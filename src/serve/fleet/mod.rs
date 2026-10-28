@@ -20,6 +20,8 @@
 //!   connection table).
 //! - `pty`: the worker's end of a `PTY` stream: a session attach in a
 //!   lent instance, through its helper's `session.attach`.
+//! - `pty_client`: the hub's end of one: a tty `exec` on an offered
+//!   machine, on this process's terminal.
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a worker
@@ -41,6 +43,7 @@ pub mod offer;
 pub mod place;
 pub mod placed;
 pub mod pty;
+pub mod pty_client;
 pub mod transfer;
 pub mod update;
 pub mod worker;

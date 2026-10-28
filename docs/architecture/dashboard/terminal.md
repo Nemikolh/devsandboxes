@@ -60,12 +60,21 @@ arrives on reader threads and only shows on the next draw.
   `remote::service_argv`), see [../daemon/machines.md](../daemon/machines.md).
   An instance's adds `--reserve-255 --session=<id>`, the id minted by
   the tab (`exec::mint_session_id`), so it can reconnect (below).
+- An offered fleet worker's instance row: this host's `devsandbox exec
+  -i -t --reserve-255 --session=<id> -- <machine>/<instance>` (no ssh to
+  it: `remote::on_machine`, the executable `ExecCli::exe`), whose tty
+  `exec` dials the worker over its fleet link
+  ([../daemon/fleet.md](../daemon/fleet.md) *PTY*) and reconnects as the
+  CLI does; the tab re-dials it the same way. Its service rows' tabs are
+  refused (`remote::service_argv`: no service terminals over the fleet
+  link).
 
 ## Remote tabs reconnect
 
 A remote instance tab carries a `Redial` (`TermSession::redial`; local
 and service tabs have none and just end). The event loop calls
-`App::redial_terminals` each pass: once the tab's ssh has ended
+`App::redial_terminals` each pass: once the tab's dial (ssh, or the local
+CLI for an offered worker) has ended
 (`TermSession::exit_code`, the PTY's EOF then a reaped child), `Redial`
 applies the CLI's rule (`serve::machines::cli::Reconnect`: a 255 after a
 dial that ran 5 s is a lost connection, `--reserve-255` keeping a

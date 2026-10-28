@@ -16,7 +16,7 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 (`serve`, `End`, `SPEC`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
-`localize`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
+`localize`, `Reconnect`, `Dials`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
 `parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
 `src/serve/relay.rs` (`--session-env`), `src/commands/machine.rs`,
 `src/commands/agent_relay.rs` (`run`, `Socket`),
@@ -382,6 +382,22 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   so a re-dial's `--attach` fails there (exit 1, its message on stderr)
   and ends the loop. SIGINT is only ignored while ssh runs, so Ctrl-C
   during a wait ends the process.
+- **On an offered fleet worker** (no ssh to it, [fleet](fleet.md#pty))
+  the dials are `PTY` streams over its fleet link from this process
+  (`fleet::pty_client::dial`), in the same loop: `dials` picks `Dials::Pty`
+  for an offered entry (`Dials::Ssh`, the argvs above, otherwise) and
+  `run_dials` hands `reconnect_loop` the dial closure. The first dial
+  creates the session (or attaches) running the command (none: the login
+  shell), each re-dial attaches only, at the instance's root there (the
+  match's, else the machine's one root); a dial's end becomes the exit
+  code an ssh dial would give (`pty_client::exit_of`: 255 only for a lost
+  link), so `Reconnect` is unchanged. `--sessions` is a `sessions.list`
+  quick call with `machine` (the lines printed, or `no sessions in
+  \`m/x\`` on stderr); a tty `--attach [ID]` is one dial attaching only
+  (no id: `exec::choose_detached` over that list), no loop, as over ssh
+  (`offered_session_exec`). Any other command there, and an `exec`
+  without a tty, takes the ssh path and its refusal
+  (`offered_refusal`).
 
 ## `devsandbox machine add|ls|set|rm`
 
@@ -428,9 +444,13 @@ parentheses. `rm` forgets the machine.
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
 routed back to a request's `machine` + remote `root`; terminal tabs use
 `tty_argv` (no hold of their own: the dashboard's `machines: true` watch
-keeps the machine, and its agent relay, up); a remote instance tab runs
+keeps the machine, and its agent relay, up); on an offered fleet worker an
+instance tab instead runs this host's `devsandbox exec … -- <m>/<name>`
+(`on_machine`, the executable `ExecCli::exe`), whose tty `exec` dials
+the worker's fleet link ([The CLI](#the-cli-clirs)), and a service tab is
+refused (service terminals aren't supported over the fleet link); a remote instance tab runs
 its shell in a helper session it names (`session_exec_argv`) and, when its
-ssh exits 255, re-dials an attach to it into the same tab (`attach_argv`,
+dial (ssh, or the local CLI) exits 255, re-dials an attach to it into the same tab (`attach_argv`,
 `tui::app::terminal::Redial`, the CLI's `Reconnect` rule;
 [terminal.md](../dashboard/terminal.md) *Remote tabs reconnect*); a machine without rows shows `box: connecting` or `box:
 unreachable: <why>` in the header (`pending_note`), the name as `box
@@ -440,7 +460,7 @@ listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while a machine is registered, shows every registered machine from
 the snapshot's `machines` with its target (dimmed `offered` for an offered
-fleet worker, whose terminal tabs and forwards say why they can't open),
+fleet worker, whose service tabs and forwards say why they can't open),
 link state (and error), `agent`, and its LEND and CAPACITY
 ([capacity](fleet.md#capacity));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a

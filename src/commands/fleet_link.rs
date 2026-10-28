@@ -21,6 +21,10 @@
 //! (`fleet-<name>.transfer.sock`): each connection there is one `TRANSFER`
 //! stream to the worker (`fleet::transfer::send` on it). `TRANSFER` streams
 //! the worker opens are refused for now: this end receives no kind yet.
+//! And `endpoint::fleet_pty_socket` (`fleet-<name>.pty.sock`): each
+//! connection there is one `PTY` stream to the worker, a terminal into one
+//! of its instances (`fleet::pty_client`, what a tty `exec` on the offered
+//! machine dials).
 //!
 //! When this is a dev build the worker isn't on, for the worker's platform
 //! (`update::hub_pushes`, over both `Hello`s), it pushes its own binary
@@ -76,7 +80,8 @@ pub fn run(
     }
     let mut held: Option<Conn> = None;
     let (api, socket) = (endpoint::fleet_socket(dir, worker), endpoint::fleet_transfer_socket(dir, worker));
-    let sockets = [(fleet::LINK.channel, api.as_path()), (channel::TRANSFER, socket.as_path())];
+    let pty = endpoint::fleet_pty_socket(dir, worker);
+    let sockets = [(fleet::LINK.channel, api.as_path()), (channel::TRANSFER, socket.as_path()), (channel::PTY, pty.as_path())];
     let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|m| eprintln!("{m}"))));
     let push_to = socket.clone();
     let end = link::opener_with(&fleet::LINK, reader, writer, &sockets, serves, |peer| {
@@ -190,9 +195,26 @@ mod tests {
                 let duplex = ssh::test_support::relayed(endpoint::connect(&daemon).ok()?).ok()?;
                 Some(duplex.stream.into())
             };
-            let serves = link::Serves::default().with(fleet::LINK.channel, open).transfers(Arc::new(Receivers::new(|_| {})));
+            let serves = link::Serves::default()
+                .with(fleet::LINK.channel, open)
+                .with(channel::PTY, fake_pty)
+                .transfers(Arc::new(Receivers::new(|_| {})));
             link::answerer_with(&fleet::LINK, r, w, &serves, None, |_| Ok(()), || {})
         })
+    }
+
+    /// A `PTY` stream's worker end, faked: past the header, `stdout` `hi
+    /// <session>`, then `exit 4`.
+    fn fake_pty() -> Option<crate::devsbd::mux::Conn> {
+        use crate::devsbd::rpc::{self, Exit, Record};
+        let (ours, theirs) = UnixStream::pair().ok()?;
+        std::thread::spawn(move || {
+            let Ok(Some(Record::Call(call))) = rpc::read_record(&mut &ours) else { return };
+            let hi = format!("hi {}", call.params.str("session").unwrap_or_default());
+            let _ = rpc::write_record(&mut &ours, &Record::Stdout(hi.into_bytes()));
+            let _ = rpc::write_record(&mut &ours, &Record::Exit(Exit::Code(4)));
+        });
+        Some(theirs.into())
     }
 
     /// The fleet root `lap` offers in these tests (a path on the worker;
@@ -252,6 +274,17 @@ mod tests {
         wait_for(|| machines::load(&registry).is_ok_and(|e| e == [lap.clone()]), "the offer registers `lap` and its root");
         assert!(endpoint::fleet_socket(&hub_dir, "lap").exists());
         assert!(endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
+        assert!(endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
+
+        // A terminal: one `PTY` stream through the link's pty socket.
+        use crate::serve::fleet::pty_client;
+        let request = pty_client::Request { root: WORKER_ROOT.into(), instance: "web-w".into(), session: "1700000000-ab12".into(), create: None };
+        let (_keys, input) = UnixStream::pair().unwrap();
+        let mut out = Vec::new();
+        let stream = endpoint::Stream::connect(endpoint::fleet_pty_socket(&hub_dir, "lap")).unwrap();
+        let term = pty_client::Terminal { input: std::os::fd::AsRawFd::as_raw_fd(&input), output: &mut out, size: &|| None };
+        let end = pty_client::attach(stream, &pty_client::header(&request), term);
+        assert_eq!((end, out), (pty_client::End::Exit(crate::devsbd::rpc::Exit::Code(4)), b"hi 1700000000-ab12".to_vec()));
 
         let mut c = conn_at(&hub_dir);
         // A quick call: the worker's answer, over the link.
@@ -290,6 +323,7 @@ mod tests {
         hub_end.join().unwrap().unwrap();
         assert!(!endpoint::fleet_socket(&hub_dir, "lap").exists());
         assert!(!endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
+        assert!(!endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
         assert!(matches!(worker_end.join().unwrap(), link::End::Closed));
         assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
         let [worker, hub] = daemons;
@@ -318,6 +352,7 @@ mod tests {
         assert!(format!("{err:#}").contains("offer refused: this devsandbox isn't a fleet hub"), "{err:#}");
         assert!(!endpoint::fleet_socket(&hub_dir, "lap").exists());
         assert!(!endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
+        assert!(!endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
         assert!(!registry.exists());
         assert!(matches!(worker_end.join().unwrap(), link::End::Closed));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);

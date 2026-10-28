@@ -101,6 +101,14 @@ pub fn fleet_transfer_socket(dir: &Path, worker: &str) -> PathBuf {
     fleet_channel_socket(dir, worker, "transfer")
 }
 
+/// An offered fleet worker's terminal socket in `dir`
+/// (docs/architecture/daemon/fleet.md, *PTY*): `fleet-<worker>.pty.sock`,
+/// bound by its `fleet-link` next to [`fleet_socket`]; each connection there
+/// is one `PTY` stream to the worker (`fleet::pty_client` dials it).
+pub fn fleet_pty_socket(dir: &Path, worker: &str) -> PathBuf {
+    fleet_channel_socket(dir, worker, "pty")
+}
+
 /// An offered fleet worker's socket in `dir` for one more channel its
 /// `fleet-link` opens toward it: `fleet-<worker>.<suffix>.sock`, next to
 /// [`fleet_socket`]; each connection there is one stream on that channel
@@ -346,7 +354,7 @@ mod tests {
         let dir = Path::new("/run/user/1000/devsandbox");
         assert_eq!(fleet_socket(dir, "lap.top"), dir.join("fleet-lap.top.sock"));
         assert_eq!(fleet_transfer_socket(dir, "lap.top"), dir.join("fleet-lap.top.transfer.sock"));
-        assert_eq!(fleet_channel_socket(dir, "lap.top", "pty"), dir.join("fleet-lap.top.pty.sock"));
+        assert_eq!(fleet_pty_socket(dir, "lap.top"), dir.join("fleet-lap.top.pty.sock"));
         let long = fleet_socket(dir, &"w".repeat(80));
         assert_eq!(long.file_name().unwrap().len(), "fleet-".len() + AGENT_CLIENT_MAX + ".sock".len());
     }

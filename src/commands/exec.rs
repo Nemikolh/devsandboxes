@@ -311,7 +311,7 @@ fn detached_sessions(listing: &str) -> Vec<(&str, &str)> {
 
 /// `--attach` without an id: the one detached session in `listing`; several
 /// → `pick` on a TTY (`tty`), else an error naming them; none → an error.
-fn choose_detached(
+pub(crate) fn choose_detached(
     key: &str,
     listing: &str,
     tty: bool,

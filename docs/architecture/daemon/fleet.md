@@ -34,7 +34,10 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/serve/fleet/offer.rs` (`call`, `Ctx`, `accept`,
 `dial`), `src/commands/fleet_link.rs` (`fleet_link`, `run`),
 `src/serve/endpoint.rs` (`fleet_socket`, `fleet_transfer_socket`,
-`fleet_channel_socket`, `accept_any`), `src/daemon_config.rs`
+`fleet_pty_socket`, `fleet_channel_socket`, `accept_any`),
+`src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`, `exit_of`,
+`Terminal`, `attach`, `dial`), `src/serve/machines/cli.rs` (`Dials`,
+`dials`, `run_dials`, `offered_session_exec`), `src/daemon_config.rs`
 (`ServeConfig::hub`), `src/serve/machines/service.rs` (`Hub`,
 `save_loop`, `log_failure`), `src/serve/machines/saved.rs` (`Saved`,
 `of`, `machines`, `load`, `save`, `save_wait`), `src/serve/snapshots.rs`
@@ -347,7 +350,11 @@ link's `API` streams.
   <why>` (on its stderr, which the worker's ssh keeps). It holds that
   daemon connection for the link's life, so a linked worker is a `clients`
   holder of the hub's daemon. `serve::machines::cli::machine_use` refuses
-  `--machine` for it.
+  `--machine` for it. Next to its socket it binds
+  `endpoint::fleet_transfer_socket` (`fleet-<name>.transfer.sock`,
+  `TRANSFER` streams) and `endpoint::fleet_pty_socket`
+  (`fleet-<name>.pty.sock`, `PTY` streams: [PTY](#pty)), unlinked with
+  it.
 - **`fleet.offer`** (`fleet::offer::call`, internal: not in the npm
   typings) is accepted only by a hub: `[serve] hub = true` in
   `daemon.config.toml` (`ServeConfig::hub`, read once at start into
@@ -375,16 +382,20 @@ link's `API` streams.
   connection is one `API` stream to the worker's daemon, so the held link
   (`service::Machines`), the quick calls and `forward::verb` (one stream
   per verb, a hang-up the stream's close) run on it as on an ssh machine.
+- **Terminals** go over the link: a tty `exec` on an offered machine
+  (and its `--attach`, `--sessions`) and the dashboard's instance tabs,
+  which run that `exec` locally, are `PTY` streams from the hub
+  ([PTY](#pty), *The hub's end*).
 - **What needs ssh** to the machine is refused for an offered one: every
   `machines::ssh` argv goes through `argv_with`, which takes
   `Entry::ssh_target`, an error for an offered entry
-  (`machines::offered_refusal`: exec, terminals, forwards and CLI re-runs
-  there need fleet step 4). So the CLI's re-runs (`exec`, `logs`,
-  `inspect`, `done`, …, `--machine` per-root commands), the dashboard's
-  terminal tabs, remote forwards and the agent relay all fail with that
-  message; `machines.set` refuses `agent` on for one (`invalid`). The
-  dashboard's logs and inspect views go through the `containers.*` quick
-  calls and work.
+  (`machines::offered_refusal`). So the CLI's other re-runs (`logs`,
+  `inspect`, `done`, …, an `exec` without a tty, `--machine` per-root
+  commands), the dashboard's service tabs (`tui::remote::service_argv`:
+  service terminals aren't supported over the fleet link), remote
+  forwards and the agent relay all fail; `machines.set` refuses `agent`
+  on for one (`invalid`). The dashboard's logs and inspect views go
+  through the `containers.*` quick calls and work.
 
 ### Hub mode
 
@@ -946,6 +957,31 @@ in the container. The stream carries `rpc` records
 are quick calls, admitted on the `Worker` table with the instance rule
 above; the session list and removal go through the helper's
 `session.ls` / `session.rm`.
+
+**The hub's end** (`fleet::pty_client`) is a CLI process on the hub, not
+its daemon: a tty `exec` on the offered machine
+([machines](machines.md#the-cli-clirs), `cli::Dials::Pty`), or the
+dashboard tab that runs one. Each dial (`pty_client::dial`) connects to
+the worker's `fleet-<name>.pty.sock` in this user's socket dir (absent:
+the link is down), sends the header (`pty_client::header`: the root and
+exact name resolution found there, the session id, `create` on the first
+dial only), puts the terminal in raw mode (crossterm's, restored by a
+guard on every return and an unwinding panic) and relays
+(`pty_client::attach`, the terminal injected): the size at once and
+whenever it changes, looked at every `pty_client::SIZE_POLL` (200 ms) as
+the helper's own session client does rather than on `SIGWINCH`; stdin as
+`stdin` records (polled, so the relay stops without a byte to read),
+its EOF `stdin-eof`; `stdout` records to stdout until the end record,
+then the stream is closed. The end becomes the exit code an ssh dial
+would give (`pty_client::exit_of`), so the CLI's `Reconnect` and the
+dashboard's `Redial` apply unchanged: `exit` its code (`128 + n` for a
+signal; 255 as 254 under `--reserve-255`); `no-session` 250, `detached`
+251, `version` 252 (`cli::NO_SESSION_EXIT`, `DETACHED_EXIT`,
+`VERSION_EXIT`) with the helper's note after `devsbd session: `;
+`lost`, a stream that ends without an end record, and an absent socket
+255; the other refusals (`bad-request`, `denied`, `not-found`,
+`not-running`, `unsupported`, `failed`) `pty_client::REFUSED_EXIT` (1)
+with `error: <message> (<code>)`, which no loop retries.
 
 ### Worker policy
 

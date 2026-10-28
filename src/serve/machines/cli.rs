@@ -18,6 +18,10 @@
 //! A tty `exec` on a machine is spawned too, in a loop: it runs in a helper
 //! session this process names ([`reconnect_session`]), and a lost connection
 //! (ssh's 255) re-dials an attach to it ([`Reconnect`], [`session_dials`]).
+//! On an offered fleet worker (no ssh to it) the dials are `PTY` streams
+//! over its fleet link from this process (`fleet::pty_client`, [`Dials`]),
+//! in the same loop; its `--attach` and `--sessions` too (the session list
+//! a `sessions.list` quick call).
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -33,6 +37,7 @@ use super::{Entry, Where, check_name, no_machine, parse_name, ssh};
 use crate::serve::api::{Found, Resolved};
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
+use crate::serve::fleet::pty_client;
 use crate::{Command, ServiceCommand};
 
 /// What `--machine` does with a command.
@@ -396,11 +401,20 @@ pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) ->
 pub(crate) const SSH_FAILED: i32 = 255;
 
 /// The helper's `NO_SESSION_EXIT` (`devsbd/src/sessions.rs`): an attach to
-/// a session that is unknown or `lost`. Its siblings need no mirror: like
-/// every code but 255 they end [`Reconnect`]'s loop as the session's answer,
-/// with the helper's own note on stderr (`DETACHED_EXIT` 251: attached
-/// elsewhere; `VERSION_EXIT` 252: started by another devsbd, still there).
+/// a session that is unknown or `lost`. Like every code but 255 it ends
+/// [`Reconnect`]'s loop as the session's answer, with the helper's own note
+/// on stderr; this one also says the session is gone ([`gone_note`]).
 pub(crate) const NO_SESSION_EXIT: i32 = 250;
+
+/// The helper's `DETACHED_EXIT`: another client took the session over (it
+/// runs on, attached elsewhere). What a `PTY` stream's `detached` end
+/// exits with (`fleet::pty_client::exit_of`).
+pub(crate) const DETACHED_EXIT: i32 = 251;
+
+/// The helper's `VERSION_EXIT`: the session was started by another devsbd
+/// (still there, not attachable by this one). A `PTY` stream's `version`
+/// end.
+pub(crate) const VERSION_EXIT: i32 = 252;
 
 /// How long a dial must have run to count as connected: a 255 sooner, on a
 /// first dial, is ssh failing to connect at all (bad host, auth), which no
@@ -524,21 +538,61 @@ pub(crate) fn session_dials(command: &Command, id: &str) -> Option<(Command, Com
     Some((first, again))
 }
 
-/// Run `first` (ssh), then `again` after each lost connection, per
-/// [`Reconnect`], with `held` kept to the end. Each dial is spawned
-/// ([`spawn_ssh_owning_signals`]): this process outlives ssh. Between dials
-/// SIGINT is ours again, so Ctrl-C during a wait ends it.
-fn reconnect_loop(first: &[OsString], again: &[OsString], id: &str, held: Option<Conn>) -> Result<Routed> {
+/// How a session exec's dials reach its machine ([`dials`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dials {
+    /// An ssh machine: each dial an ssh running the machine's `devsandbox
+    /// exec` ([`session_dials`]' commands).
+    Ssh { first: Vec<OsString>, again: Vec<OsString> },
+    /// An offered fleet worker: each dial a `PTY` stream over its fleet
+    /// link (`fleet::pty_client::dial`), the first creating the session
+    /// (or attaching), the rest attaching only.
+    Pty { first: pty_client::Request, again: pty_client::Request },
+}
+
+/// The dials of session exec `command` (an `Exec`) in session `id` on
+/// `entry`, instance `name` at `root` there; `terminal` as for
+/// [`ssh::cli_argv`].
+pub(crate) fn dials(entry: &Entry, command: &Command, name: &str, root: Option<&Path>, id: &str, terminal: bool) -> Result<Dials> {
+    let (first, again) = session_dials(command, id).context("not an exec")?;
+    if entry.is_offered() {
+        let Command::Exec { command, .. } = first else { bail!("not an exec") };
+        let root = root.with_context(|| format!("machine `{}` has no config roots (devsandbox machine ls)", entry.name))?;
+        let request = |create| pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), session: id.to_string(), create };
+        return Ok(Dials::Pty { first: request(Some(command)), again: request(None) });
+    }
+    let first = ssh::cli_argv(entry, terminal, &remote_args(&first, name, root).context("not an exec")?)?;
+    let again = ssh::cli_argv(entry, terminal, &remote_args(&again, name, root).context("not an exec")?)?;
+    Ok(Dials::Ssh { first, again })
+}
+
+/// Run `dials` on `entry`: the first dial, then the attach after each lost
+/// connection, per [`Reconnect`], with `held` kept to the end.
+fn run_dials(dials: Dials, entry: &Entry, id: &str, held: Option<Conn>) -> Result<Routed> {
+    match dials {
+        // Each dial spawned: this process outlives ssh.
+        Dials::Ssh { first, again } => reconnect_loop(id, held, |redial| spawn_ssh_owning_signals(if redial { &again } else { &first })),
+        Dials::Pty { first, again } => {
+            let dir = endpoint::socket_dir()?;
+            reconnect_loop(id, held, |redial| Ok(pty_client::dial(&dir, &entry.name, if redial { &again } else { &first }, true)))
+        }
+    }
+}
+
+/// Dial (`dial(false)`), then re-dial (`dial(true)`) after each lost
+/// connection, per [`Reconnect`], with `held` kept to the end. Between
+/// dials SIGINT is ours, so Ctrl-C during a wait ends it.
+fn reconnect_loop(id: &str, held: Option<Conn>, mut dial: impl FnMut(bool) -> Result<i32>) -> Result<Routed> {
     let mut state = Reconnect::default();
-    let mut argv = first;
+    let mut redial = false;
     loop {
         let started = Instant::now();
-        let code = spawn_ssh_owning_signals(argv)?;
+        let code = dial(redial)?;
         match state.after(code, started.elapsed()) {
             Next::Retry { wait, attempt } => {
                 eprintln!("{}", retry_note(attempt));
                 std::thread::sleep(wait);
-                argv = again;
+                redial = true;
             }
             Next::Done { code, gone } => {
                 if gone {
@@ -757,15 +811,70 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     }
     let root = chosen.root.as_deref().or(entry.roots.first().map(PathBuf::as_path));
     let terminal = on_terminal();
+    if entry.is_offered()
+        && let Some(routed) = offered_session_exec(&command, &mut conn, &entry, &chosen.name, root, terminal)?
+    {
+        return Ok(routed);
+    }
     if let Some(id) = reconnect_session(&command, terminal, || crate::commands::exec::mint_session_id(crate::state::Instance::now()))? {
-        let (first, again) = session_dials(&command, &id).context("not an exec")?;
-        let first = ssh::cli_argv(&entry, terminal, &remote_args(&first, &chosen.name, root).context("not an exec")?)?;
-        let again = ssh::cli_argv(&entry, terminal, &remote_args(&again, &chosen.name, root).context("not an exec")?)?;
-        return reconnect_loop(&first, &again, &id, hold(conn, &entry));
+        let dials = dials(&entry, &command, &chosen.name, root, &id, terminal)?;
+        return run_dials(dials, &entry, &id, hold(conn, &entry));
     }
     let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
     let argv = ssh::cli_argv(&entry, terminal, &args)?;
     run_ssh(&argv, hold(conn, &entry))
+}
+
+/// `exec --sessions` and a tty `exec --attach [ID]` of instance `name` on
+/// offered machine `entry` (at `root` there): the session list through a
+/// `sessions.list` quick call on `conn`, the attach one `PTY` dial (no loop,
+/// as over ssh: its 255 is the caller's to retry). `None` for any other
+/// exec, which [`resolve_and_route`] goes on with (a non-tty one to the ssh
+/// path's refusal).
+fn offered_session_exec(
+    command: &Command,
+    conn: &mut Conn,
+    entry: &Entry,
+    name: &str,
+    root: Option<&Path>,
+    terminal: bool,
+) -> Result<Option<Routed>> {
+    let Command::Exec { attach, sessions, reserve_255, .. } = command else { return Ok(None) };
+    if !*sessions && (attach.is_none() || !terminal) {
+        return Ok(None);
+    }
+    let m = &entry.name;
+    let key = format!("{m}/{name}");
+    let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+    let mut list = || -> Result<Vec<String>> {
+        let r = conn.call("sessions.list", json!({ "root": root, "instance": name, "machine": m }))?;
+        if let Some(e) = r.error {
+            bail!("`{key}`: {}", e.message);
+        }
+        let lines = r.result.as_ref().and_then(|r| r.get("sessions")).cloned().unwrap_or(Value::Null);
+        serde_json::from_value(lines).context("bad sessions.list result from devsandbox serve")
+    };
+    if *sessions {
+        let lines = list()?;
+        if lines.is_empty() {
+            eprintln!("no sessions in `{key}`");
+        }
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(Some(Routed::Exit(0)));
+    }
+    let id = match attach {
+        Some(Some(id)) => crate::commands::exec::checked_session_id(id)?.to_string(),
+        _ => {
+            let listing = list()?.join("\n");
+            crate::commands::exec::choose_detached(&key, &listing, std::io::stdin().is_terminal(), &mut |prompt, options| {
+                crate::commands::pick(prompt, options)
+            })?
+        }
+    };
+    let request = pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), session: id, create: None };
+    Ok(Some(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, m, &request, *reserve_255))))
 }
 
 /// Replace this process with `argv` (ssh): its exit is ours, its terminal
@@ -1125,6 +1234,35 @@ mod tests {
         let entry = entry();
         let argv = ssh::cli_argv(&entry, true, &again).unwrap();
         assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"].map(OsString::from));
+    }
+
+    /// An ssh machine's dials are ssh argvs; an offered worker's `PTY`
+    /// requests: create-or-attach with the command (none: the login shell),
+    /// then attach only, both at the instance's root there.
+    #[test]
+    fn offered_machines_dial_over_the_fleet_link() {
+        let root = Some(Path::new("/w/fleet/hub/cfg"));
+        let exec = command(&["exec", "-it", "lap/web", "zidane", "-c"]);
+        let Dials::Ssh { first, again } = dials(&entry(), &exec, "web-2", root, ID, true).unwrap() else { panic!("not ssh") };
+        let (f, a) = session_dials(&exec, ID).unwrap();
+        assert_eq!(first, ssh::cli_argv(&entry(), true, &remote_args(&f, "web-2", root).unwrap()).unwrap());
+        assert_eq!(again, ssh::cli_argv(&entry(), true, &remote_args(&a, "web-2", root).unwrap()).unwrap());
+
+        let lap = Entry { roots: vec!["/w/fleet/hub".into()], ..Entry::offered("lap") };
+        let request = |create: Option<Vec<String>>| pty_client::Request {
+            root: "/w/fleet/hub/cfg".into(),
+            instance: "web-2".into(),
+            session: ID.into(),
+            create,
+        };
+        assert_eq!(
+            dials(&lap, &exec, "web-2", root, ID, true).unwrap(),
+            Dials::Pty { first: request(Some(ms(&["zidane", "-c"]))), again: request(None) }
+        );
+        let shell = dials(&lap, &command(&["exec", "lap/web"]), "web-2", root, ID, false).unwrap();
+        assert_eq!(shell, Dials::Pty { first: request(Some(Vec::new())), again: request(None) });
+        let e = dials(&lap, &exec, "web-2", None, ID, true).unwrap_err().to_string();
+        assert!(e.contains("has no config roots"), "{e}");
     }
 
     #[test]

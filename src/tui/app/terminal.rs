@@ -46,12 +46,8 @@ impl ExecCli {
     /// CLI takes the flags as given (without one it would pick the same).
     /// `--` so an instance name can't read as a flag.
     pub fn argv(&self, instance: &str, command: &[String]) -> Result<Vec<String>, String> {
-        let exe = match &self.exe {
-            Some(exe) => exe.clone(),
-            None => crate::exe::devsandbox().map_err(|e| format!("can't find the devsandbox executable: {e}"))?,
-        };
         let mut argv = vec![
-            exe.to_string_lossy().into_owned(),
+            self.exe()?,
             "-C".into(),
             self.root.to_string_lossy().into_owned(),
             "exec".into(),
@@ -62,6 +58,16 @@ impl ExecCli {
         ];
         argv.extend(command.iter().cloned());
         Ok(argv)
+    }
+
+    /// The devsandbox executable these argvs start with (also an offered
+    /// machine's tabs', `remote::exec_argv`).
+    pub fn exe(&self) -> Result<String, String> {
+        let exe = match &self.exe {
+            Some(exe) => exe.clone(),
+            None => crate::exe::devsandbox().map_err(|e| format!("can't find the devsandbox executable: {e}"))?,
+        };
+        Ok(exe.to_string_lossy().into_owned())
     }
 }
 
@@ -582,8 +588,9 @@ impl App {
         if is_instance {
             if let (Some(machine), name) = remote::split(title) {
                 let (m, root) = self.remote_instance(title, machine).map_err(terminal)?;
-                let first = remote::session_exec_argv(m, &root, name, id).map_err(terminal)?;
-                let attach = remote::attach_argv(m, &root, name, id).map_err(terminal)?;
+                let exe = || self.local_exe();
+                let first = remote::session_exec_argv(m, &root, name, id, &exe).map_err(terminal)?;
+                let attach = remote::attach_argv(m, &root, name, id, &exe).map_err(terminal)?;
                 return Ok((first, Some(attach)));
             }
             return self.exec_argv(title, &[]).map(|argv| (argv, None)).map_err(terminal);
@@ -606,7 +613,12 @@ impl App {
             return self.exec_cli.as_ref().map_err(String::clone)?.argv(name, command);
         };
         let (entry, root) = self.remote_instance(key, machine)?;
-        remote::exec_argv(entry, &root, name, command)
+        remote::exec_argv(entry, &root, name, command, &|| self.local_exe())
+    }
+
+    /// This host's devsandbox, which an offered machine's tabs run.
+    fn local_exe(&self) -> Result<String, String> {
+        self.exec_cli.as_ref().map_err(String::clone)?.exe()
     }
 
     /// Remote instance `key`'s machine entry and its root there.
@@ -1174,8 +1186,9 @@ mod tests {
         assert!(argv[4].ends_with(r"'\''--'\'' '\''inst1'\'''"), "{}", argv[4]);
         // In session ID, which the tab re-dials an attach to.
         let machine = remote::machine(&app.machines, "box").unwrap();
-        assert_eq!(argv, remote::session_exec_argv(machine, "/r/one", "inst1", ID).unwrap());
-        assert_eq!(attach, Some(remote::attach_argv(machine, "/r/one", "inst1", ID).unwrap()));
+        let no_exe = || -> Result<String, String> { unreachable!("an ssh machine's") };
+        assert_eq!(argv, remote::session_exec_argv(machine, "/r/one", "inst1", ID, &no_exe).unwrap());
+        assert_eq!(attach, Some(remote::attach_argv(machine, "/r/one", "inst1", ID, &no_exe).unwrap()));
         // A local instance of the same name: this host's devsandbox, no re-dial.
         let (argv, attach) = app.term_argv("inst1", "devsandbox-inst1", true, ID).unwrap();
         assert_eq!(argv[..4], ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec"]);
@@ -1294,6 +1307,21 @@ mod tests {
 
     fn cli() -> ExecCli {
         ExecCli { exe: Some("/opt/bin/devsandbox".into()), root: "/home/u/cfg".into() }
+    }
+
+    /// An offered worker's tab runs this host's devsandbox on the qualified
+    /// name (its `exec` dials the fleet link), re-dialed like an ssh one.
+    #[test]
+    fn an_offered_machines_tabs_run_the_local_cli() {
+        let mut app = machine_app();
+        app.machines[0].kind = crate::serve::machines::MachineKind::Offered;
+        app.machines[0].target = None;
+        assert_eq!(app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID), Err("terminal: the devsandbox executable isn't known yet".into()));
+        app.exec_cli = Ok(cli());
+        let (argv, attach) = app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID).unwrap();
+        assert_eq!(argv, ["/opt/bin/devsandbox", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "box/inst1"]);
+        assert_eq!(attach, Some(["/opt/bin/devsandbox", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "box/inst1"].map(String::from).to_vec()));
+        assert_eq!(app.exec_argv("box/inst1", &["uname".into()]).unwrap(), ["/opt/bin/devsandbox", "exec", "-i", "-t", "--", "box/inst1", "uname"]);
     }
 
     #[test]
