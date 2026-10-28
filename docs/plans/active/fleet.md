@@ -1,6 +1,6 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-4 shipped
+Status: in progress. Steps 1-5 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
@@ -327,7 +327,8 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    `lost`); a link drop is `lost`, never an exit, and records are
    relayed unchanged by every hop. Session `ls`/`rm` within the caller's
    trust. The member's daemon attaches directly (decision 13).
-5. **The rest over the link** (M). On the fleet link, like step 4, and
+5. **The rest over the link** (M, shipped on offered workers' links; `gc`
+   waits for step 6's `full`). On the fleet link, like step 4, and
    before anything deletes an ssh argv, so an ssh machine never loses a
    command in between: API calls for `ps`, `stats`, `service ls` and
    `logs --follow`; a piped `PTY` mode for a non-tty `exec`; a host-pty
