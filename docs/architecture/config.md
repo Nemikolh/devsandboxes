@@ -89,6 +89,10 @@ last entry per target (`run::mounts::last_wins_by_target`).
 `devcontainerId` (the instance id: the name at creation, stable across
 rebuild and `rename`), `localEnv:VAR` (unset → empty), and
 `containerEnv:NAME` through `MountContext::container_env` (unset → empty).
+Both take devcontainer's `:default` (`env_name_and_default`: the name ends
+at the first `:`, the default is the rest): an unset variable reads as it,
+a set one, even empty, as its value. The fleet gate
+(`worker_policy::local_env_allowed`) sees the name only.
 Unknown expressions are left verbatim (feature mounts using one are skipped
 with a warning), and so is `containerEnv:` when the context has no
 `ContainerEnv` (`snapshot::validate_sandbox`, `ls`: no image, not an issue).

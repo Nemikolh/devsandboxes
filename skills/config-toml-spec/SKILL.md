@@ -113,7 +113,8 @@ Substituted in `mounts` (source/target), `workspaceFolder`, `worktree-branch`, `
 | `${instance}` | persistent instance id (name at creation; stable across renames) |
 | `${devcontainerId}` | same as `${instance}` (devcontainer's stable per-container id; features name volumes with it) |
 | `${localEnv:VAR}` | host env var, empty if unset |
-| `${containerEnv:NAME}` | the container's env: the sandbox's `containerEnv`, else the image's `ENV`, else for `HOME` the home of the account the container runs as (`remoteUser`, else `containerUser`, else the image's `USER`, as the image's `/etc/passwd` has it; else `/home/<user>`; `/root` for root or no user), the same under every runtime's plan; empty if unset. `target=${containerEnv:HOME}/.claude` lands in the user's home whoever that is |
+| `${localEnv:VAR:default}` | host env var if set (even to empty), else `default`: everything after the `:` following `VAR`, `:`s included |
+| `${containerEnv:NAME}` | the container's env: the sandbox's `containerEnv`, else the image's `ENV`, else for `HOME` the home of the account the container runs as (`remoteUser`, else `containerUser`, else the image's `USER`, as the image's `/etc/passwd` has it; else `/home/<user>`; `/root` for root or no user), the same under every runtime's plan; empty if unset (`${containerEnv:NAME:default}`: `default` if unset, as for `localEnv`). `target=${containerEnv:HOME}/.claude` lands in the user's home whoever that is |
 
 ## Services (`[services.<name>]`)
 

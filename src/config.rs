@@ -559,7 +559,8 @@ pub struct MountContext<'a> {
 /// The env `${containerEnv:NAME}` reads at create time, in order: the
 /// sandbox's `containerEnv` (substituted), the image's `ENV`, then for
 /// `HOME` the adopted account's home (`runtime::identity::container_home`).
-/// A name none of them sets reads as empty, like an unset `localEnv:`.
+/// A name none of them sets reads as its `${containerEnv:NAME:default}`,
+/// else empty, like an unset `localEnv:`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerEnv {
     /// The sandbox's `containerEnv`, its values substituted.
@@ -571,20 +572,21 @@ pub struct ContainerEnv {
 }
 
 impl ContainerEnv {
-    /// `name`'s value, in [`ContainerEnv`]'s order.
-    pub fn get(&self, name: &str) -> String {
+    /// `name`'s value, in [`ContainerEnv`]'s order; `None` when none of
+    /// them sets it (what `${containerEnv:NAME:default}` falls back on).
+    fn get(&self, name: &str) -> Option<String> {
         match self.sandbox.get(name) {
-            Some(v) => v.clone(),
+            Some(v) => Some(v.clone()),
             None => self.from_image(name),
         }
     }
 
     /// `name` from the image's env, else the home fallback.
-    fn from_image(&self, name: &str) -> String {
+    fn from_image(&self, name: &str) -> Option<String> {
         match self.image.iter().rev().find(|(k, _)| k == name) {
-            Some((_, v)) => v.clone(),
-            None if name == "HOME" => self.home.clone(),
-            None => String::new(),
+            Some((_, v)) => Some(v.clone()),
+            None if name == "HOME" => Some(self.home.clone()),
+            None => None,
         }
     }
 
@@ -761,19 +763,35 @@ pub fn substitute(input: &str, ctx: &MountContext) -> String {
 }
 
 fn resolve_var(expr: &str, ctx: &MountContext) -> Option<String> {
-    if let Some(var) = expr.strip_prefix("localEnv:") {
+    resolve_var_with(
+        expr,
+        ctx,
+        |name| crate::worker_policy::local_env_allowed(Path::new(ctx.config_dir), name),
+        |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()),
+    )
+}
+
+/// [`resolve_var`] over a given `localEnv` gate and host env.
+fn resolve_var_with(
+    expr: &str,
+    ctx: &MountContext,
+    local_env_allowed: impl Fn(&str) -> bool,
+    local_env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if let Some(rest) = expr.strip_prefix("localEnv:") {
+        let (name, default) = env_name_and_default(rest);
         // Under a fleet root the config is the hub's: the worker's env only
         // for names `lend.toml` allows, else left verbatim (`run` refuses
         // such a config before this, `worker_policy::Policy::check_config`;
         // this is for what no check saw, e.g. a hub's `run --branch`).
-        if !crate::worker_policy::local_env_allowed(Path::new(ctx.config_dir), var) {
+        if !local_env_allowed(name) {
             return None;
         }
-        // devcontainer semantics: an unset host variable expands to empty.
-        return Some(std::env::var(var).unwrap_or_default());
+        return Some(local_env(name).unwrap_or_else(|| default.to_string()));
     }
-    if let Some(var) = expr.strip_prefix("containerEnv:") {
-        return ctx.container_env.map(|env| env.get(var));
+    if let Some(rest) = expr.strip_prefix("containerEnv:") {
+        let (name, default) = env_name_and_default(rest);
+        return ctx.container_env.map(|env| env.get(name).unwrap_or_else(|| default.to_string()));
     }
     match expr {
         "configDir" => Some(ctx.config_dir.to_string()),
@@ -787,6 +805,15 @@ fn resolve_var(expr: &str, ctx: &MountContext) -> Option<String> {
         "instance" | "devcontainerId" => Some(ctx.instance.to_string()),
         _ => None,
     }
+}
+
+/// `NAME` and the default of a `localEnv:`/`containerEnv:` body
+/// (`NAME[:default]`): the name ends at the first `:`, the default is all
+/// the rest, `:`s included (`${localEnv:URL:http://x:1}` defaults to
+/// `http://x:1`). devcontainer semantics: a set variable is its value,
+/// even empty; an unset one is the default, empty without one.
+fn env_name_and_default(body: &str) -> (&str, &str) {
+    body.split_once(':').unwrap_or((body, ""))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2051,16 +2078,16 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
     fn container_env_order_and_home_fallback() {
         let sandbox = BTreeMap::from([("LANG".into(), "en_US.UTF-8".into())]);
         let env = ContainerEnv { sandbox, image: image_env(), home: "/home/node".into() };
-        assert_eq!(env.get("LANG"), "en_US.UTF-8");
-        assert_eq!(env.get("PATH"), "/usr/bin:/bin");
-        assert_eq!(env.get("HOME"), "/home/node");
-        assert_eq!(env.get("UNSET"), "");
+        assert_eq!(env.get("LANG").as_deref(), Some("en_US.UTF-8"));
+        assert_eq!(env.get("PATH").as_deref(), Some("/usr/bin:/bin"));
+        assert_eq!(env.get("HOME").as_deref(), Some("/home/node"));
+        assert_eq!(env.get("UNSET"), None);
         // The image's HOME beats the fallback; a later image entry wins.
         let mut image = image_env();
         image.push(("HOME".into(), "/srv".into()));
         let env = ContainerEnv { image, ..env };
-        assert_eq!(env.get("HOME"), "/srv");
-        assert_eq!(ContainerEnv { sandbox: BTreeMap::new(), ..env }.get("LANG"), "C.UTF-8");
+        assert_eq!(env.get("HOME").as_deref(), Some("/srv"));
+        assert_eq!(ContainerEnv { sandbox: BTreeMap::new(), ..env }.get("LANG").as_deref(), Some("C.UTF-8"));
     }
 
     #[test]
@@ -2085,7 +2112,7 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
         assert_eq!(env.sandbox["TOOLS_PATH"], "/usr/bin:/bin:/opt/bin");
         assert_eq!(env.sandbox["WHERE"], "repo-2@/cfg");
         // Later lookups (mounts, remoteEnv) see the substituted values.
-        assert_eq!(env.get("TOOLS_PATH"), "/usr/bin:/bin:/opt/bin");
+        assert_eq!(env.get("TOOLS_PATH").as_deref(), Some("/usr/bin:/bin:/opt/bin"));
         let none = ContainerEnv::resolve(None, Vec::new(), "/root".into(), &ctx());
         assert!(none.sandbox.is_empty());
     }
@@ -2186,6 +2213,57 @@ mounts = [{ source = "${localWorkspaceFolder}/x", target = "/x", readonly = true
         let props = config.resolve_sandbox("s").unwrap().properties;
         let resolved = props.mounts.as_ref().unwrap()[0].resolve(&ctx()).unwrap();
         assert_eq!(resolved.to_arg(), expected);
+    }
+
+    #[test]
+    fn local_env_default_applies_only_when_unset() {
+        let env = |name: &str| match name {
+            "SET" => Some("v".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let allow_all = |_: &str| true;
+        let r = |expr: &str| resolve_var_with(expr, &ctx(), allow_all, env);
+        assert_eq!(r("localEnv:SET").as_deref(), Some("v"));
+        assert_eq!(r("localEnv:SET:d").as_deref(), Some("v"));
+        // Set to empty is set: devcontainer's `typeof env === 'string'`.
+        assert_eq!(r("localEnv:EMPTY:d").as_deref(), Some(""));
+        assert_eq!(r("localEnv:UNSET:d").as_deref(), Some("d"));
+        assert_eq!(r("localEnv:UNSET").as_deref(), Some(""));
+        assert_eq!(r("localEnv:UNSET:").as_deref(), Some(""));
+        assert_eq!(r("localEnv:UNSET:http://h:8080/x").as_deref(), Some("http://h:8080/x"));
+        // Through `substitute`, against the real host env.
+        assert_eq!(
+            substitute("${localEnv:DEVSANDBOX_TEST_SURELY_UNSET:fall:back}/x", &ctx()),
+            "fall:back/x"
+        );
+        assert_eq!(substitute("${localEnv:PATH:d}", &ctx()), std::env::var("PATH").unwrap());
+    }
+
+    #[test]
+    fn local_env_gate_sees_the_name_and_refusal_stays_verbatim() {
+        let env = |_: &str| Some("secret".to_string());
+        let gate = |name: &str| {
+            assert!(!name.contains(':'), "gate got `{name}`");
+            name == "OK"
+        };
+        assert_eq!(resolve_var_with("localEnv:OK:d", &ctx(), gate, env).as_deref(), Some("secret"));
+        assert_eq!(resolve_var_with("localEnv:GH:d", &ctx(), gate, env), None);
+        assert_eq!(resolve_var_with("localEnv:GH", &ctx(), gate, env), None);
+    }
+
+    #[test]
+    fn container_env_default_applies_only_when_unset() {
+        let sandbox = BTreeMap::from([("EMPTY".into(), String::new())]);
+        let env = ContainerEnv { sandbox, image: image_env(), home: "/home/node".into() };
+        let with = MountContext { container_env: Some(&env), ..ctx() };
+        assert_eq!(substitute("${containerEnv:LANG:d}", &with), "C.UTF-8");
+        assert_eq!(substitute("${containerEnv:EMPTY:d}", &with), "");
+        assert_eq!(substitute("${containerEnv:HOME:d}", &with), "/home/node");
+        assert_eq!(substitute("${containerEnv:UNSET:a:b}", &with), "a:b");
+        assert_eq!(substitute("${containerEnv:UNSET}", &with), "");
+        // No context yet: verbatim, default and all.
+        assert_eq!(substitute("${containerEnv:UNSET:d}", &ctx()), "${containerEnv:UNSET:d}");
     }
 
     #[test]
