@@ -330,7 +330,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let registry = if opts.host {
         let shared = Arc::clone(&shared);
         let store = super::forward_store::path()?;
-        Some(Registry::spawn(log, store, forwards_machines, Box::new(move |event| shared.publish_forwards(event))))
+        let on_event = Box::new(move |event| shared.publish_forwards(event));
+        Some(Registry::spawn(log, store, forwards_machines, dir.to_path_buf(), on_event))
     } else {
         None
     };
@@ -436,8 +437,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
 /// The daemon's lending (`fleet::lender`): lend as `lend.toml` says now,
 /// and follow each `lend.set`. A lending thread's fleet root is created,
 /// each `API` stream from the hub is a `Worker` connection
-/// ([`Shared::open_lent`]) and each `PTY` stream a session attach
-/// ([`Shared::open_lent_pty`]). Without a `lend.toml` path (no data dir) it's
+/// ([`Shared::open_lent`]), each `PTY` stream a session attach
+/// ([`Shared::open_lent_pty`]) and each `TUNNEL` stream a forward's bridge
+/// ([`Shared::open_lent_tunnel`]). Without a `lend.toml` path (no data dir) it's
 /// logged and `lend.*` fail.
 fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     let path = match &opts.lend {
@@ -466,11 +468,13 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     let weak = Arc::downgrade(shared);
     let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
         let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
-        let (api, pty) = (weak.clone(), weak.clone());
-        let api_scope = Arc::clone(&scope);
+        let (api, pty, tunnel) = (weak.clone(), weak.clone(), weak.clone());
+        let (api_scope, pty_scope) = (Arc::clone(&scope), Arc::clone(&scope));
         let api: fleet::worker::Open = Arc::new(move || api.upgrade()?.open_lent(&api_scope));
-        let pty: fleet::worker::Open = Arc::new(move || pty.upgrade()?.open_lent_pty(&scope));
-        let opens = vec![(fleet::LINK.channel, api), (crate::devsbd::proto::channel::PTY, pty)];
+        let pty: fleet::worker::Open = Arc::new(move || pty.upgrade()?.open_lent_pty(&pty_scope));
+        let tunnel: fleet::worker::Open = Arc::new(move || tunnel.upgrade()?.open_lent_tunnel(&scope));
+        use crate::devsbd::proto::channel;
+        let opens = vec![(fleet::LINK.channel, api), (channel::PTY, pty), (channel::TUNNEL, tunnel)];
         // What the hub may send this worker: config roots and their repos,
         // into the fleet root (`fleet::code`); the hub's binary the lending
         // thread takes itself.
@@ -693,6 +697,23 @@ impl Shared {
         std::thread::Builder::new()
             .name("serve-pty".into())
             .spawn(move || fleet::pty::serve(ours, &helper, &state, &scope, crate::commands::exec::has_host_agent, log))
+            .ok()?;
+        Some(hub.into())
+    }
+
+    /// One `TUNNEL` stream of the lending link: a socket pair whose one end
+    /// goes to the hub, the other served by `fleet::tunnel::serve` on a
+    /// thread of its own (a forward's bridge into one of `scope`'s
+    /// instances). `None` once the daemon is stopping.
+    fn open_lent_tunnel(self: &Arc<Self>, scope: &Arc<lent::Scope>) -> Option<crate::devsbd::mux::Conn> {
+        if *self.closed.0.lock().unwrap() {
+            return None;
+        }
+        let (hub, ours) = Stream::pair().ok()?;
+        let (state, scope) = (self.state.clone(), Arc::clone(scope));
+        std::thread::Builder::new()
+            .name("serve-tunnel".into())
+            .spawn(move || fleet::tunnel::serve(ours, &state, &scope, log))
             .ok()?;
         Some(hub.into())
     }
@@ -2308,6 +2329,7 @@ pub(crate) mod tests {
             |_| {},
             scratch("fwd-hold-store").join("forwards.toml"),
             scratch("fwd-hold-store").join("machines.toml"),
+            scratch("fwd-hold-store"),
             Box::new(|_| {}),
         );
         assert_eq!(shared.holders(None, Some(&registry)), Holders::default());

@@ -24,12 +24,55 @@ use super::{notify, proto, relay_mode, BIN};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
+/// What carries a bridge's bytes: a spawned child's stdio (an `exec`, an
+/// ssh running `devsandbox tunnel`), or a stream (a fleet link's `TUNNEL`,
+/// `commands::tunnel`). Killing it ends the bridge the same way either way:
+/// the child dies, or the stream is shut down; the mux's read then ends.
+pub enum Transport {
+    Child(Child),
+    Stream(UnixStream),
+}
+
+impl From<Child> for Transport {
+    fn from(child: Child) -> Self {
+        Transport::Child(child)
+    }
+}
+
+impl From<UnixStream> for Transport {
+    fn from(stream: UnixStream) -> Self {
+        Transport::Stream(stream)
+    }
+}
+
+impl Transport {
+    /// Idempotent.
+    fn kill(&mut self) {
+        match self {
+            Transport::Child(child) => {
+                let _ = child.kill();
+            }
+            Transport::Stream(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// The child's exit code, waiting for it; a stream has none.
+    fn exit_code(&mut self) -> Option<i32> {
+        match self {
+            Transport::Child(child) => child.wait().ok().and_then(|s| s.code()),
+            Transport::Stream(_) => None,
+        }
+    }
+}
+
 /// A running bridge; dropping it kills the `exec` (the in-container bridge
-/// then sees stdin EOF and exits).
+/// then sees stdin EOF and exits), or shuts its stream down.
 pub struct Bridge {
     // Shared so the keepalive/handshake-timeout threads can kill the child too;
     // `Drop` and those threads race on `kill()`, which is idempotent.
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<Transport>>,
     done: Arc<AtomicBool>,
     // Set by the handshake thread when the failure is a protocol version
     // mismatch — either detected host-side (`proto::version_mismatch`) or by the
@@ -135,8 +178,8 @@ impl Bridge {
 impl Drop for Bridge {
     fn drop(&mut self) {
         let mut child = self.child.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill();
+        let _ = child.exit_code();
     }
 }
 
@@ -604,7 +647,7 @@ fn spawn_observed(
     let stdin = child.stdin.take()?;
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
-    Some(attach_with(child, stdin, stdout, stderr, hash, container, None, agent, notify, observe))
+    Some(attach_with(child.into(), stdin, stdout, stderr, hash, container, None, agent, notify, observe))
 }
 
 /// `<runtime> exec -i -u root <container> devsbd bridge`: the in-container end
@@ -618,16 +661,17 @@ pub fn bridge_command(container: &str) -> Command {
 
 /// Run a bridge over an already-spawned child whose stdio carries an
 /// in-container `devsbd bridge` (directly, or behind a transport such as
-/// ssh): the handshake, then the mux. Agent-less, no notify/control
+/// ssh), or over a stream that does (`stdin`/`stdout` its clones): the
+/// handshake, then the mux. Agent-less, no notify/control
 /// services, no observer: what a forward over a non-`exec` transport needs.
 /// `stdout` may already be partly read (a header before the bridge's bytes);
 /// the handshake starts at whatever it yields next. `label` names the far
 /// end in messages (`helper in <label> is outdated …`); `machine`, when the
 /// far end is a machine's, is what an outdated helper's fix names (its
 /// devsandbox, not the instance, embeds that helper). Dropping the `Bridge`
-/// kills `child`.
+/// kills `child` (shuts the stream down).
 pub fn attach(
-    child: Child,
+    child: impl Into<Transport>,
     stdin: impl Write + Send + 'static,
     stdout: impl Read + Send + 'static,
     stderr: impl Read + Send + 'static,
@@ -636,13 +680,13 @@ pub fn attach(
     machine: Option<&str>,
 ) -> Bridge {
     let none: Option<fn() -> Option<PathBuf>> = None;
-    attach_with(child, stdin, stdout, stderr, hash, label, machine, none, None, None)
+    attach_with(child.into(), stdin, stdout, stderr, hash, label, machine, none, None, None)
 }
 
 /// [`attach`] with the full set of options [`spawn_observed`] takes.
 #[allow(clippy::too_many_arguments)]
 fn attach_with(
-    child: Child,
+    child: Transport,
     mut stdin: impl Write + Send + 'static,
     mut stdout: impl Read + Send + 'static,
     mut stderr: impl Read + Send + 'static,
@@ -684,7 +728,7 @@ fn attach_with(
             // past that there's no handshake to time out.
             if !bridged.load(Ordering::Relaxed) {
                 timed_out.store(true, Ordering::Relaxed);
-                let _ = child.lock().unwrap().kill();
+                child.lock().unwrap().kill();
             }
         });
     }
@@ -715,10 +759,8 @@ fn attach_with(
                 // daemon failed on a version mismatch (it printed the line we
                 // just read). Classify that from the exit code, not the text, so
                 // reconcile can stop retrying. `wait()` after EOF is prompt.
-                if let Ok(status) = hs_child.lock().unwrap().wait() {
-                    if status.code() == Some(proto::MISMATCH_EXIT) {
-                        hs_mismatch.store(true, Ordering::Relaxed);
-                    }
+                if hs_child.lock().unwrap().exit_code() == Some(proto::MISMATCH_EXIT) {
+                    hs_mismatch.store(true, Ordering::Relaxed);
                 }
             }
             match msg.trim() {
@@ -764,7 +806,7 @@ fn attach_with(
             // so `done` flips and `Bridges::reconcile` retries.
             let dead_child = Arc::clone(&hs_child);
             mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
-                let _ = dead_child.lock().unwrap().kill();
+                dead_child.lock().unwrap().kill();
             });
             mux.serve(stdout, move |_, channel| open_stream(channel, agent.as_ref(), notify.as_ref()));
         }

@@ -22,6 +22,9 @@
 //!   lent instance, through its helper's `session.attach`.
 //! - `pty_client`: the hub's end of one: a tty `exec` on an offered
 //!   machine, on this process's terminal.
+//! - `tunnel`: the worker's end of a `TUNNEL` stream: one port forward's
+//!   bridge into a lent instance (the hub's end is
+//!   `commands::tunnel::remote_opener`).
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a worker
@@ -45,6 +48,7 @@ pub mod placed;
 pub mod pty;
 pub mod pty_client;
 pub mod transfer;
+pub mod tunnel;
 pub mod update;
 pub mod worker;
 

@@ -212,8 +212,9 @@ and goes to that machine, but for the ones served here:
   answer adds nothing, and an empty result names the unreachable ones.
 - **Served here** (`forward::HERE`: `forwards.add`): `machine` names where
   the forward reaches, not where it runs. The daemon keeps the param and
-  answers itself, binding the forward on this host with one ssh per bridge
-  ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
+  answers itself, binding the forward on this host with one ssh per bridge,
+  or on an offered fleet worker one `TUNNEL` stream per bridge over its
+  fleet link ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
 
 - **`machines.hold {name, agent?}`** (`machines::api::hold`, answered in
   `daemon.rs` `hold_machine`) is per connection: the `Want` is kept in the
@@ -329,7 +330,9 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   machine's `Entry`, the match's root or else the machine's first, the
   instance as the machine names it) and `commands::port::port_remote`
   forwards over one ssh per port (`ssh::tunnel_argv` without `BatchMode`,
-  `tunnel::remote_opener`; [forwards](forwards.md)). `vscode` on a
+  `tunnel::remote_opener`; [forwards](forwards.md)), or on an offered
+  fleet worker one `TUNNEL` stream per bridge over its fleet link
+  ([fleet](fleet.md#tunnel)). `vscode` on a
   machine's instance is refused.
 - **`--machine m`** is for nameless commands (`machine_use`): `ps`,
   `stats` run once over ssh; root-bound ones (`ls`, `status`, `gc`,
@@ -395,8 +398,8 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   quick call with `machine` (the lines printed, or `no sessions in
   \`m/x\`` on stderr); a tty `--attach [ID]` is one dial attaching only
   (no id: `exec::choose_detached` over that list), no loop, as over ssh
-  (`offered_session_exec`). Any other command there, and an `exec`
-  without a tty, takes the ssh path and its refusal
+  (`offered_session_exec`). Any other command there but `port` (above),
+  and an `exec` without a tty, takes the ssh path and its refusal
   (`offered_refusal`).
 
 ## `devsandbox machine add|ls|set|rm`
@@ -460,7 +463,7 @@ listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while a machine is registered, shows every registered machine from
 the snapshot's `machines` with its target (dimmed `offered` for an offered
-fleet worker, whose service tabs and forwards say why they can't open),
+fleet worker, whose service tabs say why they can't open),
 link state (and error), `agent`, and its LEND and CAPACITY
 ([capacity](fleet.md#capacity));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a

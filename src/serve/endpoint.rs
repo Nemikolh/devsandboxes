@@ -109,6 +109,15 @@ pub fn fleet_pty_socket(dir: &Path, worker: &str) -> PathBuf {
     fleet_channel_socket(dir, worker, "pty")
 }
 
+/// An offered fleet worker's port forward socket in `dir`
+/// (docs/architecture/daemon/fleet.md, *TUNNEL*): `fleet-<worker>.tunnel.sock`,
+/// bound by its `fleet-link` next to [`fleet_socket`]; each connection there
+/// is one `TUNNEL` stream to the worker, one forward's bridge
+/// (`commands::tunnel::remote_opener` dials it).
+pub fn fleet_tunnel_socket(dir: &Path, worker: &str) -> PathBuf {
+    fleet_channel_socket(dir, worker, "tunnel")
+}
+
 /// An offered fleet worker's socket in `dir` for one more channel its
 /// `fleet-link` opens toward it: `fleet-<worker>.<suffix>.sock`, next to
 /// [`fleet_socket`]; each connection there is one stream on that channel
@@ -355,6 +364,7 @@ mod tests {
         assert_eq!(fleet_socket(dir, "lap.top"), dir.join("fleet-lap.top.sock"));
         assert_eq!(fleet_transfer_socket(dir, "lap.top"), dir.join("fleet-lap.top.transfer.sock"));
         assert_eq!(fleet_pty_socket(dir, "lap.top"), dir.join("fleet-lap.top.pty.sock"));
+        assert_eq!(fleet_tunnel_socket(dir, "lap.top"), dir.join("fleet-lap.top.tunnel.sock"));
         let long = fleet_socket(dir, &"w".repeat(80));
         assert_eq!(long.file_name().unwrap().len(), "fleet-".len() + AGENT_CLIENT_MAX + ".sock".len());
     }

@@ -1,9 +1,12 @@
 //! Remote bridges (docs/architecture/daemon/forwards.md, *Remote bridges*):
 //! the hidden `devsandbox tunnel` a machine runs at the far end of a forward's
 //! ssh, the one-line header it answers with, and [`remote_opener`], the
-//! forward engine's opener that spawns that ssh here.
+//! forward engine's opener that spawns that ssh here, or for an offered
+//! fleet worker opens a `TUNNEL` stream through its link's socket
+//! ([`Via::Fleet`]: the [`Request`] line first; the worker's end is
+//! `serve::fleet::tunnel`).
 //!
-//! The far side resolves the route on its own host (`port::resolver`: its
+//! The far side resolves the route on its own host ([`resolve`]: its
 //! config, state, runtime), writes a [`Header`], then becomes the
 //! in-container `devsbd bridge` (`bridge::bridge_command`, `exec`'d), so the
 //! ssh's stdio carries the usual bridge handshake and mux right after the
@@ -13,7 +16,8 @@
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -22,10 +26,10 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::port::{self, LoadState};
 use crate::devsbd::bridge::{self, Bridge};
 use crate::devsbd::forward::{Opened, Opener, ProcessLookup, Route};
 use crate::serve::machines::ssh::{self, SkipError, Tail};
-use crate::state::State;
 
 /// What starts the header line; anything before it (a chatty login shell, a
 /// motd) is skipped.
@@ -74,6 +78,14 @@ pub enum Header {
 }
 
 impl Header {
+    /// The header of a [`resolve`]: the route, or why there is none.
+    pub fn of(route: &Result<Route, String>) -> Header {
+        match route {
+            Ok(route) => Header::of_route(route),
+            Err(error) => Header::Error { error: error.clone() },
+        }
+    }
+
     /// The header of a route resolved on this host.
     fn of_route(route: &Route) -> Header {
         Header::Route {
@@ -143,31 +155,70 @@ fn parse_line(line: &[u8]) -> Result<Option<Header>, HeaderError> {
     serde_json::from_str(json).map(Some).map_err(|e| HeaderError::Bad(format!("bad tunnel header: {e}")))
 }
 
-/// `devsandbox tunnel`: resolve the route to `port` of `instance` (a name, as
-/// `resolve_instance` takes it) and/or `service` in the config at `dir`,
-/// write its [`Header`], then become the in-container `devsbd bridge`. Its
-/// stdout is the header and then the bridge's bytes, nothing else. An
-/// unresolvable route is an [`Header::Error`] and a failure (stderr, exit 1).
+/// What a hub asks of a fleet worker's `TUNNEL` stream, its first line
+/// (`{"root", "instance"?, "service"?, "port"}`, JSON, then `\n`): the
+/// arguments `devsandbox tunnel` takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    /// The config root there (absolute).
+    pub root: PathBuf,
+    /// An instance, as `resolve_instance` takes a name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    pub port: u16,
+}
+
+impl Request {
+    /// The request as its line, newline included.
+    pub fn line(&self) -> String {
+        let json = serde_json::to_string(self).expect("a request serializes");
+        format!("{json}\n")
+    }
+
+    /// One line (its `\n` or `\r\n` optional) back as a request.
+    pub fn parse(line: &[u8]) -> Result<Request, String> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        serde_json::from_slice(line).map_err(|e| format!("bad tunnel request: {e}"))
+    }
+}
+
+/// The route to `port` of `instance` (a name, as `resolve_instance` takes
+/// it, among the instances `load` gives) and/or `service` in the config at
+/// `dir`: what `devsandbox tunnel` and a fleet worker's `TUNNEL` stream
+/// write the [`Header`] of.
+pub fn resolve(
+    dir: PathBuf,
+    instance: Option<String>,
+    service: Option<String>,
+    port: u16,
+    load: LoadState,
+) -> Result<Route, String> {
+    if instance.is_none() && service.is_none() {
+        return Err("name an instance or a service".into());
+    }
+    let key = match &instance {
+        Some(name) => {
+            let state = load()?;
+            Some(super::resolve_instance_noninteractive(&state, name).map_err(|e| format!("{e:#}"))?)
+        }
+        None => None,
+    };
+    port::resolver_in(dir, key, service, port, load)()
+}
+
+/// `devsandbox tunnel`: [`resolve`] the route, write its [`Header`], then
+/// become the in-container `devsbd bridge`. Its stdout is the header and
+/// then the bridge's bytes, nothing else. An unresolvable route is an
+/// [`Header::Error`] and a failure (stderr, exit 1).
 pub fn tunnel(dir: PathBuf, instance: Option<String>, service: Option<String>, port: u16) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
-    let route = (|| -> Result<Route, String> {
-        if instance.is_none() && service.is_none() {
-            return Err("name an instance or a service".into());
-        }
-        let key = match &instance {
-            Some(name) => {
-                let state = State::load().map_err(|e| format!("{e:#}"))?;
-                Some(super::resolve_instance_noninteractive(&state, name).map_err(|e| format!("{e:#}"))?)
-            }
-            None => None,
-        };
-        super::port::resolver(dir, key, service, port)()
-    })();
-    let header = match &route {
-        Ok(route) => Header::of_route(route),
-        Err(error) => Header::Error { error: error.clone() },
-    };
+    let route = resolve(dir, instance, service, port, port::default_state());
+    let header = Header::of(&route);
     let mut out = io::stdout().lock();
     out.write_all(header.line().as_bytes()).and_then(|()| out.flush()).context("writing the tunnel header")?;
     drop(out);
@@ -180,19 +231,105 @@ pub fn tunnel(dir: PathBuf, instance: Option<String>, service: Option<String>, p
     }
 }
 
-/// Builds a remote forward's argv (an ssh running `devsandbox tunnel`, from
-/// `ssh::tunnel_argv`); called on every spawn.
-pub type TunnelArgv = Box<dyn Fn() -> Result<Vec<OsString>, String> + Send + Sync>;
+/// How one spawn of a remote forward's bridge reaches its machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Via {
+    /// Spawn this argv: an ssh running `devsandbox tunnel` (from
+    /// `ssh::tunnel_argv`).
+    Ssh(Vec<OsString>),
+    /// An offered fleet worker: connect to its link's tunnel socket
+    /// (`endpoint::fleet_tunnel_socket`), one `TUNNEL` stream, and send
+    /// `request`.
+    Fleet { socket: PathBuf, request: Request },
+}
 
-/// The opener of a forward into `machine`'s instance or service: spawn
-/// `argv()` (rebuilt per spawn, so a changed registry entry heals), read the
-/// [`Header`], then run the bridge over the rest of its stdio
-/// (`bridge::attach`). The route shows as `<machine>/<label>`; the far helper
-/// answers the listening-process lookup when the header says the port lives
-/// in its container, else it stays unknown (the engine's probe fallback is
-/// the caller's: `None` for remote).
-pub fn remote_opener(machine: String, argv: TunnelArgv) -> Opener {
-    Box::new(move |stop| open_remote(&machine, &argv()?, stop))
+/// Says a remote forward's [`Via`]; called on every spawn.
+pub type TunnelVia = Box<dyn Fn() -> Result<Via, String> + Send + Sync>;
+
+/// The opener of a forward into `machine`'s instance or service: `via()`
+/// (asked per spawn, so a changed registry entry heals), then spawn its ssh
+/// or open its `TUNNEL` stream, read the [`Header`], then run the bridge
+/// over the rest of its bytes (`bridge::attach`; a stream that ends is a
+/// bridge that's done, as a dead child is). The route shows as
+/// `<machine>/<label>`; the far helper answers the listening-process lookup
+/// when the header says the port lives in its container, else it stays
+/// unknown (the engine's probe fallback is the caller's: `None` for remote).
+pub fn remote_opener(machine: String, via: TunnelVia) -> Opener {
+    Box::new(move |stop| match via()? {
+        Via::Ssh(argv) => open_remote(&machine, &argv, stop),
+        Via::Fleet { socket, request } => open_fleet(&machine, &socket, &request, stop),
+    })
+}
+
+/// How a wait for the header ended.
+enum Waited<T> {
+    Got(T),
+    Stopped,
+    TimedOut,
+    ReaderDied,
+}
+
+/// Wait up to [`HEADER_WAIT`] for the header reader's answer on `rx`,
+/// checking `stop` every [`STOP_POLL`].
+fn wait_header<T>(rx: &mpsc::Receiver<T>, stop: &AtomicBool) -> Waited<T> {
+    let deadline = Instant::now() + HEADER_WAIT;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Waited::Stopped;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Waited::TimedOut;
+        }
+        match rx.recv_timeout(STOP_POLL.min(left)) {
+            Ok(got) => return Waited::Got(got),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Waited::ReaderDied,
+        }
+    }
+}
+
+/// [`Via::Fleet`]: connect to `socket`, send `request`'s line, read the
+/// worker's [`Header`], then attach the bridge to the stream itself.
+fn open_fleet(machine: &str, socket: &Path, request: &Request, stop: &AtomicBool) -> Result<(Opened, Bridge), String> {
+    let stream = UnixStream::connect(socket)
+        .map_err(|e| format!("machine `{machine}`: its fleet link isn't up ({}: {e})", socket.display()))?;
+    let clones = (stream.try_clone(), stream.try_clone());
+    let (Ok(mut reader), Ok(writer)) = clones else {
+        return Err("cannot clone the tunnel's socket".into());
+    };
+    (&stream)
+        .write_all(request.line().as_bytes())
+        .map_err(|e| format!("machine `{machine}`: cannot send the tunnel request: {e}"))?;
+    let (tx, rx) = mpsc::channel();
+    let started = std::thread::Builder::new().name("tunnel-header".into()).spawn(move || {
+        let header = read_header(&mut reader);
+        let _ = tx.send((header, reader));
+    });
+    if let Err(e) = started {
+        return Err(format!("cannot start the tunnel's reader: {e}"));
+    }
+    let give_up = |why: String| {
+        // Ends the reader's read.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        Err(why)
+    };
+    let (header, reader) = match wait_header(&rx, stop) {
+        Waited::Got(got) => got,
+        Waited::Stopped => return give_up("stopped".into()),
+        Waited::TimedOut => return give_up(format!("no answer from {machine}")),
+        Waited::ReaderDied => return give_up("the tunnel's reader died".into()),
+    };
+    match header {
+        Ok(Header::Route { label, host, port, hash, helper }) => {
+            let label = format!("{machine}/{label}");
+            let bridge = bridge::attach(stream, writer, reader, io::empty(), hash.as_deref().unwrap_or_default(), &label, Some(machine));
+            let lookup = if helper { ProcessLookup::Helper { container: String::new() } } else { ProcessLookup::None };
+            Ok((Opened { label, host, port, lookup }, bridge))
+        }
+        Ok(Header::Error { error }) => give_up(error),
+        Err(e) => give_up(format!("{machine}: {e}")),
+    }
 }
 
 fn open_remote(machine: &str, argv: &[OsString], stop: &AtomicBool) -> Result<(Opened, Bridge), String> {
@@ -235,24 +372,15 @@ fn open_remote(machine: &str, argv: &[OsString], stop: &AtomicBool) -> Result<(O
         reap(&mut child);
         return Err(format!("cannot start the tunnel's reader: {e}"));
     }
-    let deadline = Instant::now() + HEADER_WAIT;
-    let (header, stdout) = loop {
-        if stop.load(Ordering::Relaxed) {
+    let (header, stdout) = match wait_header(&rx, stop) {
+        Waited::Got(got) => got,
+        waited => {
             reap(&mut child);
-            return Err("stopped".into());
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            reap(&mut child);
-            return Err(no_header(machine, &tail.read(Duration::ZERO)));
-        }
-        match rx.recv_timeout(STOP_POLL.min(left)) {
-            Ok(got) => break got,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                reap(&mut child);
-                return Err("the tunnel's reader died".into());
-            }
+            return Err(match waited {
+                Waited::Stopped => "stopped".into(),
+                Waited::TimedOut => no_header(machine, &tail.read(Duration::ZERO)),
+                _ => "the tunnel's reader died".into(),
+            });
         }
     };
     match header {
@@ -392,9 +520,9 @@ mod tests {
 
     // ---- the remote opener against fake argvs ----
 
-    fn sh(script: &str) -> TunnelArgv {
+    fn sh(script: &str) -> TunnelVia {
         let script = script.to_string();
-        Box::new(move || Ok(["sh", "-c", &script].into_iter().map(OsString::from).collect()))
+        Box::new(move || Ok(Via::Ssh(["sh", "-c", &script].into_iter().map(OsString::from).collect())))
     }
 
     fn open(script: &str) -> Result<(Opened, Bridge), String> {
@@ -421,7 +549,7 @@ mod tests {
         assert_eq!(open("echo motd; exit 0").err().as_deref(), Some("no answer from box"));
         let bad = remote_opener("box".into(), Box::new(|| Err("no machine `box`".into())));
         assert_eq!(bad(&AtomicBool::new(false)).err().as_deref(), Some("no machine `box`"));
-        let gone = remote_opener("box".into(), Box::new(|| Ok(vec!["/nonexistent/ssh".into()])));
+        let gone = remote_opener("box".into(), Box::new(|| Ok(Via::Ssh(vec!["/nonexistent/ssh".into()]))));
         assert!(gone(&AtomicBool::new(false)).err().unwrap().starts_with("cannot run /nonexistent/ssh"));
     }
 
@@ -440,6 +568,103 @@ mod tests {
         assert!(got.is_err());
         assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
         setter.join().unwrap();
+    }
+
+    #[test]
+    fn requests_round_trip_and_refuse_what_isnt_one() {
+        let full = Request { root: "/f/cfg".into(), instance: Some("web".into()), service: Some("db".into()), port: 5432 };
+        let bare = Request { root: "/f/cfg".into(), instance: None, service: Some("db".into()), port: 5432 };
+        assert_eq!(bare.line(), "{\"root\":\"/f/cfg\",\"service\":\"db\",\"port\":5432}\n");
+        for r in [full, bare] {
+            assert_eq!(Request::parse(r.line().as_bytes()).unwrap(), r);
+            assert_eq!(Request::parse(r.line().replace('\n', "\r\n").as_bytes()).unwrap(), r);
+        }
+        for bad in [&b"{\"root\":\"/f\"}\n"[..], b"{\"root\":\"/f\",\"port\":70000}", b"{\"root\":\"/f\",\"port\":1,\"x\":1}", b"hi"] {
+            assert!(Request::parse(bad).unwrap_err().starts_with("bad tunnel request"), "{bad:?}");
+        }
+    }
+
+    // ---- the fleet opener against a fake worker on a socket ----
+
+    /// A socket in a fresh dir whose one connection `worker` takes, with
+    /// the request line it read.
+    fn fake_worker(
+        tag: &str,
+        worker: impl FnOnce(UnixStream, Request) + Send + 'static,
+    ) -> (PathBuf, std::thread::JoinHandle<()>) {
+        let dir = std::env::temp_dir().join(format!("dsv-tunnel-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("fleet-lap.tunnel.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let t = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while (&s).read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+                line.push(byte[0]);
+            }
+            worker(s, Request::parse(&line).unwrap());
+        });
+        (socket, t)
+    }
+
+    fn fleet(socket: &Path, request: &Request) -> TunnelVia {
+        let (socket, request) = (socket.to_path_buf(), request.clone());
+        Box::new(move || Ok(Via::Fleet { socket: socket.clone(), request: request.clone() }))
+    }
+
+    fn web_request() -> Request {
+        Request { root: "/worker/fleet/hub/cfg".into(), instance: Some("web".into()), service: None, port: 3000 }
+    }
+
+    /// The worker's route header, then its end of the bridge handshake; it
+    /// reads the host's first frame (its caps) and goes away: the bridge
+    /// came up, then is seen dead.
+    #[test]
+    fn a_fleet_tunnel_runs_the_bridge_on_its_stream_and_a_closed_stream_ends_it() {
+        use crate::devsbd::proto::{self, caps};
+        let (socket, worker) = fake_worker("route", |s, req| {
+            assert_eq!(req, web_request());
+            (&s).write_all(route_header().line().as_bytes()).unwrap();
+            let (mut r, mut w) = (&s, &s);
+            proto::handshake(&mut r, &mut w, "abc", caps::TCP_FORWARD).unwrap();
+            assert!(matches!(proto::read_frame(&mut r), Ok(Some(proto::Frame::Caps(_)))));
+        });
+        let (opened, bridge) = remote_opener("lap".into(), fleet(&socket, &web_request()))(&AtomicBool::new(false)).unwrap();
+        assert_eq!((opened.label.as_str(), opened.host.as_str(), opened.port), ("lap/web:3000", "127.0.0.1", 3000));
+        assert_eq!(opened.lookup, ProcessLookup::Helper { container: String::new() });
+        assert_eq!(bridge.outcome(Duration::from_secs(5)), Some(Ok(())));
+        assert_eq!(bridge.peer_caps(), Some(caps::TCP_FORWARD));
+        worker.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !bridge.is_done() {
+            assert!(Instant::now() < deadline, "the closed stream ends the bridge");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    #[test]
+    fn a_fleet_tunnels_refusals_are_the_error() {
+        let refusal = Header::Error { error: "no instance `web` in /worker/fleet/hub/cfg".into() };
+        let line = refusal.line();
+        let (socket, worker) = fake_worker("refused", move |s, _| (&s).write_all(line.as_bytes()).unwrap());
+        let got = remote_opener("lap".into(), fleet(&socket, &web_request()))(&AtomicBool::new(false));
+        assert_eq!(got.err().as_deref(), Some("no instance `web` in /worker/fleet/hub/cfg"));
+        worker.join().unwrap();
+
+        // The link refused the stream (or the worker went away): no header.
+        let (socket, worker) = fake_worker("closed", |_, _| {});
+        let got = remote_opener("lap".into(), fleet(&socket, &web_request()))(&AtomicBool::new(false));
+        assert_eq!(got.err().as_deref(), Some("lap: the tunnel ended before its header"));
+        worker.join().unwrap();
+
+        // No link: no socket.
+        std::fs::remove_file(&socket).unwrap();
+        let got = remote_opener("lap".into(), fleet(&socket, &web_request()))(&AtomicBool::new(false));
+        assert!(got.err().unwrap().starts_with("machine `lap`: its fleet link isn't up ("));
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 
     /// Docker-gated: a forward through the remote opener whose "ssh" is a

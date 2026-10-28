@@ -257,6 +257,17 @@ fn first_referencing(
     })
 }
 
+/// Whether an instance in `state` (only `key`, when given) has a sandbox
+/// declaring `service`: what a fleet worker's `TUNNEL` asks of a service
+/// forward before it resolves it (`serve::fleet::tunnel`).
+pub(crate) fn uses_service(config: &Config, state: &State, key: Option<&str>, service: &str) -> bool {
+    state
+        .instances
+        .iter()
+        .filter(|(k, _)| key.is_none_or(|key| key == k.as_str()))
+        .any(|(_, i)| references(config, &i.sandbox, service))
+}
+
 /// Whether `sandbox` (a config sandbox name) declares `service`. A sandbox from
 /// a foreign config root won't resolve, so this is also the config-root filter.
 fn references(config: &Config, sandbox: &str, service: &str) -> bool {
@@ -292,6 +303,30 @@ pub fn resolver(
     service: Option<String>,
     port: u16,
 ) -> Box<dyn Fn() -> Result<crate::devsbd::forward::Route, String> + Send + Sync> {
+    resolver_in(dir, instance_key, service, port, default_state())
+}
+
+/// How a [`resolver`] reads `state.toml` on each call: the instances it may
+/// route through. A fleet worker's `TUNNEL` passes only the instances its
+/// hub may reach (`serve::fleet::tunnel::scoped`).
+#[cfg(unix)]
+pub type LoadState = std::sync::Arc<dyn Fn() -> Result<State, String> + Send + Sync>;
+
+/// `State::load`, as a [`LoadState`].
+#[cfg(unix)]
+pub fn default_state() -> LoadState {
+    std::sync::Arc::new(|| State::load().map_err(|e| format!("{e:#}")))
+}
+
+/// [`resolver`] over the instances `load` gives.
+#[cfg(unix)]
+pub fn resolver_in(
+    dir: std::path::PathBuf,
+    instance_key: Option<String>,
+    service: Option<String>,
+    port: u16,
+    load: LoadState,
+) -> Box<dyn Fn() -> Result<crate::devsbd::forward::Route, String> + Send + Sync> {
     use std::sync::Mutex;
 
     // Arch of the injection target, cached across (re)spawns so the fallback
@@ -300,7 +335,7 @@ pub fn resolver(
 
     Box::new(move || {
         let config = Config::load(&dir).map_err(|e| format!("{e:#}"))?;
-        let state = State::load().map_err(|e| format!("{e:#}"))?;
+        let state = load()?;
         let project = services::project_id(&dir).map_err(|e| format!("{e:#}"))?;
         let running: BTreeSet<String> = state
             .instances
@@ -504,7 +539,8 @@ pub fn port(
 
 /// `devsandbox port` on a machine's instance or global service
 /// (docs/architecture/daemon/machines.md, *The CLI*): [`port`]'s flow, each
-/// forward's bridge an ssh running `devsandbox tunnel` on `entry`
+/// forward's bridge an ssh running `devsandbox tunnel` on `entry`, or for
+/// an offered fleet worker a `TUNNEL` stream through its link's socket
 /// (`tunnel::remote_opener`). `root` is the config root there, `name` the
 /// instance as that machine knows it (already resolved, and already split
 /// from the ports by the caller: `split_target` is not applied again). No
@@ -520,22 +556,33 @@ pub fn port_remote(
 ) -> Result<()> {
     use std::sync::Arc;
 
-    use crate::serve::machines::ssh;
+    use super::tunnel::{Request, Via};
+    use crate::serve::{endpoint, machines::ssh};
 
     let specs = parse_specs(name.is_some(), service.is_some(), &ports)?;
-    let target = Arc::new((entry, root, name, service));
+    let socket = match entry.is_offered() {
+        true => Some(endpoint::fleet_tunnel_socket(&endpoint::socket_dir()?, &entry.name)),
+        false => None,
+    };
+    let target = Arc::new((entry, root, name, service, socket));
     forward_until_interrupted(
         address,
         &specs,
         |container_port| {
             let target = Arc::clone(&target);
             let machine = target.0.name.clone();
-            // A person is at the terminal: no `BatchMode`.
             super::tunnel::remote_opener(
                 machine,
                 Box::new(move || {
-                    let (entry, root, name, service) = &*target;
+                    let (entry, root, name, service, socket) = &*target;
+                    if let Some(socket) = socket {
+                        let request =
+                            Request { root: root.clone(), instance: name.clone(), service: service.clone(), port: container_port };
+                        return Ok(Via::Fleet { socket: socket.clone(), request });
+                    }
+                    // A person is at the terminal: no `BatchMode`.
                     ssh::tunnel_argv(entry, false, root, name.as_deref(), service.as_deref(), container_port)
+                        .map(Via::Ssh)
                         .map_err(|e| format!("{e:#}"))
                 }),
             )

@@ -24,7 +24,10 @@
 //! And `endpoint::fleet_pty_socket` (`fleet-<name>.pty.sock`): each
 //! connection there is one `PTY` stream to the worker, a terminal into one
 //! of its instances (`fleet::pty_client`, what a tty `exec` on the offered
-//! machine dials).
+//! machine dials). And `endpoint::fleet_tunnel_socket`
+//! (`fleet-<name>.tunnel.sock`): each connection there is one `TUNNEL`
+//! stream, a port forward's bridge (`tunnel::remote_opener`, what the
+//! daemon's forwards and `devsandbox port` on the offered machine dial).
 //!
 //! When this is a dev build the worker isn't on, for the worker's platform
 //! (`update::hub_pushes`, over both `Hello`s), it pushes its own binary
@@ -80,8 +83,13 @@ pub fn run(
     }
     let mut held: Option<Conn> = None;
     let (api, socket) = (endpoint::fleet_socket(dir, worker), endpoint::fleet_transfer_socket(dir, worker));
-    let pty = endpoint::fleet_pty_socket(dir, worker);
-    let sockets = [(fleet::LINK.channel, api.as_path()), (channel::TRANSFER, socket.as_path()), (channel::PTY, pty.as_path())];
+    let (pty, tunnel) = (endpoint::fleet_pty_socket(dir, worker), endpoint::fleet_tunnel_socket(dir, worker));
+    let sockets = [
+        (fleet::LINK.channel, api.as_path()),
+        (channel::TRANSFER, socket.as_path()),
+        (channel::PTY, pty.as_path()),
+        (channel::TUNNEL, tunnel.as_path()),
+    ];
     let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|m| eprintln!("{m}"))));
     let push_to = socket.clone();
     let end = link::opener_with(&fleet::LINK, reader, writer, &sockets, serves, |peer| {
@@ -198,6 +206,7 @@ mod tests {
             let serves = link::Serves::default()
                 .with(fleet::LINK.channel, open)
                 .with(channel::PTY, fake_pty)
+                .with(channel::TUNNEL, fake_tunnel)
                 .transfers(Arc::new(Receivers::new(|_| {})));
             link::answerer_with(&fleet::LINK, r, w, &serves, None, |_| Ok(()), || {})
         })
@@ -213,6 +222,19 @@ mod tests {
             let hi = format!("hi {}", call.params.str("session").unwrap_or_default());
             let _ = rpc::write_record(&mut &ours, &Record::Stdout(hi.into_bytes()));
             let _ = rpc::write_record(&mut &ours, &Record::Exit(Exit::Code(4)));
+        });
+        Some(theirs.into())
+    }
+
+    /// A `TUNNEL` stream's worker end, faked: past the request, an error
+    /// header naming its instance and port.
+    fn fake_tunnel() -> Option<crate::devsbd::mux::Conn> {
+        use crate::commands::tunnel::Header;
+        let (mut ours, theirs) = UnixStream::pair().ok()?;
+        std::thread::spawn(move || {
+            let Ok(req) = fleet::tunnel::read_request(&mut ours) else { return };
+            let error = format!("no {} on {}", req.instance.unwrap_or_default(), req.port);
+            let _ = ours.write_all(Header::Error { error }.line().as_bytes());
         });
         Some(theirs.into())
     }
@@ -275,6 +297,7 @@ mod tests {
         assert!(endpoint::fleet_socket(&hub_dir, "lap").exists());
         assert!(endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
         assert!(endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
+        assert!(endpoint::fleet_tunnel_socket(&hub_dir, "lap").exists());
 
         // A terminal: one `PTY` stream through the link's pty socket.
         use crate::serve::fleet::pty_client;
@@ -285,6 +308,14 @@ mod tests {
         let term = pty_client::Terminal { input: std::os::fd::AsRawFd::as_raw_fd(&input), output: &mut out, size: &|| None };
         let end = pty_client::attach(stream, &pty_client::header(&request), term);
         assert_eq!((end, out), (pty_client::End::Exit(crate::devsbd::rpc::Exit::Code(4)), b"hi 1700000000-ab12".to_vec()));
+
+        // A forward's bridge: one `TUNNEL` stream through the tunnel socket.
+        use crate::commands::tunnel::{self, Request, Via};
+        let socket = endpoint::fleet_tunnel_socket(&hub_dir, "lap");
+        let request = Request { root: WORKER_ROOT.into(), instance: Some("web-w".into()), service: None, port: 3000 };
+        let via = Via::Fleet { socket, request };
+        let open = tunnel::remote_opener("lap".into(), Box::new(move || Ok(via.clone())));
+        assert_eq!(open(&std::sync::atomic::AtomicBool::new(false)).err().as_deref(), Some("no web-w on 3000"));
 
         let mut c = conn_at(&hub_dir);
         // A quick call: the worker's answer, over the link.
@@ -324,6 +355,7 @@ mod tests {
         assert!(!endpoint::fleet_socket(&hub_dir, "lap").exists());
         assert!(!endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
         assert!(!endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
+        assert!(!endpoint::fleet_tunnel_socket(&hub_dir, "lap").exists());
         assert!(matches!(worker_end.join().unwrap(), link::End::Closed));
         assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
         let [worker, hub] = daemons;

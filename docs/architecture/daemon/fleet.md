@@ -34,7 +34,8 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/serve/fleet/offer.rs` (`call`, `Ctx`, `accept`,
 `dial`), `src/commands/fleet_link.rs` (`fleet_link`, `run`),
 `src/serve/endpoint.rs` (`fleet_socket`, `fleet_transfer_socket`,
-`fleet_pty_socket`, `fleet_channel_socket`, `accept_any`),
+`fleet_pty_socket`, `fleet_tunnel_socket`, `fleet_channel_socket`,
+`accept_any`),
 `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`, `exit_of`,
 `Terminal`, `attach`, `dial`), `src/serve/machines/cli.rs` (`Dials`,
 `dials`, `run_dials`, `offered_session_exec`), `src/daemon_config.rs`
@@ -50,10 +51,15 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/commands/lend.rs` (`show`, `set_state`, `join`, `leave`, `busy`),
 `src/serve/fleet/lent.rs` (`Scope`, `decide`, `admit`, `confine_path`,
 `filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
-(`start_lending`, `Table`, `Shared::open_lent`, `Shared::open_lent_pty`),
+(`start_lending`, `Table`, `Shared::open_lent`, `Shared::open_lent_pty`,
+`Shared::open_lent_tunnel`),
 `src/serve/fleet/worker.rs` (`Open`, `Opens`), `src/serve/fleet/pty.rs`
 (`METHOD`, `code`, `Header`, `parse_header`, `gate`, `offered`,
-`attach_params`, `serve`), `src/commands/exec.rs` (`ExecContext`,
+`attach_params`, `serve`), `src/serve/fleet/tunnel.rs` (`read_request`,
+`scoped`, `confine`, `check_service`, `serve`), `src/commands/tunnel.rs`
+(`Request`, `resolve`, `Header::of`, `Via`, `remote_opener`),
+`src/commands/port.rs` (`resolver_in`, `LoadState`, `uses_service`),
+`src/devsbd/bridge.rs` (`Transport`, `attach`), `src/commands/exec.rs` (`ExecContext`,
 `exec_context`), `src/serve/helper.rs` (`HelperClient::call_with_input`,
 `Input`), `src/serve/api.rs` (`sessions_list`, `sessions_rm`,
 `session_container`, `helper_rpc`, `SessionsList`), `src/worker_policy.rs`
@@ -162,8 +168,9 @@ The agent relay uses the one-channel cases (`link::opener`,
 `endpoint::fleet_socket` for `API` and `endpoint::fleet_transfer_socket`
 for `TRANSFER` (a further channel's socket is
 `endpoint::fleet_channel_socket`, `fleet-<name>.<suffix>.sock`) and
-serves `TRANSFER`; the worker's answerer serves `API`, `TRANSFER` and
-`PTY` ([PTY](#pty)). No end serves `TUNNEL` or `AGENT` yet. Each
+serves `TRANSFER`; the worker's answerer serves `API`, `TRANSFER`,
+`PTY` ([PTY](#pty)) and `TUNNEL` ([TUNNEL](#tunnel)). No end serves
+`AGENT` yet. Each
 connection to the API
 socket is one connection to whatever daemon socket the answerer's `API`
 handler connects, so a
@@ -352,9 +359,10 @@ link's `API` streams.
   holder of the hub's daemon. `serve::machines::cli::machine_use` refuses
   `--machine` for it. Next to its socket it binds
   `endpoint::fleet_transfer_socket` (`fleet-<name>.transfer.sock`,
-  `TRANSFER` streams) and `endpoint::fleet_pty_socket`
-  (`fleet-<name>.pty.sock`, `PTY` streams: [PTY](#pty)), unlinked with
-  it.
+  `TRANSFER` streams), `endpoint::fleet_pty_socket`
+  (`fleet-<name>.pty.sock`, `PTY` streams: [PTY](#pty)) and
+  `endpoint::fleet_tunnel_socket` (`fleet-<name>.tunnel.sock`, `TUNNEL`
+  streams: [TUNNEL](#tunnel)), unlinked with it.
 - **`fleet.offer`** (`fleet::offer::call`, internal: not in the npm
   typings) is accepted only by a hub: `[serve] hub = true` in
   `daemon.config.toml` (`ServeConfig::hub`, read once at start into
@@ -386,14 +394,18 @@ link's `API` streams.
   (and its `--attach`, `--sessions`) and the dashboard's instance tabs,
   which run that `exec` locally, are `PTY` streams from the hub
   ([PTY](#pty), *The hub's end*).
+- **Port forwards** go over the link: the daemon's forwards into an
+  offered machine (`forwards.add` with `machine`) and a `devsandbox port`
+  on one are `TUNNEL` streams from the hub ([TUNNEL](#tunnel), *The hub's
+  end*).
 - **What needs ssh** to the machine is refused for an offered one: every
   `machines::ssh` argv goes through `argv_with`, which takes
   `Entry::ssh_target`, an error for an offered entry
   (`machines::offered_refusal`). So the CLI's other re-runs (`logs`,
   `inspect`, `done`, …, an `exec` without a tty, `--machine` per-root
   commands), the dashboard's service tabs (`tui::remote::service_argv`:
-  service terminals aren't supported over the fleet link), remote
-  forwards and the agent relay all fail; `machines.set` refuses `agent`
+  service terminals aren't supported over the fleet link) and the agent
+  relay all fail; `machines.set` refuses `agent`
   on for one (`invalid`). The dashboard's logs and inspect views go
   through the `containers.*` quick calls and work.
 
@@ -982,6 +994,58 @@ signal; 255 as 254 under `--reserve-255`); `no-session` 250, `detached`
 255; the other refusals (`bad-request`, `denied`, `not-found`,
 `not-running`, `unsupported`, `failed`) `pty_client::REFUSED_EXIT` (1)
 with `error: <message> (<code>)`, which no loop retries.
+
+### TUNNEL
+
+A port forward's bridge into a lent instance over the link: each
+`TUNNEL` stream the hub opens is what an ssh machine's `devsandbox
+tunnel` is at the far end of a forward's ssh
+([forwards](forwards.md#remote-bridges)), served by
+`fleet::tunnel::serve` on a thread of its own
+(`Shared::open_lent_tunnel`).
+
+- **The request** is the hub's first line (within 30 s, at most 64 KiB,
+  read byte by byte: `tunnel::read_request`), `tunnel::Request` as JSON:
+  `{"root": <abs config root>, "instance"?: <name>, "service"?: <name>,
+  "port": <n>}`, the arguments `devsandbox tunnel` takes and with its
+  rules: an instance, a service or both; the instance as
+  `resolve_instance` takes a name (exact name or id, then sandbox or
+  folder basename; ambiguous refuses).
+- **The gate**: `root` confined as an `API` request's is
+  (`tunnel::confine`, `lent::confine_path`: under the fleet root, and it
+  must exist). The route is resolved over `tunnel::scoped` state only:
+  the lent instances whose config root is under `root`, so neither the
+  instance name nor a service's via-instance pick (`port::plan`) can land
+  on any other instance. A service must be one such an instance uses, the
+  named one when there is one (`tunnel::check_service`,
+  `port::uses_service`), so the injection fallback only reaches a service
+  container of that root's project (a `global` one too, which the
+  [worker policy](#worker-policy) denies unless allowed); `denied`
+  refusals are logged.
+- **The answer** is the route resolved as `devsandbox tunnel` resolves it
+  (`commands::tunnel::resolve` over `port::resolver_in`, the state
+  loader injected), written as one `commands::tunnel::Header` line
+  (`Header::of`): the route, or `{"error"}` for any refusal, after which
+  the stream closes. After a route the worker runs `bridge::bridge_command`
+  into its container with the stream itself as stdin and stdout (its
+  fds, `Stdio::from`), its stderr line by line in the daemon's log, so
+  the bridge's handshake and mux follow the header as over ssh. The
+  bridge is killed and reaped once the hub closes the stream (watched
+  with `daemon::hung_up`), or the stream closes when the bridge exits.
+
+**The hub's end** is the forward engine's opener
+(`commands::tunnel::remote_opener` with `tunnel::Via::Fleet`), in the
+hub's daemon (`forwards::via`, chosen per spawn from the machine's
+registry entry) or a foreground `devsandbox port` (`port::port_remote`).
+Each open connects to the worker's `fleet-<name>.tunnel.sock` in the
+socket dir (absent: `its fleet link isn't up (…)`), writes the request,
+reads the header (`read_header`, up to 10 s, `stop` checked meanwhile)
+and attaches the bridge to the stream (`bridge::attach` over a
+`bridge::Transport::Stream`: killing it shuts the stream down, and a
+stream that ends is a bridge that's done, as a dead child is), so the
+engine's self-healing re-opens a new stream as it respawns an ssh. Each
+TCP connection is then a `Connect` on that bridge's mux, inside the
+`TUNNEL` stream.
 
 ### Worker policy
 
