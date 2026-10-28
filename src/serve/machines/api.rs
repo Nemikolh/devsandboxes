@@ -1,5 +1,5 @@
 //! The `machines.*` methods (docs/architecture/daemon/machines.md,
-//! *`devsandbox machine add|ls|set|rm`*): `probe`, `add`, `list`, `get`,
+//! *`devsandbox machine add|ls|set|rm|trust|roots`*): `probe`, `add`, `list`, `get`,
 //! `set`, `rm`.
 //! Connection-free like `serve::api`: a function of the method, its params
 //! and a [`Ctx`] (the registry path and the [`Dial`]), so tests run them

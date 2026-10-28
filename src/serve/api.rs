@@ -817,7 +817,7 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
 }
 
 /// This host's candidate config roots (docs/architecture/daemon/machines.md,
-/// *`devsandbox machine add|ls|set|rm`*; what `machine add` offers):
+/// *`devsandbox machine add|ls|set|rm|trust|roots`*; what `machine add` offers):
 /// `fleet::lent::own_roots` (every distinct `config_dir` in `state` plus
 /// `~/.devsandboxes` when `home` has one, canonicalized), sorted. Known
 /// roots only, no disk scan. A root that no longer exists or whose config

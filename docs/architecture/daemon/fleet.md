@@ -712,7 +712,10 @@ What the worker is as a fleet member (its name, trust and the rest) is
   `worker`: [Trust](#trust)), `dev-builds` (take the hub's own binary
   when it runs a dev build, [Versions](#versions); absent is `false`, left
   out of the file while `false`), `roots` (config roots this host shows
-  the fleet besides those its `state.toml` has instances in, absolute),
+  the fleet besides those its `state.toml` has instances in, absolute;
+  `devsandbox machine roots add|rm` on this host sets them, and
+  `machine add` run elsewhere records the roots it picks here that way:
+  [machines.md](machines.md#devsandbox-machine-addlssetrmtrustroots)),
   an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
   and a `[caps]` table, the soft caps of the
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
@@ -973,7 +976,10 @@ a `lent::Reach` from this host's files (`Reach::load` over
 - **Own roots** (`Reach::own`): `lent::own_roots` (every `config_dir` in
   `state.toml` plus `~/.devsandboxes`, what `roots.list` answers) and
   `member.toml`'s `roots`, canonicalized where they exist (decision 17 of
-  the [plan](../../plans/active/fleet.md#decisions)). Placed instances'
+  the [plan](../../plans/active/fleet.md#decisions)); those are written
+  by `devsandbox machine roots add` (`commands::machine::roots`), which
+  `machine add` runs here over ssh for every root it picks
+  (`commands::machine::record_roots`). Placed instances'
   config roots are in `state.toml` too.
 - **The fleet root**, the `Peer`'s.
 

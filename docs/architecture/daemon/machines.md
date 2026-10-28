@@ -37,7 +37,7 @@ machine's one root is the fleet root its offer names), an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
-[`machine add`](#devsandbox-machine-addlssetrm)) through `machines.add`'s
+[`machine add`](#devsandbox-machine-addlssetrmtrustroots)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
 dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
@@ -103,7 +103,7 @@ pointed at this host's agent relay socket there while it's up
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
 copies this binary there, for `machine add`
-([`devsandbox machine add|ls|set|rm`](#devsandbox-machine-addlssetrm)). The
+([`devsandbox machine add|ls|set|rm|trust|roots`](#devsandbox-machine-addlssetrmtrustroots)). The
 CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
@@ -472,9 +472,10 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   terminal), and `gc` (host maintenance on the worker, outside a
   worker's trust).
 
-## `devsandbox machine add|ls|set|rm`
+## `devsandbox machine add|ls|set|rm|trust|roots`
 
-A client of `machines.*` only, never in-process (`src/commands/machine.rs`).
+A client of `machines.*` (and, for `trust` and `roots`, `member.*`) only,
+never in-process (`src/commands/machine.rs`).
 
 `add` first checks the machine's devsandbox (`ensure_devsandbox`, over
 [Install](#install)): `install::check` through the login `PATH`, then
@@ -502,7 +503,19 @@ login `PATH` resolves, an error naming what it resolves to. That
 `~/.devsandboxes`) and lets the user multi-select on a TTY; off a TTY it
 takes the one usable candidate, else errors listing them. `machines.add`
 then checks every given root on the machine (`roots.list {paths}`: `~`
-expanded with the remote home, canonicalized, config loaded). `add
+expanded with the remote home, canonicalized, config loaded). Between
+the two, `add` records every chosen root, probed or typed, as the
+machine's own (`record_roots`): `devsandbox machine roots add -- <roots…>`
+run there over a one-off ssh with the machine's `command`
+(`record_roots_argv`: `ssh::cli_argv` with `-T`, no `BatchMode`, each
+root quoted so its `~` reaches the remote command unexpanded), stdout
+dropped, stderr passed through. A probed root is recorded too: it may be
+an own root only through an instance, and stops being one when that
+instance goes. A failure (ssh, a non-zero exit, a devsandbox there without
+the command) is a `warning:` line (`roots_warning`) naming the target and
+the `machine roots add` to run there, since under the machine's `worker`
+trust the hub may be refused those roots
+([fleet.md](fleet.md#the-trust-table)); the add goes on. `add
 --agent` saves the machine with `agent` on; adding a name that exists is
 refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
 required) changes it on a registered machine and prints `<name>: agent
@@ -514,7 +527,18 @@ parentheses. `rm` forgets the machine.
 
 `trust [worker|full]` is about this host, not a registered machine: a
 client of `member.*` (this host's `member.toml`;
-[fleet.md](fleet.md#trust)).
+[fleet.md](fleet.md#trust)). So is `roots [add|rm] [<path>…]`
+(`commands::machine::roots`), this host's picked roots (`member.toml`'s
+`roots`): without a subcommand `member.get`, printing them one per line
+(or a note when there are none); `add` resolves each path here
+(`resolve_root`: a leading `~` / `~/` is `$HOME`, a relative path is
+against the current directory), canonicalizes it and requires a directory
+(`existing_dir`), then `member.set {roots_add}`; `rm` resolves the same
+way without requiring it to exist and sends both the canonical form (when
+it exists) and the literal one as `member.set {roots_rm}`, so a removed
+directory can be dropped. Both print the roots after the change.
+`--machine` and qualified names refuse `machine` as a whole
+(`serve::machines::cli::machine_use`).
 
 ## Dashboard
 

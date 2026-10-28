@@ -522,6 +522,35 @@ enum MachineCommand {
         #[arg(value_name = "worker|full", value_parser = commands::machine::parse_trust)]
         trust: Option<serve::fleet::member::Trust>,
     },
+    /// Show or change the config roots this host shows the fleet besides
+    /// those it has instances in (its picked roots)
+    ///
+    /// Under `worker` trust, other machines reach only this host's own
+    /// roots: those its instances are in, plus these. `machine add` records
+    /// the roots it picks on the machine this way. Without a subcommand,
+    /// lists the picked roots.
+    ///
+    ///     devsandbox machine roots add ~/sandboxes
+    Roots {
+        #[command(subcommand)]
+        cmd: Option<RootsCommand>,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum RootsCommand {
+    /// Pick roots: existing directories (`~` is this host's home, relative
+    /// paths are against the current directory)
+    Add {
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Drop picked roots (a directory that no longer exists too)
+    Rm {
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
 }
 
 #[cfg(unix)]
@@ -876,6 +905,11 @@ fn main() -> Result<()> {
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
             MachineCommand::Trust { trust } => commands::machine::trust(trust),
+            MachineCommand::Roots { cmd } => commands::machine::roots(match cmd {
+                None => commands::machine::RootsOp::Show,
+                Some(RootsCommand::Add { paths }) => commands::machine::RootsOp::Add(paths),
+                Some(RootsCommand::Rm { paths }) => commands::machine::RootsOp::Rm(paths),
+            }),
         },
         #[cfg(unix)]
         Command::Lend { cmd } => {

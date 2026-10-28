@@ -323,6 +323,12 @@ limitation means editing this file in the same commit.
   ssh machine's `api --stdio` connection is still a local client's, the
   whole API, whatever the machine's `trust` (fleet step 6).
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `serve::relay`
+- A machine added before `machine add` recorded its roots there has none
+  in its `member.toml`, so once the trust table covers ssh connections its
+  `worker` trust refuses those of its roots no instance keeps in its
+  `state.toml`. Fix: `devsandbox machine roots add <root>…` on the
+  machine, or `machine rm` + `machine add` it again.
+  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetrmtrustroots); `commands::machine::record_roots`
 - A hub's verb on a worker runs with the worker daemon's own process env
   (a systemd unit's or LaunchAgent's, not a login shell's as over ssh's
   `relay::SessionEnv`), so `PATH` additions from shell profiles are

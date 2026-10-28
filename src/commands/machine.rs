@@ -1,19 +1,26 @@
-//! `devsandbox machine add|ls|set|rm` (docs/architecture/daemon/machines.md,
-//! *`devsandbox machine add|ls|set|rm`*): a client of the daemon's `machines.*`,
+//! `devsandbox machine add|ls|set|rm|trust|roots`
+//! (docs/architecture/daemon/machines.md, *`devsandbox machine
+//! add|ls|set|rm|trust|roots`*): a client of the daemon's `machines.*`,
 //! never in-process, since the registry and the links are the daemon's.
-//! `machine trust` is likewise a client of `member.*` (this host's
-//! `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
+//! `machine trust` and `machine roots` are likewise clients of `member.*`
+//! (this host's `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
 //!
 //! `add` without `--config` probes the machine for its candidate roots and
 //! lets the user pick (a TTY) or takes the only usable one (no TTY). The
-//! picked or typed roots go to `machines.add`, which checks them on the
-//! machine itself.
+//! picked or typed roots are first recorded on the machine as its own
+//! (`devsandbox machine roots add` there over ssh, so its `worker` trust
+//! lets this host reach them even once no instance keeps them in its
+//! `state.toml`; a failure is a warning), then go to `machines.add`, which
+//! checks them on the machine itself.
 //!
 //! Before probing, `add` checks the machine's devsandbox (`install`) and,
 //! when it's missing or another version, copies this binary there: asked on
 //! a TTY, without asking under `--auto-install`, refused otherwise.
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -28,6 +35,7 @@ use crate::serve::fleet::member::{MemberInfo, Trust};
 use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
+use crate::serve::machines::ssh;
 
 const HEADERS: [&str; 8] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "LEND", "CAPACITY"];
 
@@ -44,6 +52,9 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, au
     } else {
         configs.to_vec()
     };
+    if let Err(e) = record_roots(target, command.as_deref(), &roots) {
+        eprintln!("warning: {}", roots_warning(target, &roots, &e));
+    }
     let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "agent": agent, "command": command }))?;
     let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
     println!("added {} ({target}): {}", added.name, roots.join(", "));
@@ -51,6 +62,46 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, au
         eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+/// Record `roots` as `target`'s own (its `member.toml` `roots`, decision 17
+/// of the fleet plan): `devsandbox machine roots add` there over a one-off
+/// ssh, its stderr (ssh's prompts and errors, the command's) passed through.
+fn record_roots(target: &str, command: Option<&str>, roots: &[String]) -> Result<()> {
+    let argv = record_roots_argv(target, command, roots)?;
+    let (program, args) = argv.split_first().context("empty argv")?;
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
+    if !status.success() {
+        bail!("{} exited with {status}", program.to_string_lossy());
+    }
+    Ok(())
+}
+
+/// `ssh -T … <target> <command> machine roots add -- <roots…>`: `-T` and no
+/// `BatchMode`, a person is there. Each root goes quoted, so a `~` reaches
+/// `machine roots add` unexpanded and is resolved there ([`resolve_root`]).
+fn record_roots_argv(target: &str, command: Option<&str>, roots: &[String]) -> Result<Vec<OsString>> {
+    let mut entry = Entry::ssh(target, target);
+    entry.command = command.map(String::from);
+    let mut args = vec!["machine", "roots", "add", "--"];
+    args.extend(roots.iter().map(String::as_str));
+    ssh::cli_argv(&entry, false, &args)
+}
+
+/// The warning when [`record_roots`] fails: not a failed add, but under the
+/// machine's `worker` trust the roots it has no instance in may be refused.
+fn roots_warning(target: &str, roots: &[String], why: &anyhow::Error) -> String {
+    let quoted: Vec<String> = roots.iter().map(|r| ssh::quote(r)).collect();
+    format!(
+        "couldn't record the roots on {target} ({why:#}); under its `worker` trust the hub may be refused them until `devsandbox machine roots add {}` is run there",
+        quoted.join(" ")
+    )
 }
 
 /// [`install::DEFAULT_DEST`] as the registry's `command`: shell text, the
@@ -239,6 +290,86 @@ pub fn trust(to: Option<Trust>) -> Result<()> {
     };
     println!("{}", trust_line(info.trust));
     Ok(())
+}
+
+/// What `machine roots` does.
+pub enum RootsOp {
+    Show,
+    Add(Vec<String>),
+    Rm(Vec<String>),
+}
+
+/// `machine roots [add|rm] [<path>…]`: this host's picked roots
+/// (`member.toml`'s `roots`): shown (`member.get`), added or removed
+/// (`member.set {roots_add|roots_rm}`). The paths are resolved here, where
+/// they are: `machine add` runs `roots add` on the machine over ssh.
+pub fn roots(op: RootsOp) -> Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    let params = match op {
+        RootsOp::Show => None,
+        RootsOp::Add(paths) => {
+            let roots = paths.iter().map(|p| existing_dir(&resolve_root(home.as_deref(), &cwd, p)?)).collect::<Result<Vec<_>>>()?;
+            Some(json!({ "roots_add": roots }))
+        }
+        RootsOp::Rm(paths) => {
+            let mut roots = Vec::new();
+            for p in &paths {
+                let path = resolve_root(home.as_deref(), &cwd, p)?;
+                // The canonical form when it still exists, and the literal
+                // one, so a removed dir can be dropped too.
+                if let Ok(canonical) = path.canonicalize() {
+                    roots.push(canonical);
+                }
+                roots.push(path);
+            }
+            Some(json!({ "roots_rm": roots }))
+        }
+    };
+    let mut conn = connect()?;
+    let info: MemberInfo = match params {
+        Some(params) => call(&mut conn, "member.set", params)?,
+        None => call(&mut conn, "member.get", Value::Null)?,
+    };
+    print!("{}", roots_text(&info.roots));
+    Ok(())
+}
+
+fn roots_text(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        return "no picked roots (only those with instances); `devsandbox machine roots add <path>` adds one\n".into();
+    }
+    roots.iter().map(|r| format!("{}\n", r.display())).collect()
+}
+
+/// `arg` as an absolute path: a leading `~` or `~/` is `home`, a relative
+/// path is against `cwd`. Not canonicalized (the caller does, where the
+/// path must exist).
+fn resolve_root(home: Option<&Path>, cwd: &Path, arg: &str) -> Result<PathBuf> {
+    if arg.is_empty() {
+        bail!("empty path");
+    }
+    let rest = match arg.strip_prefix('~') {
+        Some("") => Some(""),
+        Some(rest) => rest.strip_prefix('/'),
+        None => None,
+    };
+    Ok(match rest {
+        Some(rest) => {
+            let home = home.with_context(|| format!("`{arg}`: no $HOME to expand `~` with"))?;
+            if rest.is_empty() { home.to_path_buf() } else { home.join(rest) }
+        }
+        None => cwd.join(arg),
+    })
+}
+
+/// `path` canonicalized, which must be an existing directory.
+fn existing_dir(path: &Path) -> Result<PathBuf> {
+    let canonical = path.canonicalize().with_context(|| format!("no directory {}", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    Ok(canonical)
 }
 
 fn trust_line(trust: Trust) -> String {
@@ -568,6 +699,62 @@ mod tests {
         }
         assert_eq!(trust_line(Trust::Worker), "trust: worker");
         assert!(trust_line(Trust::Full).contains("whole API"));
+    }
+
+    #[test]
+    fn roots_resolve_home_and_cwd() {
+        let home = Some(Path::new("/home/me"));
+        let cwd = Path::new("/work");
+        let r = |arg: &str| resolve_root(home, cwd, arg).unwrap();
+        assert_eq!(r("~"), PathBuf::from("/home/me"));
+        assert_eq!(r("~/"), PathBuf::from("/home/me"));
+        assert_eq!(r("~/cfg"), PathBuf::from("/home/me/cfg"));
+        assert_eq!(r("/srv/cfg"), PathBuf::from("/srv/cfg"));
+        assert_eq!(r("cfg/x"), PathBuf::from("/work/cfg/x"));
+        // `~user` and `a~` aren't expanded.
+        assert_eq!(r("~bob/cfg"), PathBuf::from("/work/~bob/cfg"));
+        assert_eq!(r("a~"), PathBuf::from("/work/a~"));
+        assert!(resolve_root(home, cwd, "").is_err());
+        let err = resolve_root(None, cwd, "~/cfg").unwrap_err().to_string();
+        assert!(err.contains("$HOME"), "{err}");
+        assert_eq!(resolve_root(None, cwd, "cfg").unwrap(), PathBuf::from("/work/cfg"));
+    }
+
+    #[test]
+    fn added_roots_must_be_directories() {
+        let dir = std::env::temp_dir().join(format!("dsv-roots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(existing_dir(&dir.join(".")).unwrap(), dir.canonicalize().unwrap());
+        let err = existing_dir(&file).unwrap_err().to_string();
+        assert_eq!(err, format!("{} is not a directory", file.display()));
+        let err = existing_dir(&dir.join("gone")).unwrap_err().to_string();
+        assert_eq!(err, format!("no directory {}", dir.join("gone").display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roots_print_one_per_line_or_a_note() {
+        assert_eq!(roots_text(&["/a".into(), "/b c".into()]), "/a\n/b c\n");
+        assert!(roots_text(&[]).contains("machine roots add"));
+    }
+
+    #[test]
+    fn add_records_the_roots_on_the_machine() {
+        let strs = |argv: &[OsString]| argv.iter().map(|a| a.to_str().unwrap().to_string()).collect::<Vec<_>>();
+        let roots = ["/srv/it's".to_string(), "~/cfg".to_string()];
+        let argv = record_roots_argv("ssh://me@box:2200", Some("~/.local/bin/devsandbox"), &roots).unwrap();
+        let remote = ssh::remote_command("~/.local/bin/devsandbox", &["machine", "roots", "add", "--", "/srv/it's", "~/cfg"]);
+        assert_eq!(strs(&argv), ["ssh", "-T", "-p", "2200", "--", "me@box", remote.as_str()]);
+        assert!(!strs(&argv).iter().any(|a| a == "BatchMode=yes" || a == "-A"), "a person is there, no agent");
+        let plain = record_roots_argv("box", None, &roots[..1]).unwrap();
+        assert_eq!(strs(&plain)[4], ssh::remote_command("devsandbox", &["machine", "roots", "add", "--", "/srv/it's"]));
+        assert!(record_roots_argv("-oProxyCommand=x", None, &roots).is_err());
+
+        let warning = roots_warning("box", &roots, &anyhow::anyhow!("ssh exited with exit status: 2"));
+        assert!(warning.starts_with("couldn't record the roots on box (ssh exited with exit status: 2)"), "{warning}");
+        assert!(warning.contains("`worker` trust") && warning.contains(r"`devsandbox machine roots add '/srv/it'\''s' '~/cfg'` is run there"), "{warning}");
     }
 
     #[test]
