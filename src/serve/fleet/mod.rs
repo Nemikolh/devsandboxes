@@ -25,6 +25,9 @@
 //! - `tunnel`: the worker's end of a `TUNNEL` stream: one port forward's
 //!   bridge into a lent instance (the hub's end is
 //!   `commands::tunnel::remote_opener`).
+//! - `agent`: `AGENT` on the link: the worker's agent socket, each
+//!   connection one stream to the hub, and the hub's gate on the worker
+//!   entry's `agent`.
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a worker
@@ -37,6 +40,7 @@
 //! - `placed`: the daemon's `run` verb placed: candidates, the decision,
 //!   the request forwarded to the worker.
 
+pub mod agent;
 pub mod code;
 pub mod lend;
 pub mod lender;

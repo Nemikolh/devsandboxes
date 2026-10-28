@@ -334,7 +334,9 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
     }
     let _holding = Holding::new(ctx.held);
     let want = ctx.links.want(machine);
-    if entry.agent && let Some(want) = &want {
+    // An offered machine has no relay to wait for: its fleet link carries
+    // the agent (`fleet::agent`).
+    if entry.agent && !entry.is_offered() && let Some(want) = &want {
         if !want.agent_ready(AGENT_WAIT) {
             (ctx.log)(&format!("{}: {method} on {machine}: its agent relay isn't up; going without", ctx.who));
         }

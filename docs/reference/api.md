@@ -12,7 +12,7 @@ method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
 `src/serve/verbs.rs` (verbs), `src/serve/helper.rs` (`helper.call`),
 `src/serve/forwards.rs` (`forwards.*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
-(`QUICK`, federation), `src/serve/fleet/offer.rs` (`fleet.offer`),
+(`QUICK`, federation), `src/serve/fleet/offer.rs` (`fleet.offer`, `fleet.agent`),
 `src/serve/fleet/lender.rs` (`lend.*`),
 `src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` + `index.d.ts` (Node client; `src/serve/dts.rs`
@@ -31,7 +31,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer` (internal), `lend.get\|set`, `capacity.get` | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer\|agent` (internal), `lend.get\|set`, `capacity.get` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -984,7 +984,7 @@ and `sandboxes: []`; the call itself fails only as `internal`, when
 | `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, empty `command`, a root the machine refuses: each one's reason), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
 | `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, by name; `kind` `ssh` \| `offered`, `target` `null` for an offered one; `version` from the last hello; `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
 | `machines.get` | `{"name"}` | `{"name", "kind", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an offered one has none) | `not-found`, `internal` (as `list`) |
-| `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`; `agent: true` on an offered machine), `internal` (`machines.toml` doesn't read or write) |
+| `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `internal` (`machines.toml` doesn't read or write) |
 | `machines.hold` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"ok": true, "agent"}`: the machine is wanted (link and, with `agent` on, agent relay up) until this connection closes; `agent` says whether the relay is up | `not-found`, `invalid` (`agent` not absolute) |
 
@@ -1024,6 +1024,20 @@ restarted) when it differs. Errors: `invalid` (a bad name, a missing
 param, a `root` that isn't absolute), `denied` (this daemon isn't a
 hub: `[serve] hub = true` in `daemon.config.toml`; or the name is an ssh
 machine's), `internal` (`machines.toml` doesn't read or write).
+
+### `fleet.agent`
+
+Internal (`devsandbox fleet-link`'s; not in the npm typings): the agent
+socket the link's `AGENT` streams connect
+([fleet.md](../architecture/daemon/fleet.md#agent)), asked every 2 s.
+Params: `{"worker": "<machine name>"}`. Result: `{"agent": "<path>"}`,
+this daemon's own agent (the agents clients reported first, then the
+machines' agent relay sockets, then its `SSH_AUTH_SOCK`, as a bridge
+picks one) while `worker` is an offered machine with `agent` on;
+`{"agent": null}` otherwise (no such machine, an ssh machine's name,
+`agent` off, no live agent here). Errors: `invalid` (a bad name, no
+`worker`), `internal` (`machines.toml` doesn't read). A fleet worker's
+connection (the Worker table) is `denied` it, as every `fleet.*`.
 
 ### `lend.*`
 

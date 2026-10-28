@@ -354,6 +354,7 @@ mod tests {
             ("machines.list", p.clone(), Err("denied")),
             ("machines.hold", json!({"name": "m"}), Err("denied")),
             ("fleet.offer", p.clone(), Err("denied")),
+            ("fleet.agent", json!({"worker": "w"}), Err("denied")),
             ("lend.get", p.clone(), Err("denied")),
             ("lend.set", json!({"state": "off"}), Err("denied")),
             ("shutdown", p.clone(), Err("denied")),

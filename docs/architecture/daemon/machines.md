@@ -304,6 +304,16 @@ once (in-flight agent streams cut, later `Open`s refused) without
 restarting the link; the want ending kills it within a tick; `rm` and
 daemon exit kill it and join the thread.
 
+An offered fleet worker has no relay of its own (`spawn_link` starts no
+agent thread for it; `Want::agent_ready` is `false` at once): its
+`agent` flag gates the `AGENT` streams of its fleet link instead
+([fleet.md](fleet.md#agent)). The hub's `fleet-link` serves those
+streams from the agent this daemon answers `fleet.agent` with (its own
+`bridge::host_agent` while the flag is on, asked every 2 s), and the
+worker binds `agent-fleet-<hub>.sock` in its socket dir, found by
+`bridge::host_agent` like a relay's socket, only while its probes say
+the hub serves.
+
 The machine's API relay (`--session-env`, `relay::SessionEnv`) sets each
 verb's `SSH_AUTH_SOCK` to `endpoint::agent_socket` for its own
 `--client` (the same `link::client_name` both ssh's pass) when that

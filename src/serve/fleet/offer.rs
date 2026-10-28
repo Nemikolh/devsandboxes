@@ -3,7 +3,11 @@
 //! once its link's `Hello`s are through, writes (or keeps) the worker's
 //! offered entry in `machines.toml`, `root` (the worker's fleet root) its
 //! one root; and [`dial`], how this host reaches an
-//! offered machine: its `fleet-<worker>.sock`.
+//! offered machine: its `fleet-<worker>.sock`. And `fleet.agent {worker}`,
+//! what the same `fleet-link` asks every `fleet::agent::REFRESH`: the agent
+//! socket its `AGENT` streams connect, this daemon's own
+//! (`bridge::host_agent`, with the agents clients reported), while the
+//! worker's offered entry has `agent = true` (`fleet::agent`).
 //!
 //! Internal: devsandbox's own `fleet-link` is the only caller (not in the
 //! npm typings). Connection-free like `machines::api`: a function of the
@@ -32,6 +36,8 @@ pub struct Ctx<'a> {
     pub hub: bool,
     /// The links, reloaded when an entry is added.
     pub links: Option<&'a Handle>,
+    /// This daemon's agent socket now (`bridge::host_agent` in production).
+    pub agent: &'a dyn Fn() -> Option<PathBuf>,
     pub log: fn(&str),
 }
 
@@ -39,8 +45,25 @@ pub struct Ctx<'a> {
 pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
     match method {
         "fleet.offer" => Some(parse(params).and_then(|p| offer(p, ctx))),
+        "fleet.agent" => Some(parse(params).and_then(|p| agent(p, ctx))),
         _ => None,
     }
+}
+
+#[derive(Deserialize)]
+struct AgentParams {
+    worker: String,
+}
+
+/// `fleet.agent {worker}`: `{"agent": <path> | null}`, this daemon's agent
+/// ([`Ctx::agent`]) while `worker` is an offered entry with `agent` on;
+/// `null` otherwise (no such entry, an ssh machine's name, `agent` off, no
+/// agent here).
+fn agent(p: AgentParams, ctx: &Ctx) -> Answer {
+    check_name(&p.worker).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
+    let entries = machines::load(ctx.registry).map_err(ApiError::internal)?;
+    let on = entries.iter().any(|e| e.name == p.worker && e.is_offered() && e.agent);
+    Ok(json!({ "agent": if on { (ctx.agent)() } else { None } }))
 }
 
 #[derive(Deserialize)]
@@ -148,7 +171,7 @@ mod tests {
     use super::*;
 
     fn ctx(registry: &Path, hub: bool) -> Ctx<'_> {
-        Ctx { registry, hub, links: None, log: |_| {} }
+        Ctx { registry, hub, links: None, agent: &|| Some(PathBuf::from("/hub/agent.sock")), log: |_| {} }
     }
 
     fn lap(root: &str) -> Entry {
@@ -209,6 +232,31 @@ mod tests {
         assert!(call("fleet.nope", Value::Null, &hub).is_none());
         // Internal: not in the npm typings.
         assert!(crate::serve::dts::prop_type("ApiMethods", "fleet.offer").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_agent_is_answered_for_an_offered_entry_with_agent_on_only() {
+        let dir = std::env::temp_dir().join(format!("dsv-oagent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = dir.join("machines.toml");
+        let hub = ctx(&registry, true);
+        let ask = |w: &str| call("fleet.agent", json!({ "worker": w }), &hub).unwrap();
+        assert_eq!(ask("lap").unwrap(), json!({"agent": null}), "no registry yet");
+        machines::update(&registry, |e| {
+            e.push(Entry::offered("lap"));
+            e.push(Entry { agent: true, ..Entry::ssh("srv", "me@srv") });
+        })
+        .unwrap();
+        assert_eq!(ask("lap").unwrap(), json!({"agent": null}), "agent off");
+        assert_eq!(ask("srv").unwrap(), json!({"agent": null}), "an ssh machine's: its own relay");
+        assert_eq!(ask("nope").unwrap(), json!({"agent": null}));
+        machines::update(&registry, |e| e[0].agent = true).unwrap();
+        assert_eq!(ask("lap").unwrap(), json!({"agent": "/hub/agent.sock"}));
+        let none = Ctx { agent: &|| None, ..ctx(&registry, true) };
+        assert_eq!(call("fleet.agent", json!({"worker": "lap"}), &none).unwrap().unwrap(), json!({"agent": null}), "no agent here");
+        assert_eq!(ask("a/b").unwrap_err().code, "invalid");
+        assert!(crate::serve::dts::prop_type("ApiMethods", "fleet.agent").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

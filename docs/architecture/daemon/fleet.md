@@ -53,7 +53,14 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
 (`start_lending`, `Table`, `Shared::open_lent`, `Shared::open_lent_pty`,
 `Shared::open_lent_tunnel`),
-`src/serve/fleet/worker.rs` (`Open`, `Opens`), `src/serve/fleet/pty.rs`
+`src/serve/fleet/worker.rs` (`Open`, `Opens`), `src/serve/fleet/agent.rs`
+(`SERVING`, `NOT_SERVING`, `Status`, `status_of`, `Action`, `decide`,
+`socket`, `serve`, `PROBE`, `Cached`, `Gate`, `answer`, `refresh`,
+`REFRESH`, `MAX_AGE`), `src/serve/fleet/offer.rs` (`fleet.agent`),
+`src/commands/fleet_link.rs` (`agent_of`), `src/serve/daemon.rs`
+(`Options::host_agent`),
+`src/serve/fleet/link.rs` (`Socket`, `Outlet::is_up`),
+`src/serve/fleet/pty.rs`
 (`METHOD`, `code`, `Header`, `parse_header`, `gate`, `offered`,
 `attach_params`, `serve`), `src/serve/fleet/tunnel.rs` (`read_request`,
 `scoped`, `confine`, `check_service`, `serve`), `src/commands/tunnel.rs`
@@ -169,8 +176,9 @@ The agent relay uses the one-channel cases (`link::opener`,
 for `TRANSFER` (a further channel's socket is
 `endpoint::fleet_channel_socket`, `fleet-<name>.<suffix>.sock`) and
 serves `TRANSFER`; the worker's answerer serves `API`, `TRANSFER`,
-`PTY` ([PTY](#pty)) and `TUNNEL` ([TUNNEL](#tunnel)). No end serves
-`AGENT` yet. Each
+`PTY` ([PTY](#pty)) and `TUNNEL` ([TUNNEL](#tunnel)); the hub's opener
+also serves `AGENT` ([AGENT](#agent)), which the worker opens through
+its outlet. Each
 connection to the API
 socket is one connection to whatever daemon socket the answerer's `API`
 handler connects, so a
@@ -362,7 +370,8 @@ link's `API` streams.
   `TRANSFER` streams), `endpoint::fleet_pty_socket`
   (`fleet-<name>.pty.sock`, `PTY` streams: [PTY](#pty)) and
   `endpoint::fleet_tunnel_socket` (`fleet-<name>.tunnel.sock`, `TUNNEL`
-  streams: [TUNNEL](#tunnel)), unlinked with it.
+  streams: [TUNNEL](#tunnel)), unlinked with it. It serves the `AGENT`
+  streams the worker opens ([AGENT](#agent), *The hub's end*).
 - **`fleet.offer`** (`fleet::offer::call`, internal: not in the npm
   typings) is accepted only by a hub: `[serve] hub = true` in
   `daemon.config.toml` (`ServeConfig::hub`, read once at start into
@@ -398,16 +407,22 @@ link's `API` streams.
   offered machine (`forwards.add` with `machine`) and a `devsandbox port`
   on one are `TUNNEL` streams from the hub ([TUNNEL](#tunnel), *The hub's
   end*).
+- **The agent** goes over the link: with `machine set <name> agent on`
+  (`machines.set`, taken for an offered entry as for an ssh one) the
+  hub's agent reaches every instance on the worker as `AGENT` streams
+  ([AGENT](#agent)). The machine links run no agent relay for an offered
+  entry (`service.rs` `spawn_link` starts no agent thread for it, and
+  `Want::agent_ready` is `false` at once), and `forward::verb` waits for
+  none.
 - **What needs ssh** to the machine is refused for an offered one: every
   `machines::ssh` argv goes through `argv_with`, which takes
   `Entry::ssh_target`, an error for an offered entry
   (`machines::offered_refusal`). So the CLI's other re-runs (`logs`,
   `inspect`, `done`, …, an `exec` without a tty, `--machine` per-root
-  commands), the dashboard's service tabs (`tui::remote::service_argv`:
-  service terminals aren't supported over the fleet link) and the agent
-  relay all fail; `machines.set` refuses `agent`
-  on for one (`invalid`). The dashboard's logs and inspect views go
-  through the `containers.*` quick calls and work.
+  commands) and the dashboard's service tabs (`tui::remote::service_argv`:
+  service terminals aren't supported over the fleet link) fail. The
+  dashboard's logs and inspect views go through the `containers.*` quick
+  calls and work.
 
 ### Hub mode
 
@@ -715,6 +730,13 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   the daemon stops. The lending thread gets both handlers as its `Opens`
   (channel → `Open`), and refuses both while it waits for the hub's
   binary ([Versions](#versions)).
+- **The hub's agent** is a socket the lending thread binds in the
+  daemon's socket dir while a link serves, the hub advertised
+  `caps::AGENT` and its probes say the hub serves it (never while it
+  waits for the hub's binary): each connection there is one `AGENT`
+  stream to the hub ([AGENT](#agent)).
+  `Lending::spawn` takes the dir (`daemon::start_lending` passes its
+  own).
 
 ### Versions
 
@@ -1046,6 +1068,63 @@ stream that ends is a bridge that's done, as a dead child is), so the
 engine's self-healing re-opens a new stream as it respawns an ssh. Each
 TCP connection is then a `Connect` on that bridge's mux, inside the
 `TUNNEL` stream.
+
+### AGENT
+
+The hub's ssh agent on the worker, over the link: the agent relay's
+semantics ([machines](machines.md#agent)) for an offered machine. While
+the hub's registry entry for the worker has `agent = true`, every
+instance there reaches the hub's agent, not only placed ones. Streams go
+worker → hub (`channel::AGENT`, flowing), so the worker needs nothing of
+the hub but the link it holds.
+
+**The status byte.** Every `AGENT` stream starts with one byte from the
+hub: `agent::SERVING` (1), then the relay to the hub's agent, or
+`agent::NOT_SERVING` (0), then the close (`agent::status_of`; no byte,
+another one or a wait over 5 s is a failure).
+
+**The worker's end** (`fleet::agent::serve`, on a `serve-lend-agent`
+thread of the link's `run_link`): once the link's `Hello`s are through
+with a hub on this build that advertised `caps::AGENT`, and the outlet
+is up, it probes the hub every `agent::PROBE` (2 s): an `AGENT` stream
+(`link::Outlet::open`) whose status byte it reads, then closes. While
+the hub serves it keeps `fleet::agent::socket` bound,
+`endpoint::agent_socket` of client `fleet-<hub>` (`agent-fleet-<hub>.sock`,
+the hub its ssh target), as an opener binds its sockets (`link::Socket`:
+a temp name renamed over the path, 0600, the newest wins); on
+`NOT_SERVING` or a failure it unbinds it (`agent::decide`, pure: bind
+when serving and unbound, unbind when bound and anything else). Each
+connection to the socket becomes one `AGENT` stream on a thread of its
+own: past a `SERVING` byte relayed both ways on two threads, each
+direction's end passed on as a half-close; any other answer closes the
+client and unbinds the socket at once. When the link ends (the outlet
+goes down) or `run_link`'s answerer returns, the socket is unlinked if
+it is still its own. Named `agent-*.sock`, it is one of the agent relay
+sockets `bridge::host_agent` tries (`endpoint::agent_sockets`, newest
+first, each probed with a connect), so the worker's bridges reach the
+hub's agent as they reach a machine's relayed one, and only while it
+leads somewhere: with `agent` off on the hub, or the link gone, there is
+no socket to pick, and the worker's own agent is the fallback.
+
+**The hub's end** (`commands::fleet_link`): its table serves `AGENT`
+(so `caps::AGENT` is always advertised) with `fleet::agent::Gate::open`,
+on the mux's read thread: always a socket pair at once, whose far end
+`agent::answer` takes on a thread of its own. It writes `NOT_SERVING`
+without a fresh agent path; else `SERVING`, and once the worker's first
+bytes come (a probe sends none and closes, so it never dials the agent)
+a connection to that path, spliced. The path is the hub daemon's
+`fleet.agent {worker}` answer ([api.md](../../reference/api.md#fleetagent)):
+the daemon's own `bridge::host_agent` (the agents clients reported
+included, as for the machines' agent relays; `daemon::Options::host_agent`
+in tests) while the worker's entry is offered with `agent = true`, else
+`null`. `agent::refresh` asks it on a thread of its own, started once the
+offer is through, on a fresh connection to the hub's daemon
+(`client::connect`, `fleet_link::agent_of`) every `agent::REFRESH` (2 s),
+and caches it (`agent::Cached`, counted while younger than
+`agent::MAX_AGE`, 10 s), so `machine set <w> agent on|off` binds or
+unbinds the worker's socket within about `REFRESH` + `PROBE`, on the live
+link. A failed read keeps the last answer, which ages out; the first of a
+run of failures is on `fleet-link`'s stderr.
 
 ### Worker policy
 

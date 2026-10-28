@@ -29,6 +29,14 @@
 //! stream, a port forward's bridge (`tunnel::remote_opener`, what the
 //! daemon's forwards and `devsandbox port` on the offered machine dial).
 //!
+//! It serves `AGENT` streams the worker opens (`fleet::agent`): each one
+//! starts with a status byte, then (serving) a connection to the agent this
+//! host's daemon answers `fleet.agent` with: its own `bridge::host_agent`
+//! (the agents clients reported included) while its entry for the worker
+//! has `agent = true`. That answer is asked on a short connection of its own
+//! every `agent::REFRESH`, on a thread of its own (`agent::refresh`), so
+//! `machine set <w> agent on|off` counts within that without a new link.
+//!
 //! When this is a dev build the worker isn't on, for the worker's platform
 //! (`update::hub_pushes`, over both `Hello`s), it pushes its own binary
 //! through that socket once the offer is made ([`push_build`]): the one
@@ -37,8 +45,9 @@
 //! refusing at the header otherwise.
 
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -47,27 +56,32 @@ use crate::devsbd::proto::channel;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
 use crate::serve::fleet::transfer::Receivers;
-use crate::serve::fleet::{self, link, update};
+use crate::serve::fleet::{self, agent, link, update};
 use crate::serve::machines::check_name;
 
 /// The CLI entry: the socket dir (created 0700 if missing), then [`run`] on
-/// stdin/stdout, offering through this host's daemon (lazy start).
+/// stdin/stdout, offering through this host's daemon (lazy start) and
+/// asking it for the agent ([`agent_of`]) on a fresh connection each time.
 /// `root`: the worker's fleet root (`--root`); `draining`: the worker's
 /// `lend` is `drain` (`--drain`).
 pub fn fleet_link(worker: &str, root: &Path, draining: bool) -> Result<()> {
     check_name(worker)?;
     let dir = endpoint::socket_dir()?;
     endpoint::ensure_private_dir(&dir)?;
-    let daemon = dir.clone();
-    run(io::stdin(), io::stdout(), &dir, worker, root, draining, move || {
-        client::connect(&daemon, "fleet-link").context("cannot reach this host's devsandbox serve")
-    })
+    let connect = |dir: PathBuf| move || client::connect(&dir, "fleet-link").context("cannot reach this host's devsandbox serve");
+    let (ask, name) = (connect(dir.clone()), worker.to_string());
+    let agent = move || agent_of(&mut ask()?, &name);
+    run(io::stdin(), io::stdout(), &dir, worker, root, draining, connect(dir.clone()), agent)
 }
 
 /// The link over `reader`/`writer` with its socket in `dir`: bind, sentinel
 /// and `Hello`s (the peer must serve `API`), then the offer on the
 /// connection `daemon` opens, held until the link ends; then accept and
-/// relay (`link::opener_with`). `Ok` when the worker went away.
+/// relay (`link::opener_with`). From the offer on, `agent()` (the daemon's
+/// `fleet.agent` answer) is asked every `agent::REFRESH` on a thread of its
+/// own, and `AGENT` streams are answered from the last answer
+/// (`agent::Gate`). `Ok` when the worker went away.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     reader: impl Read + Send + 'static,
     writer: impl Write + Send + 'static,
@@ -76,6 +90,7 @@ pub fn run(
     root: &Path,
     draining: bool,
     daemon: impl FnOnce() -> Result<Conn>,
+    agent: impl FnMut() -> Result<Option<PathBuf>> + Send + 'static,
 ) -> Result<()> {
     check_name(worker)?;
     if !root.is_absolute() {
@@ -90,17 +105,37 @@ pub fn run(
         (channel::PTY, pty.as_path()),
         (channel::TUNNEL, tunnel.as_path()),
     ];
-    let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|m| eprintln!("{m}"))));
+    let gate = Arc::new(agent::Gate::default());
+    let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|m| eprintln!("{m}")))).with(channel::AGENT, {
+        let gate = Arc::clone(&gate);
+        move || gate.open(Instant::now())
+    });
     let push_to = socket.clone();
+    let mut refreshing = None;
     let end = link::opener_with(&fleet::LINK, reader, writer, &sockets, serves, |peer| {
         let mut conn = daemon()?;
         offer(&mut conn, worker, &peer.hash, root, draining)?;
         held = Some(conn);
+        // Past the offer: the daemon knows the worker.
+        refreshing = Some(agent::refresh(gate, agent::REFRESH, agent, |e| {
+            eprintln!("fleet-link: cannot ask for the agent (not served meanwhile): {e:#}")
+        }));
         push_build(fleet::LINK.hello, &peer.hash, push_to, own_binary);
         Ok(())
     });
-    drop(held);
+    drop((held, refreshing));
     end
+}
+
+/// `fleet.agent {worker}` on `conn`: the agent socket this host's daemon
+/// serves `worker` (`None`: not served).
+pub fn agent_of(conn: &mut Conn, worker: &str) -> Result<Option<PathBuf>> {
+    let r = conn.call("fleet.agent", json!({ "worker": worker }))?;
+    if let Some(e) = r.error {
+        bail!("fleet.agent: {}", e.message);
+    }
+    let agent = r.result.as_ref().and_then(|v| v.get("agent")).context("bad fleet.agent result")?;
+    serde_json::from_value(agent.clone()).context("bad fleet.agent result")
 }
 
 /// This process's own binary: on Linux `/proc/self/exe`, the inode it runs
@@ -247,7 +282,7 @@ mod tests {
     /// daemon in `hub`.
     fn hub_link(io: UnixStream, hub: PathBuf) -> std::thread::JoinHandle<Result<()>> {
         let (r, w) = (io.try_clone().unwrap(), io);
-        std::thread::spawn(move || run(r, w, &hub.clone(), "lap", Path::new(WORKER_ROOT), false, move || Ok(conn_at(&hub))))
+        std::thread::spawn(move || run(r, w, &hub.clone(), "lap", Path::new(WORKER_ROOT), false, move || Ok(conn_at(&hub)), || Ok(None)))
     }
 
     /// A worker linked to its hub: the hub's daemon registers it on offer,
@@ -395,10 +430,10 @@ mod tests {
     fn a_bad_worker_name_is_refused_before_binding() {
         let (a, b) = UnixStream::pair().unwrap();
         let dir = std::env::temp_dir();
-        let err = run(a, b, &dir, "a/b", Path::new("/r"), false, || unreachable!()).unwrap_err();
+        let err = run(a, b, &dir, "a/b", Path::new("/r"), false, || unreachable!(), || Ok(None)).unwrap_err();
         assert!(format!("{err:#}").contains("machine name"), "{err:#}");
         let (a, b) = UnixStream::pair().unwrap();
-        let err = run(a, b, &dir, "lap", Path::new("rel"), false, || unreachable!()).unwrap_err();
+        let err = run(a, b, &dir, "lap", Path::new("rel"), false, || unreachable!(), || Ok(None)).unwrap_err();
         assert!(format!("{err:#}").contains("absolute"), "{err:#}");
     }
 }

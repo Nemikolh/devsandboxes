@@ -31,7 +31,7 @@
 //! [`opener`], its answerer `machines::agent::serve` through [`answerer`]);
 //! the fleet link another (`fleet::LINK`: `API` served by the answerer,
 //! `TRANSFER` by both ends, each end's `transfer::Receivers` through
-//! [`Serves::transfers`]).
+//! [`Serves::transfers`], `AGENT` by the opener, `fleet::agent`).
 //!
 //! The newest opener for a socket wins: it binds a temp name and renames it
 //! over the path. An opener exits, unlinking its sockets if they are still
@@ -193,7 +193,6 @@ impl Outlet {
     /// A new stream on flowing `channel` to the opener (a `TRANSFER` one
     /// for `transfer::send`); an error when no link is up, the opener
     /// didn't advertise `channel`, or `channel` doesn't flow.
-    #[allow(dead_code)] // first caller: fetch-back (fleet step 5)
     pub fn open(&self, channel: u8) -> Result<Conn> {
         let (mux, theirs) = self.up.lock().unwrap().clone().context("no link is up")?;
         if !advertised(theirs, channel) {
@@ -201,6 +200,11 @@ impl Outlet {
         }
         let (_, conn) = mux.open_host(channel, |_| {}).with_context(|| format!("cannot open a channel {channel} stream"))?;
         Ok(conn)
+    }
+
+    /// Whether a link is up (its `Hello`s through, not ended yet).
+    pub fn is_up(&self) -> bool {
+        self.up.lock().unwrap().is_some()
     }
 
     fn set(&self, up: Option<(Arc<Mux>, u32)>) {
@@ -426,10 +430,12 @@ impl<W: Write> Write for Reporting<W> {
     }
 }
 
-/// The opener's listening socket. Dropping it unlinks the socket file unless
-/// a newer opener has replaced it since (another inode there).
-struct Socket {
-    listener: UnixListener,
+/// The opener's listening socket (also a fleet worker's agent socket,
+/// `fleet::agent::serve`). Dropping it unlinks the socket file unless a
+/// newer opener has replaced it since (another inode there).
+pub(crate) struct Socket {
+    /// Non-blocking: accept with `endpoint::accept_any`.
+    pub(crate) listener: UnixListener,
     path: PathBuf,
     id: (u64, u64),
 }
@@ -438,7 +444,7 @@ impl Socket {
     /// Bind a temp name next to `path` (0600), then rename it over `path`: a
     /// live socket there is another opener's, and the newest wins; a dead one
     /// is a leftover.
-    fn bind(path: &Path) -> Result<Socket> {
+    pub(crate) fn bind(path: &Path) -> Result<Socket> {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = path.parent().unwrap_or(Path::new("."));
         // Short: the temp path must fit a socket address too.

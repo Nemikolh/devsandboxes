@@ -568,9 +568,10 @@ pub struct Want {
 impl Want {
     /// Wait up to `wait` for the machine's agent relay to be up (its
     /// handshake through, so its socket there exists); `false` at once while
-    /// the machine's `agent` is off.
+    /// the machine's `agent` is off, and for an offered machine, which has
+    /// no relay (its fleet link carries the agent, `fleet::agent`).
     pub fn agent_ready(&self, wait: Duration) -> bool {
-        let ctl = self.inner.lock_links().get(&self.machine).map(|l| Arc::clone(&l.ctl));
+        let ctl = self.inner.lock_links().get(&self.machine).filter(|l| !l.entry.is_offered()).map(|l| Arc::clone(&l.ctl));
         ctl.is_some_and(|ctl| ctl.wait_ready(wait))
     }
 }
@@ -606,13 +607,15 @@ fn spawn_link(entry: Entry, inner: Arc<Inner>) -> LinkThread {
             .spawn(move || LinkLoop::new(entry, &inner, &ctl).run(&rx))
     };
     let thread = thread.map_err(|e| log(&format!("cannot start machine {}'s link: {e}", entry.name))).ok();
-    let agent = {
+    // An offered machine's agent rides its fleet link (`fleet::agent`): no
+    // relay of its own, and no ssh to it.
+    let agent = (!entry.is_offered()).then(|| {
         let (entry, ctl) = (entry.clone(), Arc::clone(&ctl));
         std::thread::Builder::new()
             .name(format!("serve-machine-{}-agent", entry.name))
             .spawn(move || agent_loop(&entry, &inner, &ctl))
-    };
-    let agent = agent.map_err(|e| log(&format!("cannot start machine {}'s agent thread: {e}", entry.name))).ok();
+    });
+    let agent = agent.and_then(|a| a.map_err(|e| log(&format!("cannot start machine {}'s agent thread: {e}", entry.name))).ok());
     LinkThread { entry, tx, ctl, thread, agent }
 }
 
@@ -1523,6 +1526,38 @@ mod tests {
         assert_eq!(dialed(&dials, "s"), 0, "an ssh machine waits to be wanted");
         assert_eq!(h.remotes().get("s").unwrap().state, LinkState::Idle);
         drop(machines);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An offered machine with `agent` on gets no relay of its own (its
+    /// fleet link carries the agent): no agent dial, and its want doesn't
+    /// wait for one.
+    #[test]
+    fn an_offered_machine_never_dials_an_agent_relay() {
+        let base = short_scratch("hub-agent");
+        let registry = base.join("machines.toml");
+        crate::serve::machines::update(&registry, |e| e.push(Entry { agent: true, ..Entry::offered("w") })).unwrap();
+        let agent_dials = Arc::new(AtomicUsize::new(0));
+        let agent_dial: Dial = {
+            let n = Arc::clone(&agent_dials);
+            Arc::new(move |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("no ssh to an offered machine")
+            })
+        };
+        let dial: Dial = Arc::new(|_| Ok(mute_peer()));
+        let hooks = Hooks { watching: Box::new(|| true), changed: Box::new(|| {}) };
+        let hub = Hub { remotes: base.join("remotes.json") };
+        let machines = Machines::spawn(registry, dial, agent_dial, opts(1, 0).machine_timing, hooks, Some(hub), |_| {});
+        let h = machines.handle();
+        wait_for("the offered link up", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        let want = h.want("w").unwrap();
+        let started = Instant::now();
+        assert!(!want.agent_ready(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_millis(100), "answered at once");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(agent_dials.load(Ordering::SeqCst), 0);
+        drop((want, machines));
         let _ = std::fs::remove_dir_all(&base);
     }
 

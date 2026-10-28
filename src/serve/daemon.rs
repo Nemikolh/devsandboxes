@@ -164,7 +164,14 @@ pub struct Options {
     /// The hub's repo caches a placed `run` fetches into; `None` is
     /// `fleet::code::repos_dir`. Tests point it at a scratch dir.
     pub repos: Option<PathBuf>,
+    /// The agent `fleet.agent` answers an offered worker's `fleet-link`
+    /// with; `None` is `bridge::host_agent` (the machines' agent relays'
+    /// provider). Tests inject one.
+    pub host_agent: Option<HostAgent>,
 }
+
+/// [`Options::host_agent`].
+pub type HostAgent = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
 /// [`Options::local_capacity`].
 pub type LocalCapacity = Arc<dyn Fn() -> super::capacity::Capacity + Send + Sync>;
@@ -194,6 +201,7 @@ impl Options {
             lend_env: None,
             local_capacity: None,
             repos: None,
+            host_agent: None,
         }
     }
 }
@@ -310,6 +318,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let links = service::Machines::spawn(registry_path.clone(), dial.clone(), agent_dial, opts.machine_timing, hooks, hub, log);
     let forwards_machines = registry_path.clone();
     shared.hub = opts.hub;
+    if let Some(agent) = &opts.host_agent {
+        shared.host_agent = Arc::clone(agent);
+    }
     shared.machines = Some(machines::api::Ctx {
         registry: registry_path,
         dial,
@@ -466,6 +477,8 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     };
     // Weak: the lender lives in `shared`.
     let weak = Arc::downgrade(shared);
+    // Where each link's agent socket goes (`fleet::agent::socket`).
+    let socket_dir = dir.to_path_buf();
     let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
         let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
         let (api, pty, tunnel) = (weak.clone(), weak.clone(), weak.clone());
@@ -479,7 +492,8 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
         // into the fleet root (`fleet::code`); the hub's binary the lending
         // thread takes itself.
         let receivers = fleet::code::receivers(&start.root, fleet::transfer::Receivers::new(log));
-        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), opens, receivers, follow.clone(), timing, log)
+        let agent_dir = Some(socket_dir.clone());
+        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), opens, receivers, agent_dir, follow.clone(), timing, log)
     });
     let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, link::hostname(), spawn, log));
     lender.start();
@@ -579,6 +593,8 @@ struct Shared {
     socket_dir: PathBuf,
     /// [`Options::local_capacity`].
     local_capacity: Option<LocalCapacity>,
+    /// [`Options::host_agent`], resolved.
+    host_agent: HostAgent,
     /// This host's capacity on demand; the host poll keeps its running
     /// count.
     host_capacity: Arc<super::capacity::HostCapacity>,
@@ -614,6 +630,7 @@ impl Shared {
             lender: OnceLock::new(),
             socket_dir: PathBuf::new(),
             local_capacity: None,
+            host_agent: Arc::new(crate::devsbd::bridge::host_agent),
             host_capacity: Arc::new(super::capacity::HostCapacity::new(Arc::new(|| crate::runtime::backend().engine_info()))),
             repos: None,
         }
@@ -1278,7 +1295,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         },
         method if method.starts_with("fleet.") && shared.machines.is_some() => {
             let m = shared.machines.as_ref().expect("checked");
-            let ctx = super::fleet::offer::Ctx { registry: &m.registry, hub: shared.hub, links: m.links.as_ref(), log };
+            let agent = || (shared.host_agent)();
+            let ctx = super::fleet::offer::Ctx { registry: &m.registry, hub: shared.hub, links: m.links.as_ref(), agent: &agent, log };
             super::fleet::offer::call(method, req.params, &ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
         }
         method if method.starts_with("machines.") && shared.machines.is_some() => {
@@ -1826,6 +1844,8 @@ pub(crate) mod tests {
             local_capacity: Some(Arc::new(crate::serve::capacity::Capacity::default)),
             // Never the user's repo caches.
             repos: Some(std::env::temp_dir().join(format!("dsv-repos-{}", std::process::id()))),
+            // Never the user's agent.
+            host_agent: Some(Arc::new(|| None)),
         }
     }
 

@@ -249,22 +249,19 @@ struct SetParams {
 }
 
 /// Change a registered machine's settings (today only `agent`). The links
-/// reload only when something changed. `agent` on an offered machine is
-/// refused: its relay is an ssh to it.
+/// reload only when something changed. An offered machine's `agent` gates
+/// `fleet.agent`, through which its `fleet-link` serves this host's agent
+/// over the fleet link (`fleet::agent`).
 fn set(p: SetParams, ctx: &Ctx) -> Answer {
     let changed = super::update(&ctx.registry, |entries| {
         let entry = entries.iter_mut().find(|e| e.name == p.name)?;
-        if p.agent && entry.is_offered() {
-            return Some(Err(ApiError::invalid(format!("{:#}", super::offered_refusal(&entry.name)))));
-        }
         let changed = entry.agent != p.agent;
         entry.agent = p.agent;
-        Some(Ok(changed))
+        Some(changed)
     });
     let Some(changed) = changed.map_err(ApiError::internal)? else {
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
     };
-    let changed = changed?;
     if changed && let Some(links) = &ctx.links {
         links.reload();
     }
@@ -615,15 +612,16 @@ mod tests {
         assert_eq!((code.as_str(), message.as_str()), ("not-found", "no machine named `nope`"));
         assert_eq!(err(&mut local, "machines.set", json!({"name": "box"})).0, "invalid");
         assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry.clone()]);
-        // An offered machine has no ssh for a relay: `agent` on is refused,
-        // off is a no-op; `get` says its kind, no target.
+        // An offered machine's `agent` rides its fleet link: on and off are
+        // taken like an ssh machine's; `get` says its kind, no target.
         crate::serve::machines::update(&registry, |e| e.push(Entry::offered("lap"))).unwrap();
-        let (code, message) = err(&mut local, "machines.set", json!({"name": "lap", "agent": true}));
-        assert!(code == "invalid" && message.contains("offered fleet worker"), "{code}: {message}");
+        assert_eq!(ok(&mut local, "machines.set", json!({"name": "lap", "agent": true})), json!({"ok": true}));
+        let lap_on = Entry { agent: true, ..Entry::offered("lap") };
+        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry.clone(), lap_on]);
+        let info = ok(&mut local, "machines.get", json!({"name": "lap"}));
+        assert_eq!(info, json!({"name": "lap", "kind": "offered", "target": null, "command": null, "roots": [], "agent": true}));
         assert_eq!(ok(&mut local, "machines.set", json!({"name": "lap", "agent": false})), json!({"ok": true}));
         assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry, Entry::offered("lap")]);
-        let info = ok(&mut local, "machines.get", json!({"name": "lap"}));
-        assert_eq!(info, json!({"name": "lap", "kind": "offered", "target": null, "command": null, "roots": [], "agent": false}));
         drop(local);
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&base);

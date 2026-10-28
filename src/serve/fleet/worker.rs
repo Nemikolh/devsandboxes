@@ -12,7 +12,9 @@
 //! `PTY` streams (`fleet::pty`) are answered by the daemon's handler for
 //! them, like `API` ones ([`Opens`]). `TRANSFER` streams the hub opens go
 //! to the daemon's `Receivers`; [`Lending::open_transfer`] opens one toward
-//! the hub while a link is up.
+//! the hub while a link is up. While a link is up and serving (its hub
+//! serves `AGENT`), its agent socket is bound in the daemon's socket dir
+//! (`fleet::agent::serve`): the hub's agent for this host's bridges.
 //!
 //! Before it serves anything, each link compares the hub's build (its
 //! `Hello`) with this one's (`update::decide`): another published build is
@@ -39,10 +41,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use super::agent;
 use super::transfer::Receivers;
 use super::update::{self, BINARY_KIND, BINARY_LIMIT, Build, Decision, Steps};
 use super::{LINK, link};
 use crate::devsbd::mux::Conn;
+use crate::devsbd::proto::caps;
 use crate::serve::endpoint::Stream;
 use crate::serve::machines::check_name;
 use crate::serve::machines::service::{self, Timing};
@@ -133,6 +137,8 @@ struct Ctl {
     /// How this worker follows its hub's version.
     follow: Option<Follow>,
     incoming: Arc<Incoming>,
+    /// The socket dir the link's agent socket goes in; `None`: none bound.
+    agent_dir: Option<PathBuf>,
 }
 
 /// The hub's binary on its way (`Decision::Receive`): what the `binary`
@@ -235,7 +241,8 @@ impl Lending {
     /// (`draining`: offering `--drain`); the hub's streams on `opens`'
     /// channels go to their handlers, its `TRANSFER` streams to
     /// `receivers`, plus the hub's binary; a hub on another build is
-    /// followed through `follow`.
+    /// followed through `follow`. Each serving link binds its agent socket
+    /// in `agent_dir` (`fleet::agent::socket`).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         hub: String,
@@ -245,6 +252,7 @@ impl Lending {
         transport: Transport,
         opens: Opens,
         receivers: Receivers,
+        agent_dir: Option<PathBuf>,
         follow: Follow,
         timing: Timing,
         log: fn(&str),
@@ -252,7 +260,7 @@ impl Lending {
         link_argv(&hub, &name, &root, draining)?;
         let incoming = Arc::new(Incoming::default());
         let receivers = Some(Arc::new(incoming.receiver(receivers)));
-        let ctl = Arc::new(Ctl { receivers, follow: Some(follow), incoming, ..Ctl::default() });
+        let ctl = Arc::new(Ctl { receivers, follow: Some(follow), incoming, agent_dir, ..Ctl::default() });
         ctl.draining.store(draining, Ordering::SeqCst);
         let thread = {
             let ctl = Arc::clone(&ctl);
@@ -364,8 +372,8 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, opens: &Opens, ctl: &Ctl,
     let up = AtomicBool::new(false);
     let wanted: Mutex<Option<String>> = Mutex::new(None);
     // While the hub's binary is on its way the link serves no `API` (or
-    // `PTY`) stream: nothing reaches the `Worker` table, nor an instance,
-    // until the update is done.
+    // `PTY`) stream, nor binds its agent socket: nothing reaches the
+    // `Worker` table, nor an instance, until the update is done.
     let receiving = AtomicBool::new(false);
     let mut link_stream = duplex.stream.try_clone().ok();
     let mut serves = link::Serves::default();
@@ -376,42 +384,61 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, opens: &Opens, ctl: &Ctl,
     if let Some(receivers) = &ctl.receivers {
         serves = serves.transfers(Arc::clone(receivers));
     }
-    let end = link::answerer_with(
-        &LINK,
-        reader,
-        writer,
-        &serves,
-        Some(&ctl.outlet),
-        |peer| {
-            let theirs = Build::parse(&peer.hash);
-            let dev_builds = ctl.follow.as_ref().is_some_and(|f| (f.dev_builds)());
-            let platform = update::platform_of(&peer.hash);
-            match update::decide(&Build::current(), &theirs, update::PLATFORM, platform, dev_builds) {
-                Decision::Same => {}
-                Decision::Download { version } => {
-                    *wanted.lock().unwrap() = Some(version);
-                    return Err(format!("the hub runs {}: updating", theirs.label()));
+    // Set once the link ended: the agent socket's thread unbinds.
+    let over = AtomicBool::new(false);
+    let end = std::thread::scope(|s| {
+        let end = link::answerer_with(
+            &LINK,
+            reader,
+            writer,
+            &serves,
+            Some(&ctl.outlet),
+            |peer| {
+                let theirs = Build::parse(&peer.hash);
+                let dev_builds = ctl.follow.as_ref().is_some_and(|f| (f.dev_builds)());
+                let platform = update::platform_of(&peer.hash);
+                match update::decide(&Build::current(), &theirs, update::PLATFORM, platform, dev_builds) {
+                    Decision::Same => {}
+                    Decision::Download { version } => {
+                        *wanted.lock().unwrap() = Some(version);
+                        return Err(format!("the hub runs {}: updating", theirs.label()));
+                    }
+                    Decision::Stop(why) => return Err(why),
+                    Decision::Receive => {
+                        let dir = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the hub's build: {e:#}"))?;
+                        receiving.store(true, Ordering::Relaxed);
+                        let seq = ctl.incoming.expect(peer.hash.clone(), dir, link_stream.take());
+                        ctl.incoming.watch(seq, PUSH_WAIT);
+                        log(&format!("fleet: hub {hub} runs devsandbox {}: receiving its binary", theirs.label()));
+                        ctl.set_status(Status::Retrying(format!("receiving the hub's build {}", theirs.label())));
+                        return Ok(());
+                    }
                 }
-                Decision::Stop(why) => return Err(why),
-                Decision::Receive => {
-                    let dir = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the hub's build: {e:#}"))?;
-                    receiving.store(true, Ordering::Relaxed);
-                    let seq = ctl.incoming.expect(peer.hash.clone(), dir, link_stream.take());
-                    ctl.incoming.watch(seq, PUSH_WAIT);
-                    log(&format!("fleet: hub {hub} runs devsandbox {}: receiving its binary", theirs.label()));
-                    ctl.set_status(Status::Retrying(format!("receiving the hub's build {}", theirs.label())));
-                    return Ok(());
+                up.store(true, Ordering::Relaxed);
+                ctl.set_status(Status::Connected);
+                log(&format!("fleet: lending to {hub} as {name}"));
+                if let Some(dir) = &ctl.agent_dir
+                    && peer.caps & caps::AGENT != 0
+                {
+                    let (path, outlet, over) = (agent::socket(dir, hub), &ctl.outlet, &over);
+                    let spawned = std::thread::Builder::new().name("serve-lend-agent".into()).spawn_scoped(s, move || {
+                        if let Err(e) = agent::serve(&path, outlet, over, agent::PROBE) {
+                            log(&format!("fleet: {e:#}"));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        log(&format!("fleet: cannot start the agent socket's thread: {e}"));
+                    }
                 }
-            }
-            up.store(true, Ordering::Relaxed);
-            ctl.set_status(Status::Connected);
-            log(&format!("fleet: lending to {hub} as {name}"));
-            Ok(())
-        },
-        move || {
-            let _ = killer.shutdown(Shutdown::Both);
-        },
-    );
+                Ok(())
+            },
+            move || {
+                let _ = killer.shutdown(Shutdown::Both);
+            },
+        );
+        over.store(true, Ordering::Relaxed);
+        end
+    });
     ctl.current.lock().unwrap().take();
     if let Some(want) = ctl.incoming.take() {
         let label = Build::parse(&want.hello).label();
@@ -506,7 +533,8 @@ mod tests {
     /// A transport whose every link is a hub `fleet-link` saying `hello` in
     /// its `Hello` (its opener in-process, its sockets under `dir`), pushing
     /// `binary()`'s file to the worker as `fleet_link::run` does
-    /// (`fleet_link::push_build`, when `update::hub_pushes`).
+    /// (`fleet_link::push_build`, when `update::hub_pushes`). Its `AGENT`
+    /// streams are echoed, standing in for the hub's agent.
     fn hub_pushing(hello: &'static str, dir: PathBuf, binary: Binary) -> Transport {
         Arc::new(move |_: &[OsString]| {
             let (worker, hub) = std::os::unix::net::UnixStream::pair()?;
@@ -515,9 +543,18 @@ mod tests {
             let binary = Arc::clone(&binary);
             std::thread::spawn(move || {
                 let spec = link::Spec { hello, ..LINK };
-                let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|_| {})));
-                let (r, w) = (hub.try_clone().unwrap(), hub);
                 use crate::devsbd::proto::channel;
+                let echo = || {
+                    let (ours, theirs) = std::os::unix::net::UnixStream::pair().ok()?;
+                    std::thread::spawn(move || {
+                        // Serving (`agent::SERVING`), then the echo.
+                        let _ = std::io::Write::write_all(&mut &ours, &[super::agent::SERVING]);
+                        let _ = std::io::copy(&mut &ours, &mut &ours);
+                    });
+                    Some(theirs.into())
+                };
+                let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|_| {}))).with(channel::AGENT, echo);
+                let (r, w) = (hub.try_clone().unwrap(), hub);
                 let sockets = [(spec.channel, socket.as_path()), (channel::TRANSFER, xfer.as_path()), (channel::PTY, pty.as_path())];
                 let push_to = xfer.clone();
                 link::opener_with(&spec, r, w, &sockets, serves, |peer| {
@@ -565,6 +602,7 @@ mod tests {
             hub_pushing(hello, dir.clone(), binary),
             vec![(LINK.channel, counter(&opens)), (crate::devsbd::proto::channel::PTY, counter(&opens))],
             Receivers::new(|_| {}),
+            Some(dir.clone()),
             Follow { steps, dev_builds: Arc::new(move || dev_builds) },
             timing,
             |_| {},
@@ -584,6 +622,32 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(10), "status: {:?}", lending.status());
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A hub on this build that serves `AGENT`: while the link is up its
+    /// agent socket is here, each connection a stream to the hub's agent.
+    #[test]
+    fn the_hubs_agent_is_bound_here_while_the_link_serves() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let lent = lend_to(LINK.hello, "agent", Arc::new(Fake::default()), false, no_binary());
+        let socket = agent::socket(&lent.dir, "hub");
+        assert_eq!(socket.file_name().unwrap(), "agent-fleet-hub.sock");
+        let start = std::time::Instant::now();
+        while !socket.exists() {
+            assert!(start.elapsed() < Duration::from_secs(10), "bound");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(lent.lending.status(), Status::Connected);
+        assert_eq!(std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(crate::serve::endpoint::agent_sockets(&lent.dir), [socket.clone()], "what `bridge::host_agent` tries");
+        let mut c = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"sign this").unwrap();
+        c.shutdown(Shutdown::Write).unwrap();
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"sign this", "the hub's echo, its end passed on");
     }
 
     fn has_release() -> bool {
@@ -662,6 +726,7 @@ mod tests {
             probe.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             assert_eq!(std::io::Read::read(&mut probe, &mut [0u8; 16]).unwrap(), 0, "{sock} closed: refused");
         }
+        assert!(!agent::socket(&lent.dir, "hub").exists(), "no agent socket while receiving");
         assert_eq!(lent.opens.load(Ordering::SeqCst), 0);
         assert!(steps.calls().is_empty(), "nothing before the binary");
 
@@ -828,7 +893,8 @@ mod tests {
         }
 
         /// A transport whose every link is the hub's `fleet-link` for `lap`
-        /// offering `root` in-process, its socket and daemon in `hub`.
+        /// offering `root` in-process, its socket and daemon in `hub` (which
+        /// it asks for the agent, `fleet.agent`).
         fn in_process_hub(hub: PathBuf, root: PathBuf) -> Transport {
             Arc::new(move |argv: &[OsString]| {
                 let words: Vec<_> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -840,10 +906,40 @@ mod tests {
                 let (hub, root) = (hub.clone(), root.clone());
                 std::thread::spawn(move || {
                     let (r, w) = (hub_io.try_clone().unwrap(), hub_io);
-                    crate::commands::fleet_link::run(r, w, &hub.clone(), "lap", &root, false, move || Ok(conn_at(&hub)))
+                    let asked = hub.clone();
+                    let agent = move || crate::commands::fleet_link::agent_of(&mut conn_at(&asked), "lap");
+                    crate::commands::fleet_link::run(r, w, &hub.clone(), "lap", &root, false, move || Ok(conn_at(&hub)), agent)
                 });
                 Ok(Duplex::socket(worker))
             })
+        }
+
+        /// A fake ssh-agent at `dir/agent.sock`: echoes each connection.
+        fn echo_agent(dir: &Path) -> PathBuf {
+            let path = dir.join("agent.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(conn) = conn else { return };
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut &conn, &mut &conn);
+                    });
+                }
+            });
+            path
+        }
+
+        /// `sign` through the agent socket at `path` (half-closed after):
+        /// what came back, empty when the stream was refused.
+        fn agent_through(path: &Path) -> Vec<u8> {
+            use std::io::Read;
+            let Ok(mut c) = UnixStream::connect(path) else { return Vec::new() };
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = c.write_all(b"sign");
+            let _ = c.shutdown(Shutdown::Write);
+            let mut got = Vec::new();
+            let _ = c.read_to_end(&mut got);
+            got
         }
 
         /// A raw stream over the hub's offered dial to `lap`, past the
@@ -913,6 +1009,9 @@ mod tests {
             hub.remotes = Some(base.join("hub-data/remotes.json"));
             hub.machines = Some(registry.clone());
             hub.state = Some(base.join("hub-data/state.toml"));
+            // The hub daemon's agent (`fleet.agent`): an echo.
+            let hub_agent = echo_agent(&base);
+            hub.host_agent = Some(Arc::new(move || Some(hub_agent.clone())));
             let hub_daemon = spawn_daemon(&hub_dir, hub);
             drop(conn_at(&hub_dir));
             let worker_daemon = spawn_daemon(&worker_dir, worker);
@@ -993,6 +1092,23 @@ mod tests {
             assert_eq!(out, "hi web-w path=/worker/bin\n");
             drop((reader, stream, c));
 
+            // The hub's agent on the worker: no socket while the hub's
+            // entry has `agent` off; `machines.set` on binds it within the
+            // probe window and the hub's agent answers through it; off
+            // unbinds it again.
+            let agent_socket = super::agent::socket(&worker_dir, "me@hub");
+            std::thread::sleep(super::agent::PROBE + Duration::from_millis(500));
+            assert!(!agent_socket.exists(), "agent off: not bound");
+            let mut c = conn_at(&hub_dir);
+            assert!(c.call("machines.set", json!({"name": "lap", "agent": true})).unwrap().error.is_none());
+            wait_for(|| agent_socket.exists(), "on: bound");
+            assert_eq!(agent_through(&agent_socket), b"sign", "the hub's agent answers");
+            assert!(c.call("machines.set", json!({"name": "lap", "agent": false})).unwrap().error.is_none());
+            wait_for(|| !agent_socket.exists(), "off again: unbound");
+            assert!(c.call("machines.set", json!({"name": "lap", "agent": true})).unwrap().error.is_none());
+            wait_for(|| agent_socket.exists(), "on again: bound");
+            drop(c);
+
             // A newer hello from the hub never hands the worker off.
             let mut raw = offered_stream(&hub_dir);
             let newer = Version { semver: "99.0.0".into(), build: 99 };
@@ -1019,6 +1135,7 @@ mod tests {
             let off = local.call("lend.set", json!({"state": "off"})).unwrap().result.unwrap();
             assert_eq!(off["link"], "off");
             wait_for(|| !endpoint::fleet_socket(&hub_dir, "lap").exists(), "off: the hub's socket gone");
+            wait_for(|| !agent_socket.exists(), "off: the agent socket gone with the link");
             assert_eq!(lend::load(&lend_path).unwrap().unwrap().state, lend::State::Off, "written");
             local.call("lend.set", json!({"state": "drain"})).unwrap().result.unwrap();
             wait_for(|| endpoint::fleet_socket(&hub_dir, "lap").exists(), "drain: linked again");
@@ -1033,6 +1150,7 @@ mod tests {
             assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
             assert_eq!(worker_daemon.join().unwrap().unwrap(), Exit::Shutdown);
             wait_for(|| !endpoint::fleet_socket(&hub_dir, "lap").exists(), "the hub's socket gone");
+            assert!(!agent_socket.exists(), "the agent socket gone with the worker");
             // A hub never idles out: stopped by hand.
             assert!(conn_at(&hub_dir).call("shutdown", json!({})).unwrap().error.is_none());
             assert_eq!(hub_daemon.join().unwrap().unwrap(), Exit::Shutdown);
@@ -1226,7 +1344,7 @@ mod tests {
         });
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let lending =
-            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Vec::new(), Receivers::new(|_| {}), Follow { steps: Arc::new(Fake::default()), dev_builds: Arc::new(|| false) }, timing, |_| {}).unwrap();
+            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Vec::new(), Receivers::new(|_| {}), None, Follow { steps: Arc::new(Fake::default()), dev_builds: Arc::new(|| false) }, timing, |_| {}).unwrap();
         let start = std::time::Instant::now();
         while tries.load(Ordering::SeqCst) < 3 {
             assert!(start.elapsed() < Duration::from_secs(5), "retried");
