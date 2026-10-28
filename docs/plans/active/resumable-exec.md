@@ -1,11 +1,15 @@
 # Resumable exec: interactive sessions that outlive their connection
 
-Status: planned (step 4)
+Status: planned (step 4, the part after fleet step 1)
 Steps 1-3 shipped: helper sessions (`devsbd/src/sessions.rs`), `exec`
 through them with `--attach` / `--sessions` / `--session`
 (`src/commands/exec.rs`), reconnect over ssh and in remote dashboard tabs
-(`serve::machines::cli` `Reconnect`, `tui::app::terminal`); the living
-docs describe them. Left: step 4, cleanup.
+(`serve::machines::cli` `Reconnect`, `tui::app::terminal`). Step 4's "now"
+part (4a-4d) shipped too: `session prune` and the prune on `new`, a
+displaced client that never blocks, the session wire version
+(`VERSION_EXIT`), the session count in `instances.procs`. The living docs
+describe all of it. Left: step 4's items after fleet step 1 (surfacing
+detached sessions, a policy for abandoned ones).
 
 ## Problem
 
@@ -206,7 +210,7 @@ Build `devsbd/src/sessions.rs` per *Sessions in the helper*.
 - Docs: `docs/architecture/daemon/machines.md` (*The CLI*, *Dashboard*),
   `docs/architecture/dashboard/terminal.md`.
 
-## Step 4: cleanup (later, not started with steps 1-3)
+## Step 4: cleanup (4a-4d shipped; the items after fleet step 1 are left)
 
 Order with the other plans: [helper-rpc](helper-rpc.md#order-across-plans).
 
@@ -229,7 +233,7 @@ After fleet step 1 (fleet root, `lend.toml`):
   explicit); on a worker they hold lent capacity, so it may belong in
   `lend.toml` or the capacity report.
 
-The "now" part ships as four commits (4a-4d). Landmarks are from recon
+The "now" part shipped as four commits (4a-4d). Landmarks are from recon
 (line numbers drift; trust the symbol).
 
 ### Step 4a: `session prune`
@@ -326,8 +330,6 @@ The "now" part ships as four commits (4a-4d). Landmarks are from recon
   Every key it takes is a key the program can't get, and closing the
   tab/terminal already detaches. Proposal: none for now, an opt-in later
   if missed.
-- **Dashboard view of sessions** before step 4: a session count on the
-  instance row is cheap once `session ls` exists.
 - **Relation to [helper-rpc](helper-rpc.md)**'s `run.attach`: sessions
   stay on `exec -it` (that plan keeps interactive exec out of scope); if
   `RPC` lands, `run.attach` could attach to a session's socket from the
