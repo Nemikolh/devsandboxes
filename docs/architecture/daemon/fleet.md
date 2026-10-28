@@ -402,7 +402,8 @@ link's `API` streams.
 - **Terminals** go over the link: a tty `exec` on an offered machine
   (and its `--attach`, `--sessions`) and the dashboard's instance tabs,
   which run that `exec` locally, are `PTY` streams from the hub
-  ([PTY](#pty), *The hub's end*).
+  ([PTY](#pty), *The hub's end*); so is an `exec` without a tty, as a
+  piped `PTY` stream ([PTY](#pty), *Pipe mode*).
 - **Port forwards** go over the link: the daemon's forwards into an
   offered machine (`forwards.add` with `machine`) and a `devsandbox port`
   on one are `TUNNEL` streams from the hub ([TUNNEL](#tunnel), *The hub's
@@ -423,9 +424,10 @@ link's `API` streams.
   (`containers.stats`), printed as the local commands print them
   ([machines](machines.md#the-cli-clirs), `machines::cli::offered`). The
   dashboard's logs and inspect views go through the same quick calls.
-- **What has no link form yet** is refused, each in its own words: an `exec` without a tty and
-  `vscode` (`cli::offered::refusal`), `gc` (host maintenance, outside a
-  worker's trust), and the dashboard's service tabs
+- **What has no link form yet** is refused, each in its own words:
+  `vscode` (`cli::offered::refusal`), a session `exec` without a tty
+  (`--attach` off a terminal, `--session` without `-t`: a session over
+  the link needs one), `gc` (host maintenance, outside a worker's trust), and the dashboard's service tabs
   (`tui::remote::service_argv`: service terminals aren't supported over
   the fleet link). No ssh argv is built for an offered entry:
   `machines::ssh`'s `argv_with` takes `Entry::ssh_target`, an error for one
@@ -949,7 +951,7 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
 ### PTY
 
 A terminal into a lent instance over the link: each `PTY` stream the hub
-opens is one session attach, the worker's daemon calling the instance
+opens is one session attach (or a piped exec: *Pipe mode* below), the worker's daemon calling the instance
 helper's `session.attach` itself over its bridge
 (`HelperClient::call_with_input`; decision 13 of the
 [plan](../../plans/active/fleet.md#decisions)): no `exec -it`, no client
@@ -1001,6 +1003,36 @@ in the container. The stream carries `rpc` records
   (the bridge or its call broke), so the hub can't tell how the session
   is, only that the attach is gone.
 
+**Pipe mode** is a `PTY` stream for an `exec` without a tty: no session,
+no helper, a `<runtime> exec` on the worker with its stdio piped.
+
+- **The header** has `"pipe": {"argv": [...], "interactive"?: bool}`
+  instead of `session` / `create` (`pty::Mode::Pipe`; with either of
+  them, or without a command in `argv`, it is `bad-request`: the hub
+  sends the login shell itself). `interactive` is `exec -i`: whether the
+  hub's stdin is forwarded.
+- **The gate** is `pty::gate`'s, without the helper: the root confined,
+  the instance lent and under it; no `offered` (nothing is asked of a
+  helper; an instance that isn't running is the runtime exec's own
+  error, on `stderr`).
+- **The exec** is `pty::runtime_exec`: the runtime's
+  `exec_argv_with(instance, interactive, false, argv, host_agent)`, the
+  same argv a local `exec` without `-t` runs (`-i` when interactive),
+  its stdin the hub's or empty, its stdout and stderr piped. The daemon
+  passes `runtime_exec` to `pty::serve` as a `pty::PipeCommand`; tests
+  pass a program of their own.
+- **Records** (`pty::run_pipe`): hub → worker `stdin` into the exec's
+  stdin, `stdin-eof` closing it (anything else ignored); worker → hub
+  its stdout as `stdout` and its stderr as `stderr` records (up to 64
+  KiB each), then, once it exited and both pipes are drained, one `exit`
+  (`pty::exit_record`: its code, or `Exit::Signal` for the signal that
+  killed it); a spawn or wait failure is `failed`. Then the worker
+  closes the stream.
+- **Hang-up**: the hub closing its end before the exit kills and reaps
+  the exec; nothing more is written. The hub's end closes when its own
+  stdout's reader went away (`| head`): `pty_client::attach` then ends
+  as `SIGPIPE` (exit 141, no note), as a local exec would.
+
 `sessions.list` / `sessions.rm` ([api](../../reference/api.md#sessions))
 are quick calls, admitted on the `Worker` table with the instance rule
 above; the session list and removal go through the helper's
@@ -1030,6 +1062,14 @@ signal; 255 as 254 under `--reserve-255`); `no-session` 250, `detached`
 255; the other refusals (`bad-request`, `denied`, `not-found`,
 `not-running`, `unsupported`, `failed`) `pty_client::REFUSED_EXIT` (1)
 with `error: <message> (<code>)`, which no loop retries.
+
+A pipe-mode dial (`pty_client::Mode::Pipe`, a non-tty `exec`:
+`cli::pipe_mode`) is the same dial without the terminal: no raw mode, no
+size; stdin read and sent (its EOF `stdin-eof`) only when interactive,
+else not read at all (`pty_client::Terminal`'s `input` `None`);
+`stdout` records to stdout, `stderr` records to stderr; the same
+`exit_of`. It never goes through the reconnect loop: its 255 (a lost
+link, or `lost`) is reported once, with its line.
 
 ### TUNNEL
 

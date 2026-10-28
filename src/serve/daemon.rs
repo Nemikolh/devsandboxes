@@ -701,7 +701,8 @@ impl Shared {
 
     /// One `PTY` stream of the lending link: a socket pair whose one end
     /// goes to the hub, the other served by `fleet::pty::serve` on a thread
-    /// of its own (a session attach in one of `scope`'s instances). `None`
+    /// of its own (a session attach or a piped exec in one of `scope`'s
+    /// instances). `None`
     /// once the daemon is stopping, or without a host side (no helper
     /// client).
     fn open_lent_pty(self: &Arc<Self>, scope: &Arc<lent::Scope>) -> Option<crate::devsbd::mux::Conn> {
@@ -713,7 +714,9 @@ impl Shared {
         let (state, scope) = (self.state.clone(), Arc::clone(scope));
         std::thread::Builder::new()
             .name("serve-pty".into())
-            .spawn(move || fleet::pty::serve(ours, &helper, &state, &scope, crate::commands::exec::has_host_agent, log))
+            .spawn(move || {
+                fleet::pty::serve(ours, &helper, &state, &scope, crate::commands::exec::has_host_agent, fleet::pty::runtime_exec, log)
+            })
             .ok()?;
         Some(hub.into())
     }

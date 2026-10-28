@@ -13,6 +13,12 @@
 //! the codes an ssh dial gives, so `cli::Reconnect` (and the dashboard's
 //! `Redial`) treat both alike: 255 is a lost link and nothing else.
 //!
+//! A piped request ([`Mode::Pipe`], a non-tty `exec`) is the same dial
+//! without a terminal: no raw mode and no size; stdin goes out only when
+//! it is interactive, the worker's `stdout` / `stderr` records go to this
+//! process's stdout / stderr. It is never re-dialed (no session to go back
+//! to): its 255 is a lost link's, reported once.
+//!
 //! [`header`] and [`exit_of`] are pure; [`attach`] is the relay over any
 //! stream and input fd, the terminal (raw mode, size) injected; [`dial`]
 //! the I/O on this process's stdio.
@@ -24,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+pub use super::pty::Mode;
 use super::pty::{METHOD, code};
 use crate::devsbd::rpc::{self, Call, Exit, Obj, Record, code as helper};
 use crate::serve::endpoint::{self, Stream};
@@ -47,23 +54,27 @@ pub struct Request {
     pub root: PathBuf,
     /// The instance's exact name there (or its id).
     pub instance: String,
-    /// The session id (`control::valid_run_id`).
-    pub session: String,
-    /// `None`: attach only. `Some(argv)`: create the session running `argv`
-    /// (empty: the login shell) unless it exists, then attach.
-    pub create: Option<Vec<String>>,
+    /// A session (its id, and `create`: `None` attach only, `Some(argv)`
+    /// create it running `argv`, empty the login shell, unless it exists,
+    /// then attach), or a piped exec.
+    pub mode: Mode,
 }
 
 /// The stream's first record: a `session.attach` call of `r`
 /// (`pty::parse_header` reads it on the worker).
 pub fn header(r: &Request) -> Record {
-    let mut params = Obj::new()
-        .with("root", r.root.to_string_lossy().as_ref())
-        .with("instance", r.instance.as_str())
-        .with("session", r.session.as_str());
-    if let Some(argv) = &r.create {
-        let create = if argv.is_empty() { Obj::new() } else { Obj::new().with("argv", argv.clone()) };
-        params = params.with("create", create);
+    let mut params = Obj::new().with("root", r.root.to_string_lossy().as_ref()).with("instance", r.instance.as_str());
+    match &r.mode {
+        Mode::Session { id, create } => {
+            params = params.with("session", id.as_str());
+            if let Some(argv) = create {
+                let create = if argv.is_empty() { Obj::new() } else { Obj::new().with("argv", argv.clone()) };
+                params = params.with("create", create);
+            }
+        }
+        Mode::Pipe { argv, interactive } => {
+            params = params.with("pipe", Obj::new().with("argv", argv.clone()).with("interactive", *interactive));
+        }
     }
     Record::Call(Call { method: METHOD.into(), params, meta: Obj::new() })
 }
@@ -107,24 +118,26 @@ pub fn exit_of(end: &End, reserve_255: bool) -> (i32, Option<String>) {
 }
 
 /// The terminal one [`attach`] relays: `input` read (polled, so the relay
-/// can stop without a byte to read), `output` written, `size` its size
-/// (`None`: not a terminal, no `resize` sent).
+/// can stop without a byte to read; `None`: nothing is, not even its EOF),
+/// `output` written (`errors`, the worker's `stderr` records), `size` its
+/// size (`None`: not a terminal, no `resize` sent).
 pub struct Terminal<'a> {
-    pub input: RawFd,
+    pub input: Option<RawFd>,
     pub output: &'a mut dyn Write,
+    pub errors: &'a mut dyn Write,
     pub size: &'a (dyn Fn() -> Option<(u16, u16)> + Sync),
 }
 
 /// Relay one `PTY` stream to its end: `header` first, then the size and
 /// `input` on a thread of their own, the worker's `stdout` to `output`
-/// (`stderr` to this process's) until its end record. Closing the stream
+/// (`stderr` to `errors`) until its end record. Closing the stream
 /// at the end (or on a write failure) leaves the session running there.
 pub fn attach(stream: Stream, header: &Record, term: Terminal) -> End {
     if let Err(e) = rpc::write_record(&mut &stream, header) {
         return End::Lost(format!("cannot start the terminal: {e}"));
     }
     let stop = AtomicBool::new(false);
-    let Terminal { input, output, size } = term;
+    let Terminal { input, output, errors, size } = term;
     std::thread::scope(|s| {
         if let Ok(writer) = stream.try_clone() {
             let stop = &stop;
@@ -133,13 +146,19 @@ pub fn attach(stream: Stream, header: &Record, term: Terminal) -> End {
         let end = loop {
             match rpc::read_record(&mut &stream) {
                 Ok(Some(Record::Stdout(bytes))) => {
-                    // A terminal that went away: nothing left to show it on.
-                    if output.write_all(&bytes).and_then(|()| output.flush()).is_err() {
-                        break End::Lost("cannot write to the terminal".into());
+                    match output.write_all(&bytes).and_then(|()| output.flush()) {
+                        Ok(()) => {}
+                        // A reader that closed (a pipe exec into `| head`):
+                        // end as a local exec does, by SIGPIPE, quietly.
+                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                            break End::Exit(Exit::Signal(libc::SIGPIPE));
+                        }
+                        // A terminal that went away: nothing left to show it on.
+                        Err(_) => break End::Lost("cannot write to the terminal".into()),
                     }
                 }
                 Ok(Some(Record::Stderr(bytes))) => {
-                    let _ = io::stderr().write_all(&bytes);
+                    let _ = errors.write_all(&bytes).and_then(|()| errors.flush());
                 }
                 Ok(Some(Record::Exit(exit))) => break End::Exit(exit),
                 Ok(Some(Record::Error { code, message })) => break End::Error { code, message },
@@ -156,8 +175,9 @@ pub fn attach(stream: Stream, header: &Record, term: Terminal) -> End {
 
 /// The input side: the size at once and whenever it changes (looked at
 /// every [`SIZE_POLL`]), `input`'s bytes as `stdin` and its EOF as
-/// `stdin-eof`, until `stop` or the stream refuses a write.
-fn feed(mut w: Stream, input: RawFd, size: &(dyn Fn() -> Option<(u16, u16)> + Sync), stop: &AtomicBool) {
+/// `stdin-eof` (no `input`: neither), until `stop` or the stream refuses a
+/// write.
+fn feed(mut w: Stream, input: Option<RawFd>, size: &(dyn Fn() -> Option<(u16, u16)> + Sync), stop: &AtomicBool) {
     let mut send = |rec: &Record| rpc::write_record(&mut w, rec).is_ok();
     let resize = |s: (u16, u16)| Record::Resize { cols: s.0, rows: s.1 };
     let mut last = size();
@@ -166,7 +186,8 @@ fn feed(mut w: Stream, input: RawFd, size: &(dyn Fn() -> Option<(u16, u16)> + Sy
     {
         return;
     }
-    let mut eof = false;
+    let mut eof = input.is_none();
+    let input = input.unwrap_or(-1);
     let mut buf = [0u8; 8192];
     while !stop.load(Ordering::SeqCst) {
         if eof {
@@ -251,18 +272,28 @@ impl Drop for Raw {
 
 /// One dial of `r` to offered machine `machine`, whose `fleet-link`
 /// sockets are in `dir`, on this process's stdio: its exit code
-/// ([`exit_of`], its line on stderr once the terminal is restored).
+/// ([`exit_of`], its line on stderr once the terminal is restored). A
+/// piped request leaves the terminal as it is and reads stdin only when
+/// interactive.
 pub fn dial(dir: &Path, machine: &str, r: &Request, reserve_255: bool) -> i32 {
     let path = endpoint::fleet_pty_socket(dir, machine);
     let end = match Stream::connect(&path) {
         Err(e) => End::Lost(format!("machine `{machine}`: its fleet link isn't up ({}: {e})", path.display())),
         Ok(stream) => {
-            let raw = Raw::enter();
-            let size = || crate::build_log::terminal_size(0).map(|s| (s.cols, s.rows));
-            let mut out = io::stdout();
-            let end = attach(stream, &header(r), Terminal { input: 0, output: &mut out, size: &size });
-            drop(raw);
-            end
+            let (mut out, mut err) = (io::stdout(), io::stderr());
+            match r.mode {
+                Mode::Session { .. } => {
+                    let raw = Raw::enter();
+                    let size = || crate::build_log::terminal_size(0).map(|s| (s.cols, s.rows));
+                    let end = attach(stream, &header(r), Terminal { input: Some(0), output: &mut out, errors: &mut err, size: &size });
+                    drop(raw);
+                    end
+                }
+                Mode::Pipe { interactive, .. } => {
+                    let input = interactive.then_some(0);
+                    attach(stream, &header(r), Terminal { input, output: &mut out, errors: &mut err, size: &|| None })
+                }
+            }
         }
     };
     let (code, note) = exit_of(&end, reserve_255);
@@ -285,15 +316,20 @@ mod tests {
     const ID: &str = "1700000000-ab12";
 
     fn req(create: Option<Vec<String>>) -> Request {
-        Request { root: "/w/fleet/hub/cfg".into(), instance: "web-1".into(), session: ID.into(), create }
+        Request { root: "/w/fleet/hub/cfg".into(), instance: "web-1".into(), mode: Mode::Session { id: ID.into(), create } }
+    }
+
+    fn pipe(interactive: bool) -> Request {
+        Request { mode: Mode::Pipe { argv: vec!["ls".into(), "-l".into()], interactive }, ..req(None) }
     }
 
     /// What the worker parses back is what was asked.
     #[test]
     fn the_header_is_what_the_worker_parses() {
-        for create in [None, Some(Vec::new()), Some(vec!["htop".to_string(), "-d".into()])] {
-            let h = pty::parse_header(header(&req(create.clone()))).unwrap();
-            assert_eq!(h, pty::Header { root: "/w/fleet/hub/cfg".into(), instance: "web-1".into(), session: ID.into(), create });
+        let sessions = [None, Some(Vec::new()), Some(vec!["htop".to_string(), "-d".into()])].map(|create| req(create).mode);
+        for mode in sessions.into_iter().chain([pipe(false).mode, pipe(true).mode]) {
+            let h = pty::parse_header(header(&Request { mode: mode.clone(), ..req(None) })).unwrap();
+            assert_eq!(h, pty::Header { root: "/w/fleet/hub/cfg".into(), instance: "web-1".into(), mode });
         }
         // The login shell is `create` without an argv.
         let Record::Call(c) = header(&req(Some(Vec::new()))) else { panic!() };
@@ -380,7 +416,9 @@ mod tests {
             std::thread::sleep(SIZE_POLL * 2);
             drop(keys);
         });
-        let end = attach(hub, &header(&req(Some(Vec::new()))), Terminal { input: input.as_raw_fd(), output: &mut out, size: &size });
+        let mut err = Vec::new();
+        let term = Terminal { input: Some(input.as_raw_fd()), output: &mut out, errors: &mut err, size: &size };
+        let end = attach(hub, &header(&req(Some(Vec::new()))), term);
         typist.join().unwrap();
         (String::from_utf8(out).unwrap(), end, worker.join().unwrap())
     }
@@ -410,6 +448,96 @@ mod tests {
         assert!(matches!(&end, End::Lost(why) if why.contains("without an end")), "{end:?}");
         assert_eq!(exit_of(&end, true).0, 255);
         assert_eq!(seen.len(), 1, "no size: no `resize`");
+    }
+
+    /// A pipe's worker end on `s`: reads the header, sends `stdout` `out`
+    /// and `stderr` `err`, takes records until `stdin-eof` (or none come
+    /// for a while), then sends `end` (`None`: closes without one).
+    fn pipe_worker(s: UnixStream, end: Option<Record>) -> std::thread::JoinHandle<Vec<Record>> {
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let send = |rec: Record| rpc::write_record(&mut &s, &rec);
+            let Ok(Some(first)) = rpc::read_record(&mut &s) else { return seen };
+            seen.push(first);
+            let _ = send(Record::Stdout(b"out".to_vec()));
+            let _ = send(Record::Stderr(b"err".to_vec()));
+            s.set_read_timeout(Some(SIZE_POLL * 3)).unwrap();
+            while let Ok(Some(rec)) = rpc::read_record(&mut &s) {
+                let eof = rec == Record::StdinEof;
+                seen.push(rec);
+                if eof {
+                    break;
+                }
+            }
+            if let Some(rec) = end {
+                let _ = send(rec);
+            }
+            let _ = s.shutdown(Shutdown::Both);
+            seen
+        })
+    }
+
+    /// [`attach`] of a pipe request as [`dial`] makes it, its stdin a
+    /// pair's end holding `abc` then closed: stdout, stderr, the end, and
+    /// what the worker read after the header.
+    fn pipe_run(interactive: bool, end: Option<Record>) -> (String, String, End, Vec<Record>) {
+        let (hub, w) = UnixStream::pair().unwrap();
+        let worker = pipe_worker(w, end);
+        let (keys, input) = UnixStream::pair().unwrap();
+        (&keys).write_all(b"abc").unwrap();
+        drop(keys);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let r = pipe(interactive);
+        let term = Terminal { input: interactive.then_some(input.as_raw_fd()), output: &mut out, errors: &mut err, size: &|| None };
+        let end = attach(hub, &header(&r), term);
+        let mut seen = worker.join().unwrap();
+        assert!(matches!(seen.remove(0), Record::Call(c) if c.params.obj("pipe").is_some()));
+        (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap(), end, seen)
+    }
+
+    #[test]
+    fn a_pipe_routes_outputs_and_reads_stdin_only_when_interactive() {
+        let (out, err, end, seen) = pipe_run(false, Some(Record::Exit(Exit::Code(4))));
+        assert_eq!((out.as_str(), err.as_str(), &end), ("out", "err", &End::Exit(Exit::Code(4))));
+        assert_eq!(seen, [], "not interactive: no stdin, no EOF, no size");
+        assert_eq!(exit_of(&end, true).0, 4);
+
+        let (out, _, end, seen) = pipe_run(true, Some(Record::Exit(Exit::Code(255))));
+        assert_eq!(out, "out");
+        assert_eq!(seen, [Record::Stdin(b"abc".to_vec()), Record::StdinEof], "no resize either");
+        assert_eq!(exit_of(&end, true).0, 254, "--reserve-255 kept");
+    }
+
+    #[test]
+    fn a_lost_pipe_is_255() {
+        let (_, _, end, _) = pipe_run(false, None);
+        assert!(matches!(&end, End::Lost(why) if why.contains("without an end")), "{end:?}");
+        assert_eq!(exit_of(&end, true).0, 255);
+        let (_, _, end, _) = pipe_run(false, Some(Record::error(code::LOST, "bridge gone")));
+        assert_eq!(exit_of(&end, true), (255, Some("the terminal's connection was lost: bridge gone".into())));
+    }
+
+    /// A stdout whose reader closed (`| head`).
+    struct Closed;
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_stdout_ends_a_pipe_as_sigpipe() {
+        let (hub, w) = UnixStream::pair().unwrap();
+        let worker = pipe_worker(w, Some(Record::Exit(Exit::Code(0))));
+        let (mut out, mut err) = (Closed, Vec::new());
+        let r = pipe(false);
+        let end = attach(hub, &header(&r), Terminal { input: None, output: &mut out, errors: &mut err, size: &|| None });
+        let _ = worker.join();
+        assert_eq!(end, End::Exit(Exit::Signal(libc::SIGPIPE)));
+        assert_eq!(exit_of(&end, true), (128 + libc::SIGPIPE, None), "quiet, like a local exec");
     }
 
     #[test]

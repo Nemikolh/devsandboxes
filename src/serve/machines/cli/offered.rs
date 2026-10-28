@@ -60,15 +60,16 @@ pub(crate) enum Use {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
     Gc,
-    /// An `exec` that gets no tty (piped, or a command without `-t`): only
-    /// session execs (`PTY`) go over the link.
-    ExecNoTty,
+    /// A session `exec` that gets no tty (`--attach` without a terminal,
+    /// `--session` without `-t`): a session over the link needs one.
+    SessionNoTty,
     Vscode,
 }
 
-/// [`Use`] of `command` on an offered machine. A non-tty `exec` is
-/// [`Use::Link`] here: whether it gets a tty is the caller's to tell
-/// (`cli::reconnect_session`), and [`Refused::ExecNoTty`] its refusal.
+/// [`Use`] of `command` on an offered machine. Every `exec` is
+/// [`Use::Link`] here: whether it gets a tty, so a session or a pipe, is
+/// the caller's to tell (`cli::reconnect_session`, `cli::pipe_mode`), and
+/// [`Refused::SessionNoTty`] a session one's refusal without.
 pub(crate) fn use_of(command: &Command) -> Use {
     match command {
         Command::Logs { build: true, follow, .. } => Use::BuildLog { follow: *follow },
@@ -96,7 +97,11 @@ pub(crate) fn refusal(m: &str, what: Refused) -> anyhow::Error {
                 "machine `{m}` is an offered fleet worker: `gc` there is host maintenance, outside a fleet worker's trust"
             );
         }
-        Refused::ExecNoTty => "an `exec` without a tty",
+        Refused::SessionNoTty => {
+            return anyhow::anyhow!(
+                "machine `{m}` is an offered fleet worker: a session `exec` there (`--attach`, `--session`) needs a terminal"
+            );
+        }
         Refused::Vscode => "`vscode`",
     };
     anyhow::anyhow!("machine `{m}` is an offered fleet worker: {what} isn't available over a fleet link yet")
@@ -385,12 +390,11 @@ mod tests {
     #[test]
     fn refusals_name_the_command_and_why() {
         let r = |what| refusal("lap", what).to_string();
-        for (what, label) in [
-            (Refused::ExecNoTty, "an `exec` without a tty"),
-            (Refused::Vscode, "`vscode`"),
-        ] {
-            assert_eq!(r(what), format!("machine `lap` is an offered fleet worker: {label} isn't available over a fleet link yet"));
-        }
+        assert_eq!(r(Refused::Vscode), "machine `lap` is an offered fleet worker: `vscode` isn't available over a fleet link yet");
+        assert_eq!(
+            r(Refused::SessionNoTty),
+            "machine `lap` is an offered fleet worker: a session `exec` there (`--attach`, `--session`) needs a terminal"
+        );
         assert_eq!(r(Refused::Gc), "machine `lap` is an offered fleet worker: `gc` there is host maintenance, outside a fleet worker's trust");
     }
 

@@ -13,18 +13,31 @@
 //! cancelled; the session runs on in the container); an attach that ends
 //! without an end record is [`code::LOST`].
 //!
-//! [`parse_header`], [`gate`], [`offered`] and [`attach_params`] are pure
-//! (`gate` canonicalizes the header's root); [`serve`] is the I/O.
+//! A header with `pipe` instead of `session` is a piped exec ([`Mode::Pipe`],
+//! a non-tty `exec`): no session and no helper, a `<runtime> exec` without
+//! `-t` on this host ([`runtime_exec`]) with its stdio piped. The hub's
+//! `stdin` records go to its stdin (`stdin-eof` closes it; only when
+//! `interactive`, else its stdin is empty); its stdout and stderr come back
+//! as `stdout` and `stderr` records, then one `exit` once both are drained
+//! and it was reaped ([`exit_record`]). The hub closing the stream first
+//! kills and reaps it, and nothing more is written.
+//!
+//! [`parse_header`], [`gate`], [`offered`], [`attach_params`] and
+//! [`exit_record`] are pure (`gate` canonicalizes the header's root);
+//! [`serve`] is the I/O.
 
+use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::lent::{self, Scope};
-use crate::commands::exec::{SHELL_FALLBACK_CMD, exec_context};
+use crate::commands::exec::{SHELL_FALLBACK_CMD, exec_argv_with, exec_context};
 use crate::devsbd::control::valid_run_id;
-use crate::devsbd::rpc::{self, Json, Obj, Record};
+use crate::devsbd::rpc::{self, Exit, Json, Obj, Record};
 use crate::serve::endpoint::Stream;
 use crate::serve::helper::{Call, CallError, Cancel, HelperClient, Input};
 use crate::state::{Instance, State};
@@ -57,19 +70,34 @@ pub mod code {
 /// How long the hub has to send the header once it opened the stream.
 const HEADER_WAIT: Duration = Duration::from_secs(30);
 
+/// How often a piped exec is checked for its exit and the hub's hang-up.
+const PIPE_TICK: Duration = Duration::from_millis(100);
+
+/// The most bytes one `stdout` / `stderr` record of a piped exec carries.
+const PIPE_CHUNK: usize = 64 * 1024;
+
 /// What the hub asks: `{"root", "instance", "session", "create"?:
-/// {"argv"?}}`.
+/// {"argv"?}}`, or `{"root", "instance", "pipe": {"argv",
+/// "interactive"?}}`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
     /// The instance's config root (absolute, under the fleet root).
     pub root: PathBuf,
     /// An exact instance name or instance id.
     pub instance: String,
-    /// The session id (`control::valid_run_id`).
-    pub session: String,
-    /// `None`: attach only. `Some(argv)`: create it running `argv` (empty:
-    /// the login shell, `SHELL_FALLBACK_CMD`) unless it exists, then attach.
-    pub create: Option<Vec<String>>,
+    pub mode: Mode,
+}
+
+/// A session attach or a piped exec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// Session `id` (`control::valid_run_id`). `create`: `None`, attach
+    /// only; `Some(argv)`, create it running `argv` (empty: the login shell,
+    /// `SHELL_FALLBACK_CMD`) unless it exists, then attach.
+    Session { id: String, create: Option<Vec<String>> },
+    /// A non-tty exec of `argv` (never empty: the hub sends the login shell
+    /// itself), the hub's stdin forwarded when `interactive` (`exec -i`).
+    Pipe { argv: Vec<String>, interactive: bool },
 }
 
 fn bad(message: impl Into<String>) -> Record {
@@ -107,9 +135,27 @@ pub fn parse_header(rec: Record) -> Result<Header, Record> {
     let text = |key: &str| p.str(key).filter(|s| !s.is_empty()).ok_or_else(|| bad(format!("the PTY header needs `{key}`")));
     let root = PathBuf::from(text("root")?);
     let instance = text("instance")?.to_string();
-    let session = text("session")?.to_string();
-    if !valid_run_id(&session) {
-        return Err(bad(format!("bad session id `{session}`")));
+    let present = |key: &str| !matches!(p.get(key), None | Some(Json::Null));
+    if present("pipe") {
+        if present("session") || present("create") {
+            return Err(bad("the PTY header takes `pipe` or `session`, not both"));
+        }
+        let Some(Json::Obj(pipe)) = p.get("pipe") else { return Err(bad("`pipe` must be an object")) };
+        let argv = match pipe.get("argv") {
+            Some(Json::Strs(argv)) if !argv.is_empty() => argv.clone(),
+            Some(Json::Strs(_)) | None | Some(Json::Null) => return Err(bad("`pipe.argv` needs a command")),
+            Some(_) => return Err(bad("`pipe.argv` must be an array of strings")),
+        };
+        let interactive = match pipe.get("interactive") {
+            None | Some(Json::Null) => false,
+            Some(Json::Bool(b)) => *b,
+            Some(_) => return Err(bad("`pipe.interactive` must be a boolean")),
+        };
+        return Ok(Header { root, instance, mode: Mode::Pipe { argv, interactive } });
+    }
+    let id = text("session")?.to_string();
+    if !valid_run_id(&id) {
+        return Err(bad(format!("bad session id `{id}`")));
     }
     let create = match p.get("create") {
         None | Some(Json::Null) => None,
@@ -120,14 +166,16 @@ pub fn parse_header(rec: Record) -> Result<Header, Record> {
         },
         Some(_) => return Err(bad("`create` must be an object")),
     };
-    Ok(Header { root, instance, session, create })
+    Ok(Header { root, instance, mode: Mode::Session { id, create } })
 }
 
 /// The instance the header names, and its `state.toml` key: `root`
 /// confined to the fleet root `fleet_root` as `lent::confine_path` does;
 /// the instance by exact name, else by id, among those lent
 /// (`lent::lent_instances`) whose config root is under `root`; with a
-/// helper. Running isn't checked here (the bridge is, [`offered`]).
+/// helper for a session ([`Mode::Session`]; a pipe needs none). Running
+/// isn't checked here (the bridge is, [`offered`]; a pipe's runtime exec
+/// says so itself).
 pub fn gate<'a>(h: &Header, state: &'a State, fleet_root: &Path) -> Result<(&'a str, &'a Instance), Record> {
     let root = lent::confine_path(fleet_root, &h.root, true).map_err(|e| match e.code {
         "invalid" => bad(e.message),
@@ -141,7 +189,7 @@ pub fn gate<'a>(h: &Header, state: &'a State, fleet_root: &Path) -> Result<(&'a 
     let Some((name, instance)) = found else {
         return Err(Record::error(code::NOT_FOUND, format!("no instance `{}` in {}", h.instance, root.display())));
     };
-    if instance.devsbd_arch.is_none() {
+    if matches!(h.mode, Mode::Session { .. }) && instance.devsbd_arch.is_none() {
         return Err(Record::error(
             code::UNSUPPORTED,
             format!("`{name}` has no devsbd helper: a terminal over the fleet link needs it"),
@@ -170,14 +218,14 @@ pub fn offered(offers: Result<bool, CallError>, name: &str) -> Result<(), Record
     }
 }
 
-/// `session.attach`'s params (devsbd's `rpc_sessions`): `{id, create?:
-/// {argv, cwd, env, user?}}`, `create` as an exec into `instance` runs
-/// (`exec::exec_context`: workspace, remote user, env with
+/// `session.attach`'s params (devsbd's `rpc_sessions`) for session `id`:
+/// `{id, create?: {argv, cwd, env, user?}}`, `create` as an exec into
+/// `instance` runs (`exec::exec_context`: workspace, remote user, env with
 /// `SSH_AUTH_SOCK`; `host_agent` as there).
-pub fn attach_params(h: &Header, instance: &Instance, host_agent: bool) -> Obj {
-    let params = Obj::new().with("id", h.session.as_str());
-    let Some(argv) = &h.create else { return params };
-    let argv = if argv.is_empty() { SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect() } else { argv.clone() };
+pub fn attach_params(id: &str, create: Option<&[String]>, instance: &Instance, host_agent: bool) -> Obj {
+    let params = Obj::new().with("id", id);
+    let Some(argv) = create else { return params };
+    let argv = if argv.is_empty() { SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect() } else { argv.to_vec() };
     let ctx = exec_context(instance, host_agent);
     // `with` replaces a repeated name (the decoder refuses repeats), the
     // later one winning as with repeated `-e`s.
@@ -189,22 +237,62 @@ pub fn attach_params(h: &Header, instance: &Instance, host_agent: bool) -> Obj {
     params.with("create", create)
 }
 
+/// What a piped exec runs: `(instance, interactive, argv, host_agent)` →
+/// the command, its stdio set by the caller. [`runtime_exec`] in the
+/// daemon; tests run a program of their own.
+pub type PipeCommand = fn(&Instance, bool, &[String], bool) -> std::process::Command;
+
+/// The runtime's `exec` of `argv` in `instance` without a tty, as a local
+/// `exec` builds it (`exec::exec_argv_with`): `-i` when `interactive`.
+pub fn runtime_exec(instance: &Instance, interactive: bool, argv: &[String], host_agent: bool) -> std::process::Command {
+    let mut command = std::process::Command::new(crate::runtime::backend().bin());
+    command.args(exec_argv_with(instance, interactive, false, argv, host_agent));
+    command
+}
+
+/// The `exit` record of a piped exec that ended with `status`: its code, or
+/// the signal that killed it.
+pub fn exit_record(status: ExitStatus) -> Record {
+    use std::os::unix::process::ExitStatusExt;
+    Record::Exit(match (status.code(), status.signal()) {
+        (Some(code), _) => Exit::Code(code),
+        (None, Some(signal)) => Exit::Signal(signal),
+        (None, None) => Exit::Code(1),
+    })
+}
+
+/// What a stream's header started.
+enum Started {
+    Attach(Call, Input),
+    Pipe(Child),
+}
+
 /// Serve one `PTY` stream, `link` the worker's end, to its end (see the
 /// module doc). `state` is this host's `state.toml`, `scope` the link's;
-/// `host_agent` probes for a host ssh-agent (`exec::has_host_agent`).
-/// Refusals with `denied` are logged.
-pub fn serve(link: Stream, helper: &HelperClient, state: &Path, scope: &Scope, host_agent: fn() -> bool, log: fn(&str)) {
+/// `host_agent` probes for a host ssh-agent (`exec::has_host_agent`);
+/// `pipe` builds a piped exec ([`runtime_exec`]). Refusals with `denied`
+/// are logged.
+pub fn serve(
+    link: Stream,
+    helper: &HelperClient,
+    state: &Path,
+    scope: &Scope,
+    host_agent: fn() -> bool,
+    pipe: PipeCommand,
+    log: fn(&str),
+) {
     let caller = format!("fleet hub {}", scope.hub);
     let _ = link.set_read_timeout(Some(HEADER_WAIT));
     let first = rpc::read_record(&mut &link);
     let _ = link.set_read_timeout(None);
     let started = match first {
-        Ok(Some(rec)) => start(rec, &link, helper, state, scope, host_agent, &caller),
+        Ok(Some(rec)) => start(rec, &link, helper, state, scope, host_agent, pipe, &caller),
         Ok(None) => return,
         Err(e) => Err(bad(format!("no PTY header: {e}"))),
     };
     match started {
-        Ok((call, input)) => pump(&link, call, input),
+        Ok(Started::Attach(call, input)) => pump(&link, call, input),
+        Ok(Started::Pipe(child)) => run_pipe(&link, child),
         Err(rec) => {
             if let Record::Error { code: c, message } = &rec
                 && c == code::DENIED
@@ -217,8 +305,9 @@ pub fn serve(link: Stream, helper: &HelperClient, state: &Path, scope: &Scope, h
     let _ = link.shutdown(Shutdown::Both);
 }
 
-/// Header, gate, then the call: the attach and its input, or the `error`
-/// to end the stream with.
+/// Header, gate, then the call (the attach and its input) or the piped
+/// exec's spawn, or the `error` to end the stream with.
+#[allow(clippy::too_many_arguments)]
 fn start(
     first: Record,
     link: &Stream,
@@ -226,20 +315,136 @@ fn start(
     state: &Path,
     scope: &Scope,
     host_agent: fn() -> bool,
+    pipe: PipeCommand,
     caller: &str,
-) -> Result<(Call, Input), Record> {
+) -> Result<Started, Record> {
     let h = parse_header(first)?;
     let state = State::load_at(state).map_err(|e| Record::error(code::FAILED, format!("{e:#}")))?;
     let (name, instance) = gate(&h, &state, &scope.root)?;
+    let (id, create) = match &h.mode {
+        Mode::Pipe { argv, interactive } => {
+            let mut command = pipe(instance, *interactive, argv, host_agent());
+            command
+                .stdin(if *interactive { Stdio::piped() } else { Stdio::null() })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            return command
+                .spawn()
+                .map(Started::Pipe)
+                .map_err(|e| Record::error(code::FAILED, format!("cannot run an exec in `{name}`: {e}")));
+        }
+        Mode::Session { id, create } => (id, create),
+    };
     offered(helper.offers(&instance.container, METHOD, caller), name)?;
-    let params = attach_params(&h, instance, host_agent());
+    let params = attach_params(id, create.as_deref(), instance, host_agent());
     // While it queues: whether the hub closed its end.
     let abandoned = || crate::serve::daemon::hung_up(link, Duration::ZERO);
-    helper.call_with_input(&instance.container, METHOD, params, Obj::new(), caller, &abandoned).map_err(|e| match e {
+    let (call, input) = helper.call_with_input(&instance.container, METHOD, params, Obj::new(), caller, &abandoned).map_err(|e| match e {
         CallError::NoBridge(_) | CallError::Unsupported(_) => offered(Err(e), name).expect_err("a refusal"),
         CallError::Abandoned => Record::error(code::FAILED, "the hub hung up while the attach queued"),
         CallError::Io(e) => Record::error(code::LOST, format!("cannot reach `{name}`'s helper: {e}")),
-    })
+    })?;
+    Ok(Started::Attach(call, input))
+}
+
+/// A piped exec to its end: the hub's input into its stdin and its stdout
+/// and stderr out as records, each on a thread of its own; once it exited
+/// and both pipes are drained, its `exit` record. The hub hanging up first
+/// (`feed_pipe` reads the stream's end, or a peek between waits does)
+/// kills and reaps it, and nothing more is written.
+fn run_pipe(link: &Stream, mut child: Child) {
+    let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    // One writer at a time: a record is one write, never interleaved.
+    let writer = Mutex::new(());
+    let send = |rec: &Record| {
+        let _turn = writer.lock().unwrap_or_else(|e| e.into_inner());
+        rpc::write_record(&mut &*link, rec).is_ok()
+    };
+    let done = AtomicBool::new(false);
+    let gone = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let send = &send;
+        let out = stdout.map(|r| s.spawn(move || drain(r, Record::Stdout, send)));
+        let err = stderr.map(|r| s.spawn(move || drain(r, Record::Stderr, send)));
+        if let Ok(reader) = link.try_clone() {
+            let (done, gone) = (&done, &gone);
+            s.spawn(move || feed_pipe(reader, stdin, done, gone));
+        }
+        let ended = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+            if gone.load(Ordering::SeqCst) || crate::serve::daemon::hung_up(link, PIPE_TICK) {
+                gone.store(true, Ordering::SeqCst);
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(std::io::Error::other("the hub hung up"));
+            }
+        };
+        for drained in [out, err].into_iter().flatten() {
+            let _ = drained.join();
+        }
+        if !gone.load(Ordering::SeqCst) {
+            let last = match ended {
+                Ok(status) => exit_record(status),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Record::error(code::FAILED, format!("cannot wait for the exec: {e}"))
+                }
+            };
+            send(&last);
+        }
+        done.store(true, Ordering::SeqCst);
+        // Ends `feed_pipe`'s read.
+        let _ = link.shutdown(Shutdown::Both);
+    });
+}
+
+/// One of a piped exec's outputs to its end, each read as one `wrap`
+/// record, until the hub refuses a write.
+fn drain(mut r: impl Read, wrap: fn(Vec<u8>) -> Record, send: &(dyn Fn(&Record) -> bool + Sync)) {
+    let mut buf = vec![0u8; PIPE_CHUNK];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if !send(&wrap(buf[..n].to_vec())) {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// The hub's records into a piped exec's `stdin` (`None`: not interactive,
+/// its input ignored) until the hub closes its end, which flags `gone`
+/// unless the exec is over (`done`). `stdin-eof`, or a write the exec
+/// refuses, closes its stdin.
+fn feed_pipe(mut reader: Stream, mut stdin: Option<std::process::ChildStdin>, done: &AtomicBool, gone: &AtomicBool) {
+    loop {
+        match rpc::read_record(&mut reader) {
+            Ok(Some(Record::Stdin(bytes))) => {
+                if let Some(w) = &mut stdin
+                    && w.write_all(&bytes).is_err()
+                {
+                    stdin = None;
+                }
+            }
+            Ok(Some(Record::StdinEof)) => stdin = None,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                if !done.load(Ordering::SeqCst) {
+                    gone.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// The attach's last record.
@@ -339,12 +544,12 @@ mod tests {
     #[test]
     fn the_header_parses_and_is_checked() {
         let h = parse_header(header(base("/f/cfg"))).unwrap();
-        assert_eq!(h, Header { root: "/f/cfg".into(), instance: "web-1".into(), session: SESSION.into(), create: None });
+        assert_eq!(h, Header { root: "/f/cfg".into(), instance: "web-1".into(), mode: session(None) });
         let shell = parse_header(header(base("/f").with("create", Obj::new()))).unwrap();
-        assert_eq!(shell.create, Some(Vec::new()), "no argv: the login shell");
+        assert_eq!(shell.mode, session(Some(Vec::new())), "no argv: the login shell");
         let argv = parse_header(header(base("/f").with("create", Obj::new().with("argv", vec!["htop".to_string()])))).unwrap();
-        assert_eq!(argv.create, Some(vec!["htop".to_string()]));
-        assert_eq!(parse_header(header(base("/f").with("create", Json::Null))).unwrap().create, None);
+        assert_eq!(argv.mode, session(Some(vec!["htop".to_string()])));
+        assert_eq!(parse_header(header(base("/f").with("create", Json::Null))).unwrap().mode, session(None));
 
         let refused = |rec: Record| match parse_header(rec) {
             Err(Record::Error { code, message }) => (code, message),
@@ -359,6 +564,49 @@ mod tests {
         assert!(refused(header(Obj::new().with("instance", "a").with("session", SESSION))).1.contains("needs `root`"));
         assert!(refused(header(base("/f").with("create", "sh"))).1.contains("`create` must be"));
         assert!(refused(header(base("/f").with("create", Obj::new().with("argv", "sh")))).1.contains("`create.argv`"));
+    }
+
+    fn session(create: Option<Vec<String>>) -> Mode {
+        Mode::Session { id: SESSION.into(), create }
+    }
+
+    fn pipe_base(root: &str) -> Obj {
+        Obj::new().with("root", root).with("instance", "web-1")
+    }
+
+    #[test]
+    fn a_pipe_header_parses_and_excludes_a_session() {
+        let ls = || Obj::new().with("argv", vec!["ls".to_string(), "-l".into()]);
+        let h = parse_header(header(pipe_base("/f").with("pipe", ls()))).unwrap();
+        assert_eq!(h.mode, Mode::Pipe { argv: vec!["ls".into(), "-l".into()], interactive: false }, "no session needed");
+        let i = parse_header(header(pipe_base("/f").with("pipe", ls().with("interactive", true)))).unwrap();
+        assert_eq!(i.mode, Mode::Pipe { argv: vec!["ls".into(), "-l".into()], interactive: true });
+
+        let refused = |params: Obj| match parse_header(header(params)) {
+            Err(Record::Error { code, message }) => {
+                assert_eq!(code, code::BAD_REQUEST);
+                message
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(refused(base("/f").with("pipe", ls())).contains("not both"), "with a session");
+        assert!(refused(pipe_base("/f").with("pipe", ls()).with("create", Obj::new())).contains("not both"));
+        assert!(refused(pipe_base("/f").with("pipe", Obj::new())).contains("needs a command"));
+        assert!(refused(pipe_base("/f").with("pipe", Obj::new().with("argv", Vec::<String>::new()))).contains("needs a command"));
+        assert!(refused(pipe_base("/f").with("pipe", Obj::new().with("argv", "ls"))).contains("array of strings"));
+        assert!(refused(pipe_base("/f").with("pipe", ls().with("interactive", "yes"))).contains("boolean"));
+        assert!(refused(pipe_base("/f").with("pipe", "ls")).contains("must be an object"));
+        assert!(refused(pipe_base("/f")).contains("needs `session`"), "neither");
+    }
+
+    #[test]
+    fn exits_encode_a_code_or_a_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_record(ExitStatus::from_raw(3 << 8)), Record::Exit(Exit::Code(3)));
+        assert_eq!(exit_record(ExitStatus::from_raw(0)), Record::Exit(Exit::Code(0)));
+        assert_eq!(exit_record(ExitStatus::from_raw(9)), Record::Exit(Exit::Signal(9)));
+        let rec = exit_record(ExitStatus::from_raw(15));
+        assert_eq!(rpc::read_record(&mut &rec.encode()[..]).unwrap(), Some(rec), "as rpc carries it");
     }
 
     /// `state.toml` text: `web-1` lent (under `cfg`, with a helper), `bare`
@@ -394,12 +642,7 @@ mod tests {
         std::fs::create_dir_all(b.join("mine")).unwrap();
         let state = state_with(&b, &root);
         let cfg = root.join("cfg");
-        let h = |root: &Path, instance: &str| Header {
-            root: root.to_path_buf(),
-            instance: instance.into(),
-            session: SESSION.into(),
-            create: None,
-        };
+        let h = |root: &Path, instance: &str| Header { root: root.to_path_buf(), instance: instance.into(), mode: session(None) };
         let (name, i) = gate(&h(&cfg, "web-1"), &state, &root).unwrap();
         assert_eq!((name, i.container.as_str()), ("web-1", "devsandbox-web-1"));
         assert_eq!(gate(&h(&cfg, "id-web-1"), &state, &root).unwrap().0, "web-1", "by id");
@@ -411,6 +654,9 @@ mod tests {
         assert_eq!(code_of(gate(&h(&root.join("gone"), "web-1"), &state, &root)), code::NOT_FOUND);
         assert_eq!(code_of(gate(&h(Path::new("rel"), "web-1"), &state, &root)), code::BAD_REQUEST);
         assert_eq!(code_of(gate(&h(&cfg, "bare"), &state, &root)), code::UNSUPPORTED, "no helper");
+        let pipe = |instance: &str| Header { mode: Mode::Pipe { argv: vec!["ls".into()], interactive: false }, ..h(&cfg, instance) };
+        assert_eq!(gate(&pipe("bare"), &state, &root).unwrap().0, "bare", "a pipe needs no helper");
+        assert_eq!(code_of(gate(&pipe("own"), &state, &root)), code::NOT_FOUND, "but the same lending");
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -431,14 +677,12 @@ mod tests {
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         let state = state_with(&b, &root);
         let mut inst = state.instances["web-1"].clone();
-        let h = Header { root: root.join("cfg"), instance: "web-1".into(), session: SESSION.into(), create: None };
-        assert_eq!(attach_params(&h, &inst, false), Obj::new().with("id", SESSION), "attach only");
+        assert_eq!(attach_params(SESSION, None, &inst, false), Obj::new().with("id", SESSION), "attach only");
 
         inst.remote_user = Some("vscode".into());
         inst.remote_env = BTreeMap::from([("A".into(), "1".into()), ("SSH_AUTH_SOCK".into(), "/mine".into())]);
         inst.ssh_auth_sock = Some("/ssh-agent".into());
-        let create = Header { create: Some(Vec::new()), ..h.clone() };
-        let p = attach_params(&create, &inst, false);
+        let p = attach_params(SESSION, Some(&[]), &inst, false);
         let c = p.obj("create").unwrap();
         let shell: Vec<String> = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
         assert_eq!(c.strs("argv"), Some(shell.as_slice()), "empty argv: the login shell");
@@ -450,8 +694,7 @@ mod tests {
         assert_eq!(rpc::read_record(&mut &rec.encode()[..]).unwrap(), Some(rec));
 
         inst.remote_user = None;
-        let argv = Header { create: Some(vec!["htop".into()]), ..h };
-        let c = attach_params(&argv, &inst, false).obj("create").unwrap().clone();
+        let c = attach_params(SESSION, Some(&["htop".to_string()]), &inst, false).obj("create").unwrap().clone();
         assert_eq!((c.strs("argv"), c.str("user")), (Some(&["htop".to_string()][..]), None), "no user: the container's");
         let _ = std::fs::remove_dir_all(&b);
     }
@@ -539,7 +782,7 @@ mod tests {
         let (hub, ours) = UnixStream::pair().unwrap();
         let scope = Scope { hub: "me@hub".into(), root: w.root.clone(), env: BTreeMap::new() };
         let state = w.state.clone();
-        let t = std::thread::spawn(move || serve(ours, &helper, &state, &scope, || false, log));
+        let t = std::thread::spawn(move || serve(ours, &helper, &state, &scope, || false, sh, log));
         rpc::write_record(&mut &hub, &header).unwrap();
         hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         (hub, t)
@@ -593,6 +836,78 @@ mod tests {
         drop(hub);
         t.join().unwrap();
         assert!(logged("helper devsandbox-web-1: session.attach from fleet hub me@hub: cancelled ("));
+    }
+
+    /// The tests' piped exec: `sh -c <argv[0]>` on this host.
+    fn sh(_: &Instance, _: bool, argv: &[String], _: bool) -> std::process::Command {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(&argv[0]);
+        c
+    }
+
+    fn pipe_header(w: &World, instance: &str, script: &str, interactive: bool) -> Record {
+        let cfg = w.root.join("cfg");
+        let pipe = Obj::new().with("argv", vec![script.to_string()]).with("interactive", interactive);
+        header(Obj::new().with("root", cfg.to_str().unwrap()).with("instance", instance).with("pipe", pipe))
+    }
+
+    /// The `stdout` and `stderr` bytes of `recs`, and their last record.
+    fn split(recs: &[Record]) -> (String, String, Option<Record>) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        for rec in recs {
+            match rec {
+                Record::Stdout(b) => out.extend_from_slice(b),
+                Record::Stderr(b) => err.extend_from_slice(b),
+                _ => {}
+            }
+        }
+        (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap(), recs.last().cloned())
+    }
+
+    #[test]
+    fn a_pipe_splits_its_outputs_and_ends_with_its_exit() {
+        let w = world("pipe-out");
+        // `bare` has no helper: a pipe doesn't need one.
+        let (hub, t) = open(&w, pipe_header(&w, "bare", "echo out; echo err >&2; cat; exit 5", false), w.helper.clone());
+        // It may be over already: the write's outcome doesn't matter.
+        let _ = rpc::write_record(&mut &hub, &Record::Stdin(b"ignored\n".to_vec()));
+        let recs = rest(&hub);
+        t.join().unwrap();
+        assert_eq!(split(&recs), ("out\n".into(), "err\n".into(), Some(Record::Exit(Exit::Code(5)))), "not interactive: empty stdin");
+        assert_eq!(recs.iter().filter(|r| matches!(r, Record::Exit(_))).count(), 1);
+
+        let (hub, t) = open(&w, pipe_header(&w, "web-1", "kill -9 $$", false), w.helper.clone());
+        let recs = rest(&hub);
+        t.join().unwrap();
+        assert_eq!(recs, [Record::Exit(Exit::Signal(9))]);
+    }
+
+    #[test]
+    fn a_pipe_forwards_stdin_to_its_eof() {
+        let w = world("pipe-in");
+        let (hub, t) = open(&w, pipe_header(&w, "web-1", "cat; echo done", true), w.helper.clone());
+        rpc::write_record(&mut &hub, &Record::Stdin(b"abc".to_vec())).unwrap();
+        rpc::write_record(&mut &hub, &Record::Resize { cols: 80, rows: 24 }).unwrap();
+        rpc::write_record(&mut &hub, &Record::Stdin(b"def\n".to_vec())).unwrap();
+        rpc::write_record(&mut &hub, &Record::StdinEof).unwrap();
+        let recs = rest(&hub);
+        t.join().unwrap();
+        assert_eq!(split(&recs), ("abcdef\ndone\n".into(), String::new(), Some(Record::Exit(Exit::Code(0)))));
+    }
+
+    #[test]
+    fn a_hang_up_kills_the_pipe() {
+        let w = world("pipe-hup");
+        let (hub, t) = open(&w, pipe_header(&w, "web-1", "echo $$; exec sleep 30", true), w.helper.clone());
+        let Ok(Some(Record::Stdout(pid))) = rpc::read_record(&mut &hub) else { panic!("no pid") };
+        let pid = String::from_utf8(pid).unwrap();
+        let pid: libc::pid_t = pid.trim().parse().unwrap_or_else(|_| panic!("{pid:?}"));
+        let started = std::time::Instant::now();
+        drop(hub);
+        t.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "killed, not waited out");
+        // SAFETY: signal 0 only checks the pid; reaped, it's gone.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "killed and reaped");
     }
 
     #[test]

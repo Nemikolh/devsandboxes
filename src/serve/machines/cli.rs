@@ -512,6 +512,31 @@ pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl Fn
     }))
 }
 
+/// The piped `PTY` mode of a machine `exec` that gets no tty (the rule
+/// [`reconnect_session`]'s): `argv` as typed, `-i` as given; no command,
+/// the login shell (`exec::SHELL_FALLBACK_CMD`) with `exec::shell_flags`'
+/// `-i`, as a local `exec` runs it. `None` for one that gets a tty, a
+/// session one (`--attach`, `--sessions`, `--session`) and any other
+/// command.
+pub(crate) fn pipe_mode(command: &Command, terminal: bool) -> Option<pty_client::Mode> {
+    let Command::Exec { interactive, tty, attach: None, sessions: false, session: None, command, .. } = command else {
+        return None;
+    };
+    let (argv, interactive) = if command.is_empty() {
+        let (interactive, tty) = crate::commands::exec::shell_flags(*interactive, *tty, terminal);
+        if tty {
+            return None;
+        }
+        (crate::commands::exec::SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect(), interactive)
+    } else {
+        if *tty {
+            return None;
+        }
+        (command.clone(), *interactive)
+    };
+    Some(pty_client::Mode::Pipe { argv, interactive })
+}
+
 /// The two remote commands of a session exec (`command`, an `Exec`) in
 /// session `id`: the first dial, `exec --session=<id>` as typed
 /// (create-or-attach), and every re-dial, `exec --attach=<id>` (attach only:
@@ -561,7 +586,11 @@ pub(crate) fn dials(entry: &Entry, command: &Command, name: &str, root: Option<&
     if entry.is_offered() {
         let Command::Exec { command, .. } = first else { bail!("not an exec") };
         let root = root.with_context(|| format!("machine `{}` has no config roots (devsandbox machine ls)", entry.name))?;
-        let request = |create| pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), session: id.to_string(), create };
+        let request = |create| pty_client::Request {
+            root: root.to_path_buf(),
+            instance: name.to_string(),
+            mode: pty_client::Mode::Session { id: id.to_string(), create },
+        };
         return Ok(Dials::Pty { first: request(Some(command)), again: request(None) });
     }
     let first = ssh::cli_argv(entry, terminal, &remote_args(&first, name, root).context("not an exec")?)?;
@@ -851,8 +880,19 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         return run_dials(dials, &entry, &id, hold(conn, &entry));
     }
     if entry.is_offered() {
-        // What's left for an offered machine: an exec without a tty.
-        return Err(offered::refusal(&m, offered::Refused::ExecNoTty));
+        // What's left for an offered machine: an exec without a tty, one
+        // piped `PTY` dial (never re-dialed: no session to go back to).
+        let Some(mode) = pipe_mode(&command, terminal) else {
+            return Err(offered::refusal(&m, offered::Refused::SessionNoTty));
+        };
+        let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+        let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
+        let request = pty_client::Request { root: root.to_path_buf(), instance: chosen.name.clone(), mode };
+        let dir = endpoint::socket_dir()?;
+        let held = hold(conn, &entry);
+        let code = pty_client::dial(&dir, &m, &request, reserve_255);
+        drop(held);
+        return Ok(Routed::Exit(code));
     }
     let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
     let argv = ssh::cli_argv(&entry, terminal, &args)?;
@@ -864,7 +904,8 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
 /// `sessions.list` quick call on `conn`, the attach one `PTY` dial (no loop,
 /// as over ssh: its 255 is the caller's to retry). `None` for any other
 /// exec, which [`resolve_and_route`] goes on with (a non-tty one to
-/// [`offered::Refused::ExecNoTty`]).
+/// [`pipe_mode`], an `--attach` without a terminal to
+/// [`offered::Refused::SessionNoTty`]).
 fn offered_session_exec(
     command: &Command,
     conn: &mut Conn,
@@ -907,7 +948,8 @@ fn offered_session_exec(
             })?
         }
     };
-    let request = pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), session: id, create: None };
+    let mode = pty_client::Mode::Session { id, create: None };
+    let request = pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), mode };
     Ok(Some(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, m, &request, *reserve_255))))
 }
 
@@ -1138,10 +1180,12 @@ mod tests {
         assert_eq!(named(&["undone", "box/web"]), (true, Use::Done(false)));
         assert_eq!(named(&["rename", "box/web", "x"]), (true, Use::Rename("x".into())));
         assert_eq!(named(&["vscode", "box/web"]), (false, Use::Refused(Refused::Vscode)));
-        // exec: a tty one dials `PTY` (`dials`), a non-tty one is refused
-        // after `reconnect_session` says it gets none.
+        // exec: a tty one dials a `PTY` session (`dials`), a non-tty one a
+        // piped `PTY` after `reconnect_session` says it gets none.
+        let ls = command(&["exec", "box/web", "--", "ls"]);
         assert_eq!(named(&["exec", "box/web", "--", "ls"]), (true, Use::Link));
-        assert_eq!(reconnect_session(&command(&["exec", "box/web", "--", "ls"]), true, || ID.into()).unwrap(), None);
+        assert_eq!(reconnect_session(&ls, true, || ID.into()).unwrap(), None);
+        assert_eq!(pipe_mode(&ls, true), Some(pty_client::Mode::Pipe { argv: ms(&["ls"]), interactive: false }));
     }
 
     fn entry() -> Entry {
@@ -1285,6 +1329,26 @@ mod tests {
         assert!(reconnect_session(&command(&["exec", "--session", "nope", "box/web"]), true, mint).is_err());
     }
 
+    /// A machine exec without a tty is piped, `-i` and the login shell as a
+    /// local `exec` decides them; one with a tty, or a session one, isn't.
+    #[test]
+    fn non_tty_execs_are_piped() {
+        use pty_client::Mode::Pipe;
+        let pm = |args: &[&str], terminal| pipe_mode(&command(args), terminal);
+        let shell: Vec<String> = crate::commands::exec::SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+        assert_eq!(pm(&["exec", "box/web", "ls"], false), Some(Pipe { argv: ms(&["ls"]), interactive: false }));
+        assert_eq!(pm(&["exec", "box/web", "ls"], true), Some(Pipe { argv: ms(&["ls"]), interactive: false }), "no -t: none");
+        assert_eq!(pm(&["exec", "-i", "box/web", "cat"], false), Some(Pipe { argv: ms(&["cat"]), interactive: true }));
+        assert_eq!(pm(&["exec", "box/web"], false), Some(Pipe { argv: shell.clone(), interactive: true }), "the shell keeps stdin");
+        assert_eq!(pm(&["exec", "-i", "box/web"], true), Some(Pipe { argv: shell, interactive: true }), "explicit -i: no tty");
+        assert_eq!(pm(&["exec", "box/web"], true), None, "the shell on a terminal: a session");
+        assert_eq!(pm(&["exec", "-t", "box/web", "ls"], false), None);
+        assert_eq!(pm(&["exec", "--session", "1790000000-0000", "box/web", "ls"], false), None);
+        assert_eq!(pm(&["exec", "box/web", "--attach"], false), None);
+        assert_eq!(pm(&["exec", "box/web", "--sessions"], false), None);
+        assert_eq!(pm(&["logs", "box/web"], false), None);
+    }
+
     /// The first dial creates (or attaches), every re-dial only attaches,
     /// both with `--reserve-255`; each parses back on the machine.
     #[test]
@@ -1320,8 +1384,7 @@ mod tests {
         let request = |create: Option<Vec<String>>| pty_client::Request {
             root: "/w/fleet/hub/cfg".into(),
             instance: "web-2".into(),
-            session: ID.into(),
-            create,
+            mode: pty_client::Mode::Session { id: ID.into(), create },
         };
         assert_eq!(
             dials(&lap, &exec, "web-2", root, ID, true).unwrap(),

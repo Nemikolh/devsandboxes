@@ -410,7 +410,14 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   quick call with `machine` (the lines printed, or `no sessions in
   \`m/x\`` on stderr); a tty `--attach [ID]` is one dial attaching only
   (no id: `exec::choose_detached` over that list), no loop, as over ssh
-  (`offered_session_exec`).
+  (`offered_session_exec`). An `exec` without a tty is one piped `PTY`
+  dial ([fleet](fleet.md#pty), *Pipe mode*) and never re-dialed:
+  `cli::pipe_mode` (pure) gives its argv and `-i` as a local `exec`
+  decides them (the command as typed with `-i` as given; none, the login
+  shell with `exec::shell_flags`' `-i`), and `resolve_and_route` dials it
+  with the machine held for the agent. A session `exec` without a tty
+  (`--attach` off a terminal, `--session` without `-t`) is refused
+  (`offered::Refused::SessionNoTty`).
 - **Other re-runs to an offered fleet worker** are API calls through this
   host's daemon with `machine` set (fleet plan decision 15: within the
   worker's trust, never a `devsandbox …` run there), printed by the local
@@ -451,9 +458,10 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   (`offered::listing`): the worker answers its whole runtime's rows cut to
   what it lends (its lent instances' containers and their config roots'
   services, [fleet](fleet.md#the-worker-table)). Refused, naming the
-  command (`offered::refusal`): an `exec` without a tty
-  and `vscode` (not over a fleet link yet), and `gc` (host maintenance on
-  the worker, outside a worker's trust).
+  command (`offered::refusal`): `vscode` (not over a fleet link yet), a
+  session `exec` without a tty (a session over the link needs a
+  terminal), and `gc` (host maintenance on the worker, outside a
+  worker's trust).
 
 ## `devsandbox machine add|ls|set|rm`
 

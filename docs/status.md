@@ -281,9 +281,9 @@ limitation means editing this file in the same commit.
   worker's `build.log` by path, page by page: a new build rotating it
   mid-follow isn't followed into `build.1.log` as a local follow (which
   keeps the file open) would. → [api](reference/api.md#instancesbuildlog); `build_log::page_in`
-- An `exec` without a tty (piped, or `exec m/x -- cmd` without `-t`) on
-  an offered worker's instance is refused: only session execs (`PTY`) go
-  over the link. → [fleet](architecture/daemon/fleet.md#pty); `machines::cli::offered::Refused::ExecNoTty`
+- A session `exec` without a tty (`--attach` off a terminal, `--session`
+  without `-t`) on an offered worker's instance is refused: a session over
+  the link needs a terminal. → [fleet](architecture/daemon/fleet.md#pty); `machines::cli::offered::Refused::SessionNoTty`
 - `inspect` on an offered worker's instance prints no browser sandbox
   line (it comes from this host's record).
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::named`

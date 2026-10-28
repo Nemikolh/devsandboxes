@@ -336,11 +336,13 @@ mod tests {
 
         // A terminal: one `PTY` stream through the link's pty socket.
         use crate::serve::fleet::pty_client;
-        let request = pty_client::Request { root: WORKER_ROOT.into(), instance: "web-w".into(), session: "1700000000-ab12".into(), create: None };
+        let mode = pty_client::Mode::Session { id: "1700000000-ab12".into(), create: None };
+        let request = pty_client::Request { root: WORKER_ROOT.into(), instance: "web-w".into(), mode };
         let (_keys, input) = UnixStream::pair().unwrap();
         let mut out = Vec::new();
         let stream = endpoint::Stream::connect(endpoint::fleet_pty_socket(&hub_dir, "lap")).unwrap();
-        let term = pty_client::Terminal { input: std::os::fd::AsRawFd::as_raw_fd(&input), output: &mut out, size: &|| None };
+        let mut err = Vec::new();
+        let term = pty_client::Terminal { input: Some(std::os::fd::AsRawFd::as_raw_fd(&input)), output: &mut out, errors: &mut err, size: &|| None };
         let end = pty_client::attach(stream, &pty_client::header(&request), term);
         assert_eq!((end, out), (pty_client::End::Exit(crate::devsbd::rpc::Exit::Code(4)), b"hi 1700000000-ab12".to_vec()));
 
