@@ -232,7 +232,7 @@ pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&st
     let resolve = |f: &str| root.join(f).canonicalize().with_context(|| format!("sandbox folder `{f}` does not exist"));
     let main = resolve(folder)?;
     if main.starts_with(&root) {
-        return not_movable(format!("its folder {} is in the config root (a root that's a repo moves in fleet step 5)", main.display()));
+        return not_movable(format!("its folder {} is in the config root (a root that's a repo moves in fleet step 11)", main.display()));
     }
     let mut outside = vec![main];
     for entry in props.folders.iter().flat_map(|f| f.values()) {

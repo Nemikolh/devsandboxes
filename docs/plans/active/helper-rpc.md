@@ -338,8 +338,8 @@ design above, found in the code:
 4. Fleet step 4 (`PTY` over the RPC stream; shipped: the fleet
    worker's daemon is `session.attach`'s first caller, `fleet::pty`).
 5. Steps 4-5 here (daemon-owned runs, restart policy), before fleet step
-   6 so dispatcher children on workers don't poll across machines.
-6. Fleet steps 5-9.
+   12 so dispatcher children on workers don't poll across machines.
+6. Fleet steps 5-15 (5-11 don't wait for steps 4-5 here).
 
 ## Open questions
 

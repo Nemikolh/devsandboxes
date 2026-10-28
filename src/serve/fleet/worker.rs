@@ -290,7 +290,7 @@ impl Lending {
 
     /// A new `TRANSFER` stream to the hub (for `transfer::send`); an error
     /// while no link is up.
-    #[allow(dead_code)] // first caller: fetch-back (fleet step 5)
+    #[allow(dead_code)] // first caller: fetch-back (fleet step 11)
     pub fn open_transfer(&self) -> Result<Conn> {
         self.ctl.outlet.open(crate::devsbd::proto::channel::TRANSFER)
     }
