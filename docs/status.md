@@ -30,10 +30,12 @@ limitation means editing this file in the same commit.
 - **machines**: VS Code on remote rows (spike),
   remote Inbox threads, nameless commands across every machine.
   → [plan](plans/active/machines-next.md)
-- **machines**: a fleet: workers dial an always-on hub and lend a
-  restricted API (no ssh into them), soft-cap placement, devsandbox-owned code transfer between hosts, dispatcher
-  children on any machine, checkpoints and re-placement: from fleet
-  step 4 (`PTY` over `session.attach`) on, steps 1-3 shipped.
+- **machines**: a fleet: every machine a member (one `machine add`,
+  links routed over a graph, `worker`/`full` trust per member, a
+  swappable hub), soft-cap placement, devsandbox-owned code transfer
+  between hosts, dispatcher children on any machine, checkpoints and
+  re-placement: from fleet step 4 (`PTY` over `session.attach`) on,
+  steps 1-3 shipped on the two-kind model step 4b replaces.
   → [plan](plans/active/fleet.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)

@@ -1,81 +1,31 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress
-Commit 1a (link primitive) shipped: `serve::fleet::link`, `channel::API`;
-1b (hub side) shipped: `fleet-link`, `fleet.offer`, the `offered` registry
-kind and its dial; 1c (worker side) shipped: `lend.toml` read at start,
-the lending thread, the fleet root and the `Worker` table; 1d (CLI)
-shipped: `serve::locked_file`, `lend.get|set` applied live, `devsandbox
-lend`, `fleet join|leave`; 1e (worker policy) shipped: `worker_policy`,
-detected by path (no flag), checked on the final `run` / `build` argv and
-the config, allowances in `lend.toml`'s `[allow]`; 1f (hub mode)
-shipped: keep-alive, offered links always held, `remotes.json`
-(`machines::saved`) restored as `unreachable`; 1g (capacity) shipped:
-`serve::capacity`, the report in every root's snapshot and on
-`SnapshotMachine`, `[caps]` in `lend.toml`, offered entries' fleet root
-(`fleet-link --root`), LEND / CAPACITY in the Machines tab and `machine
-ls`; 2a (`TRANSFER`) shipped: `channel::TRANSFER` both ways on the fleet
-link (`fleet-<name>.transfer.sock` hub → worker, the answerer's `Outlet`
-worker → hub), `serve::fleet::transfer` (header line, `ready`, body, `ok` /
-`error`), receivers by kind with none registered yet; 2b (self-update)
-shipped: the link `Hello` says `<semver> <git> <published|dev>`
-(`fleet::update::HELLO`, `build.rs`), the worker follows a published hub
-build (download, `INSTALL` run locally, forced handoff:
-`HelloParams::force`), inert until `release.yml` sets
-`DEVSANDBOX_PUBLISHED=1`; 2c (dev builds) shipped: the `Hello` gains
-`<os>/<arch>`, `lend.toml` `dev-builds` (hand-edited, default off), the
-hub's `fleet-link` pushes its own binary as a `binary` transfer, the
-worker serves no `API` stream until it's in, checks its `fleet-hello`,
-installs and hands off; 3a (image namespacing) shipped: image tags and
-feature build contexts carry the root's `services::project_id`
-(`run::image::sandbox_image`, `features_image`,
-`services::service_image_tag`, `features::build_context_name`;
-[images](../../architecture/instances/images-and-features.md)); 3b
-(`place`) shipped: `serve::fleet::place` (`place`, `score`, `Candidate::local`
-/ `from_machine`, `has_image`), pure
-([fleet](../../architecture/daemon/fleet.md#placement)); 3c1 (moving
-code) shipped: `serve::fleet::code` (`offer`, `send`, `prepare`,
-`Transfer`, `LinkTransfer`, the worker's `root-tar` / `bundle`
-receivers), the root as an in-process ustar, the hub's repo cache
-(`repos/<url hash>.git`), `Header::to`, `transfer::receive_then`,
-`host_git_bare` / `host_git_new`
-([fleet](../../architecture/daemon/fleet.md#moving-code)); 3c2 (placed
-`run`) shipped: the daemon's `run` verb places (`daemon.rs`
-`placed_run`, `serve::fleet::placed`), moves the code and forwards the
-run to the worker; `run --here`; `capacity.get` (on demand, lent) asked
-of each worker before placing; a draining worker refuses a hub's `run`;
-a new branch starts at the bundled tip (`--base`)
-([fleet](../../architecture/daemon/fleet.md#in-the-run-verb)). Steps
-1-3 are done
+Status: in progress. Steps 1-3 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
-[0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)); the rest
-is design. Builds on [machines](../../architecture/daemon/machines.md)
-and supersedes nothing yet; [machines-next](machines-next.md) items 2 and 3
-fold into step 8 here, its parked auto-update and PTY attach into steps
-2 and 4.
-
-Reshaped 2026-10-28 (with the user): one kind of machine, every machine
-a fleet member, trust a member's own setting
-([One kind of machine](#one-kind-of-machine), new steps 4b and 4c, ADR
+[0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
+built on two kinds of machine (ssh machines and offered workers, `fleet
+join`, `lend`); step 4b replaces that with the model below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
-proposed). Steps 1-3 shipped the two-kind model (ssh machines and offered
-workers, `fleet join`, `lend`); step 4b reshapes that code.
+proposed). The rest is design. Builds on
+[machines](../../architecture/daemon/machines.md);
+[machines-next](machines-next.md) items 2 and 3 fold into step 8 here,
+its parked auto-update and PTY attach into steps 2 and 4.
 
 ## Goal
 
 Add machines to run more containers. A new sandbox goes on any machine
-with room; a dispatcher on an always-on server (the **hub**) creates,
-queries and moves children wherever they run, while laptops lend CPU,
-memory and disk when they're awake. Configs live on any machine and are
-added freely; every machine sees every machine's sandboxes. Where an
-instance runs is a detail the user sees but rarely chooses.
+with room; a dispatcher on an always-on server creates, queries and moves
+children wherever they run, while laptops lend CPU, memory and disk when
+they're awake. Configs live on any machine and are added freely; every
+machine sees every machine's sandboxes. Where an instance runs is a
+detail the user sees but rarely chooses.
 
 Setting: every machine is the user's own, on one Tailscale tailnet; most
-repos have a git remote, not all. Workers are **not** reachable by ssh
-from the hub, by choice: a laptop offers itself through devsandbox only,
-and the hub can do on it exactly what the devsandbox API it's offered
-allows, nothing more (no shell, no host files).
+repos have a git remote, not all. A laptop need not accept ssh from
+anyone: links go from whichever machine ran `machine add`, and what other
+machines may do on a member through devsandbox is that member's own
+setting.
 
 ## Where today stops
 
@@ -91,211 +41,174 @@ allows, nothing more (no shell, no host files).
 | P8 | The Inbox is a per-host store. | `inbox::store` |
 | P9 | Images are built per machine, no shared cache; image tags aren't namespaced by root, so shared configs clobber. | `run::image::base_image_for` |
 | P10 | `scope = "global"` services are per host: children on two machines see two postgres. | `commands::services` |
-| P11 | Every path to a machine is an ssh *to* it: the link (`api_argv`), each forwarded verb (a fresh dial), terminal tabs and CLI re-runs (`tty_argv`, `cli_argv`), forwards (`tunnel_argv`), the agent relay (`agent_argv`), install (`script_argv`). None works when only the worker may dial. | `machines::ssh` |
-| P12 | The API a link reaches is the machine's whole daemon: every root, every instance, `machines.*`. A worker must expose only what it lends. | `serve::api` |
-| P13 | (after steps 1-3) Two ways to add a machine: `machine add` (this host sshes to it, sees its own roots, never places on it) and `fleet join` (it dials the hub, lends a fleet root, its own roots invisible). | `machines::Kind`, `commands::lend` |
+| P11 | Every path to a machine is a fresh ssh *to* it: each forwarded verb, terminal tabs and CLI re-runs (`tty_argv`, `cli_argv`), forwards (`tunnel_argv`), the agent relay (`agent_argv`). | `machines::ssh` |
+| P12 | The API a link reaches is the machine's whole daemon: every root, every instance, `machines.*`. A member must be able to expose less. | `serve::api` |
+| P13 | Two ways to add a machine: `machine add` (this host sshes to it, sees its own roots, never places on it) and `fleet join` (it dials the hub, lends a fleet root, its own roots invisible). | `machines::Kind`, `commands::lend` |
 
 ## Design decisions
 
-### One kind of machine
-
-Decided 2026-10-28; replaces the two kinds of P13 and makes ADR 0041's
-confinement the default instead of the only mode (ADR 0043, proposed;
-accepted, superseding 0041, when step 4b ships). The sections below it
-still hold except where marked.
+### Members, links and the hub
 
 **Every machine is a fleet member; one member is the hub.** A fleet is
 one user's machines with one hub, the director: it holds the member list
-(`machines.toml`, on the hub only), the federated view and placement.
-Every other member holds one link to it, always dialed by the member
-(`ssh <hub> devsandbox fleet-link`, as a worker does today), so no
-member ever has to accept ssh. There is no second kind: the hub reaches
-a member only over that member's link, and the argv builders that dial a
-machine (`api_argv`, `tty_argv`, `cli_argv`, `tunnel_argv`,
-`agent_argv`) go, replaced by step 4's channels. The one ssh at
-`machine add` time (install check, `script_argv`) stays.
+and the link graph, the federated view and placement. Being the hub is a
+role, not a kind of machine, and has nothing to do with who dials whom.
+Every member's daemon stays up while it's in a fleet (it holds links;
+`serve install` keeps it up across logins), and the hub saves remote rows
+(`remotes.json`) so a restarted hub shows the fleet before members
+reconnect.
 
-**Configs live on any member.** A member's own config roots (those it has
-instances in, plus those picked at `machine add`, as its probed roots are
+**A link is an ssh pair.** `machine add X` run on A makes a link A → X:
+A's daemon holds `ssh -T -o BatchMode=yes X devsandbox fleet-link`,
+always while both are up, retried with the links' backoff. That's the
+only way a link forms, whichever end is (or later becomes) the hub. ssh
+stays the transport
+([ADR 0020](../../decisions/0020-machines-over-plain-ssh-with-protocol-match.md)).
+Each host's `machines.toml` lists the links it dials (name, target).
+
+**Links form a graph; requests are routed over it.** The expected shape
+is a star around one always-on machine (every laptop linked to K), with
+some extra links between members. A request to X takes a path through
+the graph: each hop's daemon splices the stream onto its next link (an
+`Open` naming its destination). The hub learns the graph (each member
+reports its links and their states) and publishes it; the requester
+tries paths in order (a direct link first, then fewest hops, preferring
+hops that stay up) and on a failure tries the next one. With every path
+down, X is `unreachable`: placement skips it, re-placement (step 7) may
+move its children. Picking the fastest path (measured latency) is later.
+If the hub is A in `A → K ← B, K ← C`, K relays everything for A: the
+role and the routing centre need not be the same machine.
+
+**One link, many channels.** The link carries the helper's frame
+protocol ([protocol](../../architecture/helper/protocol.md)):
+flow-controlled streams over one byte pipe, opened from either end. Each
+thing that is a fresh ssh to a machine today (P11) becomes a channel:
+
+| today (ssh to the machine) | channel on a link |
+|---|---|
+| `api_argv`: the link | `API`: a client of the member's API, within its trust |
+| a fresh dial per forwarded verb | one `API` channel per verb (a hang-up is the channel's close) |
+| `tty_argv`, `cli_argv`: terminals, CLI re-runs | `PTY`: a session attach with resize (step 4) |
+| `tunnel_argv`: forwards | `CONNECT`: the forwarder's existing streams |
+| `agent_argv` | `SSH_AGENT`, [Credentials](#credentials) |
+| — | `TRANSFER`: binaries, bundles and tars |
+
+A routed channel's `Dial` returns a `Duplex`, so `client::Conn`,
+`forward::verb`, the quick calls and `Machines` above the `Dial` seam
+stay as they are. The ssh at `machine add` time (install check,
+`script_argv`) stays.
+
+**Configs live on any member.** A member's own config roots (those it
+has instances in, plus those picked at `machine add`, as probed roots are
 picked today) are part of the fleet: every member sees every member's
-sandboxes and instances through the hub, and can run a member's config on
-that member. A member calls the hub over an `API` channel it opens on its
-own link (the mux opens both ways, as `TRANSFER` already does): its
-daemon watches the hub with `machines: true`, and its forwarded verbs,
-quick calls, `PTY` and `CONNECT` to another member are relayed by the
-hub.
+sandboxes and instances (a member's daemon watches the hub with
+`machines: true`; rows of the asking machine are never re-exported, so no
+cycles), and can run a member's config on that member, or elsewhere as
+[Trust](#trust-worker-or-full) allows. Config authority for a member's
+own roots stays with that member
+([ADR 0002](../../decisions/0002-config-is-the-security-boundary.md));
+a config placed elsewhere runs as its home member resolved it.
 
-**`machine add <target>`**, run on host H, sshes to the target X once
-(the install check, as today) and asks both for their hub:
+### Joining and leaving
+
+**`machine add <target>`**, run on host H, makes the link H → X (the
+install check first, as today) and asks both for their hub:
 
 | H | X | result |
 |---|---|---|
-| in a fleet (hub K) | in none | X joins K: H writes K's address into X's member file over that ssh; X dials K |
-| in none | in a fleet (hub K) | H joins K: the laptop case, `machine add <any member>` run on the laptop |
-| in none | in none | H becomes the hub, X joins H |
-| hub K | hub K | nothing to do, said so |
+| in a fleet (hub K) | in none | X joins K's fleet |
+| in none | in a fleet (hub K) | H joins K's fleet: the laptop case, `machine add <any member>` run on the laptop |
+| in none | in none | a fleet of two, H the hub |
+| hub K | hub K | an extra link in the same fleet |
 | hub K | hub L | refused, naming both |
 
-Before anything is written, the joiner dials the hub once; when it can't
-(a laptop that just became the hub of a server that can't ssh back to
-it), `machine add` says so and suggests running it from the other side,
-or `machine hub <x>` right after. Members dial the hub at its
-`hub-address` (the hub's member file; default its hostname, a tailnet
-name; shown by `machine ls`, settable). `machine rm <m>` removes a member
-(from the hub, or from any member through it); `machine rm` of the host
-it runs on leaves the fleet.
+The link is H → X in every row; joining only writes `hub` in the
+joiner's member file. ssh login is the authentication (the user's own
+account). `machine unlink <m>` drops this host's link to `m` (`m` stays a
+member while another link reaches it); `machine rm <m>` takes `m` out of
+the fleet (every link to it closed, the dialers' entries dropped);
+`machine rm` of the host it runs on leaves the fleet.
 
-**The member file** (`member.toml` next to `state.toml`) replaces
-`lend.toml` and `daemon.config.toml`'s `[serve] hub`: `hub` (an address,
-or `self` on the hub), `hub-address` (on the hub), `name`, `trust`,
-`[caps]`, `[allow]`, `dev-builds`. Written by the daemon only, through
-`member.*` calls (decision 3's rule). The lending toggle (`on|off|drain`)
-goes: a member takes work while connected, and leaving is `machine rm`.
-Soft caps stay: they steer placement, they never turn it off.
+**The member file** (`member.toml` next to `state.toml`): `hub` (the
+hub's member name, or `self` on the hub), `name`, `trust`, `[caps]`,
+`[allow]`, `dev-builds`. Written by the daemon only, through `member.*`
+calls; `machine` is its client. There's no lending toggle: a member takes
+work while it's reachable, and leaving is `machine rm`.
 
-**Trust: `worker` (default) or `full`**, a member's own setting, changed
-only on that machine (`devsandbox machine trust worker|full`, a local
-`member.set`; no link's table carries `member.*`, and a `--machine` or a
-qualified name refuses it).
+### Trust: `worker` or `full`
 
-- `worker` (the split model). The hub reaches:
+A member's own setting, `worker` by default, changed only on that
+machine (`devsandbox machine trust worker|full`, a local `member.set`; no
+link's table carries `member.*`, and a `--machine` or a qualified name
+refuses it). It applies to every remote caller, the hub included: the
+hub's role adds the member list, the graph and placement, not access.
+
+- `worker`: a remote caller reaches
   - **the member's own roots**: snapshots, quick calls, verbs (`run`,
-    `start`, `stop`, `rebuild`, `rm`) and, from step 4, `PTY` and
-    `CONNECT` into those instances, which run as the member's config says
-    ([ADR 0002](../../decisions/0002-config-is-the-security-boundary.md):
-    it's the member's own file). Never an edit of those configs or files
-    (`config.*`, a `TRANSFER` into them), and never a move of them off
-    the member unless the request started on the member itself: a `run`
-    typed on the laptop may send the laptop's config elsewhere, the hub
-    or another member asking may not;
-  - **placed work** (another member's config): the fleet root and the
-    worker policy, as today;
+    `start`, `stop`, `rebuild`, `rm`), `PTY` and `CONNECT` into those
+    instances, which run as the member's config says. Never an edit of
+    those configs or files (`config.*`, a `TRANSFER` into them), and
+    never a move of them off the member unless the request started on the
+    member itself: a `run` typed on the laptop may send the laptop's
+    config elsewhere, another machine asking may not;
+  - **placed work** (another member's config), in the member's **fleet
+    root** (`<data>/devsandbox/fleet/<hub>/`: placed config roots and
+    their repo caches), under the **worker policy**: every resolved config
+    is checked before it runs (decision 9's denials), allowances in
+    `member.toml`'s `[allow]`;
   - never `member.*`, `machines.*`, `shutdown`, `helper.call`, a version
-    handoff other than the fleet's own update (step 2), or a host path
-    outside the above.
+    handoff other than the fleet's own update ([Versions](#versions)),
+    or a host path outside the above.
 - `full`: the member's whole API, as a local client has it: any root,
-  any path, its configs moved freely, the worker policy off for placed
-  work, dev builds accepted.
-- **What `worker` protects**: the member from the hub, inside devsandbox.
-  Nothing against an ssh into the member: if whoever runs the hub can ssh
-  in, `worker` buys little. `machine trust worker` says so, and `machine
-  ls` and the Machines tab say it per member when the member knows the
-  hub has sshed to it (`machine add` run on the hub, recorded at add).
-- A member's calls to the hub get the hub's full API: the hub is the
-  user's front door. Trust protects a member from the hub, not the fleet
-  from a member.
+  any path, its configs moved freely, no worker policy, dev builds
+  accepted.
+- **What `worker` protects**: the member from the other machines, inside
+  devsandbox. Nothing against an ssh into it: a machine holding a link
+  *into* B has a shell on B and could rewrite B's `member.toml`. The
+  graph says exactly when that bites: B's `worker` buys little when the
+  hub, or a `full` member the hub reaches, dials B. `machine trust
+  worker` says so then, naming the machine, and `machine ls` and the
+  Machines tab show it on B's row.
 
-**Swapping the hub** (`machine hub <m>`, step 4c; a pointer swap for
-now). Run on any member, it reaches the current hub, which tells `m` to
-become the hub, tells every connected member to repoint (rewrite `hub`,
-redial), then joins `m` itself; while it still runs it answers a late
-member's dial with `moved to <m>`. With the old hub gone, `machine hub
-<m>` on a member repoints just that member. The new hub starts empty:
-rows come back as members connect, the repo cache refills as code moves.
-Handing the hub's state over (repo cache, saved rows, dispatcher
-records, checkpoints) is step 10, once steps 6-7 make that state matter;
-the pointer swap stays the fallback for a dead hub.
+### Swapping the hub
 
-**Placement** runs on the hub: a `run` typed on any member goes to the
-hub, which places it over every connected member (the requester bias
-goes to the member it came from); with the hub unreachable it runs where
-it was typed, with a note.
+`machine hub <m>` (step 4c; a pointer swap for now). Links don't change:
+the role moves. Run on any member, it tells every reachable member that
+`m` is the hub (each rewrites `hub`); a member unreachable then learns it
+from the first member it reconnects to. `m` starts empty: rows and the
+graph come back as members report, the repo cache refills as code moves.
+Handing the hub's state over (repo cache, saved rows, dispatcher records,
+checkpoints) is step 10, once steps 6-7 make that state matter; the
+pointer swap stays for a dead hub.
 
-### Topology: workers dial the hub (the CI-runner model)
-
-(Reshaped by [One kind of machine](#one-kind-of-machine): every member
-dials, the `offered` kind and ssh machines merge, lending has no toggle.)
-
-A worker offers itself; the hub never dials it. The worker's daemon holds
-one outbound ssh to the hub (`ssh -T -o BatchMode=yes <hub> devsandbox
-fleet-link --worker <name>`, a hidden command like `agent-relay` that
-connects to the hub's daemon), retried with the link's backoff while
-lending is on. ssh stays the transport
-([ADR 0020](../../decisions/0020-machines-over-plain-ssh-with-protocol-match.md)),
-only the direction flips: the laptop needs ssh to the hub (it has it),
-the hub needs nothing on the laptop: no sshd exposure, no key of the
-hub's in the laptop's `authorized_keys`.
-
-**One link, many channels.** The link carries the helper's frame
-protocol ([protocol](../../architecture/helper/protocol.md)), which
-already runs between two hosts for the machines' agent relay
-(`commands::agent_relay`): flow-controlled streams over one byte pipe.
-Each thing that is an ssh *to* a machine today (P11) becomes a channel
-the hub opens on the held link:
-
-| today (ssh to the machine) | fleet worker (channel on its link) |
-|---|---|
-| `api_argv`: the link | `API`: the hub as a client of the worker's lent API |
-| a fresh dial per forwarded verb | one `API` channel per verb (a hang-up is the channel's close) |
-| `tty_argv`, `cli_argv`: terminals, CLI re-runs | `PTY`: exec with resize (machines-next's parked "PTY attach over the protocol", now needed) |
-| `tunnel_argv`: forwards | `CONNECT`: the forwarder's existing streams |
-| `agent_argv` | `SSH_AGENT` from hub to worker, below |
-| — | `TRANSFER`: bundles and tars, below |
-
-On the hub, a worker's `Dial` opens a channel on its held link and
-returns it as a `Duplex`, so `client::Conn`, `forward::verb`, the quick
-calls and `Machines` above the `Dial` seam stay as they are. A worker is
-a second kind of `machines.toml` entry (`offered`, no `target`), written
-when its first offer arrives; ssh machines keep working for hosts you do
-ssh into.
-
-**The lent API is not the daemon's API (P12).** An offered link is
-served on the worker by a restricted method table (`fleet::WORKER`), not
-`serve::api`'s:
-
-- it reaches only the worker's **fleet root** for that hub
-  (`<data>/devsandbox/fleet/<hub>/`): instances the hub placed, their
-  repo caches and config roots. The laptop's own roots and instances
-  don't exist for the hub;
-- verbs, quick calls, snapshots, `PTY`/`CONNECT` into those instances,
-  `TRANSFER` into and out of that root; never `machines.*`, roots,
-  `serve` handoff, host paths;
-- a **worker policy** in `lend.toml` checks every resolved config before
-  it runs: bind mounts only inside the fleet root (named volumes fine),
-  no `privileged`, no runtime socket mount, no host network, unless
-  `lend.toml` allows them (e.g. docker-in-docker features). The hub is
-  trusted; the policy bounds what a compromised hub could do to the
-  laptop to "run containers that see only what was lent".
-
-**The worker owns its lending** (`lend.toml` next to `state.toml`,
-edited by `devsandbox lend …`, never by the hub): `on|off|drain`, the hub
-it offers to, soft caps (`cpus`, `mem`, `disk`, `instances`), the policy
-above. `devsandbox fleet join <hub>` writes it and starts offering;
-`fleet leave` drains, then stops. Its capacity report rides the link's
-snapshot. A sleeping laptop is a dropped link (`unreachable`): placement
-skips it, re-placement (step 7) may move its children.
-
-Hub mode is a daemon setting (`hub = true` under `[serve]` in the existing
-`daemon.config.toml`, `src/daemon_config.rs`; implies `keep-alive`): the daemon never idles out, accepts offers, and
-persists remote rows (`remotes.json`) so a restarted hub shows the fleet
-before workers reconnect. `serve install` on the server keeps it up.
-
-Trust: an ADR records that fleet workers dial their hub and that a hub
-reaches a worker only through the lent API, inside the worker policy;
-config authority for placed instances sits with the hub
-([ADR 0002](../../decisions/0002-config-is-the-security-boundary.md)
-stays as is for a host's own roots). Sharing a fleet between users is out
-of scope.
+**A fallback hub** (step 11, later). An ordered list of members that take
+the role when the hub has been unreachable for a while (minutes to hours,
+a setting), so a fleet whose hub is a laptop keeps placing. Open: who
+decides the hub is gone (the fallback itself, or a majority of the
+members that can see each other), and what happens when the old hub
+comes back (it rejoins as a member, or takes the role back) without two
+hubs placing at once.
 
 ### Placement: soft caps, a pure `place`
 
-Today nothing is limited, so v0 is mostly the seam: a capacity report,
-a pure `place(spec, &[Candidate]) -> Placement`, and soft caps.
+Runs on the hub: a `run` typed on any member goes to the hub, which
+places it; with the hub unreachable it runs where it was typed, with a
+note. Today nothing is limited, so v0 is mostly the seam: a capacity
+report, a pure `place(spec, &[Candidate]) -> Placement`, and soft caps.
 
 - **Report**: each daemon adds to its snapshot the host's cpus, memory
   total/available, disk free under the runtime's data root, running
-  instance count and its `lend.toml`. Cheap, from the existing poll.
-- **Candidates**: the hub and every connected member that
-  can get the code (step 3: repos with a reachable `origin`; from step 5:
-  any, by transfer).
+  instance count and its `[caps]`. Cheap, from the existing poll.
+- **Candidates**: every reachable member that can get the code (step 3:
+  repos with a reachable `origin`; from step 5: any, by transfer).
 - **Score**: headroom against soft caps, plus locality (repo already
   cloned, image already built, which `config_hash`/`build_hash` labels
-  tell), plus a small bias for the requester's own host.
+  tell), plus a small bias for the member the request came from.
 - **Soft caps never refuse.** Over a cap a machine scores low; if every
   candidate is over, the best one is used and the verb's output, the
   dashboard header and the Machines tab say `over cap: mem 18G/16G`.
-  `--machine m` or a qualified name always wins over the score.
-  (`drain`, the only hard no, goes with the lending toggle in step 4b.)
+  `--machine m` or a qualified name always wins over the score; `--here`
+  forces where it was typed.
 
 ### Moving code: devsandbox owns the transfer
 
@@ -319,12 +232,11 @@ git remote, when there is one, is only a shortcut for the bulk.
   the sender streams `git bundle create - <wip ref> <branch> --not <haves>`
   on a `TRANSFER` channel; the receiver `git fetch`es the bundle into its
   repo cache (`<data>/devsandbox/repos/<repo id>.git`, bare; under the
-  fleet root on a worker) and cuts the worktree from it. With a reachable
-  `origin`, the receiver fetches from it first so the bundle carries only
-  the delta.
-- **Route**: workers never talk to each other, so laptop A's code
-  placed on laptop B flows A → hub → B. The hub keeps what passes
-  through (below), which is what makes re-placement possible.
+  fleet root for placed work) and cuts the worktree from it. With a
+  reachable `origin`, the receiver fetches from it first so the bundle
+  carries only the delta.
+- **Route**: along the graph's path (A → K → B in a star); the hub also
+  keeps a copy (below), which is what makes re-placement possible.
 - **Back**: the placed instance's branch and WIP are fetched back into the
   source repo as `refs/devsandbox/<machine>/<instance>/…` on demand
   (`devsandbox fetch <instance>`, the dashboard) and at `done`/`rm`;
@@ -333,8 +245,8 @@ git remote, when there is one, is only a shortcut for the bulk.
   placed and receives periodic checkpoints (step 7), so a repo's latest
   WIP survives its laptop going to sleep.
 - **Config roots** move the same way (a config root that's a git repo
-  as a repo, any other as a content-hashed tar of the root), so a worker
-  runs the hub's config as the hub resolved it, dockerfiles and local
+  as a repo, any other as a content-hashed tar of the root), so a placed
+  config runs as its home member resolved it, dockerfiles and local
   features included.
 
 All of it sits behind one seam, `Transfer` (`offer`, `haves`, `send`,
@@ -349,37 +261,34 @@ a real sync layer (content-defined chunks, rsync-style deltas or a
 mutagen-like live session), which `Transfer` must allow without changing
 its callers: the plan keeps the seam, the git implementation is v1.
 
-### Versions: the worker updates itself
+### Versions
 
-The hub can't install anything on a worker, so the worker updates
-itself: at its link's hello it learns the hub's version, and when it
-differs it fetches that version, installs it and lets its own version
-handoff restart its daemon
-([ADR 0015](../../decisions/0015-newest-binary-wins-version-handoff.md)),
-which re-offers:
+Every member runs the hub's exact build, and updates itself: it learns
+the hub's version from the link hellos, and when it differs fetches that
+version, installs it and lets its own version handoff restart its daemon
+([ADR 0015](../../decisions/0015-newest-binary-wins-version-handoff.md)):
 
 - **Published version**: the release asset for its own platform from
   GitHub (`devsandbox-<v>-<target>.tar.gz`, as
   `.github/workflows/release.yml` names them), verified, installed
   atomically (the existing `install::INSTALL` steps).
-- **Local build** (not a published version): the hub's own binary over a
-  `TRANSFER` channel when the OS and arch match
-  (`install::platform_matches`) and the worker's `lend.toml` accepts dev
-  builds (it's the hub choosing code the laptop runs outside a
-  container); else the worker stops offering with "dev build: can't run
-  on <os>/<arch>". Accepted: a dev fleet of mixed platforms runs
-  published builds or is built per platform by hand.
+- **Local build** (not a published version): the hub's own binary over
+  `TRANSFER` (along the path) when the OS and arch match
+  (`install::platform_matches`) and the member accepts dev builds
+  (`dev-builds`, or `full`: it's another machine choosing code this one
+  runs outside a container); else the member says "dev build: can't run
+  on <os>/<arch>" and takes no work. Accepted: a dev fleet of mixed
+  platforms runs published builds or is built per platform by hand.
 - Release targets today: linux x86_64/aarch64 (musl), macOS aarch64,
   windows x86_64. An Intel Mac can't auto-update until a target is added.
 
 ### Credentials
 
-A hub-placed child gets the hub's agent over the link's `SSH_AGENT`
-channel, served on the worker only to that hub's placed instances (the
-worker's bridges pick it for fleet-root instances, never for the
-laptop's own). The hub's agent is whatever the hub has: a dedicated key
-on the server (deploy or user key), not a laptop's. The laptop's own
-agent never reaches the hub.
+A placed child gets the hub's agent over `SSH_AGENT`, served on the
+member only to placed instances (its bridges pick it for fleet-root
+instances, never for the member's own). The hub's agent is whatever the
+hub has: a dedicated key on the server (deploy or user key), not a
+laptop's. A member's own agent never leaves it.
 
 ## Rollout
 
@@ -388,59 +297,49 @@ Each step is usable on its own. Order with the other plans is in
 helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step 6
 for its daemon-owned runs.
 
-1. **Fleet link and hub mode** (L). `fleet-link`, the frame-mux link with
-   `API` channels, the `offered` registry kind and its channel `Dial`,
-   `fleet::WORKER` over the fleet root, the worker policy, `lend.toml`,
-   `fleet join|leave`, `devsandbox lend`, `hub = true`, persisted remote
-   rows, capacity in the snapshot, the Machines tab showing lending and
-   capacity. Quick calls and verbs work on placed instances from here.
-2. **Worker self-update** (S–M). Download or the hub's binary at the
-   hello; stop offering with the reason otherwise. Before the fleet grows
-   past two workers.
-3. **Placement v0 + minimal transfer** (M). `place`, soft caps and
-   warnings; `run <sandbox>` places on the hub or a worker; a placed run
-   gets the config root as a tar and clones the repo from `origin`
-   (committed, pushed work only; a repo without a reachable `origin` runs
-   where it is). `--here` forces local. Namespace image tags and feature
-   build dirs by config root (P9's clobber), since shared configs make it
-   bite.
+1. **Fleet link and hub mode** (L, shipped). The frame-mux link with
+   `API` channels, the confined table over a fleet root, the worker
+   policy, persisted remote rows, capacity in the snapshot.
+2. **Self-update** (S–M, shipped). A published hub build downloaded, a
+   dev build pushed when accepted.
+3. **Placement v0 + minimal transfer** (M, shipped). `place`, soft caps
+   and warnings; a placed run gets the config root as a tar and a bundle
+   the hub cloned from `origin` (committed, pushed work only); `--here`;
+   image tags and feature build dirs namespaced by config root (P9).
 4. **Interactive over the link** (M). `PTY` (exec, terminal tabs, the
-   reconnecting `exec`), `CONNECT` forwards, `SSH_AGENT` from the hub.
-   Placed instances become as usable as local ones. Step 4b needs it:
-   dropping ssh machines drops their `exec`, terminals and forwards
-   until these channels carry them.
+   reconnecting `exec`), `CONNECT` forwards, `SSH_AGENT`. Step 4b needs
+   it: the per-use ssh argvs go there.
    `PTY` is a session attach ([resumable-exec](resumable-exec.md)): the
    channel opens with `{instance, session id, create|attach}` and ends
    with a structured record (`exit <code>` | `gone` | `detached` |
-   `lost`); a link drop is `lost`, never an exit. The 255 /
-   `--reserve-255` convention (`serve::machines::cli::Reconnect`) stays
-   ssh-machine-only. `fleet::WORKER` gains session `ls`/`rm` for
-   fleet-root instances. Decide first whether the worker daemon attaches
-   to the session's `sock` directly (proposed: drops the in-container
-   client and the `exec -it` hop, settles helper-rpc's `run.attach`) or
-   goes through `<runtime> exec -it` as the ssh path does.
-4b. **One kind of machine** (L). [One kind of machine](#one-kind-of-machine):
-   `machines::Kind` gone (entries are members); `machine add`'s join
-   rule, the joiner's reach check and `hub-address`; `machine rm`, `machine
-   trust`, `member.toml` and `member.*` replacing `fleet join|leave`,
-   `devsandbox lend`, `lend.*`, `lend.toml` and `[serve] hub`; the
-   `Worker` table (`fleet::lent`) gains the member's own roots, `full`
-   skips it and the worker policy; members watch the hub's federated
-   snapshot and reach other members through it (`PTY`/`CONNECT` relayed,
-   pulled forward from step 8); `run` typed on a member placed by the hub;
-   capacity's `lending` and `place`'s `drain` gone; the dialing argv
-   builders and `offered_refusal` removed. ADR 0043 accepted, 0041
-   superseded; `machines.md` and `fleet.md` (architecture) rewritten.
-4c. **Hub swap, pointer** (S–M). `machine hub <m>`: the old hub repoints
-   connected members and redirects late ones, or each member repoints
-   itself when the old hub is gone.
+   `lost`); a link drop is `lost`, never an exit, and records are
+   relayed unchanged by every hop. Session `ls`/`rm` within the caller's
+   trust. Decide first whether the member's daemon attaches to the
+   session's `sock` directly (proposed: drops the in-container client and
+   the `exec -it` hop, settles helper-rpc's `run.attach`) or goes through
+   `<runtime> exec -it` as the ssh path does.
+4b. **One kind of machine** (L). [Members, links and the hub](#members-links-and-the-hub)
+   through [Trust](#trust-worker-or-full): `machines::Kind` gone
+   (entries are this host's links); every link held, either end opening
+   streams; routed streams with path failover over the graph the hub
+   publishes; `machine add`'s join rule, `machine unlink|rm`, `machine
+   trust` (its ssh warning from the graph); `member.toml` and `member.*`
+   replacing `fleet join|leave`, `devsandbox lend`, `lend.*`, `lend.toml`
+   and `[serve] hub`; the confined table (`fleet::lent`) as `worker`
+   trust, gaining the member's own roots, `full` skipping it and the
+   policy; federated snapshots for every member; `run` typed on a member
+   placed by the hub; capacity's `lending` and `place`'s `drain` gone;
+   the per-use ssh argvs and `offered_refusal` removed. ADR 0043
+   accepted; `machines.md` and `fleet.md` (architecture) rewritten.
+4c. **Hub swap, pointer** (S–M). `machine hub <m>`: the role moves, links
+   stay; every reachable member rewrites `hub`, a late one learns it on
+   reconnect.
 5. **Transfer v1** (L). Repo identity, WIP snapshot commits, bundles
-   routed through the hub, repo caches, the hub mirror, fetch-back.
+   routed over the graph, repo caches, the hub mirror, fetch-back.
    Repos without a remote and unpushed work can be placed.
 6. **Dispatcher children on any machine** (M). Instances carry
    `origin_host` and repo identity; `ls`/the dashboard show where they
-   run. The dispatcher (on the
-   hub) keeps authorizing on its host
+   run. The dispatcher (on the hub) keeps authorizing on its host
    ([ADR 0030](../../decisions/0030-dispatcher-control-is-authorized-on-the-host.md));
    `dispatch::Executor`'s subprocess becomes a placed, forwarded verb;
    the hub's `state.toml` records child → machine; `exec`/`run-*` ops go
@@ -448,163 +347,70 @@ for its daemon-owned runs.
    `max-instances` stays per dispatcher, fleet-wide.
 7. **Checkpoints and re-placement** (M–L). Placed instances checkpoint
    WIP to the hub's mirror (on idle, every few minutes while dirty, at
-   stop). A child whose worker is unreachable past a grace period, or on a
-   worker set to `drain`, is re-ensured on another machine from its last
-   checkpoint (a member `machine rm`'d with placed work stands in for
-   step 4b's removed `drain`): same name and `instance_id`, the old copy fenced (its
-   worker, when back, is told the instance moved: stop it, keep its WIP
+   stop). A child whose member is unreachable past a grace period, or
+   `machine rm`'d, is re-ensured on another machine from its last
+   checkpoint: same name and `instance_id`, the old copy fenced (its
+   member, when back, is told the instance moved: stop it, keep its WIP
    ref, no auto-delete). Process state is lost, committed and
    checkpointed work isn't. `devsandbox move <instance> [--to m]` is the
    manual form. Fencing a copy ends its sessions: live or detached
    sessions extend the grace period (or at least warn), and an attach to
    a moved instance says `moved to <machine>`, not `no session`.
-8. **Laptop as a client of the hub** (M; its link, federated snapshot
-   and relayed `PTY`/`CONNECT` move to step 4b, the Inbox and nameless
-   commands stay here). A laptop links the hub as an
-   ordinary ssh machine (laptop → hub, fine) or, when it's also a worker,
-   over its offered link's `API` channel in the other direction. Federated
-   snapshots through the hub (a link's watch asks for `machines: true`;
-   rows of the asking machine never re-exported: no cycles), `PTY` and
-   `CONNECT` to another worker's instances relayed by the hub (`PTY` end
-   records relayed unchanged: a worker hop dropping reaches the client
-   as `lost`), the Inbox behind the daemon on
-   both ends (machines-next §2), nameless commands across the fleet
-   (machines-next §3).
+8. **The rest of the fleet view** (M). The Inbox behind the daemon on
+   every member, with a federated thread list (machines-next §2);
+   nameless commands across the fleet (machines-next §3).
 9. **Sync layer** (L, later). A second `Transfer` for state git doesn't
    carry: ignored outputs, volumes, caches, live editing. Then build-cache
    sharing (a registry on the hub, `--cache-from`) and services that span
    machines (P10) can be revisited.
 10. **Hub handoff** (M). `machine hub <m>` with the old hub alive ships
-   its state to `m` over `TRANSFER` (repo cache, saved rows, dispatcher
-   and placement records, checkpoints) before repointing; the pointer
-   swap (step 4c) stays for a dead hub.
+    its state to `m` over `TRANSFER` (repo cache, saved rows, dispatcher
+    and placement records, checkpoints) before the role moves; the
+    pointer swap (step 4c) stays for a dead hub.
+11. **Fallback hub** (M, later). [A fallback hub](#swapping-the-hub):
+    settle who decides and the old hub's return first.
 
-## Steps 1-3 in detail
+## Decisions
 
-Decided with the user before building (2026-10-27); 1, 2, 3, 7 and 9 are
-reshaped by step 4b (marked):
+Numbered as code cites them; 1, 2, 3, 7 and 9 as step 4b makes them.
 
-1. `hub = true` in `daemon.config.toml` `[serve]`, no `serve.toml`.
-   (4b: `hub = "self"` in `member.toml`.)
-2. An offer is accepted only by a hub; ssh login to the hub is the
-   authentication (the user's own account). A worker name colliding with
-   an ssh machine is refused. (4b: no ssh machines left to collide with.)
-3. `lend.toml` is written by the daemon only, through `lend.*` API calls
-   (the `machines.toml` rule); `devsandbox lend` / `fleet` are clients.
-   (4b: `member.toml`, `member.*`, `machine` as the client.)
-4. A worker's fleet root is one pseudo-root on the hub; `fleet::WORKER`
-   lists the config roots under it.
+1. The hub is `hub = "self"` in `member.toml`; no separate daemon
+   setting.
+2. ssh login is the authentication (the user's own account); `machine
+   add` refuses a name already in the fleet.
+3. `member.toml` is written by the daemon only, through `member.*` calls
+   (the `machines.toml` rule); `machine` is a client.
+4. A fleet root is one pseudo-root per member; the `worker` table lists
+   the config roots under it.
 5. Step 1's acceptance test: a config copied by hand under
-   `<worker data>/devsandbox/fleet/<hub>/`, `run --machine <worker>`.
+   `<data>/devsandbox/fleet/<hub>/`, `run --machine <member>`.
 6. Until step 4, paths that need ssh to the machine (`exec`, terminal
    tabs, forwards, CLI re-runs) refuse on an offered machine with
    `needs fleet step 4` wording; `logs` / `inspect` use the
    `containers.*` quick calls.
-7. The hub always holds offered links (no `Want` / linger for them).
-   (4b: every member's link.)
+7. Every link is always held (no `Want` / linger).
 8. Capacity: cpus / memory total from `docker info` (`NCPU`,
    `MemTotal`, cached 60 s); free memory and free disk only for a native
    Linux runtime (`/proc/meminfo`, `statvfs` of the runtime's root), else
    unknown. VM-backed engines report the VM.
-9. Worker policy denies by default: binds outside the fleet root,
+9. The worker policy denies by default: binds outside the fleet root,
    `privileged`, runtime socket mounts, host network, `caches`,
    `shared-volumes`, `worktree-link`, `global` services, inbox /
-   dispatcher sockets. Allowances per worker in `lend.toml`. (4b: for
-   placed work on a `worker` member, in `member.toml`; off under `full`.)
-10. Self-update: the hello carries git hash + `published`; the worker
+   dispatcher sockets. Allowances per member in `member.toml`; none under
+   `full`.
+10. Self-update: the hello carries git hash + `published`; a member
     follows the hub's exact version (a downgrade is a forced handoff);
     installs in place at `exe::devsandbox()`. Verified by TLS + running
     `--version`; no checksum asset (a `release.yml` change not approved).
 11. Placement runs in the daemon.
 12. Step 3's code: the hub clones `origin` with its own credentials and
-    sends a bundle over `TRANSFER`; a worker never needs credentials.
-    Pulls a slice of step 5 forward (bundle of committed refs only).
-
-Commits (landmarks from recon; line numbers drift, trust the symbol):
-
-- **1a link primitive.** `channel::API` / `caps::API`
-  (`src/devsbd/proto.rs`) on helper-rpc step 1's flow-controlled `Open`.
-  One `serve::fleet::link` module generalizing the opener of
-  `src/commands/agent_relay.rs` `run` (bind a socket, temp name +
-  rename, each accepted connection → `Mux::attach(.., Some(channel))`)
-  and the answerer of `src/serve/machines/agent.rs` `serve` (each `Open`
-  → a local socket), sentinel and channel as parameters. Test: a
-  `client::Conn` through the mux reaches a test daemon.
-- **1b hub side.** Hidden `fleet-link --worker <name>` (`src/main.rs`,
-  like `AgentRelay`; `serve::machines::cli` `machine_use` refuses it):
-  binds `fleet-<name>.sock` in the socket dir, mux on stdio, sends
-  `fleet.offer {worker, version}` to its daemon. `machines::Entry` gets
-  a kind (`Ssh { target }` | `Offered`); every ssh argv builder refuses
-  `Offered`; the offered `Dial` is `UnixStream::connect(fleet sock)` +
-  `Duplex::socket`, so `link::handshake` (the API channel writes the
-  `devsandbox-api 1` sentinel, `relay::write_sentinel`), `forward::verb`
-  and the quick calls work unchanged. `machine ls`, the Machines tab and
-  `snapshots::SnapshotMachine` show the kind.
-- **1c worker side.** A lending thread in the worker daemon holding `ssh
-  -T -o BatchMode=yes <hub> devsandbox fleet-link --worker <name>` with
-  `service.rs`'s backoff while lending is on. `Open{API}` → socketpair →
-  `Shared::spawn_conn` (`src/serve/daemon.rs`) with a per-connection
-  table `Full | Worker { hub, root }` checked at the top of `handle`:
-  hello, subscribe, `instances.watch`/`unwatch`, the `QUICK` set
-  (`machines/forward.rs`) and verbs only; no `machine` param; every
-  `root` / `dir` under the fleet root; instance rows filtered by
-  `config_dir`; verbs' `env` replaced by the worker's own login env (as
-  `relay::SessionEnv` does for ssh). ADR 0041: workers dial the hub; a
-  hub reaches a worker only through the lent API and its policy.
-- **1d CLI.** `lend.toml` model + store (third locked atomic writer after
-  `machines::update` and `forward_store`: extract a shared helper);
-  `lend.get|set` API; `devsandbox lend on|off|drain|show`, `fleet join
-  <hub>` / `fleet leave` (drain, then off); the daemon reacts to `lend.set`
-  directly (no file watching).
-- **1e worker policy.** The verb subprocess learns its root is a fleet
-  root (hidden flag from `verbs::argv`); a pure checker over the resolved
-  config, called at `run`'s privileged decision (`commands/run/mod.rs`
-  `privileged_decision`) and before `identity::create_args`'s binds;
-  allowances from `lend.toml`; refusal names the field and the
-  allowance.
-- **1f hub mode.** `hub = true` (`daemon_config.rs`, read in
-  `daemon.rs`): never idles (`idle::decide` keep-alive), accepts offers
-  (else `fleet.offer` errors), keeps offered links wanted, saves / loads
-  `remotes.json` around `snapshots::Remotes` (rows shown `unreachable`
-  until the worker reconnects).
-- **1g capacity.** `docker info` parse gains `NCPU` / `MemTotal`
-  (`runtime/identity.rs` parser, fixture there), cached; native-Linux
-  free memory / disk; running count (`host.rs` `live_instances`) and
-  lending state into each root's snapshot and `SnapshotMachine`;
-  Machines tab columns, `over cap` note; `docs/reference/api.md`,
-  `index.d.ts`.
-- **2a `TRANSFER`.** A flow-controlled channel carrying a header line
-  (kind, name, size, sha256 of the body) then raw bytes; receiver writes
-  to a temp file and checks size + hash before rename.
-- **2b self-update.** Hello gains `git` + `published`
-  (`src/serve/proto.rs`); on a mismatch the worker fetches
-  `https://github.com/<repo>/releases/download/v<v>/devsandbox-<v>-<target>.tar.gz`
-  (curl / tar shell-out like `commands/features.rs`), installs with
-  `machines::install::INSTALL`'s steps run locally, runs `--version`,
-  then hellos its own daemon to trigger the handoff (forced, also for a
-  downgrade), and re-offers.
-- **2c dev builds.** Unpublished hub version: the hub's binary over
-  `TRANSFER` when `install::platform_matches` and `lend.toml`
-  `dev-builds = true`; else stop offering with `dev build: can't run on
-  <os>/<arch>`.
-- **3a image namespacing (P9).** `run::image::base_image_for`
-  (`devsandbox-img-<sandbox>`), the `-feat` tag, `features::build_context_dir`,
-  services' `img-svc-<service>` gain a short hash of the config root;
-  check rebuild / gc / image facts.
-- **3b `place`.** Pure `place(spec, &[Candidate]) -> Placement`,
-  soft-cap score + warnings, from 1g's capacity; `drain` the only hard no.
-- **3c placed run** (two commits, split by the orchestrator: **3c1** the
-  transfer of a config root and its repo onto a worker, **3c2** `place`
-  in the `run` verb). In the daemon's `run` verb: `place` when the user
-  didn't pin a machine (`--here` forces local); config root as a tar over
-  `TRANSFER` into `fleet/<hub>/roots/<hash>/`; the hub clones `origin`
-  into its repo cache and sends a bundle of the branch; the worker cuts
-  the worktree at the folder's offset relative to the config root; no
-  reachable `origin` → runs where it is, with a note.
+    sends a bundle over `TRANSFER`; a placed member never needs
+    credentials. Pulls a slice of step 5 forward (bundle of committed
+    refs only).
 
 ## Open questions
 
-- Fencing in step 7: is "the worker stops the stale copy when it
+- Fencing in step 7: is "the member stops the stale copy when it
   reconnects" enough, or must a placed instance hold a lease it renews
   with the hub and stop itself when the lease lapses (laptop offline but
   awake, e.g. off the tailnet)? Either way it ends that copy's sessions,
@@ -617,15 +423,14 @@ Commits (landmarks from recon; line numbers drift, trust the symbol):
   `--anywhere` until placement has earned trust?
 - Services: does a placed child's `global` service move with it, or must
   `global` services pin their dependents to one machine?
-- Worker policy defaults: per-worker allowances for now (decision 9);
+- Worker policy defaults: per-member allowances for now (decision 9);
   per-sandbox allowances if docker-in-docker features make that too
   coarse.
-- One hub per worker, or may a laptop lend to several hubs (one fleet
-  root each)? (Step 4b assumes one fleet per member: `machine add`
-  refuses two hubs.)
-- Credentials for a member's own instances started by the hub: the
-  member's own agent, as when run locally (proposed), or the hub's, as
-  placed work gets?
+- One fleet per member (`machine add` refuses two hubs), or may a member
+  belong to several (one fleet root each)?
+- Credentials for a member's own instances started by another machine:
+  the member's own agent, as when run locally (proposed), or the
+  caller's?
 - Which of a member's roots the fleet sees: those with instances in
   `state.toml` plus picked ones (proposed), or an explicit
   `machine root add|rm` list?
