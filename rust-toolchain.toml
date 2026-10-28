@@ -3,3 +3,6 @@
 # shipped in this container's image so no extra toolchain download is needed.
 channel = "1.98.0"
 components = ["rust-analyzer"]
+# The in-container helper (`scripts/build-devsbd.sh`); rustup installs them on
+# first use, so a fresh checkout or rebuilt sandbox can build it at once.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
