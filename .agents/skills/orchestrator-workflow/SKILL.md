@@ -1,6 +1,6 @@
 ---
 name: orchestrator-workflow
-description: Run a multi-step feature as orchestrator - plan in markdown, delegate each step to an implementer subagent, review, commit, repeat.
+description: Run a multi-step feature as orchestrator - plan in markdown (or break down an existing plan's next rollout step), delegate each step to an implementer subagent, review, commit, repeat.
 metadata:
   internal: true
 ---
@@ -21,11 +21,22 @@ You orchestrate; subagents implement. You never let a subagent touch git.
    `docs/architecture/` docs each step must update. Both the user and the
    subagents read this file. Add an *In progress* line for it to
    `docs/status.md`.
+
+   **If the plan already exists** (a design plan whose rollout step is
+   bigger than one commit): don't write a new file or status line. Break
+   the rollout step you're doing into commit-sized sub-steps, each with
+   the same constraints, landmarks and docs to update, and present that
+   breakdown with `present_plan`; the approved breakdown is what you brief
+   implementers from. Edit the plan file only where recon shows the
+   design is wrong or a decision gets made, and say so.
 3. **Present the plan** to the user for approval before touching anything.
-   On revision requests, update the plan file and re-present.
+   On revision requests, update the plan file (or the breakdown) and
+   re-present.
 4. **Per step, spawn one implementer subagent**:
    - "task" = `/implementer` skill + the plan file path + step number
-     - code landmarks + anything learned from prior steps' reviews;
+     (and, for an existing plan, the sub-step's text from the approved
+     breakdown) + code landmarks + anything learned from prior steps'
+     reviews;
    - subagents have no conversation context — brief like a colleague who
      just walked in.
 5. **Review every completed step yourself**: read the diff (`git diff --stat`,
@@ -39,7 +50,9 @@ You orchestrate; subagents implement. You never let a subagent touch git.
 6. **Commit the step** with a message that says _why_, staging only the
    step's files (never `git add -A`; leave unrelated workspace diffs alone).
 7. Track steps with the todo list; mark off as you go.
-8. **Close the plan** in a final commit, once every step has landed:
+8. **Close the plan** in a final commit, once every step has landed (for
+   an existing plan: only once its whole rollout has, not after the
+   rollout step you were given):
    - what's now true lives in `docs/architecture/` / `docs/reference/`
      (verify it against the code, not the plan);
    - decisions that will hold become ADRs in `docs/decisions/` (a new one

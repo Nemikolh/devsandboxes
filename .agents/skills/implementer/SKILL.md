@@ -13,8 +13,10 @@ you code.
 ## Rules
 
 - **Coding only. No git commands whatsoever** (no add/commit/status/diff).
-- Read the plan file and your step's section BEFORE writing code; the brief's
-  code landmarks (file:line) are your entry points.
+- Read the plan file and your step's section BEFORE writing code (or, when
+  the brief carries a sub-step of a bigger rollout step, that sub-step and
+  the plan sections it names); the brief's code landmarks (file:line) are
+  your entry points.
 - Do exactly the step's scope. Adjacent steps are listed in the plan — do NOT
   implement them early. Flag adjacent bugs in your report instead of fixing.
 - Match the surrounding style: error handling, naming, test framework, module
