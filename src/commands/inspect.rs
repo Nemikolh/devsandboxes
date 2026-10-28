@@ -16,16 +16,19 @@ pub fn inspect(name: &str, json: bool) -> Result<()> {
     if let Some(info) = state.instances.values().find(|i| i.container == container) {
         eprintln!("{}", browser_line(info));
     }
-    // JSON mode prints the runtime's own inspect document verbatim (no color, no
-    // envelope): the payload is the backend's schema, not ours.
-    if json {
-        println!("{}", pretty_inspect(&raw));
-        return Ok(());
-    }
-    for line in pretty_inspect(&raw).lines() {
-        println!("{}", paint_json_line(line));
-    }
+    println!("{}", render(&raw, json));
     Ok(())
+}
+
+/// What `inspect` prints of raw inspect output (one `println` of it), shared
+/// with the re-run on an offered machine (`machines::cli::offered`). JSON
+/// mode is the runtime's own inspect document verbatim (no color, no
+/// envelope): the payload is the backend's schema, not ours.
+pub(crate) fn render(raw: &str, json: bool) -> String {
+    if json {
+        return pretty_inspect(raw);
+    }
+    pretty_inspect(raw).lines().map(paint_json_line).collect::<Vec<_>>().join("\n")
 }
 
 /// `run`'s browser sandbox line for a recorded instance

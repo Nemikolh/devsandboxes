@@ -17,12 +17,14 @@ pub fn logs(name: &str, lines: usize) -> Result<()> {
     let state = State::load()?;
     let container = resolve_container(&state, name)?;
     let out = backend().logs_tail(&container, lines)?;
-    if out.trim().is_empty() {
-        println!("(no log output)");
-    } else {
-        println!("{out}");
-    }
+    println!("{}", render_logs(&out));
     Ok(())
+}
+
+/// What `logs` prints of a container's output `out` (one `println` of it),
+/// shared with the re-run on an offered machine (`machines::cli::offered`).
+pub(crate) fn render_logs(out: &str) -> &str {
+    if out.trim().is_empty() { "(no log output)" } else { out }
 }
 
 /// `logs --build`: print an instance's build log (`crate::build_log`).

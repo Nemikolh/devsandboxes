@@ -273,11 +273,33 @@ limitation means editing this file in the same commit.
 - The npm client's `forwards.list(dir)` can't pass `machines` (the typed
   `call('forwards.list', {machines: true})` can).
   → [api](reference/api.md#forwards); `npm/devsandboxes/index.js`
-- An offered fleet worker (fleet step 1b) answers quick calls and verbs
-  only: `exec`, terminal tabs, forwards, the agent relay and every CLI
-  re-run over ssh (`logs`/`inspect` on the CLI included; the dashboard's
-  work) refuse with "need fleet step 4".
-  → [fleet](architecture/daemon/fleet.md#hub-side); `machines::offered_refusal`
+- `--machine <offered worker> ps` and `stats` are refused: no API call
+  answers them over a fleet link yet.
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
+- `--machine <offered worker> gc` is refused: host maintenance on the
+  worker is outside a fleet worker's trust.
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
+- `--machine <offered worker> service ls` is refused (not over a fleet
+  link yet). → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
+- `logs --build --follow` on an offered worker's instance is refused
+  (`logs --build` without it works). → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
+- An `exec` without a tty (piped, or `exec m/x -- cmd` without `-t`) on
+  an offered worker's instance is refused: only session execs (`PTY`) go
+  over the link. → [fleet](architecture/daemon/fleet.md#pty); `machines::cli::offered::Refused::ExecNoTty`
+- `inspect` on an offered worker's instance prints no browser sandbox
+  line (it comes from this host's record).
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::named`
+- `--machine <offered worker> ls` lists only the config roots its
+  instances name (placed configs without an instance left don't show).
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::config_roots`
+- Service terminals on an offered worker are refused, as are terminals
+  of its instances without a helper or whose helper daemon isn't root
+  (`session.attach` is `needs_root`, e.g. `containerUser`).
+  → [fleet](architecture/daemon/fleet.md#pty); `tui::remote::service_argv`, `fleet::pty`
+- Verbs on an offered worker run with the worker's own env: host git
+  there gets no `SSH_AUTH_SOCK` of the hub's agent, unlike an ssh
+  machine's (`--session-env`).
+  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
 - A hub notices a worker that's back (its `fleet-link` socket bound again)
   only at its offered link's next retry, up to 30 s later: a re-offer of a
   known worker doesn't wake the link.
@@ -332,8 +354,8 @@ limitation means editing this file in the same commit.
   runs stay here (fleet step 6 for children), and only offered workers
   are candidates (an ssh machine needs `--machine` or a qualified name).
   The hub's `state.toml` doesn't record a placed instance (it's the
-  worker's, seen as `<worker>/<name>` in federated views; fleet step 6),
-  and `exec`, terminals and forwards to it need fleet step 4. Moving the
+  worker's, seen as `<worker>/<name>` in federated views; fleet step 6).
+  Moving the
   code runs before the forward and isn't cancelled by a hang-up or Ctrl-C
   meanwhile (the run, once forwarded, is); a worker that refuses the run
   (draining) keeps the code it was sent. A new `--branch` starts at the

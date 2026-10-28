@@ -150,13 +150,15 @@ impl Entry {
     }
 }
 
-/// Why an ssh path (exec, terminal tabs, forwards, CLI re-runs, the agent
-/// relay) can't reach an offered machine: until fleet step 4 its link
-/// carries only the API.
+/// Why an ssh argv can't be built for an offered machine: it has no ssh
+/// target. A backstop: what reaches an offered machine goes over its fleet
+/// link (API calls, `PTY`, `TUNNEL`, `AGENT`), and each path that has no
+/// link form refuses first with its own words (`cli::offered::refusal`,
+/// `tui::remote::service_argv`).
 pub fn offered_refusal(name: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "machine `{name}` is an offered fleet worker, reached only through its fleet link's API: \
-         this needs ssh to it (exec, terminals, forwards and CLI re-runs there need fleet step 4)"
+        "machine `{name}` is an offered fleet worker, reached over its fleet link, not ssh \
+         (not over the link yet: ps, stats, gc, service ls, logs --follow, an exec without a tty, vscode, service terminals)"
     )
 }
 
@@ -377,7 +379,7 @@ mod tests {
 
         let lap = Entry::offered("lap");
         assert_eq!((lap.target(), lap.label(), lap.is_offered()), (None, "offered", true));
-        assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("fleet step 4"));
+        assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("reached over its fleet link, not ssh"));
         assert_eq!(entry("srv", "me@srv").ssh_target().unwrap(), "me@srv");
         assert_eq!(Kind::Offered.wire(), (MachineKind::Offered, None));
         assert_eq!(Kind::from_wire(MachineKind::Ssh, Some("t".into())).unwrap(), Kind::Ssh { target: "t".into() });

@@ -31,8 +31,14 @@ impl std::error::Error for Refused {}
 /// prompt) is deliberately not used here.
 pub fn rename(name: &str, new_name: &str) -> Result<()> {
     let new_name = rename_exact(name, new_name)?;
-    println!("renamed {name} -> {new_name}");
+    println!("{}", renamed_line(name, &new_name));
     Ok(())
+}
+
+/// `rename`'s line, shared with the re-run on an offered machine
+/// (`machines::cli::offered`).
+pub(crate) fn renamed_line(name: &str, new_name: &str) -> String {
+    format!("renamed {name} -> {new_name}")
 }
 
 /// Silent core shared with the daemon's `instances.rename` (via

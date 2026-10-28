@@ -927,8 +927,9 @@ offered = true                     # a fleet worker that dialed this host: no ta
 
 A machine's `kind` is `ssh` (it has a `target`) or `offered` (a fleet
 worker reached over its own link, `fleet.offer`; nothing here sshes to
-it, so terminals, forwards, the agent relay and the CLI's ssh re-runs are
-refused for it, while quick calls and verbs work).
+it: quick calls and verbs go over that link, as do terminals, forwards
+and the agent, and the CLI's re-runs there are quick calls, see
+[machines](../architecture/daemon/machines.md#the-cli-clirs)).
 
 A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-` (never
 `/` or `@`, so the CLI's `my-server/web-2` and `@/web-2` are unambiguous).

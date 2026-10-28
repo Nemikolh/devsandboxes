@@ -47,18 +47,24 @@ pub fn set_saved_at(state: &Path, key: &str, done: bool) -> Result<String> {
 /// Returns whether `state` changed, and the status line.
 fn set(state: &mut State, key: &str, done: bool, now: u64) -> Result<(bool, String), UnknownInstance> {
     let info = state.instances.get_mut(key).ok_or_else(|| UnknownInstance(key.to_string()))?;
-    Ok(match (done, info.done.is_some()) {
-        (true, true) => (false, format!("`{key}` is already done")),
-        (false, false) => (false, format!("`{key}` is not done")),
-        (true, false) => {
-            info.done = Some(now);
-            (true, format!("marked {key} done"))
-        }
-        (false, true) => {
-            info.done = None;
-            (true, format!("marked {key} not done"))
-        }
-    })
+    let line = status_line(key, done, info.done.is_some());
+    let changed = done != info.done.is_some();
+    if changed {
+        info.done = done.then_some(now);
+    }
+    Ok((changed, line))
+}
+
+/// The status line of setting (`done`) or clearing `key`'s flag when it
+/// `was` set, shared with the re-run on an offered machine
+/// (`machines::cli::offered`, which reads `was` from the machine's rows).
+pub(crate) fn status_line(key: &str, done: bool, was: bool) -> String {
+    match (done, was) {
+        (true, true) => format!("`{key}` is already done"),
+        (false, false) => format!("`{key}` is not done"),
+        (true, false) => format!("marked {key} done"),
+        (false, true) => format!("marked {key} not done"),
+    }
 }
 
 #[cfg(test)]

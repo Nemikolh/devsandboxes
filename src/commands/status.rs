@@ -29,11 +29,14 @@ impl<T: Serialize> Envelope<T> {
 }
 
 pub fn status(dir: &Path) -> Result<()> {
-    let snapshot = crate::snapshot::collect(dir);
-    let json = serde_json::to_string_pretty(&Envelope::new(snapshot))
-        .context("serialize snapshot")?;
-    println!("{json}");
+    println!("{}", render(&crate::snapshot::collect(dir))?);
     Ok(())
+}
+
+/// `status --json`'s document for `snapshot` (one `println` of it), shared
+/// with the re-run on an offered machine (`machines::cli::offered`).
+pub(crate) fn render(snapshot: &crate::snapshot::Snapshot) -> Result<String> {
+    serde_json::to_string_pretty(&Envelope::new(snapshot)).context("serialize snapshot")
 }
 
 #[cfg(test)]

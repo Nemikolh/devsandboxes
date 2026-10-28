@@ -21,7 +21,10 @@
 //! On an offered fleet worker (no ssh to it) the dials are `PTY` streams
 //! over its fleet link from this process (`fleet::pty_client`, [`Dials`]),
 //! in the same loop; its `--attach` and `--sessions` too (the session list
-//! a `sessions.list` quick call).
+//! a `sessions.list` quick call). Its other re-runs are API calls through
+//! the daemon, or refused ([`offered`]).
+
+mod offered;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -723,6 +726,15 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
         Plan::Machine(m, usage) => {
             let mut conn = connect().context("--machine needs devsandbox serve")?;
             let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
+            if entry.is_offered() && usage != MachineUse::Port {
+                let u = offered::use_of(&command);
+                if let offered::Use::Refused(what) = u {
+                    return Err(offered::refusal(&m, what));
+                }
+                let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
+                let code = offered::per_root(&mut |method, params| conn.call(method, params), &u, &m, &entry.roots, &mut out, &mut err)?;
+                return Ok(Routed::Exit(code));
+            }
             let held = match usage {
                 MachineUse::Once(_) | MachineUse::PerRoot { .. } => hold(conn, &entry),
                 _ => {
@@ -799,10 +811,13 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         (Some(m), _) | (None, Where::Machine(m)) => m.clone(),
         (None, _) => return Ok(Routed::Here(renamed(command, chosen.name))),
     };
+    let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
     if matches!(command, Command::Vscode { .. }) {
+        if entry.is_offered() {
+            return Err(offered::refusal(&m, offered::Refused::Vscode));
+        }
         bail!("`{m}/{}` is on a machine: `devsandbox vscode` is not supported on machines yet", chosen.name);
     }
-    let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
     if matches!(command, Command::Port { .. }) {
         drop(conn);
         let root = chosen.root.clone().or_else(|| entry.roots.first().cloned());
@@ -811,14 +826,29 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     }
     let root = chosen.root.as_deref().or(entry.roots.first().map(PathBuf::as_path));
     let terminal = on_terminal();
-    if entry.is_offered()
-        && let Some(routed) = offered_session_exec(&command, &mut conn, &entry, &chosen.name, root, terminal)?
-    {
-        return Ok(routed);
+    if entry.is_offered() {
+        match offered::use_of(&command) {
+            offered::Use::Refused(what) => return Err(offered::refusal(&m, what)),
+            offered::Use::Link => {}
+            u => {
+                let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+                let tty = std::io::stdout().is_terminal();
+                let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
+                let call = &mut |method: &str, params| conn.call(method, params);
+                return Ok(Routed::Exit(offered::named(call, &u, &m, &chosen.name, root, tty, &mut out, &mut err)?));
+            }
+        }
+        if let Some(routed) = offered_session_exec(&command, &mut conn, &entry, &chosen.name, root, terminal)? {
+            return Ok(routed);
+        }
     }
     if let Some(id) = reconnect_session(&command, terminal, || crate::commands::exec::mint_session_id(crate::state::Instance::now()))? {
         let dials = dials(&entry, &command, &chosen.name, root, &id, terminal)?;
         return run_dials(dials, &entry, &id, hold(conn, &entry));
+    }
+    if entry.is_offered() {
+        // What's left for an offered machine: an exec without a tty.
+        return Err(offered::refusal(&m, offered::Refused::ExecNoTty));
     }
     let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
     let argv = ssh::cli_argv(&entry, terminal, &args)?;
@@ -829,8 +859,8 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
 /// offered machine `entry` (at `root` there): the session list through a
 /// `sessions.list` quick call on `conn`, the attach one `PTY` dial (no loop,
 /// as over ssh: its 255 is the caller's to retry). `None` for any other
-/// exec, which [`resolve_and_route`] goes on with (a non-tty one to the ssh
-/// path's refusal).
+/// exec, which [`resolve_and_route`] goes on with (a non-tty one to
+/// [`offered::Refused::ExecNoTty`]).
 fn offered_session_exec(
     command: &Command,
     conn: &mut Conn,
@@ -1074,6 +1104,37 @@ mod tests {
         assert_eq!(once(&["lend", "drain"]), MachineUse::Refused("lend"));
         assert_eq!(once(&["fleet", "join", "me@hub"]), MachineUse::Refused("fleet"));
         assert_eq!(once(&["fleet", "leave"]), MachineUse::Refused("fleet"));
+    }
+
+    /// Per command: what an ssh machine re-runs (`--machine` use, or the
+    /// named re-run's args) and what an offered one does instead, an API
+    /// call or a refusal (never a `devsandbox …` there).
+    #[test]
+    fn ssh_machines_re_run_offered_ones_call_or_refuse() {
+        use offered::{Refused, Use};
+        let nameless = |args: &[&str]| (machine_use(Some(&command(args))), offered::use_of(&command(args)));
+        assert_eq!(nameless(&["ls"]), (MachineUse::PerRoot { args: ms(&["ls"]), json: false }, Use::Ls { json: false }));
+        assert_eq!(nameless(&["status", "--json"]), (MachineUse::PerRoot { args: ms(&["status", "--json"]), json: true }, Use::Status));
+        assert_eq!(nameless(&["ps"]), (MachineUse::Once(ms(&["ps"])), Use::Refused(Refused::Ps)));
+        assert_eq!(nameless(&["stats"]), (MachineUse::Once(ms(&["stats"])), Use::Refused(Refused::Stats)));
+        assert_eq!(nameless(&["gc"]), (MachineUse::PerRoot { args: ms(&["gc"]), json: false }, Use::Refused(Refused::Gc)));
+        assert_eq!(nameless(&["service", "ls"]).1, Use::Refused(Refused::ServiceLs));
+        // `port` goes over the link (`TUNNEL`) on both.
+        assert_eq!(nameless(&["port", "--service", "redis", "6379"]), (MachineUse::Port, Use::Link));
+
+        let named = |args: &[&str]| (remote_args(&command(args), "web", None).is_some(), offered::use_of(&command(args)));
+        assert_eq!(named(&["logs", "box/web"]), (true, Use::Logs { lines: 50 }));
+        assert_eq!(named(&["logs", "--build", "box/web"]), (true, Use::BuildLog));
+        assert_eq!(named(&["logs", "--build", "-f", "box/web"]), (true, Use::Refused(Refused::LogsFollow)));
+        assert_eq!(named(&["inspect", "box/web"]), (true, Use::Inspect { json: false }));
+        assert_eq!(named(&["done", "box/web"]), (true, Use::Done(true)));
+        assert_eq!(named(&["undone", "box/web"]), (true, Use::Done(false)));
+        assert_eq!(named(&["rename", "box/web", "x"]), (true, Use::Rename("x".into())));
+        assert_eq!(named(&["vscode", "box/web"]), (false, Use::Refused(Refused::Vscode)));
+        // exec: a tty one dials `PTY` (`dials`), a non-tty one is refused
+        // after `reconnect_session` says it gets none.
+        assert_eq!(named(&["exec", "box/web", "--", "ls"]), (true, Use::Link));
+        assert_eq!(reconnect_session(&command(&["exec", "box/web", "--", "ls"]), true, || ID.into()).unwrap(), None);
     }
 
     fn entry() -> Entry {

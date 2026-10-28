@@ -414,15 +414,22 @@ link's `API` streams.
   entry (`service.rs` `spawn_link` starts no agent thread for it, and
   `Want::agent_ready` is `false` at once), and `forward::verb` waits for
   none.
-- **What needs ssh** to the machine is refused for an offered one: every
-  `machines::ssh` argv goes through `argv_with`, which takes
-  `Entry::ssh_target`, an error for an offered entry
-  (`machines::offered_refusal`). So the CLI's other re-runs (`logs`,
-  `inspect`, `done`, …, an `exec` without a tty, `--machine` per-root
-  commands) and the dashboard's service tabs (`tui::remote::service_argv`:
-  service terminals aren't supported over the fleet link) fail. The
-  dashboard's logs and inspect views go through the `containers.*` quick
-  calls and work.
+- **The CLI's other re-runs** are API calls with `machine` (fleet plan
+  decision 15): `logs` (`containers.logs`), `logs --build`
+  (`instances.buildLog`), `inspect` (`containers.inspect`), `done` /
+  `undone` (`instances.done`), `rename` (`instances.rename`), `--machine
+  m ls` / `status --json` (`instances.list` per config root under the
+  fleet root), printed as the local commands print them
+  ([machines](machines.md#the-cli-clirs), `machines::cli::offered`). The
+  dashboard's logs and inspect views go through the same quick calls.
+- **What has no link form yet** is refused, each in its own words: `ps`,
+  `stats`, `service ls`, `logs --follow`, an `exec` without a tty and
+  `vscode` (`cli::offered::refusal`), `gc` (host maintenance, outside a
+  worker's trust), and the dashboard's service tabs
+  (`tui::remote::service_argv`: service terminals aren't supported over
+  the fleet link). No ssh argv is built for an offered entry:
+  `machines::ssh`'s `argv_with` takes `Entry::ssh_target`, an error for one
+  (`machines::offered_refusal`, a backstop no path reaches first).
 
 ### Hub mode
 

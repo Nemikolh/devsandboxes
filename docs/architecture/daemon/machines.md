@@ -16,7 +16,8 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 (`serve`, `End`, `SPEC`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
-`localize`, `Reconnect`, `Dials`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
+`localize`, `Reconnect`, `Dials`), `cli/offered.rs` (`use_of`, `Use`,
+`Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
 `parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
 `src/serve/relay.rs` (`--session-env`), `src/commands/machine.rs`,
 `src/commands/agent_relay.rs` (`run`, `Socket`),
@@ -56,8 +57,9 @@ collides with an instance name.
 ## ssh
 
 One argv builder for the daemon, the CLI and the dashboard; every argv
-goes through `argv_with`, which takes `Entry::ssh_target`, so an offered
-machine is refused alike by all of them (`offered_refusal`). Plain ssh, no
+goes through `argv_with`, which takes `Entry::ssh_target`, so none is
+built for an offered machine (`offered_refusal`, a backstop: each path to
+one goes over its fleet link or refuses first in its own words). Plain ssh, no
 ControlMaster of its own: `~/.ssh/config` decides. The remote command runs
 through the login shell (`exec "$SHELL" -lc '…'`, each arg quoted for it),
 so the remote `PATH` is the user's. No argv passes `-A`: this host's
@@ -344,8 +346,8 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   fleet worker one `TUNNEL` stream per bridge over its fleet link
   ([fleet](fleet.md#tunnel)). `vscode` on a
   machine's instance is refused.
-- **`--machine m`** is for nameless commands (`machine_use`): `ps`,
-  `stats` run once over ssh; root-bound ones (`ls`, `status`, `gc`,
+- **`--machine m`** is for nameless commands (`machine_use`; an offered
+  worker's: below): `ps`, `stats` run once over ssh; root-bound ones (`ls`, `status`, `gc`,
   `service ls`) run once per registered root with `-C <root>` and a
   `==> m:<root>` line (`--json` with several roots is an error); `stop
   --all`, `rebuild --all`, `start --all`, `service rebuild` go as verbs;
@@ -408,9 +410,33 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   quick call with `machine` (the lines printed, or `no sessions in
   \`m/x\`` on stderr); a tty `--attach [ID]` is one dial attaching only
   (no id: `exec::choose_detached` over that list), no loop, as over ssh
-  (`offered_session_exec`). Any other command there but `port` (above),
-  and an `exec` without a tty, takes the ssh path and its refusal
-  (`offered_refusal`).
+  (`offered_session_exec`).
+- **Other re-runs to an offered fleet worker** are API calls through this
+  host's daemon with `machine` set (fleet plan decision 15: within the
+  worker's trust, never a `devsandbox …` run there), printed by the local
+  command's own render fns (`commands::logs::render_logs`,
+  `inspect::render`, `ls::table` / `ls::render_json`, `status::render`,
+  `done::status_line`, `rename::renamed_line`), so the output reads the
+  same; `cli::offered::use_of` (pure) picks the call, `offered::named` /
+  `offered::per_root` make them over an injected call. `logs [-n N]` is
+  `containers.logs` of the instance's container (its row's, from an
+  `instances.list` at `depth: disk`: a rename keeps the container; a name
+  that is no instance is taken as a container name); `logs --build` is
+  `instances.buildLog` (up to `api::MAX_LINES` lines, a note on stderr
+  when cut; `ansi` when stdout is a terminal); `inspect [--json]` is
+  `containers.inspect` (without the local one's browser sandbox line:
+  that comes from this host's record); `done` / `undone` are
+  `instances.done`, worded from the row's `done` before; `rename` is
+  `instances.rename`. `--machine m ls [--json]` and `status --json` list
+  each config root under the machine's one root (its fleet root): the
+  roots its instance rows name (`offered::config_roots`; none: the fleet
+  root itself), each an `instances.list` after its `==> m:<root>` line,
+  `per_root`'s rules (`--json` with several roots is an error); `ls`
+  renders the snapshot's sandbox rows (a config that doesn't load is the
+  error, as locally). Refused, naming the command (`offered::refusal`):
+  `ps`, `stats`, `service ls`, `logs --follow`, an `exec` without a tty
+  and `vscode` (not over a fleet link yet), and `gc` (host maintenance on
+  the worker, outside a worker's trust).
 
 ## `devsandbox machine add|ls|set|rm`
 

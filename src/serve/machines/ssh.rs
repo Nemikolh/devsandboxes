@@ -525,7 +525,7 @@ mod tests {
         ];
         for r in refusals {
             let err = format!("{:#}", r.unwrap_err());
-            assert!(err.contains("machine `lap` is an offered fleet worker") && err.contains("fleet step 4"), "{err}");
+            assert!(err.contains("machine `lap` is an offered fleet worker") && err.contains("not ssh"), "{err}");
         }
     }
 

@@ -24,77 +24,108 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
             .and_then(|p| crate::state::State::load().ok()?.identity_acks.remove(&p))
             .unwrap_or_default();
         let (rows, _errors) = crate::snapshot::sandbox_rows(dir, &config, &acked);
-        let out = serde_json::to_string_pretty(&Envelope::new(rows))
-            .context("serialize sandboxes")?;
-        println!("{out}");
+        println!("{}", render_json(&rows)?);
         return Ok(());
     }
 
     let sandboxes = config.resolve_all()?;
     if sandboxes.is_empty() {
-        println!(
-            "no sandboxes defined in {}",
-            crate::config::display_path(dir).display()
-        );
+        println!("{}", none_defined(&crate::config::display_path(dir)));
         return Ok(());
     }
 
-    // Plain cells (for width math) and colored cells (for display) are kept in
-    // lockstep so column widths derive from the visible text, not the escapes.
-    let mut plain: Vec<[String; 5]> = Vec::with_capacity(sandboxes.len());
-    let mut colored: Vec<[String; 5]> = Vec::with_capacity(sandboxes.len());
-
+    let mut lines = Vec::with_capacity(sandboxes.len());
     for sandbox in &sandboxes {
         // Feature problems a build would hit (a missing local feature folder),
         // surfaced here rather than only at `run`.
         for issue in crate::features::feature_issues(dir, sandbox.properties.features.as_ref()) {
             eprintln!("warning: sandbox `{}`: {issue}", sandbox.name);
         }
-        let source = sandbox.source();
-        let folder = sandbox.folder();
-        let services = sandbox
-            .properties
-            .services
-            .as_ref()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.join(", "));
-        let extends = config
-            .sandboxes
-            .get(&sandbox.name)
-            .and_then(|table| table.get("extends"))
-            .and_then(extends_names);
-
-        plain.push([
-            sandbox.name.clone(),
-            source.clone(),
-            folder.unwrap_or("-").to_string(),
-            services.clone().unwrap_or_else(|| "-".to_string()),
-            extends.clone().unwrap_or_else(|| "-".to_string()),
-        ]);
-        colored.push([
-            bold_cyan(&sandbox.name),
-            color_source(&source),
-            match folder {
-                Some(f) => f.to_string(),
-                None => dim("-"),
-            },
-            match services {
-                Some(s) => magenta(&s),
-                None => dim("-"),
-            },
-            match extends {
-                Some(e) => e,
-                None => dim("-"),
-            },
-        ]);
+        lines.push(Line {
+            name: sandbox.name.clone(),
+            source: sandbox.source(),
+            folder: sandbox.folder().map(str::to_string),
+            services: sandbox
+                .properties
+                .services
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.join(", ")),
+            extends: config
+                .sandboxes
+                .get(&sandbox.name)
+                .and_then(|table| table.get("extends"))
+                .and_then(extends_names),
+        });
     }
-
-    let widths = column_widths(&HEADERS, &plain);
-    print!("{}", format_row(&HEADERS.map(|h| dim(h)), &plain_headers(), &widths));
-    for (colored_row, plain_row) in colored.iter().zip(&plain) {
-        print!("{}", format_row(colored_row, plain_row, &widths));
-    }
+    print!("{}", table(&lines));
     Ok(())
+}
+
+/// `ls --json`'s document for `rows` (one `println` of it), shared with the
+/// re-run on an offered machine (`machines::cli::offered`).
+pub(crate) fn render_json(rows: &[crate::snapshot::SandboxRow]) -> Result<String> {
+    serde_json::to_string_pretty(&Envelope::new(rows)).context("serialize sandboxes")
+}
+
+/// `ls`'s line for a config root without sandboxes.
+pub(crate) fn none_defined(dir: &Path) -> String {
+    format!("no sandboxes defined in {}", dir.display())
+}
+
+/// One sandbox of the `ls` table, its cells before colouring (`None`: `-`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Line {
+    pub name: String,
+    pub source: String,
+    pub folder: Option<String>,
+    pub services: Option<String>,
+    pub extends: Option<String>,
+}
+
+impl Line {
+    /// The line of a snapshot's sandbox row: what the re-run on an offered
+    /// machine has instead of the config (`source`, the `, `-joined
+    /// services and `extends`, as [`ls`] builds them).
+    pub(crate) fn of_row(row: &crate::snapshot::SandboxRow) -> Line {
+        let joined = |v: &[String]| (!v.is_empty()).then(|| v.join(", "));
+        Line {
+            name: row.name.clone(),
+            source: row.source.clone(),
+            folder: row.folder.clone(),
+            services: joined(&row.services),
+            extends: joined(&row.extends),
+        }
+    }
+}
+
+/// The `ls` table, header first, each line ending in `\n`.
+pub(crate) fn table(lines: &[Line]) -> String {
+    // Plain cells (for width math) and colored cells (for display) are kept in
+    // lockstep so column widths derive from the visible text, not the escapes.
+    let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+    let plain: Vec<[String; 5]> = lines
+        .iter()
+        .map(|l| [l.name.clone(), l.source.clone(), dash(&l.folder), dash(&l.services), dash(&l.extends)])
+        .collect();
+    let colored: Vec<[String; 5]> = lines
+        .iter()
+        .map(|l| {
+            [
+                bold_cyan(&l.name),
+                color_source(&l.source),
+                l.folder.clone().unwrap_or_else(|| dim("-")),
+                l.services.as_deref().map(magenta).unwrap_or_else(|| dim("-")),
+                l.extends.clone().unwrap_or_else(|| dim("-")),
+            ]
+        })
+        .collect();
+    let widths = column_widths(&HEADERS, &plain);
+    let mut out = format_row(&HEADERS.map(dim), &plain_headers(), &widths);
+    for (colored_row, plain_row) in colored.iter().zip(&plain) {
+        out.push_str(&format_row(colored_row, plain_row, &widths));
+    }
+    out
 }
 
 fn plain_headers() -> [String; 5] {
