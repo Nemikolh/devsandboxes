@@ -65,6 +65,7 @@ devsandbox run web --here
 - **`caches` work for a non-root user.** Cache mounts now go to `/var/cache/devsandbox/<name>` instead of `/root/…`, which a non-root `remoteUser` couldn't reach. The tools find them through their env vars as before.
 - **Same-named sandboxes in two config roots no longer clobber each other's images, nor does sandbox `foo-feat` clobber sandbox `foo`'s features image.** Built images are tagged per config root, one prefix per kind (`devsandbox-img-<root>-<sandbox>`, `devsandbox-feat-<root>-<sandbox>`, `devsandbox-img-svc-<root>-<service>`), so the first `run` or `rebuild` after upgrading builds them again; images under the old tags are left for `docker image prune`.
 - **`${localEnv:NAME:default}` uses its default.** An unset `NAME` now expands to `default` (everything after the `:`) instead of empty; a set one, even to empty, to its value. `${containerEnv:NAME:default}` works the same.
+- **Running devsandbox as root on rootful docker or podman works.** Instead of failing to remap the adopted account to uid 0, execs run as root with `HOME` set to the account's home, as on rootless docker.
 
 <details><summary>Commits</summary>
 

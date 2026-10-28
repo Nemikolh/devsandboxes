@@ -559,20 +559,23 @@ pub fn plan(probe: Probe, identity: Identity, accounts: Accounts, host: Ids) -> 
     let Some(account) = accounts.adopted() else {
         p.create_user = Some(ROOT.into());
         p.exec_user = Some(ROOT.into());
-        // Under rootless docker root is the plan anyway.
-        if probe.mode != Mode::RootlessDocker {
+        // Under rootless docker (or rootful as a host root) root is the
+        // plan anyway.
+        if probe.mode != Mode::RootlessDocker && !(probe.mode == Mode::Rootful && host.uid == 0) {
             p.warnings.push(NO_ACCOUNT_WARNING.into());
         }
         return p;
     };
     p.account = Some(account.into());
     match probe.mode {
-        Mode::Rootful => {
+        // A host root can't be remapped to (the helper refuses uid 0) and
+        // needn't be: root inside is the host user, as under rootless docker.
+        Mode::Rootful if host.uid != 0 => {
             p.create_user = Some(ROOT.into());
             p.remap = Some(Remap { user: account.into(), uid: host.uid, gid: host.gid });
             p.exec_user = Some(account.into());
         }
-        Mode::RootlessDocker => {
+        Mode::Rootful | Mode::RootlessDocker => {
             p.create_user = Some(ROOT.into());
             p.exec_user = Some(ROOT.into());
             p.root_home = true;
@@ -618,6 +621,9 @@ impl Plan {
                 format!("{mode}: identity = \"image\", exec as {user}, no remap")
             }
             (Identity::Host, _, None) => format!("{mode}: no account to adopt, exec as root"),
+            (Identity::Host, Mode::Rootful, Some(a)) if self.root_home => {
+                format!("{mode}: exec as root, you are root (HOME of {a})")
+            }
             (Identity::Host, Mode::Rootful, Some(a)) => {
                 let (uid, gid) = self.remap.as_ref().map_or((0, 0), |r| (r.uid, r.gid));
                 format!("{mode}: exec as {a}, remapped to {uid}:{gid}")
@@ -875,6 +881,19 @@ mod tests {
             assert!(p.warnings.is_empty(), "{mode:?}");
             assert!(!p.relabel, "{mode:?}");
         }
+    }
+
+    #[test]
+    fn rootful_host_root_plans_like_rootless_docker() {
+        let root = ids(0, 0);
+        for accounts in [vscode(), Accounts::default(), Accounts { image_user: Some("node"), ..Default::default() }] {
+            let p = plan(probe(Mode::Rootful), Identity::Host, accounts, root);
+            let want = Plan { mode: Mode::Rootful, ..plan(probe(Mode::RootlessDocker), Identity::Host, accounts, root) };
+            assert_eq!(p, want, "{accounts:?}");
+        }
+        let p = plan(probe(Mode::Rootful), Identity::Host, vscode(), root);
+        assert_eq!(p.summary(), "rootful: exec as root, you are root (HOME of vscode)");
+        assert_eq!(Plan::parse_label(&p.label()), Some(p));
     }
 
     #[test]

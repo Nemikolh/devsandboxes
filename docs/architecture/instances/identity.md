@@ -33,8 +33,8 @@ The sandbox's `identity` (`SandboxProperties::identity`):
   `run::facts::accounts`, counted only when neither field is set), as a name (a `user:group` spec loses its
   group). It keeps its name, home and shell. root, `0` or nothing means
   there's no account to adopt: the plan runs as root and warns,
-  recommending the `common-utils` feature (not under rootless docker,
-  where root is the plan anyway).
+  recommending the `common-utils` feature (not under rootless docker, nor
+  rootful as a host root, where root is the plan anyway).
 - `"image"`: users taken literally. Created as `containerUser`, exec'd as
   `remoteUser` (else `containerUser`), nothing remapped.
 
@@ -52,10 +52,16 @@ table-tested. The probe is the runtime context's mode and SELinux flag
 | Mode | Create (`run`) | `devsbd identity apply A` | Exec as | `HOME` |
 |---|---|---|---|---|
 | rootful | `--user root` | `--remap <host uid>:<host gid>` | `A` | `A`'s own |
+| rootful, host uid 0 | as rootless docker | as rootless docker | root | `A`'s home |
 | rootless docker | `--user root` | `--root-home` (home chowned to 0) | root | `A`'s home |
 | rootless podman | `--userns keep-id:uid=U,gid=G` | `--expect U:G` (`Plan::keep_id`; warns when `A` isn't) | `A` | `A`'s own |
 | VM-backed | `--user containerUser` when set | no mode flag | `A` | `A`'s own |
 | any, `identity = "image"` | `--user containerUser` when set | not run | `remoteUser`, else `containerUser` | the image's |
+
+A host root on a rootful runtime gets the rootless-docker plan (`plan`'s
+`Mode::Rootful if host.uid != 0` arm): root inside already matches the
+host's root-owned binds, and the helper refuses a remap to uid 0. The
+mode stays `rootful` (the label's `mode=`, the socket's `--socket-gid`).
 
 On every plan, SELinux enforcing (`Plan::relabel`) relabels binds
 (`create_args`): each `-v` (workspace, git companion, `worktree-link`
