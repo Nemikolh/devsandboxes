@@ -385,9 +385,10 @@ mod tests {
     fn through(gate: &Gate, now: Instant, send: &[u8]) -> Vec<u8> {
         let Some(Conn::Unix(mut c)) = gate.open(now) else { panic!("a stream is always answered") };
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        c.write_all(send).unwrap();
-        c.shutdown(Shutdown::Write).unwrap();
-        // A refusal closes with what was sent unread: a reset after the byte.
+        // A refusal may close before this write (a broken pipe), or after it
+        // with what was sent unread (a reset after the byte).
+        let _ = c.write_all(send);
+        let _ = c.shutdown(Shutdown::Write);
         let mut got = Vec::new();
         let _ = c.read_to_end(&mut got);
         got
