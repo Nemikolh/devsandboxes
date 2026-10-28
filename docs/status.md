@@ -34,9 +34,10 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 6 on. Steps 1-5 shipped on the two-kind
-  model that steps 6-9 replace (steps 4-5's channels and API forms on
-  offered workers' links only).
+  re-placement: from fleet step 7 on. Steps 1-6 shipped on the two-kind
+  model that steps 7-9 replace (steps 4-5's channels and API forms on
+  offered workers' links only; step 6's `member.toml` and trust table on
+  both kinds' API connections).
   → [plan](plans/active/fleet.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)

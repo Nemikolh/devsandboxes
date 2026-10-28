@@ -1,11 +1,12 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-5 shipped
+Status: in progress. Steps 1-6 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
 built on two kinds of machine (ssh machines and offered workers, `fleet
-join`, `lend`; step 4's channels on the fleet link only); steps 5-9 replace that with the model below (ADR
+join`, `lend`; step 4's channels on the fleet link only; step 6's
+trust table on both kinds' API connections); steps 7-9 replace that with the model below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
 proposed). The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
@@ -328,7 +329,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    relayed unchanged by every hop. Session `ls`/`rm` within the caller's
    trust. The member's daemon attaches directly (decision 13).
 5. **The rest over the link** (M, shipped on offered workers' links; `gc`
-   waits for step 6's `full`). On the fleet link, like step 4, and
+   with step 6). On the fleet link, like step 4, and
    before anything deletes an ssh argv, so an ssh machine never loses a
    command in between: API calls for `ps`, `stats`, `service ls` and
    `logs --follow`; a piped `PTY` mode for a non-tty `exec`; a host-pty
@@ -337,7 +338,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    lifted); `gc` over the link refused under `worker`, allowed under
    `full` once step 6 has trust. Ssh machines keep their argvs until
    step 7.
-6. **Member file and trust** (M). [Trust](#trust-worker-or-full):
+6. **Member file and trust** (M, shipped). [Trust](#trust-worker-or-full):
    `member.toml` takes `name`, `trust`, `[caps]`, `[allow]`, `dev-builds`
    and the picked `roots` (decision 17); `member.get` / `member.set`,
    daemon-written (decision 3); `machine trust worker|full`. The confined
@@ -345,7 +346,12 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    member's own roots plus the fleet root, placed work under the worker
    policy (decision 9); `full` skips the table and the policy. Applied to
    every remote connection, ssh machines' (`api --stdio`) too. Lending
-   state (`state`, `hub`) stays in `lend.toml` until step 8.
+   state (`state`, `hub`) stays in `lend.toml` until step 8. As built:
+   an ssh machine's relay attaches its connection with `link.attach
+   {peer}`; `machine add` records the picked roots on the member
+   (`machine roots add` there over its add-time ssh); `gc` is a daemon
+   verb, `full` only; the per-use ssh argvs still bypass trust until
+   step 7.
 7. **One link per machine pair** (L).
    [Members, links and the hub](#members-links-and-the-hub): a
    `Transport` trait (dial → `Duplex`), ssh its only implementation;
