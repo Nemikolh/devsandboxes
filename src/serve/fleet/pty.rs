@@ -22,9 +22,20 @@
 //! and it was reaped ([`exit_record`]). The hub closing the stream first
 //! kills and reaps it, and nothing more is written.
 //!
-//! [`parse_header`], [`gate`], [`offered`], [`attach_params`] and
-//! [`exit_record`] are pure (`gate` canonicalizes the header's root);
-//! [`serve`] is the I/O.
+//! A session header for an instance whose helper can't attach (none, or its
+//! daemon doesn't offer `session.attach`: not root, or older) runs a tty
+//! exec instead when it creates ([`decide`], [`Terminal::Tty`]): `<runtime>
+//! exec -it` under a host pty ([`run_tty`]), not resumable (one `stderr`
+//! note says so first); an attach-only one gets `no-session`. A header with
+//! `service` ([`Mode::Service`]) is the same tty exec into a service
+//! container the instance uses ([`service_container`]). The pty's output
+//! comes back as `stdout` records, the hub's `stdin` and `resize` go into
+//! it, its exit is one `exit` record; the hub closing first kills and reaps
+//! it.
+//!
+//! [`parse_header`], [`gate`], [`decide`], [`attach_params`],
+//! [`exit_record`] and [`tty_exit_record`] are pure (`gate` canonicalizes
+//! the header's root); [`serve`] is the I/O.
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -58,9 +69,8 @@ pub mod code {
     pub const NOT_FOUND: &str = "not-found";
     /// The instance isn't running (no live bridge to its helper).
     pub const NOT_RUNNING: &str = "not-running";
-    /// No terminal over the link for this instance: no helper, or its
-    /// daemon doesn't offer `session.attach` (not root, e.g.
-    /// `containerUser`; or an older helper).
+    /// The helper stopped offering `session.attach` between the check
+    /// ([`super::decide`]) and the call.
     pub const UNSUPPORTED: &str = "unsupported";
     /// The attach ended without an end record (the bridge to the instance
     /// was lost): neither an exit nor a refusal; the session may live on.
@@ -77,8 +87,9 @@ const PIPE_TICK: Duration = Duration::from_millis(100);
 const PIPE_CHUNK: usize = 64 * 1024;
 
 /// What the hub asks: `{"root", "instance", "session", "create"?:
-/// {"argv"?}}`, or `{"root", "instance", "pipe": {"argv",
-/// "interactive"?}}`.
+/// {"argv"?}}`, `{"root", "instance", "pipe": {"argv",
+/// "interactive"?}}`, or `{"root", "instance", "service", "create":
+/// {"argv"?}}`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
     /// The instance's config root (absolute, under the fleet root).
@@ -88,7 +99,7 @@ pub struct Header {
     pub mode: Mode,
 }
 
-/// A session attach or a piped exec.
+/// A session attach, a piped exec, or a service terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// Session `id` (`control::valid_run_id`). `create`: `None`, attach
@@ -98,6 +109,10 @@ pub enum Mode {
     /// A non-tty exec of `argv` (never empty: the hub sends the login shell
     /// itself), the hub's stdin forwarded when `interactive` (`exec -i`).
     Pipe { argv: Vec<String>, interactive: bool },
+    /// A tty exec of `argv` (empty: the login shell) in the container of
+    /// service `name` that the header's instance uses; always a new
+    /// terminal (no sessions).
+    Service { name: String, argv: Vec<String> },
 }
 
 fn bad(message: impl Into<String>) -> Record {
@@ -136,6 +151,23 @@ pub fn parse_header(rec: Record) -> Result<Header, Record> {
     let root = PathBuf::from(text("root")?);
     let instance = text("instance")?.to_string();
     let present = |key: &str| !matches!(p.get(key), None | Some(Json::Null));
+    let create_argv = |c: &Obj| match c.get("argv") {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::Strs(argv)) => Ok(argv.clone()),
+        Some(_) => Err(bad("`create.argv` must be an array of strings")),
+    };
+    if present("service") {
+        if present("session") || present("pipe") {
+            return Err(bad("the PTY header takes one of `session`, `pipe` and `service`"));
+        }
+        let name = text("service")?.to_string();
+        let argv = match p.get("create") {
+            Some(Json::Obj(c)) => create_argv(c)?,
+            None | Some(Json::Null) => return Err(bad("a service terminal needs `create` (there are no service sessions)")),
+            Some(_) => return Err(bad("`create` must be an object")),
+        };
+        return Ok(Header { root, instance, mode: Mode::Service { name, argv } });
+    }
     if present("pipe") {
         if present("session") || present("create") {
             return Err(bad("the PTY header takes `pipe` or `session`, not both"));
@@ -159,11 +191,7 @@ pub fn parse_header(rec: Record) -> Result<Header, Record> {
     }
     let create = match p.get("create") {
         None | Some(Json::Null) => None,
-        Some(Json::Obj(c)) => match c.get("argv") {
-            None | Some(Json::Null) => Some(Vec::new()),
-            Some(Json::Strs(argv)) => Some(argv.clone()),
-            Some(_) => return Err(bad("`create.argv` must be an array of strings")),
-        },
+        Some(Json::Obj(c)) => Some(create_argv(c)?),
         Some(_) => return Err(bad("`create` must be an object")),
     };
     Ok(Header { root, instance, mode: Mode::Session { id, create } })
@@ -172,10 +200,9 @@ pub fn parse_header(rec: Record) -> Result<Header, Record> {
 /// The instance the header names, and its `state.toml` key: `root`
 /// confined to the fleet root `fleet_root` as `lent::confine_path` does;
 /// the instance by exact name, else by id, among those lent
-/// (`lent::lent_instances`) whose config root is under `root`; with a
-/// helper for a session ([`Mode::Session`]; a pipe needs none). Running
-/// isn't checked here (the bridge is, [`offered`]; a pipe's runtime exec
-/// says so itself).
+/// (`lent::lent_instances`) whose config root is under `root`. Neither the
+/// helper nor running is checked here: a session's helper is asked
+/// ([`decide`]); a runtime exec (a pipe, a tty) says so itself.
 pub fn gate<'a>(h: &Header, state: &'a State, fleet_root: &Path) -> Result<(&'a str, &'a Instance), Record> {
     let root = lent::confine_path(fleet_root, &h.root, true).map_err(|e| match e.code {
         "invalid" => bad(e.message),
@@ -189,33 +216,91 @@ pub fn gate<'a>(h: &Header, state: &'a State, fleet_root: &Path) -> Result<(&'a 
     let Some((name, instance)) = found else {
         return Err(Record::error(code::NOT_FOUND, format!("no instance `{}` in {}", h.instance, root.display())));
     };
-    if matches!(h.mode, Mode::Session { .. }) && instance.devsbd_arch.is_none() {
-        return Err(Record::error(
-            code::UNSUPPORTED,
-            format!("`{name}` has no devsbd helper: a terminal over the fleet link needs it"),
-        ));
-    }
     Ok((name.as_str(), instance))
 }
 
-/// Whether instance `name`'s helper takes the attach, from
-/// `HelperClient::offers`' answer.
-pub fn offered(offers: Result<bool, CallError>, name: &str) -> Result<(), Record> {
-    match offers {
-        Ok(true) => Ok(()),
-        // Decision 13: `session.attach` is root only in the helper.
-        Ok(false) | Err(CallError::Unsupported(_)) => Err(Record::error(
-            code::UNSUPPORTED,
-            format!(
-                "a terminal over the fleet link needs `{name}`'s helper daemon running as root \
-                 (it doesn't offer `{METHOD}`: a `containerUser` instance, or an older helper)"
-            ),
-        )),
-        Err(CallError::NoBridge(_)) => {
-            Err(Record::error(code::NOT_RUNNING, format!("`{name}` isn't running (or its helper's bridge isn't up yet)")))
+/// How a session header's terminal runs ([`decide`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminal {
+    /// A session attach through the helper (resumable).
+    Attach,
+    /// A tty exec under a host pty ([`run_tty`]): not resumable, and why.
+    Tty(NotResumable),
+}
+
+/// Why an instance's terminals over the link aren't sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotResumable {
+    /// No devsbd helper in it.
+    NoHelper,
+    /// Its helper's daemon doesn't offer `session.attach` (decision 13: it
+    /// is root only; a `containerUser` instance, or an older helper).
+    HelperNotRoot,
+}
+
+impl NotResumable {
+    pub fn why(self) -> &'static str {
+        match self {
+            NotResumable::NoHelper => "no helper",
+            NotResumable::HelperNotRoot => "helper not root",
         }
-        Err(e) => Err(Record::error(code::FAILED, format!("cannot ask `{name}`'s helper: {e}"))),
     }
+
+    /// The `stderr` record's text a fallback terminal starts with (`\r\n`:
+    /// the hub's terminal is raw by then).
+    pub fn note(self) -> String {
+        format!("this terminal isn't resumable ({}): a dropped link ends it\r\n", self.why())
+    }
+}
+
+/// The terminal a session header for instance `name` gets: `create`
+/// whether it creates one; `offers` the helper's answer to whether it
+/// offers `session.attach` (`HelperClient::offers`), `None` without a
+/// helper. A helper that takes it: [`Terminal::Attach`]. One that can't
+/// (none, not offered): a creating header falls back to
+/// [`Terminal::Tty`], an attach-only one gets `no-session` (nothing
+/// resumable exists). No bridge is `not-running`.
+pub fn decide(create: bool, offers: Option<Result<bool, CallError>>, name: &str) -> Result<Terminal, Record> {
+    let why = match offers {
+        Some(Ok(true)) => return Ok(Terminal::Attach),
+        None => NotResumable::NoHelper,
+        Some(Ok(false) | Err(CallError::Unsupported(_))) => NotResumable::HelperNotRoot,
+        Some(Err(e)) => return Err(refusal(e, name)),
+    };
+    if create {
+        return Ok(Terminal::Tty(why));
+    }
+    Err(Record::error(
+        rpc::code::NO_SESSION,
+        format!("`{name}`'s terminals over the fleet link aren't resumable ({}): no session to attach to", why.why()),
+    ))
+}
+
+/// The refusal for a helper call that couldn't be made.
+fn refusal(e: CallError, name: &str) -> Record {
+    match e {
+        CallError::NoBridge(_) => {
+            Record::error(code::NOT_RUNNING, format!("`{name}` isn't running (or its helper's bridge isn't up yet)"))
+        }
+        CallError::Unsupported(_) => Record::error(code::UNSUPPORTED, format!("`{name}`'s helper no longer offers `{METHOD}`")),
+        e => Record::error(code::FAILED, format!("cannot ask `{name}`'s helper: {e}")),
+    }
+}
+
+/// The container of service `service` that lent instance `name` uses: the
+/// config read from the instance's own config root (`gate` put it under
+/// the header's), named as the forwards name it
+/// (`port::service_container_for`), never by the hub.
+pub fn service_container(instance: &Instance, name: &str, state: &State, service: &str) -> Result<String, Record> {
+    let failed = |e: anyhow::Error| Record::error(code::FAILED, format!("{e:#}"));
+    let dir = instance
+        .config_dir
+        .as_deref()
+        .ok_or_else(|| Record::error(code::NOT_FOUND, format!("`{name}` has no config root recorded")))?;
+    let config = crate::config::Config::load(dir).map_err(failed)?;
+    let project = crate::commands::services::project_id(dir).map_err(failed)?;
+    crate::commands::port::service_container_for(&config, state, &project, name, service)
+        .map_err(|e| Record::error(code::NOT_FOUND, e))
 }
 
 /// `session.attach`'s params (devsbd's `rpc_sessions`) for session `id`:
@@ -237,17 +322,40 @@ pub fn attach_params(id: &str, create: Option<&[String]>, instance: &Instance, h
     params.with("create", create)
 }
 
-/// What a piped exec runs: `(instance, interactive, argv, host_agent)` →
-/// the command, its stdio set by the caller. [`runtime_exec`] in the
-/// daemon; tests run a program of their own.
-pub type PipeCommand = fn(&Instance, bool, &[String], bool) -> std::process::Command;
+/// What a worker's exec runs in.
+pub enum Target<'a> {
+    /// Instance `instance`, as a local `exec` (`-i` when `interactive`, `-t`
+    /// when `tty`; `host_agent` as `exec_argv_with` takes it).
+    Instance { instance: &'a Instance, interactive: bool, tty: bool, argv: &'a [String], host_agent: bool },
+    /// A service container, as the dashboard's local service tab: `-i -t`.
+    Service { container: &'a str, argv: &'a [String] },
+}
 
-/// The runtime's `exec` of `argv` in `instance` without a tty, as a local
-/// `exec` builds it (`exec::exec_argv_with`): `-i` when `interactive`.
-pub fn runtime_exec(instance: &Instance, interactive: bool, argv: &[String], host_agent: bool) -> std::process::Command {
-    let mut command = std::process::Command::new(crate::runtime::backend().bin());
-    command.args(exec_argv_with(instance, interactive, false, argv, host_agent));
-    command
+/// The argv (program first) of an exec into a [`Target`]: a piped exec's
+/// and a tty one's. [`runtime_exec`] in the daemon; tests run a program of
+/// their own.
+pub type ExecCommand = fn(&Target) -> Vec<String>;
+
+/// The runtime's `exec` into `t`: for an instance, the argv a local `exec`
+/// builds (`exec::exec_argv_with`); for a service, `exec -i -t <container>
+/// <argv…>`.
+pub fn runtime_exec(t: &Target) -> Vec<String> {
+    let mut argv = vec![crate::runtime::backend().bin().to_string()];
+    match t {
+        Target::Instance { instance, interactive, tty, argv: command, host_agent } => {
+            argv.extend(exec_argv_with(instance, *interactive, *tty, command, *host_agent));
+        }
+        Target::Service { container, argv: command } => {
+            argv.extend(["exec", "-i", "-t", container].map(String::from));
+            argv.extend(command.iter().cloned());
+        }
+    }
+    argv
+}
+
+/// `argv`, or the login shell (`SHELL_FALLBACK_CMD`) when it is empty.
+fn or_shell(argv: &[String]) -> Vec<String> {
+    if argv.is_empty() { SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect() } else { argv.to_vec() }
 }
 
 /// The `exit` record of a piped exec that ended with `status`: its code, or
@@ -261,24 +369,75 @@ pub fn exit_record(status: ExitStatus) -> Record {
     })
 }
 
+/// The `exit` record of a tty exec that ended with `status`: its code, or
+/// the signal that killed it (portable-pty keeps only the signal's
+/// `strsignal` name, [`signal_number`] maps it back).
+pub fn tty_exit_record(status: &portable_pty::ExitStatus) -> Record {
+    Record::Exit(match status.signal() {
+        Some(name) => signal_number(name).map(Exit::Signal).unwrap_or(Exit::Code(i32::try_from(status.exit_code()).unwrap_or(1))),
+        None => Exit::Code(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
+    })
+}
+
+/// The signal `strsignal` names `name` (portable-pty's `Signal <n>` for one
+/// it doesn't).
+fn signal_number(name: &str) -> Option<i32> {
+    if let Some(n) = name.strip_prefix("Signal ") {
+        return n.parse().ok();
+    }
+    (1..65).find(|&n| {
+        // SAFETY: `strsignal` returns a NUL-terminated string (or null),
+        // read at once, before another call could reuse its buffer.
+        let s = unsafe { libc::strsignal(n) };
+        !s.is_null() && unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy() == name
+    })
+}
+
+/// A program on a host pty: the master (for `resize`), the child, the
+/// pty's read half and write half.
+pub struct Tty {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+}
+
+/// Spawn `argv` on a fresh host pty (80×24 until the hub's first `resize`),
+/// as the dashboard's terminal tabs do (`tui::term`).
+pub fn spawn_tty(argv: Vec<String>) -> anyhow::Result<Tty> {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })?;
+    let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
+    // Only the runtime client sees it, as in a dashboard tab.
+    cmd.env("TERM", "xterm-256color");
+    let child = pair.slave.spawn_command(cmd)?;
+    // Only the child holds the slave: its exit ends the reader.
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
+    Ok(Tty { master: pair.master, child, reader, writer })
+}
+
 /// What a stream's header started.
 enum Started {
     Attach(Call, Input),
     Pipe(Child),
+    /// A tty exec, and the note to send before its output.
+    Tty(Tty, Option<String>),
 }
 
 /// Serve one `PTY` stream, `link` the worker's end, to its end (see the
 /// module doc). `state` is this host's `state.toml`, `scope` the link's;
 /// `host_agent` probes for a host ssh-agent (`exec::has_host_agent`);
-/// `pipe` builds a piped exec ([`runtime_exec`]). Refusals with `denied`
-/// are logged.
+/// `exec` builds a piped or tty exec's argv ([`runtime_exec`]). Refusals
+/// with `denied` are logged.
 pub fn serve(
     link: Stream,
     helper: &HelperClient,
     state: &Path,
     scope: &Scope,
     host_agent: fn() -> bool,
-    pipe: PipeCommand,
+    exec: ExecCommand,
     log: fn(&str),
 ) {
     let caller = format!("fleet hub {}", scope.hub);
@@ -286,13 +445,14 @@ pub fn serve(
     let first = rpc::read_record(&mut &link);
     let _ = link.set_read_timeout(None);
     let started = match first {
-        Ok(Some(rec)) => start(rec, &link, helper, state, scope, host_agent, pipe, &caller),
+        Ok(Some(rec)) => start(rec, &link, helper, state, scope, host_agent, exec, &caller),
         Ok(None) => return,
         Err(e) => Err(bad(format!("no PTY header: {e}"))),
     };
     match started {
         Ok(Started::Attach(call, input)) => pump(&link, call, input),
         Ok(Started::Pipe(child)) => run_pipe(&link, child),
+        Ok(Started::Tty(tty, note)) => run_tty(&link, tty, note.as_deref()),
         Err(rec) => {
             if let Record::Error { code: c, message } = &rec
                 && c == code::DENIED
@@ -305,8 +465,8 @@ pub fn serve(
     let _ = link.shutdown(Shutdown::Both);
 }
 
-/// Header, gate, then the call (the attach and its input) or the piped
-/// exec's spawn, or the `error` to end the stream with.
+/// Header, gate, then the call (the attach and its input), the piped
+/// exec's spawn or the tty exec's, or the `error` to end the stream with.
 #[allow(clippy::too_many_arguments)]
 fn start(
     first: Record,
@@ -315,16 +475,25 @@ fn start(
     state: &Path,
     scope: &Scope,
     host_agent: fn() -> bool,
-    pipe: PipeCommand,
+    exec: ExecCommand,
     caller: &str,
 ) -> Result<Started, Record> {
     let h = parse_header(first)?;
     let state = State::load_at(state).map_err(|e| Record::error(code::FAILED, format!("{e:#}")))?;
     let (name, instance) = gate(&h, &state, &scope.root)?;
+    let tty = |argv: Vec<String>, note: Option<String>| {
+        spawn_tty(argv)
+            .map(|t| Started::Tty(t, note))
+            .map_err(|e| Record::error(code::FAILED, format!("cannot run a terminal in `{name}`: {e:#}")))
+    };
     let (id, create) = match &h.mode {
         Mode::Pipe { argv, interactive } => {
-            let mut command = pipe(instance, *interactive, argv, host_agent());
+            let target = Target::Instance { instance, interactive: *interactive, tty: false, argv, host_agent: host_agent() };
+            let argv = exec(&target);
+            let (program, args) = argv.split_first().ok_or_else(|| Record::error(code::FAILED, "an empty exec"))?;
+            let mut command = std::process::Command::new(program);
             command
+                .args(args)
                 .stdin(if *interactive { Stdio::piped() } else { Stdio::null() })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -333,14 +502,23 @@ fn start(
                 .map(Started::Pipe)
                 .map_err(|e| Record::error(code::FAILED, format!("cannot run an exec in `{name}`: {e}")));
         }
+        Mode::Service { name: service, argv } => {
+            let container = service_container(instance, name, &state, service)?;
+            return tty(exec(&Target::Service { container: &container, argv: &or_shell(argv) }), None);
+        }
         Mode::Session { id, create } => (id, create),
     };
-    offered(helper.offers(&instance.container, METHOD, caller), name)?;
+    let offers = instance.devsbd_arch.is_some().then(|| helper.offers(&instance.container, METHOD, caller));
+    if let Terminal::Tty(why) = decide(create.is_some(), offers, name)? {
+        let argv = or_shell(create.as_deref().unwrap_or_default());
+        let target = Target::Instance { instance, interactive: true, tty: true, argv: &argv, host_agent: host_agent() };
+        return tty(exec(&target), Some(why.note()));
+    }
     let params = attach_params(id, create.as_deref(), instance, host_agent());
     // While it queues: whether the hub closed its end.
     let abandoned = || crate::serve::daemon::hung_up(link, Duration::ZERO);
     let (call, input) = helper.call_with_input(&instance.container, METHOD, params, Obj::new(), caller, &abandoned).map_err(|e| match e {
-        CallError::NoBridge(_) | CallError::Unsupported(_) => offered(Err(e), name).expect_err("a refusal"),
+        CallError::NoBridge(_) | CallError::Unsupported(_) => refusal(e, name),
         CallError::Abandoned => Record::error(code::FAILED, "the hub hung up while the attach queued"),
         CallError::Io(e) => Record::error(code::LOST, format!("cannot reach `{name}`'s helper: {e}")),
     })?;
@@ -403,8 +581,99 @@ fn run_pipe(link: &Stream, mut child: Child) {
     });
 }
 
+/// A tty exec to its end: `note` first (as a `stderr` record), then the
+/// pty's output as `stdout` records on a thread of its own, the hub's
+/// `stdin` into the pty and its `resize`s onto it on another; once the
+/// child exited and the output is drained, its `exit` record
+/// ([`tty_exit_record`]). The hub hanging up first kills (SIGHUP, then
+/// SIGKILL: portable-pty's `kill`) and reaps it, and nothing more is
+/// written.
+fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
+    let Tty { master, mut child, reader, writer } = tty;
+    let master = Mutex::new(master);
+    // One writer at a time: a record is one write, never interleaved.
+    let turn = Mutex::new(());
+    let send = |rec: &Record| {
+        let _turn = turn.lock().unwrap_or_else(|e| e.into_inner());
+        rpc::write_record(&mut &*link, rec).is_ok()
+    };
+    if let Some(note) = note {
+        send(&Record::Stderr(note.as_bytes().to_vec()));
+    }
+    let done = AtomicBool::new(false);
+    let gone = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let send = &send;
+        let out = s.spawn(move || drain(reader, Record::Stdout, send));
+        if let Ok(r) = link.try_clone() {
+            let (master, done, gone) = (&master, &done, &gone);
+            s.spawn(move || feed_tty(r, writer, master, done, gone));
+        }
+        let ended = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+            if gone.load(Ordering::SeqCst) || crate::serve::daemon::hung_up(link, PIPE_TICK) {
+                gone.store(true, Ordering::SeqCst);
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(std::io::Error::other("the hub hung up"));
+            }
+        };
+        // The child gone, its pty's last bytes, then the read's end.
+        let _ = out.join();
+        if !gone.load(Ordering::SeqCst) {
+            let last = match ended {
+                Ok(status) => tty_exit_record(&status),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Record::error(code::FAILED, format!("cannot wait for the terminal: {e}"))
+                }
+            };
+            send(&last);
+        }
+        done.store(true, Ordering::SeqCst);
+        // Ends `feed_tty`'s read.
+        let _ = link.shutdown(Shutdown::Both);
+    });
+}
+
+/// The hub's records into a tty exec until the hub closes its end, which
+/// flags `gone` unless the exec is over (`done`): `stdin` to the pty,
+/// `resize` onto it. `stdin-eof` is ignored (a terminal has no end of its
+/// own to give), as is anything else.
+fn feed_tty(
+    mut reader: Stream,
+    mut writer: Box<dyn Write + Send>,
+    master: &Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    done: &AtomicBool,
+    gone: &AtomicBool,
+) {
+    loop {
+        match rpc::read_record(&mut reader) {
+            Ok(Some(Record::Stdin(bytes))) => {
+                let _ = writer.write_all(&bytes).and_then(|()| writer.flush());
+            }
+            Ok(Some(Record::Resize { cols, rows })) => {
+                let size = portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+                let _ = master.lock().unwrap_or_else(|e| e.into_inner()).resize(size);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                if !done.load(Ordering::SeqCst) {
+                    gone.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
+        }
+    }
+}
+
 /// One of a piped exec's outputs to its end, each read as one `wrap`
-/// record, until the hub refuses a write.
+/// record, until the hub refuses a write (a tty's too).
 fn drain(mut r: impl Read, wrap: fn(Vec<u8>) -> Record, send: &(dyn Fn(&Record) -> bool + Sync)) {
     let mut buf = vec![0u8; PIPE_CHUNK];
     loop {
@@ -600,6 +869,30 @@ mod tests {
     }
 
     #[test]
+    fn a_service_header_parses_creates_and_excludes_the_others() {
+        let svc = || pipe_base("/f").with("service", "db");
+        let h = parse_header(header(svc().with("create", Obj::new()))).unwrap();
+        assert_eq!(h, Header { root: "/f".into(), instance: "web-1".into(), mode: Mode::Service { name: "db".into(), argv: vec![] } });
+        let psql = parse_header(header(svc().with("create", Obj::new().with("argv", vec!["psql".to_string()])))).unwrap();
+        assert_eq!(psql.mode, Mode::Service { name: "db".into(), argv: vec!["psql".into()] });
+
+        let refused = |params: Obj| match parse_header(header(params)) {
+            Err(Record::Error { code, message }) => {
+                assert_eq!(code, code::BAD_REQUEST);
+                message
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(refused(svc()).contains("needs `create`"), "no attach-only service terminal");
+        assert!(refused(svc().with("create", "sh")).contains("`create` must be"));
+        assert!(refused(svc().with("create", Obj::new()).with("session", SESSION)).contains("one of"));
+        let ls = Obj::new().with("argv", vec!["ls".to_string()]);
+        assert!(refused(svc().with("create", Obj::new()).with("pipe", ls)).contains("one of"));
+        assert!(refused(pipe_base("/f").with("service", "").with("create", Obj::new())).contains("needs `service`"));
+        assert!(refused(svc().with("create", Obj::new().with("argv", "sh"))).contains("`create.argv`"));
+    }
+
+    #[test]
     fn exits_encode_a_code_or_a_signal() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(exit_record(ExitStatus::from_raw(3 << 8)), Record::Exit(Exit::Code(3)));
@@ -653,7 +946,7 @@ mod tests {
         assert_eq!(code_of(gate(&h(&b.join("mine"), "own"), &state, &root)), code::DENIED, "outside the fleet root");
         assert_eq!(code_of(gate(&h(&root.join("gone"), "web-1"), &state, &root)), code::NOT_FOUND);
         assert_eq!(code_of(gate(&h(Path::new("rel"), "web-1"), &state, &root)), code::BAD_REQUEST);
-        assert_eq!(code_of(gate(&h(&cfg, "bare"), &state, &root)), code::UNSUPPORTED, "no helper");
+        assert_eq!(gate(&h(&cfg, "bare"), &state, &root).unwrap().0, "bare", "no helper: `decide`'s to say");
         let pipe = |instance: &str| Header { mode: Mode::Pipe { argv: vec!["ls".into()], interactive: false }, ..h(&cfg, instance) };
         assert_eq!(gate(&pipe("bare"), &state, &root).unwrap().0, "bare", "a pipe needs no helper");
         assert_eq!(code_of(gate(&pipe("own"), &state, &root)), code::NOT_FOUND, "but the same lending");
@@ -661,13 +954,51 @@ mod tests {
     }
 
     #[test]
-    fn the_helper_must_offer_the_attach() {
-        assert!(offered(Ok(true), "w").is_ok());
-        let Err(Record::Error { code, message }) = offered(Ok(false), "w") else { panic!() };
-        assert_eq!(code, code::UNSUPPORTED);
-        assert!(message.contains("running as root"), "{message}");
-        assert_eq!(code_of(offered(Err(CallError::NoBridge("c".into())), "w")), code::NOT_RUNNING);
-        assert_eq!(code_of(offered(Err(CallError::Io(std::io::Error::other("x"))), "w")), code::FAILED);
+    fn a_helper_that_cant_attach_falls_back_to_a_tty_when_creating() {
+        use NotResumable::*;
+        assert_eq!(decide(true, Some(Ok(true)), "w"), Ok(Terminal::Attach));
+        assert_eq!(decide(false, Some(Ok(true)), "w"), Ok(Terminal::Attach), "an attach is the helper's");
+        assert_eq!(decide(true, None, "w"), Ok(Terminal::Tty(NoHelper)));
+        assert_eq!(decide(true, Some(Ok(false)), "w"), Ok(Terminal::Tty(HelperNotRoot)));
+        assert_eq!(decide(true, Some(Err(CallError::Unsupported("c".into()))), "w"), Ok(Terminal::Tty(HelperNotRoot)), "an older helper");
+        // Attach only: nothing resumable exists.
+        for offers in [None, Some(Ok(false))] {
+            let Err(Record::Error { code, message }) = decide(false, offers, "w") else { panic!() };
+            assert_eq!(code, rpc::code::NO_SESSION);
+            assert!(message.contains("aren't resumable"), "{message}");
+        }
+        assert_eq!(code_of(decide(true, Some(Err(CallError::NoBridge("c".into()))), "w")), code::NOT_RUNNING);
+        assert_eq!(code_of(decide(true, Some(Err(CallError::Io(std::io::Error::other("x")))), "w")), code::FAILED);
+        assert_eq!(NoHelper.note(), "this terminal isn't resumable (no helper): a dropped link ends it\r\n");
+        assert!(HelperNotRoot.note().contains("(helper not root)"));
+    }
+
+    #[test]
+    fn tty_exits_keep_the_signal_number() {
+        use std::os::unix::process::ExitStatusExt;
+        let of = |raw| tty_exit_record(&portable_pty::ExitStatus::from(ExitStatus::from_raw(raw)));
+        assert_eq!(of(3 << 8), Record::Exit(Exit::Code(3)));
+        assert_eq!(of(9), Record::Exit(Exit::Signal(9)));
+        assert_eq!(of(1), Record::Exit(Exit::Signal(1)));
+        assert_eq!(tty_exit_record(&portable_pty::ExitStatus::with_signal("Signal 50")), Record::Exit(Exit::Signal(50)));
+    }
+
+    #[test]
+    fn the_exec_argv_is_a_local_execs() {
+        let b = scratch("argv");
+        let root = b.join("fleet/hub");
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        let state = state_with(&b, &root);
+        let bin = crate::runtime::backend().bin().to_string();
+        let argv = vec!["ls".to_string()];
+        let inst = &state.instances["web-1"];
+        let tty = runtime_exec(&Target::Instance { instance: inst, interactive: true, tty: true, argv: &argv, host_agent: false });
+        assert_eq!(tty[0], bin);
+        assert_eq!(tty[1..], exec_argv_with(inst, true, true, &argv, false));
+        let svc = runtime_exec(&Target::Service { container: "devsandbox-svc-p-db", argv: &argv });
+        assert_eq!(svc, [bin.as_str(), "exec", "-i", "-t", "devsandbox-svc-p-db", "ls"]);
+        assert_eq!(or_shell(&[]), SHELL_FALLBACK_CMD);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
@@ -765,10 +1096,16 @@ mod tests {
         }
     }
 
+    /// The config at `cfg`: sandbox `web` (every instance's) uses `db`.
+    const CONFIG: &str = "[services.db]\nimage = \"postgres\"\nscope = \"isolated\"\n\n\
+                          [services.cache]\nimage = \"redis\"\nscope = \"global\"\n\n\
+                          [sandbox.web]\nimage = \"node\"\nservices = [\"db\"]\n";
+
     fn world(tag: &str) -> World {
         let base = scratch(tag);
         let root = base.join("fleet/hub");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::fs::write(root.join("cfg").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
         state_with(&base, &root);
         let fake = Fake::default();
         fake.add("devsandbox-web-1", caps::RPC, 1, sessions);
@@ -838,11 +1175,14 @@ mod tests {
         assert!(logged("helper devsandbox-web-1: session.attach from fleet hub me@hub: cancelled ("));
     }
 
-    /// The tests' piped exec: `sh -c <argv[0]>` on this host.
-    fn sh(_: &Instance, _: bool, argv: &[String], _: bool) -> std::process::Command {
-        let mut c = std::process::Command::new("sh");
-        c.arg("-c").arg(&argv[0]);
-        c
+    /// The tests' exec: `sh -c <argv[0]>` on this host; into a service,
+    /// its container's name echoed first.
+    fn sh(t: &Target) -> Vec<String> {
+        let script = match t {
+            Target::Instance { argv, .. } => argv[0].clone(),
+            Target::Service { container, argv } => format!("echo {container}; {}", argv[0]),
+        };
+        vec!["sh".into(), "-c".into(), script]
     }
 
     fn pipe_header(w: &World, instance: &str, script: &str, interactive: bool) -> Record {
@@ -930,13 +1270,101 @@ mod tests {
         std::fs::create_dir_all(&mine).unwrap();
         assert_eq!(refusal(header(base(mine.to_str().unwrap()).with("instance", "own")), w.helper.clone()), code::DENIED);
         assert!(logged("fleet: refused a PTY stream from hub me@hub"));
-        assert_eq!(refusal(header(base(cfg).with("instance", "bare")), w.helper.clone()), code::UNSUPPORTED);
+        // Attach only, without a helper that attaches: nothing to resume.
+        assert_eq!(refusal(header(base(cfg).with("instance", "bare")), w.helper.clone()), rpc::code::NO_SESSION);
 
         // Not running: no bridge; not root: `session.attach` not offered.
         let none = HelperClient::new(Fake::default(), log);
         assert_eq!(refusal(header(base(cfg)), none), code::NOT_RUNNING);
         let fake = Fake::default();
         fake.add("devsandbox-web-1", caps::RPC, 1, not_root);
-        assert_eq!(refusal(header(base(cfg)), HelperClient::new(fake, log)), code::UNSUPPORTED);
+        assert_eq!(refusal(header(base(cfg)), HelperClient::new(fake, log)), rpc::code::NO_SESSION);
+
+        let svc = |service: &str| header(pipe_base(cfg).with("service", service).with("create", Obj::new()));
+        assert_eq!(refusal(svc("cache"), w.helper.clone()), code::NOT_FOUND, "not one `web-1` uses");
+        assert_eq!(refusal(svc("nope"), w.helper.clone()), code::NOT_FOUND);
+        let own = header(base(cfg).with("instance", "own").with("session", Json::Null).with("service", "db").with("create", Obj::new()));
+        assert_eq!(refusal(own, w.helper.clone()), code::NOT_FOUND, "the instance gates the service");
+    }
+
+    fn tty_header(w: &World, instance: &str, script: &str) -> Record {
+        let cfg = w.root.join("cfg");
+        let create = Obj::new().with("argv", vec![script.to_string()]);
+        header(base(cfg.to_str().unwrap()).with("instance", instance).with("create", create))
+    }
+
+    #[test]
+    fn a_helperless_instance_gets_a_tty_that_says_it_isnt_resumable() {
+        let w = world("tty");
+        let (hub, t) = open(&w, tty_header(&w, "bare", "read x; stty size; echo got $x; exit 3"), w.helper.clone());
+        rpc::write_record(&mut &hub, &Record::Resize { cols: 100, rows: 30 }).unwrap();
+        rpc::write_record(&mut &hub, &Record::Stdin(b"hi\n".to_vec())).unwrap();
+        let recs = rest(&hub);
+        t.join().unwrap();
+        assert_eq!(recs[0], Record::Stderr(NotResumable::NoHelper.note().into_bytes()), "the note first: {recs:?}");
+        let (out, err, last) = split(&recs);
+        assert_eq!(err, NotResumable::NoHelper.note(), "only the note");
+        assert!(out.contains("30 100"), "the resize reached the pty: {out:?}");
+        assert!(out.contains("got hi"), "{out:?}");
+        assert_eq!(last, Some(Record::Exit(Exit::Code(3))));
+
+        let (hub, t) = open(&w, tty_header(&w, "bare", "kill -9 $$"), w.helper.clone());
+        let recs = rest(&hub);
+        t.join().unwrap();
+        assert_eq!(recs.last(), Some(&Record::Exit(Exit::Signal(9))));
+    }
+
+    #[test]
+    fn a_non_root_helper_falls_back_too() {
+        let w = world("tty-root");
+        let fake = Fake::default();
+        fake.add("devsandbox-web-1", caps::RPC, 1, not_root);
+        let (hub, t) = open(&w, tty_header(&w, "web-1", "echo ok"), HelperClient::new(fake, log));
+        let recs = rest(&hub);
+        t.join().unwrap();
+        assert_eq!(recs[0], Record::Stderr(NotResumable::HelperNotRoot.note().into_bytes()));
+        let (out, _, last) = split(&recs);
+        assert!(out.contains("ok"), "{out:?}");
+        assert_eq!(last, Some(Record::Exit(Exit::Code(0))));
+    }
+
+    #[test]
+    fn a_hang_up_kills_the_tty() {
+        let w = world("tty-hup");
+        let (hub, t) = open(&w, tty_header(&w, "bare", "echo $$; exec sleep 30"), w.helper.clone());
+        let mut out = String::new();
+        let pid: libc::pid_t = loop {
+            match rpc::read_record(&mut &hub) {
+                Ok(Some(Record::Stdout(b))) => out.push_str(&String::from_utf8_lossy(&b)),
+                Ok(Some(Record::Stderr(_))) => {}
+                other => panic!("{other:?} after {out:?}"),
+            }
+            if let Some(line) = out.lines().next().filter(|_| out.contains('\n')) {
+                break line.trim().parse().unwrap_or_else(|_| panic!("{out:?}"));
+            }
+        };
+        let started = std::time::Instant::now();
+        drop(hub);
+        t.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "killed, not waited out");
+        // SAFETY: signal 0 only checks the pid; reaped, it's gone.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "killed and reaped");
+    }
+
+    #[test]
+    fn a_service_terminal_runs_in_the_container_the_worker_names() {
+        let w = world("svc");
+        let cfg = w.root.join("cfg");
+        let create = Obj::new().with("argv", vec!["exit 4".to_string()]);
+        let h = header(pipe_base(cfg.to_str().unwrap()).with("service", "db").with("create", create));
+        let (hub, t) = open(&w, h, w.helper.clone());
+        let recs = rest(&hub);
+        t.join().unwrap();
+        let (out, err, last) = split(&recs);
+        let project = crate::commands::services::project_id(&cfg).unwrap();
+        let container = crate::commands::services::isolated_service_container(&project, "id-web-1", "db");
+        assert!(out.contains(&container), "{out:?}");
+        assert_eq!(err, "", "no note: a service terminal was never a session");
+        assert_eq!(last, Some(Record::Exit(Exit::Code(4))));
     }
 }

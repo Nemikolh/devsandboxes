@@ -467,8 +467,9 @@ does, 21 as step 9 does.
     `session.attach` over the bridge's RPC (`HelperClient::call_with_input`),
     no `exec -it` and no in-container client; service terminals,
     helper-less instances and instances whose helper daemon isn't root
-    (`session.attach` is `needs_root`, e.g. `containerUser`) refuse over
-    the link until step 5's `exec -it` fallback.
+    (`session.attach` is `needs_root`, e.g. `containerUser`) were refused
+    over the link until step 5, which runs them as a non-resumable
+    `exec -it` under a host pty on the member.
 14. `AGENT` on the link keeps the agent relay's semantics: the linking
     host's agent, while its registry entry has `agent = true`, reaches
     every instance on the machine (not only placed ones as

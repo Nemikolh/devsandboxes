@@ -19,6 +19,12 @@
 //! process's stdout / stderr. It is never re-dialed (no session to go back
 //! to): its 255 is a lost link's, reported once.
 //!
+//! A service request ([`Mode::Service`], `exec --service`) is a session
+//! dial's terminal (raw mode, size) without a session: never re-dialed
+//! either. A terminal the worker can't make a session (a fallback tty exec)
+//! starts with a `stderr` record saying so, already in the raw terminal's
+//! `\r\n` form.
+//!
 //! [`header`] and [`exit_of`] are pure; [`attach`] is the relay over any
 //! stream and input fd, the terminal (raw mode, size) injected; [`dial`]
 //! the I/O on this process's stdio.
@@ -56,7 +62,7 @@ pub struct Request {
     pub instance: String,
     /// A session (its id, and `create`: `None` attach only, `Some(argv)`
     /// create it running `argv`, empty the login shell, unless it exists,
-    /// then attach), or a piped exec.
+    /// then attach), a piped exec, or a service terminal.
     pub mode: Mode,
 }
 
@@ -74,6 +80,10 @@ pub fn header(r: &Request) -> Record {
         }
         Mode::Pipe { argv, interactive } => {
             params = params.with("pipe", Obj::new().with("argv", argv.clone()).with("interactive", *interactive));
+        }
+        Mode::Service { name, argv } => {
+            let create = if argv.is_empty() { Obj::new() } else { Obj::new().with("argv", argv.clone()) };
+            params = params.with("service", name.as_str()).with("create", create);
         }
     }
     Record::Call(Call { method: METHOD.into(), params, meta: Obj::new() })
@@ -282,7 +292,7 @@ pub fn dial(dir: &Path, machine: &str, r: &Request, reserve_255: bool) -> i32 {
         Ok(stream) => {
             let (mut out, mut err) = (io::stdout(), io::stderr());
             match r.mode {
-                Mode::Session { .. } => {
+                Mode::Session { .. } | Mode::Service { .. } => {
                     let raw = Raw::enter();
                     let size = || crate::build_log::terminal_size(0).map(|s| (s.cols, s.rows));
                     let end = attach(stream, &header(r), Terminal { input: Some(0), output: &mut out, errors: &mut err, size: &size });
@@ -327,7 +337,8 @@ mod tests {
     #[test]
     fn the_header_is_what_the_worker_parses() {
         let sessions = [None, Some(Vec::new()), Some(vec!["htop".to_string(), "-d".into()])].map(|create| req(create).mode);
-        for mode in sessions.into_iter().chain([pipe(false).mode, pipe(true).mode]) {
+        let services = [Vec::new(), vec!["psql".to_string()]].map(|argv| Mode::Service { name: "db".into(), argv });
+        for mode in sessions.into_iter().chain([pipe(false).mode, pipe(true).mode]).chain(services) {
             let h = pty::parse_header(header(&Request { mode: mode.clone(), ..req(None) })).unwrap();
             assert_eq!(h, pty::Header { root: "/w/fleet/hub/cfg".into(), instance: "web-1".into(), mode });
         }

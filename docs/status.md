@@ -290,10 +290,12 @@ limitation means editing this file in the same commit.
 - `--machine <offered worker> ls` lists only the config roots its
   instances name (placed configs without an instance left don't show).
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::config_roots`
-- Service terminals on an offered worker are refused, as are terminals
-  of its instances without a helper or whose helper daemon isn't root
-  (`session.attach` is `needs_root`, e.g. `containerUser`).
-  → [fleet](architecture/daemon/fleet.md#pty); `tui::remote::service_argv`, `fleet::pty`
+- Terminals on an offered worker's instances without a helper, or whose
+  helper daemon isn't root (`session.attach` is `needs_root`, e.g.
+  `containerUser`), and service terminals there are a plain `exec -it`
+  under a host pty on the worker: not resumable, a dropped link ends
+  them (it kills the runtime's exec client; the in-container process
+  may run on, as before resumable exec). → [fleet](architecture/daemon/fleet.md#pty); `fleet::pty::decide`, `fleet::pty::run_tty`
 - Verbs on an offered worker run with the worker's own env: host git
   there gets no `SSH_AUTH_SOCK` of the hub's agent, unlike an ssh
   machine's (`--session-env`).

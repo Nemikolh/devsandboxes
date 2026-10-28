@@ -176,17 +176,30 @@ pub fn attach_argv(m: &SnapshotMachine, root: &str, name: &str, id: &str, exe: E
     on_machine(m, root, &["exec", "--reserve-255", &attach], name, &[], exe)
 }
 
-/// A remote service container's terminal: `ssh -t … <runtime> exec -i -t
-/// <container> <login shell>`, the runtime the machine's snapshot named
-/// (`docker` before one came). Refused on an offered worker: its fleet link's
-/// terminals are session attaches through an instance's helper, which a
-/// service container hasn't.
-pub fn service_argv(m: &SnapshotMachine, container: &str) -> Result<Vec<String>, String> {
+/// The instance a tab on service `row`'s `container` goes through on an
+/// offered worker (the one whose service it is there): for an isolated
+/// service the `used_by` entry at the container's index (the snapshot
+/// lists one container per using instance, in `used_by`'s order), for a
+/// global one any user, the first.
+pub fn service_instance<'a>(row: &'a ServiceRow, container: &str) -> Option<&'a str> {
+    if row.scope == "isolated" {
+        let at = row.containers.iter().position(|(c, _)| c == container)?;
+        return row.used_by.get(at).map(String::as_str);
+    }
+    row.used_by.first().map(String::as_str)
+}
+
+/// A remote service container's terminal (`container`, one of `row`'s): on
+/// an ssh machine `ssh -t … <runtime> exec -i -t <container> <login
+/// shell>`, the runtime the machine's snapshot named (`docker` before one
+/// came); on an offered worker this host's `devsandbox exec
+/// --service=<name> -- <m>/<instance>` ([`service_instance`]), whose
+/// service dial the worker resolves to the container itself.
+pub fn service_argv(m: &SnapshotMachine, row: &ServiceRow, container: &str, exe: Exe) -> Result<Vec<String>, String> {
     if m.kind == crate::serve::machines::MachineKind::Offered {
-        return Err(format!(
-            "machine `{}` is an offered fleet worker: service terminals aren't supported over its fleet link (only instances')",
-            m.name
-        ));
+        let instance = service_instance(row, container).ok_or_else(|| format!("no instance on `{}` uses service `{}`", m.name, row.name))?;
+        let service = format!("--service={}", row.name);
+        return on_machine(m, "", &["exec", &service], instance, &[], exe);
     }
     let runtime = m.runtime.as_deref().unwrap_or("docker");
     let mut args: Vec<String> = ["exec", "-i", "-t", container].map(String::from).to_vec();
@@ -418,15 +431,15 @@ pub(crate) mod tests {
             crate::Command::Exec { reserve_255: true, session: Some(ref s), ref name, .. } if s == id && name == "web-2"
         ));
         m.runtime = Some("podman".into());
-        let argv = service_argv(&m, "devsandbox-svc-db").unwrap();
+        let db = service_row("isolated", &["devsandbox-svc-db"], &["web-2"]);
+        let argv = service_argv(&m, &db, "devsandbox-svc-db", no_exe).unwrap();
         assert_eq!(argv[..6], ["ssh", "-t", "-p", "2222", "--", "me@box"]);
         assert!(argv[6].starts_with(r#"exec "$SHELL" -lc 'exec podman '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[6]);
         m.runtime = None;
-        assert!(service_argv(&m, "c").unwrap()[6].contains("exec docker "));
+        assert!(service_argv(&m, &db, "c", no_exe).unwrap()[6].contains("exec docker "));
 
-        // An offered worker has no ssh: its instance tabs run this host's
-        // devsandbox on the qualified name (which dials its fleet link),
-        // its service tabs say why not.
+        // An offered worker has no ssh: its tabs run this host's devsandbox
+        // on the qualified name (which dials its fleet link).
         let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Offered, target: None, ..sm("lap", LinkState::Connected) };
         let exe = || Ok("/opt/devsandbox".to_string());
         let exe: Exe = &exe;
@@ -442,7 +455,37 @@ pub(crate) mod tests {
         ));
         let no = || Err("no exe".to_string());
         assert_eq!(exec_argv(&lap, "/r", "w", &[], &no), Err("no exe".into()));
-        assert!(service_argv(&lap, "c").unwrap_err().contains("service terminals aren't supported over its fleet link"));
+        // A service tab goes through the instance whose service it is.
+        let iso = service_row("isolated", &["devsandbox-svc-p-a-db", "devsandbox-svc-p-b-db"], &["a", "b"]);
+        let argv = service_argv(&lap, &iso, "devsandbox-svc-p-b-db", exe).unwrap();
+        assert_eq!(argv, ["/opt/devsandbox", "exec", "--service=db", "--", "lap/b"]);
+        assert!(matches!(
+            parsed(&argv[1..].iter().map(String::as_str).collect::<Vec<_>>()),
+            crate::Command::Exec { service: Some(ref s), ref name, ref command, .. } if s == "db" && name == "lap/b" && command.is_empty()
+        ));
+        let global = service_row("global", &["devsandbox-svc-p-db"], &["b", "a"]);
+        assert_eq!(service_argv(&lap, &global, "devsandbox-svc-p-db", exe).unwrap()[4], "lap/b", "any user: the first");
+        let unused = service_row("global", &["devsandbox-svc-p-db"], &[]);
+        assert!(service_argv(&lap, &unused, "devsandbox-svc-p-db", exe).unwrap_err().contains("no instance on `lap` uses service `db`"));
+        assert_eq!(service_instance(&iso, "devsandbox-svc-other"), None);
+    }
+
+    /// Service `db`'s row: its scope, containers and users.
+    fn service_row(scope: &str, containers: &[&str], used_by: &[&str]) -> ServiceRow {
+        ServiceRow {
+            name: "db".into(),
+            scope: scope.into(),
+            source: "image postgres".into(),
+            ports: Vec::new(),
+            containers: containers.iter().map(|c| (c.to_string(), crate::snapshot::ContainerStatus::Missing)).collect(),
+            used_by: used_by.iter().map(|s| s.to_string()).collect(),
+            env_len: 0,
+            command: None,
+            config_hash: String::new(),
+            drift: false,
+            root: None,
+            machine: Some("lap".into()),
+        }
     }
 
     #[test]

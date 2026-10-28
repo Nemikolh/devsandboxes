@@ -21,8 +21,9 @@
 //! On an offered fleet worker (no ssh to it) the dials are `PTY` streams
 //! over its fleet link from this process (`fleet::pty_client`, [`Dials`]),
 //! in the same loop; its `--attach` and `--sessions` too (the session list
-//! a `sessions.list` quick call). Its other re-runs are API calls through
-//! the daemon, or refused ([`offered`]).
+//! a `sessions.list` quick call). An `exec --service` there is one service
+//! `PTY` dial ([`service_mode`]), never re-dialed. Its other re-runs are
+//! API calls through the daemon, or refused ([`offered`]).
 
 mod offered;
 
@@ -375,11 +376,12 @@ pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) ->
         Command::Done { .. } => out.extend([s("done"), s("--"), s(name)]),
         Command::Undone { .. } => out.extend([s("undone"), s("--"), s(name)]),
         Command::Rename { new_name, .. } => out.extend([s("rename"), s("--"), s(name), new_name.clone()]),
-        Command::Exec { interactive, tty, attach, sessions, session, reserve_255, command, .. } => {
+        Command::Exec { interactive, tty, attach, sessions, session, service, reserve_255, command, .. } => {
             out.push(s("exec"));
             let flags = [flag(*interactive, "-i"), flag(*tty, "-t"), flag(*sessions, "--sessions"), flag(*reserve_255, "--reserve-255")];
             out.extend(flags.into_iter().flatten());
             out.extend(session.as_ref().map(|id| format!("--session={id}")));
+            out.extend(service.as_ref().map(|name| format!("--service={name}")));
             // The name before `--`: after it, it would be the command.
             out.push(s(name));
             // After the name: `--attach`'s value is optional, so a bare one
@@ -494,12 +496,13 @@ pub(crate) fn gone_note(id: &str) -> String {
 
 /// The session id a machine `exec` reconnects with: `None` when it gets no
 /// tty (a piped exec, nothing to re-attach to) or is an `--attach` /
-/// `--sessions` already. The tty rule is the remote `exec`'s
+/// `--sessions` already, or a `--service` terminal (never a session). The
+/// tty rule is the remote `exec`'s
 /// (`commands::exec::shell_flags`), `terminal` standing for the remote
 /// stdin: ssh gives it a tty ([`ssh::cli_argv`]) exactly when this process is
 /// on a terminal. A `--session` given is kept, else one is minted here.
 pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl FnOnce() -> String) -> Result<Option<String>> {
-    let Command::Exec { interactive, tty, attach: None, sessions: false, session, command, .. } = command else {
+    let Command::Exec { interactive, tty, attach: None, sessions: false, session, service: None, command, .. } = command else {
         return Ok(None);
     };
     let tty = if command.is_empty() { crate::commands::exec::shell_flags(*interactive, *tty, terminal).1 } else { *tty };
@@ -516,10 +519,10 @@ pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl Fn
 /// [`reconnect_session`]'s): `argv` as typed, `-i` as given; no command,
 /// the login shell (`exec::SHELL_FALLBACK_CMD`) with `exec::shell_flags`'
 /// `-i`, as a local `exec` runs it. `None` for one that gets a tty, a
-/// session one (`--attach`, `--sessions`, `--session`) and any other
-/// command.
+/// session one (`--attach`, `--sessions`, `--session`), a `--service` one
+/// ([`service_mode`]) and any other command.
 pub(crate) fn pipe_mode(command: &Command, terminal: bool) -> Option<pty_client::Mode> {
-    let Command::Exec { interactive, tty, attach: None, sessions: false, session: None, command, .. } = command else {
+    let Command::Exec { interactive, tty, attach: None, sessions: false, session: None, service: None, command, .. } = command else {
         return None;
     };
     let (argv, interactive) = if command.is_empty() {
@@ -537,6 +540,15 @@ pub(crate) fn pipe_mode(command: &Command, terminal: bool) -> Option<pty_client:
     Some(pty_client::Mode::Pipe { argv, interactive })
 }
 
+/// The service `PTY` mode of an `exec --service <name>` on an offered
+/// machine: the command as typed (empty: the worker's login shell). One
+/// dial, never re-dialed (no session to go back to). `None` for any other
+/// command.
+pub(crate) fn service_mode(command: &Command) -> Option<pty_client::Mode> {
+    let Command::Exec { service: Some(name), command, .. } = command else { return None };
+    Some(pty_client::Mode::Service { name: name.clone(), argv: command.clone() })
+}
+
 /// The two remote commands of a session exec (`command`, an `Exec`) in
 /// session `id`: the first dial, `exec --session=<id>` as typed
 /// (create-or-attach), and every re-dial, `exec --attach=<id>` (attach only:
@@ -549,6 +561,7 @@ pub(crate) fn session_dials(command: &Command, id: &str) -> Option<(Command, Com
         attach: None,
         sessions: false,
         session: Some(id.to_string()),
+        service: None,
         reserve_255: true,
         name: name.clone(),
         command: command.clone(),
@@ -559,6 +572,7 @@ pub(crate) fn session_dials(command: &Command, id: &str) -> Option<(Command, Com
         attach: Some(Some(id.to_string())),
         sessions: false,
         session: None,
+        service: None,
         reserve_255: true,
         name: name.clone(),
         command: Vec::new(),
@@ -870,6 +884,20 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
                 let call = &mut |method: &str, params| conn.call(method, params);
                 return Ok(Routed::Exit(offered::named(call, &u, &m, &chosen.name, root, tty, &mut out, &mut err)?));
             }
+        }
+        if let Some(mode) = service_mode(&command) {
+            // A service terminal: one dial, its 255 reported once.
+            if !terminal {
+                bail!("`exec --service` on machine `{m}` opens a terminal in the service's container: it needs a TTY");
+            }
+            let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+            let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
+            let request = pty_client::Request { root: root.to_path_buf(), instance: chosen.name.clone(), mode };
+            let dir = endpoint::socket_dir()?;
+            let held = hold(conn, &entry);
+            let code = pty_client::dial(&dir, &m, &request, reserve_255);
+            drop(held);
+            return Ok(Routed::Exit(code));
         }
         if let Some(routed) = offered_session_exec(&command, &mut conn, &entry, &chosen.name, root, terminal)? {
             return Ok(routed);
@@ -1274,6 +1302,26 @@ mod tests {
         assert!(matches!(back, Command::Exec { attach: Some(None), ref name, .. } if name == "web"));
         assert_eq!(remote_args(&command(&["stop", "web"]), "web", None), None);
         assert_eq!(remote_args(&command(&["vscode", "web"]), "web", None), None);
+        // `--service` rides along to an ssh machine, its command too.
+        let svc = ra(&["exec", "box/web", "--service", "db", "--", "psql"], "web", root);
+        assert_eq!(svc, ms(&["-C", "/srv/it's", "exec", "--service=db", "web", "--", "psql"]));
+        let back = command(&svc.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(matches!(back, Command::Exec { service: Some(ref s), ref command, .. } if s == "db" && command == &["psql"]));
+    }
+
+    /// `exec --service`: never a session nor a pipe; on an offered machine
+    /// one service `PTY` dial, on an ssh one the remote `exec --service`.
+    #[test]
+    fn service_execs_are_one_terminal() {
+        let svc = command(&["exec", "box/web", "--service", "db"]);
+        assert_eq!(reconnect_session(&svc, true, || ID.into()).unwrap(), None, "no session to reconnect to");
+        assert_eq!(pipe_mode(&svc, false), None);
+        assert_eq!(service_mode(&svc), Some(pty_client::Mode::Service { name: "db".into(), argv: vec![] }));
+        let psql = command(&["exec", "-it", "box/web", "--service", "db", "psql", "-l"]);
+        assert_eq!(service_mode(&psql), Some(pty_client::Mode::Service { name: "db".into(), argv: ms(&["psql", "-l"]) }));
+        assert_eq!(reconnect_session(&psql, true, || ID.into()).unwrap(), None);
+        assert_eq!(service_mode(&command(&["exec", "box/web"])), None);
+        assert_eq!(offered::use_of(&svc), offered::Use::Link);
     }
 
     const ID: &str = "1790000000-a1b2";

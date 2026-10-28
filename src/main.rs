@@ -258,6 +258,7 @@ enum Command {
     ///     devsandbox exec web --sessions
     ///     devsandbox exec web --attach
     ///     devsandbox exec web --attach=1790000000-a1b2
+    ///     devsandbox exec web --service db
     Exec {
         /// Keep stdin open
         #[arg(short)]
@@ -278,6 +279,11 @@ enum Command {
         /// without the helper, a plain exec
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+        /// Open a terminal in service NAME's container, the one this instance
+        /// uses (the command, else a login shell; always -i -t, never a
+        /// session); needs a TTY
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["attach", "sessions", "session"])]
+        service: Option<String>,
         /// Report a command's exit code 255 as 254, so 255 only ever means
         /// ssh's own failure: what the reconnect loops over ssh pass
         /// (`commands::exec::reported_code`)
@@ -807,12 +813,13 @@ fn main() -> Result<()> {
         Command::Undone { name } => commands::done::done(&name, false),
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
-        Command::Exec { interactive, tty, attach, sessions, session, reserve_255, name, command } => {
+        Command::Exec { interactive, tty, attach, sessions, session, service, reserve_255, name, command } => {
             use commands::exec::Exec;
-            let what = match (&attach, sessions) {
-                (Some(id), _) => Exec::Attach(id.as_deref()),
-                (None, true) => Exec::Sessions,
-                (None, false) => Exec::Run { interactive, tty, command: &command, session: session.as_deref() },
+            let what = match (&attach, sessions, &service) {
+                (_, _, Some(service)) => Exec::Service { service, command: &command },
+                (Some(id), _, _) => Exec::Attach(id.as_deref()),
+                (None, true, _) => Exec::Sessions,
+                (None, false, None) => Exec::Run { interactive, tty, command: &command, session: session.as_deref() },
             };
             commands::exec::exec(&name, what, reserve_255)
         }
@@ -999,6 +1006,25 @@ mod tests {
         ] {
             let err = exec_args(conflict).unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{conflict:?}");
+        }
+    }
+
+    #[test]
+    fn exec_service_parses_with_a_command_and_conflicts_with_sessions() {
+        let service = |args: &[&str]| -> Result<(Option<String>, String, Vec<String>), clap::Error> {
+            let cli = Cli::try_parse_from(["devsandbox", "exec"].iter().chain(args))?;
+            match cli.command {
+                Some(Command::Exec { service, name, command, .. }) => Ok((service, name, command)),
+                _ => panic!("not exec"),
+            }
+        };
+        let s = |v: &str| v.to_string();
+        assert_eq!(service(&["web", "--service", "db"]).unwrap(), (Some(s("db")), s("web"), vec![]));
+        assert_eq!(service(&["--service=db", "web", "--", "psql", "-l"]).unwrap(), (Some(s("db")), s("web"), vec![s("psql"), s("-l")]));
+        assert_eq!(service(&["-it", "web", "--service", "db"]).unwrap().0, Some(s("db")), "-i/-t are what it does anyway");
+        assert_eq!(service(&["web"]).unwrap().0, None);
+        for conflict in [&["web", "--service", "db", "--attach"][..], &["web", "--service", "db", "--sessions"], &["--session", "1790000000-a1b2", "web", "--service", "db"]] {
+            assert_eq!(service(conflict).unwrap_err().kind(), clap::error::ErrorKind::ArgumentConflict, "{conflict:?}");
         }
     }
 }

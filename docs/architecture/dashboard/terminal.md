@@ -65,9 +65,12 @@ arrives on reader threads and only shows on the next draw.
   it: `remote::on_machine`, the executable `ExecCli::exe`), whose tty
   `exec` dials the worker over its fleet link
   ([../daemon/fleet.md](../daemon/fleet.md) *PTY*) and reconnects as the
-  CLI does; the tab re-dials it the same way. Its service rows' tabs are
-  refused (`remote::service_argv`: no service terminals over the fleet
-  link).
+  CLI does; the tab re-dials it the same way. A service row's tab runs
+  this host's `devsandbox exec --service=<name> -- <machine>/<instance>`
+  (`remote::service_argv`), the instance the one whose container it is
+  (`remote::service_instance`: an isolated service's `used_by` entry at
+  the container's index, a global one's first user); the worker derives
+  the container itself. It isn't a session: no `Redial`, it just ends.
 
 ## Remote tabs reconnect
 

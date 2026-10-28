@@ -29,6 +29,9 @@ pub enum Exec<'a> {
     Attach(Option<&'a str>),
     /// `--sessions`: the helper's `session ls`.
     Sessions,
+    /// `--service NAME`: `command` (empty: the login shell) in the container
+    /// of service `service` the instance uses, `-i -t`, never a session.
+    Service { service: &'a str, command: &'a [String] },
 }
 
 /// CLI entry point: run the command, then exit the process with its status
@@ -62,6 +65,16 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
     let helper = instance.devsbd_arch.is_some();
 
     match what {
+        Exec::Service { service, command } => {
+            if !stdin_tty {
+                bail!("`exec --service` opens a terminal in the service's container: it needs a TTY");
+            }
+            let container = instance_service_container(&key, instance, &state, service)?;
+            if !super::services::container_running(&container) {
+                bail!("service `{service}` of `{key}` isn't running ({container})");
+            }
+            backend().run_inherit(&refs(&service_exec_argv(&container, command)))
+        }
         Exec::Sessions => {
             if !helper {
                 bail!("`{key}` has no devsbd helper, so no sessions");
@@ -105,6 +118,31 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
             run_in(&key, instance, interactive, tty, wrapped.as_deref().unwrap_or(command))
         }
     }
+}
+
+/// The container of service `service` instance `key` uses, from the
+/// instance's own config root (`port::service_container_for`, as the
+/// forwards and a fleet worker derive it).
+fn instance_service_container(key: &str, instance: &Instance, state: &State, service: &str) -> Result<String> {
+    let Some(dir) = instance.config_dir.as_deref() else {
+        bail!("`{key}` has no config root recorded, so its services can't be found");
+    };
+    let config = crate::config::Config::load(dir)?;
+    let project = super::services::project_id(dir)?;
+    super::port::service_container_for(&config, state, &project, key, service).map_err(anyhow::Error::msg)
+}
+
+/// The runtime argv of a terminal in service container `container`:
+/// `exec -i -t <container>` and `command`, else the login shell, as the
+/// dashboard's service tabs run it.
+fn service_exec_argv(container: &str, command: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = ["exec", "-i", "-t", container].map(String::from).to_vec();
+    if command.is_empty() {
+        args.extend(SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()));
+    } else {
+        args.extend(command.iter().cloned());
+    }
+    args
 }
 
 fn refs(args: &[String]) -> Vec<&str> {
@@ -473,6 +511,15 @@ mod tests {
             progress: None,
             created_unix: 0,
         }
+    }
+
+    #[test]
+    fn a_service_terminal_is_the_dashboards_service_tab() {
+        let shell: Vec<String> = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+        let argv = service_exec_argv("devsandbox-svc-p-db", &[]);
+        assert_eq!(argv[..4], ["exec", "-i", "-t", "devsandbox-svc-p-db"]);
+        assert_eq!(argv[4..], shell);
+        assert_eq!(service_exec_argv("c", &["psql".into()]), ["exec", "-i", "-t", "c", "psql"]);
     }
 
     #[test]

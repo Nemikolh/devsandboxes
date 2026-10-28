@@ -573,7 +573,9 @@ impl App {
     ///
     /// On a machine (a `box/…` key) either goes over ssh: the machine's
     /// `devsandbox -C <its root> exec`, or its runtime's `exec`
-    /// (docs/architecture/daemon/machines.md, *Dashboard*). A remote
+    /// (docs/architecture/daemon/machines.md, *Dashboard*); on an offered
+    /// worker, this host's `devsandbox exec` over its fleet link (a service
+    /// through an instance using it, `remote::service_argv`). A remote
     /// instance's shell runs in helper session `id`, and the second value is
     /// the attach its tab re-dials after a lost connection ([`Redial`]);
     /// `None` for every other tab.
@@ -595,10 +597,16 @@ impl App {
             }
             return self.exec_argv(title, &[]).map(|argv| (argv, None)).map_err(terminal);
         }
-        if let (Some(machine), container) = remote::split(container) {
-            return remote::service_argv(self.machine_entry(machine)?, container).map(|argv| (argv, None)).map_err(terminal);
-        }
         let snapshot = self.snapshot.as_ref().ok_or_else(|| "terminal: no data yet".to_string())?;
+        if let (Some(machine), container) = remote::split(container) {
+            let row = snapshot
+                .services
+                .iter()
+                .find(|r| r.machine.as_deref() == Some(machine) && r.containers.iter().any(|(c, _)| c == container))
+                .ok_or_else(|| terminal(format!("`{machine}/{container}` not in the snapshot")))?;
+            let exe = || self.local_exe();
+            return remote::service_argv(self.machine_entry(machine)?, row, container, &exe).map(|argv| (argv, None)).map_err(terminal);
+        }
         let mut argv = vec![snapshot.runtime_name.clone(), "exec".into(), "-i".into(), "-t".into(), container.into()];
         argv.extend(SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()));
         Ok((argv, None))

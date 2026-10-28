@@ -951,7 +951,9 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
 ### PTY
 
 A terminal into a lent instance over the link: each `PTY` stream the hub
-opens is one session attach (or a piped exec: *Pipe mode* below), the worker's daemon calling the instance
+opens is one session attach (or a piped exec: *Pipe mode*; a tty exec
+where the helper can't attach: *Tty fallback*; a service container's
+terminal: *Service terminals*, all below), the worker's daemon calling the instance
 helper's `session.attach` itself over its bridge
 (`HelperClient::call_with_input`; decision 13 of the
 [plan](../../plans/active/fleet.md#decisions)): no `exec -it`, no client
@@ -971,11 +973,14 @@ in the container. The stream carries `rpc` records
   `root` confined as an `API` request's is (`lent::confine_path`: under
   the fleet root); the instance found by exact name, else by id, among
   the lent ones (`lent::lent_instances`) whose config root is under
-  `root`; it must have the helper (`Instance::devsbd_arch`). Then the
-  helper must offer `session.attach` (`HelperClient::offers`,
-  `pty::offered`): a bridge must be up (else the instance isn't running),
-  and the helper's daemon must be root, since `session.attach` is
-  `needs_root` (a `containerUser` instance, or an older helper, refuses).
+  `root`. Then `pty::decide` (pure) picks the terminal from whether the
+  instance has the helper (`Instance::devsbd_arch`) and whether it offers
+  `session.attach` (`HelperClient::offers`): offered, the attach below; no
+  bridge up, `not-running`; no helper, or a helper whose daemon isn't root
+  (`session.attach` is `needs_root`: a `containerUser` instance, or an
+  older helper), the *Tty fallback* for a header with `create`, and for an
+  attach-only one `no-session` (nothing resumable exists), its message
+  saying the instance's terminals over the link aren't resumable.
 - **The attach**: `session.attach {id, create?: {argv, cwd, env, user?}}`
   (`pty::attach_params`), `create` as an exec into the instance runs
   (`exec::exec_context`, which `exec_argv_with` builds its argv from too:
@@ -996,10 +1001,12 @@ in the container. The stream carries `rpc` records
 - **Refusals and losses** are one `error` record and the stream's close:
   `bad-request` (no or a malformed header, a relative `root`), `denied`
   (`root` outside the fleet root; logged), `not-found` (no such root, no
-  such lent instance in it), `not-running` (no live bridge to its
-  helper), `unsupported` (no helper; its daemon doesn't offer
-  `session.attach`), `failed` (`state.toml` doesn't read, the helper
-  couldn't be asked), and `lost`: the attach ended without an end record
+  such lent instance in it, a service it doesn't use), `not-running` (no
+  live bridge to its helper), `no-session` (attach only, without a helper
+  that attaches), `unsupported` (the helper stopped offering
+  `session.attach` between the check and the call), `failed`
+  (`state.toml` or the config doesn't read, the helper couldn't be asked,
+  a terminal couldn't be spawned), and `lost`: the attach ended without an end record
   (the bridge or its call broke), so the hub can't tell how the session
   is, only that the attach is gone.
 
@@ -1015,12 +1022,13 @@ no helper, a `<runtime> exec` on the worker with its stdio piped.
   the instance lent and under it; no `offered` (nothing is asked of a
   helper; an instance that isn't running is the runtime exec's own
   error, on `stderr`).
-- **The exec** is `pty::runtime_exec`: the runtime's
-  `exec_argv_with(instance, interactive, false, argv, host_agent)`, the
-  same argv a local `exec` without `-t` runs (`-i` when interactive),
-  its stdin the hub's or empty, its stdout and stderr piped. The daemon
-  passes `runtime_exec` to `pty::serve` as a `pty::PipeCommand`; tests
-  pass a program of their own.
+- **The exec** is `pty::runtime_exec` of a `pty::Target::Instance`: the
+  runtime's `exec_argv_with(instance, interactive, false, argv,
+  host_agent)`, the same argv a local `exec` without `-t` runs (`-i` when
+  interactive), its stdin the hub's or empty, its stdout and stderr
+  piped. The daemon passes `runtime_exec` to `pty::serve` as a
+  `pty::ExecCommand` (a pipe's and a tty's argv alike); tests pass a
+  program of their own.
 - **Records** (`pty::run_pipe`): hub → worker `stdin` into the exec's
   stdin, `stdin-eof` closing it (anything else ignored); worker → hub
   its stdout as `stdout` and its stderr as `stderr` records (up to 64
@@ -1032,6 +1040,52 @@ no helper, a `<runtime> exec` on the worker with its stdio piped.
   the exec; nothing more is written. The hub's end closes when its own
   stdout's reader went away (`| head`): `pty_client::attach` then ends
   as `SIGPIPE` (exit 141, no note), as a local exec would.
+
+**Tty fallback** is a session header's terminal for an instance whose
+helper can't attach (`pty::Terminal::Tty`): `<runtime> exec -it` on the
+worker under a host pty, not resumable.
+
+- **The exec** is `pty::runtime_exec` of `exec_argv_with(instance, true,
+  true, argv, host_agent)` (the local tty exec's argv; `argv` the
+  header's `create.argv`, else the login shell), spawned on a fresh host
+  pty (`pty::spawn_tty`: portable-pty, 80×24 until the first `resize`, as
+  the dashboard's tabs spawn theirs). The session id is unused: nothing
+  is resumable. An instance that isn't running is the runtime exec's own
+  error, on the terminal.
+- **Records** (`pty::run_tty`): first one `stderr` record,
+  `this terminal isn't resumable (no helper | helper not root): a dropped
+  link ends it` (`pty::NotResumable::note`, ending `\r\n`: the hub's
+  terminal is raw by then), then the pty's output as `stdout` records;
+  hub → worker `stdin` into the pty, `resize` onto it (`MasterPty::resize`;
+  `stdin-eof` and anything else ignored); once the child exited and the
+  pty's output is drained, one `exit` (`pty::tty_exit_record`: its code,
+  or its signal, mapped back from portable-pty's `strsignal` name). Then
+  the worker closes the stream.
+- **Hang-up**: the hub closing its end first kills the child
+  (portable-pty's `kill`: SIGHUP, then SIGKILL after a grace) and reaps
+  it; nothing more is written. A lost link is that hang-up too, so the
+  hub's reconnect re-dials an attach, answered `no-session`.
+
+**Service terminals** are a `PTY` stream into the container of a service
+a lent instance uses (`exec --service`, the dashboard's service tabs):
+the same tty exec, never a session.
+
+- **The header** has `"service": <name>` and a `create` (`{"argv"?}`,
+  required: there are no service sessions) alongside `root` and
+  `instance`, without `session` or `pipe` (`pty::Mode::Service`; else
+  `bad-request`).
+- **The gate** is `pty::gate`'s for the instance (it scopes the
+  service), then `pty::service_container`: the config read from the
+  instance's own config root, the service one its sandbox uses, and the
+  container named on the worker by the service's scope
+  (`port::service_container_for`, as the forwards name it:
+  `isolated_service_container` by the instance's id, or the global
+  `service_container`), never by the hub. Not used by it, or no such
+  service: `not-found`.
+- **The exec** is `pty::runtime_exec` of a `pty::Target::Service`:
+  `<runtime> exec -i -t <container>` and the command, else the login
+  shell (the dashboard's local service tab's argv), under a host pty;
+  records and hang-up as the *Tty fallback*'s, without the note.
 
 `sessions.list` / `sessions.rm` ([api](../../reference/api.md#sessions))
 are quick calls, admitted on the `Worker` table with the instance rule
@@ -1062,6 +1116,12 @@ signal; 255 as 254 under `--reserve-255`); `no-session` 250, `detached`
 255; the other refusals (`bad-request`, `denied`, `not-found`,
 `not-running`, `unsupported`, `failed`) `pty_client::REFUSED_EXIT` (1)
 with `error: <message> (<code>)`, which no loop retries.
+
+A service dial (`pty_client::Mode::Service`, `exec --service` on the
+machine: `cli::service_mode`) is a session dial's terminal (raw mode,
+size) with the service header, never re-dialed: its 255 is reported
+once. A fallback terminal's note comes as a `stderr` record, written to
+stderr as any is.
 
 A pipe-mode dial (`pty_client::Mode::Pipe`, a non-tty `exec`:
 `cli::pipe_mode`) is the same dial without the terminal: no raw mode, no

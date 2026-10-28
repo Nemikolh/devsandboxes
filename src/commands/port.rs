@@ -268,6 +268,26 @@ pub(crate) fn uses_service(config: &Config, state: &State, key: Option<&str>, se
         .any(|(_, i)| references(config, &i.sandbox, service))
 }
 
+/// The container of service `service` that instance `key` (an exact state
+/// key) uses, project `project`'s: an isolated service's own, a global one's
+/// shared one, named as the forwards name them ([`via_service_container`]).
+/// What `exec --service` opens a shell in, here and on a fleet worker
+/// (`serve::fleet::pty`). An error when the instance doesn't use it.
+pub(crate) fn service_container_for(
+    config: &Config,
+    state: &State,
+    project: &str,
+    key: &str,
+    service: &str,
+) -> Result<String, String> {
+    let info = state.instances.get(key).ok_or_else(|| format!("no sandbox instance `{key}`"))?;
+    if !references(config, &info.sandbox, service) {
+        return Err(format!("instance `{key}` doesn't use service `{service}`"));
+    }
+    let scope = config.resolve_service(service).map_err(|e| format!("{e:#}"))?.spec.scope;
+    Ok(via_service_container(scope, state, project, key, service))
+}
+
 /// Whether `sandbox` (a config sandbox name) declares `service`. A sandbox from
 /// a foreign config root won't resolve, so this is also the config-root filter.
 fn references(config: &Config, sandbox: &str, service: &str) -> bool {
@@ -962,6 +982,19 @@ image = "node"
             plan(&config(), &state(), &running(&["plain-1"]), PROJECT, Some("plain-1"), Some("db"))
                 .unwrap_err();
         assert_eq!(err, "instance `plain-1` doesn't use service `db`");
+    }
+
+    #[test]
+    fn an_instances_service_container_by_scope() {
+        let mut state = state();
+        state.instances.insert("app-renamed".into(), instance("app", "app-9"));
+        let c = |key: &str, svc: &str| service_container_for(&config(), &state, PROJECT, key, svc);
+        assert_eq!(c("app-1", "db").unwrap(), services::isolated_service_container(PROJECT, "app-1", "db"));
+        assert_eq!(c("app-renamed", "db").unwrap(), services::isolated_service_container(PROJECT, "app-9", "db"), "by id");
+        assert_eq!(c("app-2", "cache").unwrap(), services::service_container(PROJECT, "cache"), "global: the shared one");
+        assert_eq!(c("plain-1", "db").unwrap_err(), "instance `plain-1` doesn't use service `db`");
+        assert_eq!(c("foreign", "db").unwrap_err(), "instance `foreign` doesn't use service `db`", "another root's sandbox");
+        assert_eq!(c("nope", "db").unwrap_err(), "no sandbox instance `nope`");
     }
 
     // ---- global service ----

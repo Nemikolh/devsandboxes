@@ -31,6 +31,12 @@ devsandbox logs --build web --follow
 
 `exec` runs in the workspace directory as the instance's user ([below](#who-you-are-inside)), exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
 
+`--service <name>` opens a terminal in a service's container instead, the one that instance uses (a login shell, or the command after `--`); it needs a terminal and isn't a session:
+
+```bash
+devsandbox exec web --service db -- psql -U postgres
+```
+
 <Callout variant="note" title="When a lifecycle command fails">
   A failing `postCreateCommand` aborts `run` but keeps the container, so `devsandbox logs --build web`, `devsandbox logs web` and `devsandbox exec web …` can show you why.
 </Callout>

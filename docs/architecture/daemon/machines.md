@@ -336,7 +336,8 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
 - **Other named commands** (`exec`, `logs`, `inspect`, `done`, `undone`,
   `rename`, …) are resolved through the daemon; one on a machine is re-run
   as `ssh [-t] <target> devsandbox <args>` (`exec` of ssh; with `agent`
-  on, see below). `logs` /
+  on, see below; `exec --service <name>` re-runs with `--service=<name>`,
+  once). `logs` /
   `inspect` with a bare `devsandbox-…` container name stay local. `port`
   on a machine's instance runs here: `route` returns `Routed::Port` (the
   machine's `Entry`, the match's root or else the machine's first, the
@@ -373,7 +374,7 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   the command runs without the agent. With `agent` off ssh is `exec`ed,
   except for a tty `exec` (below).
 - **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /
-  `--sessions`, and a tty by the remote `exec`'s rule, `shell_flags`, with
+  `--sessions` / `--service`, and a tty by the remote `exec`'s rule, `shell_flags`, with
   this process on a terminal standing for the remote stdin). The id is this
   process's (`--session` as given, else `exec::mint_session_id`), and the
   ssh is always spawned (`reconnect_loop`, through
@@ -417,7 +418,14 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   shell with `exec::shell_flags`' `-i`), and `resolve_and_route` dials it
   with the machine held for the agent. A session `exec` without a tty
   (`--attach` off a terminal, `--session` without `-t`) is refused
-  (`offered::Refused::SessionNoTty`).
+  (`offered::Refused::SessionNoTty`). `exec --service <name>` is one
+  service `PTY` dial (`cli::service_mode`: the command as typed, none the
+  worker's login shell; [fleet](fleet.md#pty), *Service terminals*), never
+  re-dialed (no session), refused without a terminal. A fallback terminal
+  ([fleet](fleet.md#pty), *Tty fallback*) is dialed as a session, so a
+  lost link re-dials its attach, which the worker answers with
+  `no-session`: the loop ends with 250 and the worker's
+  not-resumable message.
 - **Other re-runs to an offered fleet worker** are API calls through this
   host's daemon with `machine` set (fleet plan decision 15: within the
   worker's trust, never a `devsandbox …` run there), printed by the local
@@ -511,8 +519,9 @@ routed back to a request's `machine` + remote `root`; terminal tabs use
 keeps the machine, and its agent relay, up); on an offered fleet worker an
 instance tab instead runs this host's `devsandbox exec … -- <m>/<name>`
 (`on_machine`, the executable `ExecCli::exe`), whose tty `exec` dials
-the worker's fleet link ([The CLI](#the-cli-clirs)), and a service tab is
-refused (service terminals aren't supported over the fleet link); a remote instance tab runs
+the worker's fleet link ([The CLI](#the-cli-clirs)), and a service tab
+runs `devsandbox exec --service=<name> -- <m>/<instance>` through an
+instance using it (`service_argv`, `service_instance`); a remote instance tab runs
 its shell in a helper session it names (`session_exec_argv`) and, when its
 dial (ssh, or the local CLI) exits 255, re-dials an attach to it into the same tab (`attach_argv`,
 `tui::app::terminal::Redial`, the CLI's `Reconnect` rule;
@@ -524,7 +533,7 @@ listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while a machine is registered, shows every registered machine from
 the snapshot's `machines` with its target (dimmed `offered` for an offered
-fleet worker, whose service tabs say why they can't open),
+fleet worker),
 link state (and error), `agent`, and its LEND and CAPACITY
 ([capacity](fleet.md#capacity));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a
