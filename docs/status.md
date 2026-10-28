@@ -319,15 +319,17 @@ limitation means editing this file in the same commit.
   messages (not threads, which need `inbox`) still reach the worker's
   Inbox and desktop.
   → [fleet](architecture/daemon/fleet.md#worker-policy); `inbox::decide`
-- The trust table applies to offered workers' lending links only: an
-  ssh machine's `api --stdio` connection is still a local client's, the
-  whole API, whatever the machine's `trust` (fleet step 6).
-  → [fleet](architecture/daemon/fleet.md#the-trust-table); `serve::relay`
+- The trust table covers an ssh machine's API connections only (its
+  `api --stdio` relay's, after `link.attach`): the per-use ssh commands
+  (`ssh::tty_argv` for terminals, `cli_argv` for `--machine` `ps` / `ls` /
+  `stats` / `gc` / `service ls`, `tunnel_argv` for forwards,
+  `agent_argv`) are plain ssh shells on the machine, whatever its `trust`,
+  until one link per machine pair replaces them (fleet step 7).
+  → [machines](architecture/daemon/machines.md#ssh); `serve::machines::ssh`
 - A machine added before `machine add` recorded its roots there has none
-  in its `member.toml`, so once the trust table covers ssh connections its
-  `worker` trust refuses those of its roots no instance keeps in its
-  `state.toml`. Fix: `devsandbox machine roots add <root>…` on the
-  machine, or `machine rm` + `machine add` it again.
+  in its `member.toml`, so its `worker` trust refuses those of its roots
+  no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
+  add <root>…` on the machine, or `machine rm` + `machine add` it again.
   → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetrmtrustroots); `commands::machine::record_roots`
 - A hub's verb on a worker runs with the worker daemon's own process env
   (a systemd unit's or LaunchAgent's, not a login shell's as over ssh's

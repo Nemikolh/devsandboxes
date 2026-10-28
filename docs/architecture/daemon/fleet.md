@@ -952,8 +952,11 @@ trust (under `full`, with a note that remote callers get this host's
 whole API); `--machine` refuses it with the rest of `machine`
 (`serve::machines::cli::machine_use`). It is read for every request a
 remote caller sends (`lent::Reach::load`), so a change applies to the
-next one. `worker` is the default: a hub reaches this host's own roots
-and its fleet root through the [trust table](#the-trust-table), placed
+next one. It applies to every remote caller alike: a hub over the
+lending link, and a host that linked this one as an ssh machine (its
+relay connections, after `link.attach`). `worker` is the default: a
+remote caller reaches this host's own roots and (a hub) its fleet root
+through the [trust table](#the-trust-table), placed
 work under the [worker policy](#worker-policy). `full` gives it the API a
 local client has (but `member.*` and `link.*`), lifts the worker policy
 (`worker_policy::Policy::detect` answers none) and takes the hub's dev
@@ -963,10 +966,11 @@ builds ([Versions](#versions)).
 
 Every connection has a table (`daemon::Table`): `Full` for local clients,
 `Peer(Peer)` for a remote caller's: the hub's `API` streams over the
-lending link. A `Peer` (`fleet::lent::Peer`) is who it is (for the log),
-its fleet root (canonical; `Some` on the lending link) and the env its
-verbs get (`Some` on the lending link: this host's own; `None` keeps a
-verb's as sent). For each request on a `Peer` connection the daemon reads
+lending link (`Shared::open_lent`), and an ssh machine's relay connection
+once it is attached. A `Peer` (`fleet::lent::Peer`) is who it is (for the log),
+its fleet root (canonical; `Some` on the lending link, `None` for an ssh
+machine's peer) and the env its verbs get (`Some` on the lending link:
+this host's own; `None` keeps a verb's as sent). For each request on a `Peer` connection the daemon reads
 a `lent::Reach` from this host's files (`Reach::load` over
 `Shared::reach_files`: `member.toml` and `state.toml`, the home):
 
@@ -981,16 +985,18 @@ a `lent::Reach` from this host's files (`Reach::load` over
   `machine add` runs here over ssh for every root it picks
   (`commands::machine::record_roots`). Placed instances'
   config roots are in `state.toml` too.
-- **The fleet root**, the `Peer`'s.
+- **The fleet root**, the `Peer`'s (none for an ssh machine's peer).
 
 `Reach::admits` takes a canonical path that is under the fleet root or
 exactly one of the own roots (a dir nested in an own root isn't one);
 `Reach::admits_recorded` the same for a recorded `config_dir` (canonical
 when it exists, never with a `..`). Every gate below uses it.
 
-Each request goes through `lent::refuse_new_work` (a `run` while the
-lending thread drains is `denied`, `lent::DRAINING`, under either trust)
-and `lent::admit` at the top of `handle`, before any dispatch. Under
+Each request goes through `lent::refuse_new_work` (a `run` from the
+lending link's peer, the one with a fleet root, while the lending thread
+drains is `denied`, `lent::DRAINING`, under either trust; `drain` is
+about the lending link, so an ssh machine's peer isn't refused) and
+`lent::admit` at the top of `handle`, before any dispatch. Under
 either trust `member.*` and `link.*` are `denied`: this member's own
 settings and links are its local clients' only.
 
@@ -1006,10 +1012,10 @@ never hands the daemon off (below). Under **`worker`**:
   without `paths`: read-only; `machines.add` checks typed roots through
   it) and the verbs (`verbs::is_verb`). It refuses
   (`denied`) any request with a `machine` param or `machines: true`
-  (nothing federates past the member), a verb with `all` (`--all` is every
-  instance in `state.toml`, not the root's), and every other method:
+  (nothing federates past the member), and every other method:
   `machines.*`, `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`,
-  `bridges.ensure`, the Inbox. Refusals are logged.
+  `bridges.ensure`, the Inbox, each refusal naming `devsandbox machine
+  trust full` as what opens it. Refusals are logged.
 - **Paths**: a `root` or `dir` param must be absolute, have no `..`, and
   canonicalize (symlinks resolved) to a path the reach admits
   (`lent::confine_path`); it is rewritten to the canonical path. A path that
@@ -1021,9 +1027,14 @@ never hands the daemon off (below). Under **`worker`**:
 - **Instances**: an `instance` (exact name or id, `sessions.*`' included), `instances.procs`'
   `instances` and the `containers.*` `container` must be an instance whose
   `config_dir` the reach admits (`lent::lent_instances`, from
-  `state.toml`), else `not-found`. A verb's `instance` is resolved as the
+  `state.toml`), else `not-found`; a `containers.*` `container` may also
+  be a service container of those roots (its `devsandbox-svc-<project>-`
+  name). A verb's `instance` is resolved as the
   CLI resolves it (`commands::instance_matches`), and every match must be
-  lent; `rebuild` / `start` / `stop` / `rm` must name one.
+  lent; `rebuild` / `start` / `stop` / `rm` must name one, or carry
+  `all`: `--all` is every instance in `state.toml`, not the root's, so
+  it is admitted only while the reach admits every one of them (an
+  instance without a recorded `config_dir` stops it, `denied`).
 - **Env**: a verb's `env` is replaced by the `Peer`'s when it has one: on
   the lending link the daemon's own process env (`verbs_client::caller_env`,
   `Options::lend_env` in tests), never what the hub sent: the worker-side
@@ -1049,8 +1060,21 @@ version it says and even with `force`, under either trust: only a local
 client's newer binary (or this user's forced hello, [Versions](#versions))
 replaces it.
 
-An ssh machine's `api --stdio` connection (the relay) is a local
-client's: the `Full` table, not this one.
+**`link.attach {peer}`** turns a `Full` connection into a `Peer` one: an
+ssh machine's relay (`api --stdio --session-env`) sends it first, before
+relaying a byte ([machines](machines.md#ssh), `relay::attach`). The
+daemon (`daemon::link_attach`) takes it only from a `Full` connection of
+its own user (`endpoint::peer_is_own_user`), `peer` a non-empty name
+(`lent::attach_peer`: at most 255 bytes, no control characters; the
+linking host's name, shown only in the log), and switches the
+connection to `Peer { name: peer, fleet_root: None, env: None }`, its
+pushed snapshots filtered from then on (`Pending::reach`, as
+`Shared::spawn_conn_as` sets it for the lending link's). `env` is
+`None`: the relay's `SessionEnv` already replaced each verb's with the
+machine's login env and the linking host's agent relay, which the
+daemon must keep. It is one-way: a second `link.attach` is `link.*`,
+which the table refuses. It logs `connection N: link from <peer>, trust
+<t>` and answers `{ok, trust}`.
 
 ### PTY
 

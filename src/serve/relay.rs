@@ -18,11 +18,19 @@
 //! Every other line, and every byte downstream, still passes as is, after
 //! one line of the relay's own ([`write_sentinel`]) so the link can tell the
 //! relay's bytes from whatever the login shell printed first.
+//! Before that line, and before any byte is relayed, such a relay
+//! [`attach`]es its connection: one `link.attach {peer}` request of its own
+//! (`peer`: `--client` without its `machine:` prefix, the linking host),
+//! its one answer read and not relayed, so the daemon serves the rest of
+//! the connection with the trust table (docs/architecture/daemon/fleet.md,
+//! *The trust table*), as it does a fleet hub's lending link.
 //!
 //! Exit: 0 once stdin hits EOF (after the daemon has answered what was in
 //! flight, up to [`GRACE`]) or stdout is gone; [`EXIT_NO_HOST`] (75) when the
 //! daemon closes the connection first (it exited: reconnect, which starts a
-//! new one).
+//! new one), the attach's answer included; 1 when the daemon refuses the
+//! attach (retrying the same daemon won't change that; the message, on
+//! stderr, is what the linking host shows).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -32,7 +40,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::client::{self, Conn};
 use super::endpoint::{self, Stream};
@@ -76,11 +84,16 @@ impl End {
 /// `devsandbox api --stdio`: lazy-start the daemon, then relay until one side
 /// ends. Returns the exit code. `client` names the relay's own probe hello
 /// (`serve.log`); the client's hello goes through the relay untouched.
-/// `session_env`: verbs get this process's env, with `client`'s agent relay
-/// as their agent while it's up (see the module doc).
+/// `session_env`: the connection is [`attach`]ed first, and verbs get this
+/// process's env, with `client`'s agent relay as their agent while it's up
+/// (see the module doc).
 pub fn stdio(client: &str, session_env: bool) -> Result<i32> {
     let dir = endpoint::socket_dir()?;
     let stream = open(&dir, || client::connect(&dir, client))?;
+    if session_env && let Err(e) = attach(&stream, attach_name(client)) {
+        eprintln!("devsandbox api: {e}");
+        return Ok(e.code());
+    }
     write_sentinel(&mut std::io::stdout(), session_env).context("cannot write to stdout")?;
     let env = session_env.then(|| {
         let socket = endpoint::agent_socket(&dir, client);
@@ -101,6 +114,82 @@ pub fn write_sentinel(out: &mut impl Write, session_env: bool) -> std::io::Resul
     }
     write!(out, "\n{SENTINEL} {SENTINEL_VERSION}\n")?;
     out.flush()
+}
+
+/// The `peer` an attach names for relay client `client`: the linking
+/// host's name (`ssh::api_argv` passes `machine:<host>`).
+fn attach_name(client: &str) -> &str {
+    client.strip_prefix("machine:").unwrap_or(client)
+}
+
+/// Why an [`attach`] failed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AttachError {
+    /// The daemon answered with an error (or something that isn't the
+    /// answer).
+    Refused(String),
+    /// The connection ended (or broke) before the answer.
+    Closed(String),
+}
+
+impl AttachError {
+    pub fn code(&self) -> i32 {
+        match self {
+            AttachError::Refused(_) => 1,
+            AttachError::Closed(_) => EXIT_NO_HOST,
+        }
+    }
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            AttachError::Refused(why) => write!(f, "the daemon refused this link's connection: {why}"),
+            AttachError::Closed(why) => write!(f, "the daemon closed the connection before attaching it: {why}"),
+        }
+    }
+}
+
+/// The request id of the attach: the connection's first line, so no
+/// client id can collide with it.
+const ATTACH_ID: u64 = 0;
+
+/// `link.attach {peer}` on `daemon`, its answer read byte by byte up to
+/// its newline, so nothing after it is taken from what [`pump`] relays.
+/// `Ok` with the trust the daemon reports.
+pub fn attach<S: Read + Write>(mut daemon: S, peer: &str) -> std::result::Result<String, AttachError> {
+    let request = json!({ "id": ATTACH_ID, "method": "link.attach", "params": { "peer": peer } });
+    let closed = |e: std::io::Error| AttachError::Closed(e.to_string());
+    daemon.write_all(format!("{request}\n").as_bytes()).map_err(closed)?;
+    daemon.flush().map_err(closed)?;
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match daemon.read(&mut byte) {
+            Ok(0) => return Err(AttachError::Closed("no answer".into())),
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(closed(e)),
+        }
+        if line.len() as u64 > proto::MAX_LINE {
+            return Err(AttachError::Refused("an answer over the line limit".into()));
+        }
+    }
+    let answer: Value = serde_json::from_slice(&line)
+        .map_err(|_| AttachError::Refused(format!("not an answer: {}", String::from_utf8_lossy(&line))))?;
+    if answer.get("method").and_then(Value::as_str) == Some("closing") {
+        return Err(AttachError::Closed("it is exiting".into()));
+    }
+    if answer.get("id").and_then(Value::as_u64) != Some(ATTACH_ID) {
+        return Err(AttachError::Refused(format!("not its answer: {}", String::from_utf8_lossy(&line))));
+    }
+    if let Some(e) = answer.get("error") {
+        let message = e.get("message").and_then(Value::as_str).unwrap_or("no reason given");
+        return Err(AttachError::Refused(message.to_string()));
+    }
+    let trust = answer.get("result").and_then(|r| r.get("trust")).and_then(Value::as_str);
+    Ok(trust.unwrap_or_default().to_string())
 }
 
 /// A fresh connection for the relay, after `probe` (a hello'd connection: the
@@ -514,6 +603,49 @@ mod tests {
         let mut out = Vec::new();
         write_sentinel(&mut out, false).unwrap();
         assert!(out.is_empty(), "plain --stdio writes only the daemon's bytes");
+    }
+
+    /// The attach over a fake daemon that answers `answer` (then `after`,
+    /// then hangs up): the result, the request it got, what's left to read.
+    fn attached(answer: &[u8], after: &[u8]) -> (std::result::Result<String, AttachError>, Value, Vec<u8>) {
+        let (relay_end, daemon) = UnixStream::pair().unwrap();
+        relay_end.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (&daemon).write_all(answer).unwrap();
+        (&daemon).write_all(after).unwrap();
+        daemon.shutdown(Shutdown::Write).unwrap();
+        let got = attach(&relay_end, "lap");
+        let request: Value = serde_json::from_str(&line(&mut BufReader::new(&daemon))).unwrap();
+        let mut rest = Vec::new();
+        (&relay_end).read_to_end(&mut rest).unwrap();
+        (got, request, rest)
+    }
+
+    #[test]
+    fn an_attach_reads_its_answer_and_nothing_after() {
+        let (got, request, rest) =
+            attached(b"{\"id\":0,\"result\":{\"ok\":true,\"trust\":\"worker\"}}\n", b"{\"id\":0,\"result\":{\"protocol\":9}}\n");
+        assert_eq!(got.unwrap(), "worker");
+        assert_eq!(request, json!({"id": 0, "method": "link.attach", "params": {"peer": "lap"}}));
+        assert_eq!(rest, b"{\"id\":0,\"result\":{\"protocol\":9}}\n", "the pump's bytes untouched");
+
+        let (got, _, rest) = attached(b"{\"id\":0,\"error\":{\"code\":\"denied\",\"message\":\"nope\"}}\n", b"x");
+        let e = got.unwrap_err();
+        assert_eq!((&e, e.code()), (&AttachError::Refused("nope".into()), 1));
+        assert_eq!(rest, b"x");
+        let e = attached(b"{\"id\":0,\"error\":{\"code\":\"unknown-method\",\"message\":\"no `link.attach`\"}}\n", b"").0.unwrap_err();
+        assert!(e.to_string().contains("refused this link's connection: no `link.attach`"), "{e}");
+
+        // The daemon gone first: 75, as when it hangs up mid-relay.
+        for cut in [&b""[..], b"{\"id\":0,\"res"] {
+            let e = attached(cut, b"").0.unwrap_err();
+            assert!(matches!(e, AttachError::Closed(_)), "{e:?}");
+            assert_eq!(e.code(), EXIT_NO_HOST);
+        }
+        let e = attached(b"{\"method\":\"closing\",\"params\":{\"reason\":\"handoff\"}}\n", b"").0.unwrap_err();
+        assert_eq!(e.code(), EXIT_NO_HOST);
+        assert_eq!(attached(b"junk\n", b"").0.unwrap_err().code(), 1);
+        assert_eq!(attach_name("machine:lap.local"), "lap.local");
+        assert_eq!(attach_name("npm:x"), "npm:x");
     }
 
     #[test]

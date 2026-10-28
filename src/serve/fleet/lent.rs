@@ -1,7 +1,9 @@
 //! The trust table (docs/architecture/daemon/fleet.md, *The trust table*):
-//! what a remote caller (a [`Peer`]: a fleet hub over its link's `API`
-//! streams) may do on this member. Each such connection is served with a
-//! [`Peer`] (the daemon's `Table::Peer`); every request on it goes through
+//! what a remote caller (a [`Peer`]: a fleet hub over its lending link's
+//! `API` streams, or the host that linked this one as an ssh machine, over
+//! the relay connection its `link.attach` turned) may do on this member.
+//! Each such connection is served with a [`Peer`] (the daemon's
+//! `Table::Peer`); every request on it goes through
 //! [`admit`] first and its answer through [`filter_answer`], every
 //! `instances.snapshot` pushed to it through [`filter_snapshot`], each
 //! against the [`Reach`] read from this host's files for that request
@@ -15,23 +17,26 @@
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
 //!   quick calls (`machines::forward::QUICK`), `capacity.get`, `roots.list`
 //!   and the verbs; never a `machine` param or a federated (`machines:
-//!   true`) request, never a verb's `all`; everything else (`machines.*`,
+//!   true`) request; everything else (`machines.*`,
 //!   `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`, the
 //!   Inbox, …) is `denied`.
 //! - [`admit`] then confines the params: every `root` / `dir` canonicalized
 //!   and admitted by the [`Reach`] (rewritten to its canonical form), every
-//!   instance or container named one whose `config_dir` the reach admits,
-//!   `config.migrate` / `config.ack` (edits of a config) only under the
-//!   fleet root, and a verb's `env` replaced by the peer's when it has one.
+//!   instance or container named one whose `config_dir` the reach admits (a
+//!   service container: one of those roots'), a verb's `all` only while
+//!   every instance in `state.toml` is reached, `config.migrate` /
+//!   `config.ack` (edits of a config) only under the fleet root, and a
+//!   verb's `env` replaced by the peer's when it has one.
 //!
 //! Under `trust = "full"` none of that: the peer has the API a local client
 //! has, except `member.*` and `link.*` (this member's own settings, and its
 //! links), refused under both; a verb's `env` is still the peer's when it
 //! has one.
 //!
-//! - [`refuse_new_work`]: while lending `drain`, a `run` is `denied`
-//!   ([`DRAINING`]), under either trust; verbs on instances already here go
-//!   on.
+//! - [`refuse_new_work`]: while lending `drain`, a `run` from the lending
+//!   link's peer (the one with a fleet root) is `denied` ([`DRAINING`]),
+//!   under either trust; verbs on instances already here go on. `drain` is
+//!   about the lending link: an ssh machine's peer isn't refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -45,17 +50,39 @@ use crate::serve::verbs;
 use crate::state::State;
 use crate::worker_policy::Trust;
 
-/// A remote caller of this member: one per lending link.
+/// A remote caller of this member: one per lending link, one per attached
+/// relay connection (`link.attach`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
-    /// Who it is (the hub's ssh target), for the log.
+    /// Who it is (the hub's ssh target, the linking host's name), for the
+    /// log.
     pub name: String,
     /// This member's fleet root for it, canonical; `Some` on the lending
-    /// link.
+    /// link, `None` for an ssh machine's peer.
     pub fleet_root: Option<PathBuf>,
     /// `Some`: the env its verbs run with, whatever it sent (the lending
-    /// link's: this host's own, the daemon's). `None`: a verb's env as sent.
+    /// link's: this host's own, the daemon's). `None`: a verb's env as sent
+    /// (an attached relay's: the relay's `--session-env` already set it).
     pub env: Option<BTreeMap<String, String>>,
+}
+
+/// The longest `link.attach` `peer` taken: a hostname fits well within it.
+pub const PEER_NAME_MAX: usize = 255;
+
+/// `link.attach`'s `peer` (pure): a non-empty string of at most
+/// [`PEER_NAME_MAX`] bytes without control characters. Not
+/// `machines::check_name`: it's the linking host's hostname, which may
+/// carry dots or anything a hostname has; only the log shows it.
+pub fn attach_peer(params: &Value) -> Result<String, ApiError> {
+    let Some(name) = params.get("peer").and_then(Value::as_str) else {
+        return Err(ApiError::invalid("`link.attach` needs `peer`, the linking host's name"));
+    };
+    if name.is_empty() || name.len() > PEER_NAME_MAX || name.chars().any(char::is_control) {
+        return Err(ApiError::invalid(format!(
+            "`peer` must be 1 to {PEER_NAME_MAX} bytes without control characters"
+        )));
+    }
+    Ok(name.to_string())
 }
 
 /// Where a [`Reach`] is read from: this host's files.
@@ -161,13 +188,15 @@ pub enum Gate {
 }
 
 /// The refusal of a hub's `run` while this host drains.
-pub const DRAINING: &str = "this worker is draining: no new work";
+pub const DRAINING: &str = "this member is draining: no new work";
 
-/// `drain` is the one hard no for new work (pure): a `run` while
-/// `draining` is `denied` with [`DRAINING`]; everything else (`start`,
-/// `stop`, `rm`, `rebuild` of what's placed here) is left to [`admit`].
-pub fn refuse_new_work(method: &str, draining: bool) -> Result<(), ApiError> {
-    if draining && method == "run" {
+/// `drain` is the one hard no for new work (pure): a `run` from the
+/// lending link's `peer` (one with a fleet root) while `draining` is
+/// `denied` with [`DRAINING`]; everything else (`start`, `stop`, `rm`,
+/// `rebuild` of what's placed here, any request of an ssh machine's peer)
+/// is left to [`admit`].
+pub fn refuse_new_work(method: &str, peer: &Peer, draining: bool) -> Result<(), ApiError> {
+    if draining && peer.fleet_root.is_some() && method == "run" {
         return Err(ApiError::denied(DRAINING));
     }
     Ok(())
@@ -177,17 +206,17 @@ pub fn refuse_new_work(method: &str, draining: bool) -> Result<(), ApiError> {
 /// (pure).
 pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
     if fwd::machine_of(params)?.is_some() {
-        return Err(ApiError::denied("a fleet hub can't reach past this worker (`machine`)"));
+        return Err(ApiError::denied("a remote caller can't reach past this member (`machine`)"));
     }
     if fwd::federated(params) {
-        return Err(ApiError::denied("a fleet hub can't reach past this worker (`machines`)"));
+        return Err(ApiError::denied("a remote caller can't reach past this member (`machines`)"));
     }
     let gate = match method {
         "hello" => Gate::Hello,
         "subscribe" | "unsubscribe" => {
             let topics = params.get("topics").and_then(Value::as_array);
             if topics.is_some_and(|t| t.iter().any(|t| t.as_str() != Some("instances"))) {
-                return Err(ApiError::denied("a fleet hub subscribes to `instances` only"));
+                return Err(ApiError::denied("a remote caller subscribes to `instances` only"));
             }
             Gate::Subscribe
         }
@@ -196,17 +225,14 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         m if fwd::is_quick(m) => Gate::Quick,
         "capacity.get" => Gate::Capacity,
         "roots.list" => Gate::Roots,
-        m if verbs::is_verb(m) => {
-            // `--all` is every instance in `state.toml`, not the root's.
-            if params.get("all").and_then(Value::as_bool) == Some(true) {
-                return Err(ApiError::denied(format!("`{m}` with `all` isn't lent to a fleet hub")));
-            }
-            Gate::Verb
-        }
-        m => return Err(ApiError::denied(format!("`{m}` isn't lent to a fleet hub"))),
+        m if verbs::is_verb(m) => Gate::Verb,
+        m => return Err(ApiError::denied(format!("`{m}` isn't open to remote callers under this member's `worker` trust ({FULL_HINT})"))),
     };
     Ok(gate)
 }
+
+/// How a `worker` refusal says what opens it.
+const FULL_HINT: &str = "`devsandbox machine trust full` there opens it";
 
 /// The params naming an instance (an exact name or id, as the quick calls
 /// take it), per method.
@@ -242,7 +268,7 @@ pub fn confine_path(reach: &Reach, path: &Path, exists: bool) -> Result<PathBuf,
     };
     if !reach.admits(&real) {
         return Err(ApiError::denied(format!(
-            "`{}` is neither under this member's fleet root nor one of its own roots",
+            "`{}` isn't one of this member's roots (`devsandbox machine roots add <path>` there adds one)",
             path.display()
         )));
     }
@@ -351,14 +377,16 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
 
     let keys = instance_keys(method);
     let named_container = matches!(method, "containers.logs" | "containers.inspect");
-    if !keys.is_empty() || method == "instances.procs" || named_container {
+    // `--all` is every instance in `state.toml`, not the root's.
+    let all = gate == Gate::Verb && obj.get("all").and_then(Value::as_bool) == Some(true);
+    if !keys.is_empty() || method == "instances.procs" || named_container || all {
         let state = State::load_at(state).map_err(ApiError::internal)?;
         let lent = lent_instances(&state, reach);
         let unknown = |what: &str| ApiError::not_found(format!("no instance `{what}`"));
         for key in keys {
             let Some(name) = obj.get(*key).and_then(Value::as_str) else {
-                if needs_instance(method) {
-                    return Err(ApiError::invalid(format!("`{method}` from a fleet hub needs `{key}`")));
+                if needs_instance(method) && !all {
+                    return Err(ApiError::invalid(format!("`{method}` from a remote caller needs `{key}`")));
                 }
                 // Not a string: the method's own parse refuses it.
                 continue;
@@ -383,8 +411,14 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
         if named_container
             && let Some(c) = obj.get("container").and_then(Value::as_str)
             && !lent.containers.contains(c)
+            && !lent.projects().iter().any(|p| c.starts_with(&crate::commands::services::service_container(p, "")))
         {
-            return Err(ApiError::not_found(format!("no container `{c}` lent to this hub")));
+            return Err(ApiError::not_found(format!("no container `{c}` in this member's reach")));
+        }
+        if all && state.instances.len() != lent.names.len() {
+            return Err(ApiError::denied(format!(
+                "`{method}` with `all` reaches instances outside this member's roots ({FULL_HINT})"
+            )));
         }
     }
     if gate == Gate::Verb {
@@ -562,7 +596,7 @@ mod tests {
             ("run", json!({"root": "/x"}), Ok(Verb)),
             ("rm", json!({"root": "/x"}), Ok(Verb)),
             ("services.rebuild", json!({"root": "/x"}), Ok(Verb)),
-            ("stop", json!({"root": "/x", "all": true}), Err("denied")),
+            ("stop", json!({"root": "/x", "all": true}), Ok(Verb)),
             ("stop", json!({"root": "/x", "machine": "m"}), Err("denied")),
             ("instances.list", json!({"dir": "/x", "machine": "m"}), Err("denied")),
             ("instances.list", json!({"machine": 3}), Err("invalid")),
@@ -589,6 +623,12 @@ mod tests {
             let got = decide(method, params).map_err(|e| e.code);
             assert_eq!(got, *want, "{method} {params}");
         }
+        // A refusal says what opens it.
+        let e = decide("machines.list", &p).unwrap_err();
+        assert_eq!(
+            e.message,
+            "`machines.list` isn't open to remote callers under this member's `worker` trust (`devsandbox machine trust full` there opens it)"
+        );
         // Every quick call and verb is lent (with confined params).
         for m in fwd::QUICK {
             assert_eq!(decide(m, &p).unwrap(), Quick, "{m}");
@@ -596,13 +636,26 @@ mod tests {
     }
 
     #[test]
+    fn an_attach_names_its_peer() {
+        assert_eq!(attach_peer(&json!({"peer": "lap.local"})).unwrap(), "lap.local");
+        let long = "x".repeat(PEER_NAME_MAX + 1);
+        for bad in [json!({}), json!({"peer": 3}), json!({"peer": ""}), json!({"peer": "a\nb"}), json!({"peer": long})] {
+            assert_eq!(attach_peer(&bad).unwrap_err().code, "invalid", "{bad}");
+        }
+    }
+
+    #[test]
     fn draining_refuses_new_work_only() {
-        let e = refuse_new_work("run", true).unwrap_err();
+        let lending = peer(Path::new("/fleet/hub"));
+        let e = refuse_new_work("run", &lending, true).unwrap_err();
         assert_eq!((e.code, e.message.as_str()), ("denied", DRAINING));
         for m in ["start", "stop", "rm", "rebuild", "services.rebuild", "capacity.get", "instances.list"] {
-            assert!(refuse_new_work(m, true).is_ok(), "{m}");
+            assert!(refuse_new_work(m, &lending, true).is_ok(), "{m}");
         }
-        assert!(refuse_new_work("run", false).is_ok());
+        assert!(refuse_new_work("run", &lending, false).is_ok());
+        // `drain` is the lending link's: an ssh machine's peer still runs.
+        let ssh = Peer { name: "lap".into(), fleet_root: None, env: None };
+        assert!(refuse_new_work("run", &ssh, true).is_ok());
     }
 
     #[test]
@@ -685,6 +738,18 @@ mod tests {
         assert_eq!(code("instances.procs", json!({"instances": ["in", "own"]})), "not-found");
         assert!(admit("containers.logs", json!({"container": "devsandbox-in"}), &s, &state).is_ok());
         assert_eq!(code("containers.inspect", json!({"container": "devsandbox-own"})), "not-found");
+        // A reached root's service containers, global or isolated; not another root's.
+        let svc = |dir: &Path, rest: &str| {
+            crate::commands::services::service_container(&crate::commands::services::project_id(dir).unwrap(), rest)
+        };
+        assert!(admit("containers.logs", json!({"container": svc(&cfg, "db")}), &s, &state).is_ok());
+        assert!(admit("containers.inspect", json!({"container": svc(&cfg, "id-in-db")}), &s, &state).is_ok());
+        assert_eq!(code("containers.logs", json!({"container": svc(&base.join("mine"), "db")})), "not-found");
+
+        // `all`: only while every instance in `state.toml` is reached.
+        let e = admit("stop", json!({"root": cfg, "all": true}), &s, &state).unwrap_err();
+        assert_eq!(e.code, "denied");
+        assert!(e.message.contains("machine trust full"), "{}", e.message);
 
         // Sessions: the root confined and needed, the instance lent.
         assert_eq!(ok("sessions.list", json!({"root": cfg, "instance": "id-in"})), json!({"root": cfg, "instance": "id-in"}));
@@ -747,6 +812,19 @@ mod tests {
         assert_eq!(code("sandboxes.list", json!({"root": mine.join("nested")})), "denied", "not what's nested in one");
         assert_eq!(code("sandboxes.list", json!({"root": base.join("other")})), "denied", "nor another path");
         assert_eq!(code("sandboxes.list", json!({"root": mine.join("nested/..")})), "denied", "`..`");
+        // Every instance reached: `all` goes (`own` here, `in` under the fleet root).
+        assert!(admit("start", json!({"root": mine, "all": true}), &s, &r, &state).is_ok());
+        // An ssh machine's peer: no fleet root, so `in`'s root is reached as
+        // an own root (it's in `state.toml`), and so is `all`.
+        let ssh = Reach { fleet_root: None, ..r.clone() };
+        let own = own_roots(&State::load_at(&state).unwrap(), None);
+        let ssh = Reach { own: ssh.own.union(&own).cloned().collect(), ..ssh };
+        assert!(admit("stop", json!({"root": root.join("cfg"), "all": true}), &s, &ssh, &state).is_ok());
+        // Its verbs keep the env the relay set (`Peer.env` is `None`).
+        let attached = Peer { name: "lap".into(), fleet_root: None, env: None };
+        let sent = json!({"root": mine, "instance": "own", "env": {"SSH_AUTH_SOCK": "/run/agent-machine_lap.sock"}});
+        assert_eq!(admit("stop", sent.clone(), &attached, &ssh, &state).unwrap(), sent);
+        assert_eq!(admit("config.migrate", json!({"root": mine}), &s, &ssh, &state).unwrap_err().code, "denied");
         // Its instances are named, verbs reach them.
         assert!(admit("instances.done", json!({"instance": "own", "done": true}), &s, &r, &state).is_ok());
         assert!(admit("stop", json!({"root": mine, "instance": "web"}), &s, &r, &state).is_ok(), "both matches reached");

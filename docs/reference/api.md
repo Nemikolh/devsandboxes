@@ -22,7 +22,7 @@ checks the typings against the wire structs).
 
 | group | methods | `machine`? |
 |---|---|---|
-| connection | `hello`, `subscribe`, `unsubscribe`, `shutdown` | no |
+| connection | `hello`, `subscribe`, `unsubscribe`, `shutdown`, `link.attach` (internal) | no |
 | Inbox | `inbox.threads.list`, `inbox.thread.get\|markRead\|act\|reply\|done\|reopen`, `inbox.form.saveDraft\|submit`, `inbox.notify.dismiss\|markRead` | no |
 | instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|done` | yes |
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
@@ -121,22 +121,38 @@ absent otherwise (`confirm` included).
 
 ### Remote callers
 
-A fleet hub's connection over the lending link is served with this
-member's trust table
+A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
-its `member.toml` per request. `member.*` and `link.*` are `denied` under
+its `member.toml` per request: a fleet hub's over the lending link, and
+the connection of a host that linked this one as a machine (its relay's,
+after `link.attach`, below). `member.*` and `link.*` are `denied` under
 either trust, as is a hello's handoff. Under `trust = "worker"` (the
-default) the hub may call `hello`, `subscribe` / `unsubscribe`
+default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
-`roots.list` and the verbs (never with `all`), never with `machine` or
-`machines: true`; every `root` / `dir` must be under this member's fleet
-root or exactly one of its own roots (`roots.list`'s plus `member.toml`'s
-`roots`), every named instance one of theirs; `config.migrate` /
-`config.ack` only under the fleet root; answers and pushed snapshots are
-cut to those roots' instances. Anything else is `denied`. Under `full`
-the hub has the API a local client has. An ssh machine's `api --stdio`
-connection is a local client's.
+`roots.list` and the verbs (`all` only while every instance here is in
+reach), never with `machine` or `machines: true`; every `root` / `dir`
+must be under this member's fleet root (a hub's) or exactly one of its
+own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
+instance or container one of theirs; `config.migrate` / `config.ack`
+only under the fleet root; answers and pushed snapshots are cut to those
+roots' instances. Anything else is `denied`, naming `devsandbox machine
+trust full` (run on this member) as what opens it. Under `full` the
+caller has the API a local client has.
+
+### `link.attach`
+
+Internal (not in the npm typings): what a machine link's relay
+(`api --stdio --session-env`, *Relay*) sends as its connection's first
+line, before relaying the linking host's bytes. From then on that
+connection is a remote caller's (*Remote callers*); there is no way back.
+
+| params | result | errors |
+|---|---|---|
+| `{"peer": name}`: the linking host's name, 1 to 255 bytes, no control characters; logged | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer`) |
+
+Verbs on an attached connection keep the `env` they carry: the relay
+already set it.
 
 ## Inbox threads
 
@@ -995,7 +1011,8 @@ The API never parses a qualified name: requests carry `machine`.
 BatchMode=yes [-p N] -- <host> 'exec "$SHELL" -lc "exec <command> api
 --stdio --client machine:<this host> --session-env"'`: the remote's relay
 (*Relay*), in the user's login shell there, lazy-starting the remote
-daemon. `BatchMode`: the daemon has no TTY, so ssh fails instead of
+daemon and attaching the connection (`link.attach`), so the machine's
+trust applies to everything sent over it (*Remote callers*). `BatchMode`: the daemon has no TTY, so ssh fails instead of
 prompting. No `-A`: for a machine with `agent` on, the daemon runs an agent
 relay over an ssh of its own while the machine is wanted
 ([machines.md](../architecture/daemon/machines.md#agent)), serving the
@@ -1135,7 +1152,7 @@ next dial offers the new state.
 This host as a fleet member: `member.toml`
 ([fleet.md](../architecture/daemon/fleet.md#member-member)). The daemon is
 its only writer; `[allow]`, `[caps]` and `dev-builds` are edited by hand
-and have no param. Local only: both are denied on a fleet hub's
+and have no param. Local only: both are denied on a remote caller's
 connection under either trust (*Remote callers*).
 
 | method | params | result | errors |
@@ -1330,7 +1347,7 @@ Exit status:
 |---|---|
 | 0 | stdin hit EOF: the relay shuts its write half, so the daemon answers what's in flight and hangs up; waited for up to 5 s. Also when stdout is gone |
 | 75 | the daemon closed the connection first (it exited: idle, handoff, killed); run the relay again, which starts a new one |
-| 1 | it couldn't connect (the daemon didn't start within 5 s; see `serve.log`) |
+| 1 | it couldn't connect (the daemon didn't start within 5 s; see `serve.log`); with `--session-env`, also the daemon refusing its `link.attach` |
 
 The relay is a client like any other: it holds the daemon while it runs,
 so hang up (close its stdin) when done.
@@ -1345,7 +1362,12 @@ A client that isn't a devsandbox binary can send `"version": "0.0.0"`: the
 relay's own hello already handed off an older daemon.
 
 `--session-env` (hidden) is for a machine link's relay (*Machines*): once
-connected to the daemon, the relay first writes a newline and the sentinel
+connected to the daemon, the relay first sends `link.attach` with `peer`
+its `--client` minus a `machine:` prefix (`relay::attach`), reads that
+one answer and relays none of it, so the daemon serves the rest of the
+connection with its trust table (*Remote callers*). A refused attach
+exits 1 with the daemon's reason on stderr, the daemon hanging up first
+75; nothing reaches stdout either way. Then it writes a newline and the sentinel
 line `devsandbox-api 1` to stdout (`relay::write_sentinel`), so the link can
 skip whatever the remote login shell printed before it. The upstream copy
 then goes line by line, and a request whose `method` is a

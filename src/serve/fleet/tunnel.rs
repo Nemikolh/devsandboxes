@@ -339,7 +339,7 @@ services = ["cache"]
         };
         std::fs::create_dir_all(b.join("other")).unwrap();
         let e = error(&served(&scope, &state, &line(Some("own"), None, &b.join("other"))));
-        assert!(e.contains("neither under this member's fleet root nor one of its own roots"), "{e}");
+        assert!(e.contains("isn't one of this member's roots"), "{e}");
         // An own root (`own`'s, from `state.toml`) is reached: here a
         // service no instance of it uses is the refusal.
         std::fs::write(b.join("mine").join(crate::config::CONFIG_FILE), CONFIG).unwrap();

@@ -1171,8 +1171,8 @@ type ConfigStamps = BTreeMap<PathBuf, Vec<Option<(std::time::SystemTime, u64)>>>
 enum Table {
     /// A local client: the whole API.
     Full,
-    /// A remote caller (a fleet hub over the lending link): the trust table
-    /// (`fleet::lent`).
+    /// A remote caller (a fleet hub over the lending link, or a relay
+    /// connection after its `link.attach`): the trust table (`fleet::lent`).
     Peer(Arc<lent::Peer>),
 }
 
@@ -1263,7 +1263,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             }
             // `drain` is the one hard no: read live from the lending thread.
             let draining = shared.lender.get().is_some_and(|l| l.draining());
-            let admitted = lent::refuse_new_work(&req.method, draining)
+            let admitted = lent::refuse_new_work(&req.method, peer, draining)
                 .and_then(|()| lent::admit(&req.method, std::mem::take(&mut req.params), peer, &reach, &shared.state));
             match admitted {
                 Ok(params) => req.params = params,
@@ -1282,6 +1282,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "hello" => return Some(hello(req.id, req.params, shared, conn)),
         method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
         "helper.call" => return helper_call(req.id, req.params, shared, conn),
+        // Only reached on `Full`: the trust table refuses `link.*`.
+        "link.attach" => return Some(link_attach(req.id, &req.params, shared, conn)),
         _ => {}
     }
     // On a machine: the remote's answer as is
@@ -1356,6 +1358,38 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Response::err(req.id, e.code, e.message)
         }
     })
+}
+
+/// `link.attach {peer}`: a relay of this user (`api --stdio
+/// --session-env`, what a host linking this one as an ssh machine runs)
+/// says the rest of this connection is that host's. The connection is
+/// served with the trust table from here on (`Table::Peer`, no fleet root,
+/// the env as sent: the relay set it), its pushed snapshots filtered too.
+/// One-way: nothing turns it back to `Full`, and a second attach is
+/// refused by the table itself.
+fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut ConnState) -> Response {
+    if !matches!(conn.table, Table::Full) || !conn.own_user {
+        return Response::err(id, "denied", "`link.attach` is for this user's own relay connections");
+    }
+    let name = match lent::attach_peer(params) {
+        Ok(name) => name,
+        Err(e) => return Response::err(id, e.code, e.message),
+    };
+    let peer = Arc::new(lent::Peer { name: name.clone(), fleet_root: None, env: None });
+    let files = shared.reach_files();
+    let (reach, warning) = lent::Reach::load(&files, None);
+    if let Some(w) = warning {
+        log(&format!("{}: {w}", conn.label()));
+    }
+    let filtered = (Arc::clone(&peer), files);
+    conn.out.post(|p| {
+        p.reach = Some(filtered);
+        false
+    });
+    conn.table = Table::Peer(peer);
+    let trust = serde_json::to_value(reach.trust).unwrap_or(Value::Null);
+    log(&format!("{}: link from {name}, trust {}", conn.label(), trust.as_str().unwrap_or("?")));
+    Response::ok(id, json!({ "ok": true, "trust": trust }))
 }
 
 /// An `api.rs` method, answered by this host.
@@ -2757,6 +2791,62 @@ pub(crate) mod tests {
         assert!(matches!(h, Hello::Handoff));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Handoff);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relay's `link.attach` turns its connection into a `Peer` one: the
+    /// trust table from there on, read per request from `member.toml`.
+    #[test]
+    fn an_attached_connection_gets_the_trust_table() {
+        use crate::serve::fleet::member::{self, Member};
+        let dir = scratch("attach");
+        let data = scratch("attach-data");
+        let (own, other) = (data.join("own"), data.join("other"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let (own, other) = (std::fs::canonicalize(own).unwrap(), std::fs::canonicalize(other).unwrap());
+        let state = data.join("state.toml");
+        let instance = "[instance.w]\ninstance_id = \"id-w\"\nsandbox = \"web\"\ncontainer = \"devsandbox-w\"\n\
+                        folder = \"/w\"\nworkspace = \"/w\"\ncreated_unix = 1\n";
+        std::fs::write(&state, format!("{instance}config_dir = {:?}\n", own.to_str().unwrap())).unwrap();
+        let options = Options { state: Some(state), lend: Some(data.join("lend.toml")), ..opts(1, 1000) };
+        let daemon = spawn_daemon(&dir, options);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            if let Ok(s) = endpoint::connect(&dir) {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "daemon never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(super::super::relay::attach(&stream, "lap.local").unwrap(), "worker");
+        let Hello::Ready(hello) = client::hello(&mut stream, &v(1), "machine-link").unwrap() else { panic!("no hello") };
+        let mut conn = client::Conn::new(stream, hello).unwrap();
+        let code = |conn: &mut client::Conn, method: &str, params: Value| conn.call(method, params).unwrap().error.map(|e| e.code);
+
+        assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "instances.list", json!({"dir": own})), None, "an own root");
+        assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "machines.list", json!({})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again"})), Some("denied".into()), "one-way");
+
+        // `full` is read per request: the same connection opens up, but
+        // `member.*` and `link.*` stay local.
+        member::write_for_test(&data.join("member.toml"), &Member { trust: crate::worker_policy::Trust::Full, ..Default::default() });
+        assert_eq!(code(&mut conn, "machines.list", json!({})), None);
+        assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), None);
+        assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again"})), Some("denied".into()));
+        drop(conn);
+
+        // A bad `peer` leaves the connection as it was.
+        let mut plain = connect(&dir);
+        assert_eq!(code(&mut plain, "link.attach", json!({"peer": ""})), Some("invalid".into()));
+        assert_eq!(code(&mut plain, "member.get", json!({})), None, "still a local client");
+        drop(plain);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     /// `hub = true` implies keep-alive.

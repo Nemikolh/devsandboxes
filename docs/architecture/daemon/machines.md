@@ -99,6 +99,25 @@ request's `params.env` with its own login-shell env, `SSH_AUTH_SOCK`
 pointed at this host's agent relay socket there while it's up
 ([Agent](#agent)).
 
+`--session-env` also makes the remote relay attach its connection before
+it writes the sentinel or relays a byte (`relay::attach`): one
+`link.attach {peer}` request of its own, `peer` being `--client` without
+its `machine:` prefix (this host's name, `link::client_name`), its answer
+read byte by byte up to its newline and not relayed. From then on the
+remote daemon serves that connection with the machine's trust table
+([fleet](fleet.md#the-trust-table)): under its `trust = "worker"` (the
+default) this host reaches the machine's own roots only (those its
+instances name, plus its `member.toml` `roots`, which `machine add`
+records there), never `machines.*`, `member.*`, `shutdown` or an edit of
+those configs; under `full`, everything but `member.*` and `link.*`. The
+held link and every forwarded verb's connection dial `api_argv`, so both
+go through it. A refused attach (another user's socket, a daemon without
+`link.attach`) ends the relay with exit 1 and the reason on stderr,
+which the link reports as ssh's stderr tail (`LinkError::Closed`); the
+daemon hanging up first is exit 75. The other argvs (`tty_argv`,
+`cli_argv`, `tunnel_argv`, `agent_argv`) are ssh shells on the machine:
+the trust table isn't in their path.
+
 ## Install
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
