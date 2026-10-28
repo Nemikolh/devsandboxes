@@ -1,11 +1,11 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-3 shipped
+Status: in progress. Steps 1-4 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
 built on two kinds of machine (ssh machines and offered workers, `fleet
-join`, `lend`); step 4b replaces that with the model below (ADR
+join`, `lend`; step 4's channels on the fleet link only); step 4b replaces that with the model below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
 proposed). The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
@@ -88,9 +88,10 @@ thing that is a fresh ssh to a machine today (P11) becomes a channel:
 |---|---|
 | `api_argv`: the link | `API`: a client of the member's API, within its trust |
 | a fresh dial per forwarded verb | one `API` channel per verb (a hang-up is the channel's close) |
-| `tty_argv`, `cli_argv`: terminals, CLI re-runs | `PTY`: a session attach with resize (step 4) |
+| `tty_argv`: terminals | `PTY`: a session attach with resize (step 4) |
+| `cli_argv`: CLI re-runs | `API` calls within the member's trust (decision 15) |
 | `tunnel_argv`: forwards | `TUNNEL`: a forward's bridge, its `Connect` streams inside |
-| `agent_argv` | `SSH_AGENT`, [Credentials](#credentials) |
+| `agent_argv` | `AGENT`, [Credentials](#credentials) |
 | — | `TRANSFER`: binaries, bundles and tars |
 
 A routed channel's `Dial` returns a `Duplex`, so `client::Conn`,
@@ -284,7 +285,7 @@ version, installs it and lets its own version handoff restart its daemon
 
 ### Credentials
 
-The hub's agent reaches the member's instances over `SSH_AGENT` while
+The hub's agent reaches the member's instances over `AGENT` while
 the hub's registry entry for the member has `agent = true`, as the agent
 relay does for a machine today: every instance on the member, not only
 placed ones (decision 14). The hub's agent is whatever the hub has: a
@@ -310,12 +311,13 @@ for its daemon-owned runs.
    and warnings; a placed run gets the config root as a tar and a bundle
    the hub cloned from `origin` (committed, pushed work only); `--here`;
    image tags and feature build dirs namespaced by config root (P9).
-4. **Interactive over the link** (M). `PTY` (exec, terminal tabs, the
-   reconnecting `exec`), `TUNNEL` forwards, `SSH_AGENT`. Step 4b needs
+4. **Interactive over the link** (M, shipped on offered workers' links). `PTY` (exec, terminal tabs, the
+   reconnecting `exec`), `TUNNEL` forwards, `AGENT`, CLI re-runs as
+   API calls. Step 4b needs
    it: the per-use ssh argvs go there.
    `PTY` is a session attach ([resumable-exec](resumable-exec.md)): the
    channel opens with `{instance, session id, create|attach}` and ends
-   with a structured record (`exit <code>` | `gone` | `detached` |
+   with a structured record (`exit <code>` | `no-session` | `detached` | `version` |
    `lost`); a link drop is `lost`, never an exit, and records are
    relayed unchanged by every hop. Session `ls`/`rm` within the caller's
    trust. The member's daemon attaches directly (decision 13).
@@ -389,7 +391,8 @@ Numbered as code cites them; 1, 2, 3, 7 and 9 as step 4b makes them,
 6. Until step 4, paths that need ssh to the machine (`exec`, terminal
    tabs, forwards, CLI re-runs) refuse on an offered machine with
    `needs fleet step 4` wording; `logs` / `inspect` use the
-   `containers.*` quick calls.
+   `containers.*` quick calls. (Spent: step 4 shipped; what an offered
+   machine still refuses is in `docs/status.md`.)
 7. Every link is always held (no `Want` / linger).
 8. Capacity: cpus / memory total from `docker info` (`NCPU`,
    `MemTotal`, cached 60 s); free memory and free disk only for a native
@@ -415,7 +418,7 @@ Numbered as code cites them; 1, 2, 3, 7 and 9 as step 4b makes them,
     helper-less instances and instances whose helper daemon isn't root
     (`session.attach` is `needs_root`, e.g. `containerUser`) refuse over
     the link.
-14. `SSH_AGENT` on the link keeps the agent relay's semantics: the linking
+14. `AGENT` on the link keeps the agent relay's semantics: the linking
     host's agent, while its registry entry has `agent = true`, reaches
     every instance on the machine (not only placed ones as
     [Credentials](#credentials) first said).

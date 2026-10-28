@@ -330,8 +330,7 @@ The "now" part shipped as four commits (4a-4d). Landmarks are from recon
   Every key it takes is a key the program can't get, and closing the
   tab/terminal already detaches. Proposal: none for now, an opt-in later
   if missed.
-- **Relation to [helper-rpc](helper-rpc.md)**'s `run.attach`: sessions
-  stay on `exec -it` (that plan keeps interactive exec out of scope); if
-  `RPC` lands, `run.attach` could attach to a session's socket from the
-  daemon side. Decided together with [fleet](fleet.md) step 4's `PTY`,
-  which needs the same daemon-side attach.
+- ~~Relation to [helper-rpc](helper-rpc.md)'s `run.attach`~~ settled by
+  [fleet](fleet.md) step 4 (decision 13): a fleet worker's daemon
+  attaches through `session.attach` over `RPC`; local execs stay on
+  `exec -it`.

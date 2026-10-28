@@ -34,8 +34,9 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 4 (`PTY` over `session.attach`) on,
-  steps 1-3 shipped on the two-kind model step 4b replaces.
+  re-placement: from fleet step 4b (one kind of machine) on, steps 1-4
+  shipped on the two-kind model step 4b replaces (step 4's `PTY`,
+  `TUNNEL` and `AGENT` on offered workers' links only).
   → [plan](plans/active/fleet.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)

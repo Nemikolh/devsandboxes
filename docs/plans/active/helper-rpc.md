@@ -1,6 +1,7 @@
 # Helper RPC: host → in-container daemon requests
 
-Status: steps 1-3 and 8 shipped; steps 4-7 planned (after fleet step 4)
+Status: steps 1-3 and 8 shipped; steps 4-7 planned (fleet step 4, their
+prerequisite, shipped)
 Step 1 shipped: `channel::RPC` / `caps::RPC`, flowing `Open`
 (`proto::channel::flows`, `Mux::on_host_open`), `src/devsbd/rpc.rs`,
 `devsbd/src/rpc_server.rs` with `rpc.methods`.
@@ -334,7 +335,8 @@ design above, found in the code:
 2. Step 1 here first (fleet's link needs its flow-controlled `Open`),
    then steps 2-3 here and [fleet](fleet.md) steps 1-3.
 3. Step 8 here (`session.attach`).
-4. Fleet step 4 (`PTY` over the RPC stream).
+4. Fleet step 4 (`PTY` over the RPC stream; shipped: the fleet
+   worker's daemon is `session.attach`'s first caller, `fleet::pty`).
 5. Steps 4-5 here (daemon-owned runs, restart policy), before fleet step
    6 so dispatcher children on workers don't poll across machines.
 6. Fleet steps 5-9.
