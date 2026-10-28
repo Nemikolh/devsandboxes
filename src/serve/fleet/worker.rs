@@ -118,9 +118,11 @@ struct Ctl {
     /// What the next link offers: `--drain`.
     draining: AtomicBool,
     status: Mutex<Option<Status>>,
-    /// The links' `TRANSFER` side: the daemon's receivers (and the `binary`
-    /// one, [`Incoming`]), the live link's outlet.
-    transfer: Option<link::AnswererTransfer>,
+    /// Who takes the hub's `TRANSFER` streams: the daemon's receivers (and
+    /// the `binary` one, [`Incoming`]).
+    receivers: Option<Arc<Receivers>>,
+    /// The live link's way to open streams toward the hub.
+    outlet: link::Outlet,
     /// How this worker follows its hub's version.
     follow: Option<Follow>,
     incoming: Arc<Incoming>,
@@ -241,9 +243,8 @@ impl Lending {
     ) -> Result<Lending> {
         link_argv(&hub, &name, &root, draining)?;
         let incoming = Arc::new(Incoming::default());
-        let receivers = Arc::new(incoming.receiver(receivers));
-        let transfer = Some(link::AnswererTransfer { receivers, outlet: Default::default() });
-        let ctl = Arc::new(Ctl { transfer, follow: Some(follow), incoming, ..Ctl::default() });
+        let receivers = Some(Arc::new(incoming.receiver(receivers)));
+        let ctl = Arc::new(Ctl { receivers, follow: Some(follow), incoming, ..Ctl::default() });
         ctl.draining.store(draining, Ordering::SeqCst);
         let thread = {
             let ctl = Arc::clone(&ctl);
@@ -275,7 +276,7 @@ impl Lending {
     /// while no link is up.
     #[allow(dead_code)] // first caller: fetch-back (fleet step 5)
     pub fn open_transfer(&self) -> Result<Conn> {
-        self.ctl.transfer.as_ref().context("no transfers")?.outlet.open()
+        self.ctl.outlet.open(crate::devsbd::proto::channel::TRANSFER)
     }
 }
 
@@ -358,12 +359,16 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
     // nothing reaches the `Worker` table until the update is done.
     let receiving = AtomicBool::new(false);
     let mut link_stream = duplex.stream.try_clone().ok();
+    let mut serves = link::Serves::default().with(LINK.channel, || if receiving.load(Ordering::Relaxed) { None } else { open() });
+    if let Some(receivers) = &ctl.receivers {
+        serves = serves.transfers(Arc::clone(receivers));
+    }
     let end = link::answerer_with(
         &LINK,
         reader,
         writer,
-        || if receiving.load(Ordering::Relaxed) { None } else { open() },
-        ctl.transfer.as_ref(),
+        &serves,
+        Some(&ctl.outlet),
         |peer| {
             let theirs = Build::parse(&peer.hash);
             let dev_builds = ctl.follow.as_ref().is_some_and(|f| (f.dev_builds)());
@@ -496,10 +501,12 @@ mod tests {
             let binary = Arc::clone(&binary);
             std::thread::spawn(move || {
                 let spec = link::Spec { hello, ..LINK };
-                let transfer = link::OpenerTransfer { socket: xfer.clone(), receivers: Arc::new(Receivers::new(|_| {})) };
+                let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|_| {})));
                 let (r, w) = (hub.try_clone().unwrap(), hub);
-                link::opener_with(&spec, r, w, &socket, Some(transfer), |peer| {
-                    crate::commands::fleet_link::push_build(hello, &peer.hash, xfer, move || binary());
+                let sockets = [(spec.channel, socket.as_path()), (crate::devsbd::proto::channel::TRANSFER, xfer.as_path())];
+                let push_to = xfer.clone();
+                link::opener_with(&spec, r, w, &sockets, serves, |peer| {
+                    crate::commands::fleet_link::push_build(hello, &peer.hash, push_to, move || binary());
                     Ok(())
                 })
             });

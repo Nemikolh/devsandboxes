@@ -20,8 +20,8 @@ downloaded, a dev one received over `TRANSFER`
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
-(`Spec`, `opener`, `opener_with`, `answerer`, `answerer_with`,
-`OpenerTransfer`, `AnswererTransfer`, `Outlet`, `End`, `write_sentinel`,
+(`Spec`, `cap_of`, `Handler`, `Serves`, `opener`, `opener_with`,
+`answerer`, `answerer_with`, `Outlet`, `End`, `write_sentinel`,
 `match_sentinel`), `src/serve/fleet/transfer.rs` (`Header`, `Received`,
 `send`, `receive`, `Receivers`, `parse_header`, `check_header`,
 `receive_then`, `check_size`, `encode_reply`, `parse_reply`, `digest`),
@@ -34,12 +34,12 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/serve/fleet/offer.rs` (`call`, `Ctx`, `accept`,
 `dial`), `src/commands/fleet_link.rs` (`fleet_link`, `run`),
 `src/serve/endpoint.rs` (`fleet_socket`, `fleet_transfer_socket`,
-`accept_any`), `src/daemon_config.rs`
+`fleet_channel_socket`, `accept_any`), `src/daemon_config.rs`
 (`ServeConfig::hub`), `src/serve/machines/service.rs` (`Hub`,
 `save_loop`, `log_failure`), `src/serve/machines/saved.rs` (`Saved`,
 `of`, `machines`, `load`, `save`, `save_wait`), `src/serve/snapshots.rs`
-(`Machine::set_link`, `Remotes::restore`), `src/devsbd/proto.rs` (`channel::API`, `caps::API`,
-`channel::flows`); the worker side: `src/serve/fleet/lend.rs` (`Lend`,
+(`Machine::set_link`, `Remotes::restore`), `src/devsbd/proto.rs` (`channel::API`, `channel::PTY`,
+`channel::TUNNEL`, `channel::AGENT` and their `caps`, `channel::flows`); the worker side: `src/serve/fleet/lend.rs` (`Lend`,
 `load`, `check`, `update`, `fleet_root`, `fleet_dir_name`, `default_name`),
 `src/serve/fleet/worker.rs` (`Lending`, `Status`, `link_argv`, `Transport`),
 `src/serve/fleet/lender.rs` (`Lender`, `call`, `merge`, `transition`,
@@ -87,40 +87,59 @@ A link is one byte pipe between two hosts (an ssh's stdin/stdout in
 production) carrying the helper's [frame protocol](../helper/protocol.md),
 with the roles of a container's link moved onto the two hosts. A connection
 to a socket on one host becomes a stream on the mux, answered on the other
-host by a connection made there. A `Spec` says what a link carries: its
-sentinel line (`\n<sentinel> <version>\n`), its one channel, the cap that
-says the far end serves it, and the `Hello` hash (the agent relay's is
-informational; on the fleet link it is the build a worker
-[follows](#versions)).
+host by a connection made there. A `Spec` says what a link is: its
+sentinel line (`\n<sentinel> <version>\n`), the channel it stands for
+(the opener requires the peer to serve it), and the `Hello` hash (the
+agent relay's is informational; on the fleet link it is the build a
+worker [follows](#versions)).
 
-- **The opener** (`link::opener`, the in-container daemon's role) gets a
-  reader, a writer and a socket path. It binds a temp name next to the path
-  (0600) and renames it over the path, so the newest opener for a path
-  wins; then it writes the sentinel, exchanges `Hello`s (advertising
-  nothing) and requires the peer's `Hello` caps to include the spec's
-  cap. Its `on_ready` callback runs next, with the peer's `Hello` (its
-  `hash` is the far end's spec `hello`); an error there ends
-  the opener with it. Each accepted connection becomes one `Open { channel }` stream
-  (`Mux::attach`, ids below 2^31); on a flowing channel
-  (`channel::flows`) the stream is flow-controlled. `Open`s from the peer
-  are refused, but for [`TRANSFER`](#transfer). It returns `Ok` when the reader ends or the writer fails,
-  an error when the keepalive (`mux::KEEPALIVE_INTERVAL` /
-  `KEEPALIVE_TIMEOUT`) hears nothing or the listener fails. Exiting
-  unlinks the socket only while it is still its own (same device and
-  inode), never a newer opener's.
-- **The answerer** (`link::answerer`, the host bridge's role) gets a
-  reader, a writer and an `open` callback. It skips what the login shell
-  printed up to the sentinel (`ssh::skip_lines`, at most `SENTINEL_LIMIT`
-  bytes; another sentinel version is a handshake failure saying which side
-  to update), exchanges `Hello`s advertising the cap, and answers each
-  `Open` on the spec's channel with `open()`'s connection (`None` refuses
-  it with `Close`, as is every other channel). `answerer_with`'s
-  `on_ready` gets the opener's `Hello`; its `Err` ends the link before
-  anything is served. It returns an `End`: the
-  handshake failed (with the first line of noise), `on_ready` refused
-  (`Refused`, with why), the keepalive ran
-  `on_dead` (which must end the reader, e.g. kill the ssh), or the stream
-  closed.
+**Channels, from either end.** Each end has a table of the channels it
+serves (`link::Serves`: channel → `Handler`, a callback handing back the
+local end of a stream the peer opens, `None` to refuse it), and its
+`Hello` advertises their caps (`link::cap_of`: `SSH_AGENT`, `API`,
+`TRANSFER`, `PTY`, `TUNNEL`, `AGENT`). An `Open` on a channel missing
+from the table is refused with `Close` and the link stays up. Either end
+opens streams on a channel the other advertised, and only those: the
+opener through one bound socket per channel it opens, the answerer
+through its `Outlet`. Handlers run on the mux's read thread, so they
+return at once: a local connect, or a socket pair whose other end a
+thread of its own takes (`transfer::Receivers::accept`).
+
+- **The opener** (`link::opener_with`, the in-container daemon's role)
+  gets a reader, a writer, its sockets (a channel and a path each) and its
+  table. It binds each socket at a temp name next to its path (0600) and
+  renames it over the path, so the newest opener for a path wins; then it
+  writes the sentinel, exchanges `Hello`s and requires the peer to
+  advertise the spec's channel. Its `on_ready` callback runs next, with
+  the peer's `Hello` (its `hash` is the far end's spec `hello`); an error
+  there ends the opener with it. Each accepted connection (one accept
+  loop over all its sockets, `endpoint::accept_any`) becomes one
+  `Open { channel }` stream on its socket's channel (`Mux::attach`, ids
+  below 2^31), or is dropped unopened when the peer didn't advertise that
+  channel; on a flowing channel (`channel::flows`) the stream is
+  flow-controlled. The peer's `Open`s carry high-bit ids, admitted
+  through `Mux::on_host_open` and answered from its table. It returns
+  `Ok` when the reader ends or the writer fails, an error when the
+  keepalive (`mux::KEEPALIVE_INTERVAL` / `KEEPALIVE_TIMEOUT`) hears
+  nothing or a listener fails. Exiting unlinks each socket only while it
+  is still its own (same device and inode), never a newer opener's.
+  `link::opener` is the one-socket case: the spec's channel, nothing
+  served.
+- **The answerer** (`link::answerer_with`, the host bridge's role) gets a
+  reader, a writer, its table and optionally an `Outlet`. It skips what
+  the login shell printed up to the sentinel (`ssh::skip_lines`, at most
+  `SENTINEL_LIMIT` bytes; another sentinel version is a handshake failure
+  saying which side to update), exchanges `Hello`s, and answers each
+  `Open` from its table. Its `on_ready` gets the opener's `Hello`; its
+  `Err` ends the link before anything is served. The outlet is set to the
+  link from the `Hello`s until it ends: `Outlet::open(channel)` opens a
+  stream toward the opener (`Mux::open_host`: a high-bit id, flowing
+  channels only), an error when no link is up or the opener didn't
+  advertise the channel. It returns an `End`: the handshake failed (with
+  the first line of noise), `on_ready` refused (`Refused`, with why), the
+  keepalive ran `on_dead` (which must end the reader, e.g. kill the ssh),
+  or the stream closed. `link::answerer` is the one-channel case: the
+  spec's channel served by an `open` callback, no outlet.
 
 Two specs exist:
 
@@ -129,14 +148,21 @@ Two specs exist:
 | `machines::agent::SPEC` | `devsandbox-agent 1` | `SSH_AGENT` (legacy) | `caps::SSH_AGENT` | `commands::agent_relay::run` / `machines::agent::serve` |
 | `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run` (on the hub) / the worker's lending thread (`fleet::worker`) |
 
-On `fleet::LINK` each connection to the opener's socket is one connection
-to whatever daemon socket the answerer's `open` connects, so a
+The agent relay uses the one-channel cases (`link::opener`,
+`link::answerer`). On `fleet::LINK` the hub's opener binds
+`endpoint::fleet_socket` for `API` and `endpoint::fleet_transfer_socket`
+for `TRANSFER` (a further channel's socket is
+`endpoint::fleet_channel_socket`, `fleet-<name>.<suffix>.sock`) and
+serves `TRANSFER`; the worker's answerer serves `API` and `TRANSFER`. No
+end serves `PTY`, `TUNNEL` or `AGENT` yet. Each connection to the API
+socket is one connection to whatever daemon socket the answerer's `API`
+handler connects, so a
 `client::Conn` on the opener's host says its hello to, and calls, a daemon
 on the answerer's host.
 
 **The sentinel rule.** An `API` stream starts with the API relay's own
 sentinel line, `\n` + `devsandbox-api 1\n` (`relay::write_sentinel`): the
-answerer's `open` hands back a daemon connection that writes that line
+answerer's `API` handler hands back a daemon connection that writes that line
 before the daemon's bytes. So a stream reads exactly like an ssh machine's
 relay, and `machines::link::handshake` (which skips to that line, then
 says its hello) works on it unchanged.
@@ -144,11 +170,10 @@ says its hello) works on it unchanged.
 ## Transfer
 
 A link may also carry bulk transfers on flowing `TRANSFER` streams, in
-both directions; `fleet::LINK`'s two ends do (`link::opener_with` with an
-`OpenerTransfer`, `link::answerer_with` with an `AnswererTransfer`), the
-agent relay's don't. Both ends then advertise `caps::TRANSFER` in their
-`Hello`s; the opener requires it of the peer, the answerer opens toward
-the opener only when the opener advertised it.
+both directions; `fleet::LINK`'s two ends do (each serving `TRANSFER`
+through `link::Serves::transfers`), the agent relay's don't. Both ends
+then advertise `caps::TRANSFER` in their `Hello`s, and each opens
+`TRANSFER` streams only toward a peer that advertised it.
 
 **One transfer per stream** (`serve::fleet::transfer`):
 
@@ -200,12 +225,13 @@ root); `commands::fleet_link::run`'s receivers are empty.
 unlinked like `fleet-<name>.sock`, one accept loop over both:
 `endpoint::accept_any`); each connection there is one `Open { TRANSFER }`
 (an id below 2^31) to the worker, so a hub process connects and calls
-`transfer::send` on it. The worker's answerer hands it to its receivers.
+`transfer::send` on it. The worker's `TRANSFER` handler hands it to its
+receivers.
 
 **Worker → hub.** The answerer opens with high-bit ids
-(`Mux::open_host`, through its `Outlet`, set from the `Hello`s until the
-link ends; `Lending::open_transfer` on the worker), and the opener admits
-them through `Mux::on_host_open` (`TRANSFER` only) into its receivers. So
+(`Outlet::open(TRANSFER)`; `Lending::open_transfer` on the worker), and
+the opener answers them from its table, its `TRANSFER` handler handing
+them to its receivers. So
 the two directions never share an id space.
 
 ## Moving code

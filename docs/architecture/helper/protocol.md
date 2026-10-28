@@ -75,14 +75,21 @@ peer advertising `caps::API`, each stream one connection to a host
 daemon's API. `TRANSFER` = 7: never on a container's link either; one bulk
 transfer between two hosts' link ends (a header line, the body, a one-line
 answer: [fleet](../daemon/fleet.md#transfer)), opened by either end toward
-a peer advertising `caps::TRANSFER`: the end with the socket with ids below
-2^31, the other end with high-bit ids, which the first admits through
-`Mux::on_host_open`.
+a peer advertising `caps::TRANSFER`. `PTY` = 8 (an interactive terminal),
+`TUNNEL` = 9 (a forward's bridge, its `Connect` streams inside) and
+`AGENT` = 10 (one ssh-agent connection: the flowing sibling of the
+containers' `SSH_AGENT`): host-to-host only as well, opened by either end
+toward a peer advertising `caps::PTY` / `caps::TUNNEL` / `caps::AGENT`, a
+stream's header in its first bytes, as `TRANSFER`'s is (the `Open` payload
+stays one channel byte). Between two hosts' link ends the end with the
+sockets opens with ids below 2^31, the other end with high-bit ids, which
+the first admits through `Mux::on_host_open`; each end answers from the
+table of channels it serves (`serve::fleet::link::Serves`).
 
 Whether a channel's streams are legacy or flow-controlled (see
 [Mux](#mux)) is a property of the channel, `proto::channel::flows`, so both
-ends agree without a flag on the wire: `RPC`, `API` and `TRANSFER` flow,
-the rest are legacy.
+ends agree without a flag on the wire: `RPC`, `API`, `TRANSFER`, `PTY`,
+`TUNNEL` and `AGENT` flow, the rest are legacy.
 
 ### Caps
 
@@ -92,7 +99,10 @@ Bitset, unknown bits ignored: `TCP_FORWARD` (daemon serves `Connect`),
 `devsbd/src/daemon.rs`), `SSH_AGENT`, `NOTIFY`, `CONTROL` (host serves
 those channels), `API` (a fleet link's answerer serves `channel::API`;
 host-to-host only), `TRANSFER` (the peer receives `channel::TRANSFER`;
-both ends of a fleet link, host-to-host only). The host sends
+both ends of a fleet link, host-to-host only), `PTY`, `TUNNEL`, `AGENT`
+(bits 8–10: the peer serves that channel; host-to-host only). A link end
+advertises the caps of the channels it serves
+(`serve::fleet::link::cap_of`). The host sends
 `Caps` after the handshake (`SSH_AGENT` only when it has a live agent;
 `NOTIFY | CONTROL` only on the serve daemon's bridges). Until a bridge's
 `Caps` arrives the daemon treats it as capable of nothing, except a bridge
@@ -168,7 +178,7 @@ Two stream kinds share a connection:
   local socket, which is how request/response streams work: the daemon sends
   the request then `Eof`, the host replies and closes.
 - **Flow-controlled** (`Connect`: forwarded TCP; `Open` on a flowing
-  channel: `RPC`, `API`, `TRANSFER`). Both ends register the stream as flowing: the opener in
+  channel: `RPC`, `API`, `TRANSFER`, `PTY`, `TUNNEL`, `AGENT`). Both ends register the stream as flowing: the opener in
   `Mux::connect` / `Mux::open_host` (the host's `Open`, handing the caller
   one end of a socket pair), the acceptor when it admits the `Open`. Per-direction credit
   starting at `INITIAL_WINDOW` (256 KiB), `Window` granted once half is

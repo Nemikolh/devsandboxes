@@ -89,7 +89,7 @@ thing that is a fresh ssh to a machine today (P11) becomes a channel:
 | `api_argv`: the link | `API`: a client of the member's API, within its trust |
 | a fresh dial per forwarded verb | one `API` channel per verb (a hang-up is the channel's close) |
 | `tty_argv`, `cli_argv`: terminals, CLI re-runs | `PTY`: a session attach with resize (step 4) |
-| `tunnel_argv`: forwards | `CONNECT`: the forwarder's existing streams |
+| `tunnel_argv`: forwards | `TUNNEL`: a forward's bridge, its `Connect` streams inside |
 | `agent_argv` | `SSH_AGENT`, [Credentials](#credentials) |
 | — | `TRANSFER`: binaries, bundles and tars |
 
@@ -145,7 +145,7 @@ hub's role adds the member list, the graph and placement, not access.
 
 - `worker`: a remote caller reaches
   - **the member's own roots**: snapshots, quick calls, verbs (`run`,
-    `start`, `stop`, `rebuild`, `rm`), `PTY` and `CONNECT` into those
+    `start`, `stop`, `rebuild`, `rm`), `PTY` and `TUNNEL` into those
     instances, which run as the member's config says. Never an edit of
     those configs or files (`config.*`, a `TRANSFER` into them), and
     never a move of them off the member unless the request started on the
@@ -284,11 +284,15 @@ version, installs it and lets its own version handoff restart its daemon
 
 ### Credentials
 
-A placed child gets the hub's agent over `SSH_AGENT`, served on the
-member only to placed instances (its bridges pick it for fleet-root
-instances, never for the member's own). The hub's agent is whatever the
-hub has: a dedicated key on the server (deploy or user key), not a
-laptop's. A member's own agent never leaves it.
+The hub's agent reaches the member's instances over `SSH_AGENT` while
+the hub's registry entry for the member has `agent = true`, as the agent
+relay does for a machine today: every instance on the member, not only
+placed ones (decision 14). The hub's agent is whatever the hub has: a
+dedicated key on the server (deploy or user key), not a laptop's. A
+member's own agent never leaves it. Step 4b revisits whether placed
+instances only get the hub's agent, and whether a member's own instances
+started from another machine get the member's own agent (open question
+below).
 
 ## Rollout
 
@@ -307,17 +311,14 @@ for its daemon-owned runs.
    the hub cloned from `origin` (committed, pushed work only); `--here`;
    image tags and feature build dirs namespaced by config root (P9).
 4. **Interactive over the link** (M). `PTY` (exec, terminal tabs, the
-   reconnecting `exec`), `CONNECT` forwards, `SSH_AGENT`. Step 4b needs
+   reconnecting `exec`), `TUNNEL` forwards, `SSH_AGENT`. Step 4b needs
    it: the per-use ssh argvs go there.
    `PTY` is a session attach ([resumable-exec](resumable-exec.md)): the
    channel opens with `{instance, session id, create|attach}` and ends
    with a structured record (`exit <code>` | `gone` | `detached` |
    `lost`); a link drop is `lost`, never an exit, and records are
    relayed unchanged by every hop. Session `ls`/`rm` within the caller's
-   trust. Decide first whether the member's daemon attaches to the
-   session's `sock` directly (proposed: drops the in-container client and
-   the `exec -it` hop, settles helper-rpc's `run.attach`) or goes through
-   `<runtime> exec -it` as the ssh path does.
+   trust. The member's daemon attaches directly (decision 13).
 4b. **One kind of machine** (L). [Members, links and the hub](#members-links-and-the-hub)
    through [Trust](#trust-worker-or-full): `machines::Kind` gone
    (entries are this host's links); every link held, either end opening
@@ -372,7 +373,8 @@ for its daemon-owned runs.
 
 ## Decisions
 
-Numbered as code cites them; 1, 2, 3, 7 and 9 as step 4b makes them.
+Numbered as code cites them; 1, 2, 3, 7 and 9 as step 4b makes them,
+13–16 as step 4 does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
    setting.
@@ -407,6 +409,21 @@ Numbered as code cites them; 1, 2, 3, 7 and 9 as step 4b makes them.
     sends a bundle over `TRANSFER`; a placed member never needs
     credentials. Pulls a slice of step 5 forward (bundle of committed
     refs only).
+13. `PTY` is a direct attach: the member's daemon calls the helper's
+    `session.attach` over the bridge's RPC (`HelperClient::call_with_input`),
+    no `exec -it` and no in-container client; service terminals,
+    helper-less instances and instances whose helper daemon isn't root
+    (`session.attach` is `needs_root`, e.g. `containerUser`) refuse over
+    the link.
+14. `SSH_AGENT` on the link keeps the agent relay's semantics: the linking
+    host's agent, while its registry entry has `agent = true`, reaches
+    every instance on the machine (not only placed ones as
+    [Credentials](#credentials) first said).
+15. CLI re-runs to a member are API calls within its trust (quick calls,
+    snapshots, verbs), never a `devsandbox …` run there.
+16. Step 4 builds the channels on `fleet::LINK` (offered workers); ssh
+    machines keep their per-use argvs until step 4b makes every link a
+    fleet link.
 
 ## Open questions
 

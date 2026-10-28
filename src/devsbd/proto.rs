@@ -70,13 +70,27 @@ pub mod channel {
     /// opened by either end toward a peer that advertised `caps::TRANSFER`;
     /// never used with a container.
     pub const TRANSFER: u8 = 7;
+    /// An interactive terminal between two hosts' `serve::fleet::link`
+    /// ends, its attach header in the stream's first bytes; opened toward a
+    /// peer that advertised `caps::PTY`; never used with a container.
+    pub const PTY: u8 = 8;
+    /// A forward's bridge between two hosts' `serve::fleet::link` ends (its
+    /// `Connect` streams inside), its target in the stream's first bytes;
+    /// opened toward a peer that advertised `caps::TUNNEL`; never used with a
+    /// container.
+    pub const TUNNEL: u8 = 9;
+    /// One ssh-agent connection between two hosts' `serve::fleet::link`
+    /// ends: the flowing sibling of the containers' legacy `SSH_AGENT`,
+    /// opened toward a peer that advertised `caps::AGENT`; never used with a
+    /// container.
+    pub const AGENT: u8 = 10;
 
     /// Whether `Open` on `channel` makes a flow-controlled stream (window
     /// credit, `Eof` half-close, its own writer thread, like `Connect`) rather
     /// than a legacy one. A property of the channel, so both ends agree
     /// without a flag on the wire.
     pub const fn flows(channel: u8) -> bool {
-        matches!(channel, RPC | API | TRANSFER)
+        matches!(channel, RPC | API | TRANSFER | PTY | TUNNEL | AGENT)
     }
 }
 
@@ -119,6 +133,15 @@ pub mod caps {
     /// link).
     #[allow(dead_code)] // host-only: devsbd never sends it
     pub const TRANSFER: u32 = 1 << 7;
+    /// The peer answers `channel::PTY` streams (a fleet link's end).
+    #[allow(dead_code)] // host-only: devsbd never sends it
+    pub const PTY: u32 = 1 << 8;
+    /// The peer answers `channel::TUNNEL` streams (a fleet link's end).
+    #[allow(dead_code)] // host-only: devsbd never sends it
+    pub const TUNNEL: u32 = 1 << 9;
+    /// The peer answers `channel::AGENT` streams (a fleet link's end).
+    #[allow(dead_code)] // host-only: devsbd never sends it
+    pub const AGENT: u32 = 1 << 10;
 }
 
 /// Upper bound on the processes one `PortInfo` lists; the helper stops

@@ -2,10 +2,11 @@
 //! plan docs/plans/active/fleet.md). So far its link primitive and both
 //! sides of a worker's link:
 //!
-//! - `link`: the two ends of a host-to-host frame-mux link carrying one
-//!   channel, generic over its sentinel line and channel ([`link::Spec`]);
-//!   the machines' agent relay runs on it, and [`LINK`] is the fleet
-//!   link's spec (the `API` channel).
+//! - `link`: the two ends of a host-to-host frame-mux link, generic over
+//!   its sentinel line and channel ([`link::Spec`]), each end serving its
+//!   own table of channels ([`link::Serves`]) and opening the peer's; the
+//!   machines' agent relay runs on it, and [`LINK`] is the fleet link's
+//!   spec (the `API` channel).
 //! - `offer`: `fleet.offer`, which registers an offered worker in
 //!   `machines.toml`, and the [`offer::dial`] that reaches one through its
 //!   `fleet-link` socket (`commands::fleet_link` is that opener).
@@ -41,15 +42,15 @@ pub mod transfer;
 pub mod update;
 pub mod worker;
 
-use crate::devsbd::proto::{caps, channel};
+use crate::devsbd::proto::channel;
 
 /// The fleet link: a worker's daemon's API, one flowing `API` stream per
 /// connection to the opener's socket. Its sentinel is `devsandbox-fleet 1`.
 /// Each `API` stream starts with the API relay's own sentinel line
 /// (`relay::write_sentinel`), written by the worker's answer, so a stream
 /// reads as an ssh relay does to `machines::link::handshake`. Both ends
-/// also carry `TRANSFER` streams ([`transfer`], `link::opener_with` /
-/// `link::answerer_with`). Its `Hello` hash is this build
+/// also serve `TRANSFER` streams ([`transfer`], `link::Serves::transfers`).
+/// Its `Hello` hash is this build
 /// ([`update::HELLO`]), which a worker follows (`worker`).
 pub const LINK: link::Spec = link::Spec {
     name: "fleet link",
@@ -57,6 +58,5 @@ pub const LINK: link::Spec = link::Spec {
     sentinel: "devsandbox-fleet",
     sentinel_version: 1,
     channel: channel::API,
-    cap: caps::API,
     hello: update::HELLO,
 };

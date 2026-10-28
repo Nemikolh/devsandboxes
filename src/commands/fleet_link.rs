@@ -36,6 +36,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
+use crate::devsbd::proto::channel;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
 use crate::serve::fleet::transfer::Receivers;
@@ -59,7 +60,7 @@ pub fn fleet_link(worker: &str, root: &Path, draining: bool) -> Result<()> {
 /// The link over `reader`/`writer` with its socket in `dir`: bind, sentinel
 /// and `Hello`s (the peer must serve `API`), then the offer on the
 /// connection `daemon` opens, held until the link ends; then accept and
-/// relay (`link::opener`). `Ok` when the worker went away.
+/// relay (`link::opener_with`). `Ok` when the worker went away.
 pub fn run(
     reader: impl Read + Send + 'static,
     writer: impl Write + Send + 'static,
@@ -74,13 +75,15 @@ pub fn run(
         bail!("--root {} isn't an absolute path", root.display());
     }
     let mut held: Option<Conn> = None;
-    let socket = endpoint::fleet_transfer_socket(dir, worker);
-    let transfer = link::OpenerTransfer { socket: socket.clone(), receivers: Arc::new(Receivers::new(|m| eprintln!("{m}"))) };
-    let end = link::opener_with(&fleet::LINK, reader, writer, &endpoint::fleet_socket(dir, worker), Some(transfer), |peer| {
+    let (api, socket) = (endpoint::fleet_socket(dir, worker), endpoint::fleet_transfer_socket(dir, worker));
+    let sockets = [(fleet::LINK.channel, api.as_path()), (channel::TRANSFER, socket.as_path())];
+    let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|m| eprintln!("{m}"))));
+    let push_to = socket.clone();
+    let end = link::opener_with(&fleet::LINK, reader, writer, &sockets, serves, |peer| {
         let mut conn = daemon()?;
         offer(&mut conn, worker, &peer.hash, root, draining)?;
         held = Some(conn);
-        push_build(fleet::LINK.hello, &peer.hash, socket, own_binary);
+        push_build(fleet::LINK.hello, &peer.hash, push_to, own_binary);
         Ok(())
     });
     drop(held);
@@ -187,8 +190,8 @@ mod tests {
                 let duplex = ssh::test_support::relayed(endpoint::connect(&daemon).ok()?).ok()?;
                 Some(duplex.stream.into())
             };
-            let transfer = link::AnswererTransfer { receivers: Arc::new(Receivers::new(|_| {})), outlet: Default::default() };
-            link::answerer_with(&fleet::LINK, r, w, open, Some(&transfer), |_| Ok(()), || {})
+            let serves = link::Serves::default().with(fleet::LINK.channel, open).transfers(Arc::new(Receivers::new(|_| {})));
+            link::answerer_with(&fleet::LINK, r, w, &serves, None, |_| Ok(()), || {})
         })
     }
 

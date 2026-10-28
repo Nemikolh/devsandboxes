@@ -686,17 +686,22 @@ mod tests {
     /// (answerer) in-process, the worker's receivers [`receivers`] into
     /// `fleet`; the hub's transfer socket.
     fn link(dir: &Path, fleet: &Path) -> PathBuf {
-        use crate::serve::fleet::link::{AnswererTransfer, OpenerTransfer, answerer_with, opener_with};
+        use crate::devsbd::proto::channel;
+        use crate::serve::fleet::link::{Serves, answerer_with, opener_with};
         let hub_dir = dir.join("hub");
         std::fs::create_dir_all(&hub_dir).unwrap();
         let xfer = endpoint::fleet_transfer_socket(&hub_dir, "w");
-        let ours = OpenerTransfer { socket: xfer.clone(), receivers: Arc::new(Receivers::new(|_| {})) };
-        let theirs = Arc::new(AnswererTransfer { receivers: Arc::new(receivers(fleet, Receivers::new(|_| {}))), outlet: Default::default() });
+        let ours = Serves::default().transfers(Arc::new(Receivers::new(|_| {})));
+        let theirs = Serves::default().with(channel::API, || None).transfers(Arc::new(receivers(fleet, Receivers::new(|_| {}))));
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
         let path = hub_dir.join("fleet-w.sock");
-        std::thread::spawn(move || opener_with(&super::super::LINK, o_r, o_w, &path, Some(ours), |_| Ok(())));
-        std::thread::spawn(move || answerer_with(&super::super::LINK, a_r, a_w, || None, Some(&theirs), |_| Ok(()), || {}));
+        let sockets = [(channel::API, path), (channel::TRANSFER, xfer.clone())];
+        std::thread::spawn(move || {
+            let sockets: Vec<_> = sockets.iter().map(|(ch, p)| (*ch, p.as_path())).collect();
+            opener_with(&super::super::LINK, o_r, o_w, &sockets, ours, |_| Ok(()))
+        });
+        std::thread::spawn(move || answerer_with(&super::super::LINK, a_r, a_w, &theirs, None, |_| Ok(()), || {}));
         let start = std::time::Instant::now();
         while UnixStream::connect(&xfer).is_err() {
             assert!(start.elapsed() < Duration::from_secs(5), "the transfer socket accepts");

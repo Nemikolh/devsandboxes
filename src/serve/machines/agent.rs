@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use crate::devsbd::proto::{caps, channel};
+use crate::devsbd::proto::channel;
 use crate::serve::fleet::link::{self, Spec};
 
 pub use crate::serve::fleet::link::End;
@@ -31,7 +31,6 @@ pub const SPEC: Spec = Spec {
     sentinel: "devsandbox-agent",
     sentinel_version: 1,
     channel: channel::SSH_AGENT,
-    cap: caps::SSH_AGENT,
     hello: env!("CARGO_PKG_VERSION"),
 };
 
@@ -45,8 +44,8 @@ pub const SPEC: Spec = Spec {
 pub fn serve(
     reader: impl Read,
     writer: impl Write + Send + 'static,
-    allowed: impl Fn() -> bool,
-    agent: impl Fn() -> Option<PathBuf>,
+    allowed: impl Fn() -> bool + Send + Sync,
+    agent: impl Fn() -> Option<PathBuf> + Send + Sync,
     on_ready: impl FnOnce(),
     on_dead: impl FnOnce() + Send + 'static,
 ) -> End {

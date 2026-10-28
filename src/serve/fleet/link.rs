@@ -2,33 +2,40 @@
 //! between two hosts (an ssh's stdio in production) carrying the helper's
 //! frame protocol (docs/architecture/helper/protocol.md), where each
 //! connection to a socket on one host becomes a stream to a connection the
-//! other host makes. What a link carries is its [`Spec`]: the sentinel line,
-//! the channel and the cap that says the far end serves it.
+//! other host makes. A link's [`Spec`] is its sentinel line and the channel
+//! it stands for; what each end serves is its own table ([`Serves`]:
+//! channel → handler), and either end opens streams on any channel the
+//! other advertised.
 //!
-//! - [`opener`], the end with the socket (the in-container daemon's role):
-//!   binds it, writes the sentinel, exchanges `Hello`s, and turns each
-//!   accepted connection into one `Open { channel }` stream (flowing when
-//!   `channel::flows` says so, `Mux::attach` picks); `Open`s from the peer
-//!   are refused (but for `TRANSFER`, below).
-//! - [`answerer`], the end that dials (the host bridge's role): skips to the
-//!   sentinel, exchanges `Hello`s advertising the cap, answers each
-//!   `Open { channel }` with the connection its callback makes, refuses
-//!   every other channel.
+//! - [`opener_with`], the end with the sockets (the in-container daemon's
+//!   role): binds one socket per channel it opens, writes the sentinel,
+//!   exchanges `Hello`s, and turns each accepted connection into one
+//!   `Open { channel }` stream (flowing when `channel::flows` says so,
+//!   `Mux::attach` picks); a connection to a channel the peer didn't
+//!   advertise is dropped unopened. The peer's `Open`s (high-bit ids,
+//!   `Mux::on_host_open`) are answered from its table.
+//! - [`answerer_with`], the end that dials (the host bridge's role): skips
+//!   to the sentinel, exchanges `Hello`s, answers each `Open { channel }`
+//!   from its table, and opens streams toward the opener through an
+//!   [`Outlet`] (`Mux::open_host`: flowing channels only).
 //!
-//! The machines' agent relay is one (`machines::agent::SPEC`: its opener is
-//! `commands::agent_relay`, its answerer `machines::agent::serve`); the
-//! fleet link another (`fleet::LINK`).
+//! Each end's `Hello` advertises the caps of the channels its table serves
+//! ([`cap_of`]); an `Open` on a channel missing from it is refused with
+//! `Close`, and the link stays up. The opener requires the peer to serve
+//! the spec's channel. Handlers run on the mux's read thread, so they
+//! return fast: a local connect, or a socket pair whose other end a thread
+//! takes (`transfer::Receivers::accept`).
 //!
-//! A link may also carry `TRANSFER` streams both ways ([`opener_with`],
-//! [`answerer_with`]; the fleet link does): the opener binds a second socket
-//! whose connections become `TRANSFER` streams to the peer, the answerer
-//! opens them toward the opener through an [`Outlet`], and each end hands
-//! the peer's to its `transfer::Receivers`. Both ends then advertise and
-//! require `caps::TRANSFER`.
+//! The machines' agent relay is one link (`machines::agent::SPEC`, one
+//! channel each way: its opener is `commands::agent_relay` through
+//! [`opener`], its answerer `machines::agent::serve` through [`answerer`]);
+//! the fleet link another (`fleet::LINK`: `API` served by the answerer,
+//! `TRANSFER` by both ends, each end's `transfer::Receivers` through
+//! [`Serves::transfers`]).
 //!
 //! The newest opener for a socket wins: it binds a temp name and renames it
-//! over the path. An opener exits, unlinking the socket if it is still its
-//! own, when its reader ends, its writer fails, or the keepalive hears
+//! over the path. An opener exits, unlinking its sockets if they are still
+//! its own, when its reader ends, its writer fails, or the keepalive hears
 //! nothing for `mux::KEEPALIVE_TIMEOUT`, so a partitioned link can't leave a
 //! socket that accepts and hangs.
 
@@ -48,26 +55,85 @@ use crate::serve::machines::ssh::{self, SkipError};
 
 use super::transfer::Receivers;
 
-/// What one kind of link carries.
+/// What one kind of link is.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
     /// What errors call the link: `agent relay`, `fleet link`.
     pub name: &'static str,
-    /// What the answerer serves, for the opener's refusal of a peer
-    /// without `cap`: `ssh-agent`, `API`.
+    /// What the peer serves on `channel`, for the opener's refusal of a
+    /// peer that doesn't: `ssh-agent`, `API`.
     pub serves: &'static str,
     /// The sentinel line's word; the line is `\n<sentinel> <version>\n`.
     pub sentinel: &'static str,
     /// The sentinel's format version; a reader refuses any other.
     pub sentinel_version: u32,
-    /// The one channel the opener opens and the answerer accepts.
+    /// The channel the link stands for: the opener requires the peer to
+    /// advertise it ([`cap_of`]); [`opener`] opens it, [`answerer`] serves
+    /// it.
     pub channel: u8,
-    /// The cap the answerer advertises and the opener requires.
-    pub cap: u32,
     /// What both ends say in their `Hello` (the frame protocol's `VERSION`
     /// is what has to match; a fleet worker follows the build its hub says
     /// here, `fleet::update`).
     pub hello: &'static str,
+}
+
+/// The cap a link end advertises to say it serves `channel`; `None` for a
+/// channel no link carries.
+pub const fn cap_of(channel: u8) -> Option<u32> {
+    match channel {
+        channel::SSH_AGENT => Some(caps::SSH_AGENT),
+        channel::API => Some(caps::API),
+        channel::TRANSFER => Some(caps::TRANSFER),
+        channel::PTY => Some(caps::PTY),
+        channel::TUNNEL => Some(caps::TUNNEL),
+        channel::AGENT => Some(caps::AGENT),
+        _ => None,
+    }
+}
+
+/// Whether a peer whose `Hello` said `caps` serves `channel`.
+fn advertised(caps: u32, channel: u8) -> bool {
+    cap_of(channel).is_some_and(|cap| caps & cap != 0)
+}
+
+/// One served channel's handler: the local end of a stream the peer opens,
+/// `None` to refuse it. Runs on the mux's read thread: it must return fast.
+pub type Handler<'a> = Box<dyn Fn() -> Option<Conn> + Send + Sync + 'a>;
+
+/// What one end of a link serves the peer: channel → [`Handler`]. The end's
+/// `Hello` advertises their caps ([`cap_of`]); any other channel is
+/// refused.
+#[derive(Default)]
+pub struct Serves<'a> {
+    table: Vec<(u8, Handler<'a>)>,
+}
+
+impl<'a> Serves<'a> {
+    /// Also serve `channel` with `handler` (replacing an earlier one).
+    /// Panics on a channel no link carries (no [`cap_of`]): the channels are
+    /// constants, so that's a bug here.
+    pub fn with(mut self, channel: u8, handler: impl Fn() -> Option<Conn> + Send + Sync + 'a) -> Self {
+        assert!(cap_of(channel).is_some(), "channel {channel} isn't a link channel");
+        self.table.retain(|(c, _)| *c != channel);
+        self.table.push((channel, Box::new(handler)));
+        self
+    }
+
+    /// Also serve `TRANSFER`, each stream handed to `receivers`.
+    pub fn transfers(self, receivers: Arc<Receivers>) -> Self {
+        self.with(channel::TRANSFER, move || receivers.accept())
+    }
+
+    /// The caps this end advertises.
+    fn caps(&self) -> u32 {
+        self.table.iter().filter_map(|(c, _)| cap_of(*c)).fold(0, |all, cap| all | cap)
+    }
+
+    /// The answer to the peer's `Open { channel }`: its handler's, `None`
+    /// (refused) for a channel not served.
+    fn answer(&self, channel: u8) -> Option<Conn> {
+        self.table.iter().find(|(c, _)| *c == channel).and_then(|(_, open)| open())
+    }
 }
 
 /// How much [`answerer`] reads looking for the sentinel: the login shell's
@@ -114,48 +180,36 @@ enum OpenerEnd {
     Accept(io::Error),
 }
 
-/// The opener's `TRANSFER` side ([`opener_with`]).
-pub struct OpenerTransfer {
-    /// Where to bind the socket whose connections become `TRANSFER` streams
-    /// to the peer (bound like the link's own socket: newest wins).
-    pub socket: PathBuf,
-    /// Who takes the `TRANSFER` streams the peer opens.
-    pub receivers: Arc<Receivers>,
-}
-
-/// The answerer's `TRANSFER` side ([`answerer_with`]).
-pub struct AnswererTransfer {
-    /// Who takes the `TRANSFER` streams the opener opens.
-    pub receivers: Arc<Receivers>,
-    /// Set to the link while it is up, to open `TRANSFER` streams toward
-    /// the opener.
-    pub outlet: Arc<Outlet>,
-}
-
-/// The answerer's way to open `TRANSFER` streams toward the opener while
-/// its link is up (`Mux::open_host`: high-bit ids, which the opener admits
-/// through its `on_host_open`).
+/// The answerer's way to open streams toward the opener while its link is
+/// up (`Mux::open_host`: high-bit ids, which the opener answers from its
+/// table through its `on_host_open`).
 #[derive(Default)]
 pub struct Outlet {
-    mux: Mutex<Option<Arc<Mux>>>,
+    /// The live link's mux and the opener's caps.
+    up: Mutex<Option<(Arc<Mux>, u32)>>,
 }
 
 impl Outlet {
-    /// A new `TRANSFER` stream to the opener (for `transfer::send`); an
-    /// error when no link is up.
+    /// A new stream on flowing `channel` to the opener (a `TRANSFER` one
+    /// for `transfer::send`); an error when no link is up, the opener
+    /// didn't advertise `channel`, or `channel` doesn't flow.
     #[allow(dead_code)] // first caller: fetch-back (fleet step 5)
-    pub fn open(&self) -> Result<Conn> {
-        let mux = self.mux.lock().unwrap().clone().context("no link is up")?;
-        let (_, conn) = mux.open_host(channel::TRANSFER, |_| {}).context("cannot open a transfer")?;
+    pub fn open(&self, channel: u8) -> Result<Conn> {
+        let (mux, theirs) = self.up.lock().unwrap().clone().context("no link is up")?;
+        if !advertised(theirs, channel) {
+            bail!("the peer serves no channel {channel}");
+        }
+        let (_, conn) = mux.open_host(channel, |_| {}).with_context(|| format!("cannot open a channel {channel} stream"))?;
         Ok(conn)
     }
 
-    fn set(&self, mux: Option<Arc<Mux>>) {
-        *self.mux.lock().unwrap() = mux;
+    fn set(&self, up: Option<(Arc<Mux>, u32)>) {
+        *self.up.lock().unwrap() = up;
     }
 }
 
-/// [`opener_with`], carrying no `TRANSFER`.
+/// [`opener_with`] opening only `spec.channel`, through `socket`, and
+/// serving nothing.
 pub fn opener(
     spec: &Spec,
     reader: impl Read + Send + 'static,
@@ -163,52 +217,43 @@ pub fn opener(
     socket: &Path,
     on_ready: impl FnOnce(&proto::Peer) -> Result<()>,
 ) -> Result<()> {
-    opener_with(spec, reader, writer, socket, None, on_ready)
+    opener_with(spec, reader, writer, &[(spec.channel, socket)], Serves::default(), on_ready)
 }
 
-/// The opener over `reader`/`writer` with its socket at `socket` (temp name
-/// in the same dir): bind, sentinel and `Hello`s (the peer must advertise
-/// `spec.cap`), then accept and relay until it ends (see the module doc).
-/// With `transfer`, its socket is bound too, `caps::TRANSFER` advertised and
-/// required, and the peer's high-bit `Open { TRANSFER }`s go to its
-/// receivers. `on_ready` runs once the `Hello`s are through, with the
-/// peer's (its `hash` is what the far end's spec says, e.g. its semver),
-/// before the first accept; its error ends the opener (the sockets
-/// unlinked) with that error. `Ok` when the peer went away (the reader
-/// ended or the writer broke, whichever was seen first).
+/// The opener over `reader`/`writer`: bind each of `sockets` (a channel
+/// and its path; a temp name in the same dir first), sentinel and `Hello`s
+/// advertising `serves`' caps (the peer must advertise `spec.channel`'s),
+/// then accept and relay until it ends (see the module doc): each
+/// connection to a socket is one stream on its channel, dropped unopened
+/// when the peer didn't advertise that channel; the peer's `Open`s are
+/// answered from `serves`. `on_ready` runs once the `Hello`s are through,
+/// with the peer's (its `hash` is what the far end's spec says, e.g. its
+/// semver), before the first accept; its error ends the opener (the
+/// sockets unlinked) with that error. `Ok` when the peer went away (the
+/// reader ended or the writer broke, whichever was seen first).
 pub fn opener_with(
     spec: &Spec,
     mut reader: impl Read + Send + 'static,
     writer: impl Write + Send + 'static,
-    socket: &Path,
-    transfer: Option<OpenerTransfer>,
+    sockets: &[(u8, &Path)],
+    serves: Serves<'static>,
     on_ready: impl FnOnce(&proto::Peer) -> Result<()>,
 ) -> Result<()> {
-    // Bound before the `Hello`s, so once this end has answered, the socket
-    // is there.
-    let socket = Socket::bind(socket)?;
-    let transfer = match transfer {
-        Some(t) => Some((Socket::bind(&t.socket)?, t.receivers)),
-        None => None,
-    };
+    // Bound before the `Hello`s, so once this end has answered, the sockets
+    // are there.
+    let bound = sockets.iter().map(|&(ch, path)| Ok((Socket::bind(path)?, ch))).collect::<Result<Vec<_>>>()?;
     let (tx, ended) = mpsc::channel();
     let mut writer = Reporting { inner: writer, failed: tx.clone() };
     write_sentinel(spec, &mut writer).context("cannot write to stdout")?;
-    let ours = if transfer.is_some() { caps::TRANSFER } else { 0 };
-    let peer = proto::handshake(&mut reader, &mut writer, spec.hello, ours)
+    let peer = proto::handshake(&mut reader, &mut writer, spec.hello, serves.caps())
         .with_context(|| format!("{} handshake failed", spec.name))?;
-    if peer.caps & spec.cap == 0 {
+    if !advertised(peer.caps, spec.channel) {
         bail!("the peer serves no {}", spec.serves);
-    }
-    if transfer.is_some() && peer.caps & caps::TRANSFER == 0 {
-        bail!("the peer takes no transfers");
     }
     on_ready(&peer)?;
     let mux = Mux::new(writer);
-    if let Some((_, receivers)) = &transfer {
-        let receivers = Arc::clone(receivers);
-        mux.on_host_open(Arc::new(move |_, ch| if ch == channel::TRANSFER { receivers.accept() } else { None }));
-    }
+    let serves = Arc::new(serves);
+    mux.on_host_open(Arc::new(move |_, ch| serves.answer(ch)));
     let dead = tx.clone();
     mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
         let _ = dead.send(OpenerEnd::Dead);
@@ -222,28 +267,25 @@ pub fn opener_with(
             let _ = tx.send(OpenerEnd::Closed);
         });
     }
-    let mut listeners = vec![(&socket.listener, spec.channel)];
-    if let Some((t, _)) = &transfer {
-        listeners.push((&t.listener, channel::TRANSFER));
-    }
-    let polled: Vec<&UnixListener> = listeners.iter().map(|(l, _)| *l).collect();
+    let polled: Vec<&UnixListener> = bound.iter().map(|(s, _)| &s.listener).collect();
     let mut next = 1;
     let end = loop {
         if let Ok(end) = ended.try_recv() {
             break end;
         }
         match crate::serve::endpoint::accept_any(&polled, POLL) {
+            // Not advertised: dropped, so the client reads EOF at once.
+            Ok(Some((i, conn))) if !advertised(peer.caps, bound[i].1) => drop(conn),
             // A failed `Open` is a write error, which `Reporting` reports.
             Ok(Some((i, conn))) => {
-                let _ = mux.attach(next_stream_id(&mut next), conn, Some(listeners[i].1));
+                let _ = mux.attach(next_stream_id(&mut next), conn, Some(bound[i].1));
             }
             Ok(None) => {}
             Err(e) => break OpenerEnd::Accept(e),
         }
     };
-    drop((polled, listeners));
-    drop(socket);
-    drop(transfer);
+    drop(polled);
+    drop(bound);
     mux.close_all();
     match end {
         OpenerEnd::Closed | OpenerEnd::Write => Ok(()),
@@ -266,20 +308,14 @@ pub enum End {
     Closed,
 }
 
-/// The answerer over `reader`/`writer` until the link ends: skip to the
-/// sentinel, exchange `Hello`s advertising `spec.cap`, then answer each
-/// `Open { spec.channel }` with `open()`'s connection (`None` refuses it
-/// with `Close`, as is every other channel). `open` runs on the mux's read
-/// thread: it must be quick (a local connect). `on_ready` runs once the
-/// `Hello`s are through (the opener's socket is bound by then). Keepalive
-/// pings go out every `mux::KEEPALIVE_INTERVAL`; after
-/// `mux::KEEPALIVE_TIMEOUT` without a frame `on_dead` runs once: it must
-/// end `reader` (kill the ssh) so this returns.
+/// [`answerer_with`] serving only `spec.channel`, with `open()`'s
+/// connections, and opening nothing. `on_ready` runs once the `Hello`s are
+/// through (the opener's socket is bound by then).
 pub fn answerer(
     spec: &Spec,
     reader: impl Read,
     writer: impl Write + Send + 'static,
-    open: impl Fn() -> Option<Conn>,
+    open: impl Fn() -> Option<Conn> + Send + Sync,
     on_ready: impl FnOnce(),
     on_dead: impl FnOnce() + Send + 'static,
 ) -> End {
@@ -287,7 +323,7 @@ pub fn answerer(
         spec,
         reader,
         writer,
-        open,
+        &Serves::default().with(spec.channel, open),
         None,
         |_| {
             on_ready();
@@ -297,19 +333,23 @@ pub fn answerer(
     )
 }
 
-/// [`answerer`], with `transfer`: `caps::TRANSFER` advertised, the opener's
-/// `Open { TRANSFER }`s handed to its receivers, and its outlet set to this
-/// link from the `Hello`s until it ends (when the opener advertised
-/// `caps::TRANSFER`). `on_ready` gets the opener's `Hello` (its `hash` is
-/// the far end's `spec.hello`); an `Err` ends the link at once, before
-/// anything is served, as [`End::Refused`] (a fleet worker that must first
-/// follow its hub's version, `fleet::worker`).
+/// The answerer over `reader`/`writer` until the link ends: skip to the
+/// sentinel, exchange `Hello`s advertising `serves`' caps, then answer each
+/// `Open { channel }` from `serves` (`None`, or a channel not there, refuses
+/// it with `Close`). `outlet`, when given, is set to this link from the
+/// `Hello`s until it ends, to open streams toward the opener. `on_ready`
+/// gets the opener's `Hello` (its `hash` is the far end's `spec.hello`); an
+/// `Err` ends the link at once, before anything is served, as
+/// [`End::Refused`] (a fleet worker that must first follow its hub's
+/// version, `fleet::worker`). Keepalive pings go out every
+/// `mux::KEEPALIVE_INTERVAL`; after `mux::KEEPALIVE_TIMEOUT` without a frame
+/// `on_dead` runs once: it must end `reader` (kill the ssh) so this returns.
 pub fn answerer_with(
     spec: &Spec,
     mut reader: impl Read,
     mut writer: impl Write + Send + 'static,
-    open: impl Fn() -> Option<Conn>,
-    transfer: Option<&AnswererTransfer>,
+    serves: &Serves<'_>,
+    outlet: Option<&Outlet>,
     on_ready: impl FnOnce(&proto::Peer) -> Result<(), String>,
     on_dead: impl FnOnce() + Send + 'static,
 ) -> End {
@@ -326,8 +366,7 @@ pub fn answerer_with(
             None => why,
         });
     }
-    let ours = spec.cap | if transfer.is_some() { caps::TRANSFER } else { 0 };
-    let peer = match proto::handshake(&mut reader, &mut writer, spec.hello, ours) {
+    let peer = match proto::handshake(&mut reader, &mut writer, spec.hello, serves.caps()) {
         Ok(peer) => peer,
         Err(e) => return End::Handshake(e.to_string()),
     };
@@ -335,9 +374,8 @@ pub fn answerer_with(
         return End::Refused(why);
     }
     let mux = Mux::new(writer);
-    let outlet = transfer.filter(|_| peer.caps & caps::TRANSFER != 0).map(|t| &t.outlet);
     if let Some(outlet) = outlet {
-        outlet.set(Some(Arc::clone(&mux)));
+        outlet.set(Some((Arc::clone(&mux), peer.caps)));
     }
     let dead = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&dead);
@@ -345,11 +383,7 @@ pub fn answerer_with(
         flag.store(true, Ordering::Relaxed);
         on_dead();
     });
-    mux.serve(reader, |_, ch| match transfer {
-        _ if ch == spec.channel => open(),
-        Some(t) if ch == channel::TRANSFER => t.receivers.accept(),
-        _ => None,
-    });
+    mux.serve(reader, |_, ch| serves.answer(ch));
     if let Some(outlet) = outlet {
         outlet.set(None);
     }
@@ -466,7 +500,7 @@ mod tests {
     /// (stdio, as over ssh), the answerer serving `open`. Returns once the
     /// opener's socket accepts. The pipes can't be shut from outside, so
     /// both ends outlive the test (their keepalives are 15 s apart).
-    fn link(socket: &Path, open: impl Fn() -> Option<Conn> + Send + 'static) {
+    fn link(socket: &Path, open: impl Fn() -> Option<Conn> + Send + Sync + 'static) {
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
         let path = socket.to_path_buf();
@@ -605,14 +639,15 @@ mod tests {
         let (worker_tx, worker_rx) = mpsc::channel();
         let socket = hub_dir.join("fleet-w.sock");
         let xfer = endpoint::fleet_transfer_socket(&hub_dir, "w");
-        let ours = OpenerTransfer { socket: xfer.clone(), receivers: receivers(hub_dir.join("in"), hub_tx) };
-        let theirs = Arc::new(AnswererTransfer { receivers: receivers(worker_dir.clone(), worker_tx), outlet: Default::default() });
+        let ours = Serves::default().transfers(receivers(hub_dir.join("in"), hub_tx));
+        let theirs = Serves::default().with(channel::API, || None).transfers(receivers(worker_dir.clone(), worker_tx));
+        let outlet = Arc::new(Outlet::default());
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
-        let path = socket.clone();
-        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, &path, Some(ours), |_| Ok(())));
-        let answering = Arc::clone(&theirs);
-        std::thread::spawn(move || answerer_with(&LINK, a_r, a_w, || None, Some(&answering), |_| Ok(()), || {}));
+        let sockets = [(channel::API, socket.clone()), (channel::TRANSFER, xfer.clone())];
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, &paths(&sockets), ours, |_| Ok(())));
+        let answering = Arc::clone(&outlet);
+        std::thread::spawn(move || answerer_with(&LINK, a_r, a_w, &theirs, Some(&answering), |_| Ok(()), || {}));
         wait_for(|| UnixStream::connect(&xfer).is_ok(), "the transfer socket accepts");
 
         // Hub → worker: bigger than a window, so credit has to flow.
@@ -638,8 +673,8 @@ mod tests {
         assert_eq!(std::fs::read_dir(&worker_dir).unwrap().count(), 1, "only cfg.tar, no temp files");
 
         // Worker → hub, once the outlet is set (the `Hello`s are through).
-        wait_for(|| theirs.outlet.mux.lock().unwrap().is_some(), "the outlet is up");
-        transfer::send(theirs.outlet.open().unwrap(), &header, &body[..]).unwrap();
+        wait_for(|| outlet.up.lock().unwrap().is_some(), "the outlet is up");
+        transfer::send(outlet.open(channel::TRANSFER).unwrap(), &header, &body[..]).unwrap();
         let got = hub_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(got.path, hub_dir.join("in/cfg.tar"));
         assert_eq!(std::fs::read(&got.path).unwrap(), body);
@@ -656,7 +691,7 @@ mod tests {
         let (o_r, a_w) = std::io::pipe().unwrap();
         let socket = dir.join("fleet-w.sock");
         let opener = std::thread::spawn(move || opener(&LINK, o_r, o_w, &socket, |_| Ok(())));
-        let end = answerer_with(&LINK, a_r, a_w, || None, None, |peer| Err(format!("not {}", peer.hash)), || {});
+        let end = answerer_with(&LINK, a_r, a_w, &Serves::default().with(channel::API, || None), None, |peer| Err(format!("not {}", peer.hash)), || {});
         match end {
             End::Refused(why) => assert_eq!(why, format!("not {}", LINK.hello)),
             other => panic!("{other:?}"),
@@ -666,9 +701,148 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `(channel, path)`s borrowed as `opener_with` takes them.
+    fn paths(sockets: &[(u8, PathBuf)]) -> Vec<(u8, &Path)> {
+        sockets.iter().map(|(ch, p)| (*ch, p.as_path())).collect()
+    }
+
+    /// A handler whose every stream gets `tag` written and is then dropped.
+    fn tagged(tag: &'static [u8]) -> impl Fn() -> Option<Conn> + Send + Sync + 'static {
+        move || {
+            let (mut ours, theirs) = UnixStream::pair().ok()?;
+            std::thread::spawn(move || {
+                let _ = ours.write_all(tag);
+            });
+            Some(theirs.into())
+        }
+    }
+
+    /// What a stream reads until its end (5 s at most).
+    fn read_all(mut c: impl Read) -> Vec<u8> {
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        got
+    }
+
+    /// An outlet's stream, with a read timeout.
+    fn timed(c: Conn) -> UnixStream {
+        let Conn::Unix(c) = c else { panic!("an outlet's stream is a socket pair") };
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    }
+
+    fn connect(socket: &Path) -> UnixStream {
+        let c = UnixStream::connect(socket).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    }
+
+    /// The opener serves `PTY` and has `API`, `PTY` and `TUNNEL` sockets;
+    /// the answerer serves `API` and `PTY`. Returns the sockets' paths and
+    /// the answerer's outlet, once it is up.
+    fn two_way(dir: &Path) -> ([PathBuf; 3], Arc<Outlet>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let sockets = [
+            (channel::API, endpoint::fleet_socket(dir, "w")),
+            (channel::PTY, endpoint::fleet_channel_socket(dir, "w", "pty")),
+            (channel::TUNNEL, endpoint::fleet_channel_socket(dir, "w", "tunnel")),
+        ];
+        let paths_out = sockets.clone().map(|(_, p)| p);
+        let ours = Serves::default().with(channel::PTY, tagged(b"hub pty"));
+        let theirs = Serves::default().with(channel::API, tagged(b"worker api")).with(channel::PTY, tagged(b"worker pty"));
+        let outlet = Arc::new(Outlet::default());
+        let (a_r, o_w) = std::io::pipe().unwrap();
+        let (o_r, a_w) = std::io::pipe().unwrap();
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, &paths(&sockets), ours, |_| Ok(())));
+        let answering = Arc::clone(&outlet);
+        std::thread::spawn(move || answerer_with(&LINK, a_r, a_w, &theirs, Some(&answering), |_| Ok(()), || {}));
+        wait_for(|| outlet.up.lock().unwrap().is_some(), "the outlet is up");
+        wait_for(|| UnixStream::connect(&paths_out[0]).is_ok(), "the opener's sockets accept");
+        (paths_out, outlet)
+    }
+
     #[test]
-    fn transfer_flows() {
-        assert!(proto::channel::flows(channel::TRANSFER));
+    fn a_second_channel_reaches_the_peers_handler_both_ways() {
+        let dir = scratch("fleet-two-way");
+        let ([api, pty, _], outlet) = two_way(&dir);
+        // Opener → answerer: each socket reaches its channel's handler.
+        assert_eq!(read_all(connect(&pty)), b"worker pty");
+        assert_eq!(read_all(connect(&api)), b"worker api");
+        // Answerer → opener, through the outlet.
+        assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"hub pty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_channel_the_peer_doesnt_serve_is_refused_and_the_link_stays_up() {
+        let dir = scratch("fleet-unserved");
+        let ([api, _, tunnel], outlet) = two_way(&dir);
+        // The answerer didn't advertise `TUNNEL`: its socket's connections
+        // are dropped unopened.
+        assert_eq!(read_all(connect(&tunnel)), b"");
+        // The opener didn't advertise `API` or `TUNNEL`: the outlet won't open them.
+        for ch in [channel::API, channel::TUNNEL] {
+            let err = outlet.open(ch).err().expect("refused");
+            assert_eq!(format!("{err:#}"), format!("the peer serves no channel {ch}"));
+        }
+        // Nor a legacy channel, even served.
+        assert!(outlet.open(channel::SSH_AGENT).is_err());
+        assert_eq!(read_all(connect(&api)), b"worker api");
+        assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"hub pty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_opener_refuses_peer_opens_it_doesnt_serve() {
+        // Play the answerer by hand: sentinel, `Hello`, then high-bit `Open`s.
+        let dir = scratch("fleet-opener-refuses");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut a_r, o_w) = std::io::pipe().unwrap();
+        let (o_r, mut a_w) = std::io::pipe().unwrap();
+        let socket = dir.join("fleet-w.sock");
+        let ours = Serves::default().with(channel::PTY, tagged(b"hub pty"));
+        let path = socket.clone();
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, &[(channel::API, path.as_path())], ours, |_| Ok(())));
+        let mut noise = None;
+        ssh::skip_lines(&mut a_r, SENTINEL_LIMIT, &mut noise, |l: &[u8]| match_sentinel(&LINK, l)).unwrap();
+        let peer = proto::handshake(&mut a_r, &mut a_w, "test", caps::API).unwrap();
+        assert_eq!(peer.caps, caps::PTY);
+        let high = 1 << 31;
+        for (stream, ch) in [(high | 1, channel::TUNNEL), (high | 2, channel::API), (3, channel::PTY)] {
+            proto::write_frame(&mut a_w, &Frame::Open { stream, channel: ch }).unwrap();
+            loop {
+                match proto::read_frame(&mut a_r).unwrap() {
+                    Some(Frame::Close { stream: s, .. }) if s == stream => break,
+                    Some(Frame::Ping(_) | Frame::Pong(_)) => {}
+                    other => panic!("channel {ch}: {other:?}"),
+                }
+            }
+        }
+        // A served one is answered: its handler's bytes come back.
+        proto::write_frame(&mut a_w, &Frame::Open { stream: high | 4, channel: channel::PTY }).unwrap();
+        let mut got = Vec::new();
+        while got != b"hub pty" {
+            match proto::read_frame(&mut a_r).unwrap() {
+                Some(Frame::Data { stream, bytes }) if stream == high | 4 => got.extend(bytes),
+                Some(Frame::Window { .. } | Frame::Ping(_) | Frame::Pong(_)) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn link_channels_flow_and_have_caps() {
+        for ch in [channel::API, channel::TRANSFER, channel::PTY, channel::TUNNEL, channel::AGENT] {
+            assert!(proto::channel::flows(ch), "{ch}");
+            assert!(cap_of(ch).is_some(), "{ch}");
+        }
+        // The containers' agent channel stays legacy.
+        assert!(!proto::channel::flows(channel::SSH_AGENT));
+        assert_eq!(cap_of(channel::SSH_AGENT), Some(caps::SSH_AGENT));
+        assert_eq!(cap_of(channel::RPC), None);
+        let all = [channel::API, channel::TRANSFER, channel::PTY, channel::TUNNEL, channel::AGENT, channel::SSH_AGENT].map(|c| cap_of(c).unwrap());
+        assert_eq!(all.iter().fold(0, |a, c| a | c).count_ones(), all.len() as u32, "distinct bits");
     }
 
     #[test]
@@ -678,11 +852,6 @@ mod tests {
         assert_eq!(match_sentinel(&LINK, b"devsandbox-agent 1"), Ok(None));
         let err = match_sentinel(&LINK, b"devsandbox-fleet 2").unwrap_err();
         assert!(err.starts_with("the fleet link there speaks `devsandbox-fleet 2`"), "{err}");
-    }
-
-    #[test]
-    fn api_flows() {
-        assert!(proto::channel::flows(channel::API));
     }
 
     #[test]
