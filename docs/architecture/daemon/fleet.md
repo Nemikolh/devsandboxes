@@ -47,7 +47,13 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/commands/lend.rs` (`show`, `set_state`, `join`, `leave`, `busy`),
 `src/serve/fleet/lent.rs` (`Scope`, `decide`, `admit`, `confine_path`,
 `filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
-(`start_lending`, `Table`, `Shared::open_lent`), `src/worker_policy.rs`
+(`start_lending`, `Table`, `Shared::open_lent`, `Shared::open_lent_pty`),
+`src/serve/fleet/worker.rs` (`Open`, `Opens`), `src/serve/fleet/pty.rs`
+(`METHOD`, `code`, `Header`, `parse_header`, `gate`, `offered`,
+`attach_params`, `serve`), `src/commands/exec.rs` (`ExecContext`,
+`exec_context`), `src/serve/helper.rs` (`HelperClient::call_with_input`,
+`Input`), `src/serve/api.rs` (`sessions_list`, `sessions_rm`,
+`session_container`, `helper_rpc`, `SessionsList`), `src/worker_policy.rs`
 (`Allow`, `Policy`, `fleet_root_of`, `load_allow`, `enforce`,
 `enforce_argv`, `Refusal`); capacity: `src/serve/capacity.rs`
 (`Capacity`, `Caps`, `HostFacts`, `EngineCache`, `parse_meminfo`,
@@ -153,8 +159,9 @@ The agent relay uses the one-channel cases (`link::opener`,
 `endpoint::fleet_socket` for `API` and `endpoint::fleet_transfer_socket`
 for `TRANSFER` (a further channel's socket is
 `endpoint::fleet_channel_socket`, `fleet-<name>.<suffix>.sock`) and
-serves `TRANSFER`; the worker's answerer serves `API` and `TRANSFER`. No
-end serves `PTY`, `TUNNEL` or `AGENT` yet. Each connection to the API
+serves `TRANSFER`; the worker's answerer serves `API`, `TRANSFER` and
+`PTY` ([PTY](#pty)). No end serves `TUNNEL` or `AGENT` yet. Each
+connection to the API
 socket is one connection to whatever daemon socket the answerer's `API`
 handler connects, so a
 `client::Conn` on the opener's host says its hello to, and calls, a daemon
@@ -679,6 +686,12 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   ([the sentinel rule](#link)) and is then served like any connection
   (`spawn_conn_as`), with the `Worker` table. Its connection id comes from
   the same counter as the listener's.
+- **Each `PTY` stream** is answered by `Shared::open_lent_pty`: a socket
+  pair whose daemon end `fleet::pty::serve` takes on a `serve-pty` thread
+  ([PTY](#pty)); refused without a host side (no helper client) or once
+  the daemon stops. The lending thread gets both handlers as its `Opens`
+  (channel → `Open`), and refuses both while it waits for the hub's
+  binary ([Versions](#versions)).
 
 ### Versions
 
@@ -851,9 +864,9 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
   canonicalize (symlinks resolved) under the fleet root
   (`lent::confine_path`); it is rewritten to the canonical path. A path that
   doesn't exist is `not-found`, except an unwatch's, checked as written.
-  `instances.list`, the watches, `sandboxes.*`, `services.get`, `config.*`
-  and the verbs must carry theirs.
-- **Instances**: an `instance` (exact name or id), `instances.procs`'
+  `instances.list`, the watches, `sandboxes.*`, `services.get`, `config.*`,
+  `sessions.*` and the verbs must carry theirs.
+- **Instances**: an `instance` (exact name or id, `sessions.*`' included), `instances.procs`'
   `instances` and the `containers.*` `container` must be an instance whose
   `config_dir` is under the fleet root (`lent::lent_instances`, from
   `state.toml`), else `not-found`. A verb's `instance` is resolved as the
@@ -873,6 +886,66 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
 - **Hello** on a `Worker` connection never hands the daemon off, whatever
   version it says and even with `force`: only a local client's newer
   binary (or this user's forced hello, [Versions](#versions)) replaces it.
+
+### PTY
+
+A terminal into a lent instance over the link: each `PTY` stream the hub
+opens is one session attach, the worker's daemon calling the instance
+helper's `session.attach` itself over its bridge
+(`HelperClient::call_with_input`; decision 13 of the
+[plan](../../plans/active/fleet.md#decisions)): no `exec -it`, no client
+in the container. The stream carries `rpc` records
+(`src/devsbd/rpc.rs`, [protocol](../helper/protocol.md)), and
+`fleet::pty::serve` relays them; it parses none past the header.
+
+- **The header** is the hub's first record (within 30 s): a `call` of
+  `session.attach` (`pty::METHOD`) whose params are `{"root": <abs
+  config root>, "instance": <exact name or instance id>, "session":
+  <id>, "create"?: {"argv"?: [...]}}` (`pty::parse_header`). The session
+  id must pass `control::valid_run_id`. No `create` (or `null`) attaches
+  only; `create` creates the session unless it exists, then attaches,
+  running `argv`, or the login shell (`exec::SHELL_FALLBACK_CMD`) when
+  `argv` is absent or empty.
+- **The gate** (`pty::gate`, pure but for canonicalizing `root`):
+  `root` confined as an `API` request's is (`lent::confine_path`: under
+  the fleet root); the instance found by exact name, else by id, among
+  the lent ones (`lent::lent_instances`) whose config root is under
+  `root`; it must have the helper (`Instance::devsbd_arch`). Then the
+  helper must offer `session.attach` (`HelperClient::offers`,
+  `pty::offered`): a bridge must be up (else the instance isn't running),
+  and the helper's daemon must be root, since `session.attach` is
+  `needs_root` (a `containerUser` instance, or an older helper, refuses).
+- **The attach**: `session.attach {id, create?: {argv, cwd, env, user?}}`
+  (`pty::attach_params`), `create` as an exec into the instance runs
+  (`exec::exec_context`, which `exec_argv_with` builds its argv from too:
+  the workspace, the remote user when set, `Instance::exec_env` then
+  `SSH_AUTH_SOCK`), caller `fleet hub <hub>`. It queues behind the
+  container's `helper::MAX_CALLS` like any call, abandoned if the hub
+  hangs up meanwhile.
+- **Records**: hub → worker `stdin`, `resize`, `stdin-eof` (any other is
+  ignored, as the helper ignores it), into the call's `Input` on a thread
+  of their own; worker → hub the helper's records unchanged: `stdout`…,
+  then exactly one end record, `exit` (`128 + n` for a signal) or
+  `error {code, message}` with the helper's code (`no-session`,
+  `detached`, `version`, `bad-request`, `failed`). After it the worker
+  closes the stream.
+- **Hang-up**: the hub closing its end cancels the call; the session
+  lives on in the container (detached), for a later attach. Nothing more
+  is written.
+- **Refusals and losses** are one `error` record and the stream's close:
+  `bad-request` (no or a malformed header, a relative `root`), `denied`
+  (`root` outside the fleet root; logged), `not-found` (no such root, no
+  such lent instance in it), `not-running` (no live bridge to its
+  helper), `unsupported` (no helper; its daemon doesn't offer
+  `session.attach`), `failed` (`state.toml` doesn't read, the helper
+  couldn't be asked), and `lost`: the attach ended without an end record
+  (the bridge or its call broke), so the hub can't tell how the session
+  is, only that the attach is gone.
+
+`sessions.list` / `sessions.rm` ([api](../../reference/api.md#sessions))
+are quick calls, admitted on the `Worker` table with the instance rule
+above; the session list and removal go through the helper's
+`session.ls` / `session.rm`.
 
 ### Worker policy
 

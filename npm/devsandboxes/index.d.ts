@@ -933,6 +933,12 @@ export interface BuildLogTail {
   cut: boolean;
 }
 
+/** `sessions.list`'s answer: the helper's `session ls` lines, oldest first. */
+export interface SessionsList {
+  /** `<id> <state> <attached|detached|-> <started> <argv…>`. */
+  sessions: string[];
+}
+
 /** `containers.logs`'s answer: the container's last output lines. */
 export interface ContainerLogs {
   text: string;
@@ -1248,6 +1254,13 @@ export interface ApiMethods {
   'instances.rename': { params: { instance: string; newName: string; machine?: string }; result: InstanceRenamed };
   /** Set or clear the done flag (exact name); idempotent. */
   'instances.done': { params: { instance: string; done: boolean; machine?: string }; result: InstanceDone };
+  /**
+   * The instance's resumable sessions (exact name or instance id, its config root `root`); `unsupported` without a
+   * helper, or when its daemon isn't root.
+   */
+  'sessions.list': { params: { root: string; instance: string; machine?: string }; result: SessionsList };
+  /** End session `id` (SIGHUP, then SIGKILL); params as `sessions.list`'s. */
+  'sessions.rm': { params: { root: string; instance: string; id: string; machine?: string }; result: OkResult };
   /** `devsandbox-…` containers only; `lines` default 50, at most 10000. */
   'containers.logs': { params: { container: string; lines?: number; machine?: string }; result: ContainerLogs };
   /** `devsandbox-…` containers only: the runtime's inspect JSON (docker's: an array of one object). */

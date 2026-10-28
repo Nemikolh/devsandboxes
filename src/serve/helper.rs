@@ -189,9 +189,8 @@ impl HelperClient {
     /// [`HelperClient::call`] for a method that takes input after the `call`
     /// (`session.attach`): the stream stays open, [`Input`] writes into it
     /// from any thread while [`Call::next`] reads the reply. Dropping the
-    /// `Input` ends the input (`Eof`), not the call.
-    // First caller: fleet step 4's `PTY` (docs/plans/active/fleet.md).
-    #[allow(dead_code)]
+    /// `Input` ends the input (`Eof`), not the call. A fleet link's `PTY`
+    /// stream is one (`fleet::pty`).
     pub fn call_with_input(
         &self,
         container: &str,
@@ -397,8 +396,6 @@ pub struct Input {
     conn: Conn,
 }
 
-// First caller: fleet step 4's `PTY` (docs/plans/active/fleet.md).
-#[allow(dead_code)]
 impl Input {
     /// Bytes for the callee's stdin, in records of at most `MAX_RECORD`.
     pub fn stdin(&mut self, bytes: &[u8]) -> io::Result<()> {

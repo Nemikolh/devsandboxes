@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::forwards::{AddRequest, Added, ForwardRow, Removed};
+use crate::devsbd::rpc::Obj;
 use crate::config_identity::ops as identity_ops;
 use crate::inbox::wire::{self, Addr, resolve};
 use crate::inbox::{Inbox, Kind, Op, View, ops};
@@ -131,6 +132,8 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "instances.rename" => instances_rename(parse(params)?, &host_state(ctx)?),
         "instances.done" => instances_done(parse(params)?, &host_state(ctx)?),
         "instances.buildLog" => instances_build_log(parse(params)?, &host_state(ctx)?),
+        "sessions.list" => sessions_list(parse(params)?, &host_state(ctx)?, |c, m, p| helper_rpc(c, m, p, ctx.client)),
+        "sessions.rm" => sessions_rm(parse(params)?, &host_state(ctx)?, |c, m, p| helper_rpc(c, m, p, ctx.client)),
         "containers.logs" => {
             containers_logs(parse(params)?, |c, n| crate::runtime::backend().logs_tail(c, n).map_err(ApiError::internal))
         }
@@ -695,6 +698,95 @@ fn instances_done(p: DoneParams, state: &Path) -> Answer {
         Err(e) => ApiError::internal(e),
     })?;
     serde_json::to_value(DoneSet { instance: p.instance, done: p.done }).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct SessionsParams {
+    root: PathBuf,
+    instance: String,
+}
+
+#[derive(Deserialize)]
+struct SessionRmParams {
+    root: PathBuf,
+    instance: String,
+    id: String,
+}
+
+/// `sessions.list`'s answer: the helper's `session ls` lines, `<id>
+/// <state> <attached|detached|-> <started> <argv…>`, oldest first.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionsList {
+    pub sessions: Vec<String>,
+}
+
+/// The container of instance `name` (an exact name, else an instance id)
+/// whose config root is under `root`, for a `session.*` call: `not-found`
+/// for no such instance there, `unsupported` without a helper.
+fn session_container(state: &Path, root: &Path, name: &str) -> Result<String, ApiError> {
+    if !root.is_absolute() {
+        return Err(ApiError::invalid(format!("`root` must be absolute, got `{}`", root.display())));
+    }
+    let root = std::fs::canonicalize(root).map_err(|_| ApiError::not_found(format!("no directory {}", root.display())))?;
+    let s = load_state(state)?;
+    let found = s
+        .instances
+        .get_key_value(name)
+        .or_else(|| s.instances.iter().find(|(_, i)| i.instance_id == name))
+        .filter(|(_, i)| i.config_dir.as_deref().is_some_and(|d| crate::serve::fleet::lent::root_under(d, &root)));
+    let Some((key, instance)) = found else {
+        return Err(ApiError::not_found(format!("no instance `{name}` in {}", root.display())));
+    };
+    if instance.devsbd_arch.is_none() {
+        return Err(ApiError::unsupported(format!("`{key}` has no devsbd helper, so no sessions")));
+    }
+    Ok(instance.container.clone())
+}
+
+/// An instance's sessions (the helper's `session.ls`). `state` and `rpc`
+/// (a helper call's `result`, [`helper_rpc`]) are injected for the tests.
+fn sessions_list(p: SessionsParams, state: &Path, rpc: impl FnOnce(&str, &str, Obj) -> Result<Obj, ApiError>) -> Answer {
+    let container = session_container(state, &p.root, &p.instance)?;
+    let result = rpc(&container, "session.ls", Obj::new())?;
+    let sessions = result.strs("sessions").ok_or_else(|| ApiError::failed("session.ls answered no `sessions`"))?.to_vec();
+    to_value(SessionsList { sessions })
+}
+
+/// End an instance's session `id` (the helper's `session.rm`: SIGHUP, then
+/// SIGKILL). `state` and `rpc` as for [`sessions_list`].
+fn sessions_rm(p: SessionRmParams, state: &Path, rpc: impl FnOnce(&str, &str, Obj) -> Result<Obj, ApiError>) -> Answer {
+    if !crate::devsbd::control::valid_run_id(&p.id) {
+        return Err(ApiError::invalid(format!("bad session id `{}`", p.id)));
+    }
+    let container = session_container(state, &p.root, &p.instance)?;
+    rpc(&container, "session.rm", Obj::new().with("id", p.id.as_str()))?;
+    ok()
+}
+
+/// One call into `container`'s helper through the daemon's client
+/// (`helper::shared`), by `caller`: its `result`. No bridge is
+/// `not-found`; a helper without RPC, or one that doesn't offer `method`
+/// (the `session.*` methods are root only), `unsupported`; its `error`
+/// otherwise `failed`, with its code.
+fn helper_rpc(container: &str, method: &str, params: Obj, caller: &str) -> Result<Obj, ApiError> {
+    use super::helper::CallError;
+    use crate::devsbd::rpc::{Record, code};
+    let client = super::helper::shared().ok_or_else(|| ApiError::failed("this daemon runs no bridges"))?;
+    let mut call = client.call(container, method, params, Obj::new(), caller, &|| false).map_err(|e| match e {
+        CallError::NoBridge(_) => ApiError::not_found(e.to_string()),
+        CallError::Unsupported(_) => ApiError::unsupported(e.to_string()),
+        CallError::Abandoned | CallError::Io(_) => ApiError::failed(e.to_string()),
+    })?;
+    match call.next() {
+        Ok(Some(Record::Result(o))) => Ok(o),
+        Ok(Some(Record::Error { code: c, message })) if c == code::UNKNOWN_METHOD => Err(ApiError::unsupported(format!(
+            "the helper in {container} doesn't offer `{method}` (its daemon isn't root, or it's older): {message}"
+        ))),
+        Ok(Some(Record::Error { code: c, message })) => Err(ApiError::failed(format!("{method}: {c}: {message}"))),
+        Ok(Some(other)) => Err(ApiError::failed(format!("{method}: unexpected {other:?}"))),
+        Ok(None) => Err(ApiError::failed(format!("{method}: no reply"))),
+        Err(e) => Err(ApiError::failed(format!("{method}: {e}"))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1798,6 +1890,55 @@ mod tests {
     }
 
     #[test]
+    fn sessions_go_to_the_instances_helper_in_its_root() {
+        let dir = store_path("sessions").with_file_name("cfg");
+        let other = dir.with_file_name("other");
+        let rooted = |key: &str, helper: bool| {
+            format!(
+                "{}instance_id = \"id-{key}\"\nconfig_dir = {:?}\n{}",
+                instance(key, "web", ""),
+                dir.to_str().unwrap(),
+                if helper { "devsbd_arch = \"x86_64\"\n" } else { "" }
+            )
+        };
+        let state = state_file("sessions", &[rooted("web", true), rooted("bare", false)].concat());
+        // After `state_file`, which makes the dir afresh.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let rpc = |answer: Result<Obj, ApiError>| {
+            let asked = &asked;
+            move |c: &str, m: &str, p: Obj| {
+                asked.borrow_mut().push((c.to_string(), m.to_string(), p));
+                answer
+            }
+        };
+        let lines = Obj::new().with("sessions", vec!["1700000000-ab12 running detached 2023-11-14T22:13:20Z sh".to_string()]);
+        let list = |params: Value, answer| sessions_list(parse(params)?, &state, rpc(answer));
+        assert_eq!(
+            list(json!({"root": dir, "instance": "id-web"}), Ok(lines.clone())).unwrap(),
+            json!({"sessions": ["1700000000-ab12 running detached 2023-11-14T22:13:20Z sh"]}),
+            "by id"
+        );
+        assert_eq!(*asked.borrow(), [("devsandbox-web".to_string(), "session.ls".to_string(), Obj::new())]);
+        assert_eq!(code(list(json!({"root": other, "instance": "web"}), Ok(lines.clone()))), "not-found", "another root's");
+        assert_eq!(code(list(json!({"root": dir, "instance": "bare"}), Ok(lines.clone()))), "unsupported", "no helper");
+        assert_eq!(code(list(json!({"root": "rel", "instance": "web"}), Ok(lines.clone()))), "invalid");
+        assert_eq!(code(list(json!({"root": dir}), Ok(lines.clone()))), "invalid");
+        assert_eq!(code(list(json!({"root": dir, "instance": "web"}), Ok(Obj::new()))), "failed", "no `sessions`");
+        assert_eq!(code(list(json!({"root": dir, "instance": "web"}), Err(ApiError::unsupported("not root")))), "unsupported");
+        assert_eq!(asked.borrow().len(), 3, "refused before the helper");
+
+        asked.borrow_mut().clear();
+        let rm = |params: Value| sessions_rm(parse(params)?, &state, rpc(Ok(Obj::new())));
+        assert_eq!(rm(json!({"root": dir, "instance": "web", "id": "1700000000-ab12"})).unwrap(), json!({"ok": true}));
+        assert_eq!(asked.borrow()[0].2, Obj::new().with("id", "1700000000-ab12"));
+        assert_eq!(code(rm(json!({"root": dir, "instance": "web", "id": "../x"}))), "invalid");
+        assert_eq!(code(rm(json!({"root": dir, "instance": "nope", "id": "1700000000-ab12"}))), "not-found");
+        assert_eq!(asked.borrow().len(), 1);
+    }
+
+    #[test]
     fn instances_rename_moves_the_key_and_maps_refusals() {
         let me = std::process::id();
         let building = format!("[instance.b.progress]\nphase = \"building\"\npid = {me}\n");
@@ -2266,6 +2407,7 @@ mod tests {
         assert_matches("ServiceConfig", &v(&ServiceConfig { original: "t".into() }));
         assert_matches("InstanceRenamed", &v(&Renamed { instance: "w".into() }));
         assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true }));
+        assert_matches("SessionsList", &v(&SessionsList { sessions: vec!["1700000000-ab12 running detached 2023-11-14T22:13:20Z sh".into()] }));
         {
             use crate::config_identity::ops::{ConfigAcked, ConfigFindings, ConfigMigrated, IdentityFinding};
             let finding = IdentityFinding {
@@ -2296,6 +2438,8 @@ mod tests {
             ("instances.procs", "Record<string, InstanceProcs>"),
             ("instances.buildLog", "BuildLogTail | null"),
             ("instances.signal", "OkResult"),
+            ("sessions.list", "SessionsList"),
+            ("sessions.rm", "OkResult"),
             ("instances.rename", "InstanceRenamed"),
             ("instances.done", "InstanceDone"),
             ("containers.logs", "ContainerLogs"),

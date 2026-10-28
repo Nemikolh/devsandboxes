@@ -103,9 +103,8 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
 /// take it), per method.
 fn instance_keys(method: &str) -> &'static [&'static str] {
     match method {
-        "instances.cancel" | "instances.signal" | "instances.rename" | "instances.done" | "instances.buildLog" => {
-            &["instance"]
-        }
+        "instances.cancel" | "instances.signal" | "instances.rename" | "instances.done" | "instances.buildLog"
+        | "sessions.list" | "sessions.rm" => &["instance"],
         "rebuild" | "start" | "stop" | "rm" => &["instance"],
         _ => &[],
     }
@@ -140,7 +139,7 @@ pub fn confine_path(root: &Path, path: &Path, exists: bool) -> Result<PathBuf, A
 
 /// Whether recorded config root `dir` is under `root`: canonicalized when it
 /// still exists, else as recorded; never with a `..`.
-fn root_under(dir: &Path, root: &Path) -> bool {
+pub(crate) fn root_under(dir: &Path, root: &Path) -> bool {
     if dir.components().any(|c| c == Component::ParentDir) {
         return false;
     }
@@ -191,7 +190,12 @@ pub fn admit(method: &str, mut params: Value, scope: &Scope, state: &Path) -> Re
         Gate::Watch | Gate::Unwatch => Some("dir"),
         Gate::Verb => Some("root"),
         Gate::Quick if method == "instances.list" => Some("dir"),
-        Gate::Quick if method.starts_with("sandboxes.") || method.starts_with("config.") || method == "services.get" => {
+        Gate::Quick
+            if method.starts_with("sandboxes.")
+                || method.starts_with("config.")
+                || method.starts_with("sessions.")
+                || method == "services.get" =>
+        {
             Some("root")
         }
         _ => None,
@@ -454,6 +458,13 @@ mod tests {
         assert_eq!(code("instances.procs", json!({"instances": ["in", "own"]})), "not-found");
         assert!(admit("containers.logs", json!({"container": "devsandbox-in"}), &s, &state).is_ok());
         assert_eq!(code("containers.inspect", json!({"container": "devsandbox-own"})), "not-found");
+
+        // Sessions: the root confined and needed, the instance lent.
+        assert_eq!(ok("sessions.list", json!({"root": cfg, "instance": "id-in"})), json!({"root": cfg, "instance": "id-in"}));
+        assert!(admit("sessions.rm", json!({"root": cfg, "instance": "in", "id": "1700000000-ab12"}), &s, &state).is_ok());
+        assert_eq!(code("sessions.list", json!({"root": cfg, "instance": "own"})), "not-found");
+        assert_eq!(code("sessions.rm", json!({"root": base.join("mine"), "instance": "own", "id": "x"})), "denied");
+        assert_eq!(code("sessions.list", json!({"instance": "in"})), "invalid", "a root is needed");
 
         // Verbs: the root confined, the instance resolved (a sandbox name
         // matching both is refused), and named.

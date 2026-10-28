@@ -43,6 +43,8 @@ pub const QUICK: &[&str] = &[
     "instances.done",
     "instances.buildLog",
     "instances.resolve",
+    "sessions.list",
+    "sessions.rm",
     "containers.logs",
     "containers.inspect",
     "sandboxes.list",

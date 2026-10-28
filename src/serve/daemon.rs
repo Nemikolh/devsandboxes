@@ -435,8 +435,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
 
 /// The daemon's lending (`fleet::lender`): lend as `lend.toml` says now,
 /// and follow each `lend.set`. A lending thread's fleet root is created,
-/// and each `API` stream from the hub is a `Worker` connection
-/// ([`Shared::open_lent`]). Without a `lend.toml` path (no data dir) it's
+/// each `API` stream from the hub is a `Worker` connection
+/// ([`Shared::open_lent`]) and each `PTY` stream a session attach
+/// ([`Shared::open_lent_pty`]). Without a `lend.toml` path (no data dir) it's
 /// logged and `lend.*` fail.
 fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     let path = match &opts.lend {
@@ -465,13 +466,16 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     let weak = Arc::downgrade(shared);
     let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
         let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
-        let weak = weak.clone();
-        let open: fleet::worker::Open = Arc::new(move || weak.upgrade()?.open_lent(&scope));
+        let (api, pty) = (weak.clone(), weak.clone());
+        let api_scope = Arc::clone(&scope);
+        let api: fleet::worker::Open = Arc::new(move || api.upgrade()?.open_lent(&api_scope));
+        let pty: fleet::worker::Open = Arc::new(move || pty.upgrade()?.open_lent_pty(&scope));
+        let opens = vec![(fleet::LINK.channel, api), (crate::devsbd::proto::channel::PTY, pty)];
         // What the hub may send this worker: config roots and their repos,
         // into the fleet root (`fleet::code`); the hub's binary the lending
         // thread takes itself.
         let receivers = fleet::code::receivers(&start.root, fleet::transfer::Receivers::new(log));
-        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), open, receivers, follow.clone(), timing, log)
+        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), opens, receivers, follow.clone(), timing, log)
     });
     let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, link::hostname(), spawn, log));
     lender.start();
@@ -671,6 +675,25 @@ impl Shared {
         let (hub, ours) = Stream::pair().ok()?;
         super::relay::write_sentinel(&mut &ours, true).ok()?;
         self.spawn_conn_as(self.next_conn_id(), ours, Table::Worker(Arc::clone(scope)));
+        Some(hub.into())
+    }
+
+    /// One `PTY` stream of the lending link: a socket pair whose one end
+    /// goes to the hub, the other served by `fleet::pty::serve` on a thread
+    /// of its own (a session attach in one of `scope`'s instances). `None`
+    /// once the daemon is stopping, or without a host side (no helper
+    /// client).
+    fn open_lent_pty(self: &Arc<Self>, scope: &Arc<lent::Scope>) -> Option<crate::devsbd::mux::Conn> {
+        if *self.closed.0.lock().unwrap() {
+            return None;
+        }
+        let helper = self.helper.get()?.clone();
+        let (hub, ours) = Stream::pair().ok()?;
+        let (state, scope) = (self.state.clone(), Arc::clone(scope));
+        std::thread::Builder::new()
+            .name("serve-pty".into())
+            .spawn(move || fleet::pty::serve(ours, &helper, &state, &scope, crate::commands::exec::has_host_agent, log))
+            .ok()?;
         Some(hub.into())
     }
 
@@ -1506,7 +1529,7 @@ impl verbs::Peer for ConnPeer<'_> {
 /// readable and a peeked 0 bytes is EOF. Pending data (a request pipelined
 /// behind the verb) is left for the reader, and waited out by sleeping
 /// rather than polling again, which would return at once and spin.
-fn hung_up(stream: &Stream, tick: Duration) -> bool {
+pub(crate) fn hung_up(stream: &Stream, tick: Duration) -> bool {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };

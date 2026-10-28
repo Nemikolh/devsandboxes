@@ -18,6 +18,8 @@
 //!   its ssh to the hub.
 //! - `lent`: what a hub may do over that link (the daemon's `Worker`
 //!   connection table).
+//! - `pty`: the worker's end of a `PTY` stream: a session attach in a
+//!   lent instance, through its helper's `session.attach`.
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a worker
@@ -38,6 +40,7 @@ pub mod link;
 pub mod offer;
 pub mod place;
 pub mod placed;
+pub mod pty;
 pub mod transfer;
 pub mod update;
 pub mod worker;

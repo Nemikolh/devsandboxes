@@ -393,7 +393,7 @@ mod tests {
                 steps: Arc::new(crate::serve::fleet::update::tests::Fake::default()),
                 dev_builds: Arc::new(|| false),
             };
-            Lending::spawn(s.hub, s.name, s.root, s.draining, transport.clone(), Arc::new(|| None), crate::serve::fleet::transfer::Receivers::new(|_| {}), follow, timing, |_| {})
+            Lending::spawn(s.hub, s.name, s.root, s.draining, transport.clone(), Vec::new(), crate::serve::fleet::transfer::Receivers::new(|_| {}), follow, timing, |_| {})
         });
         Lender::new(path, "lap.local".into(), spawn, |_| {})
     }

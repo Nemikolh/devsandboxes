@@ -26,6 +26,7 @@ checks the typings against the wire structs).
 | Inbox | `inbox.threads.list`, `inbox.thread.get\|markRead\|act\|reply\|done\|reopen`, `inbox.form.saveDraft\|submit`, `inbox.notify.dismiss\|markRead` | no |
 | instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|done` | yes |
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
+| sessions | `sessions.list\|rm` | yes |
 | containers, config | `containers.logs\|inspect`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
@@ -460,6 +461,37 @@ idempotent (an instance already done keeps its original time). Result:
 
 Errors: `not-found` (no such instance), `invalid` (a missing param),
 `internal` (`state.toml` doesn't read or write).
+
+## Sessions
+
+An instance's resumable sessions (`devsandbox exec`'s, and a fleet link's
+`PTY` streams', docs/architecture/daemon/fleet.md), through its helper's
+`session.*` RPC methods (`serve::api::helper_rpc`). The instance is an
+exact name, else an instance id, whose config root is under `root`
+(canonicalized), and must have the helper. The helper's `session.*`
+methods are root only: an instance whose helper daemon isn't root
+(`containerUser`), or an older helper, answers `unsupported`.
+
+Errors of both: `invalid` (a missing param, a relative `root`),
+`not-found` (no directory `root`; no such instance in it; no live bridge
+to it: not running), `unsupported` (no helper, a helper without RPC, or
+one not offering the method), `failed` (the helper's `error`, as
+`<method>: <code>: <message>`, or the call broke), `internal`
+(`state.toml` doesn't read).
+
+### `sessions.list`
+
+Params: `{"root": "/abs/config/root", "instance": "<name or id>"}`.
+Result: `{"sessions": ["<line>", …]}`, the helper's `session ls` lines
+(`<id> <state> <attached|detached|-> <started> <argv…>`), oldest first.
+
+### `sessions.rm`
+
+Params: `{"root": …, "instance": …, "id": "<session id>"}`. Ends
+session `id` as `devsbd session rm` does (SIGHUP to its command's group,
+SIGKILL if it's still there after a grace period). Result: `{"ok":
+true}`. Also `invalid` for an id not in a session id's shape
+(`<unix secs:010>-<4 hex>`).
 
 ## Containers
 
@@ -1045,7 +1077,8 @@ machine, each with 15 s to answer:
 
 `instances.list`, `instances.resolve`, `instances.cancel`,
 `instances.procs`, `instances.signal`, `instances.rename`,
-`instances.done`, `instances.buildLog`, `containers.logs`,
+`instances.done`, `instances.buildLog`, `sessions.list`, `sessions.rm`,
+`containers.logs`,
 `containers.inspect`, `sandboxes.list`, `sandboxes.get`, `services.get`,
 and every verb (*Verbs on a machine*).
 

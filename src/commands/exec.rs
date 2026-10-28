@@ -382,6 +382,28 @@ pub(crate) fn ssh_auth_sock_env(instance: &Instance, host_agent: bool) -> Option
     }
 }
 
+/// Where and as whom a command runs in `instance`, and with what env: the
+/// workspace, the remote user (`None`: the container's own), and
+/// `Instance::exec_env` then `SSH_AUTH_SOCK` ([`ssh_auth_sock_env`]). What
+/// the runtime exec argv sets ([`exec_argv_with`]) and what a fleet `PTY`
+/// session is created with (`serve::fleet::pty`), so the two can't drift.
+pub(crate) struct ExecContext<'a> {
+    pub cwd: &'a str,
+    pub user: Option<&'a str>,
+    pub env: Vec<(String, String)>,
+}
+
+/// [`ExecContext`] of `instance`; `host_agent` as for [`ssh_auth_sock_env`].
+pub(crate) fn exec_context(instance: &Instance, host_agent: bool) -> ExecContext<'_> {
+    let mut env: Vec<(String, String)> = instance.exec_env().into_iter().collect();
+    // agent forwarding: the activating env var rides every exec, same as
+    // remote_env, via the shared rule (docs/architecture/helper/ssh-agent.md).
+    if let Some(sock) = ssh_auth_sock_env(instance, host_agent) {
+        env.push(("SSH_AUTH_SOCK".into(), sock.to_string()));
+    }
+    ExecContext { cwd: &instance.workspace, user: instance.remote_user.as_deref(), env }
+}
+
 /// Pure argv builder. `host_agent` says the host has a live agent (relay mode
 /// only); mount mode ignores it and injects unconditionally. For callers that
 /// probed it already (to ask the daemon for a bridge on the same answer).
@@ -399,20 +421,15 @@ pub(crate) fn exec_argv_with(
     if tty {
         args.push("-t".into());
     }
-    args.extend(["-w".into(), instance.workspace.clone()]);
-    if let Some(user) = &instance.remote_user {
+    let ctx = exec_context(instance, host_agent);
+    args.extend(["-w".into(), ctx.cwd.to_string()]);
+    if let Some(user) = ctx.user {
         args.push("-u".into());
-        args.push(user.clone());
+        args.push(user.to_string());
     }
-    for (key, value) in &instance.exec_env() {
+    for (key, value) in &ctx.env {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
-    }
-    // agent forwarding: the activating env var rides every exec, same as
-    // remote_env, via the shared rule (docs/architecture/helper/ssh-agent.md).
-    if let Some(sock) = ssh_auth_sock_env(instance, host_agent) {
-        args.push("-e".into());
-        args.push(format!("SSH_AUTH_SOCK={sock}"));
     }
     args.push(instance.container.clone());
     args.extend(command.iter().cloned());

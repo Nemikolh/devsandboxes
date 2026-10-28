@@ -9,8 +9,10 @@
 //! (`service::backoff`), reset once a link came up. [`Lending::status`] is
 //! the link's state for `lend.get`; [`Lending::set_draining`] changes what
 //! the next link offers (`--drain`) without dropping the current one.
-//! `TRANSFER` streams the hub opens go to the daemon's `Receivers`;
-//! [`Lending::open_transfer`] opens one toward the hub while a link is up.
+//! `PTY` streams (`fleet::pty`) are answered by the daemon's handler for
+//! them, like `API` ones ([`Opens`]). `TRANSFER` streams the hub opens go
+//! to the daemon's `Receivers`; [`Lending::open_transfer`] opens one toward
+//! the hub while a link is up.
 //!
 //! Before it serves anything, each link compares the hub's build (its
 //! `Hello`) with this one's (`update::decide`): another published build is
@@ -55,9 +57,14 @@ pub fn ssh_transport() -> Transport {
     Arc::new(|argv: &[OsString]| ssh::spawn(argv))
 }
 
-/// How the daemon answers one `API` stream: the hub's end of a new
-/// connection, `None` to refuse it.
+/// How the daemon answers one stream the hub opens (`API`, `PTY`): the
+/// hub's end of a new connection, `None` to refuse it.
 pub type Open = Arc<dyn Fn() -> Option<Conn> + Send + Sync>;
+
+/// The channels the daemon answers on each link, with their [`Open`]s
+/// (`TRANSFER` aside: the lending thread's receivers take it). All refused
+/// while the link waits for the hub's binary.
+pub type Opens = Vec<(u8, Open)>;
 
 /// How this worker follows its hub's build.
 #[derive(Clone)]
@@ -225,7 +232,8 @@ impl Incoming {
 
 impl Lending {
     /// Start lending to `hub` as `name`, offering fleet root `root`
-    /// (`draining`: offering `--drain`); the hub's `TRANSFER` streams go to
+    /// (`draining`: offering `--drain`); the hub's streams on `opens`'
+    /// channels go to their handlers, its `TRANSFER` streams to
     /// `receivers`, plus the hub's binary; a hub on another build is
     /// followed through `follow`.
     #[allow(clippy::too_many_arguments)]
@@ -235,7 +243,7 @@ impl Lending {
         root: PathBuf,
         draining: bool,
         transport: Transport,
-        open: Open,
+        opens: Opens,
         receivers: Receivers,
         follow: Follow,
         timing: Timing,
@@ -250,7 +258,7 @@ impl Lending {
             let ctl = Arc::clone(&ctl);
             std::thread::Builder::new()
                 .name("serve-lend".into())
-                .spawn(move || lend_loop(&hub, &name, &root, &transport, &open, &timing, &ctl, log))
+                .spawn(move || lend_loop(&hub, &name, &root, &transport, &opens, &timing, &ctl, log))
                 .context("cannot start the lending thread")?
         };
         Ok(Lending { ctl, thread: Some(thread) })
@@ -311,7 +319,7 @@ impl Ctl {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lend_loop(hub: &str, name: &str, root: &Path, transport: &Transport, open: &Open, timing: &Timing, ctl: &Ctl, log: fn(&str)) {
+fn lend_loop(hub: &str, name: &str, root: &Path, transport: &Transport, opens: &Opens, timing: &Timing, ctl: &Ctl, log: fn(&str)) {
     let mut failures = 0;
     while !ctl.stopped() {
         let argv = match link_argv(hub, name, root, ctl.draining.load(Ordering::SeqCst)) {
@@ -328,7 +336,7 @@ fn lend_loop(hub: &str, name: &str, root: &Path, transport: &Transport, open: &O
                 ctl.set_status(Status::Retrying(format!("{e:#}")));
             }
             Ok(duplex) => {
-                if run_link(hub, name, duplex, open, ctl, log) {
+                if run_link(hub, name, duplex, opens, ctl, log) {
                     failures = 0;
                 }
             }
@@ -340,7 +348,7 @@ fn lend_loop(hub: &str, name: &str, root: &Path, transport: &Transport, open: &O
 }
 
 /// One link over `duplex` until it ends; `true` if it came up.
-fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, log: fn(&str)) -> bool {
+fn run_link(hub: &str, name: &str, mut duplex: Duplex, opens: &Opens, ctl: &Ctl, log: fn(&str)) -> bool {
     let (Ok(reader), Ok(writer), Ok(killer)) = (duplex.stream.try_clone(), duplex.stream.try_clone(), duplex.stream.try_clone())
     else {
         log("fleet: cannot clone the link's socket");
@@ -355,11 +363,16 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
     }
     let up = AtomicBool::new(false);
     let wanted: Mutex<Option<String>> = Mutex::new(None);
-    // While the hub's binary is on its way the link serves no `API` stream:
-    // nothing reaches the `Worker` table until the update is done.
+    // While the hub's binary is on its way the link serves no `API` (or
+    // `PTY`) stream: nothing reaches the `Worker` table, nor an instance,
+    // until the update is done.
     let receiving = AtomicBool::new(false);
     let mut link_stream = duplex.stream.try_clone().ok();
-    let mut serves = link::Serves::default().with(LINK.channel, || if receiving.load(Ordering::Relaxed) { None } else { open() });
+    let mut serves = link::Serves::default();
+    for (channel, open) in opens {
+        let receiving = &receiving;
+        serves = serves.with(*channel, move || if receiving.load(Ordering::Relaxed) { None } else { open() });
+    }
     if let Some(receivers) = &ctl.receivers {
         serves = serves.transfers(Arc::clone(receivers));
     }
@@ -497,13 +510,15 @@ mod tests {
     fn hub_pushing(hello: &'static str, dir: PathBuf, binary: Binary) -> Transport {
         Arc::new(move |_: &[OsString]| {
             let (worker, hub) = std::os::unix::net::UnixStream::pair()?;
-            let (socket, xfer) = (dir.join("fleet-lap.sock"), dir.join("fleet-lap.transfer.sock"));
+            let (socket, xfer, pty) =
+                (dir.join("fleet-lap.sock"), dir.join("fleet-lap.transfer.sock"), dir.join("fleet-lap.pty.sock"));
             let binary = Arc::clone(&binary);
             std::thread::spawn(move || {
                 let spec = link::Spec { hello, ..LINK };
                 let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|_| {})));
                 let (r, w) = (hub.try_clone().unwrap(), hub);
-                let sockets = [(spec.channel, socket.as_path()), (crate::devsbd::proto::channel::TRANSFER, xfer.as_path())];
+                use crate::devsbd::proto::channel;
+                let sockets = [(spec.channel, socket.as_path()), (channel::TRANSFER, xfer.as_path()), (channel::PTY, pty.as_path())];
                 let push_to = xfer.clone();
                 link::opener_with(&spec, r, w, &sockets, serves, |peer| {
                     crate::commands::fleet_link::push_build(hello, &peer.hash, push_to, move || binary());
@@ -515,7 +530,8 @@ mod tests {
     }
 
     /// A lending thread to an in-process hub (`hub_pushing`) in a fresh
-    /// `dir`; every `API` stream the worker answers is counted (`opens`).
+    /// `dir`; every `API` and `PTY` stream the worker answers is counted
+    /// (`opens`).
     struct Lent {
         lending: Lending,
         dir: PathBuf,
@@ -534,17 +550,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&opens);
+        let counter = |opens: &Arc<std::sync::atomic::AtomicUsize>| -> Open {
+            let counted = Arc::clone(opens);
+            Arc::new(move || -> Option<Conn> {
+                counted.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+        };
         let lending = Lending::spawn(
             "hub".into(),
             "lap".into(),
             "/fleet/hub".into(),
             false,
             hub_pushing(hello, dir.clone(), binary),
-            Arc::new(move || -> Option<Conn> {
-                counted.fetch_add(1, Ordering::SeqCst);
-                None
-            }),
+            vec![(LINK.channel, counter(&opens)), (crate::devsbd::proto::channel::PTY, counter(&opens))],
             Receivers::new(|_| {}),
             Follow { steps, dev_builds: Arc::new(move || dev_builds) },
             timing,
@@ -636,10 +655,13 @@ mod tests {
         let lent = lend_to(hub, "dev-ok", Arc::clone(&steps), true, hub_binary(base.clone(), Some(gate)));
         wait_status(&lent.lending, |w| w == "receiving the hub's build 0.0.1 (dev, 0123abcd)");
 
-        // The Worker table is out of reach: an `API` stream is refused.
-        let mut probe = std::os::unix::net::UnixStream::connect(lent.dir.join("fleet-lap.sock")).unwrap();
-        probe.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(std::io::Read::read(&mut probe, &mut [0u8; 16]).unwrap(), 0, "closed: refused");
+        // The Worker table is out of reach: an `API` stream is refused, and
+        // so is a `PTY` one.
+        for sock in ["fleet-lap.sock", "fleet-lap.pty.sock"] {
+            let mut probe = std::os::unix::net::UnixStream::connect(lent.dir.join(sock)).unwrap();
+            probe.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(std::io::Read::read(&mut probe, &mut [0u8; 16]).unwrap(), 0, "{sock} closed: refused");
+        }
         assert_eq!(lent.opens.load(Ordering::SeqCst), 0);
         assert!(steps.calls().is_empty(), "nothing before the binary");
 
@@ -1204,7 +1226,7 @@ mod tests {
         });
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let lending =
-            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), Receivers::new(|_| {}), Follow { steps: Arc::new(Fake::default()), dev_builds: Arc::new(|| false) }, timing, |_| {}).unwrap();
+            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Vec::new(), Receivers::new(|_| {}), Follow { steps: Arc::new(Fake::default()), dev_builds: Arc::new(|| false) }, timing, |_| {}).unwrap();
         let start = std::time::Instant::now();
         while tries.load(Ordering::SeqCst) < 3 {
             assert!(start.elapsed() < Duration::from_secs(5), "retried");

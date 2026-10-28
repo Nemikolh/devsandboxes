@@ -81,7 +81,9 @@ a peer advertising `caps::TRANSFER`. `PTY` = 8 (an interactive terminal),
 containers' `SSH_AGENT`): host-to-host only as well, opened by either end
 toward a peer advertising `caps::PTY` / `caps::TUNNEL` / `caps::AGENT`, a
 stream's header in its first bytes, as `TRANSFER`'s is (the `Open` payload
-stays one channel byte). Between two hosts' link ends the end with the
+stays one channel byte). A `PTY` stream carries [RPC](#rpc) records, its
+header a `session.attach` `call`, the rest relayed to and from the
+instance helper's own `session.attach` ([fleet](../daemon/fleet.md#pty)). Between two hosts' link ends the end with the
 sockets opens with ids below 2^31, the other end with high-bit ids, which
 the first admits through `Mux::on_host_open`; each end answers from the
 table of channels it serves (`serve::fleet::link::Serves`).
