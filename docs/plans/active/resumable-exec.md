@@ -227,7 +227,7 @@ Now, before [fleet](fleet.md) step 2:
 After fleet step 1 (fleet root, `lend.toml`):
 
 - Surface detached sessions (dashboard rows, maybe an Inbox note). The
-  Inbox is per host until fleet step 14, so a note for a hub-placed
+  Inbox is per host until fleet step 15, so a note for a hub-placed
   instance would land in the worker's own Inbox.
 - A policy for sessions nobody re-attaches to (idle timeout or
   explicit); on a worker they hold lent capacity, so it may belong in

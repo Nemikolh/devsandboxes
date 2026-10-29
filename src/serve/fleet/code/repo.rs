@@ -36,7 +36,7 @@ pub fn probe(folder: &Path) -> Result<Option<Checkout>> {
 
 /// The cache of `origin` in `repos` (`<data>/devsandbox/repos`): a bare
 /// repo named by a hash of the URL, `<sha256 prefix>.git`. (Repo identity
-/// by root commits, which needs no URL, is fleet step 11.)
+/// by root commits, which needs no URL, is fleet step 12.)
 pub fn cache_dir(repos: &Path, origin: &str) -> PathBuf {
     let hash: String = Sha256::digest(origin.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
     repos.join(format!("{hash}.git"))

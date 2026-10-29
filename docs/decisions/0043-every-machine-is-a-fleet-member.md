@@ -1,6 +1,6 @@
 # 0043: Every machine is a fleet member; how far others reach it is the member's setting
 
-Status: proposed (fleet plan step 9). Accepted when step 9 ships; it
+Status: proposed (fleet plan step 10). Accepted when step 10 ships; it
 then replaces 0041, removed with it (never released), and 0020's
 one-hop machine links (ssh and the protocol match stay).
 
@@ -37,7 +37,7 @@ hub.
   reach. `full`: the member's whole API. No link carries the setting.
 - **The hub is swappable.** `machine hub <m>` moves the role; links stay
   and `m` rebuilds its view from the members (its state handed over
-  later, fleet step 16).
+  later, fleet step 17).
 - **One user.** A fleet is one user's machines; sharing one between
   users is out of scope.
 
@@ -56,4 +56,4 @@ hub.
   step 4's channels before the per-use ssh argvs can go.
 
 Source: docs/plans/active/fleet.md, "Members, links and the hub"
-through "Trust", rollout steps 5-9.
+through "Trust", rollout steps 5-10.

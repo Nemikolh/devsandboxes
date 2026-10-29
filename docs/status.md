@@ -35,7 +35,7 @@ limitation means editing this file in the same commit.
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
   re-placement: from fleet step 7 on. Steps 1-6 shipped on the two-kind
-  model that steps 7-9 replace (steps 4-5's channels and API forms on
+  model that steps 7-10 replace (steps 4-5's channels and API forms on
   offered workers' links only; step 6's `member.toml` and trust table on
   both kinds' API connections).
   → [plan](plans/active/fleet.md)
@@ -323,7 +323,7 @@ limitation means editing this file in the same commit.
   (`ssh::tty_argv` for terminals, `cli_argv` for `--machine` `ps` / `ls` /
   `stats` / `gc` / `service ls`, `tunnel_argv` for forwards,
   `agent_argv`) are plain ssh shells on the machine, whatever its `trust`,
-  until one link per machine pair replaces them (fleet step 7).
+  until every use goes over the machine's link (fleet steps 7-8).
   → [machines](architecture/daemon/machines.md#ssh); `serve::machines::ssh`
 - A machine added before `machine add` recorded its roots there has none
   in its `member.toml`, so its `worker` trust refuses those of its roots
@@ -358,10 +358,10 @@ limitation means editing this file in the same commit.
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::candidates`
 - A placed `run` is placed only by the daemon's `run` verb: a CLI `run`
   with no daemon to reach, the dispatcher's children and `--in-process`
-  runs stay here (fleet step 12 for children), and only offered workers
+  runs stay here (fleet step 13 for children), and only offered workers
   are candidates (an ssh machine needs `--machine` or a qualified name).
   The hub's `state.toml` doesn't record a placed instance (it's the
-  worker's, seen as `<worker>/<name>` in federated views; fleet step 12).
+  worker's, seen as `<worker>/<name>` in federated views; fleet step 13).
   Moving the
   code runs before the forward and isn't cancelled by a hang-up or Ctrl-C
   meanwhile (the run, once forwarded, is); a worker that refuses the run
