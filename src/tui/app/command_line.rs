@@ -125,7 +125,8 @@ impl App {
     /// `r` (Instances tab): open the prompt pre-filled `run <sandbox> ` for the
     /// sandbox under the cursor (a sandbox / empty node's sandbox, or the sandbox
     /// behind an instance). The orphan group, its children, and no selection fall
-    /// back to a plain empty prompt (identical to `:`).
+    /// back to a plain empty prompt (identical to `:`). The name is written
+    /// as it resolves back (`remote::typed`: `@/s` when a machine has an `s`).
     fn open_run_prompt(&mut self) {
         self.status = None;
         let sandbox = self.snapshot.as_ref().and_then(|snapshot| {
@@ -139,6 +140,7 @@ impl App {
                 }
                 Some(Node::Orphans) | None => None,
             }
+            .map(|key| remote::typed(snapshot, &key, remote::Kind::Sandbox))
         });
         let history = crate::tui::prompt::load_history();
         self.prompt = Some(match sandbox {
@@ -152,9 +154,13 @@ impl App {
     /// Sandbox / empty / orphan-group selections have no instance, so they fall
     /// back to [`Self::open_run_prompt`] — `r` keeps its run behavior there.
     pub(super) fn open_rename_or_run_prompt(&mut self) {
-        let Some(name) = self.selected_instance_name() else {
+        let Some(key) = self.selected_instance_name() else {
             self.open_run_prompt();
             return;
+        };
+        let name = match &self.snapshot {
+            Some(s) => remote::typed(s, &key, remote::Kind::Instance),
+            None => key,
         };
         self.status = None;
         let history = crate::tui::prompt::load_history();
@@ -528,10 +534,47 @@ mod tests {
         let app = machine_app();
         let sandboxes = remote::candidates(app.snapshot.as_ref().unwrap(), remote::Kind::Sandbox);
         let instances = app.instance_names();
-        assert_eq!(sandboxes, ["s", "box/s"]);
-        assert_eq!(instances, ["inst0", "inst1", "box/inst0", "box/inst1"]);
+        assert_eq!(sandboxes, ["@/s", "box/s"]);
+        assert_eq!(instances, ["@/inst0", "@/inst1", "box/inst0", "box/inst1"]);
         let got = App::candidates_for(Tab::Instances, 1, &toks("stop "), &sandboxes, &instances, &[], &BTreeMap::new());
         assert_eq!(got, instances);
+    }
+
+    /// `r` and tab write a name a machine also has qualified, so the line
+    /// submits instead of failing as ambiguous.
+    #[test]
+    fn r_and_tab_qualify_names_on_several_machines() {
+        let mut app = machine_app(); // tree: s, inst0, inst1, box's s, inst0, inst1
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(prompt(&app).input(), "run @/s ");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Run { sandbox: "s".into(), name: None, branch: None, base: None })
+        );
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(prompt(&app).input(), "rename @/inst0 ");
+        app.prompt = None;
+        for _ in 0..2 {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(prompt(&app).input(), "run box/s ");
+        app.prompt = None;
+
+        // A bare stem completes to `@/` first, then the machine's.
+        app.on_key(key(KeyCode::Char(':')));
+        type_line(&mut app, "run s");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(prompt(&app).input(), "run @/s");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(prompt(&app).input(), "run box/s");
+        app.prompt = None;
+        app.on_key(key(KeyCode::Char(':')));
+        type_line(&mut app, "stop box/i");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(prompt(&app).input(), "stop box/inst0");
     }
 
     #[test]

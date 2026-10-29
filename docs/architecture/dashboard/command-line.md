@@ -62,12 +62,15 @@ service-only one); a machine with no known root yet is a status line.
 command names for the first token; after it, the command's spec decides:
 the preceding flag's value kind, unused flags on a `-` stem, the next
 unconsumed positional, then the unused flags again. `exec`'s trailing
-argv gets nothing. The prompt filters by the token's stem, sorts, applies
-the first match and cycles on repeated `tab`; any other edit ends the
-cycle.
+argv gets nothing. The prompt filters by the token's stem (a stem without
+`/` also matches after a candidate's `<machine>/` or `@/`), sorts,
+applies the first match and cycles on repeated `tab`; any other edit ends
+the cycle.
 
 Candidates come from the snapshot only, never config: instance, service
-and sandbox names (`remote::candidates`, remote ones qualified), and for
+and sandbox names (`remote::candidates`, remote ones qualified and a
+local one `@/<name>` when a machine has the same name, `remote::typed`:
+what resolves back without ambiguity), and for
 `--branch` the sandbox row's `worktree_branch`, else
 `DEFAULT_WORKTREE_BRANCH`, with `${…}` left unsubstituted.
 
@@ -97,7 +100,8 @@ The event loop takes `App::pending_action`
   service is the same call with `machine` and its root there as `dir`.
 
 One-key shortcuts reuse the prompt: `r` prefills `rename <instance> ` (or
-`run <sandbox> ` off an instance), `p` prefills `port <instance> ` or
+`run <sandbox> ` off an instance; both names as `remote::typed` writes
+them, `run @/s ` when a machine has an `s` too), `p` prefills `port <instance> ` or
 `port <instance> --service <svc> ` (a machine's row by its key: `port
 box/web `, `port box/web --service db `, or for a service nobody uses yet
 `port  --service box/db `).

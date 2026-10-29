@@ -281,8 +281,10 @@ impl Prompt {
     /// Tab: complete the token under the cursor. `candidates(token_index,
     /// tokens)` supplies the raw candidate list for that position given the
     /// line's whitespace-split tokens (so callers can key on the command and
-    /// on preceding flags); the prompt filters by the token's stem, applies
-    /// the first match, and cycles on repeated calls. Any non-tab edit clears
+    /// on preceding flags); the prompt filters by the token's stem (a stem
+    /// without `/` also matches the name after a candidate's `<machine>/`
+    /// or `@/`, so `web` completes to `@/web` and `box/web` when both
+    /// exist), applies the first match, and cycles on repeated calls. Any non-tab edit clears
     /// the cycle (via [`Self::edited`]).
     pub fn complete<F>(&mut self, candidates: F)
     where
@@ -304,7 +306,10 @@ impl Prompt {
         let tokens: Vec<String> = self.input.split_whitespace().map(str::to_string).collect();
         let mut cands: Vec<String> = candidates(idx, &tokens)
             .into_iter()
-            .filter(|c| c.starts_with(&stem))
+            .filter(|c| {
+                c.starts_with(&stem)
+                    || (!stem.contains('/') && c.split_once('/').is_some_and(|(_, name)| name.starts_with(&stem)))
+            })
             .collect();
         cands.sort();
         cands.dedup();

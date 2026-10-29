@@ -244,12 +244,7 @@ pub enum Kind {
 /// typed (the daemon resolves sandbox / folder names, as before machines).
 pub fn resolve(s: &Snapshot, arg: &str, kind: Kind) -> Result<String, String> {
     let (place, name) = parse_name(arg).map_err(|e| format!("{e:#}"))?;
-    let rows: Vec<Option<&str>> = match kind {
-        Kind::Instance => s.instances.iter().filter(|r| r.name == name).map(|r| r.machine.as_deref()).collect(),
-        Kind::Sandbox => s.sandboxes.iter().filter(|r| r.name == name).map(|r| r.machine.as_deref()).collect(),
-        Kind::Service => s.services.iter().filter(|r| r.name == name).map(|r| r.machine.as_deref()).collect(),
-    };
-    let mut found: Vec<Option<&str>> = rows
+    let mut found: Vec<Option<&str>> = machines_of(s, &name, kind)
         .into_iter()
         .filter(|m| match &place {
             Where::Local => m.is_none(),
@@ -270,14 +265,36 @@ pub fn resolve(s: &Snapshot, arg: &str, kind: Kind) -> Result<String, String> {
     }
 }
 
-/// Completion candidates for `kind`: every row's name, remote ones
-/// qualified (a bare name is still accepted when unique).
+/// The machines (`None`: this host) with a row of `kind` named `name`.
+fn machines_of<'a>(s: &'a Snapshot, name: &str, kind: Kind) -> Vec<Option<&'a str>> {
+    match kind {
+        Kind::Instance => s.instances.iter().filter(|r| r.name == name).map(|r| r.machine.as_deref()).collect(),
+        Kind::Sandbox => s.sandboxes.iter().filter(|r| r.name == name).map(|r| r.machine.as_deref()).collect(),
+        Kind::Service => s.services.iter().filter(|r| r.name == name).map(|r| r.machine.as_deref()).collect(),
+    }
+}
+
+/// Key `key` of `kind` as the prompt writes it, so [`resolve`] gets the
+/// same key back: a local name a machine also has is `@/<name>` (bare, it
+/// would be ambiguous), anything else the key itself.
+pub fn typed(s: &Snapshot, key: &str, kind: Kind) -> String {
+    match split(key) {
+        (None, name) if machines_of(s, name, kind).iter().any(Option::is_some) => format!("@/{name}"),
+        _ => key.to_string(),
+    }
+}
+
+/// Completion candidates for `kind`: every row's name as [`typed`] writes
+/// it (remote ones qualified, a local one `@/` when a machine has it too).
 pub fn candidates(s: &Snapshot, kind: Kind) -> Vec<String> {
     let mut out: Vec<String> = match kind {
         Kind::Instance => s.instances.iter().map(instance_key).collect(),
         Kind::Sandbox => s.sandboxes.iter().map(sandbox_key).collect(),
         Kind::Service => s.services.iter().map(service_key).collect(),
     };
+    for k in &mut out {
+        *k = typed(s, k, kind);
+    }
     // A sandbox / service defined in two of a machine's roots: one key.
     let mut seen = std::collections::BTreeSet::new();
     out.retain(|k| seen.insert(k.clone()));
@@ -368,8 +385,15 @@ pub(crate) mod tests {
         // Sandboxes: one machine's two roots are one match.
         assert_eq!(resolve(&s, "box/web", Kind::Sandbox), Ok("box/web".into()));
         assert!(resolve(&s, "web", Kind::Sandbox).is_err());
-        assert_eq!(candidates(&s, Kind::Sandbox), ["web", "box/web"]);
-        assert_eq!(candidates(&s, Kind::Instance), ["web", "box/web", "box/api", "db"]);
+        // A local name a machine has too completes as `@/`, as it must be typed.
+        assert_eq!(candidates(&s, Kind::Sandbox), ["@/web", "box/web"]);
+        assert_eq!(candidates(&s, Kind::Instance), ["@/web", "box/web", "box/api", "db"]);
+        assert_eq!(typed(&s, "web", Kind::Instance), "@/web");
+        assert_eq!(typed(&s, "db", Kind::Instance), "db");
+        assert_eq!(typed(&s, "box/web", Kind::Instance), "box/web");
+        for key in s.instances.iter().map(instance_key) {
+            assert_eq!(resolve(&s, &typed(&s, &key, Kind::Instance), Kind::Instance), Ok(key));
+        }
     }
 
     /// Every machine's tabs, ssh or inbound, run this host's devsandbox on
