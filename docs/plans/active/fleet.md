@@ -1,12 +1,14 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-6 shipped
+Status: in progress. Steps 1-7 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
 built on two kinds of machine (ssh machines and offered workers, `fleet
 join`, `lend`; step 4's channels on the fleet link only; step 6's
-trust table on both kinds' API connections); steps 7-10 replace that with the model below (ADR
+trust table on both kinds' API connections; step 7's one link per pair
+under ssh machines, their per-use ssh argvs still beside it); steps 8-10
+replace that with the model below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
 proposed). The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
@@ -352,7 +354,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    (`machine roots add` there over its add-time ssh); `gc` is a daemon
    verb, `full` only; the per-use ssh argvs still bypass trust until
    step 8.
-7. **One link per machine pair** (L, as 7a-7e).
+7. **One link per machine pair** (L, shipped as 7a-7e).
    [Members, links and the hub](#members-links-and-the-hub): a
    `Transport` seam (dial → `Duplex`), ssh its only implementation;
    several connections would only ever be a bandwidth detail behind it,
@@ -413,6 +415,17 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
      (the `agent-relay` thread no longer started); no `api_argv` /
      `--session-env` for machines.
    - **7e docs close**.
+
+   As built: `links.inbound` and `link.attach` are local only (the
+   trust table refuses `link.*` and `links.*`); an inbound neighbor is a
+   `machines.list` row of kind `inbound`, its roots asked once at the
+   announce; a peer's verbs run with the daemon's env, `SSH_AUTH_SOCK`
+   its relayed `agent-link-<peer>.sock` while that answers
+   (`lent::Peer::agent`); `machines.hold` went, a CLI re-run reports its
+   terminal's agent with `machines.get {agent}`; the dialer's IN names
+   the peer by its registry entry, so its fleet root there is
+   `fleet/<entry name>/`. A daemon with machines still idles out (a link
+   isn't a holder).
 8. **One kind of machine** (L, broken down after step 7). Every entry
    reached through its channel forms (CLI, dashboard, forwards and
    `port`); the per-use ssh argvs, `devsandbox tunnel`, `agent-relay`,

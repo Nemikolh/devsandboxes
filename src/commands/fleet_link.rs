@@ -8,7 +8,7 @@
 //! `commands::agent_relay` is of the agent relay's: it binds
 //! `endpoint::fleet_socket` (`fleet-<name>.sock`, 0600 in the 0700 socket
 //! dir; the newest link for a worker wins), and each connection there (the
-//! hub's link to the offered machine, its forwarded verbs: `fleet::offer::dial`)
+//! hub's link to the offered machine, its forwarded verbs: `fleet::dialer::dial`)
 //! becomes one `API` stream to the worker's daemon. Once the `Hello`s are
 //! through it sends `fleet.offer {worker, version, root, draining}` to this host's daemon
 //! (started like any client's, if it isn't running), which registers the
