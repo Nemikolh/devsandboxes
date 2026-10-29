@@ -179,9 +179,14 @@ impl App {
     }
 
     /// The prompt prefilled `port <name> `, whatever is selected (the Inbox
-    /// thread pane's `p` targets the thread's child). A machine's instance
-    /// is its key (`port box/web `), which the prompt resolves back.
-    pub(super) fn open_port_prompt_for(&mut self, name: &str) {
+    /// thread pane's `p` targets the thread's child). `key` written as it
+    /// resolves back (`remote::typed`): `port box/web `, or `port @/web `
+    /// when a machine has a `web` too.
+    pub(super) fn open_port_prompt_for(&mut self, key: &str) {
+        let name = match &self.snapshot {
+            Some(s) => remote::typed(s, key, remote::Kind::Instance),
+            None => key.to_string(),
+        };
         self.status = None;
         let history = crate::tui::prompt::load_history();
         self.prompt = Some(Prompt::with_input(history, format!("port {name} ")));
@@ -196,19 +201,16 @@ impl App {
     /// A machine's service: `port box/<user> --service <svc> ` (the instance
     /// key names the machine, as everywhere), or with no user `port  --service
     /// box/<svc> `, the qualified service putting the instance typed next on
-    /// that machine ([`resolve_port`]).
+    /// that machine ([`resolve_port`]). A local name a machine also has is
+    /// `@/` (`remote::typed`), so the line isn't ambiguous.
     pub(super) fn open_port_prompt_service(&mut self) {
-        let Some(row) = self
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.services.get(self.selected()))
-        else {
+        let Some((s, row)) = self.snapshot.as_ref().and_then(|s| Some((s, s.services.get(self.selected())?))) else {
             return;
         };
         let machine = row.machine.as_deref();
         let (instance, svc) = match row.used_by.first() {
-            Some(user) => (remote::qualify(machine, user), row.name.clone()),
-            None => (String::new(), remote::qualify(machine, &row.name)),
+            Some(user) => (remote::typed(s, &remote::qualify(machine, user), remote::Kind::Instance), row.name.clone()),
+            None => (String::new(), remote::typed(s, &remote::qualify(machine, &row.name), remote::Kind::Service)),
         };
         self.status = None;
         let history = crate::tui::prompt::load_history();
@@ -575,6 +577,42 @@ mod tests {
         type_line(&mut app, "stop box/i");
         app.on_key(key(KeyCode::Tab));
         assert_eq!(prompt(&app).input(), "stop box/inst0");
+        app.prompt = None;
+
+        // `p` too: on the local inst0, and on a local service whose name
+        // and first user a machine also has.
+        app.set_tab(Tab::Instances);
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Up));
+        }
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port @/inst0 ");
+        type_line(&mut app, "3000");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_port().map(|r| (r.instance, r.machine)), Some(("inst0".into(), None)));
+        let mut s = app.snapshot.clone().unwrap();
+        let mut db = s.services[0].clone();
+        db.machine = None;
+        db.root = None;
+        s.services.insert(0, db);
+        app.set_snapshot(s);
+        app.set_tab(Tab::Services);
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port  --service @/db ");
+        app.prompt = None;
+        let mut s = app.snapshot.clone().unwrap();
+        s.services[0].used_by = vec!["inst0".into()];
+        app.set_snapshot(s);
+        app.set_tab(Tab::Services);
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port @/inst0 --service db ");
+        type_line(&mut app, "5432");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_pending_port().map(|r| (r.instance, r.service, r.machine)),
+            Some(("inst0".into(), Some("db".into()), None))
+        );
     }
 
     #[test]

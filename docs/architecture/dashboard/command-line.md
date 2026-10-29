@@ -104,7 +104,8 @@ One-key shortcuts reuse the prompt: `r` prefills `rename <instance> ` (or
 them, `run @/s ` when a machine has an `s` too), `p` prefills `port <instance> ` or
 `port <instance> --service <svc> ` (a machine's row by its key: `port
 box/web `, `port box/web --service db `, or for a service nobody uses yet
-`port  --service box/db `).
+`port  --service box/db `; a local name a machine also has as `@/web`,
+`remote::typed`).
 
 ## Adding a command or flag
 
