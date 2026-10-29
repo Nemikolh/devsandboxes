@@ -349,7 +349,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             procs_after_snapshot = true;
         }
         // An open build log wants (re)reading (one read outstanding at a
-        // time: `take_build_log_read`).
+        // time: `take_build_log_read`), its in-flight re-reads on the clock.
+        app.tick_build_log(Instant::now());
         if let Some(id) = app.take_build_log_read() {
             daemon.build_log(id);
         }

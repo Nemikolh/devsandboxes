@@ -206,6 +206,9 @@ pub struct App {
     /// A build-log read was handed to the event loop and isn't answered yet
     /// ([`App::take_build_log_read`]).
     build_log_in_flight: bool,
+    /// When the open build log is next re-read while it's being written
+    /// ([`App::tick_build_log`]).
+    build_log_due: Option<std::time::Instant>,
     /// Daemon reads the open modals wait on, for the event loop to send.
     pending_fetch: Vec<Fetch>,
     /// The container the logs modal shows, so a late answer for another
@@ -332,6 +335,7 @@ impl App {
             pending_cancel: None,
             pending_build_log: None,
             build_log_in_flight: false,
+            build_log_due: None,
             pending_fetch: Vec::new(),
             logs_container: None,
             pending_done: Vec::new(),

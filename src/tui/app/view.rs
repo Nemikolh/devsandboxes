@@ -206,6 +206,11 @@ pub struct HelpModal {
 /// failed, what it's doing), `logs --build` has the rest.
 pub const BUILD_LOG_LINES: usize = 500;
 
+/// How often an open build log is re-read while its instance is in flight,
+/// as `logs --build --follow` polls (`commands::logs::FOLLOW_POLL`): the
+/// snapshots it otherwise follows come 2 s or more apart.
+pub const BUILD_LOG_REREAD: std::time::Duration = crate::commands::logs::FOLLOW_POLL;
+
 /// Lines of container output the logs modal (`l`) shows.
 pub const LOG_LINES: usize = 50;
 
@@ -723,9 +728,32 @@ impl App {
         });
     }
 
+    /// The event loop's clock, on every pass: an open build log whose
+    /// instance is in flight is re-read [`BUILD_LOG_REREAD`] after the last
+    /// read was answered (only that one log; snapshots are untouched), so a
+    /// slow daemon or link isn't asked back to back. The first tick after
+    /// an answer only starts the interval.
+    pub fn tick_build_log(&mut self, now: std::time::Instant) {
+        let Modal::BuildLog(view) = &self.modal else {
+            self.build_log_due = None;
+            return;
+        };
+        if !view.live || self.build_log_in_flight || self.pending_build_log.is_some() {
+            return;
+        }
+        match self.build_log_due {
+            Some(due) if now < due => {}
+            Some(_) => {
+                self.build_log_due = Some(now + BUILD_LOG_REREAD);
+                self.pending_build_log = Some(view.instance_id.clone());
+            }
+            None => self.build_log_due = Some(now + BUILD_LOG_REREAD),
+        }
+    }
+
     /// The build log the event loop should ask the daemon for now, by
-    /// instance id: just opened, or a snapshot landed while it's being
-    /// written. `None` while an earlier read is unanswered, so a snapshot
+    /// instance id: just opened, a snapshot landed while it's being
+    /// written, or [`Self::tick_build_log`]'s timer. `None` while an earlier read is unanswered, so a snapshot
     /// every 2 s can't pile reads up: the queued one goes after the answer.
     pub fn take_build_log_read(&mut self) -> Option<String> {
         if self.build_log_in_flight {
@@ -745,6 +773,7 @@ impl App {
     /// time, whichever modal asked).
     pub fn set_build_log(&mut self, instance_id: &str, read: Result<Option<Tail>, String>) {
         self.build_log_in_flight = false;
+        self.build_log_due = None;
         let Modal::BuildLog(view) = &mut self.modal else {
             return;
         };
@@ -1474,6 +1503,50 @@ mod tests {
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(app.take_build_log_read(), Some("id0".into()));
         app.set_snapshot(recorded(None));
+        assert_eq!(app.take_build_log_read(), None);
+    }
+
+    /// While in flight the open log is re-read on the clock, between
+    /// snapshots; one read at a time, and none once it ended or closed.
+    #[test]
+    fn the_build_log_rereads_on_a_timer_while_in_flight() {
+        let t0 = std::time::Instant::now();
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        app.tick_build_log(t0);
+        assert_eq!(app.take_build_log_read(), None, "the open read is unanswered");
+        app.set_build_log("id0", tail(0..1));
+        app.tick_build_log(t0);
+        assert_eq!(app.take_build_log_read(), None, "the first tick starts the interval");
+        app.tick_build_log(t0 + BUILD_LOG_REREAD / 2);
+        assert_eq!(app.take_build_log_read(), None);
+        app.tick_build_log(t0 + BUILD_LOG_REREAD);
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        // Unanswered: later ticks wait for it.
+        app.tick_build_log(t0 + BUILD_LOG_REREAD * 3);
+        assert_eq!(app.take_build_log_read(), None);
+        // A slow answer: the next read waits an interval after it.
+        app.set_build_log("id0", tail(0..2));
+        app.tick_build_log(t0 + BUILD_LOG_REREAD * 3);
+        assert_eq!(app.take_build_log_read(), None, "due an interval after the answer");
+        app.tick_build_log(t0 + BUILD_LOG_REREAD * 4);
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        app.set_build_log("id0", tail(0..3));
+        // Ended: the snapshot's last read, then the clock asks nothing.
+        app.set_snapshot(recorded(Some(failed("building"))));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        app.set_build_log("id0", tail(0..4));
+        app.tick_build_log(t0 + BUILD_LOG_REREAD * 10);
+        assert_eq!(app.take_build_log_read(), None);
+        // Closed: nothing either.
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.take_build_log_read();
+        app.set_build_log("id0", tail(0..4));
+        app.on_key(key(KeyCode::Esc));
+        app.tick_build_log(t0 + BUILD_LOG_REREAD * 20);
         assert_eq!(app.take_build_log_read(), None);
     }
 

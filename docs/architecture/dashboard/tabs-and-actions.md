@@ -111,8 +111,10 @@ fills the modal if it is still the one open:
 - `l` (Instances) → `Logs`: `containers.logs` tail.
 - `b` → `BuildLog`: `instances.buildLog` with `ansi`, coloured by
   `ansi::parse_line` (SGR only, other escapes dropped). While the instance
-  is in flight, each snapshot triggers a re-read (one outstanding); it
-  follows the bottom unless scrolled away.
+  is in flight, it's re-read `BUILD_LOG_REREAD` (500 ms) after each
+  answer (`App::tick_build_log`, the event loop's clock) and on each
+  snapshot, plus once after it ends (one read outstanding); only the open
+  log is read. It follows the bottom unless scrolled away.
 - `Confirm`: rm's branch question, "cancel the build?", and the identity
   modals (`Confirmed::Identity`/`IdentityOffer`, a listing under the
   question: [Identity modals](#identity-modals)).
