@@ -426,16 +426,46 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    the peer by its registry entry, so its fleet root there is
    `fleet/<entry name>/`. A daemon with machines still idles out (a link
    isn't a holder).
-8. **One kind of machine** (L, broken down after step 7). Every entry
-   reached through its channel forms (CLI, dashboard, forwards and
-   `port`); the per-use ssh argvs, `devsandbox tunnel`, `agent-relay`,
-   `machines/agent.rs`, the relay's `--session-env` / sentinel / attach
-   (`api --stdio` stays for npm) and `offered_refusal` removed; placement
-   candidates are every neighbor, `place`'s `drain` gone; lending removed
-   (`fleet join|leave`, `devsandbox lend`, `lend.*`, `lend.toml`,
-   `fleet.offer`, `Lending`, capacity's `lending`, `machines::Kind` and
-   the `is_offered()` branches; decision 26): a laptop joins with
-   `machine add <hub>`.
+8. **One kind of machine** (L, as 8a-8f). Every entry reached through
+   its channel forms; inbound neighbors are machines (decision 28);
+   lending removed (decision 26): a laptop joins with `machine add <hub>`.
+
+   ```
+    laptop ──machine add hub──► hub      (the laptop dials; the hub lists
+      fleet-hub.*.sock ◄═link═► fleet-lap.*.sock     "inbound lap")
+      every client on either end: API / PTY / TUNNEL / TRANSFER there;
+      the hub places on lap through fleet-lap.sock; AGENT only lap → hub
+   ```
+
+   Nothing is deleted before its replacement is used:
+   - **8a CLI on channels for every machine.** `machines/cli.rs`
+     `plan`/`route`: the offered forms (quick calls, verbs, `PTY` exec
+     with reconnect, piped exec, `logs --follow`, `service ls`, `gc`)
+     the only path, `offered.rs` merged in; `ssh::cli_argv` left only
+     for `machine add`'s `machine roots add`.
+   - **8b Dashboard terminals, forwards and `port` on channels.**
+     `tui/remote.rs` tabs via `fleet::pty_client` for every machine;
+     `serve/forwards.rs` `via()` and `commands/port.rs` always
+     `Via::Fleet`.
+   - **8c Delete the per-use ssh paths.** `tty_argv*`, `cli_argv` but
+     add-time, `tunnel_argv`, `api_argv`, `agent_argv`, `devsandbox
+     tunnel`'s ssh half, `agent-relay`, `machines/agent.rs`, the relay's
+     `--session-env` / `SessionEnv` / `attach`, `link.attach` without a
+     `channel`, `offered_refusal`, the sentinel inside link `API` streams
+     (decision 27). `api --stdio` stays for npm.
+   - **8d Inbound neighbors are machines.** `Machines` runs a link over
+     `fleet-<n>.sock` per announced inbound neighbor (its carrier is the
+     `fleet-link` process): rows, capacity, quick calls, verbs,
+     dashboard rows; placement candidates are every connected machine
+     (`fleet/placed.rs` `workers()`), offered ones' `drain` honored
+     until 8e.
+   - **8e Delete lending.** `fleet join|leave`, `devsandbox lend`,
+     `lend.*`, `lend.toml`, `fleet.offer` / `fleet.agent`, `fleet-link
+     --worker`, `fleet/worker.rs` `Lending`, `fleet/lender.rs` (the
+     `member.toml` path into `Shared`), capacity's `lending` and LEND,
+     `place`'s `drain`, `machines::Kind` and the `is_offered()` branches
+     (decision 29).
+   - **8f Docs close.**
 9. **Membership and the hub** (M).
    [Joining and leaving](#joining-and-leaving): `hub` in `member.toml`
    (decision 1), `[serve] hub` gone; `machine add`'s join rule (a name
@@ -497,7 +527,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
 ## Decisions
 
 Numbered as code cites them; 13–16 as step 4 makes them, 3, 9 and 17 as
-step 6 does, 7, 18, 22-25 as step 7 does, 26 as step 8 does, 1, 2, 19
+step 6 does, 7, 18, 22-25 as step 7 does, 26-30 as step 8 does, 1, 2, 19
 and 20 as step 9 does, 21 as step 10 does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
@@ -580,6 +610,18 @@ and 20 as step 9 does, 21 as step 10 does.
     `dev-builds` or `full`); two non-hubs need a protocol match.
 26. `lend.toml` goes with lending (step 8); `[serve] hub` stays the hub
     flag until step 9 puts `hub` in `member.toml`.
+27. A link `API` stream carries no relay sentinel: inside a mux stream
+    there's no login shell to skip; `machines::link::handshake` reads a
+    plain hello.
+28. Inbound neighbors are machines from step 8 (rows, forwarding,
+    placement), so lending can go without a laptop losing its way to
+    lend; the join rule and hub membership stay step 9.
+29. `MachineRow.kind` after `machines::Kind`: `ssh` (this host dials
+    it) or `inbound` (it dials this host).
+30. The agent keeps decision 18's direction: a laptop that joined with
+    `machine add <hub>` is the dialer, so its agent reaches the hub's
+    instances (while its entry has `agent` on) and the hub's never
+    reaches the laptop's.
 
 ## Open questions
 
