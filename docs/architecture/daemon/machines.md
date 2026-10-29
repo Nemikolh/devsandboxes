@@ -103,7 +103,9 @@ pointed at this host's agent relay socket there while it's up
 it writes the sentinel or relays a byte (`relay::attach`): one
 `link.attach {peer}` request of its own, `peer` being `--client` without
 its `machine:` prefix (this host's name, `link::client_name`), its answer
-read byte by byte up to its newline and not relayed. From then on the
+read byte by byte up to its newline and not relayed (no `channel`: the
+relay's form; `link.attach {peer, channel}` is a fleet member's stream,
+[fleet](fleet.md#the-trust-table)). From then on the
 remote daemon serves that connection with the machine's trust table
 ([fleet](fleet.md#the-trust-table)): under its `trust = "worker"` (the
 default) this host reaches the machine's own roots only (those its

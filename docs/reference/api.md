@@ -123,16 +123,17 @@ absent otherwise (`confirm` included).
 
 A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
-its `member.toml` per request: a fleet hub's over the lending link, and
-the connection of a host that linked this one as a machine (its relay's,
-after `link.attach`, below). `member.*` and `link.*` are `denied` under
+its `member.toml` per request: a fleet hub's over the lending link, the
+connection of a host that linked this one as a machine (its relay's,
+after `link.attach`, below), and a fleet member's channel streams (after
+`link.attach {channel}`). `member.*` and `link.*` are `denied` under
 either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
 `roots.list` and the verbs but `gc` (`all` only while every instance here
 is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true`; every `root` / `dir`
-must be under this member's fleet root (a hub's) or exactly one of its
+must be under this member's fleet root for the caller (a hub's, a fleet member's) or exactly one of its
 own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
 instance or container one of theirs; `config.migrate` / `config.ack`
 only under the fleet root; answers and pushed snapshots are cut to those
@@ -142,17 +143,37 @@ caller has the API a local client has.
 
 ### `link.attach`
 
-Internal (not in the npm typings): what a machine link's relay
-(`api --stdio --session-env`, *Relay*) sends as its connection's first
-line, before relaying the linking host's bytes. From then on that
-connection is a remote caller's (*Remote callers*); there is no way back.
+Internal (not in the npm typings): the first line of a connection that
+carries a remote caller's requests or one of a fleet link's channel
+streams. From then on that connection is a remote caller's (*Remote
+callers*); there is no way back.
 
 | params | result | errors |
 |---|---|---|
-| `{"peer": name}`: the linking host's name, 1 to 255 bytes, no control characters; logged | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer`) |
+| `{"peer": name, "channel"?: "api" \| "pty" \| "tunnel" \| "transfer" \| "agent"}`: `peer` 1 to 255 bytes, no control characters, logged; with `channel`, also a machine name (letters, digits, `.`, `_`, `-`, not starting with `.` or `-`) | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer` or `channel`; bytes past the attach line already sent, or a subscribed connection, for a channel other than `api`), `failed` (no data dir for the fleet root) |
 
-Verbs on an attached connection keep the `env` they carry: the relay
-already set it.
+Without `channel` it is a machine link's relay (`api --stdio
+--session-env`, *Relay*), before it relays the linking host's bytes. Its
+verbs keep the `env` they carry: the relay already set it.
+
+With `channel` the caller is fleet member `peer`: its fleet root is
+`fleet/<peer>/` in the data dir (created by the attach), and its verbs run
+with the daemon's own env, whatever they send.
+
+- `api`: the connection goes on as an API connection, the trust table's.
+- `pty`, `tunnel`, `transfer`, `agent`: once the answer is out the
+  connection stops being JSON lines; its bytes are that channel's stream,
+  as on a fleet link ([fleet.md](../architecture/daemon/fleet.md)):
+  `pty` a session attach or exec (needs the host side's helper client,
+  else the stream closes), `tunnel` a forward's bridge, each into an
+  instance the trust table reaches; `transfer` one transfer into the fleet
+  root; `agent` this host's ssh agent (a `1` byte, then the relay) while
+  this host's `machines.toml` has an entry named `peer` with `agent` on,
+  else a `0` byte and the close.
+
+The client sends nothing after the attach line until it has read the
+answer: bytes the daemon already holds past the line refuse the attach
+(`invalid`) rather than being lost.
 
 ## Inbox threads
 

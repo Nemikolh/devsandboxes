@@ -243,8 +243,9 @@ impl Gate {
 /// One `AGENT` stream on the hub: [`NOT_SERVING`] without an agent; else
 /// [`SERVING`], and once the worker's first bytes come (a probe sends none
 /// and closes: no connection to the agent), a connection to `agent` they
-/// open, spliced.
-fn answer(ours: UnixStream, agent: Option<PathBuf>) {
+/// open, spliced. Also the daemon's `AGENT` stream of a `link.attach
+/// {channel: "agent"}` (`Shared::serve_channel`).
+pub fn answer(ours: UnixStream, agent: Option<PathBuf>) {
     let Some(agent) = agent else {
         let _ = (&ours).write_all(&[NOT_SERVING]);
         return;

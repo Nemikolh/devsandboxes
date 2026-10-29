@@ -284,6 +284,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     shared.socket_dir = dir.to_path_buf();
     shared.local_capacity = opts.local_capacity.clone();
     shared.repos = opts.repos.clone();
+    shared.peer_env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
     let registry_path = match &opts.machines {
         Some(path) => path.clone(),
         None => machines::path()?,
@@ -448,10 +449,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
 
 /// The daemon's lending (`fleet::lender`): lend as `lend.toml` says now,
 /// and follow each `lend.set`. A lending thread's fleet root is created,
-/// each `API` stream from the hub is a `Peer` connection
-/// ([`Shared::open_lent`]), each `PTY` stream a session attach
-/// ([`Shared::open_lent_pty`]) and each `TUNNEL` stream a forward's bridge
-/// ([`Shared::open_lent_tunnel`]). Without a `lend.toml` path (no data dir) it's
+/// and each `API`, `PTY` and `TUNNEL` stream from the hub is served as a
+/// `link.attach` channel's ([`Shared::open_lent`], [`Shared::serve_channel`]).
+/// Without a `lend.toml` path (no data dir) it's
 /// logged and `lend.*` and `member.*` fail.
 fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     let paths = match &opts.lend {
@@ -465,7 +465,7 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
             return;
         }
     };
-    let env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
+    let env = shared.peer_env.clone();
     let transport = opts.lend_transport.clone().unwrap_or_else(fleet::transport::Transport::ssh);
     let update = opts
         .lend_update
@@ -483,13 +483,16 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     let socket_dir = dir.to_path_buf();
     let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
         let scope = Arc::new(lent::Peer { name: start.hub.clone(), fleet_root: Some(start.root.clone()), env: Some(env.clone()) });
-        let (api, pty, tunnel) = (weak.clone(), weak.clone(), weak.clone());
-        let (api_scope, pty_scope) = (Arc::clone(&scope), Arc::clone(&scope));
-        let api: fleet::worker::Open = Arc::new(move || api.upgrade()?.open_lent(&api_scope));
-        let pty: fleet::worker::Open = Arc::new(move || pty.upgrade()?.open_lent_pty(&pty_scope));
-        let tunnel: fleet::worker::Open = Arc::new(move || tunnel.upgrade()?.open_lent_tunnel(&scope));
+        let open = |channel: lent::Channel| -> fleet::worker::Open {
+            let (weak, scope) = (weak.clone(), Arc::clone(&scope));
+            Arc::new(move || weak.upgrade()?.open_lent(channel, &scope))
+        };
         use crate::devsbd::proto::channel;
-        let opens = vec![(fleet::LINK.channel, api), (channel::PTY, pty), (channel::TUNNEL, tunnel)];
+        let opens = vec![
+            (fleet::LINK.channel, open(lent::Channel::Api)),
+            (channel::PTY, open(lent::Channel::Pty)),
+            (channel::TUNNEL, open(lent::Channel::Tunnel)),
+        ];
         // What the hub may send this worker: config roots and their repos,
         // into the fleet root (`fleet::code`); the hub's binary the lending
         // thread takes itself.
@@ -603,6 +606,14 @@ struct Shared {
     host_capacity: Arc<super::capacity::HostCapacity>,
     /// [`Options::repos`].
     repos: Option<PathBuf>,
+    /// The env a fleet peer's verbs run with ([`Options::lend_env`], else
+    /// this process's): `lent::Peer::env` of a lending link and of a
+    /// `link.attach {channel}`.
+    peer_env: BTreeMap<String, String>,
+    /// Channel streams being served ([`Shared::serve_channel`]'s `PTY`,
+    /// `TUNNEL`, `TRANSFER` and `AGENT` threads): counted with the
+    /// `clients` holders, like connections.
+    channels: Arc<AtomicUsize>,
 }
 
 impl Shared {
@@ -636,6 +647,8 @@ impl Shared {
             host_agent: Arc::new(crate::devsbd::bridge::host_agent),
             host_capacity: Arc::new(super::capacity::HostCapacity::new(Arc::new(|| crate::runtime::backend().engine_info()))),
             repos: None,
+            peer_env: BTreeMap::new(),
+            channels: Arc::default(),
         }
     }
 
@@ -663,7 +676,7 @@ impl Shared {
     }
 
     fn holders(&self, host: Option<&Host>, registry: Option<&Registry>) -> Holders {
-        let clients = self.conns.lock().unwrap().len();
+        let clients = self.conns.lock().unwrap().len() + self.channels.load(Ordering::SeqCst);
         let forwards = registry.map_or(0, Registry::active);
         let verbs = self.verbs.len() + self.remote_verbs.load(Ordering::SeqCst);
         let Some(host) = host else { return Holders { clients, forwards, verbs, ..Default::default() } };
@@ -696,58 +709,104 @@ impl Shared {
         }
     }
 
-    /// One `API` stream of the lending link: a socket pair whose one end
-    /// goes to the hub, the other served with `scope`'s trust table. The
-    /// API relay's sentinel line goes out on ours first, so the hub reads it
-    /// before any answer (`machines::link::handshake` reads the stream as an
-    /// ssh relay's). `None` once the daemon is stopping.
-    fn open_lent(self: &Arc<Self>, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
-        if *self.closed.0.lock().unwrap() {
-            return None;
-        }
-        let (hub, ours) = Stream::pair().ok()?;
-        super::relay::write_sentinel(&mut &ours, true).ok()?;
-        self.spawn_conn_as(self.next_conn_id(), ours, Table::Peer(Arc::clone(scope)));
-        Some(hub.into())
+    /// The data dir a fleet peer's root goes under (`lent::peer_fleet_root`):
+    /// `member.toml`'s; `None` without one.
+    fn data_dir(&self) -> Option<&Path> {
+        self.lender.get()?.member_path().parent()
     }
 
-    /// One `PTY` stream of the lending link: a socket pair whose one end
-    /// goes to the hub, the other served by `fleet::pty::serve` on a thread
-    /// of its own (a session attach or a piped exec in one of `scope`'s
-    /// instances). `None`
-    /// once the daemon is stopping, or without a host side (no helper
-    /// client).
-    fn open_lent_pty(self: &Arc<Self>, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
-        if *self.closed.0.lock().unwrap() {
-            return None;
-        }
-        let helper = self.helper.get()?.clone();
+    /// One stream of the lending link on `channel`: a socket pair whose one
+    /// end goes to the hub, the other [`serve_channel`](Self::serve_channel)'s
+    /// with `scope`. An `API` stream starts with the API relay's sentinel
+    /// line on ours, so the hub reads it before any answer
+    /// (`machines::link::handshake` reads the stream as an ssh relay's); a
+    /// `link.attach` client talks to the daemon directly, so that one has
+    /// none. `None` when refused.
+    fn open_lent(self: &Arc<Self>, channel: lent::Channel, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
         let (hub, ours) = Stream::pair().ok()?;
-        let (files, scope) = (self.reach_files(), Arc::clone(scope));
+        if channel == lent::Channel::Api {
+            super::relay::write_sentinel(&mut &ours, true).ok()?;
+        }
+        self.serve_channel(channel, scope, ours).then(|| hub.into())
+    }
+
+    /// Serve `stream` as one `channel` stream of `peer`'s, under this
+    /// host's trust table for it: a `link.attach {channel}` connection's
+    /// (handed off once answered) and the lending link's ([`open_lent`](Self::open_lent)).
+    /// Quick (the lending link calls it on its mux's read thread): every
+    /// channel but `api` runs on a thread of its own, counted as a holder.
+    ///
+    /// - `api`: a `Peer` connection ([`Table::Peer`]: every request
+    ///   admitted, every answer and pushed snapshot filtered).
+    /// - `pty`: `fleet::pty::serve` (a session attach or an exec in an
+    ///   instance the peer reaches); refused without a helper client.
+    /// - `tunnel`: `fleet::tunnel::serve` (a forward's bridge into one).
+    /// - `transfer`: one transfer into the peer's fleet root
+    ///   (`fleet::code::receivers`); refused without one.
+    /// - `agent`: `fleet::agent::answer` with this host's agent while this
+    ///   host's registry has an entry named the peer with `agent` on, else
+    ///   with none (its `NOT_SERVING` byte, then the close).
+    ///
+    /// `false`, `stream` dropped: refused, or the daemon is stopping.
+    fn serve_channel(self: &Arc<Self>, channel: lent::Channel, peer: &Arc<lent::Peer>, stream: Stream) -> bool {
+        if *self.closed.0.lock().unwrap() {
+            return false;
+        }
+        let peer = Arc::clone(peer);
+        match channel {
+            lent::Channel::Api => {
+                self.spawn_conn_as(self.next_conn_id(), stream, Table::Peer(peer));
+                true
+            }
+            lent::Channel::Pty => {
+                let Some(helper) = self.helper.get().cloned() else { return false };
+                let files = self.reach_files();
+                self.spawn_channel("serve-pty", move || {
+                    fleet::pty::serve(stream, &helper, &files, &peer, crate::commands::exec::has_host_agent, fleet::pty::runtime_exec, log)
+                })
+            }
+            lent::Channel::Tunnel => {
+                let files = self.reach_files();
+                self.spawn_channel("serve-tunnel", move || fleet::tunnel::serve(stream, &files, &peer, log))
+            }
+            lent::Channel::Transfer => {
+                let Some(root) = peer.fleet_root.clone() else { return false };
+                self.spawn_channel("serve-transfer", move || {
+                    let receivers = fleet::code::receivers(&root, fleet::transfer::Receivers::new(log));
+                    if let Err(e) = receivers.receive(stream) {
+                        log(&format!("fleet: a transfer from {} failed: {e:#}", peer.name));
+                    }
+                })
+            }
+            lent::Channel::Agent => {
+                let registry = self.machines.as_ref().map(|m| m.registry.clone());
+                let host_agent = Arc::clone(&self.host_agent);
+                self.spawn_channel("serve-agent", move || {
+                    let agent = agent_for(registry.as_deref(), &peer.name, &host_agent);
+                    fleet::agent::answer(stream, agent);
+                })
+            }
+        }
+    }
+
+    /// `serve` on a thread named `name`, counted in [`channels`](Self::channels)
+    /// until it returns; `false` when the thread didn't start.
+    fn spawn_channel(&self, name: &str, serve: impl FnOnce() + Send + 'static) -> bool {
+        struct Held(Arc<AtomicUsize>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.channels.fetch_add(1, Ordering::SeqCst);
+        let held = Held(Arc::clone(&self.channels));
         std::thread::Builder::new()
-            .name("serve-pty".into())
+            .name(name.into())
             .spawn(move || {
-                fleet::pty::serve(ours, &helper, &files, &scope, crate::commands::exec::has_host_agent, fleet::pty::runtime_exec, log)
+                let _held = held;
+                serve();
             })
-            .ok()?;
-        Some(hub.into())
-    }
-
-    /// One `TUNNEL` stream of the lending link: a socket pair whose one end
-    /// goes to the hub, the other served by `fleet::tunnel::serve` on a
-    /// thread of its own (a forward's bridge into one of `scope`'s
-    /// instances). `None` once the daemon is stopping.
-    fn open_lent_tunnel(self: &Arc<Self>, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
-        if *self.closed.0.lock().unwrap() {
-            return None;
-        }
-        let (hub, ours) = Stream::pair().ok()?;
-        let (files, scope) = (self.reach_files(), Arc::clone(scope));
-        std::thread::Builder::new()
-            .name("serve-tunnel".into())
-            .spawn(move || fleet::tunnel::serve(ours, &files, &scope, log))
-            .ok()?;
-        Some(hub.into())
+            .is_ok()
     }
 
     /// Register before the thread starts, so the next holder snapshot counts
@@ -769,9 +828,17 @@ impl Shared {
         self.conns.lock().unwrap().insert(id, ConnEntry { stream: clone, out: Arc::clone(&out) });
         let shared = Arc::clone(self);
         let spawned = std::thread::Builder::new().name(format!("serve-conn-{id}")).spawn(move || {
-            serve_conn(id, stream, &shared, out, table);
+            let handoff = serve_conn(id, stream, &shared, out, table);
             shared.conns.lock().unwrap().remove(&id);
             *shared.idle_since.lock().unwrap() = Instant::now();
+            // A `link.attach {channel}`: out of `conns` (the drain no longer
+            // cuts it), its notifier gone; the stream is the channel's now.
+            if let Some(Handoff { channel, peer, stream }) = handoff {
+                let _ = stream.set_write_timeout(None);
+                if !shared.serve_channel(channel, &peer, stream) {
+                    log(&format!("connection {id}: refused a {} stream from {}", channel.as_str(), peer.name));
+                }
+            }
         });
         if spawned.is_err() {
             self.conns.lock().unwrap().remove(&id);
@@ -1167,6 +1234,23 @@ fn config_stamps<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> ConfigStamps {
 
 type ConfigStamps = BTreeMap<PathBuf, Vec<Option<(std::time::SystemTime, u64)>>>;
 
+/// The agent a peer's `AGENT` stream gets ([`Shared::serve_channel`]):
+/// `host_agent`'s, while `registry` has an entry named `peer` (any kind)
+/// with `agent` on; none otherwise, a registry that won't load included.
+fn agent_for(registry: Option<&Path>, peer: &str, host_agent: &HostAgent) -> Option<PathBuf> {
+    let entries = machines::load(registry?).ok()?;
+    entries.iter().any(|e| e.name == peer && e.agent).then(|| host_agent()).flatten()
+}
+
+/// A connection a `link.attach {channel}` turned into that channel's
+/// stream: what its thread hands [`Shared::serve_channel`] once the attach
+/// is answered.
+struct Handoff {
+    channel: lent::Channel,
+    peer: Arc<lent::Peer>,
+    stream: Stream,
+}
+
 /// What a connection may call.
 enum Table {
     /// A local client: the whole API.
@@ -1193,6 +1277,12 @@ struct ConnState {
     /// `machines.hold`'s holds, one per machine name (a repeat replaces
     /// it): dropped with the connection, which releases the machines.
     holds: BTreeMap<String, service::Want>,
+    /// The reader held bytes past the request line being handled: a
+    /// `link.attach {channel}` is then refused rather than lose them.
+    buffered: bool,
+    /// Set by a `link.attach {channel}` (not `api`): the loop ends once its
+    /// answer is out and the stream goes to that channel.
+    handoff: Option<(lent::Channel, Arc<lent::Peer>)>,
 }
 
 impl ConnState {
@@ -1204,8 +1294,10 @@ impl ConnState {
     }
 }
 
-/// One connection: a request per line, a response per request, until EOF.
-fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table: Table) {
+/// One connection: a request per line, a response per request, until EOF,
+/// or until a `link.attach {channel}` is answered: then the stream, with
+/// nothing read past the attach line, is returned for that channel.
+fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table: Table) -> Option<Handoff> {
     let mut conn = ConnState {
         id,
         own_user: endpoint::peer_is_own_user(&stream),
@@ -1215,6 +1307,8 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
         out,
         notifier: None,
         holds: BTreeMap::new(),
+        buffered: false,
+        handoff: None,
     };
     let mut reader = BufReader::new(stream);
     loop {
@@ -1223,6 +1317,7 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
+        conn.buffered = !reader.buffer().is_empty();
         let too_long = !line.ends_with(b"\n") && line.len() as u64 >= proto::MAX_LINE;
         let response = if too_long {
             Response::err(None, "invalid", "request line too long")
@@ -1236,6 +1331,10 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
             }
         };
         if conn.out.send(&response).is_err() || too_long {
+            conn.handoff = None;
+            break;
+        }
+        if conn.handoff.is_some() {
             break;
         }
     }
@@ -1246,6 +1345,8 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
     if let Some(t) = conn.notifier.take() {
         let _ = t.join();
     }
+    let (channel, peer) = conn.handoff.take()?;
+    Some(Handoff { channel, peer, stream: reader.into_inner() })
 }
 
 fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response> {
@@ -1360,35 +1461,75 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
     })
 }
 
-/// `link.attach {peer}`: a relay of this user (`api --stdio
-/// --session-env`, what a host linking this one as an ssh machine runs)
-/// says the rest of this connection is that host's. The connection is
-/// served with the trust table from here on (`Table::Peer`, no fleet root,
-/// the env as sent: the relay set it), its pushed snapshots filtered too.
+/// `link.attach {peer, channel?}`: a connection of this user says the
+/// rest of it is peer `peer`'s (docs/reference/api.md, `link.attach`).
 /// One-way: nothing turns it back to `Full`, and a second attach is
 /// refused by the table itself.
+///
+/// - No `channel`: an ssh machine's relay (`api --stdio --session-env`,
+///   what a host linking this one runs). The connection is served with the
+///   trust table from here on (`Table::Peer`, no fleet root, the env as
+///   sent: the relay set it), its pushed snapshots filtered too.
+/// - `channel` (a fleet member's link, `peer` a machine name): the peer is
+///   `{peer, fleet_root: <data>/fleet/<peer>/ (created), env: the
+///   daemon's}`. `api` goes on as above with that peer; any other channel
+///   ends the line protocol once the answer is out, the stream handed to
+///   [`Shared::serve_channel`] (`ConnState::handoff`). The client sends
+///   nothing past the attach line before it has read the answer: bytes
+///   already buffered past it, or a subscribed connection (its notifier
+///   could still write), refuse the attach with `invalid`.
 fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut ConnState) -> Response {
     if !matches!(conn.table, Table::Full) || !conn.own_user {
         return Response::err(id, "denied", "`link.attach` is for this user's own relay connections");
     }
-    let name = match lent::attach_peer(params) {
-        Ok(name) => name,
+    let (name, channel) = match lent::attach_params(params) {
+        Ok(parsed) => parsed,
         Err(e) => return Response::err(id, e.code, e.message),
     };
-    let peer = Arc::new(lent::Peer { name: name.clone(), fleet_root: None, env: None });
+    let peer = match channel {
+        None => lent::Peer { name: name.clone(), fleet_root: None, env: None },
+        Some(channel) => {
+            if channel != lent::Channel::Api && conn.buffered {
+                return Response::err(id, "invalid", "nothing may follow `link.attach {channel}` before its answer");
+            }
+            if channel != lent::Channel::Api && conn.notifier.is_some() {
+                return Response::err(id, "invalid", "a subscribed connection can't become a channel stream");
+            }
+            let Some(data) = shared.data_dir() else {
+                return Response::err(id, "failed", "this daemon has no data dir for a fleet root");
+            };
+            match lent::peer_fleet_root(data, &name) {
+                Ok(root) => lent::Peer { name: name.clone(), fleet_root: Some(root), env: Some(shared.peer_env.clone()) },
+                Err(e) => {
+                    log(&format!("{}: link.attach: {e:#}", conn.label()));
+                    return Response::err(id, "internal", format!("{e:#}"));
+                }
+            }
+        }
+    };
+    let peer = Arc::new(peer);
     let files = shared.reach_files();
-    let (reach, warning) = lent::Reach::load(&files, None);
+    let (reach, warning) = lent::Reach::load(&files, peer.fleet_root.as_deref());
     if let Some(w) = warning {
         log(&format!("{}: {w}", conn.label()));
     }
-    let filtered = (Arc::clone(&peer), files);
-    conn.out.post(|p| {
-        p.reach = Some(filtered);
-        false
-    });
-    conn.table = Table::Peer(peer);
     let trust = serde_json::to_value(reach.trust).unwrap_or(Value::Null);
-    log(&format!("{}: link from {name}, trust {}", conn.label(), trust.as_str().unwrap_or("?")));
+    let trust_name = trust.as_str().unwrap_or("?");
+    match channel {
+        None | Some(lent::Channel::Api) => {
+            let filtered = (Arc::clone(&peer), files);
+            conn.out.post(|p| {
+                p.reach = Some(filtered);
+                false
+            });
+            conn.table = Table::Peer(peer);
+        }
+        Some(channel) => conn.handoff = Some((channel, peer)),
+    }
+    match channel {
+        None => log(&format!("{}: link from {name}, trust {trust_name}", conn.label())),
+        Some(c) => log(&format!("{}: {} stream from {name}, trust {trust_name}", conn.label(), c.as_str())),
+    }
     Response::ok(id, json!({ "ok": true, "trust": trust }))
 }
 
@@ -2844,6 +2985,213 @@ pub(crate) mod tests {
         assert_eq!(code(&mut plain, "link.attach", json!({"peer": ""})), Some("invalid".into()));
         assert_eq!(code(&mut plain, "member.get", json!({})), None, "still a local client");
         drop(plain);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A raw connection to `dir` (retrying while the daemon binds) whose
+    /// first line is `link.attach` with `params`, `extra` in the same
+    /// write; the answer read byte by byte, so nothing past it is taken.
+    fn attach_raw(dir: &Path, params: Value, extra: &[u8]) -> (Stream, Value) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            if let Ok(s) = endpoint::connect(dir) {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "daemon never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let line = format!("{}\n", json!({"id": 0, "method": "link.attach", "params": params}));
+        stream.write_all(&[line.as_bytes(), extra].concat()).unwrap();
+        let mut answer = Vec::new();
+        let mut byte = [0u8; 1];
+        while stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+            answer.push(byte[0]);
+        }
+        (stream, serde_json::from_slice(&answer).unwrap())
+    }
+
+    /// `data` with `own` and `other` roots (canonical) and a `state.toml`
+    /// whose one instance `w` is in `own`.
+    fn attach_fixture(data: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let (own, other) = (data.join("own"), data.join("other"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let (own, other) = (std::fs::canonicalize(own).unwrap(), std::fs::canonicalize(other).unwrap());
+        let state = data.join("state.toml");
+        let instance = "[instance.w]\ninstance_id = \"id-w\"\nsandbox = \"web\"\ncontainer = \"devsandbox-w\"\n\
+                        folder = \"/w\"\nworkspace = \"/w\"\ncreated_unix = 1\n";
+        std::fs::write(&state, format!("{instance}config_dir = {:?}\n", own.to_str().unwrap())).unwrap();
+        (state, own, other)
+    }
+
+    /// `link.attach {channel}`: the peer's fleet root `fleet/<peer>/` is
+    /// created and reached under `worker`; `api` stays an API connection,
+    /// `transfer` lands there; a bad name, an unknown channel, bytes past
+    /// the line or a subscribed connection are refused.
+    #[test]
+    fn a_channel_attach_is_the_peers_with_its_fleet_root() {
+        let dir = scratch("attach-ch");
+        let data = scratch("attach-ch-data");
+        std::fs::create_dir_all(&data).unwrap();
+        let (state, own, other) = attach_fixture(&data);
+        let options = Options { state: Some(state), lend: Some(data.join("lend.toml")), ..opts(1, 1000) };
+        let daemon = spawn_daemon(&dir, options);
+        let fleet = data.join("fleet/hub");
+
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "api"}), b"");
+        assert_eq!(answer, json!({"id": 0, "result": {"ok": true, "trust": "worker"}}));
+        assert!(fleet.is_dir(), "the fleet root is created");
+        let cfg = fleet.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let Hello::Ready(hello) = client::hello(&mut stream, &v(1), "fleet-link").unwrap() else { panic!("no hello") };
+        let mut conn = client::Conn::new(stream, hello).unwrap();
+        let code = |conn: &mut client::Conn, method: &str, params: Value| conn.call(method, params).unwrap().error.map(|e| e.code);
+        assert_eq!(code(&mut conn, "instances.list", json!({"dir": cfg})), None, "under the fleet root");
+        assert_eq!(code(&mut conn, "instances.list", json!({"dir": own})), None, "an own root");
+        assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
+        drop(conn);
+
+        // A transfer: a root tar, unpacked under `fleet/hub/roots/`.
+        use crate::serve::fleet::{code as fcode, transfer};
+        let src = data.join("src/cfg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("devsandboxes.toml"), "[sandbox.web]\nimage = \"img\"\n").unwrap();
+        let tar = fcode::pack_root(&src, Path::new("cfg")).unwrap();
+        let (size, sha256) = transfer::digest(&tar[..]).unwrap();
+        let header = transfer::Header {
+            kind: fcode::ROOT_TAR_KIND.into(),
+            name: format!("root-{}.tar", fcode::short_hash(&tar)),
+            size,
+            sha256,
+            to: None,
+        };
+        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "transfer"}), b"");
+        assert_eq!(answer["result"]["ok"], true, "{answer}");
+        transfer::send(stream, &header, &tar[..]).unwrap();
+        let landed = fleet.join("roots").join(fcode::short_hash(&tar)).join("cfg/devsandboxes.toml");
+        assert_eq!(std::fs::read_to_string(landed).unwrap(), "[sandbox.web]\nimage = \"img\"\n");
+
+        // Refusals leave a local connection as it was.
+        let refused = |params: Value, extra: &[u8]| {
+            let (stream, answer) = attach_raw(&dir, params, extra);
+            drop(stream);
+            answer["error"]["code"].as_str().map(str::to_string)
+        };
+        assert_eq!(refused(json!({"peer": "a/b", "channel": "api"}), b""), Some("invalid".into()), "not a machine name");
+        assert_eq!(refused(json!({"peer": "hub", "channel": "rpc"}), b""), Some("invalid".into()));
+        assert!(!data.join("fleet/a").exists());
+        assert_eq!(
+            refused(json!({"peer": "hub", "channel": "tunnel"}), b"{\"root\":\"/\"}\n"),
+            Some("invalid".into()),
+            "bytes past the attach line"
+        );
+        let mut subscribed = connect(&dir);
+        assert!(subscribed.call("subscribe", json!({"topics": ["inbox"]})).unwrap().error.is_none());
+        let r = subscribed.call("link.attach", json!({"peer": "hub", "channel": "pty"})).unwrap();
+        assert_eq!(r.error.map(|e| e.code), Some("invalid".into()), "a subscribed connection");
+        assert_eq!(subscribed.call("member.get", json!({})).unwrap().error, None, "still a local client");
+        drop(subscribed);
+
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// `pty` and `tunnel` streams of an attached peer go through its reach:
+    /// a root outside it is refused with `denied`, before any helper or
+    /// runtime is touched.
+    #[test]
+    fn pty_and_tunnel_channels_are_confined_to_the_peers_reach() {
+        use crate::devsbd::rpc::{self, Call, Obj, Record};
+        let dir = scratch("attach-pty");
+        let data = scratch("attach-pty-data");
+        std::fs::create_dir_all(&data).unwrap();
+        let (state, _own, other) = attach_fixture(&data);
+        let helper = helper::HelperClient::new(crate::serve::helper::tests::Fake::default(), crate::serve::helper::tests::log);
+        let options = Options { state: Some(state), lend: Some(data.join("lend.toml")), helper: Some(helper), ..opts(1, 1000) };
+        let daemon = spawn_daemon(&dir, options);
+        let other = other.to_str().unwrap();
+
+        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "pty"}), b"");
+        assert_eq!(answer["result"]["trust"], "worker", "{answer}");
+        let params = Obj::new().with("root", other).with("instance", "w").with("session", "1700000000-ab12");
+        let header = Record::Call(Call { method: crate::serve::fleet::pty::METHOD.into(), params, meta: Obj::new() });
+        rpc::write_record(&mut &stream, &header).unwrap();
+        match rpc::read_record(&mut &stream).unwrap() {
+            Some(Record::Error { code, .. }) => assert_eq!(code, "denied"),
+            other => panic!("{other:?}"),
+        }
+        drop(stream);
+
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "tunnel"}), b"");
+        assert_eq!(answer["result"]["ok"], true, "{answer}");
+        stream.write_all(format!("{}\n", json!({"root": other, "instance": "w", "port": 80})).as_bytes()).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&stream).read_line(&mut reply).unwrap();
+        assert!(reply.contains("error") && reply.contains(other), "{reply}");
+        drop(stream);
+
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// An `agent` stream gets this host's agent only while the registry's
+    /// entry named the peer has `agent` on: else `NOT_SERVING` and the close.
+    #[test]
+    fn an_agent_channel_follows_the_peers_registry_entry() {
+        use crate::serve::fleet::agent::{NOT_SERVING, SERVING};
+        let dir = scratch("attach-agent");
+        let data = scratch("attach-agent-data");
+        std::fs::create_dir_all(&data).unwrap();
+        let agent = data.join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&agent).unwrap();
+        std::thread::spawn(move || {
+            for c in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut &c, &mut &c);
+                });
+            }
+        });
+        let registry = data.join("machines.toml");
+        let host_agent: HostAgent = {
+            let agent = agent.clone();
+            Arc::new(move || Some(agent.clone()))
+        };
+        let options = Options {
+            machines: Some(registry.clone()),
+            lend: Some(data.join("lend.toml")),
+            host_agent: Some(host_agent),
+            ..opts(1, 1000)
+        };
+        let daemon = spawn_daemon(&dir, options);
+        let status = |stream: &mut Stream| {
+            let mut b = [0u8; 1];
+            stream.read_exact(&mut b).unwrap();
+            b[0]
+        };
+        let closed = |stream: &mut Stream| stream.read(&mut [0u8; 1]).unwrap() == 0;
+
+        for registry_text in ["", "[machine.hub]\ntarget = \"hub\"\n", "[machine.other]\ntarget = \"o\"\nagent = true\n"] {
+            std::fs::write(&registry, registry_text).unwrap();
+            let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent"}), b"");
+            assert_eq!(answer["result"]["ok"], true, "{answer}");
+            assert_eq!(status(&mut stream), NOT_SERVING, "{registry_text:?}");
+            assert!(closed(&mut stream));
+        }
+
+        std::fs::write(&registry, "[machine.hub]\ntarget = \"hub\"\nagent = true\n").unwrap();
+        let (mut stream, _) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent"}), b"");
+        assert_eq!(status(&mut stream), SERVING);
+        stream.write_all(b"ping").unwrap();
+        let mut back = [0u8; 4];
+        stream.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"ping", "relayed to the agent");
+        drop(stream);
+
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&data);

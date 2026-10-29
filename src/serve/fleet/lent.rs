@@ -51,18 +51,20 @@ use crate::state::State;
 use crate::worker_policy::Trust;
 
 /// A remote caller of this member: one per lending link, one per attached
-/// relay connection (`link.attach`).
+/// connection (`link.attach`, a relay's or a channel's).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
-    /// Who it is (the hub's ssh target, the linking host's name), for the
-    /// log.
+    /// Who it is (the hub's ssh target, the linking host's name, a fleet
+    /// member's name), for the log.
     pub name: String,
     /// This member's fleet root for it, canonical; `Some` on the lending
-    /// link, `None` for an ssh machine's peer.
+    /// link and for a `link.attach {channel}` ([`peer_fleet_root`]), `None`
+    /// for an ssh machine's relay.
     pub fleet_root: Option<PathBuf>,
     /// `Some`: the env its verbs run with, whatever it sent (the lending
-    /// link's: this host's own, the daemon's). `None`: a verb's env as sent
-    /// (an attached relay's: the relay's `--session-env` already set it).
+    /// link's and a channel attach's: this host's own, the daemon's).
+    /// `None`: a verb's env as sent (an attached relay's: the relay's
+    /// `--session-env` already set it).
     pub env: Option<BTreeMap<String, String>>,
 }
 
@@ -83,6 +85,73 @@ pub fn attach_peer(params: &Value) -> Result<String, ApiError> {
         )));
     }
     Ok(name.to_string())
+}
+
+/// What a `link.attach {channel}` stream carries: one link channel's
+/// streams handed to the daemon (docs/reference/api.md, `link.attach`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// API requests, served with the trust table.
+    Api,
+    /// A session attach or an exec (`fleet::pty::serve`).
+    Pty,
+    /// A forward's bridge (`fleet::tunnel::serve`).
+    Tunnel,
+    /// One bulk transfer into the peer's fleet root (`fleet::code::receivers`).
+    Transfer,
+    /// This host's ssh agent, while its registry entry for the peer has
+    /// `agent` on.
+    Agent,
+}
+
+impl Channel {
+    pub fn parse(s: &str) -> Option<Channel> {
+        Some(match s {
+            "api" => Channel::Api,
+            "pty" => Channel::Pty,
+            "tunnel" => Channel::Tunnel,
+            "transfer" => Channel::Transfer,
+            "agent" => Channel::Agent,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Api => "api",
+            Channel::Pty => "pty",
+            Channel::Tunnel => "tunnel",
+            Channel::Transfer => "transfer",
+            Channel::Agent => "agent",
+        }
+    }
+}
+
+/// `link.attach`'s params (pure): [`attach_peer`]'s `peer`, and `channel`
+/// when present. With a channel the peer is a fleet member, whose name also
+/// names its fleet root ([`peer_fleet_root`]): it must pass
+/// `machines::check_name`.
+pub fn attach_params(params: &Value) -> Result<(String, Option<Channel>), ApiError> {
+    let name = attach_peer(params)?;
+    let channel = match params.get("channel") {
+        None | Some(Value::Null) => return Ok((name, None)),
+        Some(Value::String(s)) => Channel::parse(s)
+            .ok_or_else(|| ApiError::invalid(format!("no channel `{s}` (api, pty, tunnel, transfer or agent)")))?,
+        Some(_) => return Err(ApiError::invalid("`channel` must be a string")),
+    };
+    crate::serve::machines::check_name(&name).map_err(|e| ApiError::invalid(format!("`peer`: {e:#}")))?;
+    Ok((name, Some(channel)))
+}
+
+/// A fleet member `peer`'s fleet root under data dir `data`:
+/// `<data>/fleet/<peer>/` (decision 24 of the fleet plan), created,
+/// canonical. `peer` must be a machine name (one plain path component).
+pub fn peer_fleet_root(data: &Path, peer: &str) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    crate::serve::machines::check_name(peer)?;
+    let root = data.join("fleet").join(peer);
+    std::fs::create_dir_all(&root).with_context(|| format!("cannot create {}", root.display()))?;
+    std::fs::canonicalize(&root).with_context(|| format!("cannot resolve {}", root.display()))
 }
 
 /// Where a [`Reach`] is read from: this host's files.
@@ -656,6 +725,39 @@ mod tests {
         for bad in [json!({}), json!({"peer": 3}), json!({"peer": ""}), json!({"peer": "a\nb"}), json!({"peer": long})] {
             assert_eq!(attach_peer(&bad).unwrap_err().code, "invalid", "{bad}");
         }
+    }
+
+    #[test]
+    fn an_attach_may_name_a_channel_and_then_a_machine_name() {
+        assert_eq!(attach_params(&json!({"peer": "lap.local"})).unwrap(), ("lap.local".into(), None));
+        assert_eq!(attach_params(&json!({"peer": "lap", "channel": null})).unwrap(), ("lap".into(), None));
+        for c in ["api", "pty", "tunnel", "transfer", "agent"] {
+            let (name, channel) = attach_params(&json!({"peer": "lap", "channel": c})).unwrap();
+            assert_eq!((name.as_str(), channel.map(Channel::as_str)), ("lap", Some(c)));
+        }
+        for bad in [
+            json!({"peer": "lap", "channel": "rpc"}),
+            json!({"peer": "lap", "channel": 1}),
+            // A hostname is fine without a channel, not as a directory name.
+            json!({"peer": "lap/../x", "channel": "api"}),
+            json!({"peer": "..", "channel": "pty"}),
+            json!({"peer": "a b", "channel": "transfer"}),
+            json!({"channel": "api"}),
+        ] {
+            assert_eq!(attach_params(&bad).unwrap_err().code, "invalid", "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_peers_fleet_root_is_created_under_fleet() {
+        let data = scratch("peer-root");
+        let root = peer_fleet_root(&data, "lap").unwrap();
+        assert_eq!(root, std::fs::canonicalize(data.join("fleet/lap")).unwrap());
+        assert!(root.is_dir());
+        assert_eq!(peer_fleet_root(&data, "lap").unwrap(), root, "again: the same");
+        assert!(peer_fleet_root(&data, "..").is_err());
+        assert!(peer_fleet_root(&data, "a/b").is_err());
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

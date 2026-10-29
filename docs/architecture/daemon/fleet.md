@@ -55,11 +55,12 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `transition`, `LendInfo`), `src/serve/locked_file.rs` (`update`),
 `src/commands/lend.rs` (`show`, `set_state`, `join`, `leave`, `busy`),
 `src/commands/machine.rs` (`trust`),
-`src/serve/fleet/lent.rs` (`Peer`, `Files`, `Reach`, `own_roots`,
+`src/serve/fleet/lent.rs` (`Peer`, `Channel`, `attach_params`,
+`peer_fleet_root`, `Files`, `Reach`, `own_roots`,
 `decide`, `admit`, `confine_path`, `lent_instances`, `filter_answer`,
 `filter_snapshot`), `src/serve/daemon.rs`
 (`start_lending`, `Table`, `Shared::reach_files`, `Shared::open_lent`,
-`Shared::open_lent_pty`, `Shared::open_lent_tunnel`),
+`Shared::serve_channel`, `link_attach`, `Handoff`, `agent_for`),
 `src/serve/fleet/worker.rs` (`Open`, `Opens`), `src/serve/fleet/agent.rs`
 (`SERVING`, `NOT_SERVING`, `Status`, `status_of`, `Action`, `decide`,
 `socket`, `serve`, `PROBE`, `Cached`, `Gate`, `answer`, `refresh`,
@@ -787,16 +788,19 @@ What the worker is as a fleet member (its name, trust and the rest) is
   hub target is checked when lending starts (`transport::check_target`).
   A lending daemon never idles out
   (`Lender::lends`, checked each tick): it is what holds the link.
-- **Each `API` stream** the hub opens is answered by `Shared::open_lent`: a
-  socket pair whose daemon end writes the API relay's sentinel line first
-  ([the sentinel rule](#link)) and is then served like any connection
-  (`spawn_conn_as`), with the `Worker` table. Its connection id comes from
-  the same counter as the listener's.
-- **Each `PTY` stream** is answered by `Shared::open_lent_pty`: a socket
-  pair whose daemon end `fleet::pty::serve` takes on a `serve-pty` thread
-  ([PTY](#pty)); refused without a host side (no helper client) or once
-  the daemon stops. The lending thread gets both handlers as its `Opens`
-  (channel → `Open`), and refuses both while it waits for the hub's
+- **Each `API`, `PTY` and `TUNNEL` stream** the hub opens is answered by
+  `Shared::open_lent`: a socket pair whose daemon end goes to
+  `Shared::serve_channel`, the one server of a peer's channel streams
+  that a `link.attach {channel}` connection's also go to
+  ([the trust table](#the-trust-table)). An `API` end writes the API relay's
+  sentinel line first ([the sentinel rule](#link)) and is then served like
+  any connection (`spawn_conn_as`), with the `Peer` table; its connection
+  id comes from the same counter as the listener's. A `PTY` end is
+  `fleet::pty::serve`'s on a `serve-pty` thread ([PTY](#pty)), refused
+  without a host side (no helper client); a `TUNNEL` end
+  `fleet::tunnel::serve`'s ([TUNNEL](#tunnel)). All are refused once the
+  daemon stops. The lending thread gets the three handlers as its `Opens`
+  (channel → `Open`), and refuses them while it waits for the hub's
   binary ([Versions](#versions)).
 - **The hub's agent** is a socket the lending thread binds in the
   daemon's socket dir while a link serves, the hub advertised
@@ -987,9 +991,11 @@ whole API); `--machine` refuses it with the rest of `machine`
 (`serve::machines::cli::machine_use`). It is read for every request a
 remote caller sends (`lent::Reach::load`), so a change applies to the
 next one. It applies to every remote caller alike: a hub over the
-lending link, and a host that linked this one as an ssh machine (its
-relay connections, after `link.attach`). `worker` is the default: a
-remote caller reaches this host's own roots and (a hub) its fleet root
+lending link, a host that linked this one as an ssh machine (its
+relay connections, after `link.attach`), and a fleet member's channel
+streams (after `link.attach {channel}`). `worker` is the default: a
+remote caller reaches this host's own roots and (a hub, a fleet member)
+its fleet root
 through the [trust table](#the-trust-table), placed
 work under the [worker policy](#worker-policy). `full` gives it the API a
 local client has (but `member.*` and `link.*`), lifts the worker policy
@@ -1000,11 +1006,16 @@ builds ([Versions](#versions)).
 
 Every connection has a table (`daemon::Table`): `Full` for local clients,
 `Peer(Peer)` for a remote caller's: the hub's `API` streams over the
-lending link (`Shared::open_lent`), and an ssh machine's relay connection
-once it is attached. A `Peer` (`fleet::lent::Peer`) is who it is (for the log),
-its fleet root (canonical; `Some` on the lending link, `None` for an ssh
-machine's peer) and the env its verbs get (`Some` on the lending link:
-this host's own; `None` keeps a verb's as sent). For each request on a `Peer` connection the daemon reads
+lending link (`Shared::open_lent`), an ssh machine's relay connection
+once it is attached, and a `link.attach {channel: "api"}` connection. A
+`Peer` (`fleet::lent::Peer`) is who it is (for the log),
+its fleet root (canonical; `Some` on the lending link and for a channel
+attach, `None` for an ssh machine's relay) and the env its verbs get
+(`Some` on the lending link and for a channel attach: this host's own,
+the daemon's `Shared::peer_env`; `None` keeps a verb's as sent). The
+`PTY` and `TUNNEL` streams have no table: `fleet::pty::serve` and
+`fleet::tunnel::serve` read the same `Reach` for their `Peer` and gate
+the root and instance against it ([PTY](#pty), [TUNNEL](#tunnel)). For each request on a `Peer` connection the daemon reads
 a `lent::Reach` from this host's files (`Reach::load` over
 `Shared::reach_files`: `member.toml` and `state.toml`, the home):
 
@@ -1019,7 +1030,11 @@ a `lent::Reach` from this host's files (`Reach::load` over
   `machine add` runs here over ssh for every root it picks
   (`commands::machine::record_roots`). Placed instances'
   config roots are in `state.toml` too.
-- **The fleet root**, the `Peer`'s (none for an ssh machine's peer).
+- **The fleet root**, the `Peer`'s (none for an ssh machine's relay):
+  the lending link's `lend::fleet_root` of its hub target; a channel
+  attach's `fleet/<peer>/` in the data dir (`lent::peer_fleet_root`,
+  created by the attach, decision 24 of the
+  [plan](../../plans/active/fleet.md#decisions)).
 
 `Reach::admits` takes a canonical path that is under the fleet root or
 exactly one of the own roots (a dir nested in an own root isn't one);
@@ -1111,6 +1126,36 @@ machine's login env and the linking host's agent relay, which the
 daemon must keep. It is one-way: a second `link.attach` is `link.*`,
 which the table refuses. It logs `connection N: link from <peer>, trust
 <t>` and answers `{ok, trust}`.
+
+**`link.attach {peer, channel}`** (`lent::attach_params`: `peer` must
+also be a machine name, `machines::check_name`, since it names a
+directory; `channel` one of `api`, `pty`, `tunnel`, `transfer`, `agent`,
+`lent::Channel`) is a fleet member's stream: the same gate, but the peer
+is `Peer { name: peer, fleet_root: Some(<data>/fleet/<peer>/), env:
+Some(<the daemon's env>) }`. `api` switches the connection in place like
+the relay's. Any other channel sets `ConnState::handoff`: once the
+answer is out, `serve_conn` ends its loop, the connection leaves `conns`
+(so the drain no longer cuts it) and its stream, `BufReader::into_inner`
+with nothing read past the line and its write timeout cleared, goes to
+`Shared::serve_channel`:
+
+- `pty` → `fleet::pty::serve`, `tunnel` → `fleet::tunnel::serve`, each
+  gating the root and instance on the peer's reach;
+- `transfer` → one `fleet::transfer::Receivers::receive` over
+  `fleet::code::receivers` of the peer's fleet root;
+- `agent` → `fleet::agent::answer` with `Options::host_agent`'s agent
+  while this host's `machines.toml` has an entry named the peer (either
+  kind) with `agent` on (`daemon::agent_for`), else none (`NOT_SERVING`,
+  then the close): decision 18 of the
+  [plan](../../plans/active/fleet.md#decisions), the dialer's agent
+  gated by the dialer's own entry.
+
+Each runs on a thread of its own, counted in the `clients` holders
+(`Shared::channels`) until it returns. The wait-for-answer rule: the
+client sends nothing after the attach line before it read the answer, so
+the daemon refuses (`invalid`) an attach whose connection reader already
+holds bytes past the line (`ConnState::buffered`), and one on a
+subscribed connection (its notifier could still write past the answer).
 
 ### PTY
 
@@ -1303,7 +1348,7 @@ A port forward's bridge into a lent instance over the link: each
 tunnel` is at the far end of a forward's ssh
 ([forwards](forwards.md#remote-bridges)), served by
 `fleet::tunnel::serve` on a thread of its own
-(`Shared::open_lent_tunnel`).
+(`Shared::serve_channel`).
 
 - **The request** is the hub's first line (within 30 s, at most 64 KiB,
   read byte by byte: `tunnel::read_request`), `tunnel::Request` as JSON:
