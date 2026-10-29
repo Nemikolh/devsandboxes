@@ -39,9 +39,9 @@ limitation means editing this file in the same commit.
   an inbound neighbor in its `machines.list`), every machine reached at
   its `fleet-<name>.*.sock`, every use of any machine over its channels
   (the CLI's commands, 8a; the dashboard's terminals, forwards and
-  `port`, 8b); still two kinds of machine (offered workers lend over
-  `fleet join`) until the rest of step 8 deletes the per-use ssh paths
-  and drops lending.
+  `port`, 8b), ssh only at `machine add` (8c); still two kinds of machine
+  (offered workers lend over `fleet join`) until the rest of step 8 makes
+  inbound neighbors machines and drops lending.
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -236,7 +236,7 @@ limitation means editing this file in the same commit.
   → [machines](architecture/daemon/machines.md); `machines::forward::verb`
 - Daemon-side ssh (each machine's link, `machine add`'s probe) is
   `BatchMode=yes`: passphrase-prompting keys fail.
-  → [machines](architecture/daemon/machines.md#ssh); `fleet::transport::Transport::ssh`, `ssh::api_argv`
+  → [machines](architecture/daemon/machines.md#ssh); `fleet::transport::Transport::ssh`, `ssh::probe_argv`
 - A daemon with registered machines still idles out (a link isn't a
   holder): its links go with it, and each machine drops it as an inbound
   neighbor, until a client starts the daemon again (or `serve install`

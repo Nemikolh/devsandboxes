@@ -131,9 +131,9 @@ pub struct Options {
     /// point it at their own file.
     pub machines: Option<PathBuf>,
     /// How `machines.probe` and `.add` reach a target at add time, before it
-    /// has a link; `None` is ssh ([`ssh::ssh_dial`]). Tests dial another
+    /// has a link; `None` is ssh ([`ssh::probe_dial`]). Tests dial another
     /// test daemon's socket.
-    pub dial: Option<Dial>,
+    pub probe: Option<Dial>,
     /// How an ssh machine's link is dialed (`fleet::dialer`); `None` is ssh
     /// (`Transport::ssh`). Tests run the far end's `fleet-link --peer`
     /// in-process.
@@ -167,8 +167,7 @@ pub struct Options {
     /// `fleet::code::repos_dir`. Tests point it at a scratch dir.
     pub repos: Option<PathBuf>,
     /// The agent `fleet.agent` answers an offered worker's `fleet-link`
-    /// with; `None` is `bridge::host_agent` (the machines' agent relays'
-    /// provider). Tests inject one.
+    /// with; `None` is `bridge::host_agent`. Tests inject one.
     pub host_agent: Option<HostAgent>,
     /// The argv a peer's `PTY` stream runs for a piped or tty exec; `None`
     /// is the runtime's `exec` (`fleet::pty::runtime_exec`). Tests run `sh`.
@@ -196,7 +195,7 @@ impl Options {
             join: None,
             home: None,
             machines: None,
-            dial: None,
+            probe: None,
             link_transport: None,
             machine_timing: service::Timing::default(),
             helper: None,
@@ -297,7 +296,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // Every machine, ssh or offered, is dialed at its link's socket here;
     // only `machines.probe`/`.add` ssh to a target (tests inject that part).
     let dial = fleet::dialer::dial(dir.to_path_buf());
-    let probe = opts.dial.clone().unwrap_or_else(|| ssh::ssh_dial(link::client_name()));
+    let probe = opts.probe.clone().unwrap_or_else(|| ssh::probe_dial(link::client_name()));
     // Whenever the daemon runs, host side or not: every registered machine's
     // link is held (a test daemon's registry has none unless the test writes
     // one). The hooks reach `shared` once it exists; until then nothing
@@ -779,16 +778,11 @@ impl Shared {
     /// One stream of the lending link, or of an ssh machine's link
     /// (`fleet::dialer`), on `channel`: a socket pair whose one end goes to
     /// the hub (the machine), the other [`serve_channel`](Self::serve_channel)'s
-    /// with `scope`. An `API` stream starts with the API relay's sentinel
-    /// line on ours, so the hub reads it before any answer
-    /// (`machines::link::handshake` reads the stream as an ssh relay's); a
-    /// `link.attach` client talks to the daemon directly, so that one has
-    /// none. `None` when refused.
+    /// with `scope`. An `API` stream's first byte is the daemon's, as on a
+    /// `link.attach` connection (fleet plan decision 27). `None` when
+    /// refused.
     fn open_lent(self: &Arc<Self>, channel: lent::Channel, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
         let (hub, ours) = Stream::pair().ok()?;
-        if channel == lent::Channel::Api {
-            super::relay::write_sentinel(&mut &ours, true).ok()?;
-        }
         self.serve_channel(channel, scope, ours).then(|| hub.into())
     }
 
@@ -1595,11 +1589,10 @@ const INBOUND_ROOTS_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Inbound neighbor `peer`'s config roots: `roots.list` over one `API`
 /// stream of its link, through `socket` (`fleet-<peer>.sock`, which its
-/// `fleet-link` binds before announcing; the stream starts with the API
-/// relay's sentinel, as every link `API` stream does).
+/// `fleet-link` binds before announcing).
 fn inbound_roots(peer: &str, socket: &Path) -> Result<Vec<PathBuf>> {
     let stream = Stream::connect(socket).with_context(|| format!("cannot connect to {}", socket.display()))?;
-    let mut link = machines::link::handshake(peer, machines::ssh::Duplex::socket(stream), INBOUND_ROOTS_TIMEOUT)?;
+    let mut link = machines::link::handshake(peer, machines::ssh::Duplex::socket(stream), INBOUND_ROOTS_TIMEOUT, machines::link::Over::Link)?;
     let r = link.conn.call("roots.list", json!({}))?;
     if let Some(e) = r.error {
         anyhow::bail!("roots.list: {}", e.message);
@@ -1608,23 +1601,20 @@ fn inbound_roots(peer: &str, socket: &Path) -> Result<Vec<PathBuf>> {
     Ok(rows.into_iter().map(|c| c.root).collect())
 }
 
-/// `link.attach {peer, channel?}`: a connection of this user says the
-/// rest of it is peer `peer`'s (docs/reference/api.md, `link.attach`).
-/// One-way: nothing turns it back to `Full`, and a second attach is
-/// refused by the table itself.
+/// `link.attach {peer, channel}`: a connection of this user (a
+/// `fleet-link --peer`'s, `commands::fleet_link::attach_stream`) says the
+/// rest of it is one `channel` stream of link peer `peer`'s
+/// (docs/reference/api.md, `link.attach`). One-way: nothing turns it back
+/// to `Full`, and a second attach is refused by the table itself.
 ///
-/// - No `channel`: an ssh machine's relay (`api --stdio --session-env`,
-///   what a host linking this one runs). The connection is served with the
-///   trust table from here on (`Table::Peer`, no fleet root, the env as
-///   sent: the relay set it), its pushed snapshots filtered too.
-/// - `channel` (a fleet member's link, `peer` a machine name): the peer is
-///   `{peer, fleet_root: <data>/fleet/<peer>/ (created), env: the
-///   daemon's}`. `api` goes on as above with that peer; any other channel
-///   ends the line protocol once the answer is out, the stream handed to
-///   [`Shared::serve_channel`] (`ConnState::handoff`). The client sends
-///   nothing past the attach line before it has read the answer: bytes
-///   already buffered past it, or a subscribed connection (its notifier
-///   could still write), refuse the attach with `invalid`.
+/// The peer is `{peer, fleet_root: <data>/fleet/<peer>/ (created), env:
+/// the daemon's, agent: its agent-link-<peer>.sock}`. `api` goes on served
+/// with the trust table (`Table::Peer`), its pushed snapshots filtered too;
+/// any other channel ends the line protocol once the answer is out, the
+/// stream handed to [`Shared::serve_channel`] (`ConnState::handoff`). The
+/// client sends nothing past the attach line before it has read the
+/// answer: bytes already buffered past it, or a subscribed connection (its
+/// notifier could still write), refuse the attach with `invalid`.
 fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut ConnState) -> Response {
     if !matches!(conn.table, Table::Full) || !conn.own_user {
         return Response::err(id, "denied", "`link.attach` is for this user's own relay connections");
@@ -1633,30 +1623,25 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
         Ok(parsed) => parsed,
         Err(e) => return Response::err(id, e.code, e.message),
     };
-    let peer = match channel {
-        None => lent::Peer { name: name.clone(), fleet_root: None, env: None, agent: None },
-        Some(channel) => {
-            if channel != lent::Channel::Api && conn.buffered {
-                return Response::err(id, "invalid", "nothing may follow `link.attach {channel}` before its answer");
-            }
-            if channel != lent::Channel::Api && conn.notifier.is_some() {
-                return Response::err(id, "invalid", "a subscribed connection can't become a channel stream");
-            }
-            let Some(data) = shared.data_dir() else {
-                return Response::err(id, "failed", "this daemon has no data dir for a fleet root");
-            };
-            match lent::peer_fleet_root(data, &name) {
-                Ok(root) => lent::Peer {
-                    name: name.clone(),
-                    fleet_root: Some(root),
-                    env: Some(shared.peer_env.clone()),
-                    agent: Some(endpoint::link_agent_socket(&shared.socket_dir, &name)),
-                },
-                Err(e) => {
-                    log(&format!("{}: link.attach: {e:#}", conn.label()));
-                    return Response::err(id, "internal", format!("{e:#}"));
-                }
-            }
+    if channel != lent::Channel::Api && conn.buffered {
+        return Response::err(id, "invalid", "nothing may follow `link.attach {channel}` before its answer");
+    }
+    if channel != lent::Channel::Api && conn.notifier.is_some() {
+        return Response::err(id, "invalid", "a subscribed connection can't become a channel stream");
+    }
+    let Some(data) = shared.data_dir() else {
+        return Response::err(id, "failed", "this daemon has no data dir for a fleet root");
+    };
+    let peer = match lent::peer_fleet_root(data, &name) {
+        Ok(root) => lent::Peer {
+            name: name.clone(),
+            fleet_root: Some(root),
+            env: Some(shared.peer_env.clone()),
+            agent: Some(endpoint::link_agent_socket(&shared.socket_dir, &name)),
+        },
+        Err(e) => {
+            log(&format!("{}: link.attach: {e:#}", conn.label()));
+            return Response::err(id, "internal", format!("{e:#}"));
         }
     };
     let peer = Arc::new(peer);
@@ -1668,7 +1653,7 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
     let trust = serde_json::to_value(reach.trust).unwrap_or(Value::Null);
     let trust_name = trust.as_str().unwrap_or("?");
     match channel {
-        None | Some(lent::Channel::Api) => {
+        lent::Channel::Api => {
             let filtered = (Arc::clone(&peer), files);
             conn.out.post(|p| {
                 p.reach = Some(filtered);
@@ -1676,12 +1661,9 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
             });
             conn.table = Table::Peer(peer);
         }
-        Some(channel) => conn.handoff = Some((channel, peer)),
+        channel => conn.handoff = Some((channel, peer)),
     }
-    match channel {
-        None => log(&format!("{}: link from {name}, trust {trust_name}", conn.label())),
-        Some(c) => log(&format!("{}: {} stream from {name}, trust {trust_name}", conn.label(), c.as_str())),
-    }
+    log(&format!("{}: {} stream from {name}, trust {trust_name}", conn.label(), channel.as_str()));
     Response::ok(id, json!({ "ok": true, "trust": trust }))
 }
 
@@ -1898,7 +1880,7 @@ fn fresh_capacities(
             .map(|entry| {
                 s.spawn(move || {
                     let duplex = (ctx.dial)(entry).ok()?;
-                    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT).ok()?;
+                    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT, link::Over::Link).ok()?;
                     let r = link.conn.call_within("capacity.get", json!({}), CAPACITY_WAIT).ok()??;
                     let capacity = serde_json::from_value(r.result?).ok()?;
                     Some((entry.name.clone(), capacity))
@@ -2168,8 +2150,8 @@ pub(crate) mod tests {
             // Never the user's home, registry or ssh.
             home: Some(std::env::temp_dir().join(format!("dsv-home-{}", std::process::id()))),
             machines: Some(std::env::temp_dir().join(format!("dsv-machines-{}", std::process::id())).join("machines.toml")),
-            dial: Some(Arc::new(|e: &machines::Entry| {
-                anyhow::bail!("a test daemon has no add-time dial (machine {}): set Options.dial", e.name)
+            probe: Some(Arc::new(|e: &machines::Entry| {
+                anyhow::bail!("a test daemon has no add-time dial (machine {}): set Options.probe", e.name)
             })),
             link_transport: Some(crate::serve::fleet::transport::Transport::new(|target, _| {
                 anyhow::bail!("a test daemon has no transport (to {target}): set Options.link_transport")
@@ -3071,7 +3053,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A relay's `link.attach` turns its connection into a `Peer` one: the
+    /// A `link.attach {channel: api}` turns its connection into a `Peer` one: the
     /// trust table from there on, read per request from `member.toml`.
     #[test]
     fn an_attached_connection_gets_the_trust_table() {
@@ -3089,15 +3071,8 @@ pub(crate) mod tests {
         let options = Options { state: Some(state), lend: Some(data.join("lend.toml")), ..opts(1, 1000) };
         let daemon = spawn_daemon(&dir, options);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut stream = loop {
-            if let Ok(s) = endpoint::connect(&dir) {
-                break s;
-            }
-            assert!(Instant::now() < deadline, "daemon never listened");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(super::super::relay::attach(&stream, "lap.local").unwrap(), "worker");
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "lap.local", "channel": "api"}), b"");
+        assert_eq!(answer["result"]["trust"], "worker", "{answer}");
         let Hello::Ready(hello) = client::hello(&mut stream, &v(1), "machine-link").unwrap() else { panic!("no hello") };
         let mut conn = client::Conn::new(stream, hello).unwrap();
         let code = |conn: &mut client::Conn, method: &str, params: Value| conn.call(method, params).unwrap().error.map(|e| e.code);
@@ -3106,7 +3081,7 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": own})), None, "an own root");
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), Some("denied".into()));
         assert_eq!(code(&mut conn, "machines.list", json!({})), Some("denied".into()));
-        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again"})), Some("denied".into()), "one-way");
+        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api"})), Some("denied".into()), "one-way");
 
         // `full` is read per request: the same connection opens up, but
         // `member.*` and `link.*` stay local.
@@ -3114,12 +3089,13 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "machines.list", json!({})), None);
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), None);
         assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
-        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again"})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api"})), Some("denied".into()));
         drop(conn);
 
-        // A bad `peer` leaves the connection as it was.
+        // A bad `peer`, or no `channel`, leaves the connection as it was.
         let mut plain = connect(&dir);
-        assert_eq!(code(&mut plain, "link.attach", json!({"peer": ""})), Some("invalid".into()));
+        assert_eq!(code(&mut plain, "link.attach", json!({"peer": "", "channel": "api"})), Some("invalid".into()));
+        assert_eq!(code(&mut plain, "link.attach", json!({"peer": "lap"})), Some("invalid".into()));
         assert_eq!(code(&mut plain, "member.get", json!({})), None, "still a local client");
         drop(plain);
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);

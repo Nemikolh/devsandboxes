@@ -21,8 +21,8 @@ downloaded, a dev one received over `TRANSFER`
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
-(`Spec`, `cap_of`, `Handler`, `Serves`, `Endpoint`, `opener`,
-`opener_with`, `answerer`, `answerer_with`, `run`, `Out`, `Outlet`,
+(`Spec`, `cap_of`, `Handler`, `Serves`, `Endpoint`,
+`opener_with`, `answerer_with`, `run`, `Out`, `Outlet`,
 `End`, `splice`, `write_sentinel`, `match_sentinel`),
 `src/serve/fleet/transport.rs` (`Transport`, `check_target`),
 `src/serve/fleet/transfer.rs` (`Header`, `Received`,
@@ -126,9 +126,8 @@ with the roles of a container's link moved onto the two hosts. A connection
 to a socket on one host becomes a stream on the mux, answered on the other
 host by a connection made there. A `Spec` says what a link is: its
 sentinel line (`\n<sentinel> <version>\n`), the channel it stands for
-(the opener requires the peer to serve it), and the `Hello` hash (the
-agent relay's is informational; on the fleet link it is the build a
-worker [follows](#versions)).
+(the opener requires the peer to serve it), and the `Hello` hash (on the
+fleet link the build a worker [follows](#versions)).
 
 **Channels, from either end.** Both ends are a `link::Endpoint`: OUT,
 the sockets it binds (a channel and a path each) and an `Outlet` its own
@@ -164,8 +163,8 @@ stream. The roles differ in the handshake, the stream id space
 (`link::Out`) and how an ending ends them:
 
 - **The opener** (`link::opener_with`, the end ssh runs: the hub's
-  `fleet-link`, a [peer link](#peer-links)'s dialed end, the agent
-  relay's far end) binds its sockets, writes the
+  `fleet-link`, a [peer link](#peer-links)'s dialed end) binds its
+  sockets, writes the
   sentinel, exchanges `Hello`s and requires the peer to advertise the
   spec's channel. Its `on_ready` callback runs next, with the peer's
   `Hello` (its `hash` is the far end's spec `hello`); an error there ends
@@ -176,10 +175,8 @@ stream. The roles differ in the handshake, the stream id space
   and answered from its table. Its reader runs on a thread of its own, so
   any ending ends it: `Ok` when the reader ends or the writer fails, an
   error when the keepalive hears nothing or a listener fails.
-  `link::opener` is the one-socket case: the spec's channel, nothing
-  served.
 - **The answerer** (`link::answerer_with`, the end that dials: the
-  worker's lending thread, a machine's agent relay) skips what the login
+  worker's lending thread, a [peer link](#peer-links)'s dialer) skips what the login
   shell printed up to the sentinel (`ssh::skip_lines`, at most
   `SENTINEL_LIMIT` bytes; another sentinel version is a handshake failure
   saying which side to update), binds its sockets, exchanges `Hello`s,
@@ -192,18 +189,15 @@ stream. The roles differ in the handshake, the stream id space
   `End`: the handshake failed (with the first line of noise, or a socket
   not bound), `on_ready` refused (`Refused`, with why), the keepalive ran
   `on_dead` (which must end the reader, e.g. kill the ssh), or the stream
-  closed. `link::answerer` is the one-channel case: the spec's channel
-  served by an `open` callback, no outlet.
+  closed.
 
-Two specs exist:
+One spec exists:
 
 | spec | sentinel | channel | cap | opener / answerer |
 |---|---|---|---|---|
-| `machines::agent::SPEC` | `devsandbox-agent 1` | `SSH_AGENT` (legacy) | `caps::SSH_AGENT` | `commands::agent_relay::run` / `machines::agent::serve` |
 | `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run` (on the hub) / the worker's lending thread (`fleet::worker`); `commands::fleet_link::run_peer` (a [peer link](#peer-links)'s dialed end, its `hello` `update::hello_of`) / the dialer |
 
-The agent relay uses the one-channel cases (`link::opener`,
-`link::answerer`). On `fleet::LINK` the hub's opener binds
+On `fleet::LINK` the hub's opener binds
 `endpoint::fleet_socket` for `API` and `endpoint::fleet_transfer_socket`
 for `TRANSFER` (a further channel's socket is
 `endpoint::fleet_channel_socket`, `fleet-<name>.<suffix>.sock`) and
@@ -217,12 +211,12 @@ handler connects, so a
 `client::Conn` on the opener's host says its hello to, and calls, a daemon
 on the answerer's host.
 
-**The sentinel rule.** An `API` stream starts with the API relay's own
-sentinel line, `\n` + `devsandbox-api 1\n` (`relay::write_sentinel`): the
-answerer's `API` handler hands back a daemon connection that writes that line
-before the daemon's bytes. So a stream reads exactly like an ssh machine's
-relay, and `machines::link::handshake` (which skips to that line, then
-says its hello) works on it unchanged.
+**No sentinel inside a stream.** An `API` stream is the daemon from its
+first byte: a mux stream has no login shell in it to skip (fleet plan
+decision 27), so `machines::link::handshake` says its hello at once
+(`Over::Link`). Only the link itself, and `machine add`'s probe over ssh
+(`api --stdio --sentinel`, [machines.md](machines.md#link-handshake)),
+start with a sentinel line.
 
 ## Transport
 
@@ -258,8 +252,8 @@ of `fleet::LINK` (it writes the sentinel), saying
   connecting K's daemon socket and sending `link.attach {peer: L,
   channel}` as the connection's first line, reading the answer byte by
   byte (nothing past it), then splicing the stream to the connection
-  (`link::splice`); an `API` stream gets the API relay's sentinel line
-  first ([the sentinel rule](#link)), so L reads it as any link's. Every
+  (`link::splice`); an `API` stream is K's daemon from its first byte
+  ([no sentinel inside a stream](#link)). Every
   stream is therefore served by K's daemon under K's trust table for L,
   with L's fleet root `fleet/L/` (`Shared::serve_channel`); a refused
   attach closes the stream, with why on stderr. `AGENT` isn't served: it
@@ -321,7 +315,7 @@ It is the answerer of `fleet::LINK` (it reads the sentinel), saying
 
 A link may also carry bulk transfers on flowing `TRANSFER` streams, in
 both directions; `fleet::LINK`'s two ends do (each serving `TRANSFER`
-through `link::Serves::transfers`), the agent relay's don't. Both ends
+through `link::Serves::transfers`). Both ends
 then advertise `caps::TRANSFER` in their `Hello`s, and each opens
 `TRANSFER` streams only toward a peer that advertised it.
 
@@ -480,7 +474,7 @@ link's `API` streams.
   name must pass `machines::check_name`, the root (the worker's canonical
   fleet root, a path on the worker) must be absolute. It binds
   `endpoint::fleet_socket`: `<socket dir>/fleet-<name>.sock` (0600 in the
-  0700 socket dir, the name cut as an agent relay socket's client is), so
+  0700 socket dir, the name cut as an `agent-<client>.sock`'s client is), so
   the newest link for a worker wins. Its `on_ready` connects to this host's
   daemon (`client::connect`, which starts one like any client does when
   none runs) and sends `fleet.offer {worker, version, root, draining}`,
@@ -561,8 +555,7 @@ link's `API` streams.
   `vscode` (`cli::calls::refusal`, on any machine) and the dashboard's
   tab on a global service no instance uses (`tui::remote::service_argv`:
   a service dial goes through an instance using it). No ssh argv is built for an offered entry:
-  `machines::ssh`'s `argv_with` takes `Entry::ssh_target`, an error for one
-  (`machines::offered_refusal`, a backstop no path reaches first).
+  `machines::ssh`'s `argv_with` takes `Entry::ssh_target`, an error for one.
 
 ### Hub mode
 
@@ -875,9 +868,9 @@ What the worker is as a fleet member (its name, trust and the rest) is
   `Shared::open_lent`: a socket pair whose daemon end goes to
   `Shared::serve_channel`, the one server of a peer's channel streams
   that a `link.attach {channel}` connection's also go to
-  ([the trust table](#the-trust-table)). An `API` end writes the API relay's
-  sentinel line first ([the sentinel rule](#link)) and is then served like
-  any connection (`spawn_conn_as`), with the `Peer` table; its connection
+  ([the trust table](#the-trust-table)). An `API` end is served like
+  any connection from its first byte ([no sentinel inside a
+  stream](#link)) (`spawn_conn_as`), with the `Peer` table; its connection
   id comes from the same counter as the listener's. A `PTY` end is
   `fleet::pty::serve`'s on a `serve-pty` thread ([PTY](#pty)), refused
   without a host side (no helper client); a `TUNNEL` end
@@ -1103,11 +1096,9 @@ whole API); `--machine` refuses it with the rest of `machine`
 (`serve::machines::cli::machine_use`). It is read for every request a
 remote caller sends (`lent::Reach::load`), so a change applies to the
 next one. It applies to every remote caller alike: a hub over the
-lending link, a host that linked this one as an ssh machine (its
-relay connections, after `link.attach`), and a fleet member's channel
-streams (after `link.attach {channel}`). `worker` is the default: a
-remote caller reaches this host's own roots and (a hub, a fleet member)
-its fleet root
+lending link, and a link peer's channel streams (after `link.attach`).
+`worker` is the default: a remote caller reaches this host's own roots
+and its fleet root
 through the [trust table](#the-trust-table), placed
 work under the [worker policy](#worker-policy). `full` gives it the API a
 local client has (but `member.*`, `link.*` and `links.*`), lifts the worker policy
@@ -1118,13 +1109,11 @@ builds ([Versions](#versions)).
 
 Every connection has a table (`daemon::Table`): `Full` for local clients,
 `Peer(Peer)` for a remote caller's: the hub's `API` streams over the
-lending link (`Shared::open_lent`), an ssh machine's relay connection
-once it is attached, and a `link.attach {channel: "api"}` connection. A
-`Peer` (`fleet::lent::Peer`) is who it is (for the log),
-its fleet root (canonical; `Some` on the lending link and for a channel
-attach, `None` for an ssh machine's relay) and the env its verbs get
-(`Some` on the lending link and for a channel attach: this host's own,
-the daemon's `Shared::peer_env`; `None` keeps a verb's as sent). The
+lending link (`Shared::open_lent`) and a `link.attach {channel: "api"}`
+connection. A `Peer` (`fleet::lent::Peer`) is who it is (for the log),
+its fleet root (canonical) and the env its verbs get (this host's own,
+the daemon's `Shared::peer_env`; a `Peer` without one, only in tests,
+keeps a verb's as sent). The
 `PTY` and `TUNNEL` streams have no table: `fleet::pty::serve` and
 `fleet::tunnel::serve` read the same `Reach` for their `Peer` and gate
 the root and instance against it ([PTY](#pty), [TUNNEL](#tunnel)). For each request on a `Peer` connection the daemon reads
@@ -1142,8 +1131,7 @@ a `lent::Reach` from this host's files (`Reach::load` over
   `machine add` runs here over ssh for every root it picks
   (`commands::machine::record_roots`). Placed instances'
   config roots are in `state.toml` too.
-- **The fleet root**, the `Peer`'s (none for an ssh machine's relay):
-  the lending link's `lend::fleet_root` of its hub target; a channel
+- **The fleet root**, the `Peer`'s: the lending link's `lend::fleet_root` of its hub target; a channel
   attach's `fleet/<peer>/` in the data dir (`lent::peer_fleet_root`,
   created by the attach, decision 24 of the
   [plan](../../plans/active/fleet.md#decisions)).
@@ -1200,9 +1188,8 @@ never hands the daemon off (below). Under **`worker`**:
   instance without a recorded `config_dir` stops it, `denied`).
 - **Env**: a verb's `env` is replaced by the `Peer`'s when it has one: on
   the lending link the daemon's own process env (`verbs_client::caller_env`,
-  `Options::lend_env` in tests), never what the hub sent: the worker-side
-  counterpart of `relay::SessionEnv` on an ssh machine. A peer link's
-  (`link.attach {channel}`) is the same env, its `SSH_AUTH_SOCK` the
+  `Options::lend_env` in tests), never what the hub sent. A peer link's
+  (`link.attach`) is the same env, its `SSH_AUTH_SOCK` the
   peer's relayed agent (`Peer::agent`: `agent-link-<peer>.sock`) while
   that socket answers.
 - **Answers and pushes**: a snapshot lists every instance in `state.toml`,
@@ -1226,29 +1213,22 @@ version it says and even with `force`, under either trust: only a local
 client's newer binary (or this user's forced hello, [Versions](#versions))
 replaces it.
 
-**`link.attach {peer}`** turns a `Full` connection into a `Peer` one: the
-add-time relay to an ssh machine (`api --stdio --session-env`,
-`machines.probe` / `.add`) sends it first, before relaying a byte
-([machines](machines.md#ssh), `relay::attach`). The
-daemon (`daemon::link_attach`) takes it only from a `Full` connection of
-its own user (`endpoint::peer_is_own_user`), `peer` a non-empty name
-(`lent::attach_peer`: at most 255 bytes, no control characters; the
-linking host's name, shown only in the log), and switches the
-connection to `Peer { name: peer, fleet_root: None, env: None }`, its
-pushed snapshots filtered from then on (`Pending::reach`, as
-`Shared::spawn_conn_as` sets it for the lending link's). `env` is
-`None`: the relay's `SessionEnv` already replaced each verb's with the
-machine's login env, which the daemon must keep. It is one-way: a second `link.attach` is `link.*`,
-which the table refuses. It logs `connection N: link from <peer>, trust
-<t>` and answers `{ok, trust}`.
-
-**`link.attach {peer, channel}`** (`lent::attach_params`: `peer` must
-also be a machine name, `machines::check_name`, since it names a
-directory; `channel` one of `api`, `pty`, `tunnel`, `transfer`, `agent`,
-`lent::Channel`) is a fleet member's stream: the same gate, but the peer
-is `Peer { name: peer, fleet_root: Some(<data>/fleet/<peer>/), env:
-Some(<the daemon's env>) }`. `api` switches the connection in place like
-the relay's. Any other channel sets `ConnState::handoff`: once the
+**`link.attach {peer, channel}`** turns a `Full` connection into one
+stream of a link peer's: a `fleet-link --peer` sends it first on each
+stream it hands its daemon ([peer links](#peer-links)). The daemon
+(`daemon::link_attach`) takes it only from a `Full` connection of its own
+user (`endpoint::peer_is_own_user`); `lent::attach_params` wants `peer`
+(at most 255 bytes, no control characters, and a machine name,
+`machines::check_name`, since it names a directory) and `channel`, one
+of `api`, `pty`, `tunnel`, `transfer`, `agent` (`lent::Channel`;
+required). The peer is `Peer { name: peer, fleet_root:
+Some(<data>/fleet/<peer>/), env: Some(<the daemon's env>), agent:
+Some(agent-link-<peer>.sock) }`. It is one-way: a second `link.attach`
+is `link.*`, which the table refuses. It logs `connection N: <channel>
+stream from <peer>, trust <t>` and answers `{ok, trust}`. `api` switches
+the connection in place to `Table::Peer`, its pushed snapshots filtered
+from then on (`Pending::reach`, as `Shared::spawn_conn_as` sets it for
+the lending link's). Any other channel sets `ConnState::handoff`: once the
 answer is out, `serve_conn` ends its loop, the connection leaves `conns`
 (so the drain no longer cuts it) and its stream, `BufReader::into_inner`
 with nothing read past the line and its write timeout cleared, goes to
@@ -1460,16 +1440,14 @@ link, or `lost`) is reported once, with its line.
 
 A port forward's bridge into a lent instance over the link, every remote
 forward's ([forwards](forwards.md#remote-bridges)): each `TUNNEL` stream
-the hub opens is what the hidden `devsandbox tunnel` was at the far end
-of a forward's ssh, served by
+the hub opens is served by
 `fleet::tunnel::serve` on a thread of its own
 (`Shared::serve_channel`).
 
 - **The request** is the hub's first line (within 30 s, at most 64 KiB,
   read byte by byte: `tunnel::read_request`), `tunnel::Request` as JSON:
   `{"root": <abs config root>, "instance"?: <name>, "service"?: <name>,
-  "port": <n>}`, the arguments `devsandbox tunnel` takes and with its
-  rules: an instance, a service or both; the instance as
+  "port": <n>}`: an instance, a service or both; the instance as
   `resolve_instance` takes a name (exact name or id, then sandbox or
   folder basename; ambiguous refuses).
 - **The gate**: `root` confined as an `API` request's is
@@ -1485,14 +1463,13 @@ of a forward's ssh, served by
   container of that root's project (a `global` one too, which the
   [worker policy](#worker-policy) denies unless allowed); `denied`
   refusals are logged.
-- **The answer** is the route resolved as `devsandbox tunnel` resolves it
-  (`commands::tunnel::resolve` over `port::resolver_in`, the state
+- **The answer** is the route (`commands::tunnel::resolve` over `port::resolver_in`, the state
   loader injected), written as one `commands::tunnel::Header` line
   (`Header::of`): the route, or `{"error"}` for any refusal, after which
   the stream closes. After a route the worker runs `bridge::bridge_command`
   into its container with the stream itself as stdin and stdout (its
   fds, `Stdio::from`), its stderr line by line in the daemon's log, so
-  the bridge's handshake and mux follow the header as over ssh. The
+  the bridge's handshake and mux follow the header on the stream. The
   bridge is killed and reaped once the hub closes the stream (watched
   with `daemon::hung_up`), or the stream closes when the bridge exits.
 
@@ -1512,8 +1489,8 @@ TCP connection is then a `Connect` on that bridge's mux, inside the
 
 ### AGENT
 
-The hub's ssh agent on the worker, over the link: the agent relay's
-semantics ([machines](machines.md#agent)) for an offered machine. While
+The hub's ssh agent on the worker, over the link: an ssh machine's
+`AGENT` semantics ([machines](machines.md#agent)) for an offered machine. While
 the hub's registry entry for the worker has `agent = true`, every
 instance there reaches the hub's agent, not only placed ones. Streams go
 worker → hub (`channel::AGENT`, flowing), so the worker needs nothing of
@@ -1540,8 +1517,8 @@ own: past a `SERVING` byte relayed both ways on two threads, each
 direction's end passed on as a half-close; any other answer closes the
 client and unbinds the socket at once. When the link ends (the outlet
 goes down) or `run_link`'s answerer returns, the socket is unlinked if
-it is still its own. Named `agent-*.sock`, it is one of the agent relay
-sockets `bridge::host_agent` tries (`endpoint::agent_sockets`, newest
+it is still its own. Named `agent-*.sock`, it is one of the relayed
+agents' sockets `bridge::host_agent` tries (`endpoint::agent_sockets`, newest
 first, each probed with a connect), so the worker's bridges reach the
 hub's agent as they reach a machine's relayed one, and only while it
 leads somewhere: with `agent` off on the hub, or the link gone, there is

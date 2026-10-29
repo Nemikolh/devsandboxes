@@ -24,9 +24,8 @@ use super::{notify, proto, relay_mode, BIN};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
-/// What carries a bridge's bytes: a spawned child's stdio (an `exec`, an
-/// ssh running `devsandbox tunnel`), or a stream (a fleet link's `TUNNEL`,
-/// `commands::tunnel`). Killing it ends the bridge the same way either way:
+/// What carries a bridge's bytes: a spawned child's stdio (an `exec`), or
+/// a stream (a machine link's `TUNNEL`, `commands::tunnel`). Killing it ends the bridge the same way either way:
 /// the child dies, or the stream is shut down; the mux's read then ends.
 pub enum Transport {
     Child(Child),
@@ -211,7 +210,7 @@ impl AgentCandidates {
     }
 
     /// The first candidate `live` accepts: the reported ones (newest first),
-    /// then `relays` (agent relay sockets, newest first:
+    /// then `relays` (the relayed agents' sockets, newest first:
     /// `endpoint::agent_sockets`), then `fallback` (the process's own
     /// `$SSH_AUTH_SOCK`).
     pub fn pick(
@@ -251,8 +250,8 @@ fn agent_live(path: &Path) -> bool {
 }
 
 /// The host agent socket, chosen per stream so agent rotation needs no
-/// restart: the first live reported agent, else the first live agent relay
-/// socket in the socket dir (newest first; a missing or unreadable dir has
+/// restart: the first live reported agent, else the first live relayed
+/// agent's socket in the socket dir (newest first; a missing or unreadable dir has
 /// none), else `$SSH_AUTH_SOCK` when live (see [`AgentCandidates::pick`]).
 /// Also gates whether a bridge is worth spawning (`has_host_agent`). The
 /// daemon answers its machines' `AGENT` streams with it too
@@ -269,7 +268,7 @@ pub fn host_agent() -> Option<PathBuf> {
 /// (`Bridges::reconcile`, the CLI's `bridges.ensure`) and `SSH_AUTH_SOCK`
 /// injection: with no agent a bridge and the env var only cost an extra
 /// `exec` that can't help. It counts client-reported agents (in the daemon)
-/// and live machine agent relays, so a report or a relay coming up replaces
+/// and live relayed agents, so a report or a relayed agent coming up replaces
 /// the daemon's agent-less bridges (see `reconcile`).
 pub fn has_host_agent() -> bool {
     host_agent().is_some()
@@ -654,8 +653,8 @@ fn spawn_observed(
 }
 
 /// `<runtime> exec -i -u root <container> devsbd bridge`: the in-container end
-/// of every bridge, spawned here or `exec`'d by `devsandbox tunnel` on a
-/// machine (`commands::tunnel::tunnel`).
+/// of every bridge, spawned here or on a machine's `TUNNEL` stream
+/// (`serve::fleet::tunnel`).
 pub fn bridge_command(container: &str) -> Command {
     let mut cmd = Command::new(backend().bin());
     cmd.args(["exec", "-i", "-u", "root", container, BIN, "bridge"]);

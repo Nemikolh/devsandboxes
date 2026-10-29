@@ -71,8 +71,8 @@ pub fn link_args(member: &str) -> Result<Vec<String>> {
 
 /// The daemon's [`Dial`] of a registered machine, ssh or offered: a
 /// connection to its `fleet-<name>.sock` in `socket_dir` (one `API` stream
-/// on its link, which starts with the API relay's sentinel line, so
-/// `machines::link::handshake` reads it as it reads an ssh relay's).
+/// on its link, the daemon from its first byte:
+/// `machines::link::handshake` with `Over::Link`).
 pub fn dial(socket_dir: PathBuf) -> Dial {
     Arc::new(move |entry: &Entry| {
         let path = endpoint::fleet_socket(&socket_dir, &entry.name);

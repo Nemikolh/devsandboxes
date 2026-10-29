@@ -614,9 +614,6 @@ impl<'a> LinkLoop<'a> {
                 Ok(mut link) => {
                     self.failures = 0;
                     self.logged = None;
-                    if let Some(noise) = &link.noise {
-                        (self.inner.log)(&format!("machine {}: login shell printed: {noise}", self.entry.name));
-                    }
                     let remote = link.remote().version.clone();
                     self.inner.remotes.update(&self.entry.name, |m| m.version = Some(remote));
                     self.inner.rows_changed();
@@ -726,7 +723,7 @@ impl<'a> LinkLoop<'a> {
         if self.ctl.stopped() {
             return Err("stopping".into());
         }
-        link::handshake(&self.entry.name, duplex, self.inner.timing.handshake).map_err(|e| e.to_string())
+        link::handshake(&self.entry.name, duplex, self.inner.timing.handshake, link::Over::Link).map_err(|e| e.to_string())
     }
 
     /// The connected loop: queued calls first, else a short wait for a
@@ -873,7 +870,6 @@ mod tests {
     /// anything else.
     fn mute_peer() -> Duplex {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        crate::serve::relay::write_sentinel(&mut &theirs, true).unwrap();
         std::thread::spawn(move || {
             let mut r = BufReader::new(theirs.try_clone().unwrap());
             let mut line = String::new();

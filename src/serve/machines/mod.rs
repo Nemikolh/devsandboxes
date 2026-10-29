@@ -7,17 +7,15 @@
 //! `fleet-<name>.sock` (`fleet::dialer::dial`).
 //!
 //! - this module: the registry, `machines.toml` next to `state.toml`
-//! - `ssh`: the ssh argv and quoting, and the injectable [`ssh::Dial`] that
-//!   opens a [`ssh::Duplex`] to a machine
+//! - `ssh`: the add-time ssh argvs and quoting, and the injectable
+//!   [`ssh::Dial`] that opens a [`ssh::Duplex`] to a machine
 //! - `link`: a connection to a machine's daemon (the hello)
 //! - `service`: the held link per machine, its rows and forwarded calls
 //! - `api`: the `machines.*` methods
 //! - `forward`: requests with `machine` (quick calls, verbs) and the
 //!   federated resolve and sandboxes listing
-//! - `cli`: the CLI's side: where a `<name>` points, `--machine`, and the
-//!   ssh re-run of commands that don't go through the daemon
-//! - `agent`: this end of a machine's agent relay, which nothing runs since
-//!   the link carries `AGENT` (fleet step 7d; it goes in step 8)
+//! - `cli`: the CLI's side: where a `<name>` points, `--machine`, and a
+//!   command's calls and `PTY` dials over the machine's link
 //! - `install`: the CLI's check of a machine's devsandbox and the copy of
 //!   this binary there
 //! - `saved`: a hub's `remotes.json`, the machines' last known rows
@@ -35,7 +33,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub mod agent;
 pub mod api;
 pub mod cli;
 pub mod forward;
@@ -151,24 +148,12 @@ impl Entry {
         self.target().unwrap_or("offered")
     }
 
-    /// The ssh target, for the argv builders ([`ssh`]): an offered machine
-    /// has none, so whatever needs an ssh to it is refused
-    /// ([`offered_refusal`]).
+    /// The ssh target, for the add-time argv builders ([`ssh`]): an offered
+    /// machine has none.
     pub fn ssh_target(&self) -> Result<&str> {
-        self.target().ok_or_else(|| offered_refusal(&self.name))
+        let name = &self.name;
+        self.target().with_context(|| format!("machine `{name}` is an offered fleet worker, reached over its fleet link, not ssh"))
     }
-}
-
-/// Why an ssh argv can't be built for an offered machine: it has no ssh
-/// target. A backstop: what reaches an offered machine goes over its fleet
-/// link (API calls, `PTY`, `TUNNEL`, `AGENT`), and each path that has no
-/// link form refuses first with its own words (`cli::calls::refusal`,
-/// `tui::remote::service_argv`).
-pub fn offered_refusal(name: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "machine `{name}` is an offered fleet worker, reached over its fleet link, not ssh \
-         (not over the link yet: ps, stats, gc, service ls, logs --follow, an exec without a tty, vscode, service terminals)"
-    )
 }
 
 /// [`Entry`] as the file holds it.

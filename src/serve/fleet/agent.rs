@@ -1,8 +1,7 @@
 //! `AGENT` on the fleet link (docs/architecture/daemon/fleet.md, *AGENT*):
 //! the hub's ssh agent reaching every instance on an offered worker while
 //! the hub's registry entry for the worker has `agent = true` (decision 14
-//! of the fleet plan), the agent relay's semantics (`machines::agent`)
-//! carried on the link instead of an ssh of its own.
+//! of the fleet plan), carried on the link instead of an ssh of its own.
 //!
 //! Every `AGENT` stream starts with one status byte from the hub:
 //! [`SERVING`], then the relay to the hub's agent, or [`NOT_SERVING`], then
@@ -16,9 +15,9 @@
 //!   ([`decide`]). Each connection there becomes one `AGENT` stream to the
 //!   hub (`link::Outlet::open`), spliced both ways past a `SERVING` byte;
 //!   any other answer closes the client and unbinds. Named `agent-*.sock`,
-//!   it is one of the relay sockets `bridge::host_agent` tries, so the
-//!   worker's bridges find it as they find a machine's agent relay, and
-//!   only while it leads somewhere.
+//!   it is one of the relayed agents' sockets `bridge::host_agent` tries,
+//!   so the worker's bridges find it as they find a peer link's
+//!   `agent-link-<host>.sock`, and only while it leads somewhere.
 //! - The hub's end, [`Gate`]: `commands::fleet_link` answers every `AGENT`
 //!   stream with a socket pair whose far end a thread of its own takes (the
 //!   handler runs on the mux's read thread): the status byte, then, once

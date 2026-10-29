@@ -30,8 +30,7 @@ pub mod notify;
 // Ports tab) reuses it (docs/architecture/daemon/forwards.md).
 #[cfg(unix)]
 pub mod forward;
-// Also carries a machine's agent relay (`serve::machines::agent`,
-// `commands::agent_relay`).
+// Also carries the fleet's links (`serve::fleet::link`).
 #[cfg(unix)]
 pub(crate) mod mux;
 // Partly helper-only (e.g. `Frame::encode` callers on the daemon side).

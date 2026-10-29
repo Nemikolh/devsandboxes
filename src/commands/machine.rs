@@ -91,7 +91,7 @@ fn record_roots_argv(target: &str, command: Option<&str>, roots: &[String]) -> R
     entry.command = command.map(String::from);
     let mut args = vec!["machine", "roots", "add", "--"];
     args.extend(roots.iter().map(String::as_str));
-    ssh::cli_argv(&entry, false, &args)
+    ssh::add_cli_argv(&entry, &args)
 }
 
 /// The warning when [`record_roots`] fails: not a failed add, but under the

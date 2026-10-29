@@ -123,10 +123,8 @@ absent otherwise (`confirm` included).
 
 A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
-its `member.toml` per request: a fleet hub's over the lending link, the
-connection of a host that linked this one as a machine (its relay's,
-after `link.attach`, below), and a fleet member's channel streams (after
-`link.attach {channel}`). `member.*`, `link.*` and `links.*` are `denied` under
+its `member.toml` per request: a fleet hub's over the lending link, and
+a link peer's channel streams (after `link.attach`, below). `member.*`, `link.*` and `links.*` are `denied` under
 either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
@@ -144,23 +142,22 @@ caller has the API a local client has.
 ### `link.attach`
 
 Internal (not in the npm typings): the first line of a connection that
-carries a remote caller's requests or one of a fleet link's channel
-streams. From then on that connection is a remote caller's (*Remote
-callers*); there is no way back.
+carries one of a link's channel streams (a `fleet-link --peer` sends it,
+[fleet.md](../architecture/daemon/fleet.md#peer-links)). From then on that
+connection is a remote caller's (*Remote callers*); there is no way back.
 
 | params | result | errors |
 |---|---|---|
-| `{"peer": name, "channel"?: "api" \| "pty" \| "tunnel" \| "transfer" \| "agent"}`: `peer` 1 to 255 bytes, no control characters, logged; with `channel`, also a machine name (letters, digits, `.`, `_`, `-`, not starting with `.` or `-`) | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer` or `channel`; bytes past the attach line already sent, or a subscribed connection, for a channel other than `api`), `failed` (no data dir for the fleet root) |
+| `{"peer": name, "channel": "api" \| "pty" \| "tunnel" \| "transfer" \| "agent"}`: `peer` 1 to 255 bytes, a machine name (letters, digits, `.`, `_`, `-`, not starting with `.` or `-`), logged; `channel` required | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer`, a missing or bad `channel`; bytes past the attach line already sent, or a subscribed connection, for a channel other than `api`), `failed` (no data dir for the fleet root) |
 
-Without `channel` it is a machine link's relay (`api --stdio
---session-env`, *Relay*), before it relays the linking host's bytes. Its
-verbs keep the `env` they carry: the relay already set it.
+The caller is link peer `peer`: its fleet root is `fleet/<peer>/` in the
+data dir (created by the attach), and its verbs run with the daemon's own
+env, whatever they send, `SSH_AUTH_SOCK` the peer's relayed agent
+(`agent-link-<peer>.sock`) while that answers.
 
-With `channel` the caller is fleet member `peer`: its fleet root is
-`fleet/<peer>/` in the data dir (created by the attach), and its verbs run
-with the daemon's own env, whatever they send.
-
-- `api`: the connection goes on as an API connection, the trust table's.
+- `api`: the connection goes on as an API connection, the trust table's,
+  its first byte after the answer the client's (no sentinel on a link
+  stream).
 - `pty`, `tunnel`, `transfer`, `agent`: once the answer is out the
   connection stops being JSON lines; its bytes are that channel's stream,
   as on a fleet link ([fleet.md](../architecture/daemon/fleet.md)):
@@ -857,8 +854,8 @@ With `"machine": "<name>"` (a registered machine; empty is none) the
 forward reaches that machine's instance or service but still binds here:
 the daemon serves the call itself (*The `machine` param*). `dir` is then
 the config root on the machine (absolute, taken as is) and `instance` the
-name there (the client's `instances.resolve` answer); each bridge is an ssh
-running `devsandbox tunnel` on the machine, which resolves both
+name there (the client's `instances.resolve` answer); each bridge is a
+`TUNNEL` stream over the machine's link, whose far end resolves both
 ([forwards.md](../architecture/daemon/forwards.md), *Remote bridges*).
 
 Result: `{"id": 4, "local": "127.0.0.1:3000", "target": "api:3000"}` once
@@ -1069,9 +1066,9 @@ preferred host agent (*Bridges*) while the machine's `agent` is on
 says version `0.0.0`, so it never hands off the remote daemon; the
 remote's `protocol` must equal ours, a different semver is allowed. Only
 `machines.probe` and `machines.add`, before the machine has a link, ssh
-to `<command> api --stdio --client machine:<this host> --session-env`
-(the remote's relay, *Relay*, attaching its connection with
-`link.attach`).
+to `<command> api --stdio --client machine:<this host> --sentinel` (the
+remote's relay, *Relay*: a local client there, under the user's own ssh
+login).
 
 **Links.** Every registered machine's link is held while the daemon
 runs: one `serve-machine-<name>` thread per machine (plus one carrying an
@@ -1399,7 +1396,7 @@ Exit status:
 |---|---|
 | 0 | stdin hit EOF: the relay shuts its write half, so the daemon answers what's in flight and hangs up; waited for up to 5 s. Also when stdout is gone |
 | 75 | the daemon closed the connection first (it exited: idle, handoff, killed); run the relay again, which starts a new one |
-| 1 | it couldn't connect (the daemon didn't start within 5 s; see `serve.log`); with `--session-env`, also the daemon refusing its `link.attach` |
+| 1 | it couldn't connect (the daemon didn't start within 5 s; see `serve.log`) |
 
 The relay is a client like any other: it holds the daemon while it runs,
 so hang up (close its stdin) when done.
@@ -1413,25 +1410,13 @@ $ devsandbox api --stdio
 A client that isn't a devsandbox binary can send `"version": "0.0.0"`: the
 relay's own hello already handed off an older daemon.
 
-`--session-env` (hidden) is for the add-time relay to a machine
-(`machines.probe` / `.add`, *Machines*): once
-connected to the daemon, the relay first sends `link.attach` with `peer`
-its `--client` minus a `machine:` prefix (`relay::attach`), reads that
-one answer and relays none of it, so the daemon serves the rest of the
-connection with its trust table (*Remote callers*). A refused attach
-exits 1 with the daemon's reason on stderr, the daemon hanging up first
-75; nothing reaches stdout either way. Then it writes a newline and the sentinel
-line `devsandbox-api 1` to stdout (`relay::write_sentinel`), so the link can
-skip whatever the remote login shell printed before it. The upstream copy
-then goes line by line, and a request whose `method` is a
-verb gets its `params.env` replaced by the relay's own environment (the
-remote login shell's), since the requester's is another host's, with
-`SSH_AUTH_SOCK` set to `<socket dir>/agent-<client>.sock` for the
-relay's `--client` when that accepts a connection at the time of the
-line (nothing binds it any more: the agent relay is gone); otherwise the
-login env's own `SSH_AUTH_SOCK` stays. Every
-other line, and everything downstream, passes as is; the 1 MiB line limit
-still applies.
+`--sentinel` (hidden) is for `machine add`'s probe over ssh
+(`machines.probe` / `.add`, *Machines*): once connected to the daemon,
+the relay writes a newline and the sentinel line `devsandbox-api 1` to
+stdout (`relay::write_sentinel`) before any of the daemon's bytes, so
+the probe can skip whatever the remote login shell printed before it.
+Nothing else changes: the bytes pass as they do without it. A link's
+`API` streams carry no sentinel.
 
 ## The npm client
 

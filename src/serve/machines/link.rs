@@ -1,10 +1,14 @@
 //! A connection to a machine's daemon (docs/architecture/daemon/machines.md):
 //! the handshake.
-//! `machines.probe`/`add` use one briefly; `service` holds one per machine.
+//! `machines.probe`/`add` use one briefly, over ssh; `service` holds one
+//! per machine, over its link's `fleet-<name>.sock`.
 //!
-//! Before the hello comes the relay's sentinel line (`relay::write_sentinel`):
-//! whatever the remote login shell printed ahead of it is skipped, and the
-//! first such line kept for the log.
+//! Over ssh ([`Over::Ssh`], the add-time probe's `api --stdio --sentinel`)
+//! the relay's sentinel line (`relay::write_sentinel`) comes before the
+//! hello: whatever the remote login shell printed ahead of it is skipped,
+//! and the first such line kept for the log. A link's `API` stream
+//! ([`Over::Link`]) has no login shell in it: the hello comes first (fleet
+//! plan decision 27).
 //!
 //! The hello says version `0.0.0`, build 0: older than any daemon, so a
 //! machine connection never hands off the remote daemon (only that host's
@@ -23,9 +27,19 @@ use crate::serve::relay::{SENTINEL, SENTINEL_VERSION};
 /// How long a closed connection waits for ssh's stderr to say why.
 const STDERR_WAIT: Duration = Duration::from_secs(2);
 
-/// How much a link reads looking for the sentinel: the login shell's noise
-/// and the line itself together.
+/// How much a probe reads looking for the sentinel: the login shell's
+/// noise and the line itself together.
 const SENTINEL_LIMIT: usize = 64 * 1024;
+
+/// What a [`handshake`]'s stream is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Over {
+    /// An ssh to `api --stdio --sentinel` (`ssh::probe_dial`): login-shell
+    /// noise, then the sentinel, then the daemon.
+    Ssh,
+    /// One `API` stream of a machine's link: the daemon from the first byte.
+    Link,
+}
 
 /// A machine connection past the hello. `conn.daemon` is the remote's
 /// hello reply. Dropping it closes the socket, then kills the ssh.
@@ -35,7 +49,9 @@ pub struct Link {
     #[allow(dead_code)] // read by tests
     pub peer: Peer,
     /// The first line the remote login shell printed before the sentinel,
-    /// cut short; `None` when it printed nothing.
+    /// cut short; `None` when it printed nothing (always over a link). A
+    /// failed handshake's error carries it; tests read it on success.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub noise: Option<String>,
 }
 
@@ -78,15 +94,20 @@ impl fmt::Display for LinkError {
 impl std::error::Error for LinkError {}
 
 /// Say hello over `duplex` to machine `machine` (its name, for errors),
-/// waiting up to `timeout` for the reply (ssh's connect and auth included).
-/// An equal `protocol` is a [`Link`]; anything else a [`LinkError`].
-pub fn handshake(machine: &str, duplex: Duplex, timeout: Duration) -> Result<Link, LinkError> {
+/// waiting up to `timeout` for the reply (ssh's connect and auth included),
+/// past the sentinel when `over` is [`Over::Ssh`]. An equal `protocol` is
+/// a [`Link`]; anything else a [`LinkError`].
+pub fn handshake(machine: &str, duplex: Duplex, timeout: Duration, over: Over) -> Result<Link, LinkError> {
     let Duplex { mut stream, peer } = duplex;
     let other = |error: anyhow::Error| LinkError::Other { machine: machine.into(), error };
     let version = Version { semver: "0.0.0".into(), build: 0 };
     stream.set_read_timeout(Some(timeout)).context("cannot set a read timeout").map_err(other)?;
     let mut noise = None;
-    match ssh::skip_lines(&mut stream, SENTINEL_LIMIT, &mut noise, sentinel) {
+    let skipped = match over {
+        Over::Ssh => ssh::skip_lines(&mut stream, SENTINEL_LIMIT, &mut noise, sentinel),
+        Over::Link => Ok(()),
+    };
+    match skipped {
         Ok(()) => {}
         Err(SkipError::Eof) => return Err(LinkError::Closed { machine: machine.into(), stderr: peer.stderr_tail(STDERR_WAIT) }),
         Err(SkipError::TooLong) => {
@@ -197,8 +218,23 @@ mod tests {
 
     fn sentinel_line() -> String {
         let mut out = Vec::new();
-        crate::serve::relay::write_sentinel(&mut out, true).unwrap();
+        crate::serve::relay::write_sentinel(&mut out).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    /// A link's `API` stream: the hello first, nothing skipped; a sentinel
+    /// there would be the daemon's first line, not one.
+    #[test]
+    fn a_link_stream_is_the_daemon_from_its_first_byte() {
+        let (duplex, peer) = fake_peer_after(String::new(), READY);
+        let link = handshake("m", duplex, Duration::from_secs(5), Over::Link).unwrap();
+        assert_eq!(peer.join().unwrap()["method"], "hello");
+        assert_eq!(link.noise, None);
+
+        let (duplex, peer) = fake_peer_after(sentinel_line(), READY);
+        let err = handshake("m", duplex, Duration::from_secs(5), Over::Link).err().unwrap();
+        peer.join().unwrap();
+        assert!(matches!(err, LinkError::Other { .. }), "{err:?}");
     }
 
     const READY: &str = "{\"id\":0,\"result\":{\"version\":\"0.6.0\",\"build\":1,\"protocol\":1}}\n";
@@ -207,19 +243,19 @@ mod tests {
     fn the_login_shells_noise_is_skipped_and_kept() {
         let before = format!("Welcome to box!\r\n\nLast login: today\n{}", sentinel_line());
         let (duplex, peer) = fake_peer_after(before, READY);
-        let link = handshake("m", duplex, Duration::from_secs(5)).unwrap();
+        let link = handshake("m", duplex, Duration::from_secs(5), Over::Ssh).unwrap();
         assert_eq!(peer.join().unwrap()["method"], "hello");
         assert_eq!(link.noise.as_deref(), Some("Welcome to box!"));
 
         // A motd without a final newline: the sentinel's own ends it.
         let (duplex, peer) = fake_peer_after(format!("motd{}", sentinel_line()), READY);
-        let link = handshake("m", duplex, Duration::from_secs(5)).unwrap();
+        let link = handshake("m", duplex, Duration::from_secs(5), Over::Ssh).unwrap();
         peer.join().unwrap();
         assert_eq!(link.noise.as_deref(), Some("motd"));
 
         // CRLF on the sentinel; a quiet shell leaves no noise.
         let (duplex, peer) = fake_peer_after(sentinel_line().replace('\n', "\r\n"), READY);
-        let link = handshake("m", duplex, Duration::from_secs(5)).unwrap();
+        let link = handshake("m", duplex, Duration::from_secs(5), Over::Ssh).unwrap();
         peer.join().unwrap();
         assert_eq!(link.noise, None);
     }
@@ -229,7 +265,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         (&theirs).write_all(b"motd\n{\"id\":0}\n").unwrap();
         drop(theirs);
-        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5)).err().unwrap();
+        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5), Over::Ssh).err().unwrap();
         assert!(matches!(err, LinkError::Closed { .. }), "{err:?}");
 
         let (ours, theirs) = UnixStream::pair().unwrap();
@@ -238,7 +274,7 @@ mod tests {
             // Stops once the link gives up and drops its end.
             while (&theirs).write_all(line.as_bytes()).is_ok() {}
         });
-        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5)).err().unwrap();
+        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5), Over::Ssh).err().unwrap();
         writer.join().unwrap();
         assert!(matches!(err, LinkError::Other { .. }), "{err:?}");
         let want = format!("box: no `devsandbox-api` line in the first 65536 bytes; the login shell printed: {}", "x".repeat(200));
@@ -249,7 +285,7 @@ mod tests {
     fn another_sentinel_version_says_update() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         (&theirs).write_all(b"\ndevsandbox-api 2\n").unwrap();
-        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5)).err().unwrap();
+        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5), Over::Ssh).err().unwrap();
         assert!(err.to_string().ends_with("update devsandbox on the older side"), "{err}");
     }
 
@@ -257,7 +293,7 @@ mod tests {
     fn a_silent_relay_times_out_with_the_noise() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         (&theirs).write_all(b"motd\n").unwrap();
-        let err = handshake("box", Duplex::socket(ours), Duration::from_millis(200)).err().unwrap();
+        let err = handshake("box", Duplex::socket(ours), Duration::from_millis(200), Over::Ssh).err().unwrap();
         let msg = err.to_string();
         assert!(matches!(err, LinkError::Other { .. }), "{err:?}");
         assert!(msg.contains("the login shell printed: motd") && msg.contains("`devsandbox-api` line"), "{msg}");
@@ -276,10 +312,10 @@ mod tests {
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         };
-        // The dial as tests inject it.
+        // The add-time dial as tests inject it.
         let dial: ssh::Dial = Arc::new(move |_| ssh::test_support::relayed(stream.try_clone()?));
         let entry = super::super::Entry::ssh("m", "m");
-        let mut link = handshake("m", dial(&entry).unwrap(), Duration::from_secs(5)).unwrap();
+        let mut link = handshake("m", dial(&entry).unwrap(), Duration::from_secs(5), Over::Ssh).unwrap();
         assert_eq!((link.remote().protocol, link.remote().version.as_str(), link.remote().handoff), (proto::PROTOCOL, "0.6.0", false));
         let r = link.conn.call("nope", Value::Null).unwrap();
         assert_eq!(r.error.unwrap().code, "unknown-method");
@@ -292,7 +328,7 @@ mod tests {
     #[test]
     fn hello_says_version_zero_and_its_host() {
         let (duplex, peer) = fake_peer("{\"id\":0,\"result\":{\"version\":\"0.6.0\",\"build\":1,\"protocol\":1}}\n");
-        let link = handshake("m", duplex, Duration::from_secs(5)).unwrap();
+        let link = handshake("m", duplex, Duration::from_secs(5), Over::Ssh).unwrap();
         let hello = peer.join().unwrap();
         assert_eq!(hello["method"], "hello");
         assert_eq!((hello["params"]["version"].clone(), hello["params"]["build"].clone()), (json!("0.0.0"), json!(0)));
@@ -304,7 +340,7 @@ mod tests {
     #[test]
     fn another_protocol_names_both_versions() {
         let (duplex, peer) = fake_peer("{\"id\":0,\"result\":{\"version\":\"0.7.0\",\"build\":1,\"protocol\":2}}\n");
-        let err = handshake("my-server", duplex, Duration::from_secs(5)).err().unwrap();
+        let err = handshake("my-server", duplex, Duration::from_secs(5), Over::Ssh).err().unwrap();
         peer.join().unwrap();
         assert!(matches!(err, LinkError::Protocol { remote_protocol: 2, .. }), "{err:?}");
         let want = format!(
@@ -318,14 +354,14 @@ mod tests {
     fn an_ssh_that_fails_says_why() {
         let argv: Vec<std::ffi::OsString> =
             ["sh", "-c", "echo 'me@box: Permission denied (publickey).' >&2; exit 255"].into_iter().map(Into::into).collect();
-        let err = handshake("box", ssh::spawn(&argv).unwrap(), Duration::from_secs(5)).err().unwrap();
+        let err = handshake("box", ssh::spawn(&argv).unwrap(), Duration::from_secs(5), Over::Ssh).err().unwrap();
         assert!(matches!(err, LinkError::Closed { .. }), "{err:?}");
         assert_eq!(err.to_string(), "box: me@box: Permission denied (publickey).");
 
         // A silent EOF still says what happened.
         let (ours, theirs) = UnixStream::pair().unwrap();
         drop(theirs);
-        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5)).err().unwrap();
+        let err = handshake("box", Duplex::socket(ours), Duration::from_secs(5), Over::Ssh).err().unwrap();
         assert!(err.to_string().contains("closed before devsandbox answered"), "{err}");
     }
 
@@ -335,7 +371,7 @@ mod tests {
         let script = "echo motd; printf '\\ndevsandbox-api 1\\n'; read l; echo '{\"id\":0,\"result\":{\"version\":\"0.6.0\",\"build\":1,\"protocol\":1}}'; \
                       read l; echo '{\"id\":1,\"result\":[]}'; exec cat >/dev/null";
         let argv: Vec<std::ffi::OsString> = ["sh", "-c", script].into_iter().map(Into::into).collect();
-        let mut link = handshake("box", ssh::spawn(&argv).unwrap(), Duration::from_secs(5)).unwrap();
+        let mut link = handshake("box", ssh::spawn(&argv).unwrap(), Duration::from_secs(5), Over::Ssh).unwrap();
         assert_eq!(link.noise.as_deref(), Some("motd"));
         let r = link.conn.call("roots.list", Value::Null).unwrap();
         assert_eq!(r.result, Some(json!([])));

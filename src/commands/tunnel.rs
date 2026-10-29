@@ -2,37 +2,31 @@
 //! [`remote_opener`], the forward engine's opener that opens a `TUNNEL`
 //! stream through a machine's link socket ([`Via::Fleet`]: the [`Request`]
 //! line first; the machine's end is `serve::fleet::tunnel`), and the
-//! one-line header that answers it. The hidden `devsandbox tunnel`
-//! ([`tunnel`]) is the far end of the ssh form ([`Via::Ssh`]), which no
-//! forward builds any more: fleet step 8c deletes both.
+//! one-line header that answers it.
 //!
 //! The far side resolves the route on its own host ([`resolve`]: its
-//! config, state, runtime), writes a [`Header`], then becomes the
-//! in-container `devsbd bridge` (`bridge::bridge_command`, `exec`'d), so the
-//! ssh's stdio carries the usual bridge handshake and mux right after the
-//! header line. This side reads the header byte by byte (nothing past its
-//! newline is consumed) and hands the rest of the stream to
-//! `bridge::attach`.
+//! config, state, runtime), writes a [`Header`], then runs the in-container
+//! `devsbd bridge` on the rest of the stream, so it carries the usual bridge
+//! handshake and mux right after the header line. This side reads the
+//! header byte by byte (nothing past its newline is consumed) and hands the
+//! rest of the stream to `bridge::attach`.
 
-use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::port::{self, LoadState};
 use crate::devsbd::bridge::{self, Bridge};
 use crate::devsbd::forward::{Opened, Opener, ProcessLookup, Route};
-use crate::serve::machines::ssh::{self, SkipError, Tail};
+use crate::serve::machines::ssh::{self, SkipError};
 
-/// What starts the header line; anything before it (a chatty login shell, a
-/// motd) is skipped.
+/// What starts the header line; lines before it are skipped, and it may
+/// follow other bytes on its line.
 const MAGIC: &str = "devsandbox-tunnel";
 
 /// The header's format version, after the magic. Bumped only on an
@@ -43,20 +37,16 @@ const VERSION: u32 = 1;
 /// itself together.
 const HEADER_LIMIT: usize = 64 * 1024;
 
-/// How long the remote opener waits for the header: ssh's connect and the
-/// far side's route resolution (a helper install included). Matches the
-/// engine's handshake wait.
+/// How long the remote opener waits for the header: the far side's route
+/// resolution (a helper install included). Matches the engine's handshake
+/// wait.
 const HEADER_WAIT: Duration = Duration::from_secs(10);
 
 /// How often the remote opener checks `stop` while it waits.
 const STOP_POLL: Duration = Duration::from_millis(50);
 
-/// How long ssh's stderr is waited for after it ended without a header (or
-/// its handshake died), so the reason it printed last is in.
-const STDERR_WAIT: Duration = Duration::from_millis(500);
-
-/// The one line `devsandbox tunnel` writes before the bridge's bytes:
-/// `devsandbox-tunnel 1 <json>\n`.
+/// The one line a machine's `TUNNEL` stream starts with, before the
+/// bridge's bytes: `devsandbox-tunnel 1 <json>\n`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Header {
@@ -107,8 +97,8 @@ impl Header {
 /// Why no header was read.
 #[derive(Debug)]
 pub enum HeaderError {
-    /// The stream ended first: the far side never got to write one (ssh
-    /// failed, an older devsandbox without `tunnel`).
+    /// The stream ended first: the far side never got to write one (the
+    /// link refused the stream, or it went away).
     Eof,
     /// [`HEADER_LIMIT`] bytes and no header.
     TooLong,
@@ -155,9 +145,8 @@ fn parse_line(line: &[u8]) -> Result<Option<Header>, HeaderError> {
     serde_json::from_str(json).map(Some).map_err(|e| HeaderError::Bad(format!("bad tunnel header: {e}")))
 }
 
-/// What a hub asks of a fleet worker's `TUNNEL` stream, its first line
-/// (`{"root", "instance"?, "service"?, "port"}`, JSON, then `\n`): the
-/// arguments `devsandbox tunnel` takes.
+/// What a machine's `TUNNEL` stream is asked, its first line (`{"root",
+/// "instance"?, "service"?, "port"}`, JSON, then `\n`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -188,8 +177,8 @@ impl Request {
 
 /// The route to `port` of `instance` (a name, as `resolve_instance` takes
 /// it, among the instances `load` gives) and/or `service` in the config at
-/// `dir`: what `devsandbox tunnel` and a fleet worker's `TUNNEL` stream
-/// write the [`Header`] of.
+/// `dir`: what a machine's `TUNNEL` stream writes the [`Header`] of
+/// (`serve::fleet::tunnel`).
 pub fn resolve(
     dir: PathBuf,
     instance: Option<String>,
@@ -210,34 +199,9 @@ pub fn resolve(
     port::resolver_in(dir, key, service, port, load)()
 }
 
-/// `devsandbox tunnel`: [`resolve`] the route, write its [`Header`], then
-/// become the in-container `devsbd bridge`. Its stdout is the header and
-/// then the bridge's bytes, nothing else. An unresolvable route is an
-/// [`Header::Error`] and a failure (stderr, exit 1).
-pub fn tunnel(dir: PathBuf, instance: Option<String>, service: Option<String>, port: u16) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
-    let route = resolve(dir, instance, service, port, port::default_state());
-    let header = Header::of(&route);
-    let mut out = io::stdout().lock();
-    out.write_all(header.line().as_bytes()).and_then(|()| out.flush()).context("writing the tunnel header")?;
-    drop(out);
-    match route {
-        Err(error) => bail!("{error}"),
-        // Only returns on failure; the far end then sees the handshake end
-        // and this process's stderr says why.
-        Ok(route) => Err(bridge::bridge_command(&route.container).exec())
-            .with_context(|| format!("cannot exec a bridge into {}", route.container)),
-    }
-}
-
 /// How one spawn of a remote forward's bridge reaches its machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Via {
-    /// Spawn this argv: an ssh running `devsandbox tunnel` (from
-    /// `ssh::tunnel_argv`). Only tests build it now.
-    #[allow(dead_code)] // fleet step 8c deletes it
-    Ssh(Vec<OsString>),
     /// A machine: connect to its link's tunnel socket
     /// (`endpoint::fleet_tunnel_socket`), one `TUNNEL` stream, and send
     /// `request`.
@@ -249,7 +213,7 @@ pub type TunnelVia = Box<dyn Fn() -> Result<Via, String> + Send + Sync>;
 
 /// The opener of a forward into `machine`'s instance or service: `via()`
 /// (asked per spawn, so a removed registry entry is the bridge's error),
-/// then open its `TUNNEL` stream (or spawn an ssh), read the [`Header`], then run the bridge
+/// then open its `TUNNEL` stream, read the [`Header`], then run the bridge
 /// over the rest of its bytes (`bridge::attach`; a stream that ends is a
 /// bridge that's done, as a dead child is). The route shows as
 /// `<machine>/<label>`; the far helper answers the listening-process lookup
@@ -257,7 +221,6 @@ pub type TunnelVia = Box<dyn Fn() -> Result<Via, String> + Send + Sync>;
 /// unknown (the engine's probe fallback is the caller's: `None` for remote).
 pub fn remote_opener(machine: String, via: TunnelVia) -> Opener {
     Box::new(move |stop| match via()? {
-        Via::Ssh(argv) => open_remote(&machine, &argv, stop),
         Via::Fleet { socket, request } => open_fleet(&machine, &socket, &request, stop),
     })
 }
@@ -333,117 +296,10 @@ fn open_fleet(machine: &str, socket: &Path, request: &Request, stop: &AtomicBool
     }
 }
 
-fn open_remote(machine: &str, argv: &[OsString], stop: &AtomicBool) -> Result<(Opened, Bridge), String> {
-    let (program, args) = argv.split_first().ok_or("empty tunnel argv")?;
-    let mut cmd = Command::new(program);
-    // The preferred live agent, as the daemon's machine links get it (its own
-    // inherited `$SSH_AUTH_SOCK` may be long stale); a CLI's falls back to
-    // its own `$SSH_AUTH_SOCK`, so there it changes nothing.
-    if let Some(agent) = bridge::host_agent() {
-        cmd.env("SSH_AUTH_SOCK", agent);
-    }
-    let mut child = cmd
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", program.to_string_lossy()))?;
-    let (Some(stdin), Some(mut stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
-        reap(&mut child);
-        return Err("the tunnel's pipes are missing".into());
-    };
-    // stderr is read from the start (a chatty ssh can't fill its pipe and
-    // stall the header), into a tail both the errors here and the bridge's
-    // own handshake error read.
-    let tail = match Tail::collect(stderr, "tunnel-stderr") {
-        Ok(tail) => tail,
-        Err(e) => {
-            reap(&mut child);
-            return Err(format!("cannot start the tunnel's reader: {e}"));
-        }
-    };
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::Builder::new().name("tunnel-header".into()).spawn(move || {
-        let header = read_header(&mut stdout);
-        let _ = tx.send((header, stdout));
-    });
-    if let Err(e) = reader {
-        reap(&mut child);
-        return Err(format!("cannot start the tunnel's reader: {e}"));
-    }
-    let (header, stdout) = match wait_header(&rx, stop) {
-        Waited::Got(got) => got,
-        waited => {
-            reap(&mut child);
-            return Err(match waited {
-                Waited::Stopped => "stopped".into(),
-                Waited::TimedOut => no_header(machine, &tail.read(Duration::ZERO)),
-                _ => "the tunnel's reader died".into(),
-            });
-        }
-    };
-    match header {
-        Ok(Header::Route { label, host, port, hash, helper }) => {
-            let label = format!("{machine}/{label}");
-            let stderr = TailReader { tail, rest: None };
-            let bridge = bridge::attach(child, stdin, stdout, stderr, hash.as_deref().unwrap_or_default(), &label, Some(machine));
-            let lookup = if helper { ProcessLookup::Helper { container: String::new() } } else { ProcessLookup::None };
-            Ok((Opened { label, host, port, lookup }, bridge))
-        }
-        Ok(Header::Error { error }) => {
-            reap(&mut child);
-            Err(error)
-        }
-        Err(HeaderError::Eof) => {
-            reap(&mut child);
-            Err(no_header(machine, &tail.read(STDERR_WAIT)))
-        }
-        Err(e) => {
-            reap(&mut child);
-            Err(format!("{machine}: {e}"))
-        }
-    }
-}
-
-/// Why `machine` gave no header, from ssh's stderr `tail`: an older
-/// devsandbox there (clap refusing `tunnel`), ssh's own reason
-/// (`Permission denied (publickey).`), or silence.
-fn no_header(machine: &str, tail: &str) -> String {
-    let refused = ["unrecognized subcommand", "unknown subcommand", "wasn't expected"];
-    if tail.contains("'tunnel'") && refused.iter().any(|r| tail.contains(r)) {
-        return format!("devsandbox on {machine} can't forward ports yet: update it");
-    }
-    match tail.trim() {
-        "" => format!("no answer from {machine}"),
-        tail => tail.to_string(),
-    }
-}
-
-fn reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// The tunnel's stderr as `bridge::attach` reads it (on a failed handshake,
-/// to say why): the [`Tail`] once the stream ended, or after
-/// [`STDERR_WAIT`].
-struct TailReader {
-    tail: Arc<Tail>,
-    rest: Option<io::Cursor<Vec<u8>>>,
-}
-
-impl Read for TailReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let tail = &self.tail;
-        self.rest.get_or_insert_with(|| io::Cursor::new(tail.read(STDERR_WAIT).into_bytes())).read(buf)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, TcpStream};
+    use std::sync::Arc;
 
     use super::*;
     use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState, HostPort};
@@ -511,51 +367,19 @@ mod tests {
     }
 
     #[test]
-    fn no_header_errors() {
-        let update = "devsandbox on box can't forward ports yet: update it";
-        assert_eq!(no_header("box", "error: unrecognized subcommand 'tunnel'\n\nUsage: devsandbox"), update);
-        assert_eq!(no_header("box", "error: Found argument 'tunnel' which wasn't expected"), update);
-        assert_eq!(no_header("box", "me@box: Permission denied (publickey)."), "me@box: Permission denied (publickey).");
-        assert_eq!(no_header("box", " \n"), "no answer from box");
-    }
-
-    // ---- the remote opener against fake argvs ----
-
-    fn sh(script: &str) -> TunnelVia {
-        let script = script.to_string();
-        Box::new(move || Ok(Via::Ssh(["sh", "-c", &script].into_iter().map(OsString::from).collect())))
-    }
-
-    fn open(script: &str) -> Result<(Opened, Bridge), String> {
-        remote_opener("box".into(), sh(script))(&AtomicBool::new(false))
-    }
-
-    #[test]
-    fn the_far_sides_error_header_is_the_error() {
-        let line = Header::Error { error: "no sandbox instance `web`".into() }.line();
-        let script = format!("echo motd; echo chatty >&2; printf '%s' '{line}'; exec cat");
-        assert_eq!(open(&script).err().as_deref(), Some("no sandbox instance `web`"));
-    }
-
-    #[test]
-    fn a_devsandbox_without_tunnel_says_update_it() {
-        let script = "echo \"error: unrecognized subcommand 'tunnel'\" >&2; exit 2";
-        assert_eq!(open(script).err().as_deref(), Some("devsandbox on box can't forward ports yet: update it"));
-    }
-
-    #[test]
-    fn without_a_header_ssh_says_why_or_nothing_does() {
-        let script = "echo 'me@box: Permission denied (publickey).' >&2; exit 255";
-        assert_eq!(open(script).err().as_deref(), Some("me@box: Permission denied (publickey)."));
-        assert_eq!(open("echo motd; exit 0").err().as_deref(), Some("no answer from box"));
+    fn a_failed_via_is_the_error() {
         let bad = remote_opener("box".into(), Box::new(|| Err("no machine `box`".into())));
         assert_eq!(bad(&AtomicBool::new(false)).err().as_deref(), Some("no machine `box`"));
-        let gone = remote_opener("box".into(), Box::new(|| Ok(Via::Ssh(vec!["/nonexistent/ssh".into()]))));
-        assert!(gone(&AtomicBool::new(false)).err().unwrap().starts_with("cannot run /nonexistent/ssh"));
     }
 
+    /// The far side stays silent: the opener gives up once stopped.
     #[test]
     fn a_silent_tunnel_gives_up_when_stopped() {
+        let (socket, worker) = fake_worker("silent", |s, _| {
+            let mut sink = [0u8; 1];
+            // Until the opener gives up and shuts its end.
+            let _ = (&s).read(&mut sink);
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let setter = {
             let stop = Arc::clone(&stop);
@@ -565,10 +389,12 @@ mod tests {
             })
         };
         let started = Instant::now();
-        let got = remote_opener("box".into(), sh("exec sleep 30"))(&stop);
-        assert!(got.is_err());
+        let got = remote_opener("lap".into(), fleet(&socket, &web_request()))(&stop);
+        assert_eq!(got.err().as_deref(), Some("stopped"));
         assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
         setter.join().unwrap();
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 
     #[test]
@@ -668,12 +494,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 
-    /// Docker-gated: a forward through the remote opener whose "ssh" is a
-    /// shell printing noise and a header, then `exec`ing the bridge as the
-    /// far `devsandbox tunnel` does. The echo round-trips and the listening
+    /// Docker-gated: a forward through the remote opener over a fake
+    /// machine's tunnel socket, whose end of each stream writes a header,
+    /// then runs the bridge into the container on the rest of it, as
+    /// `serve::fleet::tunnel` does. The echo round-trips and the listening
     /// process comes from the helper over that stream.
     #[test_utils::docker_test(helper)]
     fn forwards_through_a_tunnel_with_docker() -> Result<(), &'static str> {
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+
         let ok = |cmd: &mut Command| matches!(cmd.output(), Ok(o) if o.status.success());
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-fwd-tunnel-{stamp}");
@@ -691,16 +521,32 @@ mod tests {
                 hash: crate::devsbd::hash(arch).map(Into::into),
                 helper: true,
             };
-            let script = format!(
-                "echo motd; printf '%s' '{}'; exec {} exec -i -u root {name} {} bridge",
-                header.line(),
-                crate::runtime::backend().bin(),
-                crate::devsbd::BIN
-            );
+            let dir = std::env::temp_dir().join(format!("dsv-tunnel-docker-{stamp}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("fleet-box.tunnel.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let container = name.clone();
+            // Every stream the forward opens (it may reopen one): the request
+            // line, the header, then the bridge on the stream's fd.
+            std::thread::spawn(move || {
+                for s in listener.incoming().flatten() {
+                    let mut byte = [0u8; 1];
+                    while (&s).read(&mut byte).is_ok_and(|n| n == 1) && byte[0] != b'\n' {}
+                    if (&s).write_all(header.line().as_bytes()).is_err() {
+                        continue;
+                    }
+                    let (Ok(input), Ok(output)) = (s.try_clone(), s.try_clone()) else { continue };
+                    let _ = bridge::bridge_command(&container)
+                        .stdin(Stdio::from(OwnedFd::from(input)))
+                        .stdout(Stdio::from(OwnedFd::from(output)))
+                        .spawn();
+                }
+            });
+            let via = Via::Fleet { socket: socket.clone(), request: web_request() };
             let forward = Forward::start(ForwardSpec {
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 host_port: HostPort::Prefer(0),
-                open: remote_opener("box".into(), sh(&script)),
+                open: remote_opener("box".into(), Box::new(move || Ok(via.clone()))),
                 probe: Box::new(|_, _| None),
             })
             .unwrap();
@@ -741,6 +587,7 @@ mod tests {
             };
             assert!(found.contains(" (pid "), "{found}");
             drop(forward);
+            let _ = std::fs::remove_dir_all(&dir);
             Ok(())
         })
     }

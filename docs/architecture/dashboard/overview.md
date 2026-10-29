@@ -111,8 +111,9 @@ keys; the I/O edges split them back (`remote::split`) into the request's
   `box: unreachable: <why>` (`pending_note`).
 - Typed names resolve against the snapshot: bare when unique across
   machines, else `box/web` or `@/web` for this host (`remote::resolve`).
-- Remote terminals and `:exec` go over `ssh -t` (`remote::exec_argv`,
-  `service_argv`). Port forwards to a machine's rows bind here
+- Remote terminals and `:exec` run this host's `devsandbox exec` on the
+  qualified name, which reaches the machine over its link's `PTY` streams
+  (`remote::exec_argv`, `service_argv`). Port forwards to a machine's rows bind here
   (`forwards.add` with `machine`); VS Code is refused for them.
 
 ## Settings

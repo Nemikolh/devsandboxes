@@ -702,7 +702,7 @@ struct Configured {
 
 /// One forward into a machine's instance or service: ad-hoc only (a
 /// machine's `forwardPorts` are never mirrored here), bound here, its bridge
-/// an ssh running `devsandbox tunnel` there.
+/// a `TUNNEL` stream over the machine's link.
 struct Remote {
     forward: Forward,
     /// Its store entry (`machine` set): what `forwards.rm` removes.

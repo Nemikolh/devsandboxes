@@ -343,7 +343,7 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
     // Kept to cut the connection: a test's socket has no ssh to kill, and
     // shutting it is what the remote sees as a hang-up either way.
     let cut = duplex.stream.try_clone().ok();
-    let mut link = match link::handshake(machine, duplex, HANDSHAKE) {
+    let mut link = match link::handshake(machine, duplex, HANDSHAKE, link::Over::Link) {
         Ok(link) => link,
         Err(e) => return failed(e.to_string()),
     };

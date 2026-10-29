@@ -4,9 +4,8 @@
 //!
 //! - `link`: the two ends of a host-to-host frame-mux link, generic over
 //!   its sentinel line and channel ([`link::Spec`]), each end serving its
-//!   own table of channels ([`link::Serves`]) and opening the peer's; the
-//!   machines' agent relay runs on it, and [`LINK`] is the fleet link's
-//!   spec (the `API` channel).
+//!   own table of channels ([`link::Serves`]) and opening the peer's;
+//!   [`LINK`] is the fleet link's spec (the `API` channel).
 //! - `offer`: `fleet.offer`, which registers an offered worker in
 //!   `machines.toml` (`commands::fleet_link` is its link's opener).
 //! - `dialer`: the dialer's half of a peer link: how the daemon holds each
@@ -69,9 +68,8 @@ use crate::devsbd::proto::channel;
 
 /// The fleet link: a worker's daemon's API, one flowing `API` stream per
 /// connection to the opener's socket. Its sentinel is `devsandbox-fleet 1`.
-/// Each `API` stream starts with the API relay's own sentinel line
-/// (`relay::write_sentinel`), written by the worker's answer, so a stream
-/// reads as an ssh relay does to `machines::link::handshake`. Both ends
+/// An `API` stream carries no sentinel of its own: its first byte is the
+/// daemon's (decision 27 of the fleet plan). Both ends
 /// also serve `TRANSFER` streams ([`transfer`], `link::Serves::transfers`).
 /// Its `Hello` hash is this build
 /// ([`update::HELLO`]), which a worker follows (`worker`).

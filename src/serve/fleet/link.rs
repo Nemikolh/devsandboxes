@@ -29,12 +29,9 @@
 //! return fast: a local connect, or a socket pair whose other end a thread
 //! takes (`transfer::Receivers::accept`).
 //!
-//! The machines' agent relay (unused since fleet step 7d) is one link (`machines::agent::SPEC`, one
-//! channel each way: its opener is `commands::agent_relay` through
-//! [`opener`], its answerer `machines::agent::serve` through [`answerer`]);
-//! the fleet link another (`fleet::LINK`: `API` served by the answerer,
-//! `TRANSFER` by both ends, each end's `transfer::Receivers` through
-//! [`Serves::transfers`], `AGENT` by the opener, `fleet::agent`).
+//! The fleet link is the one kind (`fleet::LINK`: `API` served by the
+//! answerer, `TRANSFER` by both ends, each end's `transfer::Receivers`
+//! through [`Serves::transfers`], `AGENT` by the opener, `fleet::agent`).
 //!
 //! The newest end binding a socket wins: it binds a temp name and renames
 //! it over the path. An end unlinks its sockets, if they are still its own,
@@ -63,7 +60,7 @@ use super::transfer::Receivers;
 /// What one kind of link is.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
-    /// What errors call the link: `agent relay`, `fleet link`.
+    /// What errors call the link: `fleet link`.
     pub name: &'static str,
     /// What the peer serves on `channel`, for the opener's refusal of a
     /// peer that doesn't: `ssh-agent`, `API`.
@@ -73,7 +70,7 @@ pub struct Spec {
     /// The sentinel's format version; a reader refuses any other.
     pub sentinel_version: u32,
     /// The channel the link stands for: the opener requires the peer to
-    /// advertise it ([`cap_of`]); [`opener`] opens it, [`answerer`] serves
+    /// advertise it ([`cap_of`]); the opener opens it, the answerer serves
     /// it.
     pub channel: u8,
     /// What both ends say in their `Hello` (the frame protocol's `VERSION`
@@ -157,7 +154,7 @@ pub struct Endpoint<'a, 's> {
     pub outlet: Option<&'a Outlet>,
 }
 
-/// How much [`answerer`] reads looking for the sentinel: the login shell's
+/// How much [`answerer_with`] reads looking for the sentinel: the login shell's
 /// noise and the line itself together.
 pub const SENTINEL_LIMIT: usize = 64 * 1024;
 
@@ -250,7 +247,7 @@ impl Out {
     /// One accepted connection to `channel`'s socket, as a stream on it:
     /// dropped unopened (the client reads EOF at once) when the peer didn't
     /// advertise `channel`. The opener attaches the connection itself (a
-    /// legacy channel too: the agent relay's `SSH_AGENT`); the answerer
+    /// legacy channel too); the answerer
     /// splices it to an [`open`](Self::open)ed stream (flowing channels
     /// only, else dropped too).
     fn relay(&self, channel: u8, conn: UnixStream) {
@@ -314,7 +311,8 @@ impl Outlet {
 }
 
 /// [`opener_with`] opening only `spec.channel`, through `socket`, and
-/// serving nothing.
+/// serving nothing: the tests' opener.
+#[cfg(test)]
 pub fn opener(
     spec: &Spec,
     reader: impl Read + Send + 'static,
@@ -377,7 +375,7 @@ pub fn opener_with(
     }
 }
 
-/// How [`answerer`] ended.
+/// How [`answerer_with`] ended.
 #[derive(Debug)]
 pub enum End {
     /// The link never came up: no sentinel, a socket not bound, or the
@@ -394,8 +392,8 @@ pub enum End {
 
 /// [`answerer_with`] serving only `spec.channel`, with `open()`'s
 /// connections, and opening nothing. `on_ready` runs once the `Hello`s are
-/// through (the opener's socket is bound by then).
-#[allow(dead_code)] // its one user, `machines::agent::serve`, goes in fleet step 8
+/// through (the opener's socket is bound by then): the tests' answerer.
+#[cfg(test)]
 pub fn answerer(
     spec: &Spec,
     reader: impl Read,

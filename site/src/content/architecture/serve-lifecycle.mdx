@@ -135,8 +135,8 @@ daemon gets the manager's environment plus what `install` captured (`PATH`, the 
 | `inbox` mutations | `connect_running`, else the same op locally | no | for the call |
 | `serve install` | `connect_running`, then `shutdown` | no | no |
 | `devsandbox port` | none: forwards in its own process | no | no |
-| `machine add\|ls\|set\|rm`, a command naming a machine's instance or given `--machine` | `connect`, then `machines.*` / `instances.resolve`; a remote match is an `exec` of `ssh` | yes | for the lookup |
-| another host's daemon (a machine link) | `ssh … devsandbox api --stdio --session-env` here, hello as `0.0.0` (never a handoff) | yes, through the relay | while that host wants this machine (a watch, a call, 60 s after); a remote verb's ssh for the verb |
+| `machine add\|ls\|set\|rm`, a command naming a machine's instance or given `--machine` | `connect`, then `machines.*` / `instances.resolve`; a remote match runs as API calls and `PTY` dials over the machine's link | yes | for the lookup |
+| another host's daemon (a machine link) | `ssh … devsandbox fleet-link --peer <host>` here, each stream a `link.attach {channel}` connection, hello as `0.0.0` (never a handoff) | yes, `links.inbound` | for the link's life (that host's daemon holds it while it runs); `machine add`'s probe is `api --stdio --sentinel` once |
 
 The `bridges.ensure` rows only happen for relay-mode instances when the caller's shell has a live ssh-agent;
 otherwise those commands never contact the daemon.

@@ -94,8 +94,6 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::Port { .. } => MachineUse::Named,
         Command::Serve { .. } => MachineUse::Refused("serve"),
         Command::Api { .. } => MachineUse::Refused("api"),
-        Command::Tunnel { .. } => MachineUse::Refused("tunnel"),
-        Command::AgentRelay { .. } => MachineUse::Refused("agent-relay"),
         Command::FleetLink { .. } => MachineUse::Refused("fleet-link"),
         Command::FleetHello => MachineUse::Refused("fleet-hello"),
         Command::Machine { .. } => MachineUse::Refused("machine"),
@@ -913,8 +911,7 @@ mod tests {
             assert_eq!(e, "--here runs on this host; it doesn't go with --machine box", "{args:?}");
         }
         for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["machine", "trust", "full"], "machine"),
-            (&["machine", "roots", "add", "/x"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api"),
-            (&["tunnel", "--service", "db", "--port", "5432"], "tunnel")]
+            (&["machine", "roots", "add", "/x"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api")]
         {
             let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
             assert_eq!(e, format!("--machine isn't for `devsandbox {what}`"));

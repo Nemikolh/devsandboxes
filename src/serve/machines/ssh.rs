@@ -1,6 +1,8 @@
 //! The ssh transport to a machine (docs/architecture/daemon/machines.md,
-//! *ssh*): the argv the daemon, the CLI and the TUI all build through, and
-//! the dial that spawns it.
+//! *ssh*): the add-time argvs (`machine add`'s probe, install script and
+//! `machine roots add`, before a link exists), the dial that spawns one,
+//! and the quoting every remote command goes through (the link's own ssh
+//! too: `fleet::transport` over [`target_argv`]).
 //!
 //! Plain ssh: no ControlMaster of our own, the user's `~/.ssh/config`
 //! decides. The remote command goes through the login shell
@@ -11,16 +13,15 @@
 //! into one end of a socket pair by threads. So `client::Conn` and
 //! `client::hello` work on a machine connection as they do on the local
 //! daemon's, read timeouts included, and tests dial a test daemon's socket
-//! behind a pump that adds the relay's sentinel (`test_support::relayed`).
+//! behind a pump that adds the probe's sentinel (`test_support::relayed`).
 //!
 //! [`skip_lines`] is how a reader finds our first line past what the login
-//! shell printed: the link's sentinel, a remote forward's tunnel header.
+//! shell printed: the probe's and the link's sentinels.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
 use std::net::Shutdown;
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -124,76 +125,26 @@ pub fn remote_command(command: &str, args: &[impl AsRef<str>]) -> String {
     format!("exec \"$SHELL\" -lc {}", quote(&cmd))
 }
 
-/// The argv of an API connection to `entry` at add time (`machines.probe`,
-/// `.add`, before it has a link): `ssh -T -o BatchMode=yes [-p N] --
-/// <host> <devsandbox api --stdio --client <client> --session-env>`.
-/// `BatchMode`: whoever runs it (the daemon) has no TTY, so ssh fails rather
-/// than prompting. `--session-env`: the remote relay swaps each verb's
-/// `env` for its own login env (the probe sends none).
-pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
-    let args = ["api", "--stdio", "--client", client, "--session-env"];
-    argv(entry, &["-T", "-o", "BatchMode=yes"], &args)
+/// The argv of `machine add`'s probe of `entry` (`machines.probe`, `.add`,
+/// before it has a link): `ssh -T -o BatchMode=yes [-p N] -- <host>
+/// <devsandbox api --stdio --client <client> --sentinel>`, a local client
+/// of the daemon there under the user's own login. `BatchMode`: whoever
+/// runs it (the daemon) has no TTY, so ssh fails rather than prompting.
+/// `--sentinel`: the relay's first line, past whatever the login shell
+/// printed (`link::handshake` with `link::Over::Ssh`). No `-A`: a probe
+/// needs no agent.
+pub fn probe_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
+    argv(entry, &["-T", "-o", "BatchMode=yes"], &["api", "--stdio", "--client", client, "--sentinel"])
 }
 
-/// The argv of an interactive command on `entry`: `ssh -t [-p N] -- <host>
-/// <devsandbox remote_args…>`. No `BatchMode`: a person is there to answer
-/// ssh's prompts. No `-A`: the agent, for a machine with `agent` on, is
-/// this host's over the machine's link (`AGENT`, `fleet::dialer`). No
-/// caller since the dashboard's tabs go over the link.
-#[allow(dead_code)] // fleet step 8c deletes it
-pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
-    cli_argv(entry, true, remote_args)
-}
-
-/// The argv of a CLI command run on `entry` over ssh (`machine add`'s
-/// `machine roots add` there, `commands::machine`; the CLI's other commands
-/// on a machine go over its link, docs/architecture/daemon/machines.md,
-/// *The CLI: `cli.rs`*): [`tty_argv`]'s, but `-T` when `tty` is off (piped
-/// bytes must stay bytes, not a pty's CRLFs). No `BatchMode`: a person is
-/// there. No `-A`, as for [`tty_argv`].
-pub fn cli_argv(entry: &Entry, tty: bool, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
-    argv(entry, &[if tty { "-t" } else { "-T" }], remote_args)
-}
-
-/// [`tty_argv`] running `program` on `entry` instead of its devsandbox (a
-/// `<runtime> exec -it …`). `program` is shell text, like `entry`'s
-/// `command`. No caller since the dashboard's service tabs go over the
-/// link.
-#[allow(dead_code)] // fleet step 8c deletes it
-pub fn tty_argv_with(entry: &Entry, program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
-    argv_with(entry, &["-t"], program, remote_args)
-}
-
-/// The argv of a remote forward's bridge (docs/architecture/daemon/forwards.md,
-/// *Remote bridges*): `ssh -T [-o BatchMode=yes] [-p N] -- <host> <devsandbox
-/// -C <root> tunnel [--instance=<key>] [--service=<svc>] --port <n>>`. No
-/// `-A`: a forward's bridge serves no agent. `batch` when whoever runs it has
-/// no TTY (the daemon). The `=` forms keep a name starting with `-` a value.
-/// No caller since forwards and `port` go over the link.
-#[allow(dead_code)] // fleet step 8c deletes it
-pub fn tunnel_argv(
-    entry: &Entry,
-    batch: bool,
-    root: &Path,
-    instance: Option<&str>,
-    service: Option<&str>,
-    port: u16,
-) -> Result<Vec<OsString>> {
-    let mut args = vec!["-C".to_string(), root.to_string_lossy().into_owned(), "tunnel".into()];
-    args.extend(instance.map(|i| format!("--instance={i}")));
-    args.extend(service.map(|s| format!("--service={s}")));
-    args.extend(["--port".into(), port.to_string()]);
-    let opts: &[&str] = if batch { &["-T", "-o", "BatchMode=yes"] } else { &["-T"] };
-    argv(entry, opts, &args)
-}
-
-/// The argv of `entry`'s agent relay (docs/architecture/daemon/machines.md,
-/// *Agent*): `ssh -T -o BatchMode=yes [-p N] -- <host> <devsandbox
-/// agent-relay --client <client>>`. No `-A`: the agent travels inside the
-/// relay's own streams.
-#[allow(dead_code)] // nothing spawns the relay since fleet step 7d; goes in step 8
-pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
-    argv(entry, &["-T", "-o", "BatchMode=yes"], &["agent-relay", "--client", client])
+/// The argv of `machine add`'s `machine roots add` on `entry`
+/// (`commands::machine`), before it has a link: `ssh -T [-p N] -- <host>
+/// <devsandbox remote_args…>`. `-T`: piped bytes must stay bytes, not a
+/// pty's CRLFs. No `BatchMode`: a person is there to answer ssh's prompts.
+/// No `-A`. The CLI's other commands on a machine go over its link
+/// (docs/architecture/daemon/machines.md, *The CLI: `cli.rs`*).
+pub fn add_cli_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
+    argv(entry, &["-T"], remote_args)
 }
 
 /// The argv of a POSIX sh `script` run on `entry` by a person at the CLI
@@ -215,7 +166,7 @@ fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result
 }
 
 /// Every argv above comes through here, so an offered machine (no ssh to
-/// it) is refused for all of them alike.
+/// it) is refused for all of them alike (`Entry::ssh_target`).
 fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     target_argv(entry.ssh_target()?, opts, program, remote_args)
 }
@@ -236,14 +187,14 @@ pub(crate) fn target_argv(target: &str, opts: &[&str], program: &str, remote_arg
 }
 
 /// Opens a connection to a machine: production connects its link's socket
-/// (`fleet::dialer::dial`) or, at add time, spawns ssh ([`ssh_dial`]);
+/// (`fleet::dialer::dial`) or, at add time, spawns ssh ([`probe_dial`]);
 /// tests connect to a test daemon's socket.
 pub type Dial = Arc<dyn Fn(&Entry) -> Result<Duplex> + Send + Sync>;
 
 /// The production add-time [`Dial`] to a target's daemon: [`spawn`] of
-/// [`api_argv`], saying `client` to the remote relay (its `serve.log`).
-pub fn ssh_dial(client: String) -> Dial {
-    Arc::new(move |entry: &Entry| spawn(&api_argv(entry, &client)?))
+/// [`probe_argv`], saying `client` to the remote relay (its `serve.log`).
+pub fn probe_dial(client: String) -> Dial {
+    Arc::new(move |entry: &Entry| spawn(&probe_argv(entry, &client)?))
 }
 
 /// A connection to a peer daemon: a socket to read and write lines on, and
@@ -482,13 +433,13 @@ pub(crate) mod test_support {
         Ok(Duplex { stream, peer: Peer { child: None, stderr: Some(Tail::collect(stderr, "test-ssh-stderr")?) } })
     }
 
-    /// A test daemon's socket as a machine link sees it through the relay:
-    /// the relay's first line (`relay::write_sentinel`), then the daemon's
-    /// bytes, both ways pumped over a socket pair. Either end closing
-    /// reaches the other as EOF.
+    /// A test daemon's socket as the add-time probe sees it through ssh and
+    /// `api --stdio --sentinel`: the relay's first line
+    /// (`relay::write_sentinel`), then the daemon's bytes, both ways pumped
+    /// over a socket pair. Either end closing reaches the other as EOF.
     pub fn relayed(daemon: Stream) -> Result<Duplex> {
         let (ours, theirs) = Stream::pair()?;
-        crate::serve::relay::write_sentinel(&mut &theirs, true)?;
+        crate::serve::relay::write_sentinel(&mut &theirs)?;
         let (theirs_up, daemon_down) = (theirs.try_clone()?, daemon.try_clone()?);
         std::thread::spawn(move || {
             pipe(&mut &theirs_up, &mut &daemon);
@@ -516,16 +467,7 @@ mod tests {
     #[test]
     fn every_argv_refuses_an_offered_machine() {
         let e = Entry::offered("lap");
-        let root = Path::new("/r");
-        let refusals = [
-            api_argv(&e, "c"),
-            tty_argv(&e, &["exec", "w"]),
-            cli_argv(&e, false, &["ps"]),
-            tty_argv_with(&e, "docker", &["exec"]),
-            tunnel_argv(&e, true, root, Some("w"), None, 1),
-            agent_argv(&e, "c"),
-            script_argv(&e, "true", &[] as &[&str]),
-        ];
+        let refusals = [probe_argv(&e, "c"), add_cli_argv(&e, &["ps"]), script_argv(&e, "true", &[] as &[&str])];
         for r in refusals {
             let err = format!("{:#}", r.unwrap_err());
             assert!(err.contains("machine `lap` is an offered fleet worker") && err.contains("not ssh"), "{err}");
@@ -566,55 +508,25 @@ mod tests {
     }
 
     #[test]
-    fn api_and_tty_argvs() {
-        let api = api_argv(&entry("ssh://me@box:2200", None), "machine:laptop").unwrap();
-        let remote = remote_command("devsandbox", &["api", "--stdio", "--client", "machine:laptop", "--session-env"]);
-        assert_eq!(strs(&api), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
-        assert!(!strs(&api).contains(&"-A"), "the agent goes over the agent relay");
+    fn add_time_argvs() {
+        let probe = probe_argv(&entry("ssh://me@box:2200", None), "machine:laptop").unwrap();
+        let remote = remote_command("devsandbox", &["api", "--stdio", "--client", "machine:laptop", "--sentinel"]);
+        assert_eq!(strs(&probe), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
 
         let e = entry("box", Some("~/bin/devsandbox"));
-        let tty = tty_argv(&e, &["exec", "web", "-C", "/srv/it's here"]).unwrap();
-        let remote = remote_command("~/bin/devsandbox", &["exec", "web", "-C", "/srv/it's here"]);
-        assert_eq!(strs(&tty), ["ssh", "-t", "--", "box", remote.as_str()]);
+        let cli = add_cli_argv(&e, &["machine", "roots", "add", "/srv/it's here"]).unwrap();
+        let remote = remote_command("~/bin/devsandbox", &["machine", "roots", "add", "/srv/it's here"]);
+        assert_eq!(strs(&cli), ["ssh", "-T", "--", "box", remote.as_str()]);
         assert!(remote.contains("~/bin/devsandbox"), "the command is shell text: {remote}");
-        let piped = cli_argv(&entry("ssh://box:22", None), false, &["ps"]).unwrap();
-        let remote = remote_command("devsandbox", &["ps"]);
-        assert_eq!(strs(&piped), ["ssh", "-T", "-p", "22", "--", "box", remote.as_str()]);
-        let with = tty_argv_with(&e, "docker", &["exec", "-it", "db", "sh"]).unwrap();
-        let remote = remote_command("docker", &["exec", "-it", "db", "sh"]);
-        assert_eq!(strs(&with), ["ssh", "-t", "--", "box", remote.as_str()]);
         let script = script_argv(&entry("ssh://box:2200", Some("~/bin/devsandbox")), "echo \"$1\"", &["it's"]).unwrap();
         let remote = remote_command("sh", &["-c", "echo \"$1\"", "sh", "it's"]);
         assert_eq!(strs(&script), ["ssh", "-T", "-p", "2200", "--", "box", remote.as_str()]);
         assert!(!strs(&script).contains(&"BatchMode=yes"), "a person is there");
-        // No ssh agent forwarding anywhere: the agent relay carries it.
-        for argv in [&api, &tty, &piped, &with, &script] {
+        // No ssh agent forwarding anywhere: nothing at add time needs one.
+        for argv in [&probe, &cli, &script] {
             assert!(!strs(argv).contains(&"-A"), "{argv:?}");
         }
-        assert!(api_argv(&entry("-oProxyCommand=x", None), "c").is_err());
-    }
-
-    #[test]
-    fn tunnel_argvs() {
-        let root = Path::new("/srv/it's");
-        let daemon = tunnel_argv(&entry("ssh://me@box:2200", None), true, root, Some("web"), Some("-db"), 5432).unwrap();
-        let remote =
-            remote_command("devsandbox", &["-C", "/srv/it's", "tunnel", "--instance=web", "--service=-db", "--port", "5432"]);
-        assert_eq!(strs(&daemon), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
-        let cli = tunnel_argv(&entry("box", Some("~/bin/devsandbox")), false, root, None, Some("redis"), 6379).unwrap();
-        let remote = remote_command("~/bin/devsandbox", &["-C", "/srv/it's", "tunnel", "--service=redis", "--port", "6379"]);
-        assert_eq!(strs(&cli), ["ssh", "-T", "--", "box", remote.as_str()]);
-        assert!(!strs(&cli).contains(&"-A"), "a forward serves no agent");
-        assert!(tunnel_argv(&entry("-oProxyCommand=x", None), true, root, Some("web"), None, 1).is_err());
-    }
-
-    #[test]
-    fn agent_argvs() {
-        let argv = agent_argv(&entry("ssh://me@box:2200", Some("~/bin/devsandbox")), "machine:lap").unwrap();
-        let remote = remote_command("~/bin/devsandbox", &["agent-relay", "--client", "machine:lap"]);
-        assert_eq!(strs(&argv), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
-        assert!(!strs(&argv).contains(&"-A"), "the relay carries the agent itself");
-        assert!(agent_argv(&entry("-oProxyCommand=x", None), "machine:lap").is_err());
+        assert!(probe_argv(&entry("-oProxyCommand=x", None), "c").is_err());
     }
 
     /// A script that prints each arg as `[arg]`, at a path with a space and

@@ -70,16 +70,15 @@ pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join(LOCK_FILE)
 }
 
-/// How many bytes of a client name an agent relay socket's name keeps
-/// before cutting it and appending a hash of the whole name.
+/// How many bytes of a client name a link socket's name keeps before
+/// cutting it and appending a hash of the whole name.
 const AGENT_CLIENT_MAX: usize = 40;
 
-/// A machine agent relay's socket in `dir` (docs/architecture/daemon/machines.md,
-/// *Agent*): `agent-<client>.sock`, one per linked client
-/// (`machine:<hostname>`). The client is cut down to `[A-Za-z0-9._-]` (the
-/// rest become `_`) and to [`AGENT_CLIENT_MAX`] bytes, a long one ending in
-/// a hash of the full name so two long names don't collide: macOS caps
-/// socket paths at 104 bytes.
+/// A relayed agent's socket in `dir`: `agent-<client>.sock`, a lending
+/// worker's for its hub (`fleet::agent::socket`, client `fleet-<hub>`).
+/// The client is cut down to `[A-Za-z0-9._-]` (the rest become `_`) and to
+/// [`AGENT_CLIENT_MAX`] bytes, a long one ending in a hash of the full name
+/// so two long names don't collide: macOS caps socket paths at 104 bytes.
 pub fn agent_socket(dir: &Path, client: &str) -> PathBuf {
     dir.join(format!("agent-{}.sock", agent_socket_name(client)))
 }
@@ -148,7 +147,8 @@ fn agent_socket_name(client: &str) -> String {
     format!("{}-{}", &safe[..AGENT_CLIENT_MAX - 9], &hash[..8])
 }
 
-/// The agent relay sockets (`agent-*.sock`) in `dir`, newest mtime first,
+/// The relayed agents' sockets (`agent-*.sock`: [`link_agent_socket`],
+/// [`agent_socket`]) in `dir`, newest mtime first,
 /// unchecked: whoever uses one tries it (`bridge::host_agent`). Nothing
 /// when `dir` is missing or unreadable.
 pub fn agent_sockets(dir: &Path) -> Vec<PathBuf> {

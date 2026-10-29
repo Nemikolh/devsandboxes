@@ -84,9 +84,9 @@ extensions). It parses nothing: framing, `hello` and the protocol check
 stay with the client; diagnostics go to stderr. It lazy-starts the daemon
 and holds it while it runs. Exit 0 on stdin EOF (after up to `GRACE`, 5 s,
 for answers in flight) or when stdout is gone; 75 (`EXIT_NO_HOST`) when the
-daemon closed first (reconnect to start a new one). `--session-env`, used
-only by a machine link's remote relay, rewrites each verb request's
-`params.env` to the relay's own login-shell env.
+daemon closed first (reconnect to start a new one). `--sentinel`, used
+only by `machine add`'s probe over ssh, writes one sentinel line before
+the daemon's bytes so the probe can skip the remote login shell's noise.
 
 The npm package `devsandboxes` spawns this relay (`DEVSANDBOX_BINARY`
 overrides the binary). Its typings `index.d.ts` are hand-written;

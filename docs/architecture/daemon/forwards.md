@@ -124,11 +124,6 @@ stream), else `None`; a remote forward's `ForwardSpec.probe` finds
 nothing. Errors: the header's `error`, else `<machine>: <why>` (`the
 tunnel ended before its header` when the link refused the stream).
 
-`Via::Ssh(argv)` (`open_remote`: an ssh running the hidden `devsandbox -C
-<root> tunnel …` on the machine, `ssh::tunnel_argv`, its stderr kept in an
-`ssh::Tail` for `no_header`'s errors) is the older form; no forward builds
-it.
-
 ## Host ports
 
 `HostPort::Fixed(p)` binds `p` or fails. `HostPort::Prefer(p)` tries `p`

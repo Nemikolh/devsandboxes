@@ -354,36 +354,10 @@ enum Command {
         /// Who's relaying (`api:<name>`, `npm:<name>`), for serve.log
         #[arg(long, default_value = "api")]
         client: String,
-        /// Give relayed verb requests this process's env (a machine link's
-        /// relay over ssh: docs/architecture/daemon/machines.md)
+        /// Write the sentinel line before the daemon's bytes (`machine add`'s
+        /// probe over ssh: docs/architecture/daemon/machines.md, *ssh*)
         #[arg(long, hide = true)]
-        session_env: bool,
-    },
-    /// The far end of a remote forward's ssh (docs/architecture/daemon/forwards.md,
-    /// *Remote bridges*): resolve the route here, write its header line to
-    /// stdout, then become the instance's `devsbd bridge`
-    #[cfg(unix)]
-    #[command(hide = true)]
-    Tunnel {
-        /// Instance name, sandbox config name, or repository folder name
-        #[arg(long, required_unless_present = "service")]
-        instance: Option<String>,
-        /// The service whose port to dial
-        #[arg(long)]
-        service: Option<String>,
-        /// The container-side port
-        #[arg(long)]
-        port: u16,
-    },
-    /// The far end of a machine's agent relay (docs/architecture/daemon/machines.md,
-    /// *Agent*): serve the linked laptop's ssh-agent on a socket here, carried
-    /// over stdin/stdout
-    #[cfg(unix)]
-    #[command(hide = true)]
-    AgentRelay {
-        /// Who's linked (`machine:<hostname>`): names the socket
-        #[arg(long)]
-        client: String,
+        sentinel: bool,
     },
     /// The far end of a fleet link over stdin/stdout
     /// (docs/architecture/daemon/fleet.md): `--worker`/`--root`, the hub's
@@ -889,13 +863,7 @@ fn main() -> Result<()> {
             Some(ServeCommand::Uninstall) => serve::install::uninstall_cli(),
         },
         #[cfg(unix)]
-        Command::Api { stdio: _, client, session_env } => {
-            std::process::exit(serve::relay::stdio(&client, session_env)?)
-        }
-        #[cfg(unix)]
-        Command::Tunnel { instance, service, port } => commands::tunnel::tunnel(cli.dir, instance, service, port),
-        #[cfg(unix)]
-        Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
+        Command::Api { stdio: _, client, sentinel } => std::process::exit(serve::relay::stdio(&client, sentinel)?),
         #[cfg(unix)]
         Command::FleetLink { peer: Some(peer), .. } => commands::fleet_link::fleet_link_peer(&peer),
         Command::FleetLink { worker, root, drain, peer: None } => {

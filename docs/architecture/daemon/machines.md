@@ -9,20 +9,19 @@ requests for its instances. Read this before
 touching anything that takes a `machine` param or a `m/name`.
 
 Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
-`RawEntry`, `offered_refusal`, `path`, `parse`, `update`,
+`RawEntry`, `path`, `parse`, `update`,
 `check_name`, `Where`, `parse_name`, `default_name`), `ssh.rs`
-(`api_argv`, `tty_argv`, `tty_argv_with`, `cli_argv`, `agent_argv`,
-`script_argv`, `parse_target`, `Dial`, `Duplex`, `ssh_dial`), `link.rs`
-(`LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
-`Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `agent.rs`
-(`serve`, `End`, `SPEC`: the old agent relay, unused), `api.rs`
+(`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
+`parse_target`, `Dial`, `Duplex`, `probe_dial`), `link.rs`
+(`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
+`Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 `localize`, `Reconnect`, `dials`, `pipe_mode`, `attach_mode`), `cli/calls.rs` (`use_of`, `Use`,
 `Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
 `parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
 `src/serve/fleet/dialer.rs` (`Dialer`, `dial`, `link_args`),
-`src/serve/relay.rs` (`--session-env`), `src/commands/machine.rs`,
+`src/serve/relay.rs` (`--sentinel`), `src/commands/machine.rs`,
 `src/serve/endpoint.rs` (`fleet_socket`, `link_agent_socket`, `agent_sockets`),
 `src/tui/remote.rs`. Params: [api.md](../../reference/api.md#machines).
 
@@ -80,56 +79,48 @@ isn't something to dial.
 
 ## ssh
 
-One argv builder for the daemon, the CLI and the dashboard; every argv
-goes through `argv_with`, which takes `Entry::ssh_target`, so none is
-built for an offered machine (`offered_refusal`, a backstop: each path to
-one goes over its fleet link or refuses first in its own words). Plain ssh, no
-ControlMaster of its own: `~/.ssh/config` decides. The remote command runs
-through the login shell (`exec "$SHELL" -lc '…'`, each arg quoted for it),
-so the remote `PATH` is the user's. No argv passes `-A`: this host's
-ssh-agent reaches a machine only over its link's `AGENT` streams
-([Agent](#agent)), only with the machine's `agent` on.
-
-The machine's link itself is no argv here: the daemon dials it through
+ssh is the link's transport and the add-time path, nothing else. The
+machine's link is dialed by the daemon through
 `fleet::transport::Transport::ssh` (`ssh -T -o BatchMode=yes [-p N] --
 <host> <command> fleet-link --peer <member>`, the entry's `command` as the
-program: `Transport::dial_with`; [Held links](#held-links-machines)). The
-argvs below are the add-time ssh; every use of a machine after that (the
-CLI's commands, the dashboard's terminals, forwards and `port`) goes over
-the link's channels. `tty_argv`, `tty_argv_with` and `tunnel_argv` have no
-caller left (step 8c of the [fleet plan](../../plans/active/fleet.md)
-deletes them):
+program: `Transport::dial_with`, over `ssh::target_argv`;
+[Held links](#held-links-machines)). Every use of a machine after that
+(the CLI's commands, the dashboard's terminals, forwards and `port`) goes
+over the link's channels. Before a link exists, `machine add` reaches the
+target over ssh with the argvs in `ssh.rs`:
 
-- `api_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … api --stdio
-  --client <c> --session-env` (the daemon has no TTY: ssh must fail, not
-  prompt), what `machines.probe` and `machines.add` dial (`ssh_dial`)
-  before the machine has a link.
-- `tty_argv` / `tty_argv_with`: `-t`, no `BatchMode` (`tty_argv_with`
-  runs a program other than devsandbox).
-- `cli_argv`: `-t` on a terminal, else `-T` (piped bytes stay clean);
-  `machine add`'s `machine roots add` over the add-time ssh
+- `probe_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … api --stdio
+  --client <c> --sentinel` (the daemon has no TTY: ssh must fail, not
+  prompt), what `machines.probe` and `machines.add` dial (`probe_dial`)
+  for the hello and `roots.list`. The relay there is a local client of
+  that daemon, under the user's own ssh login; `--sentinel` makes it write
+  its sentinel line first ([Link handshake](#link-handshake)).
+- `add_cli_argv`: `-T`, no `BatchMode` (a person is there); `machine
+  add`'s `machine roots add` there
   ([`devsandbox machine add…`](#devsandbox-machine-addlssetrmtrustroots)).
-- `tunnel_argv`: `ssh -T [-o BatchMode=yes] [-p N] -- <host> … -C <root>
-  tunnel [--instance=<name>] [--service=<svc>] --port <n>`, the ssh
-  form of a remote forward's bridge; `BatchMode` when `batch`. The `=`
-  forms keep a name starting with `-` a value.
-- `agent_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … agent-relay
-  --client <c>`, the old agent relay's; nothing spawns it.
 - `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
   POSIX script run for a person at the CLI ([Install](#install)); no
   `BatchMode`. A script is one line: the login shell may be csh, which
   refuses a newline inside quotes.
 
+Each goes through `argv_with`, which takes `Entry::ssh_target`, so none
+is built for an offered machine. Plain ssh, no ControlMaster of its own:
+`~/.ssh/config` decides. The remote command runs through the login shell
+(`exec "$SHELL" -lc '…'`, each arg quoted for it), so the remote `PATH` is
+the user's. No argv passes `-A`: this host's ssh-agent reaches a machine
+only over its link's `AGENT` streams ([Agent](#agent)), only with the
+machine's `agent` on.
+
 `Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
-ssh's stderr for `spawn`'s `Peer` and the remote forward opener alike.
+ssh's stderr for `spawn`'s `Peer`.
 
 `Dial` (`Fn(&Entry) -> Duplex`) is injectable. The daemon's is
 `fleet::dialer::dial`: a connection to the machine's `fleet-<name>.sock`
 in the socket dir, one `API` stream on its link, ssh or offered alike;
 `machines::api::Ctx::dial` (the held link, forwarded verbs, placement's
-capacity asks) is that one, `Ctx::probe` the add-time `ssh_dial`
-(`api_argv`, `link::client_name` as the client). A `Duplex` is always a
-unix socket (pumped to the ssh child's pipes for `ssh_dial`), so
+capacity asks) is that one, `Ctx::probe` the add-time `probe_dial`
+(`probe_argv`, `link::client_name` as the client). A `Duplex` is always a
+unix socket (pumped to the ssh child's pipes for `probe_dial`), so
 `client::Conn` works on it unchanged and tests dial a second test
 daemon's socket.
 
@@ -148,15 +139,10 @@ own env (the peer's `env`, `fleet::lent::Peer`), not a login shell's,
 its `SSH_AUTH_SOCK` this host's agent relayed there
 (`agent-link-<this host>.sock`, the peer's `agent`) while that socket
 answers, so host git on the machine uses the agent this host serves.
-The add-time `api_argv` relay attaches its connection the same way
-(`--session-env`: `relay::attach`, `link.attach {peer}` with `peer`
-`--client` without its `machine:` prefix, its answer read byte by byte up
-to its newline and not relayed); a refused attach ends the relay with
-exit 1 and the reason on stderr, which the link reports as ssh's stderr
-tail (`LinkError::Closed`); the daemon hanging up first is exit 75. No
-use of a machine bypasses the trust table: the only ssh shells on it are
-the add-time ones (`api_argv`'s attached relay, `cli_argv`'s `machine
-roots add`, `script_argv`'s install).
+No use of a machine bypasses the trust table: the only ssh shells on it
+are the add-time ones (`probe_argv`'s `roots.list`, `add_cli_argv`'s
+`machine roots add`, `script_argv`'s install), each the user's own
+login there.
 
 ## Install
 
@@ -199,21 +185,22 @@ off the remote daemon (only that host's own clients upgrade it). The
 `protocol` must match (`LinkError`); differing semvers within one protocol
 are a warning at add and shown in `machine ls`.
 
-Before the hello, `handshake` reads up to the relay's sentinel: every
-`API` stream of a link starts with `\n` + `devsandbox-api 1\n`
-(`relay::write_sentinel`: the far end's `fleet-link` writes it on each
-stream it hands its daemon, `commands::fleet_link::attach_stream`, as the
-add-time relay does once it reaches the remote daemon), and the link skips every line
-before it (`ssh::skip_lines`, the same byte-at-a-time skipper as a remote
-forward's tunnel header, so nothing past the sentinel is consumed),
-bounded at 64 KiB, with the hello's read timeout. The leading newline ends
-a motd printed without a final one, so the sentinel always starts a line
-and is matched as a whole line (a trailing `\r` tolerated); another version
-is an error naming the older side. The first skipped line (cut at 200
-chars) is kept on `Link::noise`; a held link logs it to `serve.log` once
-per connect (`machine <name>: login shell printed: …`). EOF before the
-sentinel is `LinkError::Closed` with ssh's stderr tail; the bound or a
-timeout is `LinkError::Other` with that first line.
+`handshake` takes what the stream is (`Over`). A link's `API` stream
+(`Over::Link`: the held link, forwarded verbs, capacity asks,
+`daemon::inbound_roots`) is the remote daemon from its first byte: no
+login shell in a mux stream, so no sentinel (fleet plan decision 27).
+The add-time probe (`Over::Ssh`) reads up to the relay's sentinel first:
+`api --stdio --sentinel` writes `\n` + `devsandbox-api 1\n`
+(`relay::write_sentinel`) once it reaches the remote daemon, and the
+probe skips every line before it (`ssh::skip_lines`, byte at a time, so
+nothing past the sentinel is consumed), bounded at 64 KiB, with the
+hello's read timeout. The leading newline ends a motd printed without a
+final one, so the sentinel always starts a line and is matched as a whole
+line (a trailing `\r` tolerated); another version is an error naming the
+older side. The first skipped line (cut at 200 chars) is kept on
+`Link::noise`. EOF before the sentinel (or the hello's reply) is
+`LinkError::Closed` with ssh's stderr tail; the bound or a timeout is
+`LinkError::Other` with that first line.
 
 ## Held links: `Machines`
 
@@ -237,8 +224,8 @@ is held from the start, wanted or not (fleet plan decision 7).
   to the machine; each stream the machine opens is this daemon's
   (`daemon::machine_dialer`: `Shared::open_lent`, peer `<name>`, its
   fleet root `fleet/<name>/` under the data dir). It reports through
-  `Held`: `up` once the `Hello`s are through (the sentinel and the
-  `Hello`s within `Timing::handshake`), `note` for a link up but serving
+  `Held`: `up` once the `Hello`s are through (the link's sentinel and
+  the `Hello`s within `Timing::handshake`), `note` for a link up but serving
   nothing yet (waiting for the hub's build), and returns why it ended,
   with ssh's stderr tail (where the far end's refusal is, such as a name
   clash: [inbound neighbors](#inbound-neighbors) there). A hub machine on
@@ -350,9 +337,6 @@ the hub's `fleet-link` serves those streams from the agent this daemon
 answers `fleet.agent` with (its own `bridge::host_agent` while the flag
 is on, asked every 2 s), and the worker binds `agent-fleet-<hub>.sock` in
 its socket dir only while its probes say the hub serves.
-
-The old agent relay (`ssh::agent_argv`, `devsandbox agent-relay`,
-`machines::agent`) is no longer run; fleet step 8 removes it.
 
 ## The CLI: `cli.rs`
 
@@ -532,7 +516,7 @@ expanded with the remote home, canonicalized, config loaded). Between
 the two, `add` records every chosen root, probed or typed, as the
 machine's own (`record_roots`): `devsandbox machine roots add -- <roots…>`
 run there over a one-off ssh with the machine's `command`
-(`record_roots_argv`: `ssh::cli_argv` with `-T`, no `BatchMode`, each
+(`record_roots_argv`: `ssh::add_cli_argv`, `-T`, no `BatchMode`, each
 root quoted so its `~` reaches the remote command unexpanded), stdout
 dropped, stderr passed through. A probed root is recorded too: it may be
 an own root only through an instance, and stops being one when that

@@ -4,8 +4,8 @@
 //! <fleet root>` ([`link_args`]) on the hub, dialed through the
 //! [`Transport`] (`fleet::transport`: ssh), and runs the answerer of
 //! `fleet::LINK` on it. Each `API` stream the hub opens is answered
-//! by the daemon's `open` (a socket pair: the API relay's sentinel on the
-//! hub's end, the other end served as a `Peer` connection, `fleet::lent`).
+//! by the daemon's `open` (a socket pair: the hub's end, and the other end
+//! served as a `Peer` connection, `fleet::lent`).
 //! A link that ends is retried with the machine links' backoff
 //! (`service::backoff`), reset once a link came up. [`Lending::status`] is
 //! the link's state for `lend.get`; [`Lending::set_draining`] changes what
@@ -790,19 +790,11 @@ mod tests {
             got
         }
 
-        /// A raw stream over the hub's offered dial to `lap`, past the
-        /// API relay's sentinel line.
+        /// A raw stream over the hub's offered dial to `lap`.
         fn offered_stream(hub_dir: &Path) -> endpoint::Stream {
             let dial = crate::serve::fleet::dialer::dial(hub_dir.to_path_buf());
             let duplex = dial(&Entry::offered("lap")).unwrap();
-            let mut reader = BufReader::new(duplex.stream.try_clone().unwrap());
             duplex.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut line = String::new();
-            while line != "devsandbox-api 1\n" {
-                line.clear();
-                assert!(reader.read_line(&mut line).unwrap() > 0, "no sentinel");
-            }
-            assert!(reader.buffer().is_empty());
             duplex.stream
         }
 
@@ -873,7 +865,7 @@ mod tests {
             // The hub's own link to it: `machines::link::handshake` as for
             // an ssh machine.
             let dial = crate::serve::fleet::dialer::dial(hub_dir.clone());
-            let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5)).unwrap();
+            let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5), mlink::Over::Link).unwrap();
             assert_eq!(link.remote().version, "0.6.0");
             let call = |link: &mut mlink::Link, m: &str, p: Value| link.conn.call(m, p).unwrap();
             let r = call(&mut link, "sandboxes.list", json!({"root": cfg}));
@@ -1124,7 +1116,7 @@ mod tests {
             assert!(rows[0]["capacity"].is_null(), "{rows}");
             // Through the trust table, as the hub asks it.
             let dial = crate::serve::fleet::dialer::dial(hub_dir.clone());
-            let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5)).unwrap();
+            let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5), mlink::Over::Link).unwrap();
             let r = link.conn.call("capacity.get", json!({})).unwrap().result.unwrap();
             assert_eq!((&r["cpus"], &r["lending"]), (&json!(8), &json!("on")), "{r}");
             crate::serve::dts::assert_matches("Capacity", &r);

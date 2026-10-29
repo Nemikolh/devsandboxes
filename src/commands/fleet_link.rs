@@ -4,8 +4,7 @@
 //! devsandbox fleet-link --worker <name> --root <fleet root>`, `serve::fleet::worker`) and answers the
 //! streams it opens with connections to its own daemon.
 //!
-//! It is the opener of a `fleet::link` of `fleet::LINK`, as
-//! `commands::agent_relay` is of the agent relay's: it binds
+//! It is the opener of a `fleet::link` of `fleet::LINK`: it binds
 //! `endpoint::fleet_socket` (`fleet-<name>.sock`, 0600 in the 0700 socket
 //! dir; the newest link for a worker wins), and each connection there (the
 //! hub's link to the offered machine, its forwarded verbs: `fleet::dialer::dial`)
@@ -478,11 +477,10 @@ fn sleep_unless(stop: &AtomicBool, d: Duration) -> bool {
 /// in `dir`: a socket pair whose far end a thread of its own takes (this
 /// runs on the link's read thread). The thread connects the daemon, sends
 /// `link.attach {peer, channel}` as the connection's first line, reads the
-/// answer (nothing past it), and splices the stream to the connection; an
-/// `API` stream gets the API relay's sentinel line first, as every link
-/// `API` stream starts (`machines::link::handshake` reads it). A refused
-/// attach closes the stream, with why on stderr. `None` when no pair or
-/// thread could be made.
+/// answer (nothing past it), and splices the stream to the connection (an
+/// `API` stream's first byte is the daemon's, fleet plan decision 27). A
+/// refused attach closes the stream, with why on stderr. `None` when no
+/// pair or thread could be made.
 pub fn attach_stream(dir: &Path, channel: Channel, peer: &str) -> Option<mux::Conn> {
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().ok()?;
     let (dir, peer) = (dir.to_path_buf(), peer.to_string());
@@ -491,9 +489,6 @@ pub fn attach_stream(dir: &Path, channel: Channel, peer: &str) -> Option<mux::Co
             Ok(daemon) => daemon,
             Err(e) => return eprintln!("fleet-link: cannot hand a {} stream to this host's devsandbox: {e:#}", channel.as_str()),
         };
-        if channel == Channel::Api && crate::serve::relay::write_sentinel(&mut &ours, true).is_err() {
-            return;
-        }
         link::splice(ours, daemon.into());
     });
     spawned.ok()?;
@@ -571,16 +566,12 @@ mod tests {
     }
 
     /// The worker's end, faked: the answerer of `fleet::LINK` over `io`,
-    /// each `API` stream a connection to the daemon in `daemon` that starts
-    /// with the API relay's sentinel line, as the worker's
-    /// (`daemon::Shared::open_lent`) does.
+    /// each `API` stream a connection to the daemon in `daemon`, as the
+    /// worker's (`daemon::Shared::open_lent`) is.
     fn fake_worker(io: UnixStream, daemon: PathBuf) -> std::thread::JoinHandle<link::End> {
         let (r, w) = (io.try_clone().unwrap(), io);
         std::thread::spawn(move || {
-            let open = move || {
-                let duplex = ssh::test_support::relayed(endpoint::connect(&daemon).ok()?).ok()?;
-                Some(duplex.stream.into())
-            };
+            let open = move || Some(endpoint::connect(&daemon).ok()?.into());
             let serves = link::Serves::default()
                 .with(fleet::LINK.channel, open)
                 .with(channel::PTY, fake_pty)
@@ -899,7 +890,7 @@ mod tests {
         wait_for(|| outlet.is_up(), "the dialer's outlet is up");
         let crate::devsbd::mux::Conn::Unix(stream) = outlet.open(channel::API).unwrap() else { panic!("a socket pair") };
         let duplex = ssh::Duplex::socket(stream.into());
-        let mut api = crate::serve::machines::link::handshake("K", duplex, Duration::from_secs(5)).unwrap();
+        let mut api = crate::serve::machines::link::handshake("K", duplex, Duration::from_secs(5), crate::serve::machines::link::Over::Link).unwrap();
         let cfg = k_data.join("fleet/L/cfg");
         std::fs::create_dir_all(&cfg).unwrap();
         let code = |c: &mut Conn, m: &str, p: Value| c.call(m, p).unwrap().error.map(|e| e.code);

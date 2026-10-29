@@ -1,7 +1,7 @@
 //! The trust table (docs/architecture/daemon/fleet.md, *The trust table*):
 //! what a remote caller (a [`Peer`]: a fleet hub over its lending link's
-//! `API` streams, or the host that linked this one as an ssh machine, over
-//! the relay connection its `link.attach` turned) may do on this member.
+//! `API` streams, or the other end of a peer link over the connections its
+//! `link.attach` turned) may do on this member.
 //! Each such connection is served with a [`Peer`] (the daemon's
 //! `Table::Peer`); every request on it goes through
 //! [`admit`] first and its answer through [`filter_answer`], every
@@ -35,8 +35,7 @@
 //!
 //! - [`refuse_new_work`]: while lending `drain`, a `run` from the lending
 //!   link's peer (the one with a fleet root) is `denied` ([`DRAINING`]),
-//!   under either trust; verbs on instances already here go on. `drain` is
-//!   about the lending link: an ssh machine's peer isn't refused.
+//!   under either trust; verbs on instances already here go on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -51,26 +50,24 @@ use crate::state::State;
 use crate::worker_policy::Trust;
 
 /// A remote caller of this member: one per lending link, one per attached
-/// connection (`link.attach`, a relay's or a channel's).
+/// connection (`link.attach {channel}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
-    /// Who it is (the hub's ssh target, the linking host's name, a fleet
-    /// member's name), for the log.
+    /// Who it is (the hub's ssh target, a link peer's machine name), for
+    /// the log.
     pub name: String,
-    /// This member's fleet root for it, canonical; `Some` on the lending
-    /// link and for a `link.attach {channel}` ([`peer_fleet_root`]), `None`
-    /// for an ssh machine's relay.
+    /// This member's fleet root for it, canonical: the lending link's, a
+    /// link peer's ([`peer_fleet_root`]). `None` only in tests.
     pub fleet_root: Option<PathBuf>,
     /// `Some`: the env its verbs run with, whatever it sent (the lending
-    /// link's and a channel attach's: this host's own, the daemon's).
-    /// `None`: a verb's env as sent (an attached relay's: the relay's
-    /// `--session-env` already set it).
+    /// link's and a link peer's: this host's own, the daemon's). `None`: a
+    /// verb's env as sent.
     pub env: Option<BTreeMap<String, String>>,
     /// The linking host's agent relayed here (a peer link's
     /// `agent-link-<peer>.sock`, `endpoint::link_agent_socket`): with `env`,
     /// a verb's `SSH_AUTH_SOCK` while it answers, so host git there (a
-    /// worktree's clone) uses the agent the linking host serves, as an ssh
-    /// relay's `--session-env` did. `None`: `env` as it is.
+    /// worktree's clone) uses the agent the linking host serves. `None`:
+    /// `env` as it is.
     pub agent: Option<PathBuf>,
 }
 
@@ -78,12 +75,11 @@ pub struct Peer {
 pub const PEER_NAME_MAX: usize = 255;
 
 /// `link.attach`'s `peer` (pure): a non-empty string of at most
-/// [`PEER_NAME_MAX`] bytes without control characters. Not
-/// `machines::check_name`: it's the linking host's hostname, which may
-/// carry dots or anything a hostname has; only the log shows it.
+/// [`PEER_NAME_MAX`] bytes without control characters ([`attach_params`]
+/// then holds it to `machines::check_name`).
 pub fn attach_peer(params: &Value) -> Result<String, ApiError> {
     let Some(name) = params.get("peer").and_then(Value::as_str) else {
-        return Err(ApiError::invalid("`link.attach` needs `peer`, the linking host's name"));
+        return Err(ApiError::invalid("`link.attach` needs `peer`, the link peer's machine name"));
     };
     if name.is_empty() || name.len() > PEER_NAME_MAX || name.chars().any(char::is_control) {
         return Err(ApiError::invalid(format!(
@@ -133,20 +129,19 @@ impl Channel {
     }
 }
 
-/// `link.attach`'s params (pure): [`attach_peer`]'s `peer`, and `channel`
-/// when present. With a channel the peer is a fleet member, whose name also
-/// names its fleet root ([`peer_fleet_root`]): it must pass
-/// `machines::check_name`.
-pub fn attach_params(params: &Value) -> Result<(String, Option<Channel>), ApiError> {
+/// `link.attach`'s params (pure): [`attach_peer`]'s `peer` and the
+/// required `channel`. The peer's name also names its fleet root
+/// ([`peer_fleet_root`]): it must pass `machines::check_name`.
+pub fn attach_params(params: &Value) -> Result<(String, Channel), ApiError> {
     let name = attach_peer(params)?;
     let channel = match params.get("channel") {
-        None | Some(Value::Null) => return Ok((name, None)),
+        None | Some(Value::Null) => return Err(ApiError::invalid("`link.attach` needs `channel`")),
         Some(Value::String(s)) => Channel::parse(s)
             .ok_or_else(|| ApiError::invalid(format!("no channel `{s}` (api, pty, tunnel, transfer or agent)")))?,
         Some(_) => return Err(ApiError::invalid("`channel` must be a string")),
     };
     crate::serve::machines::check_name(&name).map_err(|e| ApiError::invalid(format!("`peer`: {e:#}")))?;
-    Ok((name, Some(channel)))
+    Ok((name, channel))
 }
 
 /// A fleet member `peer`'s fleet root under data dir `data`:
@@ -268,8 +263,8 @@ pub const DRAINING: &str = "this member is draining: no new work";
 /// `drain` is the one hard no for new work (pure): a `run` from the
 /// lending link's `peer` (one with a fleet root) while `draining` is
 /// `denied` with [`DRAINING`]; everything else (`start`, `stop`, `rm`,
-/// `rebuild` of what's placed here, any request of an ssh machine's peer)
-/// is left to [`admit`].
+/// `rebuild` of what's placed here, any request of a peer without a fleet
+/// root) is left to [`admit`].
 pub fn refuse_new_work(method: &str, peer: &Peer, draining: bool) -> Result<(), ApiError> {
     if draining && peer.fleet_root.is_some() && method == "run" {
         return Err(ApiError::denied(DRAINING));
@@ -755,17 +750,17 @@ mod tests {
     }
 
     #[test]
-    fn an_attach_may_name_a_channel_and_then_a_machine_name() {
-        assert_eq!(attach_params(&json!({"peer": "lap.local"})).unwrap(), ("lap.local".into(), None));
-        assert_eq!(attach_params(&json!({"peer": "lap", "channel": null})).unwrap(), ("lap".into(), None));
+    fn an_attach_names_a_channel_and_a_machine_name() {
         for c in ["api", "pty", "tunnel", "transfer", "agent"] {
-            let (name, channel) = attach_params(&json!({"peer": "lap", "channel": c})).unwrap();
-            assert_eq!((name.as_str(), channel.map(Channel::as_str)), ("lap", Some(c)));
+            let (name, channel) = attach_params(&json!({"peer": "lap.local", "channel": c})).unwrap();
+            assert_eq!((name.as_str(), channel.as_str()), ("lap.local", c));
         }
         for bad in [
+            json!({"peer": "lap"}),
+            json!({"peer": "lap", "channel": null}),
             json!({"peer": "lap", "channel": "rpc"}),
             json!({"peer": "lap", "channel": 1}),
-            // A hostname is fine without a channel, not as a directory name.
+            // The name names a directory: one plain component.
             json!({"peer": "lap/../x", "channel": "api"}),
             json!({"peer": "..", "channel": "pty"}),
             json!({"peer": "a b", "channel": "transfer"}),
@@ -796,7 +791,7 @@ mod tests {
             assert!(refuse_new_work(m, &lending, true).is_ok(), "{m}");
         }
         assert!(refuse_new_work("run", &lending, false).is_ok());
-        // `drain` is the lending link's: an ssh machine's peer still runs.
+        // `drain` is the lending link's: a peer without a fleet root still runs.
         let ssh = Peer { name: "lap".into(), fleet_root: None, env: None, agent: None };
         assert!(refuse_new_work("run", &ssh, true).is_ok());
     }
@@ -965,13 +960,13 @@ mod tests {
         assert_eq!(code("sandboxes.list", json!({"root": mine.join("nested/..")})), "denied", "`..`");
         // Every instance reached: `all` goes (`own` here, `in` under the fleet root).
         assert!(admit("start", json!({"root": mine, "all": true}), &s, &r, &state).is_ok());
-        // An ssh machine's peer: no fleet root, so `in`'s root is reached as
-        // an own root (it's in `state.toml`), and so is `all`.
+        // A peer without a fleet root: `in`'s root is reached as an own root
+        // (it's in `state.toml`), and so is `all`.
         let ssh = Reach { fleet_root: None, ..r.clone() };
         let own = own_roots(&State::load_at(&state).unwrap(), None);
         let ssh = Reach { own: ssh.own.union(&own).cloned().collect(), ..ssh };
         assert!(admit("stop", json!({"root": root.join("cfg"), "all": true}), &s, &ssh, &state).is_ok());
-        // Its verbs keep the env the relay set (`Peer.env` is `None`).
+        // Without a `Peer.env` its verbs keep the env they sent.
         let attached = Peer { name: "lap".into(), fleet_root: None, env: None, agent: None };
         let sent = json!({"root": mine, "instance": "own", "env": {"SSH_AUTH_SOCK": "/run/agent-machine_lap.sock"}});
         assert_eq!(admit("stop", sent.clone(), &attached, &ssh, &state).unwrap(), sent);

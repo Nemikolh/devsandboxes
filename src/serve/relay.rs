@@ -8,31 +8,17 @@
 //! the protocol check all stay with the client. Only protocol bytes reach
 //! stdout; diagnostics go to stderr.
 //!
-//! The one exception is `--session-env` (docs/architecture/daemon/machines.md,
-//! *ssh*), for a relay a machine link runs over ssh: there the upstream copy
-//! goes line by line and a verb request's `params.env` becomes the relay's
-//! own, the remote login shell's env, since the requester's (another host's)
-//! means nothing here; its `SSH_AUTH_SOCK` is the linking host's agent
-//! relay socket (`endpoint::agent_socket` for `--client`) when that accepts
-//! a connection at the time of the line.
-//! Every other line, and every byte downstream, still passes as is, after
-//! one line of the relay's own ([`write_sentinel`]) so the link can tell the
-//! relay's bytes from whatever the login shell printed first.
-//! Before that line, and before any byte is relayed, such a relay
-//! [`attach`]es its connection: one `link.attach {peer}` request of its own
-//! (`peer`: `--client` without its `machine:` prefix, the linking host),
-//! its one answer read and not relayed, so the daemon serves the rest of
-//! the connection with the trust table (docs/architecture/daemon/fleet.md,
-//! *The trust table*), as it does a fleet hub's lending link.
+//! The one addition is `--sentinel` (docs/architecture/daemon/machines.md,
+//! *ssh*), for `machine add`'s probe over ssh: one line of the relay's own
+//! ([`write_sentinel`]) before the daemon's bytes, so the probe can tell
+//! them from whatever the remote login shell printed first. The
+//! connection is a local client's there (the user's own ssh login).
 //!
 //! Exit: 0 once stdin hits EOF (after the daemon has answered what was in
 //! flight, up to [`GRACE`]) or stdout is gone; [`EXIT_NO_HOST`] (75) when the
 //! daemon closes the connection first (it exited: reconnect, which starts a
-//! new one), the attach's answer included; 1 when the daemon refuses the
-//! attach (retrying the same daemon won't change that; the message, on
-//! stderr, is what the linking host shows).
+//! new one).
 
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::path::Path;
@@ -40,20 +26,19 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
 
 use super::client::{self, Conn};
 use super::endpoint::{self, Stream};
-use super::proto;
 use crate::devsbd::control::{EXIT_NO_HOST, EXIT_OK};
 
 /// How long, after stdin's EOF, the relay waits for the daemon to answer the
 /// requests still in flight and hang up.
 pub const GRACE: Duration = Duration::from_secs(5);
 
-/// The line a `--session-env` relay writes before the daemon's bytes:
-/// `devsandbox-api <SENTINEL_VERSION>`. A machine link (`link::handshake`)
-/// skips everything before it.
+/// The line a `--sentinel` relay writes before the daemon's bytes:
+/// `devsandbox-api <SENTINEL_VERSION>`. The add-time probe
+/// (`machines::link::handshake` with `Over::Ssh`) skips everything before
+/// it.
 pub const SENTINEL: &str = "devsandbox-api";
 
 /// The sentinel's format version, after the word. Bumped only on an
@@ -84,112 +69,21 @@ impl End {
 /// `devsandbox api --stdio`: lazy-start the daemon, then relay until one side
 /// ends. Returns the exit code. `client` names the relay's own probe hello
 /// (`serve.log`); the client's hello goes through the relay untouched.
-/// `session_env`: the connection is [`attach`]ed first, and verbs get this
-/// process's env, with `client`'s agent relay as their agent while it's up
-/// (see the module doc).
-pub fn stdio(client: &str, session_env: bool) -> Result<i32> {
+/// `sentinel`: [`write_sentinel`] first (see the module doc).
+pub fn stdio(client: &str, sentinel: bool) -> Result<i32> {
     let dir = endpoint::socket_dir()?;
     let stream = open(&dir, || client::connect(&dir, client))?;
-    if session_env && let Err(e) = attach(&stream, attach_name(client)) {
-        eprintln!("devsandbox api: {e}");
-        return Ok(e.code());
+    if sentinel {
+        write_sentinel(&mut std::io::stdout()).context("cannot write to stdout")?;
     }
-    write_sentinel(&mut std::io::stdout(), session_env).context("cannot write to stdout")?;
-    let env = session_env.then(|| {
-        let socket = endpoint::agent_socket(&dir, client);
-        let probe = move || {
-            std::os::unix::net::UnixStream::connect(&socket).ok().map(|_| socket.to_string_lossy().into_owned())
-        };
-        SessionEnv::new(super::verbs_client::caller_env(std::env::vars_os()), Box::new(probe))
-    });
-    Ok(pump(std::io::stdin(), std::io::stdout(), stream, GRACE, env)?.code())
+    Ok(pump(std::io::stdin(), std::io::stdout(), stream, GRACE)?.code())
 }
 
-/// With `session_env` (a machine link's relay), the sentinel line, flushed;
-/// else nothing. Its leading newline ends a motd printed without a final
-/// one, so the sentinel always starts a line.
-pub fn write_sentinel(out: &mut impl Write, session_env: bool) -> std::io::Result<()> {
-    if !session_env {
-        return Ok(());
-    }
+/// The sentinel line, flushed. Its leading newline ends a motd printed
+/// without a final one, so the sentinel always starts a line.
+pub fn write_sentinel(out: &mut impl Write) -> std::io::Result<()> {
     write!(out, "\n{SENTINEL} {SENTINEL_VERSION}\n")?;
     out.flush()
-}
-
-/// The `peer` an attach names for relay client `client`: the linking
-/// host's name (`ssh::api_argv` passes `machine:<host>`).
-fn attach_name(client: &str) -> &str {
-    client.strip_prefix("machine:").unwrap_or(client)
-}
-
-/// Why an [`attach`] failed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum AttachError {
-    /// The daemon answered with an error (or something that isn't the
-    /// answer).
-    Refused(String),
-    /// The connection ended (or broke) before the answer.
-    Closed(String),
-}
-
-impl AttachError {
-    pub fn code(&self) -> i32 {
-        match self {
-            AttachError::Refused(_) => 1,
-            AttachError::Closed(_) => EXIT_NO_HOST,
-        }
-    }
-}
-
-impl std::fmt::Display for AttachError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            AttachError::Refused(why) => write!(f, "the daemon refused this link's connection: {why}"),
-            AttachError::Closed(why) => write!(f, "the daemon closed the connection before attaching it: {why}"),
-        }
-    }
-}
-
-/// The request id of the attach: the connection's first line, so no
-/// client id can collide with it.
-const ATTACH_ID: u64 = 0;
-
-/// `link.attach {peer}` on `daemon`, its answer read byte by byte up to
-/// its newline, so nothing after it is taken from what [`pump`] relays.
-/// `Ok` with the trust the daemon reports.
-pub fn attach<S: Read + Write>(mut daemon: S, peer: &str) -> std::result::Result<String, AttachError> {
-    let request = json!({ "id": ATTACH_ID, "method": "link.attach", "params": { "peer": peer } });
-    let closed = |e: std::io::Error| AttachError::Closed(e.to_string());
-    daemon.write_all(format!("{request}\n").as_bytes()).map_err(closed)?;
-    daemon.flush().map_err(closed)?;
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match daemon.read(&mut byte) {
-            Ok(0) => return Err(AttachError::Closed("no answer".into())),
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => line.push(byte[0]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(closed(e)),
-        }
-        if line.len() as u64 > proto::MAX_LINE {
-            return Err(AttachError::Refused("an answer over the line limit".into()));
-        }
-    }
-    let answer: Value = serde_json::from_slice(&line)
-        .map_err(|_| AttachError::Refused(format!("not an answer: {}", String::from_utf8_lossy(&line))))?;
-    if answer.get("method").and_then(Value::as_str) == Some("closing") {
-        return Err(AttachError::Closed("it is exiting".into()));
-    }
-    if answer.get("id").and_then(Value::as_u64) != Some(ATTACH_ID) {
-        return Err(AttachError::Refused(format!("not its answer: {}", String::from_utf8_lossy(&line))));
-    }
-    if let Some(e) = answer.get("error") {
-        let message = e.get("message").and_then(Value::as_str).unwrap_or("no reason given");
-        return Err(AttachError::Refused(message.to_string()));
-    }
-    let trust = answer.get("result").and_then(|r| r.get("trust")).and_then(Value::as_str);
-    Ok(trust.unwrap_or_default().to_string())
 }
 
 /// A fresh connection for the relay, after `probe` (a hello'd connection: the
@@ -214,8 +108,7 @@ enum Event {
 /// After `input`'s EOF the socket's write half is shut, so the daemon answers
 /// what it has and hangs up; that's waited for up to `grace`. The `input`
 /// thread may stay blocked in a read: the caller exits the process.
-/// `session_env`: upstream verb requests go through it.
-pub fn pump<R, W>(input: R, output: W, daemon: Stream, grace: Duration, session_env: Option<SessionEnv>) -> Result<End>
+pub fn pump<R, W>(input: R, output: W, daemon: Stream, grace: Duration) -> Result<End>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -226,10 +119,7 @@ where
     std::thread::Builder::new()
         .name("api-relay-up".into())
         .spawn(move || {
-            let r = match session_env {
-                None => copy(input, &to_daemon),
-                Some(rewrite) => copy_rewriting(input, &to_daemon, rewrite),
-            };
+            let r = copy(input, &to_daemon);
             let eof = r.is_ok();
             // Report before half-closing: once shut, the daemon may answer and
             // hang up before this thread runs again, and a `Down` seen first
@@ -275,107 +165,6 @@ fn copy(mut input: impl Read, mut to: &Stream) -> std::result::Result<(), ()> {
     }
 }
 
-/// [`copy`] through `rewrite`.
-fn copy_rewriting(mut input: impl Read, mut to: &Stream, mut rewrite: SessionEnv) -> std::result::Result<(), ()> {
-    let mut buf = [0u8; 64 * 1024];
-    let mut out = Vec::new();
-    loop {
-        let n = match input.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => 0,
-        };
-        if n == 0 {
-            rewrite.finish(&mut out);
-            return to.write_all(&out).map_err(|_| ());
-        }
-        rewrite.feed(&buf[..n], &mut out);
-        to.write_all(&out).map_err(|_| ())?;
-        out.clear();
-    }
-}
-
-/// The upstream rewrite of `--session-env`, pure over byte chunks: each
-/// complete line that is a verb request (`verbs::is_verb`) has its
-/// `params.env` replaced by `env` and is re-serialized, `SSH_AUTH_SOCK` set
-/// to what `agent` answers for that line (the agent relay socket when it's
-/// up; `None` leaves `env`'s own); every other line
-/// (a non-verb, one that doesn't parse) is passed through byte for byte. A
-/// partial line is held until its newline, or the end, where it goes out as
-/// is. A line over [`proto::MAX_LINE`] isn't held: it goes through as it
-/// comes, unmodified, and the daemon refuses it as it would without the
-/// relay (so a held line never grows past that).
-pub struct SessionEnv {
-    env: Value,
-    agent: Box<dyn Fn() -> Option<String> + Send>,
-    held: Vec<u8>,
-    /// Inside an overlong line: pass bytes through until its newline.
-    passing: bool,
-}
-
-impl SessionEnv {
-    pub fn new(env: BTreeMap<String, String>, agent: Box<dyn Fn() -> Option<String> + Send>) -> Self {
-        Self { env: serde_json::to_value(env).unwrap_or_default(), agent, held: Vec::new(), passing: false }
-    }
-
-    /// `chunk` in, what can go out appended to `out`.
-    pub(crate) fn feed(&mut self, mut chunk: &[u8], out: &mut Vec<u8>) {
-        while !chunk.is_empty() {
-            let newline = chunk.iter().position(|&b| b == b'\n');
-            let (part, rest) = match newline {
-                Some(i) => chunk.split_at(i + 1),
-                None => (chunk, &[][..]),
-            };
-            chunk = rest;
-            if self.passing {
-                out.extend_from_slice(part);
-                self.passing = newline.is_none();
-                continue;
-            }
-            self.held.extend_from_slice(part);
-            if newline.is_some() {
-                let line = std::mem::take(&mut self.held);
-                self.line(line, out);
-            } else if self.held.len() as u64 > proto::MAX_LINE {
-                out.append(&mut self.held);
-                self.passing = true;
-            }
-        }
-    }
-
-    /// The input ended: a held partial line goes out as is.
-    pub(crate) fn finish(&mut self, out: &mut Vec<u8>) {
-        out.append(&mut self.held);
-    }
-
-    fn line(&self, line: Vec<u8>, out: &mut Vec<u8>) {
-        match self.rewritten(&line) {
-            Some(new) => {
-                out.extend_from_slice(&new);
-                out.push(b'\n');
-            }
-            None => out.extend_from_slice(&line),
-        }
-    }
-
-    /// `line` with `params.env` swapped, or `None` to pass it as is.
-    fn rewritten(&self, line: &[u8]) -> Option<Vec<u8>> {
-        let mut request: Value = serde_json::from_slice(line).ok()?;
-        let method = request.get("method")?.as_str()?;
-        if !super::verbs::is_verb(method) {
-            return None;
-        }
-        let params = request.as_object_mut()?.entry("params").or_insert_with(|| Value::Object(Default::default()));
-        let params = params.as_object_mut()?;
-        let mut env = self.env.clone();
-        if let (Some(agent), Some(vars)) = ((self.agent)(), env.as_object_mut()) {
-            vars.insert("SSH_AUTH_SOCK".into(), Value::String(agent));
-        }
-        params.insert("env".into(), env);
-        serde_json::to_vec(&request).ok()
-    }
-}
-
 /// The socket → `output`, flushed per read so a line is never held back.
 /// `Ok` at the socket's EOF (or a read error); `Err` when `output` fails.
 fn copy_down(mut from: &Stream, mut output: impl Write) -> std::result::Result<(), ()> {
@@ -413,7 +202,7 @@ mod tests {
         let (relay_end, daemon_end) = UnixStream::pair().unwrap();
         stdout_r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         daemon_end.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let handle = std::thread::spawn(move || pump(stdin_r, stdout_w, relay_end, Duration::from_secs(2), None));
+        let handle = std::thread::spawn(move || pump(stdin_r, stdout_w, relay_end, Duration::from_secs(2)));
         (stdin_w, BufReader::new(stdout_r), daemon_end, handle)
     }
 
@@ -489,163 +278,11 @@ mod tests {
         assert_eq!(relay.join().unwrap().unwrap(), End::Client);
     }
 
-    fn session_env() -> SessionEnv {
-        SessionEnv::new(BTreeMap::from([("PATH".to_string(), "/remote/bin".to_string())]), Box::new(|| None))
-    }
-
-    fn fed(rw: &mut SessionEnv, chunk: &[u8]) -> Vec<u8> {
+    #[test]
+    fn the_sentinel_is_one_line_of_its_own() {
         let mut out = Vec::new();
-        rw.feed(chunk, &mut out);
-        out
-    }
-
-    #[test]
-    fn session_env_replaces_only_verb_envs() {
-        let mut rw = session_env();
-        let verb = fed(&mut rw, b"{\"id\":3,\"method\":\"stop\",\"params\":{\"instance\":\"w\",\"env\":{\"PATH\":\"/local\",\"X\":\"1\"}}}\n");
-        assert!(verb.ends_with(b"\n"));
-        let v: Value = serde_json::from_slice(&verb).unwrap();
-        assert_eq!(v, json!({"id": 3, "method": "stop", "params": {"instance": "w", "env": {"PATH": "/remote/bin"}}}));
-        // No params at all still gets one (the daemon then says what's missing).
-        let v: Value = serde_json::from_slice(&fed(&mut rw, b"{\"id\":4,\"method\":\"services.rebuild\"}\n")).unwrap();
-        assert_eq!(v["params"], json!({"env": {"PATH": "/remote/bin"}}));
-        // Everything else byte for byte: other methods, odd spacing, junk,
-        // a verb whose params aren't an object, CRLF.
-        for line in [
-            &b"{\"id\":0,\"method\":\"hello\",\"params\":{\"env\":{}}}\n"[..],
-            b"{ \"id\" : 1 , \"method\" : \"instances.list\" }\n",
-            b"not json\n",
-            b"\n",
-            b"{\"id\":5,\"method\":\"run\",\"params\":[1]}\n",
-            b"{\"method\":7}\r\n",
-        ] {
-            assert_eq!(fed(&mut rw, line), line, "{}", String::from_utf8_lossy(line));
-        }
-    }
-
-    /// The agent relay's socket while it's up, checked per line; else the
-    /// login env's own `SSH_AUTH_SOCK` stays.
-    #[test]
-    fn session_env_points_verbs_at_a_live_agent_relay() {
-        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let probe = {
-            let up = std::sync::Arc::clone(&up);
-            move || up.load(std::sync::atomic::Ordering::SeqCst).then(|| "/run/agent-machine_lap.sock".to_string())
-        };
-        let env = BTreeMap::from([("SSH_AUTH_SOCK".to_string(), "/tmp/own-agent".to_string())]);
-        let mut rw = SessionEnv::new(env, Box::new(probe));
-        let verb = b"{\"id\":1,\"method\":\"run\",\"params\":{\"env\":{\"SSH_AUTH_SOCK\":\"/local/agent\"}}}\n";
-        let v: Value = serde_json::from_slice(&fed(&mut rw, verb)).unwrap();
-        assert_eq!(v["params"]["env"], json!({"SSH_AUTH_SOCK": "/run/agent-machine_lap.sock"}));
-        up.store(false, std::sync::atomic::Ordering::SeqCst);
-        let v: Value = serde_json::from_slice(&fed(&mut rw, verb)).unwrap();
-        assert_eq!(v["params"]["env"], json!({"SSH_AUTH_SOCK": "/tmp/own-agent"}), "the login env's, not removed");
-        // Other lines pass as is.
-        up.store(true, std::sync::atomic::Ordering::SeqCst);
-        let other = b"{\"id\":2,\"method\":\"hello\",\"params\":{\"env\":{}}}\n";
-        assert_eq!(fed(&mut rw, other), other);
-    }
-
-    #[test]
-    fn session_env_holds_a_partial_line_until_its_newline() {
-        let mut rw = session_env();
-        assert_eq!(fed(&mut rw, b"{\"id\":1}\n{\"id\":2,\"method\":\"r"), b"{\"id\":1}\n");
-        let v: Value = serde_json::from_slice(&fed(&mut rw, b"m\",\"params\":{\"instance\":\"w\"}}\n{\"id\"")).unwrap();
-        assert_eq!(v["params"]["env"]["PATH"], "/remote/bin");
-        let mut out = Vec::new();
-        rw.finish(&mut out);
-        assert_eq!(out, b"{\"id\"", "a partial line at the end goes out as is");
-    }
-
-    #[test]
-    fn session_env_passes_an_overlong_line_through() {
-        let mut rw = session_env();
-        let big = vec![b'x'; proto::MAX_LINE as usize + 1];
-        assert_eq!(fed(&mut rw, b"{\"method\":\"run\",\"p\":\""), b"");
-        let out = fed(&mut rw, &big);
-        assert_eq!(out.len(), big.len() + 21, "flushed once over the limit");
-        assert_eq!(fed(&mut rw, b"more"), b"more");
-        assert_eq!(fed(&mut rw, b"\"}\n{\"id\":1}\n"), b"\"}\n{\"id\":1}\n", "back to lines after its newline");
-    }
-
-    #[test]
-    fn a_session_env_relay_rewrites_upstream_only() {
-        let (mut stdin, stdin_r) = UnixStream::pair().unwrap();
-        let (stdout_w, stdout_r) = UnixStream::pair().unwrap();
-        let (relay_end, daemon) = UnixStream::pair().unwrap();
-        daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stdout_r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let env = SessionEnv::new(BTreeMap::from([("HOME".to_string(), "/home/remote".to_string())]), Box::new(|| None));
-        let relay = std::thread::spawn(move || pump(stdin_r, stdout_w, relay_end, Duration::from_secs(2), Some(env)));
-        let mut from_relay = BufReader::new(daemon.try_clone().unwrap());
-        stdin.write_all(b"{\"id\":0,\"method\":\"hello\"}\n{\"id\":1,\"method\":\"rm\",\"params\":{\"env\":{}}}\n").unwrap();
-        assert_eq!(line(&mut from_relay), "{\"id\":0,\"method\":\"hello\"}\n");
-        let v: Value = serde_json::from_str(&line(&mut from_relay)).unwrap();
-        assert_eq!(v["params"]["env"], json!({"HOME": "/home/remote"}));
-        // Downstream: a verb-looking line is not touched.
-        let down = b"{\"method\":\"run\",\"params\":{\"env\":{\"A\":\"b\"}}}\n";
-        (&daemon).write_all(down).unwrap();
-        assert_eq!(line(&mut BufReader::new(stdout_r)).as_bytes(), down);
-        stdin.shutdown(Shutdown::Write).unwrap();
-        // The relay's EOF on the daemon side comes after it reported stdin's,
-        // so the hang-up below can't be read as the daemon leaving first.
-        let mut rest = Vec::new();
-        from_relay.read_to_end(&mut rest).unwrap();
-        drop((daemon, from_relay));
-        assert_eq!(relay.join().unwrap().unwrap(), End::Stdin);
-    }
-
-    #[test]
-    fn only_a_session_env_relay_writes_the_sentinel() {
-        let mut out = Vec::new();
-        write_sentinel(&mut out, true).unwrap();
+        write_sentinel(&mut out).unwrap();
         assert_eq!(out, b"\ndevsandbox-api 1\n");
-        let mut out = Vec::new();
-        write_sentinel(&mut out, false).unwrap();
-        assert!(out.is_empty(), "plain --stdio writes only the daemon's bytes");
-    }
-
-    /// The attach over a fake daemon that answers `answer` (then `after`,
-    /// then hangs up): the result, the request it got, what's left to read.
-    fn attached(answer: &[u8], after: &[u8]) -> (std::result::Result<String, AttachError>, Value, Vec<u8>) {
-        let (relay_end, daemon) = UnixStream::pair().unwrap();
-        relay_end.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        (&daemon).write_all(answer).unwrap();
-        (&daemon).write_all(after).unwrap();
-        daemon.shutdown(Shutdown::Write).unwrap();
-        let got = attach(&relay_end, "lap");
-        let request: Value = serde_json::from_str(&line(&mut BufReader::new(&daemon))).unwrap();
-        let mut rest = Vec::new();
-        (&relay_end).read_to_end(&mut rest).unwrap();
-        (got, request, rest)
-    }
-
-    #[test]
-    fn an_attach_reads_its_answer_and_nothing_after() {
-        let (got, request, rest) =
-            attached(b"{\"id\":0,\"result\":{\"ok\":true,\"trust\":\"worker\"}}\n", b"{\"id\":0,\"result\":{\"protocol\":9}}\n");
-        assert_eq!(got.unwrap(), "worker");
-        assert_eq!(request, json!({"id": 0, "method": "link.attach", "params": {"peer": "lap"}}));
-        assert_eq!(rest, b"{\"id\":0,\"result\":{\"protocol\":9}}\n", "the pump's bytes untouched");
-
-        let (got, _, rest) = attached(b"{\"id\":0,\"error\":{\"code\":\"denied\",\"message\":\"nope\"}}\n", b"x");
-        let e = got.unwrap_err();
-        assert_eq!((&e, e.code()), (&AttachError::Refused("nope".into()), 1));
-        assert_eq!(rest, b"x");
-        let e = attached(b"{\"id\":0,\"error\":{\"code\":\"unknown-method\",\"message\":\"no `link.attach`\"}}\n", b"").0.unwrap_err();
-        assert!(e.to_string().contains("refused this link's connection: no `link.attach`"), "{e}");
-
-        // The daemon gone first: 75, as when it hangs up mid-relay.
-        for cut in [&b""[..], b"{\"id\":0,\"res"] {
-            let e = attached(cut, b"").0.unwrap_err();
-            assert!(matches!(e, AttachError::Closed(_)), "{e:?}");
-            assert_eq!(e.code(), EXIT_NO_HOST);
-        }
-        let e = attached(b"{\"method\":\"closing\",\"params\":{\"reason\":\"handoff\"}}\n", b"").0.unwrap_err();
-        assert_eq!(e.code(), EXIT_NO_HOST);
-        assert_eq!(attached(b"junk\n", b"").0.unwrap_err().code(), 1);
-        assert_eq!(attach_name("machine:lap.local"), "lap.local");
-        assert_eq!(attach_name("npm:x"), "npm:x");
     }
 
     #[test]
@@ -661,7 +298,7 @@ mod tests {
         let (mut stdin, stdin_r) = UnixStream::pair().unwrap();
         let (stdout_w, stdout_r) = UnixStream::pair().unwrap();
         stdout_r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let relay = std::thread::spawn(move || pump(stdin_r, stdout_w, stream, GRACE, None));
+        let relay = std::thread::spawn(move || pump(stdin_r, stdout_w, stream, GRACE));
         let mut stdout = BufReader::new(stdout_r);
         let ask = |stdin: &mut UnixStream, stdout: &mut BufReader<UnixStream>, req: Value| {
             stdin.write_all(format!("{req}\n").as_bytes()).unwrap();

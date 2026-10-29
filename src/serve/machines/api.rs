@@ -355,7 +355,7 @@ fn taken(name: &str) -> ApiError {
 /// Dial `entry` and say hello: `failed` with ssh's or the hello's reason.
 fn connect(entry: &Entry, ctx: &Ctx) -> Result<Link, ApiError> {
     let duplex = (ctx.probe)(entry).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
-    link::handshake(&entry.name, duplex, HANDSHAKE_TIMEOUT).map_err(|e| ApiError::failed(e.to_string()))
+    link::handshake(&entry.name, duplex, HANDSHAKE_TIMEOUT, link::Over::Ssh).map_err(|e| ApiError::failed(e.to_string()))
 }
 
 /// One call on `link`; any error answer, or an answer that doesn't parse,
@@ -419,7 +419,7 @@ mod tests {
     fn local_opts(base: &Path, remote: Option<PathBuf>) -> Options {
         let mut o = opts(1, 1500);
         o.machines = Some(base.join("machines.toml"));
-        o.dial = Some(match remote {
+        o.probe = Some(match remote {
             Some(remote) => Arc::new(move |_: &Entry| ssh::test_support::relayed(endpoint::connect(&remote)?)),
             None => Arc::new(|e: &Entry| anyhow::bail!("ssh: Could not resolve hostname {}", e.label())),
         });
@@ -589,8 +589,8 @@ mod tests {
         let dialed: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
         let log = dialed.clone();
         let mut pair = Pair::with("mach-cmd", "0.6.0", move |o| {
-            let inner = o.dial.take().unwrap();
-            o.dial = Some(Arc::new(move |e: &Entry| {
+            let inner = o.probe.take().unwrap();
+            o.probe = Some(Arc::new(move |e: &Entry| {
                 log.lock().unwrap().push(e.command.clone());
                 inner(e)
             }));

@@ -13,7 +13,7 @@ Code: `src/commands/run/mod.rs` (`relay_first`), `src/commands/run/ssh_agent.rs`
 `exec_argv_with`, `AgentRelay`), `src/commands/run/lifecycle.rs`,
 `src/devsbd/bridge.rs` (`host_agent`, `AgentCandidates`, `report_agent`,
 `own_agent`), `devsbd/src/daemon.rs` (`AGENT_SOCK`, `accept_agent_clients`),
-`src/serve/machines/ssh.rs`.
+`src/serve/fleet/agent.rs` (a machine's and a fleet worker's relayed agent).
 
 ## Mode is decided at `run`
 
