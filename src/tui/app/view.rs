@@ -206,10 +206,10 @@ pub struct HelpModal {
 /// failed, what it's doing), `logs --build` has the rest.
 pub const BUILD_LOG_LINES: usize = 500;
 
-/// How often an open build log is re-read while its instance is in flight,
-/// as `logs --build --follow` polls (`commands::logs::FOLLOW_POLL`): the
-/// snapshots it otherwise follows come 2 s or more apart.
-pub const BUILD_LOG_REREAD: std::time::Duration = crate::commands::logs::FOLLOW_POLL;
+/// How long after an answer an open build log is re-read while its
+/// instance is in flight: often enough to read as live (the snapshots it
+/// otherwise follows come 2 s or more apart).
+pub const BUILD_LOG_REREAD: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Lines of container output the logs modal (`l`) shows.
 pub const LOG_LINES: usize = 50;
@@ -749,6 +749,13 @@ impl App {
             }
             None => self.build_log_due = Some(now + BUILD_LOG_REREAD),
         }
+    }
+
+    /// An open build log is being written: the event loop wakes at its
+    /// short cadence, so [`Self::tick_build_log`] and the answers keep pace
+    /// with [`BUILD_LOG_REREAD`].
+    pub fn following_build_log(&self) -> bool {
+        matches!(&self.modal, Modal::BuildLog(view) if view.live)
     }
 
     /// The build log the event loop should ask the daemon for now, by
@@ -1515,6 +1522,7 @@ mod tests {
         app.set_snapshot(recorded(Some(in_flight("building"))));
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('b')));
+        assert!(app.following_build_log());
         assert_eq!(app.take_build_log_read(), Some("id0".into()));
         app.tick_build_log(t0);
         assert_eq!(app.take_build_log_read(), None, "the open read is unanswered");
@@ -1539,6 +1547,7 @@ mod tests {
         app.set_snapshot(recorded(Some(failed("building"))));
         assert_eq!(app.take_build_log_read(), Some("id0".into()));
         app.set_build_log("id0", tail(0..4));
+        assert!(!app.following_build_log());
         app.tick_build_log(t0 + BUILD_LOG_REREAD * 10);
         assert_eq!(app.take_build_log_read(), None);
         // Closed: nothing either.

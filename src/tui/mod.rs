@@ -60,6 +60,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// wake `event::poll`, but child *output* arrives on the reader threads and only
 /// becomes visible on the next draw — a 250ms cadence makes shell echo feel
 /// laggy, so we redraw ~33×/s to keep echo snappy while terminals exist.
+/// Also while a build log is followed, so its re-reads (`BUILD_LOG_REREAD`)
+/// are asked and shown on time.
 const TERM_POLL_INTERVAL: Duration = Duration::from_millis(30);
 /// Process-refresh cadence for expanded instances (the snapshot is pushed).
 const PROC_TICK: Duration = Duration::from_secs(5);
@@ -254,8 +256,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             app.status = Some(format!("copied from {title}"));
         }
 
-        // Shorter cadence while terminals are open so shell echo stays snappy.
-        let poll = if app.terms.is_empty() {
+        // Shorter cadence while terminals are open so shell echo stays
+        // snappy, and while a build log is followed.
+        let poll = if app.terms.is_empty() && !app.following_build_log() {
             POLL_INTERVAL
         } else {
             TERM_POLL_INTERVAL
