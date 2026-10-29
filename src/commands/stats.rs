@@ -22,8 +22,8 @@ pub(crate) fn rows(mut rows: Vec<StatsRow>) -> Vec<StatsRow> {
 }
 
 /// What `stats` prints for `rows`: the `--json` envelope (one line ending),
-/// or the table. Shared with the run on an offered machine
-/// (`machines::cli::offered`).
+/// or the table. Shared with the run on a machine
+/// (`machines::cli::calls`).
 pub(crate) fn render(rows: Vec<StatsRow>, json: bool) -> Result<String> {
     if json {
         let out = serde_json::to_string_pretty(&Envelope::new(rows)).context("serialize stats")?;

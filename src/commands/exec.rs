@@ -294,14 +294,16 @@ fn session_for(helper: bool, tty: bool, requested: Option<&str>, mint: impl FnOn
 /// The in-container command that creates session `id` running `command` and
 /// attaches to it (an `id` already live attaches instead). No `--cwd`: the
 /// supervisor starts in the client's cwd and env, which the runtime exec's
-/// `-w`/`-u`/`-e` set as for a plain exec.
-fn session_new_command(id: &str, command: &[String]) -> Vec<String> {
+/// `-w`/`-u`/`-e` set as for a plain exec. Also a machine's piped
+/// `exec --session` (`machines::cli::pipe_mode`).
+pub(crate) fn session_new_command(id: &str, command: &[String]) -> Vec<String> {
     let head = [crate::devsbd::BIN, "session", "new", "--id", id, "--"];
     head.iter().map(|s| s.to_string()).chain(command.iter().cloned()).collect()
 }
 
-/// The in-container command attaching to session `id`.
-fn session_attach_command(id: &str) -> Vec<String> {
+/// The in-container command attaching to session `id` (also a machine's
+/// piped `exec --attach`: `machines::cli::attach_mode`).
+pub(crate) fn session_attach_command(id: &str) -> Vec<String> {
     [crate::devsbd::BIN, "session", "attach", id].iter().map(|s| s.to_string()).collect()
 }
 

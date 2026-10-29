@@ -40,8 +40,8 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `fleet_pty_socket`, `fleet_tunnel_socket`, `fleet_channel_socket`,
 `accept_any`),
 `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`, `exit_of`,
-`Terminal`, `attach`, `dial`), `src/serve/machines/cli.rs` (`Dials`,
-`dials`, `run_dials`, `offered_session_exec`), `src/daemon_config.rs`
+`Terminal`, `attach`, `dial`), `src/serve/machines/cli.rs` (`dials`,
+`reconnect_loop`, `session_exec`, `pipe_mode`), `src/daemon_config.rs`
 (`ServeConfig::hub`), `src/serve/machines/service.rs` (`Hub`,
 `save_loop`, `log_failure`), `src/serve/machines/saved.rs` (`Saved`,
 `of`, `machines`, `load`, `save`, `save_wait`), `src/serve/snapshots.rs`
@@ -532,7 +532,9 @@ link's `API` streams.
   (and its `--attach`, `--sessions`) and the dashboard's instance tabs,
   which run that `exec` locally, are `PTY` streams from the hub
   ([PTY](#pty), *The hub's end*); so is an `exec` without a tty, as a
-  piped `PTY` stream ([PTY](#pty), *Pipe mode*).
+  piped `PTY` stream ([PTY](#pty), *Pipe mode*). The CLI's `exec` takes
+  the same streams on an ssh machine's peer link; its dashboard tabs
+  still run their own ssh there.
 - **Port forwards** go over the link: the daemon's forwards into an
   offered machine (`forwards.add` with `machine`) and a `devsandbox port`
   on one are `TUNNEL` streams from the hub ([TUNNEL](#tunnel), *The hub's
@@ -542,22 +544,22 @@ link's `API` streams.
   hub's agent reaches every instance on the worker as `AGENT` streams
   ([AGENT](#agent)), as an ssh machine's link carries this host's
   agent to that machine ([machines](machines.md#agent)).
-- **The CLI's other re-runs** are API calls with `machine` (fleet plan
-  decision 15): `logs` (`containers.logs`), `logs --build`
+- **The CLI's other commands on a machine** are API calls with `machine`
+  (fleet plan decision 15), on any machine (an ssh one's over its peer
+  link, so within its trust too): `logs` (`containers.logs`), `logs --build`
   (`instances.buildLog`; `--follow`, its pages by `offset`), `inspect` (`containers.inspect`), `done` /
   `undone` (`instances.done`), `rename` (`instances.rename`), `--machine
   m ls` / `status --json` (`instances.list` per config root under the
   fleet root; `service ls` too, its service rows), `--machine m ps` (`containers.list`) and `stats`
   (`containers.stats`), printed as the local commands print them
-  ([machines](machines.md#the-cli-clirs), `machines::cli::offered`).
+  ([machines](machines.md#the-cli-clirs), `machines::cli::calls`).
   `--machine m gc [--force]` is the `gc` verb per config root
-  (`verbs_client`'s `CliVerb::Gc`), which the worker runs under `full`
+  (`verbs_client`'s `CliVerb::Gc`), which the machine runs under `full`
   trust only: under `worker` its refusal is the error. The
   dashboard's logs and inspect views go through the same quick calls.
 - **What has no link form yet** is refused, each in its own words:
-  `vscode` (`cli::offered::refusal`), a session `exec` without a tty
-  (`--attach` off a terminal, `--session` without `-t`: a session over
-  the link needs one), and the dashboard's service tabs
+  `vscode` (`cli::calls::refusal`, on any machine) and the dashboard's
+  service tabs
   (`tui::remote::service_argv`: service terminals aren't supported over
   the fleet link). No ssh argv is built for an offered entry:
   `machines::ssh`'s `argv_with` takes `Entry::ssh_target`, an error for one
@@ -1417,8 +1419,8 @@ above; the session list and removal go through the helper's
 `session.ls` / `session.rm`.
 
 **The hub's end** (`fleet::pty_client`) is a CLI process on the hub, not
-its daemon: a tty `exec` on the offered machine
-([machines](machines.md#the-cli-clirs), `cli::Dials::Pty`), or the
+its daemon: a tty `exec` on the machine
+([machines](machines.md#the-cli-clirs), `cli::dials`), or the
 dashboard tab that runs one. Each dial (`pty_client::dial`) connects to
 the worker's `fleet-<name>.pty.sock` in this user's socket dir (absent:
 the link is down), sends the header (`pty_client::header`: the root and

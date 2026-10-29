@@ -701,7 +701,7 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
 }
 
 /// What `service ls` prints of `rows` (one `print!`), shared with the re-run
-/// on an offered machine (`machines::cli::offered`): `--json` mirrors `ls
+/// on a machine (`machines::cli::calls`): `--json` mirrors `ls
 /// --json` (the `ServiceRow`s the TUI has, `data: []` when none), else the
 /// table, or a line naming `config_file` when there are no services.
 pub(crate) fn ls_render(rows: &[crate::snapshot::ServiceRow], json: bool, config_file: &Path) -> Result<String> {

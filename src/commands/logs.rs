@@ -8,7 +8,7 @@ use crate::runtime::backend;
 use crate::state::{PhaseView, State};
 
 /// How often `--follow` checks for new output and whether the build ended
-/// (the offered-machine follow too: `machines::cli::offered`).
+/// (a machine's follow too: `machines::cli::calls`).
 pub(crate) const FOLLOW_POLL: Duration = Duration::from_millis(500);
 
 /// Print the last `lines` lines of a container's stdout+stderr. Mirrors the
@@ -23,7 +23,7 @@ pub fn logs(name: &str, lines: usize) -> Result<()> {
 }
 
 /// What `logs` prints of a container's output `out` (one `println` of it),
-/// shared with the re-run on an offered machine (`machines::cli::offered`).
+/// shared with the re-run on a machine (`machines::cli::calls`).
 pub(crate) fn render_logs(out: &str) -> &str {
     if out.trim().is_empty() { "(no log output)" } else { out }
 }

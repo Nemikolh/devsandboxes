@@ -56,8 +56,8 @@ fn set(state: &mut State, key: &str, done: bool, now: u64) -> Result<(bool, Stri
 }
 
 /// The status line of setting (`done`) or clearing `key`'s flag when it
-/// `was` set, shared with the re-run on an offered machine
-/// (`machines::cli::offered`, which reads `was` from the machine's rows).
+/// `was` set, shared with the re-run on a machine
+/// (`machines::cli::calls`, which reads `was` from the machine's rows).
 pub(crate) fn status_line(key: &str, done: bool, was: bool) -> String {
     match (done, was) {
         (true, true) => format!("`{key}` is already done"),

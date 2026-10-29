@@ -428,6 +428,11 @@ pub(crate) mod tests {
 
     impl Pair {
         fn new(tag: &str, k_entries: Vec<Entry>, l: impl FnOnce(&mut Options)) -> Pair {
+            Pair::with(tag, k_entries, |_| {}, l)
+        }
+
+        /// [`Pair::new`], K's options set by `k` too.
+        fn with(tag: &str, k_entries: Vec<Entry>, k: impl FnOnce(&mut Options), l: impl FnOnce(&mut Options)) -> Pair {
             let base = scratch(tag);
             let (k_dir, l_dir) = (base.join("k"), base.join("l"));
             let k_own = base.join("k-own");
@@ -445,6 +450,7 @@ pub(crate) mod tests {
             .unwrap();
             crate::serve::machines::update(&k_data.join("machines.toml"), |e| e.extend(k_entries)).unwrap();
             k_opts.join = Some(k_join());
+            k(&mut k_opts);
             let (mut l_opts, l_data) = daemon_opts(&base, "l");
             std::fs::write(l_data.join("member.toml"), "name = \"lap\"\n").unwrap();
             let l_registry = l_data.join("machines.toml");
@@ -531,6 +537,66 @@ pub(crate) mod tests {
         pair.dialed.cut();
         pair.wait_box("box redialed", |r| connected(r) && pair.dialed.count.load(Ordering::SeqCst) == 2);
         drop((k.call("machines.list", Value::Null), l));
+        pair.finish();
+    }
+
+    /// K's `PTY` exec: the instance argv's first word run by `sh -c`.
+    fn sh(t: &crate::serve::fleet::pty::Target) -> Vec<String> {
+        let crate::serve::fleet::pty::Target::Instance { argv, .. } = t else { panic!("not an instance exec") };
+        vec!["sh".into(), "-c".into(), argv[0].clone()]
+    }
+
+    /// The CLI's re-runs on ssh machine `box` go over its link, under K's
+    /// trust for `lap` (K's own root admitted, nothing else): `--machine
+    /// box ls` and `done box/web-1` as API calls (`cli::calls`), a piped
+    /// `exec box/web-1 -- …` one `PTY` dial through `fleet-box.pty.sock`
+    /// ending in the command's exit code; a root K doesn't admit is K's
+    /// refusal.
+    #[test]
+    fn cli_re_runs_on_an_ssh_machine_go_over_its_link() {
+        use clap::Parser;
+
+        use crate::serve::fleet::pty_client;
+        use crate::serve::machines::cli::{self, calls};
+        let pair = Pair::with(
+            "dial-cli",
+            Vec::new(),
+            |k| {
+                k.helper = Some(crate::serve::helper::HelperClient::new(crate::serve::helper::tests::Fake::default(), |_| {}));
+                k.pty_exec = Some(sh);
+            },
+            |_| {},
+        );
+        pair.wait_box("box connected", connected);
+        std::fs::write(pair.k_own.join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"node\"\n").unwrap();
+        let mut l = connect(&pair.l_dir);
+        let mut call = |m: &str, p: Value| l.call(m, p);
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = calls::per_root(&mut call, &calls::Use::Ls { json: false }, "box", &[pair.k_own.clone()], &mut out, &mut err).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(err).unwrap(), format!("{}\n", cli::banner("box", &pair.k_own)));
+        let line = crate::commands::ls::Line { name: "web".into(), source: "image node".into(), folder: None, services: None, extends: None };
+        assert_eq!(String::from_utf8(out).unwrap(), crate::commands::ls::table(&[line]));
+        let mut out = Vec::new();
+        calls::named(&mut call, &calls::Use::Done(true), "box", "web-1", &pair.k_own, false, &mut out, &mut Vec::new()).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", crate::commands::done::status_line("web-1", true, false)));
+        let k_state = std::fs::read_to_string(pair.base.join("k-data/state.toml")).unwrap();
+        assert!(k_state.contains("done"), "{k_state}");
+        let e = calls::per_root(&mut call, &calls::Use::Ls { json: false }, "box", &[pair.base.clone()], &mut Vec::new(), &mut Vec::new());
+        let e = e.unwrap_err().to_string();
+        assert!(e.starts_with("machine `box`: ") && e.contains("isn't one of this member's roots"), "K's trust refuses what isn't its own: {e}");
+
+        // A piped exec, as `cli::pipe_mode` makes it of the typed command.
+        let typed = crate::Cli::try_parse_from(["devsandbox", "exec", "box/web-1", "--", "echo out; echo err >&2; exit 3"]).unwrap();
+        let mode = cli::pipe_mode(typed.command.as_ref().unwrap(), false).unwrap().unwrap();
+        let request = pty_client::Request { root: pair.k_own.clone(), instance: "web-1".into(), mode };
+        let stream = endpoint::Stream::connect(endpoint::fleet_pty_socket(&pair.l_dir, "box")).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let term = pty_client::Terminal { input: None, output: &mut out, errors: &mut err, size: &|| None };
+        let end = pty_client::attach(stream, &pty_client::header(&request), term);
+        assert_eq!((pty_client::exit_of(&end, false).0, out, err), (3, b"out\n".to_vec(), b"err\n".to_vec()));
+        drop(l);
         pair.finish();
     }
 

@@ -63,7 +63,7 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
 }
 
 /// `ls --json`'s document for `rows` (one `println` of it), shared with the
-/// re-run on an offered machine (`machines::cli::offered`).
+/// re-run on a machine (`machines::cli::calls`).
 pub(crate) fn render_json(rows: &[crate::snapshot::SandboxRow]) -> Result<String> {
     serde_json::to_string_pretty(&Envelope::new(rows)).context("serialize sandboxes")
 }
@@ -84,7 +84,7 @@ pub(crate) struct Line {
 }
 
 impl Line {
-    /// The line of a snapshot's sandbox row: what the re-run on an offered
+    /// The line of a snapshot's sandbox row: what the re-run on a
     /// machine has instead of the config (`source`, the `, `-joined
     /// services and `extends`, as [`ls`] builds them).
     pub(crate) fn of_row(row: &crate::snapshot::SandboxRow) -> Line {

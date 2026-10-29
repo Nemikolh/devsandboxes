@@ -135,8 +135,8 @@ pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     argv(entry, &["-T", "-o", "BatchMode=yes"], &args)
 }
 
-/// The argv of an interactive command on `entry` (a terminal tab, a CLI
-/// re-run): `ssh -t [-p N] -- <host> <devsandbox remote_args…>`. No
+/// The argv of an interactive command on `entry` (a dashboard terminal
+/// tab): `ssh -t [-p N] -- <host> <devsandbox remote_args…>`. No
 /// `BatchMode`: a person is there to answer ssh's prompts. No `-A`: the
 /// agent, for a machine with `agent` on, is this host's over the machine's
 /// link (`AGENT`, `fleet::dialer`).
@@ -144,11 +144,12 @@ pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<Os
     cli_argv(entry, true, remote_args)
 }
 
-/// The argv of a CLI command re-run on `entry`
-/// (docs/architecture/daemon/machines.md, *The CLI: `cli.rs`*):
-/// [`tty_argv`]'s, but `-T` when this process isn't on a terminal
-/// (`devsandbox exec m/x -- cat f > out` must get the bytes, not a pty's
-/// CRLFs). No `BatchMode`: a person is there. No `-A`, as for [`tty_argv`].
+/// The argv of a CLI command run on `entry` over ssh (`machine add`'s
+/// `machine roots add` there, `commands::machine`; the CLI's other commands
+/// on a machine go over its link, docs/architecture/daemon/machines.md,
+/// *The CLI: `cli.rs`*): [`tty_argv`]'s, but `-T` when `tty` is off (piped
+/// bytes must stay bytes, not a pty's CRLFs). No `BatchMode`: a person is
+/// there. No `-A`, as for [`tty_argv`].
 pub fn cli_argv(entry: &Entry, tty: bool, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     argv(entry, &[if tty { "-t" } else { "-T" }], remote_args)
 }

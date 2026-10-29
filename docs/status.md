@@ -37,10 +37,11 @@ limitation means editing this file in the same commit.
   re-placement: from fleet step 8 on. Steps 1-7 shipped: ssh machines are
   held over one peer link per pair (`fleet-link --peer` there, this host
   an inbound neighbor in its `machines.list`), every machine reached at
-  its `fleet-<name>.*.sock`; still two kinds of machine (offered workers
-  lend over `fleet join`), and ssh machines' per-use ssh commands
-  (terminals, CLI re-runs, forwards) bypass the link until step 8 moves
-  them onto its channels and drops lending.
+  its `fleet-<name>.*.sock`, the CLI's commands on any machine over its
+  channels (8a); still two kinds of machine (offered workers lend over
+  `fleet join`), and ssh machines' dashboard terminals, forwards and
+  `port` run their own ssh until the rest of step 8 moves them onto the
+  channels and drops lending.
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -284,19 +285,21 @@ limitation means editing this file in the same commit.
 - The npm client's `forwards.list(dir)` can't pass `machines` (the typed
   `call('forwards.list', {machines: true})` can).
   → [api](reference/api.md#forwards); `npm/devsandboxes/index.js`
-- `logs --build --follow` on an offered worker's instance reads the
-  worker's `build.log` by path, page by page: a new build rotating it
-  mid-follow isn't followed into `build.1.log` as a local follow (which
-  keeps the file open) would. → [api](reference/api.md#instancesbuildlog); `build_log::page_in`
-- A session `exec` without a tty (`--attach` off a terminal, `--session`
-  without `-t`) on an offered worker's instance is refused: a session over
-  the link needs a terminal. → [fleet](architecture/daemon/fleet.md#pty); `machines::cli::offered::Refused::SessionNoTty`
-- `inspect` on an offered worker's instance prints no browser sandbox
-  line (it comes from this host's record).
-  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::named`
+- `logs --build --follow` on a machine's instance reads the machine's
+  `build.log` by path, page by page: a new build rotating it mid-follow
+  isn't followed into `build.1.log` as a local follow (which keeps the
+  file open) would. → [api](reference/api.md#instancesbuildlog); `build_log::page_in`
+- `inspect` on a machine's instance prints no browser sandbox line on
+  stderr (it comes from the instance's record, which no API call
+  carries).
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::calls::named`
+- A piped `exec --session <id>` on a machine's instance without a helper
+  fails (its argv is the helper's session client) where a local one runs
+  as a plain exec.
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::pipe_mode`
 - `--machine <offered worker> ls` lists only the config roots its
   instances name (placed configs without an instance left don't show).
-  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::config_roots`
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::calls::config_roots`
 - Terminals on an offered worker's instances without a helper, or whose
   helper daemon isn't root (`session.attach` is `needs_root`, e.g.
   `containerUser`), and service terminals there are a plain `exec -it`
@@ -323,11 +326,11 @@ limitation means editing this file in the same commit.
   Inbox and desktop.
   → [fleet](architecture/daemon/fleet.md#worker-policy); `inbox::decide`
 - Every stream of an ssh machine's link goes through its trust table
-  (`link.attach`), but the per-use ssh commands (`ssh::tty_argv` for
-  terminals, `cli_argv` for CLI re-runs and `--machine` `ps` / `ls` /
-  `stats` / `gc` / `service ls`, `tunnel_argv` for forwards) are still
-  plain ssh shells on the machine, whatever its `trust`, until every use
-  goes over the link's channels (fleet step 8).
+  (`link.attach`), the CLI's commands there included, but the dashboard's
+  per-use ssh commands (`ssh::tty_argv` for terminal tabs) and the
+  forwards' (`tunnel_argv`, the daemon's and `devsandbox port`'s) are
+  still plain ssh shells on the machine, whatever its `trust`, until they
+  go over the link's channels (fleet step 8b).
   → [machines](architecture/daemon/machines.md#ssh); `serve::machines::ssh`
 - A machine added before `machine add` recorded its roots there has none
   in its `member.toml`, so its `worker` trust refuses those of its roots

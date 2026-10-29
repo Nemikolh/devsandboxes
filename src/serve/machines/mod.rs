@@ -162,7 +162,7 @@ impl Entry {
 /// Why an ssh argv can't be built for an offered machine: it has no ssh
 /// target. A backstop: what reaches an offered machine goes over its fleet
 /// link (API calls, `PTY`, `TUNNEL`, `AGENT`), and each path that has no
-/// link form refuses first with its own words (`cli::offered::refusal`,
+/// link form refuses first with its own words (`cli::calls::refusal`,
 /// `tui::remote::service_argv`).
 pub fn offered_refusal(name: &str) -> anyhow::Error {
     anyhow::anyhow!(

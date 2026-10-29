@@ -170,6 +170,9 @@ pub struct Options {
     /// with; `None` is `bridge::host_agent` (the machines' agent relays'
     /// provider). Tests inject one.
     pub host_agent: Option<HostAgent>,
+    /// The argv a peer's `PTY` stream runs for a piped or tty exec; `None`
+    /// is the runtime's `exec` (`fleet::pty::runtime_exec`). Tests run `sh`.
+    pub pty_exec: Option<fleet::pty::ExecCommand>,
 }
 
 /// [`Options::host_agent`].
@@ -204,6 +207,7 @@ impl Options {
             local_capacity: None,
             repos: None,
             host_agent: None,
+            pty_exec: None,
         }
     }
 }
@@ -321,6 +325,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     shared.hub = opts.hub;
     if let Some(agent) = &opts.host_agent {
         shared.host_agent = Arc::clone(agent);
+    }
+    if let Some(exec) = opts.pty_exec {
+        shared.pty_exec = exec;
     }
     shared.machines = Some(machines::api::Ctx {
         registry: registry_path,
@@ -652,6 +659,8 @@ struct Shared {
     local_capacity: Option<LocalCapacity>,
     /// [`Options::host_agent`], resolved.
     host_agent: HostAgent,
+    /// [`Options::pty_exec`], resolved.
+    pty_exec: fleet::pty::ExecCommand,
     /// This host's capacity on demand; the host poll keeps its running
     /// count.
     host_capacity: Arc<super::capacity::HostCapacity>,
@@ -696,6 +705,7 @@ impl Shared {
             socket_dir: PathBuf::new(),
             local_capacity: None,
             host_agent: Arc::new(crate::devsbd::bridge::host_agent),
+            pty_exec: fleet::pty::runtime_exec,
             host_capacity: Arc::new(super::capacity::HostCapacity::new(Arc::new(|| crate::runtime::backend().engine_info()))),
             repos: None,
             peer_env: BTreeMap::new(),
@@ -812,9 +822,9 @@ impl Shared {
             }
             lent::Channel::Pty => {
                 let Some(helper) = self.helper.get().cloned() else { return false };
-                let files = self.reach_files();
+                let (files, exec) = (self.reach_files(), self.pty_exec);
                 self.spawn_channel("serve-pty", move || {
-                    fleet::pty::serve(stream, &helper, &files, &peer, crate::commands::exec::has_host_agent, fleet::pty::runtime_exec, log)
+                    fleet::pty::serve(stream, &helper, &files, &peer, crate::commands::exec::has_host_agent, exec, log)
                 })
             }
             lent::Channel::Tunnel => {
@@ -2185,6 +2195,7 @@ pub(crate) mod tests {
             repos: Some(std::env::temp_dir().join(format!("dsv-repos-{}", std::process::id()))),
             // Never the user's agent.
             host_agent: Some(Arc::new(|| None)),
+            pty_exec: None,
         }
     }
 

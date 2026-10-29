@@ -34,7 +34,7 @@ pub fn status(dir: &Path) -> Result<()> {
 }
 
 /// `status --json`'s document for `snapshot` (one `println` of it), shared
-/// with the re-run on an offered machine (`machines::cli::offered`).
+/// with the re-run on a machine (`machines::cli::calls`).
 pub(crate) fn render(snapshot: &crate::snapshot::Snapshot) -> Result<String> {
     serde_json::to_string_pretty(&Envelope::new(snapshot)).context("serialize snapshot")
 }

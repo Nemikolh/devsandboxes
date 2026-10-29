@@ -35,8 +35,8 @@ pub fn rename(name: &str, new_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `rename`'s line, shared with the re-run on an offered machine
-/// (`machines::cli::offered`).
+/// `rename`'s line, shared with the re-run on a machine
+/// (`machines::cli::calls`).
 pub(crate) fn renamed_line(name: &str, new_name: &str) -> String {
     format!("renamed {name} -> {new_name}")
 }

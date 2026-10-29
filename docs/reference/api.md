@@ -1042,8 +1042,9 @@ offered = true                     # a fleet worker that dialed this host: no ta
 A machine's `kind` is `ssh` (it has a `target`) or `offered` (a fleet
 worker reached over its own link, `fleet.offer`; nothing here sshes to
 it: quick calls and verbs go over that link, as do terminals, forwards
-and the agent, and the CLI's re-runs there are quick calls, see
-[machines](../architecture/daemon/machines.md#the-cli-clirs)).
+and the agent). On either kind the CLI's commands are quick calls, verbs
+and `PTY` streams over the machine's link, see
+[machines](../architecture/daemon/machines.md#the-cli-clirs).
 
 A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-` (never
 `/` or `@`, so the CLI's `my-server/web-2` and `@/web-2` are unambiguous).
@@ -1127,9 +1128,9 @@ snapshot's `machines`) and decides whether the daemon answers the
 machine's `AGENT` streams with its agent (*Transport*).
 
 `get`'s `agent`, when given, is reported as the caller's agent, like a
-verb's `env.SSH_AUTH_SOCK` (*Bridges*): the CLI passes it before
-re-running a command on the machine over its own ssh, so the agent the
-machine reaches meanwhile is that terminal's. Adding a machine means trusting it: its socket is as
+verb's `env.SSH_AUTH_SOCK` (*Bridges*): the CLI passes it before running
+a command on the machine (its calls and `PTY` streams over the machine's
+link), so the agent the machine reaches meanwhile is that terminal's. Adding a machine means trusting it: its socket is as
 powerful as `docker.sock`, and with `agent` on your agent is reachable
 there.
 

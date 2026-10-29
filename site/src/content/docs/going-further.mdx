@@ -115,11 +115,11 @@ Sandboxes can also live on a server you reach over ssh. Register it once (`machi
 ```bash
 devsandbox machine add me@my-server   # pick its config roots
 devsandbox run api                    # defined only there: runs there, prints my-server/api
-devsandbox exec api pnpm test         # over ssh, in the instance there
+devsandbox exec api pnpm test         # in the instance there
 devsandbox stop my-server/web         # qualified, when `web` exists here too
 ```
 
-An interactive `exec` there reconnects by itself when ssh drops (`connection lost, reconnecting… (Ctrl-C to stop)`), back into the same session. See [Other machines](/docs/host-daemon#other-machines) for what runs where.
+An interactive `exec` there reconnects by itself when the connection drops (`connection lost, reconnecting… (Ctrl-C to stop)`), back into the same session. See [Other machines](/docs/host-daemon#other-machines) for what runs where.
 
 ## Clean up
 

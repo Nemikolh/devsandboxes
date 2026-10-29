@@ -1,38 +1,37 @@
 //! The CLI side of machines (docs/architecture/daemon/machines.md, *The CLI:
-//! `cli.rs`*): where a command's `<name>` points, and the commands that don't
-//! go through the daemon (`logs`, `exec`, `inspect`, `done`, `rename`, …)
-//! re-run over ssh when it points at a machine, as do the nameless ones given
-//! `--machine`.
+//! `cli.rs`*): where a command's `<name>` points, and how the commands that
+//! don't go through the daemon as verbs (`logs`, `exec`, `inspect`, `done`,
+//! `rename`, …) run when it points at a machine, as do the nameless ones
+//! given `--machine`: over the machine's link (`fleet-<name>.*.sock`), so
+//! within its trust (fleet plan decision 15), never a `devsandbox …` run
+//! there.
 //!
-//! The verbs (`run`, `rebuild`, …) resolve in `verbs_client` instead, from
-//! the same pieces ([`resolve_params`], [`found_of`], [`choose`]); [`route`]
-//! only checks their names here.
+//! The verbs (`run`, `rebuild`, …, `gc`) resolve in `verbs_client` instead,
+//! from the same pieces ([`resolve_params`], [`found_of`], [`choose`]);
+//! [`route`] only checks their names here.
 //!
-//! The decisions are pure ([`plan`], [`machine_use`], [`remote_args`],
-//! [`per_root`], [`info_params`]); [`route`] does the I/O: the daemon
-//! lookups, then an `exec` of ssh (or a spawn per root). The lookup
-//! (`machines.get`) passes this process's `SSH_AUTH_SOCK`, so the agent the
-//! daemon answers the machine's `AGENT` streams with is this terminal's
-//! while the command runs there (the machine's link is always up; ssh has
-//! no `-A`).
+//! The decisions are pure ([`plan`], [`machine_use`], [`root_banners`],
+//! [`info_params`], the exec modes); [`route`] does the I/O: the daemon
+//! lookups, then API calls through the daemon ([`calls`]) or `PTY` dials
+//! from this process (`fleet::pty_client`). The lookup (`machines.get`)
+//! passes this process's `SSH_AUTH_SOCK`, so the agent the daemon answers
+//! the machine's `AGENT` streams with is this terminal's while the command
+//! runs there.
 //!
-//! A tty `exec` on a machine is spawned too, in a loop: it runs in a helper
-//! session this process names ([`reconnect_session`]), and a lost connection
-//! (ssh's 255) re-dials an attach to it ([`Reconnect`], [`session_dials`]).
-//! On an offered fleet worker (no ssh to it) the dials are `PTY` streams
-//! over its fleet link from this process (`fleet::pty_client`, [`Dials`]),
-//! in the same loop; its `--attach` and `--sessions` too (the session list
-//! a `sessions.list` quick call). An `exec --service` there is one service
-//! `PTY` dial ([`service_mode`]), never re-dialed. Its other re-runs are
-//! API calls through the daemon, or refused ([`offered`]).
+//! A tty `exec` on a machine runs in a helper session this process names
+//! ([`reconnect_session`]), in a loop: a lost link (the dial's 255) re-dials
+//! an attach to it ([`Reconnect`], [`dials`]). Its `--attach` is one dial,
+//! `--sessions` a `sessions.list` quick call. An exec without a tty is one
+//! piped dial ([`pipe_mode`]; a session one, `--attach` or `--session`,
+//! runs the helper's session client piped, as a local `exec` does), an
+//! `exec --service` one service dial ([`service_mode`]); neither is
+//! re-dialed.
 
-mod offered;
+pub(crate) mod calls;
 
-pub(crate) use offered::config_roots;
+pub(crate) use calls::config_roots;
 
-use std::ffi::OsString;
 use std::io::IsTerminal;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -40,7 +39,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use super::api::MachineInfo;
-use super::{Entry, Where, check_name, no_machine, parse_name, ssh};
+use super::{Entry, Where, check_name, no_machine, parse_name};
 use crate::serve::api::{Found, Resolved};
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
@@ -50,12 +49,10 @@ use crate::{Command, ServiceCommand};
 /// What `--machine` does with a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MachineUse {
-    /// Over ssh once, with these args (`ps`, `stats`).
-    Once(Vec<String>),
-    /// Over ssh once per registered root, `-C <root>` first. `json`: its
-    /// output is one document, so several roots can't be concatenated.
-    PerRoot { args: Vec<String>, json: bool },
-    /// A daemon verb (`stop/start/rebuild --all`, `service rebuild`):
+    /// API calls through the daemon (`ps`, `stats`, and per registered
+    /// root `ls`, `status`, `service ls`): [`calls::use_of`] says which.
+    Calls,
+    /// A daemon verb (`stop/start/rebuild --all`, `service rebuild`, `gc`):
     /// `verbs_client` forwards it.
     Verb,
     /// `port --service <global-svc>` with no instance name: forwarded here
@@ -67,28 +64,16 @@ pub(crate) enum MachineUse {
     Refused(&'static str),
 }
 
-fn flag(on: bool, name: &str) -> Option<String> {
-    on.then(|| name.to_string())
-}
-
-fn args(fixed: &[&str], flags: impl IntoIterator<Item = Option<String>>) -> Vec<String> {
-    fixed.iter().map(|s| s.to_string()).chain(flags.into_iter().flatten()).collect()
-}
-
-/// `--machine`'s use for `command` (`None`: the dashboard). The remote args
-/// are rebuilt from the parsed command, never edited out of our argv.
+/// `--machine`'s use for `command` (`None`: the dashboard).
 pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
     let Some(command) = command else { return MachineUse::Refused("the dashboard") };
     match command {
-        Command::Ps { all, json } => MachineUse::Once(args(&["ps"], [flag(*all, "--all"), flag(*json, "--json")])),
-        Command::Stats { json } => MachineUse::Once(args(&["stats"], [flag(*json, "--json")])),
-        Command::Ls { json } => MachineUse::PerRoot { args: args(&["ls"], [flag(*json, "--json")]), json: *json },
-        Command::Status { json: _ } => MachineUse::PerRoot { args: args(&["status", "--json"], []), json: true },
-        Command::Gc { force } => MachineUse::PerRoot { args: args(&["gc"], [flag(*force, "--force")]), json: false },
-        Command::Service { cmd: ServiceCommand::Ls { json } } => {
-            MachineUse::PerRoot { args: args(&["service", "ls"], [flag(*json, "--json")]), json: *json }
-        }
-        Command::Service { cmd: ServiceCommand::Rebuild { .. } } => MachineUse::Verb,
+        Command::Ps { .. }
+        | Command::Stats { .. }
+        | Command::Ls { .. }
+        | Command::Status { .. }
+        | Command::Service { cmd: ServiceCommand::Ls { .. } } => MachineUse::Calls,
+        Command::Gc { .. } | Command::Service { cmd: ServiceCommand::Rebuild { .. } } => MachineUse::Verb,
         Command::Rebuild { all: true, .. } | Command::Stop { all: true, .. } | Command::Start { all: true, .. } => {
             MachineUse::Verb
         }
@@ -181,7 +166,7 @@ pub(crate) enum Plan {
     Here,
     /// Run it here with this name (an `@/` dropped).
     HereAs(String),
-    /// `--machine m` with an ssh use ([`MachineUse::Once`] / `PerRoot`).
+    /// `--machine m` with API calls ([`MachineUse::Calls`]) or a `port`.
     Machine(String, MachineUse),
     /// Look the name up through the daemon, then run it where it is.
     Resolve(Where, String),
@@ -364,56 +349,6 @@ fn machine_info_with(
     Ok(Entry { name: info.name, kind, roots: info.roots, command: info.command, agent: info.agent })
 }
 
-// ---- the ssh re-run -----------------------------------------------------------
-
-/// The args a named command re-runs with on its machine: `-C <root>` (the
-/// instance's root there; `-C` is a local path, never forwarded), the
-/// subcommand and its flags, the unqualified `name`, `exec`'s command after
-/// `--`. `None` for a command that doesn't re-run (the verbs, `vscode`, `port`).
-pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) -> Option<Vec<String>> {
-    let mut out: Vec<String> = match root {
-        Some(root) => vec!["-C".into(), root.to_string_lossy().into_owned()],
-        None => Vec::new(),
-    };
-    let s = |v: &str| v.to_string();
-    match command {
-        Command::Logs { lines, build, follow, .. } => {
-            out.extend([s("logs"), s("-n"), lines.to_string()]);
-            out.extend([flag(*build, "--build"), flag(*follow, "--follow")].into_iter().flatten());
-            out.extend([s("--"), s(name)]);
-        }
-        Command::Inspect { json, .. } => {
-            out.push(s("inspect"));
-            out.extend(flag(*json, "--json"));
-            out.extend([s("--"), s(name)]);
-        }
-        Command::Done { .. } => out.extend([s("done"), s("--"), s(name)]),
-        Command::Undone { .. } => out.extend([s("undone"), s("--"), s(name)]),
-        Command::Rename { new_name, .. } => out.extend([s("rename"), s("--"), s(name), new_name.clone()]),
-        Command::Exec { interactive, tty, attach, sessions, session, service, reserve_255, command, .. } => {
-            out.push(s("exec"));
-            let flags = [flag(*interactive, "-i"), flag(*tty, "-t"), flag(*sessions, "--sessions"), flag(*reserve_255, "--reserve-255")];
-            out.extend(flags.into_iter().flatten());
-            out.extend(session.as_ref().map(|id| format!("--session={id}")));
-            out.extend(service.as_ref().map(|name| format!("--service={name}")));
-            // The name before `--`: after it, it would be the command.
-            out.push(s(name));
-            // After the name: `--attach`'s value is optional, so a bare one
-            // before it would take the name as its id.
-            out.extend(attach.as_ref().map(|id| match id {
-                Some(id) => format!("--attach={id}"),
-                None => s("--attach"),
-            }));
-            if !command.is_empty() {
-                out.push(s("--"));
-                out.extend(command.iter().cloned());
-            }
-        }
-        _ => return None,
-    }
-    Some(out)
-}
-
 // ---- reconnecting a tty exec ------------------------------------------------
 
 /// ssh's exit code for its own failure (a lost or refused connection).
@@ -454,12 +389,14 @@ pub(crate) enum Next {
     Done { code: i32, gone: bool },
 }
 
-/// The reconnect decision of a session exec over ssh, shared by the CLI loop
-/// ([`route`]) and the dashboard's remote tabs (`tui::app::terminal::Redial`):
-/// pure over each dial's exit code and run time. A 255 is ssh's alone (the
-/// remote `exec --reserve-255` reports a program's 255 as 254), so it means
-/// the connection went: re-dial, with backoff, for as long as it takes. Any
-/// other code is the session's answer and ends the loop.
+/// The reconnect decision of a session exec on a machine, shared by the CLI
+/// loop ([`route`], `PTY` dials) and the dashboard's remote tabs
+/// (`tui::app::terminal::Redial`, ssh ones): pure over each dial's exit
+/// code and run time. A 255 is the connection's alone (a `PTY` dial's lost
+/// link, ssh's own failure; the program's 255 is reported as 254 under
+/// `--reserve-255`), so it means the connection went: re-dial, with backoff,
+/// for as long as it takes. Any other code is the session's answer and ends
+/// the loop.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Reconnect {
     /// Some dial ran [`CONNECTED_AFTER`]: a later 255 is an outage.
@@ -511,10 +448,9 @@ pub(crate) fn gone_note(id: &str) -> String {
 /// The session id a machine `exec` reconnects with: `None` when it gets no
 /// tty (a piped exec, nothing to re-attach to) or is an `--attach` /
 /// `--sessions` already, or a `--service` terminal (never a session). The
-/// tty rule is the remote `exec`'s
-/// (`commands::exec::shell_flags`), `terminal` standing for the remote
-/// stdin: ssh gives it a tty ([`ssh::cli_argv`]) exactly when this process is
-/// on a terminal. A `--session` given is kept, else one is minted here.
+/// tty rule is a local `exec`'s (`commands::exec::shell_flags`), `terminal`
+/// standing for its stdin: a `PTY` dial has a terminal exactly when this
+/// process is on one. A `--session` given is kept, else one is minted here.
 pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl FnOnce() -> String) -> Result<Option<String>> {
     let Command::Exec { interactive, tty, attach: None, sessions: false, session, service: None, command, .. } = command else {
         return Ok(None);
@@ -532,111 +468,61 @@ pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl Fn
 /// The piped `PTY` mode of a machine `exec` that gets no tty (the rule
 /// [`reconnect_session`]'s): `argv` as typed, `-i` as given; no command,
 /// the login shell (`exec::SHELL_FALLBACK_CMD`) with `exec::shell_flags`'
-/// `-i`, as a local `exec` runs it. `None` for one that gets a tty, a
-/// session one (`--attach`, `--sessions`, `--session`), a `--service` one
+/// `-i`, as a local `exec` runs it. With `--session <id>`, that `argv` in
+/// the helper's session `id` (`exec::session_new_command`), as a local
+/// `exec --session` without a tty runs it. `None` for one that gets a tty,
+/// an `--attach` / `--sessions` one ([`session_exec`]), a `--service` one
 /// ([`service_mode`]) and any other command.
-pub(crate) fn pipe_mode(command: &Command, terminal: bool) -> Option<pty_client::Mode> {
-    let Command::Exec { interactive, tty, attach: None, sessions: false, session: None, service: None, command, .. } = command else {
-        return None;
+pub(crate) fn pipe_mode(command: &Command, terminal: bool) -> Result<Option<pty_client::Mode>> {
+    let Command::Exec { interactive, tty, attach: None, sessions: false, session, service: None, command, .. } = command else {
+        return Ok(None);
     };
     let (argv, interactive) = if command.is_empty() {
         let (interactive, tty) = crate::commands::exec::shell_flags(*interactive, *tty, terminal);
         if tty {
-            return None;
+            return Ok(None);
         }
         (crate::commands::exec::SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect(), interactive)
     } else {
         if *tty {
-            return None;
+            return Ok(None);
         }
         (command.clone(), *interactive)
     };
-    Some(pty_client::Mode::Pipe { argv, interactive })
+    let argv = match session {
+        Some(id) => crate::commands::exec::session_new_command(crate::commands::exec::checked_session_id(id)?, &argv),
+        None => argv,
+    };
+    Ok(Some(pty_client::Mode::Pipe { argv, interactive }))
 }
 
-/// The service `PTY` mode of an `exec --service <name>` on an offered
-/// machine: the command as typed (empty: the worker's login shell). One
-/// dial, never re-dialed (no session to go back to). `None` for any other
-/// command.
+/// The service `PTY` mode of an `exec --service <name>` on a machine: the
+/// command as typed (empty: the machine's login shell). One dial, never
+/// re-dialed (no session to go back to). `None` for any other command.
 pub(crate) fn service_mode(command: &Command) -> Option<pty_client::Mode> {
     let Command::Exec { service: Some(name), command, .. } = command else { return None };
     Some(pty_client::Mode::Service { name: name.clone(), argv: command.clone() })
 }
 
-/// The two remote commands of a session exec (`command`, an `Exec`) in
-/// session `id`: the first dial, `exec --session=<id>` as typed
-/// (create-or-attach), and every re-dial, `exec --attach=<id>` (attach only:
-/// a reconnect never starts a second program). Both `--reserve-255`.
-pub(crate) fn session_dials(command: &Command, id: &str) -> Option<(Command, Command)> {
-    let Command::Exec { interactive, tty, name, command, .. } = command else { return None };
-    let first = Command::Exec {
-        interactive: *interactive,
-        tty: *tty,
-        attach: None,
-        sessions: false,
-        session: Some(id.to_string()),
-        service: None,
-        reserve_255: true,
-        name: name.clone(),
-        command: command.clone(),
-    };
-    let again = Command::Exec {
-        interactive: false,
-        tty: false,
-        attach: Some(Some(id.to_string())),
-        sessions: false,
-        session: None,
-        service: None,
-        reserve_255: true,
-        name: name.clone(),
-        command: Vec::new(),
-    };
-    Some((first, again))
-}
-
-/// How a session exec's dials reach its machine ([`dials`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Dials {
-    /// An ssh machine: each dial an ssh running the machine's `devsandbox
-    /// exec` ([`session_dials`]' commands).
-    Ssh { first: Vec<OsString>, again: Vec<OsString> },
-    /// An offered fleet worker: each dial a `PTY` stream over its fleet
-    /// link (`fleet::pty_client::dial`), the first creating the session
-    /// (or attaching), the rest attaching only.
-    Pty { first: pty_client::Request, again: pty_client::Request },
+/// Instance `name`'s config root on machine `m`, which every `PTY` dial
+/// and named call needs.
+fn root_on<'a>(m: &str, root: Option<&'a Path>) -> Result<&'a Path> {
+    root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))
 }
 
 /// The dials of session exec `command` (an `Exec`) in session `id` on
-/// `entry`, instance `name` at `root` there; `terminal` as for
-/// [`ssh::cli_argv`].
-pub(crate) fn dials(entry: &Entry, command: &Command, name: &str, root: Option<&Path>, id: &str, terminal: bool) -> Result<Dials> {
-    let (first, again) = session_dials(command, id).context("not an exec")?;
-    if entry.is_offered() {
-        let Command::Exec { command, .. } = first else { bail!("not an exec") };
-        let root = root.with_context(|| format!("machine `{}` has no config roots (devsandbox machine ls)", entry.name))?;
-        let request = |create| pty_client::Request {
-            root: root.to_path_buf(),
-            instance: name.to_string(),
-            mode: pty_client::Mode::Session { id: id.to_string(), create },
-        };
-        return Ok(Dials::Pty { first: request(Some(command)), again: request(None) });
-    }
-    let first = ssh::cli_argv(entry, terminal, &remote_args(&first, name, root).context("not an exec")?)?;
-    let again = ssh::cli_argv(entry, terminal, &remote_args(&again, name, root).context("not an exec")?)?;
-    Ok(Dials::Ssh { first, again })
-}
-
-/// Run `dials` on `entry`: the first dial, then the attach after each lost
-/// connection, per [`Reconnect`].
-fn run_dials(dials: Dials, entry: &Entry, id: &str) -> Result<Routed> {
-    match dials {
-        // Each dial spawned: this process outlives ssh.
-        Dials::Ssh { first, again } => reconnect_loop(id, |redial| spawn_ssh_owning_signals(if redial { &again } else { &first })),
-        Dials::Pty { first, again } => {
-            let dir = endpoint::socket_dir()?;
-            reconnect_loop(id, |redial| Ok(pty_client::dial(&dir, &entry.name, if redial { &again } else { &first }, true)))
-        }
-    }
+/// machine `m`, instance `name` at `root` there: the first creating the
+/// session running the command (none: the login shell) or attaching to it,
+/// every re-dial attaching only (a reconnect never starts a second program).
+pub(crate) fn dials(m: &str, command: &Command, name: &str, root: Option<&Path>, id: &str) -> Result<(pty_client::Request, pty_client::Request)> {
+    let Command::Exec { command, .. } = command else { bail!("not an exec") };
+    let root = root_on(m, root)?;
+    let request = |create| pty_client::Request {
+        root: root.to_path_buf(),
+        instance: name.to_string(),
+        mode: pty_client::Mode::Session { id: id.to_string(), create },
+    };
+    Ok((request(Some(command.clone())), request(None)))
 }
 
 /// Dial (`dial(false)`), then re-dial (`dial(true)`) after each lost
@@ -664,10 +550,11 @@ fn reconnect_loop(id: &str, mut dial: impl FnMut(bool) -> Result<i32>) -> Result
     }
 }
 
-/// `--machine m` on a root-bound command: one run per registered root,
-/// `-C <root>` first, each with its `==> m:<root>` banner. `--json` with
-/// several roots is an error: concatenated documents don't parse.
-pub(crate) fn per_root(m: &str, roots: &[PathBuf], args: &[String], json: bool) -> Result<Vec<(String, Vec<String>)>> {
+/// `--machine m` on a root-bound command: one listing per config root,
+/// each after its `==> m:<root>` banner (these, in `roots`' order).
+/// `--json` with several roots is an error: concatenated documents don't
+/// parse.
+pub(crate) fn root_banners(m: &str, roots: &[PathBuf], json: bool) -> Result<Vec<String>> {
     if roots.is_empty() {
         bail!("machine `{m}` has no config roots (devsandbox machine ls)");
     }
@@ -675,14 +562,7 @@ pub(crate) fn per_root(m: &str, roots: &[PathBuf], args: &[String], json: bool) 
         let list: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
         bail!("--json with machine `{m}`'s {} roots would print one document each: {}", roots.len(), list.join(", "));
     }
-    Ok(roots
-        .iter()
-        .map(|root| {
-            let mut run = vec!["-C".to_string(), root.to_string_lossy().into_owned()];
-            run.extend(args.iter().cloned());
-            (banner(m, root), run)
-        })
-        .collect())
+    Ok(roots.iter().map(|root| banner(m, root)).collect())
 }
 
 /// The line on stderr before each of a machine's roots' runs.
@@ -739,16 +619,11 @@ pub(crate) fn info_params(m: &str, own_agent: Option<PathBuf>) -> Value {
     params
 }
 
-/// Run `argv` (ssh): `exec`ed, replacing this process.
-fn run_ssh(argv: &[OsString]) -> Result<Routed> {
-    Err(exec_ssh(argv))
-}
-
 /// Where `command` runs (module doc): here (maybe with its name resolved),
-/// or on a machine over ssh, which replaces this process (a tty `exec`
-/// runs as its child, re-dialed after a lost connection:
-/// [`reconnect_loop`]). `machine` is
-/// `--machine`, `machines` the registered names ([`super::registered_names`]).
+/// or on a machine over its link: API calls through the daemon, `PTY` dials
+/// from this process (a tty `exec` re-dialed after a lost link:
+/// [`reconnect_loop`]). `machine` is `--machine`, `machines` the registered
+/// names ([`super::registered_names`]).
 pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String], command: Command) -> Result<Routed> {
     match plan(&command, machine, in_process, machines)? {
         Plan::Here => Ok(Routed::Here(command)),
@@ -757,39 +632,20 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
             let mut conn = connect().context("--machine needs devsandbox serve")?;
             let own_agent = crate::devsbd::bridge::own_agent();
             let entry = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
-            if entry.is_offered() && usage != MachineUse::Port {
-                let u = offered::use_of(&command);
-                match u {
-                    offered::Use::Refused(what) => return Err(offered::refusal(&m, what)),
-                    // The `gc` verb: `verbs_client` sends it (`CliVerb::Gc`).
-                    offered::Use::Gc => return Ok(Routed::Here(command)),
-                    _ => {}
-                }
-                let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
-                let call = &mut |method: &str, params| conn.call(method, params);
-                let code = match u {
-                    offered::Use::Ps { .. } | offered::Use::Stats { .. } => offered::listing(call, &u, &m, &mut out)?,
-                    _ => offered::per_root(call, &u, &m, &entry.roots, &mut out, &mut err)?,
-                };
-                return Ok(Routed::Exit(code));
-            }
-            drop(conn);
             match usage {
-                MachineUse::Once(args) => run_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?),
-                MachineUse::PerRoot { args, json } => {
-                    let runs = per_root(&m, &entry.roots, &args, json)?;
-                    let mut code = 0;
-                    for (banner, args) in runs {
-                        eprintln!("{banner}");
-                        let status = spawn_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?)?;
-                        if code == 0 {
-                            code = status;
-                        }
-                    }
+                MachineUse::Calls => {
+                    let u = calls::use_of(&command);
+                    let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
+                    let call = &mut |method: &str, params| conn.call(method, params);
+                    let code = match u {
+                        calls::Use::Ps { .. } | calls::Use::Stats { .. } => calls::listing(call, &u, &m, &mut out)?,
+                        _ => calls::per_root(call, &u, &m, &entry.roots, &mut out, &mut err)?,
+                    };
                     Ok(Routed::Exit(code))
                 }
                 MachineUse::Port => {
-                    let root = entry.roots.first().cloned().with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+                    drop(conn);
+                    let root = root_on(&m, entry.roots.first().map(PathBuf::as_path))?.to_path_buf();
                     routed_port(command, entry, root, None)
                 }
                 MachineUse::Verb | MachineUse::Named | MachineUse::Refused(_) => unreachable!("plan never routes these"),
@@ -844,94 +700,67 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     };
     let own_agent = crate::devsbd::bridge::own_agent();
     let entry = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
-    if matches!(command, Command::Vscode { .. }) {
-        if entry.is_offered() {
-            return Err(offered::refusal(&m, offered::Refused::Vscode));
-        }
-        bail!("`{m}/{}` is on a machine: `devsandbox vscode` is not supported on machines yet", chosen.name);
+    let u = calls::use_of(&command);
+    if let calls::Use::Refused(what) = u {
+        return Err(calls::refusal(&m, what));
     }
     if matches!(command, Command::Port { .. }) {
         drop(conn);
         let root = chosen.root.clone().or_else(|| entry.roots.first().cloned());
-        let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+        let root = root_on(&m, root.as_deref())?.to_path_buf();
         return routed_port(command, entry, root, Some(chosen.name));
     }
     let root = chosen.root.as_deref().or(entry.roots.first().map(PathBuf::as_path));
+    if u != calls::Use::Link {
+        let root = root_on(&m, root)?;
+        let tty = std::io::stdout().is_terminal();
+        let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
+        let call = &mut |method: &str, params| conn.call(method, params);
+        return Ok(Routed::Exit(calls::named(call, &u, &m, &chosen.name, root, tty, &mut out, &mut err)?));
+    }
+    // An exec: `PTY` dials from here.
     let terminal = on_terminal();
-    if entry.is_offered() {
-        match offered::use_of(&command) {
-            offered::Use::Refused(what) => return Err(offered::refusal(&m, what)),
-            offered::Use::Link => {}
-            u => {
-                let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
-                let tty = std::io::stdout().is_terminal();
-                let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
-                let call = &mut |method: &str, params| conn.call(method, params);
-                return Ok(Routed::Exit(offered::named(call, &u, &m, &chosen.name, root, tty, &mut out, &mut err)?));
-            }
+    let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
+    let one_dial = |mode| -> Result<Routed> {
+        let request = pty_client::Request { root: root_on(&m, root)?.to_path_buf(), instance: chosen.name.clone(), mode };
+        Ok(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, &m, &request, reserve_255)))
+    };
+    if let Some(mode) = service_mode(&command) {
+        // A service terminal: one dial, its 255 reported once.
+        if !terminal {
+            bail!("`exec --service` on machine `{m}` opens a terminal in the service's container: it needs a TTY");
         }
-        if let Some(mode) = service_mode(&command) {
-            // A service terminal: one dial, its 255 reported once.
-            if !terminal {
-                bail!("`exec --service` on machine `{m}` opens a terminal in the service's container: it needs a TTY");
-            }
-            let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
-            let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
-            let request = pty_client::Request { root: root.to_path_buf(), instance: chosen.name.clone(), mode };
-            let dir = endpoint::socket_dir()?;
-            drop(conn);
-            return Ok(Routed::Exit(pty_client::dial(&dir, &m, &request, reserve_255)));
-        }
-        if let Some(routed) = offered_session_exec(&command, &mut conn, &entry, &chosen.name, root, terminal)? {
-            return Ok(routed);
-        }
+        drop(conn);
+        return one_dial(mode);
+    }
+    if let Some(routed) = session_exec(&command, &mut conn, &m, &chosen.name, root, terminal)? {
+        return Ok(routed);
     }
     if let Some(id) = reconnect_session(&command, terminal, || crate::commands::exec::mint_session_id(crate::state::Instance::now()))? {
-        let dials = dials(&entry, &command, &chosen.name, root, &id, terminal)?;
+        let (first, again) = dials(&m, &command, &chosen.name, root, &id)?;
         drop(conn);
-        return run_dials(dials, &entry, &id);
-    }
-    if entry.is_offered() {
-        // What's left for an offered machine: an exec without a tty, one
-        // piped `PTY` dial (never re-dialed: no session to go back to).
-        let Some(mode) = pipe_mode(&command, terminal) else {
-            return Err(offered::refusal(&m, offered::Refused::SessionNoTty));
-        };
-        let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
-        let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
-        let request = pty_client::Request { root: root.to_path_buf(), instance: chosen.name.clone(), mode };
         let dir = endpoint::socket_dir()?;
-        drop(conn);
-        return Ok(Routed::Exit(pty_client::dial(&dir, &m, &request, reserve_255)));
+        return reconnect_loop(&id, |redial| Ok(pty_client::dial(&dir, &m, if redial { &again } else { &first }, true)));
     }
-    let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
-    let argv = ssh::cli_argv(&entry, terminal, &args)?;
+    // What's left: an exec without a tty, one piped dial (never re-dialed:
+    // nothing to go back to).
+    let mode = pipe_mode(&command, terminal)?.context("this command doesn't run on a machine")?;
     drop(conn);
-    run_ssh(&argv)
+    one_dial(mode)
 }
 
-/// `exec --sessions` and a tty `exec --attach [ID]` of instance `name` on
-/// offered machine `entry` (at `root` there): the session list through a
-/// `sessions.list` quick call on `conn`, the attach one `PTY` dial (no loop,
-/// as over ssh: its 255 is the caller's to retry). `None` for any other
-/// exec, which [`resolve_and_route`] goes on with (a non-tty one to
-/// [`pipe_mode`], an `--attach` without a terminal to
-/// [`offered::Refused::SessionNoTty`]).
-fn offered_session_exec(
-    command: &Command,
-    conn: &mut Conn,
-    entry: &Entry,
-    name: &str,
-    root: Option<&Path>,
-    terminal: bool,
-) -> Result<Option<Routed>> {
+/// `exec --sessions` and `exec --attach [ID]` of instance `name` on machine
+/// `m` (at `root` there): the session list through a `sessions.list` quick
+/// call on `conn`; the attach one `PTY` dial ([`attach_mode`]; no loop, as
+/// a local `--attach`: its 255 is the caller's to retry). `None` for any
+/// other exec, which [`resolve_and_route`] goes on with.
+fn session_exec(command: &Command, conn: &mut Conn, m: &str, name: &str, root: Option<&Path>, terminal: bool) -> Result<Option<Routed>> {
     let Command::Exec { attach, sessions, reserve_255, .. } = command else { return Ok(None) };
-    if !*sessions && (attach.is_none() || !terminal) {
+    if !*sessions && attach.is_none() {
         return Ok(None);
     }
-    let m = &entry.name;
     let key = format!("{m}/{name}");
-    let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+    let root = root_on(m, root)?;
     let mut list = || -> Result<Vec<String>> {
         let r = conn.call("sessions.list", json!({ "root": root, "instance": name, "machine": m }))?;
         if let Some(e) = r.error {
@@ -959,62 +788,18 @@ fn offered_session_exec(
             })?
         }
     };
-    let mode = pty_client::Mode::Session { id, create: None };
-    let request = pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), mode };
+    let request = pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), mode: attach_mode(id, terminal) };
     Ok(Some(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, m, &request, *reserve_255))))
 }
 
-/// Replace this process with `argv` (ssh): its exit is ours, its terminal
-/// handling (`-t`) the user's. Returns only on failure.
-fn exec_ssh(argv: &[OsString]) -> anyhow::Error {
-    let Some((program, args)) = argv.split_first() else { return anyhow::anyhow!("empty ssh argv") };
-    let e = std::process::Command::new(program).args(args).exec();
-    anyhow::Error::new(e).context(format!("cannot run {}", program.to_string_lossy()))
-}
-
-/// Run `argv` (ssh) to its end; its exit code (a signal as a shell reports it).
-fn spawn_ssh(argv: &[OsString]) -> Result<i32> {
-    let (program, args) = argv.split_first().context("empty ssh argv")?;
-    let status =
-        std::process::Command::new(program).args(args).status().with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
-    Ok(exit_code(status))
-}
-
-fn exit_code(status: std::process::ExitStatus) -> i32 {
-    status.code().or_else(|| status.signal().map(|s| 128 + s)).unwrap_or(1)
-}
-
-/// [`spawn_ssh`] in place of an `exec`: ssh owns the terminal (`-t`), and a
-/// Ctrl-C with `-T` reaches the whole process group, so this process
-/// ignores SIGINT and SIGQUIT while ssh runs and lives to exit with its
-/// status. ssh gets them back as they were here (SIG_IGN would survive the
-/// exec, and an ssh ignoring Ctrl-C can't be stopped).
-fn spawn_ssh_owning_signals(argv: &[OsString]) -> Result<i32> {
-    const SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGQUIT];
-    let (program, args) = argv.split_first().context("empty ssh argv")?;
-    // SAFETY: `signal` swaps a disposition; SIG_IGN is always valid.
-    let prev = SIGNALS.map(|sig| unsafe { libc::signal(sig, libc::SIG_IGN) });
-    // What the child starts with: ignored only if it was here before; a
-    // handler of ours means default after the exec anyway.
-    let child = prev.map(|p| if p == libc::SIG_IGN { libc::SIG_IGN } else { libc::SIG_DFL });
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args);
-    // SAFETY: only `signal`, which is async-signal-safe, between fork and exec.
-    unsafe {
-        cmd.pre_exec(move || {
-            for (sig, disposition) in SIGNALS.into_iter().zip(child) {
-                libc::signal(sig, disposition);
-            }
-            Ok(())
-        });
+/// The `PTY` mode of an `--attach` to session `id`: the session itself on a
+/// terminal, else its helper client piped with stdin kept (a local
+/// `exec --attach`'s `shell_flags(false, false, false)`).
+pub(crate) fn attach_mode(id: String, terminal: bool) -> pty_client::Mode {
+    if terminal {
+        return pty_client::Mode::Session { id, create: None };
     }
-    let status = cmd.status();
-    for (sig, p) in SIGNALS.into_iter().zip(prev) {
-        // SAFETY: `p` is what `signal` returned for `sig`.
-        unsafe { libc::signal(sig, p) };
-    }
-    let status = status.with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
-    Ok(exit_code(status))
+    pty_client::Mode::Pipe { argv: crate::commands::exec::session_attach_command(&id), interactive: true }
 }
 
 #[cfg(test)]
@@ -1099,15 +884,12 @@ mod tests {
     #[test]
     fn the_machine_flag_is_for_nameless_commands() {
         let m = &["box"];
-        assert_eq!(
-            plan_of(&["ps", "-a"], Some("box"), m).unwrap(),
-            Plan::Machine("box".into(), MachineUse::Once(ms(&["ps", "--all"])))
-        );
-        assert_eq!(
-            plan_of(&["service", "ls", "--json"], Some("box"), m).unwrap(),
-            Plan::Machine("box".into(), MachineUse::PerRoot { args: ms(&["service", "ls", "--json"]), json: true })
-        );
+        assert_eq!(plan_of(&["ps", "-a"], Some("box"), m).unwrap(), Plan::Machine("box".into(), MachineUse::Calls));
+        assert_eq!(plan_of(&["service", "ls", "--json"], Some("box"), m).unwrap(), Plan::Machine("box".into(), MachineUse::Calls));
         assert_eq!(plan_of(&["stop", "--all"], Some("box"), m).unwrap(), Plan::Here);
+        // `gc` is the daemon's verb: `verbs_client` sends it (`CliVerb::Gc`).
+        assert_eq!(plan_of(&["gc", "--force"], Some("box"), m).unwrap(), Plan::Here);
+        assert_eq!(plan_of(&["gc"], Some("nope"), m).unwrap_err().to_string(), "no machine named `nope` (devsandbox machine ls)");
         assert_eq!(plan_of(&["service", "rebuild", "db"], Some("box"), m).unwrap(), Plan::Here);
         let e = plan_of(&["exec", "web"], Some("box"), m).unwrap_err().to_string();
         assert!(e.ends_with("qualify the name instead: box/<name>"), "{e}");
@@ -1144,13 +926,12 @@ mod tests {
     }
 
     #[test]
-    fn nameless_args_are_rebuilt_from_the_command() {
+    fn each_nameless_command_has_its_use() {
         let once = |args: &[&str]| machine_use(Some(&command(args)));
-        assert_eq!(once(&["ps", "--json"]), MachineUse::Once(ms(&["ps", "--json"])));
-        assert_eq!(once(&["stats"]), MachineUse::Once(ms(&["stats"])));
-        assert_eq!(once(&["ls"]), MachineUse::PerRoot { args: ms(&["ls"]), json: false });
-        assert_eq!(once(&["status", "--json"]), MachineUse::PerRoot { args: ms(&["status", "--json"]), json: true });
-        assert_eq!(once(&["gc", "--force"]), MachineUse::PerRoot { args: ms(&["gc", "--force"]), json: false });
+        for args in [&["ps", "--json"][..], &["stats"], &["ls"], &["status", "--json"], &["service", "ls"]] {
+            assert_eq!(once(args), MachineUse::Calls, "{args:?}");
+        }
+        assert_eq!(once(&["gc", "--force"]), MachineUse::Verb);
         assert_eq!(once(&["rebuild", "--all"]), MachineUse::Verb);
         assert_eq!(once(&["start", "--all", "-d"]), MachineUse::Verb);
         assert_eq!(once(&["port", "--service", "redis", "6379"]), MachineUse::Port);
@@ -1164,40 +945,36 @@ mod tests {
         assert_eq!(once(&["fleet", "leave"]), MachineUse::Refused("fleet"));
     }
 
-    /// Per command: what an ssh machine re-runs (`--machine` use, or the
-    /// named re-run's args) and what an offered one does instead, an API
-    /// call or a refusal (never a `devsandbox …` there).
+    /// Per command, on any machine: an API call, a link stream (an exec's
+    /// `PTY`, a `port`'s `TUNNEL`) or a refusal; never a `devsandbox …`
+    /// there.
     #[test]
-    fn ssh_machines_re_run_offered_ones_call_or_refuse() {
-        use offered::{Refused, Use};
-        let nameless = |args: &[&str]| (machine_use(Some(&command(args))), offered::use_of(&command(args)));
-        assert_eq!(nameless(&["ls"]), (MachineUse::PerRoot { args: ms(&["ls"]), json: false }, Use::Ls { json: false }));
-        assert_eq!(nameless(&["status", "--json"]), (MachineUse::PerRoot { args: ms(&["status", "--json"]), json: true }, Use::Status));
-        assert_eq!(nameless(&["ps"]), (MachineUse::Once(ms(&["ps"])), Use::Ps { all: false, json: false }));
-        assert_eq!(nameless(&["stats"]), (MachineUse::Once(ms(&["stats"])), Use::Stats { json: false }));
-        assert_eq!(nameless(&["gc"]), (MachineUse::PerRoot { args: ms(&["gc"]), json: false }, Use::Gc));
-        assert_eq!(
-            nameless(&["service", "ls"]),
-            (MachineUse::PerRoot { args: ms(&["service", "ls"]), json: false }, Use::ServiceLs { json: false })
-        );
-        // `port` goes over the link (`TUNNEL`) on both.
+    fn every_machine_command_is_a_call_a_stream_or_refused() {
+        use calls::{Refused, Use};
+        let nameless = |args: &[&str]| (machine_use(Some(&command(args))), calls::use_of(&command(args)));
+        assert_eq!(nameless(&["ls"]), (MachineUse::Calls, Use::Ls { json: false }));
+        assert_eq!(nameless(&["status", "--json"]), (MachineUse::Calls, Use::Status));
+        assert_eq!(nameless(&["ps"]), (MachineUse::Calls, Use::Ps { all: false, json: false }));
+        assert_eq!(nameless(&["stats"]), (MachineUse::Calls, Use::Stats { json: false }));
+        assert_eq!(nameless(&["service", "ls"]), (MachineUse::Calls, Use::ServiceLs { json: false }));
+        assert_eq!(nameless(&["gc"]), (MachineUse::Verb, Use::Link));
         assert_eq!(nameless(&["port", "--service", "redis", "6379"]), (MachineUse::Port, Use::Link));
 
-        let named = |args: &[&str]| (remote_args(&command(args), "web", None).is_some(), offered::use_of(&command(args)));
-        assert_eq!(named(&["logs", "box/web"]), (true, Use::Logs { lines: 50 }));
-        assert_eq!(named(&["logs", "--build", "box/web"]), (true, Use::BuildLog { follow: false }));
-        assert_eq!(named(&["logs", "--build", "-f", "box/web"]), (true, Use::BuildLog { follow: true }));
-        assert_eq!(named(&["inspect", "box/web"]), (true, Use::Inspect { json: false }));
-        assert_eq!(named(&["done", "box/web"]), (true, Use::Done(true)));
-        assert_eq!(named(&["undone", "box/web"]), (true, Use::Done(false)));
-        assert_eq!(named(&["rename", "box/web", "x"]), (true, Use::Rename("x".into())));
-        assert_eq!(named(&["vscode", "box/web"]), (false, Use::Refused(Refused::Vscode)));
+        let named = |args: &[&str]| calls::use_of(&command(args));
+        assert_eq!(named(&["logs", "box/web"]), Use::Logs { lines: 50 });
+        assert_eq!(named(&["logs", "--build", "box/web"]), Use::BuildLog { follow: false });
+        assert_eq!(named(&["logs", "--build", "-f", "box/web"]), Use::BuildLog { follow: true });
+        assert_eq!(named(&["inspect", "box/web"]), Use::Inspect { json: false });
+        assert_eq!(named(&["done", "box/web"]), Use::Done(true));
+        assert_eq!(named(&["undone", "box/web"]), Use::Done(false));
+        assert_eq!(named(&["rename", "box/web", "x"]), Use::Rename("x".into()));
+        assert_eq!(named(&["vscode", "box/web"]), Use::Refused(Refused::Vscode));
         // exec: a tty one dials a `PTY` session (`dials`), a non-tty one a
         // piped `PTY` after `reconnect_session` says it gets none.
         let ls = command(&["exec", "box/web", "--", "ls"]);
-        assert_eq!(named(&["exec", "box/web", "--", "ls"]), (true, Use::Link));
+        assert_eq!(named(&["exec", "box/web", "--", "ls"]), Use::Link);
         assert_eq!(reconnect_session(&ls, true, || ID.into()).unwrap(), None);
-        assert_eq!(pipe_mode(&ls, true), Some(pty_client::Mode::Pipe { argv: ms(&["ls"]), interactive: false }));
+        assert_eq!(pipe_mode(&ls, true).unwrap(), Some(pty_client::Mode::Pipe { argv: ms(&["ls"]), interactive: false }));
     }
 
     fn entry() -> Entry {
@@ -1232,78 +1009,27 @@ mod tests {
     }
 
     #[test]
-    fn root_bound_commands_run_once_per_root() {
+    fn root_bound_commands_list_once_per_root() {
         let roots = vec![PathBuf::from("/r/a"), PathBuf::from("/r/b b")];
-        let runs = per_root("box", &roots, &ms(&["ls"]), false).unwrap();
-        assert_eq!(
-            runs,
-            vec![
-                ("==> box:/r/a".to_string(), ms(&["-C", "/r/a", "ls"])),
-                ("==> box:/r/b b".to_string(), ms(&["-C", "/r/b b", "ls"])),
-            ]
-        );
-        let e = per_root("box", &roots, &ms(&["ls", "--json"]), true).unwrap_err().to_string();
+        assert_eq!(root_banners("box", &roots, false).unwrap(), ["==> box:/r/a", "==> box:/r/b b"]);
+        let e = root_banners("box", &roots, true).unwrap_err().to_string();
         assert!(e.contains("/r/a, /r/b b"), "{e}");
-        assert_eq!(per_root("box", &roots[..1], &ms(&["status", "--json"]), true).unwrap().len(), 1);
-        assert!(per_root("box", &[], &ms(&["ls"]), false).is_err());
+        assert_eq!(root_banners("box", &roots[..1], true).unwrap().len(), 1);
+        assert!(root_banners("box", &[], false).is_err());
     }
 
-    #[test]
-    fn remote_args_per_command() {
-        let root = Some(Path::new("/srv/it's"));
-        let ra = |args: &[&str], name: &str, root| remote_args(&command(args), name, root).unwrap();
-        assert_eq!(ra(&["logs", "box/web"], "web-2", root), ms(&["-C", "/srv/it's", "logs", "-n", "50", "--", "web-2"]));
-        assert_eq!(
-            ra(&["logs", "-n", "5", "--build", "-f", "web"], "web", None),
-            ms(&["logs", "-n", "5", "--build", "--follow", "--", "web"])
-        );
-        assert_eq!(ra(&["inspect", "--json", "web"], "web", root), ms(&["-C", "/srv/it's", "inspect", "--json", "--", "web"]));
-        assert_eq!(ra(&["done", "web"], "w", None), ms(&["done", "--", "w"]));
-        assert_eq!(ra(&["undone", "web"], "w", None), ms(&["undone", "--", "w"]));
-        assert_eq!(ra(&["rename", "box/old", "new"], "old", root), ms(&["-C", "/srv/it's", "rename", "--", "old", "new"]));
-        // exec's command is kept word for word, spaces and flags included.
-        assert_eq!(
-            ra(&["exec", "-i", "box/web", "--", "sh", "-c", "echo 'a b'", "-x"], "web", root),
-            ms(&["-C", "/srv/it's", "exec", "-i", "web", "--", "sh", "-c", "echo 'a b'", "-x"])
-        );
-        assert_eq!(ra(&["exec", "web", "uname", "-a"], "web", None), ms(&["exec", "web", "--", "uname", "-a"]));
-        assert_eq!(ra(&["exec", "-t", "web"], "web", None), ms(&["exec", "-t", "web"]));
-        // Session flags ride along; a bare `--attach` stays after the name.
-        assert_eq!(ra(&["exec", "box/web", "--attach"], "web", None), ms(&["exec", "web", "--attach"]));
-        assert_eq!(
-            ra(&["exec", "box/web", "--attach", "1790000000-a1b2"], "web", None),
-            ms(&["exec", "web", "--attach=1790000000-a1b2"])
-        );
-        assert_eq!(ra(&["exec", "--sessions", "box/web"], "web", None), ms(&["exec", "--sessions", "web"]));
-        assert_eq!(
-            ra(&["exec", "--session", "1790000000-a1b2", "box/web", "zidane"], "web", root),
-            ms(&["-C", "/srv/it's", "exec", "--session=1790000000-a1b2", "web", "--", "zidane"])
-        );
-        // What it emits parses back to the same flags.
-        let back = command(&ra(&["exec", "box/web", "--attach"], "web", None).iter().map(String::as_str).collect::<Vec<_>>());
-        assert!(matches!(back, Command::Exec { attach: Some(None), ref name, .. } if name == "web"));
-        assert_eq!(remote_args(&command(&["stop", "web"]), "web", None), None);
-        assert_eq!(remote_args(&command(&["vscode", "web"]), "web", None), None);
-        // `--service` rides along to an ssh machine, its command too.
-        let svc = ra(&["exec", "box/web", "--service", "db", "--", "psql"], "web", root);
-        assert_eq!(svc, ms(&["-C", "/srv/it's", "exec", "--service=db", "web", "--", "psql"]));
-        let back = command(&svc.iter().map(String::as_str).collect::<Vec<_>>());
-        assert!(matches!(back, Command::Exec { service: Some(ref s), ref command, .. } if s == "db" && command == &["psql"]));
-    }
-
-    /// `exec --service`: never a session nor a pipe; on an offered machine
-    /// one service `PTY` dial, on an ssh one the remote `exec --service`.
+    /// `exec --service`: never a session nor a pipe; one service `PTY` dial.
     #[test]
     fn service_execs_are_one_terminal() {
         let svc = command(&["exec", "box/web", "--service", "db"]);
         assert_eq!(reconnect_session(&svc, true, || ID.into()).unwrap(), None, "no session to reconnect to");
-        assert_eq!(pipe_mode(&svc, false), None);
+        assert_eq!(pipe_mode(&svc, false).unwrap(), None);
         assert_eq!(service_mode(&svc), Some(pty_client::Mode::Service { name: "db".into(), argv: vec![] }));
         let psql = command(&["exec", "-it", "box/web", "--service", "db", "psql", "-l"]);
         assert_eq!(service_mode(&psql), Some(pty_client::Mode::Service { name: "db".into(), argv: ms(&["psql", "-l"]) }));
         assert_eq!(reconnect_session(&psql, true, || ID.into()).unwrap(), None);
         assert_eq!(service_mode(&command(&["exec", "box/web"])), None);
-        assert_eq!(offered::use_of(&svc), offered::Use::Link);
+        assert_eq!(calls::use_of(&svc), calls::Use::Link);
     }
 
     const ID: &str = "1790000000-a1b2";
@@ -1360,70 +1086,60 @@ mod tests {
     }
 
     /// A machine exec without a tty is piped, `-i` and the login shell as a
-    /// local `exec` decides them; one with a tty, or a session one, isn't.
+    /// local `exec` decides them, a `--session` one in the helper's session
+    /// client as a local one runs it; one with a tty, an `--attach` or a
+    /// `--sessions` one isn't.
     #[test]
     fn non_tty_execs_are_piped() {
         use pty_client::Mode::Pipe;
-        let pm = |args: &[&str], terminal| pipe_mode(&command(args), terminal);
+        let pm = |args: &[&str], terminal| pipe_mode(&command(args), terminal).unwrap();
         let shell: Vec<String> = crate::commands::exec::SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
         assert_eq!(pm(&["exec", "box/web", "ls"], false), Some(Pipe { argv: ms(&["ls"]), interactive: false }));
         assert_eq!(pm(&["exec", "box/web", "ls"], true), Some(Pipe { argv: ms(&["ls"]), interactive: false }), "no -t: none");
         assert_eq!(pm(&["exec", "-i", "box/web", "cat"], false), Some(Pipe { argv: ms(&["cat"]), interactive: true }));
         assert_eq!(pm(&["exec", "box/web"], false), Some(Pipe { argv: shell.clone(), interactive: true }), "the shell keeps stdin");
-        assert_eq!(pm(&["exec", "-i", "box/web"], true), Some(Pipe { argv: shell, interactive: true }), "explicit -i: no tty");
+        assert_eq!(pm(&["exec", "-i", "box/web"], true), Some(Pipe { argv: shell.clone(), interactive: true }), "explicit -i: no tty");
         assert_eq!(pm(&["exec", "box/web"], true), None, "the shell on a terminal: a session");
         assert_eq!(pm(&["exec", "-t", "box/web", "ls"], false), None);
-        assert_eq!(pm(&["exec", "--session", "1790000000-0000", "box/web", "ls"], false), None);
+        let new = |argv: &[String]| crate::commands::exec::session_new_command("1790000000-0000", argv);
+        assert_eq!(
+            pm(&["exec", "--session", "1790000000-0000", "box/web", "ls"], false),
+            Some(Pipe { argv: new(&ms(&["ls"])), interactive: false })
+        );
+        assert_eq!(pm(&["exec", "--session", "1790000000-0000", "box/web"], false), Some(Pipe { argv: new(&shell), interactive: true }));
+        assert_eq!(pm(&["exec", "--session", "1790000000-0000", "box/web"], true), None, "a tty: the reconnecting session");
+        assert!(pipe_mode(&command(&["exec", "--session", "nope", "box/web", "ls"]), false).is_err());
         assert_eq!(pm(&["exec", "box/web", "--attach"], false), None);
         assert_eq!(pm(&["exec", "box/web", "--sessions"], false), None);
         assert_eq!(pm(&["logs", "box/web"], false), None);
     }
 
-    /// The first dial creates (or attaches), every re-dial only attaches,
-    /// both with `--reserve-255`; each parses back on the machine.
+    /// An attach on a terminal is the session; without one, its helper
+    /// client piped, stdin kept.
     #[test]
-    fn first_dial_and_re_dials() {
-        let root = Some(Path::new("/r"));
-        let (first, again) = session_dials(&command(&["exec", "-it", "box/web", "zidane", "-c"]), ID).unwrap();
-        let first = remote_args(&first, "web-2", root).unwrap();
-        let again = remote_args(&again, "web-2", root).unwrap();
-        assert_eq!(first, ms(&["-C", "/r", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "web-2", "--", "zidane", "-c"]));
-        assert_eq!(again, ms(&["-C", "/r", "exec", "--reserve-255", "web-2", "--attach=1790000000-a1b2"]));
-        let parse = |args: &[String]| command(&args.iter().map(String::as_str).collect::<Vec<_>>());
-        assert!(matches!(parse(&first), Command::Exec { reserve_255: true, session: Some(ref s), ref command, .. } if s == ID && command == &ms(&["zidane", "-c"])));
-        assert!(matches!(parse(&again), Command::Exec { reserve_255: true, attach: Some(Some(ref a)), ref name, .. } if a == ID && name == "web-2"));
-        assert!(session_dials(&command(&["logs", "web"]), ID).is_none());
-        let entry = entry();
-        let argv = ssh::cli_argv(&entry, true, &again).unwrap();
-        assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"].map(OsString::from));
+    fn attaches_without_a_terminal_are_piped() {
+        assert_eq!(attach_mode(ID.into(), true), pty_client::Mode::Session { id: ID.into(), create: None });
+        let piped = pty_client::Mode::Pipe { argv: crate::commands::exec::session_attach_command(ID), interactive: true };
+        assert_eq!(attach_mode(ID.into(), false), piped);
     }
 
-    /// An ssh machine's dials are ssh argvs; an offered worker's `PTY`
-    /// requests: create-or-attach with the command (none: the login shell),
-    /// then attach only, both at the instance's root there.
+    /// A tty exec's dials: create-or-attach with the command (none: the
+    /// login shell), then attach only, both at the instance's root there.
     #[test]
-    fn offered_machines_dial_over_the_fleet_link() {
+    fn tty_execs_dial_over_the_link() {
         let root = Some(Path::new("/w/fleet/hub/cfg"));
-        let exec = command(&["exec", "-it", "lap/web", "zidane", "-c"]);
-        let Dials::Ssh { first, again } = dials(&entry(), &exec, "web-2", root, ID, true).unwrap() else { panic!("not ssh") };
-        let (f, a) = session_dials(&exec, ID).unwrap();
-        assert_eq!(first, ssh::cli_argv(&entry(), true, &remote_args(&f, "web-2", root).unwrap()).unwrap());
-        assert_eq!(again, ssh::cli_argv(&entry(), true, &remote_args(&a, "web-2", root).unwrap()).unwrap());
-
-        let lap = Entry { roots: vec!["/w/fleet/hub".into()], ..Entry::offered("lap") };
+        let exec = command(&["exec", "-it", "box/web", "zidane", "-c"]);
         let request = |create: Option<Vec<String>>| pty_client::Request {
             root: "/w/fleet/hub/cfg".into(),
             instance: "web-2".into(),
             mode: pty_client::Mode::Session { id: ID.into(), create },
         };
-        assert_eq!(
-            dials(&lap, &exec, "web-2", root, ID, true).unwrap(),
-            Dials::Pty { first: request(Some(ms(&["zidane", "-c"]))), again: request(None) }
-        );
-        let shell = dials(&lap, &command(&["exec", "lap/web"]), "web-2", root, ID, false).unwrap();
-        assert_eq!(shell, Dials::Pty { first: request(Some(Vec::new())), again: request(None) });
-        let e = dials(&lap, &exec, "web-2", None, ID, true).unwrap_err().to_string();
-        assert!(e.contains("has no config roots"), "{e}");
+        assert_eq!(dials("box", &exec, "web-2", root, ID).unwrap(), (request(Some(ms(&["zidane", "-c"]))), request(None)));
+        let shell = dials("box", &command(&["exec", "box/web"]), "web-2", root, ID).unwrap();
+        assert_eq!(shell, (request(Some(Vec::new())), request(None)));
+        let e = dials("box", &exec, "web-2", None, ID).unwrap_err().to_string();
+        assert_eq!(e, "machine `box` has no config roots (devsandbox machine ls)");
+        assert!(dials("box", &command(&["logs", "web"]), "web", root, ID).is_err());
     }
 
     #[test]

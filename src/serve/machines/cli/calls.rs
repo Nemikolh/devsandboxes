@@ -1,9 +1,9 @@
-//! CLI re-runs to an offered fleet worker (docs/architecture/daemon/machines.md,
-//! *The CLI*; fleet plan decision 15): API calls through this host's daemon
-//! with `machine` set (the quick calls, `machines::forward::QUICK`), never
-//! a `devsandbox …` run there, printed by the local commands' own render
-//! fns so the output reads as theirs; `gc` as the `gc` verb ([`Use::Gc`]).
-//! What has no such call yet is refused ([`refusal`]).
+//! CLI re-runs on a machine (docs/architecture/daemon/machines.md, *The
+//! CLI*; fleet plan decision 15): API calls through this host's daemon with
+//! `machine` set (the quick calls, `machines::forward::QUICK`), which go
+//! over the machine's link and its trust table, never a `devsandbox …` run
+//! there; printed by the local commands' own render fns so the output reads
+//! as theirs. What has no such call yet is refused ([`refusal`]).
 //!
 //! [`use_of`] is the pure choice; [`named`], [`per_root`] and [`listing`] make the calls
 //! through an injected [`Call`] and write to injected streams, so the tests
@@ -26,7 +26,7 @@ use crate::{Command, ServiceCommand};
 /// One daemon request: method, params → its response.
 pub(crate) type Call<'a> = dyn FnMut(&str, Value) -> Result<Response> + 'a;
 
-/// What a command does on an offered machine.
+/// What a command does on a machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Use {
     /// `logs` (no `--build`): `containers.logs` of the instance's container.
@@ -50,29 +50,22 @@ pub(crate) enum Use {
     Ps { all: bool, json: bool },
     /// `--machine m stats`: `containers.stats`.
     Stats { json: bool },
-    /// `--machine m gc`: the `gc` verb per config root, sent by
-    /// `verbs_client` (`CliVerb::Gc`). The worker answers it under `full`
-    /// trust only; under `worker` its refusal is the error.
-    Gc,
-    /// As on any machine: what goes over the fleet link already (a tty
-    /// `exec`, its sessions, `port`) and the verbs.
+    /// Not an API call made here: what goes over the link's streams
+    /// (`exec`, its sessions, `port`) and the verbs (`gc` among them, sent
+    /// by `verbs_client`).
     Link,
     Refused(Refused),
 }
 
-/// What an offered machine refuses.
+/// What a machine refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
-    /// A session `exec` that gets no tty (`--attach` without a terminal,
-    /// `--session` without `-t`): a session over the link needs one.
-    SessionNoTty,
     Vscode,
 }
 
-/// [`Use`] of `command` on an offered machine. Every `exec` is
-/// [`Use::Link`] here: whether it gets a tty, so a session or a pipe, is
-/// the caller's to tell (`cli::reconnect_session`, `cli::pipe_mode`), and
-/// [`Refused::SessionNoTty`] a session one's refusal without.
+/// [`Use`] of `command` on a machine. Every `exec` is [`Use::Link`] here:
+/// whether it gets a tty, so a session `PTY` dial or a piped one, is the
+/// caller's to tell (`cli::reconnect_session`, `cli::pipe_mode`).
 pub(crate) fn use_of(command: &Command) -> Use {
     match command {
         Command::Logs { build: true, follow, .. } => Use::BuildLog { follow: *follow },
@@ -85,33 +78,37 @@ pub(crate) fn use_of(command: &Command) -> Use {
         Command::Status { .. } => Use::Status,
         Command::Ps { all, json } => Use::Ps { all: *all, json: *json },
         Command::Stats { json } => Use::Stats { json: *json },
-        Command::Gc { .. } => Use::Gc,
         Command::Service { cmd: ServiceCommand::Ls { json } } => Use::ServiceLs { json: *json },
         Command::Vscode { .. } => Use::Refused(Refused::Vscode),
         _ => Use::Link,
     }
 }
 
-/// Why offered machine `m` refuses `what`.
+/// Why machine `m` refuses `what`.
 pub(crate) fn refusal(m: &str, what: Refused) -> anyhow::Error {
     let what = match what {
-        Refused::SessionNoTty => {
-            return anyhow::anyhow!(
-                "machine `{m}` is an offered fleet worker: a session `exec` there (`--attach`, `--session`) needs a terminal"
-            );
-        }
-        Refused::Vscode => "`vscode`",
+        Refused::Vscode => "`devsandbox vscode`",
     };
-    anyhow::anyhow!("machine `{m}` is an offered fleet worker: {what} isn't available over a fleet link yet")
+    anyhow::anyhow!("machine `{m}`: {what} isn't available over its link yet")
+}
+
+/// An error answer of machine `m` as ours: its message, naming `m` when
+/// it's the machine's trust refusing (`denied`), whose advice (`devsandbox
+/// machine trust full` there, `machine roots add`) is about that machine.
+fn answer_error(m: &str, e: crate::serve::proto::ErrorBody) -> anyhow::Error {
+    match e.code.as_str() {
+        "denied" => anyhow::anyhow!("machine `{m}`: {}", e.message),
+        _ => anyhow::anyhow!("{}", e.message),
+    }
 }
 
 /// `method` with `params` (plus `machine: m`) through `call`: its result, or
-/// its error's message as ours.
+/// its error as ours ([`answer_error`]).
 fn call_on<T: DeserializeOwned>(call: &mut Call, m: &str, method: &str, mut params: Value) -> Result<T> {
     params["machine"] = json!(m);
     let r = call(method, params)?;
     if let Some(e) = r.error {
-        bail!("{}", e.message);
+        return Err(answer_error(m, e));
     }
     serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("bad {method} result from devsandbox serve"))
 }
@@ -125,7 +122,8 @@ fn list(call: &mut Call, m: &str, dir: &Path, depth: Option<&str>) -> Result<Ins
 }
 
 /// Instance `name`'s row on `m`, from a listing at `root` (any root there:
-/// a snapshot lists every instance the worker lends, whatever its `dir`).
+/// a snapshot lists every instance the machine's trust admits, whatever its
+/// `dir`).
 fn row_of(call: &mut Call, m: &str, root: &Path, name: &str) -> Result<Option<InstanceRow>> {
     Ok(list(call, m, root, Some("disk"))?.snapshot.instances.into_iter().find(|r| r.name == name))
 }
@@ -142,7 +140,7 @@ fn container_of(row: Option<&InstanceRow>, name: &str) -> String {
 }
 
 /// Run named `u` (not [`Use::Ls`] / `Status` / `Link` / `Refused`) on
-/// instance or container `name` of offered machine `m`, `root` its config
+/// instance or container `name` of machine `m`, `root` its config
 /// root there (or the machine's root). `tty`: stdout is a terminal (a pty
 /// build log keeps its colours). The exit code.
 pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, tty: bool, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
@@ -190,7 +188,6 @@ pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, 
         | Use::ServiceLs { .. }
         | Use::Ps { .. }
         | Use::Stats { .. }
-        | Use::Gc
         | Use::Link
         | Use::Refused(_) => {
             bail!("not a named re-run")
@@ -222,7 +219,7 @@ pub(crate) fn follow_next(page: &crate::build_log::Page, offset: u64) -> Follow 
 }
 
 /// `logs --build --follow` of instance `name` (`id`: its `instance_id`, or
-/// the name) on offered machine `m`: `instances.buildLog` pages from the
+/// the name) on machine `m`: `instances.buildLog` pages from the
 /// log's start until one is complete, printed as `commands::logs::build_log`
 /// follows a local one (as they are on a terminal, `tty`; a pty log's
 /// escapes stripped as they come elsewhere, `build_log::Strip`). The record
@@ -242,7 +239,7 @@ pub(crate) fn follow_build_log(
         let r = call("instances.buildLog", json!({ "instance": id, "offset": offset, "machine": m }))?;
         let page: Option<crate::build_log::Page> = match r.error {
             Some(e) if strip.is_some() && e.code == "not-found" => return Ok(()),
-            Some(e) => bail!("{}", e.message),
+            Some(e) => return Err(answer_error(m, e)),
             None => serde_json::from_value(r.result.unwrap_or(Value::Null))
                 .context("bad instances.buildLog result from devsandbox serve")?,
         };
@@ -268,9 +265,9 @@ pub(crate) fn follow_build_log(
     }
 }
 
-/// `--machine m ps|stats` (`u`) on offered machine `m`: one
-/// `containers.list` / `containers.stats` (the worker cuts the rows to what
-/// it lends), printed by the local command's render. The exit code.
+/// `--machine m ps|stats` (`u`) on machine `m`: one `containers.list` /
+/// `containers.stats` (the machine cuts the rows to what its trust admits),
+/// printed by the local command's render. The exit code.
 pub(crate) fn listing(call: &mut Call, u: &Use, m: &str, out: &mut dyn Write) -> Result<i32> {
     match u {
         Use::Ps { all, json } => {
@@ -287,21 +284,32 @@ pub(crate) fn listing(call: &mut Call, u: &Use, m: &str, out: &mut dyn Write) ->
 }
 
 /// The config roots a machine root `at` stands for, from a listing of it:
-/// an offered worker's one root is its fleet root, whose config roots (one
-/// per placed config) its instance rows name. None named: `at` itself.
+/// `at` itself when it is one (an ssh machine's registered roots), and the
+/// config roots under it its instance rows name (a fleet root's, one per
+/// placed config; a listing lists every admitted instance, so rows outside
+/// `at` are other roots'). A root without a config of its own (the
+/// listing's `config: ` error) stands only for those under it, when it has
+/// any.
 pub(crate) fn config_roots(at: &Path, list: &InstancesList) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = list.snapshot.instances.iter().filter_map(|r| r.root.as_ref().map(PathBuf::from)).collect();
-    roots.sort();
-    roots.dedup();
-    if roots.is_empty() {
+    let mut roots: Vec<PathBuf> = list
+        .snapshot
+        .instances
+        .iter()
+        .filter_map(|r| r.root.as_ref().map(PathBuf::from))
+        .filter(|r| r.starts_with(at))
+        .collect();
+    let configless = list.snapshot.error.as_deref().is_some_and(|e| e.contains("config: "));
+    if roots.is_empty() || !configless {
         roots.push(at.to_path_buf());
     }
+    roots.sort();
+    roots.dedup();
     roots
 }
 
-/// `--machine m ls|status` (`u`) on offered machine `m` with registered
+/// `--machine m ls|status|service ls` (`u`) on machine `m` with registered
 /// `roots`: one `instances.list` per config root ([`config_roots`]), each
-/// after its banner on `err` (`cli::per_root`'s rules: `--json` with
+/// after its banner on `err` (`cli::root_banners`' rules: `--json` with
 /// several roots is an error). The exit code.
 pub(crate) fn per_root(call: &mut Call, u: &Use, m: &str, roots: &[PathBuf], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
     let json = match u {
@@ -313,14 +321,15 @@ pub(crate) fn per_root(call: &mut Call, u: &Use, m: &str, roots: &[PathBuf], out
     for at in roots {
         config.extend(config_roots(at, &list(call, m, at, Some("disk"))?));
     }
-    // Same checks (no roots, `--json` with several) and banners as an ssh machine's runs.
-    let runs = super::per_root(m, &config, &[], json)?;
-    for (root, (banner, _)) in config.iter().zip(runs) {
+    config.sort();
+    config.dedup();
+    let banners = super::root_banners(m, &config, json)?;
+    for (root, banner) in config.iter().zip(banners) {
         writeln!(err, "{banner}")?;
         match u {
             Use::Status => writeln!(out, "{}", crate::commands::status::render(&list(call, m, root, None)?.snapshot)?)?,
             Use::ServiceLs { json } => {
-                // A listing for the statuses; `used_by` already cut to what the worker lends.
+                // A listing for the statuses; `used_by` already cut to what the trust admits.
                 let snapshot = list(call, m, root, Some("listing"))?.snapshot;
                 if let Some(e) = snapshot.error {
                     if snapshot.services.is_empty() && e.contains("config: ") {
@@ -383,8 +392,8 @@ mod tests {
         assert_eq!(u(&["ps", "--json"]), Use::Ps { all: false, json: true });
         assert_eq!(u(&["stats"]), Use::Stats { json: false });
         assert_eq!(u(&["stats", "--json"]), Use::Stats { json: true });
-        assert_eq!(u(&["gc", "--force"]), Use::Gc);
-        assert_eq!(u(&["gc"]), Use::Gc);
+        // `gc` is a verb: `verbs_client` sends it.
+        assert_eq!(u(&["gc", "--force"]), Use::Link);
         assert_eq!(u(&["service", "ls"]), Use::ServiceLs { json: false });
         assert_eq!(u(&["service", "ls", "--json"]), Use::ServiceLs { json: true });
         assert_eq!(u(&["vscode", "lap/web"]), Use::Refused(Refused::Vscode));
@@ -396,11 +405,7 @@ mod tests {
     #[test]
     fn refusals_name_the_command_and_why() {
         let r = |what| refusal("lap", what).to_string();
-        assert_eq!(r(Refused::Vscode), "machine `lap` is an offered fleet worker: `vscode` isn't available over a fleet link yet");
-        assert_eq!(
-            r(Refused::SessionNoTty),
-            "machine `lap` is an offered fleet worker: a session `exec` there (`--attach`, `--session`) needs a terminal"
-        );
+        assert_eq!(r(Refused::Vscode), "machine `lap`: `devsandbox vscode` isn't available over its link yet");
     }
 
     fn row(name: &str, container: &str, root: &str, done: bool) -> Value {
@@ -598,11 +603,20 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// A fleet root (no config of its own) stands for the config roots its
+    /// rows name under it; an ssh machine's config root for itself, never
+    /// for the machine's other roots its listing's rows name.
     #[test]
-    fn a_fleet_root_stands_for_its_rows_config_roots() {
-        let rows = vec![row("a", "c", "/f/b", false), row("b", "c", "/f/a", false), row("c", "c", "/f/a", false)];
-        assert_eq!(config_roots(Path::new("/f"), &list_of(listing(rows, vec![], None))), [PathBuf::from("/f/a"), PathBuf::from("/f/b")]);
-        assert_eq!(config_roots(Path::new("/f"), &list_of(listing(vec![], vec![], None))), [PathBuf::from("/f")]);
+    fn a_root_stands_for_itself_or_the_config_roots_under_it() {
+        let p = |s: &[&str]| s.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let rows = || vec![row("a", "c", "/f/b", false), row("b", "c", "/f/a", false), row("c", "c", "/f/a", false), row("d", "c", "/r", false)];
+        let configless = Some("config: no devsandboxes.toml");
+        assert_eq!(config_roots(Path::new("/f"), &list_of(listing(rows(), vec![], configless))), p(&["/f/a", "/f/b"]));
+        assert_eq!(config_roots(Path::new("/f"), &list_of(listing(vec![], vec![], configless))), p(&["/f"]));
+        assert_eq!(config_roots(Path::new("/r"), &list_of(listing(rows(), vec![], None))), p(&["/r"]));
+        assert_eq!(config_roots(Path::new("/s"), &list_of(listing(rows(), vec![], None))), p(&["/s"]), "no instances there yet");
+        // A config root with others nested in it: itself and those.
+        assert_eq!(config_roots(Path::new("/f"), &list_of(listing(rows(), vec![], None))), p(&["/f", "/f/a", "/f/b"]));
     }
 
     fn run_per_root(u: Use, answer: impl FnMut(&str, &Value) -> Result<Value, (&'static str, String)>) -> (Result<i32>, String, String) {
@@ -683,9 +697,11 @@ mod tests {
         let (_, out, _) = run(Use::Ps { all: false, json: false });
         assert!(out.contains("Up 1 hour (done)") && out.contains("failed (postStartCommand)"), "{out}");
 
-        let mut f = fake(|_: &str, _: &Value| Err(("denied", "`containers.list` isn't lent to a fleet hub".into())));
+        // A trust refusal is the error, naming the machine it's about.
+        let denied = "`/x` isn't one of this member's roots (`devsandbox machine roots add <path>` there adds one)";
+        let mut f = fake(|_: &str, _: &Value| Err(("denied", denied.into())));
         let r = super::listing(&mut |m, p| f.call(m, p), &Use::Ps { all: false, json: false }, "lap", &mut Vec::new());
-        assert_eq!(r.unwrap_err().to_string(), "`containers.list` isn't lent to a fleet hub");
+        assert_eq!(r.unwrap_err().to_string(), format!("machine `lap`: {denied}"));
     }
 
     /// `service ls` prints the listing's service rows as the local one
@@ -704,6 +720,8 @@ mod tests {
             let depths = &depths;
             move |_: &str, p: &Value| {
                 depths.borrow_mut().push((p["dir"].clone(), p["depth"].clone()));
+                // The fleet root has no config of its own.
+                let error = if p["dir"] == "/f" { Some("config: no devsandboxes.toml") } else { error };
                 let mut l = listing(vec![row("w", "c", "/f/cfg", false)], vec![], error);
                 l["services"] = services.clone();
                 Ok(l)
@@ -733,7 +751,10 @@ mod tests {
         assert_eq!(r.unwrap_err().to_string(), "lap:/f: config: no devsandboxes.toml");
         let (_, out, _) = run_per_root(Use::Ls { json: false }, |_, _| Ok(listing(vec![], vec![], None)));
         assert_eq!(out, "no sandboxes defined in /f\n");
-        let two = |_: &str, _: &Value| Ok(listing(vec![row("a", "c", "/f/a", false), row("b", "c", "/f/b", false)], vec![], None));
+        let two = |_: &str, p: &Value| {
+            let error = (p["dir"] == "/f").then_some("config: no devsandboxes.toml");
+            Ok(listing(vec![row("a", "c", "/f/a", false), row("b", "c", "/f/b", false)], vec![], error))
+        };
         let (r, ..) = run_per_root(Use::Status, two);
         assert!(r.unwrap_err().to_string().contains("/f/a, /f/b"));
         let (r, _, err) = run_per_root(Use::Ls { json: false }, two);

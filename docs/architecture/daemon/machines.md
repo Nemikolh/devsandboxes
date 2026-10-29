@@ -18,7 +18,7 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 (`serve`, `End`, `SPEC`: the old agent relay, unused), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
-`localize`, `Reconnect`, `Dials`), `cli/offered.rs` (`use_of`, `Use`,
+`localize`, `Reconnect`, `dials`, `pipe_mode`, `attach_mode`), `cli/calls.rs` (`use_of`, `Use`,
 `Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
 `parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
 `src/serve/fleet/dialer.rs` (`Dialer`, `dial`, `link_args`),
@@ -94,17 +94,20 @@ The machine's link itself is no argv here: the daemon dials it through
 `fleet::transport::Transport::ssh` (`ssh -T -o BatchMode=yes [-p N] --
 <host> <command> fleet-link --peer <member>`, the entry's `command` as the
 program: `Transport::dial_with`; [Held links](#held-links-machines)). The
-argvs below are the add-time ssh and the per-use ones, which step 8 of the
-[fleet plan](../../plans/active/fleet.md) moves onto the link's channels:
+argvs below are the add-time ssh and the per-use ones the dashboard's
+terminals and the forwards still run, which step 8 of the
+[fleet plan](../../plans/active/fleet.md) moves onto the link's channels
+(the CLI's commands on a machine are on them: [The CLI](#the-cli-clirs)):
 
 - `api_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … api --stdio
   --client <c> --session-env` (the daemon has no TTY: ssh must fail, not
   prompt), what `machines.probe` and `machines.add` dial (`ssh_dial`)
   before the machine has a link.
-- `tty_argv` / `tty_argv_with`: `-t`, no `BatchMode` (terminal tabs,
-  interactive re-runs; `tty_argv_with` runs `<runtime> exec -it` for
-  service tabs).
-- `cli_argv`: `-t` on a terminal, else `-T` (piped bytes stay clean).
+- `tty_argv` / `tty_argv_with`: `-t`, no `BatchMode` (terminal tabs;
+  `tty_argv_with` runs `<runtime> exec -it` for service tabs).
+- `cli_argv`: `-t` on a terminal, else `-T` (piped bytes stay clean);
+  `machine add`'s `machine roots add` over the add-time ssh
+  ([`devsandbox machine add…`](#devsandbox-machine-addlssetrmtrustroots)).
 - `tunnel_argv`: `ssh -T [-o BatchMode=yes] [-p N] -- <host> … -C <root>
   tunnel [--instance=<name>] [--service=<svc>] --port <n>`, a remote
   forward's bridge ([forwards.md](forwards.md#remote-bridges));
@@ -151,8 +154,8 @@ The add-time `api_argv` relay attaches its connection the same way
 to its newline and not relayed); a refused attach ends the relay with
 exit 1 and the reason on stderr, which the link reports as ssh's stderr
 tail (`LinkError::Closed`); the daemon hanging up first is exit 75. The
-per-use argvs (`tty_argv`, `cli_argv`, `tunnel_argv`) are ssh shells on
-the machine: the trust table isn't in their path.
+per-use argvs (`tty_argv`, `tunnel_argv`) are ssh shells on the machine:
+the trust table isn't in their path.
 
 ## Install
 
@@ -330,7 +333,7 @@ On the machine nothing registers the socket: `bridge::host_agent` tries
 the live `agent-*.sock` files in the socket dir (`endpoint::agent_sockets`,
 newest mtime first) after the agents clients reported and before the
 process's own `$SSH_AUTH_SOCK`, so the daemon's bridges and any command
-run there (a CLI re-run, a terminal tab) find it, and a link that's gone
+run there (a verb, an `exec`'s `PTY` stream, a terminal tab) find it, and a link that's gone
 drops out by the liveness check.
 
 Each machine's `agent` flag (`Entry::agent`, off by default) is set by
@@ -353,7 +356,11 @@ The old agent relay (`ssh::agent_argv`, `devsandbox agent-relay`,
 ## The CLI: `cli.rs`
 
 `route` (I/O) runs `plan` (pure) in `main` before a verb goes to
-`verbs_client` or any command runs locally:
+`verbs_client` or any command runs locally. A command on a machine goes
+over the machine's link (`fleet-<name>.*.sock`, the same for every kind of
+machine) and so through the machine's trust table (fleet plan decision 15:
+API calls and `PTY` streams within its trust, never a `devsandbox …` run
+there); only `port` still runs its own ssh on an ssh machine (below).
 
 - Under `--in-process`: nothing fans out; `--machine` is an error.
 - **Verbs** (`run`, `rebuild`, `start`, `stop`, `rm`) keep their name;
@@ -361,138 +368,130 @@ The old agent relay (`ssh::agent_argv`, `devsandbox agent-relay`,
   `sandboxes.list` with `machines: true`), picking on a TTY when ambiguous,
   and sends the request with the match's `machine` and root.
 - **Other named commands** (`exec`, `logs`, `inspect`, `done`, `undone`,
-  `rename`, …) are resolved through the daemon; one on a machine is re-run
-  as `ssh [-t] <target> devsandbox <args>` (`exec` of ssh, but for a tty
-  `exec`, below; `exec --service <name>` re-runs with `--service=<name>`,
-  once). `logs` /
-  `inspect` with a bare `devsandbox-…` container name stay local. `port`
-  on a machine's instance runs here: `route` returns `Routed::Port` (the
-  machine's `Entry`, the match's root or else the machine's first, the
-  instance as the machine names it) and `commands::port::port_remote`
-  forwards over one ssh per port (`ssh::tunnel_argv` without `BatchMode`,
-  `tunnel::remote_opener`; [forwards](forwards.md)), or on an offered
-  fleet worker one `TUNNEL` stream per bridge over its fleet link
-  ([fleet](fleet.md#tunnel)). `vscode` on a
-  machine's instance is refused.
-- **`--machine m`** is for nameless commands (`machine_use`; an offered
-  worker's: below): `ps`, `stats` run once over ssh; root-bound ones (`ls`, `status`, `gc`,
-  `service ls`) run once per registered root with `-C <root>` and a
-  `==> m:<root>` line (`--json` with several roots is an error); `stop
-  --all`, `rebuild --all`, `start --all`, `service rebuild` go as verbs;
-  `port --service <svc>` naming no instance (`MachineUse::Port`) forwards
-  the machine's global service from its first registered root, as above.
-  On a named command it's an error (qualify the name instead); refused for
-  `inbox`, `vscode`, `serve`, `api`, `machine`, the dashboard.
+  `rename`, …) are resolved through the daemon; one on a machine is API
+  calls through this host's daemon with `machine` set, or `PTY` dials from
+  this process for an `exec` (below). `logs` / `inspect` with a bare
+  `devsandbox-…` container name stay local. `port` on a machine's instance
+  runs here: `route` returns `Routed::Port` (the machine's `Entry`, the
+  match's root or else the machine's first, the instance as the machine
+  names it) and `commands::port::port_remote` forwards over one ssh per
+  port on an ssh machine (`ssh::tunnel_argv` without `BatchMode`,
+  `tunnel::remote_opener`; [forwards](forwards.md)), or on an offered fleet
+  worker one `TUNNEL` stream per bridge over its fleet link
+  ([fleet](fleet.md#tunnel)). `vscode` on a machine's instance is refused
+  (`calls::refusal`: not available over its link yet).
+- **`--machine m`** is for nameless commands (`machine_use`): `ps`,
+  `stats`, `ls`, `status`, `service ls` are API calls
+  (`MachineUse::Calls`, below); `stop --all`, `rebuild --all`, `start
+  --all`, `service rebuild` and `gc` go as verbs (`verbs_client`; `gc` is
+  `CliVerb::Gc`, one `gc` request per config root, each after its `==>
+  m:<root>` line, the roots as `ls` takes them); `port --service <svc>`
+  naming no instance (`MachineUse::Port`) forwards the machine's global
+  service from its first registered root, as above. On a named command
+  it's an error (qualify the name instead); refused for `inbox`, `vscode`,
+  `serve`, `api`, `machine`, the dashboard.
+- **Trust**: every call and stream is served by the machine's daemon
+  under its trust for this host ([ssh](#ssh)). Under `worker` (the
+  default) a command reaches the machine's own roots (those its
+  instances name, plus its `member.toml` `roots`, which `machine add`
+  records) and its fleet root for this host only, and `gc` is refused;
+  `devsandbox machine trust full` on the machine opens the rest. A
+  refusal (`denied`) is the command's error, named after the machine
+  (`calls::answer_error`: ``machine `m`: …``, the machine's advice after
+  it).
 - Without a local daemon, a qualified remote name and `--machine` fail
   ("needs devsandbox serve"); a bare name resolves locally.
-- **The agent**: the `machines.get` lookup before a re-run passes this
-  process's `SSH_AUTH_SOCK` (if absolute) as `agent` (`info_params`), so
-  with the machine's `agent` on the agent the daemon answers the
-  machine's `AGENT` streams with, which the re-run there finds as
-  `agent-link-<this host>.sock` ([Agent](#agent)), is this terminal's.
-  Nothing is held for the run: the link is always up.
-- **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /
-  `--sessions` / `--service`, and a tty by the remote `exec`'s rule, `shell_flags`, with
-  this process on a terminal standing for the remote stdin). The id is this
-  process's (`--session` as given, else `exec::mint_session_id`), and the
-  ssh is always spawned (`reconnect_loop`, through
-  `spawn_ssh_owning_signals`: while it runs this process ignores SIGINT
-  and SIGQUIT, since with `-t` ssh owns the terminal; ssh gets the
-  dispositions back as they were, a `pre_exec`): the first
-  dial runs `exec --reserve-255 --session=<id> …` (create-or-attach),
-  each re-dial `exec --reserve-255 <name> --attach=<id>` (attach only: a
-  reconnect never starts a second program; `session_dials`). `Reconnect`
-  (pure) decides after each dial: 255 is ssh's own failure, since
-  `--reserve-255` (hidden) makes the remote `exec` report a program's 255
-  as 254 (`exec::reported_code`); after a dial that ran
-  `CONNECTED_AFTER` (5 s) it is an outage: `connection lost,
-  reconnecting… (Ctrl-C to stop)` on stderr, then `reconnecting… (attempt
-  N)` per further try, re-dialed after `backoff` (1, 2, 4, 8, then 10 s,
-  no limit on tries). A 255 before any dial got that far is ssh failing to
-  connect: the loop ends with it. Any other code ends the loop with it;
-  `NO_SESSION_EXIT` (250) also prints that the session is gone (`gone_note`);
-  the helper's 251 (attached elsewhere) and 252 (`VERSION_EXIT`: started
-  by another devsbd, still running) end it too, the helper's own note on
-  stderr.
-  Without the helper on the remote instance `--session` is a plain exec,
-  so a re-dial's `--attach` fails there (exit 1, its message on stderr)
-  and ends the loop. SIGINT is only ignored while ssh runs, so Ctrl-C
-  during a wait ends the process.
-- **On an offered fleet worker** (no ssh to it, [fleet](fleet.md#pty))
-  the dials are `PTY` streams over its fleet link from this process
-  (`fleet::pty_client::dial`), in the same loop: `dials` picks `Dials::Pty`
-  for an offered entry (`Dials::Ssh`, the argvs above, otherwise) and
-  `run_dials` hands `reconnect_loop` the dial closure. The first dial
-  creates the session (or attaches) running the command (none: the login
-  shell), each re-dial attaches only, at the instance's root there (the
-  match's, else the machine's one root); a dial's end becomes the exit
-  code an ssh dial would give (`pty_client::exit_of`: 255 only for a lost
-  link), so `Reconnect` is unchanged. `--sessions` is a `sessions.list`
-  quick call with `machine` (the lines printed, or `no sessions in
-  \`m/x\`` on stderr); a tty `--attach [ID]` is one dial attaching only
-  (no id: `exec::choose_detached` over that list), no loop, as over ssh
-  (`offered_session_exec`). An `exec` without a tty is one piped `PTY`
-  dial ([fleet](fleet.md#pty), *Pipe mode*) and never re-dialed:
-  `cli::pipe_mode` (pure) gives its argv and `-i` as a local `exec`
-  decides them (the command as typed with `-i` as given; none, the login
-  shell with `exec::shell_flags`' `-i`), and `resolve_and_route` dials it
-  with the machine held for the agent. A session `exec` without a tty
-  (`--attach` off a terminal, `--session` without `-t`) is refused
-  (`offered::Refused::SessionNoTty`). `exec --service <name>` is one
-  service `PTY` dial (`cli::service_mode`: the command as typed, none the
-  worker's login shell; [fleet](fleet.md#pty), *Service terminals*), never
-  re-dialed (no session), refused without a terminal. A fallback terminal
-  ([fleet](fleet.md#pty), *Tty fallback*) is dialed as a session, so a
-  lost link re-dials its attach, which the worker answers with
-  `no-session`: the loop ends with 250 and the worker's
-  not-resumable message.
-- **Other re-runs to an offered fleet worker** are API calls through this
-  host's daemon with `machine` set (fleet plan decision 15: within the
-  worker's trust, never a `devsandbox …` run there), printed by the local
-  command's own render fns (`commands::logs::render_logs`,
-  `inspect::render`, `ls::table` / `ls::render_json`, `status::render`,
-  `done::status_line`, `rename::renamed_line`, `ps::render`,
-  `stats::render`, `services::ls_render`), so the output reads the same; `cli::offered::use_of`
-  (pure) picks the call, `offered::named` / `offered::per_root` /
-  `offered::listing` make them over an injected call. `logs [-n N]` is
-  `containers.logs` of the instance's container (its row's, from an
-  `instances.list` at `depth: disk`: a rename keeps the container; a name
-  that is no instance is taken as a container name); `logs --build` is
-  `instances.buildLog` (up to `api::MAX_LINES` lines, a note on stderr
-  when cut; `ansi` when stdout is a terminal); `logs --build --follow` is
-  `instances.buildLog` pages with `offset` (`offered::follow_build_log`,
-  by the row's `instance_id`, so a rename doesn't lose it): from the
-  log's start, the next page at once while pages bring something, after
-  `logs::FOLLOW_POLL` when one doesn't (`offered::follow_next`), until
-  one is `complete`; printed as the local follow prints (as they are on a
+- **The agent**: the `machines.get` lookup before a command on a machine
+  passes this process's `SSH_AUTH_SOCK` (if absolute) as `agent`
+  (`info_params`), so with the machine's `agent` on the agent the daemon
+  answers the machine's `AGENT` streams with, which the command there
+  finds as `agent-link-<this host>.sock` ([Agent](#agent)), is this
+  terminal's. Nothing is held for the run: the link is always up.
+- **API calls** (`cli::calls`): printed by the local command's own render
+  fns (`commands::logs::render_logs`, `inspect::render`, `ls::table` /
+  `ls::render_json`, `status::render`, `done::status_line`,
+  `rename::renamed_line`, `ps::render`, `stats::render`,
+  `services::ls_render`), so the output reads the same; `calls::use_of`
+  (pure) picks the call, `calls::named` / `calls::per_root` /
+  `calls::listing` make them over an injected call; each exits 0, an
+  error answer is the command's error. `logs [-n N]` is `containers.logs`
+  of the instance's container (its row's, from an `instances.list` at
+  `depth: disk`: a rename keeps the container; a name that is no instance
+  is taken as a container name); `logs --build` is `instances.buildLog`
+  (up to `api::MAX_LINES` lines, a note on stderr when cut; `ansi` when
+  stdout is a terminal); `logs --build --follow` is `instances.buildLog`
+  pages with `offset` (`calls::follow_build_log`, by the row's
+  `instance_id`, so a rename doesn't lose it): from the log's start, the
+  next page at once while pages bring something, after
+  `logs::FOLLOW_POLL` when one doesn't (`calls::follow_next`), until one
+  is `complete`; printed as the local follow prints (as they are on a
   terminal, a pty log through `build_log::Strip` elsewhere), and the
   record gone meanwhile ends it, as locally; `inspect [--json]` is
-  `containers.inspect` (without the local one's browser sandbox line:
-  that comes from this host's record); `done` / `undone` are
-  `instances.done`, worded from the row's `done` before; `rename` is
-  `instances.rename`. `--machine m ls [--json]` and `status --json` list
-  each config root its listing of the machine's one root (its fleet root)
-  names: the roots its instance rows name (`offered::config_roots`: the
-  placed configs', and under `worker` trust the worker's own roots'
-  instances too; none: the fleet root itself), each an `instances.list` after its `==> m:<root>` line,
-  `per_root`'s rules (`--json` with several roots is an error); `ls`
-  renders the snapshot's sandbox rows (a config that doesn't load is the
-  error, as locally). `--machine m service ls [--json]` takes the same
-  roots and rules, each an `instances.list` at `depth: listing` (container
-  statuses), and renders its service rows (`used_by` cut to the lent
-  instances); the snapshot's `error` (the runtime's, resolve failures)
-  goes to stderr, a config that doesn't load is the error. The empty
-  line names `<root>/devsandboxes.toml`. `--machine m ps [--all] [--json]` is one
-  `containers.list`, `stats [--json]` one `containers.stats`
-  (`offered::listing`): the worker answers its whole runtime's rows cut to
+  `containers.inspect` (without the local one's browser sandbox line: that
+  comes from this host's record); `done` / `undone` are `instances.done`,
+  worded from the row's `done` before; `rename` is `instances.rename`.
+  `--machine m ls [--json]` and `status --json` take each registered root
+  for the config roots it stands for (`calls::config_roots`: itself, and
+  the config roots under it its listing's instance rows name; a root
+  without a config of its own, a fleet root, only those, when it has
+  any), each an `instances.list` after its `==> m:<root>` line
+  (`root_banners`: `--json` with several roots is an error); `ls` renders
+  the snapshot's sandbox rows (a config that doesn't load is the error, as
+  locally). `--machine m service ls [--json]` takes the same roots and
+  rules, each an `instances.list` at `depth: listing` (container
+  statuses), and renders its service rows (`used_by` cut to what the
+  trust admits); the snapshot's `error` (the runtime's, resolve failures)
+  goes to stderr, a config that doesn't load is the error. The empty line
+  names `<root>/devsandboxes.toml`. `--machine m ps [--all] [--json]` is
+  one `containers.list`, `stats [--json]` one `containers.stats`
+  (`calls::listing`): the machine answers its whole runtime's rows cut to
   what its trust reaches (those instances' containers and their config
-  roots' services, [fleet](fleet.md#the-trust-table)). `--machine m gc
-  [--force]` (`offered::Use::Gc`) is handed on to `verbs_client`: the `gc`
-  verb per config root (`config_roots`, as `ls`), each after its banner;
-  the worker runs it under `full` trust only, its `worker` refusal is the
-  error. Refused, naming the command (`offered::refusal`): `vscode` (not
-  over a fleet link yet), and a session `exec` without a tty (a session
-  over the link needs a terminal).
+  roots' services, [fleet](fleet.md#the-trust-table)).
+- **An `exec`** is `PTY` streams over the machine's link from this
+  process (`fleet::pty_client::dial`, [fleet](fleet.md#pty)), at the
+  instance's root there (the match's, else the machine's first); a dial's
+  end becomes this process's exit code (`pty_client::exit_of`: the
+  program's, 255 only for a lost link, the helper's session codes).
+- **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /
+  `--sessions` / `--service`, and a tty by a local `exec`'s rule,
+  `shell_flags`, with this process on a terminal standing for its stdin).
+  The id is this process's (`--session` as given, else
+  `exec::mint_session_id`); the first dial creates the session (or
+  attaches) running the command (none: the login shell), each re-dial
+  attaches only (a reconnect never starts a second program; `dials`),
+  both `--reserve-255` (a program's 255 reported as 254), in
+  `reconnect_loop`. `Reconnect` (pure, shared with the dashboard's remote
+  tabs) decides after each dial: after a dial that ran `CONNECTED_AFTER`
+  (5 s) a 255 is an outage: `connection lost, reconnecting… (Ctrl-C to
+  stop)` on stderr, then `reconnecting… (attempt N)` per further try,
+  re-dialed after `backoff` (1, 2, 4, 8, then 10 s, no limit on tries). A
+  255 before any dial got that far ends the loop with it. Any other code
+  ends the loop with it; `NO_SESSION_EXIT` (250) also prints that the
+  session is gone (`gone_note`); the helper's 251 (attached elsewhere) and
+  252 (`VERSION_EXIT`: started by another devsbd, still running) end it
+  too, the helper's own note on stderr. A fallback terminal
+  ([fleet](fleet.md#pty), *Tty fallback*: no helper, a non-root one) is
+  dialed as a session, so a lost link re-dials its attach, which the
+  machine answers with `no-session`: the loop ends with 250 and the
+  machine's not-resumable message. Ctrl-C during a wait ends the process.
+- **Sessions**: `--sessions` is a `sessions.list` quick call with
+  `machine` (the lines printed, or `no sessions in \`m/x\`` on stderr);
+  `--attach [ID]` is one dial attaching only (no id:
+  `exec::choose_detached` over that list), no loop, as a local
+  `--attach` (`session_exec`): on a terminal a session dial, else the
+  helper's session client piped (`attach_mode`:
+  `exec::session_attach_command`, stdin kept), as a local `exec --attach`
+  without a tty runs it.
+- **An `exec` without a tty** is one piped `PTY` dial ([fleet](fleet.md#pty),
+  *Pipe mode*), never re-dialed: `cli::pipe_mode` (pure) gives its argv
+  and `-i` as a local `exec` decides them (the command as typed with `-i`
+  as given; none, the login shell with `exec::shell_flags`' `-i`); with
+  `--session <id>` that argv in the helper's session `id`
+  (`exec::session_new_command`), as a local `exec --session` without a tty
+  runs it. `exec --service <name>` is one service `PTY` dial
+  (`cli::service_mode`: the command as typed, none the machine's login
+  shell; [fleet](fleet.md#pty), *Service terminals*), never re-dialed (no
+  session), refused without a terminal.
 
 ## `devsandbox machine add|ls|set|rm|trust|roots`
 

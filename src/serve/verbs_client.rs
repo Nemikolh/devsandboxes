@@ -72,10 +72,9 @@ pub(crate) enum CliVerb {
     /// `service rebuild <name>`: names a service, so no prompt, no cancel by
     /// name (the first Ctrl-C hangs up, as `stop --all`'s).
     ServicesRebuild { name: String },
-    /// `--machine m gc` on an offered fleet worker (`machines::cli::route`
-    /// leaves only that one to us): one request per config root there. A
-    /// local `gc` stays in this process, as does an ssh machine's (`ssh …
-    /// devsandbox gc`).
+    /// `--machine m gc`: one request per config root there, answered
+    /// under the machine's `full` trust only. A local `gc` stays in this
+    /// process.
     Gc { force: bool },
 }
 
@@ -553,8 +552,8 @@ fn prepare(
         },
         CliVerb::Gc { force } => match machine_roots(call)? {
             None => one("gc", serde_json::to_value(GcParams { root, env, force, detach: false })?, None),
-            // An offered worker's root is its fleet root: the config roots
-            // its rows name, as its `ls` lists them (`cli::config_roots`).
+            // A machine's roots as its `ls` lists them (`cli::config_roots`:
+            // a fleet root stands for the config roots under it).
             Some((m, roots)) => {
                 let mut config = Vec::new();
                 for at in &roots {
@@ -1219,7 +1218,7 @@ mod tests {
         assert_eq!(verb(&["logs", "w"]), None);
         assert_eq!(verb(&["service", "ls"]), None);
         assert_eq!(verb(&["gc"]), None);
-        // With `--machine` (an offered worker's, `cli::route` decides): a verb.
+        // With `--machine`: a verb.
         let gc = Cli::try_parse_from(["devsandbox", "--machine", "lap", "gc", "--force"]).unwrap();
         assert_eq!(from_command(&gc.command.unwrap(), gc.machine.as_deref()), Some(CliVerb::Gc { force: true }));
         let cli = Cli::try_parse_from(["devsandbox", "--in-process", "stop", "w"]).unwrap();
@@ -1724,21 +1723,22 @@ mod tests {
         let none = [machine(), ("services.get", err("not-found", "no service", None))];
         let e = prep_fed(&CliVerb::ServicesRebuild { name: "db".into() }, &on("a"), false, None, &none, 0).0.unwrap_err();
         assert_eq!(e.to_string(), "no service `db` on machine `a` (roots: /r1, /r2)");
-        // `gc` (an offered worker's): each config root its rows name, else the root itself.
+        // `gc`: a fleet root (no config of its own) stands for the config
+        // roots its rows name under it, a config root for itself.
         let row = |name: &str, root: &str| {
             json!({"name": name, "sandbox": "web", "container": "c", "status": {"state": "running", "text": "Up"}, "uptime_secs": 0,
                 "cpu": null, "mem": null, "folder": "", "worktree": false, "services": [], "workspace": "",
                 "remote_user": null, "remote_env_len": 0, "base_folder": "", "drift": false, "instance_id": "id",
                 "done": false, "root": root})
         };
-        let listing = |rows: Vec<Value>| {
+        let listing = |rows: Vec<Value>, error: Option<&str>| {
             ok(json!({"instances": rows, "sandboxes": [], "services": [], "sandbox_count": 0, "runtime_name": "docker",
-                "runtime_version": null, "error": null}))
+                "runtime_version": null, "error": error}))
         };
         let gc = [
             machine(),
-            ("instances.list /r1", listing(vec![row("x", "/r1/b"), row("y", "/r1/a"), row("z", "/r1/a")])),
-            ("instances.list /r2", listing(vec![])),
+            ("instances.list /r1", listing(vec![row("x", "/r1/b"), row("y", "/r1/a"), row("z", "/r1/a")], Some("config: no devsandboxes.toml"))),
+            ("instances.list /r2", listing(vec![row("x", "/r1/b"), row("w", "/r2")], None)),
         ];
         let out = prep_fed(&CliVerb::Gc { force: true }, &on("a"), false, None, &gc, 0);
         let Prep::Each(each) = out.0.unwrap() else { panic!() };

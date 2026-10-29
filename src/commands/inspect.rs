@@ -21,7 +21,7 @@ pub fn inspect(name: &str, json: bool) -> Result<()> {
 }
 
 /// What `inspect` prints of raw inspect output (one `println` of it), shared
-/// with the re-run on an offered machine (`machines::cli::offered`). JSON
+/// with the re-run on a machine (`machines::cli::calls`). JSON
 /// mode is the runtime's own inspect document verbatim (no color, no
 /// envelope): the payload is the backend's schema, not ours.
 pub(crate) fn render(raw: &str, json: bool) -> String {
