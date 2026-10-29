@@ -559,9 +559,9 @@ pub fn port(
 
 /// `devsandbox port` on a machine's instance or global service
 /// (docs/architecture/daemon/machines.md, *The CLI*): [`port`]'s flow, each
-/// forward's bridge an ssh running `devsandbox tunnel` on `entry`, or for
-/// an offered fleet worker a `TUNNEL` stream through its link's socket
-/// (`tunnel::remote_opener`). `root` is the config root there, `name` the
+/// forward's bridge a `TUNNEL` stream through `entry`'s link socket
+/// (`endpoint::fleet_tunnel_socket`, `tunnel::remote_opener`), served under
+/// the machine's trust there. `root` is the config root there, `name` the
 /// instance as that machine knows it (already resolved, and already split
 /// from the ports by the caller: `split_target` is not applied again). No
 /// probe fallback: the far helper is the only listening-process lookup.
@@ -577,33 +577,23 @@ pub fn port_remote(
     use std::sync::Arc;
 
     use super::tunnel::{Request, Via};
-    use crate::serve::{endpoint, machines::ssh};
+    use crate::serve::endpoint;
 
     let specs = parse_specs(name.is_some(), service.is_some(), &ports)?;
-    let socket = match entry.is_offered() {
-        true => Some(endpoint::fleet_tunnel_socket(&endpoint::socket_dir()?, &entry.name)),
-        false => None,
-    };
-    let target = Arc::new((entry, root, name, service, socket));
+    let socket = endpoint::fleet_tunnel_socket(&endpoint::socket_dir()?, &entry.name);
+    let target = Arc::new((entry.name, root, name, service, socket));
     forward_until_interrupted(
         address,
         &specs,
         |container_port| {
             let target = Arc::clone(&target);
-            let machine = target.0.name.clone();
+            let machine = target.0.clone();
             super::tunnel::remote_opener(
                 machine,
                 Box::new(move || {
-                    let (entry, root, name, service, socket) = &*target;
-                    if let Some(socket) = socket {
-                        let request =
-                            Request { root: root.clone(), instance: name.clone(), service: service.clone(), port: container_port };
-                        return Ok(Via::Fleet { socket: socket.clone(), request });
-                    }
-                    // A person is at the terminal: no `BatchMode`.
-                    ssh::tunnel_argv(entry, false, root, name.as_deref(), service.as_deref(), container_port)
-                        .map(Via::Ssh)
-                        .map_err(|e| format!("{e:#}"))
+                    let (_, root, name, service, socket) = &*target;
+                    let request = Request { root: root.clone(), instance: name.clone(), service: service.clone(), port: container_port };
+                    Ok(Via::Fleet { socket: socket.clone(), request })
                 }),
             )
         },

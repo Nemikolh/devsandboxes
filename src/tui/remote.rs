@@ -13,8 +13,7 @@
 //!
 //! Pure over the snapshot and its `machines` entries, tested here.
 
-use crate::commands::exec::SHELL_FALLBACK_CMD;
-use crate::serve::machines::{Entry, Where, parse_name, ssh};
+use crate::serve::machines::{Where, parse_name};
 use crate::serve::snapshots::{LinkState, SnapshotMachine};
 use crate::snapshot::{InstanceRow, SandboxRow, ServiceRow, Snapshot};
 
@@ -115,69 +114,51 @@ pub fn service_route(s: &Snapshot, key: &str) -> Route {
     Route { machine: Some(machine.to_string()), root }
 }
 
-/// An ssh [`Entry`] from a snapshot's machine entry (its roots aren't
-/// needed for an argv). An offered machine's makes every ssh argv builder
-/// refuse with why (the terminal argvs below don't reach them for one); an
-/// ssh one without a target (a malformed snapshot), with "empty ssh
-/// target".
-fn entry(m: &SnapshotMachine) -> Entry {
-    use crate::serve::machines::Kind as Via;
-    let kind = Via::from_wire(m.kind, m.target.clone()).unwrap_or(Via::Ssh { target: String::new() });
-    Entry { name: m.name.clone(), kind, roots: Vec::new(), command: m.command.clone(), agent: m.agent }
-}
-
-fn lossy(argv: Vec<std::ffi::OsString>) -> Vec<String> {
-    argv.into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
-}
-
-/// The devsandbox executable on this host, asked only for an offered
-/// machine's argvs ([`exec_argv`]'s `exe`).
+/// The devsandbox executable on this host, which a machine's tabs run
+/// ([`exec_argv`]'s `exe`).
 pub type Exe<'a> = &'a dyn Fn() -> Result<String, String>;
 
-/// `devsandbox <flags> -- <name> [command…]` (an `exec`) as machine `m`
-/// runs it: over ssh (`ssh -t … devsandbox -C <root> <flags> -- <name> …`)
-/// on an ssh machine; on an offered worker this host's `devsandbox <flags>
-/// -- <m>/<name> …`, whose tty `exec` dials the worker over its fleet link
-/// (`fleet::pty_client`), resolving the instance's root there itself.
-fn on_machine(m: &SnapshotMachine, root: &str, flags: &[&str], name: &str, command: &[String], exe: Exe) -> Result<Vec<String>, String> {
-    let offered = m.kind == crate::serve::machines::MachineKind::Offered;
-    let name = if offered { qualify(Some(&m.name), name) } else { name.to_string() };
-    let mut args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
-    args.extend(["--".to_string(), name]);
+/// This host's `devsandbox <flags> -- <m>/<name> [command…]` (an `exec`)
+/// for instance `name` on machine `m`: the CLI routes the qualified name
+/// onto the machine's link (`machines::cli`: the instance's root resolved
+/// there with `instances.resolve`, then a `PTY` dial through
+/// `fleet::pty_client`), so the terminal goes through the machine's trust
+/// like any other use of it.
+fn on_machine(m: &SnapshotMachine, flags: &[&str], name: &str, command: &[String], exe: Exe) -> Result<Vec<String>, String> {
+    let mut args = vec![exe()?];
+    args.extend(flags.iter().map(|s| s.to_string()));
+    args.extend(["--".to_string(), qualify(Some(&m.name), name)]);
     args.extend(command.iter().cloned());
-    if offered {
-        args.insert(0, exe()?);
-        return Ok(args);
-    }
-    let args: Vec<String> = ["-C".to_string(), root.to_string()].into_iter().chain(args).collect();
-    ssh::tty_argv(&entry(m), &args).map(lossy).map_err(|e| format!("{e:#}"))
+    Ok(args)
 }
 
 /// A remote instance's terminal (and `:exec`): `devsandbox exec -i -t --
-/// <name> [command…]` on its machine ([`on_machine`]).
-pub fn exec_argv(m: &SnapshotMachine, root: &str, name: &str, command: &[String], exe: Exe) -> Result<Vec<String>, String> {
-    on_machine(m, root, &["exec", "-i", "-t"], name, command, exe)
+/// <m>/<name> [command…]` ([`on_machine`]).
+pub fn exec_argv(m: &SnapshotMachine, name: &str, command: &[String], exe: Exe) -> Result<Vec<String>, String> {
+    on_machine(m, &["exec", "-i", "-t"], name, command, exe)
 }
 
 /// A remote instance's terminal tab, first dial: [`exec_argv`]'s with
 /// `--reserve-255 --session=<id>`, so the shell runs in helper session `id`
 /// the tab re-dials ([`attach_argv`]) after a lost connection
 /// (`tui::app::terminal::Redial`).
-pub fn session_exec_argv(m: &SnapshotMachine, root: &str, name: &str, id: &str, exe: Exe) -> Result<Vec<String>, String> {
+pub fn session_exec_argv(m: &SnapshotMachine, name: &str, id: &str, exe: Exe) -> Result<Vec<String>, String> {
     let session = format!("--session={id}");
-    on_machine(m, root, &["exec", "-i", "-t", "--reserve-255", &session], name, &[], exe)
+    on_machine(m, &["exec", "-i", "-t", "--reserve-255", &session], name, &[], exe)
 }
 
 /// A remote instance tab's re-dial: `devsandbox exec --reserve-255
-/// --attach=<id> -- <name>` on its machine, attach only (the `=` form, as
-/// `--attach`'s value is optional and the name comes after `--`).
-pub fn attach_argv(m: &SnapshotMachine, root: &str, name: &str, id: &str, exe: Exe) -> Result<Vec<String>, String> {
+/// --attach=<id> -- <m>/<name>`, attach only (the `=` form, as
+/// `--attach`'s value is optional and the name comes after `--`). A link
+/// still down when it runs exits 255 like a lost dial (`machines::cli`), so
+/// the tab keeps re-dialing through the outage.
+pub fn attach_argv(m: &SnapshotMachine, name: &str, id: &str, exe: Exe) -> Result<Vec<String>, String> {
     let attach = format!("--attach={id}");
-    on_machine(m, root, &["exec", "--reserve-255", &attach], name, &[], exe)
+    on_machine(m, &["exec", "--reserve-255", &attach], name, &[], exe)
 }
 
-/// The instance a tab on service `row`'s `container` goes through on an
-/// offered worker (the one whose service it is there): for an isolated
+/// The instance a tab on service `row`'s `container` goes through on its
+/// machine (the one whose service it is there): for an isolated
 /// service the `used_by` entry at the container's index (the snapshot
 /// lists one container per using instance, in `used_by`'s order), for a
 /// global one any user, the first.
@@ -189,22 +170,17 @@ pub fn service_instance<'a>(row: &'a ServiceRow, container: &str) -> Option<&'a 
     row.used_by.first().map(String::as_str)
 }
 
-/// A remote service container's terminal (`container`, one of `row`'s): on
-/// an ssh machine `ssh -t … <runtime> exec -i -t <container> <login
-/// shell>`, the runtime the machine's snapshot named (`docker` before one
-/// came); on an offered worker this host's `devsandbox exec
-/// --service=<name> -- <m>/<instance>` ([`service_instance`]), whose
-/// service dial the worker resolves to the container itself.
+/// A remote service container's terminal (`container`, one of `row`'s):
+/// this host's `devsandbox exec --service=<name> -- <m>/<instance>`
+/// ([`service_instance`]), whose service dial the machine resolves to the
+/// container itself. A global service no instance uses has no such
+/// instance: refused (the `PTY` service header names one).
 pub fn service_argv(m: &SnapshotMachine, row: &ServiceRow, container: &str, exe: Exe) -> Result<Vec<String>, String> {
-    if m.kind == crate::serve::machines::MachineKind::Offered {
-        let instance = service_instance(row, container).ok_or_else(|| format!("no instance on `{}` uses service `{}`", m.name, row.name))?;
-        let service = format!("--service={}", row.name);
-        return on_machine(m, "", &["exec", &service], instance, &[], exe);
-    }
-    let runtime = m.runtime.as_deref().unwrap_or("docker");
-    let mut args: Vec<String> = ["exec", "-i", "-t", container].map(String::from).to_vec();
-    args.extend(SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()));
-    ssh::tty_argv_with(&entry(m), runtime, &args).map(lossy).map_err(|e| format!("{e:#}"))
+    let instance = service_instance(row, container).ok_or_else(|| {
+        format!("no instance on `{}` uses service `{}`: a machine's service terminal goes through one", m.name, row.name)
+    })?;
+    let service = format!("--service={}", row.name);
+    on_machine(m, &["exec", &service], instance, &[], exe)
 }
 
 /// The machines with no rows in `s` yet, one dim note each: `box:
@@ -396,77 +372,54 @@ pub(crate) mod tests {
         assert_eq!(candidates(&s, Kind::Instance), ["web", "box/web", "box/api", "db"]);
     }
 
+    /// Every machine's tabs, ssh or offered, run this host's devsandbox on
+    /// the qualified name: its `exec` goes over the machine's link.
     #[test]
-    fn terminal_argvs_go_over_ssh() {
-        let mut m = sm("box", LinkState::Connected);
-        m.target = Some("ssh://me@box:2222".into());
-        m.command = Some("~/bin/devsandbox".into());
-        let no_exe = || -> Result<String, String> { unreachable!("an ssh machine's") };
-        let no_exe: Exe = &no_exe;
-        assert_eq!(
-            exec_argv(&m, "/r/one", "web-2", &[], no_exe).unwrap(),
-            [
-                "ssh", "-t", "-p", "2222", "--", "me@box",
-                r#"exec "$SHELL" -lc 'exec ~/bin/devsandbox '\''-C'\'' '\''/r/one'\'' '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''--'\'' '\''web-2'\'''"#,
-            ]
-        );
-        let id = "1790000000-a1b2";
-        let with = exec_argv(&m, "/r/one", "web-2", &["uname".into(), "-a".into()], no_exe).unwrap();
-        assert_eq!(with[6], ssh::remote_command("~/bin/devsandbox", &["-C", "/r/one", "exec", "-i", "-t", "--", "web-2", "uname", "-a"]));
-        let first = session_exec_argv(&m, "/r/one", "web-2", id, no_exe).unwrap();
-        let want = ssh::remote_command("~/bin/devsandbox", &["-C", "/r/one", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "web-2"]);
-        assert_eq!(first, ["ssh", "-t", "-p", "2222", "--", "me@box", want.as_str()]);
-        let again = attach_argv(&m, "/r/one", "web-2", id, no_exe).unwrap();
-        let want = ssh::remote_command("~/bin/devsandbox", &["-C", "/r/one", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "web-2"]);
-        assert_eq!(again, ["ssh", "-t", "-p", "2222", "--", "me@box", want.as_str()]);
-        // What each runs parses back on the machine as that exec.
+    fn terminal_argvs_run_the_local_cli_on_the_qualified_name() {
         use clap::Parser;
-        let parsed = |args: &[&str]| crate::Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied())).unwrap().command.unwrap();
-        assert!(matches!(
-            parsed(&["-C", "/r", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "web-2"]),
-            crate::Command::Exec { reserve_255: true, attach: Some(Some(ref a)), ref name, ref command, .. } if a == id && name == "web-2" && command.is_empty()
-        ));
-        assert!(matches!(
-            parsed(&["exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "web-2"]),
-            crate::Command::Exec { reserve_255: true, session: Some(ref s), ref name, .. } if s == id && name == "web-2"
-        ));
-        m.runtime = Some("podman".into());
-        let db = service_row("isolated", &["devsandbox-svc-db"], &["web-2"]);
-        let argv = service_argv(&m, &db, "devsandbox-svc-db", no_exe).unwrap();
-        assert_eq!(argv[..6], ["ssh", "-t", "-p", "2222", "--", "me@box"]);
-        assert!(argv[6].starts_with(r#"exec "$SHELL" -lc 'exec podman '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[6]);
-        m.runtime = None;
-        assert!(service_argv(&m, &db, "c", no_exe).unwrap()[6].contains("exec docker "));
-
-        // An offered worker has no ssh: its tabs run this host's devsandbox
-        // on the qualified name (which dials its fleet link).
-        let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Offered, target: None, ..sm("lap", LinkState::Connected) };
+        let parsed = |args: &[String]| {
+            let args = args[1..].iter().map(String::as_str);
+            crate::Cli::try_parse_from(std::iter::once("devsandbox").chain(args)).unwrap().command.unwrap()
+        };
+        let id = "1790000000-a1b2";
         let exe = || Ok("/opt/devsandbox".to_string());
         let exe: Exe = &exe;
-        assert_eq!(exec_argv(&lap, "/r", "w", &[], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", "lap/w"]);
-        assert_eq!(exec_argv(&lap, "/r", "w", &["ls".into()], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", "lap/w", "ls"]);
-        let first = session_exec_argv(&lap, "/r", "w", id, exe).unwrap();
-        assert_eq!(first, ["/opt/devsandbox", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "lap/w"]);
-        let again = attach_argv(&lap, "/r", "w", id, exe).unwrap();
-        assert_eq!(again, ["/opt/devsandbox", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "lap/w"]);
-        assert!(matches!(
-            parsed(&again[1..].iter().map(String::as_str).collect::<Vec<_>>()),
-            crate::Command::Exec { attach: Some(Some(ref a)), ref name, .. } if a == id && name == "lap/w"
-        ));
+        let mut ssh = sm("box", LinkState::Connected);
+        ssh.target = Some("ssh://me@box:2222".into());
+        ssh.command = Some("~/bin/devsandbox".into());
+        let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Offered, target: None, ..sm("lap", LinkState::Connected) };
+        for (m, w) in [(&ssh, "box/w"), (&lap, "lap/w")] {
+            assert_eq!(exec_argv(m, "w", &[], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", w]);
+            assert_eq!(exec_argv(m, "w", &["ls".into()], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", w, "ls"]);
+            let first = session_exec_argv(m, "w", id, exe).unwrap();
+            assert_eq!(first, ["/opt/devsandbox", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", w]);
+            assert!(matches!(
+                parsed(&first),
+                crate::Command::Exec { reserve_255: true, session: Some(ref s), ref name, .. } if s == id && name == w
+            ));
+            let again = attach_argv(m, "w", id, exe).unwrap();
+            assert_eq!(again, ["/opt/devsandbox", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", w]);
+            assert!(matches!(
+                parsed(&again),
+                crate::Command::Exec { reserve_255: true, attach: Some(Some(ref a)), ref name, ref command, .. } if a == id && name == w && command.is_empty()
+            ));
+        }
         let no = || Err("no exe".to_string());
-        assert_eq!(exec_argv(&lap, "/r", "w", &[], &no), Err("no exe".into()));
+        assert_eq!(exec_argv(&ssh, "w", &[], &no), Err("no exe".into()));
         // A service tab goes through the instance whose service it is.
         let iso = service_row("isolated", &["devsandbox-svc-p-a-db", "devsandbox-svc-p-b-db"], &["a", "b"]);
-        let argv = service_argv(&lap, &iso, "devsandbox-svc-p-b-db", exe).unwrap();
-        assert_eq!(argv, ["/opt/devsandbox", "exec", "--service=db", "--", "lap/b"]);
-        assert!(matches!(
-            parsed(&argv[1..].iter().map(String::as_str).collect::<Vec<_>>()),
-            crate::Command::Exec { service: Some(ref s), ref name, ref command, .. } if s == "db" && name == "lap/b" && command.is_empty()
-        ));
+        for (m, b) in [(&ssh, "box/b"), (&lap, "lap/b")] {
+            let argv = service_argv(m, &iso, "devsandbox-svc-p-b-db", exe).unwrap();
+            assert_eq!(argv, ["/opt/devsandbox", "exec", "--service=db", "--", b]);
+            assert!(matches!(
+                parsed(&argv),
+                crate::Command::Exec { service: Some(ref s), ref name, ref command, .. } if s == "db" && name == b && command.is_empty()
+            ));
+        }
         let global = service_row("global", &["devsandbox-svc-p-db"], &["b", "a"]);
         assert_eq!(service_argv(&lap, &global, "devsandbox-svc-p-db", exe).unwrap()[4], "lap/b", "any user: the first");
         let unused = service_row("global", &["devsandbox-svc-p-db"], &[]);
-        assert!(service_argv(&lap, &unused, "devsandbox-svc-p-db", exe).unwrap_err().contains("no instance on `lap` uses service `db`"));
+        assert!(service_argv(&ssh, &unused, "devsandbox-svc-p-db", exe).unwrap_err().contains("no instance on `box` uses service `db`"));
         assert_eq!(service_instance(&iso, "devsandbox-svc-other"), None);
     }
 

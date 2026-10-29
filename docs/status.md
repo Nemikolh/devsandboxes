@@ -37,11 +37,11 @@ limitation means editing this file in the same commit.
   re-placement: from fleet step 8 on. Steps 1-7 shipped: ssh machines are
   held over one peer link per pair (`fleet-link --peer` there, this host
   an inbound neighbor in its `machines.list`), every machine reached at
-  its `fleet-<name>.*.sock`, the CLI's commands on any machine over its
-  channels (8a); still two kinds of machine (offered workers lend over
-  `fleet join`), and ssh machines' dashboard terminals, forwards and
-  `port` run their own ssh until the rest of step 8 moves them onto the
-  channels and drops lending.
+  its `fleet-<name>.*.sock`, every use of any machine over its channels
+  (the CLI's commands, 8a; the dashboard's terminals, forwards and
+  `port`, 8b); still two kinds of machine (offered workers lend over
+  `fleet join`) until the rest of step 8 deletes the per-use ssh paths
+  and drops lending.
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -276,12 +276,10 @@ limitation means editing this file in the same commit.
   devsandbox's frame protocol; a mismatch is the bridge's version-mismatch
   error ("update devsandbox on <machine>").
   → [forwards](architecture/daemon/forwards.md#remote-bridges); `bridge::mismatch_message`
-- A remote forward to an unreachable machine re-spawns ssh after every
-  `RETRY` gap (2 s), with no backoff, until it's removed.
+- A remote forward to a machine whose link is down re-dials its tunnel
+  socket after every `RETRY` gap (2 s), with no backoff, until it's
+  removed.
   → [forwards](architecture/daemon/forwards.md#the-engine-forward); `forward::retry_gap`
-- The CLI's remote `port` waits `HEADER_WAIT` (10 s) for the tunnel header,
-  so an interactive ssh prompt (host key, password) that takes longer
-  fails. → [forwards](architecture/daemon/forwards.md#remote-bridges); `tunnel::remote_opener`
 - The npm client's `forwards.list(dir)` can't pass `machines` (the typed
   `call('forwards.list', {machines: true})` can).
   → [api](reference/api.md#forwards); `npm/devsandboxes/index.js`
@@ -300,12 +298,17 @@ limitation means editing this file in the same commit.
 - `--machine <offered worker> ls` lists only the config roots its
   instances name (placed configs without an instance left don't show).
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::calls::config_roots`
-- Terminals on an offered worker's instances without a helper, or whose
+- Terminals on a machine's instances without a helper, or whose
   helper daemon isn't root (`session.attach` is `needs_root`, e.g.
   `containerUser`), and service terminals there are a plain `exec -it`
-  under a host pty on the worker: not resumable, a dropped link ends
+  under a host pty on the machine: not resumable, a dropped link ends
   them (it kills the runtime's exec client; the in-container process
   may run on, as before resumable exec). → [fleet](architecture/daemon/fleet.md#pty); `fleet::pty::decide`, `fleet::pty::run_tty`
+- The dashboard opens no terminal in a machine's global service that no
+  instance there uses ("no instance on `m` uses service `s`"): a `PTY`
+  service dial names the instance whose service it opens, and `exec
+  --service` takes an instance name.
+  → [terminal](architecture/dashboard/terminal.md#what-a-tab-runs); `tui::remote::service_argv`, `fleet::pty::service_container`
 - A hub notices a worker that's back (its `fleet-link` socket bound again)
   only at its offered link's next retry, up to 30 s later: a re-offer of a
   known worker doesn't wake the link.
@@ -325,13 +328,6 @@ limitation means editing this file in the same commit.
   messages (not threads, which need `inbox`) still reach the worker's
   Inbox and desktop.
   → [fleet](architecture/daemon/fleet.md#worker-policy); `inbox::decide`
-- Every stream of an ssh machine's link goes through its trust table
-  (`link.attach`), the CLI's commands there included, but the dashboard's
-  per-use ssh commands (`ssh::tty_argv` for terminal tabs) and the
-  forwards' (`tunnel_argv`, the daemon's and `devsandbox port`'s) are
-  still plain ssh shells on the machine, whatever its `trust`, until they
-  go over the link's channels (fleet step 8b).
-  → [machines](architecture/daemon/machines.md#ssh); `serve::machines::ssh`
 - A machine added before `machine add` recorded its roots there has none
   in its `member.toml`, so its `worker` trust refuses those of its roots
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots

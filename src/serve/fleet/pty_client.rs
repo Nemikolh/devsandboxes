@@ -280,8 +280,7 @@ impl Drop for Raw {
     }
 }
 
-/// One dial of `r` to offered machine `machine`, whose `fleet-link`
-/// sockets are in `dir`, on this process's stdio: its exit code
+/// One dial of `r` to machine `machine`, whose link sockets are in `dir`, on this process's stdio: its exit code
 /// ([`exit_of`], its line on stderr once the terminal is restored). A
 /// piped request leaves the terminal as it is and reads stdin only when
 /// interactive.

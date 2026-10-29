@@ -332,8 +332,7 @@ pub struct SnapshotMachine {
     pub version: Option<String>,
     /// The remote's runtime (`runtime_name`), once a snapshot came.
     pub runtime: Option<String>,
-    /// The remote devsandbox (`None`: `devsandbox`), so the dashboard builds
-    /// a terminal's ssh argv (`ssh::tty_argv`) with no call.
+    /// The remote devsandbox (`None`: `devsandbox`), as the registry has it.
     pub command: Option<String>,
     /// The registry's `agent`: this host's ssh-agent is relayed there.
     pub agent: bool,

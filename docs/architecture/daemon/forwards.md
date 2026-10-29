@@ -83,72 +83,51 @@ that doesn't answer in time is not retried through `lsof`
 A forward into a machine's instance (machines.md) is always asked for from
 this side (`devsandbox port`, `forwards.add` with `machine`) and owned
 here: a machine's `forwardPorts` are never mirrored locally, since a port
-exposed there doesn't mean it's wanted here. It carries the same bridge
-mux over one ssh per bridge, so a dead ssh is just a dead bridge: the
-supervisor opens a new one after its retry gap, like any other, until the
-forward stops. `commands::tunnel::remote_opener(machine, via)` asks
-`via()` on every spawn (so a changed registry entry heals at the next
-respawn) how to reach the machine: `Via::Ssh(argv)` for an ssh machine,
-`Via::Fleet` for an offered fleet worker
-([below](#offered-fleet-workers)). For ssh it spawns the argv (an
-`ssh::tunnel_argv`), which runs the hidden
-`devsandbox -C <root> tunnel [--instance=<name>] [--service=<svc>] --port
-<n>` on the machine. The ssh gets `SSH_AUTH_SOCK` from
-`bridge::host_agent()` when there is one (`open_remote`): the daemon's own
-inherited one may be long stale, and a CLI's `host_agent()` falls back to
-its own `$SSH_AUTH_SOCK`.
+exposed there doesn't mean it's wanted here. Each bridge is one `TUNNEL`
+stream on the machine's link ([fleet.md](fleet.md#tunnel)), whatever kind
+of machine, so it goes through the machine's trust table there; a dead
+stream is just a dead bridge: the supervisor opens a new one after its
+retry gap, like any other, until the forward stops.
+`commands::tunnel::remote_opener(machine, via)` asks `via()` on every
+spawn (so a machine removed from the registry is the bridge's error) how
+to reach the machine: `Via::Fleet {socket, request}`. It connects to the
+link's `fleet-<name>.tunnel.sock` in the socket dir
+(`endpoint::fleet_tunnel_socket`; absent: "its fleet link isn't up
+(…)"), writes the `tunnel::Request` line (`{root, instance?, service?,
+port}`), then reads the header within `HEADER_WAIT` (10 s), `stop`
+polled (on stop or timeout the stream is shut down).
 
-The far side resolves everything on its own host: `tunnel` resolves the
-name (`resolve_instance_noninteractive`) and runs `port::resolver` there
-(its config, state, runtime, helper install), writes one header line to
-stdout, then `exec`s `bridge::bridge_command` (`<runtime> exec -i -u root
-<container> devsbd bridge`, the argv every local bridge spawns), so the ssh
-stdio is the bridge's from then on. The header (`Header::line`) is
+The far side resolves everything on its own host (`tunnel::resolve`: the
+name with `resolve_instance_noninteractive`, then `port::resolver` there:
+its config, state, runtime, helper install), over what its trust admits,
+writes one header line, then runs `bridge::bridge_command` (`<runtime>
+exec -i -u root <container> devsbd bridge`, the argv every local bridge
+spawns) with the stream as its stdio. The header (`Header::line`) is
 `devsandbox-tunnel 1 <json>`, the json either `{label, host, port, hash,
 helper}` (`helper`: the port lives in the dialed container) or `{error}`
-(the resolve failed; `tunnel` then also exits 1 with the error on
-stderr). Nothing else goes to stdout.
+(the resolve failed).
 
 This side reads the header (`read_header`) on a thread, one byte at a time
 so nothing of the bridge's stream past the newline is taken, skipping
-lines before the magic (a login shell's motd), bounded at 64 KiB. The
-opener waits for it up to `HEADER_WAIT` (10 s), polling `stop`; on stop or
-timeout it kills and reaps the ssh. Then `bridge::attach` runs the usual
-handshake and mux on the rest of the ssh's stdout, labelled
-`<machine>/<label>` (the route label shown too). ssh's stderr goes from the
-start into a bounded `ssh::Tail`, so a chatty ssh can't stall on a full
-pipe; `attach` reads it through `TailReader`, which yields the tail once
-stderr ends. `attach` also gets the machine, so a far helper older than
-this devsandbox's protocol reads "update devsandbox on <machine> (and
-restart the instance there)" (`mismatch_message`) rather than the local
-"restart the instance". The lookup is `ProcessLookup::Helper` when the header says
+lines before the magic, bounded at 64 KiB. Then `bridge::attach` runs the
+usual handshake and mux on the rest of the stream, labelled
+`<machine>/<label>` (the route label shown too), taking the stream itself
+as its transport (`bridge::Transport::Stream`, its stderr empty): killing
+the bridge shuts the stream down, and the stream ending (the link or the
+machine gone) ends the mux, so the bridge is done and the supervisor opens
+another. `attach` also gets the machine, so a far helper older than this
+devsandbox's protocol reads "update devsandbox on <machine> (and restart
+the instance there)" (`mismatch_message`) rather than the local "restart
+the instance". The lookup is `ProcessLookup::Helper` when the header says
 `helper` (the far helper answers `Bridge::listening` over the same
-stream), else `None`; a remote forward's `ForwardSpec.probe` finds nothing.
+stream), else `None`; a remote forward's `ForwardSpec.probe` finds
+nothing. Errors: the header's `error`, else `<machine>: <why>` (`the
+tunnel ended before its header` when the link refused the stream).
 
-Opener errors, first that applies: the header's `error`; with no header,
-an older devsandbox there (its stderr refuses the `tunnel` subcommand:
-"devsandbox on <machine> can't forward ports yet: update it"), ssh's
-stderr tail (`Permission denied (publickey).`), else "no answer from
-<machine>" (`no_header`).
-
-### Offered fleet workers
-
-An offered machine has no ssh to it: its bridge is one `TUNNEL` stream
-on its fleet link ([fleet.md](fleet.md#tunnel)). `Via::Fleet {socket,
-request}` connects to the link's `fleet-<name>.tunnel.sock` in the socket
-dir (`endpoint::fleet_tunnel_socket`; absent: "its fleet link isn't up
-(…)"), writes the `tunnel::Request` line (`{root, instance?, service?,
-port}`, what `tunnel` takes as arguments), then reads the same header
-within the same `HEADER_WAIT`, `stop` polled (on stop or timeout the
-stream is shut down). The worker resolves the route as `tunnel` does,
-over its lent instances only, and runs the bridge with the stream as its
-stdio. `bridge::attach` takes the stream itself as its transport
-(`bridge::Transport::Stream`, its stderr empty): killing the bridge shuts
-the stream down, and the stream ending (the link or the worker gone) ends
-the mux, so the bridge is done as a dead ssh's is and the supervisor opens
-another. Errors: the header's `error`, else `<machine>: <why>`
-(`the tunnel ended before its header` when the link refused the
-stream).
+`Via::Ssh(argv)` (`open_remote`: an ssh running the hidden `devsandbox -C
+<root> tunnel …` on the machine, `ssh::tunnel_argv`, its stderr kept in an
+`ssh::Tail` for `no_header`'s errors) is the older form; no forward builds
+it.
 
 ## Host ports
 
@@ -188,11 +167,10 @@ two daemons overlap during a handoff.
 `forwards.add` with `machine` (`Daemon::add_remote`) checks the machine is
 in `machines.toml` (the path `Registry::spawn` gets), then binds a
 `Forward` whose opener is `tunnel::remote_opener`; its `via` closure
-re-reads `machines.toml` on every spawn (so a changed target heals and a
-removed machine is the bridge's error) and picks the way per entry
-(`forwards::via`): an offered fleet worker's tunnel socket in the socket
-dir `Registry::spawn` gets, else `ssh::tunnel_argv` with `BatchMode` (no
-TTY to prompt on). No probe fallback. Its entry carries
+re-reads `machines.toml` on every spawn (so a
+removed machine is the bridge's error) and reaches it through its
+link's tunnel socket in the socket dir `Registry::spawn` gets
+(`forwards::via`). No probe fallback. Its entry carries
 `machine`, `dir` the root there as sent (never canonicalized here) and
 `instance` the name there. `restorable` keeps such entries without the
 local state check; restore drops the ones of machines no longer registered
@@ -234,10 +212,8 @@ The instance may be a machine's (`box/api`, or a bare name that resolves
 there), as may a global service (`--machine box --service redis`):
 `machines::cli::route` hands it to `port::port_remote`, the same flow
 (`forward_until_interrupted`, shared with `port::port`) with
-[remote bridges](#remote-bridges) opened by `ssh::tunnel_argv` without
-`BatchMode` (a person is at the terminal), or on an offered fleet worker
-its link's tunnel socket in this user's socket dir, and no probe
-fallback. Only the
+[remote bridges](#remote-bridges) through the machine's link tunnel
+socket in this user's socket dir, and no probe fallback. Only the
 bind is local; the name resolves on the machine.
 
 Limitations: [status.md](../../status.md#daemon)

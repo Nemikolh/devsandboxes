@@ -306,7 +306,8 @@ It is the answerer of `fleet::LINK` (it reads the sentinel), saying
   accepted connection a stream to K. So every client here reaches K as it
   reaches an offered worker, through `fleet-K.*.sock`: the machine's held
   link and forwarded verbs (`dialer::dial`), and the channel forms of
-  steps 4-5 once step 8 points ssh machines at them.
+  steps 4-5 (the CLI's commands, the dashboard's terminals, forwards,
+  `port`).
 - **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
   `AGENT` goes to L's daemon in-process (`dialer::Open`,
   `daemon::machine_dialer`: `Shared::open_lent` with peer `{name: K,
@@ -528,17 +529,16 @@ link's `API` streams.
   held link (`service::Machines`), the quick calls and `forward::verb`
   (one stream per verb, a hang-up the stream's close) run on it as on an
   ssh machine's [peer link](#peer-links).
-- **Terminals** go over the link: a tty `exec` on an offered machine
-  (and its `--attach`, `--sessions`) and the dashboard's instance tabs,
-  which run that `exec` locally, are `PTY` streams from the hub
+- **Terminals** go over the link: a tty `exec` on a machine (and its
+  `--attach`, `--sessions`) and the dashboard's instance and service
+  tabs, which run that `exec` locally, are `PTY` streams from the hub
   ([PTY](#pty), *The hub's end*); so is an `exec` without a tty, as a
-  piped `PTY` stream ([PTY](#pty), *Pipe mode*). The CLI's `exec` takes
-  the same streams on an ssh machine's peer link; its dashboard tabs
-  still run their own ssh there.
-- **Port forwards** go over the link: the daemon's forwards into an
-  offered machine (`forwards.add` with `machine`) and a `devsandbox port`
-  on one are `TUNNEL` streams from the hub ([TUNNEL](#tunnel), *The hub's
-  end*).
+  piped `PTY` stream ([PTY](#pty), *Pipe mode*). The same streams on an
+  offered worker's link and an ssh machine's peer link.
+- **Port forwards** go over the link: the daemon's forwards into a
+  machine (`forwards.add` with `machine`) and a `devsandbox port` on one
+  are `TUNNEL` streams from the hub ([TUNNEL](#tunnel), *The hub's
+  end*), offered or ssh alike.
 - **The agent** goes over the link: with `machine set <name> agent on`
   (`machines.set`, taken for an offered entry as for an ssh one) the
   hub's agent reaches every instance on the worker as `AGENT` streams
@@ -559,9 +559,8 @@ link's `API` streams.
   dashboard's logs and inspect views go through the same quick calls.
 - **What has no link form yet** is refused, each in its own words:
   `vscode` (`cli::calls::refusal`, on any machine) and the dashboard's
-  service tabs
-  (`tui::remote::service_argv`: service terminals aren't supported over
-  the fleet link). No ssh argv is built for an offered entry:
+  tab on a global service no instance uses (`tui::remote::service_argv`:
+  a service dial goes through an instance using it). No ssh argv is built for an offered entry:
   `machines::ssh`'s `argv_with` takes `Entry::ssh_target`, an error for one
   (`machines::offered_refusal`, a backstop no path reaches first).
 
@@ -1459,10 +1458,10 @@ link, or `lost`) is reported once, with its line.
 
 ### TUNNEL
 
-A port forward's bridge into a lent instance over the link: each
-`TUNNEL` stream the hub opens is what an ssh machine's `devsandbox
-tunnel` is at the far end of a forward's ssh
-([forwards](forwards.md#remote-bridges)), served by
+A port forward's bridge into a lent instance over the link, every remote
+forward's ([forwards](forwards.md#remote-bridges)): each `TUNNEL` stream
+the hub opens is what the hidden `devsandbox tunnel` was at the far end
+of a forward's ssh, served by
 `fleet::tunnel::serve` on a thread of its own
 (`Shared::serve_channel`).
 
@@ -1499,15 +1498,15 @@ tunnel` is at the far end of a forward's ssh
 
 **The hub's end** is the forward engine's opener
 (`commands::tunnel::remote_opener` with `tunnel::Via::Fleet`), in the
-hub's daemon (`forwards::via`, chosen per spawn from the machine's
-registry entry) or a foreground `devsandbox port` (`port::port_remote`).
+hub's daemon (`forwards::via`, per spawn, for every registered machine)
+or a foreground `devsandbox port` (`port::port_remote`).
 Each open connects to the worker's `fleet-<name>.tunnel.sock` in the
 socket dir (absent: `its fleet link isn't up (…)`), writes the request,
 reads the header (`read_header`, up to 10 s, `stop` checked meanwhile)
 and attaches the bridge to the stream (`bridge::attach` over a
 `bridge::Transport::Stream`: killing it shuts the stream down, and a
 stream that ends is a bridge that's done, as a dead child is), so the
-engine's self-healing re-opens a new stream as it respawns an ssh. Each
+engine's self-healing re-opens a new stream as it respawns any bridge. Each
 TCP connection is then a `Connect` on that bridge's mux, inside the
 `TUNNEL` stream.
 

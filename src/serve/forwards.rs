@@ -28,17 +28,16 @@
 //!
 //! Forwards into a machine's instance or service ([`Remote`], `forwards.add`
 //! with `machine`) are ad-hoc only and live apart from the [`Root`]s (which
-//! load local config): bound here, each bridge an ssh running `devsandbox
-//! tunnel` on the machine, or for an offered fleet worker a `TUNNEL` stream
-//! through its link's socket in the socket dir (`tunnel::remote_opener`,
-//! [`via`] choosing per spawn). They persist like local ones; a sync drops
-//! those of a machine gone from `machines.toml`.
+//! load local config): bound here, each bridge a `TUNNEL` stream through
+//! the machine's link socket in the socket dir (`tunnel::remote_opener`,
+//! [`via`] per spawn), served under the machine's trust there. They persist
+//! like local ones; a sync drops those of a machine gone from
+//! `machines.toml`.
 //!
 //! Each forward keeps its own self-healing bridge (`Forward::start`); riding
 //! the instance's daemon bridge mux instead is a later optimization.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -143,37 +142,12 @@ pub enum Event {
 
 pub type OnEvent = Box<dyn Fn(Event) + Send>;
 
-/// Builds a remote forward's argv from its machine's registry entry, root,
-/// instance, service and port: [`batch_tunnel_argv`] outside tests.
-type TunnelArgvFn = fn(&machines::Entry, &Path, Option<&str>, Option<&str>, u16) -> anyhow::Result<Vec<OsString>>;
-
-/// `ssh::tunnel_argv` with `BatchMode`: the daemon has no TTY to prompt on.
-fn batch_tunnel_argv(
-    entry: &machines::Entry,
-    root: &Path,
-    instance: Option<&str>,
-    service: Option<&str>,
-    port: u16,
-) -> anyhow::Result<Vec<OsString>> {
-    machines::ssh::tunnel_argv(entry, true, root, instance, service, port)
-}
-
-/// How one spawn of a forward into `entry`'s `request` reaches it: an
-/// offered fleet worker through its link's tunnel socket in `socket_dir`
-/// (`endpoint::fleet_tunnel_socket`), any other machine over the ssh
-/// `tunnel_argv` builds.
-fn via(
-    entry: &machines::Entry,
-    socket_dir: &Path,
-    request: tunnel::Request,
-    tunnel_argv: TunnelArgvFn,
-) -> anyhow::Result<tunnel::Via> {
-    if entry.is_offered() {
-        let socket = super::endpoint::fleet_tunnel_socket(socket_dir, &entry.name);
-        return Ok(tunnel::Via::Fleet { socket, request });
-    }
-    let tunnel::Request { root, instance, service, port } = &request;
-    tunnel_argv(entry, root, instance.as_deref(), service.as_deref(), *port).map(tunnel::Via::Ssh)
+/// How one spawn of a forward into `entry`'s `request` reaches it: its
+/// link's tunnel socket in `socket_dir` (`endpoint::fleet_tunnel_socket`),
+/// for every kind of machine.
+fn via(entry: &machines::Entry, socket_dir: &Path, request: tunnel::Request) -> tunnel::Via {
+    let socket = super::endpoint::fleet_tunnel_socket(socket_dir, &entry.name);
+    tunnel::Via::Fleet { socket, request }
 }
 
 enum Cmd {
@@ -205,27 +179,16 @@ impl Registry {
     /// is the ad-hoc forwards' file ([`forward_store::path`] outside tests),
     /// restored before any request is served; `machines` is `machines.toml`,
     /// read for remote forwards (each add, each bridge spawn, each sync);
-    /// `socket_dir` is the daemon's, where an offered worker's link has its
+    /// `socket_dir` is the daemon's, where each machine's link has its
     /// tunnel socket; `on_event` gets every [`Event`] (called on the registry
     /// thread: it must not block).
     pub fn spawn(log: fn(&str), store: PathBuf, machines: PathBuf, socket_dir: PathBuf, on_event: OnEvent) -> Registry {
-        Self::spawn_with(log, store, machines, socket_dir, batch_tunnel_argv, on_event)
-    }
-
-    fn spawn_with(
-        log: fn(&str),
-        store: PathBuf,
-        machines: PathBuf,
-        socket_dir: PathBuf,
-        tunnel_argv: TunnelArgvFn,
-        on_event: OnEvent,
-    ) -> Registry {
         let (tx, rx) = mpsc::channel();
         let active = Arc::new(AtomicUsize::new(0));
         let thread = {
             let active = Arc::clone(&active);
             std::thread::Builder::new().name("serve-forwards".into()).spawn(move || {
-                let mut daemon = Daemon::new(log, store, machines, socket_dir, tunnel_argv, on_event, active);
+                let mut daemon = Daemon::new(log, store, machines, socket_dir, on_event, active);
                 daemon.restore();
                 daemon.poll();
                 daemon.run(&rx);
@@ -298,9 +261,8 @@ struct Daemon {
     store: PathBuf,
     /// `machines.toml`.
     machines: PathBuf,
-    /// The daemon's socket dir: offered workers' tunnel sockets.
+    /// The daemon's socket dir: the machines' tunnel sockets.
     socket_dir: PathBuf,
-    tunnel_argv: TunnelArgvFn,
     on_event: OnEvent,
     active: Arc<AtomicUsize>,
     roots: BTreeMap<PathBuf, Root>,
@@ -319,7 +281,6 @@ impl Daemon {
         store: PathBuf,
         machines: PathBuf,
         socket_dir: PathBuf,
-        tunnel_argv: TunnelArgvFn,
         on_event: OnEvent,
         active: Arc<AtomicUsize>,
     ) -> Self {
@@ -328,7 +289,6 @@ impl Daemon {
             store,
             machines,
             socket_dir,
-            tunnel_argv,
             on_event,
             active,
             roots: BTreeMap::new(),
@@ -435,7 +395,6 @@ impl Daemon {
     fn start_remote(&mut self, mut entry: Entry, host_port: HostPort) -> std::io::Result<(u64, Entry)> {
         let machine = entry.machine.clone().unwrap_or_default();
         let (registry, socket_dir) = (self.machines.clone(), self.socket_dir.clone());
-        let build = self.tunnel_argv;
         let name = machine.clone();
         let request = tunnel::Request {
             root: entry.dir.clone(),
@@ -451,7 +410,7 @@ impl Daemon {
                 .into_iter()
                 .find(|m| m.name == name)
                 .ok_or_else(|| machines::no_machine(&name).to_string())?;
-            via(&entry, &socket_dir, request.clone(), build).map_err(|e| format!("{e:#}"))
+            Ok(via(&entry, &socket_dir, request.clone()))
         });
         let open = tunnel::remote_opener(machine, dial);
         // No probe fallback: the far helper is the only listening-process lookup.
@@ -1402,24 +1361,20 @@ forwardPorts = ["redis:6379"]
         registry_at(&tmp(&format!("store-{n}")).join("forwards.toml"))
     }
 
-    /// `machines.toml` is the store's sibling; remote bridges run [`no_ssh`].
+    /// `machines.toml` and the socket dir are the store's sibling and dir:
+    /// a remote bridge fails at once unless the test binds the machine's
+    /// tunnel socket there.
     fn registry_at(store: &Path) -> (Registry, Arc<Mutex<Vec<Event>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
-        let reg = Registry::spawn_with(
+        let reg = Registry::spawn(
             quiet,
             store.to_path_buf(),
             store.with_file_name("machines.toml"),
             store.parent().unwrap().to_path_buf(),
-            no_ssh,
             Box::new(move |e| sink.lock().unwrap().push(e)),
         );
         (reg, events)
-    }
-
-    /// A remote bridge that dies at once: no ssh to anything.
-    fn no_ssh(_: &machines::Entry, _: &Path, _: Option<&str>, _: Option<&str>, _: u16) -> anyhow::Result<Vec<OsString>> {
-        Ok(vec!["false".into()])
     }
 
     /// A fresh empty dir under the test tmp dir.
@@ -1637,7 +1592,7 @@ forwardPorts = ["redis:6379"]
                 seen.fetch_add(1, Ordering::Relaxed);
             }
         });
-        let mut d = Daemon::new(quiet, store.clone(), machines_toml.clone(), tmp("remote-drop-sock"), no_ssh, on_event, Arc::default());
+        let mut d = Daemon::new(quiet, store.clone(), machines_toml.clone(), tmp("remote-drop-sock"), on_event, Arc::default());
         let a = d.add(remote_request()).unwrap();
         let b = d.add(AddRequest { machine: Some("other".into()), ..remote_request() }).unwrap();
         d.poll();
@@ -1662,32 +1617,29 @@ forwardPorts = ["redis:6379"]
         assert_eq!(d.rows(None, true).len(), 1);
     }
 
-    /// An offered fleet worker is reached through its link's tunnel socket,
-    /// an ssh machine through the argv; the request is the forward's.
+    /// Every machine, ssh or offered, is reached through its link's tunnel
+    /// socket; the request is the forward's.
     #[test]
-    fn offered_workers_tunnel_over_their_link_and_ssh_machines_over_ssh() {
+    fn every_machine_tunnels_over_its_link() {
         let dir = Path::new("/run/devsandbox");
         let request = tunnel::Request { root: "/far/cfg".into(), instance: Some("web".into()), service: None, port: 5432 };
         let offered = machines::Entry { roots: vec!["/far".into()], ..machines::Entry::offered("lap") };
         assert_eq!(
-            via(&offered, dir, request.clone(), no_ssh).unwrap(),
+            via(&offered, dir, request.clone()),
             tunnel::Via::Fleet { socket: dir.join("fleet-lap.tunnel.sock"), request: request.clone() }
         );
-        fn argv(_: &machines::Entry, root: &Path, instance: Option<&str>, service: Option<&str>, port: u16) -> anyhow::Result<Vec<OsString>> {
-            Ok(vec![format!("{} {instance:?} {service:?} {port}", root.display()).into()])
-        }
         let ssh = machines::Entry::ssh("box", "me@box");
-        assert_eq!(via(&ssh, dir, request, argv).unwrap(), tunnel::Via::Ssh(vec!["/far/cfg Some(\"web\") None 5432".into()]));
+        assert_eq!(via(&ssh, dir, request.clone()), tunnel::Via::Fleet { socket: dir.join("fleet-box.tunnel.sock"), request });
     }
 
-    /// A forward into an offered worker dials its tunnel socket on every
-    /// spawn: the worker's refusal is the row's error.
+    /// A forward into an ssh machine dials its link's tunnel socket on
+    /// every spawn: the machine's refusal is the row's error.
     #[test]
-    fn a_forward_into_an_offered_worker_dials_its_link() {
-        let base = tmp("remote-offered");
+    fn a_forward_into_an_ssh_machine_dials_its_link() {
+        let base = tmp("remote-link");
         let store = base.join("forwards.toml");
-        std::fs::write(store.with_file_name("machines.toml"), "[machine.lap]\noffered = true\nroots = [\"/far\"]\n").unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(super::super::endpoint::fleet_tunnel_socket(&base, "lap")).unwrap();
+        std::fs::write(store.with_file_name("machines.toml"), MACHINES).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(super::super::endpoint::fleet_tunnel_socket(&base, "box")).unwrap();
         let (seen, got) = mpsc::channel();
         std::thread::spawn(move || {
             for s in listener.incoming() {
@@ -1699,7 +1651,7 @@ forwardPorts = ["redis:6379"]
         });
         let (reg, _) = registry_at(&store);
         let h = reg.handle();
-        let added = h.add(AddRequest { machine: Some("lap".into()), ..remote_request() }).unwrap();
+        let added = h.add(remote_request()).unwrap();
         let want = tunnel::Request { root: "/far/cfg".into(), instance: Some("web".into()), service: None, port: 5432 };
         assert_eq!(got.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(want));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);

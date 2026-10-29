@@ -1,10 +1,10 @@
 //! Remote bridges (docs/architecture/daemon/forwards.md, *Remote bridges*):
-//! the hidden `devsandbox tunnel` a machine runs at the far end of a forward's
-//! ssh, the one-line header it answers with, and [`remote_opener`], the
-//! forward engine's opener that spawns that ssh here, or for an offered
-//! fleet worker opens a `TUNNEL` stream through its link's socket
-//! ([`Via::Fleet`]: the [`Request`] line first; the worker's end is
-//! `serve::fleet::tunnel`).
+//! [`remote_opener`], the forward engine's opener that opens a `TUNNEL`
+//! stream through a machine's link socket ([`Via::Fleet`]: the [`Request`]
+//! line first; the machine's end is `serve::fleet::tunnel`), and the
+//! one-line header that answers it. The hidden `devsandbox tunnel`
+//! ([`tunnel`]) is the far end of the ssh form ([`Via::Ssh`]), which no
+//! forward builds any more: fleet step 8c deletes both.
 //!
 //! The far side resolves the route on its own host ([`resolve`]: its
 //! config, state, runtime), writes a [`Header`], then becomes the
@@ -235,9 +235,10 @@ pub fn tunnel(dir: PathBuf, instance: Option<String>, service: Option<String>, p
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Via {
     /// Spawn this argv: an ssh running `devsandbox tunnel` (from
-    /// `ssh::tunnel_argv`).
+    /// `ssh::tunnel_argv`). Only tests build it now.
+    #[allow(dead_code)] // fleet step 8c deletes it
     Ssh(Vec<OsString>),
-    /// An offered fleet worker: connect to its link's tunnel socket
+    /// A machine: connect to its link's tunnel socket
     /// (`endpoint::fleet_tunnel_socket`), one `TUNNEL` stream, and send
     /// `request`.
     Fleet { socket: PathBuf, request: Request },
@@ -247,8 +248,8 @@ pub enum Via {
 pub type TunnelVia = Box<dyn Fn() -> Result<Via, String> + Send + Sync>;
 
 /// The opener of a forward into `machine`'s instance or service: `via()`
-/// (asked per spawn, so a changed registry entry heals), then spawn its ssh
-/// or open its `TUNNEL` stream, read the [`Header`], then run the bridge
+/// (asked per spawn, so a removed registry entry is the bridge's error),
+/// then open its `TUNNEL` stream (or spawn an ssh), read the [`Header`], then run the bridge
 /// over the rest of its bytes (`bridge::attach`; a stream that ends is a
 /// bridge that's done, as a dead child is). The route shows as
 /// `<machine>/<label>`; the far helper answers the listening-process lookup

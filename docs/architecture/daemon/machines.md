@@ -94,25 +94,25 @@ The machine's link itself is no argv here: the daemon dials it through
 `fleet::transport::Transport::ssh` (`ssh -T -o BatchMode=yes [-p N] --
 <host> <command> fleet-link --peer <member>`, the entry's `command` as the
 program: `Transport::dial_with`; [Held links](#held-links-machines)). The
-argvs below are the add-time ssh and the per-use ones the dashboard's
-terminals and the forwards still run, which step 8 of the
-[fleet plan](../../plans/active/fleet.md) moves onto the link's channels
-(the CLI's commands on a machine are on them: [The CLI](#the-cli-clirs)):
+argvs below are the add-time ssh; every use of a machine after that (the
+CLI's commands, the dashboard's terminals, forwards and `port`) goes over
+the link's channels. `tty_argv`, `tty_argv_with` and `tunnel_argv` have no
+caller left (step 8c of the [fleet plan](../../plans/active/fleet.md)
+deletes them):
 
 - `api_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … api --stdio
   --client <c> --session-env` (the daemon has no TTY: ssh must fail, not
   prompt), what `machines.probe` and `machines.add` dial (`ssh_dial`)
   before the machine has a link.
-- `tty_argv` / `tty_argv_with`: `-t`, no `BatchMode` (terminal tabs;
-  `tty_argv_with` runs `<runtime> exec -it` for service tabs).
+- `tty_argv` / `tty_argv_with`: `-t`, no `BatchMode` (`tty_argv_with`
+  runs a program other than devsandbox).
 - `cli_argv`: `-t` on a terminal, else `-T` (piped bytes stay clean);
   `machine add`'s `machine roots add` over the add-time ssh
   ([`devsandbox machine add…`](#devsandbox-machine-addlssetrmtrustroots)).
 - `tunnel_argv`: `ssh -T [-o BatchMode=yes] [-p N] -- <host> … -C <root>
-  tunnel [--instance=<name>] [--service=<svc>] --port <n>`, a remote
-  forward's bridge ([forwards.md](forwards.md#remote-bridges));
-  `BatchMode` when `batch` (the daemon). The `=` forms keep a name
-  starting with `-` a value.
+  tunnel [--instance=<name>] [--service=<svc>] --port <n>`, the ssh
+  form of a remote forward's bridge; `BatchMode` when `batch`. The `=`
+  forms keep a name starting with `-` a value.
 - `agent_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … agent-relay
   --client <c>`, the old agent relay's; nothing spawns it.
 - `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
@@ -153,9 +153,10 @@ The add-time `api_argv` relay attaches its connection the same way
 `--client` without its `machine:` prefix, its answer read byte by byte up
 to its newline and not relayed); a refused attach ends the relay with
 exit 1 and the reason on stderr, which the link reports as ssh's stderr
-tail (`LinkError::Closed`); the daemon hanging up first is exit 75. The
-per-use argvs (`tty_argv`, `tunnel_argv`) are ssh shells on the machine:
-the trust table isn't in their path.
+tail (`LinkError::Closed`); the daemon hanging up first is exit 75. No
+use of a machine bypasses the trust table: the only ssh shells on it are
+the add-time ones (`api_argv`'s attached relay, `cli_argv`'s `machine
+roots add`, `script_argv`'s install).
 
 ## Install
 
@@ -293,9 +294,9 @@ and goes to that machine, but for the ones served here:
   answer adds nothing, and an empty result names the unreachable ones.
 - **Served here** (`forward::HERE`: `forwards.add`): `machine` names where
   the forward reaches, not where it runs. The daemon keeps the param and
-  answers itself, binding the forward on this host with one ssh per bridge,
-  or on an offered fleet worker one `TUNNEL` stream per bridge over its
-  fleet link ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
+  answers itself, binding the forward on this host with one `TUNNEL`
+  stream per bridge over the machine's link, whatever its kind
+  ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
 
 - **`machines.get {name, agent?}`** takes the caller's absolute
   `SSH_AUTH_SOCK` as `agent` and reports it like a verb's: the CLI's
@@ -359,8 +360,8 @@ The old agent relay (`ssh::agent_argv`, `devsandbox agent-relay`,
 `verbs_client` or any command runs locally. A command on a machine goes
 over the machine's link (`fleet-<name>.*.sock`, the same for every kind of
 machine) and so through the machine's trust table (fleet plan decision 15:
-API calls and `PTY` streams within its trust, never a `devsandbox …` run
-there); only `port` still runs its own ssh on an ssh machine (below).
+API calls and `PTY` and `TUNNEL` streams within its trust, never a
+`devsandbox …` run there).
 
 - Under `--in-process`: nothing fans out; `--machine` is an error.
 - **Verbs** (`run`, `rebuild`, `start`, `stop`, `rm`) keep their name;
@@ -374,11 +375,10 @@ there); only `port` still runs its own ssh on an ssh machine (below).
   `devsandbox-…` container name stay local. `port` on a machine's instance
   runs here: `route` returns `Routed::Port` (the machine's `Entry`, the
   match's root or else the machine's first, the instance as the machine
-  names it) and `commands::port::port_remote` forwards over one ssh per
-  port on an ssh machine (`ssh::tunnel_argv` without `BatchMode`,
-  `tunnel::remote_opener`; [forwards](forwards.md)), or on an offered fleet
-  worker one `TUNNEL` stream per bridge over its fleet link
-  ([fleet](fleet.md#tunnel)). `vscode` on a machine's instance is refused
+  names it) and `commands::port::port_remote` forwards over one `TUNNEL`
+  stream per bridge through the machine's `fleet-<name>.tunnel.sock`
+  (`tunnel::remote_opener`; [forwards](forwards.md),
+  [fleet](fleet.md#tunnel)). `vscode` on a machine's instance is refused
   (`calls::refusal`: not available over its link yet).
 - **`--machine m`** is for nameless commands (`machine_use`): `ps`,
   `stats`, `ls`, `status`, `service ls` are API calls
@@ -481,7 +481,11 @@ there); only `port` still runs its own ssh on an ssh machine (below).
   `--attach` (`session_exec`): on a terminal a session dial, else the
   helper's session client piped (`attach_mode`:
   `exec::session_attach_command`, stdin kept), as a local `exec --attach`
-  without a tty runs it.
+  without a tty runs it. Under `--reserve-255` (a dashboard tab's dials)
+  a qualified name whose `instances.resolve` fails but as `not-found` (the
+  machine's link is down) exits 255, the error on stderr
+  (`cli::resolve_lost`), so the tab waits the outage out as for a dial
+  that lost its link.
 - **An `exec` without a tty** is one piped `PTY` dial ([fleet](fleet.md#pty),
   *Pipe mode*), never re-dialed: `cli::pipe_mode` (pure) gives its argv
   and `-i` as a local `exec` decides them (the command as typed with `-i`
@@ -564,16 +568,17 @@ directory can be dropped. Both print the roots after the change.
 ## Dashboard
 
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
-routed back to a request's `machine` + remote `root`; terminal tabs use
-`tty_argv` (the machine's link, and so its `AGENT` streams, is up
-whatever the dashboard does); on an offered fleet worker an
-instance tab instead runs this host's `devsandbox exec … -- <m>/<name>`
-(`on_machine`, the executable `ExecCli::exe`), whose tty `exec` dials
-the worker's fleet link ([The CLI](#the-cli-clirs)), and a service tab
-runs `devsandbox exec --service=<name> -- <m>/<instance>` through an
-instance using it (`service_argv`, `service_instance`); a remote instance tab runs
+routed back to a request's `machine` + remote `root`; on every machine,
+whatever its kind, an instance tab runs this host's `devsandbox exec …
+-- <m>/<name>` (`on_machine`, the executable `ExecCli::exe`), whose tty
+`exec` dials the machine's link ([The CLI](#the-cli-clirs)), and a
+service tab runs `devsandbox exec --service=<name> -- <m>/<instance>`
+through an instance using it (`service_argv`, `service_instance`; a
+global service no instance uses has none, and its tab is refused); a
+remote instance tab runs
 its shell in a helper session it names (`session_exec_argv`) and, when its
-dial (ssh, or the local CLI) exits 255, re-dials an attach to it into the same tab (`attach_argv`,
+dial exits 255 (a lost link, or the link down when it resolves the name),
+re-dials an attach to it into the same tab (`attach_argv`,
 `tui::app::terminal::Redial`, the CLI's `Reconnect` rule;
 [terminal.md](../dashboard/terminal.md) *Remote tabs reconnect*); a machine without rows shows `box: connecting` or `box:
 unreachable: <why>` in the header (`pending_note`), the name as `box

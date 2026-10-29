@@ -213,7 +213,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // cheap no-op when unchanged; every tab (not just the active one) is
         // sized so a background tab is already correct when switched to.
         if !app.terms.is_empty() {
-            // A remote tab whose ssh dropped re-dials when its wait is over.
+            // A remote tab whose link dropped re-dials when its wait is over.
             app.redial_terminals(std::time::Instant::now());
             if let Some((rows, cols)) = ui::term_pane_size(area, app.prompt.is_some()) {
                 app.terms.resize_all(rows, cols);
@@ -525,8 +525,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
 
 /// Leave the TUI, run a prompt command (`argv`, `:exec`'s, or why there's
 /// none) with inherited stdio, wait for one keypress, then re-enter the
-/// TUI. `exec` is `devsandbox exec` as a child (`App::exec_argv`: over ssh
-/// for a machine's instance), so the dashboard reads no state for it: the
+/// TUI. `exec` is `devsandbox exec` as a child (`App::exec_argv`: on the
+/// qualified name for a machine's instance, over its link), so the dashboard reads no state for it: the
 /// CLI prints its own errors above the prompt, and only a child that can't
 /// start is ours to print. Never propagated, so a failed `exec` returns to
 /// the dashboard. The verbs go to the daemon (`spawn_verb`), `code`/

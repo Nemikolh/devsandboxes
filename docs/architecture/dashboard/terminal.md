@@ -55,33 +55,33 @@ arrives on reader threads and only shows on the next draw.
   -t <container>` + `SHELL_FALLBACK_CMD`, the binary named by the
   snapshot's `runtime_name`. The one place the dashboard runs the runtime
   itself.
-- A machine's row (`box/…` key): the same over `ssh -t` on that machine
-  (`remote::session_exec_argv` against the instance's root there,
-  `remote::service_argv`), see [../daemon/machines.md](../daemon/machines.md).
-  An instance's adds `--reserve-255 --session=<id>`, the id minted by
-  the tab (`exec::mint_session_id`), so it can reconnect (below).
-- An offered fleet worker's instance row: this host's `devsandbox exec
-  -i -t --reserve-255 --session=<id> -- <machine>/<instance>` (no ssh to
-  it: `remote::on_machine`, the executable `ExecCli::exe`), whose tty
-  `exec` dials the worker over its fleet link
-  ([../daemon/fleet.md](../daemon/fleet.md) *PTY*) and reconnects as the
-  CLI does; the tab re-dials it the same way. A service row's tab runs
+- A machine's instance row (`box/…` key), whatever kind of machine:
+  this host's `devsandbox exec -i -t --reserve-255 --session=<id> --
+  <machine>/<instance>` (`remote::session_exec_argv`, `remote::on_machine`,
+  the executable `ExecCli::exe`; the id minted by the tab,
+  `exec::mint_session_id`), whose tty `exec` dials the machine over its
+  link ([../daemon/fleet.md](../daemon/fleet.md) *PTY*), under the
+  machine's trust; the tab re-dials it (below). See
+  [../daemon/machines.md](../daemon/machines.md). A service row's tab runs
   this host's `devsandbox exec --service=<name> -- <machine>/<instance>`
   (`remote::service_argv`), the instance the one whose container it is
   (`remote::service_instance`: an isolated service's `used_by` entry at
-  the container's index, a global one's first user); the worker derives
-  the container itself. It isn't a session: no `Redial`, it just ends.
+  the container's index, a global one's first user; a global service no
+  instance uses gets no tab); the machine derives the container itself.
+  It isn't a session: no `Redial`, it just ends.
 
 ## Remote tabs reconnect
 
 A remote instance tab carries a `Redial` (`TermSession::redial`; local
 and service tabs have none and just end). The event loop calls
-`App::redial_terminals` each pass: once the tab's dial (ssh, or the local
-CLI for an offered worker) has ended
+`App::redial_terminals` each pass: once the tab's dial (the local CLI)
+has ended
 (`TermSession::exit_code`, the PTY's EOF then a reaped child), `Redial`
 applies the CLI's rule (`serve::machines::cli::Reconnect`: a 255 after a
 dial that ran 5 s is a lost connection, `--reserve-255` keeping a
-program's own 255 out of it; any other code ends). A lost tab waits out
+program's own 255 out of it, and a re-dial that finds the link still
+down exiting 255 too, `cli::resolve_lost`; any other code ends). A lost
+tab waits out
 the backoff (1, 2, 4, 8, then 10 s), labelled `(reconnecting…)` in the
 tab strip (`(reconnecting… N)` from its second try), then `TermSession::respawn` runs
 `remote::attach_argv` (`exec --reserve-255 --attach=<id>`) on a fresh PTY

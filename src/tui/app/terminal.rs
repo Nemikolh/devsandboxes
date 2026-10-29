@@ -28,7 +28,7 @@ const WHEEL_LINES: i16 = 3;
 /// executable, against the dashboard's config root. The CLI's `exec` owns
 /// the runtime argv, the in-flight guard and the ssh-agent relay
 /// (`bridges.ensure`, held for the command's life), so the dashboard reads
-/// no state for it, and a remote instance only needs an ssh prefix
+/// no state for it, and a remote instance only needs its qualified name
 /// (`tui/remote.rs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecCli {
@@ -60,8 +60,8 @@ impl ExecCli {
         Ok(argv)
     }
 
-    /// The devsandbox executable these argvs start with (also an offered
-    /// machine's tabs', `remote::exec_argv`).
+    /// The devsandbox executable these argvs start with (also a machine's
+    /// tabs', `remote::exec_argv`).
     pub fn exe(&self) -> Result<String, String> {
         let exe = match &self.exe {
             Some(exe) => exe.clone(),
@@ -73,7 +73,7 @@ impl ExecCli {
 
 /// A remote instance tab's reconnect (docs/architecture/dashboard/terminal.md,
 /// *Remote tabs reconnect*): the tab's first dial runs its shell in helper
-/// session `id` (`remote::session_exec_argv`); each time its ssh exits,
+/// session `id` (`remote::session_exec_argv`); each time its dial exits,
 /// [`Reconnect`] (the CLI's rule) says whether to re-dial `attach`
 /// (`remote::attach_argv`) into the same tab after a backoff, or end. Pure
 /// over the exit codes and the `Instant`s it's given.
@@ -571,11 +571,10 @@ impl App {
     /// binary named by the snapshot (`runtime_name` is the backend's `bin`
     /// for docker, podman and Apple's `container` alike).
     ///
-    /// On a machine (a `box/…` key) either goes over ssh: the machine's
-    /// `devsandbox -C <its root> exec`, or its runtime's `exec`
-    /// (docs/architecture/daemon/machines.md, *Dashboard*); on an offered
-    /// worker, this host's `devsandbox exec` over its fleet link (a service
-    /// through an instance using it, `remote::service_argv`). A remote
+    /// On a machine (a `box/…` key) either is this host's `devsandbox exec`
+    /// on the qualified name, over the machine's link (a service through an
+    /// instance using it, `remote::service_argv`;
+    /// docs/architecture/daemon/machines.md, *Dashboard*). A remote
     /// instance's shell runs in helper session `id`, and the second value is
     /// the attach its tab re-dials after a lost connection ([`Redial`]);
     /// `None` for every other tab.
@@ -589,10 +588,10 @@ impl App {
         let terminal = |e: String| format!("terminal: {e}");
         if is_instance {
             if let (Some(machine), name) = remote::split(title) {
-                let (m, root) = self.remote_instance(title, machine).map_err(terminal)?;
+                let m = self.machine_entry(machine).map_err(terminal)?;
                 let exe = || self.local_exe();
-                let first = remote::session_exec_argv(m, &root, name, id, &exe).map_err(terminal)?;
-                let attach = remote::attach_argv(m, &root, name, id, &exe).map_err(terminal)?;
+                let first = remote::session_exec_argv(m, name, id, &exe).map_err(terminal)?;
+                let attach = remote::attach_argv(m, name, id, &exe).map_err(terminal)?;
                 return Ok((first, Some(attach)));
             }
             return self.exec_argv(title, &[]).map(|argv| (argv, None)).map_err(terminal);
@@ -613,31 +612,22 @@ impl App {
     }
 
     /// The `devsandbox exec` of instance `key` (a terminal tab, `:exec`):
-    /// this host's [`ExecCli`], or over ssh on its machine, against the
-    /// instance's root there.
+    /// this host's [`ExecCli`], or for a machine's instance this host's
+    /// `devsandbox exec` on its qualified name (`remote::exec_argv`).
     pub fn exec_argv(&self, key: &str, command: &[String]) -> Result<Vec<String>, String> {
         let (machine, name) = remote::split(key);
         let Some(machine) = machine else {
             return self.exec_cli.as_ref().map_err(String::clone)?.argv(name, command);
         };
-        let (entry, root) = self.remote_instance(key, machine)?;
-        remote::exec_argv(entry, &root, name, command, &|| self.local_exe())
+        remote::exec_argv(self.machine_entry(machine)?, name, command, &|| self.local_exe())
     }
 
-    /// This host's devsandbox, which an offered machine's tabs run.
+    /// This host's devsandbox, which a machine's tabs run.
     fn local_exe(&self) -> Result<String, String> {
         self.exec_cli.as_ref().map_err(String::clone)?.exe()
     }
 
-    /// Remote instance `key`'s machine entry and its root there.
-    fn remote_instance(&self, key: &str, machine: &str) -> Result<(&crate::serve::snapshots::SnapshotMachine, String), String> {
-        let entry = self.machine_entry(machine)?;
-        let snapshot = self.snapshot.as_ref().ok_or_else(|| "no data yet".to_string())?;
-        let root = remote::instance_route(snapshot, key).root.ok_or_else(|| format!("`{key}`: no root known on `{machine}`"))?;
-        Ok((entry, root))
-    }
-
-    /// Machine `name`'s snapshot entry (for its ssh argv).
+    /// Machine `name`'s snapshot entry (a tab's argv names it).
     fn machine_entry(&self, name: &str) -> Result<&crate::serve::snapshots::SnapshotMachine, String> {
         remote::machine(&self.machines, name).ok_or_else(|| format!("no machine named `{name}`"))
     }
@@ -1179,52 +1169,53 @@ mod tests {
     }
 
     /// A machine's instance or service: keyed (title and dedup) by machine,
-    /// run over ssh: the machine's devsandbox in the instance's root, or
-    /// its runtime's `exec`.
+    /// run as this host's devsandbox on the qualified name (its `exec` goes
+    /// over the machine's link), whatever kind of machine it is.
     #[test]
-    fn a_machines_rows_open_terminals_over_ssh() {
-        let mut app = machine_app();
-        app.exec_cli = Ok(cli());
-        app.selected[Tab::Instances.index()] = 5; // box/inst1
-        let target = app.term_target();
-        assert_eq!(target, Ok(("box/inst1".into(), "box/devsandbox-inst1".into(), true)));
-        let (argv, attach) = app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID).unwrap();
-        assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"]);
-        assert!(argv[4].contains(r"'\''-C'\'' '\''/r/one'\'' '\''exec'\''"), "{}", argv[4]);
-        assert!(argv[4].ends_with(r"'\''--'\'' '\''inst1'\'''"), "{}", argv[4]);
-        // In session ID, which the tab re-dials an attach to.
-        let machine = remote::machine(&app.machines, "box").unwrap();
-        let no_exe = || -> Result<String, String> { unreachable!("an ssh machine's") };
-        assert_eq!(argv, remote::session_exec_argv(machine, "/r/one", "inst1", ID, &no_exe).unwrap());
-        assert_eq!(attach, Some(remote::attach_argv(machine, "/r/one", "inst1", ID, &no_exe).unwrap()));
-        // A local instance of the same name: this host's devsandbox, no re-dial.
-        let (argv, attach) = app.term_argv("inst1", "devsandbox-inst1", true, ID).unwrap();
-        assert_eq!(argv[..4], ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec"]);
-        assert_eq!(attach, None);
-        // `:exec` too.
-        let exec = app.exec_argv("box/inst1", &["uname".into()]).unwrap();
-        assert!(exec[4].ends_with(r"'\''inst1'\'' '\''uname'\'''"), "{}", exec[4]);
-        assert_eq!(app.exec_argv("nope/x", &[]), Err("no machine named `nope`".into()));
+    fn a_machines_rows_open_terminals_through_the_local_cli() {
+        for kind in [crate::serve::machines::MachineKind::Ssh, crate::serve::machines::MachineKind::Offered] {
+            let mut app = machine_app();
+            app.machines[0].kind = kind;
+            app.selected[Tab::Instances.index()] = 5; // box/inst1
+            let target = app.term_target();
+            assert_eq!(target, Ok(("box/inst1".into(), "box/devsandbox-inst1".into(), true)));
+            assert_eq!(app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID), Err("terminal: the devsandbox executable isn't known yet".into()));
+            app.exec_cli = Ok(cli());
+            // In session ID, which the tab re-dials an attach to.
+            let (argv, attach) = app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID).unwrap();
+            assert_eq!(argv, ["/opt/bin/devsandbox", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "box/inst1"]);
+            assert_eq!(attach, Some(["/opt/bin/devsandbox", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "box/inst1"].map(String::from).to_vec()));
+            // A local instance of the same name: this host's devsandbox, no re-dial.
+            let (argv, attach) = app.term_argv("inst1", "devsandbox-inst1", true, ID).unwrap();
+            assert_eq!(argv[..4], ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec"]);
+            assert_eq!(attach, None);
+            // `:exec` too.
+            assert_eq!(app.exec_argv("box/inst1", &["uname".into()]).unwrap(), ["/opt/bin/devsandbox", "exec", "-i", "-t", "--", "box/inst1", "uname"]);
+            assert_eq!(app.exec_argv("nope/x", &[]), Err("no machine named `nope`".into()));
 
-        // Dedup: box's tab doesn't stand for the local one's.
-        app.terms.open(term_sess("box/inst1", "box/devsandbox-inst1"));
-        assert_eq!(app.terms.find("devsandbox-inst1"), None);
-        assert_eq!(app.terms.find("box/devsandbox-inst1"), Some(0));
+            // Dedup: box's tab doesn't stand for the local one's.
+            app.terms.open(term_sess("box/inst1", "box/devsandbox-inst1"));
+            assert_eq!(app.terms.find("devsandbox-inst1"), None);
+            assert_eq!(app.terms.find("box/devsandbox-inst1"), Some(0));
 
-        app.tab = Tab::Services;
-        let db = app.snapshot.as_ref().unwrap().services.iter().position(|s| s.name == "db").unwrap();
-        app.selected[Tab::Services.index()] = db;
-        assert_eq!(app.term_target(), Ok(("box/svc-db".into(), "box/devsandbox-svc-db".into(), false)));
-        let (argv, attach) = app.term_argv("box/svc-db", "box/devsandbox-svc-db", false, ID).unwrap();
-        assert_eq!(attach, None, "a service tab doesn't re-dial");
-        assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"]);
-        assert!(argv[4].starts_with(r#"exec "$SHELL" -lc 'exec docker '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[4]);
+            // A service: through an instance using it, else refused.
+            app.tab = Tab::Services;
+            let db = app.snapshot.as_ref().unwrap().services.iter().position(|s| s.name == "db").unwrap();
+            app.selected[Tab::Services.index()] = db;
+            assert_eq!(app.term_target(), Ok(("box/svc-db".into(), "box/devsandbox-svc-db".into(), false)));
+            let unused = app.term_argv("box/svc-db", "box/devsandbox-svc-db", false, ID).unwrap_err();
+            assert!(unused.contains("no instance on `box` uses service `db`"), "{unused}");
+            app.snapshot.as_mut().unwrap().services[db].used_by = vec!["inst1".into()];
+            let (argv, attach) = app.term_argv("box/svc-db", "box/devsandbox-svc-db", false, ID).unwrap();
+            assert_eq!(attach, None, "a service tab doesn't re-dial");
+            assert_eq!(argv, ["/opt/bin/devsandbox", "exec", "--service=db", "--", "box/inst1"]);
+        }
     }
 
     const ID: &str = "1790000000-a1b2";
 
     fn attach() -> Vec<String> {
-        vec!["ssh".into(), "attach".into()]
+        vec!["devsandbox".into(), "attach".into()]
     }
 
     /// A tab's dials: lost (255 after a connected run) waits out the
@@ -1255,7 +1246,7 @@ mod tests {
         assert!(r.ended());
         assert_eq!(r.step(Some(255), t0 + s(200)), None, "ended stays ended");
 
-        // A first dial refused at once (ssh couldn't connect): no re-dial.
+        // A first dial refused at once (the link isn't up): no re-dial.
         let mut r = Redial::new(attach(), t0);
         assert_eq!(r.step(Some(255), t0 + Duration::from_millis(300)), None);
         assert!(r.ended());
@@ -1268,7 +1259,7 @@ mod tests {
         assert!(r.ended());
     }
 
-    /// In the app: a remote tab whose ssh dropped shows as reconnecting
+    /// In the app: a remote tab whose link dropped shows as reconnecting
     /// (still the dedup target, keys swallowed), until its wait is over;
     /// `x` closes it, which stops the loop. A tab without a `Redial` just
     /// exits.
@@ -1315,21 +1306,6 @@ mod tests {
 
     fn cli() -> ExecCli {
         ExecCli { exe: Some("/opt/bin/devsandbox".into()), root: "/home/u/cfg".into() }
-    }
-
-    /// An offered worker's tab runs this host's devsandbox on the qualified
-    /// name (its `exec` dials the fleet link), re-dialed like an ssh one.
-    #[test]
-    fn an_offered_machines_tabs_run_the_local_cli() {
-        let mut app = machine_app();
-        app.machines[0].kind = crate::serve::machines::MachineKind::Offered;
-        app.machines[0].target = None;
-        assert_eq!(app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID), Err("terminal: the devsandbox executable isn't known yet".into()));
-        app.exec_cli = Ok(cli());
-        let (argv, attach) = app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID).unwrap();
-        assert_eq!(argv, ["/opt/bin/devsandbox", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "box/inst1"]);
-        assert_eq!(attach, Some(["/opt/bin/devsandbox", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "box/inst1"].map(String::from).to_vec()));
-        assert_eq!(app.exec_argv("box/inst1", &["uname".into()]).unwrap(), ["/opt/bin/devsandbox", "exec", "-i", "-t", "--", "box/inst1", "uname"]);
     }
 
     #[test]

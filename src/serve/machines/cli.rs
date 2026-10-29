@@ -354,6 +354,15 @@ fn machine_info_with(
 /// ssh's exit code for its own failure (a lost or refused connection).
 pub(crate) const SSH_FAILED: i32 = 255;
 
+/// Whether a failed `instances.resolve` (error `code`) of `command`'s name
+/// exits [`SSH_FAILED`], as a lost dial does, instead of failing: for a
+/// qualified name under `--reserve-255` (a dashboard tab's dials, which
+/// re-dial on a 255: `tui::app::terminal::Redial`), any failure but
+/// `not-found` is the machine's link being down, an outage to wait out.
+pub(crate) fn resolve_lost(qualified: bool, command: &Command, code: &str) -> bool {
+    qualified && matches!(command, Command::Exec { reserve_255: true, .. }) && code != "not-found"
+}
+
 /// The helper's `NO_SESSION_EXIT` (`devsbd/src/sessions.rs`): an attach to
 /// a session that is unknown or `lost`. Like every code but 255 it ends
 /// [`Reconnect`]'s loop as the session's answer, with the helper's own note
@@ -670,6 +679,10 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     let found = match (r.error, r.result) {
         (None, result) => found_of(result.unwrap_or(Value::Null), &wherever)?,
         (Some(e), _) if e.code == "unknown-method" && !qualified => return Ok(Routed::Here(command)),
+        (Some(e), _) if resolve_lost(qualified, &command, &e.code) => {
+            eprintln!("{}", e.message);
+            return Ok(Routed::Exit(SSH_FAILED));
+        }
         // Not an instance: maybe a container name, which the machine looks up.
         (Some(e), _) if e.code == "not-found" && containers => {
             if !qualified {
@@ -1033,6 +1046,18 @@ mod tests {
     }
 
     const ID: &str = "1790000000-a1b2";
+
+    /// A dashboard tab's re-dial (`--reserve-255`) whose machine's link is
+    /// down fails its resolve: that's a 255 to wait out, not the tab's end.
+    /// A name the machine doesn't know, or any other exec, still fails.
+    #[test]
+    fn a_tab_dials_resolve_failure_is_a_lost_link() {
+        let again = command(&["exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "box/web"]);
+        assert!(resolve_lost(true, &again, "failed"));
+        assert!(!resolve_lost(true, &again, "not-found"));
+        assert!(!resolve_lost(false, &again, "failed"), "a bare name isn't one machine's link");
+        assert!(!resolve_lost(true, &command(&["exec", "box/web"]), "failed"));
+    }
 
     /// 255 after a connected dial retries with backoff until another code
     /// comes; a dial that never connected ends on ssh's own 255.

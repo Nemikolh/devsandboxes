@@ -239,10 +239,10 @@ fn list(ctx: &Ctx) -> Answer {
     to_value(rows)
 }
 
-/// `machines.get`'s answer: what an ssh command to the machine needs. No
-/// argv on the wire: Rust callers build it (`ssh::tty_argv`), other clients
-/// from `target` and `command`. An offered machine has no `target`: no
-/// ssh to it.
+/// `machines.get`'s answer: the machine's registry entry (what the CLI
+/// routes a command on it with, `machines::cli`). No argv on the wire: a
+/// client wanting an ssh command builds it from `target` and `command`. An
+/// offered machine has no `target`: no ssh to it.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineInfo {
     pub name: String,

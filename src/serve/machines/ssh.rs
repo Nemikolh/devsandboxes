@@ -135,11 +135,12 @@ pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     argv(entry, &["-T", "-o", "BatchMode=yes"], &args)
 }
 
-/// The argv of an interactive command on `entry` (a dashboard terminal
-/// tab): `ssh -t [-p N] -- <host> <devsandbox remote_args…>`. No
-/// `BatchMode`: a person is there to answer ssh's prompts. No `-A`: the
-/// agent, for a machine with `agent` on, is this host's over the machine's
-/// link (`AGENT`, `fleet::dialer`).
+/// The argv of an interactive command on `entry`: `ssh -t [-p N] -- <host>
+/// <devsandbox remote_args…>`. No `BatchMode`: a person is there to answer
+/// ssh's prompts. No `-A`: the agent, for a machine with `agent` on, is
+/// this host's over the machine's link (`AGENT`, `fleet::dialer`). No
+/// caller since the dashboard's tabs go over the link.
+#[allow(dead_code)] // fleet step 8c deletes it
 pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     cli_argv(entry, true, remote_args)
 }
@@ -154,10 +155,11 @@ pub fn cli_argv(entry: &Entry, tty: bool, remote_args: &[impl AsRef<str>]) -> Re
     argv(entry, &[if tty { "-t" } else { "-T" }], remote_args)
 }
 
-/// [`tty_argv`] running `program` on `entry` instead of its devsandbox: a
-/// dashboard service tab's `<runtime> exec -it …`
-/// (docs/architecture/daemon/machines.md, *ssh*). `program` is shell text,
-/// like `entry`'s `command`.
+/// [`tty_argv`] running `program` on `entry` instead of its devsandbox (a
+/// `<runtime> exec -it …`). `program` is shell text, like `entry`'s
+/// `command`. No caller since the dashboard's service tabs go over the
+/// link.
+#[allow(dead_code)] // fleet step 8c deletes it
 pub fn tty_argv_with(entry: &Entry, program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     argv_with(entry, &["-t"], program, remote_args)
 }
@@ -167,6 +169,8 @@ pub fn tty_argv_with(entry: &Entry, program: &str, remote_args: &[impl AsRef<str
 /// -C <root> tunnel [--instance=<key>] [--service=<svc>] --port <n>>`. No
 /// `-A`: a forward's bridge serves no agent. `batch` when whoever runs it has
 /// no TTY (the daemon). The `=` forms keep a name starting with `-` a value.
+/// No caller since forwards and `port` go over the link.
+#[allow(dead_code)] // fleet step 8c deletes it
 pub fn tunnel_argv(
     entry: &Entry,
     batch: bool,
