@@ -278,6 +278,8 @@ impl Out {
 pub struct Outlet {
     /// The live link's OUT half.
     up: Mutex<Option<Arc<Out>>>,
+    /// The live link's ending: [`hang_up`](Self::hang_up) sends on it.
+    end: Mutex<Option<mpsc::Sender<Ending>>>,
 }
 
 impl Outlet {
@@ -294,8 +296,20 @@ impl Outlet {
         self.up.lock().unwrap().is_some()
     }
 
-    fn set(&self, up: Option<Arc<Out>>) {
+    /// End the live link from this end (a peer link's end that must follow
+    /// its hub's build, `fleet::follow`): its body ends as when the peer's
+    /// stream ends ([`opener_with`] returns `Ok`, [`answerer_with`]
+    /// `End::Closed`), its sockets unlinked. Nothing when no link is up.
+    pub fn hang_up(&self) {
+        if let Some(end) = self.end.lock().unwrap().as_ref() {
+            let _ = end.send(Ending::Closed);
+        }
+    }
+
+    fn set(&self, up: Option<(Arc<Out>, mpsc::Sender<Ending>)>) {
+        let (up, end) = up.unzip();
         *self.up.lock().unwrap() = up;
+        *self.end.lock().unwrap() = end;
     }
 }
 
@@ -488,7 +502,7 @@ fn run(
 ) -> (Ending, bool) {
     let out = Arc::new(Out { mux: Arc::clone(mux), role, theirs, next: Mutex::new(1) });
     if let Some(outlet) = outlet {
-        outlet.set(Some(Arc::clone(&out)));
+        outlet.set(Some((Arc::clone(&out), tx.clone())));
     }
     let dead = Arc::new(AtomicBool::new(false));
     {
@@ -1048,6 +1062,33 @@ mod tests {
         assert_eq!(read_all(timed(opening.open(channel::API).unwrap())), b"answerer api");
         let err = opening.open(channel::PTY).err().expect("refused");
         assert_eq!(format!("{err:#}"), format!("the peer serves no channel {}", channel::PTY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An end's own code ends its live link through its outlet: the opener
+    /// returns `Ok`, its sockets unlinked; nothing happens with no link up.
+    #[test]
+    fn an_outlet_hangs_up_its_link() {
+        let dir = scratch("fleet-hang-up");
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("fleet-w.sock");
+        let outlet = Arc::new(Outlet::default());
+        outlet.hang_up();
+        let (a_r, o_w) = std::io::pipe().unwrap();
+        let (o_r, a_w) = std::io::pipe().unwrap();
+        let opener = {
+            let (outlet, path) = (Arc::clone(&outlet), socket.clone());
+            std::thread::spawn(move || {
+                let sockets = [(channel::API, path.as_path())];
+                opener_with(&LINK, o_r, o_w, Endpoint { sockets: &sockets, outlet: Some(&outlet), ..Endpoint::default() }, |_| Ok(()))
+            })
+        };
+        std::thread::spawn(move || answerer(&LINK, a_r, a_w, || None, || {}, || {}));
+        wait_for(|| outlet.is_up(), "the outlet is up");
+        outlet.hang_up();
+        opener.join().unwrap().unwrap();
+        assert!(!outlet.is_up());
+        assert!(!socket.exists(), "unlinked");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

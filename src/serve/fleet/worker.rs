@@ -42,9 +42,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::agent;
+use super::follow::{self, Incoming, PUSH_WAIT};
 use super::transfer::Receivers;
 use super::transport::{self, Transport};
-use super::update::{self, BINARY_KIND, BINARY_LIMIT, Build, Decision, Steps};
+use super::update::{self, Build, Decision, Steps};
 use super::{LINK, link};
 use crate::devsbd::mux::Conn;
 use crate::devsbd::proto::caps;
@@ -72,10 +73,6 @@ pub struct Follow {
     /// `Hello`s (a hand edit counts from the next attempt).
     pub dev_builds: Arc<dyn Fn() -> bool + Send + Sync>,
 }
-
-/// How long a link waiting for the hub's binary waits for its transfer to
-/// start; then it ends, retried after the backoff.
-const PUSH_WAIT: Duration = Duration::from_secs(60);
 
 /// The hub's devsandbox args for the link: `fleet-link --worker <name>
 /// --root <root>`. `root` is the canonical fleet root: the offer registers
@@ -121,7 +118,7 @@ struct Ctl {
     draining: AtomicBool,
     status: Mutex<Option<Status>>,
     /// Who takes the hub's `TRANSFER` streams: the daemon's receivers (and
-    /// the `binary` one, [`Incoming`]).
+    /// the `binary` one, `follow::Incoming`).
     receivers: Option<Arc<Receivers>>,
     /// The live link's way to open streams toward the hub.
     outlet: link::Outlet,
@@ -130,101 +127,6 @@ struct Ctl {
     incoming: Arc<Incoming>,
     /// The socket dir the link's agent socket goes in; `None`: none bound.
     agent_dir: Option<PathBuf>,
-}
-
-/// The hub's binary on its way (`Decision::Receive`): what the `binary`
-/// receiver takes, for the one link waiting for it.
-#[derive(Default)]
-struct Incoming {
-    want: Mutex<Option<Want>>,
-    wake: Condvar,
-    seq: std::sync::atomic::AtomicU64,
-}
-
-struct Want {
-    seq: u64,
-    /// The hub's `Hello` hash: what the binary must report.
-    hello: String,
-    /// The private scratch dir it lands in.
-    dir: PathBuf,
-    /// The link's stream, shut once the wait is over (received or not).
-    link: Option<Stream>,
-    /// Its transfer's header was taken: no other is.
-    started: bool,
-    received: Option<PathBuf>,
-    /// Why it didn't come.
-    why: Option<String>,
-}
-
-impl Want {
-    fn waiting(&self) -> bool {
-        !self.started && self.received.is_none() && self.why.is_none()
-    }
-}
-
-impl Incoming {
-    /// Wait for the hub's binary on the link `link`; the wait's `seq`.
-    fn expect(&self, hello: String, dir: PathBuf, link: Option<Stream>) -> u64 {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        *self.want.lock().unwrap() = Some(Want { seq, hello, dir, link, started: false, received: None, why: None });
-        seq
-    }
-
-    /// End the current wait with `f`: its link shut (which ends the link).
-    fn finish(&self, f: impl FnOnce(&mut Want)) {
-        if let Some(w) = self.want.lock().unwrap().as_mut() {
-            f(w);
-            if let Some(link) = &w.link {
-                let _ = link.shutdown(Shutdown::Both);
-            }
-        }
-        self.wake.notify_all();
-    }
-
-    /// The wait, over (its link ended).
-    fn take(&self) -> Option<Want> {
-        let want = self.want.lock().unwrap().take();
-        self.wake.notify_all();
-        want
-    }
-
-    /// After `wait` without the transfer starting, wait `seq` ends with why.
-    fn watch(self: &Arc<Self>, seq: u64, wait: Duration) {
-        let me = Arc::clone(self);
-        let _ = std::thread::Builder::new().name("serve-lend-push".into()).spawn(move || {
-            let current = |w: &Option<Want>| w.as_ref().is_some_and(|w| w.seq == seq && w.waiting());
-            let guard = me.want.lock().unwrap();
-            let (guard, _) = me.wake.wait_timeout_while(guard, wait, |w| current(w)).unwrap();
-            if current(&guard) {
-                drop(guard);
-                me.finish(|w| w.why = Some(format!("the hub sent no binary within {wait:?}")));
-            }
-        });
-    }
-
-    /// `receivers` taking the hub's binary ([`BINARY_KIND`]) into the
-    /// current wait's dir, once; with no wait, refused at the header.
-    fn receiver(self: &Arc<Self>, receivers: Receivers) -> Receivers {
-        let (take, done, failed) = (Arc::clone(self), Arc::clone(self), Arc::clone(self));
-        receivers
-            .with(
-                BINARY_KIND,
-                BINARY_LIMIT,
-                move |_| {
-                    let mut want = take.want.lock().unwrap();
-                    match want.as_mut() {
-                        Some(w) if w.waiting() => {
-                            w.started = true;
-                            take.wake.notify_all();
-                            Ok(w.dir.join("devsandbox"))
-                        }
-                        _ => anyhow::bail!("this worker isn't waiting for a binary"),
-                    }
-                },
-                move |r| done.finish(|w| w.received = Some(r.path)),
-            )
-            .on_failure(BINARY_KIND, move |why| failed.finish(|w| w.why = Some(format!("the hub's binary didn't arrive: {why}"))))
-    }
 }
 
 impl Lending {
@@ -398,7 +300,7 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, opens: &Opens, ctl: &Ctl,
                     Decision::Receive => {
                         let dir = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the hub's build: {e:#}"))?;
                         receiving.store(true, Ordering::Relaxed);
-                        let seq = ctl.incoming.expect(peer.hash.clone(), dir, link_stream.take());
+                        let seq = ctl.incoming.expect(peer.hash.clone(), dir, link_stream.take().map(follow::shutting));
                         ctl.incoming.watch(seq, PUSH_WAIT);
                         log(&format!("fleet: hub {hub} runs devsandbox {}: receiving its binary", theirs.label()));
                         ctl.set_status(Status::Retrying(format!("receiving the hub's build {}", theirs.label())));
@@ -776,46 +678,6 @@ mod tests {
         assert!(steps.calls().is_empty());
     }
 
-    /// The `binary` receiver takes one transfer, only while a link waits
-    /// for it; a wait whose transfer never starts ends with why, its link
-    /// shut.
-    #[test]
-    fn the_binary_receiver_takes_one_while_waited_for() {
-        use crate::serve::fleet::transfer::{self, Header};
-        let dir = std::env::temp_dir().join(format!("dsv-worker-incoming-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let incoming = Arc::new(Incoming::default());
-        let receivers = Arc::new(incoming.receiver(Receivers::new(|_| {})));
-        let (size, sha256) = transfer::digest(&b"bin"[..]).unwrap();
-        let header = Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None };
-        let err = transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap_err();
-        assert_eq!(format!("{err:#}"), "transfer refused: this worker isn't waiting for a binary");
-
-        let (link, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        incoming.expect("h".into(), dir.clone(), Some(link.into()));
-        transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap();
-        let err = transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap_err();
-        assert_eq!(format!("{err:#}"), "transfer refused: this worker isn't waiting for a binary", "once");
-        let start = std::time::Instant::now();
-        while incoming.want.lock().unwrap().as_ref().unwrap().received.is_none() {
-            assert!(start.elapsed() < Duration::from_secs(5), "received");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(std::io::Read::read(&mut &peer, &mut [0u8; 1]).unwrap(), 0, "the link is shut");
-        let want = incoming.take().unwrap();
-        assert_eq!(want.received, Some(dir.join("devsandbox")));
-        assert_eq!(std::fs::read(dir.join("devsandbox")).unwrap(), b"bin");
-
-        let (link, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let seq = incoming.expect("h".into(), dir.clone(), Some(link.into()));
-        incoming.watch(seq, Duration::from_millis(20));
-        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(std::io::Read::read(&mut &peer, &mut [0u8; 1]).unwrap(), 0, "shut by the watch");
-        assert_eq!(incoming.take().unwrap().why.as_deref(), Some("the hub sent no binary within 20ms"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn the_link_args() {
         let root = Path::new("/d/fleet/me@hub");
@@ -1029,7 +891,8 @@ mod tests {
             }
             let roots = call(&mut link, "roots.list", json!({})).result.unwrap();
             let roots: Vec<&str> = roots.as_array().unwrap().iter().map(|r| r["root"].as_str().unwrap()).collect();
-            assert_eq!(roots, [mine.to_str().unwrap(), cfg.to_str().unwrap()], "read-only");
+            // The fleet root, what the hub reaches besides the own roots, last.
+            assert_eq!(roots, [mine.to_str().unwrap(), cfg.to_str().unwrap(), canonical_root.to_str().unwrap()], "read-only");
             // `web` matches both instances: the fleet root's and the own root's.
             let r = call(&mut link, "instances.resolve", json!({"name": "web"}));
             assert_eq!(r.result.unwrap()["matches"], json!(["own", "web-w"]));

@@ -44,6 +44,7 @@
 
 pub mod agent;
 pub mod code;
+pub mod follow;
 pub mod lend;
 pub mod lender;
 pub mod lent;

@@ -23,6 +23,7 @@ use crate::serve::api::{ApiError, parse};
 use crate::serve::endpoint;
 use crate::serve::machines::service::Handle;
 use crate::serve::machines::ssh::{Dial, Duplex};
+use crate::serve::machines::inbound::{self, Neighbors};
 use crate::serve::machines::{self, Entry, check_name};
 
 type Answer = Result<Value, ApiError>;
@@ -38,6 +39,8 @@ pub struct Ctx<'a> {
     pub links: Option<&'a Handle>,
     /// This daemon's agent socket now (`bridge::host_agent` in production).
     pub agent: &'a dyn Fn() -> Option<PathBuf>,
+    /// The inbound neighbors up now: an offer of one's name is refused.
+    pub inbound: Option<&'a Neighbors>,
     pub log: fn(&str),
 }
 
@@ -127,6 +130,9 @@ fn offer(p: OfferParams, ctx: &Ctx) -> Answer {
             "this devsandbox isn't a fleet hub (`hub = true` under `[serve]` in daemon.config.toml)",
         ));
     }
+    if ctx.inbound.is_some_and(|n| n.contains(&p.worker)) {
+        return Err(inbound::taken(&p.worker));
+    }
     let offered = machines::update(ctx.registry, |entries| accept(entries, &p.worker, &p.root)).map_err(ApiError::internal)??;
     (ctx.log)(&format!(
         "fleet: worker {} offered (devsandbox {}{}, root {}){}",
@@ -171,7 +177,7 @@ mod tests {
     use super::*;
 
     fn ctx(registry: &Path, hub: bool) -> Ctx<'_> {
-        Ctx { registry, hub, links: None, agent: &|| Some(PathBuf::from("/hub/agent.sock")), log: |_| {} }
+        Ctx { registry, hub, links: None, agent: &|| Some(PathBuf::from("/hub/agent.sock")), inbound: None, log: |_| {} }
     }
 
     fn lap(root: &str) -> Entry {
@@ -227,6 +233,13 @@ mod tests {
 
         machines::update(&registry, |e| e.push(Entry::ssh("srv", "me@srv"))).unwrap();
         assert_eq!(call("fleet.offer", params("srv"), &hub).unwrap().unwrap_err().code, "denied");
+        // An inbound neighbor's name: refused, nothing written.
+        let neighbors = std::sync::Arc::new(Neighbors::default());
+        let _up = neighbors.announce("nb", "v", false);
+        let with = Ctx { inbound: Some(&neighbors), ..ctx(&registry, true) };
+        let e = call("fleet.offer", params("nb"), &with).unwrap().unwrap_err();
+        assert!(e.code == "denied" && e.message.contains("inbound neighbor"), "{e:?}");
+        assert!(!machines::load(&registry).unwrap().iter().any(|e| e.name == "nb"));
         assert_eq!(call("fleet.offer", params("a/b"), &hub).unwrap().unwrap_err().code, "invalid");
         assert_eq!(call("fleet.offer", json!({"worker": "x"}), &hub).unwrap().unwrap_err().code, "invalid");
         assert!(call("fleet.nope", Value::Null, &hub).is_none());

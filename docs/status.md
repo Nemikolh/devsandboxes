@@ -37,8 +37,11 @@ limitation means editing this file in the same commit.
   re-placement: from fleet step 7 on. Steps 1-6 shipped on the two-kind
   model that steps 7-10 replace (steps 4-5's channels and API forms on
   offered workers' links only; step 6's `member.toml` and trust table on
-  both kinds' API connections).
-  → [plan](plans/active/fleet.md)
+  both kinds' API connections). Step 7 in progress: the dialed end of a
+  peer link (`fleet-link --peer`, inbound neighbors in `machines.list`)
+  exists, but nothing dials it yet (7d puts ssh machines on it), so no
+  inbound neighbor appears in practice.
+  → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
 - **helper**: drop the host-side `lsof` fallback for a forward's listening
@@ -347,7 +350,7 @@ limitation means editing this file in the same commit.
 - A worker waiting for its hub's binary gives up only when the transfer
   hasn't started within 60 s (`PUSH_WAIT`) or fails; one that started and
   stalls while the link stays up waits until the link ends.
-  → [fleet](architecture/daemon/fleet.md#versions); `fleet::worker` `Incoming::watch`
+  → [fleet](architecture/daemon/fleet.md#versions); `fleet::follow` `Incoming::watch`
 - A worker that won't follow its hub (dev build, failed update) is seen by
   the hub only as an offered machine whose link is gone (`unreachable`);
   the reason is on the worker (`lend.get`, `serve.log`).

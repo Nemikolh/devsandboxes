@@ -29,7 +29,7 @@
 //!   verb's `env` replaced by the peer's when it has one.
 //!
 //! Under `trust = "full"` none of that: the peer has the API a local client
-//! has, except `member.*` and `link.*` (this member's own settings, and its
+//! has, except `member.*`, `link.*` and `links.*` (this member's own settings, and its
 //! links), refused under both; a verb's `env` is still the peer's when it
 //! has one.
 //!
@@ -396,7 +396,7 @@ impl Lent {
 /// to run it with. `state` is this host's `state.toml`, read only when the
 /// request names an instance or a container under `worker`.
 pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
-    if method.starts_with("member.") || method.starts_with("link.") {
+    if method.starts_with("member.") || method.starts_with("link.") || method.starts_with("links.") {
         return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
     }
     if reach.trust == Trust::Full {
@@ -541,6 +541,21 @@ pub fn filter_answer(method: &str, mut answer: Value, reach: &Reach, state: &Pat
         _ => {}
     }
     Ok(answer)
+}
+
+/// A `roots.list` answer (the listing, not a `paths` check) to a peer with
+/// a fleet root, that root added last unless listed already (as
+/// `{root, sandboxes: [], error: null}`: the placed configs are under it):
+/// what the peer reaches here besides this member's own roots, so a peer
+/// link's other end lists it among this member's roots (`machines.list`'s
+/// inbound neighbors).
+pub fn with_fleet_root(mut answer: Value, reach: &Reach) -> Value {
+    let (Some(root), Some(rows)) = (&reach.fleet_root, answer.as_array_mut()) else { return answer };
+    let listed = rows.iter().any(|r| r.get("root").and_then(Value::as_str) == root.to_str());
+    if !listed {
+        rows.push(serde_json::json!({ "root": root, "sandboxes": [], "error": null }));
+    }
+    answer
 }
 
 /// A `containers.list` / `containers.stats` answer's `rows` cut, in place,
@@ -956,7 +971,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `full`: nothing confined, but `member.*` and `link.*` stay local.
+    /// `full`: nothing confined, but `member.*`, `link.*` and `links.*` stay local.
     #[test]
     fn full_skips_the_table_but_not_member_or_link() {
         let base = scratch("full");
@@ -983,7 +998,7 @@ mod tests {
         let e = admit("gc", gc, &s, &fleet(&root), &state).unwrap_err();
         assert_eq!(e.code, "denied");
         assert!(e.message.contains("host maintenance"), "{}", e.message);
-        for m in ["member.get", "member.set", "link.attach", "link.anything"] {
+        for m in ["member.get", "member.set", "link.attach", "link.anything", "links.inbound"] {
             for reach in [&r, &fleet(&root)] {
                 assert_eq!(admit(m, json!({}), &s, reach, &state).unwrap_err().code, "denied", "{m}");
             }
@@ -1120,5 +1135,17 @@ mod tests {
         assert_eq!(got, json!({"rows": [{"name": format!("devsandbox-svc-{lent}-db")}]}));
         assert_eq!(filter_answer("containers.list", json!({"rows": []}), root, &base.join("bad")).unwrap(), json!({"rows": []}), "no state: none lent");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_peers_roots_listing_gets_its_fleet_root_once() {
+        let reach = worker(Path::new("/d/fleet/hub"), &[]);
+        let own = json!([{"root": "/own", "sandboxes": [{"name": "web"}], "error": null}]);
+        let got = with_fleet_root(own.clone(), &reach);
+        assert_eq!(got, json!([own[0], {"root": "/d/fleet/hub", "sandboxes": [], "error": null}]));
+        assert_eq!(with_fleet_root(got.clone(), &reach), got, "listed already");
+        let relay = Reach { fleet_root: None, ..reach.clone() };
+        assert_eq!(with_fleet_root(own.clone(), &relay), own, "no fleet root: as is");
+        assert_eq!(with_fleet_root(json!({"x": 1}), &reach), json!({"x": 1}), "not a listing");
     }
 }

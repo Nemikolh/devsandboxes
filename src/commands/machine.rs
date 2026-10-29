@@ -423,14 +423,19 @@ pub(crate) fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: V
 }
 
 /// `ls`'s cells: the first root and how many more; an offered fleet
-/// worker's TARGET is `offered` (it has none).
+/// worker's TARGET is `offered`, an inbound neighbor's `inbound` (neither
+/// has one).
 fn cells(r: MachineRow) -> [String; 8] {
     let roots = match r.roots.split_first() {
         None => "-".to_string(),
         Some((first, [])) => first.display().to_string(),
         Some((first, rest)) => format!("{} +{}", first.display(), rest.len()),
     };
-    let target = r.target.unwrap_or_else(|| "offered".into());
+    let target = match (r.target, r.kind) {
+        (Some(target), _) => target,
+        (None, crate::serve::machines::MachineKind::Inbound) => "inbound".into(),
+        (None, _) => "offered".into(),
+    };
     let capacity = r.capacity.as_ref();
     let mut room = capacity::summary(capacity);
     if let Some(note) = capacity.and_then(capacity::over_note) {
@@ -791,5 +796,7 @@ mod tests {
         assert_eq!(cells(row(&[], None))[2], "-");
         let offered = MachineRow { kind: crate::serve::machines::MachineKind::Offered, target: None, ..row(&[], None) };
         assert_eq!(cells(offered)[1], "offered");
+        let inbound = MachineRow { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..row(&[], None) };
+        assert_eq!(cells(inbound)[1], "inbound");
     }
 }

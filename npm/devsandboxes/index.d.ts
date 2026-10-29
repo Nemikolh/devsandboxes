@@ -156,10 +156,11 @@ export interface InstancesSnapshot extends InstancesList {
 export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
 
 /**
- * How a machine is reached: `ssh` (this host sshes to its `target`) or `offered` (a fleet worker that dialed
- * this host; no `target`, nothing sshes to it).
+ * How a machine is reached: `ssh` (this host sshes to its `target`), `offered` (a fleet worker that dialed
+ * this host; no `target`, nothing sshes to it) or `inbound` (only in `machines.list`: a machine whose link to
+ * this host was dialed from its end, listed while that link is up; no `target`, never in the registry).
  */
-export type MachineKind = 'ssh' | 'offered';
+export type MachineKind = 'ssh' | 'offered' | 'inbound';
 
 /** One machine of a federated {@link InstancesSnapshot}. */
 export interface SnapshotMachine {
@@ -841,13 +842,13 @@ export interface MachineHeld {
   agent: boolean;
 }
 
-/** One registered machine (`machines.list`). */
+/** One registered machine, or an inbound neighbor (`kind` `inbound`, always `connected`) (`machines.list`). */
 export interface MachineRow {
   name: string;
   kind: MachineKind;
-  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine. */
+  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine or an `inbound` neighbor. */
   target: string | null;
-  /** Config roots on the machine. */
+  /** Config roots on the machine (an `inbound` neighbor's as its `roots.list` answered; empty until then). */
   roots: string[];
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
@@ -856,7 +857,7 @@ export interface MachineRow {
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
   error: string | null;
-  /** The machine's devsandbox semver, once reached. */
+  /** The machine's devsandbox semver, once reached (an `inbound` neighbor's link hello: build, platform, `hub|member`). */
   version: string | null;
   /** Its host's capacity, from its last snapshot; `null` before one carried it. */
   capacity: Capacity | null;

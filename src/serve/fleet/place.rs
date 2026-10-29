@@ -96,7 +96,7 @@ impl Candidate {
     pub fn from_machine(spec: &Spec, m: &Machine) -> Candidate {
         let capacity = m.capacity();
         let unreported = match m.kind {
-            MachineKind::Ssh => State::Off,
+            MachineKind::Ssh | MachineKind::Inbound => State::Off,
             MachineKind::Offered => State::On,
         };
         Candidate {
@@ -117,6 +117,8 @@ pub fn reachable(kind: MachineKind, state: LinkState) -> bool {
     match kind {
         MachineKind::Ssh => state != LinkState::Unreachable,
         MachineKind::Offered => state == LinkState::Connected,
+        // Not in a snapshot's machines (fleet step 8 makes every neighbor a candidate).
+        MachineKind::Inbound => false,
     }
 }
 

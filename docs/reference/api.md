@@ -22,7 +22,7 @@ checks the typings against the wire structs).
 
 | group | methods | `machine`? |
 |---|---|---|
-| connection | `hello`, `subscribe`, `unsubscribe`, `shutdown`, `link.attach` (internal) | no |
+| connection | `hello`, `subscribe`, `unsubscribe`, `shutdown`, `link.attach`, `links.inbound` (internal) | no |
 | Inbox | `inbox.threads.list`, `inbox.thread.get\|markRead\|act\|reply\|done\|reopen`, `inbox.form.saveDraft\|submit`, `inbox.notify.dismiss\|markRead` | no |
 | instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|done` | yes |
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
@@ -126,7 +126,7 @@ A remote caller's connection is served with this member's trust table
 its `member.toml` per request: a fleet hub's over the lending link, the
 connection of a host that linked this one as a machine (its relay's,
 after `link.attach`, below), and a fleet member's channel streams (after
-`link.attach {channel}`). `member.*` and `link.*` are `denied` under
+`link.attach {channel}`). `member.*`, `link.*` and `links.*` are `denied` under
 either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
@@ -174,6 +174,19 @@ with the daemon's own env, whatever they send.
 The client sends nothing after the attach line until it has read the
 answer: bytes the daemon already holds past the line refuse the attach
 (`invalid`) rather than being lost.
+
+### `links.inbound`
+
+Internal (`devsandbox fleet-link --peer`'s; not in the npm typings): a
+link that machine `peer` dialed to this host is up
+([fleet.md](../architecture/daemon/fleet.md#peer-links)), for as long as
+this connection is open. While it is, `peer` is an inbound neighbor
+(`machines.list`, below); the newest announce of a name wins, so an older
+connection closing doesn't remove a newer one's.
+
+| params | result | errors |
+|---|---|---|
+| `{"peer": name, "version": hello, "hub"?: bool}`: `peer` a machine name; `version` the dialer's link `Hello` (`<semver> <git> <published\|dev> <os>/<arch> <hub\|member>`); `hub` (default `false`) whether it said it's the hub | `{"ok": true}`; then the daemon asks `peer`'s roots over the link (`roots.list` through `fleet-<peer>.sock`) | `denied` (a remote caller's connection or another uid's; or `machines.toml` has an entry named `peer`, any kind: the message names it), `invalid` (a bad name, a missing param), `failed` (no machines registry), `internal` (`machines.toml` doesn't read) |
 
 ## Inbox threads
 
@@ -1077,15 +1090,18 @@ recorded), sorted; no disk scan. With `paths`: exactly those, in order,
 `~` / `~/…` expanded with this host's home, then canonicalized. A root that
 doesn't exist, isn't absolute or whose config doesn't load has `error` set
 and `sandboxes: []`; the call itself fails only as `internal`, when
-`state.toml` doesn't read (without `paths`).
+`state.toml` doesn't read (without `paths`). Without `paths`, to a remote
+caller with a fleet root here (a fleet link's `API` stream, *Remote
+callers*), that fleet root is listed last (`sandboxes: []`, `error:
+null`): it is reached besides the own roots.
 
 ### `machines.*`
 
 | method | params | result | errors |
 |---|---|---|---|
 | `machines.probe` | `{"target", "command"?}` (`command`: the machine's devsandbox as shell text, default `devsandbox`) | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target, empty `command`), `failed` (ssh, the hello or the protocol) |
-| `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, empty `command`, a root the machine refuses: each one's reason), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
-| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, by name; `kind` `ssh` \| `offered`, `target` `null` for an offered one; `version` from the last hello; `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
+| `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, empty `command`, a root the machine refuses: each one's reason), `denied` (the name is a live inbound neighbor's), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
+| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, the registry's by name, then the inbound neighbors by name; `kind` `ssh` \| `offered` \| `inbound`, `target` `null` for an offered one and an inbound one; `version` from the last hello (an inbound neighbor's: its link `Hello`); an inbound neighbor is always `connected`, `agent` off, `command` and `capacity` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
 | `machines.get` | `{"name"}` | `{"name", "kind", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an offered one has none) | `not-found`, `internal` (as `list`) |
 | `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `internal` (`machines.toml` doesn't read or write) |
@@ -1126,7 +1142,7 @@ an ssh machine's), an offered one is kept, its root replaced (and its link
 restarted) when it differs. Errors: `invalid` (a bad name, a missing
 param, a `root` that isn't absolute), `denied` (this daemon isn't a
 hub: `[serve] hub = true` in `daemon.config.toml`; or the name is an ssh
-machine's), `internal` (`machines.toml` doesn't read or write).
+machine's or a live inbound neighbor's), `internal` (`machines.toml` doesn't read or write).
 
 ### `fleet.agent`
 
@@ -1195,7 +1211,7 @@ connection under either trust (*Remote callers*).
   under the new name.
 - `trust`: `worker` (the default: a remote caller reaches this host's
   own roots and its fleet root, placed work under the worker policy) or
-  `full` (the whole API but `member.*` and `link.*`, no worker policy,
+  `full` (the whole API but `member.*`, `link.*` and `links.*`, no worker policy,
   the hub's dev builds taken)
   ([fleet.md](../architecture/daemon/fleet.md#trust)).
 - `dev_builds`: `member.toml`'s `dev-builds`, as the file says.

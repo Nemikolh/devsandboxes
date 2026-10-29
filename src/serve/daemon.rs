@@ -328,6 +328,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         dial,
         version: opts.version.semver.clone(),
         links: Some(links.handle()),
+        inbound: Arc::default(),
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
@@ -1283,6 +1284,9 @@ struct ConnState {
     /// Set by a `link.attach {channel}` (not `api`): the loop ends once its
     /// answer is out and the stream goes to that channel.
     handoff: Option<(lent::Channel, Arc<lent::Peer>)>,
+    /// `links.inbound`'s announce: its neighbor is up while this
+    /// connection is (a repeat replaces it).
+    inbound: Option<machines::inbound::Guard>,
 }
 
 impl ConnState {
@@ -1309,6 +1313,7 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
         holds: BTreeMap::new(),
         buffered: false,
         handoff: None,
+        inbound: None,
     };
     let mut reader = BufReader::new(stream);
     loop {
@@ -1385,6 +1390,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "helper.call" => return helper_call(req.id, req.params, shared, conn),
         // Only reached on `Full`: the trust table refuses `link.*`.
         "link.attach" => return Some(link_attach(req.id, &req.params, shared, conn)),
+        "links.inbound" => return Some(links_inbound(req.id, req.params, shared, conn)),
         _ => {}
     }
     // On a machine: the remote's answer as is
@@ -1400,6 +1406,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         }
         Ok(None) => {}
     }
+    // A peer's `roots.list` listing (not a `paths` check) gets its fleet root.
+    let lists_roots = req.method == "roots.list" && req.params.get("paths").is_none_or(Value::is_null);
     let answer = match req.method.as_str() {
         "subscribe" => subscribe(req.params, conn, true),
         "unsubscribe" => subscribe(req.params, conn, false),
@@ -1437,7 +1445,14 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         method if method.starts_with("fleet.") && shared.machines.is_some() => {
             let m = shared.machines.as_ref().expect("checked");
             let agent = || (shared.host_agent)();
-            let ctx = super::fleet::offer::Ctx { registry: &m.registry, hub: shared.hub, links: m.links.as_ref(), agent: &agent, log };
+            let ctx = super::fleet::offer::Ctx {
+                registry: &m.registry,
+                hub: shared.hub,
+                links: m.links.as_ref(),
+                agent: &agent,
+                inbound: Some(&m.inbound),
+                log,
+            };
             super::fleet::offer::call(method, req.params, &ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
         }
         method if method.starts_with("machines.") && shared.machines.is_some() => {
@@ -1447,6 +1462,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         method => local_call(method, req.params, shared, conn),
     };
     let answer = match &reach {
+        Some(reach) if lists_roots => answer.map(|v| lent::with_fleet_root(v, reach)),
         Some(reach) => answer.and_then(|v| lent::filter_answer(&req.method, v, reach, &shared.state)),
         None => answer,
     };
@@ -1459,6 +1475,81 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Response::err(req.id, e.code, e.message)
         }
     })
+}
+
+#[derive(serde::Deserialize)]
+struct InboundParams {
+    peer: String,
+    /// Its link `Hello` (`fleet::update::hello_of`).
+    version: String,
+    #[serde(default)]
+    hub: bool,
+}
+
+/// `links.inbound {peer, version, hub}`: a `fleet-link --peer <peer>` of
+/// this user says the link `peer` dialed to this host is up, for as long as
+/// this connection is (docs/reference/api.md, `links.inbound`). Refused for
+/// a name `machines.toml` has (an inbound neighbor and a registry entry
+/// never share a name). Once announced, the neighbor's roots are asked over
+/// the link ([`inbound_roots`]) on a thread of its own.
+fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) -> Response {
+    if !matches!(conn.table, Table::Full) || !conn.own_user {
+        return Response::err(id, "denied", "`links.inbound` is for this user's own `fleet-link`");
+    }
+    let p: InboundParams = match api::parse(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, e.code, e.message),
+    };
+    if let Err(e) = machines::check_name(&p.peer) {
+        return Response::err(id, "invalid", format!("`peer`: {e:#}"));
+    }
+    let Some(m) = shared.machines.as_ref() else {
+        return Response::err(id, "failed", "this daemon has no machines registry");
+    };
+    match machines::load(&m.registry) {
+        Ok(entries) => {
+            if let Some(e) = entries.iter().find(|e| e.name == p.peer) {
+                let msg = format!(
+                    "`{}` is already a machine here ({}): a link from a machine of the same name is refused; \
+                     `devsandbox machine rm {}` here, or another `name` in its member.toml",
+                    p.peer,
+                    e.label(),
+                    p.peer
+                );
+                log(&format!("{}: links.inbound: {msg}", conn.label()));
+                return Response::err(id, "denied", msg);
+            }
+        }
+        Err(e) => return Response::err(id, "internal", format!("{e:#}")),
+    }
+    let guard = m.inbound.announce(&p.peer, &p.version, p.hub);
+    let set_roots = guard.roots_setter();
+    conn.inbound = Some(guard);
+    log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.hub { ", the hub" } else { "" }));
+    let (socket, peer) = (endpoint::fleet_socket(&shared.socket_dir, &p.peer), p.peer);
+    let _ = std::thread::Builder::new().name("serve-inbound-roots".into()).spawn(move || match inbound_roots(&peer, &socket) {
+        Ok(roots) => set_roots(roots),
+        Err(e) => log(&format!("links.inbound: cannot list {peer}'s roots: {e:#}")),
+    });
+    Response::ok(id, json!({ "ok": true }))
+}
+
+/// How long [`inbound_roots`] waits for the neighbor's hello.
+const INBOUND_ROOTS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Inbound neighbor `peer`'s config roots: `roots.list` over one `API`
+/// stream of its link, through `socket` (`fleet-<peer>.sock`, which its
+/// `fleet-link` binds before announcing; the stream starts with the API
+/// relay's sentinel, as every link `API` stream does).
+fn inbound_roots(peer: &str, socket: &Path) -> Result<Vec<PathBuf>> {
+    let stream = Stream::connect(socket).with_context(|| format!("cannot connect to {}", socket.display()))?;
+    let mut link = machines::link::handshake(peer, machines::ssh::Duplex::socket(stream), INBOUND_ROOTS_TIMEOUT)?;
+    let r = link.conn.call("roots.list", json!({}))?;
+    if let Some(e) = r.error {
+        anyhow::bail!("roots.list: {}", e.message);
+    }
+    let rows: Vec<api::RootCandidate> = serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad roots.list answer")?;
+    Ok(rows.into_iter().map(|c| c.root).collect())
 }
 
 /// `link.attach {peer, channel?}`: a connection of this user says the

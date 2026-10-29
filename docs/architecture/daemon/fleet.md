@@ -100,16 +100,23 @@ placement: `src/serve/fleet/place.rs` (`place`, `score`, `Spec`,
 `DRAINING`), `src/serve/fleet/lender.rs` (`Lender::draining`),
 `src/serve/verbs.rs` (`RunParams::here`), `src/serve/verbs_client.rs`
 (`run_target`, `Streaming`), `src/serve/machines/cli.rs` (`plan`);
-versions: `src/serve/fleet/update.rs` (`HELLO`, `PLATFORM`,
+versions: `src/serve/fleet/update.rs` (`HELLO`, `hello_of`, `is_hub`, `PLATFORM`,
 `platform_of`, `Build`, `decide`, `Decision`, `hub_pushes`, `push`,
 `install_received`, `release_target`, `asset_url`, `curl_argv`, `update`,
-`Steps`, `Release`), `src/serve/fleet/worker.rs` (`Follow`, `Incoming`),
-`src/commands/fleet_link.rs` (`push_build`), `src/main.rs`
+`Steps`, `Release`), `src/serve/fleet/worker.rs` (`Follow`), `src/serve/fleet/follow.rs`
+(`Incoming`, `PUSH_WAIT`, `EndLink`, `shutting`),
+`src/commands/fleet_link.rs` (`push_build`, `follows`), `src/main.rs`
 (`Command::FleetHello`), `build.rs` (`stamp_build`),
 `src/serve/machines/install.rs` (`install_local`, `version_of`),
 `src/serve/proto.rs` (`HelloParams::force`), `src/serve/client.rs`
 (`hello_with`), `src/serve/endpoint.rs` (`peer_is_own_user`),
-`src/serve/daemon.rs` (`hello`).
+`src/serve/daemon.rs` (`hello`); peer links: `src/commands/fleet_link.rs`
+(`fleet_link_peer`, `run_peer`, `PeerOptions`, `Announce`, `REANNOUNCE`,
+`attach_stream`), `src/serve/fleet/link.rs` (`Outlet::hang_up`),
+`src/serve/endpoint.rs` (`link_agent_socket`),
+`src/serve/machines/inbound.rs` (`Neighbors`, `Neighbor`, `Guard`,
+`taken`), `src/serve/daemon.rs` (`links_inbound`, `inbound_roots`),
+`src/serve/fleet/lent.rs` (`with_fleet_root`).
 
 ## Link
 
@@ -141,7 +148,9 @@ that channel. The end unlinks each socket when the link ends, only while
 it is still its own (same device and inode), never a newer end's. The
 outlet is set to the link from the `Hello`s until it ends:
 `Outlet::open(channel)` opens a stream (flowing channels only), an error
-when no link is up or the peer didn't advertise the channel. Handlers run
+when no link is up or the peer didn't advertise the channel;
+`Outlet::hang_up` ends the live link from that end's own code, as if the
+peer's stream had ended. Handlers run
 on the mux's read thread, so they return at once: a local connect, or a
 socket pair whose other end a thread of its own takes
 (`transfer::Receivers::accept`).
@@ -155,7 +164,8 @@ stream. The roles differ in the handshake, the stream id space
 (`link::Out`) and how an ending ends them:
 
 - **The opener** (`link::opener_with`, the end ssh runs: the hub's
-  `fleet-link`, the agent relay's far end) binds its sockets, writes the
+  `fleet-link`, a [peer link](#peer-links)'s dialed end, the agent
+  relay's far end) binds its sockets, writes the
   sentinel, exchanges `Hello`s and requires the peer to advertise the
   spec's channel. Its `on_ready` callback runs next, with the peer's
   `Hello` (its `hash` is the far end's spec `hello`); an error there ends
@@ -190,7 +200,7 @@ Two specs exist:
 | spec | sentinel | channel | cap | opener / answerer |
 |---|---|---|---|---|
 | `machines::agent::SPEC` | `devsandbox-agent 1` | `SSH_AGENT` (legacy) | `caps::SSH_AGENT` | `commands::agent_relay::run` / `machines::agent::serve` |
-| `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run` (on the hub) / the worker's lending thread (`fleet::worker`) |
+| `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run` (on the hub) / the worker's lending thread (`fleet::worker`); `commands::fleet_link::run_peer` (a [peer link](#peer-links)'s dialed end, its `hello` `update::hello_of`) / the dialer |
 
 The agent relay uses the one-channel cases (`link::opener`,
 `link::answerer`). On `fleet::LINK` the hub's opener binds
@@ -229,6 +239,55 @@ for bandwidth, changes that module and nothing that dials. Callers name
 the target and the devsandbox args only (the worker's link:
 `worker::link_args`); tests build a `Transport::new` whose far end runs
 in-process and see both.
+
+## Peer links
+
+`machine add K` run on L makes a link L → K (decisions 7, 22 and 23 of
+the plan): L dials `devsandbox fleet-link --peer L` on K through the
+[transport](#transport), and both ends run both halves of a link. K's end
+is `commands::fleet_link::run_peer` (`fleet_link_peer` from the CLI:
+`--peer` passes `machines::check_name` and excludes `--worker` /
+`--root` / `--drain`), ssh's child there, its stdio the link: the opener
+of `fleet::LINK` (it writes the sentinel), saying
+`update::hello_of(hub)` (below, *Versions*), `hub` read from
+`daemon.config.toml` as the daemon reads it (`daemon_config::load`).
+
+- **IN.** Each stream L opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
+  answered by `attach_stream`: a socket pair whose far end a thread takes,
+  connecting K's daemon socket and sending `link.attach {peer: L,
+  channel}` as the connection's first line, reading the answer byte by
+  byte (nothing past it), then splicing the stream to the connection
+  (`link::splice`); an `API` stream gets the API relay's sentinel line
+  first ([the sentinel rule](#link)), so L reads it as any link's. Every
+  stream is therefore served by K's daemon under K's trust table for L,
+  with L's fleet root `fleet/L/` (`Shared::serve_channel`); a refused
+  attach closes the stream, with why on stderr. `AGENT` isn't served: it
+  opens only member → dialer (decision 18). Per-stream connects reach
+  whichever daemon is up, a successor after a version handoff included.
+- **OUT.** K binds `fleet-L.sock`, `fleet-L.pty.sock`,
+  `fleet-L.tunnel.sock` and `fleet-L.transfer.sock`
+  (`endpoint::fleet_socket` and its siblings): each accepted connection
+  is a stream to L, which L's daemon answers. While L serves `AGENT`,
+  `agent::serve` binds `agent-link-L.sock` (`endpoint::link_agent_socket`,
+  through K's outlet): an `agent-*.sock`, so K's bridges pick it as a
+  relayed agent (`endpoint::agent_sockets`).
+- **The inbound neighbor.** Once the `Hello`s are through (and this end
+  follows nobody), K's end announces L on a connection of its own
+  (`links.inbound {peer, version, hub}`, the version L's `Hello` hash, the
+  hub flag `update::is_hub` of it) and holds that connection for the
+  link's life (`Announce`): K's daemon keeps L in its inbound neighbors
+  (`machines::inbound::Neighbors`) while the connection lives, the newest
+  announce of a name winning (`Guard`), and asks L's roots over
+  `fleet-L.sock` on a thread (`daemon::inbound_roots`: the hello as
+  `0.0.0`, then `roots.list`, which L answers with its own roots and
+  K's fleet root there, `lent::with_fleet_root`); `machines.list` shows
+  the neighbor ([machines](machines.md#inbound-neighbors)). A name that
+  `machines.toml` has (any kind) is refused, and the refusal ends the
+  link with why on stderr (L sees ssh's stderr tail); `machines.add` and
+  `fleet.offer` refuse a live neighbor's name in turn. When the held
+  connection drops (K's daemon handed off or restarted), `Announce`
+  connects and announces again, backing off from `REANNOUNCE` (100 ms) to
+  5 s; the link stays up meanwhile. A refusal then ends the link.
 
 ## Transfer
 
@@ -864,7 +923,7 @@ A worker follows its hub's exact build, an older one included
   is on `fleet-link`'s stderr.
 - **`Receive`**, the worker's side: the link's `API` streams are refused
   (the `Worker` table is out of reach until the update is done) and a
-  wait is set up (`worker::Incoming`: a private scratch dir under the temp
+  wait is set up (`follow::Incoming`: a private scratch dir under the temp
   dir, `update::scratch_dir`); `lend.get`'s error is `receiving the hub's
   build <hub build>`. The `binary` receiver takes one transfer while a
   wait is on (else `this worker isn't waiting for a binary`) into
@@ -913,6 +972,25 @@ A worker follows its hub's exact build, an older one included
   path, when installed; else detached), and waits for the lock while the
   old daemon drains ([role](role.md#version-handoff)). The new daemon
   lends as `lend.toml` says, and its hello matches the hub's.
+- **On a [peer link](#peer-links)** the `Hello` hash is
+  `update::hello_of(hub)`: `HELLO` and a fifth word, `hub` when that end's
+  host is the hub (`[serve] hub`), else `member` (`update::is_hub` reads
+  it; `Build::parse` and `platform_of` ignore it, and
+  `install_received` checks only the first four words, which is what
+  `fleet-hello` prints). Versions follow the flag, whichever end dialed
+  (decision 25; `commands::fleet_link::follows`, pure): the end that
+  isn't the hub follows a hub peer through `update::decide` as above;
+  two non-hubs only need the frame protocol's match; a hub never follows.
+  On the dialed end (`run_peer`): `Download` and `Stop` end the link
+  from `on_ready`, then `Download` installs and hands off over
+  `Follow::steps` (`update::Release` in production); `Receive` serves
+  only the hub's `binary` transfer (`follow::Incoming`, ending the link
+  with `Outlet::hang_up` once it is in or the wait is over), then
+  `install_received`. Either way `fleet-link` then exits with what
+  happened (`updated to devsandbox <build>, handing off`, or the
+  failure), so the dialer redials and reaches the new binary. A dialed
+  end on the hub pushes its own dev build to a dialer that would take it
+  (`update::hub_pushes`, `push_build` through `fleet-<dialer>.transfer.sock`).
 
 ### Lending: `lend.*`
 
@@ -998,7 +1076,7 @@ remote caller reaches this host's own roots and (a hub, a fleet member)
 its fleet root
 through the [trust table](#the-trust-table), placed
 work under the [worker policy](#worker-policy). `full` gives it the API a
-local client has (but `member.*` and `link.*`), lifts the worker policy
+local client has (but `member.*`, `link.*` and `links.*`), lifts the worker policy
 (`worker_policy::Policy::detect` answers none) and takes the hub's dev
 builds ([Versions](#versions)).
 
@@ -1046,7 +1124,7 @@ lending link's peer, the one with a fleet root, while the lending thread
 drains is `denied`, `lent::DRAINING`, under either trust; `drain` is
 about the lending link, so an ssh machine's peer isn't refused) and
 `lent::admit` at the top of `handle`, before any dispatch. Under
-either trust `member.*` and `link.*` are `denied`: this member's own
+either trust `member.*`, `link.*` and `links.*` are `denied`: this member's own
 settings and links are its local clients' only.
 
 Under **`full`** that's all: the request runs as a local client's would,

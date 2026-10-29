@@ -54,6 +54,28 @@ Default: the target's host (`default_name`). `parse_name` splits a CLI
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
 
+## Inbound neighbors
+
+A machine whose link to this host was dialed from its end (`machine add
+<this host>` run there, a [peer link](fleet.md#peer-links)) is an inbound
+neighbor here while that link is up: never in `machines.toml`, memory
+only (`machines::inbound::Neighbors`, on `machines::api::Ctx`). Its
+`fleet-link --peer <name>` announces it (`links.inbound`) on a connection
+it holds; the neighbor lasts while that connection does (`Guard`, the
+newest announce of a name winning, so an older connection's close never
+removes a newer one's). `machines.list` lists the neighbors after the
+registry's entries, as rows of `kind` `inbound` (`MachineKind::Inbound`):
+no `target`, `command` or `capacity`, `agent` off, `state` always
+`connected`, `version` the link `Hello` it said (build, platform,
+`hub|member`), `roots` its own config roots and this host's fleet root
+there, as its daemon answered `roots.list` over the link once announced
+(`daemon::inbound_roots`; empty until then). `devsandbox machine ls`
+shows `inbound` as the TARGET. A name is a registry entry's or a
+neighbor's, never both: `links.inbound` refuses a name `machines.toml`
+has (any kind), `machines.add` and `fleet.offer` a live neighbor's
+(`inbound::taken`). `Kind::from_wire` refuses `inbound`: a neighbor
+isn't something to dial.
+
 ## ssh
 
 One argv builder for the daemon, the CLI and the dashboard; every argv
@@ -111,7 +133,7 @@ remote daemon serves that connection with the machine's trust table
 default) this host reaches the machine's own roots only (those its
 instances name, plus its `member.toml` `roots`, which `machine add`
 records there), never `machines.*`, `member.*`, `shutdown` or an edit of
-those configs; under `full`, everything but `member.*` and `link.*`. The
+those configs; under `full`, everything but `member.*`, `link.*` and `links.*`. The
 held link and every forwarded verb's connection dial `api_argv`, so both
 go through it. A refused attach (another user's socket, a daemon without
 `link.attach`) ends the relay with exit 1 and the reason on stderr,

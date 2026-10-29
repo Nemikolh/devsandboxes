@@ -37,6 +37,7 @@ pub mod agent;
 pub mod api;
 pub mod cli;
 pub mod forward;
+pub mod inbound;
 pub mod install;
 pub mod link;
 pub mod saved;
@@ -79,13 +80,18 @@ pub enum Kind {
 
 /// [`Kind`] on the wire (`kind` of `machines.list` / `get` and the
 /// federated snapshot's `machines`, next to a `target` that is `null` for an
-/// offered machine).
+/// offered machine and an inbound neighbor; `inbound` only in
+/// `machines.list`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MachineKind {
     #[default]
     Ssh,
     Offered,
+    /// An inbound neighbor (`inbound`): a machine whose link to this host
+    /// is dialed from its end, listed by `machines.list` while it's up;
+    /// never a registry entry.
+    Inbound,
 }
 
 impl Kind {
@@ -104,6 +110,7 @@ impl Kind {
             (MachineKind::Ssh, Some(target)) => Ok(Kind::Ssh { target }),
             (MachineKind::Ssh, None) => bail!("an ssh machine without a target"),
             (MachineKind::Offered, _) => Ok(Kind::Offered),
+            (MachineKind::Inbound, _) => bail!("an inbound neighbor isn't a registry entry"),
         }
     }
 }
@@ -385,6 +392,7 @@ mod tests {
         assert_eq!(Kind::from_wire(MachineKind::Ssh, Some("t".into())).unwrap(), Kind::Ssh { target: "t".into() });
         assert_eq!(Kind::from_wire(MachineKind::Offered, None).unwrap(), Kind::Offered);
         assert!(Kind::from_wire(MachineKind::Ssh, None).is_err());
+        assert!(Kind::from_wire(MachineKind::Inbound, None).is_err());
     }
 
     #[test]

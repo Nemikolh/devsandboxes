@@ -385,21 +385,27 @@ enum Command {
         #[arg(long)]
         client: String,
     },
-    /// The hub's end of a fleet worker's link (docs/architecture/daemon/fleet.md,
-    /// *Hub side*): offer the worker to this host's daemon and carry its API
-    /// over stdin/stdout
+    /// The far end of a fleet link over stdin/stdout
+    /// (docs/architecture/daemon/fleet.md): `--worker`/`--root`, the hub's
+    /// end of a lending worker's link (*Hub side*: offer the worker to this
+    /// host's daemon and carry its API); `--peer`, the dialed end of a link
+    /// a machine dialed to this one (*Peer links*)
     #[cfg(unix)]
     #[command(hide = true)]
     FleetLink {
         /// The worker's machine name: names the socket and its offered entry
-        #[arg(long)]
-        worker: String,
+        #[arg(long, requires = "root", required_unless_present = "peer")]
+        worker: Option<String>,
         /// The worker's canonical fleet root: its offered entry's one root
-        #[arg(long)]
-        root: PathBuf,
+        #[arg(long, requires = "worker")]
+        root: Option<PathBuf>,
         /// The worker's lending is `drain`: it takes no new work
-        #[arg(long)]
+        #[arg(long, requires = "worker")]
         drain: bool,
+        /// The dialer's machine name: the link's inbound neighbor here,
+        /// whose streams this host's trust table answers
+        #[arg(long, conflicts_with_all = ["worker", "root", "drain"])]
+        peer: Option<String>,
     },
     /// Print the build this binary says in a fleet link's `Hello`
     /// (docs/architecture/daemon/fleet.md, *Versions*): what a worker
@@ -891,7 +897,12 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
         #[cfg(unix)]
-        Command::FleetLink { worker, root, drain } => commands::fleet_link::fleet_link(&worker, &root, drain),
+        Command::FleetLink { peer: Some(peer), .. } => commands::fleet_link::fleet_link_peer(&peer),
+        Command::FleetLink { worker, root, drain, peer: None } => {
+            // Both required by clap without `--peer`.
+            let (Some(worker), Some(root)) = (worker, root) else { anyhow::bail!("fleet-link needs --peer, or --worker and --root") };
+            commands::fleet_link::fleet_link(&worker, &root, drain)
+        }
         #[cfg(unix)]
         Command::FleetHello => {
             println!("{}", serve::fleet::update::HELLO);
@@ -1007,10 +1018,21 @@ mod tests {
         assert!(parse(&["fleet", "join"]).is_err(), "a hub is required");
         assert!(parse(&["fleet"]).is_err());
         match parse(&["fleet-link", "--worker", "lap", "--root", "/d/fleet/hub", "--drain"]).unwrap().command {
-            Some(Command::FleetLink { worker, root, drain }) => assert!(worker == "lap" && root == Path::new("/d/fleet/hub") && drain),
+            Some(Command::FleetLink { worker, root, drain, peer: None }) => {
+                assert!(worker.as_deref() == Some("lap") && root.as_deref() == Some(Path::new("/d/fleet/hub")) && drain)
+            }
             _ => panic!("not fleet-link"),
         }
         assert!(parse(&["fleet-link", "--worker", "lap"]).is_err(), "a root is required");
+        assert!(parse(&["fleet-link", "--root", "/r"]).is_err(), "a worker is required");
+        assert!(parse(&["fleet-link"]).is_err(), "a mode is required");
+        match parse(&["fleet-link", "--peer", "lap"]).unwrap().command {
+            Some(Command::FleetLink { worker: None, root: None, drain: false, peer }) => assert_eq!(peer.as_deref(), Some("lap")),
+            _ => panic!("not fleet-link --peer"),
+        }
+        for both in [&["fleet-link", "--peer", "lap", "--worker", "w", "--root", "/r"][..], &["fleet-link", "--peer", "lap", "--drain"]] {
+            assert!(parse(both).is_err(), "{both:?}: one mode");
+        }
         assert!(matches!(parse(&["fleet-hello"]).unwrap().command, Some(Command::FleetHello)));
     }
 

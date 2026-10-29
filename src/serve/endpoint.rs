@@ -118,6 +118,15 @@ pub fn fleet_tunnel_socket(dir: &Path, worker: &str) -> PathBuf {
     fleet_channel_socket(dir, worker, "tunnel")
 }
 
+/// The agent socket of a `fleet-link --peer <dialer>` in `dir`
+/// (docs/architecture/daemon/fleet.md, *Peer links*):
+/// `agent-link-<dialer>.sock`, bound while the dialer serves `AGENT`
+/// (`fleet::agent::serve`). Named `agent-*.sock`, it is one of
+/// [`agent_sockets`], so this host's bridges pick it up as a relayed agent.
+pub fn link_agent_socket(dir: &Path, dialer: &str) -> PathBuf {
+    dir.join(format!("agent-link-{}.sock", agent_socket_name(dialer)))
+}
+
 /// An offered fleet worker's socket in `dir` for one more channel its
 /// `fleet-link` opens toward it: `fleet-<worker>.<suffix>.sock`, next to
 /// [`fleet_socket`]; each connection there is one stream on that channel

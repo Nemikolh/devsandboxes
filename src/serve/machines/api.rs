@@ -14,12 +14,14 @@
 //! can tell whether they exist, expand a quoted `~`, and canonicalize them.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::inbound::{self, Neighbors};
 use super::link::{self, Link};
 use super::service::{Handle, Want};
 use super::ssh::{self, Dial};
@@ -44,6 +46,9 @@ pub struct Ctx {
     /// The links: `add`/`set`/`rm` reload them, `list` reports their state. `None`
     /// only where no service runs (then every machine lists as `idle`).
     pub links: Option<Handle>,
+    /// The inbound neighbors up now (`links.inbound`): `list` shows them,
+    /// `add` refuses their names.
+    pub inbound: Arc<Neighbors>,
 }
 
 /// Run `method` if it's a `machines.*` one; `None` otherwise.
@@ -84,12 +89,13 @@ pub struct Added {
 
 /// One `machines.list` row: the registry entry and its link's live state
 /// (`error` the last failure while `unreachable`; `version` from the last
-/// hello).
+/// hello), or an inbound neighbor (`kind` `inbound`: no `target`, always
+/// `connected`, `version` its link `Hello`, `roots` its `roots.list`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineRow {
     pub name: String,
     pub kind: MachineKind,
-    /// `None` for an offered machine.
+    /// `None` for an offered machine and an inbound neighbor.
     pub target: Option<String>,
     pub roots: Vec<PathBuf>,
     pub command: Option<String>,
@@ -149,6 +155,9 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
     if registered(ctx)?.iter().any(|e| e.name == name) {
         return Err(taken(&name));
     }
+    if ctx.inbound.contains(&name) {
+        return Err(inbound::taken(&name));
+    }
 
     let mut entry = Entry { command: p.command, agent: p.agent, ..Entry::ssh(name, p.target) };
     let mut link = connect(&entry, ctx)?;
@@ -177,6 +186,9 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         if entries.iter().any(|e| e.name == entry.name) {
             return Err(taken(&entry.name));
         }
+        if ctx.inbound.contains(&entry.name) {
+            return Err(inbound::taken(&entry.name));
+        }
         entries.push(entry.clone());
         Ok(())
     });
@@ -190,7 +202,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
 }
 
 fn list(ctx: &Ctx) -> Answer {
-    let rows: Vec<MachineRow> = registered(ctx)?
+    let mut rows: Vec<MachineRow> = registered(ctx)?
         .into_iter()
         .map(|e| {
             let live = ctx.links.as_ref().and_then(|l| l.remotes().get(&e.name)).unwrap_or_default();
@@ -209,6 +221,18 @@ fn list(ctx: &Ctx) -> Answer {
             }
         })
         .collect();
+    rows.extend(ctx.inbound.list().into_iter().map(|n| MachineRow {
+        name: n.name,
+        kind: MachineKind::Inbound,
+        target: None,
+        roots: n.roots,
+        command: None,
+        agent: false,
+        state: LinkState::Connected,
+        error: None,
+        version: Some(n.version),
+        capacity: None,
+    }));
     to_value(rows)
 }
 
@@ -659,7 +683,7 @@ mod tests {
         assert_matches("Capacity", &row["capacity"]);
         let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
-        assert_eq!(union_members("MachineKind"), ["'ssh'", "'offered'"]);
+        assert_eq!(union_members("MachineKind"), ["'ssh'", "'offered'", "'inbound'"]);
         assert_matches("MachineHeld", &to_value(Held { ok: true, agent: false }).unwrap());
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [

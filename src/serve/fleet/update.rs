@@ -28,19 +28,49 @@ use crate::serve::endpoint;
 use crate::serve::machines::install;
 use crate::serve::proto::Version;
 
+/// [`HELLO`] followed by its link's `<hub|member>` word, what a peer link
+/// (`fleet-link --peer`, docs/architecture/daemon/fleet.md, *Peer links*)
+/// says: [`hello_of`], read back by [`is_hub`]. The lending link says
+/// [`HELLO`] alone (its worker follows the hub's build whatever).
+macro_rules! hello {
+    ($flag:literal) => {
+        concat!(
+            env!("CARGO_PKG_VERSION"),
+            " ",
+            env!("DEVSANDBOX_BUILD_GIT"),
+            " ",
+            env!("DEVSANDBOX_BUILD_KIND"),
+            " ",
+            env!("DEVSANDBOX_BUILD_PLATFORM"),
+            $flag
+        )
+    };
+}
+
 /// What this build says in the fleet link's `Hello`:
 /// `<semver> <git hash> <published|dev> <os>/<arch>`, stamped by `build.rs`
 /// (`DEVSANDBOX_BUILD_GIT`, `DEVSANDBOX_BUILD_KIND`,
 /// `DEVSANDBOX_BUILD_PLATFORM`).
-pub const HELLO: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " ",
-    env!("DEVSANDBOX_BUILD_GIT"),
-    " ",
-    env!("DEVSANDBOX_BUILD_KIND"),
-    " ",
-    env!("DEVSANDBOX_BUILD_PLATFORM")
-);
+pub const HELLO: &str = hello!("");
+
+/// What this build says on a peer link: [`HELLO`] then `hub` when this
+/// host is the fleet's hub (`[serve] hub`, `daemon_config::ServeConfig::hub`),
+/// else `member`.
+pub fn hello_of(hub: bool) -> &'static str {
+    if hub { hello!(" hub") } else { hello!(" member") }
+}
+
+/// Whether a peer link's `Hello` hash ([`hello_of`]) says its end is the
+/// hub: its fifth word is `hub`. A lending link's (four words) never is.
+pub fn is_hub(hello: &str) -> bool {
+    hello.split_whitespace().nth(4) == Some("hub")
+}
+
+/// The words of a `Hello` hash that are the build (and platform): the first
+/// four, without a peer link's hub flag.
+fn build_words(hello: &str) -> impl Iterator<Item = &str> {
+    hello.split_whitespace().take(4)
+}
 
 /// This binary's platform, `<os>/<arch>` as `std::env::consts` names them.
 pub const PLATFORM: &str = env!("DEVSANDBOX_BUILD_PLATFORM");
@@ -213,7 +243,9 @@ pub fn update(steps: &dyn Steps, version: &str, os: &str, arch: &str, scratch: &
 /// binary and hand off to it: make it executable, check that it reports
 /// `hub` (the hub's `Hello` hash, every word), install it at
 /// [`Steps::dest`], check the installed binary reports `hub` too, then
-/// [`Steps::handoff`]. Removing `binary`'s scratch dir is the caller's.
+/// [`Steps::handoff`]. A peer link's hub flag in `hub` isn't part of the
+/// build (`fleet-hello` prints [`HELLO`]). Removing `binary`'s scratch dir
+/// is the caller's.
 pub fn install_received(steps: &dyn Steps, binary: &Path, hub: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))
@@ -227,7 +259,7 @@ pub fn install_received(steps: &dyn Steps, binary: &Path, hub: &str) -> Result<(
 
 fn check_build(steps: &dyn Steps, binary: &Path, want: &str, what: &str) -> Result<()> {
     let got = steps.build(binary).with_context(|| format!("{what} ({}) doesn't run", binary.display()))?;
-    if !got.split_whitespace().eq(want.split_whitespace()) {
+    if !build_words(&got).eq(build_words(want)) {
         bail!("{what} ({}) reports {:?}, not {want:?}", binary.display(), got.trim());
     }
     Ok(())
@@ -381,6 +413,14 @@ pub(crate) mod tests {
         assert_eq!(platform_of("0.7.0 1a2b dev"), "unknown");
         assert_eq!(Build::parse("0.7.0 1a2b dev linux/x86_64"), build("0.7.0", "1a2b", false), "the platform isn't the build");
         assert_eq!(build("0.7.0", "1a2b", true).label(), "0.7.0 (published, 1a2b)");
+        // A peer link's hub flag: a fifth word, not part of the build.
+        assert_eq!(hello_of(true), format!("{HELLO} hub"));
+        assert_eq!(hello_of(false), format!("{HELLO} member"));
+        assert!(hello_of(true).len() <= u8::MAX as usize, "fits a `Hello` hash");
+        assert!(is_hub(hello_of(true)) && !is_hub(hello_of(false)));
+        assert!(!is_hub(HELLO), "a lending link's hello never says hub");
+        assert!(!is_hub("0.7.0 1a2b dev hub"), "the fifth word, not any");
+        assert_eq!((Build::parse(hello_of(true)), platform_of(hello_of(false))), (ours, PLATFORM));
     }
 
     #[test]
@@ -622,6 +662,11 @@ pub(crate) mod tests {
         install_received(&fake, &binary, hub).unwrap();
         assert_eq!(std::fs::metadata(&binary).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(fake.calls(), ["build received", "install /dest/devsandbox", "build dest", "handoff "]);
+        // A peer link's hub said its hub flag too: not part of the build.
+        received();
+        let fake = Fake::building(hub);
+        install_received(&fake, &binary, &format!("{hub} hub")).unwrap();
+        assert_eq!(fake.calls().len(), 4);
         // Not the hub's build: never installed.
         received();
         let fake = Fake { received_build: "0.8.0 eeee dev linux/x86_64".into(), ..Fake::building(hub) };
