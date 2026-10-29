@@ -1,6 +1,6 @@
 //! The trust table (docs/architecture/daemon/fleet.md, *The trust table*):
-//! what a remote caller (a [`Peer`]: a fleet hub over its lending link's
-//! `API` streams, or the other end of a peer link over the connections its
+//! what a remote caller (a [`Peer`]: the other end of a peer link, over its
+//! streams this daemon answers in-process or the connections its
 //! `link.attach` turned) may do on this member.
 //! Each such connection is served with a [`Peer`] (the daemon's
 //! `Table::Peer`); every request on it goes through
@@ -18,7 +18,7 @@
 //!   quick calls (`machines::forward::QUICK`), `capacity.get`, `roots.list`
 //!   and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
 //!   true`) request; everything else (`machines.*`,
-//!   `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`, the
+//!   `shutdown`, `helper.call`, `forwards.*`, the
 //!   Inbox, …) is `denied`.
 //! - [`admit`] then confines the params: every `root` / `dir` canonicalized
 //!   and admitted by the [`Reach`] (rewritten to its canonical form), every
@@ -32,10 +32,6 @@
 //! has, except `member.*`, `link.*` and `links.*` (this member's own settings, and its
 //! links), refused under both; a verb's `env` is still the peer's when it
 //! has one.
-//!
-//! - [`refuse_new_work`]: while lending `drain`, a `run` from the lending
-//!   link's peer (the one with a fleet root) is `denied` ([`DRAINING`]),
-//!   under either trust; verbs on instances already here go on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -49,19 +45,18 @@ use crate::serve::verbs;
 use crate::state::State;
 use crate::worker_policy::Trust;
 
-/// A remote caller of this member: one per lending link, one per attached
-/// connection (`link.attach {channel}`).
+/// A remote caller of this member: one per machine link stream this
+/// daemon answers in-process, one per attached connection
+/// (`link.attach {channel}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
-    /// Who it is (the hub's ssh target, a link peer's machine name), for
-    /// the log.
+    /// Who it is (a link peer's machine name), for the log.
     pub name: String,
-    /// This member's fleet root for it, canonical: the lending link's, a
-    /// link peer's ([`peer_fleet_root`]). `None` only in tests.
+    /// This member's fleet root for it, canonical ([`peer_fleet_root`]).
+    /// `None` only in tests.
     pub fleet_root: Option<PathBuf>,
-    /// `Some`: the env its verbs run with, whatever it sent (the lending
-    /// link's and a link peer's: this host's own, the daemon's). `None`: a
-    /// verb's env as sent.
+    /// `Some`: the env its verbs run with, whatever it sent (a link peer's:
+    /// this host's own, the daemon's). `None`: a verb's env as sent.
     pub env: Option<BTreeMap<String, String>>,
     /// The linking host's agent relayed here (a peer link's
     /// `agent-link-<peer>.sock`, `endpoint::link_agent_socket`): with `env`,
@@ -255,21 +250,6 @@ pub enum Gate {
     /// checks typed roots through it).
     Roots,
     Verb,
-}
-
-/// The refusal of a hub's `run` while this host drains.
-pub const DRAINING: &str = "this member is draining: no new work";
-
-/// `drain` is the one hard no for new work (pure): a `run` from the
-/// lending link's `peer` (one with a fleet root) while `draining` is
-/// `denied` with [`DRAINING`]; everything else (`start`, `stop`, `rm`,
-/// `rebuild` of what's placed here, any request of a peer without a fleet
-/// root) is left to [`admit`].
-pub fn refuse_new_work(method: &str, peer: &Peer, draining: bool) -> Result<(), ApiError> {
-    if draining && peer.fleet_root.is_some() && method == "run" {
-        return Err(ApiError::denied(DRAINING));
-    }
-    Ok(())
 }
 
 /// Whether a `worker` member's peer may send `method` with `params` at all
@@ -703,10 +683,6 @@ mod tests {
             ("instances.list", json!({"machine": 3}), Err("invalid")),
             ("machines.list", p.clone(), Err("denied")),
             ("machines.get", json!({"name": "m"}), Err("denied")),
-            ("fleet.offer", p.clone(), Err("denied")),
-            ("fleet.agent", json!({"worker": "w"}), Err("denied")),
-            ("lend.get", p.clone(), Err("denied")),
-            ("lend.set", json!({"state": "off"}), Err("denied")),
             ("member.get", p.clone(), Err("denied")),
             ("member.set", json!({"trust": "full"}), Err("denied")),
             ("shutdown", p.clone(), Err("denied")),
@@ -788,20 +764,6 @@ mod tests {
     }
 
     #[test]
-    fn draining_refuses_new_work_only() {
-        let lending = peer(Path::new("/fleet/hub"));
-        let e = refuse_new_work("run", &lending, true).unwrap_err();
-        assert_eq!((e.code, e.message.as_str()), ("denied", DRAINING));
-        for m in ["start", "stop", "rm", "rebuild", "services.rebuild", "capacity.get", "instances.list"] {
-            assert!(refuse_new_work(m, &lending, true).is_ok(), "{m}");
-        }
-        assert!(refuse_new_work("run", &lending, false).is_ok());
-        // `drain` is the lending link's: a peer without a fleet root still runs.
-        let ssh = Peer { name: "lap".into(), fleet_root: None, env: None, agent: None };
-        assert!(refuse_new_work("run", &ssh, true).is_ok());
-    }
-
-    #[test]
     fn paths_are_confined_to_the_fleet_root() {
         let base = scratch("paths");
         let root = base.join("fleet/hub");
@@ -844,7 +806,7 @@ mod tests {
         state
     }
 
-    /// The lending link's peer: this host's env.
+    /// A link peer: this host's env.
     fn peer(root: &Path) -> Peer {
         Peer {
             name: "me@hub".into(),

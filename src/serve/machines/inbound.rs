@@ -13,7 +13,7 @@
 //! sets. Its roots are those its daemon answered `roots.list` with over the
 //! link, filled in by the daemon after the announce. A name is either a
 //! registry entry or an inbound neighbor, never both: `links.inbound`
-//! refuses an entry's name, `machines.add` and `fleet.offer` a neighbor's.
+//! refuses an entry's name, `machines.add` a neighbor's.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -137,7 +137,7 @@ impl Neighbors {
     }
 }
 
-/// The refusal of a registry entry (`machines.add`, `fleet.offer`) named
+/// The refusal of a registry entry (`machines.add`) named
 /// like inbound neighbor `name`.
 pub fn taken(name: &str) -> ApiError {
     ApiError::denied(format!(

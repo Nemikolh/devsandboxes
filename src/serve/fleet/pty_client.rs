@@ -1,11 +1,11 @@
-//! The hub's end of a fleet link's `PTY` stream
+//! The asking end of a fleet link's `PTY` stream
 //! (docs/architecture/daemon/fleet.md, *PTY*): a terminal on this host into
-//! an offered worker's instance, what a tty `exec` on that machine runs
+//! a machine's instance, what a tty `exec` on that machine runs
 //! instead of ssh (`machines::cli`), and so the dashboard's terminal tabs
 //! (which spawn that `exec`).
 //!
-//! One [`dial`] is one stream on the worker's `fleet-<name>.pty.sock`
-//! (`endpoint::fleet_pty_socket`, bound by its `fleet-link`): the
+//! One [`dial`] is one stream on the machine's `fleet-<name>.pty.sock`
+//! (`endpoint::fleet_pty_socket`, bound by this host's end of its link): the
 //! [`header`] (`session.attach` with the [`Request`]), the terminal's size
 //! at once and on every change, stdin as `stdin` records (EOF:
 //! `stdin-eof`); the worker's `stdout` records to stdout until its one end

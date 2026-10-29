@@ -37,7 +37,7 @@ use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
 use crate::serve::machines::ssh;
 
-const HEADERS: [&str; 8] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "LEND", "CAPACITY"];
+const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
 pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, auto_install: bool) -> Result<()> {
     let command = ensure_devsandbox(target, auto_install)?;
@@ -268,7 +268,7 @@ pub fn ls(json: bool) -> Result<()> {
         println!("no machines; `devsandbox machine add <target>` adds one");
         return Ok(());
     }
-    let cells: Vec<[String; 8]> = rows.into_iter().map(cells).collect();
+    let cells: Vec<[String; 7]> = rows.into_iter().map(cells).collect();
     print!("{}", table(&HEADERS, &cells));
     Ok(())
 }
@@ -413,7 +413,7 @@ fn connect() -> Result<Conn> {
 }
 
 /// One call; an error answer is the command's error, with the daemon's
-/// message. `lend` / `fleet` call the same way.
+/// message.
 pub(crate) fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: Value) -> Result<T> {
     let r = conn.call(method, params)?;
     if let Some(e) = r.error {
@@ -422,20 +422,15 @@ pub(crate) fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: V
     serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("unexpected {method} answer"))
 }
 
-/// `ls`'s cells: the first root and how many more; an offered fleet
-/// worker's TARGET is `offered`, an inbound neighbor's `inbound` (neither
-/// has one).
-fn cells(r: MachineRow) -> [String; 8] {
+/// `ls`'s cells: the first root and how many more; an inbound neighbor's
+/// TARGET is `inbound` (it has none).
+fn cells(r: MachineRow) -> [String; 7] {
     let roots = match r.roots.split_first() {
         None => "-".to_string(),
         Some((first, [])) => first.display().to_string(),
         Some((first, rest)) => format!("{} +{}", first.display(), rest.len()),
     };
-    let target = match (r.target, r.kind) {
-        (Some(target), _) => target,
-        (None, crate::serve::machines::MachineKind::Inbound) => "inbound".into(),
-        (None, _) => "offered".into(),
-    };
+    let target = r.target.unwrap_or_else(|| "inbound".into());
     let capacity = r.capacity.as_ref();
     let mut room = capacity::summary(capacity);
     if let Some(note) = capacity.and_then(capacity::over_note) {
@@ -448,7 +443,6 @@ fn cells(r: MachineRow) -> [String; 8] {
         on_off(r.agent).into(),
         r.state.as_str().into(),
         r.version.unwrap_or_else(|| "-".into()),
-        capacity::lend_label(capacity).into(),
         room,
     ]
 }
@@ -777,26 +771,23 @@ mod tests {
             version: version.map(String::from),
             capacity: None,
         };
-        assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "off", "idle", "-", "-", "-"].map(String::from));
+        assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "off", "idle", "-", "-"].map(String::from));
         assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..6], ["/a +2", "off", "idle", "0.7.0"].map(String::from));
-        // Lending and capacity from the machine's last snapshot, and what's
-        // over a soft cap.
+        // Capacity from the machine's last snapshot, and what's over a soft
+        // cap.
         let g = 1u64 << 30;
         let capacity = crate::serve::capacity::Capacity {
             cpus: Some(8),
             mem_total: Some(32 * g),
             mem_available: Some(14 * g),
             running: 3,
-            lending: Some(crate::serve::fleet::lend::State::On),
             caps: Some(crate::serve::capacity::Caps { mem: Some(16 * g), ..Default::default() }),
             ..Default::default()
         };
-        let lent = cells(MachineRow { capacity: Some(capacity), ..row(&[], None) });
-        assert_eq!(lent[6..], ["on", "8 cpu · 18/32G · 3 run (over cap: mem 18G/16G)"].map(String::from));
+        let full = cells(MachineRow { capacity: Some(capacity), ..row(&[], None) });
+        assert_eq!(full[6], "8 cpu · 18/32G · 3 run (over cap: mem 18G/16G)");
         assert_eq!(cells(MachineRow { agent: true, ..row(&[], None) })[3], "on");
         assert_eq!(cells(row(&[], None))[2], "-");
-        let offered = MachineRow { kind: crate::serve::machines::MachineKind::Offered, target: None, ..row(&[], None) };
-        assert_eq!(cells(offered)[1], "offered");
         let inbound = MachineRow { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..row(&[], None) };
         assert_eq!(cells(inbound)[1], "inbound");
     }

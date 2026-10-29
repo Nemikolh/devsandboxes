@@ -7,7 +7,6 @@ pub mod exec;
 pub mod inbox;
 pub mod inspect;
 #[cfg(unix)]
-pub mod lend;
 pub mod logs;
 pub mod ls;
 #[cfg(unix)]

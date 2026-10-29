@@ -682,9 +682,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The hub's `fleet-link` (opener) and the worker's lending end
-    /// (answerer) in-process, the worker's receivers [`receivers`] into
-    /// `fleet`; the hub's transfer socket.
+    /// A link's two ends in-process (this host the opener, the machine the
+    /// answerer), the machine's receivers [`receivers`] into `fleet`; this
+    /// host's transfer socket.
     fn link(dir: &Path, fleet: &Path) -> PathBuf {
         use crate::devsbd::proto::channel;
         use crate::serve::fleet::link::{Endpoint, Serves, answerer_with, opener_with};

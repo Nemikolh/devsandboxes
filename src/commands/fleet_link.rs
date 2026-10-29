@@ -1,52 +1,7 @@
-//! `devsandbox fleet-link --worker <name> --root <path>` (hidden): the hub's end of a fleet
-//! worker's link (docs/architecture/daemon/fleet.md, *Hub side*). A worker's
-//! daemon runs it on its hub over its own ssh (`ssh -T -o BatchMode=yes <hub>
-//! devsandbox fleet-link --worker <name> --root <fleet root>`, `serve::fleet::worker`) and answers the
-//! streams it opens with connections to its own daemon.
-//!
-//! It is the opener of a `fleet::link` of `fleet::LINK`: it binds
-//! `endpoint::fleet_socket` (`fleet-<name>.sock`, 0600 in the 0700 socket
-//! dir; the newest link for a worker wins), and each connection there (the
-//! hub's link to the offered machine, its forwarded verbs: `fleet::dialer::dial`)
-//! becomes one `API` stream to the worker's daemon. Once the `Hello`s are
-//! through it sends `fleet.offer {worker, version, root, draining}` to this host's daemon
-//! (started like any client's, if it isn't running), which registers the
-//! worker as an offered machine whose one root is `root` (the worker's
-//! canonical fleet root, a path on the worker), and holds that connection for the link's
-//! life, so a linked worker keeps the hub's daemon from idling out. A refused
-//! offer (not a hub, a name an ssh machine has) ends the link with why.
-//!
-//! It also binds `endpoint::fleet_transfer_socket`
-//! (`fleet-<name>.transfer.sock`): each connection there is one `TRANSFER`
-//! stream to the worker (`fleet::transfer::send` on it). `TRANSFER` streams
-//! the worker opens are refused for now: this end receives no kind yet.
-//! And `endpoint::fleet_pty_socket` (`fleet-<name>.pty.sock`): each
-//! connection there is one `PTY` stream to the worker, a terminal into one
-//! of its instances (`fleet::pty_client`, what a tty `exec` on the offered
-//! machine dials). And `endpoint::fleet_tunnel_socket`
-//! (`fleet-<name>.tunnel.sock`): each connection there is one `TUNNEL`
-//! stream, a port forward's bridge (`tunnel::remote_opener`, what the
-//! daemon's forwards and `devsandbox port` on the offered machine dial).
-//!
-//! It serves `AGENT` streams the worker opens (`fleet::agent`): each one
-//! starts with a status byte, then (serving) a connection to the agent this
-//! host's daemon answers `fleet.agent` with: its own `bridge::host_agent`
-//! (the agents clients reported included) while its entry for the worker
-//! has `agent = true`. That answer is asked on a short connection of its own
-//! every `agent::REFRESH`, on a thread of its own (`agent::refresh`), so
-//! `machine set <w> agent on|off` counts within that without a new link.
-//!
-//! When this is a dev build the worker isn't on, for the worker's platform
-//! (`update::hub_pushes`, over both `Hello`s), it pushes its own binary
-//! through that socket once the offer is made ([`push_build`]): the one
-//! that said this link's `Hello`, so the build the worker decided on.
-//! The worker takes it only while it waits for it (`dev-builds` on),
-//! refusing at the header otherwise.
-//!
-//! `devsandbox fleet-link --peer <dialer>` is the other mode
+//! `devsandbox fleet-link --peer <dialer>` (hidden)
 //! (docs/architecture/daemon/fleet.md, *Peer links*): the dialed end of a
 //! link `machine add <this host>` made on `<dialer>` ([`fleet_link_peer`],
-//! [`run_peer`]). Still the opener (it writes the sentinel), saying
+//! [`run_peer`]). The opener (it writes the sentinel), saying
 //! `update::hello_of` (its build and whether this host is the hub). IN:
 //! each stream the dialer opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
 //! handed to this host's daemon as a connection whose first line is
@@ -81,93 +36,13 @@ use crate::serve::fleet::follow::{Incoming, PUSH_WAIT};
 use crate::serve::fleet::lent::Channel;
 use crate::serve::fleet::transfer::Receivers;
 use crate::serve::fleet::update::{Build, Decision};
-use crate::serve::fleet::worker::Follow;
+use crate::serve::fleet::follow::Follow;
 use crate::serve::fleet::{self, agent, link, update};
 use crate::serve::machines::check_name;
 
-/// The CLI entry: the socket dir (created 0700 if missing), then [`run`] on
-/// stdin/stdout, offering through this host's daemon (lazy start) and
-/// asking it for the agent ([`agent_of`]) on a fresh connection each time.
-/// `root`: the worker's fleet root (`--root`); `draining`: the worker's
-/// `lend` is `drain` (`--drain`).
-pub fn fleet_link(worker: &str, root: &Path, draining: bool) -> Result<()> {
-    check_name(worker)?;
-    let dir = endpoint::socket_dir()?;
-    endpoint::ensure_private_dir(&dir)?;
-    let connect = |dir: PathBuf| move || client::connect(&dir, "fleet-link").context("cannot reach this host's devsandbox serve");
-    let (ask, name) = (connect(dir.clone()), worker.to_string());
-    let agent = move || agent_of(&mut ask()?, &name);
-    run(io::stdin(), io::stdout(), &dir, worker, root, draining, connect(dir.clone()), agent)
-}
-
-/// The link over `reader`/`writer` with its socket in `dir`: bind, sentinel
-/// and `Hello`s (the peer must serve `API`), then the offer on the
-/// connection `daemon` opens, held until the link ends; then accept and
-/// relay (`link::opener_with`). From the offer on, `agent()` (the daemon's
-/// `fleet.agent` answer) is asked every `agent::REFRESH` on a thread of its
-/// own, and `AGENT` streams are answered from the last answer
-/// (`agent::Gate`). `Ok` when the worker went away.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    reader: impl Read + Send + 'static,
-    writer: impl Write + Send + 'static,
-    dir: &Path,
-    worker: &str,
-    root: &Path,
-    draining: bool,
-    daemon: impl FnOnce() -> Result<Conn>,
-    agent: impl FnMut() -> Result<Option<PathBuf>> + Send + 'static,
-) -> Result<()> {
-    check_name(worker)?;
-    if !root.is_absolute() {
-        bail!("--root {} isn't an absolute path", root.display());
-    }
-    let mut held: Option<Conn> = None;
-    let (api, socket) = (endpoint::fleet_socket(dir, worker), endpoint::fleet_transfer_socket(dir, worker));
-    let (pty, tunnel) = (endpoint::fleet_pty_socket(dir, worker), endpoint::fleet_tunnel_socket(dir, worker));
-    let sockets = [
-        (fleet::LINK.channel, api.as_path()),
-        (channel::TRANSFER, socket.as_path()),
-        (channel::PTY, pty.as_path()),
-        (channel::TUNNEL, tunnel.as_path()),
-    ];
-    let gate = Arc::new(agent::Gate::default());
-    let serves = link::Serves::default().transfers(Arc::new(Receivers::new(|m| eprintln!("{m}")))).with(channel::AGENT, {
-        let gate = Arc::clone(&gate);
-        move || gate.open(Instant::now())
-    });
-    let push_to = socket.clone();
-    let mut refreshing = None;
-    let endpoint = link::Endpoint { sockets: &sockets, serves, outlet: None };
-    let end = link::opener_with(&fleet::LINK, reader, writer, endpoint, |peer| {
-        let mut conn = daemon()?;
-        offer(&mut conn, worker, &peer.hash, root, draining)?;
-        held = Some(conn);
-        // Past the offer: the daemon knows the worker.
-        refreshing = Some(agent::refresh(gate, agent::REFRESH, agent, |e| {
-            eprintln!("fleet-link: cannot ask for the agent (not served meanwhile): {e:#}")
-        }));
-        push_build(fleet::LINK.hello, &peer.hash, push_to, own_binary);
-        Ok(())
-    });
-    drop((held, refreshing));
-    end
-}
-
-/// `fleet.agent {worker}` on `conn`: the agent socket this host's daemon
-/// serves `worker` (`None`: not served).
-pub fn agent_of(conn: &mut Conn, worker: &str) -> Result<Option<PathBuf>> {
-    let r = conn.call("fleet.agent", json!({ "worker": worker }))?;
-    if let Some(e) = r.error {
-        bail!("fleet.agent: {}", e.message);
-    }
-    let agent = r.result.as_ref().and_then(|v| v.get("agent")).context("bad fleet.agent result")?;
-    serde_json::from_value(agent.clone()).context("bad fleet.agent result")
-}
-
 /// This process's own binary: on Linux `/proc/self/exe`, the inode it runs
 /// even when the path was replaced since; elsewhere `current_exe()`. The
-/// worker checks what it got reports this link's `Hello` anyway.
+/// member checks what it got reports this link's `Hello` anyway.
 pub(crate) fn own_binary() -> io::Result<std::path::PathBuf> {
     #[cfg(target_os = "linux")]
     return Ok("/proc/self/exe".into());
@@ -175,12 +50,11 @@ pub(crate) fn own_binary() -> io::Result<std::path::PathBuf> {
     std::env::current_exe()
 }
 
-/// When a hub saying `ours` pushes to a worker saying `theirs`
+/// When a hub saying `ours` pushes to a member saying `theirs`
 /// (`update::hub_pushes`), `binary()`'s file to it on a thread of its own
 /// through the link's transfer socket `socket` (`update::push`; its
 /// connection waits in the backlog until the opener's accept loop runs).
-/// A failure is on stderr (which the worker sees as ssh's); the worker's
-/// wait ends on its own.
+/// A failure is on stderr; the member's wait ends on its own.
 pub fn push_build(
     ours: &str,
     theirs: &str,
@@ -193,20 +67,11 @@ pub fn push_build(
     let pushed = std::thread::Builder::new().name("fleet-push".into()).spawn(move || {
         let pushed = binary().context("cannot locate this binary").and_then(|b| update::push(&socket, &b));
         if let Err(e) = &pushed {
-            eprintln!("fleet-link: cannot send this build to the worker: {e:#}");
+            eprintln!("fleet-link: cannot send this build to the member: {e:#}");
         }
         pushed
     });
     pushed.ok()
-}
-
-/// `fleet.offer` on `conn`; a refusal is an error with the daemon's reason.
-fn offer(conn: &mut Conn, worker: &str, version: &str, root: &Path, draining: bool) -> Result<()> {
-    let r = conn.call("fleet.offer", json!({ "worker": worker, "version": version, "root": root, "draining": draining }))?;
-    if let Some(e) = r.error {
-        bail!("offer refused: {}", e.message);
-    }
-    Ok(())
 }
 
 /// The first wait before re-announcing a dropped `links.inbound`, doubled
@@ -522,7 +387,6 @@ fn attach(dir: &Path, channel: Channel, peer: &str) -> Result<endpoint::Stream> 
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
@@ -565,214 +429,6 @@ mod tests {
         Conn::new(stream_at(dir), reply).unwrap()
     }
 
-    /// The worker's end, faked: the answerer of `fleet::LINK` over `io`,
-    /// each `API` stream a connection to the daemon in `daemon`, as the
-    /// worker's (`daemon::Shared::open_lent`) is.
-    fn fake_worker(io: UnixStream, daemon: PathBuf) -> std::thread::JoinHandle<link::End> {
-        let (r, w) = (io.try_clone().unwrap(), io);
-        std::thread::spawn(move || {
-            let open = move || Some(endpoint::connect(&daemon).ok()?.into());
-            let serves = link::Serves::default()
-                .with(fleet::LINK.channel, open)
-                .with(channel::PTY, fake_pty)
-                .with(channel::TUNNEL, fake_tunnel)
-                .transfers(Arc::new(Receivers::new(|_| {})));
-            link::answerer_with(&fleet::LINK, r, w, link::Endpoint { serves, ..link::Endpoint::default() }, |_| Ok(()), || {})
-        })
-    }
-
-    /// A `PTY` stream's worker end, faked: past the header, `stdout` `hi
-    /// <session>`, then `exit 4`.
-    fn fake_pty() -> Option<crate::devsbd::mux::Conn> {
-        use crate::devsbd::rpc::{self, Exit, Record};
-        let (ours, theirs) = UnixStream::pair().ok()?;
-        std::thread::spawn(move || {
-            let Ok(Some(Record::Call(call))) = rpc::read_record(&mut &ours) else { return };
-            let hi = format!("hi {}", call.params.str("session").unwrap_or_default());
-            let _ = rpc::write_record(&mut &ours, &Record::Stdout(hi.into_bytes()));
-            let _ = rpc::write_record(&mut &ours, &Record::Exit(Exit::Code(4)));
-        });
-        Some(theirs.into())
-    }
-
-    /// A `TUNNEL` stream's worker end, faked: past the request, an error
-    /// header naming its instance and port.
-    fn fake_tunnel() -> Option<crate::devsbd::mux::Conn> {
-        use crate::commands::tunnel::Header;
-        let (mut ours, theirs) = UnixStream::pair().ok()?;
-        std::thread::spawn(move || {
-            let Ok(req) = fleet::tunnel::read_request(&mut ours) else { return };
-            let error = format!("no {} on {}", req.instance.unwrap_or_default(), req.port);
-            let _ = ours.write_all(Header::Error { error }.line().as_bytes());
-        });
-        Some(theirs.into())
-    }
-
-    /// The fleet root `lap` offers in these tests (a path on the worker;
-    /// the hub never reads it).
-    const WORKER_ROOT: &str = "/worker/fleet/hub";
-
-    /// The hub's `fleet-link` for worker `lap` over `io`, its socket and
-    /// daemon in `hub`.
-    fn hub_link(io: UnixStream, hub: PathBuf) -> std::thread::JoinHandle<Result<()>> {
-        let (r, w) = (io.try_clone().unwrap(), io);
-        std::thread::spawn(move || run(r, w, &hub.clone(), "lap", Path::new(WORKER_ROOT), false, move || Ok(conn_at(&hub)), || Ok(None)))
-    }
-
-    /// A worker linked to its hub: the hub's daemon registers it on offer,
-    /// and quick calls and verbs reach the worker's daemon over the link
-    /// through the offered dial, `link::handshake` and `forward::verb` as
-    /// for an ssh machine.
-    #[test]
-    fn an_offered_worker_answers_quick_calls_and_verbs_over_its_link() {
-        let base = scratch("fleet-e2e");
-        let (worker_dir, hub_dir) = (base.join("w"), base.join("hub"));
-        let worker_root = base.join("worker-root");
-        std::fs::create_dir_all(&worker_root).unwrap();
-        std::fs::write(worker_root.join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"a\"\n").unwrap();
-        let worker_root = std::fs::canonicalize(&worker_root).unwrap();
-        let worker_state = base.join("worker-data/state.toml");
-        std::fs::create_dir_all(worker_state.parent().unwrap()).unwrap();
-        std::fs::write(
-            &worker_state,
-            format!(
-                "[instance.web-w]\nsandbox = \"web\"\ncontainer = \"devsandbox-web-w\"\nfolder = \"/w\"\n\
-                 workspace = \"/w\"\ncreated_unix = 1\nconfig_dir = {:?}\n",
-                worker_root.to_str().unwrap()
-            ),
-        )
-        .unwrap();
-
-        let (runner, verb_dir) = crate::serve::verbs::tests::script_runner("fleet-e2e", r#"for a; do n=$a; done; echo "hi $n""#);
-        let mut worker = opts(1, 60_000);
-        worker.verbs = Some(runner);
-        worker.state = Some(worker_state);
-        worker.home = Some(base.join("worker-home"));
-        worker.machines = Some(base.join("worker-machines.toml"));
-        let registry = base.join("machines.toml");
-        let mut hub = opts(1, 300);
-        hub.hub = true;
-        hub.remotes = Some(base.join("hub-data/remotes.json"));
-        hub.machines = Some(registry.clone());
-        hub.state = Some(base.join("hub-data/state.toml"));
-        let daemons = [spawn_daemon(&worker_dir, worker), spawn_daemon(&hub_dir, hub)];
-        drop(conn_at(&worker_dir));
-
-        let (worker_io, hub_io) = UnixStream::pair().unwrap();
-        let worker_end = fake_worker(worker_io, worker_dir.clone());
-        let hub_end = hub_link(hub_io.try_clone().unwrap(), hub_dir.clone());
-        let lap = Entry { roots: vec![WORKER_ROOT.into()], ..Entry::offered("lap") };
-        wait_for(|| machines::load(&registry).is_ok_and(|e| e == [lap.clone()]), "the offer registers `lap` and its root");
-        assert!(endpoint::fleet_socket(&hub_dir, "lap").exists());
-        assert!(endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
-        assert!(endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
-        assert!(endpoint::fleet_tunnel_socket(&hub_dir, "lap").exists());
-
-        // A terminal: one `PTY` stream through the link's pty socket.
-        use crate::serve::fleet::pty_client;
-        let mode = pty_client::Mode::Session { id: "1700000000-ab12".into(), create: None };
-        let request = pty_client::Request { root: WORKER_ROOT.into(), instance: "web-w".into(), mode };
-        let (_keys, input) = UnixStream::pair().unwrap();
-        let mut out = Vec::new();
-        let stream = endpoint::Stream::connect(endpoint::fleet_pty_socket(&hub_dir, "lap")).unwrap();
-        let mut err = Vec::new();
-        let term = pty_client::Terminal { input: Some(std::os::fd::AsRawFd::as_raw_fd(&input)), output: &mut out, errors: &mut err, size: &|| None };
-        let end = pty_client::attach(stream, &pty_client::header(&request), term);
-        assert_eq!((end, out), (pty_client::End::Exit(crate::devsbd::rpc::Exit::Code(4)), b"hi 1700000000-ab12".to_vec()));
-
-        // A forward's bridge: one `TUNNEL` stream through the tunnel socket.
-        use crate::commands::tunnel::{self, Request, Via};
-        let socket = endpoint::fleet_tunnel_socket(&hub_dir, "lap");
-        let request = Request { root: WORKER_ROOT.into(), instance: Some("web-w".into()), service: None, port: 3000 };
-        let via = Via::Fleet { socket, request };
-        let open = tunnel::remote_opener("lap".into(), Box::new(move || Ok(via.clone())));
-        assert_eq!(open(&std::sync::atomic::AtomicBool::new(false)).err().as_deref(), Some("no web-w on 3000"));
-
-        let mut c = conn_at(&hub_dir);
-        // A quick call: the worker's answer, over the link.
-        let r = c.call("instances.resolve", json!({"name": "web-w", "machine": "lap"})).unwrap();
-        assert_eq!(r.result, Some(json!({"matches": ["web-w"], "found": [{"name": "web-w", "machine": null, "root": worker_root, "sandbox": "web"}]})), "{r:?}");
-        let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
-        assert_eq!((&rows[0]["name"], &rows[0]["kind"], &rows[0]["target"]), (&json!("lap"), &json!("offered"), &Value::Null));
-        assert_eq!(rows[0]["state"], "connected");
-        assert_eq!(rows[0]["version"], "0.6.0", "the worker daemon's hello");
-
-        // A verb: its own `API` stream, streamed back under this request's id.
-        let stream = stream_at(&hub_dir);
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let params = json!({"root": verb_dir, "env": {}, "instance": "web-w", "machine": "lap"});
-        use std::io::Write as _;
-        writeln!(&stream, "{}", json!({"id": 5, "method": "stop", "params": params})).unwrap();
-        let mut out = String::new();
-        let answer = loop {
-            let mut line = String::new();
-            assert!(reader.read_line(&mut line).unwrap() > 0, "closed before the answer");
-            let msg: Value = serde_json::from_str(&line).unwrap();
-            if msg.get("id").is_some() {
-                break msg;
-            }
-            if msg["method"] == "output" && msg["params"]["stream"] == "stdout" {
-                assert_eq!(msg["params"]["request"], 5);
-                out.push_str(msg["params"]["data"].as_str().unwrap());
-            }
-        };
-        assert!(answer["error"].is_null(), "{answer}");
-        assert_eq!(out, "hi web-w\n");
-        drop((reader, stream, c));
-
-        // The worker going away ends the hub's end, which unlinks its socket.
-        hub_io.shutdown(Shutdown::Both).unwrap();
-        hub_end.join().unwrap().unwrap();
-        assert!(!endpoint::fleet_socket(&hub_dir, "lap").exists());
-        assert!(!endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
-        assert!(!endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
-        assert!(!endpoint::fleet_tunnel_socket(&hub_dir, "lap").exists());
-        assert!(matches!(worker_end.join().unwrap(), link::End::Closed));
-        assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
-        let [worker, hub] = daemons;
-        assert_eq!(worker.join().unwrap().unwrap(), Exit::Shutdown);
-        // A hub never idles out: stopped by hand.
-        assert!(conn_at(&hub_dir).call("shutdown", json!({})).unwrap().error.is_none());
-        assert_eq!(hub.join().unwrap().unwrap(), Exit::Shutdown);
-        let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&verb_dir);
-    }
-
-    /// A daemon that isn't a hub refuses the offer: the link ends with why,
-    /// its socket gone, nothing registered.
-    #[test]
-    fn a_refused_offer_ends_the_link() {
-        let base = scratch("fleet-nohub");
-        let hub_dir = base.join("hub");
-        let registry = base.join("machines.toml");
-        let mut not_hub = opts(1, 300);
-        not_hub.machines = Some(registry.clone());
-        let daemon = spawn_daemon(&hub_dir, not_hub);
-        drop(conn_at(&hub_dir));
-        let (worker_io, hub_io) = UnixStream::pair().unwrap();
-        let worker_end = fake_worker(worker_io, base.join("nowhere"));
-        let err = hub_link(hub_io, hub_dir.clone()).join().unwrap().unwrap_err();
-        assert!(format!("{err:#}").contains("offer refused: this devsandbox isn't a fleet hub"), "{err:#}");
-        assert!(!endpoint::fleet_socket(&hub_dir, "lap").exists());
-        assert!(!endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
-        assert!(!endpoint::fleet_pty_socket(&hub_dir, "lap").exists());
-        assert!(!registry.exists());
-        assert!(matches!(worker_end.join().unwrap(), link::End::Closed));
-        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn a_bad_worker_name_is_refused_before_binding() {
-        let (a, b) = UnixStream::pair().unwrap();
-        let dir = std::env::temp_dir();
-        let err = run(a, b, &dir, "a/b", Path::new("/r"), false, || unreachable!(), || Ok(None)).unwrap_err();
-        assert!(format!("{err:#}").contains("machine name"), "{err:#}");
-        let (a, b) = UnixStream::pair().unwrap();
-        let err = run(a, b, &dir, "lap", Path::new("rel"), false, || unreachable!(), || Ok(None)).unwrap_err();
-        assert!(format!("{err:#}").contains("absolute"), "{err:#}");
-    }
-
     /// A daemon for a peer link's end in `base/<name>`: its data dir (where
     /// fleet roots go) `base/<name>-data`, its registry there, a state whose
     /// one instance is in its own root `base/<name>-own` (canonical, returned
@@ -794,7 +450,7 @@ mod tests {
         .unwrap();
         let mut o = opts(1, 60_000);
         o.state = Some(state);
-        o.lend = Some(data.join("lend.toml"));
+        o.member = Some(data.join("member.toml"));
         o.machines = Some(data.join("machines.toml"));
         o.home = Some(base.join(format!("{name}-home")));
         (dir, std::fs::canonicalize(&data).unwrap(), own, o)
@@ -950,7 +606,7 @@ mod tests {
         let base = scratch("peer-again");
         let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
         let (l_dir, _, _, l_opts) = peer_daemon(&base, "l");
-        let again = crate::serve::daemon::Options { machines: k_opts.machines.clone(), state: k_opts.state.clone(), lend: k_opts.lend.clone(), ..opts(2, 60_000) };
+        let again = crate::serve::daemon::Options { machines: k_opts.machines.clone(), state: k_opts.state.clone(), member: k_opts.member.clone(), ..opts(2, 60_000) };
         let first = spawn_daemon(&k_dir, k_opts);
         let l_daemon = spawn_daemon(&l_dir, l_opts);
         drop((conn_at(&k_dir), conn_at(&l_dir)));
@@ -989,7 +645,7 @@ mod tests {
         // No hub, or this end is it: nothing to follow.
         assert_eq!(follows(ours, &published.replace(" hub", " member"), false), Decision::Same);
         assert_eq!(follows(update::hello_of(true), &published, false), Decision::Same);
-        assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", false), Decision::Same, "a lending hello says no hub");
+        assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", false), Decision::Same, "a hello without the flag says no hub");
     }
 
     /// A hub dialer on a published build: K's end drops the link, installs

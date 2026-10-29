@@ -12,8 +12,7 @@ method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
 `src/serve/verbs.rs` (verbs), `src/serve/helper.rs` (`helper.call`),
 `src/serve/forwards.rs` (`forwards.*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
-(`QUICK`, federation), `src/serve/fleet/offer.rs` (`fleet.offer`, `fleet.agent`),
-`src/serve/fleet/lender.rs` (`lend.*`), `src/serve/fleet/member.rs` (`member.*`),
+(`QUICK`, federation), `src/serve/fleet/member.rs` (`member.*`),
 `src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` + `index.d.ts` (Node client; `src/serve/dts.rs`
 checks the typings against the wire structs).
@@ -31,7 +30,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer\|agent` (internal), `lend.get\|set`, `member.get\|set`, `capacity.get` | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `capacity.get` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -82,7 +81,7 @@ Send it first:
 | `version` | the client's devsandbox semver; external clients send the version they were built against |
 | `build` | optional; the devsandbox binary's mtime (unix secs), for dev builds |
 | `client` | who's calling: `tui`, `cli`, `api:<name>`. Logged, and recorded in the store on the user's feed items (`tui` and `cli` as is, any other name as `api:<name>`) for the user's audit; never shown to owners |
-| `force` | optional, internal (not in the npm typings): `true` hands off whatever the client's version, honored only from a local client of the daemon's own uid; a fleet worker's after installing its hub's version ([fleet](../architecture/daemon/fleet.md#versions)) |
+| `force` | optional, internal (not in the npm typings): `true` hands off whatever the client's version, honored only from a local client of the daemon's own uid; a fleet member's after installing its hub's version ([fleet](../architecture/daemon/fleet.md#versions)) |
 
 Result: the daemon's `version` and `build`, the API `protocol` number, and
 `"handoff": true` when the client's version is newer than the daemon's: the
@@ -123,8 +122,9 @@ absent otherwise (`confirm` included).
 
 A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
-its `member.toml` per request: a fleet hub's over the lending link, and
-a link peer's channel streams (after `link.attach`, below). `member.*`, `link.*` and `links.*` are `denied` under
+its `member.toml` per request: a link peer's channel streams (those the
+daemon answers in-process on the links it dials, and those after
+`link.attach`, below). `member.*`, `link.*` and `links.*` are `denied` under
 either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
@@ -390,7 +390,7 @@ push (`null` before one carried it):
 ```json
 {"cpus": 8, "mem_total": 34359738368, "mem_available": 21474836480,
  "disk_free": 128849018880, "disk_total": 536870912000, "running": 3,
- "lending": "on", "caps": {"cpus": null, "mem": 17179869184, "disk": null, "instances": 4}}
+ "caps": {"cpus": null, "mem": 17179869184, "disk": null, "instances": 4}}
 ```
 
 Sizes in bytes; `null` is unknown. `cpus` and `mem_total` are the
@@ -399,8 +399,7 @@ runtime's (`docker info` `NCPU` / `MemTotal`, podman's `host.cpus` /
 `mem_available` (`/proc/meminfo` `MemAvailable`) and `disk_free` /
 `disk_total` (the filesystem of the runtime's data root) only for a
 native Linux engine, else `null`. `running`: instances whose container
-runs. `lending`: `lend.toml`'s `state` (`null` without one); `caps`
-`member.toml`'s `[caps]` soft caps (`null` when none is set): never enforced, over one is
+runs. `caps`: `member.toml`'s `[caps]` soft caps (`null` when none is set): never enforced, over one is
 a note ([fleet.md](../architecture/daemon/fleet.md#capacity)).
 
 Errors: `invalid` (missing or relative `dir`; watch without the
@@ -492,7 +491,7 @@ they are (a `\r` redraw keeps its last state), whatever `ansi` says.
 
 With `"offset": <n>` (bytes; `lines` and `ansi` then don't apply) the
 result is the log's bytes from there instead, what `logs --build
---follow` on an offered worker prints as they come:
+--follow` on a machine prints as they come:
 `{"text": "…", "next": <n>, "tty": false, "complete": false}`, at most
 128 KiB (`build_log::PAGE_BYTES`) of them as UTF-8 text (invalid bytes as
 U+FFFD; a character the page or a write in progress cuts is left for the
@@ -606,7 +605,7 @@ the runtime's `name`, `image`, `status`, `state`, `labels`, `host_ports`,
 plus `done` (its instance is marked done; `false` for a service) and
 `phase` while its instance is being created or failed (absent once
 ready). `state.toml` is read best-effort: unreadable, no row is done.
-On a fleet hub's connection under `worker` (*Remote callers*) the rows are
+On a link peer's connection under `worker` (*Remote callers*) the rows are
 cut to what it reaches: those instances' containers and their config
 roots' services ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)).
 
@@ -916,17 +915,16 @@ and `HOME` are the caller's, never the daemon's.
 again on the daemon's host instead of read from its cache
 ([runtimes](../architecture/runtimes.md#mode-detection)).
 
-**Placement** (`run` without `machine`): on a fleet hub with a worker
-taking work, `run` goes where placement scores best, this host or a worker
-([fleet](../architecture/daemon/fleet.md#placement)). Placed on a worker,
+**Placement** (`run` without `machine`): on a fleet hub with a machine
+connected, `run` goes where placement scores best, this host or a machine
+([fleet](../architecture/daemon/fleet.md#placement)). Placed on a machine,
 the sandbox's config root and folders move there first, then the request
 is forwarded as with `machine`, in the worker's copy of the root; its
 output starts with a `stderr` line `placed on <worker> (<reasons>)` (and
 `warning: <worker>: over cap: …` lines), and its `progress`, its result
 and its detached answer carry `"machine": "<worker>"`. A sandbox that
 can't move runs here, its output starting `note: not placed on <worker>:
-<why>; running here` (`<why>` is `draining` when the worker refused the
-run); a move that fails is the error `failed` (`data.exit`
+<why>; running here`; a move that fails is the error `failed` (`data.exit`
 `null`), nothing runs. `"here": true` (the CLI's `--here`) always runs
 here.
 
@@ -1024,7 +1022,7 @@ Remote hosts whose daemons this one talks to over ssh
 ([machines.md](../architecture/daemon/machines.md)).
 The registry is `<data-dir>/devsandbox/machines.toml`, next to
 `state.toml`, written only by `machines.add` / `machines.set` /
-`machines.rm` and `fleet.offer`:
+`machines.rm`:
 
 ```toml
 [machine.my-server]
@@ -1032,15 +1030,14 @@ target = "me@my-server"            # what ssh takes, or ssh://[user@]host[:port]
 roots = ["/home/me/.devsandboxes"] # config roots there, canonical
 command = "~/bin/devsandbox"       # optional: the remote devsandbox, shell text
 agent = true                       # optional, default false: this host's ssh-agent is meant for it
-
-[machine.laptop]
-offered = true                     # a fleet worker that dialed this host: no target, no ssh to it
 ```
 
-A machine's `kind` is `ssh` (it has a `target`) or `offered` (a fleet
-worker reached over its own link, `fleet.offer`; nothing here sshes to
-it: quick calls and verbs go over that link, as do terminals, forwards
-and the agent). On either kind the CLI's commands are quick calls, verbs
+An entry with `offered = true` (an older build's fleet worker) fails the
+file, naming it: delete it by hand. A machine's `kind` is `ssh` (a
+registry entry: it has a `target`, this host dials it) or `inbound` (a
+host whose link to this one it dialed, `machine add <this host>` there;
+never in the registry, a machine here while that link is up). On either
+kind the CLI's commands are quick calls, verbs
 and `PTY` streams over the machine's link, see
 [machines](../architecture/daemon/machines.md#the-cli-clirs).
 
@@ -1114,8 +1111,8 @@ roots, and it is where that caller's placement moves code to.
 |---|---|---|---|
 | `machines.probe` | `{"target", "command"?}` (`command`: the machine's devsandbox as shell text, default `devsandbox`) | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target, empty `command`), `failed` (ssh, the hello or the protocol) |
 | `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, empty `command`, a root the machine refuses: each one's reason), `denied` (the name is a live inbound neighbor's), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
-| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, the registry's by name, then the inbound neighbors up now by name; `kind` `ssh` \| `offered` \| `inbound`, `target` `null` for an offered one and an inbound one; `state`, `error` and `version` (from the last hello) its held link's, whatever its kind; an inbound one has `agent` off and `command` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
-| `machines.get` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"name", "kind", "target", "command", "roots", "agent"}`, a registered machine's or an inbound one's: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an offered or inbound one has none) | `not-found`, `invalid` (`agent` not absolute), `internal` (as `list`) |
+| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, the registry's by name, then the inbound neighbors up now by name; `kind` `ssh` \| `inbound`, `target` `null` for an inbound one; `state`, `error` and `version` (from the last hello) its held link's, whatever its kind; an inbound one has `agent` off and `command` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
+| `machines.get` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"name", "kind", "target", "command", "roots", "agent"}`, a registered machine's or an inbound one's: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an inbound one has none) | `not-found`, `invalid` (`agent` not absolute), `internal` (as `list`) |
 | `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `denied` (an inbound machine: this host's agent never reaches it; its own entry for this host has the `agent` that counts), `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `denied` (an inbound machine: it goes with its link, `machine rm` on it), `internal` (`machines.toml` doesn't read or write) |
 
@@ -1136,71 +1133,6 @@ link), so the agent the machine reaches meanwhile is that terminal's. Adding a m
 powerful as `docker.sock`, and with `agent` on your agent is reachable
 there.
 
-### `fleet.offer`
-
-Internal (`devsandbox fleet-link`'s; not in the npm typings): a fleet
-worker's link to this host is up
-([fleet.md](../architecture/daemon/fleet.md#hub-side)). Params:
-`{"worker": "<machine name>", "version": "<its semver>", "root":
-"<its fleet root>", "draining"?: <bool>}` (`root`: the worker's canonical
-fleet root, a path on the worker; `draining`: the worker's lending was
-`drain` when it dialed; logged). Result: `{"ok": true}`; a new name is
-saved as an offered machine whose one root is `root` (its link starts,
-dialed at the worker's `fleet-<worker>.sock`, and watches that root like
-an ssh machine's), an offered one is kept, its root replaced (and its link
-restarted) when it differs. Errors: `invalid` (a bad name, a missing
-param, a `root` that isn't absolute), `denied` (this daemon isn't a
-hub: `[serve] hub = true` in `daemon.config.toml`; or the name is an ssh
-machine's or a live inbound neighbor's), `internal` (`machines.toml` doesn't read or write).
-
-### `fleet.agent`
-
-Internal (`devsandbox fleet-link`'s; not in the npm typings): the agent
-socket the link's `AGENT` streams connect
-([fleet.md](../architecture/daemon/fleet.md#agent)), asked every 2 s.
-Params: `{"worker": "<machine name>"}`. Result: `{"agent": "<path>"}`,
-this daemon's own agent (the agents clients reported first, then the
-relayed agents' `agent-*.sock`, then its `SSH_AUTH_SOCK`, as a bridge
-picks one) while `worker` is an offered machine with `agent` on;
-`{"agent": null}` otherwise (no such machine, an ssh machine's name,
-`agent` off, no live agent here). Errors: `invalid` (a bad name, no
-`worker`), `internal` (`machines.toml` doesn't read). A fleet worker's
-connection under `worker` (*Remote callers*) is `denied` it, as every
-`fleet.*`.
-
-### `lend.*`
-
-This host as a fleet worker: `lend.toml` and the link to its hub
-([fleet.md](../architecture/daemon/fleet.md#lending-lend)). The daemon is
-`lend.toml`'s only writer, and a change applies at once. Both are denied
-on a fleet hub's connection under `worker` (*Remote callers*).
-
-| method | params | result | errors |
-|---|---|---|---|
-| `lend.get` | `{}` | `{"state", "hub", "name", "fleet_root", "link", "error"}` | `internal` (`lend.toml` doesn't parse), `failed` (no data dir) |
-| `lend.set` | `{"state"?, "hub"?}`: each one given is changed | as `lend.get`, after the change | `invalid` (an unknown param or `state`, an empty or bad `hub`, lending without a `hub`, or no `name` in `member.toml` and a hostname that isn't a valid one), `failed` (the daemon is exiting, no data dir), `internal` (`lend.toml` doesn't read or write, the fleet root can't be created) |
-
-- `state`: `on` (offer this host, take new work), `off` (no link) or
-  `drain` (keep the link, so what's placed here stays reachable; take no
-  new work: the hub's `run` is refused `denied`, `this worker is
-  draining: no new work`, while `start`, `stop`, `rm` and `rebuild` of
-  what's here go on).
-- `hub`: the hub's ssh target, as `machines.add` takes one; `null` when
-  none was set. Kept when lending goes `off`.
-- `name`: the name this host offers itself under: `member.toml`'s
-  ([`member.*`](#member)), else the hostname's first label; `null` when
-  neither is a valid machine name.
-- `fleet_root`: `<data>/devsandbox/fleet/<hub>/`, all the hub reaches
-  (canonical while lending); `null` without a `hub`.
-- `link`: `off`, `connecting` (the first attempt hasn't ended),
-  `connected`, or `retrying` (`error` says why; the next attempt follows
-  the backoff). `error` is also set while `off` when the file says lend
-  but lending couldn't start.
-
-`lend.set` restarts the link only for a new `hub` (the old ssh killed
-first), `member.set` for a new `name`; `on` ↔ `drain` keeps it, and the
-next dial offers the new state.
-
 ### `member.*`
 
 This host as a fleet member: `member.toml`
@@ -1216,8 +1148,8 @@ connection under either trust (*Remote callers*).
 
 - `name`: the name this host goes by in the fleet: the one set, else the
   hostname's first label; `null` when neither is a valid machine name.
-  `member.set {name: ""}` clears it. A change restarts a lending link
-  under the new name.
+  `member.set {name: ""}` clears it. A link this host dials says the new
+  name from its next dial.
 - `trust`: `worker` (the default: a remote caller reaches this host's
   own roots and its fleet root, placed work under the worker policy) or
   `full` (the whole API but `member.*`, `link.*` and `links.*`, no worker policy,
@@ -1232,7 +1164,7 @@ connection under either trust (*Remote callers*).
 
 This host's capacity report now, as its snapshots carry it (`Capacity`:
 `cpus`, `mem_total`, `mem_available`, `disk_free`, `disk_total`,
-`running`, `lending`, `caps`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
+`running`, `caps`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
 built on demand: no watched root needed. Params `{}`. On every link
 peer's connection: a host asks each machine before it places a `run`.
 

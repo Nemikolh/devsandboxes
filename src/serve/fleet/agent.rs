@@ -1,35 +1,32 @@
 //! `AGENT` on the fleet link (docs/architecture/daemon/fleet.md, *AGENT*):
-//! the hub's ssh agent reaching every instance on an offered worker while
-//! the hub's registry entry for the worker has `agent = true` (decision 14
-//! of the fleet plan), carried on the link instead of an ssh of its own.
+//! the dialer's ssh agent reaching every instance on the machine it dialed
+//! while the dialer's registry entry for it has `agent = true` (decisions
+//! 14, 18 and 30 of the fleet plan), carried on the link instead of an ssh
+//! of its own.
 //!
-//! Every `AGENT` stream starts with one status byte from the hub:
-//! [`SERVING`], then the relay to the hub's agent, or [`NOT_SERVING`], then
-//! the close.
+//! Every `AGENT` stream starts with one status byte from the dialer:
+//! [`SERVING`], then the relay to its agent, or [`NOT_SERVING`], then the
+//! close.
 //!
-//! - The worker's end, [`serve`]: while a link is up, the lending thread
-//!   probes the hub every [`PROBE`] (an `AGENT` stream it reads the status
-//!   byte of and closes) and binds [`socket`] (`agent-fleet-<hub>.sock` in
-//!   its socket dir, as `link::opener` binds: temp name and rename, newest
-//!   wins, 0600, unlinked while still its own) only while the hub serves
-//!   ([`decide`]). Each connection there becomes one `AGENT` stream to the
-//!   hub (`link::Outlet::open`), spliced both ways past a `SERVING` byte;
-//!   any other answer closes the client and unbinds. Named `agent-*.sock`,
-//!   it is one of the relayed agents' sockets `bridge::host_agent` tries,
-//!   so the worker's bridges find it as they find a peer link's
-//!   `agent-link-<host>.sock`, and only while it leads somewhere.
-//! - The hub's end, [`Gate`]: `commands::fleet_link` answers every `AGENT`
-//!   stream with a socket pair whose far end a thread of its own takes (the
-//!   handler runs on the mux's read thread): the status byte, then, once
-//!   the worker sends its first bytes, a connection to the agent path its
-//!   daemon last gave (`fleet.agent`, [`Cached`]), while fresh. The path is
-//!   read on a thread of its own too ([`refresh`]).
+//! - The dialed end, [`serve`]: while a link is up, `fleet-link --peer`
+//!   probes the dialer every [`PROBE`] (an `AGENT` stream it reads the
+//!   status byte of and closes) and binds `agent-link-<dialer>.sock`
+//!   (`endpoint::link_agent_socket`, as `link::opener` binds: temp name and
+//!   rename, newest wins, 0600, unlinked while still its own) only while
+//!   the dialer serves ([`decide`]). Each connection there becomes one
+//!   `AGENT` stream to the dialer (`link::Outlet::open`), spliced both ways
+//!   past a `SERVING` byte; any other answer closes the client and
+//!   unbinds. Named `agent-*.sock`, it is one of the relayed agents'
+//!   sockets `bridge::host_agent` tries, and only while it leads somewhere.
+//! - The dialer's end, [`answer`]: the daemon answers each `AGENT` stream
+//!   (`Shared::serve_channel`) with the status byte, then, once the far end
+//!   sends its first bytes, a connection to this host's agent.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -39,23 +36,17 @@ use crate::devsbd::mux::Conn;
 use crate::devsbd::proto::channel;
 use crate::serve::endpoint;
 
-/// The status byte of a stream the hub serves: the relay follows.
+/// The status byte of a stream the dialer serves: the relay follows.
 pub const SERVING: u8 = 1;
-/// The status byte of a stream the hub doesn't serve: the close follows.
+/// The status byte of a stream the dialer doesn't serve: the close follows.
 pub const NOT_SERVING: u8 = 0;
 
-/// The worker's agent socket for its link to `hub` (its ssh target) in
-/// `dir`: `endpoint::agent_socket` of client `fleet-<hub>`.
-pub fn socket(dir: &Path, hub: &str) -> PathBuf {
-    endpoint::agent_socket(dir, &format!("fleet-{hub}"))
-}
-
-/// How often the worker asks the hub whether it serves `AGENT`: with the
-/// hub's own [`REFRESH`], a `machine set <w> agent on|off` binds or
-/// unbinds the worker's socket within about twice this.
+/// How often the dialed end asks the dialer whether it serves `AGENT`: a
+/// `machine set <m> agent on|off` there binds or unbinds the socket here
+/// within about this.
 pub const PROBE: Duration = Duration::from_secs(2);
 
-/// How long the worker waits for a stream's status byte.
+/// How long the dialed end waits for a stream's status byte.
 const STATUS_WAIT: Duration = Duration::from_secs(5);
 
 /// How often [`serve`] looks up from its listener (or its sleep) to see
@@ -81,7 +72,7 @@ pub fn status_of(byte: Option<u8>) -> Status {
     }
 }
 
-/// What the worker does with its socket after an answer.
+/// What the dialed end does with its socket after an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Bind,
@@ -89,8 +80,8 @@ pub enum Action {
     Keep,
 }
 
-/// The worker's socket after an answer `status` (pure): bound while the
-/// hub serves, unbound on anything else.
+/// The dialed end's socket after an answer `status` (pure): bound while
+/// the dialer serves, unbound on anything else.
 pub fn decide(bound: bool, status: Status) -> Action {
     match (bound, status) {
         (false, Status::Serving) => Action::Bind,
@@ -99,10 +90,10 @@ pub fn decide(bound: bool, status: Status) -> Action {
     }
 }
 
-/// The worker's end at `path` for the link `outlet` stands for, until `over`
+/// The dialed end at `path` for the link `outlet` stands for, until `over`
 /// is set or the outlet goes down: once the outlet is up, a probe every
 /// `every` ([`PROBE`] in production) binds or unbinds the socket
-/// ([`decide`]); a client the hub turns down unbinds it too. Unbound (the
+/// ([`decide`]); a client the dialer turns down unbinds it too. Unbound (the
 /// file unlinked unless a newer one replaced it) when this returns.
 pub fn serve(path: &Path, outlet: &Outlet, over: &AtomicBool, every: Duration) -> Result<()> {
     while !outlet.is_up() {
@@ -175,11 +166,11 @@ fn read_status(stream: &Conn, wait: Duration) -> Status {
     status
 }
 
-/// A client of the worker's socket on its own thread: past a `SERVING`
+/// A client of the dialed end's socket on its own thread: past a `SERVING`
 /// byte spliced to `stream`; else both closed and `refused` set (the
 /// socket goes).
 fn relay(client: UnixStream, stream: Conn, refused: Arc<AtomicBool>) {
-    let _ = std::thread::Builder::new().name("serve-lend-agent-conn".into()).spawn(move || {
+    let _ = std::thread::Builder::new().name("fleet-link-agent-conn".into()).spawn(move || {
         match read_status(&stream, STATUS_WAIT) {
             Status::Serving => splice(client, stream),
             _ => refused.store(true, Ordering::Relaxed),
@@ -187,63 +178,10 @@ fn relay(client: UnixStream, stream: Conn, refused: Arc<AtomicBool>) {
     });
 }
 
-/// How often the hub's `fleet-link` asks its daemon for the agent
-/// (`fleet.agent`, [`refresh`]).
-pub const REFRESH: Duration = Duration::from_secs(2);
-
-/// How old the last answer may be and still count: past it (the daemon
-/// stopped answering) streams are not served.
-pub const MAX_AGE: Duration = Duration::from_secs(10);
-
-/// The hub daemon's last `fleet.agent` answer, and when it came.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Cached {
-    agent: Option<PathBuf>,
-    at: Option<Instant>,
-}
-
-impl Cached {
-    /// `agent`, as answered at `at`.
-    pub fn read(agent: Option<PathBuf>, at: Instant) -> Cached {
-        Cached { agent, at: Some(at) }
-    }
-
-    /// The agent a stream gets at `now`: the answer's, while it is less
-    /// than [`MAX_AGE`] old; never before a first answer.
-    pub fn fresh(&self, now: Instant) -> Option<&Path> {
-        let at = self.at?;
-        (now.saturating_duration_since(at) < MAX_AGE).then_some(self.agent.as_deref()).flatten()
-    }
-}
-
-/// The hub's `AGENT` handler's state: the [`Cached`] answer [`refresh`]
-/// keeps.
-#[derive(Debug, Default)]
-pub struct Gate {
-    cached: Mutex<Cached>,
-}
-
-impl Gate {
-    pub fn set(&self, cached: Cached) {
-        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = cached;
-    }
-
-    /// The answer to one `AGENT` stream at `now`, at once: a socket pair
-    /// whose far end [`answer`] takes on a thread of its own, with the agent
-    /// fresh at `now` (`None` without a socket pair or a thread: refused).
-    pub fn open(&self, now: Instant) -> Option<Conn> {
-        let agent = self.cached.lock().unwrap_or_else(|e| e.into_inner()).fresh(now).map(Path::to_path_buf);
-        let (ours, theirs) = UnixStream::pair().ok()?;
-        std::thread::Builder::new().name("fleet-link-agent-conn".into()).spawn(move || answer(ours, agent)).ok()?;
-        Some(theirs.into())
-    }
-}
-
-/// One `AGENT` stream on the hub: [`NOT_SERVING`] without an agent; else
-/// [`SERVING`], and once the worker's first bytes come (a probe sends none
-/// and closes: no connection to the agent), a connection to `agent` they
-/// open, spliced. Also the daemon's `AGENT` stream of a `link.attach
-/// {channel: "agent"}` (`Shared::serve_channel`).
+/// One `AGENT` stream on the dialer: [`NOT_SERVING`] without an agent;
+/// else [`SERVING`], and once the far end's first bytes come (a probe
+/// sends none and closes: no connection to the agent), a connection to
+/// `agent` they open, spliced (`Shared::serve_channel`).
 pub fn answer(ours: UnixStream, agent: Option<PathBuf>) {
     let Some(agent) = agent else {
         let _ = (&ours).write_all(&[NOT_SERVING]);
@@ -262,41 +200,6 @@ pub fn answer(ours: UnixStream, agent: Option<PathBuf>) {
         return;
     }
     splice(ours, to.into());
-}
-
-/// Keep `gate` fresh on a thread of its own: `read()` (the daemon's
-/// `fleet.agent` answer) at once, then every `every`, until the returned
-/// sender is dropped. A failed read keeps the last answer, which ages out
-/// ([`MAX_AGE`]); `on_error` hears the first of each run of failures.
-pub fn refresh(
-    gate: Arc<Gate>,
-    every: Duration,
-    mut read: impl FnMut() -> Result<Option<PathBuf>> + Send + 'static,
-    on_error: impl Fn(&anyhow::Error) + Send + 'static,
-) -> mpsc::Sender<()> {
-    let (stop, stopped) = mpsc::channel::<()>();
-    let _ = std::thread::Builder::new().name("fleet-link-agent".into()).spawn(move || {
-        let mut failing = false;
-        loop {
-            match read() {
-                Ok(agent) => {
-                    gate.set(Cached::read(agent, Instant::now()));
-                    failing = false;
-                }
-                Err(e) => {
-                    if !failing {
-                        on_error(&e);
-                    }
-                    failing = true;
-                }
-            }
-            match stopped.recv_timeout(every) {
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                _ => return,
-            }
-        }
-    });
-    stop
 }
 
 #[cfg(test)]
@@ -334,19 +237,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_cached_answer_counts_while_fresh() {
-        let t = Instant::now();
-        let a = || Some(PathBuf::from("/a"));
-        assert_eq!(Cached::default().fresh(t), None, "never read");
-        assert_eq!(Cached::read(a(), t).fresh(t), Some(Path::new("/a")));
-        assert_eq!(Cached::read(a(), t).fresh(t + MAX_AGE - Duration::from_millis(1)), Some(Path::new("/a")));
-        assert_eq!(Cached::read(a(), t).fresh(t + MAX_AGE), None, "aged out");
-        assert_eq!(Cached::read(None, t).fresh(t), None);
-        // A clock read before the answer (another thread's `now`) still counts.
-        assert!(Cached::read(a(), t + Duration::from_secs(1)).fresh(t).is_some());
-    }
-
     /// A fake agent at `dir/agent`: echoes each connection, counted.
     fn echo_agent(dir: &Path) -> (PathBuf, Arc<AtomicUsize>) {
         let path = dir.join("agent");
@@ -365,47 +255,12 @@ mod tests {
         (path, n)
     }
 
-    /// Everything a `Gate` stream says to a client sending `send`, then
-    /// half-closing.
-    fn through(gate: &Gate, now: Instant, send: &[u8]) -> Vec<u8> {
-        let Some(Conn::Unix(mut c)) = gate.open(now) else { panic!("a stream is always answered") };
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        // A refusal may close before this write (a broken pipe), or after it
-        // with what was sent unread (a reset after the byte).
-        let _ = c.write_all(send);
-        let _ = c.shutdown(Shutdown::Write);
-        let mut got = Vec::new();
-        let _ = c.read_to_end(&mut got);
-        got
-    }
-
+    /// The dialed end over a real link to a fake dialer ([`answer`] in front
+    /// of an echo agent while `on`): bound only while the dialer serves,
+    /// relaying with half-closes, unbound when it stops serving or the link
+    /// dies.
     #[test]
-    fn the_gate_says_whether_it_serves_and_relays_only_then() {
-        let dir = scratch("gate");
-        let (agent, connects) = echo_agent(&dir);
-        let gate = Gate::default();
-        let now = Instant::now();
-        assert_eq!(through(&gate, now, b"hi"), [NOT_SERVING], "nothing read yet");
-        gate.set(Cached::read(None, now));
-        assert_eq!(through(&gate, now, b"hi"), [NOT_SERVING], "off");
-        gate.set(Cached::read(Some(agent.clone()), now));
-        assert_eq!(through(&gate, now, b"hi"), b"\x01hi", "on: the status byte, then the agent");
-        assert_eq!(through(&gate, now + MAX_AGE, b"hi"), [NOT_SERVING], "stale");
-        // A probe sends nothing: the agent is never dialed for it.
-        let before = connects.load(Ordering::SeqCst);
-        assert_eq!(through(&gate, now, b""), [SERVING]);
-        assert_eq!(connects.load(Ordering::SeqCst), before);
-        // A dead agent: served, then closed.
-        gate.set(Cached::read(Some(dir.join("gone")), now));
-        assert_eq!(through(&gate, now, b"hi"), [SERVING]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The worker's end over a real link to a fake hub (a [`Gate`] in front
-    /// of an echo agent): bound only while the hub serves, relaying with
-    /// half-closes, unbound when it stops serving or the link dies.
-    #[test]
-    fn the_worker_socket_follows_the_hub_and_goes_with_the_link() {
+    fn the_socket_follows_the_dialer_and_goes_with_the_link() {
         use super::super::LINK;
         use super::super::link::{self, Serves};
         let dir = scratch("w");
@@ -413,11 +268,17 @@ mod tests {
         let (worker_io, hub_io) = UnixStream::pair().unwrap();
         let cut = hub_io.try_clone().unwrap();
         let api = dir.join("fleet-w.sock");
-        let gate = Arc::new(Gate::default());
+        let on = Arc::new(AtomicBool::new(false));
         let hub = {
-            let gate = Arc::clone(&gate);
+            let (on, agent) = (Arc::clone(&on), agent.clone());
             std::thread::spawn(move || {
-                let serves = Serves::default().with(channel::AGENT, move || gate.open(Instant::now()));
+                let open = move || {
+                    let (ours, theirs) = UnixStream::pair().ok()?;
+                    let agent = on.load(Ordering::SeqCst).then(|| agent.clone());
+                    std::thread::spawn(move || answer(ours, agent));
+                    Some(theirs.into())
+                };
+                let serves = Serves::default().with(channel::AGENT, open);
                 let sockets = [(channel::API, api.as_path())];
                 let endpoint = link::Endpoint { sockets: &sockets, serves, outlet: None };
                 link::opener_with(&LINK, hub_io.try_clone().unwrap(), hub_io, endpoint, |_| Ok(()))
@@ -430,7 +291,7 @@ mod tests {
             let endpoint = link::Endpoint { serves, outlet: Some(&answering), ..link::Endpoint::default() };
             link::answerer_with(&LINK, worker_io.try_clone().unwrap(), worker_io, endpoint, |_| Ok(()), || {})
         });
-        let path = socket(&dir, "me@hub");
+        let path = endpoint::link_agent_socket(&dir, "hub");
         let over = Arc::new(AtomicBool::new(false));
         let serving = {
             let (path, outlet, over) = (path.clone(), Arc::clone(&outlet), Arc::clone(&over));
@@ -446,7 +307,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert!(!path.exists(), "not served: not bound");
 
-        gate.set(Cached::read(Some(agent.clone()), Instant::now()));
+        on.store(true, Ordering::SeqCst);
         wait(true, "served: bound");
         assert_eq!(endpoint::agent_sockets(&dir), [path.clone()]);
         for msg in [&b"one"[..], b"two"] {
@@ -459,9 +320,9 @@ mod tests {
             assert_eq!(got, msg, "the agent's answer, past the status byte");
         }
 
-        gate.set(Cached::read(None, Instant::now()));
+        on.store(false, Ordering::SeqCst);
         wait(false, "no longer served: unbound");
-        gate.set(Cached::read(Some(agent), Instant::now()));
+        on.store(true, Ordering::SeqCst);
         wait(true, "served again");
 
         // The link dies: the outlet goes down, the socket with it.
@@ -481,33 +342,5 @@ mod tests {
         let over = AtomicBool::new(true);
         serve(&path, &Outlet::default(), &over, PROBE).unwrap();
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn refresh_reads_until_dropped_and_keeps_the_answer_on_errors() {
-        let gate = Arc::new(Gate::default());
-        let (tx, reads) = mpsc::channel();
-        let (errors, errored) = mpsc::channel();
-        let mut n = 0;
-        let stop = refresh(
-            Arc::clone(&gate),
-            Duration::from_millis(10),
-            move || {
-                n += 1;
-                let _ = tx.send(n);
-                if n == 1 { Ok(Some(PathBuf::from("/a"))) } else { anyhow::bail!("daemon away") }
-            },
-            move |e| errors.send(e.to_string()).unwrap(),
-        );
-        assert_eq!(reads.recv_timeout(Duration::from_secs(5)), Ok(1));
-        assert_eq!(reads.recv_timeout(Duration::from_secs(5)), Ok(2));
-        assert_eq!(reads.recv_timeout(Duration::from_secs(5)), Ok(3));
-        // The failed reads left the first one's answer.
-        assert_eq!(gate.cached.lock().unwrap().fresh(Instant::now()), Some(Path::new("/a")));
-        assert_eq!(errored.try_iter().collect::<Vec<_>>(), ["daemon away"], "the first of a run only");
-        drop(stop);
-        // At most one read already under way; then none.
-        let _ = reads.recv_timeout(Duration::from_millis(100));
-        assert!(reads.recv_timeout(Duration::from_millis(100)).is_err(), "stopped");
     }
 }

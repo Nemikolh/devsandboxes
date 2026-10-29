@@ -1,6 +1,6 @@
 //! How one host reaches another's devsandbox (docs/architecture/daemon/fleet.md,
 //! *Transport*): [`Transport::dial`] of a target and a devsandbox command
-//! line, a [`Duplex`] out: one byte pipe to that command's stdio, which a
+//! line (a machine's `command` and its args), a [`Duplex`] out: one byte pipe to that command's stdio, which a
 //! link (`fleet::link`) runs on. The seam exists so that what carries the
 //! bytes is one module's business: ssh is the only implementation
 //! ([`Transport::ssh`]), and swapping it, or spreading a link over more than
@@ -41,22 +41,12 @@ impl Transport {
         Transport(Arc::new(move |target, _, args| dial(target, args)))
     }
 
-    /// A connection to `devsandbox <args>` on `target` (`[user@]host`, an
-    /// ssh-config alias or `ssh://[user@]host[:port]`, [`check_target`]).
-    pub fn dial(&self, target: &str, args: &[String]) -> Result<Duplex> {
-        (self.0)(target, "devsandbox", args)
-    }
-
-    /// [`dial`](Self::dial) running `program` instead of `devsandbox` (a
-    /// machine's `command`, as its login shell reads it).
-    pub fn dial_with(&self, target: &str, program: &str, args: &[String]) -> Result<Duplex> {
+    /// A connection to `<program> <args>` on `target` (`[user@]host`, an
+    /// ssh-config alias or `ssh://[user@]host[:port]`): `program` is a
+    /// machine's `command` (`devsandbox`, or as its login shell reads it).
+    pub fn dial(&self, target: &str, program: &str, args: &[String]) -> Result<Duplex> {
         (self.0)(target, program, args)
     }
-}
-
-/// `Ok` when `target` is one [`Transport::ssh`] can dial; else why not.
-pub fn check_target(target: &str) -> Result<()> {
-    ssh::parse_target(target).map(drop)
 }
 
 /// [`Transport::ssh`]'s argv.
@@ -74,7 +64,7 @@ mod tests {
 
     #[test]
     fn the_ssh_argv() {
-        let link = args(&["fleet-link", "--worker", "lap", "--root", "/d/fleet/me@hub"]);
+        let link = args(&["fleet-link", "--peer", "lap"]);
         let argv = ssh_argv("ssh://me@hub:2200", "devsandbox", &link).unwrap();
         let want = [
             "ssh",
@@ -85,21 +75,13 @@ mod tests {
             "2200",
             "--",
             "me@hub",
-            r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--worker'\'' '\''lap'\'' '\''--root'\'' '\''/d/fleet/me@hub'\'''"#,
+            r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--peer'\'' '\''lap'\'''"#,
         ];
         assert_eq!(argv, want.map(OsString::from));
         assert_eq!(ssh_argv("hub", "devsandbox", &link).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
         assert!(ssh_argv("-oProxyCommand=x", "devsandbox", &link).is_err());
         let custom = ssh_argv("hub", "~/bin/ds", &args(&["fleet-link"])).unwrap();
         assert_eq!(custom.last().unwrap(), r#"exec "$SHELL" -lc 'exec ~/bin/ds '\''fleet-link'\'''"#);
-    }
-
-    #[test]
-    fn targets_are_checked_as_ssh_reads_them() {
-        assert!(check_target("me@hub").is_ok());
-        assert!(check_target("ssh://me@hub:2200").is_ok());
-        assert!(check_target("-oProxyCommand=x").is_err());
-        assert!(check_target("").is_err());
     }
 
     #[test]
@@ -110,7 +92,7 @@ mod tests {
             *saw.lock().unwrap() = Some((target.to_string(), args.to_vec()));
             anyhow::bail!("no route")
         });
-        let err = transport.clone().dial("me@hub", &args(&["fleet-link"])).err().unwrap();
+        let err = transport.clone().dial("me@hub", "devsandbox", &args(&["fleet-link"])).err().unwrap();
         assert_eq!(err.to_string(), "no route");
         assert_eq!(*seen.lock().unwrap(), Some(("me@hub".to_string(), args(&["fleet-link"]))));
     }

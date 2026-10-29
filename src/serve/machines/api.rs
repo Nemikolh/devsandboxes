@@ -98,7 +98,7 @@ pub struct Added {
 pub struct MachineRow {
     pub name: String,
     pub kind: MachineKind,
-    /// `None` for an offered machine and an inbound neighbor.
+    /// `None` for an inbound neighbor.
     pub target: Option<String>,
     pub roots: Vec<PathBuf>,
     pub command: Option<String>,
@@ -247,8 +247,8 @@ fn machines(ctx: &Ctx) -> Result<Vec<Entry>, ApiError> {
 /// `machines.get`'s answer: the machine's registry entry, or an inbound
 /// neighbor's (what the CLI routes a command on it with, `machines::cli`).
 /// No argv on the wire: a client wanting an ssh command builds it from
-/// `target` and `command`. An offered or inbound machine has no `target`:
-/// no ssh to it.
+/// `target` and `command`. An inbound machine has no `target`: no ssh to
+/// it.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineInfo {
     pub name: String,
@@ -302,9 +302,8 @@ struct SetParams {
 }
 
 /// Change a registered machine's settings (today only `agent`). The links
-/// reload only when something changed. An offered machine's `agent` gates
-/// `fleet.agent`, through which its `fleet-link` serves this host's agent
-/// over the fleet link (`fleet::agent`).
+/// reload only when something changed (the link's `AGENT` streams follow
+/// `agent`, `fleet::dialer`).
 fn set(p: SetParams, ctx: &Ctx) -> Answer {
     let changed = super::update(&ctx.registry, |entries| {
         let entry = entries.iter_mut().find(|e| e.name == p.name)?;
@@ -495,10 +494,15 @@ mod tests {
             Pair { base, home, local, daemons }
         }
 
+        /// Both shut down: a daemon with a machine registered holds its
+        /// link and never idles out (`idle::Holders::links`).
         fn finish(self) {
             drop(self.local);
+            for dir in [self.base.join("local"), self.base.join("remote")] {
+                assert!(client_at(&dir).call("shutdown", json!({})).unwrap().error.is_none());
+            }
             for d in self.daemons {
-                assert_eq!(d.join().unwrap().unwrap(), Exit::Idle);
+                assert_eq!(d.join().unwrap().unwrap(), Exit::Shutdown);
             }
             let _ = std::fs::remove_dir_all(&self.base);
         }
@@ -648,19 +652,11 @@ mod tests {
         let (code, message) = err(&mut local, "machines.set", json!({"name": "nope", "agent": true}));
         assert_eq!((code.as_str(), message.as_str()), ("not-found", "no machine named `nope`"));
         assert_eq!(err(&mut local, "machines.set", json!({"name": "box"})).0, "invalid");
-        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry.clone()]);
-        // An offered machine's `agent` rides its fleet link: on and off are
-        // taken like an ssh machine's; `get` says its kind, no target.
-        crate::serve::machines::update(&registry, |e| e.push(Entry::offered("lap"))).unwrap();
-        assert_eq!(ok(&mut local, "machines.set", json!({"name": "lap", "agent": true})), json!({"ok": true}));
-        let lap_on = Entry { agent: true, ..Entry::offered("lap") };
-        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry.clone(), lap_on]);
-        let info = ok(&mut local, "machines.get", json!({"name": "lap"}));
-        assert_eq!(info, json!({"name": "lap", "kind": "offered", "target": null, "command": null, "roots": [], "agent": true}));
-        assert_eq!(ok(&mut local, "machines.set", json!({"name": "lap", "agent": false})), json!({"ok": true}));
-        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry, Entry::offered("lap")]);
+        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry]);
+        // A registered machine's link holds the daemon up.
+        assert!(local.call("shutdown", json!({})).unwrap().error.is_none());
         drop(local);
-        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -681,7 +677,7 @@ mod tests {
         assert_matches("MachineAdded", &to_value(added).unwrap());
         let row = MachineRow {
             name: "m".into(),
-            kind: MachineKind::Offered,
+            kind: MachineKind::Inbound,
             target: None,
             roots: vec![],
             command: None,
@@ -696,7 +692,7 @@ mod tests {
         assert_matches("Capacity", &row["capacity"]);
         let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
-        assert_eq!(union_members("MachineKind"), ["'ssh'", "'offered'", "'inbound'"]);
+        assert_eq!(union_members("MachineKind"), ["'ssh'", "'inbound'"]);
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [
             ("machines.probe", "MachineProbe"),

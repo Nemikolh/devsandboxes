@@ -55,6 +55,7 @@ use crate::devsbd::mux::{self, Conn, Mux};
 use crate::devsbd::proto::{self, caps, channel};
 use crate::serve::machines::ssh::{self, SkipError};
 
+#[cfg(test)]
 use super::transfer::Receivers;
 
 /// What one kind of link is.
@@ -121,7 +122,9 @@ impl<'a> Serves<'a> {
         self
     }
 
-    /// Also serve `TRANSFER`, each stream handed to `receivers`.
+    /// Also serve `TRANSFER`, each stream handed to `receivers` (tests: the
+    /// daemon's ends take `TRANSFER` with [`with`](Self::with)).
+    #[cfg(test)]
     pub fn transfers(self, receivers: Arc<Receivers>) -> Self {
         self.with(channel::TRANSFER, move || receivers.accept())
     }
@@ -602,7 +605,7 @@ impl<W: Write> Write for Reporting<W> {
     }
 }
 
-/// A link end's listening socket (also a fleet worker's agent socket,
+/// A link end's listening socket (also a link's agent socket,
 /// `fleet::agent::serve`). Dropping it unlinks the socket file unless a
 /// newer end has replaced it since (another inode there).
 pub(crate) struct Socket {

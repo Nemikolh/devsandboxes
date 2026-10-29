@@ -29,14 +29,15 @@ federated joins), `cli.rs` (`machine_names`, `plan`, `Plan`, `machine_use`, `rou
 
 ## Registry: `machines.toml`
 
-`<data-dir>/devsandbox/machines.toml`, `[machine.<name>]` with its kind
-(`Entry::kind`, read and written through `RawEntry`): `target` (`me@host`,
-an ssh-config alias, or `ssh://[user@]host[:port]`) for a machine this host
-sshes to (`Kind::Ssh`), or `offered = true` and no `target` for a fleet
-worker that dialed this host (`Kind::Offered`, written by `fleet.offer`:
-[fleet](fleet.md#hub-side)); exactly one of the two. Then `roots`
-(remote config roots, as the remote canonicalized them; an offered
-machine's one root is the fleet root its offer names), an optional
+`<data-dir>/devsandbox/machines.toml`, `[machine.<name>]` (read and
+written through `RawEntry`): `target` (`me@host`, an ssh-config alias, or
+`ssh://[user@]host[:port]`), the machine this host sshes to
+(`Kind::Ssh`); an entry an older build wrote with `offered = true` fails
+the file, the error naming it (`machines::parse`: delete it by hand).
+`Kind::Inbound` is the other kind, never in the file: the service's
+entry for an [inbound neighbor](#inbound-neighbors) (`Entry::inbound`).
+Then `roots` (remote config roots, as the remote canonicalized them), an
+optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
@@ -45,7 +46,7 @@ when it installs there off the login `PATH` (see
 dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
 written only when on). Only the daemon writes it
-(`machines.add`/`set`/`rm`, `fleet.offer`): locked read-modify-write on `machines.lock`, temp
+(`machines.add`/`set`/`rm`): locked read-modify-write on `machines.lock`, temp
 file + rename (`serve::locked_file::update`), since two daemons overlap during a handoff. A file that
 doesn't parse is logged and changes nothing. The CLI reads it only to know
 which machines exist (`cli::machine_names`), adding the inbound ones a
@@ -101,7 +102,7 @@ machine: its link is stopped and its rows dropped (not kept as
 (`forwards::Known`). `devsandbox machine ls` shows `inbound` as the
 TARGET. A name is a registry entry's or a neighbor's, never both:
 `links.inbound` refuses a name `machines.toml` has (any kind),
-`machines.add` and `fleet.offer` a live neighbor's (`inbound::taken`);
+`machines.add` a live neighbor's (`inbound::taken`);
 should one race the other, the registry's entry is the machine
 (`service::with_inbound`).
 
@@ -132,7 +133,7 @@ target over ssh with the argvs in `ssh.rs`:
   refuses a newline inside quotes.
 
 Each goes through `argv_with`, which takes `Entry::ssh_target`, so none
-is built for an offered machine. Plain ssh, no ControlMaster of its own:
+is built for an inbound machine. Plain ssh, no ControlMaster of its own:
 `~/.ssh/config` decides. The remote command runs through the login shell
 (`exec "$SHELL" -lc '…'`, each arg quoted for it), so the remote `PATH` is
 the user's. No argv passes `-A`: this host's ssh-agent reaches a machine
@@ -144,7 +145,7 @@ ssh's stderr for `spawn`'s `Peer`.
 
 `Dial` (`Fn(&Entry) -> Duplex`) is injectable. The daemon's is
 `fleet::dialer::dial`: a connection to the machine's `fleet-<name>.sock`
-in the socket dir, one `API` stream on its link, ssh or offered alike;
+in the socket dir, one `API` stream on its link, ssh or inbound alike;
 `machines::api::Ctx::dial` (the held link, forwarded verbs, placement's
 capacity asks) is that one, `Ctx::probe` the add-time `probe_dial`
 (`probe_argv`, `link::client_name` as the client). A `Duplex` is always a
@@ -262,10 +263,9 @@ one's while its neighbor is up.
   with ssh's stderr tail (where the far end's refusal is, such as a name
   clash: [inbound neighbors](#inbound-neighbors) there). A hub machine on
   another build is followed first ([fleet](fleet.md#versions)). An
-  offered machine's carrier is its worker's `fleet-link --worker` here
-  ([fleet](fleet.md#hub-side)), an inbound one's the `fleet-link --peer
-  <name>` that announced it: no thread of their own (`service::carried`).
-- **The link.** Once the carrier is up (always, for an offered or inbound machine)
+  inbound machine's carrier is the `fleet-link --peer <name>` that
+  announced it: no thread of its own (`service::carried`).
+- **The link.** Once the carrier is up (always, for an inbound machine)
   the machine thread dials `fleet-<name>.sock` (`Dial`) and says hello,
   subscribes to `instances`, watches each of the machine's roots while a
   local watcher wants machines (`Hooks::watching`), and stores pushed
@@ -278,8 +278,8 @@ one's while its neighbor is up.
 `LinkState`: `idle` (before the first attempt), `connecting`,
 `connected`, `unreachable` (with the reason). A failure is logged when it
 differs from the last one logged since the link (or carrier) was up, so
-a machine that's away logs once. A link isn't an idle holder of the
-local daemon. On the machine it's an [inbound neighbor](#inbound-neighbors)
+a machine that's away logs once. Each registered machine's link holds
+the local daemon up (`idle::Holders::links`). On the machine it's an [inbound neighbor](#inbound-neighbors)
 (`links.inbound`), its streams clients like any other, and the machine
 holds a link back over it to this host.
 
@@ -329,8 +329,8 @@ the ones served here:
 `instances.watch {dir, machines: true}` (the dashboard always sends it)
 gets every push merged with each machine's rows (`snapshots::merge`): rows
 gain `machine` and keep their remote `root`, and a top-level `machines`
-array carries each machine's `name`, `kind` (`ssh` | `offered` |
-`inbound`), `target` (`null` for an offered or inbound one), `state`,
+array carries each machine's `name`, `kind` (`ssh` |
+`inbound`, fleet plan decision 29), `target` (`null` for an inbound one), `state`,
 `error`, `version`, `command`,
 `runtime`, `agent`, `capacity` (its host's
 [capacity report](fleet.md#capacity), from its last push). A machine's push or state change re-publishes those
@@ -366,13 +366,6 @@ dashboard's Machines tab (`machines.add` / `machines.set`), listed by
 `machines.list` / `get` and the federated snapshot's `machines`, shown
 in the Machines tab's AGENT column, and marked `(agent)` in the
 dashboard's header note.
-
-An offered fleet worker's `agent` flag gates the `AGENT` streams of its
-fleet link the same way, from the other side ([fleet.md](fleet.md#agent)):
-the hub's `fleet-link` serves those streams from the agent this daemon
-answers `fleet.agent` with (its own `bridge::host_agent` while the flag
-is on, asked every 2 s), and the worker binds `agent-fleet-<hub>.sock` in
-its socket dir only while its probes say the hub serves.
 
 ## The CLI: `cli.rs`
 
@@ -564,11 +557,10 @@ trust the hub may be refused those roots
 --agent` saves the machine with `agent` on; adding a name that exists is
 refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
 required) changes it on a registered machine and prints `<name>: agent
-on|off`; on is refused for an offered machine, both for an inbound one
+on|off`; both are refused for an inbound one
 ([Inbound neighbors](#inbound-neighbors)). `ls` shows it in an `AGENT`
-column, and `offered` / `inbound` as an offered / inbound machine's
-`TARGET`; `LEND` and
-`CAPACITY` are the machine's last [capacity report](fleet.md#capacity)
+column, and `inbound` as an inbound machine's `TARGET`; `CAPACITY` is the
+machine's last [capacity report](fleet.md#capacity)
 (`machines.list`'s `capacity`, `-` before one came), the over-cap note in
 parentheses. `rm` forgets the machine (refused for an inbound one).
 
@@ -609,10 +601,9 @@ unreachable: <why>` in the header (`pending_note`), the name as `box
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while there is a machine, shows every machine from the snapshot's
-`machines` with its target (dimmed `offered` for an offered fleet worker,
-`inbound` for an inbound one),
-link state (and error), `agent` (`-` for an inbound one), and its LEND
-and CAPACITY ([capacity](fleet.md#capacity));
+`machines` with its target (dimmed `inbound` for an inbound one),
+link state (and error), `agent` (`-` for an inbound one), and its
+CAPACITY ([capacity](fleet.md#capacity));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a
 down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers

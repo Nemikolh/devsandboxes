@@ -199,7 +199,7 @@ mod tests {
         let saved = of(&[machine("lap", &[("/r", rows.clone()), ("/old", json!({}))], Some(at)), machine("gone", &[], None)], 0);
         let remotes = Remotes::default();
         remotes.restore(machines(saved));
-        let lap = Entry { roots: vec!["/r".into()], ..Entry::offered("lap") };
+        let lap = Entry { roots: vec!["/r".into()], ..Entry::inbound("lap", Vec::new()) };
         remotes.sync(&[lap]);
         assert!(remotes.get("gone").is_none(), "no longer registered: dropped");
         let m = remotes.get("lap").unwrap();

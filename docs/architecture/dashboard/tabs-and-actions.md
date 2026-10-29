@@ -53,8 +53,7 @@ for Instances when the last machine goes. Each keeps its own selected row.
 - **Machines**: one row per registered machine, in the snapshot's
   `machines` order (`SnapshotMachine`, `ui.rs` `draw_machines`): NAME,
   TARGET, STATE (`LinkState::as_str`, with `: <error>` when set), AGENT
-  (`on`/`off`), VERSION (`-` before a link), LEND (`on`/`drain`/`off`,
-  `-` without a report or a `lend.toml`: `capacity::lend_label`) and
+  (`on`/`off`, `-` for an inbound one), VERSION (`-` before a link) and
   CAPACITY (`ui.rs` `capacity_text`: `capacity::summary`, e.g. `8 cpu ·
   12/32G · 120G free · 3 run`, then `over cap: mem 18G/16G` in yellow
   when `capacity::over_caps` finds a soft cap exceeded), from the

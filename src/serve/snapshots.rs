@@ -202,9 +202,9 @@ impl LinkState {
 #[derive(Debug, Clone, Default)]
 pub struct Machine {
     pub name: String,
-    /// Its kind: ssh, an offered fleet worker, or inbound.
+    /// Its kind: ssh or inbound.
     pub kind: MachineKind,
-    /// The ssh target; `None` for an offered or inbound machine.
+    /// The ssh target; `None` for an inbound machine.
     pub target: Option<String>,
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
@@ -328,7 +328,7 @@ impl Remotes {
 pub struct SnapshotMachine {
     pub name: String,
     pub kind: MachineKind,
-    /// `None` for an offered or inbound machine (no ssh to it).
+    /// `None` for an inbound machine (no ssh to it).
     pub target: Option<String>,
     pub state: LinkState,
     pub error: Option<String>,
@@ -581,7 +581,7 @@ pub(crate) mod tests {
         // Every root's snapshot lists all of the machine's instances, and
         // carries its host's capacity.
         let all = [("in-one", Some("/r/one")), ("in-two", Some("/r/two")), ("orphan", Some("/r/gone")), ("old", None)];
-        let capacity = Capacity { cpus: Some(8), running: 2, lending: Some(crate::serve::fleet::lend::State::On), ..Capacity::default() };
+        let capacity = Capacity { cpus: Some(8), running: 2, ..Capacity::default() };
         let with_capacity = |dir: &str| {
             let mut p = (*remote(dir, &all)).clone();
             p["capacity"] = serde_json::to_value(&capacity).unwrap();
@@ -597,8 +597,8 @@ pub(crate) mod tests {
         let mut c = machine("c", &["/c"], LinkState::Unreachable);
         c.error = Some("c: Permission denied".into());
         c.command = Some("~/bin/devsandbox".into());
-        // An offered worker: no target.
-        let w = Machine { kind: MachineKind::Offered, target: None, ..machine("w", &[], LinkState::Idle) };
+        // An inbound machine: no target.
+        let w = Machine { kind: MachineKind::Inbound, target: None, ..machine("w", &[], LinkState::Idle) };
 
         let merged = merge(&local, &[a, b, c, w]);
         // From its own root's snapshot when registered, else the first's.
@@ -622,7 +622,7 @@ pub(crate) mod tests {
                 {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap},
                 {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null},
                 {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null},
-                {"name": "w", "kind": "offered", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null},
+                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null},
             ])
         );
         crate::serve::dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
@@ -648,9 +648,9 @@ pub(crate) mod tests {
     fn remotes_follow_the_registry() {
         let remotes = Remotes::default();
         let entry = |name: &str, roots: &[&str]| Entry { roots: roots.iter().map(PathBuf::from).collect(), ..Entry::ssh(name, name) };
-        remotes.sync(&[entry("a", &["/1", "/2"]), entry("b", &["/b"]), Entry::offered("w")]);
+        remotes.sync(&[entry("a", &["/1", "/2"]), entry("b", &["/b"]), Entry::inbound("w", Vec::new())]);
         let w = remotes.get("w").unwrap();
-        assert_eq!((w.kind, w.target), (MachineKind::Offered, None));
+        assert_eq!((w.kind, w.target), (MachineKind::Inbound, None));
         assert_eq!(remotes.get("a").unwrap().target.as_deref(), Some("a"));
         remotes.update("a", |m| {
             m.state = LinkState::Connected;

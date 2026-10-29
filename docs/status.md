@@ -41,8 +41,8 @@ limitation means editing this file in the same commit.
   (the CLI's commands, 8a; the dashboard's terminals, forwards and
   `port`, 8b), ssh only at `machine add` (8c); inbound neighbors are
   machines (8d: rows, forwarding, the CLI's names, forwards, placement
-  over every connected machine); offered workers still lend over `fleet
-  join` until 8e drops lending.
+  over every connected machine); lending is gone (8e): a laptop joins a
+  hub with `machine add <hub>`, an inbound machine there.
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -65,7 +65,7 @@ limitation means editing this file in the same commit.
   every instance. → [plan](plans/active/agents-skills.md)
 - **daemon**: `rename`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
   (they run in the CLI process; the API has `instances.rename`/`instances.done`,
-  and `gc` is a verb for an offered worker's `--machine m gc`).
+  and `gc` is a verb for `--machine m gc`).
 - **npm**: typed verb helpers (`api.run(…)`); `ApiInstances` has only `list`.
 - **config**: `runArgs` pass-through, `envFile`, secrets; `devsandbox init`
   scaffolding.
@@ -238,10 +238,6 @@ limitation means editing this file in the same commit.
 - Daemon-side ssh (each machine's link, `machine add`'s probe) is
   `BatchMode=yes`: passphrase-prompting keys fail.
   → [machines](architecture/daemon/machines.md#ssh); `fleet::transport::Transport::ssh`, `ssh::probe_argv`
-- A daemon with registered machines still idles out (a link isn't a
-  holder): its links go with it, and each machine drops it as an inbound
-  neighbor, until a client starts the daemon again (or `serve install`
-  keeps it up). → [machines](architecture/daemon/machines.md#held-links-machines); `idle::decide`
 - A CLI re-run reports its terminal's agent once (`machines.get
   {agent}`): a daemon that hands over while the ssh session runs leaves
   the machine's `AGENT` streams to the successor's own agent (or the next
@@ -296,8 +292,9 @@ limitation means editing this file in the same commit.
   fails (its argv is the helper's session client) where a local one runs
   as a plain exec.
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::pipe_mode`
-- `--machine <offered worker> ls` lists only the config roots its
-  instances name (placed configs without an instance left don't show).
+- `--machine <m> ls` lists of a fleet root on `m` only the config roots
+  its instances name (placed configs without an instance left don't
+  show).
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::calls::config_roots`
 - Terminals on a machine's instances without a helper, or whose
   helper daemon isn't root (`session.attach` is `needs_root`, e.g.
@@ -310,14 +307,6 @@ limitation means editing this file in the same commit.
   service dial names the instance whose service it opens, and `exec
   --service` takes an instance name.
   → [terminal](architecture/dashboard/terminal.md#what-a-tab-runs); `tui::remote::service_argv`, `fleet::pty::service_container`
-- A hub notices a worker that's back (its `fleet-link` socket bound again)
-  only at its offered link's next retry, up to 30 s later: a re-offer of a
-  known worker doesn't wake the link.
-  → [fleet](architecture/daemon/fleet.md#hub-mode); `fleet::offer::offer`
-- A worker's `drain` in its offer (sent at the next link only: `lend on`
-  ↔ `drain` keeps the current one) is only logged; the hub learns it from
-  the worker's `capacity.get` and the worker refuses a `run` itself.
-  → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
 - The capacity report's soft caps (`member.toml` `[caps]`) are edited by
   hand (no `member.set` param), and measured against the whole host's memory and
   disk use, not what placed work takes; `cpus` caps nothing measured. The
@@ -334,31 +323,41 @@ limitation means editing this file in the same commit.
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
   add <root>…` on the machine, or `machine rm` + `machine add` it again.
   → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetrmtrustroots); `commands::machine::record_roots`
-- A verb from a linked host (a hub's on its offered worker, any host's on
-  its ssh machine) runs with the machine daemon's own process env (a
-  systemd unit's or LaunchAgent's, not a login shell's), so `PATH`
-  additions from shell profiles are missing (an ssh machine's verbs get
-  the linking host's agent as `SSH_AUTH_SOCK` while its
-  `agent-link-<host>.sock` answers; an offered worker's get the daemon's
-  own); fix: capture a login env once at the daemon's start.
+- No command sets this host's member name (what the machines it dials
+  know it by, `fleet-link --peer <name>`): it's `member.toml`'s `name`,
+  set only through `member.set {name}` (API) or by hand, else the
+  hostname's first label; a rename counts from each link's next dial.
+  And a machine can't stop taking placed work while staying reachable
+  (lending's `drain` went with it).
+  → [fleet](architecture/daemon/fleet.md); `fleet::member::default_name`, `fleet::dialer::member_name`
+- A verb from a linked host (on either end of the link) runs with the
+  machine daemon's own process env (a systemd unit's or LaunchAgent's,
+  not a login shell's), so `PATH` additions from shell profiles are
+  missing (the dialer's verbs on the dialed end get the dialer's agent as
+  `SSH_AUTH_SOCK` while its `agent-link-<host>.sock` answers; the dialed
+  end's on the dialer get the daemon's own); fix: capture a login env
+  once at the daemon's start.
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
 - No build is marked published yet: the release workflow doesn't set
-  `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a worker's
-  download path never runs; a worker on another build than its hub takes
+  `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a member's
+  download path never runs; a member on another build than its hub takes
   the hub's binary over the link only with `dev-builds = true` in
-  `member.toml` (or trust `full`) and the same OS/arch, else stops offering. Dev builds from
+  `member.toml` (or trust `full`) and the same OS/arch, else drops the
+  link (redialed, refused again). Dev builds from
   the same commit with different local changes count as the same build
   (the git hash has no dirty marker). A mixed-platform dev fleet is built
   per platform by hand.
   → [fleet](architecture/daemon/fleet.md#versions); `build.rs` `stamp_build`, `fleet::update::decide`
-- A worker waiting for its hub's binary gives up only when the transfer
+- A member waiting for its hub's binary gives up only when the transfer
   hasn't started within 60 s (`PUSH_WAIT`) or fails; one that started and
   stalls while the link stays up waits until the link ends.
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::follow` `Incoming::watch`
-- A worker that won't follow its hub (dev build, failed update) is seen by
-  the hub only as an offered machine whose link is gone (`unreachable`);
-  the reason is on the worker (`lend.get`, `serve.log`).
-  → [fleet](architecture/daemon/fleet.md#versions); `fleet::worker` `run_link`
+- A member that won't follow its hub (dev build, failed update) drops
+  the link at each dial: a hub that dialed it sees the reason as its
+  row's error (ssh's stderr tail), a hub it dialed only sees the inbound
+  machine come and go (the reason is in the member's `machine ls` and
+  `serve.log`).
+  → [fleet](architecture/daemon/fleet.md#versions); `fleet::dialer`, `commands::fleet_link::run_peer`
 - An inbound machine lasts while its link is up: when it goes (a
   laptop asleep, its network down) its rows and its forwards on this
   host go with it, not kept as `unreachable`, and come back (forwards
@@ -372,15 +371,14 @@ limitation means editing this file in the same commit.
   with no daemon to reach, the dispatcher's children and `--in-process`
   runs stay here (fleet step 13 for children), and only a hub (`[serve]
   hub`) places: a `run` typed elsewhere stays there (step 9 sends it to
-  the hub). On a hub every connected machine is a candidate (ssh,
-  inbound and offered), so it asks each a `capacity.get` (2 s at most)
+  the hub). On a hub every connected machine is a candidate (ssh and
+  inbound), so it asks each a `capacity.get` (2 s at most)
   before every unpinned `run` (`--here` keeps it local).
   The placing host's `state.toml` doesn't record a placed instance (it's the
   machine's, seen as `<machine>/<name>` in federated views; fleet step 13).
   Moving the
   code runs before the forward and isn't cancelled by a hang-up or Ctrl-C
-  meanwhile (the run, once forwarded, is); a worker that refuses the run
-  (draining) keeps the code it was sent. A new `--branch` starts at the
+  meanwhile (the run, once forwarded, is). A new `--branch` starts at the
   hub checkout's branch tip, not `origin/HEAD` as on the hub; a `--base`
   or `worktree-base` naming an `origin/…` ref fails on the worker (its
   checkout has no `origin`).

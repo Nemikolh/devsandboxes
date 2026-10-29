@@ -125,11 +125,11 @@ pub fn serve(link: Stream, files: &Files, peer: &Peer, log: fn(&str)) {
 fn route(req: Request, files: &Files, peer: &Peer, log: fn(&str)) -> Result<Route, String> {
     let (reach, warning) = Reach::load(files, peer.fleet_root.as_deref());
     if let Some(w) = warning {
-        log(&format!("fleet: a TUNNEL stream from hub {}: {w}", peer.name));
+        log(&format!("fleet: a TUNNEL stream from {}: {w}", peer.name));
     }
     let root = confine(&req, &reach).map_err(|e| {
         if e.code == "denied" {
-            log(&format!("fleet: refused a TUNNEL stream from hub {}: {}", peer.name, e.message));
+            log(&format!("fleet: refused a TUNNEL stream from {}: {}", peer.name, e.message));
         }
         e.message
     })?;
@@ -344,7 +344,7 @@ services = ["cache"]
         // service no instance of it uses is the refusal.
         std::fs::write(b.join("mine").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
         assert_eq!(error(&served(&scope, &state, &line(Some("own"), Some("cache"), &b.join("mine")))), "instance `own` doesn't use service `cache`");
-        assert!(crate::serve::helper::tests::logged("fleet: refused a TUNNEL stream from hub me@hub"));
+        assert!(crate::serve::helper::tests::logged("fleet: refused a TUNNEL stream from me@hub"));
         assert!(error(&served(&scope, &state, &line(Some("own"), None, &cfg))).contains("own"), "not lent: no such instance");
         assert!(error(&served(&scope, &state, &line(Some("far"), None, &cfg))).contains("far"), "another root's");
         assert_eq!(error(&served(&scope, &state, &line(None, Some("nope"), &cfg))), "no instance here uses service `nope`");

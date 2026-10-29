@@ -1,7 +1,7 @@
 //! The daemon's `run` verb placed (docs/architecture/daemon/fleet.md,
 //! *Placement*; fleet step 3c): a `run` that names no `machine` and isn't
 //! `here` goes where [`place::place`] says among this host and every
-//! machine whose link is up (ssh, inbound or offered: fleet step 8d). On a
+//! machine whose link is up (ssh or inbound). On a
 //! machine, its sandbox's code moves first, into this host's fleet root
 //! there (`code::prepare`; [`fleet_root`] says where that is), then the
 //! request is forwarded as a `machine` one would be, in the moved config
@@ -11,7 +11,7 @@
 //! candidates ([`candidates`], each worker's fresh `capacity.get` answer
 //! over its saved report, [`with_fresh`]), the cheap check that placing
 //! can matter ([`worth_placing`]), the request the worker gets
-//! ([`forwarded`]), its answer read ([`after_forward`]) and the lines the
+//! ([`forwarded`]), its answer tagged ([`tag_answer`]) and the lines the
 //! verb's output starts with.
 
 use std::collections::BTreeMap;
@@ -25,7 +25,6 @@ use super::code::{Prepared, Unprepared};
 use super::place::{self, Candidate, MachineRef, Placement, Spec};
 use crate::serve::api::RootCandidate;
 use crate::serve::capacity::Capacity;
-use crate::serve::machines::MachineKind;
 use crate::serve::snapshots::Machine;
 use crate::serve::verbs;
 
@@ -61,15 +60,11 @@ pub fn worth_placing(machines: &[Machine]) -> bool {
 }
 
 /// `c` with its machine's fresh report, when one came: its capacity
-/// replaces the saved report's, and for an offered worker (of `kind`) its
-/// lending state too (pure; lending is lending's alone, `place::lends`).
-/// None came (a timeout, an error): the saved one stands.
-pub fn with_fresh(c: Candidate, kind: MachineKind, fresh: Option<&Capacity>) -> Candidate {
+/// replaces the saved report's (pure). None came (a timeout, an error):
+/// the saved one stands.
+pub fn with_fresh(c: Candidate, fresh: Option<&Capacity>) -> Candidate {
     match fresh {
-        Some(f) => {
-            let lending = if place::lends(kind) { f.lending.unwrap_or(c.lending) } else { c.lending };
-            Candidate { lending, capacity: Some(f.clone()), ..c }
-        }
+        Some(f) => Candidate { capacity: Some(f.clone()), ..c },
         None => c,
     }
 }
@@ -102,7 +97,7 @@ pub fn candidates(
     fresh: &BTreeMap<String, Capacity>,
 ) -> Vec<Candidate> {
     let mut out = vec![Candidate::local(spec, capacity, local_roots.iter().map(|v| v.as_ref()))];
-    out.extend(workers(machines).map(|m| with_fresh(Candidate::from_machine(spec, m), m.kind, fresh.get(&m.name))));
+    out.extend(workers(machines).map(|m| with_fresh(Candidate::from_machine(spec, m), fresh.get(&m.name))));
     out
 }
 
@@ -206,27 +201,6 @@ pub fn forwarded(mut params: Value, worker: &str, root: &Path, base: Option<&str
     params
 }
 
-/// What the forwarded run's answer means.
-#[derive(Debug)]
-pub enum Forwarded {
-    /// The worker's answer, `machine` in its result ([`tag_answer`]).
-    Answer(crate::serve::proto::Response),
-    /// The worker refused new work (`denied`, `lent::DRAINING`): run here
-    /// with this note. The code it was sent stays there.
-    Here(String),
-}
-
-/// Read the forwarded run's answer `r` from worker `worker` (pure).
-pub fn after_forward(r: crate::serve::proto::Response, worker: &str) -> Forwarded {
-    if let Some(e) = &r.error
-        && e.code == "denied"
-        && e.message == super::lent::DRAINING
-    {
-        return Forwarded::Here(format!("note: not placed on {worker}: draining; running here"));
-    }
-    Forwarded::Answer(tag_answer(r, worker))
-}
-
 /// A placed run's answer with `machine` (the worker) in its result, so the
 /// client names the instance where it is (`lap/web-2`).
 pub fn tag_answer(mut r: crate::serve::proto::Response, worker: &str) -> crate::serve::proto::Response {
@@ -270,7 +244,7 @@ mod tests {
 
     use super::*;
     use crate::serve::capacity::Caps;
-    use crate::serve::fleet::lend::State;
+    use crate::serve::machines::MachineKind;
     use crate::serve::snapshots::LinkState;
 
     const G: u64 = 1 << 30;
@@ -283,7 +257,6 @@ mod tests {
             disk_free: Some(250 * G),
             disk_total: Some(500 * G),
             running,
-            lending: Some(State::On),
             caps,
         }
     }
@@ -308,20 +281,18 @@ mod tests {
     fn worth_placing_wants_a_connected_machine() {
         use LinkState::*;
         let roomy = || Some(cap(28, 0, None));
-        let drain = Some(Capacity { lending: Some(State::Drain), ..cap(28, 0, None) });
         assert!(!worth_placing(&[]), "no machines");
-        for kind in [MachineKind::Ssh, MachineKind::Inbound, MachineKind::Offered] {
+        for kind in [MachineKind::Ssh, MachineKind::Inbound] {
             assert!(worth_placing(&[worker("m", kind, Connected, roomy())]), "{kind:?}: every kind is a candidate");
             for down in [Idle, Connecting, Unreachable] {
                 assert!(!worth_placing(&[worker("m", kind, down, roomy())]), "{kind:?} {down:?}: its link is down");
             }
         }
-        // Its saved report may be stale: asked afresh either way.
-        assert!(worth_placing(&[worker("lap", MachineKind::Offered, Connected, drain)]));
-        assert!(worth_placing(&[worker("lap", MachineKind::Offered, Connected, None)]));
+        // No saved report: asked afresh either way.
+        assert!(worth_placing(&[worker("lap", MachineKind::Inbound, Connected, None)]));
         let all = [
-            worker("a", MachineKind::Offered, Connected, None),
-            worker("b", MachineKind::Offered, Unreachable, None),
+            worker("a", MachineKind::Inbound, Connected, None),
+            worker("b", MachineKind::Inbound, Unreachable, None),
             worker("c", MachineKind::Inbound, Connected, None),
             worker("d", MachineKind::Ssh, Connected, None),
             worker("e", MachineKind::Ssh, Idle, None),
@@ -349,26 +320,15 @@ mod tests {
     #[test]
     fn a_fresh_report_replaces_the_saved_one() {
         let s = spec("web", None);
-        let saved = Capacity { lending: Some(State::Drain), ..cap(4, 6, None) };
-        let m = worker("lap", MachineKind::Offered, LinkState::Connected, Some(saved.clone()));
+        let saved = cap(4, 6, None);
+        let m = worker("lap", MachineKind::Inbound, LinkState::Connected, Some(saved.clone()));
         let fresh = cap(28, 0, None);
-        let offered = MachineKind::Offered;
-        let c = with_fresh(Candidate::from_machine(&s, &m), offered, Some(&fresh));
-        assert_eq!((c.lending, c.capacity.as_ref()), (State::On, Some(&fresh)));
-        let c = with_fresh(Candidate::from_machine(&s, &m), offered, None);
-        assert_eq!((c.lending, c.capacity.as_ref()), (State::Drain, Some(&saved)));
-        // No lending in the fresh one (no `lend.toml` there): the saved state.
-        let c = with_fresh(Candidate::from_machine(&s, &m), offered, Some(&Capacity { lending: None, ..fresh.clone() }));
-        assert_eq!(c.lending, State::Drain);
-        // Any other kind's lending state isn't placement's: a drain there takes work.
-        for kind in [MachineKind::Ssh, MachineKind::Inbound] {
-            let other = Machine { kind, ..m.clone() };
-            let drained = Capacity { lending: Some(State::Drain), ..fresh.clone() };
-            let c = with_fresh(Candidate::from_machine(&s, &other), kind, Some(&drained));
-            assert_eq!((c.lending, c.capacity.as_ref()), (State::On, Some(&drained)), "{kind:?}");
-        }
+        let c = with_fresh(Candidate::from_machine(&s, &m), Some(&fresh));
+        assert_eq!(c.capacity.as_ref(), Some(&fresh));
+        let c = with_fresh(Candidate::from_machine(&s, &m), None);
+        assert_eq!(c.capacity.as_ref(), Some(&saved));
         // Through `candidates`, by name; the fresh one decides the placement.
-        let neutral = worker("lap", MachineKind::Offered, LinkState::Connected, None);
+        let neutral = worker("lap", MachineKind::Inbound, LinkState::Connected, None);
         let stale = candidates(&s, None, &[], std::slice::from_ref(&neutral), &BTreeMap::new());
         assert_eq!(decide(&Ask::default(), &s, &stale, |_| unreachable!()), Placed::Local, "neutral both: this host's bias");
         let fresh_map = BTreeMap::from([("lap".to_string(), fresh)]);
@@ -389,7 +349,7 @@ mod tests {
     fn candidates_are_this_host_and_every_machine() {
         let machines = [
             worker("srv", MachineKind::Ssh, LinkState::Connected, None),
-            worker("lap", MachineKind::Offered, LinkState::Connected, None),
+            worker("lap", MachineKind::Inbound, LinkState::Connected, None),
             worker("nb", MachineKind::Inbound, LinkState::Connected, None),
             worker("off", MachineKind::Ssh, LinkState::Unreachable, None),
         ];
@@ -414,8 +374,8 @@ mod tests {
     #[test]
     fn the_decision() {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
-        let busy_here = || candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Offered, LinkState::Connected, Some(cap(28, 0, None)))], &BTreeMap::new());
-        let idle_here = || candidates(&spec("web", None), Some(cap(28, 0, None)), &[], &[worker("lap", MachineKind::Offered, LinkState::Connected, Some(cap(4, 6, None)))], &BTreeMap::new());
+        let busy_here = || candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, None)))], &BTreeMap::new());
+        let idle_here = || candidates(&spec("web", None), Some(cap(28, 0, None)), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(4, 6, None)))], &BTreeMap::new());
         let asked = RefCell::new(Vec::new());
         let ok = |branch: &'static str| {
             let asked = &asked;
@@ -452,7 +412,7 @@ mod tests {
 
         // Every candidate over a cap: the best, warned.
         let over_mem = Some(Caps { mem: Some(G), ..Caps::default() });
-        let all_over = candidates(&s, Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Offered, LinkState::Connected, Some(cap(28, 0, over_mem)))], &BTreeMap::new());
+        let all_over = candidates(&s, Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, over_mem)))], &BTreeMap::new());
         let Placed::Worker { lines, .. } = decide(&ask, &s, &all_over, ok("main")) else { panic!() };
         assert_eq!(lines, ["placed on lap (mem 0% free, disk 50% free, cpu 100% free)", "warning: lap: over cap: mem 4G/1G"]);
     }
@@ -486,18 +446,6 @@ mod tests {
         crate::serve::dts::assert_matches("VerbResult", r.result.as_ref().unwrap());
         let r = tag_answer(crate::serve::proto::Response::err(Some(1), "failed", "x"), "lap");
         assert!(r.result.is_none());
-    }
-
-    #[test]
-    fn a_draining_workers_refusal_runs_here() {
-        use crate::serve::proto::Response;
-        let refused = Response::err(Some(1), "denied", crate::serve::fleet::lent::DRAINING);
-        assert!(matches!(after_forward(refused, "lap"), Forwarded::Here(n) if n == "note: not placed on lap: draining; running here"));
-        // Another denial is the answer, as is.
-        let other = Response::err(Some(1), "denied", "`run` with `all` isn't lent to a fleet hub");
-        assert!(matches!(after_forward(other, "lap"), Forwarded::Answer(r) if r.error.is_some()));
-        let Forwarded::Answer(ok) = after_forward(Response::ok(Some(1), json!({"instance": "w", "exit": 0})), "lap") else { panic!() };
-        assert_eq!(ok.result.unwrap()["machine"], "lap");
     }
 
     #[test]

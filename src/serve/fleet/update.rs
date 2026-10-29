@@ -30,8 +30,7 @@ use crate::serve::proto::Version;
 
 /// [`HELLO`] followed by its link's `<hub|member>` word, what a peer link
 /// (`fleet-link --peer`, docs/architecture/daemon/fleet.md, *Peer links*)
-/// says: [`hello_of`], read back by [`is_hub`]. The lending link says
-/// [`HELLO`] alone (its worker follows the hub's build whatever).
+/// says: [`hello_of`], read back by [`is_hub`].
 macro_rules! hello {
     ($flag:literal) => {
         concat!(
@@ -61,7 +60,7 @@ pub fn hello_of(hub: bool) -> &'static str {
 }
 
 /// Whether a peer link's `Hello` hash ([`hello_of`]) says its end is the
-/// hub: its fifth word is `hub`. A lending link's (four words) never is.
+/// hub: its fifth word is `hub`. [`HELLO`] alone (four words) never is.
 pub fn is_hub(hello: &str) -> bool {
     hello.split_whitespace().nth(4) == Some("hub")
 }
@@ -72,10 +71,12 @@ fn build_words(hello: &str) -> impl Iterator<Item = &str> {
     hello.split_whitespace().take(4)
 }
 
-/// This binary's platform, `<os>/<arch>` as `std::env::consts` names them.
+/// This binary's platform, `<os>/<arch>` as `std::env::consts` names them
+/// (what [`HELLO`] says; tests build other ends' hellos with it).
+#[cfg(test)]
 pub const PLATFORM: &str = env!("DEVSANDBOX_BUILD_PLATFORM");
 
-/// The transfer kind of a hub's binary, and the most a worker takes of it.
+/// The transfer kind of a hub's binary, and the most a member takes of it.
 pub const BINARY_KIND: &str = "binary";
 pub const BINARY_LIMIT: u64 = 256 << 20;
 
@@ -99,11 +100,6 @@ pub struct Build {
 }
 
 impl Build {
-    /// This binary's.
-    pub fn current() -> Build {
-        Build::parse(HELLO)
-    }
-
     /// A `Hello` hash, `<semver> <git> <published|dev> …`; a missing word is
     /// `unknown` / dev. The platform isn't part of the build
     /// ([`platform_of`]): one release is built for several.
@@ -121,10 +117,10 @@ impl Build {
     }
 }
 
-/// What a worker does about its hub's build.
+/// What a member does about its hub's build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// The same build: lend.
+    /// The same build: serve the link.
     Same,
     /// The hub runs published `version`, this worker another build: fetch
     /// and install it, then hand off (an older version too).
@@ -404,7 +400,7 @@ pub(crate) mod tests {
         assert_eq!(Build::parse("0.7.0 1a2b3c dev"), build("0.7.0", "1a2b3c", false));
         assert_eq!(Build::parse("0.7.0"), build("0.7.0", "unknown", false));
         assert_eq!(Build::parse(""), build("", "unknown", false));
-        let ours = Build::current();
+        let ours = Build::parse(HELLO);
         assert_eq!(ours.semver, env!("CARGO_PKG_VERSION"));
         assert_eq!(Build::parse(HELLO), ours);
         assert!(HELLO.len() <= u8::MAX as usize, "fits a `Hello` hash");
@@ -418,7 +414,7 @@ pub(crate) mod tests {
         assert_eq!(hello_of(false), format!("{HELLO} member"));
         assert!(hello_of(true).len() <= u8::MAX as usize, "fits a `Hello` hash");
         assert!(is_hub(hello_of(true)) && !is_hub(hello_of(false)));
-        assert!(!is_hub(HELLO), "a lending link's hello never says hub");
+        assert!(!is_hub(HELLO), "a hello without the flag never says hub");
         assert!(!is_hub("0.7.0 1a2b dev hub"), "the fifth word, not any");
         assert_eq!((Build::parse(hello_of(true)), platform_of(hello_of(false))), (ours, PLATFORM));
     }

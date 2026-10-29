@@ -2,8 +2,8 @@
 //! streams of one link per machine (docs/architecture/daemon/machines.md):
 //! for an ssh machine the link this host holds to it
 //! (`ssh <target> devsandbox fleet-link --peer <this host>`,
-//! `fleet::dialer`), for an offered fleet worker the one it holds to this
-//! host (docs/architecture/daemon/fleet.md); either way reached at
+//! `fleet::dialer`), for an inbound neighbor the one it holds to this host
+//! (`inbound`, docs/architecture/daemon/fleet.md); either way reached at
 //! `fleet-<name>.sock` (`fleet::dialer::dial`).
 //!
 //! - this module: the registry, `machines.toml` next to `state.toml`
@@ -45,8 +45,9 @@ pub mod ssh;
 
 /// One registered machine, as `machines.toml` holds it under
 /// `[machine.<name>]` (docs/architecture/daemon/machines.md, *Registry:
-/// `machines.toml`*). In the file the kind is `target = "…"` (ssh) or
-/// `offered = true`, exactly one of them ([`RawEntry`]).
+/// `machines.toml`*): an ssh machine, `target = "…"` ([`RawEntry`]). The
+/// service also holds an [`Entry::inbound`] per inbound neighbor, never
+/// saved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawEntry", into = "RawEntry")]
 pub struct Entry {
@@ -71,10 +72,6 @@ pub enum Kind {
     /// This host sshes to it: `target` is what ssh takes (`me@host`, `host`,
     /// an ssh-config alias) or an `ssh://` URL ([`ssh::parse_target`]).
     Ssh { target: String },
-    /// A fleet worker that dialed this host (docs/architecture/daemon/fleet.md,
-    /// *Hub side*): reached only over the `API` channel of its held fleet
-    /// link, through `fleet-<name>.sock`; nothing here can ssh to it.
-    Offered,
     /// An inbound neighbor (`inbound::Neighbors`): it dialed this host, its
     /// `fleet-link --peer <it>` here binds `fleet-<name>.sock`. Never in
     /// `machines.toml`: the service makes one of each neighbor up now
@@ -84,13 +81,12 @@ pub enum Kind {
 
 /// [`Kind`] on the wire (`kind` of `machines.list` / `get` and the
 /// federated snapshot's `machines`, next to a `target` that is `null` for an
-/// offered machine and an inbound neighbor).
+/// inbound neighbor; fleet plan decision 29).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MachineKind {
     #[default]
     Ssh,
-    Offered,
     /// An inbound neighbor (`inbound`): a machine whose link to this host
     /// is dialed from its end, a machine here while that link is up;
     /// never a registry entry.
@@ -102,7 +98,6 @@ impl Kind {
     pub fn wire(&self) -> (MachineKind, Option<String>) {
         match self {
             Kind::Ssh { target } => (MachineKind::Ssh, Some(target.clone())),
-            Kind::Offered => (MachineKind::Offered, None),
             Kind::Inbound => (MachineKind::Inbound, None),
         }
     }
@@ -113,7 +108,6 @@ impl Kind {
         match (kind, target) {
             (MachineKind::Ssh, Some(target)) => Ok(Kind::Ssh { target }),
             (MachineKind::Ssh, None) => bail!("an ssh machine without a target"),
-            (MachineKind::Offered, _) => Ok(Kind::Offered),
             (MachineKind::Inbound, _) => Ok(Kind::Inbound),
         }
     }
@@ -123,12 +117,6 @@ impl Entry {
     /// An ssh machine with no roots yet, `command` and `agent` unset.
     pub fn ssh(name: impl Into<String>, target: impl Into<String>) -> Entry {
         Entry { name: name.into(), kind: Kind::Ssh { target: target.into() }, roots: Vec::new(), command: None, agent: false }
-    }
-
-    /// An offered fleet worker with no roots (`fleet.offer` adds its fleet
-    /// root: `fleet::offer::accept`).
-    pub fn offered(name: impl Into<String>) -> Entry {
-        Entry { name: name.into(), kind: Kind::Offered, roots: Vec::new(), command: None, agent: false }
     }
 
     /// Inbound neighbor `name` as the service holds it: its `roots` as its
@@ -141,47 +129,38 @@ impl Entry {
         self.command.as_deref().unwrap_or("devsandbox")
     }
 
-    /// The ssh target; `None` for an offered machine or an inbound one.
+    /// The ssh target; `None` for an inbound one.
     pub fn target(&self) -> Option<&str> {
         match &self.kind {
             Kind::Ssh { target } => Some(target),
-            Kind::Offered | Kind::Inbound => None,
+            Kind::Inbound => None,
         }
     }
 
-    pub fn is_offered(&self) -> bool {
-        self.kind == Kind::Offered
-    }
-
-    pub fn is_inbound(&self) -> bool {
-        self.kind == Kind::Inbound
-    }
-
     /// What messages and listings call where it is: the target, or
-    /// `offered` / `inbound`.
+    /// `inbound`.
     pub fn label(&self) -> &str {
         match self.kind {
             Kind::Ssh { ref target } => target,
-            Kind::Offered => "offered",
             Kind::Inbound => "inbound",
         }
     }
 
-    /// The ssh target, for the add-time argv builders ([`ssh`]): an offered
+    /// The ssh target, for the add-time argv builders ([`ssh`]): an inbound
     /// machine has none.
     pub fn ssh_target(&self) -> Result<&str> {
         let name = &self.name;
-        let what = if self.is_inbound() { "links to this host from its end" } else { "is an offered fleet worker" };
-        self.target().with_context(|| format!("machine `{name}` {what}, reached over its fleet link, not ssh"))
+        self.target().with_context(|| format!("machine `{name}` links to this host from its end, reached over its fleet link, not ssh"))
     }
 }
 
-/// [`Entry`] as the file holds it.
+/// [`Entry`] as the file holds it. `offered` is only read, to name an
+/// entry an older build wrote for a fleet worker ([`TryFrom`]).
 #[derive(Serialize, Deserialize)]
 struct RawEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing)]
     offered: bool,
     #[serde(default)]
     roots: Vec<PathBuf>,
@@ -197,10 +176,13 @@ impl TryFrom<RawEntry> for Entry {
     /// The name is the table key: [`parse`] fills it in.
     fn try_from(raw: RawEntry) -> Result<Entry, String> {
         let kind = match (raw.target, raw.offered) {
+            (_, true) => {
+                return Err("`offered = true` (an older devsandbox's fleet worker) is no longer read: \
+                     delete the entry from the file by hand"
+                    .into());
+            }
             (Some(target), false) => Kind::Ssh { target },
-            (None, true) => Kind::Offered,
-            (Some(_), true) => return Err("`target` and `offered = true` both set".into()),
-            (None, false) => return Err("no `target` (or `offered = true`)".into()),
+            (None, false) => return Err("no `target`".into()),
         };
         Ok(Entry { name: String::new(), kind, roots: raw.roots, command: raw.command, agent: raw.agent })
     }
@@ -208,21 +190,20 @@ impl TryFrom<RawEntry> for Entry {
 
 impl From<Entry> for RawEntry {
     fn from(e: Entry) -> RawEntry {
-        let (target, offered) = match e.kind {
-            Kind::Ssh { target } => (Some(target), false),
-            Kind::Offered => (None, true),
+        let target = match e.kind {
+            Kind::Ssh { target } => Some(target),
             // Never saved (`update` only holds what `load` read): it would
-            // read back as an entry with neither.
-            Kind::Inbound => (None, false),
+            // read back as an entry without a target.
+            Kind::Inbound => None,
         };
-        RawEntry { target, offered, roots: e.roots, command: e.command, agent: e.agent }
+        RawEntry { target, offered: false, roots: e.roots, command: e.command, agent: e.agent }
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct Doc {
     #[serde(default, rename = "machine")]
-    machines: BTreeMap<String, Entry>,
+    machines: BTreeMap<String, RawEntry>,
 }
 
 /// [`path_from`] over the process env.
@@ -236,21 +217,23 @@ pub fn path_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Res
 }
 
 /// The entries, sorted by name. A hand-edited name that breaks
-/// [`check_name`] fails the whole file: a qualified `<machine>/<name>`
-/// could not address it.
+/// [`check_name`], or an entry that isn't one ([`RawEntry`]), fails the
+/// whole file, naming the entry: a qualified `<machine>/<name>` could not
+/// address it.
 pub fn parse(text: &str) -> Result<Vec<Entry>> {
     let doc: Doc = toml::from_str(text)?;
     doc.machines
         .into_iter()
-        .map(|(name, entry)| {
+        .map(|(name, raw)| {
             check_name(&name)?;
+            let entry = Entry::try_from(raw).map_err(|why| anyhow::anyhow!("[machine.{name}]: {why}"))?;
             Ok(Entry { name, ..entry })
         })
         .collect()
 }
 
 pub fn serialize(entries: &[Entry]) -> Result<String> {
-    let doc = Doc { machines: entries.iter().map(|e| (e.name.clone(), e.clone())).collect() };
+    let doc = Doc { machines: entries.iter().map(|e| (e.name.clone(), RawEntry::from(e.clone()))).collect() };
     toml::to_string_pretty(&doc).context("cannot serialize machines")
 }
 
@@ -382,29 +365,28 @@ mod tests {
     }
 
     #[test]
-    fn offered_entries_round_trip_as_offered_true() {
-        let entries = vec![Entry::offered("lap"), entry("srv", "me@srv")];
-        let text = serialize(&entries).unwrap();
-        assert_eq!(text.matches("offered = true").count(), 1, "{text}");
-        assert_eq!(text.matches("target").count(), 1, "{text}");
-        assert!(!text.contains("offered = false"), "{text}");
-        assert_eq!(parse(&text).unwrap(), entries);
-        assert_eq!(parse("[machine.lap]\noffered = true\n").unwrap(), vec![Entry::offered("lap")]);
-        let both = parse("[machine.m]\ntarget = \"m\"\noffered = true\n").unwrap_err();
-        assert!(format!("{both:#}").contains("both set"), "{both:#}");
-        assert!(parse("[machine.m]\noffered = false\n").is_err(), "neither");
+    fn an_old_offered_entry_fails_the_file_naming_it() {
+        for text in ["[machine.lap]\noffered = true\n", "[machine.srv]\ntarget = \"s\"\n\n[machine.lap]\ntarget = \"m\"\noffered = true\n"] {
+            let e = format!("{:#}", parse(text).unwrap_err());
+            assert!(e.contains("[machine.lap]: `offered = true`") && e.contains("delete the entry from the file by hand"), "{e}");
+        }
+        // Never written.
+        let text = serialize(&[entry("srv", "me@srv")]).unwrap();
+        assert!(!text.contains("offered"), "{text}");
+        assert!(parse("[machine.m]\noffered = false\n").is_err(), "no target");
+        let e = format!("{:#}", parse("[machine.m]\n").unwrap_err());
+        assert!(e.contains("[machine.m]: no `target`"), "{e}");
+    }
 
-        let lap = Entry::offered("lap");
-        assert_eq!((lap.target(), lap.label(), lap.is_offered()), (None, "offered", true));
-        assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("reached over its fleet link, not ssh"));
+    #[test]
+    fn kinds_on_the_wire() {
         assert_eq!(entry("srv", "me@srv").ssh_target().unwrap(), "me@srv");
-        assert_eq!(Kind::Offered.wire(), (MachineKind::Offered, None));
         assert_eq!(Kind::from_wire(MachineKind::Ssh, Some("t".into())).unwrap(), Kind::Ssh { target: "t".into() });
-        assert_eq!(Kind::from_wire(MachineKind::Offered, None).unwrap(), Kind::Offered);
         assert!(Kind::from_wire(MachineKind::Ssh, None).is_err());
+        assert!(serde_json::from_value::<MachineKind>(serde_json::json!("offered")).is_err(), "ssh | inbound only");
         assert_eq!(Kind::from_wire(MachineKind::Inbound, None).unwrap(), Kind::Inbound);
         let lap = Entry::inbound("lap", vec!["/f".into()]);
-        assert_eq!((lap.target(), lap.label(), lap.is_inbound(), lap.kind.wire()), (None, "inbound", true, (MachineKind::Inbound, None)));
+        assert_eq!((lap.target(), lap.label(), lap.kind == Kind::Inbound, lap.kind.wire()), (None, "inbound", true, (MachineKind::Inbound, None)));
         assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("links to this host from its end"));
     }
 

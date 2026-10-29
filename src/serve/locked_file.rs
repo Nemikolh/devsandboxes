@@ -1,5 +1,5 @@
 //! The daemon-owned TOML files' one write discipline (`machines.toml`,
-//! `forwards.toml`, `lend.toml`): two daemons can briefly overlap during a
+//! `forwards.toml`, `member.toml`): two daemons can briefly overlap during a
 //! handoff, so every write is a read-modify-write under an exclusive lock on
 //! the sibling `<stem>.lock` (separate from the file, which the write
 //! replaces), written to a temp file and renamed.

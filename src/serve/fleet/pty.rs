@@ -459,7 +459,7 @@ pub fn serve(
             if let Record::Error { code: c, message } = &rec
                 && c == code::DENIED
             {
-                log(&format!("fleet: refused a PTY stream from hub {}: {message}", peer.name));
+                log(&format!("fleet: refused a PTY stream from {}: {message}", peer.name));
             }
             let _ = rpc::write_record(&mut &link, &rec);
         }
@@ -485,7 +485,7 @@ fn start(
     let state = State::load_at(&files.state).map_err(|e| Record::error(code::FAILED, format!("{e:#}")))?;
     let (reach, warning) = Reach::load(files, peer.fleet_root.as_deref());
     if let Some(w) = warning {
-        log(&format!("fleet: a PTY stream from hub {}: {w}", peer.name));
+        log(&format!("fleet: a PTY stream from {}: {w}", peer.name));
     }
     let (name, instance) = gate(&h, &state, &reach)?;
     let tty = |argv: Vec<String>, note: Option<String>| {
@@ -526,7 +526,7 @@ fn start(
     let abandoned = || crate::serve::daemon::hung_up(link, Duration::ZERO);
     let (call, input) = helper.call_with_input(&instance.container, METHOD, params, Obj::new(), caller, &abandoned).map_err(|e| match e {
         CallError::NoBridge(_) | CallError::Unsupported(_) => refusal(e, name),
-        CallError::Abandoned => Record::error(code::FAILED, "the hub hung up while the attach queued"),
+        CallError::Abandoned => Record::error(code::FAILED, "the caller hung up while the attach queued"),
         CallError::Io(e) => Record::error(code::LOST, format!("cannot reach `{name}`'s helper: {e}")),
     })?;
     Ok(Started::Attach(call, input))
@@ -565,7 +565,7 @@ fn run_pipe(link: &Stream, mut child: Child) {
                 gone.store(true, Ordering::SeqCst);
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(std::io::Error::other("the hub hung up"));
+                break Err(std::io::Error::other("the caller hung up"));
             }
         };
         for drained in [out, err].into_iter().flatten() {
@@ -626,7 +626,7 @@ fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
                 gone.store(true, Ordering::SeqCst);
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(std::io::Error::other("the hub hung up"));
+                break Err(std::io::Error::other("the caller hung up"));
             }
         };
         // The child gone, its pty's last bytes, then the read's end.
@@ -969,7 +969,7 @@ mod tests {
         assert_eq!(gate(&h(&cfg, "bare"), &state, &r).unwrap().0, "bare", "no helper: `decide`'s to say");
         let pipe = |instance: &str| Header { mode: Mode::Pipe { argv: vec!["ls".into()], interactive: false }, ..h(&cfg, instance) };
         assert_eq!(gate(&pipe("bare"), &state, &r).unwrap().0, "bare", "a pipe needs no helper");
-        assert_eq!(code_of(gate(&pipe("own"), &state, &r)), code::NOT_FOUND, "but the same lending");
+        assert_eq!(code_of(gate(&pipe("own"), &state, &r)), code::NOT_FOUND, "but the same reach");
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
         let other = w.base.join("other");
         std::fs::create_dir_all(&other).unwrap();
         assert_eq!(refusal(header(base(other.to_str().unwrap()).with("instance", "own")), w.helper.clone()), code::DENIED);
-        assert!(logged("fleet: refused a PTY stream from hub me@hub"));
+        assert!(logged("fleet: refused a PTY stream from me@hub"));
         // An own root's instance is reached (its helper isn't running here).
         let mine = w.base.join("mine");
         std::fs::create_dir_all(&mine).unwrap();

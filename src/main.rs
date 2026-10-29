@@ -101,7 +101,7 @@ enum Command {
         reprobe: bool,
         #[arg(short, long, help = DETACH_HELP)]
         detach: bool,
-        /// Run on this host: never placed on a fleet worker (not with
+        /// Run on this host: never placed on another machine (not with
         /// `--machine` or a `<machine>/<sandbox>`)
         #[arg(long)]
         here: bool,
@@ -359,30 +359,18 @@ enum Command {
         #[arg(long, hide = true)]
         sentinel: bool,
     },
-    /// The far end of a fleet link over stdin/stdout
-    /// (docs/architecture/daemon/fleet.md): `--worker`/`--root`, the hub's
-    /// end of a lending worker's link (*Hub side*: offer the worker to this
-    /// host's daemon and carry its API); `--peer`, the dialed end of a link
-    /// a machine dialed to this one (*Peer links*)
+    /// The dialed end of a fleet link over stdin/stdout, a link a machine
+    /// dialed to this one (docs/architecture/daemon/fleet.md, *Peer links*)
     #[cfg(unix)]
     #[command(hide = true)]
     FleetLink {
-        /// The worker's machine name: names the socket and its offered entry
-        #[arg(long, requires = "root", required_unless_present = "peer")]
-        worker: Option<String>,
-        /// The worker's canonical fleet root: its offered entry's one root
-        #[arg(long, requires = "worker")]
-        root: Option<PathBuf>,
-        /// The worker's lending is `drain`: it takes no new work
-        #[arg(long, requires = "worker")]
-        drain: bool,
         /// The dialer's machine name: the link's inbound neighbor here,
         /// whose streams this host's trust table answers
-        #[arg(long, conflicts_with_all = ["worker", "root", "drain"])]
-        peer: Option<String>,
+        #[arg(long)]
+        peer: String,
     },
     /// Print the build this binary says in a fleet link's `Hello`
-    /// (docs/architecture/daemon/fleet.md, *Versions*): what a worker
+    /// (docs/architecture/daemon/fleet.md, *Versions*): what a member
     /// checks the hub's binary by
     #[cfg(unix)]
     #[command(hide = true)]
@@ -393,20 +381,6 @@ enum Command {
     Machine {
         #[command(subcommand)]
         cmd: MachineCommand,
-    },
-    /// Show or change whether this host lends itself to a fleet hub
-    /// (docs/architecture/daemon/fleet.md); `fleet join` picks the hub
-    #[cfg(unix)]
-    Lend {
-        #[command(subcommand)]
-        cmd: Option<LendCommand>,
-    },
-    /// Join or leave a fleet: lend this host to a hub as a worker
-    /// (docs/architecture/daemon/fleet.md)
-    #[cfg(unix)]
-    Fleet {
-        #[command(subcommand)]
-        cmd: FleetCommand,
     },
 }
 
@@ -533,39 +507,6 @@ enum RootsCommand {
     },
 }
 
-#[cfg(unix)]
-#[derive(Subcommand, Debug, PartialEq, Eq)]
-enum LendCommand {
-    /// The lending state, the hub, the name offered and the link (the default)
-    Show,
-    /// Lend to the hub `fleet join` set: offer this host and take new work
-    On,
-    /// Stop lending: the link to the hub goes down
-    Off,
-    /// Keep the link (what's placed here stays reachable), take no new work
-    Drain,
-}
-
-#[cfg(unix)]
-#[derive(Subcommand, Debug, PartialEq, Eq)]
-enum FleetCommand {
-    /// Lend this host to a hub: its daemon dials `ssh <hub> devsandbox fleet-link`
-    ///
-    ///     devsandbox fleet join me@hub
-    ///
-    ///     devsandbox fleet join ssh://me@hub:2200 --name lap
-    Join {
-        /// What ssh takes (`me@host`, an ssh-config alias) or `ssh://[user@]host[:port]`
-        hub: String,
-        /// The name this host offers itself under (default: the hostname's first label)
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Drain, wait until no instance the hub placed here runs, then stop lending
-    /// (Ctrl-C stops the wait and leaves it draining)
-    Leave,
-}
-
 /// `<thread>`: `<owner>/<key>` (owner: instance name or id) or the id `inbox ls` shows.
 type ThreadArg = commands::inbox::ThreadArg;
 
@@ -680,8 +621,8 @@ fn main() -> Result<()> {
         std::process::exit(2);
     };
 
-    // The five verbs and `service rebuild` (and `--machine m gc` on an
-    // offered fleet worker) go to the daemon
+    // The five verbs and `service rebuild` (and `--machine m gc`) go to
+    // the daemon
     // (docs/architecture/daemon/verbs.md, docs/reference/api.md *Verbs*); it runs
     // them as `--in-process` subprocesses, which take the arms below. With
     // no daemon to reach, `fallback` says why and they run here instead.
@@ -866,12 +807,7 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Command::Api { stdio: _, client, sentinel } => std::process::exit(serve::relay::stdio(&client, sentinel)?),
         #[cfg(unix)]
-        Command::FleetLink { peer: Some(peer), .. } => commands::fleet_link::fleet_link_peer(&peer),
-        Command::FleetLink { worker, root, drain, peer: None } => {
-            // Both required by clap without `--peer`.
-            let (Some(worker), Some(root)) = (worker, root) else { anyhow::bail!("fleet-link needs --peer, or --worker and --root") };
-            commands::fleet_link::fleet_link(&worker, &root, drain)
-        }
+        Command::FleetLink { peer } => commands::fleet_link::fleet_link_peer(&peer),
         #[cfg(unix)]
         Command::FleetHello => {
             println!("{}", serve::fleet::update::HELLO);
@@ -891,21 +827,6 @@ fn main() -> Result<()> {
                 Some(RootsCommand::Add { paths }) => commands::machine::RootsOp::Add(paths),
                 Some(RootsCommand::Rm { paths }) => commands::machine::RootsOp::Rm(paths),
             }),
-        },
-        #[cfg(unix)]
-        Command::Lend { cmd } => {
-            use serve::fleet::lend::State;
-            match cmd.unwrap_or(LendCommand::Show) {
-                LendCommand::Show => commands::lend::show(),
-                LendCommand::On => commands::lend::set_state(State::On),
-                LendCommand::Off => commands::lend::set_state(State::Off),
-                LendCommand::Drain => commands::lend::set_state(State::Drain),
-            }
-        }
-        #[cfg(unix)]
-        Command::Fleet { cmd } => match cmd {
-            FleetCommand::Join { hub, name } => commands::lend::join(&hub, name.as_deref()),
-            FleetCommand::Leave => commands::lend::leave(),
         },
     }
 }
@@ -936,10 +857,6 @@ mod tests {
     use clap::Parser;
 
     use super::{rm_branch_flag, Cli, Command};
-    #[cfg(unix)]
-    use super::{FleetCommand, LendCommand};
-    #[cfg(unix)]
-    use std::path::Path;
 
     fn rm_flag(args: &[&str]) -> Result<Option<bool>, clap::Error> {
         let cli = Cli::try_parse_from(["devsandbox", "rm", "web"].iter().chain(args))?;
@@ -962,45 +879,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn lend_and_fleet_parse() {
+    fn fleet_link_parses() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()));
-        let lend = |args: &[&str]| match parse(args).unwrap().command {
-            Some(Command::Lend { cmd }) => cmd,
-            _ => panic!("not lend"),
-        };
-        assert_eq!(lend(&["lend"]), None, "show by default");
-        assert_eq!(lend(&["lend", "show"]), Some(LendCommand::Show));
-        assert_eq!(lend(&["lend", "on"]), Some(LendCommand::On));
-        assert_eq!(lend(&["lend", "off"]), Some(LendCommand::Off));
-        assert_eq!(lend(&["lend", "drain"]), Some(LendCommand::Drain));
-        assert!(parse(&["lend", "maybe"]).is_err());
-        let fleet = |args: &[&str]| match parse(args).unwrap().command {
-            Some(Command::Fleet { cmd }) => cmd,
-            _ => panic!("not fleet"),
-        };
-        assert_eq!(fleet(&["fleet", "join", "me@hub"]), FleetCommand::Join { hub: "me@hub".into(), name: None });
-        assert_eq!(
-            fleet(&["fleet", "join", "ssh://me@hub:2200", "--name", "lap"]),
-            FleetCommand::Join { hub: "ssh://me@hub:2200".into(), name: Some("lap".into()) }
-        );
-        assert_eq!(fleet(&["fleet", "leave"]), FleetCommand::Leave);
-        assert!(parse(&["fleet", "join"]).is_err(), "a hub is required");
-        assert!(parse(&["fleet"]).is_err());
-        match parse(&["fleet-link", "--worker", "lap", "--root", "/d/fleet/hub", "--drain"]).unwrap().command {
-            Some(Command::FleetLink { worker, root, drain, peer: None }) => {
-                assert!(worker.as_deref() == Some("lap") && root.as_deref() == Some(Path::new("/d/fleet/hub")) && drain)
-            }
-            _ => panic!("not fleet-link"),
-        }
-        assert!(parse(&["fleet-link", "--worker", "lap"]).is_err(), "a root is required");
-        assert!(parse(&["fleet-link", "--root", "/r"]).is_err(), "a worker is required");
-        assert!(parse(&["fleet-link"]).is_err(), "a mode is required");
         match parse(&["fleet-link", "--peer", "lap"]).unwrap().command {
-            Some(Command::FleetLink { worker: None, root: None, drain: false, peer }) => assert_eq!(peer.as_deref(), Some("lap")),
+            Some(Command::FleetLink { peer }) => assert_eq!(peer, "lap"),
             _ => panic!("not fleet-link --peer"),
         }
-        for both in [&["fleet-link", "--peer", "lap", "--worker", "w", "--root", "/r"][..], &["fleet-link", "--peer", "lap", "--drain"]] {
-            assert!(parse(both).is_err(), "{both:?}: one mode");
+        assert!(parse(&["fleet-link"]).is_err(), "a peer is required");
+        for gone in [&["fleet-link", "--worker", "w", "--root", "/r"][..], &["lend"], &["fleet", "join", "me@hub"]] {
+            assert!(parse(gone).is_err(), "{gone:?}");
         }
         assert!(matches!(parse(&["fleet-hello"]).unwrap().command, Some(Command::FleetHello)));
     }

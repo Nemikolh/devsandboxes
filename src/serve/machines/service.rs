@@ -10,9 +10,8 @@
 //! `serve-machine-<name>-link` thread running the [`Hold`]
 //! (`fleet::dialer`: `fleet-link --peer <this host>` there through the
 //! transport, this end binding `fleet-<name>.*.sock` here), redialed after
-//! the backoff below whenever it ends; an offered machine's is its worker's
-//! `fleet-link --worker` here, an inbound neighbor's the `fleet-link --peer
-//! <it>` that announced it. Once the carrier
+//! the backoff below whenever it ends; an inbound neighbor's is the
+//! `fleet-link --peer <it>` that announced it. Once the carrier
 //! is up the link thread dials `fleet-<name>.sock` (the [`Dial`]) and says
 //! hello, subscribes to `instances`, watches each of the machine's roots
 //! while a local connection watches with `machines: true`
@@ -179,7 +178,7 @@ struct LinkThread {
 }
 
 /// The machine's link has a carrier of its own (an ssh machine): an
-/// offered worker's and an inbound neighbor's is a `fleet-link` here.
+/// inbound neighbor's is a `fleet-link` here.
 fn carried(entry: &Entry) -> bool {
     matches!(entry.kind, Kind::Ssh { .. })
 }
@@ -566,8 +565,8 @@ fn spawn_link(entry: Entry, inner: Arc<Inner>) -> LinkThread {
             .spawn(move || LinkLoop::new(entry, &inner, &ctl).run(&rx))
     };
     let thread = thread.map_err(|e| log(&format!("cannot start machine {}'s link: {e}", entry.name))).ok();
-    // An offered machine's carrier is its worker's `fleet-link` here, an
-    // inbound one's the `fleet-link --peer` that announced it.
+    // An inbound machine's carrier is the `fleet-link --peer` that
+    // announced it.
     let carrier = carried(&entry).then(|| {
         let (entry, ctl, tx) = (entry.clone(), Arc::clone(&ctl), tx.clone());
         std::thread::Builder::new()
@@ -915,6 +914,7 @@ mod tests {
 
     use super::*;
     use crate::serve::daemon::tests::opts;
+    use crate::serve::machines::inbound;
     use crate::serve::machines::ssh::Duplex;
     use crate::serve::snapshots::Machine;
 
@@ -1097,33 +1097,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ---- offered machines and a hub -----------------------------------------
+    // ---- inbound machines and a hub -----------------------------------------
 
     static HUB_LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    /// Offered worker `w` and ssh machine `s`, nobody watching; `w`'s
-    /// fleet-link socket is "up" while the flag says so (a [`mute_peer`]),
-    /// else its dial fails as `fleet::dialer::dial`'s does; `s`'s carrier
-    /// always fails. Dials and carrier runs by name.
+    /// Inbound neighbor `w` (announced: the returned guard) and ssh machine
+    /// `s`, nobody watching; `w`'s fleet-link socket is "up" while the flag
+    /// says so (a [`mute_peer`]), else its dial fails as
+    /// `fleet::dialer::dial`'s does; `s`'s carrier always fails. Dials and
+    /// carrier runs by name.
     #[allow(clippy::type_complexity)]
-    fn offered_and_ssh(
+    fn inbound_and_ssh(
         base: &Path,
         hub: Option<Hub>,
         log: fn(&str),
-    ) -> (Machines, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    ) -> (Machines, inbound::Guard, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
         let registry = base.join("machines.toml");
-        crate::serve::machines::update(&registry, |e| {
-            e.push(Entry { agent: true, ..Entry::offered("w") });
-            e.push(Entry::ssh("s", "me@s"));
-        })
-        .unwrap();
+        crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("s", "me@s"))).unwrap();
+        let neighbors: Arc<inbound::Neighbors> = Arc::default();
+        let guard = neighbors.announce("w", "0.6.0 abc dev x/y member", false);
         let up = Arc::new(AtomicBool::new(false));
         let dials = Arc::new(Mutex::new(Vec::new()));
         let dial: Dial = {
             let (up, dials) = (Arc::clone(&up), Arc::clone(&dials));
             Arc::new(move |e: &Entry| {
                 dials.lock().unwrap().push(e.name.clone());
-                if e.is_offered() && up.load(Ordering::SeqCst) {
+                if e.kind == Kind::Inbound && up.load(Ordering::SeqCst) {
                     return Ok(mute_peer());
                 }
                 anyhow::bail!("its link isn't up (fleet-{}.sock: No such file or directory)", e.name)
@@ -1131,28 +1130,28 @@ mod tests {
         };
         let runs = Arc::new(Mutex::new(Vec::new()));
         let hold = fake_hold(&Arc::new(AtomicBool::new(false)), &runs);
-        let machines = Machines::spawn(registry, Arc::default(), dial, hold, opts(1, 0).machine_timing, no_hooks(), hub, log);
-        (machines, up, dials, runs)
+        let machines = Machines::spawn(registry, neighbors, dial, hold, opts(1, 0).machine_timing, no_hooks(), hub, log);
+        (machines, guard, up, dials, runs)
     }
 
-    /// Every link is held with no watcher: an offered one retries an absent
-    /// worker (logging that once) and connects when it comes, with no
+    /// Every link is held with no watcher: an inbound one retries an absent
+    /// socket (logging that once) and connects when it comes, with no
     /// carrier of its own; an ssh one runs its carrier, never dialing its
     /// socket while that's down.
     #[test]
     fn every_link_is_held() {
         let base = short_scratch("held");
-        let (machines, up, dials, runs) = offered_and_ssh(&base, None, |l| HUB_LOGGED.lock().unwrap().push(l.into()));
+        let (machines, _w, up, dials, runs) = inbound_and_ssh(&base, None, |l| HUB_LOGGED.lock().unwrap().push(l.into()));
         let h = machines.handle();
-        wait_for("the offered link retrying", Duration::from_secs(5), || ran(&dials, "w") >= 3);
+        wait_for("the inbound link retrying", Duration::from_secs(5), || ran(&dials, "w") >= 3);
         assert_eq!(h.remotes().get("w").unwrap().state, LinkState::Unreachable);
         let logged: Vec<_> = HUB_LOGGED.lock().unwrap().iter().filter(|l| l.starts_with("machine w: ")).cloned().collect();
         assert_eq!(logged.len(), 1, "one line for one way of failing: {logged:?}");
         assert!(logged[0].contains("its link isn't up"), "{}", logged[0]);
 
         up.store(true, Ordering::SeqCst);
-        wait_for("the offered link up", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
-        assert_eq!(ran(&runs, "w"), 0, "no carrier for an offered machine");
+        wait_for("the inbound link up", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        assert_eq!(ran(&runs, "w"), 0, "no carrier for an inbound machine");
         assert!(ran(&runs, "s") >= 1, "the ssh machine's carrier runs");
         assert_eq!(ran(&dials, "s"), 0, "nothing dialed over a down carrier");
         assert_eq!(h.remotes().get("s").unwrap().state, LinkState::Unreachable);
@@ -1176,7 +1175,7 @@ mod tests {
         };
         saved::save(&path, &saved::of(&[row("s"), row("gone")], 0)).unwrap();
         let hub = Hub { remotes: path.clone() };
-        let (machines, up, _, runs) = offered_and_ssh(&base, Some(hub), |_| {});
+        let (machines, _w, up, _, runs) = inbound_and_ssh(&base, Some(hub), |_| {});
         let h = machines.handle();
         assert!(h.remotes().get("gone").is_none(), "not registered: dropped");
         let s = h.remotes().get("s").unwrap();

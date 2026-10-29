@@ -1611,7 +1611,7 @@ mod tests {
         Ok(())
     }
 
-    /// A config under a fleet root (`<data>/devsandbox/fleet/<hub>/`, here or
+    /// A config under a fleet root (`<data>/devsandbox/fleet/<peer>/`, here or
     /// through a symlink) asking for `privileged` is refused by `run` before
     /// any runtime call: the child has no runtime on its `PATH`, so a call
     /// would fail with another error, and nothing is recorded. Allowed in
@@ -1637,7 +1637,7 @@ mod tests {
         .unwrap();
         let link = root.join("link");
         std::os::unix::fs::symlink(&cfg, &link).unwrap();
-        let want = "refused by this machine's lending policy: privileged \
+        let want = "refused by this machine's worker policy: privileged \
                     (allow with privileged = true under [allow] in member.toml)";
         for dir in [&cfg, &link] {
             let err = run(dir, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
@@ -1680,7 +1680,7 @@ mod tests {
 
         std::fs::write(data.join("member.toml"), "[allow]\nprivileged = true\n").unwrap();
         let err = run(&cfg, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
-        assert!(!format!("{err:#}").contains("lending policy"), "{err:#}");
+        assert!(!format!("{err:#}").contains("worker policy"), "{err:#}");
     }
 
     /// The child's root when this process is [`isolated`]'s child for `test`.

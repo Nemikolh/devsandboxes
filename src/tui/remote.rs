@@ -372,7 +372,7 @@ pub(crate) mod tests {
         assert_eq!(candidates(&s, Kind::Instance), ["web", "box/web", "box/api", "db"]);
     }
 
-    /// Every machine's tabs, ssh or offered, run this host's devsandbox on
+    /// Every machine's tabs, ssh or inbound, run this host's devsandbox on
     /// the qualified name: its `exec` goes over the machine's link.
     #[test]
     fn terminal_argvs_run_the_local_cli_on_the_qualified_name() {
@@ -387,7 +387,7 @@ pub(crate) mod tests {
         let mut ssh = sm("box", LinkState::Connected);
         ssh.target = Some("ssh://me@box:2222".into());
         ssh.command = Some("~/bin/devsandbox".into());
-        let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Offered, target: None, ..sm("lap", LinkState::Connected) };
+        let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..sm("lap", LinkState::Connected) };
         for (m, w) in [(&ssh, "box/w"), (&lap, "lap/w")] {
             assert_eq!(exec_argv(m, "w", &[], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", w]);
             assert_eq!(exec_argv(m, "w", &["ls".into()], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", w, "ls"]);

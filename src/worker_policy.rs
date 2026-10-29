@@ -1,12 +1,12 @@
 //! The worker policy (docs/architecture/daemon/fleet.md, *Worker policy*):
-//! what a config under a fleet root (`<data>/devsandbox/fleet/<hub>/`, the
-//! root a hub reaches on a lending host) may ask of this host, beyond
-//! containers that see only what was lent. Denied by default; each item has
+//! what a config under a fleet root (`<data>/devsandbox/fleet/<peer>/`, the
+//! root a link peer reaches on this host) may ask of this host, beyond
+//! containers that see only what was placed there. Denied by default; each item has
 //! an allowance in `member.toml`'s `[allow]` table ([`Allow`]); none of it
 //! applies under `trust = "full"` ([`Trust`]).
 //!
 //! A config is under the policy by its path, whatever process runs it (a
-//! lending daemon's verb subprocess, a local CLI pointed at the dir): every
+//! daemon's verb subprocess for a peer, a local CLI pointed at the dir): every
 //! entry point calls [`Policy::for_dir`] itself, so there is no flag to
 //! forget. The authority is the check of the final runtime argv
 //! ([`Policy::check_run`], [`Policy::check_build`]) right before it runs, so
@@ -131,7 +131,7 @@ impl Refusal {
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "refused by this machine's lending policy: {}", self.what)?;
+        write!(f, "refused by this machine's worker policy: {}", self.what)?;
         match &self.allow {
             Some(allow) => write!(f, " (allow with {allow} under [allow] in member.toml)"),
             None => write!(f, " (no member.toml allowance permits it)"),
@@ -144,7 +144,7 @@ impl std::error::Error for Refusal {}
 /// The policy over one fleet root.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// The canonical fleet root (`<data>/devsandbox/fleet/<hub>`), or the
+    /// The canonical fleet root (`<data>/devsandbox/fleet/<peer>`), or the
     /// fleet dir itself for a config placed directly in it.
     pub root: PathBuf,
     /// The canonical `<data>/devsandbox`: where devsandbox's own seccomp
@@ -767,8 +767,7 @@ mod tests {
         let (data2, _, outside2) = fixture("detect-none");
         std::fs::remove_dir_all(data2.join("fleet")).unwrap();
         assert_eq!(fleet_root_of(&data2, &outside2).unwrap(), None);
-        // `detect` reads `[allow]` off member.toml next to it, not lend.toml.
-        std::fs::write(data.join("lend.toml"), "[allow]\nhost-network = true\n").unwrap();
+        // `detect` reads `[allow]` off member.toml next to it.
         std::fs::write(data.join("member.toml"), "name = \"lap\"\n[allow]\nprivileged = true\n").unwrap();
         let p = Policy::detect(&data, &cfg, Vec::new()).unwrap().unwrap();
         assert!(p.allow.privileged && !p.allow.host_network);
@@ -810,7 +809,7 @@ mod tests {
         let r = Refusal::new("privileged", "privileged = true");
         assert_eq!(
             r.to_string(),
-            "refused by this machine's lending policy: privileged (allow with privileged = true under [allow] in member.toml)"
+            "refused by this machine's worker policy: privileged (allow with privileged = true under [allow] in member.toml)"
         );
         assert!(Refusal::always("runtime flag `--cap-add`").to_string().ends_with("(no member.toml allowance permits it)"));
     }

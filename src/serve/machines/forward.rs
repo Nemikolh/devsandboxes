@@ -529,17 +529,17 @@ mod tests {
             remote.home = Some(base.join("remote-home"));
             remote.machines = Some(base.join("remote-machines.toml"));
             // `full`: the verbs' scratch dir is no root of the machine's.
-            remote.lend = Some(base.join("remote-data/lend.toml"));
+            remote.member = Some(base.join("remote-data/member.toml"));
             std::fs::write(base.join("remote-data/member.toml"), "trust = \"full\"\n").unwrap();
             let mut local = opts(1, 300);
             local.state = Some(local_state);
             local.machines = Some(registry);
-            local.lend = Some(base.join("local-data/lend.toml"));
+            local.member = Some(base.join("local-data/member.toml"));
             std::fs::write(base.join("local-data/member.toml"), "name = \"lap\"\n").unwrap();
             // `box` is the remote daemon over a peer link; `down` has no route.
             let (peer, _) = crate::serve::fleet::dialer::tests::peer_transport(&remote_dir);
             local.link_transport = Some(crate::serve::fleet::transport::Transport::new(move |target, args| match target {
-                "me@box" => peer.dial(target, args),
+                "me@box" => peer.dial(target, "devsandbox", args),
                 other => anyhow::bail!("ssh: Could not resolve hostname {}", other.trim_start_matches("me@")),
             }));
             let daemons = vec![spawn_daemon(&remote_dir, remote), spawn_daemon(&base.join("local"), local)];
@@ -557,13 +557,15 @@ mod tests {
             self.base.join("local")
         }
 
-        fn finish(self) {
+        fn finish(mut self) {
             let r = conn_at(&self.remote_dir).call("shutdown", json!({})).unwrap();
             assert!(r.error.is_none(), "{r:?}");
+            // A registered machine's link holds the local daemon up.
+            assert!(self.local.call("shutdown", json!({})).unwrap().error.is_none());
             drop(self.local);
             let mut daemons = self.daemons.into_iter();
             assert_eq!(daemons.next().unwrap().join().unwrap().unwrap(), Exit::Shutdown);
-            assert_eq!(daemons.next().unwrap().join().unwrap().unwrap(), Exit::Idle);
+            assert_eq!(daemons.next().unwrap().join().unwrap().unwrap(), Exit::Shutdown);
             let _ = std::fs::remove_dir_all(&self.base);
             let _ = std::fs::remove_dir_all(&self.verb_dir);
         }

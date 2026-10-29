@@ -124,13 +124,15 @@ The daemon exits `IDLE_TIMEOUT` (10 min) after its last holder left
   included);
 - `verbs`: verb subprocesses not reaped (detached and adopted ones too)
   plus verbs forwarded to a machine while their ssh runs;
-- `autostart`: the startup pass while it runs.
-
-`followers` exists in the struct but nothing sets it. A machine link is
-not a holder. `--keep-alive` or `[serve] keep-alive = true` in
+- `autostart`: the startup pass while it runs;
+- `links`: the links this host dials, one per registered machine
+  (`Kind::Ssh` entries of `machines::service::Handle::entries`): a
+  member's daemon stays up while it's in a fleet, or its machines would
+  lose it as an inbound neighbor. A machine dialing this host holds it
+  through its `fleet-link`'s `links.inbound` connection (`clients`). `--keep-alive` or `[serve] keep-alive = true` in
 `daemon.config.toml` (read once at start; a bad file is logged, defaults
-used) disables the idle exit, as do `[serve] hub = true` (a
-[fleet hub](fleet.md#hub-mode)) and lending to a hub.
+used) disables the idle exit, as does `[serve] hub = true` (a
+[fleet hub](fleet.md#hub-mode)).
 
 ## Drain
 

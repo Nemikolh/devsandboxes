@@ -98,8 +98,7 @@ pub struct Options {
     /// ([`crate::daemon_config`]), resolved once by [`serve`].
     pub keep_alive: bool,
     /// A fleet hub: `[serve] hub = true` ([`crate::daemon_config`]), resolved
-    /// once by [`serve`]. Only a hub accepts `fleet.offer`; a hub never idles
-    /// out (keep-alive), saves the machines' rows in `remotes`
+    /// once by [`serve`]. A hub never idles out (keep-alive), saves the machines' rows in `remotes`
     /// (`service::Hub`), and its machines' links say it's the hub (they
     /// follow its build, `fleet::dialer`).
     pub hub: bool,
@@ -143,31 +142,27 @@ pub struct Options {
     /// How `helper.call` reaches containers; `None` is the host side's
     /// bridges (none without one). Tests pass a client over fake links.
     pub helper: Option<helper::HelperClient>,
-    /// `lend.toml`, read at start (lending `on`/`drain` starts the lending
-    /// thread, `fleet::worker`) and written by `lend.set`
-    /// (`fleet::lender`); its dir holds the fleet roots and `member.toml`
-    /// (`fleet::member`). `None` is the default ([`fleet::lend::path`],
-    /// [`fleet::member::path`]). Tests point it at their own file.
-    pub lend: Option<PathBuf>,
-    /// How the lending thread reaches its hub; `None` is ssh. Tests link an
-    /// in-process hub.
-    pub lend_transport: Option<fleet::transport::Transport>,
-    /// How the lending thread and the ssh machines' links follow a hub's
-    /// version; `None` is the release download and a forced handoff on this
-    /// daemon's socket (`fleet::update::Release`). Tests fake it.
-    pub lend_update: Option<Arc<dyn fleet::update::Steps>>,
-    /// The env a hub's verbs run with; `None` is this process's.
-    pub lend_env: Option<BTreeMap<String, String>>,
-    /// This host's capacity before its lend state and caps (which come
-    /// from `lend.toml` and `member.toml` either way), as `capacity.get` and a placed `run`
+    /// `member.toml` (`fleet::member`), for `member.*`, the trust table and
+    /// the capacity's caps; its dir (the data dir) holds the peers' fleet
+    /// roots. `None` is the default ([`fleet::member::path`]). Tests point
+    /// it at their own file.
+    pub member: Option<PathBuf>,
+    /// How the ssh machines' links follow a hub's version; `None` is the
+    /// release download and a forced handoff on this daemon's socket
+    /// (`fleet::update::Release`). Tests fake it.
+    pub update_steps: Option<Arc<dyn fleet::update::Steps>>,
+    /// The env a fleet peer's verbs run with; `None` is this process's.
+    pub peer_env: Option<BTreeMap<String, String>>,
+    /// This host's capacity before its caps (which come from
+    /// `member.toml` either way), as `capacity.get` and a placed `run`
     /// read it; `None` is `capacity::HostCapacity` (the runtime's cached
     /// `info`, `HostFacts`, the poll's running count). Tests inject one.
     pub local_capacity: Option<LocalCapacity>,
     /// The hub's repo caches a placed `run` fetches into; `None` is
     /// `fleet::code::repos_dir`. Tests point it at a scratch dir.
     pub repos: Option<PathBuf>,
-    /// The agent `fleet.agent` answers an offered worker's `fleet-link`
-    /// with; `None` is `bridge::host_agent`. Tests inject one.
+    /// The agent a machine's `AGENT` streams reach while its entry has
+    /// `agent` on; `None` is `bridge::host_agent`. Tests inject one.
     pub host_agent: Option<HostAgent>,
     /// The argv a peer's `PTY` stream runs for a piped or tty exec; `None`
     /// is the runtime's `exec` (`fleet::pty::runtime_exec`). Tests run `sh`.
@@ -199,10 +194,9 @@ impl Options {
             link_transport: None,
             machine_timing: service::Timing::default(),
             helper: None,
-            lend: None,
-            lend_transport: None,
-            lend_update: None,
-            lend_env: None,
+            member: None,
+            update_steps: None,
+            peer_env: None,
             local_capacity: None,
             repos: None,
             host_agent: None,
@@ -288,12 +282,17 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     shared.socket_dir = dir.to_path_buf();
     shared.local_capacity = opts.local_capacity.clone();
     shared.repos = opts.repos.clone();
-    shared.peer_env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
+    shared.peer_env = opts.peer_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
+    match member_path(opts) {
+        Ok(path) => shared.member = Some(path),
+        Err(e) => log(&format!("warning: no member.toml (no peer is served, `member.*` fails): {e:#}")),
+    }
+    shared.hostname = link::hostname();
     let registry_path = match &opts.machines {
         Some(path) => path.clone(),
         None => machines::path()?,
     };
-    // Every machine, ssh or offered, is dialed at its link's socket here;
+    // Every machine, ssh or inbound, is dialed at its link's socket here;
     // only `machines.probe`/`.add` ssh to a target (tests inject that part).
     let dial = fleet::dialer::dial(dir.to_path_buf());
     let probe = opts.probe.clone().unwrap_or_else(|| ssh::probe_dial(link::client_name()));
@@ -366,14 +365,13 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         // Configured `forwardPorts` follow the running containers.
         let sync = registry.as_ref().map(Registry::handle);
         let observers = {
-            let (watching, publishing, lending) = (Arc::clone(&shared), Arc::clone(&shared), Arc::clone(&shared));
+            let (watching, publishing, owning) = (Arc::clone(&shared), Arc::clone(&shared), Arc::clone(&shared));
             Observers {
                 watched: Box::new(move || watching.watched_roots()),
                 cache: Arc::clone(&shared.snapshots),
                 join: Arc::clone(&shared.join),
                 on_snapshot: Box::new(move |dir, params| publishing.publish_snapshot(dir, params)),
-                // The lender exists once lending started, just after the host.
-                own: Box::new(move || lending.lender.get().map(|l| l.own()).unwrap_or_default()),
+                own: Box::new(move || owning.own()),
                 capacity: Arc::clone(&shared.host_capacity),
             }
         };
@@ -396,7 +394,6 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let _ = shared.helper.set(client);
     }
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
-    start_lending(dir, opts, &shared);
     let exit = loop {
         if let Some(exit) = *shared.stop.lock().unwrap() {
             break exit;
@@ -410,9 +407,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             *shared.idle_since.lock().unwrap() = now;
         }
         let idle_since = *shared.idle_since.lock().unwrap();
-        // A hub holds its workers' links, a lending daemon its link to the
-        // hub: neither idles out.
-        let keep_alive = opts.keep_alive || opts.hub || shared.lender.get().is_some_and(|l| l.lends());
+        // A hub holds its members' links: it never idles out.
+        let keep_alive = opts.keep_alive || opts.hub;
         if idle::decide(&holders, idle_since, now, keep_alive, opts.idle_timeout) == Decision::Exit {
             break Exit::Idle;
         }
@@ -439,10 +435,6 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         _ => "idle",
     });
     shared.drain(DRAIN_TIMEOUT);
-    // After the drain: the hub's connections answer over the link.
-    if let Some(lender) = shared.lender.get() {
-        lender.stop();
-    }
     drop(watcher);
     // The machine links close (their ssh killed) after the connections whose
     // forwarded calls they may still answer.
@@ -457,24 +449,23 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     Ok(exit)
 }
 
-/// `lend.toml` and `member.toml` (next to it): [`Options::lend`]'s, else
-/// the data dir's.
-fn lend_paths(opts: &Options) -> Result<(PathBuf, PathBuf)> {
-    match &opts.lend {
-        Some(path) => Ok((path.clone(), path.with_file_name("member.toml"))),
-        None => fleet::lend::path().and_then(|lend| Ok((lend, fleet::member::path()?))),
+/// `member.toml`: [`Options::member`], else the data dir's.
+fn member_path(opts: &Options) -> Result<PathBuf> {
+    match &opts.member {
+        Some(path) => Ok(path.clone()),
+        None => fleet::member::path(),
     }
 }
 
-/// How this host follows a hub's build (the lending thread, the ssh
-/// machines' links): [`Options::lend_update`]'s steps, dev builds as
-/// `member` (`member.toml`) says at each `Hello`.
-fn follow_hub(dir: &Path, opts: &Options, member: PathBuf) -> fleet::worker::Follow {
+/// How this host follows a hub's build (the ssh machines' links):
+/// [`Options::update_steps`], dev builds as `member` (`member.toml`) says
+/// at each `Hello`.
+fn follow_hub(dir: &Path, opts: &Options, member: PathBuf) -> fleet::follow::Follow {
     let steps = opts
-        .lend_update
+        .update_steps
         .clone()
         .unwrap_or_else(|| Arc::new(fleet::update::Release { socket_dir: dir.to_path_buf() }));
-    fleet::worker::Follow {
+    fleet::follow::Follow {
         steps,
         dev_builds: Arc::new(move || fleet::member::load(&member).ok().flatten().is_some_and(|m| m.takes_dev_builds())),
     }
@@ -487,7 +478,7 @@ fn follow_hub(dir: &Path, opts: &Options, member: PathBuf) -> fleet::worker::Fol
 /// fleet root `fleet/<entry name>/` under the data dir and the daemon's env
 /// (decision 24 of the fleet plan). Without a data dir no stream is served.
 fn machine_dialer(dir: &Path, opts: &Options, hooked: &Arc<OnceLock<std::sync::Weak<Shared>>>) -> service::Hold {
-    let member = lend_paths(opts).map(|(_, member)| member);
+    let member = member_path(opts);
     let data = member.as_ref().ok().and_then(|m| m.parent()).map(Path::to_path_buf);
     let follow = follow_hub(dir, opts, member.as_ref().cloned().unwrap_or_default());
     let hostname = link::hostname();
@@ -517,51 +508,6 @@ fn machine_dialer(dir: &Path, opts: &Options, hooked: &Arc<OnceLock<std::sync::W
         log,
     };
     Arc::new(move |entry, held| dialer.hold(entry, held))
-}
-
-/// The daemon's lending (`fleet::lender`): lend as `lend.toml` says now,
-/// and follow each `lend.set`. A lending thread's fleet root is created,
-/// and each `API`, `PTY` and `TUNNEL` stream from the hub is served as a
-/// `link.attach` channel's ([`Shared::open_lent`], [`Shared::serve_channel`]).
-/// Without a `lend.toml` path (no data dir) it's
-/// logged and `lend.*` and `member.*` fail.
-fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
-    let (path, member_path) = match lend_paths(opts) {
-        Ok(paths) => paths,
-        Err(e) => {
-            log(&format!("warning: not lending: {e:#}"));
-            return;
-        }
-    };
-    let env = shared.peer_env.clone();
-    let transport = opts.lend_transport.clone().unwrap_or_else(fleet::transport::Transport::ssh);
-    let timing = opts.machine_timing;
-    let follow = follow_hub(dir, opts, member_path.clone());
-    // Weak: the lender lives in `shared`.
-    let weak = Arc::downgrade(shared);
-    // Where each link's agent socket goes (`fleet::agent::socket`).
-    let socket_dir = dir.to_path_buf();
-    let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
-        let scope = Arc::new(lent::Peer { name: start.hub.clone(), fleet_root: Some(start.root.clone()), env: Some(env.clone()), agent: None });
-        let open = |channel: lent::Channel| -> fleet::worker::Open {
-            let (weak, scope) = (weak.clone(), Arc::clone(&scope));
-            Arc::new(move || weak.upgrade()?.open_lent(channel, &scope))
-        };
-        use crate::devsbd::proto::channel;
-        let opens = vec![
-            (fleet::LINK.channel, open(lent::Channel::Api)),
-            (channel::PTY, open(lent::Channel::Pty)),
-            (channel::TUNNEL, open(lent::Channel::Tunnel)),
-        ];
-        // What the hub may send this worker: config roots and their repos,
-        // into the fleet root (`fleet::code`); the hub's binary the lending
-        // thread takes itself.
-        let receivers = fleet::code::receivers(&start.root, fleet::transfer::Receivers::new(log));
-        let agent_dir = Some(socket_dir.clone());
-        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), opens, receivers, agent_dir, follow.clone(), timing, log)
-    });
-    let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, member_path, link::hostname(), spawn, log));
-    lender.start();
 }
 
 /// Take the start lock, or `None` when a live daemon (one answering on the
@@ -605,8 +551,8 @@ struct Shared {
     state: PathBuf,
     /// Live connections. Its size is the `clients` holder count.
     conns: Mutex<HashMap<u64, ConnEntry>>,
-    /// The last connection id handed out: the listener's and the lending
-    /// link's connections share it.
+    /// The last connection id handed out: the listener's and the machine
+    /// links' connections share it.
     next_conn: AtomicU64,
     /// Inbox changes this daemon has seen: the `generation` of
     /// `inbox.changed`.
@@ -642,7 +588,7 @@ struct Shared {
     join: Join,
     /// What `roots.list` reads `~` as.
     home: Option<PathBuf>,
-    /// [`Options::hub`]: `fleet.offer` is accepted.
+    /// [`Options::hub`].
     hub: bool,
     /// The `machines.*` methods' registry and dial, and the machine links;
     /// unset only in tests that build a bare `Shared` (the methods are then
@@ -651,11 +597,13 @@ struct Shared {
     /// Each watched root's last local `instances.snapshot` params (the poll's,
     /// or a new watch's disk one): what a machine's push is merged with.
     locals: Mutex<BTreeMap<PathBuf, Arc<Value>>>,
-    /// `lend.toml`, `member.toml` and the lending thread, for `lend.*` and
-    /// `member.*`; unset without a
+    /// `member.toml` ([`Options::member`]), for `member.*`, the trust table
+    /// and the capacity's caps; its dir is the data dir. `None` without a
     /// data dir and in tests that build a bare `Shared`.
-    lender: OnceLock<fleet::lender::Lender>,
-    /// The socket dir: a worker's `fleet-<name>.transfer.sock` is here.
+    member: Option<PathBuf>,
+    /// What names this host when `member.toml` doesn't.
+    hostname: String,
+    /// The socket dir: a machine's `fleet-<name>.transfer.sock` is here.
     socket_dir: PathBuf,
     /// [`Options::local_capacity`].
     local_capacity: Option<LocalCapacity>,
@@ -668,9 +616,9 @@ struct Shared {
     host_capacity: Arc<super::capacity::HostCapacity>,
     /// [`Options::repos`].
     repos: Option<PathBuf>,
-    /// The env a fleet peer's verbs run with ([`Options::lend_env`], else
-    /// this process's): `lent::Peer::env` of a lending link and of a
-    /// `link.attach {channel}`.
+    /// The env a fleet peer's verbs run with ([`Options::peer_env`], else
+    /// this process's): `lent::Peer::env` of a machine's link streams and
+    /// of a `link.attach {channel}`.
     peer_env: BTreeMap<String, String>,
     /// Channel streams being served ([`Shared::serve_channel`]'s `PTY`,
     /// `TUNNEL`, `TRANSFER` and `AGENT` threads): counted with the
@@ -703,7 +651,8 @@ impl Shared {
             hub: false,
             machines: None,
             locals: Mutex::default(),
-            lender: OnceLock::new(),
+            member: None,
+            hostname: String::new(),
             socket_dir: PathBuf::new(),
             local_capacity: None,
             host_agent: Arc::new(crate::devsbd::bridge::host_agent),
@@ -717,16 +666,24 @@ impl Shared {
 
     /// This host's capacity now (`capacity.get`, a placed `run`'s own
     /// candidate): [`Options::local_capacity`] or the [`HostCapacity`]
-    /// report, with `lend.toml`'s state and `member.toml`'s caps.
+    /// report, with `member.toml`'s caps.
     ///
     /// [`HostCapacity`]: super::capacity::HostCapacity
     fn capacity(&self) -> super::capacity::Capacity {
-        let own = self.lender.get().map(|l| l.own()).unwrap_or_default();
+        let own = self.own();
         let base = match &self.local_capacity {
             Some(f) => f(),
             None => self.host_capacity.report(&own),
         };
         base.with_own(&own)
+    }
+
+    /// What the capacity report carries of this host's own files:
+    /// `member.toml`'s `[caps]` (none while it's missing or doesn't parse).
+    /// Read each time, so a hand edit shows on the next poll.
+    fn own(&self) -> super::capacity::Own {
+        let member = self.member.as_deref().and_then(|p| fleet::member::load(p).ok().flatten());
+        super::capacity::Own { caps: member.map(|m| m.caps).unwrap_or_default() }
     }
 
     fn links(&self) -> Option<&service::Handle> {
@@ -742,11 +699,13 @@ impl Shared {
         let clients = self.conns.lock().unwrap().len() + self.channels.load(Ordering::SeqCst);
         let forwards = registry.map_or(0, Registry::active);
         let verbs = self.verbs.len() + self.remote_verbs.load(Ordering::SeqCst);
-        let Some(host) = host else { return Holders { clients, forwards, verbs, ..Default::default() } };
+        let links = self.links().map_or(0, |l| l.entries().iter().filter(|e| matches!(e.kind, machines::Kind::Ssh { .. })).count());
+        let Some(host) = host else { return Holders { clients, forwards, verbs, links, ..Default::default() } };
         Holders {
             clients,
             forwards,
             verbs,
+            links,
             live_instances: host.live_instances(),
             control: host.control(),
             autostart: host.autostarting(),
@@ -767,7 +726,7 @@ impl Shared {
     fn reach_files(&self) -> lent::Files {
         lent::Files {
             state: self.state.clone(),
-            member: self.lender.get().map(|l| l.member_path().to_path_buf()),
+            member: self.member.clone(),
             home: self.home.clone(),
         }
     }
@@ -775,12 +734,11 @@ impl Shared {
     /// The data dir a fleet peer's root goes under (`lent::peer_fleet_root`):
     /// `member.toml`'s; `None` without one.
     fn data_dir(&self) -> Option<&Path> {
-        self.lender.get()?.member_path().parent()
+        self.member.as_deref()?.parent()
     }
 
-    /// One stream of the lending link, or of an ssh machine's link
-    /// (`fleet::dialer`), on `channel`: a socket pair whose one end goes to
-    /// the hub (the machine), the other [`serve_channel`](Self::serve_channel)'s
+    /// One stream of an ssh machine's link (`fleet::dialer`), on
+    /// `channel`: a socket pair whose one end goes to the machine, the other [`serve_channel`](Self::serve_channel)'s
     /// with `scope`. An `API` stream's first byte is the daemon's, as on a
     /// `link.attach` connection (fleet plan decision 27). `None` when
     /// refused.
@@ -791,8 +749,8 @@ impl Shared {
 
     /// Serve `stream` as one `channel` stream of `peer`'s, under this
     /// host's trust table for it: a `link.attach {channel}` connection's
-    /// (handed off once answered) and the lending link's ([`open_lent`](Self::open_lent)).
-    /// Quick (the lending link calls it on its mux's read thread): every
+    /// (handed off once answered) and a machine link's ([`open_lent`](Self::open_lent)).
+    /// Quick (a machine link calls it on its mux's read thread): every
     /// channel but `api` runs on a thread of its own, counted as a holder.
     ///
     /// - `api`: a `Peer` connection ([`Table::Peer`]: every request
@@ -1314,7 +1272,7 @@ struct Handoff {
 enum Table {
     /// A local client: the whole API.
     Full,
-    /// A remote caller (a fleet hub over the lending link, or a relay
+    /// A remote caller (a machine over its link, or a `fleet-link`
     /// connection after its `link.attach`): the trust table (`fleet::lent`).
     Peer(Arc<lent::Peer>),
 }
@@ -1421,10 +1379,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             if let Some(w) = warning {
                 log(&format!("{}: {w}", conn.label()));
             }
-            // `drain` is the one hard no: read live from the lending thread.
-            let draining = shared.lender.get().is_some_and(|l| l.draining());
-            let admitted = lent::refuse_new_work(&req.method, peer, draining)
-                .and_then(|()| lent::admit(&req.method, std::mem::take(&mut req.params), peer, &reach, &shared.state));
+            let admitted = lent::admit(&req.method, std::mem::take(&mut req.params), peer, &reach, &shared.state);
             match admitted {
                 Ok(params) => req.params = params,
                 Err(e) => {
@@ -1482,32 +1437,12 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Ok(json!({ "ok": true }))
         }
         "capacity.get" => serde_json::to_value(shared.capacity()).map_err(|e| api::ApiError::internal(e.into())),
-        method if method.starts_with("lend.") => match shared.lender.get() {
-            Some(lender) => fleet::lender::call(method, req.params, lender)
-                .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
-            None => Err(api::ApiError::failed("this daemon has no lend.toml (no data dir)")),
-        },
         // Local only: no link's table admits `member.*` (`fleet::lent`).
-        method if method.starts_with("member.") => match shared.lender.get() {
-            Some(lender) => {
-                fleet::member::call(method, req.params, lender.member_path(), lender.hostname(), || lender.reapply())
-                    .unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
-            }
+        method if method.starts_with("member.") => match &shared.member {
+            Some(path) => fleet::member::call(method, req.params, path, &shared.hostname)
+                .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
-        method if method.starts_with("fleet.") && shared.machines.is_some() => {
-            let m = shared.machines.as_ref().expect("checked");
-            let agent = || (shared.host_agent)();
-            let ctx = super::fleet::offer::Ctx {
-                registry: &m.registry,
-                hub: shared.hub,
-                links: m.links.as_ref(),
-                agent: &agent,
-                inbound: Some(&m.inbound),
-                log,
-            };
-            super::fleet::offer::call(method, req.params, &ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
-        }
         method if method.starts_with("machines.") && shared.machines.is_some() => {
             let ctx = shared.machines.as_ref().expect("checked");
             machines::api::call(method, req.params, ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
@@ -1827,13 +1762,8 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
         let Some(entry) = entries.iter().find(|e| e.name == worker) else {
             return Err(Unprepared::NotMovable("it's no longer a machine here".into()));
         };
-        // An offered worker's fleet root is its entry's (`fleet.offer`);
-        // any other machine says where this host's is over the link.
-        let worker_root = match entry.roots.first() {
-            Some(root) if entry.is_offered() => root.clone(),
-            None if entry.is_offered() => return Err(Unprepared::NotMovable("its fleet root isn't known (it offered none)".into())),
-            _ => fleet_root_on(shared, entry).map_err(Unprepared::NotMovable)?,
-        };
+        // The machine says where this host's fleet root is, over the link.
+        let worker_root = fleet_root_on(shared, entry).map_err(Unprepared::NotMovable)?;
         let repos = match &shared.repos {
             Some(repos) => repos.clone(),
             None => code::repos_dir()?,
@@ -1863,15 +1793,7 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
             }
             let params = placed::forwarded(params.clone(), &name, &root, base.as_deref());
             let tagged = placed::Tagged { inner: &peer, machine: &name };
-            match remote_verb(id, "run", params, &name, shared, conn, &tagged).map(|r| placed::after_forward(r, &name)) {
-                None => Some(None),
-                Some(placed::Forwarded::Answer(r)) => Some(Some(r)),
-                Some(placed::Forwarded::Here(note)) => {
-                    log(&format!("{}: run: {note}", conn.label()));
-                    say(&note);
-                    None
-                }
-            }
+            Some(remote_verb(id, "run", params, &name, shared, conn, &tagged).map(|r| placed::tag_answer(r, &name)))
         }
     }
 }
@@ -2198,14 +2120,12 @@ pub(crate) mod tests {
                 tick: Duration::from_millis(20),
             },
             helper: None,
-            // Never the user's: absent, so nothing lends unless a test
-            // writes its own.
-            lend: Some(std::env::temp_dir().join(format!("dsv-lend-{}", std::process::id())).join("lend.toml")),
-            lend_transport: None,
+            // Never the user's: absent unless a test writes its own.
+            member: Some(std::env::temp_dir().join(format!("dsv-member-{}", std::process::id())).join("member.toml")),
             // Never a download or a handoff of this test binary.
-            lend_update: Some(Arc::new(crate::serve::fleet::update::tests::Fake::default())),
-            lend_env: None,
-            // Never the runtime's `info`: an empty report (lend state aside).
+            update_steps: Some(Arc::new(crate::serve::fleet::update::tests::Fake::default())),
+            peer_env: None,
+            // Never the runtime's `info`: an empty report (caps aside).
             local_capacity: Some(Arc::new(crate::serve::capacity::Capacity::default)),
             // Never the user's repo caches.
             repos: Some(std::env::temp_dir().join(format!("dsv-repos-{}", std::process::id()))),
@@ -3103,7 +3023,7 @@ pub(crate) mod tests {
         let instance = "[instance.w]\ninstance_id = \"id-w\"\nsandbox = \"web\"\ncontainer = \"devsandbox-w\"\n\
                         folder = \"/w\"\nworkspace = \"/w\"\ncreated_unix = 1\n";
         std::fs::write(&state, format!("{instance}config_dir = {:?}\n", own.to_str().unwrap())).unwrap();
-        let options = Options { state: Some(state), lend: Some(data.join("lend.toml")), ..opts(1, 1000) };
+        let options = Options { state: Some(state), member: Some(data.join("member.toml")), ..opts(1, 1000) };
         let daemon = spawn_daemon(&dir, options);
 
         let (mut stream, answer) = attach_raw(&dir, json!({"peer": "lap.local", "channel": "api"}), b"");
@@ -3184,7 +3104,7 @@ pub(crate) mod tests {
         let data = scratch("attach-ch-data");
         std::fs::create_dir_all(&data).unwrap();
         let (state, own, other) = attach_fixture(&data);
-        let options = Options { state: Some(state), lend: Some(data.join("lend.toml")), ..opts(1, 1000) };
+        let options = Options { state: Some(state), member: Some(data.join("member.toml")), ..opts(1, 1000) };
         let daemon = spawn_daemon(&dir, options);
         let fleet = data.join("fleet/hub");
 
@@ -3259,7 +3179,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let (state, _own, other) = attach_fixture(&data);
         let helper = helper::HelperClient::new(crate::serve::helper::tests::Fake::default(), crate::serve::helper::tests::log);
-        let options = Options { state: Some(state), lend: Some(data.join("lend.toml")), helper: Some(helper), ..opts(1, 1000) };
+        let options = Options { state: Some(state), member: Some(data.join("member.toml")), helper: Some(helper), ..opts(1, 1000) };
         let daemon = spawn_daemon(&dir, options);
         let other = other.to_str().unwrap();
 
@@ -3311,7 +3231,7 @@ pub(crate) mod tests {
         };
         let options = Options {
             machines: Some(registry.clone()),
-            lend: Some(data.join("lend.toml")),
+            member: Some(data.join("member.toml")),
             host_agent: Some(host_agent),
             ..opts(1, 1000)
         };

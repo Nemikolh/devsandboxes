@@ -23,15 +23,15 @@
 //! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
 //! - `forward_store`: `forwards.toml`, the ad-hoc forwards a successor restores
 //! - `locked_file`: the locked read-modify-write and atomic rename every
-//!   daemon-owned TOML file (`machines.toml`, `forwards.toml`, `lend.toml`)
+//!   daemon-owned TOML file (`machines.toml`, `forwards.toml`, `member.toml`)
 //!   is written with
 //! - `client`: connect-or-lazy-start for commands
 //! - `machines`: remote hosts over ssh (docs/architecture/daemon/machines.md):
 //!   the registry (`machines.toml`), the ssh argv and dial, the link
 //!   handshake, the `machines.*` methods
-//! - `fleet`: machines as one pool (docs/architecture/daemon/fleet.md); so
-//!   far the link primitive both host-to-host frame-mux links run on, a
-//!   worker's link to its hub and `lend.*`
+//! - `fleet`: machines as one pool (docs/architecture/daemon/fleet.md): the
+//!   peer link between two machines, its channels, the trust table,
+//!   `member.toml` and placement
 //! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket
 //! - `install`: `serve install|uninstall`, the systemd user unit / LaunchAgent
 //! - `verbs`: `run`/`rebuild`/`start`/`stop`/`rm`/`services.rebuild` as

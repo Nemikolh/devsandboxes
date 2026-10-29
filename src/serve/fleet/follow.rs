@@ -3,9 +3,9 @@
 //! end that follows serves nothing but the one `binary` transfer the hub
 //! pushes (`update::push`), into a private scratch dir, then ends the link
 //! so the binary can be installed and handed off to
-//! (`update::install_received`). Shared by the lending link's worker
-//! (`fleet::worker`) and a peer link's dialed end (`commands::fleet_link`,
-//! *Peer links*).
+//! (`update::install_received`). Shared by a peer link's two ends: the
+//! dialer's (`fleet::dialer`) and the dialed end's (`commands::fleet_link`,
+//! *Peer links*). [`Follow`] is how either one follows.
 
 use std::net::Shutdown;
 use std::path::PathBuf;
@@ -14,15 +14,25 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::transfer::Receivers;
-use super::update::{BINARY_KIND, BINARY_LIMIT};
+use super::update::{BINARY_KIND, BINARY_LIMIT, Steps};
 use crate::serve::endpoint::Stream;
 
+/// How this host follows a hub's build on a peer link.
+#[derive(Clone)]
+pub struct Follow {
+    /// The update's steps (`update::Release` in production).
+    pub steps: Arc<dyn Steps>,
+    /// `member.toml`'s `dev-builds` or trust `full`
+    /// (`fleet::member::Member::takes_dev_builds`), read at each link's
+    /// `Hello`s (a hand edit counts from the next link).
+    pub dev_builds: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
 /// How long a link waiting for the hub's binary waits for its transfer to
-/// start; then it ends (the lending link retries after the backoff, a peer
-/// link is redialed).
+/// start; then it ends (and is redialed).
 pub const PUSH_WAIT: Duration = Duration::from_secs(60);
 
-/// How a wait ends its link: a lending link's stream shut, a peer link's
+/// How a wait ends its link: the dialer's stream shut, the dialed end's
 /// `link::Outlet::hang_up`.
 pub type EndLink = Box<dyn Fn() + Send + Sync>;
 
@@ -119,7 +129,7 @@ impl Incoming {
                             take.wake.notify_all();
                             Ok(w.dir.join("devsandbox"))
                         }
-                        _ => anyhow::bail!("this worker isn't waiting for a binary"),
+                        _ => anyhow::bail!("this member isn't waiting for a binary"),
                     }
                 },
                 move |r| done.finish(|w| w.received = Some(r.path)),
@@ -146,13 +156,13 @@ mod tests {
         let (size, sha256) = transfer::digest(&b"bin"[..]).unwrap();
         let header = Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None };
         let err = transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap_err();
-        assert_eq!(format!("{err:#}"), "transfer refused: this worker isn't waiting for a binary");
+        assert_eq!(format!("{err:#}"), "transfer refused: this member isn't waiting for a binary");
 
         let (link, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         incoming.expect("h".into(), dir.clone(), Some(shutting(link.into())));
         transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap();
         let err = transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap_err();
-        assert_eq!(format!("{err:#}"), "transfer refused: this worker isn't waiting for a binary", "once");
+        assert_eq!(format!("{err:#}"), "transfer refused: this member isn't waiting for a binary", "once");
         let start = std::time::Instant::now();
         while incoming.want.lock().unwrap().as_ref().unwrap().received.is_none() {
             assert!(start.elapsed() < Duration::from_secs(5), "received");

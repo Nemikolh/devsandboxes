@@ -16,7 +16,7 @@
 //! snapshot handed to the daemon to push, with this host's capacity report
 //! (`capacity.rs`: the runtime's `info` at most every
 //! `capacity::ENGINE_TTL`, free memory and disk, the running instances,
-//! `lend.toml`'s state, `member.toml`'s caps). The poll also owns the runtime's
+//! `member.toml`'s caps). The poll also owns the runtime's
 //! event stream ([`EventWatcher`], `events.rs`): each relevant container
 //! event wakes it at once. The sleep is [`tick`]:
 //! [`snapshots::LISTING_INTERVAL`] while anything is watched, else
@@ -72,8 +72,7 @@ pub struct Observers {
     /// Each watched root's snapshot (`instances.snapshot` params), every
     /// tick; it must not block.
     pub on_snapshot: Box<dyn Fn(&Path, Arc<Value>) + Send>,
-    /// `lend.toml`'s state and `member.toml`'s caps now, for the capacity
-    /// report.
+    /// `member.toml`'s caps now, for the capacity report.
     pub own: Box<dyn Fn() -> Own + Send>,
     /// This host's capacity: the poll keeps its running count, and asks it
     /// for the report while a root is watched (the daemon asks it too).

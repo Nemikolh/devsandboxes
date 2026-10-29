@@ -4,8 +4,8 @@
 //! `[allow]`, `[caps]` and `dev-builds`.
 //!
 //! Written by the daemon only (decision 3 of the fleet plan), through
-//! `member.set` ([`call`]; `devsandbox machine trust` and `fleet join
-//! --name` are its clients), with [`update`]: under the sibling
+//! `member.set` ([`call`]; `devsandbox machine trust` and `machine roots`
+//! are its clients), with [`update`]: under the sibling
 //! `member.lock`, a temp file and a rename (`serve::locked_file`).
 //! `[allow]`, `[caps]` and `dev-builds` have no call: they're edited by
 //! hand and re-read at each use (`worker_policy` reads `trust` and
@@ -55,7 +55,7 @@ pub struct Member {
     pub caps: SoftCaps,
 }
 
-/// `[caps]`: what this host means to lend (fleet plan, *Placement*). All
+/// `[caps]`: what this host means to give the fleet (fleet plan, *Placement*). All
 /// optional; sizes as `16G`, `512M`, `1.5T` (binary units) or bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -158,7 +158,7 @@ pub fn default_name(hostname: &str) -> Result<String> {
     let label = hostname.split('.').next().unwrap_or_default();
     match check_name(label) {
         Ok(()) => Ok(label.to_string()),
-        Err(e) => bail!("cannot name this host after hostname `{hostname}` ({e:#}); set `name` (`devsandbox fleet join <hub> --name <name>`)"),
+        Err(e) => bail!("cannot name this host after hostname `{hostname}` ({e:#}); set `name` in member.toml (next to state.toml)"),
     }
 }
 
@@ -231,31 +231,24 @@ pub fn get(path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
     Ok(info(&member, hostname))
 }
 
-/// `member.set`: `p` merged into the file, checked, written. Also whether
-/// the name this host goes by changed (the lending thread follows it).
-pub fn set(path: &Path, hostname: &str, p: &SetParams) -> Result<(MemberInfo, bool), ApiError> {
-    let (before, after) = update(path, |cur| -> Result<(Member, Member), ApiError> {
-        let next = merge(cur.clone(), p)?;
-        let before = std::mem::replace(cur, next.clone());
-        Ok((before, next))
+/// `member.set`: `p` merged into the file, checked, written. Nothing else
+/// follows it: a peer link reads the name at its next dial
+/// (`fleet::dialer::member_name`), the rest is read at each use.
+pub fn set(path: &Path, hostname: &str, p: &SetParams) -> Result<MemberInfo, ApiError> {
+    let after = update(path, |cur| -> Result<Member, ApiError> {
+        *cur = merge(cur.clone(), p)?;
+        Ok(cur.clone())
     })
     .map_err(ApiError::internal)??;
-    let renamed = before.name_or(hostname).ok() != after.name_or(hostname).ok();
-    Ok((info(&after, hostname), renamed))
+    Ok(info(&after, hostname))
 }
 
-/// Run `method` if it's a `member.*` one; `None` otherwise. `renamed` runs
-/// after a `member.set` that changed the name.
-pub fn call(method: &str, params: Value, path: &Path, hostname: &str, renamed: impl FnOnce()) -> Option<Answer> {
+/// Run `method` if it's a `member.*` one; `None` otherwise.
+pub fn call(method: &str, params: Value, path: &Path, hostname: &str) -> Option<Answer> {
     let to_value = |info: MemberInfo| serde_json::to_value(info).map_err(|e| ApiError::internal(e.into()));
     let answer = match method {
         "member.get" => get(path, hostname).and_then(to_value),
-        "member.set" => parse_params(params).and_then(|p: SetParams| set(path, hostname, &p)).and_then(|(info, changed)| {
-            if changed {
-                renamed();
-            }
-            to_value(info)
-        }),
+        "member.set" => parse_params(params).and_then(|p: SetParams| set(path, hostname, &p)).and_then(to_value),
         _ => return None,
     };
     Some(answer)
@@ -382,41 +375,32 @@ mod tests {
         let dir = scratch("api");
         let path = dir.join("member.toml");
         let host = "lap.local";
-        let call = |method: &str, params: Value| {
-            let mut renamed = false;
-            let answer = super::call(method, params, &path, host, || renamed = true);
-            (answer, renamed)
-        };
-        let (got, _) = call("member.get", Value::Null);
+        let call = |method: &str, params: Value| super::call(method, params, &path, host);
+        let got = call("member.get", Value::Null);
         assert_eq!(got.unwrap().unwrap(), json!({"name": "lap", "trust": "worker", "dev_builds": false, "roots": []}));
         assert!(!path.exists(), "a get writes nothing");
 
-        let (set, renamed) = call("member.set", json!({"trust": "full", "roots_add": ["/srv/cfg"]}));
+        let set = call("member.set", json!({"trust": "full", "roots_add": ["/srv/cfg"]}));
         assert_eq!(set.unwrap().unwrap(), json!({"name": "lap", "trust": "full", "dev_builds": false, "roots": ["/srv/cfg"]}));
-        assert!(!renamed);
         assert_eq!(load(&path).unwrap().unwrap().trust, Trust::Full, "written");
         assert!(dir.join("member.lock").exists(), "written through locked_file");
 
-        // The hostname's label set as the name is no rename; another is.
-        assert!(!call("member.set", json!({"name": "lap"})).1);
-        let (set, renamed) = call("member.set", json!({"name": "box"}));
+        let set = call("member.set", json!({"name": "box"}));
         assert_eq!(set.unwrap().unwrap()["name"], "box");
-        assert!(renamed);
 
         // Hand edits survive a set; a refused set changes nothing.
         update(&path, |m| m.dev_builds = true).unwrap();
-        let (bad, renamed) = call("member.set", json!({"name": "a/b"}));
+        let bad = call("member.set", json!({"name": "a/b"}));
         assert_eq!(bad.unwrap().unwrap_err().code, "invalid");
-        assert!(!renamed);
-        assert_eq!(call("member.set", json!({"nope": 1})).0.unwrap().unwrap_err().code, "invalid");
+        assert_eq!(call("member.set", json!({"nope": 1})).unwrap().unwrap_err().code, "invalid");
         let m = load(&path).unwrap().unwrap();
         assert_eq!((m.name.as_str(), m.dev_builds, m.trust), ("box", true, Trust::Full));
-        assert!(call("member.nope", Value::Null).0.is_none());
+        assert!(call("member.nope", Value::Null).is_none());
 
         // A file that doesn't parse isn't overwritten.
         std::fs::write(&path, "trust = 1\n").unwrap();
-        assert_eq!(call("member.get", Value::Null).0.unwrap().unwrap_err().code, "internal");
-        assert!(call("member.set", json!({"trust": "worker"})).0.unwrap().is_err());
+        assert_eq!(call("member.get", Value::Null).unwrap().unwrap_err().code, "internal");
+        assert!(call("member.set", json!({"trust": "worker"})).unwrap().is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "trust = 1\n");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -165,7 +165,7 @@ fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result
     argv_with(entry, opts, entry.command(), remote_args)
 }
 
-/// Every argv above comes through here, so an offered machine (no ssh to
+/// Every argv above comes through here, so an inbound machine (no ssh to
 /// it) is refused for all of them alike (`Entry::ssh_target`).
 fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     target_argv(entry.ssh_target()?, opts, program, remote_args)
@@ -173,7 +173,7 @@ fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl As
 
 /// `ssh <opts> [-p N] -- <host> <remote_command>` to a bare target: what
 /// [`argv_with`] builds for an entry, and `fleet::transport::Transport::ssh`'s
-/// dial of a bare target (a fleet worker's link to its hub has no entry).
+/// dial of a bare target.
 pub(crate) fn target_argv(target: &str, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     let target = parse_target(target)?;
     let mut argv: Vec<OsString> = ["ssh"].iter().chain(opts).map(OsString::from).collect();
@@ -205,8 +205,8 @@ pub struct Duplex {
 }
 
 impl Duplex {
-    /// A plain socket to a daemon: an offered machine's fleet socket
-    /// (`fleet::dial`), a test daemon's.
+    /// A plain socket to a daemon: a machine's fleet socket
+    /// (`fleet::dialer::dial`), a test daemon's.
     pub fn socket(stream: Stream) -> Self {
         Self { stream, peer: Peer::default() }
     }
@@ -465,12 +465,12 @@ mod tests {
     }
 
     #[test]
-    fn every_argv_refuses_an_offered_machine() {
-        let e = Entry::offered("lap");
+    fn every_argv_refuses_an_inbound_machine() {
+        let e = Entry::inbound("lap", Vec::new());
         let refusals = [probe_argv(&e, "c"), add_cli_argv(&e, &["ps"]), script_argv(&e, "true", &[] as &[&str])];
         for r in refusals {
             let err = format!("{:#}", r.unwrap_err());
-            assert!(err.contains("machine `lap` is an offered fleet worker") && err.contains("not ssh"), "{err}");
+            assert!(err.contains("machine `lap` links to this host from its end") && err.contains("not ssh"), "{err}");
         }
     }
 

@@ -6,17 +6,15 @@
 //! Soft caps never refuse: a machine over one scores below every machine
 //! that isn't, and when all are over the best is still used with an
 //! `over cap: …` warning. New work never goes to a machine that is
-//! unreachable or lending `off` / `drain`, unless the spec pins it; a pin
-//! is refused only when the machine is unreachable (or unknown).
+//! unreachable; a pin is refused only then (or when the machine is
+//! unknown).
 
 use std::cmp::Ordering;
 use std::fmt;
 
 use serde_json::Value;
 
-use super::lend::State;
 use crate::serve::capacity::{Capacity, over_caps, over_note};
-use crate::serve::machines::MachineKind;
 use crate::serve::snapshots::{LinkState, Machine};
 
 /// A machine as placement names it: this host, or a registered machine.
@@ -60,9 +58,6 @@ pub struct Spec {
 pub struct Candidate {
     pub machine: MachineRef,
     pub reachable: bool,
-    /// `On` but for an offered worker's reported `off` / `drain`
-    /// ([`lends`]).
-    pub lending: State,
     /// `None` before a report came: every headroom item counts as neutral.
     pub capacity: Option<Capacity>,
     /// An instance of the spec's sandbox runs there at the spec's hashes
@@ -73,14 +68,13 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// This host: reachable and lending by definition. `roots` are its
+    /// This host: reachable by definition. `roots` are its
     /// roots' `instances.snapshot` params, for [`has_image`]; `has_repo` is
     /// the caller's (no snapshot says which repos are here).
     pub fn local<'a>(spec: &Spec, capacity: Option<Capacity>, roots: impl IntoIterator<Item = &'a Value>) -> Candidate {
         Candidate {
             machine: MachineRef::Local,
             reachable: true,
-            lending: State::On,
             capacity,
             has_image: has_image(spec, roots),
             has_repo: false,
@@ -88,19 +82,13 @@ impl Candidate {
     }
 
     /// A machine (any kind), from what the daemon keeps of it: its link
-    /// state ([`reachable`]), its pushed rows for [`has_image`], and, for
-    /// an offered worker only ([`lends`]), its capacity report's lending
-    /// state (`On` before a report comes: it links only while lending; its
-    /// `drain` shows once one does). Any other machine takes new work
-    /// (`On`) whatever its report says. `has_repo` is the caller's.
+    /// state ([`reachable`]), its pushed rows for [`has_image`] and its
+    /// capacity report. `has_repo` is the caller's.
     pub fn from_machine(spec: &Spec, m: &Machine) -> Candidate {
-        let capacity = m.capacity();
-        let reported = capacity.as_ref().and_then(|c| c.lending).filter(|_| lends(m.kind));
         Candidate {
             machine: MachineRef::Machine(m.name.clone()),
             reachable: reachable(m.state),
-            lending: reported.unwrap_or(State::On),
-            capacity,
+            capacity: m.capacity(),
             has_image: has_image(spec, m.rows.values().map(|v| v.as_ref())),
             has_repo: false,
         }
@@ -111,12 +99,6 @@ impl Candidate {
 /// whatever its kind (the code moves over it before the run does).
 pub fn reachable(state: LinkState) -> bool {
     state == LinkState::Connected
-}
-
-/// Whether a machine's lending state counts: an offered worker's only (its
-/// `drain`, until lending goes in fleet step 8e).
-pub fn lends(kind: MachineKind) -> bool {
-    kind == MachineKind::Offered
 }
 
 /// Whether some root's snapshot in `roots` (`instances.snapshot` params)
@@ -150,8 +132,7 @@ pub fn has_image<'a>(spec: &Spec, roots: impl IntoIterator<Item = &'a Value>) ->
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     pub machine: MachineRef,
-    /// For the verb's output: `over cap: mem 18G/16G`, a pinned machine
-    /// draining, ….
+    /// For the verb's output: `over cap: mem 18G/16G`, ….
     pub warnings: Vec<String>,
     pub score: i64,
     /// The score's parts, as text (`mem 60% free`, `image built`, …).
@@ -202,34 +183,21 @@ pub const REPO: i64 = 150;
 pub const REQUESTER: i64 = 50;
 
 /// Pick the machine for `spec` among `candidates`. A pin wins (refused only
-/// unknown or unreachable; warned over cap, draining or off); otherwise the
-/// highest [`score`] among reachable candidates lending `on`, ties to the
-/// lowest [`MachineRef`].
+/// unknown or unreachable; warned over cap); otherwise the highest
+/// [`score`] among reachable candidates, ties to the lowest [`MachineRef`].
 pub fn place(spec: &Spec, candidates: &[Candidate]) -> Result<Placement, NoPlace> {
     if let Some(pin) = &spec.pinned {
         let c = candidates.iter().find(|c| &c.machine == pin).ok_or_else(|| NoPlace::UnknownPin(pin.clone()))?;
         if !c.reachable {
             return Err(NoPlace::PinUnreachable(pin.clone()));
         }
-        let mut p = scored(spec, c);
-        match c.lending {
-            State::On => {}
-            State::Drain => p.warnings.insert(0, format!("{pin} is draining")),
-            State::Off => p.warnings.insert(0, format!("{pin} isn't lending")),
-        }
-        return Ok(p);
+        return Ok(scored(spec, c));
     }
     let mut skipped = Vec::new();
     let mut best: Option<Placement> = None;
     for c in candidates {
-        let why = match (c.reachable, c.lending) {
-            (false, _) => Some("unreachable"),
-            (true, State::Off) => Some("not lending"),
-            (true, State::Drain) => Some("draining"),
-            (true, State::On) => None,
-        };
-        if let Some(why) = why {
-            skipped.push((c.machine.clone(), why));
+        if !c.reachable {
+            skipped.push((c.machine.clone(), "unreachable"));
             continue;
         }
         let p = scored(spec, c);
@@ -338,6 +306,7 @@ mod tests {
 
     use super::*;
     use crate::serve::capacity::Caps;
+    use crate::serve::machines::MachineKind;
 
     const G: u64 = 1 << 30;
 
@@ -365,13 +334,12 @@ mod tests {
             disk_free: Some(free_disk * G),
             disk_total: Some(500 * G),
             running,
-            lending: Some(State::On),
             caps: None,
         }
     }
 
     fn cand(machine: MachineRef, capacity: Option<Capacity>) -> Candidate {
-        Candidate { machine, reachable: true, lending: State::On, capacity, has_image: false, has_repo: false }
+        Candidate { machine, reachable: true, capacity, has_image: false, has_repo: false }
     }
 
     fn over_mem(c: Capacity) -> Capacity {
@@ -463,11 +431,9 @@ mod tests {
                 warnings: &[],
             },
             Case {
-                name: "drain, off and unreachable take no new work",
+                name: "an unreachable machine takes no new work",
                 spec: spec(),
                 candidates: vec![
-                    Candidate { lending: State::Drain, ..roomy() },
-                    Candidate { lending: State::Off, ..cand(m("off"), Some(cap(30, 490, 0))) },
                     Candidate { reachable: false, ..cand(m("gone"), Some(cap(30, 490, 0))) },
                     local(),
                 ],
@@ -477,8 +443,8 @@ mod tests {
             Case {
                 name: "nothing takes new work",
                 spec: spec(),
-                candidates: vec![Candidate { lending: State::Drain, ..roomy() }, Candidate { reachable: false, ..local() }],
-                want: Err(NoPlace::NoCandidate(vec![(m("big"), "draining"), (MachineRef::Local, "unreachable")])),
+                candidates: vec![Candidate { reachable: false, ..roomy() }, Candidate { reachable: false, ..local() }],
+                want: Err(NoPlace::NoCandidate(vec![(m("big"), "unreachable"), (MachineRef::Local, "unreachable")])),
                 warnings: &[],
             },
             Case {
@@ -495,20 +461,6 @@ mod tests {
                 candidates: vec![local(), cand(m("a"), Some(over_mem(cap(4, 250, 2))))],
                 want: Ok(m("a")),
                 warnings: &["a: over cap: mem 28G/16G"],
-            },
-            Case {
-                name: "a pin on a draining machine is warned",
-                spec: pinned(m("big")),
-                candidates: vec![local(), Candidate { lending: State::Drain, ..roomy() }],
-                want: Ok(m("big")),
-                warnings: &["big is draining"],
-            },
-            Case {
-                name: "a pin on a machine not lending is warned",
-                spec: pinned(m("big")),
-                candidates: vec![Candidate { lending: State::Off, ..roomy() }],
-                want: Ok(m("big")),
-                warnings: &["big isn't lending"],
             },
             Case {
                 name: "a pin on an unreachable machine is refused",
@@ -557,13 +509,11 @@ mod tests {
     }
 
     #[test]
-    fn reachable_while_the_link_is_up_and_only_offered_ones_lend() {
+    fn reachable_while_the_link_is_up() {
         use LinkState::*;
         for (state, want) in [(Idle, false), (Connecting, false), (Connected, true), (Unreachable, false)] {
             assert_eq!(reachable(state), want, "{state:?}");
         }
-        let lending: Vec<_> = [MachineKind::Ssh, MachineKind::Offered, MachineKind::Inbound].into_iter().map(lends).collect();
-        assert_eq!(lending, [false, true, false]);
     }
 
     fn root_snapshot(drift: bool, phase: Value) -> Value {
@@ -603,35 +553,33 @@ mod tests {
     fn candidates_from_the_daemons_state() {
         let ok = root_snapshot(false, Value::Null);
         let local = Candidate::local(&spec(), Some(cap(16, 250, 2)), [&ok]);
-        assert_eq!((local.machine, local.reachable, local.lending, local.has_image), (MachineRef::Local, true, State::On, true));
+        assert_eq!((local.machine, local.reachable, local.has_image), (MachineRef::Local, true, true));
 
         let mut snap = ok.clone();
-        snap["capacity"] = serde_json::to_value(Capacity { lending: Some(State::Drain), ..cap(8, 100, 1) }).unwrap();
+        snap["capacity"] = serde_json::to_value(cap(8, 100, 1)).unwrap();
         let w = Machine {
             name: "w".into(),
-            kind: MachineKind::Offered,
+            kind: MachineKind::Ssh,
             roots: vec![PathBuf::from("/r")],
             state: LinkState::Connected,
             rows: BTreeMap::from([(PathBuf::from("/r"), Arc::new(snap))]),
             ..Machine::default()
         };
         let c = Candidate::from_machine(&spec(), &w);
-        assert_eq!((c.machine.clone(), c.reachable, c.lending, c.has_image, c.has_repo), (m("w"), true, State::Drain, true, false));
+        assert_eq!((c.machine.clone(), c.reachable, c.has_image, c.has_repo), (m("w"), true, true, false));
         assert_eq!(c.capacity.as_ref().map(|c| c.running), Some(1));
-        // An ssh machine: takes work whatever its report's lending says;
-        // its link down: unreachable.
+        // Its link down: unreachable.
         let bare = Machine { name: "s".into(), state: LinkState::Idle, ..Machine::default() };
         let c = Candidate::from_machine(&spec(), &bare);
-        assert_eq!((c.reachable, c.lending, c.capacity, c.has_image), (false, State::On, None, false));
-        let ssh = Machine { kind: MachineKind::Ssh, ..w.clone() };
-        let c = Candidate::from_machine(&spec(), &ssh);
-        assert_eq!((c.reachable, c.lending, c.has_image), (true, State::On, true), "its `drain` is lending's");
+        assert_eq!((c.reachable, c.capacity, c.has_image), (false, None, false));
+        // An inbound one: the same rules.
         let inbound = Machine { kind: MachineKind::Inbound, ..w.clone() };
-        assert_eq!(Candidate::from_machine(&spec(), &inbound).lending, State::On);
-        // An offered one without a report: lending (it linked), neutral.
-        let fresh = Machine { name: "f".into(), kind: MachineKind::Offered, state: LinkState::Connected, ..Machine::default() };
+        let c = Candidate::from_machine(&spec(), &inbound);
+        assert_eq!((c.reachable, c.has_image), (true, true));
+        // Connected without a report: neutral.
+        let fresh = Machine { name: "f".into(), state: LinkState::Connected, ..Machine::default() };
         let c = Candidate::from_machine(&spec(), &fresh);
-        assert_eq!((c.reachable, c.lending, c.capacity), (true, State::On, None));
+        assert_eq!((c.reachable, c.capacity), (true, None));
         let down = Machine { state: LinkState::Idle, ..w };
         assert!(!Candidate::from_machine(&spec(), &down).reachable);
     }
@@ -642,8 +590,8 @@ mod tests {
         assert_eq!(NoPlace::PinUnreachable(m("x")).to_string(), "x is unreachable");
         assert_eq!(NoPlace::NoCandidate(vec![]).to_string(), "no machine to place on");
         assert_eq!(
-            NoPlace::NoCandidate(vec![(m("a"), "draining"), (MachineRef::Local, "unreachable")]).to_string(),
-            "no machine takes new work (a: draining, this host: unreachable)"
+            NoPlace::NoCandidate(vec![(m("a"), "unreachable"), (MachineRef::Local, "unreachable")]).to_string(),
+            "no machine takes new work (a: unreachable, this host: unreachable)"
         );
     }
 }

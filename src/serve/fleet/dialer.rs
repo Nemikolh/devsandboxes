@@ -10,7 +10,7 @@
 //! binds `fleet-<entry>.sock` and its `.pty`, `.tunnel`, `.transfer`
 //! siblings in the socket dir, each accept one stream to the machine, so
 //! the entry's link ([`dial`]) and every other local client reach the
-//! machine as they reach an offered worker. IN: each stream the machine
+//! machine as they reach an inbound one. IN: each stream the machine
 //! opens (`API`, `PTY`, `TUNNEL`, `TRANSFER`, `AGENT`) goes to this daemon
 //! in-process ([`Open`]: `Shared::open_lent` with the entry's name as the
 //! peer, its fleet root `fleet/<entry>/`), under this host's trust table
@@ -46,7 +46,7 @@ use super::lent::Channel;
 use super::transfer::Receivers;
 use super::transport::Transport;
 use super::update::{self, Build, Decision};
-use super::worker::Follow;
+use super::follow::Follow;
 use super::{LINK, link};
 use crate::commands::fleet_link;
 use crate::devsbd::mux::Conn;
@@ -69,7 +69,7 @@ pub fn link_args(member: &str) -> Result<Vec<String>> {
     Ok(["fleet-link", "--peer", member].map(String::from).to_vec())
 }
 
-/// The daemon's [`Dial`] of a registered machine, ssh or offered: a
+/// The daemon's [`Dial`] of a machine, ssh or inbound: a
 /// connection to its `fleet-<name>.sock` in `socket_dir` (one `API` stream
 /// on its link, the daemon from its first byte:
 /// `machines::link::handshake` with `Over::Link`).
@@ -113,7 +113,7 @@ impl Dialer {
             Ok(args) => args,
             Err(e) => return format!("cannot name this host for the link: {e:#}"),
         };
-        let mut duplex = match self.transport.dial_with(target, entry.command(), &args) {
+        let mut duplex = match self.transport.dial(target, entry.command(), &args) {
             Ok(duplex) => duplex,
             Err(e) => return format!("{e:#}"),
         };
@@ -419,7 +419,7 @@ pub(crate) mod tests {
         let data = base.join(format!("{name}-data"));
         std::fs::create_dir_all(&data).unwrap();
         let mut o = opts(1, 60_000);
-        o.lend = Some(data.join("lend.toml"));
+        o.member = Some(data.join("member.toml"));
         o.machines = Some(data.join("machines.toml"));
         o.home = Some(base.join(format!("{name}-home")));
         o.state = Some(data.join("state.toml"));
@@ -596,6 +596,22 @@ pub(crate) mod tests {
         let term = pty_client::Terminal { input: None, output: &mut out, errors: &mut err, size: &|| None };
         let end = pty_client::attach(stream, &pty_client::header(&request), term);
         assert_eq!((pty_client::exit_of(&end, false).0, out, err), (3, b"out\n".to_vec(), b"err\n".to_vec()));
+
+        // A forward's bridge: one `TUNNEL` stream through
+        // `fleet-box.tunnel.sock`, answered by K's daemon under its trust for
+        // lap.
+        use crate::commands::tunnel::{self, Request, Via};
+        let socket = endpoint::fleet_tunnel_socket(&pair.l_dir, "box");
+        let bridge = |root: &Path| {
+            let request = Request { root: root.to_path_buf(), instance: Some("web-1".into()), service: None, port: 3000 };
+            let via = Via::Fleet { socket: socket.clone(), request };
+            let open = tunnel::remote_opener("box".into(), Box::new(move || Ok(via.clone())));
+            open(&std::sync::atomic::AtomicBool::new(false)).err()
+        };
+        let e = bridge(&pair.k_own).unwrap();
+        assert_eq!(e, "instance `web-1` is not running (devsandbox start web-1)", "K's own answer: found, not running");
+        let e = bridge(&pair.base).unwrap();
+        assert!(e.contains("isn't one of this member's roots"), "K's trust refuses what isn't its own: {e}");
         drop(l);
         pair.finish();
     }
@@ -676,7 +692,7 @@ pub(crate) mod tests {
         let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-inbound-l", r#"echo "lap $*""#);
         let pair = Pair::new("dial-inbound", Vec::new(), |l| {
             l.verbs = Some(l_runner);
-            l.lend_env = Some(std::collections::BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap_or_default())]));
+            l.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap_or_default())]));
             // L's join: one instance in the watched root.
             l.join = Some(Arc::new(|dir, view| {
                 let mut list = fake_join()(dir, view);
@@ -787,7 +803,7 @@ pub(crate) mod tests {
             },
             |l| {
                 l.verbs = Some(l_runner);
-                l.lend_env = Some(std::collections::BTreeMap::from([("PATH".into(), path.clone())]));
+                l.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), path.clone())]));
                 let roomy = Capacity {
                     cpus: Some(8),
                     mem_total: Some(32 * G),
@@ -857,9 +873,9 @@ pub(crate) mod tests {
         let fake = Arc::new(update::tests::Fake::reporting("9.9.9"));
         let mut o = opts(1, 60_000);
         o.machines = Some(registry);
-        o.lend = Some(base.join("lend.toml"));
+        o.member = Some(base.join("member.toml"));
         o.link_transport = Some(transport);
-        o.lend_update = Some(fake.clone());
+        o.update_steps = Some(fake.clone());
         let dir = base.join("l");
         let daemon = spawn_daemon(&dir, o);
         let row = || {

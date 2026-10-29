@@ -156,17 +156,17 @@ export interface InstancesSnapshot extends InstancesList {
 export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
 
 /**
- * How a machine is reached: `ssh` (this host sshes to its `target`), `offered` (a fleet worker that dialed
- * this host; no `target`, nothing sshes to it) or `inbound` (a machine whose link to this host was dialed
- * from its end, a machine here while that link is up; no `target`, never in the registry).
+ * How a machine is reached: `ssh` (this host sshes to its `target`) or `inbound` (a machine whose link to
+ * this host was dialed from its end, a machine here while that link is up; no `target`, never in the
+ * registry).
  */
-export type MachineKind = 'ssh' | 'offered' | 'inbound';
+export type MachineKind = 'ssh' | 'inbound';
 
 /** One machine of a federated {@link InstancesSnapshot}. */
 export interface SnapshotMachine {
   name: string;
   kind: MachineKind;
-  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` or `inbound` machine. */
+  /** What ssh takes, or an `ssh://` URL; `null` for an `inbound` machine. */
   target: string | null;
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
@@ -199,8 +199,6 @@ export interface Capacity {
   disk_total: number | null;
   /** Instances whose container runs. */
   running: number;
-  /** `lend.toml`'s `state`; `null` without a `lend.toml`. */
-  lending: LendState | null;
   /** `member.toml`'s soft caps; `null` when none is set. */
   caps: Caps | null;
 }
@@ -830,7 +828,7 @@ export interface MachineAdded {
 export interface MachineInfo {
   name: string;
   kind: MachineKind;
-  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` or `inbound` machine. */
+  /** What ssh takes, or an `ssh://` URL; `null` for an `inbound` machine. */
   target: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
@@ -844,7 +842,7 @@ export interface MachineInfo {
 export interface MachineRow {
   name: string;
   kind: MachineKind;
-  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine or an `inbound` neighbor. */
+  /** What ssh takes, or an `ssh://` URL; `null` for an `inbound` neighbor. */
   target: string | null;
   /** Config roots on the machine (an `inbound` neighbor's as its `roots.list` answered; empty until then). */
   roots: string[];
@@ -859,26 +857,6 @@ export interface MachineRow {
   version: string | null;
   /** Its host's capacity, from its last snapshot; `null` before one carried it. */
   capacity: Capacity | null;
-}
-
-/** Whether this host lends itself to a fleet hub: `drain` keeps the link but takes no new work. */
-export type LendState = 'on' | 'off' | 'drain';
-
-/** The lending link to the hub: `retrying` after a failure (see `error`). */
-export type LendLinkState = 'off' | 'connecting' | 'connected' | 'retrying';
-
-/** `lend.get`'s answer (and `lend.set`'s, after the change): this host as a fleet worker. */
-export interface LendInfo {
-  state: LendState;
-  /** The hub's ssh target; `null` when none was ever set. */
-  hub: string | null;
-  /** The name offered: `member.toml`'s, else the hostname's first label; `null` when neither is a valid name. */
-  name: string | null;
-  /** `<data>/devsandbox/fleet/<hub>/`, all the hub reaches here (canonical while lending). */
-  fleet_root: string | null;
-  link: LendLinkState;
-  /** Why the link is `retrying`, or why it's `off` while `state` says lend. */
-  error: string | null;
 }
 
 /** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). */
@@ -1102,9 +1080,9 @@ export interface RunParams extends VerbParams {
    */
   tty?: TtySize | null;
   /**
-   * Run on this host. Without it (and without `machine`) a fleet hub places
-   * the run on itself or one of its workers; placed on a worker, the code
-   * moves there first and the answer and `progress` carry `machine`.
+   * Run on this host. Without it (and without `machine`) the daemon places
+   * the run on itself or one of its connected machines; placed on a machine,
+   * the code moves there first and the answer and `progress` carry `machine`.
    */
   here?: boolean;
 }
@@ -1170,7 +1148,7 @@ export interface VerbResult {
   /** The instance it acted on; `null` for `all` or when unknown. */
   instance: string | null;
   exit: 0;
-  /** A `run` placed on a fleet worker: that machine (the instance is `<machine>/<instance>`). */
+  /** A `run` placed on another machine: that machine (the instance is `<machine>/<instance>`). */
   machine?: string;
 }
 
@@ -1343,20 +1321,13 @@ export interface ApiMethods {
   'machines.get': { params: { name: string; agent?: string }; result: MachineInfo };
   /**
    * This host's capacity report now (the one its snapshots carry), built on demand: no
-   * watched root needed. A fleet hub asks its workers before placing a `run`.
+   * watched root needed. Placement asks each connected machine before placing a `run`.
    */
   'capacity.get': { params: {}; result: Capacity };
-  /** This host's lending to a fleet hub (`lend.toml`) and its link. */
-  'lend.get': { params: {}; result: LendInfo };
-  /**
-   * Change what's given and apply it at once: start, stop or retarget the link (`on` ↔ `drain` keeps it).
-   * `invalid` for an empty or bad `hub`, or lending without a hub (or without a name: `member.set`'s).
-   */
-  'lend.set': { params: { state?: LendState; hub?: string }; result: LendInfo };
   /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. */
   'member.get': { params: {}; result: MemberInfo };
   /**
-   * Change what's given: `name` (`''` clears it; a lending link restarts under the new one), `trust`, and
+   * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `trust`, and
    * `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root.
    */
   'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };

@@ -722,10 +722,9 @@ fn draw_machines_table(frame: &mut Frame, app: &App, area: Rect, term_focused: b
         Constraint::Min(14),
         Constraint::Length(5),
         Constraint::Length(12),
-        Constraint::Length(5),
         Constraint::Length(room_width as u16),
     ];
-    let header = Row::new(["NAME", "TARGET", "STATE", "AGENT", "VERSION", "LEND", "CAPACITY"].map(Cell::from))
+    let header = Row::new(["NAME", "TARGET", "STATE", "AGENT", "VERSION", "CAPACITY"].map(Cell::from))
         .style(Style::default().add_modifier(Modifier::DIM));
     let rows: Vec<Row> = app.machines.iter().map(machine_row).collect();
     let block = Block::default()
@@ -754,7 +753,7 @@ fn capacity_text(c: Option<&crate::serve::capacity::Capacity>) -> String {
 }
 
 /// One machine's cells: STATE is the link state, with `: <error>` when the
-/// last attempt said why; LEND and CAPACITY from its last snapshot's
+/// last attempt said why; CAPACITY from its last snapshot's
 /// capacity report (last known while it isn't connected).
 fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
     use crate::serve::machines::MachineKind;
@@ -771,12 +770,10 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
     };
     Row::new([
         Cell::from(Span::styled(m.name.clone(), Style::default().fg(ACCENT))),
-        // An offered fleet worker or an inbound machine has no ssh target:
-        // its kind instead.
-        match (&m.target, m.kind) {
-            (Some(target), _) => Cell::from(target.clone()),
-            (None, MachineKind::Inbound) => Cell::from(Span::styled("inbound", Style::default().add_modifier(Modifier::DIM))),
-            (None, _) => Cell::from(Span::styled("offered", Style::default().add_modifier(Modifier::DIM))),
+        // An inbound machine has no ssh target: its kind instead.
+        match &m.target {
+            Some(target) => Cell::from(target.clone()),
+            None => Cell::from(Span::styled("inbound", Style::default().add_modifier(Modifier::DIM))),
         },
         Cell::from(Span::styled(state, style)),
         // This host's agent never reaches an inbound machine: nothing to toggle.
@@ -786,7 +783,6 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
             (_, false) => "off",
         }),
         Cell::from(m.version.clone().unwrap_or_else(|| "-".to_string())),
-        Cell::from(crate::serve::capacity::lend_label(m.capacity.as_ref())),
         {
             let over = m.capacity.as_ref().is_some_and(|c| !crate::serve::capacity::over_caps(c).is_empty());
             let style = if over { Style::default().fg(Color::Yellow) } else { Style::default() };
@@ -3327,24 +3323,23 @@ mod tests {
             disk_free: Some(120 * g),
             disk_total: Some(500 * g),
             running: 3,
-            lending: Some(crate::serve::fleet::lend::State::Drain),
             caps: Some(crate::serve::capacity::Caps { mem: Some(16 * g), ..Default::default() }),
         });
         app.set_machines(vec![up, down]);
         app.on_key(KeyEvent::from(KeyCode::Char('5')));
         let screen = render(&app, 180, 30);
         let header = screen.lines().find(|l| l.contains("NAME")).unwrap();
-        for col in ["TARGET", "STATE", "AGENT", "VERSION", "LEND", "CAPACITY"] {
+        for col in ["TARGET", "STATE", "AGENT", "VERSION", "CAPACITY"] {
             assert!(header.contains(col), "{screen}");
         }
+        assert!(!header.contains("LEND"), "{screen}");
         let line = |name: &str| screen.lines().find(|l| l.contains(&format!("│{name} "))).unwrap().to_string();
         let (up, down) = (line("box"), line("down"));
         assert!(up.contains("me@box") && up.contains(" connected ") && up.contains(" on ") && up.contains("0.9.1"), "{screen}");
-        assert!(up.contains(" drain "), "{screen}");
         assert!(up.contains("8 cpu · 18/32G · 120G free · 3 run  over cap: mem 18G/16G"), "{screen}");
         assert!(down.contains(" unreachable: Connection refused ") && down.contains(" off ") && down.contains(" - "), "{screen}");
-        // No report yet: LEND and CAPACITY `-`.
-        assert!(down.trim_end_matches('│').trim_end().ends_with("-     -"), "{down}");
+        // No report yet: VERSION and CAPACITY `-`.
+        assert!(down.trim_end_matches('│').trim_end().ends_with("-            -"), "{down}");
         assert!(screen.find("│box ").unwrap() < screen.find("│down ").unwrap(), "{screen}");
         assert!(screen.contains("Machines"), "{screen}");
     }

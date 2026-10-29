@@ -28,12 +28,16 @@ pub struct Holders {
     /// Verb subprocesses (`run`, `rebuild`, …; `serve::verbs`) not reaped
     /// yet, detached ones included: their client may be gone.
     pub verbs: usize,
+    /// Links this host dials (its registered machines): a member's daemon
+    /// stays up while it's in a fleet (fleet plan decision 7), or its
+    /// machines would lose it as an inbound neighbor.
+    pub links: usize,
 }
 
 impl Holders {
     pub fn any(&self) -> bool {
-        let Holders { clients, forwards, live_instances, control, autostart, verbs } = *self;
-        clients + forwards + live_instances + control + autostart + verbs > 0
+        let Holders { clients, forwards, live_instances, control, autostart, verbs, links } = *self;
+        clients + forwards + live_instances + control + autostart + verbs + links > 0
     }
 }
 
@@ -89,6 +93,7 @@ mod tests {
             Holders { control: 1, ..Default::default() },
             Holders { autostart: 1, ..Default::default() },
             Holders { verbs: 1, ..Default::default() },
+            Holders { links: 1, ..Default::default() },
         ];
         for h in rows {
             assert_eq!(decide(&h, start, late, false, T), Decision::Hold, "{h:?}");

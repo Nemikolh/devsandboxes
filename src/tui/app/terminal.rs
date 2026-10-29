@@ -1173,7 +1173,7 @@ mod tests {
     /// over the machine's link), whatever kind of machine it is.
     #[test]
     fn a_machines_rows_open_terminals_through_the_local_cli() {
-        for kind in [crate::serve::machines::MachineKind::Ssh, crate::serve::machines::MachineKind::Offered] {
+        for kind in [crate::serve::machines::MachineKind::Ssh, crate::serve::machines::MachineKind::Inbound] {
             let mut app = machine_app();
             app.machines[0].kind = kind;
             app.selected[Tab::Instances.index()] = 5; // box/inst1

@@ -1,8 +1,7 @@
 //! A host's capacity report (docs/architecture/daemon/fleet.md, *Capacity*;
 //! fleet plan decision 8): cpus and memory from the runtime's `info`
 //! (cached [`ENGINE_TTL`]), free memory and disk only for a native Linux
-//! engine, the running instance count, `lend.toml`'s state and
-//! `member.toml`'s soft caps. The host poll (`host.rs`) builds one per watched tick and the
+//! engine, the running instance count and `member.toml`'s soft caps. The host poll (`host.rs`) builds one per watched tick and the
 //! snapshots carry it (`Snapshots::set_capacity`); a machine's comes from
 //! its pushed snapshot (`snapshots::SnapshotMachine::capacity`). On demand,
 //! `capacity.get` and a placed `run` build one through [`HostCapacity`],
@@ -21,7 +20,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::fleet::lend::State;
 use super::fleet::member::SoftCaps;
 use crate::runtime::identity::EngineInfo;
 
@@ -65,17 +63,13 @@ pub struct Capacity {
     pub disk_total: Option<u64>,
     /// Instances in `state.toml` whose container runs.
     pub running: usize,
-    /// `lend.toml`'s `state`; `None` without a `lend.toml`.
-    pub lending: Option<State>,
     /// `member.toml`'s soft caps; `None` when none is set.
     pub caps: Option<Caps>,
 }
 
-/// What this host's own files put in its report: `lend.toml`'s state
-/// (`None` without one) and `member.toml`'s `[caps]`.
+/// What this host's own files put in its report: `member.toml`'s `[caps]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Own {
-    pub lending: Option<State>,
     pub caps: SoftCaps,
 }
 
@@ -111,14 +105,13 @@ impl Capacity {
             disk_free: host.disk_free,
             disk_total: host.disk_total,
             running,
-            lending: own.lending,
             caps: Caps::of(&own.caps),
         }
     }
 
-    /// This report with `own`'s state and caps instead of its own (pure).
+    /// This report with `own`'s caps instead of its own (pure).
     pub fn with_own(self, own: &Own) -> Capacity {
-        Capacity { lending: own.lending, caps: Caps::of(&own.caps), ..self }
+        Capacity { caps: Caps::of(&own.caps), ..self }
     }
 }
 
@@ -283,11 +276,6 @@ pub fn over_note(c: &Capacity) -> Option<String> {
     (!over.is_empty()).then(|| format!("over cap: {}", over.iter().map(Over::to_string).collect::<Vec<_>>().join(", ")))
 }
 
-/// The LEND column: `on`, `drain`, `off`, `-` (no report or no `lend.toml`).
-pub fn lend_label(c: Option<&Capacity>) -> &'static str {
-    c.and_then(|c| c.lending).map_or("-", State::as_str)
-}
-
 /// The CAPACITY column: `8 cpu · 12/32G · 120G free · 3 run`, each part
 /// left out while unknown (memory as `32G` without `mem_available`); `-`
 /// without a report.
@@ -346,7 +334,7 @@ mod tests {
     const G: u64 = 1 << 30;
 
     /// On demand: the cached `info` (asked once within the TTL), the poll's
-    /// running count, the lend state given; `with_own` swaps the latter.
+    /// running count, the caps given; `with_own` swaps the latter.
     #[test]
     fn the_host_report_on_demand() {
         let asked = Arc::new(AtomicUsize::new(0));
@@ -356,13 +344,14 @@ mod tests {
             Ok(EngineInfo { cpus: Some(4), mem_total: Some(8 * G), root_dir: None, native: false })
         }));
         host.set_running(2);
-        let r = host.report(&Own { lending: Some(State::Drain), ..Own::default() });
-        assert_eq!((r.cpus, r.mem_total, r.mem_available, r.running, r.lending), (Some(4), Some(8 * G), None, 2, Some(State::Drain)));
-        assert_eq!(host.report(&Own::default()).lending, None);
+        let capped = Own { caps: SoftCaps { cpus: Some(2), ..SoftCaps::default() } };
+        let r = host.report(&capped);
+        assert_eq!((r.cpus, r.mem_total, r.mem_available, r.running), (Some(4), Some(8 * G), None, 2));
+        assert_eq!(r.caps.as_ref().and_then(|c| c.cpus), Some(2));
+        assert_eq!(host.report(&Own::default()).caps, None);
         assert_eq!(asked.load(Ordering::SeqCst), 1, "cached");
-        let on = Own { lending: Some(State::On), ..Own::default() };
-        assert_eq!(r.clone().with_own(&on), Capacity { lending: Some(State::On), ..r.clone() });
-        assert_eq!(r.clone().with_own(&Own::default()), Capacity { lending: None, caps: None, ..r });
+        assert_eq!(r.clone().with_own(&capped), r.clone());
+        assert_eq!(r.clone().with_own(&Own::default()), Capacity { caps: None, ..r });
         // A runtime that won't answer: no engine part, the count still.
         let down = HostCapacity::new(Arc::new(|| bail!("no runtime")));
         down.set_running(1);
@@ -420,8 +409,8 @@ mod tests {
         assert!(empty.get(t0, || bail!("down")).is_none());
     }
 
-    fn own(state: State, caps: SoftCaps) -> Own {
-        Own { lending: Some(state), caps }
+    fn own(caps: SoftCaps) -> Own {
+        Own { caps }
     }
 
     #[test]
@@ -429,7 +418,7 @@ mod tests {
         let engine = EngineInfo { cpus: Some(8), mem_total: Some(32 * G), root_dir: None, native: true };
         let host = HostFacts { mem_available: Some(20 * G), disk_free: Some(120 * G), disk_total: Some(500 * G) };
         let soft = SoftCaps { mem: Some("16G".into()), instances: Some(3), ..SoftCaps::default() };
-        let c = Capacity::build(Some(&engine), host, 3, &own(State::Drain, soft));
+        let c = Capacity::build(Some(&engine), host, 3, &own(soft));
         assert_eq!(
             c,
             Capacity {
@@ -439,22 +428,20 @@ mod tests {
                 disk_free: Some(120 * G),
                 disk_total: Some(500 * G),
                 running: 3,
-                lending: Some(State::Drain),
                 caps: Some(Caps { cpus: None, mem: Some(16 * G), disk: None, instances: Some(3) }),
             }
         );
         assert_eq!(summary(Some(&c)), "8 cpu · 12/32G · 120G free · 3 run");
-        assert_eq!(lend_label(Some(&c)), "drain");
-        // No engine answer, no lend.toml or member.toml.
+        // No engine answer, no member.toml.
         let bare = Capacity::build(None, HostFacts::default(), 0, &Own::default());
-        assert_eq!((bare.cpus, bare.lending, bare.caps.as_ref()), (None, None, None));
+        assert_eq!((bare.cpus, bare.caps.as_ref()), (None, None));
         assert_eq!(summary(Some(&bare)), "0 run");
-        assert_eq!((summary(None), lend_label(None), lend_label(Some(&bare))), ("-".into(), "-", "-"));
+        assert_eq!(summary(None), "-");
         // A VM's memory without what's free.
         let vm = Capacity { mem_total: Some(8 * G), ..bare.clone() };
         assert_eq!(summary(Some(&vm)), "8G · 0 run");
         // No caps: none reported.
-        assert_eq!(Capacity::build(None, HostFacts::default(), 0, &own(State::On, SoftCaps::default())).caps, None);
+        assert_eq!(Capacity::build(None, HostFacts::default(), 0, &own(SoftCaps::default())).caps, None);
         // Not native: never read.
         let vm_engine = EngineInfo { native: false, root_dir: Some("/".into()), ..engine };
         assert_eq!(HostFacts::read(Some(&vm_engine)), HostFacts::default());
@@ -477,11 +464,11 @@ mod tests {
     fn npm_typings_match() {
         use crate::serve::dts::assert_matches;
         let caps = Caps { cpus: Some(4), mem: Some(G), disk: None, instances: Some(2) };
-        let c = Capacity { caps: Some(caps), lending: Some(State::On), ..Capacity::default() };
+        let c = Capacity { caps: Some(caps), ..Capacity::default() };
         let v = serde_json::to_value(&c).unwrap();
         assert_matches("Capacity", &v);
         assert_matches("Caps", &v["caps"]);
-        assert_eq!(v["lending"], "on");
+        assert!(v.get("lending").is_none());
         assert_eq!(crate::serve::dts::prop_type("InstancesSnapshot", "capacity").as_deref(), Some("Capacity"));
     }
 
