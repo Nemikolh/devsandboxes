@@ -1,0 +1,126 @@
+---
+/**
+ * A slide stepper over `Drill` cards: one slide at a time, prev/next,
+ * numbered dots, ←/→ (and Home/End) while focus is on the deck or its
+ * controls. The URL hash follows the slide (`#<card.id>`), and a hash
+ * pointing anywhere inside a slide opens that slide. Without JS
+ * (`:root[data-js]` unset) every slide stacks and the controls are hidden.
+ */
+import { ChevronLeft, ChevronRight } from '@lucide/astro';
+import Drill from './Drill.astro';
+import type { Card } from './drill';
+import './drill.css';
+
+interface Props {
+  slides: Card[];
+  /** Accessible name of the deck. */
+  label: string;
+}
+
+const { slides, label } = Astro.props;
+const n = slides.length;
+---
+
+<section class="arc-deck" data-deck aria-roledescription="carousel" aria-label={label} data-pagefind-ignore>
+  <div class="arc-deck-bar">
+    <button type="button" class="arc-deck-step" data-deck-prev aria-label="Previous slide">
+      <ChevronLeft size={15} aria-hidden="true" />
+    </button>
+    <ol class="arc-deck-dots">
+      {
+        slides.map((s, i) => (
+          <li>
+            <button
+              type="button"
+              data-deck-dot={i}
+              aria-controls={`${s.id}-slide`}
+              aria-current={i === 0 ? 'step' : undefined}
+              title={s.title}
+            >
+              <span aria-hidden="true">{i + 1}</span>
+              <span class="visually-hidden">
+                Slide {i + 1}: {s.title}
+              </span>
+            </button>
+          </li>
+        ))
+      }
+    </ol>
+    <button type="button" class="arc-deck-step" data-deck-next aria-label="Next slide">
+      <ChevronRight size={15} aria-hidden="true" />
+    </button>
+    <span class="arc-deck-count" aria-live="polite" data-deck-count>1 / {n}</span>
+  </div>
+  <div class="arc-deck-slides">
+    {
+      slides.map((s, i) => (
+        <div
+          class="arc-deck-slide"
+          id={`${s.id}-slide`}
+          role="group"
+          aria-roledescription="slide"
+          aria-label={`${i + 1} of ${n}: ${s.title}`}
+          data-current={i === 0 ? '' : undefined}
+        >
+          <Drill card={s} />
+        </div>
+      ))
+    }
+  </div>
+</section>
+
+<script>
+  for (const root of document.querySelectorAll<HTMLElement>('[data-deck]')) {
+    const slides = [...root.querySelectorAll<HTMLElement>('.arc-deck-slide')];
+    const dots = [...root.querySelectorAll<HTMLButtonElement>('[data-deck-dot]')];
+    const prev = root.querySelector<HTMLButtonElement>('[data-deck-prev]')!;
+    const next = root.querySelector<HTMLButtonElement>('[data-deck-next]')!;
+    const count = root.querySelector<HTMLElement>('[data-deck-count]')!;
+    const bar = root.querySelector<HTMLElement>('.arc-deck-bar')!;
+    let current = 0;
+
+    const show = (i: number, hash: boolean) => {
+      current = Math.max(0, Math.min(slides.length - 1, i));
+      slides.forEach((s, j) => s.toggleAttribute('data-current', j === current));
+      dots.forEach((d, j) => (j === current ? d.setAttribute('aria-current', 'step') : d.removeAttribute('aria-current')));
+      prev.disabled = current === 0;
+      next.disabled = current === slides.length - 1;
+      count.textContent = `${current + 1} / ${slides.length}`;
+      const id = slides[current].querySelector<HTMLElement>('[data-drill]')?.id;
+      if (hash && id) history.replaceState(null, '', `#${id}`);
+    };
+
+    // A hash anywhere inside a slide (the card's id, or a deeper anchor) opens it.
+    const fromHash = () => {
+      const id = decodeURIComponent(location.hash.slice(1));
+      const slide = id ? document.getElementById(id)?.closest<HTMLElement>('.arc-deck-slide') : null;
+      const i = slide ? slides.indexOf(slide) : -1;
+      if (i >= 0) show(i, false);
+    };
+
+    prev.addEventListener('click', () => show(current - 1, true));
+    next.addEventListener('click', () => show(current + 1, true));
+    for (const [i, d] of dots.entries()) d.addEventListener('click', () => show(i, true));
+
+    // Arrow keys only on the deck itself or its bar: inside a slide they
+    // still scroll code and move the caret.
+    root.tabIndex = 0;
+    root.addEventListener('keydown', (e) => {
+      if (e.target !== root && !bar.contains(e.target as Node)) return;
+      const to =
+        e.key === 'ArrowRight' ? current + 1
+        : e.key === 'ArrowLeft' ? current - 1
+        : e.key === 'Home' ? 0
+        : e.key === 'End' ? slides.length - 1
+        : null;
+      if (to === null) return;
+      e.preventDefault();
+      show(to, true);
+      if (bar.contains(e.target as Node)) dots[current].focus();
+    });
+
+    addEventListener('hashchange', fromHash);
+    show(0, false);
+    fromHash();
+  }
+</script>

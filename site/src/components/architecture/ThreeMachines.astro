@@ -1,0 +1,120 @@
+---
+/**
+ * A few states of one picture (Before / Steps 1-6 / After), switched by a
+ * segmented control (WAI-ARIA tabs, like `Tabs.astro`). Each state is an
+ * ASCII diagram (never wrapped, scrolls sideways when narrow) and its arrows
+ * as `<details>`: the list is the diagram's text alternative. Without JS
+ * every state shows, stacked under its own heading; the control is hidden.
+ */
+import './drill.css';
+
+export interface Arrow {
+  from: string;
+  to: string;
+  label: string;
+  /** Short trusted HTML. */
+  detail: string;
+}
+
+export interface MachinesState {
+  id: string;
+  label: string;
+  diagram: string;
+  arrows: Arrow[];
+  /** Short trusted HTML under the arrows. */
+  note?: string;
+}
+
+interface Props {
+  states: MachinesState[];
+  /** Prefix for element ids; unique on the page. */
+  id?: string;
+  /** Accessible name of the state switcher. */
+  label?: string;
+}
+
+const { states, id = 'machines', label = 'Diagram state' } = Astro.props;
+---
+
+<figure class="arc-tm" data-tm data-pagefind-ignore>
+  <div class="arc-tm-switch" role="tablist" aria-label={label}>
+    {
+      states.map((s, i) => (
+        <button
+          type="button"
+          role="tab"
+          id={`${id}-tab-${s.id}`}
+          aria-controls={`${id}-panel-${s.id}`}
+          aria-selected={i === 0 ? 'true' : 'false'}
+          tabindex={i === 0 ? 0 : -1}
+        >
+          {s.label}
+        </button>
+      ))
+    }
+  </div>
+  {
+    states.map((s, i) => (
+      <section class="arc-tm-state" id={`${id}-panel-${s.id}`} data-current={i === 0 ? '' : undefined}>
+        <h3 class="arc-tm-heading">{s.label}</h3>
+        <pre class="arc-tm-diagram" tabindex="0" aria-label={`${s.label}: diagram, described by the arrows below`}>{s.diagram.replace(/^\n|\n$/g, '')}</pre>
+        <ul class="arc-tm-arrows">
+          {s.arrows.map((a) => (
+            <li>
+              <details>
+                <summary>
+                  <code>{a.from}</code>
+                  <span class="arc-tm-to" aria-hidden="true">→</span>
+                  <span class="visually-hidden">to</span>
+                  <code>{a.to}</code>
+                  <span class="arc-tm-label">: {a.label}</span>
+                </summary>
+                <div class="arc-tm-detail" set:html={a.detail} />
+              </details>
+            </li>
+          ))}
+        </ul>
+        {s.note && <p class="arc-tm-note" set:html={s.note} />}
+      </section>
+    ))
+  }
+</figure>
+
+<script>
+  for (const root of document.querySelectorAll<HTMLElement>('[data-tm]')) {
+    const list = root.querySelector<HTMLElement>('[role="tablist"]')!;
+    const tabs = [...list.querySelectorAll<HTMLElement>('[role="tab"]')];
+    // Tab semantics only once the switcher works; without JS the panels are plain sections.
+    for (const tab of tabs) {
+      const panel = document.getElementById(tab.getAttribute('aria-controls') ?? '');
+      panel?.setAttribute('role', 'tabpanel');
+      panel?.setAttribute('aria-labelledby', tab.id);
+    }
+    const select = (next: HTMLElement, focus: boolean) => {
+      for (const tab of tabs) {
+        const on = tab === next;
+        tab.setAttribute('aria-selected', String(on));
+        tab.tabIndex = on ? 0 : -1;
+        document.getElementById(tab.getAttribute('aria-controls') ?? '')?.toggleAttribute('data-current', on);
+      }
+      if (focus) next.focus();
+    };
+    list.addEventListener('click', (e) => {
+      const tab = (e.target as Element).closest<HTMLElement>('[role="tab"]');
+      if (tab) select(tab, false);
+    });
+    list.addEventListener('keydown', (e) => {
+      const i = tabs.indexOf(document.activeElement as HTMLElement);
+      if (i < 0) return;
+      const to =
+        e.key === 'ArrowRight' ? (i + 1) % tabs.length
+        : e.key === 'ArrowLeft' ? (i - 1 + tabs.length) % tabs.length
+        : e.key === 'Home' ? 0
+        : e.key === 'End' ? tabs.length - 1
+        : -1;
+      if (to < 0) return;
+      e.preventDefault();
+      select(tabs[to], true);
+    });
+  }
+</script>

@@ -1,0 +1,52 @@
+---
+title: Machines to fleet
+description: How remote machines went from per-use ssh to one held link per machine pair, with a hub that places work, in steps 1 to 8, and what is still planned.
+eyebrow: ARCHITECTURE · 04
+order: 4
+---
+
+import Deck from '../../components/architecture/Deck.astro';
+import Drill from '../../components/architecture/Drill.astro';
+import CommandTable from '../../components/architecture/CommandTable.astro';
+import ThreeMachines from '../../components/architecture/ThreeMachines.astro';
+import { why, phases, commands, machines, steps, limits } from './fleet-data';
+
+A machine used to be a remote you drove over ssh. Now every machine you add is a member of one fleet: it stays
+connected, a hub can run work on it, and it decides how much other machines may do there. This page goes from
+why, to how it got here (`7716cb8` to `main`), down to the code.
+
+## Why
+
+Seven problems with machines at `7716cb8`, one slide each. Each slide opens one level into how it works now and
+points to the section below that covers it.
+
+<Deck slides={why} label="Why machines became a fleet" />
+
+## The migration
+
+Four stages. Steps 1–6 built a second kind of machine (lending) that steps 7–8 folded back into one; the second
+slide is kept for history.
+
+<Deck slides={phases} label="From machines to fleet, by stage" />
+
+## Command by command
+
+What each command does with a machine at `7716cb8` and on `main`. Rows with a chevron open onto the details,
+including the steps 1–6 behavior where it differed.
+
+<CommandTable rows={commands} beforeLabel="Before (7716cb8)" afterLabel="Today (main)" />
+
+## Three machines
+
+One hub K, one laptop L that accepts no ssh, one box B reached from K. Each tab is the same setup at one stage;
+the arrows below each diagram explain it.
+
+<ThreeMachines states={machines} id="tm" label="Stage" />
+
+## What's left
+
+Steps 1–8 are on `main`. The rest is planned, and the current build has the limits listed after it.
+
+<Drill card={steps} open />
+
+<Drill card={limits} open />

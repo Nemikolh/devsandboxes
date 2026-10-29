@@ -1,0 +1,618 @@
+/* --------------------------------------- Drill-down components (architecture) */
+
+/*
+ * `Drill`, `Deck`, `CommandTable`, `ThreeMachines`. Tokens only
+ * (`tokens.css`). JS-only parts are gated on `:root[data-js]` (set in
+ * `Base.astro` before first paint), so without JS everything reads in full.
+ * Selectors are two classes deep where `.prose ul` / `.prose li` / `.prose p`
+ * would otherwise win.
+ */
+
+:root:not([data-js]) .arc-drill-all,
+:root:not([data-js]) .arc-deck-bar,
+:root:not([data-js]) .arc-tm-switch {
+  display: none;
+}
+
+.arc-rev {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--cyan);
+  font: 10px / 1.4 var(--font-mono);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ Drill */
+
+.arc-drill {
+  position: relative;
+  margin: 24px 0 28px;
+  padding: 18px 20px 20px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.arc-drill.is-headless {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.arc-drill .arc-drill-head {
+  margin-bottom: 14px;
+}
+
+.arc-drill-tag {
+  display: inline-block;
+  margin-bottom: 8px;
+  font: 10.5px / 1.3 var(--font-mono);
+  /* Not uppercased: tags are often commit hashes. */
+  letter-spacing: 0.06em;
+  color: var(--lime);
+}
+
+.prose .arc-drill .arc-drill-title {
+  margin: 0 0 6px;
+}
+
+/* Room for the expand-all button in the corner. */
+:root[data-js] .arc-drill:has(> .arc-drill-all) > .arc-drill-head {
+  padding-right: 110px;
+}
+
+.prose .arc-drill .arc-drill-summary {
+  margin: 0;
+  color: var(--text-body);
+}
+
+.arc-drill-all {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  padding: 4px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font: 11px / 1.3 var(--font-mono);
+  cursor: pointer;
+}
+
+.arc-drill.is-headless .arc-drill-all {
+  position: static;
+  margin-bottom: 10px;
+}
+
+.arc-drill-all:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.arc-drill-all:focus-visible,
+.arc-layer > summary:focus-visible,
+.arc-cmd-row summary:focus-visible,
+.arc-tm-arrows summary:focus-visible,
+.arc-deck:focus-visible,
+.arc-deck-bar button:focus-visible,
+.arc-tm-switch button:focus-visible,
+.arc-tm-diagram:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Each layer is indented inside the previous one, with a rail on the left. */
+.arc-layer {
+  margin-top: 10px;
+  border-left: 2px solid var(--border-strong);
+}
+
+.arc-layer[open] {
+  border-left-color: var(--cyan-deep);
+}
+
+.arc-layer > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 6px 10px;
+  list-style: none;
+  cursor: pointer;
+  font: 500 13px / 1.35 var(--font-body);
+  color: var(--text);
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+
+.arc-layer > summary::-webkit-details-marker {
+  display: none;
+}
+
+.arc-layer > summary::after {
+  content: '+';
+  margin-left: auto;
+  font: 13px / 1 var(--font-mono);
+  color: var(--text-subtle);
+}
+
+.arc-layer[open] > summary::after {
+  content: '−';
+}
+
+.arc-layer > summary:hover {
+  background: var(--surface-hover);
+}
+
+.arc-layer-n {
+  font: 10px / 1 var(--font-mono);
+  color: var(--cyan);
+}
+
+.arc-layer-body {
+  padding: 4px 0 4px 14px;
+}
+
+.prose .arc-layer-text {
+  font-size: 14px;
+  color: var(--text-body);
+}
+
+.prose .arc-layer-text > :last-child {
+  margin-bottom: 0;
+}
+
+.arc-snippet {
+  position: relative;
+  margin-top: 12px;
+}
+
+/* The code head holds the title and copy button; the rev badge sits between. */
+.arc-snippet > .arc-rev {
+  position: absolute;
+  z-index: 1;
+  top: 9px;
+  right: 86px;
+}
+
+.prose .arc-snippet .code-block {
+  margin: 0;
+}
+
+.arc-drill-links {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.prose .arc-drill-links .arc-drill-links-label {
+  margin: 0 0 6px;
+  font: 10.5px / 1.3 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.prose .arc-drill-links ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prose .arc-drill-links li {
+  margin: 0 0 4px;
+  padding: 0;
+}
+
+.arc-drill-links a {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  max-width: 100%;
+  font-size: 13.5px;
+}
+
+.arc-drill-links a code {
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------- Deck */
+
+.arc-deck {
+  margin: 24px 0 30px;
+  border-radius: var(--radius-lg);
+}
+
+.arc-deck-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.arc-deck-bar button {
+  display: grid;
+  place-items: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font: 11.5px / 1 var(--font-mono);
+  cursor: pointer;
+}
+
+.arc-deck-bar button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.arc-deck-bar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.arc-deck-bar button[aria-current] {
+  border-color: var(--lime);
+  color: var(--lime);
+}
+
+.prose .arc-deck .arc-deck-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prose .arc-deck .arc-deck-dots li {
+  margin: 0;
+  padding: 0;
+}
+
+.arc-deck-count {
+  margin-left: auto;
+  font: 11px / 1 var(--font-mono);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+:root[data-js] .arc-deck-slide:not([data-current]) {
+  display: none;
+}
+
+.arc-deck .arc-drill {
+  margin: 0;
+}
+
+:root:not([data-js]) .arc-deck-slide + .arc-deck-slide {
+  margin-top: 16px;
+}
+
+/* ----------------------------------------------------------- CommandTable */
+
+.arc-cmds {
+  container-type: inline-size;
+  margin: 24px 0 30px;
+}
+
+.arc-cmds-filter[hidden],
+.arc-cmds-empty[hidden],
+.arc-cmd-row[hidden] {
+  display: none;
+}
+
+.arc-cmds-filter {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.arc-cmds-filter input {
+  box-sizing: border-box;
+  width: min(100%, 320px);
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-code);
+  color: var(--text);
+  font: 13px / 1.3 var(--font-mono);
+}
+
+.arc-cmds-filter input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.arc-cmd-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.25fr) 18px;
+  gap: 14px;
+  align-items: start;
+  padding: 10px 14px;
+}
+
+.arc-cmds-head {
+  font: 10.5px / 1.3 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.prose .arc-cmds .arc-cmds-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prose .arc-cmds .arc-cmd-row {
+  margin: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.arc-cmd-row summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.arc-cmd-row summary::-webkit-details-marker {
+  display: none;
+}
+
+.arc-cmd-row summary:hover,
+.arc-cmd-row details[open] > summary {
+  background: var(--surface-hover);
+}
+
+.arc-cmd-cell {
+  display: block;
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--text-body);
+}
+
+.arc-cmd-value {
+  display: block;
+}
+
+.arc-cmd-name code {
+  overflow-wrap: anywhere;
+}
+
+/* The header row names the columns when wide; each cell keeps its label for
+   screen readers (the header is `aria-hidden`) and shows it when narrow. */
+.arc-cmd-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.arc-cmd-chevron {
+  display: grid;
+  place-items: center;
+  color: var(--text-subtle);
+  transition: rotate 0.15s;
+}
+
+details[open] > summary .arc-cmd-chevron {
+  rotate: 180deg;
+}
+
+.arc-cmd-body {
+  padding: 6px 14px 16px 28px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+.arc-cmds-empty {
+  padding: 12px 14px;
+  color: var(--text-subtle);
+  font-size: 13.5px;
+}
+
+@container (max-width: 640px) {
+  .arc-cmds-head {
+    display: none;
+  }
+
+  .prose .arc-cmds .arc-cmd-row {
+    margin-bottom: 10px;
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    overflow: hidden;
+  }
+
+  .arc-cmd-grid {
+    grid-template-columns: minmax(0, 1fr) 18px;
+    gap: 8px;
+    padding: 12px 14px;
+  }
+
+  .arc-cmd-name {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .arc-cmd-chevron {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .arc-cmd-cell:not(.arc-cmd-name) {
+    grid-column: 1 / -1;
+  }
+
+  .arc-cmd-label {
+    position: static;
+    display: block;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+    margin-bottom: 2px;
+    font: 10px / 1.3 var(--font-mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+
+  .arc-cmd-body {
+    padding: 6px 14px 14px;
+  }
+}
+
+/* ---------------------------------------------------------- ThreeMachines */
+
+.arc-tm {
+  margin: 24px 0 30px;
+}
+
+.arc-tm-switch {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 12px;
+  padding: 3px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-code);
+}
+
+.arc-tm-switch button {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-muted);
+  font: 500 12px / 1.2 var(--font-mono);
+  cursor: pointer;
+}
+
+.arc-tm-switch button:hover {
+  color: var(--text);
+}
+
+.arc-tm-switch button[aria-selected='true'] {
+  background: var(--surface-hover);
+  color: var(--lime);
+  box-shadow: inset 0 0 0 1px var(--border-card);
+}
+
+:root[data-js] .arc-tm-state:not([data-current]) {
+  display: none;
+}
+
+/* With the switcher, its selected tab is the heading. */
+:root[data-js] .arc-tm-heading {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.prose .arc-tm .arc-tm-heading {
+  margin: 0 0 10px;
+}
+
+:root:not([data-js]) .arc-tm-state + .arc-tm-state {
+  margin-top: 28px;
+}
+
+.prose .arc-tm .arc-tm-diagram {
+  margin: 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-code);
+  color: var(--code-base);
+  font: 12.5px / 1.45 var(--font-mono);
+  tab-size: 4;
+}
+
+.prose .arc-tm .arc-tm-arrows {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prose .arc-tm .arc-tm-arrows > li {
+  margin: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.arc-tm-arrows summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  padding: 7px 4px;
+  cursor: pointer;
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+.arc-tm-arrows summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Flex drops the native marker: draw one. */
+.arc-tm-arrows summary {
+  list-style: none;
+}
+
+.arc-tm-arrows summary::before {
+  content: '▸';
+  width: 12px;
+  color: var(--text-subtle);
+  transition: rotate 0.15s;
+}
+
+.arc-tm-arrows details[open] > summary::before {
+  rotate: 90deg;
+}
+
+.arc-tm-arrows summary:hover {
+  background: var(--surface-hover);
+}
+
+.arc-tm-to {
+  color: var(--cyan);
+}
+
+.arc-tm-label {
+  color: var(--text-body);
+}
+
+.prose .arc-tm .arc-tm-detail {
+  padding: 2px 4px 10px 20px;
+  font-size: 13.5px;
+  color: var(--text-body);
+}
+
+.prose .arc-tm .arc-tm-detail > :last-child {
+  margin-bottom: 0;
+}
+
+.prose .arc-tm .arc-tm-note {
+  margin: 12px 0 0;
+  font-size: 13.5px;
+  color: var(--text-subtle);
+}

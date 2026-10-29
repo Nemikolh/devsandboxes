@@ -1,0 +1,44 @@
+---
+/**
+ * `Drill.astro`'s layers, one `<details>` each, layer N+1 nested inside
+ * layer N: reading deeper is opening deeper. Recursive through `Astro.self`.
+ */
+import CodeBlock from '../CodeBlock.astro';
+import { shortRev, type Layer } from './drill';
+
+interface Props {
+  layers: Layer[];
+  /** Whether the outermost of these layers starts open. */
+  open?: boolean;
+  depth?: number;
+}
+
+const { layers, open = false, depth = 1 } = Astro.props;
+const [layer, ...rest] = layers;
+---
+
+{
+  layer && (
+    <details class="arc-layer" open={open} data-depth={depth}>
+      <summary>
+        <span class="arc-layer-n" aria-hidden="true">{String(depth).padStart(2, '0')}</span>
+        {layer.label}
+      </summary>
+      <div class="arc-layer-body">
+        <div class="arc-layer-text" set:html={layer.body} />
+        {layer.snippets?.map((s) => (
+          <div class="arc-snippet">
+            {s.rev && (
+              <span class="arc-rev" title={`at ${s.rev}`}>
+                <span class="visually-hidden">at revision </span>
+                {shortRev(s.rev)}
+              </span>
+            )}
+            <CodeBlock code={s.code} lang={s.lang} title={s.title} />
+          </div>
+        ))}
+        {rest.length > 0 && <Astro.self layers={rest} depth={depth + 1} />}
+      </div>
+    </details>
+  )
+}

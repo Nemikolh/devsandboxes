@@ -1,0 +1,116 @@
+---
+/**
+ * Command | before | after | what changed for you, one row per command. A
+ * row with a `card` is a `<details>` whose summary is the row itself, opening
+ * onto the card's layers (`Drill`, headless). Wide: a grid with a header
+ * row; narrow (the component under 640px, a container query, so the sidebar
+ * counts): each row a card with labeled fields. The filter box is JS-only.
+ * Cells are short trusted HTML inside `<summary>`: keep links out of them
+ * (a click would toggle the row), put them in the card instead.
+ */
+import { ChevronDown } from '@lucide/astro';
+import Drill from './Drill.astro';
+import type { Card } from './drill';
+import './drill.css';
+
+export interface CommandRow {
+  /** Plain text: the command, rendered as code. */
+  cmd: string;
+  before: string;
+  after: string;
+  change: string;
+  card?: Card;
+}
+
+interface Props {
+  rows: CommandRow[];
+  beforeLabel?: string;
+  afterLabel?: string;
+}
+
+const { rows, beforeLabel = 'Before', afterLabel = 'After' } = Astro.props;
+const changeLabel = 'What changed for you';
+const fields = (r: CommandRow) => [
+  { label: beforeLabel, html: r.before },
+  { label: afterLabel, html: r.after },
+  { label: changeLabel, html: r.change },
+];
+---
+
+<div class="arc-cmds" data-cmds data-pagefind-ignore>
+  <label class="arc-cmds-filter" hidden data-cmds-filter>
+    <span class="visually-hidden">Filter commands</span>
+    <input type="search" placeholder="Filter commands…" autocomplete="off" spellcheck="false" />
+  </label>
+  <div class="arc-cmds-head arc-cmd-grid" aria-hidden="true">
+    <span>Command</span>
+    <span>{beforeLabel}</span>
+    <span>{afterLabel}</span>
+    <span>{changeLabel}</span>
+    <span></span>
+  </div>
+  <ul class="arc-cmds-rows">
+    {
+      rows.map((r) => {
+        const cells = (
+          <>
+            <span class="arc-cmd-cell arc-cmd-name">
+              <code>{r.cmd}</code>
+            </span>
+            {fields(r).map((f) => (
+              <span class="arc-cmd-cell">
+                <span class="arc-cmd-label">{f.label}</span>
+                <span class="arc-cmd-value" set:html={f.html} />
+              </span>
+            ))}
+          </>
+        );
+        return (
+          <li class="arc-cmd-row" data-cmd-row>
+            {r.card ? (
+              <details>
+                <summary class="arc-cmd-grid">
+                  {cells}
+                  <span class="arc-cmd-chevron" aria-hidden="true">
+                    <ChevronDown size={15} />
+                  </span>
+                </summary>
+                <div class="arc-cmd-body">
+                  <Drill card={r.card} headless />
+                </div>
+              </details>
+            ) : (
+              <div class="arc-cmd-grid">
+                {cells}
+                <span />
+              </div>
+            )}
+          </li>
+        );
+      })
+    }
+  </ul>
+  <p class="arc-cmds-empty" hidden data-cmds-empty>No command matches.</p>
+</div>
+
+<script>
+  for (const root of document.querySelectorAll<HTMLElement>('[data-cmds]')) {
+    const box = root.querySelector<HTMLElement>('[data-cmds-filter]')!;
+    const input = box.querySelector('input')!;
+    const empty = root.querySelector<HTMLElement>('[data-cmds-empty]')!;
+    const rows = [...root.querySelectorAll<HTMLElement>('[data-cmd-row]')].map((el) => ({
+      el,
+      text: (el.textContent ?? '').toLowerCase(),
+    }));
+    box.hidden = false;
+    input.addEventListener('input', () => {
+      const q = input.value.trim().toLowerCase();
+      let shown = 0;
+      for (const r of rows) {
+        r.el.hidden = q !== '' && !r.text.includes(q);
+        if (!r.el.hidden) shown++;
+      }
+      empty.hidden = shown > 0;
+    });
+  }
+</script>

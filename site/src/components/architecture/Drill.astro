@@ -1,0 +1,86 @@
+---
+/**
+ * A card read top-down: title and summary always visible, then the layers
+ * as nested native `<details>` (`DrillLayers.astro`), then the sources.
+ * Native disclosure, so it reads and works without JS; the script only adds
+ * the expand-all / collapse-all button (hidden without JS).
+ */
+import { ArrowUpRight } from '@lucide/astro';
+import DrillLayers from './DrillLayers.astro';
+import { blobUrl, shortRev, type Card } from './drill';
+import './drill.css';
+
+interface Props {
+  card: Card;
+  /** Start with the first layer open. */
+  open?: boolean;
+  /** Skip the title, tag and summary (the container already shows them: `CommandTable`). */
+  headless?: boolean;
+}
+
+const { card, open = false, headless = false } = Astro.props;
+const layers = card.layers ?? [];
+const links = card.links ?? [];
+---
+
+<section class:list={['arc-drill', { 'is-headless': headless }]} id={card.id} data-drill>
+  {
+    !headless && (
+      <header class="arc-drill-head">
+        {card.tag && <span class="arc-drill-tag">{card.tag}</span>}
+        <h3 class="arc-drill-title">{card.title}</h3>
+        <p class="arc-drill-summary" set:html={card.summary} />
+      </header>
+    )
+  }
+  {
+    layers.length > 1 && (
+      <button type="button" class="arc-drill-all" data-drill-all aria-expanded="false">
+        Expand all
+      </button>
+    )
+  }
+  {layers.length > 0 && <DrillLayers layers={layers} open={open} />}
+  {
+    links.length > 0 && (
+      <div class="arc-drill-links">
+        <p class="arc-drill-links-label">Source</p>
+        <ul>
+          {links.map((l) => (
+            <li>
+              <a href={blobUrl(l.path, l.rev)} target="_blank" rel="noopener noreferrer">
+                <span>{l.label}</span>
+                <code>{l.path}</code>
+                {l.rev && <span class="arc-rev">{shortRev(l.rev)}</span>}
+                <ArrowUpRight size={13} aria-hidden="true" />
+                <span class="visually-hidden">(opens in a new tab)</span>
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+    )
+  }
+</section>
+
+<script>
+  // One button per drill: opens every layer, or closes them all once all are open.
+  // The label follows manual toggles too (`toggle` doesn't bubble: capture).
+  for (const root of document.querySelectorAll<HTMLElement>('[data-drill]')) {
+    const button = root.querySelector<HTMLButtonElement>(':scope > [data-drill-all]');
+    if (!button) continue;
+    const layers = () => [...root.querySelectorAll<HTMLDetailsElement>('.arc-layer')];
+    const sync = () => {
+      const all = layers().every((d) => d.open);
+      button.textContent = all ? 'Collapse all' : 'Expand all';
+      button.setAttribute('aria-expanded', String(all));
+    };
+    button.addEventListener('click', () => {
+      const open = !layers().every((d) => d.open);
+      for (const d of layers()) d.open = open;
+      sync();
+    });
+    root.addEventListener('toggle', sync, true);
+    sync();
+  }
+</script>
