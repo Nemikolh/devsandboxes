@@ -89,11 +89,11 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `SnapshotMachine::capacity`), `src/serve/fleet/lend.rs` (`SoftCaps`);
 placement: `src/serve/fleet/place.rs` (`place`, `score`, `Spec`,
 `Candidate`, `MachineRef`, `Placement`, `NoPlace`, `has_image`,
-`reachable`), `src/serve/fleet/placed.rs` (`worth_placing`, `workers`,
-`reachable_workers`, `CAPACITY_WAIT`, `with_fresh`, `spec`,
+`reachable`, `lends`), `src/serve/fleet/placed.rs` (`worth_placing`, `workers`,
+`reachable_workers`, `fleet_root`, `CAPACITY_WAIT`, `with_fresh`, `spec`,
 `candidates`, `Ask`, `decide`, `Placed`, `start_point`, `lines`,
 `forwarded`, `after_forward`, `Forwarded`, `tag_answer`, `Tagged`),
-`src/serve/daemon.rs` (`placed_run`, `fresh_capacities`,
+`src/serve/daemon.rs` (`placed_run`, `fresh_capacities`, `fleet_root_on`,
 `remote_verb`, `Shared::capacity`, `Options::local_capacity`,
 `Options::repos`), `src/serve/capacity.rs` (`HostCapacity`,
 `Capacity::with_own`), `src/serve/fleet/lent.rs` (`refuse_new_work`,
@@ -275,8 +275,13 @@ of `fleet::LINK` (it writes the sentinel), saying
   announce of a name winning (`Guard`), and asks L's roots over
   `fleet-L.sock` on a thread (`daemon::inbound_roots`: the hello as
   `0.0.0`, then `roots.list`, which L answers with its own roots and
-  K's fleet root there, `lent::with_fleet_root`); `machines.list` shows
-  the neighbor ([machines](machines.md#inbound-neighbors)). A name that
+  K's fleet root there, flagged `fleet`, `lent::with_fleet_root`). L is
+  then a machine on K like a registered one, of kind `inbound`: K's
+  `Machines` service holds a link to it over `fleet-L.sock` while the
+  neighbor is up, so its rows, quick calls, verbs, the CLI's re-runs,
+  terminal tabs, forwards and placement reach L through the sockets this
+  end binds, each stream served by L's daemon under L's trust table for
+  K ([machines](machines.md#inbound-neighbors)). A name that
   `machines.toml` has (any kind) is refused, and the refusal ends the
   link with why on stderr (L sees ssh's stderr tail); `machines.add` and
   `fleet.offer` refuse a live neighbor's name in turn. When the held
@@ -629,7 +634,7 @@ holds the one `EngineCache` and the running count the poll sets from
 every listing (watched or not), and the daemon adds `lend.toml`'s state
 and `member.toml`'s caps (`Shared::capacity`, `Capacity::with_own`); tests replace the
 rest with `Options::local_capacity`. It is on the trust table under either trust, so
-a hub asks its workers before it places.
+a host asks its machines before it places.
 
 - **`cpus`, `mem_total`**: the runtime's `info`
   (`Backend::engine_info`: `docker info`'s `NCPU` / `MemTotal`,
@@ -669,7 +674,7 @@ stores each pushed root's params (`service.rs` `LinkLoop::store`), and
 `Machine::capacity` takes the first of its roots' that has one, into
 `SnapshotMachine::capacity` (federated snapshots) and `machines.list`'s
 `capacity`; last known while the link is down, and restored with a hub's
-`remotes.json` rows. A worker's comes through its offered root
+`remotes.json` rows (an inbound machine's go with it). A worker's comes through its offered root
 ([Hub side](#hub-side)); the trust table's snapshot filter
 (`lent::filter_snapshot`) leaves it as is. The dashboard's Machines tab
 and `devsandbox machine ls` show it as LEND (`capacity::lend_label`:
@@ -713,13 +718,12 @@ and `has_repo`. It answers a `Placement` (the machine, `warnings`, the
 
 Candidates come from what the daemon already keeps:
 `Candidate::local` (this host: always reachable and lending `on`) and
-`Candidate::from_machine` over a `snapshots::Machine` (its
-`Machine::capacity`; `lending` from that report; without one an ssh
-machine is `off`, so one that never ran `devsandbox lend` takes only
-pinned work, and an offered one `on`, since it links only while lending
-(a draining one refuses the `run` itself, below);
-`place::reachable`: an ssh machine unless its link state is
-`unreachable`, an offered one only while `connected`).
+`Candidate::from_machine` over a `snapshots::Machine` of any kind (its
+`Machine::capacity`; `lending` `on`, but for an offered worker that
+report's state, `place::lends`: without one `on`, since it links only
+while lending (a draining one refuses the `run` itself, below); an ssh or
+inbound machine's report's `lending` isn't placement's;
+`place::reachable`: while its link is `connected`, whatever its kind).
 `place::has_image` reads roots' `instances.snapshot` params: a sandbox
 row of the spec's name at its `config_hash` (and `build_hash`, when the
 spec has one) with a ready, non-drifted instance of that sandbox from
@@ -728,34 +732,41 @@ which repos a host has, so `has_repo` is the caller's to fill.
 
 ### In the `run` verb
 
-The daemon's `run` verb places a request that names no `machine` and
-isn't `here` (`daemon.rs` `placed_run`, the decisions pure in
-`fleet::placed`). Placement runs on a hub in practice: the candidates are
-this host and its offered workers (`placed::workers`; code moves only
-over a worker's link, so an ssh machine is never placed on, only pinned
-with `--machine` or a qualified name, which are forwarded as before), and
-only a hub has offered workers.
+A hub's (`[serve] hub`) `run` verb places a request that names no
+`machine` and isn't `here` (`daemon.rs` `placed_run`, the decisions pure
+in `fleet::placed`); any other host runs it here. The candidates are this host and every machine, ssh,
+inbound or offered (`placed::workers`: placement candidates are every
+neighbor), the ones whose link is up taking new work; code moves over
+the machine's link into this host's fleet root there, which every
+peer link's `TRANSFER` receives into (`Shared::serve_channel`), so a
+placed run needs no ssh of its own. A `--machine` or qualified run is
+forwarded as before.
 
-- **Worth it?** `placed::worth_placing`: some worker reachable (an
-  offered link `connected`). If none, the run is local with nothing else
-  read or asked.
+- **Worth it?** `placed::worth_placing`: some machine reachable (its
+  link `connected`, read from the links' last states, no I/O). If none,
+  the run is local with nothing else read or asked.
 - **Fresh reports** (`daemon.rs` `fresh_capacities`): each reachable
-  worker is asked `capacity.get`, in parallel, each on a fresh `API`
-  stream over its offered dial (`machines::link::handshake`, then the
+  machine is asked `capacity.get`, in parallel, each on a fresh `API`
+  stream over its link's dial (`machines::link::handshake`, then the
   call), each bounded by `placed::CAPACITY_WAIT` (2 s) for the dial and
-  hello and again for the answer. An answer replaces the worker's saved
-  report and lending state (`placed::with_fresh`, pure); a timeout or an
-  error leaves the saved one (its last push, or `remotes.json`'s).
+  hello and again for the answer. An answer replaces the machine's saved
+  report, and an offered worker's lending state (`placed::with_fresh`,
+  pure); a timeout or an error leaves the saved one (its last push, or
+  `remotes.json`'s).
 - **Candidates** (`placed::candidates`): `Candidate::local` with this
   host's capacity built now (`Shared::capacity`, as `capacity.get`
   answers it) and every watched root's snapshot, and `from_machine` for
-  each worker with its fresh report. The `Spec` (`placed::spec`) takes the sandbox's
+  each machine with its fresh report. The `Spec` (`placed::spec`) takes the sandbox's
   `config_hash` / `build_hash` from the request root's snapshot when it
   is watched, and the requester is this host.
 - **Decide** (`placed::decide`): this host wins (the `REQUESTER` bias
-  breaks a tie) → the local verb, unchanged. A worker wins →
-  `code::prepare` for it: the worker's fleet root is its registry entry's
-  one root, the transfer its link's `LinkTransfer`, the repo cache
+  breaks a tie) → the local verb, unchanged. A machine wins →
+  `code::prepare` for it: its fleet root for this host is an offered
+  worker's registry entry's one root, any other machine's the row its
+  `roots.list` flags `fleet` over a fresh `API` stream
+  (`daemon::fleet_root_on`, `placed::fleet_root`; none, or no answer
+  within `CAPACITY_WAIT`, is a `NotMovable`), the transfer its link's
+  `LinkTransfer` (`fleet-<name>.transfer.sock`), the repo cache
   `Options::repos` (default `code::repos_dir`), the config root the
   request's, the branch its `branch`. `NotMovable(why)` runs it here with
   `note: not placed on <worker>: <why>; running here` first in the
@@ -770,10 +781,11 @@ only a hub has offered workers.
   answer carry `machine` (`placed::Tagged`, `placed::tag_answer`), so the
   CLI prints `<worker>/<instance>`, cancels there on Ctrl-C, and the
   dashboard's status line names it so.
-- **`drain` is a hard no at the worker**: on a Worker connection a `run`
+- **`drain` is a hard no at the worker**: on a peer connection a `run`
   is refused `denied` with `lent::DRAINING` (`this worker is draining: no
   new work`) while the lending thread drains (`Lender::draining`, the
-  live state, not the file; `lent::refuse_new_work`); `start`, `stop`,
+  live state, not the file; `lent::refuse_new_work`), whichever kind of
+  machine it is to the placing host; `start`, `stop`,
   `rm` and `rebuild` of what's placed there go on. A fresh report already
   keeps a draining worker out of the candidates; if the hub picked it
   anyway (no report in time, a drain since), the code has moved but the

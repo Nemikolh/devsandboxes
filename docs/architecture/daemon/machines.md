@@ -1,22 +1,24 @@
 # Machines: remote hosts over ssh
 
 A machine is a remote host running devsandbox, registered with `devsandbox
-machine add`. The local daemon holds one link to each machine (for an ssh
-machine `ssh <target> devsandbox fleet-link --peer <this host>`, a
-[peer link](fleet.md#peer-links)), talks to the machine's daemon over its
+machine add`, or one that registered this host from its end (an
+[inbound neighbor](#inbound-neighbors)). The local daemon holds one link to
+each machine (for an ssh machine `ssh <target> devsandbox fleet-link --peer
+<this host>`, a [peer link](fleet.md#peer-links); for an inbound one the
+peer link it dialed), talks to the machine's daemon over its
 `API` streams, merges its rows into watched snapshots, and forwards
 requests for its instances. Read this before
 touching anything that takes a `machine` param or a `m/name`.
 
 Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
-`RawEntry`, `path`, `parse`, `update`,
+`RawEntry`, `path`, `parse`, `update`, `inbound.rs` (`Neighbors`, `Guard`),
 `check_name`, `Where`, `parse_name`, `default_name`), `ssh.rs`
 (`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
 `parse_target`, `Dial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
 `Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
-federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
+federated joins), `cli.rs` (`machine_names`, `plan`, `Plan`, `machine_use`, `route`,
 `localize`, `Reconnect`, `dials`, `pipe_mode`, `attach_mode`), `cli/calls.rs` (`use_of`, `Use`,
 `Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
 `parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
@@ -46,8 +48,12 @@ written only when on). Only the daemon writes it
 (`machines.add`/`set`/`rm`, `fleet.offer`): locked read-modify-write on `machines.lock`, temp
 file + rename (`serve::locked_file::update`), since two daemons overlap during a handoff. A file that
 doesn't parse is logged and changes nothing. The CLI reads it only to know
-whether any machine exists, so with none every command resolves exactly as
-without machines and never starts a daemon it didn't need.
+which machines exist (`cli::machine_names`), adding the inbound ones a
+running daemon lists (`machines.list`, without a lazy start) only when the
+socket dir holds a `fleet-*.sock` none of the registered machines' links
+binds (`cli::foreign_link_sockets`), so with no machine of either kind every
+command resolves exactly as without machines and never contacts a daemon it
+didn't need.
 
 Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
 Default: the target's host (`default_name`). `parse_name` splits a CLI
@@ -60,22 +66,44 @@ collides with an instance name.
 A machine whose link to this host was dialed from its end (`machine add
 <this host>` run there, a [peer link](fleet.md#peer-links)) is an inbound
 neighbor here while that link is up: never in `machines.toml`, memory
-only (`machines::inbound::Neighbors`, on `machines::api::Ctx`). Its
-`fleet-link --peer <name>` announces it (`links.inbound`) on a connection
-it holds; the neighbor lasts while that connection does (`Guard`, the
-newest announce of a name winning, so an older connection's close never
-removes a newer one's). `machines.list` lists the neighbors after the
-registry's entries, as rows of `kind` `inbound` (`MachineKind::Inbound`):
-no `target`, `command` or `capacity`, `agent` off, `state` always
-`connected`, `version` the link `Hello` it said (build, platform,
-`hub|member`), `roots` its own config roots and this host's fleet root
+only (`machines::inbound::Neighbors`, shared by `machines::api::Ctx`, the
+`Machines` service and the forwards registry). Its `fleet-link --peer
+<name>` announces it (`links.inbound`) on a connection it holds; the
+neighbor lasts while that connection does (`Guard`, the newest announce
+of a name winning, so an older connection's close never removes a newer
+one's). Its roots are its own config roots and this host's fleet root
 there, as its daemon answered `roots.list` over the link once announced
-(`daemon::inbound_roots`; empty until then). `devsandbox machine ls`
-shows `inbound` as the TARGET. A name is a registry entry's or a
-neighbor's, never both: `links.inbound` refuses a name `machines.toml`
-has (any kind), `machines.add` and `fleet.offer` a live neighbor's
-(`inbound::taken`). `Kind::from_wire` refuses `inbound`: a neighbor
-isn't something to dial.
+(`daemon::inbound_roots`; empty until then).
+
+An inbound neighbor is a machine like a registered one (fleet plan
+decision 28), of kind `inbound` (`Kind::Inbound`, `MachineKind::Inbound`,
+`Entry::inbound`): the service holds a link to it
+([Held links](#held-links-machines)), so it has rows in federated
+snapshots and the dashboard, quick calls and verbs with `machine: <name>`
+and qualified names `<name>/x` reach it ([Forwarded
+requests](#forwarded-requests)), the CLI's re-runs, terminal tabs and
+forwards go over its `fleet-<name>.*.sock` (which its `fleet-link --peer`
+binds here), and placement may pick it
+([fleet](fleet.md#placement)). Every stream this host opens on it is
+served by its daemon under its trust table for this host (its registry
+entry's name for this host is the peer there, its fleet root
+`fleet/<that name>/`). `machines.list` lists the neighbors after the
+registry's entries, `machines.get` answers them: no `target` or
+`command`, `agent` off, `state`, `error`, `version` and `capacity` its
+held link's. Its agent direction is the dialer's (fleet plan decision
+30): its agent reaches this host's instances while its entry for this
+host has `agent` on there; this host's never reaches it, so
+`machines.set` refuses its `agent` (`api::inbound_agent`, `denied`), as
+the Machines tab's `a` does, and `machines.rm` refuses it (it goes with
+its link: `machine rm` there). When the neighbor goes, so does the
+machine: its link is stopped and its rows dropped (not kept as
+`unreachable`: nothing here could reach it again), and its forwards go
+(`forwards::Known`). `devsandbox machine ls` shows `inbound` as the
+TARGET. A name is a registry entry's or a neighbor's, never both:
+`links.inbound` refuses a name `machines.toml` has (any kind),
+`machines.add` and `fleet.offer` a live neighbor's (`inbound::taken`);
+should one race the other, the registry's entry is the machine
+(`service::with_inbound`).
 
 ## ssh
 
@@ -205,12 +233,16 @@ older side. The first skipped line (cut at 200 chars) is kept on
 ## Held links: `Machines`
 
 The daemon runs a `Machines` service for its whole life: one
-`serve-machine-<name>` thread per registered machine, plus, for an ssh
-machine, a `serve-machine-<name>-link` thread carrying its link, started,
-stopped or restarted when `add`/`set`/`rm` change the registry
-(`Handle::reload`: a change to a machine's entry restarts its link,
-except a change of `agent` alone, which the live link keeps). Every link
-is held from the start, wanted or not (fleet plan decision 7).
+`serve-machine-<name>` thread per registered machine and per inbound
+neighbor up now, plus, for an ssh machine, a `serve-machine-<name>-link`
+thread carrying its link, started, stopped or restarted when `add`/`set`/`rm`
+change the registry or a neighbor comes, goes or gets its roots
+(`Handle::reload`, which the neighbors' hook, `Neighbors::on_change`,
+calls; one reload at a time; a change to a machine's entry restarts its
+link, except a change of `agent` alone, which the live link keeps).
+`Handle::entries` is both sources (`service::with_inbound`). Every link is
+held from the start, wanted or not (fleet plan decision 7), an inbound
+one's while its neighbor is up.
 
 - **The carrier.** An ssh machine's link thread runs the service's `Hold`
   again and again, the backoff (1 s doubling to 30 s, reset once a carrier
@@ -231,8 +263,9 @@ is held from the start, wanted or not (fleet plan decision 7).
   clash: [inbound neighbors](#inbound-neighbors) there). A hub machine on
   another build is followed first ([fleet](fleet.md#versions)). An
   offered machine's carrier is its worker's `fleet-link --worker` here
-  ([fleet](fleet.md#hub-side)): no thread of its own.
-- **The link.** Once the carrier is up (always, for an offered machine)
+  ([fleet](fleet.md#hub-side)), an inbound one's the `fleet-link --peer
+  <name>` that announced it: no thread of their own (`service::carried`).
+- **The link.** Once the carrier is up (always, for an offered or inbound machine)
   the machine thread dials `fleet-<name>.sock` (`Dial`) and says hello,
   subscribes to `instances`, watches each of the machine's roots while a
   local watcher wants machines (`Hooks::watching`), and stores pushed
@@ -247,12 +280,14 @@ is held from the start, wanted or not (fleet plan decision 7).
 differs from the last one logged since the link (or carrier) was up, so
 a machine that's away logs once. A link isn't an idle holder of the
 local daemon. On the machine it's an [inbound neighbor](#inbound-neighbors)
-(`links.inbound`), its streams clients like any other.
+(`links.inbound`), its streams clients like any other, and the machine
+holds a link back over it to this host.
 
 ## Forwarded requests
 
-A request carrying `machine` (not registered: `not-found`) has it stripped
-and goes to that machine, but for the ones served here:
+A request carrying `machine` (neither registered nor an inbound neighbor
+up now: `not-found`) has it stripped and goes to that machine, but for
+the ones served here:
 
 - **Quick calls** (`forward::QUICK`: `instances.list|cancel|procs|signal|
   rename|done|buildLog|resolve`, `containers.logs|inspect`,
@@ -294,8 +329,9 @@ and goes to that machine, but for the ones served here:
 `instances.watch {dir, machines: true}` (the dashboard always sends it)
 gets every push merged with each machine's rows (`snapshots::merge`): rows
 gain `machine` and keep their remote `root`, and a top-level `machines`
-array carries each machine's `name`, `kind` (`ssh` | `offered`), `target`
-(`null` for an offered one), `state`, `error`, `version`, `command`,
+array carries each machine's `name`, `kind` (`ssh` | `offered` |
+`inbound`), `target` (`null` for an offered or inbound one), `state`,
+`error`, `version`, `command`,
 `runtime`, `agent`, `capacity` (its host's
 [capacity report](fleet.md#capacity), from its last push). A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
@@ -528,11 +564,13 @@ trust the hub may be refused those roots
 --agent` saves the machine with `agent` on; adding a name that exists is
 refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
 required) changes it on a registered machine and prints `<name>: agent
-on|off`; on is refused for an offered machine. `ls` shows it in an `AGENT`
-column, and `offered` as an offered machine's `TARGET`; `LEND` and
+on|off`; on is refused for an offered machine, both for an inbound one
+([Inbound neighbors](#inbound-neighbors)). `ls` shows it in an `AGENT`
+column, and `offered` / `inbound` as an offered / inbound machine's
+`TARGET`; `LEND` and
 `CAPACITY` are the machine's last [capacity report](fleet.md#capacity)
 (`machines.list`'s `capacity`, `-` before one came), the over-cap note in
-parentheses. `rm` forgets the machine.
+parentheses. `rm` forgets the machine (refused for an inbound one).
 
 `trust [worker|full]` is about this host, not a registered machine: a
 client of `member.*` (this host's `member.toml`;
@@ -570,14 +608,16 @@ unreachable: <why>` in the header (`pending_note`), the name as `box
 `forwards.add` with `machine` and the row's root (the forward binds here,
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
-listed while a machine is registered, shows every registered machine from
-the snapshot's `machines` with its target (dimmed `offered` for an offered
-fleet worker),
-link state (and error), `agent`, and its LEND and CAPACITY
-([capacity](fleet.md#capacity));
+listed while there is a machine, shows every machine from the snapshot's
+`machines` with its target (dimmed `offered` for an offered fleet worker,
+`inbound` for an inbound one),
+link state (and error), `agent` (`-` for an inbound one), and its LEND
+and CAPACITY ([capacity](fleet.md#capacity));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a
 down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers
-([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*).
+([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*); on an
+inbound machine it only says why there's nothing to flip
+(`App::toggle_selected_agent`).
 
 Limitations: [status.md](../../status.md#daemon)

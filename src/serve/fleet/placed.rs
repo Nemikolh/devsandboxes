@@ -1,9 +1,11 @@
 //! The daemon's `run` verb placed (docs/architecture/daemon/fleet.md,
 //! *Placement*; fleet step 3c): a `run` that names no `machine` and isn't
-//! `here` goes where [`place::place`] says among this host and its offered
-//! fleet workers. On a worker, its sandbox's code moves there first
-//! (`code::prepare`), then the request is forwarded as a `machine` one
-//! would be, in the moved config root.
+//! `here` goes where [`place::place`] says among this host and every
+//! machine whose link is up (ssh, inbound or offered: fleet step 8d). On a
+//! machine, its sandbox's code moves first, into this host's fleet root
+//! there (`code::prepare`; [`fleet_root`] says where that is), then the
+//! request is forwarded as a `machine` one would be, in the moved config
+//! root.
 //!
 //! Pure but for the `prepare` the daemon passes [`decide`]: the
 //! candidates ([`candidates`], each worker's fresh `capacity.get` answer
@@ -21,16 +23,24 @@ use serde_json::{Value, json};
 
 use super::code::{Prepared, Unprepared};
 use super::place::{self, Candidate, MachineRef, Placement, Spec};
+use crate::serve::api::RootCandidate;
 use crate::serve::capacity::Capacity;
 use crate::serve::machines::MachineKind;
 use crate::serve::snapshots::Machine;
 use crate::serve::verbs;
 
-/// The machines placement may pick besides this host: offered fleet
-/// workers only, the hosts code moves to (through their link). An ssh
-/// machine is reached with `--machine` or a qualified name.
+/// The machines placement may pick besides this host: every one, whatever
+/// its kind (the candidates are every neighbor); [`place::reachable`]
+/// keeps those whose link is up.
 pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
-    machines.iter().filter(|m| m.kind == MachineKind::Offered)
+    machines.iter()
+}
+
+/// This host's fleet root on a machine, from its `roots.list` answer over
+/// the link (the row flagged `fleet`, `fleet::lent::with_fleet_root`):
+/// where placement moves code to. `None` when none is flagged.
+pub fn fleet_root(rows: &[RootCandidate]) -> Option<PathBuf> {
+    rows.iter().find(|r| r.fleet).map(|r| r.root.clone())
 }
 
 /// How long a worker's `capacity.get` (its dial, hello and answer) may
@@ -40,22 +50,26 @@ pub const CAPACITY_WAIT: Duration = Duration::from_secs(2);
 /// The workers placement asks for a fresh report: the reachable ones
 /// (their link up), whatever their saved report says.
 pub fn reachable_workers(machines: &[Machine]) -> Vec<String> {
-    workers(machines).filter(|m| place::reachable(m.kind, m.state)).map(|m| m.name.clone()).collect()
+    workers(machines).filter(|m| place::reachable(m.state)).map(|m| m.name.clone()).collect()
 }
 
-/// Whether placing can pick anything but this host: some worker is
-/// reachable. Checked first, so a host without one (every host but a hub
-/// with a worker linked) pays nothing, not even a `capacity.get`.
+/// Whether placing can pick anything but this host: some machine is
+/// reachable. Checked first (no I/O: the links' last states), so a host
+/// with no machine linked pays nothing, not even a `capacity.get`.
 pub fn worth_placing(machines: &[Machine]) -> bool {
     !reachable_workers(machines).is_empty()
 }
 
-/// `c` with its machine's fresh report, when one came: its capacity and
-/// lending state replace the saved report's (pure). None came (a timeout,
-/// an error): the saved one stands.
-pub fn with_fresh(c: Candidate, fresh: Option<&Capacity>) -> Candidate {
+/// `c` with its machine's fresh report, when one came: its capacity
+/// replaces the saved report's, and for an offered worker (of `kind`) its
+/// lending state too (pure; lending is lending's alone, `place::lends`).
+/// None came (a timeout, an error): the saved one stands.
+pub fn with_fresh(c: Candidate, kind: MachineKind, fresh: Option<&Capacity>) -> Candidate {
     match fresh {
-        Some(f) => Candidate { lending: f.lending.unwrap_or(c.lending), capacity: Some(f.clone()), ..c },
+        Some(f) => {
+            let lending = if place::lends(kind) { f.lending.unwrap_or(c.lending) } else { c.lending };
+            Candidate { lending, capacity: Some(f.clone()), ..c }
+        }
         None => c,
     }
 }
@@ -88,7 +102,7 @@ pub fn candidates(
     fresh: &BTreeMap<String, Capacity>,
 ) -> Vec<Candidate> {
     let mut out = vec![Candidate::local(spec, capacity, local_roots.iter().map(|v| v.as_ref()))];
-    out.extend(workers(machines).map(|m| with_fresh(Candidate::from_machine(spec, m), fresh.get(&m.name))));
+    out.extend(workers(machines).map(|m| with_fresh(Candidate::from_machine(spec, m), m.kind, fresh.get(&m.name))));
     out
 }
 
@@ -291,19 +305,44 @@ mod tests {
     }
 
     #[test]
-    fn worth_placing_wants_a_reachable_worker() {
+    fn worth_placing_wants_a_connected_machine() {
         use LinkState::*;
         let roomy = || Some(cap(28, 0, None));
         let drain = Some(Capacity { lending: Some(State::Drain), ..cap(28, 0, None) });
-        let ssh_lending = worker("srv", MachineKind::Ssh, Connected, roomy());
         assert!(!worth_placing(&[]), "no machines");
-        assert!(!worth_placing(&[ssh_lending]), "ssh machines aren't placed on");
-        assert!(!worth_placing(&[worker("lap", MachineKind::Offered, Idle, roomy())]), "its link is down");
+        for kind in [MachineKind::Ssh, MachineKind::Inbound, MachineKind::Offered] {
+            assert!(worth_placing(&[worker("m", kind, Connected, roomy())]), "{kind:?}: every kind is a candidate");
+            for down in [Idle, Connecting, Unreachable] {
+                assert!(!worth_placing(&[worker("m", kind, down, roomy())]), "{kind:?} {down:?}: its link is down");
+            }
+        }
         // Its saved report may be stale: asked afresh either way.
         assert!(worth_placing(&[worker("lap", MachineKind::Offered, Connected, drain)]));
         assert!(worth_placing(&[worker("lap", MachineKind::Offered, Connected, None)]));
-        let both = [worker("a", MachineKind::Offered, Connected, None), worker("b", MachineKind::Offered, Unreachable, None)];
-        assert_eq!(reachable_workers(&both), ["a"]);
+        let all = [
+            worker("a", MachineKind::Offered, Connected, None),
+            worker("b", MachineKind::Offered, Unreachable, None),
+            worker("c", MachineKind::Inbound, Connected, None),
+            worker("d", MachineKind::Ssh, Connected, None),
+            worker("e", MachineKind::Ssh, Idle, None),
+        ];
+        assert_eq!(reachable_workers(&all), ["a", "c", "d"]);
+    }
+
+    #[test]
+    fn the_fleet_root_is_the_flagged_row() {
+        let row = |root: &str, fleet| RootCandidate { root: root.into(), sandboxes: vec![], error: None, fleet };
+        assert_eq!(fleet_root(&[row("/own", false), row("/d/fleet/hub", true)]), Some(PathBuf::from("/d/fleet/hub")));
+        assert_eq!(fleet_root(&[row("/own", false)]), None);
+        // As the wire has it: absent is unflagged.
+        let rows: Vec<RootCandidate> = serde_json::from_value(json!([
+            {"root": "/own", "sandboxes": [], "error": null},
+            {"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": true},
+        ]))
+        .unwrap();
+        assert_eq!(fleet_root(&rows), Some(PathBuf::from("/d/fleet/hub")));
+        crate::serve::dts::assert_matches("RootCandidate", &serde_json::to_value(&rows[1]).unwrap());
+        crate::serve::dts::assert_matches("RootCandidate", &serde_json::to_value(&rows[0]).unwrap());
     }
 
     /// A fresh `capacity.get` answer over the saved report; none: the saved one.
@@ -313,13 +352,21 @@ mod tests {
         let saved = Capacity { lending: Some(State::Drain), ..cap(4, 6, None) };
         let m = worker("lap", MachineKind::Offered, LinkState::Connected, Some(saved.clone()));
         let fresh = cap(28, 0, None);
-        let c = with_fresh(Candidate::from_machine(&s, &m), Some(&fresh));
+        let offered = MachineKind::Offered;
+        let c = with_fresh(Candidate::from_machine(&s, &m), offered, Some(&fresh));
         assert_eq!((c.lending, c.capacity.as_ref()), (State::On, Some(&fresh)));
-        let c = with_fresh(Candidate::from_machine(&s, &m), None);
+        let c = with_fresh(Candidate::from_machine(&s, &m), offered, None);
         assert_eq!((c.lending, c.capacity.as_ref()), (State::Drain, Some(&saved)));
         // No lending in the fresh one (no `lend.toml` there): the saved state.
-        let c = with_fresh(Candidate::from_machine(&s, &m), Some(&Capacity { lending: None, ..fresh.clone() }));
+        let c = with_fresh(Candidate::from_machine(&s, &m), offered, Some(&Capacity { lending: None, ..fresh.clone() }));
         assert_eq!(c.lending, State::Drain);
+        // Any other kind's lending state isn't placement's: a drain there takes work.
+        for kind in [MachineKind::Ssh, MachineKind::Inbound] {
+            let other = Machine { kind, ..m.clone() };
+            let drained = Capacity { lending: Some(State::Drain), ..fresh.clone() };
+            let c = with_fresh(Candidate::from_machine(&s, &other), kind, Some(&drained));
+            assert_eq!((c.lending, c.capacity.as_ref()), (State::On, Some(&drained)), "{kind:?}");
+        }
         // Through `candidates`, by name; the fresh one decides the placement.
         let neutral = worker("lap", MachineKind::Offered, LinkState::Connected, None);
         let stale = candidates(&s, None, &[], std::slice::from_ref(&neutral), &BTreeMap::new());
@@ -339,15 +386,27 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_this_host_and_the_workers() {
+    fn candidates_are_this_host_and_every_machine() {
         let machines = [
             worker("srv", MachineKind::Ssh, LinkState::Connected, None),
             worker("lap", MachineKind::Offered, LinkState::Connected, None),
+            worker("nb", MachineKind::Inbound, LinkState::Connected, None),
+            worker("off", MachineKind::Ssh, LinkState::Unreachable, None),
         ];
         let c = candidates(&spec("web", None), Some(cap(16, 2, None)), &[], &machines, &BTreeMap::new());
-        let names: Vec<_> = c.iter().map(|c| c.machine.to_string()).collect();
-        assert_eq!(names, ["this host", "lap"]);
+        let names: Vec<_> = c.iter().map(|c| (c.machine.to_string(), c.reachable)).collect();
+        let want = [("this host", true), ("srv", true), ("lap", true), ("nb", true), ("off", false)];
+        assert_eq!(names, want.map(|(n, r)| (n.to_string(), r)));
         assert_eq!(c[0].capacity.as_ref().map(|c| c.running), Some(2));
+
+        // An inbound or ssh machine with more room wins over a busy host.
+        let over = Some(Caps { instances: Some(1), ..Caps::default() });
+        for kind in [MachineKind::Inbound, MachineKind::Ssh] {
+            let roomy = [worker("m", kind, LinkState::Connected, Some(cap(28, 0, None)))];
+            let c = candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &roomy, &BTreeMap::new());
+            let placed = decide(&Ask::default(), &spec("web", None), &c, |_| Ok(prepared("main")));
+            assert!(matches!(&placed, Placed::Worker { name, .. } if name == "m"), "{kind:?}: {placed:?}");
+        }
     }
 
     /// The decision over (request, candidates), `prepare` faked: what it

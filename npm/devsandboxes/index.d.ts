@@ -157,8 +157,8 @@ export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
 
 /**
  * How a machine is reached: `ssh` (this host sshes to its `target`), `offered` (a fleet worker that dialed
- * this host; no `target`, nothing sshes to it) or `inbound` (only in `machines.list`: a machine whose link to
- * this host was dialed from its end, listed while that link is up; no `target`, never in the registry).
+ * this host; no `target`, nothing sshes to it) or `inbound` (a machine whose link to this host was dialed
+ * from its end, a machine here while that link is up; no `target`, never in the registry).
  */
 export type MachineKind = 'ssh' | 'offered' | 'inbound';
 
@@ -166,7 +166,7 @@ export type MachineKind = 'ssh' | 'offered' | 'inbound';
 export interface SnapshotMachine {
   name: string;
   kind: MachineKind;
-  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine. */
+  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` or `inbound` machine. */
   target: string | null;
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
@@ -801,6 +801,11 @@ export interface RootCandidate {
   sandboxes: SandboxEntry[];
   /** Why the root's sandboxes can't be read (gone, a config that doesn't load). */
   error: string | null;
+  /**
+   * Set (`true`) on the asking link peer's fleet root on this host, listed last unless it's one of this host's
+   * own roots: where code that peer places here goes. Absent otherwise.
+   */
+  fleet?: boolean;
 }
 
 /** `machines.probe`'s answer: the machine's devsandbox and its candidate roots. */
@@ -821,11 +826,11 @@ export interface MachineAdded {
   warning: string | null;
 }
 
-/** `machines.get`'s answer: what an ssh command to the machine needs. */
+/** `machines.get`'s answer (a registered machine or an inbound one): what an ssh command to the machine needs. */
 export interface MachineInfo {
   name: string;
   kind: MachineKind;
-  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine. */
+  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` or `inbound` machine. */
   target: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
@@ -835,7 +840,7 @@ export interface MachineInfo {
   agent: boolean;
 }
 
-/** One registered machine, or an inbound neighbor (`kind` `inbound`, always `connected`) (`machines.list`). */
+/** One registered machine, or an inbound neighbor up now (`kind` `inbound`), with its held link's state (`machines.list`). */
 export interface MachineRow {
   name: string;
   kind: MachineKind;
@@ -850,7 +855,7 @@ export interface MachineRow {
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
   error: string | null;
-  /** The machine's devsandbox semver, once reached (an `inbound` neighbor's link hello: build, platform, `hub|member`). */
+  /** The machine's devsandbox semver, from its link's last hello. */
   version: string | null;
   /** Its host's capacity, from its last snapshot; `null` before one carried it. */
   capacity: Capacity | null;

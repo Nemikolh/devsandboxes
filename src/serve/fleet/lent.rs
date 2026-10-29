@@ -552,15 +552,20 @@ pub fn filter_answer(method: &str, mut answer: Value, reach: &Reach, state: &Pat
 
 /// A `roots.list` answer (the listing, not a `paths` check) to a peer with
 /// a fleet root, that root added last unless listed already (as
-/// `{root, sandboxes: [], error: null}`: the placed configs are under it):
-/// what the peer reaches here besides this member's own roots, so a peer
-/// link's other end lists it among this member's roots (`machines.list`'s
-/// inbound neighbors).
+/// `{root, sandboxes: [], error: null, fleet: true}`: the placed configs
+/// are under it), flagged `fleet` either way: what the peer reaches here
+/// besides this member's own roots, so a peer link's other end lists it
+/// among this member's roots (an inbound machine's roots) and knows where
+/// its placement moves code to (`fleet::placed::fleet_root`).
 pub fn with_fleet_root(mut answer: Value, reach: &Reach) -> Value {
     let (Some(root), Some(rows)) = (&reach.fleet_root, answer.as_array_mut()) else { return answer };
-    let listed = rows.iter().any(|r| r.get("root").and_then(Value::as_str) == root.to_str());
-    if !listed {
-        rows.push(serde_json::json!({ "root": root, "sandboxes": [], "error": null }));
+    match rows.iter_mut().find(|r| r.get("root").and_then(Value::as_str) == root.to_str()) {
+        Some(row) => {
+            if let Some(row) = row.as_object_mut() {
+                row.insert("fleet".into(), Value::Bool(true));
+            }
+        }
+        None => rows.push(serde_json::json!({ "root": root, "sandboxes": [], "error": null, "fleet": true })),
     }
     answer
 }
@@ -1157,8 +1162,11 @@ mod tests {
         let reach = worker(Path::new("/d/fleet/hub"), &[]);
         let own = json!([{"root": "/own", "sandboxes": [{"name": "web"}], "error": null}]);
         let got = with_fleet_root(own.clone(), &reach);
-        assert_eq!(got, json!([own[0], {"root": "/d/fleet/hub", "sandboxes": [], "error": null}]));
+        assert_eq!(got, json!([own[0], {"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": true}]));
         assert_eq!(with_fleet_root(got.clone(), &reach), got, "listed already");
+        // Listed among the own roots already: flagged there.
+        let listed = json!([{"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": false}]);
+        assert_eq!(with_fleet_root(listed, &reach), json!([{"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": true}]));
         let relay = Reach { fleet_root: None, ..reach.clone() };
         assert_eq!(with_fleet_root(own.clone(), &relay), own, "no fleet root: as is");
         assert_eq!(with_fleet_root(json!({"x": 1}), &reach), json!({"x": 1}), "not a listing");

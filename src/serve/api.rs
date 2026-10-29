@@ -342,6 +342,10 @@ pub struct RootCandidate {
     pub root: PathBuf,
     pub sandboxes: Vec<SandboxEntry>,
     pub error: Option<String>,
+    /// The asking link peer's fleet root on this host (`fleet::lent::with_fleet_root`):
+    /// where code placed by that peer goes. Only written when set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet: bool,
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -830,9 +834,9 @@ fn roots_list(state: &Path, home: Option<&Path>) -> Answer {
             Ok(config) => {
                 let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
                 let sandboxes = names.into_iter().map(SandboxEntry::named).collect();
-                RootCandidate { root, sandboxes, error: None }
+                RootCandidate { root, sandboxes, error: None, fleet: false }
             }
-            Err(e) => RootCandidate { root, sandboxes: Vec::new(), error: Some(e.message) },
+            Err(e) => RootCandidate { root, sandboxes: Vec::new(), error: Some(e.message), fleet: false },
         })
         .collect();
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
@@ -855,7 +859,7 @@ fn roots_check(paths: &[String], home: Option<&Path>) -> Answer {
     let rows: Vec<RootCandidate> = paths
         .iter()
         .map(|given| {
-            let failed = |root: PathBuf, error: String| RootCandidate { root, sandboxes: Vec::new(), error: Some(error) };
+            let failed = |root: PathBuf, error: String| RootCandidate { root, sandboxes: Vec::new(), error: Some(error), fleet: false };
             let rest = if given == "~" { Some("") } else { given.strip_prefix("~/") };
             let root = match (rest, home) {
                 (Some(rest), Some(home)) => home.join(rest),
@@ -873,7 +877,7 @@ fn roots_check(paths: &[String], home: Option<&Path>) -> Answer {
             match config_at(&root) {
                 Ok(config) => {
                     let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
-                    RootCandidate { root, sandboxes: names.into_iter().map(SandboxEntry::named).collect(), error: None }
+                    RootCandidate { root, sandboxes: names.into_iter().map(SandboxEntry::named).collect(), error: None, fleet: false }
                 }
                 Err(e) => failed(root, e.message),
             }
@@ -2765,7 +2769,7 @@ mod tests {
         let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
         let error = ErrorBody { code: "failed".into(), message: "m".into(), data: Some(json!({"exit": 1})) };
 
-        let root = RootCandidate { root: "/cfg".into(), sandboxes: vec![SandboxEntry::named("web".into())], error: None };
+        let root = RootCandidate { root: "/cfg".into(), sandboxes: vec![SandboxEntry::named("web".into())], error: None, fleet: false };
 
         let cases: [(&str, Value); 13] = [
             ("ThreadSummary", v(&summary())),

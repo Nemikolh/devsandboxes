@@ -319,7 +319,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         (true, Some(path)) => Some(service::Hub { remotes: path.clone() }),
         (true, None) => Some(service::Hub { remotes: machines::saved::path()? }),
     };
-    let links = service::Machines::spawn(registry_path.clone(), dial.clone(), hold, opts.machine_timing, hooks, hub, log);
+    // Inbound neighbors are machines too: the service follows them.
+    let inbound: Arc<machines::inbound::Neighbors> = Arc::default();
+    let links =
+        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial.clone(), hold, opts.machine_timing, hooks, hub, log);
     let forwards_machines = registry_path.clone();
     shared.hub = opts.hub;
     if let Some(agent) = &opts.host_agent {
@@ -334,7 +337,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         probe,
         version: opts.version.semver.clone(),
         links: Some(links.handle()),
-        inbound: Arc::default(),
+        inbound: Arc::clone(&inbound),
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
@@ -351,7 +354,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let shared = Arc::clone(&shared);
         let store = super::forward_store::path()?;
         let on_event = Box::new(move |event| shared.publish_forwards(event));
-        Some(Registry::spawn(log, store, forwards_machines, dir.to_path_buf(), on_event))
+        Some(Registry::spawn(log, store, forwards_machines, Arc::clone(&inbound), dir.to_path_buf(), on_event))
     } else {
         None
     };
@@ -1785,9 +1788,9 @@ fn remote_verb(
 /// *Placement*; `fleet::placed`): `None` when it runs here (a note, if
 /// any, already in its output), else the answer of the run forwarded to
 /// the worker it was placed on, in the worker's copy of the config root,
-/// or the failure to move the code there. Placement only looks further
-/// than this host when some offered worker takes work
-/// (`placed::worth_placing`), so in practice only on a hub. Moving the
+/// or the failure to move the code there. Placement runs only on a hub
+/// (`[serve] hub`) and only looks further than this host when some
+/// machine's link is up (`placed::worth_placing`: any kind). Moving the
 /// code (a fetch of each folder's origin, the transfers) runs on this
 /// connection's thread before anything is forwarded; a hang-up meanwhile
 /// is seen once the forward starts.
@@ -1795,6 +1798,11 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     use fleet::placed::{self, Placed};
     let str_of = |k: &str| params.get(k).and_then(Value::as_str);
     if params.get("here").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    // Placement runs on the hub (fleet plan *Placement*): elsewhere a `run`
+    // stays here until step 9 sends it to the hub.
+    if !shared.hub {
         return None;
     }
     let sandbox = str_of("sandbox")?;
@@ -1816,15 +1824,22 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     let ask = placed::Ask { here: false, branch: str_of("branch"), base: str_of("base") };
     let decided = placed::decide(&ask, &spec, &candidates, |worker| {
         use fleet::code::{self, LinkTransfer, Unprepared};
-        let Some(worker_root) = entries.iter().find(|e| e.name == worker).and_then(|e| e.roots.first()) else {
-            return Err(Unprepared::NotMovable("its fleet root isn't known (it offered none)".into()));
+        let Some(entry) = entries.iter().find(|e| e.name == worker) else {
+            return Err(Unprepared::NotMovable("it's no longer a machine here".into()));
+        };
+        // An offered worker's fleet root is its entry's (`fleet.offer`);
+        // any other machine says where this host's is over the link.
+        let worker_root = match entry.roots.first() {
+            Some(root) if entry.is_offered() => root.clone(),
+            None if entry.is_offered() => return Err(Unprepared::NotMovable("its fleet root isn't known (it offered none)".into())),
+            _ => fleet_root_on(shared, entry).map_err(Unprepared::NotMovable)?,
         };
         let repos = match &shared.repos {
             Some(repos) => repos.clone(),
             None => code::repos_dir()?,
         };
         let t = LinkTransfer::for_worker(&shared.socket_dir, worker);
-        code::prepare(&t, &repos, worker_root, &root, sandbox, ask.branch)
+        code::prepare(&t, &repos, &worker_root, &root, sandbox, ask.branch)
     });
     let peer = ConnPeer { out: &conn.out, shared };
     let say = |line: &str| {
@@ -1861,7 +1876,26 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     }
 }
 
-/// Each of `workers`' `capacity.get`, asked in parallel over its offered
+/// This host's fleet root on machine `entry`, as its `roots.list` answer
+/// over a fresh `API` stream of the link flags it (`fleet::placed::fleet_root`);
+/// why not, for the note of a run that then stays here.
+fn fleet_root_on(shared: &Shared, entry: &machines::Entry) -> std::result::Result<PathBuf, String> {
+    use fleet::placed::CAPACITY_WAIT;
+    let ctx = shared.machines.as_ref().ok_or("this daemon has no machines")?;
+    let unknown = |why: String| format!("its fleet root for this host isn't known ({why})");
+    let duplex = (ctx.dial)(entry).map_err(|e| unknown(format!("{e:#}")))?;
+    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| unknown(e.to_string()))?;
+    let r = link.conn.call_within("roots.list", json!({}), CAPACITY_WAIT).map_err(|e| unknown(format!("{e:#}")))?;
+    let r = r.ok_or_else(|| unknown("`roots.list` timed out".into()))?;
+    if let Some(e) = r.error {
+        return Err(unknown(format!("roots.list: {}", e.message)));
+    }
+    let rows: Vec<api::RootCandidate> =
+        serde_json::from_value(r.result.unwrap_or(Value::Null)).map_err(|e| unknown(format!("bad roots.list answer: {e}")))?;
+    fleet::placed::fleet_root(&rows).ok_or_else(|| unknown("none listed".into()))
+}
+
+/// Each of `workers`' `capacity.get`, asked in parallel over its link's
 /// dial (a fresh `API` stream: hello, then the call), each bounded by
 /// `placed::CAPACITY_WAIT` for its dial-and-hello and again for its
 /// answer. A worker that doesn't answer in time, or fails, is left out:
@@ -2681,6 +2715,7 @@ pub(crate) mod tests {
             |_| {},
             scratch("fwd-hold-store").join("forwards.toml"),
             scratch("fwd-hold-store").join("machines.toml"),
+            Arc::default(),
             scratch("fwd-hold-store"),
             Box::new(|_| {}),
         );

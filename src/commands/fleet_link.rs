@@ -871,10 +871,11 @@ mod tests {
         let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
         let l_fleet = l_data.join("fleet/K");
         let want = json!([l_own, l_fleet]);
-        wait_for(|| inbound_row(&k_dir).is_some_and(|r| r["roots"] == want), "L listed with its roots");
+        // A machine on K: its held link's state and its daemon's semver.
+        wait_for(|| inbound_row(&k_dir).is_some_and(|r| r["roots"] == want && r["state"] == "connected"), "L listed with its roots");
         let row = inbound_row(&k_dir).unwrap();
         assert_eq!((&row["name"], &row["target"], &row["state"]), (&json!("L"), &Value::Null, &json!("connected")));
-        assert_eq!(row["version"], update::hello_of(false));
+        assert_eq!(row["version"], "0.6.0");
         for socket in [endpoint::fleet_socket(&k_dir, "L"), endpoint::fleet_pty_socket(&k_dir, "L")] {
             assert!(socket.exists(), "{}", socket.display());
         }

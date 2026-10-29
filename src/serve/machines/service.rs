@@ -1,15 +1,18 @@
 //! The held link per machine (docs/architecture/daemon/machines.md, *Held
 //! links: `Machines`*): one `serve-machine-<name>` thread per registered
-//! machine, owned by the [`Machines`] service the daemon runs for its whole
-//! life.
+//! machine and per inbound neighbor up now (`inbound::Neighbors`, whose
+//! hook reloads the service as one comes, goes or gets its roots), owned
+//! by the [`Machines`] service the daemon runs for its whole life.
 //!
 //! Every link is held for as long as the service runs (fleet plan decision
-//! 7). What carries it depends on the machine's kind: an ssh machine's
-//! carrier is its peer link, held by a `serve-machine-<name>-link` thread
-//! running the [`Hold`] (`fleet::dialer`: `fleet-link --peer <this host>`
-//! there through the transport, this end binding `fleet-<name>.*.sock`
-//! here), redialed after the backoff below whenever it ends; an offered
-//! machine's is its worker's `fleet-link --worker` here. Once the carrier
+//! 7), an inbound neighbor's while it's up. What carries it depends on the
+//! machine's kind: an ssh machine's carrier is its peer link, held by a
+//! `serve-machine-<name>-link` thread running the [`Hold`]
+//! (`fleet::dialer`: `fleet-link --peer <this host>` there through the
+//! transport, this end binding `fleet-<name>.*.sock` here), redialed after
+//! the backoff below whenever it ends; an offered machine's is its worker's
+//! `fleet-link --worker` here, an inbound neighbor's the `fleet-link --peer
+//! <it>` that announced it. Once the carrier
 //! is up the link thread dials `fleet-<name>.sock` (the [`Dial`]) and says
 //! hello, subscribes to `instances`, watches each of the machine's roots
 //! while a local connection watches with `machines: true`
@@ -53,8 +56,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use super::Entry;
+use super::inbound::Neighbors;
 use super::link::{self, Link};
+use super::{Entry, Kind};
 use super::saved;
 use super::ssh::Dial;
 use crate::serve::api::ApiError;
@@ -146,6 +150,11 @@ pub struct Handle {
 struct Inner {
     /// `machines.toml`.
     registry: PathBuf,
+    /// The inbound neighbors: a machine each, beside the registry's.
+    inbound: Arc<Neighbors>,
+    /// One [`Handle::reload`] at a time: two reading the sources apart
+    /// could leave a gone neighbor's link behind.
+    reloading: Mutex<()>,
     dial: Dial,
     /// Carries an ssh machine's link.
     hold: Hold,
@@ -167,6 +176,12 @@ struct LinkThread {
     thread: Option<JoinHandle<()>>,
     /// An ssh machine's carrier thread.
     carrier: Option<JoinHandle<()>>,
+}
+
+/// The machine's link has a carrier of its own (an ssh machine): an
+/// offered worker's and an inbound neighbor's is a `fleet-link` here.
+fn carried(entry: &Entry) -> bool {
+    matches!(entry.kind, Kind::Ssh { .. })
 }
 
 /// What a machine's link and carrier threads share with the service: how
@@ -292,14 +307,27 @@ struct Call {
 }
 
 impl Machines {
-    /// Start the service: one link per entry of `registry`, each held at
-    /// once. `dial` opens a machine's link (its `fleet-<name>.sock`, or a
-    /// test daemon's socket), `hold` carries an ssh machine's. A `hub`'s
-    /// saved rows are restored before the links start.
-    pub fn spawn(registry: PathBuf, dial: Dial, hold: Hold, timing: Timing, hooks: Hooks, hub: Option<Hub>, log: fn(&str)) -> Machines {
+    /// Start the service: one link per entry of `registry` and per neighbor
+    /// of `inbound` (from now on as they come and go), each held at once.
+    /// `dial` opens a machine's link (its `fleet-<name>.sock`, or a test
+    /// daemon's socket), `hold` carries an ssh machine's. A `hub`'s saved
+    /// rows are restored before the links start.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
+        registry: PathBuf,
+        inbound: Arc<Neighbors>,
+        dial: Dial,
+        hold: Hold,
+        timing: Timing,
+        hooks: Hooks,
+        hub: Option<Hub>,
+        log: fn(&str),
+    ) -> Machines {
         let hub = hub.map(|h| HubSave { path: h.remotes, state: Mutex::default(), cv: Condvar::new() });
         let inner = Arc::new(Inner {
             registry,
+            inbound,
+            reloading: Mutex::new(()),
             dial,
             hold,
             timing,
@@ -322,6 +350,14 @@ impl Machines {
                 .map_err(|e| log(&format!("cannot start saving remotes.json: {e}")))
                 .ok()
         });
+        // Weak: the neighbors outlive the service (the API's `Ctx` holds
+        // them), and a stopped service has nothing to reload.
+        let weak = Arc::downgrade(&inner);
+        inner.inbound.on_change(Arc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                Handle { inner }.reload();
+            }
+        }));
         let machines = Machines { inner, saver };
         machines.handle().reload();
         machines
@@ -408,21 +444,36 @@ impl Inner {
     }
 }
 
+/// The registry's `entries` and an inbound entry per neighbor up now
+/// (`Entry::inbound`), sorted by name; a registry name wins (the clash
+/// rules refuse one, this covers a race between them).
+fn with_inbound(mut entries: Vec<Entry>, inbound: &Neighbors) -> Vec<Entry> {
+    for n in inbound.list() {
+        if !entries.iter().any(|e| e.name == n.name) {
+            entries.push(Entry::inbound(n.name, n.roots));
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
 /// The same link: everything but `agent`, which the live one follows.
 fn same_link(a: &Entry, b: &Entry) -> bool {
     Entry { agent: b.agent, ..a.clone() } == *b
 }
 
 impl Handle {
-    /// Re-read the registry: start links for new machines, stop (and drop
-    /// the rows of) removed ones, restart changed ones, except for a change
-    /// of `agent` alone, which the live link keeps. `machines.add`, `.set`
-    /// and `.rm` call it; a registry that doesn't load is logged and
-    /// changes nothing.
+    /// Re-read the registry and the inbound neighbors: start links for new
+    /// machines, stop (and drop the rows of) removed ones, restart changed
+    /// ones, except for a change of `agent` alone, which the live link
+    /// keeps. `machines.add`, `.set` and `.rm` call it, as does the
+    /// neighbors' hook; a registry that doesn't load is logged and changes
+    /// nothing.
     pub fn reload(&self) {
         let inner = &self.inner;
+        let _one = lock(&inner.reloading);
         let entries = match super::load(&inner.registry) {
-            Ok(entries) => entries,
+            Ok(entries) => with_inbound(entries, &inner.inbound),
             Err(e) => {
                 (inner.log)(&format!("machines: {e:#}"));
                 return;
@@ -470,9 +521,9 @@ impl Handle {
         }
     }
 
-    /// The registered machines as of the last reload, sorted by name: what
-    /// a forwarded verb dials and a federated call fans out to, without a
-    /// registry read per request.
+    /// The machines as of the last reload (the registry's and the inbound
+    /// neighbors'), sorted by name: what a forwarded verb dials and a
+    /// federated call fans out to, without a registry read per request.
     pub fn entries(&self) -> Vec<Entry> {
         self.inner.lock_links().values().map(|l| l.entry.clone()).collect()
     }
@@ -515,8 +566,9 @@ fn spawn_link(entry: Entry, inner: Arc<Inner>) -> LinkThread {
             .spawn(move || LinkLoop::new(entry, &inner, &ctl).run(&rx))
     };
     let thread = thread.map_err(|e| log(&format!("cannot start machine {}'s link: {e}", entry.name))).ok();
-    // An offered machine's carrier is its worker's `fleet-link` here.
-    let carrier = (!entry.is_offered()).then(|| {
+    // An offered machine's carrier is its worker's `fleet-link` here, an
+    // inbound one's the `fleet-link --peer` that announced it.
+    let carrier = carried(&entry).then(|| {
         let (entry, ctl, tx) = (entry.clone(), Arc::clone(&ctl), tx.clone());
         std::thread::Builder::new()
             .name(format!("serve-machine-{}-link", entry.name))
@@ -661,7 +713,7 @@ impl<'a> LinkLoop<'a> {
     /// `Some` while an ssh machine's carrier is down: why (`None` before
     /// its first attempt ended). A new carrier resets the backoff.
     fn carrier_down(&mut self) -> Option<Option<String>> {
-        if self.entry.is_offered() {
+        if !carried(&self.entry) {
             return None;
         }
         let c = lock(&self.ctl.carrier);
@@ -679,7 +731,7 @@ impl<'a> LinkLoop<'a> {
     /// An ssh machine's carrier went down, or came up again, since this
     /// link dialed it.
     fn carrier_moved(&self) -> bool {
-        if self.entry.is_offered() {
+        if !carried(&self.entry) {
             return false;
         }
         let c = lock(&self.ctl.carrier);
@@ -951,7 +1003,7 @@ mod tests {
         let dials = Arc::new(AtomicUsize::new(0));
         let (up, runs) = (Arc::new(AtomicBool::new(true)), Arc::default());
         let timing = Timing { call: Duration::from_millis(200), ..opts(1, 0).machine_timing };
-        let machines = Machines::spawn(registry, counting_dial(&dials), fake_hold(&up, &runs), timing, no_hooks(), None, |_| {});
+        let machines = Machines::spawn(registry, Arc::default(), counting_dial(&dials), fake_hold(&up, &runs), timing, no_hooks(), None, |_| {});
         let h = machines.handle();
         for round in 1..=2 {
             let r = h.forward("m", "instances.list", json!({"dir": "/x"})).unwrap();
@@ -983,7 +1035,7 @@ mod tests {
         let (up, runs) = (Arc::new(AtomicBool::new(false)), Arc::default());
         let timing = opts(1, 0).machine_timing;
         let log = |line: &str| LOGGED.lock().unwrap().push(line.into());
-        let machines = Machines::spawn(registry, counting_dial(&dials), fake_hold(&up, &runs), timing, no_hooks(), None, log);
+        let machines = Machines::spawn(registry, Arc::default(), counting_dial(&dials), fake_hold(&up, &runs), timing, no_hooks(), None, log);
         let h = machines.handle();
         let state = || h.remotes().get("c").unwrap();
         wait_for("the carrier retried", Duration::from_secs(5), || ran(&runs, "c") >= 3);
@@ -1024,7 +1076,7 @@ mod tests {
         };
         let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
         let (up, runs) = (Arc::new(AtomicBool::new(false)), Arc::default());
-        let machines = Machines::spawn(registry.clone(), no_dial, fake_hold(&up, &runs), opts(1, 0).machine_timing, hooks, None, |_| {});
+        let machines = Machines::spawn(registry.clone(), Arc::default(), no_dial, fake_hold(&up, &runs), opts(1, 0).machine_timing, hooks, None, |_| {});
         let h = machines.handle();
         assert!(!h.remotes().get("m").unwrap().agent);
         let ctl = Arc::clone(&h.inner.lock_links()["m"].ctl);
@@ -1079,7 +1131,7 @@ mod tests {
         };
         let runs = Arc::new(Mutex::new(Vec::new()));
         let hold = fake_hold(&Arc::new(AtomicBool::new(false)), &runs);
-        let machines = Machines::spawn(registry, dial, hold, opts(1, 0).machine_timing, no_hooks(), hub, log);
+        let machines = Machines::spawn(registry, Arc::default(), dial, hold, opts(1, 0).machine_timing, no_hooks(), hub, log);
         (machines, up, dials, runs)
     }
 

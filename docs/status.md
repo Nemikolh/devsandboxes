@@ -39,9 +39,10 @@ limitation means editing this file in the same commit.
   an inbound neighbor in its `machines.list`), every machine reached at
   its `fleet-<name>.*.sock`, every use of any machine over its channels
   (the CLI's commands, 8a; the dashboard's terminals, forwards and
-  `port`, 8b), ssh only at `machine add` (8c); still two kinds of machine
-  (offered workers lend over `fleet join`) until the rest of step 8 makes
-  inbound neighbors machines and drops lending.
+  `port`, 8b), ssh only at `machine add` (8c); inbound neighbors are
+  machines (8d: rows, forwarding, the CLI's names, forwards, placement
+  over every connected machine); offered workers still lend over `fleet
+  join` until 8e drops lending.
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -358,16 +359,24 @@ limitation means editing this file in the same commit.
   the hub only as an offered machine whose link is gone (`unreachable`);
   the reason is on the worker (`lend.get`, `serve.log`).
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::worker` `run_link`
+- An inbound machine lasts while its link is up: when it goes (a
+  laptop asleep, its network down) its rows and its forwards on this
+  host go with it, not kept as `unreachable`, and come back (forwards
+  not) when it dials again.
+  → [machines](architecture/daemon/machines.md#inbound-neighbors); `forwards::Known`
 - Placement's `has_image` reads only watched roots' snapshots (this
-  host's while watched, a worker's last pushed), and `has_repo` is never
+  host's while watched, a machine's last pushed), and `has_repo` is never
   filled (no repo locality yet).
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::candidates`
 - A placed `run` is placed only by the daemon's `run` verb: a CLI `run`
   with no daemon to reach, the dispatcher's children and `--in-process`
-  runs stay here (fleet step 13 for children), and only offered workers
-  are candidates (an ssh machine needs `--machine` or a qualified name).
-  The hub's `state.toml` doesn't record a placed instance (it's the
-  worker's, seen as `<worker>/<name>` in federated views; fleet step 13).
+  runs stay here (fleet step 13 for children), and only a hub (`[serve]
+  hub`) places: a `run` typed elsewhere stays there (step 9 sends it to
+  the hub). On a hub every connected machine is a candidate (ssh,
+  inbound and offered), so it asks each a `capacity.get` (2 s at most)
+  before every unpinned `run` (`--here` keeps it local).
+  The placing host's `state.toml` doesn't record a placed instance (it's the
+  machine's, seen as `<machine>/<name>` in federated views; fleet step 13).
   Moving the
   code runs before the forward and isn't cancelled by a hang-up or Ctrl-C
   meanwhile (the run, once forwarded, is); a worker that refuses the run

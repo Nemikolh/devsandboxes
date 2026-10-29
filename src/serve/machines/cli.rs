@@ -616,6 +616,50 @@ fn connect() -> Result<Conn> {
     endpoint::socket_dir().and_then(|dir| client::connect(&dir, "cli"))
 }
 
+/// The machine names a CLI `<name>` may point at (what [`route`] and
+/// `verbs_client::Fed` take): the registered ones, read from the file
+/// ([`super::registered_names`]), plus the inbound machines a running
+/// daemon lists (`machines.list`), asked only when the socket dir holds a
+/// link socket no registered machine's link binds ([`foreign_link_sockets`]):
+/// an inbound one's `fleet-link --peer` binds `fleet-<name>.sock` there. So
+/// a host without machines still contacts no daemon, nor starts one.
+pub fn machine_names() -> Vec<String> {
+    let mut names = super::registered_names();
+    let Ok(dir) = endpoint::socket_dir() else { return names };
+    let Ok(files) = std::fs::read_dir(&dir) else { return names };
+    let files: Vec<String> = files.flatten().map(|f| f.file_name().to_string_lossy().into_owned()).collect();
+    if !foreign_link_sockets(&dir, &files, &names) {
+        return names;
+    }
+    let version = crate::serve::proto::Version::current();
+    let Ok(Some(mut conn)) = client::connect_running(&dir, "cli", &version, Duration::from_secs(2)) else { return names };
+    let rows = conn.call("machines.list", Value::Null).ok().and_then(|r| r.result).unwrap_or(Value::Null);
+    let rows: Vec<super::api::MachineRow> = serde_json::from_value(rows).unwrap_or_default();
+    for r in rows {
+        if r.kind == super::MachineKind::Inbound && !names.contains(&r.name) {
+            names.push(r.name);
+        }
+    }
+    names
+}
+
+/// Whether `files` (names in socket dir `dir`) hold a `fleet-*.sock` that
+/// isn't one of `registered`'s link sockets (`endpoint::fleet_socket` and
+/// its `.pty`, `.tunnel`, `.transfer` siblings): some other machine's link
+/// is up here, an inbound one's (or a stale socket, which the daemon then
+/// lists no machine for).
+pub(crate) fn foreign_link_sockets(dir: &Path, files: &[String], registered: &[String]) -> bool {
+    let name = |p: PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let ours: Vec<String> = registered
+        .iter()
+        .flat_map(|m| {
+            let channels = ["pty", "tunnel", "transfer"].map(|s| name(endpoint::fleet_channel_socket(dir, m, s)));
+            std::iter::once(name(endpoint::fleet_socket(dir, m))).chain(channels)
+        })
+        .collect();
+    files.iter().any(|f| f.starts_with("fleet-") && f.ends_with(".sock") && !ours.contains(f))
+}
+
 /// `machines.get`'s params for machine `m`: with `own_agent` when absolute
 /// (the daemon then serves the machine's `AGENT` streams with it).
 pub(crate) fn info_params(m: &str, own_agent: Option<PathBuf>) -> Value {
@@ -629,8 +673,8 @@ pub(crate) fn info_params(m: &str, own_agent: Option<PathBuf>) -> Value {
 /// Where `command` runs (module doc): here (maybe with its name resolved),
 /// or on a machine over its link: API calls through the daemon, `PTY` dials
 /// from this process (a tty `exec` re-dialed after a lost link:
-/// [`reconnect_loop`]). `machine` is `--machine`, `machines` the registered
-/// names ([`super::registered_names`]).
+/// [`reconnect_loop`]). `machine` is `--machine`, `machines` the machine
+/// names ([`machine_names`]).
 pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String], command: Command) -> Result<Routed> {
     match plan(&command, machine, in_process, machines)? {
         Plan::Here => Ok(Routed::Here(command)),
@@ -998,6 +1042,21 @@ mod tests {
         assert_eq!(info_params("box", Some("/tmp/agent.sock".into())), json!({"name": "box", "agent": "/tmp/agent.sock"}));
         assert_eq!(info_params("box", Some("rel.sock".into())), json!({"name": "box"}));
         assert_eq!(info_params("box", None), json!({"name": "box"}));
+    }
+
+    /// The daemon is asked for inbound machines only when a link socket is
+    /// there that no registered machine's link binds.
+    #[test]
+    fn only_a_foreign_link_socket_asks_for_inbound_machines() {
+        let dir = Path::new("/run/devsandbox");
+        let files = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let own = files(&["serve.sock", "fleet-box.sock", "fleet-box.pty.sock", "fleet-box.tunnel.sock", "fleet-box.transfer.sock", "agent-link-box.sock"]);
+        assert!(!foreign_link_sockets(dir, &own, &ms(&["box"])), "box's own");
+        assert!(foreign_link_sockets(dir, &own, &[]), "box isn't registered");
+        assert!(!foreign_link_sockets(dir, &files(&["serve.sock", "fleet.sock"]), &[]), "no machine's");
+        let with_lap = [own, files(&["fleet-lap.sock", "fleet-lap.pty.sock"])].concat();
+        assert!(foreign_link_sockets(dir, &with_lap, &ms(&["box"])), "lap's link is up here");
+        assert!(!foreign_link_sockets(dir, &with_lap, &ms(&["box", "lap"])));
     }
 
     /// What `main` gets for a port: a nameless one's port comes out of

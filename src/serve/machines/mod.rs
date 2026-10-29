@@ -75,12 +75,16 @@ pub enum Kind {
     /// *Hub side*): reached only over the `API` channel of its held fleet
     /// link, through `fleet-<name>.sock`; nothing here can ssh to it.
     Offered,
+    /// An inbound neighbor (`inbound::Neighbors`): it dialed this host, its
+    /// `fleet-link --peer <it>` here binds `fleet-<name>.sock`. Never in
+    /// `machines.toml`: the service makes one of each neighbor up now
+    /// ([`Entry::inbound`]).
+    Inbound,
 }
 
 /// [`Kind`] on the wire (`kind` of `machines.list` / `get` and the
 /// federated snapshot's `machines`, next to a `target` that is `null` for an
-/// offered machine and an inbound neighbor; `inbound` only in
-/// `machines.list`).
+/// offered machine and an inbound neighbor).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MachineKind {
@@ -88,7 +92,7 @@ pub enum MachineKind {
     Ssh,
     Offered,
     /// An inbound neighbor (`inbound`): a machine whose link to this host
-    /// is dialed from its end, listed by `machines.list` while it's up;
+    /// is dialed from its end, a machine here while that link is up;
     /// never a registry entry.
     Inbound,
 }
@@ -99,6 +103,7 @@ impl Kind {
         match self {
             Kind::Ssh { target } => (MachineKind::Ssh, Some(target.clone())),
             Kind::Offered => (MachineKind::Offered, None),
+            Kind::Inbound => (MachineKind::Inbound, None),
         }
     }
 
@@ -109,7 +114,7 @@ impl Kind {
             (MachineKind::Ssh, Some(target)) => Ok(Kind::Ssh { target }),
             (MachineKind::Ssh, None) => bail!("an ssh machine without a target"),
             (MachineKind::Offered, _) => Ok(Kind::Offered),
-            (MachineKind::Inbound, _) => bail!("an inbound neighbor isn't a registry entry"),
+            (MachineKind::Inbound, _) => Ok(Kind::Inbound),
         }
     }
 }
@@ -126,15 +131,21 @@ impl Entry {
         Entry { name: name.into(), kind: Kind::Offered, roots: Vec::new(), command: None, agent: false }
     }
 
+    /// Inbound neighbor `name` as the service holds it: its `roots` as its
+    /// daemon listed them (`inbound::Neighbor::roots`).
+    pub fn inbound(name: impl Into<String>, roots: Vec<PathBuf>) -> Entry {
+        Entry { name: name.into(), kind: Kind::Inbound, roots, command: None, agent: false }
+    }
+
     pub fn command(&self) -> &str {
         self.command.as_deref().unwrap_or("devsandbox")
     }
 
-    /// The ssh target; `None` for an offered machine.
+    /// The ssh target; `None` for an offered machine or an inbound one.
     pub fn target(&self) -> Option<&str> {
         match &self.kind {
             Kind::Ssh { target } => Some(target),
-            Kind::Offered => None,
+            Kind::Offered | Kind::Inbound => None,
         }
     }
 
@@ -142,17 +153,26 @@ impl Entry {
         self.kind == Kind::Offered
     }
 
+    pub fn is_inbound(&self) -> bool {
+        self.kind == Kind::Inbound
+    }
+
     /// What messages and listings call where it is: the target, or
-    /// `offered`.
+    /// `offered` / `inbound`.
     pub fn label(&self) -> &str {
-        self.target().unwrap_or("offered")
+        match self.kind {
+            Kind::Ssh { ref target } => target,
+            Kind::Offered => "offered",
+            Kind::Inbound => "inbound",
+        }
     }
 
     /// The ssh target, for the add-time argv builders ([`ssh`]): an offered
     /// machine has none.
     pub fn ssh_target(&self) -> Result<&str> {
         let name = &self.name;
-        self.target().with_context(|| format!("machine `{name}` is an offered fleet worker, reached over its fleet link, not ssh"))
+        let what = if self.is_inbound() { "links to this host from its end" } else { "is an offered fleet worker" };
+        self.target().with_context(|| format!("machine `{name}` {what}, reached over its fleet link, not ssh"))
     }
 }
 
@@ -191,6 +211,9 @@ impl From<Entry> for RawEntry {
         let (target, offered) = match e.kind {
             Kind::Ssh { target } => (Some(target), false),
             Kind::Offered => (None, true),
+            // Never saved (`update` only holds what `load` read): it would
+            // read back as an entry with neither.
+            Kind::Inbound => (None, false),
         };
         RawEntry { target, offered, roots: e.roots, command: e.command, agent: e.agent }
     }
@@ -379,7 +402,10 @@ mod tests {
         assert_eq!(Kind::from_wire(MachineKind::Ssh, Some("t".into())).unwrap(), Kind::Ssh { target: "t".into() });
         assert_eq!(Kind::from_wire(MachineKind::Offered, None).unwrap(), Kind::Offered);
         assert!(Kind::from_wire(MachineKind::Ssh, None).is_err());
-        assert!(Kind::from_wire(MachineKind::Inbound, None).is_err());
+        assert_eq!(Kind::from_wire(MachineKind::Inbound, None).unwrap(), Kind::Inbound);
+        let lap = Entry::inbound("lap", vec!["/f".into()]);
+        assert_eq!((lap.target(), lap.label(), lap.is_inbound(), lap.kind.wire()), (None, "inbound", true, (MachineKind::Inbound, None)));
+        assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("links to this host from its end"));
     }
 
     #[test]

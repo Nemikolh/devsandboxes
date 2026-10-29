@@ -572,6 +572,7 @@ mod tests {
             root: root.into(),
             sandboxes: sandboxes.iter().map(|s| SandboxEntry::named(s.to_string())).collect(),
             error: error.map(String::from),
+            fleet: false,
         }
     }
 

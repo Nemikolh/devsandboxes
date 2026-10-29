@@ -645,6 +645,184 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A verb on `conn`: its answer, its streamed stdout and stderr.
+    fn verb(conn: &mut Conn, method: &str, params: Value) -> (crate::serve::proto::Response, String, String) {
+        let (mut out, mut err) = (String::new(), String::new());
+        let streamed = conn.call_streaming(method, params, Duration::from_millis(50), &mut |n| {
+            if let Some(n) = n.filter(|n| n.method == "output") {
+                let data = n.params["data"].as_str().unwrap_or_default();
+                if n.params["stream"] == "stdout" { out.push_str(data) } else { err.push_str(data) }
+            }
+            true
+        });
+        let Ok(client::Streamed::Answer(r)) = streamed else { panic!("{method}: no answer") };
+        (r, out, err)
+    }
+
+    /// `rows`' entry named `name`, if any.
+    fn named(rows: &Value, name: &str) -> Option<Value> {
+        rows.as_array()?.iter().find(|r| r["name"] == name).cloned()
+    }
+
+    /// From K's side, the dialed host, L is a machine (kind `inbound`) like
+    /// any other: `machines.list` says connected with its link's version
+    /// and its roots (its fleet root for K among them), `machines.get`
+    /// answers it, a quick call and a forwarded verb run on L under L's
+    /// trust for K (`box` there), K's federated snapshot has L's rows; its
+    /// `agent` and `rm` are refused here. L dropping its entry for K takes
+    /// the machine and its rows away on K.
+    #[test]
+    fn the_dialer_is_an_inbound_machine_on_the_dialed_host() {
+        let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-inbound-l", r#"echo "lap $*""#);
+        let pair = Pair::new("dial-inbound", Vec::new(), |l| {
+            l.verbs = Some(l_runner);
+            l.lend_env = Some(std::collections::BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap_or_default())]));
+            // L's join: one instance in the watched root.
+            l.join = Some(Arc::new(|dir, view| {
+                let mut list = fake_join()(dir, view);
+                let mut row = crate::serve::snapshots::tests::row("lap-1", true, None);
+                row.root = Some(dir.display().to_string());
+                list.snapshot.instances.push(row);
+                list
+            }));
+        });
+        pair.wait_box("box connected", connected);
+        // L's fleet root for K: `fleet/<its name for K>/`.
+        let fleet_root = std::fs::canonicalize(pair.base.join("l-data/fleet/box")).unwrap();
+        let k_rows = || connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+        wait_for("lap connected on K, its roots listed", Duration::from_secs(10), || {
+            named(&k_rows(), "lap").is_some_and(|r| connected(&r) && r["roots"].as_array().is_some_and(|a| !a.is_empty()))
+        });
+        let lap = named(&k_rows(), "lap").unwrap();
+        assert_eq!((&lap["kind"], &lap["target"], &lap["version"], &lap["agent"]), (&json!("inbound"), &Value::Null, &json!("0.6.0"), &json!(false)));
+        assert_eq!(lap["roots"], json!([fleet_root]), "L's own roots (none) and its fleet root for K");
+        crate::serve::dts::assert_matches("MachineRow", &lap);
+        let mut k = connect(&pair.k_dir);
+        let info = k.call("machines.get", json!({"name": "lap"})).unwrap().result.unwrap();
+        assert_eq!(info, json!({"name": "lap", "kind": "inbound", "target": null, "command": null, "roots": [fleet_root], "agent": false}));
+        for (method, params) in [("machines.set", json!({"name": "lap", "agent": true})), ("machines.rm", json!({"name": "lap"}))] {
+            let e = k.call(method, params).unwrap().error.unwrap();
+            assert!(e.code == "denied" && e.message.contains("links to this host from its end"), "{method}: {e:?}");
+        }
+
+        // A quick call: L's answer, within L's trust for K.
+        let r = k.call("instances.list", json!({"dir": fleet_root, "machine": "lap"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let r = k.call("instances.list", json!({"dir": pair.base, "machine": "lap"})).unwrap();
+        assert_eq!(r.error.unwrap().code, "denied", "outside what L's trust table lets K reach");
+        // A forwarded verb runs on L, in L's fleet root for K.
+        let stop = |root: &Path| json!({"root": root, "env": {}, "instance": "lap-1", "machine": "lap"});
+        let (r, out, _) = verb(&mut k, "stop", stop(&fleet_root));
+        assert!(r.error.is_none(), "{r:?}");
+        assert_eq!(out, format!("lap --in-process -C {} stop -- lap-1\n", fleet_root.display()));
+        let (r, ..) = verb(&mut k, "stop", stop(&pair.k_own));
+        assert_eq!(r.error.unwrap().code, "denied", "L's trust: K's own root isn't K's to reach on L");
+
+        // K's federated snapshot: L's rows, tagged `lap`, and the machine.
+        k.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        k.call("instances.watch", json!({"dir": pair.k_own, "machines": true})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let n = k.next_notification(left).unwrap().expect("no snapshot with lap's rows");
+            let rows = n.params["instances"].as_array().cloned().unwrap_or_default();
+            if n.method == "instances.snapshot" && rows.iter().any(|r| r["machine"] == "lap") {
+                let lap_row = rows.iter().find(|r| r["machine"] == "lap").unwrap();
+                assert_eq!(lap_row["name"], "lap-1");
+                assert_eq!(named(&n.params["machines"], "lap").unwrap()["kind"], "inbound");
+                break;
+            }
+        }
+
+        // L drops its entry for K: the link goes, and with it the machine
+        // and its rows on K.
+        assert!(connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().error.is_none());
+        wait_for("lap gone on K", Duration::from_secs(10), || named(&k_rows(), "lap").is_none());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let n = k.next_notification(left).unwrap().expect("no snapshot without lap");
+            if n.method == "instances.snapshot" && named(&n.params["machines"], "lap").is_none() {
+                assert!(!n.params["instances"].as_array().unwrap().iter().any(|r| r["machine"] == "lap"), "its rows went with it");
+                break;
+            }
+        }
+        let e = connect(&pair.k_dir).call("instances.list", json!({"dir": fleet_root, "machine": "lap"})).unwrap().error.unwrap();
+        assert_eq!(e.code, "not-found");
+        drop(k);
+        pair.finish();
+        let _ = std::fs::remove_dir_all(&l_verbs);
+    }
+
+    /// A `run` on K (the dialed host) is placed on L, the inbound machine
+    /// whose fresh `capacity.get` has room: the config root's tar and the
+    /// branch's bundle land in L's fleet root for K (as L's `roots.list`
+    /// flags it), and the run is forwarded there.
+    #[test]
+    fn a_run_is_placed_on_an_inbound_machine() {
+        use crate::serve::capacity::Capacity;
+        use crate::serve::fleet::code::repo::tests::{git, origin_and_checkout};
+        const G: u64 = 1 << 30;
+
+        let (l_runner, l_verbs) =
+            crate::serve::verbs::tests::script_runner("dial-place-l", r#"echo "lap $*"; cat "$3/dockerfiles/web.Dockerfile" "$3/../web/F""#);
+        let (k_runner, k_verbs) = crate::serve::verbs::tests::script_runner("dial-place-k", r#"echo "local $*""#);
+        let path = std::env::var("PATH").unwrap_or_default();
+        let src = scratch("dial-place-src");
+        std::fs::create_dir_all(&src).unwrap();
+        origin_and_checkout(&src, "web");
+        let cfg = src.join("cfg");
+        std::fs::create_dir_all(cfg.join("dockerfiles")).unwrap();
+        std::fs::write(cfg.join(crate::config::CONFIG_FILE), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n").unwrap();
+        std::fs::write(cfg.join("dockerfiles/web.Dockerfile"), "FROM x\n").unwrap();
+        let cfg = std::fs::canonicalize(&cfg).unwrap();
+        let pair = Pair::with(
+            "dial-place",
+            Vec::new(),
+            |k| {
+                // Placement runs on the hub.
+                k.hub = true;
+                k.verbs = Some(k_runner);
+                k.repos = Some(src.join("k-repos"));
+            },
+            |l| {
+                l.verbs = Some(l_runner);
+                l.lend_env = Some(std::collections::BTreeMap::from([("PATH".into(), path.clone())]));
+                let roomy = Capacity {
+                    cpus: Some(8),
+                    mem_total: Some(32 * G),
+                    mem_available: Some(28 * G),
+                    disk_free: Some(400 * G),
+                    disk_total: Some(500 * G),
+                    ..Capacity::default()
+                };
+                l.local_capacity = Some(Arc::new(move || roomy.clone()));
+            },
+        );
+        pair.wait_box("box connected", connected);
+        wait_for("lap connected on K", Duration::from_secs(10), || {
+            let rows = connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+            named(&rows, "lap").is_some_and(|r| connected(&r))
+        });
+        let fleet_root = std::fs::canonicalize(pair.base.join("l-data/fleet/box")).unwrap();
+        let mut k = connect(&pair.k_dir);
+        let (r, out, err) = verb(&mut k, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature"}));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!(r.result.as_ref().unwrap()["machine"], "lap", "{r:?}");
+        assert!(err.starts_with("placed on lap ("), "{err}");
+        let roots: Vec<_> =
+            std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != ".in").collect();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let remote = fleet_root.join("roots").join(&roots[0]).join("cfg");
+        assert_eq!(out, format!("lap --in-process -C {} run --branch=feature -- web\nFROM x\nfeature\n", remote.display()));
+        assert_eq!(git(&remote.join("../web"), &["symbolic-ref", "--short", "HEAD"]), "feature");
+        drop(k);
+        pair.finish();
+        for dir in [src, l_verbs, k_verbs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// K already has a machine named `lap` (the two hosts added each
     /// other): its refusal is box's error here.
     #[test]

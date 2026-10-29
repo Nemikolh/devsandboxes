@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use super::api::ApiError;
 use super::forward_store::{self, Entry};
 use super::machines;
+use super::machines::inbound::Neighbors;
 use crate::commands::{port, services, tunnel};
 use crate::config::{Config, ForwardPort, ServiceScope};
 use crate::devsbd::forward::{local_opener, Forward, ForwardSpec, ForwardState, ForwardStatus, HostPort, PREFER_SPAN};
@@ -142,11 +143,11 @@ pub enum Event {
 
 pub type OnEvent = Box<dyn Fn(Event) + Send>;
 
-/// How one spawn of a forward into `entry`'s `request` reaches it: its
-/// link's tunnel socket in `socket_dir` (`endpoint::fleet_tunnel_socket`),
+/// How one spawn of a forward into machine `name`'s `request` reaches it:
+/// its link's tunnel socket in `socket_dir` (`endpoint::fleet_tunnel_socket`),
 /// for every kind of machine.
-fn via(entry: &machines::Entry, socket_dir: &Path, request: tunnel::Request) -> tunnel::Via {
-    let socket = super::endpoint::fleet_tunnel_socket(socket_dir, &entry.name);
+fn via(name: &str, socket_dir: &Path, request: tunnel::Request) -> tunnel::Via {
+    let socket = super::endpoint::fleet_tunnel_socket(socket_dir, name);
     tunnel::Via::Fleet { socket, request }
 }
 
@@ -178,17 +179,26 @@ impl Registry {
     /// Start the registry thread. `log` writes one `serve.log` line; `store`
     /// is the ad-hoc forwards' file ([`forward_store::path`] outside tests),
     /// restored before any request is served; `machines` is `machines.toml`,
-    /// read for remote forwards (each add, each bridge spawn, each sync);
+    /// read for remote forwards (each add, each bridge spawn, each sync),
+    /// with `inbound`'s neighbors machines beside its entries (while up);
     /// `socket_dir` is the daemon's, where each machine's link has its
     /// tunnel socket; `on_event` gets every [`Event`] (called on the registry
     /// thread: it must not block).
-    pub fn spawn(log: fn(&str), store: PathBuf, machines: PathBuf, socket_dir: PathBuf, on_event: OnEvent) -> Registry {
+    pub fn spawn(
+        log: fn(&str),
+        store: PathBuf,
+        machines: PathBuf,
+        inbound: Arc<Neighbors>,
+        socket_dir: PathBuf,
+        on_event: OnEvent,
+    ) -> Registry {
         let (tx, rx) = mpsc::channel();
         let active = Arc::new(AtomicUsize::new(0));
         let thread = {
             let active = Arc::clone(&active);
             std::thread::Builder::new().name("serve-forwards".into()).spawn(move || {
-                let mut daemon = Daemon::new(log, store, machines, socket_dir, on_event, active);
+                let known = Known { registry: machines, inbound };
+                let mut daemon = Daemon::new(log, store, known, socket_dir, on_event, active);
                 daemon.restore();
                 daemon.poll();
                 daemon.run(&rx);
@@ -254,13 +264,28 @@ impl super::api::Forwarding for Handle {
     }
 }
 
+/// The machines a remote forward may go into: `machines.toml`'s entries
+/// and the inbound neighbors up now.
+#[derive(Clone)]
+struct Known {
+    registry: PathBuf,
+    inbound: Arc<Neighbors>,
+}
+
+impl Known {
+    fn names(&self) -> anyhow::Result<BTreeSet<String>> {
+        let mut names: BTreeSet<String> = machines::load(&self.registry)?.into_iter().map(|m| m.name).collect();
+        names.extend(self.inbound.list().into_iter().map(|n| n.name));
+        Ok(names)
+    }
+}
+
 /// The registry thread's state.
 struct Daemon {
     log: fn(&str),
     /// `forwards.toml`.
     store: PathBuf,
-    /// `machines.toml`.
-    machines: PathBuf,
+    machines: Known,
     /// The daemon's socket dir: the machines' tunnel sockets.
     socket_dir: PathBuf,
     on_event: OnEvent,
@@ -279,7 +304,7 @@ impl Daemon {
     fn new(
         log: fn(&str),
         store: PathBuf,
-        machines: PathBuf,
+        machines: Known,
         socket_dir: PathBuf,
         on_event: OnEvent,
         active: Arc<AtomicUsize>,
@@ -367,11 +392,12 @@ impl Daemon {
         Ok(added)
     }
 
-    /// `forwards.add` into `machine`: it must be registered; the far side
-    /// resolves the rest, on the forward's own thread.
+    /// `forwards.add` into `machine`: it must be registered (or an inbound
+    /// neighbor up now); the far side resolves the rest, on the forward's
+    /// own thread.
     fn add_remote(&mut self, machine: String, req: &AddRequest) -> Result<Added, ApiError> {
-        let known = machines::load(&self.machines).map_err(ApiError::internal)?;
-        if !known.iter().any(|m| m.name == machine) {
+        let known = self.registered().map_err(ApiError::internal)?;
+        if !known.contains(&machine) {
             return Err(ApiError::not_found(machines::no_machine(&machine).to_string()));
         }
         let entry = Entry {
@@ -402,15 +428,13 @@ impl Daemon {
             service: entry.service.clone(),
             port: entry.container_port,
         };
-        // Re-read on every spawn: a changed target heals, a removed machine
-        // is the bridge's error until the next sync drops the forward.
+        // Re-read on every spawn: a removed machine (a gone neighbor) is
+        // the bridge's error until the next sync drops the forward.
         let dial: tunnel::TunnelVia = Box::new(move || {
-            let entry = machines::load(&registry)
-                .map_err(|e| format!("{e:#}"))?
-                .into_iter()
-                .find(|m| m.name == name)
-                .ok_or_else(|| machines::no_machine(&name).to_string())?;
-            Ok(via(&entry, &socket_dir, request.clone()))
+            if !registry.names().map_err(|e| format!("{e:#}"))?.contains(&name) {
+                return Err(machines::no_machine(&name).to_string());
+            }
+            Ok(via(&name, &socket_dir, request.clone()))
         });
         let open = tunnel::remote_opener(machine, dial);
         // No probe fallback: the far helper is the only listening-process lookup.
@@ -423,14 +447,15 @@ impl Daemon {
         Ok((id, entry))
     }
 
-    /// The registered machines' names.
+    /// The machines' names: registered, or inbound neighbors up now.
     fn registered(&self) -> anyhow::Result<BTreeSet<String>> {
-        Ok(machines::load(&self.machines)?.into_iter().map(|m| m.name).collect())
+        self.machines.names()
     }
 
     /// Drop the remote forwards, and their store entries, of machines no
-    /// longer in `machines.toml` (`machine rm`). A registry that doesn't load
-    /// drops nothing; with no remote forwards it isn't read.
+    /// longer in `machines.toml` (`machine rm`) or up as an inbound
+    /// neighbor (its link went). A registry that doesn't load drops
+    /// nothing; with no remote forwards it isn't read.
     fn drop_unregistered(&mut self) {
         if self.remote.is_empty() {
             return;
@@ -1371,6 +1396,7 @@ forwardPorts = ["redis:6379"]
             quiet,
             store.to_path_buf(),
             store.with_file_name("machines.toml"),
+            Arc::default(),
             store.parent().unwrap().to_path_buf(),
             Box::new(move |e| sink.lock().unwrap().push(e)),
         );
@@ -1577,8 +1603,9 @@ forwardPorts = ["redis:6379"]
     }
 
     /// `machine rm`: what each sync runs first drops the machine's forwards
-    /// and their store entries, and only theirs. Called on a [`Daemon`]
-    /// directly: a whole sync also reconciles this host's real state.
+    /// and their store entries, and only theirs; an inbound neighbor's go
+    /// when it does. Called on a [`Daemon`] directly: a whole sync also
+    /// reconciles this host's real state.
     #[test]
     fn a_removed_machines_forwards_are_dropped() {
         let store = tmp("remote-drop").join("forwards.toml");
@@ -1592,7 +1619,20 @@ forwardPorts = ["redis:6379"]
                 seen.fetch_add(1, Ordering::Relaxed);
             }
         });
-        let mut d = Daemon::new(quiet, store.clone(), machines_toml.clone(), tmp("remote-drop-sock"), on_event, Arc::default());
+        let inbound: Arc<Neighbors> = Arc::default();
+        let known = Known { registry: machines_toml.clone(), inbound: Arc::clone(&inbound) };
+        let mut d = Daemon::new(quiet, store.clone(), known, tmp("remote-drop-sock"), on_event, Arc::default());
+        let into_nb = || AddRequest { machine: Some("nb".into()), ..remote_request() };
+        assert_eq!(d.add(into_nb()).unwrap_err().code, "not-found", "no neighbor `nb` yet");
+        let up = inbound.announce("nb", "v", false);
+        d.add(into_nb()).unwrap();
+        d.drop_unregistered();
+        assert_eq!(d.rows(None, true).len(), 1, "a neighbor's forward lasts while it's up");
+        drop(up);
+        d.drop_unregistered();
+        assert!(d.rows(None, true).is_empty(), "gone with it");
+        assert!(forward_store::load(&store).unwrap().is_empty());
+
         let a = d.add(remote_request()).unwrap();
         let b = d.add(AddRequest { machine: Some("other".into()), ..remote_request() }).unwrap();
         d.poll();
@@ -1617,19 +1657,17 @@ forwardPorts = ["redis:6379"]
         assert_eq!(d.rows(None, true).len(), 1);
     }
 
-    /// Every machine, ssh or offered, is reached through its link's tunnel
-    /// socket; the request is the forward's.
+    /// Every machine, whatever its kind, is reached through its link's
+    /// tunnel socket; the request is the forward's.
     #[test]
     fn every_machine_tunnels_over_its_link() {
         let dir = Path::new("/run/devsandbox");
         let request = tunnel::Request { root: "/far/cfg".into(), instance: Some("web".into()), service: None, port: 5432 };
-        let offered = machines::Entry { roots: vec!["/far".into()], ..machines::Entry::offered("lap") };
         assert_eq!(
-            via(&offered, dir, request.clone()),
+            via("lap", dir, request.clone()),
             tunnel::Via::Fleet { socket: dir.join("fleet-lap.tunnel.sock"), request: request.clone() }
         );
-        let ssh = machines::Entry::ssh("box", "me@box");
-        assert_eq!(via(&ssh, dir, request.clone()), tunnel::Via::Fleet { socket: dir.join("fleet-box.tunnel.sock"), request });
+        assert_eq!(via("box", dir, request.clone()), tunnel::Via::Fleet { socket: dir.join("fleet-box.tunnel.sock"), request });
     }
 
     /// A forward into an ssh machine dials its link's tunnel socket on

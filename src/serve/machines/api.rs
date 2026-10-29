@@ -90,10 +90,10 @@ pub struct Added {
     pub warning: Option<String>,
 }
 
-/// One `machines.list` row: the registry entry and its link's live state
-/// (`error` the last failure while `unreachable`; `version` from the last
-/// hello), or an inbound neighbor (`kind` `inbound`: no `target`, always
-/// `connected`, `version` its link `Hello`, `roots` its `roots.list`).
+/// One `machines.list` row: the registry entry, or an inbound neighbor up
+/// now (`kind` `inbound`: no `target`, `roots` its `roots.list`), and its
+/// held link's live state (`error` the last failure while `unreachable`;
+/// `version` from the last hello).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineRow {
     pub name: String,
@@ -204,8 +204,10 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
     to_value(Added { name: entry.name, roots: entry.roots, version, warning })
 }
 
+/// The registry's machines, then the inbound neighbors up now, each with
+/// its held link's state.
 fn list(ctx: &Ctx) -> Answer {
-    let mut rows: Vec<MachineRow> = registered(ctx)?
+    let rows: Vec<MachineRow> = machines(ctx)?
         .into_iter()
         .map(|e| {
             let live = ctx.links.as_ref().and_then(|l| l.remotes().get(&e.name)).unwrap_or_default();
@@ -224,25 +226,29 @@ fn list(ctx: &Ctx) -> Answer {
             }
         })
         .collect();
-    rows.extend(ctx.inbound.list().into_iter().map(|n| MachineRow {
-        name: n.name,
-        kind: MachineKind::Inbound,
-        target: None,
-        roots: n.roots,
-        command: None,
-        agent: false,
-        state: LinkState::Connected,
-        error: None,
-        version: Some(n.version),
-        capacity: None,
-    }));
     to_value(rows)
 }
 
-/// `machines.get`'s answer: the machine's registry entry (what the CLI
-/// routes a command on it with, `machines::cli`). No argv on the wire: a
-/// client wanting an ssh command builds it from `target` and `command`. An
-/// offered machine has no `target`: no ssh to it.
+/// The registry's entries, then an inbound one per neighbor up now whose
+/// name the registry hasn't (`Entry::inbound`).
+fn machines(ctx: &Ctx) -> Result<Vec<Entry>, ApiError> {
+    let mut entries = registered(ctx)?;
+    let inbound: Vec<Entry> = ctx
+        .inbound
+        .list()
+        .into_iter()
+        .filter(|n| !entries.iter().any(|e| e.name == n.name))
+        .map(|n| Entry::inbound(n.name, n.roots))
+        .collect();
+    entries.extend(inbound);
+    Ok(entries)
+}
+
+/// `machines.get`'s answer: the machine's registry entry, or an inbound
+/// neighbor's (what the CLI routes a command on it with, `machines::cli`).
+/// No argv on the wire: a client wanting an ssh command builds it from
+/// `target` and `command`. An offered or inbound machine has no `target`:
+/// no ssh to it.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineInfo {
     pub name: String,
@@ -260,7 +266,7 @@ struct GetParams {
     agent: Option<PathBuf>,
 }
 
-/// One registered machine. `agent` is the caller's `SSH_AUTH_SOCK`
+/// One machine (registered or inbound). `agent` is the caller's `SSH_AUTH_SOCK`
 /// (absolute), reported to this daemon (`bridge::report_agent`), so the
 /// agent this host answers the machine's `AGENT` streams with
 /// (`bridge::host_agent`) is the caller's: what a CLI re-run over ssh on
@@ -271,7 +277,7 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
     {
         return Err(ApiError::invalid(format!("`agent` must be absolute, got `{}`", agent.display())));
     }
-    let entry = registered(ctx)?
+    let entry = machines(ctx)?
         .into_iter()
         .find(|e| e.name == p.name)
         .ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
@@ -307,6 +313,9 @@ fn set(p: SetParams, ctx: &Ctx) -> Answer {
         Some(changed)
     });
     let Some(changed) = changed.map_err(ApiError::internal)? else {
+        if ctx.inbound.contains(&p.name) {
+            return Err(inbound_agent(&p.name));
+        }
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
     };
     if changed && let Some(links) = &ctx.links {
@@ -327,6 +336,12 @@ fn rm(p: NameParams, ctx: &Ctx) -> Answer {
         entries.len() != before
     });
     if !removed.map_err(ApiError::internal)? {
+        if ctx.inbound.contains(&p.name) {
+            return Err(ApiError::denied(format!(
+                "`{}` links to this host from its end (inbound): it goes with that link (`devsandbox machine rm` there)",
+                p.name
+            )));
+        }
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
     }
     if let Some(links) = &ctx.links {
@@ -346,6 +361,15 @@ fn check_command(command: Option<&str>) -> Result<(), ApiError> {
         Some(c) if c.trim().is_empty() => Err(ApiError::invalid("empty `command`: omit it for `devsandbox`")),
         _ => Ok(()),
     }
+}
+
+/// `machines.set` on inbound machine `name`: this host's agent never
+/// reaches it (fleet plan decision 30), so there's no `agent` to set here.
+pub fn inbound_agent(name: &str) -> ApiError {
+    ApiError::denied(format!(
+        "`{name}` links to this host from its end (inbound): this host's agent never reaches it; \
+         its agent reaches this host's instances while its entry for this host has `agent` on (set it there)"
+    ))
 }
 
 fn taken(name: &str) -> ApiError {
@@ -651,7 +675,7 @@ mod tests {
     #[test]
     fn npm_typings_match() {
         use crate::serve::dts::{assert_matches, prop_type, union_members};
-        let root = || RootCandidate { root: "/cfg".into(), sandboxes: vec![], error: None };
+        let root = || RootCandidate { root: "/cfg".into(), sandboxes: vec![], error: None, fleet: false };
         assert_matches("MachineProbe", &to_value(Probed { version: "0.6.0".into(), protocol: 1, roots: vec![root()] }).unwrap());
         let added = Added { name: "m".into(), roots: vec!["/cfg".into()], version: "0.6.0".into(), warning: None };
         assert_matches("MachineAdded", &to_value(added).unwrap());

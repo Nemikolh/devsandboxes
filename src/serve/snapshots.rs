@@ -197,13 +197,14 @@ impl LinkState {
     }
 }
 
-/// One registered machine as federation sees it.
+/// One machine (registered, or an inbound neighbor up now) as federation
+/// sees it.
 #[derive(Debug, Clone, Default)]
 pub struct Machine {
     pub name: String,
-    /// The registry's kind: ssh, or an offered fleet worker.
+    /// Its kind: ssh, an offered fleet worker, or inbound.
     pub kind: MachineKind,
-    /// The ssh target; `None` for an offered machine.
+    /// The ssh target; `None` for an offered or inbound machine.
     pub target: Option<String>,
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
@@ -266,16 +267,18 @@ pub fn restored_error(why: Option<&str>, seen: Option<u64>) -> String {
     }
 }
 
-/// Every registered machine's [`Machine`], by name. The machine links write
-/// it, the daemon reads it to merge; only short in-memory work under its lock.
+/// Every machine's [`Machine`] (the service's entries: registered and
+/// inbound), by name. The machine links write it, the daemon reads it to
+/// merge; only short in-memory work under its lock.
 #[derive(Default)]
 pub struct Remotes {
     inner: Mutex<BTreeMap<String, Machine>>,
 }
 
 impl Remotes {
-    /// Follow the registry: new machines start [`LinkState::Idle`], removed
-    /// ones go with their rows, and a root no longer registered loses its.
+    /// Follow the service's entries: new machines start
+    /// [`LinkState::Idle`], removed ones (an inbound neighbor gone too) go
+    /// with their rows, and a root no longer listed loses its.
     pub fn sync(&self, entries: &[Entry]) {
         let mut inner = self.lock();
         inner.retain(|name, _| entries.iter().any(|e| e.name == *name));
@@ -325,7 +328,7 @@ impl Remotes {
 pub struct SnapshotMachine {
     pub name: String,
     pub kind: MachineKind,
-    /// `None` for an offered machine (no ssh to it).
+    /// `None` for an offered or inbound machine (no ssh to it).
     pub target: Option<String>,
     pub state: LinkState,
     pub error: Option<String>,

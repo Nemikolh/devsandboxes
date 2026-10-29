@@ -7,11 +7,13 @@
 //! the link's sockets do: an older connection's close doesn't take a newer
 //! one's neighbor away.
 //!
-//! `machines.list` shows them (with the roots their daemon answered
-//! `roots.list` with over the link, filled in by the daemon after the
-//! announce), and a name is either a registry entry or an inbound neighbor,
-//! never both: `links.inbound` refuses an entry's name, `machines.add` and
-//! `fleet.offer` a neighbor's.
+//! Each is a machine here while it's up (fleet plan decision 28): the
+//! service (`service::Machines`) holds a link to it over `fleet-<name>.sock`
+//! and drops it when it goes, told by the hook [`Neighbors::on_change`]
+//! sets. Its roots are those its daemon answered `roots.list` with over the
+//! link, filled in by the daemon after the announce. A name is either a
+//! registry entry or an inbound neighbor, never both: `links.inbound`
+//! refuses an entry's name, `machines.add` and `fleet.offer` a neighbor's.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,11 +36,22 @@ pub struct Neighbor {
     seq: u64,
 }
 
+/// What [`Neighbors`] calls once a neighbor came, went or got its roots:
+/// never under its lock (it reads [`Neighbors::list`]).
+pub type OnChange = Arc<dyn Fn() + Send + Sync>;
+
 /// The neighbors that are up now.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Neighbors {
     live: Mutex<BTreeMap<String, Neighbor>>,
     seq: AtomicU64,
+    on_change: Mutex<Option<OnChange>>,
+}
+
+impl std::fmt::Debug for Neighbors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Neighbors").field("live", &self.live).finish_non_exhaustive()
+    }
 }
 
 /// One announce, held by the connection that made it: dropping it removes
@@ -66,9 +79,12 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        let mut live = self.neighbors.live.lock().unwrap();
-        if live.get(&self.name).is_some_and(|n| n.seq == self.seq) {
-            live.remove(&self.name);
+        let removed = {
+            let mut live = self.neighbors.live.lock().unwrap();
+            live.get(&self.name).is_some_and(|n| n.seq == self.seq) && live.remove(&self.name).is_some()
+        };
+        if removed {
+            self.neighbors.changed();
         }
     }
 }
@@ -80,12 +96,33 @@ impl Neighbors {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let neighbor = Neighbor { name: name.into(), version: version.into(), hub, roots: Vec::new(), seq };
         self.live.lock().unwrap().insert(name.into(), neighbor);
+        self.changed();
         Guard { neighbors: Arc::clone(self), name: name.into(), seq }
     }
 
+    /// Call `f` after every change from now on (the one hook: a second
+    /// call replaces it).
+    pub fn on_change(&self, f: OnChange) {
+        *self.on_change.lock().unwrap() = Some(f);
+    }
+
+    fn changed(&self) {
+        let hook = self.on_change.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn set_roots(&self, name: &str, seq: u64, roots: Vec<PathBuf>) {
-        if let Some(n) = self.live.lock().unwrap().get_mut(name).filter(|n| n.seq == seq) {
-            n.roots = roots;
+        let moved = match self.live.lock().unwrap().get_mut(name).filter(|n| n.seq == seq) {
+            Some(n) if n.roots != roots => {
+                n.roots = roots;
+                true
+            }
+            _ => false,
+        };
+        if moved {
+            self.changed();
         }
     }
 
@@ -136,5 +173,29 @@ mod tests {
         drop(other);
         assert!(n.list().is_empty());
         assert_eq!(taken("lap").code, "denied");
+    }
+
+    /// The hook fires after each change, outside the lock (it can list),
+    /// and not for what changes nothing.
+    #[test]
+    fn the_hook_follows_changes() {
+        let n = Arc::new(Neighbors::default());
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let (weak, log) = (Arc::downgrade(&n), Arc::clone(&seen));
+        n.on_change(Arc::new(move || {
+            let now = weak.upgrade().map(|n| n.list().into_iter().map(|n| format!("{}{:?}", n.name, n.roots)).collect()).unwrap_or_default();
+            log.lock().unwrap().push(now);
+        }));
+        let lap = n.announce("lap", "v", false);
+        lap.roots_setter()(vec!["/r".into()]);
+        lap.roots_setter()(vec!["/r".into()]);
+        let old = n.announce("srv", "v", false);
+        let new = n.announce("srv", "v", false);
+        drop(old);
+        drop((lap, new));
+        let seen = seen.lock().unwrap().clone();
+        let want: Vec<Vec<&str>> =
+            vec![vec!["lap[]"], vec!["lap[\"/r\"]"], vec!["lap[\"/r\"]", "srv[]"], vec!["lap[\"/r\"]", "srv[]"], vec!["srv[]"], vec![]];
+        assert_eq!(seen, want.into_iter().map(|v| v.into_iter().map(String::from).collect::<Vec<_>>()).collect::<Vec<_>>());
     }
 }

@@ -60,8 +60,8 @@ pub struct Spec {
 pub struct Candidate {
     pub machine: MachineRef,
     pub reachable: bool,
-    /// This host's is always `On`; an ssh machine without a `lend.toml`
-    /// is `Off`.
+    /// `On` but for an offered worker's reported `off` / `drain`
+    /// ([`lends`]).
     pub lending: State,
     /// `None` before a report came: every headroom item counts as neutral.
     pub capacity: Option<Capacity>,
@@ -87,22 +87,19 @@ impl Candidate {
         }
     }
 
-    /// A registered machine, from what the daemon keeps of it: its link
-    /// state ([`reachable`]), its capacity report's lending state, its
-    /// pushed rows for [`has_image`]. Without a report's lending state an
-    /// ssh machine is `Off` (one that never ran `lend` isn't lending) and
-    /// an offered one `On` (it links only while lending; its `drain` shows
-    /// once a report comes). `has_repo` is the caller's.
+    /// A machine (any kind), from what the daemon keeps of it: its link
+    /// state ([`reachable`]), its pushed rows for [`has_image`], and, for
+    /// an offered worker only ([`lends`]), its capacity report's lending
+    /// state (`On` before a report comes: it links only while lending; its
+    /// `drain` shows once one does). Any other machine takes new work
+    /// (`On`) whatever its report says. `has_repo` is the caller's.
     pub fn from_machine(spec: &Spec, m: &Machine) -> Candidate {
         let capacity = m.capacity();
-        let unreported = match m.kind {
-            MachineKind::Ssh | MachineKind::Inbound => State::Off,
-            MachineKind::Offered => State::On,
-        };
+        let reported = capacity.as_ref().and_then(|c| c.lending).filter(|_| lends(m.kind));
         Candidate {
             machine: MachineRef::Machine(m.name.clone()),
-            reachable: reachable(m.kind, m.state),
-            lending: capacity.as_ref().and_then(|c| c.lending).unwrap_or(unreported),
+            reachable: reachable(m.state),
+            lending: reported.unwrap_or(State::On),
             capacity,
             has_image: has_image(spec, m.rows.values().map(|v| v.as_ref())),
             has_repo: false,
@@ -110,16 +107,16 @@ impl Candidate {
     }
 }
 
-/// Whether new work can reach a machine: an ssh machine unless its last
-/// attempt failed (an idle one is dialed on demand); an offered one only
-/// while its link is up (nothing can dial it).
-pub fn reachable(kind: MachineKind, state: LinkState) -> bool {
-    match kind {
-        MachineKind::Ssh => state != LinkState::Unreachable,
-        MachineKind::Offered => state == LinkState::Connected,
-        // Not in a snapshot's machines (fleet step 8 makes every neighbor a candidate).
-        MachineKind::Inbound => false,
-    }
+/// Whether new work can reach a machine: while its held link is up,
+/// whatever its kind (the code moves over it before the run does).
+pub fn reachable(state: LinkState) -> bool {
+    state == LinkState::Connected
+}
+
+/// Whether a machine's lending state counts: an offered worker's only (its
+/// `drain`, until lending goes in fleet step 8e).
+pub fn lends(kind: MachineKind) -> bool {
+    kind == MachineKind::Offered
 }
 
 /// Whether some root's snapshot in `roots` (`instances.snapshot` params)
@@ -560,20 +557,13 @@ mod tests {
     }
 
     #[test]
-    fn reachability_by_kind() {
+    fn reachable_while_the_link_is_up_and_only_offered_ones_lend() {
         use LinkState::*;
-        for (kind, state, want) in [
-            (MachineKind::Ssh, Idle, true),
-            (MachineKind::Ssh, Connecting, true),
-            (MachineKind::Ssh, Connected, true),
-            (MachineKind::Ssh, Unreachable, false),
-            (MachineKind::Offered, Idle, false),
-            (MachineKind::Offered, Connecting, false),
-            (MachineKind::Offered, Connected, true),
-            (MachineKind::Offered, Unreachable, false),
-        ] {
-            assert_eq!(reachable(kind, state), want, "{kind:?} {state:?}");
+        for (state, want) in [(Idle, false), (Connecting, false), (Connected, true), (Unreachable, false)] {
+            assert_eq!(reachable(state), want, "{state:?}");
         }
+        let lending: Vec<_> = [MachineKind::Ssh, MachineKind::Offered, MachineKind::Inbound].into_iter().map(lends).collect();
+        assert_eq!(lending, [false, true, false]);
     }
 
     fn root_snapshot(drift: bool, phase: Value) -> Value {
@@ -628,10 +618,16 @@ mod tests {
         let c = Candidate::from_machine(&spec(), &w);
         assert_eq!((c.machine.clone(), c.reachable, c.lending, c.has_image, c.has_repo), (m("w"), true, State::Drain, true, false));
         assert_eq!(c.capacity.as_ref().map(|c| c.running), Some(1));
-        // No report, no lend.toml: not lending; an offered link down: unreachable.
+        // An ssh machine: takes work whatever its report's lending says;
+        // its link down: unreachable.
         let bare = Machine { name: "s".into(), state: LinkState::Idle, ..Machine::default() };
         let c = Candidate::from_machine(&spec(), &bare);
-        assert_eq!((c.reachable, c.lending, c.capacity, c.has_image), (true, State::Off, None, false));
+        assert_eq!((c.reachable, c.lending, c.capacity, c.has_image), (false, State::On, None, false));
+        let ssh = Machine { kind: MachineKind::Ssh, ..w.clone() };
+        let c = Candidate::from_machine(&spec(), &ssh);
+        assert_eq!((c.reachable, c.lending, c.has_image), (true, State::On, true), "its `drain` is lending's");
+        let inbound = Machine { kind: MachineKind::Inbound, ..w.clone() };
+        assert_eq!(Candidate::from_machine(&spec(), &inbound).lending, State::On);
         // An offered one without a report: lending (it linked), neutral.
         let fresh = Machine { name: "f".into(), kind: MachineKind::Offered, state: LinkState::Connected, ..Machine::default() };
         let c = Candidate::from_machine(&spec(), &fresh);

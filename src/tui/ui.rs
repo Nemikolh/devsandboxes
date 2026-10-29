@@ -757,6 +757,7 @@ fn capacity_text(c: Option<&crate::serve::capacity::Capacity>) -> String {
 /// last attempt said why; LEND and CAPACITY from its last snapshot's
 /// capacity report (last known while it isn't connected).
 fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
+    use crate::serve::machines::MachineKind;
     use crate::serve::snapshots::LinkState;
     let state = match &m.error {
         Some(e) => format!("{}: {e}", m.state.as_str()),
@@ -770,13 +771,20 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
     };
     Row::new([
         Cell::from(Span::styled(m.name.clone(), Style::default().fg(ACCENT))),
-        // An offered fleet worker has no ssh target: its kind instead.
-        match &m.target {
-            Some(target) => Cell::from(target.clone()),
-            None => Cell::from(Span::styled("offered", Style::default().add_modifier(Modifier::DIM))),
+        // An offered fleet worker or an inbound machine has no ssh target:
+        // its kind instead.
+        match (&m.target, m.kind) {
+            (Some(target), _) => Cell::from(target.clone()),
+            (None, MachineKind::Inbound) => Cell::from(Span::styled("inbound", Style::default().add_modifier(Modifier::DIM))),
+            (None, _) => Cell::from(Span::styled("offered", Style::default().add_modifier(Modifier::DIM))),
         },
         Cell::from(Span::styled(state, style)),
-        Cell::from(if m.agent { "on" } else { "off" }),
+        // This host's agent never reaches an inbound machine: nothing to toggle.
+        Cell::from(match (m.kind, m.agent) {
+            (MachineKind::Inbound, _) => "-",
+            (_, true) => "on",
+            (_, false) => "off",
+        }),
         Cell::from(m.version.clone().unwrap_or_else(|| "-".to_string())),
         Cell::from(crate::serve::capacity::lend_label(m.capacity.as_ref())),
         {

@@ -690,9 +690,10 @@ fn main() -> Result<()> {
     // and `--machine` runs a nameless command there. A command that ran on a
     // machine over ssh ends here; the rest come back with their name as this
     // host knows it. The registry is read from the file (no daemon round
-    // trip), never under `--in-process`.
+    // trip unless an inbound machine's link socket is there to ask about:
+    // `machine_names`), never under `--in-process`.
     #[cfg(unix)]
-    let machines = if cli.in_process { Vec::new() } else { serve::machines::registered_names() };
+    let machines = if cli.in_process { Vec::new() } else { serve::machines::cli::machine_names() };
     #[cfg(unix)]
     let command = match serve::machines::cli::route(cli.machine.as_deref(), cli.in_process, &machines, command)? {
         serve::machines::cli::Routed::Here(command) => command,
