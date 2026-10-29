@@ -1,14 +1,13 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-7 shipped
+Status: in progress. Steps 1-8 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
-[0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
-built on two kinds of machine (ssh machines and offered workers, `fleet
-join`, `lend`; step 4's channels on the fleet link only; step 6's
-trust table on both kinds' API connections; step 7's one link per pair
-under ssh machines, their per-use ssh argvs still beside it); steps 8-10
-replace that with the model below (ADR
+[0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)):
+steps 1-6 on two kinds of machine (ssh machines and lending workers),
+steps 7-8 down to one: every machine one peer link per pair, reached
+only over its channels, a laptop joining with `machine add <hub>`.
+Steps 9-10 (membership, routing) finish the model below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
 proposed). The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
@@ -426,7 +425,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    the peer by its registry entry, so its fleet root there is
    `fleet/<entry name>/`. A daemon with machines still idles out (a link
    isn't a holder).
-8. **One kind of machine** (L, as 8a-8f). Every entry reached through
+8. **One kind of machine** (L, shipped as 8a-8f). Every entry reached through
    its channel forms; inbound neighbors are machines (decision 28);
    lending removed (decision 26): a laptop joins with `machine add <hub>`.
 
@@ -466,6 +465,15 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
      `place`'s `drain`, `machines::Kind` and the `is_offered()` branches
      (decision 29).
    - **8f Docs close.**
+
+   As built: a hub only places (`[serve] hub`; a `run` elsewhere stays
+   there until step 9), over every connected machine; an inbound
+   machine that goes takes its rows and forwards with it; each link a
+   host dials holds its daemon up (`idle::Holders::links`); `machine
+   add`'s probe is `api --stdio --sentinel` over ssh, the only ssh but
+   the link's; `roots.list` marks the caller's fleet root (`fleet:
+   true`), which placement moves code into; no command sets the member
+   name (`member.set {name}` only), and `drain` went with lending.
 9. **Membership and the hub** (M).
    [Joining and leaving](#joining-and-leaving): `hub` in `member.toml`
    (decision 1), `[serve] hub` gone; `machine add`'s join rule (a name

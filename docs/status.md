@@ -34,15 +34,13 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 8 on. Steps 1-7 shipped: ssh machines are
-  held over one peer link per pair (`fleet-link --peer` there, this host
-  an inbound neighbor in its `machines.list`), every machine reached at
-  its `fleet-<name>.*.sock`, every use of any machine over its channels
-  (the CLI's commands, 8a; the dashboard's terminals, forwards and
-  `port`, 8b), ssh only at `machine add` (8c); inbound neighbors are
-  machines (8d: rows, forwarding, the CLI's names, forwards, placement
-  over every connected machine); lending is gone (8e): a laptop joins a
-  hub with `machine add <hub>`, an inbound machine there.
+  re-placement: from fleet step 9 on. Steps 1-8 shipped: one kind of
+  machine, one peer link per pair (`fleet-link --peer` on the dialed
+  end, where the dialer is an inbound machine), every use over the
+  link's channels and trust, ssh only for the link and `machine add`'s
+  probe; a laptop joins a hub with `machine add <hub>`; a hub (`[serve]
+  hub`) places over every connected machine. Next: membership and the
+  hub in `member.toml` (step 9), routing over the graph (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
