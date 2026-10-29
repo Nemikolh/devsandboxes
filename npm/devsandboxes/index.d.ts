@@ -152,7 +152,7 @@ export interface InstancesSnapshot extends InstancesList {
   machines?: SnapshotMachine[];
 }
 
-/** Where a machine's link stands. `idle`: not wanted, so not connected. */
+/** Where a machine's link stands. `idle`: not attempted yet (every link is held). */
 export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
 
 /**
@@ -835,13 +835,6 @@ export interface MachineInfo {
   agent: boolean;
 }
 
-/** `machines.hold`'s answer. */
-export interface MachineHeld {
-  ok: true;
-  /** The machine's agent relay is up; always `false` for a machine with `agent` off. */
-  agent: boolean;
-}
-
 /** One registered machine, or an inbound neighbor (`kind` `inbound`, always `connected`) (`machines.list`). */
 export interface MachineRow {
   name: string;
@@ -1338,13 +1331,11 @@ export interface ApiMethods {
   /** Change a registered machine's settings; `not-found` for an unknown name. */
   'machines.set': { params: { name: string; agent: boolean }; result: OkResult };
   'machines.rm': { params: { name: string }; result: OkResult };
-  /** One registered machine, to build an ssh command to it; `not-found` for an unknown name. */
-  'machines.get': { params: { name: string }; result: MachineInfo };
   /**
-   * Hold a machine's link (and, with `agent` on, its agent relay) up until this connection closes; `agent` is the
-   * caller's absolute `SSH_AUTH_SOCK`. Waits up to 5 s for the relay; `not-found` for an unknown name.
+   * One registered machine, to build an ssh command to it; `not-found` for an unknown name. `agent`, the
+   * caller's absolute `SSH_AUTH_SOCK`, becomes the agent this host serves the machine's `AGENT` streams with.
    */
-  'machines.hold': { params: { name: string; agent?: string }; result: MachineHeld };
+  'machines.get': { params: { name: string; agent?: string }; result: MachineInfo };
   /**
    * This host's capacity report now (the one its snapshots carry), built on demand: no
    * watched root needed. A fleet hub asks its workers before placing a `run`.

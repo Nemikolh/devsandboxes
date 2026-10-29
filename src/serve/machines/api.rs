@@ -2,13 +2,12 @@
 //! *`devsandbox machine add|ls|set|rm|trust|roots`*): `probe`, `add`, `list`, `get`,
 //! `set`, `rm`.
 //! Connection-free like `serve::api`: a function of the method, its params
-//! and a [`Ctx`] (the registry path and the [`Dial`]), so tests run them
-//! against a second test daemon standing in as the machine. The one
-//! per-connection method, `machines.hold`, is [`hold`]: it returns the
-//! [`Want`] the daemon keeps on the connection.
+//! and a [`Ctx`] (the registry path and the [`Dial`]s), so tests run them
+//! against a second test daemon standing in as the machine.
 //!
-//! `probe` and `add` open a fresh connection each (ssh, the hello, one or
-//! two calls) and drop it; the held link per machine is `service`'s, which
+//! `probe` and `add` open a fresh connection each (ssh at add time,
+//! [`Ctx::probe`]: the hello, one or two calls) and drop it; the held link
+//! per machine is `service`'s, which
 //! `add`, `set` and `rm` tell to reload and `list` reads the live state of. `add`
 //! checks the typed roots *on the machine* (`roots.list {paths}`): only it
 //! can tell whether they exist, expand a quoted `~`, and canonicalize them.
@@ -23,7 +22,7 @@ use serde_json::{Value, json};
 
 use super::inbound::{self, Neighbors};
 use super::link::{self, Link};
-use super::service::{Handle, Want};
+use super::service::Handle;
 use super::ssh::{self, Dial};
 use super::{Entry, MachineKind, check_name, default_name};
 use crate::serve::api::{ApiError, RootCandidate, parse};
@@ -40,7 +39,11 @@ type Answer = Result<Value, ApiError>;
 pub struct Ctx {
     /// `machines.toml` ([`super::path`] outside tests).
     pub registry: PathBuf,
+    /// A registered machine's link (`fleet::dialer::dial`): forwarded
+    /// verbs and placement's capacity asks dial it.
     pub dial: Dial,
+    /// A target at add time, before it has a link (`probe`, `add`): ssh.
+    pub probe: Dial,
     /// This daemon's semver, which `add` warns a differing machine's against.
     pub version: String,
     /// The links: `add`/`set`/`rm` reload them, `list` reports their state. `None`
@@ -250,11 +253,31 @@ pub struct MachineInfo {
     pub agent: bool,
 }
 
-fn get(p: NameParams, ctx: &Ctx) -> Answer {
+#[derive(Deserialize)]
+struct GetParams {
+    name: String,
+    #[serde(default)]
+    agent: Option<PathBuf>,
+}
+
+/// One registered machine. `agent` is the caller's `SSH_AUTH_SOCK`
+/// (absolute), reported to this daemon (`bridge::report_agent`), so the
+/// agent this host answers the machine's `AGENT` streams with
+/// (`bridge::host_agent`) is the caller's: what a CLI re-run over ssh on
+/// the machine passes, for its terminal's agent.
+fn get(p: GetParams, ctx: &Ctx) -> Answer {
+    if let Some(agent) = &p.agent
+        && !agent.is_absolute()
+    {
+        return Err(ApiError::invalid(format!("`agent` must be absolute, got `{}`", agent.display())));
+    }
     let entry = registered(ctx)?
         .into_iter()
         .find(|e| e.name == p.name)
         .ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
+    if let Some(agent) = p.agent {
+        crate::devsbd::bridge::report_agent(agent);
+    }
     let (kind, target) = entry.kind.wire();
     to_value(MachineInfo {
         name: entry.name,
@@ -297,46 +320,6 @@ struct NameParams {
     name: String,
 }
 
-#[derive(Deserialize)]
-struct HoldParams {
-    name: String,
-    #[serde(default)]
-    agent: Option<PathBuf>,
-}
-
-/// `machines.hold`'s answer: `agent`, whether the machine's agent relay is
-/// up (always `false` for a machine with `agent` off).
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Held {
-    pub ok: bool,
-    pub agent: bool,
-}
-
-/// `machines.hold {name, agent?}`: hold machine `name` wanted (its link
-/// and, with `agent` on, its agent relay up) for as long as the caller keeps
-/// the returned [`Want`], which the daemon keeps until the connection
-/// closes. `agent` is the caller's `SSH_AUTH_SOCK`, reported to this daemon
-/// (`bridge::report_agent`) like a forwarded verb's, so the relay serves
-/// it. With `agent` on, waits up to [`super::forward::AGENT_WAIT`] for the
-/// relay, as a forwarded verb does (the caller's ssh would race it).
-pub fn hold(params: Value, ctx: &Ctx) -> Result<(Want, Held), ApiError> {
-    let p: HoldParams = parse(params)?;
-    if let Some(agent) = &p.agent
-        && !agent.is_absolute()
-    {
-        return Err(ApiError::invalid(format!("`agent` must be absolute, got `{}`", agent.display())));
-    }
-    let no_machine = || ApiError::not_found(format!("no machine named `{}`", p.name));
-    let links = ctx.links.as_ref().ok_or_else(no_machine)?;
-    let on = links.entries().iter().find(|e| e.name == p.name).ok_or_else(no_machine)?.agent;
-    if let Some(agent) = p.agent {
-        crate::devsbd::bridge::report_agent(agent);
-    }
-    let want = links.want(&p.name).ok_or_else(no_machine)?;
-    let ready = on && want.agent_ready(super::forward::AGENT_WAIT);
-    Ok((want, Held { ok: true, agent: ready }))
-}
-
 fn rm(p: NameParams, ctx: &Ctx) -> Answer {
     let removed = super::update(&ctx.registry, |entries| {
         let before = entries.len();
@@ -371,7 +354,7 @@ fn taken(name: &str) -> ApiError {
 
 /// Dial `entry` and say hello: `failed` with ssh's or the hello's reason.
 fn connect(entry: &Entry, ctx: &Ctx) -> Result<Link, ApiError> {
-    let duplex = (ctx.dial)(entry).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
+    let duplex = (ctx.probe)(entry).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
     link::handshake(&entry.name, duplex, HANDSHAKE_TIMEOUT).map_err(|e| ApiError::failed(e.to_string()))
 }
 
@@ -576,13 +559,19 @@ mod tests {
         assert_eq!(box2.command.as_deref(), Some(cmd), "`command` saved");
         assert!(std::fs::read_to_string(&registry).unwrap().contains("command = \"~/.local/bin/devsandbox\""));
 
-        // Listed sorted by name, idle (no link wanted); then removed.
-        let rows = ok(&mut pair.local, "machines.list", Value::Null);
+        // Listed sorted by name, their links held at once (a test daemon's
+        // transport fails: `state` and `error` are its); then removed.
+        let mut rows = ok(&mut pair.local, "machines.list", Value::Null);
+        for row in rows.as_array_mut().unwrap() {
+            let row = row.as_object_mut().unwrap();
+            assert_ne!(row.remove("state").unwrap(), "connected");
+            row.remove("error");
+        }
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "kind": "ssh", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "state": "idle", "error": null, "version": null, "capacity": null},
-                {"name": "box2", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "state": "idle", "error": null, "version": null, "capacity": null},
+                {"name": "box", "kind": "ssh", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "version": null, "capacity": null},
+                {"name": "box2", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box2"}));
@@ -684,7 +673,6 @@ mod tests {
         let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
         assert_eq!(union_members("MachineKind"), ["'ssh'", "'offered'", "'inbound'"]);
-        assert_matches("MachineHeld", &to_value(Held { ok: true, agent: false }).unwrap());
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [
             ("machines.probe", "MachineProbe"),
@@ -693,7 +681,6 @@ mod tests {
             ("machines.rm", "OkResult"),
             ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
-            ("machines.hold", "MachineHeld"),
         ] {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
             assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");

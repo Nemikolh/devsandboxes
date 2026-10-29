@@ -187,9 +187,11 @@ impl Drop for Bridge {
 const MAX_AGENTS: usize = 8;
 
 /// The host agent sockets this process knows of, most recent first: what
-/// clients reported through `bridges.ensure` (docs/reference/api.md). Only the daemon
+/// clients reported through `bridges.ensure`, a forwarded verb's env or
+/// `machines.get {agent}` (docs/reference/api.md). Only the daemon
 /// gets reports; everywhere else the list stays empty and [`pick`](Self::pick)
-/// goes on to the machine agent relays' sockets in the socket dir
+/// goes on to the relayed agents' sockets in the socket dir (a linking
+/// host's `agent-link-<host>.sock`, a hub's `agent-fleet-<hub>.sock`)
 /// (docs/architecture/daemon/machines.md, *Agent*), then the own
 /// `$SSH_AUTH_SOCK`. The reports are what keep the daemon's relay working
 /// when the agent it inherited is gone or rotated (a new `ssh -A` session):
@@ -253,7 +255,8 @@ fn agent_live(path: &Path) -> bool {
 /// socket in the socket dir (newest first; a missing or unreadable dir has
 /// none), else `$SSH_AUTH_SOCK` when live (see [`AgentCandidates::pick`]).
 /// Also gates whether a bridge is worth spawning (`has_host_agent`). The
-/// daemon's machine agent relays serve it too (`machines::agent::serve`).
+/// daemon answers its machines' `AGENT` streams with it too
+/// (`daemon::agent_for`).
 pub fn host_agent() -> Option<PathBuf> {
     let candidates = AGENTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let relays = crate::serve::endpoint::socket_dir()

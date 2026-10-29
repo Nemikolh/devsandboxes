@@ -25,9 +25,9 @@ Start with `docs/README.md` (reading order and map) and
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `inbox.rs` is `devsandbox inbox …` (docs/reference/inbox-cli.md): reads from the
   store, mutations via a running daemon's API, else the same `wire::decide_*`
-  ops locally. `agent_relay.rs` is the hidden `agent-relay`, a machine's
-  end of its agent relay (socket + frame mux over stdio; machines.md
-  *Agent*). `machine.rs` is `devsandbox machine add|ls|set|rm|trust|roots`
+  ops locally. `agent_relay.rs` is the hidden `agent-relay`, the old
+  agent relay's machine end (unused since the link carries `AGENT`;
+  fleet step 8 removes it). `machine.rs` is `devsandbox machine add|ls|set|rm|trust|roots`
   (docs/architecture/daemon/machines.md): a client of `machines.*` only (never in-process);
   `add`'s install check first (ask on a TTY, `--auto-install`, else
   refuse; `machines/install.rs`), its TTY multi-select of probed roots and
@@ -141,15 +141,16 @@ Start with `docs/README.md` (reading order and map) and
   login-shell quoting; the injectable `Dial` → `Duplex`, ssh's stderr tail),
   `link.rs` (the hello as version 0.0.0, protocol must match, `LinkError`),
   `service.rs` (`Machines`: one `serve-machine-<name>` thread per machine,
-  connected only while wanted + 60 s linger, backoff, state into
-  `snapshots::Remotes`, forwarded quick calls one at a time),
+  always held; an ssh machine's link carried by a `Hold` thread,
+  `fleet::dialer`'s `fleet-link --peer` through the transport; backoff,
+  state into `snapshots::Remotes`, forwarded quick calls one at a time),
   `api.rs` (`machines.probe|add|list|get|rm`, connection-free, dial
   injectable), `forward.rs` (requests with `machine`: the quick-call list,
-  verbs over an ssh each with ids rewritten, the federated `instances.resolve`
+  verbs over an `API` stream each with ids rewritten, the federated `instances.resolve`
   / `sandboxes.list` joins as pure fns), `cli.rs` (the CLI side: `plan` where
   a command's name points, `--machine` uses, the ssh re-exec argv; pure, with
-  `route` doing the I/O), `agent.rs` (this end of a machine's agent relay:
-  `serve` answers its `Open`s from the local agent while `allowed`),
+  `route` doing the I/O), `agent.rs` (the old agent relay's
+  answerer, unused: the link's `AGENT` streams replaced it),
   `install.rs` (the CLI's check of a machine's devsandbox and the copy of
   this binary there, for `machine add`; `check`/`decide`/`install`).
   `snapshots.rs`'s `merge` builds the federated

@@ -1,27 +1,29 @@
 # Machines: remote hosts over ssh
 
 A machine is a remote host running devsandbox, registered with `devsandbox
-machine add`. The local daemon links to each machine's daemon over
-`ssh <target> devsandbox api --stdio`, merges its rows into watched
-snapshots, and forwards requests for its instances. Read this before
+machine add`. The local daemon holds one link to each machine (for an ssh
+machine `ssh <target> devsandbox fleet-link --peer <this host>`, a
+[peer link](fleet.md#peer-links)), talks to the machine's daemon over its
+`API` streams, merges its rows into watched snapshots, and forwards
+requests for its instances. Read this before
 touching anything that takes a `machine` param or a `m/name`.
 
 Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 `RawEntry`, `offered_refusal`, `path`, `parse`, `update`,
 `check_name`, `Where`, `parse_name`, `default_name`), `ssh.rs`
 (`api_argv`, `tty_argv`, `tty_argv_with`, `cli_argv`, `agent_argv`,
-`script_argv`, `parse_target`, `Dial`, `Duplex`, `ssh_dial`, `ssh_agent_dial`), `link.rs`
-(`LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Want`,
-`Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `agent.rs`
-(`serve`, `End`, `SPEC`), `api.rs`
+`script_argv`, `parse_target`, `Dial`, `Duplex`, `ssh_dial`), `link.rs`
+(`LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
+`Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `agent.rs`
+(`serve`, `End`, `SPEC`: the old agent relay, unused), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 `localize`, `Reconnect`, `Dials`), `cli/offered.rs` (`use_of`, `Use`,
 `Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
 `parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
+`src/serve/fleet/dialer.rs` (`Dialer`, `dial`, `link_args`),
 `src/serve/relay.rs` (`--session-env`), `src/commands/machine.rs`,
-`src/commands/agent_relay.rs` (`run`, `Socket`),
-`src/serve/endpoint.rs` (`agent_socket`, `agent_sockets`),
+`src/serve/endpoint.rs` (`fleet_socket`, `link_agent_socket`, `agent_sockets`),
 `src/tui/remote.rs`. Params: [api.md](../../reference/api.md#machines).
 
 ## Registry: `machines.toml`
@@ -85,12 +87,20 @@ one goes over its fleet link or refuses first in its own words). Plain ssh, no
 ControlMaster of its own: `~/.ssh/config` decides. The remote command runs
 through the login shell (`exec "$SHELL" -lc '…'`, each arg quoted for it),
 so the remote `PATH` is the user's. No argv passes `-A`: this host's
-ssh-agent reaches a machine only over its [agent relay](#agent), only with
-the machine's `agent` on.
+ssh-agent reaches a machine only over its link's `AGENT` streams
+([Agent](#agent)), only with the machine's `agent` on.
+
+The machine's link itself is no argv here: the daemon dials it through
+`fleet::transport::Transport::ssh` (`ssh -T -o BatchMode=yes [-p N] --
+<host> <command> fleet-link --peer <member>`, the entry's `command` as the
+program: `Transport::dial_with`; [Held links](#held-links-machines)). The
+argvs below are the add-time ssh and the per-use ones, which step 8 of the
+[fleet plan](../../plans/active/fleet.md) moves onto the link's channels:
 
 - `api_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … api --stdio
   --client <c> --session-env` (the daemon has no TTY: ssh must fail, not
-  prompt).
+  prompt), what `machines.probe` and `machines.add` dial (`ssh_dial`)
+  before the machine has a link.
 - `tty_argv` / `tty_argv_with`: `-t`, no `BatchMode` (terminal tabs,
   interactive re-runs; `tty_argv_with` runs `<runtime> exec -it` for
   service tabs).
@@ -101,7 +111,7 @@ the machine's `agent` on.
   `BatchMode` when `batch` (the daemon). The `=` forms keep a name
   starting with `-` a value.
 - `agent_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … agent-relay
-  --client <c>`, a machine's agent relay ([Agent](#agent)).
+  --client <c>`, the old agent relay's; nothing spawns it.
 - `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
   POSIX script run for a person at the CLI ([Install](#install)); no
   `BatchMode`. A script is one line: the login shell may be csh, which
@@ -110,37 +120,39 @@ the machine's `agent` on.
 `Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
 ssh's stderr for `spawn`'s `Peer` and the remote forward opener alike.
 
-`Dial` (`Fn(&Entry) -> Duplex`) is injectable: `ssh_dial` spawns
-`api_argv`, `ssh_agent_dial` `agent_argv`, both with `link::client_name`
-as the client. The daemon wraps its API dial in `fleet::offer::dial`,
-which dials an offered machine at its fleet link's socket instead. A `Duplex` is always a unix socket pumped to the ssh
-child's pipes, so `client::Conn` works on it unchanged and tests dial a
-second test daemon's socket (or run the agent relay's far end
-in-process). `--session-env` makes the remote relay replace each verb
-request's `params.env` with its own login-shell env, `SSH_AUTH_SOCK`
-pointed at this host's agent relay socket there while it's up
-([Agent](#agent)).
+`Dial` (`Fn(&Entry) -> Duplex`) is injectable. The daemon's is
+`fleet::dialer::dial`: a connection to the machine's `fleet-<name>.sock`
+in the socket dir, one `API` stream on its link, ssh or offered alike;
+`machines::api::Ctx::dial` (the held link, forwarded verbs, placement's
+capacity asks) is that one, `Ctx::probe` the add-time `ssh_dial`
+(`api_argv`, `link::client_name` as the client). A `Duplex` is always a
+unix socket (pumped to the ssh child's pipes for `ssh_dial`), so
+`client::Conn` works on it unchanged and tests dial a second test
+daemon's socket.
 
-`--session-env` also makes the remote relay attach its connection before
-it writes the sentinel or relays a byte (`relay::attach`): one
-`link.attach {peer}` request of its own, `peer` being `--client` without
-its `machine:` prefix (this host's name, `link::client_name`), its answer
-read byte by byte up to its newline and not relayed (no `channel`: the
-relay's form; `link.attach {peer, channel}` is a fleet member's stream,
-[fleet](fleet.md#the-trust-table)). From then on the
-remote daemon serves that connection with the machine's trust table
+Every stream of a machine's link reaches the machine's daemon through
+`link.attach {peer: <this host's member name>, channel}`, which its
+`fleet-link --peer` sends first ([fleet](fleet.md#peer-links)), so the
+remote daemon serves it with the machine's trust table
 ([fleet](fleet.md#the-trust-table)): under its `trust = "worker"` (the
-default) this host reaches the machine's own roots only (those its
-instances name, plus its `member.toml` `roots`, which `machine add`
-records there), never `machines.*`, `member.*`, `shutdown` or an edit of
-those configs; under `full`, everything but `member.*`, `link.*` and `links.*`. The
-held link and every forwarded verb's connection dial `api_argv`, so both
-go through it. A refused attach (another user's socket, a daemon without
-`link.attach`) ends the relay with exit 1 and the reason on stderr,
-which the link reports as ssh's stderr tail (`LinkError::Closed`); the
-daemon hanging up first is exit 75. The other argvs (`tty_argv`,
-`cli_argv`, `tunnel_argv`, `agent_argv`) are ssh shells on the machine:
-the trust table isn't in their path.
+default) this host reaches the machine's own roots and its fleet root
+for this host (`fleet/<this host>/` there) only (its own roots being
+those its instances name, plus its `member.toml` `roots`, which `machine
+add` records there), never `machines.*`, `member.*`, `shutdown` or an
+edit of those configs; under `full`, everything but `member.*`,
+`link.*` and `links.*`. A verb this way runs with the machine daemon's
+own env (the peer's `env`, `fleet::lent::Peer`), not a login shell's,
+its `SSH_AUTH_SOCK` this host's agent relayed there
+(`agent-link-<this host>.sock`, the peer's `agent`) while that socket
+answers, so host git on the machine uses the agent this host serves.
+The add-time `api_argv` relay attaches its connection the same way
+(`--session-env`: `relay::attach`, `link.attach {peer}` with `peer`
+`--client` without its `machine:` prefix, its answer read byte by byte up
+to its newline and not relayed); a refused attach ends the relay with
+exit 1 and the reason on stderr, which the link reports as ssh's stderr
+tail (`LinkError::Closed`); the daemon hanging up first is exit 75. The
+per-use argvs (`tty_argv`, `cli_argv`, `tunnel_argv`) are ssh shells on
+the machine: the trust table isn't in their path.
 
 ## Install
 
@@ -183,9 +195,11 @@ off the remote daemon (only that host's own clients upgrade it). The
 `protocol` must match (`LinkError`); differing semvers within one protocol
 are a warning at add and shown in `machine ls`.
 
-Before the hello, `handshake` reads up to the relay's sentinel: the relay
-(`--session-env`) writes `\n` + `devsandbox-api 1\n` once it reaches the
-remote daemon (`relay::write_sentinel`), and the link skips every line
+Before the hello, `handshake` reads up to the relay's sentinel: every
+`API` stream of a link starts with `\n` + `devsandbox-api 1\n`
+(`relay::write_sentinel`: the far end's `fleet-link` writes it on each
+stream it hands its daemon, `commands::fleet_link::attach_stream`, as the
+add-time relay does once it reaches the remote daemon), and the link skips every line
 before it (`ssh::skip_lines`, the same byte-at-a-time skipper as a remote
 forward's tunnel header, so nothing past the sentinel is consumed),
 bounded at 64 KiB, with the hello's read timeout. The leading newline ends
@@ -200,30 +214,49 @@ timeout is `LinkError::Other` with that first line.
 ## Held links: `Machines`
 
 The daemon runs a `Machines` service for its whole life: one
-`serve-machine-<name>` thread per registered machine, plus a
-`serve-machine-<name>-agent` one for its [agent relay](#agent), started,
+`serve-machine-<name>` thread per registered machine, plus, for an ssh
+machine, a `serve-machine-<name>-link` thread carrying its link, started,
 stopped or restarted when `add`/`set`/`rm` change the registry
 (`Handle::reload`: a change to a machine's entry restarts its link,
-except a change of `agent` alone, which flips the live link's flag).
-A machine is wanted while a local connection watches with `machines:
-true`, a forwarded call is queued, or a `Want` holds it, and for
-`Timing::linger` (60 s) after (both threads share the last want, a
-`Want`'s drop counting as one). `Handle::want` returns a `Want`: a guard
-per holder (a forwarded verb for its run, a connection's
-`machines.hold` for the connection's life), counted per machine name so a
-hold outlives a restarted link; `Want::agent_ready` waits, bounded, for
-the agent relay's handshake (`false` at once with `agent` off). The link
-connects only while the machine is wanted; on a fleet hub
-(`service::Hub`) an offered machine is always wanted
-([fleet](fleet.md#hub-mode)). Connected, it
-subscribes to `instances`, watches each of the machine's roots while a
-local watcher wants machines (not for a link lingering on calls), and
-stores pushed snapshots in `Remotes` (kept while the link is down; in
-memory only, but on a hub, which also saves them to `remotes.json`).
-`LinkState`: `idle`, `connecting`, `connected`, `unreachable` (with the
-reason); retries back off from 1 s doubling to 30 s while wanted.
-Handshake timeout 20 s. A link isn't an idle holder of the local daemon;
-the clients that want it are. On the machine it's a client like any other.
+except a change of `agent` alone, which the live link keeps). Every link
+is held from the start, wanted or not (fleet plan decision 7).
+
+- **The carrier.** An ssh machine's link thread runs the service's `Hold`
+  again and again, the backoff (1 s doubling to 30 s, reset once a carrier
+  came up) between: `fleet::dialer::Dialer::hold`, which dials
+  `fleet-link --peer <this host's member name>` there (`member.toml`'s
+  `name`, else the hostname's first label; `fleet::dialer::link_args`)
+  through the daemon's transport and runs the answerer of the fleet link
+  ([fleet](fleet.md#peer-links)). It binds `fleet-<name>.sock` and its
+  `.pty`, `.tunnel`, `.transfer` siblings in the socket dir (newest binder
+  wins, so a successor daemon takes them over), each accept one stream
+  to the machine; each stream the machine opens is this daemon's
+  (`daemon::machine_dialer`: `Shared::open_lent`, peer `<name>`, its
+  fleet root `fleet/<name>/` under the data dir). It reports through
+  `Held`: `up` once the `Hello`s are through (the sentinel and the
+  `Hello`s within `Timing::handshake`), `note` for a link up but serving
+  nothing yet (waiting for the hub's build), and returns why it ended,
+  with ssh's stderr tail (where the far end's refusal is, such as a name
+  clash: [inbound neighbors](#inbound-neighbors) there). A hub machine on
+  another build is followed first ([fleet](fleet.md#versions)). An
+  offered machine's carrier is its worker's `fleet-link --worker` here
+  ([fleet](fleet.md#hub-side)): no thread of its own.
+- **The link.** Once the carrier is up (always, for an offered machine)
+  the machine thread dials `fleet-<name>.sock` (`Dial`) and says hello,
+  subscribes to `instances`, watches each of the machine's roots while a
+  local watcher wants machines (`Hooks::watching`), and stores pushed
+  snapshots in `Remotes` (kept while the link is down; in memory only,
+  but on a hub, which also saves them to `remotes.json`). A carrier going
+  down ends the link at once and is the machine's `error`; a carrier
+  coming up is dialed at once; a connect that fails or a link lost over a
+  live carrier is retried with the backoff.
+
+`LinkState`: `idle` (before the first attempt), `connecting`,
+`connected`, `unreachable` (with the reason). A failure is logged when it
+differs from the last one logged since the link (or carrier) was up, so
+a machine that's away logs once. A link isn't an idle holder of the
+local daemon. On the machine it's an [inbound neighbor](#inbound-neighbors)
+(`links.inbound`), its streams clients like any other.
 
 ## Forwarded requests
 
@@ -234,22 +267,22 @@ and goes to that machine, but for the ones served here:
   rename|done|buildLog|resolve`, `containers.logs|inspect`,
   `sandboxes.list|get`, `services.get`) go over the held link, one in
   flight per machine, `Timing::call` (15 s) each. A timeout drops the link
-  (its late answer would be read as the next call's); a call arriving
-  during the backoff retries the connect at once, and calls queued when a
-  connect fails get `failed` (`<machine>: unreachable: …`). The remote's answer, error code and data
-  included, is the answer.
-- **Verbs** get a fresh dial per request, so a build never holds up the
-  link. The requester's `SSH_AUTH_SOCK` (an absolute path in `env`) is
-  reported to this daemon (`bridge::report_agent`), so the agent relay
-  serves the live agent of whoever asked even when the daemon started
-  without one. The verb holds its machine wanted (a `Want`) for its run;
-  with `agent` on it waits up to 5 s (`forward::AGENT_WAIT`) for the
-  relay's handshake before dialing, so a `run` that clones over ssh there
-  doesn't race it, and goes anyway (logged) if it isn't up.
-  `output`/`progress` are relayed with `request` rewritten to the local
-  id. While its ssh runs it's a `verbs` holder here. A hang-up, or a
-  local drain, closes the ssh, which the remote sees as a hang-up:
-  cancelled there unless `detach`.
+  (its late answer would be read as the next call's), not its carrier; a
+  call arriving during the backoff retries the connect at once, and calls
+  queued when a connect fails or while the carrier is down get `failed`
+  (`<machine>: unreachable: …`; during the carrier's first attempt they
+  wait for it). The remote's answer, error code and data included, is the
+  answer.
+- **Verbs** get a fresh `API` stream per request (`Dial`), so a build
+  never holds up the link. The requester's `SSH_AUTH_SOCK` (an absolute
+  path in `env`) is reported to this daemon (`bridge::report_agent`), so
+  the machine's `AGENT` streams reach the live agent of whoever asked even
+  when the daemon started without one; the rest of `env` gives way to the
+  machine daemon's own. A link that's down fails it at once
+  (`<machine>: unreachable: <why>`). `output`/`progress` are relayed with
+  `request` rewritten to the local id. While its stream is open it's a
+  `verbs` holder here. A hang-up, or a local drain, closes the stream,
+  which the remote sees as a hang-up: cancelled there unless `detach`.
 - **Federated** `instances.resolve` / `sandboxes.list` with `machines:
   true` ask this host and every machine in parallel, each machine given
   `FANOUT_WAIT` (5 s). Remote matches come back qualified (`box/web-2`)
@@ -261,15 +294,9 @@ and goes to that machine, but for the ones served here:
   or on an offered fleet worker one `TUNNEL` stream per bridge over its
   fleet link ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
 
-- **`machines.hold {name, agent?}`** (`machines::api::hold`, answered in
-  `daemon.rs` `hold_machine`) is per connection: the `Want` is kept in the
-  connection's `ConnState` (one per machine; holding again replaces it)
-  and dropped when the connection's thread ends, so a holder that exits
-  or dies releases the machine (then the linger). `agent`, the caller's
-  absolute `SSH_AUTH_SOCK`, is reported like a verb's; with the machine's
-  `agent` on the answer waits up to `forward::AGENT_WAIT` for the relay.
-  It answers `{ok, agent}`, `agent` whether the relay is up. The CLI's
-  re-runs use it ([The CLI](#the-cli-clirs)).
+- **`machines.get {name, agent?}`** takes the caller's absolute
+  `SSH_AUTH_SOCK` as `agent` and reports it like a verb's: the CLI's
+  re-runs pass it ([The CLI](#the-cli-clirs)).
 
 ## Federated snapshots
 
@@ -285,45 +312,26 @@ watchers' roots from the last local params. Details:
 
 ## Agent
 
-A machine's agent relay carries this host's ssh-agent to the machine over
-its own ssh (`ssh::agent_argv`, no `-A`), on the helper's frame protocol
-([protocol.md](../helper/protocol.md)) with the roles of a container's
-relay ([ssh-agent.md](../helper/ssh-agent.md)) swapped onto the two hosts.
-It is a [fleet link](fleet.md#link) of `agent::SPEC`: `fleet::link::opener` and
-`fleet::link::answerer` hold the mechanics below.
-
-- **The machine's end**, the hidden `devsandbox agent-relay --client <c>`
-  (`commands::agent_relay`), plays the in-container daemon. It binds
-  `endpoint::agent_socket`: `<socket dir>/agent-<client>.sock`, 0600 in
-  the 0700 socket dir, the client cut to `[A-Za-z0-9._-]` and 40 bytes (a
-  longer one ends in a hash of the whole name) so the path stays under
-  macOS's 104 bytes. It binds a temp name and renames it over that path,
-  so the newest relay for a client wins. Then it writes the sentinel line
-  `\n` + `devsandbox-agent 1\n` (`fleet::link::write_sentinel`), exchanges
-  `Hello`s on its stdin/stdout and requires the peer to advertise
-  `caps::SSH_AGENT`. Each connection to its socket becomes one
-  `Open { channel: SSH_AGENT }` stream on the mux over stdout (ids in the
-  daemon's space, below 2^31); `Open`s from the peer are refused. It
-  exits when stdin ends or stdout fails (`Ok`) or when the keepalive
-  (`mux::KEEPALIVE_INTERVAL`/`KEEPALIVE_TIMEOUT`) hears nothing, so a
-  partitioned link can't leave a socket that accepts and hangs. Exiting
-  unlinks the socket only while it is still its own (same device and
-  inode), never a newer relay's.
-- **This end**, `agent::serve` over any byte stream, plays the host
-  bridge: it skips the login shell's output up to the sentinel
-  (`ssh::skip_lines`, as the [link](#link-handshake) does), sends its
-  `Hello` advertising `caps::SSH_AGENT`, and answers each
-  `Open { SSH_AGENT }` with a connection to its `agent()` (production:
-  `bridge::host_agent`) when `allowed()` says yes at that moment, else a
-  `Close`, which the machine's end turns into a closed client socket. It
-  returns an `End`: the handshake failed, the keepalive ran `on_dead`
-  (which must end the stream, e.g. kill the ssh), or the stream closed.
+This host's ssh-agent reaches a machine over the machine's link, as
+`AGENT` streams the machine opens (fleet plan decisions 14 and 18; no
+ssh of its own, no `-A`). The machine's `fleet-link --peer <this host>`
+probes this host every `fleet::agent::PROBE` (2 s) and binds
+`agent-link-<this host>.sock` (`endpoint::link_agent_socket`) in its
+socket dir only while this host serves ([fleet](fleet.md#agent)); each
+connection there becomes one `AGENT` stream. This daemon answers each
+stream (`daemon::agent_for`, `fleet::agent::answer`) with its agent
+(`bridge::host_agent`: the agents clients reported first) while its
+registry entry for the machine has `agent` on, read per stream, else
+with `NOT_SERVING` and the close. So turning `agent` off refuses the
+next stream at once, and the machine unbinds its socket at its next
+probe; the link stays up either way.
 
 On the machine nothing registers the socket: `bridge::host_agent` tries
 the live `agent-*.sock` files in the socket dir (`endpoint::agent_sockets`,
 newest mtime first) after the agents clients reported and before the
 process's own `$SSH_AUTH_SOCK`, so the daemon's bridges and any command
-run there find it, and an exited relay drops out by the liveness check.
+run there (a CLI re-run, a terminal tab) find it, and a link that's gone
+drops out by the liveness check.
 
 Each machine's `agent` flag (`Entry::agent`, off by default) is set by
 `machine add --agent`, `machine set <name> --agent on|off` or `a` on the
@@ -332,39 +340,15 @@ dashboard's Machines tab (`machines.add` / `machines.set`), listed by
 in the Machines tab's AGENT column, and marked `(agent)` in the
 dashboard's header note.
 
-The local daemon runs the relay: the machine's agent thread
-(`service.rs` `agent_loop`) spawns `ssh::agent_argv` through the agent
-`Dial` while the flag is on and the machine is wanted
-([Held links](#held-links-machines), linger included). What keeps it
-wanted: a dashboard (it always watches with `machines: true`, which
-covers its terminal tabs), a forwarded verb for its run, and a CLI
-command re-run there over ssh, through its `machines.hold`. It serves it
-with `agent::serve`, its `allowed()` reading the live flag. A failed
-relay (ssh, handshake, keepalive) is logged (`machine <name>: agent
-relay: <why>`, with ssh's stderr tail) and retried with the link's
-backoff. The relay's socket and ssh are kept where the service reaches
-them (`Ctl::kill_relay`): turning `agent` off (`machine set <name>
---agent off`, or `a` on the dashboard's Machines tab) kills it at
-once (in-flight agent streams cut, later `Open`s refused) without
-restarting the link; the want ending kills it within a tick; `rm` and
-daemon exit kill it and join the thread.
+An offered fleet worker's `agent` flag gates the `AGENT` streams of its
+fleet link the same way, from the other side ([fleet.md](fleet.md#agent)):
+the hub's `fleet-link` serves those streams from the agent this daemon
+answers `fleet.agent` with (its own `bridge::host_agent` while the flag
+is on, asked every 2 s), and the worker binds `agent-fleet-<hub>.sock` in
+its socket dir only while its probes say the hub serves.
 
-An offered fleet worker has no relay of its own (`spawn_link` starts no
-agent thread for it; `Want::agent_ready` is `false` at once): its
-`agent` flag gates the `AGENT` streams of its fleet link instead
-([fleet.md](fleet.md#agent)). The hub's `fleet-link` serves those
-streams from the agent this daemon answers `fleet.agent` with (its own
-`bridge::host_agent` while the flag is on, asked every 2 s), and the
-worker binds `agent-fleet-<hub>.sock` in its socket dir, found by
-`bridge::host_agent` like a relay's socket, only while its probes say
-the hub serves.
-
-The machine's API relay (`--session-env`, `relay::SessionEnv`) sets each
-verb's `SSH_AUTH_SOCK` to `endpoint::agent_socket` for its own
-`--client` (the same `link::client_name` both ssh's pass) when that
-socket accepts a connection at the time of the request line, so host git
-there (worktree clones) signs with this host's agent; otherwise the login
-env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
+The old agent relay (`ssh::agent_argv`, `devsandbox agent-relay`,
+`machines::agent`) is no longer run; fleet step 8 removes it.
 
 ## The CLI: `cli.rs`
 
@@ -378,8 +362,8 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   and sends the request with the match's `machine` and root.
 - **Other named commands** (`exec`, `logs`, `inspect`, `done`, `undone`,
   `rename`, …) are resolved through the daemon; one on a machine is re-run
-  as `ssh [-t] <target> devsandbox <args>` (`exec` of ssh; with `agent`
-  on, see below; `exec --service <name>` re-runs with `--service=<name>`,
+  as `ssh [-t] <target> devsandbox <args>` (`exec` of ssh, but for a tty
+  `exec`, below; `exec --service <name>` re-runs with `--service=<name>`,
   once). `logs` /
   `inspect` with a bare `devsandbox-…` container name stay local. `port`
   on a machine's instance runs here: `route` returns `Routed::Port` (the
@@ -401,27 +385,20 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   `inbox`, `vscode`, `serve`, `api`, `machine`, the dashboard.
 - Without a local daemon, a qualified remote name and `--machine` fail
   ("needs devsandbox serve"); a bare name resolves locally.
-- **`agent` on** (`hold_params` decides from the `machines.get` entry):
-  the command keeps its daemon connection and sends `machines.hold {name,
-  agent}` (`agent`: this process's `SSH_AUTH_SOCK`, if absolute) first,
-  so the relay is up for ssh. `--machine`'s per-root runs, spawned
-  already, keep that connection across all of them. A single re-run's ssh
-  is spawned and waited for instead of `exec`ed (an
-  `exec` would drop the connection, and OpenSSH closes inherited fds), and
-  the command exits with ssh's status (`Routed::Exit`). While it runs this
-  process ignores SIGINT and SIGQUIT (`spawn_ssh_owning_signals`): with
-  `-t` ssh owns the terminal, and with `-T` a Ctrl-C reaches the whole
-  process group; ssh gets the dispositions back as they were before
-  (a `pre_exec`, since an ignored signal survives `exec`). A hold that
-  fails (a daemon without the method, any error) prints a `warning:` and
-  the command runs without the agent. With `agent` off ssh is `exec`ed,
-  except for a tty `exec` (below).
+- **The agent**: the `machines.get` lookup before a re-run passes this
+  process's `SSH_AUTH_SOCK` (if absolute) as `agent` (`info_params`), so
+  with the machine's `agent` on the agent the daemon answers the
+  machine's `AGENT` streams with, which the re-run there finds as
+  `agent-link-<this host>.sock` ([Agent](#agent)), is this terminal's.
+  Nothing is held for the run: the link is always up.
 - **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /
   `--sessions` / `--service`, and a tty by the remote `exec`'s rule, `shell_flags`, with
   this process on a terminal standing for the remote stdin). The id is this
   process's (`--session` as given, else `exec::mint_session_id`), and the
   ssh is always spawned (`reconnect_loop`, through
-  `spawn_ssh_owning_signals`, a hold kept across every dial): the first
+  `spawn_ssh_owning_signals`: while it runs this process ignores SIGINT
+  and SIGQUIT, since with `-t` ssh owns the terminal; ssh gets the
+  dispositions back as they were, a `pre_exec`): the first
   dial runs `exec --reserve-255 --session=<id> …` (create-or-attach),
   each re-dial `exec --reserve-255 <name> --attach=<id>` (attach only: a
   reconnect never starts a second program; `session_dials`). `Reconnect`
@@ -589,8 +566,8 @@ directory can be dropped. Both print the roots after the change.
 
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
 routed back to a request's `machine` + remote `root`; terminal tabs use
-`tty_argv` (no hold of their own: the dashboard's `machines: true` watch
-keeps the machine, and its agent relay, up); on an offered fleet worker an
+`tty_argv` (the machine's link, and so its `AGENT` streams, is up
+whatever the dashboard does); on an offered fleet worker an
 instance tab instead runs this host's `devsandbox exec … -- <m>/<name>`
 (`on_machine`, the executable `ExecCli::exe`), whose tty `exec` dials
 the worker's fleet link ([The CLI](#the-cli-clirs)), and a service tab

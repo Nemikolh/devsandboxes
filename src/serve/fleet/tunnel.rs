@@ -325,7 +325,7 @@ services = ["cache"]
         std::fs::write(root.join("cfg").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
         state_with(&b, &root);
         let state = b.join("state.toml");
-        let scope = Peer { name: "me@hub".into(), fleet_root: Some(root.clone()), env: None };
+        let scope = Peer { name: "me@hub".into(), fleet_root: Some(root.clone()), env: None, agent: None };
         let error = |out: &str| match crate::commands::tunnel::read_header(&mut out.as_bytes()) {
             Ok(Header::Error { error }) => {
                 assert!(out.ends_with("}\n"), "nothing after the header: {out:?}");

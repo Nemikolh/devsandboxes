@@ -1137,7 +1137,7 @@ mod tests {
     /// The hub's end of a stream served on a thread, its header sent.
     fn open(w: &World, header: Record, helper: HelperClient) -> (UnixStream, std::thread::JoinHandle<()>) {
         let (hub, ours) = UnixStream::pair().unwrap();
-        let peer = Peer { name: "me@hub".into(), fleet_root: Some(w.root.clone()), env: None };
+        let peer = Peer { name: "me@hub".into(), fleet_root: Some(w.root.clone()), env: None, agent: None };
         let files = Files { state: w.state.clone(), member: None, home: None };
         let t = std::thread::spawn(move || serve(ours, &helper, &files, &peer, || false, sh, log));
         rpc::write_record(&mut &hub, &header).unwrap();

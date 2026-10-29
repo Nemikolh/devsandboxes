@@ -16,9 +16,9 @@ use anyhow::Result;
 
 use crate::serve::machines::ssh::{self, Duplex};
 
-/// The dial behind a [`Transport`]: the target and the devsandbox args in,
-/// the connection out.
-type Dial = dyn Fn(&str, &[String]) -> Result<Duplex> + Send + Sync;
+/// The dial behind a [`Transport`]: the target, the program (`devsandbox`,
+/// or a machine's `command`) and its args in, the connection out.
+type Dial = dyn Fn(&str, &str, &[String]) -> Result<Duplex> + Send + Sync;
 
 /// A way to reach a devsandbox on another host.
 #[derive(Clone)]
@@ -31,18 +31,26 @@ impl Transport {
     /// (`ssh::spawn`: its stdio behind a socket, its stderr's tail kept).
     /// `BatchMode`: the daemon has no TTY to prompt on.
     pub fn ssh() -> Transport {
-        Transport::new(|target, args| ssh::spawn(&ssh_argv(target, args)?))
+        Transport(Arc::new(|target, program, args| ssh::spawn(&ssh_argv(target, program, args)?)))
     }
 
-    /// A transport dialing with `dial` (tests: an in-process far end).
+    /// A transport dialing with `dial` (tests: an in-process far end, which
+    /// is devsandbox whatever the program).
+    #[cfg(test)]
     pub fn new(dial: impl Fn(&str, &[String]) -> Result<Duplex> + Send + Sync + 'static) -> Transport {
-        Transport(Arc::new(dial))
+        Transport(Arc::new(move |target, _, args| dial(target, args)))
     }
 
     /// A connection to `devsandbox <args>` on `target` (`[user@]host`, an
     /// ssh-config alias or `ssh://[user@]host[:port]`, [`check_target`]).
     pub fn dial(&self, target: &str, args: &[String]) -> Result<Duplex> {
-        (self.0)(target, args)
+        (self.0)(target, "devsandbox", args)
+    }
+
+    /// [`dial`](Self::dial) running `program` instead of `devsandbox` (a
+    /// machine's `command`, as its login shell reads it).
+    pub fn dial_with(&self, target: &str, program: &str, args: &[String]) -> Result<Duplex> {
+        (self.0)(target, program, args)
     }
 }
 
@@ -52,8 +60,8 @@ pub fn check_target(target: &str) -> Result<()> {
 }
 
 /// [`Transport::ssh`]'s argv.
-fn ssh_argv(target: &str, args: &[String]) -> Result<Vec<OsString>> {
-    ssh::target_argv(target, &["-T", "-o", "BatchMode=yes"], "devsandbox", args)
+fn ssh_argv(target: &str, program: &str, args: &[String]) -> Result<Vec<OsString>> {
+    ssh::target_argv(target, &["-T", "-o", "BatchMode=yes"], program, args)
 }
 
 #[cfg(test)]
@@ -67,7 +75,7 @@ mod tests {
     #[test]
     fn the_ssh_argv() {
         let link = args(&["fleet-link", "--worker", "lap", "--root", "/d/fleet/me@hub"]);
-        let argv = ssh_argv("ssh://me@hub:2200", &link).unwrap();
+        let argv = ssh_argv("ssh://me@hub:2200", "devsandbox", &link).unwrap();
         let want = [
             "ssh",
             "-T",
@@ -80,8 +88,10 @@ mod tests {
             r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--worker'\'' '\''lap'\'' '\''--root'\'' '\''/d/fleet/me@hub'\'''"#,
         ];
         assert_eq!(argv, want.map(OsString::from));
-        assert_eq!(ssh_argv("hub", &link).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
-        assert!(ssh_argv("-oProxyCommand=x", &link).is_err());
+        assert_eq!(ssh_argv("hub", "devsandbox", &link).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
+        assert!(ssh_argv("-oProxyCommand=x", "devsandbox", &link).is_err());
+        let custom = ssh_argv("hub", "~/bin/ds", &args(&["fleet-link"])).unwrap();
+        assert_eq!(custom.last().unwrap(), r#"exec "$SHELL" -lc 'exec ~/bin/ds '\''fleet-link'\'''"#);
     }
 
     #[test]

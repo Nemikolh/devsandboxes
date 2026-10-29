@@ -1049,35 +1049,45 @@ A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-` (never
 `/` or `@`, so the CLI's `my-server/web-2` and `@/web-2` are unambiguous).
 The API never parses a qualified name: requests carry `machine`.
 
-**Transport.** Every connection to a machine is `ssh -T -o
-BatchMode=yes [-p N] -- <host> 'exec "$SHELL" -lc "exec <command> api
---stdio --client machine:<this host> --session-env"'`: the remote's relay
-(*Relay*), in the user's login shell there, lazy-starting the remote
-daemon and attaching the connection (`link.attach`), so the machine's
-trust applies to everything sent over it (*Remote callers*). `BatchMode`: the daemon has no TTY, so ssh fails instead of
-prompting. No `-A`: for a machine with `agent` on, the daemon runs an agent
-relay over an ssh of its own while the machine is wanted
-([machines.md](../architecture/daemon/machines.md#agent)), serving the
-daemon's preferred host agent (*Bridges*). The hello says version `0.0.0`, so it
-never hands off the remote daemon; the remote's `protocol` must equal
-ours, a different semver is allowed.
+**Transport.** This daemon holds one link to each ssh machine: `ssh -T -o
+BatchMode=yes [-p N] -- <host> 'exec "$SHELL" -lc "exec <command>
+fleet-link --peer <this host>"'`, `<this host>` its member name
+(`member.toml`'s `name`, else the hostname's first label), in the
+user's login shell there. It is a fleet [peer link](../architecture/daemon/fleet.md#peer-links):
+`fleet-link` hands every stream to the machine's daemon with
+`link.attach {peer, channel}`, so the machine's trust applies to
+everything sent over it (*Remote callers*), and this host binds
+`fleet-<name>.sock` and its siblings, each connection one stream there.
+The link's `API` streams are what this daemon talks to the machine over
+(the held connection, a fresh one per forwarded verb); a verb that way
+runs with the machine daemon's own env. `BatchMode`: the daemon has no
+TTY, so ssh fails instead of prompting. No `-A`: the machine opens
+`AGENT` streams over the link, which this daemon answers with its
+preferred host agent (*Bridges*) while the machine's `agent` is on
+([machines.md](../architecture/daemon/machines.md#agent)). Each hello
+says version `0.0.0`, so it never hands off the remote daemon; the
+remote's `protocol` must equal ours, a different semver is allowed. Only
+`machines.probe` and `machines.add`, before the machine has a link, ssh
+to `<command> api --stdio --client machine:<this host> --session-env`
+(the remote's relay, *Relay*, attaching its connection with
+`link.attach`).
 
-**Links.** One `serve-machine-<name>` thread per registered machine holds a
-connection to it only while wanted: while some connection watches with
-`machines: true`, a forwarded quick call is queued, a forwarded verb
-runs or a connection holds it (`machines.hold`), and 60 s after; on a
-fleet hub, an offered machine always
-([fleet](../architecture/daemon/fleet.md#hub-mode)). Connected, it subscribes to `instances` and, while a watcher wants
-machines, watches each of the machine's roots. A failed connect or a lost
-link is retried 1 s, 2 s, … 30 s apart while wanted (a forwarded call
-arriving meanwhile retries at once); the rows stay. A link's `state`:
+**Links.** Every registered machine's link is held while the daemon
+runs: one `serve-machine-<name>` thread per machine (plus one carrying an
+ssh machine's peer link) connects at once and stays connected, whatever
+watches. Connected, it subscribes to `instances` and, while a connection
+watches with `machines: true`, watches each of the machine's roots. A
+peer link that ends is redialed 1 s, 2 s, … 30 s apart; a failed connect
+or a lost connection over a live one is retried the same way (a
+forwarded call arriving meanwhile retries at once); the rows stay. A
+link's `state`:
 
 | `state` | |
 |---|---|
-| `idle` | not wanted, so not connected |
-| `connecting` | dialing ssh and saying hello |
+| `idle` | not attempted yet (the link's thread is starting) |
+| `connecting` | dialing its link and saying hello |
 | `connected` | up; `error` may still name a registered root the machine refused |
-| `unreachable` | the last attempt failed or the link was lost; `error` says why (ssh's last stderr, a protocol mismatch, `its devsandbox serve is exiting`); on a fleet hub also rows restored from `remotes.json` until the link connects, `error` ending `(rows from <time> UTC)` |
+| `unreachable` | the last attempt failed or the link was lost; `error` says why (ssh's last stderr, the machine's refusal, a protocol mismatch, `its devsandbox serve is exiting`, a hub build being followed: `updated to <build>: handing off`); on a fleet hub also rows restored from `remotes.json` until the link connects, `error` ending `(rows from <time> UTC)` |
 
 ### `roots.list`
 
@@ -1102,28 +1112,24 @@ null`): it is reached besides the own roots.
 | `machines.probe` | `{"target", "command"?}` (`command`: the machine's devsandbox as shell text, default `devsandbox`) | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target, empty `command`), `failed` (ssh, the hello or the protocol) |
 | `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, empty `command`, a root the machine refuses: each one's reason), `denied` (the name is a live inbound neighbor's), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
 | `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, the registry's by name, then the inbound neighbors by name; `kind` `ssh` \| `offered` \| `inbound`, `target` `null` for an offered one and an inbound one; `version` from the last hello (an inbound neighbor's: its link `Hello`); an inbound neighbor is always `connected`, `agent` off, `command` and `capacity` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
-| `machines.get` | `{"name"}` | `{"name", "kind", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an offered one has none) | `not-found`, `internal` (as `list`) |
+| `machines.get` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"name", "kind", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an offered one has none) | `not-found`, `invalid` (`agent` not absolute), `internal` (as `list`) |
 | `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `internal` (`machines.toml` doesn't read or write) |
-| `machines.hold` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"ok": true, "agent"}`: the machine is wanted (link and, with `agent` on, agent relay up) until this connection closes; `agent` says whether the relay is up | `not-found`, `invalid` (`agent` not absolute) |
 
 `probe` and `add` open a connection of their own (a 20 s hello), checking
 ssh, the remote devsandbox and the protocol before anything is saved.
 `add` checks every root with `roots.list {paths}` on the machine: a quoted
 `~` is the machine's home. `name` defaults to the target's host
 (`me@my-server.com` → `my-server.com`). `add`, `set` and `rm` reach the links at
-once (`set` flips `agent` on the live link: off kills the agent relay at
-once, without reconnecting). `agent` is listed (also in the federated
-snapshot's `machines`) and decides whether the daemon relays its agent
-there (*Transport*).
+once (`set` of `agent` keeps the live link: the next `AGENT` stream is
+answered as it says). `agent` is listed (also in the federated
+snapshot's `machines`) and decides whether the daemon answers the
+machine's `AGENT` streams with its agent (*Transport*).
 
-`hold` is per connection, for a client that runs its own ssh to the
-machine (the CLI re-running a command there) and needs the agent relay up
-meanwhile: `agent`, when given, is reported as the client's agent, like a
-verb's `env.SSH_AUTH_SOCK` (*Bridges*); with the machine's `agent` on the
-answer waits up to 5 s for the relay, else comes at once with `agent:
-false`. Holding the same machine again on one connection is allowed and
-still one hold. Closing the connection releases it (then the 60 s). Adding a machine means trusting it: its socket is as
+`get`'s `agent`, when given, is reported as the caller's agent, like a
+verb's `env.SSH_AUTH_SOCK` (*Bridges*): the CLI passes it before
+re-running a command on the machine over its own ssh, so the agent the
+machine reaches meanwhile is that terminal's. Adding a machine means trusting it: its socket is as
 powerful as `docker.sock`, and with `agent` on your agent is reachable
 there.
 
@@ -1151,7 +1157,7 @@ socket the link's `AGENT` streams connect
 ([fleet.md](../architecture/daemon/fleet.md#agent)), asked every 2 s.
 Params: `{"worker": "<machine name>"}`. Result: `{"agent": "<path>"}`,
 this daemon's own agent (the agents clients reported first, then the
-machines' agent relay sockets, then its `SSH_AUTH_SOCK`, as a bridge
+relayed agents' `agent-*.sock`, then its `SSH_AUTH_SOCK`, as a bridge
 picks one) while `worker` is an offered machine with `agent` on;
 `{"agent": null}` otherwise (no such machine, an ssh machine's name,
 `agent` off, no live agent here). Errors: `invalid` (a bad name, no
@@ -1300,27 +1306,27 @@ gets exactly what it got before machines.
 
 ### Verbs on a machine
 
-A verb with `machine` (`root` then a path on the machine) goes over an ssh
-connection of its own, dialled for that request, so a long build never
-holds up the link's quick calls. The request minus `machine` is sent after
-the hello; the remote relay replaces its `env` with the remote login
-shell's (*Relay*, `--session-env`), so only `env.SSH_AUTH_SOCK` matters
-here: an absolute path is reported to this daemon as an agent, which the
-machine's agent relay serves from. The verb keeps the machine wanted while
-it runs; with the machine's `agent` on it waits up to 5 s for the agent
-relay before it's sent. The machine's `output` and `progress`
+A verb with `machine` (`root` then a path on the machine) goes over an
+`API` stream of its own on the machine's link, opened for that request,
+so a long build never holds up the link's quick calls. The request minus
+`machine` is sent after the hello; the machine runs it with its daemon's
+own env (the link's, *Remote callers*), so only `env.SSH_AUTH_SOCK`
+matters here: an absolute path is reported to this daemon as an agent,
+which the machine's `AGENT` streams are answered with. A machine whose
+link is down fails it at once (`failed`, `<machine>: unreachable:
+<why>`). The machine's `output` and `progress`
 are relayed with `request` rewritten to the local id, and its answer
 (`failed`'s `data`, `confirm`, `detached` included) passed through.
 
-- **Hang-up**: the local client leaving closes the ssh, which the remote
+- **Hang-up**: the local client leaving closes the stream, which the remote
   daemon sees as its client hanging up: cancelled there unless `detach`.
 - **Drain**: a local daemon exit (idle, handoff, `shutdown`) closes it the
   same way, so a non-`detach` remote verb is cancelled, unlike a local verb
   (no spool here to adopt it by). A `detach` verb runs on.
-- **Errors**: the dial or hello failing is `failed` with `data:
-  {"exit": null, "instance": null}` and ssh's reason; the ssh ending before
-  the answer is `failed` (`connection lost; the verb may still be running
-  there`).
+- **Errors**: the stream or its hello failing is `failed` with `data:
+  {"exit": null, "instance": null}` and the reason (the link's, when it's
+  down); the stream ending before the answer is `failed` (`connection
+  lost; the verb may still be running there`).
 
 A forwarded verb holds this daemon while its ssh runs (*Holders*).
 
@@ -1406,7 +1412,8 @@ $ devsandbox api --stdio
 A client that isn't a devsandbox binary can send `"version": "0.0.0"`: the
 relay's own hello already handed off an older daemon.
 
-`--session-env` (hidden) is for a machine link's relay (*Machines*): once
+`--session-env` (hidden) is for the add-time relay to a machine
+(`machines.probe` / `.add`, *Machines*): once
 connected to the daemon, the relay first sends `link.attach` with `peer`
 its `--client` minus a `machine:` prefix (`relay::attach`), reads that
 one answer and relays none of it, so the daemon serves the rest of the
@@ -1418,10 +1425,10 @@ skip whatever the remote login shell printed before it. The upstream copy
 then goes line by line, and a request whose `method` is a
 verb gets its `params.env` replaced by the relay's own environment (the
 remote login shell's), since the requester's is another host's, with
-`SSH_AUTH_SOCK` set to the linking host's agent relay socket
-(`<socket dir>/agent-<client>.sock` for the relay's `--client`) when that
-accepts a connection at the time of the line; otherwise the login env's
-own `SSH_AUTH_SOCK` stays. Every
+`SSH_AUTH_SOCK` set to `<socket dir>/agent-<client>.sock` for the
+relay's `--client` when that accepts a connection at the time of the
+line (nothing binds it any more: the agent relay is gone); otherwise the
+login env's own `SSH_AUTH_SOCK` stays. Every
 other line, and everything downstream, passes as is; the 1 MiB line limit
 still applies.
 

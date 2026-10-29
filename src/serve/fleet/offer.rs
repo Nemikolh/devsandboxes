@@ -2,8 +2,8 @@
 //! side*): `fleet.offer {worker, version, root, draining?}`, sent by a worker's `fleet-link`
 //! once its link's `Hello`s are through, writes (or keeps) the worker's
 //! offered entry in `machines.toml`, `root` (the worker's fleet root) its
-//! one root; and [`dial`], how this host reaches an
-//! offered machine: its `fleet-<worker>.sock`. And `fleet.agent {worker}`,
+//! one root (its link is then dialed at `fleet-<worker>.sock`, as every
+//! machine's is: `fleet::dialer::dial`). And `fleet.agent {worker}`,
 //! what the same `fleet-link` asks every `fleet::agent::REFRESH`: the agent
 //! socket its `AGENT` streams connect, this daemon's own
 //! (`bridge::host_agent`, with the agents clients reported), while the
@@ -14,15 +14,12 @@
 //! params and a [`Ctx`].
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::serve::api::{ApiError, parse};
-use crate::serve::endpoint;
 use crate::serve::machines::service::Handle;
-use crate::serve::machines::ssh::{Dial, Duplex};
 use crate::serve::machines::inbound::{self, Neighbors};
 use crate::serve::machines::{self, Entry, check_name};
 
@@ -155,23 +152,6 @@ fn offer(p: OfferParams, ctx: &Ctx) -> Answer {
     Ok(json!({ "ok": true }))
 }
 
-/// The daemon's [`Dial`]: an offered machine is a connection to its
-/// worker's `fleet-link` socket in `socket_dir` (one `API` stream on the
-/// held link, which starts with the API relay's sentinel line, so
-/// `machines::link::handshake` reads it as it reads an ssh relay's);
-/// anything else goes to `ssh`.
-pub fn dial(socket_dir: PathBuf, ssh: Dial) -> Dial {
-    Arc::new(move |entry: &Entry| {
-        if !entry.is_offered() {
-            return ssh(entry);
-        }
-        let path = endpoint::fleet_socket(&socket_dir, &entry.name);
-        let stream = endpoint::Stream::connect(&path)
-            .map_err(|e| anyhow::anyhow!("its fleet link isn't up ({}: {e})", path.display()))?;
-        Ok(Duplex::socket(stream))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,21 +250,6 @@ mod tests {
         assert_eq!(call("fleet.agent", json!({"worker": "lap"}), &none).unwrap().unwrap(), json!({"agent": null}), "no agent here");
         assert_eq!(ask("a/b").unwrap_err().code, "invalid");
         assert!(crate::serve::dts::prop_type("ApiMethods", "fleet.agent").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_dial_picks_the_fleet_socket_for_offered_machines_only() {
-        let dir = std::env::temp_dir().join(format!("dsv-odial-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let ssh: Dial = Arc::new(|e: &Entry| anyhow::bail!("ssh to {}", e.label()));
-        let d = dial(dir.clone(), ssh);
-        assert_eq!(format!("{:#}", d(&Entry::ssh("srv", "me@srv")).err().unwrap()), "ssh to me@srv");
-        let down = format!("{:#}", d(&Entry::offered("lap")).err().unwrap());
-        assert!(down.starts_with("its fleet link isn't up"), "{down}");
-        let _listener = std::os::unix::net::UnixListener::bind(endpoint::fleet_socket(&dir, "lap")).unwrap();
-        assert!(d(&Entry::offered("lap")).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

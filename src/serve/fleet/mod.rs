@@ -8,8 +8,11 @@
 //!   machines' agent relay runs on it, and [`LINK`] is the fleet link's
 //!   spec (the `API` channel).
 //! - `offer`: `fleet.offer`, which registers an offered worker in
-//!   `machines.toml`, and the [`offer::dial`] that reaches one through its
-//!   `fleet-link` socket (`commands::fleet_link` is that opener).
+//!   `machines.toml` (`commands::fleet_link` is its link's opener).
+//! - `dialer`: the dialer's half of a peer link: how the daemon holds each
+//!   ssh machine's link (`fleet-link --peer` there), and the
+//!   [`dialer::dial`] that reaches every machine through its
+//!   `fleet-<name>.sock`.
 //! - `lend`: `lend.toml` (whether and to which hub this host lends) and the
 //!   fleet root a hub reaches.
 //! - `member`: `member.toml` (this host's name, trust, roots, `[allow]`,
@@ -44,6 +47,7 @@
 
 pub mod agent;
 pub mod code;
+pub mod dialer;
 pub mod follow;
 pub mod lend;
 pub mod lender;

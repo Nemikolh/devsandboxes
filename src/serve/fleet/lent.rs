@@ -66,6 +66,12 @@ pub struct Peer {
     /// `None`: a verb's env as sent (an attached relay's: the relay's
     /// `--session-env` already set it).
     pub env: Option<BTreeMap<String, String>>,
+    /// The linking host's agent relayed here (a peer link's
+    /// `agent-link-<peer>.sock`, `endpoint::link_agent_socket`): with `env`,
+    /// a verb's `SSH_AUTH_SOCK` while it answers, so host git there (a
+    /// worktree's clone) uses the agent the linking host serves, as an ssh
+    /// relay's `--session-env` did. `None`: `env` as it is.
+    pub agent: Option<PathBuf>,
 }
 
 /// The longest `link.attach` `peer` taken: a hostname fits well within it.
@@ -499,9 +505,15 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
     Ok(params)
 }
 
-/// A verb's `env` replaced by the peer's, when it has one.
+/// A verb's `env` replaced by the peer's, when it has one, its
+/// `SSH_AUTH_SOCK` the peer's relayed agent while that answers
+/// ([`Peer::agent`]).
 fn peer_env(obj: &mut serde_json::Map<String, Value>, peer: &Peer) -> Result<(), ApiError> {
     if let Some(env) = &peer.env {
+        let mut env = env.clone();
+        if let Some(agent) = peer.agent.as_deref().filter(|a| std::os::unix::net::UnixStream::connect(a).is_ok()) {
+            env.insert("SSH_AUTH_SOCK".into(), agent.to_string_lossy().into_owned());
+        }
         obj.insert("env".into(), serde_json::to_value(env).map_err(|e| ApiError::internal(e.into()))?);
     }
     Ok(())
@@ -690,7 +702,7 @@ mod tests {
             ("instances.list", json!({"dir": "/x", "machine": "m"}), Err("denied")),
             ("instances.list", json!({"machine": 3}), Err("invalid")),
             ("machines.list", p.clone(), Err("denied")),
-            ("machines.hold", json!({"name": "m"}), Err("denied")),
+            ("machines.get", json!({"name": "m"}), Err("denied")),
             ("fleet.offer", p.clone(), Err("denied")),
             ("fleet.agent", json!({"worker": "w"}), Err("denied")),
             ("lend.get", p.clone(), Err("denied")),
@@ -785,7 +797,7 @@ mod tests {
         }
         assert!(refuse_new_work("run", &lending, false).is_ok());
         // `drain` is the lending link's: an ssh machine's peer still runs.
-        let ssh = Peer { name: "lap".into(), fleet_root: None, env: None };
+        let ssh = Peer { name: "lap".into(), fleet_root: None, env: None, agent: None };
         assert!(refuse_new_work("run", &ssh, true).is_ok());
     }
 
@@ -838,6 +850,7 @@ mod tests {
             name: "me@hub".into(),
             fleet_root: Some(root.to_path_buf()),
             env: Some(BTreeMap::from([("PATH".into(), "/worker/bin".into())])),
+            agent: None,
         }
     }
 
@@ -922,7 +935,14 @@ mod tests {
         let full = Reach { trust: Trust::Full, ..r.clone() };
         assert_eq!(admit("stop", p.clone(), &as_sent, &full, &state).unwrap()["env"], p["env"]);
         // `full` still takes the peer's.
-        assert_eq!(admit("stop", p, &peer(&root), &full, &state).unwrap()["env"], json!({"PATH": "/worker/bin"}));
+        assert_eq!(admit("stop", p.clone(), &peer(&root), &full, &state).unwrap()["env"], json!({"PATH": "/worker/bin"}));
+        // A relayed agent: the verb's `SSH_AUTH_SOCK` while it answers.
+        let sock = base.join("agent-link-lap.sock");
+        let linked = Peer { agent: Some(sock.clone()), ..peer(&root) };
+        assert_eq!(admit("stop", p.clone(), &linked, &r, &state).unwrap()["env"], json!({"PATH": "/worker/bin"}), "not bound");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let want = json!({"PATH": "/worker/bin", "SSH_AUTH_SOCK": sock});
+        assert_eq!(admit("stop", p, &linked, &r, &state).unwrap()["env"], want);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -952,7 +972,7 @@ mod tests {
         let ssh = Reach { own: ssh.own.union(&own).cloned().collect(), ..ssh };
         assert!(admit("stop", json!({"root": root.join("cfg"), "all": true}), &s, &ssh, &state).is_ok());
         // Its verbs keep the env the relay set (`Peer.env` is `None`).
-        let attached = Peer { name: "lap".into(), fleet_root: None, env: None };
+        let attached = Peer { name: "lap".into(), fleet_root: None, env: None, agent: None };
         let sent = json!({"root": mine, "instance": "own", "env": {"SSH_AUTH_SOCK": "/run/agent-machine_lap.sock"}});
         assert_eq!(admit("stop", sent.clone(), &attached, &ssh, &state).unwrap(), sent);
         assert_eq!(admit("config.migrate", json!({"root": mine}), &s, &ssh, &state).unwrap_err().code, "denied");

@@ -169,7 +169,7 @@ pub fn agent_of(conn: &mut Conn, worker: &str) -> Result<Option<PathBuf>> {
 /// This process's own binary: on Linux `/proc/self/exe`, the inode it runs
 /// even when the path was replaced since; elsewhere `current_exe()`. The
 /// worker checks what it got reports this link's `Hello` anyway.
-fn own_binary() -> io::Result<std::path::PathBuf> {
+pub(crate) fn own_binary() -> io::Result<std::path::PathBuf> {
     #[cfg(target_os = "linux")]
     return Ok("/proc/self/exe".into());
     #[cfg(not(target_os = "linux"))]

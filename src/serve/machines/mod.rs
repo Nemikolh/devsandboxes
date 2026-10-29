@@ -1,8 +1,10 @@
-//! Machines: remote hosts whose daemons this one talks to over
-//! `ssh <target> devsandbox api --stdio`
-//! (docs/architecture/daemon/machines.md), or, for an offered fleet worker,
-//! over the `API` streams of the link it holds to this host
-//! (docs/architecture/daemon/fleet.md, `fleet::offer::dial`).
+//! Machines: remote hosts whose daemons this one talks to over the `API`
+//! streams of one link per machine (docs/architecture/daemon/machines.md):
+//! for an ssh machine the link this host holds to it
+//! (`ssh <target> devsandbox fleet-link --peer <this host>`,
+//! `fleet::dialer`), for an offered fleet worker the one it holds to this
+//! host (docs/architecture/daemon/fleet.md); either way reached at
+//! `fleet-<name>.sock` (`fleet::dialer::dial`).
 //!
 //! - this module: the registry, `machines.toml` next to `state.toml`
 //! - `ssh`: the ssh argv and quoting, and the injectable [`ssh::Dial`] that
@@ -14,8 +16,8 @@
 //!   federated resolve and sandboxes listing
 //! - `cli`: the CLI's side: where a `<name>` points, `--machine`, and the
 //!   ssh re-run of commands that don't go through the daemon
-//! - `agent`: this end of a machine's agent relay, serving its streams from
-//!   the local ssh-agent (`commands::agent_relay` is the far end)
+//! - `agent`: this end of a machine's agent relay, which nothing runs since
+//!   the link carries `AGENT` (fleet step 7d; it goes in step 8)
 //! - `install`: the CLI's check of a machine's devsandbox and the copy of
 //!   this binary there
 //! - `saved`: a hub's `remotes.json`, the machines' last known rows
@@ -60,9 +62,9 @@ pub struct Entry {
     /// The remote devsandbox as shell text (`~/bin/devsandbox`); `None` is
     /// `devsandbox` on the login shell's `PATH`.
     pub command: Option<String>,
-    /// This host's ssh-agent is relayed to the machine while its link is
-    /// wanted (docs/architecture/daemon/machines.md, *Agent*); off by
-    /// default, and only written when on.
+    /// This host's ssh-agent answers the machine's `AGENT` streams
+    /// (docs/architecture/daemon/machines.md, *Agent*); off by default, and
+    /// only written when on.
     pub agent: bool,
 }
 

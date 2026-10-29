@@ -793,7 +793,7 @@ mod tests {
         /// A raw stream over the hub's offered dial to `lap`, past the
         /// API relay's sentinel line.
         fn offered_stream(hub_dir: &Path) -> endpoint::Stream {
-            let dial = crate::serve::fleet::offer::dial(hub_dir.to_path_buf(), Arc::new(|_: &Entry| unreachable!()));
+            let dial = crate::serve::fleet::dialer::dial(hub_dir.to_path_buf());
             let duplex = dial(&Entry::offered("lap")).unwrap();
             let mut reader = BufReader::new(duplex.stream.try_clone().unwrap());
             duplex.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -872,7 +872,7 @@ mod tests {
 
             // The hub's own link to it: `machines::link::handshake` as for
             // an ssh machine.
-            let dial = crate::serve::fleet::offer::dial(hub_dir.clone(), Arc::new(|_: &Entry| unreachable!()));
+            let dial = crate::serve::fleet::dialer::dial(hub_dir.clone());
             let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5)).unwrap();
             assert_eq!(link.remote().version, "0.6.0");
             let call = |link: &mut mlink::Link, m: &str, p: Value| link.conn.call(m, p).unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
             let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
             assert!(rows[0]["capacity"].is_null(), "{rows}");
             // Through the trust table, as the hub asks it.
-            let dial = crate::serve::fleet::offer::dial(hub_dir.clone(), Arc::new(|_: &Entry| unreachable!()));
+            let dial = crate::serve::fleet::dialer::dial(hub_dir.clone());
             let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5)).unwrap();
             let r = link.conn.call("capacity.get", json!({})).unwrap().result.unwrap();
             assert_eq!((&r["cpus"], &r["lending"]), (&json!(8), &json!("on")), "{r}");

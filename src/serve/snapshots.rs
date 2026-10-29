@@ -175,8 +175,9 @@ pub fn stats_due(last: Option<Instant>, now: Instant, fresh: bool) -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkState {
-    /// Not wanted, so not connected (docs/architecture/daemon/machines.md,
-    /// *Held links: `Machines`*).
+    /// Not attempted yet: every link is held from the start
+    /// (docs/architecture/daemon/machines.md, *Held links: `Machines`*), so
+    /// only until its thread's first attempt (or where no service runs).
     #[default]
     Idle,
     Connecting,

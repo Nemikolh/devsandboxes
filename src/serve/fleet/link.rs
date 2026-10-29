@@ -29,7 +29,7 @@
 //! return fast: a local connect, or a socket pair whose other end a thread
 //! takes (`transfer::Receivers::accept`).
 //!
-//! The machines' agent relay is one link (`machines::agent::SPEC`, one
+//! The machines' agent relay (unused since fleet step 7d) is one link (`machines::agent::SPEC`, one
 //! channel each way: its opener is `commands::agent_relay` through
 //! [`opener`], its answerer `machines::agent::serve` through [`answerer`]);
 //! the fleet link another (`fleet::LINK`: `API` served by the answerer,
@@ -395,6 +395,7 @@ pub enum End {
 /// [`answerer_with`] serving only `spec.channel`, with `open()`'s
 /// connections, and opening nothing. `on_ready` runs once the `Hello`s are
 /// through (the opener's socket is bound by then).
+#[allow(dead_code)] // its one user, `machines::agent::serve`, goes in fleet step 8
 pub fn answerer(
     spec: &Spec,
     reader: impl Read,

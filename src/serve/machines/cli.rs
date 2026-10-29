@@ -9,11 +9,12 @@
 //! only checks their names here.
 //!
 //! The decisions are pure ([`plan`], [`machine_use`], [`remote_args`],
-//! [`per_root`], [`hold_params`]); [`route`] does the I/O: the daemon
-//! lookups, then an `exec` of ssh (or a spawn per root). For a machine with
-//! `agent` on, ssh is spawned and waited for instead of `exec`ed: this
-//! process keeps a daemon connection holding the machine (`machines.hold`),
-//! so its agent relay is up while ssh runs, and ssh has no `-A`.
+//! [`per_root`], [`info_params`]); [`route`] does the I/O: the daemon
+//! lookups, then an `exec` of ssh (or a spawn per root). The lookup
+//! (`machines.get`) passes this process's `SSH_AUTH_SOCK`, so the agent the
+//! daemon answers the machine's `AGENT` streams with is this terminal's
+//! while the command runs there (the machine's link is always up; ssh has
+//! no `-A`).
 //!
 //! A tty `exec` on a machine is spawned too, in a loop: it runs in a helper
 //! session this process names ([`reconnect_session`]), and a lost connection
@@ -339,7 +340,18 @@ pub(crate) fn choose(name: &str, mut found: Vec<Found>, tty: bool, pick: &mut Pi
 
 /// A machine as `machines.get` describes it.
 pub(crate) fn machine_info(call: &mut dyn FnMut(&str, Value) -> Result<crate::serve::proto::Response>, m: &str) -> Result<Entry> {
-    let r = call("machines.get", json!({ "name": m }))?;
+    machine_info_with(call, m, None)
+}
+
+/// [`machine_info`] reporting `own_agent` (this process's `SSH_AUTH_SOCK`)
+/// to the daemon ([`info_params`]): the lookup before a re-run on the
+/// machine.
+fn machine_info_with(
+    call: &mut dyn FnMut(&str, Value) -> Result<crate::serve::proto::Response>,
+    m: &str,
+    own_agent: Option<PathBuf>,
+) -> Result<Entry> {
+    let r = call("machines.get", info_params(m, own_agent))?;
     if let Some(e) = r.error {
         if e.code == "not-found" {
             return Err(no_machine(m));
@@ -615,22 +627,22 @@ pub(crate) fn dials(entry: &Entry, command: &Command, name: &str, root: Option<&
 }
 
 /// Run `dials` on `entry`: the first dial, then the attach after each lost
-/// connection, per [`Reconnect`], with `held` kept to the end.
-fn run_dials(dials: Dials, entry: &Entry, id: &str, held: Option<Conn>) -> Result<Routed> {
+/// connection, per [`Reconnect`].
+fn run_dials(dials: Dials, entry: &Entry, id: &str) -> Result<Routed> {
     match dials {
         // Each dial spawned: this process outlives ssh.
-        Dials::Ssh { first, again } => reconnect_loop(id, held, |redial| spawn_ssh_owning_signals(if redial { &again } else { &first })),
+        Dials::Ssh { first, again } => reconnect_loop(id, |redial| spawn_ssh_owning_signals(if redial { &again } else { &first })),
         Dials::Pty { first, again } => {
             let dir = endpoint::socket_dir()?;
-            reconnect_loop(id, held, |redial| Ok(pty_client::dial(&dir, &entry.name, if redial { &again } else { &first }, true)))
+            reconnect_loop(id, |redial| Ok(pty_client::dial(&dir, &entry.name, if redial { &again } else { &first }, true)))
         }
     }
 }
 
 /// Dial (`dial(false)`), then re-dial (`dial(true)`) after each lost
-/// connection, per [`Reconnect`], with `held` kept to the end. Between
-/// dials SIGINT is ours, so Ctrl-C during a wait ends it.
-fn reconnect_loop(id: &str, held: Option<Conn>, mut dial: impl FnMut(bool) -> Result<i32>) -> Result<Routed> {
+/// connection, per [`Reconnect`]. Between dials SIGINT is ours, so Ctrl-C
+/// during a wait ends it.
+fn reconnect_loop(id: &str, mut dial: impl FnMut(bool) -> Result<i32>) -> Result<Routed> {
     let mut state = Reconnect::default();
     let mut redial = false;
     loop {
@@ -646,7 +658,6 @@ fn reconnect_loop(id: &str, held: Option<Conn>, mut dial: impl FnMut(bool) -> Re
                 if gone {
                     eprintln!("{}", gone_note(id));
                 }
-                drop(held);
                 return Ok(Routed::Exit(code));
             }
         }
@@ -718,51 +729,25 @@ fn connect() -> Result<Conn> {
     endpoint::socket_dir().and_then(|dir| client::connect(&dir, "cli"))
 }
 
-/// `machines.hold`'s params for a re-run on `entry`, `None` when it needs no
-/// hold (`agent` off: nothing to keep up). `own_agent` is this process's
-/// `SSH_AUTH_SOCK`, passed on when absolute, so the relay serves the agent
-/// of the terminal the command runs in.
-pub(crate) fn hold_params(entry: &Entry, own_agent: Option<PathBuf>) -> Option<Value> {
-    if !entry.agent {
-        return None;
-    }
-    let mut params = json!({ "name": entry.name });
+/// `machines.get`'s params for machine `m`: with `own_agent` when absolute
+/// (the daemon then serves the machine's `AGENT` streams with it).
+pub(crate) fn info_params(m: &str, own_agent: Option<PathBuf>) -> Value {
+    let mut params = json!({ "name": m });
     if let Some(agent) = own_agent.filter(|a| a.is_absolute()) {
         params["agent"] = json!(agent);
     }
-    Some(params)
+    params
 }
 
-/// Hold `entry` on `conn` for a re-run ([`hold_params`]): `conn` back when
-/// held, to keep until ssh exits. A hold that fails (a daemon without the
-/// method, an error) is a warning: the command runs without the agent.
-fn hold(mut conn: Conn, entry: &Entry) -> Option<Conn> {
-    let params = hold_params(entry, crate::devsbd::bridge::own_agent())?;
-    let failed = match conn.call("machines.hold", params) {
-        Ok(r) => match r.error {
-            None => return Some(conn),
-            Some(e) => e.message,
-        },
-        Err(e) => format!("{e:#}"),
-    };
-    eprintln!("warning: cannot hold machine `{}` for its ssh-agent relay: {failed}", entry.name);
-    None
-}
-
-/// Run `argv` (ssh) on `entry`: with `held` (a [`hold`]ing connection),
-/// spawned and waited for with the connection kept to its end; else
-/// `exec`ed, as without an agent.
-fn run_ssh(argv: &[OsString], held: Option<Conn>) -> Result<Routed> {
-    let Some(conn) = held else { return Err(exec_ssh(argv)) };
-    let code = spawn_ssh_owning_signals(argv);
-    drop(conn);
-    Ok(Routed::Exit(code?))
+/// Run `argv` (ssh): `exec`ed, replacing this process.
+fn run_ssh(argv: &[OsString]) -> Result<Routed> {
+    Err(exec_ssh(argv))
 }
 
 /// Where `command` runs (module doc): here (maybe with its name resolved),
-/// or on a machine over ssh, which replaces this process (or, `agent` on,
-/// runs as its child: [`hold`]; a tty `exec` always does, re-dialed after a
-/// lost connection: [`reconnect_loop`]). `machine` is
+/// or on a machine over ssh, which replaces this process (a tty `exec`
+/// runs as its child, re-dialed after a lost connection:
+/// [`reconnect_loop`]). `machine` is
 /// `--machine`, `machines` the registered names ([`super::registered_names`]).
 pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String], command: Command) -> Result<Routed> {
     match plan(&command, machine, in_process, machines)? {
@@ -770,7 +755,8 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
         Plan::HereAs(name) => Ok(Routed::Here(renamed(command, name))),
         Plan::Machine(m, usage) => {
             let mut conn = connect().context("--machine needs devsandbox serve")?;
-            let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
+            let own_agent = crate::devsbd::bridge::own_agent();
+            let entry = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
             if entry.is_offered() && usage != MachineUse::Port {
                 let u = offered::use_of(&command);
                 match u {
@@ -787,15 +773,9 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
                 };
                 return Ok(Routed::Exit(code));
             }
-            let held = match usage {
-                MachineUse::Once(_) | MachineUse::PerRoot { .. } => hold(conn, &entry),
-                _ => {
-                    drop(conn);
-                    None
-                }
-            };
+            drop(conn);
             match usage {
-                MachineUse::Once(args) => run_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?, held),
+                MachineUse::Once(args) => run_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?),
                 MachineUse::PerRoot { args, json } => {
                     let runs = per_root(&m, &entry.roots, &args, json)?;
                     let mut code = 0;
@@ -806,7 +786,6 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
                             code = status;
                         }
                     }
-                    drop(held);
                     Ok(Routed::Exit(code))
                 }
                 MachineUse::Port => {
@@ -863,7 +842,8 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         (Some(m), _) | (None, Where::Machine(m)) => m.clone(),
         (None, _) => return Ok(Routed::Here(renamed(command, chosen.name))),
     };
-    let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
+    let own_agent = crate::devsbd::bridge::own_agent();
+    let entry = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
     if matches!(command, Command::Vscode { .. }) {
         if entry.is_offered() {
             return Err(offered::refusal(&m, offered::Refused::Vscode));
@@ -899,10 +879,8 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
             let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
             let request = pty_client::Request { root: root.to_path_buf(), instance: chosen.name.clone(), mode };
             let dir = endpoint::socket_dir()?;
-            let held = hold(conn, &entry);
-            let code = pty_client::dial(&dir, &m, &request, reserve_255);
-            drop(held);
-            return Ok(Routed::Exit(code));
+            drop(conn);
+            return Ok(Routed::Exit(pty_client::dial(&dir, &m, &request, reserve_255)));
         }
         if let Some(routed) = offered_session_exec(&command, &mut conn, &entry, &chosen.name, root, terminal)? {
             return Ok(routed);
@@ -910,7 +888,8 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     }
     if let Some(id) = reconnect_session(&command, terminal, || crate::commands::exec::mint_session_id(crate::state::Instance::now()))? {
         let dials = dials(&entry, &command, &chosen.name, root, &id, terminal)?;
-        return run_dials(dials, &entry, &id, hold(conn, &entry));
+        drop(conn);
+        return run_dials(dials, &entry, &id);
     }
     if entry.is_offered() {
         // What's left for an offered machine: an exec without a tty, one
@@ -922,14 +901,13 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
         let request = pty_client::Request { root: root.to_path_buf(), instance: chosen.name.clone(), mode };
         let dir = endpoint::socket_dir()?;
-        let held = hold(conn, &entry);
-        let code = pty_client::dial(&dir, &m, &request, reserve_255);
-        drop(held);
-        return Ok(Routed::Exit(code));
+        drop(conn);
+        return Ok(Routed::Exit(pty_client::dial(&dir, &m, &request, reserve_255)));
     }
     let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
     let argv = ssh::cli_argv(&entry, terminal, &args)?;
-    run_ssh(&argv, hold(conn, &entry))
+    drop(conn);
+    run_ssh(&argv)
 }
 
 /// `exec --sessions` and a tty `exec --attach [ID]` of instance `name` on
@@ -1226,15 +1204,13 @@ mod tests {
         Entry { roots: vec![PathBuf::from("/r")], ..Entry::ssh("box", "me@box") }
     }
 
-    /// A re-run holds its machine only with `agent` on, passing this
-    /// process's agent when it's an absolute path.
+    /// A re-run's lookup passes this process's agent when it's an
+    /// absolute path.
     #[test]
-    fn re_runs_hold_machines_with_the_agent_on() {
-        assert_eq!(hold_params(&entry(), Some("/tmp/agent.sock".into())), None, "agent off: exec as ever");
-        let on = Entry { agent: true, ..entry() };
-        assert_eq!(hold_params(&on, Some("/tmp/agent.sock".into())), Some(json!({"name": "box", "agent": "/tmp/agent.sock"})));
-        assert_eq!(hold_params(&on, Some("rel.sock".into())), Some(json!({"name": "box"})));
-        assert_eq!(hold_params(&on, None), Some(json!({"name": "box"})));
+    fn a_re_runs_lookup_reports_the_agent() {
+        assert_eq!(info_params("box", Some("/tmp/agent.sock".into())), json!({"name": "box", "agent": "/tmp/agent.sock"}));
+        assert_eq!(info_params("box", Some("rel.sock".into())), json!({"name": "box"}));
+        assert_eq!(info_params("box", None), json!({"name": "box"}));
     }
 
     /// What `main` gets for a port: a nameless one's port comes out of

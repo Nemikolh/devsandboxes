@@ -41,6 +41,7 @@ pub const SPEC: Spec = Spec {
 /// `Hello`s are through (the far end's socket is bound by then); `on_dead`
 /// once the keepalive hears nothing: it must end `reader` (kill the ssh) so
 /// this returns.
+#[allow(dead_code)] // nothing runs the relay since fleet step 7d; goes with `agent-relay` in step 8
 pub fn serve(
     reader: impl Read,
     writer: impl Write + Send + 'static,

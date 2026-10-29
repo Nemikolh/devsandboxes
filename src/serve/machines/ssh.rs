@@ -124,13 +124,12 @@ pub fn remote_command(command: &str, args: &[impl AsRef<str>]) -> String {
     format!("exec \"$SHELL\" -lc {}", quote(&cmd))
 }
 
-/// The argv of `entry`'s API connection: `ssh -T -o BatchMode=yes [-p N]
-/// -- <host> <devsandbox api --stdio --client <client> --session-env>`.
+/// The argv of an API connection to `entry` at add time (`machines.probe`,
+/// `.add`, before it has a link): `ssh -T -o BatchMode=yes [-p N] --
+/// <host> <devsandbox api --stdio --client <client> --session-env>`.
 /// `BatchMode`: whoever runs it (the daemon) has no TTY, so ssh fails rather
 /// than prompting. `--session-env`: the remote relay swaps each verb's
-/// `env` for its own login env, with `SSH_AUTH_SOCK` pointed at `client`'s
-/// agent relay socket while one is up. No `-A`: the agent travels over the
-/// agent relay ([`agent_argv`]), only for a machine with `agent` on.
+/// `env` for its own login env (the probe sends none).
 pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     let args = ["api", "--stdio", "--client", client, "--session-env"];
     argv(entry, &["-T", "-o", "BatchMode=yes"], &args)
@@ -139,9 +138,8 @@ pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
 /// The argv of an interactive command on `entry` (a terminal tab, a CLI
 /// re-run): `ssh -t [-p N] -- <host> <devsandbox remote_args…>`. No
 /// `BatchMode`: a person is there to answer ssh's prompts. No `-A`: the
-/// agent, for a machine with `agent` on, is the daemon's agent relay
-/// ([`agent_argv`]), up while the machine is wanted (a watching dashboard,
-/// a CLI's `machines.hold`).
+/// agent, for a machine with `agent` on, is this host's over the machine's
+/// link (`AGENT`, `fleet::dialer`).
 pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     cli_argv(entry, true, remote_args)
 }
@@ -188,6 +186,7 @@ pub fn tunnel_argv(
 /// *Agent*): `ssh -T -o BatchMode=yes [-p N] -- <host> <devsandbox
 /// agent-relay --client <client>>`. No `-A`: the agent travels inside the
 /// relay's own streams.
+#[allow(dead_code)] // nothing spawns the relay since fleet step 7d; goes in step 8
 pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     argv(entry, &["-T", "-o", "BatchMode=yes"], &["agent-relay", "--client", client])
 }
@@ -231,23 +230,15 @@ pub(crate) fn target_argv(target: &str, opts: &[&str], program: &str, remote_arg
     Ok(argv)
 }
 
-/// Opens a connection to a machine: production spawns ssh ([`ssh_dial`] to
-/// its daemon, [`ssh_agent_dial`] for its agent relay), tests connect to a
-/// test daemon's socket or run the relay's far end in-process.
+/// Opens a connection to a machine: production connects its link's socket
+/// (`fleet::dialer::dial`) or, at add time, spawns ssh ([`ssh_dial`]);
+/// tests connect to a test daemon's socket.
 pub type Dial = Arc<dyn Fn(&Entry) -> Result<Duplex> + Send + Sync>;
 
-/// The production [`Dial`] to a machine's daemon: [`spawn`] of
-/// [`api_argv`], saying `client` to the remote relay (its `serve.log`, and
-/// which agent relay socket its verbs get).
+/// The production add-time [`Dial`] to a target's daemon: [`spawn`] of
+/// [`api_argv`], saying `client` to the remote relay (its `serve.log`).
 pub fn ssh_dial(client: String) -> Dial {
     Arc::new(move |entry: &Entry| spawn(&api_argv(entry, &client)?))
-}
-
-/// The production [`Dial`] of a machine's agent relay: [`spawn`] of
-/// [`agent_argv`], with the same `client` as [`ssh_dial`]'s so the remote
-/// API relay finds this relay's socket.
-pub fn ssh_agent_dial(client: String) -> Dial {
-    Arc::new(move |entry: &Entry| spawn(&agent_argv(entry, &client)?))
 }
 
 /// A connection to a peer daemon: a socket to read and write lines on, and
@@ -478,6 +469,13 @@ pub fn skip_lines<T, E>(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    /// `stream` as a dial through a stand-in for ssh whose stderr is
+    /// `stderr` (what [`Peer::stderr_tail`] reads): a far end run
+    /// in-process writes there what the real one's stderr would carry.
+    pub fn with_stderr(stream: Stream, stderr: impl Read + Send + 'static) -> Result<Duplex> {
+        Ok(Duplex { stream, peer: Peer { child: None, stderr: Some(Tail::collect(stderr, "test-ssh-stderr")?) } })
+    }
 
     /// A test daemon's socket as a machine link sees it through the relay:
     /// the relay's first line (`relay::write_sentinel`), then the daemon's

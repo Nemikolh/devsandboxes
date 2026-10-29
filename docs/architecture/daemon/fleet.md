@@ -2,8 +2,8 @@
 
 Machines as one pool of capacity (the plan:
 [fleet](../../plans/active/fleet.md)). What exists so far is the link
-primitive the fleet's links are built on (the machines'
-[agent relay](machines.md#agent) runs on it too) and both sides of a
+primitive the fleet's links are built on, the [peer links](#peer-links)
+that carry every ssh machine, and both sides of a
 worker's link: on the hub the offer, the offered registry entry and its
 dial, and [hub mode](#hub-mode); on the worker `lend.toml`,
 `member.toml`, the lending thread, the lent API, the worker policy,
@@ -237,8 +237,9 @@ uses, and spawned by `ssh::spawn`; `BatchMode`: the daemon has no TTY to
 prompt on). Swapping ssh, or spreading a link over several connections
 for bandwidth, changes that module and nothing that dials. Callers name
 the target and the devsandbox args only (the worker's link:
-`worker::link_args`); tests build a `Transport::new` whose far end runs
-in-process and see both.
+`worker::link_args`; an ssh machine's: `dialer::link_args`, run as the
+entry's `command` through `Transport::dial_with`); tests build a
+`Transport::new` whose far end runs in-process and see both.
 
 ## Peer links
 
@@ -288,6 +289,32 @@ of `fleet::LINK` (it writes the sentinel), saying
   connection drops (K's daemon handed off or restarted), `Announce`
   connects and announces again, backing off from `REANNOUNCE` (100 ms) to
   5 s; the link stays up meanwhile. A refusal then ends the link.
+
+L's end is the daemon's: each ssh machine `K` in L's `machines.toml` is
+held by its `serve-machine-K-link` thread running
+`fleet::dialer::Dialer::hold` (the service's `Hold`;
+[machines](machines.md#held-links-machines)), redialed after the backoff
+whenever it ends, the far end's refusal (ssh's stderr tail) its error.
+It is the answerer of `fleet::LINK` (it reads the sentinel), saying
+`update::hello_of(hub)` for L, with the sentinel and the `Hello`s within
+`machines::service::Timing::handshake`.
+
+- **OUT.** L binds `fleet-K.sock` and its `.pty`, `.tunnel`,
+  `.transfer` siblings in its socket dir, as a hub's `fleet-link
+  --worker` binds an offered worker's (newest binder wins: a successor
+  daemon's link takes them over, the old daemon's ssh dying with it); each
+  accepted connection a stream to K. So every client here reaches K as it
+  reaches an offered worker, through `fleet-K.*.sock`: the machine's held
+  link and forwarded verbs (`dialer::dial`), and the channel forms of
+  steps 4-5 once step 8 points ssh machines at them.
+- **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
+  `AGENT` goes to L's daemon in-process (`dialer::Open`,
+  `daemon::machine_dialer`: `Shared::open_lent` with peer `{name: K,
+  fleet_root: fleet/K/, env: the daemon's}`), the `serve_channel` a
+  `link.attach` connection gets (decision 24); `AGENT` is answered with
+  L's agent while L's entry for K has `agent` on (`daemon::agent_for`,
+  read per stream: decision 18). While the hub's binary is on its way
+  every stream but that `binary` transfer is refused.
 
 ## Transfer
 
@@ -494,13 +521,13 @@ link's `API` streams.
   rows as well as the placed ones, which `snapshots::merge` takes from
   the fleet root's snapshot as it takes an ssh machine's unregistered
   roots' rows from its first root's.
-- **The dial** (`fleet::offer::dial`, wrapped around whatever reaches ssh
-  machines when `daemon::run` builds its `Dial`): for an offered entry, a
-  connection to its `fleet-<name>.sock` in the daemon's socket dir as a
-  plain `ssh::Duplex::socket`; down, `its fleet link isn't up (…)`. Each
-  connection is one `API` stream to the worker's daemon, so the held link
-  (`service::Machines`), the quick calls and `forward::verb` (one stream
-  per verb, a hang-up the stream's close) run on it as on an ssh machine.
+- **The dial** (`fleet::dialer::dial`, the daemon's `Dial` for every
+  machine): a connection to its `fleet-<name>.sock` in the daemon's
+  socket dir as a plain `ssh::Duplex::socket`; down, `its link isn't up
+  (…)`. Each connection is one `API` stream to the worker's daemon, so the
+  held link (`service::Machines`), the quick calls and `forward::verb`
+  (one stream per verb, a hang-up the stream's close) run on it as on an
+  ssh machine's [peer link](#peer-links).
 - **Terminals** go over the link: a tty `exec` on an offered machine
   (and its `--attach`, `--sessions`) and the dashboard's instance tabs,
   which run that `exec` locally, are `PTY` streams from the hub
@@ -513,10 +540,8 @@ link's `API` streams.
 - **The agent** goes over the link: with `machine set <name> agent on`
   (`machines.set`, taken for an offered entry as for an ssh one) the
   hub's agent reaches every instance on the worker as `AGENT` streams
-  ([AGENT](#agent)). The machine links run no agent relay for an offered
-  entry (`service.rs` `spawn_link` starts no agent thread for it, and
-  `Want::agent_ready` is `false` at once), and `forward::verb` waits for
-  none.
+  ([AGENT](#agent)), as an ssh machine's link carries this host's
+  agent to that machine ([machines](machines.md#agent)).
 - **The CLI's other re-runs** are API calls with `machine` (fleet plan
   decision 15): `logs` (`containers.logs`), `logs --build`
   (`instances.buildLog`; `--follow`, its pages by `offset`), `inspect` (`containers.inspect`), `done` /
@@ -548,16 +573,14 @@ keeps it running) makes the daemon a hub:
   passes `keep_alive` to `idle::decide` for a hub).
 - **It accepts offers** (`fleet.offer`, above); any other daemon refuses
   them.
-- **It holds every offered link** (fleet plan decision 7): the daemon
-  passes `service::Hub` to `Machines::spawn`, and `Inner::wanted` is true
-  for an offered entry whatever holds, watchers or linger say. Its link
-  thread dials at once and, while the worker's `fleet-link` socket is
-  absent, retries with the usual backoff (1 s doubling to 30 s), its
-  `state` `unreachable`. An offered link's failure is logged only when it
+- **It holds every offered link**, as every daemon holds every link
+  (fleet plan decision 7; [machines](machines.md#held-links-machines)):
+  the link thread dials at once and, while the worker's `fleet-link`
+  socket is absent, retries with the usual backoff (1 s doubling to 30 s),
+  its `state` `unreachable`. A link's failure is logged only when it
   differs from the last one logged since the link was up
   (`service::log_failure`), so an absent worker is one line in
-  `serve.log`, not one per retry. Ssh machines are held only while
-  wanted, as anywhere.
+  `serve.log`, not one per retry.
 - **It saves the machines' rows**, `remotes.json` next to `state.toml`
   (`machines::saved::path`; `Options::remotes` in tests), so a restarted
   hub shows the fleet before its machines reconnect. The
@@ -991,6 +1014,16 @@ A worker follows its hub's exact build, an older one included
   failure), so the dialer redials and reaches the new binary. A dialed
   end on the hub pushes its own dev build to a dialer that would take it
   (`update::hub_pushes`, `push_build` through `fleet-<dialer>.transfer.sock`).
+  On the dialer (`fleet::dialer`, the same `follows` from the answerer's
+  `on_ready`): `Download` and `Stop` refuse the link (`End::Refused`), then
+  `Download` kills the ssh, installs and hands off over the daemon's
+  `Follow` (`Options::lend_update` in tests); `Receive` serves only the
+  hub's `binary` transfer, its wait shutting the link once it is in or
+  over, then `install_received` and the handoff. The outcome (`updated to
+  <build>: handing off`, `update to <build> failed: <why>`) is the
+  machine's `error` until the next attempt, after the backoff. A dialer
+  that is the hub pushes its own dev build to a machine that would take
+  it (`push_build` through `fleet-<machine>.transfer.sock`).
 
 ### Lending: `lend.*`
 
@@ -1167,7 +1200,10 @@ never hands the daemon off (below). Under **`worker`**:
 - **Env**: a verb's `env` is replaced by the `Peer`'s when it has one: on
   the lending link the daemon's own process env (`verbs_client::caller_env`,
   `Options::lend_env` in tests), never what the hub sent: the worker-side
-  counterpart of `relay::SessionEnv` on an ssh machine.
+  counterpart of `relay::SessionEnv` on an ssh machine. A peer link's
+  (`link.attach {channel}`) is the same env, its `SSH_AUTH_SOCK` the
+  peer's relayed agent (`Peer::agent`: `agent-link-<peer>.sock`) while
+  that socket answers.
 - **Answers and pushes**: a snapshot lists every instance in `state.toml`,
   whatever its `dir`, so `instances.list` answers and every
   `instances.snapshot` pushed to the connection (`Pending::reach`: the
@@ -1189,9 +1225,10 @@ version it says and even with `force`, under either trust: only a local
 client's newer binary (or this user's forced hello, [Versions](#versions))
 replaces it.
 
-**`link.attach {peer}`** turns a `Full` connection into a `Peer` one: an
-ssh machine's relay (`api --stdio --session-env`) sends it first, before
-relaying a byte ([machines](machines.md#ssh), `relay::attach`). The
+**`link.attach {peer}`** turns a `Full` connection into a `Peer` one: the
+add-time relay to an ssh machine (`api --stdio --session-env`,
+`machines.probe` / `.add`) sends it first, before relaying a byte
+([machines](machines.md#ssh), `relay::attach`). The
 daemon (`daemon::link_attach`) takes it only from a `Full` connection of
 its own user (`endpoint::peer_is_own_user`), `peer` a non-empty name
 (`lent::attach_peer`: at most 255 bytes, no control characters; the
@@ -1200,8 +1237,7 @@ connection to `Peer { name: peer, fleet_root: None, env: None }`, its
 pushed snapshots filtered from then on (`Pending::reach`, as
 `Shared::spawn_conn_as` sets it for the lending link's). `env` is
 `None`: the relay's `SessionEnv` already replaced each verb's with the
-machine's login env and the linking host's agent relay, which the
-daemon must keep. It is one-way: a second `link.attach` is `link.*`,
+machine's login env, which the daemon must keep. It is one-way: a second `link.attach` is `link.*`,
 which the table refuses. It logs `connection N: link from <peer>, trust
 <t>` and answers `{ok, trust}`.
 
@@ -1519,7 +1555,7 @@ bytes come (a probe sends none and closes, so it never dials the agent)
 a connection to that path, spliced. The path is the hub daemon's
 `fleet.agent {worker}` answer ([api.md](../../reference/api.md#fleetagent)):
 the daemon's own `bridge::host_agent` (the agents clients reported
-included, as for the machines' agent relays; `daemon::Options::host_agent`
+included, as for an ssh machine's `AGENT` streams; `daemon::Options::host_agent`
 in tests) while the worker's entry is offered with `agent = true`, else
 `null`. `agent::refresh` asks it on a thread of its own, started once the
 offer is through, on a fresh connection to the hub's daemon

@@ -29,6 +29,7 @@ use super::ssh::Dial;
 use crate::serve::api::{ApiError, Found, Resolved, SandboxEntry};
 use crate::serve::client::Streamed;
 use crate::serve::proto::{Notification, Response};
+use crate::serve::snapshots::LinkState;
 use crate::serve::verbs;
 
 /// The non-verb methods that take a `machine`: the ones naming an
@@ -76,12 +77,8 @@ pub fn is_here(method: &str) -> bool {
 /// up answers well within it; one that isn't connecting costs the caller
 /// this much at most, not `service`'s longer bound.
 pub const FANOUT_WAIT: Duration = Duration::from_secs(5);
-/// A forwarded verb's hello: ssh's connect and auth, the remote login
-/// shell, a lazy start of the remote daemon.
+/// A forwarded verb's hello: a lazy start of the remote daemon.
 const HANDSHAKE: Duration = Duration::from_secs(20);
-/// How long a forwarded verb to a machine with `agent` on waits for its
-/// agent relay before going without (`machines.hold` too).
-pub(super) const AGENT_WAIT: Duration = Duration::from_secs(5);
 /// How often a forwarded verb looks at its local client while the remote
 /// is silent.
 const TICK: Duration = Duration::from_millis(50);
@@ -279,7 +276,7 @@ pub struct VerbCtx<'a> {
     /// The registered machines (the links' entries).
     pub entries: Vec<Entry>,
     pub dial: &'a Dial,
-    /// The links: a verb holds its machine wanted ([`Handle::want`]).
+    /// The links: why a machine whose link is down is unreachable.
     pub links: &'a Handle,
     /// The forwarded verbs in flight: an idle holder each, while its ssh runs.
     pub held: &'a AtomicUsize,
@@ -305,16 +302,13 @@ impl Drop for Holding<'_> {
 }
 
 /// Verb `method` on machine `machine` (its `params` still carrying
-/// `machine`): a fresh dial and hello, then the request minus `machine`,
-/// its notifications relayed to `peer` under local request id `id`. The
-/// remote relay swaps `env` for its login env, so only the agent is
-/// taken from it here: reported to this daemon (`bridge::report_agent`),
-/// whose agent relays serve from `bridge::host_agent`.
-///
-/// The machine is held wanted for the verb's run, so its link and, with
-/// `agent` on, its agent relay are up; with `agent` on the request waits
-/// up to [`AGENT_WAIT`] for the relay (a `run` that clones over ssh
-/// there would race it), and goes anyway, logged, if it isn't up by then.
+/// `machine`): a fresh `API` stream on its link (the [`Dial`]) and hello,
+/// then the request minus `machine`, its notifications relayed to `peer`
+/// under local request id `id`. The machine runs it with its daemon's own
+/// env (the link's peer env, `fleet::lent::Peer`), so only the agent is
+/// taken from `env` here: reported to this daemon (`bridge::report_agent`),
+/// which answers the machine's `AGENT` streams from `bridge::host_agent`.
+/// A link that's down fails at once, with why.
 ///
 /// `None`: the local client hung up, or this daemon drains. Either way the
 /// connection to the machine is cut, which the remote daemon takes as its
@@ -336,17 +330,15 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
         Err(e) => return Some(Response::err(id, e.code, e.message)),
     }
     let _holding = Holding::new(ctx.held);
-    let want = ctx.links.want(machine);
-    // An offered machine has no relay to wait for: its fleet link carries
-    // the agent (`fleet::agent`).
-    if entry.agent && !entry.is_offered() && let Some(want) = &want {
-        if !want.agent_ready(AGENT_WAIT) {
-            (ctx.log)(&format!("{}: {method} on {machine}: its agent relay isn't up; going without", ctx.who));
-        }
-    }
     let duplex = match (ctx.dial)(entry) {
         Ok(duplex) => duplex,
-        Err(e) => return failed(format!("{machine}: {e:#}")),
+        Err(e) => {
+            let down = ctx.links.remotes().get(machine).filter(|m| m.state != LinkState::Connected).and_then(|m| m.error);
+            return failed(match down {
+                Some(why) => format!("{machine}: unreachable: {why}"),
+                None => format!("{machine}: {e:#}"),
+            });
+        }
     };
     // Kept to cut the connection: a test's socket has no ssh to kill, and
     // shutting it is what the remote sees as a hang-up either way.
@@ -405,14 +397,12 @@ fn check_verb_params(params: &Value) -> Result<Option<PathBuf>, ApiError> {
 mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::path::Path;
-    use std::sync::Arc;
 
     use super::*;
     use crate::serve::client::{self, Conn, Hello};
     use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
     use crate::serve::daemon::Exit;
     use crate::serve::endpoint::{self, Stream};
-    use crate::serve::machines::ssh;
     use crate::serve::proto::{ErrorBody, Version};
 
     #[test]
@@ -538,19 +528,28 @@ mod tests {
             remote.state = Some(remote_state);
             remote.home = Some(base.join("remote-home"));
             remote.machines = Some(base.join("remote-machines.toml"));
+            // `full`: the verbs' scratch dir is no root of the machine's.
+            remote.lend = Some(base.join("remote-data/lend.toml"));
+            std::fs::write(base.join("remote-data/member.toml"), "trust = \"full\"\n").unwrap();
             let mut local = opts(1, 300);
             local.state = Some(local_state);
             local.machines = Some(registry);
-            local.dial = Some({
-                let remote_dir = remote_dir.clone();
-                Arc::new(move |e: &Entry| match e.name.as_str() {
-                    "box" => ssh::test_support::relayed(endpoint::connect(&remote_dir)?),
-                    other => anyhow::bail!("ssh: Could not resolve hostname {other}"),
-                })
-            });
+            local.lend = Some(base.join("local-data/lend.toml"));
+            std::fs::write(base.join("local-data/member.toml"), "name = \"lap\"\n").unwrap();
+            // `box` is the remote daemon over a peer link; `down` has no route.
+            let (peer, _) = crate::serve::fleet::dialer::tests::peer_transport(&remote_dir);
+            local.link_transport = Some(crate::serve::fleet::transport::Transport::new(move |target, args| match target {
+                "me@box" => peer.dial(target, args),
+                other => anyhow::bail!("ssh: Could not resolve hostname {}", other.trim_start_matches("me@")),
+            }));
             let daemons = vec![spawn_daemon(&remote_dir, remote), spawn_daemon(&base.join("local"), local)];
             drop(conn_at(&remote_dir));
-            let local = conn_at(&base.join("local"));
+            let mut local = conn_at(&base.join("local"));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while machine_state(&mut local, "box") != "connected" || machine_state(&mut local, "down") != "unreachable" {
+                assert!(Instant::now() < deadline, "the links never settled");
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Pair { base, remote_dir, verb_dir, remote_root, local_root, local, daemons }
         }
 
@@ -622,7 +621,7 @@ mod tests {
         assert_eq!(code_message(&r), ("internal", "this daemon runs no forwards"));
         // The link to `down` can't connect: `failed`, why.
         let r = c.call("instances.list", json!({"dir": "/x", "machine": "down"})).unwrap();
-        assert_eq!(code_message(&r), ("failed", "down: unreachable: down: ssh: Could not resolve hostname down"));
+        assert_eq!(code_message(&r), ("failed", "down: unreachable: ssh: Could not resolve hostname down"));
 
         // Federated: here and there, qualified, sorted; `down` adds nothing.
         let r = c.call("instances.resolve", json!({"name": "web", "machines": true})).unwrap().result.unwrap();
@@ -740,7 +739,7 @@ mod tests {
         let e = answer(&mut reader, 10).0["error"].clone();
         assert_eq!(
             e,
-            json!({"code": "failed", "message": "down: ssh: Could not resolve hostname down", "data": {"exit": null, "instance": null}})
+            json!({"code": "failed", "message": "down: unreachable: ssh: Could not resolve hostname down", "data": {"exit": null, "instance": null}})
         );
 
         // A hang-up mid-verb: SIGINT there.
@@ -761,19 +760,18 @@ mod tests {
         pair.finish();
     }
 
-    fn box_state(c: &mut Conn) -> String {
+    fn machine_state(c: &mut Conn, name: &str) -> String {
         let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
-        let row = rows.as_array().unwrap().iter().find(|r| r["name"] == "box").unwrap().clone();
+        let row = rows.as_array().unwrap().iter().find(|r| r["name"] == name).unwrap().clone();
         row["state"].as_str().unwrap().to_string()
     }
 
-    /// A verb holds its machine wanted while it runs (the link comes up with
-    /// no watcher), and reports the requester's agent to this daemon.
+    /// A verb reports the requester's agent to this daemon, which answers
+    /// the machine's `AGENT` streams with it.
     #[test]
-    fn a_forwarded_verb_holds_its_machine_and_reports_the_agent() {
-        let mut pair = Pair::new("fwd-want", SCRIPT);
+    fn a_forwarded_verb_reports_the_agent() {
+        let pair = Pair::new("fwd-agent", SCRIPT);
         let root = pair.verb_dir.clone();
-        assert_eq!(box_state(&mut pair.local), "idle");
         let agent = std::env::temp_dir().join(format!("dsv-fwd-agent-{}.sock", std::process::id()));
         let stream = stream_at(&pair.local_dir());
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -782,57 +780,23 @@ mod tests {
         send(&stream, 1, "stop", params);
         until_ready(&mut reader);
         assert!(crate::devsbd::bridge::reported_agents().contains(&agent), "the requester's agent reported");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while box_state(&mut pair.local) != "connected" {
-            assert!(Instant::now() < deadline, "the held machine's link never came up");
-            std::thread::sleep(Duration::from_millis(20));
-        }
         let (a, _) = answer(&mut reader, 1);
         assert!(a["error"].is_null(), "{a}");
-        // Released: idle again after the linger.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while box_state(&mut pair.local) != "idle" {
-            assert!(Instant::now() < deadline, "the link outlived the verb");
-            std::thread::sleep(Duration::from_millis(20));
-        }
         drop((reader, stream));
         pair.finish();
     }
 
-    /// `machines.hold` keeps its machine wanted (the link comes up with no
-    /// watcher) until its connection closes; with `agent` off it answers
-    /// at once, `agent: false`.
+    /// `machines.get {agent}` reports the caller's agent (a CLI re-run's
+    /// terminal); a relative one is `invalid`.
     #[test]
-    fn a_hold_keeps_its_machine_up_until_the_connection_closes() {
-        let mut pair = Pair::new("fwd-hold", "exit 0");
-        assert_eq!(box_state(&mut pair.local), "idle");
-        let mut holder = conn_at(&pair.local_dir());
-        let r = holder.call("machines.hold", json!({"name": "nope"})).unwrap();
-        assert_eq!(code_message(&r), ("not-found", "no machine named `nope`"));
-        let r = holder.call("machines.hold", json!({"name": "box", "agent": "rel.sock"})).unwrap();
+    fn a_lookup_reports_the_callers_agent() {
+        let mut pair = Pair::new("fwd-get-agent", "exit 0");
+        let r = pair.local.call("machines.get", json!({"name": "box", "agent": "rel.sock"})).unwrap();
         assert_eq!(code_message(&r), ("invalid", "`agent` must be absolute, got `rel.sock`"));
-        assert_eq!(code_message(&holder.call("machines.hold", json!({})).unwrap()).0, "invalid");
-
-        let agent = std::env::temp_dir().join(format!("dsv-hold-agent-{}.sock", std::process::id()));
-        let started = Instant::now();
-        let r = holder.call("machines.hold", json!({"name": "box", "agent": agent})).unwrap();
-        assert_eq!(r.result, Some(json!({"ok": true, "agent": false})), "{r:?}");
-        assert!(started.elapsed() < Duration::from_secs(2), "agent off: no wait for a relay");
+        let agent = std::env::temp_dir().join(format!("dsv-get-agent-{}.sock", std::process::id()));
+        let r = pair.local.call("machines.get", json!({"name": "box", "agent": agent})).unwrap();
+        assert_eq!(r.result.unwrap()["name"], "box");
         assert!(crate::devsbd::bridge::reported_agents().contains(&agent), "the caller's agent reported");
-        // Again: fine, still one hold.
-        assert!(holder.call("machines.hold", json!({"name": "box"})).unwrap().error.is_none());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while box_state(&mut pair.local) != "connected" {
-            assert!(Instant::now() < deadline, "the held machine's link never came up");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Released with the connection: idle again after the linger.
-        drop(holder);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while box_state(&mut pair.local) != "idle" {
-            assert!(Instant::now() < deadline, "the link outlived the holding connection");
-            std::thread::sleep(Duration::from_millis(20));
-        }
         pair.finish();
     }
 }

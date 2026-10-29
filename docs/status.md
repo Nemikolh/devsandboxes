@@ -37,10 +37,9 @@ limitation means editing this file in the same commit.
   re-placement: from fleet step 7 on. Steps 1-6 shipped on the two-kind
   model that steps 7-10 replace (steps 4-5's channels and API forms on
   offered workers' links only; step 6's `member.toml` and trust table on
-  both kinds' API connections). Step 7 in progress: the dialed end of a
-  peer link (`fleet-link --peer`, inbound neighbors in `machines.list`)
-  exists, but nothing dials it yet (7d puts ssh machines on it), so no
-  inbound neighbor appears in practice.
+  both kinds' API connections). Step 7 in progress: ssh machines are held
+  over a peer link (`fleet-link --peer` there, this host an inbound
+  neighbor in its `machines.list`); 7e (the docs close) is left.
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -233,20 +232,25 @@ limitation means editing this file in the same commit.
 - A local daemon exit (handoff, idle, shutdown) cancels a held non-`detach`
   remote verb (every CLI verb): there is no spool to adopt it by.
   → [machines](architecture/daemon/machines.md); `machines::forward::verb`
-- Daemon-side ssh is `BatchMode=yes`, one handshake per forwarded verb:
-  passphrase-prompting keys fail. → [machines](architecture/daemon/machines.md); `ssh::api_argv`
-- A CLI re-run's `machines.hold` isn't renewed: if the local daemon exits
-  or hands over while the ssh session runs (`exec -it m/x` left open), the
-  machine's agent relay goes with it for the rest of that session unless
-  something else (a dashboard) wants the machine.
-  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::hold`
-- Every agent check on a machine with a live agent relay (`host_agent`'s
-  liveness connect: each `Bridges::reconcile` of its daemon's poll, each
-  verb line its API relay rewrites) opens and closes a stream through the
-  relay to this host's agent. → [machines](architecture/daemon/machines.md#agent);
+- Daemon-side ssh (each machine's link, `machine add`'s probe) is
+  `BatchMode=yes`: passphrase-prompting keys fail.
+  → [machines](architecture/daemon/machines.md#ssh); `fleet::transport::Transport::ssh`, `ssh::api_argv`
+- A daemon with registered machines still idles out (a link isn't a
+  holder): its links go with it, and each machine drops it as an inbound
+  neighbor, until a client starts the daemon again (or `serve install`
+  keeps it up). → [machines](architecture/daemon/machines.md#held-links-machines); `idle::decide`
+- A CLI re-run reports its terminal's agent once (`machines.get
+  {agent}`): a daemon that hands over while the ssh session runs leaves
+  the machine's `AGENT` streams to the successor's own agent (or the next
+  client's report). → [machines](architecture/daemon/machines.md#agent); `machines::cli::info_params`
+- Every agent check on a machine whose linking host serves `AGENT`
+  (`host_agent`'s liveness connect on `agent-link-<host>.sock`: each
+  `Bridges::reconcile` of its daemon's poll) opens and closes a stream
+  over the link to that host's agent. → [machines](architecture/daemon/machines.md#agent);
   `bridge::agent_live`
-- Several hosts linking one machine with `agent` on each run a relay;
-  processes there use the newest live socket (mtime), not their caller's.
+- Several hosts linking one machine with `agent` on each get an
+  `agent-link-<host>.sock` there; processes there use the newest live
+  socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
 - `machine add` has no `--command`: it sets `command` only when it finds or
   installs devsandbox in `~/.local/bin` off the login `PATH`; a remote devsandbox
@@ -298,10 +302,6 @@ limitation means editing this file in the same commit.
   under a host pty on the worker: not resumable, a dropped link ends
   them (it kills the runtime's exec client; the in-container process
   may run on, as before resumable exec). → [fleet](architecture/daemon/fleet.md#pty); `fleet::pty::decide`, `fleet::pty::run_tty`
-- Verbs on an offered worker run with the worker's own env: host git
-  there gets no `SSH_AUTH_SOCK` of the hub's agent, unlike an ssh
-  machine's (`--session-env`).
-  → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
 - A hub notices a worker that's back (its `fleet-link` socket bound again)
   only at its offered link's next retry, up to 30 s later: a re-offer of a
   known worker doesn't wake the link.
@@ -321,22 +321,25 @@ limitation means editing this file in the same commit.
   messages (not threads, which need `inbox`) still reach the worker's
   Inbox and desktop.
   → [fleet](architecture/daemon/fleet.md#worker-policy); `inbox::decide`
-- The trust table covers an ssh machine's API connections only (its
-  `api --stdio` relay's, after `link.attach`): the per-use ssh commands
-  (`ssh::tty_argv` for terminals, `cli_argv` for `--machine` `ps` / `ls` /
-  `stats` / `gc` / `service ls`, `tunnel_argv` for forwards,
-  `agent_argv`) are plain ssh shells on the machine, whatever its `trust`,
-  until every use goes over the machine's link (fleet steps 7-8).
+- Every stream of an ssh machine's link goes through its trust table
+  (`link.attach`), but the per-use ssh commands (`ssh::tty_argv` for
+  terminals, `cli_argv` for CLI re-runs and `--machine` `ps` / `ls` /
+  `stats` / `gc` / `service ls`, `tunnel_argv` for forwards) are still
+  plain ssh shells on the machine, whatever its `trust`, until every use
+  goes over the link's channels (fleet step 8).
   → [machines](architecture/daemon/machines.md#ssh); `serve::machines::ssh`
 - A machine added before `machine add` recorded its roots there has none
   in its `member.toml`, so its `worker` trust refuses those of its roots
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
   add <root>…` on the machine, or `machine rm` + `machine add` it again.
   → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetrmtrustroots); `commands::machine::record_roots`
-- A hub's verb on a worker runs with the worker daemon's own process env
-  (a systemd unit's or LaunchAgent's, not a login shell's as over ssh's
-  `relay::SessionEnv`), so `PATH` additions from shell profiles are
-  missing; fix: capture a login env once when lending starts.
+- A verb from a linked host (a hub's on its offered worker, any host's on
+  its ssh machine) runs with the machine daemon's own process env (a
+  systemd unit's or LaunchAgent's, not a login shell's), so `PATH`
+  additions from shell profiles are missing (an ssh machine's verbs get
+  the linking host's agent as `SSH_AUTH_SOCK` while its
+  `agent-link-<host>.sock` answers; an offered worker's get the daemon's
+  own); fix: capture a login env once at the daemon's start.
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
 - No build is marked published yet: the release workflow doesn't set
   `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a worker's

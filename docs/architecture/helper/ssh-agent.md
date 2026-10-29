@@ -74,10 +74,10 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
   has a live agent; it is replaced when the agent appears or disappears.
 - Which agent: chosen per stream by `host_agent()`: the newest live socket
   among those clients reported (`AgentCandidates`, up to 8), else the
-  newest live machine agent relay socket in the socket dir
-  (`agent-*.sock`, `endpoint::agent_sockets`;
-  [machines.md](../daemon/machines.md#agent); on a fleet worker its link's
-  `agent-fleet-<hub>.sock` too, bound only while the hub serves its agent, [fleet.md](../daemon/fleet.md#agent)), else the
+  newest live relayed agent socket in the socket dir
+  (`agent-*.sock`, `endpoint::agent_sockets`: on a machine a linking
+  host's `agent-link-<host>.sock`, [machines.md](../daemon/machines.md#agent);
+  on a fleet worker its link's `agent-fleet-<hub>.sock`, bound only while the hub serves its agent, [fleet.md](../daemon/fleet.md#agent)), else the
   daemon's own `$SSH_AUTH_SOCK`. Every client that asks for a bridge
   (`bridges.ensure`) reports its own `$SSH_AUTH_SOCK`, as does every verb
   forwarded to a machine (`machines::forward::verb`), so agent rotation (a
@@ -104,7 +104,7 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
 | macOS, podman | yes | attempted symlink bind; the host socket can't cross into the podman machine VM |
 | Apple `container` | yes | no (`supports_file_binds` false) |
 | Windows native | no (relay is unix-only) | no (`ssh_agent_forward` is unix-only) |
-| remote machine | with `agent` on: the local daemon's agent relay serves it there while the machine is wanted, and verbs get its socket as `SSH_AUTH_SOCK` ([machines.md](../daemon/machines.md#agent)); no ssh to a machine passes `-A` (CLI re-runs hold the machine, terminal tabs ride the dashboard's watch); with `agent` off nothing of this host's agent reaches it; an offered fleet worker gets it over its fleet link's `AGENT` streams instead ([fleet.md](../daemon/fleet.md#agent)) | n/a |
+| remote machine | with `agent` on: the local daemon answers the `AGENT` streams the machine opens over its link with it, as `agent-link-<host>.sock` there ([machines.md](../daemon/machines.md#agent)); no ssh to a machine passes `-A` (a CLI re-run reports its terminal's agent through `machines.get`); with `agent` off nothing of this host's agent reaches it; an offered fleet worker gets it over its fleet link's `AGENT` streams instead ([fleet.md](../daemon/fleet.md#agent)) | n/a |
 
 VS Code terminals are not devsandbox's: VS Code forwards its own agent
 through its server, independently of both modes.
