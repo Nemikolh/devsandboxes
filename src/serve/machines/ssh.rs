@@ -217,8 +217,8 @@ fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl As
 }
 
 /// `ssh <opts> [-p N] -- <host> <remote_command>` to a bare target: what
-/// [`argv_with`] builds for an entry, and a fleet worker's link to its hub
-/// (`fleet::worker::link_argv`), which has no entry.
+/// [`argv_with`] builds for an entry, and `fleet::transport::Transport::ssh`'s
+/// dial of a bare target (a fleet worker's link to its hub has no entry).
 pub(crate) fn target_argv(target: &str, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     let target = parse_target(target)?;
     let mut argv: Vec<OsString> = ["ssh"].iter().chain(opts).map(OsString::from).collect();

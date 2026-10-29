@@ -55,6 +55,7 @@ pub mod placed;
 pub mod pty;
 pub mod pty_client;
 pub mod transfer;
+pub mod transport;
 pub mod tunnel;
 pub mod update;
 pub mod worker;

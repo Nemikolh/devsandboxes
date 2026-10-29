@@ -26,8 +26,7 @@
 //!   daemon last gave (`fleet.agent`, [`Cached`]), while fresh. The path is
 //!   read on a thread of its own too ([`refresh`]).
 
-use std::io::{self, Read, Write};
-use std::net::Shutdown;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::link::{Outlet, Socket};
+use super::link::{Outlet, Socket, splice};
 use crate::devsbd::mux::Conn;
 use crate::devsbd::proto::channel;
 use crate::serve::endpoint;
@@ -189,22 +188,6 @@ fn relay(client: UnixStream, stream: Conn, refused: Arc<AtomicBool>) {
     });
 }
 
-/// Relay `client` and `stream` both ways on threads of their own, each
-/// direction's end passed on as a half-close.
-fn splice(client: UnixStream, stream: Conn) {
-    let (Ok(client2), Ok(stream2)) = (client.try_clone(), stream.try_clone()) else { return };
-    let up = move || {
-        let _ = io::copy(&mut &client, &mut &stream);
-        let _ = stream.shutdown(Shutdown::Write);
-    };
-    let down = move || {
-        let _ = io::copy(&mut &stream2, &mut &client2);
-        let _ = client2.shutdown(Shutdown::Write);
-    };
-    let _ = std::thread::Builder::new().name("fleet-agent-up".into()).spawn(up);
-    let _ = std::thread::Builder::new().name("fleet-agent-down".into()).spawn(down);
-}
-
 /// How often the hub's `fleet-link` asks its daemon for the agent
 /// (`fleet.agent`, [`refresh`]).
 pub const REFRESH: Duration = Duration::from_secs(2);
@@ -318,6 +301,8 @@ pub fn refresh(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::net::Shutdown;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::AtomicUsize;
 
@@ -433,14 +418,17 @@ mod tests {
             let gate = Arc::clone(&gate);
             std::thread::spawn(move || {
                 let serves = Serves::default().with(channel::AGENT, move || gate.open(Instant::now()));
-                link::opener_with(&LINK, hub_io.try_clone().unwrap(), hub_io, &[(channel::API, api.as_path())], serves, |_| Ok(()))
+                let sockets = [(channel::API, api.as_path())];
+                let endpoint = link::Endpoint { sockets: &sockets, serves, outlet: None };
+                link::opener_with(&LINK, hub_io.try_clone().unwrap(), hub_io, endpoint, |_| Ok(()))
             })
         };
         let outlet = Arc::new(Outlet::default());
         let answering = Arc::clone(&outlet);
         let worker = std::thread::spawn(move || {
             let serves = Serves::default().with(channel::API, || None);
-            link::answerer_with(&LINK, worker_io.try_clone().unwrap(), worker_io, &serves, Some(&answering), |_| Ok(()), || {})
+            let endpoint = link::Endpoint { serves, outlet: Some(&answering), ..link::Endpoint::default() };
+            link::answerer_with(&LINK, worker_io.try_clone().unwrap(), worker_io, endpoint, |_| Ok(()), || {})
         });
         let path = socket(&dir, "me@hub");
         let over = Arc::new(AtomicBool::new(false));

@@ -369,14 +369,13 @@ pub fn call(method: &str, params: Value, lender: &Lender) -> Option<Answer> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use serde_json::json;
 
     use super::*;
-    use crate::serve::fleet::worker::Transport;
+    use crate::serve::fleet::transport::Transport;
     use crate::serve::machines::service::Timing;
 
     fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
@@ -394,15 +393,16 @@ mod tests {
         dir
     }
 
-    /// Every dial's argv, each refused: no ssh, no hub.
+    /// Every dial's target and args (`[target, args…]`), each refused: no
+    /// ssh, no hub.
     #[derive(Clone, Default)]
     struct Dials(Arc<Mutex<Vec<Vec<String>>>>);
 
     impl Dials {
         fn transport(&self) -> Transport {
             let dials = self.clone();
-            Arc::new(move |argv: &[OsString]| {
-                dials.0.lock().unwrap().push(argv.iter().map(|a| a.to_string_lossy().into_owned()).collect());
+            Transport::new(move |target, args| {
+                dials.0.lock().unwrap().push([target.to_string()].into_iter().chain(args.iter().cloned()).collect());
                 anyhow::bail!("no route")
             })
         }
@@ -484,27 +484,26 @@ mod tests {
         assert_eq!(on.fleet_root, Some(root.clone()), "created, canonical");
         assert_eq!(lend::load(&path).unwrap().unwrap().hub, "me@hub", "written");
         wait_for(|| dials.count() >= 1, "a dial");
-        let argv = dials.last().unwrap();
-        assert_eq!(argv[5], "me@hub");
-        assert!(argv[6].contains("'\\''--worker'\\'' '\\''lap'\\''"), "the hostname's label: {argv:?}");
-        assert!(argv[6].contains(&format!("'\\''--root'\\'' '\\''{}'\\''", root.display())), "the fleet root: {argv:?}");
+        let dial = dials.last().unwrap();
+        let root_arg = root.display().to_string();
+        assert_eq!(dial, ["me@hub", "fleet-link", "--worker", "lap", "--root", root_arg.as_str()], "the hostname's label, the fleet root");
         wait_for(|| l.get().unwrap().link == LinkState::Retrying, "retrying");
         assert_eq!(l.get().unwrap().error.as_deref(), Some("no route"));
 
         let drain = set(&l, json!({"state": "drain"})).unwrap();
         assert_eq!((drain.state, drain.link), (State::Drain, LinkState::Retrying), "the same thread");
-        wait_for(|| dials.last().unwrap()[6].contains("--drain"), "the next dial offers --drain");
+        wait_for(|| dials.last().unwrap().last().unwrap() == "--drain", "the next dial offers --drain");
 
         let rename = |name: &str| {
             member::call("member.set", json!({ "name": name }), l.member_path(), l.hostname(), || l.reapply()).unwrap().unwrap()
         };
         assert_eq!(rename("box")["name"], "box");
-        wait_for(|| dials.last().unwrap()[6].contains("'\\''box'\\''"), "a dial under the new name");
+        wait_for(|| dials.last().unwrap()[3] == "box", "a dial under the new name");
         assert_eq!(l.get().unwrap().name.as_deref(), Some("box"));
         set(&l, json!({"hub": "me@hub2"})).unwrap();
-        wait_for(|| dials.last().unwrap()[5] == "me@hub2", "a dial to the new hub");
-        let argv = dials.last().unwrap();
-        assert!(argv[6].contains("box") && argv[6].contains("--drain"), "{argv:?}");
+        wait_for(|| dials.last().unwrap()[0] == "me@hub2", "a dial to the new hub");
+        let dial = dials.last().unwrap();
+        assert!(dial[3] == "box" && dial.last().unwrap() == "--drain", "{dial:?}");
         assert_eq!(l.get().unwrap().fleet_root, Some(std::fs::canonicalize(dir.join("fleet/me@hub2")).unwrap()));
 
         let off = set(&l, json!({"state": "off"})).unwrap();

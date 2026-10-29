@@ -150,7 +150,7 @@ pub struct Options {
     pub lend: Option<PathBuf>,
     /// How the lending thread reaches its hub; `None` is ssh. Tests link an
     /// in-process hub.
-    pub lend_transport: Option<fleet::worker::Transport>,
+    pub lend_transport: Option<fleet::transport::Transport>,
     /// How the lending thread follows its hub's version; `None` is the
     /// release download and a forced handoff on this daemon's socket
     /// (`fleet::update::Release`). Tests fake it.
@@ -466,7 +466,7 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
         }
     };
     let env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
-    let transport = opts.lend_transport.clone().unwrap_or_else(fleet::worker::ssh_transport);
+    let transport = opts.lend_transport.clone().unwrap_or_else(fleet::transport::Transport::ssh);
     let update = opts
         .lend_update
         .clone()

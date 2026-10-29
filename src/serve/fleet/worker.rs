@@ -1,8 +1,9 @@
 //! The worker side of a fleet link (docs/architecture/daemon/fleet.md,
 //! *Worker side*): while `lend.toml` says `on` or `drain`, the daemon's
-//! `serve-lend` thread holds `ssh -T -o BatchMode=yes <hub> devsandbox
-//! fleet-link --worker <name> --root <fleet root>` ([`link_argv`]) and runs the answerer of
-//! `fleet::LINK` on its stdio. Each `API` stream the hub opens is answered
+//! `serve-lend` thread holds `devsandbox fleet-link --worker <name> --root
+//! <fleet root>` ([`link_args`]) on the hub, dialed through the
+//! [`Transport`] (`fleet::transport`: ssh), and runs the answerer of
+//! `fleet::LINK` on it. Each `API` stream the hub opens is answered
 //! by the daemon's `open` (a socket pair: the API relay's sentinel on the
 //! hub's end, the other end served as a `Peer` connection, `fleet::lent`).
 //! A link that ends is retried with the machine links' backoff
@@ -27,11 +28,10 @@
 //! why. Either way the next attempt is after the backoff, so a failed
 //! update is retried at the backoff's pace, never in a loop.
 //!
-//! The transport is injectable ([`Transport`]): production spawns ssh
-//! (`ssh::spawn`), tests hand back one end of a socket pair whose other end
-//! is the hub's `fleet-link` in-process.
+//! The transport is injectable ([`Transport`]): production is
+//! `Transport::ssh`, tests hand back one end of a socket pair whose other
+//! end is the hub's `fleet-link` in-process.
 
-use std::ffi::OsString;
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +43,7 @@ use anyhow::{Context, Result};
 
 use super::agent;
 use super::transfer::Receivers;
+use super::transport::{self, Transport};
 use super::update::{self, BINARY_KIND, BINARY_LIMIT, Build, Decision, Steps};
 use super::{LINK, link};
 use crate::devsbd::mux::Conn;
@@ -50,16 +51,7 @@ use crate::devsbd::proto::caps;
 use crate::serve::endpoint::Stream;
 use crate::serve::machines::check_name;
 use crate::serve::machines::service::{self, Timing};
-use crate::serve::machines::ssh::{self, Duplex};
-
-/// How the worker reaches its hub: the argv in, a connection out (ssh's
-/// stdio behind a socket, as `ssh::spawn` returns it).
-pub type Transport = Arc<dyn Fn(&[OsString]) -> Result<Duplex> + Send + Sync>;
-
-/// The production [`Transport`]: ssh.
-pub fn ssh_transport() -> Transport {
-    Arc::new(|argv: &[OsString]| ssh::spawn(argv))
-}
+use crate::serve::machines::ssh::Duplex;
 
 /// How the daemon answers one stream the hub opens (`API`, `PTY`): the
 /// hub's end of a new connection, `None` to refuse it.
@@ -85,20 +77,18 @@ pub struct Follow {
 /// start; then it ends, retried after the backoff.
 const PUSH_WAIT: Duration = Duration::from_secs(60);
 
-/// `ssh -T -o BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker
-/// <name> --root <root>>` through the hub's login shell, as every machine
-/// argv is (`ssh::remote_command`). `BatchMode`: the daemon has no TTY.
-/// `root` is the canonical fleet root: the offer registers it as the
-/// offered entry's one root, which the hub watches. `draining` adds
-/// `--drain`: the offer says this worker takes no new work.
-pub fn link_argv(hub: &str, name: &str, root: &Path, draining: bool) -> Result<Vec<OsString>> {
+/// The hub's devsandbox args for the link: `fleet-link --worker <name>
+/// --root <root>`. `root` is the canonical fleet root: the offer registers
+/// it as the offered entry's one root, which the hub watches. `draining`
+/// adds `--drain`: the offer says this worker takes no new work.
+pub fn link_args(name: &str, root: &Path, draining: bool) -> Result<Vec<String>> {
     check_name(name)?;
     let root = root.to_str().with_context(|| format!("fleet root {} is not UTF-8", root.display()))?;
     let mut args = vec!["fleet-link", "--worker", name, "--root", root];
     if draining {
         args.push("--drain");
     }
-    ssh::target_argv(hub, &["-T", "-o", "BatchMode=yes"], "devsandbox", &args)
+    Ok(args.into_iter().map(String::from).collect())
 }
 
 /// The link's state, for `lend.get`.
@@ -258,7 +248,8 @@ impl Lending {
         timing: Timing,
         log: fn(&str),
     ) -> Result<Lending> {
-        link_argv(&hub, &name, &root, draining)?;
+        transport::check_target(&hub)?;
+        link_args(&name, &root, draining)?;
         let incoming = Arc::new(Incoming::default());
         let receivers = Some(Arc::new(incoming.receiver(receivers)));
         let ctl = Arc::new(Ctl { receivers, follow: Some(follow), incoming, agent_dir, ..Ctl::default() });
@@ -331,15 +322,15 @@ impl Ctl {
 fn lend_loop(hub: &str, name: &str, root: &Path, transport: &Transport, opens: &Opens, timing: &Timing, ctl: &Ctl, log: fn(&str)) {
     let mut failures = 0;
     while !ctl.stopped() {
-        let argv = match link_argv(hub, name, root, ctl.draining.load(Ordering::SeqCst)) {
-            Ok(argv) => argv,
+        let args = match link_args(name, root, ctl.draining.load(Ordering::SeqCst)) {
+            Ok(args) => args,
             Err(e) => {
                 // Checked by `spawn`: unreachable short of a bug.
                 log(&format!("fleet: {e:#}"));
                 return;
             }
         };
-        match transport(&argv) {
+        match transport.dial(hub, &args) {
             Err(e) => {
                 log(&format!("fleet: cannot reach hub {hub}: {e:#}"));
                 ctl.set_status(Status::Retrying(format!("{e:#}")));
@@ -392,8 +383,7 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, opens: &Opens, ctl: &Ctl,
             &LINK,
             reader,
             writer,
-            &serves,
-            Some(&ctl.outlet),
+            link::Endpoint { serves, outlet: Some(&ctl.outlet), ..link::Endpoint::default() },
             |peer| {
                 let theirs = Build::parse(&peer.hash);
                 let dev_builds = ctl.follow.as_ref().is_some_and(|f| (f.dev_builds)());
@@ -537,7 +527,7 @@ mod tests {
     /// (`fleet_link::push_build`, when `update::hub_pushes`). Its `AGENT`
     /// streams are echoed, standing in for the hub's agent.
     fn hub_pushing(hello: &'static str, dir: PathBuf, binary: Binary) -> Transport {
-        Arc::new(move |_: &[OsString]| {
+        Transport::new(move |_, _| {
             let (worker, hub) = std::os::unix::net::UnixStream::pair()?;
             let (socket, xfer, pty) =
                 (dir.join("fleet-lap.sock"), dir.join("fleet-lap.transfer.sock"), dir.join("fleet-lap.pty.sock"));
@@ -558,7 +548,7 @@ mod tests {
                 let (r, w) = (hub.try_clone().unwrap(), hub);
                 let sockets = [(spec.channel, socket.as_path()), (channel::TRANSFER, xfer.as_path()), (channel::PTY, pty.as_path())];
                 let push_to = xfer.clone();
-                link::opener_with(&spec, r, w, &sockets, serves, |peer| {
+                link::opener_with(&spec, r, w, link::Endpoint { sockets: &sockets, serves, outlet: None }, |peer| {
                     crate::commands::fleet_link::push_build(hello, &peer.hash, push_to, move || binary());
                     Ok(())
                 })
@@ -827,26 +817,19 @@ mod tests {
     }
 
     #[test]
-    fn the_link_argv() {
+    fn the_link_args() {
         let root = Path::new("/d/fleet/me@hub");
-        let argv = link_argv("ssh://me@hub:2200", "lap", root, false).unwrap();
-        let want = [
-            "ssh",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-p",
-            "2200",
-            "--",
-            "me@hub",
-            r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--worker'\'' '\''lap'\'' '\''--root'\'' '\''/d/fleet/me@hub'\'''"#,
-        ];
-        assert_eq!(argv, want.map(OsString::from));
-        assert_eq!(link_argv("hub", "lap", root, false).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
-        let drain = link_argv("hub", "lap", root, true).unwrap();
-        assert!(drain[6].to_string_lossy().ends_with(r#"'\''--drain'\'''"#), "{drain:?}");
-        assert!(link_argv("-oProxyCommand=x", "lap", root, false).is_err());
-        assert!(link_argv("hub", "a/b", root, false).is_err());
+        assert_eq!(link_args("lap", root, false).unwrap(), ["fleet-link", "--worker", "lap", "--root", "/d/fleet/me@hub"]);
+        assert_eq!(link_args("lap", root, true).unwrap().last().unwrap(), "--drain");
+        assert!(link_args("a/b", root, false).is_err());
+    }
+
+    #[test]
+    fn a_hub_ssh_cant_dial_is_refused_at_spawn() {
+        let follow = Follow { steps: Arc::new(Fake::default()), dev_builds: Arc::new(|| false) };
+        let transport = Transport::new(|_, _| unreachable!());
+        let spawned = Lending::spawn("-oProxyCommand=x".into(), "lap".into(), "/fleet/hub".into(), false, transport, Vec::new(), Receivers::new(|_| {}), None, follow, Timing::default(), |_| {});
+        assert!(spawned.is_err());
     }
 
     mod e2e {
@@ -901,12 +884,10 @@ mod tests {
         /// offering `root` in-process, its socket and daemon in `hub` (which
         /// it asks for the agent, `fleet.agent`).
         fn in_process_hub(hub: PathBuf, root: PathBuf) -> Transport {
-            Arc::new(move |argv: &[OsString]| {
-                let words: Vec<_> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-                assert_eq!(&words[..5], ["ssh", "-T", "-o", "BatchMode=yes", "--"]);
-                assert_eq!(words[5], "me@hub");
-                assert!(words[6].contains("fleet-link") && words[6].contains("lap"), "{}", words[6]);
-                assert!(words[6].contains(&format!("'\\''--root'\\'' '\\''{}'\\''", root.display())), "{}", words[6]);
+            Transport::new(move |target, args| {
+                assert_eq!(target, "me@hub");
+                let root_arg = root.display().to_string();
+                assert_eq!(args[..5], ["fleet-link", "--worker", "lap", "--root", root_arg.as_str()]);
                 let (worker, hub_io) = UnixStream::pair()?;
                 let (hub, root) = (hub.clone(), root.clone());
                 std::thread::spawn(move || {
@@ -1350,7 +1331,7 @@ mod tests {
     fn a_failing_transport_is_retried_until_dropped() {
         let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&tries);
-        let transport: Transport = Arc::new(move |_: &[OsString]| {
+        let transport = Transport::new(move |_, _| {
             counted.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("no route")
         });

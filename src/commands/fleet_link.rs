@@ -112,7 +112,8 @@ pub fn run(
     });
     let push_to = socket.clone();
     let mut refreshing = None;
-    let end = link::opener_with(&fleet::LINK, reader, writer, &sockets, serves, |peer| {
+    let endpoint = link::Endpoint { sockets: &sockets, serves, outlet: None };
+    let end = link::opener_with(&fleet::LINK, reader, writer, endpoint, |peer| {
         let mut conn = daemon()?;
         offer(&mut conn, worker, &peer.hash, root, draining)?;
         held = Some(conn);
@@ -243,7 +244,7 @@ mod tests {
                 .with(channel::PTY, fake_pty)
                 .with(channel::TUNNEL, fake_tunnel)
                 .transfers(Arc::new(Receivers::new(|_| {})));
-            link::answerer_with(&fleet::LINK, r, w, &serves, None, |_| Ok(()), || {})
+            link::answerer_with(&fleet::LINK, r, w, link::Endpoint { serves, ..link::Endpoint::default() }, |_| Ok(()), || {})
         })
     }
 
