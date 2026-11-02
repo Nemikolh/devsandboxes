@@ -205,7 +205,8 @@ mod tests {
             let mut r = BufReader::new(theirs.try_clone().unwrap());
             let mut line = String::new();
             r.read_line(&mut line).unwrap();
-            (&theirs).write_all(reply.as_bytes()).unwrap();
+            // A handshake that failed on `before` may have closed its end.
+            let _ = (&theirs).write_all(reply.as_bytes());
             serde_json::from_str(&line).unwrap()
         });
         (Duplex::socket(ours), peer)
