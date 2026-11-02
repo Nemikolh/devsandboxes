@@ -140,11 +140,14 @@ roots' instances. Anything else is `denied`, naming `devsandbox machine
 trust full` (run on this member) as what opens it. Under `full` the
 caller has the API a local client has.
 
-`fleet.*` goes by who the caller is under either trust, never by the
-table (*`fleet.*`*): `fleet.leave` and `fleet.forget` only from the peer
-this host's `hub` names, `fleet.rm` and `fleet.place` only on the hub
-and from one of its machines; anything else, a local client included,
-is `denied`.
+`fleet.*` goes by the member key the caller's link proved, under either
+trust, never by the table (*`fleet.*`*): `fleet.leave` and `fleet.forget`
+only from the hub of this host's membership log (its name and its key
+there, never the name alone), `fleet.rm` and `fleet.place` only on the
+hub (the log's hub is this host) and from a member of the log (its name
+and key), `fleet.place` from a held introduction's too; anything else, a
+local client, a peer that proved no key and an introduced (capped)
+member's `fleet.rm` included, is `denied`.
 
 ### `link.attach`
 
@@ -155,12 +158,13 @@ connection is a remote caller's (*Remote callers*); there is no way back.
 
 | params | result | errors |
 |---|---|---|
-| `{"peer": name, "channel": "api" \| "pty" \| "tunnel" \| "transfer" \| "agent"}`: `peer` 1 to 255 bytes, a machine name (letters, digits, `.`, `_`, `-`, not starting with `.` or `-`), logged; `channel` required | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer`, a missing or bad `channel`; bytes past the attach line already sent, or a subscribed connection, for a channel other than `api`), `failed` (no data dir for the fleet root) |
+| `{"peer": name, "channel": "api" \| "pty" \| "tunnel" \| "transfer" \| "agent", "key": "ed25519:<hex>", "introduced_by"?: name}`: `peer` 1 to 255 bytes, a machine name (letters, digits, `.`, `_`, `-`, not starting with `.` or `-`), logged; `channel` required; `key` required, the member key the link proved for the peer; `introduced_by` its introducer when it's held as an introduction (capped), else absent or `null` | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer`, a missing or bad `channel` or `key`, a bad `introduced_by`; bytes past the attach line already sent, or a subscribed connection, for a channel other than `api`), `failed` (no data dir for the fleet root) |
 
-The caller is link peer `peer`: its fleet root is `fleet/<peer>/` in the
-data dir (created by the attach), and its verbs run with the daemon's own
-env, whatever they send, `SSH_AUTH_SOCK` the peer's relayed agent
-(`agent-link-<peer>.sock`) while that answers.
+The caller is link peer `peer`, which proved `key`: its fleet root is
+`fleet/<peer>/` in the data dir (created by the attach), its `fleet.*`
+calls are admitted by `key` (*Remote callers*), and its verbs run with
+the daemon's own env, whatever they send, `SSH_AUTH_SOCK` the peer's
+relayed agent (`agent-link-<peer>.sock`) while that answers.
 
 - `api`: the connection goes on as an API connection, the trust table's,
   its first byte after the answer the client's (no sentinel on a link
@@ -1067,7 +1071,8 @@ fleet-link --peer <this host>"'`, `<this host>` its member name
 (`member.toml`'s `name`, else the hostname's first label), in the
 user's login shell there. It is a fleet [peer link](../architecture/daemon/fleet.md#peer-links):
 `fleet-link` hands every stream to the machine's daemon with
-`link.attach {peer, channel}`, so the machine's trust applies to
+`link.attach {peer, channel, key, introduced_by}` (who the link proved),
+so the machine's trust applies to
 everything sent over it (*Remote callers*), and this host binds
 `fleet-<name>.sock` and its siblings, each connection one stream there.
 The link's `API` streams are what this daemon talks to the machine over
@@ -1131,7 +1136,7 @@ roots, and it is where that caller's placement moves code to.
 |---|---|---|---|
 | `machines.probe` | `{"target", "command"?}` (`command`: the machine's devsandbox as shell text, default `devsandbox`) | `{"version", "protocol", "roots": […], "key", "fingerprint"}`: the machine's devsandbox, its `roots.list`, and its member key and fingerprint (its `member.get`'s), for the user to confirm | `invalid` (bad target, empty `command`), `failed` (ssh, the hello or the protocol) |
 | `machines.add` | `{"target", "name"?, "roots": […], "hub", "key", "agent"?, "command"?}` (`roots` may be empty: a machine that only runs other members' configs; `hub` mandatory, `true` to make the machine the hub of the new fleet (`machine add --hub`); `key` mandatory, the machine's key as the user confirmed it (`probe`'s); `agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning", "fleet": {"hub", "joined"}}`: `name` the machine's member name (its `member.get`'s) unless `name` renamed it as it joined, `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours, `fleet` the fleet both ends are in after the add: `hub` its hub's member name, `joined` `target` (the machine joined this host's fleet), `this` (this host joined the machine's), `new` (a fleet of two, this host the hub, or the machine under `hub: true`) or `same` (both were in it: the membership logs exchanged, nothing else written but the entry). Both ends' membership logs are written (*`membership.*`*): a new fleet's signed here, a joining machine's `add` or introduction signed here, this host's signed on the machine (`membership.sign` there); each end's `hub` from the log it adopts | `invalid` (bad target or name, a name taken in the registry or the fleet, a `name` that isn't the member name of a machine already in a fleet, empty `command`, a root the machine refuses: each one's reason; no `key`; a name or key the fleet's log knows), `denied` (the machine's key isn't `key`, naming both fingerprints; the name is a live inbound neighbor's; the two ends are in different fleets, naming both hubs; `hub: true` with either end in a fleet whose hub the machine isn't; another fleet's log or a fork; the end letting a host in is capped or in no log; an extra link to an end the log doesn't list), `failed` (as `probe`, or a remote too old to check roots, or this host without a member name or `member.toml`; an end in a fleet with no membership log: make the fleet again), `internal` (`machines.toml`, `member.toml`, `member.key` or `membership.json` doesn't read or write); a write that fails after an earlier one says what was already written |
-| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, the registry's by name, then the inbound neighbors up now by name; `kind` `ssh` \| `inbound`, `target` `null` for an inbound one; `state`, `error` and `version` (from the last hello) its held link's, whatever its kind; an inbound one has `agent` off and `command` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
+| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity", "introduced_by"}]`, the registry's by name, then the inbound neighbors up now by name; `kind` `ssh` \| `inbound`, `target` `null` for an inbound one; `state`, `error` and `version` (from the last hello) its held link's, whatever its kind; an inbound one has `agent` off and `command` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it); `introduced_by` its introducer while this host's membership holds the machine's name as an introduction (capped: it introduces no one), else `null` | `internal` (`machines.toml` doesn't parse) |
 | `machines.get` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"name", "kind", "target", "command", "roots", "agent"}`, a registered machine's or an inbound one's: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an inbound one has none) | `not-found`, `denied` (a machine seen only through the hub, naming it), `invalid` (`agent` not absolute), `internal` (as `list`) |
 | `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `denied` (an inbound machine: this host's agent never reaches it; its own entry for this host has the `agent` that counts; a machine seen only through the hub), `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.unlink` | `{"name"}` | `{"ok": true}`; this host's entry goes, its link stops and its rows go. Nothing on the machine changes: it stays a fleet member | `not-found`, `denied` (an inbound machine: it goes with its link, `machine unlink <this host>` run on it), `internal` (`machines.toml` doesn't read or write) |
@@ -1162,15 +1167,16 @@ A removal from the fleet ([fleet](../architecture/daemon/fleet.md), *How
 a machine leaves*) and a member's `run` placed by the hub
 ([fleet](../architecture/daemon/fleet.md#a-members-run)), sent between
 members over their links. Admitted by
-who the caller is, not by trust (`lent::admit_fleet`, *Remote callers*);
-a local client is `denied` (it uses `machines.rm` / `machines.unlink`).
+the key the caller's link proved, against this host's membership log,
+not by trust (`lent::admit_fleet`, *Remote callers*); a local client is
+`denied` (it uses `machines.rm` / `machines.unlink`).
 
 | method | from | params | result | errors |
 |---|---|---|---|---|
-| `fleet.rm` | one of the hub's machines, to the hub | `{"name"}` | `{"name", "hub", "leave", "error", "forgot", "missed"}`: `leave` `told` (`name` answered `fleet.leave`), `leaving` (`name` asked: it leaves on its own), `unreachable` (`error` says why); `forgot` the other machines of the hub that answered `fleet.forget`, `missed` `[{"name", "error"}]` those it couldn't reach (not connected, or an error answer). `name` is unlinked on the hub | `denied` (not the hub, not one of its machines, `name` the hub), `not-found` (not one of the hub's machines), `internal` |
-| `fleet.place` | one of the hub's machines, to the hub | `{"spec": {"sandbox", "config_hash", "build_hash"}, "capacity", "reachable"}`: the member's spec, its capacity now (as `capacity.get` answers it), the machines it has a connected direct link to | `{"on", "machine", "lines"}`: `on` `requester` (the member), `hub` or `machine`, among the member, the hub and the hub's connected machines in `reachable`; `machine` the hub's name for it (its own member name for `hub`); `lines` what the run's output starts with (`placed on <machine> (<reasons>)`, `warning: <machine>: over cap: …`) | `denied` (not the hub, not one of its machines), `invalid`, `failed` (the hub has no member name), `internal` |
-| `fleet.leave` | this host's hub | `{}` | `{"ok": true}`: `hub` cleared, `membership.json` removed and every registry entry dropped; the links end once the answer is out | `denied` (not from this host's hub), `internal` |
-| `fleet.forget` | this host's hub | `{"name"}` | `{"ok": true}`: the registry entry for `name` dropped, if any, and `name`'s inbound link ended, if it has one (`links.cycle {"why"}` on its `fleet-link`) | `denied` (not from this host's hub), `invalid` (`name` is this host or the hub), `internal` |
+| `fleet.rm` | a member of the log (name and key), to the hub | `{"name"}` | `{"name", "hub", "leave", "error", "forgot", "missed"}`: `leave` `told` (`name` answered `fleet.leave`), `leaving` (`name` asked: it leaves on its own), `unreachable` (`error` says why); `forgot` the other machines of the hub that answered `fleet.forget`, `missed` `[{"name", "error"}]` those it couldn't reach (not connected, or an error answer). `name` is unlinked on the hub | `denied` (not the hub, not a member of the log by its key, an introduced member, `name` the hub), `not-found` (not one of the hub's machines), `internal` |
+| `fleet.place` | a member of the log or a held introduction (name and key), to the hub | `{"spec": {"sandbox", "config_hash", "build_hash"}, "capacity", "reachable"}`: the member's spec, its capacity now (as `capacity.get` answers it), the machines it has a connected direct link to | `{"on", "machine", "lines"}`: `on` `requester` (the member), `hub` or `machine`, among the member, the hub and the hub's connected machines in `reachable`; `machine` the hub's name for it (its own member name for `hub`); `lines` what the run's output starts with (`placed on <machine> (<reasons>)`, `warning: <machine>: over cap: …`) | `denied` (not the hub, neither a member nor introduced by its key), `invalid`, `failed` (the hub has no member name), `internal` |
+| `fleet.leave` | the log's hub (name and key) | `{}` | `{"ok": true}`: `hub` cleared, `membership.json` removed and every registry entry dropped; the links end once the answer is out | `denied` (not from the log's hub by its key), `internal` |
+| `fleet.forget` | the log's hub (name and key) | `{"name"}` | `{"ok": true}`: the registry entry for `name` dropped, if any, and `name`'s inbound link ended, if it has one (`links.cycle {"why"}` on its `fleet-link`) | `denied` (not from the log's hub by its key), `invalid` (`name` is this host or the hub), `internal` |
 
 Nothing is refused for a member that can't be reached: the answer says
 who was. A member removed while unreachable keeps its `hub` and its

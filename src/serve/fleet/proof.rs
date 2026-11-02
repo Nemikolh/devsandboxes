@@ -135,7 +135,6 @@ pub struct Proven {
     pub key: PublicKey,
     /// Who introduced it, when the log doesn't list it yet (capped,
     /// decision 46).
-    #[cfg_attr(not(test), allow(dead_code))] // trust by the proven key (10a.5)
     pub introduced_by: Option<String>,
     /// Our stored log and introductions with what the peer carried, when
     /// that changed them: for the daemon to adopt.

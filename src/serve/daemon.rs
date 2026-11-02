@@ -555,12 +555,20 @@ fn machine_dialer(
     };
     let open: fleet::dialer::Open = {
         let hooked = Arc::clone(hooked);
-        Arc::new(move |name: &str, channel: lent::Channel| {
+        Arc::new(move |proven: &fleet::proof::Proven, channel: lent::Channel| {
             let shared = hooked.get()?.upgrade()?;
+            let name = proven.name.as_str();
             let root = lent::peer_fleet_root(data.as_deref()?, name)
                 .map_err(|e| log(&format!("machine {name}: {e:#}")))
                 .ok()?;
-            let peer = Arc::new(lent::Peer { name: name.to_string(), fleet_root: Some(root), env: Some(shared.peer_env.clone()), agent: None });
+            let peer = Arc::new(lent::Peer {
+                name: name.to_string(),
+                fleet_root: Some(root),
+                env: Some(shared.peer_env.clone()),
+                agent: None,
+                key: Some(proven.key),
+                introduced_by: proven.introduced_by.clone(),
+            });
             shared.open_lent(channel, &peer)
         })
     };
@@ -1669,22 +1677,29 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
 /// How long a [`ConnState::after`] waits once its answer is written.
 const AFTER_ANSWER: Duration = Duration::from_millis(300);
 
-/// `fleet.*` (docs/reference/api.md, *fleet*): admitted by who the peer is
-/// (`lent::admit_fleet`: this host's hub, its machines), never from a
-/// local client, then run by `machines::leave::fleet_call` (`fleet.place`
-/// by [`fleet_place`]); what it ends of the links waits for the answer
-/// ([`ConnState::after`]).
+/// `fleet.*` (docs/reference/api.md, *fleet*): admitted by the key the peer
+/// proved (`lent::admit_fleet` against this host's membership log, read
+/// per call), never from a local client, then run by
+/// `machines::leave::fleet_call` (`fleet.place` by [`fleet_place`]); what
+/// it ends of the links waits for the answer ([`ConnState::after`]).
 fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
-    let from = match &conn.table {
-        Table::Peer(peer) => Some(peer.name.clone()),
+    let peer = match &conn.table {
+        Table::Peer(peer) => Some(Arc::clone(peer)),
         Table::Full => None,
     };
+    let from = peer.as_ref().map(|p| p.name.clone());
     let ctx = shared.machines.as_ref();
-    let is_machine = |name: &str| {
-        ctx.is_some_and(|m| m.inbound.contains(name) || machines::load(&m.registry).is_ok_and(|e| e.iter().any(|e| e.name == name)))
+    let own = shared.member.as_deref().and_then(|p| fleet::dialer::member_name(p, &shared.hostname).ok());
+    let stored = match shared.member.as_deref().map(fleet::membership_api::load) {
+        Some(Ok(stored)) => stored,
+        Some(Err(e)) => {
+            log(&format!("{}: {}: {}", conn.label(), req.method, e.message));
+            None
+        }
+        None => None,
     };
-    let hub = lock_hub(&shared.hub).clone();
-    if let Err(e) = lent::admit_fleet(&req.method, from.as_deref(), &hub, from.as_deref().is_some_and(is_machine)) {
+    let log_of = stored.as_ref().zip(own.as_deref()).map(|(stored, own)| lent::Log { stored, own });
+    if let Err(e) = lent::admit_fleet(&req.method, peer.as_deref(), log_of) {
         log(&format!("{}: refused {} from {}: {}", conn.label(), req.method, from.as_deref().unwrap_or("a local client"), e.message));
         return Response::err(req.id, e.code, e.message);
     }
@@ -1813,14 +1828,15 @@ fn inbound_roots(peer: &str, socket: &Path) -> Result<Vec<PathBuf>> {
     Ok(rows.into_iter().map(|c| c.root).collect())
 }
 
-/// `link.attach {peer, channel}`: a connection of this user (a
-/// `fleet-link --peer`'s, `commands::fleet_link::attach_stream`) says the
-/// rest of it is one `channel` stream of link peer `peer`'s
-/// (docs/reference/api.md, `link.attach`). One-way: nothing turns it back
-/// to `Full`, and a second attach is refused by the table itself.
+/// `link.attach {peer, channel, key, introduced_by?}`: a connection of this
+/// user (a `fleet-link --peer`'s, `commands::fleet_link::attach_stream`)
+/// says the rest of it is one `channel` stream of link peer `peer`'s, which
+/// proved `key` on the link (docs/reference/api.md, `link.attach`).
+/// One-way: nothing turns it back to `Full`, and a second attach is refused
+/// by the table itself.
 ///
 /// The peer is `{peer, fleet_root: <data>/fleet/<peer>/ (created), env:
-/// the daemon's, agent: its agent-link-<peer>.sock}`. `api` goes on served
+/// the daemon's, agent: its agent-link-<peer>.sock, key, introduced_by}`. `api` goes on served
 /// with the trust table (`Table::Peer`), its pushed snapshots filtered too;
 /// any other channel ends the line protocol once the answer is out, the
 /// stream handed to [`Shared::serve_channel`] (`ConnState::handoff`). The
@@ -1831,7 +1847,7 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
     if !matches!(conn.table, Table::Full) || !conn.own_user {
         return Response::err(id, "denied", "`link.attach` is for this user's own relay connections");
     }
-    let (name, channel) = match lent::attach_params(params) {
+    let lent::Attach { name, channel, key, introduced_by } = match lent::attach_params(params) {
         Ok(parsed) => parsed,
         Err(e) => return Response::err(id, e.code, e.message),
     };
@@ -1850,6 +1866,8 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
             fleet_root: Some(root),
             env: Some(shared.peer_env.clone()),
             agent: Some(endpoint::link_agent_socket(&shared.socket_dir, &name)),
+            key: Some(key),
+            introduced_by,
         },
         Err(e) => {
             log(&format!("{}: link.attach: {e:#}", conn.label()));
@@ -3383,7 +3401,7 @@ pub(crate) mod tests {
         let options = Options { state: Some(state), member: Some(data.join("member.toml")), ..opts(1, 1000) };
         let daemon = spawn_daemon(&dir, options);
 
-        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "lap.local", "channel": "api"}), b"");
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "lap.local", "channel": "api", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["trust"], "worker", "{answer}");
         let Hello::Ready(hello) = client::hello(&mut stream, &v(1), "machine-link").unwrap() else { panic!("no hello") };
         let mut conn = client::Conn::new(stream, hello).unwrap();
@@ -3393,7 +3411,7 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": own})), None, "an own root");
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), Some("denied".into()));
         assert_eq!(code(&mut conn, "machines.list", json!({})), Some("denied".into()));
-        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api"})), Some("denied".into()), "one-way");
+        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api", "key": attach_key()})), Some("denied".into()), "one-way");
 
         // `full` is read per request: the same connection opens up, but
         // `member.*` and `link.*` stay local.
@@ -3402,18 +3420,26 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), None);
         assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
         assert_eq!(code(&mut conn, "membership.get", json!({})), Some("denied".into()));
-        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api"})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api", "key": attach_key()})), Some("denied".into()));
         drop(conn);
 
         // A bad `peer`, or no `channel`, leaves the connection as it was.
         let mut plain = connect(&dir);
-        assert_eq!(code(&mut plain, "link.attach", json!({"peer": "", "channel": "api"})), Some("invalid".into()));
+        assert_eq!(code(&mut plain, "link.attach", json!({"peer": "", "channel": "api", "key": attach_key()})), Some("invalid".into()));
         assert_eq!(code(&mut plain, "link.attach", json!({"peer": "lap"})), Some("invalid".into()));
+        // No proven key: no link stream.
+        assert_eq!(code(&mut plain, "link.attach", json!({"peer": "lap", "channel": "api"})), Some("invalid".into()));
         assert_eq!(code(&mut plain, "member.get", json!({})), None, "still a local client");
         drop(plain);
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A member key, as `link.attach`'s `key` (the one the link proved).
+    fn attach_key() -> String {
+        use crate::serve::fleet::identity::{Signer, SigningKey};
+        SigningKey::from_seed([7; 32]).public_key().to_string()
     }
 
     /// A raw connection to `dir` (retrying while the daemon binds) whose
@@ -3466,7 +3492,7 @@ pub(crate) mod tests {
         let daemon = spawn_daemon(&dir, options);
         let fleet = data.join("fleet/hub");
 
-        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "api"}), b"");
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "api", "key": attach_key()}), b"");
         assert_eq!(answer, json!({"id": 0, "result": {"ok": true, "trust": "worker"}}));
         assert!(fleet.is_dir(), "the fleet root is created");
         let cfg = fleet.join("cfg");
@@ -3494,7 +3520,7 @@ pub(crate) mod tests {
             sha256,
             to: None,
         };
-        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "transfer"}), b"");
+        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "transfer", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["ok"], true, "{answer}");
         transfer::send(stream, &header, &tar[..]).unwrap();
         let landed = fleet.join("roots").join(fcode::short_hash(&tar)).join("cfg/devsandboxes.toml");
@@ -3506,17 +3532,17 @@ pub(crate) mod tests {
             drop(stream);
             answer["error"]["code"].as_str().map(str::to_string)
         };
-        assert_eq!(refused(json!({"peer": "a/b", "channel": "api"}), b""), Some("invalid".into()), "not a machine name");
-        assert_eq!(refused(json!({"peer": "hub", "channel": "rpc"}), b""), Some("invalid".into()));
+        assert_eq!(refused(json!({"peer": "a/b", "channel": "api", "key": attach_key()}), b""), Some("invalid".into()), "not a machine name");
+        assert_eq!(refused(json!({"peer": "hub", "channel": "rpc", "key": attach_key()}), b""), Some("invalid".into()));
         assert!(!data.join("fleet/a").exists());
         assert_eq!(
-            refused(json!({"peer": "hub", "channel": "tunnel"}), b"{\"root\":\"/\"}\n"),
+            refused(json!({"peer": "hub", "channel": "tunnel", "key": attach_key()}), b"{\"root\":\"/\"}\n"),
             Some("invalid".into()),
             "bytes past the attach line"
         );
         let mut subscribed = connect(&dir);
         assert!(subscribed.call("subscribe", json!({"topics": ["inbox"]})).unwrap().error.is_none());
-        let r = subscribed.call("link.attach", json!({"peer": "hub", "channel": "pty"})).unwrap();
+        let r = subscribed.call("link.attach", json!({"peer": "hub", "channel": "pty", "key": attach_key()})).unwrap();
         assert_eq!(r.error.map(|e| e.code), Some("invalid".into()), "a subscribed connection");
         assert_eq!(subscribed.call("member.get", json!({})).unwrap().error, None, "still a local client");
         drop(subscribed);
@@ -3541,7 +3567,7 @@ pub(crate) mod tests {
         let daemon = spawn_daemon(&dir, options);
         let other = other.to_str().unwrap();
 
-        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "pty"}), b"");
+        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "pty", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["trust"], "worker", "{answer}");
         let params = Obj::new().with("root", other).with("instance", "w").with("session", "1700000000-ab12");
         let header = Record::Call(Call { method: crate::serve::fleet::pty::METHOD.into(), params, meta: Obj::new() });
@@ -3552,7 +3578,7 @@ pub(crate) mod tests {
         }
         drop(stream);
 
-        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "tunnel"}), b"");
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "tunnel", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["ok"], true, "{answer}");
         stream.write_all(format!("{}\n", json!({"root": other, "instance": "w", "port": 80})).as_bytes()).unwrap();
         let mut reply = String::new();
@@ -3603,14 +3629,14 @@ pub(crate) mod tests {
 
         for registry_text in ["", "[machine.hub]\ntarget = \"hub\"\n", "[machine.other]\ntarget = \"o\"\nagent = true\n"] {
             std::fs::write(&registry, registry_text).unwrap();
-            let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent"}), b"");
+            let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent", "key": attach_key()}), b"");
             assert_eq!(answer["result"]["ok"], true, "{answer}");
             assert_eq!(status(&mut stream), NOT_SERVING, "{registry_text:?}");
             assert!(closed(&mut stream));
         }
 
         std::fs::write(&registry, "[machine.hub]\ntarget = \"hub\"\nagent = true\n").unwrap();
-        let (mut stream, _) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent"}), b"");
+        let (mut stream, _) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent", "key": attach_key()}), b"");
         assert_eq!(status(&mut stream), SERVING);
         stream.write_all(b"ping").unwrap();
         let mut back = [0u8; 4];

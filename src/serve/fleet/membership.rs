@@ -275,7 +275,6 @@ impl Membership {
     }
 
     /// The hub's key; `None` while genesis's hub isn't added yet.
-    #[cfg_attr(not(test), allow(dead_code))] // the hub-only calls by key (10a.5)
     pub fn hub_key(&self) -> Option<PublicKey> {
         self.key_of(&self.hub)
     }

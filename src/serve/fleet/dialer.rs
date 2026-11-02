@@ -13,8 +13,8 @@
 //! machine as they reach an inbound one. IN: each stream the machine
 //! opens (`API`, `PTY`, `TUNNEL`, `TRANSFER`, `AGENT`) goes to this daemon
 //! in-process ([`Open`]: `Shared::open_lent` with the entry's name as the
-//! peer, its fleet root `fleet/<entry>/`), under this host's trust table
-//! for it; `AGENT` is answered with this host's agent while the entry has
+//! peer, the key and introducer it proved, its fleet root
+//! `fleet/<entry>/`), under this host's trust table for it; `AGENT` is answered with this host's agent while the entry has
 //! `agent` on (`daemon::agent_for`).
 //!
 //! Right after the `Hello`s both ends prove their member keys
@@ -50,14 +50,14 @@
 use std::net::Shutdown;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use super::follow::{self, Incoming, PUSH_WAIT};
 use super::membership::Stored;
-use super::proof::{self, Identity};
+use super::proof::{self, Identity, Proven};
 use super::lent::Channel;
 use super::transfer::Receivers;
 use super::transport::Transport;
@@ -72,10 +72,12 @@ use crate::serve::machines::service::Held;
 use crate::serve::machines::ssh::{Dial, Duplex};
 use crate::serve::machines::{Entry, check_name};
 
-/// How the daemon answers one stream machine `<name>` opens on `Channel`:
-/// the machine's end of a new connection, `None` to refuse it. Runs on the
-/// link's read thread: it must return fast.
-pub type Open = Arc<dyn Fn(&str, Channel) -> Option<Conn> + Send + Sync>;
+/// How the daemon answers one stream a machine opens on `Channel`, the
+/// machine being who its link proved (`Proven`: its entry's name, its key,
+/// its introducer; `newer` always `None`): the machine's end of a new
+/// connection, `None` to refuse it. Runs on the link's read thread: it
+/// must return fast.
+pub type Open = Arc<dyn Fn(&Proven, Channel) -> Option<Conn> + Send + Sync>;
 
 /// The far end's devsandbox args: `fleet-link --peer <member>`, `member`
 /// being this host's member name (`fleet::member`), which the machine
@@ -189,9 +191,12 @@ impl Dialer {
         let receiving = AtomicBool::new(false);
         let incoming = Arc::new(Incoming::default());
         let binary = Arc::new(incoming.receiver(Receivers::new(self.log)));
+        // Who the machine proved it is, set once the `Hello`s and the proof
+        // are through (before any stream is served).
+        let proven: OnceLock<Proven> = OnceLock::new();
         let served = |ch: Channel| {
-            let receiving = &receiving;
-            move || if receiving.load(Ordering::Relaxed) { None } else { (self.open)(name, ch) }
+            let (receiving, proven) = (&receiving, &proven);
+            move || if receiving.load(Ordering::Relaxed) { None } else { (self.open)(proven.get()?, ch) }
         };
         let transfers = {
             let (attach, receiving, binary) = (served(Channel::Transfer), &receiving, &binary);
@@ -216,6 +221,10 @@ impl Dialer {
             endpoint,
             |peer| {
                 let _ = duplex.stream.set_read_timeout(None);
+                let Some(p) = &peer.proven else {
+                    return Err(format!("{name} proved no member key"));
+                };
+                let _ = proven.set(Proven { newer: None, ..p.clone() });
                 if let Some(newer) = peer.proven.as_ref().and_then(|p| p.newer.as_ref()) {
                     (self.adopt)(newer).map_err(|e| format!("cannot take {name}'s newer membership entries: {e}"))?;
                     (self.log)(&format!("machine {name}: took its newer membership log ({})", newer.log.head()));
@@ -1231,15 +1240,20 @@ pub(crate) mod tests {
     }
 
     /// A [`Pair`] in one fleet: K (`box`, with a registry entry `x` it never
-    /// reaches) and L (`lap`), `k_hub` / `l_hub` their `hub`s.
+    /// reaches) and L (`lap`), `k_hub` / `l_hub` their `hub`s, the log's hub
+    /// the one they name (`lap` when L says `self`, else `box`).
     fn fleet_pair(tag: &str, k_hub: &str, l_hub: &str) -> Pair {
         use crate::serve::fleet::member::{Member, write_for_test};
+        let hub = if l_hub == "self" { "lap" } else { "box" };
         let (k_hub, l_hub) = (k_hub.to_string(), l_hub.to_string());
-        Pair::with(
+        Pair::build(
             tag,
             vec![Entry::ssh("x", "me@x")],
             move |k| write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), hub: k_hub, ..Default::default() }),
             move |l| write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: l_hub, ..Default::default() }),
+            |k_member, l_member| {
+                test_support::fleet_of(hub, &[("lap", l_member), ("box", k_member)]);
+            },
         )
     }
 

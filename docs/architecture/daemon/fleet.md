@@ -124,8 +124,12 @@ The files are written before the answer; the links follow
 (`daemon::ConnState::after`, after `AFTER_ANSWER`). An inbound link ends
 as a hub change ends it: `links.cycle` on the neighbor's held
 `links.inbound` connection, here with `{why}` (`Shared::end_inbound`;
-`fleet-link` prints it). Who may send `fleet.*`:
-[the trust table](#the-trust-table).
+`fleet-link` prints it). Who may send `fleet.*` is decided by the key
+the sender's link proved, never by the name it announced: a member
+admits `fleet.leave` / `fleet.forget` only from the hub of its
+membership log by the hub's key there, and the hub admits `fleet.rm`
+only from a member of the log by its key, never from an introduced
+(capped) one ([the trust table](#the-trust-table)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `cap_of`, `Handler`, `Serves`, `Endpoint`, `Socket`,
@@ -370,7 +374,9 @@ dial is a process of its own).
 - **IN.** Each stream L opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
   answered by `attach_stream`: a socket pair whose far end a thread takes,
   connecting K's daemon socket and sending `link.attach {peer: L,
-  channel}` as the connection's first line, reading the answer byte by
+  channel, key, introduced_by}` (the key and introducer L proved on this
+  link, `attach_params`; a stream before the proof is refused) as the
+  connection's first line, reading the answer byte by
   byte (nothing past it), then splicing the stream to the connection
   (`link::splice`); an `API` stream is K's daemon from its first byte
   ([no sentinel inside a stream](#link)). Every
@@ -491,8 +497,9 @@ ends redial saying it.
   with it); each accepted connection a stream to K. Every client here
   reaches K through it ([over a link](#over-a-link)).
 - **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
-  `AGENT` goes to L's daemon in-process (`dialer::Open`: `Shared::open_lent`
-  with peer `{name: K, fleet_root: fleet/K/, env: the daemon's}`), the
+  `AGENT` goes to L's daemon in-process (`dialer::Open`, given the link's
+  `Proven`: `Shared::open_lent` with peer `{name: K, fleet_root:
+  fleet/K/, env: the daemon's, key and introduced_by: what K proved}`), the
   `serve_channel` a `link.attach` connection gets (decision 24); `AGENT`
   is answered with L's agent while L's entry for K has `agent` on
   (`daemon::agent_for`, read per stream: decision 18). While the hub's
@@ -963,7 +970,8 @@ over its own links (`daemon.rs` `placed_run`, `placed::by_hub`):
   (`placed::reachable_workers`), the hub among them. Machines seen only
   through the hub (`via`) are never among them.
 - **The hub's answer** (`daemon.rs` `fleet_place`, admitted by
-  `lent::admit_fleet` only on the hub and from one of its machines):
+  `lent::admit_fleet` only on the hub and from a member of its log or a
+  held introduction, by the key the requester proved):
   `placed::for_member` scores with `place::place` over the requester
   (the capacity it sent, its image as the hub's view of its rows shows,
   `REQUESTER`'s bias as the spec's requester), the hub itself
@@ -1389,10 +1397,12 @@ Every connection has a table (`daemon::Table`): `Full` for local clients,
 `Peer(Peer)` for a link peer's `API` stream: a `link.attach {channel:
 "api"}` connection on the dialed end, an `API` stream `Shared::open_lent`
 hands the daemon on the dialer. A `Peer` (`fleet::lent::Peer`) is who it
-is (the peer's machine name, for the log), its fleet root (canonical)
-and the env its verbs get (this host's own, the daemon's
+is (the peer's machine name, for the log), its fleet root (canonical),
+the env its verbs get (this host's own, the daemon's
 `Shared::peer_env`; a `Peer` without one, only in tests, keeps a verb's
-as sent). The
+as sent), the member key its link proved (`Peer::key`, from
+`proof::Proven`; `None` only in tests) and its introducer while it's held
+as an introduction (`Peer::introduced_by`: capped). The
 `PTY` and `TUNNEL` streams have no table: `fleet::pty::serve` and
 `fleet::tunnel::serve` read the same `Reach` for their `Peer` and gate
 the root and instance against it ([PTY](#pty), [TUNNEL](#tunnel)). For each request on a `Peer` connection the daemon reads
@@ -1424,15 +1434,22 @@ any dispatch. Under either trust `member.*`, `link.*` and `links.*` are
 `denied`: this member's own settings and links are its local clients'
 only.
 
-`fleet.*` (a removal from the fleet: *How a machine leaves*, at the top) goes
-by who the caller is, not by trust: `daemon::fleet_call` takes it before
-the table, through `lent::admit_fleet` (pure, over the method, the
-peer's name, this host's `hub` and whether the peer is one of its
-machines). `fleet.leave` and `fleet.forget` are admitted only from the
-peer this host's `hub` names; `fleet.rm` only on the hub, from one of its
-machines (registry or inbound). A local client is `denied` all three (it
-uses `machines.rm` / `machines.unlink`), as is any other caller; `admit`
-itself refuses `fleet.*` should one reach it.
+`fleet.*` (a removal from the fleet: *How a machine leaves*, at the top;
+a member's placed run) goes by the key the caller proved, not by trust:
+`daemon::fleet_call` takes it before the table, through
+`lent::admit_fleet` (pure, over the method, the `Peer` and `lent::Log`:
+this host's stored log and held introductions, `membership.json` read
+per call, and its own member name). `fleet.leave` and `fleet.forget` are
+admitted only from the log's hub, its name and its key there both (the
+hub's name over another key, or the hub's key under another name, is
+`denied`); `fleet.rm` and `fleet.place` only on the hub (the log's hub is
+this host's name), from a member of the log by its name and key;
+`fleet.place` also from a held introduction's name and key, but an
+introduced member's `fleet.rm` is `denied` (capped: it changes no one's
+membership, decision 51). A local client, a peer that proved no key and
+a host in no log are `denied` all of them (a local client uses
+`machines.rm` / `machines.unlink`); `admit` itself refuses `fleet.*`
+should one reach it.
 
 Under **`full`** that's all: the request runs as a local client's would,
 any root, any instance, no filter on its answer or its pushes, except
@@ -1501,7 +1518,7 @@ version it says and even with `force`, under either trust: only a local
 client's newer binary (or this user's forced hello, [Versions](#versions))
 replaces it.
 
-**`link.attach {peer, channel}`** turns a `Full` connection into one
+**`link.attach {peer, channel, key, introduced_by}`** turns a `Full` connection into one
 stream of a link peer's: a `fleet-link --peer` sends it first on each
 stream it hands its daemon ([peer links](#peer-links)). The daemon
 (`daemon::link_attach`) takes it only from a `Full` connection of its own
@@ -1509,9 +1526,11 @@ user (`endpoint::peer_is_own_user`); `lent::attach_params` wants `peer`
 (at most 255 bytes, no control characters, and a machine name,
 `machines::check_name`, since it names a directory) and `channel`, one
 of `api`, `pty`, `tunnel`, `transfer`, `agent` (`lent::Channel`;
-required). The peer is `Peer { name: peer, fleet_root:
+required), `key`, the member key the link proved (required: no fallback)
+and `introduced_by`, its introducer when held as an introduction
+(`lent::Attach`). The peer is `Peer { name: peer, fleet_root:
 Some(<data>/fleet/<peer>/), env: Some(<the daemon's env>), agent:
-Some(agent-link-<peer>.sock) }`. It is one-way: a second `link.attach`
+Some(agent-link-<peer>.sock), key: Some(key), introduced_by }`. It is one-way: a second `link.attach`
 is `link.*`, which the table refuses. It logs `connection N: <channel>
 stream from <peer>, trust <t>` and answers `{ok, trust}`. `api` switches
 the connection in place to `Table::Peer`, its pushed snapshots filtered

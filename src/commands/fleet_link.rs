@@ -7,7 +7,8 @@
 //! another hub is refused (`update::same_fleet`). IN:
 //! each stream the dialer opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
 //! handed to this host's daemon as a connection whose first line is
-//! `link.attach {peer: <dialer>, channel}` ([`attach_stream`]), so this
+//! `link.attach {peer: <dialer>, channel, key, introduced_by}`
+//! ([`attach_stream`]: the key and introducer the dialer proved), so this
 //! host's trust table for the dialer applies to every one. `AGENT` isn't
 //! served: it only opens member → dialer. Right after the `Hello`s both
 //! ends prove their member keys (`fleet::proof`; this host's identity read
@@ -32,7 +33,7 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -173,9 +174,12 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
     let receiving = Arc::new(AtomicBool::new(false));
     let incoming = Arc::new(Incoming::default());
     let binary = Arc::new(incoming.receiver(Receivers::new(|m| eprintln!("{m}"))));
+    // Who the dialer proved it is, set once the `Hello`s and the proof are
+    // through (before any stream is served).
+    let proven: Arc<OnceLock<fleet::proof::Proven>> = Arc::default();
     let attached = |ch: Channel| {
-        let (dir, peer, receiving) = (dir.clone(), peer.to_string(), Arc::clone(&receiving));
-        move || if receiving.load(Ordering::Relaxed) { None } else { attach_stream(&dir, ch, &peer) }
+        let (dir, proven, receiving) = (dir.clone(), Arc::clone(&proven), Arc::clone(&receiving));
+        move || if receiving.load(Ordering::Relaxed) { None } else { attach_stream(&dir, ch, proven.get()?) }
     };
     let transfers = {
         let (attach, receiving) = (attached(Channel::Transfer), Arc::clone(&receiving));
@@ -196,6 +200,10 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
     let auth = fleet::proof::Auth { identity, expect: peer.to_string(), log: |m| eprintln!("fleet-link: {m}") };
     let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: Some(&outlet), auth: Some(auth) };
     let end = link::opener_with(&spec, reader, writer, endpoint, |theirs| {
+        let Some(p) = &theirs.proven else {
+            bail!("{peer} proved no member key");
+        };
+        let _ = proven.set(fleet::proof::Proven { newer: None, ..p.clone() });
         if let Some(newer) = theirs.proven.as_ref().and_then(|p| p.newer.as_ref()) {
             adopt(&mut (opts.daemon)()?, newer).with_context(|| format!("cannot take {peer}'s newer membership entries"))?;
             eprintln!("fleet-link: took {peer}'s newer membership log ({})", newer.log.head());
@@ -397,19 +405,21 @@ fn sleep_unless(stop: &AtomicBool, d: Duration) -> bool {
     !stop.load(Ordering::Relaxed)
 }
 
-/// One stream peer `peer` opens on `channel`, handed to this host's daemon
-/// in `dir`: a socket pair whose far end a thread of its own takes (this
-/// runs on the link's read thread). The thread connects the daemon, sends
-/// `link.attach {peer, channel}` as the connection's first line, reads the
+/// One stream peer `peer` (who its link proved: name, key, introducer)
+/// opens on `channel`, handed to this host's daemon in `dir`: a socket pair
+/// whose far end a thread of its own takes (this runs on the link's read
+/// thread). The thread connects the daemon, sends `link.attach {peer,
+/// channel, key, introduced_by}` as the connection's first line, reads the
 /// answer (nothing past it), and splices the stream to the connection (an
 /// `API` stream's first byte is the daemon's, fleet plan decision 27). A
 /// refused attach closes the stream, with why on stderr. `None` when no
 /// pair or thread could be made.
-pub fn attach_stream(dir: &Path, channel: Channel, peer: &str) -> Option<mux::Conn> {
+pub fn attach_stream(dir: &Path, channel: Channel, peer: &fleet::proof::Proven) -> Option<mux::Conn> {
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().ok()?;
-    let (dir, peer) = (dir.to_path_buf(), peer.to_string());
+    let params = attach_params(peer, channel);
+    let dir = dir.to_path_buf();
     let spawned = std::thread::Builder::new().name("fleet-link-attach".into()).spawn(move || {
-        let daemon = match attach(&dir, channel, &peer) {
+        let daemon = match attach(&dir, params) {
             Ok(daemon) => daemon,
             Err(e) => return eprintln!("fleet-link: cannot hand a {} stream to this host's devsandbox: {e:#}", channel.as_str()),
         };
@@ -419,12 +429,18 @@ pub fn attach_stream(dir: &Path, channel: Channel, peer: &str) -> Option<mux::Co
     Some(theirs.into())
 }
 
-/// A connection to the daemon in `dir` past `link.attach {peer, channel}`'s
-/// `ok`, its answer read byte by byte so nothing past it is taken.
-fn attach(dir: &Path, channel: Channel, peer: &str) -> Result<endpoint::Stream> {
+/// `link.attach`'s params for a `channel` stream of `peer` (pure).
+pub fn attach_params(peer: &fleet::proof::Proven, channel: Channel) -> Value {
+    json!({ "peer": peer.name, "channel": channel.as_str(), "key": peer.key, "introduced_by": peer.introduced_by })
+}
+
+/// A connection to the daemon in `dir` past `link.attach`'s `ok` (with
+/// `params`, [`attach_params`]), its answer read byte by byte so nothing
+/// past it is taken.
+fn attach(dir: &Path, params: Value) -> Result<endpoint::Stream> {
     let mut stream = endpoint::connect(dir).context("cannot connect")?;
     stream.set_read_timeout(Some(ATTACH_TIMEOUT)).context("cannot set a read timeout")?;
-    let line = json!({ "id": 0, "method": "link.attach", "params": { "peer": peer, "channel": channel.as_str() } });
+    let line = json!({ "id": 0, "method": "link.attach", "params": params });
     stream.write_all(format!("{line}\n").as_bytes()).context("cannot send link.attach")?;
     let mut answer = Vec::new();
     let mut byte = [0u8; 1];
@@ -555,13 +571,19 @@ mod tests {
     fn fake_dialer(io: UnixStream, hello: &'static str, identity: Identity, daemon: PathBuf, outlet: Arc<link::Outlet>) -> std::thread::JoinHandle<link::End> {
         let (r, w) = (io.try_clone().unwrap(), io);
         std::thread::spawn(move || {
+            let proven: Arc<OnceLock<fleet::proof::Proven>> = Arc::default();
+            let k = Arc::clone(&proven);
             let serves = link::Serves::default()
-                .with(channel::API, move || attach_stream(&daemon, Channel::Api, "K"))
+                .with(channel::API, move || attach_stream(&daemon, Channel::Api, k.get()?))
                 .with(channel::PTY, tagged(b"dialer pty"));
             let spec = link::Spec { hello, ..fleet::LINK };
             let auth = Auth { identity, expect: "K".into(), log: |_| {} };
             let endpoint = link::Endpoint { serves, outlet: Some(&outlet), auth: Some(auth), ..link::Endpoint::default() };
-            link::answerer_with(&spec, r, w, endpoint, |_| Ok(()), || {})
+            let ready = |peer: &link::Ready| {
+                let _ = proven.set(peer.proven.clone().ok_or_else(|| "K proved no key".to_string())?);
+                Ok(())
+            };
+            link::answerer_with(&spec, r, w, endpoint, ready, || {})
         })
     }
 
@@ -592,6 +614,20 @@ mod tests {
             member,
         };
         std::thread::spawn(move || run_peer(r, w, "L", opts))
+    }
+
+    /// What the dialer proved goes into `link.attach` as the daemon parses
+    /// it: name, channel, key, introducer.
+    #[test]
+    fn an_attach_carries_the_proven_key_and_introducer() {
+        use crate::serve::fleet::identity::{Signer, SigningKey};
+        use crate::serve::fleet::lent;
+        let key = SigningKey::from_seed([3; 32]).public_key();
+        let proven = fleet::proof::Proven { name: "pi".into(), key, introduced_by: Some("lap".into()), newer: None };
+        let got = lent::attach_params(&attach_params(&proven, Channel::Pty)).unwrap();
+        assert_eq!(got, lent::Attach { name: "pi".into(), channel: Channel::Pty, key, introduced_by: Some("lap".into()) });
+        let member = fleet::proof::Proven { introduced_by: None, ..proven };
+        assert_eq!(lent::attach_params(&attach_params(&member, Channel::Api)).unwrap().introduced_by, None);
     }
 
     fn machine_rows(dir: &Path) -> Vec<Value> {

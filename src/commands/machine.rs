@@ -561,8 +561,13 @@ pub(crate) fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: V
 }
 
 /// `ls`'s cells: the first root and how many more; an inbound neighbor's
-/// TARGET is `inbound` (it has none).
+/// TARGET is `inbound` (it has none); a member held as an introduction
+/// (capped, fleet plan decision 51) named with its introducer.
 fn cells(r: MachineRow) -> [String; 7] {
+    let name = match &r.introduced_by {
+        Some(by) => format!("{} (introduced by {by})", r.name),
+        None => r.name.clone(),
+    };
     let roots = match r.roots.split_first() {
         None => "-".to_string(),
         Some((first, [])) => first.display().to_string(),
@@ -575,7 +580,7 @@ fn cells(r: MachineRow) -> [String; 7] {
         room = format!("{room} ({note})");
     }
     [
-        r.name,
+        name,
         target,
         roots,
         on_off(r.agent).into(),
@@ -989,6 +994,7 @@ mod tests {
             error: None,
             version: version.map(String::from),
             capacity: None,
+            introduced_by: None,
         };
         assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "off", "idle", "-", "-"].map(String::from));
         assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..6], ["/a +2", "off", "idle", "0.7.0"].map(String::from));
@@ -1009,5 +1015,8 @@ mod tests {
         assert_eq!(cells(row(&[], None))[2], "-");
         let inbound = MachineRow { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..row(&[], None) };
         assert_eq!(cells(inbound)[1], "inbound");
+        // A capped member: named with its introducer.
+        let capped = MachineRow { introduced_by: Some("lap".into()), ..row(&[], None) };
+        assert_eq!(cells(capped)[0], "m (introduced by lap)");
     }
 }

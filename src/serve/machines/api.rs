@@ -146,6 +146,17 @@ pub struct MachineRow {
     /// (`snapshots::Machine::capacity`).
     #[serde(default)]
     pub capacity: Option<Capacity>,
+    /// Who introduced it, while this host's membership holds it as an
+    /// introduction, not in the log (capped: it introduces no one, fleet
+    /// plan decision 51).
+    #[serde(default)]
+    pub introduced_by: Option<String>,
+}
+
+/// Who introduced member `name`, when `stored` holds it as an introduction
+/// (pure).
+pub fn introducer_of(stored: Option<&Stored>, name: &str) -> Option<String> {
+    stored?.introductions.iter().find(|i| i.name == name).map(|i| i.introducer.clone())
 }
 
 #[derive(Deserialize)]
@@ -341,13 +352,17 @@ fn after(mut e: ApiError, written: &[String]) -> ApiError {
 
 /// The registry's machines, then the inbound neighbors up now, each with
 /// its held link's state.
+/// Each row's `introduced_by` from this host's `membership.json` (one that
+/// doesn't load: none).
 fn list(ctx: &Ctx) -> Answer {
+    let stored = ctx.member.as_deref().and_then(|m| membership_api::load(m).ok().flatten());
     let rows: Vec<MachineRow> = machines(ctx)?
         .into_iter()
         .map(|e| {
             let live = ctx.links.as_ref().and_then(|l| l.remotes().get(&e.name)).unwrap_or_default();
             let (kind, target) = e.kind.wire();
             MachineRow {
+                introduced_by: introducer_of(stored.as_ref(), &e.name),
                 name: e.name,
                 kind,
                 target,
@@ -866,7 +881,7 @@ mod tests {
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null},
+                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box"}));
@@ -1224,6 +1239,7 @@ mod tests {
             error: None,
             version: None,
             capacity: Some(Capacity::default()),
+            introduced_by: Some("lap".into()),
         };
         let row = to_value(row).unwrap();
         assert_matches("MachineRow", &row);

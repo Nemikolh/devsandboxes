@@ -961,6 +961,8 @@ export interface MachineRow {
   version: string | null;
   /** Its host's capacity, from its last snapshot; `null` before one carried it. */
   capacity: Capacity | null;
+  /** Who introduced it, while this host's membership holds it as an introduction (capped: it introduces no one); `null` for a member of the log. */
+  introduced_by: string | null;
 }
 
 /** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). */

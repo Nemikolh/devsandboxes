@@ -35,8 +35,9 @@
 //! has one.
 //!
 //! `fleet.*` (a removal from the fleet, `machines::leave`; a member's run
-//! placed by the hub, `fleet.place`) goes by who the
-//! peer is, not by trust: [`admit_fleet`], before any of the above.
+//! placed by the hub, `fleet.place`) goes by who the peer proved it is
+//! (its key, [`Peer::key`], against this host's membership log), not by
+//! trust: [`admit_fleet`], before any of the above.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -44,7 +45,9 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::serve::api::ApiError;
+use crate::serve::fleet::identity::PublicKey;
 use crate::serve::fleet::member::{self, Member};
+use crate::serve::fleet::membership::Stored;
 use crate::serve::machines::forward as fwd;
 use crate::serve::verbs;
 use crate::state::State;
@@ -69,6 +72,12 @@ pub struct Peer {
     /// worktree's clone) uses the agent the linking host serves. `None`:
     /// `env` as it is.
     pub agent: Option<PathBuf>,
+    /// The member key the link proved for it (`fleet::proof`); `None` only
+    /// in tests: [`admit_fleet`] admits nothing from a peer without one.
+    pub key: Option<PublicKey>,
+    /// Who introduced it, while this host's log doesn't list it (capped,
+    /// fleet plan decisions 46 and 51).
+    pub introduced_by: Option<String>,
 }
 
 /// The longest `link.attach` `peer` taken: a hostname fits well within it.
@@ -129,10 +138,23 @@ impl Channel {
     }
 }
 
-/// `link.attach`'s params (pure): [`attach_peer`]'s `peer` and the
-/// required `channel`. The peer's name also names its fleet root
-/// ([`peer_fleet_root`]): it must pass `machines::check_name`.
-pub fn attach_params(params: &Value) -> Result<(String, Channel), ApiError> {
+/// `link.attach`'s params, parsed ([`attach_params`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attach {
+    pub name: String,
+    pub channel: Channel,
+    /// The key the link proved for the peer.
+    pub key: PublicKey,
+    /// Its introducer, when it's held as an introduction.
+    pub introduced_by: Option<String>,
+}
+
+/// `link.attach`'s params (pure): [`attach_peer`]'s `peer`, the required
+/// `channel` and `key` (the peer's proven member key: no link stream
+/// without one), and `introduced_by` (none, or a name). The peer's name
+/// also names its fleet root ([`peer_fleet_root`]): it must pass
+/// `machines::check_name`.
+pub fn attach_params(params: &Value) -> Result<Attach, ApiError> {
     let name = attach_peer(params)?;
     let channel = match params.get("channel") {
         None | Some(Value::Null) => return Err(ApiError::invalid("`link.attach` needs `channel`")),
@@ -141,7 +163,22 @@ pub fn attach_params(params: &Value) -> Result<(String, Channel), ApiError> {
         Some(_) => return Err(ApiError::invalid("`channel` must be a string")),
     };
     crate::serve::machines::check_name(&name).map_err(|e| ApiError::invalid(format!("`peer`: {e:#}")))?;
-    Ok((name, channel))
+    let key = match params.get("key") {
+        None | Some(Value::Null) => {
+            return Err(ApiError::invalid("`link.attach` needs `key`, the member key the link proved for the peer"));
+        }
+        Some(Value::String(s)) => s.parse::<PublicKey>().map_err(|e| ApiError::invalid(format!("`key`: {e:#}")))?,
+        Some(_) => return Err(ApiError::invalid("`key` must be a string")),
+    };
+    let introduced_by = match params.get("introduced_by") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            member::check_member_name(s).map_err(|e| ApiError::invalid(format!("`introduced_by`: {e:#}")))?;
+            Some(s.clone())
+        }
+        Some(_) => return Err(ApiError::invalid("`introduced_by` must be a string")),
+    };
+    Ok(Attach { name, channel, key, introduced_by })
 }
 
 /// A fleet member `peer`'s fleet root under data dir `data`:
@@ -380,29 +417,55 @@ impl Lent {
     }
 }
 
-/// Whether `fleet.*` `method` is admitted (pure), under either trust: `from`
-/// the link peer's name (`None`: a local client, which uses `machines.*`),
-/// `hub` this host's, `is_machine` whether `from` is one of this host's
-/// machines (registry or inbound). `fleet.leave` / `fleet.forget` come only
-/// from this host's hub; `fleet.rm` and `fleet.place` only to the hub,
-/// from one of its machines (decisions 32 and 31 of the fleet plan).
-pub fn admit_fleet(method: &str, from: Option<&str>, hub: &member::Hub, is_machine: bool) -> Result<(), ApiError> {
-    let Some(from) = from else {
+/// This host's membership, as [`admit_fleet`] reads it: its stored log and
+/// held introductions, and its own member name.
+#[derive(Debug, Clone, Copy)]
+pub struct Log<'a> {
+    pub stored: &'a Stored,
+    pub own: &'a str,
+}
+
+/// Whether `fleet.*` `method` is admitted (pure), under either trust, by
+/// the key `from` proved (`None`: a local client, which uses `machines.*`)
+/// against `log` (`None`: this host is in no fleet's log). `fleet.leave` /
+/// `fleet.forget` come only from the log's hub: its name and its key in
+/// the log, never the name alone. `fleet.rm` and `fleet.place` run only on
+/// the hub (the log's hub is this host): `fleet.rm` from a member of the
+/// log (name and key), `fleet.place` from one too or from a held
+/// introduction's (a capped member runs work as the others do, but changes
+/// no one's membership, decision 51). Decisions 31 and 32 of the fleet plan.
+pub fn admit_fleet(method: &str, from: Option<&Peer>, log: Option<Log>) -> Result<(), ApiError> {
+    let Some(peer) = from else {
         return Err(ApiError::denied(format!(
             "`{method}` comes over a fleet link: here `devsandbox machine rm|unlink` (`machines.*`)"
         )));
     };
+    if !matches!(method, "fleet.leave" | "fleet.forget" | "fleet.rm" | "fleet.place") {
+        return Err(ApiError::unknown_method(method));
+    }
+    let from = peer.name.as_str();
+    let Some(key) = peer.key else {
+        return Err(ApiError::denied(format!("`{method}` from `{from}`, which proved no member key")));
+    };
+    let Some((log, m)) = log.and_then(|l| Some((l, l.stored.log.membership()?))) else {
+        return Err(ApiError::denied(format!("`{method}`: this host is in no fleet's membership log")));
+    };
+    let member = m.key_of(from) == Some(key);
     match method {
-        "fleet.leave" | "fleet.forget" => match hub {
-            member::Hub::Other(h) if h == from => Ok(()),
-            _ => Err(ApiError::denied(format!("`{method}` is taken from this host's hub only, and `{from}` isn't it"))),
-        },
-        "fleet.rm" | "fleet.place" if !hub.is_this() => Err(ApiError::denied(format!("`{method}` runs on the hub, and this host isn't it"))),
-        "fleet.rm" | "fleet.place" if !is_machine => {
-            Err(ApiError::denied(format!("`{method}` is taken from the hub's machines, and `{from}` isn't one")))
+        "fleet.leave" | "fleet.forget" => {
+            if m.hub == from && m.hub_key() == Some(key) {
+                Ok(())
+            } else {
+                Err(ApiError::denied(format!("`{method}` is taken from this host's hub only (by its key in the log), and `{from}` isn't it")))
+            }
         }
-        "fleet.rm" | "fleet.place" => Ok(()),
-        m => Err(ApiError::unknown_method(m)),
+        _ if m.hub != log.own => Err(ApiError::denied(format!("`{method}` runs on the hub, and this host isn't it"))),
+        _ if member => Ok(()),
+        "fleet.place" if log.stored.introductions.iter().any(|i| i.name == from && i.key == key) => Ok(()),
+        "fleet.rm" if peer.introduced_by.is_some() || log.stored.introductions.iter().any(|i| i.name == from) => Err(ApiError::denied(format!(
+            "`{method}` from `{from}`: an introduced member (capped) changes no one's membership"
+        ))),
+        _ => Err(ApiError::denied(format!("`{method}` is taken from the fleet's members (by their keys in the log), and `{from}` isn't one"))),
     }
 }
 
@@ -776,21 +839,32 @@ mod tests {
     }
 
     #[test]
-    fn an_attach_names_a_channel_and_a_machine_name() {
+    fn an_attach_names_a_channel_a_machine_name_and_its_key() {
+        let key = pk(1);
         for c in ["api", "pty", "tunnel", "transfer", "agent"] {
-            let (name, channel) = attach_params(&json!({"peer": "lap.local", "channel": c})).unwrap();
-            assert_eq!((name.as_str(), channel.as_str()), ("lap.local", c));
+            let a = attach_params(&json!({"peer": "lap.local", "channel": c, "key": key.to_string()})).unwrap();
+            assert_eq!(a, Attach { name: "lap.local".into(), channel: Channel::parse(c).unwrap(), key, introduced_by: None });
         }
+        let a = attach_params(&json!({"peer": "pi", "channel": "api", "key": key.to_string(), "introduced_by": "lap"})).unwrap();
+        assert_eq!(a.introduced_by.as_deref(), Some("lap"));
+        let k = key.to_string();
         for bad in [
-            json!({"peer": "lap"}),
-            json!({"peer": "lap", "channel": null}),
-            json!({"peer": "lap", "channel": "rpc"}),
-            json!({"peer": "lap", "channel": 1}),
+            json!({"peer": "lap", "key": k}),
+            json!({"peer": "lap", "channel": null, "key": k}),
+            json!({"peer": "lap", "channel": "rpc", "key": k}),
+            json!({"peer": "lap", "channel": 1, "key": k}),
             // The name names a directory: one plain component.
-            json!({"peer": "lap/../x", "channel": "api"}),
-            json!({"peer": "..", "channel": "pty"}),
-            json!({"peer": "a b", "channel": "transfer"}),
-            json!({"channel": "api"}),
+            json!({"peer": "lap/../x", "channel": "api", "key": k}),
+            json!({"peer": "..", "channel": "pty", "key": k}),
+            json!({"peer": "a b", "channel": "transfer", "key": k}),
+            json!({"channel": "api", "key": k}),
+            // No proven key: no link stream.
+            json!({"peer": "lap", "channel": "api"}),
+            json!({"peer": "lap", "channel": "api", "key": null}),
+            json!({"peer": "lap", "channel": "api", "key": "ed25519:00"}),
+            json!({"peer": "lap", "channel": "api", "key": 1}),
+            json!({"peer": "lap", "channel": "api", "key": k, "introduced_by": 1}),
+            json!({"peer": "lap", "channel": "api", "key": k, "introduced_by": "a/b"}),
         ] {
             assert_eq!(attach_params(&bad).unwrap_err().code, "invalid", "{bad}");
         }
@@ -858,6 +932,8 @@ mod tests {
             fleet_root: Some(root.to_path_buf()),
             env: Some(BTreeMap::from([("PATH".into(), "/worker/bin".into())])),
             agent: None,
+            key: None,
+            introduced_by: None,
         }
     }
 
@@ -979,7 +1055,7 @@ mod tests {
         let ssh = Reach { own: ssh.own.union(&own).cloned().collect(), ..ssh };
         assert!(admit("stop", json!({"root": root.join("cfg"), "all": true}), &s, &ssh, &state).is_ok());
         // Without a `Peer.env` its verbs keep the env they sent.
-        let attached = Peer { name: "lap".into(), fleet_root: None, env: None, agent: None };
+        let attached = Peer { name: "lap".into(), fleet_root: None, env: None, agent: None, key: None, introduced_by: None };
         let sent = json!({"root": mine, "instance": "own", "env": {"SSH_AUTH_SOCK": "/run/agent-machine_lap.sock"}});
         assert_eq!(admit("stop", sent.clone(), &attached, &ssh, &state).unwrap(), sent);
         assert_eq!(admit("config.migrate", json!({"root": mine}), &s, &ssh, &state).unwrap_err().code, "denied");
@@ -1033,27 +1109,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `fleet.*` goes by who the peer is: `leave` / `forget` from this
-    /// host's hub, `rm` and `place` to the hub from one of its machines; never from a
-    /// local client.
+    fn sk(n: u8) -> crate::serve::fleet::identity::SigningKey {
+        crate::serve::fleet::identity::SigningKey::from_seed([n; 32])
+    }
+
+    fn pk(n: u8) -> PublicKey {
+        crate::serve::fleet::identity::Signer::public_key(&sk(n))
+    }
+
+    /// A peer named `name` that proved key `n`.
+    fn proved(name: &str, n: u8) -> Peer {
+        Peer { name: name.into(), fleet_root: None, env: None, agent: None, key: Some(pk(n)), introduced_by: None }
+    }
+
+    /// `lap` (1) the authority, `box` (2) the hub, `pi` (3) a member; `new`
+    /// (5) introduced by `pi`.
+    fn fleet_log() -> Stored {
+        use crate::serve::fleet::membership::Introduction;
+        let mut s = crate::serve::fleet::membership_api::test_support::fleet("lap", &sk(1), "box", &[("box", pk(2)), ("pi", pk(3))]);
+        let genesis = s.log.membership().unwrap().genesis;
+        s.introduce(Introduction::sign(&genesis, "new", pk(5), "pi", &sk(3))).unwrap();
+        s
+    }
+
+    /// `fleet.*` goes by the key the peer proved: `leave` / `forget` from
+    /// the log's hub (name and key), `rm` and `place` to the hub from a
+    /// member (`place` from an introduced one too); never from a local
+    /// client, nor from a peer that proved no key.
     #[test]
-    fn fleet_calls_go_by_the_hub() {
-        use member::Hub;
-        let k = Hub::Other("k".into());
+    fn fleet_calls_go_by_the_proven_key() {
+        let stored = fleet_log();
+        let on = |own| Some(Log { stored: &stored, own });
+        let code = |m: &str, p: &Peer, own| admit_fleet(m, Some(p), on(own)).unwrap_err().code;
+        let capped = Peer { introduced_by: Some("pi".into()), ..proved("new", 5) };
         for m in ["fleet.leave", "fleet.forget"] {
-            assert_eq!(admit_fleet(m, Some("k"), &k, true), Ok(()), "{m} from the hub");
-            for (from, hub) in [(Some("x"), &k), (Some("k"), &Hub::This), (Some("k"), &Hub::None), (None, &k)] {
-                assert_eq!(admit_fleet(m, from, hub, true).unwrap_err().code, "denied", "{m} from {from:?} with hub {hub:?}");
-            }
+            assert_eq!(admit_fleet(m, Some(&proved("box", 2)), on("pi")), Ok(()), "{m} from the hub");
+            assert_eq!(code(m, &proved("box", 9), "pi"), "denied", "{m}: the hub's name, another key");
+            assert_eq!(code(m, &proved("lap", 2), "pi"), "denied", "{m}: the hub's key, another name");
+            assert_eq!(code(m, &proved("lap", 1), "pi"), "denied", "{m}: the authority isn't the hub");
+            assert_eq!(code(m, &capped, "pi"), "denied");
+            assert_eq!(code(m, &Peer { key: None, ..proved("box", 2) }, "pi"), "denied", "{m}: no key");
+            assert_eq!(admit_fleet(m, Some(&proved("box", 2)), None).unwrap_err().code, "denied", "{m}: no log");
+            assert_eq!(admit_fleet(m, None, on("pi")).unwrap_err().code, "denied", "{m}: a local client");
         }
         for m in ["fleet.rm", "fleet.place"] {
-            assert_eq!(admit_fleet(m, Some("lap"), &Hub::This, true), Ok(()));
-            let refused = [(Some("lap"), &Hub::This, false), (Some("lap"), &k, true), (Some("k"), &k, true), (Some("lap"), &Hub::None, true), (None, &Hub::This, true)];
-            for (from, hub, machine) in refused {
-                assert_eq!(admit_fleet(m, from, hub, machine).unwrap_err().code, "denied", "{m} {from:?} {hub:?} {machine}");
-            }
+            assert_eq!(admit_fleet(m, Some(&proved("pi", 3)), on("box")), Ok(()), "{m} from a member");
+            assert_eq!(admit_fleet(m, Some(&proved("lap", 1)), on("box")), Ok(()), "{m} from the authority");
+            let e = admit_fleet(m, Some(&proved("pi", 3)), on("lap")).unwrap_err();
+            assert_eq!((e.code, e.message), ("denied", format!("`{m}` runs on the hub, and this host isn't it")));
+            assert_eq!(code(m, &proved("pi", 1), "box"), "denied", "{m}: a member's name, another's key");
+            assert_eq!(code(m, &proved("stranger", 9), "box"), "denied");
+            assert_eq!(code(m, &Peer { key: None, ..proved("pi", 3) }, "box"), "denied", "{m}: no key");
+            assert_eq!(admit_fleet(m, None, on("box")).unwrap_err().code, "denied");
         }
-        assert_eq!(admit_fleet("fleet.other", Some("k"), &k, true).unwrap_err().code, "unknown-method");
+        // A capped member's run is placed; it removes no one.
+        assert_eq!(admit_fleet("fleet.place", Some(&capped), on("box")), Ok(()));
+        assert_eq!(admit_fleet("fleet.place", Some(&Peer { key: Some(pk(9)), ..capped.clone() }), on("box")).unwrap_err().code, "denied");
+        let e = admit_fleet("fleet.rm", Some(&capped), on("box")).unwrap_err();
+        assert_eq!(e.code, "denied");
+        assert!(e.message.contains("capped"), "{}", e.message);
+        assert_eq!(admit_fleet("fleet.other", Some(&proved("box", 2)), on("pi")).unwrap_err().code, "unknown-method");
     }
 
     #[test]

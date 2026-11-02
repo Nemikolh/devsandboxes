@@ -165,7 +165,9 @@ unix socket (pumped to the ssh child's pipes for `probe_dial`), so
 daemon's socket.
 
 Every stream of a machine's link reaches the machine's daemon through
-`link.attach {peer: <this host's member name>, channel}`, which its
+`link.attach {peer: <this host's member name>, channel, key,
+introduced_by}` (the key and introducer this host proved on the link),
+which its
 `fleet-link --peer` sends first ([fleet](fleet.md#peer-links)), so the
 remote daemon serves it with the machine's trust table
 ([fleet](fleet.md#the-trust-table)): under its `trust = "worker"` (the
@@ -652,7 +654,10 @@ on|off`; both are refused for an inbound one
 column, and `inbound` as an inbound machine's `TARGET`; `CAPACITY` is the
 machine's last [capacity report](fleet.md#capacity)
 (`machines.list`'s `capacity`, `-` before one came), the over-cap note in
-parentheses. `unlink <name>` (`machines.unlink`) drops this host's link to
+parentheses; a machine this host's membership holds as an introduction
+(`machines.list`'s `introduced_by`, `api::introducer_of`: capped, it
+introduces no one, fleet plan decision 51) is named `<name> (introduced
+by <introducer>)` (`commands::machine::cells`). `unlink <name>` (`machines.unlink`) drops this host's link to
 a registered machine, which stays a fleet member; refused for an inbound
 one, prints `unlinked <name>`. `rm <name>` (`machines.rm`) takes the
 machine out of the fleet, and `rm` of this host's own member name leaves
