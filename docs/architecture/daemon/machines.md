@@ -14,7 +14,8 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 `RawEntry`, `path`, `parse`, `update`, `inbound.rs` (`Neighbors`, `Guard`),
 `check_name`, `Where`, `parse_name`), `join.rs` (`plan`, `Plan`, `Fleet`,
 `Joined`), `leave.rs` (`plan`, `Plan`, `Here`, `rm`, `fleet_call`,
-`After`, `apply`, `RmAnswer`, `Removed`, `Left`), `ssh.rs`
+`After`, `apply`, `RmAnswer`, `Removed`, `Left`), `changes.rs`
+(`revoke`, `propose`, `push`, `call`, `Signed`, `Proposed`), `ssh.rs`
 (`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
 `parse_target`, `Dial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
@@ -646,7 +647,12 @@ already written. Each end's name is pinned as it adopts, so a name that
 came from the hostname stays the one the fleet knows it by.
 The answer's `fleet` is the
 fleet both ends are in and who joined; the CLI prints it on a line after
-`added …` (`fleet_line`). `add --agent` saves the machine with `agent`
+`added …` (`fleet_line`). When this host, not the fleet's authority,
+introduced the machine, `machines.add` then proposes that introduction
+to the authority over a direct link (`fleet.propose`, best effort; the
+answer's `proposed`), and the CLI prints `proposed its add to
+<authority>: approve there with devsandbox machine approve <id>`, or why
+not (`proposed_line`). `add --agent` saves the machine with `agent`
 on; a name the registry or an inbound neighbor has is refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
 required) changes it on a registered machine and prints `<name>: agent
 on|off`; both are refused for an inbound one
@@ -662,9 +668,19 @@ a registered machine, which stays a fleet member; refused for an inbound
 one, prints `unlinked <name>`. `rm <name>` (`machines.rm`) takes the
 machine out of the fleet, and `rm` of this host's own member name leaves
 it ([fleet.md](fleet.md), *How a machine leaves*); it prints one line per
-outcome (`rm_lines`): who was removed from whose fleet, whether the
-machine was told or not reached (and why), each member that forgot it
-or wasn't reached, and on a leave the entries this host dropped.
+outcome (`rm_lines`): on the authority the revoke signed and whom it was
+sent to (`signed_lines`), then who was removed from whose fleet, whether
+the machine was told or not reached (and why), each member that forgot
+it or wasn't reached; on another member `proposed removing <name> to
+<authority>: approve there with devsandbox machine approve <id>`; on a
+leave its own proposal's outcome and the entries this host dropped.
+`pending`, `approve <id>` and `deny <id>` are the authority's side of a
+proposal ([fleet.md](fleet.md#approvals-and-pushes)), local only:
+`pending` (`membership.pending`) prints an `ID FROM WHAT WHEN` table
+(`pending_text`, the age as the Inbox shows one) or `no pending
+proposals`; `approve` (`membership.approve`) signs it here and prints
+`signed_lines`; `deny` (`membership.deny`) drops it and prints `denied
+proposal <id>`.
 
 `trust [worker|full]` is about this host, not a registered machine: a
 client of `member.*` (this host's `member.toml`;

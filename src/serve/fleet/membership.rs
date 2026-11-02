@@ -494,6 +494,13 @@ impl Log {
         let from = usize::try_from(len).unwrap_or(usize::MAX).min(self.entries.len());
         &self.entries[from..]
     }
+
+    /// Whether member `name` was revoked and isn't a member again: what a
+    /// removal (`fleet.rm`, `fleet.forget`) follows.
+    pub fn revoked_name(&self, name: &str) -> bool {
+        self.membership.as_ref().is_some_and(|m| !m.members.contains_key(name))
+            && self.entries.iter().any(|e| matches!(&e.op, Op::Revoke { name: n, .. } if n == name))
+    }
 }
 
 fn fork_at(seq: u64) -> String {
@@ -801,13 +808,16 @@ mod tests {
         assert_eq!((hub_for(&m, "box"), hub_for(&m, "lap")), (member::Hub::This, member::Hub::Other("box".into())));
 
         log.append(Op::Hub { name: "pi".into() }, "lap", &key(1)).unwrap();
+        assert!(!log.revoked_name("box"));
         log.append(Op::Revoke { name: "box".into(), key: pk(2) }, "lap", &key(1)).unwrap();
         let m = log.membership().unwrap();
         assert_eq!((m.hub.as_str(), m.key_of("box"), m.head.len), ("pi", None, 5));
         assert!(m.revoked.contains(&pk(2)));
+        assert!(log.revoked_name("box") && !log.revoked_name("pi") && !log.revoked_name("nope"));
         // A revoked name may come back with a new key.
         log.append(Op::Add { name: "box".into(), key: pk(4) }, "lap", &key(1)).unwrap();
         assert_eq!(log.membership().unwrap().key_of("box"), Some(pk(4)));
+        assert!(!log.revoked_name("box"), "a member again");
         // Genesis's hub need not be added yet: no hub key until it is.
         let mut early = Log::default();
         early.append(genesis(1, "box"), "lap", &key(1)).unwrap();

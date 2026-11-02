@@ -40,6 +40,8 @@ use crate::serve::fleet::member::{MemberInfo, Trust};
 use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::join::{Fleet, Joined};
+use crate::serve::fleet::proposals::Proposal;
+use crate::serve::machines::changes::{Approved, Proposed, Signed};
 use crate::serve::machines::leave::{Heard, Removed, RmAnswer};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
 use crate::serve::machines::ssh;
@@ -72,6 +74,9 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hu
     let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
     println!("added {} ({target}): {}", added.name, added_roots(&roots));
     println!("{}", fleet_line(&added.name, &added.fleet));
+    if let Some(p) = &added.proposed {
+        println!("{}", proposed_line("its add", p));
+    }
     if let Some(warning) = added.warning {
         eprintln!("warning: {warning}");
     }
@@ -501,9 +506,13 @@ pub fn rm(name: &str) -> Result<()> {
 /// `machine rm`'s lines (pure).
 fn rm_lines(answer: &RmAnswer) -> Vec<String> {
     match answer {
-        RmAnswer::Removed(r) => removed_lines(r),
+        RmAnswer::Revoked(s) => signed_lines(s),
+        RmAnswer::Proposed(p) => vec![proposed_line(&format!("removing {}", p.name), p)],
         RmAnswer::Left(l) => {
             let mut lines = Vec::new();
+            if let Some(p) = &l.proposed {
+                lines.push(proposed_line("its own removal", p));
+            }
             if l.hub == l.name {
                 lines.push(format!("this host ({}) was the hub, alone: no fleet now", l.name));
             } else {
@@ -522,6 +531,77 @@ fn rm_lines(answer: &RmAnswer) -> Vec<String> {
             lines
         }
     }
+}
+
+/// A proposal's outcome: where to approve it, or why it wasn't sent.
+fn proposed_line(what: &str, p: &Proposed) -> String {
+    match (p.id, &p.error) {
+        (Some(id), _) => format!("proposed {what} to {}: approve there with `devsandbox machine approve {id}`", p.authority),
+        (None, Some(why)) => format!("{what} not proposed to the authority {}: {why}", p.authority),
+        (None, None) => format!("{what} not proposed to the authority {}", p.authority),
+    }
+}
+
+/// A change signed here (the authority): the change, whom its push
+/// reached, then the removal's lines.
+fn signed_lines(s: &Signed) -> Vec<String> {
+    let mut lines = vec![format!("signed {}", s.change)];
+    if !s.pushed.is_empty() {
+        lines.push(format!("sent to {}", s.pushed.join(", ")));
+    }
+    for m in &s.unpushed {
+        lines.push(format!("not sent to {} ({}): it takes it on its next link", m.name, m.error));
+    }
+    if let Some(r) = &s.removed {
+        lines.extend(removed_lines(r));
+    }
+    if let Some(why) = &s.error {
+        lines.push(why.clone());
+    }
+    lines
+}
+
+/// `machine pending`: the proposals waiting for approval here.
+pub fn pending() -> Result<()> {
+    let mut conn = connect()?;
+    let list: Vec<Proposal> = call(&mut conn, "membership.pending", Value::Null)?;
+    print!("{}", pending_text(&list, now_unix()));
+    Ok(())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// `machine pending`'s table, or a note when there's none (pure).
+fn pending_text(list: &[Proposal], now: u64) -> String {
+    if list.is_empty() {
+        return "no pending proposals\n".into();
+    }
+    let offset = crate::inbox::clock::local_utc_offset();
+    let cells: Vec<[String; 4]> = list
+        .iter()
+        .map(|p| [p.id.to_string(), p.from.clone(), p.op.to_string(), crate::inbox::clock::short_age(p.at, now, offset)])
+        .collect();
+    table(&["ID", "FROM", "WHAT", "WHEN"], &cells)
+}
+
+/// `machine approve <id>`: sign the proposal here and run it.
+pub fn approve(id: u64) -> Result<()> {
+    let mut conn = connect()?;
+    let approved: Approved = call(&mut conn, "membership.approve", json!({ "id": id }))?;
+    for line in signed_lines(&approved.signed) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// `machine deny <id>`: drop the proposal.
+pub fn deny(id: u64) -> Result<()> {
+    let mut conn = connect()?;
+    let _: Value = call(&mut conn, "membership.deny", json!({ "id": id }))?;
+    println!("denied proposal {id}");
+    Ok(())
 }
 
 fn removed_lines(r: &Removed) -> Vec<String> {
@@ -757,12 +837,35 @@ mod tests {
             forgot: vec!["y".into()],
             missed: vec![Missed { name: "z".into(), error: "no link to it".into() }],
         };
+        let signed = |removed, error: Option<&str>| Signed {
+            name: "box".into(),
+            change: "revoke `box`".into(),
+            pushed: vec!["k".into()],
+            unpushed: vec![Missed { name: "w".into(), error: "its link isn't up".into() }],
+            removed,
+            error: error.map(String::from),
+        };
         assert_eq!(
-            rm_lines(&RmAnswer::Removed(removed(Heard::Told, None))),
-            ["removed box from k's fleet", "box left the fleet", "y forgot box", "z wasn't reached (no link to it): it may still link to box"]
+            rm_lines(&RmAnswer::Revoked(signed(Some(removed(Heard::Told, None)), None))),
+            [
+                "signed revoke `box`",
+                "sent to k",
+                "not sent to w (its link isn't up): it takes it on its next link",
+                "removed box from k's fleet",
+                "box left the fleet",
+                "y forgot box",
+                "z wasn't reached (no link to it): it may still link to box"
+            ]
         );
-        let lines = rm_lines(&RmAnswer::Removed(removed(Heard::Unreachable, Some("down"))));
-        assert!(lines[1].starts_with("box wasn't reached (down): "), "{lines:?}");
+        let lines = rm_lines(&RmAnswer::Revoked(signed(Some(removed(Heard::Unreachable, Some("down"))), None)));
+        assert!(lines[4].starts_with("box wasn't reached (down): "), "{lines:?}");
+        let lines = rm_lines(&RmAnswer::Revoked(signed(None, Some("the hub `k` didn't remove it"))));
+        assert_eq!(lines.last().unwrap(), "the hub `k` didn't remove it");
+        let proposed = Proposed { name: "box".into(), authority: "lap".into(), id: Some(3), error: None };
+        assert_eq!(
+            rm_lines(&RmAnswer::Proposed(proposed)),
+            ["proposed removing box to lap: approve there with `devsandbox machine approve 3`"]
+        );
         let mut by_hub = removed(Heard::Leaving, None);
         (by_hub.name, by_hub.forgot, by_hub.missed) = ("lap".into(), vec![], vec![]);
         let left = |removed, error: Option<&str>| Left {
@@ -771,12 +874,27 @@ mod tests {
             removed,
             error: error.map(String::from),
             dropped: vec!["k".into()],
+            proposed: None,
         };
         assert_eq!(rm_lines(&RmAnswer::Left(left(Some(by_hub), None))), ["this host (lap) left k's fleet", "unlinked k"]);
         let lines = rm_lines(&RmAnswer::Left(left(None, Some("no link to it"))));
         assert_eq!(lines[0], "the hub k wasn't reached (no link to it): it still lists this host until `machine rm lap` there");
-        let alone = Left { name: "k".into(), hub: "k".into(), removed: None, error: None, dropped: vec![] };
+        let alone = Left { name: "k".into(), hub: "k".into(), removed: None, error: None, dropped: vec![], proposed: None };
         assert_eq!(rm_lines(&RmAnswer::Left(alone)), ["this host (k) was the hub, alone: no fleet now"]);
+        let not_linked = Proposed { name: "lap".into(), authority: "a".into(), id: None, error: Some("not linked".into()) };
+        let lines = rm_lines(&RmAnswer::Left(Left { proposed: Some(not_linked), ..left(None, None) }));
+        assert_eq!(lines[0], "its own removal not proposed to the authority a: not linked");
+    }
+
+    #[test]
+    fn pending_lists_id_from_what_and_when() {
+        use crate::serve::fleet::proposals::Change;
+        assert_eq!(pending_text(&[], 0), "no pending proposals\n");
+        let p = Proposal { id: 3, from: "box".into(), op: Change::Revoke { name: "pi".into() }, at: 1_000 };
+        let text = pending_text(&[p], 1_000 + 120);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("ID") && lines[0].contains("FROM") && lines[0].contains("WHAT") && lines[0].contains("WHEN"), "{text}");
+        assert!(lines[1].contains("box") && lines[1].contains("remove pi from the fleet") && lines[1].trim_end().ends_with("2m"), "{text}");
     }
 
     #[test]

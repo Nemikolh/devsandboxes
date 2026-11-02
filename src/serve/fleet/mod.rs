@@ -20,6 +20,9 @@
 //!   the authority signs, its heads compared, and the introductions held
 //!   beside it; `membership_api`: the local-only `membership.get` /
 //!   `adopt` / `sign` over it, and the joins `machine add` checks with it.
+//! - `proposals`: membership changes proposed to the authority
+//!   (`fleet.propose`), queued in `proposals.json` until the user approves
+//!   or denies them there.
 //! - `proof`: a peer link's proof of both members' keys after its
 //!   `Hello`s, with the membership heads compared and synced.
 //! - `lent`: the trust table, what a peer may do over a link (the
@@ -59,6 +62,7 @@ pub mod membership_api;
 pub mod place;
 pub mod placed;
 pub mod proof;
+pub mod proposals;
 pub mod pty;
 pub mod pty_client;
 pub mod transfer;

@@ -9,7 +9,8 @@
 //! `machines.add` also runs over both ends' logs before writing anything
 //! (`machines::join::logs`); [`call`] does the I/O. An adopt writes
 //! `member.toml`'s `hub` from the log it accepted (`member::set_fleet`): the
-//! only way a hub is set.
+//! only way a hub is set. [`sync`] is the same store for a pushed log
+//! (`fleet.sync`, `machines::changes`), which may revoke this host.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -108,6 +109,17 @@ pub fn lists(stored: &Stored, name: &str, key: &PublicKey) -> bool {
 /// The result must list `own` (a member, or introduced): a host never
 /// takes a fleet that doesn't contain it.
 pub fn adopt_into(ours: &Stored, theirs: &Stored, own: &Own) -> Result<Stored, ApiError> {
+    take_into(ours, theirs, own, false)
+}
+
+/// [`adopt_into`] for a pushed log (`fleet.sync`): one that revokes this
+/// host's own key is taken too, so the hub's `fleet.leave` that follows a
+/// revoke finds it here (decision 32; fleet plan 10a.6).
+pub fn sync_into(ours: &Stored, theirs: &Stored, own: &Own) -> Result<Stored, ApiError> {
+    take_into(ours, theirs, own, true)
+}
+
+fn take_into(ours: &Stored, theirs: &Stored, own: &Own, revoked_ok: bool) -> Result<Stored, ApiError> {
     if theirs.log.membership().is_none() {
         return Err(ApiError::invalid("no membership log to adopt"));
     }
@@ -133,7 +145,8 @@ pub fn adopt_into(ours: &Stored, theirs: &Stored, own: &Own) -> Result<Stored, A
         next.introduce(i.clone())
             .map_err(|e| ApiError::denied(format!("introduction of `{}` by `{}`: {e:#}", i.name, i.introducer)))?;
     }
-    if !lists(&next, own.name, &own.key) {
+    let revoked_here = revoked_ok && next.log.membership().is_some_and(|m| m.revoked.contains(&own.key));
+    if !lists(&next, own.name, &own.key) && !revoked_here {
         return Err(ApiError::denied(format!(
             "this membership log doesn't list this host (`{}`, {}): a host takes only a fleet that contains it",
             own.name,
@@ -226,16 +239,32 @@ pub fn load(member_toml: &Path) -> Result<Option<Stored>, ApiError> {
 /// `member.toml`'s `hub` (and the name the log knows this host by) written
 /// from the log. The answer, and the hub the daemon follows.
 pub fn adopt(member_toml: &Path, hostname: &str, theirs: &Stored) -> Result<(MembershipInfo, Hub), ApiError> {
+    let (after, hub, _) = take(member_toml, hostname, theirs, adopt_into)?;
+    Ok((MembershipInfo::of(Some(&after)), hub))
+}
+
+/// `fleet.sync`'s store: `theirs` taken as [`sync_into`] says, stored, and
+/// `hub` written as [`adopt`] does. What's stored now, the hub, and whether
+/// it changed.
+pub fn sync(member_toml: &Path, hostname: &str, theirs: &Stored) -> Result<(Stored, Hub, bool), ApiError> {
+    take(member_toml, hostname, theirs, sync_into)
+}
+
+type Take = fn(&Stored, &Stored, &Own) -> Result<Stored, ApiError>;
+
+fn take(member_toml: &Path, hostname: &str, theirs: &Stored, rule: Take) -> Result<(Stored, Hub, bool), ApiError> {
     let (name, key) = own(member_toml, hostname)?;
     let own = Own { name: &name, key: key.public_key() };
-    let after = membership::update(&membership::path(member_toml), |cur| -> Result<Stored, ApiError> {
-        *cur = adopt_into(cur, theirs, &own)?;
-        Ok(cur.clone())
+    let (after, changed) = membership::update(&membership::path(member_toml), |cur| -> Result<(Stored, bool), ApiError> {
+        let next = rule(cur, theirs, &own)?;
+        let changed = next != *cur;
+        *cur = next;
+        Ok((cur.clone(), changed))
     })
     .map_err(ApiError::internal)??;
     let hub = membership::hub_for(after.log.membership().expect("adopted"), &name);
     member::set_fleet(member_toml, Some(&name), &hub).map_err(ApiError::internal)?;
-    Ok((MembershipInfo::of(Some(&after)), hub))
+    Ok((after, hub, changed))
 }
 
 /// `membership.sign`: `name` (`key`) let in here ([`sign_into`]), stored;
@@ -433,6 +462,24 @@ mod tests {
         let rival = sign_into(&s, &own("box", 2), &key(2), "new", &pk(6)).unwrap();
         let e = adopt_into(&intro, &rival, &own("lap", 1)).unwrap_err();
         assert!(e.code == "denied" && e.message.contains("introduction of `new` by `box`"), "{}", e.message);
+    }
+
+    /// A pushed log revoking this host's own key is taken (the hub's
+    /// `fleet.leave` follows it); an adopt refuses it, as it does any log
+    /// that doesn't list this host.
+    #[test]
+    fn a_sync_takes_a_log_revoking_this_host() {
+        let s = three();
+        let mut revoked = s.clone();
+        revoked.log.append(Op::Revoke { name: "pi".into(), key: pk(3) }, "lap", &key(1)).unwrap();
+        assert_eq!(sync_into(&s, &revoked, &own("pi", 3)).unwrap(), revoked);
+        assert_eq!(adopt_into(&s, &revoked, &own("pi", 3)).unwrap_err().code, "denied");
+        // Not listed and not revoked: refused either way.
+        assert_eq!(sync_into(&s, &revoked, &own("zed", 9)).unwrap_err().code, "denied");
+        // Otherwise the same rules as an adopt.
+        assert_eq!(sync_into(&revoked, &s, &own("lap", 1)).unwrap(), revoked, "ahead: ours kept");
+        let other = fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", pk(3))]);
+        assert!(sync_into(&s, &other, &own("pi", 3)).unwrap_err().message.contains("another fleet"));
     }
 
     #[test]

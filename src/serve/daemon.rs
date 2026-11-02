@@ -369,6 +369,16 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             })
         },
+        notify: {
+            let desktop = opts.host;
+            Box::new(move |body: &str| {
+                log(&format!("fleet: {body}"));
+                if desktop {
+                    let popup = crate::inbox::ShownPopup { key: None, level: crate::devsbd::notify::Level::Warn, body: body.to_string() };
+                    crate::devsbd::desktop::notify_desktop("fleet", &popup);
+                }
+            })
+        },
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
@@ -1639,6 +1649,11 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
                 .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
+        // Local only too: the proposals queued here, approved over the links.
+        "membership.pending" | "membership.approve" | "membership.deny" if shared.machines.is_some() => {
+            let ctx = shared.machines.as_ref().expect("checked");
+            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny method")
+        }
         // Local only too; an adopt wrote `hub` from the log: followed here.
         method if method.starts_with("membership.") => match &shared.member {
             Some(path) => match fleet::membership_api::call(method, req.params, path, &shared.hostname) {
@@ -1698,8 +1713,13 @@ fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
         }
         None => None,
     };
-    let log_of = stored.as_ref().zip(own.as_deref()).map(|(stored, own)| lent::Log { stored, own });
-    if let Err(e) = lent::admit_fleet(&req.method, peer.as_deref(), log_of) {
+    let key = shared.member.as_deref().and_then(|p| {
+        use fleet::identity::Signer;
+        let k = fleet::identity::FileKeyStore::new(fleet::member::key_path(p)).load().ok().flatten();
+        k.map(|k| k.public_key())
+    });
+    let log_of = stored.as_ref().zip(own.as_deref()).map(|(stored, own)| lent::Log { stored, own, key });
+    if let Err(e) = lent::admit_fleet(&req.method, &req.params, peer.as_deref(), log_of) {
         log(&format!("{}: refused {} from {}: {}", conn.label(), req.method, from.as_deref().unwrap_or("a local client"), e.message));
         return Response::err(req.id, e.code, e.message);
     }

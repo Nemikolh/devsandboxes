@@ -87,34 +87,51 @@ X's `member.get` says another
 ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
 ssh's first-use trust of the target is the root of this check.
 
-**How a machine leaves** (decision 32 of the plan;
-`machines::leave`): `machine unlink <m>` (`machines.unlink`) only drops
-this host's registry entry for `m`, which stays a member. `machine rm
-<m>` (`machines.rm`) takes `m` out of the fleet, and runs on the hub
-(`leave::plan` decides from this host's name, `hub` and machines):
+**How a machine leaves** (decisions 32 and 49 of the plan, step
+10a.6; `machines::leave`): `machine unlink <m>` (`machines.unlink`) only
+drops this host's registry entry for `m`, which stays a member. `machine
+rm <m>` (`machines.rm`) takes `m` out of the fleet, revoke first
+(`leave::plan` decides from this host's name, `hub`, machines, the log's
+authority and whether `m` is in the log):
 
-- **On the hub**, `m` one of its machines (registry or inbound): it
-  sends `fleet.leave {}` to `m` over `m`'s link while that's connected,
+- **On the authority**: it signs `revoke {m, key}` with its own key
+  (`changes::revoke`; refused for the hub, `name another hub first`, and
+  for the authority itself; a name the log already revokes signs nothing
+  again, so a retry only re-runs the rest), stores it through the adopt
+  path and pushes its log to every machine it holds (`fleet.sync`,
+  [Approvals and pushes](#approvals-and-pushes)); then the removal: run
+  here when this host is the hub, else asked of the hub with `fleet.rm
+  {name: m}`, which the push let in. The answer (`changes::Signed`) says
+  whom the push reached and what the removal did; a hub not reached is
+  `error`, the revoke stands.
+- **On another member**: it proposes `revoke m` to the authority
+  (`fleet.propose`, `changes::propose`) over its direct link to it, and
+  answers the proposal's id there (`approve there with devsandbox machine
+  approve <id>`). With no direct link to the authority it's refused
+  naming it: until routing (step 10b) a proposal reaches the authority
+  only that way.
+- **The removal**, on the hub, `m` in its log or one of its machines: it
+  sends each machine it tells its log first (`fleet.sync`, best effort),
+  then `fleet.leave {}` to `m` over `m`'s link while that's connected,
   and on `m` that clears `hub`, removes its `membership.json` and drops
-  all of `m`'s own registry entries; then `fleet.forget {name: m}` to every other machine it
-  links to, each of which drops its entry for `m` or, if `m` is an
-  inbound neighbor there, ends `m`'s link; then it unlinks `m` here (its
-  entry dropped, or its inbound link ended). Nothing is refused for a
-  member that can't be reached: the answer (`leave::Removed`) says
-  whether `m` was `told`, `unreachable` (with why) or `leaving` (it asked
-  itself), which members `forgot` it, and which were `missed` (with why).
-- **On a member**, `m` a machine it links to or one it sees through the
-  hub: it sends `fleet.rm {name: m}` to the hub over the hub's link, and
-  answers the hub's `Removed`. With no link up to the hub, or in no
-  fleet, it fails saying so. `m` naming the hub is refused (`denied`):
-  the hub leaves on its own host.
+  all of `m`'s own registry entries; then `fleet.forget {name: m}` to
+  every other machine it links to, each of which drops its entry for `m`
+  or, if `m` is an inbound neighbor there, ends `m`'s link; then it
+  unlinks `m` here (its entry dropped, or its inbound link ended).
+  Nothing is refused for a member that can't be reached: the answer
+  (`leave::Removed`) says whether `m` was `told`, `unreachable` (with
+  why) or `leaving` (it asked itself), which members `forgot` it, and
+  which were `missed` (with why).
 - **`m` is this host's own member name** (leaving): on a member, it
-  sends `fleet.rm {name: <itself>}` to the hub first (best effort: an
-  unreachable hub is a note in the answer, `leave::Left::error`), then
-  clears its own `hub`, removes its `membership.json` and drops all its
-  registry entries. On the hub
-  with any machine it's refused (`the hub can't leave while it has
-  members: machine rm each first`); alone, it just clears `hub`.
+  proposes its own revoke to the authority when that's another host
+  (best effort, `leave::Left::proposed`), sends `fleet.rm {name:
+  <itself>}` to the hub (best effort: an unreachable hub is a note in the
+  answer, `leave::Left::error`), then clears its own `hub`, removes its
+  `membership.json` and drops all its registry entries. The hub drops
+  its entry for it; the other members forget it only once the authority
+  approves the revoke. On the hub with any machine it's refused (`the hub
+  can't leave while it has members: machine rm each first`); alone, it
+  just clears `hub`.
 
 The link a call came on may be one the call ends: `m` answering
 `fleet.leave` (its `hub` change ends every link), the hub answering a
@@ -125,11 +142,53 @@ The files are written before the answer; the links follow
 as a hub change ends it: `links.cycle` on the neighbor's held
 `links.inbound` connection, here with `{why}` (`Shared::end_inbound`;
 `fleet-link` prints it). Who may send `fleet.*` is decided by the key
-the sender's link proved, never by the name it announced: a member
-admits `fleet.leave` / `fleet.forget` only from the hub of its
-membership log by the hub's key there, and the hub admits `fleet.rm`
-only from a member of the log by its key, never from an introduced
-(capped) one ([the trust table](#the-trust-table)).
+the sender's link proved, never by the name it announced, and the
+removals follow a valid revoke: a member admits `fleet.leave` only from
+the hub of its membership log by the hub's key there and once its log
+revokes its own key, `fleet.forget {name}` likewise once its log revokes
+`name`; the hub admits `fleet.rm {name}` only from a member of the log
+by its key, never from an introduced (capped) one, and only of the
+member itself or of one its log revokes ([the trust
+table](#the-trust-table)). A `fleet.sync` that revokes the receiving
+host's own key is taken (`membership_api::sync_into`), so its
+`fleet.leave` has the revoke to follow; its links then no longer prove.
+
+### Approvals and pushes
+
+The authority's key is the only one that signs membership changes, and
+it never signs on a remote request alone (decision 49;
+`machines::changes`, `fleet::proposals`):
+
+- **Proposals.** A member's change goes to the authority as
+  `fleet.propose {op}`, `op` `{"kind": "revoke", "name"}` (a member's
+  `machine rm`, or its own when it leaves) or `{"kind": "add",
+  "introduction"}` (the introduction a non-authority member's `machine
+  add` signs: `machines.add` proposes it after the add, best effort, its
+  answer's `proposed` saying the id or why not). The authority admits it
+  only from a member of its log by its key (a capped one proposes
+  nothing, decision 51), checks it against its log now
+  (`proposals::check`: a revoke of a member's current key, never the
+  authority's or the hub's; an introduction that holds), and queues it in
+  `proposals.json` next to `membership.json` (`{"next", "pending": [{"id",
+  "from", "op", "at"}]}`, daemon-written, locked and atomic like the
+  other stores; a pending proposal of the same change answers its own
+  id, `Proposals::queue`). A new one is shown on the desktop
+  (`Ctx::notify`, `devsbd::desktop` on the host side): `<from> proposes
+  to remove <m> from the fleet: devsandbox machine approve <id>`.
+  `devsandbox machine pending|approve|deny` (`membership.pending`,
+  `.approve`, `.deny`, local only) list them, sign one (checked against
+  the log again, then signed, pushed and, for a revoke, removed as
+  `machine rm` typed there would) or drop one.
+- **Pushes.** After every change it signs, the authority sends its whole
+  log to every machine it holds, registry and inbound (`changes::push`,
+  `fleet.sync`). The receiver, from a member or an introduced peer,
+  merges it as a link's handshake does (self-verifying; another fleet's
+  log or a fork refused; `membership_api::sync`), and when that made its
+  log newer, follows the hub and sends it on to every other machine it
+  holds, not back to the sender, on a thread of its own. A host that
+  takes nothing sends nothing on, so a push floods the connected graph
+  once. A host not reached catches up at its next link's head comparison
+  (`fleet::proof`).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `cap_of`, `Handler`, `Serves`, `Endpoint`, `Socket`,
@@ -162,8 +221,13 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/machines/join.rs` (`plan`, `Plan`, `Fleet`, `Joined`,
 `logs`, `Logs`, `Side`), `src/serve/machines/api.rs` (`add`, `probe`,
 `Probed`),
-`src/serve/machines/leave.rs` (`plan`, `Plan`, `Here`, `rm`,
-`fleet_call`, `After`, `apply`, `Removed`, `Left`, `RmAnswer`),
+`src/serve/machines/leave.rs` (`plan`, `Plan`, `Here`, `Authority`,
+`rm`, `remove`, `fleet_call`, `After`, `apply`, `Removed`, `Left`,
+`RmAnswer`), `src/serve/machines/changes.rs` (`revoke`, `propose`,
+`push`, `call`, `fleet_call`, `Signed`, `Proposed`, `Approved`),
+`src/serve/fleet/proposals.rs` (`Change`, `check`, `Proposal`,
+`Proposals`, `Proposals::queue`, `update`),
+`src/serve/fleet/membership_api.rs` (`sync`, `sync_into`),
 `src/serve/daemon.rs` (`fleet_call`, `Shared::end_inbound`),
 `src/serve/fleet/lent.rs` (`admit_fleet`),
 `src/serve/machines/service.rs` (`Hub`, `save_loop`, `log_failure`,
@@ -1372,6 +1436,9 @@ hash chain of entries only the authority signs
     signed can be run again; a name or key the log or a held
     introduction has otherwise is `invalid`. Stored; it answers the whole `Wire`, for the
     joining host to adopt.
+  - `membership.pending`, `.approve {id}`, `.deny {id}` are the
+    authority's proposal queue (`machines::changes::call`, needing the
+    links: [Approvals and pushes](#approvals-and-pushes)).
 
 ### Trust
 
@@ -1437,19 +1504,27 @@ only.
 `fleet.*` (a removal from the fleet: *How a machine leaves*, at the top;
 a member's placed run) goes by the key the caller proved, not by trust:
 `daemon::fleet_call` takes it before the table, through
-`lent::admit_fleet` (pure, over the method, the `Peer` and `lent::Log`:
-this host's stored log and held introductions, `membership.json` read
-per call, and its own member name). `fleet.leave` and `fleet.forget` are
-admitted only from the log's hub, its name and its key there both (the
-hub's name over another key, or the hub's key under another name, is
-`denied`); `fleet.rm` and `fleet.place` only on the hub (the log's hub is
-this host's name), from a member of the log by its name and key;
-`fleet.place` also from a held introduction's name and key, but an
-introduced member's `fleet.rm` is `denied` (capped: it changes no one's
-membership, decision 51). A local client, a peer that proved no key and
-a host in no log are `denied` all of them (a local client uses
-`machines.rm` / `machines.unlink`); `admit` itself refuses `fleet.*`
-should one reach it.
+`lent::admit_fleet` (pure, over the method, its params, the `Peer` and
+`lent::Log`: this host's stored log and held introductions,
+`membership.json` read per call, its own member name and its own key).
+`fleet.leave` and `fleet.forget` are admitted only from the log's hub,
+its name and its key there both (the hub's name over another key, or the
+hub's key under another name, is `denied`), and only after a revoke:
+`leave` once the log revokes this host's own key, `forget {name}` once
+it revokes `name` (`Log::revoked_name`); `fleet.rm` and `fleet.place`
+only on the hub (the log's hub is this host's name), from a member of
+the log by its name and key, `fleet.rm {name}` only of the member itself
+(leaving) or of one the log revokes; `fleet.place` also from a held
+introduction's name and key, but an introduced member's `fleet.rm` is
+`denied` (capped: it changes no one's membership, decision 51).
+`fleet.propose` is admitted only on the authority (this host's name and
+key the log's authority's) and from a member of the log, never an
+introduced one; `fleet.sync` from a member or an introduced peer
+([Approvals and pushes](#approvals-and-pushes)). A local client, a peer
+that proved no key and a host in no log are `denied` all of them (a
+local client uses `machines.rm` / `machines.unlink` /
+`membership.approve`); `admit` itself refuses `fleet.*` should one reach
+it.
 
 Under **`full`** that's all: the request runs as a local client's would,
 any root, any instance, no filter on its answer or its pushes, except

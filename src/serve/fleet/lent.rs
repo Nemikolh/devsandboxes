@@ -34,8 +34,9 @@
 //! settings and membership log, and its links), refused under both; a verb's `env` is still the peer's when it
 //! has one.
 //!
-//! `fleet.*` (a removal from the fleet, `machines::leave`; a member's run
-//! placed by the hub, `fleet.place`) goes by who the peer proved it is
+//! `fleet.*` (a removal from the fleet, `machines::leave`; a membership
+//! change proposed to the authority or pushed from it, `machines::changes`;
+//! a member's run placed by the hub, `fleet.place`) goes by who the peer proved it is
 //! (its key, [`Peer::key`], against this host's membership log), not by
 //! trust: [`admit_fleet`], before any of the above.
 
@@ -418,29 +419,43 @@ impl Lent {
 }
 
 /// This host's membership, as [`admit_fleet`] reads it: its stored log and
-/// held introductions, and its own member name.
+/// held introductions, its own member name and its own key (`None`: no
+/// `member.key` yet).
 #[derive(Debug, Clone, Copy)]
 pub struct Log<'a> {
     pub stored: &'a Stored,
     pub own: &'a str,
+    pub key: Option<PublicKey>,
 }
 
-/// Whether `fleet.*` `method` is admitted (pure), under either trust, by
-/// the key `from` proved (`None`: a local client, which uses `machines.*`)
-/// against `log` (`None`: this host is in no fleet's log). `fleet.leave` /
-/// `fleet.forget` come only from the log's hub: its name and its key in
-/// the log, never the name alone. `fleet.rm` and `fleet.place` run only on
-/// the hub (the log's hub is this host): `fleet.rm` from a member of the
-/// log (name and key), `fleet.place` from one too or from a held
-/// introduction's (a capped member runs work as the others do, but changes
-/// no one's membership, decision 51). Decisions 31 and 32 of the fleet plan.
-pub fn admit_fleet(method: &str, from: Option<&Peer>, log: Option<Log>) -> Result<(), ApiError> {
+/// The `fleet.*` methods [`admit_fleet`] knows.
+pub const FLEET_METHODS: &[&str] = &["fleet.leave", "fleet.forget", "fleet.rm", "fleet.place", "fleet.propose", "fleet.sync"];
+
+/// Whether `fleet.*` `method` with `params` is admitted (pure), under either
+/// trust, by the key `from` proved (`None`: a local client, which uses
+/// `machines.*`) against `log` (`None`: this host is in no fleet's log).
+/// Fleet plan decisions 31, 32 and 49, step 10a.6:
+///
+/// - `fleet.leave` / `fleet.forget` come only from the log's hub (its name
+///   and its key in the log, never the name alone), and follow a revoke:
+///   `leave` only once the log revokes this host's own key, `forget
+///   {name}` only once it revokes `name`.
+/// - `fleet.rm` and `fleet.place` run only on the hub (the log's hub is this
+///   host): `fleet.rm {name}` from a member of the log (name and key), of
+///   itself (leaving) or of a member the log has revoked; `fleet.place` from
+///   a member or a held introduction's (a capped member runs work as the
+///   others do, but changes no one's membership, decision 51).
+/// - `fleet.propose` runs only on the authority (this host's key is the
+///   log's authority's), from a member of the log; never from a capped one.
+/// - `fleet.sync` from a member of the log or an introduced (capped) one:
+///   what it carries verifies itself.
+pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Option<Log>) -> Result<(), ApiError> {
     let Some(peer) = from else {
         return Err(ApiError::denied(format!(
-            "`{method}` comes over a fleet link: here `devsandbox machine rm|unlink` (`machines.*`)"
+            "`{method}` comes over a fleet link: here `devsandbox machine rm|unlink|approve` (`machines.*`, `membership.*`)"
         )));
     };
-    if !matches!(method, "fleet.leave" | "fleet.forget" | "fleet.rm" | "fleet.place") {
+    if !FLEET_METHODS.contains(&method) {
         return Err(ApiError::unknown_method(method));
     }
     let from = peer.name.as_str();
@@ -451,18 +466,70 @@ pub fn admit_fleet(method: &str, from: Option<&Peer>, log: Option<Log>) -> Resul
         return Err(ApiError::denied(format!("`{method}`: this host is in no fleet's membership log")));
     };
     let member = m.key_of(from) == Some(key);
+    let introduced = peer.introduced_by.is_some() || log.stored.introductions.iter().any(|i| i.name == from && i.key == key);
+    let name = || -> Result<&str, ApiError> {
+        params.get("name").and_then(Value::as_str).ok_or_else(|| ApiError::invalid(format!("`{method}` needs `name`")))
+    };
     match method {
         "fleet.leave" | "fleet.forget" => {
-            if m.hub == from && m.hub_key() == Some(key) {
-                Ok(())
+            if m.hub != from || m.hub_key() != Some(key) {
+                return Err(ApiError::denied(format!(
+                    "`{method}` is taken from this host's hub only (by its key in the log), and `{from}` isn't it"
+                )));
+            }
+            if method == "fleet.leave" {
+                if !log.key.is_some_and(|k| m.revoked.contains(&k)) {
+                    return Err(ApiError::denied(format!(
+                        "`fleet.leave` follows a revoke of this host's key, and this host's membership log has none \
+                         (the authority `{}` signs it)",
+                        m.authority.0
+                    )));
+                }
             } else {
-                Err(ApiError::denied(format!("`{method}` is taken from this host's hub only (by its key in the log), and `{from}` isn't it")))
+                let name = name()?;
+                if !log.stored.log.revoked_name(name) {
+                    return Err(ApiError::denied(format!(
+                        "`fleet.forget` of `{name}` follows a revoke of its key, and this host's membership log has none \
+                         (the authority `{}` signs it)",
+                        m.authority.0
+                    )));
+                }
+            }
+            Ok(())
+        }
+        "fleet.propose" => {
+            if m.authority.0 != log.own || log.key != Some(m.authority.1) {
+                return Err(ApiError::denied(format!(
+                    "`fleet.propose` goes to the fleet's authority `{}`, and this host isn't it",
+                    m.authority.0
+                )));
+            }
+            if member {
+                Ok(())
+            } else if introduced {
+                Err(ApiError::denied(format!("`fleet.propose` from `{from}`: an introduced member (capped) proposes no membership change")))
+            } else {
+                Err(ApiError::denied(format!("`fleet.propose` is taken from the fleet's members (by their keys in the log), and `{from}` isn't one")))
             }
         }
+        "fleet.sync" if member || introduced => Ok(()),
+        "fleet.sync" => Err(ApiError::denied(format!("`fleet.sync` from `{from}`, which is neither a member nor introduced"))),
         _ if m.hub != log.own => Err(ApiError::denied(format!("`{method}` runs on the hub, and this host isn't it"))),
-        _ if member => Ok(()),
+        "fleet.rm" if member => {
+            let name = name()?;
+            if name == from || log.stored.log.revoked_name(name) {
+                Ok(())
+            } else {
+                Err(ApiError::denied(format!(
+                    "`fleet.rm` of `{name}`: its key isn't revoked in the hub's membership log \
+                     (the authority `{}` signs that: `devsandbox machine rm {name}` there)",
+                    m.authority.0
+                )))
+            }
+        }
+        "fleet.place" if member => Ok(()),
         "fleet.place" if log.stored.introductions.iter().any(|i| i.name == from && i.key == key) => Ok(()),
-        "fleet.rm" if peer.introduced_by.is_some() || log.stored.introductions.iter().any(|i| i.name == from) => Err(ApiError::denied(format!(
+        "fleet.rm" if introduced || log.stored.introductions.iter().any(|i| i.name == from) => Err(ApiError::denied(format!(
             "`{method}` from `{from}`: an introduced member (capped) changes no one's membership"
         ))),
         _ => Err(ApiError::denied(format!("`{method}` is taken from the fleet's members (by their keys in the log), and `{from}` isn't one"))),
@@ -1136,39 +1203,94 @@ mod tests {
     /// the log's hub (name and key), `rm` and `place` to the hub from a
     /// member (`place` from an introduced one too); never from a local
     /// client, nor from a peer that proved no key.
+    /// The key of each member of [`fleet_log`] by name (seeds 1, 2, 3, 5).
+    fn own_key(own: &str) -> Option<PublicKey> {
+        match own {
+            "lap" => Some(pk(1)),
+            "box" => Some(pk(2)),
+            "pi" => Some(pk(3)),
+            "new" => Some(pk(5)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn fleet_calls_go_by_the_proven_key() {
         let stored = fleet_log();
-        let on = |own| Some(Log { stored: &stored, own });
-        let code = |m: &str, p: &Peer, own| admit_fleet(m, Some(p), on(own)).unwrap_err().code;
+        // `pi` revoked: what `fleet.leave` / `.forget` / `.rm` follow.
+        let mut revoked = stored.clone();
+        revoked.log.append(crate::serve::fleet::membership::Op::Revoke { name: "pi".into(), key: pk(3) }, "lap", &sk(1)).unwrap();
+        let on = |own| Some(Log { stored: &stored, own, key: own_key(own) });
+        let after = |own| Some(Log { stored: &revoked, own, key: own_key(own) });
+        let none = json!({});
+        let pi = json!({"name": "pi"});
+        let code = |m: &str, p: &Peer, log: Option<Log>| admit_fleet(m, &pi, Some(p), log).unwrap_err().code;
         let capped = Peer { introduced_by: Some("pi".into()), ..proved("new", 5) };
-        for m in ["fleet.leave", "fleet.forget"] {
-            assert_eq!(admit_fleet(m, Some(&proved("box", 2)), on("pi")), Ok(()), "{m} from the hub");
-            assert_eq!(code(m, &proved("box", 9), "pi"), "denied", "{m}: the hub's name, another key");
-            assert_eq!(code(m, &proved("lap", 2), "pi"), "denied", "{m}: the hub's key, another name");
-            assert_eq!(code(m, &proved("lap", 1), "pi"), "denied", "{m}: the authority isn't the hub");
-            assert_eq!(code(m, &capped, "pi"), "denied");
-            assert_eq!(code(m, &Peer { key: None, ..proved("box", 2) }, "pi"), "denied", "{m}: no key");
-            assert_eq!(admit_fleet(m, Some(&proved("box", 2)), None).unwrap_err().code, "denied", "{m}: no log");
-            assert_eq!(admit_fleet(m, None, on("pi")).unwrap_err().code, "denied", "{m}: a local client");
+        for (m, params) in [("fleet.leave", &none), ("fleet.forget", &pi)] {
+            assert_eq!(admit_fleet(m, params, Some(&proved("box", 2)), after("pi")), Ok(()), "{m} from the hub, after the revoke");
+            let e = admit_fleet(m, params, Some(&proved("box", 2)), on("pi")).unwrap_err();
+            assert!(e.code == "denied" && e.message.contains("follows a revoke"), "{m}: no revoke yet: {}", e.message);
+            assert_eq!(code(m, &proved("box", 9), after("pi")), "denied", "{m}: the hub's name, another key");
+            assert_eq!(code(m, &proved("lap", 2), after("pi")), "denied", "{m}: the hub's key, another name");
+            assert_eq!(code(m, &proved("lap", 1), after("pi")), "denied", "{m}: the authority isn't the hub");
+            assert_eq!(code(m, &capped, after("pi")), "denied");
+            assert_eq!(code(m, &Peer { key: None, ..proved("box", 2) }, after("pi")), "denied", "{m}: no key");
+            assert_eq!(admit_fleet(m, params, Some(&proved("box", 2)), None).unwrap_err().code, "denied", "{m}: no log");
+            assert_eq!(admit_fleet(m, params, None, after("pi")).unwrap_err().code, "denied", "{m}: a local client");
         }
+        // `fleet.leave` follows a revoke of this host's own key, not another's.
+        assert_eq!(code("fleet.leave", &proved("box", 2), after("lap")), "denied");
+        assert_eq!(admit_fleet("fleet.forget", &none, Some(&proved("box", 2)), after("lap")).unwrap_err().code, "invalid");
         for m in ["fleet.rm", "fleet.place"] {
-            assert_eq!(admit_fleet(m, Some(&proved("pi", 3)), on("box")), Ok(()), "{m} from a member");
-            assert_eq!(admit_fleet(m, Some(&proved("lap", 1)), on("box")), Ok(()), "{m} from the authority");
-            let e = admit_fleet(m, Some(&proved("pi", 3)), on("lap")).unwrap_err();
+            let log = if m == "fleet.rm" { after("box") } else { on("box") };
+            assert_eq!(admit_fleet(m, &pi, Some(&proved("pi", 3)), on("box")), Ok(()), "{m} from a member (`rm` of itself)");
+            assert_eq!(admit_fleet(m, &pi, Some(&proved("lap", 1)), log), Ok(()), "{m} from the authority");
+            let e = admit_fleet(m, &pi, Some(&proved("pi", 3)), on("lap")).unwrap_err();
             assert_eq!((e.code, e.message), ("denied", format!("`{m}` runs on the hub, and this host isn't it")));
-            assert_eq!(code(m, &proved("pi", 1), "box"), "denied", "{m}: a member's name, another's key");
-            assert_eq!(code(m, &proved("stranger", 9), "box"), "denied");
-            assert_eq!(code(m, &Peer { key: None, ..proved("pi", 3) }, "box"), "denied", "{m}: no key");
-            assert_eq!(admit_fleet(m, None, on("box")).unwrap_err().code, "denied");
+            assert_eq!(code(m, &proved("pi", 1), on("box")), "denied", "{m}: a member's name, another's key");
+            assert_eq!(code(m, &proved("stranger", 9), on("box")), "denied");
+            assert_eq!(code(m, &Peer { key: None, ..proved("pi", 3) }, on("box")), "denied", "{m}: no key");
+            assert_eq!(admit_fleet(m, &pi, None, on("box")).unwrap_err().code, "denied");
         }
+        // `fleet.rm` of another member: only once the log revokes it.
+        let e = admit_fleet("fleet.rm", &pi, Some(&proved("lap", 1)), on("box")).unwrap_err();
+        assert!(e.code == "denied" && e.message.contains("isn't revoked in the hub's membership log"), "{}", e.message);
         // A capped member's run is placed; it removes no one.
-        assert_eq!(admit_fleet("fleet.place", Some(&capped), on("box")), Ok(()));
-        assert_eq!(admit_fleet("fleet.place", Some(&Peer { key: Some(pk(9)), ..capped.clone() }), on("box")).unwrap_err().code, "denied");
-        let e = admit_fleet("fleet.rm", Some(&capped), on("box")).unwrap_err();
+        assert_eq!(admit_fleet("fleet.place", &none, Some(&capped), on("box")), Ok(()));
+        assert_eq!(admit_fleet("fleet.place", &none, Some(&Peer { key: Some(pk(9)), ..capped.clone() }), on("box")).unwrap_err().code, "denied");
+        let e = admit_fleet("fleet.rm", &pi, Some(&capped), on("box")).unwrap_err();
         assert_eq!(e.code, "denied");
         assert!(e.message.contains("capped"), "{}", e.message);
-        assert_eq!(admit_fleet("fleet.other", Some(&proved("box", 2)), on("pi")).unwrap_err().code, "unknown-method");
+        assert_eq!(admit_fleet("fleet.other", &none, Some(&proved("box", 2)), on("pi")).unwrap_err().code, "unknown-method");
+    }
+
+    /// `fleet.propose` on the authority only (by its own key), from a member
+    /// of the log, never a capped one; `fleet.sync` from a member or an
+    /// introduced peer, anywhere.
+    #[test]
+    fn proposals_go_to_the_authority_and_syncs_come_from_members() {
+        let stored = fleet_log();
+        let on = |own| Some(Log { stored: &stored, own, key: own_key(own) });
+        let p = json!({"op": {"kind": "revoke", "name": "pi"}});
+        let capped = Peer { introduced_by: Some("pi".into()), ..proved("new", 5) };
+        assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("pi", 3)), on("lap")), Ok(()));
+        assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("box", 2)), on("lap")), Ok(()), "the hub is a member too");
+        let e = admit_fleet("fleet.propose", &p, Some(&proved("pi", 3)), on("box")).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("denied", "`fleet.propose` goes to the fleet's authority `lap`, and this host isn't it"));
+        // The authority's name with another key (a stale `member.toml`).
+        let impostor = Some(Log { stored: &stored, own: "lap", key: Some(pk(9)) });
+        assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("pi", 3)), impostor).unwrap_err().code, "denied");
+        let e = admit_fleet("fleet.propose", &p, Some(&capped), on("lap")).unwrap_err();
+        assert!(e.code == "denied" && e.message.contains("capped"), "{}", e.message);
+        assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("pi", 9)), on("lap")).unwrap_err().code, "denied");
+        assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("stranger", 9)), on("lap")).unwrap_err().code, "denied");
+        let sync = json!({"entries": []});
+        for own in ["lap", "box", "pi"] {
+            assert_eq!(admit_fleet("fleet.sync", &sync, Some(&proved("box", 2)), on(own)), Ok(()), "on {own}");
+        }
+        assert_eq!(admit_fleet("fleet.sync", &sync, Some(&capped), on("pi")), Ok(()), "from an introduced peer");
+        assert_eq!(admit_fleet("fleet.sync", &sync, Some(&proved("stranger", 9)), on("pi")).unwrap_err().code, "denied");
+        assert_eq!(admit_fleet("fleet.sync", &sync, None, on("pi")).unwrap_err().code, "denied");
     }
 
     #[test]

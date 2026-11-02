@@ -481,13 +481,29 @@ enum MachineCommand {
     Unlink { name: String },
     /// Take a machine out of the fleet; this host's own name leaves it
     ///
-    /// Runs on the hub (from a member it's sent there): the machine clears
-    /// its hub and drops its links, every other member the hub reaches
-    /// forgets it. Each outcome is printed; an unreachable machine or member
-    /// is reported, not an error.
+    /// On the fleet's authority it revokes the machine's key, sends the
+    /// change to the machines it links to, then the hub removes it: the
+    /// machine clears its hub and drops its links, every other member the
+    /// hub reaches forgets it. On another member it's proposed to the
+    /// authority (linked directly), approved there with `machine approve`.
+    /// Each outcome is printed; an unreachable machine or member is
+    /// reported, not an error.
     ///
     ///     devsandbox machine rm my-server
     Rm { name: String },
+    /// List the membership changes proposed to this host, the fleet's
+    /// authority, waiting for `machine approve` or `machine deny`
+    ///
+    ///     devsandbox machine pending
+    Pending,
+    /// Sign a proposed membership change here (the authority) and run it
+    ///
+    ///     devsandbox machine approve 3
+    Approve { id: u64 },
+    /// Drop a proposed membership change, signing nothing
+    ///
+    ///     devsandbox machine deny 3
+    Deny { id: u64 },
     /// Show or set what other machines reach on this host (its fleet trust)
     ///
     /// `worker` (the default): this host's own roots and its fleet root,
@@ -854,6 +870,9 @@ fn main() -> Result<()> {
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
             MachineCommand::Unlink { name } => commands::machine::unlink(&name),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
+            MachineCommand::Pending => commands::machine::pending(),
+            MachineCommand::Approve { id } => commands::machine::approve(id),
+            MachineCommand::Deny { id } => commands::machine::deny(id),
             MachineCommand::Trust { trust } => commands::machine::trust(trust),
             MachineCommand::Key => commands::machine::key(),
             MachineCommand::Roots { cmd } => commands::machine::roots(match cmd {

@@ -833,6 +833,11 @@ export interface MachineAdded {
   warning: string | null;
   /** The fleet both ends are in after the add. */
   fleet: MachineFleet;
+  /**
+   * When this host (not the fleet's authority) introduced the machine: the introduction proposed to the
+   * authority (`fleet.propose`, best effort), its id there or why not.
+   */
+  proposed: FleetProposed | null;
 }
 
 /**
@@ -905,9 +910,39 @@ export interface FleetPlaced {
   lines: string[];
 }
 
-/** `machines.rm`: the hub took the machine out of the fleet. */
-export interface MachineRmRemoved extends FleetRemoved {
-  type: 'removed';
+/** A membership change proposed to the fleet's authority: its id there, or why it wasn't sent. */
+export interface FleetProposed {
+  /** The member the change is about. */
+  name: string;
+  authority: string;
+  id: number | null;
+  error: string | null;
+}
+
+/** A membership change signed on the authority: whom its push (`fleet.sync`) reached, and a revoke's removal. */
+export interface FleetSigned {
+  /** The member the change is about. */
+  name: string;
+  /** The entry signed, as the log says it (`revoke \`pi\``). */
+  change: string;
+  /** The machines the push reached. */
+  pushed: string[];
+  /** Those it didn't: they catch up on their next link. */
+  unpushed: FleetMissed[];
+  /** A revoke's removal: run here on the hub, or the hub's answer to `fleet.rm`. */
+  removed: FleetRemoved | null;
+  /** Why a revoke has no `removed` (the hub not reached, or refusing). */
+  error: string | null;
+}
+
+/** `machines.rm` on the fleet's authority: the machine's key revoked, pushed, then removed by the hub. */
+export interface MachineRmRevoked extends FleetSigned {
+  type: 'revoked';
+}
+
+/** `machines.rm` on another member: the revoke proposed to the authority, approved there. */
+export interface MachineRmProposed extends FleetProposed {
+  type: 'proposed';
 }
 
 /** `machines.rm` of this host's own name: it left its fleet. */
@@ -923,10 +958,54 @@ export interface MachineRmLeft {
   error: string | null;
   /** This host's registry entries, dropped. */
   dropped: string[];
+  /** Its own revoke proposed to the authority (another host's), best effort. */
+  proposed: FleetProposed | null;
 }
 
 /** `machines.rm`'s answer. */
-export type MachineRmResult = MachineRmRemoved | MachineRmLeft;
+export type MachineRmResult = MachineRmRevoked | MachineRmProposed | MachineRmLeft;
+
+/** A proposed membership change: a held introduction promoted to an `add`. */
+export interface FleetChangeAdd {
+  kind: 'add';
+  introduction: MembershipIntroduction;
+}
+
+/** A proposed membership change: `name` out of the fleet (its key revoked). */
+export interface FleetChangeRevoke {
+  kind: 'revoke';
+  name: string;
+}
+
+/** A membership change proposed to the authority (`fleet.propose`'s `op`). */
+export type FleetChange = FleetChangeAdd | FleetChangeRevoke;
+
+/** A proposal waiting on the authority (`proposals.json`). */
+export interface FleetProposal {
+  id: number;
+  /** The member that proposed it. */
+  from: string;
+  op: FleetChange;
+  /** When it came (unix seconds). */
+  at: number;
+}
+
+/** `fleet.propose`'s answer: the proposal's id on the authority. */
+export interface FleetQueued {
+  id: number;
+  pending: boolean;
+}
+
+/** `fleet.sync`'s answer: whether this host's log took something, and its head after. */
+export interface FleetSynced {
+  changed: boolean;
+  head: MembershipHead;
+}
+
+/** `membership.approve`'s answer: the proposal's id, and what signing it did. */
+export interface MembershipApproved extends FleetSigned {
+  id: number;
+}
 
 /** `machines.get`'s answer (a registered machine or an inbound one): what an ssh command to the machine needs. */
 export interface MachineInfo {
@@ -1540,22 +1619,40 @@ export interface ApiMethods {
    */
   'machines.unlink': { params: { name: string }; result: OkResult };
   /**
-   * Take a machine out of the fleet: run on the hub, sent there from a member (`failed` when the hub can't be
-   * reached); this host's own name leaves the fleet. `denied` for the hub from a member, or the hub leaving while
-   * it has machines; `not-found` for a name neither linked nor seen through the hub.
+   * Take a machine out of the fleet. On the authority: its key revoked, pushed, then removed by the hub. On
+   * another member: proposed to the authority over a direct link (`denied` naming it without one, `failed` when
+   * its link is down). This host's own name leaves the fleet (its revoke proposed, best effort). `denied` for the
+   * hub, the authority, or the hub leaving while it has machines; `not-found` for a name neither linked, in the
+   * log, nor seen through the hub.
    */
   'machines.rm': { params: { name: string }; result: MachineRmResult };
-  /** On the hub, from one of its machines: `machines.rm` sent from a member. Never from a local client. */
+  /**
+   * On the hub, from one of its machines: the removal of a member the hub's log has revoked, or of the asking
+   * member itself (leaving). Never from a local client.
+   */
   'fleet.rm': { params: { name: string }; result: FleetRemoved };
   /**
    * On the hub, from one of its machines: where that member's `run` goes, among itself, the hub and the hub's
    * connected machines in `reachable`. Never from a local client.
    */
   'fleet.place': { params: FleetPlaceParams; result: FleetPlaced };
-  /** From this host's hub only: clear `hub` and drop every registry entry; the links end once answered. */
+  /**
+   * From this host's hub only, once this host's log revokes its key: clear `hub` and drop every registry entry
+   * and the log; the links end once answered.
+   */
   'fleet.leave': { params: {}; result: OkResult };
-  /** From this host's hub only: drop the entry for `name`, or end its inbound link. */
+  /** From this host's hub only, once this host's log revokes `name`: drop its entry, or end its inbound link. */
   'fleet.forget': { params: { name: string }; result: OkResult };
+  /**
+   * On the fleet's authority, from a member of its log (never a capped one): queue a membership change for the
+   * user's approval there (a desktop notification). `invalid` for one that doesn't apply to the log.
+   */
+  'fleet.propose': { params: { op: FleetChange }; result: FleetQueued };
+  /**
+   * From a member or an introduced peer: take newer membership entries (self-verifying; `denied` for another
+   * fleet's or a fork) and send them on to this host's other connected machines.
+   */
+  'fleet.sync': { params: MembershipStored; result: FleetSynced };
   /**
    * One registered machine, to build an ssh command to it; `not-found` for an unknown name. `agent`, the
    * caller's absolute `SSH_AUTH_SOCK`, becomes the agent this host serves the machine's `AGENT` streams with.
@@ -1589,6 +1686,15 @@ export interface ApiMethods {
    * name or key the fleet knows. Local only.
    */
   'membership.sign': { params: { name: string; key: string }; result: MembershipStored };
+  /** The membership changes proposed to this host (the fleet's authority), oldest first. Local only. */
+  'membership.pending': { params: {}; result: FleetProposal[] };
+  /**
+   * Sign proposal `id` here, push it, and run a revoke's removal; dropped from the queue. `denied` off the
+   * authority, `not-found` for no such proposal, `invalid` for one that no longer applies. Local only.
+   */
+  'membership.approve': { params: { id: number }; result: MembershipApproved };
+  /** Drop proposal `id`, signing nothing; `not-found` for no such proposal. Local only. */
+  'membership.deny': { params: { id: number }; result: OkResult };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

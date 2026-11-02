@@ -12,6 +12,10 @@
 //! - `link`: a connection to a machine's daemon (the hello)
 //! - `service`: the held link per machine, its rows and forwarded calls
 //! - `api`: the `machines.*` methods
+//! - `leave`: `machine rm` (a revoke on the authority, a proposal from
+//!   another member) and the step-9 removal over the links
+//! - `changes`: signed membership changes pushed (`fleet.sync`), proposals
+//!   (`fleet.propose`) and their approval (`membership.pending|approve|deny`)
 //! - `forward`: requests with `machine` (quick calls, verbs) and the
 //!   federated resolve and sandboxes listing
 //! - `cli`: the CLI's side: where a `<name>` points, `--machine`, and a
@@ -34,6 +38,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod changes;
 pub mod cli;
 pub mod forward;
 pub mod inbound;

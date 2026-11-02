@@ -259,9 +259,20 @@ limitation means editing this file in the same commit.
   socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
 - An introduction made by a non-authority member (`machine add` run on
-  it) isn't sent to the authority yet (fleet plan step 10a.6), so the
-  introduced member stays capped.
-  → [fleet](architecture/daemon/fleet.md#membership-log); `membership_api::sign_into`
+  it) is proposed to the authority only when the adding host links to it
+  directly (else the add's answer says why, and the introduced member
+  stays capped until it's proposed some other way); one the machine signs
+  for this host (this host joining a non-authority member's fleet) isn't
+  proposed at all. → [fleet](architecture/daemon/fleet.md#approvals-and-pushes);
+  `machines::api::add`, `machines::changes::propose`
+- Membership proposals (`fleet.propose`: a member's `machine rm`, its
+  own leave, an introduction) reach the authority only over a direct link
+  to it until fleet step 10b routes over the graph; without one they're
+  refused naming the authority.
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `machines::changes::propose`
+- A member only introduced (capped, not in the log) can't be removed with
+  `machine rm`: the log has no key of it to revoke; it goes once its
+  introducer is revoked. → [fleet](architecture/daemon/fleet.md); `machines::changes::revoke`
 - `machine add` has no `--command`: it sets `command` only when it finds or
   installs devsandbox in `~/.local/bin` off the login `PATH`; a remote devsandbox
   anywhere else off `PATH` is set by hand in `machines.toml`.
@@ -384,16 +395,21 @@ limitation means editing this file in the same commit.
   host go with it, not kept as `unreachable`, and come back (forwards
   not) when it dials again.
   → [machines](architecture/daemon/machines.md#inbound-neighbors); `forwards::Known`
-- A member removed while unreachable (`machine rm` on the hub, `leave`
-  `unreachable`) keeps its `hub` and its registry entries, so when it
-  comes back it re-links as before. `machine rm` it again once it's
+- A member removed while unreachable (`leave` `unreachable`) keeps its
+  `hub` and its registry entries; its links are refused once the peer
+  holds the revoke, and it never takes a log that revokes it except from
+  a push (`fleet.sync`). `machine rm` it again on the authority once it's
   reachable, or run `machine rm <its name>` on it.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::rm`
-- Members the hub has no link to learn of a removal only with routing
-  (fleet step 10): `fleet.forget` goes to the machines the hub links to
-  directly, so another member still linked to the removed one keeps that
-  link.
+- Members the hub has no link to keep their registry entry for a removed
+  member until routing (fleet step 10b): `fleet.forget` goes to the
+  machines the hub links to directly. The revoke reaches them (a push, or
+  their next link's head comparison), so that entry's link is refused.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::remove`
+- A member that leaves (`machine rm <itself>`) is forgotten by the other
+  members only once the authority approves its proposed revoke; until
+  then only the hub drops its entry.
+  → [fleet](architecture/daemon/fleet.md); `machines::leave::rm`
 - Placement's `has_image` reads only watched roots' snapshots (this
   host's while watched, a machine's last pushed), and `has_repo` is never
   filled (no repo locality yet).

@@ -361,12 +361,12 @@ pub(crate) mod tests {
     use crate::serve::proto::Version;
     use crate::serve::snapshots::Join;
 
-    fn connect(dir: &Path) -> Conn {
+    pub(crate) fn connect(dir: &Path) -> Conn {
         let v = Version { semver: "0.6.0".into(), build: 1 };
         client::connect_with(dir, "test", &v, client::START_TIMEOUT, &|_, _| Ok(())).unwrap()
     }
 
-    fn wait_for(what: &str, within: Duration, mut cond: impl FnMut() -> bool) {
+    pub(crate) fn wait_for(what: &str, within: Duration, mut cond: impl FnMut() -> bool) {
         let deadline = Instant::now() + within;
         while !cond() {
             assert!(Instant::now() < deadline, "timed out waiting: {what}");
@@ -451,17 +451,17 @@ pub(crate) mod tests {
     /// `box` (K, its root K's own), reached through [`peer_transport`]. Both
     /// in one membership log (`lap` its authority, `box` its hub), K named
     /// `box` there.
-    struct Pair {
-        base: PathBuf,
-        k_dir: PathBuf,
-        l_dir: PathBuf,
+    pub(crate) struct Pair {
+        pub(crate) base: PathBuf,
+        pub(crate) k_dir: PathBuf,
+        pub(crate) l_dir: PathBuf,
         k_own: PathBuf,
         l_registry: PathBuf,
-        dialed: Arc<Dialed>,
+        pub(crate) dialed: Arc<Dialed>,
         daemons: Vec<std::thread::JoinHandle<Result<Exit>>>,
     }
 
-    fn daemon_opts(base: &Path, name: &str) -> (Options, PathBuf) {
+    pub(crate) fn daemon_opts(base: &Path, name: &str) -> (Options, PathBuf) {
         let data = base.join(format!("{name}-data"));
         std::fs::create_dir_all(&data).unwrap();
         let mut o = opts(1, 60_000);
@@ -486,7 +486,7 @@ pub(crate) mod tests {
 
         /// [`Pair::with`], the membership logs written by `fleet` (given K's
         /// and L's `member.toml`) once both options are set.
-        fn build(
+        pub(crate) fn build(
             tag: &str,
             k_entries: Vec<Entry>,
             k: impl FnOnce(&mut Options),
@@ -533,12 +533,12 @@ pub(crate) mod tests {
             rows.as_array().unwrap().iter().find(|r| r["name"] == "box").cloned().unwrap()
         }
 
-        fn wait_box(&self, what: &str, cond: impl Fn(&Value) -> bool) -> Value {
+        pub(crate) fn wait_box(&self, what: &str, cond: impl Fn(&Value) -> bool) -> Value {
             wait_for(what, Duration::from_secs(10), || cond(&self.box_row()));
             self.box_row()
         }
 
-        fn finish(self) {
+        pub(crate) fn finish(self) {
             for (dir, daemon) in [&self.l_dir, &self.k_dir].into_iter().zip(self.daemons.into_iter().rev()) {
                 assert!(connect(dir).call("shutdown", json!({})).unwrap().error.is_none());
                 assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
@@ -548,7 +548,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn connected(r: &Value) -> bool {
+    pub(crate) fn connected(r: &Value) -> bool {
         r["state"] == "connected"
     }
 
@@ -737,7 +737,7 @@ pub(crate) mod tests {
     }
 
     /// `rows`' entry named `name`, if any.
-    fn named(rows: &Value, name: &str) -> Option<Value> {
+    pub(crate) fn named(rows: &Value, name: &str) -> Option<Value> {
         rows.as_array()?.iter().find(|r| r["name"] == name).cloned()
     }
 
@@ -1258,42 +1258,54 @@ pub(crate) mod tests {
     }
 
     /// `who`'s (`k` or `l`) `member.toml` hub, and its registry's names.
-    fn member_and_registry(pair: &Pair, who: &str) -> (crate::serve::fleet::member::Hub, Vec<String>) {
+    pub(crate) fn member_and_registry(pair: &Pair, who: &str) -> (crate::serve::fleet::member::Hub, Vec<String>) {
         let data = pair.base.join(format!("{who}-data"));
         let hub = crate::serve::fleet::member::load(&data.join("member.toml")).unwrap().unwrap().hub();
         let names = crate::serve::machines::load(&data.join("machines.toml")).unwrap().into_iter().map(|e| e.name).collect();
         (hub, names)
     }
 
-    fn lap_on_k(pair: &Pair) -> Option<Value> {
+    pub(crate) fn lap_on_k(pair: &Pair) -> Option<Value> {
         named(&connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap(), "lap")
     }
 
-    /// The hub L removes member K: K hears `fleet.leave` over the link, so
-    /// its `hub` is cleared and its own entries dropped; L unlinks it, and
-    /// the link ends.
+    /// L, the authority and the hub, removes member K: it signs K's
+    /// revoke, pushes it to K (`fleet.sync`), then K hears `fleet.leave`
+    /// over the link, which it follows since its log revokes its key: its
+    /// `hub` is cleared, its log and its own entries dropped; L unlinks it,
+    /// and the link ends.
     #[test]
-    fn the_hubs_rm_of_a_member_reaches_it() {
+    fn the_authoritys_rm_of_a_member_revokes_and_removes_it() {
         use crate::serve::fleet::member::Hub;
         let pair = fleet_pair("dial-rm", "lap", "self");
         pair.wait_box("box connected", connected);
         let r = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap();
         assert!(r.error.is_none(), "{r:?}");
         let answer = r.result.unwrap();
-        assert_eq!(answer, json!({"type": "removed", "name": "box", "hub": "lap", "leave": "told", "error": null, "forgot": [], "missed": []}));
-        crate::serve::dts::assert_variant("MachineRmRemoved", &answer);
+        let removed = json!({"name": "box", "hub": "lap", "leave": "told", "error": null, "forgot": [], "missed": []});
+        assert_eq!(
+            answer,
+            json!({"type": "revoked", "name": "box", "change": "revoke `box`", "pushed": ["box"], "unpushed": [], "removed": removed, "error": null})
+        );
+        crate::serve::dts::assert_variant("MachineRmRevoked", &answer);
         assert_eq!(member_and_registry(&pair, "k"), (Hub::None, vec![]), "K left: no hub, no entries");
+        assert!(test_support::read(&pair.base.join("k-data/member.toml")).is_none(), "K dropped its log");
         assert_eq!(member_and_registry(&pair, "l"), (Hub::This, vec![]), "L unlinked it");
+        let l_log = test_support::read(&pair.base.join("l-data/member.toml")).unwrap();
+        assert!(l_log.log.revoked_name("box"), "L's log revokes box");
         wait_for("lap gone on K", Duration::from_secs(10), || lap_on_k(&pair).is_none());
-        let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().error.unwrap();
-        assert_eq!(e.code, "not-found");
+        // Again: the revoke stands, nothing more to reach.
+        let r = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().result.unwrap();
+        assert_eq!((&r["pushed"], &r["removed"]["leave"]), (&json!([]), &json!("unreachable")));
+        assert_eq!(test_support::read(&pair.base.join("l-data/member.toml")).unwrap(), l_log, "signed once");
         pair.finish();
     }
 
     /// `fleet.*` goes by who asks: from a peer that isn't this host's hub
     /// (or from a local client) `fleet.forget` / `fleet.leave` are refused
-    /// and nothing changes; from the hub they run. The hub itself can't be
-    /// removed by a member.
+    /// and nothing changes; from the hub they still follow only a revoke.
+    /// The hub removes no member its log hasn't revoked, and the hub itself
+    /// isn't removed.
     #[test]
     fn fleet_forget_from_a_non_hub_peer_is_refused() {
         use crate::serve::fleet::member::Hub;
@@ -1314,15 +1326,16 @@ pub(crate) mod tests {
             assert_eq!(e.code, "denied", "{method} from a local client: {e:?}");
         }
         let e = lap.conn.call("fleet.rm", json!({"name": "box"})).unwrap().error.unwrap();
-        assert_eq!((e.code.as_str(), e.message.as_str()), ("denied", "`box` is the hub: it leaves on its own host"));
+        assert_eq!(e.code, "denied");
+        assert!(e.message.contains("`box`: its key isn't revoked in the hub's membership log"), "{}", e.message);
         assert_eq!(member_and_registry(&pair, "k"), (Hub::This, vec!["x".to_string()]), "nothing changed on K");
         // From the member's own `machine rm`, too.
         let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().error.unwrap();
         assert_eq!(e.code, "denied");
-        // K on L: L's hub, admitted.
+        // K on L: L's hub, but `fleet.forget` follows a revoke L's log hasn't.
         let mut k = api_to(&endpoint::fleet_socket(&pair.k_dir, "lap"), "lap");
-        let r = k.conn.call("fleet.forget", json!({"name": "nobody"})).unwrap();
-        assert!(r.error.is_none(), "{r:?}");
+        let e = k.conn.call("fleet.forget", json!({"name": "nobody"})).unwrap().error.unwrap();
+        assert!(e.code == "denied" && e.message.contains("follows a revoke"), "{e:?}");
         drop((lap, k));
         pair.finish();
     }
@@ -1345,7 +1358,7 @@ pub(crate) mod tests {
         assert_eq!(
             answer,
             json!({
-                "type": "left", "name": "lap", "hub": "box", "error": null, "dropped": ["box"],
+                "type": "left", "name": "lap", "hub": "box", "error": null, "dropped": ["box"], "proposed": null,
                 "removed": {"name": "lap", "hub": "box", "leave": "leaving", "error": null, "forgot": [], "missed": null},
             })
         );

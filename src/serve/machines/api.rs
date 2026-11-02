@@ -40,7 +40,8 @@ use crate::serve::api::{ApiError, RootCandidate, parse};
 use crate::serve::capacity::Capacity;
 use crate::serve::fleet::identity::{PublicKey, Signer};
 use crate::serve::fleet::member::{self, Hub, MemberInfo};
-use crate::serve::fleet::membership::{Stored, Wire};
+use crate::serve::fleet::membership::{Introduction, Stored, Wire};
+use crate::serve::fleet::proposals::Change;
 use crate::serve::fleet::membership_api::{self, MembershipInfo};
 use crate::serve::snapshots::LinkState;
 
@@ -82,6 +83,10 @@ pub struct Ctx {
     /// `links.inbound` connection gets `links.cycle` and hangs up
     /// (`rm`, `fleet.forget`).
     pub end_inbound: Box<dyn Fn(&str) + Send + Sync>,
+    /// Tell the user on this host's desktop (a proposal waiting for
+    /// approval, `changes`): `devsbd::desktop` on the host side, else only
+    /// logged.
+    pub notify: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 /// Run `method` if it's a `machines.*` one; `None` otherwise.
@@ -124,6 +129,11 @@ pub struct Added {
     pub warning: Option<String>,
     /// The fleet both ends are in now, and who joined it.
     pub fleet: Fleet,
+    /// When this host (not the authority) introduced the machine: that
+    /// introduction proposed to the authority (`fleet.propose`, best
+    /// effort), its id there or why not.
+    #[serde(default)]
+    pub proposed: Option<super::changes::Proposed>,
 }
 
 /// One `machines.list` row: the registry entry, or an inbound neighbor up
@@ -315,9 +325,24 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
     if let Some(links) = &ctx.links {
         links.reload();
     }
+    let proposed = introduced_here(&ours, &here, &this_name, &entry.name).map(|(authority, introduction)| {
+        let name = introduction.name.clone();
+        match super::changes::propose(ctx, &authority, Change::Add { introduction }) {
+            Ok(id) => super::changes::Proposed { name, authority, id: Some(id), error: None },
+            Err(e) => super::changes::Proposed { name, authority, id: None, error: Some(e.message) },
+        }
+    });
     let warning = (version != ctx.version)
         .then(|| format!("{} runs devsandbox {version}, this is {}", entry.name, ctx.version));
-    to_value(Added { name: entry.name, roots: entry.roots, version, warning, fleet: plan.fleet })
+    to_value(Added { name: entry.name, roots: entry.roots, version, warning, fleet: plan.fleet, proposed })
+}
+
+/// The introduction of `name` this add signed here (by `me`, in `after`, not
+/// in `before`), with the authority to propose it to (pure).
+fn introduced_here(before: &Stored, after: &Stored, me: &str, name: &str) -> Option<(String, Introduction)> {
+    let i = after.introductions.iter().find(|i| i.name == name && i.introducer == me && !before.introductions.contains(i))?;
+    let authority = after.log.membership()?.authority.0.clone();
+    Some((authority, i.clone()))
 }
 
 /// This host's member name and hub, from its `member.toml`.
@@ -832,7 +857,7 @@ mod tests {
         let via = format!("{}/broken/../.devsandboxes", pair.home.display());
         let r = pair.add(json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes", "~", via]}));
         let fleet = json!({"hub": "lap", "joined": "new"});
-        assert_eq!(r, json!({"name": "box", "roots": [dot, home], "version": "0.6.0", "warning": null, "fleet": fleet}));
+        assert_eq!(r, json!({"name": "box", "roots": [dot, home], "version": "0.6.0", "warning": null, "fleet": fleet, "proposed": null}));
         assert_eq!(pair.registry(), vec![Entry { roots: vec![dot.clone(), home.clone()], ..Entry::ssh("box", "me@box") }]);
         assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
         // One log on both ends, signed here: `lap` the authority and the
@@ -945,7 +970,8 @@ mod tests {
 
     /// A member of `k`'s fleet (not its authority) adds a machine: it
     /// introduces it (signed here), and the machine takes the log and the
-    /// introduction, its hub `k` from the log.
+    /// introduction, its hub `k` from the log. The introduction isn't
+    /// proposed to `k`, which this host has no link to: the answer says why.
     #[test]
     fn the_machine_joins_this_hosts_fleet_under_its_name() {
         let mut pair = Pair::fleets("mach-join-target", named("lap", "k"), named("box", ""), |this, _| {
@@ -961,6 +987,9 @@ mod tests {
         assert_eq!(here.log.head().len, 2, "the log as it was: only `k` signs it");
         let i = &here.introductions[0];
         assert_eq!((i.name.as_str(), i.key, i.introducer.as_str()), ("b2", pair.machine_key().public_key(), "lap"));
+        let proposed = &r["proposed"];
+        assert_eq!((&proposed["name"], &proposed["authority"], &proposed["id"]), (&json!("b2"), &json!("k"), &Value::Null));
+        assert!(proposed["error"].as_str().unwrap().contains("isn't directly linked"), "{proposed}");
         pair.finish();
     }
 
@@ -972,6 +1001,7 @@ mod tests {
         });
         let r = pair.add(json!({"hub": false, "target": "me@box", "roots": []}));
         assert_eq!(r["fleet"], json!({"hub": "lap", "joined": "target"}));
+        assert_eq!(r["proposed"], Value::Null, "signed here: nothing to propose");
         assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!(here, there);
@@ -1219,9 +1249,11 @@ mod tests {
         let probed = Probed { version: "0.6.0".into(), protocol: 1, roots: vec![root()], key, fingerprint: key.fingerprint() };
         assert_matches("MachineProbe", &to_value(probed).unwrap());
         let fleet = Fleet { hub: "k".into(), joined: join::Joined::Target };
-        let added = Added { name: "m".into(), roots: vec!["/cfg".into()], version: "0.6.0".into(), warning: None, fleet };
+        let proposed = super::super::changes::Proposed { name: "m".into(), authority: "lap".into(), id: Some(1), error: None };
+        let added = Added { name: "m".into(), roots: vec!["/cfg".into()], version: "0.6.0".into(), warning: None, fleet, proposed: Some(proposed) };
         let added = to_value(added).unwrap();
         assert_matches("MachineAdded", &added);
+        assert_matches("FleetProposed", &added["proposed"]);
         assert_matches("MachineFleet", &added["fleet"]);
         assert_eq!(union_members("FleetJoined"), ["'target'", "'this'", "'new'", "'same'"]);
         for joined in [join::Joined::Target, join::Joined::This, join::Joined::New, join::Joined::Same] {
@@ -1260,10 +1292,36 @@ mod tests {
             missed: vec![missed],
         };
         assert_matches("FleetRemoved", &to_value(removed.clone()).unwrap());
-        assert_variant("MachineRmRemoved", &to_value(RmAnswer::Removed(removed.clone())).unwrap());
-        let left = Left { name: "lap".into(), hub: "k".into(), removed: Some(removed), error: None, dropped: vec!["k".into()] };
+        use super::super::changes::{Approved, Proposed, Signed};
+        let signed = Signed {
+            name: "m".into(),
+            change: "revoke `m`".into(),
+            pushed: vec!["k".into()],
+            unpushed: vec![Missed { name: "w".into(), error: "down".into() }],
+            removed: Some(removed.clone()),
+            error: None,
+        };
+        assert_variant("MachineRmRevoked", &to_value(RmAnswer::Revoked(signed.clone())).unwrap());
+        assert_matches("FleetSigned", &to_value(signed.clone()).unwrap());
+        assert_matches("MembershipApproved", &to_value(Approved { id: 2, signed }).unwrap());
+        let proposed = Proposed { name: "m".into(), authority: "lap".into(), id: Some(2), error: None };
+        assert_variant("MachineRmProposed", &to_value(RmAnswer::Proposed(proposed.clone())).unwrap());
+        let left = Left { name: "lap".into(), hub: "k".into(), removed: Some(removed), error: None, dropped: vec!["k".into()], proposed: Some(proposed) };
         assert_variant("MachineRmLeft", &to_value(RmAnswer::Left(left)).unwrap());
-        assert_eq!(union_members("MachineRmResult"), ["MachineRmRemoved", "MachineRmLeft"]);
+        assert_eq!(union_members("MachineRmResult"), ["MachineRmRevoked", "MachineRmProposed", "MachineRmLeft"]);
+        use crate::serve::fleet::proposals::{Change, Proposal};
+        let p = Proposal { id: 2, from: "box".into(), op: Change::Revoke { name: "m".into() }, at: 1 };
+        let p = to_value(p).unwrap();
+        assert_matches("FleetProposal", &p);
+        assert_variant_kind("FleetChangeRevoke", &p["op"]);
+        let s = crate::serve::fleet::membership_api::test_support::fleet("lap", &SigningKey::from_seed([1; 32]), "lap", &[]);
+        let g = s.log.membership().unwrap().genesis;
+        let i = crate::serve::fleet::membership::Introduction::sign(&g, "new", key, "lap", &SigningKey::from_seed([1; 32]));
+        assert_variant_kind("FleetChangeAdd", &to_value(Change::Add { introduction: i }).unwrap());
+        assert_eq!(union_members("FleetChange"), ["FleetChangeAdd", "FleetChangeRevoke"]);
+        let synced = super::super::changes::Synced { changed: true, head: s.log.head() };
+        assert_matches("FleetSynced", &to_value(synced).unwrap());
+        assert_matches("FleetQueued", &to_value(super::super::changes::Queued { id: 1, pending: true }).unwrap());
         assert_eq!(union_members("FleetHeard"), ["'told'", "'leaving'", "'unreachable'"]);
         for heard in [Heard::Told, Heard::Leaving, Heard::Unreachable] {
             let wire = to_value(heard).unwrap();
@@ -1280,11 +1338,24 @@ mod tests {
             ("fleet.place", "FleetPlaced"),
             ("fleet.leave", "OkResult"),
             ("fleet.forget", "OkResult"),
+            ("fleet.propose", "FleetQueued"),
+            ("fleet.sync", "FleetSynced"),
+            ("membership.pending", "FleetProposal[]"),
+            ("membership.approve", "MembershipApproved"),
+            ("membership.deny", "OkResult"),
             ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
         ] {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
             assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");
         }
+    }
+
+    /// One variant of a `kind`-tagged union, as `dts::assert_variant` checks
+    /// a `type`-tagged one.
+    fn assert_variant_kind(iface: &str, value: &Value) {
+        crate::serve::dts::assert_matches(iface, value);
+        let tag = value["kind"].as_str().unwrap();
+        assert_eq!(crate::serve::dts::prop_type(iface, "kind"), Some(format!("'{tag}'")), "{iface}");
     }
 }
