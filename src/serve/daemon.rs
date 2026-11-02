@@ -359,6 +359,14 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             })
         },
+        end_inbound: {
+            let hooked = Arc::clone(&hooked);
+            Box::new(move |name: &str| {
+                if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
+                    s.end_inbound(name);
+                }
+            })
+        },
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
@@ -768,8 +776,27 @@ impl Shared {
         }
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
-                p.cycle |= p.inbound;
-                p.inbound
+                if p.inbound.is_some() {
+                    p.cycle = Some(None);
+                }
+                p.inbound.is_some()
+            });
+        }
+    }
+
+    /// Inbound neighbor `name` is out of this host's fleet (`machine rm`,
+    /// `fleet.forget`): its `fleet-link`'s held `links.inbound` connection
+    /// gets `links.cycle` saying so, and it hangs up the link.
+    fn end_inbound(&self, name: &str) {
+        log(&format!("{name} is out of this host's fleet: its inbound link ends"));
+        let why = format!("`{name}` is out of this host's fleet: the link ends");
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                let hit = p.inbound.as_deref() == Some(name);
+                if hit {
+                    p.cycle = Some(Some(why.clone()));
+                }
+                hit
             });
         }
     }
@@ -1142,10 +1169,12 @@ struct Pending {
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
     /// The connection holds a `links.inbound` announce (a `fleet-link
-    /// --peer`'s): [`Shared::set_hub`] cycles it.
-    inbound: bool,
-    /// `links.cycle`: this host's hub changed, the `fleet-link` hangs up.
-    cycle: bool,
+    /// --peer`'s) of this neighbor: [`Shared::set_hub`] cycles it, as
+    /// [`Shared::end_inbound`] does for its name.
+    inbound: Option<String>,
+    /// `links.cycle`, with why when it isn't this host's hub changing: the
+    /// `fleet-link` hangs up.
+    cycle: Option<Option<String>>,
     /// A `Peer` connection's peer, and where its reach is read from: its
     /// snapshots are cut to that reach, read per push
     /// (`lent::filter_snapshot`), by the notifier.
@@ -1169,7 +1198,7 @@ impl Pending {
             || self.forwards
             || self.forwards_status.is_some()
             || self.closing.is_some()
-            || self.cycle
+            || self.cycle.is_some()
     }
 
     fn take(&mut self) -> Vec<Notification> {
@@ -1192,8 +1221,12 @@ impl Pending {
         if let Some(line) = self.forwards_status.take() {
             out.push(Notification { method: "forwards.status".into(), params: json!({ "line": line }) });
         }
-        if std::mem::take(&mut self.cycle) {
-            out.push(Notification { method: crate::commands::fleet_link::LINKS_CYCLE.into(), params: json!({}) });
+        if let Some(why) = self.cycle.take() {
+            let params = match why {
+                Some(why) => json!({ "why": why }),
+                None => json!({}),
+            };
+            out.push(Notification { method: crate::commands::fleet_link::LINKS_CYCLE.into(), params });
         }
         if let Some(reason) = self.closing.take() {
             out.push(Notification { method: "closing".into(), params: json!({ "reason": reason }) });
@@ -1408,6 +1441,10 @@ struct ConnState {
     /// `links.inbound`'s announce: its neighbor is up while this
     /// connection is (a repeat replaces it).
     inbound: Option<machines::inbound::Guard>,
+    /// What the links do once this request's answer is out
+    /// (`machines::leave::After`): a `fleet.*` call whose change ends the
+    /// link it came on.
+    after: Option<machines::leave::After>,
 }
 
 impl ConnState {
@@ -1434,6 +1471,7 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
         buffered: false,
         handoff: None,
         inbound: None,
+        after: None,
     };
     let mut reader = BufReader::new(stream);
     loop {
@@ -1455,7 +1493,15 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
                 None => break,
             }
         };
-        if conn.out.send(&response).is_err() || too_long {
+        let sent = conn.out.send(&response);
+        if let Some(after) = conn.after.take() {
+            // The answer goes back over the link this ends: let it leave.
+            std::thread::sleep(AFTER_ANSWER);
+            if let Some(ctx) = shared.machines.as_ref() {
+                machines::leave::apply(after, ctx);
+            }
+        }
+        if sent.is_err() || too_long {
             conn.handoff = None;
             break;
         }
@@ -1479,6 +1525,10 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         Ok(req) => req,
         Err(e) => return Some(Response::err(None, "invalid", format!("not a request: {e}"))),
     };
+    // By who the peer is, not by the trust table.
+    if req.method.starts_with("fleet.") {
+        return Some(fleet_call(req, shared, conn));
+    }
     // A remote caller: the trust table, its params confined, before anything
     // else looks at the request.
     let reach = match &conn.table {
@@ -1587,6 +1637,39 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
     })
 }
 
+/// How long a [`ConnState::after`] waits once its answer is written.
+const AFTER_ANSWER: Duration = Duration::from_millis(300);
+
+/// `fleet.*` (docs/reference/api.md, *fleet*): admitted by who the peer is
+/// (`lent::admit_fleet`: this host's hub, its machines), never from a
+/// local client, then run by `machines::leave::fleet_call`; what it ends
+/// of the links waits for the answer ([`ConnState::after`]).
+fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
+    let from = match &conn.table {
+        Table::Peer(peer) => Some(peer.name.clone()),
+        Table::Full => None,
+    };
+    let ctx = shared.machines.as_ref();
+    let is_machine = |name: &str| {
+        ctx.is_some_and(|m| m.inbound.contains(name) || machines::load(&m.registry).is_ok_and(|e| e.iter().any(|e| e.name == name)))
+    };
+    let hub = lock_hub(&shared.hub).clone();
+    if let Err(e) = lent::admit_fleet(&req.method, from.as_deref(), &hub, from.as_deref().is_some_and(is_machine)) {
+        log(&format!("{}: refused {} from {}: {}", conn.label(), req.method, from.as_deref().unwrap_or("a local client"), e.message));
+        return Response::err(req.id, e.code, e.message);
+    }
+    let (Some(ctx), Some(from)) = (ctx, from) else {
+        return Response::err(req.id, "failed", "this daemon has no machines registry");
+    };
+    log(&format!("{}: {} from {from}", conn.label(), req.method));
+    let (answer, after) = machines::leave::fleet_call(&req.method, req.params, &from, ctx);
+    conn.after = after;
+    match answer {
+        Ok(result) => Response::ok(req.id, result),
+        Err(e) => Response::err(req.id, e.code, e.message),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct InboundParams {
     peer: String,
@@ -1621,7 +1704,7 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
             if let Some(e) = entries.iter().find(|e| e.name == p.peer) {
                 let msg = format!(
                     "`{}` is already a machine here ({}): a link from a machine of the same name is refused; \
-                     `devsandbox machine rm {}` here, or another `name` in its member.toml",
+                     `devsandbox machine unlink {}` here, or another `name` in its member.toml",
                     p.peer,
                     e.label(),
                     p.peer
@@ -1639,8 +1722,9 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
     let guard = m.inbound.announce(&p.peer, &p.version, p.hub);
     let set_roots = guard.roots_setter();
     conn.inbound = Some(guard);
+    let name = p.peer.clone();
     conn.out.post(|p| {
-        p.inbound = true;
+        p.inbound = Some(name);
         false
     });
     log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.hub { ", the hub" } else { "" }));

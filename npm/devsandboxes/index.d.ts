@@ -844,6 +844,56 @@ export interface MachineFleet {
   joined: FleetJoined;
 }
 
+/**
+ * How a removed member heard of it: `told` it answered `fleet.leave`, `leaving` it asked itself,
+ * `unreachable` it wasn't reached (it keeps its hub and entries until it is).
+ */
+export type FleetHeard = 'told' | 'leaving' | 'unreachable';
+
+/** A member a removal didn't reach. */
+export interface FleetMissed {
+  name: string;
+  error: string;
+}
+
+/** `fleet.rm`'s answer: what a removal on the hub reached. */
+export interface FleetRemoved {
+  /** Who's out of the fleet. */
+  name: string;
+  /** The hub that ran it. */
+  hub: string;
+  leave: FleetHeard;
+  /** Why `name` wasn't reached (`leave` is `unreachable`). */
+  error: string | null;
+  /** The other members the hub links to that dropped it. */
+  forgot: string[];
+  /** Those it couldn't reach. */
+  missed: FleetMissed[];
+}
+
+/** `machines.rm`: the hub took the machine out of the fleet. */
+export interface MachineRmRemoved extends FleetRemoved {
+  type: 'removed';
+}
+
+/** `machines.rm` of this host's own name: it left its fleet. */
+export interface MachineRmLeft {
+  type: 'left';
+  /** This host's member name. */
+  name: string;
+  /** The hub of the fleet it left (its own name when it was the hub). */
+  hub: string;
+  /** The hub's answer to this host's `fleet.rm`; `null` when this host was the hub, or the hub wasn't reached. */
+  removed: FleetRemoved | null;
+  /** Why the hub wasn't reached. */
+  error: string | null;
+  /** This host's registry entries, dropped. */
+  dropped: string[];
+}
+
+/** `machines.rm`'s answer. */
+export type MachineRmResult = MachineRmRemoved | MachineRmLeft;
+
 /** `machines.get`'s answer (a registered machine or an inbound one): what an ssh command to the machine needs. */
 export interface MachineInfo {
   name: string;
@@ -1335,7 +1385,23 @@ export interface ApiMethods {
   'machines.list': { params: {}; result: MachineRow[] };
   /** Change a registered machine's settings; `not-found` for an unknown name. */
   'machines.set': { params: { name: string; agent: boolean }; result: OkResult };
-  'machines.rm': { params: { name: string }; result: OkResult };
+  /**
+   * Drop this host's link to a registered machine (it stays a fleet member); `not-found` for an unknown name,
+   * `denied` for an inbound one (its link is dialed from there).
+   */
+  'machines.unlink': { params: { name: string }; result: OkResult };
+  /**
+   * Take a machine out of the fleet: run on the hub, sent there from a member (`failed` when the hub can't be
+   * reached); this host's own name leaves the fleet. `denied` for the hub from a member, or the hub leaving while
+   * it has machines; `not-found` for a name neither linked nor seen through the hub.
+   */
+  'machines.rm': { params: { name: string }; result: MachineRmResult };
+  /** On the hub, from one of its machines: `machines.rm` sent from a member. Never from a local client. */
+  'fleet.rm': { params: { name: string }; result: FleetRemoved };
+  /** From this host's hub only: clear `hub` and drop every registry entry; the links end once answered. */
+  'fleet.leave': { params: {}; result: OkResult };
+  /** From this host's hub only: drop the entry for `name`, or end its inbound link. */
+  'fleet.forget': { params: { name: string }; result: OkResult };
   /**
    * One registered machine, to build an ssh command to it; `not-found` for an unknown name. `agent`, the
    * caller's absolute `SSH_AUTH_SOCK`, becomes the agent this host serves the machine's `AGENT` streams with.

@@ -13,7 +13,8 @@ touching anything that takes a `machine` param or a `m/name`.
 Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 `RawEntry`, `path`, `parse`, `update`, `inbound.rs` (`Neighbors`, `Guard`),
 `check_name`, `Where`, `parse_name`), `join.rs` (`plan`, `Plan`, `Fleet`,
-`Joined`), `ssh.rs`
+`Joined`), `leave.rs` (`plan`, `Plan`, `Here`, `rm`, `fleet_call`,
+`After`, `apply`, `RmAnswer`, `Removed`, `Left`), `ssh.rs`
 (`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
 `parse_target`, `Dial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
@@ -42,12 +43,13 @@ optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
-[`machine add`](#devsandbox-machine-addlssetrmtrustroots)) through `machines.add`'s
+[`machine add`](#devsandbox-machine-addlssetunlinkrmtrustroots)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
 dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
 written only when on). Only the daemon writes it
-(`machines.add`/`set`/`rm`): locked read-modify-write on `machines.lock`, temp
+(`machines.add`/`set`/`unlink`/`rm`, and `fleet.leave`/`fleet.forget`
+from the hub, [fleet.md](fleet.md), *How a machine leaves*): locked read-modify-write on `machines.lock`, temp
 file + rename (`serve::locked_file::update`), since two daemons overlap during a handoff. A file that
 doesn't parse is logged and changes nothing. The CLI reads it only to know
 which machines exist (`cli::machine_names`), adding the inbound ones a
@@ -61,7 +63,7 @@ Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
 A machine's registry name is its member name (fleet plan decision 35):
 without `--name`, `machines.add` takes it from the machine's `member.get`;
 `--name` renames the machine only while it joins a fleet by that add
-([`machine add`](#devsandbox-machine-addlssetrmtrustroots)). `parse_name` splits a CLI
+([`machine add`](#devsandbox-machine-addlssetunlinkrmtrustroots)). `parse_name` splits a CLI
 `<name>`: `m/x` → `Where::Machine`, `@/x` → `Where::Local`, bare →
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
@@ -99,8 +101,13 @@ held link's. Its agent direction is the dialer's (fleet plan decision
 30): its agent reaches this host's instances while its entry for this
 host has `agent` on there; this host's never reaches it, so
 `machines.set` refuses its `agent` (`api::inbound_agent`, `denied`), as
-the Machines tab's `a` does, and `machines.rm` refuses it (it goes with
-its link: `machine rm` there). When the neighbor goes, so does the
+the Machines tab's `a` does, and `machines.unlink` refuses it (it goes
+with its link: `devsandbox machine unlink <this host>` run on it).
+`machines.rm` takes it out of the fleet like any machine
+([fleet.md](fleet.md), *How a machine leaves*): there, or once its `fleet.leave`
+or `fleet.forget` came, this host ends its link (`Ctx::end_inbound`,
+`daemon::Shared::end_inbound`: `links.cycle {why}` on its `fleet-link`'s
+held `links.inbound` connection, which hangs up). When the neighbor goes, so does the
 machine: its link is stopped and its rows dropped (not kept as
 `unreachable`: nothing here could reach it again), and its forwards go
 (`forwards::Known`). `devsandbox machine ls` shows `inbound` as the
@@ -130,7 +137,7 @@ target over ssh with the argvs in `ssh.rs`:
   its sentinel line first ([Link handshake](#link-handshake)).
 - `add_cli_argv`: `-T`, no `BatchMode` (a person is there); `machine
   add`'s `machine roots add` there
-  ([`devsandbox machine add…`](#devsandbox-machine-addlssetrmtrustroots)).
+  ([`devsandbox machine add…`](#devsandbox-machine-addlssetunlinkrmtrustroots)).
 - `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
   POSIX script run for a person at the CLI ([Install](#install)); no
   `BatchMode`. A script is one line: the login shell may be csh, which
@@ -166,7 +173,8 @@ default) this host reaches the machine's own roots and its fleet root
 for this host (`fleet/<this host>/` there) only (its own roots being
 those its instances name, plus its `member.toml` `roots`, which `machine
 add` records there), never `machines.*`, `member.*`, `shutdown` or an
-edit of those configs; under `full`, everything but `member.*`,
+edit of those configs (`fleet.*` goes by who the caller is, whatever the
+trust: [fleet](fleet.md#the-trust-table)); under `full`, everything but `member.*`,
 `link.*` and `links.*`. A verb this way runs with the machine daemon's
 own env (the peer's `env`, `fleet::lent::Peer`), not a login shell's,
 its `SSH_AUTH_SOCK` this host's agent relayed there
@@ -181,7 +189,7 @@ login there.
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
 copies this binary there, for `machine add`
-([`devsandbox machine add|ls|set|rm|trust|roots`](#devsandbox-machine-addlssetrmtrustroots)). The
+([`devsandbox machine add|ls|set|unlink|rm|trust|roots`](#devsandbox-machine-addlssetunlinkrmtrustroots)). The
 CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
@@ -553,7 +561,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   shell; [fleet](fleet.md#pty), *Service terminals*), never re-dialed (no
   session), refused without a terminal.
 
-## `devsandbox machine add|ls|set|rm|trust|roots`
+## `devsandbox machine add|ls|set|unlink|rm|trust|roots`
 
 A client of `machines.*` (and, for `trust` and `roots`, `member.*`) only,
 never in-process (`src/commands/machine.rs`).
@@ -623,7 +631,14 @@ on|off`; both are refused for an inbound one
 column, and `inbound` as an inbound machine's `TARGET`; `CAPACITY` is the
 machine's last [capacity report](fleet.md#capacity)
 (`machines.list`'s `capacity`, `-` before one came), the over-cap note in
-parentheses. `rm` forgets the machine (refused for an inbound one).
+parentheses. `unlink <name>` (`machines.unlink`) drops this host's link to
+a registered machine, which stays a fleet member; refused for an inbound
+one, prints `unlinked <name>`. `rm <name>` (`machines.rm`) takes the
+machine out of the fleet, and `rm` of this host's own member name leaves
+it ([fleet.md](fleet.md), *How a machine leaves*); it prints one line per
+outcome (`rm_lines`): who was removed from whose fleet, whether the
+machine was told or not reached (and why), each member that forgot it
+or wasn't reached, and on a leave the entries this host dropped.
 
 `trust [worker|full]` is about this host, not a registered machine: a
 client of `member.*` (this host's `member.toml`;

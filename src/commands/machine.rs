@@ -1,6 +1,6 @@
-//! `devsandbox machine add|ls|set|rm|trust|roots`
+//! `devsandbox machine add|ls|set|unlink|rm|trust|roots`
 //! (docs/architecture/daemon/machines.md, *`devsandbox machine
-//! add|ls|set|rm|trust|roots`*): a client of the daemon's `machines.*`,
+//! add|ls|set|unlink|rm|trust|roots`*): a client of the daemon's `machines.*`,
 //! never in-process, since the registry and the links are the daemon's.
 //! `machine trust` and `machine roots` are likewise clients of `member.*`
 //! (this host's `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
@@ -35,6 +35,7 @@ use crate::serve::fleet::member::{MemberInfo, Trust};
 use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::join::{Fleet, Joined};
+use crate::serve::machines::leave::{Heard, Removed, RmAnswer};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
 use crate::serve::machines::ssh;
 
@@ -414,11 +415,70 @@ fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
 
+pub fn unlink(name: &str) -> Result<()> {
+    let mut conn = connect()?;
+    let _: Value = call(&mut conn, "machines.unlink", json!({ "name": name }))?;
+    println!("unlinked {name}");
+    Ok(())
+}
+
+/// `machine rm`: `name` out of the fleet (or this host leaving it), one
+/// line per outcome.
 pub fn rm(name: &str) -> Result<()> {
     let mut conn = connect()?;
-    let _: Value = call(&mut conn, "machines.rm", json!({ "name": name }))?;
-    println!("removed {name}");
+    let answer: RmAnswer = call(&mut conn, "machines.rm", json!({ "name": name }))?;
+    for line in rm_lines(&answer) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// `machine rm`'s lines (pure).
+fn rm_lines(answer: &RmAnswer) -> Vec<String> {
+    match answer {
+        RmAnswer::Removed(r) => removed_lines(r),
+        RmAnswer::Left(l) => {
+            let mut lines = Vec::new();
+            if l.hub == l.name {
+                lines.push(format!("this host ({}) was the hub, alone: no fleet now", l.name));
+            } else {
+                match (&l.removed, &l.error) {
+                    (Some(r), _) => lines.extend(removed_lines(r).into_iter().skip(1)),
+                    (None, Some(why)) => {
+                        lines.push(format!("the hub {} wasn't reached ({why}): it still lists this host until `machine rm {}` there", l.hub, l.name))
+                    }
+                    (None, None) => {}
+                }
+                lines.push(format!("this host ({}) left {}'s fleet", l.name, l.hub));
+            }
+            if !l.dropped.is_empty() {
+                lines.push(format!("unlinked {}", l.dropped.join(", ")));
+            }
+            lines
+        }
+    }
+}
+
+fn removed_lines(r: &Removed) -> Vec<String> {
+    let mut lines = vec![format!("removed {} from {}'s fleet", r.name, r.hub)];
+    match r.leave {
+        Heard::Told => lines.push(format!("{} left the fleet", r.name)),
+        Heard::Leaving => {}
+        Heard::Unreachable => lines.push(format!(
+            "{} wasn't reached ({}): it keeps its links until `machine rm {}` reaches it, or `machine rm {}` runs on it",
+            r.name,
+            r.error.as_deref().unwrap_or("unknown"),
+            r.name,
+            r.name
+        )),
+    }
+    for m in &r.forgot {
+        lines.push(format!("{m} forgot {}", r.name));
+    }
+    for m in &r.missed {
+        lines.push(format!("{} wasn't reached ({}): it may still link to {}", m.name, m.error, r.name));
+    }
+    lines
 }
 
 fn connect() -> Result<Conn> {
@@ -604,6 +664,39 @@ mod tests {
         assert_eq!(line(Joined::This), "this host joined k's fleet");
         assert_eq!(line(Joined::New), "a fleet of two: this host (k) is the hub");
         assert_eq!(line(Joined::Same), "an extra link in k's fleet");
+    }
+
+    #[test]
+    fn rm_says_what_reached_whom() {
+        use crate::serve::machines::leave::{Left, Missed};
+        let removed = |leave, error: Option<&str>| Removed {
+            name: "box".into(),
+            hub: "k".into(),
+            leave,
+            error: error.map(String::from),
+            forgot: vec!["y".into()],
+            missed: vec![Missed { name: "z".into(), error: "no link to it".into() }],
+        };
+        assert_eq!(
+            rm_lines(&RmAnswer::Removed(removed(Heard::Told, None))),
+            ["removed box from k's fleet", "box left the fleet", "y forgot box", "z wasn't reached (no link to it): it may still link to box"]
+        );
+        let lines = rm_lines(&RmAnswer::Removed(removed(Heard::Unreachable, Some("down"))));
+        assert!(lines[1].starts_with("box wasn't reached (down): "), "{lines:?}");
+        let mut by_hub = removed(Heard::Leaving, None);
+        (by_hub.name, by_hub.forgot, by_hub.missed) = ("lap".into(), vec![], vec![]);
+        let left = |removed, error: Option<&str>| Left {
+            name: "lap".into(),
+            hub: "k".into(),
+            removed,
+            error: error.map(String::from),
+            dropped: vec!["k".into()],
+        };
+        assert_eq!(rm_lines(&RmAnswer::Left(left(Some(by_hub), None))), ["this host (lap) left k's fleet", "unlinked k"]);
+        let lines = rm_lines(&RmAnswer::Left(left(None, Some("no link to it"))));
+        assert_eq!(lines[0], "the hub k wasn't reached (no link to it): it still lists this host until `machine rm lap` there");
+        let alone = Left { name: "k".into(), hub: "k".into(), removed: None, error: None, dropped: vec![] };
+        assert_eq!(rm_lines(&RmAnswer::Left(alone)), ["this host (k) was the hub, alone: no fleet now"]);
     }
 
     #[test]

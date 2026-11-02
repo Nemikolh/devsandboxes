@@ -43,11 +43,12 @@ limitation means editing this file in the same commit.
   machine, and a link between two hosts naming different hubs is
   refused. `machine add` joins (step 9b): the end in no fleet takes the
   other's hub, two ends in none make a fleet of two, two hubs are
-  refused; nothing takes a member out of a fleet yet but `member.set
-  {hub: ""}` (`machine rm` and leaving: 9d). A member sees the fleet
-  through its hub (step 9c: the machines the hub links to show `via`
-  it). Next: the rest of membership (step 9), routing over the graph
-  (step 10).
+  refused. A member sees the fleet through its hub (step 9c: the
+  machines the hub links to show `via` it). `machine rm <m>` takes `m`
+  out of the fleet on the hub (a member's is sent there), `machine rm
+  <this host>` leaves, `machine unlink <m>` only drops this host's link
+  (step 9d). Next: a member's `run` placed by the hub (9e), routing over
+  the graph (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -336,8 +337,8 @@ limitation means editing this file in the same commit.
 - A machine added before `machine add` recorded its roots there has none
   in its `member.toml`, so its `worker` trust refuses those of its roots
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
-  add <root>…` on the machine, or `machine rm` + `machine add` it again.
-  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetrmtrustroots); `commands::machine::record_roots`
+  add <root>…` on the machine, or `machine unlink` + `machine add` it again.
+  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmtrustroots); `commands::machine::record_roots`
 - No command sets this host's member name (what the machines it dials
   know it by, `fleet-link --peer <name>`): it's `member.toml`'s `name`,
   set only through `member.set {name}` (API) or by hand, else the
@@ -378,6 +379,16 @@ limitation means editing this file in the same commit.
   host go with it, not kept as `unreachable`, and come back (forwards
   not) when it dials again.
   → [machines](architecture/daemon/machines.md#inbound-neighbors); `forwards::Known`
+- A member removed while unreachable (`machine rm` on the hub, `leave`
+  `unreachable`) keeps its `hub` and its registry entries, so when it
+  comes back it re-links as before. `machine rm` it again once it's
+  reachable, or run `machine rm <its name>` on it.
+  → [fleet](architecture/daemon/fleet.md); `machines::leave::rm`
+- Members the hub has no link to learn of a removal only with routing
+  (fleet step 10): `fleet.forget` goes to the machines the hub links to
+  directly, so another member still linked to the removed one keeps that
+  link.
+  → [fleet](architecture/daemon/fleet.md); `machines::leave::remove`
 - Placement's `has_image` reads only watched roots' snapshots (this
   host's while watched, a machine's last pushed), and `has_repo` is never
   filled (no repo locality yet).

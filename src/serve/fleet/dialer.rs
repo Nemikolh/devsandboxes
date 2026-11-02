@@ -684,7 +684,7 @@ pub(crate) mod tests {
     /// and its roots (its fleet root for K among them), `machines.get`
     /// answers it, a quick call and a forwarded verb run on L under L's
     /// trust for K (`box` there), K's federated snapshot has L's rows; its
-    /// `agent` and `rm` are refused here. L dropping its entry for K takes
+    /// `agent` and `unlink` are refused here. L dropping its entry for K takes
     /// the machine and its rows away on K.
     #[test]
     fn the_dialer_is_an_inbound_machine_on_the_dialed_host() {
@@ -715,7 +715,7 @@ pub(crate) mod tests {
         let mut k = connect(&pair.k_dir);
         let info = k.call("machines.get", json!({"name": "lap"})).unwrap().result.unwrap();
         assert_eq!(info, json!({"name": "lap", "kind": "inbound", "target": null, "command": null, "roots": [fleet_root], "agent": false}));
-        for (method, params) in [("machines.set", json!({"name": "lap", "agent": true})), ("machines.rm", json!({"name": "lap"}))] {
+        for (method, params) in [("machines.set", json!({"name": "lap", "agent": true})), ("machines.unlink", json!({"name": "lap"}))] {
             let e = k.call(method, params).unwrap().error.unwrap();
             assert!(e.code == "denied" && e.message.contains("links to this host from its end"), "{method}: {e:?}");
         }
@@ -751,7 +751,7 @@ pub(crate) mod tests {
 
         // L drops its entry for K: the link goes, and with it the machine
         // and its rows on K.
-        assert!(connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().error.is_none());
+        assert!(connect(&pair.l_dir).call("machines.unlink", json!({"name": "box"})).unwrap().error.is_none());
         wait_for("lap gone on K", Duration::from_secs(10), || named(&k_rows(), "lap").is_none());
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1031,5 +1031,120 @@ pub(crate) mod tests {
         drop((l, k, k_on_l, lap_on_k));
         pair.finish();
         let _ = std::fs::remove_dir_all(&base_remotes);
+    }
+
+    /// A [`Pair`] in one fleet: K (`box`, with a registry entry `x` it never
+    /// reaches) and L (`lap`), `k_hub` / `l_hub` their `hub`s.
+    fn fleet_pair(tag: &str, k_hub: &str, l_hub: &str) -> Pair {
+        use crate::serve::fleet::member::{Member, write_for_test};
+        let (k_hub, l_hub) = (k_hub.to_string(), l_hub.to_string());
+        Pair::with(
+            tag,
+            vec![Entry::ssh("x", "me@x")],
+            move |k| write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), hub: k_hub, ..Default::default() }),
+            move |l| write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: l_hub, ..Default::default() }),
+        )
+    }
+
+    /// `who`'s (`k` or `l`) `member.toml` hub, and its registry's names.
+    fn member_and_registry(pair: &Pair, who: &str) -> (crate::serve::fleet::member::Hub, Vec<String>) {
+        let data = pair.base.join(format!("{who}-data"));
+        let hub = crate::serve::fleet::member::load(&data.join("member.toml")).unwrap().unwrap().hub();
+        let names = crate::serve::machines::load(&data.join("machines.toml")).unwrap().into_iter().map(|e| e.name).collect();
+        (hub, names)
+    }
+
+    fn lap_on_k(pair: &Pair) -> Option<Value> {
+        named(&connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap(), "lap")
+    }
+
+    /// The hub L removes member K: K hears `fleet.leave` over the link, so
+    /// its `hub` is cleared and its own entries dropped; L unlinks it, and
+    /// the link ends.
+    #[test]
+    fn the_hubs_rm_of_a_member_reaches_it() {
+        use crate::serve::fleet::member::Hub;
+        let pair = fleet_pair("dial-rm", "lap", "self");
+        pair.wait_box("box connected", connected);
+        let r = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let answer = r.result.unwrap();
+        assert_eq!(answer, json!({"type": "removed", "name": "box", "hub": "lap", "leave": "told", "error": null, "forgot": [], "missed": []}));
+        crate::serve::dts::assert_variant("MachineRmRemoved", &answer);
+        assert_eq!(member_and_registry(&pair, "k"), (Hub::None, vec![]), "K left: no hub, no entries");
+        assert_eq!(member_and_registry(&pair, "l"), (Hub::This, vec![]), "L unlinked it");
+        wait_for("lap gone on K", Duration::from_secs(10), || lap_on_k(&pair).is_none());
+        let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().error.unwrap();
+        assert_eq!(e.code, "not-found");
+        pair.finish();
+    }
+
+    /// `fleet.*` goes by who asks: from a peer that isn't this host's hub
+    /// (or from a local client) `fleet.forget` / `fleet.leave` are refused
+    /// and nothing changes; from the hub they run. The hub itself can't be
+    /// removed by a member.
+    #[test]
+    fn fleet_forget_from_a_non_hub_peer_is_refused() {
+        use crate::serve::fleet::member::Hub;
+        let pair = fleet_pair("dial-forget", "self", "box");
+        pair.wait_box("box connected", connected);
+        wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(&pair).is_some_and(|r| connected(&r)));
+        let api_to = |socket: &Path, name: &str| {
+            let stream = link::connect(socket, channel::API).unwrap();
+            let duplex = crate::serve::machines::ssh::Duplex::socket(stream);
+            crate::serve::machines::link::handshake(name, duplex, Duration::from_secs(10), crate::serve::machines::link::Over::Link).unwrap()
+        };
+        // lap on K: not K's hub (K is the hub).
+        let mut lap = api_to(&endpoint::fleet_socket(&pair.l_dir, "box"), "box");
+        for (method, params) in [("fleet.forget", json!({"name": "x"})), ("fleet.leave", json!({}))] {
+            let e = lap.conn.call(method, params.clone()).unwrap().error.unwrap();
+            assert_eq!(e.code, "denied", "{method}: {e:?}");
+            let e = connect(&pair.k_dir).call(method, params).unwrap().error.unwrap();
+            assert_eq!(e.code, "denied", "{method} from a local client: {e:?}");
+        }
+        let e = lap.conn.call("fleet.rm", json!({"name": "box"})).unwrap().error.unwrap();
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("denied", "`box` is the hub: it leaves on its own host"));
+        assert_eq!(member_and_registry(&pair, "k"), (Hub::This, vec!["x".to_string()]), "nothing changed on K");
+        // From the member's own `machine rm`, too.
+        let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().error.unwrap();
+        assert_eq!(e.code, "denied");
+        // K on L: L's hub, admitted.
+        let mut k = api_to(&endpoint::fleet_socket(&pair.k_dir, "lap"), "lap");
+        let r = k.conn.call("fleet.forget", json!({"name": "nobody"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        drop((lap, k));
+        pair.finish();
+    }
+
+    /// Member L leaves: it tells the hub K (`fleet.rm` of itself: K forgets
+    /// it, `x` unreached), then clears its `hub` and drops its entries; the
+    /// link ends.
+    #[test]
+    fn a_member_leaves_its_fleet() {
+        use crate::serve::fleet::member::Hub;
+        let pair = fleet_pair("dial-leave", "self", "box");
+        pair.wait_box("box connected", connected);
+        wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(&pair).is_some_and(|r| connected(&r)));
+        let r = connect(&pair.l_dir).call("machines.rm", json!({"name": "lap"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let mut answer = r.result.unwrap();
+        crate::serve::dts::assert_variant("MachineRmLeft", &answer);
+        let missed = answer["removed"]["missed"].take();
+        assert_eq!(missed.as_array().map(|m| m.iter().map(|m| m["name"].clone()).collect::<Vec<_>>()), Some(vec![json!("x")]));
+        assert_eq!(
+            answer,
+            json!({
+                "type": "left", "name": "lap", "hub": "box", "error": null, "dropped": ["box"],
+                "removed": {"name": "lap", "hub": "box", "leave": "leaving", "error": null, "forgot": [], "missed": null},
+            })
+        );
+        assert_eq!(member_and_registry(&pair, "l"), (Hub::None, vec![]), "L left");
+        assert_eq!(member_and_registry(&pair, "k"), (Hub::This, vec!["x".to_string()]), "K stays the hub");
+        wait_for("lap gone on K", Duration::from_secs(10), || lap_on_k(&pair).is_none());
+        assert_eq!(connect(&pair.l_dir).call("member.get", json!({})).unwrap().result.unwrap()["hub"], Value::Null);
+        // Out of every fleet: nothing more to leave.
+        let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "lap"})).unwrap().error.unwrap();
+        assert_eq!(e.code, "failed");
+        pair.finish();
     }
 }

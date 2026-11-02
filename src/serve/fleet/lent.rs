@@ -33,6 +33,9 @@
 //! has, except `member.*`, `link.*` and `links.*` (this member's own settings, and its
 //! links), refused under both; a verb's `env` is still the peer's when it
 //! has one.
+//!
+//! `fleet.*` (a removal from the fleet, `machines::leave`) goes by who the
+//! peer is, not by trust: [`admit_fleet`], before any of the above.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -376,12 +379,40 @@ impl Lent {
     }
 }
 
+/// Whether `fleet.*` `method` is admitted (pure), under either trust: `from`
+/// the link peer's name (`None`: a local client, which uses `machines.*`),
+/// `hub` this host's, `is_machine` whether `from` is one of this host's
+/// machines (registry or inbound). `fleet.leave` / `fleet.forget` come only
+/// from this host's hub; `fleet.rm` only to the hub, from one of its
+/// machines (decision 32 of the fleet plan).
+pub fn admit_fleet(method: &str, from: Option<&str>, hub: &member::Hub, is_machine: bool) -> Result<(), ApiError> {
+    let Some(from) = from else {
+        return Err(ApiError::denied(format!(
+            "`{method}` comes over a fleet link: here `devsandbox machine rm|unlink` (`machines.*`)"
+        )));
+    };
+    match method {
+        "fleet.leave" | "fleet.forget" => match hub {
+            member::Hub::Other(h) if h == from => Ok(()),
+            _ => Err(ApiError::denied(format!("`{method}` is taken from this host's hub only, and `{from}` isn't it"))),
+        },
+        "fleet.rm" if !hub.is_this() => Err(ApiError::denied("`fleet.rm` runs on the hub, and this host isn't it")),
+        "fleet.rm" if !is_machine => Err(ApiError::denied(format!("`fleet.rm` is taken from the hub's machines, and `{from}` isn't one"))),
+        "fleet.rm" => Ok(()),
+        m => Err(ApiError::unknown_method(m)),
+    }
+}
+
 /// Gate, then confine, a peer's request (see the module doc): the params
 /// to run it with. `state` is this host's `state.toml`, read only when the
 /// request names an instance or a container under `worker`.
 pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
     if method.starts_with("member.") || method.starts_with("link.") || method.starts_with("links.") {
         return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
+    }
+    // [`admit_fleet`]'s, which knows this host's hub: never through here.
+    if method.starts_with("fleet.") {
+        return Err(ApiError::denied(format!("`{method}` goes by this host's hub, not its trust table")));
     }
     if reach.trust == Trust::Full {
         if verbs::is_verb(method)
@@ -990,12 +1021,32 @@ mod tests {
         let e = admit("gc", gc, &s, &fleet(&root), &state).unwrap_err();
         assert_eq!(e.code, "denied");
         assert!(e.message.contains("host maintenance"), "{}", e.message);
-        for m in ["member.get", "member.set", "link.attach", "link.anything", "links.inbound"] {
+        for m in ["member.get", "member.set", "link.attach", "link.anything", "links.inbound", "fleet.leave", "fleet.rm"] {
             for reach in [&r, &fleet(&root)] {
                 assert_eq!(admit(m, json!({}), &s, reach, &state).unwrap_err().code, "denied", "{m}");
             }
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `fleet.*` goes by who the peer is: `leave` / `forget` from this
+    /// host's hub, `rm` to the hub from one of its machines; never from a
+    /// local client.
+    #[test]
+    fn fleet_calls_go_by_the_hub() {
+        use member::Hub;
+        let k = Hub::Other("k".into());
+        for m in ["fleet.leave", "fleet.forget"] {
+            assert_eq!(admit_fleet(m, Some("k"), &k, true), Ok(()), "{m} from the hub");
+            for (from, hub) in [(Some("x"), &k), (Some("k"), &Hub::This), (Some("k"), &Hub::None), (None, &k)] {
+                assert_eq!(admit_fleet(m, from, hub, true).unwrap_err().code, "denied", "{m} from {from:?} with hub {hub:?}");
+            }
+        }
+        assert_eq!(admit_fleet("fleet.rm", Some("lap"), &Hub::This, true), Ok(()));
+        for (from, hub, machine) in [(Some("lap"), &Hub::This, false), (Some("lap"), &k, true), (Some("k"), &k, true), (None, &Hub::This, true)] {
+            assert_eq!(admit_fleet("fleet.rm", from, hub, machine).unwrap_err().code, "denied", "{from:?} {hub:?} {machine}");
+        }
+        assert_eq!(admit_fleet("fleet.other", Some("k"), &k, true).unwrap_err().code, "unknown-method");
     }
 
     #[test]

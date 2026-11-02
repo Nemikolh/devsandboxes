@@ -209,7 +209,8 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
             move |end: AnnounceEnd| {
                 let why = match end {
                     AnnounceEnd::Refused(why) => format!("refused: {why}"),
-                    AnnounceEnd::Cycled => format!("this host's hub changed: the link ends so {peer} redials it"),
+                    AnnounceEnd::Cycled(Some(why)) => why,
+                    AnnounceEnd::Cycled(None) => format!("this host's hub changed: the link ends so {peer} redials it"),
                 };
                 eprintln!("fleet-link: {why}");
                 *refused.lock().unwrap() = Some(why);
@@ -261,8 +262,9 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
 }
 
 /// The notification on the held `links.inbound` connection that ends the
-/// link (`daemon::Shared::set_hub`: this host's hub changed, so both ends
-/// redial saying the new one).
+/// link: `daemon::Shared::set_hub` (this host's hub changed, so both ends
+/// redial saying the new one), or `daemon::Shared::end_inbound` (the peer
+/// is out of this host's fleet; params `{why}`).
 pub const LINKS_CYCLE: &str = "links.cycle";
 
 /// Why [`Announce`]'s hold ends the link.
@@ -270,8 +272,8 @@ pub const LINKS_CYCLE: &str = "links.cycle";
 pub enum AnnounceEnd {
     /// A re-announce was refused, with why.
     Refused(String),
-    /// The daemon sent [`LINKS_CYCLE`].
-    Cycled,
+    /// The daemon sent [`LINKS_CYCLE`], with its `why` when it gave one.
+    Cycled(Option<String>),
 }
 
 /// `links.inbound` with `params` on `conn`: `Ok(Err(why))` when the daemon
@@ -314,7 +316,10 @@ impl Announce {
                     // Only `links.cycle` means something on it; an error is the drop.
                     while !stopping.load(Ordering::Relaxed) {
                         match conn.next_notification(Duration::from_millis(100)) {
-                            Ok(Some(n)) if n.method == LINKS_CYCLE => return on_end(AnnounceEnd::Cycled),
+                            Ok(Some(n)) if n.method == LINKS_CYCLE => {
+                                let why = n.params.get("why").and_then(Value::as_str).map(str::to_string);
+                                return on_end(AnnounceEnd::Cycled(why));
+                            }
                             Ok(_) => {}
                             Err(_) => break,
                         }

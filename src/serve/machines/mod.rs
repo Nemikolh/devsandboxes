@@ -39,6 +39,7 @@ pub mod forward;
 pub mod inbound;
 pub mod install;
 pub mod join;
+pub mod leave;
 pub mod link;
 pub mod saved;
 pub mod service;

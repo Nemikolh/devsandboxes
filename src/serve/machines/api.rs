@@ -1,6 +1,7 @@
 //! The `machines.*` methods (docs/architecture/daemon/machines.md,
-//! *`devsandbox machine add|ls|set|rm|trust|roots`*): `probe`, `add`, `list`, `get`,
-//! `set`, `rm`.
+//! *`devsandbox machine add|ls|set|unlink|rm|trust|roots`*): `probe`, `add`,
+//! `list`, `get`, `set`, `unlink`, and `rm` (taking a machine out of the
+//! fleet, [`super::leave`]).
 //! Connection-free like `serve::api`: a function of the method, its params
 //! and a [`Ctx`] (the registry path and the [`Dial`]s), so tests run them
 //! against a second test daemon standing in as the machine.
@@ -8,7 +9,7 @@
 //! `probe` and `add` open a fresh connection each (ssh at add time,
 //! [`Ctx::probe`]: the hello, one or two calls) and drop it; the held link
 //! per machine is `service`'s, which
-//! `add`, `set` and `rm` tell to reload and `list` reads the live state of. `add`
+//! `add`, `set`, `unlink` and `rm` tell to reload and `list` reads the live state of. `add`
 //! checks the typed roots *on the machine* (`roots.list {paths}`): only it
 //! can tell whether they exist, expand a quoted `~`, and canonicalize them.
 //! It also applies the join rule ([`super::join`]) over this host's
@@ -67,6 +68,10 @@ pub struct Ctx {
     /// `add` wrote this host's `hub`: the daemon follows it as after a
     /// `member.set` (`daemon::Shared::set_hub`).
     pub hub_changed: Box<dyn Fn(Hub) + Send + Sync>,
+    /// End inbound neighbor `name`'s link: its `fleet-link`'s held
+    /// `links.inbound` connection gets `links.cycle` and hangs up
+    /// (`rm`, `fleet.forget`).
+    pub end_inbound: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 /// Run `method` if it's a `machines.*` one; `None` otherwise.
@@ -77,7 +82,8 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
         "machines.list" => list(ctx),
         "machines.get" => parse(params).and_then(|p| get(p, ctx)),
         "machines.set" => parse(params).and_then(|p| set(p, ctx)),
-        "machines.rm" => parse(params).and_then(|p| rm(p, ctx)),
+        "machines.unlink" => parse(params).and_then(|p| unlink(p, ctx)),
+        "machines.rm" => super::leave::rm(params, ctx),
         _ => return None,
     };
     Some(answer)
@@ -249,7 +255,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
 }
 
 /// This host's member name and hub, from its `member.toml`.
-fn own_member(ctx: &Ctx) -> Result<(String, Hub), ApiError> {
+pub(super) fn own_member(ctx: &Ctx) -> Result<(String, Hub), ApiError> {
     let Some(path) = &ctx.member else {
         return Err(ApiError::failed("this daemon has no member.toml (no data dir)"));
     };
@@ -305,7 +311,7 @@ fn list(ctx: &Ctx) -> Answer {
 
 /// The registry's entries, then an inbound one per neighbor up now whose
 /// name the registry hasn't (`Entry::inbound`).
-fn machines(ctx: &Ctx) -> Result<Vec<Entry>, ApiError> {
+pub(super) fn machines(ctx: &Ctx) -> Result<Vec<Entry>, ApiError> {
     let mut entries = registered(ctx)?;
     let inbound: Vec<Entry> = ctx
         .inbound
@@ -407,7 +413,9 @@ struct NameParams {
     name: String,
 }
 
-fn rm(p: NameParams, ctx: &Ctx) -> Answer {
+/// Drop this host's link to `name`: its registry entry (it stays a fleet
+/// member). Refused for an inbound neighbor: its link is dialed from there.
+fn unlink(p: NameParams, ctx: &Ctx) -> Answer {
     let removed = super::update(&ctx.registry, |entries| {
         let before = entries.len();
         entries.retain(|e| e.name != p.name);
@@ -416,8 +424,9 @@ fn rm(p: NameParams, ctx: &Ctx) -> Answer {
     if !removed.map_err(ApiError::internal)? {
         if ctx.inbound.contains(&p.name) {
             return Err(ApiError::denied(format!(
-                "`{}` links to this host from its end (inbound): it goes with that link (`devsandbox machine rm` there)",
-                p.name
+                "`{}` links to this host from its end (inbound): it goes with that link \
+                 (`devsandbox machine unlink <this host>` run on `{}`)",
+                p.name, p.name
             )));
         }
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
@@ -700,7 +709,7 @@ mod tests {
 
         // Unregistered (the fleet stays), added again: an extra link in the
         // same fleet, nothing written but the entry.
-        assert_eq!(ok(&mut pair.local, "machines.rm", json!({"name": "box"})), json!({"ok": true}));
+        assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
         let cmd = "~/.local/bin/devsandbox";
         let r = ok(
             &mut pair.local,
@@ -731,8 +740,8 @@ mod tests {
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box"}));
         assert_eq!(info, json!({"name": "box", "kind": "ssh", "target": "ssh://box:2200", "command": cmd, "roots": [dot], "agent": true}));
         assert_eq!(err(&mut pair.local, "machines.get", json!({"name": "nope"})).0, "not-found");
-        assert_eq!(ok(&mut pair.local, "machines.rm", json!({"name": "box"})), json!({"ok": true}));
-        let (code, _) = err(&mut pair.local, "machines.rm", json!({"name": "box"}));
+        assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
+        let (code, _) = err(&mut pair.local, "machines.unlink", json!({"name": "box"}));
         assert_eq!(code, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.list", Value::Null).as_array().unwrap().len(), 0);
         pair.finish();
@@ -886,12 +895,38 @@ mod tests {
         let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
         assert_eq!(union_members("MachineKind"), ["'ssh'", "'inbound'"]);
+        use super::super::leave::{Heard, Left, Missed, Removed, RmAnswer};
+        use crate::serve::dts::assert_variant;
+        let missed = Missed { name: "x".into(), error: "no link to it".into() };
+        assert_matches("FleetMissed", &to_value(missed.clone()).unwrap());
+        let removed = Removed {
+            name: "m".into(),
+            hub: "k".into(),
+            leave: Heard::Unreachable,
+            error: Some("down".into()),
+            forgot: vec!["y".into()],
+            missed: vec![missed],
+        };
+        assert_matches("FleetRemoved", &to_value(removed.clone()).unwrap());
+        assert_variant("MachineRmRemoved", &to_value(RmAnswer::Removed(removed.clone())).unwrap());
+        let left = Left { name: "lap".into(), hub: "k".into(), removed: Some(removed), error: None, dropped: vec!["k".into()] };
+        assert_variant("MachineRmLeft", &to_value(RmAnswer::Left(left)).unwrap());
+        assert_eq!(union_members("MachineRmResult"), ["MachineRmRemoved", "MachineRmLeft"]);
+        assert_eq!(union_members("FleetHeard"), ["'told'", "'leaving'", "'unreachable'"]);
+        for heard in [Heard::Told, Heard::Leaving, Heard::Unreachable] {
+            let wire = to_value(heard).unwrap();
+            assert!(union_members("FleetHeard").contains(&format!("'{}'", wire.as_str().unwrap())));
+        }
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [
             ("machines.probe", "MachineProbe"),
             ("machines.add", "MachineAdded"),
             ("machines.list", "MachineRow[]"),
-            ("machines.rm", "OkResult"),
+            ("machines.unlink", "OkResult"),
+            ("machines.rm", "MachineRmResult"),
+            ("fleet.rm", "FleetRemoved"),
+            ("fleet.leave", "OkResult"),
+            ("fleet.forget", "OkResult"),
             ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
         ] {

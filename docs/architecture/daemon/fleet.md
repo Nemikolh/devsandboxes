@@ -30,7 +30,7 @@ entry for K has `agent` on; K's agent never reaches L.
 The add is also the join (`machines::join::plan`, run by `machines.add`
 over this host's `member.toml` and the target's `member.get` and
 `machines.list` on the add-time probe;
-[machines.md](machines.md#devsandbox-machine-addlssetrmtrustroots)).
+[machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
 `machine add X` run on H, with "hub K" a member's hub by name (its own
 name when it's `self`):
 
@@ -48,6 +48,45 @@ The link is H → X in every row; joining writes only the joiner's
 X's name when X is in a fleet already. A joiner whose name the fleet has
 is refused: X's against H's name, H's machines and H's hub; H's against
 X's name and X's `machines.list`. X's name is never H's.
+
+**How a machine leaves** (decision 32 of the plan;
+`machines::leave`): `machine unlink <m>` (`machines.unlink`) only drops
+this host's registry entry for `m`, which stays a member. `machine rm
+<m>` (`machines.rm`) takes `m` out of the fleet, and runs on the hub
+(`leave::plan` decides from this host's name, `hub` and machines):
+
+- **On the hub**, `m` one of its machines (registry or inbound): it
+  sends `fleet.leave {}` to `m` over `m`'s link while that's connected,
+  and on `m` that clears `hub` and drops all of `m`'s own registry
+  entries; then `fleet.forget {name: m}` to every other machine it
+  links to, each of which drops its entry for `m` or, if `m` is an
+  inbound neighbor there, ends `m`'s link; then it unlinks `m` here (its
+  entry dropped, or its inbound link ended). Nothing is refused for a
+  member that can't be reached: the answer (`leave::Removed`) says
+  whether `m` was `told`, `unreachable` (with why) or `leaving` (it asked
+  itself), which members `forgot` it, and which were `missed` (with why).
+- **On a member**, `m` a machine it links to or one it sees through the
+  hub: it sends `fleet.rm {name: m}` to the hub over the hub's link, and
+  answers the hub's `Removed`. With no link up to the hub, or in no
+  fleet, it fails saying so. `m` naming the hub is refused (`denied`):
+  the hub leaves on its own host.
+- **`m` is this host's own member name** (leaving): on a member, it
+  sends `fleet.rm {name: <itself>}` to the hub first (best effort: an
+  unreachable hub is a note in the answer, `leave::Left::error`), then
+  clears its own `hub` and drops all its registry entries. On the hub
+  with any machine it's refused (`the hub can't leave while it has
+  members: machine rm each first`); alone, it just clears `hub`.
+
+The link a call came on may be one the call ends: `m` answering
+`fleet.leave` (its `hub` change ends every link), the hub answering a
+leaving member's own `fleet.rm` (its unlink ends that member's link).
+The files are written before the answer; the links follow
+(`leave::After`, `leave::apply`) only once the answer is out
+(`daemon::ConnState::after`, after `AFTER_ANSWER`). An inbound link ends
+as a hub change ends it: `links.cycle` on the neighbor's held
+`links.inbound` connection, here with `{why}` (`Shared::end_inbound`;
+`fleet-link` prints it). Who may send `fleet.*`:
+[the trust table](#the-trust-table).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `cap_of`, `Handler`, `Serves`, `Endpoint`, `Socket`,
@@ -78,6 +117,10 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/fleet/member.rs` (`Hub`, `Member::hub`), `src/serve/daemon.rs`
 (`Shared::hub`, `Shared::is_hub`, `Shared::set_hub`),
 `src/serve/machines/join.rs` (`plan`, `Plan`, `Fleet`, `Joined`),
+`src/serve/machines/leave.rs` (`plan`, `Plan`, `Here`, `rm`,
+`fleet_call`, `After`, `apply`, `Removed`, `Left`, `RmAnswer`),
+`src/serve/daemon.rs` (`fleet_call`, `Shared::end_inbound`),
+`src/serve/fleet/lent.rs` (`admit_fleet`),
 `src/serve/machines/service.rs` (`Hub`, `save_loop`, `log_failure`,
 `Handle::cycle`), `src/commands/fleet_link.rs` (`LINKS_CYCLE`,
 `AnnounceEnd`),
@@ -810,7 +853,7 @@ there only through the trust table.
   those its `state.toml` has instances in, absolute; `devsandbox machine
   roots add|rm` on this host sets them, and `machine add` run elsewhere
   records the roots it picks here that way:
-  [machines.md](machines.md#devsandbox-machine-addlssetrmtrustroots)),
+  [machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)),
   an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
   and a `[caps]` table, the soft caps of the
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
@@ -1054,6 +1097,16 @@ Each request goes through `lent::admit` at the top of `handle`, before
 any dispatch. Under either trust `member.*`, `link.*` and `links.*` are
 `denied`: this member's own settings and links are its local clients'
 only.
+
+`fleet.*` (a removal from the fleet: *How a machine leaves*, at the top) goes
+by who the caller is, not by trust: `daemon::fleet_call` takes it before
+the table, through `lent::admit_fleet` (pure, over the method, the
+peer's name, this host's `hub` and whether the peer is one of its
+machines). `fleet.leave` and `fleet.forget` are admitted only from the
+peer this host's `hub` names; `fleet.rm` only on the hub, from one of its
+machines (registry or inbound). A local client is `denied` all three (it
+uses `machines.rm` / `machines.unlink`), as is any other caller; `admit`
+itself refuses `fleet.*` should one reach it.
 
 Under **`full`** that's all: the request runs as a local client's would,
 any root, any instance, no filter on its answer or its pushes, except

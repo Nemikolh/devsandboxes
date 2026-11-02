@@ -223,7 +223,8 @@ devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
 devsandbox machine add me@my-server --agent    # with `agent` on
 devsandbox machine ls [--json]                 # NAME TARGET ROOTS AGENT STATE VERSION
 devsandbox machine set box --agent on|off      # change a machine's `agent`
-devsandbox machine rm box                      # unregister only
+devsandbox machine unlink box                  # drop this host's link only (it stays in the fleet)
+devsandbox machine rm box                      # take it out of the fleet (this host's own name: leave)
 devsandbox machine trust [worker|full]         # this host's fleet trust (show / set)
 devsandbox machine roots [add|rm <path>…]      # this host's picked roots (add records them on the machine)
 ```

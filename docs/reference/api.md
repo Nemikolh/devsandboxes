@@ -139,6 +139,11 @@ roots' instances. Anything else is `denied`, naming `devsandbox machine
 trust full` (run on this member) as what opens it. Under `full` the
 caller has the API a local client has.
 
+`fleet.*` goes by who the caller is under either trust, never by the
+table (*`fleet.*`*): `fleet.leave` and `fleet.forget` only from the peer
+this host's `hub` names, `fleet.rm` only on the hub and from one of its
+machines; anything else, a local client included, is `denied`.
+
 ### `link.attach`
 
 Internal (not in the npm typings): the first line of a connection that
@@ -1026,7 +1031,8 @@ Remote hosts whose daemons this one talks to over ssh
 ([machines.md](../architecture/daemon/machines.md)).
 The registry is `<data-dir>/devsandbox/machines.toml`, next to
 `state.toml`, written only by `machines.add` / `machines.set` /
-`machines.rm`:
+`machines.unlink` / `machines.rm`, and by `fleet.leave` / `fleet.forget`
+from the hub (*`fleet.*`*):
 
 ```toml
 [machine.my-server]
@@ -1122,7 +1128,8 @@ roots, and it is where that caller's placement moves code to.
 | `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, the registry's by name, then the inbound neighbors up now by name; `kind` `ssh` \| `inbound`, `target` `null` for an inbound one; `state`, `error` and `version` (from the last hello) its held link's, whatever its kind; an inbound one has `agent` off and `command` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
 | `machines.get` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"name", "kind", "target", "command", "roots", "agent"}`, a registered machine's or an inbound one's: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an inbound one has none) | `not-found`, `denied` (a machine seen only through the hub, naming it), `invalid` (`agent` not absolute), `internal` (as `list`) |
 | `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `denied` (an inbound machine: this host's agent never reaches it; its own entry for this host has the `agent` that counts; a machine seen only through the hub), `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
-| `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `denied` (an inbound machine: it goes with its link, `machine rm` on it), `internal` (`machines.toml` doesn't read or write) |
+| `machines.unlink` | `{"name"}` | `{"ok": true}`; this host's entry goes, its link stops and its rows go. Nothing on the machine changes: it stays a fleet member | `not-found`, `denied` (an inbound machine: it goes with its link, `machine unlink <this host>` run on it), `internal` (`machines.toml` doesn't read or write) |
+| `machines.rm` | `{"name"}` | the machine out of the fleet, or this host leaving it when `name` is its own member name (*`fleet.*`*). `{"type": "removed", "name", "hub", "leave", "error", "forgot", "missed"}`: the hub's removal, run here on the hub or sent there from a member as `fleet.rm` (its answer). `{"type": "left", "name", "hub", "removed", "error", "dropped"}`: this host left `hub`'s fleet (`hub` its own name when it was the hub, alone); `removed` the hub's answer to its `fleet.rm` (`null` on the hub, or with the hub not reached: `error` says why), `dropped` its registry entries, gone with its `hub` | `not-found` (neither a machine here nor one seen through the hub), `denied` (the hub, from a member: it leaves on its own host; the hub leaving while it has machines), `failed` (the hub can't be reached; this host in no fleet), `internal` |
 
 `probe` and `add` open a connection of their own (a 20 s hello), checking
 ssh, the remote devsandbox and the protocol before anything is saved.
@@ -1130,7 +1137,7 @@ ssh, the remote devsandbox and the protocol before anything is saved.
 `~` is the machine's home. `name` defaults to the machine's member name
 (its `member.get` on the same connection, with its `hub` and
 `machines.list`, which the join rule reads:
-[fleet](../architecture/daemon/fleet.md), *How a machine joins*). `add`, `set` and `rm` reach the links at
+[fleet](../architecture/daemon/fleet.md), *How a machine joins*). `add`, `set`, `unlink` and `rm` reach the links at
 once (`set` of `agent` keeps the live link: the next `AGENT` stream is
 answered as it says). `agent` is listed (also in the federated
 snapshot's `machines`) and decides whether the daemon answers the
@@ -1142,6 +1149,23 @@ a command on the machine (its calls and `PTY` streams over the machine's
 link), so the agent the machine reaches meanwhile is that terminal's. Adding a machine means trusting it: its socket is as
 powerful as `docker.sock`, and with `agent` on your agent is reachable
 there.
+
+### `fleet.*`
+
+A removal from the fleet ([fleet](../architecture/daemon/fleet.md), *How
+a machine leaves*), sent between members over their links. Admitted by
+who the caller is, not by trust (`lent::admit_fleet`, *Remote callers*);
+a local client is `denied` (it uses `machines.rm` / `machines.unlink`).
+
+| method | from | params | result | errors |
+|---|---|---|---|---|
+| `fleet.rm` | one of the hub's machines, to the hub | `{"name"}` | `{"name", "hub", "leave", "error", "forgot", "missed"}`: `leave` `told` (`name` answered `fleet.leave`), `leaving` (`name` asked: it leaves on its own), `unreachable` (`error` says why); `forgot` the other machines of the hub that answered `fleet.forget`, `missed` `[{"name", "error"}]` those it couldn't reach (not connected, or an error answer). `name` is unlinked on the hub | `denied` (not the hub, not one of its machines, `name` the hub), `not-found` (not one of the hub's machines), `internal` |
+| `fleet.leave` | this host's hub | `{}` | `{"ok": true}`: `hub` cleared and every registry entry dropped; the links end once the answer is out | `denied` (not from this host's hub), `internal` |
+| `fleet.forget` | this host's hub | `{"name"}` | `{"ok": true}`: the registry entry for `name` dropped, if any, and `name`'s inbound link ended, if it has one (`links.cycle {"why"}` on its `fleet-link`) | `denied` (not from this host's hub), `invalid` (`name` is this host or the hub), `internal` |
+
+Nothing is refused for a member that can't be reached: the answer says
+who was. A member removed while unreachable keeps its `hub` and its
+entries.
 
 ### `member.*`
 

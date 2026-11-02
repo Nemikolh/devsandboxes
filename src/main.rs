@@ -466,7 +466,16 @@ enum MachineCommand {
         #[arg(long, required = true, action = clap::ArgAction::Set, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
         agent: bool,
     },
-    /// Unregister a machine (nothing on it changes)
+    /// Drop this host's link to a registered machine (it stays a fleet member; nothing on it changes)
+    Unlink { name: String },
+    /// Take a machine out of the fleet; this host's own name leaves it
+    ///
+    /// Runs on the hub (from a member it's sent there): the machine clears
+    /// its hub and drops its links, every other member the hub reaches
+    /// forgets it. Each outcome is printed; an unreachable machine or member
+    /// is reported, not an error.
+    ///
+    ///     devsandbox machine rm my-server
     Rm { name: String },
     /// Show or set what other machines reach on this host (its fleet trust)
     ///
@@ -824,6 +833,7 @@ fn main() -> Result<()> {
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
+            MachineCommand::Unlink { name } => commands::machine::unlink(&name),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
             MachineCommand::Trust { trust } => commands::machine::trust(trust),
             MachineCommand::Roots { cmd } => commands::machine::roots(match cmd {
