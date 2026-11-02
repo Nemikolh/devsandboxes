@@ -9,7 +9,7 @@ steps 7-8 down to one: every machine one peer link per pair, reached
 only over its channels, a laptop joining with `machine add <hub>`;
 step 9 made it a fleet: the hub in `member.toml`, `machine add`'s join
 rule, `machine unlink|rm`, every member seeing the fleet through the
-hub and its runs placed there. Step 10 (routing) finishes the model
+hub and its runs placed there. Step 10 (member identity, then routing) finishes the model
 below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
 proposed). The rest is design. Builds on
@@ -524,14 +524,29 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    `fleet.rm`; the links a call ends go after its answer is written.
    `fleet.place` answers `{on: requester|hub|machine, machine,
    lines}`; a member asks it on every unpinned `run`.
-10. **Routing over the graph** (M–L). Members report their links and the
-    hub publishes the graph; routed streams are spliced hop by hop toward
-    a destination (an `Open` naming it); requesters try paths in order
-    (direct, then fewest hops, preferring hops that stay up) and fail over
-    (decision 21). `machine trust worker`'s ssh warning comes from the
-    graph, shown in `machine ls` and the Machines tab. ADR 0043 accepted
-    (0041 removed); `machines.md` and `fleet.md` (architecture)
-    rewritten.
+10. **Identity, then routing over the graph** (L). Identity first
+    (decision 44). Sub-steps:
+    - **10a Member identity.** Each member holds a private key; the fleet
+      knows every member's public key (the hub's member list carries it,
+      recorded at `machine add`, the add-time ssh vouching for it once);
+      a link proves both ends' keys in its handshake, so no device acts
+      as another member, or as the hub, without that member's key.
+      Decision 32's hub-only calls check the hub's key, not the name the
+      link announced. A signed statement format (signer, payload hash,
+      a version that only goes up) for what later steps sign: config
+      snapshots in the mesh (decision 39, steps 12-13) and delegated
+      config edits.
+    - **10b Routing.** Members report their links and the hub publishes
+      the graph; routed streams are spliced hop by hop toward a
+      destination (an `Open` naming it), each naming the member it
+      started on, proven by that member's key (10a), so a relay can't
+      speak for another member and each destination applies its trust
+      for the stream's origin; requesters try paths in order (direct,
+      then fewest hops, preferring hops that stay up) and fail over
+      (decision 21). `machine trust worker`'s ssh warning comes from the
+      graph, shown in `machine ls` and the Machines tab. ADR 0043
+      accepted (0041 removed); `machines.md` and `fleet.md`
+      (architecture) rewritten.
 11. **Hub swap, pointer** (S–M). `machine hub <m>`: the role moves, links
     stay; every reachable member rewrites `hub`, a late one learns it on
     reconnect.
@@ -575,7 +590,9 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
 
 Numbered as code cites them; 13–16 as step 4 makes them, 3, 9 and 17 as
 step 6 does, 7, 18, 22-25 as step 7 does, 26-30 as step 8 does, 1, 2, 19
-and 20 as step 9 does, 21 as step 10 does.
+and 20 as step 9 does, 21 as step 10 does, 36 and 37 as a fix to
+step 9's `machine add` does, 38 as a fix to step 9's placement does, 39-43 as steps 13, 14
+and 16 do, 44 as step 10 does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
    setting.
@@ -693,6 +710,68 @@ and 20 as step 9 does, 21 as step 10 does.
 35. A machine's registry name defaults to its member name (`member.get`
     over the add-time probe), so the name `machine add` checks against
     the fleet is the one the fleet knows it by.
+36. `machine add --hub` makes the target the hub: `machines.add` takes a
+    mandatory `hub: boolean`. With neither end in a fleet, `true` makes a
+    fleet of two with the target as hub (the target's `member.set {hub:
+    "self"}`, this host's `hub` the target's name), `false` with this
+    host as hub, as before. With either end in a fleet the join table
+    decides as before ([Joining and leaving](#joining-and-leaving)); `true`
+    there is refused unless the target already is the hub (moving the
+    role is step 11's `machine hub`). So a laptop holding the configs
+    makes an always-on server the hub with no ssh into the laptop.
+37. A member may have no picked roots (amends decision 17): `machines.add`
+    takes `roots: []`. When the probe finds no candidate roots, `machine
+    add` takes none without asking; with candidates, the picker accepts an
+    empty pick, and off a TTY one candidate is taken, several are an
+    error as before. No roots picked, nothing is recorded on the machine
+    (no `machine roots add` ssh). A hub or worker that only runs other
+    members' configs (in their fleet roots) is added that way.
+38. A run typed by the user (CLI, dashboard) runs on the member whose
+    config it names, never placed (amends decision 20, narrows decision
+    31): the user's own sandboxes stay on their machine and nothing waits
+    on the hub. Placement is for dispatcher children (step 13) and an
+    explicit `run --place`, which asks the hub as decision 31 says.
+    `--machine` and qualified names still pick the machine.
+39. A dispatcher runs on any member and has no notion of where its
+    config lives: it reads its home member's config from the mesh. While
+    the home member is up, an edit there reaches it at once; while it is
+    down, the last copy the mesh holds is the current config
+    ([ADR 0030](../../decisions/0030-dispatcher-control-is-authorized-on-the-host.md)'s
+    check runs against it). When the member running a dispatcher goes
+    down, a per-dispatcher setting says what the hub does: move it to
+    another member, or notify that it is down.
+40. What ties a sandbox to a host is known before anything moves, two
+    ways, both before step 13:
+    - **Inferred** from the merged config: bind sources outside the
+      config root, `${localEnv:…}`, `shared-volumes/` paths, runtime
+      sockets, X11, `folder`/`folders` that can't move (`code::offer`'s
+      reasons). Placement skips a host that can't satisfy them and says
+      why; `code::offer` refuses up front what the worker policy would
+      only refuse on the worker after the code moved.
+    - **Pinned** in the config (`placement = "home"`, or the members it
+      may run on): explicit and self-documenting, even where inference
+      would let it move.
+41. The target model is named host resources: a config names what it
+    needs (a mount of resource `gh-auth`, say), each member maps names to
+    its own paths, and a sandbox is placeable on members that provide
+    all of its names. Secrets never move: each host supplies its own (a
+    worker's own scoped token, never the home member's). The worker
+    policy's `binds` / `local-env` allowances become which resources
+    another member's configs may use there. Decision 40 comes first;
+    this waits on the open question below.
+42. A dispatcher's state (leader, log, its records) is mesh state, not a
+    bind on the host it runs on, so it moves with the dispatcher
+    (decision 39). A dispatcher is its own sandbox config, not part of a
+    development sandbox whose binds tie it to one host.
+43. `shared-volumes` that aren't secrets (skills, agent state) are mesh
+    state, carried by step 16's sync layer; until then each host has its
+    own.
+44. Member identity (step 10a) comes before routing: ssh vouches only
+    for the end of a direct link, and a routed stream reaches its
+    destination through other members, so without keys a relay could
+    claim to carry another member's stream and get that member's trust.
+    Steps 11-13 lean on the same proof (the hub's calls, signed config
+    snapshots), so they build on keys rather than names.
 
 ## Open questions
 
@@ -712,10 +791,14 @@ and 20 as step 9 does, 21 as step 10 does.
   coarse.
 - Authenticating peers without ssh (later): a transport over the
   tailnet, say, where no ssh login vouches for `--peer` (decision 22).
-- Member and hub identity as a key pair (user's note, to be placed:
-  maybe a step before 10): each member holds a private key, the fleet
-  knows its public key, and a link proves both ends, so no new device
-  can act as another member or as the hub without that device's
-  private key. Today a peer's name is vouched for only by ssh login
-  (decisions 2, 22), and decision 32's hub-only calls trust the name
-  the link was announced with.
+- A dispatcher's down-host setting (decision 39): in its sandbox config
+  or the hub's `member.toml`, and after how long a member counts as
+  down? And the worker policy denies dispatcher sockets (decision 9): a
+  dispatcher moved onto another member runs under that member's trust
+  for its home member, so does each member that may run it need the
+  `dispatcher` allowance (or `full`) for that home member, set ahead?
+- **Blocks decision 41.** Named host resources need: an opt-in way to
+  move a config to resource names (a config keeps its host paths until
+  its user moves it), and a way for the user to see and set a member's
+  resources, since `member.toml` is written by the daemon only
+  (decision 3) and not something a user opens.

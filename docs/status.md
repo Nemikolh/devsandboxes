@@ -48,7 +48,8 @@ limitation means editing this file in the same commit.
   out of the fleet on the hub (a member's is sent there), `machine rm
   <this host>` leaves, `machine unlink <m>` only drops this host's link
   (step 9d). A member's `run` is placed by the hub (step 9e,
-  `fleet.place`). Next: routing over the graph (step 10).
+  `fleet.place`). Next: member identity, then routing over the graph
+  (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -339,6 +340,16 @@ limitation means editing this file in the same commit.
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
   add <root>…` on the machine, or `machine unlink` + `machine add` it again.
   → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmtrustroots); `commands::machine::record_roots`
+- `machine add` requires at least one config root on the machine (its
+  picker, `machines.add`'s `no roots`), so a hub or worker meant to run
+  only other members' configs must still pick one of its own (fleet
+  plan decision 37).
+  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmtrustroots); `commands::machine::add`, `machines::api::add`
+- With neither end in a fleet, `machine add` always makes the host
+  running it the hub: a laptop can't make the server it adds the hub
+  without that server running `machine add <laptop>` (ssh into the
+  laptop); `machine add --hub` (fleet plan decision 36) isn't built.
+  → [fleet](architecture/daemon/fleet.md); `machines::join::plan`
 - No command sets this host's member name (what the machines it dials
   know it by, `fleet-link --peer <name>`): it's `member.toml`'s `name`,
   set only through `member.set {name}` (API) or by hand, else the
