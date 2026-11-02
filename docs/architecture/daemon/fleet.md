@@ -14,9 +14,13 @@ follows its hub's build, a published one downloaded, a dev one received
 over `TRANSFER`
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md));
 and the [member side](#member-side): `member.toml`, `member.*` with
-`devsandbox machine trust|roots|key`, the [member
-identity](#member-identity) key, the trust table and the worker policy
-that every remote caller goes through.
+`devsandbox machine trust|roots|key`, the trust table and the worker
+policy that every remote caller goes through; and [member
+identity](#member-identity): each member's key (never reachable from a
+container), the [membership log](#membership-log) only the fleet's
+authority signs, the [key proof](#key-proof) every peer link starts
+with, and the [approvals and pushes](#approvals-and-pushes) that carry
+membership changes.
 
 **How a machine joins** (decisions 28 and 30 of the plan): on a laptop
 L, `devsandbox machine add <hub>` registers the hub K in L's
@@ -31,7 +35,7 @@ entry for K has `agent` on; K's agent never reaches L.
 The add is also the join (`machines::join::plan`, run by `machines.add`
 over this host's `member.toml` and the target's `member.get` and
 `machines.list` on the add-time probe;
-[machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
+[machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
 `machine add X` run on H, with "hub K" a member's hub by name (its own
 name when it's `self`):
 
@@ -84,7 +88,7 @@ X's key is the one the user confirmed: `machine add` shows the
 fingerprint `machines.probe` answers and asks (`--yes` off a TTY), and
 `machines.add {key}` refuses (`denied`, naming both fingerprints) when
 X's `member.get` says another
-([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
+([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
 ssh's first-use trust of the target is the root of this check.
 
 **How a machine leaves** (decisions 32 and 49 of the plan, step
@@ -143,65 +147,10 @@ as a hub change ends it: `links.cycle` on the neighbor's held
 `links.inbound` connection, here with `{why}` (`Shared::end_inbound`;
 `fleet-link` prints it). Who may send `fleet.*` is decided by the key
 the sender's link proved, never by the name it announced, and the
-removals follow a valid revoke: a member admits `fleet.leave` only from
-the hub of its membership log by the hub's key there and once its log
-revokes its own key, `fleet.forget {name}` likewise once its log revokes
-`name`; the hub admits `fleet.rm {name}` only from a member of the log
-by its key, never from an introduced (capped) one, and only of the
-member itself or of one its log revokes ([the trust
-table](#the-trust-table)). A `fleet.sync` that revokes the receiving
+removals follow a valid revoke ([the trust table](#the-trust-table)).
+A `fleet.sync` that revokes the receiving
 host's own key is taken (`membership_api::sync_into`), so its
 `fleet.leave` has the revoke to follow; its links then no longer prove.
-
-### Approvals and pushes
-
-The authority's key is the only one that signs membership changes, and
-it never signs on a remote request alone (decision 49;
-`machines::changes`, `fleet::proposals`):
-
-- **Proposals.** A member's change goes to the authority as
-  `fleet.propose {op}`, `op` `{"kind": "revoke", "name"}` (a member's
-  `machine rm`, or its own when it leaves) or `{"kind": "add",
-  "introduction"}` (the introduction a non-authority member's `machine
-  add` signs: `machines.add` proposes it after the add, best effort, its
-  answer's `proposed` saying the id or why not). The authority admits it
-  only from a member of its log by its key (a capped one proposes
-  nothing, decision 51), checks it against its log now
-  (`proposals::check`: a revoke of a member's current key, never the
-  authority's or the hub's; an introduction that holds), and queues it in
-  `proposals.json` next to `membership.json` (`{"next", "pending": [{"id",
-  "from", "op", "at"}]}`, daemon-written, locked and atomic like the
-  other stores; a pending proposal of the same change answers its own
-  id, `Proposals::queue`). A new one is shown on the desktop
-  (`Ctx::notify`, `devsbd::desktop` on the host side): `<from> proposes
-  to remove <m> from the fleet: devsandbox machine approve <id>`.
-  `devsandbox machine pending|approve|deny` (`membership.pending`,
-  `.approve`, `.deny`, local only) list them, sign one (checked against
-  the log again, then signed, pushed and, for a revoke, removed as
-  `machine rm` typed there would) or drop one.
-- **Rotations.** A member's `machine key rotate` proposes `{"kind":
-  "rotate", "name", "old", "new", "by_old"}` the same way
-  ([Member identity](#member-identity)). `proposals::check` takes it only
-  from the member it names (a member rotates only its own key), from its
-  current key, countersigned by that key, to a key the log doesn't know
-  (`Membership::check_op`); a rotate to the key the log already has says
-  it's signed. The queue collapses a rotate of the same name to the same
-  key. Approved, the `rotate` is signed and pushed like any change; the
-  member promotes its next key when the push (or its next link's sync)
-  reaches it, and ends its links to redial with it. The authority's own
-  `machine key rotate` is signed at once with its old key, pushed, then
-  its links end and redial; later entries are signed with the new one
-  (`Membership::authority`).
-- **Pushes.** After every change it signs, the authority sends its whole
-  log to every machine it holds, registry and inbound (`changes::push`,
-  `fleet.sync`). The receiver, from a member or an introduced peer,
-  merges it as a link's handshake does (self-verifying; another fleet's
-  log or a fork refused; `membership_api::sync`), and when that made its
-  log newer, follows the hub and sends it on to every other machine it
-  holds, not back to the sender, on a thread of its own. A host that
-  takes nothing sends nothing on, so a push floods the connected graph
-  once. A host not reached catches up at its next link's head comparison
-  (`fleet::proof`).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `cap_of`, `Handler`, `Serves`, `Endpoint`, `Socket`,
@@ -237,11 +186,13 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/machines/leave.rs` (`plan`, `Plan`, `Here`, `Authority`,
 `rm`, `remove`, `fleet_call`, `After`, `apply`, `Removed`, `Left`,
 `RmAnswer`), `src/serve/machines/changes.rs` (`revoke`, `propose`,
-`push`, `call`, `fleet_call`, `Signed`, `Proposed`, `Approved`),
+`push`, `call`, `fleet_call`, `rotate`, `can_rotate`, `plan_rotate`,
+`Signed`, `Proposed`, `Approved`, `Rotation`),
 `src/serve/fleet/proposals.rs` (`Change`, `check`, `Proposal`,
 `Proposals`, `Proposals::queue`, `update`),
 `src/serve/fleet/membership_api.rs` (`sync`, `sync_into`),
-`src/serve/daemon.rs` (`fleet_call`, `Shared::end_inbound`),
+`src/serve/daemon.rs` (`fleet_call`, `Shared::end_inbound`,
+`Shared::key_rotated`),
 `src/serve/fleet/lent.rs` (`admit_fleet`),
 `src/serve/machines/service.rs` (`Hub`, `save_loop`, `log_failure`,
 `Handle::cycle`), `src/commands/fleet_link.rs` (`LINKS_CYCLE`,
@@ -285,11 +236,18 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `update`, `default_name`, `check_member_name`, `merge`, `call`, `MemberInfo`,
 `key_path`, `set_fleet`), `src/serve/fleet/membership_api.rs` (`call`,
 `MembershipInfo`, `Summary`, `adopt`, `adopt_into`, `sign`, `sign_into`,
-`can_sign`, `Signs`, `lists`, `Own`), `src/serve/fleet/identity.rs` (`PublicKey`, `Signature`,
+`can_sign`, `Signs`, `lists`, `Own`, `settle`), `src/serve/fleet/identity.rs` (`PublicKey`, `Signature`,
 `Signer`, `SigningKey`, `KeyStore`, `FileKeyStore`, `Statement`,
 `STATEMENT_DOMAIN`, `Seen`, `Accepted`, `Refusal`),
+`src/serve/fleet/membership.rs` (`Op`, `Entry`, `Head`, `Membership`,
+`apply`, `Log`, `Compare`, `compare`, `Introduction`,
+`check_introduction`, `countersign_rotate`, `hub_for`, `Stored`, `Wire`,
+`path`, `load`, `update`), `src/serve/fleet/proof.rs` (`prove`,
+`Identity`, `Auth`, `Proven`, `DOMAIN`, `hub_moved`), `src/key_guard.rs`
+(`Guard`, `check_argv`, `check_mount`, `Exposure`),
 `src/serve/locked_file.rs` (`update`, `lock_at`, `write_atomic_mode`),
-`src/commands/machine.rs` (`trust`, `roots`, `record_roots`, `key`), `src/serve/fleet/lent.rs` (`Peer`,
+`src/commands/machine.rs` (`trust`, `roots`, `record_roots`, `key`,
+`rotate_key`, `confirm_key`, `pending`, `approve`, `deny`), `src/serve/fleet/lent.rs` (`Peer`,
 `Channel`, `attach_params`, `peer_fleet_root`, `Files`, `Reach`,
 `own_roots`, `decide`, `admit`, `confine_path`, `lent_instances`,
 `filter_answer`, `filter_snapshot`, `cut_containers`),
@@ -508,6 +466,20 @@ It is the answerer of `fleet::LINK` (it reads the sentinel), saying
 read at each dial), with the sentinel, the `Hello`s and the
 [key proof](#key-proof) within `machines::service::Timing::handshake`.
 
+- **OUT.** L binds `fleet-K.sock` in its socket dir (newest binder wins:
+  a successor daemon's link takes it over, the old daemon's ssh dying
+  with it); each accepted connection a stream to K. Every client here
+  reaches K through it ([over a link](#over-a-link)).
+- **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
+  `AGENT` goes to L's daemon in-process (`dialer::Open`, given the link's
+  `Proven`: `Shared::open_lent` with peer `{name: K, fleet_root:
+  fleet/K/, env: the daemon's, key and introduced_by: what K proved}`), the
+  `serve_channel` a `link.attach` connection gets (decision 24); `AGENT`
+  is answered with L's agent while L's entry for K has `agent` on
+  (`daemon::agent_for`, read per stream: decision 18). While the hub's
+  binary is on its way every stream but that `binary` transfer is
+  refused.
+
 ### Key proof
 
 Both ends of a peer link prove their member keys right after the
@@ -570,20 +542,6 @@ own `membership.adopt` path in-process (`Dialer::adopt`:
 way `member.toml`'s `hub` follows the log; when the log's hub isn't the
 one this end's `Hello` said (`proof::hub_moved`), the link ends so both
 ends redial saying it.
-
-- **OUT.** L binds `fleet-K.sock` in its socket dir (newest binder wins:
-  a successor daemon's link takes it over, the old daemon's ssh dying
-  with it); each accepted connection a stream to K. Every client here
-  reaches K through it ([over a link](#over-a-link)).
-- **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
-  `AGENT` goes to L's daemon in-process (`dialer::Open`, given the link's
-  `Proven`: `Shared::open_lent` with peer `{name: K, fleet_root:
-  fleet/K/, env: the daemon's, key and introduced_by: what K proved}`), the
-  `serve_channel` a `link.attach` connection gets (decision 24); `AGENT`
-  is answered with L's agent while L's entry for K has `agent` on
-  (`daemon::agent_for`, read per stream: decision 18). While the hub's
-  binary is on its way every stream but that `binary` transfer is
-  refused.
 
 ## Over a link
 
@@ -784,9 +742,10 @@ makes this host the hub; `hub = "<name>"` names another member as its
 fleet's hub, absent is in no fleet. The daemon is the file's only
 writer (decision 3), so it reads `hub` once at start into
 `Shared::hub` and from then on keeps it there itself: `hub` is written
-only from an accepted membership log (`membership.adopt`, or
-`machines.add` adopting the log it makes; `member::set_fleet`) or cleared
-on leaving, and `Shared::set_hub` follows each write. Everything below asks
+only from an accepted membership log (`membership.adopt`,
+`machines.add` adopting the log it makes, a link's
+[key proof](#key-proof) sync, a `fleet.sync` push;
+`member::set_fleet`) or cleared on leaving, and `Shared::set_hub` follows each write. Everything below asks
 `Shared::is_hub` at its use, so a change applies under a running
 daemon. A change also ends every link this host has, so both ends
 redial saying the new hub ([Versions](#versions)): each ssh machine's
@@ -1100,7 +1059,7 @@ there only through the trust table.
   those its `state.toml` has instances in, absolute; `devsandbox machine
   roots add|rm` on this host sets them, and `machine add` run elsewhere
   records the roots it picks here that way:
-  [machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)),
+  [machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)),
   an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
   and a `[caps]` table, the soft caps of the
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
@@ -1310,7 +1269,7 @@ signatures, signed statements and the rollback rule.
   (naming the path and `chmod 600`) and a malformed one (never echoing
   its text); neither is replaced. `member.get` (and `member.set`) answer
   its public half, making the key on the first ask; `devsandbox machine
-  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
+  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
 - **Rotation**: `devsandbox machine key rotate` (`membership.rotate`,
   `machines::changes::rotate`) makes the next key, `member.key.next`
   (`FileKeyStore::next_path`, `KeyStore::next_key`: the same format and
@@ -1517,8 +1476,55 @@ hash chain of entries only the authority signs
     introduction has otherwise is `invalid`. Stored; it answers the whole `Wire`, for the
     joining host to adopt.
   - `membership.pending`, `.approve {id}`, `.deny {id}` are the
-    authority's proposal queue (`machines::changes::call`, needing the
-    links: [Approvals and pushes](#approvals-and-pushes)).
+    authority's proposal queue, `membership.rotate` this host's key
+    rotation (`machines::changes::call`, needing the links: [Approvals
+    and pushes](#approvals-and-pushes), *Rotation* above).
+
+#### Approvals and pushes
+
+The authority's key is the only one that signs membership changes, and
+it never signs on a remote request alone (decision 49;
+`machines::changes`, `fleet::proposals`):
+
+- **Proposals.** A member's change goes to the authority as
+  `fleet.propose {op}`, `op` `{"kind": "revoke", "name"}` (a member's
+  `machine rm`, or its own when it leaves) or `{"kind": "add",
+  "introduction"}` (the introduction a non-authority member's `machine
+  add` signs: `machines.add` proposes it after the add, best effort, its
+  answer's `proposed` saying the id or why not). The authority admits it
+  only from a member of its log by its key (a capped one proposes
+  nothing, decision 51), checks it against its log now
+  (`proposals::check`: a revoke of a member's current key, never the
+  authority's or the hub's; an introduction that holds), and queues it in
+  `proposals.json` next to `membership.json` (`{"next", "pending": [{"id",
+  "from", "op", "at"}]}`, daemon-written, locked and atomic like the
+  other stores; a pending proposal of the same change answers its own
+  id, `Proposals::queue`). A new one is shown on the desktop
+  (`Ctx::notify`, `devsbd::desktop` on the host side): `<from> proposes
+  to remove <m> from the fleet: devsandbox machine approve <id>`.
+  `devsandbox machine pending|approve|deny` (`membership.pending`,
+  `.approve`, `.deny`, local only) list them, sign one (checked against
+  the log again, then signed, pushed and, for a revoke, removed as
+  `machine rm` typed there would) or drop one.
+- **Rotations.** A member's `machine key rotate` proposes `{"kind":
+  "rotate", "name", "old", "new", "by_old"}` the same way
+  ([Member identity](#member-identity)). `proposals::check` takes it only
+  from the member it names (a member rotates only its own key), from its
+  current key, countersigned by that key, to a key the log doesn't know
+  (`Membership::check_op`); a rotate to the key the log already has says
+  it's signed. The queue collapses a rotate of the same name to the same
+  key. Approved, the `rotate` is signed and pushed like any change; how
+  the member then takes its next key is under *Rotation* above.
+- **Pushes.** After every change it signs, the authority sends its whole
+  log to every machine it holds, registry and inbound (`changes::push`,
+  `fleet.sync`). The receiver, from a member or an introduced peer,
+  merges it as a link's handshake does (self-verifying; another fleet's
+  log or a fork refused; `membership_api::sync`), and when that made its
+  log newer, follows the hub and sends it on to every other machine it
+  holds, not back to the sender, on a thread of its own. A host that
+  takes nothing sends nothing on, so a push floods the connected graph
+  once. A host not reached catches up at its next link's head comparison
+  (`fleet::proof`).
 
 ### Trust
 
@@ -1534,7 +1540,8 @@ next one. It applies to every link peer alike, whichever end dialed.
 and its fleet root
 through the [trust table](#the-trust-table), placed
 work under the [worker policy](#worker-policy). `full` gives it the API a
-local client has (but `member.*`, `link.*` and `links.*`), lifts the worker policy
+local client has (but `member.*`, `membership.*`, `link.*` and
+`links.*`), lifts the worker policy
 (`worker_policy::Policy::detect` answers none) and takes a hub's dev
 builds ([Versions](#versions)).
 
@@ -1577,9 +1584,9 @@ exactly one of the own roots (a dir nested in an own root isn't one);
 when it exists, never with a `..`). Every gate below uses it.
 
 Each request goes through `lent::admit` at the top of `handle`, before
-any dispatch. Under either trust `member.*`, `link.*` and `links.*` are
-`denied`: this member's own settings and links are its local clients'
-only.
+any dispatch. Under either trust `member.*`, `membership.*`, `link.*`
+and `links.*` are `denied`: this member's own settings, membership log
+and links are its local clients' only.
 
 `fleet.*` (a removal from the fleet: *How a machine leaves*, at the top;
 a member's placed run) goes by the key the caller proved, not by trust:

@@ -25,10 +25,12 @@ Start with `docs/README.md` (reading order and map) and
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `inbox.rs` is `devsandbox inbox …` (docs/reference/inbox-cli.md): reads from the
   store, mutations via a running daemon's API, else the same `wire::decide_*`
-  ops locally. `machine.rs` is `devsandbox machine add|ls|set|unlink|rm|trust|roots`
-  (docs/architecture/daemon/machines.md): a client of `machines.*` only (never in-process);
+  ops locally. `machine.rs` is `devsandbox machine add|ls|set|unlink|rm|pending|approve|deny|key [rotate]|trust|roots`
+  (docs/architecture/daemon/machines.md): a client of `machines.*`,
+  `member.*`, `membership.*` only (never in-process);
   `add`'s install check first (ask on a TTY, `--auto-install`, else
-  refuse; `machines/install.rs`), its TTY multi-select of probed roots and
+  refuse; `machines/install.rs`), the target's key fingerprint confirmed
+  (`--yes` off a TTY), its TTY multi-select of probed roots and
   the off-TTY one-candidate rule.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
   `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the
@@ -151,7 +153,17 @@ Start with `docs/README.md` (reading order and map) and
   a command's name points, `--machine` uses, its calls and `PTY` dials over
   the machine's link; pure, with `route` doing the I/O),
   `install.rs` (the CLI's check of a machine's devsandbox and the copy of
-  this binary there, for `machine add`; `check`/`decide`/`install`).
+  this binary there, for `machine add`; `check`/`decide`/`install`),
+  `changes.rs` (membership changes over the links: signed on the
+  authority, `fleet.propose`d elsewhere, `fleet.sync` pushes,
+  `membership.rotate|pending|approve|deny`).
+  `fleet/` identity (docs/architecture/daemon/fleet.md, *Member
+  identity*): `identity.rs` (`member.key` behind `KeyStore`, signed
+  statements), `membership.rs` (the authority-signed log and
+  introductions, pure), `membership_api.rs` (`membership.get|adopt|sign`,
+  `fleet.sync`'s store), `proof.rs` (a peer link's key proof),
+  `proposals.rs` (`proposals.json`). `src/key_guard.rs` refuses any
+  container bind or build path covering the member key.
   `snapshots.rs`'s `merge` builds the federated
   snapshot (`instances.watch {machines: true}`).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.

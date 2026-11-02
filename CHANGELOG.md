@@ -57,6 +57,23 @@ devsandbox run web --branch fix-login   # placed on lap (mem 71% free, …)
 devsandbox run web --here
 ```
 
+- **`machine add` without config roots, and `--hub`.** A machine with no config roots (or none picked) can be added: it runs only other members' configs, as a hub or worker. `machine add <server> --hub`, run on a laptop with neither in a fleet yet, makes the server the hub of the new fleet, so the server never has to reach the laptop.
+
+- **Member keys and a signed member list.** Every machine has its own key (`devsandbox machine key` prints its fingerprint). Who belongs to a fleet is a list only the machine that created the fleet can sign, and every member checks it. `machine add` shows the other machine's fingerprint and asks you to confirm it (compare it with `machine key` run there); `--yes` skips the question off a terminal.
+
+```bash
+devsandbox machine key
+devsandbox machine add me@my-server   # my-server's key fingerprint is SHA256:…
+```
+
+- **Fleet links prove both machines' keys.** Every link between two machines checks each end's key against the member list before anything goes over it, so a machine can't pass itself off as another member or as the hub. A machine added by a member other than the fleet's creator is shown as `introduced by …` in `machine ls` and can't add others until the creator approves it. Fleets made before this release must be made again with `machine add`: their links are refused.
+
+- **Approving membership changes: `machine pending|approve|deny`.** `machine rm`, `machine key rotate` and adds typed on another member are sent to the machine that created the fleet, which shows a desktop notification; `devsandbox machine pending` lists them there, `machine approve <id>` applies one and `machine deny <id>` drops it. On the creating machine they apply at once.
+
+- **`machine key rotate`.** Replaces this machine's key without leaving the fleet; its links reconnect with the new key once the change is approved.
+
+- **The member key never reaches a container.** `run`, `rebuild` and services refuse any bind mount, build context or build secret that would expose the machine's key (`$HOME`, the data dir, `/`, …), on every machine and whatever its trust; the error names the path and asks for a narrower one.
+
 - **API: `config.findings`, `config.migrate` and `config.ack`.** The `/root` findings of a config root, the in-place update (guarded by the file's hash: `conflict` when it changed since) and "continue as is", also on a machine (`machine`). Details: `docs/reference/api.md`, *Config*.
 
 ### Fixed

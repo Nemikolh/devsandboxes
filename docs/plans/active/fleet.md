@@ -1,15 +1,19 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-9 shipped
+Status: in progress. Steps 1-9 and 10a shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
-[0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)):
+[0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md),
+[0044](../../decisions/0044-one-fleet-authority-signs-membership.md)):
 steps 1-6 on two kinds of machine (ssh machines and lending workers),
 steps 7-8 down to one: every machine one peer link per pair, reached
 only over its channels, a laptop joining with `machine add <hub>`;
 step 9 made it a fleet: the hub in `member.toml`, `machine add`'s join
 rule, `machine unlink|rm`, every member seeing the fleet through the
-hub and its runs placed there. Step 10 (member identity, then routing) finishes the model
+hub and its runs placed there; step 10a gave members identity: a key
+each, a membership log only the fleet's authority signs, links that
+prove both keys, changes made elsewhere approved on the authority.
+Step 10 (routing next, 10b) finishes the model
 below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
 proposed). The rest is design. Builds on
@@ -613,6 +617,28 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
         `KeyStore` are parked (decision 52).
       - **10a.8 Docs close.** An ADR for decision 45; `fleet.md`
         (architecture), `docs/status.md`, this step's as-built note.
+
+      As built: there is no `fleet.membership` call; the entries an end
+      lacks travel in the key proof's `sync` round (`fleet::proof`),
+      after a `hello` round (names, nonces, heads), and a fourth
+      `confirm` round has the opener's verdict on the answerer's proof.
+      The proof sits on the raw pipe before the mux, `fleet::LINK`'s
+      sentinel at version 2. A signed change is pushed to every machine
+      the authority holds and flooded on by each host whose log it made
+      newer (`fleet.sync`, `membership_api::sync`). `member.set` takes no
+      `hub`; `machines.add` takes a mandatory `key` (the fingerprint the
+      user confirmed, checked against the target's `member.get`) and
+      `hub`, and `membership.sign` answers unchanged for a name already in
+      under that key, so a failed add can be run again. `membership.json`
+      and `proposals.json` sit next to `member.toml`. A rotation makes
+      `member.key.next`, promoted over `member.key` once a log the host
+      takes lists it (`membership_api::settle`), after which the host's
+      links cycle and redial (`Shared::key_rotated`). Introductions made
+      by a non-authority `machine add` are proposed as `fleet.propose
+      {kind: add}` after the add. No command signs a `hub` entry yet
+      (step 11). The key guard (`key_guard`) also refuses a build whose
+      context, dockerfile, `--build-context`, `--secret` or `--ssh` path
+      covers the key.
     - **10b Routing.** Members report their links and the hub publishes
       the graph; routed streams are spliced hop by hop toward a
       destination (an `Open` naming it), each naming the member it

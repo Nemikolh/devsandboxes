@@ -13,14 +13,15 @@ touching anything that takes a `machine` param or a `m/name`.
 Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 `RawEntry`, `path`, `parse`, `update`, `inbound.rs` (`Neighbors`, `Guard`),
 `check_name`, `Where`, `parse_name`), `join.rs` (`plan`, `Plan`, `Fleet`,
-`Joined`), `leave.rs` (`plan`, `Plan`, `Here`, `rm`, `fleet_call`,
+`Joined`, `logs`, `Logs`), `leave.rs` (`plan`, `Plan`, `Here`, `rm`, `fleet_call`,
 `After`, `apply`, `RmAnswer`, `Removed`, `Left`), `changes.rs`
-(`revoke`, `propose`, `push`, `call`, `Signed`, `Proposed`), `ssh.rs`
+(`revoke`, `rotate`, `propose`, `push`, `call`, `Signed`, `Proposed`,
+`Rotation`), `ssh.rs`
 (`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
 `parse_target`, `Dial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
 `Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `api.rs`
-(`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
+(`machines.*`, `Ctx`, `introducer_of`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`machine_names`, `plan`, `Plan`, `machine_use`, `route`,
 `localize`, `Reconnect`, `dials`, `pipe_mode`, `attach_mode`), `cli/calls.rs` (`use_of`, `Use`,
 `Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
@@ -44,7 +45,7 @@ optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
-[`machine add`](#devsandbox-machine-addlssetunlinkrmtrustroots)) through `machines.add`'s
+[`machine add`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
 dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
@@ -64,7 +65,7 @@ Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
 A machine's registry name is its member name (fleet plan decision 35):
 without `--name`, `machines.add` takes it from the machine's `member.get`;
 `--name` renames the machine only while it joins a fleet by that add
-([`machine add`](#devsandbox-machine-addlssetunlinkrmtrustroots)). `parse_name` splits a CLI
+([`machine add`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)). `parse_name` splits a CLI
 `<name>`: `m/x` → `Where::Machine`, `@/x` → `Where::Local`, bare →
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
@@ -138,7 +139,7 @@ target over ssh with the argvs in `ssh.rs`:
   its sentinel line first ([Link handshake](#link-handshake)).
 - `add_cli_argv`: `-T`, no `BatchMode` (a person is there); `machine
   add`'s `machine roots add` there
-  ([`devsandbox machine add…`](#devsandbox-machine-addlssetunlinkrmtrustroots)).
+  ([`devsandbox machine add…`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
 - `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
   POSIX script run for a person at the CLI ([Install](#install)); no
   `BatchMode`. A script is one line: the login shell may be csh, which
@@ -192,7 +193,7 @@ login there.
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
 copies this binary there, for `machine add`
-([`devsandbox machine add|ls|set|unlink|rm|trust|roots`](#devsandbox-machine-addlssetunlinkrmtrustroots)). The
+([`devsandbox machine …`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)). The
 CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
@@ -227,7 +228,9 @@ A failed ssh or script is an error carrying the tail of its stderr.
 `link.rs`: the hello says version `0.0.0`, build 0, so a link never hands
 off the remote daemon (only that host's own clients upgrade it). The
 `protocol` must match (`LinkError`); differing semvers within one protocol
-are a warning at add and shown in `machine ls`.
+are a warning at add and shown in `machine ls`. Who the machine is was
+settled below this, by the peer link's [key proof](fleet.md#key-proof);
+the add-time probe has no link and checks the confirmed key instead.
 
 `handshake` takes what the stream is (`Over`). A link's `API` stream
 (`Over::Link`: the held link, forwarded verbs, capacity asks,
@@ -564,10 +567,11 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   shell; [fleet](fleet.md#pty), *Service terminals*), never re-dialed (no
   session), refused without a terminal.
 
-## `devsandbox machine add|ls|set|unlink|rm|trust|roots`
+## `devsandbox machine add|ls|set|unlink|rm|pending|approve|deny|key|trust|roots`
 
 A client of `machines.*` (and, for `trust`, `roots` and `key`,
-`member.*`) only, never in-process (`src/commands/machine.rs`).
+`member.*`; for `key rotate`, `pending`, `approve` and `deny`,
+`membership.*`) only, never in-process (`src/commands/machine.rs`).
 
 `add` first checks the machine's devsandbox (`ensure_devsandbox`, over
 [Install](#install)): `install::check` through the login `PATH`, then

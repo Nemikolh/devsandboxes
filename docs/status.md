@@ -34,7 +34,7 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 10 on. Steps 1-9 shipped: one kind of
+  re-placement: from fleet step 10b on. Steps 1-9 and 10a shipped: one kind of
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
@@ -48,9 +48,13 @@ limitation means editing this file in the same commit.
   out of the fleet on the hub (a member's is sent there), `machine rm
   <this host>` leaves, `machine unlink <m>` only drops this host's link
   (step 9d). A member's `run` is placed by the hub (step 9e,
-  `fleet.place`). Next: member identity, then routing over the graph
-  (step 10).
-  → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
+  `fleet.place`). Member identity (step 10a): every member has a key,
+  the fleet's membership is a log only its authority (the host that
+  made it) signs, every link proves both ends' keys against it, and a
+  change typed on another member (`machine rm`, `machine key rotate`,
+  an introduction) waits for `machine approve` on the authority. Next:
+  routing over the graph (step 10b), then end-to-end sessions (10c).
+  → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#member-identity), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
 - **helper**: drop the host-side `lsof` fallback for a forward's listening
@@ -268,7 +272,7 @@ limitation means editing this file in the same commit.
   proposed at all. → [fleet](architecture/daemon/fleet.md#approvals-and-pushes);
   `machines::api::add`, `machines::changes::propose`
 - Membership proposals (`fleet.propose`: a member's `machine rm`, its
-  own leave, an introduction) reach the authority only over a direct link
+  own leave, its `machine key rotate`, an introduction) reach the authority only over a direct link
   to it until fleet step 10b routes over the graph; without one they're
   refused naming the authority.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `machines::changes::propose`
@@ -278,6 +282,10 @@ limitation means editing this file in the same commit.
 - A capped (introduced) member can't rotate its key: the log has no key
   of it to rotate until the authority adds it.
   → [fleet](architecture/daemon/fleet.md#member-identity); `machines::changes::can_rotate`
+- Fleets made before member identity (fleet step 10a) have no
+  membership log: their links are refused until the fleet is made again
+  with `machine add` (fleet plan decision 52).
+  → [fleet](architecture/daemon/fleet.md#key-proof); `fleet::proof::Identity::load`
 - `machine add` has no `--command`: it sets `command` only when it finds or
   installs devsandbox in `~/.local/bin` off the login `PATH`; a remote devsandbox
   anywhere else off `PATH` is set by hand in `machines.toml`.
@@ -287,7 +295,7 @@ limitation means editing this file in the same commit.
   that's a symlink replaces the link with a file (`install::INSTALL`'s
   `mv -f`). → [machines](architecture/daemon/machines.md#install)
 - Machines a fleet member sees only through its hub (`via` in the
-  snapshot) are view-only until fleet step 10 routes over the graph:
+  snapshot) are view-only until fleet step 10b routes over the graph:
   actions, `machine`-param requests, `machines.get`/`set`, forwards and
   terminals on them are refused naming the hub, and the federated
   `instances.resolve` / `sandboxes.list` don't ask them. One hop only:
@@ -359,7 +367,7 @@ limitation means editing this file in the same commit.
   in its `member.toml`, so its `worker` trust refuses those of its roots
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
   add <root>…` on the machine, or `machine unlink` + `machine add` it again.
-  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmtrustroots); `commands::machine::record_roots`
+  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots); `commands::machine::record_roots`
 - No command sets this host's member name (what the machines it dials
   know it by, `fleet-link --peer <name>`): it's `member.toml`'s `name`,
   set only through `member.set {name}` (API) or by hand, else the
@@ -441,7 +449,7 @@ limitation means editing this file in the same commit.
 - A member's `run` has only the machines it links to directly as
   candidates (the hub, and those of its machines the hub links to too):
   those it sees only through
-  the hub can't take its code until routing (fleet step 10), so the hub
+  the hub can't take its code until routing (fleet step 10b), so the hub
   never picks them.
   → [fleet](architecture/daemon/fleet.md#a-members-run); `fleet::placed::member_workers`
 - A placed `run` moves committed, pushed work
