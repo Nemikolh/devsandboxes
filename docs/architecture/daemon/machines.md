@@ -12,7 +12,8 @@ touching anything that takes a `machine` param or a `m/name`.
 
 Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 `RawEntry`, `path`, `parse`, `update`, `inbound.rs` (`Neighbors`, `Guard`),
-`check_name`, `Where`, `parse_name`, `default_name`), `ssh.rs`
+`check_name`, `Where`, `parse_name`), `join.rs` (`plan`, `Plan`, `Fleet`,
+`Joined`), `ssh.rs`
 (`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
 `parse_target`, `Dial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
@@ -57,7 +58,10 @@ command resolves exactly as without machines and never contacts a daemon it
 didn't need.
 
 Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
-Default: the target's host (`default_name`). `parse_name` splits a CLI
+A machine's registry name is its member name (fleet plan decision 35):
+without `--name`, `machines.add` takes it from the machine's `member.get`;
+`--name` renames the machine only while it joins a fleet by that add
+([`machine add`](#devsandbox-machine-addlssetrmtrustroots)). `parse_name` splits a CLI
 `<name>`: `m/x` → `Where::Machine`, `@/x` → `Where::Local`, bare →
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
@@ -553,9 +557,27 @@ instance goes. A failure (ssh, a non-zero exit, a devsandbox there without
 the command) is a `warning:` line (`roots_warning`) naming the target and
 the `machine roots add` to run there, since under the machine's `worker`
 trust the hub may be refused those roots
-([fleet.md](fleet.md#the-trust-table)); the add goes on. `add
---agent` saves the machine with `agent` on; adding a name that exists is
-refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
+([fleet.md](fleet.md#the-trust-table)); the add goes on.
+
+`machines.add` also applies the join rule
+([fleet.md](fleet.md), *How a machine joins*): on the same probe it asks
+the machine's `member.get` and `machines.list`, reads this host's
+`member.toml` (`Ctx::member`, the name `Member::name_or` the hostname),
+and `join::plan` decides from both ends' hubs who joins, the registry
+name, and what each end writes, refusing two hubs (`denied`) and a
+joining name the fleet already has. Every check (names, roots, the
+registry and the inbound neighbors) comes before any write; then the
+machine's `member.set {name, hub}` over the still-open probe, this
+host's registry entry, this host's `hub` with its `name` (`member::set`, then
+`Ctx::hub_changed`, which is `daemon::Shared::set_hub` as after a
+`member.set` call), and the links reload. A write that fails after an
+earlier one says what was already written. Each side that joins (or
+becomes the hub) gets its member name written with its `hub`, so a name
+that came from the hostname is pinned: the fleet knows it by that name.
+The answer's `fleet` is the
+fleet both ends are in and who joined; the CLI prints it on a line after
+`added …` (`fleet_line`). `add --agent` saves the machine with `agent`
+on; a name the registry or an inbound neighbor has is refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
 required) changes it on a registered machine and prints `<name>: agent
 on|off`; both are refused for an inbound one
 ([Inbound neighbors](#inbound-neighbors)). `ls` shows it in an `AGENT`

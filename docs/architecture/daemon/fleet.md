@@ -27,6 +27,28 @@ its rows, quick calls, verbs, terminals, forwards and placement reach
 it over the link L holds. L's agent reaches K's instances while L's
 entry for K has `agent` on; K's agent never reaches L.
 
+The add is also the join (`machines::join::plan`, run by `machines.add`
+over this host's `member.toml` and the target's `member.get` and
+`machines.list` on the add-time probe;
+[machines.md](machines.md#devsandbox-machine-addlssetrmtrustroots)).
+`machine add X` run on H, with "hub K" a member's hub by name (its own
+name when it's `self`):
+
+| H | X | result |
+|---|---|---|
+| hub K | in no fleet | X joins K's fleet: X's `hub` = K |
+| in no fleet | hub K | H joins K's fleet: H's `hub` = K |
+| in no fleet | in no fleet | a fleet of two: X's `hub` = H's name, H's `hub` = `self` |
+| hub K | hub K | an extra link in the same fleet: nothing written |
+| hub K | hub L | refused (`denied`), naming both |
+
+The link is H → X in every row; joining writes only the joiner's
+`hub`. X is registered under its member name; `--name` renames X (its
+`member.set {name}`, with the `hub`) only while X joins, and must be
+X's name when X is in a fleet already. A joiner whose name the fleet has
+is refused: X's against H's name, H's machines and H's hub; H's against
+X's name and X's `machines.list`. X's name is never H's.
+
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `cap_of`, `Handler`, `Serves`, `Endpoint`, `Socket`,
 `opener_with`, `answerer_with`, `run`, `Out`, `Outlet`, `Outlet::is_up`,
@@ -55,6 +77,7 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 (`dials`, `reconnect_loop`, `session_exec`, `pipe_mode`); hub mode:
 `src/serve/fleet/member.rs` (`Hub`, `Member::hub`), `src/serve/daemon.rs`
 (`Shared::hub`, `Shared::is_hub`, `Shared::set_hub`),
+`src/serve/machines/join.rs` (`plan`, `Plan`, `Fleet`, `Joined`),
 `src/serve/machines/service.rs` (`Hub`, `save_loop`, `log_failure`,
 `Handle::cycle`), `src/commands/fleet_link.rs` (`LINKS_CYCLE`,
 `AnnounceEnd`),
@@ -94,7 +117,7 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 (`hello_with`), `src/serve/endpoint.rs` (`peer_is_own_user`),
 `src/serve/daemon.rs` (`hello`); the member side:
 `src/serve/fleet/member.rs` (`Member`, `SoftCaps`, `load`, `check`,
-`update`, `default_name`, `merge`, `call`, `MemberInfo`),
+`update`, `default_name`, `check_member_name`, `merge`, `call`, `MemberInfo`),
 `src/serve/locked_file.rs` (`update`), `src/commands/machine.rs`
 (`trust`, `roots`, `record_roots`), `src/serve/fleet/lent.rs` (`Peer`,
 `Channel`, `attach_params`, `peer_fleet_root`, `Files`, `Reach`,
@@ -518,7 +541,8 @@ makes this host the hub; `hub = "<name>"` names another member as its
 fleet's hub, absent is in no fleet. The daemon is the file's only
 writer (decision 3), so it reads `hub` once at start into
 `Shared::hub` and from then on keeps it there itself: `member.set {hub}`
-writes the file and `Shared::set_hub` the value. Everything below asks
+(or `machines.add` joining this host to a fleet) writes the file and
+`Shared::set_hub` the value. Everything below asks
 `Shared::is_hub` at its use, so a change applies under a running
 daemon. A change also ends every link this host has, so both ends
 redial saying the new hub ([Versions](#versions)): each ssh machine's
@@ -758,7 +782,9 @@ there only through the trust table.
   `state.toml`, `fleet::member::path`; `Options::member` in tests) is
   this host as a member. Keys: `name` (what this host goes by on the
   links it dials; absent is the hostname's first label,
-  `member::default_name`, which must pass `machines::check_name`), `hub`
+  `member::default_name`; either must pass `member::check_member_name`:
+  `machines::check_name`, and never `self`, which `hub` reads as this
+  host), `hub`
   (`self` on the hub, else the hub's member name; absent is in no fleet:
   [Hub mode](#hub-mode)),
   `trust` (`worker` | `full`, absent is `worker`: [Trust](#trust)),
@@ -774,7 +800,7 @@ there only through the trust table.
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
   `disk`, `instances`, each optional; `mem` and `disk` sizes like `16G`,
   checked by `capacity::parse_size`). Unknown keys are ignored.
-  `member::check`: a `name` that's set is valid, a `hub` that's set is
+  `member::check`: a `name` that's set is a valid member name, a `hub` that's set is
   `self` or a valid name, `roots` are absolute,
   `[caps]` and `[allow]` well-formed. The daemon is its only writer
   ([Member: `member.*`](#member-member)), with `member::update`, a
@@ -943,14 +969,16 @@ Wire: [`member.*`](../../reference/api.md#member).
   fleet), `trust`, `dev_builds` as the file says, and `roots`.
 - **`member.set {name?, hub?, trust?, roots_add?, roots_rm?}`** merges what's
   given into the file (`member::merge`, pure: `name` a
-  `machines::check_name`, `""` clears it; `hub` `self` or a
+  `member::check_member_name`, `""` clears it; `hub` `self` or a
   `machines::check_name`, `""` clears it; `roots_add` absolute, one
   already there kept once; `roots_rm` drops what it names), checks it and
   writes it. It answers the `MemberInfo` after the change. A changed
   name is what the next dial of each link says (`dialer::member_name`
   reads it per dial); a changed `hub` is the daemon's
   (`Shared::set_hub`), which ends this host's links ([Hub
-  mode](#hub-mode)). No CLI sets `hub` yet.
+  mode](#hub-mode)). `machine add` sets `hub` on the end that joins
+  (on the machine over the add-time probe; on this host through
+  `member::set` and `Shared::set_hub`, the same as a call's).
 
 ### Trust
 

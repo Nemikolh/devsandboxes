@@ -428,13 +428,17 @@ enum MachineCommand {
     /// copy this one there (to ~/.local/bin/devsandbox when missing, in
     /// place when updating); off a TTY it fails unless --auto-install.
     ///
+    /// Both ends end up in one fleet: the machine joins this host's, this
+    /// host joins the machine's, or (neither in one) a fleet of two with
+    /// this host the hub. Two different fleets are refused.
+    ///
     ///     devsandbox machine add me@my-server
     ///
     ///     devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
     Add {
         /// What ssh takes (`me@host`, an ssh-config alias) or `ssh://[user@]host[:port]`
         target: String,
-        /// The machine's name (default: the target's host)
+        /// The machine's name (default: its member name; renames it only while it joins a fleet)
         #[arg(long)]
         name: Option<String>,
         /// A config root on the machine (repeatable)

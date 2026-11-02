@@ -41,9 +41,11 @@ limitation means editing this file in the same commit.
   probe; a laptop joins a hub with `machine add <hub>`; a hub (`hub =
   "self"` in `member.toml`, step 9a) places over every connected
   machine, and a link between two hosts naming different hubs is
-  refused. Nothing sets `hub` but `member.set` yet: `machine add`'s join
-  rule (9b) and `machine rm` (9d) will. Next: the rest of membership
-  (step 9), routing over the graph (step 10).
+  refused. `machine add` joins (step 9b): the end in no fleet takes the
+  other's hub, two ends in none make a fleet of two, two hubs are
+  refused; nothing takes a member out of a fleet yet but `member.set
+  {hub: ""}` (`machine rm` and leaving: 9d). Next: the rest of
+  membership (step 9), routing over the graph (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)

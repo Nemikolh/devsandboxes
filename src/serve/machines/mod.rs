@@ -38,6 +38,7 @@ pub mod cli;
 pub mod forward;
 pub mod inbound;
 pub mod install;
+pub mod join;
 pub mod link;
 pub mod saved;
 pub mod service;
@@ -311,19 +312,6 @@ pub fn no_machine(name: &str) -> anyhow::Error {
     anyhow::anyhow!("no machine named `{name}` (devsandbox machine ls)")
 }
 
-/// The name `machine add` gives a target without `--name`: its host
-/// (`me@my-server.com` → `my-server.com`, `ssh://me@box:2200` → `box`, an
-/// ssh-config alias as is). A host that isn't a valid name (an IPv6
-/// address, ssh's own `host:port`) is an error that asks for `--name`.
-pub fn default_name(target: &str) -> Result<String> {
-    let host = ssh::parse_target(target)?.host;
-    let host = host.rsplit_once('@').map_or(host.as_str(), |(_, h)| h);
-    match check_name(host) {
-        Ok(()) => Ok(host.to_string()),
-        Err(e) => bail!("cannot name a machine after `{host}` ({e:#}); pass --name"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,18 +444,5 @@ mod tests {
             assert!(parse_name(bad).is_err(), "{bad:?} parsed");
         }
         assert_eq!(no_machine("m").to_string(), "no machine named `m` (devsandbox machine ls)");
-    }
-
-    #[test]
-    fn default_names_are_the_host() {
-        assert_eq!(default_name("me@my-server.com").unwrap(), "my-server.com");
-        assert_eq!(default_name("ssh://me@box:2200").unwrap(), "box");
-        assert_eq!(default_name("ssh://box").unwrap(), "box");
-        assert_eq!(default_name("my-alias").unwrap(), "my-alias");
-        assert_eq!(default_name("10.0.0.5").unwrap(), "10.0.0.5");
-        for (target, why) in [("ssh://[::1]:22", "pass --name"), ("me@host:22", "pass --name"), ("-x", "starts with `-`")] {
-            let err = format!("{:#}", default_name(target).unwrap_err());
-            assert!(err.contains(why), "{target}: {err}");
-        }
     }
 }

@@ -129,6 +129,16 @@ impl Hub {
     }
 }
 
+/// A member name: a valid machine name but `self`, which `hub = "self"`
+/// reads as this host.
+pub fn check_member_name(name: &str) -> Result<()> {
+    check_name(name)?;
+    if name == HUB_SELF {
+        bail!("`{HUB_SELF}` is reserved (`hub = \"{HUB_SELF}\"` means this host)");
+    }
+    Ok(())
+}
+
 /// `hub` is empty, `self` or a valid machine name.
 fn check_hub(hub: &str) -> Result<()> {
     if !hub.is_empty() && hub != HUB_SELF {
@@ -174,11 +184,11 @@ pub fn parse(text: &str) -> Result<Member> {
     Ok(member)
 }
 
-/// A `name` that's set is a valid machine name, `roots` are absolute, and
+/// A `name` that's set is a valid member name, `roots` are absolute, and
 /// `[caps]` and `[allow]` are well-formed.
 pub fn check(member: &Member) -> Result<()> {
     if !member.name.is_empty() {
-        check_name(&member.name).context("`name`")?;
+        check_member_name(&member.name).context("`name`")?;
     }
     check_hub(&member.hub)?;
     if let Some(bad) = member.roots.iter().find(|r| !r.is_absolute()) {
@@ -209,10 +219,10 @@ pub fn load(path: &Path) -> Result<Option<Member>> {
 }
 
 /// The name a member goes by without `name`: the hostname's first label
-/// (`lap.local` → `lap`), if it's a valid machine name.
+/// (`lap.local` → `lap`), if it's a valid member name.
 pub fn default_name(hostname: &str) -> Result<String> {
     let label = hostname.split('.').next().unwrap_or_default();
-    match check_name(label) {
+    match check_member_name(label) {
         Ok(()) => Ok(label.to_string()),
         Err(e) => bail!("cannot name this host after hostname `{hostname}` ({e:#}); set `name` in member.toml (next to state.toml)"),
     }
@@ -257,7 +267,7 @@ pub struct SetParams {
 pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
     if let Some(name) = &p.name {
         if !name.is_empty() {
-            check_name(name).map_err(|e| ApiError::invalid(format!("`name`: {e:#}")))?;
+            check_member_name(name).map_err(|e| ApiError::invalid(format!("`name`: {e:#}")))?;
         }
         member.name = name.clone();
     }
@@ -359,6 +369,7 @@ mod tests {
         assert!(parse("trust = \"worker\"\nlater = 1\n").is_ok(), "unknown keys are ignored");
         assert!(parse("trust = \"most\"\n").is_err());
         assert!(parse("name = \"a/b\"\n").is_err());
+        assert!(parse("name = \"self\"\n").is_err(), "`self` is reserved");
         assert!(parse("roots = [\"rel\"]\n").is_err(), "roots are absolute");
         // `[allow]`.
         let a = parse("[allow]\nprivileged = true\nbinds = [\"/srv/x\"]\nlater = true\n").unwrap().allow;
@@ -416,6 +427,7 @@ mod tests {
         assert_eq!(default_name("box").unwrap(), "box");
         assert!(default_name("").is_err());
         assert!(default_name("a b").is_err());
+        assert!(default_name("self.local").is_err(), "`self` is reserved");
         let m = Member { name: "mine".into(), ..Default::default() };
         assert_eq!(m.name_or("a b").unwrap(), "mine");
         assert_eq!(Member::default().name_or("lap.local").unwrap(), "lap");
@@ -438,6 +450,7 @@ mod tests {
         assert_eq!(merge(hub, &p(json!({"hub": ""}))).unwrap().hub(), Hub::None, "cleared");
         let code = |v: Value| merge(named.clone(), &p(v)).unwrap_err().code;
         assert_eq!(code(json!({"name": "a/b"})), "invalid");
+        assert_eq!(code(json!({"name": "self"})), "invalid");
         assert_eq!(code(json!({"roots_add": ["rel"]})), "invalid");
         assert_eq!(code(json!({"hub": "a b"})), "invalid");
         // Hand-edited parts aren't settable.

@@ -346,6 +346,18 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         version: opts.version.semver.clone(),
         links: Some(links.handle()),
         inbound: Arc::clone(&inbound),
+        member: shared.member.clone(),
+        hostname: shared.hostname.clone(),
+        // `machines.add` wrote this host's `hub` through `member::set`: the
+        // same follow-up as a `member.set` call's.
+        hub_changed: {
+            let hooked = Arc::clone(&hooked);
+            Box::new(move |hub| {
+                if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
+                    s.set_hub(hub);
+                }
+            })
+        },
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));

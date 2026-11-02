@@ -822,6 +822,21 @@ export interface MachineAdded {
   version: string;
   /** Set when that semver differs from this daemon's. */
   warning: string | null;
+  /** The fleet both ends are in after the add. */
+  fleet: MachineFleet;
+}
+
+/**
+ * Who joined at `machines.add`: `target` the machine joined this host's fleet, `this` this host
+ * joined the machine's, `new` a fleet of two with this host the hub, `same` both were in it already.
+ */
+export type FleetJoined = 'target' | 'this' | 'new' | 'same';
+
+/** `machines.add`'s `fleet`. */
+export interface MachineFleet {
+  /** The hub's member name. */
+  hub: string;
+  joined: FleetJoined;
 }
 
 /** `machines.get`'s answer (a registered machine or an inbound one): what an ssh command to the machine needs. */

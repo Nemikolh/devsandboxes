@@ -34,6 +34,7 @@ use crate::serve::endpoint;
 use crate::serve::fleet::member::{MemberInfo, Trust};
 use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
+use crate::serve::machines::join::{Fleet, Joined};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
 use crate::serve::machines::ssh;
 
@@ -58,10 +59,22 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, au
     let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "agent": agent, "command": command }))?;
     let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
     println!("added {} ({target}): {}", added.name, roots.join(", "));
+    println!("{}", fleet_line(&added.name, &added.fleet));
     if let Some(warning) = added.warning {
         eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+/// What `add`'s join did, in one line.
+fn fleet_line(name: &str, fleet: &Fleet) -> String {
+    let hub = &fleet.hub;
+    match fleet.joined {
+        Joined::Target => format!("{name} joined {hub}'s fleet"),
+        Joined::This => format!("this host joined {hub}'s fleet"),
+        Joined::New => format!("a fleet of two: this host ({hub}) is the hub"),
+        Joined::Same => format!("an extra link in {hub}'s fleet"),
+    }
 }
 
 /// Record `roots` as `target`'s own (its `member.toml` `roots`, decision 17
@@ -582,6 +595,15 @@ mod tests {
         for bad in ["", " , ", "0", "5", "x", "3-1", "1-", "-2"] {
             assert!(parse_selection(bad, 3).is_err(), "{bad:?} parsed");
         }
+    }
+
+    #[test]
+    fn the_join_is_one_line() {
+        let line = |joined| fleet_line("box", &Fleet { hub: "k".into(), joined });
+        assert_eq!(line(Joined::Target), "box joined k's fleet");
+        assert_eq!(line(Joined::This), "this host joined k's fleet");
+        assert_eq!(line(Joined::New), "a fleet of two: this host (k) is the hub");
+        assert_eq!(line(Joined::Same), "an extra link in k's fleet");
     }
 
     #[test]
