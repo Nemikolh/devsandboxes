@@ -382,8 +382,9 @@ impl Statement {
     }
 }
 
-/// `[u8; 32]` as 64 lowercase hex digits.
-mod hex32 {
+/// `[u8; 32]` as 64 lowercase hex digits (`#[serde(with = "hex32")]`; the
+/// membership log's hashes use it too).
+pub(crate) mod hex32 {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {

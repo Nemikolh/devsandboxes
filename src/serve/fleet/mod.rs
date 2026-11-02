@@ -16,6 +16,9 @@
 //! - `identity`: this member's key (`member.key`, behind a `KeyStore`),
 //!   public keys' text form and fingerprint, domain-separated signatures,
 //!   signed statements and the rollback check.
+//! - `membership`: the membership log (`membership.json`), a hash chain
+//!   the authority signs, its heads compared, and the introductions held
+//!   beside it.
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an
@@ -48,6 +51,7 @@ pub mod identity;
 pub mod lent;
 pub mod link;
 pub mod member;
+pub mod membership;
 pub mod place;
 pub mod placed;
 pub mod pty;

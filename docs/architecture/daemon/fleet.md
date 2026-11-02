@@ -1151,6 +1151,84 @@ signatures, signed statements and the rollback rule.
   (`Refusal::Equivocation`) or a lower one (`Refusal::Rollback`) is
   refused, and a refusal records nothing.
 
+#### Membership log
+
+Who is in the fleet, with which key, and which member is the hub is a
+hash chain of entries only the authority signs
+(`src/serve/fleet/membership.rs`, pure but for its file).
+
+- **Entries** (`Entry {op, prev, statement}`): `prev` is the previous
+  entry's hash (zeros for the first), `statement` the authority's
+  `Statement` of kind `membership` whose `version` is the entry's
+  sequence number (0 for the first) and whose payload is `prev` then
+  the op, each field length-prefixed (u32 big-endian), keys and
+  signatures raw; never the serde output. An entry carries its op, so
+  `Statement::verify_payload` checks it alone. An entry's hash
+  (`Entry::hash`) is the sha256 of the statement's signed bytes and its
+  signature.
+- **Ops** (`Op`): `genesis {id, authority, key, hub}` (the first entry,
+  and only it: the authority, a member with `key`, signs it and every
+  later entry; the hub may be a member a later entry adds; `id` is 16
+  random bytes, 32 hex digits on the wire, drawn by `Op::genesis`, since
+  signing is deterministic and a fleet one authority makes again with the
+  same hub would otherwise have the same genesis, the same fleet to a
+  member holding the first one's log), `add {name, key}`,
+  `revoke {name, key}`, `rotate {name, old, new, by_old}` and `hub
+  {name}`. `rotate`'s `by_old` is the old key's signature
+  (`countersign_rotate`, in `ROTATE_DOMAIN`) over the fleet's genesis
+  hash, the name and the new key, so the authority's key alone can't
+  swap a member's.
+- **Rules** (`apply`, entry by entry): numbered from 0 with no gap;
+  each one's `prev` the hash of the one before; signed by the authority's
+  name and its key as of that entry (a `rotate` of the authority changes
+  the key later entries are signed with). `add` refuses a name already a
+  member, a revoked key and another member's key, and names go through
+  `member::check_member_name`; `revoke` needs the member's current key
+  and refuses the authority (it rotates instead) and the hub (another is
+  named first); `rotate` needs the current key as `old`, a valid
+  `by_old`, and a `new` neither revoked nor in use, and revokes `old`;
+  `hub` names a current member. The result, `Membership`: the authority
+  (name and key), the hub, the members and their keys, the revoked keys,
+  the head and the genesis hash (which fleet this is).
+  `membership::hub_for` is what this host's `member.toml` `hub` reads as
+  from it (`self` when the log's hub is this host).
+- **The log** (`Log`) is kept verified: `Log::append` signs the next
+  entry and takes it only if it applies; `Log::extend` takes a peer's
+  entries that continue ours (a run we already have is skipped), refusing
+  a gap, an entry that differs from ours or doesn't follow our head (a
+  fork; named as another fleet's entries when they differ at the
+  genesis, past it the heads' comparison tells which) and any that
+  doesn't apply, leaving the log unchanged. `Log::entries_after(len)` is
+  what a peer whose log has `len` entries lacks.
+- **Heads** (`Head {len, hash, genesis}`: the hashes of the last and
+  the genesis entry, zeros when empty) compare on their own (`compare`):
+  equal is `Same`; two non-empty logs with different genesis hashes are
+  `Fork { another_fleet: true }` (another fleet), whatever their
+  lengths; otherwise a longer head is `Behind` (the entries, when they
+  come, go through `Log::extend`), a shorter one `Ahead` when our entry
+  at its end hashes as it does (an empty log is behind every log), and
+  the rest `Fork { another_fleet: false }`: one authority signed two
+  histories.
+- **Introductions** (`Introduction {name, key, introducer, statement}`)
+  sit outside the chain: a member's word that `name` is `key`, a
+  `Statement` of kind `introduction` by the introducer's key (version 0)
+  over the genesis hash, the name and the key, so it holds in one fleet
+  only. `check_introduction` takes it when the introducer is a member of
+  the log with that key (an introduced member is capped and introduces no
+  one), the name and key aren't in the log, and the signature holds.
+  `Membership::drop_settled` drops those the log has since settled: the
+  name or key now in it (added, or decided otherwise) or the introducer
+  no longer a member with the key that signed it.
+- **`membership.json`**, next to `state.toml` (`membership::path`),
+  written by the daemon only: `{"entries": [...], "introductions":
+  [...]}`, an entry on the wire being its op's fields (tagged by `op`)
+  beside `prev` and `statement`. A missing file is no fleet's log.
+  `membership::load` verifies the log and every held introduction (one
+  per name and key) and refuses a file that doesn't verify rather than
+  dropping any of it; `membership::update` is a read-modify-write under
+  `membership.lock` (`locked_file`) that drops settled introductions and
+  saves only state that verifies, never overwriting a file that doesn't.
+
 ### Trust
 
 `member.toml`'s `trust` is this member's own setting, changed only on it:
