@@ -38,9 +38,12 @@ limitation means editing this file in the same commit.
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
-  probe; a laptop joins a hub with `machine add <hub>`; a hub (`[serve]
-  hub`) places over every connected machine. Next: membership and the
-  hub in `member.toml` (step 9), routing over the graph (step 10).
+  probe; a laptop joins a hub with `machine add <hub>`; a hub (`hub =
+  "self"` in `member.toml`, step 9a) places over every connected
+  machine, and a link between two hosts naming different hubs is
+  refused. Nothing sets `hub` but `member.set` yet: `machine add`'s join
+  rule (9b) and `machine rm` (9d) will. Next: the rest of membership
+  (step 9), routing over the graph (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -368,8 +371,8 @@ limitation means editing this file in the same commit.
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::candidates`
 - A placed `run` is placed only by the daemon's `run` verb: a CLI `run`
   with no daemon to reach, the dispatcher's children and `--in-process`
-  runs stay here (fleet step 13 for children), and only a hub (`[serve]
-  hub`) places: a `run` typed elsewhere stays there (step 9 sends it to
+  runs stay here (fleet step 13 for children), and only a hub (`hub =
+  "self"` in `member.toml`) places: a `run` typed elsewhere stays there (step 9 sends it to
   the hub). On a hub every connected machine is a candidate (ssh and
   inbound), so it asks each a `capacity.get` (2 s at most)
   before every unpinned `run` (`--here` keeps it local).

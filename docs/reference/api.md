@@ -183,7 +183,7 @@ connection closing doesn't remove a newer one's.
 
 | params | result | errors |
 |---|---|---|
-| `{"peer": name, "version": hello, "hub"?: bool}`: `peer` a machine name; `version` the dialer's link `Hello` (`<semver> <git> <published\|dev> <os>/<arch> <hub\|member>`); `hub` (default `false`) whether it said it's the hub | `{"ok": true}`; then the daemon asks `peer`'s roots over the link (`roots.list` through `fleet-<peer>.sock`) | `denied` (a remote caller's connection or another uid's; or `machines.toml` has an entry named `peer`, any kind: the message names it), `invalid` (a bad name, a missing param), `failed` (no machines registry), `internal` (`machines.toml` doesn't read) |
+| `{"peer": name, "version": hello, "hub"?: bool}`: `peer` a machine name; `version` the dialer's link `Hello` (`<semver> <git> <published\|dev> <os>/<arch> <hub\|member> <hub name\|->`); `hub` (default `false`) whether it said it's the hub | `{"ok": true}`; then the daemon asks `peer`'s roots over the link (`roots.list` through `fleet-<peer>.sock`). When this host's hub changes the daemon sends `links.cycle` (no params) on this connection: the `fleet-link` ends the link | `denied` (a remote caller's connection or another uid's; or `machines.toml` has an entry named `peer`, any kind: the message names it), `invalid` (a bad name, a missing param), `failed` (no machines registry), `internal` (`machines.toml` doesn't read) |
 
 ## Inbox threads
 
@@ -1143,13 +1143,17 @@ connection under either trust (*Remote callers*).
 
 | method | params | result | errors |
 |---|---|---|---|
-| `member.get` | `{}` | `{"name", "trust", "dev_builds", "roots"}` | `internal` (`member.toml` doesn't parse), `failed` (no data dir) |
-| `member.set` | `{"name"?, "trust"?, "roots_add"?, "roots_rm"?}`: each one given is changed | as `member.get`, after the change | `invalid` (an unknown param or `trust`, a bad `name`, a relative root), `failed` (no data dir), `internal` (`member.toml` doesn't read or write) |
+| `member.get` | `{}` | `{"name", "hub", "trust", "dev_builds", "roots"}` | `internal` (`member.toml` doesn't parse), `failed` (no data dir) |
+| `member.set` | `{"name"?, "hub"?, "trust"?, "roots_add"?, "roots_rm"?}`: each one given is changed | as `member.get`, after the change | `invalid` (an unknown param or `trust`, a bad `name` or `hub`, a relative root), `failed` (no data dir), `internal` (`member.toml` doesn't read or write) |
 
 - `name`: the name this host goes by in the fleet: the one set, else the
   hostname's first label; `null` when neither is a valid machine name.
   `member.set {name: ""}` clears it. A link this host dials says the new
   name from its next dial.
+- `hub`: the fleet's hub: `"self"` on the hub, else the hub's member
+  name; `null` in no fleet. `member.set {hub: ""}` clears it. A change
+  ends every link of this host (both ends redial saying the new hub,
+  [fleet.md](../architecture/daemon/fleet.md#hub-mode)).
 - `trust`: `worker` (the default: a remote caller reaches this host's
   own roots and its fleet root, placed work under the worker policy) or
   `full` (the whole API but `member.*`, `link.*` and `links.*`, no worker policy,

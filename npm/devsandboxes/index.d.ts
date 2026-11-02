@@ -866,6 +866,8 @@ export type MemberTrust = 'worker' | 'full';
 export interface MemberInfo {
   /** `member.toml`'s `name`, else the hostname's first label; `null` when neither is a valid name. */
   name: string | null;
+  /** The fleet's hub: `'self'` on the hub, else the hub's member name; `null` in no fleet. */
+  hub: string | null;
   trust: MemberTrust;
   /** `dev-builds` as the file says (`full` takes the hub's dev builds either way). */
   dev_builds: boolean;
@@ -1327,10 +1329,11 @@ export interface ApiMethods {
   /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. */
   'member.get': { params: {}; result: MemberInfo };
   /**
-   * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `trust`, and
-   * `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root.
+   * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `hub` (`'self'`
+   * or the hub's member name, `''` clears it; a change ends every link of this host, which redial), `trust`, and
+   * `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or hub, or a relative root.
    */
-  'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
+  'member.set': { params: { name?: string; hub?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

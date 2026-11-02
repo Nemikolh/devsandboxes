@@ -17,6 +17,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -27,35 +28,56 @@ use crate::serve::endpoint;
 use crate::serve::machines::install;
 use crate::serve::proto::Version;
 
-/// [`HELLO`] followed by its link's `<hub|member>` word, what a peer link
-/// (`fleet-link --peer`, docs/architecture/daemon/fleet.md, *Peer links*)
-/// says: [`hello_of`], read back by [`is_hub`].
-macro_rules! hello {
-    ($flag:literal) => {
-        concat!(
-            env!("CARGO_PKG_VERSION"),
-            " ",
-            env!("DEVSANDBOX_BUILD_GIT"),
-            " ",
-            env!("DEVSANDBOX_BUILD_KIND"),
-            " ",
-            env!("DEVSANDBOX_BUILD_PLATFORM"),
-            $flag
-        )
-    };
-}
-
 /// What this build says in the fleet link's `Hello`:
 /// `<semver> <git hash> <published|dev> <os>/<arch>`, stamped by `build.rs`
 /// (`DEVSANDBOX_BUILD_GIT`, `DEVSANDBOX_BUILD_KIND`,
 /// `DEVSANDBOX_BUILD_PLATFORM`).
-pub const HELLO: &str = hello!("");
+pub const HELLO: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " ",
+    env!("DEVSANDBOX_BUILD_GIT"),
+    " ",
+    env!("DEVSANDBOX_BUILD_KIND"),
+    " ",
+    env!("DEVSANDBOX_BUILD_PLATFORM")
+);
 
-/// What this build says on a peer link: [`HELLO`] then `hub` when this
-/// host is the fleet's hub (`[serve] hub`, `daemon_config::ServeConfig::hub`),
-/// else `member`.
-pub fn hello_of(hub: bool) -> &'static str {
-    if hub { hello!(" hub") } else { hello!(" member") }
+/// What this build says on a peer link (`fleet-link --peer`,
+/// docs/architecture/daemon/fleet.md, *Peer links*): [`HELLO`], then `hub`
+/// when this host is the fleet's hub, else `member`, then the fleet's hub
+/// by member name (on the hub, its own), `-` in no fleet (fleet plan
+/// decision 34). Read back by [`is_hub`] and [`hub_of`]. A name that would
+/// overflow a `Hello` hash (255 bytes) is said as `-`.
+///
+/// Interned: `link::Spec::hello` is `&'static`, and a process only ever
+/// says a handful of these (one per hub it's had), so each distinct one is
+/// leaked once.
+pub fn hello_of(hub: bool, fleet: Option<&str>) -> &'static str {
+    static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let role = if hub { "hub" } else { "member" };
+    let mut hello = format!("{HELLO} {role} {}", fleet.unwrap_or("-"));
+    if hello.len() > u8::MAX as usize {
+        hello = format!("{HELLO} {role} -");
+    }
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = said.iter().find(|s| **s == hello) {
+        return s;
+    }
+    let s: &'static str = Box::leak(hello.into_boxed_str());
+    said.push(s);
+    s
+}
+
+/// [`hello_of`] for this host as `member.toml` says: its `hub`
+/// ([`super::member::Hub`]) and its own member name `own` (what the hub
+/// says as its fleet's).
+pub fn hello_for(hub: &super::member::Hub, own: Option<&str>) -> &'static str {
+    use super::member::Hub;
+    match hub {
+        Hub::None => hello_of(false, None),
+        Hub::This => hello_of(true, own),
+        Hub::Other(name) => hello_of(false, Some(name)),
+    }
 }
 
 /// Whether a peer link's `Hello` hash ([`hello_of`]) says its end is the
@@ -64,8 +86,27 @@ pub fn is_hub(hello: &str) -> bool {
     hello.split_whitespace().nth(4) == Some("hub")
 }
 
+/// The fleet a peer link's `Hello` hash ([`hello_of`]) says its end is in,
+/// by its hub's member name: its sixth word; `None` for `-` or none.
+pub fn hub_of(hello: &str) -> Option<&str> {
+    hello.split_whitespace().nth(5).filter(|w| *w != "-")
+}
+
+/// A link whose two ends name different hubs is refused (fleet plan
+/// decision 34; pure): `Err` with why, `peer` the far end's name. One end
+/// in no fleet, or both, is fine (`machine add`'s join rule puts them in
+/// one).
+pub fn same_fleet(peer: &str, ours: &str, theirs: &str) -> Result<(), String> {
+    match (hub_of(ours), hub_of(theirs)) {
+        (Some(ours), Some(theirs)) if ours != theirs => {
+            Err(format!("`{peer}` is in `{theirs}`'s fleet, this host in `{ours}`'s: a link between two fleets is refused"))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The words of a `Hello` hash that are the build (and platform): the first
-/// four, without a peer link's hub flag.
+/// four, without a peer link's hub words.
 fn build_words(hello: &str) -> impl Iterator<Item = &str> {
     hello.split_whitespace().take(4)
 }
@@ -238,7 +279,7 @@ pub fn update(steps: &dyn Steps, version: &str, os: &str, arch: &str, scratch: &
 /// binary and hand off to it: make it executable, check that it reports
 /// `hub` (the hub's `Hello` hash, every word), install it at
 /// [`Steps::dest`], check the installed binary reports `hub` too, then
-/// [`Steps::handoff`]. A peer link's hub flag in `hub` isn't part of the
+/// [`Steps::handoff`]. A peer link's hub words in `hub` aren't part of the
 /// build (`fleet-hello` prints [`HELLO`]). Removing `binary`'s scratch dir
 /// is the caller's.
 pub fn install_received(steps: &dyn Steps, binary: &Path, hub: &str) -> Result<()> {
@@ -408,14 +449,35 @@ pub(crate) mod tests {
         assert_eq!(platform_of("0.7.0 1a2b dev"), "unknown");
         assert_eq!(Build::parse("0.7.0 1a2b dev linux/x86_64"), build("0.7.0", "1a2b", false), "the platform isn't the build");
         assert_eq!(build("0.7.0", "1a2b", true).label(), "0.7.0 (published, 1a2b)");
-        // A peer link's hub flag: a fifth word, not part of the build.
-        assert_eq!(hello_of(true), format!("{HELLO} hub"));
-        assert_eq!(hello_of(false), format!("{HELLO} member"));
-        assert!(hello_of(true).len() <= u8::MAX as usize, "fits a `Hello` hash");
-        assert!(is_hub(hello_of(true)) && !is_hub(hello_of(false)));
+        // A peer link's hub words: the role, then the hub, not part of the build.
+        assert_eq!(hello_of(true, Some("box")), format!("{HELLO} hub box"));
+        assert_eq!(hello_of(false, Some("box")), format!("{HELLO} member box"));
+        assert_eq!(hello_of(false, None), format!("{HELLO} member -"));
+        assert!(std::ptr::eq(hello_of(false, Some("box")), hello_of(false, Some("box"))), "leaked once");
+        assert!(hello_of(true, Some("box")).len() <= u8::MAX as usize, "fits a `Hello` hash");
+        assert_eq!(hello_of(true, Some(&"x".repeat(250))), format!("{HELLO} hub -"), "too long a name isn't said");
+        assert!(is_hub(hello_of(true, None)) && !is_hub(hello_of(false, Some("hub"))));
         assert!(!is_hub(HELLO), "a hello without the flag never says hub");
         assert!(!is_hub("0.7.0 1a2b dev hub"), "the fifth word, not any");
-        assert_eq!((Build::parse(hello_of(true)), platform_of(hello_of(false))), (ours, PLATFORM));
+        assert_eq!((Build::parse(hello_of(true, None)), platform_of(hello_of(false, None))), (ours, PLATFORM));
+        assert_eq!((hub_of(hello_of(true, Some("k"))), hub_of(hello_of(false, Some("k")))), (Some("k"), Some("k")));
+        assert_eq!((hub_of(hello_of(false, None)), hub_of(HELLO), hub_of("0.7.0 a dev x/y hub")), (None, None, None));
+        use crate::serve::fleet::member::Hub;
+        assert_eq!(hello_for(&Hub::This, Some("k")), hello_of(true, Some("k")));
+        assert_eq!(hello_for(&Hub::Other("k".into()), Some("lap")), hello_of(false, Some("k")));
+        assert_eq!(hello_for(&Hub::None, Some("lap")), hello_of(false, None));
+    }
+
+    #[test]
+    fn two_fleets_never_link() {
+        let (k, l, none) = (hello_of(true, Some("k")), hello_of(false, Some("l")), hello_of(false, None));
+        assert_eq!(same_fleet("box", k, l), Err("`box` is in `l`'s fleet, this host in `k`'s: a link between two fleets is refused".into()));
+        assert!(same_fleet("box", l, k).unwrap_err().starts_with("`box` is in `k`'s fleet, this host in `l`'s"));
+        assert_eq!(same_fleet("box", k, hello_of(false, Some("k"))), Ok(()), "the same hub");
+        assert_eq!(same_fleet("box", k, none), Ok(()), "one end in no fleet");
+        assert_eq!(same_fleet("box", none, l), Ok(()));
+        assert_eq!(same_fleet("box", none, none), Ok(()));
+        assert_eq!(same_fleet("box", k, HELLO), Ok(()), "a hello without the words");
     }
 
     #[test]

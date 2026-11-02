@@ -53,8 +53,11 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `exit_of`, `Terminal`, `attach`, `dial`), `src/serve/machines/cli.rs`
 (`dials`, `reconnect_loop`, `session_exec`, `pipe_mode`); hub mode:
-`src/daemon_config.rs` (`ServeConfig::hub`),
-`src/serve/machines/service.rs` (`Hub`, `save_loop`, `log_failure`),
+`src/serve/fleet/member.rs` (`Hub`, `Member::hub`), `src/serve/daemon.rs`
+(`Shared::hub`, `Shared::is_hub`, `Shared::set_hub`),
+`src/serve/machines/service.rs` (`Hub`, `save_loop`, `log_failure`,
+`Handle::cycle`), `src/commands/fleet_link.rs` (`LINKS_CYCLE`,
+`AnnounceEnd`),
 `src/serve/machines/saved.rs` (`Saved`, `of`, `machines`, `load`,
 `save`, `save_wait`), `src/serve/snapshots.rs` (`Machine::set_link`,
 `Remotes::restore`); channels: `src/devsbd/proto.rs` (`channel::API`,
@@ -78,8 +81,8 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `Options::repos`), `src/serve/verbs.rs` (`RunParams::here`),
 `src/serve/verbs_client.rs` (`run_target`, `Streaming`),
 `src/serve/machines/cli.rs` (`plan`); versions:
-`src/serve/fleet/update.rs` (`HELLO`, `hello_of`, `is_hub`,
-`platform_of`, `Build`, `decide`, `Decision`, `hub_pushes`, `push`,
+`src/serve/fleet/update.rs` (`HELLO`, `hello_of`, `hello_for`, `is_hub`,
+`hub_of`, `same_fleet`, `platform_of`, `Build`, `decide`, `Decision`, `hub_pushes`, `push`,
 `install_received`, `scratch_dir`, `release_target`, `asset_url`,
 `curl_argv`, `update`, `Steps`, `Release`), `src/serve/fleet/follow.rs`
 (`Follow`, `Incoming`, `PUSH_WAIT`, `EndLink`, `shutting`),
@@ -242,9 +245,9 @@ read at each dial), and both ends run both halves of a link. K's end
 is `commands::fleet_link::run_peer` (`fleet_link_peer` from the CLI:
 the required `--peer` passes `machines::check_name`), ssh's child
 there, its stdio the link: the opener of `fleet::LINK` (it writes the
-sentinel), saying `update::hello_of(hub)` (below, *Versions*), `hub`
-read from `daemon.config.toml` as the daemon reads it
-(`daemon_config::load`).
+sentinel), saying `update::hello_for` this host's `hub` and member name
+(below, *Versions*), read from `member.toml` once at its start (each
+dial is a process of its own).
 
 - **IN.** Each stream L opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
   answered by `attach_stream`: a socket pair whose far end a thread takes,
@@ -286,7 +289,11 @@ read from `daemon.config.toml` as the daemon reads it
   refuses a live neighbor's name in turn. When the held
   connection drops (K's daemon handed off or restarted), `Announce`
   connects and announces again, backing off from `REANNOUNCE` (100 ms) to
-  5 s; the link stays up meanwhile. A refusal then ends the link.
+  5 s; the link stays up meanwhile. A refusal then ends the link, as
+  does a `links.cycle` notification on that connection (`LINKS_CYCLE`,
+  sent when K's hub changes: [Hub mode](#hub-mode)): `fleet-link` hangs
+  up its outlet and exits with `this host's hub changed: the link ends
+  so L redials it`.
 
 L's end is the daemon's: each ssh machine `K` in L's `machines.toml` is
 held by its `serve-machine-K-link` thread running
@@ -295,7 +302,8 @@ held by its `serve-machine-K-link` thread running
 redialed after the backoff (`service::backoff`: 1 s doubling to 30 s)
 whenever it ends, the far end's refusal (ssh's stderr tail) its error.
 It is the answerer of `fleet::LINK` (it reads the sentinel), saying
-`update::hello_of(hub)` for L, with the sentinel and the `Hello`s within
+`update::hello_for` L's hub as the daemon keeps it (`Dialer::hello`,
+read at each dial), with the sentinel and the `Hello`s within
 `machines::service::Timing::handshake`.
 
 - **OUT.** L binds `fleet-K.sock` in its socket dir (newest binder wins:
@@ -504,23 +512,37 @@ checkouts fall under the [worker policy](#worker-policy) like any other.
 
 ## Hub mode
 
-`[serve] hub = true` in `daemon.config.toml` (`ServeConfig::hub`, read
-once at start into `daemon::Options::hub`; `serve install` on the server
-keeps it running) makes the daemon a hub:
+`hub = "self"` in `member.toml` (`member::Hub::This`, decision 1 of the
+fleet plan; `serve install` on the server keeps the daemon running)
+makes this host the hub; `hub = "<name>"` names another member as its
+fleet's hub, absent is in no fleet. The daemon is the file's only
+writer (decision 3), so it reads `hub` once at start into
+`Shared::hub` and from then on keeps it there itself: `member.set {hub}`
+writes the file and `Shared::set_hub` the value. Everything below asks
+`Shared::is_hub` at its use, so a change applies under a running
+daemon. A change also ends every link this host has, so both ends
+redial saying the new hub ([Versions](#versions)): each ssh machine's
+carrier (`service::Handle::cycle`: its transport's socket shut, redialed
+at once, not after the backoff), and each `fleet-link --peer` it is
+dialed on (a `links.cycle` notification on that `fleet-link`'s held
+`links.inbound` connection, whose `Announce` hangs up the link; the
+dialer then redials). A hub:
 
-- **It never idles out**: `hub` implies `keep-alive` (`daemon::run`
-  passes `keep_alive` to `idle::decide` for a hub). Nothing else keeps a
-  daemon alive for the fleet.
+- **Never idles out**: the daemon's loop passes `keep_alive` to
+  `idle::decide` while it's the hub. Nothing else keeps a daemon alive
+  for the fleet.
 - **Its links say `hub`**: the `Hello` of every peer link it holds or is
-  dialed on ends `hub` (`update::hello_of`), so the member at the other
-  end follows its build ([Versions](#versions)), and pushes its dev build
-  to a member that takes one.
-- **It places runs**: its `run` verb places a request that names no
+  dialed on says `hub` and its own member name (`update::hello_for`), so
+  the member at the other end follows its build ([Versions](#versions)),
+  and it pushes its dev build to a member that takes one.
+- **Places runs**: its `run` verb places a request that names no
   machine ([In the `run` verb](#in-the-run-verb)).
-- **It saves the machines' rows**, `remotes.json` next to `state.toml`
+- **Saves the machines' rows**, `remotes.json` next to `state.toml`
   (`machines::saved::path`; `Options::remotes` in tests), so a restarted
-  hub shows the fleet before its machines reconnect. The
-  `serve-remotes` thread (`service::save_loop`) saves when the rows
+  hub shows the fleet before its machines reconnect: restored at the
+  start when this host is the hub then. The `serve-remotes` thread
+  (`service::save_loop`, `service::Hub::is_hub` asked at each save:
+  nothing is saved while this host isn't the hub) saves when the rows
   change (a pushed snapshot, a hello's version, a registry reload), at
   most every `saved::SAVE_EVERY` (5 s, `saved::save_wait`), and once more
   after the links stop; through `locked_file::update` (under
@@ -661,7 +683,7 @@ which repos a host has, so `has_repo` is the caller's to fill.
 
 ### In the `run` verb
 
-A hub's (`[serve] hub`) `run` verb places a request that names no
+A hub's (`member.toml`'s `hub = "self"`) `run` verb places a request that names no
 `machine` and isn't `here` (`daemon.rs` `placed_run`, the decisions pure
 in `fleet::placed`); any other host runs it here. The candidates are
 this host and every machine, ssh or inbound (`placed::workers`:
@@ -736,7 +758,9 @@ there only through the trust table.
   `state.toml`, `fleet::member::path`; `Options::member` in tests) is
   this host as a member. Keys: `name` (what this host goes by on the
   links it dials; absent is the hostname's first label,
-  `member::default_name`, which must pass `machines::check_name`),
+  `member::default_name`, which must pass `machines::check_name`), `hub`
+  (`self` on the hub, else the hub's member name; absent is in no fleet:
+  [Hub mode](#hub-mode)),
   `trust` (`worker` | `full`, absent is `worker`: [Trust](#trust)),
   `dev-builds` (take a hub's own binary when it runs a dev build,
   [Versions](#versions); absent is `false`, left out of the file while
@@ -750,7 +774,8 @@ there only through the trust table.
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
   `disk`, `instances`, each optional; `mem` and `disk` sizes like `16G`,
   checked by `capacity::parse_size`). Unknown keys are ignored.
-  `member::check`: a `name` that's set is valid, `roots` are absolute,
+  `member::check`: a `name` that's set is valid, a `hub` that's set is
+  `self` or a valid name, `roots` are absolute,
   `[caps]` and `[allow]` well-formed. The daemon is its only writer
   ([Member: `member.*`](#member-member)), with `member::update`, a
   read-modify-write under the sibling `member.lock`, written to a temp
@@ -781,11 +806,19 @@ A member follows its hub's exact build, an older one included
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
 on a [peer link](#peer-links), whichever end dialed (decision 25):
 
-- **The build in the `Hello`.** `fleet::LINK`'s `hello` is
-  `update::hello_of(hub)`: `fleet::update::HELLO`, `<semver> <git>
+- **The build in the `Hello`.** A peer link's `hello` is
+  `update::hello_of(hub, fleet)`: `fleet::update::HELLO`, `<semver> <git>
   <published|dev> <os>/<arch>` (`0.8.0 1a2b3c4d5e6f dev linux/x86_64`),
-  and a fifth word, `hub` when that end's host is the hub (`[serve]
-  hub`), else `member` (`update::is_hub` reads it). `HELLO` is from
+  then a fifth word, `hub` when that end's host is the hub, else
+  `member` (`update::is_hub` reads it), and a sixth, the fleet's hub by
+  member name (the hub's own name on the hub), `-` in no fleet
+  (`update::hub_of` reads it; decision 34): `<build> hub k`, `<build>
+  member k`, `<build> member -`. `update::hello_for` makes it of
+  `member.toml`'s `hub` and this host's member name; a name that would
+  overflow the `Hello` hash (255 bytes) is said as `-`. `link::Spec`'s
+  `hello` is `&'static`: each distinct one a process says is leaked once
+  (`hello_of` interns them). `HELLO` alone is `fleet::LINK`'s and what
+  `fleet-hello` prints. `HELLO` is from
   `build.rs`'s `stamp_build`: `DEVSANDBOX_BUILD_PLATFORM` is the target's
   `CARGO_CFG_TARGET_OS` / `CARGO_CFG_TARGET_ARCH` (what
   `std::env::consts` says); `DEVSANDBOX_BUILD_GIT` is `git rev-parse
@@ -796,8 +829,16 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   workflow), else `dev`. `Build::parse` reads the first three words back
   (a missing one is `unknown` / dev), `update::platform_of` the fourth
   (`unknown` without one): the platform isn't part of the build, one
-  release being built for several; both ignore the fifth.
+  release being built for several; both ignore the rest.
   `devsandbox fleet-hello` (hidden) prints `HELLO`.
+- **Two fleets never link** (`update::same_fleet`, pure, over both
+  `Hello`s): when both ends name a hub and the names differ the link is
+  refused before anything else, on both ends (the dialer's answerer
+  callback, `run_peer`'s opener callback), with `` `<peer>` is in
+  `<X>`'s fleet, this host in `<Y>`'s: a link between two fleets is
+  refused ``. One end in no fleet, or both, links.
+  [Hub mode](#hub-mode)'s change of `hub` ends the links so both ends
+  say the new one.
 - **Who follows** (`commands::fleet_link::follows`, pure, over both
   `Hello`s): the end that isn't the hub follows a hub peer through
   `update::decide`; two non-hubs only need the frame protocol's match; a
@@ -898,15 +939,18 @@ Wire: [`member.*`](../../reference/api.md#member).
 
 - **`member.get`** answers `MemberInfo`: the `name` this host goes by
   (`Member::name_or`: the file's, else the hostname's first label; `null`
-  when neither is valid), `trust`, `dev_builds` as the file says, and
-  `roots`.
-- **`member.set {name?, trust?, roots_add?, roots_rm?}`** merges what's
+  when neither is valid), `hub` (`self`, the hub's name, or `null` in no
+  fleet), `trust`, `dev_builds` as the file says, and `roots`.
+- **`member.set {name?, hub?, trust?, roots_add?, roots_rm?}`** merges what's
   given into the file (`member::merge`, pure: `name` a
+  `machines::check_name`, `""` clears it; `hub` `self` or a
   `machines::check_name`, `""` clears it; `roots_add` absolute, one
   already there kept once; `roots_rm` drops what it names), checks it and
   writes it. It answers the `MemberInfo` after the change. A changed
   name is what the next dial of each link says (`dialer::member_name`
-  reads it per dial).
+  reads it per dial); a changed `hub` is the daemon's
+  (`Shared::set_hub`), which ends this host's links ([Hub
+  mode](#hub-mode)). No CLI sets `hub` yet.
 
 ### Trust
 

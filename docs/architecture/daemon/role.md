@@ -131,8 +131,9 @@ The daemon exits `IDLE_TIMEOUT` (10 min) after its last holder left
   lose it as an inbound neighbor. A machine dialing this host holds it
   through its `fleet-link`'s `links.inbound` connection (`clients`). `--keep-alive` or `[serve] keep-alive = true` in
 `daemon.config.toml` (read once at start; a bad file is logged, defaults
-used) disables the idle exit, as does `[serve] hub = true` (a
-[fleet hub](fleet.md#hub-mode)).
+used) disables the idle exit, as does being a
+[fleet hub](fleet.md#hub-mode) (`hub = "self"` in `member.toml`, asked
+at each pass of the loop).
 
 ## Drain
 

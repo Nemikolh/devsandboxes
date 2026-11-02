@@ -26,7 +26,7 @@ use crate::serve::api::ApiError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Neighbor {
     pub name: String,
-    /// Its link `Hello` (`fleet::update::hello_of`: build, platform, hub flag).
+    /// Its link `Hello` (`fleet::update::hello_of`: build, platform, role, hub).
     pub version: String,
     /// It said it's the fleet's hub.
     pub hub: bool,

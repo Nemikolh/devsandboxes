@@ -61,7 +61,7 @@ use crate::devsbd::proto::channel;
 /// daemon's (decision 27 of the fleet plan). Both ends
 /// also serve `TRANSFER` streams ([`transfer`], `link::Serves::transfers`).
 /// Its `Hello` hash is this build
-/// ([`update::HELLO`]); a peer link's says the hub flag too
+/// ([`update::HELLO`]); a peer link's says its end's role and hub too
 /// (`update::hello_of`).
 pub const LINK: link::Spec = link::Spec {
     name: "fleet link",

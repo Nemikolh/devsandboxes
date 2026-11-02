@@ -1,7 +1,7 @@
 //! `member.toml`, next to `state.toml`: this host as a fleet member
 //! (docs/architecture/daemon/fleet.md, *Member file*): the name it goes by,
-//! its trust, the config roots it shows the fleet, and the hand-edited
-//! `[allow]`, `[caps]` and `dev-builds`.
+//! its fleet's hub, its trust, the config roots it shows the fleet, and the
+//! hand-edited `[allow]`, `[caps]` and `dev-builds`.
 //!
 //! Written by the daemon only (decision 3 of the fleet plan), through
 //! `member.set` ([`call`]; `devsandbox machine trust` and `machine roots`
@@ -33,6 +33,10 @@ pub struct Member {
     /// of the hostname.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// The fleet's hub ([`Member::hub`]): `self` on the hub, else the hub's
+    /// member name; empty is in no fleet (fleet plan decision 1).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hub: String,
     /// What a remote caller reaches here (`worker_policy::Trust`).
     pub trust: Trust,
     /// Take the hub's own binary when it runs an unpublished build
@@ -86,7 +90,58 @@ impl SoftCaps {
     }
 }
 
+/// `hub` in `member.toml`, typed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Hub {
+    /// In no fleet.
+    #[default]
+    None,
+    /// This host is the hub (`self`).
+    This,
+    /// The hub is the member of this name.
+    Other(String),
+}
+
+/// The `hub` value naming this host.
+pub const HUB_SELF: &str = "self";
+
+impl Hub {
+    /// The file's `hub` value read (`""`: none). Unchecked: [`check`] is.
+    pub fn of(field: &str) -> Hub {
+        match field {
+            "" => Hub::None,
+            HUB_SELF => Hub::This,
+            name => Hub::Other(name.to_string()),
+        }
+    }
+
+    /// What the file and `member.get` say: `None` in no fleet.
+    pub fn field(&self) -> Option<String> {
+        match self {
+            Hub::None => None,
+            Hub::This => Some(HUB_SELF.into()),
+            Hub::Other(name) => Some(name.clone()),
+        }
+    }
+
+    pub fn is_this(&self) -> bool {
+        *self == Hub::This
+    }
+}
+
+/// `hub` is empty, `self` or a valid machine name.
+fn check_hub(hub: &str) -> Result<()> {
+    if !hub.is_empty() && hub != HUB_SELF {
+        check_name(hub).context("`hub`")?;
+    }
+    Ok(())
+}
+
 impl Member {
+    pub fn hub(&self) -> Hub {
+        Hub::of(&self.hub)
+    }
+
     /// Whether a hub's dev build is taken (fleet plan, *Versions*:
     /// `dev-builds`, or `full`).
     pub fn takes_dev_builds(&self) -> bool {
@@ -125,6 +180,7 @@ pub fn check(member: &Member) -> Result<()> {
     if !member.name.is_empty() {
         check_name(&member.name).context("`name`")?;
     }
+    check_hub(&member.hub)?;
     if let Some(bad) = member.roots.iter().find(|r| !r.is_absolute()) {
         bail!("`roots`: `{}` is not an absolute path", bad.display());
     }
@@ -168,6 +224,9 @@ pub struct MemberInfo {
     /// `member.toml`'s `name`, else the hostname's first label; `None`
     /// when neither is a valid name.
     pub name: Option<String>,
+    /// `hub` as the file says: `self` on the hub, else the hub's member
+    /// name; `None` in no fleet.
+    pub hub: Option<String>,
     pub trust: Trust,
     /// `dev-builds` as the file says (`full` takes dev builds either way).
     pub dev_builds: bool,
@@ -181,6 +240,9 @@ pub struct SetParams {
     /// A machine name; `""` clears it (the hostname's first label).
     #[serde(default)]
     pub name: Option<String>,
+    /// `self` or the hub's member name; `""` clears it (in no fleet).
+    #[serde(default)]
+    pub hub: Option<String>,
     #[serde(default)]
     pub trust: Option<Trust>,
     /// Absolute paths added to `roots` (one already there is kept once).
@@ -198,6 +260,10 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
             check_name(name).map_err(|e| ApiError::invalid(format!("`name`: {e:#}")))?;
         }
         member.name = name.clone();
+    }
+    if let Some(hub) = &p.hub {
+        check_hub(hub).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
+        member.hub = hub.clone();
     }
     if let Some(trust) = p.trust {
         member.trust = trust;
@@ -218,6 +284,7 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
 fn info(member: &Member, hostname: &str) -> MemberInfo {
     MemberInfo {
         name: member.name_or(hostname).ok(),
+        hub: member.hub().field(),
         trust: member.trust,
         dev_builds: member.dev_builds,
         roots: member.roots.clone(),
@@ -232,8 +299,9 @@ pub fn get(path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
 }
 
 /// `member.set`: `p` merged into the file, checked, written. Nothing else
-/// follows it: a peer link reads the name at its next dial
-/// (`fleet::dialer::member_name`), the rest is read at each use.
+/// follows it here: a peer link reads the name at its next dial
+/// (`fleet::dialer::member_name`), the rest is read at each use but `hub`,
+/// which the daemon keeps in memory and follows itself (`daemon::Shared::set_hub`).
 pub fn set(path: &Path, hostname: &str, p: &SetParams) -> Result<MemberInfo, ApiError> {
     let after = update(path, |cur| -> Result<Member, ApiError> {
         *cur = merge(cur.clone(), p)?;
@@ -323,6 +391,19 @@ mod tests {
     }
 
     #[test]
+    fn hub_is_self_a_name_or_none() {
+        assert_eq!(parse("").unwrap().hub(), Hub::None);
+        assert_eq!(parse("hub = \"self\"\n").unwrap().hub(), Hub::This);
+        assert_eq!(parse("hub = \"box\"\n").unwrap().hub(), Hub::Other("box".into()));
+        assert!(parse("hub = \"a/b\"\n").is_err());
+        assert!(parse("hub = \"-x\"\n").is_err());
+        assert_eq!(serialize(&Member { hub: "self".into(), ..Default::default() }).unwrap(), "hub = \"self\"\ntrust = \"worker\"\n\n[allow]\n");
+        assert!(!serialize(&Member::default()).unwrap().contains("hub"), "no fleet: left out");
+        assert_eq!((Hub::None.field(), Hub::This.field(), Hub::Other("k".into()).field()), (None, Some("self".into()), Some("k".into())));
+        assert!(Hub::This.is_this() && !Hub::Other("self2".into()).is_this());
+    }
+
+    #[test]
     fn dev_builds_or_full_take_dev_builds() {
         assert!(!Member::default().takes_dev_builds());
         assert!(Member { dev_builds: true, ..Default::default() }.takes_dev_builds());
@@ -351,9 +432,14 @@ mod tests {
         let rm = merge(kept.clone(), &p(json!({"roots_rm": ["/a", "/gone"], "roots_add": ["/c"]}))).unwrap();
         assert_eq!(rm.roots, [PathBuf::from("/b"), PathBuf::from("/c")]);
         assert_eq!(merge(rm, &p(json!({"name": ""}))).unwrap().name, "", "cleared");
+        let hub = merge(named.clone(), &p(json!({"hub": "self"}))).unwrap();
+        assert_eq!((hub.hub(), hub.name.as_str()), (Hub::This, "lap"));
+        assert_eq!(merge(hub.clone(), &p(json!({"hub": "box"}))).unwrap().hub(), Hub::Other("box".into()));
+        assert_eq!(merge(hub, &p(json!({"hub": ""}))).unwrap().hub(), Hub::None, "cleared");
         let code = |v: Value| merge(named.clone(), &p(v)).unwrap_err().code;
         assert_eq!(code(json!({"name": "a/b"})), "invalid");
         assert_eq!(code(json!({"roots_add": ["rel"]})), "invalid");
+        assert_eq!(code(json!({"hub": "a b"})), "invalid");
         // Hand-edited parts aren't settable.
         for bad in [json!({"trust": "most"}), json!({"dev_builds": true}), json!({"allow": {}}), json!({"caps": {}})] {
             assert!(serde_json::from_value::<SetParams>(bad.clone()).is_err(), "{bad}");
@@ -363,8 +449,9 @@ mod tests {
     #[test]
     fn the_wire_matches_the_typings() {
         use crate::serve::dts::{assert_matches, prop_type, union_members};
-        let info = MemberInfo { name: Some("lap".into()), trust: Trust::Full, dev_builds: true, roots: vec!["/srv/cfg".into()] };
-        assert_matches("MemberInfo", &serde_json::to_value(info).unwrap());
+        let info = MemberInfo { name: Some("lap".into()), hub: Some("self".into()), trust: Trust::Full, dev_builds: true, roots: vec!["/srv/cfg".into()] };
+        assert_matches("MemberInfo", &serde_json::to_value(&info).unwrap());
+        assert_matches("MemberInfo", &serde_json::to_value(MemberInfo { hub: None, ..info }).unwrap());
         assert_eq!(union_members("MemberTrust"), ["'worker'", "'full'"]);
         assert!(prop_type("ApiMethods", "member.get").is_some());
         assert!(prop_type("ApiMethods", "member.set").is_some());
@@ -377,16 +464,19 @@ mod tests {
         let host = "lap.local";
         let call = |method: &str, params: Value| super::call(method, params, &path, host);
         let got = call("member.get", Value::Null);
-        assert_eq!(got.unwrap().unwrap(), json!({"name": "lap", "trust": "worker", "dev_builds": false, "roots": []}));
+        assert_eq!(got.unwrap().unwrap(), json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": []}));
         assert!(!path.exists(), "a get writes nothing");
 
         let set = call("member.set", json!({"trust": "full", "roots_add": ["/srv/cfg"]}));
-        assert_eq!(set.unwrap().unwrap(), json!({"name": "lap", "trust": "full", "dev_builds": false, "roots": ["/srv/cfg"]}));
+        assert_eq!(set.unwrap().unwrap(), json!({"name": "lap", "hub": null, "trust": "full", "dev_builds": false, "roots": ["/srv/cfg"]}));
         assert_eq!(load(&path).unwrap().unwrap().trust, Trust::Full, "written");
         assert!(dir.join("member.lock").exists(), "written through locked_file");
 
         let set = call("member.set", json!({"name": "box"}));
         assert_eq!(set.unwrap().unwrap()["name"], "box");
+        let set = call("member.set", json!({"hub": "self"}));
+        assert_eq!(set.unwrap().unwrap()["hub"], "self");
+        assert_eq!(load(&path).unwrap().unwrap().hub(), Hub::This, "written");
 
         // Hand edits survive a set; a refused set changes nothing.
         update(&path, |m| m.dev_builds = true).unwrap();

@@ -97,12 +97,8 @@ pub struct Options {
     /// it) or `[serve] keep-alive = true` in the per-user global config
     /// ([`crate::daemon_config`]), resolved once by [`serve`].
     pub keep_alive: bool,
-    /// A fleet hub: `[serve] hub = true` ([`crate::daemon_config`]), resolved
-    /// once by [`serve`]. A hub never idles out (keep-alive), saves the machines' rows in `remotes`
-    /// (`service::Hub`), and its machines' links say it's the hub (they
-    /// follow its build, `fleet::dialer`).
-    pub hub: bool,
-    /// A hub's `remotes.json`; `None` is the default
+    /// A hub's `remotes.json` (this host is the hub while `member.toml`'s
+    /// `hub` is `self`, [`Shared::hub`]); `None` is the default
     /// ([`machines::saved::path`]). Tests point it at their own file.
     pub remotes: Option<PathBuf>,
     /// [`idle::IDLE_TIMEOUT`] outside tests.
@@ -180,7 +176,6 @@ impl Options {
         Self {
             version: Version::current(),
             keep_alive,
-            hub: false,
             remotes: None,
             idle_timeout: idle::IDLE_TIMEOUT,
             host: true,
@@ -237,7 +232,7 @@ pub fn serve(socket_dir: Option<PathBuf>, keep_alive: bool) -> Result<()> {
         log(&format!("warning: {e:#}; using defaults"));
         Default::default()
     });
-    let opts = Options { hub: config.serve.hub, ..Options::new(keep_alive || config.serve.keep_alive) };
+    let opts = Options::new(keep_alive || config.serve.keep_alive);
     match run(&dir, &opts)? {
         Exit::AlreadyRunning => {}
         Exit::Idle => log("idle, exiting"),
@@ -263,13 +258,24 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         None => crate::state::State::path()?,
     };
     let listener = Listener::bind(dir)?;
+    let member = member_path(opts);
+    // The daemon is `member.toml`'s only writer (fleet plan decision 3): its
+    // `hub` is read once here, then kept by `member.set` ([`Shared::set_hub`]).
+    let hub = match &member {
+        Ok(path) => fleet::member::load(path).unwrap_or_else(|e| {
+            log(&format!("warning: {e:#}; in no fleet until it's fixed"));
+            None
+        }),
+        Err(_) => None,
+    };
+    let hub = hub.map(|m| m.hub()).unwrap_or_default();
     log(&format!(
         "listening on {} (pid {}, version {} build {}{})",
         endpoint::socket_path(dir).display(),
         std::process::id(),
         opts.version.semver,
         opts.version.build,
-        match (opts.hub, opts.keep_alive) {
+        match (hub.is_this(), opts.keep_alive) {
             (true, _) => ", fleet hub (keep-alive)",
             (false, true) => ", keep-alive",
             (false, false) => "",
@@ -283,10 +289,11 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     shared.local_capacity = opts.local_capacity.clone();
     shared.repos = opts.repos.clone();
     shared.peer_env = opts.peer_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
-    match member_path(opts) {
+    match member {
         Ok(path) => shared.member = Some(path),
         Err(e) => log(&format!("warning: no member.toml (no peer is served, `member.*` fails): {e:#}")),
     }
+    shared.hub = Arc::new(Mutex::new(hub));
     shared.hostname = link::hostname();
     let registry_path = match &opts.machines {
         Some(path) => path.clone(),
@@ -301,7 +308,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // one). The hooks reach `shared` once it exists; until then nothing
     // watches, there's nobody to tell and a machine's streams are refused.
     let hooked: Arc<OnceLock<std::sync::Weak<Shared>>> = Arc::default();
-    let hold = machine_dialer(dir, opts, &hooked);
+    let hold = machine_dialer(dir, opts, &hooked, &shared.hub);
     let hooks = {
         let (a, b) = (Arc::clone(&hooked), Arc::clone(&hooked));
         service::Hooks {
@@ -313,17 +320,19 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             }),
         }
     };
-    let hub = match (opts.hub, &opts.remotes) {
-        (false, _) => None,
-        (true, Some(path)) => Some(service::Hub { remotes: path.clone() }),
-        (true, None) => Some(service::Hub { remotes: machines::saved::path()? }),
+    let hub = {
+        let remotes = match &opts.remotes {
+            Some(path) => path.clone(),
+            None => machines::saved::path()?,
+        };
+        let hub = Arc::clone(&shared.hub);
+        service::Hub { remotes, is_hub: Arc::new(move || lock_hub(&hub).is_this()) }
     };
     // Inbound neighbors are machines too: the service follows them.
     let inbound: Arc<machines::inbound::Neighbors> = Arc::default();
     let links =
-        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial.clone(), hold, opts.machine_timing, hooks, hub, log);
+        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial.clone(), hold, opts.machine_timing, hooks, Some(hub), log);
     let forwards_machines = registry_path.clone();
-    shared.hub = opts.hub;
     if let Some(agent) = &opts.host_agent {
         shared.host_agent = Arc::clone(agent);
     }
@@ -408,7 +417,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         }
         let idle_since = *shared.idle_since.lock().unwrap();
         // A hub holds its members' links: it never idles out.
-        let keep_alive = opts.keep_alive || opts.hub;
+        let keep_alive = opts.keep_alive || shared.is_hub();
         if idle::decide(&holders, idle_since, now, keep_alive, opts.idle_timeout) == Decision::Exit {
             break Exit::Idle;
         }
@@ -449,6 +458,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     Ok(exit)
 }
 
+fn lock_hub(hub: &Mutex<fleet::member::Hub>) -> std::sync::MutexGuard<'_, fleet::member::Hub> {
+    hub.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `member.toml`: [`Options::member`], else the data dir's.
 fn member_path(opts: &Options) -> Result<PathBuf> {
     match &opts.member {
@@ -477,15 +490,28 @@ fn follow_hub(dir: &Path, opts: &Options, member: PathBuf) -> fleet::follow::Fol
 /// in-process ([`Shared::open_lent`]) as peer `<entry name>`, with its
 /// fleet root `fleet/<entry name>/` under the data dir and the daemon's env
 /// (decision 24 of the fleet plan). Without a data dir no stream is served.
-fn machine_dialer(dir: &Path, opts: &Options, hooked: &Arc<OnceLock<std::sync::Weak<Shared>>>) -> service::Hold {
+/// Its hello says `hub` as it is at each dial.
+fn machine_dialer(
+    dir: &Path,
+    opts: &Options,
+    hooked: &Arc<OnceLock<std::sync::Weak<Shared>>>,
+    hub: &Arc<Mutex<fleet::member::Hub>>,
+) -> service::Hold {
     let member = member_path(opts);
     let data = member.as_ref().ok().and_then(|m| m.parent()).map(Path::to_path_buf);
     let follow = follow_hub(dir, opts, member.as_ref().cloned().unwrap_or_default());
     let hostname = link::hostname();
-    let member_name = Arc::new(move || match &member {
+    let member_name: Arc<dyn Fn() -> Result<String> + Send + Sync> = Arc::new(move || match &member {
         Ok(path) => fleet::dialer::member_name(path, &hostname),
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     });
+    let hello = {
+        let (hub, name) = (Arc::clone(hub), Arc::clone(&member_name));
+        Arc::new(move || {
+            let hub = lock_hub(&hub).clone();
+            fleet::update::hello_for(&hub, name().ok().as_deref())
+        })
+    };
     let open: fleet::dialer::Open = {
         let hooked = Arc::clone(hooked);
         Arc::new(move |name: &str, channel: lent::Channel| {
@@ -502,7 +528,7 @@ fn machine_dialer(dir: &Path, opts: &Options, hooked: &Arc<OnceLock<std::sync::W
         dir: dir.to_path_buf(),
         member: member_name,
         open,
-        hub: opts.hub,
+        hello,
         follow,
         handshake: opts.machine_timing.handshake,
         log,
@@ -588,8 +614,11 @@ struct Shared {
     join: Join,
     /// What `roots.list` reads `~` as.
     home: Option<PathBuf>,
-    /// [`Options::hub`].
-    hub: bool,
+    /// `member.toml`'s `hub`: read at the start, then set by `member.set`
+    /// ([`Shared::set_hub`]); the daemon is the file's only writer (fleet
+    /// plan decision 3), so nothing re-reads it. The keep-alive, placement,
+    /// `remotes.json` (`service::Hub`) and the links' hellos follow it.
+    hub: Arc<Mutex<fleet::member::Hub>>,
     /// The `machines.*` methods' registry and dial, and the machine links;
     /// unset only in tests that build a bare `Shared` (the methods are then
     /// unknown, and no machine exists).
@@ -648,7 +677,7 @@ impl Shared {
             snapshots: Arc::default(),
             join,
             home: None,
-            hub: false,
+            hub: Arc::default(),
             machines: None,
             locals: Mutex::default(),
             member: None,
@@ -688,6 +717,37 @@ impl Shared {
 
     fn links(&self) -> Option<&service::Handle> {
         self.machines.as_ref()?.links.as_ref()
+    }
+
+    /// This host is its fleet's hub ([`Shared::hub`] is `self`).
+    fn is_hub(&self) -> bool {
+        lock_hub(&self.hub).is_this()
+    }
+
+    /// `member.set` wrote `hub`: keep it, and when it changed end every
+    /// link this host holds and every one it's dialed on, so both ends
+    /// redial saying the new hub (`fleet::update::hello_of`). Held links:
+    /// `service::Handle::cycle`. Dialed ones: each `fleet-link --peer`'s
+    /// held `links.inbound` connection gets `links.cycle`
+    /// (`commands::fleet_link::LINKS_CYCLE`), on which it hangs up.
+    fn set_hub(&self, hub: fleet::member::Hub) {
+        {
+            let mut cur = lock_hub(&self.hub);
+            if *cur == hub {
+                return;
+            }
+            *cur = hub.clone();
+        }
+        log(&format!("this host's hub is now {}: its links end and redial", hub.field().as_deref().unwrap_or("none")));
+        if let Some(links) = self.links() {
+            links.cycle();
+        }
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                p.cycle |= p.inbound;
+                p.inbound
+            });
+        }
     }
 
     /// Every machine's state and rows, for a merge.
@@ -1048,6 +1108,11 @@ struct Pending {
     forwards_status: Option<String>,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
+    /// The connection holds a `links.inbound` announce (a `fleet-link
+    /// --peer`'s): [`Shared::set_hub`] cycles it.
+    inbound: bool,
+    /// `links.cycle`: this host's hub changed, the `fleet-link` hangs up.
+    cycle: bool,
     /// A `Peer` connection's peer, and where its reach is read from: its
     /// snapshots are cut to that reach, read per push
     /// (`lent::filter_snapshot`), by the notifier.
@@ -1065,6 +1130,7 @@ impl Pending {
             || self.forwards
             || self.forwards_status.is_some()
             || self.closing.is_some()
+            || self.cycle
     }
 
     fn take(&mut self) -> Vec<Notification> {
@@ -1086,6 +1152,9 @@ impl Pending {
         }
         if let Some(line) = self.forwards_status.take() {
             out.push(Notification { method: "forwards.status".into(), params: json!({ "line": line }) });
+        }
+        if std::mem::take(&mut self.cycle) {
+            out.push(Notification { method: crate::commands::fleet_link::LINKS_CYCLE.into(), params: json!({}) });
         }
         if let Some(reason) = self.closing.take() {
             out.push(Notification { method: "closing".into(), params: json!({ "reason": reason }) });
@@ -1439,8 +1508,16 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "capacity.get" => serde_json::to_value(shared.capacity()).map_err(|e| api::ApiError::internal(e.into())),
         // Local only: no link's table admits `member.*` (`fleet::lent`).
         method if method.starts_with("member.") => match &shared.member {
-            Some(path) => fleet::member::call(method, req.params, path, &shared.hostname)
-                .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
+            Some(path) => {
+                let answer = fleet::member::call(method, req.params, path, &shared.hostname)
+                    .unwrap_or_else(|| Err(api::ApiError::unknown_method(method)));
+                if method == "member.set"
+                    && let Ok(info) = &answer
+                {
+                    shared.set_hub(fleet::member::Hub::of(info["hub"].as_str().unwrap_or_default()));
+                }
+                answer
+            }
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
         method if method.starts_with("machines.") && shared.machines.is_some() => {
@@ -1510,9 +1587,17 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
         }
         Err(e) => return Response::err(id, "internal", format!("{e:#}")),
     }
+    // `links.cycle` comes on this connection, unsubscribed.
+    if let Err(e) = start_notifier(conn) {
+        return Response::err(id, "internal", format!("cannot start this connection's notifier: {e}"));
+    }
     let guard = m.inbound.announce(&p.peer, &p.version, p.hub);
     let set_roots = guard.roots_setter();
     conn.inbound = Some(guard);
+    conn.out.post(|p| {
+        p.inbound = true;
+        false
+    });
     log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.hub { ", the hub" } else { "" }));
     let (socket, peer) = (endpoint::fleet_socket(&shared.socket_dir, &p.peer), p.peer);
     let _ = std::thread::Builder::new().name("serve-inbound-roots".into()).spawn(move || match inbound_roots(&peer, &socket) {
@@ -1725,7 +1810,7 @@ fn remote_verb(
 /// any, already in its output), else the answer of the run forwarded to
 /// the worker it was placed on, in the worker's copy of the config root,
 /// or the failure to move the code there. Placement runs only on a hub
-/// (`[serve] hub`) and only looks further than this host when some
+/// (`member.toml`'s `hub = "self"`, [`Shared::is_hub`]) and only looks further than this host when some
 /// machine's link is up (`placed::worth_placing`: any kind). Moving the
 /// code (a fetch of each folder's origin, the transfers) runs on this
 /// connection's thread before anything is forwarded; a hang-up meanwhile
@@ -1738,7 +1823,7 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     }
     // Placement runs on the hub (fleet plan *Placement*): elsewhere a `run`
     // stays here until step 9 sends it to the hub.
-    if !shared.hub {
+    if !shared.is_hub() {
         return None;
     }
     let sandbox = str_of("sandbox")?;
@@ -1897,15 +1982,23 @@ pub(crate) fn hung_up(stream: &Stream, tick: Duration) -> bool {
     }
 }
 
+/// The connection's notifier, started once.
+fn start_notifier(conn: &mut ConnState) -> std::io::Result<()> {
+    if conn.notifier.is_none() {
+        let out = Arc::clone(&conn.out);
+        let spawned = std::thread::Builder::new().name(format!("serve-notify-{}", conn.id)).spawn(move || notifier(&out));
+        conn.notifier = Some(spawned?);
+    }
+    Ok(())
+}
+
 /// `subscribe` (`on`) / `unsubscribe`. The first subscribe starts the
 /// connection's notifier. Nothing is sent for the past: a client subscribes,
 /// then fetches.
 fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api::ApiError> {
     let topics = api::topics(params)?;
-    if on && conn.notifier.is_none() {
-        let out = Arc::clone(&conn.out);
-        let spawned = std::thread::Builder::new().name(format!("serve-notify-{}", conn.id)).spawn(move || notifier(&out));
-        conn.notifier = Some(spawned.map_err(|e| api::ApiError::internal(e.into()))?);
+    if on {
+        start_notifier(conn).map_err(|e| api::ApiError::internal(e.into()))?;
     }
     conn.out.post(|p| {
         for topic in topics {
@@ -2087,7 +2180,6 @@ pub(crate) mod tests {
         Options {
             version: Version { semver: "0.6.0".into(), build },
             keep_alive: false,
-            hub: false,
             // Never the user's: a test hub that checks it sets its own.
             remotes: Some(std::env::temp_dir().join(format!("dsv-remotes-{}", std::process::id())).join("remotes.json")),
             idle_timeout: Duration::from_millis(idle_ms),
@@ -3266,11 +3358,14 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// `hub = true` implies keep-alive.
+    /// `hub = "self"` in member.toml implies keep-alive.
     #[test]
     fn a_hub_never_idles() {
+        use crate::serve::fleet::member::{self, Member};
         let dir = scratch("hub-idle");
-        let hub = Options { hub: true, remotes: Some(dir.join("data/remotes.json")), ..opts(1, 50) };
+        let data = scratch("hub-idle-data");
+        member::write_for_test(&data.join("member.toml"), &Member { hub: "self".into(), ..Default::default() });
+        let hub = Options { remotes: Some(data.join("remotes.json")), member: Some(data.join("member.toml")), ..opts(1, 50) };
         let daemon = spawn_daemon(&dir, hub);
         let _ = hello_at(&dir, &v(1));
         std::thread::sleep(Duration::from_millis(400));
@@ -3278,5 +3373,41 @@ pub(crate) mod tests {
         assert!(connect(&dir).call("shutdown", json!({})).unwrap().error.is_none());
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// `member.set {hub}` flips the hub under a running daemon: clearing it
+    /// lets the daemon idle out again; a change sends `links.cycle` on each
+    /// held `links.inbound` connection (and nothing on a repeat).
+    #[test]
+    fn a_hub_change_cycles_the_inbound_links_and_the_keep_alive_follows() {
+        use crate::serve::fleet::member::{self, Member};
+        let dir = scratch("hub-flip");
+        let data = scratch("hub-flip-data");
+        member::write_for_test(&data.join("member.toml"), &Member { hub: "self".into(), ..Default::default() });
+        let options = Options {
+            remotes: Some(data.join("remotes.json")),
+            member: Some(data.join("member.toml")),
+            machines: Some(data.join("machines.toml")),
+            ..opts(1, 300)
+        };
+        let daemon = spawn_daemon(&dir, options);
+        let mut inbound = connect(&dir);
+        let r = inbound.call("links.inbound", json!({"peer": "lap", "version": "0.6.0 a dev x/y member box"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let mut local = connect(&dir);
+        let r = local.call("member.set", json!({"hub": "self"})).unwrap();
+        assert_eq!(r.result.unwrap()["hub"], "self");
+        assert!(inbound.next_notification(Duration::from_millis(300)).unwrap().is_none(), "no change, no cycle");
+        let r = local.call("member.set", json!({"hub": "box"})).unwrap();
+        assert_eq!(r.result.unwrap()["hub"], "box");
+        let n = inbound.next_notification(Duration::from_secs(5)).unwrap().expect("no links.cycle");
+        assert_eq!(n.method, crate::commands::fleet_link::LINKS_CYCLE);
+        assert_eq!(member::load(&data.join("member.toml")).unwrap().unwrap().hub(), member::Hub::Other("box".into()));
+        // No longer the hub: it idles out once nobody holds it.
+        drop((inbound, local));
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }

@@ -26,7 +26,13 @@
 //! A hub also saves `Remotes` to `remotes.json` (`machines::saved`) from a
 //! `serve-remotes` thread, at most every `saved::SAVE_EVERY` while rows
 //! change and once more at the stop, and restores it at the start: those
-//! rows show `unreachable` until their machine's link connects.
+//! rows show `unreachable` until their machine's link connects. Whether
+//! this host is the hub is asked each time ([`Hub::is_hub`]: `member.toml`'s
+//! `hub` can change under a running daemon), so a host that stops being
+//! the hub stops saving, one that becomes it saves from the next change.
+//!
+//! [`Handle::cycle`] ends every ssh machine's carrier and redials it at
+//! once, with no backoff (this host's hub changed: its hello did).
 //!
 //! Forwarded calls reach the thread over its channel, one in flight
 //! per machine, each with [`Timing::call`] to answer. A timed-out call drops
@@ -108,11 +114,12 @@ pub struct Hooks {
 /// is `fleet::dialer::Dialer::hold`; tests fake it.
 pub type Hold = Arc<dyn Fn(&Entry, &Held) -> String + Send + Sync>;
 
-/// This daemon is a fleet hub (`[serve] hub = true`): `Remotes` lives on in
-/// `remotes`.
+/// Where a fleet hub's `Remotes` lives on, and whether this host is the
+/// hub now (`member.toml`'s `hub = "self"`, as the daemon keeps it).
 pub struct Hub {
     /// `remotes.json` (`saved::path`; a scratch file in tests).
     pub remotes: PathBuf,
+    pub is_hub: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// The service, owned by the daemon's `run`. Dropping it stops and joins
@@ -127,6 +134,7 @@ pub struct Machines {
 /// wake-ups.
 struct HubSave {
     path: PathBuf,
+    is_hub: Arc<dyn Fn() -> bool + Send + Sync>,
     state: Mutex<SaveState>,
     cv: Condvar,
 }
@@ -163,7 +171,7 @@ struct Inner {
     remotes: Arc<Remotes>,
     links: Mutex<BTreeMap<String, LinkThread>>,
     stopped: AtomicBool,
-    /// `Some` on a fleet hub.
+    /// `Some` on a daemon that may be a fleet hub ([`HubSave::is_hub`]).
     hub: Option<HubSave>,
 }
 
@@ -188,6 +196,8 @@ fn carried(entry: &Entry) -> bool {
 #[derive(Default)]
 struct Ctl {
     stop: AtomicBool,
+    /// [`Handle::cycle`] cut the carrier: redial with no backoff.
+    cycled: AtomicBool,
     /// The link's connection while one is open, to shut it down.
     stream: Mutex<Option<Stream>>,
     carrier: Mutex<Carrier>,
@@ -232,10 +242,19 @@ impl Ctl {
         *lock(&self.stream) = stream;
     }
 
-    /// Sleep up to `wait` unless stopped first.
+    /// End the carrier (not the machine): [`carry`] redials at once.
+    fn cycle(&self) {
+        self.cycled.store(true, Ordering::SeqCst);
+        if let Some(s) = lock(&self.carrier).stream.as_ref() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        self.carrier_cv.notify_all();
+    }
+
+    /// Sleep up to `wait` unless stopped or cycled first.
     fn sleep(&self, wait: Duration) {
         let c = lock(&self.carrier);
-        let _ = self.carrier_cv.wait_timeout_while(c, wait, |_| !self.stopped());
+        let _ = self.carrier_cv.wait_timeout_while(c, wait, |_| !self.stopped() && !self.cycled.load(Ordering::SeqCst));
     }
 }
 
@@ -310,7 +329,8 @@ impl Machines {
     /// of `inbound` (from now on as they come and go), each held at once.
     /// `dial` opens a machine's link (its `fleet-<name>.sock`, or a test
     /// daemon's socket), `hold` carries an ssh machine's. A `hub`'s saved
-    /// rows are restored before the links start.
+    /// rows are restored before the links start when this host is the hub
+    /// then.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         registry: PathBuf,
@@ -322,7 +342,7 @@ impl Machines {
         hub: Option<Hub>,
         log: fn(&str),
     ) -> Machines {
-        let hub = hub.map(|h| HubSave { path: h.remotes, state: Mutex::default(), cv: Condvar::new() });
+        let hub = hub.map(|h| HubSave { path: h.remotes, is_hub: h.is_hub, state: Mutex::default(), cv: Condvar::new() });
         let inner = Arc::new(Inner {
             registry,
             inbound,
@@ -338,9 +358,11 @@ impl Machines {
             hub,
         });
         let saver = inner.hub.as_ref().and_then(|h| {
-            match saved::load(&h.path) {
-                Ok(s) => inner.remotes.restore(saved::machines(s)),
-                Err(e) => log(&format!("machines: {e:#}")),
+            if (h.is_hub)() {
+                match saved::load(&h.path) {
+                    Ok(s) => inner.remotes.restore(saved::machines(s)),
+                    Err(e) => log(&format!("machines: {e:#}")),
+                }
             }
             let inner = Arc::clone(&inner);
             std::thread::Builder::new()
@@ -390,6 +412,7 @@ fn now_unix() -> u64 {
 /// A hub's `serve-remotes` thread: each change of the rows saves them,
 /// at most every `saved::SAVE_EVERY` ([`saved::save_wait`]); the stop saves
 /// what's left at once. A failed save is logged; the next change retries.
+/// Changes while this host isn't the hub are dropped.
 fn save_loop(inner: &Inner) {
     let Some(hub) = &inner.hub else { return };
     let mut last: Option<Instant> = None;
@@ -408,6 +431,9 @@ fn save_loop(inner: &Inner) {
                 continue;
             }
             s.dirty = false;
+        }
+        if !(hub.is_hub)() {
+            continue;
         }
         if let Err(e) = saved::save(&hub.path, &saved::of(&inner.remotes.all(), now_unix())) {
             (inner.log)(&format!("machines: cannot save remotes: {e:#}"));
@@ -513,6 +539,18 @@ impl Handle {
         (inner.hooks.changed)();
     }
 
+    /// End every ssh machine's carrier and redial it at once (this host's
+    /// hub changed, so its hello did; the far end's `fleet-link` exits with
+    /// it). An inbound machine's carrier is its `fleet-link` here, which the
+    /// daemon ends itself (`links.cycle`).
+    pub fn cycle(&self) {
+        for l in self.inner.lock_links().values() {
+            if carried(&l.entry) {
+                l.ctl.cycle();
+            }
+        }
+    }
+
     /// Every link looks at its watchers now (a `machines: true` watch came).
     pub fn wake(&self) {
         for l in self.inner.lock_links().values() {
@@ -593,8 +631,14 @@ fn carry(entry: &Entry, inner: &Inner, ctl: &Ctl, tx: &Sender<Cmd>) {
     let mut failures = 0;
     let mut logged = None;
     while !ctl.stopped() {
+        // A cycle before this attempt (in the backoff) is spent by it.
+        ctl.cycled.store(false, Ordering::SeqCst);
         let held = Held { ctl, tx, came_up: AtomicBool::new(false) };
-        let why = (inner.hold)(entry, &held);
+        let mut why = (inner.hold)(entry, &held);
+        let cycled = ctl.cycled.swap(false, Ordering::SeqCst);
+        if cycled {
+            why = "this host's hub changed: redialing".into();
+        }
         {
             let mut c = lock(&ctl.carrier);
             c.up = false;
@@ -608,6 +652,9 @@ fn carry(entry: &Entry, inner: &Inner, ctl: &Ctl, tx: &Sender<Cmd>) {
         if held.came_up.load(Ordering::SeqCst) {
             failures = 0;
             logged = None;
+        }
+        if cycled {
+            continue;
         }
         if log_failure(&mut logged, &why) {
             (inner.log)(&format!("machine {}: {why}", entry.name));
@@ -1174,7 +1221,7 @@ mod tests {
             ..Machine::default()
         };
         saved::save(&path, &saved::of(&[row("s"), row("gone")], 0)).unwrap();
-        let hub = Hub { remotes: path.clone() };
+        let hub = Hub { remotes: path.clone(), is_hub: Arc::new(|| true) };
         let (machines, _w, up, _, runs) = inbound_and_ssh(&base, Some(hub), |_| {});
         let h = machines.handle();
         assert!(h.remotes().get("gone").is_none(), "not registered: dropped");
@@ -1193,6 +1240,82 @@ mod tests {
         let saved = saved::load(&path).unwrap();
         assert_eq!(saved.machines.keys().collect::<Vec<_>>(), ["w"], "gone dropped; s has nothing left to save");
         assert_eq!(saved.machines["w"].version.as_deref(), Some("0.6.0"), "w's hello");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Not the hub at the start: nothing restored, nothing saved; the flag
+    /// flipping on (member.set) saves from the next change.
+    #[test]
+    fn only_while_the_hub_are_remotes_saved() {
+        let base = short_scratch("hub-flip");
+        let path = base.join("remotes.json");
+        let rows = json!({"dir": "/r", "instances": []});
+        let saved_s = Machine { name: "s".into(), rows: [(PathBuf::from("/r"), Arc::new(rows))].into(), seen: Some(1), ..Machine::default() };
+        saved::save(&path, &saved::of(&[saved_s], 0)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let is_hub = {
+            let flag = Arc::clone(&flag);
+            Arc::new(move || flag.load(Ordering::SeqCst))
+        };
+        let (machines, _w, up, _, _) = inbound_and_ssh(&base, Some(Hub { remotes: path.clone(), is_hub }), |_| {});
+        let h = machines.handle();
+        assert!(!h.remotes().get("s").unwrap().restored, "not the hub: nothing restored");
+        up.store(true, Ordering::SeqCst);
+        wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "not the hub: nothing saved");
+
+        flag.store(true, Ordering::SeqCst);
+        h.reload();
+        drop(machines);
+        assert_eq!(saved::load(&path).unwrap().machines.keys().collect::<Vec<_>>(), ["w"], "the hub now: saved");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `cycle` ends a live carrier and redials it at once, not after the
+    /// backoff; a carrier down in its backoff is redialed at once too.
+    #[test]
+    fn a_cycle_redials_the_carrier_at_once() {
+        let base = short_scratch("cycle");
+        let registry = base.join("machines.toml");
+        crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("c", "me@c"))).unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        // Up until its stream is shut (by `cycle` or the stop), or failing.
+        let hold: Hold = {
+            let (runs, fail) = (Arc::clone(&runs), Arc::clone(&fail));
+            Arc::new(move |_: &Entry, held: &Held| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                if fail.load(Ordering::SeqCst) {
+                    return "ssh: no route".into();
+                }
+                let (ours, mut theirs) = UnixStream::pair().unwrap();
+                if !held.hold(Some(ours)) {
+                    return "stopping".into();
+                }
+                held.up();
+                let _ = std::io::Read::read(&mut theirs, &mut [0u8; 1]);
+                "link closed".into()
+            })
+        };
+        let timing = Timing { backoff: Duration::from_secs(60), backoff_cap: Duration::from_secs(60), ..opts(1, 0).machine_timing };
+        let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
+        let machines = Machines::spawn(registry, Arc::default(), no_dial, hold, timing, no_hooks(), None, |_| {});
+        let h = machines.handle();
+        wait_for("up", Duration::from_secs(5), || runs.load(Ordering::SeqCst) == 1 && lock(&h.inner.lock_links()["c"].ctl.carrier).up);
+        h.cycle();
+        wait_for("redialed at once", Duration::from_secs(5), || runs.load(Ordering::SeqCst) == 2);
+        // Down, in a 60 s backoff: a cycle redials it now.
+        fail.store(true, Ordering::SeqCst);
+        h.cycle();
+        wait_for("failed", Duration::from_secs(5), || runs.load(Ordering::SeqCst) == 3);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(runs.load(Ordering::SeqCst), 3, "in its backoff");
+        fail.store(false, Ordering::SeqCst);
+        h.cycle();
+        wait_for("redialed out of the backoff", Duration::from_secs(5), || runs.load(Ordering::SeqCst) == 4);
+        drop(machines);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

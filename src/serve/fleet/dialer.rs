@@ -17,6 +17,11 @@
 //! for it; `AGENT` is answered with this host's agent while the entry has
 //! `agent` on (`daemon::agent_for`).
 //!
+//! This host's hello (`update::hello_of`: its role and its fleet's hub) is
+//! read at each dial, so a hub change counts from the next one
+//! (`service::Handle::cycle` ends every link then); a machine naming
+//! another hub is refused (`update::same_fleet`, fleet plan decision 34).
+//!
 //! Versions follow the hello's hub flag (fleet plan decision 25,
 //! `commands::fleet_link::follows`): a machine that is the hub while this
 //! host isn't is followed before anything is served. Another published
@@ -92,8 +97,9 @@ pub struct Dialer {
     pub member: Arc<dyn Fn() -> Result<String> + Send + Sync>,
     /// IN: the daemon's answer to each of the machine's streams.
     pub open: Open,
-    /// This host is the fleet's hub (`[serve] hub`): its `Hello` says so.
-    pub hub: bool,
+    /// What this host says on a peer link (`update::hello_for` of its
+    /// `hub`, as the daemon keeps it), read at each dial.
+    pub hello: Arc<dyn Fn() -> &'static str + Send + Sync>,
     /// How this host follows a hub machine's build.
     pub follow: Follow,
     /// The sentinel's and the `Hello`s' wait (`service::Timing::handshake`).
@@ -173,7 +179,7 @@ impl Dialer {
             .with(channel::TUNNEL, served(Channel::Tunnel))
             .with(channel::AGENT, served(Channel::Agent))
             .with(channel::TRANSFER, transfers);
-        let ours = update::hello_of(self.hub);
+        let ours = (self.hello)();
         let spec = link::Spec { hello: ours, ..LINK };
         let wanted: Mutex<Option<String>> = Mutex::new(None);
         let mut end_link = duplex.stream.try_clone().ok().map(follow::shutting);
@@ -185,6 +191,7 @@ impl Dialer {
             endpoint,
             |peer| {
                 let _ = duplex.stream.set_read_timeout(None);
+                update::same_fleet(name, ours, &peer.hash)?;
                 let label = Build::parse(&peer.hash).label();
                 match fleet_link::follows(ours, &peer.hash, (self.follow.dev_builds)()) {
                     Decision::Same => {}
@@ -204,7 +211,7 @@ impl Dialer {
                         return Ok(());
                     }
                 }
-                if self.hub {
+                if update::is_hub(ours) {
                     fleet_link::push_build(ours, &peer.hash, socket.clone(), fleet_link::own_binary);
                 }
                 held.up();
@@ -365,7 +372,7 @@ pub(crate) mod tests {
             let (daemon_dir, peer) = (k_dir.clone(), peer.to_string());
             let opts = PeerOptions {
                 dir: k_dir.clone(),
-                hub: false,
+                hello: update::hello_of(false, None),
                 daemon: Arc::new(move || Ok(connect(&daemon_dir))),
                 follow: Follow { steps: Arc::new(update::tests::Fake::default()), dev_builds: Arc::new(|| false) },
                 reannounce: Duration::from_millis(20),
@@ -789,7 +796,8 @@ pub(crate) mod tests {
             Vec::new(),
             |k| {
                 // Placement runs on the hub.
-                k.hub = true;
+                let hub = crate::serve::fleet::member::Member { hub: "self".into(), ..Default::default() };
+                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);
                 k.verbs = Some(k_runner);
                 k.repos = Some(src.join("k-repos"));
             },

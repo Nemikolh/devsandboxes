@@ -2,7 +2,9 @@
 //! (docs/architecture/daemon/fleet.md, *Peer links*): the dialed end of a
 //! link `machine add <this host>` made on `<dialer>` ([`fleet_link_peer`],
 //! [`run_peer`]). The opener (it writes the sentinel), saying
-//! `update::hello_of` (its build and whether this host is the hub). IN:
+//! `update::hello_of` (its build, whether this host is the hub, and its
+//! fleet's hub, as `member.toml` says when it starts); a dialer naming
+//! another hub is refused (`update::same_fleet`). IN:
 //! each stream the dialer opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
 //! handed to this host's daemon as a connection whose first line is
 //! `link.attach {peer: <dialer>, channel}` ([`attach_stream`]), so this
@@ -14,7 +16,9 @@
 //! `Hello`s are through it announces the dialer as an inbound neighbor
 //! (`links.inbound`, a refusal ends the link with why) and holds that
 //! connection for the link's life, re-announcing on a new one when it drops
-//! (a version handoff of this host's daemon) ([`Announce`]). Versions
+//! (a version handoff of this host's daemon) ([`Announce`]); a
+//! `links.cycle` notification on it (this host's hub changed) ends the
+//! link, so the dialer redials and both ends say the new hub. Versions
 //! follow the hub flag ([`follows`]): this end, not the hub, follows a hub
 //! dialer's build, then ends the link (the dialer redials the new binary);
 //! this end, the hub, pushes its dev build to a dialer that would take it.
@@ -87,8 +91,9 @@ pub struct PeerOptions {
     /// The socket dir: this host's daemon socket, and where the link's
     /// sockets are bound.
     pub dir: PathBuf,
-    /// This host is the fleet's hub (`[serve] hub` in daemon.config.toml).
-    pub hub: bool,
+    /// What this end says (`update::hello_of`): its role and its fleet's
+    /// hub, as `member.toml` said when this process started.
+    pub hello: &'static str,
     /// A fresh connection to this host's daemon (lazy start), for
     /// `links.inbound`.
     pub daemon: Arc<dyn Fn() -> Result<Conn> + Send + Sync>,
@@ -100,21 +105,22 @@ pub struct PeerOptions {
     pub push_wait: Duration,
 }
 
-/// The `--peer` CLI entry: the socket dir (created 0700 if missing), the hub
-/// flag read as the daemon reads it (`daemon_config::load`), then
-/// [`run_peer`] on stdin/stdout. Following the hub uses the release steps
-/// (`update::Release`) and `member.toml`'s `dev-builds` / trust `full`,
-/// read at the `Hello`s.
+/// The `--peer` CLI entry: the socket dir (created 0700 if missing), this
+/// end's hello from `member.toml`'s `hub` and name (each dial is a process
+/// of its own: read once), then [`run_peer`] on stdin/stdout. Following the
+/// hub uses the release steps (`update::Release`) and `member.toml`'s
+/// `dev-builds` / trust `full`, read at the `Hello`s.
 pub fn fleet_link_peer(peer: &str) -> Result<()> {
     check_name(peer)?;
     let dir = endpoint::socket_dir()?;
     endpoint::ensure_private_dir(&dir)?;
-    let hub = crate::daemon_config::load()?.serve.hub;
     let member = fleet::member::path()?;
+    let this = fleet::member::load(&member)?.unwrap_or_default();
+    let own = this.name_or(&crate::serve::machines::link::hostname()).ok();
     let daemon_dir = dir.clone();
     let opts = PeerOptions {
         dir: dir.clone(),
-        hub,
+        hello: update::hello_for(&this.hub(), own.as_deref()),
         daemon: Arc::new(move || client::connect(&daemon_dir, "fleet-link").context("cannot reach this host's devsandbox serve")),
         follow: Follow {
             steps: Arc::new(update::Release { socket_dir: dir }),
@@ -167,13 +173,14 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         .with(channel::TRANSFER, transfers);
     let outlet = Arc::new(link::Outlet::default());
     let over = Arc::new(AtomicBool::new(false));
-    let spec = link::Spec { hello: update::hello_of(opts.hub), ..fleet::LINK };
+    let spec = link::Spec { hello: opts.hello, ..fleet::LINK };
     let refused: Arc<Mutex<Option<String>>> = Arc::default();
     let mut wanted = None;
     let mut held = None;
     let mut agent_thread = None;
     let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: Some(&outlet) };
     let end = link::opener_with(&spec, reader, writer, endpoint, |theirs| {
+        update::same_fleet(peer, spec.hello, &theirs.hash).map_err(|why| anyhow!("{why}"))?;
         let label = Build::parse(&theirs.hash).label();
         match follows(spec.hello, &theirs.hash, (opts.follow.dev_builds)()) {
             Decision::Same => {}
@@ -197,15 +204,19 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         if let Err(why) = announce(&mut conn, &params)? {
             bail!("refused: {why}");
         }
-        let on_refused = {
-            let (refused, outlet) = (Arc::clone(&refused), Arc::clone(&outlet));
-            move |why: String| {
-                eprintln!("fleet-link: refused: {why}");
+        let on_end = {
+            let (refused, outlet, peer) = (Arc::clone(&refused), Arc::clone(&outlet), peer.to_string());
+            move |end: AnnounceEnd| {
+                let why = match end {
+                    AnnounceEnd::Refused(why) => format!("refused: {why}"),
+                    AnnounceEnd::Cycled => format!("this host's hub changed: the link ends so {peer} redials it"),
+                };
+                eprintln!("fleet-link: {why}");
                 *refused.lock().unwrap() = Some(why);
                 outlet.hang_up();
             }
         };
-        held = Some(Announce::hold(conn, params, Arc::clone(&opts.daemon), opts.reannounce, on_refused));
+        held = Some(Announce::hold(conn, params, Arc::clone(&opts.daemon), opts.reannounce, on_end));
         if theirs.caps & caps::AGENT != 0 {
             let (path, outlet, over) = (endpoint::link_agent_socket(&dir, peer), Arc::clone(&outlet), Arc::clone(&over));
             agent_thread = std::thread::Builder::new()
@@ -217,7 +228,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
                 })
                 .ok();
         }
-        if opts.hub && !update::is_hub(&theirs.hash) {
+        if update::is_hub(spec.hello) && !update::is_hub(&theirs.hash) {
             push_build(spec.hello, &theirs.hash, socket.clone(), own_binary);
         }
         Ok(())
@@ -244,9 +255,23 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         bail!("updated to devsandbox {version}, handing off: the link ends so {peer} redials it");
     }
     if let Some(why) = refused.lock().unwrap().take() {
-        bail!("refused: {why}");
+        bail!("{why}");
     }
     end
+}
+
+/// The notification on the held `links.inbound` connection that ends the
+/// link (`daemon::Shared::set_hub`: this host's hub changed, so both ends
+/// redial saying the new one).
+pub const LINKS_CYCLE: &str = "links.cycle";
+
+/// Why [`Announce`]'s hold ends the link.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AnnounceEnd {
+    /// A re-announce was refused, with why.
+    Refused(String),
+    /// The daemon sent [`LINKS_CYCLE`].
+    Cycled,
 }
 
 /// `links.inbound` with `params` on `conn`: `Ok(Err(why))` when the daemon
@@ -262,9 +287,10 @@ fn announce(conn: &mut Conn, params: &Value) -> Result<Result<(), String>> {
 /// The held `links.inbound` connection: while the link is up, a thread waits
 /// for it to drop (the daemon handed off or restarted) and then announces
 /// again on a new one, backing off from the first wait to
-/// [`REANNOUNCE_MAX`] while the daemon can't be reached. A refusal then
-/// goes to `on_refused` (which ends the link) and the thread ends. Dropping
-/// it stops the thread and closes the connection.
+/// [`REANNOUNCE_MAX`] while the daemon can't be reached. A refusal then, or
+/// a [`LINKS_CYCLE`] notification on it, goes to `on_end` (which ends the
+/// link) and the thread ends. Dropping it stops the thread and closes the
+/// connection.
 pub struct Announce {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -276,7 +302,7 @@ impl Announce {
         params: Value,
         daemon: Arc<dyn Fn() -> Result<Conn> + Send + Sync>,
         first_wait: Duration,
-        on_refused: impl FnOnce(String) + Send + 'static,
+        on_end: impl FnOnce(AnnounceEnd) + Send + 'static,
     ) -> Announce {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
@@ -285,10 +311,12 @@ impl Announce {
             .spawn(move || {
                 let mut conn = conn;
                 loop {
-                    // Nothing comes on it: a notification is ignored, an error is the drop.
+                    // Only `links.cycle` means something on it; an error is the drop.
                     while !stopping.load(Ordering::Relaxed) {
-                        if conn.next_notification(Duration::from_millis(100)).is_err() {
-                            break;
+                        match conn.next_notification(Duration::from_millis(100)) {
+                            Ok(Some(n)) if n.method == LINKS_CYCLE => return on_end(AnnounceEnd::Cycled),
+                            Ok(_) => {}
+                            Err(_) => break,
                         }
                     }
                     let mut wait = first_wait;
@@ -299,7 +327,7 @@ impl Announce {
                         wait = (wait * 2).min(REANNOUNCE_MAX);
                         match daemon().and_then(|mut c| Ok((announce(&mut c, &params)?, c))) {
                             Ok((Ok(()), c)) => break c,
-                            Ok((Err(why), _)) => return on_refused(why),
+                            Ok((Err(why), _)) => return on_end(AnnounceEnd::Refused(why)),
                             Err(e) => eprintln!("fleet-link: cannot announce the link again yet: {e:#}"),
                         }
                     };
@@ -479,11 +507,16 @@ mod tests {
     /// K's `fleet-link --peer L` over `io`, its daemon and sockets in `dir`,
     /// a member; following through `steps` (dev builds taken).
     fn peer_link(io: UnixStream, dir: PathBuf, steps: Arc<dyn update::Steps>) -> std::thread::JoinHandle<Result<()>> {
+        peer_link_saying(io, dir, steps, update::hello_of(false, None))
+    }
+
+    /// [`peer_link`], K saying `hello`.
+    fn peer_link_saying(io: UnixStream, dir: PathBuf, steps: Arc<dyn update::Steps>, hello: &'static str) -> std::thread::JoinHandle<Result<()>> {
         let (r, w) = (io.try_clone().unwrap(), io);
         let daemon_dir = dir.clone();
         let opts = PeerOptions {
             dir,
-            hub: false,
+            hello,
             daemon: Arc::new(move || Ok(conn_at(&daemon_dir))),
             follow: Follow { steps, dev_builds: Arc::new(|| true) },
             reannounce: Duration::from_millis(20),
@@ -516,7 +549,7 @@ mod tests {
 
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let outlet = Arc::new(link::Outlet::default());
-        let dialer = fake_dialer(dialer_io, update::hello_of(false), l_dir.clone(), Arc::clone(&outlet));
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_dir.clone(), Arc::clone(&outlet));
         let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
         let l_fleet = l_data.join("fleet/K");
         let want = json!([l_own, l_fleet]);
@@ -579,7 +612,7 @@ mod tests {
         let daemon = spawn_daemon(&k_dir, k_opts);
         drop(conn_at(&k_dir));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false), base.join("nowhere"), Arc::default());
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), base.join("nowhere"), Arc::default());
         let err = peer_link(k_io, k_dir.clone(), Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("refused: `L` is already a machine here (me@l)"), "{err:#}");
         assert!(!endpoint::fleet_socket(&k_dir, "L").exists());
@@ -603,7 +636,7 @@ mod tests {
         let l_daemon = spawn_daemon(&l_dir, l_opts);
         drop((conn_at(&k_dir), conn_at(&l_dir)));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false), l_dir.clone(), Arc::default());
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_dir.clone(), Arc::default());
         let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
         wait_for(|| inbound_row(&k_dir).is_some(), "L listed");
         assert!(conn_at(&k_dir).call("shutdown", json!({})).unwrap().error.is_none());
@@ -621,14 +654,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// K's hub changes (`member.set {hub}` on K's daemon): K's end gets
+    /// `links.cycle` on its held announce and ends the link, saying why.
+    #[test]
+    fn a_hub_change_on_the_dialed_host_ends_the_link() {
+        let base = scratch("peer-cycle");
+        let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
+        let (l_dir, _, _, l_opts) = peer_daemon(&base, "l");
+        let daemons = [spawn_daemon(&k_dir, k_opts), spawn_daemon(&l_dir, l_opts)];
+        drop((conn_at(&k_dir), conn_at(&l_dir)));
+        let (dialer_io, k_io) = UnixStream::pair().unwrap();
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_dir.clone(), Arc::default());
+        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
+        wait_for(|| inbound_row(&k_dir).is_some(), "L listed");
+        assert!(conn_at(&k_dir).call("member.set", json!({"hub": "self"})).unwrap().error.is_none());
+        let err = k_end.join().unwrap().unwrap_err();
+        assert_eq!(format!("{err:#}"), "this host's hub changed: the link ends so L redials it");
+        // `fleet-link` exits there: its stdio closes.
+        k_io.shutdown(Shutdown::Both).unwrap();
+        assert!(matches!(dialer.join().unwrap(), link::End::Closed));
+        wait_for(|| inbound_row(&k_dir).is_none(), "L no longer listed");
+        for (dir, daemon) in [&k_dir, &l_dir].into_iter().zip(daemons) {
+            assert!(conn_at(dir).call("shutdown", json!({})).unwrap().error.is_none());
+            assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dialer naming another hub than K's: refused before anything is
+    /// announced, naming both.
+    #[test]
+    fn a_dialer_in_another_fleet_is_refused() {
+        let base = scratch("peer-two-fleets");
+        std::fs::create_dir_all(&base).unwrap();
+        let (dialer_io, k_io) = UnixStream::pair().unwrap();
+        let dialer = fake_dialer(dialer_io, update::hello_of(true, Some("lap")), base.join("nowhere"), Arc::default());
+        let k_end = peer_link_saying(k_io.try_clone().unwrap(), base.clone(), Arc::new(update::tests::Fake::default()), update::hello_of(false, Some("box")));
+        let err = k_end.join().unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("`L` is in `lap`'s fleet, this host in `box`'s"), "{err:#}");
+        k_io.shutdown(Shutdown::Both).unwrap();
+        let _ = dialer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn only_a_non_hub_follows_a_hub() {
-        let ours = update::hello_of(false);
+        let ours = update::hello_of(false, None);
         let semver = env!("CARGO_PKG_VERSION");
         let platform = update::PLATFORM;
         let published = format!("9.9.9 abc published {platform} hub");
         assert_eq!(follows(ours, &published, false), Decision::Download { version: "9.9.9".into() });
-        assert_eq!(follows(ours, update::hello_of(true), false), Decision::Same, "the same build");
+        assert_eq!(follows(ours, update::hello_of(true, None), false), Decision::Same, "the same build");
         let dev = format!("{semver} zzz dev {platform} hub");
         assert_eq!(follows(ours, &dev, true), Decision::Receive);
         assert!(matches!(follows(ours, &dev, false), Decision::Stop(_)));
@@ -636,7 +712,7 @@ mod tests {
         assert!(matches!(follows(ours, &elsewhere, true), Decision::Stop(why) if why.contains("can't run on")));
         // No hub, or this end is it: nothing to follow.
         assert_eq!(follows(ours, &published.replace(" hub", " member"), false), Decision::Same);
-        assert_eq!(follows(update::hello_of(true), &published, false), Decision::Same);
+        assert_eq!(follows(update::hello_of(true, None), &published, false), Decision::Same);
         assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", false), Decision::Same, "a hello without the flag says no hub");
     }
 
