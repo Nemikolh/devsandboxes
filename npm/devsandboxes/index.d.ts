@@ -811,11 +811,15 @@ export interface RootCandidate {
   fleet?: boolean;
 }
 
-/** `machines.probe`'s answer: the machine's devsandbox and its candidate roots. */
+/** `machines.probe`'s answer: the machine's devsandbox, its candidate roots and its member key. */
 export interface MachineProbe {
   version: string;
   protocol: number;
   roots: RootCandidate[];
+  /** The machine's member key (`ed25519:<64 lowercase hex>`): what `machines.add`'s `key` confirms. */
+  key: string;
+  /** The key's fingerprint, to show the user. */
+  fingerprint: string;
 }
 
 /** `machines.add`'s answer. */
@@ -977,6 +981,112 @@ export interface MemberInfo {
   key: string;
   /** The key's fingerprint, `SHA256:` and 8 groups of 4 lowercase hex digits joined by `-`. */
   fingerprint: string;
+}
+
+/** A signed statement (a membership entry's, an introduction's): `signer` says, with `key`, the payload of that hash. */
+export interface MembershipStatement {
+  signer: string;
+  key: string;
+  kind: string;
+  /** 64 lowercase hex digits. */
+  payload_sha256: string;
+  version: number;
+  sig: string;
+}
+
+/** What every membership log entry carries besides its op's fields. */
+export interface MembershipEntryBase {
+  /** The previous entry's hash (64 lowercase hex; zeros for the genesis). */
+  prev: string;
+  /** The authority's signature over the op and `prev`; its `version` is the entry's number. */
+  statement: MembershipStatement;
+}
+
+/** The first entry: the fleet's authority (its key signs every entry) and its hub; `id` is random (32 hex). */
+export interface MembershipGenesis extends MembershipEntryBase {
+  op: 'genesis';
+  id: string;
+  authority: string;
+  key: string;
+  hub: string;
+}
+
+export interface MembershipAdd extends MembershipEntryBase {
+  op: 'add';
+  name: string;
+  key: string;
+}
+
+export interface MembershipRevoke extends MembershipEntryBase {
+  op: 'revoke';
+  name: string;
+  key: string;
+}
+
+/** `name`'s key goes from `old` to `new`, countersigned by `old` (`by_old`). */
+export interface MembershipRotate extends MembershipEntryBase {
+  op: 'rotate';
+  name: string;
+  old: string;
+  new: string;
+  by_old: string;
+}
+
+export interface MembershipHub extends MembershipEntryBase {
+  op: 'hub';
+  name: string;
+}
+
+/** One entry of the membership log, a hash chain the fleet's authority signs. */
+export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipHub;
+
+/** A member's signed word for a key the authority hasn't added: capped until it does. */
+export interface MembershipIntroduction {
+  name: string;
+  key: string;
+  introducer: string;
+  statement: MembershipStatement;
+}
+
+/** A membership log and the introductions held beside it, as stored (`membership.json`). */
+export interface MembershipStored {
+  entries: MembershipEntry[];
+  introductions: MembershipIntroduction[];
+}
+
+/** Where a log stands: its length, last entry's hash and genesis hash (64 lowercase hex each; zeros when empty). */
+export interface MembershipHead {
+  len: number;
+  hash: string;
+  genesis: string;
+}
+
+export interface MembershipKey {
+  key: string;
+  fingerprint: string;
+}
+
+/** A held introduction: who, by whom, the introduced key's fingerprint. */
+export interface MembershipIntroduced {
+  name: string;
+  introducer: string;
+  fingerprint: string;
+}
+
+/** What a stored log says; all empty in no fleet's log. */
+export interface MembershipSummary {
+  authority: string | null;
+  hub: string | null;
+  members: Record<string, MembershipKey>;
+  introductions: MembershipIntroduced[];
+  head: MembershipHead;
+}
+
+/** `membership.get`'s answer (and `membership.adopt`'s, after it). */
+export interface MembershipInfo {
+  /** `null` in no fleet's log. */
+  stored: MembershipStored | null;
+  summary: MembershipSummary;
 }
 
 /** One process of an instance, as `ps` printed it. */
@@ -1414,9 +1524,11 @@ export interface ApiMethods {
   /**
    * Check `roots` on the machine (a quoted `~` is its home) and register it; `invalid` for a taken name, a bad
    * root or an empty `command`. `command` as `machines.probe`'s, saved as the machine's. `hub`: the machine is
-   * the hub of the new fleet; `denied` when either end is in a fleet whose hub it isn't.
+   * the hub of the new fleet; `denied` when either end is in a fleet whose hub it isn't. `key`: the machine's
+   * key as the user confirmed it (`machines.probe`'s); `denied` when the machine's differs. Writes both ends'
+   * membership logs (`denied` for another fleet's log, a fork, a capped member letting a host in).
    */
-  'machines.add': { params: { target: string; name?: string; roots: string[]; hub: boolean; agent?: boolean; command?: string }; result: MachineAdded };
+  'machines.add': { params: { target: string; name?: string; roots: string[]; hub: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
   'machines.list': { params: {}; result: MachineRow[] };
   /** Change a registered machine's settings; `not-found` for an unknown name. */
   'machines.set': { params: { name: string; agent: boolean }; result: OkResult };
@@ -1455,11 +1567,26 @@ export interface ApiMethods {
   /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. */
   'member.get': { params: {}; result: MemberInfo };
   /**
-   * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `hub` (`'self'`
-   * or the hub's member name, `''` clears it; a change ends every link of this host, which redial), `trust`, and
-   * `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or hub, or a relative root.
+   * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `trust`,
+   * and `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root. `hub` isn't
+   * settable: it comes from the membership log (`membership.adopt`).
    */
-  'member.set': { params: { name?: string; hub?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
+  'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
+  /** This host's membership log and the introductions it holds. Local only: never over a fleet link. */
+  'membership.get': { params: {}; result: MembershipInfo };
+  /**
+   * Take a membership log: none here takes it, one behind takes its later entries, the same or ahead keeps
+   * this host's; their introductions are held. `denied` for another fleet's log, a fork, or a log that lists
+   * this host neither as a member nor introduced; `invalid` for one that doesn't verify. Writes `hub` from the
+   * log (a change ends every link of this host, which redial). Local only.
+   */
+  'membership.adopt': { params: MembershipStored; result: MembershipInfo };
+  /**
+   * Let `name` (`key`) into this host's fleet: the authority signs an `add`, another member an introduction;
+   * stored, the whole answered. `denied` in no fleet's log or as a capped (introduced) member; `invalid` for a
+   * name or key the fleet knows. Local only.
+   */
+  'membership.sign': { params: { name: string; key: string }; result: MembershipStored };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

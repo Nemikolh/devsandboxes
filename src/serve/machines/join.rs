@@ -19,11 +19,18 @@
 //! Names (fleet plan decisions 2 and 35): the machine is registered under
 //! its member name; `--name` renames it only while it joins by this add.
 //! The joining side's name must be new to the fleet it joins.
+//!
+//! Neither end's `hub` is written from the plan: [`logs`] says what each
+//! end's membership log becomes (decisions 48-50), and each end's `hub`
+//! follows the log it adopts (`fleet::membership_api::adopt`).
 
 use serde::{Deserialize, Serialize};
 
 use crate::serve::api::ApiError;
+use crate::serve::fleet::identity::{PublicKey, Signer};
 use crate::serve::fleet::member::{HUB_SELF, Hub, check_member_name};
+use crate::serve::fleet::membership::{self, Compare, Log, Op, Stored};
+use crate::serve::fleet::membership_api::{Own, adopt_into, can_sign, lists, sign_into};
 
 /// This host's side: its member name, its hub, and the names of the
 /// machines it knows (registry and inbound neighbors).
@@ -49,21 +56,18 @@ pub struct Target<'a> {
 pub struct Plan {
     /// The registry name: the machine's member name once the add is done.
     pub name: String,
-    /// The machine's `member.set`, when it joins.
+    /// The machine's `member.set {name}`, when it joins.
     pub target_set: Option<TargetSet>,
-    /// This host's new `hub`, when it joins or becomes a hub.
-    pub this_hub: Option<String>,
     pub fleet: Fleet,
 }
 
-/// The machine's `member.set {name, hub}`.
+/// The machine's `member.set {name}`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TargetSet {
     /// Its member name, always written: `--name`, or the name it goes by
     /// now, pinned so a later hostname change can't rename a member the
     /// fleet knows by name.
     pub name: String,
-    pub hub: String,
 }
 
 /// `machines.add`'s `fleet`: the fleet both ends are in after the add.
@@ -128,14 +132,14 @@ pub fn plan(this: &This, target: &Target, asked: Option<&str>, target_hub: bool)
         (Some(k), Some(_)) => {
             let name = fixed_name(target, asked, &k)?;
             not_this(this, label, &name, false)?;
-            Ok(Plan { name, target_set: None, this_hub: None, fleet: Fleet { hub: k, joined: Joined::Same } })
+            Ok(Plan { name, target_set: None, fleet: Fleet { hub: k, joined: Joined::Same } })
         }
         (Some(k), None) => {
             let name = joining_name(target, asked)?;
             not_this(this, label, &name, true)?;
             new_to(&name, &k, this.known, label, true)?;
-            let target_set = TargetSet { name: name.clone(), hub: k.clone() };
-            Ok(Plan { name, target_set: Some(target_set), this_hub: None, fleet: Fleet { hub: k, joined: Joined::Target } })
+            let target_set = TargetSet { name: name.clone() };
+            Ok(Plan { name, target_set: Some(target_set), fleet: Fleet { hub: k, joined: Joined::Target } })
         }
         (None, Some(k)) => {
             let name = fixed_name(target, asked, &k)?;
@@ -146,33 +150,118 @@ pub fn plan(this: &This, target: &Target, asked: Option<&str>, target_hub: bool)
                     this.name
                 )));
             }
-            Ok(Plan { name, target_set: None, this_hub: Some(k.clone()), fleet: Fleet { hub: k, joined: Joined::This } })
-        }
-        (None, None) if target_hub => {
-            let name = joining_name(target, asked)?;
-            not_this(this, label, &name, true)?;
-            new_to(&name, this.name, this.known, label, true)?;
-            let target_set = TargetSet { name: name.clone(), hub: HUB_SELF.to_string() };
-            Ok(Plan {
-                target_set: Some(target_set),
-                this_hub: Some(name.clone()),
-                fleet: Fleet { hub: name.clone(), joined: Joined::New },
-                name,
-            })
+            Ok(Plan { name, target_set: None, fleet: Fleet { hub: k, joined: Joined::This } })
         }
         (None, None) => {
             let name = joining_name(target, asked)?;
             not_this(this, label, &name, true)?;
             new_to(&name, this.name, this.known, label, true)?;
-            let target_set = TargetSet { name: name.clone(), hub: this.name.to_string() };
-            Ok(Plan {
-                name,
-                target_set: Some(target_set),
-                this_hub: Some(HUB_SELF.to_string()),
-                fleet: Fleet { hub: this.name.to_string(), joined: Joined::New },
-            })
+            let hub = if target_hub { name.clone() } else { this.name.to_string() };
+            Ok(Plan { target_set: Some(TargetSet { name: name.clone() }), fleet: Fleet { hub, joined: Joined::New }, name })
         }
     }
+}
+
+/// One end of an add as [`logs`] sees it: its member name once the add is
+/// done, its key (the machine's as the user confirmed it), and its stored
+/// membership log.
+pub struct Side<'a> {
+    pub name: &'a str,
+    pub key: PublicKey,
+    pub stored: &'a Stored,
+}
+
+impl Side<'_> {
+    fn own(&self) -> Own<'_> {
+        Own { name: self.name, key: self.key }
+    }
+}
+
+/// What the add does to the membership logs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Logs {
+    /// Both ends adopt this (`new`: the genesis and the machine's `add`
+    /// signed here; `target`: the machine's `add`, or its introduction,
+    /// signed here).
+    Both(Stored),
+    /// `this`: the machine lets this host in (`membership.sign` there), and
+    /// this host adopts its answer.
+    Signed,
+    /// `same`: each end adopts the other's.
+    Exchange,
+}
+
+/// A fleet made before member keys: no log to sign into (decision 52).
+fn no_log(who: &str, hub: &str) -> ApiError {
+    ApiError::failed(format!(
+        "{who} is in `{hub}`'s fleet but holds no membership log (a fleet made before member keys): make the fleet again \
+         (`devsandbox machine rm` each member, then `machine add`)"
+    ))
+}
+
+/// The membership logs for `fleet` (the plan's), this host signing with
+/// `signer` (`this.key`'s), every check made on both ends' logs before
+/// anything is written: what each end adopts must take on its log and list
+/// it. `label` names the machine in messages.
+pub fn logs(fleet: &Fleet, this: &Side, signer: &impl Signer, target: &Side, label: &str) -> Result<Logs, ApiError> {
+    let both = |next: Stored| -> Result<Logs, ApiError> {
+        adopt_into(this.stored, &next, &this.own())?;
+        adopt_into(target.stored, &next, &target.own()).map_err(|e| on(label, e))?;
+        Ok(Logs::Both(next))
+    };
+    match fleet.joined {
+        Joined::New => {
+            // Decision 48: the host running the fleet-creating add is the
+            // authority, whichever end is the hub.
+            let invalid = |e: anyhow::Error| ApiError::invalid(format!("{e:#}"));
+            let mut log = Log::default();
+            log.append(Op::genesis(this.name, this.key, &fleet.hub).map_err(ApiError::internal)?, this.name, signer).map_err(invalid)?;
+            log.append(Op::Add { name: target.name.to_string(), key: target.key }, this.name, signer).map_err(invalid)?;
+            both(Stored { log, introductions: vec![] })
+        }
+        Joined::Target => {
+            if this.stored.log.membership().is_none() {
+                return Err(no_log("this host", &fleet.hub));
+            }
+            both(sign_into(this.stored, &this.own(), signer, target.name, &target.key)?)
+        }
+        Joined::This => {
+            if target.stored.log.membership().is_none() {
+                return Err(no_log(label, &fleet.hub));
+            }
+            can_sign(target.stored, &target.own(), this.name, &this.key).map_err(|e| on(label, e))?;
+            if this.stored.log.membership().is_some()
+                && let fork @ Compare::Fork { .. } = membership::compare(&this.stored.log, target.stored.log.head())
+            {
+                return Err(ApiError::denied(format!("{label}: {fork}")));
+            }
+            Ok(Logs::Signed)
+        }
+        Joined::Same => {
+            for (who, side) in [("this host", this), (label, target)] {
+                if side.stored.log.membership().is_none() {
+                    return Err(no_log(who, &fleet.hub));
+                }
+            }
+            let here = adopt_into(this.stored, target.stored, &this.own())?;
+            adopt_into(target.stored, this.stored, &target.own()).map_err(|e| on(label, e))?;
+            if !lists(&here, target.name, &target.key) {
+                return Err(ApiError::denied(format!(
+                    "{label} (`{}`, {}) isn't in `{}`'s membership log nor introduced: it isn't this fleet's member",
+                    target.name,
+                    target.key.fingerprint(),
+                    fleet.hub
+                )));
+            }
+            Ok(Logs::Exchange)
+        }
+    }
+}
+
+/// `e` as the machine's refusal.
+fn on(label: &str, mut e: ApiError) -> ApiError {
+    e.message = format!("{label}: {}", e.message);
+    e
 }
 
 /// A machine already in fleet `k` keeps its member name: `--name` must say
@@ -258,8 +347,7 @@ mod tests {
                 p,
                 Plan {
                     name: "box".into(),
-                    target_set: Some(TargetSet { name: "box".into(), hub: k.into() }),
-                    this_hub: None,
+                    target_set: Some(TargetSet { name: "box".into() }),
                     fleet: Fleet { hub: k.into(), joined: Joined::Target },
                 }
             );
@@ -268,7 +356,7 @@ mod tests {
         for own in [Some("box"), None] {
             let p = run(other("k"), own, Hub::None, Some("b2")).unwrap();
             assert_eq!(p.name, "b2");
-            assert_eq!(p.target_set, Some(TargetSet { name: "b2".into(), hub: "k".into() }));
+            assert_eq!(p.target_set, Some(TargetSet { name: "b2".into() }));
         }
         let p = run(other("k"), Some("box"), Hub::None, Some("box")).unwrap();
         assert_eq!(p.target_set.unwrap().name, "box", "its own name, pinned");
@@ -278,12 +366,9 @@ mod tests {
     fn this_host_joins_the_machines_fleet() {
         // Its hub `self`: the hub is the machine, by its member name.
         let p = run(Hub::None, Some("box"), Hub::This, None).unwrap();
-        assert_eq!(
-            p,
-            Plan { name: "box".into(), target_set: None, this_hub: Some("box".into()), fleet: Fleet { hub: "box".into(), joined: Joined::This } }
-        );
+        assert_eq!(p, Plan { name: "box".into(), target_set: None, fleet: Fleet { hub: "box".into(), joined: Joined::This } });
         let p = run(Hub::None, Some("box"), other("k"), Some("box")).unwrap();
-        assert_eq!((p.this_hub.as_deref(), p.fleet), (Some("k"), Fleet { hub: "k".into(), joined: Joined::This }));
+        assert_eq!((p.target_set, p.fleet), (None, Fleet { hub: "k".into(), joined: Joined::This }));
     }
 
     #[test]
@@ -293,8 +378,7 @@ mod tests {
             p,
             Plan {
                 name: "box".into(),
-                target_set: Some(TargetSet { name: "box".into(), hub: "lap".into() }),
-                this_hub: Some("self".into()),
+                target_set: Some(TargetSet { name: "box".into() }),
                 fleet: Fleet { hub: "lap".into(), joined: Joined::New },
             }
         );
@@ -308,14 +392,13 @@ mod tests {
             p,
             Plan {
                 name: "box".into(),
-                target_set: Some(TargetSet { name: "box".into(), hub: "self".into() }),
-                this_hub: Some("box".into()),
+                target_set: Some(TargetSet { name: "box".into() }),
                 fleet: Fleet { hub: "box".into(), joined: Joined::New },
             }
         );
         // Named as a joining machine is: `--name`, else its own.
         let p = run_hub(Hub::None, None, Hub::None, Some("srv"), true).unwrap();
-        assert_eq!((p.target_set.unwrap().name, p.this_hub.as_deref(), p.fleet.hub), ("srv".into(), Some("srv"), "srv".into()));
+        assert_eq!((p.target_set.unwrap().name, p.fleet.hub), ("srv".into(), "srv".into()));
         assert!(message(run_hub(Hub::None, None, Hub::None, None, true)).ends_with("pass --name"));
         assert!(message(run_hub(Hub::None, Some("lap"), Hub::None, None, true)).contains("`lap` is this host's too"));
         assert!(message(run_hub(Hub::None, Some("old"), Hub::None, None, true)).contains("`old` (me@box) is already a member"));
@@ -345,7 +428,7 @@ mod tests {
     fn the_same_hub_is_an_extra_link() {
         for (this, target) in [(other("k"), other("k")), (Hub::This, other("lap")), (other("box"), Hub::This)] {
             let p = run(this, Some("box"), target, None).unwrap();
-            assert_eq!((p.target_set, p.this_hub, p.fleet.joined), (None, None, Joined::Same), "nothing written");
+            assert_eq!((p.target_set, p.fleet.joined), (None, Joined::Same), "nothing pinned");
         }
     }
 
@@ -389,6 +472,118 @@ mod tests {
         let this = This { name: "k", hub: &Hub::None, known: &this_known };
         let target = Target { label: "me@box", name: Some("box"), hub: &other("k"), known: &target_known };
         assert!(plan(&this, &target, None, false).is_err(), "this host named as the hub");
+    }
+
+    mod logs {
+        use super::super::*;
+        use crate::serve::fleet::identity::SigningKey;
+        use crate::serve::fleet::membership_api::test_support::fleet as made;
+
+        fn key(n: u8) -> SigningKey {
+            SigningKey::from_seed([n; 32])
+        }
+
+        fn pk(n: u8) -> PublicKey {
+            key(n).public_key()
+        }
+
+        /// `k`'s fleet (key 7) with member `m` (key 8), which introduces
+        /// `name` (key `n`): capped there.
+        fn capped(name: &str, n: u8) -> Stored {
+            let s = made("k", &key(7), "k", &[("m", pk(8))]);
+            sign_into(&s, &Own { name: "m", key: pk(8) }, &key(8), name, &pk(n)).unwrap()
+        }
+
+        fn f(hub: &str, joined: Joined) -> Fleet {
+            Fleet { hub: hub.into(), joined }
+        }
+
+        /// [`logs`] with this host `lap` (key 1, holding `this`) and the
+        /// machine `box` (key 2, holding `target`).
+        fn run(fleet: Fleet, this: &Stored, target: &Stored) -> Result<Logs, ApiError> {
+            let this_side = Side { name: "lap", key: pk(1), stored: this };
+            let target_side = Side { name: "box", key: pk(2), stored: target };
+            logs(&fleet, &this_side, &key(1), &target_side, "me@box")
+        }
+
+        fn both(r: Result<Logs, ApiError>) -> Stored {
+            match r.unwrap() {
+                Logs::Both(s) => s,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_new_fleet_is_signed_here_whichever_end_is_the_hub() {
+            let none = Stored::default();
+            for hub in ["lap", "box"] {
+                let s = both(run(f(hub, Joined::New), &none, &none));
+                let m = s.log.membership().unwrap();
+                assert_eq!((&m.authority, m.hub.as_str(), m.head.len), (&("lap".to_string(), pk(1)), hub, 2));
+                assert_eq!(m.key_of("box"), Some(pk(2)));
+            }
+            // A stale log on either end: another fleet's, refused.
+            let stale = made("x", &key(9), "x", &[("lap", pk(1)), ("box", pk(2))]);
+            assert_eq!(run(f("lap", Joined::New), &stale, &none).unwrap_err().code, "denied");
+            let e = run(f("lap", Joined::New), &none, &stale).unwrap_err();
+            assert!(e.code == "denied" && e.message.starts_with("me@box: "), "{}", e.message);
+        }
+
+        #[test]
+        fn the_machine_joining_is_added_or_introduced_here() {
+            let none = Stored::default();
+            // This host the authority: an `add`.
+            let ours = made("lap", &key(1), "lap", &[]);
+            let s = both(run(f("lap", Joined::Target), &ours, &none));
+            assert_eq!((s.log.head().len, s.log.membership().unwrap().key_of("box")), (2, Some(pk(2))));
+            // A member: an introduction, the log as it was.
+            let ours = made("k", &key(7), "k", &[("lap", pk(1))]);
+            let s = both(run(f("k", Joined::Target), &ours, &none));
+            assert_eq!(s.log, ours.log);
+            assert_eq!((s.introductions[0].name.as_str(), s.introductions[0].introducer.as_str()), ("box", "lap"));
+            // Capped here: refused.
+            assert_eq!(run(f("k", Joined::Target), &capped("lap", 1), &none).unwrap_err().code, "denied");
+            // No log here (a fleet made before keys).
+            let e = run(f("k", Joined::Target), &none, &none).unwrap_err();
+            assert!(e.code == "failed" && e.message.contains("no membership log"), "{}", e.message);
+        }
+
+        #[test]
+        fn this_host_joining_is_checked_against_the_machines_log() {
+            let none = Stored::default();
+            let theirs = made("box", &key(2), "box", &[]);
+            assert_eq!(run(f("box", Joined::This), &none, &theirs), Ok(Logs::Signed));
+            let e = run(f("box", Joined::This), &none, &none).unwrap_err();
+            assert!(e.code == "failed" && e.message.starts_with("me@box is in `box`'s fleet but holds no membership log"), "{}", e.message);
+            // The machine capped, or this host's name taken there.
+            let e = run(f("k", Joined::This), &none, &capped("box", 2)).unwrap_err();
+            assert!(e.code == "denied" && e.message.starts_with("me@box: "), "{}", e.message);
+            let taken = made("box", &key(2), "box", &[("lap", pk(5))]);
+            assert_eq!(run(f("box", Joined::This), &none, &taken).unwrap_err().code, "invalid");
+            // A log of another fleet here.
+            let stale = made("x", &key(9), "x", &[("lap", pk(1))]);
+            assert_eq!(run(f("box", Joined::This), &stale, &theirs).unwrap_err().code, "denied");
+        }
+
+        #[test]
+        fn an_extra_link_exchanges_logs_both_known() {
+            let s = made("lap", &key(1), "lap", &[("box", pk(2))]);
+            assert_eq!(run(f("lap", Joined::Same), &s, &s), Ok(Logs::Exchange));
+            let longer = sign_into(&s, &Own { name: "lap", key: pk(1) }, &key(1), "pi", &pk(3)).unwrap();
+            assert_eq!(run(f("lap", Joined::Same), &s, &longer), Ok(Logs::Exchange));
+            assert_eq!(run(f("lap", Joined::Same), &longer, &s), Ok(Logs::Exchange));
+            // Another fleet; a fork.
+            let other = made("lap", &key(1), "lap", &[("box", pk(2))]);
+            let e = run(f("lap", Joined::Same), &s, &other).unwrap_err();
+            assert!(e.code == "denied" && e.message.contains("another fleet"), "{}", e.message);
+            let fork = sign_into(&s, &Own { name: "lap", key: pk(1) }, &key(1), "pi", &pk(4)).unwrap();
+            assert_eq!(run(f("lap", Joined::Same), &longer, &fork).unwrap_err().code, "denied");
+            // Not each other's: the machine isn't in the log.
+            let alone = made("lap", &key(1), "lap", &[]);
+            assert_eq!(run(f("lap", Joined::Same), &alone, &alone).unwrap_err().code, "denied");
+            let e = run(f("lap", Joined::Same), &Stored::default(), &s).unwrap_err();
+            assert!(e.code == "failed" && e.message.starts_with("this host is in"), "{}", e.message);
+        }
     }
 
     #[test]

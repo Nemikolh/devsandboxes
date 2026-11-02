@@ -258,6 +258,10 @@ limitation means editing this file in the same commit.
   `agent-link-<host>.sock` there; processes there use the newest live
   socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
+- An introduction made by a non-authority member (`machine add` run on
+  it) isn't sent to the authority yet (fleet plan step 10a.6), so the
+  introduced member stays capped.
+  → [fleet](architecture/daemon/fleet.md#membership-log); `membership_api::sign_into`
 - `machine add` has no `--command`: it sets `command` only when it finds or
   installs devsandbox in `~/.local/bin` off the login `PATH`; a remote devsandbox
   anywhere else off `PATH` is set by hand in `machines.toml`.

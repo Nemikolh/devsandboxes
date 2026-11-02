@@ -138,7 +138,8 @@ pub struct Options {
     /// How `helper.call` reaches containers; `None` is the host side's
     /// bridges (none without one). Tests pass a client over fake links.
     pub helper: Option<helper::HelperClient>,
-    /// `member.toml` (`fleet::member`), for `member.*`, the trust table and
+    /// `member.toml` (`fleet::member`), for `member.*` and `membership.*`
+    /// (`member.key` and `membership.json` beside it), the trust table and
     /// the capacity's caps; its dir (the data dir) holds the peers' fleet
     /// roots. `None` is the default ([`fleet::member::path`]). Tests point
     /// it at their own file.
@@ -260,7 +261,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let listener = Listener::bind(dir)?;
     let member = member_path(opts);
     // The daemon is `member.toml`'s only writer (fleet plan decision 3): its
-    // `hub` is read once here, then kept by `member.set` ([`Shared::set_hub`]).
+    // `hub` is read once here, then kept by each write of it (an adopted
+    // membership log, a leave: [`Shared::set_hub`]).
     let hub = match &member {
         Ok(path) => fleet::member::load(path).unwrap_or_else(|e| {
             log(&format!("warning: {e:#}; in no fleet until it's fixed"));
@@ -349,8 +351,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         inbound: Arc::clone(&inbound),
         member: shared.member.clone(),
         hostname: shared.hostname.clone(),
-        // `machines.add` wrote this host's `hub` through `member::set`: the
-        // same follow-up as a `member.set` call's.
+        // `machines.add` or a leave wrote this host's `hub`: the same
+        // follow-up as a `membership.adopt` call's.
         hub_changed: {
             let hooked = Arc::clone(&hooked);
             Box::new(move |hub| {
@@ -635,9 +637,10 @@ struct Shared {
     join: Join,
     /// What `roots.list` reads `~` as.
     home: Option<PathBuf>,
-    /// `member.toml`'s `hub`: read at the start, then set by `member.set`
-    /// ([`Shared::set_hub`]); the daemon is the file's only writer (fleet
-    /// plan decision 3), so nothing re-reads it. The keep-alive, placement,
+    /// `member.toml`'s `hub`: read at the start, then set by each write of
+    /// it (`membership.adopt`, `machines.add`, a leave: [`Shared::set_hub`]);
+    /// the daemon is the file's only writer (fleet plan decision 3), so
+    /// nothing re-reads it. The keep-alive, placement,
     /// `remotes.json` (`service::Hub`) and the links' hellos follow it.
     hub: Arc<Mutex<fleet::member::Hub>>,
     /// The `machines.*` methods' registry and dial, and the machine links;
@@ -756,7 +759,8 @@ impl Shared {
         Some(service::HubOf { hub, me })
     }
 
-    /// `member.set` wrote `hub`: keep it, and when it changed end every
+    /// `hub` was written (from an adopted membership log, or cleared on
+    /// leaving): keep it, and when it changed end every
     /// link this host holds and every one it's dialed on, so both ends
     /// redial saying the new hub (`fleet::update::hello_of`). Held links:
     /// `service::Handle::cycle`. Dialed ones: each `fleet-link --peer`'s
@@ -1603,16 +1607,21 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "capacity.get" => serde_json::to_value(shared.capacity()).map_err(|e| api::ApiError::internal(e.into())),
         // Local only: no link's table admits `member.*` (`fleet::lent`).
         method if method.starts_with("member.") => match &shared.member {
-            Some(path) => {
-                let answer = fleet::member::call(method, req.params, path, &shared.hostname)
-                    .unwrap_or_else(|| Err(api::ApiError::unknown_method(method)));
-                if method == "member.set"
-                    && let Ok(info) = &answer
-                {
-                    shared.set_hub(fleet::member::Hub::of(info["hub"].as_str().unwrap_or_default()));
+            Some(path) => fleet::member::call(method, req.params, path, &shared.hostname)
+                .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
+            None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
+        },
+        // Local only too; an adopt wrote `hub` from the log: followed here.
+        method if method.starts_with("membership.") => match &shared.member {
+            Some(path) => match fleet::membership_api::call(method, req.params, path, &shared.hostname) {
+                Some((answer, hub)) => {
+                    if let Some(hub) = hub {
+                        shared.set_hub(hub);
+                    }
+                    answer
                 }
-                answer
-            }
+                None => Err(api::ApiError::unknown_method(method)),
+            },
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
         method if method.starts_with("machines.") && shared.machines.is_some() => {
@@ -3372,6 +3381,7 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "machines.list", json!({})), None);
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), None);
         assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "membership.get", json!({})), Some("denied".into()));
         assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api"})), Some("denied".into()));
         drop(conn);
 
@@ -3611,15 +3621,28 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// `member.set {hub}` flips the hub under a running daemon: clearing it
-    /// lets the daemon idle out again; a change sends `links.cycle` on each
-    /// held `links.inbound` connection (and nothing on a repeat).
+    /// An adopted membership log flips the hub under a running daemon: no
+    /// longer the hub lets the daemon idle out again; a change sends
+    /// `links.cycle` on each held `links.inbound` connection (and nothing on
+    /// a repeat).
     #[test]
     fn a_hub_change_cycles_the_inbound_links_and_the_keep_alive_follows() {
+        use crate::serve::fleet::identity::{Signer, SigningKey};
         use crate::serve::fleet::member::{self, Member};
+        use crate::serve::fleet::membership::Op;
+        use crate::serve::fleet::membership_api::test_support;
         let dir = scratch("hub-flip");
         let data = scratch("hub-flip-data");
-        member::write_for_test(&data.join("member.toml"), &Member { hub: "self".into(), ..Default::default() });
+        let member_toml = data.join("member.toml");
+        member::write_for_test(&member_toml, &Member { name: "lap".into(), hub: "self".into(), ..Default::default() });
+        // `lap` the authority and the hub; then `box` added and made the hub.
+        let lap = test_support::key_of(&member_toml);
+        let box_key = SigningKey::from_seed([2; 32]).public_key();
+        let first = test_support::fleet("lap", &lap, "lap", &[]);
+        let mut second = first.clone();
+        second.log.append(Op::Add { name: "box".into(), key: box_key }, "lap", &lap).unwrap();
+        second.log.append(Op::Hub { name: "box".into() }, "lap", &lap).unwrap();
+        assert_ne!(lap.public_key(), box_key);
         let options = Options {
             remotes: Some(data.join("remotes.json")),
             member: Some(data.join("member.toml")),
@@ -3631,14 +3654,15 @@ pub(crate) mod tests {
         let r = inbound.call("links.inbound", json!({"peer": "lap", "version": "0.6.0 a dev x/y member box"})).unwrap();
         assert!(r.error.is_none(), "{r:?}");
         let mut local = connect(&dir);
-        let r = local.call("member.set", json!({"hub": "self"})).unwrap();
-        assert_eq!(r.result.unwrap()["hub"], "self");
+        let r = local.call("membership.adopt", serde_json::to_value(first.to_wire()).unwrap()).unwrap();
+        assert_eq!(r.result.unwrap()["summary"]["hub"], "lap");
+        assert_eq!(member::load(&member_toml).unwrap().unwrap().hub(), member::Hub::This);
         assert!(inbound.next_notification(Duration::from_millis(300)).unwrap().is_none(), "no change, no cycle");
-        let r = local.call("member.set", json!({"hub": "box"})).unwrap();
-        assert_eq!(r.result.unwrap()["hub"], "box");
+        let r = local.call("membership.adopt", serde_json::to_value(second.to_wire()).unwrap()).unwrap();
+        assert_eq!(r.result.unwrap()["summary"]["hub"], "box");
         let n = inbound.next_notification(Duration::from_secs(5)).unwrap().expect("no links.cycle");
         assert_eq!(n.method, crate::commands::fleet_link::LINKS_CYCLE);
-        assert_eq!(member::load(&data.join("member.toml")).unwrap().unwrap().hub(), member::Hub::Other("box".into()));
+        assert_eq!(member::load(&member_toml).unwrap().unwrap().hub(), member::Hub::Other("box".into()));
         // No longer the hub: it idles out once nobody holds it.
         drop((inbound, local));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);

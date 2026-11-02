@@ -5,9 +5,13 @@
 //! `machine trust`, `machine roots` and `machine key` are likewise clients of `member.*`
 //! (this host's `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
 //!
-//! `add` without `--config` probes the machine for its candidate roots and
-//! lets the user pick (a TTY; none is a pick too) or takes the only usable
-//! one (no TTY); no candidates, it takes none without asking. The picked or
+//! `add` always probes the machine first (`machines.probe`): its member key's
+//! fingerprint is shown and confirmed on a TTY (`--yes` takes it without
+//! asking; off a TTY `--yes` is required), and the confirmed key goes to
+//! `machines.add`, which refuses a machine whose key differs. Without
+//! `--config` the user picks among the probe's candidate roots (a TTY;
+//! none is a pick too) or `add` takes the only usable one (no TTY); no
+//! candidates, it takes none without asking. The picked or
 //! typed roots, if any, are first recorded on the machine as its own
 //! (`devsandbox machine roots add` there over ssh, so its `worker` trust
 //! lets this host reach them even once no instance keeps them in its
@@ -42,11 +46,12 @@ use crate::serve::machines::ssh;
 
 const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
-pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hub: bool, auto_install: bool) -> Result<()> {
+pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hub: bool, auto_install: bool, yes: bool) -> Result<()> {
     let command = ensure_devsandbox(target, auto_install)?;
     let mut conn = connect()?;
+    let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target, "command": command }))?;
+    confirm_key(target, &probed.fingerprint, std::io::stdin().is_terminal(), yes)?;
     let roots = if configs.is_empty() {
-        let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target, "command": command }))?;
         if probed.roots.is_empty() {
             Vec::new()
         } else if std::io::stdin().is_terminal() {
@@ -62,7 +67,8 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hu
     {
         eprintln!("warning: {}", roots_warning(target, &roots, &e));
     }
-    let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "hub": hub, "agent": agent, "command": command }))?;
+    let params = json!({ "target": target, "name": name, "roots": roots, "hub": hub, "agent": agent, "command": command, "key": probed.key });
+    let added: Added = call(&mut conn, "machines.add", params)?;
     let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
     println!("added {} ({target}): {}", added.name, added_roots(&roots));
     println!("{}", fleet_line(&added.name, &added.fleet));
@@ -70,6 +76,39 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hu
         eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+/// Show `target`'s key fingerprint and have it confirmed: asked on a TTY
+/// unless `yes`; off one, `yes` is required.
+fn confirm_key(target: &str, fingerprint: &str, tty: bool, yes: bool) -> Result<()> {
+    let shown = key_line(target, fingerprint);
+    match consent(tty, yes) {
+        Consent::Install => {
+            eprintln!("{shown}");
+            Ok(())
+        }
+        Consent::Refuse => bail!("{}", key_refusal(target, fingerprint)),
+        Consent::Ask => {
+            eprintln!("{shown}");
+            if is_yes(&prompt("Is that the machine's key (`devsandbox machine key` there)? [y/N] ")?) {
+                Ok(())
+            } else {
+                bail!("{target}'s key not confirmed: nothing added")
+            }
+        }
+    }
+}
+
+fn key_line(target: &str, fingerprint: &str) -> String {
+    format!("{target}'s key fingerprint is {fingerprint}")
+}
+
+/// Off a TTY without `--yes`.
+fn key_refusal(target: &str, fingerprint: &str) -> String {
+    format!(
+        "{}: pass --yes to take it without a TTY to confirm it on (check it against `devsandbox machine key` run there)",
+        key_line(target, fingerprint)
+    )
 }
 
 /// The roots `add` reports: listed, or that there are none.
@@ -759,6 +798,18 @@ mod tests {
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
         Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into) }
+    }
+
+    #[test]
+    fn the_key_is_confirmed_on_a_tty_or_by_yes() {
+        let fp = "SHA256:aaaa";
+        // `--yes`: taken whatever the TTY (no prompt is read in a test).
+        for tty in [true, false] {
+            confirm_key("me@box", fp, tty, true).unwrap();
+        }
+        let e = confirm_key("me@box", fp, false, false).unwrap_err().to_string();
+        assert_eq!(e, key_refusal("me@box", fp));
+        assert!(e.starts_with("me@box's key fingerprint is SHA256:aaaa: pass --yes"), "{e}");
     }
 
     #[test]

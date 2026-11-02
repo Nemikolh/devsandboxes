@@ -4,7 +4,7 @@
 //! their links (admitted by `fleet::lent::admit_fleet`).
 //!
 //! A removal runs on the hub: it tells the member (`fleet.leave`: it clears
-//! its `hub` and drops its own registry entries), tells every other member
+//! its `hub`, drops its membership log and its own registry entries), tells every other member
 //! it links to (`fleet.forget`: each drops its entry for it, or ends its
 //! inbound link), then unlinks it here. A member's `machine rm` is sent to
 //! the hub as `fleet.rm`; `machine rm` of this host's own name leaves.
@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use super::api::{self, Ctx};
 use crate::serve::api::{ApiError, parse};
 use crate::serve::fleet::member::{self, Hub};
+use crate::serve::fleet::membership;
 use crate::serve::snapshots::LinkState;
 
 type Answer = Result<Value, ApiError>;
@@ -225,14 +226,20 @@ fn leave(ctx: &Ctx, me: &str, hub: Option<String>) -> Result<Left, ApiError> {
     Ok(Left { name: me.into(), hub: hub.unwrap_or_else(|| me.into()), removed, error, dropped })
 }
 
-/// Clear this host's `hub` and drop every registry entry (written, not
+/// Clear this host's `hub`, drop its membership log (`membership.json`:
+/// leaving a fleet drops its log) and every registry entry (written, not
 /// applied: [`After::Left`]). The entries dropped.
 fn drop_all(ctx: &Ctx) -> Result<Vec<String>, ApiError> {
     let path = ctx.member.as_deref().ok_or_else(|| ApiError::failed("this daemon has no member.toml (no data dir)"))?;
     let dropped = super::update(&ctx.registry, |entries| std::mem::take(entries).into_iter().map(|e| e.name).collect());
     let dropped: Vec<String> = dropped.map_err(ApiError::internal)?;
-    let set = member::SetParams { hub: Some(String::new()), ..Default::default() };
-    member::set(path, &ctx.hostname, &set)?;
+    member::set_fleet(path, None, &Hub::None).map_err(ApiError::internal)?;
+    let log = membership::path(path);
+    match std::fs::remove_file(&log) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ApiError::internal(anyhow::Error::new(e).context(format!("cannot remove {}", log.display())))),
+    }
     Ok(dropped)
 }
 

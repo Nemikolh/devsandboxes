@@ -40,7 +40,7 @@ name when it's `self`):
 | hub K | in no fleet | X joins K's fleet: X's `hub` = K |
 | in no fleet | hub K | H joins K's fleet: H's `hub` = K |
 | in no fleet | in no fleet | a fleet of two: X's `hub` = H's name, H's `hub` = `self`; with `--hub`, X's `hub` = `self`, H's `hub` = X's name |
-| hub K | hub K | an extra link in the same fleet: nothing written |
+| hub K | hub K | an extra link in the same fleet: the membership logs exchanged |
 | hub K | hub L | refused (`denied`), naming both |
 
 `machine add --hub` (`machines.add`'s mandatory `hub`) only picks the
@@ -50,13 +50,42 @@ on as without it; moving the role to another member isn't a join's. So
 a laptop holding the configs makes an always-on server the hub without
 the server ever dialing the laptop.
 
-The link is H → X in every row; joining writes only the joiner's
-`hub`. X is registered under its member name; `--name` renames X (its
-`member.set {name}`, with the `hub`) only while X joins (or becomes the
-hub under `--hub`), and must be
-X's name when X is in a fleet already. A joiner whose name the fleet has
-is refused: X's against H's name, H's machines and H's hub; H's against
-X's name and X's `machines.list`. X's name is never H's.
+The link is H → X in every row. X is registered under its member name;
+`--name` renames X (its `member.set {name}`) only while X joins (or
+becomes the hub under `--hub`), and must be X's name when X is in a fleet
+already. A joiner whose name the fleet has is refused: X's against H's
+name, H's machines and H's hub; H's against X's name and X's
+`machines.list`. X's name is never H's.
+
+No `hub` is written from the table: each end's comes from the
+[membership log](#membership-log) it adopts (`membership.adopt`, which
+writes `hub` and pins the name the log knows it by). Who signs what
+(`machines::join::logs`, pure, over both ends' `membership.get` and
+keys; every check on both logs before anything is written, as the
+rest of the add):
+
+- **A new fleet**: H's key signs `genesis` (H the authority, decision 48;
+  the hub H, or X under `--hub`) then X's `add`; both ends adopt it.
+- **X joins H's fleet**: H the authority signs X's `add`; H another
+  member of the log signs an introduction of X (decision 46: X is capped
+  until the authority adds it); H only introduced itself (capped) is
+  refused (`denied`). Both ends adopt the result.
+- **H joins X's fleet**: X lets H in over the add-time probe
+  (`membership.sign {name, key}` there: an `add` when X is the
+  authority, else an introduction, refused when X is capped), and H
+  adopts X's answer.
+- **An extra link**: each end adopts the other's log (the end behind
+  takes the later entries); another fleet's log or a fork is refused,
+  and so is an end the merged log doesn't list (member or introduced).
+- A host in a fleet with no log (a fleet made before member keys) is
+  refused (`failed`), saying to make the fleet again (decision 52).
+
+X's key is the one the user confirmed: `machine add` shows the
+fingerprint `machines.probe` answers and asks (`--yes` off a TTY), and
+`machines.add {key}` refuses (`denied`, naming both fingerprints) when
+X's `member.get` says another
+([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
+ssh's first-use trust of the target is the root of this check.
 
 **How a machine leaves** (decision 32 of the plan;
 `machines::leave`): `machine unlink <m>` (`machines.unlink`) only drops
@@ -66,8 +95,8 @@ this host's registry entry for `m`, which stays a member. `machine rm
 
 - **On the hub**, `m` one of its machines (registry or inbound): it
   sends `fleet.leave {}` to `m` over `m`'s link while that's connected,
-  and on `m` that clears `hub` and drops all of `m`'s own registry
-  entries; then `fleet.forget {name: m}` to every other machine it
+  and on `m` that clears `hub`, removes its `membership.json` and drops
+  all of `m`'s own registry entries; then `fleet.forget {name: m}` to every other machine it
   links to, each of which drops its entry for `m` or, if `m` is an
   inbound neighbor there, ends `m`'s link; then it unlinks `m` here (its
   entry dropped, or its inbound link ended). Nothing is refused for a
@@ -82,7 +111,8 @@ this host's registry entry for `m`, which stays a member. `machine rm
 - **`m` is this host's own member name** (leaving): on a member, it
   sends `fleet.rm {name: <itself>}` to the hub first (best effort: an
   unreachable hub is a note in the answer, `leave::Left::error`), then
-  clears its own `hub` and drops all its registry entries. On the hub
+  clears its own `hub`, removes its `membership.json` and drops all its
+  registry entries. On the hub
   with any machine it's refused (`the hub can't leave while it has
   members: machine rm each first`); alone, it just clears `hub`.
 
@@ -125,7 +155,9 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 (`dials`, `reconnect_loop`, `session_exec`, `pipe_mode`); hub mode:
 `src/serve/fleet/member.rs` (`Hub`, `Member::hub`), `src/serve/daemon.rs`
 (`Shared::hub`, `Shared::is_hub`, `Shared::set_hub`),
-`src/serve/machines/join.rs` (`plan`, `Plan`, `Fleet`, `Joined`),
+`src/serve/machines/join.rs` (`plan`, `Plan`, `Fleet`, `Joined`,
+`logs`, `Logs`, `Side`), `src/serve/machines/api.rs` (`add`, `probe`,
+`Probed`),
 `src/serve/machines/leave.rs` (`plan`, `Plan`, `Here`, `rm`,
 `fleet_call`, `After`, `apply`, `Removed`, `Left`, `RmAnswer`),
 `src/serve/daemon.rs` (`fleet_call`, `Shared::end_inbound`),
@@ -170,7 +202,9 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/daemon.rs` (`hello`); the member side:
 `src/serve/fleet/member.rs` (`Member`, `SoftCaps`, `load`, `check`,
 `update`, `default_name`, `check_member_name`, `merge`, `call`, `MemberInfo`,
-`key_path`), `src/serve/fleet/identity.rs` (`PublicKey`, `Signature`,
+`key_path`, `set_fleet`), `src/serve/fleet/membership_api.rs` (`call`,
+`MembershipInfo`, `Summary`, `adopt`, `adopt_into`, `sign`, `sign_into`,
+`can_sign`, `Signs`, `lists`, `Own`), `src/serve/fleet/identity.rs` (`PublicKey`, `Signature`,
 `Signer`, `SigningKey`, `KeyStore`, `FileKeyStore`, `Statement`,
 `STATEMENT_DOMAIN`, `Seen`, `Accepted`, `Refusal`),
 `src/serve/locked_file.rs` (`update`, `lock_at`, `write_atomic_mode`),
@@ -595,9 +629,10 @@ fleet plan; `serve install` on the server keeps the daemon running)
 makes this host the hub; `hub = "<name>"` names another member as its
 fleet's hub, absent is in no fleet. The daemon is the file's only
 writer (decision 3), so it reads `hub` once at start into
-`Shared::hub` and from then on keeps it there itself: `member.set {hub}`
-(or `machines.add` joining this host to a fleet) writes the file and
-`Shared::set_hub` the value. Everything below asks
+`Shared::hub` and from then on keeps it there itself: `hub` is written
+only from an accepted membership log (`membership.adopt`, or
+`machines.add` adopting the log it makes; `member::set_fleet`) or cleared
+on leaving, and `Shared::set_hub` follows each write. Everything below asks
 `Shared::is_hub` at its use, so a change applies under a running
 daemon. A change also ends every link this host has, so both ends
 redial saying the new hub ([Versions](#versions)): each ssh machine's
@@ -1088,18 +1123,17 @@ Wire: [`member.*`](../../reference/api.md#member).
   member's public `key` with its `fingerprint` ([Member
   identity](#member-identity); the first ask makes the key). `member.set`
   answers them too.
-- **`member.set {name?, hub?, trust?, roots_add?, roots_rm?}`** merges what's
+- **`member.set {name?, trust?, roots_add?, roots_rm?}`** merges what's
   given into the file (`member::merge`, pure: `name` a
-  `member::check_member_name`, `""` clears it; `hub` `self` or a
-  `machines::check_name`, `""` clears it; `roots_add` absolute, one
+  `member::check_member_name`, `""` clears it; `roots_add` absolute, one
   already there kept once; `roots_rm` drops what it names), checks it and
   writes it. It answers the `MemberInfo` after the change. A changed
   name is what the next dial of each link says (`dialer::member_name`
-  reads it per dial); a changed `hub` is the daemon's
-  (`Shared::set_hub`), which ends this host's links ([Hub
-  mode](#hub-mode)). `machine add` sets `hub` on the end that joins
-  (on the machine over the add-time probe; on this host through
-  `member::set` and `Shared::set_hub`, the same as a call's).
+  reads it per dial). `hub` isn't a param: `member::set_fleet` writes it
+  (with the name the log knows this host by) from an accepted
+  [membership log](#membership-log), and clears it on leaving; the daemon
+  follows it (`Shared::set_hub`), which ends this host's links ([Hub
+  mode](#hub-mode)).
 
 ### Member identity
 
@@ -1219,8 +1253,9 @@ hash chain of entries only the authority signs
   `Membership::drop_settled` drops those the log has since settled: the
   name or key now in it (added, or decided otherwise) or the introducer
   no longer a member with the key that signed it.
-- **`membership.json`**, next to `state.toml` (`membership::path`),
-  written by the daemon only: `{"entries": [...], "introductions":
+- **`membership.json`**, next to `member.toml` (`membership::path` of
+  it, as `member::key_path`; both next to `state.toml`), written by the
+  daemon only: `{"entries": [...], "introductions":
   [...]}`, an entry on the wire being its op's fields (tagged by `op`)
   beside `prev` and `statement`. A missing file is no fleet's log.
   `membership::load` verifies the log and every held introduction (one
@@ -1228,6 +1263,35 @@ hash chain of entries only the authority signs
   dropping any of it; `membership::update` is a read-modify-write under
   `membership.lock` (`locked_file`) that drops settled introductions and
   saves only state that verifies, never overwriting a file that doesn't.
+  `machine rm` of this host (and `fleet.leave` from its hub) removes it:
+  leaving a fleet drops its log.
+- **`membership.*`** (`src/serve/fleet/membership_api.rs`, `call`;
+  local only like `member.*`: `lent::admit` refuses them on every link;
+  the add-time probe reaches them on the machine as a local client there,
+  its ssh login being the user's). Wire:
+  [`membership.*`](../../reference/api.md#membership).
+  - `membership.get` answers `MembershipInfo`: the stored log and
+    introductions (`Wire`, `null` in no fleet's log) and a `Summary`
+    (authority, hub, members with key and fingerprint, introductions with
+    introducer and fingerprint, head).
+  - `membership.adopt {entries, introductions}` verifies them
+    (`Stored::from_wire`) and takes them (`adopt_into`, pure): with no log
+    here, theirs; ours behind, their later entries (`Log::extend`); the
+    same or ahead, ours; another fleet's or a fork is `denied`. Their
+    introductions the result hasn't settled are held (one that doesn't
+    check refuses the whole). The result must list this host (its name
+    with its own key, as a member or introduced): a host never takes a
+    fleet that doesn't contain it. Then `member.toml`'s `hub` and name
+    from the log (`hub_for`, `member::set_fleet`), and the daemon follows
+    the hub (`Shared::set_hub`). It answers as `membership.get`.
+  - `membership.sign {name, key}` (`sign_into`, over `can_sign`): the
+    authority appends `add`; another member of the log signs an
+    introduction; a host only introduced (capped, decision 51) or in no
+    fleet's log is `denied`; the name already in under that key signs
+    nothing (`Signs::Already`), so an add that failed after the target
+    signed can be run again; a name or key the log or a held
+    introduction has otherwise is `invalid`. Stored; it answers the whole `Wire`, for the
+    joining host to adopt.
 
 ### Trust
 

@@ -430,6 +430,9 @@ enum MachineCommand {
     /// copy this one there (to ~/.local/bin/devsandbox when missing, in
     /// place when updating); off a TTY it fails unless --auto-install.
     ///
+    /// The machine's key fingerprint is shown to confirm (compare it with
+    /// `devsandbox machine key` run there); off a TTY it fails unless --yes.
+    ///
     /// Both ends end up in one fleet: the machine joins this host's, this
     /// host joins the machine's, or (neither in one) a fleet of two with
     /// this host the hub. Two different fleets are refused.
@@ -455,6 +458,9 @@ enum MachineCommand {
         /// Install or update devsandbox on the machine without asking (copies this binary)
         #[arg(long)]
         auto_install: bool,
+        /// Take the machine's key without asking to confirm its fingerprint
+        #[arg(long)]
+        yes: bool,
     },
     /// List the registered machines
     Ls {
@@ -841,8 +847,8 @@ fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
-            MachineCommand::Add { target, name, configs, agent, hub, auto_install } => {
-                commands::machine::add(&target, name.as_deref(), &configs, agent, hub, auto_install)
+            MachineCommand::Add { target, name, configs, agent, hub, auto_install, yes } => {
+                commands::machine::add(&target, name.as_deref(), &configs, agent, hub, auto_install, yes)
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),

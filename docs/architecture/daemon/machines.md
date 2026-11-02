@@ -587,9 +587,15 @@ directly and the machine's `command` becomes `LOCAL_COMMAND`
 login `PATH` resolves, an error naming what it resolves to. That
 `command` goes to both `machines.probe` and `machines.add`.
 
-`add` without `--config` calls `machines.probe` (the remote's
-`roots.list`: every `config_dir` in its `state.toml` plus
-`~/.devsandboxes`). No candidates, it takes no roots without asking;
+`add` then always calls `machines.probe` (the remote's `roots.list`:
+every `config_dir` in its `state.toml` plus `~/.devsandboxes`; and its
+`member.get`'s `key` and `fingerprint`). It prints `<target>'s key
+fingerprint is SHA256:…` on stderr and has it confirmed (`confirm_key`,
+over `consent`): `--yes` takes it, a TTY asks `[y/N]` (to compare with
+`devsandbox machine key` run there), no TTY without `--yes` is an error
+naming the fingerprint and the flag (`key_refusal`). The confirmed key
+goes to `machines.add` as `key`. Without `--config`, the probe's roots
+are offered: no candidates, it takes no roots without asking;
 else it lets the user multi-select on a TTY (`pick_roots`, Enter for
 none), and off a TTY takes the one usable candidate, else errors listing
 them (`only_root`). A machine with no roots is one that only runs other
@@ -613,23 +619,29 @@ chosen, nothing is recorded (no ssh).
 
 `machines.add` also applies the join rule
 ([fleet.md](fleet.md), *How a machine joins*): on the same probe it asks
-the machine's `member.get` and `machines.list`, reads this host's
-`member.toml` (`Ctx::member`, the name `Member::name_or` the hostname),
-and `join::plan` decides from both ends' hubs who joins, the registry
-name, and what each end writes, refusing two hubs (`denied`) and a
-joining name the fleet already has. `add --hub` (`machines.add`'s `hub`,
-always sent) makes the machine the hub of the new fleet when neither end
-is in one (its `member.set {name, hub: "self"}`, this host's `hub` its
-name), and is refused (`denied`) when either end is in a fleet whose hub
-the machine isn't. Every check (names, roots, the
-registry and the inbound neighbors) comes before any write; then the
-machine's `member.set {name, hub}` over the still-open probe, this
-host's registry entry, this host's `hub` with its `name` (`member::set`, then
-`Ctx::hub_changed`, which is `daemon::Shared::set_hub` as after a
-`member.set` call), and the links reload. A write that fails after an
-earlier one says what was already written. Each side that joins (or
-becomes the hub) gets its member name written with its `hub`, so a name
-that came from the hostname is pinned: the fleet knows it by that name.
+the machine's `member.get` (refusing, `denied` and naming both
+fingerprints, a `key` that isn't the one there) and `machines.list`,
+reads this host's `member.toml` (`Ctx::member`, the name
+`Member::name_or` the hostname), and `join::plan` decides from both
+ends' hubs who joins and the registry name, refusing two hubs (`denied`)
+and a joining name the fleet already has. `add --hub` (`machines.add`'s
+`hub`, always sent) makes the machine the hub of the new fleet when
+neither end is in one, and is refused (`denied`) when either end is in a
+fleet whose hub the machine isn't. Then `join::logs` plans both ends'
+membership logs over this host's `membership.json`, its key, and the
+machine's `membership.get`. Every check (names, roots, the registry and
+the inbound neighbors, both logs) comes before any write; then the
+machine's `member.set {name}` when it joins, its membership over the
+still-open probe (`membership.adopt` of the log made here, or of this
+host's on an extra link; `membership.sign` of this host when it joins
+the machine's fleet), this host's registry entry, this host's
+membership (`membership_api::adopt` of the same log, the machine's, or
+the machine's signed answer: it writes `hub` and the name the log knows
+this host by, then `Ctx::hub_changed`, which is
+`daemon::Shared::set_hub` as after a `membership.adopt` call), and the
+links reload. A write that fails after an earlier one says what was
+already written. Each end's name is pinned as it adopts, so a name that
+came from the hostname stays the one the fleet knows it by.
 The answer's `fleet` is the
 fleet both ends are in and who joined; the CLI prints it on a line after
 `added …` (`fleet_line`). `add --agent` saves the machine with `agent`

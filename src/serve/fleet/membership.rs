@@ -9,16 +9,12 @@
 //! for a key the authority hasn't added yet, checked against the log
 //! ([`check_introduction`]) and held until the log settles it.
 //!
-//! `membership.json`, next to `state.toml` ([`path`]), holds both
+//! `membership.json`, next to `member.toml` ([`path`]), holds both
 //! ([`Stored`]); written by the daemon only, through [`update`], and only
-//! state that verifies is loaded or saved.
-
-// No caller until `machine add` writes the log (10a.3) and links compare
-// heads (10a.4); the tests are here.
-#![cfg_attr(not(test), allow(dead_code))]
+//! state that verifies is loaded or saved. The `membership.*` calls over it
+//! are `super::membership_api`'s.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +160,7 @@ fn rotate_message(genesis: &[u8; 32], name: &str, new: &PublicKey) -> Vec<u8> {
 
 /// `old`'s countersignature of `name` moving to `new` in the fleet of
 /// genesis hash `genesis` ([`Membership::genesis`]): a `rotate`'s `by_old`.
+#[cfg_attr(not(test), allow(dead_code))] // `machine key rotate` (10a.6)
 pub fn countersign_rotate(genesis: &[u8; 32], name: &str, new: &PublicKey, old: &impl Signer) -> Signature {
     old.sign(ROTATE_DOMAIN, &rotate_message(genesis, name, new))
 }
@@ -278,6 +275,7 @@ impl Membership {
     }
 
     /// The hub's key; `None` while genesis's hub isn't added yet.
+    #[cfg_attr(not(test), allow(dead_code))] // the hub-only calls by key (10a.5)
     pub fn hub_key(&self) -> Option<PublicKey> {
         self.key_of(&self.hub)
     }
@@ -437,6 +435,7 @@ impl Log {
         Ok(Log { entries, membership })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // the link's head comparison (10a.4)
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -638,16 +637,29 @@ pub struct Stored {
     pub introductions: Vec<Introduction>,
 }
 
-/// The file's JSON.
-#[derive(Serialize, Deserialize)]
+/// [`Stored`] as JSON: the file's, and the `membership.*` calls' (unchecked
+/// until [`Stored::from_wire`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct File {
-    entries: Vec<Entry>,
+pub struct Wire {
+    pub entries: Vec<Entry>,
     #[serde(default)]
-    introductions: Vec<Introduction>,
+    pub introductions: Vec<Introduction>,
 }
 
 impl Stored {
+    /// `wire` verified: a log that doesn't [`apply`] or an introduction
+    /// that doesn't check refuses the whole of it.
+    pub fn from_wire(wire: Wire) -> Result<Stored> {
+        let stored = Stored { log: Log::new(wire.entries)?, introductions: wire.introductions };
+        stored.check()?;
+        Ok(stored)
+    }
+
+    pub fn to_wire(&self) -> Wire {
+        Wire { entries: self.log.entries.clone(), introductions: self.introductions.clone() }
+    }
+
     /// `i` held (once), if it checks against the log and no other held
     /// one names its name or key; refused, nothing changes.
     pub fn introduce(&mut self, i: Introduction) -> Result<()> {
@@ -688,30 +700,22 @@ impl Stored {
     }
 }
 
-/// [`path_from`] over the process env.
-pub fn path() -> Result<PathBuf> {
-    path_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+/// `membership.json` next to the `member.toml` at `member_toml` (both next
+/// to `state.toml`), as `member::key_path` is: a test daemon's member file
+/// carries its fleet identity with it.
+pub fn path(member_toml: &Path) -> PathBuf {
+    member_toml.with_file_name("membership.json")
 }
 
-/// `<data>/devsandbox/membership.json`.
-pub fn path_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
-    Ok(crate::daemon_config::data_dir_from(xdg_data_home, home)?.join("membership.json"))
-}
-
-/// `text` as [`Stored`], verified: a log that doesn't [`apply`] or an
-/// introduction that doesn't check refuses the whole file.
+/// `text` as [`Stored`], verified ([`Stored::from_wire`]).
 pub fn parse(text: &str) -> Result<Stored> {
-    let file: File = serde_json::from_str(text)?;
-    let stored = Stored { log: Log::new(file.entries)?, introductions: file.introductions };
-    stored.check()?;
-    Ok(stored)
+    Stored::from_wire(serde_json::from_str(text)?)
 }
 
 /// `stored` as the file's JSON; refused unless it verifies.
 pub fn serialize(stored: &Stored) -> Result<String> {
     stored.check()?;
-    let file = File { entries: stored.log.entries.clone(), introductions: stored.introductions.clone() };
-    Ok(serde_json::to_string_pretty(&file).context("cannot serialize membership.json")? + "\n")
+    Ok(serde_json::to_string_pretty(&stored.to_wire()).context("cannot serialize membership.json")? + "\n")
 }
 
 /// The file at `path`; missing is `None` (in no fleet's log). A file that
@@ -1169,8 +1173,7 @@ mod tests {
 
     #[test]
     fn the_file_round_trips_and_refuses_what_doesnt_verify() {
-        assert_eq!(path_from(Some("/xdg".into()), None).unwrap(), PathBuf::from("/xdg/devsandbox/membership.json"));
-        assert!(path().unwrap().ends_with("devsandbox/membership.json"));
+        assert_eq!(path(Path::new("/xdg/devsandbox/member.toml")), PathBuf::from("/xdg/devsandbox/membership.json"));
         let dir = scratch("store");
         let path = dir.join("membership.json");
         assert!(load(&path).unwrap().is_none(), "missing: in no fleet's log");

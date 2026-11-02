@@ -569,7 +569,9 @@ mod tests {
 
         // A registry entry can't take a live neighbor's name.
         let mut k = conn_at(&k_dir);
-        let e = k.call("machines.add", json!({"hub": false, "target": "me@l", "name": "L", "roots": ["/x"]})).unwrap().error.unwrap();
+        let key = crate::serve::fleet::identity::Signer::public_key(&crate::serve::fleet::identity::SigningKey::from_seed([9; 32]));
+        let add = json!({"hub": false, "target": "me@l", "name": "L", "roots": ["/x"], "key": key});
+        let e = k.call("machines.add", add).unwrap().error.unwrap();
         assert!(e.code == "denied" && e.message.contains("inbound neighbor"), "{e:?}");
 
         // L → K: an `API` stream, K's trust table for L (`worker`): its
@@ -659,12 +661,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// K's hub changes (`member.set {hub}` on K's daemon): K's end gets
+    /// K's hub changes (a membership log adopted on K's daemon): K's end gets
     /// `links.cycle` on its held announce and ends the link, saying why.
     #[test]
     fn a_hub_change_on_the_dialed_host_ends_the_link() {
+        use crate::serve::fleet::member::{self, Member};
+        use crate::serve::fleet::membership_api::test_support;
         let base = scratch("peer-cycle");
         let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
+        let k_member = k_opts.member.clone().unwrap();
+        member::write_for_test(&k_member, &Member { name: "k".into(), ..Default::default() });
+        let k_fleet = test_support::fleet("k", &test_support::key_of(&k_member), "k", &[]);
         let (l_dir, _, _, l_opts) = peer_daemon(&base, "l");
         let daemons = [spawn_daemon(&k_dir, k_opts), spawn_daemon(&l_dir, l_opts)];
         drop((conn_at(&k_dir), conn_at(&l_dir)));
@@ -672,7 +679,8 @@ mod tests {
         let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_dir.clone(), Arc::default());
         let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
         wait_for(|| inbound_row(&k_dir).is_some(), "L listed");
-        assert!(conn_at(&k_dir).call("member.set", json!({"hub": "self"})).unwrap().error.is_none());
+        let adopt = serde_json::to_value(k_fleet.to_wire()).unwrap();
+        assert!(conn_at(&k_dir).call("membership.adopt", adopt).unwrap().error.is_none());
         let err = k_end.join().unwrap().unwrap_err();
         assert_eq!(format!("{err:#}"), "this host's hub changed: the link ends so L redials it");
         // `fleet-link` exits there: its stdio closes.

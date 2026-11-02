@@ -8,7 +8,10 @@
 //! Written by the daemon only (decision 3 of the fleet plan), through
 //! `member.set` ([`call`]; `devsandbox machine trust` and `machine roots`
 //! are its clients), with [`update`]: under the sibling
-//! `member.lock`, a temp file and a rename (`serve::locked_file`).
+//! `member.lock`, a temp file and a rename (`serve::locked_file`). `hub`
+//! has no call: it's written from an accepted membership log
+//! (`membership.adopt`, `super::membership_api`) and cleared on leaving,
+//! both through [`set_fleet`].
 //! `[allow]`, `[caps]` and `dev-builds` have no call: they're edited by
 //! hand and re-read at each use (`worker_policy` reads `trust` and
 //! `[allow]` itself, on every platform).
@@ -264,9 +267,6 @@ pub struct SetParams {
     /// A machine name; `""` clears it (the hostname's first label).
     #[serde(default)]
     pub name: Option<String>,
-    /// `self` or the hub's member name; `""` clears it (in no fleet).
-    #[serde(default)]
-    pub hub: Option<String>,
     #[serde(default)]
     pub trust: Option<Trust>,
     /// Absolute paths added to `roots` (one already there is kept once).
@@ -284,10 +284,6 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
             check_member_name(name).map_err(|e| ApiError::invalid(format!("`name`: {e:#}")))?;
         }
         member.name = name.clone();
-    }
-    if let Some(hub) = &p.hub {
-        check_hub(hub).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
-        member.hub = hub.clone();
     }
     if let Some(trust) = p.trust {
         member.trust = trust;
@@ -328,9 +324,8 @@ pub fn get(path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
 }
 
 /// `member.set`: `p` merged into the file, checked, written. Nothing else
-/// follows it here: a peer link reads the name at its next dial
-/// (`fleet::dialer::member_name`), the rest is read at each use but `hub`,
-/// which the daemon keeps in memory and follows itself (`daemon::Shared::set_hub`).
+/// follows it: a peer link reads the name at its next dial
+/// (`fleet::dialer::member_name`), the rest is read at each use.
 pub fn set(path: &Path, hostname: &str, p: &SetParams) -> Result<MemberInfo, ApiError> {
     let after = update(path, |cur| -> Result<Member, ApiError> {
         *cur = merge(cur.clone(), p)?;
@@ -338,6 +333,23 @@ pub fn set(path: &Path, hostname: &str, p: &SetParams) -> Result<MemberInfo, Api
     })
     .map_err(ApiError::internal)??;
     info(&after, path, hostname)
+}
+
+/// `hub` written as `hub` (from an accepted membership log, or
+/// [`Hub::None`] on leaving), and with it `name` when given (the name the
+/// log knows this host by, pinned). Not an API call: the daemon follows a
+/// change itself (`daemon::Shared::set_hub`).
+pub fn set_fleet(path: &Path, name: Option<&str>, hub: &Hub) -> Result<Member> {
+    update(path, |cur| -> Result<Member> {
+        let mut next = cur.clone();
+        if let Some(name) = name {
+            next.name = name.to_string();
+        }
+        next.hub = hub.field().unwrap_or_default();
+        check(&next)?;
+        *cur = next;
+        Ok(cur.clone())
+    })?
 }
 
 /// Run `method` if it's a `member.*` one; `None` otherwise.
@@ -464,17 +476,13 @@ mod tests {
         let rm = merge(kept.clone(), &p(json!({"roots_rm": ["/a", "/gone"], "roots_add": ["/c"]}))).unwrap();
         assert_eq!(rm.roots, [PathBuf::from("/b"), PathBuf::from("/c")]);
         assert_eq!(merge(rm, &p(json!({"name": ""}))).unwrap().name, "", "cleared");
-        let hub = merge(named.clone(), &p(json!({"hub": "self"}))).unwrap();
-        assert_eq!((hub.hub(), hub.name.as_str()), (Hub::This, "lap"));
-        assert_eq!(merge(hub.clone(), &p(json!({"hub": "box"}))).unwrap().hub(), Hub::Other("box".into()));
-        assert_eq!(merge(hub, &p(json!({"hub": ""}))).unwrap().hub(), Hub::None, "cleared");
         let code = |v: Value| merge(named.clone(), &p(v)).unwrap_err().code;
         assert_eq!(code(json!({"name": "a/b"})), "invalid");
         assert_eq!(code(json!({"name": "self"})), "invalid");
         assert_eq!(code(json!({"roots_add": ["rel"]})), "invalid");
-        assert_eq!(code(json!({"hub": "a b"})), "invalid");
-        // Hand-edited parts aren't settable.
-        for bad in [json!({"trust": "most"}), json!({"dev_builds": true}), json!({"allow": {}}), json!({"caps": {}})] {
+        // Hand-edited parts aren't settable, nor `hub` (only an accepted
+        // membership log writes it).
+        for bad in [json!({"trust": "most"}), json!({"dev_builds": true}), json!({"allow": {}}), json!({"caps": {}}), json!({"hub": "self"})] {
             assert!(serde_json::from_value::<SetParams>(bad.clone()).is_err(), "{bad}");
         }
     }
@@ -524,9 +532,16 @@ mod tests {
 
         let set = call("member.set", json!({"name": "box"}));
         assert_eq!(set.unwrap().unwrap()["name"], "box");
-        let set = call("member.set", json!({"hub": "self"}));
-        assert_eq!(set.unwrap().unwrap()["hub"], "self");
-        assert_eq!(load(&path).unwrap().unwrap().hub(), Hub::This, "written");
+        assert_eq!(call("member.set", json!({"hub": "self"})).unwrap().unwrap_err().code, "invalid");
+        // The log's hub, written internally; the name pinned with it.
+        set_fleet(&path, Some("box2"), &Hub::This).unwrap();
+        let m = load(&path).unwrap().unwrap();
+        assert_eq!((m.hub(), m.name.as_str()), (Hub::This, "box2"), "written");
+        assert!(set_fleet(&path, Some("a/b"), &Hub::None).is_err());
+        set_fleet(&path, None, &Hub::Other("k".into())).unwrap();
+        assert_eq!(call("member.get", Value::Null).unwrap().unwrap()["hub"], "k");
+        set_fleet(&path, Some("box"), &Hub::None).unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().hub(), Hub::None, "cleared");
 
         // Hand edits survive a set; a refused set changes nothing.
         update(&path, |m| m.dev_builds = true).unwrap();

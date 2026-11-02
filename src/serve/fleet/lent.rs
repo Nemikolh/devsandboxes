@@ -30,8 +30,8 @@
 //!   verb's `env` replaced by the peer's when it has one.
 //!
 //! Under `trust = "full"` none of that: the peer has the API a local client
-//! has, except `member.*`, `link.*` and `links.*` (this member's own settings, and its
-//! links), refused under both; a verb's `env` is still the peer's when it
+//! has, except `member.*`, `membership.*`, `link.*` and `links.*` (this member's own
+//! settings and membership log, and its links), refused under both; a verb's `env` is still the peer's when it
 //! has one.
 //!
 //! `fleet.*` (a removal from the fleet, `machines::leave`; a member's run
@@ -410,7 +410,7 @@ pub fn admit_fleet(method: &str, from: Option<&str>, hub: &member::Hub, is_machi
 /// to run it with. `state` is this host's `state.toml`, read only when the
 /// request names an instance or a container under `worker`.
 pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
-    if method.starts_with("member.") || method.starts_with("link.") || method.starts_with("links.") {
+    if method.starts_with("member.") || method.starts_with("membership.") || method.starts_with("link.") || method.starts_with("links.") {
         return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
     }
     // [`admit_fleet`]'s, which knows this host's hub: never through here.
@@ -729,6 +729,7 @@ mod tests {
             ("machines.get", json!({"name": "m"}), Err("denied")),
             ("member.get", p.clone(), Err("denied")),
             ("member.set", json!({"trust": "full"}), Err("denied")),
+            ("membership.get", p.clone(), Err("denied")),
             ("shutdown", p.clone(), Err("denied")),
             ("helper.call", p.clone(), Err("denied")),
             ("forwards.add", p.clone(), Err("denied")),
@@ -997,7 +998,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `full`: nothing confined, but `member.*`, `link.*` and `links.*` stay local.
+    /// `full`: nothing confined, but `member.*`, `membership.*`, `link.*` and `links.*` stay local.
     #[test]
     fn full_skips_the_table_but_not_member_or_link() {
         let base = scratch("full");
@@ -1024,7 +1025,7 @@ mod tests {
         let e = admit("gc", gc, &s, &fleet(&root), &state).unwrap_err();
         assert_eq!(e.code, "denied");
         assert!(e.message.contains("host maintenance"), "{}", e.message);
-        for m in ["member.get", "member.set", "link.attach", "link.anything", "links.inbound", "fleet.leave", "fleet.rm"] {
+        for m in ["member.get", "member.set", "membership.get", "membership.adopt", "membership.sign", "link.attach", "link.anything", "links.inbound", "fleet.leave", "fleet.rm"] {
             for reach in [&r, &fleet(&root)] {
                 assert_eq!(admit(m, json!({}), &s, reach, &state).unwrap_err().code, "denied", "{m}");
             }

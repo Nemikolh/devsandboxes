@@ -18,7 +18,8 @@
 //!   signed statements and the rollback check.
 //! - `membership`: the membership log (`membership.json`), a hash chain
 //!   the authority signs, its heads compared, and the introductions held
-//!   beside it.
+//!   beside it; `membership_api`: the local-only `membership.get` /
+//!   `adopt` / `sign` over it, and the joins `machine add` checks with it.
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an
@@ -52,6 +53,7 @@ pub mod lent;
 pub mod link;
 pub mod member;
 pub mod membership;
+pub mod membership_api;
 pub mod place;
 pub mod placed;
 pub mod pty;
