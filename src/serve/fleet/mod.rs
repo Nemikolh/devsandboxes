@@ -20,6 +20,8 @@
 //!   the authority signs, its heads compared, and the introductions held
 //!   beside it; `membership_api`: the local-only `membership.get` /
 //!   `adopt` / `sign` over it, and the joins `machine add` checks with it.
+//! - `proof`: a peer link's proof of both members' keys after its
+//!   `Hello`s, with the membership heads compared and synced.
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an
@@ -56,6 +58,7 @@ pub mod membership;
 pub mod membership_api;
 pub mod place;
 pub mod placed;
+pub mod proof;
 pub mod pty;
 pub mod pty_client;
 pub mod transfer;
@@ -66,7 +69,8 @@ pub mod update;
 use crate::devsbd::proto::channel;
 
 /// The fleet link: the other end's daemon API, one flowing `API` stream per
-/// connection to this end's socket. Its sentinel is `devsandbox-fleet 1`.
+/// connection to this end's socket. Its sentinel is `devsandbox-fleet 2`
+/// (2: a peer link proves both keys after the `Hello`s, `proof`).
 /// An `API` stream carries no sentinel of its own: its first byte is the
 /// daemon's (decision 27 of the fleet plan). Both ends
 /// also serve `TRANSFER` streams ([`transfer`], `link::Serves::transfers`).
@@ -77,7 +81,7 @@ pub const LINK: link::Spec = link::Spec {
     name: "fleet link",
     serves: "API",
     sentinel: "devsandbox-fleet",
-    sentinel_version: 1,
+    sentinel_version: 2,
     channel: channel::API,
     hello: update::HELLO,
 };

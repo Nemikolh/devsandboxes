@@ -17,6 +17,15 @@
 //! for it; `AGENT` is answered with this host's agent while the entry has
 //! `agent` on (`daemon::agent_for`).
 //!
+//! Right after the `Hello`s both ends prove their member keys
+//! (`super::proof`): this host's identity (`proof::Identity`: its name,
+//! `member.key`, `membership.json`) is read at each dial, the machine must
+//! prove the key its entry's name has in the membership log (or a held
+//! introduction), and a log behind the machine's takes its newer entries
+//! through the daemon's `membership.adopt` path ([`Dialer::adopt`]), the
+//! link then redialed if they moved the hub (`proof::hub_moved`). No
+//! identity, no dial.
+//!
 //! This host's hello (`update::hello_of`: its role and its fleet's hub) is
 //! read at each dial, so a hub change counts from the next one
 //! (`service::Handle::cycle` ends every link then); a machine naming
@@ -47,6 +56,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::follow::{self, Incoming, PUSH_WAIT};
+use super::membership::Stored;
+use super::proof::{self, Identity};
 use super::lent::Channel;
 use super::transfer::Receivers;
 use super::transport::Transport;
@@ -102,9 +113,16 @@ pub struct Dialer {
     pub hello: Arc<dyn Fn() -> &'static str + Send + Sync>,
     /// How this host follows a hub machine's build.
     pub follow: Follow,
-    /// The sentinel's and the `Hello`s' wait (`service::Timing::handshake`).
+    /// The sentinel's, the `Hello`s' and the key proof's wait
+    /// (`service::Timing::handshake`).
     pub handshake: Duration,
     pub log: fn(&str),
+    /// This host's identity, read at each dial ([`Identity::load`]).
+    pub identity: Arc<dyn Fn() -> Result<Identity> + Send + Sync>,
+    /// Newer membership entries (and introductions) a machine carried,
+    /// stored as `membership.adopt` stores them (`hub` written from the
+    /// log, the daemon following it); `Err` says why not.
+    pub adopt: Arc<dyn Fn(&Stored) -> Result<(), String> + Send + Sync>,
 }
 
 impl Dialer {
@@ -119,6 +137,10 @@ impl Dialer {
             Ok(args) => args,
             Err(e) => return format!("cannot name this host for the link: {e:#}"),
         };
+        let identity = match (self.identity)() {
+            Ok(identity) => identity,
+            Err(e) => return format!("{e:#}"),
+        };
         let mut duplex = match self.transport.dial(target, entry.command(), &args) {
             Ok(duplex) => duplex,
             Err(e) => return format!("{e:#}"),
@@ -132,7 +154,7 @@ impl Dialer {
         }
         // Cleared once the `Hello`s are through: the mux reads unbounded.
         let _ = duplex.stream.set_read_timeout(Some(self.handshake));
-        let end = self.answer(entry, &duplex, reader, writer, killer, held);
+        let end = self.answer(entry, identity, &duplex, reader, writer, killer, held);
         let why = match end {
             Ended::Link(end) => end_why(end, &duplex),
             Ended::Follow(follow) => {
@@ -148,10 +170,12 @@ impl Dialer {
         why
     }
 
-    /// The answerer over `duplex` until the link ends.
+    /// The answerer over `duplex` until the link ends, proving `identity`.
+    #[allow(clippy::too_many_arguments)]
     fn answer(
         &self,
         entry: &Entry,
+        identity: Identity,
         duplex: &Duplex,
         reader: endpoint::Stream,
         writer: endpoint::Stream,
@@ -183,7 +207,8 @@ impl Dialer {
         let spec = link::Spec { hello: ours, ..LINK };
         let wanted: Mutex<Option<String>> = Mutex::new(None);
         let mut end_link = duplex.stream.try_clone().ok().map(follow::shutting);
-        let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: None };
+        let auth = proof::Auth { identity, expect: name.to_string(), log: self.log };
+        let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: None, auth: Some(auth) };
         let end = link::answerer_with(
             &spec,
             reader,
@@ -191,6 +216,13 @@ impl Dialer {
             endpoint,
             |peer| {
                 let _ = duplex.stream.set_read_timeout(None);
+                if let Some(newer) = peer.proven.as_ref().and_then(|p| p.newer.as_ref()) {
+                    (self.adopt)(newer).map_err(|e| format!("cannot take {name}'s newer membership entries: {e}"))?;
+                    (self.log)(&format!("machine {name}: took its newer membership log ({})", newer.log.head()));
+                    if let Some(why) = proof::hub_moved(ours, newer) {
+                        return Err(why);
+                    }
+                }
                 update::same_fleet(name, ours, &peer.hash)?;
                 let label = Build::parse(&peer.hash).label();
                 match fleet_link::follows(ours, &peer.hash, (self.follow.dev_builds)()) {
@@ -314,6 +346,7 @@ pub(crate) mod tests {
     use crate::commands::fleet_link::{PeerOptions, run_peer};
     use crate::serve::client::{self, Conn};
     use crate::serve::daemon::tests::{fake_join, opts, scratch, spawn_daemon};
+    use crate::serve::fleet::membership_api::test_support;
     use crate::serve::daemon::{Exit, Options};
     use crate::serve::machines::ssh;
     use crate::serve::proto::Version;
@@ -352,11 +385,12 @@ pub(crate) mod tests {
 
     /// A transport whose far end is `fleet-link --peer <member>` run
     /// in-process (`commands::fleet_link::run_peer`) against the daemon in
-    /// `k_dir`, a member taking no dev builds (`Fake` steps). Its error, as
+    /// `k_dir`, a member taking no dev builds (`Fake` steps), proving with
+    /// the identity next to `k_member` (its `member.toml`). Its error, as
     /// `main` would print it, goes to the stand-in ssh's stderr.
-    pub(crate) fn peer_transport(k_dir: &Path) -> (Transport, Arc<Dialed>) {
+    pub(crate) fn peer_transport(k_dir: &Path, k_member: &Path) -> (Transport, Arc<Dialed>) {
         let dialed = Arc::new(Dialed::default());
-        let (k_dir, seen) = (k_dir.to_path_buf(), Arc::clone(&dialed));
+        let (k_dir, seen, k_member) = (k_dir.to_path_buf(), Arc::clone(&dialed), k_member.to_path_buf());
         let transport = Transport::new(move |_, args| {
             let ["fleet-link", "--peer", peer] = args.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
                 anyhow::bail!("not a peer link: {args:?}");
@@ -377,6 +411,7 @@ pub(crate) mod tests {
                 follow: Follow { steps: Arc::new(update::tests::Fake::default()), dev_builds: Arc::new(|| false) },
                 reannounce: Duration::from_millis(20),
                 push_wait: Duration::from_secs(5),
+                member: k_member.clone(),
             };
             std::thread::spawn(move || {
                 if let Err(e) = run_peer(r, w, &peer, opts) {
@@ -404,7 +439,9 @@ pub(crate) mod tests {
     /// Two daemons: K (`base/k`, its own root `base/k-own` with one
     /// instance, its data in `base/k-data`) and L (`base/l`, member name
     /// `lap`, its data in `base/l-data`) whose registry has ssh machine
-    /// `box` (K, its root K's own), reached through [`peer_transport`].
+    /// `box` (K, its root K's own), reached through [`peer_transport`]. Both
+    /// in one membership log (`lap` its authority, `box` its hub), K named
+    /// `box` there.
     struct Pair {
         base: PathBuf,
         k_dir: PathBuf,
@@ -433,6 +470,20 @@ pub(crate) mod tests {
 
         /// [`Pair::new`], K's options set by `k` too.
         fn with(tag: &str, k_entries: Vec<Entry>, k: impl FnOnce(&mut Options), l: impl FnOnce(&mut Options)) -> Pair {
+            Pair::build(tag, k_entries, k, l, |k_member, l_member| {
+                test_support::fleet_of("box", &[("lap", l_member), ("box", k_member)]);
+            })
+        }
+
+        /// [`Pair::with`], the membership logs written by `fleet` (given K's
+        /// and L's `member.toml`) once both options are set.
+        fn build(
+            tag: &str,
+            k_entries: Vec<Entry>,
+            k: impl FnOnce(&mut Options),
+            l: impl FnOnce(&mut Options),
+            fleet: impl FnOnce(&Path, &Path),
+        ) -> Pair {
             let base = scratch(tag);
             let (k_dir, l_dir) = (base.join("k"), base.join("l"));
             let k_own = base.join("k-own");
@@ -456,9 +507,11 @@ pub(crate) mod tests {
             let l_registry = l_data.join("machines.toml");
             let entry = Entry { roots: vec![k_own.clone()], ..Entry::ssh("box", "me@box") };
             crate::serve::machines::update(&l_registry, |e| e.push(entry)).unwrap();
-            let (transport, dialed) = peer_transport(&k_dir);
+            let k_member = k_opts.member.clone().unwrap();
+            let (transport, dialed) = peer_transport(&k_dir, &k_member);
             l_opts.link_transport = Some(transport);
             l(&mut l_opts);
+            fleet(&k_member, l_opts.member.as_ref().unwrap());
             let k = spawn_daemon(&k_dir, k_opts);
             drop(connect(&k_dir));
             let l = spawn_daemon(&l_dir, l_opts);
@@ -938,6 +991,47 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&l_verbs);
     }
 
+    /// L's membership log is behind K's, whose last entry makes `lap` the
+    /// hub: the link's proof carries the entry to L, L's daemon adopts it
+    /// (its `member.toml` hub follows: this host), the link ends since L's
+    /// `Hello` said no hub, and the redial comes up.
+    #[test]
+    fn the_end_behind_takes_the_newer_entries_and_follows_their_hub() {
+        use crate::serve::fleet::member::Hub;
+        use crate::serve::fleet::membership::Op;
+        let newer = Arc::new(Mutex::new(None));
+        let kept = Arc::clone(&newer);
+        let pair = Pair::build("dial-behind", Vec::new(), |_| {}, |_| {}, move |k_member, l_member| {
+            let mut ahead = test_support::fleet_of("box", &[("lap", l_member), ("box", k_member)]);
+            ahead.log.append(Op::Hub { name: "lap".into() }, "lap", &test_support::key_of(l_member)).unwrap();
+            test_support::write(k_member, &ahead);
+            *kept.lock().unwrap() = Some(ahead);
+        });
+        let ahead = newer.lock().unwrap().take().unwrap();
+        pair.wait_box("box connected after a redial", |r| connected(r) && pair.dialed.count.load(Ordering::SeqCst) >= 2);
+        let l_member = pair.base.join("l-data/member.toml");
+        assert_eq!(test_support::read(&l_member).unwrap(), ahead, "L took K's entries");
+        assert_eq!(crate::serve::fleet::member::load(&l_member).unwrap().unwrap().hub(), Hub::This, "L's hub follows its log");
+        assert_eq!(connect(&pair.l_dir).call("member.get", json!({})).unwrap().result.unwrap()["hub"], "self");
+        pair.finish();
+    }
+
+    /// K has no membership log (a fleet made before keys): its `fleet-link`
+    /// refuses to link, saying how to make the fleet again; box's error
+    /// here.
+    #[test]
+    fn a_machine_with_no_membership_log_is_refused() {
+        let pair = Pair::build("dial-no-log", Vec::new(), |_| {}, |_| {}, |k_member, l_member| {
+            test_support::fleet_of("box", &[("lap", l_member), ("box", k_member)]);
+            std::fs::remove_file(crate::serve::fleet::membership::path(k_member)).unwrap();
+        });
+        let row = pair.wait_box("box refused", |r| r["error"].as_str().is_some_and(|e| e.contains("membership log")));
+        let e = row["error"].as_str().unwrap();
+        assert!(e.contains("in no fleet's membership log") && e.contains("machine add"), "{e}");
+        assert_ne!(row["state"], "connected");
+        pair.finish();
+    }
+
     /// K already has a machine named `lap` (the two hosts added each
     /// other): its refusal is box's error here.
     #[test]
@@ -958,14 +1052,18 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let registry = base.join("machines.toml");
         crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
-        std::fs::write(base.join("member.toml"), "name = \"lap\"\n").unwrap();
+        let box_member = base.join("box-data/member.toml");
+        std::fs::create_dir_all(box_member.parent().unwrap()).unwrap();
+        test_support::fleet_of("box", &[("lap", &base.join("member.toml")), ("box", &box_member)]);
         let hello: &'static str = Box::leak(format!("9.9.9 abc published {} hub", update::PLATFORM).into_boxed_str());
         let transport = Transport::new(move |_, _| {
             let (ours, theirs) = UnixStream::pair()?;
             let (r, w) = (theirs.try_clone()?, theirs);
+            let identity = Identity::load(&box_member, "box")?;
             std::thread::spawn(move || {
                 let spec = link::Spec { hello, ..LINK };
-                link::opener_with(&spec, r, w, link::Endpoint::default(), |_| Ok(()))
+                let auth = proof::Auth { identity, expect: "lap".into(), log: |_| {} };
+                link::opener_with(&spec, r, w, link::Endpoint { auth: Some(auth), ..link::Endpoint::default() }, |_| Ok(()))
             });
             Ok(Duplex::socket(ours))
         });

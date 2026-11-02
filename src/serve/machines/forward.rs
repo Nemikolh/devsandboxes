@@ -537,8 +537,13 @@ mod tests {
             local.machines = Some(registry);
             local.member = Some(base.join("local-data/member.toml"));
             std::fs::write(base.join("local-data/member.toml"), "name = \"lap\"\n").unwrap();
+            let remote_member = base.join("remote-data/member.toml");
+            crate::serve::fleet::membership_api::test_support::fleet_of(
+                "box",
+                &[("lap", &base.join("local-data/member.toml")), ("box", &remote_member)],
+            );
             // `box` is the remote daemon over a peer link; `down` has no route.
-            let (peer, _) = crate::serve::fleet::dialer::tests::peer_transport(&remote_dir);
+            let (peer, _) = crate::serve::fleet::dialer::tests::peer_transport(&remote_dir, &remote_member);
             local.link_transport = Some(crate::serve::fleet::transport::Transport::new(move |target, args| match target {
                 "me@box" => peer.dial(target, "devsandbox", args),
                 other => anyhow::bail!("ssh: Could not resolve hostname {}", other.trim_start_matches("me@")),

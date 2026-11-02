@@ -9,7 +9,13 @@
 //! handed to this host's daemon as a connection whose first line is
 //! `link.attach {peer: <dialer>, channel}` ([`attach_stream`]), so this
 //! host's trust table for the dialer applies to every one. `AGENT` isn't
-//! served: it only opens member → dialer. OUT: `fleet-<dialer>.sock` and
+//! served: it only opens member → dialer. Right after the `Hello`s both
+//! ends prove their member keys (`fleet::proof`; this host's identity read
+//! once, at the start: no key or log, no link): the dialer must prove the
+//! key `<dialer>` has in the membership log (or a held introduction), and
+//! when this host's log is behind, the dialer's newer entries are stored
+//! through this host's daemon (`membership.adopt`) before anything is
+//! announced, the link ending if they moved the hub. OUT: `fleet-<dialer>.sock` and
 //! its `.pty`, `.tunnel`, `.transfer` siblings, each accept a stream to the
 //! dialer; `agent-link-<dialer>.sock` (`endpoint::link_agent_socket`,
 //! `fleet::agent::serve`) while the dialer serves `AGENT`. Once the
@@ -103,6 +109,10 @@ pub struct PeerOptions {
     pub reannounce: Duration,
     /// How long a wait for the hub's binary waits ([`PUSH_WAIT`]).
     pub push_wait: Duration,
+    /// This host's `member.toml`: its name, and the `member.key` and
+    /// `membership.json` next to it the link proves with
+    /// (`fleet::proof::Identity`).
+    pub member: PathBuf,
 }
 
 /// The `--peer` CLI entry: the socket dir (created 0700 if missing), this
@@ -124,10 +134,14 @@ pub fn fleet_link_peer(peer: &str) -> Result<()> {
         daemon: Arc::new(move || client::connect(&daemon_dir, "fleet-link").context("cannot reach this host's devsandbox serve")),
         follow: Follow {
             steps: Arc::new(update::Release { socket_dir: dir }),
-            dev_builds: Arc::new(move || fleet::member::load(&member).ok().flatten().is_some_and(|m| m.takes_dev_builds())),
+            dev_builds: {
+                let member = member.clone();
+                Arc::new(move || fleet::member::load(&member).ok().flatten().is_some_and(|m| m.takes_dev_builds()))
+            },
         },
         reannounce: REANNOUNCE,
         push_wait: PUSH_WAIT,
+        member: member.clone(),
     };
     run_peer(io::stdin(), io::stdout(), peer, opts)
 }
@@ -152,6 +166,7 @@ pub fn follows(ours: &str, theirs: &str, dev_builds: bool) -> Decision {
 /// way the link has ended, so the dialer redials.
 pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, peer: &str, opts: PeerOptions) -> Result<()> {
     check_name(peer)?;
+    let identity = fleet::proof::Identity::load(&opts.member, &crate::serve::machines::link::hostname())?;
     let dir = opts.dir.clone();
     let socket = endpoint::fleet_socket(&dir, peer);
     // While the hub's binary is on its way nothing but it is served.
@@ -178,8 +193,16 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
     let mut wanted = None;
     let mut held = None;
     let mut agent_thread = None;
-    let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: Some(&outlet) };
+    let auth = fleet::proof::Auth { identity, expect: peer.to_string(), log: |m| eprintln!("fleet-link: {m}") };
+    let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: Some(&outlet), auth: Some(auth) };
     let end = link::opener_with(&spec, reader, writer, endpoint, |theirs| {
+        if let Some(newer) = theirs.proven.as_ref().and_then(|p| p.newer.as_ref()) {
+            adopt(&mut (opts.daemon)()?, newer).with_context(|| format!("cannot take {peer}'s newer membership entries"))?;
+            eprintln!("fleet-link: took {peer}'s newer membership log ({})", newer.log.head());
+            if let Some(why) = fleet::proof::hub_moved(spec.hello, newer) {
+                bail!("{why}");
+            }
+        }
         update::same_fleet(peer, spec.hello, &theirs.hash).map_err(|why| anyhow!("{why}"))?;
         let label = Build::parse(&theirs.hash).label();
         match follows(spec.hello, &theirs.hash, (opts.follow.dev_builds)()) {
@@ -259,6 +282,16 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         bail!("{why}");
     }
     end
+}
+
+/// `membership.adopt` of `newer` on `conn` (this host's daemon writes the
+/// log, and `hub` from it).
+fn adopt(conn: &mut Conn, newer: &fleet::membership::Stored) -> Result<()> {
+    let r = conn.call("membership.adopt", serde_json::to_value(newer.to_wire())?)?;
+    match r.error {
+        Some(e) => bail!("{}", e.message),
+        None => Ok(()),
+    }
 }
 
 /// The notification on the held `links.inbound` connection that ends the
@@ -423,6 +456,8 @@ mod tests {
     use super::*;
     use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
     use crate::serve::daemon::Exit;
+    use crate::serve::fleet::membership_api::test_support;
+    use crate::serve::fleet::proof::{Auth, Identity};
     use crate::serve::machines::{self, Entry, ssh};
     use crate::serve::proto::{HelloResult, Version};
 
@@ -493,30 +528,58 @@ mod tests {
         }
     }
 
+    /// K (`k_member`, its `member.toml`) and L (`l_member`) in one fleet,
+    /// K its authority and hub; the fleet's log and L's identity (the fake
+    /// dialer's).
+    fn fleet(k_member: &Path, l_member: &Path) -> (crate::serve::fleet::membership::Stored, Identity) {
+        for m in [k_member, l_member] {
+            std::fs::create_dir_all(m.parent().unwrap()).unwrap();
+        }
+        let stored = test_support::fleet_of("K", &[("K", k_member), ("L", l_member)]);
+        (stored, Identity::load(l_member, "L").unwrap())
+    }
+
+    /// [`fleet`] in `base/k-id` and `base/l-id`: K's `member.toml` and L's
+    /// identity.
+    fn ids(base: &Path) -> (PathBuf, Identity) {
+        let k = base.join("k-id/member.toml");
+        let (_, l) = fleet(&k, &base.join("l-id/member.toml"));
+        (k, l)
+    }
+
     /// The dialer's end, faked as 7d's daemon answers it: the answerer of a
-    /// peer link saying `hello`, each `API` stream K opens handed to the
-    /// daemon in `daemon` as peer `K`'s (`attach_stream`, the in-process
-    /// path's stand-in), `PTY` streams answered `dialer pty`; its outlet
-    /// `outlet`.
-    fn fake_dialer(io: UnixStream, hello: &'static str, daemon: PathBuf, outlet: Arc<link::Outlet>) -> std::thread::JoinHandle<link::End> {
+    /// peer link saying `hello`, proving `identity` (L's) and expecting `K`,
+    /// each `API` stream K opens handed to the daemon in `daemon` as peer
+    /// `K`'s (`attach_stream`, the in-process path's stand-in), `PTY`
+    /// streams answered `dialer pty`; its outlet `outlet`.
+    fn fake_dialer(io: UnixStream, hello: &'static str, identity: Identity, daemon: PathBuf, outlet: Arc<link::Outlet>) -> std::thread::JoinHandle<link::End> {
         let (r, w) = (io.try_clone().unwrap(), io);
         std::thread::spawn(move || {
             let serves = link::Serves::default()
                 .with(channel::API, move || attach_stream(&daemon, Channel::Api, "K"))
                 .with(channel::PTY, tagged(b"dialer pty"));
             let spec = link::Spec { hello, ..fleet::LINK };
-            link::answerer_with(&spec, r, w, link::Endpoint { serves, outlet: Some(&outlet), ..link::Endpoint::default() }, |_| Ok(()), || {})
+            let auth = Auth { identity, expect: "K".into(), log: |_| {} };
+            let endpoint = link::Endpoint { serves, outlet: Some(&outlet), auth: Some(auth), ..link::Endpoint::default() };
+            link::answerer_with(&spec, r, w, endpoint, |_| Ok(()), || {})
         })
     }
 
     /// K's `fleet-link --peer L` over `io`, its daemon and sockets in `dir`,
-    /// a member; following through `steps` (dev builds taken).
-    fn peer_link(io: UnixStream, dir: PathBuf, steps: Arc<dyn update::Steps>) -> std::thread::JoinHandle<Result<()>> {
-        peer_link_saying(io, dir, steps, update::hello_of(false, None))
+    /// its `member.toml` `member`, a member; following through `steps` (dev
+    /// builds taken).
+    fn peer_link(io: UnixStream, dir: PathBuf, member: PathBuf, steps: Arc<dyn update::Steps>) -> std::thread::JoinHandle<Result<()>> {
+        peer_link_saying(io, dir, member, steps, update::hello_of(false, None))
     }
 
     /// [`peer_link`], K saying `hello`.
-    fn peer_link_saying(io: UnixStream, dir: PathBuf, steps: Arc<dyn update::Steps>, hello: &'static str) -> std::thread::JoinHandle<Result<()>> {
+    fn peer_link_saying(
+        io: UnixStream,
+        dir: PathBuf,
+        member: PathBuf,
+        steps: Arc<dyn update::Steps>,
+        hello: &'static str,
+    ) -> std::thread::JoinHandle<Result<()>> {
         let (r, w) = (io.try_clone().unwrap(), io);
         let daemon_dir = dir.clone();
         let opts = PeerOptions {
@@ -526,6 +589,7 @@ mod tests {
             follow: Follow { steps, dev_builds: Arc::new(|| true) },
             reannounce: Duration::from_millis(20),
             push_wait: Duration::from_secs(5),
+            member,
         };
         std::thread::spawn(move || run_peer(r, w, "L", opts))
     }
@@ -549,13 +613,15 @@ mod tests {
         let base = scratch("peer-e2e");
         let (k_dir, k_data, k_own, k_opts) = peer_daemon(&base, "k");
         let (l_dir, l_data, l_own, l_opts) = peer_daemon(&base, "l");
+        let k_member = k_opts.member.clone().unwrap();
+        let (_, l_id) = fleet(&k_member, l_opts.member.as_ref().unwrap());
         let daemons = [spawn_daemon(&k_dir, k_opts), spawn_daemon(&l_dir, l_opts)];
         drop((conn_at(&k_dir), conn_at(&l_dir)));
 
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let outlet = Arc::new(link::Outlet::default());
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_dir.clone(), Arc::clone(&outlet));
-        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, l_dir.clone(), Arc::clone(&outlet));
+        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), k_member, Arc::new(update::tests::Fake::default()));
         let l_fleet = l_data.join("fleet/K");
         let want = json!([l_own, l_fleet]);
         // A machine on K: its held link's state and its daemon's semver.
@@ -616,11 +682,13 @@ mod tests {
         let base = scratch("peer-clash");
         let (k_dir, k_data, _, k_opts) = peer_daemon(&base, "k");
         machines::update(&k_data.join("machines.toml"), |e| e.push(Entry::ssh("L", "me@l"))).unwrap();
+        let k_member = k_opts.member.clone().unwrap();
+        let (_, l_id) = fleet(&k_member, &base.join("l-id/member.toml"));
         let daemon = spawn_daemon(&k_dir, k_opts);
         drop(conn_at(&k_dir));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), base.join("nowhere"), Arc::default());
-        let err = peer_link(k_io, k_dir.clone(), Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, base.join("nowhere"), Arc::default());
+        let err = peer_link(k_io, k_dir.clone(), k_member, Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("refused: `L` is already a machine here (me@l)"), "{err:#}");
         assert!(!endpoint::fleet_socket(&k_dir, "L").exists());
         assert!(matches!(dialer.join().unwrap(), link::End::Closed));
@@ -639,12 +707,14 @@ mod tests {
         let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
         let (l_dir, _, _, l_opts) = peer_daemon(&base, "l");
         let again = crate::serve::daemon::Options { machines: k_opts.machines.clone(), state: k_opts.state.clone(), member: k_opts.member.clone(), ..opts(2, 60_000) };
+        let k_member = k_opts.member.clone().unwrap();
+        let (_, l_id) = fleet(&k_member, l_opts.member.as_ref().unwrap());
         let first = spawn_daemon(&k_dir, k_opts);
         let l_daemon = spawn_daemon(&l_dir, l_opts);
         drop((conn_at(&k_dir), conn_at(&l_dir)));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_dir.clone(), Arc::default());
-        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, l_dir.clone(), Arc::default());
+        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), k_member, Arc::new(update::tests::Fake::default()));
         wait_for(|| inbound_row(&k_dir).is_some(), "L listed");
         assert!(conn_at(&k_dir).call("shutdown", json!({})).unwrap().error.is_none());
         assert_eq!(first.join().unwrap().unwrap(), Exit::Shutdown);
@@ -661,23 +731,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// K's hub changes (a membership log adopted on K's daemon): K's end gets
-    /// `links.cycle` on its held announce and ends the link, saying why.
+    /// K's hub changes (a newer membership log adopted on K's daemon): K's
+    /// end gets `links.cycle` on its held announce and ends the link,
+    /// saying why.
     #[test]
     fn a_hub_change_on_the_dialed_host_ends_the_link() {
-        use crate::serve::fleet::member::{self, Member};
-        use crate::serve::fleet::membership_api::test_support;
+        use crate::serve::fleet::membership::Op;
         let base = scratch("peer-cycle");
         let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
         let k_member = k_opts.member.clone().unwrap();
-        member::write_for_test(&k_member, &Member { name: "k".into(), ..Default::default() });
-        let k_fleet = test_support::fleet("k", &test_support::key_of(&k_member), "k", &[]);
         let (l_dir, _, _, l_opts) = peer_daemon(&base, "l");
+        let (mut k_fleet, l_id) = fleet(&k_member, l_opts.member.as_ref().unwrap());
+        k_fleet.log.append(Op::Hub { name: "L".into() }, "K", &test_support::key_of(&k_member)).unwrap();
         let daemons = [spawn_daemon(&k_dir, k_opts), spawn_daemon(&l_dir, l_opts)];
         drop((conn_at(&k_dir), conn_at(&l_dir)));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_dir.clone(), Arc::default());
-        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), Arc::new(update::tests::Fake::default()));
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, l_dir.clone(), Arc::default());
+        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), k_member, Arc::new(update::tests::Fake::default()));
         wait_for(|| inbound_row(&k_dir).is_some(), "L listed");
         let adopt = serde_json::to_value(k_fleet.to_wire()).unwrap();
         assert!(conn_at(&k_dir).call("membership.adopt", adopt).unwrap().error.is_none());
@@ -694,15 +764,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// K's membership log is behind the dialer's, whose newer entry makes
+    /// `L` the hub: K's end stores it through its daemon (`membership.adopt`:
+    /// K's `member.toml` hub follows) before announcing anything, then ends
+    /// the link so both ends redial saying the new hub.
+    #[test]
+    fn the_dialed_end_behind_takes_the_dialers_entries() {
+        use crate::serve::fleet::member::{self, Hub};
+        use crate::serve::fleet::membership::Op;
+        let base = scratch("peer-behind");
+        let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
+        let k_member = k_opts.member.clone().unwrap();
+        let (mut ahead, mut l_id) = fleet(&k_member, &base.join("l-id/member.toml"));
+        ahead.log.append(Op::Hub { name: "L".into() }, "K", &test_support::key_of(&k_member)).unwrap();
+        l_id.stored = ahead.clone();
+        let daemon = spawn_daemon(&k_dir, k_opts);
+        drop(conn_at(&k_dir));
+        let (dialer_io, k_io) = UnixStream::pair().unwrap();
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, base.join("nowhere"), Arc::default());
+        let err = peer_link(k_io, k_dir.clone(), k_member.clone(), Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("the fleet's hub is now `L`"), "{err:#}");
+        assert_eq!(test_support::read(&k_member).unwrap(), ahead, "K took L's entries");
+        assert_eq!(member::load(&k_member).unwrap().unwrap().hub(), Hub::Other("L".into()));
+        assert!(matches!(dialer.join().unwrap(), link::End::Closed));
+        assert!(inbound_row(&k_dir).is_none(), "nothing announced");
+        assert!(conn_at(&k_dir).call("shutdown", json!({})).unwrap().error.is_none());
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dialer whose key isn't the one K's log has for `L`: refused by the
+    /// proof, before anything is announced.
+    #[test]
+    fn a_dialer_proving_another_key_is_refused() {
+        let base = scratch("peer-wrong-key");
+        std::fs::create_dir_all(&base).unwrap();
+        let (k_member, mut l_id) = ids(&base);
+        l_id.key = crate::serve::fleet::identity::SigningKey::from_seed([7; 32]);
+        let (dialer_io, k_io) = UnixStream::pair().unwrap();
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, base.join("nowhere"), Arc::default());
+        let err = peer_link(k_io, base.clone(), k_member, Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("`L` proved key"), "{err:#}");
+        assert!(matches!(dialer.join().unwrap(), link::End::Refused(why) if why.contains("`K` refused the link")));
+        assert!(!endpoint::fleet_socket(&base, "L").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A dialer naming another hub than K's: refused before anything is
     /// announced, naming both.
     #[test]
     fn a_dialer_in_another_fleet_is_refused() {
         let base = scratch("peer-two-fleets");
         std::fs::create_dir_all(&base).unwrap();
+        let (k_member, l_id) = ids(&base);
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(true, Some("lap")), base.join("nowhere"), Arc::default());
-        let k_end = peer_link_saying(k_io.try_clone().unwrap(), base.clone(), Arc::new(update::tests::Fake::default()), update::hello_of(false, Some("box")));
+        let dialer = fake_dialer(dialer_io, update::hello_of(true, Some("lap")), l_id, base.join("nowhere"), Arc::default());
+        let k_end = peer_link_saying(k_io.try_clone().unwrap(), base.clone(), k_member, Arc::new(update::tests::Fake::default()), update::hello_of(false, Some("box")));
         let err = k_end.join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("`L` is in `lap`'s fleet, this host in `box`'s"), "{err:#}");
         k_io.shutdown(Shutdown::Both).unwrap();
@@ -737,9 +854,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let hub: &'static str = Box::leak(format!("9.9.9 abc published {} hub", update::PLATFORM).into_boxed_str());
-        let dialer = fake_dialer(dialer_io, hub, base.join("nowhere"), Arc::default());
+        let (k_member, l_id) = ids(&base);
+        let dialer = fake_dialer(dialer_io, hub, l_id, base.join("nowhere"), Arc::default());
         let fake = Arc::new(update::tests::Fake::reporting("9.9.9"));
-        let err = peer_link(k_io, base.clone(), fake.clone()).join().unwrap().unwrap_err();
+        let err = peer_link(k_io, base.clone(), k_member, fake.clone()).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").starts_with("updated to devsandbox 9.9.9, handing off"), "{err:#}");
         assert!(fake.calls().first().is_some_and(|c| c.starts_with("fetch https://") && c.contains("v9.9.9")), "{:?}", fake.calls());
         assert_eq!(fake.calls().last().map(String::as_str), Some("handoff "));
@@ -758,9 +876,10 @@ mod tests {
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let hub: &'static str = Box::leak(format!("{} zzz dev {} hub", env!("CARGO_PKG_VERSION"), update::PLATFORM).into_boxed_str());
         let outlet = Arc::new(link::Outlet::default());
-        let dialer = fake_dialer(dialer_io, hub, base.join("nowhere"), Arc::clone(&outlet));
+        let (k_member, l_id) = ids(&base);
+        let dialer = fake_dialer(dialer_io, hub, l_id, base.join("nowhere"), Arc::clone(&outlet));
         let fake = Arc::new(update::tests::Fake::building(hub.trim_end_matches(" hub")));
-        let k_end = peer_link(k_io.try_clone().unwrap(), base.clone(), fake.clone());
+        let k_end = peer_link(k_io.try_clone().unwrap(), base.clone(), k_member, fake.clone());
         wait_for(|| outlet.is_up(), "the link is up");
         // Waiting for the binary: nothing else is served.
         let api = outlet.open(channel::API).unwrap();

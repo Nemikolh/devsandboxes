@@ -524,6 +524,24 @@ fn machine_dialer(
     let data = member.as_ref().ok().and_then(|m| m.parent()).map(Path::to_path_buf);
     let follow = follow_hub(dir, opts, member.as_ref().cloned().unwrap_or_default());
     let hostname = link::hostname();
+    let member_toml = member.as_ref().ok().cloned();
+    let identity: Arc<dyn Fn() -> Result<fleet::proof::Identity> + Send + Sync> = {
+        let (member_toml, hostname) = (member_toml.clone(), hostname.clone());
+        Arc::new(move || fleet::proof::Identity::load(member_toml.as_deref().context("this daemon has no member.toml")?, &hostname))
+    };
+    // A machine's newer membership entries: what `membership.adopt` does,
+    // `hub` followed the same way.
+    let adopt: Arc<dyn Fn(&fleet::membership::Stored) -> Result<(), String> + Send + Sync> = {
+        let (hooked, hostname) = (Arc::clone(hooked), hostname.clone());
+        Arc::new(move |newer| {
+            let path = member_toml.as_deref().ok_or("this daemon has no member.toml")?;
+            let (_, hub) = fleet::membership_api::adopt(path, &hostname, newer).map_err(|e| e.message)?;
+            if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
+                s.set_hub(hub);
+            }
+            Ok(())
+        })
+    };
     let member_name: Arc<dyn Fn() -> Result<String> + Send + Sync> = Arc::new(move || match &member {
         Ok(path) => fleet::dialer::member_name(path, &hostname),
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
@@ -555,6 +573,8 @@ fn machine_dialer(
         follow,
         handshake: opts.machine_timing.handshake,
         log,
+        identity,
+        adopt,
     };
     Arc::new(move |entry, held| dialer.hold(entry, held))
 }

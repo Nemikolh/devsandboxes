@@ -279,7 +279,7 @@ mod tests {
                     Some(theirs.into())
                 };
                 let serves = Serves::default().with(channel::AGENT, open);
-                let endpoint = link::Endpoint { socket: Some(&api), serves, outlet: None };
+                let endpoint = link::Endpoint { socket: Some(&api), serves, outlet: None, auth: None };
                 link::opener_with(&LINK, hub_io.try_clone().unwrap(), hub_io, endpoint, |_| Ok(()))
             })
         };

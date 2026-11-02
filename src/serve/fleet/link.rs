@@ -30,6 +30,12 @@
 //! return fast: a local connect, or a socket pair whose other end a thread
 //! takes (`transfer::Receivers::accept`).
 //!
+//! An end whose [`Endpoint`] carries an `auth` proves its member key right
+//! after the `Hello`s, before the mux starts (`super::proof`); the peer
+//! must too, or the link is refused. `on_ready` gets the outcome
+//! ([`Ready::proven`]). The peer links (`fleet-link`, the dialer) always
+//! do; a bare link (tests) proves nothing.
+//!
 //! The fleet link is the one kind (`fleet::LINK`: `API` served by the
 //! answerer, `TRANSFER` by both ends, each end's `transfer::Receivers`
 //! through [`Serves::transfers`], `AGENT` by the opener, `fleet::agent`).
@@ -55,6 +61,8 @@ use anyhow::{bail, Context, Result};
 use crate::devsbd::mux::{self, Conn, Mux};
 use crate::devsbd::proto::{self, caps, channel};
 use crate::serve::machines::ssh::{self, SkipError};
+
+use super::proof::{self, Auth, Proven, Side};
 
 #[cfg(test)]
 use super::transfer::Receivers;
@@ -156,6 +164,30 @@ pub struct Endpoint<'a, 's> {
     /// OUT for this end's own code: set to the link from the `Hello`s until
     /// it ends.
     pub outlet: Option<&'a Outlet>,
+    /// This end's member identity and the peer it expects: the keys are
+    /// proven after the `Hello`s (`super::proof`); `None` proves nothing.
+    pub auth: Option<Auth>,
+}
+
+/// What `on_ready` gets: the peer's `Hello` (what it derefs to) and, when
+/// the endpoint had an `auth`, the peer's proven identity.
+pub struct Ready<'p> {
+    pub peer: &'p proto::Peer,
+    pub proven: Option<Proven>,
+}
+
+impl std::ops::Deref for Ready<'_> {
+    type Target = proto::Peer;
+
+    fn deref(&self) -> &proto::Peer {
+        self.peer
+    }
+}
+
+/// `auth`'s proof from `side`, if any, `ours` this end's `Hello` hash and
+/// caps.
+fn prove(side: Side, auth: Option<&Auth>, r: &mut impl Read, w: &mut impl Write, ours: (&str, u32), peer: &proto::Peer) -> Result<Option<Proven>> {
+    auth.map(|auth| proof::prove(side, r, w, auth, ours, (&peer.hash, peer.caps))).transpose()
 }
 
 /// How much [`answerer_with`] reads looking for the sentinel: the login shell's
@@ -335,18 +367,19 @@ pub fn opener(
     reader: impl Read + Send + 'static,
     writer: impl Write + Send + 'static,
     socket: &Path,
-    on_ready: impl FnOnce(&proto::Peer) -> Result<()>,
+    on_ready: impl FnOnce(&Ready) -> Result<()>,
 ) -> Result<()> {
     opener_with(spec, reader, writer, Endpoint { socket: Some(socket), ..Endpoint::default() }, on_ready)
 }
 
 /// The opener over `reader`/`writer`: bind `endpoint`'s socket, sentinel
 /// and `Hello`s advertising its `serves`' caps (the peer must advertise
-/// `spec.channel`'s), then the link's body until it ends ([`run`], see the
-/// module doc). `on_ready` runs once the `Hello`s are through, with the
-/// peer's (its `hash` is what the far end's spec says, e.g. its semver),
-/// before the first accept; its error ends the opener (the socket
-/// unlinked) with that error. `Ok` when the peer went away (the reader
+/// `spec.channel`'s), `endpoint.auth`'s proof, then the link's body until
+/// it ends ([`run`], see the module doc). `on_ready` runs once the `Hello`s
+/// (and the proof) are through, with the peer's (its `hash` is what the
+/// far end's spec says, e.g. its semver), before the first accept; its
+/// error, or a failed proof, ends the opener (the socket unlinked) with
+/// that error. `Ok` when the peer went away (the reader
 /// ended or the writer broke, whichever was seen first); an error when the
 /// keepalive heard nothing or a listener failed.
 pub fn opener_with(
@@ -354,7 +387,7 @@ pub fn opener_with(
     mut reader: impl Read + Send + 'static,
     writer: impl Write + Send + 'static,
     endpoint: Endpoint<'_, 'static>,
-    on_ready: impl FnOnce(&proto::Peer) -> Result<()>,
+    on_ready: impl FnOnce(&Ready) -> Result<()>,
 ) -> Result<()> {
     // Bound before the `Hello`s, so once this end has answered, the socket
     // is there.
@@ -367,7 +400,8 @@ pub fn opener_with(
     if !advertised(peer.caps, spec.channel) {
         bail!("the peer serves no {}", spec.serves);
     }
-    on_ready(&peer)?;
+    let proven = prove(Side::Opener, endpoint.auth.as_ref(), &mut reader, &mut writer, (spec.hello, endpoint.serves.caps()), &peer)?;
+    on_ready(&Ready { peer: &peer, proven })?;
     let mux = Mux::new(writer);
     let serves = Arc::new(endpoint.serves);
     mux.on_host_open(Arc::new(move |_, ch| serves.answer(ch)));
@@ -397,8 +431,8 @@ pub enum End {
     /// The link never came up: no sentinel, the socket not bound, or the
     /// `Hello`s failed.
     Handshake(String),
-    /// `answerer_with`'s `on_ready` turned the peer down, with why: nothing
-    /// was served.
+    /// The key proof failed, or `answerer_with`'s `on_ready` turned the
+    /// peer down, with why: nothing was served.
     Refused(String),
     /// No frame for `mux::KEEPALIVE_TIMEOUT`: `on_dead` ran.
     Dead,
@@ -433,7 +467,8 @@ pub fn answerer(
 
 /// The answerer over `reader`/`writer` until the link ends: skip to the
 /// sentinel, bind `endpoint`'s socket, exchange `Hello`s advertising its
-/// `serves`' caps, then the link's body ([`run`], see the module doc) on
+/// `serves`' caps, `endpoint.auth`'s proof (a failed one is
+/// [`End::Refused`]), then the link's body ([`run`], see the module doc) on
 /// this thread: each `Open { channel }` answered from `serves` (`None`, or
 /// a channel not there, refuses it with `Close`). `on_ready` gets the
 /// opener's `Hello` (its `hash` is the far end's `spec.hello`); an `Err`
@@ -448,7 +483,7 @@ pub fn answerer_with(
     mut reader: impl Read,
     writer: impl Write + Send + 'static,
     endpoint: Endpoint<'_, '_>,
-    on_ready: impl FnOnce(&proto::Peer) -> Result<(), String>,
+    on_ready: impl FnOnce(&Ready) -> Result<(), String>,
     on_dead: impl FnOnce() + Send + 'static,
 ) -> End {
     let mut noise = None;
@@ -475,7 +510,11 @@ pub fn answerer_with(
         Ok(peer) => peer,
         Err(e) => return End::Handshake(e.to_string()),
     };
-    if let Err(why) = on_ready(&peer) {
+    let proven = match prove(Side::Answerer, endpoint.auth.as_ref(), &mut reader, &mut writer, (spec.hello, endpoint.serves.caps()), &peer) {
+        Ok(proven) => proven,
+        Err(e) => return End::Refused(format!("{e:#}")),
+    };
+    if let Err(why) = on_ready(&Ready { peer: &peer, proven }) {
         return End::Refused(why);
     }
     let mux = Mux::new(writer);
@@ -847,7 +886,7 @@ mod tests {
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
         let path = socket.clone();
-        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(())));
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None, auth: None }, |_| Ok(())));
         let answering = Arc::clone(&outlet);
         std::thread::spawn(move || {
             answerer_with(&LINK, a_r, a_w, Endpoint { serves: theirs, outlet: Some(&answering), ..Endpoint::default() }, |_| Ok(()), || {})
@@ -952,7 +991,7 @@ mod tests {
         let outlet = Arc::new(Outlet::default());
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
-        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(())));
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None, auth: None }, |_| Ok(())));
         let answering = Arc::clone(&outlet);
         std::thread::spawn(move || {
             answerer_with(&LINK, a_r, a_w, Endpoint { serves: theirs, outlet: Some(&answering), ..Endpoint::default() }, |_| Ok(()), || {})
@@ -1008,7 +1047,7 @@ mod tests {
         let socket = dir.join("fleet-w.sock");
         let ours = Serves::default().with(channel::PTY, tagged(b"hub pty"));
         let path = socket.clone();
-        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(())));
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None, auth: None }, |_| Ok(())));
         let mut noise = None;
         ssh::skip_lines(&mut a_r, SENTINEL_LIMIT, &mut noise, |l: &[u8]| match_sentinel(&LINK, l)).unwrap();
         let peer = proto::handshake(&mut a_r, &mut a_w, "test", caps::API).unwrap();
@@ -1052,12 +1091,12 @@ mod tests {
         let (o_r, a_w) = std::io::pipe().unwrap();
         {
             let (api, opening) = (api.clone(), Arc::clone(&opening));
-            std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&api), serves: ours, outlet: Some(&opening) }, |_| Ok(())));
+            std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&api), serves: ours, outlet: Some(&opening), auth: None }, |_| Ok(())));
         }
         {
             let (path, answering) = (theirs_sock.clone(), Arc::clone(&answering));
             std::thread::spawn(move || {
-                let endpoint = Endpoint { socket: Some(&path), serves: theirs, outlet: Some(&answering) };
+                let endpoint = Endpoint { socket: Some(&path), serves: theirs, outlet: Some(&answering), auth: None };
                 answerer_with(&LINK, a_r, a_w, endpoint, |_| Ok(()), || {})
             });
         }
@@ -1119,11 +1158,12 @@ mod tests {
 
     #[test]
     fn the_sentinel_matcher_takes_only_its_line() {
-        assert_eq!(match_sentinel(&LINK, b"devsandbox-fleet 1"), Ok(Some(())));
-        assert_eq!(match_sentinel(&LINK, b"devsandbox-fleet 1\r"), Ok(Some(())));
-        assert_eq!(match_sentinel(&LINK, b"devsandbox-agent 1"), Ok(None));
-        let err = match_sentinel(&LINK, b"devsandbox-fleet 2").unwrap_err();
-        assert!(err.starts_with("the fleet link there speaks `devsandbox-fleet 2`"), "{err}");
+        assert_eq!(match_sentinel(&LINK, b"devsandbox-fleet 2"), Ok(Some(())));
+        assert_eq!(match_sentinel(&LINK, b"devsandbox-fleet 2\r"), Ok(Some(())));
+        assert_eq!(match_sentinel(&LINK, b"devsandbox-agent 2"), Ok(None));
+        let err = match_sentinel(&LINK, b"devsandbox-fleet 1").unwrap_err();
+        assert!(err.starts_with("the fleet link there speaks `devsandbox-fleet 1`"), "{err}");
+        assert!(err.ends_with("update devsandbox on the older side"), "{err}");
     }
 
     #[test]

@@ -313,6 +313,26 @@ pub mod test_support {
         membership::update(&membership::path(member_toml), |s| *s = stored.clone()).unwrap();
     }
 
+    /// A fleet of `members` (each a name and its `member.toml`, the first
+    /// the authority), hub `hub`, written as every member's
+    /// `membership.json`: each `member.toml` gets its name (its other
+    /// fields kept), each member its `member.key`, as a fleet-creating
+    /// `machine add` leaves them. The log, for a test to extend.
+    pub fn fleet_of(hub: &str, members: &[(&str, &Path)]) -> Stored {
+        for (name, toml) in members {
+            let mut m = member::load(toml).unwrap().unwrap_or_default();
+            m.name = name.to_string();
+            member::write_for_test(toml, &m);
+        }
+        let (authority, first) = members[0];
+        let added: Vec<(&str, PublicKey)> = members[1..].iter().map(|(n, t)| (*n, key_of(t).public_key())).collect();
+        let stored = fleet(authority, &key_of(first), hub, &added);
+        for (_, toml) in members {
+            write(toml, &stored);
+        }
+        stored
+    }
+
     /// The `membership.json` of `member_toml`'s member.
     pub fn read(member_toml: &Path) -> Option<Stored> {
         membership::load(&membership::path(member_toml)).unwrap()

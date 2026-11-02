@@ -279,9 +279,12 @@ stream. The roles differ in the handshake, the stream id space
 - **The opener** (`link::opener_with`, the end ssh runs: a
   [peer link](#peer-links)'s dialed end) binds its socket, writes the
   sentinel, exchanges `Hello`s and requires the peer to advertise the
-  spec's channel. Its `on_ready` callback runs next, with the peer's
-  `Hello` (its `hash` is the far end's spec `hello`); an error there ends
-  the opener with it. It opens ids below 2^31 (`Mux::attach`: a socket's
+  spec's channel. With an `Endpoint::auth` it then runs the
+  [key proof](#key-proof) (`proof::prove`); a failed one ends the opener
+  with why. Its `on_ready` callback runs next, with a `link::Ready`: the
+  peer's `Hello` (what it derefs to; its `hash` is the far end's spec
+  `hello`) and the peer's proven identity (`Ready::proven`); an error
+  there ends the opener with it. It opens ids below 2^31 (`Mux::attach`: a socket's
   connection attached as it is, flow-controlled on a flowing channel,
   `channel::flows`, legacy otherwise; an outlet's a socket pair). The
   peer's `Open`s carry high-bit ids, admitted through `Mux::on_host_open`
@@ -293,14 +296,17 @@ stream. The roles differ in the handshake, the stream id space
   shell printed up to the sentinel (`ssh::skip_lines`, at most
   `SENTINEL_LIMIT` bytes; another sentinel version is a handshake failure
   saying which side to update), binds its socket, exchanges `Hello`s,
+  runs the [key proof](#key-proof) when its `Endpoint` has an `auth`,
   and answers each low-bit `Open` from its table. Its `on_ready` gets the
-  opener's `Hello`; its `Err` ends the link before anything is served. It
+  opener's `Hello` and proven identity (`link::Ready`); a failed proof or
+  its `Err` ends the link before anything is served. It
   opens high-bit ids (`Mux::open_host`: flowing channels only, which every
   link channel is; a socket's connection spliced to the stream,
   `link::splice`). Its reader runs on the caller's thread until the
   stream ends; a failed listener ends only the accepts. It returns an
   `End`: the handshake failed (with the first line of noise, or a socket
-  not bound), `on_ready` refused (`Refused`, with why), the keepalive ran
+  not bound), the key proof failed or `on_ready` refused (`Refused`,
+  with why), the keepalive ran
   `on_dead` (which must end the reader, e.g. kill the ssh), or the stream
   closed.
 
@@ -308,7 +314,7 @@ One spec exists:
 
 | spec | sentinel | channel | cap | opener / answerer |
 |---|---|---|---|---|
-| `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run_peer` (a [peer link](#peer-links)'s dialed end) / `fleet::dialer::Dialer::hold` (the dialer); each end's `hello` `update::hello_of` |
+| `fleet::LINK` | `devsandbox-fleet 2` | `API` (flowing) | `caps::API` | `commands::fleet_link::run_peer` (a [peer link](#peer-links)'s dialed end) / `fleet::dialer::Dialer::hold` (the dialer); each end's `hello` `update::hello_of` |
 
 Each end binds one socket, `fleet-<peer>.sock` (`endpoint::fleet_socket`):
 a connection's first byte names its channel (`link::connect` writes it;
@@ -379,8 +385,9 @@ dial is a process of its own).
   `agent::serve` binds `agent-link-L.sock` (`endpoint::link_agent_socket`,
   through K's outlet): an `agent-*.sock`, so K's bridges pick it as a
   relayed agent (`endpoint::agent_sockets`).
-- **The inbound neighbor.** Once the `Hello`s are through (and this end
-  follows nobody), K's end announces L on a connection of its own
+- **The inbound neighbor.** Once the `Hello`s and the
+  [key proof](#key-proof) are through (and this end follows nobody), K's
+  end announces L on a connection of its own
   (`links.inbound {peer, version, hub}`, the version L's `Hello` hash, the
   hub flag `update::is_hub` of it) and holds that connection for the
   link's life (`Announce`): K's daemon keeps L in its inbound neighbors
@@ -415,8 +422,69 @@ redialed after the backoff (`service::backoff`: 1 s doubling to 30 s)
 whenever it ends, the far end's refusal (ssh's stderr tail) its error.
 It is the answerer of `fleet::LINK` (it reads the sentinel), saying
 `update::hello_for` L's hub as the daemon keeps it (`Dialer::hello`,
-read at each dial), with the sentinel and the `Hello`s within
-`machines::service::Timing::handshake`.
+read at each dial), with the sentinel, the `Hello`s and the
+[key proof](#key-proof) within `machines::service::Timing::handshake`.
+
+### Key proof
+
+Both ends of a peer link prove their member keys right after the
+`Hello`s, on the raw pipe before the mux (`src/serve/fleet/proof.rs`,
+`proof::prove`; decisions 44-46, 50-52): ssh vouches only for the end of
+one hop, the key for the member. Each end's identity
+(`proof::Identity::load`: its member name, `member.key`, its
+`membership.json`, which must list it under that name and key) is read at
+the link's start: by the dialer at each dial (`Dialer::identity`), by
+`fleet-link` once (each dial is a process of its own,
+`PeerOptions::member`). A host with no key or no membership log links
+with no one: the error says to make the fleet again with `machine add`
+(decision 52); there is no unproven fallback. Each end expects one
+name: the dialer its entry's, `fleet-link` its `--peer`.
+
+Each message is a u32 big-endian length, a tag byte (a message, or a
+refusal whose body says why) and the body, bounded per round (4 KiB; the
+sync 8 MiB); the opener writes each round first, the answerer reads
+first, so the two never block writing at once. An end that refuses
+writes its refusal in place of its next message, and the peer reports
+it as `` `<name>` refused the link: … ``.
+
+1. **hello**: the member name, 32 random bytes (a nonce, `getrandom`)
+   and the membership log's `Head`. A name other than the expected one is
+   refused. The heads are compared (`membership::compare`): another
+   fleet's log (another genesis) or a fork (one authority signed two
+   histories) refuses the link, logged (the daemon's log, `fleet-link`'s
+   stderr).
+2. **sync**: what the peer lacks, as `membership::Wire` JSON: the
+   entries past its head when ours is ahead (`Log::entries_after`), and
+   every introduction held. This replaces a separate fetch: the entries
+   are self-verifying (authority-signed, chained to the receiver's
+   head), so any member carries them. The end behind extends a copy of
+   its log (`Log::extend`; entries that don't continue it, or don't reach
+   the head the peer said, refuse the link), holds the introductions that
+   check (one that doesn't is logged and dropped), then resolves the
+   peer's name to a key: its key in the log, else a held introduction's
+   (the peer is capped: `Proven::introduced_by`). A name in neither is
+   refused.
+3. **proof**: the end's public key and its signature in `proof::DOMAIN`
+   (`devsandbox/link/v1`) over the transcript (`proof::transcript`: the
+   opener's then the answerer's name, nonce, `Hello` digest (its hash
+   string and caps) and head, length-prefixed) followed by its own role
+   (`opener` / `answerer`), so a signature is good for one link and one
+   side only. The key must be the one the name resolved to (a revoked key
+   is refused as revoked, another as not its key) and the signature must
+   verify.
+4. **confirm**: the opener's verdict on the answerer's proof, so both
+   ends agree the link is proven before either serves anything.
+
+The outcome is `proof::Proven {name, key, introduced_by, newer}`, handed
+to `on_ready` (`link::Ready::proven`). `newer` is this end's stored log
+and introductions with what the peer carried, when that changed them;
+the end stores it before anything else: the dialer through the daemon's
+own `membership.adopt` path in-process (`Dialer::adopt`:
+`membership_api::adopt`, then `Shared::set_hub`), `fleet-link` with a
+`membership.adopt` call to its daemon before `links.inbound`. Either
+way `member.toml`'s `hub` follows the log; when the log's hub isn't the
+one this end's `Hello` said (`proof::hub_moved`), the link ends so both
+ends redial saying it.
 
 - **OUT.** L binds `fleet-K.sock` in its socket dir (newest binder wins:
   a successor daemon's link takes it over, the old daemon's ssh dying
@@ -1177,6 +1245,10 @@ signatures, signed statements and the rollback rule.
   `Statement::verify_payload` also that a payload is the one hashed. On
   the wire (serde) the hash is 64 lowercase hex digits, the key and
   signature their text forms.
+- **On a link**: each peer link's ends prove their keys after the
+  `Hello`s, signing a per-link transcript in `proof::DOMAIN`
+  ([key proof](#key-proof)); a name resolves to its key in the
+  [membership log](#membership-log) or a held introduction.
 - **The rollback rule** (`Seen::accept`, pure): per signer key (not
   name) and `kind`, the highest version accepted and its payload hash. A
   statement that doesn't verify is refused; a higher version is recorded

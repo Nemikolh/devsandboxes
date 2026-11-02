@@ -7,10 +7,11 @@
 //! `member.key` next to `member.toml` (`member::key_path`), mode 0600,
 //! created once under its own lock. `member.get` answers its public half;
 //! `membership.*` signs the membership log's entries and introductions with
-//! it (`super::membership_api`); the link's proof of keys will build on
-//! [`Signer`], [`PublicKey::verify`] and [`Statement`] too.
+//! it (`super::membership_api`); a peer link proves it with [`Signer`] and
+//! [`PublicKey::verify`] (`super::proof`).
 
-// `Seen` has no caller until the link's proof (10a.4); its tests are here.
+// `Seen` has no caller yet (a link's proof is per-link nonces, not
+// versions); its tests are here.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;

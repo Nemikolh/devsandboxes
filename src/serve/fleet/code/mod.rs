@@ -697,7 +697,7 @@ mod tests {
         let (o_r, a_w) = std::io::pipe().unwrap();
         let path = socket.clone();
         std::thread::spawn(move || {
-            opener_with(&super::super::LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(()))
+            opener_with(&super::super::LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None, auth: None }, |_| Ok(()))
         });
         std::thread::spawn(move || {
             answerer_with(&super::super::LINK, a_r, a_w, Endpoint { serves: theirs, ..Endpoint::default() }, |_| Ok(()), || {})
