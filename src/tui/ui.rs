@@ -770,14 +770,18 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
     };
     Row::new([
         Cell::from(Span::styled(m.name.clone(), Style::default().fg(ACCENT))),
-        // An inbound machine has no ssh target: its kind instead.
-        match &m.target {
-            Some(target) => Cell::from(target.clone()),
-            None => Cell::from(Span::styled("inbound", Style::default().add_modifier(Modifier::DIM))),
+        // An inbound machine has no ssh target: its kind instead; one seen
+        // through the hub, the hub.
+        match (&m.via, &m.target) {
+            (Some(hub), _) => Cell::from(Span::styled(format!("via {hub}"), Style::default().add_modifier(Modifier::DIM))),
+            (None, Some(target)) => Cell::from(target.clone()),
+            (None, None) => Cell::from(Span::styled("inbound", Style::default().add_modifier(Modifier::DIM))),
         },
         Cell::from(Span::styled(state, style)),
-        // This host's agent never reaches an inbound machine: nothing to toggle.
+        // This host's agent never reaches an inbound machine, nor one seen
+        // through the hub: nothing to toggle.
         Cell::from(match (m.kind, m.agent) {
+            _ if m.via.is_some() => "-",
             (MachineKind::Inbound, _) => "-",
             (_, true) => "on",
             (_, false) => "off",

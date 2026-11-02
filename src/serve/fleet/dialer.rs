@@ -889,4 +889,147 @@ pub(crate) mod tests {
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// The next `instances.snapshot` on `conn` that `pick` takes, within
+    /// 10 s.
+    fn snapshot_where(conn: &mut Conn, what: &str, pick: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let n = conn.next_notification(left).unwrap().unwrap_or_else(|| panic!("no snapshot: {what}"));
+            if n.method == "instances.snapshot" && pick(&n.params) {
+                return n.params;
+            }
+        }
+    }
+
+    fn tagged(params: &Value, machine: &str) -> Vec<String> {
+        let rows = params["instances"].as_array().cloned().unwrap_or_default();
+        rows.iter().filter(|r| r["machine"] == machine).map(|r| r["name"].as_str().unwrap_or_default().to_string()).collect()
+    }
+
+    /// A fleet: K (member `box`) is the hub, with a third machine `x` it
+    /// knows rows of (restored from its `remotes.json`; x itself is never
+    /// reached); L (`lap`) is a member whose hub is `box`. L's federated
+    /// snapshot shows K's rows and, through K, x's (`via: box`), never its
+    /// own as K sees them; acting on x from L is refused naming K. K
+    /// serves a federated watch only as the hub.
+    #[test]
+    fn a_member_sees_the_fleet_through_its_hub() {
+        let base_remotes = scratch("dial-via-files");
+        std::fs::create_dir_all(&base_remotes).unwrap();
+        let (k_remotes, l_remotes) = (base_remotes.join("k-remotes.json"), base_remotes.join("l-remotes.json"));
+        let x_root = PathBuf::from("/x/root");
+        let x_rows = json!({"dir": x_root, "instances": [{"name": "x-1", "root": x_root}], "sandboxes": [], "services": []});
+        let x = crate::serve::snapshots::Machine {
+            name: "x".into(),
+            rows: [(x_root.clone(), Arc::new(x_rows))].into(),
+            seen: Some(1_761_566_400),
+            ..Default::default()
+        };
+        crate::serve::machines::saved::save(&k_remotes, &crate::serve::machines::saved::of(&[x], 0)).unwrap();
+        let pair = Pair::with(
+            "dial-via",
+            vec![Entry { roots: vec![x_root.clone()], ..Entry::ssh("x", "me@x") }],
+            |k| {
+                let hub = crate::serve::fleet::member::Member { name: "box".into(), hub: "self".into(), ..Default::default() };
+                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);
+                k.remotes = Some(k_remotes.clone());
+            },
+            |l| {
+                let member = crate::serve::fleet::member::Member { name: "lap".into(), hub: "box".into(), ..Default::default() };
+                crate::serve::fleet::member::write_for_test(l.member.as_ref().unwrap(), &member);
+                l.remotes = Some(l_remotes.clone());
+                // L's join: one instance in the watched root, which K sees.
+                l.join = Some(Arc::new(|dir, view| {
+                    let mut list = fake_join()(dir, view);
+                    let mut row = crate::serve::snapshots::tests::row("lap-1", true, None);
+                    row.root = Some(dir.display().to_string());
+                    list.snapshot.instances.push(row);
+                    list
+                }));
+            },
+        );
+        pair.wait_box("box connected", connected);
+
+        // L's dashboard: K's rows, x's through K, nothing of lap's own as K has them.
+        let l_root = pair.base.join("l-root");
+        std::fs::create_dir_all(&l_root).unwrap();
+        let mut l = connect(&pair.l_dir);
+        l.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        l.call("instances.watch", json!({"dir": l_root, "machines": true})).unwrap();
+        let seen = snapshot_where(&mut l, "x's rows through box", |p| !tagged(p, "x").is_empty() && !tagged(p, "box").is_empty());
+        assert_eq!(tagged(&seen, "x"), ["x-1"]);
+        assert_eq!(tagged(&seen, "box"), ["web-1"]);
+        let x = named(&seen["machines"], "x").unwrap();
+        assert_eq!((&x["via"], &x["target"], &x["state"]), (&json!("box"), &Value::Null, &json!("unreachable")));
+        assert_eq!(named(&seen["machines"], "box").unwrap()["via"], Value::Null);
+        crate::serve::dts::assert_matches("SnapshotMachine", &x);
+
+        // K has lap's rows by now (its own federated watch shows them),
+        // yet L's next pushes still carry none of them.
+        let mut k = connect(&pair.k_dir);
+        k.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        k.call("instances.watch", json!({"dir": pair.k_own, "machines": true})).unwrap();
+        snapshot_where(&mut k, "lap's rows on K", |p| !tagged(p, "lap").is_empty());
+        // A re-watch pushes the merge as it is now.
+        l.call("instances.watch", json!({"dir": l_root, "machines": true})).unwrap();
+        let until = Instant::now() + Duration::from_millis(1500);
+        let mut pushes = 0;
+        while Instant::now() < until {
+            let Some(n) = l.next_notification(Duration::from_millis(200)).unwrap() else { continue };
+            if n.method == "instances.snapshot" {
+                pushes += 1;
+                assert!(tagged(&n.params, "lap").is_empty(), "lap's own rows came back: {}", n.params);
+                assert!(named(&n.params["machines"], "lap").is_none(), "{}", n.params);
+                assert_eq!(tagged(&n.params, "x"), ["x-1"]);
+            }
+        }
+        assert!(pushes > 0, "no push after the re-watch");
+        // K itself leaves lap out (not only L's guard): a federated watch
+        // on lap's own API stream to K.
+        let api_to = |socket: &Path, name: &str| {
+            let stream = link::connect(socket, channel::API).unwrap();
+            let duplex = crate::serve::machines::ssh::Duplex::socket(stream);
+            crate::serve::machines::link::handshake(name, duplex, Duration::from_secs(10), crate::serve::machines::link::Over::Link).unwrap()
+        };
+        let mut lap_on_k = api_to(&endpoint::fleet_socket(&pair.l_dir, "box"), "box");
+        let rows = lap_on_k.conn.call("roots.list", json!({})).unwrap().result.unwrap();
+        let k_fleet = rows.as_array().unwrap().iter().find(|r| r["fleet"] == true).unwrap()["root"].clone();
+        lap_on_k.conn.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        let r = lap_on_k.conn.call("instances.watch", json!({"dir": k_fleet, "machines": true})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let pushed = snapshot_where(&mut lap_on_k.conn, "K's push to lap", |_| true);
+        assert_eq!(tagged(&pushed, "x"), ["x-1"], "{pushed}");
+        assert!(tagged(&pushed, "lap").is_empty() && named(&pushed["machines"], "lap").is_none(), "{pushed}");
+
+        // View-only: anything acting on x is refused naming the hub.
+        let refused = crate::serve::snapshots::seen_via("x", "box");
+        let calls = [
+            ("instances.list", json!({"dir": x_root, "machine": "x"})),
+            ("machines.get", json!({"name": "x"})),
+            ("machines.set", json!({"name": "x", "agent": true})),
+            ("forwards.add", json!({"root": x_root, "instance": "x-1", "port": 3000, "machine": "x"})),
+        ];
+        for (method, params) in calls {
+            let e = connect(&pair.l_dir).call(method, params).unwrap().error.unwrap();
+            assert_eq!((e.code.as_str(), e.message.as_str()), ("denied", refused.as_str()), "{method}");
+        }
+        let (r, ..) = verb(&mut connect(&pair.l_dir), "stop", json!({"root": x_root, "env": {}, "instance": "x-1", "machine": "x"}));
+        let e = r.error.unwrap();
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("denied", refused.as_str()));
+        // A name nobody sees is still unknown.
+        assert_eq!(connect(&pair.l_dir).call("machines.get", json!({"name": "nope"})).unwrap().error.unwrap().code, "not-found");
+
+        // Only the hub federates for a peer: L refuses K's federated watch.
+        let fleet_root = std::fs::canonicalize(pair.base.join("l-data/fleet/box")).unwrap();
+        let mut k_on_l = api_to(&endpoint::fleet_socket(&pair.k_dir, "lap"), "lap");
+        k_on_l.conn.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        let e = k_on_l.conn.call("instances.watch", json!({"dir": fleet_root, "machines": true})).unwrap().error.unwrap();
+        assert_eq!(e.code, "denied", "{e:?}");
+        assert!(!l_remotes.exists(), "a member saves no remotes");
+        drop((l, k, k_on_l, lap_on_k));
+        pair.finish();
+        let _ = std::fs::remove_dir_all(&base_remotes);
+    }
 }

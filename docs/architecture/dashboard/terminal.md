@@ -68,7 +68,9 @@ arrives on reader threads and only shows on the next draw.
   (`remote::service_instance`: an isolated service's `used_by` entry at
   the container's index, a global one's first user; a global service no
   instance uses gets no tab); the machine derives the container itself.
-  It isn't a session: no `Redial`, it just ends.
+  It isn't a session: no `Redial`, it just ends. A machine seen only
+  through the fleet's hub (its `via`) has no link here: `on_machine`
+  refuses its tabs naming the hub (`snapshots::seen_via`).
 
 ## Remote tabs reconnect
 

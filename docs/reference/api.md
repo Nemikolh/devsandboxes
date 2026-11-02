@@ -130,7 +130,7 @@ default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
 `roots.list` and the verbs but `gc` (`all` only while every instance here
-is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true`; every `root` / `dir`
+is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true` but an `instances.watch`'s (a member watching its hub, which only the hub serves); every `root` / `dir`
 must be under this member's fleet root for the caller (a hub's, a fleet member's) or exactly one of its
 own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
 instance or container one of theirs; `config.migrate` / `config.ack`
@@ -379,6 +379,10 @@ With `"machines": true` every push for `dir` is federated: merged with
 every machine's rows (registered or inbound), plus a top-level `machines`, and the
 machine links stay up while such a watch lasts (*Machines*, *Federated
 snapshots*). Re-watching with another `machines` switches the variant.
+From a remote caller (a link peer) it is served only by the fleet's hub
+(else `denied`), and the push never has that peer's own rows nor its
+`machines` entry; other machines' rows stay, whatever the trust (this
+host's own rows are cut as for any of its pushes).
 
 Every push from the poll carries this host's `capacity` at the top level
 (the same in every root's; the first `disk`-depth push of a new watch has
@@ -1074,7 +1078,11 @@ runs, an inbound neighbor's while it's up (it is a machine of kind
 thread per machine (plus one carrying an
 ssh machine's peer link) connects at once and stays connected, whatever
 watches. Connected, it subscribes to `instances` and, while a connection
-watches with `machines: true`, watches each of the machine's roots. A
+watches with `machines: true`, watches each of the machine's roots; the
+machine that is this host's hub (`member.toml`'s `hub` naming it) also
+has its fleet root for this host (its `roots.list`'s `fleet` row)
+watched with `machines: true`, for the machines the hub sees (*Federated
+snapshots*). A
 peer link that ends is redialed 1 s, 2 s, … 30 s apart; a failed connect
 or a lost connection over a live one is retried the same way (a
 forwarded call arriving meanwhile retries at once); the rows stay. A
@@ -1112,8 +1120,8 @@ roots, and it is where that caller's placement moves code to.
 | `machines.probe` | `{"target", "command"?}` (`command`: the machine's devsandbox as shell text, default `devsandbox`) | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target, empty `command`), `failed` (ssh, the hello or the protocol) |
 | `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning", "fleet": {"hub", "joined"}}`: `name` the machine's member name (its `member.get`'s) unless `name` renamed it as it joined, `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours, `fleet` the fleet both ends are in after the add: `hub` its hub's member name, `joined` `target` (the machine joined this host's fleet), `this` (this host joined the machine's), `new` (a fleet of two, this host the hub) or `same` (both were in it: nothing written but the entry) | `invalid` (bad target or name, a name taken in the registry or the fleet, a `name` that isn't the member name of a machine already in a fleet, no `roots`, empty `command`, a root the machine refuses: each one's reason), `denied` (the name is a live inbound neighbor's; the two ends are in different fleets, naming both hubs), `failed` (as `probe`, or a remote too old to check roots, or this host without a member name or `member.toml`), `internal` (`machines.toml` or `member.toml` doesn't read or write); a write that fails after an earlier one says what was already written |
 | `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, the registry's by name, then the inbound neighbors up now by name; `kind` `ssh` \| `inbound`, `target` `null` for an inbound one; `state`, `error` and `version` (from the last hello) its held link's, whatever its kind; an inbound one has `agent` off and `command` `null`, `roots` what its `roots.list` answered over the link (empty until it has); `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
-| `machines.get` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"name", "kind", "target", "command", "roots", "agent"}`, a registered machine's or an inbound one's: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an inbound one has none) | `not-found`, `invalid` (`agent` not absolute), `internal` (as `list`) |
-| `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `denied` (an inbound machine: this host's agent never reaches it; its own entry for this host has the `agent` that counts), `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
+| `machines.get` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"name", "kind", "target", "command", "roots", "agent"}`, a registered machine's or an inbound one's: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an inbound one has none) | `not-found`, `denied` (a machine seen only through the hub, naming it), `invalid` (`agent` not absolute), `internal` (as `list`) |
+| `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `denied` (an inbound machine: this host's agent never reaches it; its own entry for this host has the `agent` that counts; a machine seen only through the hub), `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `denied` (an inbound machine: it goes with its link, `machine rm` on it), `internal` (`machines.toml` doesn't read or write) |
 
 `probe` and `add` open a connection of their own (a 20 s hello), checking
@@ -1195,7 +1203,9 @@ the forward on this host (*Forwards*).
 
 Any other method with `machine` is `invalid` ("can't take a machine
 yet"), so a client never takes a local answer for a remote one. Errors
-added by the forwarding: `not-found` (no such machine), `failed`
+added by the forwarding: `not-found` (no such machine), `denied` (a
+machine seen only through this host's hub, *Federated snapshots*: the
+message names the hub; `forwards.add` too), `failed`
 (`<machine>: unreachable: <why>`: the connect the call triggered failed,
 answered without waiting out the backoff; or `<machine>: <why>`: the link
 broke mid-call), `internal` (`<machine>: timed out`: the link is dropped
@@ -1235,7 +1245,19 @@ remote `thread_children` aren't merged. Plus, top-level:
 
 | field | |
 |---|---|
-| `machines` | every machine (registered, and the inbound neighbors up now), by name: `{"name", "kind", "target", "command", "state", "error", "version", "runtime", "agent", "capacity"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` the registry's, `capacity` its [capacity](#capacity) from its last push (`null` before one carried it) |
+| `machines` | every machine (registered, and the inbound neighbors up now), by name, then those seen through this host's hub: `{"name", "kind", "target", "command", "state", "error", "version", "runtime", "agent", "capacity", "via"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` the registry's, `capacity` its [capacity](#capacity) from its last push (`null` before one carried it), `via` `null` |
+
+On a fleet member, the machines its hub sees (the hub's federated push to
+this host's watch of it, this host left out) follow, each one `via` the
+hub's name, its rows tagged with its own name as the hub tagged them:
+`kind`, `version`, `runtime`, `capacity` as the hub reports them,
+`target` and `command` `null`, `agent` `false`; while the hub's own link
+isn't `connected`, `state` is the hub's and `error` `through <hub>:
+<why>`, the rows last known. A machine this host links to itself is
+listed once, as its own. Only one hop: the hub's machines, not what they
+see. They are view-only: a request naming one as `machine` (a quick call,
+a verb, `forwards.add`), `machines.get` and `machines.set` are `denied`,
+naming the hub; `machines.list` doesn't list them.
 
 A machine's rows are last known: they stay while its link is down (in
 memory only, so a fresh daemon has none until it connects), and a client

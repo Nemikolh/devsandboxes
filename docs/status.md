@@ -44,8 +44,10 @@ limitation means editing this file in the same commit.
   refused. `machine add` joins (step 9b): the end in no fleet takes the
   other's hub, two ends in none make a fleet of two, two hubs are
   refused; nothing takes a member out of a fleet yet but `member.set
-  {hub: ""}` (`machine rm` and leaving: 9d). Next: the rest of
-  membership (step 9), routing over the graph (step 10).
+  {hub: ""}` (`machine rm` and leaving: 9d). A member sees the fleet
+  through its hub (step 9c: the machines the hub links to show `via`
+  it). Next: the rest of membership (step 9), routing over the graph
+  (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -262,9 +264,18 @@ limitation means editing this file in the same commit.
   same OS and arch (`install::platform_matches`); updating a devsandbox
   that's a symlink replaces the link with a file (`install::INSTALL`'s
   `mv -f`). → [machines](architecture/daemon/machines.md#install)
+- Machines a fleet member sees only through its hub (`via` in the
+  snapshot) are view-only until fleet step 10 routes over the graph:
+  actions, `machine`-param requests, `machines.get`/`set`, forwards and
+  terminals on them are refused naming the hub, and the federated
+  `instances.resolve` / `sandboxes.list` don't ask them. One hop only:
+  the machines the hub itself links to. A member watches its hub
+  federated only while one of its own watchers wants machines.
+  → [fleet](architecture/daemon/fleet.md#hub-mode), [machines](architecture/daemon/machines.md#federated-snapshots); `snapshots::seen_via`, `snapshots::fleet_view`
 - Remote rows live in memory except on a hub (which reloads them from
   `remotes.json`): a fresh non-hub daemon shows a machine without rows
-  until its link connects. → [machines](architecture/daemon/machines.md), [fleet](architecture/daemon/fleet.md#hub-mode); `snapshots::Remotes`, `machines::saved`
+  until its link connects (machines seen via the hub too, until it
+  connects). → [machines](architecture/daemon/machines.md), [fleet](architecture/daemon/fleet.md#hub-mode); `snapshots::Remotes`, `machines::saved`
 - `vscode` and `inbox` are refused for a machine's instances on the CLI;
   the dashboard's `o` on a remote row answers "not supported yet" (its
   `p` and the CLI's `port` work); nameless commands are local only; no

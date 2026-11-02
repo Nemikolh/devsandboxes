@@ -50,10 +50,12 @@ for Instances when the last machine goes. Each keeps its own selected row.
   ([../daemon/forwards.md](../daemon/forwards.md)).
 - **Inbox**: threads from the shared Inbox store
   ([inbox-tab.md](inbox-tab.md)).
-- **Machines**: one row per registered machine, in the snapshot's
-  `machines` order (`SnapshotMachine`, `ui.rs` `draw_machines`): NAME,
-  TARGET, STATE (`LinkState::as_str`, with `: <error>` when set), AGENT
-  (`on`/`off`, `-` for an inbound one), VERSION (`-` before a link) and
+- **Machines**: one row per machine, in the snapshot's `machines` order
+  (`SnapshotMachine`, `ui.rs` `draw_machines`; on a fleet member those
+  seen through the hub last): NAME, TARGET (dimmed `inbound` for an
+  inbound one, `via <hub>` for one seen through the hub), STATE
+  (`LinkState::as_str`, with `: <error>` when set), AGENT
+  (`on`/`off`, `-` for an inbound one or one via the hub), VERSION (`-` before a link) and
   CAPACITY (`ui.rs` `capacity_text`: `capacity::summary`, e.g. `8 cpu ·
   12/32G · 120G free · 3 run`, then `over cap: mem 18G/16G` in yellow
   when `capacity::over_caps` finds a soft cap exceeded), from the
@@ -64,7 +66,8 @@ for Instances when the last machine goes. Each keeps its own selected row.
   worker (`Cmd::MachineSet`, `machines.set {name, agent}`), and the
   answer is a status line; the row isn't touched, it shows the new value
   with the next snapshot push
-  ([../daemon/machines.md](../daemon/machines.md) *Dashboard*).
+  ([../daemon/machines.md](../daemon/machines.md) *Dashboard*); on a
+  machine via the hub it's refused with a status line naming the hub.
 
 The header's totals line marks the snapshot stale with why when the daemon
 connection is down, or after `STALE_AFTER_SECS` without a push.

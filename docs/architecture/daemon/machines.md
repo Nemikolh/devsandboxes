@@ -274,7 +274,21 @@ one's while its neighbor is up.
   subscribes to `instances`, watches each of the machine's roots while a
   local watcher wants machines (`Hooks::watching`), and stores pushed
   snapshots in `Remotes` (kept while the link is down; in memory only,
-  but on a hub, which also saves them to `remotes.json`). A carrier going
+  but on a hub, which also saves them to `remotes.json`). The machine
+  that is this host's hub (`Hooks::hub`: `member.toml`'s `hub` names
+  another member, `daemon::Shared::hub_of`; asked at each look at the
+  watchers, and a hub change redials every link anyway) is also watched
+  federated meanwhile: `roots.list` over the link gives its fleet root
+  for this host (the `fleet` row, there whether or not the hub has a
+  config root of its own), watched with `machines: true`
+  (`LinkLoop::watch`, `Want`/`Watched`; a refusal is the machine's
+  `error`, asked again at the next change). That push is split
+  (`snapshots::fleet_view`): its rows tagged `machine` and its `machines`
+  array, this host's own name left out (guarded: the hub leaves it out
+  already) and only one hop (entries the hub sees `via` another are
+  dropped), are the hub's `Machine::fleet`; the rest is that root's own
+  rows when it is one of the entry's roots. A machine that stops being
+  the hub loses its view. A carrier going
   down ends the link at once and is the machine's `error`; a carrier
   coming up is dialed at once; a connect that fails or a link lost over a
   live carrier is retried with the backoff.
@@ -290,8 +304,10 @@ holds a link back over it to this host.
 ## Forwarded requests
 
 A request carrying `machine` (neither registered nor an inbound neighbor
-up now: `not-found`) has it stripped and goes to that machine, but for
-the ones served here:
+up now: `not-found`; one seen only through this host's hub, [Federated
+snapshots](#federated-snapshots): `denied` naming the hub,
+`snapshots::seen_via`, from `Handle::unknown`) has it stripped and goes
+to that machine, but for the ones served here:
 
 - **Quick calls** (`forward::QUICK`: `instances.list|cancel|procs|signal|
   rename|done|buildLog|resolve`, `containers.logs|inspect`,
@@ -322,11 +338,16 @@ the ones served here:
   the forward reaches, not where it runs. The daemon keeps the param and
   answers itself, binding the forward on this host with one `TUNNEL`
   stream per bridge over the machine's link, whatever its kind
-  ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
+  ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)); a
+  machine seen through the hub is `denied` before it (`daemon::handle`).
 
 - **`machines.get {name, agent?}`** takes the caller's absolute
   `SSH_AUTH_SOCK` as `agent` and reports it like a verb's: the CLI's
-  re-runs pass it ([The CLI](#the-cli-clirs)).
+  re-runs pass it ([The CLI](#the-cli-clirs)). A machine seen through
+  the hub is `denied` naming the hub (so is `machines.set`), which is
+  what the CLI prints for a command on it; a tab's `--reserve-255`
+  resolve takes `denied` as final, not as an outage
+  (`cli::resolve_lost`).
 
 ## Federated snapshots
 
@@ -337,9 +358,27 @@ array carries each machine's `name`, `kind` (`ssh` |
 `inbound`, fleet plan decision 29), `target` (`null` for an inbound one), `state`,
 `error`, `version`, `command`,
 `runtime`, `agent`, `capacity` (its host's
-[capacity report](fleet.md#capacity), from its last push). A machine's push or state change re-publishes those
+[capacity report](fleet.md#capacity), from its last push), `via`. A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
+
+On a fleet member, `merge` also lifts the hub's `Machine::fleet` view:
+each machine it lists becomes an entry of its own after the direct ones,
+`via` the hub, with no `target`, `command` or `agent` (no link here
+reaches it), its rows as the hub tagged them; while the hub's link isn't
+connected it takes the hub's state, `error` `through <hub>: <why>`, rows
+last known. A machine this host links to wins over the same name seen
+via the hub. The view lives in `Remotes` only (never in `remotes.json`:
+`saved::of` takes rows and versions), and isn't a machine of the
+service's: placement (`fleet::placed::workers`, over `Remotes::all`), the
+federated calls and `machines.list` never see it; `Remotes::via` (pure:
+`snapshots::via_of`) names the hub for the refusals.
+
+On a hub, a link peer's federated watch (a member watching it,
+[fleet](fleet.md#hub-mode)) is merged with `merge`'s `except` the peer's
+name: its own rows and entry never go back to it. `publish_snapshot` and
+`publish_machines` merge once per root and asking peer
+(`Pending::except`: `None` for local clients, which share one merge).
 
 ## Agent
 
@@ -623,14 +662,18 @@ unreachable: <why>` in the header (`pending_note`), the name as `box
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while there is a machine, shows every machine from the snapshot's
-`machines` with its target (dimmed `inbound` for an inbound one),
-link state (and error), `agent` (`-` for an inbound one), and its
+`machines` with its target (dimmed `inbound` for an inbound one, dimmed
+`via <hub>` for one seen through the hub), link state (and error),
+`agent` (`-` for an inbound one or one seen via the hub), and its
 CAPACITY ([capacity](fleet.md#capacity));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a
 down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers
 ([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*); on an
 inbound machine it only says why there's nothing to flip
-(`App::toggle_selected_agent`).
+(`App::toggle_selected_agent`), on one seen via the hub that it's
+view-only. A tab on a machine seen via the hub is refused naming the hub
+(`on_machine`), and actions on its rows carry its name as `machine`,
+which the daemon refuses the same way.
 
 Limitations: [status.md](../../status.md#daemon)

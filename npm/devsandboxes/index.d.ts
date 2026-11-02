@@ -181,6 +181,11 @@ export interface SnapshotMachine {
   agent: boolean;
   /** Its host's capacity, from its last snapshot (last known while not `connected`); `null` before one carried it. */
   capacity: Capacity | null;
+  /**
+   * The fleet hub this machine is seen through (a member's view of the hub's other machines): view-only,
+   * acting on it is refused naming the hub; `null` for a machine this host links to.
+   */
+  via: string | null;
 }
 
 /**

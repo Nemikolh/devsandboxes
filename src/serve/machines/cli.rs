@@ -353,9 +353,10 @@ pub(crate) const SSH_FAILED: i32 = 255;
 /// exits [`SSH_FAILED`], as a lost dial does, instead of failing: for a
 /// qualified name under `--reserve-255` (a dashboard tab's dials, which
 /// re-dial on a 255: `tui::app::terminal::Redial`), any failure but
-/// `not-found` is the machine's link being down, an outage to wait out.
+/// `not-found` and `denied` (a machine seen only through the hub, say) is
+/// the machine's link being down, an outage to wait out.
 pub(crate) fn resolve_lost(qualified: bool, command: &Command, code: &str) -> bool {
-    qualified && matches!(command, Command::Exec { reserve_255: true, .. }) && code != "not-found"
+    qualified && matches!(command, Command::Exec { reserve_255: true, .. }) && !matches!(code, "not-found" | "denied")
 }
 
 /// The helper's `NO_SESSION_EXIT` (`devsbd/src/sessions.rs`): an attach to
@@ -1096,6 +1097,7 @@ mod tests {
         let again = command(&["exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "box/web"]);
         assert!(resolve_lost(true, &again, "failed"));
         assert!(!resolve_lost(true, &again, "not-found"));
+        assert!(!resolve_lost(true, &again, "denied"), "a refusal isn't an outage");
         assert!(!resolve_lost(false, &again, "failed"), "a bare name isn't one machine's link");
         assert!(!resolve_lost(true, &command(&["exec", "box/web"]), "failed"));
     }

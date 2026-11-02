@@ -17,7 +17,8 @@
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
 //!   quick calls (`machines::forward::QUICK`), `capacity.get`, `roots.list`
 //!   and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
-//!   true`) request; everything else (`machines.*`,
+//!   true`) request but `instances.watch` (a member watching its hub);
+//!   everything else (`machines.*`,
 //!   `shutdown`, `helper.call`, `forwards.*`, the
 //!   Inbox, …) is `denied`.
 //! - [`admit`] then confines the params: every `root` / `dir` canonicalized
@@ -258,7 +259,9 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
     if fwd::machine_of(params)?.is_some() {
         return Err(ApiError::denied("a remote caller can't reach past this member (`machine`)"));
     }
-    if fwd::federated(params) {
+    // But a federated watch: a member watching its hub, which only a hub
+    // serves (the daemon's `watch_root`).
+    if fwd::federated(params) && method != "instances.watch" {
         return Err(ApiError::denied("a remote caller can't reach past this member (`machines`)"));
     }
     let gate = match method {
@@ -582,18 +585,24 @@ fn row_lent(row: &Value, reach: &Reach) -> bool {
 /// instances `reach` admits (by their rows' `root`), in place: other rows
 /// gone, and their names from services' `used_by` and from
 /// `thread_children`. The snapshot lists every instance in `state.toml`,
-/// whatever `dir`, so this is what keeps what isn't reached out. Nothing
-/// is cut under `full`.
+/// whatever `dir`, so this is what keeps what isn't reached out. Rows
+/// tagged `machine` (a hub's federated push: other machines' rows, their
+/// `root` a path there) aren't this host's and stay. Nothing is cut under
+/// `full`.
 pub fn filter_snapshot(snapshot: &mut Value, reach: &Reach) {
     if reach.trust == Trust::Full {
         return;
     }
+    let remote = |r: &Value| r.get("machine").is_some_and(|m| !m.is_null());
     let mut kept = BTreeSet::new();
     let mut ids = BTreeSet::new();
     if let Some(rows) = snapshot.get_mut("instances").and_then(Value::as_array_mut) {
-        rows.retain(|r| row_lent(r, reach));
-        kept.extend(rows.iter().filter_map(|r| r.get("name").and_then(Value::as_str).map(String::from)));
-        ids.extend(rows.iter().filter_map(|r| r.get("instance_id").and_then(Value::as_str).map(String::from)));
+        rows.retain(|r| remote(r) || row_lent(r, reach));
+        let own = rows.iter().filter(|r| !remote(r));
+        for r in own {
+            kept.extend(r.get("name").and_then(Value::as_str).map(String::from));
+            ids.extend(r.get("instance_id").and_then(Value::as_str).map(String::from));
+        }
     }
     let keep = |v: &Value| v.as_str().is_some_and(|n| kept.contains(n));
     // An isolated service's container is per instance
@@ -604,7 +613,7 @@ pub fn filter_snapshot(snapshot: &mut Value, reach: &Reach) {
         ids.iter().any(|id| name.contains(&format!("-{id}-")))
     };
     if let Some(services) = snapshot.get_mut("services").and_then(Value::as_array_mut) {
-        for s in services {
+        for s in services.iter_mut().filter(|s| !remote(s)) {
             if let Some(used) = s.get_mut("used_by").and_then(Value::as_array_mut) {
                 used.retain(keep);
             }
@@ -659,7 +668,8 @@ mod tests {
             ("subscribe", json!({"topics": ["instances", "inbox"]}), Err("denied")),
             ("subscribe", json!({"topics": ["forwards"]}), Err("denied")),
             ("instances.watch", json!({"dir": "/x"}), Ok(Watch)),
-            ("instances.watch", json!({"dir": "/x", "machines": true}), Err("denied")),
+            // A member watching its hub: the daemon serves it on a hub only.
+            ("instances.watch", json!({"dir": "/x", "machines": true}), Ok(Watch)),
             ("instances.unwatch", json!({"dir": "/x"}), Ok(Unwatch)),
             ("instances.list", json!({"dir": "/x"}), Ok(Quick)),
             ("instances.resolve", json!({"name": "a"}), Ok(Quick)),
@@ -1066,6 +1076,34 @@ mod tests {
         let own = json!({"matches": ["own"], "found": [{"name": "own", "root": "/nonexistent/mine"}]});
         assert_eq!(filter_answer("instances.resolve", own, root, Path::new("/nonexistent/state.toml")).unwrap_err().code, "not-found");
         assert_eq!(filter_answer("sandboxes.list", json!({"a": 1}), root, Path::new("/nonexistent/state.toml")).unwrap(), json!({"a": 1}));
+    }
+
+    /// A hub's federated push: other machines' rows (tagged, their `root` a
+    /// path there) stay, their services untouched; this host's own rows are
+    /// cut as ever, and a remote instance of the same name keeps no local
+    /// row's service user.
+    #[test]
+    fn a_federated_push_keeps_other_machines_rows() {
+        let root = Path::new("/nonexistent/fleet/hub");
+        let mut snap = json!({
+            "instances": [
+                {"name": "in", "root": "/nonexistent/fleet/hub/cfg", "instance_id": "i1"},
+                {"name": "own", "root": "/nonexistent/mine", "instance_id": "o1"},
+                {"name": "own", "root": "/x/cfg", "machine": "x", "instance_id": "x1"},
+            ],
+            "services": [
+                {"name": "db", "used_by": ["in", "own"]},
+                {"name": "db", "used_by": ["own"], "machine": "x", "root": "/x/cfg"},
+            ],
+            "machines": [{"name": "x"}],
+        });
+        filter_snapshot(&mut snap, &fleet(root));
+        let rows: Vec<(&str, Option<&str>)> =
+            snap["instances"].as_array().unwrap().iter().map(|r| (r["name"].as_str().unwrap(), r["machine"].as_str())).collect();
+        assert_eq!(rows, [("in", None), ("own", Some("x"))]);
+        assert_eq!(snap["services"][0]["used_by"], json!(["in"]), "x's `own` isn't this host's");
+        assert_eq!(snap["services"][1]["used_by"], json!(["own"]), "x's service as x has it");
+        assert_eq!(snap["machines"], json!([{"name": "x"}]));
     }
 
     #[test]

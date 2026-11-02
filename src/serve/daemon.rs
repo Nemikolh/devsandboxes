@@ -310,7 +310,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let hooked: Arc<OnceLock<std::sync::Weak<Shared>>> = Arc::default();
     let hold = machine_dialer(dir, opts, &hooked, &shared.hub);
     let hooks = {
-        let (a, b) = (Arc::clone(&hooked), Arc::clone(&hooked));
+        let (a, b, c) = (Arc::clone(&hooked), Arc::clone(&hooked), Arc::clone(&hooked));
         service::Hooks {
             watching: Box::new(move || a.get().and_then(std::sync::Weak::upgrade).is_some_and(|s| s.watching_machines())),
             changed: Box::new(move || {
@@ -318,6 +318,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                     s.publish_machines();
                 }
             }),
+            hub: Box::new(move || c.get().and_then(std::sync::Weak::upgrade).and_then(|s| s.hub_of())),
         }
     };
     let hub = {
@@ -736,6 +737,17 @@ impl Shared {
         lock_hub(&self.hub).is_this()
     }
 
+    /// This host's hub when another member is, and this host's own member
+    /// name: what the machine links watch the hub's fleet with
+    /// (`service::Hooks::hub`).
+    fn hub_of(&self) -> Option<service::HubOf> {
+        let fleet::member::Hub::Other(hub) = lock_hub(&self.hub).clone() else { return None };
+        // No name of its own: nothing to guard against (the hub leaves the
+        // asking member out anyway).
+        let me = self.member.as_deref().and_then(|p| fleet::dialer::member_name(p, &self.hostname).ok()).unwrap_or_default();
+        Some(service::HubOf { hub, me })
+    }
+
     /// `member.set` wrote `hub`: keep it, and when it changed end every
     /// link this host holds and every one it's dialed on, so both ends
     /// redial saying the new hub (`fleet::update::hello_of`). Held links:
@@ -971,20 +983,26 @@ impl Shared {
 
     /// `instances.snapshot` of root `dir`, to the connections watching it:
     /// `params` as is, or merged with the machines' rows for a `machines:
-    /// true` watcher (merged once, for all of them). Latest wins per root:
+    /// true` watcher (merged once per asking peer: a link peer's own rows
+    /// are left out of its push, `Pending::except`). Latest wins per root:
     /// under backpressure older snapshots are dropped.
     fn publish_snapshot(&self, dir: &Path, params: Arc<Value>) {
         self.locals.lock().unwrap().insert(dir.to_path_buf(), Arc::clone(&params));
-        let mut merged: Option<Arc<Value>> = None;
+        let mut merged: BTreeMap<Option<String>, Arc<Value>> = BTreeMap::new();
         let mut remotes: Option<Vec<snapshots::Machine>> = None;
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
                 let push = match p.watched.get(dir) {
                     None => return false,
                     Some(false) => Arc::clone(&params),
-                    Some(true) => Arc::clone(merged.get_or_insert_with(|| {
-                        Arc::new(snapshots::merge(&params, remotes.get_or_insert_with(|| self.remotes())))
-                    })),
+                    Some(true) => {
+                        let except = p.except();
+                        let push = merged.entry(except.clone()).or_insert_with(|| {
+                            let remotes = remotes.get_or_insert_with(|| self.remotes());
+                            Arc::new(snapshots::merge(&params, remotes, except.as_deref()))
+                        });
+                        Arc::clone(push)
+                    }
                 };
                 p.snapshots.insert(dir.to_path_buf(), push);
                 true
@@ -998,13 +1016,16 @@ impl Shared {
     fn publish_machines(&self) {
         let locals = self.locals.lock().unwrap().clone();
         let remotes = self.remotes();
-        let mut merged: BTreeMap<PathBuf, Arc<Value>> = BTreeMap::new();
+        let mut merged: BTreeMap<(PathBuf, Option<String>), Arc<Value>> = BTreeMap::new();
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
                 let mut any = false;
+                let except = p.except();
                 for (dir, _) in p.watched.iter().filter(|(_, machines)| **machines) {
                     let Some(local) = locals.get(dir) else { continue };
-                    let push = merged.entry(dir.clone()).or_insert_with(|| Arc::new(snapshots::merge(local, &remotes)));
+                    let push = merged
+                        .entry((dir.clone(), except.clone()))
+                        .or_insert_with(|| Arc::new(snapshots::merge(local, &remotes, except.as_deref())));
                     p.snapshots.insert(dir.clone(), Arc::clone(push));
                     any = true;
                 }
@@ -1134,6 +1155,12 @@ struct Pending {
 }
 
 impl Pending {
+    /// The machine a federated push to this connection leaves out: a link
+    /// peer's own (its rows are never re-exported to it).
+    fn except(&self) -> Option<String> {
+        self.reach.as_ref().map(|(peer, _)| peer.name.clone())
+    }
+
     fn any(&self) -> bool {
         self.inbox.is_some()
             || self.shown.is_some()
@@ -1490,7 +1517,13 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         Ok(Some(machine)) if fwd::is_quick(&req.method) => {
             return Some(forward(req.id, &req.method, req.params, &machine, shared));
         }
-        Ok(Some(_)) if fwd::is_here(&req.method) => {}
+        // Served here, but not on a machine this host sees only through
+        // its hub (view-only).
+        Ok(Some(machine)) if fwd::is_here(&req.method) => {
+            if let Some(hub) = shared.links().and_then(|l| l.remotes().via(&machine)) {
+                return Some(Response::err(req.id, "denied", snapshots::seen_via(&machine, &hub)));
+            }
+        }
         Ok(Some(_)) => {
             return Some(Response::err(req.id, "invalid", format!("`{}` can't take a machine yet", req.method)));
         }
@@ -2052,6 +2085,18 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
 fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value, api::ApiError> {
     let machines = api::watch_machines(&params)?;
     let dir = api::watch_dir(params, true)?;
+    // A link peer's federated watch: a member watching its hub. Only the
+    // hub federates for a peer (it watches its members plain), so no two
+    // members re-export each other's rows.
+    let except = match &conn.table {
+        Table::Peer(peer) if machines => {
+            if !shared.is_hub() {
+                return Err(api::ApiError::denied("only the fleet's hub serves a federated watch to a link peer"));
+            }
+            Some(peer.name.clone())
+        }
+        _ => None,
+    };
     let mut subscribed = false;
     conn.out.post(|p| {
         subscribed = p.topics.contains(&Topic::Instances);
@@ -2076,7 +2121,7 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
         }
     };
     let first = match first {
-        Some(first) if machines => Some(Arc::new(snapshots::merge(&first, &shared.remotes()))),
+        Some(first) if machines => Some(Arc::new(snapshots::merge(&first, &shared.remotes(), except.as_deref()))),
         first => first,
     };
     conn.out.post(|p| {
@@ -2844,7 +2889,7 @@ pub(crate) mod tests {
         }
         // A `machines: true` watcher's variant.
         let machine = snapshots::Machine { name: "m".into(), target: Some("me@m".into()), ..Default::default() };
-        let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine]);
+        let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine], None);
         dts::assert_matches(&dts::prop_type("ApiEvents", "instances.snapshot").unwrap(), &merged);
         dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
     }

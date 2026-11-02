@@ -17,6 +17,12 @@
 //! its last snapshot per remote root, kept while its link is down. A watcher
 //! with `machines: true` gets [`merge`] of a local root's params and every
 //! machine's rows; any other watcher gets the local params untouched.
+//!
+//! A fleet member also keeps its hub's federated view ([`Machine::fleet`],
+//! [`fleet_view`]): the hub's other machines, which [`merge`] lifts into
+//! machines of their own, `via` the hub (docs/architecture/daemon/fleet.md,
+//! *Hub mode*). A hub serving a peer's federated watch leaves that peer
+//! out (`merge`'s `except`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -226,6 +232,10 @@ pub struct Machine {
     /// `rows` were restored from a hub's `remotes.json` and the link hasn't
     /// connected since: shown `unreachable` ([`Machine::set_link`]).
     pub restored: bool,
+    /// This machine is this host's hub: its last federated push cut to the
+    /// other machines it sees ([`fleet_view`]: their tagged rows and
+    /// `machines` entries). Kept while the link is down, never saved.
+    pub fleet: Option<Arc<Value>>,
 }
 
 impl Machine {
@@ -313,6 +323,12 @@ impl Remotes {
         self.lock().get(name).cloned()
     }
 
+    /// The hub machine `name` is seen through, when it's no machine here
+    /// but one of a hub's federated view lists it ([`via_of`]).
+    pub fn via(&self, name: &str) -> Option<String> {
+        via_of(&self.lock().values().cloned().collect::<Vec<_>>(), name)
+    }
+
     /// Every machine, sorted by name (the rows are `Arc`s: cheap).
     pub fn all(&self) -> Vec<Machine> {
         self.lock().values().cloned().collect()
@@ -343,6 +359,58 @@ pub struct SnapshotMachine {
     /// the link is down); `None` before one carried it.
     #[serde(default)]
     pub capacity: Option<Capacity>,
+    /// The hub it's seen through (a fleet member's view of the hub's other
+    /// machines): view-only, no link of this host's reaches it. `None` for
+    /// a machine this host links to.
+    #[serde(default)]
+    pub via: Option<String>,
+}
+
+/// Why acting on machine `machine` is refused: this host sees it only
+/// through its hub `hub`'s federated view (fleet plan decision 33).
+pub fn seen_via(machine: &str, hub: &str) -> String {
+    format!("`{machine}` is seen through the hub `{hub}` only: acting on it needs routing over the fleet (fleet step 10)")
+}
+
+/// The hub `name` is seen through among `machines` (pure): `None` when it's
+/// one of them (a direct machine wins), else the first whose
+/// [`Machine::fleet`] lists it.
+pub fn via_of(machines: &[Machine], name: &str) -> Option<String> {
+    if machines.iter().any(|m| m.name == name) {
+        return None;
+    }
+    machines
+        .iter()
+        .find(|m| m.fleet.as_deref().is_some_and(|v| rows(v, "machines").any(|e| e.get("name").and_then(Value::as_str) == Some(name))))
+        .map(|m| m.name.clone())
+}
+
+/// A hub's federated push (`params`, pushed to this member's `machines:
+/// true` watch) split in place: its rows tagged `machine` and its
+/// `machines` array leave `params` (which keeps the hub's own rows) and
+/// come back as the view [`Machine::fleet`] holds. Left out of the view:
+/// `me` (this host: the hub leaves the asking member out already), entries
+/// that are themselves `via` another hub (one hop), and rows of machines
+/// not in the view.
+pub fn fleet_view(params: &mut Value, me: Option<&str>) -> Value {
+    let Some(obj) = params.as_object_mut() else { return json!({}) };
+    let entries: Vec<Value> = take_array(obj, "machines")
+        .into_iter()
+        .filter(|e| {
+            let name = e.get("name").and_then(Value::as_str);
+            name.is_some() && name != me && e.get("via").is_none_or(Value::is_null)
+        })
+        .collect();
+    let names: BTreeSet<String> = entries.iter().filter_map(|e| e.get("name")?.as_str().map(String::from)).collect();
+    let mut view = Map::new();
+    for key in ["instances", "sandboxes", "services"] {
+        let (tagged, own): (Vec<Value>, Vec<Value>) = take_array(obj, key).into_iter().partition(|r| r.get("machine").and_then(Value::as_str).is_some());
+        obj.insert(key.into(), Value::Array(own));
+        let kept = tagged.into_iter().filter(|r| r.get("machine").and_then(Value::as_str).is_some_and(|m| names.contains(m)));
+        view.insert(key.into(), Value::Array(kept.collect()));
+    }
+    view.insert("machines".into(), Value::Array(entries));
+    Value::Object(view)
 }
 
 /// A `machines: true` watcher's `instances.snapshot`: `local` (a local
@@ -356,13 +424,25 @@ pub struct SnapshotMachine {
 /// from the snapshot of its own `root` when that root is registered, else
 /// from the machine's first root's. Remote `thread_children` aren't merged:
 /// the Inbox is this host's only.
-pub fn merge(local: &Value, machines: &[Machine]) -> Value {
+///
+/// A machine with a [`Machine::fleet`] view (this host's hub) also lifts
+/// each machine that view lists into one of its own, after the direct
+/// ones: `via` the hub, no `target`, `command` or `agent` (no link here
+/// reaches it), its state the hub's while the hub isn't connected, its rows
+/// as the hub tagged them. A machine this host links to directly wins over
+/// the same name seen through the hub.
+///
+/// `except` leaves that machine out, its rows and its entry, direct or
+/// lifted: what a hub pushes to that machine's own federated watch (the
+/// asking machine's rows are never re-exported).
+pub fn merge(local: &Value, machines: &[Machine], except: Option<&str>) -> Value {
+    let machines: Vec<&Machine> = machines.iter().filter(|m| Some(m.name.as_str()) != except).collect();
     let mut out = local.clone();
     let Some(obj) = out.as_object_mut() else { return out };
     let mut instances = take_array(obj, "instances");
     let mut sandboxes = take_array(obj, "sandboxes");
     let mut services = take_array(obj, "services");
-    for m in machines {
+    for m in machines.iter().copied() {
         for (i, root) in m.roots.iter().enumerate() {
             let Some(params) = m.rows.get(root) else { continue };
             let root_text = root.to_string_lossy();
@@ -380,14 +460,55 @@ pub fn merge(local: &Value, machines: &[Machine]) -> Value {
             services.extend(rows(params, "services").map(|row| tag(row, &m.name, Some(&root_text))));
         }
     }
+    let mut entries: Vec<SnapshotMachine> = machines.iter().map(|m| snapshot_machine(m)).collect();
+    for hub in machines.iter().copied() {
+        let Some(view) = hub.fleet.as_deref() else { continue };
+        let mut lifted = BTreeSet::new();
+        for e in rows(view, "machines") {
+            let Ok(mut m) = serde_json::from_value::<SnapshotMachine>(e.clone()) else { continue };
+            if Some(m.name.as_str()) == except || entries.iter().any(|d| d.name == m.name) {
+                continue;
+            }
+            lift(&mut m, hub);
+            lifted.insert(m.name.clone());
+            entries.push(m);
+        }
+        let theirs = |r: &&Value| r.get("machine").and_then(Value::as_str).is_some_and(|m| lifted.contains(m));
+        instances.extend(rows(view, "instances").filter(theirs).cloned());
+        sandboxes.extend(rows(view, "sandboxes").filter(theirs).cloned());
+        services.extend(rows(view, "services").filter(theirs).cloned());
+    }
     obj.insert("instances".into(), Value::Array(instances));
     // The header's "N sandboxes" counts the machines' too.
     obj.insert("sandbox_count".into(), json!(sandboxes.len()));
     obj.insert("sandboxes".into(), Value::Array(sandboxes));
     obj.insert("services".into(), Value::Array(services));
-    let entries: Vec<Value> = machines.iter().map(|m| json!(snapshot_machine(m))).collect();
+    let entries: Vec<Value> = entries.iter().map(|m| json!(m)).collect();
     obj.insert("machines".into(), Value::Array(entries));
     out
+}
+
+/// Machine `m`, as hub `hub` reported it, made one seen through it: `via`
+/// the hub, nothing that would reach it from here, and while the hub's
+/// own link isn't connected, the hub's state (its rows stay, last known).
+fn lift(m: &mut SnapshotMachine, hub: &Machine) {
+    m.via = Some(hub.name.clone());
+    m.target = None;
+    m.command = None;
+    m.agent = false;
+    if hub.state != LinkState::Connected {
+        let why = hub.error.as_deref().unwrap_or(hub.state.as_str());
+        m.state = match hub.state {
+            LinkState::Idle => LinkState::Connecting,
+            state => state,
+        };
+        m.error = Some(format!("through {}: {}", hub.name, why_without(&hub.name, why)));
+    }
+}
+
+/// `error` without the `<machine>: ` the link's messages start with.
+fn why_without<'a>(machine: &str, error: &'a str) -> &'a str {
+    error.strip_prefix(machine).and_then(|e| e.strip_prefix(": ")).unwrap_or(error)
 }
 
 fn snapshot_machine(m: &Machine) -> SnapshotMachine {
@@ -406,6 +527,7 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         runtime,
         command: m.command.clone(),
         agent: m.agent,
+        via: None,
     }
 }
 
@@ -600,7 +722,7 @@ pub(crate) mod tests {
         // An inbound machine: no target.
         let w = Machine { kind: MachineKind::Inbound, target: None, ..machine("w", &[], LinkState::Idle) };
 
-        let merged = merge(&local, &[a, b, c, w]);
+        let merged = merge(&local, &[a, b, c, w], None);
         // From its own root's snapshot when registered, else the first's.
         assert_eq!(names(&merged, "instances"), ["mine@-", "in-one@a", "orphan@a", "old@a", "in-two@a", "bee@b"]);
         assert_eq!(names(&merged, "sandboxes"), ["s@-", "sb-one@a", "sb-two@a", "sb-b@b"]);
@@ -619,27 +741,114 @@ pub(crate) mod tests {
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap},
-                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null},
-                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null},
-                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null},
+                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap, "via": null},
+                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null, "via": null},
+                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null, "via": null},
+                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null, "via": null},
             ])
         );
         crate::serve::dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
         crate::serve::dts::assert_matches("Capacity", &merged["machines"][0]["capacity"]);
         // No machines: the local params plus an empty `machines`.
-        let alone = merge(&local, &[]);
+        let alone = merge(&local, &[], None);
         let mut want = local.clone();
         want["machines"] = serde_json::json!([]);
         want["sandbox_count"] = serde_json::json!(want["sandboxes"].as_array().unwrap().len());
         assert_eq!(alone, want);
     }
 
+    /// A hub's federated push as a member gets it: the hub's own rows,
+    /// then machines `x` (direct on the hub) and `me` (should never come,
+    /// guarded anyway), and `y`, itself seen via another hub.
+    fn hub_push() -> Value {
+        let entry = |name: &str, via: Option<&str>| {
+            serde_json::json!({"name": name, "kind": "ssh", "target": format!("me@{name}"), "state": "connected", "error": null,
+                "version": "0.6.0", "runtime": "docker", "command": "~/ds", "agent": true, "capacity": null, "via": via})
+        };
+        serde_json::json!({
+            "dir": "/fleet/me", "runtime_name": "docker",
+            "instances": [{"name": "hub-own", "root": "/k"}, {"name": "xi", "machine": "x", "root": "/x"},
+                          {"name": "mine", "machine": "me", "root": "/m"}, {"name": "yi", "machine": "y", "root": "/y"}],
+            "sandboxes": [{"name": "hub-sb"}, {"name": "x-sb", "machine": "x", "root": "/x"}],
+            "services": [{"name": "x-svc", "machine": "x", "root": "/x"}],
+            "machines": [entry("x", None), entry("me", None), entry("y", Some("z"))],
+        })
+    }
+
+    #[test]
+    fn a_hubs_push_splits_into_its_own_rows_and_the_fleet_view() {
+        let mut params = hub_push();
+        let view = fleet_view(&mut params, Some("me"));
+        // The hub's own rows stay, as a plain root's would.
+        assert_eq!(names(&params, "instances"), ["hub-own@-"]);
+        assert_eq!(names(&params, "sandboxes"), ["hub-sb@-"]);
+        assert!(params.get("machines").is_none());
+        // The view: `x` only (not this host, not a second hop).
+        assert_eq!(names(&view, "instances"), ["xi@x"]);
+        assert_eq!(names(&view, "sandboxes"), ["x-sb@x"]);
+        assert_eq!(names(&view, "services"), ["x-svc@x"]);
+        assert_eq!(view["machines"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_lifts_the_hubs_view_and_a_direct_machine_wins() {
+        let local = serde_json::json!({"dir": "/here", "instances": [], "sandboxes": [], "services": []});
+        let mut params = hub_push();
+        let view = Arc::new(fleet_view(&mut params, Some("me")));
+        let mut k = machine("k", &["/k"], LinkState::Connected);
+        k.fleet = Some(Arc::clone(&view));
+        k.rows.insert("/k".into(), remote("/k", &[("hub-own", Some("/k"))]));
+
+        let merged = merge(&local, &[k.clone()], None);
+        assert_eq!(names(&merged, "instances"), ["hub-own@k", "xi@x"]);
+        assert_eq!(names(&merged, "sandboxes"), ["sb-k@k", "x-sb@x"]);
+        assert_eq!(merged["sandbox_count"], 2);
+        let x = &merged["machines"][1];
+        assert_eq!((&x["name"], &x["via"], &x["target"], &x["command"], &x["agent"]), (&"x".into(), &"k".into(), &Value::Null, &Value::Null, &false.into()));
+        assert_eq!((&x["state"], &x["version"]), (&"connected".into(), &"0.6.0".into()));
+        assert_eq!(merged["machines"][0]["via"], Value::Null);
+        crate::serve::dts::assert_matches("SnapshotMachine", x);
+        assert_eq!(via_of(&[k.clone()], "x").as_deref(), Some("k"));
+        assert_eq!(via_of(&[k.clone()], "k"), None, "a direct machine");
+        assert_eq!(via_of(&[k.clone()], "y"), None, "a second hop isn't kept");
+
+        // This host links to `x` too: its own entry and rows, nothing lifted.
+        let mut x = machine("x", &["/x"], LinkState::Connected);
+        x.rows.insert("/x".into(), remote("/x", &[("direct", Some("/x"))]));
+        let merged = merge(&local, &[k.clone(), x.clone()], None);
+        assert_eq!(names(&merged, "instances"), ["hub-own@k", "direct@x"]);
+        assert_eq!(merged["machines"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["machines"][1]["via"], Value::Null);
+        assert_eq!(via_of(&[k.clone(), x], "x"), None);
+
+        // The hub's link down: its view stays, with its state.
+        k.state = LinkState::Unreachable;
+        k.error = Some("k: ssh: no route".into());
+        let merged = merge(&local, &[k], None);
+        assert_eq!(names(&merged, "instances"), ["hub-own@k", "xi@x"]);
+        assert_eq!((&merged["machines"][1]["state"], &merged["machines"][1]["error"]), (&"unreachable".into(), &"through k: ssh: no route".into()));
+    }
+
+    /// A hub's push to member `m`'s federated watch: `m`'s rows and entry
+    /// left out, the other machines' kept.
+    #[test]
+    fn merge_leaves_the_asking_machine_out() {
+        let local = serde_json::json!({"dir": "/fleet/m", "instances": [{"name": "hub-own"}], "sandboxes": [], "services": []});
+        let mut m = machine("m", &["/m"], LinkState::Connected);
+        m.rows.insert("/m".into(), remote("/m", &[("mi", Some("/m"))]));
+        let mut x = machine("x", &["/x"], LinkState::Connected);
+        x.rows.insert("/x".into(), remote("/x", &[("xi", Some("/x"))]));
+        let merged = merge(&local, &[m.clone(), x.clone()], Some("m"));
+        assert_eq!(names(&merged, "instances"), ["hub-own@-", "xi@x"]);
+        let entries: Vec<_> = merged["machines"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(entries, ["x"]);
+    }
+
     #[test]
     fn the_first_roots_snapshot_missing_drops_its_unregistered_instances_for_now() {
         let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connecting);
         a.rows.insert("/r/two".into(), remote("/r/two", &[("in-one", Some("/r/one")), ("in-two", Some("/r/two")), ("old", None)]));
-        let merged = merge(&serde_json::json!({"instances": [], "sandboxes": [], "services": []}), &[a]);
+        let merged = merge(&serde_json::json!({"instances": [], "sandboxes": [], "services": []}), &[a], None);
         // `in-one` waits for its own root's snapshot; `old` for the first's.
         assert_eq!(names(&merged, "instances"), ["in-two@a"]);
     }

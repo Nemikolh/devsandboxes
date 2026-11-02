@@ -357,6 +357,14 @@ mod tests {
         let names: Vec<_> = c.iter().map(|c| (c.machine.to_string(), c.reachable)).collect();
         let want = [("this host", true), ("srv", true), ("lap", true), ("nb", true), ("off", false)];
         assert_eq!(names, want.map(|(n, r)| (n.to_string(), r)));
+
+        // A hub's view of its machines (on a member) adds no candidate:
+        // those are seen through it, view-only.
+        let mut hub = worker("k", MachineKind::Ssh, LinkState::Connected, None);
+        hub.fleet = Some(Arc::new(json!({"machines": [{"name": "x", "state": "connected"}], "instances": []})));
+        let seen = candidates(&spec("web", None), None, &[], std::slice::from_ref(&hub), &BTreeMap::new());
+        assert_eq!(seen.iter().map(|c| c.machine.to_string()).collect::<Vec<_>>(), ["this host", "k"]);
+        assert_eq!(reachable_workers(std::slice::from_ref(&hub)), ["k"]);
         assert_eq!(c[0].capacity.as_ref().map(|c| c.running), Some(2));
 
         // An inbound or ssh machine with more room wins over a busy host.

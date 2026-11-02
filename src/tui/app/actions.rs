@@ -102,6 +102,10 @@ impl App {
         let Some(m) = self.machines.get(self.selected()) else {
             return;
         };
+        if let Some(hub) = &m.via {
+            self.status = Some(crate::serve::snapshots::seen_via(&m.name, hub));
+            return;
+        }
         if m.kind == crate::serve::machines::MachineKind::Inbound {
             self.status = Some(format!(
                 "{}: inbound (it dialed this host): this host's agent never reaches it; set `agent` in its entry for this host there",
@@ -334,6 +338,13 @@ mod tests {
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(app.take_pending_machine_set(), None);
         assert!(app.status.as_deref().is_some_and(|s| s.starts_with("lap: inbound (it dialed this host)")), "{:?}", app.status);
+
+        // One seen through the hub: refused naming it.
+        let x = crate::serve::snapshots::SnapshotMachine { via: Some("k".into()), target: None, ..sm("x", LinkState::Connected) };
+        app.set_machines(vec![x]);
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_machine_set(), None);
+        assert!(app.status.as_deref().is_some_and(|s| s.starts_with("`x` is seen through the hub `k` only")), "{:?}", app.status);
     }
 
     #[test]

@@ -561,6 +561,22 @@ dialer then redials). A hub:
   and it pushes its dev build to a member that takes one.
 - **Places runs**: its `run` verb places a request that names no
   machine ([In the `run` verb](#in-the-run-verb)).
+- **Federates for its members**: a link peer's `instances.watch
+  {machines: true}` is served only here (`daemon::watch_root`; elsewhere
+  `denied`), under the trust table for that peer, merged with every
+  machine's rows but the asking peer's own (`snapshots::merge`'s
+  `except`, the peer's name). The hub watches its members plain, so no
+  rows go round in a cycle. A member watches its hub that way (the
+  hub's fleet root for it, with `machines: true`) while a local watcher
+  wants machines, and shows each machine the hub sees as one of its
+  own, `via` the hub, after the machines it links to itself (which win
+  over a same-named one via the hub); one hop, never itself
+  ([machines.md](machines.md#held-links-machines),
+  [federated snapshots](machines.md#federated-snapshots)). Those are
+  view-only (fleet plan decision 33): their rows and state show, while
+  a request naming one as `machine`, `machines.get`/`set`, a forward
+  into one, its terminals and the agent toggle are refused naming the
+  hub (`snapshots::seen_via`); placement never sees them.
 - **Saves the machines' rows**, `remotes.json` next to `state.toml`
   (`machines::saved::path`; `Options::remotes` in tests), so a restarted
   hub shows the fleet before its machines reconnect: restored at the
@@ -1051,7 +1067,8 @@ never hands the daemon off (below). Under **`worker`**:
   without `paths`: read-only; `machines.add` checks typed roots through
   it) and the verbs (`verbs::is_verb`) but `gc`. It refuses
   (`denied`) any request with a `machine` param or `machines: true`
-  (nothing federates past the member), `gc` (host maintenance: it reaps
+  (nothing federates past the member) but an `instances.watch`'s, which
+  the daemon serves on the hub only ([Hub mode](#hub-mode)), `gc` (host maintenance: it reaps
   services and the host's agent links, not one root's instances), and
   every other method:
   `machines.*`, `shutdown`, `helper.call`, `forwards.*`,
@@ -1088,7 +1105,10 @@ never hands the daemon off (below). Under **`worker`**:
   cut by `lent::filter_snapshot`: instance rows whose `root` the reach
   admits, their names alone in services' `used_by` and in
   `thread_children`, their ids alone in `isolated` services' `containers`
-  (whose names carry the instance id). `instances.resolve`'s matches are cut the same way
+  (whose names carry the instance id). Rows tagged `machine` (a hub's
+  federated push: other machines' rows, their `root` a path there) aren't
+  this host's and stay as they are, so is `machines`; the asking peer's
+  own were left out by the merge. `instances.resolve`'s matches are cut the same way
   (`lent::filter_answer`); none left is `not-found`. `containers.list` /
   `containers.stats` list the whole host's runtime, so their `rows` are
   cut (`lent::cut_containers`) to the lent instances' containers and the

@@ -340,7 +340,8 @@ struct GetParams {
     agent: Option<PathBuf>,
 }
 
-/// One machine (registered or inbound). `agent` is the caller's `SSH_AUTH_SOCK`
+/// One machine (registered or inbound; one seen only through this host's
+/// hub is `denied`, naming the hub). `agent` is the caller's `SSH_AUTH_SOCK`
 /// (absolute), reported to this daemon (`bridge::report_agent`), so the
 /// agent this host answers the machine's `AGENT` streams with
 /// (`bridge::host_agent`) is the caller's: what a CLI re-run over ssh on
@@ -351,10 +352,11 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
     {
         return Err(ApiError::invalid(format!("`agent` must be absolute, got `{}`", agent.display())));
     }
-    let entry = machines(ctx)?
-        .into_iter()
-        .find(|e| e.name == p.name)
-        .ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
+    // A machine seen through the hub is no entry: refused naming the hub.
+    let entry = machines(ctx)?.into_iter().find(|e| e.name == p.name).ok_or_else(|| match &ctx.links {
+        Some(links) => links.unknown(&p.name),
+        None => ApiError::not_found(format!("no machine named `{}`", p.name)),
+    })?;
     if let Some(agent) = p.agent {
         crate::devsbd::bridge::report_agent(agent);
     }
@@ -388,6 +390,9 @@ fn set(p: SetParams, ctx: &Ctx) -> Answer {
     let Some(changed) = changed.map_err(ApiError::internal)? else {
         if ctx.inbound.contains(&p.name) {
             return Err(inbound_agent(&p.name));
+        }
+        if let Some(links) = &ctx.links {
+            return Err(links.unknown(&p.name));
         }
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
     };

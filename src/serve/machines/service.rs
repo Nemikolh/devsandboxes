@@ -16,7 +16,11 @@
 //! hello, subscribes to `instances`, watches each of the machine's roots
 //! while a local connection watches with `machines: true`
 //! ([`Hooks::watching`]), and stores every pushed `instances.snapshot` in
-//! the shared [`Remotes`] ([`Hooks::changed`] then re-publishes). A carrier
+//! the shared [`Remotes`] ([`Hooks::changed`] then re-publishes). The link
+//! to this host's hub ([`Hooks::hub`]: another member) also watches the
+//! hub's fleet root for this host (its `roots.list`'s `fleet` row) with
+//! `machines: true`, the federated view, whose other machines are kept as
+//! the hub's `snapshots::Machine::fleet` (`snapshots::fleet_view`). A carrier
 //! that's down, a failed connect or a lost link is `unreachable` with the
 //! reason, rows kept; a failed connect or lost link over a live carrier is
 //! retried with a doubling backoff, a carrier coming back is dialed at
@@ -99,7 +103,7 @@ impl Default for Timing {
     }
 }
 
-/// What the service needs from the daemon. Both are called on link threads
+/// What the service needs from the daemon. All are called on link threads
 /// and must not block.
 pub struct Hooks {
     /// Whether any local connection watches a root with `machines: true`.
@@ -107,6 +111,19 @@ pub struct Hooks {
     /// A machine's rows or state changed: re-publish the federated
     /// snapshots.
     pub changed: Box<dyn Fn() + Send + Sync>,
+    /// This host's hub, when another member is (`member.toml`'s `hub`, as
+    /// the daemon keeps it): asked at each look at the watchers.
+    pub hub: Box<dyn Fn() -> Option<HubOf> + Send + Sync>,
+}
+
+/// This host as a member of a fleet whose hub is another member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubOf {
+    /// The hub's member name: the machine whose link watches with
+    /// `machines: true`.
+    pub hub: String,
+    /// This host's own member name: never taken from the hub's view.
+    pub me: String,
 }
 
 /// How an ssh machine's link is carried: hold `entry`'s peer link until it
@@ -570,13 +587,23 @@ impl Handle {
         &self.inner.remotes
     }
 
+    /// The error for `machine`, no machine here: `denied` naming the hub
+    /// when this host sees it through its hub's view (view-only, fleet plan
+    /// decision 33), else `not-found`.
+    pub fn unknown(&self, machine: &str) -> ApiError {
+        match self.inner.remotes.via(machine) {
+            Some(hub) => ApiError::denied(snapshots::seen_via(machine, &hub)),
+            None => ApiError::not_found(format!("no machine named `{machine}`")),
+        }
+    }
+
     /// Call `method` on machine `machine`'s daemon over its link: the
     /// remote's response as is (its error code kept), or `not-found` for a
     /// machine that isn't registered.
     pub fn forward(&self, machine: &str, method: &str, params: Value) -> Result<Response, ApiError> {
         let tx = match self.inner.lock_links().get(machine) {
             Some(l) => l.tx.clone(),
-            None => return Err(ApiError::not_found(format!("no machine named `{machine}`"))),
+            None => return Err(self.unknown(machine)),
         };
         let (reply, rx) = mpsc::channel();
         let stopping = || ApiError::internal(anyhow::anyhow!("{machine}: the link is stopping"));
@@ -832,7 +859,7 @@ impl<'a> LinkLoop<'a> {
         if let Err(why) = self.quick(link, "subscribe", json!({ "topics": ["instances"] })) {
             return End::Lost(why);
         }
-        let mut watching = false;
+        let mut watched = Watched::default();
         loop {
             if self.ctl.stopped() {
                 return End::Stopped;
@@ -850,13 +877,18 @@ impl<'a> LinkLoop<'a> {
                 }
             }
             // The remote polls its runtime for a watch: only while a local
-            // watcher wants machines.
-            let want_watch = (self.inner.hooks.watching)();
-            if want_watch != watching {
-                if let Err(why) = self.watch(link, want_watch) {
+            // watcher wants machines. This host's hub is watched federated
+            // too, for the machines it sees.
+            let roots = (self.inner.hooks.watching)();
+            let hub = (self.inner.hooks.hub)().filter(|h| h.hub == name);
+            if hub.is_none() {
+                self.drop_fleet();
+            }
+            let want = Want { roots, fleet: roots && hub.is_some() };
+            if want != watched.asked {
+                if let Err(why) = self.watch(link, &mut watched, want) {
                     return End::Lost(why);
                 }
-                watching = want_watch;
             }
             if let Some(call) = self.pending.pop_front() {
                 let answer = link.conn.call_within(&call.method, call.params, t.call);
@@ -876,7 +908,7 @@ impl<'a> LinkLoop<'a> {
                 continue;
             }
             match link.conn.next_notification(t.tick) {
-                Ok(Some(n)) if n.method == "instances.snapshot" => self.store(n.params),
+                Ok(Some(n)) if n.method == "instances.snapshot" => self.store(n.params, watched.fleet.as_deref()),
                 Ok(Some(n)) if n.method == "closing" => {
                     let reason = n.params.get("reason").and_then(Value::as_str).unwrap_or("closing");
                     return End::Lost(format!("{name}: its devsandbox serve is exiting ({reason})"));
@@ -887,25 +919,70 @@ impl<'a> LinkLoop<'a> {
         }
     }
 
-    /// `instances.watch` (`on`) or `.unwatch` each root. A root the remote
-    /// refuses (gone since `machine add`) is the machine's `error`, the
-    /// others still watched; a dead connection is lost.
-    fn watch(&self, link: &mut Link, on: bool) -> Result<(), String> {
-        let method = if on { "instances.watch" } else { "instances.unwatch" };
+    /// Go from what `watched` has to `want`: everything watched is
+    /// unwatched, then each root `instances.watch`ed plain and, for the
+    /// hub, its fleet root for this host (`roots.list`'s `fleet` row: there
+    /// even on a hub with no config root of its own) with `machines: true`.
+    /// A root the remote refuses (gone since `machine add`) is the
+    /// machine's `error`, the others still watched; a dead connection is
+    /// lost.
+    fn watch(&self, link: &mut Link, watched: &mut Watched, want: Want) -> Result<(), String> {
+        let name = &self.entry.name;
+        let t = self.inner.timing;
+        let call = |link: &mut Link, method: &str, params: Value| {
+            link.conn
+                .call_within(method, params, t.call)
+                .map_err(|e| format!("{name}: {e:#}"))?
+                .ok_or_else(|| format!("{name}: `{method}` timed out"))
+        };
+        if watched.asked.roots {
+            for root in &self.entry.roots {
+                call(link, "instances.unwatch", json!({ "dir": root }))?;
+            }
+        }
+        if let Some(dir) = watched.fleet.take() {
+            call(link, "instances.unwatch", json!({ "dir": dir }))?;
+        }
+        watched.asked = want;
         let mut refused = Vec::new();
-        for root in &self.entry.roots {
-            let r = link
-                .conn
-                .call_within(method, json!({ "dir": root }), self.inner.timing.call)
-                .map_err(|e| format!("{}: {e:#}", self.entry.name))?
-                .ok_or_else(|| format!("{}: `{method}` timed out", self.entry.name))?;
-            if let Some(e) = r.error {
-                refused.push(format!("{}: {}", root.display(), e.message));
+        if want.fleet {
+            let r = call(link, "roots.list", json!({}))?;
+            let rows: Option<Vec<crate::serve::api::RootCandidate>> = r.result.and_then(|v| serde_json::from_value(v).ok());
+            match rows.as_deref().and_then(crate::serve::fleet::placed::fleet_root) {
+                Some(dir) => {
+                    let r = call(link, "instances.watch", json!({ "dir": dir, "machines": true }))?;
+                    match r.error {
+                        Some(e) => refused.push(format!("the fleet through it: {}", e.message)),
+                        None => watched.fleet = Some(dir),
+                    }
+                }
+                None => refused.push("the fleet through it: it lists no fleet root for this host".to_string()),
+            }
+        }
+        if want.roots {
+            for root in &self.entry.roots {
+                // Watched federated already: its own rows come in that push.
+                if watched.fleet.as_ref() == Some(root) {
+                    continue;
+                }
+                let r = call(link, "instances.watch", json!({ "dir": root }))?;
+                if let Some(e) = r.error {
+                    refused.push(format!("{}: {}", root.display(), e.message));
+                }
             }
         }
         let error = (!refused.is_empty()).then(|| refused.join("; "));
         self.set(LinkState::Connected, error);
         Ok(())
+    }
+
+    /// This machine is no longer this host's hub: its fleet view goes.
+    fn drop_fleet(&self) {
+        let mut had = false;
+        self.inner.remotes.update(&self.entry.name, |m| had = m.fleet.take().is_some());
+        if had {
+            (self.inner.hooks.changed)();
+        }
     }
 
     /// A call of the link's own; an error answer or a lost connection is the
@@ -922,9 +999,21 @@ impl<'a> LinkLoop<'a> {
         }
     }
 
-    /// A pushed snapshot of one of the machine's roots: its rows now.
-    fn store(&self, mut params: Value) {
+    /// A pushed snapshot of one of the machine's roots: its rows now. The
+    /// push of `fleet` (the hub's fleet root, watched federated) is split:
+    /// the machines it sees are the hub's fleet view
+    /// (`snapshots::fleet_view`), the rest that root's own rows.
+    fn store(&self, mut params: Value, fleet: Option<&std::path::Path>) {
         let Some(dir) = params.get("dir").and_then(Value::as_str).map(PathBuf::from) else { return };
+        if fleet == Some(dir.as_path()) {
+            let me = (self.inner.hooks.hub)().map(|h| h.me);
+            let view = Arc::new(snapshots::fleet_view(&mut params, me.as_deref()));
+            self.inner.remotes.update(&self.entry.name, |m| m.fleet = Some(view));
+            if !self.entry.roots.contains(&dir) {
+                (self.inner.hooks.changed)();
+                return;
+            }
+        }
         if !self.entry.roots.contains(&dir) {
             return;
         }
@@ -939,6 +1028,25 @@ impl<'a> LinkLoop<'a> {
         self.inner.rows_changed();
         (self.inner.hooks.changed)();
     }
+}
+
+/// What a link wants watched on its machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Want {
+    /// Each of the machine's roots (a local watcher wants machines).
+    roots: bool,
+    /// The fleet through it (it's this host's hub, and `roots`).
+    fleet: bool,
+}
+
+/// What a link has watched on its machine.
+#[derive(Debug, Default)]
+struct Watched {
+    /// What it last asked for (a refused fleet watch isn't retried every
+    /// tick: only once the want changes, or on the next connect).
+    asked: Want,
+    /// The hub's fleet root for this host, watched with `machines: true`.
+    fleet: Option<PathBuf>,
 }
 
 /// Whether a link's `failed` goes to the log (`logged`: the last one that
@@ -1027,7 +1135,7 @@ mod tests {
     }
 
     fn no_hooks() -> Hooks {
-        Hooks { watching: Box::new(|| false), changed: Box::new(|| {}) }
+        Hooks { watching: Box::new(|| false), changed: Box::new(|| {}), hub: Box::new(|| None) }
     }
 
     fn counting_dial(dials: &Arc<AtomicUsize>) -> Dial {
@@ -1119,7 +1227,7 @@ mod tests {
         let changed = Arc::new(AtomicUsize::new(0));
         let hooks = {
             let c = Arc::clone(&changed);
-            Hooks { watching: Box::new(|| false), changed: Box::new(move || _ = c.fetch_add(1, Ordering::SeqCst)) }
+            Hooks { watching: Box::new(|| false), changed: Box::new(move || _ = c.fetch_add(1, Ordering::SeqCst)), hub: Box::new(|| None) }
         };
         let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
         let (up, runs) = (Arc::new(AtomicBool::new(false)), Arc::default());

@@ -322,7 +322,8 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
         Some(Response::err_with(id, "failed", message, Some(json!({ "exit": null, "instance": null }))))
     };
     let Some(entry) = ctx.entries.iter().find(|e| e.name == machine) else {
-        return Some(Response::err(id, "not-found", format!("no machine named `{machine}`")));
+        let e = ctx.links.unknown(machine);
+        return Some(Response::err(id, e.code, e.message));
     };
     match check_verb_params(&params) {
         Ok(Some(agent)) => crate::devsbd::bridge::report_agent(agent),

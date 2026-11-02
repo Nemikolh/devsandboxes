@@ -205,7 +205,7 @@ mod tests {
         let m = remotes.get("lap").unwrap();
         assert_eq!((m.state, m.restored, m.rows.keys().collect::<Vec<_>>()), (LinkState::Unreachable, true, vec![&PathBuf::from("/r")]));
         assert_eq!(m.error.as_deref(), Some("not reconnected since this daemon started (rows from Oct 27 12:00 UTC)"));
-        let merged = crate::serve::snapshots::merge(&json!({"instances": []}), &remotes.all());
+        let merged = crate::serve::snapshots::merge(&json!({"instances": []}), &remotes.all(), None);
         assert_eq!((&merged["instances"][0]["name"], &merged["instances"][0]["machine"]), (&json!("web-1"), &json!("lap")));
         assert_eq!((&merged["machines"][0]["state"], &merged["machines"][0]["runtime"]), (&json!("unreachable"), &json!("podman")));
         // Saving again keeps the rows' time and drops what the registry dropped.

@@ -123,8 +123,12 @@ pub type Exe<'a> = &'a dyn Fn() -> Result<String, String>;
 /// onto the machine's link (`machines::cli`: the instance's root resolved
 /// there with `instances.resolve`, then a `PTY` dial through
 /// `fleet::pty_client`), so the terminal goes through the machine's trust
-/// like any other use of it.
+/// like any other use of it. A machine seen only through the hub has no
+/// link here to dial: refused naming the hub (fleet plan decision 33).
 fn on_machine(m: &SnapshotMachine, flags: &[&str], name: &str, command: &[String], exe: Exe) -> Result<Vec<String>, String> {
+    if let Some(hub) = &m.via {
+        return Err(crate::serve::snapshots::seen_via(&m.name, hub));
+    }
     let mut args = vec![exe()?];
     args.extend(flags.iter().map(|s| s.to_string()));
     args.extend(["--".to_string(), qualify(Some(&m.name), name)]);
@@ -317,6 +321,7 @@ pub(crate) mod tests {
             command: None,
             agent: false,
             capacity: None,
+            via: None,
         }
     }
 
@@ -430,6 +435,12 @@ pub(crate) mod tests {
         }
         let no = || Err("no exe".to_string());
         assert_eq!(exec_argv(&ssh, "w", &[], &no), Err("no exe".into()));
+        // Seen through the hub: no tab, the hub named.
+        let via = SnapshotMachine { via: Some("k".into()), target: None, ..sm("x", LinkState::Connected) };
+        let refused = crate::serve::snapshots::seen_via("x", "k");
+        assert_eq!(exec_argv(&via, "w", &[], exe), Err(refused.clone()));
+        assert_eq!(session_exec_argv(&via, "w", id, exe), Err(refused.clone()));
+        assert_eq!(attach_argv(&via, "w", id, exe), Err(refused.clone()));
         // A service tab goes through the instance whose service it is.
         let iso = service_row("isolated", &["devsandbox-svc-p-a-db", "devsandbox-svc-p-b-db"], &["a", "b"]);
         for (m, b) in [(&ssh, "box/b"), (&lap, "lap/b")] {
