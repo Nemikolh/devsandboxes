@@ -563,8 +563,8 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
 
 ## `devsandbox machine add|ls|set|unlink|rm|trust|roots`
 
-A client of `machines.*` (and, for `trust` and `roots`, `member.*`) only,
-never in-process (`src/commands/machine.rs`).
+A client of `machines.*` (and, for `trust`, `roots` and `key`,
+`member.*`) only, never in-process (`src/commands/machine.rs`).
 
 `add` first checks the machine's devsandbox (`ensure_devsandbox`, over
 [Install](#install)): `install::check` through the login `PATH`, then
@@ -660,7 +660,11 @@ against the current directory), canonicalizes it and requires a directory
 (`existing_dir`), then `member.set {roots_add}`; `rm` resolves the same
 way without requiring it to exist and sends both the canonical form (when
 it exists) and the literal one as `member.set {roots_rm}`, so a removed
-directory can be dropped. Both print the roots after the change.
+directory can be dropped. Both print the roots after the change. So is
+`key` (`commands::machine::key`): `member.get`, printing `<name> <key>`
+(`-` for a host with no valid name) and the key's fingerprint on the next
+line (`key_text`); the key is made on that first ask
+([fleet.md](fleet.md#member-identity)).
 `--machine` and qualified names refuse `machine` as a whole
 (`serve::machines::cli::machine_use`).
 

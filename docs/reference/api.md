@@ -1185,8 +1185,8 @@ connection under either trust (*Remote callers*).
 
 | method | params | result | errors |
 |---|---|---|---|
-| `member.get` | `{}` | `{"name", "hub", "trust", "dev_builds", "roots"}` | `internal` (`member.toml` doesn't parse), `failed` (no data dir) |
-| `member.set` | `{"name"?, "hub"?, "trust"?, "roots_add"?, "roots_rm"?}`: each one given is changed | as `member.get`, after the change | `invalid` (an unknown param or `trust`, a bad `name` or `hub`, a relative root), `failed` (no data dir), `internal` (`member.toml` doesn't read or write) |
+| `member.get` | `{}` | `{"name", "hub", "trust", "dev_builds", "roots", "key", "fingerprint"}` | `internal` (`member.toml` doesn't parse; `member.key` can't be made, or is malformed or reachable by group or others), `failed` (no data dir) |
+| `member.set` | `{"name"?, "hub"?, "trust"?, "roots_add"?, "roots_rm"?}`: each one given is changed | as `member.get`, after the change | `invalid` (an unknown param or `trust`, a bad `name` or `hub`, a relative root), `failed` (no data dir), `internal` (`member.toml` doesn't read or write; `member.key` as `member.get`) |
 
 - `name`: the name this host goes by in the fleet: the one set, else the
   hostname's first label; `null` when neither is a valid machine name.
@@ -1205,6 +1205,11 @@ connection under either trust (*Remote callers*).
 - `roots`: config roots shown to the fleet besides those with instances
   here (absolute paths). `roots_add` adds each one not there yet,
   `roots_rm` drops each one named.
+- `key`: this member's public key, `ed25519:<64 lowercase hex>`, from
+  `member.key` next to `member.toml`, made on the first ask
+  ([fleet.md](../architecture/daemon/fleet.md#member-identity)).
+- `fingerprint`: the key's, `SHA256:` and 8 groups of 4 lowercase hex
+  digits joined by `-` (the first 16 bytes of the sha256 of the raw key).
 
 ### `capacity.get`
 

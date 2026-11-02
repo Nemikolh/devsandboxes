@@ -14,7 +14,8 @@ follows its hub's build, a published one downloaded, a dev one received
 over `TRANSFER`
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md));
 and the [member side](#member-side): `member.toml`, `member.*` with
-`devsandbox machine trust|roots`, the trust table and the worker policy
+`devsandbox machine trust|roots|key`, the [member
+identity](#member-identity) key, the trust table and the worker policy
 that every remote caller goes through.
 
 **How a machine joins** (decisions 28 and 30 of the plan): on a laptop
@@ -168,9 +169,12 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 (`hello_with`), `src/serve/endpoint.rs` (`peer_is_own_user`),
 `src/serve/daemon.rs` (`hello`); the member side:
 `src/serve/fleet/member.rs` (`Member`, `SoftCaps`, `load`, `check`,
-`update`, `default_name`, `check_member_name`, `merge`, `call`, `MemberInfo`),
-`src/serve/locked_file.rs` (`update`), `src/commands/machine.rs`
-(`trust`, `roots`, `record_roots`), `src/serve/fleet/lent.rs` (`Peer`,
+`update`, `default_name`, `check_member_name`, `merge`, `call`, `MemberInfo`,
+`key_path`), `src/serve/fleet/identity.rs` (`PublicKey`, `Signature`,
+`Signer`, `SigningKey`, `KeyStore`, `FileKeyStore`, `Statement`,
+`STATEMENT_DOMAIN`, `Seen`, `Accepted`, `Refusal`),
+`src/serve/locked_file.rs` (`update`, `lock_at`, `write_atomic_mode`),
+`src/commands/machine.rs` (`trust`, `roots`, `record_roots`, `key`), `src/serve/fleet/lent.rs` (`Peer`,
 `Channel`, `attach_params`, `peer_fleet_root`, `Files`, `Reach`,
 `own_roots`, `decide`, `admit`, `confine_path`, `lent_instances`,
 `filter_answer`, `filter_snapshot`, `cut_containers`),
@@ -921,6 +925,8 @@ there only through the trust table.
   `forwards.toml` are written with too); `dev-builds`, `[allow]` and
   `[caps]` are edited by hand (no call changes them) and read at each
   use.
+- **`member.key`** (next to `member.toml`, `member::key_path`) is this
+  member's private key ([Member identity](#member-identity)).
 - **A peer's fleet root** is `<data>/devsandbox/fleet/<peer>/`
   (`lent::peer_fleet_root`, `<peer>` the link peer's machine name),
   created when the peer's first stream is served. What the peer places
@@ -1078,7 +1084,10 @@ Wire: [`member.*`](../../reference/api.md#member).
 - **`member.get`** answers `MemberInfo`: the `name` this host goes by
   (`Member::name_or`: the file's, else the hostname's first label; `null`
   when neither is valid), `hub` (`self`, the hub's name, or `null` in no
-  fleet), `trust`, `dev_builds` as the file says, and `roots`.
+  fleet), `trust`, `dev_builds` as the file says, `roots`, and this
+  member's public `key` with its `fingerprint` ([Member
+  identity](#member-identity); the first ask makes the key). `member.set`
+  answers them too.
 - **`member.set {name?, hub?, trust?, roots_add?, roots_rm?}`** merges what's
   given into the file (`member::merge`, pure: `name` a
   `member::check_member_name`, `""` clears it; `hub` `self` or a
@@ -1091,6 +1100,56 @@ Wire: [`member.*`](../../reference/api.md#member).
   mode](#hub-mode)). `machine add` sets `hub` on the end that joins
   (on the machine over the add-time probe; on this host through
   `member::set` and `Shared::set_hub`, the same as a call's).
+
+### Member identity
+
+Each member holds an ed25519 key (`src/serve/fleet/identity.rs`): the
+key file, the public key's text form and fingerprint, domain-separated
+signatures, signed statements and the rollback rule.
+
+- **The key file**: `member.key` next to `member.toml`
+  (`member::key_path`), behind the `KeyStore` seam; `FileKeyStore` is
+  its file implementation. One line, `ed25519-seed:<64 lowercase hex>`
+  (the 32-byte seed), mode 0600. `KeyStore::signing_key` loads it, or
+  creates it when there's none: under the sibling `member.key.lock`
+  (`locked_file::lock_at`; its own lock, not `member.lock`, since a
+  `member.toml` write may load the key), the file is checked again, then
+  a new seed from the OS RNG (`SigningKey::generate`, `getrandom`) is
+  written to a temp file created 0600 and renamed
+  (`locked_file::write_atomic_mode`), so concurrent creators end with one
+  key. `FileKeyStore::load` refuses a file group or others can reach
+  (naming the path and `chmod 600`) and a malformed one (never echoing
+  its text); neither is replaced. `member.get` (and `member.set`) answer
+  its public half, making the key on the first ask; `devsandbox machine
+  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
+- **Public keys** (`PublicKey`): text form `ed25519:<64 lowercase hex>`
+  (`Display`, `FromStr`, serde as that string; parsing refuses uppercase
+  and bytes that aren't a curve point). The fingerprint
+  (`PublicKey::fingerprint`) is `SHA256:` and the first 16 bytes of the
+  sha256 of the raw 32 key bytes, in lowercase hex, in eight groups of
+  four joined by `-`: 128 bits, short enough to compare by eye.
+  Signatures (`Signature`) are 128 lowercase hex digits.
+- **Domain separation**: every signature is over `domain || 0x00 ||
+  message`, `domain` a constant per use (`Signer::sign(domain,
+  message)`, `PublicKey::verify(domain, message, sig)`, which verifies
+  strictly), so a signature made for one use never verifies as another.
+- **Statements** (`Statement {signer, key, kind, payload_sha256, version,
+  sig}`): `signer` says, with `key`, that the payload hashing to
+  `payload_sha256` is its `kind` at `version`. `Statement::sign` signs,
+  in `STATEMENT_DOMAIN` (`devsandbox/statement/v1`),
+  `Statement::signed_bytes`: each field in order, length-prefixed (u32
+  big-endian), the key and hash raw, the version a u64 big-endian; never
+  the serde output. `Statement::verify` checks the signature by `key`,
+  `Statement::verify_payload` also that a payload is the one hashed. On
+  the wire (serde) the hash is 64 lowercase hex digits, the key and
+  signature their text forms.
+- **The rollback rule** (`Seen::accept`, pure): per signer key (not
+  name) and `kind`, the highest version accepted and its payload hash. A
+  statement that doesn't verify is refused; a higher version is recorded
+  (`Accepted::Newer`); the same version with the same payload is
+  `Accepted::Again`; the same version with another payload
+  (`Refusal::Equivocation`) or a lower one (`Refusal::Rollback`) is
+  refused, and a refusal records nothing.
 
 ### Trust
 

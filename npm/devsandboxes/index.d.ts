@@ -973,6 +973,10 @@ export interface MemberInfo {
   dev_builds: boolean;
   /** Config roots shown to the fleet besides those with instances (absolute). */
   roots: string[];
+  /** This member's public key, `ed25519:<64 lowercase hex>` (made on first ask). */
+  key: string;
+  /** The key's fingerprint, `SHA256:` and 8 groups of 4 lowercase hex digits joined by `-`. */
+  fingerprint: string;
 }
 
 /** One process of an instance, as `ps` printed it. */

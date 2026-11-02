@@ -1,7 +1,9 @@
 //! `member.toml`, next to `state.toml`: this host as a fleet member
 //! (docs/architecture/daemon/fleet.md, *Member file*): the name it goes by,
 //! its fleet's hub, its trust, the config roots it shows the fleet, and the
-//! hand-edited `[allow]`, `[caps]` and `dev-builds`.
+//! hand-edited `[allow]`, `[caps]` and `dev-builds`. Next to it,
+//! `member.key` ([`key_path`]) is this member's private key
+//! (`fleet::identity::FileKeyStore`), whose public half `member.get` answers.
 //!
 //! Written by the daemon only (decision 3 of the fleet plan), through
 //! `member.set` ([`call`]; `devsandbox machine trust` and `machine roots`
@@ -19,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::serve::api::{ApiError, parse as parse_params};
+use crate::serve::fleet::identity::{FileKeyStore, KeyStore, PublicKey};
 use crate::serve::machines::check_name;
 pub use crate::worker_policy::{Allow, Trust};
 
@@ -177,6 +180,12 @@ pub fn path_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Res
     Ok(crate::daemon_config::data_dir_from(xdg_data_home, home)?.join("member.toml"))
 }
 
+/// `member.key` next to the `member.toml` at `member_toml`: this member's
+/// private key (`fleet::identity::FileKeyStore`).
+pub fn key_path(member_toml: &Path) -> PathBuf {
+    member_toml.with_file_name("member.key")
+}
+
 /// `text` as a [`Member`], [`check`]ed.
 pub fn parse(text: &str) -> Result<Member> {
     let member: Member = toml::from_str(text)?;
@@ -241,6 +250,11 @@ pub struct MemberInfo {
     /// `dev-builds` as the file says (`full` takes dev builds either way).
     pub dev_builds: bool,
     pub roots: Vec<PathBuf>,
+    /// This member's public key (`ed25519:<hex>`), from `member.key`,
+    /// created on first ask.
+    pub key: PublicKey,
+    /// [`PublicKey::fingerprint`] of `key`.
+    pub fingerprint: String,
 }
 
 /// `member.set`'s params: each one present is changed, the rest kept.
@@ -291,21 +305,26 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
     Ok(member)
 }
 
-fn info(member: &Member, hostname: &str) -> MemberInfo {
-    MemberInfo {
+/// The answer for `member`, its key loaded (or created) from `member.key`
+/// next to `path`.
+fn info(member: &Member, path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
+    let key = FileKeyStore::new(key_path(path)).public_key().map_err(ApiError::internal)?;
+    Ok(MemberInfo {
         name: member.name_or(hostname).ok(),
         hub: member.hub().field(),
         trust: member.trust,
         dev_builds: member.dev_builds,
         roots: member.roots.clone(),
-    }
+        fingerprint: key.fingerprint(),
+        key,
+    })
 }
 
 /// `member.get` over the file at `path`; `hostname` names this host when
-/// the file doesn't.
+/// the file doesn't. The first one creates `member.key`.
 pub fn get(path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
     let member = load(path).map_err(ApiError::internal)?.unwrap_or_default();
-    Ok(info(&member, hostname))
+    info(&member, path, hostname)
 }
 
 /// `member.set`: `p` merged into the file, checked, written. Nothing else
@@ -318,7 +337,7 @@ pub fn set(path: &Path, hostname: &str, p: &SetParams) -> Result<MemberInfo, Api
         Ok(cur.clone())
     })
     .map_err(ApiError::internal)??;
-    Ok(info(&after, hostname))
+    info(&after, path, hostname)
 }
 
 /// Run `method` if it's a `member.*` one; `None` otherwise.
@@ -344,6 +363,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::serve::fleet::identity::Signer as _;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dsv-member-{tag}-{}", std::process::id()));
@@ -462,7 +482,16 @@ mod tests {
     #[test]
     fn the_wire_matches_the_typings() {
         use crate::serve::dts::{assert_matches, prop_type, union_members};
-        let info = MemberInfo { name: Some("lap".into()), hub: Some("self".into()), trust: Trust::Full, dev_builds: true, roots: vec!["/srv/cfg".into()] };
+        let key = crate::serve::fleet::identity::SigningKey::from_seed([1; 32]).public_key();
+        let info = MemberInfo {
+            name: Some("lap".into()),
+            hub: Some("self".into()),
+            trust: Trust::Full,
+            dev_builds: true,
+            roots: vec!["/srv/cfg".into()],
+            fingerprint: key.fingerprint(),
+            key,
+        };
         assert_matches("MemberInfo", &serde_json::to_value(&info).unwrap());
         assert_matches("MemberInfo", &serde_json::to_value(MemberInfo { hub: None, ..info }).unwrap());
         assert_eq!(union_members("MemberTrust"), ["'worker'", "'full'"]);
@@ -476,12 +505,20 @@ mod tests {
         let path = dir.join("member.toml");
         let host = "lap.local";
         let call = |method: &str, params: Value| super::call(method, params, &path, host);
-        let got = call("member.get", Value::Null);
-        assert_eq!(got.unwrap().unwrap(), json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": []}));
-        assert!(!path.exists(), "a get writes nothing");
+        let mut got = call("member.get", Value::Null).unwrap().unwrap();
+        assert!(!path.exists(), "a get writes no member.toml");
+        // The first get makes the key; every answer says the same one.
+        let key = FileKeyStore::new(key_path(&path)).public_key().unwrap();
+        assert_eq!(key_path(&path), dir.join("member.key"));
+        let key_fields = json!({"key": key.to_string(), "fingerprint": key.fingerprint()});
+        for f in ["key", "fingerprint"] {
+            assert_eq!(got.as_object_mut().unwrap().remove(f).unwrap(), key_fields[f], "{f}");
+        }
+        assert_eq!(got, json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": []}));
 
-        let set = call("member.set", json!({"trust": "full", "roots_add": ["/srv/cfg"]}));
-        assert_eq!(set.unwrap().unwrap(), json!({"name": "lap", "hub": null, "trust": "full", "dev_builds": false, "roots": ["/srv/cfg"]}));
+        let set = call("member.set", json!({"trust": "full", "roots_add": ["/srv/cfg"]})).unwrap().unwrap();
+        assert_eq!((&set["key"], &set["fingerprint"]), (&key_fields["key"], &key_fields["fingerprint"]));
+        assert_eq!((&set["trust"], &set["roots"]), (&json!("full"), &json!(["/srv/cfg"])));
         assert_eq!(load(&path).unwrap().unwrap().trust, Trust::Full, "written");
         assert!(dir.join("member.lock").exists(), "written through locked_file");
 

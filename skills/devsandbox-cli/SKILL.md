@@ -227,6 +227,7 @@ devsandbox machine unlink box                  # drop this host's link only (it 
 devsandbox machine rm box                      # take it out of the fleet (this host's own name: leave)
 devsandbox machine trust [worker|full]         # this host's fleet trust (show / set)
 devsandbox machine roots [add|rm <path>…]      # this host's picked roots (add records them on the machine)
+devsandbox machine key                         # this host's member key (ed25519:<hex>) and its fingerprint
 ```
 
 - `add` without `--config` offers the machine's known config roots (a

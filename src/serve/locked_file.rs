@@ -2,7 +2,9 @@
 //! `forwards.toml`, `member.toml`): two daemons can briefly overlap during a
 //! handoff, so every write is a read-modify-write under an exclusive lock on
 //! the sibling `<stem>.lock` (separate from the file, which the write
-//! replaces), written to a temp file and renamed.
+//! replaces), written to a temp file and renamed. `member.key` is created
+//! once with the same pieces ([`lock_at`], [`write_atomic_mode`]; see
+//! `fleet::identity::FileKeyStore`).
 
 use std::fs::File;
 use std::path::Path;
@@ -33,13 +35,18 @@ pub fn update<V: Clone + PartialEq, T>(
 
 /// `<stem>.lock` next to `path`, locked exclusively until dropped.
 fn lock(path: &Path) -> Result<File> {
-    let lock_path = path.with_extension("lock");
+    lock_at(&path.with_extension("lock"))
+}
+
+/// The lock file `lock_path` (created if missing), locked exclusively until
+/// dropped. An `flock`: two opens in one process exclude each other too.
+pub fn lock_at(lock_path: &Path) -> Result<File> {
     let file = File::options()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)
+        .open(lock_path)
         .with_context(|| format!("cannot open {}", lock_path.display()))?;
     file.lock().with_context(|| format!("cannot lock {}", lock_path.display()))?;
     Ok(file)
@@ -48,10 +55,37 @@ fn lock(path: &Path) -> Result<File> {
 /// Temp file + rename; the pid in the temp name keeps a killed writer's stale
 /// temp from being reused by the other daemon.
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let name = path.file_name().context("no file name")?.to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let tmp = tmp_path(path)?;
     std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// [`write_atomic`] with the temp file created fresh with `mode`, so the
+/// file is never there with wider permissions (a stale temp is removed
+/// first: its mode could be anything). The caller holds the lock.
+pub fn write_atomic_mode(path: &Path, text: &str, mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = tmp_path(path)?;
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).with_context(|| format!("cannot remove {}", tmp.display())),
+        _ => {}
+    }
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("cannot create {}", tmp.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))
+}
+
+fn tmp_path(path: &Path) -> Result<std::path::PathBuf> {
+    let name = path.file_name().context("no file name")?.to_string_lossy();
+    Ok(path.with_file_name(format!(".{name}.{}.tmp", std::process::id())))
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
-//! `devsandbox machine add|ls|set|unlink|rm|trust|roots`
+//! `devsandbox machine add|ls|set|unlink|rm|trust|roots|key`
 //! (docs/architecture/daemon/machines.md, *`devsandbox machine
 //! add|ls|set|unlink|rm|trust|roots`*): a client of the daemon's `machines.*`,
 //! never in-process, since the registry and the links are the daemon's.
-//! `machine trust` and `machine roots` are likewise clients of `member.*`
+//! `machine trust`, `machine roots` and `machine key` are likewise clients of `member.*`
 //! (this host's `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
 //!
 //! `add` without `--config` probes the machine for its candidate roots and
@@ -316,6 +316,20 @@ pub fn trust(to: Option<Trust>) -> Result<()> {
     };
     println!("{}", trust_line(info.trust));
     Ok(())
+}
+
+/// `machine key`: this host's member key (`member.get`'s `key`, created
+/// there on first ask) and its fingerprint.
+pub fn key() -> Result<()> {
+    let mut conn = connect()?;
+    let info: MemberInfo = call(&mut conn, "member.get", Value::Null)?;
+    print!("{}", key_text(&info));
+    Ok(())
+}
+
+/// `<name> <key>`, then the fingerprint; `-` for a host with no valid name.
+fn key_text(info: &MemberInfo) -> String {
+    format!("{} {}\n{}\n", info.name.as_deref().unwrap_or("-"), info.key, info.fingerprint)
 }
 
 /// What `machine roots` does.
@@ -836,6 +850,23 @@ mod tests {
         }
         assert_eq!(trust_line(Trust::Worker), "trust: worker");
         assert!(trust_line(Trust::Full).contains("whole API"));
+    }
+
+    #[test]
+    fn key_prints_name_key_and_fingerprint() {
+        use crate::serve::fleet::identity::{Signer as _, SigningKey};
+        let key = SigningKey::from_seed([2; 32]).public_key();
+        let info = MemberInfo {
+            name: Some("lap".into()),
+            hub: None,
+            trust: Trust::Worker,
+            dev_builds: false,
+            roots: Vec::new(),
+            fingerprint: key.fingerprint(),
+            key,
+        };
+        assert_eq!(key_text(&info), format!("lap {key}\n{}\n", key.fingerprint()));
+        assert!(key_text(&MemberInfo { name: None, ..info }).starts_with("- ed25519:"));
     }
 
     #[test]

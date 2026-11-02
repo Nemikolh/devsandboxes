@@ -507,6 +507,14 @@ enum MachineCommand {
         #[command(subcommand)]
         cmd: Option<RootsCommand>,
     },
+    /// Show this host's member key and its fingerprint
+    ///
+    /// Prints `<name> ed25519:<hex>`, then the fingerprint to compare with
+    /// what another machine shows for this one. The key (`member.key`, next
+    /// to `member.toml`) is made on first use.
+    ///
+    ///     devsandbox machine key
+    Key,
 }
 
 #[cfg(unix)]
@@ -841,6 +849,7 @@ fn main() -> Result<()> {
             MachineCommand::Unlink { name } => commands::machine::unlink(&name),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
             MachineCommand::Trust { trust } => commands::machine::trust(trust),
+            MachineCommand::Key => commands::machine::key(),
             MachineCommand::Roots { cmd } => commands::machine::roots(match cmd {
                 None => commands::machine::RootsOp::Show,
                 Some(RootsCommand::Add { paths }) => commands::machine::RootsOp::Add(paths),

@@ -13,6 +13,9 @@
 //!   `fleet-<name>.sock`.
 //! - `member`: `member.toml` (this host's name, trust, roots, `[allow]`,
 //!   `[caps]`, `dev-builds`) and `member.get` / `member.set`.
+//! - `identity`: this member's key (`member.key`, behind a `KeyStore`),
+//!   public keys' text form and fingerprint, domain-separated signatures,
+//!   signed statements and the rollback check.
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an
@@ -41,6 +44,7 @@ pub mod agent;
 pub mod code;
 pub mod dialer;
 pub mod follow;
+pub mod identity;
 pub mod lent;
 pub mod link;
 pub mod member;
