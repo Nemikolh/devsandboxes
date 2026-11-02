@@ -34,7 +34,7 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 9 on. Steps 1-8 shipped: one kind of
+  re-placement: from fleet step 10 on. Steps 1-9 shipped: one kind of
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
@@ -48,8 +48,7 @@ limitation means editing this file in the same commit.
   out of the fleet on the hub (a member's is sent there), `machine rm
   <this host>` leaves, `machine unlink <m>` only drops this host's link
   (step 9d). A member's `run` is placed by the hub (step 9e,
-  `fleet.place`). Step 9 is complete pending its docs close (9f); next:
-  routing over the graph (step 10).
+  `fleet.place`). Next: routing over the graph (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)

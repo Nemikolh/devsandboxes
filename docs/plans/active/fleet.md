@@ -1,15 +1,18 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-8 shipped
+Status: in progress. Steps 1-9 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)):
 steps 1-6 on two kinds of machine (ssh machines and lending workers),
 steps 7-8 down to one: every machine one peer link per pair, reached
-only over its channels, a laptop joining with `machine add <hub>`.
-Steps 9-10 (membership, routing) finish the model below (ADR
+only over its channels, a laptop joining with `machine add <hub>`;
+step 9 made it a fleet: the hub in `member.toml`, `machine add`'s join
+rule, `machine unlink|rm`, every member seeing the fleet through the
+hub and its runs placed there. Step 10 (routing) finishes the model
+below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
-proposed); step 9 is in progress (9a-9f). The rest is design. Builds on
+proposed). The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
 [machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
 its parked auto-update and PTY attach into steps 2 and 4.
@@ -504,6 +507,23 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
      `unlink`; `rm` per decision 32; `rm` of this host leaves.
    - **9e A member's `run` placed by the hub** (decision 31).
    - **9f Docs close.**
+
+   As built: the daemon keeps `hub` in memory (`Shared::hub`, read at
+   start, set by `member.set`); a change cycles the links it holds
+   (`service::Handle::cycle`) and sends `links.cycle` to each
+   `fleet-link` it's dialed on. The hello is `<build> <hub|member>
+   <hub name|->` (`update::same_fleet`). `machine add` pins both
+   joiners' member names and reserves `self`; `--name` renames the
+   target only while it joins. A member watches the hub's fleet root
+   for it with `machines: true` (a peer's federated watch is served on
+   the hub only); machines seen that way are `via` the hub, one hop,
+   and the federated `instances.resolve` / `sandboxes.list` don't ask
+   them. `machine unlink` is the old `rm`; `machine rm` runs
+   `fleet.leave` / `fleet.forget` from the hub (`machines::leave`,
+   admitted by `lent::admit_fleet`), a member's sent there as
+   `fleet.rm`; the links a call ends go after its answer is written.
+   `fleet.place` answers `{on: requester|hub|machine, machine,
+   lines}`; a member asks it on every unpinned `run`.
 10. **Routing over the graph** (M–L). Members report their links and the
     hub publishes the graph; routed streams are spliced hop by hop toward
     a destination (an `Open` naming it); requesters try paths in order
