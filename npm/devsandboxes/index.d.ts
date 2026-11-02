@@ -871,6 +871,35 @@ export interface FleetRemoved {
   missed: FleetMissed[];
 }
 
+/** What a member's `fleet.place` names of the sandbox it runs. */
+export interface FleetPlaceSpec {
+  sandbox: string;
+  /** The sandbox's config hash as the member's snapshot has it; `null` unknown (no image locality). */
+  config_hash: string | null;
+  build_hash: string | null;
+}
+
+/** `fleet.place`'s params: a member's run, for the hub to place. */
+export interface FleetPlaceParams {
+  spec: FleetPlaceSpec;
+  /** The member's own capacity now. */
+  capacity: Capacity;
+  /** The machines the member has a connected direct link to, its hub among them: the only other candidates. */
+  reachable: string[];
+}
+
+/** Where the hub placed a member's run: the member that asked, the hub, or another machine. */
+export type FleetPlaceOn = 'requester' | 'hub' | 'machine';
+
+/** `fleet.place`'s answer. */
+export interface FleetPlaced {
+  on: FleetPlaceOn;
+  /** The machine, by the hub's name for it (the hub's own member name for `hub`). */
+  machine: string;
+  /** What the run's output starts with: `placed on <machine> (<reasons>)`, then `warning: … over cap: …` lines. */
+  lines: string[];
+}
+
 /** `machines.rm`: the hub took the machine out of the fleet. */
 export interface MachineRmRemoved extends FleetRemoved {
   type: 'removed';
@@ -1398,6 +1427,11 @@ export interface ApiMethods {
   'machines.rm': { params: { name: string }; result: MachineRmResult };
   /** On the hub, from one of its machines: `machines.rm` sent from a member. Never from a local client. */
   'fleet.rm': { params: { name: string }; result: FleetRemoved };
+  /**
+   * On the hub, from one of its machines: where that member's `run` goes, among itself, the hub and the hub's
+   * connected machines in `reachable`. Never from a local client.
+   */
+  'fleet.place': { params: FleetPlaceParams; result: FleetPlaced };
   /** From this host's hub only: clear `hub` and drop every registry entry; the links end once answered. */
   'fleet.leave': { params: {}; result: OkResult };
   /** From this host's hub only: drop the entry for `name`, or end its inbound link. */

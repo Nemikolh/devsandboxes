@@ -141,8 +141,9 @@ caller has the API a local client has.
 
 `fleet.*` goes by who the caller is under either trust, never by the
 table (*`fleet.*`*): `fleet.leave` and `fleet.forget` only from the peer
-this host's `hub` names, `fleet.rm` only on the hub and from one of its
-machines; anything else, a local client included, is `denied`.
+this host's `hub` names, `fleet.rm` and `fleet.place` only on the hub
+and from one of its machines; anything else, a local client included,
+is `denied`.
 
 ### `link.attach`
 
@@ -926,7 +927,11 @@ again on the daemon's host instead of read from its cache
 
 **Placement** (`run` without `machine`): on a fleet hub with a machine
 connected, `run` goes where placement scores best, this host or a machine
-([fleet](../architecture/daemon/fleet.md#placement)). Placed on a machine,
+([fleet](../architecture/daemon/fleet.md#placement)). On a member the
+hub places it (`fleet.place`) among the member, the hub and the
+machines both link to; with no answer from the hub it runs here, its
+output starting ``note: the hub `<hub>` is unreachable (<why>): running
+here`` ([fleet](../architecture/daemon/fleet.md#a-members-run)). Placed on a machine,
 the sandbox's config root and folders move there first, then the request
 is forwarded as with `machine`, in the worker's copy of the root; its
 output starts with a `stderr` line `placed on <worker> (<reasons>)` (and
@@ -1153,13 +1158,16 @@ there.
 ### `fleet.*`
 
 A removal from the fleet ([fleet](../architecture/daemon/fleet.md), *How
-a machine leaves*), sent between members over their links. Admitted by
+a machine leaves*) and a member's `run` placed by the hub
+([fleet](../architecture/daemon/fleet.md#a-members-run)), sent between
+members over their links. Admitted by
 who the caller is, not by trust (`lent::admit_fleet`, *Remote callers*);
 a local client is `denied` (it uses `machines.rm` / `machines.unlink`).
 
 | method | from | params | result | errors |
 |---|---|---|---|---|
 | `fleet.rm` | one of the hub's machines, to the hub | `{"name"}` | `{"name", "hub", "leave", "error", "forgot", "missed"}`: `leave` `told` (`name` answered `fleet.leave`), `leaving` (`name` asked: it leaves on its own), `unreachable` (`error` says why); `forgot` the other machines of the hub that answered `fleet.forget`, `missed` `[{"name", "error"}]` those it couldn't reach (not connected, or an error answer). `name` is unlinked on the hub | `denied` (not the hub, not one of its machines, `name` the hub), `not-found` (not one of the hub's machines), `internal` |
+| `fleet.place` | one of the hub's machines, to the hub | `{"spec": {"sandbox", "config_hash", "build_hash"}, "capacity", "reachable"}`: the member's spec, its capacity now (as `capacity.get` answers it), the machines it has a connected direct link to | `{"on", "machine", "lines"}`: `on` `requester` (the member), `hub` or `machine`, among the member, the hub and the hub's connected machines in `reachable`; `machine` the hub's name for it (its own member name for `hub`); `lines` what the run's output starts with (`placed on <machine> (<reasons>)`, `warning: <machine>: over cap: …`) | `denied` (not the hub, not one of its machines), `invalid`, `failed` (the hub has no member name), `internal` |
 | `fleet.leave` | this host's hub | `{}` | `{"ok": true}`: `hub` cleared and every registry entry dropped; the links end once the answer is out | `denied` (not from this host's hub), `internal` |
 | `fleet.forget` | this host's hub | `{"name"}` | `{"ok": true}`: the registry entry for `name` dropped, if any, and `name`'s inbound link ended, if it has one (`links.cycle {"why"}` on its `fleet-link`) | `denied` (not from this host's hub), `invalid` (`name` is this host or the hub), `internal` |
 

@@ -656,7 +656,7 @@ and 20 as step 9 does, 21 as step 10 does.
     it reaches), the hub answers a machine with its fleet-wide view,
     and the member moves the code and forwards over its own links. Until
     step 10 the candidates are the machines the member links to
-    directly. With the hub unreachable the member places locally, with a
+    directly. With the hub unreachable the member runs here, with a
     note.
 32. `machine rm <m>` runs on the hub (a member's is sent there as
     `fleet.rm`): the hub sends `fleet.leave` to `m` (it clears `hub` and

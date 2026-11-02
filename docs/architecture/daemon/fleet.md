@@ -729,7 +729,9 @@ daemon). `place::place` is pure over a `Spec` (the sandbox, its
 and the `Candidate`s, each a `MachineRef` (this host or a machine name)
 with `reachable`, its `Capacity` (or none yet), `has_image` and
 `has_repo`. It answers a `Placement` (the machine, `warnings`, the
-`score` and its `reasons` as text) or a `NoPlace`.
+`score` and its `reasons` as text) or a `NoPlace`. It runs on the hub,
+for the hub's own runs and, through `fleet.place`, for its members'
+([A member's run](#a-members-run)).
 
 - **A pin wins** (`Spec::pinned`: `--machine m` or a qualified name).
   It is refused only when the machine isn't a candidate
@@ -768,7 +770,8 @@ which repos a host has, so `has_repo` is the caller's to fill.
 
 A hub's (`member.toml`'s `hub = "self"`) `run` verb places a request that names no
 `machine` and isn't `here` (`daemon.rs` `placed_run`, the decisions pure
-in `fleet::placed`); any other host runs it here. The candidates are
+in `fleet::placed`); a member's asks the hub ([A member's run](#a-members-run));
+a host in no fleet runs it here. On the hub the candidates are
 this host and every machine, ssh or inbound (`placed::workers`:
 placement candidates are every neighbor), the ones whose link is up
 taking new work; code moves over the machine's link into this host's
@@ -829,6 +832,48 @@ of it; the CLI then resolves the sandbox among this host's only
 (`verbs_client::run_target`) and refuses a qualified one, and `--here`
 with `--machine` is refused (`machines::cli::plan`). The dashboard's `run`
 is the same verb request, so it is placed too.
+
+### A member's run
+
+On a member (`hub = "<name>"`) the hub decides where a `run` goes
+(fleet plan decision 31), and the member moves the code and forwards
+over its own links (`daemon.rs` `placed_run`, `placed::by_hub`):
+
+- **The ask** (`daemon.rs` `ask_hub`): `fleet.place` to the hub over a
+  fresh `API` stream of its link (dial and hello bounded by
+  `CAPACITY_WAIT`, the answer by `placed::PLACE_WAIT`, 6 s), with
+  `placed::PlaceParams`: the spec as `placed::spec` built it here (the
+  sandbox and its hashes), this host's capacity now (`Shared::capacity`)
+  and `reachable`, the machines this host has a connected direct link to
+  (`placed::reachable_workers`), the hub among them. Machines seen only
+  through the hub (`via`) are never among them.
+- **The hub's answer** (`daemon.rs` `fleet_place`, admitted by
+  `lent::admit_fleet` only on the hub and from one of its machines):
+  `placed::for_member` scores with `place::place` over the requester
+  (the capacity it sent, its image as the hub's view of its rows shows,
+  `REQUESTER`'s bias as the spec's requester), the hub itself
+  (`Shared::capacity`, its watched roots) and each of its own connected
+  machines named in `reachable` but the requester
+  (`placed::member_workers`), each with a fresh `capacity.get`
+  (`fresh_capacities`). Every candidate goes by the hub's name for it,
+  the hub by its member name. It answers a `placed::PlaceAnswer`: `on`
+  (`requester`, `hub` or `machine`), `machine`, and the `placed::lines`
+  the run's output starts with.
+- **The requester**: the run is local, the hub's lines first in its
+  output (`Placed::Here`).
+- **The hub or another machine this host links to**: `placed::moved`,
+  the hub's own path for a worker: `daemon.rs` `move_code` moves the code
+  into this host's fleet root there, then the run is forwarded
+  (`placed::forwarded`, `remote_verb`), its output starting with the hub's
+  lines. A sandbox that can't move runs here with `note: not placed on
+  <worker>: …`.
+- **No answer**: the hub's link isn't up, the dial, hello or call fails,
+  or no answer within `PLACE_WAIT`: the run is local, its output starting
+  ``note: the hub `<hub>` is unreachable (<why>): running here``. An
+  error answer: ``note: the hub `<hub>` didn't place it (<why>): running
+  here``. A machine this host has no link to: ``note: the hub `<hub>`
+  placed it on <machine>, which this host has no link to: running
+  here``.
 
 ## Member side
 

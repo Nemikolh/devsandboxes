@@ -1642,8 +1642,9 @@ const AFTER_ANSWER: Duration = Duration::from_millis(300);
 
 /// `fleet.*` (docs/reference/api.md, *fleet*): admitted by who the peer is
 /// (`lent::admit_fleet`: this host's hub, its machines), never from a
-/// local client, then run by `machines::leave::fleet_call`; what it ends
-/// of the links waits for the answer ([`ConnState::after`]).
+/// local client, then run by `machines::leave::fleet_call` (`fleet.place`
+/// by [`fleet_place`]); what it ends of the links waits for the answer
+/// ([`ConnState::after`]).
 fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
     let from = match &conn.table {
         Table::Peer(peer) => Some(peer.name.clone()),
@@ -1662,12 +1663,41 @@ fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
         return Response::err(req.id, "failed", "this daemon has no machines registry");
     };
     log(&format!("{}: {} from {from}", conn.label(), req.method));
+    if req.method == "fleet.place" {
+        return match fleet_place(req.params, &from, shared) {
+            Ok(result) => Response::ok(req.id, result),
+            Err(e) => Response::err(req.id, e.code, e.message),
+        };
+    }
     let (answer, after) = machines::leave::fleet_call(&req.method, req.params, &from, ctx);
     conn.after = after;
     match answer {
         Ok(result) => Response::ok(req.id, result),
         Err(e) => Response::err(req.id, e.code, e.message),
     }
+}
+
+/// `fleet.place` on the hub, from member `from` (fleet plan decision 31):
+/// where its run goes, by `placed::for_member` over this host (its
+/// capacity now, its watched roots), the member's own report, and this
+/// host's connected machines the member links to directly, each asked a
+/// fresh `capacity.get` as the hub's own placement does.
+fn fleet_place(params: Value, from: &str, shared: &Shared) -> Result<Value, api::ApiError> {
+    use fleet::placed;
+    let ask: placed::PlaceParams = api::parse(params)?;
+    let hub = shared
+        .member
+        .as_deref()
+        .and_then(|p| fleet::dialer::member_name(p, &shared.hostname).ok())
+        .ok_or_else(|| api::ApiError::failed("this hub has no member name"))?;
+    let machines = shared.remotes();
+    let entries = shared.links().map(|l| l.entries()).unwrap_or_default();
+    let fresh = fresh_capacities(shared, &entries, &placed::member_workers(&ask, from, &machines));
+    let local_roots: Vec<Arc<Value>> = shared.locals.lock().unwrap().values().cloned().collect();
+    let answer = placed::for_member(&ask, from, &hub, shared.capacity(), &local_roots, &machines, &fresh)
+        .map_err(|e| api::ApiError::failed(e.to_string()))?;
+    log(&format!("fleet.place from {from}: {} on {}", ask.spec.sandbox, answer.machine));
+    serde_json::to_value(answer).map_err(|e| api::ApiError::internal(e.into()))
 }
 
 #[derive(serde::Deserialize)]
@@ -1938,26 +1968,29 @@ fn remote_verb(
 /// *Placement*; `fleet::placed`): `None` when it runs here (a note, if
 /// any, already in its output), else the answer of the run forwarded to
 /// the worker it was placed on, in the worker's copy of the config root,
-/// or the failure to move the code there. Placement runs only on a hub
-/// (`member.toml`'s `hub = "self"`, [`Shared::is_hub`]) and only looks further than this host when some
-/// machine's link is up (`placed::worth_placing`: any kind). Moving the
+/// or the failure to move the code there. On the hub (`member.toml`'s
+/// `hub = "self"`, [`Shared::is_hub`]) this host places it, looking
+/// further than itself only when some machine's link is up
+/// (`placed::worth_placing`: any kind); on a member the hub does
+/// (`fleet.place`, [`ask_hub`]), and the code moves over this host's own
+/// links either way ([`move_code`]); in no fleet it runs here. Moving the
 /// code (a fetch of each folder's origin, the transfers) runs on this
 /// connection's thread before anything is forwarded; a hang-up meanwhile
 /// is seen once the forward starts.
 fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState) -> Option<Option<Response>> {
+    use fleet::member::Hub;
     use fleet::placed::{self, Placed};
     let str_of = |k: &str| params.get(k).and_then(Value::as_str);
     if params.get("here").and_then(Value::as_bool) == Some(true) {
         return None;
     }
-    // Placement runs on the hub (fleet plan *Placement*): elsewhere a `run`
-    // stays here until step 9 sends it to the hub.
-    if !shared.is_hub() {
+    let hub = lock_hub(&shared.hub).clone();
+    if hub == Hub::None {
         return None;
     }
     let sandbox = str_of("sandbox")?;
     let machines = shared.remotes();
-    if !placed::worth_placing(&machines) {
+    if hub.is_this() && !placed::worth_placing(&machines) {
         return None;
     }
     // A bad `root` is the local parse's to refuse.
@@ -1969,23 +2002,20 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     let spec = placed::spec(sandbox, locals.iter().find(|(d, _)| *d == root).map(|(_, v)| v.as_ref()));
     let local_roots: Vec<Arc<Value>> = locals.into_iter().map(|(_, v)| v).collect();
     let entries = shared.links().map(|l| l.entries()).unwrap_or_default();
-    let fresh = fresh_capacities(shared, &entries, &placed::reachable_workers(&machines));
-    let candidates = placed::candidates(&spec, Some(shared.capacity()), &local_roots, &machines, &fresh);
     let ask = placed::Ask { here: false, branch: str_of("branch"), base: str_of("base") };
-    let decided = placed::decide(&ask, &spec, &candidates, |worker| {
-        use fleet::code::{self, LinkTransfer, Unprepared};
-        let Some(entry) = entries.iter().find(|e| e.name == worker) else {
-            return Err(Unprepared::NotMovable("it's no longer a machine here".into()));
-        };
-        // The machine says where this host's fleet root is, over the link.
-        let worker_root = fleet_root_on(shared, entry).map_err(Unprepared::NotMovable)?;
-        let repos = match &shared.repos {
-            Some(repos) => repos.clone(),
-            None => code::repos_dir()?,
-        };
-        let t = LinkTransfer::for_worker(&shared.socket_dir, worker);
-        code::prepare(&t, &repos, &worker_root, &root, sandbox, ask.branch)
-    });
+    let prepare = |worker: &str| move_code(shared, &entries, worker, &root, sandbox, ask.branch);
+    let decided = match &hub {
+        Hub::Other(k) => {
+            let reachable = placed::reachable_workers(&machines);
+            let answer = ask_hub(shared, &entries, &machines, k, &placed::PlaceParams::of(&spec, shared.capacity(), reachable.clone()));
+            placed::by_hub(&ask, k, answer, &reachable, prepare)
+        }
+        _ => {
+            let fresh = fresh_capacities(shared, &entries, &placed::reachable_workers(&machines));
+            let candidates = placed::candidates(&spec, Some(shared.capacity()), &local_roots, &machines, &fresh);
+            placed::decide(&ask, &spec, &candidates, prepare)
+        }
+    };
     let peer = ConnPeer { out: &conn.out, shared };
     let say = |line: &str| {
         let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
@@ -1995,6 +2025,13 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
         Placed::LocalWithNote(note) => {
             log(&format!("{}: run: {note}", conn.label()));
             say(&note);
+            None
+        }
+        Placed::Here(lines) => {
+            log(&format!("{}: run placed here by the hub", conn.label()));
+            for line in &lines {
+                say(line);
+            }
             None
         }
         Placed::Failed(why) => {
@@ -2011,6 +2048,63 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
             Some(remote_verb(id, "run", params, &name, shared, conn, &tagged).map(|r| placed::tag_answer(r, &name)))
         }
     }
+}
+
+/// Move the code of `sandbox` (config root `root`, `--branch` `branch`)
+/// into this host's fleet root on `worker`, over its link: the `prepare` of
+/// a placed run, the hub's own or a member's placed by the hub.
+fn move_code(
+    shared: &Shared,
+    entries: &[machines::Entry],
+    worker: &str,
+    root: &Path,
+    sandbox: &str,
+    branch: Option<&str>,
+) -> std::result::Result<fleet::code::Prepared, fleet::code::Unprepared> {
+    use fleet::code::{self, LinkTransfer, Unprepared};
+    let Some(entry) = entries.iter().find(|e| e.name == worker) else {
+        return Err(Unprepared::NotMovable("it's no longer a machine here".into()));
+    };
+    // The machine says where this host's fleet root is, over the link.
+    let worker_root = fleet_root_on(shared, entry).map_err(Unprepared::NotMovable)?;
+    let repos = match &shared.repos {
+        Some(repos) => repos.clone(),
+        None => code::repos_dir()?,
+    };
+    let t = LinkTransfer::for_worker(&shared.socket_dir, worker);
+    code::prepare(&t, &repos, &worker_root, root, sandbox, branch)
+}
+
+/// The hub `hub`'s `fleet.place` answer to `ask`, over a fresh `API`
+/// stream of its link (its dial and hello bounded by
+/// `placed::CAPACITY_WAIT`, the answer by `placed::PLACE_WAIT`); why none,
+/// for the note of a run that then stays here.
+fn ask_hub(
+    shared: &Shared,
+    entries: &[machines::Entry],
+    machines: &[snapshots::Machine],
+    hub: &str,
+    ask: &fleet::placed::PlaceParams,
+) -> std::result::Result<fleet::placed::PlaceAnswer, fleet::placed::Unplaced> {
+    use fleet::placed::{CAPACITY_WAIT, PLACE_WAIT, Unplaced};
+    let down = |why: String| Unplaced::Unreachable(why);
+    match machines.iter().find(|m| m.name == hub) {
+        Some(m) if fleet::place::reachable(m.state) => {}
+        Some(m) => return Err(down(m.error.clone().unwrap_or_else(|| "its link isn't up".into()))),
+        None => return Err(down("no link to it".into())),
+    }
+    let (Some(ctx), Some(entry)) = (shared.machines.as_ref(), entries.iter().find(|e| e.name == hub)) else {
+        return Err(down("no link to it".into()));
+    };
+    let duplex = (ctx.dial)(entry).map_err(|e| down(format!("{e:#}")))?;
+    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| down(e.to_string()))?;
+    let params = serde_json::to_value(ask).map_err(|e| Unplaced::Refused(e.to_string()))?;
+    let r = link.conn.call_within("fleet.place", params, PLACE_WAIT).map_err(|e| down(format!("{e:#}")))?;
+    let r = r.ok_or_else(|| down(format!("no `fleet.place` answer within {}s", PLACE_WAIT.as_secs())))?;
+    if let Some(e) = r.error {
+        return Err(Unplaced::Refused(format!("fleet.place: {}", e.message)));
+    }
+    serde_json::from_value(r.result.unwrap_or(Value::Null)).map_err(|e| Unplaced::Refused(format!("bad fleet.place answer: {e}")))
 }
 
 /// This host's fleet root on machine `entry`, as its `roots.list` answer

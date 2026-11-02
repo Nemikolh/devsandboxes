@@ -839,6 +839,105 @@ pub(crate) mod tests {
         }
     }
 
+    /// A `run` typed on member L (`lap`, hub `box`) is placed by the hub K
+    /// (`fleet.place`): L is over a cap, K has room, so L moves the code
+    /// into its fleet root on K (as K's `roots.list` flags it) and forwards
+    /// the run there, the hub's lines first.
+    #[test]
+    fn a_members_run_is_placed_by_the_hub() {
+        use crate::serve::capacity::{Capacity, Caps};
+        use crate::serve::fleet::code::repo::tests::{git, origin_and_checkout};
+        use crate::serve::fleet::member::{Member, write_for_test};
+        const G: u64 = 1 << 30;
+
+        let (k_runner, k_verbs) =
+            crate::serve::verbs::tests::script_runner("dial-hub-place-k", r#"echo "box $*"; cat "$3/dockerfiles/web.Dockerfile" "$3/../web/F""#);
+        let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-hub-place-l", r#"echo "local $*""#);
+        let path = std::env::var("PATH").unwrap_or_default();
+        let src = scratch("dial-hub-place-src");
+        std::fs::create_dir_all(&src).unwrap();
+        origin_and_checkout(&src, "web");
+        let cfg = src.join("cfg");
+        std::fs::create_dir_all(cfg.join("dockerfiles")).unwrap();
+        std::fs::write(cfg.join(crate::config::CONFIG_FILE), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n").unwrap();
+        std::fs::write(cfg.join("dockerfiles/web.Dockerfile"), "FROM x\n").unwrap();
+        let cfg = std::fs::canonicalize(&cfg).unwrap();
+        let capacity = |avail: u64, running: usize, caps: Option<Caps>| Capacity {
+            cpus: Some(8),
+            mem_total: Some(32 * G),
+            mem_available: Some(avail * G),
+            disk_free: Some(400 * G),
+            disk_total: Some(500 * G),
+            running,
+            caps,
+        };
+        let roomy = capacity(28, 0, None);
+        let busy = capacity(4, 3, Some(Caps { instances: Some(1), ..Caps::default() }));
+        let pair = Pair::with(
+            "dial-hub-place",
+            Vec::new(),
+            |k| {
+                write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), hub: "self".into(), ..Default::default() });
+                k.verbs = Some(k_runner);
+                k.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), path.clone())]));
+                k.local_capacity = Some(Arc::new(move || roomy.clone()));
+            },
+            |l| {
+                write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: "box".into(), ..Default::default() });
+                l.verbs = Some(l_runner);
+                l.repos = Some(src.join("l-repos"));
+                l.local_capacity = Some(Arc::new(move || busy.clone()));
+            },
+        );
+        pair.wait_box("box connected", connected);
+        wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(&pair).is_some_and(|r| connected(&r)));
+        let fleet_root = std::fs::canonicalize(pair.base.join("k-data/fleet/lap")).unwrap();
+        let mut l = connect(&pair.l_dir);
+        let (r, out, err) = verb(&mut l, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature"}));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!(r.result.as_ref().unwrap()["machine"], "box", "{r:?}");
+        assert!(err.starts_with("placed on box ("), "{err}");
+        let roots: Vec<_> =
+            std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != ".in").collect();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let remote = fleet_root.join("roots").join(&roots[0]).join("cfg");
+        assert_eq!(out, format!("box --in-process -C {} run --branch=feature -- web\nFROM x\nfeature\n", remote.display()));
+        assert_eq!(git(&remote.join("../web"), &["symbolic-ref", "--short", "HEAD"]), "feature");
+        drop(l);
+        pair.finish();
+        for dir in [src, l_verbs, k_verbs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Member L's hub `box` can't be reached (its ssh fails): a `run` typed
+    /// on L runs on L, its output starting with a note naming the hub.
+    #[test]
+    fn a_members_run_stays_here_when_its_hub_is_unreachable() {
+        use crate::serve::fleet::member::{Member, write_for_test};
+        let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-hub-down-l", r#"echo "local $*""#);
+        let pair = Pair::with(
+            "dial-hub-down",
+            Vec::new(),
+            |k| write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), hub: "self".into(), ..Default::default() }),
+            |l| {
+                write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: "box".into(), ..Default::default() });
+                l.verbs = Some(l_runner);
+                l.link_transport = Some(Transport::new(|_, _| anyhow::bail!("ssh: connect to host box port 22: Connection refused")));
+            },
+        );
+        pair.wait_box("box unreachable", |r| r["state"] == "unreachable");
+        let cfg = pair.base.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let (r, out, err) = verb(&mut connect(&pair.l_dir), "run", json!({"root": cfg, "env": {}, "sandbox": "web"}));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!(r.result.as_ref().unwrap().get("machine"), None, "{r:?}");
+        assert!(err.starts_with("note: the hub `box` is unreachable (") && err.contains("): running here\n"), "{err}");
+        assert_eq!(out, format!("local --in-process -C {} run -- web\n", cfg.display()));
+        pair.finish();
+        let _ = std::fs::remove_dir_all(&l_verbs);
+    }
+
     /// K already has a machine named `lap` (the two hosts added each
     /// other): its refusal is box's error here.
     #[test]

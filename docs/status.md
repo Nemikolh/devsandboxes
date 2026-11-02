@@ -47,8 +47,9 @@ limitation means editing this file in the same commit.
   machines the hub links to show `via` it). `machine rm <m>` takes `m`
   out of the fleet on the hub (a member's is sent there), `machine rm
   <this host>` leaves, `machine unlink <m>` only drops this host's link
-  (step 9d). Next: a member's `run` placed by the hub (9e), routing over
-  the graph (step 10).
+  (step 9d). A member's `run` is placed by the hub (step 9e,
+  `fleet.place`). Step 9 is complete pending its docs close (9f); next:
+  routing over the graph (step 10).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#peer-links)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -395,11 +396,14 @@ limitation means editing this file in the same commit.
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::candidates`
 - A placed `run` is placed only by the daemon's `run` verb: a CLI `run`
   with no daemon to reach, the dispatcher's children and `--in-process`
-  runs stay here (fleet step 13 for children), and only a hub (`hub =
-  "self"` in `member.toml`) places: a `run` typed elsewhere stays there (step 9 sends it to
-  the hub). On a hub every connected machine is a candidate (ssh and
-  inbound), so it asks each a `capacity.get` (2 s at most)
-  before every unpinned `run` (`--here` keeps it local).
+  runs stay here (fleet step 13 for children). A hub (`hub = "self"` in
+  `member.toml`) places its own runs; a `run` typed on a member is placed
+  by the hub (`fleet.place`, up to 2 s for the dial and 6 s for the
+  answer) among the machines the member links to directly, and runs on
+  the member with a note when the hub can't be reached. On a hub every
+  connected machine is a candidate (ssh and inbound), so it asks each a
+  `capacity.get` (2 s at most) before every unpinned `run` (`--here`
+  keeps it local).
   The placing host's `state.toml` doesn't record a placed instance (it's the
   machine's, seen as `<machine>/<name>` in federated views; fleet step 13).
   Moving the
@@ -409,6 +413,12 @@ limitation means editing this file in the same commit.
   or `worktree-base` naming an `origin/…` ref fails on the worker (its
   checkout has no `origin`).
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::start_point`
+- A member's `run` has only the machines it links to directly as
+  candidates (the hub, and those of its machines the hub links to too):
+  those it sees only through
+  the hub can't take its code until routing (fleet step 10), so the hub
+  never picks them.
+  → [fleet](architecture/daemon/fleet.md#a-members-run); `fleet::placed::member_workers`
 - A placed `run` moves committed, pushed work
   only: one branch of each folder's `origin`, fetched by the hub; a
   folder with no `origin`, an unreachable one, a branch origin lacks, a

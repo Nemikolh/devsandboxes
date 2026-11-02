@@ -925,6 +925,7 @@ mod tests {
             ("machines.unlink", "OkResult"),
             ("machines.rm", "MachineRmResult"),
             ("fleet.rm", "FleetRemoved"),
+            ("fleet.place", "FleetPlaced"),
             ("fleet.leave", "OkResult"),
             ("fleet.forget", "OkResult"),
             ("machines.set", "OkResult"),
