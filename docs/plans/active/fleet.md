@@ -557,6 +557,62 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
       - **No fallback:** a link that doesn't prove its keys is refused.
         Decision 32's hub-only calls check the hub's key, not the name
         the link announced.
+
+      Sub-steps, each a commit (decisions 48-52 settle what the above
+      left open):
+      - **10a.1 Identity primitives** (`fleet/identity.rs`,
+        `ed25519-dalek`). A `KeyStore` seam, its file implementation
+        `member.key` next to `member.toml` (0600, created under a lock,
+        read by the daemon and `fleet-link`); public keys as
+        `ed25519:<hex>` with a fingerprint; sign/verify with domain
+        separation; `Statement {signer, key, kind, payload_sha256,
+        version, sig}` and the pure rollback check (the highest version
+        seen per signer and kind, older refused). `member.get` answers
+        `key` and `fingerprint`; `devsandbox machine key` prints them.
+      - **10a.2 The membership log** (`fleet/membership.rs`, pure;
+        `membership.json` next to `state.toml`, daemon-written). A hash
+        chain of authority-signed entries: `Genesis {authority, key,
+        hub}`, `Add {name, key}`, `Revoke {name, key}`, `Rotate {name,
+        old, new}` (the new key countersigned by the old) and `Hub
+        {name}`. `apply` verifies every entry into the members, the hub,
+        the revoked keys and the head; `compare` says same, behind, ahead
+        or fork. Introductions sit outside the chain (decision 50).
+        `member.toml`'s `hub` is written only from an accepted log.
+      - **10a.3 `machine add` writes the log.** A fleet-creating add
+        signs `Genesis` and the target's `Add` here (decision 48); an add
+        by the authority signs `Add`; an add by another member signs an
+        introduction and proposes it to the authority (decision 49); a
+        host joining the target's fleet gets its introduction (or `Add`,
+        the target being the authority) signed there over the add-time
+        probe and takes the log from it. The joining key's fingerprint is
+        shown and confirmed on a TTY (`--yes` off one).
+      - **10a.4 The link proves both keys.** After the `Hello`s
+        (`link::opener_with`, `link::answerer_with`) each end sends a
+        nonce, then signs the transcript (both nonces, both `Hello`s,
+        both names); the peer's name must resolve to its key in the log
+        or a capped introduction. Unknown names, revoked keys and links
+        that don't prove are refused; `fleet::LINK`'s sentinel version
+        goes up. Heads are compared on every link: the end behind fetches
+        the entries it lacks (`fleet.membership`, self-verifying, from any
+        member); a fork refuses the link and is logged.
+      - **10a.5 Trust by the proven key.** `lent::Peer` carries the
+        proven key and its introducer (`link.attach` from `fleet-link`,
+        the dialer's in-process peer); `lent::admit_fleet` admits the
+        hub-only calls by the log's hub key; a capped member introduces
+        no one (decision 51).
+      - **10a.6 Revocation, rotation, approvals.** `machine rm` is a
+        `Revoke`, `machine key rotate` a `Rotate`; typed on the
+        authority they're signed there, elsewhere proposed to it
+        (`fleet.propose`) and approved there (decision 49). A signed
+        change is pushed to the hub and the authority's linked members,
+        the rest catch up on their next link's head comparison; step 9's
+        `fleet.leave`/`fleet.forget` follow a valid `Revoke`.
+      - **10a.7 Key at rest.** A bind whose source covers `member.key` is
+        refused on every host (mount assembly, not the worker policy);
+        the key is never loaded into an ssh-agent; OS keychains behind
+        `KeyStore` are parked (decision 52).
+      - **10a.8 Docs close.** An ADR for decision 45; `fleet.md`
+        (architecture), `docs/status.md`, this step's as-built note.
     - **10b Routing.** Members report their links and the hub publishes
       the graph; routed streams are spliced hop by hop toward a
       destination (an `Open` naming it), each naming the member it
@@ -620,7 +676,7 @@ Numbered as code cites them; 13–16 as step 4 makes them, 3, 9 and 17 as
 step 6 does, 7, 18, 22-25 as step 7 does, 26-30 as step 8 does, 1, 2, 19
 and 20 as step 9 does, 21 as step 10 does, 36 and 37 as a fix to
 step 9's `machine add` does, 38 as a fix to step 9's placement does, 39-43 as steps 13, 14
-and 16 do, 44-47 as step 10 does.
+and 16 do, 44-47 as step 10 does, 48-52 as step 10a does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
    setting.
@@ -814,6 +870,26 @@ and 16 do, 44-47 as step 10 does.
 47. End-to-end sessions between members are their own step (10c), after
     routing (10b): proving who opened a stream doesn't stop a relay from
     altering it afterward.
+48. The authority (decision 45) is the host that ran the fleet-creating
+    `machine add`; with `--hub` (decision 36) that's the laptop, the
+    server it adds the hub.
+49. A membership change typed on another member is forwarded to the
+    authority (`fleet.propose`) and waits there for the user's approval
+    (`devsandbox machine pending|approve|deny` on the authority, with a
+    desktop notification); the authority's key never signs on a remote
+    request alone. Until routing (10b) a proposal reaches the authority
+    only over a direct link to it, else it's refused naming it.
+50. The membership log has one writer, the authority. An introduction
+    (decision 46) is a statement signed by its introducer, outside the
+    chain, held by every member as capped until the authority adds that
+    member to the log.
+51. While trust is one setting per host, decision 46's cap is recorded
+    and shown, and a capped member can't introduce others; it narrows
+    trust once per-peer grants exist (not decided).
+52. The member key lives behind a `KeyStore` seam, a 0600 file for now;
+    OS keychain backends are parked. Fleets made before step 10a have no
+    membership log: their links are refused until the fleet is made
+    again with `machine add` (no migration, pre-1.0).
 
 ## Open questions
 
