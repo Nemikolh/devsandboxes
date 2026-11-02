@@ -977,8 +977,18 @@ export interface FleetChangeRevoke {
   name: string;
 }
 
+/** A proposed membership change: the proposer's own key from `old` to `new`, countersigned by `old`. */
+export interface FleetChangeRotate {
+  kind: 'rotate';
+  name: string;
+  old: string;
+  new: string;
+  /** `old`'s signature over the fleet, the name and `new` (128 lowercase hex digits). */
+  by_old: string;
+}
+
 /** A membership change proposed to the authority (`fleet.propose`'s `op`). */
-export type FleetChange = FleetChangeAdd | FleetChangeRevoke;
+export type FleetChange = FleetChangeAdd | FleetChangeRevoke | FleetChangeRotate;
 
 /** A proposal waiting on the authority (`proposals.json`). */
 export interface FleetProposal {
@@ -1006,6 +1016,25 @@ export interface FleetSynced {
 export interface MembershipApproved extends FleetSigned {
   id: number;
 }
+
+/** `membership.rotate` on the fleet's authority: the `rotate` signed with the old key, the new key this host's now, pushed. */
+export interface MembershipRotated extends FleetSigned {
+  type: 'rotated';
+  /** The new key, `ed25519:<64 lowercase hex>`. */
+  key: string;
+  fingerprint: string;
+}
+
+/** `membership.rotate` on another member: the `rotate` proposed to the authority; the new key waits in `member.key.next`. */
+export interface MembershipRotateProposed extends FleetProposed {
+  type: 'proposed';
+  /** The next key, this host's once the signed `rotate` reaches it. */
+  key: string;
+  fingerprint: string;
+}
+
+/** `membership.rotate`'s answer. */
+export type MembershipRotateResult = MembershipRotated | MembershipRotateProposed;
 
 /** `machines.get`'s answer (a registered machine or an inbound one): what an ssh command to the machine needs. */
 export interface MachineInfo {
@@ -1062,6 +1091,8 @@ export interface MemberInfo {
   key: string;
   /** The key's fingerprint, `SHA256:` and 8 groups of 4 lowercase hex digits joined by `-`. */
   fingerprint: string;
+  /** A pending rotation's next key (`member.key.next`), the key once a membership log listing it is taken; `null` when none is pending. */
+  next: MembershipKey | null;
 }
 
 /** A signed statement (a membership entry's, an introduction's): `signer` says, with `key`, the payload of that hash. */
@@ -1168,6 +1199,8 @@ export interface MembershipInfo {
   /** `null` in no fleet's log. */
   stored: MembershipStored | null;
   summary: MembershipSummary;
+  /** A pending rotation's next key (`member.key.next`); `null` when none is pending. */
+  next: MembershipKey | null;
 }
 
 /** One process of an instance, as `ps` printed it. */
@@ -1695,6 +1728,14 @@ export interface ApiMethods {
   'membership.approve': { params: { id: number }; result: MembershipApproved };
   /** Drop proposal `id`, signing nothing; `not-found` for no such proposal. Local only. */
   'membership.deny': { params: { id: number }; result: OkResult };
+  /**
+   * Rotate this host's member key: a next key (`member.key.next`, a pending one reused) countersigned by the key.
+   * On the authority the `rotate` is signed, stored (the next key becomes the key) and pushed; elsewhere it's
+   * proposed to the authority over a direct link, and the next key becomes the key when a log listing it is
+   * taken. `denied` for a capped (introduced) member, one in no fleet's log, or with no direct link to the
+   * authority; `invalid` when the log refuses it. Local only.
+   */
+  'membership.rotate': { params: {}; result: MembershipRotateResult };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

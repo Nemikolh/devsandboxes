@@ -206,6 +206,9 @@ pub enum After {
     /// This machine's entry was dropped, or it's an inbound neighbor whose
     /// link ends.
     Unlinked(String),
+    /// A `fleet.sync` promoted this host's next key: every link it's on
+    /// ends (`Ctx::key_rotated`), after the answer to the sync is out.
+    Rotated,
 }
 
 /// Apply `after` to the links.
@@ -225,6 +228,7 @@ pub fn apply(after: After, ctx: &Ctx) {
                 (ctx.end_inbound)(&name);
             }
         }
+        After::Rotated => (ctx.key_rotated)(),
     }
 }
 
@@ -432,7 +436,7 @@ fn fleet_call_inner(method: &str, params: Value, from: &str, ctx: &Ctx) -> Resul
                 Ok((value, Some(after)))
             }
         }
-        "fleet.propose" | "fleet.sync" => changes::fleet_call(method, params, from, ctx).map(|v| (v, None)),
+        "fleet.propose" | "fleet.sync" => changes::fleet_call(method, params, from, ctx),
         m => Err(ApiError::unknown_method(m)),
     }
 }

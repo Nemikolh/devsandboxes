@@ -696,8 +696,15 @@ it exists) and the literal one as `member.set {roots_rm}`, so a removed
 directory can be dropped. Both print the roots after the change. So is
 `key` (`commands::machine::key`): `member.get`, printing `<name> <key>`
 (`-` for a host with no valid name) and the key's fingerprint on the next
-line (`key_text`); the key is made on that first ask
-([fleet.md](fleet.md#member-identity)).
+line (`key_text`), then a pending rotation's next key (`rotating to
+<fingerprint> (<key>): …`, `member.get`'s `next`); the key is made on
+that first ask ([fleet.md](fleet.md#member-identity)). `key rotate`
+(`commands::machine::rotate_key`, `membership.rotate`) rotates it: on the
+authority `this host's key is now <fingerprint> (<key>)` then
+`signed_lines`; on another member `proposed rotating this host's key to
+<fingerprint> to <authority>: approve there with devsandbox machine
+approve <id>` and that this host keeps its key until the signed change
+reaches it (`rotation_lines`).
 `--machine` and qualified names refuse `machine` as a whole
 (`serve::machines::cli::machine_use`).
 

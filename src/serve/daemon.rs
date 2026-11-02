@@ -361,6 +361,14 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             })
         },
+        key_rotated: {
+            let hooked = Arc::clone(&hooked);
+            Box::new(move || {
+                if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
+                    s.key_rotated();
+                }
+            })
+        },
         end_inbound: {
             let hooked = Arc::clone(&hooked);
             Box::new(move |name: &str| {
@@ -545,9 +553,12 @@ fn machine_dialer(
         let (hooked, hostname) = (Arc::clone(hooked), hostname.clone());
         Arc::new(move |newer| {
             let path = member_toml.as_deref().ok_or("this daemon has no member.toml")?;
-            let (_, hub) = fleet::membership_api::adopt(path, &hostname, newer).map_err(|e| e.message)?;
+            let taken = fleet::membership_api::adopt(path, &hostname, newer).map_err(|e| e.message)?;
             if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
-                s.set_hub(hub);
+                s.set_hub(taken.hub);
+                if taken.rotated {
+                    s.key_rotated();
+                }
             }
             Ok(())
         })
@@ -813,6 +824,22 @@ impl Shared {
             *cur = hub.clone();
         }
         log(&format!("this host's hub is now {}: its links end and redial", hub.field().as_deref().unwrap_or("none")));
+        self.cycle_links();
+    }
+
+    /// This host's pending next key was promoted to `member.key` (fleet
+    /// plan step 10a.6, `membership_api::Taken::rotated`): every link it's
+    /// on ends, as on a hub change, so both ends redial and the link proves
+    /// the new key (a peer keeps the key a link proved, `lent::Peer::key`).
+    pub(crate) fn key_rotated(&self) {
+        log("this host's member key rotated: its links end and redial proving the new key");
+        self.cycle_links();
+    }
+
+    /// End every link this host holds (`service::Handle::cycle`) and every
+    /// one it's dialed on (`links.cycle` on each `fleet-link --peer`'s held
+    /// `links.inbound` connection).
+    fn cycle_links(&self) {
         if let Some(links) = self.links() {
             links.cycle();
         }
@@ -1650,16 +1677,20 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
         // Local only too: the proposals queued here, approved over the links.
-        "membership.pending" | "membership.approve" | "membership.deny" if shared.machines.is_some() => {
+        "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" if shared.machines.is_some() => {
             let ctx = shared.machines.as_ref().expect("checked");
-            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny method")
+            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny|rotate method")
         }
-        // Local only too; an adopt wrote `hub` from the log: followed here.
+        // Local only too; an adopt wrote `hub` from the log and may have
+        // promoted this host's next key: both followed here.
         method if method.starts_with("membership.") => match &shared.member {
             Some(path) => match fleet::membership_api::call(method, req.params, path, &shared.hostname) {
-                Some((answer, hub)) => {
-                    if let Some(hub) = hub {
-                        shared.set_hub(hub);
+                Some((answer, follow)) => {
+                    if let Some(follow) = follow {
+                        shared.set_hub(follow.hub);
+                        if follow.rotated {
+                            shared.key_rotated();
+                        }
                     }
                     answer
                 }

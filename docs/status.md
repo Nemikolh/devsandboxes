@@ -273,6 +273,9 @@ limitation means editing this file in the same commit.
 - A member only introduced (capped, not in the log) can't be removed with
   `machine rm`: the log has no key of it to revoke; it goes once its
   introducer is revoked. → [fleet](architecture/daemon/fleet.md); `machines::changes::revoke`
+- A capped (introduced) member can't rotate its key: the log has no key
+  of it to rotate until the authority adds it.
+  → [fleet](architecture/daemon/fleet.md#member-identity); `machines::changes::can_rotate`
 - `machine add` has no `--command`: it sets `command` only when it finds or
   installs devsandbox in `~/.local/bin` off the login `PATH`; a remote devsandbox
   anywhere else off `PATH` is set by hand in `machines.toml`.

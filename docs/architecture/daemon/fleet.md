@@ -179,6 +179,19 @@ it never signs on a remote request alone (decision 49;
   `.approve`, `.deny`, local only) list them, sign one (checked against
   the log again, then signed, pushed and, for a revoke, removed as
   `machine rm` typed there would) or drop one.
+- **Rotations.** A member's `machine key rotate` proposes `{"kind":
+  "rotate", "name", "old", "new", "by_old"}` the same way
+  ([Member identity](#member-identity)). `proposals::check` takes it only
+  from the member it names (a member rotates only its own key), from its
+  current key, countersigned by that key, to a key the log doesn't know
+  (`Membership::check_op`); a rotate to the key the log already has says
+  it's signed. The queue collapses a rotate of the same name to the same
+  key. Approved, the `rotate` is signed and pushed like any change; the
+  member promotes its next key when the push (or its next link's sync)
+  reaches it, and ends its links to redial with it. The authority's own
+  `machine key rotate` is signed at once with its old key, pushed, then
+  its links end and redial; later entries are signed with the new one
+  (`Membership::authority`).
 - **Pushes.** After every change it signs, the authority sends its whole
   log to every machine it holds, registry and inbound (`changes::push`,
   `fleet.sync`). The receiver, from a member or an introduced peer,
@@ -502,7 +515,9 @@ Both ends of a peer link prove their member keys right after the
 `proof::prove`; decisions 44-46, 50-52): ssh vouches only for the end of
 one hop, the key for the member. Each end's identity
 (`proof::Identity::load`: its member name, `member.key`, its
-`membership.json`, which must list it under that name and key) is read at
+`membership.json`, which must list it under that name and key, and a
+pending rotation's `member.key.next`, promoted first when that log lists
+it, [Member identity](#member-identity)) is read at
 the link's start: by the dialer at each dial (`Dialer::identity`), by
 `fleet-link` once (each dial is a process of its own,
 `PeerOptions::member`). A host with no key or no membership log links
@@ -1296,6 +1311,42 @@ signatures, signed statements and the rollback rule.
   its text); neither is replaced. `member.get` (and `member.set`) answer
   its public half, making the key on the first ask; `devsandbox machine
   key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmtrustroots)).
+- **Rotation**: `devsandbox machine key rotate` (`membership.rotate`,
+  `machines::changes::rotate`) makes the next key, `member.key.next`
+  (`FileKeyStore::next_path`, `KeyStore::next_key`: the same format and
+  mode, made under the same lock; a pending one is reused, so a second
+  rotate proposes the same key again), and countersigns it with the key
+  (`countersign_rotate`): a `rotate {name, old, new, by_old}` of this
+  host's own key, checked against the log (`changes::plan_rotate`). Only
+  a member of the log by its key rotates: an introduced (capped) member
+  has no log key, and is refused before any key is made
+  (`changes::can_rotate`). On the authority the `rotate` is signed with
+  the old key and stored through the adopt path, which promotes the
+  next key; then pushed. Elsewhere it's proposed to the authority
+  ([Approvals and pushes](#approvals-and-pushes)) and the member keeps
+  its key. The next key is promoted (`KeyStore::promote`: under the key
+  lock, a rename of `member.key.next` over `member.key`, only when the
+  pending key is the one expected, so idempotent) when a log this host
+  takes lists it under the next key (`membership_api::settle`, run after
+  every store on the adopt path: a link's sync, `membership.adopt`,
+  `fleet.sync`), and by every read of this host's key (`membership_api::own`,
+  `proof::Identity::load`), which catches up a crash between storing the
+  log and the rename. The adopt path takes a log that lists this host
+  under the next key while one is pending (`membership_api::Own::next`);
+  one listing neither key is refused. From the promotion on this host
+  signs and proves with the new key. A peer keeps the key a link proved
+  (`lent::Peer::key`), so a host that promoted ends every link it's on,
+  as on a hub change (`daemon::Shared::key_rotated`, `Taken::rotated`:
+  its held links' `service::Handle::cycle`, `links.cycle` to each
+  `fleet-link` it's dialed on), and both ends redial proving the new key.
+  The authority ends them after its push, so its peers hold the `rotate`
+  when they redial; a member promoting on a `fleet.sync` sends the log on
+  to its other machines first and ends its links once its answer is out
+  (`leave::After::Rotated`); one promoting on a link's sync or
+  `membership.adopt` ends them then (the link that carried the log
+  redials once more). `member.get` and `membership.get` answer a
+  pending rotation's next key as `next` (`{key, fingerprint}`), which
+  `machine key` prints.
 - **Public keys** (`PublicKey`): text form `ed25519:<64 lowercase hex>`
   (`Display`, `FromStr`, serde as that string; parsing refuses uppercase
   and bytes that aren't a curve point). The fingerprint
@@ -1320,7 +1371,10 @@ signatures, signed statements and the rollback rule.
 - **On a link**: each peer link's ends prove their keys after the
   `Hello`s, signing a per-link transcript in `proof::DOMAIN`
   ([key proof](#key-proof)); a name resolves to its key in the
-  [membership log](#membership-log) or a held introduction.
+  [membership log](#membership-log) or a held introduction. An end with a
+  pending rotation proves with the next key when the log it merged in
+  that link's sync lists it so (`Identity::signer_for`), else with its
+  key.
 - **The rollback rule** (`Seen::accept`, pure): per signer key (not
   name) and `kind`, the highest version accepted and its payload hash. A
   statement that doesn't verify is refused; a higher version is recorded

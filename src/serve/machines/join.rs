@@ -173,7 +173,7 @@ pub struct Side<'a> {
 
 impl Side<'_> {
     fn own(&self) -> Own<'_> {
-        Own { name: self.name, key: self.key }
+        Own { name: self.name, key: self.key, next: None }
     }
 }
 
@@ -491,7 +491,7 @@ mod tests {
         /// `name` (key `n`): capped there.
         fn capped(name: &str, n: u8) -> Stored {
             let s = made("k", &key(7), "k", &[("m", pk(8))]);
-            sign_into(&s, &Own { name: "m", key: pk(8) }, &key(8), name, &pk(n)).unwrap()
+            sign_into(&s, &Own { name: "m", key: pk(8), next: None }, &key(8), name, &pk(n)).unwrap()
         }
 
         fn f(hub: &str, joined: Joined) -> Fleet {
@@ -569,14 +569,14 @@ mod tests {
         fn an_extra_link_exchanges_logs_both_known() {
             let s = made("lap", &key(1), "lap", &[("box", pk(2))]);
             assert_eq!(run(f("lap", Joined::Same), &s, &s), Ok(Logs::Exchange));
-            let longer = sign_into(&s, &Own { name: "lap", key: pk(1) }, &key(1), "pi", &pk(3)).unwrap();
+            let longer = sign_into(&s, &Own { name: "lap", key: pk(1), next: None }, &key(1), "pi", &pk(3)).unwrap();
             assert_eq!(run(f("lap", Joined::Same), &s, &longer), Ok(Logs::Exchange));
             assert_eq!(run(f("lap", Joined::Same), &longer, &s), Ok(Logs::Exchange));
             // Another fleet; a fork.
             let other = made("lap", &key(1), "lap", &[("box", pk(2))]);
             let e = run(f("lap", Joined::Same), &s, &other).unwrap_err();
             assert!(e.code == "denied" && e.message.contains("another fleet"), "{}", e.message);
-            let fork = sign_into(&s, &Own { name: "lap", key: pk(1) }, &key(1), "pi", &pk(4)).unwrap();
+            let fork = sign_into(&s, &Own { name: "lap", key: pk(1), next: None }, &key(1), "pi", &pk(4)).unwrap();
             assert_eq!(run(f("lap", Joined::Same), &longer, &fork).unwrap_err().code, "denied");
             // Not each other's: the machine isn't in the log.
             let alone = made("lap", &key(1), "lap", &[]);

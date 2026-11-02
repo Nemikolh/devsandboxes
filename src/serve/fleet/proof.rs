@@ -28,7 +28,10 @@
 //! 3. `proof`: the end's public key and its signature, in [`DOMAIN`], over
 //!    the [`transcript`] (both names, nonces, `Hello`s and heads) and its
 //!    own role. The key must be the one the name resolved to (a revoked one
-//!    says so), the signature must verify.
+//!    says so), the signature must verify. An end with a pending rotation
+//!    (`member.key.next`) proves with the next key when the log it just
+//!    merged lists it so (the peer carried the signed `rotate`), else with
+//!    its key.
 //! 4. `confirm`: the opener's verdict on the answerer's proof (empty, or a
 //!    refusal), so both ends agree the link is proven before either serves.
 //!
@@ -44,7 +47,7 @@ use sha2::{Digest, Sha256};
 use super::identity::{FileKeyStore, PublicKey, Signature, Signer, SigningKey};
 use super::member;
 use super::membership::{self, Compare, Head, Stored, Wire};
-use super::membership_api::lists;
+use super::membership_api::{lists, settle};
 use super::update;
 
 /// The domain a link proof's signature is made in.
@@ -61,37 +64,49 @@ const REFUSAL: u8 = 1;
 /// What every refusal for a missing identity ends with (decision 52).
 const MAKE_AGAIN: &str = "a fleet link proves both members' keys against the fleet's membership log: make the fleet again with `devsandbox machine add`";
 
-/// This member as a link proves it: its name, its key, its stored log.
+/// This member as a link proves it: its name, its key, its stored log, and
+/// a pending rotation's next key.
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub name: String,
     pub key: SigningKey,
     pub stored: Stored,
+    pub next: Option<SigningKey>,
 }
 
 impl Identity {
     /// This host's identity, read now (each link reads it at its start):
     /// the name `member.toml` at `member_toml` gives (else `hostname`'s),
-    /// `member.key` and `membership.json` next to it. No key, no log, or a
-    /// log that doesn't list this host under that name and key is an error
-    /// naming the fix.
+    /// `member.key` and `membership.json` next to it (a pending rotation the
+    /// log lists settled first: `membership_api::settle`). No key, no log, or
+    /// a log that doesn't list this host under that name and key is an
+    /// error naming the fix.
     pub fn load(member_toml: &Path, hostname: &str) -> Result<Identity> {
         let name = member::load(member_toml)?.unwrap_or_default().name_or(hostname)?;
         let key_path = member::key_path(member_toml);
-        let key = FileKeyStore::new(key_path.clone())
-            .load()?
-            .with_context(|| format!("this host has no member key ({}): {MAKE_AGAIN}", key_path.display()))?;
         let log_path = membership::path(member_toml);
-        let stored = membership::load(&log_path)?
-            .filter(|s| s.log.membership().is_some())
-            .with_context(|| format!("this host is in no fleet's membership log ({}): {MAKE_AGAIN}", log_path.display()))?;
+        let stored = membership::load(&log_path)?.filter(|s| s.log.membership().is_some());
+        let super::membership_api::Settled { key, next, .. } = settle(&FileKeyStore::new(key_path.clone()), &name, stored.as_ref())?;
+        let key = key.with_context(|| format!("this host has no member key ({}): {MAKE_AGAIN}", key_path.display()))?;
+        let stored =
+            stored.with_context(|| format!("this host is in no fleet's membership log ({}): {MAKE_AGAIN}", log_path.display()))?;
         if !lists(&stored, &name, &key.public_key()) {
             bail!(
                 "this host's membership log doesn't list it (`{name}`, {}): {MAKE_AGAIN}",
                 key.public_key().fingerprint()
             );
         }
-        Ok(Identity { name, key, stored })
+        Ok(Identity { name, key, stored, next })
+    }
+
+    /// The key to prove with against `merged` (the log after this link's
+    /// sync): the pending next one when `merged` lists this host under it,
+    /// else the key.
+    fn signer_for(&self, merged: &Stored) -> &SigningKey {
+        match &self.next {
+            Some(next) if lists(merged, &self.name, &next.public_key()) => next,
+            _ => &self.key,
+        }
     }
 }
 
@@ -424,11 +439,14 @@ pub fn prove(side: Side, r: &mut impl Read, w: &mut impl Write, auth: &Auth, our
         Side::Answerer => ((&them, hello_digest(theirs.0, theirs.1)), (&mine, hello_digest(ours.0, ours.1))),
     };
     let t = transcript(o, a);
-    let proof = encode_proof(&id.key.public_key(), &id.key.sign(DOMAIN, &signed(&t, side)));
+    let proof = |merged: &Stored| {
+        let key = id.signer_for(merged);
+        encode_proof(&key.public_key(), &key.sign(DOMAIN, &signed(&t, side)))
+    };
     let (merged, (expected, introduced_by)) = match side {
         Side::Opener => {
             let resolved = resolved;
-            let theirs_proof = chan.exchange(resolved.as_ref().map(|_| proof).map_err(Clone::clone), SMALL)?;
+            let theirs_proof = chan.exchange(resolved.as_ref().map(|(merged, _)| proof(merged)).map_err(Clone::clone), SMALL)?;
             let (merged, found) = resolved.expect("refused above otherwise");
             // 4. confirm: our verdict on theirs.
             let verdict = check_proof(&theirs_proof, &found.0, &merged, peer, &signed(&t, side.other()));
@@ -440,7 +458,7 @@ pub fn prove(side: Side, r: &mut impl Read, w: &mut impl Write, auth: &Auth, our
             let verdict = resolved.and_then(|(merged, found)| {
                 check_proof(&theirs_proof, &found.0, &merged, peer, &signed(&t, side.other())).map(|_| (merged, found))
             });
-            chan.send(verdict.as_ref().map(|_| proof).map_err(Clone::clone))?;
+            chan.send(verdict.as_ref().map(|(merged, _)| proof(merged)).map_err(Clone::clone))?;
             read_raw(chan.r, SMALL, peer)?;
             verdict.expect("refused above otherwise")
         }
@@ -487,7 +505,7 @@ pub mod tests {
     }
 
     fn auth(name: &str, k: u8, stored: Stored, expect: &str) -> Auth {
-        Auth { identity: Identity { name: name.into(), key: key(k), stored }, expect: expect.into(), log: |_| {} }
+        Auth { identity: Identity { name: name.into(), key: key(k), stored, next: None }, expect: expect.into(), log: |_| {} }
     }
 
     const HELLO_O: (&str, u32) = ("o hello", 1);
@@ -672,6 +690,51 @@ pub mod tests {
         test_support::write(&toml, &test_support::fleet("lap", &key(1), "lap", &[("box", k.public_key())]));
         let id = Identity::load(&toml, "host").unwrap();
         assert_eq!((id.name.as_str(), id.key.public_key()), ("box", k.public_key()));
+        assert!(id.next.is_none());
+
+        // A pending rotation: carried while the log lists the key; promoted
+        // once it lists the next one; neither listed is refused as before.
+        use crate::serve::fleet::identity::KeyStore as _;
+        let store = FileKeyStore::new(member::key_path(&toml));
+        let next = store.next_key().unwrap();
+        let id = Identity::load(&toml, "host").unwrap();
+        assert_eq!((id.key.public_key(), id.next.map(|n| n.public_key())), (k.public_key(), Some(next.public_key())));
+        test_support::write(&toml, &test_support::fleet("lap", &key(1), "lap", &[("box", pk(9))]));
+        assert!(format!("{:#}", Identity::load(&toml, "host").unwrap_err()).contains("doesn't list it"));
+        assert!(store.next_path().exists());
+        test_support::write(&toml, &test_support::fleet("lap", &key(1), "lap", &[("box", next.public_key())]));
+        let id = Identity::load(&toml, "host").unwrap();
+        assert_eq!((id.key.public_key(), id.next.is_none()), (next.public_key(), true));
+        assert!(!store.next_path().exists(), "promoted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `box` (2) has a pending next key (9) and a log behind `lap`'s, whose
+    /// last entry rotates box to 9: the merged log lists box under 9, so box
+    /// proves with it and lap accepts; its old key is refused as revoked.
+    /// Before the rotate is in, box proves with its key.
+    #[test]
+    fn a_pending_rotation_proves_with_the_key_the_merged_log_lists() {
+        let s = two(1);
+        let g = s.log.membership().unwrap().genesis;
+        let rotate = Op::Rotate { name: "box".into(), old: pk(2), new: pk(9), by_old: membership::countersign_rotate(&g, "box", &pk(9), &key(2)) };
+        let rotated = with(s.clone(), rotate);
+        let pending = |stored: Stored| {
+            let mut a = auth("box", 2, stored, "lap");
+            a.identity.next = Some(key(9));
+            a
+        };
+        // box opens, then answers.
+        let (o, a) = run(pending(s.clone()), auth("lap", 1, rotated.clone(), "box"));
+        let (o, a) = (o.unwrap(), a.unwrap());
+        assert_eq!((a.key, o.newer.as_ref()), (pk(9), Some(&rotated)));
+        let (o, a) = run(auth("lap", 1, rotated.clone(), "box"), pending(s.clone()));
+        assert_eq!((o.unwrap().key, a.unwrap().newer), (pk(9), Some(rotated.clone())));
+        // No next key: the old one is refused as revoked.
+        let (_, a) = run(auth("box", 2, s.clone(), "lap"), auth("lap", 1, rotated.clone(), "box"));
+        assert!(err(a).contains("which is revoked"));
+        // The rotate not in: box proves with its key, next pending.
+        let (o, a) = run(pending(s.clone()), auth("lap", 1, s.clone(), "box"));
+        assert_eq!((o.unwrap().newer, a.unwrap().key), (None, pk(2)));
     }
 }

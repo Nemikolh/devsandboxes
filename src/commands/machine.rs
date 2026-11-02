@@ -41,7 +41,7 @@ use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::join::{Fleet, Joined};
 use crate::serve::fleet::proposals::Proposal;
-use crate::serve::machines::changes::{Approved, Proposed, Signed};
+use crate::serve::machines::changes::{Approved, Proposed, Rotation, Signed};
 use crate::serve::machines::leave::{Heard, Removed, RmAnswer};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
 use crate::serve::machines::ssh;
@@ -372,8 +372,38 @@ pub fn key() -> Result<()> {
 }
 
 /// `<name> <key>`, then the fingerprint; `-` for a host with no valid name.
+/// A pending rotation's next key after.
 fn key_text(info: &MemberInfo) -> String {
-    format!("{} {}\n{}\n", info.name.as_deref().unwrap_or("-"), info.key, info.fingerprint)
+    let mut text = format!("{} {}\n{}\n", info.name.as_deref().unwrap_or("-"), info.key, info.fingerprint);
+    if let Some(next) = &info.next {
+        text.push_str(&format!("rotating to {} ({}): this host's key once the authority's signed change reaches it\n", next.fingerprint, next.key));
+    }
+    text
+}
+
+/// `machine key rotate`: a new key for this host (`membership.rotate`),
+/// signed here on the authority or proposed to it.
+pub fn rotate_key() -> Result<()> {
+    let mut conn = connect()?;
+    let r: Rotation = call(&mut conn, "membership.rotate", Value::Null)?;
+    for line in rotation_lines(&r) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn rotation_lines(r: &Rotation) -> Vec<String> {
+    match r {
+        Rotation::Rotated(r) => {
+            let mut lines = vec![format!("this host's key is now {} ({})", r.fingerprint, r.key)];
+            lines.extend(signed_lines(&r.signed));
+            lines
+        }
+        Rotation::Proposed(p) => vec![
+            proposed_line(&format!("rotating this host's key to {}", p.fingerprint), &p.proposed),
+            "this host keeps its key until the signed change reaches it".into(),
+        ],
+    }
 }
 
 /// What `machine roots` does.
@@ -1038,9 +1068,29 @@ mod tests {
             roots: Vec::new(),
             fingerprint: key.fingerprint(),
             key,
+            next: None,
         };
         assert_eq!(key_text(&info), format!("lap {key}\n{}\n", key.fingerprint()));
-        assert!(key_text(&MemberInfo { name: None, ..info }).starts_with("- ed25519:"));
+        assert!(key_text(&MemberInfo { name: None, ..info.clone() }).starts_with("- ed25519:"));
+        let next = SigningKey::from_seed([3; 32]).public_key();
+        let pending = MemberInfo { next: Some(crate::serve::fleet::membership_api::KeyInfo::of(&next)), ..info };
+        assert!(key_text(&pending).ends_with(&format!("\nrotating to {} ({next}): this host's key once the authority's signed change reaches it\n", next.fingerprint())));
+    }
+
+    #[test]
+    fn rotation_says_the_new_key_and_where_it_went() {
+        use crate::serve::fleet::identity::{Signer as _, SigningKey};
+        use crate::serve::machines::changes::{RotateProposed, Rotated};
+        let key = SigningKey::from_seed([2; 32]).public_key();
+        let signed = Signed { name: "lap".into(), change: "rotate `lap`'s key".into(), pushed: vec!["box".into()], unpushed: vec![], removed: None, error: None };
+        let r = Rotation::Rotated(Rotated { key, fingerprint: key.fingerprint(), signed });
+        assert_eq!(rotation_lines(&r), [format!("this host's key is now {} ({key})", key.fingerprint()), "signed rotate `lap`'s key".into(), "sent to box".into()]);
+        let proposed = Proposed { name: "pi".into(), authority: "lap".into(), id: Some(4), error: None };
+        let r = Rotation::Proposed(RotateProposed { key, fingerprint: key.fingerprint(), proposed });
+        assert_eq!(
+            rotation_lines(&r)[0],
+            format!("proposed rotating this host's key to {} to lap: approve there with `devsandbox machine approve 4`", key.fingerprint())
+        );
     }
 
     #[test]

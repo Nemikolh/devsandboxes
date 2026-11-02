@@ -11,6 +11,11 @@
 //! `member.toml`'s `hub` from the log it accepted (`member::set_fleet`): the
 //! only way a hub is set. [`sync`] is the same store for a pushed log
 //! (`fleet.sync`, `machines::changes`), which may revoke this host.
+//!
+//! A pending key rotation (`member.key.next`, `machine key rotate`) is
+//! settled on that path too ([`settle`]): a log that lists this host under
+//! the next key is taken, and the next key promoted to `member.key` once
+//! it's stored; this host proves and signs with it from then on.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -59,12 +64,21 @@ pub struct MembershipInfo {
     /// log.
     pub stored: Option<Wire>,
     pub summary: Summary,
+    /// The pending rotation's next key (`member.key.next`), until a log
+    /// listing it is taken; `None` when none is pending.
+    pub next: Option<KeyInfo>,
+}
+
+impl KeyInfo {
+    pub fn of(key: &PublicKey) -> KeyInfo {
+        KeyInfo { key: *key, fingerprint: key.fingerprint() }
+    }
 }
 
 impl MembershipInfo {
     pub fn of(stored: Option<&Stored>) -> MembershipInfo {
         let m = stored.and_then(|s| s.log.membership());
-        let key_info = |key: &PublicKey| KeyInfo { key: *key, fingerprint: key.fingerprint() };
+        let key_info = KeyInfo::of;
         let summary = Summary {
             authority: m.map(|m| m.authority.0.clone()),
             hub: m.map(|m| m.hub.clone()),
@@ -79,7 +93,7 @@ impl MembershipInfo {
                 .unwrap_or_default(),
             head: m.map_or(Head::EMPTY, |m| m.head),
         };
-        MembershipInfo { stored: stored.filter(|s| s.log.membership().is_some()).map(Stored::to_wire), summary }
+        MembershipInfo { stored: stored.filter(|s| s.log.membership().is_some()).map(Stored::to_wire), summary, next: None }
     }
 
     /// `stored` verified (`None`: the empty log).
@@ -88,11 +102,21 @@ impl MembershipInfo {
     }
 }
 
-/// A host as the rules see it: its member name and key.
+/// A host as the rules see it: its member name and key, and the next key
+/// of a pending rotation (`member.key.next`).
 #[derive(Debug, Clone, Copy)]
 pub struct Own<'a> {
     pub name: &'a str,
     pub key: PublicKey,
+    pub next: Option<PublicKey>,
+}
+
+impl Own<'_> {
+    /// `stored` lists this host: by its name, under its key or its pending
+    /// next one.
+    fn listed(&self, stored: &Stored) -> bool {
+        lists(stored, self.name, &self.key) || self.next.is_some_and(|n| lists(stored, self.name, &n))
+    }
 }
 
 /// `stored` lists `name` as `key`: a member of its log, or held as an
@@ -106,8 +130,9 @@ pub fn lists(stored: &Stored, name: &str, key: &PublicKey) -> bool {
 /// behind theirs takes its later entries; ours the same or ahead keeps ours;
 /// another fleet's or a fork is `denied`. Their introductions the result
 /// hasn't settled are held too (one that doesn't check refuses the whole).
-/// The result must list `own` (a member, or introduced): a host never
-/// takes a fleet that doesn't contain it.
+/// The result must list `own` (a member, or introduced; under its key, or
+/// its pending next one when a rotate of it is in): a host never takes a
+/// fleet that doesn't contain it.
 pub fn adopt_into(ours: &Stored, theirs: &Stored, own: &Own) -> Result<Stored, ApiError> {
     take_into(ours, theirs, own, false)
 }
@@ -146,7 +171,7 @@ fn take_into(ours: &Stored, theirs: &Stored, own: &Own, revoked_ok: bool) -> Res
             .map_err(|e| ApiError::denied(format!("introduction of `{}` by `{}`: {e:#}", i.name, i.introducer)))?;
     }
     let revoked_here = revoked_ok && next.log.membership().is_some_and(|m| m.revoked.contains(&own.key));
-    if !lists(&next, own.name, &own.key) && !revoked_here {
+    if !own.listed(&next) && !revoked_here {
         return Err(ApiError::denied(format!(
             "this membership log doesn't list this host (`{}`, {}): a host takes only a fleet that contains it",
             own.name,
@@ -222,12 +247,58 @@ pub fn sign_into(ours: &Stored, own: &Own, signer: &impl Signer, name: &str, key
 }
 
 /// This host's member name (`member.toml`, else the hostname's) and key
-/// (`member.key`, made on first use).
+/// (`member.key`, made on first use; a pending rotation the stored log
+/// already lists settled first, [`settle`]).
 pub fn own(member_toml: &Path, hostname: &str) -> Result<(String, SigningKey), ApiError> {
+    let (name, key, _) = own_keys(member_toml, hostname)?;
+    Ok((name, key))
+}
+
+/// [`own`], and the pending rotation's next key, if one still is.
+fn own_keys(member_toml: &Path, hostname: &str) -> Result<(String, SigningKey, Option<SigningKey>), ApiError> {
     let m = member::load(member_toml).map_err(ApiError::internal)?.unwrap_or_default();
     let name = m.name_or(hostname).map_err(|e| ApiError::failed(format!("{e:#}")))?;
-    let key = FileKeyStore::new(member::key_path(member_toml)).signing_key().map_err(ApiError::internal)?;
-    Ok((name, key))
+    let store = FileKeyStore::new(member::key_path(member_toml));
+    let Settled { key, next, .. } = settle(&store, &name, load(member_toml)?.as_ref()).map_err(ApiError::internal)?;
+    let key = match key {
+        Some(key) => key,
+        None => store.signing_key().map_err(ApiError::internal)?,
+    };
+    Ok((name, key, next))
+}
+
+/// [`settle`]'s answer.
+#[derive(Debug)]
+pub struct Settled {
+    /// This host's key; `None`: no `member.key` yet.
+    pub key: Option<SigningKey>,
+    /// The pending rotation's next key, while one still is.
+    pub next: Option<SigningKey>,
+    /// This settle moved the next key over `member.key`.
+    pub promoted: bool,
+}
+
+/// This host's key and its pending next one, against `stored`: when
+/// `stored` lists `name` under the next key (the rotate is in the log), the
+/// next key is promoted to `member.key` and is the key, none pending.
+/// Idempotent, and how a crash between storing a log and the promotion is
+/// caught up: every read of this host's key settles.
+pub fn settle(store: &FileKeyStore, name: &str, stored: Option<&Stored>) -> anyhow::Result<Settled> {
+    let Some(next) = store.pending()? else {
+        return Ok(Settled { key: store.load()?, next: None, promoted: false });
+    };
+    if stored.is_some_and(|s| lists(s, name, &next.public_key())) {
+        let promoted = store.promote(&next.public_key())?;
+        return Ok(Settled { key: Some(next), next: None, promoted });
+    }
+    Ok(Settled { key: store.load()?, next: Some(next), promoted: false })
+}
+
+/// The pending rotation's next key next to `member_toml`, as
+/// `membership.get` and `member.get` show it.
+pub fn pending_next(member_toml: &Path) -> Result<Option<KeyInfo>, ApiError> {
+    let next = FileKeyStore::new(member::key_path(member_toml)).pending().map_err(ApiError::internal)?;
+    Ok(next.map(|k| KeyInfo::of(&k.public_key())))
 }
 
 /// This host's stored log (`None`: in no fleet's log).
@@ -235,26 +306,39 @@ pub fn load(member_toml: &Path) -> Result<Option<Stored>, ApiError> {
     membership::load(&membership::path(member_toml)).map_err(ApiError::internal)
 }
 
-/// `membership.adopt`: `theirs` taken ([`adopt_into`]) and stored, then
-/// `member.toml`'s `hub` (and the name the log knows this host by) written
-/// from the log. The answer, and the hub the daemon follows.
-pub fn adopt(member_toml: &Path, hostname: &str, theirs: &Stored) -> Result<(MembershipInfo, Hub), ApiError> {
-    let (after, hub, _) = take(member_toml, hostname, theirs, adopt_into)?;
-    Ok((MembershipInfo::of(Some(&after)), hub))
+/// What a store on the adopt path did ([`adopt`], [`sync`]).
+#[derive(Debug)]
+pub struct Taken {
+    /// What's stored now.
+    pub stored: Stored,
+    /// The hub written from it, for the daemon to follow.
+    pub hub: Hub,
+    /// The store changed the log or its introductions.
+    pub changed: bool,
+    /// It promoted this host's pending next key (a rotate of it is in): the
+    /// daemon ends every link this host is on, so each redials proving the
+    /// new key (`daemon::Shared::key_rotated`).
+    pub rotated: bool,
 }
 
-/// `fleet.sync`'s store: `theirs` taken as [`sync_into`] says, stored, and
-/// `hub` written as [`adopt`] does. What's stored now, the hub, and whether
-/// it changed.
-pub fn sync(member_toml: &Path, hostname: &str, theirs: &Stored) -> Result<(Stored, Hub, bool), ApiError> {
+/// `membership.adopt`: `theirs` taken ([`adopt_into`]) and stored, then
+/// `member.toml`'s `hub` (and the name the log knows this host by) written
+/// from the log, and a pending rotation the log lists promoted.
+pub fn adopt(member_toml: &Path, hostname: &str, theirs: &Stored) -> Result<Taken, ApiError> {
+    take(member_toml, hostname, theirs, adopt_into)
+}
+
+/// `fleet.sync`'s store: `theirs` taken as [`sync_into`] says, then as
+/// [`adopt`] does.
+pub fn sync(member_toml: &Path, hostname: &str, theirs: &Stored) -> Result<Taken, ApiError> {
     take(member_toml, hostname, theirs, sync_into)
 }
 
 type Take = fn(&Stored, &Stored, &Own) -> Result<Stored, ApiError>;
 
-fn take(member_toml: &Path, hostname: &str, theirs: &Stored, rule: Take) -> Result<(Stored, Hub, bool), ApiError> {
-    let (name, key) = own(member_toml, hostname)?;
-    let own = Own { name: &name, key: key.public_key() };
+fn take(member_toml: &Path, hostname: &str, theirs: &Stored, rule: Take) -> Result<Taken, ApiError> {
+    let (name, key, next) = own_keys(member_toml, hostname)?;
+    let own = Own { name: &name, key: key.public_key(), next: next.as_ref().map(Signer::public_key) };
     let (after, changed) = membership::update(&membership::path(member_toml), |cur| -> Result<(Stored, bool), ApiError> {
         let next = rule(cur, theirs, &own)?;
         let changed = next != *cur;
@@ -262,16 +346,18 @@ fn take(member_toml: &Path, hostname: &str, theirs: &Stored, rule: Take) -> Resu
         Ok((cur.clone(), changed))
     })
     .map_err(ApiError::internal)??;
+    // A rotate of this host's key is in: the next key is the key now.
+    let settled = settle(&FileKeyStore::new(member::key_path(member_toml)), &name, Some(&after)).map_err(ApiError::internal)?;
     let hub = membership::hub_for(after.log.membership().expect("adopted"), &name);
     member::set_fleet(member_toml, Some(&name), &hub).map_err(ApiError::internal)?;
-    Ok((after, hub, changed))
+    Ok(Taken { stored: after, hub, changed, rotated: settled.promoted })
 }
 
 /// `membership.sign`: `name` (`key`) let in here ([`sign_into`]), stored;
 /// the whole of it answered for the joining host to adopt.
 pub fn sign(member_toml: &Path, hostname: &str, name: &str, key: &PublicKey) -> Result<Wire, ApiError> {
     let (own_name, signer) = own(member_toml, hostname)?;
-    let own = Own { name: &own_name, key: signer.public_key() };
+    let own = Own { name: &own_name, key: signer.public_key(), next: None };
     let after = membership::update(&membership::path(member_toml), |cur| -> Result<Stored, ApiError> {
         *cur = sign_into(cur, &own, &signer, name, key)?;
         Ok(cur.clone())
@@ -291,17 +377,29 @@ fn to_value(x: impl Serialize) -> Answer {
     serde_json::to_value(x).map_err(|e| ApiError::internal(e.into()))
 }
 
+/// What the daemon follows after an adopt: the hub it wrote, and whether it
+/// promoted this host's next key (every link then ends and redials).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Follow {
+    pub hub: Hub,
+    pub rotated: bool,
+}
+
 /// Run `method` if it's a `membership.*` one (`None` otherwise): its answer,
-/// and the hub an adopt wrote, for the daemon to follow.
-pub fn call(method: &str, params: Value, member_toml: &Path, hostname: &str) -> Option<(Answer, Option<Hub>)> {
+/// and what an adopt leaves for the daemon to follow.
+pub fn call(method: &str, params: Value, member_toml: &Path, hostname: &str) -> Option<(Answer, Option<Follow>)> {
     let answer = match method {
-        "membership.get" => (load(member_toml).and_then(|s| to_value(MembershipInfo::of(s.as_ref()))), None),
+        "membership.get" => {
+            let info = load(member_toml).and_then(|s| Ok(MembershipInfo { next: pending_next(member_toml)?, ..MembershipInfo::of(s.as_ref()) }));
+            (info.and_then(to_value), None)
+        }
         "membership.adopt" => {
             let adopted = parse::<Wire>(params)
                 .and_then(|w| Stored::from_wire(w).map_err(|e| ApiError::invalid(format!("{e:#}"))))
-                .and_then(|theirs| adopt(member_toml, hostname, &theirs));
+                .and_then(|theirs| adopt(member_toml, hostname, &theirs))
+                .and_then(|t| Ok((MembershipInfo { next: pending_next(member_toml)?, ..MembershipInfo::of(Some(&t.stored)) }, t)));
             match adopted {
-                Ok((info, hub)) => (to_value(info), Some(hub)),
+                Ok((info, t)) => (to_value(info), Some(Follow { hub: t.hub, rotated: t.rotated })),
                 Err(e) => (Err(e), None),
             }
         }
@@ -384,7 +482,7 @@ mod tests {
     }
 
     fn own(name: &str, n: u8) -> Own<'_> {
-        Own { name, key: pk(n) }
+        Own { name, key: pk(n), next: None }
     }
 
     /// `lap` (1) the authority, `box` (2) the hub, `pi` (3) a member.
@@ -482,6 +580,70 @@ mod tests {
         assert!(sync_into(&s, &other, &own("pi", 3)).unwrap_err().message.contains("another fleet"));
     }
 
+    /// A log that rotated this host's key to its pending next one is taken
+    /// (an adopt or a sync); one listing neither key is refused as before.
+    #[test]
+    fn a_log_listing_the_next_key_is_taken() {
+        let s = three();
+        let mut rotated = s.clone();
+        let g = s.log.membership().unwrap().genesis;
+        let by_old = membership::countersign_rotate(&g, "pi", &pk(9), &key(3));
+        rotated.log.append(Op::Rotate { name: "pi".into(), old: pk(3), new: pk(9), by_old }, "lap", &key(1)).unwrap();
+        let pending = Own { name: "pi", key: pk(3), next: Some(pk(9)) };
+        assert_eq!(adopt_into(&s, &rotated, &pending).unwrap(), rotated);
+        assert_eq!(adopt_into(&Stored::default(), &rotated, &pending).unwrap(), rotated);
+        assert_eq!(adopt_into(&Stored::default(), &rotated, &own("pi", 3)).unwrap_err().code, "denied", "no next key here");
+        let other = Own { name: "pi", key: pk(3), next: Some(pk(8)) };
+        assert_eq!(adopt_into(&Stored::default(), &rotated, &other).unwrap_err().code, "denied", "another next key");
+        // Before the rotate is in, the current key lists it.
+        assert_eq!(adopt_into(&Stored::default(), &s, &pending).unwrap(), s);
+    }
+
+    /// The adopt path promotes `member.key.next` once a log listing it is
+    /// stored (and only then); `membership.get` shows it while pending.
+    #[test]
+    fn the_adopt_path_promotes_the_next_key() {
+        let dir = scratch("promote");
+        let member_toml = dir.join("member.toml");
+        member::write_for_test(&member_toml, &member::Member { name: "pi".into(), ..Default::default() });
+        let mine = test_support::key_of(&member_toml);
+        let store = FileKeyStore::new(member::key_path(&member_toml));
+        let s = fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", mine.public_key())]);
+        test_support::write(&member_toml, &s);
+        let next = store.next_key().unwrap();
+        let call = |m: &str, p: Value| super::call(m, p, &member_toml, "host").unwrap().0.unwrap();
+        let got = call("membership.get", Value::Null);
+        assert_eq!(got["next"], json!({"key": next.public_key(), "fingerprint": next.public_key().fingerprint()}));
+        // A log without the rotate: the key stays, the next one waits.
+        assert_eq!(call("membership.adopt", serde_json::to_value(s.to_wire()).unwrap())["next"]["key"], json!(next.public_key()));
+        assert_eq!(super::own(&member_toml, "host").unwrap().1.public_key(), mine.public_key());
+
+        let mut rotated = s.clone();
+        let g = s.log.membership().unwrap().genesis;
+        let by_old = membership::countersign_rotate(&g, "pi", &next.public_key(), &mine);
+        rotated.log.append(Op::Rotate { name: "pi".into(), old: mine.public_key(), new: next.public_key(), by_old }, "lap", &key(1)).unwrap();
+        let (got, follow) = super::call("membership.adopt", serde_json::to_value(rotated.to_wire()).unwrap(), &member_toml, "host").unwrap();
+        assert_eq!(got.unwrap()["next"], Value::Null);
+        assert!(follow.unwrap().rotated, "the daemon ends its links");
+        assert_eq!(store.load().unwrap().unwrap().public_key(), next.public_key(), "promoted");
+        assert!(!store.next_path().exists());
+        assert_eq!(super::own(&member_toml, "host").unwrap().1.public_key(), next.public_key());
+        // Again: idempotent, nothing to follow.
+        let (_, follow) = super::call("membership.adopt", serde_json::to_value(rotated.to_wire()).unwrap(), &member_toml, "host").unwrap();
+        assert!(!follow.unwrap().rotated);
+        assert_eq!(store.load().unwrap().unwrap().public_key(), next.public_key());
+
+        // A crash between storing that log and the rename: the next read settles it.
+        let later = store.next_key().unwrap();
+        let mut again = rotated.clone();
+        let by_old = membership::countersign_rotate(&g, "pi", &later.public_key(), &next);
+        again.log.append(Op::Rotate { name: "pi".into(), old: next.public_key(), new: later.public_key(), by_old }, "lap", &key(1)).unwrap();
+        test_support::write(&member_toml, &again);
+        assert_eq!(super::own(&member_toml, "host").unwrap().1.public_key(), later.public_key());
+        assert!(!store.next_path().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_calls_go_through_the_files() {
         let dir = scratch("calls");
@@ -493,7 +655,7 @@ mod tests {
         let (got, hub) = call("membership.get", Value::Null);
         assert_eq!(hub, None);
         let head = serde_json::to_value(Head::EMPTY).unwrap();
-        assert_eq!(got.unwrap(), json!({"stored": null, "summary": {"authority": null, "hub": null, "members": {}, "introductions": [], "head": head}}));
+        assert_eq!(got.unwrap(), json!({"stored": null, "summary": {"authority": null, "hub": null, "members": {}, "introductions": [], "head": head}, "next": null}));
         let (e, _) = call("membership.sign", json!({"name": "new", "key": pk(5)}));
         assert_eq!(e.unwrap_err().code, "denied", "in no fleet");
 
@@ -501,7 +663,7 @@ mod tests {
         let s = fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", mine.public_key())]);
         let (got, hub) = call("membership.adopt", serde_json::to_value(s.to_wire()).unwrap());
         let got = got.unwrap();
-        assert_eq!(hub, Some(Hub::Other("box".into())));
+        assert_eq!(hub, Some(Follow { hub: Hub::Other("box".into()), rotated: false }));
         assert_eq!((&got["summary"]["authority"], &got["summary"]["hub"]), (&json!("lap"), &json!("box")));
         assert_eq!(got["summary"]["members"]["pi"]["fingerprint"], mine.public_key().fingerprint());
         assert_eq!(test_support::read(&member_toml).unwrap(), s);

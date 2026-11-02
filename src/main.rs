@@ -529,14 +529,34 @@ enum MachineCommand {
         #[command(subcommand)]
         cmd: Option<RootsCommand>,
     },
-    /// Show this host's member key and its fingerprint
+    /// Show this host's member key and its fingerprint, or rotate it
     ///
     /// Prints `<name> ed25519:<hex>`, then the fingerprint to compare with
-    /// what another machine shows for this one. The key (`member.key`, next
-    /// to `member.toml`) is made on first use.
+    /// what another machine shows for this one, and a pending rotation's
+    /// next key. The key (`member.key`, next to `member.toml`) is made on
+    /// first use.
     ///
     ///     devsandbox machine key
-    Key,
+    Key {
+        #[command(subcommand)]
+        cmd: Option<KeyCommand>,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Replace this host's member key with a new one, countersigned by it
+    ///
+    /// On the fleet's authority the change is signed at once and sent to
+    /// the machines it links to; this host then signs and proves with the
+    /// new key. On another member it's proposed to the authority (linked
+    /// directly), approved there with `machine approve`; this host keeps
+    /// its key until the signed change reaches it. Running it again while
+    /// one is pending proposes the same new key again.
+    ///
+    ///     devsandbox machine key rotate
+    Rotate,
 }
 
 #[cfg(unix)]
@@ -874,7 +894,8 @@ fn main() -> Result<()> {
             MachineCommand::Approve { id } => commands::machine::approve(id),
             MachineCommand::Deny { id } => commands::machine::deny(id),
             MachineCommand::Trust { trust } => commands::machine::trust(trust),
-            MachineCommand::Key => commands::machine::key(),
+            MachineCommand::Key { cmd: None } => commands::machine::key(),
+            MachineCommand::Key { cmd: Some(KeyCommand::Rotate) } => commands::machine::rotate_key(),
             MachineCommand::Roots { cmd } => commands::machine::roots(match cmd {
                 None => commands::machine::RootsOp::Show,
                 Some(RootsCommand::Add { paths }) => commands::machine::RootsOp::Add(paths),

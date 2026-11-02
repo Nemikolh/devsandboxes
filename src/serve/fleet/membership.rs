@@ -160,7 +160,6 @@ fn rotate_message(genesis: &[u8; 32], name: &str, new: &PublicKey) -> Vec<u8> {
 
 /// `old`'s countersignature of `name` moving to `new` in the fleet of
 /// genesis hash `genesis` ([`Membership::genesis`]): a `rotate`'s `by_old`.
-#[cfg_attr(not(test), allow(dead_code))] // `machine key rotate` (10a.6)
 pub fn countersign_rotate(genesis: &[u8; 32], name: &str, new: &PublicKey, old: &impl Signer) -> Signature {
     old.sign(ROTATE_DOMAIN, &rotate_message(genesis, name, new))
 }
@@ -297,6 +296,12 @@ impl Membership {
     /// `intros` without those the log has settled ([`Membership::settles`]).
     pub fn drop_settled(&self, intros: &mut Vec<Introduction>) {
         intros.retain(|i| !self.settles(i));
+    }
+
+    /// Whether `op` would apply as the next entry (the rules but the
+    /// entry's signature): what a proposal is checked by.
+    pub fn check_op(&self, op: &Op) -> Result<()> {
+        self.clone().apply_op(op)
     }
 
     /// `op` applied (the rules but the signature's).

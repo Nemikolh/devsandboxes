@@ -79,6 +79,10 @@ pub struct Ctx {
     /// daemon follows it as after a `membership.adopt`
     /// (`daemon::Shared::set_hub`).
     pub hub_changed: Box<dyn Fn(Hub) + Send + Sync>,
+    /// This host's next key was promoted (a rotate of it stored): every
+    /// link it's on ends and redials proving the new key
+    /// (`daemon::Shared::key_rotated`).
+    pub key_rotated: Box<dyn Fn() + Send + Sync>,
     /// End inbound neighbor `name`'s link: its `fleet-link`'s held
     /// `links.inbound` connection gets `links.cycle` and hangs up
     /// (`rm`, `fleet.forget`).
@@ -320,7 +324,11 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
     saved.map_err(ApiError::internal).and_then(|r| r).map_err(|e| after(e, &written))?;
     written.push(format!("this host's machines.toml (`{}`)", entry.name));
     // Its `hub` (and the name the fleet knows it by) from the log.
-    let (_, hub) = membership_api::adopt(member_toml, &ctx.hostname, &here).map_err(|e| after(e, &written))?;
+    let taken = membership_api::adopt(member_toml, &ctx.hostname, &here).map_err(|e| after(e, &written))?;
+    let hub = taken.hub;
+    if taken.rotated {
+        (ctx.key_rotated)();
+    }
     (ctx.hub_changed)(hub);
     if let Some(links) = &ctx.links {
         links.reload();
@@ -671,7 +679,7 @@ mod tests {
     fn capped(name: &str, key: PublicKey) -> Stored {
         let m = SigningKey::from_seed([8; 32]);
         let s = fleet("k", &k_key(), "k", &[("m", m.public_key())]);
-        membership_api::sign_into(&s, &membership_api::Own { name: "m", key: m.public_key() }, &m, name, &key).unwrap()
+        membership_api::sign_into(&s, &membership_api::Own { name: "m", key: m.public_key(), next: None }, &m, name, &key).unwrap()
     }
 
     /// What a test fleet's setup writes: this host's and the machine's
@@ -1318,7 +1326,21 @@ mod tests {
         let g = s.log.membership().unwrap().genesis;
         let i = crate::serve::fleet::membership::Introduction::sign(&g, "new", key, "lap", &SigningKey::from_seed([1; 32]));
         assert_variant_kind("FleetChangeAdd", &to_value(Change::Add { introduction: i }).unwrap());
-        assert_eq!(union_members("FleetChange"), ["FleetChangeAdd", "FleetChangeRevoke"]);
+        let old = SigningKey::from_seed([1; 32]);
+        let by_old = crate::serve::fleet::membership::countersign_rotate(&g, "lap", &key, &old);
+        assert_variant_kind("FleetChangeRotate", &to_value(Change::Rotate { name: "lap".into(), old: old.public_key(), new: key, by_old }).unwrap());
+        assert_eq!(union_members("FleetChange"), ["FleetChangeAdd", "FleetChangeRevoke", "FleetChangeRotate"]);
+        use super::super::changes::{RotateProposed, Rotated, Rotation};
+        let signed = Signed { name: "lap".into(), change: "rotate `lap`'s key".into(), pushed: vec![], unpushed: vec![], removed: None, error: None };
+        let rotated = Rotation::Rotated(Rotated { key, fingerprint: key.fingerprint(), signed });
+        assert_variant("MembershipRotated", &to_value(&rotated).unwrap());
+        let proposed = Proposed { name: "pi".into(), authority: "lap".into(), id: Some(3), error: None };
+        let rp = Rotation::Proposed(RotateProposed { key, fingerprint: key.fingerprint(), proposed });
+        assert_variant("MembershipRotateProposed", &to_value(&rp).unwrap());
+        for r in [rotated, rp] {
+            assert_eq!(serde_json::from_value::<Rotation>(to_value(&r).unwrap()).unwrap(), r, "round trip");
+        }
+        assert_eq!(union_members("MembershipRotateResult"), ["MembershipRotated", "MembershipRotateProposed"]);
         let synced = super::super::changes::Synced { changed: true, head: s.log.head() };
         assert_matches("FleetSynced", &to_value(synced).unwrap());
         assert_matches("FleetQueued", &to_value(super::super::changes::Queued { id: 1, pending: true }).unwrap());
@@ -1343,6 +1365,7 @@ mod tests {
             ("membership.pending", "FleetProposal[]"),
             ("membership.approve", "MembershipApproved"),
             ("membership.deny", "OkResult"),
+            ("membership.rotate", "MembershipRotateResult"),
             ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
         ] {

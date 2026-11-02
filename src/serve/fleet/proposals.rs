@@ -1,6 +1,7 @@
 //! Membership changes proposed to the authority (docs/architecture/daemon/fleet.md,
-//! *Approvals*; fleet plan step 10a.6, decision 49): a member's `machine rm`
-//! or the introduction its `machine add` signed reaches the authority as
+//! *Approvals*; fleet plan step 10a.6, decision 49): a member's `machine rm`,
+//! its `machine key rotate`, or the introduction its `machine add` signed
+//! reaches the authority as
 //! `fleet.propose {op}` and waits in `proposals.json` (next to
 //! `membership.json`, [`path`]) until the user runs `devsandbox machine
 //! approve|deny <id>` there. The authority's key never signs on a remote
@@ -16,10 +17,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::identity::{PublicKey, Signature};
 use super::membership::{Introduction, Membership, Op, check_introduction};
 
 /// A proposed change. On the wire tagged by `kind`: `{"kind": "revoke",
-/// "name": "pi"}`, `{"kind": "add", "introduction": {…}}`.
+/// "name": "pi"}`, `{"kind": "add", "introduction": {…}}`, `{"kind":
+/// "rotate", "name": "pi", "old": …, "new": …, "by_old": …}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Change {
@@ -27,16 +30,28 @@ pub enum Change {
     Add { introduction: Introduction },
     /// `name` out of the fleet: a `revoke` of its key.
     Revoke { name: String },
+    /// The proposer's own key from `old` to `new`, countersigned by `old`
+    /// (`membership::countersign_rotate`): a `rotate` entry as is.
+    Rotate { name: String, old: PublicKey, new: PublicKey, by_old: Signature },
 }
 
 impl Change {
     /// The same change as `other`: a revoke of the same name, an add of the
-    /// same name and key.
+    /// same name and key, a rotate of the same name to the same key.
     fn same(&self, other: &Change) -> bool {
         match (self, other) {
             (Change::Revoke { name: a }, Change::Revoke { name: b }) => a == b,
             (Change::Add { introduction: a }, Change::Add { introduction: b }) => a.name == b.name && a.key == b.key,
+            (Change::Rotate { name: a, new: x, .. }, Change::Rotate { name: b, new: y, .. }) => a == b && x == y,
             _ => false,
+        }
+    }
+
+    /// The member the change is about.
+    pub fn subject(&self) -> &str {
+        match self {
+            Change::Add { introduction } => &introduction.name,
+            Change::Revoke { name } | Change::Rotate { name, .. } => name,
         }
     }
 }
@@ -48,16 +63,31 @@ impl fmt::Display for Change {
                 write!(f, "add {} to the fleet (introduced by {}, key {})", i.name, i.introducer, i.key.fingerprint())
             }
             Change::Revoke { name } => write!(f, "remove {name} from the fleet"),
+            Change::Rotate { name, new, .. } => write!(f, "rotate {name}'s key to {}", new.fingerprint()),
         }
     }
 }
 
-/// The entry `change` makes the authority sign, checked against `m` (pure):
-/// a revoke of a member's current key (not the authority's, not the hub's),
-/// or an add of an introduction that holds ([`check_introduction`]: its
-/// introducer a member of the log, its name and key new). Why not, else.
-pub fn check(m: &Membership, change: &Change) -> Result<Op, String> {
+/// The entry `change`, proposed by member `from`, makes the authority sign,
+/// checked against `m` (pure): a revoke of a member's current key (not the
+/// authority's, not the hub's), an add of an introduction that holds
+/// ([`check_introduction`]: its introducer a member of the log, its name
+/// and key new), or a rotate of `from`'s own key (a member rotates only its
+/// own): from its current key, countersigned by it, to a key the log
+/// doesn't know. Why not, else.
+pub fn check(m: &Membership, from: &str, change: &Change) -> Result<Op, String> {
     match change {
+        Change::Rotate { name, old, new, by_old } => {
+            if name != from {
+                return Err(format!("a member rotates only its own key: `{from}` proposed a rotate of `{name}`'s"));
+            }
+            if m.key_of(name) == Some(*new) {
+                return Err(format!("`{name}`'s key is {} already: the rotate is signed", new.fingerprint()));
+            }
+            let op = Op::Rotate { name: name.clone(), old: *old, new: *new, by_old: *by_old };
+            m.check_op(&op).map_err(|e| format!("rotate of `{name}`'s key: {e:#}"))?;
+            Ok(op)
+        }
         Change::Revoke { name } => {
             if *name == m.authority.0 {
                 return Err(format!("`{name}` is the fleet's authority: it can't be removed"));
@@ -150,6 +180,7 @@ mod tests {
 
     use super::*;
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
+    use crate::serve::fleet::membership::countersign_rotate;
     use crate::serve::fleet::membership_api::test_support::fleet;
 
     fn key(n: u8) -> SigningKey {
@@ -172,17 +203,63 @@ mod tests {
     #[test]
     fn a_change_checks_against_the_log() {
         let m = three();
-        assert_eq!(check(&m, &revoke("pi")), Ok(Op::Revoke { name: "pi".into(), key: pk(3) }));
-        assert!(check(&m, &revoke("lap")).unwrap_err().contains("the fleet's authority"));
-        assert!(check(&m, &revoke("box")).unwrap_err().contains("is the hub: name another hub first"));
-        assert!(check(&m, &revoke("zed")).unwrap_err().contains("not a member"));
+        assert_eq!(check(&m, "box", &revoke("pi")), Ok(Op::Revoke { name: "pi".into(), key: pk(3) }));
+        assert!(check(&m, "box", &revoke("lap")).unwrap_err().contains("the fleet's authority"));
+        assert!(check(&m, "pi", &revoke("box")).unwrap_err().contains("is the hub: name another hub first"));
+        assert!(check(&m, "pi", &revoke("zed")).unwrap_err().contains("not a member"));
         let by_pi = Introduction::sign(&m.genesis, "new", pk(5), "pi", &key(3));
-        assert_eq!(check(&m, &Change::Add { introduction: by_pi }), Ok(Op::Add { name: "new".into(), key: pk(5) }));
+        assert_eq!(check(&m, "pi", &Change::Add { introduction: by_pi }), Ok(Op::Add { name: "new".into(), key: pk(5) }));
         // An introducer that isn't a member (a capped one), a name taken.
         let by_new = Introduction::sign(&m.genesis, "other", pk(6), "new", &key(5));
-        assert!(check(&m, &Change::Add { introduction: by_new }).unwrap_err().contains("not a member of the log"));
+        assert!(check(&m, "pi", &Change::Add { introduction: by_new }).unwrap_err().contains("not a member of the log"));
         let taken = Introduction::sign(&m.genesis, "pi", pk(6), "box", &key(2));
-        assert!(check(&m, &Change::Add { introduction: taken }).unwrap_err().contains("already a member"));
+        assert!(check(&m, "box", &Change::Add { introduction: taken }).unwrap_err().contains("already a member"));
+    }
+
+    /// `name`'s key from `old` (seed) to `new` (seed), countersigned by
+    /// `signer` (seed).
+    fn rotate(m: &Membership, name: &str, old: u8, new: u8, signer: u8) -> Change {
+        let by_old = countersign_rotate(&m.genesis, name, &pk(new), &key(signer));
+        Change::Rotate { name: name.into(), old: pk(old), new: pk(new), by_old }
+    }
+
+    #[test]
+    fn a_rotate_is_of_the_proposers_own_key_countersigned_by_it() {
+        let s = fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", pk(3))]);
+        let m = s.log.membership().unwrap().clone();
+        let ok = rotate(&m, "pi", 3, 9, 3);
+        let Change::Rotate { by_old, .. } = &ok else { unreachable!() };
+        assert_eq!(check(&m, "pi", &ok), Ok(Op::Rotate { name: "pi".into(), old: pk(3), new: pk(9), by_old: *by_old }));
+        // The authority rotates its own the same way.
+        assert!(check(&m, "lap", &rotate(&m, "lap", 1, 9, 1)).is_ok());
+        // Someone else's key: refused, even countersigned.
+        let e = check(&m, "box", &ok).unwrap_err();
+        assert!(e.contains("rotates only its own key") && e.contains("`box` proposed a rotate of `pi`'s"), "{e}");
+        // A bad countersignature: by another key, or over another new key.
+        assert!(check(&m, "pi", &rotate(&m, "pi", 3, 9, 2)).unwrap_err().contains("isn't countersigned"));
+        let Change::Rotate { by_old: for_eight, .. } = rotate(&m, "pi", 3, 8, 3) else { unreachable!() };
+        let swapped = Change::Rotate { name: "pi".into(), old: pk(3), new: pk(9), by_old: for_eight };
+        assert!(check(&m, "pi", &swapped).unwrap_err().contains("isn't countersigned"));
+        // Not its current key; a new key another member has.
+        assert!(check(&m, "pi", &rotate(&m, "pi", 4, 9, 4)).unwrap_err().contains("`pi`'s key is"));
+        assert!(check(&m, "pi", &rotate(&m, "pi", 3, 2, 3)).unwrap_err().contains("already `box`'s key"));
+        // Already signed (a retry after the approval): says so.
+        let mut log = s.log.clone();
+        let Ok(op) = check(&m, "pi", &ok) else { unreachable!() };
+        log.append(op, "lap", &key(1)).unwrap();
+        let after = log.membership().unwrap();
+        assert!(check(after, "pi", &rotate(&m, "pi", 3, 9, 3)).unwrap_err().contains("already: the rotate is signed"));
+        assert!(check(after, "pi", &rotate(after, "pi", 3, 8, 3)).is_err(), "the old key is rotated away");
+        // In the queue, a rotate to the same key collapses; another key doesn't.
+        let mut q = Proposals::default();
+        assert_eq!(q.queue("pi", ok.clone(), 1), (1, true));
+        assert_eq!(q.queue("pi", rotate(&m, "pi", 3, 9, 3), 2), (1, false));
+        assert_eq!(q.queue("pi", rotate(&m, "pi", 3, 8, 3), 3), (2, true));
+        assert_eq!(ok.subject(), "pi");
+        assert_eq!(ok.to_string(), format!("rotate pi's key to {}", pk(9).fingerprint()));
+        let wire = serde_json::to_value(&ok).unwrap();
+        assert_eq!((&wire["kind"], &wire["name"], &wire["new"]), (&json!("rotate"), &json!("pi"), &json!(pk(9).to_string())));
+        assert_eq!(serde_json::from_value::<Change>(wire).unwrap(), ok);
     }
 
     #[test]

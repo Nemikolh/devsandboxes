@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::serve::api::{ApiError, parse as parse_params};
 use crate::serve::fleet::identity::{FileKeyStore, KeyStore, PublicKey};
+use crate::serve::fleet::membership_api::KeyInfo;
 use crate::serve::machines::check_name;
 pub use crate::worker_policy::{Allow, Trust};
 
@@ -258,6 +259,10 @@ pub struct MemberInfo {
     pub key: PublicKey,
     /// [`PublicKey::fingerprint`] of `key`.
     pub fingerprint: String,
+    /// A pending rotation's next key (`member.key.next`, `machine key
+    /// rotate`), the key once a membership log listing it is taken; `None`
+    /// when none is pending.
+    pub next: Option<KeyInfo>,
 }
 
 /// `member.set`'s params: each one present is changed, the rest kept.
@@ -305,7 +310,9 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
 /// next to `path`.
 fn info(member: &Member, path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
     let key = FileKeyStore::new(key_path(path)).public_key().map_err(ApiError::internal)?;
+    let next = crate::serve::fleet::membership_api::pending_next(path)?;
     Ok(MemberInfo {
+        next,
         name: member.name_or(hostname).ok(),
         hub: member.hub().field(),
         trust: member.trust,
@@ -499,8 +506,10 @@ mod tests {
             roots: vec!["/srv/cfg".into()],
             fingerprint: key.fingerprint(),
             key,
+            next: Some(KeyInfo::of(&key)),
         };
         assert_matches("MemberInfo", &serde_json::to_value(&info).unwrap());
+        assert_matches("MembershipKey", &serde_json::to_value(&info).unwrap()["next"]);
         assert_matches("MemberInfo", &serde_json::to_value(MemberInfo { hub: None, ..info }).unwrap());
         assert_eq!(union_members("MemberTrust"), ["'worker'", "'full'"]);
         assert!(prop_type("ApiMethods", "member.get").is_some());
@@ -522,7 +531,12 @@ mod tests {
         for f in ["key", "fingerprint"] {
             assert_eq!(got.as_object_mut().unwrap().remove(f).unwrap(), key_fields[f], "{f}");
         }
-        assert_eq!(got, json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": []}));
+        assert_eq!(got, json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null}));
+        // A pending rotation shows.
+        let next = FileKeyStore::new(key_path(&path)).next_key().unwrap().public_key();
+        let got = call("member.get", Value::Null).unwrap().unwrap();
+        assert_eq!((&got["key"], &got["next"]), (&key_fields["key"], &json!({"key": next, "fingerprint": next.fingerprint()})));
+        std::fs::remove_file(FileKeyStore::new(key_path(&path)).next_path()).unwrap();
 
         let set = call("member.set", json!({"trust": "full", "roots_add": ["/srv/cfg"]})).unwrap().unwrap();
         assert_eq!((&set["key"], &set["fingerprint"]), (&key_fields["key"], &key_fields["fingerprint"]));

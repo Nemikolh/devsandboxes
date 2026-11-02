@@ -5,7 +5,8 @@
 //!
 //! The private key sits behind [`KeyStore`]; [`FileKeyStore`] is
 //! `member.key` next to `member.toml` (`member::key_path`), mode 0600,
-//! created once under its own lock. `member.get` answers its public half;
+//! created once under its own lock; a pending rotation's key waits in
+//! `member.key.next` until the membership log lists it. `member.get` answers its public half;
 //! `membership.*` signs the membership log's entries and introductions with
 //! it (`super::membership_api`); a peer link proves it with [`Signer`] and
 //! [`PublicKey::verify`] (`super::proof`).
@@ -243,7 +244,9 @@ impl fmt::Debug for SigningKey {
 }
 
 /// Where this member's private key is kept (decision 52: a file now, OS
-/// keychains parked).
+/// keychains parked), and the next one while a rotation is pending (fleet
+/// plan step 10a.6: made by `machine key rotate`, the current one until the
+/// membership log lists it).
 pub trait KeyStore {
     /// The key, created on first use.
     fn signing_key(&self) -> Result<SigningKey>;
@@ -251,6 +254,17 @@ pub trait KeyStore {
     fn public_key(&self) -> Result<PublicKey> {
         Ok(self.signing_key()?.public_key())
     }
+
+    /// The pending next key; `None` when no rotation is pending.
+    fn pending(&self) -> Result<Option<SigningKey>>;
+
+    /// The pending next key, made now when none is: a second rotation
+    /// while one is pending reuses it.
+    fn next_key(&self) -> Result<SigningKey>;
+
+    /// The pending next key made the key, if it's `expected` (another one,
+    /// or none, changes nothing): whether it was. Idempotent.
+    fn promote(&self, expected: &PublicKey) -> Result<bool>;
 }
 
 /// `member.key` (`member::key_path`): one line, `ed25519-seed:<64
@@ -259,6 +273,10 @@ pub trait KeyStore {
 /// key), a 0600 temp file renamed into place, so two creators end with one
 /// key. Loading refuses a file group or others can reach, and a malformed
 /// one: neither is replaced.
+///
+/// A rotation's next key is `member.key.next` ([`FileKeyStore::next_path`]),
+/// the same format, made under the same lock; promoting it is a rename over
+/// `member.key` under that lock, so a crash leaves either key whole.
 #[derive(Debug, Clone)]
 pub struct FileKeyStore {
     path: PathBuf,
@@ -279,44 +297,81 @@ impl FileKeyStore {
         self.path.with_file_name(name)
     }
 
+    /// `member.key.next`: the pending rotation's key.
+    pub fn next_path(&self) -> PathBuf {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".next");
+        self.path.with_file_name(name)
+    }
+
     /// The key in the file; `None` when there's no file.
     pub fn load(&self) -> Result<Option<SigningKey>> {
-        let path = &self.path;
-        let mut file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
-        };
-        let mode = file.metadata().with_context(|| format!("cannot read {}", path.display()))?.permissions().mode();
-        if mode & 0o077 != 0 {
-            bail!(
-                "{} is reachable by group or others (mode {:04o}): this member's private key must be 0600 (`chmod 600 {}`)",
-                path.display(),
-                mode & 0o7777,
-                path.display()
-            );
-        }
-        let mut text = String::new();
-        file.read_to_string(&mut text).with_context(|| format!("cannot read {}", path.display()))?;
-        SigningKey::from_text(&text).map(Some).with_context(|| format!("invalid {}", path.display()))
+        load_at(&self.path)
     }
+
+    /// Under the lock, the key at `path`, made there first when there's
+    /// none.
+    fn load_or_make(&self, path: &Path) -> Result<SigningKey> {
+        if let Some(key) = load_at(path)? {
+            return Ok(key);
+        }
+        let dir = path.parent().with_context(|| format!("{} has no parent", path.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        let _lock = crate::serve::locked_file::lock_at(&self.lock_path())?;
+        // Another creator may have won while this one waited.
+        if let Some(key) = load_at(path)? {
+            return Ok(key);
+        }
+        let key = SigningKey::generate()?;
+        crate::serve::locked_file::write_atomic_mode(path, &format!("{}\n", key.to_line()), 0o600)?;
+        Ok(key)
+    }
+}
+
+/// The key in the file at `path`; `None` when there's no file.
+fn load_at(path: &Path) -> Result<Option<SigningKey>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let mode = file.metadata().with_context(|| format!("cannot read {}", path.display()))?.permissions().mode();
+    if mode & 0o077 != 0 {
+        bail!(
+            "{} is reachable by group or others (mode {:04o}): this member's private key must be 0600 (`chmod 600 {}`)",
+            path.display(),
+            mode & 0o7777,
+            path.display()
+        );
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).with_context(|| format!("cannot read {}", path.display()))?;
+    SigningKey::from_text(&text).map(Some).with_context(|| format!("invalid {}", path.display()))
 }
 
 impl KeyStore for FileKeyStore {
     fn signing_key(&self) -> Result<SigningKey> {
-        if let Some(key) = self.load()? {
-            return Ok(key);
-        }
-        let dir = self.path.parent().with_context(|| format!("{} has no parent", self.path.display()))?;
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        self.load_or_make(&self.path)
+    }
+
+    fn pending(&self) -> Result<Option<SigningKey>> {
+        load_at(&self.next_path())
+    }
+
+    fn next_key(&self) -> Result<SigningKey> {
+        self.load_or_make(&self.next_path())
+    }
+
+    fn promote(&self, expected: &PublicKey) -> Result<bool> {
         let _lock = crate::serve::locked_file::lock_at(&self.lock_path())?;
-        // Another creator may have won while this one waited.
-        if let Some(key) = self.load()? {
-            return Ok(key);
+        match load_at(&self.next_path())? {
+            Some(next) if next.public_key() == *expected => {}
+            _ => return Ok(false),
         }
-        let key = SigningKey::generate()?;
-        crate::serve::locked_file::write_atomic_mode(&self.path, &format!("{}\n", key.to_line()), 0o600)?;
-        Ok(key)
+        let next = self.next_path();
+        std::fs::rename(&next, &self.path)
+            .with_context(|| format!("cannot move {} over {}", next.display(), self.path.display()))?;
+        Ok(true)
     }
 }
 
@@ -640,6 +695,34 @@ mod tests {
             assert!(e.contains("invalid") && !e.contains(&text.trim()[13..]), "{e}");
             assert_eq!(std::fs::read_to_string(store.path()).unwrap(), bad);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `member.key.next`: made once and reused, 0600; promoted over
+    /// `member.key` only when it's the expected key, and only once.
+    #[test]
+    fn a_next_key_is_reused_then_promoted_once() {
+        let dir = scratch("next");
+        let store = FileKeyStore::new(dir.join("member.key"));
+        assert_eq!(store.next_path(), dir.join("member.key.next"));
+        let old = store.signing_key().unwrap();
+        assert!(store.pending().unwrap().is_none());
+        assert!(!store.promote(&old.public_key()).unwrap(), "nothing pending");
+        let next = store.next_key().unwrap();
+        assert_ne!(next.public_key(), old.public_key());
+        assert_eq!(std::fs::metadata(store.next_path()).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(store.next_key().unwrap().public_key(), next.public_key(), "a pending one is reused");
+        assert_eq!(store.pending().unwrap().unwrap().public_key(), next.public_key());
+        assert_eq!(store.public_key().unwrap(), old.public_key(), "the key until promoted");
+
+        assert!(!store.promote(&key(9).public_key()).unwrap(), "another key: nothing moves");
+        assert!(store.next_path().exists());
+        assert!(store.promote(&next.public_key()).unwrap());
+        assert_eq!(store.public_key().unwrap(), next.public_key());
+        assert!(!store.next_path().exists() && store.pending().unwrap().is_none());
+        assert_eq!(std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert!(!store.promote(&next.public_key()).unwrap(), "idempotent");
+        assert_eq!(store.public_key().unwrap(), next.public_key());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
