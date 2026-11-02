@@ -9,7 +9,7 @@ steps 7-8 down to one: every machine one peer link per pair, reached
 only over its channels, a laptop joining with `machine add <hub>`.
 Steps 9-10 (membership, routing) finish the model below (ADR
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
-proposed). The rest is design. Builds on
+proposed); step 9 is in progress (9a-9f). The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
 [machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
 its parked auto-update and PTY attach into steps 2 and 4.
@@ -485,6 +485,25 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    unreachable it runs where it was typed, with a note); `remotes.json`
    saved rows on the hub; versions follow the hub as `member.toml` names
    it (step 7 reads `[serve] hub`).
+   Decisions 31-35 settle what the design above left open. Sub-steps,
+   each a commit:
+   - **9a `hub` in `member.toml`.** `hub = "self" | "<name>"` (absent:
+     no fleet), `member.get`/`member.set {hub}`; `[serve] hub` goes and
+     every reader reads the member file at its use (hello, keep-alive,
+     placement, `remotes.json`); the hello names the hub (decision 34);
+     a hub change ends this host's links so both ends redial.
+   - **9b `machine add`'s join rule.** The table in
+     [Joining and leaving](#joining-and-leaving) over both ends'
+     `member.get` (the target's over the add-time probe), the joiner's
+     `hub` written; names (decision 35) and two hubs refused.
+   - **9c Members see the fleet through the hub.** A member watches the
+     hub with `machines: true`, the asking member's rows never
+     re-exported; machines seen only that way are view-only (decision
+     33).
+   - **9d `machine unlink|rm`, leaving.** Today's `rm` becomes
+     `unlink`; `rm` per decision 32; `rm` of this host leaves.
+   - **9e A member's `run` placed by the hub** (decision 31).
+   - **9f Docs close.**
 10. **Routing over the graph** (M–L). Members report their links and the
     hub publishes the graph; routed streams are spliced hop by hop toward
     a destination (an `Open` naming it); requesters try paths in order
@@ -632,6 +651,28 @@ and 20 as step 9 does, 21 as step 10 does.
     `machine add <hub>` is the dialer, so its agent reaches the hub's
     instances (while its entry has `agent` on) and the hub's never
     reaches the laptop's.
+31. A `run` typed on a member is placed by the hub's decision only:
+    the member asks `fleet.place` (its spec, capacity and the machines
+    it reaches), the hub answers a machine with its fleet-wide view,
+    and the member moves the code and forwards over its own links. Until
+    step 10 the candidates are the machines the member links to
+    directly. With the hub unreachable the member places locally, with a
+    note.
+32. `machine rm <m>` runs on the hub (a member's is sent there as
+    `fleet.rm`): the hub sends `fleet.leave` to `m` (it clears `hub` and
+    drops its own entries) and `fleet.forget {m}` to every member it
+    links (each drops its entry for `m`, refuses `m`'s inbound link). A
+    member admits `fleet.leave` / `fleet.forget` only from the peer its
+    `member.toml` names as hub; members the hub has no link to learn it
+    in step 10.
+33. Machines a member sees only through the hub's federated view are
+    view-only until step 10: their rows and state show, actions,
+    terminals and forwards on them are refused naming the hub.
+34. A link's hello names its end's hub (not only a hub flag); a link
+    whose two ends name different hubs is refused.
+35. A machine's registry name defaults to its member name (`member.get`
+    over the add-time probe), so the name `machine add` checks against
+    the fleet is the one the fleet knows it by.
 
 ## Open questions
 
@@ -651,3 +692,10 @@ and 20 as step 9 does, 21 as step 10 does.
   coarse.
 - Authenticating peers without ssh (later): a transport over the
   tailnet, say, where no ssh login vouches for `--peer` (decision 22).
+- Member and hub identity as a key pair (user's note, to be placed:
+  maybe a step before 10): each member holds a private key, the fleet
+  knows its public key, and a link proves both ends, so no new device
+  can act as another member or as the hub without that device's
+  private key. Today a peer's name is vouched for only by ssh login
+  (decisions 2, 22), and decision 32's hub-only calls trust the name
+  the link was announced with.
