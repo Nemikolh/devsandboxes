@@ -3,13 +3,13 @@
  * Host ↔ helper overview: the host daemon reaches every running instance
  * through one `exec -i … devsbd bridge` pipe, the bridge attaches to the
  * in-container `devsbd daemon` over `devsbd.ctl`, and the daemon owns the
- * sockets in-container tools use. In the landing diagrams' language
+ * sockets in-container tools use and answers the host's RPC calls. In the landing diagrams' language
  * (`BabysitDiagram.astro`): purple the host daemon, cyan the container side,
  * lime you, green the ssh-agent, yellow notify. Desktop is one grid with
  * fixed rows (`--row`) so the arrows meet the cards; narrow screens stack it
  * and turn the arrows vertical.
  */
-import { Bell, Binary, Cable, Container, KeyRound, Network, Server, Terminal, UserRound } from '@lucide/astro';
+import { Bell, Binary, Cable, Container, KeyRound, Network, Server, SquareTerminal, Terminal, UserRound } from '@lucide/astro';
 import '../../styles/architecture.css';
 
 const sockets = [
@@ -18,7 +18,7 @@ const sockets = [
   { name: 'devsbd.ctl', mode: '0600' },
 ];
 
-const serveParts = ['Bridges · event-driven poll', 'Forwards', 'API', 'Inbox sink'];
+const serveParts = ['Bridges · event-driven poll', 'Forwards', 'API', 'Inbox sink', 'Helper RPC'];
 const hostEnds = [
   { icon: KeyRound, label: '$SSH_AUTH_SOCK', tone: 'agent' },
   { icon: Bell, label: 'inbox.json · popup', tone: 'notify' },
@@ -33,8 +33,9 @@ const hostEnds = [
     /run/devsandbox/bin/devsbd through exec stdin. The host daemon runs exec -i devsbd bridge in each running
     container; the bridge speaks length-prefixed frames on its stdio and attaches to the devsbd daemon over the
     devsbd.ctl socket. The daemon, running as root, owns ssh-agent.sock for ssh and git, api.sock for devsbd notify,
-    ensure and events, and dials TCP inside the container for port forwards. The host daemon ends those streams at your
-    ssh-agent, the Inbox store and desktop popups, and forward listeners on localhost.
+    ensure and events, dials TCP inside the container for port forwards, and runs the host daemon's RPC calls, such as
+    attaching to a helper session or a tracked run. The host daemon ends the container's streams at your ssh-agent, the
+    Inbox store and desktop popups, and forward listeners on localhost.
   </p>
 
   <div class="arc-helper-grid" aria-hidden="true" inert>
@@ -66,7 +67,7 @@ const hostEnds = [
 
     <div class="arc-link arc-link--right arc-link--both arc-h-pipe" data-tone="serve">
       <span>exec -i -u root devsbd bridge</span>
-      <small>frames on stdin/stdout</small>
+      <small>frames · both ways</small>
     </div>
 
     <div class="arc-card arc-h-bridge">
@@ -103,6 +104,8 @@ const hostEnds = [
     <div class="arc-client arc-h-c-api"><Bell /><span>devsbd notify · ensure<small>outbox · control</small></span></div>
     <div class="arc-link arc-link--right arc-h-l-tcp" data-tone="helper"><span>TCP dial</span></div>
     <div class="arc-client arc-h-c-tcp"><Network /><span>web:3000 · postgres<small>Connect streams</small></span></div>
+    <div class="arc-link arc-link--right arc-h-l-rpc" data-tone="serve"><span>RPC</span></div>
+    <div class="arc-client arc-h-c-rpc"><SquareTerminal /><span>sessions · runs<small>session.attach · run.*</small></span></div>
 
     <div class="arc-link arc-link--down arc-h-ends" data-tone="serve"><span>streams end at</span></div>
     <ul class="arc-ends arc-h-endlist">

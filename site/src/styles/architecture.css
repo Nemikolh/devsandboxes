@@ -398,15 +398,15 @@
   grid-template-columns:
     12px minmax(0, 1.15fr) 12px 116px 12px minmax(0, 1fr) 70px minmax(0, 1fr)
     84px minmax(0, 1fr) 12px;
-  grid-template-rows: 38px 52px 40px var(--row) var(--row) var(--row) 40px auto 14px;
+  grid-template-rows: 38px 52px 40px var(--row) var(--row) var(--row) var(--row) 40px auto 14px;
 }
 
 .arc-zone--host {
-  grid-area: 1 / 1 / 10 / 4;
+  grid-area: 1 / 1 / 11 / 4;
 }
 
 .arc-zone--box {
-  grid-area: 1 / 5 / 8 / 12;
+  grid-area: 1 / 5 / 9 / 12;
 }
 
 .arc-zone-label--host {
@@ -449,7 +449,7 @@
 }
 
 .arc-h-serve {
-  grid-area: 4 / 2 / 7 / 3;
+  grid-area: 4 / 2 / 8 / 3;
 }
 
 .arc-h-pipe {
@@ -465,7 +465,7 @@
 }
 
 .arc-h-daemon {
-  grid-area: 4 / 8 / 7 / 9;
+  grid-area: 4 / 8 / 8 / 9;
 }
 
 .arc-h-l-agent {
@@ -492,18 +492,27 @@
   grid-area: 6 / 10 / 7 / 11;
 }
 
+.arc-h-l-rpc {
+  grid-area: 7 / 9 / 8 / 10;
+}
+
+.arc-h-c-rpc {
+  grid-area: 7 / 10 / 8 / 11;
+}
+
 .arc-h-ends {
-  grid-area: 7 / 2 / 8 / 3;
+  grid-area: 8 / 2 / 9 / 3;
 }
 
 .arc-helper .arc-h-endlist {
-  grid-area: 8 / 2 / 9 / 3;
+  grid-area: 9 / 2 / 10 / 3;
 }
 
 .arc-h-bridge,
 .arc-h-c-agent,
 .arc-h-c-api,
-.arc-h-c-tcp {
+.arc-h-c-tcp,
+.arc-h-c-rpc {
   align-self: center;
 }
 
@@ -648,8 +657,10 @@
   .arc-h-c-api { order: 13; }
   .arc-h-l-tcp { order: 14; }
   .arc-h-c-tcp { order: 15; }
-  .arc-h-ends { order: 16; }
-  .arc-helper .arc-h-endlist { order: 17; }
+  .arc-h-l-rpc { order: 16; }
+  .arc-h-c-rpc { order: 17; }
+  .arc-h-ends { order: 18; }
+  .arc-helper .arc-h-endlist { order: 19; }
 
   .arc-zone-label--box {
     margin: 4px 0 10px;

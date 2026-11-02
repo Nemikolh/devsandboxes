@@ -1,5 +1,5 @@
 ---
-title: Host and helper
+title: Host and containers
 description: How the host reaches into every container through devsbd, the static helper it writes there, and which process owns each end.
 eyebrow: ARCHITECTURE · 01
 order: 1
@@ -9,8 +9,12 @@ import HelperDiagram from '../../components/architecture/HelperDiagram.astro';
 
 Nothing in a sandbox talks to the host directly: there is no mounted socket and no TCP port back. Instead, the
 host runs `exec -i … devsbd bridge` in the container and keeps the pipe open. Everything that crosses the boundary
-(ssh-agent requests, `devsbd notify`, a dispatcher's `devsbd ensure`, a forwarded port) is a stream in that one
-pipe. Since it's plain `exec` stdio, it works the same on docker, podman and Apple `container`.
+(ssh-agent requests, `devsbd notify`, a dispatcher's `devsbd ensure`, a forwarded port, the host's own calls into
+the container) is a stream in that one pipe. Since it's plain `exec` stdio, it works the same on docker, podman and
+Apple `container`.
+
+This page is one host and its containers. How several machines reach each other's containers is
+[Fleet](/architecture/fleet).
 
 <HelperDiagram />
 
@@ -38,6 +42,10 @@ instance falls back to a bind-mounted agent socket, if there is one.
 | `/run/devsandbox/api.sock` | 0666 | `devsbd notify`'s poke, the control verbs (`ensure`, `events`, `run`, …) |
 | `/run/devsandbox/devsbd.ctl` | 0600 | `devsbd bridge` only |
 
+On the bridge it also answers the host's `RPC` streams, one per call: the method runs in the daemon and the reply
+streams back (`rpc.methods` lists what it offers). That's how the host attaches to a helper session
+(`session.attach`) or drives a dispatcher child's tracked runs (`run.*`) without an `exec` of its own.
+
 It also holds an exclusive lock on `/run/devsandbox/devsbd.pid` (`<pid> <build hash>`) for its lifetime. A daemon
 of another build takes over by sending `Quit` on `devsbd.ctl` (see [Daemon and bridge](/architecture/bridge#takeover)).
 Three things start a daemon, and the lock makes any race between them harmless:
@@ -62,14 +70,21 @@ the container's agent streams. Notify and control only ever go to the instance b
 
 Commands that need the relay (`exec`, `run`'s and `start`'s lifecycle commands, a dashboard terminal) don't bridge
 themselves: they ask the daemon with `bridges.ensure`, passing their own `$SSH_AUTH_SOCK`
-([Host daemon lifecycle](/architecture/serve-lifecycle#who-talks-to-the-daemon)).
+([Host daemon lifecycle](/architecture/serve-lifecycle#who-talks-to-the-daemon)). A tty `exec` (a dashboard terminal
+is one) runs its command in a helper session, `devsbd session new`, under `/var/lib/devsandbox/sessions`: the command
+outlives its client, and `exec --attach` picks it up again.
 
 ## Where the streams end
 
-On the host, the daemon's bridge connects each agent stream to the first live agent it knows (up to 8 that clients
-reported, newest first, then its own `$SSH_AUTH_SOCK`). It stores notify records in `inbox.json` and shows
-popups, and it serves control requests itself (`src/commands/dispatch.rs`). A forward's bridge goes the other way:
-the host opens `Connect` streams, and the daemon dials the TCP target from inside the container.
+On the host, the daemon's bridge connects each agent stream to the first live agent it knows: up to 8 that clients
+reported, newest first, then an agent another machine relays over its link ([Fleet](/architecture/fleet)), then its
+own `$SSH_AUTH_SOCK`. It stores notify records in `inbox.json` and shows popups, and it serves control requests
+itself (`src/commands/dispatch.rs`).
+
+Two kinds of stream go the other way, opened by the host. A forward's bridge opens `Connect` streams, and the daemon
+dials the TCP target from inside the container. The serve daemon opens an `RPC` stream per call (`HelperClient`,
+`src/serve/helper.rs`): the API's `helper.call`, a dispatcher's run ops, a session attach.
 
 Design notes: `docs/architecture/helper/overview.md`, `docs/architecture/helper/bridges.md`,
-`docs/architecture/helper/ssh-agent.md`, `docs/architecture/daemon/forwards.md`.
+`docs/architecture/helper/in-container.md`, `docs/architecture/helper/ssh-agent.md`,
+`docs/architecture/daemon/forwards.md`.
