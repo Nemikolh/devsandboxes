@@ -172,9 +172,6 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         check_name(name).map_err(invalid)?;
     }
     check_command(p.command.as_deref())?;
-    if p.roots.is_empty() {
-        return Err(ApiError::invalid("no roots: pass --config <path on the machine>"));
-    }
     // A `--name` is the registry name if the add goes through: checked
     // before the ssh, so a taken one fails fast; again at the save.
     if let Some(name) = &p.name {
@@ -675,7 +672,6 @@ mod tests {
         assert!(message.starts_with("box: `~/gone`: no directory ") && message.ends_with("; `rel`: not absolute"), "{message}");
         let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/broken"]}));
         assert!(code == "invalid" && message.contains("devsandboxes.toml"), "{code}: {message}");
-        assert_eq!(err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": []})).0, "invalid");
         let (code, message) =
             err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~"], "command": " "}));
         assert!(code == "invalid" && message.contains("`command`"), "{code}: {message}");
@@ -744,6 +740,15 @@ mod tests {
         let (code, _) = err(&mut pair.local, "machines.unlink", json!({"name": "box"}));
         assert_eq!(code, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.list", Value::Null).as_array().unwrap().len(), 0);
+        pair.finish();
+    }
+
+    #[test]
+    fn add_takes_no_roots() {
+        let mut pair = Pair::new("mach-add-noroots", "0.6.0");
+        let r = ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": []}));
+        assert_eq!((&r["name"], &r["roots"]), (&json!("box"), &json!([])));
+        assert_eq!(pair.registry(), vec![Entry::ssh("box", "me@box")]);
         pair.finish();
     }
 

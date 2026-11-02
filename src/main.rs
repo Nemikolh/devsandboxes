@@ -420,7 +420,9 @@ enum MachineCommand {
     /// and its devsandbox socket is as powerful as docker.sock.
     ///
     /// Without --config, its known config roots are offered to pick from
-    /// (on a TTY; otherwise the only one is taken). --config is a path on
+    /// (on a TTY, none is fine; otherwise the only one is taken); with none
+    /// known, it gets no roots and runs only other members' configs.
+    /// --config is a path on
     /// the machine: quote a `~` (`--config '~/sandboxes'`), or your local
     /// shell expands it to your local home.
     ///

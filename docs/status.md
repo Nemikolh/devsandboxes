@@ -340,11 +340,6 @@ limitation means editing this file in the same commit.
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
   add <root>…` on the machine, or `machine unlink` + `machine add` it again.
   → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmtrustroots); `commands::machine::record_roots`
-- `machine add` requires at least one config root on the machine (its
-  picker, `machines.add`'s `no roots`), so a hub or worker meant to run
-  only other members' configs must still pick one of its own (fleet
-  plan decision 37).
-  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmtrustroots); `commands::machine::add`, `machines::api::add`
 - With neither end in a fleet, `machine add` always makes the host
   running it the hub: a laptop can't make the server it adds the hub
   without that server running `machine add <laptop>` (ssh into the

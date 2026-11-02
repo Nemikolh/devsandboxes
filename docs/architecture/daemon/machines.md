@@ -589,11 +589,15 @@ login `PATH` resolves, an error naming what it resolves to. That
 
 `add` without `--config` calls `machines.probe` (the remote's
 `roots.list`: every `config_dir` in its `state.toml` plus
-`~/.devsandboxes`) and lets the user multi-select on a TTY; off a TTY it
-takes the one usable candidate, else errors listing them. `machines.add`
-then checks every given root on the machine (`roots.list {paths}`: `~`
-expanded with the remote home, canonicalized, config loaded). Between
-the two, `add` records every chosen root, probed or typed, as the
+`~/.devsandboxes`). No candidates, it takes no roots without asking;
+else it lets the user multi-select on a TTY (`pick_roots`, Enter for
+none), and off a TTY takes the one usable candidate, else errors listing
+them (`only_root`). A machine with no roots is one that only runs other
+members' configs (in their fleet roots), as a hub or worker can.
+`machines.add` then checks every given root on the machine
+(`roots.list {paths}`: `~` expanded with the remote home, canonicalized,
+config loaded); `roots: []` is valid. Between the two, `add` records
+every chosen root, probed or typed, as the
 machine's own (`record_roots`): `devsandbox machine roots add -- <roots…>`
 run there over a one-off ssh with the machine's `command`
 (`record_roots_argv`: `ssh::add_cli_argv`, `-T`, no `BatchMode`, each
@@ -604,7 +608,8 @@ instance goes. A failure (ssh, a non-zero exit, a devsandbox there without
 the command) is a `warning:` line (`roots_warning`) naming the target and
 the `machine roots add` to run there, since under the machine's `worker`
 trust the hub may be refused those roots
-([fleet.md](fleet.md#the-trust-table)); the add goes on.
+([fleet.md](fleet.md#the-trust-table)); the add goes on. No roots
+chosen, nothing is recorded (no ssh).
 
 `machines.add` also applies the join rule
 ([fleet.md](fleet.md), *How a machine joins*): on the same probe it asks
