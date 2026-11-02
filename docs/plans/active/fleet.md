@@ -526,16 +526,37 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    lines}`; a member asks it on every unpinned `run`.
 10. **Identity, then routing over the graph** (L). Identity first
     (decision 44). Sub-steps:
-    - **10a Member identity.** Each member holds a private key; the fleet
-      knows every member's public key (the hub's member list carries it,
-      recorded at `machine add`, the add-time ssh vouching for it once);
-      a link proves both ends' keys in its handshake, so no device acts
-      as another member, or as the hub, without that member's key.
-      Decision 32's hub-only calls check the hub's key, not the name the
-      link announced. A signed statement format (signer, payload hash,
-      a version that only goes up) for what later steps sign: config
-      snapshots in the mesh (decision 39, steps 12-13) and delegated
-      config edits.
+    - **10a Member identity.** Each member holds a private key; a link
+      proves both ends' keys in its handshake, so no device acts as
+      another member, or as the hub, without that member's key.
+      - **Signed statements:** signer, payload hash, a version that only
+        goes up per signer; every verifier keeps the highest version it
+        has seen and refuses older (rollback). What's signed: membership,
+        keys, revocations, the hub, config snapshots (the whole config
+        root's hash plus each moved repo's commit ids, checked by the
+        worker against what arrives; decision 39, steps 12-13) and
+        delegated config edits.
+      - **The authority** (decision 45) signs membership, key changes,
+        revocations and hub changes. The hub stores and serves them,
+        vouching for nothing: a key the hub (or a relay) hands over with
+        no authority's or introducer's signature is refused.
+      - **Membership is a hash-chained log** whose head members compare
+        with each other directly on every link, so a hub showing two
+        members different lists is seen.
+      - **Joining:** `machine add` shows the joining key's fingerprint
+        to check (ssh's first-use trust is the root). A member added by
+        a non-authority member is signed by that introducer and capped
+        by it (decision 46).
+      - **Revocation and rotation:** `machine rm` revokes the key, signed,
+        pushed to every member and fetched again on reconnect; a member
+        can rotate its key.
+      - **Key at rest:** never reachable from a container (a bind whose
+        source covers the key path is refused on every host, not only
+        under the worker policy) nor through an ssh-agent that is
+        relayed (decision 30); the OS keychain where there is one.
+      - **No fallback:** a link that doesn't prove its keys is refused.
+        Decision 32's hub-only calls check the hub's key, not the name
+        the link announced.
     - **10b Routing.** Members report their links and the hub publishes
       the graph; routed streams are spliced hop by hop toward a
       destination (an `Open` naming it), each naming the member it
@@ -546,7 +567,14 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
       (decision 21). `machine trust worker`'s ssh warning comes from the
       graph, shown in `machine ls` and the Machines tab. ADR 0043
       accepted (0041 removed); `machines.md` and `fleet.md`
-      (architecture) rewritten.
+      (architecture) rewritten. Until 10c a relay still sees and can
+      alter a routed stream's bytes after its opening.
+    - **10c End-to-end sessions** (its own step, decision 47). Each
+      routed stream is an authenticated, encrypted session between the
+      member it started on and its destination (a Noise-style handshake
+      over both identity keys, 10a), naming its destination and with
+      replay protection, so a relay carries ciphertext only: it can't
+      read, change, inject into, replay or redirect a stream.
 11. **Hub swap, pointer** (S–M). `machine hub <m>`: the role moves, links
     stay; every reachable member rewrites `hub`, a late one learns it on
     reconnect.
@@ -592,7 +620,7 @@ Numbered as code cites them; 13–16 as step 4 makes them, 3, 9 and 17 as
 step 6 does, 7, 18, 22-25 as step 7 does, 26-30 as step 8 does, 1, 2, 19
 and 20 as step 9 does, 21 as step 10 does, 36 and 37 as a fix to
 step 9's `machine add` does, 38 as a fix to step 9's placement does, 39-43 as steps 13, 14
-and 16 do, 44 as step 10 does.
+and 16 do, 44-47 as step 10 does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
    setting.
@@ -772,9 +800,28 @@ and 16 do, 44 as step 10 does.
     claim to carry another member's stream and get that member's trust.
     Steps 11-13 lean on the same proof (the hub's calls, signed config
     snapshots), so they build on keys rather than names.
+45. The fleet's authority is one member, H (the user's trusted machine),
+    for now: its key alone signs membership, key changes, revocations and
+    hub changes, step 11's included (a hub can't hand its role over by
+    itself). The hub, even always-on, is availability, not authority.
+    Adding or revoking a member waits until H is reachable, except
+    through an introducer (decision 46).
+46. A member that a non-authority member adds (B joining through
+    `machine add A`) is signed by its introducer, A, and every host
+    trusts it no more than it trusts A, until the user confirms it on
+    that host (its fingerprint). A's own trust table is A's: A may use B
+    as A trusts it; B can't gain more on H than A has.
+47. End-to-end sessions between members are their own step (10c), after
+    routing (10b): proving who opened a stream doesn't stop a relay from
+    altering it afterward.
 
 ## Open questions
 
+- Withholding (parked): a hub that hides a member's newer signed
+  snapshot can't be told from "there is none" while that member is
+  offline, and decision 39 runs the last copy meanwhile. Pushing heads
+  directly to every linked member, or a snapshot lifetime, are the
+  candidates if it matters later.
 - Fencing in step 14: is "the member stops the stale copy when it
   reconnects" enough, or must a placed instance hold a lease it renews
   with the hub and stop itself when the lease lapses (laptop offline but
