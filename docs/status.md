@@ -94,6 +94,8 @@ limitation means editing this file in the same commit.
 - **json**: raw-number cpu/mem (schema v2); plain `status` without `--json`.
 - **inbox**: listener grants (a child following a thread's events),
   auto-withdraw older open forms, threads shared across users.
+- **machines**: OS keychain backends for the member key behind `KeyStore`
+  (fleet plan decision 52). → [plan](plans/active/fleet.md)
 
 ## Known limitations
 

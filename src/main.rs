@@ -8,6 +8,7 @@ mod exe;
 mod features;
 mod inbox;
 mod json_stdout;
+mod key_guard;
 mod render;
 mod runtime;
 #[cfg(unix)]

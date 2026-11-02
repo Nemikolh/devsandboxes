@@ -48,6 +48,9 @@ pub(super) fn resolve_mounts(
     let resolved = last_wins_by_target(resolved);
     // Before any source is created on the host (the argv check comes too
     // late for that).
+    for m in &resolved {
+        crate::key_guard::check_mount(&m.to_arg())?;
+    }
     crate::worker_policy::enforce(dir, |p| resolved.iter().try_for_each(|m| p.check_mount(&m.to_arg())))?;
     let mut out = ResolvedMounts::default();
     for resolved in resolved {

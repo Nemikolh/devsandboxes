@@ -187,7 +187,7 @@ pub fn path_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Res
 /// `member.key` next to the `member.toml` at `member_toml`: this member's
 /// private key (`fleet::identity::FileKeyStore`).
 pub fn key_path(member_toml: &Path) -> PathBuf {
-    member_toml.with_file_name("member.key")
+    member_toml.with_file_name(crate::daemon_config::MEMBER_KEY)
 }
 
 /// `text` as a [`Member`], [`check`]ed.

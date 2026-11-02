@@ -424,18 +424,11 @@ impl Policy {
     /// keys devsandbox writes; a bind's source passes [`Self::check_bind`].
     /// Driver options (`volume-opt`, which can bind host paths) are refused.
     pub fn check_mount(&self, value: &str) -> Result<(), Refusal> {
-        let (mut kind, mut source) = (None, None);
-        for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let (key, v) = part.split_once('=').map_or((part, None), |(k, v)| (k.trim(), Some(v.trim())));
-            match key {
-                "type" => kind = v,
-                "source" | "src" => source = v,
-                "target" | "destination" | "dst" | "readonly" | "ro" | "consistency" => {}
-                "relabel" if v == Some("shared") => {}
-                _ => return Err(Refusal::always(format!("mount option `{part}` in `{value}`"))),
-            }
+        let MountFields { kind, source, unknown } = mount_fields(value);
+        if let Some(part) = unknown {
+            return Err(Refusal::always(format!("mount option `{part}` in `{value}`")));
         }
-        match kind.unwrap_or("bind") {
+        match kind {
             "bind" => match source {
                 Some(source) => self.check_bind(source),
                 None => Err(Refusal::always(format!("bind mount without a source `{value}`"))),
@@ -449,18 +442,15 @@ impl Policy {
     /// is a bind ([`Self::check_bind`]), any other a named volume; options
     /// only `ro`, `rw`, `z`, `Z`.
     pub fn check_volume(&self, value: &str) -> Result<(), Refusal> {
-        let mut parts = value.splitn(3, ':');
-        let src = parts.next().unwrap_or_default();
-        let _dst = parts.next();
-        if let Some(opts) = parts.next() {
+        if let Some(opts) = value.splitn(3, ':').nth(2) {
             if let Some(bad) = opts.split(',').find(|o| !matches!(*o, "ro" | "rw" | "z" | "Z")) {
                 return Err(Refusal::always(format!("volume option `{bad}` in `{value}`")));
             }
         }
-        if src.starts_with('/') || src.starts_with('.') || src.starts_with('~') {
-            return self.check_bind(src);
+        match volume_source(value) {
+            Some(src) => self.check_bind(src),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// The final `run` argv of a container (sandbox or service), before it
@@ -472,22 +462,17 @@ impl Policy {
     /// `--ipc`, …) is refused. The first positional is the image; what
     /// follows is its command.
     pub fn check_run(&self, argv: &[String]) -> Result<(), Refusal> {
-        let mut it = argv.iter();
-        match it.next().map(String::as_str) {
+        match argv.first().map(String::as_str) {
             Some("run") => {}
             other => return Err(Refusal::always(format!("runtime command `{}`", other.unwrap_or_default()))),
         }
-        while let Some(arg) = it.next() {
-            if !arg.starts_with('-') {
-                return Ok(()); // the image
-            }
-            let (flag, inline) = split_flag(arg);
-            let mut value = || {
-                inline
-                    .map(str::to_string)
-                    .or_else(|| it.next().cloned())
-                    .ok_or_else(|| Refusal::always(format!("runtime flag `{flag}` without a value")))
+        for arg in args(argv, RUN_SWITCHES, "runtime") {
+            let (flag, inline) = match arg? {
+                Arg::Positional(_) => return Ok(()), // the image
+                Arg::Flag(flag, value) => (flag, value),
             };
+            // A flag outside `RUN_SWITCHES` always has its value here.
+            let value = || Ok::<_, Refusal>(inline.unwrap_or_default().to_string());
             match flag {
                 "-d" | "--detach" | "--init" if inline.is_none() => {}
                 "--privileged" if inline.is_none() => {
@@ -537,26 +522,23 @@ impl Policy {
     /// `--no-cache`, `-q` (what `build.options` might add: `--secret`,
     /// `--ssh`, `--build-context`, `--allow`, …) are refused.
     pub fn check_build(&self, argv: &[String]) -> Result<(), Refusal> {
-        let mut it = argv.iter();
-        match it.next().map(String::as_str) {
+        match argv.first().map(String::as_str) {
             Some("build") => {}
             other => return Err(Refusal::always(format!("runtime command `{}`", other.unwrap_or_default()))),
         }
         let mut context = None;
-        while let Some(arg) = it.next() {
-            if !arg.starts_with('-') || arg == "-" {
-                if context.replace(arg).is_some() {
-                    return Err(Refusal::always(format!("a second build context `{arg}`")));
+        for arg in args(argv, BUILD_SWITCHES, "build") {
+            let (flag, inline) = match arg? {
+                Arg::Positional(arg) => {
+                    if context.replace(arg).is_some() {
+                        return Err(Refusal::always(format!("a second build context `{arg}`")));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let (flag, inline) = split_flag(arg);
-            let mut value = || {
-                inline
-                    .map(str::to_string)
-                    .or_else(|| it.next().cloned())
-                    .ok_or_else(|| Refusal::always(format!("build flag `{flag}` without a value")))
+                Arg::Flag(flag, value) => (flag, value),
             };
+            // A flag outside `BUILD_SWITCHES` always has its value here.
+            let value = || Ok::<_, Refusal>(inline.unwrap_or_default().to_string());
             match flag {
                 "--pull" | "--no-cache" | "-q" | "--quiet" if inline.is_none() => {}
                 "-t" | "--tag" | "--build-arg" | "--target" | "--cache-from" | "--platform" | "--progress" => {
@@ -572,7 +554,7 @@ impl Policy {
                 _ => return Err(Refusal::always(format!("build flag `{flag}`"))),
             }
         }
-        match context.map(String::as_str) {
+        match context {
             Some("-") => Err(Refusal::always("a build context from stdin")),
             Some(context) => self.check_path(Path::new(context), "build context"),
             None => Err(Refusal::always("a build without a context")),
@@ -605,18 +587,101 @@ impl Policy {
 }
 
 /// `--flag=value` as `("--flag", Some("value"))`; anything else as is.
-fn split_flag(arg: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_flag(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
         Some((flag, value)) if arg.starts_with("--") => (flag, Some(value)),
         _ => (arg, None),
     }
 }
 
+/// The `run` flags devsandbox writes that take no value.
+pub(crate) const RUN_SWITCHES: &[&str] = &["-d", "--detach", "--init", "--privileged"];
+
+/// The `build` flags [`Policy::check_build`] allows that take no value.
+pub(crate) const BUILD_SWITCHES: &[&str] = &["--pull", "--no-cache", "-q", "--quiet"];
+
+/// One item of a runtime argv: a flag with its value, or a positional (`-`
+/// included: stdin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arg<'a> {
+    Flag(&'a str, Option<&'a str>),
+    Positional(&'a str),
+}
+
+/// The items of `argv` after its command (`argv[0]`): `--flag=value` is a
+/// flag with its value; any other flag takes the next arg as its value unless
+/// it's one of `switches` (which keep only an inline one). A flag missing its
+/// value is an error (`what` names the argv: `runtime`, `build`), after which
+/// nothing more is yielded. The one walk both [`Policy::check_run`] /
+/// [`Policy::check_build`] and `key_guard` read an argv with.
+pub(crate) fn args<'a>(
+    argv: &'a [String],
+    switches: &'a [&'a str],
+    what: &'a str,
+) -> impl Iterator<Item = Result<Arg<'a>, Refusal>> + 'a {
+    let mut it = argv.iter().skip(1);
+    let mut failed = false;
+    std::iter::from_fn(move || {
+        if failed {
+            return None;
+        }
+        let arg = it.next()?;
+        if !arg.starts_with('-') || arg == "-" {
+            return Some(Ok(Arg::Positional(arg)));
+        }
+        let (flag, inline) = split_flag(arg);
+        if inline.is_some() || switches.contains(&flag) {
+            return Some(Ok(Arg::Flag(flag, inline)));
+        }
+        Some(match it.next() {
+            Some(value) => Ok(Arg::Flag(flag, Some(value))),
+            None => {
+                failed = true;
+                Err(Refusal::always(format!("{what} flag `{flag}` without a value")))
+            }
+        })
+    })
+}
+
+/// A `--mount` value's fields: its `type` (`bind` when absent, stricter than
+/// docker's default), its `source`, and its first part outside the keys
+/// devsandbox writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MountFields<'a> {
+    pub kind: &'a str,
+    pub source: Option<&'a str>,
+    pub unknown: Option<&'a str>,
+}
+
+pub(crate) fn mount_fields(value: &str) -> MountFields<'_> {
+    let (mut kind, mut source, mut unknown) = (None, None, None);
+    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (key, v) = part.split_once('=').map_or((part, None), |(k, v)| (k.trim(), Some(v.trim())));
+        match key {
+            "type" => kind = v,
+            "source" | "src" => source = v,
+            "target" | "destination" | "dst" | "readonly" | "ro" | "consistency" => {}
+            "relabel" if v == Some("shared") => {}
+            _ => {
+                unknown.get_or_insert(part);
+            }
+        }
+    }
+    MountFields { kind: kind.unwrap_or("bind"), source, unknown }
+}
+
+/// A `-v` value's (`src:dst[:opts]`) host source: an absolute (or `.`/`~`-
+/// relative) `src`, a bind; `None` for any other, a named volume.
+pub(crate) fn volume_source(value: &str) -> Option<&str> {
+    let src = value.split(':').next().unwrap_or_default();
+    (src.starts_with('/') || src.starts_with('.') || src.starts_with('~')).then_some(src)
+}
+
 /// `path` as the host resolves it: made absolute, its deepest existing
 /// ancestor canonicalized (symlinks and `..` resolved), the rest appended.
 /// `None` for a `..` in the part that doesn't exist yet, which can't be
 /// resolved without it.
-fn resolve(path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve(path: &Path) -> Option<PathBuf> {
     let path = std::path::absolute(path).ok()?;
     let mut existing = path.as_path();
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();

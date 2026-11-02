@@ -1347,6 +1347,32 @@ signatures, signed statements and the rollback rule.
   redials once more). `member.get` and `membership.get` answer a
   pending rotation's next key as `next` (`{key, fingerprint}`), which
   `machine key` prints.
+- **Key at rest**: the key is never reachable from a container, on every
+  host, for every config and trust level (`full` included), with no
+  `[allow]` entry to lift it (`src/key_guard.rs`, not the
+  [worker policy](#worker-policy)). `key_guard::Guard` holds the key files
+  (`daemon_config::member_key_files`: `member.key`, `member.key.next`,
+  `member.key.lock`, from `daemon_config::member_key`, which
+  `member::key_path` and `FileKeyStore` share), each as written and
+  resolved; a host path covers them when it is one of them or a dir
+  above (`$HOME`, `~/.local/share`, the data dir, `/`), taken as written
+  (made absolute, `..` dropped as the runtime cleans it, `~` as `$HOME`)
+  and resolved (symlinks). `key_guard::check_argv` runs on the final argv
+  of every container devsandbox creates (`run_container`,
+  `services::ensure_service`) and of every build (`image::base_image_for`,
+  the features image's `features_build`, `services::service_image`),
+  before the worker policy's check: a `run`'s binds (`-v`, `--volume`,
+  `--mount type=bind`, read with `worker_policy::args`,
+  `volume_source`, `mount_fields`; named volumes and tmpfs aren't host
+  paths) and a build's context, `-f`, `--build-context`, `--secret`'s
+  `src` and `--ssh` files (found flag by flag: `build.options` is
+  free-form). `key_guard::check_mount` refuses a config `mounts` bind
+  earlier, before `mounts::resolve_mounts` creates missing sources. The
+  refusal names the path, the key file and why, and points to a narrower
+  path. devsandbox never loads the key into an ssh-agent (no code path
+  runs `ssh-add` or speaks the agent protocol's add), so a relayed agent
+  never carries it. `KeyStore` is the seam for other stores; the file is
+  the only implementation.
 - **Public keys** (`PublicKey`): text form `ed25519:<64 lowercase hex>`
   (`Display`, `FromStr`, serde as that string; parsing refuses uppercase
   and bytes that aren't a curve point). The fingerprint

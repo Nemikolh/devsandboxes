@@ -292,16 +292,12 @@ impl FileKeyStore {
     }
 
     fn lock_path(&self) -> PathBuf {
-        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
-        name.push(".lock");
-        self.path.with_file_name(name)
+        crate::daemon_config::member_key_sibling(&self.path, ".lock")
     }
 
     /// `member.key.next`: the pending rotation's key.
     pub fn next_path(&self) -> PathBuf {
-        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
-        name.push(".next");
-        self.path.with_file_name(name)
+        crate::daemon_config::member_key_sibling(&self.path, ".next")
     }
 
     /// The key in the file; `None` when there's no file.

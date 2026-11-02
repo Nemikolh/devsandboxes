@@ -186,6 +186,7 @@ fn base_image_for(dir: &Path, project: &str, sandbox: &ResolvedSandbox) -> Resul
         build,
         &format!("sandbox `{}`", sandbox.name),
     );
+    crate::key_guard::check_argv(&args)?;
     crate::worker_policy::enforce_argv(dir, &args)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&arg_refs)?;
@@ -289,14 +290,7 @@ fn build_features_image(
         .with_context(|| format!("cannot write {}", dockerfile_path.display()))?;
 
     let tag = features_image(project, &sandbox.name);
-    backend().run_checked(&[
-        "build",
-        "-t",
-        &tag,
-        "-f",
-        &dockerfile_path.to_string_lossy(),
-        &context.to_string_lossy(),
-    ])?;
+    features_build(&tag, &dockerfile_path, &context)?;
 
     // Feature entrypoints: a second, metadata-only build on the same tag. The
     // image's own ENTRYPOINT is read from the first build (which inherits the
@@ -317,16 +311,20 @@ fn build_features_image(
         let dockerfile_path = context.join("Dockerfile.devsandbox-entrypoint");
         std::fs::write(&dockerfile_path, entrypoint_dockerfile(&tag, &image_entrypoint))
             .with_context(|| format!("cannot write {}", dockerfile_path.display()))?;
-        backend().run_checked(&[
-            "build",
-            "-t",
-            &tag,
-            "-f",
-            &dockerfile_path.to_string_lossy(),
-            &context.to_string_lossy(),
-        ])?;
+        features_build(&tag, &dockerfile_path, &context)?;
     }
     Ok(tag)
+}
+
+/// `build -t tag -f dockerfile context` of the features image's generated
+/// context, past the member key's guard like every build.
+fn features_build(tag: &str, dockerfile: &Path, context: &Path) -> Result<()> {
+    let args: Vec<String> = ["build", "-t", tag, "-f", &dockerfile.to_string_lossy(), &context.to_string_lossy()]
+        .map(str::to_string)
+        .into();
+    crate::key_guard::check_argv(&args)?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    backend().run_checked(&refs)
 }
 
 /// Build-context name of the generated entrypoint chain.

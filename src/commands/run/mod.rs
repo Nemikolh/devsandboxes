@@ -1149,7 +1149,9 @@ fn run_container(
     args.extend(container_command());
 
     // The worker policy's authority: this argv is everything the runtime
-    // gets (features' mounts and `privileged`, identity, caches).
+    // gets (features' mounts and `privileged`, identity, caches). The member
+    // key's guard holds whatever the policy.
+    crate::key_guard::check_argv(&args)?;
     crate::worker_policy::enforce_argv(dir, &args)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&arg_refs)?;

@@ -47,6 +47,31 @@ pub fn data_dir_from(xdg_data_home: Option<OsString>, home: Option<OsString>) ->
     Ok(base.join("devsandbox"))
 }
 
+/// `member.key` in the data dir `data` (`<data>/devsandbox`, next to
+/// `member.toml`): this member's private key (fleet identity,
+/// `serve::fleet::identity::FileKeyStore`). Here, not in `serve`, because
+/// the run pipeline guards it on every platform (`key_guard`).
+pub fn member_key(data: &Path) -> PathBuf {
+    data.join(MEMBER_KEY)
+}
+
+/// The member key's file name.
+pub const MEMBER_KEY: &str = "member.key";
+
+/// The sibling of the key file `key` named with `suffix` appended
+/// (`member.key.next`, `member.key.lock`).
+pub fn member_key_sibling(key: &Path, suffix: &str) -> PathBuf {
+    let mut name = key.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    key.with_file_name(name)
+}
+
+/// Every file of the member key at `key`: the key, a pending rotation's
+/// next key (`.next`) and the lock both are made under (`.lock`).
+pub fn member_key_files(key: &Path) -> [PathBuf; 3] {
+    [key.to_path_buf(), member_key_sibling(key, ".next"), member_key_sibling(key, ".lock")]
+}
+
 /// The global config; a missing file is the defaults.
 pub fn load() -> Result<DaemonConfig> {
     load_from(&path()?)
@@ -67,6 +92,17 @@ fn parse(contents: &str) -> Result<DaemonConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_key_files_sit_in_the_data_dir() {
+        let key = member_key(Path::new("/d/devsandbox"));
+        assert_eq!(key, PathBuf::from("/d/devsandbox/member.key"));
+        assert_eq!(
+            member_key_files(&key),
+            ["/d/devsandbox/member.key", "/d/devsandbox/member.key.next", "/d/devsandbox/member.key.lock"]
+                .map(PathBuf::from)
+        );
+    }
 
     #[test]
     fn the_path_prefers_xdg_data_home_then_home() {

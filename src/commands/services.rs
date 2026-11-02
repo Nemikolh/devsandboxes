@@ -174,6 +174,7 @@ fn ensure_service(
             check_port_conflicts(container, &ports)?;
             let image = service_image(dir, project, service)?;
             let args = service_run_args(backend(), container, network, &image, service, &ports, labels);
+            crate::key_guard::check_argv(&args)?;
             if let Some(policy) = &policy {
                 policy.check_run(&args)?;
             }
@@ -202,6 +203,7 @@ fn service_image(dir: &Path, project: &str, service: &ResolvedService) -> Result
     let tag = service_image_tag(project, &service.name);
 
     let args = build_args(backend(), dir, &tag, dockerfile, build, &format!("service `{}`", service.name));
+    crate::key_guard::check_argv(&args)?;
     crate::worker_policy::enforce_argv(dir, &args)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&refs)?;
