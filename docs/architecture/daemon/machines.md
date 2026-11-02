@@ -389,7 +389,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   runs here: `route` returns `Routed::Port` (the machine's `Entry`, the
   match's root or else the machine's first, the instance as the machine
   names it) and `commands::port::port_remote` forwards over one `TUNNEL`
-  stream per bridge through the machine's `fleet-<name>.tunnel.sock`
+  stream per bridge through the machine's `fleet-<name>.sock`
   (`tunnel::remote_opener`; [forwards](forwards.md),
   [fleet](fleet.md#tunnel)). `vscode` on a machine's instance is refused
   (`calls::refusal`: not available over its link yet).

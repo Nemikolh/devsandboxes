@@ -144,10 +144,10 @@ pub enum Event {
 pub type OnEvent = Box<dyn Fn(Event) + Send>;
 
 /// How one spawn of a forward into machine `name`'s `request` reaches it:
-/// its link's tunnel socket in `socket_dir` (`endpoint::fleet_tunnel_socket`),
-/// for every kind of machine.
+/// its link's socket in `socket_dir` (`endpoint::fleet_socket`), for every
+/// kind of machine.
 fn via(name: &str, socket_dir: &Path, request: tunnel::Request) -> tunnel::Via {
-    let socket = super::endpoint::fleet_tunnel_socket(socket_dir, name);
+    let socket = super::endpoint::fleet_socket(socket_dir, name);
     tunnel::Via::Fleet { socket, request }
 }
 
@@ -182,7 +182,7 @@ impl Registry {
     /// read for remote forwards (each add, each bridge spawn, each sync),
     /// with `inbound`'s neighbors machines beside its entries (while up);
     /// `socket_dir` is the daemon's, where each machine's link has its
-    /// tunnel socket; `on_event` gets every [`Event`] (called on the registry
+    /// socket; `on_event` gets every [`Event`] (called on the registry
     /// thread: it must not block).
     pub fn spawn(
         log: fn(&str),
@@ -286,7 +286,7 @@ struct Daemon {
     /// `forwards.toml`.
     store: PathBuf,
     machines: Known,
-    /// The daemon's socket dir: the machines' tunnel sockets.
+    /// The daemon's socket dir: the machines' link sockets.
     socket_dir: PathBuf,
     on_event: OnEvent,
     active: Arc<AtomicUsize>,
@@ -1388,7 +1388,7 @@ forwardPorts = ["redis:6379"]
 
     /// `machines.toml` and the socket dir are the store's sibling and dir:
     /// a remote bridge fails at once unless the test binds the machine's
-    /// tunnel socket there.
+    /// link socket there.
     fn registry_at(store: &Path) -> (Registry, Arc<Mutex<Vec<Event>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
@@ -1658,30 +1658,34 @@ forwardPorts = ["redis:6379"]
     }
 
     /// Every machine, whatever its kind, is reached through its link's
-    /// tunnel socket; the request is the forward's.
+    /// socket, a `TUNNEL` stream; the request is the forward's.
     #[test]
     fn every_machine_tunnels_over_its_link() {
         let dir = Path::new("/run/devsandbox");
         let request = tunnel::Request { root: "/far/cfg".into(), instance: Some("web".into()), service: None, port: 5432 };
         assert_eq!(
             via("lap", dir, request.clone()),
-            tunnel::Via::Fleet { socket: dir.join("fleet-lap.tunnel.sock"), request: request.clone() }
+            tunnel::Via::Fleet { socket: dir.join("fleet-lap.sock"), request: request.clone() }
         );
-        assert_eq!(via("box", dir, request.clone()), tunnel::Via::Fleet { socket: dir.join("fleet-box.tunnel.sock"), request });
+        assert_eq!(via("box", dir, request.clone()), tunnel::Via::Fleet { socket: dir.join("fleet-box.sock"), request });
     }
 
-    /// A forward into an ssh machine dials its link's tunnel socket on
-    /// every spawn: the machine's refusal is the row's error.
+    /// A forward into an ssh machine dials its link's socket (a `TUNNEL`
+    /// stream) on every spawn: the machine's refusal is the row's error.
     #[test]
     fn a_forward_into_an_ssh_machine_dials_its_link() {
         let base = tmp("remote-link");
         let store = base.join("forwards.toml");
         std::fs::write(store.with_file_name("machines.toml"), MACHINES).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(super::super::endpoint::fleet_tunnel_socket(&base, "box")).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(super::super::endpoint::fleet_socket(&base, "box")).unwrap();
         let (seen, got) = mpsc::channel();
         std::thread::spawn(move || {
             for s in listener.incoming() {
                 let Ok(mut s) = s else { return };
+                let mut ch = [0u8; 1];
+                if std::io::Read::read_exact(&mut s, &mut ch).is_err() || ch[0] != crate::devsbd::proto::channel::TUNNEL {
+                    continue;
+                }
                 let request = super::super::fleet::tunnel::read_request(&mut s);
                 let _ = std::io::Write::write_all(&mut s, tunnel::Header::Error { error: "no instance `web`".into() }.line().as_bytes());
                 let _ = seen.send(request);

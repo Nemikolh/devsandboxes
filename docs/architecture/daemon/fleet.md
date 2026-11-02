@@ -45,8 +45,8 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `PeerOptions`, `Announce`, `REANNOUNCE`, `attach_stream`),
 `src/serve/fleet/dialer.rs` (`Dialer`, `Dialer::hold`, `link_args`,
 `member_name`, `dial`, `Open`), `src/serve/endpoint.rs` (`fleet_socket`,
-`fleet_transfer_socket`, `fleet_pty_socket`, `fleet_tunnel_socket`,
-`fleet_channel_socket`, `link_agent_socket`, `accept_any`),
+`link_agent_socket`, `accept_any`), `src/serve/fleet/link.rs`
+(`connect`),
 `src/serve/machines/inbound.rs` (`Neighbors`, `Neighbor`, `Guard`,
 `taken`), `src/serve/daemon.rs` (`machine_dialer`, `links_inbound`,
 `inbound_roots`), `src/serve/fleet/lent.rs` (`with_fleet_root`); over a
@@ -127,21 +127,23 @@ sentinel line (`\n<sentinel> <version>\n`), the channel it stands for
 fleet link the build, which a member [follows](#versions)).
 
 **Channels, from either end.** Both ends are a `link::Endpoint`: OUT,
-the sockets it binds (a channel and a path each) and an `Outlet` its own
+the socket it binds (`Endpoint::socket`, optional) and an `Outlet` its own
 code opens streams through; IN, a table of the channels it serves
 (`link::Serves`: channel → `Handler`, a callback handing back the local
 end of a stream the peer opens, `None` to refuse it). Its `Hello`
 advertises the table's caps (`link::cap_of`: `SSH_AGENT`, `API`,
 `TRANSFER`, `PTY`, `TUNNEL`, `AGENT`). An `Open` on a channel missing
 from the table is refused with `Close` and the link stays up. Either end
-opens streams on a channel the other advertised, and only those. Each
+opens streams on a channel the other advertised, and only those. The
 socket is bound at a temp name next to its path (0600) and renamed over
 the path, before the end's `Hello`, so the newest end binding a path
-wins (`link::Socket`); each accepted connection (one accept loop over all its sockets,
-`endpoint::accept_any`) becomes one `Open { channel }` stream on its
-socket's channel, or is dropped unopened when the peer didn't advertise
-that channel. The end unlinks each socket when the link ends, only while
-it is still its own (same device and inode), never a newer end's. The
+wins (`link::Socket`). Each accepted connection (`link::accept`) names
+its channel in its first byte (`link::connect`), read on a thread of its
+own so a silent client holds up only itself (`link::read_channel`,
+`CHANNEL_WAIT`), and becomes one `Open { channel }` stream on it, or is
+dropped unopened when it names nothing in time or a channel the peer
+didn't advertise. The end unlinks the socket when the link ends, only
+while it is still its own (same device and inode), never a newer end's. The
 outlet is set to the link from the `Hello`s until it ends:
 `Outlet::open(channel)` opens a stream (flowing channels only), an error
 when no link is up or the peer didn't advertise the channel;
@@ -160,7 +162,7 @@ stream. The roles differ in the handshake, the stream id space
 (`link::Out`) and how an ending ends them:
 
 - **The opener** (`link::opener_with`, the end ssh runs: a
-  [peer link](#peer-links)'s dialed end) binds its sockets, writes the
+  [peer link](#peer-links)'s dialed end) binds its socket, writes the
   sentinel, exchanges `Hello`s and requires the peer to advertise the
   spec's channel. Its `on_ready` callback runs next, with the peer's
   `Hello` (its `hash` is the far end's spec `hello`); an error there ends
@@ -175,7 +177,7 @@ stream. The roles differ in the handshake, the stream id space
   [peer link](#peer-links)'s dialer) skips what the login
   shell printed up to the sentinel (`ssh::skip_lines`, at most
   `SENTINEL_LIMIT` bytes; another sentinel version is a handshake failure
-  saying which side to update), binds its sockets, exchanges `Hello`s,
+  saying which side to update), binds its socket, exchanges `Hello`s,
   and answers each low-bit `Open` from its table. Its `on_ready` gets the
   opener's `Hello`; its `Err` ends the link before anything is served. It
   opens high-bit ids (`Mux::open_host`: flowing channels only, which every
@@ -193,15 +195,15 @@ One spec exists:
 |---|---|---|---|---|
 | `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run_peer` (a [peer link](#peer-links)'s dialed end) / `fleet::dialer::Dialer::hold` (the dialer); each end's `hello` `update::hello_of` |
 
-Each end binds `fleet-<peer>.sock` for `API` (`endpoint::fleet_socket`)
-and its `.pty`, `.tunnel` and `.transfer` siblings
-(`endpoint::fleet_pty_socket`, `fleet_tunnel_socket`,
-`fleet_transfer_socket`; a further channel's socket is
-`endpoint::fleet_channel_socket`, `fleet-<name>.<suffix>.sock`), and
+Each end binds one socket, `fleet-<peer>.sock` (`endpoint::fleet_socket`):
+a connection's first byte names its channel (`link::connect` writes it;
+the end reads it off its accept loop, `link::read_channel`, within
+`CHANNEL_WAIT`, 10 s, and drops a connection that names none or one the
+peer doesn't serve), the rest is that channel's stream. Each end
 serves `API`, `TRANSFER`, `PTY` ([PTY](#pty)) and `TUNNEL`
 ([TUNNEL](#tunnel)) with its daemon; the dialer also serves `AGENT`
-([AGENT](#agent)), which the dialed end opens. Each connection to an
-end's API socket is one connection to the far host's daemon, so a
+([AGENT](#agent)), which the dialed end opens. Each `API` connection to
+an end's socket is one connection to the far host's daemon, so a
 `client::Conn` on one host says its hello to, and calls, the daemon on
 the other.
 
@@ -256,10 +258,9 @@ read from `daemon.config.toml` as the daemon reads it
   attach closes the stream, with why on stderr. `AGENT` isn't served: it
   opens only member → dialer (decision 18). Per-stream connects reach
   whichever daemon is up, a successor after a version handoff included.
-- **OUT.** K binds `fleet-L.sock`, `fleet-L.pty.sock`,
-  `fleet-L.tunnel.sock` and `fleet-L.transfer.sock`
-  (`endpoint::fleet_socket` and its siblings): each accepted connection
-  is a stream to L, which L's daemon answers. While L serves `AGENT`,
+- **OUT.** K binds `fleet-L.sock` (`endpoint::fleet_socket`): each
+  accepted connection is a stream to L on the channel it names, which
+  L's daemon answers. While L serves `AGENT`,
   `agent::serve` binds `agent-link-L.sock` (`endpoint::link_agent_socket`,
   through K's outlet): an `agent-*.sock`, so K's bridges pick it as a
   relayed agent (`endpoint::agent_sockets`).
@@ -276,7 +277,7 @@ read from `daemon.config.toml` as the daemon reads it
   then a machine on K like a registered one, of kind `inbound`: K's
   `Machines` service holds a link to it over `fleet-L.sock` while the
   neighbor is up, so its rows, quick calls, verbs, the CLI's re-runs,
-  terminal tabs, forwards and placement reach L through the sockets this
+  terminal tabs, forwards and placement reach L through the socket this
   end binds ([over a link](#over-a-link)), each stream served by L's
   daemon under L's trust table for K
   ([machines](machines.md#inbound-neighbors)). A name that
@@ -297,11 +298,10 @@ It is the answerer of `fleet::LINK` (it reads the sentinel), saying
 `update::hello_of(hub)` for L, with the sentinel and the `Hello`s within
 `machines::service::Timing::handshake`.
 
-- **OUT.** L binds `fleet-K.sock` and its `.pty`, `.tunnel`,
-  `.transfer` siblings in its socket dir (newest binder wins: a
-  successor daemon's link takes them over, the old daemon's ssh dying
+- **OUT.** L binds `fleet-K.sock` in its socket dir (newest binder wins:
+  a successor daemon's link takes it over, the old daemon's ssh dying
   with it); each accepted connection a stream to K. Every client here
-  reaches K through them ([over a link](#over-a-link)).
+  reaches K through it ([over a link](#over-a-link)).
 - **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
   `AGENT` goes to L's daemon in-process (`dialer::Open`: `Shared::open_lent`
   with peer `{name: K, fleet_root: fleet/K/, env: the daemon's}`), the
@@ -313,11 +313,12 @@ It is the answerer of `fleet::LINK` (it reads the sentinel), saying
 
 ## Over a link
 
-Every client reaches a machine, ssh or inbound, through the sockets its
-link's local end binds, `fleet-<name>.*.sock` in the daemon's socket dir.
+Every client reaches a machine, ssh or inbound, through the socket its
+link's local end binds, `fleet-<name>.sock` in the daemon's socket dir,
+naming its channel first (`link::connect`).
 
 - **The dial** (`fleet::dialer::dial`, the daemon's `Dial` for every
-  machine): a connection to its `fleet-<name>.sock` as a plain
+  machine): an `API` connection to its `fleet-<name>.sock` as a plain
   `ssh::Duplex::socket`; down, `its link isn't up (…)`. Each connection
   is one `API` stream to the machine's daemon, so the held link
   (`service::Machines`), the quick calls and `forward::verb` (one stream
@@ -413,7 +414,8 @@ at most `BINARY_LIMIT`, 256 MiB: the hub's dev build,
 **Directions.** The opener's streams carry ids below 2^31, the
 answerer's high-bit ids (`Outlet::open(TRANSFER)`), so the two
 directions never share an id space. A process on either host connects
-to `fleet-<peer>.transfer.sock` and calls `transfer::send` on it.
+to `fleet-<peer>.sock` for `TRANSFER` (`link::connect`) and calls
+`transfer::send` on it.
 
 ## Moving code
 
@@ -425,7 +427,7 @@ worker never needs any). It sits behind one seam, `serve::fleet::code`'s
 `Transfer` (`haves`, `send`; `offer` builds what goes, `receivers` takes
 it), so a sync layer can replace the git + tar implementation;
 `LinkTransfer` sends each body as one `TRANSFER` through the machine's
-link (a connection to `endpoint::fleet_transfer_socket`).
+link (a `TRANSFER` connection to `endpoint::fleet_socket`).
 `prepare(transfer, repos, worker root, config root, sandbox, branch)` is
 `offer` then `send`, answering `Prepared` (the config root on the
 worker, `remote_root`, and each moved folder with its branch) or
@@ -691,7 +693,7 @@ fleet root there, which every peer link's `TRANSFER` receives into
   `roots.list` flags `fleet`, asked over a fresh `API` stream
   (`daemon::fleet_root_on`, `placed::fleet_root`; none, or no answer
   within `CAPACITY_WAIT`, is a `NotMovable`), the transfer its link's
-  `LinkTransfer` (`fleet-<name>.transfer.sock`), the repo cache
+  `LinkTransfer` (`fleet-<name>.sock`), the repo cache
   `Options::repos` (default `code::repos_dir`), the config root the
   request's, the branch its `branch`. `NotMovable(why)` runs it here with
   `note: not placed on <worker>: <why>; running here` first in the
@@ -819,7 +821,7 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   own binary when `update::hub_pushes` (over both `Hello`s: the member,
   taking dev builds, would `Receive`), from a thread of its own
   (`commands::fleet_link::push_build`): `update::push`, one `binary`
-  transfer named `devsandbox` through `fleet-<member>.transfer.sock`.
+  transfer named `devsandbox` through `fleet-<member>.sock`.
   On a dialed hub the binary is the `fleet-link` process's
   (`own_binary`: `/proc/self/exe` on Linux, the inode it runs even if
   the path was replaced since; `current_exe()` elsewhere), not the hub
@@ -1215,8 +1217,8 @@ above; the session list and removal go through the helper's
 calling host, not its daemon: a tty `exec` on the machine
 ([machines](machines.md#the-cli-clirs), `cli::dials`), or the
 dashboard tab that runs one. Each dial (`pty_client::dial`) connects to
-the machine's `fleet-<name>.pty.sock` in this user's socket dir (absent:
-the link is down), sends the header (`pty_client::header`: the root and
+the machine's `fleet-<name>.sock` in this user's socket dir for `PTY`
+(absent: the link is down), sends the header (`pty_client::header`: the root and
 exact name resolution found there, the session id, `create` on the first
 dial only), puts the terminal in raw mode (crossterm's, restored by a
 guard on every return and an unwinding panic) and relays
@@ -1291,8 +1293,8 @@ a link peer (the caller) opens is served by
 (`commands::tunnel::remote_opener` with `tunnel::Via::Fleet`), in the
 calling host's daemon (`forwards::via`, per spawn, for every registered machine)
 or a foreground `devsandbox port` (`port::port_remote`).
-Each open connects to the machine's `fleet-<name>.tunnel.sock` in the
-socket dir (absent: `its fleet link isn't up (…)`), writes the request,
+Each open connects to the machine's `fleet-<name>.sock` in the socket
+dir for `TUNNEL` (absent: `its fleet link isn't up (…)`), writes the request,
 reads the header (`read_header`, up to 10 s, `stop` checked meanwhile)
 and attaches the bridge to the stream (`bridge::attach` over a
 `bridge::Transport::Stream`: killing it shuts the stream down, and a
@@ -1322,7 +1324,7 @@ with a dialer that advertised `caps::AGENT`, and the outlet is up, it
 probes the dialer every `agent::PROBE` (2 s): an `AGENT` stream
 (`link::Outlet::open`) whose status byte it reads, then closes. While
 the dialer serves it keeps `agent-link-<dialer>.sock` bound
-(`endpoint::link_agent_socket`), as an opener binds its sockets
+(`endpoint::link_agent_socket`), as an opener binds its socket
 (`link::Socket`: a temp name renamed over the path, 0600, the newest
 wins); on `NOT_SERVING` or a failure it unbinds it (`agent::decide`,
 pure: bind when serving and unbound, unbind when bound and anything

@@ -52,7 +52,7 @@ pub(crate) fn own_binary() -> io::Result<std::path::PathBuf> {
 
 /// When a hub saying `ours` pushes to a member saying `theirs`
 /// (`update::hub_pushes`), `binary()`'s file to it on a thread of its own
-/// through the link's transfer socket `socket` (`update::push`; its
+/// through the link's socket `socket` (`update::push`; its
 /// connection waits in the backlog until the opener's accept loop runs).
 /// A failure is on stderr; the member's wait ends on its own.
 pub fn push_build(
@@ -147,14 +147,7 @@ pub fn follows(ours: &str, theirs: &str, dev_builds: bool) -> Decision {
 pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, peer: &str, opts: PeerOptions) -> Result<()> {
     check_name(peer)?;
     let dir = opts.dir.clone();
-    let (api, transfer) = (endpoint::fleet_socket(&dir, peer), endpoint::fleet_transfer_socket(&dir, peer));
-    let (pty, tunnel) = (endpoint::fleet_pty_socket(&dir, peer), endpoint::fleet_tunnel_socket(&dir, peer));
-    let sockets = [
-        (channel::API, api.as_path()),
-        (channel::TRANSFER, transfer.as_path()),
-        (channel::PTY, pty.as_path()),
-        (channel::TUNNEL, tunnel.as_path()),
-    ];
+    let socket = endpoint::fleet_socket(&dir, peer);
     // While the hub's binary is on its way nothing but it is served.
     let receiving = Arc::new(AtomicBool::new(false));
     let incoming = Arc::new(Incoming::default());
@@ -179,7 +172,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
     let mut wanted = None;
     let mut held = None;
     let mut agent_thread = None;
-    let endpoint = link::Endpoint { sockets: &sockets, serves, outlet: Some(&outlet) };
+    let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: Some(&outlet) };
     let end = link::opener_with(&spec, reader, writer, endpoint, |theirs| {
         let label = Build::parse(&theirs.hash).label();
         match follows(spec.hello, &theirs.hash, (opts.follow.dev_builds)()) {
@@ -225,7 +218,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
                 .ok();
         }
         if opts.hub && !update::is_hub(&theirs.hash) {
-            push_build(spec.hello, &theirs.hash, transfer.clone(), own_binary);
+            push_build(spec.hello, &theirs.hash, socket.clone(), own_binary);
         }
         Ok(())
     });
@@ -532,9 +525,8 @@ mod tests {
         let row = inbound_row(&k_dir).unwrap();
         assert_eq!((&row["name"], &row["target"], &row["state"]), (&json!("L"), &Value::Null, &json!("connected")));
         assert_eq!(row["version"], "0.6.0");
-        for socket in [endpoint::fleet_socket(&k_dir, "L"), endpoint::fleet_pty_socket(&k_dir, "L")] {
-            assert!(socket.exists(), "{}", socket.display());
-        }
+        let socket = endpoint::fleet_socket(&k_dir, "L");
+        assert!(socket.exists(), "{}", socket.display());
         assert!(!endpoint::link_agent_socket(&k_dir, "L").exists(), "the dialer serves no AGENT");
 
         // A registry entry can't take a live neighbor's name.
@@ -560,10 +552,10 @@ mod tests {
 
         // K → L: a local client on K reaches the dialer's table.
         let mut got = Vec::new();
-        UnixStream::connect(endpoint::fleet_pty_socket(&k_dir, "L")).unwrap().read_to_end(&mut got).unwrap();
+        link::connect(&socket, channel::PTY).unwrap().read_to_end(&mut got).unwrap();
         assert_eq!(got, b"dialer pty");
 
-        // The link ends: K's end returns, its sockets and the neighbor go.
+        // The link ends: K's end returns, its socket and the neighbor go.
         k_io.shutdown(Shutdown::Both).unwrap();
         k_end.join().unwrap().unwrap();
         assert!(!endpoint::fleet_socket(&k_dir, "L").exists());

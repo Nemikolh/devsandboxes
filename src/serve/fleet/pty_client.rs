@@ -4,8 +4,8 @@
 //! instead of ssh (`machines::cli`), and so the dashboard's terminal tabs
 //! (which spawn that `exec`).
 //!
-//! One [`dial`] is one stream on the machine's `fleet-<name>.pty.sock`
-//! (`endpoint::fleet_pty_socket`, bound by this host's end of its link): the
+//! One [`dial`] is one stream on the machine's `fleet-<name>.sock`
+//! (`link::connect`, bound by this host's end of its link): the
 //! [`header`] (`session.attach` with the [`Request`]), the terminal's size
 //! at once and on every change, stdin as `stdin` records (EOF:
 //! `stdin-eof`); the worker's `stdout` records to stdout until its one end
@@ -285,8 +285,8 @@ impl Drop for Raw {
 /// piped request leaves the terminal as it is and reads stdin only when
 /// interactive.
 pub fn dial(dir: &Path, machine: &str, r: &Request, reserve_255: bool) -> i32 {
-    let path = endpoint::fleet_pty_socket(dir, machine);
-    let end = match Stream::connect(&path) {
+    let path = endpoint::fleet_socket(dir, machine);
+    let end = match super::link::connect(&path, crate::devsbd::proto::channel::PTY) {
         Err(e) => End::Lost(format!("machine `{machine}`: its fleet link isn't up ({}: {e})", path.display())),
         Ok(stream) => {
             let (mut out, mut err) = (io::stdout(), io::stderr());

@@ -27,7 +27,6 @@ pub mod tar;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -102,22 +101,22 @@ pub trait Transfer {
     fn send(&self, header: &Header, body: &mut dyn Read) -> Result<()>;
 }
 
-/// [`Transfer`] over a worker's link: each send one connection to its
-/// `fleet-link`'s transfer socket (`endpoint::fleet_transfer_socket`).
+/// [`Transfer`] over a worker's link: each send one `TRANSFER` stream
+/// through its `fleet-link`'s socket (`endpoint::fleet_socket`).
 pub struct LinkTransfer {
     pub socket: PathBuf,
 }
 
 impl LinkTransfer {
-    /// The transfer socket of `worker`'s link in the socket dir `dir`.
+    /// The socket of `worker`'s link in the socket dir `dir`.
     pub fn for_worker(dir: &Path, worker: &str) -> LinkTransfer {
-        LinkTransfer { socket: endpoint::fleet_transfer_socket(dir, worker) }
+        LinkTransfer { socket: endpoint::fleet_socket(dir, worker) }
     }
 }
 
 impl Transfer for LinkTransfer {
     fn send(&self, header: &Header, body: &mut dyn Read) -> Result<()> {
-        let stream = UnixStream::connect(&self.socket)
+        let stream = super::link::connect(&self.socket, crate::devsbd::proto::channel::TRANSFER)
             .with_context(|| format!("cannot reach the worker's link at {}", self.socket.display()))?;
         transfer::send(stream, header, body)
     }
@@ -493,6 +492,7 @@ fn unpack_root(tar: &Path, roots: &Path, hash: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -684,32 +684,30 @@ mod tests {
 
     /// A link's two ends in-process (this host the opener, the machine the
     /// answerer), the machine's receivers [`receivers`] into `fleet`; this
-    /// host's transfer socket.
+    /// host's link socket.
     fn link(dir: &Path, fleet: &Path) -> PathBuf {
         use crate::devsbd::proto::channel;
         use crate::serve::fleet::link::{Endpoint, Serves, answerer_with, opener_with};
         let hub_dir = dir.join("hub");
         std::fs::create_dir_all(&hub_dir).unwrap();
-        let xfer = endpoint::fleet_transfer_socket(&hub_dir, "w");
+        let socket = endpoint::fleet_socket(&hub_dir, "w");
         let ours = Serves::default().transfers(Arc::new(Receivers::new(|_| {})));
         let theirs = Serves::default().with(channel::API, || None).transfers(Arc::new(receivers(fleet, Receivers::new(|_| {}))));
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
-        let path = hub_dir.join("fleet-w.sock");
-        let sockets = [(channel::API, path), (channel::TRANSFER, xfer.clone())];
+        let path = socket.clone();
         std::thread::spawn(move || {
-            let sockets: Vec<_> = sockets.iter().map(|(ch, p)| (*ch, p.as_path())).collect();
-            opener_with(&super::super::LINK, o_r, o_w, Endpoint { sockets: &sockets, serves: ours, outlet: None }, |_| Ok(()))
+            opener_with(&super::super::LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(()))
         });
         std::thread::spawn(move || {
             answerer_with(&super::super::LINK, a_r, a_w, Endpoint { serves: theirs, ..Endpoint::default() }, |_| Ok(()), || {})
         });
         let start = std::time::Instant::now();
-        while UnixStream::connect(&xfer).is_err() {
-            assert!(start.elapsed() < Duration::from_secs(5), "the transfer socket accepts");
+        while UnixStream::connect(&socket).is_err() {
+            assert!(start.elapsed() < Duration::from_secs(5), "the link socket accepts");
             std::thread::sleep(Duration::from_millis(10));
         }
-        xfer
+        socket
     }
 
     #[test]

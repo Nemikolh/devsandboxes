@@ -560,7 +560,7 @@ pub fn port(
 /// `devsandbox port` on a machine's instance or global service
 /// (docs/architecture/daemon/machines.md, *The CLI*): [`port`]'s flow, each
 /// forward's bridge a `TUNNEL` stream through `entry`'s link socket
-/// (`endpoint::fleet_tunnel_socket`, `tunnel::remote_opener`), served under
+/// (`endpoint::fleet_socket`, `tunnel::remote_opener`), served under
 /// the machine's trust there. `root` is the config root there, `name` the
 /// instance as that machine knows it (already resolved, and already split
 /// from the ports by the caller: `split_target` is not applied again). No
@@ -580,7 +580,7 @@ pub fn port_remote(
     use crate::serve::endpoint;
 
     let specs = parse_specs(name.is_some(), service.is_some(), &ports)?;
-    let socket = endpoint::fleet_tunnel_socket(&endpoint::socket_dir()?, &entry.name);
+    let socket = endpoint::fleet_socket(&endpoint::socket_dir()?, &entry.name);
     let target = Arc::new((entry.name, root, name, service, socket));
     forward_until_interrupted(
         address,

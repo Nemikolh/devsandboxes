@@ -15,7 +15,6 @@
 //! fake every one.
 
 use std::ffi::OsString;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -165,13 +164,13 @@ pub fn hub_pushes(hub: &str, worker: &str) -> bool {
 }
 
 /// The hub's end of a dev build's update: `binary` (this process's own) as
-/// one [`BINARY_KIND`] transfer through the link's transfer socket at
-/// `socket` (`endpoint::fleet_transfer_socket`), named `devsandbox`.
+/// one [`BINARY_KIND`] transfer, a `TRANSFER` stream through the link's
+/// socket at `socket` (`endpoint::fleet_socket`), named `devsandbox`.
 pub fn push(socket: &Path, binary: &Path) -> Result<()> {
     let open = || std::fs::File::open(binary).with_context(|| format!("cannot read {}", binary.display()));
     let (size, sha256) = transfer::digest(open()?).with_context(|| format!("cannot read {}", binary.display()))?;
     let header = transfer::Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None };
-    let stream = UnixStream::connect(socket).with_context(|| format!("cannot connect to {}", socket.display()))?;
+    let stream = super::link::connect(socket, crate::devsbd::proto::channel::TRANSFER).with_context(|| format!("cannot connect to {}", socket.display()))?;
     transfer::send(stream, &header, open()?)
 }
 
@@ -477,7 +476,10 @@ pub(crate) mod tests {
         std::fs::write(&binary, b"the hub's build").unwrap();
         let into = dir.join("in");
         let receiver = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut ch = [0u8; 1];
+            std::io::Read::read_exact(&mut stream, &mut ch).unwrap();
+            assert_eq!(ch[0], crate::devsbd::proto::channel::TRANSFER, "a `TRANSFER` stream");
             transfer::receive(stream, BINARY_LIMIT, |h| Ok(into.join(&h.name)))
         });
         push(&socket, &binary).unwrap();

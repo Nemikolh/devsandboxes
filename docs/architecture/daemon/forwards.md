@@ -91,8 +91,8 @@ retry gap, like any other, until the forward stops.
 `commands::tunnel::remote_opener(machine, via)` asks `via()` on every
 spawn (so a machine removed from the registry is the bridge's error) how
 to reach the machine: `Via::Fleet {socket, request}`. It connects to the
-link's `fleet-<name>.tunnel.sock` in the socket dir
-(`endpoint::fleet_tunnel_socket`; absent: "its fleet link isn't up
+link's `fleet-<name>.sock` in the socket dir for one `TUNNEL` stream
+(`endpoint::fleet_socket`, `fleet::link::connect`; absent: "its fleet link isn't up
 (…)"), writes the `tunnel::Request` line (`{root, instance?, service?,
 port}`), then reads the header within `HEADER_WAIT` (10 s), `stop`
 polled (on stop or timeout the stream is shut down).
@@ -164,7 +164,7 @@ in `machines.toml` (the path `Registry::spawn` gets), then binds a
 `Forward` whose opener is `tunnel::remote_opener`; its `via` closure
 re-reads `machines.toml` on every spawn (so a
 removed machine is the bridge's error) and reaches it through its
-link's tunnel socket in the socket dir `Registry::spawn` gets
+link's socket in the socket dir `Registry::spawn` gets
 (`forwards::via`). No probe fallback. Its entry carries
 `machine`, `dir` the root there as sent (never canonicalized here) and
 `instance` the name there. `restorable` keeps such entries without the

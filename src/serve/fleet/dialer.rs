@@ -26,11 +26,11 @@
 //! serving only the `binary` transfer the hub pushes, then installs it and
 //! hands off (`update::install_received`). This host, the hub, pushes its
 //! dev build to a machine that would take it (`fleet_link::push_build`
-//! through `fleet-<entry>.transfer.sock`). Two non-hubs follow nothing.
+//! through `fleet-<entry>.sock`). Two non-hubs follow nothing.
 //!
-//! The link's sockets are bound as `link::Socket` binds them (the newest
+//! The link's socket is bound as `link::Socket` binds one (the newest
 //! binder wins), so after a version handoff the next daemon's links take
-//! them over: the old daemon's ssh dies with it, the far end's `fleet-link`
+//! it over: the old daemon's ssh dies with it, the far end's `fleet-link`
 //! exits, the new daemon redials.
 
 use std::net::Shutdown;
@@ -71,13 +71,13 @@ pub fn link_args(member: &str) -> Result<Vec<String>> {
 
 /// The daemon's [`Dial`] of a machine, ssh or inbound: a
 /// connection to its `fleet-<name>.sock` in `socket_dir` (one `API` stream
-/// on its link, the daemon from its first byte:
+/// on its link, `link::connect`, the daemon from its first byte:
 /// `machines::link::handshake` with `Over::Link`).
 pub fn dial(socket_dir: PathBuf) -> Dial {
     Arc::new(move |entry: &Entry| {
         let path = endpoint::fleet_socket(&socket_dir, &entry.name);
         let stream =
-            endpoint::Stream::connect(&path).map_err(|e| anyhow::anyhow!("its link isn't up ({}: {e})", path.display()))?;
+            link::connect(&path, channel::API).map_err(|e| anyhow::anyhow!("its link isn't up ({}: {e})", path.display()))?;
         Ok(Duplex::socket(stream))
     })
 }
@@ -85,7 +85,7 @@ pub fn dial(socket_dir: PathBuf) -> Dial {
 /// What the daemon's ssh machines' links need.
 pub struct Dialer {
     pub transport: Transport,
-    /// The socket dir: where the link's sockets are bound.
+    /// The socket dir: where the link's socket is bound.
     pub dir: PathBuf,
     /// This host's member name, read at each dial (a `member.toml` change
     /// counts from the next one).
@@ -154,14 +154,7 @@ impl Dialer {
     ) -> Ended {
         let name = entry.name.as_str();
         let dir = &self.dir;
-        let (api, pty) = (endpoint::fleet_socket(dir, name), endpoint::fleet_pty_socket(dir, name));
-        let (tunnel, transfer) = (endpoint::fleet_tunnel_socket(dir, name), endpoint::fleet_transfer_socket(dir, name));
-        let sockets = [
-            (channel::API, api.as_path()),
-            (channel::PTY, pty.as_path()),
-            (channel::TUNNEL, tunnel.as_path()),
-            (channel::TRANSFER, transfer.as_path()),
-        ];
+        let socket = endpoint::fleet_socket(dir, name);
         // While the hub's binary is on its way nothing but it is served.
         let receiving = AtomicBool::new(false);
         let incoming = Arc::new(Incoming::default());
@@ -184,7 +177,7 @@ impl Dialer {
         let spec = link::Spec { hello: ours, ..LINK };
         let wanted: Mutex<Option<String>> = Mutex::new(None);
         let mut end_link = duplex.stream.try_clone().ok().map(follow::shutting);
-        let endpoint = link::Endpoint { sockets: &sockets, serves, outlet: None };
+        let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: None };
         let end = link::answerer_with(
             &spec,
             reader,
@@ -212,7 +205,7 @@ impl Dialer {
                     }
                 }
                 if self.hub {
-                    fleet_link::push_build(ours, &peer.hash, transfer.clone(), fleet_link::own_binary);
+                    fleet_link::push_build(ours, &peer.hash, socket.clone(), fleet_link::own_binary);
                 }
                 held.up();
                 Ok(())
@@ -501,9 +494,8 @@ pub(crate) mod tests {
         let row = pair.wait_box("box connected", connected);
         assert_eq!((&row["version"], &row["error"]), (&json!("0.6.0"), &Value::Null));
         assert_eq!(*pair.dialed.peers.lock().unwrap(), ["lap"]);
-        for socket in [endpoint::fleet_socket(&pair.l_dir, "box"), endpoint::fleet_transfer_socket(&pair.l_dir, "box")] {
-            assert!(socket.exists(), "{}", socket.display());
-        }
+        let socket = endpoint::fleet_socket(&pair.l_dir, "box");
+        assert!(socket.exists(), "{}", socket.display());
         let mut k = connect(&pair.k_dir);
         let inbound = || {
             let rows = connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
@@ -549,7 +541,7 @@ pub(crate) mod tests {
     /// The CLI's re-runs on ssh machine `box` go over its link, under K's
     /// trust for `lap` (K's own root admitted, nothing else): `--machine
     /// box ls` and `done box/web-1` as API calls (`cli::calls`), a piped
-    /// `exec box/web-1 -- …` one `PTY` dial through `fleet-box.pty.sock`
+    /// `exec box/web-1 -- …` one `PTY` dial through `fleet-box.sock`
     /// ending in the command's exit code; a root K doesn't admit is K's
     /// refusal.
     #[test]
@@ -591,17 +583,17 @@ pub(crate) mod tests {
         let typed = crate::Cli::try_parse_from(["devsandbox", "exec", "box/web-1", "--", "echo out; echo err >&2; exit 3"]).unwrap();
         let mode = cli::pipe_mode(typed.command.as_ref().unwrap(), false).unwrap().unwrap();
         let request = pty_client::Request { root: pair.k_own.clone(), instance: "web-1".into(), mode };
-        let stream = endpoint::Stream::connect(endpoint::fleet_pty_socket(&pair.l_dir, "box")).unwrap();
+        let stream = link::connect(&endpoint::fleet_socket(&pair.l_dir, "box"), channel::PTY).unwrap();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let term = pty_client::Terminal { input: None, output: &mut out, errors: &mut err, size: &|| None };
         let end = pty_client::attach(stream, &pty_client::header(&request), term);
         assert_eq!((pty_client::exit_of(&end, false).0, out, err), (3, b"out\n".to_vec(), b"err\n".to_vec()));
 
         // A forward's bridge: one `TUNNEL` stream through
-        // `fleet-box.tunnel.sock`, answered by K's daemon under its trust for
+        // `fleet-box.sock`, answered by K's daemon under its trust for
         // lap.
         use crate::commands::tunnel::{self, Request, Via};
-        let socket = endpoint::fleet_tunnel_socket(&pair.l_dir, "box");
+        let socket = endpoint::fleet_socket(&pair.l_dir, "box");
         let bridge = |root: &Path| {
             let request = Request { root: root.to_path_buf(), instance: Some("web-1".into()), service: None, port: 3000 };
             let via = Via::Fleet { socket: socket.clone(), request };

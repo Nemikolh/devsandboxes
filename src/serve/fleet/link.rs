@@ -6,19 +6,20 @@
 //! link's [`Spec`] is its sentinel line and the channel it stands for.
 //!
 //! Both ends are the same [`Endpoint`] once the `Hello`s are through: OUT,
-//! the sockets it binds (each accepted connection one `Open { channel }`
-//! stream, dropped unopened when the peer didn't advertise that channel)
-//! and an [`Outlet`] its own code opens streams through; IN, its own table
+//! the socket it binds (each accepted connection one `Open { channel }`
+//! stream, the channel its first byte, written by [`connect`]; dropped
+//! unopened when the peer didn't advertise that channel) and an [`Outlet`]
+//! its own code opens streams through; IN, its own table
 //! ([`Serves`]: channel → handler) answering the peer's streams. The two
 //! roles differ only in the handshake and the stream id space:
 //!
 //! - [`opener_with`], the end ssh runs (it writes the sentinel): binds its
-//!   sockets, writes the sentinel, exchanges `Hello`s; it opens low-bit ids
+//!   socket, writes the sentinel, exchanges `Hello`s; it opens low-bit ids
 //!   (`next_stream_id`, `Mux::attach`: flowing when `channel::flows` says
 //!   so, legacy otherwise) and answers the peer's high-bit ones
 //!   (`Mux::on_host_open`).
 //! - [`answerer_with`], the end that dials: skips to the sentinel, binds its
-//!   sockets, exchanges `Hello`s; it opens high-bit ids (`Mux::open_host`:
+//!   socket, exchanges `Hello`s; it opens high-bit ids (`Mux::open_host`:
 //!   flowing channels only, every link channel flows; a socket's connection
 //!   spliced to the stream) and answers the peer's low-bit ones.
 //!
@@ -34,7 +35,7 @@
 //! through [`Serves::transfers`], `AGENT` by the opener, `fleet::agent`).
 //!
 //! The newest end binding a socket wins: it binds a temp name and renames
-//! it over the path. An end unlinks its sockets, if they are still its own,
+//! it over the path. An end unlinks its socket, if it is still its own,
 //! when the link ends: the opener when its reader ends, its writer fails,
 //! or the keepalive hears nothing for `mux::KEEPALIVE_TIMEOUT`; the answerer
 //! when its reader ends (`on_dead` ends it after that same silence). So a
@@ -146,10 +147,10 @@ impl<'a> Serves<'a> {
 /// answered on a thread of the link's own.
 #[derive(Default)]
 pub struct Endpoint<'a, 's> {
-    /// OUT: a channel and its socket path each, bound before the `Hello`s
-    /// (a temp name in the same dir first, [`Socket::bind`]); each
-    /// accepted connection one stream on the channel.
-    pub sockets: &'a [(u8, &'a Path)],
+    /// OUT: the socket path, bound before the `Hello`s (a temp name in the
+    /// same dir first, [`Socket::bind`]); each accepted connection one
+    /// stream on the channel its first byte names ([`connect`]).
+    pub socket: Option<&'a Path>,
     /// IN: what this end answers the peer's streams with.
     pub serves: Serves<'s>,
     /// OUT for this end's own code: set to the link from the `Hello`s until
@@ -161,9 +162,22 @@ pub struct Endpoint<'a, 's> {
 /// noise and the line itself together.
 pub const SENTINEL_LIMIT: usize = 64 * 1024;
 
-/// How often an end's accept loop looks up from its listeners to see
+/// How often an end's accept loop looks up from its listener to see
 /// whether the link has ended.
 const POLL: Duration = Duration::from_millis(200);
+
+/// How long an accepted connection has to name its channel before it is
+/// dropped.
+const CHANNEL_WAIT: Duration = Duration::from_secs(10);
+
+/// A connection to a link end's `socket` for one stream on `channel`: its
+/// first byte names the channel ([`Endpoint::socket`]); the rest is the
+/// stream's.
+pub fn connect(socket: &Path, channel: u8) -> io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(&[channel])?;
+    Ok(stream)
+}
 
 /// `spec`'s sentinel line, flushed. Its leading newline ends a motd printed
 /// without a final one, so the sentinel always starts a line.
@@ -247,7 +261,7 @@ impl Out {
         opened.with_context(|| format!("cannot open a channel {channel} stream"))
     }
 
-    /// One accepted connection to `channel`'s socket, as a stream on it:
+    /// One accepted connection that named `channel`, as a stream on it:
     /// dropped unopened (the client reads EOF at once) when the peer didn't
     /// advertise `channel`. The opener attaches the connection itself (a
     /// legacy channel too); the answerer
@@ -299,7 +313,7 @@ impl Outlet {
     /// End the live link from this end (a peer link's end that must follow
     /// its hub's build, `fleet::follow`): its body ends as when the peer's
     /// stream ends ([`opener_with`] returns `Ok`, [`answerer_with`]
-    /// `End::Closed`), its sockets unlinked. Nothing when no link is up.
+    /// `End::Closed`), its socket unlinked. Nothing when no link is up.
     pub fn hang_up(&self) {
         if let Some(end) = self.end.lock().unwrap().as_ref() {
             let _ = end.send(Ending::Closed);
@@ -313,8 +327,8 @@ impl Outlet {
     }
 }
 
-/// [`opener_with`] opening only `spec.channel`, through `socket`, and
-/// serving nothing: the tests' opener.
+/// [`opener_with`] binding `socket` and serving nothing: the tests'
+/// opener.
 #[cfg(test)]
 pub fn opener(
     spec: &Spec,
@@ -323,16 +337,15 @@ pub fn opener(
     socket: &Path,
     on_ready: impl FnOnce(&proto::Peer) -> Result<()>,
 ) -> Result<()> {
-    let sockets = [(spec.channel, socket)];
-    opener_with(spec, reader, writer, Endpoint { sockets: &sockets, ..Endpoint::default() }, on_ready)
+    opener_with(spec, reader, writer, Endpoint { socket: Some(socket), ..Endpoint::default() }, on_ready)
 }
 
-/// The opener over `reader`/`writer`: bind `endpoint`'s sockets, sentinel
+/// The opener over `reader`/`writer`: bind `endpoint`'s socket, sentinel
 /// and `Hello`s advertising its `serves`' caps (the peer must advertise
 /// `spec.channel`'s), then the link's body until it ends ([`run`], see the
 /// module doc). `on_ready` runs once the `Hello`s are through, with the
 /// peer's (its `hash` is what the far end's spec says, e.g. its semver),
-/// before the first accept; its error ends the opener (the sockets
+/// before the first accept; its error ends the opener (the socket
 /// unlinked) with that error. `Ok` when the peer went away (the reader
 /// ended or the writer broke, whichever was seen first); an error when the
 /// keepalive heard nothing or a listener failed.
@@ -343,9 +356,9 @@ pub fn opener_with(
     endpoint: Endpoint<'_, 'static>,
     on_ready: impl FnOnce(&proto::Peer) -> Result<()>,
 ) -> Result<()> {
-    // Bound before the `Hello`s, so once this end has answered, the sockets
-    // are there.
-    let bound = bind(endpoint.sockets)?;
+    // Bound before the `Hello`s, so once this end has answered, the socket
+    // is there.
+    let bound = endpoint.socket.map(Socket::bind).transpose()?;
     let (tx, ended) = mpsc::channel();
     let mut writer = Reporting { inner: writer, failed: tx.clone() };
     write_sentinel(spec, &mut writer).context("cannot write to stdout")?;
@@ -381,7 +394,7 @@ pub fn opener_with(
 /// How [`answerer_with`] ended.
 #[derive(Debug)]
 pub enum End {
-    /// The link never came up: no sentinel, a socket not bound, or the
+    /// The link never came up: no sentinel, the socket not bound, or the
     /// `Hello`s failed.
     Handshake(String),
     /// `answerer_with`'s `on_ready` turned the peer down, with why: nothing
@@ -419,7 +432,7 @@ pub fn answerer(
 }
 
 /// The answerer over `reader`/`writer` until the link ends: skip to the
-/// sentinel, bind `endpoint`'s sockets, exchange `Hello`s advertising its
+/// sentinel, bind `endpoint`'s socket, exchange `Hello`s advertising its
 /// `serves`' caps, then the link's body ([`run`], see the module doc) on
 /// this thread: each `Open { channel }` answered from `serves` (`None`, or
 /// a channel not there, refuses it with `Close`). `on_ready` gets the
@@ -429,7 +442,7 @@ pub fn answerer(
 /// `fleet::worker`). Keepalive pings go out every `mux::KEEPALIVE_INTERVAL`;
 /// after `mux::KEEPALIVE_TIMEOUT` without a frame `on_dead` runs once: it
 /// must end `reader` (kill the ssh) so this returns. A failed listener
-/// ends only the accepts (its sockets unlinked); the link stays up.
+/// ends only the accepts (its socket unlinked); the link stays up.
 pub fn answerer_with(
     spec: &Spec,
     mut reader: impl Read,
@@ -452,7 +465,7 @@ pub fn answerer_with(
         });
     }
     // Bound before this end's `Hello`, as the opener's are.
-    let bound = match bind(endpoint.sockets) {
+    let bound = match endpoint.socket.map(Socket::bind).transpose() {
         Ok(bound) => bound,
         Err(e) => return End::Handshake(format!("{e:#}")),
     };
@@ -477,11 +490,6 @@ pub fn answerer_with(
     if dead { End::Dead } else { End::Closed }
 }
 
-/// `sockets`, each bound ([`Socket::bind`]) with its channel.
-fn bind(sockets: &[(u8, &Path)]) -> Result<Vec<(Socket, u8)>> {
-    sockets.iter().map(|&(ch, path)| Ok((Socket::bind(path)?, ch))).collect()
-}
-
 /// The link's body past the `Hello`s, the same for both roles, until it
 /// ends: `outlet` set to it, the keepalive (reporting [`Ending::Dead`],
 /// then running `on_dead`), OUT's accept loop over `bound` on a thread of
@@ -496,7 +504,7 @@ fn run(
     mux: &Arc<Mux>,
     role: Role,
     theirs: u32,
-    bound: Vec<(Socket, u8)>,
+    bound: Option<Socket>,
     outlet: Option<&Outlet>,
     (tx, ended): (mpsc::Sender<Ending>, mpsc::Receiver<Ending>),
     on_dead: impl FnOnce() + Send + 'static,
@@ -517,7 +525,7 @@ fn run(
     }
     let stop = AtomicBool::new(false);
     let first = std::thread::scope(|s| {
-        if !bound.is_empty() {
+        if let Some(bound) = bound {
             let (out, stop, tx) = (&out, &stop, tx.clone());
             s.spawn(move || {
                 if let Err(e) = accept(bound, out, stop) {
@@ -538,18 +546,34 @@ fn run(
     (first, dead.load(Ordering::Relaxed))
 }
 
-/// OUT's accept loop: each connection to one of `bound` relayed as a
-/// stream on its channel ([`Out::relay`]), until `stop` (looked at every
-/// [`POLL`]) or a listener fails. The sockets go (unlinked unless
-/// replaced) when it returns.
-fn accept(bound: Vec<(Socket, u8)>, out: &Out, stop: &AtomicBool) -> io::Result<()> {
-    let polled: Vec<&UnixListener> = bound.iter().map(|(s, _)| &s.listener).collect();
+/// OUT's accept loop: each connection to `bound` relayed as a stream on
+/// the channel its first byte names ([`Out::relay`]), until `stop`
+/// (looked at every [`POLL`]) or the listener fails. The socket goes
+/// (unlinked unless replaced) when it returns.
+fn accept(bound: Socket, out: &Arc<Out>, stop: &AtomicBool) -> io::Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        if let Some((i, conn)) = crate::serve::endpoint::accept_any(&polled, POLL)? {
-            out.relay(bound[i].1, conn);
+        if let Some((_, conn)) = crate::serve::endpoint::accept_any(&[&bound.listener], POLL)? {
+            let out = Arc::clone(out);
+            // Off the accept loop: a client slow to name its channel holds
+            // up only itself.
+            let _ = std::thread::Builder::new().name("link-accept".into()).spawn(move || {
+                if let Some(channel) = read_channel(&conn) {
+                    out.relay(channel, conn);
+                }
+            });
         }
     }
     Ok(())
+}
+
+/// The channel byte a connection starts with ([`connect`]), waiting up to
+/// [`CHANNEL_WAIT`]; `None` when it closed or said nothing in time.
+fn read_channel(conn: &UnixStream) -> Option<u8> {
+    conn.set_read_timeout(Some(CHANNEL_WAIT)).ok()?;
+    let mut byte = [0u8; 1];
+    (&*conn).read_exact(&mut byte).ok()?;
+    conn.set_read_timeout(None).ok()?;
+    Some(byte[0])
 }
 
 /// Relay `client` and `stream` both ways on threads of their own, each
@@ -705,8 +729,7 @@ mod tests {
         let (stream, hello) = {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                let mut stream = UnixStream::connect(&socket).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut stream = dial(&socket, channel::API);
                 match client::hello(&mut stream, &Version { semver: "0.0.0".into(), build: 0 }, "test") {
                     Ok(Hello::Ready(reply)) => break (stream, reply),
                     other => assert!(Instant::now() < deadline, "no hello through the link: {other:?}"),
@@ -788,8 +811,7 @@ mod tests {
         let old_ino = std::fs::metadata(&socket).unwrap().ino();
         link(&socket, tagged(b"new"));
         wait_for(|| std::fs::metadata(&socket).is_ok_and(|m| m.ino() != old_ino), "the newer socket in place");
-        let mut c = UnixStream::connect(&socket).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut c = dial(&socket, channel::API);
         let mut got = [0; 3];
         c.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"new");
@@ -799,7 +821,7 @@ mod tests {
     }
 
     /// A file each way over a real link: the hub (opener) sends to the
-    /// worker (answerer) through its transfer socket, the worker to the hub
+    /// worker (answerer) through its socket (a `TRANSFER` stream), the worker to the hub
     /// through its outlet; each end's receivers by kind.
     #[test]
     fn transfers_cross_the_link_both_ways() {
@@ -818,40 +840,40 @@ mod tests {
         };
         let (hub_tx, hub_rx) = mpsc::channel();
         let (worker_tx, worker_rx) = mpsc::channel();
-        let socket = hub_dir.join("fleet-w.sock");
-        let xfer = endpoint::fleet_transfer_socket(&hub_dir, "w");
+        let socket = endpoint::fleet_socket(&hub_dir, "w");
         let ours = Serves::default().transfers(receivers(hub_dir.join("in"), hub_tx));
         let theirs = Serves::default().with(channel::API, || None).transfers(receivers(worker_dir.clone(), worker_tx));
         let outlet = Arc::new(Outlet::default());
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
-        let sockets = [(channel::API, socket.clone()), (channel::TRANSFER, xfer.clone())];
-        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { sockets: &paths(&sockets), serves: ours, outlet: None }, |_| Ok(())));
+        let path = socket.clone();
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(())));
         let answering = Arc::clone(&outlet);
         std::thread::spawn(move || {
             answerer_with(&LINK, a_r, a_w, Endpoint { serves: theirs, outlet: Some(&answering), ..Endpoint::default() }, |_| Ok(()), || {})
         });
-        wait_for(|| UnixStream::connect(&xfer).is_ok(), "the transfer socket accepts");
+        wait_for(|| UnixStream::connect(&socket).is_ok(), "the socket accepts");
+        let xfer = || connect(&socket, channel::TRANSFER).unwrap();
 
         // Hub → worker: bigger than a window, so credit has to flow.
         let body: Vec<u8> = (0..600_000u32).map(|i| i as u8).collect();
         let (size, sha256) = transfer::digest(&body[..]).unwrap();
         let header = Header { kind: "root-tar".into(), name: "cfg.tar".into(), size, sha256, to: None };
-        transfer::send(UnixStream::connect(&xfer).unwrap(), &header, &body[..]).unwrap();
+        transfer::send(xfer(), &header, &body[..]).unwrap();
         let got = worker_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(got.path, worker_dir.join("cfg.tar"));
         assert_eq!(std::fs::read(&got.path).unwrap(), body);
         // A kind the worker doesn't take is refused over the link.
         let other = Header { kind: "binary".into(), ..header.clone() };
-        let err = transfer::send(UnixStream::connect(&xfer).unwrap(), &other, &body[..]).unwrap_err();
+        let err = transfer::send(xfer(), &other, &body[..]).unwrap_err();
         assert_eq!(format!("{err:#}"), "transfer refused: nothing here receives `binary` transfers");
         // A bad body's answer still arrives, the whole body through the mux.
         let bad = Header { sha256: "0".repeat(64), ..header.clone() };
-        let err = transfer::send(UnixStream::connect(&xfer).unwrap(), &bad, &body[..]).unwrap_err();
+        let err = transfer::send(xfer(), &bad, &body[..]).unwrap_err();
         assert!(format!("{err:#}").starts_with("transfer refused: the body's sha256 is"), "{err:#}");
         let mut long = body.clone();
         long.extend_from_slice(&[0; 1000]);
-        let err = transfer::send(UnixStream::connect(&xfer).unwrap(), &header, &long[..]).unwrap_err();
+        let err = transfer::send(xfer(), &header, &long[..]).unwrap_err();
         assert!(format!("{err:#}").contains("the body is longer than its 600000 bytes"), "{err:#}");
         assert_eq!(std::fs::read_dir(&worker_dir).unwrap().count(), 1, "only cfg.tar, no temp files");
 
@@ -885,11 +907,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `(channel, path)`s borrowed as an `Endpoint` takes them.
-    fn paths(sockets: &[(u8, PathBuf)]) -> Vec<(u8, &Path)> {
-        sockets.iter().map(|(ch, p)| (*ch, p.as_path())).collect()
-    }
-
     /// A handler whose every stream gets `tag` written and is then dropped.
     fn tagged(tag: &'static [u8]) -> impl Fn() -> Option<Conn> + Send + Sync + 'static {
         move || {
@@ -915,45 +932,43 @@ mod tests {
         c
     }
 
-    fn connect(socket: &Path) -> UnixStream {
-        let c = UnixStream::connect(socket).unwrap();
+    /// A connection to `socket` for one `channel` stream, with a read
+    /// timeout.
+    fn dial(socket: &Path, channel: u8) -> UnixStream {
+        let c = connect(socket, channel).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         c
     }
 
-    /// The opener serves `PTY` and has `API`, `PTY` and `TUNNEL` sockets;
-    /// the answerer serves `API` and `PTY`. Returns the sockets' paths and
-    /// the answerer's outlet, once it is up.
-    fn two_way(dir: &Path) -> ([PathBuf; 3], Arc<Outlet>) {
+    /// The opener serves `PTY` and binds a socket; the answerer serves
+    /// `API` and `PTY`. Returns the socket's path and the answerer's
+    /// outlet, once it is up.
+    fn two_way(dir: &Path) -> (PathBuf, Arc<Outlet>) {
         std::fs::create_dir_all(dir).unwrap();
-        let sockets = [
-            (channel::API, endpoint::fleet_socket(dir, "w")),
-            (channel::PTY, endpoint::fleet_channel_socket(dir, "w", "pty")),
-            (channel::TUNNEL, endpoint::fleet_channel_socket(dir, "w", "tunnel")),
-        ];
-        let paths_out = sockets.clone().map(|(_, p)| p);
+        let socket = endpoint::fleet_socket(dir, "w");
+        let path = socket.clone();
         let ours = Serves::default().with(channel::PTY, tagged(b"hub pty"));
         let theirs = Serves::default().with(channel::API, tagged(b"worker api")).with(channel::PTY, tagged(b"worker pty"));
         let outlet = Arc::new(Outlet::default());
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
-        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { sockets: &paths(&sockets), serves: ours, outlet: None }, |_| Ok(())));
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(())));
         let answering = Arc::clone(&outlet);
         std::thread::spawn(move || {
             answerer_with(&LINK, a_r, a_w, Endpoint { serves: theirs, outlet: Some(&answering), ..Endpoint::default() }, |_| Ok(()), || {})
         });
         wait_for(|| outlet.is_up(), "the outlet is up");
-        wait_for(|| UnixStream::connect(&paths_out[0]).is_ok(), "the opener's sockets accept");
-        (paths_out, outlet)
+        wait_for(|| UnixStream::connect(&socket).is_ok(), "the opener's socket accepts");
+        (socket, outlet)
     }
 
     #[test]
     fn a_second_channel_reaches_the_peers_handler_both_ways() {
         let dir = scratch("fleet-two-way");
-        let ([api, pty, _], outlet) = two_way(&dir);
-        // Opener → answerer: each socket reaches its channel's handler.
-        assert_eq!(read_all(connect(&pty)), b"worker pty");
-        assert_eq!(read_all(connect(&api)), b"worker api");
+        let (socket, outlet) = two_way(&dir);
+        // Opener → answerer: each named channel reaches its handler.
+        assert_eq!(read_all(dial(&socket, channel::PTY)), b"worker pty");
+        assert_eq!(read_all(dial(&socket, channel::API)), b"worker api");
         // Answerer → opener, through the outlet.
         assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"hub pty");
         let _ = std::fs::remove_dir_all(&dir);
@@ -962,10 +977,15 @@ mod tests {
     #[test]
     fn a_channel_the_peer_doesnt_serve_is_refused_and_the_link_stays_up() {
         let dir = scratch("fleet-unserved");
-        let ([api, _, tunnel], outlet) = two_way(&dir);
-        // The answerer didn't advertise `TUNNEL`: its socket's connections
-        // are dropped unopened.
-        assert_eq!(read_all(connect(&tunnel)), b"");
+        let (socket, outlet) = two_way(&dir);
+        // The answerer didn't advertise `TUNNEL`: connections naming it are
+        // dropped unopened, as are ones naming no channel at all.
+        assert_eq!(read_all(dial(&socket, channel::TUNNEL)), b"");
+        assert_eq!(read_all(dial(&socket, 0xff)), b"");
+        let mut silent = UnixStream::connect(&socket).unwrap();
+        silent.shutdown(Shutdown::Write).unwrap();
+        silent.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_all(&mut silent), b"");
         // The opener didn't advertise `API` or `TUNNEL`: the outlet won't open them.
         for ch in [channel::API, channel::TUNNEL] {
             let err = outlet.open(ch).err().expect("refused");
@@ -973,7 +993,7 @@ mod tests {
         }
         // Nor a legacy channel, even served.
         assert!(outlet.open(channel::SSH_AGENT).is_err());
-        assert_eq!(read_all(connect(&api)), b"worker api");
+        assert_eq!(read_all(dial(&socket, channel::API)), b"worker api");
         assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"hub pty");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -988,10 +1008,7 @@ mod tests {
         let socket = dir.join("fleet-w.sock");
         let ours = Serves::default().with(channel::PTY, tagged(b"hub pty"));
         let path = socket.clone();
-        std::thread::spawn(move || {
-            let sockets = [(channel::API, path.as_path())];
-            opener_with(&LINK, o_r, o_w, Endpoint { sockets: &sockets, serves: ours, outlet: None }, |_| Ok(()))
-        });
+        std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None }, |_| Ok(())));
         let mut noise = None;
         ssh::skip_lines(&mut a_r, SENTINEL_LIMIT, &mut noise, |l: &[u8]| match_sentinel(&LINK, l)).unwrap();
         let peer = proto::handshake(&mut a_r, &mut a_w, "test", caps::API).unwrap();
@@ -1027,8 +1044,7 @@ mod tests {
     fn the_answerer_binds_sockets_and_the_opener_has_an_outlet() {
         let dir = scratch("fleet-swapped");
         std::fs::create_dir_all(&dir).unwrap();
-        let (pty, tunnel) = (dir.join("a.pty.sock"), dir.join("a.tunnel.sock"));
-        let api = dir.join("o.sock");
+        let (theirs_sock, api) = (dir.join("a.sock"), dir.join("o.sock"));
         let ours = Serves::default().with(channel::PTY, tagged(b"opener pty"));
         let theirs = Serves::default().with(channel::API, tagged(b"answerer api")).with(channel::TRANSFER, tagged(b"answerer xfer"));
         let (opening, answering) = (Arc::new(Outlet::default()), Arc::new(Outlet::default()));
@@ -1036,28 +1052,24 @@ mod tests {
         let (o_r, a_w) = std::io::pipe().unwrap();
         {
             let (api, opening) = (api.clone(), Arc::clone(&opening));
-            std::thread::spawn(move || {
-                let sockets = [(channel::API, api.as_path())];
-                opener_with(&LINK, o_r, o_w, Endpoint { sockets: &sockets, serves: ours, outlet: Some(&opening) }, |_| Ok(()))
-            });
+            std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&api), serves: ours, outlet: Some(&opening) }, |_| Ok(())));
         }
         {
-            let sockets = [(channel::PTY, pty.clone()), (channel::TUNNEL, tunnel.clone())];
-            let answering = Arc::clone(&answering);
+            let (path, answering) = (theirs_sock.clone(), Arc::clone(&answering));
             std::thread::spawn(move || {
-                let endpoint = Endpoint { sockets: &paths(&sockets), serves: theirs, outlet: Some(&answering) };
+                let endpoint = Endpoint { socket: Some(&path), serves: theirs, outlet: Some(&answering) };
                 answerer_with(&LINK, a_r, a_w, endpoint, |_| Ok(()), || {})
             });
         }
         wait_for(|| opening.is_up() && answering.is_up(), "both outlets are up");
         // The answerer's socket reaches the opener's table, twice (two
         // high-bit ids)...
-        assert_eq!(read_all(connect(&pty)), b"opener pty");
-        assert_eq!(read_all(connect(&pty)), b"opener pty");
+        assert_eq!(read_all(dial(&theirs_sock, channel::PTY)), b"opener pty");
+        assert_eq!(read_all(dial(&theirs_sock, channel::PTY)), b"opener pty");
         // ...a channel the opener doesn't serve is dropped unopened...
-        assert_eq!(read_all(connect(&tunnel)), b"");
+        assert_eq!(read_all(dial(&theirs_sock, channel::TUNNEL)), b"");
         // ...and the opener's own socket still reaches the answerer's.
-        assert_eq!(read_all(connect(&api)), b"answerer api");
+        assert_eq!(read_all(dial(&api, channel::API)), b"answerer api");
         // The opener's outlet: low-bit streams to the answerer's table,
         // alongside its socket's.
         assert_eq!(read_all(timed(opening.open(channel::TRANSFER).unwrap())), b"answerer xfer");
@@ -1068,7 +1080,7 @@ mod tests {
     }
 
     /// An end's own code ends its live link through its outlet: the opener
-    /// returns `Ok`, its sockets unlinked; nothing happens with no link up.
+    /// returns `Ok`, its socket unlinked; nothing happens with no link up.
     #[test]
     fn an_outlet_hangs_up_its_link() {
         let dir = scratch("fleet-hang-up");
@@ -1080,10 +1092,7 @@ mod tests {
         let (o_r, a_w) = std::io::pipe().unwrap();
         let opener = {
             let (outlet, path) = (Arc::clone(&outlet), socket.clone());
-            std::thread::spawn(move || {
-                let sockets = [(channel::API, path.as_path())];
-                opener_with(&LINK, o_r, o_w, Endpoint { sockets: &sockets, outlet: Some(&outlet), ..Endpoint::default() }, |_| Ok(()))
-            })
+            std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), outlet: Some(&outlet), ..Endpoint::default() }, |_| Ok(())))
         };
         std::thread::spawn(move || answerer(&LINK, a_r, a_w, || None, || {}, || {}));
         wait_for(|| outlet.is_up(), "the outlet is up");

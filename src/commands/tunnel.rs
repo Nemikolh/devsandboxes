@@ -12,7 +12,6 @@
 //! rest of the stream to `bridge::attach`.
 
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -202,8 +201,8 @@ pub fn resolve(
 /// How one spawn of a remote forward's bridge reaches its machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Via {
-    /// A machine: connect to its link's tunnel socket
-    /// (`endpoint::fleet_tunnel_socket`), one `TUNNEL` stream, and send
+    /// A machine: connect to its link's socket (`endpoint::fleet_socket`)
+    /// for one `TUNNEL` stream (`fleet::link::connect`), and send
     /// `request`.
     Fleet { socket: PathBuf, request: Request },
 }
@@ -256,7 +255,7 @@ fn wait_header<T>(rx: &mpsc::Receiver<T>, stop: &AtomicBool) -> Waited<T> {
 /// [`Via::Fleet`]: connect to `socket`, send `request`'s line, read the
 /// worker's [`Header`], then attach the bridge to the stream itself.
 fn open_fleet(machine: &str, socket: &Path, request: &Request, stop: &AtomicBool) -> Result<(Opened, Bridge), String> {
-    let stream = UnixStream::connect(socket)
+    let stream = crate::serve::fleet::link::connect(socket, crate::devsbd::proto::channel::TUNNEL)
         .map_err(|e| format!("machine `{machine}`: its fleet link isn't up ({}: {e})", socket.display()))?;
     let clones = (stream.try_clone(), stream.try_clone());
     let (Ok(mut reader), Ok(writer)) = clones else {
@@ -299,6 +298,7 @@ fn open_fleet(machine: &str, socket: &Path, request: &Request, stop: &AtomicBool
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, TcpStream};
+    use std::os::unix::net::UnixStream;
     use std::sync::Arc;
 
     use super::*;
@@ -422,12 +422,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dsv-tunnel-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("fleet-lap.tunnel.sock");
+        let socket = dir.join("fleet-lap.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let t = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            let mut line = Vec::new();
             let mut byte = [0u8; 1];
+            (&s).read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], crate::devsbd::proto::channel::TUNNEL, "the connection names its channel");
+            let mut line = Vec::new();
             while (&s).read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
                 line.push(byte[0]);
             }
@@ -495,7 +497,7 @@ mod tests {
     }
 
     /// Docker-gated: a forward through the remote opener over a fake
-    /// machine's tunnel socket, whose end of each stream writes a header,
+    /// machine's link socket, whose end of each stream writes a header,
     /// then runs the bridge into the container on the rest of it, as
     /// `serve::fleet::tunnel` does. The echo round-trips and the listening
     /// process comes from the helper over that stream.
@@ -523,7 +525,7 @@ mod tests {
             };
             let dir = std::env::temp_dir().join(format!("dsv-tunnel-docker-{stamp}"));
             std::fs::create_dir_all(&dir).unwrap();
-            let socket = dir.join("fleet-box.tunnel.sock");
+            let socket = dir.join("fleet-box.sock");
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
             let container = name.clone();
             // Every stream the forward opens (it may reopen one): the request

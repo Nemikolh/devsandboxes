@@ -376,10 +376,10 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    │  reads the sentinel       │  devsandbox     │   is the link; writes the     │
    │                           │  fleet-link …)  │   sentinel)                   │
    │ OUT: fleet-K.sock         │ ═══════════════►│ OUT: fleet-L.sock             │
-   │      fleet-K.pty.sock     │ one byte pipe,  │      fleet-L.pty.sock …       │
-   │      fleet-K.tunnel.sock  │ frame mux:      │      agent-link-L.sock        │
-   │      fleet-K.transfer.sock│ API PTY TUNNEL  │  each accept → Open(ch)       │
-   │  each accept → Open(ch)   │ TRANSFER AGENT, │                               │
+   │  each accept: first byte  │ one byte pipe,  │      agent-link-L.sock        │
+   │  names ch → Open(ch)      │ frame mux:      │  each accept: first byte      │
+   │                           │ API PTY TUNNEL  │  names ch → Open(ch)          │
+   │                           │ TRANSFER AGENT, │                               │
    │                           │ either end opens│ IN: Open(ch) from L → K's     │
    │ IN: Open(ch) from K → L's │                 │  daemon socket, first line    │
    │  daemon in-process, peer K│                 │  link.attach{ch, peer: L}     │

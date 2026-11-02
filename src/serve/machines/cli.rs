@@ -641,19 +641,12 @@ pub fn machine_names() -> Vec<String> {
 }
 
 /// Whether `files` (names in socket dir `dir`) hold a `fleet-*.sock` that
-/// isn't one of `registered`'s link sockets (`endpoint::fleet_socket` and
-/// its `.pty`, `.tunnel`, `.transfer` siblings): some other machine's link
-/// is up here, an inbound one's (or a stale socket, which the daemon then
+/// isn't one of `registered`'s link sockets (`endpoint::fleet_socket`):
+/// some other machine's link is up here, an inbound one's (or a stale socket, which the daemon then
 /// lists no machine for).
 pub(crate) fn foreign_link_sockets(dir: &Path, files: &[String], registered: &[String]) -> bool {
     let name = |p: PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let ours: Vec<String> = registered
-        .iter()
-        .flat_map(|m| {
-            let channels = ["pty", "tunnel", "transfer"].map(|s| name(endpoint::fleet_channel_socket(dir, m, s)));
-            std::iter::once(name(endpoint::fleet_socket(dir, m))).chain(channels)
-        })
-        .collect();
+    let ours: Vec<String> = registered.iter().map(|m| name(endpoint::fleet_socket(dir, m))).collect();
     files.iter().any(|f| f.starts_with("fleet-") && f.ends_with(".sock") && !ours.contains(f))
 }
 
@@ -1042,11 +1035,11 @@ mod tests {
     fn only_a_foreign_link_socket_asks_for_inbound_machines() {
         let dir = Path::new("/run/devsandbox");
         let files = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let own = files(&["serve.sock", "fleet-box.sock", "fleet-box.pty.sock", "fleet-box.tunnel.sock", "fleet-box.transfer.sock", "agent-link-box.sock"]);
+        let own = files(&["serve.sock", "fleet-box.sock", "agent-link-box.sock"]);
         assert!(!foreign_link_sockets(dir, &own, &ms(&["box"])), "box's own");
         assert!(foreign_link_sockets(dir, &own, &[]), "box isn't registered");
         assert!(!foreign_link_sockets(dir, &files(&["serve.sock", "fleet.sock"]), &[]), "no machine's");
-        let with_lap = [own, files(&["fleet-lap.sock", "fleet-lap.pty.sock"])].concat();
+        let with_lap = [own, files(&["fleet-lap.sock"])].concat();
         assert!(foreign_link_sockets(dir, &with_lap, &ms(&["box"])), "lap's link is up here");
         assert!(!foreign_link_sockets(dir, &with_lap, &ms(&["box", "lap"])));
     }

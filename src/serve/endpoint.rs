@@ -78,37 +78,14 @@ const AGENT_CLIENT_MAX: usize = 40;
 /// *Peer links*): `fleet-<machine>.sock`, bound by this host's end of the
 /// link (the daemon's `fleet::dialer` for an ssh machine, the
 /// `fleet-link --peer <machine>` for an inbound one); each connection there
-/// is one `API` stream to the machine's daemon. The name is cut down to
+/// is one stream to the machine on the channel its first byte names
+/// (`fleet::link::connect`: `API`, `PTY`, `TUNNEL`, `TRANSFER`). The name is cut down to
 /// `[A-Za-z0-9._-]` (the rest become `_`) and to [`AGENT_CLIENT_MAX`]
 /// bytes, a long one ending in a hash of the full name so two long names
 /// don't collide: macOS caps socket paths at 104 bytes (a valid machine
 /// name needs only the length cut).
 pub fn fleet_socket(dir: &Path, machine: &str) -> PathBuf {
     dir.join(format!("fleet-{}.sock", agent_socket_name(machine)))
-}
-
-/// A machine's transfer socket in `dir` (docs/architecture/daemon/fleet.md,
-/// *Transfer*): `fleet-<machine>.transfer.sock`, next to [`fleet_socket`];
-/// each connection there is one `TRANSFER` stream to the machine.
-pub fn fleet_transfer_socket(dir: &Path, machine: &str) -> PathBuf {
-    fleet_channel_socket(dir, machine, "transfer")
-}
-
-/// A machine's terminal socket in `dir` (docs/architecture/daemon/fleet.md,
-/// *PTY*): `fleet-<machine>.pty.sock`, next to [`fleet_socket`]; each
-/// connection there is one `PTY` stream to the machine (`fleet::pty_client`
-/// dials it).
-pub fn fleet_pty_socket(dir: &Path, machine: &str) -> PathBuf {
-    fleet_channel_socket(dir, machine, "pty")
-}
-
-/// A machine's port forward socket in `dir`
-/// (docs/architecture/daemon/fleet.md, *TUNNEL*): `fleet-<machine>.tunnel.sock`,
-/// next to [`fleet_socket`]; each connection there is one `TUNNEL` stream to
-/// the machine, one forward's bridge (`commands::tunnel::remote_opener`
-/// dials it).
-pub fn fleet_tunnel_socket(dir: &Path, machine: &str) -> PathBuf {
-    fleet_channel_socket(dir, machine, "tunnel")
 }
 
 /// The agent socket of a `fleet-link --peer <dialer>` in `dir`
@@ -118,14 +95,6 @@ pub fn fleet_tunnel_socket(dir: &Path, machine: &str) -> PathBuf {
 /// [`agent_sockets`], so this host's bridges pick it up as a relayed agent.
 pub fn link_agent_socket(dir: &Path, dialer: &str) -> PathBuf {
     dir.join(format!("agent-link-{}.sock", agent_socket_name(dialer)))
-}
-
-/// A machine's socket in `dir` for one more channel this end of its link
-/// opens toward it: `fleet-<machine>.<suffix>.sock`, next to
-/// [`fleet_socket`]; each connection there is one stream on that channel
-/// (`fleet::link::opener_with`).
-pub fn fleet_channel_socket(dir: &Path, machine: &str, suffix: &str) -> PathBuf {
-    dir.join(format!("fleet-{}.{suffix}.sock", agent_socket_name(machine)))
 }
 
 fn agent_socket_name(client: &str) -> String {
@@ -365,9 +334,6 @@ mod tests {
     fn fleet_sockets_are_named_after_the_machine() {
         let dir = Path::new("/run/user/1000/devsandbox");
         assert_eq!(fleet_socket(dir, "lap.top"), dir.join("fleet-lap.top.sock"));
-        assert_eq!(fleet_transfer_socket(dir, "lap.top"), dir.join("fleet-lap.top.transfer.sock"));
-        assert_eq!(fleet_pty_socket(dir, "lap.top"), dir.join("fleet-lap.top.pty.sock"));
-        assert_eq!(fleet_tunnel_socket(dir, "lap.top"), dir.join("fleet-lap.top.tunnel.sock"));
         let long = fleet_socket(dir, &"w".repeat(80));
         assert_eq!(long.file_name().unwrap().len(), "fleet-".len() + AGENT_CLIENT_MAX + ".sock".len());
     }

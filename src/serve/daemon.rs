@@ -603,7 +603,7 @@ struct Shared {
     member: Option<PathBuf>,
     /// What names this host when `member.toml` doesn't.
     hostname: String,
-    /// The socket dir: a machine's `fleet-<name>.transfer.sock` is here.
+    /// The socket dir: a machine's `fleet-<name>.sock` is here.
     socket_dir: PathBuf,
     /// [`Options::local_capacity`].
     local_capacity: Option<LocalCapacity>,
@@ -1529,7 +1529,8 @@ const INBOUND_ROOTS_TIMEOUT: Duration = Duration::from_secs(20);
 /// stream of its link, through `socket` (`fleet-<peer>.sock`, which its
 /// `fleet-link` binds before announcing).
 fn inbound_roots(peer: &str, socket: &Path) -> Result<Vec<PathBuf>> {
-    let stream = Stream::connect(socket).with_context(|| format!("cannot connect to {}", socket.display()))?;
+    let stream = super::fleet::link::connect(socket, crate::devsbd::proto::channel::API)
+        .with_context(|| format!("cannot connect to {}", socket.display()))?;
     let mut link = machines::link::handshake(peer, machines::ssh::Duplex::socket(stream), INBOUND_ROOTS_TIMEOUT, machines::link::Over::Link)?;
     let r = link.conn.call("roots.list", json!({}))?;
     if let Some(e) = r.error {
