@@ -340,11 +340,6 @@ limitation means editing this file in the same commit.
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
   add <root>…` on the machine, or `machine unlink` + `machine add` it again.
   → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmtrustroots); `commands::machine::record_roots`
-- With neither end in a fleet, `machine add` always makes the host
-  running it the hub: a laptop can't make the server it adds the hub
-  without that server running `machine add <laptop>` (ssh into the
-  laptop); `machine add --hub` (fleet plan decision 36) isn't built.
-  → [fleet](architecture/daemon/fleet.md); `machines::join::plan`
 - No command sets this host's member name (what the machines it dials
   know it by, `fleet-link --peer <name>`): it's `member.toml`'s `name`,
   set only through `member.set {name}` (API) or by hand, else the

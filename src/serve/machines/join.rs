@@ -8,9 +8,13 @@
 //! |---|---|---|
 //! | in a fleet (hub K) | in none | it joins K's fleet |
 //! | in none | in a fleet (hub K) | this host joins K's fleet |
-//! | in none | in none | a fleet of two, this host the hub |
+//! | in none | in none | a fleet of two, this host the hub (`--hub`: the machine) |
 //! | hub K | hub K | an extra link in the same fleet |
 //! | hub K | hub L | refused, naming both |
+//!
+//! `--hub` (fleet plan decision 36) only chooses the hub of a new fleet:
+//! with either end in a fleet it is refused unless the machine already is
+//! the hub, since moving the role is `machine hub`'s.
 //!
 //! Names (fleet plan decisions 2 and 35): the machine is registered under
 //! its member name; `--name` renames it only while it joins by this add.
@@ -78,7 +82,7 @@ pub enum Joined {
     Target,
     /// This host joined the machine's fleet.
     This,
-    /// A new fleet of two, this host the hub.
+    /// A new fleet of two: `Fleet::hub` says which end is the hub.
     New,
     /// Both were in it already: an extra link.
     Same,
@@ -93,8 +97,9 @@ fn resolve(hub: &Hub, own: Option<&str>) -> Option<String> {
     }
 }
 
-/// The join rule over both sides and `--name` (`asked`).
-pub fn plan(this: &This, target: &Target, asked: Option<&str>) -> Result<Plan, ApiError> {
+/// The join rule over both sides, `--name` (`asked`) and `--hub`
+/// (`target_hub`: the machine is to be the hub).
+pub fn plan(this: &This, target: &Target, asked: Option<&str>, target_hub: bool) -> Result<Plan, ApiError> {
     let label = target.label;
     if let Some(asked) = asked {
         check_member_name(asked).map_err(|e| ApiError::invalid(format!("--name: {e:#}")))?;
@@ -104,6 +109,18 @@ pub fn plan(this: &This, target: &Target, asked: Option<&str>) -> Result<Plan, A
     }
     let this_fleet = resolve(this.hub, Some(this.name));
     let target_fleet = resolve(target.hub, target.name);
+    if target_hub && !matches!(target.hub, Hub::This) {
+        if let Some(k) = this_fleet.as_ref().or(target_fleet.as_ref()) {
+            let at = if this_fleet.is_some() {
+                format!("this host is in `{k}`'s fleet and {label} isn't its hub")
+            } else {
+                format!("{label} is in `{k}`'s fleet and isn't its hub")
+            };
+            return Err(ApiError::denied(format!(
+                "--hub: {at}; moving the hub role (`machine hub`) isn't available yet"
+            )));
+        }
+    }
     match (this_fleet, target_fleet) {
         (Some(k), Some(l)) if k != l => Err(ApiError::denied(format!(
             "this host is in `{k}`'s fleet, {label} in `{l}`'s: a machine is in one fleet only"
@@ -130,6 +147,18 @@ pub fn plan(this: &This, target: &Target, asked: Option<&str>) -> Result<Plan, A
                 )));
             }
             Ok(Plan { name, target_set: None, this_hub: Some(k.clone()), fleet: Fleet { hub: k, joined: Joined::This } })
+        }
+        (None, None) if target_hub => {
+            let name = joining_name(target, asked)?;
+            not_this(this, label, &name, true)?;
+            new_to(&name, this.name, this.known, label, true)?;
+            let target_set = TargetSet { name: name.clone(), hub: HUB_SELF.to_string() };
+            Ok(Plan {
+                target_set: Some(target_set),
+                this_hub: Some(name.clone()),
+                fleet: Fleet { hub: name.clone(), joined: Joined::New },
+                name,
+            })
         }
         (None, None) => {
             let name = joining_name(target, asked)?;
@@ -206,10 +235,15 @@ mod tests {
     /// `plan` with this host `lap` (knowing `this_known`) and the machine
     /// `box` (or `target_name`) at `me@box`, knowing `target_known`.
     fn run(this_hub: Hub, target_name: Option<&str>, target_hub: Hub, asked: Option<&str>) -> Result<Plan, ApiError> {
+        run_hub(this_hub, target_name, target_hub, asked, false)
+    }
+
+    /// `run` with `--hub` as `make_hub`.
+    fn run_hub(this_hub: Hub, target_name: Option<&str>, target_hub: Hub, asked: Option<&str>, make_hub: bool) -> Result<Plan, ApiError> {
         let (this_known, target_known) = (names(&["old"]), names(&["peer"]));
         let this = This { name: "lap", hub: &this_hub, known: &this_known };
         let target = Target { label: "me@box", name: target_name, hub: &target_hub, known: &target_known };
-        plan(&this, &target, asked)
+        plan(&this, &target, asked, make_hub)
     }
 
     fn message(r: Result<Plan, ApiError>) -> String {
@@ -268,6 +302,46 @@ mod tests {
     }
 
     #[test]
+    fn hub_makes_the_machine_the_hub_of_a_new_fleet() {
+        let p = run_hub(Hub::None, Some("box"), Hub::None, None, true).unwrap();
+        assert_eq!(
+            p,
+            Plan {
+                name: "box".into(),
+                target_set: Some(TargetSet { name: "box".into(), hub: "self".into() }),
+                this_hub: Some("box".into()),
+                fleet: Fleet { hub: "box".into(), joined: Joined::New },
+            }
+        );
+        // Named as a joining machine is: `--name`, else its own.
+        let p = run_hub(Hub::None, None, Hub::None, Some("srv"), true).unwrap();
+        assert_eq!((p.target_set.unwrap().name, p.this_hub.as_deref(), p.fleet.hub), ("srv".into(), Some("srv"), "srv".into()));
+        assert!(message(run_hub(Hub::None, None, Hub::None, None, true)).ends_with("pass --name"));
+        assert!(message(run_hub(Hub::None, Some("lap"), Hub::None, None, true)).contains("`lap` is this host's too"));
+        assert!(message(run_hub(Hub::None, Some("old"), Hub::None, None, true)).contains("`old` (me@box) is already a member"));
+    }
+
+    #[test]
+    fn hub_in_a_fleet_needs_the_machine_to_be_its_hub() {
+        // Refused whichever end is in a fleet, the machine not its hub.
+        for (this, target, m) in [
+            (Hub::This, Hub::None, "--hub: this host is in `lap`'s fleet and me@box isn't its hub"),
+            (other("k"), Hub::None, "--hub: this host is in `k`'s fleet and me@box isn't its hub"),
+            (other("k"), other("k"), "--hub: this host is in `k`'s fleet and me@box isn't its hub"),
+            (Hub::None, other("k"), "--hub: me@box is in `k`'s fleet and isn't its hub"),
+        ] {
+            let e = run_hub(this, Some("box"), target, None, true).unwrap_err();
+            assert_eq!(e.code, "denied");
+            assert_eq!(e.message, format!("{m}; moving the hub role (`machine hub`) isn't available yet"));
+        }
+        // The machine is the hub: the table as without `--hub`.
+        for this in [Hub::None, other("box")] {
+            assert_eq!(run_hub(this.clone(), Some("box"), Hub::This, None, true).unwrap(), run(this, Some("box"), Hub::This, None).unwrap());
+        }
+        assert_eq!(run_hub(other("k"), Some("box"), Hub::This, None, true).unwrap_err().message, message(run(other("k"), Some("box"), Hub::This, None)));
+    }
+
+    #[test]
     fn the_same_hub_is_an_extra_link() {
         for (this, target) in [(other("k"), other("k")), (Hub::This, other("lap")), (other("box"), Hub::This)] {
             let p = run(this, Some("box"), target, None).unwrap();
@@ -311,10 +385,10 @@ mod tests {
         let target_known = names(&["peer", "lap"]);
         let this = This { name: "lap", hub: &Hub::None, known: &this_known };
         let target = Target { label: "me@box", name: Some("box"), hub: &Hub::This, known: &target_known };
-        assert!(plan(&this, &target, None).unwrap_err().message.starts_with("this host's member name `lap` is already in `box`'s fleet"));
+        assert!(plan(&this, &target, None, false).unwrap_err().message.starts_with("this host's member name `lap` is already in `box`'s fleet"));
         let this = This { name: "k", hub: &Hub::None, known: &this_known };
         let target = Target { label: "me@box", name: Some("box"), hub: &other("k"), known: &target_known };
-        assert!(plan(&this, &target, None).is_err(), "this host named as the hub");
+        assert!(plan(&this, &target, None, false).is_err(), "this host named as the hub");
     }
 
     #[test]

@@ -38,13 +38,21 @@ name when it's `self`):
 |---|---|---|
 | hub K | in no fleet | X joins K's fleet: X's `hub` = K |
 | in no fleet | hub K | H joins K's fleet: H's `hub` = K |
-| in no fleet | in no fleet | a fleet of two: X's `hub` = H's name, H's `hub` = `self` |
+| in no fleet | in no fleet | a fleet of two: X's `hub` = H's name, H's `hub` = `self`; with `--hub`, X's `hub` = `self`, H's `hub` = X's name |
 | hub K | hub K | an extra link in the same fleet: nothing written |
 | hub K | hub L | refused (`denied`), naming both |
 
+`machine add --hub` (`machines.add`'s mandatory `hub`) only picks the
+hub of a new fleet: with either end in a fleet it is refused (`denied`)
+unless X already is the hub (its `hub` is `self`), when the table goes
+on as without it; moving the role to another member isn't a join's. So
+a laptop holding the configs makes an always-on server the hub without
+the server ever dialing the laptop.
+
 The link is H → X in every row; joining writes only the joiner's
 `hub`. X is registered under its member name; `--name` renames X (its
-`member.set {name}`, with the `hub`) only while X joins, and must be
+`member.set {name}`, with the `hub`) only while X joins (or becomes the
+hub under `--hub`), and must be
 X's name when X is in a fleet already. A joiner whose name the fleet has
 is refused: X's against H's name, H's machines and H's hub; H's against
 X's name and X's `machines.list`. X's name is never H's.

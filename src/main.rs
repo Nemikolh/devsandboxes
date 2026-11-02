@@ -449,6 +449,9 @@ enum MachineCommand {
         /// Relay this host's ssh-agent to the machine (off by default; see `machine set`)
         #[arg(long)]
         agent: bool,
+        /// Make the machine the hub of the new fleet (neither end in a fleet yet; in one, only if it already is the hub)
+        #[arg(long)]
+        hub: bool,
         /// Install or update devsandbox on the machine without asking (copies this binary)
         #[arg(long)]
         auto_install: bool,
@@ -830,8 +833,8 @@ fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
-            MachineCommand::Add { target, name, configs, agent, auto_install } => {
-                commands::machine::add(&target, name.as_deref(), &configs, agent, auto_install)
+            MachineCommand::Add { target, name, configs, agent, hub, auto_install } => {
+                commands::machine::add(&target, name.as_deref(), &configs, agent, hub, auto_install)
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),

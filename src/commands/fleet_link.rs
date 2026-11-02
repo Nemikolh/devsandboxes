@@ -569,7 +569,7 @@ mod tests {
 
         // A registry entry can't take a live neighbor's name.
         let mut k = conn_at(&k_dir);
-        let e = k.call("machines.add", json!({"target": "me@l", "name": "L", "roots": ["/x"]})).unwrap().error.unwrap();
+        let e = k.call("machines.add", json!({"hub": false, "target": "me@l", "name": "L", "roots": ["/x"]})).unwrap().error.unwrap();
         assert!(e.code == "denied" && e.message.contains("inbound neighbor"), "{e:?}");
 
         // L → K: an `API` stream, K's trust table for L (`worker`): its

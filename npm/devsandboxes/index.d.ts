@@ -833,7 +833,8 @@ export interface MachineAdded {
 
 /**
  * Who joined at `machines.add`: `target` the machine joined this host's fleet, `this` this host
- * joined the machine's, `new` a fleet of two with this host the hub, `same` both were in it already.
+ * joined the machine's, `new` a fleet of two (`hub` says which end, the machine under `hub: true`), `same`
+ * both were in it already.
  */
 export type FleetJoined = 'target' | 'this' | 'new' | 'same';
 
@@ -1408,9 +1409,10 @@ export interface ApiMethods {
   'machines.probe': { params: { target: string; command?: string }; result: MachineProbe };
   /**
    * Check `roots` on the machine (a quoted `~` is its home) and register it; `invalid` for a taken name, a bad
-   * root or an empty `command`. `command` as `machines.probe`'s, saved as the machine's.
+   * root or an empty `command`. `command` as `machines.probe`'s, saved as the machine's. `hub`: the machine is
+   * the hub of the new fleet; `denied` when either end is in a fleet whose hub it isn't.
    */
-  'machines.add': { params: { target: string; name?: string; roots: string[]; agent?: boolean; command?: string }; result: MachineAdded };
+  'machines.add': { params: { target: string; name?: string; roots: string[]; hub: boolean; agent?: boolean; command?: string }; result: MachineAdded };
   'machines.list': { params: {}; result: MachineRow[] };
   /** Change a registered machine's settings; `not-found` for an unknown name. */
   'machines.set': { params: { name: string; agent: boolean }; result: OkResult };

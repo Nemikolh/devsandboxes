@@ -159,6 +159,8 @@ struct AddParams {
     #[serde(default)]
     name: Option<String>,
     roots: Vec<String>,
+    /// `--hub`: the machine is to be the hub (`join::plan`).
+    hub: bool,
     #[serde(default)]
     agent: bool,
     #[serde(default)]
@@ -191,6 +193,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         &join::This { name: &this_name, hub: &this_hub, known: &this_known },
         &join::Target { label: &p.target, name: target.name.as_deref(), hub: &target_hub, known: &target_known },
         p.name.as_deref(),
+        p.hub,
     )?;
     check_free(ctx, &plan.name, plan.target_set.is_some())?;
 
@@ -653,7 +656,7 @@ mod tests {
         let mut local = client_at(&base.join("local"));
         let (code, message) = err(&mut local, "machines.probe", json!({"target": "me@box"}));
         assert_eq!((code.as_str(), message.as_str()), ("failed", "me@box: ssh: Could not resolve hostname me@box"));
-        let (code, _) = err(&mut local, "machines.add", json!({"target": "me@box", "roots": ["/x"]}));
+        let (code, _) = err(&mut local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["/x"]}));
         assert_eq!(code, "failed");
         assert!(!base.join("machines.toml").exists(), "nothing saved");
         drop(local);
@@ -667,13 +670,13 @@ mod tests {
         let registry = pair.base.join("machines.toml");
         // A typed bad root is refused, naming it; nothing is saved.
         let (code, message) =
-            err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes", "~/gone", "rel"]}));
+            err(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes", "~/gone", "rel"]}));
         assert_eq!(code, "invalid");
         assert!(message.starts_with("box: `~/gone`: no directory ") && message.ends_with("; `rel`: not absolute"), "{message}");
-        let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/broken"]}));
+        let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/broken"]}));
         assert!(code == "invalid" && message.contains("devsandboxes.toml"), "{code}: {message}");
         let (code, message) =
-            err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~"], "command": " "}));
+            err(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~"], "command": " "}));
         assert!(code == "invalid" && message.contains("`command`"), "{code}: {message}");
         assert!(!registry.exists(), "nothing saved");
 
@@ -685,7 +688,7 @@ mod tests {
         let dot = std::fs::canonicalize(pair.home.join(".devsandboxes")).unwrap();
         let home = std::fs::canonicalize(&pair.home).unwrap();
         let via = format!("{}/broken/../.devsandboxes", pair.home.display());
-        let r = ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes", "~", via]}));
+        let r = ok(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes", "~", via]}));
         let fleet = json!({"hub": "lap", "joined": "new"});
         assert_eq!(r, json!({"name": "box", "roots": [dot, home], "version": "0.6.0", "warning": null, "fleet": fleet}));
         assert_eq!(pair.registry(), vec![Entry { roots: vec![dot.clone(), home.clone()], ..Entry::ssh("box", "me@box") }]);
@@ -693,14 +696,14 @@ mod tests {
 
         // Taken: the machine is `box` in this fleet, whatever the target
         // or `--name` says.
-        let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "roots": ["~"]}));
+        let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "ssh://box:2200", "roots": ["~"]}));
         assert_eq!((code.as_str(), message.as_str()), ("invalid", "a machine named `box` exists"));
-        let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "name": "box2", "roots": ["~"]}));
+        let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "ssh://box:2200", "name": "box2", "roots": ["~"]}));
         assert_eq!(code, "invalid");
         assert_eq!(message, "ssh://box:2200 is in `lap`'s fleet as `box`: pass --name box, or no --name");
-        let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "x", "name": "box", "roots": ["~"]}));
+        let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "x", "name": "box", "roots": ["~"]}));
         assert_eq!((code.as_str(), message.as_str()), ("invalid", "a machine named `box` exists; pass --name"), "fast, before the ssh");
-        let (code, _) = err(&mut pair.local, "machines.add", json!({"target": "x", "name": "a/b", "roots": ["~"]}));
+        let (code, _) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "x", "name": "a/b", "roots": ["~"]}));
         assert_eq!(code, "invalid");
 
         // Unregistered (the fleet stays), added again: an extra link in the
@@ -710,7 +713,7 @@ mod tests {
         let r = ok(
             &mut pair.local,
             "machines.add",
-            json!({"target": "ssh://box:2200", "name": "box", "roots": ["~/.devsandboxes"], "agent": true, "command": cmd}),
+            json!({"hub": false, "target": "ssh://box:2200", "name": "box", "roots": ["~/.devsandboxes"], "agent": true, "command": cmd}),
         );
         assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "lap", "joined": "same"})));
         assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
@@ -746,16 +749,48 @@ mod tests {
     #[test]
     fn add_takes_no_roots() {
         let mut pair = Pair::new("mach-add-noroots", "0.6.0");
-        let r = ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": []}));
+        let r = ok(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": []}));
         assert_eq!((&r["name"], &r["roots"]), (&json!("box"), &json!([])));
         assert_eq!(pair.registry(), vec![Entry::ssh("box", "me@box")]);
         pair.finish();
     }
 
     #[test]
+    fn add_hub_makes_the_machine_the_hub() {
+        let mut pair = Pair::new("mach-add-hub", "0.6.0");
+        // `hub` is mandatory.
+        let (code, _) = err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": []}));
+        assert_eq!(code, "invalid");
+        assert!(!pair.base.join("machines.toml").exists(), "nothing saved");
+        let r = ok(&mut pair.local, "machines.add", json!({"hub": true, "target": "me@box", "roots": []}));
+        assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "box", "joined": "new"})));
+        assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
+        assert_eq!(ok(&mut pair.local, "member.get", Value::Null)["hub"], "box");
+        pair.finish();
+    }
+
+    #[test]
+    fn add_hub_in_a_fleet_is_refused_unless_the_machine_is_its_hub() {
+        let (this, machine) = (named("lap", "self"), named("box", ""));
+        let mut pair = Pair::members("mach-add-hub-fleet", "0.6.0", this.clone(), machine.clone(), |_| {});
+        let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": true, "target": "me@box", "roots": []}));
+        assert_eq!(code, "denied");
+        assert!(message.starts_with("--hub: this host is in `lap`'s fleet and me@box isn't its hub"), "{message}");
+        assert_eq!((pair.this(), pair.machine()), (this, machine), "nothing written");
+        assert!(!pair.base.join("machines.toml").exists(), "no entry");
+        pair.finish();
+        // The machine is the hub already: this host joins, as without it.
+        let mut pair = Pair::members("mach-add-hub-is", "0.6.0", named("lap", ""), named("box", "self"), |_| {});
+        let r = ok(&mut pair.local, "machines.add", json!({"hub": true, "target": "me@box", "roots": []}));
+        assert_eq!(r["fleet"], json!({"hub": "box", "joined": "this"}));
+        assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
+        pair.finish();
+    }
+
+    #[test]
     fn the_machine_joins_this_hosts_fleet_under_its_name() {
         let mut pair = Pair::members("mach-join-target", "0.6.0", named("lap", "k"), named("box", ""), |_| {});
-        let r = ok(&mut pair.local, "machines.add", json!({"target": "me@box", "name": "b2", "roots": ["~/.devsandboxes"]}));
+        let r = ok(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "name": "b2", "roots": ["~/.devsandboxes"]}));
         assert_eq!((&r["name"], &r["fleet"]), (&json!("b2"), &json!({"hub": "k", "joined": "target"})));
         assert_eq!(pair.machine(), named("b2", "k"), "renamed as it joined");
         assert_eq!(pair.this(), named("lap", "k"), "this host unchanged");
@@ -766,7 +801,7 @@ mod tests {
     #[test]
     fn this_host_joins_the_machines_fleet() {
         let mut pair = Pair::members("mach-join-this", "0.6.0", named("lap", ""), named("box", "self"), |_| {});
-        let r = ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes"]}));
+        let r = ok(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes"]}));
         assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "box", "joined": "this"})));
         assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
         // Through the daemon's own `member.set` path: `member.get` says it.
@@ -778,7 +813,7 @@ mod tests {
     fn two_hubs_are_refused_and_nothing_written() {
         let (this, machine) = (named("lap", "self"), named("box", "k"));
         let mut pair = Pair::members("mach-two-hubs", "0.6.0", this.clone(), machine.clone(), |_| {});
-        let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes"]}));
+        let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes"]}));
         assert_eq!(code, "denied");
         assert_eq!(message, "this host is in `lap`'s fleet, me@box in `k`'s: a machine is in one fleet only");
         assert_eq!((pair.this(), pair.machine()), (this, machine));
@@ -794,7 +829,7 @@ mod tests {
             ("mach-name-hub", named("lap", "k"), named("k", ""), "`k` (me@box) is already a member of `k`'s fleet: pass --name"),
         ] {
             let mut pair = Pair::members(tag, "0.6.0", this.clone(), machine.clone(), |_| {});
-            let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes"]}));
+            let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes"]}));
             assert_eq!((code.as_str(), message.as_str()), ("invalid", says));
             assert_eq!((pair.this(), pair.machine()), (this, machine), "nothing written");
             assert!(!pair.base.join("machines.toml").exists());
@@ -804,7 +839,7 @@ mod tests {
         let mut pair = Pair::members("mach-name-known", "0.6.0", named("lap", ""), named("box", "self"), |_| {});
         let theirs = Entry { roots: vec!["/r".into()], ..Entry::ssh("lap", "me@other") };
         crate::serve::machines::update(&pair.base.join("remote-machines.toml"), |e| e.push(theirs)).unwrap();
-        let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes"]}));
+        let (code, message) = err(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes"]}));
         assert_eq!(code, "invalid");
         assert!(message.starts_with("this host's member name `lap` is already in `box`'s fleet"), "{message}");
         assert_eq!(pair.this(), named("lap", ""), "nothing written");
@@ -825,7 +860,7 @@ mod tests {
         let cmd = "~/.local/bin/devsandbox";
         ok(&mut pair.local, "machines.probe", json!({"target": "me@box", "command": cmd}));
         ok(&mut pair.local, "machines.probe", json!({"target": "me@box"}));
-        ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes"], "command": cmd}));
+        ok(&mut pair.local, "machines.add", json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes"], "command": cmd}));
         assert_eq!(*dialed.lock().unwrap(), [Some(cmd.to_string()), None, Some(cmd.to_string())]);
         pair.finish();
     }
@@ -862,7 +897,7 @@ mod tests {
     #[test]
     fn another_semver_is_a_warning() {
         let mut pair = Pair::new("mach-skew", "0.5.0");
-        let r = ok(&mut pair.local, "machines.add", json!({"target": "box", "roots": ["~/.devsandboxes"]}));
+        let r = ok(&mut pair.local, "machines.add", json!({"hub": false, "target": "box", "roots": ["~/.devsandboxes"]}));
         assert_eq!(r["warning"], "box runs devsandbox 0.5.0, this is 0.6.0");
         pair.finish();
     }

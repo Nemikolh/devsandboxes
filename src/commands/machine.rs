@@ -42,7 +42,7 @@ use crate::serve::machines::ssh;
 
 const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
-pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, auto_install: bool) -> Result<()> {
+pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hub: bool, auto_install: bool) -> Result<()> {
     let command = ensure_devsandbox(target, auto_install)?;
     let mut conn = connect()?;
     let roots = if configs.is_empty() {
@@ -62,7 +62,7 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, au
     {
         eprintln!("warning: {}", roots_warning(target, &roots, &e));
     }
-    let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "agent": agent, "command": command }))?;
+    let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "hub": hub, "agent": agent, "command": command }))?;
     let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
     println!("added {} ({target}): {}", added.name, added_roots(&roots));
     println!("{}", fleet_line(&added.name, &added.fleet));
@@ -83,6 +83,8 @@ fn fleet_line(name: &str, fleet: &Fleet) -> String {
     match fleet.joined {
         Joined::Target => format!("{name} joined {hub}'s fleet"),
         Joined::This => format!("this host joined {hub}'s fleet"),
+        // `--hub` made the machine the hub: the hub is its name.
+        Joined::New if *hub == name => format!("a fleet of two: {name} is the hub"),
         Joined::New => format!("a fleet of two: this host ({hub}) is the hub"),
         Joined::Same => format!("an extra link in {hub}'s fleet"),
     }
@@ -682,6 +684,7 @@ mod tests {
         assert_eq!(line(Joined::Target), "box joined k's fleet");
         assert_eq!(line(Joined::This), "this host joined k's fleet");
         assert_eq!(line(Joined::New), "a fleet of two: this host (k) is the hub");
+        assert_eq!(fleet_line("box", &Fleet { hub: "box".into(), joined: Joined::New }), "a fleet of two: box is the hub");
         assert_eq!(line(Joined::Same), "an extra link in k's fleet");
     }
 

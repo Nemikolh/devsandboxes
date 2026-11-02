@@ -617,7 +617,11 @@ the machine's `member.get` and `machines.list`, reads this host's
 `member.toml` (`Ctx::member`, the name `Member::name_or` the hostname),
 and `join::plan` decides from both ends' hubs who joins, the registry
 name, and what each end writes, refusing two hubs (`denied`) and a
-joining name the fleet already has. Every check (names, roots, the
+joining name the fleet already has. `add --hub` (`machines.add`'s `hub`,
+always sent) makes the machine the hub of the new fleet when neither end
+is in one (its `member.set {name, hub: "self"}`, this host's `hub` its
+name), and is refused (`denied`) when either end is in a fleet whose hub
+the machine isn't. Every check (names, roots, the
 registry and the inbound neighbors) comes before any write; then the
 machine's `member.set {name, hub}` over the still-open probe, this
 host's registry entry, this host's `hub` with its `name` (`member::set`, then
