@@ -9,7 +9,7 @@
 //! machine's kind: an ssh machine's carrier is its peer link, held by a
 //! `serve-machine-<name>-link` thread running the [`Hold`]
 //! (`fleet::dialer`: `fleet-link --peer <this host>` there through the
-//! transport, this end binding `fleet-<name>.*.sock` here), redialed after
+//! transport, this end binding `fleet-<name>.sock` here), redialed after
 //! the backoff below whenever it ends; an inbound neighbor's is the
 //! `fleet-link --peer <it>` that announced it. Once the carrier
 //! is up the link thread dials `fleet-<name>.sock` (the [`Dial`]) and says

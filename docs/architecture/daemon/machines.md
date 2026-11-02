@@ -83,7 +83,7 @@ decision 28), of kind `inbound` (`Kind::Inbound`, `MachineKind::Inbound`,
 snapshots and the dashboard, quick calls and verbs with `machine: <name>`
 and qualified names `<name>/x` reach it ([Forwarded
 requests](#forwarded-requests)), the CLI's re-runs, terminal tabs and
-forwards go over its `fleet-<name>.*.sock` (which its `fleet-link --peer`
+forwards go over its `fleet-<name>.sock` (which its `fleet-link --peer`
 binds here), and placement may pick it
 ([fleet](fleet.md#placement)). Every stream this host opens on it is
 served by its daemon under its trust table for this host (its registry
@@ -371,7 +371,7 @@ dashboard's header note.
 
 `route` (I/O) runs `plan` (pure) in `main` before a verb goes to
 `verbs_client` or any command runs locally. A command on a machine goes
-over the machine's link (`fleet-<name>.*.sock`, the same for every kind of
+over the machine's link (`fleet-<name>.sock`, the same for every kind of
 machine) and so through the machine's trust table (fleet plan decision 15:
 API calls and `PTY` and `TUNNEL` streams within its trust, never a
 `devsandbox …` run there).

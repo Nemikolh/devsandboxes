@@ -2,7 +2,7 @@
 //! `cli.rs`*): where a command's `<name>` points, and how the commands that
 //! don't go through the daemon as verbs (`logs`, `exec`, `inspect`, `done`,
 //! `rename`, …) run when it points at a machine, as do the nameless ones
-//! given `--machine`: over the machine's link (`fleet-<name>.*.sock`), so
+//! given `--machine`: over the machine's link (`fleet-<name>.sock`), so
 //! within its trust (fleet plan decision 15), never a `devsandbox …` run
 //! there.
 //!

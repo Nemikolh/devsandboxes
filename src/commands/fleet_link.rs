@@ -505,7 +505,7 @@ mod tests {
     /// `machines.list` shows with the roots L's daemon answers over the link
     /// (its own root and its fleet root for K); L's `API` streams reach K's
     /// daemon under K's trust table for L; K's local clients reach L's
-    /// table through `fleet-L.*.sock`; the neighbor goes with the link.
+    /// table through `fleet-L.sock`; the neighbor goes with the link.
     #[test]
     fn a_peer_link_announces_its_dialer_and_hands_its_streams_to_the_daemon() {
         let base = scratch("peer-e2e");

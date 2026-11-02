@@ -360,8 +360,8 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
    never a second path in the code. Every registry entry is held by its
    dialer, always (decision 7), as `fleet-link --peer <dialer>` on the
    far end (decision 22). Both ends run both halves (decision 23): OUT
-   binds `fleet-<other>.{sock,pty,tunnel,transfer}.sock` for local
-   clients and opens a channel per accept; IN hands each of the other
+   binds one `fleet-<other>.sock` for local clients and opens the
+   channel each accept names in its first byte; IN hands each of the other
    end's streams to this daemon under this host's trust table. On the
    dialed end that's `link.attach {channel, peer}` as the stream's first
    line on the daemon socket; on the dialer, the daemon in-process. The
@@ -404,7 +404,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
      (decision 24). One `serve_channel(channel, peer, stream)` behind
      both the socket and the in-process paths.
    - **7c `fleet-link --peer <dialer>`**. IN through `link.attach`, OUT
-     binding `fleet-<peer>.*.sock` + `agent-link-<peer>.sock`; the
+     binding `fleet-<peer>.sock` + `agent-link-<peer>.sock`; the
      inbound neighbor announced (`links.inbound`) for the link's life
      and shown by `machines.list`, a name clash with an outbound entry
      refused. `--worker/--root` stays until step 8.
@@ -431,7 +431,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
 
    ```
     laptop ──machine add hub──► hub      (the laptop dials; the hub lists
-      fleet-hub.*.sock ◄═link═► fleet-lap.*.sock     "inbound lap")
+      fleet-hub.sock ◄═link═► fleet-lap.sock         "inbound lap")
       every client on either end: API / PTY / TUNNEL / TRANSFER there;
       the hub places on lap through fleet-lap.sock; AGENT only lap → hub
    ```
@@ -603,13 +603,15 @@ and 20 as step 9 does, 21 as step 10 does.
     per-link sockets; the far end's `fleet-link --peer <dialer>` hands
     each stream to its daemon with `link.attach`; the peer's name is
     authenticated only by ssh login (decision 2). Who binds: decision 23.
-23. Both ends of a link run both halves: OUT binds
-    `fleet-<other>.*.sock` (and, on the dialed end,
-    `agent-link-<dialer>.sock`) and opens a channel per accept; IN hands
+23. Both ends of a link run both halves: OUT binds one
+    `fleet-<other>.sock` (and, on the dialed end,
+    `agent-link-<dialer>.sock`, since ssh-agent clients can't send a
+    channel byte) and opens the channel each accept names in its first
+    byte; IN hands
     the other end's streams to this daemon under this host's trust
     table. The handshake roles (the dialed end writes the sentinel, the
     dialer reads it) say nothing about who binds, so every client reaches
-    every machine the same way (`fleet-<name>.*.sock`).
+    every machine the same way (`fleet-<name>.sock`).
 24. A peer's fleet root is `fleet/<peer member name>/` under the data
     dir, replacing `lend::fleet_dir_name(<hub target>)`; no migration.
 25. Versions follow the hello's hub flag (`[serve] hub` until step 9):

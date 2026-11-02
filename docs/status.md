@@ -257,8 +257,9 @@ limitation means editing this file in the same commit.
   same OS and arch (`install::platform_matches`); updating a devsandbox
   that's a symlink replaces the link with a file (`install::INSTALL`'s
   `mv -f`). → [machines](architecture/daemon/machines.md#install)
-- Remote rows live in memory: a fresh daemon shows a machine without rows
-  until its link connects. → [machines](architecture/daemon/machines.md); `snapshots::Remotes`
+- Remote rows live in memory except on a hub (which reloads them from
+  `remotes.json`): a fresh non-hub daemon shows a machine without rows
+  until its link connects. → [machines](architecture/daemon/machines.md), [fleet](architecture/daemon/fleet.md#hub-mode); `snapshots::Remotes`, `machines::saved`
 - `vscode` and `inbox` are refused for a machine's instances on the CLI;
   the dashboard's `o` on a remote row answers "not supported yet" (its
   `p` and the CLI's `port` work); nameless commands are local only; no
