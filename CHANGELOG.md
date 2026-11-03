@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-One user model on every runtime: inside a sandbox you are a user with your host uid/gid, so workspace files come out owned by you on rootful docker, rootless docker, rootless podman and VM-backed runtimes alike. Browsers keep their own sandbox wherever it can work, and tools are told when it can't. Interactive `exec` sessions survive a dropped connection: `--attach` gets the program back, and a machine's terminal reconnects by itself after a network blip.
+One user model on every runtime: inside a sandbox you are a user with your host uid/gid, so workspace files come out owned by you on rootful docker, rootless docker, rootless podman and VM-backed runtimes alike. Browsers keep their own sandbox wherever it can work, and tools are told when it can't. Interactive `exec` sessions survive a dropped connection: `--attach` gets the program back, and a machine's terminal reconnects by itself after a network blip. Machines become one fleet: every machine is a member with its own key and trust setting, reached over its own link or through other members, and `run --place` asks the hub where a new sandbox has room.
 
 **Behaviour change: sandboxes run as the host user by default (`identity = "host"`).** The config's `remoteUser` (else `containerUser`, else the image's `USER`) is adopted with your host uid/gid, keeping its name, home and shell. A config that assumes root in the container (mounts or paths under `/root`, a root `remoteUser`/`containerUser`) can break under it, so `run`, `start` and `rebuild` now offer to update it first (the dashboard asks too), and `identity = "image"` keeps the old behaviour. Existing instances keep the user they were created with until rebuilt (`devsandbox rebuild --force <name>`).
 
@@ -40,7 +40,7 @@ userns = false
 
 - **Browsers where execs run as root.** On plans where execs run as root (rootless docker, root images), `chrome`, `chromium` and `google-chrome` go through a wrapper in `/run/devsandbox/bin` that starts the real browser at a non-root uid, so Chromium keeps its sandbox. `DEVSANDBOX_CHROME` (and `CHROME_PATH`, `CHROME_BIN`, `PUPPETEER_EXECUTABLE_PATH`) point at it; a Playwright script passes `executablePath: process.env.DEVSANDBOX_CHROME` and `chromiumSandbox: true`. Root plans also silence pip's and bundler's root warnings.
 
-- **Resumable `exec` sessions.** On an instance with the helper, a tty `exec` runs in a session that outlives the client: if the terminal or connection goes, the program keeps running, and `exec --attach` gets back to it (the instance's one detached session, a pick list when there are several, or `--attach=<id>`). `--sessions` lists them, `--session <id>` runs in a named one, attaching if it's live. The dashboard's instance terminals run in sessions too, so a shell closed with the dashboard can be reattached from the CLI. Detached sessions aren't cleaned up yet.
+- **Resumable `exec` sessions.** On an instance with the helper, a tty `exec` runs in a session that outlives the client: if the terminal or connection goes, the program keeps running, and `exec --attach` gets back to it (the instance's one detached session, a pick list when there are several, or `--attach=<id>`). `--sessions` lists them, `--session <id>` runs in a named one, attaching if it's live. The dashboard's instance terminals run in sessions too, so a shell closed with the dashboard can be reattached from the CLI, and its Detail panel shows `sessions: N (M detached)` with a `▣N` badge on the instance's row. Ended sessions are cleaned up after a few minutes; detached ones nobody reattaches to stay until removed.
 
 ```bash
 devsandbox exec web --sessions
@@ -50,14 +50,31 @@ devsandbox exec web --attach=1790000000-a1b2
 
 - **Machine terminals reconnect.** A tty `exec` on a machine's instance, and a dashboard terminal tab on one, reattach to their session when ssh drops (`connection lost, reconnecting… (Ctrl-C to stop)`, backing off up to 10 s between tries), instead of ending the program's terminal. To keep ssh's own failure apart, a program there that exits 255 reports 254.
 
-- **Fleet: machines lend capacity to an always-on hub.** A hub (`hub = true` under `[serve]` in `daemon.config.toml`) takes workers that dial it (`devsandbox fleet join <hub>` on the worker; `devsandbox lend on|off|drain` after), with no ssh into them. On the hub, `run` places a new instance on the hub or a worker by headroom against soft caps (`over cap: …` warns, never refuses) and says where (`placed on <worker> (…)`); placed on a worker, the config root and the folder's branch move there first (committed, pushed work only; anything else runs on the hub with a note). `run --here` stays on the hub. `exec` and terminals into a placed instance come later.
+- **Fleet: one pool of machines around a hub.** `machine add` now also joins fleets: the machine joins this host's fleet, this host joins the machine's, or (neither in one) the two make a new fleet with this host as its hub; two different fleets are refused. A laptop joins an always-on server's fleet with `machine add <server>` and dials it, so the server never needs ssh into the laptop. Every member sees the whole fleet: a machine it has no link to is reached through the members between them (see *Routing through the fleet*).
+
+- **Placed runs: `run --place`.** A typed `run` always runs on the machine whose config it names. `run --place` (also `:run … --place` in the dashboard) asks the hub where the new instance goes: the hub or a machine with the most headroom against its soft caps (`[caps]` in `member.toml`; `over cap: …` warns, never refuses), and says where (`placed on <machine> (…)`). Placed on another machine, the config root and the folder's branch move there first (committed, pushed work only; anything else runs here with a note), and the instance is that machine's, `<machine>/<instance>`. A sandbox whose config ties it to this host (binds outside what moves, `${localEnv:…}`, shared volumes, the runtime socket, `caches`, `privileged`, `initializeCommand`, global services, build paths outside the root) runs here with a note naming why, before the hub is asked; so does one with `placement = "home"`. An unreachable hub runs it here with a note.
 
 ```bash
-devsandbox run web --branch fix-login   # placed on lap (mem 71% free, …)
-devsandbox run web --here
+devsandbox run web --place --branch fix-login   # placed on lap (mem 71% free, …)
 ```
 
-- **`machine add` without config roots, and `--hub`.** A machine with no config roots (or none picked) can be added: it runs only other members' configs, as a hub or worker. `machine add <server> --hub`, run on a laptop with neither in a fleet yet, makes the server the hub of the new fleet, so the server never has to reach the laptop.
+```toml
+[sandbox.web]
+placement = "home"   # run --place never moves it
+```
+
+- **`machine add` without config roots, and `--hub`.** A machine with no config roots (or none picked) can be added: it runs only other members' configs. `machine add <server> --hub`, run on a laptop with neither in a fleet yet, makes the server the hub of the new fleet.
+
+- **`machine trust` and `machine roots`.** Each machine decides what the others reach on it. `worker` (the default) admits only this host's own config roots (those with instances, plus the ones `machine roots add` picks) and the code placed on it, and holds placed configs to a worker policy: binds only under the placed code, no extra capabilities or devices, no `initializeCommand`, and host networking, the runtime socket, `${localEnv:…}`, public ports and the like only where `[allow]` in `member.toml` permits them. `full` gives other machines the API a local client has.
+
+```bash
+devsandbox machine trust full
+devsandbox machine roots add ~/sandboxes
+```
+
+- **Members follow the hub's build.** A member runs its hub's exact version, downgrades included, so a fleet never mixes protocols. A hub on a dev build hands its binary to members that set `dev-builds = true` in `member.toml` (or trust `full`) on the same OS/arch.
+
+- **`machine rm` takes a machine out of the fleet; `machine unlink` only drops the link.** `machine rm <name>` removes a member from the fleet (`machine rm <this host>` leaves it); the old behaviour, forgetting the link while it stays a member, is `machine unlink <name>`.
 
 - **Member keys and a signed member list.** Every machine has its own key (`devsandbox machine key` prints its fingerprint). Who belongs to a fleet is a list only the machine that created the fleet can sign, and every member checks it. `machine add` shows the other machine's fingerprint and asks you to confirm it (compare it with `machine key` run there); `--yes` skips the question off a terminal.
 
@@ -66,15 +83,23 @@ devsandbox machine key
 devsandbox machine add me@my-server   # my-server's key fingerprint is SHA256:…
 ```
 
-- **Fleet links prove both machines' keys.** Every link between two machines checks each end's key against the member list before anything goes over it, so a machine can't pass itself off as another member or as the hub. A machine added by a member other than the fleet's creator is shown as `introduced by …` in `machine ls` and can't add others until the creator approves it. Fleets made before this release must be made again with `machine add`: their links are refused.
+- **Fleet links prove both machines' keys.** Every link between two machines checks each end's key against the member list before anything goes over it, so a machine can't pass itself off as another member or as the hub. A machine added by a member other than the fleet's creator is shown as `introduced by …` in `machine ls` and can't add others until the creator approves it.
 
 - **Approving membership changes: `machine pending|approve|deny`.** `machine rm`, `machine key rotate` and adds typed on another member are sent to the machine that created the fleet, which shows a desktop notification; `devsandbox machine pending` lists them there, `machine approve <id>` applies one and `machine deny <id>` drops it. On the creating machine they apply at once.
 
 - **`machine key rotate`.** Replaces this machine's key without leaving the fleet; its links reconnect with the new key once the change is approved.
 
+- **Routing through the fleet.** Members report their links to each other, signed, so every member knows the fleet's link graph. A machine with no link to this host is a `routed` machine (`machine ls` says `routed via <machine>`): commands, verbs, terminals, port forwards and `run --place` reach it through the members between them, trying the next path when one is down. Each routed stream proves which member it came from with that member's key, so a machine in the middle can't speak for another member, and the far end applies its own trust to the member the stream came from. Membership changes reach the fleet's creator over any path too, so they no longer need a direct link to it. The ssh agent isn't carried over routes, and until end-to-end encryption lands a machine in the middle can read and alter a routed stream once it's open.
+
+- **`machine trust worker` says when it doesn't protect this machine.** When the hub, or a machine the hub's side controls, has an ssh link into this machine, it has a shell here and could change its trust; `machine trust` warns naming that machine, and `machine ls` and the dashboard's Machines tab mark such machines `exposed via <machine>`.
+
 - **The member key never reaches a container.** `run`, `rebuild` and services refuse any bind mount, build context or build secret that would expose the machine's key (`$HOME`, the data dir, `/`, …), on every machine and whatever its trust; the error names the path and asks for a narrower one.
 
 - **API: `config.findings`, `config.migrate` and `config.ack`.** The `/root` findings of a config root, the in-place update (guarded by the file's hash: `conflict` when it changed since) and "continue as is", also on a machine (`machine`). Details: `docs/reference/api.md`, *Config*.
+
+### Changed
+
+- **Machines go over one link each, under the machine's trust.** Everything done on a machine (CLI commands, verbs, terminals, port forwards, the ssh agent) now rides one held link per pair of machines instead of an ssh connection per use; ssh is used only for that link and for `machine add`'s probe. What a link reaches is the machine's own `machine trust` setting (`worker` by default), so a machine that should be driven freely needs `machine trust full` there. Machines added before this release must be added again with `machine add`: their links are refused until both ends have keys and a signed member list.
 
 ### Fixed
 
@@ -83,9 +108,136 @@ devsandbox machine add me@my-server   # my-server's key fingerprint is SHA256:�
 - **Same-named sandboxes in two config roots no longer clobber each other's images, nor does sandbox `foo-feat` clobber sandbox `foo`'s features image.** Built images are tagged per config root, one prefix per kind (`devsandbox-img-<root>-<sandbox>`, `devsandbox-feat-<root>-<sandbox>`, `devsandbox-img-svc-<root>-<service>`), so the first `run` or `rebuild` after upgrading builds them again; images under the old tags are left for `docker image prune`.
 - **`${localEnv:NAME:default}` uses its default.** An unset `NAME` now expands to `default` (everything after the `:`) instead of empty; a set one, even to empty, to its value. `${containerEnv:NAME:default}` works the same.
 - **Running devsandbox as root on rootful docker or podman works.** Instead of failing to remap the adopted account to uid 0, execs run as root with `HOME` set to the account's home, as on rootless docker.
+- **The dashboard's build log follows a running build.** The modal re-reads an in-flight build's log as it's written instead of only on snapshots, and refreshes within about 100 ms.
+- **Dashboard prefills no longer fail as ambiguous.** `r`'s prefill and tab completion, and `p`'s port prefills, write a local name a machine also has as `@/<name>`, so the line submits.
+
+### Internal
+
+- **Gated tests run under rootless podman on CI**, alongside docker, so the rootless-podman identity mode is exercised.
+- **Host-to-helper RPC channel.** The host calls the in-container helper over the bridge instead of a fresh runtime exec per request; the dispatcher's `wait` and `follow` are one held stream instead of an exec per poll.
 
 <details><summary>Commits</summary>
 
+- f10b5c9 docs(fleet): close step 10b with ADR 0045 (a routed stream proves its origin per stream), 0043 accepted and 0041 removed, the routing docs as one account, its limitations and an as-built note, so 10c starts from routing as it is
+- b4fdffc feat(machine): machine trust worker warns, and machine ls and the Machines tab show, when a machine the hub's side controls dials this one over ssh, worked out from the link graph, so a worker setting that a shell can rewrite isn't mistaken for protection
+- 08ac478 feat(fleet): proposals, removals, forgets and run --place reach their member over any path, and every member floods graph changes to its links, so the fleet works for members with no direct link to the authority, the hub or the worker (lifts decision 49's direct-link limit)
+- de6c450 feat(machine): a member reached only through others is a routed machine, listed as such and taking quick calls, verbs, terminals and forwards over its route, so machines seen through the hub are no longer view-only (fleet decision 60; the agent stays direct until 10c)
+- 5b7ea54 feat(fleet): a route-<member>.sock for every member with no link up here, opening each stream over the graph's paths in order and failing over to the next, and terminals, forwards and code moves fall back to it, so a member is reached through the fleet when no direct link is up
+- abfe3a2 feat(fleet): both ends of a link relay a routed stream to a next hop that's up and, as its destination, serve the inner channel under this host's trust for the proven origin, so a member is reachable through others whatever the relays' own trust
+- d22fa6f feat(fleet): a routed stream's opening on a ROUTE channel, its header checked at every hop and its origin and destination proving their keys to each other over fresh nonces, so no relay can speak for the origin, replay it or pose as the destination
+- 156214d feat(fleet): every member signs a report of its links on change and sends it to the hub, which pushes the graph to its members, and any member hands its copy to a neighbor on link-up, so each member holds the fleet's link graph to route over
+- 56bbf09 feat(fleet): a link graph of members' own signed link reports, taken only by the reporter's key in the log and newer than the last, with paths ordered direct, fewest hops, through always-on members, longest up, so routing (10b) has a graph no carrier can forge
+- 840787f docs(fleet): break step 10b into nine sub-steps and record decisions 53-60 (a ROUTE channel, per-stream origin challenge, source routing, relaying isn't access, routed origins as direct peers, AGENT direct-only until a per-member grant in 10c, signed link reports, routed machines as rows), so routing lands on a settled design
+- d9e7ead feat(config): placement = "home" pins a sandbox to the host whose config names it, so run --place never moves it even where nothing inferred would keep it home (fleet decision 40)
+- 17e88ea feat(fleet): run --place keeps a sandbox home when its config ties it there (binds outside what moves, ${localEnv:…}, shared volumes, sockets, host-only features, build paths), saying why before the hub is asked, so nothing moves to a worker only to be refused by its policy (fleet decision 40)
+- 2c28f0f feat(run): a typed run stays on the member whose config it names and only run --place asks the hub, so the user's own sandboxes never wait on or move through the fleet (fleet decision 38; --here goes, nothing is placed by default)
+- e0bb55d chore(deps): bump sha2 to 0.11 so it shares one version with ed25519-dalek
+- bf5cd91 docs(fleet): close step 10a with ADR 0044 (one authority signs membership), an as-built note, status, changelog and module map, so routing (10b) starts from member identity as it is
+- 6d3421f feat(run): refuse any container bind or build path that reaches the member key, on every host and under any trust, so a sandbox can never read the key that proves this machine to the fleet
+- cc080f1 feat(fleet): machine key rotate replaces a member's key through a rotate entry countersigned by the old key, signed on the authority or proposed to it, the new key taking over and every link redialing once the log lists it, so a key can be retired without leaving the fleet
+- 3c45e63 feat(fleet): machine rm revokes the member's key in the membership log, signed on the authority or proposed to it and approved there with machine pending|approve|deny, and a signed change floods to the members over fleet.sync before the step-9 removal follows it, so only the authority's key ends a membership
+- ca3943b feat(fleet): a link peer carries the key it proved and its introducer, the hub-only fleet calls are admitted by the hub's key in the membership log rather than the name the link announced, and machine ls marks introduced members, so a relay or a stranger with the right name gets nothing
+- 876a3cc feat(fleet): both ends of a link prove their member keys against the membership log after the hellos, the end behind taking the entries it lacks and a fork or another fleet refused, so no device acts as a member or the hub without that member's key
+- 418a3ea feat(machine): machine add signs the joining machine into the fleet's membership log (genesis by the creator, adds by the authority, introductions by other members) after the user confirms its key's fingerprint, and every host takes its hub from the log it adopted, so membership is signed before links start checking it
+- 7015c9a feat(fleet): a hash-chained membership log signed by the fleet's authority, with introductions held beside it and a membership.json store, so who belongs to a fleet is something every member can verify rather than take from the hub
+- 9bb5ea5 docs(site): catch the bridge page up with the helper protocol as built: rpc as the one host-opened channel, port queries, the daemon's full caps, and the serve daemon as a takeover trigger once machines follow their hub's version; fleet-only channels pointed to, not listed
+- fbce32b feat(fleet): every member has an ed25519 key in a 0600 member.key, shown by member.get and machine key, with signed statements whose versions only go up, so the membership log and link proofs of step 10a have keys to sign with
+- 2486e9b docs(fleet): break step 10a into eight sub-steps and record decisions 48-52 (the fleet's creator is its authority, forwarded changes approved there, a single-writer membership log with introductions beside it, the cap while trust is per host, a file key store for now), so each piece of identity lands on a settled design
+- d4455ec feat(machine): machine add --hub makes the target the hub of a new fleet, so a laptop holding the configs can make an always-on server the hub without the server sshing into it (fleet decision 36)
+- 4af90c0 feat(machine): machine add takes no config roots when the machine has none or none are picked, so a hub or worker that only runs other members' configs can join (fleet decision 37)
+- c0b31aa docs(fleet): make H the only authority, cap introduced members by their introducer and add end-to-end sessions as step 10c, so a less trusted always-on hub or relay can't mint members, swap keys or read routed streams
+- fe72296 docs(fleet): record decisions 36-44 (machine add --hub, rootless members, typed runs stay home, mesh-held dispatcher config and state, inferred and pinned placement constraints, named host resources as the target, identity before routing as step 10a), so the hub-on-a-server setup and what binds a sandbox to a host are settled before step 10 starts
+- d486014 docs(fleet): mark step 9 shipped with an as-built note, so step 10 starts from members, the join rule and hub-placed runs as they are
+- e832892 feat(fleet): a member's run asks the hub's fleet.place where to go and moves its code there over its own links, running here with a note when the hub can't answer, so placement has one decider for the whole fleet
+- 001ccfa feat(machine): machine rm takes a member out of the fleet through the hub's fleet.leave/forget, machine rm of this host leaves, and machine unlink keeps the old link-only removal, so membership can shrink as well as grow
+- 582b629 feat(fleet): a member watches its hub's federated view and shows the hub's other machines as view-only via rows, the asking member's own rows never sent back, so every member sees the whole fleet before routing can reach it
+- 9121363 test(machine): the fake peer tolerates a handshake that closed before its reply, so the sentinel-in-a-link-stream case stops failing on EPIPE under load
+- 581389b feat(machine): machine add joins the target to this host's fleet, this host to the target's, or starts a fleet of two, refusing two hubs and a name the fleet has, so every link is made inside one fleet whose members go by pinned names
+- 98d5c06 feat(fleet): the hub is member.toml's hub, named in every link's hello and followed at runtime, so membership has one home the join rule can write and two fleets never share a link
+- 3e5bb50 docs(site): rename host-and-helper to host and containers and catch its diagram up with the helper as built: the bridge carries the host's RPC calls (sessions, tracked runs), tty execs run in helper sessions, agents relayed by other machines come before the daemon's own; fleet is pointed to, not drawn
+- a1bb25d docs(fleet): break step 9 into 9a-9f and record decisions 31-35 (hub-decided placement, hub-only leave/forget, view-only indirect members, the hub named in the hello, member names as registry names), plus key-pair identity as an open question, so each piece of membership lands on a settled design
+- 3fa327c docs(fleet): finish the one-socket-per-link wording, hub rows persist
+- fda8634 refactor(fleet): one link socket per machine, channel named by first byte
+- 95a0839 docs(site): an interactive machines-to-fleet page from identity landing to step 8, so readers see why machines became one fleet before drilling into how
+- 941b105 fix(tui): re-read a followed build log 100 ms after each answer and wake the event loop every 30 ms meanwhile, so the 250 ms idle wake no longer stretches each refresh past half a second
+- 9ddf242 fix(tui): re-read an in-flight build log every 500 ms instead of only on snapshots, so the modal follows a build as it writes
+- 2d20b5a fix(tui): p's port prefills write a local instance or service a machine also has as @/<name>, so the forward submits instead of failing as ambiguous
+- e97ec11 fix(tui): r's prefill and tab completion write a local name a machine also has as @/<name>, so the line submits instead of failing as ambiguous
+- 08e8279 docs(fleet): mark step 8 shipped with one kind of machine on one link per pair, so step 9 starts from what's true
+- b9cab24 feat(fleet): drop lending, offered machines and drain, and count each dialed link as a holder, so a laptop joins with machine add <hub> and stays up as one kind of machine
+- dd4d2ed feat(machine): a dialed host holds a link to each inbound neighbor and a hub places on every connected machine, so a laptop that runs machine add <hub> is a machine there like any other
+- a83207c refactor(machine): delete the per-use ssh argvs, the agent relay, devsandbox tunnel's ssh half and the relay's session env, and drop the sentinel inside link streams, so the only ssh to a machine is its link and machine add's probe
+- bfc7846 feat(machine): dashboard terminals, forwards and port reach every machine over its link's PTY and TUNNEL channels, so nothing per-use dials an ssh machine around its trust
+- 90c7ee3 feat(machine): CLI re-runs on every machine are API calls and PTY dials over its link, so an ssh machine's commands go through its trust like an offered worker's
+- 2e1bd6d docs(fleet): break step 8 into 8a-8f and record decisions 27-30 (no sentinel in link streams, inbound neighbors as machines, the row kind, the agent's direction), so each removal lands after its replacement
+- 23ecf62 docs(fleet): mark step 7 shipped with ssh machines on one peer link per pair, so step 8 starts from what's true
+- e5b8f78 feat(machine): every ssh machine is held as a fleet-link --peer link whose sockets every client dials, its agent over AGENT and a hub's version followed, so an ssh machine reaches and is reached under trust over one link per pair
+- 6af5483 feat(fleet): fleet-link --peer binds the dialer's sockets, hands its streams to the daemon with link.attach and announces it as an inbound neighbor, following a hub dialer's build, so a dialed machine serves its link under its own trust
+- 4286ca8 feat(fleet): link.attach takes a channel and hands the connection to that channel's server under the peer's trust with its own fleet root, so a link's far end can pass every stream to its daemon over the socket
+- b1cd7d3 refactor(fleet): links dial through one transport seam and both link roles share one body that can bind sockets and answer opens, so ssh is swapped in one module and either end of a link can serve local clients
+- 8660be9 docs(fleet): split one link per machine pair from one kind of machine and renumber the rest, recording decisions 23-26 (both ends bind and answer, per-peer fleet root, versions on the hub flag, lend.toml with lending), so step 7 ships in small commits without regressions
+- 3ce588f docs(fleet): mark step 6 shipped with member.toml and the trust table on both kinds' connections, so step 7 starts from what's true
+- 1d956a0 feat(machine): gc on an offered worker is a daemon verb its member's full trust admits and worker trust refuses, so host maintenance over the link follows the member's setting
+- aa25738 feat(machine): an ssh machine's api relay attaches its connection as the linking host's with link.attach, so the machine's trust table applies to it as to a lending link
+- 2281189 feat(machine): machine add records the picked roots on the machine with machine roots add there, so its worker trust keeps admitting them once no instance holds them
+- 952c42e feat(fleet): a lending link's table admits the member's own roots beside its fleet root under worker trust and the whole API but member.* under full, so trust, not lending, decides what a remote caller reaches
+- 9f29d4d feat(fleet): member.toml holds a member's name, trust, roots, allowances, caps and dev-builds behind member.get/set and machine trust, so trust has a home before the trust table reads it
+- b28e1d8 docs(fleet): mark step 5 shipped on offered workers' links, so step 6 starts from what's true
+- 8b3e040 feat(exec): service terminals and terminals into helper-less or non-root-helper instances on an offered worker run as a runtime exec under a host pty there, and exec --service opens a service's shell, so no terminal is refused over the fleet link
+- 9abbf50 feat(exec): a non-tty exec on an offered worker runs as a piped PTY stream into a runtime exec there, so scripts and pipes work without ssh to the worker
+- f0308d9 feat(machine): service ls and a followed build log on an offered worker go over the API, and its snapshots no longer show other roots' isolated service containers, so the hub sees only what's lent
+- 8e5707c feat(machine): ps and stats on an offered worker are quick calls cut to what it lends, so they work without re-running devsandbox there
+- 709466f docs(fleet): split one kind of machine into steps 5-9 behind a transport seam and renumber the rest, recording the answered open questions as decisions 17-22, so each step is one reviewable change
+- ed7a621 docs(fleet): mark step 4 shipped on offered workers' links and settle the daemon-side attach question, so step 4b starts from what's true
+- 67a9dd5 feat(machine): logs, inspect, done, rename, ls and status on an offered worker run as API calls within its trust, and the rest say why they're refused, so the CLI never re-runs devsandbox on a worker
+- c39a57c test(fleet): the agent gate test tolerates a refusal closing before its write, so it stops failing under load
+- f0320ad feat(fleet): the hub's ssh agent reaches an offered worker's instances over the fleet link's AGENT channel while its entry has agent on, so agent forwarding needs no ssh relay to the worker
+- 1a2aaf4 feat(fleet): port forwards to an offered worker ride the fleet link's TUNNEL channel into a bridge there, so forwards need no ssh to the worker
+- 5435dca feat(fleet): exec and dashboard terminals on an offered worker attach over the fleet link's PTY channel, reconnecting as over ssh, so workers need no inbound ssh for terminals
+- de317bc feat(fleet): a worker serves PTY streams as helper session attaches and lists its instances' sessions, so the hub can open terminals without ssh to the worker
+- f87d0f2 refactor(fleet): a link serves a table of channels and either end opens any the peer serves, so PTY, TUNNEL and AGENT can ride the fleet link
+- b20420f chore(skills): orchestrator breaks down an existing plan's rollout step instead of writing a new plan, so design plans can be executed step by step
+- 5d9cecb docs(fleet): links are the ssh pairs machine add makes, routed over a graph, with trust applying to every caller, so the hub is only a role
+- fb0178d docs(exec): mark resumable exec step 4a-4d shipped, leaving only the items after fleet step 1
+- 8f0ee37 docs(fleet): one kind of machine, every machine a fleet member with its own trust setting, so configs live anywhere and machines are added one way
+- 4b7c4ae chore(toolchain): list the helper's musl targets in rust-toolchain.toml, so a fresh checkout or rebuilt sandbox can build devsbd without a manual rustup step
+- 760a41b fix(identity): plan a root host user on a rootful runtime like rootless docker, so running devsandbox as root stops failing on a remap to uid 0
+- 72b96cb fix(images): tag features images devsandbox-feat-…, so a sandbox named foo-feat can't overwrite sandbox foo's features image
+- e0dc02d fix(config): ${localEnv:NAME:default} and ${containerEnv:NAME:default} use their default, as devcontainers do, instead of looking up a variable named NAME:default
+- 5a03e86 feat(devsbd): session attach, ls and rm over RPC, so the daemon can attach to a session without an exec, as fleet's PTY channel will
+- 230d22a feat(fleet): run places a sandbox on the roomiest lending worker, moving its code first, so a hub spreads work without anyone picking machines
+- 3c8b19e feat(fleet): move a sandbox's config root as a tar and its repos as hub-cloned bundles onto a worker, so a worker can run hub configs without credentials
+- 8d54318 feat(fleet): a pure place over soft caps, locality and reachability, so the placed run has one tested rule for where work goes
+- 2c10a2d fix(images): key image tags and feature build dirs by config root, so two roots with a same-named sandbox stop overwriting each other's images
+- b214318 feat(fleet): a hub on a dev build pushes its own binary to workers that accept dev builds on its platform, so a dev fleet stays on one build
+- 2b2bb3c feat(fleet): a worker follows its hub's exact published build, downgrades included, so a fleet never runs mixed protocols
+- b7fd80b feat(fleet): a TRANSFER channel on the fleet link, size- and hash-checked, so binaries, config roots and bundles can move between hub and worker
+- f59a05d feat(fleet): each daemon reports capacity and a worker its fleet root, so the hub sees placed instances and where there's room
+- c5189f1 feat(fleet): hub mode keeps the daemon and every worker link up and saves remote rows, so a restarted hub shows its fleet before workers reconnect
+- 3a65d5b feat(fleet): check every container a fleet-root config creates against the worker's lending policy, so a hub can't reach the laptop's host through a config
+- e19a8f5 feat(lend): lend and fleet join|leave set lending through the daemon, applied live, so joining a hub needs no hand-edited file or restart
+- 782b07d feat(fleet): a lending worker dials its hub and serves it a confined Worker table, so the hub reaches only what the laptop lends
+- ca191f5 feat(fleet): a hub accepts worker offers as offered machines reached over the worker's own link, so a laptop can lend without the hub ever ssh-ing in
+- e8f1123 feat(fleet): one link primitive for host-to-host muxes, shared with the agent relay, so a worker can carry the API to its hub
+- a96b371 test(devsbd): send only the hello in the wire-mismatch check, so the supervisor's close can't reset the test's read
+- fabb742 feat(dispatch): run ops call the child's helper over RPC when it offers them, so wait and follow are one held stream instead of an exec per poll
+- bed361d feat(serve): a HelperClient over each bridge's RPC channel, so host code can call the in-container daemon with a queue, a log and cancel
+- 65f14ff feat(devsbd): an RPC channel the host opens on the bridge, flow-controlled like Connect, so host requests stop needing a fresh runtime exec
+- a409203 feat(tui): count an instance's exec sessions in instances.procs, so a detached session left behind is visible without --sessions
+- 5c03315 feat(devsbd): version the session wire and check it before any takeover, so a client never displaces or garbles a session of another helper build
+- 31f95b6 fix(devsbd): keep reading a session socket while the terminal stalls, so a displaced client still gets detached and exits
+- a446f52 feat(devsbd): prune settled session dirs on session new and add session prune, so ended sessions stop hiding live ones from ls
+- 30c14bb docs(plans): step-level landmarks and the user's fleet decisions, so implementers don't re-derive them from the code
+- b2547f1 docs(plans): order resumable-exec, helper-rpc and fleet so fleet's PTY rides a daemon-side session attach instead of ssh exit codes
+- 7716cb8 docs(test): say gated tests follow DEVSANDBOX_RUNTIME and rootless podman is now exercised on CI
+- b939766 ci(podman): opt into the service-manager e2e, which fails rather than skips on CI
+- 8869ad2 ci(podman): give the podman job a user session and isolated children its bus, so rootless builds get systemd cgroups like on a desktop
+- f8e852c test: share rootless podman's store with isolated children and drop the last docker-only assumptions, so the podman job tests the code, not the harness
+- 43041f1 ci: run the gated tests under rootless podman, the identity mode nothing exercised
+- f971a2c test: drive gated tests through the selected runtime, scoping the seccomp ones to docker, so podman runs the same suite
+- d1fe235 test(support): gate runtime tests on the selected runtime, with a docker_only scope, so the same tests can run under podman
+- 6d6aaec docs(site): cover host identity, the /root prompt, browsers and resumable exec, so the site matches what ships next
+- d0aed1d docs(changelog): notes for host identity, the browser sandbox, the /root migration and resumable exec
 - b2c4d7c docs(identity): close the identity plan, with ADRs for the user model, the browser sandbox and the /root migration, and the living docs checked against the code
 - d37a8f3 feat(tui): offer the /root migration when the dashboard opens and before run, start and rebuild, so dashboard users get the same choice as the cli
 - 6ce79cc feat(run): ask before run, start and rebuild whether to update a config that mounts into /root, so the switch to host identity doesn't break sandboxes silently
