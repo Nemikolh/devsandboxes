@@ -16,7 +16,7 @@ each, a membership log only the fleet's authority signs, links that
 prove both keys, changes made elsewhere approved on the authority;
 step 10b routed streams over the members' signed link graph, each
 proving its origin to its destination. Step 10c (end-to-end sessions)
-is next. The rest is design. Builds on
+is in progress. The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
 [machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
 its parked auto-update and PTY attach into steps 2 and 4.
@@ -736,7 +736,33 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
       member it started on and its destination (a Noise-style handshake
       over both identity keys, 10a), naming its destination and with
       replay protection, so a relay carries ciphertext only: it can't
-      read, change, inject into, replay or redirect a stream.
+      read, change, inject into, replay or redirect a stream. `AGENT`
+      becomes routed behind a per-member grant (decision 58).
+
+      Sub-steps, each a commit (decisions 61-67 settle what the above
+      left open):
+      - **10c.1 The session layer** (`fleet/session.rs`, pure over
+        `Read`/`Write`). Per-direction keys from the DH output and the
+        transcript (decision 62), sealed records with an authenticated
+        end per direction (decision 63) and the pump between a plaintext
+        stream and a sealed one. Tests: a flipped byte, a dropped,
+        reordered, replayed or reflected record, a truncation, an
+        oversized length.
+      - **10c.2 Encrypted routed streams.** The opening carries both
+        ephemeral keys (decision 61) and yields the session;
+        `Shared::serve_routed` and `Shared::serve_route` pump through it
+        (decision 64). Tampering-relay tests in `route.rs`. ADR 0046
+        (supersedes 0045's "a relay sees and can alter bytes").
+      - **10c.3 The agent grant** (decisions 65, 67). `member.toml`'s
+        grants, `agent_for` by proven key, `machines.toml`'s `agent`
+        flag gone, `machines.set {agent}` on any machine, the grantees in
+        each member's report (decision 66).
+      - **10c.4 Routed `AGENT`** (decision 66). `Header::check` allows
+        it; the destination answers by its grant; the instance's host
+        probes the members whose report lists it and binds
+        `agent-route-<member>.sock` while one serves.
+      - **10c.5 Docs close.** `docs/status.md`, this step's as-built
+        note, `CHANGELOG.md`.
 11. **Hub swap, pointer** (S–M). `machine hub <m>`: the role moves, links
     stay; every reachable member rewrites `hub`, a late one learns it on
     reconnect.
@@ -1050,6 +1076,47 @@ step 10b does.
 60. Machines reached only over a route are rows of their own
     (`machine ls`, `machines.list`), their instances still from the
     hub's federated view.
+61. A routed stream's session is SIGMA-style over the opening of
+    decision 54, with no extra round trip: the destination's challenge
+    carries a fresh ephemeral x25519 key and the origin's proof its own,
+    in place of the nonces; both ends sign the transcript holding both
+    with their ed25519 member keys (no static DH key, no key
+    conversion), in the domain `devsandbox/route/v2`. A DH output that
+    isn't contributory (a low-order key) is refused. Crates:
+    `x25519-dalek` 3, `chacha20poly1305` 0.11, `hkdf` 0.13, all on
+    `curve25519-dalek` 5 and `digest` 0.11 like `ed25519-dalek` 3; no
+    Noise crate.
+62. Session keys: HKDF-SHA256 with the transcript's SHA-256 as salt
+    and the DH output as input, expanded once per direction with its
+    role in the info, so a record can't be reflected to its sender.
+63. A session's bytes are records: a `u16` length and a
+    ChaCha20-Poly1305 ciphertext of at most 16 KiB of plaintext, its
+    nonce a per-direction counter, its type (data or end) in the
+    associated data. Each direction ends with an authenticated end
+    record; a bare EOF, a bad tag or a record out of order is an error
+    that tears both directions down, never a half-close. Each read is
+    sealed and sent at once (`PTY` and `TUNNEL` are interactive).
+64. A session's ends are the two daemons: the origin's
+    `serve_routed` and the destination's `serve_route`, a socket pair
+    between the session and the inner channel's handler, so handlers
+    and relays don't change. Direct link streams stay as they are, on
+    ssh.
+65. An agent grant is this host's consent, per member, kept in
+    `member.toml` (written by the daemon only, decision 3) as the
+    member's name and key. It replaces `machines.toml`'s `agent` flag,
+    so a direct link's `AGENT` and a routed one follow one rule: the
+    stream's proven key is granted. A grant follows an authority-signed
+    rotation of that key and ends with its revocation. Off by default;
+    never inherited from a relay's grant.
+66. A member's signed link report (decision 59) lists the members it
+    grants agent to. A host probes, over a routed `AGENT` stream, only
+    the members whose report lists it, and binds
+    `agent-route-<member>.sock` while one answers serving; the granting
+    member checks its grant on every stream regardless.
+67. `machines.set {agent}` grants or withdraws agent for any machine:
+    registered, inbound or routed. Decisions 18 and 30 hold as "never
+    implicitly": an agent goes where the user granted it, whichever end
+    dialed.
 
 ## Open questions
 

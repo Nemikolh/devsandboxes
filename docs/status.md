@@ -61,7 +61,8 @@ limitation means editing this file in the same commit.
   origin; members reached only that way are routed machines, with
   actions, terminals, forwards, placement and fleet calls; `machine
   trust worker` warns when a machine the hub's side controls dials this
-  host. Next: end-to-end sessions (step 10c).
+  host. In progress: end-to-end sessions and routed `AGENT` (step 10c,
+  sub-steps 10c.1-10c.5 in the plan).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)

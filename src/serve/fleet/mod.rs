@@ -34,6 +34,9 @@
 //!   [`route::connect`], how a local client reaches a member;
 //!   `routes`: the daemon's `route-<member>.sock` per member it has no
 //!   link up to, each connection opened over the graph's paths in order.
+//! - `session`: a routed stream's end-to-end session: the ephemeral key
+//!   agreement, per-direction keys, sealed records and the pump between
+//!   a plaintext stream and a sealed one.
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an
@@ -76,6 +79,9 @@ pub mod proposals;
 pub mod reports;
 pub mod route;
 pub mod routes;
+// Only its tests use it until routed streams pump through it (fleet plan 10c.2).
+#[allow(dead_code)]
+pub mod session;
 pub mod pty;
 pub mod pty_client;
 pub mod transfer;
