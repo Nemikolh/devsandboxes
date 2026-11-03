@@ -651,6 +651,66 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
       accepted (0041 removed); `machines.md` and `fleet.md`
       (architecture) rewritten. Until 10c a relay still sees and can
       alter a routed stream's bytes after its opening.
+
+      Sub-steps, each a commit (decisions 53-60 settle what the above
+      left open):
+      - **10b.1 The graph model** (`fleet/graph.rs`, pure). A member's
+        link report (decision 59) as an `identity::Statement` of kind
+        `links`, its version `max(now_ms, last + 1)`, older refused
+        through `Seen`; `Graph::apply` takes a report only from a log
+        member or a held introduction, never a revoked key;
+        `Graph::paths(from, to)` in order: direct, fewest hops, hops
+        through always-on members, the oldest `since`; an edge is up when
+        the newer of its two ends' reports says so.
+      - **10b.2 Reports and the published graph.** Each member sends
+        `fleet.report` to the hub on a link-state change (debounced) and
+        when its hub link comes up; the hub collects them and pushes the
+        graph to its linked members as `changes::push` does the log.
+        Every member keeps the graph it has and answers `fleet.graph`
+        with it (the reports verify themselves, so a member with no link
+        to the hub gets it from a neighbor); `graph.get` for local
+        clients. `lent::admit_fleet`: `fleet.report` on the hub only,
+        `fleet.graph` from any log member or held introduction.
+      - **10b.3 The routed opening** (`fleet/route.rs`). `channel::ROUTE`
+        and `caps::ROUTE` (decision 53; the helper never sees it),
+        `lent::Channel::Route`; the header, the challenge-response both
+        ways (decision 54) on `proof`'s framing (`Chan`, `write_raw`,
+        `read_raw`, `resolve` shared), refusals for a forged or revoked
+        origin, a replay, a relay posing as the destination, a TTL of 0,
+        a loop, an oversized header.
+      - **10b.4 Relays and destinations.** `Shared::serve_channel`
+        serves `ROUTE` on both link ends (`Dialer::answer`,
+        `fleet_link::run_peer`): a relay checks its next hop is a direct
+        link that's up and splices (decision 56); the destination
+        verifies the opening and serves the inner channel under its trust
+        for the origin (decision 57; `AGENT` refused, decision 58). A
+        three-daemon fixture next to `Pair`.
+      - **10b.5 Paths and failover.** A per-member `route-<name>.sock`
+        the daemon binds for every member in its graph; each accept
+        tries `Graph::paths` in order within the handshake budget and
+        moves on at a refusal, a timeout or a failed connect.
+        `route::connect(dir, name, channel)`: `fleet-<name>.sock` first,
+        else `route-<name>.sock`; every link-socket caller uses it.
+      - **10b.6 Routed machines get actions** (decision 60). Routed
+        entries in `Machines` (no link of their own; rows still the hub's
+        view), quick calls, verbs, terminals and forwards over
+        `route::connect`; decision 33's `seen_via` refusals go, except
+        the agent toggle's (decision 58).
+      - **10b.7 Fleet calls over any path.** `changes::propose` (lifting
+        decision 49's direct-link limit) and an add's introduction,
+        `leave::remove`'s `fleet.forget`, `ask_hub`; `run --place`
+        candidates and code moves to routed machines
+        (`placed::reachable_workers`, `member_workers`).
+      - **10b.8 Exposure from the graph.** `graph::exposure`: the hub is
+        exposed; so is every member an exposed one dials (it has a shell
+        there) and every `full` member an exposed one reaches, to a fixed
+        point, each with its chain. `member.get`'s `exposed_by`, `machine
+        trust worker`'s warning naming it, `machine ls` and the Machines
+        tab ([What `worker` protects](#trust-worker-or-full)).
+      - **10b.9 Docs close.** ADR 0045 (a routed stream's origin proof),
+        ADR 0043 accepted and 0041 removed (links to it fixed),
+        `machines.md` and `fleet.md` rewritten, `docs/status.md`, this
+        step's as-built note.
     - **10c End-to-end sessions** (its own step, decision 47). Each
       routed stream is an authenticated, encrypted session between the
       member it started on and its destination (a Noise-style handshake
@@ -702,7 +762,8 @@ Numbered as code cites them; 13–16 as step 4 makes them, 3, 9 and 17 as
 step 6 does, 7, 18, 22-25 as step 7 does, 26-30 as step 8 does, 1, 2, 19
 and 20 as step 9 does, 21 as step 10 does, 36 and 37 as a fix to
 step 9's `machine add` does, 38 as a fix to step 9's placement does, 39-43 as steps 13, 14
-and 16 do, 44-47 as step 10 does, 48-52 as step 10a does.
+and 16 do, 44-47 as step 10 does, 48-52 as step 10a does, 53-60 as
+step 10b does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
    setting.
@@ -924,6 +985,44 @@ and 16 do, 44-47 as step 10 does, 48-52 as step 10a does.
     OS keychain backends are parked. Fleets made before step 10a have no
     membership log: their links are refused until the fleet is made
     again with `machine add` (no migration, pre-1.0).
+53. A routed stream is a link stream on its own channel, `ROUTE`, that
+    starts with a header naming its destination, origin, inner channel,
+    path and TTL; `Frame::Open`, which the in-container helper shares,
+    stays one channel byte.
+54. A routed stream's origin proves itself per stream, challenge and
+    response both ways: the destination sends a nonce, the origin signs
+    the fleet's genesis, origin, destination, channel, path and both
+    nonces with its member key (its own domain, apart from the link
+    proof's), then the destination proves itself back. A fresh nonce
+    stops replays and a relay can't pose as the destination; 10c's
+    handshake takes this place.
+55. Source routing: the requester puts the path in the header as a list
+    of member names; a relay checks only that its next hop is a direct
+    link that's up. TTL 4; a path with a loop is refused. The path stays
+    a list so a later "an empty path lets the relay decide" mode is a
+    small change.
+56. Relaying isn't access: a relay carries a stream from any proven
+    link peer to any member in its log or held introductions, whatever
+    its own trust setting, and refuses revoked keys and names it doesn't
+    know.
+57. A destination treats a routed origin as a direct peer: the key it
+    proved, its fleet root `fleet/<origin>/`, its introduction's cap
+    (decision 46). No agent comes with it.
+58. Routed channels are `API`, `PTY`, `TUNNEL` and `TRANSFER`; `AGENT`
+    stays direct-only until 10c (decisions 18, 30). In 10c `AGENT` is
+    routed behind a per-member agent grant: consent per destination
+    member, keyed by that member's key (10a), off by default. My agent
+    reaches instances on B only if I turned agent access on for B; it
+    never comes along from a relay's (K's) own `agent` flag.
+59. The graph is the members' own signed link reports (each link's
+    peer, who dials, its state and since when, plus the member's trust
+    and whether it's always on), one `identity::Statement` per member
+    whose version only goes up. The hub collects and pushes them; every
+    member keeps them and serves them to any log member, and a report
+    verifies by its signer's key whoever carried it.
+60. Machines reached only over a route are rows of their own
+    (`machine ls`, `machines.list`), their instances still from the
+    hub's federated view.
 
 ## Open questions
 
