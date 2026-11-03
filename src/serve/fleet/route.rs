@@ -7,8 +7,9 @@
 //! the body).
 //!
 //! - **The header** ([`Header`], [`write_header`], [`read_header`]): its
-//!   destination, its origin, the inner channel (`API`, `PTY`, `TUNNEL` or
-//!   `TRANSFER`: `AGENT` stays direct, decision 58, and a route carries no
+//!   destination, its origin, the inner channel (`API`, `PTY`, `TUNNEL`,
+//!   `TRANSFER` or `AGENT`, the last answered by the destination's agent
+//!   grant for the origin's proven key, decision 58; a route carries no
 //!   route), the path (the hops after the origin, ending in the
 //!   destination) and a TTL, at most [`HEADER_LIMIT`] bytes. The origin
 //!   sets the TTL to [`MAX_HOPS`]; each relay checks it ([`relay_header`])
@@ -161,13 +162,13 @@ impl Header {
         Ok(Header { dest, origin, channel, path, ttl })
     }
 
-    /// What every hop checks: a routed channel, a TTL left, a path of at
-    /// most [`MAX_HOPS`] ending in the destination, valid names, no loop.
+    /// What every hop checks: a routed channel (any but `ROUTE`; an `AGENT`
+    /// one is answered by the destination's grant for the origin, never a
+    /// relay's), a TTL left, a path of at most [`MAX_HOPS`] ending in the
+    /// destination, valid names, no loop.
     pub fn check(&self) -> Result<()> {
-        match self.channel {
-            Channel::Agent => bail!("`agent` isn't routed: an ssh agent reaches only a direct link's peer"),
-            Channel::Route => bail!("a routed stream can't carry another"),
-            _ => {}
+        if self.channel == Channel::Route {
+            bail!("a routed stream can't carry another");
         }
         if self.ttl == 0 {
             bail!("its TTL ran out");
@@ -525,13 +526,6 @@ pub fn connect(dir: &Path, name: &str, channel: u8) -> io::Result<UnixStream> {
     })
 }
 
-/// `header`'s body unchecked, for tests to send what [`write_header`]
-/// wouldn't.
-#[cfg(test)]
-pub(crate) fn encode_unchecked(header: &Header) -> Vec<u8> {
-    header.encode()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex, mpsc};
@@ -798,13 +792,12 @@ mod tests {
     #[test]
     fn a_bad_header_is_refused_where_it_arrives() {
         let h = |ttl: u8, channel: Channel, p: &[&str]| Header { ttl, ..Header::new("lap", channel, path(p)) };
-        let cases: [(Header, bool, &str); 8] = [
+        let cases: [(Header, bool, &str); 7] = [
             (h(0, Channel::Api, &["b"]), false, "`b`: the routed stream from `lap` to `b`: its TTL ran out"),
             (h(0, Channel::Api, &["k", "b"]), true, "`k`: the routed stream from `lap` to `b`: its TTL ran out"),
             (h(1, Channel::Api, &["k", "b"]), true, "`k`: the routed stream from `lap` to `b`: its TTL 1 doesn't cover the 2 hops left"),
             (h(4, Channel::Api, &["k", "lap", "b"]), false, "its path loops through `lap`"),
             (h(4, Channel::Api, &["k", "k", "b"]), true, "its path loops through `k`"),
-            (h(4, Channel::Agent, &["b"]), false, "`agent` isn't routed"),
             (h(4, Channel::Route, &["k", "b"]), true, "a routed stream can't carry another"),
             (Header { dest: "b".into(), ..h(4, Channel::Api, &["k", "m"]) }, false, "its path doesn't end in its destination `b`"),
         ];
@@ -815,6 +808,8 @@ mod tests {
             let e = raw(header.encode(), relayed);
             assert!(e.contains(want) && e.starts_with("the routed stream with `b` is refused: "), "{e}");
         }
+        // `AGENT` is routed (decision 58): its destination's grant decides.
+        h(4, Channel::Agent, &["k", "b"]).check().unwrap();
         let e = raw(vec![0; HEADER_LIMIT + 1], false);
         assert!(e.contains("`b`: `lap` sent a routed stream header of 4098 bytes (at most 4097)"), "{e}");
         assert!(raw(b"junk".to_vec(), true).contains("`k`: `lap` sent a malformed routed stream header"));
@@ -1077,8 +1072,10 @@ mod tests {
         if !kept.is_empty() {
             assert_eq!(read_n(&w.b, kept.len()), kept);
         }
-        (&w.a).write_all(b"two").unwrap();
-        w.a.shutdown(Shutdown::Write).unwrap();
+        // A tampered record before it (a replayed `one`) may have torn the
+        // session down already: the write then fails, which is the point.
+        let _ = (&w.a).write_all(b"two");
+        let _ = w.a.shutdown(Shutdown::Write);
         let got = rest(&w.b);
         assert!(!got.windows(3).any(|x| x == b"two"), "altered bytes delivered: {got:?}");
         let e = format!("{:#}", w.dest().err().expect("the destination's pump fails"));

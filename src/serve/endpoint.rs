@@ -111,6 +111,18 @@ pub fn link_agent_socket(dir: &Path, dialer: &str) -> PathBuf {
     dir.join(format!("agent-link-{}.sock", agent_socket_name(dialer)))
 }
 
+/// The agent socket the daemon binds for member `member` in `dir`
+/// (docs/architecture/daemon/fleet.md, *AGENT*): `agent-route-<member>.sock`,
+/// bound while `member` serves `AGENT` to this host over
+/// `fleet::route::connect` (`fleet::agent_routes`). Named `agent-*.sock`
+/// like [`link_agent_socket`], and cut down as [`fleet_socket`]'s name is.
+pub fn route_agent_socket(dir: &Path, member: &str) -> PathBuf {
+    dir.join(format!("{ROUTE_AGENT_PREFIX}{}.sock", agent_socket_name(member)))
+}
+
+/// What every [`route_agent_socket`]'s file name starts with.
+pub const ROUTE_AGENT_PREFIX: &str = "agent-route-";
+
 fn agent_socket_name(client: &str) -> String {
     let safe: String = client
         .chars()
@@ -124,7 +136,8 @@ fn agent_socket_name(client: &str) -> String {
     format!("{}-{}", &safe[..AGENT_CLIENT_MAX - 9], &hash[..8])
 }
 
-/// The relayed agents' sockets (`agent-*.sock`: [`link_agent_socket`]) in
+/// The relayed agents' sockets (`agent-*.sock`: [`link_agent_socket`],
+/// [`route_agent_socket`]) in
 /// `dir`, newest mtime first,
 /// unchecked: whoever uses one tries it (`bridge::host_agent`). Nothing
 /// when `dir` is missing or unreadable.

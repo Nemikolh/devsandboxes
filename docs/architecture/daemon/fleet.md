@@ -37,8 +37,8 @@ link. K's `fleet-link --peer` announces L to K's daemon as an inbound
 neighbor (`links.inbound`), so L is a machine on K, of kind `inbound`:
 its rows, quick calls, verbs, terminals, forwards and placement reach
 it over the link L holds. L's agent reaches K's instances while L
-grants K agent (`member.toml`'s `[[agent]]`, [AGENT](#agent)); K's
-agent never reaches L over this link.
+grants K agent (`member.toml`'s `[[agent]]`, [AGENT](#agent)), and K's
+reaches L's only while K grants L agent.
 
 The add is also the join (`machines::join::plan`, run by `machines.add`
 over this host's `member.toml` and the target's `member.get` and
@@ -276,7 +276,10 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `Shared::open_lent`, `Shared::serve_channel`, `link_attach`, `Handoff`,
 `agent_for`), `src/serve/fleet/grants.rs` (`granted`, `granted_names`,
 `grant`, `withdraw`), `src/serve/fleet/agent.rs` (`SERVING`, `NOT_SERVING`,
-`Status`, `status_of`, `Action`, `decide`, `serve`, `PROBE`, `answer`),
+`Status`, `status_of`, `Action`, `decide`, `Opener`, `ToMember`, `serve`,
+`PROBE`, `answer`), `src/serve/fleet/agent_routes.rs` (`wanted`,
+`AgentRoutes`, `Io`), `Options::agent_probe` and
+`Shared::agent_routed_members` in `src/serve/daemon.rs`,
 `src/serve/fleet/pty.rs` (`METHOD`, `code`, `Header`, `parse_header`,
 `gate`, `attach_params`, `serve`), `src/serve/fleet/tunnel.rs`
 (`read_request`, `scoped`, `confine`, `check_service`, `serve`),
@@ -381,9 +384,9 @@ a connection's first byte names its channel (`link::connect` writes it;
 the end reads it off its accept loop, `link::read_channel`, within
 `CHANNEL_WAIT`, 10 s, and drops a connection that names none or one the
 peer doesn't serve), the rest is that channel's stream. Each end
-serves `API`, `TRANSFER`, `PTY` ([PTY](#pty)) and `TUNNEL`
-([TUNNEL](#tunnel)) with its daemon; the dialer also serves `AGENT`
-([AGENT](#agent)), which the dialed end opens. Each `API` connection to
+serves `API`, `TRANSFER`, `PTY` ([PTY](#pty)), `TUNNEL`
+([TUNNEL](#tunnel)) and `AGENT` ([AGENT](#agent), answered by its
+host's agent grant) with its daemon. Each `API` connection to
 an end's socket is one connection to the far host's daemon, so a
 `client::Conn` on one host says its hello to, and calls, the daemon on
 the other.
@@ -439,8 +442,8 @@ dial is a process of its own).
   ([no sentinel inside a stream](#link)). Every
   stream is therefore served by K's daemon under K's trust table for L,
   with L's fleet root `fleet/L/` (`Shared::serve_channel`); a refused
-  attach closes the stream, with why on stderr. `AGENT` isn't served: it
-  opens only member → dialer (decision 18). Per-stream connects reach
+  attach closes the stream, with why on stderr. An `AGENT` stream is
+  answered by K's grant for L's key (decision 67). Per-stream connects reach
   whichever daemon is up, a successor after a version handoff included.
 - **OUT.** K binds `fleet-L.sock` (`endpoint::fleet_socket`): each
   accepted connection is a stream to L on the channel it names, which
@@ -599,9 +602,10 @@ there, the error names both sockets.
 - **The agent**: with `machine set <name> --agent on` this host grants
   its agent to that member's key ([AGENT](#agent),
   [machines](machines.md#agent)), for a machine of any kind; it reaches
-  every instance on a machine this host dials as `AGENT` streams. On an
-  inbound or routed machine the grant is recorded and in this host's
-  link report, and no `AGENT` stream carries it there.
+  every instance on the machine as `AGENT` streams: over the link to a
+  machine this host dials or that dials it, or routed to a routed one,
+  the machine binding its socket while it finds the grant in this host's
+  link report.
 - **The CLI's other commands on a machine** are API calls with `machine`
   (fleet plan decision 15), within the machine's trust: `logs`
   (`containers.logs`), `logs --build` (`instances.buildLog`; `--follow`,
@@ -1639,8 +1643,8 @@ destination serves it under its trust for the origin, never for a
 relay, and relays carry its ciphertext whatever their own trust. Members reached only this way are
 [routed machines](machines.md#routed-machines): calls, verbs,
 terminals, forwards, placement and the `fleet.*` calls
-(`leave::call`, `service::Handle::call_member`) reach them, `AGENT`
-doesn't (decision 58).
+(`leave::call`, `service::Handle::call_member`) reach them, and `AGENT`
+behind the destination's grant (decision 58, [AGENT](#agent)).
 
 #### Link graph
 
@@ -1741,8 +1745,9 @@ origin reads which hop refused and why.
   destination) and a TTL, each field length-prefixed. `Header::new` sets
   the TTL to `graph::MAX_HOPS` (4). Every hop that reads it
   (`route::read_header`) checks it (`Header::check`): the channel is
-  `API`, `PTY`, `TUNNEL` or `TRANSFER` (`AGENT` stays direct-only; a
-  route carries no route), the TTL is 1 to 4, the path is 1 to 4 hops
+  `API`, `PTY`, `TUNNEL`, `TRANSFER` or `AGENT` (answered by the
+  destination's agent grant for the origin's key, never a relay's:
+  [AGENT](#agent); a route carries no route), the TTL is 1 to 4, the path is 1 to 4 hops
   and ends in the destination, every name is a member name, and neither
   the origin nor any hop comes twice (a loop). `route::write_header`
   checks the same before writing.
@@ -2085,9 +2090,9 @@ with nothing read past the line and its write timeout cleared, goes to
 - `agent` → `fleet::agent::answer` with `Options::host_agent`'s agent
   while this host's `member.toml` grants it to the key the peer proved
   (`daemon::agent_for`), else none (`NOT_SERVING`, then the close):
-  decisions 18 and 65 of the
-  [plan](../../plans/active/fleet.md#decisions), the dialer's agent
-  gated by the dialer's own grant.
+  decisions 18, 65 and 67 of the
+  [plan](../../plans/active/fleet.md#decisions), this host's agent
+  gated by its own grant, whichever end dialed.
 
 Each runs on a thread of its own, counted in the `clients` holders
 (`Shared::channels`) until it returns. The wait-for-answer rule: the
@@ -2332,58 +2337,88 @@ TCP connection is then a `Connect` on that bridge's mux, inside the
 
 ### AGENT
 
-The dialer's ssh agent on the machine it dials, over the
-[peer link](#peer-links): an ssh machine's `AGENT` semantics
-([machines](machines.md#agent)). While the dialer L grants K agent, by
-K's member key (`member.toml`'s `[[agent]]`, `fleet::grants`: it follows
-the log's rotations of that key and ends with its revocation, decision
-65), every instance on K reaches L's agent, not only placed ones. Streams go dialed end → dialer (`channel::AGENT`,
-flowing), so K needs nothing of L but the link L holds; K's agent never
-reaches L (decision 18).
+A member's ssh agent on another member it grants agent to: an ssh
+machine's `AGENT` semantics ([machines](machines.md#agent)). While L
+grants K agent, by K's member key (`member.toml`'s `[[agent]]`,
+`fleet::grants`: it follows the log's rotations of that key and ends
+with its revocation, decision 65), every instance on K reaches L's
+agent, not only placed ones, whichever end dialed and whatever the path
+between them (decisions 66, 67). Streams go K → L (`channel::AGENT`,
+flowing): K, the instances' host, opens them; L, the granting member,
+answers. Nothing reaches an agent implicitly: L's agent goes where L
+granted it, K's never comes along (decisions 18, 30).
 
 **The status byte.** Every `AGENT` stream starts with one byte from the
-dialer: `agent::SERVING` (1), then the relay to its agent, or
+granting end: `agent::SERVING` (1), then the relay to its agent, or
 `agent::NOT_SERVING` (0), then the close (`agent::status_of`; no byte,
 another one or a wait over 5 s is a failure).
 
-**The dialed end** (`fleet::agent::serve`, on a thread of
-`commands::fleet_link::run_peer`): once the link's `Hello`s are through
-with a dialer that advertised `caps::AGENT`, and the outlet is up, it
-probes the dialer every `agent::PROBE` (2 s): an `AGENT` stream
-(`link::Outlet::open`) whose status byte it reads, then closes. While
-the dialer serves it keeps `agent-link-<dialer>.sock` bound
-(`endpoint::link_agent_socket`), as an opener binds its socket
-(`link::Socket`: a temp name renamed over the path, 0600, the newest
-wins); on `NOT_SERVING` or a failure it unbinds it (`agent::decide`,
-pure: bind when serving and unbound, unbind when bound and anything
-else). Each connection to the socket becomes one `AGENT` stream on a
-thread of its own: past a `SERVING` byte relayed both ways on two
-threads, each direction's end passed on as a half-close; any other
-answer closes the client and unbinds the socket at once. When the link
-ends (the outlet goes down) the socket is unlinked if it is still its
-own. Named `agent-*.sock`, it is one of the relayed agents' sockets
+**The relaying end** (`fleet::agent::serve`, over an `agent::Opener`):
+once its opener is up it probes the granting end every `agent::PROBE`
+(2 s): an `AGENT` stream (`Opener::open`) whose status byte it reads,
+then closes. While that end serves it keeps its socket bound, as an
+opener binds its socket (`link::Socket`: a temp name renamed over the
+path, 0600, the newest wins); on `NOT_SERVING` or a failure it unbinds
+it (`agent::decide`, pure: bind when serving and unbound, unbind when
+bound and anything else). Each connection to the socket becomes one
+`AGENT` stream on a thread of its own: past a `SERVING` byte relayed
+both ways on two threads, each direction's end passed on as a
+half-close; any other answer closes the client and unbinds the socket at
+once. When it stops (its opener goes down, or its owner says it's over)
+the socket is unlinked if it is still its own. Two kinds run on K:
+
+- **`agent-link-<L>.sock`**, when L dials K: a thread of
+  `commands::fleet_link::run_peer`, `fleet-link --peer L`'s own, over its
+  link's outlet (`link::Outlet`), started once the link's `Hello`s are
+  through with a dialer that advertised `caps::AGENT`
+  (`endpoint::link_agent_socket`); it ends with the link.
+- **`agent-route-<L>.sock`**, for any other L
+  (`endpoint::route_agent_socket`): the daemon's `fleet::agent_routes`.
+  For each member whose link report in K's graph lists K among its agent
+  grantees (`graph::Report::agent`, decision 66), still resolving to the
+  key that signed it, and that isn't an inbound neighbor here (one that
+  dials K has the agent-link above), the `serve-agent-routes` thread runs
+  one `serve-agent-route` loop (`agent_routes::wanted`, pure, over the
+  graph, the log and `machines::inbound::Neighbors`). Its opener,
+  `agent::ToMember`, opens each stream with `fleet::route::connect`: K's
+  `fleet-<L>.sock` when K dials L (L's `fleet-link --peer K` serves
+  `AGENT`, handing each stream to L's daemon with `link.attach`), else
+  its `route-<L>.sock`, a [routed stream](#routed-streams) end to end
+  with L. The set is reconciled on every graph change and link change
+  (the poke the route sockets take); a member that drops out has its
+  loop told to stop, and its socket goes as the loop returns. The
+  daemon stops them all, sockets unlinked, before its route sockets and
+  links at shutdown, and sweeps a dead daemon's `agent-route-*.sock` at
+  start. The probe period is `daemon::Options::agent_probe`. A report
+  only says whom to probe: L checks its grant on every stream.
+
+Named `agent-*.sock`, each is one of the relayed agents' sockets
 `bridge::host_agent` tries (`endpoint::agent_sockets`, newest first,
 each probed with a connect), so K's bridges reach L's agent as they
 reach a machine's relayed one, and only while it leads somewhere: with
-no grant for K on L, or the link gone, there is no socket to pick, and K's
-own agent is the fallback. A verb a `Peer` connection runs gets that
-socket as `SSH_AUTH_SOCK` while it answers (`Peer::agent`,
-[the trust table](#the-trust-table)).
+no grant for K on L, or no way to L, there is no socket to pick, and K's
+own agent is the fallback. A verb a `Peer` connection runs gets
+`agent-link-<peer>.sock` as `SSH_AUTH_SOCK` while it answers
+(`Peer::agent`, [the trust table](#the-trust-table)).
 
-**The dialer's end**: its table serves `AGENT` (so `caps::AGENT` is
-always advertised); each stream goes to `Shared::serve_channel`
-(`dialer::Open`), which answers it with `fleet::agent::answer` on a
-thread of its own. `answer` writes `NOT_SERVING` without an agent path;
-else `SERVING`, and once the far end's first bytes come (a probe sends
-none and closes, so it never dials the agent) a connection to that
+**The granting end**: every link end serves `AGENT` (the dialer's table
+and `fleet-link --peer`'s, so `caps::AGENT` is always advertised), and a
+routed stream carries it ([routed streams](#routed-streams)); each
+stream goes to `Shared::serve_channel` (`dialer::Open`, `link.attach`,
+`Shared::serve_route`), which answers it with `fleet::agent::answer` on
+a thread of its own. `answer` writes `NOT_SERVING` without an agent
+path; else `SERVING`, and once the far end's first bytes come (a probe
+sends none and closes, so it never dials the agent) a connection to that
 path, spliced. The path is `daemon::agent_for`, read per stream: the
 daemon's own `bridge::host_agent` (the agents clients reported
 included; `daemon::Options::host_agent` in tests) while this host's
-`member.toml` grants the peer's name the key the peer proved on the link
-(`lent::Peer::key`; `fleet::grants::granted` against the membership log
-beside it), else none: no proven key, no log or no grant is none. So
-`machine set <K> --agent on|off` binds or unbinds K's socket within
-about `PROBE`, on the live link.
+`member.toml` grants the peer's name the key the peer proved
+(`lent::Peer::key`: on a link, the link's proof; on a routed stream, its
+origin's, never a relay's; `fleet::grants::granted` against the
+membership log beside it), else none: no proven key, no log or no grant
+is none. So `machine set <K> --agent on|off` binds or unbinds K's socket
+within about `PROBE`, on the live link or route. `AGENT` streams aren't
+logged one by one at either end (they are mostly probes).
 
 ### Worker policy
 

@@ -161,6 +161,10 @@ pub struct Options {
     /// The agent a machine's `AGENT` streams reach while this host grants
     /// it agent ([`agent_for`]); `None` is `bridge::host_agent`. Tests inject one.
     pub host_agent: Option<HostAgent>,
+    /// How often an `agent-route-<member>.sock`'s loop asks its member
+    /// whether it serves `AGENT` (`fleet::agent_routes`); `agent::PROBE`
+    /// outside tests.
+    pub agent_probe: Duration,
     /// The argv a peer's `PTY` stream runs for a piped or tty exec; `None`
     /// is the runtime's `exec` (`fleet::pty::runtime_exec`). Tests run `sh`.
     pub pty_exec: Option<fleet::pty::ExecCommand>,
@@ -196,6 +200,7 @@ impl Options {
             local_capacity: None,
             repos: None,
             host_agent: None,
+            agent_probe: fleet::agent::PROBE,
             pty_exec: None,
         }
     }
@@ -427,16 +432,32 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // `member.toml`, as the graph.
     let routes = shared.member.is_some().then(|| {
         let (wanting, accepting) = (Arc::clone(&shared), Arc::clone(&shared));
-        let routes = fleet::routes::Routes::spawn(fleet::routes::Io {
+        fleet::routes::Routes::spawn(fleet::routes::Io {
             dir: dir.to_path_buf(),
             wanted: Box::new(move || wanting.routed_members()),
             accept: Box::new(move |name, conn| accepting.accept_routed(name, conn)),
             log,
-        });
-        let poke = routes.poke();
-        shared.graph.on_change(Box::new(move || poke.poke()));
-        routes
+        })
     });
+    // An `agent-route-<member>.sock` per member whose report grants this
+    // host agent and that doesn't dial it (fleet plan decision 66),
+    // following the graph and the links as the route sockets do.
+    let agent_routes = shared.member.is_some().then(|| {
+        let wanting = Arc::clone(&shared);
+        fleet::agent_routes::AgentRoutes::spawn(fleet::agent_routes::Io {
+            dir: dir.to_path_buf(),
+            wanted: Box::new(move || wanting.agent_routed_members()),
+            every: opts.agent_probe,
+            log,
+        })
+    });
+    if let (Some(routes), Some(agents)) = (&routes, &agent_routes) {
+        let (routes, agents) = (routes.poke(), agents.poke());
+        shared.graph.on_change(Box::new(move || {
+            routes.poke();
+            agents.poke();
+        }));
+    }
     let _ = shared.runner.set(match &opts.verbs {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
@@ -535,6 +556,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     shared.drain(DRAIN_TIMEOUT);
     drop(watcher);
+    // Its streams go over the route sockets and the links: stopped first.
+    drop(agent_routes);
     // Its streams go over the links: stopped before them.
     drop(routes);
     // Its calls go over the links: stopped before them.
@@ -1016,7 +1039,8 @@ impl Shared {
     /// - `agent`: `fleet::agent::answer` with this host's agent while
     ///   `member.toml` grants it to the key the peer proved
     ///   ([`agent_for`]), else with none (its `NOT_SERVING` byte, then the
-    ///   close).
+    ///   close). For a routed stream the peer is its origin, with the key
+    ///   its opening proved: never the relay that carried it.
     /// - `route`: [`serve_route`](Self::serve_route), on a thread of its
     ///   own: relayed, or served as its origin's stream when it's for this
     ///   host.
@@ -1109,7 +1133,10 @@ impl Shared {
         };
         match peer.map(|p| self.serve_channel(routed.channel, &Arc::new(p), theirs)) {
             Ok(true) => {
-                log(&format!("fleet: a routed {channel} stream from {origin} (via {})", from.name));
+                // `AGENT` streams are mostly probes, one every `agent::PROBE`.
+                if routed.channel != lent::Channel::Agent {
+                    log(&format!("fleet: a routed {channel} stream from {origin} (via {})", from.name));
+                }
                 if let Err(e) = fleet::session::pump(plain, stream, keys) {
                     log(&format!("fleet: a routed {channel} stream from {origin}: {e:#}"));
                 }
@@ -1150,6 +1177,16 @@ impl Shared {
             Some((stored, me)) => fleet::routes::wanted(&self.graph.graph(), &stored, &me, |n| self.link_up(n)),
             None => Default::default(),
         }
+    }
+
+    /// The members this host binds an `agent-route-<name>.sock` for
+    /// (`fleet::agent_routes::wanted`): those whose report grants it agent,
+    /// but its inbound neighbors (their `fleet-link --peer` here binds
+    /// `agent-link-<name>.sock`). None outside a fleet's log.
+    fn agent_routed_members(&self) -> BTreeSet<String> {
+        let Some((stored, me)) = self.fleet_log() else { return BTreeSet::new() };
+        let inbound = self.machines.as_ref().map(|m| &m.inbound);
+        fleet::agent_routes::wanted(&self.graph.graph(), &stored, &me, |n| inbound.is_some_and(|i| i.contains(n)))
     }
 
     /// This host's membership log (one with a genesis) and its member name.
@@ -1221,7 +1258,10 @@ impl Shared {
                 }
             }
             Err(why) => {
-                log(&format!("fleet: a routed stream to {dest}: {why}"));
+                // `AGENT` streams are mostly probes (`fleet::agent_routes`).
+                if byte != crate::devsbd::proto::channel::AGENT {
+                    log(&format!("fleet: a routed stream to {dest}: {why}"));
+                }
                 if byte == crate::devsbd::proto::channel::API {
                     fleet::routes::refuse_api(&client, &why);
                 }
@@ -2251,7 +2291,10 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
         }
         channel => conn.handoff = Some((channel, peer)),
     }
-    log(&format!("{}: {} stream from {name}, trust {trust_name}", conn.label(), channel.as_str()));
+    // `AGENT` streams are mostly probes, one every `agent::PROBE`.
+    if channel != lent::Channel::Agent {
+        log(&format!("{}: {} stream from {name}, trust {trust_name}", conn.label(), channel.as_str()));
+    }
     Response::ok(id, json!({ "ok": true, "trust": trust }))
 }
 
@@ -2863,6 +2906,8 @@ pub(crate) mod tests {
             repos: Some(std::env::temp_dir().join(format!("dsv-repos-{}", std::process::id()))),
             // Never the user's agent.
             host_agent: Some(Arc::new(|| None)),
+            // Short, but each probe of a routed member is a routed opening.
+            agent_probe: Duration::from_millis(200),
             pty_exec: None,
         }
     }

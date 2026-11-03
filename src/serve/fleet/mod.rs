@@ -49,8 +49,10 @@
 //! - `tunnel`: the serving end of a `TUNNEL` stream: one port forward's
 //!   bridge into an instance here (the asking end is
 //!   `commands::tunnel::remote_opener`).
-//! - `agent`: `AGENT` on the link: the dialed end's agent socket, each
-//!   connection one stream to the dialer's agent.
+//! - `agent`: `AGENT`: a relaying end's agent socket, bound while the
+//!   granting member serves, each connection one stream to its agent;
+//!   `agent_routes`: the daemon's `agent-route-<member>.sock` per member
+//!   whose report grants this host agent and that doesn't dial it.
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a member
@@ -65,6 +67,7 @@
 //!   the request forwarded to the machine.
 
 pub mod agent;
+pub mod agent_routes;
 pub mod code;
 pub mod dialer;
 pub mod follow;

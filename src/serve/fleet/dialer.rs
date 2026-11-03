@@ -730,6 +730,7 @@ pub(crate) mod tests {
         let mut got = [0u8; 4];
         c.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"pong");
+        assert_eq!(endpoint::agent_sockets(&pair.k_dir), [socket.clone()], "no agent-route-lap.sock: lap dials K");
         set(false);
         wait_for("K unbinds it", Duration::from_secs(10), || !socket.exists());
         assert_eq!((pair.dialed.count.load(Ordering::SeqCst), connected(&pair.box_row())), (1, true), "the same link");
@@ -1599,25 +1600,144 @@ pub(crate) mod tests {
         trio.finish();
     }
 
-    /// A relay refuses, naming itself: a next hop with no link to it (`m`
-    /// has no daemon), and `AGENT` (decision 58).
+    /// A relay refuses, naming itself, a next hop with no link to it (`m`
+    /// has no daemon); a routed `AGENT` stream isn't refused as a channel
+    /// (decision 58): B, granting nobody, answers it `NOT_SERVING`.
     #[test]
-    fn a_relay_refuses_a_hop_that_isnt_up_and_agent_streams() {
+    fn a_relay_refuses_a_hop_that_isnt_up_not_agent_streams() {
         let trio = Trio::new("route-refused", false);
         let header = route::Header::new("lap", Channel::Api, path(&["box", "m"]));
         let e = format!("{:#}", open_routed(&trio.a_dir, &trio.a_member, &header).unwrap_err());
         assert_eq!(e, "the routed stream with `m` is refused: `box`: the routed stream from `lap` to `m`: `m` has no link to this host");
-        // `AGENT` isn't even written by the origin…
         let agent = route::Header::new("lap", Channel::Agent, path(&["box", "b"]));
-        assert!(format!("{:#}", open_routed(&trio.a_dir, &trio.a_member, &agent).unwrap_err()).contains("`agent` isn't routed"));
-        // …and sent anyway, the relay refuses it.
-        let stream = link::connect(&endpoint::fleet_socket(&trio.a_dir, "box"), channel::ROUTE).unwrap();
-        proof::write_raw(&mut &stream, proof::MESSAGE, &route::encode_unchecked(&agent)).unwrap();
-        let a_key = test_support::key_of(&trio.a_member);
-        let a_log = test_support::read(&trio.a_member).unwrap();
-        let e = format!("{:#}", route::origin_side(&mut &stream, &mut &stream, &agent, &a_key, &a_log).err().expect("refused"));
-        assert!(e.contains("is refused: `box`: the routed stream from `lap` to `b`: `agent` isn't routed"), "{e}");
+        let stream = open_routed(&trio.a_dir, &trio.a_member, &agent).unwrap();
+        assert_eq!(status_byte(&stream), Some(crate::serve::fleet::agent::NOT_SERVING));
         trio.finish();
+    }
+
+    /// The first byte on `stream` (an `AGENT` stream's status), `None` at
+    /// its end or after 10 s.
+    fn status_byte(stream: &UnixStream) -> Option<u8> {
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut b = [0u8; 1];
+        (&mut &*stream).read_exact(&mut b).ok().map(|()| b[0])
+    }
+
+    /// A fake host agent at `dir/agent.sock`: answers `pong` to each
+    /// connection's `ping`.
+    fn ping_agent(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            for mut c in listener.incoming().flatten() {
+                let mut ping = [0u8; 4];
+                if c.read_exact(&mut ping).is_ok() {
+                    let _ = c.write_all(b"pong");
+                }
+            }
+        });
+        path
+    }
+
+    /// `ping` to the agent socket at `socket`: its answer.
+    fn ping(socket: &Path) -> [u8; 4] {
+        let mut c = UnixStream::connect(socket).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(b"ping").unwrap();
+        let mut got = [0u8; 4];
+        c.read_exact(&mut got).unwrap();
+        got
+    }
+
+    /// Whether `dir`'s daemon holds `member`'s report granting agent to
+    /// exactly `grantees`.
+    fn grants_in_graph(dir: &Path, member: &str, grantees: &[&str]) -> bool {
+        let g = connect(dir).call("graph.get", json!({})).unwrap().result.unwrap();
+        g["reports"].as_array().unwrap().iter().any(|r| r["report"]["member"] == member && r["report"]["agent"] == json!(grantees))
+    }
+
+    /// `lap` grants `b`, which it has no link to, agent (decision 66): B
+    /// sees it in lap's report (through the hub), binds
+    /// `agent-route-lap.sock`, and a client there reaches lap's agent over
+    /// a routed `AGENT` stream through K; K, not granted, binds nothing.
+    /// Withdrawn, B's socket goes.
+    #[test]
+    fn a_routed_member_reaches_the_agent_of_a_member_granting_it() {
+        let base = scratch("route-agent-fake");
+        let agent = ping_agent(&base);
+        let trio = Trio::build("route-agent", false, Some("box"), |a, _, _| {
+            a.host_agent = Some(Arc::new(move || Some(agent.clone())));
+        });
+        let socket = endpoint::route_agent_socket(&trio.b_dir, "lap");
+        let set = |on: bool| {
+            let r = connect(&trio.a_dir).call("machines.set", json!({"name": "b", "agent": on})).unwrap();
+            assert!(r.error.is_none(), "{r:?}");
+        };
+        set(true);
+        wait_for("B binds agent-route-lap.sock", Duration::from_secs(15), || socket.exists());
+        assert_eq!(&ping(&socket), b"pong", "lap's agent, through K");
+        assert_eq!(endpoint::agent_sockets(&trio.b_dir), [socket.clone()]);
+        assert!(!endpoint::route_agent_socket(&trio.k_dir, "lap").exists() && !endpoint::link_agent_socket(&trio.k_dir, "lap").exists());
+        set(false);
+        wait_for("B unbinds it", Duration::from_secs(15), || !socket.exists());
+        trio.finish();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `lap` grants `box` (K, the relay between it and B) but not `b`: K
+    /// has its agent-link from lap's dialing, B binds nothing, and a routed
+    /// `AGENT` stream from B to lap is answered `NOT_SERVING`: the grant is
+    /// checked for the origin's key, never the relay's.
+    #[test]
+    fn a_relays_agent_grant_does_not_reach_past_it() {
+        let base = scratch("route-agent-relay-fake");
+        let agent = ping_agent(&base);
+        let trio = Trio::build("route-agent-relay", false, Some("box"), |a, _, _| {
+            a.host_agent = Some(Arc::new(move || Some(agent.clone())));
+        });
+        let r = connect(&trio.a_dir).call("machines.set", json!({"name": "box", "agent": true})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let k_agent = endpoint::link_agent_socket(&trio.k_dir, "lap");
+        wait_for("K binds agent-link-lap.sock", Duration::from_secs(15), || k_agent.exists());
+        assert_eq!(&ping(&k_agent), b"pong");
+        wait_for("B holds lap's report granting box", Duration::from_secs(15), || grants_in_graph(&trio.b_dir, "lap", &["box"]));
+        let header = route::Header::new("b", Channel::Agent, path(&["box", "lap"]));
+        let stream = open_routed(&trio.b_dir, &trio.b_member, &header).unwrap();
+        assert_eq!(status_byte(&stream), Some(crate::serve::fleet::agent::NOT_SERVING));
+        assert!(!endpoint::route_agent_socket(&trio.b_dir, "lap").exists(), "lap's report doesn't list b");
+        assert!(!endpoint::route_agent_socket(&trio.k_dir, "lap").exists(), "covered by K's agent-link");
+        trio.finish();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// K (`box`) grants `lap`, its inbound neighbor, agent: L, the dialer,
+    /// binds `agent-route-box.sock` over its own link socket (no route:
+    /// K's `fleet-link --peer lap` serves `AGENT`), and a client there
+    /// reaches K's agent. K binds no socket for lap.
+    #[test]
+    fn the_dialer_reaches_the_agent_of_the_machine_it_dialed_when_granted() {
+        let base = scratch("dial-agent-inbound-fake");
+        let agent = ping_agent(&base);
+        let pair = Pair::with(
+            "dial-agent-inbound",
+            Vec::new(),
+            |k| k.host_agent = Some(Arc::new(move || Some(agent.clone()))),
+            |_| {},
+        );
+        pair.wait_box("box connected", connected);
+        let r = connect(&pair.k_dir).call("machines.set", json!({"name": "lap", "agent": true})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let socket = endpoint::route_agent_socket(&pair.l_dir, "box");
+        wait_for("L binds agent-route-box.sock", Duration::from_secs(15), || socket.exists());
+        assert!(!endpoint::route_socket(&pair.l_dir, "box").exists(), "box is linked: no route");
+        assert_eq!(&ping(&socket), b"pong", "K's agent, over L's link");
+        assert!(endpoint::agent_sockets(&pair.k_dir).is_empty(), "K binds none: lap grants it nothing");
+        let r = connect(&pair.k_dir).call("machines.set", json!({"name": "lap", "agent": false})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        wait_for("L unbinds it", Duration::from_secs(15), || !socket.exists());
+        pair.finish();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A reaches B, which it has no link to, through `route-b.sock`: its

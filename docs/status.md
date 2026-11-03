@@ -264,14 +264,15 @@ limitation means editing this file in the same commit.
   {agent}`): a daemon that hands over while the ssh session runs leaves
   the machine's `AGENT` streams to the successor's own agent (or the next
   client's report). → [machines](architecture/daemon/machines.md#agent); `machines::cli::info_params`
-- Every agent check on a machine whose linking host serves `AGENT`
-  (`host_agent`'s liveness connect on `agent-link-<host>.sock`: each
-  `Bridges::reconcile` of its daemon's poll) opens and closes a stream
-  over the link to that host's agent. → [machines](architecture/daemon/machines.md#agent);
+- Every agent check on a machine a granting host serves `AGENT` to
+  (`host_agent`'s liveness connect on `agent-link-<host>.sock` or
+  `agent-route-<host>.sock`: each `Bridges::reconcile` of its daemon's
+  poll) opens and closes a stream to that host's agent, a routed one's
+  opening included. → [machines](architecture/daemon/machines.md#agent);
   `bridge::agent_live`
-- Several hosts linking one machine and granting it agent each get an
-  `agent-link-<host>.sock` there; processes there use the newest live
-  socket (mtime), not their caller's.
+- Several hosts granting one machine agent each get an
+  `agent-link-<host>.sock` or `agent-route-<host>.sock` there; processes
+  there use the newest live socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
 - An introduction the machine signs for this host (this host joining a
   non-authority member's fleet with `machine add`, `membership.sign`
@@ -328,12 +329,18 @@ limitation means editing this file in the same commit.
   dropped by a sync once it's no routed machine (no path in the graph,
   not in the hub's view).
   → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`, `snapshots::merge`
-- `AGENT` isn't routed: a grant for a routed machine (`machines.set
-  {agent}`, the dashboard's toggle) is recorded and in this host's link
-  report, but no routed `AGENT` stream carries it yet (fleet step
-  10c.4); an inbound machine's grant likewise reaches no stream (its
-  link's `AGENT` streams go the other way).
-  → [machines](architecture/daemon/machines.md#agent); `route::Header::check`, `fleet::agent::serve`
+- A grant for an inbound or routed machine takes effect there once this
+  host's link report reaches it (pushed by the hub or flooded by the
+  links), then within a probe; while the report lists it, that machine
+  probes this host every 2 s, a routed probe being a full routed
+  opening, even while this host has no agent to serve.
+  → [fleet](architecture/daemon/fleet.md#agent); `fleet::agent_routes`, `fleet::agent::PROBE`
+- A verb this host forwards to a machine that reaches its agent through
+  `agent-route-<host>.sock` (an inbound or routed machine) doesn't run
+  with that socket as `SSH_AUTH_SOCK` (`Peer::agent` is only a dialed
+  end's `agent-link-<peer>.sock`), so host git there doesn't use this
+  host's agent; the machine's instances do (`bridge::host_agent`).
+  → [fleet](architecture/daemon/fleet.md#the-trust-table); `daemon::Shared::fleet_peer`
 - Remote rows live in memory except on a hub (which reloads them from
   `remotes.json`): a fresh non-hub daemon shows a machine without rows
   until its link connects (machines seen via the hub too, until it

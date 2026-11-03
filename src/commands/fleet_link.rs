@@ -5,13 +5,13 @@
 //! `update::hello_of` (its build, whether this host is the hub, and its
 //! fleet's hub, as `member.toml` says when it starts); a dialer naming
 //! another hub is refused (`update::same_fleet`). IN:
-//! each stream the dialer opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
-//! `ROUTE` (a routed stream to relay or answer, `fleet::route`) is
-//! handed to this host's daemon as a connection whose first line is
-//! `link.attach {peer: <dialer>, channel, key, introduced_by}`
+//! each stream the dialer opens on `API`, `PTY`, `TUNNEL`, `TRANSFER`,
+//! `AGENT` (answered by this host's agent grant for the key the dialer
+//! proved, `fleet::agent`) or `ROUTE` (a routed stream to relay or answer,
+//! `fleet::route`) is handed to this host's daemon as a connection whose
+//! first line is `link.attach {peer: <dialer>, channel, key, introduced_by}`
 //! ([`attach_stream`]: the key and introducer the dialer proved), so this
-//! host's trust table for the dialer applies to every one. `AGENT` isn't
-//! served: it only opens member → dialer. Right after the `Hello`s both
+//! host's trust table for the dialer applies to every one. Right after the `Hello`s both
 //! ends prove their member keys (`fleet::proof`; this host's identity read
 //! once, at the start: no key or log, no link): the dialer must prove the
 //! key `<dialer>` has in the membership log (or a held introduction), and
@@ -190,6 +190,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         .with(channel::API, attached(Channel::Api))
         .with(channel::PTY, attached(Channel::Pty))
         .with(channel::TUNNEL, attached(Channel::Tunnel))
+        .with(channel::AGENT, attached(Channel::Agent))
         .with(channel::ROUTE, attached(Channel::Route))
         .with(channel::TRANSFER, transfers);
     let outlet = Arc::new(link::Outlet::default());
@@ -256,7 +257,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
             agent_thread = std::thread::Builder::new()
                 .name("fleet-link-agent".into())
                 .spawn(move || {
-                    if let Err(e) = agent::serve(&path, &outlet, &over, agent::PROBE) {
+                    if let Err(e) = agent::serve(&path, &*outlet, &over, agent::PROBE) {
                         eprintln!("fleet-link: {e:#}");
                     }
                 })

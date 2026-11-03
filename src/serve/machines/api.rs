@@ -527,13 +527,16 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
     };
     let stored = ctx.member.as_deref().and_then(|m| membership_api::load(m).ok().flatten());
     let agent = granted_here(ctx, stored.as_ref()).contains(&p.name);
+    if routed.is_none() && entry.is_none() {
+        return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
+    }
+    if let Some(caller) = p.agent {
+        crate::devsbd::bridge::report_agent(caller);
+    }
     if let Some(r) = routed {
         return to_value(MachineInfo { name: r.name, kind: MachineKind::Routed, target: None, command: None, roots: r.roots, agent });
     }
     let entry = entry.ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
-    if let Some(agent) = p.agent {
-        crate::devsbd::bridge::report_agent(agent);
-    }
     let (kind, target) = entry.kind.wire();
     to_value(MachineInfo {
         name: entry.name,

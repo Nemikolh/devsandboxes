@@ -107,9 +107,10 @@ registry's entries, `machines.get` answers them: no `target` or
 `command`, `agent` this host's grant for it ([Agent](#agent)), `state`,
 `error`, `version` and `capacity` its held link's. `machines.set
 {agent}` records a grant for it by its key like any machine's (fleet
-plan decision 67); its `AGENT` streams come from the dialed end's probe,
-and on its link this host is the dialed end, so no stream carries this
-host's agent there. `machines.unlink` refuses it (it goes
+plan decision 67); on its link this host is the dialed end, so the
+neighbor's daemon probes this host over its own `fleet-<this host>.sock`
+and binds `agent-route-<this host>.sock` while it finds the grant in
+this host's link report ([Agent](#agent)). `machines.unlink` refuses it (it goes
 with its link: `devsandbox machine unlink <this host>` run on it).
 `machines.rm` takes it out of the fleet like any machine
 ([fleet.md](fleet.md), *How a machine leaves*): there, or once its `fleet.leave`
@@ -156,8 +157,8 @@ is built for an inbound machine. Plain ssh, no ControlMaster of its own:
 `~/.ssh/config` decides. The remote command runs through the login shell
 (`exec "$SHELL" -lc '…'`, each arg quoted for it), so the remote `PATH` is
 the user's. No argv passes `-A`: this host's ssh-agent reaches a machine
-only over its link's `AGENT` streams ([Agent](#agent)), only while this
-host grants it.
+only over `AGENT` streams ([Agent](#agent)), only while this host grants
+it.
 
 `Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
 ssh's stderr for `spawn`'s `Peer`.
@@ -371,9 +372,8 @@ of machine's on `route::connect`). Its daemon serves them under its trust for th
 ([fleet](fleet.md#routed-streams), *The destination*). `machines.set
 {agent}` and the dashboard's agent toggle record and withdraw a grant
 for it by its key in this host's membership log, as for any machine
-([Agent](#agent)); the grant is in this host's link report, but the
-routed `AGENT` streams that would carry it are refused
-(`route::Header::check`).
+([Agent](#agent)); the grant is in this host's link report, and the
+machine's routed `AGENT` streams carry this host's agent there.
 
 ## Forwarded requests
 
@@ -418,8 +418,8 @@ has it stripped and goes to that machine, but for the ones served here:
 - **`machines.get {name, agent?}`** takes the caller's absolute
   `SSH_AUTH_SOCK` as `agent` and reports it like a verb's: the CLI's
   re-runs pass it ([The CLI](#the-cli-clirs)). A routed machine answers
-  kind `routed`, no `target`, its view roots (the agent isn't reported:
-  no `AGENT` stream reaches a routed machine); the CLI takes it like an inbound one
+  kind `routed`, no `target`, its view roots (the agent reported as for
+  any machine); the CLI takes it like an inbound one
   (`Kind::from_wire`: no ssh target, reached over the sockets). A tab's
   `--reserve-255` resolve takes `denied` as final, not as an outage
   (`cli::resolve_lost`).
@@ -459,20 +459,30 @@ name: its own rows and entry never go back to it. `publish_snapshot` and
 
 ## Agent
 
-This host's ssh-agent reaches a machine over the machine's link, as
-`AGENT` streams the machine opens (fleet plan decisions 14 and 18; no
-ssh of its own, no `-A`). The machine's `fleet-link --peer <this host>`
-probes this host every `fleet::agent::PROBE` (2 s) and binds
-`agent-link-<this host>.sock` (`endpoint::link_agent_socket`) in its
-socket dir only while this host serves ([fleet](fleet.md#agent)); each
-connection there becomes one `AGENT` stream. This daemon answers each
-stream (`daemon::agent_for`, `fleet::agent::answer`) with its agent
-(`bridge::host_agent`: the agents clients reported first) while
-`member.toml` grants it to the key the machine proved on the link
-(`fleet::grants::granted`), read per stream, else with `NOT_SERVING` and
-the close. So withdrawing the grant refuses the next stream at once, and
-the machine unbinds its socket at its next probe; the link stays up
-either way.
+This host's ssh-agent reaches a machine of any kind as `AGENT` streams
+the machine opens (fleet plan decisions 14, 18, 66 and 67; no ssh of its
+own, no `-A`), probing this host every `fleet::agent::PROBE` (2 s) and
+binding a socket in its socket dir only while this host serves
+([fleet](fleet.md#agent)); each connection there becomes one `AGENT`
+stream:
+
+- a machine this host dials (registered here): its `fleet-link --peer
+  <this host>` binds `agent-link-<this host>.sock`
+  (`endpoint::link_agent_socket`) over the link;
+- an inbound or routed machine: its daemon binds
+  `agent-route-<this host>.sock` (`endpoint::route_agent_socket`,
+  `fleet::agent_routes`), probing only while this host's link report
+  lists it among the grantees, over its link to this host
+  (`fleet-<this host>.sock`, which this host's `fleet-link --peer`
+  serves `AGENT` on) or a routed stream, end to end with this host.
+
+This daemon answers each stream (`daemon::agent_for`,
+`fleet::agent::answer`) with its agent (`bridge::host_agent`: the agents
+clients reported first) while `member.toml` grants it to the key the
+machine proved (on the link, or as the routed stream's origin; never a
+relay's), read per stream, else with `NOT_SERVING` and the close. So
+withdrawing the grant refuses the next stream at once, and the machine
+unbinds its socket at its next probe; the link stays up either way.
 
 On the machine nothing registers the socket: `bridge::host_agent` tries
 the live `agent-*.sock` files in the socket dir (`endpoint::agent_sockets`,
@@ -555,7 +565,8 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   passes this process's `SSH_AUTH_SOCK` (if absolute) as `agent`
   (`info_params`), so while this host grants the machine agent the agent the daemon
   answers the machine's `AGENT` streams with, which the command there
-  finds as `agent-link-<this host>.sock` ([Agent](#agent)), is this
+  finds as `agent-link-<this host>.sock` or `agent-route-<this
+  host>.sock` ([Agent](#agent)), is this
   terminal's. Nothing is held for the run: the link is always up.
 - **API calls** (`cli::calls`): printed by the local command's own render
   fns (`commands::logs::render_logs`, `inspect::render`, `ls::table` /

@@ -1,26 +1,31 @@
-//! `AGENT` on the fleet link (docs/architecture/daemon/fleet.md, *AGENT*):
-//! the dialer's ssh agent reaching every instance on the machine it dialed
-//! while the dialer grants it agent by its member key (`member.toml`'s
-//! `[[agent]]`, `fleet::grants`; decisions 14, 18, 30 and 65 of the fleet
-//! plan), carried on the link instead of an ssh of its own.
+//! `AGENT` in the fleet (docs/architecture/daemon/fleet.md, *AGENT*): a
+//! member's ssh agent reaching every instance on another member while it
+//! grants that member agent by its member key (`member.toml`'s
+//! `[[agent]]`, `fleet::grants`; decisions 14, 18, 30, 65 and 66 of the
+//! fleet plan), carried on a link or a routed stream instead of an ssh of
+//! its own.
 //!
-//! Every `AGENT` stream starts with one status byte from the dialer:
+//! Every `AGENT` stream starts with one status byte from the granting end:
 //! [`SERVING`], then the relay to its agent, or [`NOT_SERVING`], then the
 //! close.
 //!
-//! - The dialed end, [`serve`]: while a link is up, `fleet-link --peer`
-//!   probes the dialer every [`PROBE`] (an `AGENT` stream it reads the
-//!   status byte of and closes) and binds `agent-link-<dialer>.sock`
-//!   (`endpoint::link_agent_socket`, as `link::opener` binds: temp name and
-//!   rename, newest wins, 0600, unlinked while still its own) only while
-//!   the dialer serves ([`decide`]). Each connection there becomes one
-//!   `AGENT` stream to the dialer (`link::Outlet::open`), spliced both ways
-//!   past a `SERVING` byte; any other answer closes the client and
-//!   unbinds. Named `agent-*.sock`, it is one of the relayed agents'
-//!   sockets `bridge::host_agent` tries, and only while it leads somewhere.
-//! - The dialer's end, [`answer`]: the daemon answers each `AGENT` stream
-//!   (`Shared::serve_channel`) with the status byte, then, once the far end
-//!   sends its first bytes, a connection to this host's agent.
+//! - The relaying end, [`serve`] over an [`Opener`]: it probes the
+//!   granting end every [`PROBE`] (an `AGENT` stream it reads the status
+//!   byte of and closes) and binds its socket (as `link::opener` binds:
+//!   temp name and rename, newest wins, 0600, unlinked while still its own)
+//!   only while that end serves ([`decide`]). Each connection there becomes
+//!   one `AGENT` stream ([`Opener::open`]), spliced both ways past a
+//!   `SERVING` byte; any other answer closes the client and unbinds. A
+//!   `fleet-link --peer` binds `agent-link-<dialer>.sock`
+//!   (`endpoint::link_agent_socket`) over its link's [`Outlet`]; the daemon
+//!   binds `agent-route-<member>.sock` (`endpoint::route_agent_socket`,
+//!   `fleet::agent_routes`) for a member reached by name ([`ToMember`]).
+//!   Named `agent-*.sock`, each is one of the relayed agents' sockets
+//!   `bridge::host_agent` tries, and only while it leads somewhere.
+//! - The granting end, [`answer`]: the daemon answers each `AGENT` stream
+//!   (`Shared::serve_channel`, direct or routed) with the status byte, then,
+//!   once the far end sends its first bytes, a connection to this host's
+//!   agent.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -90,13 +95,54 @@ pub fn decide(bound: bool, status: Status) -> Action {
     }
 }
 
-/// The dialed end at `path` for the link `outlet` stands for, until `over`
-/// is set or the outlet goes down: once the outlet is up, a probe every
+/// Where [`serve`]'s `AGENT` streams come from: a link's [`Outlet`] (the
+/// dialed end's, to its dialer), or a member reached by name
+/// ([`ToMember`]: `route::connect`, a link socket or a route socket).
+pub trait Opener {
+    /// A new `AGENT` stream to the granting end.
+    fn open(&self) -> Result<Conn>;
+    /// Whether streams can be opened now: [`serve`] waits for it, and
+    /// returns once it no longer is.
+    fn is_up(&self) -> bool;
+}
+
+impl Opener for Outlet {
+    fn open(&self) -> Result<Conn> {
+        Outlet::open(self, channel::AGENT)
+    }
+
+    fn is_up(&self) -> bool {
+        Outlet::is_up(self)
+    }
+}
+
+/// Member `member` reached from the socket dir `dir` (`route::connect`:
+/// its `fleet-<member>.sock`, else its `route-<member>.sock`): always up,
+/// the caller's `over` flag ends it.
+pub struct ToMember {
+    pub dir: PathBuf,
+    pub member: String,
+}
+
+impl Opener for ToMember {
+    fn open(&self) -> Result<Conn> {
+        let stream = super::route::connect(&self.dir, &self.member, channel::AGENT)?;
+        Ok(stream.into())
+    }
+
+    fn is_up(&self) -> bool {
+        true
+    }
+}
+
+/// The relaying end at `path` for the granting end `opener` reaches, until
+/// `over` is set or the opener goes down: once it is up, a probe every
 /// `every` ([`PROBE`] in production) binds or unbinds the socket
-/// ([`decide`]); a client the dialer turns down unbinds it too. Unbound (the
-/// file unlinked unless a newer one replaced it) when this returns.
-pub fn serve(path: &Path, outlet: &Outlet, over: &AtomicBool, every: Duration) -> Result<()> {
-    while !outlet.is_up() {
+/// ([`decide`]); a client the granting end turns down unbinds it too.
+/// Unbound (the file unlinked unless a newer one replaced it) when this
+/// returns.
+pub fn serve(path: &Path, opener: &impl Opener, over: &AtomicBool, every: Duration) -> Result<()> {
+    while !opener.is_up() {
         if over.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -105,12 +151,12 @@ pub fn serve(path: &Path, outlet: &Outlet, over: &AtomicBool, every: Duration) -
     let refused = Arc::new(AtomicBool::new(false));
     let mut bound: Option<Socket> = None;
     let mut next_probe = Instant::now();
-    while !over.load(Ordering::Relaxed) && outlet.is_up() {
+    while !over.load(Ordering::Relaxed) && opener.is_up() {
         let answer = if refused.swap(false, Ordering::Relaxed) {
             Some(Status::NotServing)
         } else if Instant::now() >= next_probe {
             next_probe = Instant::now() + every;
-            Some(probe(outlet))
+            Some(probe(opener))
         } else {
             None
         };
@@ -128,7 +174,7 @@ pub fn serve(path: &Path, outlet: &Outlet, over: &AtomicBool, every: Duration) -
         };
         match endpoint::accept_any(&[&socket.listener], wait) {
             Ok(Some((_, client))) => {
-                if let Ok(stream) = outlet.open(channel::AGENT) {
+                if let Ok(stream) = opener.open() {
                     relay(client, stream, Arc::clone(&refused));
                 }
             }
@@ -140,8 +186,8 @@ pub fn serve(path: &Path, outlet: &Outlet, over: &AtomicBool, every: Duration) -
 }
 
 /// One probe: an `AGENT` stream's status byte, the stream then closed.
-fn probe(outlet: &Outlet) -> Status {
-    match outlet.open(channel::AGENT) {
+fn probe(opener: &impl Opener) -> Status {
+    match opener.open() {
         Ok(stream) => read_status(&stream, STATUS_WAIT),
         Err(_) => Status::Failed,
     }
@@ -294,7 +340,7 @@ mod tests {
         let over = Arc::new(AtomicBool::new(false));
         let serving = {
             let (path, outlet, over) = (path.clone(), Arc::clone(&outlet), Arc::clone(&over));
-            std::thread::spawn(move || serve(&path, &outlet, &over, Duration::from_millis(30)))
+            std::thread::spawn(move || serve(&path, &*outlet, &over, Duration::from_millis(30)))
         };
         let wait = |want: bool, what: &str| {
             let start = Instant::now();
