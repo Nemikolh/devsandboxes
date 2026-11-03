@@ -269,7 +269,7 @@ limitation means editing this file in the same commit.
   `Bridges::reconcile` of its daemon's poll) opens and closes a stream
   over the link to that host's agent. → [machines](architecture/daemon/machines.md#agent);
   `bridge::agent_live`
-- Several hosts linking one machine with `agent` on each get an
+- Several hosts linking one machine and granting it agent each get an
   `agent-link-<host>.sock` there; processes there use the newest live
   socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
@@ -328,9 +328,12 @@ limitation means editing this file in the same commit.
   dropped by a sync once it's no routed machine (no path in the graph,
   not in the hub's view).
   → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`, `snapshots::merge`
-- `AGENT` isn't routed: a routed machine gets no agent (`machines.set`
-  and the dashboard's toggle refuse it) until per-member agent grants
-  (fleet step 10c). → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed_agent`
+- `AGENT` isn't routed: a grant for a routed machine (`machines.set
+  {agent}`, the dashboard's toggle) is recorded and in this host's link
+  report, but no routed `AGENT` stream carries it yet (fleet step
+  10c.4); an inbound machine's grant likewise reaches no stream (its
+  link's `AGENT` streams go the other way).
+  → [machines](architecture/daemon/machines.md#agent); `route::Header::check`, `fleet::agent::serve`
 - Remote rows live in memory except on a hub (which reloads them from
   `remotes.json`): a fresh non-hub daemon shows a machine without rows
   until its link connects (machines seen via the hub too, until it

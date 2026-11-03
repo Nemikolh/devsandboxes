@@ -211,7 +211,7 @@ pub fn pending_note(machines: &[SnapshotMachine], s: &Snapshot, why: bool) -> Op
 }
 
 /// A machine's name as the header says it: `box (agent)` when this host's
-/// ssh-agent is relayed there (its registry `agent`), else `box`.
+/// ssh-agent is granted to it (`member.toml`'s `[[agent]]`), else `box`.
 fn label(m: &SnapshotMachine) -> String {
     if m.agent { format!("{} (agent)", m.name) } else { m.name.clone() }
 }

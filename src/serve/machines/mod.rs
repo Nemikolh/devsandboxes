@@ -67,10 +67,6 @@ pub struct Entry {
     /// The remote devsandbox as shell text (`~/bin/devsandbox`); `None` is
     /// `devsandbox` on the login shell's `PATH`.
     pub command: Option<String>,
-    /// This host's ssh-agent answers the machine's `AGENT` streams
-    /// (docs/architecture/daemon/machines.md, *Agent*); off by default, and
-    /// only written when on.
-    pub agent: bool,
 }
 
 /// How a machine is reached.
@@ -127,15 +123,15 @@ impl Kind {
 }
 
 impl Entry {
-    /// An ssh machine with no roots yet, `command` and `agent` unset.
+    /// An ssh machine with no roots yet, `command` unset.
     pub fn ssh(name: impl Into<String>, target: impl Into<String>) -> Entry {
-        Entry { name: name.into(), kind: Kind::Ssh { target: target.into() }, roots: Vec::new(), command: None, agent: false }
+        Entry { name: name.into(), kind: Kind::Ssh { target: target.into() }, roots: Vec::new(), command: None }
     }
 
     /// Inbound neighbor `name` as the service holds it: its `roots` as its
     /// daemon listed them (`inbound::Neighbor::roots`).
     pub fn inbound(name: impl Into<String>, roots: Vec<PathBuf>) -> Entry {
-        Entry { name: name.into(), kind: Kind::Inbound, roots, command: None, agent: false }
+        Entry { name: name.into(), kind: Kind::Inbound, roots, command: None }
     }
 
     pub fn command(&self) -> &str {
@@ -168,7 +164,9 @@ impl Entry {
 }
 
 /// [`Entry`] as the file holds it. `offered` is only read, to name an
-/// entry an older build wrote for a fleet worker ([`TryFrom`]).
+/// entry an older build wrote for a fleet worker ([`TryFrom`]). Unknown
+/// keys are ignored (an older build's `agent`: agent grants live in
+/// `member.toml`, `fleet::member::Grant`).
 #[derive(Serialize, Deserialize)]
 struct RawEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,8 +177,6 @@ struct RawEntry {
     roots: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     command: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    agent: bool,
 }
 
 impl TryFrom<RawEntry> for Entry {
@@ -197,7 +193,7 @@ impl TryFrom<RawEntry> for Entry {
             (Some(target), false) => Kind::Ssh { target },
             (None, false) => return Err("no `target`".into()),
         };
-        Ok(Entry { name: String::new(), kind, roots: raw.roots, command: raw.command, agent: raw.agent })
+        Ok(Entry { name: String::new(), kind, roots: raw.roots, command: raw.command })
     }
 }
 
@@ -209,7 +205,7 @@ impl From<Entry> for RawEntry {
             // read back as an entry without a target.
             Kind::Inbound => None,
         };
-        RawEntry { target, offered: false, roots: e.roots, command: e.command, agent: e.agent }
+        RawEntry { target, offered: false, roots: e.roots, command: e.command }
     }
 }
 
@@ -345,14 +341,12 @@ mod tests {
     fn entries_round_trip_sorted_by_name() {
         let entries = vec![
             Entry { command: Some("~/bin/devsandbox".into()), roots: vec!["/a".into(), "/b".into()], ..entry("b-box", "ssh://me@b:2200") },
-            Entry { agent: true, ..entry("a.box", "me@a") },
+            entry("a.box", "me@a"),
         ];
         let text = serialize(&entries).unwrap();
         assert!(text.contains("[machine.\"a.box\"]") && text.contains("[machine.b-box]"), "{text}");
-        // `command` and `agent` only when set; the name is the key, not a field.
+        // `command` only when set; the name is the key, not a field.
         assert_eq!(text.matches("command").count(), 1, "{text}");
-        assert_eq!(text.matches("agent = true").count(), 1, "{text}");
-        assert!(!text.contains("agent = false"), "{text}");
         assert!(!text.contains("name"), "{text}");
         let mut want = entries.clone();
         want.reverse();
@@ -360,6 +354,8 @@ mod tests {
         assert_eq!(parse("").unwrap(), vec![]);
         let minimal = parse("[machine.m]\ntarget = \"m\"\n").unwrap();
         assert_eq!(minimal, vec![Entry::ssh("m", "m")]);
+        // An older build's `agent` is ignored (grants are member.toml's).
+        assert_eq!(parse("[machine.m]\ntarget = \"m\"\nagent = true\n").unwrap(), vec![Entry::ssh("m", "m")]);
         assert!(parse("[machine.\"a/b\"]\ntarget = \"m\"\n").is_err(), "a bad name fails the file");
         assert!(parse("[machine.m]\n").is_err(), "no target");
     }

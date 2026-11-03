@@ -21,7 +21,7 @@ use crate::serve::fleet::graph::{self, Graph, LinkReport, Report};
 use crate::serve::fleet::identity::Statement;
 use crate::serve::fleet::member::{self, Hub};
 use crate::serve::fleet::membership::Stored;
-use crate::serve::fleet::{membership_api, proof};
+use crate::serve::fleet::{grants, membership_api, proof};
 use crate::serve::machines::MachineKind;
 use crate::serve::machines::service::Handle;
 use crate::serve::snapshots::{LinkState, Machine};
@@ -142,15 +142,16 @@ impl Tracker {
     }
 
     /// `member`'s report of the links whose peer `known` (a member of the
-    /// log or a held introduction: no registry entry outside the fleet).
-    pub fn report(&self, member: &str, trust: crate::worker_policy::Trust, always_on: bool, known: impl Fn(&str) -> bool) -> Report {
+    /// log or a held introduction: no registry entry outside the fleet),
+    /// and of `agent`, the members it grants its agent to.
+    pub fn report(&self, member: &str, trust: crate::worker_policy::Trust, always_on: bool, agent: Vec<String>, known: impl Fn(&str) -> bool) -> Report {
         let links = self
             .links
             .iter()
             .filter(|(peer, _)| peer.as_str() != member && known(peer))
             .map(|(peer, t)| LinkReport { peer: peer.clone(), dials: t.dials, state: t.state, since_ms: t.since_ms })
             .collect();
-        Report { member: member.to_string(), trust, always_on, links }
+        Report { member: member.to_string(), trust, always_on, links, agent }
     }
 }
 
@@ -263,7 +264,8 @@ impl Published {
     }
 
     /// This host's report due at once, whatever its links did (its trust
-    /// changed: `member.set`), and the thread woken. Doesn't block.
+    /// changed: `member.set`; an agent grant: `machines.set {agent}`), and
+    /// the thread woken. Doesn't block.
     pub fn republish(&self) {
         self.lock().tracker.now(Instant::now());
         self.cv.notify_all();
@@ -363,8 +365,8 @@ pub fn graph_call(params: Value, from: &str, published: &Published, stored: &Sto
 
 /// What the thread reads and calls through.
 pub struct Io {
-    /// `member.toml`: its `trust`, and beside it `membership.json` and
-    /// `member.key`.
+    /// `member.toml`: its `trust` and agent grants, and beside it
+    /// `membership.json` and `member.key`.
     pub member: PathBuf,
     pub hostname: String,
     pub links: Handle,
@@ -479,9 +481,10 @@ fn run(p: &Published, io: &Io) {
 /// linked peer too ([`Flood`]).
 fn publish_own(p: &Published, io: &Io, own: &Own, hub: &Hub) {
     let Some(genesis) = own.stored.log.membership().map(|m| m.genesis) else { return };
-    let trust = member::load(&io.member).ok().flatten().map(|m| m.trust).unwrap_or_default();
+    let file = member::load(&io.member).ok().flatten().unwrap_or_default();
+    let agent = grants::granted_names(&file.agent, &own.stored).into_iter().collect();
     let mut st = p.lock();
-    let report = st.tracker.report(&own.me, trust, (io.always_on)(), |peer| proof::resolve(&own.stored, peer).is_some());
+    let report = st.tracker.report(&own.me, file.trust, (io.always_on)(), agent, |peer| proof::resolve(&own.stored, peer).is_some());
     let (statement, report) = graph::sign_report(&own.key, &genesis, &report, st.last, now_ms());
     st.last = statement.version;
     let signed = Signed { statement, report };
@@ -580,17 +583,17 @@ mod tests {
         // A down link retrying doesn't flap: its first down state stays.
         assert!(t.observe(&[link("box", true, LinkState::Unreachable), link("pi", false, LinkState::Connected), link("x", true, LinkState::Connected)], t0, 20).is_empty());
         assert_eq!(t.due(), None);
-        let r = t.report("lap", Trust::Worker, true, |p| p != "x");
+        let r = t.report("lap", Trust::Worker, true, vec![], |p| p != "x");
         let want = vec![
             LinkReport { peer: "box".into(), dials: true, state: LinkState::Connecting, since_ms: 10 },
             LinkReport { peer: "pi".into(), dials: false, state: LinkState::Connected, since_ms: 10 },
         ];
-        assert_eq!(r, Report { member: "lap".into(), trust: Trust::Worker, always_on: true, links: want }, "x isn't in the fleet");
+        assert_eq!(r, Report { member: "lap".into(), trust: Trust::Worker, always_on: true, links: want, agent: vec![] }, "x isn't in the fleet");
         // Up, then a peer gone: since moves, the gone one goes.
         assert_eq!(t.observe(&[link("box", true, LinkState::Connected)], t0, 30), ["box"]);
-        let r = t.report("lap", Trust::Full, false, |_| true);
+        let r = t.report("lap", Trust::Full, false, vec!["pi".into()], |_| true);
         assert_eq!(r.links, [LinkReport { peer: "box".into(), dials: true, state: LinkState::Connected, since_ms: 30 }]);
-        assert_eq!(r.trust, Trust::Full);
+        assert_eq!((r.trust, r.agent), (Trust::Full, vec!["pi".to_string()]));
     }
 
     #[test]
@@ -612,7 +615,7 @@ mod tests {
 
     fn signed(stored: &Stored, member: &str, n: u8, version: u64) -> Signed {
         let g = stored.log.membership().unwrap().genesis;
-        let r = Report { member: member.into(), trust: Trust::Worker, always_on: false, links: vec![] };
+        let r = Report { member: member.into(), trust: Trust::Worker, always_on: false, links: vec![], agent: vec![] };
         let (statement, report) = graph::sign_report(&SigningKey::from_seed([n; 32]), &g, &r, version - 1, 0);
         Signed { statement, report }
     }
@@ -691,6 +694,19 @@ mod tests {
         let set = connect(&pair.l_dir).call("member.set", json!({"trust": "full"})).unwrap();
         assert_eq!(set.result.unwrap()["trust"], "full");
         wait_for("lap's full trust on K", Duration::from_secs(20), || trust(&get(&pair.k_dir), "lap") == Some(json!("full")));
+
+        // So does an agent grant (decision 66): lap's report lists box.
+        let agent = |g: &Value, member: &str| {
+            g["reports"].as_array().and_then(|rs| rs.iter().find(|r| r["report"]["member"] == member)).map(|r| r["report"]["agent"].clone())
+        };
+        assert_eq!(agent(&get(&pair.k_dir), "lap"), Some(json!([])));
+        let set = connect(&pair.l_dir).call("machines.set", json!({"name": "box", "agent": true})).unwrap();
+        assert!(set.error.is_none(), "{set:?}");
+        wait_for("lap's grant of box on K", Duration::from_secs(20), || agent(&get(&pair.k_dir), "lap") == Some(json!(["box"])));
+        crate::serve::dts::assert_matches("FleetGraph", &get(&pair.k_dir));
+        let set = connect(&pair.l_dir).call("machines.set", json!({"name": "box", "agent": false})).unwrap();
+        assert!(set.error.is_none(), "{set:?}");
+        wait_for("withdrawn on K", Duration::from_secs(20), || agent(&get(&pair.k_dir), "lap") == Some(json!([])));
         pair.finish();
     }
 

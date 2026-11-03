@@ -708,7 +708,7 @@ fn cells(r: MachineRow) -> [String; 7] {
         (None, crate::serve::machines::MachineKind::Routed, via) => format!("routed via {}", via.as_deref().unwrap_or("-")),
         (None, ..) => "inbound".into(),
     };
-    let agent = if r.kind == crate::serve::machines::MachineKind::Routed { "-" } else { on_off(r.agent) };
+    let agent = on_off(r.agent);
     let capacity = r.capacity.as_ref();
     let mut room = capacity::summary(capacity);
     if let Some(note) = capacity.and_then(capacity::over_note) {
@@ -1212,7 +1212,7 @@ mod tests {
         let inbound = MachineRow { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..row(&[], None) };
         assert_eq!(cells(inbound)[1], "inbound");
         let routed = MachineRow { kind: crate::serve::machines::MachineKind::Routed, target: None, via: Some("box".into()), ..row(&[], None) };
-        assert_eq!(cells(routed)[1..4], ["routed via box", "-", "-"].map(String::from));
+        assert_eq!(cells(routed)[1..4], ["routed via box", "-", "off"].map(String::from), "a routed member's grant shows too");
         // A capped member: named with its introducer.
         let capped = MachineRow { introduced_by: Some("lap".into()), ..row(&[], None) };
         assert_eq!(cells(capped)[0], "m (introduced by lap)");

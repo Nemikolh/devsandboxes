@@ -178,7 +178,7 @@ export interface SnapshotMachine {
   runtime: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH` (for an ssh argv). */
   command: string | null;
-  /** This host's ssh-agent is relayed to it (`machines.set`). */
+  /** This host grants its ssh-agent to this member, at its current key (`machines.set {agent}`, `member.toml`'s `[[agent]]`), whatever its kind. */
   agent: boolean;
   /** Its host's capacity, from its last snapshot (last known while not `connected`); `null` before one carried it. */
   capacity: Capacity | null;
@@ -1027,12 +1027,13 @@ export interface FleetLink {
   since_ms: number;
 }
 
-/** A member's word on its links: its trust, whether its daemon stays up (keep-alive, or the hub), each link it has. */
+/** A member's word on its links: its trust, whether its daemon stays up (keep-alive, or the hub), each link it has, and the members it grants its ssh-agent to (sorted). */
 export interface FleetLinkReport {
   member: string;
   trust: MemberTrust;
   always_on: boolean;
   links: FleetLink[];
+  agent: string[];
 }
 
 /** A link report as it travels: the member's signed statement (kind `links`, its version only going up) over it. */
@@ -1085,7 +1086,7 @@ export interface MachineInfo {
   command: string | null;
   /** Config roots on the machine. */
   roots: string[];
-  /** This host's ssh-agent is relayed to it (`machines.set`). */
+  /** This host grants its ssh-agent to this member, at its current key (`machines.set {agent}`, `member.toml`'s `[[agent]]`), whatever its kind. */
   agent: boolean;
 }
 
@@ -1102,7 +1103,7 @@ export interface MachineRow {
   roots: string[];
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
-  /** This host's ssh-agent is relayed to it (`machines.set`). */
+  /** This host grants its ssh-agent to this member, at its current key (`machines.set {agent}`, `member.toml`'s `[[agent]]`), whatever its kind. */
   agent: boolean;
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
@@ -1691,11 +1692,16 @@ export interface ApiMethods {
    * root or an empty `command`. `command` as `machines.probe`'s, saved as the machine's. `hub`: the machine is
    * the hub of the new fleet; `denied` when either end is in a fleet whose hub it isn't. `key`: the machine's
    * key as the user confirmed it (`machines.probe`'s); `denied` when the machine's differs. Writes both ends'
-   * membership logs (`denied` for another fleet's log, a fork, a capped member letting a host in).
+   * membership logs (`denied` for another fleet's log, a fork, a capped member letting a host in). `agent`:
+   * grant this host's ssh-agent to the machine by `key` once it's added.
    */
   'machines.add': { params: { target: string; name?: string; roots: string[]; hub: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
   'machines.list': { params: {}; result: MachineRow[] };
-  /** Change a registered machine's settings; `not-found` for an unknown name. */
+  /**
+   * Grant (`agent: true`) or withdraw this host's ssh-agent for a machine of any kind (registered, inbound,
+   * routed), by the key its name has in this host's membership log; `not-found` for an unknown name, `failed`
+   * for a machine with no key there (or no log).
+   */
   'machines.set': { params: { name: string; agent: boolean }; result: OkResult };
   /**
    * Drop this host's link to a registered machine (it stays a fleet member); `not-found` for an unknown name,

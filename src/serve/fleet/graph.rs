@@ -32,8 +32,10 @@ pub const KIND: &str = "links";
 pub const MAX_HOPS: usize = 4;
 
 /// One member's word on its links (decision 59): its trust, whether it's
-/// always on, and each link it has. On the wire `{"member", "trust",
-/// "always_on", "links": [{"peer", "dials", "state", "since_ms"}]}`.
+/// always on, each link it has, and the members it grants its agent to
+/// (decision 66; `fleet::grants::granted_names`, sorted). On the wire
+/// `{"member", "trust", "always_on", "links": [{"peer", "dials", "state",
+/// "since_ms"}], "agent": ["<member>"]}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
@@ -41,6 +43,7 @@ pub struct Report {
     pub trust: Trust,
     pub always_on: bool,
     pub links: Vec<LinkReport>,
+    pub agent: Vec<String>,
 }
 
 /// One link of a [`Report`]: to `peer`, in `state` since `since_ms` (unix
@@ -73,7 +76,8 @@ fn trust_str(t: Trust) -> &'static str {
 
 /// What a report's statement signs: the fleet's genesis hash (a report is
 /// one fleet's), the member, trust, always-on and the link count, then
-/// each link's peer, dials, state and since, every field length-prefixed
+/// each link's peer, dials, state and since, then the grantee count and
+/// each grantee's name, every field length-prefixed
 /// as the membership log's are (not JSON: no serializer's choices in what's
 /// signed).
 pub fn encode(genesis: &[u8; 32], r: &Report) -> Vec<u8> {
@@ -87,6 +91,11 @@ pub fn encode(genesis: &[u8; 32], r: &Report) -> Vec<u8> {
             put(&mut out, f);
         }
     }
+    let grantees = u32::try_from(r.agent.len()).expect("under 4 Gi grantees");
+    put(&mut out, &grantees.to_be_bytes());
+    for name in &r.agent {
+        put(&mut out, name.as_bytes());
+    }
     out
 }
 
@@ -97,10 +106,12 @@ pub fn next_version(last: u64, now_ms: u64) -> u64 {
 }
 
 /// `report` signed by `key` for the fleet of genesis hash `genesis`, at
-/// [`next_version`], its links in peer order.
+/// [`next_version`], its links in peer order, its grantees sorted.
 pub fn sign_report(key: &impl Signer, genesis: &[u8; 32], report: &Report, last: u64, now_ms: u64) -> (Statement, Report) {
     let mut report = report.clone();
     report.links.sort_by(|a, b| a.peer.cmp(&b.peer));
+    report.agent.sort();
+    report.agent.dedup();
     let s = Statement::sign(&report.member, key, KIND, &encode(genesis, &report), next_version(last, now_ms));
     (s, report)
 }
@@ -426,7 +437,7 @@ mod tests {
     }
 
     fn report(member: &str, always_on: bool, links: Vec<LinkReport>) -> Report {
-        Report { member: member.into(), trust: Trust::Worker, always_on, links }
+        Report { member: member.into(), trust: Trust::Worker, always_on, links, agent: vec![] }
     }
 
     /// `r` signed by its member's own key for `stored`'s fleet at `version`.
@@ -465,8 +476,9 @@ mod tests {
         assert_eq!(next_version(1000, 1000), 1001);
         assert_eq!(next_version(5000, 1000), 5001, "a clock that went back");
         let stored = fleet(1);
-        let r = report("pi", false, vec![link("lap", true, 1), link("box", true, 2)]);
+        let r = Report { agent: vec!["lap".into(), "box".into(), "lap".into()], ..report("pi", false, vec![link("lap", true, 1), link("box", true, 2)]) };
         let (s, sorted) = sign_report(&key(3), &genesis(&stored), &r, 0, 77);
+        assert_eq!(sorted.agent, ["box", "lap"], "grantees sorted, once each");
         assert_eq!((s.kind.as_str(), s.signer.as_str(), s.key, s.version), (KIND, "pi", pk(3), 77));
         assert_eq!(sorted.links.iter().map(|l| l.peer.as_str()).collect::<Vec<_>>(), ["box", "lap"]);
         s.verify_payload(&encode(&genesis(&stored), &sorted)).unwrap();
@@ -513,6 +525,9 @@ mod tests {
         let mut changed = r.clone();
         changed.links[0].since_ms = 2;
         assert!(format!("{:#}", g.apply(&s, &changed, &stored).unwrap_err()).contains("tampered"));
+        // A grantee added after signing (a relay granting itself agent).
+        let granting = Report { agent: vec!["k".into()], ..r.clone() };
+        assert!(format!("{:#}", g.apply(&s, &granting, &stored).unwrap_err()).contains("tampered"));
         // Another fleet's report, the same keys.
         let other = fleet(2);
         let (foreign, _) = signed(&other, &r, 5);

@@ -112,8 +112,8 @@ pub enum Channel {
     Tunnel,
     /// One bulk transfer into the peer's fleet root (`fleet::code::receivers`).
     Transfer,
-    /// This host's ssh agent, while its registry entry for the peer has
-    /// `agent` on.
+    /// This host's ssh agent, while its `member.toml` grants it to the
+    /// peer's proven key (`daemon::agent_for`).
     Agent,
     /// A routed stream to relay or answer (`fleet::route`).
     Route,

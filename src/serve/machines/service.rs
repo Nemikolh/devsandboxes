@@ -51,9 +51,9 @@
 //! over the [`RouteDial`] (`fleet::route::connect`), says hello, makes the
 //! call within [`Timing::call`] and closes it, on the caller's thread.
 //!
-//! `agent` isn't the link's business: this host answers the machine's
-//! `AGENT` streams per stream from the registry (`daemon::agent_for`), so a
-//! `reload` that changes only `agent` keeps the live link.
+//! Agent isn't the link's business: this host answers the machine's
+//! `AGENT` streams per stream by its grants in `member.toml`
+//! (`daemon::agent_for`), not the registry.
 //!
 //! Nothing here blocks a connection or the daemon's locks on the network:
 //! the threads do all the I/O, a caller only waits for its reply. A stop
@@ -516,18 +516,11 @@ fn with_inbound(mut entries: Vec<Entry>, inbound: &Neighbors) -> Vec<Entry> {
     entries
 }
 
-/// The same link: everything but `agent`, which the live one follows.
-fn same_link(a: &Entry, b: &Entry) -> bool {
-    Entry { agent: b.agent, ..a.clone() } == *b
-}
-
 impl Handle {
     /// Re-read the registry and the inbound neighbors: start links for new
     /// machines, stop (and drop the rows of) removed ones, restart changed
-    /// ones, except for a change of `agent` alone, which the live link
-    /// keeps. `machines.add`, `.set` and `.rm` call it, as does the
-    /// neighbors' hook; a registry that doesn't load is logged and changes
-    /// nothing.
+    /// ones. `machines.add` and `.rm` call it, as does the neighbors' hook;
+    /// a registry that doesn't load is logged and changes nothing.
     pub fn reload(&self) {
         let inner = &self.inner;
         let _one = lock(&inner.reloading);
@@ -540,12 +533,6 @@ impl Handle {
         };
         let gone: Vec<LinkThread> = {
             let mut links = inner.lock_links();
-            for (name, l) in links.iter_mut() {
-                let Some(e) = entries.iter().find(|e| e.name == *name) else { continue };
-                if e.agent != l.entry.agent && same_link(e, &l.entry) {
-                    l.entry.agent = e.agent;
-                }
-            }
             let stale: Vec<String> = links
                 .iter()
                 .filter(|(name, l)| !entries.iter().any(|e| e.name == **name && *e == l.entry))
@@ -1334,42 +1321,6 @@ mod tests {
         up.store(true, Ordering::SeqCst);
         wait_for("connected again", Duration::from_secs(5), || state().state == LinkState::Connected);
         assert_eq!(dials.load(Ordering::SeqCst), 2, "one dial per carrier");
-        drop(machines);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// `machines.set` flipping `agent` alone: the reload puts it in
-    /// `Remotes` (what the next federated snapshot carries) and fires
-    /// `changed` (which re-publishes), without restarting the link.
-    #[test]
-    fn an_agent_flip_reaches_remotes_and_fires_changed() {
-        let base = short_scratch("agent-flip");
-        let registry = base.join("machines.toml");
-        crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("m", "m"))).unwrap();
-        let changed = Arc::new(AtomicUsize::new(0));
-        let hooks = {
-            let c = Arc::clone(&changed);
-            Hooks { watching: Box::new(|| false), changed: Box::new(move || _ = c.fetch_add(1, Ordering::SeqCst)), hub: Box::new(|| None), routed: Box::new(Vec::new) }
-        };
-        let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
-        let (up, runs) = (Arc::new(AtomicBool::new(false)), Arc::default());
-        let machines = Machines::spawn(registry.clone(), Arc::default(), no_dial, no_route(), fake_hold(&up, &runs), opts(1, 0).machine_timing, hooks, None, |_| {});
-        let h = machines.handle();
-        assert!(!h.remotes().get("m").unwrap().agent);
-        let ctl = Arc::clone(&h.inner.lock_links()["m"].ctl);
-        let before = changed.load(Ordering::SeqCst);
-
-        crate::serve::machines::update(&registry, |e| e[0].agent = true).unwrap();
-        h.reload();
-        assert!(h.remotes().get("m").unwrap().agent, "Remotes has the new agent");
-        assert!(changed.load(Ordering::SeqCst) > before, "changed fired");
-        assert!(Arc::ptr_eq(&ctl, &h.inner.lock_links()["m"].ctl), "the same link");
-        assert!(h.entries()[0].agent, "the entry follows");
-
-        crate::serve::machines::update(&registry, |e| e[0].agent = false).unwrap();
-        h.reload();
-        assert!(!h.remotes().get("m").unwrap().agent);
-        assert!(Arc::ptr_eq(&ctl, &h.inner.lock_links()["m"].ctl));
         drop(machines);
         let _ = std::fs::remove_dir_all(&base);
     }

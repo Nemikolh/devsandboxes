@@ -12,7 +12,9 @@
 //!   [`dialer::dial`] that reaches every machine through its
 //!   `fleet-<name>.sock`.
 //! - `member`: `member.toml` (this host's name, trust, roots, `[allow]`,
-//!   `[caps]`, `dev-builds`) and `member.get` / `member.set`.
+//!   `[caps]`, `dev-builds`, `[[agent]]` grants) and `member.get` /
+//!   `member.set`; `grants`: the agent grants (whom this host's agent
+//!   reaches, by member key) and their writes.
 //! - `identity`: this member's key (`member.key`, behind a `KeyStore`),
 //!   public keys' text form and fingerprint, domain-separated signatures,
 //!   signed statements and the rollback check.
@@ -66,6 +68,7 @@ pub mod agent;
 pub mod code;
 pub mod dialer;
 pub mod follow;
+pub mod grants;
 pub mod graph;
 pub mod identity;
 pub mod lent;

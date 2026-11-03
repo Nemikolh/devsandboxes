@@ -36,8 +36,9 @@ fleet-link --peer <L's member name>`, `fleet::dialer`) and holds that
 link. K's `fleet-link --peer` announces L to K's daemon as an inbound
 neighbor (`links.inbound`), so L is a machine on K, of kind `inbound`:
 its rows, quick calls, verbs, terminals, forwards and placement reach
-it over the link L holds. L's agent reaches K's instances while L's
-entry for K has `agent` on; K's agent never reaches L.
+it over the link L holds. L's agent reaches K's instances while L
+grants K agent (`member.toml`'s `[[agent]]`, [AGENT](#agent)); K's
+agent never reaches L over this link.
 
 The add is also the join (`machines::join::plan`, run by `machines.add`
 over this host's `member.toml` and the target's `member.get` and
@@ -273,7 +274,8 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/daemon.rs` (`Options::member`, `Options::peer_env`,
 `Options::host_agent`, `member_path`, `Table`, `Shared::reach_files`,
 `Shared::open_lent`, `Shared::serve_channel`, `link_attach`, `Handoff`,
-`agent_for`), `src/serve/fleet/agent.rs` (`SERVING`, `NOT_SERVING`,
+`agent_for`), `src/serve/fleet/grants.rs` (`granted`, `granted_names`,
+`grant`, `withdraw`), `src/serve/fleet/agent.rs` (`SERVING`, `NOT_SERVING`,
 `Status`, `status_of`, `Action`, `decide`, `serve`, `PROBE`, `answer`),
 `src/serve/fleet/pty.rs` (`METHOD`, `code`, `Header`, `parse_header`,
 `gate`, `attach_params`, `serve`), `src/serve/fleet/tunnel.rs`
@@ -496,8 +498,8 @@ read at each dial), with the sentinel, the `Hello`s and the
   fleet/K/, env: the daemon's, key and introduced_by: what K proved}`,
   `Shared::fleet_peer`), the
   `serve_channel` a `link.attach` connection gets (decision 24); `AGENT`
-  is answered with L's agent while L's entry for K has `agent` on
-  (`daemon::agent_for`, read per stream: decision 18). While the hub's
+  is answered with L's agent while L grants it to the key K proved
+  (`daemon::agent_for`, read per stream: decisions 18, 65). While the hub's
   binary is on its way every stream but that `binary` transfer is
   refused.
 
@@ -594,11 +596,12 @@ there, the error names both sockets.
 - **Port forwards**: the daemon's forwards into a machine (`forwards.add`
   with `machine`) and a `devsandbox port` on one are `TUNNEL` streams
   ([TUNNEL](#tunnel), *The caller's end*).
-- **The agent**: with `machine set <name> agent on` this host's agent
-  reaches every instance on that machine as `AGENT` streams
-  ([AGENT](#agent), [machines](machines.md#agent)); only on a machine
-  this host dials (its entry's `agent`), never on an inbound or routed
-  one.
+- **The agent**: with `machine set <name> --agent on` this host grants
+  its agent to that member's key ([AGENT](#agent),
+  [machines](machines.md#agent)), for a machine of any kind; it reaches
+  every instance on a machine this host dials as `AGENT` streams. On an
+  inbound or routed machine the grant is recorded and in this host's
+  link report, and no `AGENT` stream carries it there.
 - **The CLI's other commands on a machine** are API calls with `machine`
   (fleet plan decision 15), within the machine's trust: `logs`
   (`containers.logs`), `logs --build` (`instances.buildLog`; `--follow`,
@@ -1145,16 +1148,21 @@ there only through the trust table.
   and a `[caps]` table, the soft caps of the
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
   `disk`, `instances`, each optional; `mem` and `disk` sizes like `16G`,
-  checked by `capacity::parse_size`). Unknown keys are ignored.
+  checked by `capacity::parse_size`), and `[[agent]]` tables, the agent
+  grants (`member::Grant`: `name`, `key` as `ed25519:<hex>`; none by
+  default; [AGENT](#agent)). Unknown keys are ignored.
   `member::check`: a `name` that's set is a valid member name, a `hub` that's set is
   `self` or a valid name, `roots` are absolute,
-  `[caps]` and `[allow]` well-formed. The daemon is its only writer
+  `[caps]` and `[allow]` well-formed, each grant's `name` a valid member
+  name and one grant per name. The daemon is its only writer
   ([Member: `member.*`](#member-member)), with `member::update`, a
   read-modify-write under the sibling `member.lock`, written to a temp
   file and renamed (`locked_file::update`, which `machines.toml` and
   `forwards.toml` are written with too); `dev-builds`, `[allow]` and
   `[caps]` are edited by hand (no call changes them) and read at each
-  use.
+  use; the grants are written by `machines.set {agent}` and
+  `machines.add {agent}` (`fleet::grants::grant` / `withdraw`, through
+  `member::update`) and read per `AGENT` stream.
 - **`member.key`** (next to `member.toml`, `member::key_path`) is this
   member's private key ([Member identity](#member-identity)).
 - **A peer's fleet root** is `<data>/devsandbox/fleet/<peer>/`
@@ -1641,13 +1649,15 @@ The fleet's links are the members' own signed reports: the model in
 `src/serve/fleet/reports.rs`.
 
 - **A report** (`graph::Report`) is a member's trust, whether it's
-  always on, and each of its links (`LinkReport`: the peer, whether this
-  member dials it, its `LinkState`, since when in unix ms). It's an
+  always on, each of its links (`LinkReport`: the peer, whether this
+  member dials it, its `LinkState`, since when in unix ms), and `agent`,
+  the members it grants its agent to (decision 66). It's an
   identity `Statement` of kind `links` by the member's key over
   `graph::encode`: the fleet's genesis hash, then every field
   length-prefixed, so a report is one fleet's. Its version is
   `graph::next_version`, the time in ms unless that isn't past the last
-  one signed (`sign_report`, which also puts the links in peer order).
+  one signed (`sign_report`, which also puts the links in peer order and
+  the grantees in name order, once each).
 - **Taking one** (`Graph::apply`): only from a name that resolves, by the
   key that signed, to a member of the log or a held introduction
   (`proof::resolve`); a revoked key, a link to itself, two links to one
@@ -1673,12 +1683,15 @@ The fleet's links are the members' own signed reports: the model in
   `connecting` and `unreachable` keeps the state first recorded, so a
   retrying link doesn't flap. A peer new or gone, a link up or down, or
   `dials` changed makes a report due `reports::DEBOUNCE` (1.5 s) later,
-  later changes joining it; the hub link coming up, or a `member.set`
-  that changed `trust` (`Published::republish`, which wakes the thread),
-  makes it due at once.
+  later changes joining it; the hub link coming up, a `member.set`
+  that changed `trust`, or an agent grant changed by `machines.set` or
+  `machines.add` (`Published::republish`, which wakes the thread; the
+  latter through `machines::api::Ctx::agent_changed`), makes it due at
+  once.
   The report lists only peers the log or a held introduction names; its
-  trust is `member.toml`'s, and it's always on when the daemon never
-  idles out (keep-alive, or the hub).
+  trust is `member.toml`'s, its grantees `member.toml`'s grants that hold
+  now (`grants::granted_names` against the stored log), and it's always
+  on when the daemon never idles out (keep-alive, or the hub).
 - **Sending it** (`reports::Publisher`, the `serve-fleet-graph` thread,
   woken by `service::Hooks::changed` through `Published::poke`): signed
   with `member.key`, taken into this host's own graph, and sent to the
@@ -2070,11 +2083,11 @@ with nothing read past the line and its write timeout cleared, goes to
 - `transfer` → one `fleet::transfer::Receivers::receive` over
   `fleet::code::receivers` of the peer's fleet root;
 - `agent` → `fleet::agent::answer` with `Options::host_agent`'s agent
-  while this host's `machines.toml` has an entry named the peer with
-  `agent` on (`daemon::agent_for`), else none (`NOT_SERVING`, then the
-  close): decision 18 of the
+  while this host's `member.toml` grants it to the key the peer proved
+  (`daemon::agent_for`), else none (`NOT_SERVING`, then the close):
+  decisions 18 and 65 of the
   [plan](../../plans/active/fleet.md#decisions), the dialer's agent
-  gated by the dialer's own entry.
+  gated by the dialer's own grant.
 
 Each runs on a thread of its own, counted in the `clients` holders
 (`Shared::channels`) until it returns. The wait-for-answer rule: the
@@ -2321,9 +2334,10 @@ TCP connection is then a `Connect` on that bridge's mux, inside the
 
 The dialer's ssh agent on the machine it dials, over the
 [peer link](#peer-links): an ssh machine's `AGENT` semantics
-([machines](machines.md#agent)). While the dialer L's registry entry
-for K has `agent = true`, every instance on K reaches L's agent, not
-only placed ones. Streams go dialed end → dialer (`channel::AGENT`,
+([machines](machines.md#agent)). While the dialer L grants K agent, by
+K's member key (`member.toml`'s `[[agent]]`, `fleet::grants`: it follows
+the log's rotations of that key and ends with its revocation, decision
+65), every instance on K reaches L's agent, not only placed ones. Streams go dialed end → dialer (`channel::AGENT`,
 flowing), so K needs nothing of L but the link L holds; K's agent never
 reaches L (decision 18).
 
@@ -2351,7 +2365,7 @@ own. Named `agent-*.sock`, it is one of the relayed agents' sockets
 `bridge::host_agent` tries (`endpoint::agent_sockets`, newest first,
 each probed with a connect), so K's bridges reach L's agent as they
 reach a machine's relayed one, and only while it leads somewhere: with
-`agent` off on L, or the link gone, there is no socket to pick, and K's
+no grant for K on L, or the link gone, there is no socket to pick, and K's
 own agent is the fallback. A verb a `Peer` connection runs gets that
 socket as `SSH_AUTH_SOCK` while it answers (`Peer::agent`,
 [the trust table](#the-trust-table)).
@@ -2365,9 +2379,11 @@ none and closes, so it never dials the agent) a connection to that
 path, spliced. The path is `daemon::agent_for`, read per stream: the
 daemon's own `bridge::host_agent` (the agents clients reported
 included; `daemon::Options::host_agent` in tests) while this host's
-`machines.toml` has an entry named the peer with `agent` on, else
-none. So `machine set <K> agent on|off` binds or unbinds K's socket
-within about `PROBE`, on the live link.
+`member.toml` grants the peer's name the key the peer proved on the link
+(`lent::Peer::key`; `fleet::grants::granted` against the membership log
+beside it), else none: no proven key, no log or no grant is none. So
+`machine set <K> --agent on|off` binds or unbinds K's socket within
+about `PROBE`, on the live link.
 
 ### Worker policy
 

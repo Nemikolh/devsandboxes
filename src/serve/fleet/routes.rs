@@ -291,7 +291,7 @@ mod tests {
 
     fn report(s: &Stored, graph: &mut Graph, member: &str, k: u8, peers: &[&str]) {
         let links = peers.iter().map(|p| LinkReport { peer: p.to_string(), dials: true, state: LinkState::Connected, since_ms: 1 }).collect();
-        let r = Report { member: member.into(), trust: Trust::default(), always_on: false, links };
+        let r = Report { member: member.into(), trust: Trust::default(), always_on: false, links, agent: vec![] };
         let genesis = s.log.membership().unwrap().genesis;
         let (st, r) = sign_report(&key(k), &genesis, &r, 0, 10);
         graph.apply(&st, &r, s).unwrap();

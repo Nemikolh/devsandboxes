@@ -341,7 +341,7 @@ fn machine_info_with(
     let info: MachineInfo =
         serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad machines.get result from devsandbox serve")?;
     let kind = super::Kind::from_wire(info.kind, info.target).with_context(|| format!("machine `{m}`"))?;
-    Ok(Entry { name: info.name, kind, roots: info.roots, command: info.command, agent: info.agent })
+    Ok(Entry { name: info.name, kind, roots: info.roots, command: info.command })
 }
 
 // ---- reconnecting a tty exec ------------------------------------------------

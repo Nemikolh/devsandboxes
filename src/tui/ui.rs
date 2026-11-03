@@ -765,7 +765,6 @@ fn machine_name_text(m: &crate::serve::snapshots::SnapshotMachine) -> String {
 /// last attempt said why; CAPACITY from its last snapshot's
 /// capacity report (last known while it isn't connected).
 fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
-    use crate::serve::machines::MachineKind;
     use crate::serve::snapshots::LinkState;
     let state = match &m.error {
         Some(e) => format!("{}: {e}", m.state.as_str()),
@@ -794,14 +793,8 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
             (None, None) => Cell::from(Span::styled("inbound", Style::default().add_modifier(Modifier::DIM))),
         },
         Cell::from(Span::styled(state, style)),
-        // This host's agent never reaches an inbound machine, nor one seen
-        // through the hub: nothing to toggle.
-        Cell::from(match (m.kind, m.agent) {
-            _ if m.via.is_some() => "-",
-            (MachineKind::Inbound, _) => "-",
-            (_, true) => "on",
-            (_, false) => "off",
-        }),
+        // This host's agent grant for the member, whatever the kind.
+        Cell::from(if m.agent { "on" } else { "off" }),
         Cell::from(m.version.clone().unwrap_or_else(|| "-".to_string())),
         {
             let over = m.capacity.as_ref().is_some_and(|c| !crate::serve::capacity::over_caps(c).is_empty());

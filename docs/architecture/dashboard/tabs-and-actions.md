@@ -64,15 +64,14 @@ for Instances when the last machine goes. Each keeps its own selected row.
   when `capacity::over_caps` finds a soft cap exceeded), from the
   machine's last snapshot's capacity report
   ([../daemon/fleet.md](../daemon/fleet.md#capacity)). `a` flips the selected
-  machine's `agent`: `App::toggle_selected_agent` queues it
+  machine's agent grant (any kind: registered, inbound or routed, fleet
+  plan decision 67): `App::toggle_selected_agent` queues it
   (`take_pending_machine_set`), the event loop hands it to the daemon
   worker (`Cmd::MachineSet`, `machines.set {name, agent}`), and the
   answer is a status line; the row isn't touched, it shows the new value
   with the next snapshot push
-  ([../daemon/machines.md](../daemon/machines.md) *Dashboard*); on a
-  routed machine (via the hub) it's refused with a status line: its
-  agent isn't routed (`snapshots::routed_agent`, fleet plan decision 58).
-  Its other actions and tabs work as on any machine's rows.
+  ([../daemon/machines.md](../daemon/machines.md) *Dashboard*). A
+  routed machine's actions and tabs work as on any machine's rows.
 
 The header's totals line marks the snapshot stale with why when the daemon
 connection is down, or after `STALE_AFTER_SECS` without a push.

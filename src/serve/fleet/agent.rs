@@ -1,8 +1,8 @@
 //! `AGENT` on the fleet link (docs/architecture/daemon/fleet.md, *AGENT*):
 //! the dialer's ssh agent reaching every instance on the machine it dialed
-//! while the dialer's registry entry for it has `agent = true` (decisions
-//! 14, 18 and 30 of the fleet plan), carried on the link instead of an ssh
-//! of its own.
+//! while the dialer grants it agent by its member key (`member.toml`'s
+//! `[[agent]]`, `fleet::grants`; decisions 14, 18, 30 and 65 of the fleet
+//! plan), carried on the link instead of an ssh of its own.
 //!
 //! Every `AGENT` stream starts with one status byte from the dialer:
 //! [`SERVING`], then the relay to its agent, or [`NOT_SERVING`], then the

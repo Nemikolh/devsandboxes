@@ -95,25 +95,13 @@ impl App {
 
     /// `a` (Machines tab): flip the selected machine's `agent`, queuing the
     /// new value for the event loop to set through the daemon worker. The row
-    /// changes with the next snapshot push. No-op with no row selected; an
-    /// inbound machine has no `agent` here (it dialed this host: this
-    /// host's agent never reaches it, fleet plan decision 30), nor a routed
-    /// one (`AGENT` isn't routed, decision 58), so a note.
+    /// changes with the next snapshot push. No-op with no row selected. Any
+    /// kind: registered, inbound or routed (the grant is by member key,
+    /// fleet plan decision 67).
     pub(super) fn toggle_selected_agent(&mut self) {
         let Some(m) = self.machines.get(self.selected()) else {
             return;
         };
-        if let Some(via) = &m.via {
-            self.status = Some(crate::serve::snapshots::routed_agent(&m.name, via));
-            return;
-        }
-        if m.kind == crate::serve::machines::MachineKind::Inbound {
-            self.status = Some(format!(
-                "{}: inbound (it dialed this host): this host's agent never reaches it; set `agent` in its entry for this host there",
-                m.name
-            ));
-            return;
-        }
         let agent = !m.agent;
         self.status = Some(format!("{}: agent {}…", m.name, if agent { "on" } else { "off" }));
         self.pending_machine_set = Some((m.name.clone(), agent));
@@ -329,29 +317,28 @@ mod tests {
         assert_eq!(app.take_pending_machine_set(), Some(("b".into(), false)));
         assert_eq!(app.status.as_deref(), Some("b: agent off…"));
 
-        // An inbound machine: refused with a note, nothing queued.
+        // Inbound and routed machines alike: a grant by member key (fleet
+        // plan decision 67), queued.
         let lap = crate::serve::snapshots::SnapshotMachine {
             kind: crate::serve::machines::MachineKind::Inbound,
             target: None,
             ..sm("lap", LinkState::Connected)
         };
-        app.set_machines(vec![lap]);
-        app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(app.take_pending_machine_set(), None);
-        assert!(app.status.as_deref().is_some_and(|s| s.starts_with("lap: inbound (it dialed this host)")), "{:?}", app.status);
-
-        // A routed one (seen through the hub): its agent isn't routed
-        // (fleet plan decision 58), nothing queued.
         let x = crate::serve::snapshots::SnapshotMachine {
             kind: crate::serve::machines::MachineKind::Routed,
             via: Some("k".into()),
             target: None,
+            agent: true,
             ..sm("x", LinkState::Connected)
         };
-        app.set_machines(vec![x]);
+        app.set_machines(vec![lap, x]);
+        app.on_key(key(KeyCode::Up));
         app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(app.take_pending_machine_set(), None);
-        assert_eq!(app.status, Some(crate::serve::snapshots::routed_agent("x", "k")));
+        assert_eq!(app.take_pending_machine_set(), Some(("lap".into(), true)));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_machine_set(), Some(("x".into(), false)));
+        assert_eq!(app.status.as_deref(), Some("x: agent off…"));
     }
 
     #[test]

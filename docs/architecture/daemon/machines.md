@@ -29,7 +29,8 @@ federated joins), `cli.rs` (`machine_names`, `plan`, `Plan`, `machine_use`, `rou
 `localize`, `Reconnect`, `dials`, `pipe_mode`, `attach_mode`), `cli/calls.rs` (`use_of`, `Use`,
 `Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
 `parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`,
-`fleet_view`, `routed`, `Routed`, `routed_agent`),
+`fleet_view`, `routed`, `Routed`), `src/serve/fleet/grants.rs` (`granted`,
+`granted_names`, `grant`, `withdraw`),
 `src/serve/fleet/dialer.rs` (`Dialer`, `dial`, `routed`, `link_args`),
 `src/serve/fleet/route.rs` (`connect`), `src/serve/fleet/routes.rs` (`reach`),
 `src/serve/relay.rs` (`--sentinel`), `src/commands/machine.rs`,
@@ -52,9 +53,9 @@ optional
 when it installs there off the login `PATH` (see
 [`machine add`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
-dials with the same param) and `agent` (whether this host's
-ssh-agent is meant for the machine, see [Agent](#agent); off by default,
-written only when on). Only the daemon writes it
+dials with the same param). An older build's `agent` key is ignored:
+whom this host's ssh-agent reaches is `member.toml`'s grants
+([Agent](#agent)). Only the daemon writes it
 (`machines.add`/`set`/`unlink`/`rm`, and `fleet.leave`/`fleet.forget`
 from the hub, [fleet.md](fleet.md), *How a machine leaves*): locked read-modify-write on `machines.lock`, temp
 file + rename (`serve::locked_file::update`), since two daemons overlap during a handoff. A file that
@@ -103,12 +104,12 @@ served by its daemon under its trust table for this host (its registry
 entry's name for this host is the peer there, its fleet root
 `fleet/<that name>/`). `machines.list` lists the neighbors after the
 registry's entries, `machines.get` answers them: no `target` or
-`command`, `agent` off, `state`, `error`, `version` and `capacity` its
-held link's. Its agent direction is the dialer's (fleet plan decision
-30): its agent reaches this host's instances while its entry for this
-host has `agent` on there; this host's never reaches it, so
-`machines.set` refuses its `agent` (`api::inbound_agent`, `denied`), as
-the Machines tab's `a` does, and `machines.unlink` refuses it (it goes
+`command`, `agent` this host's grant for it ([Agent](#agent)), `state`,
+`error`, `version` and `capacity` its held link's. `machines.set
+{agent}` records a grant for it by its key like any machine's (fleet
+plan decision 67); its `AGENT` streams come from the dialed end's probe,
+and on its link this host is the dialed end, so no stream carries this
+host's agent there. `machines.unlink` refuses it (it goes
 with its link: `devsandbox machine unlink <this host>` run on it).
 `machines.rm` takes it out of the fleet like any machine
 ([fleet.md](fleet.md), *How a machine leaves*): there, or once its `fleet.leave`
@@ -155,8 +156,8 @@ is built for an inbound machine. Plain ssh, no ControlMaster of its own:
 `~/.ssh/config` decides. The remote command runs through the login shell
 (`exec "$SHELL" -lc '…'`, each arg quoted for it), so the remote `PATH` is
 the user's. No argv passes `-A`: this host's ssh-agent reaches a machine
-only over its link's `AGENT` streams ([Agent](#agent)), only with the
-machine's `agent` on.
+only over its link's `AGENT` streams ([Agent](#agent)), only while this
+host grants it.
 
 `Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
 ssh's stderr for `spawn`'s `Peer`.
@@ -269,7 +270,8 @@ thread carrying its link, started, stopped or restarted when `add`/`set`/`rm`
 change the registry or a neighbor comes, goes or gets its roots
 (`Handle::reload`, which the neighbors' hook, `Neighbors::on_change`,
 calls; one reload at a time; a change to a machine's entry restarts its
-link, except a change of `agent` alone, which the live link keeps).
+link). Agent grants aren't the registry's: a grant change reloads
+nothing.
 `Handle::entries` is both sources (`service::with_inbound`). Every link is
 held from the start, wanted or not (fleet plan decision 7), an inbound
 one's while its neighbor is up.
@@ -366,10 +368,12 @@ calls (`Handle::call_routed`: a stream of its own per call, hello within
 (`Handle::dial`), the federated calls, placement and code moves
 ([fleet](fleet.md#in-the-run-verb)), terminals and forwards (every kind
 of machine's on `route::connect`). Its daemon serves them under its trust for this host
-([fleet](fleet.md#routed-streams), *The destination*). What's refused:
-`machines.set` (no entry to keep `agent` in, and `AGENT` isn't routed,
-decision 58: `denied`, `snapshots::routed_agent`), and so the dashboard's
-agent toggle.
+([fleet](fleet.md#routed-streams), *The destination*). `machines.set
+{agent}` and the dashboard's agent toggle record and withdraw a grant
+for it by its key in this host's membership log, as for any machine
+([Agent](#agent)); the grant is in this host's link report, but the
+routed `AGENT` streams that would carry it are refused
+(`route::Header::check`).
 
 ## Forwarded requests
 
@@ -415,7 +419,7 @@ has it stripped and goes to that machine, but for the ones served here:
   `SSH_AUTH_SOCK` as `agent` and reports it like a verb's: the CLI's
   re-runs pass it ([The CLI](#the-cli-clirs)). A routed machine answers
   kind `routed`, no `target`, its view roots (the agent isn't reported:
-  `AGENT` isn't routed); the CLI takes it like an inbound one
+  no `AGENT` stream reaches a routed machine); the CLI takes it like an inbound one
   (`Kind::from_wire`: no ssh target, reached over the sockets). A tab's
   `--reserve-255` resolve takes `denied` as final, not as an outage
   (`cli::resolve_lost`).
@@ -428,7 +432,7 @@ gain `machine` and keep their remote `root`, and a top-level `machines`
 array carries each machine's `name`, `kind` (`ssh` |
 `inbound` | `routed`, fleet plan decisions 29, 60), `target` (`null` for an inbound one), `state`,
 `error`, `version`, `command`,
-`runtime`, `agent`, `capacity` (its host's
+`runtime`, `agent` (this host's grant, [Agent](#agent)), `capacity` (its host's
 [capacity report](fleet.md#capacity), from its last push), `via`,
 `exposed_by` ([exposure](fleet.md#exposure)). A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
@@ -436,8 +440,9 @@ watchers' roots from the last local params. Details:
 
 On a fleet member, `merge` also lifts the hub's `Machine::fleet` view:
 each machine it lists becomes an entry of its own after the direct ones,
-kind `routed`, `via` the hub, with no `target`, `command` or `agent` (no
-link of its own here reaches it), its rows as the hub tagged them; while the hub's link isn't
+kind `routed`, `via` the hub, with no `target` or `command` (no link of
+its own here reaches it), its `agent` this host's grant (not the hub's),
+its rows as the hub tagged them; while the hub's link isn't
 connected it takes the hub's state, `error` `through <hub>: <why>`, rows
 last known. A machine this host links to wins over the same name seen
 via the hub. The view lives in `Remotes` only (never in `remotes.json`:
@@ -462,11 +467,12 @@ probes this host every `fleet::agent::PROBE` (2 s) and binds
 socket dir only while this host serves ([fleet](fleet.md#agent)); each
 connection there becomes one `AGENT` stream. This daemon answers each
 stream (`daemon::agent_for`, `fleet::agent::answer`) with its agent
-(`bridge::host_agent`: the agents clients reported first) while its
-registry entry for the machine has `agent` on, read per stream, else
-with `NOT_SERVING` and the close. So turning `agent` off refuses the
-next stream at once, and the machine unbinds its socket at its next
-probe; the link stays up either way.
+(`bridge::host_agent`: the agents clients reported first) while
+`member.toml` grants it to the key the machine proved on the link
+(`fleet::grants::granted`), read per stream, else with `NOT_SERVING` and
+the close. So withdrawing the grant refuses the next stream at once, and
+the machine unbinds its socket at its next probe; the link stays up
+either way.
 
 On the machine nothing registers the socket: `bridge::host_agent` tries
 the live `agent-*.sock` files in the socket dir (`endpoint::agent_sockets`,
@@ -475,11 +481,25 @@ process's own `$SSH_AUTH_SOCK`, so the daemon's bridges and any command
 run there (a verb, an `exec`'s `PTY` stream, a terminal tab) find it, and a link that's gone
 drops out by the liveness check.
 
-Each machine's `agent` flag (`Entry::agent`, off by default) is set by
-`machine add --agent`, `machine set <name> --agent on|off` or `a` on the
-dashboard's Machines tab (`machines.add` / `machines.set`), listed by
-`machines.list` / `get` and the federated snapshot's `machines`, shown
-in the Machines tab's AGENT column, and marked `(agent)` in the
+**Grants** (fleet plan decisions 65-67) are this host's consent, per
+member, kept in `member.toml` as `[[agent]]` tables of `name` and `key`
+(`fleet::member::Grant`, none by default, one per name), written by the
+daemon only (`fleet::grants::grant` / `withdraw`, locked and atomic like
+every `member.toml` write). A grant holds for the key it was made with
+and every key the membership log's `rotate` entries move it to under
+that name, while that key is the name's current one (the log's, or a
+held introduction's); a `revoke` ends it, and a member added again under
+the name with a new key isn't granted. `machine add --agent` grants the
+key the user confirmed once the add succeeds (`machines.add {agent}`);
+`machine set <name> --agent on|off` and `a` on the dashboard's Machines
+tab (`machines.set {agent}`) grant `name`'s current key in this host's
+membership log, or withdraw the grant, for any kind of machine:
+registered, inbound or routed. A grant change makes this host's link
+report due at once (it lists the grantees, [fleet](fleet.md#link-graph))
+and re-publishes the federated snapshots. Whether this host grants a
+member now (`grants::granted_names`) is `agent` in `machines.list` /
+`get` and the federated snapshot's `machines`, shown in the Machines
+tab's AGENT column and `machine ls`, and marked `(agent)` in the
 dashboard's header note.
 
 ## The CLI: `cli.rs`
@@ -533,7 +553,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   ("needs devsandbox serve"); a bare name resolves locally.
 - **The agent**: the `machines.get` lookup before a command on a machine
   passes this process's `SSH_AUTH_SOCK` (if absolute) as `agent`
-  (`info_params`), so with the machine's `agent` on the agent the daemon
+  (`info_params`), so while this host grants the machine agent the agent the daemon
   answers the machine's `AGENT` streams with, which the command there
   finds as `agent-link-<this host>.sock` ([Agent](#agent)), is this
   terminal's. Nothing is held for the run: the link is always up.
@@ -716,13 +736,13 @@ introduced the machine, `machines.add` then proposes that introduction
 to the authority over any path (`fleet.propose`, best effort; the
 answer's `proposed`), and the CLI prints `proposed its add to
 <authority>: approve there with devsandbox machine approve <id>`, or why
-not (`proposed_line`). `add --agent` saves the machine with `agent`
-on; a name the registry or an inbound neighbor has is refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
-required) changes it on a registered machine and prints `<name>: agent
-on|off`; both are refused for an inbound one
-([Inbound neighbors](#inbound-neighbors)). `ls` shows it in an `AGENT`
+not (`proposed_line`). `add --agent` grants the machine agent by its
+confirmed key ([Agent](#agent)); a name the registry or an inbound
+neighbor has is refused. `set <name> --agent on|off` (`machines.set`;
+`--agent` is required) grants or withdraws it for a machine of any kind
+and prints `<name>: agent on|off`. `ls` shows the grant in an `AGENT`
 column, and `inbound` as an inbound machine's `TARGET`, `routed via
-<hop>` as a [routed](#routed-machines) one's (its `AGENT` `-`); `CAPACITY` is the
+<hop>` as a [routed](#routed-machines) one's; `CAPACITY` is the
 machine's last [capacity report](fleet.md#capacity)
 (`machines.list`'s `capacity`, `-` before one came), the over-cap note in
 parentheses; a machine this host's membership holds as an introduction
@@ -796,26 +816,24 @@ re-dials an attach to it into the same tab (`attach_argv`,
 `tui::app::terminal::Redial`, the CLI's `Reconnect` rule;
 [terminal.md](../dashboard/terminal.md) *Remote tabs reconnect*); a machine without rows shows `box: connecting` or `box:
 unreachable: <why>` in the header (`pending_note`), the name as `box
-(agent)` when its `agent` is on. `p` / `:port` on a remote row sends
+(agent)` while this host grants it agent. `p` / `:port` on a remote row sends
 `forwards.add` with `machine` and the row's root (the forward binds here,
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while there is a machine, shows every machine from the snapshot's
 `machines` with its target (dimmed `inbound` for an inbound one, dimmed
 `via <hub>` for a routed one, which the snapshot has only from the hub's
-view), link state (and error), `agent` (`-` for an inbound or routed
-one), and its
+view), link state (and error), `agent` (this host's grant, any kind),
+and its
 CAPACITY ([capacity](fleet.md#capacity)); a machine `worker` and exposed
 through another one (the entry's `exposed_by`) has `exposed via
 <dialer>` after its NAME, in yellow (`ui::machine_name_text`,
 [exposure](fleet.md#exposure));
-`a` flips the selected one's `agent` with `machines.set` (no prompt; a
-down machine's too, it's a registry write), and the row follows with the
-next push, which the reload triggers
-([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*); on an
-inbound machine it only says why there's nothing to flip
-(`App::toggle_selected_agent`), on a routed one that its agent isn't
-routed (`snapshots::routed_agent`). A routed machine's
+`a` flips the selected one's grant with `machines.set` (no prompt; a
+down machine's too, it's a `member.toml` write; any kind,
+`App::toggle_selected_agent`), and the row follows with the next push,
+which the grant change triggers
+([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*). A routed machine's
 rows are actionable like any other's: its tabs run the same `exec` on the
 qualified name (`on_machine`), dialed over a route, and actions on its
 rows carry its name as `machine`, which the daemon forwards to it over a

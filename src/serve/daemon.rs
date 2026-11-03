@@ -158,8 +158,8 @@ pub struct Options {
     /// The hub's repo caches a placed `run` fetches into; `None` is
     /// `fleet::code::repos_dir`. Tests point it at a scratch dir.
     pub repos: Option<PathBuf>,
-    /// The agent a machine's `AGENT` streams reach while its entry has
-    /// `agent` on; `None` is `bridge::host_agent`. Tests inject one.
+    /// The agent a machine's `AGENT` streams reach while this host grants
+    /// it agent ([`agent_for`]); `None` is `bridge::host_agent`. Tests inject one.
     pub host_agent: Option<HostAgent>,
     /// The argv a peer's `PTY` stream runs for a piped or tty exec; `None`
     /// is the runtime's `exec` (`fleet::pty::runtime_exec`). Tests run `sh`.
@@ -393,6 +393,17 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         exposed: {
             let hooked = Arc::clone(&hooked);
             Box::new(move || hooked.get().and_then(std::sync::Weak::upgrade).map(|s| s.exposed_workers(None)).unwrap_or_default())
+        },
+        // A grant changed: in this host's link report at once (fleet plan
+        // decision 66), and in the federated snapshots' `agent`.
+        agent_changed: {
+            let hooked = Arc::clone(&hooked);
+            Box::new(move || {
+                if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
+                    s.graph.republish();
+                    s.publish_machines();
+                }
+            })
         },
     });
     let shared = Arc::new(shared);
@@ -1002,9 +1013,10 @@ impl Shared {
     /// - `tunnel`: `fleet::tunnel::serve` (a forward's bridge into one).
     /// - `transfer`: one transfer into the peer's fleet root
     ///   (`fleet::code::receivers`); refused without one.
-    /// - `agent`: `fleet::agent::answer` with this host's agent while this
-    ///   host's registry has an entry named the peer with `agent` on, else
-    ///   with none (its `NOT_SERVING` byte, then the close).
+    /// - `agent`: `fleet::agent::answer` with this host's agent while
+    ///   `member.toml` grants it to the key the peer proved
+    ///   ([`agent_for`]), else with none (its `NOT_SERVING` byte, then the
+    ///   close).
     /// - `route`: [`serve_route`](Self::serve_route), on a thread of its
     ///   own: relayed, or served as its origin's stream when it's for this
     ///   host.
@@ -1041,10 +1053,10 @@ impl Shared {
                 })
             }
             lent::Channel::Agent => {
-                let registry = self.machines.as_ref().map(|m| m.registry.clone());
+                let member = self.member.clone();
                 let host_agent = Arc::clone(&self.host_agent);
                 self.spawn_channel("serve-agent", move || {
-                    let agent = agent_for(registry.as_deref(), &peer.name, &host_agent);
+                    let agent = agent_for(member.as_deref(), &peer.name, peer.key.as_ref(), &host_agent);
                     fleet::agent::answer(stream, agent);
                 })
             }
@@ -1156,6 +1168,12 @@ impl Shared {
             Some((stored, _)) => fleet::graph::exposed_workers(&self.graph.graph(), &stored, me),
             None => BTreeMap::new(),
         }
+    }
+
+    /// The members this host grants its agent to now
+    /// (`fleet::grants::load_granted`): the federated snapshots' `agent`.
+    fn agent_granted(&self) -> BTreeSet<String> {
+        self.member.as_deref().map(fleet::grants::load_granted).unwrap_or_default()
     }
 
     /// The routed machines' reach (`service::Hooks::routed`): each of
@@ -1343,7 +1361,7 @@ impl Shared {
     fn publish_snapshot(&self, dir: &Path, params: Arc<Value>) {
         self.locals.lock().unwrap().insert(dir.to_path_buf(), Arc::clone(&params));
         let mut merged: BTreeMap<Option<String>, Arc<Value>> = BTreeMap::new();
-        let mut remotes: Option<(Vec<snapshots::Machine>, BTreeMap<String, Vec<String>>)> = None;
+        let mut remotes: Option<(Vec<snapshots::Machine>, BTreeMap<String, Vec<String>>, BTreeSet<String>)> = None;
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
                 let push = match p.watched.get(dir) {
@@ -1352,8 +1370,9 @@ impl Shared {
                     Some(true) => {
                         let except = p.except();
                         let push = merged.entry(except.clone()).or_insert_with(|| {
-                            let (remotes, exposed) = remotes.get_or_insert_with(|| (self.remotes(), self.exposed_workers(None)));
-                            Arc::new(snapshots::merge(&params, remotes, except.as_deref(), exposed))
+                            let (remotes, exposed, granted) =
+                                remotes.get_or_insert_with(|| (self.remotes(), self.exposed_workers(None), self.agent_granted()));
+                            Arc::new(snapshots::merge(&params, remotes, except.as_deref(), exposed, granted))
                         });
                         Arc::clone(push)
                     }
@@ -1371,6 +1390,7 @@ impl Shared {
         let locals = self.locals.lock().unwrap().clone();
         let remotes = self.remotes();
         let exposed = self.exposed_workers(None);
+        let granted = self.agent_granted();
         let mut merged: BTreeMap<(PathBuf, Option<String>), Arc<Value>> = BTreeMap::new();
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
@@ -1380,7 +1400,7 @@ impl Shared {
                     let Some(local) = locals.get(dir) else { continue };
                     let push = merged
                         .entry((dir.clone(), except.clone()))
-                        .or_insert_with(|| Arc::new(snapshots::merge(local, &remotes, except.as_deref(), &exposed)));
+                        .or_insert_with(|| Arc::new(snapshots::merge(local, &remotes, except.as_deref(), &exposed, &granted)));
                     p.snapshots.insert(dir.clone(), Arc::clone(push));
                     any = true;
                 }
@@ -1721,11 +1741,15 @@ fn config_stamps<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> ConfigStamps {
 type ConfigStamps = BTreeMap<PathBuf, Vec<Option<(std::time::SystemTime, u64)>>>;
 
 /// The agent a peer's `AGENT` stream gets ([`Shared::serve_channel`]):
-/// `host_agent`'s, while `registry` has an entry named `peer` (any kind)
-/// with `agent` on; none otherwise, a registry that won't load included.
-fn agent_for(registry: Option<&Path>, peer: &str, host_agent: &HostAgent) -> Option<PathBuf> {
-    let entries = machines::load(registry?).ok()?;
-    entries.iter().any(|e| e.name == peer && e.agent).then(|| host_agent()).flatten()
+/// `host_agent`'s, while `member`'s `[[agent]]` grants member `peer` the
+/// key it proved (`fleet::grants::granted`, against the membership log
+/// beside it, both read per stream); none otherwise: no key proven, or a
+/// member file, log or grant missing or not loading.
+fn agent_for(member: Option<&Path>, peer: &str, key: Option<&fleet::identity::PublicKey>, host_agent: &HostAgent) -> Option<PathBuf> {
+    let (member, key) = (member?, key?);
+    let grants = fleet::member::load(member).ok()??.agent;
+    let stored = fleet::membership_api::load(member).ok()??;
+    fleet::grants::granted(&grants, &stored, peer, key).then(|| host_agent()).flatten()
 }
 
 /// A connection a `link.attach {channel}` turned into that channel's
@@ -2676,7 +2700,10 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
         }
     };
     let first = match first {
-        Some(first) if machines => Some(Arc::new(snapshots::merge(&first, &shared.remotes(), except.as_deref(), &shared.exposed_workers(None)))),
+        Some(first) if machines => {
+            let merged = snapshots::merge(&first, &shared.remotes(), except.as_deref(), &shared.exposed_workers(None), &shared.agent_granted());
+            Some(Arc::new(merged))
+        }
         first => first,
     };
     conn.out.post(|p| {
@@ -3445,7 +3472,7 @@ pub(crate) mod tests {
         }
         // A `machines: true` watcher's variant.
         let machine = snapshots::Machine { name: "m".into(), target: Some("me@m".into()), ..Default::default() };
-        let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine], None, &Default::default());
+        let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine], None, &Default::default(), &Default::default());
         dts::assert_matches(&dts::prop_type("ApiEvents", "instances.snapshot").unwrap(), &merged);
         dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
     }
@@ -3922,10 +3949,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// An `agent` stream gets this host's agent only while the registry's
-    /// entry named the peer has `agent` on: else `NOT_SERVING` and the close.
+    /// An `agent` stream gets this host's agent only while member.toml
+    /// grants it to the key the peer proved: else `NOT_SERVING` and the
+    /// close.
     #[test]
-    fn an_agent_channel_follows_the_peers_registry_entry() {
+    fn an_agent_channel_follows_the_grant_of_the_peers_key() {
         use crate::serve::fleet::agent::{NOT_SERVING, SERVING};
         let dir = scratch("attach-agent");
         let data = scratch("attach-agent-data");
@@ -3939,13 +3967,12 @@ pub(crate) mod tests {
                 });
             }
         });
-        let registry = data.join("machines.toml");
         let host_agent: HostAgent = {
             let agent = agent.clone();
             Arc::new(move || Some(agent.clone()))
         };
         let options = Options {
-            machines: Some(registry.clone()),
+            machines: Some(data.join("machines.toml")),
             member: Some(data.join("member.toml")),
             host_agent: Some(host_agent),
             ..opts(1, 1000)
@@ -3958,15 +3985,38 @@ pub(crate) mod tests {
         };
         let closed = |stream: &mut Stream| stream.read(&mut [0u8; 1]).unwrap() == 0;
 
-        for registry_text in ["", "[machine.hub]\ntarget = \"hub\"\n", "[machine.other]\ntarget = \"o\"\nagent = true\n"] {
-            std::fs::write(&registry, registry_text).unwrap();
+        use crate::serve::fleet::grants;
+        use crate::serve::fleet::identity::{Signer, SigningKey};
+        use crate::serve::fleet::membership_api::test_support;
+        let member = data.join("member.toml");
+        let pk = |n: u8| SigningKey::from_seed([n; 32]).public_key();
+        let attached = || {
             let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent", "key": attach_key()}), b"");
             assert_eq!(answer["result"]["ok"], true, "{answer}");
-            assert_eq!(status(&mut stream), NOT_SERVING, "{registry_text:?}");
+            let got = status(&mut stream);
+            (stream, got)
+        };
+        // No log, no grant; then a log (`hub` is key 7) and no grant, a
+        // grant for another member, one for `hub` by another key.
+        let (mut stream, got) = attached();
+        assert_eq!(got, NOT_SERVING, "nothing");
+        assert!(closed(&mut stream));
+        grants::grant(&member, "hub", pk(7)).unwrap();
+        let (mut stream, got) = attached();
+        assert_eq!(got, NOT_SERVING, "a grant but no log");
+        assert!(closed(&mut stream));
+        grants::withdraw(&member, "hub").unwrap();
+        test_support::write(&member, &test_support::fleet("me", &SigningKey::from_seed([9; 32]), "me", &[("hub", pk(7)), ("other", pk(8))]));
+        for (name, key) in [(None, 0), (Some("other"), 8), (Some("hub"), 8)] {
+            if let Some(name) = name {
+                grants::grant(&member, name, pk(key)).unwrap();
+            }
+            let (mut stream, got) = attached();
+            assert_eq!(got, NOT_SERVING, "{name:?} {key}");
             assert!(closed(&mut stream));
         }
 
-        std::fs::write(&registry, "[machine.hub]\ntarget = \"hub\"\nagent = true\n").unwrap();
+        grants::grant(&member, "hub", pk(7)).unwrap();
         let (mut stream, _) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent", "key": attach_key()}), b"");
         assert_eq!(status(&mut stream), SERVING);
         stream.write_all(b"ping").unwrap();

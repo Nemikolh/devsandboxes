@@ -450,7 +450,7 @@ enum MachineCommand {
         /// A config root on the machine (repeatable)
         #[arg(long = "config", value_name = "PATH")]
         configs: Vec<String>,
-        /// Relay this host's ssh-agent to the machine (off by default; see `machine set`)
+        /// Grant this host's ssh-agent to the machine, by its member key (off by default; see `machine set`)
         #[arg(long)]
         agent: bool,
         /// Make the machine the hub of the new fleet (neither end in a fleet yet; in one, only if it already is the hub)
@@ -469,12 +469,12 @@ enum MachineCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Change a registered machine's settings
+    /// Change a machine's settings (registered, inbound or routed)
     ///
     ///     devsandbox machine set my-server --agent on
     Set {
         name: String,
-        /// Relay this host's ssh-agent to the machine
+        /// Grant (on) or withdraw (off) this host's ssh-agent for the machine, by its member key
         #[arg(long, required = true, action = clap::ArgAction::Set, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
         agent: bool,
     },

@@ -22,6 +22,7 @@
 //! this host's registry entry, and this host's membership, whose adopt
 //! writes its `hub`.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,7 @@ use crate::serve::fleet::member::{self, Hub, MemberInfo};
 use crate::serve::fleet::membership::{Introduction, Stored, Wire};
 use crate::serve::fleet::proposals::Change;
 use crate::serve::fleet::membership_api::{self, MembershipInfo};
+use crate::serve::fleet::{grants, proof};
 use crate::serve::snapshots::LinkState;
 
 /// The hello's wait: ssh's connect and auth, the remote login shell, and a
@@ -92,6 +94,10 @@ pub struct Ctx {
     /// with their chains (`fleet::graph::exposed_workers`): `list`'s
     /// `exposed_by`.
     pub exposed: Box<dyn Fn() -> std::collections::BTreeMap<String, Vec<String>> + Send + Sync>,
+    /// An agent grant in `member.toml` changed (`set`, `add`): this host's
+    /// link report is due at once and the snapshots' `agent` follow
+    /// (`daemon::Shared`'s `graph.republish`, `publish_machines`).
+    pub agent_changed: Box<dyn Fn() + Send + Sync>,
 }
 
 /// Run `method` if it's a `machines.*` one; `None` otherwise.
@@ -145,8 +151,8 @@ pub struct Added {
 /// now (`kind` `inbound`: no `target`, `roots` its `roots.list`), and its
 /// held link's live state (`error` the last failure while `unreachable`;
 /// `version` from the last hello). Or a routed machine (`kind` `routed`,
-/// fleet plan decision 60; `snapshots::Routed`): no `target`, `command` or
-/// `agent`, `roots`, `version` and `capacity` as the hub's view has them,
+/// fleet plan decision 60; `snapshots::Routed`): no `target` or `command`,
+/// `roots`, `version` and `capacity` as the hub's view has them,
 /// `via` the first hop its streams take, `state` `connected` while this
 /// host's link graph has a path to it starting with a link up here.
 #[derive(Debug, Serialize, Deserialize)]
@@ -157,6 +163,8 @@ pub struct MachineRow {
     pub target: Option<String>,
     pub roots: Vec<PathBuf>,
     pub command: Option<String>,
+    /// This host grants its agent to the member of this name, at its
+    /// current key (`fleet::grants::granted_names`), whatever the kind.
     pub agent: bool,
     pub state: LinkState,
     pub error: Option<String>,
@@ -217,6 +225,7 @@ struct AddParams {
     /// The machine's member key as the user confirmed it (its fingerprint,
     /// from `machines.probe`): the add is refused if the machine's differs.
     key: PublicKey,
+    /// Grant this host's agent to the machine (by `key`) once it's added.
     #[serde(default)]
     agent: bool,
     #[serde(default)]
@@ -262,7 +271,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
     )?;
     check_free(ctx, &plan.name, plan.target_set.is_some())?;
 
-    let mut entry = Entry { command: p.command, agent: p.agent, ..Entry::ssh(plan.name.clone(), p.target) };
+    let mut entry = Entry { command: p.command, ..Entry::ssh(plan.name.clone(), p.target) };
     let checked: Vec<RootCandidate> = remote_call(&mut link, &entry.name, "roots.list", json!({ "paths": p.roots }))?;
     // A daemon that ignores `paths` answers its candidates instead.
     if checked.len() != p.roots.len() {
@@ -347,6 +356,12 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
     if let Some(links) = &ctx.links {
         links.reload();
     }
+    if p.agent {
+        let granted = grants::grant(member_toml, &entry.name, p.key).map_err(|e| after(ApiError::internal(e), &written))?;
+        if granted {
+            (ctx.agent_changed)();
+        }
+    }
     let proposed = introduced_here(&ours, &here, &this_name, &entry.name).map(|(authority, introduction)| {
         let name = introduction.name.clone();
         match super::changes::propose(ctx, &authority, Change::Add { introduction }) {
@@ -404,6 +419,7 @@ fn after(mut e: ApiError, written: &[String]) -> ApiError {
 fn list(ctx: &Ctx) -> Answer {
     let stored = ctx.member.as_deref().and_then(|m| membership_api::load(m).ok().flatten());
     let exposed = (ctx.exposed)();
+    let granted = granted_here(ctx, stored.as_ref());
     let rows: Vec<MachineRow> = machines(ctx)?
         .into_iter()
         .map(|e| {
@@ -412,12 +428,12 @@ fn list(ctx: &Ctx) -> Answer {
             MachineRow {
                 introduced_by: introducer_of(stored.as_ref(), &e.name),
                 exposed_by: exposed.get(&e.name).cloned(),
+                agent: granted.contains(&e.name),
                 name: e.name,
                 kind,
                 target,
                 roots: e.roots,
                 command: e.command,
-                agent: e.agent,
                 capacity: live.capacity(),
                 state: live.state,
                 error: live.error,
@@ -431,12 +447,12 @@ fn list(ctx: &Ctx) -> Answer {
     rows.extend(routed.into_iter().map(|r| MachineRow {
         introduced_by: introducer_of(stored.as_ref(), &r.name),
         exposed_by: exposed.get(&r.name).cloned(),
+        agent: granted.contains(&r.name),
         name: r.name,
         kind: MachineKind::Routed,
         target: None,
         roots: r.roots,
         command: None,
-        agent: false,
         state: r.state,
         error: r.error,
         version: r.version,
@@ -444,6 +460,14 @@ fn list(ctx: &Ctx) -> Answer {
         via: r.via,
     }));
     to_value(rows)
+}
+
+/// The members this host grants its agent to now
+/// (`fleet::grants::granted_names` of `member.toml`'s against `stored`);
+/// none without either.
+fn granted_here(ctx: &Ctx, stored: Option<&Stored>) -> BTreeSet<String> {
+    let grants = ctx.member.as_deref().and_then(|m| member::load(m).ok().flatten()).map(|m| m.agent).unwrap_or_default();
+    stored.map(|s| grants::granted_names(&grants, s)).unwrap_or_default()
 }
 
 /// The registry's entries, then an inbound one per neighbor up now whose
@@ -473,6 +497,7 @@ pub struct MachineInfo {
     pub target: Option<String>,
     pub command: Option<String>,
     pub roots: Vec<PathBuf>,
+    /// As [`MachineRow::agent`].
     pub agent: bool,
 }
 
@@ -500,8 +525,10 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
         (None, Some(links)) => links.routed_one(&p.name),
         _ => None,
     };
+    let stored = ctx.member.as_deref().and_then(|m| membership_api::load(m).ok().flatten());
+    let agent = granted_here(ctx, stored.as_ref()).contains(&p.name);
     if let Some(r) = routed {
-        return to_value(MachineInfo { name: r.name, kind: MachineKind::Routed, target: None, command: None, roots: r.roots, agent: false });
+        return to_value(MachineInfo { name: r.name, kind: MachineKind::Routed, target: None, command: None, roots: r.roots, agent });
     }
     let entry = entry.ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
     if let Some(agent) = p.agent {
@@ -514,7 +541,7 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
         target,
         command: entry.command,
         roots: entry.roots,
-        agent: entry.agent,
+        agent,
     })
 }
 
@@ -524,32 +551,42 @@ struct SetParams {
     agent: bool,
 }
 
-/// Change a registered machine's settings (today only `agent`). The links
-/// reload only when something changed (the link's `AGENT` streams follow
-/// `agent`, `fleet::dialer`).
+/// Grant or withdraw this host's agent for machine `name` (fleet plan
+/// decision 67): registered, inbound or routed alike, by the key `name`
+/// has in this host's membership log (or a held introduction), written to
+/// `member.toml`'s `[[agent]]` (`fleet::grants`). Nothing reloads: each
+/// `AGENT` stream reads the grants (`daemon::agent_for`). A change fires
+/// [`Ctx::agent_changed`]. A withdrawal needs no key: a grant by that
+/// name goes whatever its member's state.
 fn set(p: SetParams, ctx: &Ctx) -> Answer {
-    let changed = super::update(&ctx.registry, |entries| {
-        let entry = entries.iter_mut().find(|e| e.name == p.name)?;
-        let changed = entry.agent != p.agent;
-        entry.agent = p.agent;
-        Some(changed)
-    });
-    let Some(changed) = changed.map_err(ApiError::internal)? else {
-        if ctx.inbound.contains(&p.name) {
-            return Err(inbound_agent(&p.name));
-        }
-        if let Some(links) = &ctx.links {
-            // No entry here to keep the flag in, and `AGENT` isn't routed
-            // (fleet plan decision 58).
-            if let Some(r) = links.routed_one(&p.name) {
-                return Err(ApiError::denied(crate::serve::snapshots::routed_agent(&r.name, r.via.as_deref().unwrap_or("another member"))));
-            }
-            return Err(links.unknown(&p.name));
-        }
-        return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
+    let Some(member_toml) = ctx.member.as_deref() else {
+        return Err(ApiError::failed("this daemon has no member.toml (no data dir)"));
     };
-    if changed && let Some(links) = &ctx.links {
-        links.reload();
+    let stored = membership_api::load(member_toml)?;
+    let key = stored.as_ref().and_then(|s| proof::resolve(s, &p.name)).map(|(key, _)| key);
+    let changed = match (p.agent, key) {
+        (true, Some(key)) => grants::grant(member_toml, &p.name, key).map_err(ApiError::internal)?,
+        (false, _) if grants::withdraw(member_toml, &p.name).map_err(ApiError::internal)? => true,
+        (false, Some(_)) => false,
+        (_, None) => {
+            let is_machine = machines(ctx)?.iter().any(|e| e.name == p.name) || ctx.links.as_ref().is_some_and(|l| l.routed_one(&p.name).is_some());
+            if !is_machine {
+                return Err(match &ctx.links {
+                    Some(links) => links.unknown(&p.name),
+                    None => ApiError::not_found(format!("no machine named `{}`", p.name)),
+                });
+            }
+            if !p.agent {
+                return Ok(json!({ "ok": true }));
+            }
+            return Err(ApiError::failed(match stored {
+                None => format!("this host is in no fleet's membership log: no key to grant `{}` agent by", p.name),
+                Some(_) => format!("`{}` isn't a member of this host's membership log nor a held introduction: no key to grant agent by", p.name),
+            }));
+        }
+    };
+    if changed {
+        (ctx.agent_changed)();
     }
     Ok(json!({ "ok": true }))
 }
@@ -594,15 +631,6 @@ fn check_command(command: Option<&str>) -> Result<(), ApiError> {
         Some(c) if c.trim().is_empty() => Err(ApiError::invalid("empty `command`: omit it for `devsandbox`")),
         _ => Ok(()),
     }
-}
-
-/// `machines.set` on inbound machine `name`: this host's agent never
-/// reaches it (fleet plan decision 30), so there's no `agent` to set here.
-pub fn inbound_agent(name: &str) -> ApiError {
-    ApiError::denied(format!(
-        "`{name}` links to this host from its end (inbound): this host's agent never reaches it; \
-         its agent reaches this host's instances while its entry for this host has `agent` on (set it there)"
-    ))
 }
 
 fn taken(name: &str, rename: bool) -> ApiError {
@@ -939,10 +967,12 @@ mod tests {
         let cmd = "~/.local/bin/devsandbox";
         let r = pair.add(json!({"hub": false, "target": "ssh://box:2200", "name": "box", "roots": ["~/.devsandboxes"], "agent": true, "command": cmd}));
         assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "lap", "joined": "same"})));
-        assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
+        // `agent`: granted by the confirmed key, in this host's member.toml.
+        let grant = member::Grant { name: "box".into(), key: pair.machine_key().public_key() };
+        assert_eq!((pair.this(), pair.machine()), (Member { agent: vec![grant], ..named("lap", "self") }, named("box", "lap")));
         assert_eq!(pair.logs(), (Some(here.clone()), Some(here)));
         let saved = &pair.registry()[0];
-        assert!(saved.agent, "`agent` saved");
+        assert!(!std::fs::read_to_string(&registry).unwrap().contains("agent"), "not the registry's");
         assert_eq!(saved.command.as_deref(), Some(cmd), "`command` saved");
         assert!(std::fs::read_to_string(&registry).unwrap().contains("command = \"~/.local/bin/devsandbox\""));
 
@@ -953,11 +983,14 @@ mod tests {
             let row = row.as_object_mut().unwrap();
             assert_ne!(row.remove("state").unwrap(), "connected");
             row.remove("error");
+            // This host's own report (due at once on the grant, else after
+            // the link's debounce) says it dials box: exposed, by timing.
+            row.remove("exposed_by");
         }
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null, "via": null, "exposed_by": null},
+                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null, "via": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box"}));
@@ -1257,27 +1290,34 @@ mod tests {
     }
 
     #[test]
-    fn set_flips_agent_and_saves_it() {
+    fn set_grants_and_withdraws_agent_in_member_toml() {
         let base = scratch("mach-set");
         let registry = base.join("machines.toml");
+        let member_toml = base.join("member.toml");
         let entry = Entry { roots: vec!["/r".into()], ..Entry::ssh("box", "me@box") };
         crate::serve::machines::update(&registry, |e| e.push(entry.clone())).unwrap();
         let daemon = spawn_daemon(&base.join("local"), local_opts(&base, None));
         let mut local = client_at(&base.join("local"));
-        let agent = || crate::serve::machines::load(&registry).unwrap()[0].agent;
+        // No log yet: no key to grant by.
+        let (code, message) = err(&mut local, "machines.set", json!({"name": "box", "agent": true}));
+        assert!(code == "failed" && message.contains("no fleet's membership log"), "{code}: {message}");
+        // `box` in the log as key 2.
+        let box_key = SigningKey::from_seed([2; 32]).public_key();
+        test_support::write(&member_toml, &fleet("lap", &test_support::key_of(&member_toml), "lap", &[("box", box_key)]));
+        let grants = || member::load(&member_toml).unwrap().unwrap_or_default().agent;
         assert_eq!(ok(&mut local, "machines.set", json!({"name": "box", "agent": true})), json!({"ok": true}));
-        assert!(agent());
-        assert!(std::fs::read_to_string(&registry).unwrap().contains("agent = true"));
+        assert_eq!(grants(), [member::Grant { name: "box".into(), key: box_key }]);
         assert_eq!(ok(&mut local, "machines.get", json!({"name": "box"}))["agent"], true);
+        assert_eq!(ok(&mut local, "machines.list", Value::Null)[0]["agent"], true);
         // Again is a no-op, not an error.
         assert_eq!(ok(&mut local, "machines.set", json!({"name": "box", "agent": true})), json!({"ok": true}));
         assert_eq!(ok(&mut local, "machines.set", json!({"name": "box", "agent": false})), json!({"ok": true}));
-        assert!(!agent());
-        assert!(!std::fs::read_to_string(&registry).unwrap().contains("agent"));
+        assert!(grants().is_empty());
+        assert_eq!(ok(&mut local, "machines.get", json!({"name": "box"}))["agent"], false);
         let (code, message) = err(&mut local, "machines.set", json!({"name": "nope", "agent": true}));
         assert_eq!((code.as_str(), message.as_str()), ("not-found", "no machine named `nope`"));
         assert_eq!(err(&mut local, "machines.set", json!({"name": "box"})).0, "invalid");
-        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry]);
+        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry], "the registry untouched");
         // A registered machine's link holds the daemon up.
         assert!(local.call("shutdown", json!({})).unwrap().error.is_none());
         drop(local);

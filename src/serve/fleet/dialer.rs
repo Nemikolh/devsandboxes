@@ -14,8 +14,8 @@
 //! opens (`API`, `PTY`, `TUNNEL`, `TRANSFER`, `AGENT`, `ROUTE`) goes to this daemon
 //! in-process ([`Open`]: `Shared::open_lent` with the entry's name as the
 //! peer, the key and introducer it proved, its fleet root
-//! `fleet/<entry>/`), under this host's trust table for it; `AGENT` is answered with this host's agent while the entry has
-//! `agent` on (`daemon::agent_for`).
+//! `fleet/<entry>/`), under this host's trust table for it; `AGENT` is answered with this host's agent while
+//! `member.toml` grants it to the key the machine proved (`daemon::agent_for`).
 //!
 //! Right after the `Hello`s both ends prove their member keys
 //! (`super::proof`): this host's identity (`proof::Identity`: its name,
@@ -692,9 +692,10 @@ pub(crate) mod tests {
         pair.finish();
     }
 
-    /// K's `AGENT` streams are answered with this host's agent while L's
-    /// entry has `agent` on: K binds `agent-link-lap.sock` then, and it
-    /// leads to L's agent; off, it goes. The link stays up throughout.
+    /// K's `AGENT` streams are answered with this host's agent while L
+    /// grants it to K's key (`machines.set {agent}`, L's `member.toml`): K
+    /// binds `agent-link-lap.sock` then, and it leads to L's agent;
+    /// withdrawn, it goes. The link stays up throughout.
     #[test]
     fn the_machines_agent_streams_follow_the_entrys_agent() {
         let base = scratch("dial-agent-sock");
@@ -761,7 +762,7 @@ pub(crate) mod tests {
     /// and its roots (its fleet root for K among them), `machines.get`
     /// answers it, a quick call and a forwarded verb run on L under L's
     /// trust for K (`box` there), K's federated snapshot has L's rows; its
-    /// `agent` and `unlink` are refused here. L dropping its entry for K takes
+    /// `unlink` is refused here, an agent grant by its key written. L dropping its entry for K takes
     /// the machine and its rows away on K.
     #[test]
     fn the_dialer_is_an_inbound_machine_on_the_dialed_host() {
@@ -792,10 +793,20 @@ pub(crate) mod tests {
         let mut k = connect(&pair.k_dir);
         let info = k.call("machines.get", json!({"name": "lap"})).unwrap().result.unwrap();
         assert_eq!(info, json!({"name": "lap", "kind": "inbound", "target": null, "command": null, "roots": [fleet_root], "agent": false}));
-        for (method, params) in [("machines.set", json!({"name": "lap", "agent": true})), ("machines.unlink", json!({"name": "lap"}))] {
-            let e = k.call(method, params).unwrap().error.unwrap();
-            assert!(e.code == "denied" && e.message.contains("links to this host from its end"), "{method}: {e:?}");
-        }
+        let e = k.call("machines.unlink", json!({"name": "lap"})).unwrap().error.unwrap();
+        assert!(e.code == "denied" && e.message.contains("links to this host from its end"), "{e:?}");
+        // An agent grant by lap's key (fleet plan decision 67), in K's member.toml.
+        let r = k.call("machines.set", json!({"name": "lap", "agent": true})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let k_member = pair.base.join("k-data/member.toml");
+        let lap_key = crate::serve::fleet::identity::Signer::public_key(&test_support::key_of(&pair.base.join("l-data/member.toml")));
+        let grants = crate::serve::fleet::member::load(&k_member).unwrap().unwrap().agent;
+        assert_eq!(grants, [crate::serve::fleet::member::Grant { name: "lap".into(), key: lap_key }]);
+        assert_eq!(k.call("machines.get", json!({"name": "lap"})).unwrap().result.unwrap()["agent"], true);
+        wait_for("lap's row shows the grant", Duration::from_secs(10), || named(&k_rows(), "lap").is_some_and(|r| r["agent"] == true));
+        let r = k.call("machines.set", json!({"name": "lap", "agent": false})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        assert!(crate::serve::fleet::member::load(&k_member).unwrap().unwrap().agent.is_empty(), "withdrawn");
 
         // A quick call: L's answer, within L's trust for K.
         let r = k.call("instances.list", json!({"dir": fleet_root, "machine": "lap"})).unwrap();
@@ -1244,8 +1255,11 @@ pub(crate) mod tests {
         assert_eq!(x["kind"], "routed");
         let info = connect(&pair.l_dir).call("machines.get", json!({"name": "x"})).unwrap().result.unwrap();
         assert_eq!(info, json!({"name": "x", "kind": "routed", "target": null, "command": null, "roots": [], "agent": false}));
+        // A machine, but not in the log: no key to grant agent by.
         let e = connect(&pair.l_dir).call("machines.set", json!({"name": "x", "agent": true})).unwrap().error.unwrap();
-        assert_eq!((e.code.as_str(), e.message), ("denied", crate::serve::snapshots::routed_agent("x", "box")));
+        assert!(e.code == "failed" && e.message.contains("no key to grant agent by"), "{e:?}");
+        let r = connect(&pair.l_dir).call("machines.set", json!({"name": "x", "agent": false})).unwrap();
+        assert!(r.error.is_none(), "nothing to withdraw: {r:?}");
         let e = connect(&pair.l_dir).call("instances.list", json!({"dir": x_root, "machine": "x"})).unwrap().error.unwrap();
         assert!(e.code == "failed" && e.message.starts_with("x: unreachable: no link to `x` is up"), "{e:?}");
         let add = json!({"dir": x_root, "instance": "x-1", "spec": "3000", "machine": "x"});
@@ -1623,7 +1637,7 @@ pub(crate) mod tests {
         let m_member = trio.base.join("m-data/member.toml");
         let genesis = test_support::read(&trio.a_member).unwrap().log.membership().unwrap().genesis;
         let links = ["lap", "box", "b"].map(|p| LinkReport { peer: p.into(), dials: false, state: LinkState::Connected, since_ms: 1 }).to_vec();
-        let report = Report { member: "m".into(), trust: Default::default(), always_on: true, links };
+        let report = Report { member: "m".into(), trust: Default::default(), always_on: true, links, agent: vec![] };
         let later = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 3_600_000;
         let (statement, report) = sign_report(&test_support::key_of(&m_member), &genesis, &report, 0, later);
         // Carried to K, the hub, as `lap` over A's link: K pushes it on.
@@ -1660,7 +1674,7 @@ pub(crate) mod tests {
     /// via `box`, connected (a path starts with A's link up); a quick call,
     /// a forwarded verb and a federated resolve go to it by name over
     /// `route-b.sock`, served under B's trust for A (not for the relay);
-    /// its agent stays refused (decision 58).
+    /// an agent grant for it is written by B's key (decision 67), and shows.
     #[test]
     fn a_routed_machine_takes_quick_calls_and_verbs() {
         let (b_runner, b_verbs) = crate::serve::verbs::tests::script_runner("route-machine-b", r#"echo "b $*""#);
@@ -1697,8 +1711,13 @@ pub(crate) mod tests {
         let r = a.call("instances.resolve", json!({"name": "b-1", "machines": true})).unwrap().result.unwrap();
         assert_eq!(r["matches"], json!(["b/b-1"]), "{r}");
 
-        let e = a.call("machines.set", json!({"name": "b", "agent": true})).unwrap().error.unwrap();
-        assert_eq!((e.code.as_str(), e.message), ("denied", crate::serve::snapshots::routed_agent("b", "box")));
+        let r = a.call("machines.set", json!({"name": "b", "agent": true})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let grants = crate::serve::fleet::member::load(&trio.a_member).unwrap().unwrap().agent;
+        let b_key = crate::serve::fleet::identity::Signer::public_key(&test_support::key_of(&trio.b_member));
+        assert_eq!(grants, [crate::serve::fleet::member::Grant { name: "b".into(), key: b_key }]);
+        assert_eq!(named(&rows(), "b").unwrap()["agent"], true);
+        assert_eq!(a.call("machines.get", json!({"name": "b"})).unwrap().result.unwrap()["agent"], true);
         drop(a);
         trio.finish();
         let _ = std::fs::remove_dir_all(&b_verbs);

@@ -14,7 +14,9 @@
 //! both through [`set_fleet`].
 //! `[allow]`, `[caps]` and `dev-builds` have no call: they're edited by
 //! hand and re-read at each use (`worker_policy` reads `trust` and
-//! `[allow]` itself, on every platform).
+//! `[allow]` itself, on every platform). The `[[agent]]` grants have no
+//! `member.*` call either: `machines.set {agent}` and `machines.add
+//! {agent}` write them (`super::grants`), read at each `AGENT` stream.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -64,6 +66,21 @@ pub struct Member {
     /// (`serve::capacity::Capacity::caps`); never enforced.
     #[serde(skip_serializing_if = "SoftCaps::is_empty")]
     pub caps: SoftCaps,
+    /// `[[agent]]`: the members this host's ssh-agent is granted to, by
+    /// name and key (fleet plan decision 65; `super::grants`). None by
+    /// default; one per name.
+    #[serde(rename = "agent", skip_serializing_if = "Vec::is_empty")]
+    pub agent: Vec<Grant>,
+}
+
+/// One `[[agent]]` grant: member `name`, as it proved `key` when granted
+/// (`ed25519:<hex>`). It holds for `key` and the keys the membership log
+/// rotates it to under `name` (`super::grants::granted`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grant {
+    pub name: String,
+    pub key: PublicKey,
 }
 
 /// `[caps]`: what this host means to give the fleet (fleet plan, *Placement*). All
@@ -208,6 +225,13 @@ pub fn check(member: &Member) -> Result<()> {
         bail!("`roots`: `{}` is not an absolute path", bad.display());
     }
     member.caps.check()?;
+    let mut names = std::collections::BTreeSet::new();
+    for g in &member.agent {
+        check_member_name(&g.name).with_context(|| format!("`agent`: `{}`", g.name))?;
+        if !names.insert(&g.name) {
+            bail!("`agent`: two grants for `{}`", g.name);
+        }
+    }
     member.allow.check()
 }
 
