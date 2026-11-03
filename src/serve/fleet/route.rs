@@ -1,9 +1,10 @@
 //! A routed stream's opening (docs/architecture/daemon/fleet.md, *Routed
-//! streams*; fleet plan step 10b, decisions 53-58): the header a `ROUTE`
-//! stream starts with and the challenge-response both ways that proves its
-//! origin to its destination, and the destination back, over any byte
-//! pipe, on [`proof`]'s framing (a `u32` length, a tag byte: a message or a
-//! refusal, the body).
+//! streams*; fleet plan steps 10b and 10c, decisions 53-58 and 61-62): the
+//! header a `ROUTE` stream starts with and the challenge-response both ways
+//! that proves its origin to its destination, and the destination back,
+//! and agrees the stream's end-to-end session, over any byte pipe, on
+//! [`proof`]'s framing (a `u32` length, a tag byte: a message or a refusal,
+//! the body).
 //!
 //! - **The header** ([`Header`], [`write_header`], [`read_header`]): its
 //!   destination, its origin, the inner channel (`API`, `PTY`, `TUNNEL` or
@@ -12,14 +13,21 @@
 //!   destination) and a TTL, at most [`HEADER_LIMIT`] bytes. The origin
 //!   sets the TTL to [`MAX_HOPS`]; each relay checks it ([`relay_header`])
 //!   and forwards it one lower, then splices the rest unread.
-//! - **The proof**: the destination sends a challenge (a fresh nonce); the
-//!   origin answers with its own nonce, its key and its signature, in
-//!   [`DOMAIN`], over the [`transcript`] (the fleet's genesis hash, origin,
-//!   destination, channel, path, both nonces) and its role; the
-//!   destination checks the origin's name resolves to that key
+//! - **The session** (SIGMA-style, no round trip beyond the proof's): the
+//!   destination's challenge is a fresh ephemeral x25519 key
+//!   ([`Ephemeral`]); the origin answers with its own, its key and its
+//!   signature, in [`DOMAIN`], over the [`transcript`] (the fleet's genesis
+//!   hash, origin, destination, channel, path, both ephemeral keys) and its
+//!   role; the destination checks the origin's name resolves to that key
 //!   ([`proof::resolve`]: a log member or a held introduction, revoked keys
 //!   refused) and proves itself back the same way in its role; the origin
-//!   checks that key is the destination's and answers its verdict.
+//!   checks that key is the destination's and answers its verdict. Each end
+//!   refuses a peer's ephemeral key whose DH output isn't contributory. Both
+//!   ends then derive the session's keys from the DH output and the
+//!   transcript ([`Keys::derive`]), and the inner channel's bytes that
+//!   follow are sealed records ([`session`](super::session)): a relay that
+//!   swaps an ephemeral key breaks a signature, and one that touches a
+//!   record breaks the session.
 //!
 //! A relay or the destination refusing writes a refusal naming itself
 //! ([`refuse`]) back toward the origin, which reads it as the stream's
@@ -48,10 +56,11 @@ use super::lent::Channel;
 use super::member::check_member_name;
 use super::membership::Stored;
 use super::proof::{self, Bad, Chan, Fields, Frame, MESSAGE, REFUSAL, Side, put, read_frame, write_raw};
+use super::session::{Ephemeral, Keys, Role};
 
 /// The domain a routed stream's proofs are signed in (apart from the link
 /// proof's, `proof::DOMAIN`).
-pub const DOMAIN: &str = "devsandbox/route/v1";
+pub const DOMAIN: &str = "devsandbox/route/v2";
 
 /// The bound of a header's body.
 pub const HEADER_LIMIT: usize = 4096;
@@ -278,10 +287,10 @@ pub fn refuse(w: &mut impl Write, me: &str, why: &str) {
 }
 
 /// What both ends sign: the fleet's genesis hash, origin, destination,
-/// channel, path (its hops as one field) and both nonces (the origin's,
-/// then the destination's), each length-prefixed. The TTL isn't in it: each
-/// relay lowers it.
-fn transcript(genesis: &[u8; 32], h: &Header, nonce_o: &[u8; 32], nonce_d: &[u8; 32]) -> Vec<u8> {
+/// channel, path (its hops as one field) and both ephemeral keys (the
+/// origin's, then the destination's), each length-prefixed. The TTL isn't
+/// in it: each relay lowers it.
+fn transcript(genesis: &[u8; 32], h: &Header, e_o: &[u8; 32], e_d: &[u8; 32]) -> Vec<u8> {
     let mut path = Vec::new();
     for hop in &h.path {
         put(&mut path, hop.as_bytes());
@@ -292,8 +301,8 @@ fn transcript(genesis: &[u8; 32], h: &Header, nonce_o: &[u8; 32], nonce_d: &[u8;
     put(&mut out, h.dest.as_bytes());
     put(&mut out, &[channel_byte(h.channel)]);
     put(&mut out, &path);
-    put(&mut out, nonce_o);
-    put(&mut out, nonce_d);
+    put(&mut out, e_o);
+    put(&mut out, e_d);
     out
 }
 
@@ -308,12 +317,6 @@ fn signed(transcript: &[u8], role: &[u8]) -> Vec<u8> {
     out
 }
 
-fn nonce() -> Result<[u8; 32]> {
-    let mut n = [0u8; 32];
-    getrandom::fill(&mut n).map_err(|e| anyhow!("cannot read the OS random source: {e}"))?;
-    Ok(n)
-}
-
 fn genesis(stored: &Stored) -> Result<[u8; 32], String> {
     stored.log.membership().map(|m| m.genesis).ok_or_else(|| "this host has no membership log".to_string())
 }
@@ -323,62 +326,75 @@ fn resolved(stored: &Stored, name: &str) -> Result<(PublicKey, Option<String>), 
 }
 
 /// The origin's side, after it wrote `header` ([`write_header`]) on a
-/// stream reaching the destination: answers the challenge with `key`'s
-/// proof, then checks the destination's against `stored`. `Ok` once both
-/// ends are proven: the inner channel's bytes follow.
-pub fn origin_side(r: &mut impl Read, w: &mut impl Write, header: &Header, key: &SigningKey, stored: &Stored) -> Result<()> {
+/// stream reaching the destination: answers the challenge (the
+/// destination's ephemeral key) with its own and `key`'s proof, then checks
+/// the destination's against `stored`. Once both ends are proven, the
+/// session's keys ([`Keys`], the origin's end): the inner
+/// channel's bytes follow as its sealed records.
+pub fn origin_side(r: &mut impl Read, w: &mut impl Write, header: &Header, key: &SigningKey, stored: &Stored) -> Result<Keys> {
     let me = header.origin.as_str();
     let dest = header.dest.as_str();
     let mut chan = Chan { side: Side::Opener, r, w, peer: dest, read: read_msg };
     let challenge = (chan.read)(chan.r, SMALL, dest)?;
     let mut f = Fields(&challenge);
-    let nonce_d: [u8; 32] = f.array().and_then(|n| f.end().map(|()| n)).with_context(|| format!("`{dest}`'s challenge is malformed"))?;
-    let nonce_o = nonce()?;
-    let checked = genesis(stored).and_then(|g| resolved(stored, dest).map(|found| (g, found)));
-    let ours = checked.as_ref().map_err(|why| format!("`{me}`: {why}")).map(|(g, _)| {
-        let t = transcript(g, header, &nonce_o, &nonce_d);
+    let e_d: [u8; 32] = f.array().and_then(|n| f.end().map(|()| n)).with_context(|| format!("`{dest}`'s challenge is malformed"))?;
+    let ephemeral = Ephemeral::new()?;
+    let e_o = ephemeral.public();
+    let checked = genesis(stored).and_then(|g| resolved(stored, dest).map(|found| (g, found))).and_then(|found| {
+        let dh = ephemeral.agree(&e_d).map_err(|e| format!("`{dest}`'s challenge: {e:#}"))?;
+        Ok((found, dh))
+    });
+    let ours = checked.as_ref().map_err(|why| format!("`{me}`: {why}")).map(|((g, _), _)| {
+        let t = transcript(g, header, &e_o, &e_d);
         let mut out = Vec::new();
-        put(&mut out, &nonce_o);
+        put(&mut out, &e_o);
         out.extend(proof::encode_proof(&key.public_key(), &key.sign(DOMAIN, &signed(&t, ORIGIN))));
         out
     });
     let theirs = chan.exchange(ours, SMALL)?;
-    let (g, (expected, _)) = checked.expect("refused above otherwise");
-    let t = transcript(&g, header, &nonce_o, &nonce_d);
+    let ((g, (expected, _)), dh) = checked.expect("refused above otherwise");
+    let t = transcript(&g, header, &e_o, &e_d);
     let verdict = proof::check_proof(&theirs, &expected, stored, dest, DOMAIN, &signed(&t, DESTINATION));
-    chan.send(verdict.map(|_| Vec::new()).map_err(|why| format!("`{me}`: {why}")))
+    chan.send(verdict.map(|_| Vec::new()).map_err(|why| format!("`{me}`: {why}")))?;
+    Ok(Keys::derive(&dh, &t, Role::Origin))
 }
 
 /// The destination's side, after it read `header` ([`read_header`]):
-/// challenges the origin, checks its proof against `stored`, proves itself
-/// back with `key` and takes the origin's verdict. `me` is this member's
-/// name. A refusal is written back to the origin and returned.
-pub fn dest_side(r: &mut impl Read, w: &mut impl Write, header: &Header, me: &str, key: &SigningKey, stored: &Stored) -> Result<Routed> {
+/// challenges the origin with an ephemeral key, checks its proof against
+/// `stored`, proves itself back with `key` and takes the origin's verdict:
+/// the proven origin and the session's keys (the destination's end). `me`
+/// is this member's name. A refusal is written back to the origin and
+/// returned.
+pub fn dest_side(r: &mut impl Read, w: &mut impl Write, header: &Header, me: &str, key: &SigningKey, stored: &Stored) -> Result<(Routed, Keys)> {
     let origin = header.origin.as_str();
     let mut chan = Chan { side: Side::Answerer, r, w, peer: origin, read: read_msg };
-    let nonce_d = nonce()?;
+    let ephemeral = Ephemeral::new()?;
+    let e_d = ephemeral.public();
     let checked = if header.dest != me {
         Err(format!("{} isn't for `{me}`", header.what()))
     } else {
         genesis(stored).and_then(|g| resolved(stored, origin).map(|found| (g, found)))
     };
     let mut challenge = Vec::new();
-    put(&mut challenge, &nonce_d);
+    put(&mut challenge, &e_d);
     chan.send(checked.as_ref().map(|_| challenge).map_err(|why| format!("`{me}`: {why}")))?;
     let (g, (expected, introduced_by)) = checked.expect("refused above otherwise");
 
     let body = (chan.read)(chan.r, SMALL, origin)?;
-    let verdict = (|| -> Result<Vec<u8>, String> {
+    let verdict = (|| -> Result<(Vec<u8>, _), String> {
         let mut f = Fields(&body);
-        let nonce_o: [u8; 32] = f.array().map_err(|e| format!("`{origin}`'s key proof is malformed: {e:#}"))?;
-        let t = transcript(&g, header, &nonce_o, &nonce_d);
+        let e_o: [u8; 32] = f.array().map_err(|e| format!("`{origin}`'s key proof is malformed: {e:#}"))?;
+        let t = transcript(&g, header, &e_o, &e_d);
         proof::check_proof(f.0, &expected, stored, origin, DOMAIN, &signed(&t, ORIGIN))?;
-        Ok(t)
+        let dh = ephemeral.agree(&e_o).map_err(|e| format!("`{origin}`'s key proof: {e:#}"))?;
+        Ok((t, dh))
     })();
-    let ours = verdict.map(|t| proof::encode_proof(&key.public_key(), &key.sign(DOMAIN, &signed(&t, DESTINATION))));
+    let ours = verdict.as_ref().map(|(t, _)| proof::encode_proof(&key.public_key(), &key.sign(DOMAIN, &signed(t, DESTINATION))));
     chan.send(ours.map_err(|why| format!("`{me}`: {why}")))?;
+    let (t, dh) = verdict.expect("refused above otherwise");
     (chan.read)(chan.r, SMALL, origin)?;
-    Ok(Routed { origin: origin.to_string(), key: expected, introduced_by, channel: header.channel })
+    let routed = Routed { origin: origin.to_string(), key: expected, introduced_by, channel: header.channel };
+    Ok((routed, Keys::derive(&dh, &t, Role::Destination)))
 }
 
 /// Who serves a `ROUTE` stream here ([`serve`]): this member's name, the
@@ -392,8 +408,9 @@ pub struct Here<'a> {
 /// A `ROUTE` stream link peer `from` opened to this member (`here`): its
 /// header read and checked within [`OPENING`] ([`read_header`], that it
 /// came from `from`: [`came_from`]). For this member, the destination's
-/// side ([`dest_side`]): the proven origin and the stream, its inner
-/// channel's bytes next, to serve as the origin's (decision 57). Else a
+/// side ([`dest_side`]): the proven origin, the session's keys and the
+/// stream, its inner channel's sealed records next, to serve as the
+/// origin's (decision 57) through [`session::pump`](super::session::pump). Else a
 /// relay (decision 56, whatever this member's trust): [`relay_header`],
 /// then `reach` connects the next hop's link (`Err` why not: no direct
 /// link that's up), the header goes on one TTL lower and the rest is
@@ -404,7 +421,7 @@ pub fn serve(
     from: &str,
     here: &Here,
     reach: impl FnOnce(&str) -> Result<UnixStream, String>,
-) -> Result<Option<(Routed, UnixStream)>> {
+) -> Result<Option<(Routed, Keys, UnixStream)>> {
     let me = here.me;
     let (mut r, mut w) = (&stream, &stream);
     let refused = |w: &mut &UnixStream, e: anyhow::Error| {
@@ -417,9 +434,9 @@ pub fn serve(
         Err(e) => return refused(&mut w, e),
     };
     if header.dest == me {
-        let routed = dest_side(&mut r, &mut w, &header, me, here.key, here.stored)?;
+        let (routed, keys) = dest_side(&mut r, &mut w, &header, me, here.key, here.stored)?;
         stream.set_read_timeout(None).context("cannot clear a routed stream's read timeout")?;
-        return Ok(Some((routed, stream)));
+        return Ok(Some((routed, keys, stream)));
     }
     let hop = relay_header(&header, me, here.stored)
         .and_then(|hop| reach(&hop.next).map(|down| (hop, down)).map_err(|why| anyhow!("{}: {why}", header.what())));
@@ -455,9 +472,10 @@ pub fn splice(a: UnixStream, b: UnixStream) {
 /// `header`'s first hop (`fleet-<hop>.sock` in socket dir `dir`), its
 /// header written and its opening proven with `key` against `stored`
 /// ([`origin_side`]), all its reads within `budget` together (a stalled
-/// hop is a timeout, the next path's turn); the stream, ready for the
-/// inner channel's bytes.
-pub fn open(dir: &Path, header: &Header, key: &SigningKey, stored: &Stored, budget: Duration) -> Result<UnixStream> {
+/// hop is a timeout, the next path's turn); the stream and the session's
+/// keys, the inner channel's bytes next as sealed records
+/// ([`session::pump`](super::session::pump)).
+pub fn open(dir: &Path, header: &Header, key: &SigningKey, stored: &Stored, budget: Duration) -> Result<(UnixStream, Keys)> {
     header.check().with_context(|| header.what())?;
     let first = &header.path[0];
     let socket = endpoint::fleet_socket(dir, first);
@@ -466,9 +484,9 @@ pub fn open(dir: &Path, header: &Header, key: &SigningKey, stored: &Stored, budg
     let mut r = Until { stream: &stream, at: Instant::now() + budget };
     let mut w = &stream;
     write_header(&mut w, header)?;
-    origin_side(&mut r, &mut w, header, key, stored)?;
+    let keys = origin_side(&mut r, &mut w, header, key, stored)?;
     stream.set_read_timeout(None).context("cannot clear a routed stream's read timeout")?;
-    Ok(stream)
+    Ok((stream, keys))
 }
 
 /// Reads of `stream` that end at `at`: each waits what's left, none is
@@ -516,10 +534,12 @@ pub(crate) fn encode_unchecked(header: &Header) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
     use super::*;
     use crate::serve::fleet::membership::{Introduction, Log, Op};
+    use crate::serve::fleet::session;
 
     fn key(n: u8) -> SigningKey {
         SigningKey::from_seed([n; 32])
@@ -568,7 +588,7 @@ mod tests {
                     return Err(e);
                 }
             };
-            let out = dest_side(&mut r, &mut w, &header, me, &key(k), &stored);
+            let out = dest_side(&mut r, &mut w, &header, me, &key(k), &stored).map(|(routed, _)| routed);
             let _ = w.shutdown(Shutdown::Both);
             out
         })
@@ -591,7 +611,7 @@ mod tests {
             (destination("b", "lap", dk, dest_stored, far), None)
         };
         let (mut r, mut w) = split(o);
-        let origin = write_header(&mut w, &header).and_then(|()| origin_side(&mut r, &mut w, &header, &key(ok), &origin_stored));
+        let origin = write_header(&mut w, &header).and_then(|()| origin_side(&mut r, &mut w, &header, &key(ok), &origin_stored).map(drop));
         let _ = w.shutdown(Shutdown::Write);
         let dest = dest.join().unwrap();
         drop((r, w));
@@ -601,8 +621,8 @@ mod tests {
         Run { origin, dest }
     }
 
-    fn err<T: std::fmt::Debug>(r: Result<T>) -> String {
-        format!("{:#}", r.expect_err("refused"))
+    fn err<T>(r: Result<T>) -> String {
+        format!("{:#}", r.err().expect("refused"))
     }
 
     #[test]
@@ -615,24 +635,36 @@ mod tests {
         }
     }
 
+    /// The inner channel's bytes follow the opening as its session's
+    /// sealed records, each way.
     #[test]
-    fn the_inner_bytes_follow_the_opening() {
+    fn the_inner_bytes_follow_the_opening_sealed() {
         let (o, d) = UnixStream::pair().unwrap();
         let dest = thread::spawn(move || {
             let (mut r, mut w) = split(d);
             let h = read_header(&mut r, "lap").unwrap();
-            dest_side(&mut r, &mut w, &h, "b", &key(3), &stored()).unwrap();
-            let mut rest = String::new();
-            r.read_to_string(&mut rest).unwrap();
+            let (_, keys) = dest_side(&mut r, &mut w, &h, "b", &key(3), &stored()).map_err(|e| format!("{e:#}")).unwrap();
+            let mut opener = session::Opener::new(r, keys.open);
+            let mut rest = Vec::new();
+            while let Some(data) = opener.next().unwrap() {
+                rest.extend(data);
+            }
+            let mut sealer = session::Sealer::new(w, keys.seal);
+            sealer.seal_data(b"hi back").unwrap();
+            sealer.seal_end().unwrap();
             rest
         });
         let (mut r, mut w) = split(o);
         let h = Header::new("lap", Channel::Api, path(&["b"]));
         write_header(&mut w, &h).unwrap();
-        origin_side(&mut r, &mut w, &h, &key(1), &stored()).unwrap();
-        w.write_all(b"hello").unwrap();
-        w.shutdown(Shutdown::Write).unwrap();
-        assert_eq!(dest.join().unwrap(), "hello");
+        let keys = origin_side(&mut r, &mut w, &h, &key(1), &stored()).map_err(|e| format!("{e:#}")).unwrap();
+        let mut sealer = session::Sealer::new(&w, keys.seal);
+        sealer.seal_data(b"hello").unwrap();
+        sealer.seal_end().unwrap();
+        assert_eq!(dest.join().unwrap(), b"hello");
+        let mut opener = session::Opener::new(&r, keys.open);
+        assert_eq!(opener.next().unwrap().as_deref(), Some(&b"hi back"[..]));
+        assert!(opener.next().unwrap().is_none());
     }
 
     #[test]
@@ -645,7 +677,7 @@ mod tests {
         let (mut r, mut w) = split(o);
         let h = Header::new("new", Channel::Tunnel, path(&["b"]));
         write_header(&mut w, &h).unwrap();
-        origin_side(&mut r, &mut w, &h, &key(5), &s).unwrap();
+        origin_side(&mut r, &mut w, &h, &key(5), &s).map(drop).unwrap();
         let got = dest.join().unwrap().unwrap();
         assert_eq!((got.key, got.introduced_by.as_deref()), (pk(5), Some("k")));
     }
@@ -677,7 +709,7 @@ mod tests {
             let (mut r, mut w) = split(o);
             let h = Header::new("pi", Channel::Api, path(&["b"]));
             write_header(&mut w, &h).unwrap();
-            let origin = origin_side(&mut r, &mut w, &h, &key(6), &s);
+            let origin = origin_side(&mut r, &mut w, &h, &key(6), &s).map(drop);
             Run { origin, dest: dest.join().unwrap() }
         };
         let got = open(s);
@@ -713,7 +745,7 @@ mod tests {
         let (mut r, w) = split(o);
         let mut tee = Tee(w, Vec::new());
         write_header(&mut tee.0, &h).unwrap();
-        origin_side(&mut r, &mut tee, &h, &key(1), &stored()).unwrap();
+        origin_side(&mut r, &mut tee, &h, &key(1), &stored()).map(drop).unwrap();
         dest.join().unwrap().unwrap();
         let len = u32::from_be_bytes(tee.1[..4].try_into().unwrap()) as usize;
         let recorded = tee.1[..4 + len].to_vec();
@@ -879,5 +911,260 @@ mod tests {
         write_header(&mut w, &h).unwrap();
         assert!(err(origin_side(&mut r, &mut w, &h, &key(1), &stored())).contains("`m`: the routed stream from `lap` to `b` isn't for `m`"));
         assert!(dest.join().unwrap().is_err());
+    }
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Where a middle is in a direction's bytes: the opening's frames, then
+    /// the session's records.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Part {
+        Opening,
+        Record,
+    }
+
+    /// What a middle does with one frame or record.
+    enum To {
+        /// Forward it.
+        On(Vec<u8>),
+        /// Send it back where it came from.
+        Back(Vec<u8>),
+        /// End this direction here (a half-close onward).
+        Close,
+    }
+
+    fn on(_: Part, _: usize, b: Vec<u8>) -> Vec<To> {
+        vec![To::On(b)]
+    }
+
+    type Edit = Box<dyn FnMut(Part, usize, Vec<u8>) -> Vec<To> + Send>;
+
+    /// One direction of a middle: `opening` frames ([`proof`]'s: a `u32`
+    /// length, then that many bytes), then session records (a `u16`
+    /// length), each through `edit`; every byte it sends kept in `seen`.
+    fn middle(from: UnixStream, to: UnixStream, opening: usize, mut edit: Edit, seen: Arc<Mutex<Vec<u8>>>) {
+        thread::spawn(move || {
+            let send = |s: &UnixStream, b: &[u8]| -> io::Result<()> {
+                seen.lock().unwrap().extend_from_slice(b);
+                (&mut &*s).write_all(b)
+            };
+            let ok = (|| -> io::Result<()> {
+                let mut counts = [0usize; 2];
+                loop {
+                    let part = if counts[0] < opening { Part::Opening } else { Part::Record };
+                    let head = if part == Part::Opening { 4 } else { 2 };
+                    let mut len = vec![0u8; head];
+                    if let Err(e) = (&from).read_exact(&mut len) {
+                        return if e.kind() == io::ErrorKind::UnexpectedEof { Ok(()) } else { Err(e) };
+                    }
+                    let n = if head == 4 { u32::from_be_bytes(len[..].try_into().unwrap()) as usize } else { u16::from_be_bytes([len[0], len[1]]) as usize };
+                    let mut msg = len;
+                    msg.resize(head + n, 0);
+                    (&from).read_exact(&mut msg[head..])?;
+                    let i = &mut counts[(part == Part::Record) as usize];
+                    for out in edit(part, *i, msg) {
+                        match out {
+                            To::On(b) => send(&to, &b)?,
+                            To::Back(b) => send(&from, &b)?,
+                            To::Close => return Ok(()),
+                        }
+                    }
+                    *i += 1;
+                }
+            })();
+            if ok.is_ok() {
+                let _ = to.shutdown(Shutdown::Write);
+            } else {
+                let _ = to.shutdown(Shutdown::Both);
+                let _ = from.shutdown(Shutdown::Both);
+            }
+        });
+    }
+
+    /// A session from `lap` to `b` through relay `k` (a real [`serve`]),
+    /// with a middle between `lap` and `k` editing each direction: the
+    /// plaintext ends of both daemons' pumps, each end's result (its
+    /// opening, then its pump) and the bytes the middle carried.
+    struct Wired {
+        a: UnixStream,
+        b: UnixStream,
+        origin: mpsc::Receiver<Result<()>>,
+        dest: mpsc::Receiver<Result<()>>,
+        seen: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Wired {
+        fn new(to_d: Edit, to_o: Edit) -> Wired {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (o, mid_o) = UnixStream::pair().unwrap();
+            let (mid_k, far) = UnixStream::pair().unwrap();
+            let (near, d) = UnixStream::pair().unwrap();
+            // Toward `b`: the header, the origin's proof, its verdict; back:
+            // the challenge, the destination's proof.
+            middle(mid_o.try_clone().unwrap(), mid_k.try_clone().unwrap(), 3, to_d, seen.clone());
+            middle(mid_k, mid_o, 2, to_o, seen.clone());
+            relay("k", "lap", stored(), far, near);
+            let (a, a_pump) = UnixStream::pair().unwrap();
+            let (b, b_pump) = UnixStream::pair().unwrap();
+            let (tx, origin) = mpsc::channel();
+            thread::spawn(move || {
+                let h = Header::new("lap", Channel::Pty, path(&["k", "b"]));
+                let (mut r, mut w) = split(o);
+                let keys = write_header(&mut w, &h).and_then(|()| origin_side(&mut r, &mut w, &h, &key(1), &stored()));
+                let _ = tx.send(keys.and_then(|keys| session::pump(a_pump, w, keys)));
+            });
+            let (tx, dest) = mpsc::channel();
+            thread::spawn(move || {
+                let (mut r, mut w) = split(d);
+                let opened = read_header(&mut r, "k").and_then(|h| dest_side(&mut r, &mut w, &h, "b", &key(3), &stored()));
+                let _ = tx.send(opened.and_then(|(_, keys)| session::pump(b_pump, w, keys)));
+            });
+            for s in [&a, &b] {
+                s.set_read_timeout(Some(WAIT)).unwrap();
+            }
+            Wired { a, b, origin, dest, seen }
+        }
+
+        fn origin(&self) -> Result<()> {
+            self.origin.recv_timeout(WAIT).expect("the origin returns")
+        }
+
+        fn dest(&self) -> Result<()> {
+            self.dest.recv_timeout(WAIT).expect("the destination returns")
+        }
+    }
+
+    fn read_n(s: &UnixStream, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        (&mut &*s).read_exact(&mut buf).unwrap();
+        buf
+    }
+
+    /// What `s` reads to its end, a reset as the end.
+    fn rest(s: &UnixStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        let _ = (&mut &*s).read_to_end(&mut out);
+        out
+    }
+
+    #[test]
+    fn a_relay_carries_ciphertext_only() {
+        let w = Wired::new(Box::new(on), Box::new(on));
+        let marker = b"MARKER-the-plaintext-a-relay-never-sees";
+        (&w.a).write_all(marker).unwrap();
+        assert_eq!(read_n(&w.b, marker.len()), marker);
+        (&w.b).write_all(b"MARKER-and-back").unwrap();
+        assert_eq!(read_n(&w.a, 15), b"MARKER-and-back");
+        w.a.shutdown(Shutdown::Write).unwrap();
+        w.b.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(rest(&w.a), b"");
+        assert_eq!(rest(&w.b), b"");
+        w.origin().unwrap();
+        w.dest().unwrap();
+        let seen = w.seen.lock().unwrap();
+        assert!(!seen.windows(6).any(|x| x == b"MARKER"), "the middle saw plaintext");
+    }
+
+    /// A middle editing the origin's session records (`to_d`): `b`'s end
+    /// fails with `want` and never delivers what `a` sent after `kept`.
+    fn tampered_to_d(edit: impl FnMut(usize, Vec<u8>) -> Vec<To> + Send + 'static, kept: &[u8], want: &str) {
+        let mut edit = edit;
+        let w = Wired::new(
+            Box::new(move |part, i, b| if part == Part::Record { edit(i, b) } else { vec![To::On(b)] }),
+            Box::new(on),
+        );
+        (&w.a).write_all(b"one").unwrap();
+        if !kept.is_empty() {
+            assert_eq!(read_n(&w.b, kept.len()), kept);
+        }
+        (&w.a).write_all(b"two").unwrap();
+        w.a.shutdown(Shutdown::Write).unwrap();
+        let got = rest(&w.b);
+        assert!(!got.windows(3).any(|x| x == b"two"), "altered bytes delivered: {got:?}");
+        let e = format!("{:#}", w.dest().err().expect("the destination's pump fails"));
+        assert!(e.contains(want), "{e}");
+    }
+
+    #[test]
+    fn a_flipped_byte_breaks_the_session_end_to_end() {
+        tampered_to_d(
+            |_, mut rec| {
+                rec[3] ^= 1;
+                vec![To::On(rec)]
+            },
+            b"",
+            "authenticate",
+        );
+    }
+
+    #[test]
+    fn a_dropped_or_replayed_record_breaks_the_session_end_to_end() {
+        // Each write is one record: `one` is record 0, `two` record 1.
+        tampered_to_d(|i, rec| if i == 0 { vec![] } else { vec![To::On(rec)] }, b"", "authenticate");
+        tampered_to_d(|i, rec| if i == 1 { vec![] } else { vec![To::On(rec)] }, b"one", "authenticate");
+        tampered_to_d(|i, rec| if i == 0 { vec![To::On(rec.clone()), To::On(rec)] } else { vec![To::On(rec)] }, b"one", "authenticate");
+    }
+
+    #[test]
+    fn a_truncation_breaks_the_session_end_to_end() {
+        // The middle closes after `one`, without the origin's END.
+        let w = Wired::new(Box::new(|part, i, b| if part == Part::Record && i > 0 { vec![To::Close] } else { vec![To::On(b)] }), Box::new(on));
+        (&w.a).write_all(b"one").unwrap();
+        assert_eq!(read_n(&w.b, 3), b"one");
+        w.a.shutdown(Shutdown::Write).unwrap();
+        let e = format!("{:#}", w.dest().err().expect("the destination's pump fails"));
+        assert!(e.contains("without its end record"), "{e}");
+    }
+
+    #[test]
+    fn a_reflected_record_breaks_the_session_end_to_end() {
+        let w = Wired::new(Box::new(|part, _, b| if part == Part::Record { vec![To::Back(b)] } else { vec![To::On(b)] }), Box::new(on));
+        (&w.a).write_all(b"echo?").unwrap();
+        let got = rest(&w.a);
+        assert!(!got.windows(5).any(|x| x == b"echo?"), "a reflected record delivered: {got:?}");
+        let e = format!("{:#}", w.origin().err().expect("the origin's pump fails"));
+        assert!(e.contains("authenticate"), "{e}");
+    }
+
+    /// An ephemeral key in an opening frame (its body's first field: after
+    /// the frame's length and tag and the field's length) replaced.
+    fn swap_key(mut frame: Vec<u8>, with: [u8; 32]) -> Vec<u8> {
+        frame[9..41].copy_from_slice(&with);
+        frame
+    }
+
+    #[test]
+    fn a_swapped_ephemeral_key_is_refused() {
+        let theirs = session::Ephemeral::new().unwrap().public();
+        // The destination's, in its challenge: the origin signs over the
+        // middle's key, so its proof doesn't verify at `b`.
+        let w = Wired::new(
+            Box::new(on),
+            Box::new(move |part, i, b| vec![To::On(if part == Part::Opening && i == 0 { swap_key(b, theirs) } else { b })]),
+        );
+        let d = format!("{:#}", w.dest().err().expect("refused"));
+        assert!(d.contains("`lap`'s key proof doesn't verify"), "{d}");
+        let o = format!("{:#}", w.origin().err().expect("refused"));
+        assert!(o.contains("is refused: `b`: `lap`'s key proof doesn't verify"), "{o}");
+        // The origin's, in its proof: the same.
+        let w = Wired::new(
+            Box::new(move |part, i, b| vec![To::On(if part == Part::Opening && i == 1 { swap_key(b, theirs) } else { b })]),
+            Box::new(on),
+        );
+        let d = format!("{:#}", w.dest().err().expect("refused"));
+        assert!(d.contains("`lap`'s key proof doesn't verify"), "{d}");
+        assert!(w.origin().is_err());
+    }
+
+    #[test]
+    fn a_low_order_challenge_key_is_refused_by_the_origin() {
+        let w = Wired::new(
+            Box::new(on),
+            Box::new(|part, i, b| vec![To::On(if part == Part::Opening && i == 0 { swap_key(b, [0; 32]) } else { b })]),
+        );
+        let o = format!("{:#}", w.origin().err().expect("refused"));
+        assert!(o.contains("`lap`: `b`'s challenge: ") && o.contains("non-contributory"), "{o}");
+        let d = format!("{:#}", w.dest().err().expect("refused"));
+        assert!(d.contains("is refused: `lap`: `b`'s challenge: ") && d.contains("non-contributory"), "{d}");
     }
 }

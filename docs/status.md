@@ -63,7 +63,7 @@ limitation means editing this file in the same commit.
   trust worker` warns when a machine the hub's side controls dials this
   host. In progress: end-to-end sessions and routed `AGENT` (step 10c,
   sub-steps 10c.1-10c.5 in the plan).
-  → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)
+  → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md), [ADR 0046](decisions/0046-routed-streams-are-end-to-end-sessions.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
 - **helper**: drop the host-side `lsof` fallback for a forward's listening
@@ -298,10 +298,6 @@ limitation means editing this file in the same commit.
   reported since; a Machines tab row's `exposed via` follows a graph
   change at the next push (the next poll pass or machine change).
   → [fleet](architecture/daemon/fleet.md#exposure); `fleet::graph::exposed_workers`
-- Until fleet step 10c a relay sees and can alter a routed stream's
-  bytes after its opening (only the opening is proven end to end), and
-  so can drive the API calls its origin makes.
-  → [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md); `fleet::route::serve`
 - A routed stream doesn't fail over once open: a hop going down ends it,
   and its client opens it again.
   → [fleet](architecture/daemon/fleet.md#routed-streams); `fleet::routes::first_open`

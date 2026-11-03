@@ -1062,7 +1062,10 @@ impl Shared {
     /// 56). One for this host is served as one of its origin's streams on
     /// its inner channel ([`serve_channel`](Self::serve_channel)), under
     /// this host's trust table for the origin ([`fleet_peer`](Self::fleet_peer),
-    /// no agent: decision 57).
+    /// no agent: decision 57): the handler gets one end of a socket pair,
+    /// the stream's session (`fleet::session::pump`) runs between the other
+    /// and the sealed stream on this thread, so it's counted while it lasts
+    /// (decision 64).
     fn serve_route(self: &Arc<Self>, from: &lent::Peer, stream: Stream) {
         let identity = self
             .member
@@ -1077,7 +1080,7 @@ impl Shared {
             }
         };
         let here = fleet::route::Here { me: &identity.name, key: identity.signer_for(&identity.stored), stored: &identity.stored };
-        let (routed, stream) = match fleet::route::serve(stream, &from.name, &here, |next| self.route_next(next)) {
+        let (routed, keys, stream) = match fleet::route::serve(stream, &from.name, &here, |next| self.route_next(next)) {
             Ok(Some(arrived)) => arrived,
             Ok(None) => return,
             Err(e) => return log(&format!("fleet: refused a routed stream from {}: {e:#}", from.name)),
@@ -1088,8 +1091,17 @@ impl Shared {
             .context("this daemon has no data dir for a fleet root")
             .and_then(|data| self.fleet_peer(data, origin, routed.key, routed.introduced_by.clone(), None));
         let channel = routed.channel.as_str();
-        match peer.map(|p| self.serve_channel(routed.channel, &Arc::new(p), stream)) {
-            Ok(true) => log(&format!("fleet: a routed {channel} stream from {origin} (via {})", from.name)),
+        let (plain, theirs) = match Stream::pair() {
+            Ok(pair) => pair,
+            Err(e) => return log(&format!("fleet: a routed stream from {origin}: cannot make its socket pair: {e}")),
+        };
+        match peer.map(|p| self.serve_channel(routed.channel, &Arc::new(p), theirs)) {
+            Ok(true) => {
+                log(&format!("fleet: a routed {channel} stream from {origin} (via {})", from.name));
+                if let Err(e) = fleet::session::pump(plain, stream, keys) {
+                    log(&format!("fleet: a routed {channel} stream from {origin}: {e:#}"));
+                }
+            }
             Ok(false) => log(&format!("fleet: refused a routed {channel} stream from {origin}")),
             Err(e) => log(&format!("fleet: a routed stream from {origin}: {e:#}")),
         }
@@ -1178,13 +1190,18 @@ impl Shared {
     }
 
     /// `client`'s channel byte read, a routed stream to `dest` opened on it
-    /// ([`open_routed`](Self::open_routed)) and spliced to `client` until
-    /// both ways end. None opening: logged, and an `API` client answered
-    /// why (`fleet::routes::refuse_api`); any other closed.
+    /// ([`open_routed`](Self::open_routed)) and its session pumped between
+    /// `client` and it (`fleet::session::pump`, decision 64) until both
+    /// ways end. None opening: logged, and an `API` client answered why
+    /// (`fleet::routes::refuse_api`); any other closed.
     fn serve_routed(&self, dest: &str, client: Stream) {
         let Some(byte) = fleet::link::read_channel(&client) else { return };
         match self.open_routed(dest, byte) {
-            Ok(stream) => fleet::route::splice(client, stream),
+            Ok((stream, keys)) => {
+                if let Err(e) = fleet::session::pump(client, stream, keys) {
+                    log(&format!("fleet: a routed stream to {dest}: {e:#}"));
+                }
+            }
             Err(why) => {
                 log(&format!("fleet: a routed stream to {dest}: {why}"));
                 if byte == crate::devsbd::proto::channel::API {
@@ -1199,8 +1216,9 @@ impl Shared {
     /// picks it, `Identity::signer_for`): its graph's paths in order
     /// (`fleet::routes::first_open`), skipping those whose first hop has
     /// no link up here, each attempt within `fleet::routes::ATTEMPT` and
-    /// all within [`route_budget`](Self::route_budget). Else why not.
-    fn open_routed(&self, dest: &str, byte: u8) -> Result<Stream, String> {
+    /// all within [`route_budget`](Self::route_budget): the stream and its
+    /// session's keys. Else why not.
+    fn open_routed(&self, dest: &str, byte: u8) -> Result<(Stream, fleet::session::Keys), String> {
         let channel = fleet::route::channel_of(byte).ok_or_else(|| format!("no channel {byte}"))?;
         let identity = self
             .member

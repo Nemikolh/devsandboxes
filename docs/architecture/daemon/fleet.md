@@ -24,7 +24,9 @@ membership changes; and routing: the [link graph](#link-graph) of the
 members' signed link reports, the [routed streams](#routed-streams)
 that reach a member with no link here through others, each proving its
 origin to its destination
-([ADR 0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)),
+([ADR 0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md))
+and sealed end to end between them
+([ADR 0046](../../decisions/0046-routed-streams-are-end-to-end-sessions.md)),
 and the [exposure](#exposure) the graph shows.
 
 **How a machine joins** (decisions 28 and 30 of the plan): on a laptop
@@ -1617,15 +1619,16 @@ it never signs on a remote request alone (decision 49;
 
 A member reaches another it has no link to through members that have
 one (decision 21,
-[ADR 0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)).
+[ADR 0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md),
+[ADR 0046](../../decisions/0046-routed-streams-are-end-to-end-sessions.md)).
 Every member signs a report of its own links and the members flood
 them, so each holds the fleet's [link graph](#link-graph); a client
 connects to the daemon's `route-<member>.sock`, and the daemon opens a
 [routed stream](#routed-streams) along the graph's paths in order, each
 hop a peer link that's up. The stream's origin and destination prove
-their keys to each other at its opening, so the destination serves it
-under its trust for the origin, never for a relay, and relays carry it
-whatever their own trust. Members reached only this way are
+their keys to each other at its opening and agree its session, so the
+destination serves it under its trust for the origin, never for a
+relay, and relays carry its ciphertext whatever their own trust. Members reached only this way are
 [routed machines](machines.md#routed-machines): calls, verbs,
 terminals, forwards, placement and the `fleet.*` calls
 (`leave::call`, `service::Handle::call_member`) reach them, `AGENT`
@@ -1751,25 +1754,50 @@ origin reads which hop refused and why.
   unread both ways until both end (`route::splice`). Relaying isn't
   access (decision 56): no trust table applies, so a `worker` member
   relays too.
-- **The proof** (decision 54), after the header: the destination
-  (`route::dest_side`) resolves the origin (a log member, or a held
-  introduction, capped) and sends a challenge, a 32-byte nonce from the
-  OS RNG. The origin (`route::origin_side`) answers with its own nonce,
-  its key and its signature, in `route::DOMAIN`
-  (`devsandbox/route/v1`, apart from the link proof's), over the
+- **The proof** (decisions 54 and 61), after the header: the
+  destination (`route::dest_side`) resolves the origin (a log member, or
+  a held introduction, capped) and sends a challenge, a fresh ephemeral
+  x25519 public key (`session::Ephemeral`, seeded from the OS RNG). The
+  origin (`route::origin_side`) answers with its own ephemeral key, its
+  member key and its signature, in `route::DOMAIN`
+  (`devsandbox/route/v2`, apart from the link proof's), over the
   transcript (`route::transcript`: the fleet's genesis hash, origin,
-  destination, channel, path and both nonces; not the TTL, which each
-  relay lowers) and its role (`origin`). The destination checks the key
-  is the one the origin's name resolved to (a revoked key says so) and
-  the signature (`proof::check_proof`), then proves itself back the
-  same way in its role (`destination`); the origin checks that key is
-  the destination's, so a relay answering in its place is refused, and
-  sends its verdict (empty, or a refusal). A fresh nonce on each side
-  means no recorded proof verifies again. The destination comes out
-  with `route::Routed` (the origin, its proven key, its introducer, the
-  inner channel); the inner channel's bytes follow the verdict. A
-  destination proves with the key a link would (`Identity::signer_for`
-  its own log).
+  destination, channel, path and both ephemeral keys, the origin's
+  first; not the TTL, which each relay lowers) and its role (`origin`).
+  The destination checks the key is the one the origin's name resolved
+  to (a revoked key says so) and the signature (`proof::check_proof`),
+  then proves itself back the same way in its role (`destination`); the
+  origin checks that key is the destination's, so a relay answering in
+  its place is refused, and sends its verdict (empty, or a refusal).
+  Fresh ephemeral keys on each side mean no recorded proof verifies
+  again, and a relay that swaps either for its own breaks the signature
+  over it. Each end refuses a peer's ephemeral key whose DH output isn't
+  contributory (`Ephemeral::agree`: a low-order key), the origin before
+  it signs. The destination comes out with `route::Routed` (the origin,
+  its proven key, its introducer, the inner channel); both ends with the
+  session's keys (`session::Keys`). A destination proves with the key a
+  link would (`Identity::signer_for` its own log).
+- **The session** (`src/serve/fleet/session.rs`, decisions 62-64): each
+  end derives the keys from the DH output and the transcript
+  (`Keys::derive`: HKDF-SHA256, the transcript's SHA-256 as salt, one
+  key per direction with the direction in the info, so a record
+  reflected to its sender doesn't open), and every byte of the inner
+  channel after the verdict is a sealed record (`session::Sealer`,
+  `session::Opener`): a `u16` length, then a ChaCha20-Poly1305
+  ciphertext of at most `session::MAX_RECORD` (16 KiB) of plaintext, its
+  nonce the direction's record counter, its type (data or end) its
+  associated data. Each direction ends with an end record; a bare EOF,
+  a record that doesn't authenticate (altered, dropped, reordered,
+  replayed or reflected) or a byte after the end is an error that tears
+  both directions down (`session::pump`), never a half-close. The
+  session's ends are the two daemons: the origin's `Shared::serve_routed`
+  pumps between the client's connection and the stream, the
+  destination's `Shared::serve_route` between the stream and one end of
+  a socket pair whose other end its inner channel's handler serves, on
+  the `serve-route` thread. Handlers and relays are as for a direct
+  link's streams; a relay carries ciphertext only, and can't read,
+  change, inject into, replay or redirect a stream. Direct link streams
+  carry no session: ssh secures them.
 - **The destination** (decision 57) serves the inner channel
   (`Shared::serve_channel`) as one of the origin's own streams: its
   `Peer` is built as a direct peer's (`Shared::fleet_peer`: the proven
@@ -1778,9 +1806,9 @@ origin reads which hop refused and why.
   trust table for the origin.
 - **The origin** over a link (`route::open`): a `ROUTE` connection to its
   first hop's `fleet-<hop>.sock`, the header, `route::origin_side`, its
-  reads within one budget together (`route::Until`); the stream it
-  returns carries the inner channel (for `API`, the hello as over a
-  link).
+  reads within one budget together (`route::Until`); it returns the
+  stream and the session's keys, the inner channel's bytes (for `API`,
+  the hello as over a link) carried sealed through them.
 - **The requester** (`src/serve/fleet/routes.rs`, decision 21): the
   daemon (with a `member.toml`) binds `route-<member>.sock`
   (`endpoint::route_socket`) in its socket dir for every member its graph
@@ -1804,8 +1832,8 @@ origin reads which hop refused and why.
   `routes::ATTEMPT` (5 s) and all of them within the machine links'
   handshake wait (`service::Timing::handshake`, a client's hello waiting
   as long); a refusal, a timeout or a failed connect is the next path's
-  turn. The first that opens is spliced to the connection
-  (`route::splice`). None opening, the failures are logged in path order
+  turn. The first that opens is pumped to the connection through its
+  session (`session::pump`). None opening, the failures are logged in path order
   (`routes::failure`: ``no path to `<member>` opened: via <hops>: <why>;
   …``, or ``no path to `<member>` in this host's link graph``); an `API` client gets
   that as the error answering its hello (`routes::refuse_api`, code

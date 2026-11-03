@@ -1516,9 +1516,14 @@ pub(crate) mod tests {
     }
 
     /// `member_toml`'s member opening `header` over its link in `dir`
-    /// (`route::open`, its own key and log).
+    /// (`route::open`, its own key and log): the plaintext end of its
+    /// session, pumped on a thread (`session::pump`) as the daemon's
+    /// `serve_routed` does.
     fn open_routed(dir: &Path, member_toml: &Path, header: &route::Header) -> Result<UnixStream> {
-        route::open(dir, header, &test_support::key_of(member_toml), &test_support::read(member_toml).unwrap(), route::OPENING)
+        let (sealed, keys) = route::open(dir, header, &test_support::key_of(member_toml), &test_support::read(member_toml).unwrap(), route::OPENING)?;
+        let (plain, pumped) = UnixStream::pair()?;
+        std::thread::spawn(move || crate::serve::fleet::session::pump(pumped, sealed, keys));
+        Ok(plain)
     }
 
     /// An API connection over a routed `stream` to `dest` (the hello as
@@ -1574,7 +1579,7 @@ pub(crate) mod tests {
             let stream = link::connect(&endpoint::fleet_socket(&trio.k_dir, "b"), channel::ROUTE).unwrap();
             let (mut r, mut w) = (&stream, &stream);
             route::write_header(&mut w, &header).unwrap();
-            let e = format!("{:#}", route::origin_side(&mut r, &mut w, &header, &k_key, &k_log).unwrap_err());
+            let e = format!("{:#}", route::origin_side(&mut r, &mut w, &header, &k_key, &k_log).err().expect("refused"));
             assert!(e.contains(want), "{p:?}: {e}");
         }
         trio.finish();
@@ -1596,7 +1601,7 @@ pub(crate) mod tests {
         proof::write_raw(&mut &stream, proof::MESSAGE, &route::encode_unchecked(&agent)).unwrap();
         let a_key = test_support::key_of(&trio.a_member);
         let a_log = test_support::read(&trio.a_member).unwrap();
-        let e = format!("{:#}", route::origin_side(&mut &stream, &mut &stream, &agent, &a_key, &a_log).unwrap_err());
+        let e = format!("{:#}", route::origin_side(&mut &stream, &mut &stream, &agent, &a_key, &a_log).err().expect("refused"));
         assert!(e.contains("is refused: `box`: the routed stream from `lap` to `b`: `agent` isn't routed"), "{e}");
         trio.finish();
     }

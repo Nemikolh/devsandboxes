@@ -30,7 +30,8 @@
 //!   sent to the hub (`fleet.report`), the reports exchanged and pushed
 //!   (`fleet.graph`), the graph the daemon holds (`graph.get`).
 //! - `route`: a routed stream (`ROUTE`): its header, the origin's and the
-//!   destination's proof, how a link end relays or answers one, and
+//!   destination's proof and their session's keys, how a link end relays
+//!   or answers one, and
 //!   [`route::connect`], how a local client reaches a member;
 //!   `routes`: the daemon's `route-<member>.sock` per member it has no
 //!   link up to, each connection opened over the graph's paths in order.
@@ -79,8 +80,6 @@ pub mod proposals;
 pub mod reports;
 pub mod route;
 pub mod routes;
-// Only its tests use it until routed streams pump through it (fleet plan 10c.2).
-#[allow(dead_code)]
 pub mod session;
 pub mod pty;
 pub mod pty_client;

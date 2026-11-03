@@ -5,7 +5,8 @@ Status: in progress. Steps 1-9, 10a and 10b shipped
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md),
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
 [0044](../../decisions/0044-one-fleet-authority-signs-membership.md),
-[0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)):
+[0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md),
+[0046](../../decisions/0046-routed-streams-are-end-to-end-sessions.md)):
 steps 1-6 on two kinds of machine (ssh machines and lending workers),
 steps 7-8 down to one: every machine one peer link per pair, reached
 only over its channels, a laptop joining with `machine add <hub>`;
