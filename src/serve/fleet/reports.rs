@@ -262,6 +262,13 @@ impl Published {
         self.changed();
     }
 
+    /// This host's report due at once, whatever its links did (its trust
+    /// changed: `member.set`), and the thread woken. Doesn't block.
+    pub fn republish(&self) {
+        self.lock().tracker.now(Instant::now());
+        self.cv.notify_all();
+    }
+
     /// `f` called on each poke and graph change from now on (once: a
     /// second one is ignored). Must not block.
     pub fn on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
@@ -586,6 +593,17 @@ mod tests {
         assert_eq!(r.trust, Trust::Full);
     }
 
+    #[test]
+    fn a_republish_makes_a_report_due_now_whatever_the_links() {
+        let p = Published::default();
+        assert_eq!(p.lock().tracker.due(), None, "nothing changed");
+        p.republish();
+        let at = Instant::now();
+        let mut st = p.lock();
+        assert!(st.tracker.due().is_some_and(|d| d <= at), "due at once, no debounce");
+        assert!(st.tracker.take_due(at));
+    }
+
     /// `lap` (1) the authority, `box` (2) the hub, `pi` (3).
     fn stored() -> Stored {
         let k = |n: u8| SigningKey::from_seed([n; 32]);
@@ -664,6 +682,15 @@ mod tests {
         assert_eq!(link(&on_k, "lap", "box").unwrap()["dials"], json!(true));
         let always_on = |g: &Value, member: &str| g["reports"].as_array().unwrap().iter().find(|r| r["report"]["member"] == member).unwrap()["report"]["always_on"].clone();
         assert_eq!((always_on(&on_l, "box"), always_on(&on_k, "lap")), (json!(true), json!(false)), "the hub never idles out");
+
+        // A trust change on L reaches K's graph with no link change.
+        let trust = |g: &Value, member: &str| {
+            g["reports"].as_array().and_then(|rs| rs.iter().find(|r| r["report"]["member"] == member)).map(|r| r["report"]["trust"].clone())
+        };
+        assert_eq!(trust(&on_k, "lap"), Some(json!("worker")));
+        let set = connect(&pair.l_dir).call("member.set", json!({"trust": "full"})).unwrap();
+        assert_eq!(set.result.unwrap()["trust"], "full");
+        wait_for("lap's full trust on K", Duration::from_secs(20), || trust(&get(&pair.k_dir), "lap") == Some(json!("full")));
         pair.finish();
     }
 

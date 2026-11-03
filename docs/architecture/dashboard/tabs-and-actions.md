@@ -52,7 +52,10 @@ for Instances when the last machine goes. Each keeps its own selected row.
   ([inbox-tab.md](inbox-tab.md)).
 - **Machines**: one row per machine, in the snapshot's `machines` order
   (`SnapshotMachine`, `ui.rs` `draw_machines`; on a fleet member those
-  seen through the hub last): NAME, TARGET (dimmed `inbound` for an
+  seen through the hub last): NAME (then `exposed via <dialer>` in
+  yellow while it's `worker` and exposed through another machine,
+  `ui.rs` `machine_name_text`;
+  [../daemon/fleet.md](../daemon/fleet.md#exposure)), TARGET (dimmed `inbound` for an
   inbound one, `via <hub>` for a routed one, seen through the hub), STATE
   (`LinkState::as_str`, with `: <error>` when set), AGENT
   (`on`/`off`, `-` for an inbound one or one via the hub), VERSION (`-` before a link) and

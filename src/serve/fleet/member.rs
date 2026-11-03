@@ -263,7 +263,16 @@ pub struct MemberInfo {
     /// rotate`), the key once a membership log listing it is taken; `None`
     /// when none is pending.
     pub next: Option<KeyInfo>,
+    /// While this host is `worker` and exposed through another machine
+    /// (`fleet::graph::exposed_workers`, over this host's link graph): the
+    /// chain from the hub, its last but one dialing this host (a shell
+    /// here). `None` otherwise.
+    pub exposed_by: Option<Vec<String>>,
 }
+
+/// The [`MemberInfo::exposed_by`] chain of the member of this name at this
+/// trust (the daemon's link graph).
+pub type Exposure<'a> = &'a dyn Fn(&str, Trust) -> Option<Vec<String>>;
 
 /// `member.set`'s params: each one present is changed, the rest kept.
 #[derive(Debug, Default, Deserialize)]
@@ -308,12 +317,14 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
 
 /// The answer for `member`, its key loaded (or created) from `member.key`
 /// next to `path`.
-fn info(member: &Member, path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
+fn info(member: &Member, path: &Path, hostname: &str, exposure: Exposure) -> Result<MemberInfo, ApiError> {
     let key = FileKeyStore::new(key_path(path)).public_key().map_err(ApiError::internal)?;
     let next = crate::serve::fleet::membership_api::pending_next(path)?;
+    let name = member.name_or(hostname).ok();
     Ok(MemberInfo {
         next,
-        name: member.name_or(hostname).ok(),
+        exposed_by: name.as_deref().and_then(|n| exposure(n, member.trust)),
+        name,
         hub: member.hub().field(),
         trust: member.trust,
         dev_builds: member.dev_builds,
@@ -325,21 +336,22 @@ fn info(member: &Member, path: &Path, hostname: &str) -> Result<MemberInfo, ApiE
 
 /// `member.get` over the file at `path`; `hostname` names this host when
 /// the file doesn't. The first one creates `member.key`.
-pub fn get(path: &Path, hostname: &str) -> Result<MemberInfo, ApiError> {
+pub fn get(path: &Path, hostname: &str, exposure: Exposure) -> Result<MemberInfo, ApiError> {
     let member = load(path).map_err(ApiError::internal)?.unwrap_or_default();
-    info(&member, path, hostname)
+    info(&member, path, hostname, exposure)
 }
 
 /// `member.set`: `p` merged into the file, checked, written. Nothing else
 /// follows it: a peer link reads the name at its next dial
-/// (`fleet::dialer::member_name`), the rest is read at each use.
-pub fn set(path: &Path, hostname: &str, p: &SetParams) -> Result<MemberInfo, ApiError> {
+/// (`fleet::dialer::member_name`), the rest is read at each use. The
+/// answer's `exposed_by` is at the new trust.
+pub fn set(path: &Path, hostname: &str, p: &SetParams, exposure: Exposure) -> Result<MemberInfo, ApiError> {
     let after = update(path, |cur| -> Result<Member, ApiError> {
         *cur = merge(cur.clone(), p)?;
         Ok(cur.clone())
     })
     .map_err(ApiError::internal)??;
-    info(&after, path, hostname)
+    info(&after, path, hostname, exposure)
 }
 
 /// `hub` written as `hub` (from an accepted membership log, or
@@ -360,11 +372,11 @@ pub fn set_fleet(path: &Path, name: Option<&str>, hub: &Hub) -> Result<Member> {
 }
 
 /// Run `method` if it's a `member.*` one; `None` otherwise.
-pub fn call(method: &str, params: Value, path: &Path, hostname: &str) -> Option<Answer> {
+pub fn call(method: &str, params: Value, path: &Path, hostname: &str, exposure: Exposure) -> Option<Answer> {
     let to_value = |info: MemberInfo| serde_json::to_value(info).map_err(|e| ApiError::internal(e.into()));
     let answer = match method {
-        "member.get" => get(path, hostname).and_then(to_value),
-        "member.set" => parse_params(params).and_then(|p: SetParams| set(path, hostname, &p)).and_then(to_value),
+        "member.get" => get(path, hostname, exposure).and_then(to_value),
+        "member.set" => parse_params(params).and_then(|p: SetParams| set(path, hostname, &p, exposure)).and_then(to_value),
         _ => return None,
     };
     Some(answer)
@@ -507,8 +519,10 @@ mod tests {
             fingerprint: key.fingerprint(),
             key,
             next: Some(KeyInfo::of(&key)),
+            exposed_by: Some(vec!["box".into(), "lap".into()]),
         };
         assert_matches("MemberInfo", &serde_json::to_value(&info).unwrap());
+        assert_eq!(serde_json::to_value(&info).unwrap()["exposed_by"], json!(["box", "lap"]));
         assert_matches("MembershipKey", &serde_json::to_value(&info).unwrap()["next"]);
         assert_matches("MemberInfo", &serde_json::to_value(MemberInfo { hub: None, ..info }).unwrap());
         assert_eq!(union_members("MemberTrust"), ["'worker'", "'full'"]);
@@ -521,7 +535,9 @@ mod tests {
         let dir = scratch("api");
         let path = dir.join("member.toml");
         let host = "lap.local";
-        let call = |method: &str, params: Value| super::call(method, params, &path, host);
+        // Exposed while `worker`, as the daemon's graph would say.
+        let exposure = |name: &str, trust: Trust| (trust == Trust::Worker).then(|| vec!["k".to_string(), name.to_string()]);
+        let call = |method: &str, params: Value| super::call(method, params, &path, host, &exposure);
         let mut got = call("member.get", Value::Null).unwrap().unwrap();
         assert!(!path.exists(), "a get writes no member.toml");
         // The first get makes the key; every answer says the same one.
@@ -531,7 +547,10 @@ mod tests {
         for f in ["key", "fingerprint"] {
             assert_eq!(got.as_object_mut().unwrap().remove(f).unwrap(), key_fields[f], "{f}");
         }
-        assert_eq!(got, json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null}));
+        assert_eq!(
+            got,
+            json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null, "exposed_by": ["k", "lap"]})
+        );
         // A pending rotation shows.
         let next = FileKeyStore::new(key_path(&path)).next_key().unwrap().public_key();
         let got = call("member.get", Value::Null).unwrap().unwrap();
@@ -541,6 +560,7 @@ mod tests {
         let set = call("member.set", json!({"trust": "full", "roots_add": ["/srv/cfg"]})).unwrap().unwrap();
         assert_eq!((&set["key"], &set["fingerprint"]), (&key_fields["key"], &key_fields["fingerprint"]));
         assert_eq!((&set["trust"], &set["roots"]), (&json!("full"), &json!(["/srv/cfg"])));
+        assert_eq!(set["exposed_by"], Value::Null, "at the new trust");
         assert_eq!(load(&path).unwrap().unwrap().trust, Trust::Full, "written");
         assert!(dir.join("member.lock").exists(), "written through locked_file");
 

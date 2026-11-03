@@ -88,6 +88,10 @@ pub struct Ctx {
     /// approval, `changes`): `devsbd::desktop` on the host side, else only
     /// logged.
     pub notify: Box<dyn Fn(&str) + Send + Sync>,
+    /// The members this host's link graph says `worker` buys little for,
+    /// with their chains (`fleet::graph::exposed_workers`): `list`'s
+    /// `exposed_by`.
+    pub exposed: Box<dyn Fn() -> std::collections::BTreeMap<String, Vec<String>> + Send + Sync>,
 }
 
 /// Run `method` if it's a `machines.*` one; `None` otherwise.
@@ -170,6 +174,11 @@ pub struct MachineRow {
     /// `None` for a machine this host links to.
     #[serde(default)]
     pub via: Option<String>,
+    /// While it's `worker` and exposed through another machine, as this
+    /// host's link graph says (`fleet::graph::exposed_workers`): the chain
+    /// from the hub, its last but one dialing it. `None` otherwise.
+    #[serde(default)]
+    pub exposed_by: Option<Vec<String>>,
 }
 
 /// Who introduced member `name`, when `stored` holds it as an introduction
@@ -391,9 +400,10 @@ fn after(mut e: ApiError, written: &[String]) -> ApiError {
 /// The registry's machines, then the inbound neighbors up now, each with
 /// its held link's state, then the routed machines.
 /// Each row's `introduced_by` from this host's `membership.json` (one that
-/// doesn't load: none).
+/// doesn't load: none), its `exposed_by` from [`Ctx::exposed`].
 fn list(ctx: &Ctx) -> Answer {
     let stored = ctx.member.as_deref().and_then(|m| membership_api::load(m).ok().flatten());
+    let exposed = (ctx.exposed)();
     let rows: Vec<MachineRow> = machines(ctx)?
         .into_iter()
         .map(|e| {
@@ -401,6 +411,7 @@ fn list(ctx: &Ctx) -> Answer {
             let (kind, target) = e.kind.wire();
             MachineRow {
                 introduced_by: introducer_of(stored.as_ref(), &e.name),
+                exposed_by: exposed.get(&e.name).cloned(),
                 name: e.name,
                 kind,
                 target,
@@ -419,6 +430,7 @@ fn list(ctx: &Ctx) -> Answer {
     let routed = ctx.links.as_ref().map(|l| l.routed()).unwrap_or_default();
     rows.extend(routed.into_iter().map(|r| MachineRow {
         introduced_by: introducer_of(stored.as_ref(), &r.name),
+        exposed_by: exposed.get(&r.name).cloned(),
         name: r.name,
         kind: MachineKind::Routed,
         target: None,
@@ -945,7 +957,7 @@ mod tests {
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null, "via": null},
+                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null, "via": null, "exposed_by": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box"}));
@@ -1313,6 +1325,7 @@ mod tests {
             capacity: Some(Capacity::default()),
             introduced_by: Some("lap".into()),
             via: Some("k".into()),
+            exposed_by: Some(vec!["k".into(), "m".into()]),
         };
         let row = to_value(row).unwrap();
         assert_matches("MachineRow", &row);

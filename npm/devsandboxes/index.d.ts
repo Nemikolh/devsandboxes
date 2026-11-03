@@ -187,6 +187,12 @@ export interface SnapshotMachine {
    * `routed`: acted on over a route); `null` for a machine this host links to.
    */
   via: string | null;
+  /**
+   * While it's `worker` and exposed through another machine, as this host's link graph says: the chain
+   * from the hub (each member dials, or reaches a `full` one, the next), its last but one dialing it (a
+   * shell there `worker` doesn't stop); `null` otherwise.
+   */
+  exposed_by: string[] | null;
 }
 
 /**
@@ -1109,6 +1115,8 @@ export interface MachineRow {
   introduced_by: string | null;
   /** A routed machine's first hop (or the hub whose view lists it); `null` for a machine this host links to. */
   via: string | null;
+  /** As {@link SnapshotMachine.exposed_by}: the chain from the hub while it's `worker` and exposed through another machine; `null` otherwise. */
+  exposed_by: string[] | null;
 }
 
 /** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). */
@@ -1131,6 +1139,11 @@ export interface MemberInfo {
   fingerprint: string;
   /** A pending rotation's next key (`member.key.next`), the key once a membership log listing it is taken; `null` when none is pending. */
   next: MembershipKey | null;
+  /**
+   * While this host is `worker` and exposed through another machine (this host's link graph): the chain
+   * from the hub, its last but one dialing this host (a shell here `worker` doesn't stop); `null` otherwise.
+   */
+  exposed_by: string[] | null;
 }
 
 /** A signed statement (a membership entry's, an introduction's): `signer` says, with `key`, the payload of that hash. */

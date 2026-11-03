@@ -359,7 +359,21 @@ pub fn trust(to: Option<Trust>) -> Result<()> {
         None => call(&mut conn, "member.get", Value::Null)?,
     };
     println!("{}", trust_line(info.trust));
+    if let Some(warning) = info.exposed_by.as_deref().and_then(exposure_warning) {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
+}
+
+/// What `machine trust` warns of while this host is `worker` and exposed
+/// (`member.get`'s `exposed_by`, the chain from the hub): the machine that
+/// dials this host has a shell here, which `worker` doesn't stop.
+fn exposure_warning(chain: &[String]) -> Option<String> {
+    let dialer = crate::serve::fleet::graph::dialer(chain)?;
+    Some(format!(
+        "{dialer} dials this host over ssh, so it has a shell here and could rewrite member.toml: `worker` doesn't protect this host from {dialer} (exposed through {})",
+        chain.join(" > ")
+    ))
 }
 
 /// `machine key`: this host's member key (`member.get`'s `key`, created
@@ -672,12 +686,17 @@ pub(crate) fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: V
 
 /// `ls`'s cells: the first root and how many more; an inbound neighbor's
 /// TARGET is `inbound` (it has none); a member held as an introduction
-/// (capped, fleet plan decision 51) named with its introducer.
+/// (capped, fleet plan decision 51) named with its introducer, one exposed
+/// while `worker` with the machine that dials it.
 fn cells(r: MachineRow) -> [String; 7] {
-    let name = match &r.introduced_by {
-        Some(by) => format!("{} (introduced by {by})", r.name),
-        None => r.name.clone(),
-    };
+    let notes: Vec<String> = r
+        .introduced_by
+        .as_ref()
+        .map(|by| format!("introduced by {by}"))
+        .into_iter()
+        .chain(crate::serve::fleet::graph::exposed_note(r.exposed_by.as_deref()))
+        .collect();
+    let name = if notes.is_empty() { r.name.clone() } else { format!("{} ({})", r.name, notes.join(", ")) };
     let roots = match r.roots.split_first() {
         None => "-".to_string(),
         Some((first, [])) => first.display().to_string(),
@@ -1075,6 +1094,7 @@ mod tests {
             fingerprint: key.fingerprint(),
             key,
             next: None,
+            exposed_by: None,
         };
         assert_eq!(key_text(&info), format!("lap {key}\n{}\n", key.fingerprint()));
         assert!(key_text(&MemberInfo { name: None, ..info.clone() }).starts_with("- ed25519:"));
@@ -1170,6 +1190,7 @@ mod tests {
             capacity: None,
             introduced_by: None,
             via: None,
+            exposed_by: None,
         };
         assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "off", "idle", "-", "-"].map(String::from));
         assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..6], ["/a +2", "off", "idle", "0.7.0"].map(String::from));
@@ -1195,5 +1216,22 @@ mod tests {
         // A capped member: named with its introducer.
         let capped = MachineRow { introduced_by: Some("lap".into()), ..row(&[], None) };
         assert_eq!(cells(capped)[0], "m (introduced by lap)");
+        // Exposed while `worker`: the machine that dials it.
+        let chain = Some(vec!["box".into(), "k".into(), "m".into()]);
+        assert_eq!(cells(MachineRow { exposed_by: chain.clone(), ..row(&[], None) })[0], "m (exposed via k)");
+        let both = MachineRow { exposed_by: chain, introduced_by: Some("lap".into()), ..row(&[], None) };
+        assert_eq!(cells(both)[0], "m (introduced by lap, exposed via k)");
+    }
+
+    #[test]
+    fn trust_warns_naming_the_machine_with_a_shell_here() {
+        let chain = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            exposure_warning(&chain(&["box", "lap"])).unwrap(),
+            "box dials this host over ssh, so it has a shell here and could rewrite member.toml: `worker` doesn't protect this host from box (exposed through box > lap)"
+        );
+        let w = exposure_warning(&chain(&["box", "k", "lap"])).unwrap();
+        assert!(w.starts_with("k dials this host") && w.ends_with("(exposed through box > k > lap)"), "{w}");
+        assert_eq!(exposure_warning(&chain(&["box"])), None, "the hub itself");
     }
 }

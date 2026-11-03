@@ -712,7 +712,10 @@ machine's last [capacity report](fleet.md#capacity)
 parentheses; a machine this host's membership holds as an introduction
 (`machines.list`'s `introduced_by`, `api::introducer_of`: capped, it
 introduces no one, fleet plan decision 51) is named `<name> (introduced
-by <introducer>)` (`commands::machine::cells`). `unlink <name>` (`machines.unlink`) drops this host's link to
+by <introducer>)`, and one `worker` and exposed through another machine
+(`machines.list`'s `exposed_by`, [exposure](fleet.md#exposure)) `<name>
+(exposed via <dialer>)`, the machine that dials it (`graph::exposed_note`;
+both notes joined by a comma) (`commands::machine::cells`). `unlink <name>` (`machines.unlink`) drops this host's link to
 a registered machine, which stays a fleet member; refused for an inbound
 one, prints `unlinked <name>`. `rm <name>` (`machines.rm`) takes the
 machine out of the fleet, and `rm` of this host's own member name leaves
@@ -733,7 +736,10 @@ proposal <id>`.
 
 `trust [worker|full]` is about this host, not a registered machine: a
 client of `member.*` (this host's `member.toml`;
-[fleet.md](fleet.md#trust)). So is `roots [add|rm] [<path>…]`
+[fleet.md](fleet.md#trust)); while the answer's `exposed_by` is set it
+prints `warning: <dialer> dials this host over ssh, so it has a shell
+here …` on stderr, naming that machine and the chain
+(`exposure_warning`, [exposure](fleet.md#exposure)). So is `roots [add|rm] [<path>…]`
 (`commands::machine::roots`), this host's picked roots (`member.toml`'s
 `roots`): without a subcommand `member.get`, printing them one per line
 (or a note when there are none); `add` resolves each path here
@@ -782,7 +788,10 @@ listed while there is a machine, shows every machine from the snapshot's
 `machines` with its target (dimmed `inbound` for an inbound one, dimmed
 `via <hub>` for one seen through the hub), link state (and error),
 `agent` (`-` for an inbound one or one seen via the hub), and its
-CAPACITY ([capacity](fleet.md#capacity));
+CAPACITY ([capacity](fleet.md#capacity)); a machine `worker` and exposed
+through another one (the entry's `exposed_by`) has `exposed via
+<dialer>` after its NAME, in yellow (`ui::machine_name_text`,
+[exposure](fleet.md#exposure));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a
 down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers

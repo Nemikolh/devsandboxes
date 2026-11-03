@@ -320,6 +320,7 @@ pub(crate) mod tests {
             agent: false,
             capacity: None,
             via: None,
+            exposed_by: None,
         }
     }
 

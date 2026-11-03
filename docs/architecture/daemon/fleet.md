@@ -1291,8 +1291,9 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
 
 `member.toml` is the daemon's (decision 3 of the fleet plan):
 `member.get` and `member.set` (`fleet::member::call(method, params,
-path, hostname)`, over the daemon's `Shared::member` path and
-`Shared::hostname`) are the only way to change it. Local only: never on
+path, hostname, exposure)`, over the daemon's `Shared::member` path,
+`Shared::hostname` and `Shared::exposed_workers`) are the only way to
+change it. Local only: never on
 a `Peer` connection (`lent::admit` refuses them under either trust).
 Wire: [`member.*`](../../reference/api.md#member).
 
@@ -1301,15 +1302,19 @@ Wire: [`member.*`](../../reference/api.md#member).
   when neither is valid), `hub` (`self`, the hub's name, or `null` in no
   fleet), `trust`, `dev_builds` as the file says, `roots`, and this
   member's public `key` with its `fingerprint` ([Member
-  identity](#member-identity); the first ask makes the key). `member.set`
-  answers them too.
+  identity](#member-identity); the first ask makes the key), and
+  `exposed_by`: this host's [exposure](#exposure) chain while it's
+  `worker` and exposed through another machine, else `null`. `member.set`
+  answers them too, `exposed_by` at the new trust.
 - **`member.set {name?, trust?, roots_add?, roots_rm?}`** merges what's
   given into the file (`member::merge`, pure: `name` a
   `member::check_member_name`, `""` clears it; `roots_add` absolute, one
   already there kept once; `roots_rm` drops what it names), checks it and
   writes it. It answers the `MemberInfo` after the change. A changed
   name is what the next dial of each link says (`dialer::member_name`
-  reads it per dial). `hub` isn't a param: `member::set_fleet` writes it
+  reads it per dial); a changed `trust` makes this host's [link
+  report](#link-graph) due at once (`Published::republish`), so the other
+  members' [exposure](#exposure) of it follows. `hub` isn't a param: `member::set_fleet` writes it
   (with the name the log knows this host by) from an accepted
   [membership log](#membership-log), and clears it on leaving; the daemon
   follows it (`Shared::set_hub`), which ends this host's links ([Hub
@@ -1634,7 +1639,9 @@ The fleet's links are the members' own signed reports: the model in
   `connecting` and `unreachable` keeps the state first recorded, so a
   retrying link doesn't flap. A peer new or gone, a link up or down, or
   `dials` changed makes a report due `reports::DEBOUNCE` (1.5 s) later,
-  later changes joining it; the hub link coming up makes it due at once.
+  later changes joining it; the hub link coming up, or a `member.set`
+  that changed `trust` (`Published::republish`, which wakes the thread),
+  makes it due at once.
   The report lists only peers the log or a held introduction names; its
   trust is `member.toml`'s, and it's always on when the daemon never
   idles out (keep-alive, or the hub).
@@ -1780,7 +1787,8 @@ origin reads which hop refused and why.
 `devsandbox machine trust [worker|full]` (`commands::machine::trust`) is
 `member.set {trust}`, or `member.get` without an argument, printing the
 trust (under `full`, with a note that remote callers get this host's
-whole API); `--machine` refuses it with the rest of `machine`
+whole API; under `worker`, a warning when this host is
+[exposed](#exposure)); `--machine` refuses it with the rest of `machine`
 (`serve::machines::cli::machine_use`). It is read for every request a
 remote caller sends (`lent::Reach::load`), so a change applies to the
 next one. It applies to every link peer alike, whichever end dialed.
@@ -1792,6 +1800,45 @@ local client has (but `member.*`, `membership.*`, `graph.*`, `link.*`
 and `links.*`), lifts the worker policy
 (`worker_policy::Policy::detect` answers none) and takes a hub's dev
 builds ([Versions](#versions)).
+
+#### Exposure
+
+`worker` protects this host from the other machines inside devsandbox,
+not from an ssh into it: a machine that dials it has a shell here and
+could rewrite `member.toml`. `graph::exposure(graph, stored)` (pure, over
+the [link graph](#link-graph)) says where that bites: the hub is exposed
+(chain `[hub]`); so is every member an exposed one dials, and every
+`full` member (by its report) an exposed one reaches, to a fixed point.
+
+- **Dials**: either end's report says so (the dialer's `dials`, or the
+  dialed one listing it with `dials` false), whatever the link's state: a
+  configured ssh link is a standing shell credential while down, and an
+  exposed member leaving a link out of its own report doesn't hide it
+  while the dialed one's lists it.
+- **Reaches**: a chain of links in any state (either end listing it)
+  within `MAX_HOPS` (a routed stream's TTL), through members the log or a
+  held introduction names: a down link comes back on its own, so the
+  answer doesn't flicker with link state. A `full` member gives its whole
+  API to any caller, so an exposed caller controls it.
+- **Chains**: the steps from the hub, each member dialing or reaching the
+  next (`[box, lap]`: box dials lap), the fewest steps, ties to the
+  smallest chain by name. Revoked and unknown members never appear;
+  outside a fleet's log, or before its hub is added, nothing is exposed.
+
+`graph::exposed_workers(graph, stored, me)` keeps the members that
+exposure makes `worker` buy little for: a chain of two or more (the hub's
+own `[hub]` warns of nothing) and `worker` (or no report: the default),
+a `full` one being exposed by design; `me` puts this host's trust as
+`member.toml` has it now over its report's. Its chain's last but one
+(`graph::dialer`) is the machine with a shell there. Each host computes it
+from its own graph (`Shared::exposed_workers`): `member.get`'s
+`exposed_by`, `machines.list`'s and the federated snapshot's machine
+entries' `exposed_by` (`machines::api::Ctx::exposed`; `snapshots::merge`
+sets it on every entry, a hub view's lifted ones included).
+`devsandbox machine trust` prints a `warning:` on stderr while
+`exposed_by` is set (`commands::machine::exposure_warning`), naming the
+machine that dials this host and the chain; `machine ls` and the
+Machines tab mark the row `exposed via <dialer>` (`graph::exposed_note`).
 
 ### The trust table
 

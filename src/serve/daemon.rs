@@ -390,6 +390,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             })
         },
+        exposed: {
+            let hooked = Arc::clone(&hooked);
+            Box::new(move || hooked.get().and_then(std::sync::Weak::upgrade).map(|s| s.exposed_workers(None)).unwrap_or_default())
+        },
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
@@ -1132,6 +1136,16 @@ impl Shared {
         stored.log.membership().is_some().then_some((stored, me))
     }
 
+    /// The members this host's graph says `worker` buys little for
+    /// (`fleet::graph::exposed_workers`), `me` overriding this host's own
+    /// trust; none outside a fleet's log.
+    fn exposed_workers(&self, me: Option<(&str, fleet::member::Trust)>) -> BTreeMap<String, Vec<String>> {
+        match self.fleet_log() {
+            Some((stored, _)) => fleet::graph::exposed_workers(&self.graph.graph(), &stored, me),
+            None => BTreeMap::new(),
+        }
+    }
+
     /// The routed machines' reach (`service::Hooks::routed`): each of
     /// [`routed_members`](Self::routed_members) the graph has a path to,
     /// with the first hop its streams take now, or why none
@@ -1311,7 +1325,7 @@ impl Shared {
     fn publish_snapshot(&self, dir: &Path, params: Arc<Value>) {
         self.locals.lock().unwrap().insert(dir.to_path_buf(), Arc::clone(&params));
         let mut merged: BTreeMap<Option<String>, Arc<Value>> = BTreeMap::new();
-        let mut remotes: Option<Vec<snapshots::Machine>> = None;
+        let mut remotes: Option<(Vec<snapshots::Machine>, BTreeMap<String, Vec<String>>)> = None;
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
                 let push = match p.watched.get(dir) {
@@ -1320,8 +1334,8 @@ impl Shared {
                     Some(true) => {
                         let except = p.except();
                         let push = merged.entry(except.clone()).or_insert_with(|| {
-                            let remotes = remotes.get_or_insert_with(|| self.remotes());
-                            Arc::new(snapshots::merge(&params, remotes, except.as_deref()))
+                            let (remotes, exposed) = remotes.get_or_insert_with(|| (self.remotes(), self.exposed_workers(None)));
+                            Arc::new(snapshots::merge(&params, remotes, except.as_deref(), exposed))
                         });
                         Arc::clone(push)
                     }
@@ -1338,6 +1352,7 @@ impl Shared {
     fn publish_machines(&self) {
         let locals = self.locals.lock().unwrap().clone();
         let remotes = self.remotes();
+        let exposed = self.exposed_workers(None);
         let mut merged: BTreeMap<(PathBuf, Option<String>), Arc<Value>> = BTreeMap::new();
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
@@ -1347,7 +1362,7 @@ impl Shared {
                     let Some(local) = locals.get(dir) else { continue };
                     let push = merged
                         .entry((dir.clone(), except.clone()))
-                        .or_insert_with(|| Arc::new(snapshots::merge(local, &remotes, except.as_deref())));
+                        .or_insert_with(|| Arc::new(snapshots::merge(local, &remotes, except.as_deref(), &exposed)));
                     p.snapshots.insert(dir.clone(), Arc::clone(push));
                     any = true;
                 }
@@ -1893,8 +1908,20 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "capacity.get" => serde_json::to_value(shared.capacity()).map_err(|e| api::ApiError::internal(e.into())),
         // Local only: no link's table admits `member.*` (`fleet::lent`).
         method if method.starts_with("member.") => match &shared.member {
-            Some(path) => fleet::member::call(method, req.params, path, &shared.hostname)
-                .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
+            Some(path) => {
+                let trust = |p: &Path| fleet::member::load(p).ok().map(Option::unwrap_or_default).map(|m| m.trust);
+                let before = trust(path);
+                let answer = fleet::member::call(method, req.params, path, &shared.hostname, &|name, trust| {
+                    shared.exposed_workers(Some((name, trust))).remove(name)
+                })
+                .unwrap_or_else(|| Err(api::ApiError::unknown_method(method)));
+                // A changed trust is in this host's link report at once,
+                // so the other members' exposure of it follows.
+                if answer.is_ok() && trust(path) != before {
+                    shared.graph.republish();
+                }
+                answer
+            }
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
         // Local only (`lent::admit` refuses `graph.*`): the reports held here.
@@ -2631,7 +2658,7 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
         }
     };
     let first = match first {
-        Some(first) if machines => Some(Arc::new(snapshots::merge(&first, &shared.remotes(), except.as_deref()))),
+        Some(first) if machines => Some(Arc::new(snapshots::merge(&first, &shared.remotes(), except.as_deref(), &shared.exposed_workers(None)))),
         first => first,
     };
     conn.out.post(|p| {
@@ -3400,7 +3427,7 @@ pub(crate) mod tests {
         }
         // A `machines: true` watcher's variant.
         let machine = snapshots::Machine { name: "m".into(), target: Some("me@m".into()), ..Default::default() };
-        let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine], None);
+        let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine], None, &Default::default());
         dts::assert_matches(&dts::prop_type("ApiEvents", "instances.snapshot").unwrap(), &merged);
         dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
     }

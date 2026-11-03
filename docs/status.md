@@ -285,6 +285,11 @@ limitation means editing this file in the same commit.
   received). The daemon's route sockets, and so every routed stream,
   follow it.
   → [fleet](architecture/daemon/fleet.md#link-graph); `fleet::graph::next_version`, `fleet::reports`
+- [Exposure](architecture/daemon/fleet.md#exposure) takes either end's
+  report of a link, so a link gone stays counted until both ends have
+  reported since; a Machines tab row's `exposed via` follows a graph
+  change at the next push (the next poll pass or machine change).
+  → [fleet](architecture/daemon/fleet.md#exposure); `fleet::graph::exposed_workers`
 - Routed streams are opened only through the daemon's
   `route-<member>.sock`. A routed stream doesn't fail over once open: a hop going down ends it, and its client
   opens it again. Until 10c a relay sees and can alter a routed stream's

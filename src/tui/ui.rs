@@ -708,7 +708,7 @@ fn draw_machines(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_machines_table(frame: &mut Frame, app: &App, area: Rect, term_focused: bool) {
-    let name_width = app.machines.iter().map(|m| m.name.chars().count()).max().unwrap_or(0).max("NAME".len());
+    let name_width = app.machines.iter().map(|m| machine_name_text(m).chars().count()).max().unwrap_or(0).max("NAME".len());
     let room_width = app
         .machines
         .iter()
@@ -752,6 +752,15 @@ fn capacity_text(c: Option<&crate::serve::capacity::Capacity>) -> String {
     }
 }
 
+/// A machine's NAME: its name, then `  exposed via <dialer>` while it's
+/// `worker` and exposed (`SnapshotMachine::exposed_by`).
+fn machine_name_text(m: &crate::serve::snapshots::SnapshotMachine) -> String {
+    match crate::serve::fleet::graph::exposed_note(m.exposed_by.as_deref()) {
+        Some(note) => format!("{}  {note}", m.name),
+        None => m.name.clone(),
+    }
+}
+
 /// One machine's cells: STATE is the link state, with `: <error>` when the
 /// last attempt said why; CAPACITY from its last snapshot's
 /// capacity report (last known while it isn't connected).
@@ -768,8 +777,15 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
         LinkState::Unreachable => Style::default().fg(Color::Red),
         LinkState::Idle => Style::default(),
     };
+    let name = match crate::serve::fleet::graph::exposed_note(m.exposed_by.as_deref()) {
+        Some(note) => Line::from(vec![
+            Span::styled(m.name.clone(), Style::default().fg(ACCENT)),
+            Span::styled(format!("  {note}"), Style::default().fg(Color::Yellow)),
+        ]),
+        None => Line::from(Span::styled(m.name.clone(), Style::default().fg(ACCENT))),
+    };
     Row::new([
-        Cell::from(Span::styled(m.name.clone(), Style::default().fg(ACCENT))),
+        Cell::from(name),
         // An inbound machine has no ssh target: its kind instead; one seen
         // through the hub, the hub.
         match (&m.via, &m.target) {
@@ -3319,6 +3335,7 @@ mod tests {
         let mut up = sm("box", LinkState::Connected);
         up.agent = true;
         up.version = Some("0.9.1".into());
+        down.exposed_by = Some(vec!["hub".into(), "box".into(), "down".into()]);
         let g = 1u64 << 30;
         up.capacity = Some(crate::serve::capacity::Capacity {
             cpus: Some(8),
@@ -3342,6 +3359,8 @@ mod tests {
         assert!(up.contains("me@box") && up.contains(" connected ") && up.contains(" on ") && up.contains("0.9.1"), "{screen}");
         assert!(up.contains("8 cpu · 18/32G · 120G free · 3 run  over cap: mem 18G/16G"), "{screen}");
         assert!(down.contains(" unreachable: Connection refused ") && down.contains(" off ") && down.contains(" - "), "{screen}");
+        // Exposed while `worker`: the machine that dials it named.
+        assert!(down.contains("│down  exposed via box ") && !up.contains("exposed"), "{screen}");
         // No report yet: VERSION and CAPACITY `-`.
         assert!(down.trim_end_matches('│').trim_end().ends_with("-            -"), "{down}");
         assert!(screen.find("│box ").unwrap() < screen.find("│down ").unwrap(), "{screen}");

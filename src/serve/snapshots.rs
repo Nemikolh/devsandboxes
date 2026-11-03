@@ -364,6 +364,11 @@ pub struct SnapshotMachine {
     /// machine this host links to.
     #[serde(default)]
     pub via: Option<String>,
+    /// While it's `worker` and exposed through another machine, as this
+    /// host's link graph says (`fleet::graph::exposed_workers`): the chain
+    /// from the hub, its last but one dialing it. `None` otherwise.
+    #[serde(default)]
+    pub exposed_by: Option<Vec<String>>,
 }
 
 /// Why turning `agent` on for routed machine `machine` (reached through
@@ -496,7 +501,10 @@ pub fn fleet_view(params: &mut Value, me: Option<&str>) -> Value {
 /// `except` leaves that machine out, its rows and its entry, direct or
 /// lifted: what a hub pushes to that machine's own federated watch (the
 /// asking machine's rows are never re-exported).
-pub fn merge(local: &Value, machines: &[Machine], except: Option<&str>) -> Value {
+///
+/// Every entry's `exposed_by` is `exposed`'s (this host's graph), a lifted
+/// one's from the hub's view replaced.
+pub fn merge(local: &Value, machines: &[Machine], except: Option<&str>, exposed: &BTreeMap<String, Vec<String>>) -> Value {
     let machines: Vec<&Machine> = machines.iter().filter(|m| Some(m.name.as_str()) != except).collect();
     let mut out = local.clone();
     let Some(obj) = out.as_object_mut() else { return out };
@@ -544,6 +552,9 @@ pub fn merge(local: &Value, machines: &[Machine], except: Option<&str>) -> Value
     obj.insert("sandbox_count".into(), json!(sandboxes.len()));
     obj.insert("sandboxes".into(), Value::Array(sandboxes));
     obj.insert("services".into(), Value::Array(services));
+    for m in &mut entries {
+        m.exposed_by = exposed.get(&m.name).cloned();
+    }
     let entries: Vec<Value> = entries.iter().map(|m| json!(m)).collect();
     obj.insert("machines".into(), Value::Array(entries));
     out
@@ -591,6 +602,7 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         command: m.command.clone(),
         agent: m.agent,
         via: None,
+        exposed_by: None,
     }
 }
 
@@ -785,7 +797,7 @@ pub(crate) mod tests {
         // An inbound machine: no target.
         let w = Machine { kind: MachineKind::Inbound, target: None, ..machine("w", &[], LinkState::Idle) };
 
-        let merged = merge(&local, &[a, b, c, w], None);
+        let merged = merge(&local, &[a, b, c, w], None, &Default::default());
         // From its own root's snapshot when registered, else the first's.
         assert_eq!(names(&merged, "instances"), ["mine@-", "in-one@a", "orphan@a", "old@a", "in-two@a", "bee@b"]);
         assert_eq!(names(&merged, "sandboxes"), ["s@-", "sb-one@a", "sb-two@a", "sb-b@b"]);
@@ -804,16 +816,16 @@ pub(crate) mod tests {
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap, "via": null},
-                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null, "via": null},
-                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null, "via": null},
-                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null, "via": null},
+                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap, "via": null, "exposed_by": null},
+                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
             ])
         );
         crate::serve::dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
         crate::serve::dts::assert_matches("Capacity", &merged["machines"][0]["capacity"]);
         // No machines: the local params plus an empty `machines`.
-        let alone = merge(&local, &[], None);
+        let alone = merge(&local, &[], None, &Default::default());
         let mut want = local.clone();
         want["machines"] = serde_json::json!([]);
         want["sandbox_count"] = serde_json::json!(want["sandboxes"].as_array().unwrap().len());
@@ -862,7 +874,7 @@ pub(crate) mod tests {
         k.fleet = Some(Arc::clone(&view));
         k.rows.insert("/k".into(), remote("/k", &[("hub-own", Some("/k"))]));
 
-        let merged = merge(&local, &[k.clone()], None);
+        let merged = merge(&local, &[k.clone()], None, &Default::default());
         assert_eq!(names(&merged, "instances"), ["hub-own@k", "xi@x"]);
         assert_eq!(names(&merged, "sandboxes"), ["sb-k@k", "x-sb@x"]);
         assert_eq!(merged["sandbox_count"], 2);
@@ -871,11 +883,17 @@ pub(crate) mod tests {
         assert_eq!((&x["state"], &x["version"], &x["kind"]), (&"connected".into(), &"0.6.0".into(), &"routed".into()));
         assert_eq!(merged["machines"][0]["via"], Value::Null);
         crate::serve::dts::assert_matches("SnapshotMachine", x);
+        assert_eq!((&merged["machines"][0]["exposed_by"], &x["exposed_by"]), (&Value::Null, &Value::Null));
+
+        // Exposure from this host's graph, on direct and lifted entries alike.
+        let exposed = BTreeMap::from([("x".to_string(), vec!["k".to_string(), "x".to_string()]), ("k".to_string(), vec!["k".to_string()])]);
+        let merged = merge(&local, &[k.clone()], None, &exposed);
+        assert_eq!((&merged["machines"][0]["exposed_by"], &merged["machines"][1]["exposed_by"]), (&serde_json::json!(["k"]), &serde_json::json!(["k", "x"])));
 
         // This host links to `x` too: its own entry and rows, nothing lifted.
         let mut x = machine("x", &["/x"], LinkState::Connected);
         x.rows.insert("/x".into(), remote("/x", &[("direct", Some("/x"))]));
-        let merged = merge(&local, &[k.clone(), x.clone()], None);
+        let merged = merge(&local, &[k.clone(), x.clone()], None, &Default::default());
         assert_eq!(names(&merged, "instances"), ["hub-own@k", "direct@x"]);
         assert_eq!(merged["machines"].as_array().unwrap().len(), 2);
         assert_eq!(merged["machines"][1]["via"], Value::Null);
@@ -883,7 +901,7 @@ pub(crate) mod tests {
         // The hub's link down: its view stays, with its state.
         k.state = LinkState::Unreachable;
         k.error = Some("k: ssh: no route".into());
-        let merged = merge(&local, &[k], None);
+        let merged = merge(&local, &[k], None, &Default::default());
         assert_eq!(names(&merged, "instances"), ["hub-own@k", "xi@x"]);
         assert_eq!((&merged["machines"][1]["state"], &merged["machines"][1]["error"]), (&"unreachable".into(), &"through k: ssh: no route".into()));
     }
@@ -925,7 +943,7 @@ pub(crate) mod tests {
         m.rows.insert("/m".into(), remote("/m", &[("mi", Some("/m"))]));
         let mut x = machine("x", &["/x"], LinkState::Connected);
         x.rows.insert("/x".into(), remote("/x", &[("xi", Some("/x"))]));
-        let merged = merge(&local, &[m.clone(), x.clone()], Some("m"));
+        let merged = merge(&local, &[m.clone(), x.clone()], Some("m"), &Default::default());
         assert_eq!(names(&merged, "instances"), ["hub-own@-", "xi@x"]);
         let entries: Vec<_> = merged["machines"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
         assert_eq!(entries, ["x"]);
@@ -935,7 +953,7 @@ pub(crate) mod tests {
     fn the_first_roots_snapshot_missing_drops_its_unregistered_instances_for_now() {
         let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connecting);
         a.rows.insert("/r/two".into(), remote("/r/two", &[("in-one", Some("/r/one")), ("in-two", Some("/r/two")), ("old", None)]));
-        let merged = merge(&serde_json::json!({"instances": [], "sandboxes": [], "services": []}), &[a], None);
+        let merged = merge(&serde_json::json!({"instances": [], "sandboxes": [], "services": []}), &[a], None, &Default::default());
         // `in-one` waits for its own root's snapshot; `old` for the first's.
         assert_eq!(names(&merged, "instances"), ["in-two@a"]);
     }
