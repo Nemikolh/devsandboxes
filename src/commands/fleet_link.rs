@@ -5,7 +5,8 @@
 //! `update::hello_of` (its build, whether this host is the hub, and its
 //! fleet's hub, as `member.toml` says when it starts); a dialer naming
 //! another hub is refused (`update::same_fleet`). IN:
-//! each stream the dialer opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
+//! each stream the dialer opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
+//! `ROUTE` (a routed stream to relay or answer, `fleet::route`) is
 //! handed to this host's daemon as a connection whose first line is
 //! `link.attach {peer: <dialer>, channel, key, introduced_by}`
 //! ([`attach_stream`]: the key and introducer the dialer proved), so this
@@ -189,6 +190,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         .with(channel::API, attached(Channel::Api))
         .with(channel::PTY, attached(Channel::Pty))
         .with(channel::TUNNEL, attached(Channel::Tunnel))
+        .with(channel::ROUTE, attached(Channel::Route))
         .with(channel::TRANSFER, transfers);
     let outlet = Arc::new(link::Outlet::default());
     let over = Arc::new(AtomicBool::new(false));

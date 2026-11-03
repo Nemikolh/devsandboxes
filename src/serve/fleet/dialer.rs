@@ -11,7 +11,7 @@
 //! siblings in the socket dir, each accept one stream to the machine, so
 //! the entry's link ([`dial`]) and every other local client reach the
 //! machine as they reach an inbound one. IN: each stream the machine
-//! opens (`API`, `PTY`, `TUNNEL`, `TRANSFER`, `AGENT`) goes to this daemon
+//! opens (`API`, `PTY`, `TUNNEL`, `TRANSFER`, `AGENT`, `ROUTE`) goes to this daemon
 //! in-process ([`Open`]: `Shared::open_lent` with the entry's name as the
 //! peer, the key and introducer it proved, its fleet root
 //! `fleet/<entry>/`), under this host's trust table for it; `AGENT` is answered with this host's agent while the entry has
@@ -207,6 +207,7 @@ impl Dialer {
             .with(channel::PTY, served(Channel::Pty))
             .with(channel::TUNNEL, served(Channel::Tunnel))
             .with(channel::AGENT, served(Channel::Agent))
+            .with(channel::ROUTE, served(Channel::Route))
             .with(channel::TRANSFER, transfers);
         let ours = (self.hello)();
         let spec = link::Spec { hello: ours, ..LINK };
@@ -356,6 +357,7 @@ pub(crate) mod tests {
     use crate::serve::client::{self, Conn};
     use crate::serve::daemon::tests::{fake_join, opts, scratch, spawn_daemon};
     use crate::serve::fleet::membership_api::test_support;
+    use crate::serve::fleet::route;
     use crate::serve::daemon::{Exit, Options};
     use crate::serve::machines::ssh;
     use crate::serve::proto::Version;
@@ -1377,5 +1379,198 @@ pub(crate) mod tests {
         let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "lap"})).unwrap().error.unwrap();
         assert_eq!(e.code, "failed");
         pair.finish();
+    }
+
+    /// Three daemons in one fleet, A and B not linked: A (`base/a`, member
+    /// `lap`) dials K (`base/k`, `box`), K dials B (`base/b`, `b`), each
+    /// through [`peer_transport`], so each of K's links has one end of each
+    /// kind (A → K reaches K's `fleet-link`, B → K K's dialer). The log
+    /// (authority `lap`, hub `box`) also has `m`, who has no daemon. With
+    /// `introduced`, the log is `b`'s (hub `box`) without `lap`, which every
+    /// host holds as `box`'s introduction (capped).
+    struct Trio {
+        base: PathBuf,
+        a_dir: PathBuf,
+        k_dir: PathBuf,
+        b_dir: PathBuf,
+        a_member: PathBuf,
+        k_member: PathBuf,
+        b_member: PathBuf,
+        dialed: Vec<Arc<Dialed>>,
+        daemons: Vec<std::thread::JoinHandle<Result<Exit>>>,
+    }
+
+    impl Trio {
+        fn new(tag: &str, introduced: bool) -> Trio {
+            use crate::serve::fleet::member::{Member, write_for_test};
+            use crate::serve::fleet::identity::Signer;
+            use crate::serve::fleet::membership::Introduction;
+            let base = scratch(tag);
+            let (a_dir, k_dir, b_dir) = (base.join("a"), base.join("k"), base.join("b"));
+            let (mut a_opts, _) = daemon_opts(&base, "a");
+            let (mut k_opts, _) = daemon_opts(&base, "k");
+            let (b_opts, b_data) = daemon_opts(&base, "b");
+            let (_, m_data) = daemon_opts(&base, "m");
+            let (a_member, k_member, b_member) = (a_opts.member.clone().unwrap(), k_opts.member.clone().unwrap(), b_opts.member.clone().unwrap());
+            let m_member = m_data.join("member.toml");
+            // B's fleet roots for both peers, so a refusal of one is the trust table's.
+            for peer in ["lap", "box"] {
+                std::fs::create_dir_all(b_data.join("fleet").join(peer)).unwrap();
+            }
+            let members: [(&str, &Path); 4] = [("lap", &a_member), ("box", &k_member), ("b", &b_member), ("m", &m_member)];
+            if introduced {
+                for (name, toml) in members {
+                    write_for_test(toml, &Member { name: name.into(), ..Default::default() });
+                }
+                let pk = |t: &Path| test_support::key_of(t).public_key();
+                let mut s = test_support::fleet("b", &test_support::key_of(&b_member), "box", &[("box", pk(&k_member)), ("m", pk(&m_member))]);
+                let genesis = s.log.membership().unwrap().genesis;
+                s.introduce(Introduction::sign(&genesis, "lap", pk(&a_member), "box", &test_support::key_of(&k_member))).unwrap();
+                for (_, toml) in members {
+                    test_support::write(toml, &s);
+                }
+            } else {
+                test_support::fleet_of("box", &members);
+            }
+            crate::serve::machines::update(a_opts.machines.as_ref().unwrap(), |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
+            crate::serve::machines::update(k_opts.machines.as_ref().unwrap(), |e| e.push(Entry::ssh("b", "me@b"))).unwrap();
+            let (to_k, a_dialed) = peer_transport(&k_dir, &k_member);
+            let (to_b, k_dialed) = peer_transport(&b_dir, &b_member);
+            a_opts.link_transport = Some(to_k);
+            k_opts.link_transport = Some(to_b);
+            let mut daemons = Vec::new();
+            for (dir, o) in [(&b_dir, b_opts), (&k_dir, k_opts), (&a_dir, a_opts)] {
+                daemons.push(spawn_daemon(dir, o));
+                drop(connect(dir));
+            }
+            let trio = Trio { base, a_dir, k_dir, b_dir, a_member, k_member, b_member, dialed: vec![a_dialed, k_dialed], daemons };
+            for (dir, name) in [(&trio.a_dir, "box"), (&trio.k_dir, "b"), (&trio.k_dir, "lap"), (&trio.b_dir, "box")] {
+                wait_for(&format!("{name} connected on {}", dir.display()), Duration::from_secs(10), || {
+                    named(&connect(dir).call("machines.list", Value::Null).unwrap().result.unwrap(), name).is_some_and(|r| connected(&r))
+                });
+            }
+            trio
+        }
+
+        /// The fleet root `who` (`a` or `b`) has for `peer`, canonical.
+        fn fleet_root(&self, who: &str, peer: &str) -> PathBuf {
+            let root = self.base.join(format!("{who}-data/fleet/{peer}"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::canonicalize(root).unwrap()
+        }
+
+        fn finish(self) {
+            for dir in [&self.a_dir, &self.k_dir, &self.b_dir] {
+                assert!(connect(dir).call("shutdown", json!({})).unwrap().error.is_none());
+            }
+            for daemon in self.daemons {
+                assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+            }
+            for d in &self.dialed {
+                d.cut();
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// `member_toml`'s member opening `header` over its link in `dir`
+    /// (`route::open`, its own key and log).
+    fn open_routed(dir: &Path, member_toml: &Path, header: &route::Header) -> Result<UnixStream> {
+        route::open(dir, header, &test_support::key_of(member_toml), &test_support::read(member_toml).unwrap())
+    }
+
+    /// An API connection over a routed `stream` to `dest` (the hello as
+    /// `0.0.0`, as over a link).
+    fn routed_api(stream: UnixStream, dest: &str) -> crate::serve::machines::link::Link {
+        use crate::serve::machines::link;
+        link::handshake(dest, Duplex::socket(stream), Duration::from_secs(10), link::Over::Link).unwrap()
+    }
+
+    fn path(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A's `API` stream to B through K is served by B under its trust for
+    /// A: A's fleet root there is reached, B's for K isn't; the other way
+    /// too (K relaying from its dialer's end, A answering on its own). K
+    /// relays under `worker`, its default.
+    #[test]
+    fn a_routed_api_stream_is_served_as_its_origins() {
+        let trio = Trio::new("route-api", false);
+        // (origin's socket dir, its member.toml, origin, destination, the destination's data prefix)
+        for (dir, member, origin, dest, data) in [
+            (&trio.a_dir, &trio.a_member, "lap", "b", "b"),
+            (&trio.b_dir, &trio.b_member, "b", "lap", "a"),
+        ] {
+            let header = route::Header::new(origin, Channel::Api, path(&["box", dest]));
+            let mut api = routed_api(open_routed(dir, member, &header).unwrap(), dest);
+            let own = trio.fleet_root(data, origin);
+            let r = api.conn.call("instances.list", json!({"dir": own})).unwrap();
+            assert!(r.error.is_none(), "{origin} → {dest}: {r:?}");
+            let e = api.conn.call("instances.list", json!({"dir": trio.fleet_root(data, "box")})).unwrap().error.unwrap();
+            assert_eq!(e.code, "denied", "{origin} → {dest}: the relay's fleet root isn't the origin's: {e:?}");
+            let r = api.conn.call("roots.list", json!({})).unwrap().result.unwrap();
+            let fleet = r.as_array().unwrap().iter().find(|r| r["fleet"] == true).unwrap()["root"].clone();
+            assert_eq!(fleet, json!(own), "{origin} → {dest}");
+        }
+        trio.finish();
+    }
+
+    /// K holds no key of A's: a stream claiming to come from A, sent on K's
+    /// own link to B, is refused, as through K (the hop before B) or
+    /// straight (not from A, its first hop).
+    #[test]
+    fn a_relay_cannot_open_a_stream_as_another_member() {
+        let trio = Trio::new("route-forged", false);
+        let k_key = test_support::key_of(&trio.k_member);
+        let k_log = test_support::read(&trio.k_member).unwrap();
+        for (p, want) in [
+            (&["box", "b"][..], "is refused: `b`: `lap` proved key"),
+            (&["b"][..], "is refused: `b`: the routed stream from `lap` to `b`: it came from `box`, not from `lap`"),
+        ] {
+            let header = route::Header::new("lap", Channel::Api, path(p));
+            let stream = link::connect(&endpoint::fleet_socket(&trio.k_dir, "b"), channel::ROUTE).unwrap();
+            let (mut r, mut w) = (&stream, &stream);
+            route::write_header(&mut w, &header).unwrap();
+            let e = format!("{:#}", route::origin_side(&mut r, &mut w, &header, &k_key, &k_log).unwrap_err());
+            assert!(e.contains(want), "{p:?}: {e}");
+        }
+        trio.finish();
+    }
+
+    /// A relay refuses, naming itself: a next hop with no link to it (`m`
+    /// has no daemon), and `AGENT` (decision 58).
+    #[test]
+    fn a_relay_refuses_a_hop_that_isnt_up_and_agent_streams() {
+        let trio = Trio::new("route-refused", false);
+        let header = route::Header::new("lap", Channel::Api, path(&["box", "m"]));
+        let e = format!("{:#}", open_routed(&trio.a_dir, &trio.a_member, &header).unwrap_err());
+        assert_eq!(e, "the routed stream with `m` is refused: `box`: the routed stream from `lap` to `m`: `m` has no link to this host");
+        // `AGENT` isn't even written by the origin…
+        let agent = route::Header::new("lap", Channel::Agent, path(&["box", "b"]));
+        assert!(format!("{:#}", open_routed(&trio.a_dir, &trio.a_member, &agent).unwrap_err()).contains("`agent` isn't routed"));
+        // …and sent anyway, the relay refuses it.
+        let stream = link::connect(&endpoint::fleet_socket(&trio.a_dir, "box"), channel::ROUTE).unwrap();
+        proof::write_raw(&mut &stream, proof::MESSAGE, &route::encode_unchecked(&agent)).unwrap();
+        let a_key = test_support::key_of(&trio.a_member);
+        let a_log = test_support::read(&trio.a_member).unwrap();
+        let e = format!("{:#}", route::origin_side(&mut &stream, &mut &stream, &agent, &a_key, &a_log).unwrap_err());
+        assert!(e.contains("is refused: `box`: the routed stream from `lap` to `b`: `agent` isn't routed"), "{e}");
+        trio.finish();
+    }
+
+    /// An introduced origin (capped) is served capped at its destination:
+    /// B, the authority, refuses its `fleet.propose` as a capped member's,
+    /// while its fleet root is reached.
+    #[test]
+    fn an_introduced_origin_is_served_capped() {
+        let trio = Trio::new("route-capped", true);
+        let header = route::Header::new("lap", Channel::Api, path(&["box", "b"]));
+        let mut api = routed_api(open_routed(&trio.a_dir, &trio.a_member, &header).unwrap(), "b");
+        let r = api.conn.call("instances.list", json!({"dir": trio.fleet_root("b", "lap")})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let e = api.conn.call("fleet.propose", json!({"op": {"kind": "revoke", "name": "m"}})).unwrap().error.unwrap();
+        assert!(e.code == "denied" && e.message.contains("capped"), "{e:?}");
+        trio.finish();
     }
 }

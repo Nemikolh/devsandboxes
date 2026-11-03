@@ -101,8 +101,9 @@ impl Identity {
 
     /// The key to prove with against `merged` (the log after this link's
     /// sync): the pending next one when `merged` lists this host under it,
-    /// else the key.
-    fn signer_for(&self, merged: &Stored) -> &SigningKey {
+    /// else the key. A routed stream's destination proves with the key
+    /// this picks against its own stored log (`fleet::route::Here`).
+    pub(crate) fn signer_for(&self, merged: &Stored) -> &SigningKey {
         match &self.next {
             Some(next) if lists(merged, &self.name, &next.public_key()) => next,
             _ => &self.key,

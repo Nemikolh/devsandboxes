@@ -24,16 +24,25 @@
 //! A relay or the destination refusing writes a refusal naming itself
 //! ([`refuse`]) back toward the origin, which reads it as the stream's
 //! refusal.
+//!
+//! A link end serves a `ROUTE` stream with [`serve`]: it relays it toward
+//! its next hop, or answers it as its destination; [`open`] is the
+//! origin's side over a link.
 
-// No caller yet: relays and destinations serve `ROUTE` in fleet plan step
-// 10b.4.
+// `open` has no caller but tests yet: the origin's path choice is fleet
+// plan step 10b.5.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::devsbd::proto::channel;
+use crate::serve::endpoint;
 
 use super::graph::MAX_HOPS;
 use super::identity::{PublicKey, Signer, SigningKey};
@@ -50,6 +59,11 @@ pub const DOMAIN: &str = "devsandbox/route/v1";
 pub const HEADER_LIMIT: usize = 4096;
 /// The bound of a challenge, a proof or a verdict.
 const SMALL: usize = 4096;
+
+/// How long each read of a routed stream's opening may wait, at every hop
+/// (a header, a challenge, a proof, a verdict): a stalled origin or hop
+/// doesn't hold a thread.
+pub const OPENING: Duration = Duration::from_secs(10);
 
 /// A routed stream's header (module doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +259,20 @@ pub fn relay_header(header: &Header, me: &str, stored: &Stored) -> Result<Hop> {
     Ok(Hop { next: next.clone(), header: Header { ttl: header.ttl - 1, ..header.clone() } })
 }
 
+/// That `header` came to `me` from link peer `from`, the hop before `me` on
+/// its path (its origin when `me` is the first): a peer can't hand on a
+/// stream as if it came through another, nor have it sent back to itself
+/// (its next hop would then be the hop it came from, a loop). `me` not on
+/// the path is [`relay_header`]'s refusal.
+pub fn came_from(header: &Header, me: &str, from: &str) -> Result<()> {
+    let Some(at) = header.path.iter().position(|h| h == me) else { return Ok(()) };
+    let before = if at == 0 { &header.origin } else { &header.path[at - 1] };
+    if before != from {
+        bail!("{}: it came from `{from}`, not from `{before}`, the hop before `{me}`", header.what());
+    }
+    Ok(())
+}
+
 /// `why` written back toward the origin as `me`'s refusal (best effort:
 /// the stream may be gone).
 pub fn refuse(w: &mut impl Write, me: &str, why: &str) {
@@ -355,11 +383,104 @@ pub fn dest_side(r: &mut impl Read, w: &mut impl Write, header: &Header, me: &st
     Ok(Routed { origin: origin.to_string(), key: expected, introduced_by, channel: header.channel })
 }
 
+/// Who serves a `ROUTE` stream here ([`serve`]): this member's name, the
+/// key it proves with as a destination, its stored log.
+pub struct Here<'a> {
+    pub me: &'a str,
+    pub key: &'a SigningKey,
+    pub stored: &'a Stored,
+}
+
+/// A `ROUTE` stream link peer `from` opened to this member (`here`): its
+/// header read and checked within [`OPENING`] ([`read_header`], that it
+/// came from `from`: [`came_from`]). For this member, the destination's
+/// side ([`dest_side`]): the proven origin and the stream, its inner
+/// channel's bytes next, to serve as the origin's (decision 57). Else a
+/// relay (decision 56, whatever this member's trust): [`relay_header`],
+/// then `reach` connects the next hop's link (`Err` why not: no direct
+/// link that's up), the header goes on one TTL lower and the rest is
+/// spliced unread until both ways end (`Ok(None)`). A refusal is written
+/// back toward the origin and returned.
+pub fn serve(
+    stream: UnixStream,
+    from: &str,
+    here: &Here,
+    reach: impl FnOnce(&str) -> Result<UnixStream, String>,
+) -> Result<Option<(Routed, UnixStream)>> {
+    let me = here.me;
+    let (mut r, mut w) = (&stream, &stream);
+    let refused = |w: &mut &UnixStream, e: anyhow::Error| {
+        refuse(w, me, &format!("{e:#}"));
+        Err(e)
+    };
+    stream.set_read_timeout(Some(OPENING)).context("cannot set a routed stream's read timeout")?;
+    let header = match read_header(&mut r, from).and_then(|h| came_from(&h, me, from).map(|()| h)) {
+        Ok(h) => h,
+        Err(e) => return refused(&mut w, e),
+    };
+    if header.dest == me {
+        let routed = dest_side(&mut r, &mut w, &header, me, here.key, here.stored)?;
+        stream.set_read_timeout(None).context("cannot clear a routed stream's read timeout")?;
+        return Ok(Some((routed, stream)));
+    }
+    let hop = relay_header(&header, me, here.stored)
+        .and_then(|hop| reach(&hop.next).map(|down| (hop, down)).map_err(|why| anyhow!("{}: {why}", header.what())));
+    let (hop, down) = match hop {
+        Ok(found) => found,
+        Err(e) => return refused(&mut w, e),
+    };
+    if let Err(e) = write_header(&mut &down, &hop.header) {
+        return refused(&mut w, e.context(format!("cannot hand it on to `{}`", hop.next)));
+    }
+    stream.set_read_timeout(None).context("cannot clear a routed stream's read timeout")?;
+    splice(stream, down);
+    Ok(None)
+}
+
+/// Copy `a` and `b` both ways, each direction's end passed on as a
+/// half-close; returns once both have ended (the caller's thread is the
+/// relay's, counted while it runs).
+pub fn splice(a: UnixStream, b: UnixStream) {
+    let (Ok(a2), Ok(b2)) = (a.try_clone(), b.try_clone()) else { return };
+    let back = std::thread::Builder::new().name("route-splice".into()).spawn(move || {
+        let _ = io::copy(&mut &b2, &mut &a2);
+        let _ = a2.shutdown(Shutdown::Write);
+    });
+    let _ = io::copy(&mut &a, &mut &b);
+    let _ = b.shutdown(Shutdown::Write);
+    if let Ok(t) = back {
+        let _ = t.join();
+    }
+}
+
+/// The origin's side over a link: a `ROUTE` stream through the link to
+/// `header`'s first hop (`fleet-<hop>.sock` in socket dir `dir`), its
+/// header written and its opening proven with `key` against `stored`
+/// ([`origin_side`], each read within [`OPENING`]); the stream, ready for
+/// the inner channel's bytes.
+pub fn open(dir: &Path, header: &Header, key: &SigningKey, stored: &Stored) -> Result<UnixStream> {
+    header.check().with_context(|| header.what())?;
+    let first = &header.path[0];
+    let socket = endpoint::fleet_socket(dir, first);
+    let stream = super::link::connect(&socket, channel::ROUTE)
+        .with_context(|| format!("{}: no link to `{first}` is up ({})", header.what(), socket.display()))?;
+    stream.set_read_timeout(Some(OPENING)).context("cannot set a routed stream's read timeout")?;
+    let (mut r, mut w) = (&stream, &stream);
+    write_header(&mut w, header)?;
+    origin_side(&mut r, &mut w, header, key, stored)?;
+    stream.set_read_timeout(None).context("cannot clear a routed stream's read timeout")?;
+    Ok(stream)
+}
+
+/// `header`'s body unchecked, for tests to send what [`write_header`]
+/// wouldn't.
+#[cfg(test)]
+pub(crate) fn encode_unchecked(header: &Header) -> Vec<u8> {
+    header.encode()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::net::Shutdown;
-    use std::os::unix::net::UnixStream;
     use std::thread;
 
     use super::*;
@@ -392,26 +513,12 @@ mod tests {
         (s.try_clone().unwrap(), s)
     }
 
-    /// A relay `me` between `up` (toward the origin, link peer `from`) and
-    /// `down` (toward the destination): checks and forwards the header,
-    /// then splices both ways; a refusal goes back up.
+    /// A relay `me` ([`serve`], key 2) between `up` (toward the origin,
+    /// link peer `from`) and `down` (toward the destination).
     fn relay(me: &'static str, from: &'static str, stored: Stored, up: UnixStream, down: UnixStream) -> thread::JoinHandle<()> {
         thread::spawn(move || {
-            let (mut ur, mut uw) = split(up);
-            let (mut dr, mut dw) = split(down);
-            match read_header(&mut ur, from).and_then(|h| relay_header(&h, me, &stored)) {
-                Err(e) => refuse(&mut uw, me, &format!("{e:#}")),
-                Ok(hop) => {
-                    write_header(&mut dw, &hop.header).unwrap();
-                    let back = thread::spawn(move || {
-                        let _ = io::copy(&mut dr, &mut uw);
-                        let _ = uw.shutdown(Shutdown::Write);
-                    });
-                    let _ = io::copy(&mut ur, &mut dw);
-                    let _ = dw.shutdown(Shutdown::Write);
-                    back.join().unwrap();
-                }
-            }
+            let here = Here { me, key: &key(2), stored: &stored };
+            let _ = serve(up, from, &here, |_| Ok(down));
         })
     }
 
@@ -660,6 +767,43 @@ mod tests {
         assert!(format!("{:#}", relay_header(&far, "k", &s).unwrap_err()).contains("`zed` is neither a member"));
         let long = Header::new("lap", Channel::Api, path(&["k", "m", "b", "x", "y"]));
         assert!(format!("{:#}", long.check().unwrap_err()).contains("5 hops (at most 4)"));
+    }
+
+    #[test]
+    fn a_stream_from_a_peer_off_its_path_is_refused() {
+        let h = Header::new("lap", Channel::Api, path(&["k", "b"]));
+        came_from(&h, "k", "lap").unwrap();
+        came_from(&h, "b", "k").unwrap();
+        let e = format!("{:#}", came_from(&h, "b", "lap").unwrap_err());
+        assert!(e.contains("it came from `lap`, not from `k`, the hop before `b`"), "{e}");
+        // `m` posing as the origin's first hop; `k` sent `b`'s stream back.
+        assert!(came_from(&h, "k", "m").is_err());
+        assert!(came_from(&Header::new("b", Channel::Api, path(&["k", "lap"])), "k", "lap").is_err());
+        // Over a stream: the relay refuses it at once.
+        let (o, far) = UnixStream::pair().unwrap();
+        let (near, _d) = UnixStream::pair().unwrap();
+        let hop = relay("k", "m", stored(), far, near);
+        let (mut r, mut w) = split(o);
+        write_header(&mut w, &h).unwrap();
+        let e = err(origin_side(&mut r, &mut w, &h, &key(1), &stored()));
+        assert!(e.contains("is refused: `k`: the routed stream from `lap` to `b`: it came from `m`"), "{e}");
+        hop.join().unwrap();
+    }
+
+    #[test]
+    fn a_relay_whose_next_hop_is_down_refuses() {
+        let (o, far) = UnixStream::pair().unwrap();
+        let hop = thread::spawn(move || {
+            let s = stored();
+            let here = Here { me: "k", key: &key(2), stored: &s };
+            serve(far, "lap", &here, |next| Err(format!("its link to `{next}` is unreachable"))).map(|_| ())
+        });
+        let (mut r, mut w) = split(o);
+        let h = Header::new("lap", Channel::Api, path(&["k", "b"]));
+        write_header(&mut w, &h).unwrap();
+        let e = err(origin_side(&mut r, &mut w, &h, &key(1), &stored()));
+        assert_eq!(e, "the routed stream with `b` is refused: `k`: the routed stream from `lap` to `b`: its link to `b` is unreachable");
+        assert!(hop.join().unwrap().is_err());
     }
 
     #[test]

@@ -184,8 +184,11 @@ relayed agent (`agent-link-<peer>.sock`) while that answers.
   root; `agent` this host's ssh agent (a `1` byte, then the relay) while
   this host's `machines.toml` has an entry named `peer` with `agent` on,
   else a `0` byte and the close.
-- `route`: answered, then the connection closes: the daemon serves no
-  routed stream (`Shared::serve_channel`).
+- `route`: once the answer is out the bytes are a routed stream from
+  `peer` ([fleet.md](../architecture/daemon/fleet.md#routed-streams)),
+  relayed toward its next hop or, for this host, served on its inner
+  channel as a stream of its proven origin's, under the trust table for
+  the origin.
 
 The client sends nothing after the attach line until it has read the
 answer: bytes the daemon already holds past the line refuse the attach

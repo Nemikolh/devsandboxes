@@ -29,6 +29,8 @@
 //!   (pure); `reports`: this host's own report built from its links and
 //!   sent to the hub (`fleet.report`), the reports exchanged and pushed
 //!   (`fleet.graph`), the graph the daemon holds (`graph.get`).
+//! - `route`: a routed stream (`ROUTE`): its header, the origin's and the
+//!   destination's proof, and how a link end relays or answers one.
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an

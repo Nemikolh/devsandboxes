@@ -38,7 +38,8 @@
 //!
 //! The fleet link is the one kind (`fleet::LINK`: `API` served by the
 //! answerer, `TRANSFER` by both ends, each end's `transfer::Receivers`
-//! through [`Serves::transfers`], `AGENT` by the opener, `fleet::agent`).
+//! through [`Serves::transfers`], `AGENT` by the opener, `fleet::agent`;
+//! `ROUTE` by both ends, `fleet::route`).
 //!
 //! The newest end binding a socket wins: it binds a temp name and renames
 //! it over the path. An end unlinks its socket, if it is still its own,

@@ -406,8 +406,9 @@ sentinel), saying `update::hello_for` this host's `hub` and member name
 (below, *Versions*), read from `member.toml` once at its start (each
 dial is a process of its own).
 
-- **IN.** Each stream L opens on `API`, `PTY`, `TUNNEL` or `TRANSFER` is
-  answered by `attach_stream`: a socket pair whose far end a thread takes,
+- **IN.** Each stream L opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
+  `ROUTE` ([routed streams](#routed-streams)) is answered by
+  `attach_stream`: a socket pair whose far end a thread takes,
   connecting K's daemon socket and sending `link.attach {peer: L,
   channel, key, introduced_by}` (the key and introducer L proved on this
   link, `attach_params`; a stream before the proof is refused) as the
@@ -470,10 +471,11 @@ read at each dial), with the sentinel, the `Hello`s and the
   a successor daemon's link takes it over, the old daemon's ssh dying
   with it); each accepted connection a stream to K. Every client here
   reaches K through it ([over a link](#over-a-link)).
-- **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER` or
-  `AGENT` goes to L's daemon in-process (`dialer::Open`, given the link's
+- **IN.** Each stream K opens on `API`, `PTY`, `TUNNEL`, `TRANSFER`,
+  `AGENT` or `ROUTE` goes to L's daemon in-process (`dialer::Open`, given the link's
   `Proven`: `Shared::open_lent` with peer `{name: K, fleet_root:
-  fleet/K/, env: the daemon's, key and introduced_by: what K proved}`), the
+  fleet/K/, env: the daemon's, key and introduced_by: what K proved}`,
+  `Shared::fleet_peer`), the
   `serve_channel` a `link.attach` connection gets (decision 24); `AGENT`
   is answered with L's agent while L's entry for K has `agent` on
   (`daemon::agent_for`, read per stream: decision 18). While the hub's
@@ -1657,11 +1659,27 @@ origin reads which hop refused and why.
   and ends in the destination, every name is a member name, and neither
   the origin nor any hop comes twice (a loop). `route::write_header`
   checks the same before writing.
+- **Serving one** (`route::serve`): both ends of every peer link serve
+  `ROUTE` (the dialed end's `fleet-link` through `link.attach {channel:
+  "route"}`, the dialer in-process), each stream on a `serve-route`
+  thread of the daemon's own (`Shared::serve_route`, counted in
+  `Shared::channels` while it lasts), as this host's identity read then
+  (`proof::Identity::load`). Each read of the opening waits at most
+  `route::OPENING` (10 s). The header must have come from the link peer
+  that sent it (`route::came_from`: the hop before this member on the
+  path, its origin for the first hop), so a peer can't hand a stream on
+  as if it came through another, nor have it sent back to itself.
 - **A relay** (`route::relay_header`): it is on the path and not its
   end, the TTL covers the hops left from it, its next hop and the
   destination resolve in its log or held introductions
-  (`proof::resolve`); it forwards the header with the TTL one lower to
-  the next hop (`route::Hop`) and splices the rest unread.
+  (`proof::resolve`). The next hop must be a machine here, registered or
+  inbound, whose link is connected (`Shared::route_next`; else the
+  refusal says it has no link here, or the link's state and error); the
+  relay connects that link's `fleet-<next>.sock` on `ROUTE`, forwards the
+  header with the TTL one lower (`route::Hop`) and splices the rest
+  unread both ways until both end (`route::splice`). Relaying isn't
+  access (decision 56): no trust table applies, so a `worker` member
+  relays too.
 - **The proof** (decision 54), after the header: the destination
   (`route::dest_side`) resolves the origin (a log member, or a held
   introduction, capped) and sends a challenge, a 32-byte nonce from the
@@ -1678,7 +1696,19 @@ origin reads which hop refused and why.
   sends its verdict (empty, or a refusal). A fresh nonce on each side
   means no recorded proof verifies again. The destination comes out
   with `route::Routed` (the origin, its proven key, its introducer, the
-  inner channel); the inner channel's bytes follow the verdict.
+  inner channel); the inner channel's bytes follow the verdict. A
+  destination proves with the key a link would (`Identity::signer_for`
+  its own log).
+- **The destination** (decision 57) serves the inner channel
+  (`Shared::serve_channel`) as one of the origin's own streams: its
+  `Peer` is built as a direct peer's (`Shared::fleet_peer`: the proven
+  key, its introducer, so a capped origin stays capped, its fleet root
+  `fleet/<origin>/`, the daemon's env) with no agent, under this host's
+  trust table for the origin.
+- **The origin** over a link (`route::open`): a `ROUTE` connection to its
+  first hop's `fleet-<hop>.sock`, the header, `route::origin_side`; the
+  stream it returns carries the inner channel (for `API`, the hello as
+  over a link).
 
 ### Trust
 
@@ -1704,7 +1734,9 @@ builds ([Versions](#versions)).
 Every connection has a table (`daemon::Table`): `Full` for local clients,
 `Peer(Peer)` for a link peer's `API` stream: a `link.attach {channel:
 "api"}` connection on the dialed end, an `API` stream `Shared::open_lent`
-hands the daemon on the dialer. A `Peer` (`fleet::lent::Peer`) is who it
+hands the daemon on the dialer, and a routed `API` stream's at its
+destination, whose `Peer` is the stream's proven origin
+([routed streams](#routed-streams)). A `Peer` (`fleet::lent::Peer`) is who it
 is (the peer's machine name, for the log), its fleet root (canonical),
 the env its verbs get (this host's own, the daemon's
 `Shared::peer_env`; a `Peer` without one, only in tests, keeps a verb's

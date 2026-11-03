@@ -596,18 +596,11 @@ fn machine_dialer(
         Arc::new(move |proven: &fleet::proof::Proven, channel: lent::Channel| {
             let shared = hooked.get()?.upgrade()?;
             let name = proven.name.as_str();
-            let root = lent::peer_fleet_root(data.as_deref()?, name)
+            let peer = shared
+                .fleet_peer(data.as_deref()?, name, proven.key, proven.introduced_by.clone(), None)
                 .map_err(|e| log(&format!("machine {name}: {e:#}")))
                 .ok()?;
-            let peer = Arc::new(lent::Peer {
-                name: name.to_string(),
-                fleet_root: Some(root),
-                env: Some(shared.peer_env.clone()),
-                agent: None,
-                key: Some(proven.key),
-                introduced_by: proven.introduced_by.clone(),
-            });
-            shared.open_lent(channel, &peer)
+            shared.open_lent(channel, &Arc::new(peer))
         })
     };
     let dialer = fleet::dialer::Dialer {
@@ -740,7 +733,7 @@ struct Shared {
     /// of a `link.attach {channel}`.
     peer_env: BTreeMap<String, String>,
     /// Channel streams being served ([`Shared::serve_channel`]'s `PTY`,
-    /// `TUNNEL`, `TRANSFER` and `AGENT` threads): counted with the
+    /// `TUNNEL`, `TRANSFER`, `AGENT` and `ROUTE` threads): counted with the
     /// `clients` holders, like connections.
     channels: Arc<AtomicUsize>,
     /// The link reports this host holds (`fleet.report`, `fleet.graph`,
@@ -939,6 +932,23 @@ impl Shared {
         self.member.as_deref()?.parent()
     }
 
+    /// Fleet member `name` as this host serves its streams, whatever
+    /// carried them (a machine link's, a `link.attach`'s, a routed stream's
+    /// origin: fleet plan decision 57): the key it proved, its introducer,
+    /// its fleet root `fleet/<name>/` under `data` (created), the daemon's
+    /// env, `agent` its relayed agent (only a direct link's dialed end has
+    /// one).
+    fn fleet_peer(&self, data: &Path, name: &str, key: fleet::identity::PublicKey, introduced_by: Option<String>, agent: Option<PathBuf>) -> Result<lent::Peer> {
+        Ok(lent::Peer {
+            name: name.to_string(),
+            fleet_root: Some(lent::peer_fleet_root(data, name)?),
+            env: Some(self.peer_env.clone()),
+            agent,
+            key: Some(key),
+            introduced_by,
+        })
+    }
+
     /// One stream of an ssh machine's link (`fleet::dialer`), on
     /// `channel`: a socket pair whose one end goes to the machine, the other [`serve_channel`](Self::serve_channel)'s
     /// with `scope`. An `API` stream's first byte is the daemon's, as on a
@@ -965,7 +975,9 @@ impl Shared {
     /// - `agent`: `fleet::agent::answer` with this host's agent while this
     ///   host's registry has an entry named the peer with `agent` on, else
     ///   with none (its `NOT_SERVING` byte, then the close).
-    /// - `route`: refused (no relay or destination serves one yet).
+    /// - `route`: [`serve_route`](Self::serve_route), on a thread of its
+    ///   own: relayed, or served as its origin's stream when it's for this
+    ///   host.
     ///
     /// `false`, `stream` dropped: refused, or the daemon is stopping.
     fn serve_channel(self: &Arc<Self>, channel: lent::Channel, peer: &Arc<lent::Peer>, stream: Stream) -> bool {
@@ -1006,8 +1018,69 @@ impl Shared {
                     fleet::agent::answer(stream, agent);
                 })
             }
-            lent::Channel::Route => false,
+            lent::Channel::Route => {
+                let shared = Arc::clone(self);
+                self.spawn_channel("serve-route", move || shared.serve_route(&peer, stream))
+            }
         }
+    }
+
+    /// A `ROUTE` stream link peer `from` opened (`fleet::route::serve`, as
+    /// this host's identity, read now): a relay's, spliced to its next hop
+    /// through [`route_next`](Self::route_next) on this thread, so it's
+    /// counted while it lasts; relaying needs no trust (fleet plan decision
+    /// 56). One for this host is served as one of its origin's streams on
+    /// its inner channel ([`serve_channel`](Self::serve_channel)), under
+    /// this host's trust table for the origin ([`fleet_peer`](Self::fleet_peer),
+    /// no agent: decision 57).
+    fn serve_route(self: &Arc<Self>, from: &lent::Peer, stream: Stream) {
+        let identity = self
+            .member
+            .as_deref()
+            .context("this daemon has no member.toml")
+            .and_then(|m| fleet::proof::Identity::load(m, &self.hostname));
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(e) => {
+                fleet::route::refuse(&mut &stream, &self.hostname, &format!("{e:#}"));
+                return log(&format!("fleet: refused a routed stream from {}: {e:#}", from.name));
+            }
+        };
+        let here = fleet::route::Here { me: &identity.name, key: identity.signer_for(&identity.stored), stored: &identity.stored };
+        let (routed, stream) = match fleet::route::serve(stream, &from.name, &here, |next| self.route_next(next)) {
+            Ok(Some(arrived)) => arrived,
+            Ok(None) => return,
+            Err(e) => return log(&format!("fleet: refused a routed stream from {}: {e:#}", from.name)),
+        };
+        let origin = routed.origin.as_str();
+        let peer = self
+            .data_dir()
+            .context("this daemon has no data dir for a fleet root")
+            .and_then(|data| self.fleet_peer(data, origin, routed.key, routed.introduced_by.clone(), None));
+        let channel = routed.channel.as_str();
+        match peer.map(|p| self.serve_channel(routed.channel, &Arc::new(p), stream)) {
+            Ok(true) => log(&format!("fleet: a routed {channel} stream from {origin} (via {})", from.name)),
+            Ok(false) => log(&format!("fleet: refused a routed {channel} stream from {origin}")),
+            Err(e) => log(&format!("fleet: a routed stream from {origin}: {e:#}")),
+        }
+    }
+
+    /// A relay's next hop `next`: a `ROUTE` stream through its link's
+    /// `fleet-<next>.sock`, when `next` is a machine here (registered or
+    /// inbound) whose link is connected; else why not.
+    fn route_next(&self, next: &str) -> Result<Stream, String> {
+        let machine = self.links().and_then(|l| l.remotes().get(next));
+        match machine {
+            None => return Err(format!("`{next}` has no link to this host")),
+            Some(m) if m.state != snapshots::LinkState::Connected => {
+                let why = m.error.map(|e| format!(": {e}")).unwrap_or_default();
+                return Err(format!("its link to `{next}` is {}{why}", m.state.as_str()));
+            }
+            Some(_) => {}
+        }
+        let socket = endpoint::fleet_socket(&self.socket_dir, next);
+        fleet::link::connect(&socket, crate::devsbd::proto::channel::ROUTE)
+            .map_err(|e| format!("its link to `{next}` isn't up ({}: {e})", socket.display()))
     }
 
     /// `serve` on a thread named `name`, counted in [`channels`](Self::channels)
@@ -1958,15 +2031,8 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
     let Some(data) = shared.data_dir() else {
         return Response::err(id, "failed", "this daemon has no data dir for a fleet root");
     };
-    let peer = match lent::peer_fleet_root(data, &name) {
-        Ok(root) => lent::Peer {
-            name: name.clone(),
-            fleet_root: Some(root),
-            env: Some(shared.peer_env.clone()),
-            agent: Some(endpoint::link_agent_socket(&shared.socket_dir, &name)),
-            key: Some(key),
-            introduced_by,
-        },
+    let peer = match shared.fleet_peer(data, &name, key, introduced_by, Some(endpoint::link_agent_socket(&shared.socket_dir, &name))) {
+        Ok(peer) => peer,
         Err(e) => {
             log(&format!("{}: link.attach: {e:#}", conn.label()));
             return Response::err(id, "internal", format!("{e:#}"));
