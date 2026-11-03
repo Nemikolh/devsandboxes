@@ -163,13 +163,16 @@ Start with `docs/README.md` (reading order and map) and
   introductions, pure), `membership_api.rs` (`membership.get|adopt|sign`,
   `fleet.sync`'s store), `proof.rs` (a peer link's key proof),
   `proposals.rs` (`proposals.json`), `graph.rs` (members' signed link
-  reports and `Graph::paths` over them, pure), `reports.rs` (this host's
-  report from its links, debounced, sent to the hub as `fleet.report`; the
-  hub's pushes and each link-up's `fleet.graph` exchange on the
-  `serve-fleet-graph` thread; the in-memory graph `graph.get` answers),
-  `route.rs` (a routed `ROUTE` stream's opening: the header a relay
-  checks and forwards, the origin's and destination's challenge-response
-  on `proof`'s framing; not served yet).
+  reports, `Graph::paths` over them and `exposure`, pure), `reports.rs`
+  (this host's report from its links, debounced, sent to the hub as
+  `fleet.report`; every member's `fleet.graph` floods and link-up
+  exchanges on the `serve-fleet-graph` thread; the in-memory graph
+  `graph.get` answers), `route.rs` (a `ROUTE` stream's opening: the
+  header each hop checks, the origin's and destination's
+  challenge-response, relaying and `connect`: a member's link socket,
+  else its route socket), `routes.rs` (the requester: a
+  `route-<member>.sock` per member with no link up here, its graph's
+  paths tried in order).
   `src/key_guard.rs` refuses any
   container bind or build path covering the member key.
   `snapshots.rs`'s `merge` builds the federated

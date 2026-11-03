@@ -337,7 +337,6 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
     ],
     links: [
       L.fleetDoc(MIDDLE),
-      { label: 'ADR 0041', path: 'docs/decisions/0041-fleet-workers-dial-their-hub.md', rev: MIDDLE },
       { label: 'ADR 0042', path: 'docs/decisions/0042-fleet-workers-follow-their-hubs-version.md', rev: MIDDLE },
       L.src('Lending worker', 'src/serve/fleet/worker.rs', MIDDLE),
       L.src('lend and fleet join', 'src/commands/lend.rs', MIDDLE),

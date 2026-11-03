@@ -1351,7 +1351,7 @@ remote `thread_children` aren't merged. Plus, top-level:
 On a fleet member, the machines its hub sees (the hub's federated push to
 this host's watch of it, this host left out) follow, each one `via` the
 hub's name, its rows tagged with its own name as the hub tagged them:
-`kind`, `version`, `runtime`, `capacity` as the hub reports them,
+`version`, `runtime`, `capacity` as the hub reports them,
 `target` and `command` `null`, `agent` `false`; while the hub's own link
 isn't `connected`, `state` is the hub's and `error` `through <hub>:
 <why>`, the rows last known. A machine this host links to itself is

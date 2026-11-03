@@ -20,7 +20,12 @@ identity](#member-identity): each member's key (never reachable from a
 container), the [membership log](#membership-log) only the fleet's
 authority signs, the [key proof](#key-proof) every peer link starts
 with, and the [approvals and pushes](#approvals-and-pushes) that carry
-membership changes.
+membership changes; and routing: the [link graph](#link-graph) of the
+members' signed link reports, the [routed streams](#routed-streams)
+that reach a member with no link here through others, each proving its
+origin to its destination
+([ADR 0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)),
+and the [exposure](#exposure) the graph shows.
 
 **How a machine joins** (decisions 28 and 30 of the plan): on a laptop
 L, `devsandbox machine add <hub>` registers the hub K in L's
@@ -202,7 +207,7 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/machines/saved.rs` (`Saved`, `of`, `machines`, `load`,
 `save`, `save_wait`), `src/serve/snapshots.rs` (`Machine::set_link`,
 `Remotes::restore`); channels: `src/devsbd/proto.rs` (`channel::API`,
-`channel::PTY`, `channel::TUNNEL`, `channel::AGENT` and their `caps`,
+`channel::PTY`, `channel::TUNNEL`, `channel::AGENT`, `channel::ROUTE` and their `caps`,
 `channel::flows`); capacity: `src/serve/capacity.rs` (`Capacity`,
 `Caps`, `Own`, `HostFacts`, `EngineCache`, `HostCapacity`,
 `Capacity::with_own`, `parse_meminfo`, `parse_size`, `over_caps`,
@@ -245,7 +250,17 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `apply`, `Log`, `Compare`, `compare`, `Introduction`,
 `check_introduction`, `countersign_rotate`, `hub_for`, `Stored`, `Wire`,
 `path`, `load`, `update`), `src/serve/fleet/proof.rs` (`prove`,
-`Identity`, `Auth`, `Proven`, `DOMAIN`, `hub_moved`), `src/key_guard.rs`
+`Identity`, `Auth`, `Proven`, `DOMAIN`, `hub_moved`, `resolve`); routing:
+`src/serve/fleet/graph.rs` (`Report`, `LinkReport`, `Graph`,
+`Graph::apply`, `Graph::paths`, `MAX_HOPS`, `exposure`,
+`exposed_workers`, `exposed_note`), `src/serve/fleet/reports.rs`
+(`Tracker`, `Publisher`, `Published`, `Flood`, `report_call`,
+`graph_call`), `src/serve/fleet/route.rs` (`Header`, `serve`,
+`relay_header`, `came_from`, `open`, `connect`, `OPENING`),
+`src/serve/fleet/routes.rs` (`Routes`, `wanted`, `first_open`, `reach`,
+`ATTEMPT`), `src/serve/daemon.rs` (`Shared::serve_route`,
+`Shared::route_next`, `Shared::serve_routed`, `Shared::open_routed`,
+`Shared::routed_reach`); `src/key_guard.rs`
 (`Guard`, `check_argv`, `check_mount`, `Exposure`),
 `src/serve/locked_file.rs` (`update`, `lock_at`, `write_atomic_mode`),
 `src/commands/machine.rs` (`trust`, `roots`, `record_roots`, `key`,
@@ -288,7 +303,7 @@ code opens streams through; IN, a table of the channels it serves
 (`link::Serves`: channel → `Handler`, a callback handing back the local
 end of a stream the peer opens, `None` to refuse it). Its `Hello`
 advertises the table's caps (`link::cap_of`: `SSH_AGENT`, `API`,
-`TRANSFER`, `PTY`, `TUNNEL`, `AGENT`). An `Open` on a channel missing
+`TRANSFER`, `PTY`, `TUNNEL`, `AGENT`, `ROUTE`). An `Open` on a channel missing
 from the table is refused with `Close` and the link stays up. Either end
 opens streams on a channel the other advertised, and only those. The
 socket is bound at a temp name next to its path (0600) and renamed over
@@ -549,22 +564,23 @@ ends redial saying it.
 
 ## Over a link
 
-Every client reaches a machine, ssh or inbound, through the socket its
-link's local end binds, `fleet-<name>.sock` in the daemon's socket dir,
-naming its channel first (`link::connect`). Terminals, port forwards and
-code transfers go through `route::connect`: that socket when it answers,
-else the daemon's `route-<name>.sock` for a member it has no link up to
-([Routed streams](#routed-streams)), the same bytes either way; neither
+Every client reaches a member through `route::connect`, naming its
+channel first: the socket its link's local end binds, `fleet-<name>.sock`
+in the daemon's socket dir (`link::connect`), when it answers, else the
+daemon's `route-<name>.sock` for a member it has no link up to
+([routed streams](#routed-streams)), the same bytes either way; neither
 there, the error names both sockets.
 
 - **The dial** (`fleet::dialer::dial`, the daemon's `Dial` for every
-  machine): an `API` connection to its `fleet-<name>.sock` as a plain
-  `ssh::Duplex::socket`; down, `its link isn't up (…)`. Never the route
-  socket: this connection is the machine's link state, which this host's
-  link report says as a direct link. Each connection
-  is one `API` stream to the machine's daemon, so the held link
-  (`service::Machines`), the quick calls and `forward::verb` (one stream
-  per verb, a hang-up the stream's close) run on it. A link's failure is
+  registered or inbound machine): an `API` connection to its
+  `fleet-<name>.sock` as a plain `ssh::Duplex::socket`; down, `its link
+  isn't up (…)`. Never the route socket: this connection is the
+  machine's link state, which this host's link report says. A routed
+  machine's `API` streams go through `route::connect`
+  (`dialer::routed`, [machines](machines.md#routed-machines)). Each
+  connection is one `API` stream to the machine's daemon, so the held
+  link (`service::Machines`), the quick calls and `forward::verb` (one
+  stream per verb, a hang-up the stream's close) run on it. A link's failure is
   logged only when it differs from the last one logged since the link
   was up (`service::log_failure`), so an absent machine is one line in
   `serve.log`, not one per retry.
@@ -579,7 +595,8 @@ there, the error names both sockets.
 - **The agent**: with `machine set <name> agent on` this host's agent
   reaches every instance on that machine as `AGENT` streams
   ([AGENT](#agent), [machines](machines.md#agent)); only on a machine
-  this host dials (its entry's `agent`), never on an inbound one.
+  this host dials (its entry's `agent`), never on an inbound or routed
+  one.
 - **The CLI's other commands on a machine** are API calls with `machine`
   (fleet plan decision 15), within the machine's trust: `logs`
   (`containers.logs`), `logs --build` (`instances.buildLog`; `--follow`,
@@ -807,18 +824,14 @@ dialer then redials). A hub:
   `except`, the peer's name). The hub watches its members plain, so no
   rows go round in a cycle. A member watches its hub that way (the
   hub's fleet root for it, with `machines: true`) while a local watcher
-  wants machines, and shows each machine the hub sees as one of its
+  wants machines, and shows each machine the hub links to as one of its
   own, `via` the hub, after the machines it links to itself (which win
-  over a same-named one via the hub); one hop, never itself
-  ([machines.md](machines.md#held-links-machines),
-  [federated snapshots](machines.md#federated-snapshots)). Those are
-  routed machines (fleet plan decision 60,
-  [machines.md](machines.md#routed-machines)): their rows stay the
-  hub's view's, while a request naming one as `machine`, `machines.get`,
-  a forward into one and its terminals go to it over a routed stream;
-  `machines.set` and the agent toggle are refused (`AGENT` isn't
-  routed, decision 58; `snapshots::routed_agent`); placement never sees
-  them.
+  over a same-named one via the hub), never itself
+  ([federated snapshots](machines.md#federated-snapshots)). Those, and
+  the graph's members with no link here, are
+  [routed machines](machines.md#routed-machines): their rows the hub's
+  view's, everything else (calls, verbs, terminals, forwards,
+  placement) over routed streams.
 - **Saves the machines' rows**, `remotes.json` next to `state.toml`
   (`machines::saved::path`; `Options::remotes` in tests), so a restarted
   hub shows the fleet before its machines reconnect: restored at the
@@ -1599,6 +1612,24 @@ it never signs on a remote request alone (decision 49;
   takes nothing sends nothing on, so a push floods the connected graph
   once. A host not reached catches up at its next link's head comparison
   (`fleet::proof`).
+
+### Routing
+
+A member reaches another it has no link to through members that have
+one (decision 21,
+[ADR 0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)).
+Every member signs a report of its own links and the members flood
+them, so each holds the fleet's [link graph](#link-graph); a client
+connects to the daemon's `route-<member>.sock`, and the daemon opens a
+[routed stream](#routed-streams) along the graph's paths in order, each
+hop a peer link that's up. The stream's origin and destination prove
+their keys to each other at its opening, so the destination serves it
+under its trust for the origin, never for a relay, and relays carry it
+whatever their own trust. Members reached only this way are
+[routed machines](machines.md#routed-machines): calls, verbs,
+terminals, forwards, placement and the `fleet.*` calls
+(`leave::call`, `service::Handle::call_member`) reach them, `AGENT`
+doesn't (decision 58).
 
 #### Link graph
 

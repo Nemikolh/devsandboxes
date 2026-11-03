@@ -1,10 +1,11 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-9 and 10a shipped
+Status: in progress. Steps 1-9, 10a and 10b shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
-[0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md),
-[0044](../../decisions/0044-one-fleet-authority-signs-membership.md)):
+[0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
+[0044](../../decisions/0044-one-fleet-authority-signs-membership.md),
+[0045](../../decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)):
 steps 1-6 on two kinds of machine (ssh machines and lending workers),
 steps 7-8 down to one: every machine one peer link per pair, reached
 only over its channels, a laptop joining with `machine add <hub>`;
@@ -12,11 +13,10 @@ step 9 made it a fleet: the hub in `member.toml`, `machine add`'s join
 rule, `machine unlink|rm`, every member seeing the fleet through the
 hub and its runs placed there; step 10a gave members identity: a key
 each, a membership log only the fleet's authority signs, links that
-prove both keys, changes made elsewhere approved on the authority.
-Step 10 (routing next, 10b) finishes the model
-below (ADR
-[0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
-proposed). The rest is design. Builds on
+prove both keys, changes made elsewhere approved on the authority;
+step 10b routed streams over the members' signed link graph, each
+proving its origin to its destination. Step 10c (end-to-end sessions)
+is next. The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
 [machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
 its parked auto-update and PTY attach into steps 2 and 4.
@@ -711,6 +711,26 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
         ADR 0043 accepted and 0041 removed (links to it fixed),
         `machines.md` and `fleet.md` rewritten, `docs/status.md`, this
         step's as-built note.
+
+      As built: `fleet.graph {reports}` is both the link-up exchange
+      and the push, and every member, not only the hub, floods a graph
+      change to its connected links (not back to the one peer it came
+      from). A member's report is due at once on its hub link coming up
+      and on a `member.set` that changes `trust`. `route-<name>.sock` is
+      bound only for members with no connected link here, and
+      `route::connect` tries `fleet-<name>.sock` first; the held link's
+      own dial (`dialer::dial`) stays direct-only, since it is the link
+      state this host reports. `relay_header` checks the next hop and
+      destination against the relay's stored log, and every hop checks
+      the header came from the hop before it (`route::came_from`). Each
+      read of an opening waits at most `route::OPENING` (10 s) at a hop,
+      each path's attempt `routes::ATTEMPT` (5 s), all within the hello
+      wait. Routed machines are the graph's members with a path and no
+      link here plus the hub view's (`snapshots::routed`), `via` the
+      first hop that's up (the hub for one only the view lists); the
+      dashboard's Machines tab shows only the view's, `via` the hub.
+      Exposure counts a link that dials whatever its state, and a
+      reach over links in any state.
     - **10c End-to-end sessions** (its own step, decision 47). Each
       routed stream is an authenticated, encrypted session between the
       member it started on and its destination (a Noise-style handshake
@@ -875,7 +895,8 @@ step 10b does.
     in step 10.
 33. Machines a member sees only through the hub's federated view are
     view-only until step 10: their rows and state show, actions,
-    terminals and forwards on them are refused naming the hub.
+    terminals and forwards on them are refused naming the hub. (Spent:
+    10b.6 makes them routed machines, decision 60.)
 34. A link's hello names its end's hub (not only a hub flag); a link
     whose two ends name different hubs is refused.
 35. A machine's registry name defaults to its member name (`member.get`

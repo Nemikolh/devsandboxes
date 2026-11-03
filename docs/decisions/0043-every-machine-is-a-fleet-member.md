@@ -1,8 +1,8 @@
 # 0043: Every machine is a fleet member; how far others reach it is the member's setting
 
-Status: proposed (fleet plan step 10). Accepted when step 10 ships; it
-then replaces 0041, removed with it (never released), and 0020's
-one-hop machine links (ssh and the protocol match stay).
+Status: accepted. Supersedes 0020's one-hop machine links (ssh and the
+protocol match stay) and an earlier ADR 0041 (workers dialing their hub,
+reached only through a lent API), removed (never released).
 
 ## Context
 

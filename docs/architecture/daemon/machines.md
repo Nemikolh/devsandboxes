@@ -1,14 +1,17 @@
 # Machines: remote hosts over ssh
 
-A machine is a remote host running devsandbox, registered with `devsandbox
-machine add`, or one that registered this host from its end (an
-[inbound neighbor](#inbound-neighbors)). The local daemon holds one link to
-each machine (for an ssh machine `ssh <target> devsandbox fleet-link --peer
-<this host>`, a [peer link](fleet.md#peer-links); for an inbound one the
-peer link it dialed), talks to the machine's daemon over its
-`API` streams, merges its rows into watched snapshots, and forwards
-requests for its instances. Read this before
-touching anything that takes a `machine` param or a `m/name`.
+A machine is a remote host running devsandbox: registered with `devsandbox
+machine add`, one that registered this host from its end (an
+[inbound neighbor](#inbound-neighbors)), or a fleet member this host has
+no link to, reached through others (a [routed machine](#routed-machines)).
+The local daemon holds one link to each registered or inbound machine
+(for an ssh machine `ssh <target> devsandbox fleet-link --peer <this
+host>`, a [peer link](fleet.md#peer-links); for an inbound one the peer
+link it dialed), talks to the machine's daemon over its `API` streams (a
+routed machine's over [routed streams](fleet.md#routed-streams)), merges
+its rows into watched snapshots, and forwards requests for its
+instances. Read this before touching anything that takes a `machine`
+param or a `m/name`.
 
 Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 `RawEntry`, `path`, `parse`, `update`, `inbound.rs` (`Neighbors`, `Guard`),
@@ -18,15 +21,17 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 (`revoke`, `rotate`, `propose`, `push`, `call`, `Signed`, `Proposed`,
 `Rotation`), `ssh.rs`
 (`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
-`parse_target`, `Dial`, `Duplex`, `probe_dial`), `link.rs`
+`parse_target`, `Dial`, `RouteDial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
 `Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `api.rs`
 (`machines.*`, `Ctx`, `introducer_of`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`machine_names`, `plan`, `Plan`, `machine_use`, `route`,
 `localize`, `Reconnect`, `dials`, `pipe_mode`, `attach_mode`), `cli/calls.rs` (`use_of`, `Use`,
 `Refused`, `refusal`, `named`, `per_root`, `config_roots`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
-`parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
-`src/serve/fleet/dialer.rs` (`Dialer`, `dial`, `link_args`),
+`parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`,
+`fleet_view`, `routed`, `Routed`, `routed_agent`),
+`src/serve/fleet/dialer.rs` (`Dialer`, `dial`, `routed`, `link_args`),
+`src/serve/fleet/route.rs` (`connect`), `src/serve/fleet/routes.rs` (`reach`),
 `src/serve/relay.rs` (`--sentinel`), `src/commands/machine.rs`,
 `src/serve/endpoint.rs` (`fleet_socket`, `link_agent_socket`, `agent_sockets`),
 `src/tui/remote.rs`. Params: [api.md](../../reference/api.md#machines).
@@ -158,10 +163,14 @@ ssh's stderr for `spawn`'s `Peer`.
 
 `Dial` (`Fn(&Entry) -> Duplex`) is injectable. The daemon's is
 `fleet::dialer::dial`: a connection to the machine's `fleet-<name>.sock`
-in the socket dir, one `API` stream on its link, ssh or inbound alike;
-`machines::api::Ctx::dial` (the held link, forwarded verbs, placement's
-capacity asks) is that one, `Ctx::probe` the add-time `probe_dial`
-(`probe_argv`, `link::client_name` as the client). A `Duplex` is always a
+in the socket dir, one `API` stream on its link, ssh or inbound alike,
+never a route (it is the link's state, which this host's link report
+says); `machines::api::Ctx::dial` (the held link, forwarded verbs,
+placement's capacity asks) is that one, `Ctx::probe` the add-time
+`probe_dial` (`probe_argv`, `link::client_name` as the client).
+`RouteDial` (`Fn(&str) -> Duplex`, the daemon's `fleet::dialer::routed`)
+is a member's `API` stream through `fleet::route::connect`, what a
+[routed machine](#routed-machines) is dialed with. A `Duplex` is always a
 unix socket (pumped to the ssh child's pipes for `probe_dial`), so
 `client::Conn` works on it unchanged and tests dial a second test
 daemon's socket.
@@ -170,8 +179,10 @@ Every stream of a machine's link reaches the machine's daemon through
 `link.attach {peer: <this host's member name>, channel, key,
 introduced_by}` (the key and introducer this host proved on the link),
 which its
-`fleet-link --peer` sends first ([fleet](fleet.md#peer-links)), so the
-remote daemon serves it with the machine's trust table
+`fleet-link --peer` sends first ([fleet](fleet.md#peer-links)); a
+[routed stream](fleet.md#routed-streams)'s destination serves it for
+its proven origin, this host, the same way but with no agent. Either way
+the remote daemon serves it with the machine's trust table
 ([fleet](fleet.md#the-trust-table)): under its `trust = "worker"` (the
 default) this host reaches the machine's own roots and its fleet root
 for this host (`fleet/<this host>/` there) only (its own roots being
@@ -179,9 +190,9 @@ those its instances name, plus its `member.toml` `roots`, which `machine
 add` records there), never `machines.*`, `member.*`, `shutdown` or an
 edit of those configs (`fleet.*` goes by who the caller is, whatever the
 trust: [fleet](fleet.md#the-trust-table)); under `full`, everything but `member.*`,
-`link.*` and `links.*`. A verb this way runs with the machine daemon's
+`membership.*`, `graph.*`, `link.*` and `links.*`. A verb this way runs with the machine daemon's
 own env (the peer's `env`, `fleet::lent::Peer`), not a login shell's,
-its `SSH_AUTH_SOCK` this host's agent relayed there
+over a direct link its `SSH_AUTH_SOCK` this host's agent relayed there
 (`agent-link-<this host>.sock`, the peer's `agent`) while that socket
 answers, so host git on the machine uses the agent this host serves.
 No use of a machine bypasses the trust table: the only ssh shells on it
@@ -299,9 +310,10 @@ one's while its neighbor is up.
   `error`, asked again at the next change). That push is split
   (`snapshots::fleet_view`): its rows tagged `machine` and its `machines`
   array, this host's own name left out (guarded: the hub leaves it out
-  already) and only one hop (entries the hub sees `via` another are
-  dropped), are the hub's `Machine::fleet`; the rest is that root's own
-  rows when it is one of the entry's roots. A machine that stops being
+  already) and entries the hub itself sees `via` another dropped (the
+  machines the hub links to), are the hub's `Machine::fleet`, whose
+  machines are [routed](#routed-machines) here; the rest is that root's
+  own rows when it is one of the entry's roots. A machine that stops being
   the hub loses its view. A carrier going
   down ends the link at once and is the machine's `error`; a carrier
   coming up is dialed at once; a connect that fails or a link lost over a
@@ -331,27 +343,29 @@ machine binds, or any `route-*.sock`, is there.
 
 A routed machine (`MachineKind::Routed`, wire `routed`; fleet plan
 decision 60) is a fleet member this host has no link of its own to,
-reached through other members: each member of this host's link graph it
-binds a route socket for that the graph has a path to (the daemon's
-`Shared::routed_reach`, the service's `Hooks::routed`), plus each machine
-its hub's federated view lists ([Federated snapshots](#federated-snapshots)),
-neither a machine here (`snapshots::routed`, pure). It has no registry
-entry, no `serve-machine-*` thread and no watch: its rows are the hub's
-view's. `Handle::routed` lists them (`snapshots::Routed`): `via` the first
-hop of the first graph path whose first hop is a link up here
-(`fleet::routes::reach`), else the hub whose view lists it; `state`
-`connected` while there is such a path, else `unreachable` with why (a
-path that's there may still fail past its first hop: the call says so);
-`roots` the `root`s of its sandboxes rows in the hub's view, `version`
-and `capacity` the view's.
+reached through other members (`snapshots::routed`, pure, over the
+daemon's `Shared::routed_reach`, the service's `Hooks::routed`): each
+member it binds a route socket for that its link graph has a path to,
+plus each machine its hub's federated view lists, neither a machine
+here. It has no registry entry, no `serve-machine-*` thread and no watch:
+its rows are the hub's view's. `Handle::routed` lists them
+(`snapshots::Routed`): `via` the first hop of the first graph path whose
+first hop is a link up here (`fleet::routes::reach`), else the hub whose
+view lists it; `state` `connected` while there is such a path, else
+`unreachable` with why (a path that's there may still fail past its
+first hop: the call says so); `roots` the `root`s of its sandboxes rows
+in the hub's view, `version` and `capacity` the view's. `machines.list`
+and `machine ls` list them all; the federated snapshot (and so the
+dashboard) has only those the hub's view lists, `via` the hub
+([Federated snapshots](#federated-snapshots)).
 
 Everything that acts on a machine works on a routed one the same way,
-over `RouteDial` (`fleet::dialer::routed`: one `API` stream through
-`route::connect`) where a direct machine uses its link: forwarded quick
+over `RouteDial` where a direct machine uses its link: forwarded quick
 calls (`Handle::call_routed`: a stream of its own per call, hello within
 `Timing::handshake`, the call within `Timing::call`), verbs
-(`Handle::dial`), the federated calls, terminals and forwards (already on
-`route::connect`). Its daemon serves them under its trust for this host
+(`Handle::dial`), the federated calls, placement and code moves
+([fleet](fleet.md#in-the-run-verb)), terminals and forwards (every kind
+of machine's on `route::connect`). Its daemon serves them under its trust for this host
 ([fleet](fleet.md#routed-streams), *The destination*). What's refused:
 `machines.set` (no entry to keep `agent` in, and `AGENT` isn't routed,
 decision 58: `denied`, `snapshots::routed_agent`), and so the dashboard's
@@ -415,7 +429,8 @@ array carries each machine's `name`, `kind` (`ssh` |
 `inbound` | `routed`, fleet plan decisions 29, 60), `target` (`null` for an inbound one), `state`,
 `error`, `version`, `command`,
 `runtime`, `agent`, `capacity` (its host's
-[capacity report](fleet.md#capacity), from its last push), `via`. A machine's push or state change re-publishes those
+[capacity report](fleet.md#capacity), from its last push), `via`,
+`exposed_by` ([exposure](fleet.md#exposure)). A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
 
@@ -427,10 +442,9 @@ connected it takes the hub's state, `error` `through <hub>: <why>`, rows
 last known. A machine this host links to wins over the same name seen
 via the hub. The view lives in `Remotes` only (never in `remotes.json`:
 `saved::of` takes rows and versions), and isn't a machine of the
-service's: placement (`fleet::placed::workers`, over `Remotes::all`)
-never sees it; its machines are [routed](#routed-machines)
-(`Remotes::routed`), which is how `machines.list`, the federated calls and
-forwarded requests reach them.
+service's: its machines are [routed](#routed-machines)
+(`Remotes::routed`), which is how `machines.list`, placement, the
+federated calls and forwarded requests reach them.
 
 On a hub, a link peer's federated watch (a member watching it,
 [fleet](fleet.md#hub-mode)) is merged with `merge`'s `except` the peer's
@@ -472,8 +486,10 @@ dashboard's header note.
 
 `route` (I/O) runs `plan` (pure) in `main` before a verb goes to
 `verbs_client` or any command runs locally. A command on a machine goes
-over the machine's link (`fleet-<name>.sock`, the same for every kind of
-machine) and so through the machine's trust table (fleet plan decision 15:
+through this host's daemon (API calls with `machine`) or, for `PTY` and
+`TUNNEL` dials from this process, `fleet::route::connect` (the
+machine's `fleet-<name>.sock`, else its `route-<name>.sock`: the same
+for every kind of machine), and so through the machine's trust table (fleet plan decision 15:
 API calls and `PTY` and `TUNNEL` streams within its trust, never a
 `devsandbox …` run there).
 
@@ -490,7 +506,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   runs here: `route` returns `Routed::Port` (the machine's `Entry`, the
   match's root or else the machine's first, the instance as the machine
   names it) and `commands::port::port_remote` forwards over one `TUNNEL`
-  stream per bridge through the machine's `fleet-<name>.sock`
+  stream per bridge through `route::connect`
   (`tunnel::remote_opener`; [forwards](forwards.md),
   [fleet](fleet.md#tunnel)). `vscode` on a machine's instance is refused
   (`calls::refusal`: not available over its link yet).
@@ -561,8 +577,8 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   (`calls::listing`): the machine answers its whole runtime's rows cut to
   what its trust reaches (those instances' containers and their config
   roots' services, [fleet](fleet.md#the-trust-table)).
-- **An `exec`** is `PTY` streams over the machine's link from this
-  process (`fleet::pty_client::dial`, [fleet](fleet.md#pty)), at the
+- **An `exec`** is `PTY` streams to the machine from this process
+  (`fleet::pty_client::dial`, over `route::connect`; [fleet](fleet.md#pty)), at the
   instance's root there (the match's, else the machine's first); a dial's
   end becomes this process's exit code (`pty_client::exit_of`: the
   program's, 255 only for a lost link, the helper's session codes).
@@ -697,7 +713,7 @@ The answer's `fleet` is the
 fleet both ends are in and who joined; the CLI prints it on a line after
 `added …` (`fleet_line`). When this host, not the fleet's authority,
 introduced the machine, `machines.add` then proposes that introduction
-to the authority over a direct link (`fleet.propose`, best effort; the
+to the authority over any path (`fleet.propose`, best effort; the
 answer's `proposed`), and the CLI prints `proposed its add to
 <authority>: approve there with devsandbox machine approve <id>`, or why
 not (`proposed_line`). `add --agent` saves the machine with `agent`
@@ -769,7 +785,7 @@ reaches it (`rotation_lines`).
 routed back to a request's `machine` + remote `root`; on every machine,
 whatever its kind, an instance tab runs this host's `devsandbox exec …
 -- <m>/<name>` (`on_machine`, the executable `ExecCli::exe`), whose tty
-`exec` dials the machine's link ([The CLI](#the-cli-clirs)), and a
+`exec` dials the machine ([The CLI](#the-cli-clirs)), and a
 service tab runs `devsandbox exec --service=<name> -- <m>/<instance>`
 through an instance using it (`service_argv`, `service_instance`; a
 global service no instance uses has none, and its tab is refused); a
@@ -786,8 +802,9 @@ listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while there is a machine, shows every machine from the snapshot's
 `machines` with its target (dimmed `inbound` for an inbound one, dimmed
-`via <hub>` for one seen through the hub), link state (and error),
-`agent` (`-` for an inbound one or one seen via the hub), and its
+`via <hub>` for a routed one, which the snapshot has only from the hub's
+view), link state (and error), `agent` (`-` for an inbound or routed
+one), and its
 CAPACITY ([capacity](fleet.md#capacity)); a machine `worker` and exposed
 through another one (the entry's `exposed_by`) has `exposed via
 <dialer>` after its NAME, in yellow (`ui::machine_name_text`,
@@ -797,8 +814,8 @@ down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers
 ([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*); on an
 inbound machine it only says why there's nothing to flip
-(`App::toggle_selected_agent`), on a routed one (seen via the hub) that
-its agent isn't routed (`snapshots::routed_agent`). A routed machine's
+(`App::toggle_selected_agent`), on a routed one that its agent isn't
+routed (`snapshots::routed_agent`). A routed machine's
 rows are actionable like any other's: its tabs run the same `exec` on the
 qualified name (`on_machine`), dialed over a route, and actions on its
 rows carry its name as `machine`, which the daemon forwards to it over a

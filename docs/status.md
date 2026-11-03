@@ -34,7 +34,7 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 10b on. Steps 1-9 and 10a shipped: one kind of
+  re-placement: from fleet step 10c on. Steps 1-9, 10a and 10b shipped: one kind of
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
@@ -53,9 +53,16 @@ limitation means editing this file in the same commit.
   the fleet's membership is a log only its authority (the host that
   made it) signs, every link proves both ends' keys against it, and a
   change typed on another member (`machine rm`, `machine key rotate`,
-  an introduction) waits for `machine approve` on the authority. Next:
-  routing over the graph (step 10b), then end-to-end sessions (10c).
-  → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#member-identity), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md)
+  an introduction) waits for `machine approve` on the authority. Routing
+  (step 10b): every member signs a report of its links and the members
+  flood them into one link graph; a member with no link to another
+  reaches it over the graph's paths, each routed stream proving its
+  origin to its destination, which serves it under its trust for that
+  origin; members reached only that way are routed machines, with
+  actions, terminals, forwards, placement and fleet calls; `machine
+  trust worker` warns when a machine the hub's side controls dials this
+  host. Next: end-to-end sessions (step 10c).
+  → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
 - **helper**: drop the host-side `lsof` fallback for a forward's listening
@@ -290,11 +297,15 @@ limitation means editing this file in the same commit.
   reported since; a Machines tab row's `exposed via` follows a graph
   change at the next push (the next poll pass or machine change).
   → [fleet](architecture/daemon/fleet.md#exposure); `fleet::graph::exposed_workers`
-- Routed streams are opened only through the daemon's
-  `route-<member>.sock`. A routed stream doesn't fail over once open: a hop going down ends it, and its client
-  opens it again. Until 10c a relay sees and can alter a routed stream's
-  bytes after its opening (only the opening is proven end to end).
-  → [fleet](architecture/daemon/fleet.md#routed-streams); `fleet::route`, `fleet::routes`
+- Until fleet step 10c a relay sees and can alter a routed stream's
+  bytes after its opening (only the opening is proven end to end), and
+  so can drive the API calls its origin makes.
+  → [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md); `fleet::route::serve`
+- A routed stream doesn't fail over once open: a hop going down ends it,
+  and its client opens it again.
+  → [fleet](architecture/daemon/fleet.md#routed-streams); `fleet::routes::first_open`
+- A member more than four hops away is unreachable (a routed stream's
+  TTL). → [fleet](architecture/daemon/fleet.md#link-graph); `fleet::graph::MAX_HOPS`
 - A capped (introduced) member can't rotate its key: the log has no key
   of it to rotate until the authority adds it.
   → [fleet](architecture/daemon/fleet.md#member-identity); `machines::changes::can_rotate`
@@ -315,10 +326,14 @@ limitation means editing this file in the same commit.
   to), and a member watches its hub federated only while one of its own
   watchers wants machines; a graph member the view doesn't list is a
   `machine ls` row with no roots, so the federated `sandboxes.list`
-  doesn't ask it. Their agent isn't routed (`machines.set` and the
-  dashboard's toggle refuse it) until fleet step 10c. A routed machine's
-  forward is dropped by a sync while the graph has no path to it.
-  → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`
+  doesn't ask it, and isn't on the dashboard's Machines tab, whose routed
+  rows are the view's, `via` the hub. A routed machine's forward is
+  dropped by a sync once it's no routed machine (no path in the graph,
+  not in the hub's view).
+  → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`, `snapshots::merge`
+- `AGENT` isn't routed: a routed machine gets no agent (`machines.set`
+  and the dashboard's toggle refuse it) until per-member agent grants
+  (fleet step 10c). → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed_agent`
 - Remote rows live in memory except on a hub (which reloads them from
   `remotes.json`): a fresh non-hub daemon shows a machine without rows
   until its link connects (machines seen via the hub too, until it
