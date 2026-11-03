@@ -1,6 +1,6 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-9, 10a and 10b shipped
+Status: in progress. Steps 1-10 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md),
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
@@ -16,8 +16,9 @@ hub and its runs placed there; step 10a gave members identity: a key
 each, a membership log only the fleet's authority signs, links that
 prove both keys, changes made elsewhere approved on the authority;
 step 10b routed streams over the members' signed link graph, each
-proving its origin to its destination. Step 10c (end-to-end sessions)
-is in progress. The rest is design. Builds on
+proving its origin to its destination; step 10c made each routed
+stream an end-to-end session and agent access a per-member grant
+carried over any path. Step 11 is next. The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
 [machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
 its parked auto-update and PTY attach into steps 2 and 4.
@@ -764,6 +765,24 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
         `agent-route-<member>.sock` while one serves.
       - **10c.5 Docs close.** `docs/status.md`, this step's as-built
         note, `CHANGELOG.md`.
+
+      As built: `session::pump` runs one direction on a `route-session`
+      thread and the other on the caller's (the counted `serve-routed` or
+      `serve-route` thread); a record's type follows from its length (an
+      END is the only empty one) and is authenticated as its associated
+      data. Grants live in `fleet::grants` over `member.toml`'s
+      `[[agent]]`; `machines.toml` has no `agent` flag. A host probes a
+      granting member through `route::connect` (its link socket when it
+      dialed that member, else its route socket) from
+      `fleet::agent_routes`, one `serve-agent-route` thread per member,
+      skipping inbound neighbors (their `fleet-link --peer` binds
+      `agent-link-<member>.sock` as before); the dialed end's
+      `fleet-link --peer` now serves `AGENT` too, so a member that was
+      dialed can grant its dialer. `AGENT` openings and probes aren't
+      logged per stream. A forwarded verb's `SSH_AUTH_SOCK` is still only
+      a dialed end's `agent-link-<peer>.sock` (`Shared::fleet_peer`), and
+      an agent grant isn't counted as exposure (both in
+      `docs/status.md`).
 11. **Hub swap, pointer** (S–M). `machine hub <m>`: the role moves, links
     stay; every reachable member rewrites `hub`, a late one learns it on
     reconnect.

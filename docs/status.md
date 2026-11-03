@@ -34,7 +34,7 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 10c on. Steps 1-9, 10a and 10b shipped: one kind of
+  re-placement: from fleet step 11 on. Steps 1-10 shipped: one kind of
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
@@ -61,8 +61,10 @@ limitation means editing this file in the same commit.
   origin; members reached only that way are routed machines, with
   actions, terminals, forwards, placement and fleet calls; `machine
   trust worker` warns when a machine the hub's side controls dials this
-  host. In progress: end-to-end sessions and routed `AGENT` (step 10c,
-  sub-steps 10c.1-10c.5 in the plan).
+  host. End-to-end sessions (step 10c): each routed stream is encrypted
+  between its two daemons, so a relay carries ciphertext only; agent
+  access is a per-member grant (`machine set <m> agent on`), carried to
+  a granted member over any path. Next: hub swap (step 11).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md), [ADR 0046](decisions/0046-routed-streams-are-end-to-end-sessions.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -109,6 +111,10 @@ limitation means editing this file in the same commit.
   auto-withdraw older open forms, threads shared across users.
 - **machines**: OS keychain backends for the member key behind `KeyStore`
   (fleet plan decision 52). → [plan](plans/active/fleet.md)
+- **machines**: an agent grant counted as exposure (a granted member can
+  ssh as the granter wherever its agent reaches; reports carry grants
+  since step 10c, `fleet::graph::exposure` doesn't read them).
+  → [fleet](architecture/daemon/fleet.md#exposure)
 
 ## Known limitations
 
