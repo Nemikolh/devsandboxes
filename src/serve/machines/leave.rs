@@ -327,10 +327,12 @@ fn drop_all(ctx: &Ctx) -> Result<Vec<String>, ApiError> {
 }
 
 /// On the hub `hub`: take `name` out of the fleet (see the module doc).
-/// `machines` are this host's direct ones; each it tells gets this host's
-/// log first (`fleet.sync`, best effort), so the revoke its `fleet.leave` /
-/// `fleet.forget` follows is there even before a push reached it. The
-/// unlink here is written; the links follow with the returned [`After`].
+/// `machines` are this host's direct ones; the members it tells are those
+/// and its routed ones ([`forget_targets`]), each over any path ([`call`]).
+/// Each it tells gets this host's log first (`fleet.sync`, best effort),
+/// so the revoke its `fleet.leave` / `fleet.forget` follows is there even
+/// before a push reached it. The unlink here is written; the links follow
+/// with the returned [`After`].
 pub(super) fn remove(ctx: &Ctx, hub: &str, name: &str, tell: bool, machines: &[String]) -> Result<(Removed, After), ApiError> {
     let log = membership_api::load(member_toml(ctx)?)?.map(|s| serde_json::to_value(s.to_wire()));
     let log = log.transpose().map_err(|e| ApiError::internal(e.into()))?;
@@ -349,7 +351,8 @@ pub(super) fn remove(ctx: &Ctx, hub: &str, name: &str, tell: bool, machines: &[S
         }
     };
     let (mut forgot, mut missed) = (Vec::new(), Vec::new());
-    for other in machines.iter().filter(|m| *m != name) {
+    let routed: Vec<String> = ctx.links.as_ref().map(|l| l.routed().into_iter().map(|r| r.name).collect()).unwrap_or_default();
+    for other in &forget_targets(machines, &routed, hub, name) {
         sync(other);
         match call(ctx, other, "fleet.forget", json!({ "name": name })) {
             Ok(_) => forgot.push(other.clone()),
@@ -361,28 +364,50 @@ pub(super) fn remove(ctx: &Ctx, hub: &str, name: &str, tell: bool, machines: &[S
     Ok((removed, After::Unlinked(name.into())))
 }
 
+/// Who a removal of `name` on hub `hub` sends `fleet.forget` (pure): the
+/// hub's direct `machines`, then its `routed` members (graph members with
+/// no link of their own here) that aren't among them; never `name` or the
+/// hub itself.
+fn forget_targets(machines: &[String], routed: &[String], hub: &str, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in machines.iter().chain(routed) {
+        if m != name && m != hub && !out.contains(m) {
+            out.push(m.clone());
+        }
+    }
+    out
+}
+
 /// Drop `name`'s registry entry, if it has one (written, not applied).
 fn unregister(ctx: &Ctx, name: &str) -> Result<(), ApiError> {
     super::update(&ctx.registry, |entries| entries.retain(|e| e.name != name)).map_err(ApiError::internal)
 }
 
-/// `method` on machine `name` over its link, while it's connected: its
-/// result, or why not.
+/// `method` on member `name` over any path: its link while connected,
+/// else a route over this host's link graph (`service::Handle::call_member`):
+/// its result, or why not. Every membership call to a member goes this
+/// way (`fleet.propose`, `fleet.rm`, `fleet.leave`, `fleet.forget` and the
+/// `fleet.sync` before them).
 pub(super) fn call(ctx: &Ctx, name: &str, method: &str, params: Value) -> Result<Value, String> {
     match &ctx.links {
-        Some(links) => call_on(links, name, method, params),
+        Some(links) => answer_of(method, links.call_member(name, method, params)?),
         None => Err("no links here".into()),
     }
 }
 
-/// [`call`] over `links`.
+/// `method` on machine `name` over its own link only, while it's
+/// connected: its result, or why not. What stays on direct links: a push's
+/// flood (`changes::push`) and the link reports (`fleet::reports`).
 pub(crate) fn call_on(links: &Handle, name: &str, method: &str, params: Value) -> Result<Value, String> {
     match links.remotes().get(name) {
         Some(m) if m.state == LinkState::Connected => {}
         Some(m) => return Err(m.error.unwrap_or_else(|| "its link isn't up".into())),
         None => return Err("no link to it".into()),
     }
-    let r = links.forward(name, method, params).map_err(|e| e.message)?;
+    answer_of(method, links.forward(name, method, params).map_err(|e| e.message)?)
+}
+
+fn answer_of(method: &str, r: crate::serve::proto::Response) -> Result<Value, String> {
     if let Some(e) = r.error {
         return Err(format!("{method}: {} ({})", e.message, e.code));
     }
@@ -519,6 +544,12 @@ mod tests {
         assert_eq!(run(Hub::This, &[], false, "lap", None), Ok(Plan::Leave { hub: None }));
         assert_eq!(code(run(Hub::This, &["box"], false, "lap", None)), ("denied", HUB_HAS_MEMBERS.into()));
         assert_eq!(code(run(Hub::None, &[], false, "lap", None)), ("failed", "this host is in no fleet".into()));
+    }
+
+    #[test]
+    fn the_hub_forgets_on_direct_and_routed_members() {
+        assert_eq!(forget_targets(&names(&["box", "x"]), &names(&["lap", "x", "pi"]), "b", "pi"), names(&["box", "x", "lap"]));
+        assert_eq!(forget_targets(&[], &names(&["b", "lap"]), "b", "zed"), names(&["lap"]), "never the hub itself");
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! The daemon's `run` verb placed (docs/architecture/daemon/fleet.md,
 //! *Placement*; fleet step 3c): a `run` that names no `machine` and asks
 //! for it (`place`, `run --place`: [`asked`]; fleet plan decision 38) goes
-//! where [`place::place`] says among this host and every
-//! machine whose link is up (ssh or inbound). On a
+//! where [`place::place`] says among this host, every
+//! machine whose link is up (ssh or inbound) and every routed machine a
+//! path reaches (fleet plan decision 60). On a
 //! machine, its sandbox's code moves first, into this host's fleet root
 //! there (`code::prepare`; [`fleet_root`] says where that is), then the
 //! request is forwarded as a `machine` one would be, in the moved config
@@ -17,9 +18,9 @@
 //!
 //! On a member (fleet plan decision 31) the hub decides: the member sends
 //! `fleet.place` ([`PlaceParams`]: its spec, capacity and the machines it
-//! links to directly), the hub scores those it can see among them
-//! ([`for_member`]) and answers a [`PlaceAnswer`], and the member moves
-//! the code and forwards over its own links ([`by_hub`]).
+//! reaches, over a link or a route), the hub scores those it reaches too
+//! among them ([`for_member`]) and answers a [`PlaceAnswer`], and the
+//! member moves the code and forwards over its own paths ([`by_hub`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,7 @@ use super::code::{Prepared, Unprepared};
 use super::place::{self, Candidate, MachineRef, NoPlace, Placement, Spec};
 use crate::serve::api::RootCandidate;
 use crate::serve::capacity::Capacity;
-use crate::serve::snapshots::Machine;
+use crate::serve::snapshots::{Machine, Routed};
 use crate::serve::verbs;
 
 /// The machines placement may pick besides this host: every one, whatever
@@ -75,16 +76,19 @@ pub fn tied(ties: &[String]) -> Option<Placed> {
 }
 
 /// The workers placement asks for a fresh report: the reachable ones
-/// (their link up), whatever their saved report says.
-pub fn reachable_workers(machines: &[Machine]) -> Vec<String> {
-    workers(machines).filter(|m| place::reachable(m.state)).map(|m| m.name.clone()).collect()
+/// (their link up, or a `routed` one a path reaches), whatever their saved
+/// report says.
+pub fn reachable_workers(machines: &[Machine], routed: &[Routed]) -> Vec<String> {
+    let direct = workers(machines).filter(|m| place::reachable(m.state)).map(|m| m.name.clone());
+    direct.chain(routed.iter().filter(|r| place::reachable(r.state)).map(|r| r.name.clone())).collect()
 }
 
 /// Whether placing can pick anything but this host: some machine is
-/// reachable. Checked first (no I/O: the links' last states), so a host
-/// with no machine linked pays nothing, not even a `capacity.get`.
-pub fn worth_placing(machines: &[Machine]) -> bool {
-    !reachable_workers(machines).is_empty()
+/// reachable. Checked first (no I/O: the links' and the graph's last
+/// states), so a host with no machine linked pays nothing, not even a
+/// `capacity.get`.
+pub fn worth_placing(machines: &[Machine], routed: &[Routed]) -> bool {
+    !reachable_workers(machines, routed).is_empty()
 }
 
 /// `c` with its machine's fresh report, when one came: its capacity
@@ -114,18 +118,20 @@ pub fn spec(sandbox: &str, root: Option<&Value>) -> Spec {
     }
 }
 
-/// This host (its `capacity`, its watched roots' snapshots `local_roots`)
-/// and every worker among `machines`, each with its `fresh` report by name
-/// ([`with_fresh`]).
+/// This host (its `capacity`, its watched roots' snapshots `local_roots`),
+/// every worker among `machines` and every `routed` machine, each with its
+/// `fresh` report by name ([`with_fresh`]).
 pub fn candidates(
     spec: &Spec,
     capacity: Option<Capacity>,
     local_roots: &[Arc<Value>],
     machines: &[Machine],
+    routed: &[Routed],
     fresh: &BTreeMap<String, Capacity>,
 ) -> Vec<Candidate> {
     let mut out = vec![Candidate::local(spec, capacity, local_roots.iter().map(|v| v.as_ref()))];
     out.extend(workers(machines).map(|m| with_fresh(Candidate::from_machine(spec, m), fresh.get(&m.name))));
+    out.extend(routed.iter().map(|r| with_fresh(Candidate::from_routed(r), fresh.get(&r.name))));
     out
 }
 
@@ -198,9 +204,9 @@ pub struct PlaceSpec {
 }
 
 /// `fleet.place`'s params (docs/reference/api.md, *fleet*): the member's
-/// spec, its own capacity now, and the machines it has a connected direct
-/// link to (its hub among them): until routing (fleet step 10), the only
-/// ones it could move code to.
+/// spec, its own capacity now, and the machines it reaches
+/// ([`reachable_workers`]: a connected link, or a route; its hub among
+/// them): those it can move code to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceParams {
     pub spec: PlaceSpec,
@@ -239,20 +245,22 @@ pub struct PlaceAnswer {
 }
 
 /// The hub's machines `fleet.place` from `from` asks a fresh
-/// `capacity.get`: those whose link is up here, that the requester links
-/// to directly (`ask.reachable`), the requester itself left out (it sent
-/// its own).
-pub fn member_workers(ask: &PlaceParams, from: &str, machines: &[Machine]) -> Vec<String> {
-    reachable_workers(machines).into_iter().filter(|m| m != from && ask.reachable.contains(m)).collect()
+/// `capacity.get`: those it reaches ([`reachable_workers`]: a link up
+/// here, or a route), that the requester reaches too (`ask.reachable`),
+/// the requester itself left out (it sent its own).
+pub fn member_workers(ask: &PlaceParams, from: &str, machines: &[Machine], routed: &[Routed]) -> Vec<String> {
+    reachable_workers(machines, routed).into_iter().filter(|m| m != from && ask.reachable.contains(m)).collect()
 }
 
 /// The hub's placement of member `from`'s run (pure): the candidates are
 /// the requester (its own `capacity`, its image as the hub's view of its
 /// rows shows; `place`'s [`place::REQUESTER`] bias), the hub `hub` itself
 /// (`capacity`, its watched roots `hub_roots`) and each of
-/// [`member_workers`] with its `fresh` report. Every candidate is named as
+/// [`member_workers`] (among `machines` and the hub's `routed` ones) with
+/// its `fresh` report. Every candidate is named as
 /// the hub knows it, the hub by its member name, so the answer's lines
 /// read the same on the member.
+#[allow(clippy::too_many_arguments)]
 pub fn for_member(
     ask: &PlaceParams,
     from: &str,
@@ -260,6 +268,7 @@ pub fn for_member(
     capacity: Capacity,
     hub_roots: &[Arc<Value>],
     machines: &[Machine],
+    routed: &[Routed],
     fresh: &BTreeMap<String, Capacity>,
 ) -> Result<PlaceAnswer, NoPlace> {
     let requester = MachineRef::Machine(from.to_string());
@@ -277,12 +286,15 @@ pub fn for_member(
         None => Candidate { machine: requester.clone(), reachable: true, capacity: Some(ask.capacity.clone()), has_image: false, has_repo: false },
     };
     let this = Candidate { machine: MachineRef::Machine(hub.to_string()), ..Candidate::local(&spec, Some(capacity), hub_roots.iter().map(|v| v.as_ref())) };
-    let others = member_workers(ask, from, machines);
+    let others = member_workers(ask, from, machines, routed);
     let mut candidates = vec![asker, this];
     candidates.extend(
         workers(machines)
             .filter(|m| others.contains(&m.name))
             .map(|m| with_fresh(Candidate::from_machine(&spec, m), fresh.get(&m.name))),
+    );
+    candidates.extend(
+        routed.iter().filter(|r| others.contains(&r.name)).map(|r| with_fresh(Candidate::from_routed(r), fresh.get(&r.name))),
     );
     let placement = place::place(&spec, &candidates)?;
     let MachineRef::Machine(name) = &placement.machine else { unreachable!("every candidate is named") };
@@ -306,7 +318,7 @@ pub enum Unplaced {
 }
 
 /// A member's `run` as hub `hub` answered it (`reachable`: the machines
-/// this host links to directly and connected): here (the hub's lines
+/// this host reaches, [`reachable_workers`]): here (the hub's lines
 /// first), or on a worker this host reaches, `prepare` moving the code
 /// there as for a hub's own placement ([`moved`]). No answer, or a worker
 /// this host can't reach: here, with a note naming the hub.
@@ -328,7 +340,7 @@ pub fn by_hub(
         PlaceOn::Machine => a.machine,
     };
     if !reachable.contains(&name) {
-        return Placed::LocalWithNote(format!("note: the hub `{hub}` placed it on {name}, which this host has no link to: running here"));
+        return Placed::LocalWithNote(format!("note: the hub `{hub}` placed it on {name}, which this host has no path to: running here"));
     }
     moved(ask, &name, a.lines, prepare)
 }
@@ -468,15 +480,15 @@ mod tests {
     fn worth_placing_wants_a_connected_machine() {
         use LinkState::*;
         let roomy = || Some(cap(28, 0, None));
-        assert!(!worth_placing(&[]), "no machines");
+        assert!(!worth_placing(&[], &[]), "no machines");
         for kind in [MachineKind::Ssh, MachineKind::Inbound] {
-            assert!(worth_placing(&[worker("m", kind, Connected, roomy())]), "{kind:?}: every kind is a candidate");
+            assert!(worth_placing(&[worker("m", kind, Connected, roomy())], &[]), "{kind:?}: every kind is a candidate");
             for down in [Idle, Connecting, Unreachable] {
-                assert!(!worth_placing(&[worker("m", kind, down, roomy())]), "{kind:?} {down:?}: its link is down");
+                assert!(!worth_placing(&[worker("m", kind, down, roomy())], &[]), "{kind:?} {down:?}: its link is down");
             }
         }
         // No saved report: asked afresh either way.
-        assert!(worth_placing(&[worker("lap", MachineKind::Inbound, Connected, None)]));
+        assert!(worth_placing(&[worker("lap", MachineKind::Inbound, Connected, None)], &[]));
         let all = [
             worker("a", MachineKind::Inbound, Connected, None),
             worker("b", MachineKind::Inbound, Unreachable, None),
@@ -484,7 +496,7 @@ mod tests {
             worker("d", MachineKind::Ssh, Connected, None),
             worker("e", MachineKind::Ssh, Idle, None),
         ];
-        assert_eq!(reachable_workers(&all), ["a", "c", "d"]);
+        assert_eq!(reachable_workers(&all, &[]), ["a", "c", "d"]);
     }
 
     #[test]
@@ -516,10 +528,10 @@ mod tests {
         assert_eq!(c.capacity.as_ref(), Some(&saved));
         // Through `candidates`, by name; the fresh one decides the placement.
         let neutral = worker("lap", MachineKind::Inbound, LinkState::Connected, None);
-        let stale = candidates(&s, None, &[], std::slice::from_ref(&neutral), &BTreeMap::new());
+        let stale = candidates(&s, None, &[], std::slice::from_ref(&neutral), &[], &BTreeMap::new());
         assert_eq!(decide(&Ask::default(), &s, &stale, |_| unreachable!()), Placed::Local, "neutral both: this host's bias");
         let fresh_map = BTreeMap::from([("lap".to_string(), fresh)]);
-        let c = candidates(&s, None, &[], &[neutral], &fresh_map);
+        let c = candidates(&s, None, &[], &[neutral], &[], &fresh_map);
         assert!(matches!(decide(&Ask::default(), &s, &c, |_| Ok(prepared("main"))), Placed::Worker { .. }));
     }
 
@@ -540,28 +552,80 @@ mod tests {
             worker("nb", MachineKind::Inbound, LinkState::Connected, None),
             worker("off", MachineKind::Ssh, LinkState::Unreachable, None),
         ];
-        let c = candidates(&spec("web", None), Some(cap(16, 2, None)), &[], &machines, &BTreeMap::new());
+        let c = candidates(&spec("web", None), Some(cap(16, 2, None)), &[], &machines, &[], &BTreeMap::new());
         let names: Vec<_> = c.iter().map(|c| (c.machine.to_string(), c.reachable)).collect();
         let want = [("this host", true), ("srv", true), ("lap", true), ("nb", true), ("off", false)];
         assert_eq!(names, want.map(|(n, r)| (n.to_string(), r)));
 
-        // A hub's view of its machines (on a member) adds no candidate:
-        // those are routed, and placement doesn't reach them yet.
+        // A hub's view of its machines (on a member) adds no candidate of
+        // itself: those are the routed ones (`Handle::routed`), passed apart.
         let mut hub = worker("k", MachineKind::Ssh, LinkState::Connected, None);
         hub.fleet = Some(Arc::new(json!({"machines": [{"name": "x", "state": "connected"}], "instances": []})));
-        let seen = candidates(&spec("web", None), None, &[], std::slice::from_ref(&hub), &BTreeMap::new());
+        let seen = candidates(&spec("web", None), None, &[], std::slice::from_ref(&hub), &[], &BTreeMap::new());
         assert_eq!(seen.iter().map(|c| c.machine.to_string()).collect::<Vec<_>>(), ["this host", "k"]);
-        assert_eq!(reachable_workers(std::slice::from_ref(&hub)), ["k"]);
+        assert_eq!(reachable_workers(std::slice::from_ref(&hub), &[]), ["k"]);
         assert_eq!(c[0].capacity.as_ref().map(|c| c.running), Some(2));
 
         // An inbound or ssh machine with more room wins over a busy host.
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
         for kind in [MachineKind::Inbound, MachineKind::Ssh] {
             let roomy = [worker("m", kind, LinkState::Connected, Some(cap(28, 0, None)))];
-            let c = candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &roomy, &BTreeMap::new());
+            let c = candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &roomy, &[], &BTreeMap::new());
             let placed = decide(&Ask::default(), &spec("web", None), &c, |_| Ok(prepared("main")));
             assert!(matches!(&placed, Placed::Worker { name, .. } if name == "m"), "{kind:?}: {placed:?}");
         }
+    }
+
+    fn routed(name: &str, state: LinkState, capacity: Option<Capacity>) -> Routed {
+        Routed { name: name.into(), via: Some("k".into()), state, capacity, ..Routed::default() }
+    }
+
+    /// Routed machines (no link of their own, a path in the graph) are
+    /// workers too: reachable while a path starts with a link up here,
+    /// scored by the hub view's capacity or a fresh one, picked and moved
+    /// to like any other.
+    #[test]
+    fn routed_machines_are_candidates() {
+        let machines = [worker("k", MachineKind::Ssh, LinkState::Connected, None)];
+        let r = [routed("b", LinkState::Connected, None), routed("far", LinkState::Unreachable, Some(cap(30, 0, None)))];
+        assert_eq!(reachable_workers(&machines, &r), ["k", "b"]);
+        assert!(worth_placing(&[], &r[..1]), "a routed one alone is worth placing");
+        assert!(!worth_placing(&[], &r[1..]), "no path up: not");
+        let s = spec("web", None);
+        let c = candidates(&s, Some(cap(16, 2, None)), &[], &machines, &r, &BTreeMap::new());
+        let names: Vec<_> = c.iter().map(|c| (c.machine.to_string(), c.reachable, c.has_image)).collect();
+        assert_eq!(names, [("this host", true, false), ("k", true, false), ("b", true, false), ("far", false, false)].map(|(n, r, i)| (n.to_string(), r, i)));
+        assert_eq!(c[3].capacity.as_ref().map(|c| c.running), Some(0), "the hub view's report");
+
+        // A busy host, b roomy by its fresh report: placed on b, moved there.
+        let over = Some(Caps { instances: Some(1), ..Caps::default() });
+        let fresh = BTreeMap::from([("b".to_string(), cap(28, 0, None))]);
+        let c = candidates(&s, Some(cap(4, 3, over.clone())), &[], &[], &r, &fresh);
+        let placed = decide(&Ask::default(), &s, &c, |w| {
+            assert_eq!(w, "b");
+            Ok(prepared("main"))
+        });
+        assert!(matches!(&placed, Placed::Worker { name, .. } if name == "b"), "{placed:?}");
+        // Unreachable, however roomy: never picked.
+        let c = candidates(&s, Some(cap(4, 3, over)), &[], &[], &r[1..], &BTreeMap::new());
+        assert_eq!(decide(&Ask::default(), &s, &c, |_| unreachable!()), Placed::Local);
+    }
+
+    /// On the hub: a member's run may go to a machine the hub reaches over
+    /// a route, when the member reaches it too (it says so in `reachable`).
+    #[test]
+    fn the_hub_places_on_a_routed_machine_both_reach() {
+        let over = Some(Caps { instances: Some(1), ..Caps::default() });
+        let machines = [worker("lap", MachineKind::Inbound, LinkState::Connected, None)];
+        let r = [routed("b", LinkState::Connected, None), routed("c", LinkState::Connected, None)];
+        let a = PlaceParams::of(&spec("web", None), cap(4, 3, over.clone()), names(&["box", "b"]));
+        assert_eq!(member_workers(&a, "lap", &machines, &r), ["b"], "c: lap doesn't reach it");
+        let fresh = BTreeMap::from([("b".to_string(), cap(30, 0, None)), ("c".to_string(), cap(31, 0, None))]);
+        let got = for_member(&a, "lap", "box", cap(4, 3, over), &[], &machines, &r, &fresh).unwrap();
+        assert_eq!((got.on, got.machine.as_str()), (PlaceOn::Machine, "b"));
+        // The member moves the code there: b is among what it reaches.
+        let Placed::Worker { name, .. } = by_hub(&Ask::default(), "box", Ok(got), &a.reachable, |_| Ok(prepared("main"))) else { panic!() };
+        assert_eq!(name, "b");
     }
 
     /// The decision over (request, candidates), `prepare` faked: what it
@@ -569,8 +633,8 @@ mod tests {
     #[test]
     fn the_decision() {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
-        let busy_here = || candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, None)))], &BTreeMap::new());
-        let idle_here = || candidates(&spec("web", None), Some(cap(28, 0, None)), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(4, 6, None)))], &BTreeMap::new());
+        let busy_here = || candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, None)))], &[], &BTreeMap::new());
+        let idle_here = || candidates(&spec("web", None), Some(cap(28, 0, None)), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(4, 6, None)))], &[], &BTreeMap::new());
         let asked = RefCell::new(Vec::new());
         let ok = |branch: &'static str| {
             let asked = &asked;
@@ -604,7 +668,7 @@ mod tests {
 
         // Every candidate over a cap: the best, warned.
         let over_mem = Some(Caps { mem: Some(G), ..Caps::default() });
-        let all_over = candidates(&s, Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, over_mem)))], &BTreeMap::new());
+        let all_over = candidates(&s, Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, over_mem)))], &[], &BTreeMap::new());
         let Placed::Worker { lines, .. } = decide(&ask, &s, &all_over, ok("main")) else { panic!() };
         assert_eq!(lines, ["placed on lap (mem 0% free, disk 50% free, cpu 100% free)", "warning: lap: over cap: mem 4G/1G"]);
     }
@@ -628,34 +692,34 @@ mod tests {
         ];
         // Asked afresh: the hub's connected ones lap reaches, never lap itself.
         let a = ask(cap(4, 3, over.clone()), &["box", "srv", "off", "lap"]);
-        assert_eq!(member_workers(&a, "lap", &machines), ["srv"]);
+        assert_eq!(member_workers(&a, "lap", &machines, &[]), ["srv"]);
 
         // A busy requester (its own report, not the hub's saved one), a roomy hub.
         let none = BTreeMap::new();
         let busy_srv = BTreeMap::from([("srv".to_string(), cap(2, 6, over.clone()))]);
-        let got = for_member(&a, "lap", "box", cap(28, 0, None), &[], &machines, &busy_srv).unwrap();
+        let got = for_member(&a, "lap", "box", cap(28, 0, None), &[], &machines, &[], &busy_srv).unwrap();
         assert_eq!((got.on, got.machine.as_str()), (PlaceOn::Hub, "box"));
         assert_eq!(got.lines, ["placed on box (mem 87% free, disk 50% free, cpu 100% free)"]);
 
         // A roomy requester: it stays there, the bias among its reasons.
         let a = ask(cap(28, 0, None), &["box"]);
-        let got = for_member(&a, "lap", "box", cap(28, 0, None), &[], &machines, &none).unwrap();
+        let got = for_member(&a, "lap", "box", cap(28, 0, None), &[], &machines, &[], &none).unwrap();
         assert_eq!((got.on, got.machine.as_str()), (PlaceOn::Requester, "lap"));
         assert!(got.lines[0].starts_with("placed on lap (") && got.lines[0].contains("requester's host"), "{:?}", got.lines);
 
         // Another machine, roomier by its fresh report, which lap links to.
         let a = ask(cap(4, 3, over.clone()), &["box", "srv"]);
         let roomy_srv = BTreeMap::from([("srv".to_string(), cap(30, 0, None))]);
-        let got = for_member(&a, "lap", "box", cap(4, 3, over.clone()), &[], &machines, &roomy_srv).unwrap();
+        let got = for_member(&a, "lap", "box", cap(4, 3, over.clone()), &[], &machines, &[], &roomy_srv).unwrap();
         assert_eq!((got.on, got.machine.as_str()), (PlaceOn::Machine, "srv"));
         // One lap doesn't link to is no candidate, however roomy.
         let a = ask(cap(4, 3, over.clone()), &["box"]);
-        let got = for_member(&a, "lap", "box", cap(16, 1, None), &[], &machines, &roomy_srv).unwrap();
+        let got = for_member(&a, "lap", "box", cap(16, 1, None), &[], &machines, &[], &roomy_srv).unwrap();
         assert_eq!(got.on, PlaceOn::Hub);
 
         // Every candidate over a cap: the best, warned by name.
         let a = ask(cap(4, 3, over.clone()), &["box"]);
-        let got = for_member(&a, "lap", "box", cap(28, 2, over.clone()), &[], &[], &none).unwrap();
+        let got = for_member(&a, "lap", "box", cap(28, 2, over.clone()), &[], &[], &[], &none).unwrap();
         assert_eq!(got.machine, "box");
         assert_eq!(got.lines[1], "warning: box: over cap: instances 2/1");
 
@@ -694,7 +758,7 @@ mod tests {
         assert_eq!(*asked.borrow(), ["box", "srv"]);
         assert_eq!(
             by_hub(&ask, "box", answer(PlaceOn::Machine, "nb"), &reach, ok),
-            Placed::LocalWithNote("note: the hub `box` placed it on nb, which this host has no link to: running here".into())
+            Placed::LocalWithNote("note: the hub `box` placed it on nb, which this host has no path to: running here".into())
         );
         assert_eq!(
             by_hub(&ask, "box", Err(Unplaced::Unreachable("its link is down".into())), &reach, ok),

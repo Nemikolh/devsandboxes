@@ -1423,18 +1423,19 @@ pub(crate) mod tests {
 
     impl Trio {
         fn new(tag: &str, introduced: bool) -> Trio {
-            Trio::build(tag, introduced, false, |_| {})
+            Trio::build(tag, introduced, None, |_, _, _| {})
         }
 
         /// [`Trio::new`] (not introduced) whose `member.toml`s also name
         /// the hub (`box`): the members report their links to it and it
         /// pushes the graph (`fleet::reports`).
         fn hubbed(tag: &str) -> Trio {
-            Trio::build(tag, false, true, |_| {})
+            Trio::build(tag, false, Some("box"), |_, _, _| {})
         }
 
-        /// B's options set by `b` too.
-        fn build(tag: &str, introduced: bool, hubbed: bool, b: impl FnOnce(&mut Options)) -> Trio {
+        /// A's, K's and B's options set by `set` too; with `hub`, the log's
+        /// hub (not introduced) and every `member.toml`'s.
+        fn build(tag: &str, introduced: bool, hub: Option<&str>, set: impl FnOnce(&mut Options, &mut Options, &mut Options)) -> Trio {
             use crate::serve::fleet::member::{Member, write_for_test};
             use crate::serve::fleet::identity::Signer;
             use crate::serve::fleet::membership::Introduction;
@@ -1450,7 +1451,7 @@ pub(crate) mod tests {
             for peer in ["lap", "box"] {
                 std::fs::create_dir_all(b_data.join("fleet").join(peer)).unwrap();
             }
-            b(&mut b_opts);
+            set(&mut a_opts, &mut k_opts, &mut b_opts);
             let members: [(&str, &Path); 4] = [("lap", &a_member), ("box", &k_member), ("b", &b_member), ("m", &m_member)];
             if introduced {
                 for (name, toml) in members {
@@ -1464,12 +1465,12 @@ pub(crate) mod tests {
                     test_support::write(toml, &s);
                 }
             } else {
-                test_support::fleet_of("box", &members);
+                test_support::fleet_of(hub.unwrap_or("box"), &members);
             }
-            if hubbed {
+            if let Some(hub) = hub {
                 for (name, toml) in members {
                     let mut m = crate::serve::fleet::member::load(toml).unwrap().unwrap();
-                    m.hub = if name == "box" { "self" } else { "box" }.into();
+                    m.hub = if name == hub { "self" } else { hub }.into();
                     write_for_test(toml, &m);
                 }
             }
@@ -1658,7 +1659,7 @@ pub(crate) mod tests {
     #[test]
     fn a_routed_machine_takes_quick_calls_and_verbs() {
         let (b_runner, b_verbs) = crate::serve::verbs::tests::script_runner("route-machine-b", r#"echo "b $*""#);
-        let trio = Trio::build("route-machine", false, true, |b| {
+        let trio = Trio::build("route-machine", false, Some("box"), |_, _, b| {
             b.verbs = Some(b_runner);
             b.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap_or_default())]));
             // One instance in B's fleet root for lap.
@@ -1711,5 +1712,156 @@ pub(crate) mod tests {
         let e = api.conn.call("fleet.propose", json!({"op": {"kind": "revoke", "name": "m"}})).unwrap().error.unwrap();
         assert!(e.code == "denied" && e.message.contains("capped"), "{e:?}");
         trio.finish();
+    }
+
+    /// `method` on the daemon in `dir`: its result, or its error's code and message.
+    fn call(dir: &Path, method: &str, params: Value) -> std::result::Result<Value, (String, String)> {
+        let r = connect(dir).call(method, params).unwrap();
+        match r.error {
+            Some(e) => Err((e.code, e.message)),
+            None => Ok(r.result.unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Whether `dir`'s daemon lists `name` as a routed machine, connected.
+    fn routed_up(dir: &Path, name: &str) -> bool {
+        named(&call(dir, "machines.list", Value::Null).unwrap(), name).is_some_and(|r| r["kind"] == "routed" && connected(&r))
+    }
+
+    /// B has no link to the fleet's authority `lap` (A): its `machine rm m`
+    /// is proposed over a route (`b` → `box` → `lap`), admitted at A as
+    /// B's (the routed origin, not the relay `box`), and waits in A's
+    /// pending list; the same again collapses with it.
+    #[test]
+    fn a_proposal_reaches_the_authority_over_a_route() {
+        let trio = Trio::hubbed("route-propose");
+        wait_for("lap routed and connected on B", Duration::from_secs(15), || routed_up(&trio.b_dir, "lap"));
+        let r = call(&trio.b_dir, "machines.rm", json!({"name": "m"})).unwrap();
+        assert_eq!(r, json!({"type": "proposed", "name": "m", "authority": "lap", "id": 1, "error": null}));
+        assert_eq!(call(&trio.b_dir, "machines.rm", json!({"name": "m"})).unwrap()["id"], 1, "pending: the same id");
+        let pending = call(&trio.a_dir, "membership.pending", json!({})).unwrap();
+        assert_eq!(pending.as_array().unwrap().len(), 1, "{pending}");
+        assert_eq!((&pending[0]["from"], &pending[0]["op"]), (&json!("b"), &json!({"kind": "revoke", "name": "m"})));
+        assert_eq!(call(&trio.k_dir, "membership.pending", json!({})).unwrap(), json!([]), "nothing queued on the relay");
+        trio.finish();
+    }
+
+    /// `b` is the hub, A (`lap`, the authority) not linked to it: A's
+    /// `machine rm m` signs the revoke, pushes it to K (which floods it to
+    /// B) and asks B's `fleet.rm` over a route; B's removal tells `box`
+    /// over its link and `lap`, a routed member, over a route
+    /// (`fleet.forget`, admitted there as from the hub `b`).
+    #[test]
+    fn a_removal_forgets_on_a_routed_member() {
+        let trio = Trio::build("route-forget", false, Some("b"), |_, _, _| {});
+        wait_for("b routed and connected on A, lap on B", Duration::from_secs(15), || {
+            routed_up(&trio.a_dir, "b") && routed_up(&trio.b_dir, "lap")
+        });
+        let mut r = call(&trio.a_dir, "machines.rm", json!({"name": "m"})).unwrap();
+        assert_eq!((&r["type"], &r["pushed"]), (&json!("revoked"), &json!(["box"])), "{r}");
+        wait_for("b holds the revoke", Duration::from_secs(10), || test_support::read(&trio.b_member).unwrap().log.revoked_name("m"));
+        if r["removed"].is_null() {
+            // K sends the revoke on to B off its `fleet.sync`'s request
+            // thread, so A's `fleet.rm` can reach B first, refused there
+            // (no revoke of `m` yet): the retry removes it.
+            r = call(&trio.a_dir, "machines.rm", json!({"name": "m"})).unwrap();
+        }
+        let removed = &r["removed"];
+        assert_eq!((&removed["hub"], &removed["leave"], &removed["forgot"]), (&json!("b"), &json!("unreachable"), &json!(["box", "lap"])), "{r}");
+        assert_eq!(removed["missed"], json!([]), "{r}");
+        trio.finish();
+    }
+
+    /// `b` is the hub, A linked only to K (not the hub): B's link reports
+    /// reach A through K's flood, with no exchange of A's own. B starts
+    /// with a registry entry `m` it can't reach (its report lists the link
+    /// down); `machine unlink m` there changes its report, and the newer
+    /// one, without `m`, reaches A the same way.
+    #[test]
+    fn a_report_change_on_the_hub_reaches_a_member_it_has_no_link_to() {
+        let trio = Trio::build("graph-flood", false, Some("b"), |_, _, b| {
+            crate::serve::machines::update(b.machines.as_ref().unwrap(), |e| e.push(Entry::ssh("m", "me@m"))).unwrap();
+            b.link_transport = Some(Transport::new(|_, _| anyhow::bail!("ssh: connect to host m port 22: Connection refused")));
+        });
+        let b_report = || {
+            let g = call(&trio.a_dir, "graph.get", json!({})).unwrap();
+            g["reports"].as_array().unwrap().iter().find(|r| r["report"]["member"] == "b").cloned()
+        };
+        let peers = |r: &Value| -> Vec<String> { r["report"]["links"].as_array().unwrap().iter().map(|l| l["peer"].as_str().unwrap().to_string()).collect() };
+        wait_for("b's report, linked to box and listing m, on A", Duration::from_secs(20), || {
+            b_report().is_some_and(|r| {
+                let p = peers(&r);
+                p.contains(&"m".to_string()) && r["report"]["links"].as_array().unwrap().iter().any(|l| l["peer"] == "box" && l["state"] == "connected")
+            })
+        });
+        let before = b_report().unwrap()["statement"]["version"].as_u64().unwrap();
+        assert_eq!(call(&trio.b_dir, "machines.unlink", json!({"name": "m"})).unwrap(), json!({"ok": true}));
+        wait_for("b's newer report, without m, on A", Duration::from_secs(20), || {
+            b_report().is_some_and(|r| r["statement"]["version"].as_u64().unwrap() > before && !peers(&r).contains(&"m".to_string()))
+        });
+        trio.finish();
+    }
+
+    /// A `run --place` on member A (`lap`, hub `box`), A and K busy, B
+    /// roomy: A tells the hub it reaches `b` over a route, the hub places it
+    /// there (its fresh `capacity.get` of B), and A moves the code into its
+    /// fleet root on B and forwards the run, both over the route.
+    #[test]
+    fn a_members_run_is_placed_on_a_routed_machine() {
+        use crate::serve::capacity::{Capacity, Caps};
+        use crate::serve::fleet::code::repo::tests::{git, origin_and_checkout};
+        const G: u64 = 1 << 30;
+        let (b_runner, b_verbs) =
+            crate::serve::verbs::tests::script_runner("route-place-b", r#"echo "b $*"; cat "$3/dockerfiles/web.Dockerfile" "$3/../web/F""#);
+        let (a_runner, a_verbs) = crate::serve::verbs::tests::script_runner("route-place-a", r#"echo "local $*""#);
+        let path = std::env::var("PATH").unwrap_or_default();
+        let src = scratch("route-place-src");
+        std::fs::create_dir_all(&src).unwrap();
+        origin_and_checkout(&src, "web");
+        let cfg = src.join("cfg");
+        std::fs::create_dir_all(cfg.join("dockerfiles")).unwrap();
+        std::fs::write(cfg.join(crate::config::CONFIG_FILE), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n").unwrap();
+        std::fs::write(cfg.join("dockerfiles/web.Dockerfile"), "FROM x\n").unwrap();
+        let cfg = std::fs::canonicalize(&cfg).unwrap();
+        let capacity = |avail: u64, running: usize, caps: Option<Caps>| Capacity {
+            cpus: Some(8),
+            mem_total: Some(32 * G),
+            mem_available: Some(avail * G),
+            disk_free: Some(400 * G),
+            disk_total: Some(500 * G),
+            running,
+            caps,
+        };
+        let busy = capacity(4, 3, Some(Caps { instances: Some(1), ..Caps::default() }));
+        let roomy = capacity(28, 0, None);
+        let repos = src.join("a-repos");
+        let trio = Trio::build("route-place", false, Some("box"), |a, k, b| {
+            a.verbs = Some(a_runner);
+            a.repos = Some(repos);
+            let (busy_a, busy_k) = (busy.clone(), busy.clone());
+            a.local_capacity = Some(Arc::new(move || busy_a.clone()));
+            k.local_capacity = Some(Arc::new(move || busy_k.clone()));
+            b.verbs = Some(b_runner);
+            b.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), path.clone())]));
+            b.local_capacity = Some(Arc::new(move || roomy.clone()));
+        });
+        wait_for("b routed and connected on A", Duration::from_secs(15), || routed_up(&trio.a_dir, "b"));
+        let fleet_root = trio.fleet_root("b", "lap");
+        let mut a = connect(&trio.a_dir);
+        let (r, out, err) = verb(&mut a, "run", json!({"root": cfg, "env": {"PATH": std::env::var("PATH").unwrap_or_default()}, "sandbox": "web", "branch": "feature", "place": true}));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!(r.result.as_ref().unwrap()["machine"], "b", "{r:?} {err}");
+        assert!(err.starts_with("placed on b ("), "{err}");
+        let roots: Vec<_> =
+            std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != ".in").collect();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let remote = fleet_root.join("roots").join(&roots[0]).join("cfg");
+        assert_eq!(out, format!("b --in-process -C {} run --branch=feature -- web\nFROM x\nfeature\n", remote.display()));
+        assert_eq!(git(&remote.join("../web"), &["symbolic-ref", "--short", "HEAD"]), "feature");
+        drop(a);
+        trio.finish();
+        for dir in [src, a_verbs, b_verbs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

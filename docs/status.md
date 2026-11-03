@@ -265,18 +265,15 @@ limitation means editing this file in the same commit.
   `agent-link-<host>.sock` there; processes there use the newest live
   socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
-- An introduction made by a non-authority member (`machine add` run on
-  it) is proposed to the authority only when the adding host links to it
-  directly (else the add's answer says why, and the introduced member
-  stays capped until it's proposed some other way); one the machine signs
-  for this host (this host joining a non-authority member's fleet) isn't
-  proposed at all. → [fleet](architecture/daemon/fleet.md#approvals-and-pushes);
+- An introduction the machine signs for this host (this host joining a
+  non-authority member's fleet with `machine add`, `membership.sign`
+  there) isn't proposed to the authority: the joining host is capped and
+  proposes nothing, and the signer doesn't propose it. (One this host
+  signs for the machine is proposed after the add, over any path; with
+  none, the add's answer says why and the member stays capped until it's
+  proposed some other way.)
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes);
   `machines::api::add`, `machines::changes::propose`
-- Membership proposals (`fleet.propose`: a member's `machine rm`, its
-  own leave, its `machine key rotate`, an introduction) reach the authority only over a direct link
-  to it until fleet step 10b routes over the graph; without one they're
-  refused naming the authority.
-  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `machines::changes::propose`
 - A member only introduced (capped, not in the log) can't be removed with
   `machine rm`: the log has no key of it to revoke; it goes once its
   introducer is revoked. → [fleet](architecture/daemon/fleet.md); `machines::changes::revoke`
@@ -285,15 +282,11 @@ limitation means editing this file in the same commit.
   two members' clocks, and a member whose clock went back after a daemon
   restart has its reports refused as older until the clock passes its
   last one (a peer's copy of its own last report moves it past only once
-  received). The daemon's route sockets read it (fleet step 10b.5); the
-  CLI, dashboard and fleet calls use them from fleet steps 10b.6-10b.7.
+  received). The daemon's route sockets, and so every routed stream,
+  follow it.
   → [fleet](architecture/daemon/fleet.md#link-graph); `fleet::graph::next_version`, `fleet::reports`
 - Routed streams are opened only through the daemon's
-  `route-<member>.sock`, which only `route::connect`'s callers reach
-  (terminals, port forwards, code transfers to a machine whose own link
-  is down); nothing names a routed-only member yet: its rows, actions and
-  fleet calls over a route are fleet steps 10b.6-10b.7. A routed stream
-  doesn't fail over once open: a hop going down ends it, and its client
+  `route-<member>.sock`. A routed stream doesn't fail over once open: a hop going down ends it, and its client
   opens it again. Until 10c a relay sees and can alter a routed stream's
   bytes after its opening (only the opening is proven end to end).
   → [fleet](architecture/daemon/fleet.md#routed-streams); `fleet::route`, `fleet::routes`
@@ -318,8 +311,7 @@ limitation means editing this file in the same commit.
   watchers wants machines; a graph member the view doesn't list is a
   `machine ls` row with no roots, so the federated `sandboxes.list`
   doesn't ask it. Their agent isn't routed (`machines.set` and the
-  dashboard's toggle refuse it) until fleet step 10c; placement and
-  `fleet.*` calls don't reach them until step 10b.7. A routed machine's
+  dashboard's toggle refuse it) until fleet step 10c. A routed machine's
   forward is dropped by a sync while the graph has no path to it.
   → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`
 - Remote rows live in memory except on a hub (which reloads them from
@@ -434,17 +426,19 @@ limitation means editing this file in the same commit.
   a push (`fleet.sync`). `machine rm` it again on the authority once it's
   reachable, or run `machine rm <its name>` on it.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::rm`
-- Members the hub has no link to keep their registry entry for a removed
-  member until routing (fleet step 10b): `fleet.forget` goes to the
-  machines the hub links to directly. The revoke reaches them (a push, or
-  their next link's head comparison), so that entry's link is refused.
+- Members the hub reaches by no path (no link up, no path in its link
+  graph) keep their registry entry for a removed member: `fleet.forget`
+  goes once, to the hub's machines and its routed members. The revoke
+  reaches them (a push, or their next link's head comparison), so that
+  entry's link is refused.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::remove`
 - A member that leaves (`machine rm <itself>`) is forgotten by the other
   members only once the authority approves its proposed revoke; until
   then only the hub drops its entry.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::rm`
 - Placement's `has_image` reads only watched roots' snapshots (this
-  host's while watched, a machine's last pushed), and `has_repo` is never
+  host's while watched, a machine's last pushed; a routed machine has
+  none, so never has the image), and `has_repo` is never
   filled (no repo locality yet).
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::candidates`
 - Only `run --place` is placed, and only by the daemon's `run` verb: a
@@ -452,9 +446,10 @@ limitation means editing this file in the same commit.
   here, with a note; the dispatcher's children aren't placed yet (fleet step 13). A
   hub (`hub = "self"` in `member.toml`) places its own; a member's is
   placed by the hub (`fleet.place`, up to 2 s for the dial and 6 s for
-  the answer) among the machines the member links to directly, and runs
-  on the member with a note when the hub can't be reached. On a hub every
-  connected machine is a candidate (ssh and inbound), each asked a
+  the answer) among the machines both the member and the hub reach (a
+  link or a route), and runs on the member with a note when the hub
+  can't be reached. On a hub every connected machine is a candidate (ssh
+  and inbound), and every routed one a path reaches, each asked a
   `capacity.get` (2 s at most) first.
   The placing host's `state.toml` doesn't record a placed instance (it's the
   machine's, seen as `<machine>/<name>` in federated views; fleet step 13).
@@ -465,12 +460,6 @@ limitation means editing this file in the same commit.
   or `worktree-base` naming an `origin/…` ref fails on the worker (its
   checkout has no `origin`).
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::start_point`
-- A member's `run` has only the machines it links to directly as
-  candidates (the hub, and those of its machines the hub links to too):
-  those it sees only through
-  the hub can't take its code until routing (fleet step 10b), so the hub
-  never picks them.
-  → [fleet](architecture/daemon/fleet.md#a-members-run); `fleet::placed::member_workers`
 - A placed `run` moves committed, pushed work
   only: one branch of each folder's `origin`, fetched by the hub; a
   folder with no `origin`, an unreachable one, a branch origin lacks, a

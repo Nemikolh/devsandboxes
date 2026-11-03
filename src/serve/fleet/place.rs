@@ -1,7 +1,8 @@
 //! Placement (docs/architecture/daemon/fleet.md, *Placement*; fleet plan
 //! decision 11: it runs in the daemon): which machine a new instance goes
 //! on. [`place`] is pure over a [`Spec`] and the [`Candidate`]s the daemon
-//! fills from its snapshots ([`Candidate::local`], [`Candidate::from_machine`]).
+//! fills from its snapshots ([`Candidate::local`], [`Candidate::from_machine`],
+//! [`Candidate::from_routed`]).
 //!
 //! Soft caps never refuse: a machine over one scores below every machine
 //! that isn't, and when all are over the best is still used with an
@@ -15,7 +16,7 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::serve::capacity::{Capacity, over_caps, over_note};
-use crate::serve::snapshots::{LinkState, Machine};
+use crate::serve::snapshots::{LinkState, Machine, Routed};
 
 /// A machine as placement names it: this host, or a registered machine.
 /// Orders this host first, then machines by name (the tie-break).
@@ -90,6 +91,20 @@ impl Candidate {
             reachable: reachable(m.state),
             capacity: m.capacity(),
             has_image: has_image(spec, m.rows.values().map(|v| v.as_ref())),
+            has_repo: false,
+        }
+    }
+
+    /// A routed machine (no link of its own here, fleet plan decision 60):
+    /// reachable while a path to it starts with a link up here, its
+    /// capacity as the hub's view reports it. No rows of its own are
+    /// watched, so no image locality.
+    pub fn from_routed(r: &Routed) -> Candidate {
+        Candidate {
+            machine: MachineRef::Machine(r.name.clone()),
+            reachable: reachable(r.state),
+            capacity: r.capacity.clone(),
+            has_image: false,
             has_repo: false,
         }
     }

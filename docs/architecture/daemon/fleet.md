@@ -105,24 +105,26 @@ authority and whether `m` is in the log):
   path and pushes its log to every machine it holds (`fleet.sync`,
   [Approvals and pushes](#approvals-and-pushes)); then the removal: run
   here when this host is the hub, else asked of the hub with `fleet.rm
-  {name: m}`, which the push let in. The answer (`changes::Signed`) says
+  {name: m}` over any path to it, which the push let in. The answer (`changes::Signed`) says
   whom the push reached and what the removal did; a hub not reached is
   `error`, the revoke stands.
 - **On another member**: it proposes `revoke m` to the authority
-  (`fleet.propose`, `changes::propose`) over its direct link to it, and
-  answers the proposal's id there (`approve there with devsandbox machine
-  approve <id>`). With no direct link to the authority it's refused
-  naming it: until routing (step 10b) a proposal reaches the authority
-  only that way.
+  (`fleet.propose`, `changes::propose`) over any path to it (its direct
+  link while up, else a route), and answers the proposal's id there
+  (`approve there with devsandbox machine approve <id>`). With no path to
+  the authority it fails naming it and why.
 - **The removal**, on the hub, `m` in its log or one of its machines: it
   sends each machine it tells its log first (`fleet.sync`, best effort),
-  then `fleet.leave {}` to `m` over `m`'s link while that's connected,
-  and on `m` that clears `hub`, removes its `membership.json` and drops
-  all of `m`'s own registry entries; then `fleet.forget {name: m}` to
-  every other machine it links to, each of which drops its entry for `m`
+  then `fleet.leave {}` to `m`, and on `m` that clears `hub`, removes its
+  `membership.json` and drops all of `m`'s own registry entries; then
+  `fleet.forget {name: m}` to every other machine it links to and every
+  routed member (`leave::forget_targets`), each of which drops its entry for `m`
   or, if `m` is an inbound neighbor there, ends `m`'s link; then it
-  unlinks `m` here (its entry dropped, or its inbound link ended).
-  Nothing is refused for a member that can't be reached: the answer
+  unlinks `m` here (its entry dropped, or its inbound link ended). Each
+  of these calls goes over any path (`leave::call`,
+  `service::Handle::call_member`: the member's own link while it's
+  connected, else a routed stream over the link graph; with neither, why
+  names both). Nothing is refused for a member that can't be reached: the answer
   (`leave::Removed`) says whether `m` was `told`, `unreachable` (with
   why) or `leaving` (it asked itself), which members `forgot` it, and
   which were `missed` (with why).
@@ -956,7 +958,10 @@ for the hub's own runs and, through `fleet.place`, for its members'
 Candidates come from what the daemon already keeps:
 `Candidate::local` (this host: always reachable) and
 `Candidate::from_machine` over a `snapshots::Machine` of either kind (its
-`Machine::capacity`; `place::reachable`: while its link is `connected`).
+`Machine::capacity`; `place::reachable`: while its link is `connected`),
+and `Candidate::from_routed` over a routed machine (`snapshots::Routed`:
+reachable while a path to it starts with a link up here, its capacity as
+the hub's view reports it, no image locality).
 `place::has_image` reads roots' `instances.snapshot` params: a sandbox
 row of the spec's name at its `config_hash` (and `build_hash`, when the
 spec has one) with a ready, non-drifted instance of that sandbox from
@@ -975,15 +980,18 @@ A hub's (`member.toml`'s `hub = "self"`) `run` verb places a `place`
 request that names no `machine` (`daemon.rs` `placed_run`, the decisions
 pure in `fleet::placed`); a member's asks the hub ([A member's run](#a-members-run));
 a host in no fleet runs it here. On the hub the candidates are
-this host and every machine, ssh or inbound (`placed::workers`:
-placement candidates are every neighbor), the ones whose link is up
-taking new work; code moves over the machine's link into this host's
-fleet root there, which every peer link's `TRANSFER` receives into
-(`Shared::serve_channel`), so a placed run needs no ssh of its own. A
+this host, every machine, ssh or inbound (`placed::workers`:
+placement candidates are every neighbor), and every routed machine
+(`service::Handle::routed`), the ones whose link is up or that a path
+reaches taking new work; code moves over the machine's link (a routed
+one's route) into this host's fleet root there, which every peer link's
+`TRANSFER` receives into (`Shared::serve_channel`, a routed stream's
+destination the same way), so a placed run needs no ssh of its own. A
 `--machine` or qualified run is forwarded as before.
 
 - **Worth it?** `placed::worth_placing`: some machine reachable (its
-  link `connected`, read from the links' last states, no I/O). If none,
+  link `connected`, or a routed one's path starting with a link up, read
+  from the links' and the graph's last states, no I/O). If none,
   the run is local with nothing else read or asked.
 - **Tied?** `code::ties_of` over the request's root and sandbox
   ([Moving code](#moving-code)), before the hub is asked or any machine
@@ -993,24 +1001,27 @@ fleet root there, which every peer link's `TRANSFER` receives into
   local run to report (no note).
 - **Fresh reports** (`daemon.rs` `fresh_capacities`): each reachable
   machine is asked `capacity.get`, in parallel, each on a fresh `API`
-  stream over its link's dial (`machines::link::handshake`, then the
-  call), each bounded by `placed::CAPACITY_WAIT` (2 s) for the dial and
+  stream over any path to it (`service::Handle::open_member`: its link's
+  dial while connected, else a route; `machines::link::handshake`, then
+  the call), each bounded by `placed::CAPACITY_WAIT` (2 s) for the dial and
   hello and again for the answer. An answer replaces the machine's saved
   report (`placed::with_fresh`, pure); a timeout or an error leaves the
   saved one (its last push, or `remotes.json`'s).
 - **Candidates** (`placed::candidates`): `Candidate::local` with this
   host's capacity built now (`Shared::capacity`, as `capacity.get`
-  answers it) and every watched root's snapshot, and `from_machine` for
-  each machine with its fresh report. The `Spec` (`placed::spec`) takes the sandbox's
+  answers it) and every watched root's snapshot, `from_machine` for
+  each machine and `from_routed` for each routed one, with its fresh
+  report. The `Spec` (`placed::spec`) takes the sandbox's
   `config_hash` / `build_hash` from the request root's snapshot when it
   is watched, and the requester is this host.
 - **Decide** (`placed::decide`): this host wins (the `REQUESTER` bias
   breaks a tie) → the local verb, unchanged. A machine wins →
   `code::prepare` for it: its fleet root for this host is the row its
-  `roots.list` flags `fleet`, asked over a fresh `API` stream
-  (`daemon::fleet_root_on`, `placed::fleet_root`; none, or no answer
-  within `CAPACITY_WAIT`, is a `NotMovable`), the transfer its link's
-  `LinkTransfer` (`fleet-<name>.sock`), the repo cache
+  `roots.list` flags `fleet`, asked over a fresh `API` stream of any
+  path (`daemon::fleet_root_on` over `Handle::open_member`,
+  `placed::fleet_root`; none, or no answer within `CAPACITY_WAIT`, is a
+  `NotMovable`), the transfer its `LinkTransfer` (`route::connect`:
+  `fleet-<name>.sock`, else `route-<name>.sock`), the repo cache
   `Options::repos` (default `code::repos_dir`), the config root the
   request's, the branch its `branch`. `NotMovable(why)` runs it here with
   `note: not placed on <worker>: <why>; running here` first in the
@@ -1019,7 +1030,8 @@ fleet root there, which every peer link's `TRANSFER` receives into
 - **Forward**: the request as a `machine` one (`placed::forwarded`:
   `machine` the worker, `root` its `Prepared::remote_root`, `place`
   dropped so the worker never places again), through `remote_verb` as any machine verb
-  ([machines](machines.md#forwarded-requests)). Its output starts with
+  ([machines](machines.md#forwarded-requests); a routed worker's over
+  its route, `Handle::dial`). Its output starts with
   `placed on <worker> (<reasons>)` and a `warning: <worker>: over cap: …`
   line per warning (`placed::lines`); its `progress`, result and detached
   answer carry `machine` (`placed::Tagged`, `placed::tag_answer`), so the
@@ -1050,24 +1062,25 @@ no daemon to send it to, `run --place` runs in-process here with a note
 On a member (`hub = "<name>"`) the hub decides where a `run --place`
 goes (fleet plan decisions 31 and 38; a run without it stays here and
 asks nothing), and the member moves the code and forwards
-over its own links (`daemon.rs` `placed_run`, `placed::by_hub`):
+over its own paths (`daemon.rs` `placed_run`, `placed::by_hub`):
 
 - **The ask** (`daemon.rs` `ask_hub`): `fleet.place` to the hub over a
-  fresh `API` stream of its link (dial and hello bounded by
+  fresh `API` stream of any path to it (`Handle::open_member`: its link
+  while connected, else a route; dial and hello bounded by
   `CAPACITY_WAIT`, the answer by `placed::PLACE_WAIT`, 6 s), with
   `placed::PlaceParams`: the spec as `placed::spec` built it here (the
   sandbox and its hashes), this host's capacity now (`Shared::capacity`)
-  and `reachable`, the machines this host has a connected direct link to
-  (`placed::reachable_workers`), the hub among them. Machines seen only
-  through the hub (`via`) are never among them.
+  and `reachable`, the machines this host reaches
+  (`placed::reachable_workers`): those with a connected link here and
+  the routed ones a path reaches, the hub among them.
 - **The hub's answer** (`daemon.rs` `fleet_place`, admitted by
   `lent::admit_fleet` only on the hub and from a member of its log or a
   held introduction, by the key the requester proved):
   `placed::for_member` scores with `place::place` over the requester
   (the capacity it sent, its image as the hub's view of its rows shows,
   `REQUESTER`'s bias as the spec's requester), the hub itself
-  (`Shared::capacity`, its watched roots) and each of its own connected
-  machines named in `reachable` but the requester
+  (`Shared::capacity`, its watched roots) and each machine it reaches
+  (a connected link, or a route) named in `reachable` but the requester
   (`placed::member_workers`), each with a fresh `capacity.get`
   (`fresh_capacities`). Every candidate goes by the hub's name for it,
   the hub by its member name. It answers a `placed::PlaceAnswer`: `on`
@@ -1075,18 +1088,18 @@ over its own links (`daemon.rs` `placed_run`, `placed::by_hub`):
   the run's output starts with.
 - **The requester**: the run is local, the hub's lines first in its
   output (`Placed::Here`).
-- **The hub or another machine this host links to**: `placed::moved`,
+- **The hub or another machine this host reaches**: `placed::moved`,
   the hub's own path for a worker: `daemon.rs` `move_code` moves the code
-  into this host's fleet root there, then the run is forwarded
+  into this host's fleet root there (over its link, or a route), then the run is forwarded
   (`placed::forwarded`, `remote_verb`), its output starting with the hub's
   lines. A sandbox that can't move runs here with `note: not placed on
   <worker>: …`.
-- **No answer**: the hub's link isn't up, the dial, hello or call fails,
+- **No answer**: no path to the hub, the dial, hello or call fails,
   or no answer within `PLACE_WAIT`: the run is local, its output starting
   ``note: the hub `<hub>` is unreachable (<why>): running here``. An
   error answer: ``note: the hub `<hub>` didn't place it (<why>): running
-  here``. A machine this host has no link to: ``note: the hub `<hub>`
-  placed it on <machine>, which this host has no link to: running
+  here``. A machine this host has no path to: ``note: the hub `<hub>`
+  placed it on <machine>, which this host has no path to: running
   here``.
 
 ## Member side
@@ -1540,7 +1553,10 @@ it never signs on a remote request alone (decision 49;
 `machines::changes`, `fleet::proposals`):
 
 - **Proposals.** A member's change goes to the authority as
-  `fleet.propose {op}`, `op` `{"kind": "revoke", "name"}` (a member's
+  `fleet.propose {op}` over any path to it (`changes::propose` through
+  `leave::call`: its direct link while up, else a route over the link
+  graph, the authority admitting it by the routed origin's proven key;
+  no path: `failed`, naming the authority and why), `op` `{"kind": "revoke", "name"}` (a member's
   `machine rm`, or its own when it leaves) or `{"kind": "add",
   "introduction"}` (the introduction a non-authority member's `machine
   add` signs: `machines.add` proposes it after the add, best effort, its
@@ -1626,17 +1642,25 @@ The fleet's links are the members' own signed reports: the model in
   woken by `service::Hooks::changed` through `Published::poke`): signed
   with `member.key`, taken into this host's own graph, and sent to the
   hub as `fleet.report {statement, report}` while that link is up. The
-  hub takes it (`reports::report_call`: the sender's own report only)
-  and, when its graph changed (that report, or its own), pushes every
-  report it holds to each machine whose link is up, as
-  `fleet.graph {reports}`, as `changes::push` sends the log.
+  hub takes it (`reports::report_call`: the sender's own report only).
+- **Flooding** (`reports::Flood`). On every member, hub or not, a graph
+  change (its own new report, or newer reports taken from a
+  `fleet.report`, a `fleet.graph` call or an exchange's answer) sends
+  every report it holds on to each machine whose link is up, as
+  `fleet.graph {reports}` over the direct link only (`leave::call_on`),
+  as a `fleet.sync` floods the log: not back to the peer when every
+  change since the last flood came from that one peer. Only a strictly
+  newer report changes a graph, so a flood ends once every connected
+  host holds the newest reports, and a member with no link to the hub
+  (or one whose neighbor's links changed after their first exchange)
+  stays current.
 - **Exchanges.** On each link that comes up, both ends send `fleet.graph
   {reports}` with every report they hold, and take the answer: every
   report the peer holds. `reports::graph_call` takes what's carried
   (each verifies by its signer's key whoever carried it, so a member with
   no link to the hub gets the graph from a neighbor; a refusal, an older
-  one included, is logged, not fatal) and answers the whole graph; on
-  the hub a change is pushed on. A host's own report coming back from a
+  one included, is logged, not fatal) and answers the whole graph; a
+  change floods on. A host's own report coming back from a
   peer moves its next version past it (`reports::take_into`).
 - **Held in memory** (`Shared::graph`, `reports::Published`), never
   persisted: a restarted daemon starts empty and rebuilds from its own
@@ -1820,6 +1844,9 @@ a member's placed run) goes by the key the caller proved, not by trust:
 `lent::admit_fleet` (pure, over the method, its params, the `Peer` and
 `lent::Log`: this host's stored log and held introductions,
 `membership.json` read per call, its own member name and its own key).
+Over a routed stream the `Peer` is the stream's proven origin
+(`daemon.rs` `serve_route`), never the relay, so these calls are judged
+by who sent them whichever path they took.
 `fleet.leave` and `fleet.forget` are admitted only from the log's hub,
 its name and its key there both (the hub's name over another key, or the
 hub's key under another name, is `denied`), and only after a revoke:

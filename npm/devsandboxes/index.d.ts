@@ -895,7 +895,7 @@ export interface FleetPlaceParams {
   spec: FleetPlaceSpec;
   /** The member's own capacity now. */
   capacity: Capacity;
-  /** The machines the member has a connected direct link to, its hub among them: the only other candidates. */
+  /** The machines the member reaches (a connected link, or a route over the link graph), its hub among them: the only other candidates. */
   reachable: string[];
 }
 
@@ -1691,8 +1691,8 @@ export interface ApiMethods {
   'machines.unlink': { params: { name: string }; result: OkResult };
   /**
    * Take a machine out of the fleet. On the authority: its key revoked, pushed, then removed by the hub. On
-   * another member: proposed to the authority over a direct link (`denied` naming it without one, `failed` when
-   * its link is down). This host's own name leaves the fleet (its revoke proposed, best effort). `denied` for the
+   * another member: proposed to the authority over any path, its direct link while up, else a route (`failed`
+   * naming it when none reaches it). This host's own name leaves the fleet (its revoke proposed, best effort). `denied` for the
    * hub, the authority, or the hub leaving while it has machines; `not-found` for a name neither linked, in the
    * log, nor seen through the hub.
    */
@@ -1781,8 +1781,8 @@ export interface ApiMethods {
   /**
    * Rotate this host's member key: a next key (`member.key.next`, a pending one reused) countersigned by the key.
    * On the authority the `rotate` is signed, stored (the next key becomes the key) and pushed; elsewhere it's
-   * proposed to the authority over a direct link, and the next key becomes the key when a log listing it is
-   * taken. `denied` for a capped (introduced) member, one in no fleet's log, or with no direct link to the
+   * proposed to the authority over any path, and the next key becomes the key when a log listing it is
+   * taken. `denied` for a capped (introduced) member or one in no fleet's log, `failed` with no path to the
    * authority; `invalid` when the log refuses it. Local only.
    */
   'membership.rotate': { params: {}; result: MembershipRotateResult };

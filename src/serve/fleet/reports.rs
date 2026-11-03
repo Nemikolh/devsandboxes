@@ -1,8 +1,9 @@
 //! The published link graph (docs/architecture/daemon/fleet.md, *Link
 //! graph*; fleet plan step 10b.2, decision 59): this host's own report built
 //! from its links ([`Tracker`], pure), signed and sent to the hub
-//! (`fleet.report`); the hub's pushes and every member's exchanges of the
-//! reports it holds (`fleet.graph`), all on one `serve-fleet-graph` thread
+//! (`fleet.report`); every member's exchanges of the reports it holds
+//! (`fleet.graph`): on a link coming up, and a flood of each change to
+//! its linked peers ([`Flood`]), all on one `serve-fleet-graph` thread
 //! ([`Publisher`]). [`Published`] is the graph a daemon holds, in memory
 //! only: a restarted daemon rebuilds it from the reports its peers hold.
 
@@ -197,9 +198,51 @@ struct State {
     dirty: bool,
     /// Peers to exchange reports with (`fleet.graph`): each link that came up.
     exchange: BTreeSet<String>,
-    /// The graph changed on the hub: push it to every linked member.
-    push: bool,
+    /// The graph changed: send it on to every linked peer ([`Flood`]).
+    push: Flood,
     stop: bool,
+}
+
+/// The graph's changes not yet sent on, and who the flood skips (pure): a
+/// host whose graph took something newer sends every report it holds to
+/// each peer whose link is up (`fleet.graph`), as a `fleet.sync` floods a
+/// log. Only strictly newer reports change a graph, so the flood ends once
+/// every host connected holds the newest ones. Skipped: the one peer every
+/// change since the last flood came from (it holds them).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Flood {
+    /// Nothing changed.
+    #[default]
+    None,
+    /// Every change came from this peer.
+    From(String),
+    /// Changes from several peers, or this host's own report: to every one.
+    All,
+}
+
+impl Flood {
+    /// A change taken from `from` (`None`: this host's own).
+    pub fn add(&mut self, from: Option<&str>) {
+        *self = match (std::mem::take(self), from) {
+            (Flood::None, Some(f)) => Flood::From(f.to_string()),
+            (Flood::From(p), Some(f)) if p == f => Flood::From(p),
+            _ => Flood::All,
+        };
+    }
+
+    /// Whether a flood is due.
+    pub fn due(&self) -> bool {
+        *self != Flood::None
+    }
+
+    /// Whether the flood sends to `peer`.
+    pub fn sends_to(&self, peer: &str) -> bool {
+        match self {
+            Flood::None => false,
+            Flood::From(p) => p != peer,
+            Flood::All => true,
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -236,14 +279,14 @@ impl Published {
         self.lock().graph.clone()
     }
 
-    /// [`take_into`] this daemon's graph; a change on the hub (`is_hub`)
-    /// is pushed to its linked members. Refusals logged with `from`.
-    pub fn take(&self, stored: &Stored, me: &str, reports: &[Signed], from: &str, is_hub: bool, log: fn(&str)) -> bool {
+    /// [`take_into`] this daemon's graph; a change is sent on to its other
+    /// linked peers ([`Flood`]). Refusals logged with `from`.
+    pub fn take(&self, stored: &Stored, me: &str, reports: &[Signed], from: &str, log: fn(&str)) -> bool {
         let mut st = self.lock();
         let State { graph, last, .. } = &mut *st;
         let (changed, refused) = take_into(graph, last, stored, me, reports);
-        if changed && is_hub {
-            st.push = true;
+        if changed {
+            st.push.add(Some(from));
             self.cv.notify_all();
         }
         drop(st);
@@ -275,7 +318,7 @@ fn to_value(x: impl Serialize) -> Result<Value, ApiError> {
 /// `fleet.report {statement, report}` on the hub, from link peer `from`
 /// (admitted, `lent::admit_fleet`): its own report only, taken into the
 /// hub's graph (`invalid` saying why when refused, an older one included);
-/// a change is pushed to the hub's linked members.
+/// a change is sent on to the hub's other linked peers ([`Flood`]).
 pub fn report_call(params: Value, from: &str, published: &Published, stored: &Stored, me: &str, log: fn(&str)) -> Result<Value, ApiError> {
     let s: Signed = parse(params)?;
     if s.report.member != from {
@@ -292,7 +335,7 @@ pub fn report_call(params: Value, from: &str, published: &Published, stored: &St
         *last = (*last).max(s.statement.version);
     }
     if changed {
-        st.push = true;
+        st.push.add(Some(from));
         published.cv.notify_all();
         drop(st);
         published.changed();
@@ -303,10 +346,11 @@ pub fn report_call(params: Value, from: &str, published: &Published, stored: &St
 
 /// `fleet.graph {reports?}` from link peer `from` (admitted): the reports
 /// it carries taken (each verifies itself; a refusal is logged), answered
-/// with every report this host holds after. On the hub a change is pushed.
-pub fn graph_call(params: Value, from: &str, published: &Published, stored: &Stored, me: &str, is_hub: bool, log: fn(&str)) -> Result<Value, ApiError> {
+/// with every report this host holds after. A change is sent on to this
+/// host's other linked peers ([`Flood`]), on any member.
+pub fn graph_call(params: Value, from: &str, published: &Published, stored: &Stored, me: &str, log: fn(&str)) -> Result<Value, ApiError> {
     let theirs: Reports = parse(params)?;
-    published.take(stored, me, &theirs.reports, from, is_hub, log);
+    published.take(stored, me, &theirs.reports, from, log);
     to_value(published.reports(Some(stored)))
 }
 
@@ -385,7 +429,7 @@ fn run(p: &Published, io: &Io) {
         }
         let at = Instant::now();
         let due = st.tracker.due().is_some_and(|d| d <= at);
-        if !(st.dirty || st.push || due || !st.exchange.is_empty()) {
+        if !(st.dirty || st.push.due() || due || !st.exchange.is_empty()) {
             let wait = st.tracker.due().map_or(IDLE_WAIT, |d| d.saturating_duration_since(at).min(IDLE_WAIT));
             st = p.cv.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner()).0;
             continue;
@@ -402,20 +446,20 @@ fn run(p: &Published, io: &Io) {
         }
         let report = st.tracker.take_due(Instant::now());
         let exchange = std::mem::take(&mut st.exchange);
-        let push = std::mem::take(&mut st.push) && hub.is_this();
+        let push = std::mem::take(&mut st.push);
         drop(st);
         if let Some(own) = own(io) {
             if report {
                 publish_own(p, io, &own, &hub);
             }
             for peer in &exchange {
-                exchange_with(p, io, &own, peer, hub.is_this());
+                exchange_with(p, io, &own, peer);
             }
-            if push {
-                for e in io.links.entries() {
-                    if up(io, &e.name) {
-                        exchange_with(p, io, &own, &e.name, true);
-                    }
+            // The changes before this round, flooded; one taken during it
+            // (an own report, an exchange's answer) is the next round's.
+            for e in io.links.entries() {
+                if push.sends_to(&e.name) && up(io, &e.name) {
+                    exchange_with(p, io, &own, &e.name);
                 }
             }
         }
@@ -424,7 +468,8 @@ fn run(p: &Published, io: &Io) {
 }
 
 /// This host's report signed, taken into its own graph, and sent to its
-/// hub while that link is up (on the hub: pushed when it changed).
+/// hub while that link is up; when it changed the graph, flooded to every
+/// linked peer too ([`Flood`]).
 fn publish_own(p: &Published, io: &Io, own: &Own, hub: &Hub) {
     let Some(genesis) = own.stored.log.membership().map(|m| m.genesis) else { return };
     let trust = member::load(&io.member).ok().flatten().map(|m| m.trust).unwrap_or_default();
@@ -435,8 +480,8 @@ fn publish_own(p: &Published, io: &Io, own: &Own, hub: &Hub) {
     let signed = Signed { statement, report };
     let State { graph, last, .. } = &mut *st;
     let (changed, refused) = take_into(graph, last, &own.stored, &own.me, std::slice::from_ref(&signed));
-    if changed && hub.is_this() {
-        st.push = true;
+    if changed {
+        st.push.add(None);
     }
     drop(st);
     if changed {
@@ -459,7 +504,7 @@ fn publish_own(p: &Published, io: &Io, own: &Own, hub: &Hub) {
 }
 
 /// Every report held sent to `peer` (`fleet.graph`), and its answer taken.
-fn exchange_with(p: &Published, io: &Io, own: &Own, peer: &str, is_hub: bool) {
+fn exchange_with(p: &Published, io: &Io, own: &Own, peer: &str) {
     let params = match serde_json::to_value(p.reports(Some(&own.stored))) {
         Ok(v) => v,
         Err(e) => return (io.log)(&format!("cannot encode the link reports: {e}")),
@@ -468,7 +513,7 @@ fn exchange_with(p: &Published, io: &Io, own: &Own, peer: &str, is_hub: bool) {
         .and_then(|v| serde_json::from_value::<Reports>(v).map_err(|e| format!("fleet.graph: unexpected answer: {e}")));
     match answer {
         Ok(theirs) => {
-            p.take(&own.stored, &own.me, &theirs.reports, peer, is_hub, io.log);
+            p.take(&own.stored, &own.me, &theirs.reports, peer, io.log);
         }
         Err(e) => (io.log)(&format!("link reports with {peer}: {e}")),
     }
@@ -569,6 +614,24 @@ mod tests {
         assert!(!changed && refused.is_empty(), "the one held");
         let (_, refused) = take_into(&mut g, &mut last, &s, "pi", &[signed(&s, "box", 2, 3)]);
         assert!(refused[0].contains("rollback"), "{refused:?}");
+    }
+
+    #[test]
+    fn a_flood_skips_the_one_peer_its_changes_came_from() {
+        let mut f = Flood::default();
+        assert!(!f.due() && !f.sends_to("box"));
+        f.add(Some("box"));
+        f.add(Some("box"));
+        assert_eq!(f, Flood::From("box".into()));
+        assert!(f.due() && !f.sends_to("box") && f.sends_to("pi"));
+        f.add(Some("pi"));
+        assert_eq!(f, Flood::All, "changes from two peers: each may lack the other's");
+        assert!(f.sends_to("box") && f.sends_to("pi"));
+        let mut own = Flood::From("box".into());
+        own.add(None);
+        assert_eq!(own, Flood::All, "this host's own report goes to every peer");
+        f.add(Some("box"));
+        assert_eq!(f, Flood::All);
     }
 
     /// A [`Pair`](crate::serve::fleet::dialer::tests::Pair): L (`lap`, the

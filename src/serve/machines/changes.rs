@@ -13,8 +13,8 @@
 //!   machines, off the request thread; one not reached catches up at its
 //!   next link's head comparison (`fleet::proof`).
 //! - **Proposed elsewhere.** On another member the change goes to the
-//!   authority as `fleet.propose` over a direct link ([`propose`]; routing
-//!   comes with fleet plan step 10b), queued there (`fleet::proposals`)
+//!   authority as `fleet.propose` over any path ([`propose`]: a direct link
+//!   while up, else a route), queued there (`fleet::proposals`)
 //!   with a desktop notification until the user runs `devsandbox machine
 //!   approve|deny <id>` there (`membership.approve|deny`). The authority's
 //!   key never signs on a remote request alone.
@@ -326,7 +326,7 @@ pub fn plan_rotate(stored: &Stored, me: &str, key: &SigningKey, next: &PublicKey
 /// `membership.rotate`: this host's next key (`member.key.next`; a pending
 /// one is reused), its `rotate` signed here on the authority (with the old
 /// key; storing it promotes the next key, the push sends it on) or proposed
-/// to the authority over a direct link ([`propose`], collapsing with a
+/// to the authority over any path ([`propose`], collapsing with a
 /// pending one). Refused for a capped member or one in no log, before any
 /// key is made.
 pub fn rotate(ctx: &Ctx) -> Result<Rotation, ApiError> {
@@ -365,18 +365,11 @@ pub fn rotate(ctx: &Ctx) -> Result<Rotation, ApiError> {
     }
 }
 
-/// `change` proposed to the fleet's authority `authority` over this host's
-/// direct link to it: its id there. `denied` naming it when there's no
-/// direct link (routing comes with fleet plan step 10b), `failed` when the
-/// link is down or the authority refuses.
+/// `change` proposed to the fleet's authority `authority` over any path
+/// (`leave::call`: its direct link while up, else a route over this
+/// host's link graph): its id there. `failed` naming it when no path
+/// reaches it, or it refuses.
 pub fn propose(ctx: &Ctx, authority: &str, change: Change) -> Result<u64, ApiError> {
-    let linked = ctx.links.as_ref().is_some_and(|l| l.entries().iter().any(|e| e.name == authority));
-    if !linked {
-        return Err(ApiError::denied(format!(
-            "the fleet's authority `{authority}` isn't directly linked to this host: a proposal reaches it only over a \
-             direct link until routing (fleet plan step 10b); run it on `{authority}`, or link to it"
-        )));
-    }
     let v = leave::call(ctx, authority, "fleet.propose", json!({ "op": change }))
         .map_err(|why| ApiError::failed(format!("the fleet's authority `{authority}`: {why}")))?;
     let q: Queued = serde_json::from_value(v).map_err(|e| ApiError::failed(format!("{authority}: fleet.propose: unexpected answer: {e}")))?;
@@ -595,7 +588,10 @@ mod tests {
             approved,
             json!({
                 "id": 2, "name": "zed", "change": "revoke `zed`", "pushed": ["box"], "unpushed": [], "error": null,
-                "removed": {"name": "zed", "hub": "box", "leave": "unreachable", "error": "no link to it", "forgot": ["lap"], "missed": null},
+                "removed": {
+                    "name": "zed", "hub": "box", "leave": "unreachable",
+                    "error": "no link to it, and no path to it in this host's link graph", "forgot": ["lap"], "missed": null,
+                },
             })
         );
         assert!(test_support::read(&l_toml).unwrap().log.revoked_name("zed"));
@@ -613,10 +609,12 @@ mod tests {
         pair.finish();
     }
 
-    /// The fleet's authority (`auth`) runs nowhere here: a member's `machine
-    /// rm` is refused naming it, and nothing is queued anywhere.
+    /// The fleet's authority (`auth`) runs nowhere here, no link nor path
+    /// to it: a member's `machine rm` fails naming it and why, and nothing
+    /// is queued anywhere. (A route to it: `fleet::dialer`'s
+    /// `a_proposal_reaches_the_authority_over_a_route`.)
     #[test]
-    fn a_proposal_needs_a_direct_link_to_the_authority() {
+    fn a_proposal_needs_a_path_to_the_authority() {
         let pair = pair("changes-unlinked", |k, l| {
             let auth = SigningKey::from_seed([9; 32]);
             test_support::fleet("auth", &auth, "box", &[("lap", key_of(l).public_key()), ("box", key_of(k).public_key()), ("zed", pk(7))])
@@ -624,8 +622,8 @@ mod tests {
         up(&pair);
         for dir in [&pair.l_dir, &pair.k_dir] {
             let (code, message) = call(dir, "machines.rm", json!({"name": "zed"})).unwrap_err();
-            assert_eq!(code, "denied", "{message}");
-            assert!(message.contains("authority `auth` isn't directly linked") && message.contains("10b"), "{message}");
+            assert_eq!(code, "failed", "{message}");
+            assert_eq!(message, "the fleet's authority `auth`: no link to it, and no path to it in this host's link graph");
         }
         assert!(!pair.base.join("l-data/proposals.json").exists() && !pair.base.join("k-data/proposals.json").exists());
         pair.finish();

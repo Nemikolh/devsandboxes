@@ -338,7 +338,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // Inbound neighbors are machines too: the service follows them.
     let inbound: Arc<machines::inbound::Neighbors> = Arc::default();
     let links =
-        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial.clone(), route, hold, opts.machine_timing, hooks, Some(hub), log);
+        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial, route, hold, opts.machine_timing, hooks, Some(hub), log);
     let forwards_machines = registry_path.clone();
     if let Some(agent) = &opts.host_agent {
         shared.host_agent = Arc::clone(agent);
@@ -348,7 +348,6 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     }
     shared.machines = Some(machines::api::Ctx {
         registry: registry_path,
-        dial,
         probe,
         version: opts.version.semver.clone(),
         links: Some(links.handle()),
@@ -724,7 +723,7 @@ struct Shared {
     /// nothing re-reads it. The keep-alive, placement,
     /// `remotes.json` (`service::Hub`) and the links' hellos follow it.
     hub: Arc<Mutex<fleet::member::Hub>>,
-    /// The `machines.*` methods' registry and dial, and the machine links;
+    /// The `machines.*` methods' registry and probe, and the machine links;
     /// unset only in tests that build a bare `Shared` (the methods are then
     /// unknown, and no machine exists).
     machines: Option<machines::api::Ctx>,
@@ -1996,7 +1995,7 @@ fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
         let answer = if req.method == "fleet.report" {
             fleet::reports::report_call(req.params, &from, &shared.graph, stored, me, log)
         } else {
-            fleet::reports::graph_call(req.params, &from, &shared.graph, stored, me, shared.is_hub(), log)
+            fleet::reports::graph_call(req.params, &from, &shared.graph, stored, me, log)
         };
         return match answer {
             Ok(result) => Response::ok(req.id, result),
@@ -2019,9 +2018,10 @@ fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
 
 /// `fleet.place` on the hub, from member `from` (fleet plan decision 31):
 /// where its run goes, by `placed::for_member` over this host (its
-/// capacity now, its watched roots), the member's own report, and this
-/// host's connected machines the member links to directly, each asked a
-/// fresh `capacity.get` as the hub's own placement does.
+/// capacity now, its watched roots), the member's own report, and the
+/// machines this host reaches (a link up, or a route) that the member
+/// reaches too, each asked a fresh `capacity.get` as the hub's own
+/// placement does.
 fn fleet_place(params: Value, from: &str, shared: &Shared) -> Result<Value, api::ApiError> {
     use fleet::placed;
     let ask: placed::PlaceParams = api::parse(params)?;
@@ -2031,10 +2031,10 @@ fn fleet_place(params: Value, from: &str, shared: &Shared) -> Result<Value, api:
         .and_then(|p| fleet::dialer::member_name(p, &shared.hostname).ok())
         .ok_or_else(|| api::ApiError::failed("this hub has no member name"))?;
     let machines = shared.remotes();
-    let entries = shared.links().map(|l| l.entries()).unwrap_or_default();
-    let fresh = fresh_capacities(shared, &entries, &placed::member_workers(&ask, from, &machines));
+    let routed = shared.links().map(|l| l.routed()).unwrap_or_default();
+    let fresh = fresh_capacities(shared, &placed::member_workers(&ask, from, &machines, &routed));
     let local_roots: Vec<Arc<Value>> = shared.locals.lock().unwrap().values().cloned().collect();
-    let answer = placed::for_member(&ask, from, &hub, shared.capacity(), &local_roots, &machines, &fresh)
+    let answer = placed::for_member(&ask, from, &hub, shared.capacity(), &local_roots, &machines, &routed, &fresh)
         .map_err(|e| api::ApiError::failed(e.to_string()))?;
     log(&format!("fleet.place from {from}: {} on {}", ask.spec.sandbox, answer.machine));
     serde_json::to_value(answer).map_err(|e| api::ApiError::internal(e.into()))
@@ -2308,10 +2308,11 @@ fn remote_verb(
 /// the worker it was placed on, in the worker's copy of the config root,
 /// or the failure to move the code there. On the hub (`member.toml`'s
 /// `hub = "self"`, [`Shared::is_hub`]) this host places it, looking
-/// further than itself only when some machine's link is up
-/// (`placed::worth_placing`: any kind); on a member the hub does
-/// (`fleet.place`, [`ask_hub`]), and the code moves over this host's own
-/// links either way ([`move_code`]); in no fleet it runs here. Moving the
+/// further than itself only when some machine's link is up or a routed
+/// one has a path (`placed::worth_placing`: any kind); on a member the hub
+/// does (`fleet.place`, [`ask_hub`]), and the code moves over this host's
+/// own paths either way ([`move_code`]: a link, else a route); in no fleet
+/// it runs here. Moving the
 /// code (a fetch of each folder's origin, the transfers) runs on this
 /// connection's thread before anything is forwarded; a hang-up meanwhile
 /// is seen once the forward starts.
@@ -2328,7 +2329,8 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     }
     let sandbox = str_of("sandbox")?;
     let machines = shared.remotes();
-    if hub.is_this() && !placed::worth_placing(&machines) {
+    let routed = shared.links().map(|l| l.routed()).unwrap_or_default();
+    if hub.is_this() && !placed::worth_placing(&machines, &routed) {
         return None;
     }
     // A bad `root` is the local parse's to refuse.
@@ -2350,18 +2352,17 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     let locals: Vec<(PathBuf, Arc<Value>)> = shared.locals.lock().unwrap().iter().map(|(d, v)| (d.clone(), Arc::clone(v))).collect();
     let spec = placed::spec(sandbox, locals.iter().find(|(d, _)| *d == root).map(|(_, v)| v.as_ref()));
     let local_roots: Vec<Arc<Value>> = locals.into_iter().map(|(_, v)| v).collect();
-    let entries = shared.links().map(|l| l.entries()).unwrap_or_default();
     let ask = placed::Ask { branch: str_of("branch"), base: str_of("base") };
-    let prepare = |worker: &str| move_code(shared, &entries, worker, &root, sandbox, ask.branch);
+    let prepare = |worker: &str| move_code(shared, worker, &root, sandbox, ask.branch);
     let decided = match &hub {
         Hub::Other(k) => {
-            let reachable = placed::reachable_workers(&machines);
-            let answer = ask_hub(shared, &entries, &machines, k, &placed::PlaceParams::of(&spec, shared.capacity(), reachable.clone()));
+            let reachable = placed::reachable_workers(&machines, &routed);
+            let answer = ask_hub(shared, k, &placed::PlaceParams::of(&spec, shared.capacity(), reachable.clone()));
             placed::by_hub(&ask, k, answer, &reachable, prepare)
         }
         _ => {
-            let fresh = fresh_capacities(shared, &entries, &placed::reachable_workers(&machines));
-            let candidates = placed::candidates(&spec, Some(shared.capacity()), &local_roots, &machines, &fresh);
+            let fresh = fresh_capacities(shared, &placed::reachable_workers(&machines, &routed));
+            let candidates = placed::candidates(&spec, Some(shared.capacity()), &local_roots, &machines, &routed, &fresh);
             placed::decide(&ask, &spec, &candidates, prepare)
         }
     };
@@ -2396,22 +2397,19 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
 }
 
 /// Move the code of `sandbox` (config root `root`, `--branch` `branch`)
-/// into this host's fleet root on `worker`, over its link: the `prepare` of
-/// a placed run, the hub's own or a member's placed by the hub.
+/// into this host's fleet root on `worker`, over its link or a route
+/// (`route::connect`): the `prepare` of a placed run, the hub's own or a
+/// member's placed by the hub.
 fn move_code(
     shared: &Shared,
-    entries: &[machines::Entry],
     worker: &str,
     root: &Path,
     sandbox: &str,
     branch: Option<&str>,
 ) -> std::result::Result<fleet::code::Prepared, fleet::code::Unprepared> {
     use fleet::code::{self, LinkTransfer, Unprepared};
-    let Some(entry) = entries.iter().find(|e| e.name == worker) else {
-        return Err(Unprepared::NotMovable("it's no longer a machine here".into()));
-    };
-    // The machine says where this host's fleet root is, over the link.
-    let worker_root = fleet_root_on(shared, entry).map_err(Unprepared::NotMovable)?;
+    // The machine says where this host's fleet root is, over the same path.
+    let worker_root = fleet_root_on(shared, worker).map_err(Unprepared::NotMovable)?;
     let repos = match &shared.repos {
         Some(repos) => repos.clone(),
         None => code::repos_dir()?,
@@ -2421,28 +2419,20 @@ fn move_code(
 }
 
 /// The hub `hub`'s `fleet.place` answer to `ask`, over a fresh `API`
-/// stream of its link (its dial and hello bounded by
-/// `placed::CAPACITY_WAIT`, the answer by `placed::PLACE_WAIT`); why none,
-/// for the note of a run that then stays here.
+/// stream of any path to it (`Handle::open_member`: its link while up,
+/// else a route; the dial and hello bounded by `placed::CAPACITY_WAIT`,
+/// the answer by `placed::PLACE_WAIT`); why none, for the note of a run
+/// that then stays here.
 fn ask_hub(
     shared: &Shared,
-    entries: &[machines::Entry],
-    machines: &[snapshots::Machine],
     hub: &str,
     ask: &fleet::placed::PlaceParams,
 ) -> std::result::Result<fleet::placed::PlaceAnswer, fleet::placed::Unplaced> {
     use fleet::placed::{CAPACITY_WAIT, PLACE_WAIT, Unplaced};
     let down = |why: String| Unplaced::Unreachable(why);
-    match machines.iter().find(|m| m.name == hub) {
-        Some(m) if fleet::place::reachable(m.state) => {}
-        Some(m) => return Err(down(m.error.clone().unwrap_or_else(|| "its link isn't up".into()))),
-        None => return Err(down("no link to it".into())),
-    }
-    let (Some(ctx), Some(entry)) = (shared.machines.as_ref(), entries.iter().find(|e| e.name == hub)) else {
-        return Err(down("no link to it".into()));
-    };
-    let duplex = (ctx.dial)(entry).map_err(|e| down(format!("{e:#}")))?;
-    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| down(e.to_string()))?;
+    let links = shared.links().ok_or_else(|| down("this daemon has no machines".into()))?;
+    let duplex = links.open_member(hub).map_err(down)?;
+    let mut link = link::handshake(hub, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| down(e.to_string()))?;
     let params = serde_json::to_value(ask).map_err(|e| Unplaced::Refused(e.to_string()))?;
     let r = link.conn.call_within("fleet.place", params, PLACE_WAIT).map_err(|e| down(format!("{e:#}")))?;
     let r = r.ok_or_else(|| down(format!("no `fleet.place` answer within {}s", PLACE_WAIT.as_secs())))?;
@@ -2452,15 +2442,16 @@ fn ask_hub(
     serde_json::from_value(r.result.unwrap_or(Value::Null)).map_err(|e| Unplaced::Refused(format!("bad fleet.place answer: {e}")))
 }
 
-/// This host's fleet root on machine `entry`, as its `roots.list` answer
-/// over a fresh `API` stream of the link flags it (`fleet::placed::fleet_root`);
-/// why not, for the note of a run that then stays here.
-fn fleet_root_on(shared: &Shared, entry: &machines::Entry) -> std::result::Result<PathBuf, String> {
+/// This host's fleet root on machine `worker`, as its `roots.list` answer
+/// over a fresh `API` stream of any path to it (`Handle::open_member`)
+/// flags it (`fleet::placed::fleet_root`); why not, for the note of a run
+/// that then stays here.
+fn fleet_root_on(shared: &Shared, worker: &str) -> std::result::Result<PathBuf, String> {
     use fleet::placed::CAPACITY_WAIT;
-    let ctx = shared.machines.as_ref().ok_or("this daemon has no machines")?;
+    let links = shared.links().ok_or("this daemon has no machines")?;
     let unknown = |why: String| format!("its fleet root for this host isn't known ({why})");
-    let duplex = (ctx.dial)(entry).map_err(|e| unknown(format!("{e:#}")))?;
-    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| unknown(e.to_string()))?;
+    let duplex = links.open_member(worker).map_err(unknown)?;
+    let mut link = link::handshake(worker, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| unknown(e.to_string()))?;
     let r = link.conn.call_within("roots.list", json!({}), CAPACITY_WAIT).map_err(|e| unknown(format!("{e:#}")))?;
     let r = r.ok_or_else(|| unknown("`roots.list` timed out".into()))?;
     if let Some(e) = r.error {
@@ -2471,29 +2462,25 @@ fn fleet_root_on(shared: &Shared, entry: &machines::Entry) -> std::result::Resul
     fleet::placed::fleet_root(&rows).ok_or_else(|| unknown("none listed".into()))
 }
 
-/// Each of `workers`' `capacity.get`, asked in parallel over its link's
-/// dial (a fresh `API` stream: hello, then the call), each bounded by
-/// `placed::CAPACITY_WAIT` for its dial-and-hello and again for its
-/// answer. A worker that doesn't answer in time, or fails, is left out:
-/// its saved report stands.
-fn fresh_capacities(
-    shared: &Shared,
-    entries: &[machines::Entry],
-    workers: &[String],
-) -> BTreeMap<String, super::capacity::Capacity> {
+/// Each of `workers`' `capacity.get`, asked in parallel over any path to
+/// it (`Handle::open_member`: a fresh `API` stream of its link, else a
+/// route; hello, then the call), each bounded by `placed::CAPACITY_WAIT`
+/// for its dial-and-hello and again for its answer. A worker that doesn't
+/// answer in time, or fails, is left out: its saved report stands.
+fn fresh_capacities(shared: &Shared, workers: &[String]) -> BTreeMap<String, super::capacity::Capacity> {
     use fleet::placed::CAPACITY_WAIT;
-    let Some(ctx) = shared.machines.as_ref() else { return BTreeMap::new() };
+    let Some(links) = shared.links() else { return BTreeMap::new() };
     std::thread::scope(|s| {
         let asks: Vec<_> = workers
             .iter()
-            .filter_map(|w| entries.iter().find(|e| &e.name == w))
-            .map(|entry| {
+            .map(|worker| {
+                let links = &links;
                 s.spawn(move || {
-                    let duplex = (ctx.dial)(entry).ok()?;
-                    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT, link::Over::Link).ok()?;
+                    let duplex = links.open_member(worker).ok()?;
+                    let mut link = link::handshake(worker, duplex, CAPACITY_WAIT, link::Over::Link).ok()?;
                     let r = link.conn.call_within("capacity.get", json!({}), CAPACITY_WAIT).ok()??;
                     let capacity = serde_json::from_value(r.result?).ok()?;
-                    Some((entry.name.clone(), capacity))
+                    Some((worker.clone(), capacity))
                 })
             })
             .collect();

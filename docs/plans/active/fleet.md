@@ -974,6 +974,10 @@ step 10b does.
     desktop notification); the authority's key never signs on a remote
     request alone. Until routing (10b) a proposal reaches the authority
     only over a direct link to it, else it's refused naming it.
+
+    As built (10b.7): a proposal goes over any path (`leave::call`: the
+    direct link while up, else a route), failing only when none reaches
+    the authority, naming it and why.
 50. The membership log has one writer, the authority. An introduction
     (decision 46) is a statement signed by its introducer, outside the
     chain, held by every member as capped until the authority adds that
@@ -1019,7 +1023,9 @@ step 10b does.
     and whether it's always on), one `identity::Statement` per member
     whose version only goes up. The hub collects and pushes them; every
     member keeps them and serves them to any log member, and a report
-    verifies by its signer's key whoever carried it.
+    verifies by its signer's key whoever carried it. As built (10b.7):
+    every member floods what made its copy newer to its direct links,
+    not only the hub, so a member with no link to the hub stays current.
 60. Machines reached only over a route are rows of their own
     (`machine ls`, `machines.list`), their instances still from the
     hub's federated view.

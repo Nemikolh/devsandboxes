@@ -55,9 +55,6 @@ type Answer = Result<Value, ApiError>;
 pub struct Ctx {
     /// `machines.toml` ([`super::path`] outside tests).
     pub registry: PathBuf,
-    /// A registered machine's link (`fleet::dialer::dial`): forwarded
-    /// verbs and placement's capacity asks dial it.
-    pub dial: Dial,
     /// A target at add time, before it has a link (`probe`, `add`): ssh.
     pub probe: Dial,
     /// This daemon's semver, which `add` warns a differing machine's against.
@@ -1013,7 +1010,8 @@ mod tests {
     /// A member of `k`'s fleet (not its authority) adds a machine: it
     /// introduces it (signed here), and the machine takes the log and the
     /// introduction, its hub `k` from the log. The introduction isn't
-    /// proposed to `k`, which this host has no link to: the answer says why.
+    /// proposed to `k`, which this host has no link nor path to: the answer
+    /// says why.
     #[test]
     fn the_machine_joins_this_hosts_fleet_under_its_name() {
         let mut pair = Pair::fleets("mach-join-target", named("lap", "k"), named("box", ""), |this, _| {
@@ -1031,7 +1029,7 @@ mod tests {
         assert_eq!((i.name.as_str(), i.key, i.introducer.as_str()), ("b2", pair.machine_key().public_key(), "lap"));
         let proposed = &r["proposed"];
         assert_eq!((&proposed["name"], &proposed["authority"], &proposed["id"]), (&json!("b2"), &json!("k"), &Value::Null));
-        assert!(proposed["error"].as_str().unwrap().contains("isn't directly linked"), "{proposed}");
+        assert!(proposed["error"].as_str().unwrap().starts_with("the fleet's authority `k`: "), "{proposed}");
         pair.finish();
     }
 

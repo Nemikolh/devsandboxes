@@ -659,6 +659,67 @@ impl Handle {
         })
     }
 
+    /// Whether `machine`'s own link here is connected: `Err` why not (its
+    /// error, or no link to it at all).
+    fn direct_up(&self, machine: &str) -> Result<(), String> {
+        match self.inner.remotes.get(machine) {
+            Some(m) if m.state == LinkState::Connected => Ok(()),
+            Some(m) => Err(m.error.unwrap_or_else(|| "its link isn't up".into())),
+            None => Err("no link to it".into()),
+        }
+    }
+
+    /// Whether a route is worth trying to `machine`, whose own link isn't
+    /// up (`direct`: why): one with a link here (down) may have a route
+    /// socket bound (`fleet::routes::wanted` skips only links that are up);
+    /// a routed one while the graph has a path starting with a link up
+    /// here. Else why there's no way to it.
+    fn route_worth(&self, machine: &str, direct: &str) -> Result<(), String> {
+        if self.inner.lock_links().contains_key(machine) {
+            return Ok(());
+        }
+        match self.routed_one(machine) {
+            Some(r) if r.state == LinkState::Connected => Ok(()),
+            Some(r) => Err(format!("{direct}, and {}", r.error.unwrap_or_else(|| "no route to it is up".into()))),
+            None => Err(format!("{direct}, and no path to it in this host's link graph")),
+        }
+    }
+
+    /// A fresh `API` stream to member `machine`'s daemon over any path:
+    /// its own link while that's connected, else a route (the
+    /// [`RouteDial`]). Why neither, naming the link's and the route's
+    /// failures. What the fleet's calls to a member dial (the hub's
+    /// `fleet.place`, a placement's `capacity.get` and `roots.list`).
+    pub fn open_member(&self, machine: &str) -> Result<Duplex, String> {
+        let direct = match self.direct_up(machine) {
+            Ok(()) => {
+                let entry = self.inner.lock_links().get(machine).map(|l| l.entry.clone());
+                if let Some(entry) = entry {
+                    return (self.inner.dial)(&entry).map_err(|e| format!("{e:#}"));
+                }
+                "no link to it".to_string()
+            }
+            Err(why) => why,
+        };
+        self.route_worth(machine, &direct)?;
+        (self.inner.route)(machine).map_err(|e| format!("{direct}; over a route: {e:#}"))
+    }
+
+    /// `method` on member `machine` over any path ([`Self::open_member`]'s
+    /// rule): over its link while connected ([`Self::forward`]), else a
+    /// routed stream of its own ([`Self::call_routed`]). The remote's
+    /// response as is, or why it didn't get there. The fleet's membership
+    /// calls go this way (`leave::call`).
+    pub fn call_member(&self, machine: &str, method: &str, params: Value) -> Result<Response, String> {
+        match self.direct_up(machine) {
+            Ok(()) => self.forward(machine, method, params).map_err(|e| e.message),
+            Err(direct) => {
+                self.route_worth(machine, &direct)?;
+                self.call_routed(machine, method, params).map_err(|e| format!("{direct}; over a route: {}", e.message))
+            }
+        }
+    }
+
     /// `method` on routed machine `machine`: an `API` stream opened over
     /// the [`RouteDial`], the hello within [`Timing::handshake`], the call
     /// within [`Timing::call`], then closed. No path or a failed hello is
