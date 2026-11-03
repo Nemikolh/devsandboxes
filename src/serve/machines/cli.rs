@@ -1043,6 +1043,9 @@ mod tests {
         let with_lap = [own, files(&["fleet-lap.sock"])].concat();
         assert!(foreign_link_sockets(dir, &with_lap, &ms(&["box"])), "lap's link is up here");
         assert!(!foreign_link_sockets(dir, &with_lap, &ms(&["box", "lap"])));
+        // A route socket is the daemon's, for a member it has no link to.
+        let routed = [files(&["serve.sock", "fleet-box.sock"]), files(&["route-b.sock"])].concat();
+        assert!(!foreign_link_sockets(dir, &routed, &ms(&["box"])), "a route socket is no link");
     }
 
     /// What `main` gets for a port: a nameless one's port comes out of

@@ -39,7 +39,7 @@ use std::time::Duration;
 pub use super::pty::Mode;
 use super::pty::{METHOD, code};
 use crate::devsbd::rpc::{self, Call, Exit, Obj, Record, code as helper};
-use crate::serve::endpoint::{self, Stream};
+use crate::serve::endpoint::Stream;
 use crate::serve::machines::cli::{DETACHED_EXIT, NO_SESSION_EXIT, SSH_FAILED, VERSION_EXIT};
 
 /// How often the input side looks for a size change (and a stop): as the
@@ -285,9 +285,8 @@ impl Drop for Raw {
 /// piped request leaves the terminal as it is and reads stdin only when
 /// interactive.
 pub fn dial(dir: &Path, machine: &str, r: &Request, reserve_255: bool) -> i32 {
-    let path = endpoint::fleet_socket(dir, machine);
-    let end = match super::link::connect(&path, crate::devsbd::proto::channel::PTY) {
-        Err(e) => End::Lost(format!("machine `{machine}`: its fleet link isn't up ({}: {e})", path.display())),
+    let end = match super::route::connect(dir, machine, crate::devsbd::proto::channel::PTY) {
+        Err(e) => End::Lost(format!("machine `{machine}`: {e}")),
         Ok(stream) => {
             let (mut out, mut err) = (io::stdout(), io::stderr());
             match r.mode {

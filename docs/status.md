@@ -285,14 +285,18 @@ limitation means editing this file in the same commit.
   two members' clocks, and a member whose clock went back after a daemon
   restart has its reports refused as older until the clock passes its
   last one (a peer's copy of its own last report moves it past only once
-  received). Nothing reads the graph yet but `graph.get`; routing over it
-  is fleet steps 10b.4-10b.7.
+  received). The daemon's route sockets read it (fleet step 10b.5); the
+  CLI, dashboard and fleet calls use them from fleet steps 10b.6-10b.7.
   → [fleet](architecture/daemon/fleet.md#link-graph); `fleet::graph::next_version`, `fleet::reports`
-- Every link end relays and answers routed streams (`ROUTE`), but nothing
-  opens one yet: choosing a path and failing over is fleet step 10b.5.
-  Until 10c a relay sees and can alter a routed stream's bytes after its
-  opening (only the opening is proven end to end).
-  → [fleet](architecture/daemon/fleet.md#routed-streams); `fleet::route`
+- Routed streams are opened only through the daemon's
+  `route-<member>.sock`, which only `route::connect`'s callers reach
+  (terminals, port forwards, code transfers to a machine whose own link
+  is down); nothing names a routed-only member yet: its rows, actions and
+  fleet calls over a route are fleet steps 10b.6-10b.7. A routed stream
+  doesn't fail over once open: a hop going down ends it, and its client
+  opens it again. Until 10c a relay sees and can alter a routed stream's
+  bytes after its opening (only the opening is proven end to end).
+  → [fleet](architecture/daemon/fleet.md#routed-streams); `fleet::route`, `fleet::routes`
 - A capped (introduced) member can't rotate its key: the log has no key
   of it to rotate until the authority adds it.
   → [fleet](architecture/daemon/fleet.md#member-identity); `machines::changes::can_rotate`

@@ -170,8 +170,17 @@ impl Graph {
         self.reports.len() != before
     }
 
-    // No caller yet: the paths are tried in fleet plan step 10b.5.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Every member the graph names: each report's, and each peer one
+    /// lists.
+    pub fn members(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for (name, (_, r)) in &self.reports {
+            out.insert(name.clone());
+            out.extend(r.links.iter().map(|l| l.peer.clone()));
+        }
+        out
+    }
+
     /// The edge between `a` and `b`: up when the newer of the two ends'
     /// reports (by statement version) says the link is connected; a report
     /// that doesn't list the other end says it isn't. At equal versions,
@@ -196,8 +205,6 @@ impl Graph {
         }
     }
 
-    // No caller yet: the paths are tried in fleet plan step 10b.5.
-    #[cfg_attr(not(test), allow(dead_code))]
     /// The simple paths from `from` to `to` over up edges, at most
     /// `max_hops` long, each the hops after `from` ending in `to`; only
     /// members of `stored`'s log or held introductions are on one. In the
@@ -232,7 +239,6 @@ impl Graph {
         keyed.into_iter().map(|(_, hops)| hops).collect()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     /// Depth-first over up edges from `path`'s last node: every simple path
     /// to `to` within `max_hops`, with its edges' most recent `since`.
     fn walk(&self, nodes: &BTreeSet<&str>, to: &str, max_hops: usize, path: &mut Vec<String>, newest: u64, out: &mut Vec<(Vec<String>, u64)>) {

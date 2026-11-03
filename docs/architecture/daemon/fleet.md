@@ -549,11 +549,17 @@ ends redial saying it.
 
 Every client reaches a machine, ssh or inbound, through the socket its
 link's local end binds, `fleet-<name>.sock` in the daemon's socket dir,
-naming its channel first (`link::connect`).
+naming its channel first (`link::connect`). Terminals, port forwards and
+code transfers go through `route::connect`: that socket when it answers,
+else the daemon's `route-<name>.sock` for a member it has no link up to
+([Routed streams](#routed-streams)), the same bytes either way; neither
+there, the error names both sockets.
 
 - **The dial** (`fleet::dialer::dial`, the daemon's `Dial` for every
   machine): an `API` connection to its `fleet-<name>.sock` as a plain
-  `ssh::Duplex::socket`; down, `its link isn't up (…)`. Each connection
+  `ssh::Duplex::socket`; down, `its link isn't up (…)`. Never the route
+  socket: this connection is the machine's link state, which this host's
+  link report says as a direct link. Each connection
   is one `API` stream to the machine's daemon, so the held link
   (`service::Machines`), the quick calls and `forward::verb` (one stream
   per verb, a hang-up the stream's close) run on it. A link's failure is
@@ -1706,9 +1712,40 @@ origin reads which hop refused and why.
   `fleet/<origin>/`, the daemon's env) with no agent, under this host's
   trust table for the origin.
 - **The origin** over a link (`route::open`): a `ROUTE` connection to its
-  first hop's `fleet-<hop>.sock`, the header, `route::origin_side`; the
-  stream it returns carries the inner channel (for `API`, the hello as
-  over a link).
+  first hop's `fleet-<hop>.sock`, the header, `route::origin_side`, its
+  reads within one budget together (`route::Until`); the stream it
+  returns carries the inner channel (for `API`, the hello as over a
+  link).
+- **The requester** (`src/serve/fleet/routes.rs`, decision 21): the
+  daemon (with a `member.toml`) binds `route-<member>.sock`
+  (`endpoint::route_socket`) in its socket dir for every member its graph
+  names (`Graph::members`) that its log or held introductions know, but
+  itself and those it has a link up to (`routes::wanted`; a connected
+  link's `fleet-<member>.sock` is there). The `serve-routes` thread
+  (`routes::Routes`) binds and unbinds them (`link::Socket`, the newest
+  binder wins) whenever the graph changes or a link moves
+  (`reports::Published::on_change`, called on its `poke` from the machine
+  links' `changed` hook and on every graph change), and sweeps the
+  `route-*.sock` a dead daemon left when it starts (under the start
+  lock). Each connection names its channel first, as on a
+  `fleet-*.sock` (`link::read_channel`), and is served on a
+  `serve-routed` thread counted in `Shared::channels`
+  (`Shared::serve_routed`): the channel and names are checked once
+  (`Header::check`), then `Graph::paths` from this host to the member
+  are tried in order (`routes::first_open`, `Shared::open_routed`): a path
+  whose first hop has no connected link here is skipped, the others
+  opened with `route::open` as this host's identity read then (its key
+  as a link proves it, `Identity::signer_for`), each attempt within
+  `routes::ATTEMPT` (5 s) and all of them within the machine links'
+  handshake wait (`service::Timing::handshake`, a client's hello waiting
+  as long); a refusal, a timeout or a failed connect is the next path's
+  turn. The first that opens is spliced to the connection
+  (`route::splice`). None opening, the failures are logged in path order
+  (`routes::failure`: ``no path to `<member>` opened: via <hops>: <why>;
+  …``, or ``no path to `<member>` in this host's link graph``); an `API` client gets
+  that as the error answering its hello (`routes::refuse_api`, code
+  `failed`, after reading the hello line), any other channel's
+  connection is closed. Once open, a stream stays on its path.
 
 ### Trust
 

@@ -559,8 +559,8 @@ pub fn port(
 
 /// `devsandbox port` on a machine's instance or global service
 /// (docs/architecture/daemon/machines.md, *The CLI*): [`port`]'s flow, each
-/// forward's bridge a `TUNNEL` stream through `entry`'s link socket
-/// (`endpoint::fleet_socket`, `tunnel::remote_opener`), served under
+/// forward's bridge a `TUNNEL` stream through `entry`'s link socket, else
+/// its route socket (`fleet::route::connect`, `tunnel::remote_opener`), served under
 /// the machine's trust there. `root` is the config root there, `name` the
 /// instance as that machine knows it (already resolved, and already split
 /// from the ports by the caller: `split_target` is not applied again). No
@@ -580,8 +580,8 @@ pub fn port_remote(
     use crate::serve::endpoint;
 
     let specs = parse_specs(name.is_some(), service.is_some(), &ports)?;
-    let socket = endpoint::fleet_socket(&endpoint::socket_dir()?, &entry.name);
-    let target = Arc::new((entry.name, root, name, service, socket));
+    let dir = endpoint::socket_dir()?;
+    let target = Arc::new((entry.name, root, name, service, dir));
     forward_until_interrupted(
         address,
         &specs,
@@ -591,9 +591,9 @@ pub fn port_remote(
             super::tunnel::remote_opener(
                 machine,
                 Box::new(move || {
-                    let (_, root, name, service, socket) = &*target;
+                    let (_, root, name, service, dir) = &*target;
                     let request = Request { root: root.clone(), instance: name.clone(), service: service.clone(), port: container_port };
-                    Ok(Via::Fleet { socket: socket.clone(), request })
+                    Ok(Via::Fleet { dir: dir.clone(), request })
                 }),
             )
         },

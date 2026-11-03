@@ -609,7 +609,7 @@ fn accept(bound: Socket, out: &Arc<Out>, stop: &AtomicBool) -> io::Result<()> {
 
 /// The channel byte a connection starts with ([`connect`]), waiting up to
 /// [`CHANNEL_WAIT`]; `None` when it closed or said nothing in time.
-fn read_channel(conn: &UnixStream) -> Option<u8> {
+pub(crate) fn read_channel(conn: &UnixStream) -> Option<u8> {
     conn.set_read_timeout(Some(CHANNEL_WAIT)).ok()?;
     let mut byte = [0u8; 1];
     (&*conn).read_exact(&mut byte).ok()?;

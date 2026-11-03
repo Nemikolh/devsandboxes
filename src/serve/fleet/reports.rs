@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -181,6 +181,9 @@ pub fn take_into(graph: &mut Graph, last: &mut u64, stored: &Stored, me: &str, r
 pub struct Published {
     state: Mutex<State>,
     cv: Condvar,
+    /// Called on each [`poke`](Self::poke) and each change of the graph
+    /// (the daemon's route sockets follow both: `fleet::routes`).
+    on_change: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -213,6 +216,24 @@ impl Published {
     pub fn poke(&self) {
         self.lock().dirty = true;
         self.cv.notify_all();
+        self.changed();
+    }
+
+    /// `f` called on each poke and graph change from now on (once: a
+    /// second one is ignored). Must not block.
+    pub fn on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.on_change.set(f);
+    }
+
+    fn changed(&self) {
+        if let Some(f) = self.on_change.get() {
+            f();
+        }
+    }
+
+    /// The graph held now.
+    pub fn graph(&self) -> Graph {
+        self.lock().graph.clone()
     }
 
     /// [`take_into`] this daemon's graph; a change on the hub (`is_hub`)
@@ -226,6 +247,9 @@ impl Published {
             self.cv.notify_all();
         }
         drop(st);
+        if changed {
+            self.changed();
+        }
         for why in refused {
             log(&format!("link reports from {from}: refused one: {why}"));
         }
@@ -271,6 +295,7 @@ pub fn report_call(params: Value, from: &str, published: &Published, stored: &St
         st.push = true;
         published.cv.notify_all();
         drop(st);
+        published.changed();
         log(&format!("link report from {from} (version {})", s.statement.version));
     }
     to_value(Took { changed })
@@ -414,6 +439,9 @@ fn publish_own(p: &Published, io: &Io, own: &Own, hub: &Hub) {
         st.push = true;
     }
     drop(st);
+    if changed {
+        p.changed();
+    }
     for why in refused {
         (io.log)(&format!("this host's own link report: refused: {why}"));
     }

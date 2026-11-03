@@ -88,6 +88,20 @@ pub fn fleet_socket(dir: &Path, machine: &str) -> PathBuf {
     dir.join(format!("fleet-{}.sock", agent_socket_name(machine)))
 }
 
+/// A routed member's socket in `dir` (docs/architecture/daemon/fleet.md,
+/// *Routed streams*): `route-<member>.sock`, bound by the daemon
+/// (`fleet::routes`) for each member of its link graph it has no link up
+/// to; each connection there is one stream to the member on the channel
+/// its first byte names, as on [`fleet_socket`], opened over the graph's
+/// paths (`fleet::route::connect` tries `fleet-<member>.sock` first). The
+/// name is cut down as [`fleet_socket`]'s is.
+pub fn route_socket(dir: &Path, member: &str) -> PathBuf {
+    dir.join(format!("{ROUTE_PREFIX}{}.sock", agent_socket_name(member)))
+}
+
+/// What every [`route_socket`]'s file name starts with.
+pub const ROUTE_PREFIX: &str = "route-";
+
 /// The agent socket of a `fleet-link --peer <dialer>` in `dir`
 /// (docs/architecture/daemon/fleet.md, *Peer links*):
 /// `agent-link-<dialer>.sock`, bound while the dialer serves `AGENT`
@@ -336,6 +350,9 @@ mod tests {
         assert_eq!(fleet_socket(dir, "lap.top"), dir.join("fleet-lap.top.sock"));
         let long = fleet_socket(dir, &"w".repeat(80));
         assert_eq!(long.file_name().unwrap().len(), "fleet-".len() + AGENT_CLIENT_MAX + ".sock".len());
+        assert_eq!(route_socket(dir, "lap.top"), dir.join("route-lap.top.sock"));
+        let long = route_socket(dir, &"w".repeat(80));
+        assert_eq!(long.file_name().unwrap().len(), "route-".len() + AGENT_CLIENT_MAX + ".sock".len());
     }
 
     #[test]

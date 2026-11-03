@@ -201,10 +201,10 @@ pub fn resolve(
 /// How one spawn of a remote forward's bridge reaches its machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Via {
-    /// A machine: connect to its link's socket (`endpoint::fleet_socket`)
-    /// for one `TUNNEL` stream (`fleet::link::connect`), and send
-    /// `request`.
-    Fleet { socket: PathBuf, request: Request },
+    /// A machine whose link sockets are in the socket dir `dir`: one
+    /// `TUNNEL` stream through its link, else its route
+    /// (`fleet::route::connect`), and send `request`.
+    Fleet { dir: PathBuf, request: Request },
 }
 
 /// Says a remote forward's [`Via`]; called on every spawn.
@@ -220,7 +220,7 @@ pub type TunnelVia = Box<dyn Fn() -> Result<Via, String> + Send + Sync>;
 /// unknown (the engine's probe fallback is the caller's: `None` for remote).
 pub fn remote_opener(machine: String, via: TunnelVia) -> Opener {
     Box::new(move |stop| match via()? {
-        Via::Fleet { socket, request } => open_fleet(&machine, &socket, &request, stop),
+        Via::Fleet { dir, request } => open_fleet(&machine, &dir, &request, stop),
     })
 }
 
@@ -252,11 +252,12 @@ fn wait_header<T>(rx: &mpsc::Receiver<T>, stop: &AtomicBool) -> Waited<T> {
     }
 }
 
-/// [`Via::Fleet`]: connect to `socket`, send `request`'s line, read the
-/// worker's [`Header`], then attach the bridge to the stream itself.
-fn open_fleet(machine: &str, socket: &Path, request: &Request, stop: &AtomicBool) -> Result<(Opened, Bridge), String> {
-    let stream = crate::serve::fleet::link::connect(socket, crate::devsbd::proto::channel::TUNNEL)
-        .map_err(|e| format!("machine `{machine}`: its fleet link isn't up ({}: {e})", socket.display()))?;
+/// [`Via::Fleet`]: connect to `machine` from socket dir `dir`, send
+/// `request`'s line, read the worker's [`Header`], then attach the bridge
+/// to the stream itself.
+fn open_fleet(machine: &str, dir: &Path, request: &Request, stop: &AtomicBool) -> Result<(Opened, Bridge), String> {
+    let stream = crate::serve::fleet::route::connect(dir, machine, crate::devsbd::proto::channel::TUNNEL)
+        .map_err(|e| format!("machine `{machine}`: {e}"))?;
     let clones = (stream.try_clone(), stream.try_clone());
     let (Ok(mut reader), Ok(writer)) = clones else {
         return Err("cannot clone the tunnel's socket".into());
@@ -438,9 +439,10 @@ mod tests {
         (socket, t)
     }
 
+    /// `socket`'s dir is the socket dir (`socket` is `fleet-lap.sock` there).
     fn fleet(socket: &Path, request: &Request) -> TunnelVia {
-        let (socket, request) = (socket.to_path_buf(), request.clone());
-        Box::new(move || Ok(Via::Fleet { socket: socket.clone(), request: request.clone() }))
+        let (dir, request) = (socket.parent().unwrap().to_path_buf(), request.clone());
+        Box::new(move || Ok(Via::Fleet { dir: dir.clone(), request: request.clone() }))
     }
 
     fn web_request() -> Request {
@@ -492,7 +494,8 @@ mod tests {
         // No link: no socket.
         std::fs::remove_file(&socket).unwrap();
         let got = remote_opener("lap".into(), fleet(&socket, &web_request()))(&AtomicBool::new(false));
-        assert!(got.err().unwrap().starts_with("machine `lap`: its fleet link isn't up ("));
+        let e = got.err().unwrap();
+        assert!(e.starts_with("machine `lap`: no link to `lap` is up (") && e.contains("route-lap.sock"), "{e}");
         let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 
@@ -544,7 +547,7 @@ mod tests {
                         .spawn();
                 }
             });
-            let via = Via::Fleet { socket: socket.clone(), request: web_request() };
+            let via = Via::Fleet { dir: dir.clone(), request: web_request() };
             let forward = Forward::start(ForwardSpec {
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 host_port: HostPort::Prefer(0),

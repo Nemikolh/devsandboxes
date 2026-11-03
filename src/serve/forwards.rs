@@ -143,12 +143,11 @@ pub enum Event {
 
 pub type OnEvent = Box<dyn Fn(Event) + Send>;
 
-/// How one spawn of a forward into machine `name`'s `request` reaches it:
-/// its link's socket in `socket_dir` (`endpoint::fleet_socket`), for every
-/// kind of machine.
-fn via(name: &str, socket_dir: &Path, request: tunnel::Request) -> tunnel::Via {
-    let socket = super::endpoint::fleet_socket(socket_dir, name);
-    tunnel::Via::Fleet { socket, request }
+/// How one spawn of a forward into a machine's `request` reaches it: its
+/// link's socket in `socket_dir`, else its route socket there
+/// (`fleet::route::connect`), for every kind of machine.
+fn via(socket_dir: &Path, request: tunnel::Request) -> tunnel::Via {
+    tunnel::Via::Fleet { dir: socket_dir.to_path_buf(), request }
 }
 
 enum Cmd {
@@ -434,7 +433,7 @@ impl Daemon {
             if !registry.names().map_err(|e| format!("{e:#}"))?.contains(&name) {
                 return Err(machines::no_machine(&name).to_string());
             }
-            Ok(via(&name, &socket_dir, request.clone()))
+            Ok(via(&socket_dir, request.clone()))
         });
         let open = tunnel::remote_opener(machine, dial);
         // No probe fallback: the far helper is the only listening-process lookup.
@@ -1657,17 +1656,13 @@ forwardPorts = ["redis:6379"]
         assert_eq!(d.rows(None, true).len(), 1);
     }
 
-    /// Every machine, whatever its kind, is reached through its link's
-    /// socket, a `TUNNEL` stream; the request is the forward's.
+    /// Every machine, whatever its kind, is reached from the socket dir, a
+    /// `TUNNEL` stream; the request is the forward's.
     #[test]
     fn every_machine_tunnels_over_its_link() {
         let dir = Path::new("/run/devsandbox");
         let request = tunnel::Request { root: "/far/cfg".into(), instance: Some("web".into()), service: None, port: 5432 };
-        assert_eq!(
-            via("lap", dir, request.clone()),
-            tunnel::Via::Fleet { socket: dir.join("fleet-lap.sock"), request: request.clone() }
-        );
-        assert_eq!(via("box", dir, request.clone()), tunnel::Via::Fleet { socket: dir.join("fleet-box.sock"), request });
+        assert_eq!(via(dir, request.clone()), tunnel::Via::Fleet { dir: dir.into(), request });
     }
 
     /// A forward into an ssh machine dials its link's socket (a `TUNNEL`

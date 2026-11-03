@@ -90,7 +90,9 @@ pub fn link_args(member: &str) -> Result<Vec<String>> {
 /// The daemon's [`Dial`] of a machine, ssh or inbound: a
 /// connection to its `fleet-<name>.sock` in `socket_dir` (one `API` stream
 /// on its link, `link::connect`, the daemon from its first byte:
-/// `machines::link::handshake` with `Over::Link`).
+/// `machines::link::handshake` with `Over::Link`). Never its route socket
+/// (`fleet::route::connect`): this connection is the machine's link state,
+/// which this host's link report says as a direct link.
 pub fn dial(socket_dir: PathBuf) -> Dial {
     Arc::new(move |entry: &Entry| {
         let path = endpoint::fleet_socket(&socket_dir, &entry.name);
@@ -664,10 +666,9 @@ pub(crate) mod tests {
         // `fleet-box.sock`, answered by K's daemon under its trust for
         // lap.
         use crate::commands::tunnel::{self, Request, Via};
-        let socket = endpoint::fleet_socket(&pair.l_dir, "box");
         let bridge = |root: &Path| {
             let request = Request { root: root.to_path_buf(), instance: Some("web-1".into()), service: None, port: 3000 };
-            let via = Via::Fleet { socket: socket.clone(), request };
+            let via = Via::Fleet { dir: pair.l_dir.clone(), request };
             let open = tunnel::remote_opener("box".into(), Box::new(move || Ok(via.clone())));
             open(&std::sync::atomic::AtomicBool::new(false)).err()
         };
@@ -1402,6 +1403,17 @@ pub(crate) mod tests {
 
     impl Trio {
         fn new(tag: &str, introduced: bool) -> Trio {
+            Trio::build(tag, introduced, false)
+        }
+
+        /// [`Trio::new`] (not introduced) whose `member.toml`s also name
+        /// the hub (`box`): the members report their links to it and it
+        /// pushes the graph (`fleet::reports`).
+        fn hubbed(tag: &str) -> Trio {
+            Trio::build(tag, false, true)
+        }
+
+        fn build(tag: &str, introduced: bool, hubbed: bool) -> Trio {
             use crate::serve::fleet::member::{Member, write_for_test};
             use crate::serve::fleet::identity::Signer;
             use crate::serve::fleet::membership::Introduction;
@@ -1431,6 +1443,13 @@ pub(crate) mod tests {
                 }
             } else {
                 test_support::fleet_of("box", &members);
+            }
+            if hubbed {
+                for (name, toml) in members {
+                    let mut m = crate::serve::fleet::member::load(toml).unwrap().unwrap();
+                    m.hub = if name == "box" { "self" } else { "box" }.into();
+                    write_for_test(toml, &m);
+                }
             }
             crate::serve::machines::update(a_opts.machines.as_ref().unwrap(), |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
             crate::serve::machines::update(k_opts.machines.as_ref().unwrap(), |e| e.push(Entry::ssh("b", "me@b"))).unwrap();
@@ -1476,7 +1495,7 @@ pub(crate) mod tests {
     /// `member_toml`'s member opening `header` over its link in `dir`
     /// (`route::open`, its own key and log).
     fn open_routed(dir: &Path, member_toml: &Path, header: &route::Header) -> Result<UnixStream> {
-        route::open(dir, header, &test_support::key_of(member_toml), &test_support::read(member_toml).unwrap())
+        route::open(dir, header, &test_support::key_of(member_toml), &test_support::read(member_toml).unwrap(), route::OPENING)
     }
 
     /// An API connection over a routed `stream` to `dest` (the hello as
@@ -1556,6 +1575,55 @@ pub(crate) mod tests {
         let a_log = test_support::read(&trio.a_member).unwrap();
         let e = format!("{:#}", route::origin_side(&mut &stream, &mut &stream, &agent, &a_key, &a_log).unwrap_err());
         assert!(e.contains("is refused: `box`: the routed stream from `lap` to `b`: `agent` isn't routed"), "{e}");
+        trio.finish();
+    }
+
+    /// A reaches B, which it has no link to, through `route-b.sock`: its
+    /// daemon opens the stream over the graph K pushed (`lap` → `box` →
+    /// `b`), and B serves it as A's. `m` (no daemon) signs a report saying
+    /// it's linked to everyone since long ago and is always on, so its
+    /// paths sort first: `m → b` is skipped (A has no link to `m`), and to
+    /// `m` itself every path fails over to the next, the API client reading
+    /// why as its hello's answer. A has no route socket for `box`, its link.
+    #[test]
+    fn a_member_without_a_link_is_reached_through_its_route_socket() {
+        use crate::serve::fleet::graph::{LinkReport, Report, sign_report};
+        use crate::serve::fleet::reports::{Reports, Signed};
+        use crate::serve::machines::link::{Over, handshake};
+        use crate::serve::snapshots::LinkState;
+        let trio = Trio::hubbed("route-socket");
+        let m_member = trio.base.join("m-data/member.toml");
+        let genesis = test_support::read(&trio.a_member).unwrap().log.membership().unwrap().genesis;
+        let links = ["lap", "box", "b"].map(|p| LinkReport { peer: p.into(), dials: false, state: LinkState::Connected, since_ms: 1 }).to_vec();
+        let report = Report { member: "m".into(), trust: Default::default(), always_on: true, links };
+        let later = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 3_600_000;
+        let (statement, report) = sign_report(&test_support::key_of(&m_member), &genesis, &report, 0, later);
+        // Carried to K, the hub, as `lap` over A's link: K pushes it on.
+        let mut k = routed_api(link::connect(&endpoint::fleet_socket(&trio.a_dir, "box"), channel::API).unwrap(), "box");
+        let params = serde_json::to_value(Reports { reports: vec![Signed { statement, report }] }).unwrap();
+        let r = k.conn.call("fleet.graph", params).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let (to_b, to_m) = (endpoint::route_socket(&trio.a_dir, "b"), endpoint::route_socket(&trio.a_dir, "m"));
+        wait_for("A's route sockets for b and m", Duration::from_secs(15), || to_b.exists() && to_m.exists());
+        assert!(!endpoint::route_socket(&trio.a_dir, "box").exists(), "box is linked: its fleet socket serves");
+
+        let mut api = routed_api(route::connect(&trio.a_dir, "b", channel::API).unwrap(), "b");
+        let r = api.conn.call("instances.list", json!({"dir": trio.fleet_root("b", "lap")})).unwrap();
+        assert!(r.error.is_none(), "served as lap's at b: {r:?}");
+
+        let stream = route::connect(&trio.a_dir, "m", channel::API).unwrap();
+        let e = match handshake("m", Duplex::socket(stream), Duration::from_secs(20), Over::Link) {
+            Ok(_) => panic!("no path to `m` opens"),
+            Err(e) => e.to_string(),
+        };
+        for want in [
+            "no path to `m` opened: via m: no link to `m` is up here",
+            "via box → m: the routed stream with `m` is refused: `box`: the routed stream from `lap` to `m`: `m` has no link to this host",
+            "via box → b → m: the routed stream with `m` is refused: `b`:",
+            "(failed)",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
         trio.finish();
     }
 

@@ -297,6 +297,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     }
     shared.hub = Arc::new(Mutex::new(hub));
     shared.hostname = link::hostname();
+    shared.route_budget = opts.machine_timing.handshake;
     let registry_path = match &opts.machines {
         Some(path) => path.clone(),
         None => machines::path()?,
@@ -405,6 +406,21 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             log,
         })
     });
+    // A route socket per member this host has no link up to (fleet plan
+    // step 10b.5), following the graph and the links: only with a
+    // `member.toml`, as the graph.
+    let routes = shared.member.is_some().then(|| {
+        let (wanting, accepting) = (Arc::clone(&shared), Arc::clone(&shared));
+        let routes = fleet::routes::Routes::spawn(fleet::routes::Io {
+            dir: dir.to_path_buf(),
+            wanted: Box::new(move || wanting.routed_members()),
+            accept: Box::new(move |name, conn| accepting.accept_routed(name, conn)),
+            log,
+        });
+        let poke = routes.poke();
+        shared.graph.on_change(Box::new(move || poke.poke()));
+        routes
+    });
     let _ = shared.runner.set(match &opts.verbs {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
@@ -501,6 +517,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     shared.drain(DRAIN_TIMEOUT);
     drop(watcher);
+    // Its streams go over the links: stopped before them.
+    drop(routes);
     // Its calls go over the links: stopped before them.
     drop(publisher);
     // The machine links close (their ssh killed) after the connections whose
@@ -740,6 +758,10 @@ struct Shared {
     /// `graph.get`), in memory only; `fleet::reports::Publisher` keeps
     /// this host's own.
     graph: Arc<fleet::reports::Published>,
+    /// What all the paths of one routed stream this host opens share
+    /// (`fleet::routes`): the machine links' handshake wait
+    /// (`service::Timing::handshake`), a client's hello waiting as long.
+    route_budget: Duration,
 }
 
 impl Shared {
@@ -778,6 +800,7 @@ impl Shared {
             peer_env: BTreeMap::new(),
             channels: Arc::default(),
             graph: Arc::default(),
+            route_budget: service::Timing::default().handshake,
         }
     }
 
@@ -1081,6 +1104,83 @@ impl Shared {
         let socket = endpoint::fleet_socket(&self.socket_dir, next);
         fleet::link::connect(&socket, crate::devsbd::proto::channel::ROUTE)
             .map_err(|e| format!("its link to `{next}` isn't up ({}: {e})", socket.display()))
+    }
+
+    /// `name`'s link here (a machine registered or inbound) is connected.
+    fn link_up(&self, name: &str) -> bool {
+        self.links().and_then(|l| l.remotes().get(name)).is_some_and(|m| m.state == snapshots::LinkState::Connected)
+    }
+
+    /// The members this host binds a `route-<name>.sock` for
+    /// (`fleet::routes::wanted`): its graph's, but itself and those it has
+    /// a link up to. None outside a fleet's log.
+    fn routed_members(&self) -> std::collections::BTreeSet<String> {
+        let Some(member) = self.member.as_deref() else { return Default::default() };
+        let Ok(Some(stored)) = fleet::membership_api::load(member) else { return Default::default() };
+        let Ok(me) = fleet::dialer::member_name(member, &self.hostname) else { return Default::default() };
+        if stored.log.membership().is_none() {
+            return Default::default();
+        }
+        fleet::routes::wanted(&self.graph.graph(), &stored, &me, |n| self.link_up(n))
+    }
+
+    /// A connection to `dest`'s route socket (`fleet::routes`): served on
+    /// a thread of its own, counted while it lasts ([`serve_routed`](Self::serve_routed)).
+    fn accept_routed(self: &Arc<Self>, dest: &str, conn: Stream) {
+        if *self.closed.0.lock().unwrap() {
+            return;
+        }
+        let (shared, dest) = (Arc::clone(self), dest.to_string());
+        self.spawn_channel("serve-routed", move || shared.serve_routed(&dest, conn));
+    }
+
+    /// `client`'s channel byte read, a routed stream to `dest` opened on it
+    /// ([`open_routed`](Self::open_routed)) and spliced to `client` until
+    /// both ways end. None opening: logged, and an `API` client answered
+    /// why (`fleet::routes::refuse_api`); any other closed.
+    fn serve_routed(&self, dest: &str, client: Stream) {
+        let Some(byte) = fleet::link::read_channel(&client) else { return };
+        match self.open_routed(dest, byte) {
+            Ok(stream) => fleet::route::splice(client, stream),
+            Err(why) => {
+                log(&format!("fleet: a routed stream to {dest}: {why}"));
+                if byte == crate::devsbd::proto::channel::API {
+                    fleet::routes::refuse_api(&client, &why);
+                }
+            }
+        }
+    }
+
+    /// A routed stream to `dest` on channel `byte`, from this host's
+    /// identity (read now; a pending rotation's key as the link proof
+    /// picks it, `Identity::signer_for`): its graph's paths in order
+    /// (`fleet::routes::first_open`), skipping those whose first hop has
+    /// no link up here, each attempt within `fleet::routes::ATTEMPT` and
+    /// all within [`route_budget`](Self::route_budget). Else why not.
+    fn open_routed(&self, dest: &str, byte: u8) -> Result<Stream, String> {
+        let channel = fleet::route::channel_of(byte).ok_or_else(|| format!("no channel {byte}"))?;
+        let identity = self
+            .member
+            .as_deref()
+            .context("this daemon has no member.toml")
+            .and_then(|m| fleet::proof::Identity::load(m, &self.hostname))
+            .map_err(|e| format!("{e:#}"))?;
+        let me = identity.name.as_str();
+        // The channel and the names, checked once rather than per path.
+        fleet::route::Header::new(me, channel, vec![dest.to_string()]).check().map_err(|e| format!("{e:#}"))?;
+        let stored = &identity.stored;
+        let key = identity.signer_for(stored);
+        let paths = self.graph.graph().paths(stored, me, dest, fleet::graph::MAX_HOPS);
+        let deadline = Instant::now() + self.route_budget;
+        let open = |path: &[String]| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                anyhow::bail!("out of the {:?} its paths share", self.route_budget);
+            }
+            let header = fleet::route::Header::new(me, channel, path.to_vec());
+            fleet::route::open(&self.socket_dir, &header, key, stored, left.min(fleet::routes::ATTEMPT))
+        };
+        fleet::routes::first_open(&paths, |hop| self.link_up(hop), open).map_err(|failed| fleet::routes::failure(dest, &failed))
     }
 
     /// `serve` on a thread named `name`, counted in [`channels`](Self::channels)

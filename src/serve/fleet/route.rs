@@ -27,17 +27,15 @@
 //!
 //! A link end serves a `ROUTE` stream with [`serve`]: it relays it toward
 //! its next hop, or answers it as its destination; [`open`] is the
-//! origin's side over a link.
-
-// `open` has no caller but tests yet: the origin's path choice is fleet
-// plan step 10b.5.
-#![cfg_attr(not(test), allow(dead_code))]
+//! origin's side over a link (`fleet::routes` tries the graph's paths with
+//! it). [`connect`] is how every local client reaches a member: its
+//! direct link's socket, else its route socket.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -107,7 +105,7 @@ fn channel_byte(c: Channel) -> u8 {
     }
 }
 
-fn channel_of(b: u8) -> Option<Channel> {
+pub(crate) fn channel_of(b: u8) -> Option<Channel> {
     Some(match b {
         channel::API => Channel::Api,
         channel::PTY => Channel::Pty,
@@ -456,20 +454,57 @@ pub fn splice(a: UnixStream, b: UnixStream) {
 /// The origin's side over a link: a `ROUTE` stream through the link to
 /// `header`'s first hop (`fleet-<hop>.sock` in socket dir `dir`), its
 /// header written and its opening proven with `key` against `stored`
-/// ([`origin_side`], each read within [`OPENING`]); the stream, ready for
-/// the inner channel's bytes.
-pub fn open(dir: &Path, header: &Header, key: &SigningKey, stored: &Stored) -> Result<UnixStream> {
+/// ([`origin_side`]), all its reads within `budget` together (a stalled
+/// hop is a timeout, the next path's turn); the stream, ready for the
+/// inner channel's bytes.
+pub fn open(dir: &Path, header: &Header, key: &SigningKey, stored: &Stored, budget: Duration) -> Result<UnixStream> {
     header.check().with_context(|| header.what())?;
     let first = &header.path[0];
     let socket = endpoint::fleet_socket(dir, first);
     let stream = super::link::connect(&socket, channel::ROUTE)
         .with_context(|| format!("{}: no link to `{first}` is up ({})", header.what(), socket.display()))?;
-    stream.set_read_timeout(Some(OPENING)).context("cannot set a routed stream's read timeout")?;
-    let (mut r, mut w) = (&stream, &stream);
+    let mut r = Until { stream: &stream, at: Instant::now() + budget };
+    let mut w = &stream;
     write_header(&mut w, header)?;
     origin_side(&mut r, &mut w, header, key, stored)?;
     stream.set_read_timeout(None).context("cannot clear a routed stream's read timeout")?;
     Ok(stream)
+}
+
+/// Reads of `stream` that end at `at`: each waits what's left, none is
+/// left a timeout.
+struct Until<'a> {
+    stream: &'a UnixStream,
+    at: Instant,
+}
+
+impl Read for Until<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "the routed stream's opening took too long"));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+/// A stream on `channel` (its byte) to member `name`, from the socket dir
+/// `dir`: through `fleet-<name>.sock` when a link to it binds one there
+/// and answers, else through `route-<name>.sock` (`endpoint::route_socket`:
+/// the daemon opens it over its link graph's paths, `fleet::routes`). The
+/// error names both sockets.
+pub fn connect(dir: &Path, name: &str, channel: u8) -> io::Result<UnixStream> {
+    let direct = endpoint::fleet_socket(dir, name);
+    let first = match super::link::connect(&direct, channel) {
+        Ok(stream) => return Ok(stream),
+        Err(e) => e,
+    };
+    let routed = endpoint::route_socket(dir, name);
+    super::link::connect(&routed, channel).map_err(|e| {
+        let why = format!("no link to `{name}` is up ({}: {first}) nor a route to it ({}: {e})", direct.display(), routed.display());
+        io::Error::new(first.kind(), why)
+    })
 }
 
 /// `header`'s body unchecked, for tests to send what [`write_header`]
@@ -804,6 +839,35 @@ mod tests {
         let e = err(origin_side(&mut r, &mut w, &h, &key(1), &stored()));
         assert_eq!(e, "the routed stream with `b` is refused: `k`: the routed stream from `lap` to `b`: its link to `b` is unreachable");
         assert!(hop.join().unwrap().is_err());
+    }
+
+    /// The link's socket first; without one (or a dead one) the route
+    /// socket; neither, an error naming both.
+    #[test]
+    fn connect_prefers_the_link_then_the_route() {
+        let dir = std::env::temp_dir().join(format!("dsv-route-connect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_byte = |l: &std::os::unix::net::UnixListener| {
+            let (s, _) = l.accept().unwrap();
+            let mut b = [0u8; 1];
+            (&s).read_exact(&mut b).unwrap();
+            b[0]
+        };
+        let e = connect(&dir, "b", channel::API).unwrap_err().to_string();
+        assert!(e.starts_with("no link to `b` is up (") && e.contains("fleet-b.sock") && e.contains("nor a route to it (") && e.contains("route-b.sock"), "{e}");
+        let routed = std::os::unix::net::UnixListener::bind(endpoint::route_socket(&dir, "b")).unwrap();
+        let _s = connect(&dir, "b", channel::PTY).unwrap();
+        assert_eq!(first_byte(&routed), channel::PTY);
+        // A leftover link socket nobody listens on: the route still.
+        drop(std::os::unix::net::UnixListener::bind(endpoint::fleet_socket(&dir, "b")).unwrap());
+        let _s = connect(&dir, "b", channel::API).unwrap();
+        assert_eq!(first_byte(&routed), channel::API);
+        std::fs::remove_file(endpoint::fleet_socket(&dir, "b")).unwrap();
+        let direct = std::os::unix::net::UnixListener::bind(endpoint::fleet_socket(&dir, "b")).unwrap();
+        let _s = connect(&dir, "b", channel::TUNNEL).unwrap();
+        assert_eq!(first_byte(&direct), channel::TUNNEL);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

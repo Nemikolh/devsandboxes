@@ -315,6 +315,18 @@ the local daemon up (`idle::Holders::links`). On the machine it's an [inbound ne
 (`links.inbound`), its streams clients like any other, and the machine
 holds a link back over it to this host.
 
+The socket dir holds one `fleet-<name>.sock` per link up (or coming
+up), bound by the link's local end, and the daemon's own
+`route-<member>.sock` for each member of its link graph it has no link
+up to, which opens routed streams to that member over the graph's paths
+([fleet](fleet.md#routed-streams), *The requester*). A link coming up
+unbinds that member's route socket, a link going down binds it again.
+`route::connect` tries the link's socket first, then the route socket;
+the held link's own dial (`Dial`) only ever uses the link's socket. The
+CLI's look for inbound machines (`cli::foreign_link_sockets`) counts
+`fleet-*.sock` files only, so a route socket is never taken for a
+machine.
+
 ## Forwarded requests
 
 A request carrying `machine` (neither registered nor an inbound neighbor

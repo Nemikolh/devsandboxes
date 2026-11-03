@@ -35,7 +35,6 @@ use sha2::{Digest, Sha256};
 
 use super::transfer::{self, Header, Received, Receivers};
 use crate::config::{Build, Config, MountContext, Placement, ResolvedSandbox};
-use crate::serve::endpoint;
 use crate::worker_policy::{self, Allow, Policy, Refusal};
 
 /// A config root's tar: [`tar`], unpacked under `roots/<hash>/`.
@@ -103,22 +102,25 @@ pub trait Transfer {
 }
 
 /// [`Transfer`] over a worker's link: each send one `TRANSFER` stream
-/// through its `fleet-link`'s socket (`endpoint::fleet_socket`).
+/// through its link's socket, else its route socket
+/// (`fleet::route::connect`).
 pub struct LinkTransfer {
-    pub socket: PathBuf,
+    /// The socket dir.
+    pub dir: PathBuf,
+    pub worker: String,
 }
 
 impl LinkTransfer {
-    /// The socket of `worker`'s link in the socket dir `dir`.
+    /// `worker`, its sockets in the socket dir `dir`.
     pub fn for_worker(dir: &Path, worker: &str) -> LinkTransfer {
-        LinkTransfer { socket: endpoint::fleet_socket(dir, worker) }
+        LinkTransfer { dir: dir.to_path_buf(), worker: worker.to_string() }
     }
 }
 
 impl Transfer for LinkTransfer {
     fn send(&self, header: &Header, body: &mut dyn Read) -> Result<()> {
-        let stream = super::link::connect(&self.socket, crate::devsbd::proto::channel::TRANSFER)
-            .with_context(|| format!("cannot reach the worker's link at {}", self.socket.display()))?;
+        let stream = super::route::connect(&self.dir, &self.worker, crate::devsbd::proto::channel::TRANSFER)
+            .with_context(|| format!("cannot reach the worker `{}`", self.worker))?;
         transfer::send(stream, header, body)
     }
 }
@@ -607,6 +609,7 @@ mod tests {
 
     use super::repo::tests::{git, origin_and_checkout, scratch};
     use super::*;
+    use crate::serve::endpoint;
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
@@ -918,7 +921,7 @@ mod tests {
         // `../lib`: a second repo, same origin, on `feature`.
         git(&dir, &["clone", "-q", "-b", "feature", dir.join("origin.git").to_str().unwrap(), "lib"]);
         let fleet = dir.join("worker/fleet/hub");
-        let t = LinkTransfer { socket: link(&dir, &fleet) };
+        let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
         let repos = dir.join("hub-data/repos");
 
         let got = prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
