@@ -115,6 +115,8 @@ pub enum Channel {
     /// This host's ssh agent, while its registry entry for the peer has
     /// `agent` on.
     Agent,
+    /// A routed stream to relay or answer (`fleet::route`).
+    Route,
 }
 
 impl Channel {
@@ -125,6 +127,7 @@ impl Channel {
             "tunnel" => Channel::Tunnel,
             "transfer" => Channel::Transfer,
             "agent" => Channel::Agent,
+            "route" => Channel::Route,
             _ => return None,
         })
     }
@@ -136,6 +139,7 @@ impl Channel {
             Channel::Tunnel => "tunnel",
             Channel::Transfer => "transfer",
             Channel::Agent => "agent",
+            Channel::Route => "route",
         }
     }
 }
@@ -161,7 +165,7 @@ pub fn attach_params(params: &Value) -> Result<Attach, ApiError> {
     let channel = match params.get("channel") {
         None | Some(Value::Null) => return Err(ApiError::invalid("`link.attach` needs `channel`")),
         Some(Value::String(s)) => Channel::parse(s)
-            .ok_or_else(|| ApiError::invalid(format!("no channel `{s}` (api, pty, tunnel, transfer or agent)")))?,
+            .ok_or_else(|| ApiError::invalid(format!("no channel `{s}` (api, pty, tunnel, transfer, agent or route)")))?,
         Some(_) => return Err(ApiError::invalid("`channel` must be a string")),
     };
     crate::serve::machines::check_name(&name).map_err(|e| ApiError::invalid(format!("`peer`: {e:#}")))?;
@@ -914,7 +918,7 @@ mod tests {
     #[test]
     fn an_attach_names_a_channel_a_machine_name_and_its_key() {
         let key = pk(1);
-        for c in ["api", "pty", "tunnel", "transfer", "agent"] {
+        for c in ["api", "pty", "tunnel", "transfer", "agent", "route"] {
             let a = attach_params(&json!({"peer": "lap.local", "channel": c, "key": key.to_string()})).unwrap();
             assert_eq!(a, Attach { name: "lap.local".into(), channel: Channel::parse(c).unwrap(), key, introduced_by: None });
         }

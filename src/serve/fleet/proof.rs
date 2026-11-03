@@ -58,8 +58,8 @@ const SMALL: usize = 4096;
 /// The bound of a `sync` message's body (entries and introductions as JSON).
 const SYNC_LIMIT: usize = 8 << 20;
 
-const MESSAGE: u8 = 0;
-const REFUSAL: u8 = 1;
+pub(crate) const MESSAGE: u8 = 0;
+pub(crate) const REFUSAL: u8 = 1;
 
 /// What every refusal for a missing identity ends with (decision 52).
 const MAKE_AGAIN: &str = "a fleet link proves both members' keys against the fleet's membership log: make the fleet again with `devsandbox machine add`";
@@ -165,7 +165,7 @@ struct Hello {
 }
 
 /// `field` length-prefixed (u32 big-endian) onto `out`.
-fn put(out: &mut Vec<u8>, field: &[u8]) {
+pub(crate) fn put(out: &mut Vec<u8>, field: &[u8]) {
     let len = u32::try_from(field.len()).expect("a link proof field under 4 GiB");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(field);
@@ -180,10 +180,10 @@ fn put_head(out: &mut Vec<u8>, head: &Head) {
 }
 
 /// Reads [`put`]'s fields back, refusing anything short or left over.
-struct Fields<'a>(&'a [u8]);
+pub(crate) struct Fields<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Fields<'a> {
-    fn next(&mut self) -> Result<&'a [u8]> {
+    pub(crate) fn next(&mut self) -> Result<&'a [u8]> {
         let (len, rest) = self.0.split_at_checked(4).context("a truncated field")?;
         let len = u32::from_be_bytes(len.try_into().expect("4 bytes")) as usize;
         let (field, rest) = rest.split_at_checked(len).context("a truncated field")?;
@@ -191,11 +191,16 @@ impl<'a> Fields<'a> {
         Ok(field)
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.next()?.try_into().map_err(|_| anyhow!("a field of the wrong size"))
     }
 
-    fn end(&self) -> Result<()> {
+    /// Whether every field has been read.
+    pub(crate) fn done(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn end(&self) -> Result<()> {
         if !self.0.is_empty() {
             bail!("trailing bytes");
         }
@@ -257,7 +262,7 @@ fn signed(transcript: &[u8], side: Side) -> Vec<u8> {
     out
 }
 
-fn write_raw(w: &mut impl Write, tag: u8, body: &[u8]) -> Result<()> {
+pub(crate) fn write_raw(w: &mut impl Write, tag: u8, body: &[u8]) -> Result<()> {
     let len = u32::try_from(body.len() + 1).context("a link proof message too long")?;
     w.write_all(&len.to_be_bytes())?;
     w.write_all(&[tag])?;
@@ -266,35 +271,64 @@ fn write_raw(w: &mut impl Write, tag: u8, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// One message, bounded by `limit`: its body, or the peer's refusal as an
-/// error.
-fn read_raw(r: &mut impl Read, limit: usize, peer: &str) -> Result<Vec<u8>> {
+/// One message read off the pipe ([`read_frame`]).
+pub(crate) enum Frame {
+    Message(Vec<u8>),
+    /// The other end's refusal: why, in its words.
+    Refusal(String),
+}
+
+/// Why [`read_frame`] read no [`Frame`], for its caller to word.
+pub(crate) enum Bad {
+    Closed(std::io::Error),
+    /// A length of 0 or over the bound (tag byte included).
+    Size(usize),
+    Tag(u8),
+}
+
+/// One message, bounded by `limit` (its body; the tag byte comes on top).
+pub(crate) fn read_frame(r: &mut impl Read, limit: usize) -> Result<Frame, Bad> {
     let mut len = [0u8; 4];
-    r.read_exact(&mut len).with_context(|| format!("`{peer}` closed the link during the key proof"))?;
+    r.read_exact(&mut len).map_err(Bad::Closed)?;
     let len = u32::from_be_bytes(len) as usize;
     if len == 0 || len > limit + 1 {
-        bail!("`{peer}` sent a key proof message of {len} bytes (at most {})", limit + 1);
+        return Err(Bad::Size(len));
     }
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).with_context(|| format!("`{peer}` closed the link during the key proof"))?;
+    r.read_exact(&mut buf).map_err(Bad::Closed)?;
     match buf[0] {
-        MESSAGE => Ok(buf.split_off(1)),
-        REFUSAL => bail!("`{peer}` refused the link: {}", String::from_utf8_lossy(&buf[1..])),
-        tag => bail!("`{peer}` sent a key proof message tagged {tag}"),
+        MESSAGE => Ok(Frame::Message(buf.split_off(1))),
+        REFUSAL => Ok(Frame::Refusal(String::from_utf8_lossy(&buf[1..]).into_owned())),
+        tag => Err(Bad::Tag(tag)),
     }
 }
 
-/// The ordered exchange of one round's messages (module doc).
-struct Chan<'a, R, W> {
-    side: Side,
-    r: &'a mut R,
-    w: &'a mut W,
-    peer: &'a str,
+/// One message, bounded by `limit`: its body, or the peer's refusal as an
+/// error.
+fn read_raw<R: Read>(r: &mut R, limit: usize, peer: &str) -> Result<Vec<u8>> {
+    match read_frame(r, limit) {
+        Ok(Frame::Message(body)) => Ok(body),
+        Ok(Frame::Refusal(why)) => bail!("`{peer}` refused the link: {why}"),
+        Err(Bad::Closed(e)) => Err(anyhow::Error::new(e).context(format!("`{peer}` closed the link during the key proof"))),
+        Err(Bad::Size(len)) => bail!("`{peer}` sent a key proof message of {len} bytes (at most {})", limit + 1),
+        Err(Bad::Tag(tag)) => bail!("`{peer}` sent a key proof message tagged {tag}"),
+    }
+}
+
+/// The ordered exchange of one round's messages (module doc), each read
+/// with `read` (its words for a close or a refusal: [`read_raw`]'s here,
+/// `route`'s for a routed opening).
+pub(crate) struct Chan<'a, R, W> {
+    pub(crate) side: Side,
+    pub(crate) r: &'a mut R,
+    pub(crate) w: &'a mut W,
+    pub(crate) peer: &'a str,
+    pub(crate) read: fn(&mut R, usize, &str) -> Result<Vec<u8>>,
 }
 
 impl<R: Read, W: Write> Chan<'_, R, W> {
     /// Write ours (or our refusal, which ends the proof with `Err(why)`).
-    fn send(&mut self, ours: Result<Vec<u8>, String>) -> Result<()> {
+    pub(crate) fn send(&mut self, ours: Result<Vec<u8>, String>) -> Result<()> {
         match ours {
             Ok(body) => write_raw(self.w, MESSAGE, &body),
             Err(why) => {
@@ -306,14 +340,14 @@ impl<R: Read, W: Write> Chan<'_, R, W> {
 
     /// One round: the opener writes then reads, the answerer reads then
     /// writes.
-    fn exchange(&mut self, ours: Result<Vec<u8>, String>, limit: usize) -> Result<Vec<u8>> {
+    pub(crate) fn exchange(&mut self, ours: Result<Vec<u8>, String>, limit: usize) -> Result<Vec<u8>> {
         match self.side {
             Side::Opener => {
                 self.send(ours)?;
-                read_raw(self.r, limit, self.peer)
+                (self.read)(self.r, limit, self.peer)
             }
             Side::Answerer => {
-                let theirs = read_raw(self.r, limit, self.peer)?;
+                let theirs = (self.read)(self.r, limit, self.peer)?;
                 self.send(ours)?;
                 Ok(theirs)
             }
@@ -366,7 +400,7 @@ pub(crate) fn resolve(stored: &Stored, name: &str) -> Option<(PublicKey, Option<
     stored.introductions.iter().find(|i| i.name == name).map(|i| (i.key, Some(i.introducer.clone())))
 }
 
-fn encode_proof(key: &PublicKey, sig: &Signature) -> Vec<u8> {
+pub(crate) fn encode_proof(key: &PublicKey, sig: &Signature) -> Vec<u8> {
     let mut out = Vec::new();
     put(&mut out, key.as_bytes());
     put(&mut out, &sig.to_bytes());
@@ -382,8 +416,16 @@ fn decode_proof(body: &[u8]) -> Result<(PublicKey, Signature)> {
 }
 
 /// The peer's proof checked: its key is the one its name resolved to (a
-/// revoked one, or another, refused) and it signed `message` with it.
-fn check_proof(body: &[u8], expected: &PublicKey, stored: &Stored, peer: &str, message: &[u8]) -> Result<PublicKey, String> {
+/// revoked one, or another, refused) and it signed `message` with it in
+/// `domain`.
+pub(crate) fn check_proof(
+    body: &[u8],
+    expected: &PublicKey,
+    stored: &Stored,
+    peer: &str,
+    domain: &'static str,
+    message: &[u8],
+) -> Result<PublicKey, String> {
     let (key, sig) = decode_proof(body).map_err(|e| format!("`{peer}`'s key proof is malformed: {e:#}"))?;
     if key != *expected {
         let revoked = stored.log.membership().is_some_and(|m| m.revoked.contains(&key));
@@ -393,7 +435,7 @@ fn check_proof(body: &[u8], expected: &PublicKey, stored: &Stored, peer: &str, m
             format!("`{peer}` proved key {}, not its key in this fleet's membership log ({})", key.fingerprint(), expected.fingerprint())
         });
     }
-    key.verify(DOMAIN, message, &sig).map_err(|_| format!("`{peer}`'s key proof doesn't verify: a bad signature"))?;
+    key.verify(domain, message, &sig).map_err(|_| format!("`{peer}`'s key proof doesn't verify: a bad signature"))?;
     Ok(key)
 }
 
@@ -403,7 +445,7 @@ fn check_proof(body: &[u8], expected: &PublicKey, stored: &Stored, peer: &str, m
 pub fn prove(side: Side, r: &mut impl Read, w: &mut impl Write, auth: &Auth, ours: (&str, u32), theirs: (&str, u32)) -> Result<Proven> {
     let id = &auth.identity;
     let peer = auth.expect.as_str();
-    let mut chan = Chan { side, r, w, peer };
+    let mut chan = Chan { side, r, w, peer, read: read_raw };
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| anyhow!("cannot read the OS random source: {e}"))?;
     let mine = Hello { name: id.name.clone(), nonce, head: id.stored.log.head() };
@@ -449,14 +491,14 @@ pub fn prove(side: Side, r: &mut impl Read, w: &mut impl Write, auth: &Auth, our
             let theirs_proof = chan.exchange(resolved.as_ref().map(|(merged, _)| proof(merged)).map_err(Clone::clone), SMALL)?;
             let (merged, found) = resolved.expect("refused above otherwise");
             // 4. confirm: our verdict on theirs.
-            let verdict = check_proof(&theirs_proof, &found.0, &merged, peer, &signed(&t, side.other()));
+            let verdict = check_proof(&theirs_proof, &found.0, &merged, peer, DOMAIN, &signed(&t, side.other()));
             chan.send(verdict.map(|_| Vec::new()))?;
             (merged, found)
         }
         Side::Answerer => {
             let theirs_proof = read_raw(chan.r, SMALL, peer)?;
             let verdict = resolved.and_then(|(merged, found)| {
-                check_proof(&theirs_proof, &found.0, &merged, peer, &signed(&t, side.other())).map(|_| (merged, found))
+                check_proof(&theirs_proof, &found.0, &merged, peer, DOMAIN, &signed(&t, side.other())).map(|_| (merged, found))
             });
             chan.send(verdict.as_ref().map(|(merged, _)| proof(merged)).map_err(Clone::clone))?;
             read_raw(chan.r, SMALL, peer)?;

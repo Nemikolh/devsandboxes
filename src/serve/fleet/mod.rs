@@ -69,6 +69,7 @@ pub mod placed;
 pub mod proof;
 pub mod proposals;
 pub mod reports;
+pub mod route;
 pub mod pty;
 pub mod pty_client;
 pub mod transfer;

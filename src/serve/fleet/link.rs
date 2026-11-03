@@ -99,6 +99,7 @@ pub const fn cap_of(channel: u8) -> Option<u32> {
         channel::PTY => Some(caps::PTY),
         channel::TUNNEL => Some(caps::TUNNEL),
         channel::AGENT => Some(caps::AGENT),
+        channel::ROUTE => Some(caps::ROUTE),
         _ => None,
     }
 }
@@ -1144,7 +1145,7 @@ mod tests {
 
     #[test]
     fn link_channels_flow_and_have_caps() {
-        for ch in [channel::API, channel::TRANSFER, channel::PTY, channel::TUNNEL, channel::AGENT] {
+        for ch in [channel::API, channel::TRANSFER, channel::PTY, channel::TUNNEL, channel::AGENT, channel::ROUTE] {
             assert!(proto::channel::flows(ch), "{ch}");
             assert!(cap_of(ch).is_some(), "{ch}");
         }
@@ -1152,7 +1153,8 @@ mod tests {
         assert!(!proto::channel::flows(channel::SSH_AGENT));
         assert_eq!(cap_of(channel::SSH_AGENT), Some(caps::SSH_AGENT));
         assert_eq!(cap_of(channel::RPC), None);
-        let all = [channel::API, channel::TRANSFER, channel::PTY, channel::TUNNEL, channel::AGENT, channel::SSH_AGENT].map(|c| cap_of(c).unwrap());
+        let all = [channel::API, channel::TRANSFER, channel::PTY, channel::TUNNEL, channel::AGENT, channel::ROUTE, channel::SSH_AGENT]
+            .map(|c| cap_of(c).unwrap());
         assert_eq!(all.iter().fold(0, |a, c| a | c).count_ones(), all.len() as u32, "distinct bits");
     }
 

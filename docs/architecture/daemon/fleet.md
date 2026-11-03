@@ -1635,6 +1635,51 @@ The fleet's links are the members' own signed reports: the model in
   `graph.get` answers it to local clients (`lent::admit` refuses
   `graph.*` over a link).
 
+#### Routed streams
+
+A routed stream is a link stream on its own channel, `ROUTE` (11,
+`caps::ROUTE`; host-to-host only, the in-container helper never opens
+or serves it), that reaches its destination through other members. Its
+opening is `src/serve/fleet/route.rs`, over any byte pipe, on the key
+proof's framing (`proof::write_raw`, `proof::read_frame`, `proof::Chan`:
+a `u32` length, a tag byte, a message or a refusal, the body). Each
+refuser writes its refusal naming itself (`route::refuse`), so the
+origin reads which hop refused and why.
+
+- **The header** (`route::Header`, the stream's first message, at most
+  `route::HEADER_LIMIT`, 4 KiB): the destination, the origin, the inner
+  channel, the path (the hops after the origin, ending in the
+  destination) and a TTL, each field length-prefixed. `Header::new` sets
+  the TTL to `graph::MAX_HOPS` (4). Every hop that reads it
+  (`route::read_header`) checks it (`Header::check`): the channel is
+  `API`, `PTY`, `TUNNEL` or `TRANSFER` (`AGENT` stays direct-only; a
+  route carries no route), the TTL is 1 to 4, the path is 1 to 4 hops
+  and ends in the destination, every name is a member name, and neither
+  the origin nor any hop comes twice (a loop). `route::write_header`
+  checks the same before writing.
+- **A relay** (`route::relay_header`): it is on the path and not its
+  end, the TTL covers the hops left from it, its next hop and the
+  destination resolve in its log or held introductions
+  (`proof::resolve`); it forwards the header with the TTL one lower to
+  the next hop (`route::Hop`) and splices the rest unread.
+- **The proof** (decision 54), after the header: the destination
+  (`route::dest_side`) resolves the origin (a log member, or a held
+  introduction, capped) and sends a challenge, a 32-byte nonce from the
+  OS RNG. The origin (`route::origin_side`) answers with its own nonce,
+  its key and its signature, in `route::DOMAIN`
+  (`devsandbox/route/v1`, apart from the link proof's), over the
+  transcript (`route::transcript`: the fleet's genesis hash, origin,
+  destination, channel, path and both nonces; not the TTL, which each
+  relay lowers) and its role (`origin`). The destination checks the key
+  is the one the origin's name resolved to (a revoked key says so) and
+  the signature (`proof::check_proof`), then proves itself back the
+  same way in its role (`destination`); the origin checks that key is
+  the destination's, so a relay answering in its place is refused, and
+  sends its verdict (empty, or a refusal). A fresh nonce on each side
+  means no recorded proof verifies again. The destination comes out
+  with `route::Routed` (the origin, its proven key, its introducer, the
+  inner channel); the inner channel's bytes follow the verdict.
+
 ### Trust
 
 `member.toml`'s `trust` is this member's own setting, changed only on it:

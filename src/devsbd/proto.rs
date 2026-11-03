@@ -84,13 +84,19 @@ pub mod channel {
     /// opened toward a peer that advertised `caps::AGENT`; never used with a
     /// container.
     pub const AGENT: u8 = 10;
+    /// A routed stream between two hosts' `serve::fleet::link` ends: a
+    /// header naming its origin, destination, inner channel and path, then
+    /// the origin's proof (`serve::fleet::route`), spliced on by each relay;
+    /// opened toward a peer that advertised `caps::ROUTE`; never used with a
+    /// container.
+    pub const ROUTE: u8 = 11;
 
     /// Whether `Open` on `channel` makes a flow-controlled stream (window
     /// credit, `Eof` half-close, its own writer thread, like `Connect`) rather
     /// than a legacy one. A property of the channel, so both ends agree
     /// without a flag on the wire.
     pub const fn flows(channel: u8) -> bool {
-        matches!(channel, RPC | API | TRANSFER | PTY | TUNNEL | AGENT)
+        matches!(channel, RPC | API | TRANSFER | PTY | TUNNEL | AGENT | ROUTE)
     }
 }
 
@@ -142,6 +148,10 @@ pub mod caps {
     /// The peer answers `channel::AGENT` streams (a fleet link's end).
     #[allow(dead_code)] // host-only: devsbd never sends it
     pub const AGENT: u32 = 1 << 10;
+    /// The peer relays or answers `channel::ROUTE` streams (a fleet link's
+    /// end).
+    #[allow(dead_code)] // host-only: devsbd never sends it
+    pub const ROUTE: u32 = 1 << 11;
 }
 
 /// Upper bound on the processes one `PortInfo` lists; the helper stops

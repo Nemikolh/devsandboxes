@@ -164,7 +164,7 @@ connection is a remote caller's (*Remote callers*); there is no way back.
 
 | params | result | errors |
 |---|---|---|
-| `{"peer": name, "channel": "api" \| "pty" \| "tunnel" \| "transfer" \| "agent", "key": "ed25519:<hex>", "introduced_by"?: name}`: `peer` 1 to 255 bytes, a machine name (letters, digits, `.`, `_`, `-`, not starting with `.` or `-`), logged; `channel` required; `key` required, the member key the link proved for the peer; `introduced_by` its introducer when it's held as an introduction (capped), else absent or `null` | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer`, a missing or bad `channel` or `key`, a bad `introduced_by`; bytes past the attach line already sent, or a subscribed connection, for a channel other than `api`), `failed` (no data dir for the fleet root) |
+| `{"peer": name, "channel": "api" \| "pty" \| "tunnel" \| "transfer" \| "agent" \| "route", "key": "ed25519:<hex>", "introduced_by"?: name}`: `peer` 1 to 255 bytes, a machine name (letters, digits, `.`, `_`, `-`, not starting with `.` or `-`), logged; `channel` required; `key` required, the member key the link proved for the peer; `introduced_by` its introducer when it's held as an introduction (capped), else absent or `null` | `{"ok": true, "trust": "worker" \| "full"}`, this member's trust at the time | `denied` (a remote caller's connection already, a second attach included, or a connection of another uid), `invalid` (a bad `peer`, a missing or bad `channel` or `key`, a bad `introduced_by`; bytes past the attach line already sent, or a subscribed connection, for a channel other than `api`), `failed` (no data dir for the fleet root) |
 
 The caller is link peer `peer`, which proved `key`: its fleet root is
 `fleet/<peer>/` in the data dir (created by the attach), its `fleet.*`
@@ -184,6 +184,8 @@ relayed agent (`agent-link-<peer>.sock`) while that answers.
   root; `agent` this host's ssh agent (a `1` byte, then the relay) while
   this host's `machines.toml` has an entry named `peer` with `agent` on,
   else a `0` byte and the close.
+- `route`: answered, then the connection closes: the daemon serves no
+  routed stream (`Shared::serve_channel`).
 
 The client sends nothing after the attach line until it has read the
 answer: bytes the daemon already holds past the line refuse the attach

@@ -965,6 +965,7 @@ impl Shared {
     /// - `agent`: `fleet::agent::answer` with this host's agent while this
     ///   host's registry has an entry named the peer with `agent` on, else
     ///   with none (its `NOT_SERVING` byte, then the close).
+    /// - `route`: refused (no relay or destination serves one yet).
     ///
     /// `false`, `stream` dropped: refused, or the daemon is stopping.
     fn serve_channel(self: &Arc<Self>, channel: lent::Channel, peer: &Arc<lent::Peer>, stream: Stream) -> bool {
@@ -1005,6 +1006,7 @@ impl Shared {
                     fleet::agent::answer(stream, agent);
                 })
             }
+            lent::Channel::Route => false,
         }
     }
 

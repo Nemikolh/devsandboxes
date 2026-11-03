@@ -166,7 +166,10 @@ Start with `docs/README.md` (reading order and map) and
   reports and `Graph::paths` over them, pure), `reports.rs` (this host's
   report from its links, debounced, sent to the hub as `fleet.report`; the
   hub's pushes and each link-up's `fleet.graph` exchange on the
-  `serve-fleet-graph` thread; the in-memory graph `graph.get` answers).
+  `serve-fleet-graph` thread; the in-memory graph `graph.get` answers),
+  `route.rs` (a routed `ROUTE` stream's opening: the header a relay
+  checks and forwards, the origin's and destination's challenge-response
+  on `proof`'s framing; not served yet).
   `src/key_guard.rs` refuses any
   container bind or build path covering the member key.
   `snapshots.rs`'s `merge` builds the federated

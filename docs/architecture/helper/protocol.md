@@ -76,10 +76,13 @@ daemon's API. `TRANSFER` = 7: never on a container's link either; one bulk
 transfer between two hosts' link ends (a header line, the body, a one-line
 answer: [fleet](../daemon/fleet.md#transfer)), opened by either end toward
 a peer advertising `caps::TRANSFER`. `PTY` = 8 (an interactive terminal),
-`TUNNEL` = 9 (a forward's bridge, its `Connect` streams inside) and
+`TUNNEL` = 9 (a forward's bridge, its `Connect` streams inside),
 `AGENT` = 10 (one ssh-agent connection: the flowing sibling of the
-containers' `SSH_AGENT`): host-to-host only as well, opened by either end
-toward a peer advertising `caps::PTY` / `caps::TUNNEL` / `caps::AGENT`, a
+containers' `SSH_AGENT`) and `ROUTE` = 11 (a routed stream: its header
+and origin proof, then an inner channel's bytes,
+[fleet](../daemon/fleet.md#routed-streams)): host-to-host only as well,
+opened by either end toward a peer advertising `caps::PTY` /
+`caps::TUNNEL` / `caps::AGENT` / `caps::ROUTE`, a
 stream's header in its first bytes, as `TRANSFER`'s is (the `Open` payload
 stays one channel byte). A `PTY` stream carries [RPC](#rpc) records, its
 header a `session.attach` `call`, the rest relayed to and from the
@@ -91,7 +94,7 @@ table of channels it serves (`serve::fleet::link::Serves`).
 Whether a channel's streams are legacy or flow-controlled (see
 [Mux](#mux)) is a property of the channel, `proto::channel::flows`, so both
 ends agree without a flag on the wire: `RPC`, `API`, `TRANSFER`, `PTY`,
-`TUNNEL` and `AGENT` flow, the rest are legacy.
+`TUNNEL`, `AGENT` and `ROUTE` flow, the rest are legacy.
 
 ### Caps
 
@@ -101,8 +104,8 @@ Bitset, unknown bits ignored: `TCP_FORWARD` (daemon serves `Connect`),
 `devsbd/src/daemon.rs`), `SSH_AGENT`, `NOTIFY`, `CONTROL` (host serves
 those channels), `API` (a fleet link's answerer serves `channel::API`;
 host-to-host only), `TRANSFER` (the peer receives `channel::TRANSFER`;
-both ends of a fleet link, host-to-host only), `PTY`, `TUNNEL`, `AGENT`
-(bits 8–10: the peer serves that channel; host-to-host only). A link end
+both ends of a fleet link, host-to-host only), `PTY`, `TUNNEL`, `AGENT`,
+`ROUTE` (bits 8–11: the peer serves that channel; host-to-host only). A link end
 advertises the caps of the channels it serves
 (`serve::fleet::link::cap_of`). The host sends
 `Caps` after the handshake (`SSH_AGENT` only when it has a live agent;
