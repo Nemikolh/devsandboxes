@@ -864,10 +864,11 @@ and 16 do, 44-47 as step 10 does, 48-52 as step 10a does.
       may run on): explicit and self-documenting, even where inference
       would let it move.
 
-    As built (inferred, `code::ties`): any tie keeps the sandbox home,
+    As built (`code::ties`): any tie keeps the sandbox home,
     whatever a worker's trust or allowances (per-host satisfaction waits
     on decision 41), and a tied `run --place` runs here with a note
-    before the hub is asked.
+    before the hub is asked. The pin is `placement = "home"` only (no
+    member lists), reported as the first tie.
 41. The target model is named host resources: a config names what it
     needs (a mount of resource `gh-auth`, say), each member maps names to
     its own paths, and a sandbox is placeable on members that provide

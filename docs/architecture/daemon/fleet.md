@@ -684,8 +684,11 @@ A sandbox with ties (below) is `NotMovable` before any fetch, its ties
 the why.
 
 **Ties** (`ties`, `ties_of`; fleet plan decision 40). What keeps a
-sandbox on its host, inferred from the merged config before anything
-moves: what a [worker policy](#worker-policy) with no allowances would
+sandbox on its host, known from the merged config before anything
+moves. First the pin: a sandbox with `placement = "home"`
+(`config::Placement::Home`, through `extends` like any scalar) is tied,
+as `` `placement = "home"` ``, even where nothing else would keep it.
+Then what's inferred: what a [worker policy](#worker-policy) with no allowances would
 refuse, with the config root and the folders that move with it
 (`folder`, `folders` entries outside the root) as the only paths that
 travel. From the config, every `worker_policy::Policy::config_refusals`

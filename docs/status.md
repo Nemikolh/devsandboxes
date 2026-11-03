@@ -472,7 +472,8 @@ limitation means editing this file in the same commit.
   home whatever a worker's trust or `member.toml` allowances: nothing
   checks whether another host could satisfy it until named host
   resources (fleet plan decision 41). X11 has no check of its own beyond
-  its bind. Pinning (`placement = "home"`) isn't there yet.
+  its bind. A pin names only home (`placement = "home"`): a list of the
+  members a sandbox may run on isn't built.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::ties`
 - After a worker's downgrade, a dashboard or other long-lived client still
   running the replaced, newer binary hands the new daemon off again at its

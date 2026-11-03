@@ -174,6 +174,11 @@ pub struct SandboxProperties {
     /// _Ownership_). Separate from `dispatcher`, which only grants child ops.
     /// Checked on every request, so excluded from `config_hash`.
     pub inbox: Option<bool>,
+    /// `placement = "home"` pins the sandbox to the host whose config names
+    /// it: a `run --place` runs it here (fleet plan decision 40, reported as
+    /// a tie by `serve::fleet::code::ties`). Host-side only, so excluded
+    /// from `config_hash`.
+    pub placement: Option<Placement>,
 
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
@@ -246,6 +251,14 @@ pub enum Autostart {
     Devsandbox,
     /// The container runtime restarts the containers on boot.
     Runtime,
+}
+
+/// `placement`: where a placed `run` may put the sandbox. Only `"home"`
+/// (the host whose config names it) exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Placement {
+    Home,
 }
 
 /// `dispatcher = { spawn = [...], max-instances = N }`.
@@ -1237,11 +1250,12 @@ fn config_hash(table: &Table) -> String {
 }
 
 /// [`config_hash`] of a merged sandbox table minus the keys that apply without
-/// recreating the container (`autostart`, `dispatcher`, `inbox`, the host-side
-/// `forwardPorts`), so changing them isn't drift.
+/// recreating the container (`autostart`, `dispatcher`, `inbox`, `placement`,
+/// the host-side `forwardPorts`), so changing them isn't drift.
 fn sandbox_hash(table: &Table) -> String {
     let mut table = table.clone();
     table.remove("autostart");
+    table.remove("placement");
     table.remove("dispatcher");
     table.remove("inbox");
     table.remove("forwardPorts");
@@ -1699,6 +1713,27 @@ folders = { "/workspaces/docs" = "../docs", "/workspaces/lib" = { path = "../lib
     }
 
     #[test]
+    fn placement_parses_merges_and_is_not_drift() {
+        let config = Config::parse(
+            "[template.pinned]\nplacement = \"home\"\n\
+             [sandbox.a]\nfolder = \".\"\nextends = [\"pinned\"]\n\
+             [sandbox.b]\nfolder = \".\"\nplacement = \"home\"\n\
+             [sandbox.c]\nfolder = \".\"\n",
+        )
+        .unwrap();
+        let placement = |s| config.resolve_sandbox(s).unwrap().properties.placement;
+        assert_eq!(placement("a"), Some(Placement::Home));
+        assert_eq!(placement("b"), Some(Placement::Home));
+        assert_eq!(placement("c"), None);
+        let hash = |s| config.resolve_sandbox(s).unwrap().config_hash;
+        assert_eq!(hash("a"), hash("c"));
+        assert_eq!(hash("b"), hash("c"));
+        let bad = Config::parse("[sandbox.a]\nplacement = \"anywhere\"\n").unwrap();
+        let err = format!("{:#}", bad.resolve_sandbox("a").unwrap_err());
+        assert!(err.contains("anywhere") && err.contains("home"), "{err}");
+    }
+
+    #[test]
     fn forward_ports_excluded_from_config_hash() {
         let base = "[sandbox.app]\nfolder = \"../app\"\n";
         let plain = Config::parse(base).unwrap();
@@ -1938,6 +1973,7 @@ containerEnv = { FOO = "bar" }
 postCreateCommand = "npm install"
 customizations.vscode.extensions = ["rust-lang.rust-analyzer"]
 privileged = true
+placement = "home"
 "#,
         )
         .unwrap();

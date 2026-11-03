@@ -34,7 +34,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use super::transfer::{self, Header, Received, Receivers};
-use crate::config::{Build, Config, MountContext, ResolvedSandbox};
+use crate::config::{Build, Config, MountContext, Placement, ResolvedSandbox};
 use crate::serve::endpoint;
 use crate::worker_policy::{self, Allow, Policy, Refusal};
 
@@ -292,7 +292,8 @@ pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<Vec<String>> {
 }
 
 /// What ties `sandbox` of `config` (at the canonical config root `root`) to
-/// this host, for the user (fleet plan decision 40, inferred ties): what a
+/// this host, for the user (fleet plan decision 40): first the pin
+/// (`placement = "home"`), then the inferred ties, what a
 /// worker policy with no allowances would refuse, over the config root and
 /// the folders that move with it (`folder`, `folders` outside the root) as
 /// the only paths that travel. From the config ([`Policy::config_refusals`]:
@@ -320,7 +321,11 @@ pub fn ties(root: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Vec<Stri
         allow: Allow { binds: moved, ..Allow::default() },
         sockets: worker_policy::host_sockets(),
     };
-    let mut out: Vec<String> = policy.config_refusals(root, config, sandbox).into_iter().map(tie).collect();
+    let mut out: Vec<String> = Vec::new();
+    if props.placement == Some(Placement::Home) {
+        out.push("`placement = \"home\"`".into());
+    }
+    out.extend(policy.config_refusals(root, config, sandbox).into_iter().map(tie));
     let root_s = root.to_string_lossy();
     let shared = root.join("shared-volumes");
     let shared_s = shared.to_string_lossy();
@@ -819,6 +824,9 @@ mod tests {
             ties_of_toml("build = { dockerfile = \"Dockerfile\", context = \"../elsewhere\" }"),
             [format!("build context `{}` (outside the config root)", cfg.join("../elsewhere").display())]
         );
+        // The pin: a tie on its own, and first among others.
+        assert_eq!(ties_of_toml("placement = \"home\""), ["`placement = \"home\"`"]);
+        assert_eq!(ties_of_toml("privileged = true\nplacement = \"home\""), ["`placement = \"home\"`", "privileged"]);
         assert_eq!(ties_of_toml(""), Vec::<String>::new());
         let out = dir.join("elsewhere").display().to_string();
         for (extra, want) in [
