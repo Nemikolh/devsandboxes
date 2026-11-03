@@ -358,7 +358,7 @@ fn merge(stored: &Stored, cmp: Compare, theirs: Head, wire: Wire, peer: &str, lo
 
 /// `name`'s key in `stored`: a member's in the log, else a held
 /// introduction's (with its introducer).
-fn resolve(stored: &Stored, name: &str) -> Option<(PublicKey, Option<String>)> {
+pub(crate) fn resolve(stored: &Stored, name: &str) -> Option<(PublicKey, Option<String>)> {
     let m = stored.log.membership()?;
     if let Some(key) = m.key_of(name) {
         return Some((key, None));

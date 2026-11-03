@@ -25,6 +25,8 @@
 //!   or denies them there.
 //! - `proof`: a peer link's proof of both members' keys after its
 //!   `Hello`s, with the membership heads compared and synced.
+//! - `graph`: the members' signed link reports and the paths over them
+//!   (pure).
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an
@@ -53,6 +55,7 @@ pub mod agent;
 pub mod code;
 pub mod dialer;
 pub mod follow;
+pub mod graph;
 pub mod identity;
 pub mod lent;
 pub mod link;

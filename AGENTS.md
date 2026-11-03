@@ -162,7 +162,8 @@ Start with `docs/README.md` (reading order and map) and
   statements), `membership.rs` (the authority-signed log and
   introductions, pure), `membership_api.rs` (`membership.get|adopt|sign`,
   `fleet.sync`'s store), `proof.rs` (a peer link's key proof),
-  `proposals.rs` (`proposals.json`). `src/key_guard.rs` refuses any
+  `proposals.rs` (`proposals.json`), `graph.rs` (members' signed link
+  reports and `Graph::paths` over them, pure). `src/key_guard.rs` refuses any
   container bind or build path covering the member key.
   `snapshots.rs`'s `merge` builds the federated
   snapshot (`instances.watch {machines: true}`).

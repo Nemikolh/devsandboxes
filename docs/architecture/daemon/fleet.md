@@ -1568,6 +1568,39 @@ it never signs on a remote request alone (decision 49;
   once. A host not reached catches up at its next link's head comparison
   (`fleet::proof`).
 
+#### Link graph
+
+The fleet's links are the members' own signed reports
+(`src/serve/fleet/graph.rs`), pure for now: nothing sends or collects
+them yet.
+
+- **A report** (`graph::Report`) is a member's trust, whether it's
+  always on, and each of its links (`LinkReport`: the peer, whether this
+  member dials it, its `LinkState`, since when in unix ms). It's an
+  identity `Statement` of kind `links` by the member's key over
+  `graph::encode`: the fleet's genesis hash, then every field
+  length-prefixed, so a report is one fleet's. Its version is
+  `graph::next_version`, the time in ms unless that isn't past the last
+  one signed (`sign_report`, which also puts the links in peer order).
+- **Taking one** (`Graph::apply`): only from a name that resolves, by the
+  key that signed, to a member of the log or a held introduction
+  (`proof::resolve`); a revoked key, a link to itself, two links to one
+  peer, a payload not signed for this fleet are refused. `Seen` keeps
+  versions per key: the report held is unchanged, an older one or another
+  at the same version refused, and a refusal changes nothing.
+  `Graph::prune` drops the reports whose member no longer resolves to the
+  key that signed them (revoked, rotated, gone).
+- **An edge is up** when the newer of its two ends' reports (by version)
+  says the link is connected; a report not listing the other end says it
+  isn't, one end's alone decides, and at equal versions either saying up
+  is enough.
+- **Paths** (`Graph::paths(stored, from, to, max_hops)`, `MAX_HOPS` 4,
+  decision 55's TTL): every simple path over up edges through members the
+  log or a held introduction names, each the hops after `from`, in the
+  order to try: fewest hops (the direct link first), then fewest hops
+  through members not always on (the destination not counted), then the
+  longest up (its edges' newest `since` oldest), then by name.
+
 ### Trust
 
 `member.toml`'s `trust` is this member's own setting, changed only on it:
