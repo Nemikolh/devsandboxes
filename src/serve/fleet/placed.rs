@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(names, want.map(|(n, r)| (n.to_string(), r)));
 
         // A hub's view of its machines (on a member) adds no candidate:
-        // those are seen through it, view-only.
+        // those are routed, and placement doesn't reach them yet.
         let mut hub = worker("k", MachineKind::Ssh, LinkState::Connected, None);
         hub.fleet = Some(Arc::new(json!({"machines": [{"name": "x", "state": "connected"}], "instances": []})));
         let seen = candidates(&spec("web", None), None, &[], std::slice::from_ref(&hub), &BTreeMap::new());

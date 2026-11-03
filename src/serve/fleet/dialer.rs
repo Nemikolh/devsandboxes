@@ -69,7 +69,7 @@ use crate::devsbd::mux::Conn;
 use crate::devsbd::proto::channel;
 use crate::serve::endpoint;
 use crate::serve::machines::service::Held;
-use crate::serve::machines::ssh::{Dial, Duplex};
+use crate::serve::machines::ssh::{Dial, Duplex, RouteDial};
 use crate::serve::machines::{Entry, check_name};
 
 /// How the daemon answers one stream a machine opens on `Channel`, the
@@ -98,6 +98,18 @@ pub fn dial(socket_dir: PathBuf) -> Dial {
         let path = endpoint::fleet_socket(&socket_dir, &entry.name);
         let stream =
             link::connect(&path, channel::API).map_err(|e| anyhow::anyhow!("its link isn't up ({}: {e})", path.display()))?;
+        Ok(Duplex::socket(stream))
+    })
+}
+
+/// The daemon's [`RouteDial`] of a routed machine: one `API` stream over
+/// `route::connect` (its `fleet-<name>.sock` if a link came up meanwhile,
+/// else its `route-<name>.sock`, opened over the graph's paths), the daemon
+/// from its first byte like [`dial`]'s. A routed machine's forwarded calls
+/// and verbs go this way; nothing holds it.
+pub fn routed(socket_dir: PathBuf) -> RouteDial {
+    Arc::new(move |name: &str| {
+        let stream = super::route::connect(&socket_dir, name, channel::API).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Duplex::socket(stream))
     })
 }
@@ -1127,9 +1139,11 @@ pub(crate) mod tests {
     /// A fleet: K (member `box`) is the hub, with a third machine `x` it
     /// knows rows of (restored from its `remotes.json`; x itself is never
     /// reached); L (`lap`) is a member whose hub is `box`. L's federated
-    /// snapshot shows K's rows and, through K, x's (`via: box`), never its
-    /// own as K sees them; acting on x from L is refused naming K. K
-    /// serves a federated watch only as the hub.
+    /// snapshot shows K's rows and, through K, x's (`via: box`, kind
+    /// `routed`), never its own as K sees them; x is a routed machine on L
+    /// (`machines.list`/`get`), acted on over a route (none reaches it: the
+    /// route's error), its agent refused. K serves a federated watch only
+    /// as the hub.
     #[test]
     fn a_member_sees_the_fleet_through_its_hub() {
         let base_remotes = scratch("dial-via-files");
@@ -1219,21 +1233,27 @@ pub(crate) mod tests {
         assert_eq!(tagged(&pushed, "x"), ["x-1"], "{pushed}");
         assert!(tagged(&pushed, "lap").is_empty() && named(&pushed["machines"], "lap").is_none(), "{pushed}");
 
-        // View-only: anything acting on x is refused naming the hub.
-        let refused = crate::serve::snapshots::seen_via("x", "box");
-        let calls = [
-            ("instances.list", json!({"dir": x_root, "machine": "x"})),
-            ("machines.get", json!({"name": "x"})),
-            ("machines.set", json!({"name": "x", "agent": true})),
-            ("forwards.add", json!({"root": x_root, "instance": "x-1", "port": 3000, "machine": "x"})),
-        ];
-        for (method, params) in calls {
-            let e = connect(&pair.l_dir).call(method, params).unwrap().error.unwrap();
-            assert_eq!((e.code.as_str(), e.message.as_str()), ("denied", refused.as_str()), "{method}");
-        }
+        // Routed (fleet plan decision 60): x is a machine of its own here,
+        // kind `routed`, acted on over a route, which x (no daemon, not in
+        // the log, so in no graph) never has.
+        let rows = connect(&pair.l_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+        let row = named(&rows, "x").unwrap();
+        assert_eq!((&row["kind"], &row["via"], &row["state"], &row["target"]), (&json!("routed"), &json!("box"), &json!("unreachable"), &Value::Null));
+        assert_eq!(row["roots"], json!([]), "x's view has no sandboxes rows");
+        crate::serve::dts::assert_matches("MachineRow", &row);
+        assert_eq!(x["kind"], "routed");
+        let info = connect(&pair.l_dir).call("machines.get", json!({"name": "x"})).unwrap().result.unwrap();
+        assert_eq!(info, json!({"name": "x", "kind": "routed", "target": null, "command": null, "roots": [], "agent": false}));
+        let e = connect(&pair.l_dir).call("machines.set", json!({"name": "x", "agent": true})).unwrap().error.unwrap();
+        assert_eq!((e.code.as_str(), e.message), ("denied", crate::serve::snapshots::routed_agent("x", "box")));
+        let e = connect(&pair.l_dir).call("instances.list", json!({"dir": x_root, "machine": "x"})).unwrap().error.unwrap();
+        assert!(e.code == "failed" && e.message.starts_with("x: unreachable: no link to `x` is up"), "{e:?}");
+        let add = json!({"dir": x_root, "instance": "x-1", "spec": "3000", "machine": "x"});
+        let e = connect(&pair.l_dir).call("forwards.add", add).unwrap().error.unwrap();
+        assert_eq!(e.message, "this daemon runs no forwards", "served here, not refused");
         let (r, ..) = verb(&mut connect(&pair.l_dir), "stop", json!({"root": x_root, "env": {}, "instance": "x-1", "machine": "x"}));
         let e = r.error.unwrap();
-        assert_eq!((e.code.as_str(), e.message.as_str()), ("denied", refused.as_str()));
+        assert!(e.code == "failed" && e.message.starts_with("x: unreachable: no link to `x` is up"), "{e:?}");
         // A name nobody sees is still unknown.
         assert_eq!(connect(&pair.l_dir).call("machines.get", json!({"name": "nope"})).unwrap().error.unwrap().code, "not-found");
 
@@ -1403,17 +1423,18 @@ pub(crate) mod tests {
 
     impl Trio {
         fn new(tag: &str, introduced: bool) -> Trio {
-            Trio::build(tag, introduced, false)
+            Trio::build(tag, introduced, false, |_| {})
         }
 
         /// [`Trio::new`] (not introduced) whose `member.toml`s also name
         /// the hub (`box`): the members report their links to it and it
         /// pushes the graph (`fleet::reports`).
         fn hubbed(tag: &str) -> Trio {
-            Trio::build(tag, false, true)
+            Trio::build(tag, false, true, |_| {})
         }
 
-        fn build(tag: &str, introduced: bool, hubbed: bool) -> Trio {
+        /// B's options set by `b` too.
+        fn build(tag: &str, introduced: bool, hubbed: bool, b: impl FnOnce(&mut Options)) -> Trio {
             use crate::serve::fleet::member::{Member, write_for_test};
             use crate::serve::fleet::identity::Signer;
             use crate::serve::fleet::membership::Introduction;
@@ -1421,7 +1442,7 @@ pub(crate) mod tests {
             let (a_dir, k_dir, b_dir) = (base.join("a"), base.join("k"), base.join("b"));
             let (mut a_opts, _) = daemon_opts(&base, "a");
             let (mut k_opts, _) = daemon_opts(&base, "k");
-            let (b_opts, b_data) = daemon_opts(&base, "b");
+            let (mut b_opts, b_data) = daemon_opts(&base, "b");
             let (_, m_data) = daemon_opts(&base, "m");
             let (a_member, k_member, b_member) = (a_opts.member.clone().unwrap(), k_opts.member.clone().unwrap(), b_opts.member.clone().unwrap());
             let m_member = m_data.join("member.toml");
@@ -1429,6 +1450,7 @@ pub(crate) mod tests {
             for peer in ["lap", "box"] {
                 std::fs::create_dir_all(b_data.join("fleet").join(peer)).unwrap();
             }
+            b(&mut b_opts);
             let members: [(&str, &Path); 4] = [("lap", &a_member), ("box", &k_member), ("b", &b_member), ("m", &m_member)];
             if introduced {
                 for (name, toml) in members {
@@ -1625,6 +1647,55 @@ pub(crate) mod tests {
             assert!(e.contains(want), "{want:?} in {e}");
         }
         trio.finish();
+    }
+
+    /// A reaches B, which it has no link to, as a routed machine (fleet
+    /// plan decision 60): `machines.list` and `machines.get` say `routed`,
+    /// via `box`, connected (a path starts with A's link up); a quick call,
+    /// a forwarded verb and a federated resolve go to it by name over
+    /// `route-b.sock`, served under B's trust for A (not for the relay);
+    /// its agent stays refused (decision 58).
+    #[test]
+    fn a_routed_machine_takes_quick_calls_and_verbs() {
+        let (b_runner, b_verbs) = crate::serve::verbs::tests::script_runner("route-machine-b", r#"echo "b $*""#);
+        let trio = Trio::build("route-machine", false, true, |b| {
+            b.verbs = Some(b_runner);
+            b.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap_or_default())]));
+            // One instance in B's fleet root for lap.
+            let state = b.state.clone().unwrap();
+            let root = std::fs::canonicalize(state.parent().unwrap().join("fleet/lap")).unwrap();
+            let toml = format!(
+                "[instance.b-1]\ninstance_id = \"id-b\"\nsandbox = \"web\"\ncontainer = \"devsandbox-b-1\"\nfolder = \"/w\"\n\
+                 workspace = \"/w\"\ncreated_unix = 1\nconfig_dir = {:?}\n",
+                root.to_str().unwrap()
+            );
+            std::fs::write(state, toml).unwrap();
+        });
+        let rows = || connect(&trio.a_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+        wait_for("b routed and connected on A", Duration::from_secs(15), || named(&rows(), "b").is_some_and(|r| connected(&r)));
+        let b = named(&rows(), "b").unwrap();
+        assert_eq!((&b["kind"], &b["via"], &b["target"], &b["agent"]), (&json!("routed"), &json!("box"), &Value::Null, &json!(false)));
+        crate::serve::dts::assert_matches("MachineRow", &b);
+        let mut a = connect(&trio.a_dir);
+        let info = a.call("machines.get", json!({"name": "b"})).unwrap().result.unwrap();
+        assert_eq!((&info["kind"], &info["target"]), (&json!("routed"), &Value::Null));
+
+        let own = trio.fleet_root("b", "lap");
+        let r = a.call("instances.list", json!({"dir": own, "machine": "b"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let e = a.call("instances.list", json!({"dir": trio.fleet_root("b", "box"), "machine": "b"})).unwrap().error.unwrap();
+        assert_eq!(e.code, "denied", "B's trust for lap, not for the relay: {e:?}");
+        let (r, out, _) = verb(&mut a, "stop", json!({"root": own, "env": {}, "instance": "b-1", "machine": "b"}));
+        assert!(r.error.is_none(), "{r:?}");
+        assert_eq!(out, format!("b --in-process -C {} stop -- b-1\n", own.display()));
+        let r = a.call("instances.resolve", json!({"name": "b-1", "machines": true})).unwrap().result.unwrap();
+        assert_eq!(r["matches"], json!(["b/b-1"]), "{r}");
+
+        let e = a.call("machines.set", json!({"name": "b", "agent": true})).unwrap().error.unwrap();
+        assert_eq!((e.code.as_str(), e.message), ("denied", crate::serve::snapshots::routed_agent("b", "box")));
+        drop(a);
+        trio.finish();
+        let _ = std::fs::remove_dir_all(&b_verbs);
     }
 
     /// An introduced origin (capped) is served capped at its destination:

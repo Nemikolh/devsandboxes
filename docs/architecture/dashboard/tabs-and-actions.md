@@ -53,7 +53,7 @@ for Instances when the last machine goes. Each keeps its own selected row.
 - **Machines**: one row per machine, in the snapshot's `machines` order
   (`SnapshotMachine`, `ui.rs` `draw_machines`; on a fleet member those
   seen through the hub last): NAME, TARGET (dimmed `inbound` for an
-  inbound one, `via <hub>` for one seen through the hub), STATE
+  inbound one, `via <hub>` for a routed one, seen through the hub), STATE
   (`LinkState::as_str`, with `: <error>` when set), AGENT
   (`on`/`off`, `-` for an inbound one or one via the hub), VERSION (`-` before a link) and
   CAPACITY (`ui.rs` `capacity_text`: `capacity::summary`, e.g. `8 cpu ·
@@ -67,7 +67,9 @@ for Instances when the last machine goes. Each keeps its own selected row.
   answer is a status line; the row isn't touched, it shows the new value
   with the next snapshot push
   ([../daemon/machines.md](../daemon/machines.md) *Dashboard*); on a
-  machine via the hub it's refused with a status line naming the hub.
+  routed machine (via the hub) it's refused with a status line: its
+  agent isn't routed (`snapshots::routed_agent`, fleet plan decision 58).
+  Its other actions and tabs work as on any machine's rows.
 
 The header's totals line marks the snapshot stale with why when the daemon
 connection is down, or after `STALE_AFTER_SECS` without a push.

@@ -810,10 +810,13 @@ dialer then redials). A hub:
   over a same-named one via the hub); one hop, never itself
   ([machines.md](machines.md#held-links-machines),
   [federated snapshots](machines.md#federated-snapshots)). Those are
-  view-only (fleet plan decision 33): their rows and state show, while
-  a request naming one as `machine`, `machines.get`/`set`, a forward
-  into one, its terminals and the agent toggle are refused naming the
-  hub (`snapshots::seen_via`); placement never sees them.
+  routed machines (fleet plan decision 60,
+  [machines.md](machines.md#routed-machines)): their rows stay the
+  hub's view's, while a request naming one as `machine`, `machines.get`,
+  a forward into one and its terminals go to it over a routed stream;
+  `machines.set` and the agent toggle are refused (`AGENT` isn't
+  routed, decision 58; `snapshots::routed_agent`); placement never sees
+  them.
 - **Saves the machines' rows**, `remotes.json` next to `state.toml`
   (`machines::saved::path`; `Options::remotes` in tests), so a restarted
   hub shows the fleet before its machines reconnect: restored at the

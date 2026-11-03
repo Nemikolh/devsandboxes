@@ -143,7 +143,11 @@ pub struct Added {
 /// One `machines.list` row: the registry entry, or an inbound neighbor up
 /// now (`kind` `inbound`: no `target`, `roots` its `roots.list`), and its
 /// held link's live state (`error` the last failure while `unreachable`;
-/// `version` from the last hello).
+/// `version` from the last hello). Or a routed machine (`kind` `routed`,
+/// fleet plan decision 60; `snapshots::Routed`): no `target`, `command` or
+/// `agent`, `roots`, `version` and `capacity` as the hub's view has them,
+/// `via` the first hop its streams take, `state` `connected` while this
+/// host's link graph has a path to it starting with a link up here.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineRow {
     pub name: String,
@@ -165,6 +169,10 @@ pub struct MachineRow {
     /// plan decision 51).
     #[serde(default)]
     pub introduced_by: Option<String>,
+    /// A routed machine's first hop (or the hub whose view lists it);
+    /// `None` for a machine this host links to.
+    #[serde(default)]
+    pub via: Option<String>,
 }
 
 /// Who introduced member `name`, when `stored` holds it as an introduction
@@ -384,7 +392,7 @@ fn after(mut e: ApiError, written: &[String]) -> ApiError {
 }
 
 /// The registry's machines, then the inbound neighbors up now, each with
-/// its held link's state.
+/// its held link's state, then the routed machines.
 /// Each row's `introduced_by` from this host's `membership.json` (one that
 /// doesn't load: none).
 fn list(ctx: &Ctx) -> Answer {
@@ -406,9 +414,26 @@ fn list(ctx: &Ctx) -> Answer {
                 state: live.state,
                 error: live.error,
                 version: live.version,
+                via: None,
             }
         })
         .collect();
+    let mut rows = rows;
+    let routed = ctx.links.as_ref().map(|l| l.routed()).unwrap_or_default();
+    rows.extend(routed.into_iter().map(|r| MachineRow {
+        introduced_by: introducer_of(stored.as_ref(), &r.name),
+        name: r.name,
+        kind: MachineKind::Routed,
+        target: None,
+        roots: r.roots,
+        command: None,
+        agent: false,
+        state: r.state,
+        error: r.error,
+        version: r.version,
+        capacity: r.capacity,
+        via: r.via,
+    }));
     to_value(rows)
 }
 
@@ -449,8 +474,8 @@ struct GetParams {
     agent: Option<PathBuf>,
 }
 
-/// One machine (registered or inbound; one seen only through this host's
-/// hub is `denied`, naming the hub). `agent` is the caller's `SSH_AUTH_SOCK`
+/// One machine (registered, inbound or routed: a routed one's roots as
+/// the hub's view has them, no `target`). `agent` is the caller's `SSH_AUTH_SOCK`
 /// (absolute), reported to this daemon (`bridge::report_agent`), so the
 /// agent this host answers the machine's `AGENT` streams with
 /// (`bridge::host_agent`) is the caller's: what a CLI re-run over ssh on
@@ -461,11 +486,15 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
     {
         return Err(ApiError::invalid(format!("`agent` must be absolute, got `{}`", agent.display())));
     }
-    // A machine seen through the hub is no entry: refused naming the hub.
-    let entry = machines(ctx)?.into_iter().find(|e| e.name == p.name).ok_or_else(|| match &ctx.links {
-        Some(links) => links.unknown(&p.name),
-        None => ApiError::not_found(format!("no machine named `{}`", p.name)),
-    })?;
+    let entry = machines(ctx)?.into_iter().find(|e| e.name == p.name);
+    let routed = match (&entry, &ctx.links) {
+        (None, Some(links)) => links.routed_one(&p.name),
+        _ => None,
+    };
+    if let Some(r) = routed {
+        return to_value(MachineInfo { name: r.name, kind: MachineKind::Routed, target: None, command: None, roots: r.roots, agent: false });
+    }
+    let entry = entry.ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
     if let Some(agent) = p.agent {
         crate::devsbd::bridge::report_agent(agent);
     }
@@ -501,6 +530,11 @@ fn set(p: SetParams, ctx: &Ctx) -> Answer {
             return Err(inbound_agent(&p.name));
         }
         if let Some(links) = &ctx.links {
+            // No entry here to keep the flag in, and `AGENT` isn't routed
+            // (fleet plan decision 58).
+            if let Some(r) = links.routed_one(&p.name) {
+                return Err(ApiError::denied(crate::serve::snapshots::routed_agent(&r.name, r.via.as_deref().unwrap_or("another member"))));
+            }
             return Err(links.unknown(&p.name));
         }
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
@@ -914,7 +948,7 @@ mod tests {
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null},
+                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null, "via": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box"}));
@@ -1280,13 +1314,14 @@ mod tests {
             version: None,
             capacity: Some(Capacity::default()),
             introduced_by: Some("lap".into()),
+            via: Some("k".into()),
         };
         let row = to_value(row).unwrap();
         assert_matches("MachineRow", &row);
         assert_matches("Capacity", &row["capacity"]);
         let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
-        assert_eq!(union_members("MachineKind"), ["'ssh'", "'inbound'"]);
+        assert_eq!(union_members("MachineKind"), ["'ssh'", "'inbound'", "'routed'"]);
         use super::super::leave::{Heard, Left, Missed, Removed, RmAnswer};
         use crate::serve::dts::assert_variant;
         let missed = Missed { name: "x".into(), error: "no link to it".into() };

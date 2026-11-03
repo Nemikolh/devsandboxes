@@ -97,13 +97,14 @@ impl App {
     /// new value for the event loop to set through the daemon worker. The row
     /// changes with the next snapshot push. No-op with no row selected; an
     /// inbound machine has no `agent` here (it dialed this host: this
-    /// host's agent never reaches it, fleet plan decision 30), so a note.
+    /// host's agent never reaches it, fleet plan decision 30), nor a routed
+    /// one (`AGENT` isn't routed, decision 58), so a note.
     pub(super) fn toggle_selected_agent(&mut self) {
         let Some(m) = self.machines.get(self.selected()) else {
             return;
         };
-        if let Some(hub) = &m.via {
-            self.status = Some(crate::serve::snapshots::seen_via(&m.name, hub));
+        if let Some(via) = &m.via {
+            self.status = Some(crate::serve::snapshots::routed_agent(&m.name, via));
             return;
         }
         if m.kind == crate::serve::machines::MachineKind::Inbound {
@@ -339,12 +340,18 @@ mod tests {
         assert_eq!(app.take_pending_machine_set(), None);
         assert!(app.status.as_deref().is_some_and(|s| s.starts_with("lap: inbound (it dialed this host)")), "{:?}", app.status);
 
-        // One seen through the hub: refused naming it.
-        let x = crate::serve::snapshots::SnapshotMachine { via: Some("k".into()), target: None, ..sm("x", LinkState::Connected) };
+        // A routed one (seen through the hub): its agent isn't routed
+        // (fleet plan decision 58), nothing queued.
+        let x = crate::serve::snapshots::SnapshotMachine {
+            kind: crate::serve::machines::MachineKind::Routed,
+            via: Some("k".into()),
+            target: None,
+            ..sm("x", LinkState::Connected)
+        };
         app.set_machines(vec![x]);
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(app.take_pending_machine_set(), None);
-        assert!(app.status.as_deref().is_some_and(|s| s.starts_with("`x` is seen through the hub `k` only")), "{:?}", app.status);
+        assert_eq!(app.status, Some(crate::serve::snapshots::routed_agent("x", "k")));
     }
 
     #[test]

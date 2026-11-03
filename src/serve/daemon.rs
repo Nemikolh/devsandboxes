@@ -305,6 +305,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // Every machine, ssh or inbound, is dialed at its link's socket here;
     // only `machines.probe`/`.add` ssh to a target (tests inject that part).
     let dial = fleet::dialer::dial(dir.to_path_buf());
+    let route = fleet::dialer::routed(dir.to_path_buf());
     let probe = opts.probe.clone().unwrap_or_else(|| ssh::probe_dial(link::client_name()));
     // Whenever the daemon runs, host side or not: every registered machine's
     // link is held (a test daemon's registry has none unless the test writes
@@ -313,7 +314,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let hooked: Arc<OnceLock<std::sync::Weak<Shared>>> = Arc::default();
     let hold = machine_dialer(dir, opts, &hooked, &shared.hub);
     let hooks = {
-        let (a, b, c) = (Arc::clone(&hooked), Arc::clone(&hooked), Arc::clone(&hooked));
+        let (a, b, c, d) = (Arc::clone(&hooked), Arc::clone(&hooked), Arc::clone(&hooked), Arc::clone(&hooked));
         service::Hooks {
             watching: Box::new(move || a.get().and_then(std::sync::Weak::upgrade).is_some_and(|s| s.watching_machines())),
             changed: Box::new(move || {
@@ -323,6 +324,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             }),
             hub: Box::new(move || c.get().and_then(std::sync::Weak::upgrade).and_then(|s| s.hub_of())),
+            routed: Box::new(move || d.get().and_then(std::sync::Weak::upgrade).map(|s| s.routed_reach()).unwrap_or_default()),
         }
     };
     let hub = {
@@ -336,7 +338,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // Inbound neighbors are machines too: the service follows them.
     let inbound: Arc<machines::inbound::Neighbors> = Arc::default();
     let links =
-        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial.clone(), hold, opts.machine_timing, hooks, Some(hub), log);
+        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial.clone(), route, hold, opts.machine_timing, hooks, Some(hub), log);
     let forwards_machines = registry_path.clone();
     if let Some(agent) = &opts.host_agent {
         shared.host_agent = Arc::clone(agent);
@@ -434,7 +436,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let shared = Arc::clone(&shared);
         let store = super::forward_store::path()?;
         let on_event = Box::new(move |event| shared.publish_forwards(event));
-        Some(Registry::spawn(log, store, forwards_machines, Arc::clone(&inbound), dir.to_path_buf(), on_event))
+        let routed_of = links.handle();
+        let routed: super::forwards::RoutedNames = Arc::new(move || routed_of.routed().into_iter().map(|r| r.name).collect());
+        Some(Registry::spawn(log, store, forwards_machines, Arc::clone(&inbound), routed, dir.to_path_buf(), on_event))
     } else {
         None
     };
@@ -1115,13 +1119,39 @@ impl Shared {
     /// (`fleet::routes::wanted`): its graph's, but itself and those it has
     /// a link up to. None outside a fleet's log.
     fn routed_members(&self) -> std::collections::BTreeSet<String> {
-        let Some(member) = self.member.as_deref() else { return Default::default() };
-        let Ok(Some(stored)) = fleet::membership_api::load(member) else { return Default::default() };
-        let Ok(me) = fleet::dialer::member_name(member, &self.hostname) else { return Default::default() };
-        if stored.log.membership().is_none() {
-            return Default::default();
+        match self.fleet_log() {
+            Some((stored, me)) => fleet::routes::wanted(&self.graph.graph(), &stored, &me, |n| self.link_up(n)),
+            None => Default::default(),
         }
-        fleet::routes::wanted(&self.graph.graph(), &stored, &me, |n| self.link_up(n))
+    }
+
+    /// This host's membership log (one with a genesis) and its member name.
+    fn fleet_log(&self) -> Option<(fleet::membership::Stored, String)> {
+        let member = self.member.as_deref()?;
+        let stored = fleet::membership_api::load(member).ok().flatten()?;
+        let me = fleet::dialer::member_name(member, &self.hostname).ok()?;
+        stored.log.membership().is_some().then_some((stored, me))
+    }
+
+    /// The routed machines' reach (`service::Hooks::routed`): each of
+    /// [`routed_members`](Self::routed_members) the graph has a path to,
+    /// with the first hop its streams take now, or why none
+    /// (`fleet::routes::reach`). A member with no path at all (one that
+    /// left, its last report stale) is no routed machine.
+    fn routed_reach(&self) -> Vec<(String, Result<String, String>)> {
+        let Some((stored, me)) = self.fleet_log() else { return Vec::new() };
+        let graph = self.graph.graph();
+        fleet::routes::wanted(&graph, &stored, &me, |n| self.link_up(n))
+            .into_iter()
+            .filter_map(|name| {
+                let paths = graph.paths(&stored, &me, &name, fleet::graph::MAX_HOPS);
+                if paths.is_empty() {
+                    return None;
+                }
+                let reach = fleet::routes::reach(&name, &paths, |hop| self.link_up(hop));
+                Some((name, reach))
+            })
+            .collect()
     }
 
     /// A connection to `dest`'s route socket (`fleet::routes`): served on
@@ -1833,13 +1863,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         Ok(Some(machine)) if fwd::is_quick(&req.method) => {
             return Some(forward(req.id, &req.method, req.params, &machine, shared));
         }
-        // Served here, but not on a machine this host sees only through
-        // its hub (view-only).
-        Ok(Some(machine)) if fwd::is_here(&req.method) => {
-            if let Some(hub) = shared.links().and_then(|l| l.remotes().via(&machine)) {
-                return Some(Response::err(req.id, "denied", snapshots::seen_via(&machine, &hub)));
-            }
-        }
+        // Served here, `machine` kept.
+        Ok(Some(_)) if fwd::is_here(&req.method) => {}
         Ok(Some(_)) => {
             return Some(Response::err(req.id, "invalid", format!("`{}` can't take a machine yet", req.method)));
         }
@@ -2267,11 +2292,11 @@ fn remote_verb(
     conn: &ConnState,
     peer: &dyn verbs::Peer,
 ) -> Option<Response> {
-    let (Some(ctx), Some(links)) = (shared.machines.as_ref(), shared.links()) else {
+    let Some(links) = shared.links() else {
         return Some(Response::err(id, "not-found", format!("no machine named `{machine}`")));
     };
     let label = conn.label();
-    let vctx = fwd::VerbCtx { entries: links.entries(), dial: &ctx.dial, links, held: &shared.remote_verbs, who: &label, log };
+    let vctx = fwd::VerbCtx { links, held: &shared.remote_verbs, who: &label, log };
     fwd::verb(id, method, params, machine, &vctx, peer)
 }
 
@@ -3284,6 +3309,7 @@ pub(crate) mod tests {
             scratch("fwd-hold-store").join("forwards.toml"),
             scratch("fwd-hold-store").join("machines.toml"),
             Arc::default(),
+            Arc::new(Vec::new),
             scratch("fwd-hold-store"),
             Box::new(|_| {}),
         );

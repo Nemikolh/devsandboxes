@@ -123,12 +123,10 @@ pub type Exe<'a> = &'a dyn Fn() -> Result<String, String>;
 /// onto the machine's link (`machines::cli`: the instance's root resolved
 /// there with `instances.resolve`, then a `PTY` dial through
 /// `fleet::pty_client`), so the terminal goes through the machine's trust
-/// like any other use of it. A machine seen only through the hub has no
-/// link here to dial: refused naming the hub (fleet plan decision 33).
+/// like any other use of it. A machine seen only through the hub (`routed`)
+/// is dialed the same way: the dial goes over a route
+/// (`fleet::route::connect`, fleet plan decision 60).
 fn on_machine(m: &SnapshotMachine, flags: &[&str], name: &str, command: &[String], exe: Exe) -> Result<Vec<String>, String> {
-    if let Some(hub) = &m.via {
-        return Err(crate::serve::snapshots::seen_via(&m.name, hub));
-    }
     let mut args = vec![exe()?];
     args.extend(flags.iter().map(|s| s.to_string()));
     args.extend(["--".to_string(), qualify(Some(&m.name), name)]);
@@ -401,8 +399,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every machine's tabs, ssh or inbound, run this host's devsandbox on
-    /// the qualified name: its `exec` goes over the machine's link.
+    /// Every machine's tabs, ssh, inbound or routed, run this host's
+    /// devsandbox on the qualified name: its `exec` goes over the machine's
+    /// link, or a route.
     #[test]
     fn terminal_argvs_run_the_local_cli_on_the_qualified_name() {
         use clap::Parser;
@@ -417,7 +416,14 @@ pub(crate) mod tests {
         ssh.target = Some("ssh://me@box:2222".into());
         ssh.command = Some("~/bin/devsandbox".into());
         let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..sm("lap", LinkState::Connected) };
-        for (m, w) in [(&ssh, "box/w"), (&lap, "lap/w")] {
+        // Seen through the hub: routed, a tab like any other.
+        let via = SnapshotMachine {
+            kind: crate::serve::machines::MachineKind::Routed,
+            via: Some("k".into()),
+            target: None,
+            ..sm("x", LinkState::Connected)
+        };
+        for (m, w) in [(&ssh, "box/w"), (&lap, "lap/w"), (&via, "x/w")] {
             assert_eq!(exec_argv(m, "w", &[], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", w]);
             assert_eq!(exec_argv(m, "w", &["ls".into()], exe).unwrap(), ["/opt/devsandbox", "exec", "-i", "-t", "--", w, "ls"]);
             let first = session_exec_argv(m, "w", id, exe).unwrap();
@@ -435,12 +441,6 @@ pub(crate) mod tests {
         }
         let no = || Err("no exe".to_string());
         assert_eq!(exec_argv(&ssh, "w", &[], &no), Err("no exe".into()));
-        // Seen through the hub: no tab, the hub named.
-        let via = SnapshotMachine { via: Some("k".into()), target: None, ..sm("x", LinkState::Connected) };
-        let refused = crate::serve::snapshots::seen_via("x", "k");
-        assert_eq!(exec_argv(&via, "w", &[], exe), Err(refused.clone()));
-        assert_eq!(session_exec_argv(&via, "w", id, exe), Err(refused.clone()));
-        assert_eq!(attach_argv(&via, "w", id, exe), Err(refused.clone()));
         // A service tab goes through the instance whose service it is.
         let iso = service_row("isolated", &["devsandbox-svc-p-a-db", "devsandbox-svc-p-b-db"], &["a", "b"]);
         for (m, b) in [(&ssh, "box/b"), (&lap, "lap/b")] {

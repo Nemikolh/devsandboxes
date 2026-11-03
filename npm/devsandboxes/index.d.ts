@@ -156,11 +156,12 @@ export interface InstancesSnapshot extends InstancesList {
 export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
 
 /**
- * How a machine is reached: `ssh` (this host sshes to its `target`) or `inbound` (a machine whose link to
+ * How a machine is reached: `ssh` (this host sshes to its `target`), `inbound` (a machine whose link to
  * this host was dialed from its end, a machine here while that link is up; no `target`, never in the
- * registry).
+ * registry) or `routed` (a fleet member with no link of its own here, reached through other members;
+ * no `target`, never in the registry).
  */
-export type MachineKind = 'ssh' | 'inbound';
+export type MachineKind = 'ssh' | 'inbound' | 'routed';
 
 /** One machine of a federated {@link InstancesSnapshot}. */
 export interface SnapshotMachine {
@@ -182,8 +183,8 @@ export interface SnapshotMachine {
   /** Its host's capacity, from its last snapshot (last known while not `connected`); `null` before one carried it. */
   capacity: Capacity | null;
   /**
-   * The fleet hub this machine is seen through (a member's view of the hub's other machines): view-only,
-   * acting on it is refused naming the hub; `null` for a machine this host links to.
+   * The fleet hub this machine is seen through (a member's view of the hub's other machines, kind
+   * `routed`: acted on over a route); `null` for a machine this host links to.
    */
   via: string | null;
 }
@@ -1068,7 +1069,7 @@ export interface MembershipRotateProposed extends FleetProposed {
 /** `membership.rotate`'s answer. */
 export type MembershipRotateResult = MembershipRotated | MembershipRotateProposed;
 
-/** `machines.get`'s answer (a registered machine or an inbound one): what an ssh command to the machine needs. */
+/** `machines.get`'s answer (a registered machine, an inbound or a routed one): what an ssh command to the machine needs. */
 export interface MachineInfo {
   name: string;
   kind: MachineKind;
@@ -1082,7 +1083,10 @@ export interface MachineInfo {
   agent: boolean;
 }
 
-/** One registered machine, or an inbound neighbor up now (`kind` `inbound`), with its held link's state (`machines.list`). */
+/**
+ * One registered machine, or an inbound neighbor up now (`kind` `inbound`), with its held link's state, or a
+ * routed machine (`kind` `routed`: `state` whether a path to it starts with a link up here) (`machines.list`).
+ */
 export interface MachineRow {
   name: string;
   kind: MachineKind;
@@ -1103,6 +1107,8 @@ export interface MachineRow {
   capacity: Capacity | null;
   /** Who introduced it, while this host's membership holds it as an introduction (capped: it introduces no one); `null` for a member of the log. */
   introduced_by: string | null;
+  /** A routed machine's first hop (or the hub whose view lists it); `null` for a machine this host links to. */
+  via: string | null;
 }
 
 /** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). */

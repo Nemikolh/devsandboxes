@@ -191,6 +191,10 @@ pub(crate) fn target_argv(target: &str, opts: &[&str], program: &str, remote_arg
 /// tests connect to a test daemon's socket.
 pub type Dial = Arc<dyn Fn(&Entry) -> Result<Duplex> + Send + Sync>;
 
+/// Opens an `API` stream to a routed machine (no entry, no link of its
+/// own here) by name: production's is `fleet::dialer::routed`.
+pub type RouteDial = Arc<dyn Fn(&str) -> Result<Duplex> + Send + Sync>;
+
 /// The production add-time [`Dial`] to a target's daemon: [`spawn`] of
 /// [`probe_argv`], saying `client` to the remote relay (its `serve.log`).
 pub fn probe_dial(client: String) -> Dial {

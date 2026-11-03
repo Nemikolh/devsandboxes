@@ -69,6 +69,21 @@ pub fn first_open<T>(paths: &[Vec<String>], up: impl Fn(&str) -> bool, mut open:
     Err(failed)
 }
 
+/// Where a routed stream to `dest` goes first now (pure): the first hop
+/// of the first of `paths` whose first hop `up` says is a link up here (the
+/// one [`first_open`] tries first), else why none is. What a routed
+/// machine's row says (`snapshots::Routed`): a path that's there may still
+/// fail to open past its first hop.
+pub fn reach(dest: &str, paths: &[Vec<String>], up: impl Fn(&str) -> bool) -> Result<String, String> {
+    if let Some(hop) = paths.iter().filter_map(|p| p.first()).find(|h| up(h)) {
+        return Ok(hop.clone());
+    }
+    if paths.is_empty() {
+        return Err(failure(dest, &[]));
+    }
+    Err(format!("no path to `{dest}` starts with a link up here"))
+}
+
 /// Why no routed stream to `dest` opened, from [`first_open`]'s failures.
 pub fn failure(dest: &str, failed: &[String]) -> String {
     if failed.is_empty() {
@@ -280,6 +295,15 @@ mod tests {
         let genesis = s.log.membership().unwrap().genesis;
         let (st, r) = sign_report(&key(k), &genesis, &r, 0, 10);
         graph.apply(&st, &r, s).unwrap();
+    }
+
+    #[test]
+    fn reach_is_the_first_path_whose_first_hop_is_up() {
+        let paths = [path(&["b"]), path(&["m", "b"]), path(&["k", "b"])];
+        assert_eq!(reach("b", &paths, |h| h == "k"), Ok("k".into()));
+        assert_eq!(reach("b", &paths, |h| h == "m" || h == "k"), Ok("m".into()));
+        assert_eq!(reach("b", &paths, |_| false), Err("no path to `b` starts with a link up here".into()));
+        assert_eq!(reach("b", &[], |_| true), Err("no path to `b` in this host's link graph".into()));
     }
 
     #[test]

@@ -616,11 +616,13 @@ fn connect() -> Result<Conn> {
 
 /// The machine names a CLI `<name>` may point at (what [`route`] and
 /// `verbs_client::Fed` take): the registered ones, read from the file
-/// ([`super::registered_names`]), plus the inbound machines a running
-/// daemon lists (`machines.list`), asked only when the socket dir holds a
-/// link socket no registered machine's link binds ([`foreign_link_sockets`]):
-/// an inbound one's `fleet-link --peer` binds `fleet-<name>.sock` there. So
-/// a host without machines still contacts no daemon, nor starts one.
+/// ([`super::registered_names`]), plus the inbound and routed machines a
+/// running daemon lists (`machines.list`), asked only when the socket dir
+/// holds a link socket no registered machine's link binds, or a route
+/// socket ([`foreign_link_sockets`]): an inbound one's `fleet-link --peer`
+/// binds `fleet-<name>.sock` there, the daemon a `route-<name>.sock` per
+/// member it routes to. So a host without machines still contacts no
+/// daemon, nor starts one.
 pub fn machine_names() -> Vec<String> {
     let mut names = super::registered_names();
     let Ok(dir) = endpoint::socket_dir() else { return names };
@@ -634,7 +636,7 @@ pub fn machine_names() -> Vec<String> {
     let rows = conn.call("machines.list", Value::Null).ok().and_then(|r| r.result).unwrap_or(Value::Null);
     let rows: Vec<super::api::MachineRow> = serde_json::from_value(rows).unwrap_or_default();
     for r in rows {
-        if r.kind == super::MachineKind::Inbound && !names.contains(&r.name) {
+        if r.kind != super::MachineKind::Ssh && !names.contains(&r.name) {
             names.push(r.name);
         }
     }
@@ -644,11 +646,14 @@ pub fn machine_names() -> Vec<String> {
 /// Whether `files` (names in socket dir `dir`) hold a `fleet-*.sock` that
 /// isn't one of `registered`'s link sockets (`endpoint::fleet_socket`):
 /// some other machine's link is up here, an inbound one's (or a stale socket, which the daemon then
-/// lists no machine for).
+/// lists no machine for); or any `route-*.sock` (a routed machine's, or a
+/// registered one's whose link is down).
 pub(crate) fn foreign_link_sockets(dir: &Path, files: &[String], registered: &[String]) -> bool {
     let name = |p: PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let ours: Vec<String> = registered.iter().map(|m| name(endpoint::fleet_socket(dir, m))).collect();
-    files.iter().any(|f| f.starts_with("fleet-") && f.ends_with(".sock") && !ours.contains(f))
+    files.iter().any(|f| {
+        f.ends_with(".sock") && ((f.starts_with("fleet-") && !ours.contains(f)) || f.starts_with(endpoint::ROUTE_PREFIX))
+    })
 }
 
 /// `machines.get`'s params for machine `m`: with `own_agent` when absolute
@@ -1043,9 +1048,10 @@ mod tests {
         let with_lap = [own, files(&["fleet-lap.sock"])].concat();
         assert!(foreign_link_sockets(dir, &with_lap, &ms(&["box"])), "lap's link is up here");
         assert!(!foreign_link_sockets(dir, &with_lap, &ms(&["box", "lap"])));
-        // A route socket is the daemon's, for a member it has no link to.
+        // A route socket is the daemon's, for a member it has no link to:
+        // a routed machine the daemon lists.
         let routed = [files(&["serve.sock", "fleet-box.sock"]), files(&["route-b.sock"])].concat();
-        assert!(!foreign_link_sockets(dir, &routed, &ms(&["box"])), "a route socket is no link");
+        assert!(foreign_link_sockets(dir, &routed, &ms(&["box"])), "b is routed: ask the daemon");
     }
 
     /// What `main` gets for a port: a nameless one's port comes out of

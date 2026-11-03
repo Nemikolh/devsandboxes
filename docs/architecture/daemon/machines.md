@@ -323,17 +323,45 @@ up to, which opens routed streams to that member over the graph's paths
 unbinds that member's route socket, a link going down binds it again.
 `route::connect` tries the link's socket first, then the route socket;
 the held link's own dial (`Dial`) only ever uses the link's socket. The
-CLI's look for inbound machines (`cli::foreign_link_sockets`) counts
-`fleet-*.sock` files only, so a route socket is never taken for a
-machine.
+CLI's look for inbound and routed machines (`cli::foreign_link_sockets`)
+asks the daemon's `machines.list` when a `fleet-*.sock` no registered
+machine binds, or any `route-*.sock`, is there.
+
+## Routed machines
+
+A routed machine (`MachineKind::Routed`, wire `routed`; fleet plan
+decision 60) is a fleet member this host has no link of its own to,
+reached through other members: each member of this host's link graph it
+binds a route socket for that the graph has a path to (the daemon's
+`Shared::routed_reach`, the service's `Hooks::routed`), plus each machine
+its hub's federated view lists ([Federated snapshots](#federated-snapshots)),
+neither a machine here (`snapshots::routed`, pure). It has no registry
+entry, no `serve-machine-*` thread and no watch: its rows are the hub's
+view's. `Handle::routed` lists them (`snapshots::Routed`): `via` the first
+hop of the first graph path whose first hop is a link up here
+(`fleet::routes::reach`), else the hub whose view lists it; `state`
+`connected` while there is such a path, else `unreachable` with why (a
+path that's there may still fail past its first hop: the call says so);
+`roots` the `root`s of its sandboxes rows in the hub's view, `version`
+and `capacity` the view's.
+
+Everything that acts on a machine works on a routed one the same way,
+over `RouteDial` (`fleet::dialer::routed`: one `API` stream through
+`route::connect`) where a direct machine uses its link: forwarded quick
+calls (`Handle::call_routed`: a stream of its own per call, hello within
+`Timing::handshake`, the call within `Timing::call`), verbs
+(`Handle::dial`), the federated calls, terminals and forwards (already on
+`route::connect`). Its daemon serves them under its trust for this host
+([fleet](fleet.md#routed-streams), *The destination*). What's refused:
+`machines.set` (no entry to keep `agent` in, and `AGENT` isn't routed,
+decision 58: `denied`, `snapshots::routed_agent`), and so the dashboard's
+agent toggle.
 
 ## Forwarded requests
 
-A request carrying `machine` (neither registered nor an inbound neighbor
-up now: `not-found`; one seen only through this host's hub, [Federated
-snapshots](#federated-snapshots): `denied` naming the hub,
-`snapshots::seen_via`, from `Handle::unknown`) has it stripped and goes
-to that machine, but for the ones served here:
+A request carrying `machine` (neither registered, an inbound neighbor
+up now nor [routed](#routed-machines): `not-found`, `Handle::unknown`)
+has it stripped and goes to that machine, but for the ones served here:
 
 - **Quick calls** (`forward::QUICK`: `instances.list|cancel|procs|signal|
   rename|done|buildLog|resolve`, `containers.logs|inspect`,
@@ -343,36 +371,39 @@ to that machine, but for the ones served here:
   call arriving during the backoff retries the connect at once, and calls
   queued when a connect fails or while the carrier is down get `failed`
   (`<machine>: unreachable: …`; during the carrier's first attempt they
-  wait for it). The remote's answer, error code and data included, is the
-  answer.
-- **Verbs** get a fresh `API` stream per request (`Dial`), so a build
+  wait for it). A routed machine's go over a stream of their own each
+  ([Routed machines](#routed-machines)). The remote's answer, error code
+  and data included, is the answer.
+- **Verbs** get a fresh `API` stream per request (`Handle::dial`: the
+  link's `Dial`, a routed machine's `RouteDial`), so a build
   never holds up the link. The requester's `SSH_AUTH_SOCK` (an absolute
   path in `env`) is reported to this daemon (`bridge::report_agent`), so
   the machine's `AGENT` streams reach the live agent of whoever asked even
   when the daemon started without one; the rest of `env` gives way to the
-  machine daemon's own. A link that's down fails it at once
-  (`<machine>: unreachable: <why>`). `output`/`progress` are relayed with
+  machine daemon's own. A link that's down, or no route that opens, fails
+  it at once (`<machine>: unreachable: <why>`). `output`/`progress` are relayed with
   `request` rewritten to the local id. While its stream is open it's a
   `verbs` holder here. A hang-up, or a local drain, closes the stream,
   which the remote sees as a hang-up: cancelled there unless `detach`.
 - **Federated** `instances.resolve` / `sandboxes.list` with `machines:
-  true` ask this host and every machine in parallel, each machine given
+  true` ask this host and every machine (routed ones too, at their roots
+  as the hub's view has them) in parallel, each machine given
   `FANOUT_WAIT` (5 s). Remote matches come back qualified (`box/web-2`)
   with an additive `found: [{name, machine, root}]`; a machine that doesn't
   answer adds nothing, and an empty result names the unreachable ones.
 - **Served here** (`forward::HERE`: `forwards.add`): `machine` names where
   the forward reaches, not where it runs. The daemon keeps the param and
   answers itself, binding the forward on this host with one `TUNNEL`
-  stream per bridge over the machine's link, whatever its kind
-  ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)); a
-  machine seen through the hub is `denied` before it (`daemon::handle`).
+  stream per bridge over the machine's link, or a route, whatever its
+  kind ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
 
 - **`machines.get {name, agent?}`** takes the caller's absolute
   `SSH_AUTH_SOCK` as `agent` and reports it like a verb's: the CLI's
-  re-runs pass it ([The CLI](#the-cli-clirs)). A machine seen through
-  the hub is `denied` naming the hub (so is `machines.set`), which is
-  what the CLI prints for a command on it; a tab's `--reserve-255`
-  resolve takes `denied` as final, not as an outage
+  re-runs pass it ([The CLI](#the-cli-clirs)). A routed machine answers
+  kind `routed`, no `target`, its view roots (the agent isn't reported:
+  `AGENT` isn't routed); the CLI takes it like an inbound one
+  (`Kind::from_wire`: no ssh target, reached over the sockets). A tab's
+  `--reserve-255` resolve takes `denied` as final, not as an outage
   (`cli::resolve_lost`).
 
 ## Federated snapshots
@@ -381,7 +412,7 @@ to that machine, but for the ones served here:
 gets every push merged with each machine's rows (`snapshots::merge`): rows
 gain `machine` and keep their remote `root`, and a top-level `machines`
 array carries each machine's `name`, `kind` (`ssh` |
-`inbound`, fleet plan decision 29), `target` (`null` for an inbound one), `state`,
+`inbound` | `routed`, fleet plan decisions 29, 60), `target` (`null` for an inbound one), `state`,
 `error`, `version`, `command`,
 `runtime`, `agent`, `capacity` (its host's
 [capacity report](fleet.md#capacity), from its last push), `via`. A machine's push or state change re-publishes those
@@ -390,15 +421,16 @@ watchers' roots from the last local params. Details:
 
 On a fleet member, `merge` also lifts the hub's `Machine::fleet` view:
 each machine it lists becomes an entry of its own after the direct ones,
-`via` the hub, with no `target`, `command` or `agent` (no link here
-reaches it), its rows as the hub tagged them; while the hub's link isn't
+kind `routed`, `via` the hub, with no `target`, `command` or `agent` (no
+link of its own here reaches it), its rows as the hub tagged them; while the hub's link isn't
 connected it takes the hub's state, `error` `through <hub>: <why>`, rows
 last known. A machine this host links to wins over the same name seen
 via the hub. The view lives in `Remotes` only (never in `remotes.json`:
 `saved::of` takes rows and versions), and isn't a machine of the
-service's: placement (`fleet::placed::workers`, over `Remotes::all`), the
-federated calls and `machines.list` never see it; `Remotes::via` (pure:
-`snapshots::via_of`) names the hub for the refusals.
+service's: placement (`fleet::placed::workers`, over `Remotes::all`)
+never sees it; its machines are [routed](#routed-machines)
+(`Remotes::routed`), which is how `machines.list`, the federated calls and
+forwarded requests reach them.
 
 On a hub, a link peer's federated watch (a member watching it,
 [fleet](fleet.md#hub-mode)) is merged with `merge`'s `except` the peer's
@@ -673,7 +705,8 @@ on; a name the registry or an inbound neighbor has is refused. `set <name> --age
 required) changes it on a registered machine and prints `<name>: agent
 on|off`; both are refused for an inbound one
 ([Inbound neighbors](#inbound-neighbors)). `ls` shows it in an `AGENT`
-column, and `inbound` as an inbound machine's `TARGET`; `CAPACITY` is the
+column, and `inbound` as an inbound machine's `TARGET`, `routed via
+<hop>` as a [routed](#routed-machines) one's (its `AGENT` `-`); `CAPACITY` is the
 machine's last [capacity report](fleet.md#capacity)
 (`machines.list`'s `capacity`, `-` before one came), the over-cap note in
 parentheses; a machine this host's membership holds as an introduction
@@ -755,9 +788,11 @@ down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers
 ([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*); on an
 inbound machine it only says why there's nothing to flip
-(`App::toggle_selected_agent`), on one seen via the hub that it's
-view-only. A tab on a machine seen via the hub is refused naming the hub
-(`on_machine`), and actions on its rows carry its name as `machine`,
-which the daemon refuses the same way.
+(`App::toggle_selected_agent`), on a routed one (seen via the hub) that
+its agent isn't routed (`snapshots::routed_agent`). A routed machine's
+rows are actionable like any other's: its tabs run the same `exec` on the
+qualified name (`on_machine`), dialed over a route, and actions on its
+rows carry its name as `machine`, which the daemon forwards to it over a
+route ([Routed machines](#routed-machines)).
 
 Limitations: [status.md](../../status.md#daemon)

@@ -312,14 +312,16 @@ limitation means editing this file in the same commit.
   same OS and arch (`install::platform_matches`); updating a devsandbox
   that's a symlink replaces the link with a file (`install::INSTALL`'s
   `mv -f`). → [machines](architecture/daemon/machines.md#install)
-- Machines a fleet member sees only through its hub (`via` in the
-  snapshot) are view-only until fleet step 10b routes over the graph:
-  actions, `machine`-param requests, `machines.get`/`set`, forwards and
-  terminals on them are refused naming the hub, and the federated
-  `instances.resolve` / `sandboxes.list` don't ask them. One hop only:
-  the machines the hub itself links to. A member watches its hub
-  federated only while one of its own watchers wants machines.
-  → [fleet](architecture/daemon/fleet.md#hub-mode), [machines](architecture/daemon/machines.md#federated-snapshots); `snapshots::seen_via`, `snapshots::fleet_view`
+- Routed machines (no link of their own here) have no rows but the
+  hub's federated view's, one hop only (the machines the hub itself links
+  to), and a member watches its hub federated only while one of its own
+  watchers wants machines; a graph member the view doesn't list is a
+  `machine ls` row with no roots, so the federated `sandboxes.list`
+  doesn't ask it. Their agent isn't routed (`machines.set` and the
+  dashboard's toggle refuse it) until fleet step 10c; placement and
+  `fleet.*` calls don't reach them until step 10b.7. A routed machine's
+  forward is dropped by a sync while the graph has no path to it.
+  → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`
 - Remote rows live in memory except on a hub (which reloads them from
   `remotes.json`): a fresh non-hub daemon shows a machine without rows
   until its link connects (machines seen via the hub too, until it

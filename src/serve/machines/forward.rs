@@ -2,15 +2,18 @@
 //! *Forwarded requests*).
 //!
 //! - Quick calls with `machine` ([`QUICK`]): the daemon strips it and
-//!   sends the rest over the machine's held link (`service::Handle::forward`);
+//!   sends the rest over the machine's held link (`service::Handle::forward`;
+//!   a routed machine's over a stream of its own, `fleet::route::connect`);
 //!   the remote's answer is the answer, its error code and data kept.
 //! - Verbs with `machine` ([`verb`]): one fresh connection per request, like
 //!   a local verb's one connection, so a long build never holds up the link's
-//!   quick calls. The remote's `output`/`progress` are relayed with `request`
-//!   rewritten to the local id, its answer passed through.
+//!   quick calls (`service::Handle::dial`: on its link, or routed). The
+//!   remote's `output`/`progress` are relayed with `request` rewritten to
+//!   the local id, its answer passed through.
 //! - Federated `instances.resolve` and `sandboxes.list` (`machines: true`):
-//!   this host and every machine in parallel, each machine given
-//!   [`FANOUT_WAIT`] to answer; the joins are pure fns over the answers.
+//!   this host and every machine, routed ones included, in parallel, each
+//!   machine given [`FANOUT_WAIT`] to answer; the joins are pure fns over
+//!   the answers.
 //! - [`HERE`] (`forwards.add`): not forwarded at all; the daemon serves it
 //!   with `machine` kept, binding the forward on this host.
 
@@ -22,10 +25,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::Entry;
 use super::link;
 use super::service::Handle;
-use super::ssh::Dial;
 use crate::serve::api::{ApiError, Found, Resolved, SandboxEntry};
 use crate::serve::client::Streamed;
 use crate::serve::proto::{Notification, Response};
@@ -142,7 +143,7 @@ fn ask_all(links: &Handle, calls: Vec<(String, &'static str, Value)>, wait: Dura
 }
 
 /// `instances.resolve {name, machines: true}`: `local` (this host's own
-/// answer) joined with every registered machine's.
+/// answer) joined with every machine's, routed ones' too.
 pub fn resolve_everywhere(params: &Value, local: Result<Value, ApiError>, links: Option<&Handle>) -> Result<Value, ApiError> {
     // A bad request (no `name`) or an unreadable state fails as it would
     // locally, before anything goes out.
@@ -154,7 +155,8 @@ pub fn resolve_everywhere(params: &Value, local: Result<Value, ApiError>, links:
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
     let remotes = match links {
         Some(links) => {
-            let machines: Vec<String> = links.entries().into_iter().map(|e| e.name).collect();
+            let mut machines: Vec<String> = links.entries().into_iter().map(|e| e.name).collect();
+            machines.extend(links.routed().into_iter().map(|r| r.name));
             let calls = machines.iter().map(|m| (m.clone(), "instances.resolve", json!({ "name": name }))).collect();
             machines.into_iter().zip(ask_all(links, calls, FANOUT_WAIT)).collect()
         }
@@ -240,14 +242,16 @@ fn tidy(machine: &str, message: &str) -> String {
 }
 
 /// `sandboxes.list {root, machines: true}`: `local` (this root's entries)
-/// then each machine's registered roots', tagged `machine` and `root`. A
-/// machine or root that doesn't answer adds nothing: the result stays an
+/// then each machine's registered roots', tagged `machine` and `root` (a
+/// routed machine's roots as the hub's view has them, `snapshots::Routed`).
+/// A machine or root that doesn't answer adds nothing: the result stays an
 /// array, and a client wanting to say why reads `machines.list`.
 pub fn sandboxes_everywhere(local: Result<Value, ApiError>, links: Option<&Handle>) -> Result<Value, ApiError> {
     let local = local?;
     let Some(links) = links else { return Ok(local) };
-    let roots: Vec<(String, PathBuf)> =
+    let mut roots: Vec<(String, PathBuf)> =
         links.entries().into_iter().flat_map(|e| e.roots.into_iter().map(move |r| (e.name.clone(), r))).collect();
+    roots.extend(links.routed().into_iter().flat_map(|m| m.roots.into_iter().map(move |r| (m.name.clone(), r))));
     let calls = roots.iter().map(|(m, r)| (m.clone(), "sandboxes.list", json!({ "root": r }))).collect();
     let answers = ask_all(links, calls, FANOUT_WAIT);
     Ok(join_sandboxes(local, roots.into_iter().zip(answers).collect()))
@@ -273,10 +277,8 @@ fn join_sandboxes(local: Value, remotes: Vec<((String, PathBuf), Result<Response
 
 /// What a forwarded verb needs from the daemon.
 pub struct VerbCtx<'a> {
-    /// The registered machines (the links' entries).
-    pub entries: Vec<Entry>,
-    pub dial: &'a Dial,
-    /// The links: why a machine whose link is down is unreachable.
+    /// The machines: a fresh stream to one (`Handle::dial`), and why one
+    /// whose link is down is unreachable.
     pub links: &'a Handle,
     /// The forwarded verbs in flight: an idle holder each, while its ssh runs.
     pub held: &'a AtomicUsize,
@@ -302,7 +304,8 @@ impl Drop for Holding<'_> {
 }
 
 /// Verb `method` on machine `machine` (its `params` still carrying
-/// `machine`): a fresh `API` stream on its link (the [`Dial`]) and hello,
+/// `machine`): a fresh `API` stream on its link, or a routed machine's
+/// over a route (`service::Handle::dial`), and hello,
 /// then the request minus `machine`, its notifications relayed to `peer`
 /// under local request id `id`. The machine runs it with its daemon's own
 /// env (the link's peer env, `fleet::lent::Peer`), so only the agent is
@@ -321,22 +324,25 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
     let failed = |message: String| {
         Some(Response::err_with(id, "failed", message, Some(json!({ "exit": null, "instance": null }))))
     };
-    let Some(entry) = ctx.entries.iter().find(|e| e.name == machine) else {
+    if ctx.links.entries().iter().all(|e| e.name != machine) && ctx.links.routed_one(machine).is_none() {
         let e = ctx.links.unknown(machine);
         return Some(Response::err(id, e.code, e.message));
-    };
+    }
     match check_verb_params(&params) {
         Ok(Some(agent)) => crate::devsbd::bridge::report_agent(agent),
         Ok(None) => {}
         Err(e) => return Some(Response::err(id, e.code, e.message)),
     }
     let _holding = Holding::new(ctx.held);
-    let duplex = match (ctx.dial)(entry) {
+    let dialed = ctx.links.dial(machine).unwrap_or_else(|| Err(anyhow::anyhow!("no longer a machine here")));
+    let duplex = match dialed {
         Ok(duplex) => duplex,
         Err(e) => {
             let down = ctx.links.remotes().get(machine).filter(|m| m.state != LinkState::Connected).and_then(|m| m.error);
             return failed(match down {
                 Some(why) => format!("{machine}: unreachable: {why}"),
+                // A routed machine (no link here): why no route opened.
+                None if ctx.links.remotes().get(machine).is_none() => format!("{machine}: unreachable: {e:#}"),
                 None => format!("{machine}: {e:#}"),
             });
         }
@@ -400,6 +406,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::serve::machines::Entry;
     use crate::serve::client::{self, Conn, Hello};
     use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
     use crate::serve::daemon::Exit;

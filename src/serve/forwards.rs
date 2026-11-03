@@ -179,7 +179,8 @@ impl Registry {
     /// is the ad-hoc forwards' file ([`forward_store::path`] outside tests),
     /// restored before any request is served; `machines` is `machines.toml`,
     /// read for remote forwards (each add, each bridge spawn, each sync),
-    /// with `inbound`'s neighbors machines beside its entries (while up);
+    /// with `inbound`'s neighbors machines beside its entries (while up),
+    /// and `routed`'s;
     /// `socket_dir` is the daemon's, where each machine's link has its
     /// socket; `on_event` gets every [`Event`] (called on the registry
     /// thread: it must not block).
@@ -188,6 +189,7 @@ impl Registry {
         store: PathBuf,
         machines: PathBuf,
         inbound: Arc<Neighbors>,
+        routed: RoutedNames,
         socket_dir: PathBuf,
         on_event: OnEvent,
     ) -> Registry {
@@ -196,7 +198,7 @@ impl Registry {
         let thread = {
             let active = Arc::clone(&active);
             std::thread::Builder::new().name("serve-forwards".into()).spawn(move || {
-                let known = Known { registry: machines, inbound };
+                let known = Known { registry: machines, inbound, routed };
                 let mut daemon = Daemon::new(log, store, known, socket_dir, on_event, active);
                 daemon.restore();
                 daemon.poll();
@@ -263,18 +265,23 @@ impl super::api::Forwarding for Handle {
     }
 }
 
-/// The machines a remote forward may go into: `machines.toml`'s entries
-/// and the inbound neighbors up now.
+/// The routed machines' names now (`machines::service::Handle::routed`).
+pub type RoutedNames = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// The machines a remote forward may go into: `machines.toml`'s entries,
+/// the inbound neighbors up now and the routed machines.
 #[derive(Clone)]
 struct Known {
     registry: PathBuf,
     inbound: Arc<Neighbors>,
+    routed: RoutedNames,
 }
 
 impl Known {
     fn names(&self) -> anyhow::Result<BTreeSet<String>> {
         let mut names: BTreeSet<String> = machines::load(&self.registry)?.into_iter().map(|m| m.name).collect();
         names.extend(self.inbound.list().into_iter().map(|n| n.name));
+        names.extend((self.routed)());
         Ok(names)
     }
 }
@@ -392,7 +399,7 @@ impl Daemon {
     }
 
     /// `forwards.add` into `machine`: it must be registered (or an inbound
-    /// neighbor up now); the far side resolves the rest, on the forward's
+    /// neighbor up now, or routed); the far side resolves the rest, on the forward's
     /// own thread.
     fn add_remote(&mut self, machine: String, req: &AddRequest) -> Result<Added, ApiError> {
         let known = self.registered().map_err(ApiError::internal)?;
@@ -1396,6 +1403,7 @@ forwardPorts = ["redis:6379"]
             store.to_path_buf(),
             store.with_file_name("machines.toml"),
             Arc::default(),
+            Arc::new(Vec::new),
             store.parent().unwrap().to_path_buf(),
             Box::new(move |e| sink.lock().unwrap().push(e)),
         );
@@ -1619,8 +1627,21 @@ forwardPorts = ["redis:6379"]
             }
         });
         let inbound: Arc<Neighbors> = Arc::default();
-        let known = Known { registry: machines_toml.clone(), inbound: Arc::clone(&inbound) };
+        let routed_now: Arc<Mutex<Vec<String>>> = Arc::default();
+        let names = Arc::clone(&routed_now);
+        let routed: RoutedNames = Arc::new(move || names.lock().unwrap().clone());
+        let known = Known { registry: machines_toml.clone(), inbound: Arc::clone(&inbound), routed };
         let mut d = Daemon::new(quiet, store.clone(), known, tmp("remote-drop-sock"), on_event, Arc::default());
+        // A routed machine's forward, while it's routed.
+        let into_r = || AddRequest { machine: Some("r".into()), ..remote_request() };
+        assert_eq!(d.add(into_r()).unwrap_err().code, "not-found", "no routed `r` yet");
+        routed_now.lock().unwrap().push("r".into());
+        d.add(into_r()).unwrap();
+        d.drop_unregistered();
+        assert_eq!(d.rows(None, true).len(), 1, "a routed machine's forward lasts while it's routed");
+        routed_now.lock().unwrap().clear();
+        d.drop_unregistered();
+        assert!(d.rows(None, true).is_empty(), "gone with it");
         let into_nb = || AddRequest { machine: Some("nb".into()), ..remote_request() };
         assert_eq!(d.add(into_nb()).unwrap_err().code, "not-found", "no neighbor `nb` yet");
         let up = inbound.announce("nb", "v", false);

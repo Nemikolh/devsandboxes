@@ -52,13 +52,14 @@ pub enum Authority<'a> {
 
 /// This host as a removal sees it: its member name, its hub, the machines
 /// it links to directly (registry and inbound neighbors), whether the name
-/// asked about is one it sees only through its hub, the fleet's authority,
+/// asked about is a routed machine here (no link of its own,
+/// `service::Handle::routed`), the fleet's authority,
 /// and whether the name is in its membership log (a member, or revoked).
 pub struct Here<'a> {
     pub name: &'a str,
     pub hub: &'a Hub,
     pub machines: &'a [String],
-    pub seen_via_hub: bool,
+    pub routed: bool,
     pub authority: Authority<'a>,
     pub in_log: bool,
 }
@@ -112,7 +113,7 @@ pub fn plan(here: &Here, name: &str, from: Option<&str>) -> Result<Plan, ApiErro
             "this host's fleet has no membership log: make the fleet again with `devsandbox machine add`",
         )),
         Authority::Other(a) if a == name => Err(ApiError::denied(format!("`{name}` is the fleet's authority: it can't be removed"))),
-        _ if !(known || here.seen_via_hub) => Err(unknown(name)),
+        _ if !(known || here.routed) => Err(unknown(name)),
         Authority::This => Ok(Plan::Revoke { name: name.into() }),
         Authority::Other(a) => Ok(Plan::Propose { authority: a.into() }),
     }
@@ -263,11 +264,11 @@ pub fn rm(params: Value, ctx: &Ctx) -> Answer {
     let (me, hub) = api::own_member(ctx)?;
     let path = member_toml(ctx)?;
     let machines: Vec<String> = api::machines(ctx)?.into_iter().map(|e| e.name).collect();
-    let seen_via_hub = ctx.links.as_ref().is_some_and(|l| l.remotes().via(&p.name).is_some());
+    let routed = ctx.links.as_ref().is_some_and(|l| l.routed_one(&p.name).is_some());
     let stored = membership_api::load(path)?;
     let (_, key) = membership_api::own(path, &ctx.hostname)?;
     let authority = authority_of(stored.as_ref(), &me, &crate::serve::fleet::identity::Signer::public_key(&key));
-    let here = Here { name: &me, hub: &hub, machines: &machines, seen_via_hub, authority, in_log: in_log(stored.as_ref(), &p.name) };
+    let here = Here { name: &me, hub: &hub, machines: &machines, routed, authority, in_log: in_log(stored.as_ref(), &p.name) };
     let answer = match plan(&here, &p.name, None)? {
         Plan::Revoke { name } => RmAnswer::Revoked(changes::revoke(ctx, &name)?),
         Plan::Propose { authority } => {
@@ -422,7 +423,7 @@ fn fleet_call_inner(method: &str, params: Value, from: &str, ctx: &Ctx) -> Resul
             let machines: Vec<String> = api::machines(ctx)?.into_iter().map(|e| e.name).collect();
             let stored = membership_api::load(member_toml(ctx)?)?;
             let in_log = in_log(stored.as_ref(), &p.name);
-            let here = Here { name: &me, hub: &hub, machines: &machines, seen_via_hub: false, authority: Authority::None, in_log };
+            let here = Here { name: &me, hub: &hub, machines: &machines, routed: false, authority: Authority::None, in_log };
             let Plan::Remove { name, tell } = plan(&here, &p.name, Some(from))? else {
                 return Err(ApiError::denied("`fleet.rm` removes another member"));
             };
@@ -453,7 +454,7 @@ mod tests {
     /// fleet's authority `authority`, `in_log` whether the name is in its log.
     fn plan_on(hub: Hub, machines: &[&str], seen: bool, authority: Authority, in_log: bool, name: &str, from: Option<&str>) -> Result<Plan, ApiError> {
         let machines = names(machines);
-        plan(&Here { name: "lap", hub: &hub, machines: &machines, seen_via_hub: seen, authority, in_log }, name, from)
+        plan(&Here { name: "lap", hub: &hub, machines: &machines, routed: seen, authority, in_log }, name, from)
     }
 
     /// [`plan_on`] with `lap` the authority, the name not in the log.

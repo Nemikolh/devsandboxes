@@ -683,7 +683,13 @@ fn cells(r: MachineRow) -> [String; 7] {
         Some((first, [])) => first.display().to_string(),
         Some((first, rest)) => format!("{} +{}", first.display(), rest.len()),
     };
-    let target = r.target.unwrap_or_else(|| "inbound".into());
+    // An inbound machine has no target: its kind; a routed one, its first hop.
+    let target = match (r.target, r.kind, r.via) {
+        (Some(target), ..) => target,
+        (None, crate::serve::machines::MachineKind::Routed, via) => format!("routed via {}", via.as_deref().unwrap_or("-")),
+        (None, ..) => "inbound".into(),
+    };
+    let agent = if r.kind == crate::serve::machines::MachineKind::Routed { "-" } else { on_off(r.agent) };
     let capacity = r.capacity.as_ref();
     let mut room = capacity::summary(capacity);
     if let Some(note) = capacity.and_then(capacity::over_note) {
@@ -693,7 +699,7 @@ fn cells(r: MachineRow) -> [String; 7] {
         name,
         target,
         roots,
-        on_off(r.agent).into(),
+        agent.into(),
         r.state.as_str().into(),
         r.version.unwrap_or_else(|| "-".into()),
         room,
@@ -1163,6 +1169,7 @@ mod tests {
             version: version.map(String::from),
             capacity: None,
             introduced_by: None,
+            via: None,
         };
         assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "off", "idle", "-", "-"].map(String::from));
         assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..6], ["/a +2", "off", "idle", "0.7.0"].map(String::from));
@@ -1183,6 +1190,8 @@ mod tests {
         assert_eq!(cells(row(&[], None))[2], "-");
         let inbound = MachineRow { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..row(&[], None) };
         assert_eq!(cells(inbound)[1], "inbound");
+        let routed = MachineRow { kind: crate::serve::machines::MachineKind::Routed, target: None, via: Some("box".into()), ..row(&[], None) };
+        assert_eq!(cells(routed)[1..4], ["routed via box", "-", "-"].map(String::from));
         // A capped member: named with its introducer.
         let capped = MachineRow { introduced_by: Some("lap".into()), ..row(&[], None) };
         assert_eq!(cells(capped)[0], "m (introduced by lap)");

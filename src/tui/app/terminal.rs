@@ -1192,13 +1192,14 @@ mod tests {
             // `:exec` too.
             assert_eq!(app.exec_argv("box/inst1", &["uname".into()]).unwrap(), ["/opt/bin/devsandbox", "exec", "-i", "-t", "--", "box/inst1", "uname"]);
             assert_eq!(app.exec_argv("nope/x", &[]), Err("no machine named `nope`".into()));
-            // Seen only through the hub: refused naming it, nothing dialed.
+            // Seen only through the hub (routed): the same tab, its dial
+            // routed.
             let mut seen = app.machines.clone();
             seen[0].via = Some("k".into());
+            seen[0].kind = crate::serve::machines::MachineKind::Routed;
             let real = std::mem::replace(&mut app.machines, seen);
-            let refused = crate::serve::snapshots::seen_via("box", "k");
-            assert_eq!(app.exec_argv("box/inst1", &[]), Err(refused.clone()));
-            assert_eq!(app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID), Err(format!("terminal: {refused}")));
+            assert_eq!(app.exec_argv("box/inst1", &[]).unwrap(), ["/opt/bin/devsandbox", "exec", "-i", "-t", "--", "box/inst1"]);
+            assert_eq!(app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID).unwrap().0[..5], ["/opt/bin/devsandbox", "exec", "-i", "-t", "--reserve-255"]);
             app.machines = real;
 
             // Dedup: box's tab doesn't stand for the local one's.

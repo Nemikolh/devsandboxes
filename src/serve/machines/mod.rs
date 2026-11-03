@@ -98,6 +98,10 @@ pub enum MachineKind {
     /// is dialed from its end, a machine here while that link is up;
     /// never a registry entry.
     Inbound,
+    /// A routed machine (`routed`): a fleet member this host has no link
+    /// of its own to, reached over a route through other members (fleet
+    /// plan decision 60); never a registry entry.
+    Routed,
 }
 
 impl Kind {
@@ -110,12 +114,14 @@ impl Kind {
     }
 
     /// Back from the wire's `kind` and `target`: an ssh machine needs its
-    /// target.
+    /// target. A routed machine comes back as `Inbound`: like one, it has
+    /// no ssh target and is reached over this host's sockets
+    /// (`fleet::route::connect`), all the CLI asks of it.
     pub fn from_wire(kind: MachineKind, target: Option<String>) -> Result<Kind> {
         match (kind, target) {
             (MachineKind::Ssh, Some(target)) => Ok(Kind::Ssh { target }),
             (MachineKind::Ssh, None) => bail!("an ssh machine without a target"),
-            (MachineKind::Inbound, _) => Ok(Kind::Inbound),
+            (MachineKind::Inbound | MachineKind::Routed, _) => Ok(Kind::Inbound),
         }
     }
 }
@@ -377,8 +383,10 @@ mod tests {
         assert_eq!(entry("srv", "me@srv").ssh_target().unwrap(), "me@srv");
         assert_eq!(Kind::from_wire(MachineKind::Ssh, Some("t".into())).unwrap(), Kind::Ssh { target: "t".into() });
         assert!(Kind::from_wire(MachineKind::Ssh, None).is_err());
-        assert!(serde_json::from_value::<MachineKind>(serde_json::json!("offered")).is_err(), "ssh | inbound only");
+        assert!(serde_json::from_value::<MachineKind>(serde_json::json!("offered")).is_err(), "ssh | inbound | routed only");
         assert_eq!(Kind::from_wire(MachineKind::Inbound, None).unwrap(), Kind::Inbound);
+        assert_eq!(serde_json::from_value::<MachineKind>(serde_json::json!("routed")).unwrap(), MachineKind::Routed);
+        assert_eq!(Kind::from_wire(MachineKind::Routed, None).unwrap(), Kind::Inbound, "no ssh target either");
         let lap = Entry::inbound("lap", vec!["/f".into()]);
         assert_eq!((lap.target(), lap.label(), lap.kind == Kind::Inbound, lap.kind.wire()), (None, "inbound", true, (MachineKind::Inbound, None)));
         assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("links to this host from its end"));

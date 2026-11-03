@@ -323,10 +323,9 @@ impl Remotes {
         self.lock().get(name).cloned()
     }
 
-    /// The hub machine `name` is seen through, when it's no machine here
-    /// but one of a hub's federated view lists it ([`via_of`]).
-    pub fn via(&self, name: &str) -> Option<String> {
-        via_of(&self.lock().values().cloned().collect::<Vec<_>>(), name)
+    /// The routed machines ([`routed`]) given this host's graph's `reach`.
+    pub fn routed(&self, reach: Vec<(String, Result<String, String>)>) -> Vec<Routed> {
+        routed(reach, &self.lock().values().cloned().collect::<Vec<_>>())
     }
 
     /// Every machine, sorted by name (the rows are `Arc`s: cheap).
@@ -360,29 +359,90 @@ pub struct SnapshotMachine {
     #[serde(default)]
     pub capacity: Option<Capacity>,
     /// The hub it's seen through (a fleet member's view of the hub's other
-    /// machines): view-only, no link of this host's reaches it. `None` for
-    /// a machine this host links to.
+    /// machines, kind `routed`): no link of this host's own reaches it,
+    /// its streams are routed (fleet plan decision 60). `None` for a
+    /// machine this host links to.
     #[serde(default)]
     pub via: Option<String>,
 }
 
-/// Why acting on machine `machine` is refused: this host sees it only
-/// through its hub `hub`'s federated view (fleet plan decision 33).
-pub fn seen_via(machine: &str, hub: &str) -> String {
-    format!("`{machine}` is seen through the hub `{hub}` only: acting on it needs routing over the fleet (fleet step 10)")
+/// Why turning `agent` on for routed machine `machine` (reached through
+/// `via`) is refused: `AGENT` isn't routed (fleet plan decision 58), and a
+/// routed machine has no registry entry here to keep the flag in.
+pub fn routed_agent(machine: &str, via: &str) -> String {
+    format!(
+        "`{machine}` is reached through `{via}`, with no link of its own here: its agent isn't routed until per-member agent grants (fleet step 10c); `devsandbox machine add` links it directly"
+    )
 }
 
-/// The hub `name` is seen through among `machines` (pure): `None` when it's
-/// one of them (a direct machine wins), else the first whose
-/// [`Machine::fleet`] lists it.
-pub fn via_of(machines: &[Machine], name: &str) -> Option<String> {
-    if machines.iter().any(|m| m.name == name) {
-        return None;
+/// A machine this host has no link of its own to, reached over a route
+/// (fleet plan decision 60): a member of this host's link graph with no
+/// link up here, or one its hub's federated view lists. Its rows stay the
+/// hub's view's; nothing here watches it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Routed {
+    pub name: String,
+    /// The first hop of the path a routed stream takes now, else (no path
+    /// opens) the hub whose view lists it.
+    pub via: Option<String>,
+    /// `connected` while the graph has a path to it whose first hop is a
+    /// link up here, else `unreachable` with why.
+    pub state: LinkState,
+    pub error: Option<String>,
+    /// Its roots as the hub's view has them (the `root` of its sandboxes
+    /// rows, in order): what a federated `sandboxes.list` asks it for.
+    pub roots: Vec<PathBuf>,
+    /// Its version and capacity, as the hub's view reports them.
+    pub version: Option<String>,
+    pub capacity: Option<Capacity>,
+}
+
+/// Every routed machine, by name (pure): each member `reach` names (this
+/// host's graph: the first hop of the first usable path, or why there is
+/// none), then each one a hub's [`Machine::fleet`] view lists that `reach`
+/// doesn't (no path in the graph: `unreachable`, via the hub). A machine
+/// in `machines` (a link of its own here, up or not) is never routed.
+pub fn routed(reach: Vec<(String, Result<String, String>)>, machines: &[Machine]) -> Vec<Routed> {
+    let direct = |name: &str| machines.iter().any(|m| m.name == name);
+    let mut out: BTreeMap<String, Routed> = BTreeMap::new();
+    for (name, r) in reach {
+        if direct(&name) {
+            continue;
+        }
+        let (via, state, error) = match r {
+            Ok(hop) => (Some(hop), LinkState::Connected, None),
+            Err(why) => (None, LinkState::Unreachable, Some(why)),
+        };
+        out.insert(name.clone(), Routed { name, via, state, error, ..Routed::default() });
     }
-    machines
-        .iter()
-        .find(|m| m.fleet.as_deref().is_some_and(|v| rows(v, "machines").any(|e| e.get("name").and_then(Value::as_str) == Some(name))))
-        .map(|m| m.name.clone())
+    for hub in machines {
+        let Some(view) = hub.fleet.as_deref() else { continue };
+        for e in rows(view, "machines") {
+            let Ok(seen) = serde_json::from_value::<SnapshotMachine>(e.clone()) else { continue };
+            if direct(&seen.name) {
+                continue;
+            }
+            let r = out.entry(seen.name.clone()).or_insert_with(|| Routed {
+                name: seen.name.clone(),
+                state: LinkState::Unreachable,
+                error: Some(format!("no path to `{}` in this host's link graph", seen.name)),
+                ..Routed::default()
+            });
+            if r.via.is_none() {
+                r.via = Some(hub.name.clone());
+            }
+            r.version = r.version.take().or(seen.version);
+            r.capacity = r.capacity.take().or(seen.capacity);
+            for row in rows(view, "sandboxes").filter(|row| row.get("machine").and_then(Value::as_str) == Some(&seen.name)) {
+                if let Some(root) = row.get("root").and_then(Value::as_str).map(PathBuf::from)
+                    && !r.roots.contains(&root)
+                {
+                    r.roots.push(root);
+                }
+            }
+        }
+    }
+    out.into_values().collect()
 }
 
 /// A hub's federated push (`params`, pushed to this member's `machines:
@@ -427,9 +487,10 @@ pub fn fleet_view(params: &mut Value, me: Option<&str>) -> Value {
 ///
 /// A machine with a [`Machine::fleet`] view (this host's hub) also lifts
 /// each machine that view lists into one of its own, after the direct
-/// ones: `via` the hub, no `target`, `command` or `agent` (no link here
-/// reaches it), its state the hub's while the hub isn't connected, its rows
-/// as the hub tagged them. A machine this host links to directly wins over
+/// ones: kind `routed`, `via` the hub, no `target`, `command` or `agent`
+/// (no link of this host's own reaches it: its streams are routed), its
+/// state the hub's while the hub isn't connected, its rows as the hub
+/// tagged them. A machine this host links to directly wins over
 /// the same name seen through the hub.
 ///
 /// `except` leaves that machine out, its rows and its entry, direct or
@@ -488,10 +549,12 @@ pub fn merge(local: &Value, machines: &[Machine], except: Option<&str>) -> Value
     out
 }
 
-/// Machine `m`, as hub `hub` reported it, made one seen through it: `via`
-/// the hub, nothing that would reach it from here, and while the hub's
-/// own link isn't connected, the hub's state (its rows stay, last known).
+/// Machine `m`, as hub `hub` reported it, made one seen through it: kind
+/// `routed`, `via` the hub, nothing that would reach it over a link of its
+/// own, and while the hub's own link isn't connected, the hub's state (its
+/// rows stay, last known).
 fn lift(m: &mut SnapshotMachine, hub: &Machine) {
+    m.kind = MachineKind::Routed;
     m.via = Some(hub.name.clone());
     m.target = None;
     m.command = None;
@@ -805,12 +868,9 @@ pub(crate) mod tests {
         assert_eq!(merged["sandbox_count"], 2);
         let x = &merged["machines"][1];
         assert_eq!((&x["name"], &x["via"], &x["target"], &x["command"], &x["agent"]), (&"x".into(), &"k".into(), &Value::Null, &Value::Null, &false.into()));
-        assert_eq!((&x["state"], &x["version"]), (&"connected".into(), &"0.6.0".into()));
+        assert_eq!((&x["state"], &x["version"], &x["kind"]), (&"connected".into(), &"0.6.0".into(), &"routed".into()));
         assert_eq!(merged["machines"][0]["via"], Value::Null);
         crate::serve::dts::assert_matches("SnapshotMachine", x);
-        assert_eq!(via_of(&[k.clone()], "x").as_deref(), Some("k"));
-        assert_eq!(via_of(&[k.clone()], "k"), None, "a direct machine");
-        assert_eq!(via_of(&[k.clone()], "y"), None, "a second hop isn't kept");
 
         // This host links to `x` too: its own entry and rows, nothing lifted.
         let mut x = machine("x", &["/x"], LinkState::Connected);
@@ -819,7 +879,6 @@ pub(crate) mod tests {
         assert_eq!(names(&merged, "instances"), ["hub-own@k", "direct@x"]);
         assert_eq!(merged["machines"].as_array().unwrap().len(), 2);
         assert_eq!(merged["machines"][1]["via"], Value::Null);
-        assert_eq!(via_of(&[k.clone(), x], "x"), None);
 
         // The hub's link down: its view stays, with its state.
         k.state = LinkState::Unreachable;
@@ -827,6 +886,34 @@ pub(crate) mod tests {
         let merged = merge(&local, &[k], None);
         assert_eq!(names(&merged, "instances"), ["hub-own@k", "xi@x"]);
         assert_eq!((&merged["machines"][1]["state"], &merged["machines"][1]["error"]), (&"unreachable".into(), &"through k: ssh: no route".into()));
+    }
+
+    /// The routed machines: the graph's members (a path's first hop, or
+    /// why none), then the hub view's others (via the hub, no path); the
+    /// view lends roots, version and capacity; a direct machine never.
+    #[test]
+    fn routed_machines_come_from_the_graph_and_the_hubs_view() {
+        let mut params = hub_push();
+        let view = Arc::new(fleet_view(&mut params, Some("me")));
+        let mut k = machine("k", &["/k"], LinkState::Connected);
+        k.fleet = Some(view);
+        let reach = vec![
+            ("b".to_string(), Ok("k".to_string())),
+            ("m".to_string(), Err("no path to `m` opened".to_string())),
+            ("k".to_string(), Err("its link is down".to_string())),
+        ];
+        let all = routed(reach.clone(), &[k.clone()]);
+        let names: Vec<&str> = all.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["b", "m", "x"], "k is a machine here");
+        assert_eq!((&all[0].via, all[0].state, &all[0].error), (&Some("k".into()), LinkState::Connected, &None));
+        assert_eq!((&all[1].via, all[1].state), (&None, LinkState::Unreachable));
+        let x = &all[2];
+        assert_eq!((&x.via, x.state, x.version.as_deref()), (&Some("k".into()), LinkState::Unreachable, Some("0.6.0")));
+        assert_eq!(x.error.as_deref(), Some("no path to `x` in this host's link graph"));
+        assert_eq!(x.roots, [PathBuf::from("/x")]);
+        // In the graph too: its path's hop, the view's roots.
+        let both = routed(vec![("x".into(), Ok("k".into()))], &[k]);
+        assert_eq!((both[0].state, &both[0].roots), (LinkState::Connected, &vec![PathBuf::from("/x")]));
     }
 
     /// A hub's push to member `m`'s federated watch: `m`'s rows and entry

@@ -44,6 +44,13 @@
 //! carrier. A call made while the carrier is down fails at once with why
 //! (or waits for the carrier's first attempt to end).
 //!
+//! Routed machines ([`Handle::routed`], fleet plan decision 60: members of
+//! this host's link graph with no link up here, or ones its hub's view
+//! lists) have no thread: nothing holds or watches them (their rows are the
+//! hub's view's). A call forwarded to one opens an `API` stream of its own
+//! over the [`RouteDial`] (`fleet::route::connect`), says hello, makes the
+//! call within [`Timing::call`] and closes it, on the caller's thread.
+//!
 //! `agent` isn't the link's business: this host answers the machine's
 //! `AGENT` streams per stream from the registry (`daemon::agent_for`), so a
 //! `reload` that changes only `agent` keeps the live link.
@@ -69,7 +76,7 @@ use super::inbound::Neighbors;
 use super::link::{self, Link};
 use super::{Entry, Kind};
 use super::saved;
-use super::ssh::Dial;
+use super::ssh::{Dial, Duplex, RouteDial};
 use crate::serve::api::ApiError;
 use crate::serve::endpoint::Stream;
 use crate::serve::proto::Response;
@@ -114,6 +121,11 @@ pub struct Hooks {
     /// This host's hub, when another member is (`member.toml`'s `hub`, as
     /// the daemon keeps it): asked at each look at the watchers.
     pub hub: Box<dyn Fn() -> Option<HubOf> + Send + Sync>,
+    /// The members this host's link graph routes to (no link up here),
+    /// each with the first hop of its first usable path or why there is
+    /// none. Called on API threads (it may read `membership.json`), never
+    /// on a link thread.
+    pub routed: Box<dyn Fn() -> Vec<(String, Result<String, String>)> + Send + Sync>,
 }
 
 /// This host as a member of a fleet whose hub is another member.
@@ -180,6 +192,8 @@ struct Inner {
     /// could leave a gone neighbor's link behind.
     reloading: Mutex<()>,
     dial: Dial,
+    /// Opens a routed machine's `API` stream.
+    route: RouteDial,
     /// Carries an ssh machine's link.
     hold: Hold,
     timing: Timing,
@@ -345,7 +359,8 @@ impl Machines {
     /// Start the service: one link per entry of `registry` and per neighbor
     /// of `inbound` (from now on as they come and go), each held at once.
     /// `dial` opens a machine's link (its `fleet-<name>.sock`, or a test
-    /// daemon's socket), `hold` carries an ssh machine's. A `hub`'s saved
+    /// daemon's socket), `route` a routed machine's stream, `hold` carries
+    /// an ssh machine's link. A `hub`'s saved
     /// rows are restored before the links start when this host is the hub
     /// then.
     #[allow(clippy::too_many_arguments)]
@@ -353,6 +368,7 @@ impl Machines {
         registry: PathBuf,
         inbound: Arc<Neighbors>,
         dial: Dial,
+        route: RouteDial,
         hold: Hold,
         timing: Timing,
         hooks: Hooks,
@@ -365,6 +381,7 @@ impl Machines {
             inbound,
             reloading: Mutex::new(()),
             dial,
+            route,
             hold,
             timing,
             hooks,
@@ -587,22 +604,46 @@ impl Handle {
         &self.inner.remotes
     }
 
-    /// The error for `machine`, no machine here: `denied` naming the hub
-    /// when this host sees it through its hub's view (view-only, fleet plan
-    /// decision 33), else `not-found`.
+    /// The error for `machine`, neither a machine here nor routed:
+    /// `not-found`.
     pub fn unknown(&self, machine: &str) -> ApiError {
-        match self.inner.remotes.via(machine) {
-            Some(hub) => ApiError::denied(snapshots::seen_via(machine, &hub)),
-            None => ApiError::not_found(format!("no machine named `{machine}`")),
+        ApiError::not_found(format!("no machine named `{machine}`"))
+    }
+
+    /// The routed machines now (`snapshots::routed`): the graph's
+    /// ([`Hooks::routed`]) and the hub view's, none with a link here.
+    pub fn routed(&self) -> Vec<snapshots::Routed> {
+        self.inner.remotes.routed((self.inner.hooks.routed)())
+    }
+
+    /// Routed machine `name`, if it is one.
+    pub fn routed_one(&self, name: &str) -> Option<snapshots::Routed> {
+        if self.inner.lock_links().contains_key(name) {
+            return None;
+        }
+        self.routed().into_iter().find(|r| r.name == name)
+    }
+
+    /// A fresh `API` stream to `machine`'s daemon: over its link for a
+    /// machine here, over the [`RouteDial`] for a routed one; `None` for a
+    /// name that's neither. What a forwarded verb runs on.
+    pub fn dial(&self, machine: &str) -> Option<anyhow::Result<Duplex>> {
+        let entry = self.inner.lock_links().get(machine).map(|l| l.entry.clone());
+        match entry {
+            Some(entry) => Some((self.inner.dial)(&entry)),
+            None => self.routed_one(machine).map(|_| (self.inner.route)(machine)),
         }
     }
 
-    /// Call `method` on machine `machine`'s daemon over its link: the
-    /// remote's response as is (its error code kept), or `not-found` for a
-    /// machine that isn't registered.
+    /// Call `method` on machine `machine`'s daemon over its link (a routed
+    /// machine's: a stream of its own, [`Self::call_routed`]): the remote's
+    /// response as is (its error code kept), or `not-found` for a name
+    /// that's no machine here nor routed.
     pub fn forward(&self, machine: &str, method: &str, params: Value) -> Result<Response, ApiError> {
-        let tx = match self.inner.lock_links().get(machine) {
-            Some(l) => l.tx.clone(),
+        let tx = self.inner.lock_links().get(machine).map(|l| l.tx.clone());
+        let tx = match tx {
+            Some(tx) => tx,
+            None if self.routed_one(machine).is_some() => return self.call_routed(machine, method, params),
             None => return Err(self.unknown(machine)),
         };
         let (reply, rx) = mpsc::channel();
@@ -616,6 +657,21 @@ impl Handle {
             RecvTimeoutError::Timeout => ApiError::internal(anyhow::anyhow!("{machine}: no answer")),
             RecvTimeoutError::Disconnected => stopping(),
         })
+    }
+
+    /// `method` on routed machine `machine`: an `API` stream opened over
+    /// the [`RouteDial`], the hello within [`Timing::handshake`], the call
+    /// within [`Timing::call`], then closed. No path or a failed hello is
+    /// `failed`, why.
+    fn call_routed(&self, machine: &str, method: &str, params: Value) -> Result<Response, ApiError> {
+        let t = &self.inner.timing;
+        let duplex = (self.inner.route)(machine).map_err(|e| ApiError::failed(format!("{machine}: unreachable: {e:#}")))?;
+        let mut link = link::handshake(machine, duplex, t.handshake, link::Over::Link).map_err(|e| ApiError::failed(e.to_string()))?;
+        match link.conn.call_within(method, params, t.call) {
+            Ok(Some(r)) => Ok(r),
+            Ok(None) => Err(ApiError::internal(anyhow::anyhow!("{machine}: timed out"))),
+            Err(e) => Err(ApiError::failed(format!("{machine}: {e:#}"))),
+        }
     }
 }
 
@@ -1135,7 +1191,12 @@ mod tests {
     }
 
     fn no_hooks() -> Hooks {
-        Hooks { watching: Box::new(|| false), changed: Box::new(|| {}), hub: Box::new(|| None) }
+        Hooks { watching: Box::new(|| false), changed: Box::new(|| {}), hub: Box::new(|| None), routed: Box::new(Vec::new) }
+    }
+
+    /// No routed machine is ever dialed in these tests.
+    fn no_route() -> RouteDial {
+        Arc::new(|name: &str| anyhow::bail!("no route to `{name}`"))
     }
 
     fn counting_dial(dials: &Arc<AtomicUsize>) -> Dial {
@@ -1158,7 +1219,7 @@ mod tests {
         let dials = Arc::new(AtomicUsize::new(0));
         let (up, runs) = (Arc::new(AtomicBool::new(true)), Arc::default());
         let timing = Timing { call: Duration::from_millis(200), ..opts(1, 0).machine_timing };
-        let machines = Machines::spawn(registry, Arc::default(), counting_dial(&dials), fake_hold(&up, &runs), timing, no_hooks(), None, |_| {});
+        let machines = Machines::spawn(registry, Arc::default(), counting_dial(&dials), no_route(), fake_hold(&up, &runs), timing, no_hooks(), None, |_| {});
         let h = machines.handle();
         for round in 1..=2 {
             let r = h.forward("m", "instances.list", json!({"dir": "/x"})).unwrap();
@@ -1190,7 +1251,7 @@ mod tests {
         let (up, runs) = (Arc::new(AtomicBool::new(false)), Arc::default());
         let timing = opts(1, 0).machine_timing;
         let log = |line: &str| LOGGED.lock().unwrap().push(line.into());
-        let machines = Machines::spawn(registry, Arc::default(), counting_dial(&dials), fake_hold(&up, &runs), timing, no_hooks(), None, log);
+        let machines = Machines::spawn(registry, Arc::default(), counting_dial(&dials), no_route(), fake_hold(&up, &runs), timing, no_hooks(), None, log);
         let h = machines.handle();
         let state = || h.remotes().get("c").unwrap();
         wait_for("the carrier retried", Duration::from_secs(5), || ran(&runs, "c") >= 3);
@@ -1227,11 +1288,11 @@ mod tests {
         let changed = Arc::new(AtomicUsize::new(0));
         let hooks = {
             let c = Arc::clone(&changed);
-            Hooks { watching: Box::new(|| false), changed: Box::new(move || _ = c.fetch_add(1, Ordering::SeqCst)), hub: Box::new(|| None) }
+            Hooks { watching: Box::new(|| false), changed: Box::new(move || _ = c.fetch_add(1, Ordering::SeqCst)), hub: Box::new(|| None), routed: Box::new(Vec::new) }
         };
         let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
         let (up, runs) = (Arc::new(AtomicBool::new(false)), Arc::default());
-        let machines = Machines::spawn(registry.clone(), Arc::default(), no_dial, fake_hold(&up, &runs), opts(1, 0).machine_timing, hooks, None, |_| {});
+        let machines = Machines::spawn(registry.clone(), Arc::default(), no_dial, no_route(), fake_hold(&up, &runs), opts(1, 0).machine_timing, hooks, None, |_| {});
         let h = machines.handle();
         assert!(!h.remotes().get("m").unwrap().agent);
         let ctl = Arc::clone(&h.inner.lock_links()["m"].ctl);
@@ -1285,7 +1346,7 @@ mod tests {
         };
         let runs = Arc::new(Mutex::new(Vec::new()));
         let hold = fake_hold(&Arc::new(AtomicBool::new(false)), &runs);
-        let machines = Machines::spawn(registry, neighbors, dial, hold, opts(1, 0).machine_timing, no_hooks(), hub, log);
+        let machines = Machines::spawn(registry, neighbors, dial, no_route(), hold, opts(1, 0).machine_timing, no_hooks(), hub, log);
         (machines, guard, up, dials, runs)
     }
 
@@ -1409,7 +1470,7 @@ mod tests {
         };
         let timing = Timing { backoff: Duration::from_secs(60), backoff_cap: Duration::from_secs(60), ..opts(1, 0).machine_timing };
         let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
-        let machines = Machines::spawn(registry, Arc::default(), no_dial, hold, timing, no_hooks(), None, |_| {});
+        let machines = Machines::spawn(registry, Arc::default(), no_dial, no_route(), hold, timing, no_hooks(), None, |_| {});
         let h = machines.handle();
         wait_for("up", Duration::from_secs(5), || runs.load(Ordering::SeqCst) == 1 && lock(&h.inner.lock_links()["c"].ctl.carrier).up);
         h.cycle();
