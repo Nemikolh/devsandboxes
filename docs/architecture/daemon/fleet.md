@@ -1570,9 +1570,9 @@ it never signs on a remote request alone (decision 49;
 
 #### Link graph
 
-The fleet's links are the members' own signed reports
-(`src/serve/fleet/graph.rs`), pure for now: nothing sends or collects
-them yet.
+The fleet's links are the members' own signed reports: the model in
+`src/serve/fleet/graph.rs` (pure), how they travel in
+`src/serve/fleet/reports.rs`.
 
 - **A report** (`graph::Report`) is a member's trust, whether it's
   always on, and each of its links (`LinkReport`: the peer, whether this
@@ -1600,6 +1600,40 @@ them yet.
   order to try: fewest hops (the direct link first), then fewest hops
   through members not always on (the destination not counted), then the
   longest up (its edges' newest `since` oldest), then by name.
+- **This host's report** (`reports::Tracker`, pure) follows its machines'
+  links (`Remotes`, `reports::links_of`): `dials` for an ssh machine (this
+  host has a shell there), not for an inbound one; `since` when the link
+  last came up or went down. A down link moving between `idle`,
+  `connecting` and `unreachable` keeps the state first recorded, so a
+  retrying link doesn't flap. A peer new or gone, a link up or down, or
+  `dials` changed makes a report due `reports::DEBOUNCE` (1.5 s) later,
+  later changes joining it; the hub link coming up makes it due at once.
+  The report lists only peers the log or a held introduction names; its
+  trust is `member.toml`'s, and it's always on when the daemon never
+  idles out (keep-alive, or the hub).
+- **Sending it** (`reports::Publisher`, the `serve-fleet-graph` thread,
+  woken by `service::Hooks::changed` through `Published::poke`): signed
+  with `member.key`, taken into this host's own graph, and sent to the
+  hub as `fleet.report {statement, report}` while that link is up. The
+  hub takes it (`reports::report_call`: the sender's own report only)
+  and, when its graph changed (that report, or its own), pushes every
+  report it holds to each machine whose link is up, as
+  `fleet.graph {reports}`, as `changes::push` sends the log.
+- **Exchanges.** On each link that comes up, both ends send `fleet.graph
+  {reports}` with every report they hold, and take the answer: every
+  report the peer holds. `reports::graph_call` takes what's carried
+  (each verifies by its signer's key whoever carried it, so a member with
+  no link to the hub gets the graph from a neighbor; a refusal, an older
+  one included, is logged, not fatal) and answers the whole graph; on
+  the hub a change is pushed on. A host's own report coming back from a
+  peer moves its next version past it (`reports::take_into`).
+- **Held in memory** (`Shared::graph`, `reports::Published`), never
+  persisted: a restarted daemon starts empty and rebuilds from its own
+  report and its peers' exchanges. Each take and each read prunes it
+  against the log as stored then (`Graph::prune`), so a log change drops
+  revoked, rotated or removed members' reports at the next use.
+  `graph.get` answers it to local clients (`lent::admit` refuses
+  `graph.*` over a link).
 
 ### Trust
 
@@ -1615,8 +1649,8 @@ next one. It applies to every link peer alike, whichever end dialed.
 and its fleet root
 through the [trust table](#the-trust-table), placed
 work under the [worker policy](#worker-policy). `full` gives it the API a
-local client has (but `member.*`, `membership.*`, `link.*` and
-`links.*`), lifts the worker policy
+local client has (but `member.*`, `membership.*`, `graph.*`, `link.*`
+and `links.*`), lifts the worker policy
 (`worker_policy::Policy::detect` answers none) and takes a hub's dev
 builds ([Versions](#versions)).
 
@@ -1659,9 +1693,9 @@ exactly one of the own roots (a dir nested in an own root isn't one);
 when it exists, never with a `..`). Every gate below uses it.
 
 Each request goes through `lent::admit` at the top of `handle`, before
-any dispatch. Under either trust `member.*`, `membership.*`, `link.*`
-and `links.*` are `denied`: this member's own settings, membership log
-and links are its local clients' only.
+any dispatch. Under either trust `member.*`, `membership.*`, `graph.*`,
+`link.*` and `links.*` are `denied`: this member's own settings,
+membership log, link graph and links are its local clients' only.
 
 `fleet.*` (a removal from the fleet: *How a machine leaves*, at the top;
 a member's placed run) goes by the key the caller proved, not by trust:
@@ -1682,7 +1716,10 @@ introduction's name and key, but an introduced member's `fleet.rm` is
 `fleet.propose` is admitted only on the authority (this host's name and
 key the log's authority's) and from a member of the log, never an
 introduced one; `fleet.sync` from a member or an introduced peer
-([Approvals and pushes](#approvals-and-pushes)). A local client, a peer
+([Approvals and pushes](#approvals-and-pushes)); `fleet.report` only on
+the hub, from a member of the log or a held introduction's name and key,
+and `fleet.graph` anywhere from a member or an introduced peer
+([Link graph](#link-graph)). A local client, a peer
 that proved no key and a host in no log are `denied` all of them (a
 local client uses `machines.rm` / `machines.unlink` /
 `membership.approve`); `admit` itself refuses `fleet.*` should one reach

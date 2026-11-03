@@ -14,6 +14,7 @@ method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
 (`QUICK`, federation), `src/serve/fleet/member.rs` (`member.*`),
 `src/serve/fleet/membership_api.rs` (`membership.*`),
+`src/serve/fleet/reports.rs` (`graph.get`, `fleet.report|graph`),
 `src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` + `index.d.ts` (Node client; `src/serve/dts.rs`
 checks the typings against the wire structs).
@@ -31,7 +32,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `capacity.get` | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `graph.get`, `capacity.get` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -125,7 +126,7 @@ A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
 its `member.toml` per request: a link peer's channel streams (those the
 daemon answers in-process on the links it dials, and those after
-`link.attach`, below). `member.*`, `membership.*`, `link.*` and `links.*` are
+`link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*` and `links.*` are
 `denied` under either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
@@ -148,7 +149,9 @@ there, never the name alone) and only after a revoke in that log,
 and from a member of the log (its name and key), `fleet.rm` of itself or
 of a revoked member, `fleet.place` from a held introduction's too;
 `fleet.propose` only on the authority, from a member of the log;
-`fleet.sync` from a member or an introduced one. Anything else, a local
+`fleet.sync` and `fleet.graph` from a member or an introduced one;
+`fleet.report` only on the hub, from a member of the log or a held
+introduction's (name and key). Anything else, a local
 client, a peer that proved no key and an introduced (capped) member's
 `fleet.rm` or `fleet.propose` included, is `denied`.
 
@@ -1171,8 +1174,9 @@ there.
 A removal from the fleet ([fleet](../architecture/daemon/fleet.md), *How
 a machine leaves*), a membership change proposed to the authority or
 pushed from it ([fleet](../architecture/daemon/fleet.md#approvals-and-pushes)),
-and a member's `run` placed by the hub
-([fleet](../architecture/daemon/fleet.md#a-members-run)), sent between
+a member's `run` placed by the hub
+([fleet](../architecture/daemon/fleet.md#a-members-run)), and the link
+reports ([fleet](../architecture/daemon/fleet.md#link-graph)), sent between
 members over their links. Admitted by
 the key the caller's link proved, against this host's membership log,
 not by trust (`lent::admit_fleet`, *Remote callers*); a local client is
@@ -1186,6 +1190,8 @@ not by trust (`lent::admit_fleet`, *Remote callers*); a local client is
 | `fleet.forget` | the log's hub (name and key), once this host's log revokes `name` | `{"name"}` | `{"ok": true}`: the registry entry for `name` dropped, if any, and `name`'s inbound link ended, if it has one (`links.cycle {"why"}` on its `fleet-link`) | `denied` (not from the log's hub by its key; no revoke of `name` in its log), `invalid` (no `name`; `name` is this host or the hub), `internal` |
 | `fleet.propose` | a member of the log (name and key; never an introduced one), to the authority (this host's name and key the log's authority's) | `{"op"}`: `{"kind": "revoke", "name"}`, `{"kind": "add", "introduction"}` (a held introduction to promote) or `{"kind": "rotate", "name", "old", "new", "by_old"}` (the proposer's own key, countersigned by `old`) | `{"id", "pending": true}`: checked against the log now, queued in `proposals.json` (next to `membership.json`) as `{"id", "from", "op", "at"}`; a pending proposal of the same change (a revoke of the same name, an add of the same name and key, a rotate of the same name to the same key) answers its own id. A new one is shown on the authority's desktop (`<from> proposes to remove <m> from the fleet: devsandbox machine approve <id>`). Nothing is signed until `membership.approve` there | `denied` (not the authority, not a member by its key, an introduced member), `invalid` (a change that doesn't apply: an unknown member, the authority, the hub, an introduction that doesn't check; a rotate of another member's key, from a key that isn't the current one, not countersigned by it, or to a key the log knows), `internal` |
 | `fleet.sync` | a member of the log or an introduced one (name and key) | `{"entries", "introductions"?}`: the sender's whole log, as `membership.get`'s `stored` | `{"changed", "head"}`: merged as a link's handshake merges (`membership.adopt`'s rules, but a log revoking this host's own key is taken, so the hub's `fleet.leave` that follows finds it); when it made this host's log newer, `hub` followed and the log sent on to every other machine this host holds (`fleet.sync`, not back to the sender), off the request thread, best effort. When it rotated this host's key (listing it under its pending next key, which becomes `member.key`), the log is sent on before the answer, and every link of this host ends once the answer is out, redialing to prove the new key | `denied` (neither a member nor introduced; another fleet's log, a fork, a log that doesn't list this host and doesn't revoke it), `invalid` (a log that doesn't verify), `internal` |
+| `fleet.report` | a member of the log or a held introduction (name and key), to the hub | `{"statement", "report"}`: the sender's own link report (`report` `{"member", "trust", "always_on", "links": [{"peer", "dials", "state", "since_ms"}]}`, `statement` its signed statement of kind `links`, as a membership entry's) | `{"changed"}`: taken into the hub's graph (`false`: the one held already); when it changed, the hub pushes every report it holds to its linked machines (`fleet.graph`) | `denied` (not the hub, neither a member nor introduced by its key), `invalid` (another member's report, or one the graph refuses: older than the one held, another at its version, a key that isn't the member's or is revoked, not signed for this fleet, a link to itself or two to one peer), `failed` (no log) |
+| `fleet.graph` | a member of the log or an introduced one (name and key) | `{"reports"?}`: link reports as `fleet.report` carries each (none: a pull) | `{"reports"}`: every report this host holds after taking the carried ones, by member name. Each carried one verifies alone: a refused one (older, forged, revoked) is logged here and skipped. On the hub, a change is pushed on to its linked machines. Sent by each end of a link as it comes up, and by the hub's pushes | `denied` (neither a member nor introduced), `invalid` (bad params), `failed` (no log) |
 
 Nothing is refused for a member that can't be reached: the answer says
 who was. A member removed while unreachable keeps its `hub` and its
@@ -1217,7 +1223,7 @@ connection under either trust (*Remote callers*).
   [fleet.md](../architecture/daemon/fleet.md#hub-mode)).
 - `trust`: `worker` (the default: a remote caller reaches this host's
   own roots and its fleet root, placed work under the worker policy) or
-  `full` (the whole API but `member.*`, `membership.*`, `link.*` and `links.*`, no worker policy,
+  `full` (the whole API but `member.*`, `membership.*`, `graph.*`, `link.*` and `links.*`, no worker policy,
   the hub's dev builds taken)
   ([fleet.md](../architecture/daemon/fleet.md#trust)).
 - `dev_builds`: `member.toml`'s `dev-builds`, as the file says.
@@ -1253,6 +1259,15 @@ authority, key, hub}`, `add {name, key}`, `revoke {name, key}`, `rotate
 {name, old, new, by_old}`, `hub {name}`), beside `prev` and `statement`
 (`{signer, key, kind, payload_sha256, version, sig}`); an introduction is
 `{name, key, introducer, statement}`.
+
+### `graph.get`
+
+Local only, like `membership.*` (`src/serve/fleet/reports.rs`,
+[fleet](../architecture/daemon/fleet.md#link-graph)). Params `{}`; answers
+`{"reports"}`: the link reports this host holds, one per member, as
+`fleet.graph` answers them, pruned against the stored log. In memory
+only: a restarted daemon holds its own and what its peers send it.
+Errors: `internal` (`membership.json` doesn't verify).
 
 ### `capacity.get`
 

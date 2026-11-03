@@ -30,13 +30,14 @@
 //!   verb's `env` replaced by the peer's when it has one.
 //!
 //! Under `trust = "full"` none of that: the peer has the API a local client
-//! has, except `member.*`, `membership.*`, `link.*` and `links.*` (this member's own
-//! settings and membership log, and its links), refused under both; a verb's `env` is still the peer's when it
+//! has, except `member.*`, `membership.*`, `graph.*`, `link.*` and `links.*` (this member's own
+//! settings, membership log and link graph, and its links), refused under both; a verb's `env` is still the peer's when it
 //! has one.
 //!
 //! `fleet.*` (a removal from the fleet, `machines::leave`; a membership
 //! change proposed to the authority or pushed from it, `machines::changes`;
-//! a member's run placed by the hub, `fleet.place`) goes by who the peer proved it is
+//! a member's run placed by the hub, `fleet.place`; link reports,
+//! `fleet.report` / `fleet.graph`) goes by who the peer proved it is
 //! (its key, [`Peer::key`], against this host's membership log), not by
 //! trust: [`admit_fleet`], before any of the above.
 
@@ -429,7 +430,8 @@ pub struct Log<'a> {
 }
 
 /// The `fleet.*` methods [`admit_fleet`] knows.
-pub const FLEET_METHODS: &[&str] = &["fleet.leave", "fleet.forget", "fleet.rm", "fleet.place", "fleet.propose", "fleet.sync"];
+pub const FLEET_METHODS: &[&str] =
+    &["fleet.leave", "fleet.forget", "fleet.rm", "fleet.place", "fleet.propose", "fleet.sync", "fleet.report", "fleet.graph"];
 
 /// Whether `fleet.*` `method` with `params` is admitted (pure), under either
 /// trust, by the key `from` proved (`None`: a local client, which uses
@@ -447,8 +449,10 @@ pub const FLEET_METHODS: &[&str] = &["fleet.leave", "fleet.forget", "fleet.rm", 
 ///   others do, but changes no one's membership, decision 51).
 /// - `fleet.propose` runs only on the authority (this host's key is the
 ///   log's authority's), from a member of the log; never from a capped one.
-/// - `fleet.sync` from a member of the log or an introduced (capped) one:
-///   what it carries verifies itself.
+/// - `fleet.sync` and `fleet.graph` from a member of the log or an
+///   introduced (capped) one: what they carry verifies itself.
+/// - `fleet.report` runs only on the hub, from a member of the log or a
+///   held introduction's (name and key): a capped member's links route too.
 pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Option<Log>) -> Result<(), ApiError> {
     let Some(peer) = from else {
         return Err(ApiError::denied(format!(
@@ -512,8 +516,10 @@ pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Optio
                 Err(ApiError::denied(format!("`fleet.propose` is taken from the fleet's members (by their keys in the log), and `{from}` isn't one")))
             }
         }
-        "fleet.sync" if member || introduced => Ok(()),
-        "fleet.sync" => Err(ApiError::denied(format!("`fleet.sync` from `{from}`, which is neither a member nor introduced"))),
+        "fleet.sync" | "fleet.graph" if member || introduced => Ok(()),
+        "fleet.sync" | "fleet.graph" => {
+            Err(ApiError::denied(format!("`{method}` from `{from}`, which is neither a member nor introduced")))
+        }
         _ if m.hub != log.own => Err(ApiError::denied(format!("`{method}` runs on the hub, and this host isn't it"))),
         "fleet.rm" if member => {
             let name = name()?;
@@ -527,8 +533,8 @@ pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Optio
                 )))
             }
         }
-        "fleet.place" if member => Ok(()),
-        "fleet.place" if log.stored.introductions.iter().any(|i| i.name == from && i.key == key) => Ok(()),
+        "fleet.place" | "fleet.report" if member => Ok(()),
+        "fleet.place" | "fleet.report" if log.stored.introductions.iter().any(|i| i.name == from && i.key == key) => Ok(()),
         "fleet.rm" if introduced || log.stored.introductions.iter().any(|i| i.name == from) => Err(ApiError::denied(format!(
             "`{method}` from `{from}`: an introduced member (capped) changes no one's membership"
         ))),
@@ -540,7 +546,7 @@ pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Optio
 /// to run it with. `state` is this host's `state.toml`, read only when the
 /// request names an instance or a container under `worker`.
 pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
-    if method.starts_with("member.") || method.starts_with("membership.") || method.starts_with("link.") || method.starts_with("links.") {
+    if ["member.", "membership.", "graph.", "link.", "links."].iter().any(|p| method.starts_with(p)) {
         return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
     }
     // [`admit_fleet`]'s, which knows this host's hub: never through here.
@@ -1291,6 +1297,39 @@ mod tests {
         assert_eq!(admit_fleet("fleet.sync", &sync, Some(&capped), on("pi")), Ok(()), "from an introduced peer");
         assert_eq!(admit_fleet("fleet.sync", &sync, Some(&proved("stranger", 9)), on("pi")).unwrap_err().code, "denied");
         assert_eq!(admit_fleet("fleet.sync", &sync, None, on("pi")).unwrap_err().code, "denied");
+    }
+
+    /// `fleet.report` on the hub only, from a member or a held
+    /// introduction by its key; `fleet.graph` anywhere from either.
+    #[test]
+    fn link_reports_go_to_the_hub_and_graphs_come_from_members() {
+        let stored = fleet_log();
+        let on = |own| Some(Log { stored: &stored, own, key: own_key(own) });
+        let p = json!({});
+        let capped = Peer { introduced_by: Some("pi".into()), ..proved("new", 5) };
+        for from in [proved("pi", 3), proved("lap", 1), capped.clone()] {
+            assert_eq!(admit_fleet("fleet.report", &p, Some(&from), on("box")), Ok(()), "{} to the hub", from.name);
+            for own in ["lap", "box", "pi"] {
+                assert_eq!(admit_fleet("fleet.graph", &p, Some(&from), on(own)), Ok(()), "{} on {own}", from.name);
+            }
+        }
+        let e = admit_fleet("fleet.report", &p, Some(&proved("pi", 3)), on("lap")).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("denied", "`fleet.report` runs on the hub, and this host isn't it"));
+        for m in ["fleet.report", "fleet.graph"] {
+            let on = if m == "fleet.report" { on("box") } else { on("pi") };
+            assert_eq!(admit_fleet(m, &p, Some(&proved("pi", 9)), on).unwrap_err().code, "denied", "{m}: a member's name, another key");
+            assert_eq!(admit_fleet(m, &p, Some(&proved("stranger", 9)), on).unwrap_err().code, "denied", "{m}");
+            assert_eq!(admit_fleet(m, &p, Some(&Peer { key: None, ..proved("pi", 3) }), on).unwrap_err().code, "denied", "{m}: no key");
+            assert_eq!(admit_fleet(m, &p, Some(&proved("pi", 3)), None).unwrap_err().code, "denied", "{m}: no log");
+            assert_eq!(admit_fleet(m, &p, None, on).unwrap_err().code, "denied", "{m}: a local client");
+        }
+        // An introduction's name under another key.
+        let e = admit_fleet("fleet.report", &p, Some(&proved("new", 9)), on("box")).unwrap_err();
+        assert_eq!(e.code, "denied");
+        // `graph.get` is this member's own: never over a link.
+        let r = Reach { trust: Trust::Full, fleet_root: None, own: BTreeSet::new() };
+        let e = admit("graph.get", json!({}), &proved("pi", 3), &r, Path::new("/nonexistent")).unwrap_err();
+        assert_eq!(e.code, "denied");
     }
 
     #[test]

@@ -9,10 +9,6 @@
 //! report), its version [`next_version`]: it only goes up, and [`Seen`]
 //! refuses an older one whoever carries it.
 
-// No caller yet: the reports go on the wire in fleet plan step 10b.2, the
-// paths are tried in 10b.5.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +25,8 @@ pub const KIND: &str = "links";
 
 /// The longest path [`Graph::paths`] answers, in hops: a routed stream's
 /// TTL (decision 55).
+// No caller yet: the paths are tried in fleet plan step 10b.5.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const MAX_HOPS: usize = 4;
 
 /// One member's word on its links (decision 59): its trust, whether it's
@@ -158,6 +156,11 @@ impl Graph {
         }
     }
 
+    /// Every report held, by member name.
+    pub fn reports(&self) -> impl Iterator<Item = &(Statement, Report)> {
+        self.reports.values()
+    }
+
     /// The reports whose member no longer resolves to the key that signed
     /// them dropped (revoked, rotated, or gone from the log and the held
     /// introductions). Whether any was.
@@ -167,6 +170,8 @@ impl Graph {
         self.reports.len() != before
     }
 
+    // No caller yet: the paths are tried in fleet plan step 10b.5.
+    #[cfg_attr(not(test), allow(dead_code))]
     /// The edge between `a` and `b`: up when the newer of the two ends'
     /// reports (by statement version) says the link is connected; a report
     /// that doesn't list the other end says it isn't. At equal versions,
@@ -191,6 +196,8 @@ impl Graph {
         }
     }
 
+    // No caller yet: the paths are tried in fleet plan step 10b.5.
+    #[cfg_attr(not(test), allow(dead_code))]
     /// The simple paths from `from` to `to` over up edges, at most
     /// `max_hops` long, each the hops after `from` ending in `to`; only
     /// members of `stored`'s log or held introductions are on one. In the
@@ -225,6 +232,7 @@ impl Graph {
         keyed.into_iter().map(|(_, hops)| hops).collect()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// Depth-first over up edges from `path`'s last node: every simple path
     /// to `to` within `max_hops`, with its edges' most recent `since`.
     fn walk(&self, nodes: &BTreeSet<&str>, to: &str, max_hops: usize, path: &mut Vec<String>, newest: u64, out: &mut Vec<(Vec<String>, u64)>) {

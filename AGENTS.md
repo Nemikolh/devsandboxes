@@ -163,7 +163,11 @@ Start with `docs/README.md` (reading order and map) and
   introductions, pure), `membership_api.rs` (`membership.get|adopt|sign`,
   `fleet.sync`'s store), `proof.rs` (a peer link's key proof),
   `proposals.rs` (`proposals.json`), `graph.rs` (members' signed link
-  reports and `Graph::paths` over them, pure). `src/key_guard.rs` refuses any
+  reports and `Graph::paths` over them, pure), `reports.rs` (this host's
+  report from its links, debounced, sent to the hub as `fleet.report`; the
+  hub's pushes and each link-up's `fleet.graph` exchange on the
+  `serve-fleet-graph` thread; the in-memory graph `graph.get` answers).
+  `src/key_guard.rs` refuses any
   container bind or build path covering the member key.
   `snapshots.rs`'s `merge` builds the federated
   snapshot (`instances.watch {machines: true}`).

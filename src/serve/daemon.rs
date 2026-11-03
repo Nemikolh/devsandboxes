@@ -318,6 +318,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             changed: Box::new(move || {
                 if let Some(s) = b.get().and_then(std::sync::Weak::upgrade) {
                     s.publish_machines();
+                    s.graph.poke();
                 }
             }),
             hub: Box::new(move || c.get().and_then(std::sync::Weak::upgrade).and_then(|s| s.hub_of())),
@@ -390,6 +391,20 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
+    // This host's link report and the published graph (fleet plan step
+    // 10b.2): only with a `member.toml`, beside which the log and key are.
+    let publisher = shared.member.clone().map(|member| {
+        let (hub, always) = (Arc::clone(&shared.hub), Arc::clone(&shared.hub));
+        let keep_alive = opts.keep_alive;
+        fleet::reports::Publisher::spawn(Arc::clone(&shared.graph), fleet::reports::Io {
+            member,
+            hostname: shared.hostname.clone(),
+            links: links.handle(),
+            hub: Arc::new(move || lock_hub(&hub).clone()),
+            always_on: Arc::new(move || keep_alive || lock_hub(&always).is_this()),
+            log,
+        })
+    });
     let _ = shared.runner.set(match &opts.verbs {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
@@ -486,6 +501,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     shared.drain(DRAIN_TIMEOUT);
     drop(watcher);
+    // Its calls go over the links: stopped before them.
+    drop(publisher);
     // The machine links close (their ssh killed) after the connections whose
     // forwarded calls they may still answer.
     drop(links);
@@ -726,6 +743,10 @@ struct Shared {
     /// `TUNNEL`, `TRANSFER` and `AGENT` threads): counted with the
     /// `clients` holders, like connections.
     channels: Arc<AtomicUsize>,
+    /// The link reports this host holds (`fleet.report`, `fleet.graph`,
+    /// `graph.get`), in memory only; `fleet::reports::Publisher` keeps
+    /// this host's own.
+    graph: Arc<fleet::reports::Published>,
 }
 
 impl Shared {
@@ -763,6 +784,7 @@ impl Shared {
             repos: None,
             peer_env: BTreeMap::new(),
             channels: Arc::default(),
+            graph: Arc::default(),
         }
     }
 
@@ -1676,6 +1698,14 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
                 .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
+        // Local only (`lent::admit` refuses `graph.*`): the reports held here.
+        "graph.get" => {
+            let stored = match shared.member.as_deref() {
+                Some(path) => fleet::membership_api::load(path),
+                None => Ok(None),
+            };
+            stored.and_then(|s| serde_json::to_value(shared.graph.reports(s.as_ref())).map_err(|e| api::ApiError::internal(e.into())))
+        }
         // Local only too: the proposals queued here, approved over the links.
         "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" if shared.machines.is_some() => {
             let ctx = shared.machines.as_ref().expect("checked");
@@ -1758,6 +1788,21 @@ fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
         return Response::err(req.id, "failed", "this daemon has no machines registry");
     };
     log(&format!("{}: {} from {from}", conn.label(), req.method));
+    if matches!(req.method.as_str(), "fleet.report" | "fleet.graph") {
+        // Admitted: this host has a log and a name.
+        let (Some(stored), Some(me)) = (stored.as_ref(), own.as_deref()) else {
+            return Response::err(req.id, "failed", "this host is in no fleet's membership log");
+        };
+        let answer = if req.method == "fleet.report" {
+            fleet::reports::report_call(req.params, &from, &shared.graph, stored, me, log)
+        } else {
+            fleet::reports::graph_call(req.params, &from, &shared.graph, stored, me, shared.is_hub(), log)
+        };
+        return match answer {
+            Ok(result) => Response::ok(req.id, result),
+            Err(e) => Response::err(req.id, e.code, e.message),
+        };
+    }
     if req.method == "fleet.place" {
         return match fleet_place(req.params, &from, shared) {
             Ok(result) => Response::ok(req.id, result),

@@ -280,6 +280,14 @@ limitation means editing this file in the same commit.
 - A member only introduced (capped, not in the log) can't be removed with
   `machine rm`: the log has no key of it to revoke; it goes once its
   introducer is revoked. → [fleet](architecture/daemon/fleet.md); `machines::changes::revoke`
+- Link reports (fleet step 10b.2) are versioned by their signer's wall
+  clock in ms: which end of a link the graph believes is decided across
+  two members' clocks, and a member whose clock went back after a daemon
+  restart has its reports refused as older until the clock passes its
+  last one (a peer's copy of its own last report moves it past only once
+  received). Nothing reads the graph yet but `graph.get`; routing over it
+  is fleet steps 10b.3-10b.7.
+  → [fleet](architecture/daemon/fleet.md#link-graph); `fleet::graph::next_version`, `fleet::reports`
 - A capped (introduced) member can't rotate its key: the log has no key
   of it to rotate until the authority adds it.
   → [fleet](architecture/daemon/fleet.md#member-identity); `machines::changes::can_rotate`

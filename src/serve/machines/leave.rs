@@ -375,7 +375,7 @@ pub(super) fn call(ctx: &Ctx, name: &str, method: &str, params: Value) -> Result
 }
 
 /// [`call`] over `links`.
-pub(super) fn call_on(links: &Handle, name: &str, method: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn call_on(links: &Handle, name: &str, method: &str, params: Value) -> Result<Value, String> {
     match links.remotes().get(name) {
         Some(m) if m.state == LinkState::Connected => {}
         Some(m) => return Err(m.error.unwrap_or_else(|| "its link isn't up".into())),

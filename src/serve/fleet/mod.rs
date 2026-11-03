@@ -26,7 +26,9 @@
 //! - `proof`: a peer link's proof of both members' keys after its
 //!   `Hello`s, with the membership heads compared and synced.
 //! - `graph`: the members' signed link reports and the paths over them
-//!   (pure).
+//!   (pure); `reports`: this host's own report built from its links and
+//!   sent to the hub (`fleet.report`), the reports exchanged and pushed
+//!   (`fleet.graph`), the graph the daemon holds (`graph.get`).
 //! - `lent`: the trust table, what a peer may do over a link (the
 //!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the serving end of a `PTY` stream: a session attach in an
@@ -66,6 +68,7 @@ pub mod place;
 pub mod placed;
 pub mod proof;
 pub mod proposals;
+pub mod reports;
 pub mod pty;
 pub mod pty_client;
 pub mod transfer;

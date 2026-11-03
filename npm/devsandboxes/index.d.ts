@@ -1012,6 +1012,38 @@ export interface FleetSynced {
   head: MembershipHead;
 }
 
+/** One link of a {@link FleetLinkReport}: to `peer`, in `state` since `since_ms` (unix ms, the reporter's clock); `dials`: the reporter dials it (has a shell there). */
+export interface FleetLink {
+  peer: string;
+  dials: boolean;
+  state: LinkState;
+  since_ms: number;
+}
+
+/** A member's word on its links: its trust, whether its daemon stays up (keep-alive, or the hub), each link it has. */
+export interface FleetLinkReport {
+  member: string;
+  trust: MemberTrust;
+  always_on: boolean;
+  links: FleetLink[];
+}
+
+/** A link report as it travels: the member's signed statement (kind `links`, its version only going up) over it. */
+export interface FleetReport {
+  statement: MembershipStatement;
+  report: FleetLinkReport;
+}
+
+/** The link reports a host holds, one per member (`fleet.graph`, `graph.get`). */
+export interface FleetGraph {
+  reports: FleetReport[];
+}
+
+/** `fleet.report`'s answer: whether the hub's graph took it as new. */
+export interface FleetReported {
+  changed: boolean;
+}
+
 /** `membership.approve`'s answer: the proposal's id, and what signing it did. */
 export interface MembershipApproved extends FleetSigned {
   id: number;
@@ -1687,6 +1719,16 @@ export interface ApiMethods {
    */
   'fleet.sync': { params: MembershipStored; result: FleetSynced };
   /**
+   * On the hub, from a member or an introduced peer: its own link report, taken into the hub's graph (`invalid`
+   * for one refused: older, forged, another member's); a change is pushed to the hub's linked members.
+   */
+  'fleet.report': { params: FleetReport; result: FleetReported };
+  /**
+   * From a member or an introduced peer: the reports it carries taken (each verifies itself; refusals are
+   * logged), answered with every report this host holds. On the hub a change is pushed on.
+   */
+  'fleet.graph': { params: { reports?: FleetReport[] }; result: FleetGraph };
+  /**
    * One registered machine, to build an ssh command to it; `not-found` for an unknown name. `agent`, the
    * caller's absolute `SSH_AUTH_SOCK`, becomes the agent this host serves the machine's `AGENT` streams with.
    */
@@ -1706,6 +1748,8 @@ export interface ApiMethods {
   'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
   /** This host's membership log and the introductions it holds. Local only: never over a fleet link. */
   'membership.get': { params: {}; result: MembershipInfo };
+  /** The link reports this host holds (in memory: rebuilt from its peers after a restart). Local only. */
+  'graph.get': { params: {}; result: FleetGraph };
   /**
    * Take a membership log: none here takes it, one behind takes its later entries, the same or ahead keeps
    * this host's; their introductions are held. `denied` for another fleet's log, a fork, or a log that lists
