@@ -67,6 +67,13 @@ pub fn asked(params: &Value) -> bool {
     params.get("place").and_then(Value::as_bool) == Some(true)
 }
 
+/// A placed run whose sandbox has `ties` (`code::ties`, fleet plan decision
+/// 40) runs here with a note naming them, before the hub is asked or any
+/// worker scored; none: placement goes on (`None`).
+pub fn tied(ties: &[String]) -> Option<Placed> {
+    (!ties.is_empty()).then(|| Placed::LocalWithNote(format!("note: not placed: {}; running here", ties.join(", "))))
+}
+
 /// The workers placement asks for a fresh report: the reachable ones
 /// (their link up), whatever their saved report says.
 pub fn reachable_workers(machines: &[Machine]) -> Vec<String> {
@@ -137,8 +144,8 @@ pub enum Placed {
     /// Here, as without a fleet.
     Local,
     /// Here, after placement picked a worker the sandbox can't move to
-    /// (or a member's hub couldn't place it): this note first in the
-    /// verb's output.
+    /// (or a member's hub couldn't place it, or the sandbox is tied here,
+    /// [`tied`]): this note first in the verb's output.
     LocalWithNote(String),
     /// Here, where a member's hub placed it: the hub's [`lines`] first.
     Here(Vec<String>),
@@ -419,6 +426,15 @@ mod tests {
     use crate::serve::snapshots::LinkState;
 
     const G: u64 = 1 << 30;
+
+    #[test]
+    fn a_tied_sandbox_runs_here_with_its_ties_named() {
+        assert_eq!(tied(&[]), None);
+        assert_eq!(
+            tied(&["`caches`".into(), "privileged".into()]),
+            Some(Placed::LocalWithNote("note: not placed: `caches`, privileged; running here".into()))
+        );
+    }
 
     fn cap(avail: u64, running: usize, caps: Option<Caps>) -> Capacity {
         Capacity {

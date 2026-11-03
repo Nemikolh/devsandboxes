@@ -680,6 +680,29 @@ init --bare`; `repo::cache_dir`, `repos_dir`). The branch is the
 requested one (`run --branch`, for `folder` only) when origin has it,
 else the checkout's current branch when origin has it; neither is
 `NotMovable` (push it first), as is an origin the fetch can't reach.
+A sandbox with ties (below) is `NotMovable` before any fetch, its ties
+the why.
+
+**Ties** (`ties`, `ties_of`; fleet plan decision 40). What keeps a
+sandbox on its host, inferred from the merged config before anything
+moves: what a [worker policy](#worker-policy) with no allowances would
+refuse, with the config root and the folders that move with it
+(`folder`, `folders` entries outside the root) as the only paths that
+travel. From the config, every `worker_policy::Policy::config_refusals`
+item (`initializeCommand`, `dispatcher`, `inbox`, `caches`,
+`persist-shell-history`, `worktree-link`, `privileged`, `global`
+services, local features outside those paths, each `${localEnv:NAME}`
+in the merged sandbox or its services); from each `mounts` bind (its
+source substituted as `run` does, `${localWorkspaceFolder}` the
+`folder`), `Policy::check_bind`'s: a source outside those paths, one
+under `shared-volumes` or `shared-files` (`${sharedVolumes}`: they never
+travel, `ROOT_SKIPS`), a runtime socket. A bind whose source reads
+`${localEnv:…}` counts once, as that variable. The sandbox's and its
+services' `build` context and dockerfile (relative to the config root)
+must be under those paths too (`Policy::check_path`). Each tie is a line for
+the user (``bind mount of `/home/u/.config/gh` (outside the config
+root)``, `` `${localEnv:HOME}` (this host's env) ``, `` `caches` ``). Any
+tie keeps the sandbox home whatever a worker's trust or allowances.
 
 **Layout** (`layout`, pure). Paths stay as the config says: each folder
 relative to the root climbs `n` times (`..`) then goes down, and the
@@ -948,6 +971,12 @@ fleet root there, which every peer link's `TRANSFER` receives into
 - **Worth it?** `placed::worth_placing`: some machine reachable (its
   link `connected`, read from the links' last states, no I/O). If none,
   the run is local with nothing else read or asked.
+- **Tied?** `code::ties_of` over the request's root and sandbox
+  ([Moving code](#moving-code)), before the hub is asked or any machine
+  probed, on a hub and a member alike: any tie runs it here with
+  `note: not placed: <tie>, <tie>…; running here` first in the output
+  (`placed::tied`). A config that doesn't load or resolve is left to the
+  local run to report (no note).
 - **Fresh reports** (`daemon.rs` `fresh_capacities`): each reachable
   machine is asked `capacity.get`, in parallel, each on a fresh `API`
   stream over its link's dial (`machines::link::handshake`, then the

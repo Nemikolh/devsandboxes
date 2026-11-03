@@ -186,6 +186,18 @@ pub fn runtime_sockets(
     out
 }
 
+/// [`runtime_sockets`] over the process env.
+pub fn host_sockets() -> Vec<PathBuf> {
+    let var = |k: &str| std::env::var(k).ok();
+    let os = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    runtime_sockets(
+        var("DOCKER_HOST").as_deref(),
+        var("CONTAINER_HOST").as_deref(),
+        os("XDG_RUNTIME_DIR").as_deref(),
+        os("HOME").as_deref(),
+    )
+}
+
 /// The fleet root `dir` is under, from the canonical `<data>/devsandbox`
 /// (`data`): `<data>/fleet/<first component of dir's path below it>`, or
 /// the fleet dir itself for `dir` = it. `None` when `dir` (canonical) isn't
@@ -246,15 +258,7 @@ impl Policy {
     /// root.
     pub fn for_dir(dir: &Path) -> Result<Option<Policy>> {
         let data = crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
-        let var = |k: &str| std::env::var(k).ok();
-        let os = |k: &str| std::env::var_os(k).map(PathBuf::from);
-        let sockets = runtime_sockets(
-            var("DOCKER_HOST").as_deref(),
-            var("CONTAINER_HOST").as_deref(),
-            os("XDG_RUNTIME_DIR").as_deref(),
-            os("HOME").as_deref(),
-        );
-        Self::detect(&data, dir, sockets)
+        Self::detect(&data, dir, host_sockets())
     }
 
     /// [`Self::for_dir`] over a given `<data>/devsandbox` and socket list.
@@ -280,6 +284,17 @@ impl Policy {
     /// resolving outside it), and `${localEnv:NAME}` in the merged sandbox
     /// or its services for a name `local-env` doesn't list.
     pub fn check_config(&self, dir: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Result<(), Refusal> {
+        match self.config_refusals(dir, config, sandbox).into_iter().next() {
+            Some(r) => Err(r),
+            None => Ok(()),
+        }
+    }
+
+    /// Every refusal of [`Self::check_config`], in its order (one per
+    /// `${localEnv:…}` name, the first per local feature): what ties a
+    /// sandbox to its host (`fleet::code::ties`) lists them all.
+    pub fn config_refusals(&self, dir: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Vec<Refusal> {
+        let mut out = Vec::new();
         let props = &sandbox.properties;
         let a = &self.allow;
         let flags = [
@@ -293,7 +308,7 @@ impl Policy {
         ];
         for (asked, allowed, what, key) in flags {
             if asked && !allowed {
-                return Err(Refusal::new(what, format!("{key} = true")));
+                out.push(Refusal::new(what, format!("{key} = true")));
             }
         }
         // `${localEnv:…}` anywhere in the merged sandbox or its services,
@@ -306,9 +321,15 @@ impl Policy {
                 table_strings(table, &mut texts);
             }
         }
+        let mut names: Vec<&str> = Vec::new();
         for name in texts.iter().flat_map(|t| local_env_names(t)) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for name in names {
             if !self.allows_local_env(name) {
-                return Err(Refusal::new(
+                out.push(Refusal::new(
                     format!("`${{localEnv:{name}}}` (this host's env)"),
                     format!("local-env = [\"{name}\"]"),
                 ));
@@ -317,16 +338,16 @@ impl Policy {
         for name in props.services.iter().flatten() {
             // An unknown service fails later with its own error.
             if let Ok(service) = config.resolve_service(name) {
-                self.check_service(&service)?;
+                out.extend(self.check_service(&service).err());
             }
         }
         for reference in props.features.iter().flat_map(|f| f.keys()) {
             let Ok(source) = crate::features::FeatureSource::parse(reference) else { continue };
             if let Some(local) = source.local_dir(dir) {
-                self.check_tree(&local, &format!("local feature `{reference}`"))?;
+                out.extend(self.check_tree(&local, &format!("local feature `{reference}`")).err());
             }
         }
-        Ok(())
+        out
     }
 
     /// Whether `allow.local-env` lists `var`'s name (up to a `:`).

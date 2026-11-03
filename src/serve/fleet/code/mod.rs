@@ -34,8 +34,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use super::transfer::{self, Header, Received, Receivers};
-use crate::config::Config;
+use crate::config::{Build, Config, MountContext, ResolvedSandbox};
 use crate::serve::endpoint;
+use crate::worker_policy::{self, Allow, Policy, Refusal};
 
 /// A config root's tar: [`tar`], unpacked under `roots/<hash>/`.
 pub const ROOT_TAR_KIND: &str = "root-tar";
@@ -221,7 +222,8 @@ pub struct Prepared {
 /// `branch` (a `run --branch`) is the `folder`'s branch when its origin
 /// has it; else, and for `folders` entries, the checkout's current branch.
 /// `folders` entries inside the config root travel in its tar (their
-/// `.git` doesn't); one with a `${…}` variable doesn't move yet.
+/// `.git` doesn't); one with a `${…}` variable doesn't move yet; nor does
+/// a sandbox with [`ties`].
 pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&str>) -> Result<Offer, Unprepared> {
     let root = config_root.canonicalize().with_context(|| format!("config root {} does not exist", config_root.display()))?;
     let config = Config::load(&root)?;
@@ -242,6 +244,10 @@ pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&st
         if !host.starts_with(&root) && !outside.contains(&host) {
             outside.push(host);
         }
+    }
+    let tied = ties(&root, &config, &resolved);
+    if !tied.is_empty() {
+        return not_movable(tied.join(", "));
     }
     let layout = layout(&root, &outside).map_err(Unprepared::NotMovable)?;
     let mut repos_out = Vec::new();
@@ -274,6 +280,104 @@ pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&st
     let tar = pack_root(&root, &layout.root)?;
     let hash = short_hash(&tar);
     Ok(Offer { tar, hash, layout, repos: repos_out })
+}
+
+/// [`ties`] of sandbox `sandbox` of the config at `config_root`; a config
+/// that doesn't load or resolve is the error (the run reports it itself).
+pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<Vec<String>> {
+    let root = config_root.canonicalize().with_context(|| format!("config root {} does not exist", config_root.display()))?;
+    let config = Config::load(&root)?;
+    let resolved = config.resolve_sandbox(sandbox)?;
+    Ok(ties(&root, &config, &resolved))
+}
+
+/// What ties `sandbox` of `config` (at the canonical config root `root`) to
+/// this host, for the user (fleet plan decision 40, inferred ties): what a
+/// worker policy with no allowances would refuse, over the config root and
+/// the folders that move with it (`folder`, `folders` outside the root) as
+/// the only paths that travel. From the config ([`Policy::config_refusals`]:
+/// `initializeCommand`, `caches`, `privileged`, global services,
+/// `${localEnv:…}`, …) and each `mounts` bind ([`Policy::check_bind`]:
+/// sources outside those paths, `${sharedVolumes}` ones, which never travel
+/// ([`ROOT_SKIPS`]), runtime sockets) and each `build` context or
+/// dockerfile, the sandbox's or a service's. Any tie keeps the sandbox home,
+/// whatever a worker's trust or allowances. Folders that can't move are
+/// [`offer`]'s to say (they need git).
+pub fn ties(root: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Vec<String> {
+    let props = &sandbox.properties;
+    let at = |f: &str| {
+        let p = root.join(f);
+        worker_policy::resolve(&p).unwrap_or(p)
+    };
+    let main = props.folder.as_deref().map(at);
+    let mut moved: Vec<PathBuf> = main.iter().cloned().collect();
+    moved.extend(props.folders.iter().flat_map(|f| f.values()).filter(|e| !e.path().contains("${")).map(|e| at(e.path())));
+    moved.retain(|f| !f.starts_with(root));
+    // The moved folders as `binds`: paths under them travel as the root does.
+    let policy = Policy {
+        root: root.to_path_buf(),
+        data: root.to_path_buf(),
+        allow: Allow { binds: moved, ..Allow::default() },
+        sockets: worker_policy::host_sockets(),
+    };
+    let mut out: Vec<String> = policy.config_refusals(root, config, sandbox).into_iter().map(tie).collect();
+    let root_s = root.to_string_lossy();
+    let shared = root.join("shared-volumes");
+    let shared_s = shared.to_string_lossy();
+    let folder_s = main.as_deref().map(|m| m.to_string_lossy().into_owned()).unwrap_or_default();
+    let basename = main.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let ctx = MountContext {
+        config_dir: &root_s,
+        workspace_folder: &folder_s,
+        workspace_folder_basename: &basename,
+        shared_volumes: &shared_s,
+        instance: "instance",
+        container_env: None,
+    };
+    for mount in props.mounts.iter().flatten() {
+        // A bad mount is the run's to report.
+        let Ok(m) = mount.resolve(&ctx) else { continue };
+        let Some(source) = m.source.as_deref().filter(|_| m.kind == "bind") else { continue };
+        // `${localEnv:…}` is counted above; what's still a variable (or
+        // relative) isn't a host path to judge.
+        if source.contains("${") || !Path::new(source).is_absolute() || reads_local_env(mount) {
+            continue;
+        }
+        if let Err(r) = policy.check_bind(source) {
+            out.push(tie(r));
+        }
+    }
+    // Build paths, the sandbox's and its services' (both relative to the
+    // config dir, as `services::build_args` takes them); a missing one is
+    // the build's to report.
+    let services: Vec<Build> = props.services.iter().flatten().filter_map(|n| config.resolve_service(n).ok()?.spec.build).collect();
+    for build in props.build.iter().chain(&services) {
+        let paths = [("build context", build.context.as_deref().or(Some("."))), ("dockerfile", build.dockerfile.as_deref())];
+        for (what, rel) in paths {
+            let Some(path) = rel.map(|r| root.join(r)).filter(|p| p.exists()) else { continue };
+            if let Err(r) = policy.check_path(&path, what) {
+                out.push(tie(r));
+            }
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// A mount whose raw source reads `${localEnv:…}`: [`ties`] counts it once,
+/// as that variable.
+fn reads_local_env(mount: &crate::config::Mount) -> bool {
+    let raw = match mount {
+        crate::config::Mount::Shorthand(s) => s.as_str(),
+        crate::config::Mount::Object(o) => o.source.as_deref().unwrap_or_default(),
+    };
+    raw.contains("${localEnv:")
+}
+
+/// A refusal as a tie: what it names, with the policy's root called what it
+/// is here.
+fn tie(r: Refusal) -> String {
+    r.what.replace("(outside the fleet root)", "(outside the config root)")
 }
 
 /// The first 16 hex of `bytes`' sha256.
@@ -679,6 +783,90 @@ mod tests {
         assert!(why("[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\n").contains("local-only isn't on origin"));
         assert!(why("[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\nfolders = { \"/w/x\" = \"../${localEnv:X}\" }\n")
             .contains("uses a variable"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ties_name_what_keeps_a_sandbox_home() {
+        let dir = scratch("ties");
+        let cfg = dir.join("cfg");
+        for d in ["cfg/data", "web/sub", "lib", "elsewhere"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let ties_of_toml = |extra: &str| {
+            let text = format!(
+                "[services.g]\nimage = \"redis\"\nscope = \"global\"\n[services.i]\nimage = \"redis\"\n\
+                 [sandbox.s]\nfolder = \"../web\"\nimage = \"alpine\"\nfolders = {{ \"/w/lib\" = \"../lib\" }}\n{extra}\n"
+            );
+            let config = Config::parse(&text).unwrap();
+            let s = config.resolve_sandbox("s").unwrap();
+            ties(&cfg, &config, &s)
+        };
+        // What travels (the root, the moved folders) and what isn't a bind.
+        let web = dir.join("web").display().to_string();
+        let lib = dir.join("lib").display().to_string();
+        let clean = format!(
+            "services = [\"i\"]\nmounts = [\"source=${{configDir}}/data,target=/d,type=bind\", \
+             \"source=${{localWorkspaceFolder}}/sub,target=/s\", \"source={web}/sub,target=/w\", \
+             \"source={lib},target=/l\", \"source=v-${{instance}},target=/v,type=volume\", \
+             {{ type = \"tmpfs\", target = \"/t\" }}]"
+        );
+        assert_eq!(ties_of_toml(&clean), Vec::<String>::new());
+        // A build inside the root isn't a tie; one whose context climbs out is.
+        std::fs::write(cfg.join("Dockerfile"), "FROM alpine\n").unwrap();
+        assert_eq!(ties_of_toml("build = { dockerfile = \"Dockerfile\" }"), Vec::<String>::new());
+        assert_eq!(
+            ties_of_toml("build = { dockerfile = \"Dockerfile\", context = \"../elsewhere\" }"),
+            [format!("build context `{}` (outside the config root)", cfg.join("../elsewhere").display())]
+        );
+        assert_eq!(ties_of_toml(""), Vec::<String>::new());
+        let out = dir.join("elsewhere").display().to_string();
+        for (extra, want) in [
+            (format!("mounts = [\"source={out},target=/o\"]"), format!("bind mount of `{out}` (outside the config root)")),
+            (
+                "mounts = [{ source = \"${sharedVolumes}/x\", target = \"/x\" }]".into(),
+                format!("shared-volumes mount `{}`", cfg.join("shared-volumes/x").display()),
+            ),
+            (
+                "mounts = [\"source=/var/run/docker.sock,target=/s\"]".into(),
+                "runtime socket mount `/var/run/docker.sock`".into(),
+            ),
+            ("containerEnv = { T = \"${localEnv:X}\" }".into(), "`${localEnv:X}` (this host's env)".into()),
+            ("caches = [\"cargo\"]".into(), "`caches`".into()),
+            ("privileged = true".into(), "privileged".into()),
+            ("initializeCommand = \"true\"".into(), "`initializeCommand`".into()),
+            ("services = [\"i\", \"g\"]".into(), "global service `g`".into()),
+        ] {
+            assert_eq!(ties_of_toml(&extra), [want], "{extra}");
+        }
+        // All of them, a `${localEnv:…}` mount counted once, as its variable.
+        let all = ties_of_toml(&format!(
+            "privileged = true\ncaches = [\"cargo\"]\nmounts = [\"source=${{localEnv:HOME}}/.gh,target=/g\", \"source={out},target=/o\"]"
+        ));
+        assert_eq!(
+            all,
+            [
+                "`caches`".to_string(),
+                "privileged".into(),
+                "`${localEnv:HOME}` (this host's env)".into(),
+                format!("bind mount of `{out}` (outside the config root)"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offer_refuses_a_tied_sandbox() {
+        let dir = scratch("offer-tied");
+        let cfg = fixture(&dir);
+        std::fs::write(cfg.join("devsandboxes.toml"), "[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\nprivileged = true\ncaches = [\"npm\"]\n")
+            .unwrap();
+        match offer(&dir.join("repos"), &cfg, "web", None) {
+            Err(Unprepared::NotMovable(why)) => assert_eq!(why, "`caches`, privileged"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(ties_of(&cfg, "web").unwrap(), ["`caches`", "privileged"]);
+        assert!(ties_of(&cfg, "nope").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

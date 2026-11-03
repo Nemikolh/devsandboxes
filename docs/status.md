@@ -467,6 +467,13 @@ limitation means editing this file in the same commit.
   (later bundles update other branches' refs), and `roots/<hash>/` trees
   are never removed.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::repo::land`
+- What ties a sandbox to its host (a bind outside the config root and its
+  moved folders, `${localEnv:…}`, `caches`, `privileged`, …) keeps it
+  home whatever a worker's trust or `member.toml` allowances: nothing
+  checks whether another host could satisfy it until named host
+  resources (fleet plan decision 41). X11 has no check of its own beyond
+  its bind. Pinning (`placement = "home"`) isn't there yet.
+  → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::ties`
 - After a worker's downgrade, a dashboard or other long-lived client still
   running the replaced, newer binary hands the new daemon off again at its
   next hello (its version is newer), restarting the older binary each

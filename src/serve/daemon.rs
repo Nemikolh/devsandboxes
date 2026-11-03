@@ -2098,6 +2098,17 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     if !root.is_absolute() {
         return None;
     }
+    let peer = ConnPeer { out: &conn.out, shared };
+    let say = |line: &str| {
+        let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
+    };
+    // What ties the sandbox here is known before anything is asked; a
+    // config that doesn't load is the local run's to report.
+    if let Some(Placed::LocalWithNote(note)) = fleet::code::ties_of(&root, sandbox).ok().and_then(|t| placed::tied(&t)) {
+        log(&format!("{}: run: {note}", conn.label()));
+        say(&note);
+        return None;
+    }
     let locals: Vec<(PathBuf, Arc<Value>)> = shared.locals.lock().unwrap().iter().map(|(d, v)| (d.clone(), Arc::clone(v))).collect();
     let spec = placed::spec(sandbox, locals.iter().find(|(d, _)| *d == root).map(|(_, v)| v.as_ref()));
     let local_roots: Vec<Arc<Value>> = locals.into_iter().map(|(_, v)| v).collect();
@@ -2115,10 +2126,6 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
             let candidates = placed::candidates(&spec, Some(shared.capacity()), &local_roots, &machines, &fresh);
             placed::decide(&ask, &spec, &candidates, prepare)
         }
-    };
-    let peer = ConnPeer { out: &conn.out, shared };
-    let say = |line: &str| {
-        let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
     };
     match decided {
         Placed::Local => None,
