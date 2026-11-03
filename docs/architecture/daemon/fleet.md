@@ -416,6 +416,20 @@ the devsandbox args only (`dialer::link_args`); the daemon's is
 which build a `Transport::new` whose far end runs in-process and see
 both.
 
+**A transport's pipe is secure.** The fleet adds no encryption to a
+link: a direct link's streams travel as the transport carries them, so
+every `Transport` owes the link three things. Confidentiality and
+integrity, so nothing on the network reads or changes the bytes. And
+an authenticated far end, so that no middleman can sit in the pipe: the
+[key proof](#key-proof) signs both ends' nonces, `Hello`s and names but
+isn't bound to the pipe, so on a pipe that only encrypted, a middleman
+could pass both proofs through and then read or alter the link.
+`Transport::ssh` gives all three (ssh's encryption, and the host key
+`BatchMode` checks against `known_hosts`). A transport that doesn't
+brings its own handshake over the pipe. A link's two ends see its
+streams in the clear, so a relay, an end of both links it joins, sees
+the [routed streams](#routed-streams) it carries.
+
 ## Peer links
 
 `machine add K` run on L makes a link L → K (decisions 7, 22, 23 and 28
