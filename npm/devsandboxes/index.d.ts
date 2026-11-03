@@ -1410,11 +1410,11 @@ export interface RunParams extends VerbParams {
    */
   tty?: TtySize | null;
   /**
-   * Run on this host. Without it (and without `machine`) the daemon places
-   * the run on itself or one of its connected machines; placed on a machine,
-   * the code moves there first and the answer and `progress` carry `machine`.
+   * Ask the fleet's hub where to run it (`run --place`; not with `machine`).
+   * Without it the run stays on this host. Placed on a machine, the code
+   * moves there first and the answer and `progress` carry `machine`.
    */
-  here?: boolean;
+  place?: boolean;
 }
 
 /** `rebuild` params: `instance` or `all: true`. */
@@ -1665,7 +1665,7 @@ export interface ApiMethods {
    */
   'fleet.rm': { params: { name: string }; result: FleetRemoved };
   /**
-   * On the hub, from one of its machines: where that member's `run` goes, among itself, the hub and the hub's
+   * On the hub, from one of its machines: where that member's `run --place` goes, among itself, the hub and the hub's
    * connected machines in `reachable`. Never from a local client.
    */
   'fleet.place': { params: FleetPlaceParams; result: FleetPlaced };

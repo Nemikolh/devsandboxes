@@ -217,7 +217,7 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `forwarded`, `tag_answer`, `Tagged`), `src/serve/daemon.rs`
 (`placed_run`, `fresh_capacities`, `fleet_root_on`, `remote_verb`,
 `Shared::capacity`, `Shared::own`, `Options::local_capacity`,
-`Options::repos`), `src/serve/verbs.rs` (`RunParams::here`),
+`Options::repos`), `src/serve/verbs.rs` (`RunParams::place`),
 `src/serve/verbs_client.rs` (`run_target`, `Streaming`),
 `src/serve/machines/cli.rs` (`plan`); versions:
 `src/serve/fleet/update.rs` (`HELLO`, `hello_of`, `hello_for`, `is_hub`,
@@ -762,8 +762,8 @@ dialer then redials). A hub:
   dialed on says `hub` and its own member name (`update::hello_for`), so
   the member at the other end follows its build ([Versions](#versions)),
   and it pushes its dev build to a member that takes one.
-- **Places runs**: its `run` verb places a request that names no
-  machine ([In the `run` verb](#in-the-run-verb)).
+- **Places runs**: its `run` verb places a `run --place` request
+  ([In the `run` verb](#in-the-run-verb)).
 - **Federates for its members**: a link peer's `instances.watch
   {machines: true}` is served only here (`daemon::watch_root`; elsewhere
   `denied`), under the trust table for that peer, merged with every
@@ -928,9 +928,15 @@ which repos a host has, so `has_repo` is the caller's to fill.
 
 ### In the `run` verb
 
-A hub's (`member.toml`'s `hub = "self"`) `run` verb places a request that names no
-`machine` and isn't `here` (`daemon.rs` `placed_run`, the decisions pure
-in `fleet::placed`); a member's asks the hub ([A member's run](#a-members-run));
+A run the user types (CLI, dashboard) runs on the member whose config it
+names, never placed (fleet plan decision 38): the user's own sandboxes
+stay on their machine and nothing waits on the hub. Only a request with
+`place` (`run --place`, `RunParams::place`; `placed::asked`) is placed:
+without it `daemon.rs` `placed_run` returns at once, nothing asks the
+hub or probes a machine's capacity.
+A hub's (`member.toml`'s `hub = "self"`) `run` verb places a `place`
+request that names no `machine` (`daemon.rs` `placed_run`, the decisions
+pure in `fleet::placed`); a member's asks the hub ([A member's run](#a-members-run));
 a host in no fleet runs it here. On the hub the candidates are
 this host and every machine, ssh or inbound (`placed::workers`:
 placement candidates are every neighbor), the ones whose link is up
@@ -968,8 +974,8 @@ fleet root there, which every peer link's `TRANSFER` receives into
   output; `Failed` is the verb's `failed` error (`cannot place on
   <worker>: …`), nothing runs elsewhere.
 - **Forward**: the request as a `machine` one (`placed::forwarded`:
-  `machine` the worker, `root` its `Prepared::remote_root`, `here` so the
-  worker never places again), through `remote_verb` as any machine verb
+  `machine` the worker, `root` its `Prepared::remote_root`, `place`
+  dropped so the worker never places again), through `remote_verb` as any machine verb
   ([machines](machines.md#forwarded-requests)). Its output starts with
   `placed on <worker> (<reasons>)` and a `warning: <worker>: over cap: …`
   line per warning (`placed::lines`); its `progress`, result and detached
@@ -987,16 +993,20 @@ fleet root there, which every peer link's `TRANSFER` receives into
 
 The moving runs on the request's connection thread before the forward
 (a fetch of each origin, the transfers), so a hang-up meanwhile is only
-seen once the forward starts. `run --here` (`RunParams::here`) skips all
-of it; the CLI then resolves the sandbox among this host's only
-(`verbs_client::run_target`) and refuses a qualified one, and `--here`
-with `--machine` is refused (`machines::cli::plan`). The dashboard's `run`
-is the same verb request, so it is placed too.
+seen once the forward starts. Placement starts from this host's config:
+with `--place` the CLI resolves the sandbox among this host's only
+(`verbs_client::run_target`) and refuses a qualified one, and `--place`
+with `--machine` is refused (`machines::cli::plan`). The dashboard's
+`:run … --place` is the same verb request (`tui::prompt::PromptAction::Run`'s
+`place`), refused on a machine's sandbox (`tui::routed_verb_call`). With
+no daemon to send it to, `run --place` runs in-process here with a note
+(`main`).
 
 ### A member's run
 
-On a member (`hub = "<name>"`) the hub decides where a `run` goes
-(fleet plan decision 31), and the member moves the code and forwards
+On a member (`hub = "<name>"`) the hub decides where a `run --place`
+goes (fleet plan decisions 31 and 38; a run without it stays here and
+asks nothing), and the member moves the code and forwards
 over its own links (`daemon.rs` `placed_run`, `placed::by_hub`):
 
 - **The ask** (`daemon.rs` `ask_hub`): `fleet.place` to the hub over a

@@ -88,7 +88,9 @@ The event loop takes `App::pending_action`
 
 - `run`, `rebuild`, `start`, `stop`, `rm`, `ServiceRebuild`: a verb
   request to the daemon (`spawn_verb`), see
-  [../daemon/verbs.md](../daemon/verbs.md).
+  [../daemon/verbs.md](../daemon/verbs.md). `run … --place` sends
+  `place` (the hub picks where, [../daemon/fleet.md](../daemon/fleet.md#in-the-run-verb));
+  refused on a machine's sandbox (`routed_verb_call`).
 - `exec`: suspends the dashboard and runs `devsandbox -C <root> exec -i
   -t -- <instance> <cmd…>` (over ssh for a machine's row) with inherited
   stdio, then waits for a key ([terminal.md](terminal.md) for the

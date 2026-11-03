@@ -62,8 +62,8 @@ pub(crate) enum CliVerb {
         json: bool,
         reprobe: bool,
         detach: bool,
-        /// `--here`: this host's sandbox, never placed on a fleet worker.
-        here: bool,
+        /// `--place`: this host's sandbox, where the fleet's hub says.
+        place: bool,
     },
     Rebuild { target: Option<String>, force: bool, reprobe: bool, detach: bool },
     Start { target: Option<String>, detach: bool },
@@ -114,7 +114,7 @@ pub(crate) fn from_command(command: &Command, machine: Option<&str>) -> Option<C
     Some(match command {
         Command::Gc { force } if machine.is_some() => CliVerb::Gc { force: *force },
         Command::Run { env, dispatcher, .. } if !env.is_empty() || dispatcher.is_some() => return None,
-        Command::Run { sandbox, name, branch, base, json, reprobe, detach, here, .. } => CliVerb::Run {
+        Command::Run { sandbox, name, branch, base, json, reprobe, detach, place, .. } => CliVerb::Run {
             sandbox: sandbox.clone(),
             name: name.clone(),
             branch: branch.clone(),
@@ -122,7 +122,7 @@ pub(crate) fn from_command(command: &Command, machine: Option<&str>) -> Option<C
             json: *json,
             reprobe: *reprobe,
             detach: *detach,
-            here: *here,
+            place: *place,
         },
         Command::Rebuild { name, force, reprobe, detach, .. } => {
             CliVerb::Rebuild { target: name.clone(), force: *force, reprobe: *reprobe, detach: *detach }
@@ -412,8 +412,8 @@ fn prepare(
         banner: None,
     };
     let prepared = match verb.clone() {
-        CliVerb::Run { sandbox, name, branch, base, json, reprobe, detach, here } => {
-            let Some(target) = run_target(sandbox, here, &root, fed, call, ui, json)? else {
+        CliVerb::Run { sandbox, name, branch, base, json, reprobe, detach, place } => {
+            let Some(target) = run_target(sandbox, place, &root, fed, call, ui, json)? else {
                 return Ok(Prep::Exit(0));
             };
             let target = match target {
@@ -436,7 +436,7 @@ fn prepare(
                 reprobe,
                 detach,
                 tty,
-                here,
+                place,
             };
             // `run` names no instance before it runs: `progress` does.
             Prepared { instance: None, ..one("run", serde_json::to_value(p)?, Some(&target)) }
@@ -651,10 +651,11 @@ fn target_of(name: &str, root: &Path, fed: &Fed, call: &mut Call, ui: &mut Ui) -
 
 /// `run`'s sandbox: where it's defined, after the pick. `None`: nothing to
 /// send (the example config was offered); `Err(why)` from an older daemon.
-/// `here` (`--here`): this host's only, a machine's name refused.
+/// `place` (`--place`): this host's only (placement starts from this
+/// host's config), a machine's name refused.
 fn run_target(
     sandbox: Option<String>,
-    here: bool,
+    place: bool,
     root: &Path,
     fed: &Fed,
     call: &mut Call,
@@ -674,13 +675,15 @@ fn run_target(
         Some(s) => Some((Where::Any, s)),
         None => None,
     };
-    let wanted = match (wanted, here) {
-        (Some((Where::Machine(m), name)), true) => bail!("--here runs on this host; `{m}/{name}` is on machine `{m}`"),
+    let wanted = match (wanted, place) {
+        (Some((Where::Machine(m), name)), true) => {
+            bail!("--place asks the hub where to run this host's sandbox; `{m}/{name}` is on machine `{m}`")
+        }
         (Some((_, name)), true) => Some((Where::Local, name)),
         (wanted, _) => wanted,
     };
-    // `--here` without a name picks among this host's sandboxes only.
-    let rows = if here { rows.into_iter().filter(|r| r.machine.is_none()).collect() } else { rows };
+    // `--place` without a name picks among this host's sandboxes only.
+    let rows = if place { rows.into_iter().filter(|r| r.machine.is_none()).collect() } else { rows };
     let local = |name: String| Target { sandbox: Some(name.clone()), name, machine: None, root: root.to_path_buf() };
     let there = |row: SandboxEntry| -> Result<Target> {
         let root = row.root.context("bad sandboxes.list entry from devsandbox serve: no root")?;
@@ -688,7 +691,7 @@ fn run_target(
     };
     let target = match choose_sandbox(rows, wanted) {
         SandboxChoice::Example { unmatched } => {
-            if let Some(name) = unmatched.filter(|_| fed.machines && !here) {
+            if let Some(name) = unmatched.filter(|_| fed.machines && !place) {
                 note_unreachable(&name, call);
             }
             (ui.offer_example)()?;
@@ -699,7 +702,7 @@ fn run_target(
             return Ok(None);
         }
         SandboxChoice::Here { sandbox, matched } => {
-            if !matched && fed.machines && !here {
+            if !matched && fed.machines && !place {
                 note_unreachable(&sandbox, call);
             }
             local(sandbox)
@@ -1180,15 +1183,15 @@ mod tests {
                 json: true,
                 reprobe: true,
                 detach: true,
-                here: false,
+                place: false,
             })
         );
         assert_eq!(
             verb(&["run"]),
-            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, json: false, reprobe: false, detach: false, here: false })
+            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, json: false, reprobe: false, detach: false, place: false })
         );
-        // (`--here` with `--machine`: `machines::cli::plan` refuses it.)
-        assert!(matches!(verb(&["run", "web", "--here"]), Some(CliVerb::Run { here: true, .. })));
+        // (`--place` with `--machine`: `machines::cli::plan` refuses it.)
+        assert!(matches!(verb(&["run", "web", "--place"]), Some(CliVerb::Run { place: true, .. })));
         assert_eq!(verb(&["rebuild", "w", "--force"]), Some(CliVerb::Rebuild { target: Some("w".into()), force: true, reprobe: false, detach: false }));
         assert_eq!(verb(&["recreate", "--all", "--detach"]), Some(CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: true }));
         assert_eq!(verb(&["rebuild", "w", "--reprobe"]), Some(CliVerb::Rebuild { target: Some("w".into()), force: false, reprobe: true, detach: false }));
@@ -1456,7 +1459,7 @@ mod tests {
             json,
             reprobe: false,
             detach: false,
-            here: false,
+            place: false,
         };
         let two = [("sandboxes.list", ok(json!([{"name": "api"}, {"name": "web"}])))];
         let p = sent(prep(&run(None, false), true, &two, 1).0);
@@ -1481,7 +1484,7 @@ mod tests {
     /// (its stdout is the record) and not off a terminal.
     #[test]
     fn build_verbs_send_the_terminal_size() {
-        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, here: false };
+        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, place: false };
         let rebuild = CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: false };
         let start = CliVerb::Start { target: None, detach: true };
         let list = [("sandboxes.list", ok(json!([{"name": "web"}])))];
@@ -1542,7 +1545,7 @@ mod tests {
     }
 
     fn run_of(sandbox: Option<&str>) -> CliVerb {
-        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, json: false, reprobe: false, detach: false, here: false }
+        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, json: false, reprobe: false, detach: false, place: false }
     }
 
     fn row(name: &str, machine: Option<&str>, root: &str) -> SandboxEntry {
@@ -1607,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn run_here_stays_on_this_host() {
+    fn run_place_starts_from_this_host() {
         let here = |sandbox: Option<&str>| CliVerb::Run {
             sandbox: sandbox.map(str::to_string),
             name: None,
@@ -1616,12 +1619,12 @@ mod tests {
             json: false,
             reprobe: false,
             detach: false,
-            here: true,
+            place: true,
         };
         let list = [("sandboxes.list", ok(json!([{"name": "web", "root": "/cfg"}, {"name": "web", "machine": "a", "root": "/r"}, {"name": "db", "machine": "a", "root": "/r"}])))];
-        // A name both define: this host's, no pick, `here` sent.
+        // A name both define: this host's, no pick, `place` sent.
         let p = sent(prep_fed(&here(Some("web")), &FED, false, None, &list, 0).0);
-        assert_eq!((p.params.get("machine"), &p.params["root"], &p.params["here"], p.machine), (None, &json!("/cfg"), &json!(true), None));
+        assert_eq!((p.params.get("machine"), &p.params["root"], &p.params["place"], p.machine), (None, &json!("/cfg"), &json!(true), None));
         // Only a machine's: not looked for there (the local `run` says it's missing).
         let p = sent(prep_fed(&here(Some("db")), &FED, false, None, &list, 0).0);
         assert_eq!((p.params.get("machine"), &p.params["sandbox"]), (None, &json!("db")));
@@ -1632,9 +1635,9 @@ mod tests {
         assert_eq!(sent(p).params["sandbox"], "web");
         // A machine's name is refused.
         let e = prep_fed(&here(Some("a/web")), &FED, false, None, &list, 0).0.unwrap_err();
-        assert_eq!(e.to_string(), "--here runs on this host; `a/web` is on machine `a`");
-        // Without it: `here: false` on the wire.
-        assert_eq!(sent(prep_fed(&run_of(Some("@/web")), &FED, false, None, &list, 0).0).params["here"], false);
+        assert_eq!(e.to_string(), "--place asks the hub where to run this host's sandbox; `a/web` is on machine `a`");
+        // Without it: `place: false` on the wire, so the daemon runs it here.
+        assert_eq!(sent(prep_fed(&run_of(Some("@/web")), &FED, false, None, &list, 0).0).params["place"], false);
     }
 
     /// A run the daemon placed on a worker says so in its `progress`: the
@@ -1799,7 +1802,7 @@ mod tests {
     }
 
     fn run_web(json: bool) -> CliVerb {
-        CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, here: false }
+        CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, place: false }
     }
 
     fn list() -> (&'static str, Response) {

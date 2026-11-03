@@ -236,7 +236,7 @@ mod tests {
         for action in [
             start(),
             PromptAction::Rebuild { instance: "inst1".into(), force: false },
-            PromptAction::Run { sandbox: "s".into(), name: None, branch: None, base: None },
+            PromptAction::Run { sandbox: "s".into(), name: None, branch: None, base: None, place: false },
         ] {
             app.pending_action = Some(action.clone());
             assert_eq!(app.take_pending_action(), None, "{action:?}");

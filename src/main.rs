@@ -102,10 +102,10 @@ enum Command {
         reprobe: bool,
         #[arg(short, long, help = DETACH_HELP)]
         detach: bool,
-        /// Run on this host: never placed on another machine (not with
+        /// Ask the fleet's hub where to run this host's sandbox (not with
         /// `--machine` or a `<machine>/<sandbox>`)
         #[arg(long)]
-        here: bool,
+        place: bool,
     },
     /// Recreate an instance's container from the current config (keeps the
     /// worktree, branch, and per-instance state); no-op when there is no drift
@@ -740,10 +740,13 @@ fn main() -> Result<()> {
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
-        // `--here` only matters to the daemon's placement: in-process is here.
-        Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, here: _ } => {
+        // Placement is the daemon's: here, `--place` can only say it isn't.
+        Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, place } => {
             if detach {
                 return Err(detach_refused());
+            }
+            if place {
+                eprintln!("note: --place needs devsandbox serve to ask the hub: running here");
             }
             // Taken before any work so every child process (and autostart
             // below) writes to stderr; only the final document hits stdout.

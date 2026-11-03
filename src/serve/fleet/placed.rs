@@ -1,6 +1,7 @@
 //! The daemon's `run` verb placed (docs/architecture/daemon/fleet.md,
-//! *Placement*; fleet step 3c): a `run` that names no `machine` and isn't
-//! `here` goes where [`place::place`] says among this host and every
+//! *Placement*; fleet step 3c): a `run` that names no `machine` and asks
+//! for it (`place`, `run --place`: [`asked`]; fleet plan decision 38) goes
+//! where [`place::place`] says among this host and every
 //! machine whose link is up (ssh or inbound). On a
 //! machine, its sandbox's code moves first, into this host's fleet root
 //! there (`code::prepare`; [`fleet_root`] says where that is), then the
@@ -57,6 +58,14 @@ pub const CAPACITY_WAIT: Duration = Duration::from_secs(2);
 /// hello is through: the hub asks its own machines' `capacity.get` first,
 /// each up to twice [`CAPACITY_WAIT`].
 pub const PLACE_WAIT: Duration = Duration::from_secs(6);
+
+/// Whether the `run` request `params` asks to be placed (`place`, `run
+/// --place`). A run the user typed without it runs on this host, whose
+/// config it names (fleet plan decision 38): nothing asks the hub or
+/// probes a worker's capacity for it.
+pub fn asked(params: &Value) -> bool {
+    params.get("place").and_then(Value::as_bool) == Some(true)
+}
 
 /// The workers placement asks for a fresh report: the reachable ones
 /// (their link up), whatever their saved report says.
@@ -116,8 +125,6 @@ pub fn candidates(
 /// What the request asked that placement reads.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ask<'a> {
-    /// `--here`: never placed.
-    pub here: bool,
     /// `--branch`.
     pub branch: Option<&'a str>,
     /// `--base`.
@@ -143,9 +150,8 @@ pub enum Placed {
     Failed(String),
 }
 
-/// Where `run` goes: here when asked (`here`) or when placement picks
-/// this host (or nothing, which a candidate list with this host in it
-/// never gives); else `prepare(worker)` moves the code there, and its
+/// Where `run` goes: here when placement picks this host (or nothing,
+/// which a candidate list with this host in it never gives); else `prepare(worker)` moves the code there, and its
 /// answer decides: there, here with a note (`NotMovable`), or failed.
 pub fn decide(
     ask: &Ask,
@@ -153,9 +159,6 @@ pub fn decide(
     candidates: &[Candidate],
     prepare: impl FnOnce(&str) -> Result<Prepared, Unprepared>,
 ) -> Placed {
-    if ask.here {
-        return Placed::Local;
-    }
     let Ok(placement) = place::place(spec, candidates) else { return Placed::Local };
     let MachineRef::Machine(name) = &placement.machine else { return Placed::Local };
     moved(ask, name, lines(&placement), prepare)
@@ -355,13 +358,13 @@ pub fn lines(p: &Placement) -> Vec<String> {
 
 /// The `run` request `params` as worker `worker` gets it: `machine` set
 /// (the daemon forwards it as a `machine` request), `root` its copy of the
-/// config root, `here` (it runs there), `base` when [`start_point`] gave
-/// one.
+/// config root, no `place` (it runs there, never placed again), `base`
+/// when [`start_point`] gave one.
 pub fn forwarded(mut params: Value, worker: &str, root: &Path, base: Option<&str>) -> Value {
     if let Some(p) = params.as_object_mut() {
         p.insert("machine".into(), json!(worker));
         p.insert("root".into(), json!(root));
-        p.insert("here".into(), json!(true));
+        p.remove("place");
         if let Some(base) = base {
             p.insert("base".into(), json!(base));
         }
@@ -566,9 +569,6 @@ mod tests {
         // This host has more room: here, nothing moved.
         assert_eq!(decide(&ask, &s, &idle_here(), ok("main")), Placed::Local);
         assert!(asked.borrow().is_empty());
-        // `--here`: here whatever the score.
-        assert_eq!(decide(&Ask { here: true, ..ask }, &s, &busy_here(), ok("main")), Placed::Local);
-        assert!(asked.borrow().is_empty());
 
         // The worker wins: moved, then there.
         let Placed::Worker { name, root, base, lines } = decide(&ask, &s, &busy_here(), ok("main")) else { panic!() };
@@ -697,9 +697,19 @@ mod tests {
         assert_eq!(*asked.borrow(), ["box", "srv"]);
     }
 
+    /// Only `run --place` is placed: a typed run's request (no `place`,
+    /// or `false`) runs here without asking anyone.
+    #[test]
+    fn only_a_place_request_is_placed() {
+        assert!(asked(&json!({"root": "/w/cfg", "sandbox": "web", "place": true})));
+        for params in [json!({"root": "/w/cfg", "sandbox": "web"}), json!({"sandbox": "web", "place": false}), json!({"place": "yes"})] {
+            assert!(!asked(&params), "{params}");
+        }
+    }
+
     #[test]
     fn a_new_branch_starts_at_the_bundled_tip() {
-        let ask = |branch, base| Ask { here: false, branch, base };
+        let ask = |branch, base| Ask { branch, base };
         // Origin has it: the bundle carried it, no base needed.
         assert_eq!(start_point(&ask(Some("feature"), None), &prepared("feature")), None);
         // A new one: the bundle carried the checkout's branch, its start.
@@ -712,12 +722,14 @@ mod tests {
 
     #[test]
     fn the_worker_gets_the_request_in_its_root() {
-        let params = json!({"root": "/w/cfg", "env": {}, "sandbox": "web", "branch": "new-one", "base": null});
+        let params = json!({"root": "/w/cfg", "env": {}, "sandbox": "web", "branch": "new-one", "base": null, "place": true});
         let p = forwarded(params, "lap", Path::new("/fleet/hub/roots/h/cfg"), Some("main"));
+        // No `place`: the worker runs it, never places it again.
         assert_eq!(
             p,
-            json!({"root": "/fleet/hub/roots/h/cfg", "env": {}, "sandbox": "web", "branch": "new-one", "base": "main", "machine": "lap", "here": true})
+            json!({"root": "/fleet/hub/roots/h/cfg", "env": {}, "sandbox": "web", "branch": "new-one", "base": "main", "machine": "lap"})
         );
+        assert!(!asked(&p));
         let p = forwarded(json!({"root": "/w/cfg", "base": "v1"}), "lap", Path::new("/x"), None);
         assert_eq!(p["base"], "v1");
 

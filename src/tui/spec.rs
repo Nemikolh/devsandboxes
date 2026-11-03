@@ -49,11 +49,12 @@ pub const SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "run",
         aliases: &[],
-        usage: "run <sandbox> [--name n] [--branch b] [--base ref]",
+        usage: "run <sandbox> [--name n] [--branch b] [--base ref] [--place]",
         flags: &[
             FlagSpec { name: "--name", value: Some(ArgValue::Free) },
             FlagSpec { name: "--branch", value: Some(ArgValue::Branch) },
             FlagSpec { name: "--base", value: Some(ArgValue::Free) },
+            FlagSpec { name: "--place", value: None },
         ],
         positionals: &[ArgValue::Sandbox],
         trailing: false,
@@ -242,7 +243,10 @@ mod tests {
         assert_eq!(args.positionals, vec!["web".to_string()]);
         assert_eq!(args.value("--name"), Some("api"));
 
-        assert_eq!(parse("run"), Err("usage: run <sandbox> [--name n] [--branch b] [--base ref]".into()));
+        assert!(!parse("run web").unwrap().flag("--place"));
+        assert!(parse("run --place web").unwrap().flag("--place"));
+
+        assert_eq!(parse("run"), Err("usage: run <sandbox> [--name n] [--branch b] [--base ref] [--place]".into()));
         assert_eq!(parse("run web --name"), Err("`--name` needs a value".into()));
         assert_eq!(parse("run web --branch"), Err("`--branch` needs a value".into()));
         assert_eq!(parse("run web --bogus"), Err("unknown flag `--bogus`".into()));

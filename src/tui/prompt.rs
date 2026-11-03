@@ -29,7 +29,9 @@ const HISTORY_CAP: usize = 200;
 /// `exec`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptAction {
-    Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String> },
+    /// `place`: `--place`, the fleet's hub picks where (else it runs where
+    /// its config is).
+    Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String>, place: bool },
     Exec { instance: String, argv: Vec<String> },
     /// `goto`: also open a file at a line in the window (`--goto`, an Inbox
     /// `vscode` action's path/line/col).
@@ -403,6 +405,7 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             name: args.value("--name").map(str::to_string),
             branch: args.value("--branch").map(str::to_string),
             base: args.value("--base").map(str::to_string),
+            place: args.flag("--place"),
         }),
         "exec" => {
             Ok(PromptAction::Exec { instance: args.positionals.remove(0), argv: args.trailing })
@@ -622,7 +625,7 @@ mod tests {
     fn parse_run_variants() {
         assert_eq!(
             parse_line("run web"),
-            Ok(PromptAction::Run { sandbox: "web".into(), name: None, branch: None, base: None })
+            Ok(PromptAction::Run { sandbox: "web".into(), name: None, branch: None, base: None, place: false })
         );
         assert_eq!(
             parse_line("run web --name api"),
@@ -631,6 +634,7 @@ mod tests {
                 name: Some("api".into()),
                 branch: None,
                 base: None,
+                place: false,
             })
         );
         assert_eq!(
@@ -640,6 +644,7 @@ mod tests {
                 name: None,
                 branch: Some("feat/x".into()),
                 base: None,
+                place: false,
             })
         );
         assert_eq!(
@@ -649,7 +654,12 @@ mod tests {
                 name: None,
                 branch: None,
                 base: Some("origin/develop".into()),
+                place: false,
             })
+        );
+        assert_eq!(
+            parse_line("run --place web --name api"),
+            Ok(PromptAction::Run { sandbox: "web".into(), name: Some("api".into()), branch: None, base: None, place: true })
         );
         assert!(parse_line("run web --base").is_err());
         assert!(parse_line("run").is_err());

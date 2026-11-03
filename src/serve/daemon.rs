@@ -2062,9 +2062,11 @@ fn remote_verb(
     fwd::verb(id, method, params, machine, &vctx, peer)
 }
 
-/// `run` without `machine`, placed (docs/architecture/daemon/fleet.md,
+/// `run --place` without `machine`, placed (docs/architecture/daemon/fleet.md,
 /// *Placement*; `fleet::placed`): `None` when it runs here (a note, if
-/// any, already in its output), else the answer of the run forwarded to
+/// any, already in its output), as every run without `place` does
+/// ([`fleet::placed::asked`]: a typed run never asks the hub), else the
+/// answer of the run forwarded to
 /// the worker it was placed on, in the worker's copy of the config root,
 /// or the failure to move the code there. On the hub (`member.toml`'s
 /// `hub = "self"`, [`Shared::is_hub`]) this host places it, looking
@@ -2079,7 +2081,7 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     use fleet::member::Hub;
     use fleet::placed::{self, Placed};
     let str_of = |k: &str| params.get(k).and_then(Value::as_str);
-    if params.get("here").and_then(Value::as_bool) == Some(true) {
+    if !placed::asked(params) {
         return None;
     }
     let hub = lock_hub(&shared.hub).clone();
@@ -2100,7 +2102,7 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     let spec = placed::spec(sandbox, locals.iter().find(|(d, _)| *d == root).map(|(_, v)| v.as_ref()));
     let local_roots: Vec<Arc<Value>> = locals.into_iter().map(|(_, v)| v).collect();
     let entries = shared.links().map(|l| l.entries()).unwrap_or_default();
-    let ask = placed::Ask { here: false, branch: str_of("branch"), base: str_of("base") };
+    let ask = placed::Ask { branch: str_of("branch"), base: str_of("base") };
     let prepare = |worker: &str| move_code(shared, &entries, worker, &root, sandbox, ask.branch);
     let decided = match &hub {
         Hub::Other(k) => {

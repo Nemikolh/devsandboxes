@@ -85,11 +85,12 @@ pub struct RunParams {
     /// TTY progress, as on the caller's terminal. Absent: pipes.
     #[serde(default)]
     pub tty: Option<TtySize>,
-    /// Run on this host, never placed on a fleet worker (`run --here`;
-    /// docs/architecture/daemon/fleet.md, *Placement*). Only the daemon
-    /// reads it: the subprocess runs here either way.
+    /// Ask the fleet's hub where to run it (`run --place`;
+    /// docs/architecture/daemon/fleet.md, *Placement*). Absent, it runs on
+    /// this host: a typed run is never placed. Only the daemon reads it:
+    /// the subprocess runs here either way.
     #[serde(default)]
-    pub here: bool,
+    pub place: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1131,12 +1132,12 @@ pub(crate) mod tests {
             reprobe: true,
         };
         match parse(run) {
-            Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, here } => {
+            Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, place } => {
                 assert_eq!(sandbox.as_deref(), Some("-web"));
                 assert_eq!((name.as_deref(), branch.as_deref(), base.as_deref()), (Some("w2"), Some("-b"), Some("origin/main")));
                 // The daemon detaches by itself: the subprocess never gets `-d`.
-                // Nor `--here`: placement is the daemon's, the subprocess runs here.
-                assert!(json && reprobe && env.is_empty() && dispatcher.is_none() && !detach && !here);
+                // Nor `--place`: placement is the daemon's, the subprocess runs here.
+                assert!(json && reprobe && env.is_empty() && dispatcher.is_none() && !detach && !place);
             }
             _ => panic!("not run"),
         }
@@ -1656,7 +1657,7 @@ pub(crate) mod tests {
             reprobe: true,
             detach: true,
             tty: Some(TtySize { cols: 100, rows: 30 }),
-            here: true,
+            place: true,
         };
         let rebuild = RebuildParams {
             root: root.clone(),

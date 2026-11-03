@@ -47,8 +47,9 @@ limitation means editing this file in the same commit.
   machines the hub links to show `via` it). `machine rm <m>` takes `m`
   out of the fleet on the hub (a member's is sent there), `machine rm
   <this host>` leaves, `machine unlink <m>` only drops this host's link
-  (step 9d). A member's `run` is placed by the hub (step 9e,
-  `fleet.place`). Member identity (step 10a): every member has a key,
+  (step 9d). A member's `run --place` is placed by the hub (step 9e,
+  `fleet.place`); a typed `run` without it stays on its member
+  (decision 38). Member identity (step 10a): every member has a key,
   the fleet's membership is a log only its authority (the host that
   made it) signs, every link proves both ends' keys against it, and a
   change typed on another member (`machine rm`, `machine key rotate`,
@@ -427,16 +428,15 @@ limitation means editing this file in the same commit.
   host's while watched, a machine's last pushed), and `has_repo` is never
   filled (no repo locality yet).
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::candidates`
-- A placed `run` is placed only by the daemon's `run` verb: a CLI `run`
-  with no daemon to reach, the dispatcher's children and `--in-process`
-  runs stay here (fleet step 13 for children). A hub (`hub = "self"` in
-  `member.toml`) places its own runs; a `run` typed on a member is placed
-  by the hub (`fleet.place`, up to 2 s for the dial and 6 s for the
-  answer) among the machines the member links to directly, and runs on
-  the member with a note when the hub can't be reached. On a hub every
-  connected machine is a candidate (ssh and inbound), so it asks each a
-  `capacity.get` (2 s at most) before every unpinned `run` (`--here`
-  keeps it local).
+- Only `run --place` is placed, and only by the daemon's `run` verb: a
+  `run --place` with no daemon to reach and `--in-process` runs stay
+  here, with a note; the dispatcher's children aren't placed yet (fleet step 13). A
+  hub (`hub = "self"` in `member.toml`) places its own; a member's is
+  placed by the hub (`fleet.place`, up to 2 s for the dial and 6 s for
+  the answer) among the machines the member links to directly, and runs
+  on the member with a note when the hub can't be reached. On a hub every
+  connected machine is a candidate (ssh and inbound), each asked a
+  `capacity.get` (2 s at most) first.
   The placing host's `state.toml` doesn't record a placed instance (it's the
   machine's, seen as `<machine>/<name>` in federated views; fleet step 13).
   Moving the

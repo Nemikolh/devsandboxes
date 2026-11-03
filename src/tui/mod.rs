@@ -685,7 +685,7 @@ fn verb_call(
     let root = root.to_path_buf();
     let tty = Some(tty);
     let (method, params) = match action.clone() {
-        PromptAction::Run { sandbox, name, branch, base } => (
+        PromptAction::Run { sandbox, name, branch, base, place } => (
             "run",
             serde_json::to_value(RunParams {
                 root,
@@ -698,7 +698,7 @@ fn verb_call(
                 reprobe: false,
                 detach: true,
                 tty,
-                here: false,
+                place,
             }),
         ),
         PromptAction::Rebuild { instance, force } => (
@@ -770,7 +770,9 @@ fn fetch_route(s: &data::Snapshot, fetch: &app::Fetch) -> remote::Route {
 fn unqualified(action: &PromptAction) -> PromptAction {
     let bare = |key: &str| remote::split(key).1.to_string();
     match action.clone() {
-        PromptAction::Run { sandbox, name, branch, base } => PromptAction::Run { sandbox: bare(&sandbox), name, branch, base },
+        PromptAction::Run { sandbox, name, branch, base, place } => {
+            PromptAction::Run { sandbox: bare(&sandbox), name, branch, base, place }
+        }
         PromptAction::Rebuild { instance, force } => PromptAction::Rebuild { instance: bare(&instance), force },
         PromptAction::Start { instance } => PromptAction::Start { instance: bare(&instance) },
         PromptAction::Stop { instance } => PromptAction::Stop { instance: bare(&instance) },
@@ -796,6 +798,10 @@ fn routed_verb_call(
     let Some(machine) = &route.machine else {
         return verb_call(action, root, env, tty).context("not a verb");
     };
+    // Placement starts from this host's config, as the CLI's `run --place`.
+    if let PromptAction::Run { sandbox, place: true, .. } = action {
+        anyhow::bail!("--place asks the hub where to run this host's sandbox; `{sandbox}` is on machine `{machine}`");
+    }
     let Some(remote_root) = &route.root else {
         anyhow::bail!("no config root known on machine `{machine}`");
     };
@@ -965,6 +971,7 @@ mod tests {
             name: name.map(String::from),
             branch: branch.map(String::from),
             base: base.map(String::from),
+            place: false,
         }
     }
 
@@ -1001,7 +1008,14 @@ mod tests {
         assert_eq!((root_param, machine, &params["instance"]), ("/here".into(), serde_json::Value::Null, &"web-2".into()));
         let (method, root_param, machine, params) = call(&run_action(None, None, None)).unwrap();
         assert_eq!((method, root_param, machine, &params["sandbox"]), ("run", "/here".into(), serde_json::Value::Null, &"web".into()));
-        let remote_run = PromptAction::Run { sandbox: "box/web".into(), name: None, branch: None, base: None };
+        // A typed run carries no `place`: the daemon runs it here.
+        assert_eq!(params["place"], false);
+        let placed = PromptAction::Run { sandbox: "web".into(), name: None, branch: None, base: None, place: true };
+        assert_eq!(call(&placed).unwrap().3["place"], true);
+        let remote_run = PromptAction::Run { sandbox: "box/web".into(), name: None, branch: None, base: None, place: false };
+        // `--place` starts from this host's config: not a machine's.
+        let e = call(&PromptAction::Run { sandbox: "box/web".into(), name: None, branch: None, base: None, place: true }).unwrap_err();
+        assert_eq!(e.to_string(), "--place asks the hub where to run this host's sandbox; `box/web` is on machine `box`");
         let (_, root_param, machine, params) = call(&remote_run).unwrap();
         assert_eq!((root_param, machine, &params["sandbox"]), ("/r/one".into(), "box".into(), &"web".into()));
         // Minus the routing param, the request the machine would get from

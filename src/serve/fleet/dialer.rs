@@ -884,7 +884,7 @@ pub(crate) mod tests {
         });
         let fleet_root = std::fs::canonicalize(pair.base.join("l-data/fleet/box")).unwrap();
         let mut k = connect(&pair.k_dir);
-        let (r, out, err) = verb(&mut k, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature"}));
+        let (r, out, err) = verb(&mut k, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
         assert_eq!(r.result.as_ref().unwrap()["machine"], "lap", "{r:?}");
         assert!(err.starts_with("placed on lap ("), "{err}");
@@ -901,10 +901,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A `run` typed on member L (`lap`, hub `box`) is placed by the hub K
+    /// A `run --place` on member L (`lap`, hub `box`) is placed by the hub K
     /// (`fleet.place`): L is over a cap, K has room, so L moves the code
     /// into its fleet root on K (as K's `roots.list` flags it) and forwards
-    /// the run there, the hub's lines first.
+    /// the run there, the hub's lines first. Without `place` it runs on L,
+    /// whatever the hub would say.
     #[test]
     fn a_members_run_is_placed_by_the_hub() {
         use crate::serve::capacity::{Capacity, Caps};
@@ -957,6 +958,11 @@ pub(crate) mod tests {
         let mut l = connect(&pair.l_dir);
         let (r, out, err) = verb(&mut l, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature"}));
         assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!(r.result.as_ref().unwrap().get("machine"), None, "{r:?}");
+        assert_eq!((out, err.as_str()), (format!("local --in-process -C {} run --branch=feature -- web\n", cfg.display()), ""));
+        assert!(!fleet_root.join("roots").exists() || std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().all(|e| e.file_name() == ".in"));
+        let (r, out, err) = verb(&mut l, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature", "place": true}));
+        assert!(r.error.is_none(), "{r:?} {err}");
         assert_eq!(r.result.as_ref().unwrap()["machine"], "box", "{r:?}");
         assert!(err.starts_with("placed on box ("), "{err}");
         let roots: Vec<_> =
@@ -972,8 +978,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Member L's hub `box` can't be reached (its ssh fails): a `run` typed
-    /// on L runs on L, its output starting with a note naming the hub.
+    /// Member L's hub `box` can't be reached (its ssh fails): a `run
+    /// --place` on L runs on L, its output starting with a note naming the
+    /// hub.
     #[test]
     fn a_members_run_stays_here_when_its_hub_is_unreachable() {
         use crate::serve::fleet::member::{Member, write_for_test};
@@ -991,7 +998,7 @@ pub(crate) mod tests {
         pair.wait_box("box unreachable", |r| r["state"] == "unreachable");
         let cfg = pair.base.join("cfg");
         std::fs::create_dir_all(&cfg).unwrap();
-        let (r, out, err) = verb(&mut connect(&pair.l_dir), "run", json!({"root": cfg, "env": {}, "sandbox": "web"}));
+        let (r, out, err) = verb(&mut connect(&pair.l_dir), "run", json!({"root": cfg, "env": {}, "sandbox": "web", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
         assert_eq!(r.result.as_ref().unwrap().get("machine"), None, "{r:?}");
         assert!(err.starts_with("note: the hub `box` is unreachable (") && err.contains("): running here\n"), "{err}");

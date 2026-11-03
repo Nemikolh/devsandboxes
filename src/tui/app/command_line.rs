@@ -20,8 +20,8 @@ fn resolve_action(s: &crate::snapshot::Snapshot, action: PromptAction, services:
     use remote::{Kind, resolve};
     let inst = |name: String| resolve(s, &name, Kind::Instance);
     Ok(match action {
-        PromptAction::Run { sandbox, name, branch, base } => {
-            PromptAction::Run { sandbox: resolve(s, &sandbox, Kind::Sandbox)?, name, branch, base }
+        PromptAction::Run { sandbox, name, branch, base, place } => {
+            PromptAction::Run { sandbox: resolve(s, &sandbox, Kind::Sandbox)?, name, branch, base, place }
         }
         PromptAction::Exec { instance, argv } => PromptAction::Exec { instance: inst(instance)?, argv },
         PromptAction::Code { instance, goto } => PromptAction::Code { instance: inst(instance)?, goto },
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(submit(&mut app, "start @/inst1"), Some(PromptAction::Start { instance: "inst1".into() }));
         assert_eq!(
             submit(&mut app, "run box/s"),
-            Some(PromptAction::Run { sandbox: "box/s".into(), name: None, branch: None, base: None })
+            Some(PromptAction::Run { sandbox: "box/s".into(), name: None, branch: None, base: None, place: false })
         );
         // Unique across machines: bare is enough.
         let mut s = app.snapshot.clone().unwrap();
@@ -552,7 +552,7 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Run { sandbox: "s".into(), name: None, branch: None, base: None })
+            Some(PromptAction::Run { sandbox: "s".into(), name: None, branch: None, base: None, place: false })
         );
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('r')));
@@ -948,17 +948,17 @@ mod tests {
         // Empty token after the sandbox → the flags.
         assert_eq!(
             App::candidates_for(Tab::Instances, 2, &toks("run web"), &sandboxes, &[], &[], &no_branches()),
-            vec!["--name".to_string(), "--branch".to_string(), "--base".to_string()]
+            vec!["--name".to_string(), "--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
         // A `--` stem too (the prompt then filters by the stem).
         assert_eq!(
             App::candidates_for(Tab::Instances, 2, &toks("run web --"), &sandboxes, &[], &[], &no_branches()),
-            vec!["--name".to_string(), "--branch".to_string(), "--base".to_string()]
+            vec!["--name".to_string(), "--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
         // A flag already used is not offered again.
         assert_eq!(
             App::candidates_for(Tab::Instances, 4, &toks("run web --name x"), &sandboxes, &[], &[], &no_branches()),
-            vec!["--branch".to_string(), "--base".to_string()]
+            vec!["--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
     }
 

@@ -921,7 +921,7 @@ and `HOME` are the caller's, never the daemon's.
 
 | method | params (besides `root`, `env`) |
 |---|---|
-| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `reprobe?`, `detach?`, `tty?`, `here?` |
+| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `reprobe?`, `detach?`, `tty?`, `place?` |
 | `rebuild` | `instance` \| `all: true`, `force?`, `reprobe?`, `detach?`, `tty?` |
 | `start` | `instance` \| `all: true`, `detach?`, `tty?` |
 | `stop` | `instance` \| `all: true`, `detach?` |
@@ -933,7 +933,9 @@ and `HOME` are the caller's, never the daemon's.
 again on the daemon's host instead of read from its cache
 ([runtimes](../architecture/runtimes.md#mode-detection)).
 
-**Placement** (`run` without `machine`): on a fleet hub with a machine
+**Placement** (`run` with `"place": true`, the CLI's `--place`, not with
+`machine`): without it `run` always runs here, asking no one. With it, on
+a fleet hub with a machine
 connected, `run` goes where placement scores best, this host or a machine
 ([fleet](../architecture/daemon/fleet.md#placement)). On a member the
 hub places it (`fleet.place`) among the member, the hub and the
@@ -947,8 +949,8 @@ output starts with a `stderr` line `placed on <worker> (<reasons>)` (and
 and its detached answer carry `"machine": "<worker>"`. A sandbox that
 can't move runs here, its output starting `note: not placed on <worker>:
 <why>; running here`; a move that fails is the error `failed` (`data.exit`
-`null`), nothing runs. `"here": true` (the CLI's `--here`) always runs
-here.
+`null`), nothing runs. The request a worker gets carries no `place`, so
+it is never placed again.
 
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no
@@ -1179,7 +1181,7 @@ not by trust (`lent::admit_fleet`, *Remote callers*); a local client is
 | method | from | params | result | errors |
 |---|---|---|---|---|
 | `fleet.rm` | a member of the log (name and key), to the hub, of itself (leaving) or of a member the hub's log has revoked | `{"name"}` | `{"name", "hub", "leave", "error", "forgot", "missed"}`: `leave` `told` (`name` answered `fleet.leave`), `leaving` (`name` asked: it leaves on its own), `unreachable` (`error` says why); `forgot` the other machines of the hub that answered `fleet.forget`, `missed` `[{"name", "error"}]` those it couldn't reach (not connected, or an error answer). `name` is unlinked on the hub. Each machine told gets the hub's log first (`fleet.sync`), so the revoke its `fleet.leave` / `fleet.forget` follows is there | `denied` (not the hub, not a member of the log by its key, an introduced member, `name` another member the hub's log doesn't revoke, `name` the hub), `not-found` (neither one of the hub's machines nor in its log), `internal` |
-| `fleet.place` | a member of the log or a held introduction (name and key), to the hub | `{"spec": {"sandbox", "config_hash", "build_hash"}, "capacity", "reachable"}`: the member's spec, its capacity now (as `capacity.get` answers it), the machines it has a connected direct link to | `{"on", "machine", "lines"}`: `on` `requester` (the member), `hub` or `machine`, among the member, the hub and the hub's connected machines in `reachable`; `machine` the hub's name for it (its own member name for `hub`); `lines` what the run's output starts with (`placed on <machine> (<reasons>)`, `warning: <machine>: over cap: …`) | `denied` (not the hub, neither a member nor introduced by its key), `invalid`, `failed` (the hub has no member name), `internal` |
+| `fleet.place` | a member of the log or a held introduction (name and key), to the hub | `{"spec": {"sandbox", "config_hash", "build_hash"}, "capacity", "reachable"}`, sent for a member's `run --place` only: the member's spec, its capacity now (as `capacity.get` answers it), the machines it has a connected direct link to | `{"on", "machine", "lines"}`: `on` `requester` (the member), `hub` or `machine`, among the member, the hub and the hub's connected machines in `reachable`; `machine` the hub's name for it (its own member name for `hub`); `lines` what the run's output starts with (`placed on <machine> (<reasons>)`, `warning: <machine>: over cap: …`) | `denied` (not the hub, neither a member nor introduced by its key), `invalid`, `failed` (the hub has no member name), `internal` |
 | `fleet.leave` | the log's hub (name and key), once this host's log revokes its own key | `{}` | `{"ok": true}`: `hub` cleared, `membership.json` removed and every registry entry dropped; the links end once the answer is out | `denied` (not from the log's hub by its key; no revoke of this host's key in its log), `internal` |
 | `fleet.forget` | the log's hub (name and key), once this host's log revokes `name` | `{"name"}` | `{"ok": true}`: the registry entry for `name` dropped, if any, and `name`'s inbound link ended, if it has one (`links.cycle {"why"}` on its `fleet-link`) | `denied` (not from the log's hub by its key; no revoke of `name` in its log), `invalid` (no `name`; `name` is this host or the hub), `internal` |
 | `fleet.propose` | a member of the log (name and key; never an introduced one), to the authority (this host's name and key the log's authority's) | `{"op"}`: `{"kind": "revoke", "name"}`, `{"kind": "add", "introduction"}` (a held introduction to promote) or `{"kind": "rotate", "name", "old", "new", "by_old"}` (the proposer's own key, countersigned by `old`) | `{"id", "pending": true}`: checked against the log now, queued in `proposals.json` (next to `membership.json`) as `{"id", "from", "op", "at"}`; a pending proposal of the same change (a revoke of the same name, an add of the same name and key, a rotate of the same name to the same key) answers its own id. A new one is shown on the authority's desktop (`<from> proposes to remove <m> from the fleet: devsandbox machine approve <id>`). Nothing is signed until `membership.approve` there | `denied` (not the authority, not a member by its key, an introduced member), `invalid` (a change that doesn't apply: an unknown member, the authority, the hub, an introduction that doesn't check; a rotate of another member's key, from a key that isn't the current one, not countersigned by it, or to a key the log knows), `internal` |
@@ -1258,7 +1260,7 @@ This host's capacity report now, as its snapshots carry it (`Capacity`:
 `cpus`, `mem_total`, `mem_available`, `disk_free`, `disk_total`,
 `running`, `caps`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
 built on demand: no watched root needed. Params `{}`. On every link
-peer's connection: a host asks each machine before it places a `run`.
+peer's connection: a host asks each machine before it places a `run --place`.
 
 ### The `machine` param
 

@@ -841,7 +841,9 @@ and 16 do, 44-47 as step 10 does, 48-52 as step 10a does.
     31): the user's own sandboxes stay on their machine and nothing waits
     on the hub. Placement is for dispatcher children (step 13) and an
     explicit `run --place`, which asks the hub as decision 31 says.
-    `--machine` and qualified names still pick the machine.
+    `--machine` and qualified names still pick the machine. `run --here`
+    is dropped: with nothing placed by default there is nothing to opt
+    out of.
 39. A dispatcher runs on any member and has no notion of where its
     config lives: it reads its home member's config from the mesh. While
     the home member is up, an edit there reaches it at once; while it is
