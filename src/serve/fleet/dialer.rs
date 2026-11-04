@@ -1076,10 +1076,11 @@ pub(crate) mod tests {
             test_support::fleet_of("box", &[("lap", l_member), ("box", k_member)]);
             std::fs::remove_file(crate::serve::fleet::membership::path(k_member)).unwrap();
         });
-        let row = pair.wait_box("box refused", |r| r["error"].as_str().is_some_and(|e| e.contains("membership log")));
+        let row = pair.wait_box("box refused", |r| {
+            r["state"] == "unreachable" && r["error"].as_str().is_some_and(|e| e.contains("membership log"))
+        });
         let e = row["error"].as_str().unwrap();
         assert!(e.contains("in no fleet's membership log") && e.contains("machine add"), "{e}");
-        assert_ne!(row["state"], "connected");
         pair.finish();
     }
 
