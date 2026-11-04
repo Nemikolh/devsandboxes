@@ -786,6 +786,53 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
 11. **Hub swap, pointer** (S–M). `machine hub <m>`: the role moves, links
     stay; every reachable member rewrites `hub`, a late one learns it on
     reconnect.
+
+    Most of it is there from 10a: the log's `hub` entry (`Op::Hub`,
+    `membership::Membership` checks its target is a member), `hub`
+    written from an adopted log (`membership_api::adopt`, `hub_for`), a
+    live hub change cycling every link (`daemon::Shared::set_hub`), a
+    late member taking the newer log at its next link's proof and
+    redialing (`proof::hub_moved`), and every role reader asking the hub
+    at its use. What's missing is a way to sign the entry, and an order:
+    `changes::sign` follows the hub (cycling links) before the push, and
+    `changes::sync` before its answer is written. Sub-steps, each a
+    commit (decisions 68-70 settle what the above left open):
+    - **11a `machine hub <m>`** (decisions 68, 69).
+      `proposals::Change::Hub {name}` and its `check` (a member of the
+      log, not already the hub; an introduced or unknown name `invalid`);
+      `membership.hub {name}` in `machines::changes`, modeled on
+      `membership.rotate`: on the authority the `hub` entry signed, stored,
+      pushed, then followed here; elsewhere proposed (`propose`, a pending
+      one of the same name answering its id), answered `{"type":
+      "signed"|"proposed", …}`; `membership.approve` signs a `hub`
+      proposal (`sign_change`). Decision 69's order: a host follows a hub
+      change only after its push (the authority) or after its flood and
+      written answer (a `fleet.sync` that made its log newer: a
+      `leave::After` variant, as `After::Rotated` does for a key).
+      `devsandbox machine hub <m>` (`commands::machine`, `main.rs`)
+      prints what the push reached or the proposal's id and the
+      `machine approve` to run on the authority. The refusals that point
+      at step 11 name `machine hub` (`leave::hub_named`, `proposals::check`'s revoke of the hub, `join.rs`'s
+      `--hub` refusal). Docs: `docs/reference/api.md` (`membership.hub`,
+      `fleet.propose`'s `hub` kind, `membership.approve`),
+      `npm/devsandboxes/index.d.ts` (the `dts` check),
+      `docs/architecture/daemon/fleet.md` (*Membership log*, *Approvals and
+      pushes*, *Hub mode*), `docs/architecture/daemon/machines.md` (the
+      `machine` CLI section).
+    - **11b The role follows on every host.** A member the push missed
+      (down while the authority signed) learns at its next link's proof
+      and redials saying the new hub; everything that reads the role
+      follows a live change with no restart: the federated watch moves to
+      the new hub (`service::Hooks::hub`), link reports go to it
+      (`fleet::reports`), the hub-only `fleet.*` calls are admitted by the
+      new hub's key (`lent::admit_fleet`), the old hub stops saving
+      `remotes.json` and the new one starts from none
+      (`service::save_loop`), members linked to the new hub follow its
+      build (`fleet_link::follows`). A test for each that has none, a fix
+      for any reader that takes the role once.
+    - **11c Docs close.** `docs/status.md` (step 11 shipped, next 12;
+      decision 70's limitation), this step's as-built note,
+      `CHANGELOG.md`.
 12. **Transfer v1** (L). Repo identity, WIP snapshot commits, bundles
     routed over the graph, repo caches, the hub mirror, fetch-back.
     Repos without a remote and unpushed work can be placed.
@@ -829,7 +876,7 @@ step 6 does, 7, 18, 22-25 as step 7 does, 26-30 as step 8 does, 1, 2, 19
 and 20 as step 9 does, 21 as step 10 does, 36 and 37 as a fix to
 step 9's `machine add` does, 38 as a fix to step 9's placement does, 39-43 as steps 13, 14
 and 16 do, 44-47 as step 10 does, 48-52 as step 10a does, 53-60 as
-step 10b does.
+step 10b does, 61-67 as step 10c does, 68-70 as step 11 does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
    setting.
@@ -1137,6 +1184,25 @@ step 10b does.
     registered, inbound or routed. Decisions 18 and 30 hold as "never
     implicitly": an agent goes where the user granted it, whichever end
     dialed.
+68. `machine hub <m>` is a `hub` entry in the membership log, signed by
+    the authority only (decision 45): typed there it's signed at once
+    (the user typing it is the approval), typed on another member it's a
+    `fleet.propose {kind: hub}` approved there with `machine approve`.
+    Its target is a member of the log (an introduced member can't be the
+    hub); it needn't be reachable, so a dead hub can be replaced. Naming
+    the current hub is refused as `invalid` (nothing to sign).
+69. A host follows a hub change (its `hub` rewritten, every link cycled
+    so both ends redial saying it) only once the change has left it: the
+    authority after its push, a host a `fleet.sync` made newer after
+    sending the log on and writing its answer. Cycling first would cut
+    the links carrying the change; a host it misses still learns it at
+    its next link's proof (`proof::hub_moved`).
+70. The swap moves the role only, not links nor what the hub's view
+    reaches: the new hub's federated view is the machines it links to
+    (one hop, as before), and members watch it federated only over a
+    direct link. A hub off the routing centre (A in `A → K ← B`) shows
+    fewer rows than K would until watches go over routes, which is
+    parked, not step 11.
 
 ## Open questions
 
