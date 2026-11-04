@@ -506,6 +506,11 @@ impl Inner {
     }
 }
 
+/// Whether `a` and `b` differ in nothing but their roots.
+fn same_but_roots(a: &Entry, b: &Entry) -> bool {
+    *a == Entry { roots: a.roots.clone(), ..b.clone() }
+}
+
 /// The registry's `entries` and an inbound entry per neighbor up now
 /// (`Entry::inbound`), sorted by name; a registry name wins (the clash
 /// rules refuse one, this covers a race between them).
@@ -535,6 +540,7 @@ impl Handle {
                 return;
             }
         };
+        let mut moved = Vec::new();
         let gone: Vec<LinkThread> = {
             let mut links = inner.lock_links();
             let mut stale = Vec::new();
@@ -546,9 +552,9 @@ impl Handle {
                     // its announce (`daemon::inbound_roots`), so each new one's
                     // link would go down once, failing whatever used it then
                     // (a placement's `roots.list`).
-                    Some(e) if Entry { roots: e.roots.clone(), ..l.entry.clone() } == *e => {
+                    Some(e) if same_but_roots(e, &l.entry) => {
                         l.entry.roots.clone_from(&e.roots);
-                        let _ = l.tx.send(Cmd::Roots(e.roots.clone()));
+                        moved.push(name.clone());
                     }
                     _ => stale.push(name.clone()),
                 }
@@ -565,6 +571,13 @@ impl Handle {
         // Before the new threads run: they record their state there.
         inner.remotes.sync(&entries);
         inner.rows_changed();
+        // After the sync: a link's push for a root it gained is only stored
+        // once `Remotes` lists that root (`LinkLoop::store`).
+        for name in &moved {
+            if let Some(l) = links.get(name) {
+                let _ = l.tx.send(Cmd::Roots(l.entry.roots.clone()));
+            }
+        }
         for e in &entries {
             if !links.contains_key(&e.name) {
                 let link = spawn_link(e.clone(), Arc::clone(inner));
@@ -1138,13 +1151,24 @@ impl<'a> LinkLoop<'a> {
             return;
         }
         // A reconnect's first push is disk-depth: keep the last statuses.
+        let mut stored = false;
         self.inner.remotes.update(&self.entry.name, |m| {
+            // The synced roots too, not only this thread's: a reload may
+            // have dropped `dir` (and its rows) with its `Cmd::Roots` not
+            // drained here yet, and a late push mustn't bring them back.
+            if !m.roots.contains(&dir) {
+                return;
+            }
             if let Some(prev) = m.rows.get(&dir) {
                 snapshots::carry_remote_status(prev, &mut params);
             }
             m.rows.insert(dir, Arc::new(params));
             m.seen = Some(now_unix());
+            stored = true;
         });
+        if !stored {
+            return;
+        }
         self.inner.rows_changed();
         (self.inner.hooks.changed)();
     }
