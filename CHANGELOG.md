@@ -89,7 +89,7 @@ devsandbox machine add me@my-server   # my-server's key fingerprint is SHA256:â€
 
 - **`machine key rotate`.** Replaces this machine's key without leaving the fleet; its links reconnect with the new key once the change is approved.
 
-- **`machine hub <m>` moves the hub role.** The fleet's hub becomes member `m` with no link changing: on the machine that created the fleet it applies at once, typed elsewhere it waits for `machine approve` there. Every member it reaches follows within seconds, and one that was offline follows when it next connects. The old hub takes no part, so a hub that's down for good can be replaced; the new hub's fleet view is the machines it links to directly.
+- **`machine hub <m>` moves the hub role.** The fleet's hub becomes member `m` with no link changing: on the machine that created the fleet it applies at once, typed elsewhere it waits for `machine approve` there. Every member it reaches follows within seconds, and one that was offline follows when it next connects. The old hub takes no part, so a hub that's down can be replaced, unless it's the machine that created the fleet (that machine signs the move); the new hub's fleet view is the machines it links to directly.
 
 ```bash
 devsandbox machine hub my-server

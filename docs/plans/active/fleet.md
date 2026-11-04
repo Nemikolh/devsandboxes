@@ -192,9 +192,12 @@ hub's role adds the member list, the graph and placement, not access.
 ### Swapping the hub
 
 `machine hub <m>` (step 11; a pointer swap for now). Links don't change:
-the role moves. Run on any member, it tells every reachable member that
-`m` is the hub (each rewrites `hub`); a member unreachable then learns it
-from the first member it reconnects to. `m` starts empty: rows and the
+the role moves. It's a `hub` entry the authority signs (decision 68:
+typed elsewhere, proposed and approved there), pushed to every
+reachable member (each rewrites `hub`); a member unreachable then learns
+it from the first member it reconnects to. A dead hub can be replaced
+only while the authority is up, so not in a fleet made without `--hub`,
+where they're one machine (step 18). `m` starts empty: rows and the
 graph come back as members report, the repo cache refills as code moves.
 Handing the hub's state over (repo cache, saved rows, dispatcher records,
 checkpoints) is step 17, once steps 13-14 make that state matter; the
@@ -1206,8 +1209,10 @@ step 10b does, 61-67 as step 10c does, 68-70 as step 11 does.
     (the user typing it is the approval), typed on another member it's a
     `fleet.propose {kind: hub}` approved there with `machine approve`.
     Its target is a member of the log (an introduced member can't be the
-    hub); it needn't be reachable, so a dead hub can be replaced. Naming
-    the current hub is refused as `invalid` (nothing to sign).
+    hub); it needn't be reachable, so a dead hub can be replaced while the
+    authority is up (not when the dead hub is the authority, the default
+    for a fleet made without `--hub`). Naming the current hub is refused
+    as `invalid` (nothing to sign).
 69. A host follows a hub change (its `hub` rewritten, every link cycled
     so both ends redial saying it) only once the change has left it: the
     authority after its push, a host a `fleet.sync` made newer after

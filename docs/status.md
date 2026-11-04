@@ -346,7 +346,10 @@ limitation means editing this file in the same commit.
   links go to a hub that is down learns of a move only once one of them
   is back. Right after a move a link can drop twice (both ends cycle
   it: the authority after its push, the other end after its answer), so
-  a call made then may fail once.
+  a call made then may fail once. Only the authority signs a move, so a
+  hub that is down can be replaced only while the authority is up; a
+  fleet made without `--hub` has them on one machine, and with it down
+  the role can't move (fleet plan step 18).
   → [fleet](architecture/daemon/fleet.md#hub-mode); `machines::changes::follow`, `leave::After::Hub`
 - A grant for an inbound or routed machine takes effect there once this
   host's link report reaches it (pushed by the hub or flooded by the
