@@ -768,6 +768,9 @@ struct Shared {
     /// Each watched root's last local `instances.snapshot` params (the poll's,
     /// or a new watch's disk one): what a machine's push is merged with.
     locals: Mutex<BTreeMap<PathBuf, Arc<Value>>>,
+    /// Held through a [`publish_machines`](Shared::publish_machines), so
+    /// one called later posts later remotes (taken before `locals`).
+    publishing: Mutex<()>,
     /// `member.toml` ([`Options::member`]), for `member.*`, the trust table
     /// and the capacity's caps; its dir is the data dir. `None` without a
     /// data dir and in tests that build a bare `Shared`.
@@ -830,6 +833,7 @@ impl Shared {
             hub: Arc::default(),
             machines: None,
             locals: Mutex::default(),
+            publishing: Mutex::default(),
             member: None,
             hostname: String::new(),
             socket_dir: PathBuf::new(),
@@ -1426,7 +1430,14 @@ impl Shared {
     /// A machine's rows or state changed: every root watched with `machines:
     /// true` gets its last local params merged again, to those watchers
     /// only. A root with no local params yet waits for its first.
+    /// One at a time: two at once could post in the other order, the older
+    /// remotes replacing the newer under latest-wins, and with no poll
+    /// nothing re-merges until the next change.
     fn publish_machines(&self) {
+        let _one = self.publishing.lock().unwrap();
+        // `locals` before the remotes: a root `watch_root` adds after this
+        // clone merged its first push with remotes (and grants) read after
+        // the change that called this one.
         let locals = self.locals.lock().unwrap().clone();
         let remotes = self.remotes();
         let exposed = self.exposed_workers(None);
@@ -1451,8 +1462,12 @@ impl Shared {
 
     /// Every root some live connection watches: what the host poll collects.
     /// A connection that hung up is gone from `conns`, its watches with it
-    /// (and the root's local params, once nobody watches it).
+    /// (and the root's local params, once nobody watches it). `locals` is
+    /// held from the collection to the prune, so a [`watch_root`] (which
+    /// adds its root's params and watch under it) is seen whole or not at
+    /// all, never pruned between the two.
     fn watched_roots(&self) -> BTreeSet<PathBuf> {
+        let mut locals = self.locals.lock().unwrap();
         let mut roots = BTreeSet::new();
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
@@ -1460,7 +1475,7 @@ impl Shared {
                 false
             });
         }
-        self.locals.lock().unwrap().retain(|dir, _| roots.contains(dir));
+        locals.retain(|dir, _| roots.contains(dir));
         roots
     }
 
@@ -2732,35 +2747,41 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
     let cached = shared.snapshots.cached(&dir);
     let first = match &cached {
         Some(params) => Some(Arc::clone(params)),
-        None => {
-            let first = snapshots::params(&dir, &(shared.join)(&dir, &crate::snapshot::RuntimeView::disk()));
-            // Nothing fresher for a machine's push to merge with (with no
-            // poll, as in tests, the only one).
-            if let Some(first) = &first {
-                shared.locals.lock().unwrap().insert(dir.clone(), Arc::clone(first));
-            }
-            first
-        }
+        None => snapshots::params(&dir, &(shared.join)(&dir, &crate::snapshot::RuntimeView::disk())),
     };
-    let first = match first {
-        Some(first) if machines => {
-            let merged = snapshots::merge(&first, &shared.remotes(), except.as_deref(), &shared.exposed_workers(None), &shared.agent_granted());
-            Some(Arc::new(merged))
-        }
-        first => first,
-    };
+    // Under `locals`, the root's params, its watch and the first push's
+    // merge go in together: `watched_roots` can't prune the params before
+    // the watch lands, and a `publish_machines` either sees both (and
+    // posts after, with remotes read later) or neither (and this merge
+    // reads remotes after the change it was called for). Every remotes or
+    // grants change calls its own `publish_machines`, so none is missed.
+    let mut locals = shared.locals.lock().unwrap();
+    if cached.is_none()
+        && let Some(first) = &first
+    {
+        // Nothing fresher for a machine's push to merge with (with no
+        // poll, as in tests, the only one).
+        locals.insert(dir.clone(), Arc::clone(first));
+    }
     conn.out.post(|p| {
         let switched = p.watched.insert(dir.clone(), machines).is_some_and(|was| was != machines);
         // A poll's snapshot already pending (a re-watch) is newer, unless
         // it's the other variant.
         match first {
             Some(first) if switched || !p.snapshots.contains_key(&dir) => {
+                let first = if machines {
+                    let merged = snapshots::merge(&first, &shared.remotes(), except.as_deref(), &shared.exposed_workers(None), &shared.agent_granted());
+                    Arc::new(merged)
+                } else {
+                    first
+                };
                 p.snapshots.insert(dir, first);
                 true
             }
             _ => false,
         }
     });
+    drop(locals);
     if cached.is_none()
         && let Some(poll) = shared.bridges.get()
     {
