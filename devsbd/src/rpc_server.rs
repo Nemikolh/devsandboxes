@@ -327,9 +327,16 @@ pub(crate) mod tests {
         assert!(!hung_up(&ours), "eof only");
         theirs.shutdown(Shutdown::Both).unwrap();
         assert!(hung_up(&ours));
+        // Dropping only closes our fd: a test thread forking right then
+        // holds the socket open until its child execs, so the hang-up may
+        // come a moment later (production re-checks `hung_up` in a loop).
         let (ours, theirs) = UnixStream::pair().unwrap();
         drop(theirs);
-        assert!(hung_up(&ours));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !hung_up(&ours) {
+            assert!(std::time::Instant::now() < deadline, "no hang-up after the peer's drop");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     /// A host and a daemon mux over pipes, the daemon serving host `Open`s
