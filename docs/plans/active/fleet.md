@@ -321,7 +321,7 @@ member's own, as today (decision 18).
 Each step is usable on its own. Order with the other plans is in
 [helper-rpc](helper-rpc.md#order-across-plans): steps 1-3 run alongside
 helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
-12 for its daemon-owned runs.
+13 for its daemon-owned runs.
 
 1. **Fleet link and hub mode** (L, shipped). The frame-mux link with
    `API` channels, the confined table over a fleet root, the worker
@@ -856,6 +856,75 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
 12. **Transfer v1** (L). Repo identity, WIP snapshot commits, bundles
     routed over the graph, repo caches, the hub mirror, fetch-back.
     Repos without a remote and unpushed work can be placed.
+
+    Today (step 3, decision 12) the placing host fetches each folder's
+    `origin` into a cache keyed by URL (`code::repo::cache_dir`) and
+    bundles one pushed branch from there; the worker lands it straight
+    into a checkout (`code::repo::land`); `Transfer::haves` asks nothing,
+    so everything is sent every time. Bundles already go over any path
+    (`LinkTransfer` through `route::connect`). Sub-steps, each a commit
+    (decisions 71-77 settle what the above left open):
+    - **12a Git plumbing** (`fleet/code/repo.rs`, a `fleet/code/wip.rs`
+      if it reads better; pure git over temp repos, no wire). Every git
+      child bounded (`runtime::bounded::run` with a timeout, the existing
+      `repo::run` / `optional` and the tests' `git` helper included).
+      Repo identity (decision 71): `identity(checkout, rev)`, the
+      unborn repo's `refs/devsandbox/root`. The snapshot (decision 73):
+      a WIP commit over `HEAD` through a temp index (`GIT_INDEX_FILE`;
+      `read-tree`, `add -A`, `write-tree`, `commit-tree` with a fixed
+      devsandbox identity, `update-ref`), the user's index, branches,
+      stash and working tree untouched; applying one to a checkout
+      (working tree to its tree, index at `HEAD`: modified, deleted and
+      untracked files come back as uncommitted). Bundles of given refs
+      `--not` a list of haves (unknown ones dropped, none new: no
+      bundle), the tips a repo has (capped). All through the `host_git`
+      family (ADR 0003).
+    - **12b Repo caches and haves on the receiver.** A worker keeps one
+      bare cache per repo identity and sender, `<fleet root>/repos/<repo
+      id>.git` (`host_git_bare`); a `bundle` transfer names its repo
+      and refs in its header and goes into that cache first (a body of
+      0 bytes: no new objects), its refs set from the header (each
+      checked to be a commit there), then the checkout at `to` is cut
+      from the cache (new: the branch checked out, the WIP applied;
+      existing: refs as `land` moves them today). `code.haves {repo}`,
+      an API call any peer may make about its own fleet root
+      (`lent`'s table, `docs/reference/api.md`), answers the roots
+      unpacked there and the cache's tips; `Transfer` becomes `haves`,
+      `send` and (12e) `pull`, `LinkTransfer::haves` asking it over
+      `route::connect`'s `API`, so a root the worker has isn't sent
+      again and a bundle carries only what it lacks. The sender is still
+      the origin cache here.
+    - **12c Send from the source checkout** (decisions 72, 73). `offer`
+      bundles from the folder's own checkout: its branch (the requested
+      one when the checkout has it, else its current one; a detached
+      `HEAD` doesn't move) and a fresh WIP snapshot, on a transient ref
+      removed once bundled, `--not` the worker's haves. No `origin`
+      anywhere: `repo::fetch`, `cache_dir` by URL and the hub's
+      `Options::repos` go, and the `NotMovable` reasons for a missing,
+      unreachable or behind origin with them. `place::Spec::repo` is the
+      identity. `start_point` keeps a new `--branch` starting at the
+      bundled branch.
+    - **12d The hub mirror** (decision 75). A placing host that isn't the
+      hub, placing on a worker that isn't the hub, sends the same refs
+      to the hub's cache for it too (no checkout), best effort.
+    - **12e Fetch-back** (decision 76). A pull on `TRANSFER`
+      (`transfer.rs`: the opener names what it wants, the other end
+      answers a `Header` and the body, or `error`); `instances.fetch
+      {instance, haves}` on the worker (the instance's worktree
+      snapshotted onto `refs/devsandbox/wip/<instance_id>`, its branch
+      and that ref bundled for the asker under its fleet root);
+      `placements.json` on the placing host (written when a placed run's
+      answer names its instance); the bundle landed in the source
+      checkout as `refs/devsandbox/<machine>/<instance>/heads/<branch>`
+      and `…/wip`; `devsandbox fetch <machine>/<instance>`
+      (`commands/fetch.rs`, `main.rs`), the API call on this host's
+      daemon, `npm/devsandboxes/index.d.ts`.
+    - **12f Fetch-back at `rm` and `done`** (decision 77). A placed
+      instance's `rm` or `done` typed on the host that placed it fetches
+      back first.
+    - **12g Docs close.** `docs/status.md` (steps 1-12 shipped, next
+      13; the parked items below), this step's as-built note,
+      `CHANGELOG.md`.
 13. **Dispatcher children on any machine** (M). Instances carry
     `origin_host` and repo identity; `ls`/the dashboard show where they
     run. The dispatcher (on the hub) keeps authorizing on its host
@@ -896,7 +965,8 @@ step 6 does, 7, 18, 22-25 as step 7 does, 26-30 as step 8 does, 1, 2, 19
 and 20 as step 9 does, 21 as step 10 does, 36 and 37 as a fix to
 step 9's `machine add` does, 38 as a fix to step 9's placement does, 39-43 as steps 13, 14
 and 16 do, 44-47 as step 10 does, 48-52 as step 10a does, 53-60 as
-step 10b does, 61-67 as step 10c does, 68-70 as step 11 does.
+step 10b does, 61-67 as step 10c does, 68-70 as step 11 does, 71-77 as
+step 12 does.
 
 1. The hub is `hub = "self"` in `member.toml`; no separate daemon
    setting.
@@ -1225,6 +1295,61 @@ step 10b does, 61-67 as step 10c does, 68-70 as step 11 does.
     direct link. A hub off the routing centre (A in `A → K ← B`) shows
     fewer rows than K would until watches go over routes, which is
     parked, not step 11.
+71. A repo's identity is the first 16 hex of the sha256 over the sorted
+    root commit ids (hex, one per line) of the moved branch's history.
+    A repo with no commit yet first gets `refs/devsandbox/root`, one
+    empty-tree commit devsandbox makes once (with its own timestamp, so
+    two empty repos don't share an id), and its snapshots start there.
+    The identity names caches; it isn't a trust boundary (a sender can
+    name any id, and a receiver's caches are per sender, under its fleet
+    root).
+72. v1 sends from the checkout of the host the run was placed from (the
+    one whose config it is), never from an `origin`: decision 12's origin
+    fetch on the placing host goes, and no receiver fetches an origin (a
+    placed member never needs credentials, as decision 12 said). A repeat
+    send carries only what the receiver lacks, by its haves (its cache's
+    tips, the roots it has). A first send of a big repo goes whole over
+    the link; fetching it from a reachable `origin` first is parked.
+73. A placement's snapshot is the folder's working tree as one commit
+    over its branch tip (tracked changes plus untracked, non-ignored
+    files), made through a temp index on a transient ref in the source
+    repo that is removed once bundled. The receiver's cache keeps it as
+    `refs/devsandbox/wip/<branch>` (the latest one sent for that branch).
+    It is applied only to a checkout the transfer creates; an existing
+    checkout gets its refs moved as `land` does today and its working
+    tree is otherwise left alone, since an instance on the worker may be
+    using it. A detached `HEAD` still doesn't move. Ignored files a
+    worktree wants (`.worktreeinclude`, `worktree-include`) don't travel
+    in v1 (parked).
+74. A config root that's a git repo keeps moving as a tar (its `.git`
+    left out), so a `folder` inside the config root still doesn't move;
+    moving such a root as a repo is parked.
+75. The hub mirror: a placing host that isn't the hub, placing on a
+    worker that isn't the hub, also sends the same refs into the hub's
+    cache for it (`fleet/<source>/repos/<id>.git` there, no checkout),
+    after the worker's transfer. Best effort: a failure is a note line in
+    the run's output and the log, and the run goes on. Nothing prunes it
+    yet (the retention question stays open).
+76. Fetch-back is a pull by the host that placed the instance:
+    `devsandbox fetch <machine>/<instance>` asks the worker
+    (`instances.fetch`, admitted for an instance in the caller's fleet
+    root under `worker`, any it reaches under `full`), which snapshots the
+    instance's `folder` working tree onto `refs/devsandbox/wip/<instance_id>`
+    in its repo and bundles that ref and the instance's branch `--not` the
+    asker's haves into a file under the asker's fleet root; the asker
+    pulls it on a `TRANSFER` stream it opened (the worker serves only
+    files it made for that peer) and lands it in the local checkout the
+    placement came from as `refs/devsandbox/<machine>/<instance>/heads/<branch>`
+    and `refs/devsandbox/<machine>/<instance>/wip`: never the user's
+    branches, index or working tree. That checkout comes from the placing
+    host's own record (`placements.json` next to `state.toml`, written by
+    the daemon when a placed run's answer names the instance), never from
+    what the worker says. Only the `folder` repo comes back; `folders`
+    entries' work is parked.
+77. A placed instance's `rm` typed on the host that placed it fetches
+    back first: a fetch-back that fails refuses the `rm`, naming why, and
+    `rm --force` (which already discards uncommitted work) skips it. A
+    `done` there fetches back best effort (a warning on failure).
 
 ## Open questions
 
