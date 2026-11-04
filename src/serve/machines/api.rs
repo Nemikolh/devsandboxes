@@ -768,6 +768,9 @@ mod tests {
         base: PathBuf,
         home: PathBuf,
         local: Conn,
+        /// Held: nothing else holds the machine's daemon between a test's
+        /// dials (its link here never comes up), and it would idle out.
+        remote: Conn,
         daemons: Vec<std::thread::JoinHandle<anyhow::Result<Exit>>>,
     }
 
@@ -810,9 +813,9 @@ mod tests {
             let daemons =
                 vec![spawn_daemon(&remote, remote_opts(&base, remote_semver)), spawn_daemon(&base.join("local"), local_o)];
             // The dial connects straight away: the machine must be up.
-            drop(client_at(&base.join("remote")));
+            let remote = client_at(&base.join("remote"));
             let local = client_at(&base.join("local"));
-            Pair { base, home, local, daemons }
+            Pair { base, home, local, remote, daemons }
         }
 
         /// This host's `member.toml`.
@@ -860,12 +863,11 @@ mod tests {
             crate::serve::machines::load(&self.base.join("machines.toml")).unwrap()
         }
 
-        /// Both shut down: a daemon with a machine registered holds its
-        /// link and never idles out (`idle::Holders::links`).
-        fn finish(self) {
-            drop(self.local);
-            for dir in [self.base.join("local"), self.base.join("remote")] {
-                assert!(client_at(&dir).call("shutdown", json!({})).unwrap().error.is_none());
+        /// Both shut down, over the connections held (a daemon left with no
+        /// holder would idle out before a new one connects).
+        fn finish(mut self) {
+            for conn in [&mut self.local, &mut self.remote] {
+                assert!(conn.call("shutdown", json!({})).unwrap().error.is_none());
             }
             for d in self.daemons {
                 assert_eq!(d.join().unwrap().unwrap(), Exit::Shutdown);
