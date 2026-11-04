@@ -678,7 +678,9 @@ pub mod tests {
             write_raw(&mut w, MESSAGE, br#"{"entries":[]}"#).unwrap();
             read_raw(&mut r, SYNC_LIMIT, "lap").unwrap();
             let t = transcript((&mine, hello_digest(HELLO_O.0, HELLO_O.1)), (&them, hello_digest(HELLO_A.0, HELLO_A.1)));
-            write_raw(&mut w, MESSAGE, &forge(&t)).unwrap();
+            // The answerer may refuse at the length (oversize) and hang up
+            // before the body is written: the test asserts its refusal.
+            let _ = write_raw(&mut w, MESSAGE, &forge(&t));
             let _ = read_raw(&mut r, SMALL, "lap");
         });
         let (mut r, mut w) = (as_.try_clone().unwrap(), as_);
