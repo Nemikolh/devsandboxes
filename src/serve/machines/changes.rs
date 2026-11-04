@@ -1041,4 +1041,63 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// K (`box`, the hub), L (`lap`, the authority) and P (`pi`), L and P
+    /// each linked to K only. P is down while L signs `machine hub lap`
+    /// (pushed to K alone); P's daemon starts later, behind: its link's
+    /// proof carries the entry, P adopts it (`hub = "lap"`), the link ends
+    /// since P's `Hello` named `box`, and the redial, saying `lap`, comes up
+    /// (K, saying `lap` too, takes it: the same fleet).
+    #[test]
+    fn a_member_down_during_a_hub_move_follows_at_its_next_proof() {
+        let base = scratch("changes-hub-late");
+        let (k_dir, l_dir, p_dir) = (base.join("k"), base.join("l"), base.join("p"));
+        let (k_opts, _) = daemon_opts(&base, "k");
+        let (mut l_opts, _) = daemon_opts(&base, "l");
+        let (mut p_opts, _) = daemon_opts(&base, "p");
+        let k_toml = k_opts.member.clone().unwrap();
+        let (l_toml, p_toml) = (l_opts.member.clone().unwrap(), p_opts.member.clone().unwrap());
+        let members = [("box", key_of(&k_toml).public_key()), ("pi", key_of(&p_toml).public_key())];
+        let stored = test_support::fleet("lap", &key_of(&l_toml), "box", &members);
+        write_fleet(&stored, &[(&k_toml, "box", "self"), (&l_toml, "lap", "box"), (&p_toml, "pi", "box")]);
+        let mut dialed = Vec::new();
+        for (opts, registry) in [(&mut l_opts, base.join("l-data/machines.toml")), (&mut p_opts, base.join("p-data/machines.toml"))] {
+            crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
+            let (transport, d) = peer_transport(&k_dir, &k_toml);
+            opts.link_transport = Some(transport);
+            dialed.push(d);
+        }
+        let on = |dir: &Path, name: &str| {
+            let rows = connect(dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+            named(&rows, name).is_some_and(|r| connected(&r))
+        };
+        let mut daemons = vec![spawn_daemon(&k_dir, k_opts)];
+        drop(connect(&k_dir));
+        daemons.push(spawn_daemon(&l_dir, l_opts));
+        drop(connect(&l_dir));
+        wait_for("lap connected on K", Duration::from_secs(10), || on(&k_dir, "lap"));
+
+        let r = call(&l_dir, "membership.hub", json!({"name": "lap"})).unwrap();
+        assert_eq!((&r["type"], &r["pushed"]), (&json!("signed"), &json!(["box"])), "{r}");
+        assert_eq!(hub_field(&k_toml), "lap", "K followed");
+        assert_eq!(hub_field(&p_toml), "box", "P, down, missed it");
+
+        daemons.push(spawn_daemon(&p_dir, p_opts));
+        drop(connect(&p_dir));
+        wait_for("box connected on P after a redial", Duration::from_secs(20), || {
+            dialed[1].count.load(std::sync::atomic::Ordering::SeqCst) >= 2 && on(&p_dir, "box") && on(&k_dir, "pi")
+        });
+        assert_eq!(hub_field(&p_toml), "lap", "P's hub follows the log it took");
+        assert_eq!(test_support::read(&p_toml).unwrap().log.head(), test_support::read(&l_toml).unwrap().log.head());
+        assert_eq!(call(&p_dir, "member.get", json!({})).unwrap()["hub"], "lap");
+
+        for (dir, daemon) in [&p_dir, &l_dir, &k_dir].into_iter().zip(daemons.into_iter().rev()) {
+            assert!(connect(dir).call("shutdown", json!({})).unwrap().error.is_none());
+            assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        }
+        for d in dialed {
+            d.cut();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

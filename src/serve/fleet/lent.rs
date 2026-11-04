@@ -1274,6 +1274,34 @@ mod tests {
         assert_eq!(admit_fleet("fleet.other", &none, Some(&proved("box", 2)), on("pi")).unwrap_err().code, "unknown-method");
     }
 
+    /// The hub is the one the log names at the call: once a `hub` entry
+    /// moves it from `box` to `pi`, `box`'s key no longer sends `fleet.forget`
+    /// and `pi`'s does; `rm` / `place` / `report` run on `pi`, not `box`.
+    #[test]
+    fn the_hub_only_calls_follow_the_logs_hub() {
+        use crate::serve::fleet::membership::Op;
+        let mut before = fleet_log();
+        before.log.append(Op::Add { name: "zed".into(), key: pk(4) }, "lap", &sk(1)).unwrap();
+        before.log.append(Op::Revoke { name: "zed".into(), key: pk(4) }, "lap", &sk(1)).unwrap();
+        let mut moved = before.clone();
+        moved.log.append(Op::Hub { name: "pi".into() }, "lap", &sk(1)).unwrap();
+        let (zed, none) = (json!({"name": "zed"}), json!({}));
+        fn at<'a>(stored: &'a Stored, own: &'a str) -> Option<Log<'a>> {
+            Some(Log { stored, own, key: own_key(own) })
+        }
+        assert_eq!(admit_fleet("fleet.forget", &zed, Some(&proved("box", 2)), at(&before, "lap")), Ok(()));
+        assert_eq!(admit_fleet("fleet.forget", &zed, Some(&proved("pi", 3)), at(&before, "lap")).unwrap_err().code, "denied");
+        assert_eq!(admit_fleet("fleet.forget", &zed, Some(&proved("pi", 3)), at(&moved, "lap")), Ok(()), "the new hub's key");
+        let e = admit_fleet("fleet.forget", &zed, Some(&proved("box", 2)), at(&moved, "lap")).unwrap_err();
+        assert!(e.code == "denied" && e.message.contains("`box` isn't it"), "the old hub's key: {}", e.message);
+        for (m, params) in [("fleet.rm", &zed), ("fleet.place", &none), ("fleet.report", &none)] {
+            assert_eq!(admit_fleet(m, params, Some(&proved("lap", 1)), at(&before, "box")), Ok(()), "{m} on the hub");
+            assert_eq!(admit_fleet(m, params, Some(&proved("lap", 1)), at(&moved, "pi")), Ok(()), "{m} on the new hub");
+            let e = admit_fleet(m, params, Some(&proved("lap", 1)), at(&moved, "box")).unwrap_err();
+            assert_eq!((e.code, e.message), ("denied", format!("`{m}` runs on the hub, and this host isn't it")), "{m} on the old hub");
+        }
+    }
+
     /// `fleet.propose` on the authority only (by its own key), from a member
     /// of the log, never a capped one; `fleet.sync` from a member or an
     /// introduced peer, anywhere.

@@ -1497,6 +1497,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The hub at the start, then not (the role moved): restored, then
+    /// nothing saved from the flip on, the stop included.
+    #[test]
+    fn a_hub_no_longer_the_hub_stops_saving_remotes() {
+        let base = short_scratch("hub-unflip");
+        let path = base.join("remotes.json");
+        let rows = json!({"dir": "/r", "instances": []});
+        let saved_s = Machine { name: "s".into(), rows: [(PathBuf::from("/r"), Arc::new(rows))].into(), seen: Some(1), ..Machine::default() };
+        saved::save(&path, &saved::of(&[saved_s], 0)).unwrap();
+        let flag = Arc::new(AtomicBool::new(true));
+        let is_hub = {
+            let flag = Arc::clone(&flag);
+            Arc::new(move || flag.load(Ordering::SeqCst))
+        };
+        let (machines, _w, up, _, _) = inbound_and_ssh(&base, Some(Hub { remotes: path.clone(), is_hub }), |_| {});
+        let h = machines.handle();
+        assert!(h.remotes().get("s").unwrap().restored, "the hub: restored");
+        flag.store(false, Ordering::SeqCst);
+        // A save already past its check lands now; none after it.
+        std::thread::sleep(Duration::from_millis(100));
+        let before = std::fs::read(&path).unwrap();
+        up.store(true, Ordering::SeqCst);
+        wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        h.reload();
+        drop(machines);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no longer the hub: nothing saved");
+        assert!(!saved::load(&path).unwrap().machines.contains_key("w"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A fake machine daemon answering every call `ok`, each call's
     /// `method dir` kept in `calls`.
     fn recording_peer(calls: &Arc<Mutex<Vec<String>>>) -> Duplex {
