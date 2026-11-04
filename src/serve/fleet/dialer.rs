@@ -549,9 +549,17 @@ pub(crate) mod tests {
             rows.as_array().unwrap().iter().find(|r| r["name"] == "box").cloned().unwrap()
         }
 
+        /// The row `cond` matched, not a later read: box's link loop may
+        /// retry in between (`Connecting` clears the error).
         pub(crate) fn wait_box(&self, what: &str, cond: impl Fn(&Value) -> bool) -> Value {
-            wait_for(what, Duration::from_secs(10), || cond(&self.box_row()));
-            self.box_row()
+            let mut matched = None;
+            wait_for(what, Duration::from_secs(10), || {
+                let row = self.box_row();
+                let hit = cond(&row);
+                matched = hit.then_some(row);
+                hit
+            });
+            matched.unwrap()
         }
 
         pub(crate) fn finish(self) {
@@ -1080,8 +1088,9 @@ pub(crate) mod tests {
     #[test]
     fn a_clash_refused_there_is_the_machines_error() {
         let pair = Pair::new("dial-clash", vec![Entry::ssh("lap", "me@lap")], |_| {});
-        let row = pair.wait_box("box refused", |r| r["error"].as_str().is_some_and(|e| e.contains("already a machine here")));
-        assert_eq!(row["state"], "unreachable");
+        let row = pair.wait_box("box refused", |r| {
+            r["state"] == "unreachable" && r["error"].as_str().is_some_and(|e| e.contains("already a machine here"))
+        });
         assert!(row["error"].as_str().unwrap().contains("refused: `lap` is already a machine here (me@lap)"), "{row}");
         pair.finish();
     }
