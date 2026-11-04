@@ -124,7 +124,7 @@ fn hub_leaves_itself(hub: &str) -> ApiError {
 }
 
 fn hub_named(hub: &str) -> ApiError {
-    ApiError::denied(format!("`{hub}` is the hub: name another hub first (fleet plan step 11)"))
+    ApiError::denied(format!("`{hub}` is the hub: move the role first (`devsandbox machine hub <m>`)"))
 }
 
 fn unknown(name: &str) -> ApiError {
@@ -210,6 +210,10 @@ pub enum After {
     /// A `fleet.sync` promoted this host's next key: every link it's on
     /// ends (`Ctx::key_rotated`), after the answer to the sync is out.
     Rotated,
+    /// A `fleet.sync` moved this host's hub: it's followed
+    /// (`Ctx::hub_changed`, every link ending so both ends redial saying
+    /// it) after the answer to the sync is out and the log was sent on.
+    Hub(Hub),
 }
 
 /// Apply `after` to the links.
@@ -230,6 +234,7 @@ pub fn apply(after: After, ctx: &Ctx) {
             }
         }
         After::Rotated => (ctx.key_rotated)(),
+        After::Hub(hub) => (ctx.hub_changed)(hub),
     }
 }
 
@@ -502,7 +507,7 @@ mod tests {
         // The hub: another hub first.
         assert_eq!(
             code(run(Hub::Other("k".into()), &["k"], false, "k", None)),
-            ("denied", "`k` is the hub: name another hub first (fleet plan step 11)".into())
+            ("denied", "`k` is the hub: move the role first (`devsandbox machine hub <m>`)".into())
         );
     }
 

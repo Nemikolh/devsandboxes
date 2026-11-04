@@ -51,7 +51,7 @@ optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
-[`machine add`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)) through `machines.add`'s
+[`machine add`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
 dials with the same param). An older build's `agent` key is ignored:
 whom this host's ssh-agent reaches is `member.toml`'s grants
@@ -71,7 +71,7 @@ Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
 A machine's registry name is its member name (fleet plan decision 35):
 without `--name`, `machines.add` takes it from the machine's `member.get`;
 `--name` renames the machine only while it joins a fleet by that add
-([`machine add`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)). `parse_name` splits a CLI
+([`machine add`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)). `parse_name` splits a CLI
 `<name>`: `m/x` → `Where::Machine`, `@/x` → `Where::Local`, bare →
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
@@ -146,7 +146,7 @@ target over ssh with the argvs in `ssh.rs`:
   its sentinel line first ([Link handshake](#link-handshake)).
 - `add_cli_argv`: `-T`, no `BatchMode` (a person is there); `machine
   add`'s `machine roots add` there
-  ([`devsandbox machine add…`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
+  ([`devsandbox machine add…`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)).
 - `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
   POSIX script run for a person at the CLI ([Install](#install)); no
   `BatchMode`. A script is one line: the login shell may be csh, which
@@ -206,7 +206,7 @@ login there.
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
 copies this binary there, for `machine add`
-([`devsandbox machine …`](#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)). The
+([`devsandbox machine …`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)). The
 CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
@@ -659,10 +659,10 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   shell; [fleet](fleet.md#pty), *Service terminals*), never re-dialed (no
   session), refused without a terminal.
 
-## `devsandbox machine add|ls|set|unlink|rm|pending|approve|deny|key|trust|roots`
+## `devsandbox machine add|ls|set|unlink|rm|hub|pending|approve|deny|key|trust|roots`
 
 A client of `machines.*` (and, for `trust`, `roots` and `key`,
-`member.*`; for `key rotate`, `pending`, `approve` and `deny`,
+`member.*`; for `key rotate`, `hub`, `pending`, `approve` and `deny`,
 `membership.*`) only, never in-process (`src/commands/machine.rs`).
 
 `add` first checks the machine's devsandbox (`ensure_devsandbox`, over
@@ -774,6 +774,12 @@ the machine was told or not reached (and why), each member that forgot
 it or wasn't reached; on another member `proposed removing <name> to
 <authority>: approve there with devsandbox machine approve <id>`; on a
 leave its own proposal's outcome and the entries this host dropped.
+`hub <name>` (`commands::machine::hub`, `membership.hub`) moves the
+fleet's hub role to member `name` ([fleet.md](fleet.md#approvals-and-pushes)):
+on the authority it prints `<name> is the fleet's hub` then
+`signed_lines` (whom the push reached); on another member `proposed
+making <name> the fleet's hub to <authority>: approve there with
+devsandbox machine approve <id>` (`hub_lines`).
 `pending`, `approve <id>` and `deny <id>` are the authority's side of a
 proposal ([fleet.md](fleet.md#approvals-and-pushes)), local only:
 `pending` (`membership.pending`) prints an `ID FROM WHAT WHEN` table

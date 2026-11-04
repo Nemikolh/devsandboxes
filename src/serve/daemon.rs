@@ -2030,9 +2030,9 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             stored.and_then(|s| serde_json::to_value(shared.graph.reports(s.as_ref())).map_err(|e| api::ApiError::internal(e.into())))
         }
         // Local only too: the proposals queued here, approved over the links.
-        "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" if shared.machines.is_some() => {
+        "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" | "membership.hub" if shared.machines.is_some() => {
             let ctx = shared.machines.as_ref().expect("checked");
-            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny|rotate method")
+            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny|rotate|hub method")
         }
         // Local only too; an adopt wrote `hub` from the log and may have
         // promoted this host's next key: both followed here.

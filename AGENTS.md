@@ -25,7 +25,7 @@ Start with `docs/README.md` (reading order and map) and
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `inbox.rs` is `devsandbox inbox …` (docs/reference/inbox-cli.md): reads from the
   store, mutations via a running daemon's API, else the same `wire::decide_*`
-  ops locally. `machine.rs` is `devsandbox machine add|ls|set|unlink|rm|pending|approve|deny|key [rotate]|trust|roots`
+  ops locally. `machine.rs` is `devsandbox machine add|ls|set|unlink|rm|hub|pending|approve|deny|key [rotate]|trust|roots`
   (docs/architecture/daemon/machines.md): a client of `machines.*`,
   `member.*`, `membership.*` only (never in-process);
   `add`'s install check first (ask on a TTY, `--auto-install`, else

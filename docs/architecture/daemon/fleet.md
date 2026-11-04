@@ -43,7 +43,7 @@ reaches L's only while K grants L agent.
 The add is also the join (`machines::join::plan`, run by `machines.add`
 over this host's `member.toml` and the target's `member.get` and
 `machines.list` on the add-time probe;
-[machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
+[machines.md](machines.md#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)).
 `machine add X` run on H, with "hub K" a member's hub by name (its own
 name when it's `self`):
 
@@ -96,7 +96,7 @@ X's key is the one the user confirmed: `machine add` shows the
 fingerprint `machines.probe` answers and asks (`--yes` off a TTY), and
 `machines.add {key}` refuses (`denied`, naming both fingerprints) when
 X's `member.get` says another
-([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
+([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)).
 ssh's first-use trust of the target is the root of this check.
 
 **How a machine leaves** (decisions 32 and 49 of the plan, step
@@ -107,7 +107,8 @@ rm <m>` (`machines.rm`) takes `m` out of the fleet, revoke first
 authority and whether `m` is in the log):
 
 - **On the authority**: it signs `revoke {m, key}` with its own key
-  (`changes::revoke`; refused for the hub, `name another hub first`, and
+  (`changes::revoke`; refused for the hub, whose role moves first with
+  `machine hub`, and
   for the authority itself; a name the log already revokes signs nothing
   again, so a retry only re-runs the rest), stores it through the adopt
   path and pushes its log to every machine it holds (`fleet.sync`,
@@ -829,7 +830,15 @@ carrier (`service::Handle::cycle`: its transport's socket shut, redialed
 at once, not after the backoff), and each `fleet-link --peer` it is
 dialed on (a `links.cycle` notification on that `fleet-link`'s held
 `links.inbound` connection, whose `Announce` hangs up the link; the
-dialer then redials). A hub:
+dialer then redials).
+
+The role moves with `devsandbox machine hub <m>`: a `hub` entry in the
+membership log, signed by the authority only ([Approvals and
+pushes](#approvals-and-pushes)). The role moves, links stay: every host
+the change reaches rewrites `hub` and cycles its links as above, after
+the change has left it; one it misses learns at its next link's proof
+(`proof::hub_moved`). The new hub's federated view is the machines it
+links to, one hop, as the old one's was. A hub:
 
 - **Never idles out**: the daemon's loop passes `keep_alive` to
   `idle::decide` while it's the hub. Nothing else keeps a daemon alive
@@ -1161,7 +1170,7 @@ there only through the trust table.
   those its `state.toml` has instances in, absolute; `devsandbox machine
   roots add|rm` on this host sets them, and `machine add` run elsewhere
   records the roots it picks here that way:
-  [machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)),
+  [machines.md](machines.md#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)),
   an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
   and a `[caps]` table, the soft caps of the
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
@@ -1381,7 +1390,7 @@ signatures, signed statements and the rollback rule.
   (naming the path and `chmod 600`) and a malformed one (never echoing
   its text); neither is replaced. `member.get` (and `member.set`) answer
   its public half, making the key on the first ask; `devsandbox machine
-  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots)).
+  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)).
 - **Rotation**: `devsandbox machine key rotate` (`membership.rotate`,
   `machines::changes::rotate`) makes the next key, `member.key.next`
   (`FileKeyStore::next_path`, `KeyStore::next_key`: the same format and
@@ -1516,7 +1525,9 @@ hash chain of entries only the authority signs
   and refuses the authority (it rotates instead) and the hub (another is
   named first); `rotate` needs the current key as `old`, a valid
   `by_old`, and a `new` neither revoked nor in use, and revokes `old`;
-  `hub` names a current member. The result, `Membership`: the authority
+  `hub` names a current member (never an introduced one): `devsandbox
+  machine hub <m>` signs it ([Approvals and
+  pushes](#approvals-and-pushes)). The result, `Membership`: the authority
   (name and key), the hub, the members and their keys, the revoked keys,
   the head and the genesis hash (which fleet this is).
   `membership::hub_for` is what this host's `member.toml` `hub` reads as
@@ -1589,7 +1600,8 @@ hash chain of entries only the authority signs
     joining host to adopt.
   - `membership.pending`, `.approve {id}`, `.deny {id}` are the
     authority's proposal queue, `membership.rotate` this host's key
-    rotation (`machines::changes::call`, needing the links: [Approvals
+    rotation, `membership.hub {name}` a move of the hub role
+    (`machines::changes::call`, needing the links: [Approvals
     and pushes](#approvals-and-pushes), *Rotation* above).
 
 #### Approvals and pushes
@@ -1630,13 +1642,35 @@ it never signs on a remote request alone (decision 49;
   it's signed. The queue collapses a rotate of the same name to the same
   key. Approved, the `rotate` is signed and pushed like any change; how
   the member then takes its next key is under *Rotation* above.
+- **Hub moves.** `devsandbox machine hub <m>` (`membership.hub {name}`,
+  `changes::hub` over the pure `changes::plan_hub`) asks for a `hub`
+  entry naming member `m` (decision 68). On the authority the user
+  typing it is the approval: signed at once. Elsewhere it's proposed as
+  `{"kind": "hub", "name"}`, collapsing with a pending one of the same
+  name, and approved there with `machine approve`. `proposals::check`
+  takes a name that is a member of the log (an introduced member can't
+  be the hub) and isn't the hub already (`invalid` otherwise: nothing to
+  sign); only a member by its key asks (a capped host is `denied`). `m`
+  needn't be reachable, so a dead hub can be replaced.
+- **Following a hub change** (decision 69). A host follows a hub change
+  (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
+  both ends redial saying it) only once the change has left it: cycling
+  first would cut the links carrying it. The authority signs and stores
+  (`changes::sign`), pushes over the links as they are, then follows
+  (`changes::follow`, which also ends the links after a rotate of its own
+  key). A host a `fleet.sync` moved sends the log on before answering and
+  follows once the answer is written (`leave::After::Hub`, applied after
+  the answer as `After::Rotated` is; a sync that also rotated this host's
+  key needs that one cycle only). A host the push misses learns at its
+  next link's proof (`proof::hub_moved`).
 - **Pushes.** After every change it signs, the authority sends its whole
   log to every machine it holds, registry and inbound (`changes::push`,
   `fleet.sync`). The receiver, from a member or an introduced peer,
   merges it as a link's handshake does (self-verifying; another fleet's
   log or a fork refused; `membership_api::sync`), and when that made its
-  log newer, follows the hub and sends it on to every other machine it
-  holds, not back to the sender, on a thread of its own. A host that
+  log newer, sends it on to every other machine it holds, not back to
+  the sender: on a thread of its own, or before its answer when the
+  links end after it (a moved hub, a rotated key: above). A host that
   takes nothing sends nothing on, so a push floods the connected graph
   once. A host not reached catches up at its next link's head comparison
   (`fleet::proof`).

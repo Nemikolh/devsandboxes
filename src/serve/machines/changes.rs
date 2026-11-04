@@ -27,6 +27,14 @@
 //!   A host that promoted ends every link it's on (`Ctx::key_rotated`),
 //!   after its push (the authority) or its answer and onward push (a
 //!   member's `fleet.sync`), so each redials proving the new key.
+//! - **Hub move.** `membership.hub {name}` ([`hub`]) signs a `hub` entry on
+//!   the authority, else proposes it there. A host follows a hub change
+//!   (`Ctx::hub_changed`: `hub` kept, every link ended so both ends redial
+//!   saying it) only once the change has left it (fleet plan decision 69):
+//!   the authority after its push, a member a `fleet.sync` moved after its
+//!   onward push and its answer (`After::Hub`). Cycling first would cut
+//!   the links carrying it; a host it misses learns it at its next link's
+//!   proof (`fleet::proof::hub_moved`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -82,6 +90,17 @@ pub struct Approved {
     pub signed: Signed,
 }
 
+/// `membership.hub`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum HubMove {
+    /// On the authority: the `hub` entry signed, stored, pushed, then
+    /// followed here.
+    Signed(Signed),
+    /// On another member: proposed to the authority.
+    Proposed(Proposed),
+}
+
 /// `membership.rotate`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -114,10 +133,11 @@ pub struct RotateProposed {
 }
 
 /// Run `method` if it's one of the local
-/// `membership.pending|approve|deny|rotate`; `None` otherwise.
+/// `membership.pending|approve|deny|rotate|hub`; `None` otherwise.
 pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
     let answer = match method {
         "membership.rotate" => parse::<Empty>(params).and_then(|_| rotate(ctx)).and_then(to_value),
+        "membership.hub" => parse::<NameParams>(params).and_then(|p| hub(ctx, &p.name)).and_then(to_value),
         "membership.pending" => pending(ctx),
         "membership.approve" => parse::<IdParams>(params).and_then(|p| approve(p.id, ctx)),
         "membership.deny" => parse::<IdParams>(params).and_then(|p| deny(p.id, ctx)),
@@ -145,6 +165,12 @@ struct IdParams {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NameParams {
+    name: String,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,16 +221,34 @@ fn on_authority(ctx: &Ctx) -> Result<(String, Stored), ApiError> {
 }
 
 /// `op` signed with this host's key (the authority's) and stored through
-/// the adopt path; `hub` followed. What the store did: a `rotate` of this
-/// host's own key promoted its next key (`Taken::rotated`), and the caller
-/// ends the links once it has pushed.
+/// the adopt path (`hub` written from the log). What the store did, for the
+/// caller to [`follow`] once it has pushed: the hub written (`Taken::hub`),
+/// a `rotate` of this host's own key promoting its next key
+/// (`Taken::rotated`).
 fn sign(ctx: &Ctx, me: &str, mut stored: Stored, op: Op) -> Result<membership_api::Taken, ApiError> {
     let path = leave::member_toml(ctx)?;
     let (_, signer) = membership_api::own(path, &ctx.hostname)?;
     stored.log.append(op, me, &signer).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
-    let taken = membership_api::adopt(path, &ctx.hostname, &stored)?;
+    membership_api::adopt(path, &ctx.hostname, &stored)
+}
+
+/// What a [`sign`] stored, followed by the links once its push is out
+/// (fleet plan decision 69): the hub (a move ends every link, so both ends
+/// redial saying it), a promoted key (every link ends, redialing to prove
+/// it). Each entry does one or neither.
+fn follow(ctx: &Ctx, taken: &membership_api::Taken) {
     (ctx.hub_changed)(taken.hub.clone());
-    Ok(taken)
+    if taken.rotated {
+        (ctx.key_rotated)();
+    }
+}
+
+/// [`sign`], then [`push`] over the links as they are, then [`follow`].
+fn sign_and_push(ctx: &Ctx, me: &str, stored: Stored, op: Op) -> Result<(Stored, Vec<String>, Vec<Missed>), ApiError> {
+    let taken = sign(ctx, me, stored, op)?;
+    let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None)).unwrap_or_default();
+    follow(ctx, &taken);
+    Ok((taken.stored, pushed, unpushed))
 }
 
 /// `stored` sent to every machine `links` holds but `except`
@@ -232,8 +276,8 @@ pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<Strin
 /// this host is the hub, else the hub's `fleet.rm` (which the push let in).
 pub fn revoke(ctx: &Ctx, name: &str) -> Result<Signed, ApiError> {
     let (me, stored) = on_authority(ctx)?;
-    let stored = if stored.log.revoked_name(name) {
-        stored
+    let (pushed, unpushed) = if stored.log.revoked_name(name) {
+        ctx.links.as_ref().map(|l| push(l, &stored, None)).unwrap_or_default()
     } else {
         let m = stored.log.membership().expect("on_authority checked");
         if !m.members.contains_key(name) {
@@ -247,9 +291,9 @@ pub fn revoke(ctx: &Ctx, name: &str) -> Result<Signed, ApiError> {
             });
         }
         let op = proposals::check(m, &me, &Change::Revoke { name: name.into() }).map_err(ApiError::denied)?;
-        sign(ctx, &me, stored, op)?.stored
+        let (_, pushed, unpushed) = sign_and_push(ctx, &me, stored, op)?;
+        (pushed, unpushed)
     };
-    let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &stored, None)).unwrap_or_default();
     let (_, hub) = api::own_member(ctx)?;
     let (removed, error) = match hub {
         Hub::This => {
@@ -271,14 +315,14 @@ pub fn revoke(ctx: &Ctx, name: &str) -> Result<Signed, ApiError> {
 }
 
 /// On the authority: `change` from member `from` (an introduction promoted
-/// to an `add`, a member's `rotate` of its own key) signed, the log pushed.
+/// to an `add`, a member's `rotate` of its own key, a `hub`) signed, the log
+/// pushed, then followed here.
 fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiError> {
     let (me, stored) = on_authority(ctx)?;
     let m = stored.log.membership().expect("on_authority checked");
     let op = proposals::check(m, from, change).map_err(ApiError::invalid)?;
     let what = op.to_string();
-    let stored = sign(ctx, &me, stored, op)?.stored;
-    let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &stored, None)).unwrap_or_default();
+    let (_, pushed, unpushed) = sign_and_push(ctx, &me, stored, op)?;
     Ok(Signed { name: change.subject().to_string(), change: what, pushed, unpushed, removed: None, error: None })
 }
 
@@ -301,15 +345,16 @@ pub fn can_rotate(stored: Option<&Stored>, me: &str, key: &PublicKey) -> Result<
     Err(ApiError::denied(format!("`{me}` (this key) isn't a member of its fleet's membership log: it has no key there to rotate")))
 }
 
-/// What `membership.rotate` does once [`can_rotate`] holds (pure): the
-/// `rotate` of `me`'s key (`key`) to `next`, countersigned by `key`,
-/// checked against the log; signed here on the authority, else proposed to
-/// it.
+/// What `membership.rotate` ([`plan_rotate`]) or `membership.hub`
+/// ([`plan_hub`]) does (pure): the entry checked against the log, signed
+/// here on the authority, else proposed to it.
 pub enum RotatePlan {
     Sign(Op),
     Propose { authority: String, change: Change },
 }
 
+/// `membership.rotate`'s, once [`can_rotate`] holds: the `rotate` of `me`'s
+/// key (`key`) to `next`, countersigned by `key`.
 pub fn plan_rotate(stored: &Stored, me: &str, key: &SigningKey, next: &PublicKey) -> Result<RotatePlan, ApiError> {
     can_rotate(Some(stored), me, &key.public_key())?;
     let m = stored.log.membership().expect("can_rotate checked");
@@ -351,9 +396,7 @@ pub fn rotate(ctx: &Ctx) -> Result<Rotation, ApiError> {
             // peer holds the `rotate` before the links end and redial
             // proving the new key.
             let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None)).unwrap_or_default();
-            if taken.rotated {
-                (ctx.key_rotated)();
-            }
+            follow(ctx, &taken);
             let signed = Signed { name: me, change: what, pushed, unpushed, removed: None, error: None };
             Ok(Rotation::Rotated(Rotated { key: key_text, fingerprint, signed }))
         }
@@ -361,6 +404,54 @@ pub fn rotate(ctx: &Ctx) -> Result<Rotation, ApiError> {
             let id = propose(ctx, &authority, change)?;
             let proposed = Proposed { name: me, authority, id: Some(id), error: None };
             Ok(Rotation::Proposed(RotateProposed { key: key_text, fingerprint, proposed }))
+        }
+    }
+}
+
+/// `membership.hub`'s plan (pure): a `hub` entry moving the role to `name`,
+/// asked by `me` (key `key`), a member of `stored`'s log by that key (an
+/// introduced host or one in no log has no say in it), checked against the
+/// log ([`proposals::check`]: `name` a member, not the hub already).
+pub fn plan_hub(stored: Option<&Stored>, me: &str, key: &PublicKey, name: &str) -> Result<RotatePlan, ApiError> {
+    let Some(s) = stored.filter(|s| s.log.membership().is_some()) else { return Err(no_log()) };
+    let m = s.log.membership().expect("filtered");
+    if m.key_of(me) != Some(*key) {
+        return Err(match s.introductions.iter().find(|i| i.name == me && i.key == *key) {
+            Some(i) => ApiError::denied(format!(
+                "`{me}` is introduced by `{}`, not in the fleet's membership log: it can't move the hub role until the \
+                 authority `{}` adds it (`machine approve` there)",
+                i.introducer, m.authority.0
+            )),
+            None => ApiError::denied(format!("`{me}` (this key) isn't a member of its fleet's membership log: it can't move the hub role")),
+        });
+    }
+    let change = Change::Hub { name: name.to_string() };
+    let op = proposals::check(m, me, &change).map_err(ApiError::invalid)?;
+    Ok(match leave::authority_of(Some(s), me, key) {
+        Authority::This => RotatePlan::Sign(op),
+        Authority::Other(a) => RotatePlan::Propose { authority: a.to_string(), change },
+        Authority::None => return Err(no_log()),
+    })
+}
+
+/// `membership.hub {name}`: the fleet's hub role moved to member `name`. On
+/// the authority the `hub` entry is signed, stored, pushed over the links as
+/// they are, and only then followed here (every link cycled, so the push
+/// isn't cut); elsewhere it's proposed to the authority over any path
+/// ([`propose`], collapsing with a pending one of the same name).
+pub fn hub(ctx: &Ctx, name: &str) -> Result<HubMove, ApiError> {
+    let path = leave::member_toml(ctx)?;
+    let (me, key) = membership_api::own(path, &ctx.hostname)?;
+    let stored = membership_api::load(path)?;
+    match plan_hub(stored.as_ref(), &me, &key.public_key(), name)? {
+        RotatePlan::Sign(op) => {
+            let what = op.to_string();
+            let (_, pushed, unpushed) = sign_and_push(ctx, &me, stored.expect("plan_hub checked"), op)?;
+            Ok(HubMove::Signed(Signed { name: name.into(), change: what, pushed, unpushed, removed: None, error: None }))
+        }
+        RotatePlan::Propose { authority, change } => {
+            let id = propose(ctx, &authority, change)?;
+            Ok(HubMove::Proposed(Proposed { name: name.into(), authority, id: Some(id), error: None }))
         }
     }
 }
@@ -398,24 +489,33 @@ fn queue(params: Value, from: &str, ctx: &Ctx) -> Answer {
 /// a log revoking this host's own key taken, for the `fleet.leave` that
 /// follows it). When it made this host's log newer: `hub` followed, and
 /// the log sent on to every other machine this host holds, off the request
-/// thread. When it promoted this host's next key (a rotate of it is in),
-/// the log is sent on before answering, and every link ends once the
-/// answer is out (`After::Rotated`), redialing to prove the new key.
+/// thread. When it promoted this host's next key (a rotate of it is in) or
+/// moved this host's hub, the log is sent on before answering, and every
+/// link ends once the answer is out (`After::Rotated`: redialing to prove
+/// the new key; `After::Hub`: the hub followed, redialing to say it).
 fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), ApiError> {
     let wire: Wire = parse(params)?;
     let theirs = Stored::from_wire(wire).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     let path = leave::member_toml(ctx)?;
+    let before = api::own_member(ctx).ok().map(|(_, hub)| hub);
     let taken = membership_api::sync(path, &ctx.hostname, &theirs)?;
     let head = taken.stored.log.head();
     let mut after = None;
     if taken.changed {
+        let moved = before.as_ref() != Some(&taken.hub);
+        // Both end every link once the answer is out. A move that comes
+        // with a rotate needs one cycle only: `After::Hub` keeps the new
+        // hub, and the redial proves the key `member.key` holds by then.
+        let follow = match (moved, taken.rotated) {
+            (true, _) => Some(After::Hub(taken.hub.clone())),
+            (false, true) => Some(After::Rotated),
+            (false, false) => None,
+        };
         if let Some(links) = ctx.links.clone() {
-            if taken.rotated {
-                // This host's key rotated: its links end once the answer is
-                // out (`After::Rotated`), so the log goes on over them now,
-                // before that.
+            if follow.is_some() {
+                // The links end once the answer is out, so the log goes on
+                // over them now, before that.
                 flood(&links, &taken.stored, from);
-                after = Some(After::Rotated);
             } else {
                 let (sender, stored) = (from.to_string(), taken.stored.clone());
                 let thread = std::thread::Builder::new().name("serve-fleet-sync".into()).spawn(move || flood(&links, &stored, &sender));
@@ -423,10 +523,11 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
                     crate::serve::daemon::log(&format!("fleet.sync from {from}: cannot send it on: {e}"));
                 }
             }
-        } else if taken.rotated {
-            after = Some(After::Rotated);
         }
-        (ctx.hub_changed)(taken.hub);
+        if follow.is_none() {
+            (ctx.hub_changed)(taken.hub);
+        }
+        after = follow;
     }
     Ok((to_value(Synced { changed: taken.changed, head })?, after))
 }
@@ -464,7 +565,7 @@ fn approve(id: u64, ctx: &Ctx) -> Answer {
     let p = q.get(id).cloned().ok_or_else(|| ApiError::not_found(format!("no pending proposal {id}")))?;
     let signed = match &p.op {
         Change::Revoke { name } => revoke(ctx, name),
-        Change::Add { .. } | Change::Rotate { .. } => sign_change(ctx, &p.from, &p.op),
+        Change::Add { .. } | Change::Rotate { .. } | Change::Hub { .. } => sign_change(ctx, &p.from, &p.op),
     };
     let signed = signed.map_err(|mut e| {
         e.message = format!("proposal {id} ({}): {}; `devsandbox machine deny {id}` drops it", p.op, e.message);
@@ -494,7 +595,7 @@ mod tests {
     use crate::serve::daemon::tests::{scratch, spawn_daemon};
     use crate::serve::endpoint;
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
-    use super::{Change, Op, RotatePlan, can_rotate, countersign_rotate, plan_rotate};
+    use super::{Change, Op, RotatePlan, can_rotate, countersign_rotate, plan_hub, plan_rotate};
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
     use crate::serve::fleet::member::{Member, write_for_test};
     use crate::serve::fleet::membership::{Introduction, Stored};
@@ -786,6 +887,98 @@ mod tests {
         assert_eq!(can_rotate(None, "box", &bx.public_key()).unwrap_err().code, "failed");
         // A next key the log knows.
         assert_eq!(plan_rotate(&s, "box", &bx, &lap.public_key()).err().unwrap().code, "invalid");
+    }
+
+    /// `lap` the authority, `box` the hub, `pi` a member, `new` introduced by
+    /// box (capped).
+    #[test]
+    fn a_hub_move_is_planned_by_the_log() {
+        let (lap, bx) = (SigningKey::from_seed([1; 32]), SigningKey::from_seed([2; 32]));
+        let mut s = test_support::fleet("lap", &lap, "box", &[("box", bx.public_key()), ("pi", pk(3))]);
+        let g = s.log.membership().unwrap().genesis;
+        s.introduce(Introduction::sign(&g, "new", pk(5), "box", &bx)).unwrap();
+        let Ok(RotatePlan::Sign(op)) = plan_hub(Some(&s), "lap", &lap.public_key(), "pi") else { panic!("the authority signs") };
+        assert_eq!(op, Op::Hub { name: "pi".into() });
+        let Ok(RotatePlan::Propose { authority, change }) = plan_hub(Some(&s), "box", &bx.public_key(), "lap") else { panic!("a member proposes") };
+        assert_eq!((authority.as_str(), change), ("lap", Change::Hub { name: "lap".into() }));
+        // The hub already, an introduced name, an unknown one: `invalid`.
+        for name in ["box", "new", "zed"] {
+            assert_eq!(plan_hub(Some(&s), "lap", &lap.public_key(), name).err().unwrap().code, "invalid", "{name}");
+        }
+        // Asked by a capped member, by a key the log doesn't list, in no fleet.
+        let e = plan_hub(Some(&s), "new", &pk(5), "pi").err().unwrap();
+        assert!(e.code == "denied" && e.message.contains("introduced by `box`"), "{}", e.message);
+        assert_eq!(plan_hub(Some(&s), "box", &pk(6), "pi").err().unwrap().code, "denied");
+        assert_eq!(plan_hub(None, "box", &bx.public_key(), "pi").err().unwrap().code, "failed");
+    }
+
+    /// The `hub` field of the `member.toml` at `toml`.
+    fn hub_field(toml: &Path) -> String {
+        crate::serve::fleet::member::load(toml).unwrap().unwrap().hub
+    }
+
+    /// `lap` (L) the authority, `box` (K) the hub. `machine hub lap` on L is
+    /// signed at once, pushed to K, then followed: both rewrite `hub` and
+    /// the links redial. `machine hub box` on K is proposed to L, approved
+    /// there, and the role moves back the same way. Naming the hub, or a
+    /// name not in the log, is `invalid`.
+    #[test]
+    fn the_hub_role_moves_and_back() {
+        let pair = pair("changes-hub", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
+        up(&pair);
+        let (k_toml, l_toml) = (pair.base.join("k-data/member.toml"), pair.base.join("l-data/member.toml"));
+        let dials = || pair.dialed.count.load(std::sync::atomic::Ordering::SeqCst);
+        let redialed = |before: usize| {
+            pair.wait_box("box redialed", |r| connected(r) && dials() > before);
+            wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(&pair).is_some_and(|r| connected(&r)));
+        };
+        for (dir, name) in [(&pair.l_dir, "box"), (&pair.k_dir, "box"), (&pair.l_dir, "zed")] {
+            assert_eq!(call(dir, "membership.hub", json!({"name": name})).unwrap_err().0, "invalid", "{name}");
+        }
+        assert_eq!(call(&pair.l_dir, "membership.hub", json!({"name": "lap", "later": 1})).unwrap_err().0, "invalid");
+
+        let before = dials();
+        let r = call(&pair.l_dir, "membership.hub", json!({"name": "lap"})).unwrap();
+        crate::serve::dts::assert_variant("MembershipHubSigned", &r);
+        assert_eq!(r, json!({"type": "signed", "name": "lap", "change": "hub `lap`", "pushed": ["box"], "unpushed": [], "removed": null, "error": null}));
+        assert_eq!((hub_field(&l_toml), hub_field(&k_toml)), ("self".to_string(), "lap".to_string()), "the push reached K before the links ended");
+        for toml in [&l_toml, &k_toml] {
+            assert_eq!(test_support::read(toml).unwrap().log.membership().unwrap().hub, "lap");
+        }
+        redialed(before);
+        assert_eq!(call(&pair.l_dir, "membership.hub", json!({"name": "lap"})).unwrap_err().0, "invalid", "the hub already");
+
+        // Both ends cycle (K once its answer is out, `AFTER_ANSWER` later):
+        // the link L redialed first may end once more. A retry collapses
+        // with a pending proposal.
+        let mut r = Value::Null;
+        wait_for("K's proposal reaches L", Duration::from_secs(10), || match call(&pair.k_dir, "membership.hub", json!({"name": "box"})) {
+            Ok(v) => {
+                r = v;
+                true
+            }
+            Err((code, message)) => {
+                assert_eq!(code, "failed", "{message}");
+                false
+            }
+        });
+        crate::serve::dts::assert_variant("MembershipHubProposed", &r);
+        assert_eq!(r, json!({"type": "proposed", "name": "box", "authority": "lap", "id": 1, "error": null}));
+        assert_eq!(call(&pair.k_dir, "membership.hub", json!({"name": "box"})).unwrap()["id"], 1, "pending: the same id");
+        let pending = call(&pair.l_dir, "membership.pending", json!({})).unwrap();
+        assert_eq!(pending.as_array().unwrap().len(), 1, "{pending}");
+        assert_eq!((&pending[0]["from"], &pending[0]["op"]), (&json!("box"), &json!({"kind": "hub", "name": "box"})));
+        crate::serve::dts::assert_matches("FleetChangeHub", &pending[0]["op"]);
+        assert_eq!(hub_field(&l_toml), "self", "never signed on the request alone");
+
+        let before = dials();
+        let approved = call(&pair.l_dir, "membership.approve", json!({"id": 1})).unwrap();
+        crate::serve::dts::assert_matches("MembershipApproved", &approved);
+        assert_eq!((&approved["change"], &approved["name"], &approved["pushed"]), (&json!("hub `box`"), &json!("box"), &json!(["box"])));
+        assert_eq!((hub_field(&l_toml), hub_field(&k_toml)), ("box".to_string(), "self".to_string()));
+        assert_eq!(call(&pair.l_dir, "membership.pending", json!({})).unwrap(), json!([]));
+        redialed(before);
+        pair.finish();
     }
 
     /// Three daemons: K (`box`, the hub), L (`lap`, the authority) and P

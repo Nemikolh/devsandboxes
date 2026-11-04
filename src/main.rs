@@ -492,6 +492,17 @@ enum MachineCommand {
     ///
     ///     devsandbox machine rm my-server
     Rm { name: String },
+    /// Make a member of the fleet its hub
+    ///
+    /// The role moves, links stay. On the fleet's authority it's signed at
+    /// once and sent to the machines it links to; each then redials saying
+    /// the new hub, and a member not reached learns it on its next link.
+    /// On another member it's proposed to the authority, approved there
+    /// with `machine approve`. The member needn't be reachable, so a dead
+    /// hub can be replaced.
+    ///
+    ///     devsandbox machine hub my-server
+    Hub { name: String },
     /// List the membership changes proposed to this host, the fleet's
     /// authority, waiting for `machine approve` or `machine deny`
     ///
@@ -894,6 +905,7 @@ fn main() -> Result<()> {
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
             MachineCommand::Unlink { name } => commands::machine::unlink(&name),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
+            MachineCommand::Hub { name } => commands::machine::hub(&name),
             MachineCommand::Pending => commands::machine::pending(),
             MachineCommand::Approve { id } => commands::machine::approve(id),
             MachineCommand::Deny { id } => commands::machine::deny(id),

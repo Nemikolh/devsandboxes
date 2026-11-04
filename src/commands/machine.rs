@@ -41,7 +41,7 @@ use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::join::{Fleet, Joined};
 use crate::serve::fleet::proposals::Proposal;
-use crate::serve::machines::changes::{Approved, Proposed, Rotation, Signed};
+use crate::serve::machines::changes::{Approved, HubMove, Proposed, Rotation, Signed};
 use crate::serve::machines::leave::{Heard, Removed, RmAnswer};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
 use crate::serve::machines::ssh;
@@ -417,6 +417,28 @@ fn rotation_lines(r: &Rotation) -> Vec<String> {
             proposed_line(&format!("rotating this host's key to {}", p.fingerprint), &p.proposed),
             "this host keeps its key until the signed change reaches it".into(),
         ],
+    }
+}
+
+/// `machine hub <name>`: the fleet's hub role moved to member `name`
+/// (`membership.hub`), signed here on the authority or proposed to it.
+pub fn hub(name: &str) -> Result<()> {
+    let mut conn = connect()?;
+    let r: HubMove = call(&mut conn, "membership.hub", json!({ "name": name }))?;
+    for line in hub_lines(&r) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn hub_lines(r: &HubMove) -> Vec<String> {
+    match r {
+        HubMove::Signed(s) => {
+            let mut lines = vec![format!("{} is the fleet's hub", s.name)];
+            lines.extend(signed_lines(s));
+            lines
+        }
+        HubMove::Proposed(p) => vec![proposed_line(&format!("making {} the fleet's hub", p.name), p)],
     }
 }
 
@@ -1116,6 +1138,17 @@ mod tests {
         assert_eq!(
             rotation_lines(&r)[0],
             format!("proposed rotating this host's key to {} to lap: approve there with `devsandbox machine approve 4`", key.fingerprint())
+        );
+    }
+
+    #[test]
+    fn a_hub_move_says_where_it_went() {
+        let signed = Signed { name: "lap".into(), change: "hub `lap`".into(), pushed: vec!["box".into()], unpushed: vec![], removed: None, error: None };
+        assert_eq!(hub_lines(&HubMove::Signed(signed)), ["lap is the fleet's hub", "signed hub `lap`", "sent to box"]);
+        let proposed = Proposed { name: "box".into(), authority: "lap".into(), id: Some(3), error: None };
+        assert_eq!(
+            hub_lines(&HubMove::Proposed(proposed)),
+            ["proposed making box the fleet's hub to lap: approve there with `devsandbox machine approve 3`"]
         );
     }
 

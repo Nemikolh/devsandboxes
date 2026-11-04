@@ -994,8 +994,14 @@ export interface FleetChangeRotate {
   by_old: string;
 }
 
+/** A proposed membership change: the fleet's hub role moved to member `name` (a `hub` entry). */
+export interface FleetChangeHub {
+  kind: 'hub';
+  name: string;
+}
+
 /** A membership change proposed to the authority (`fleet.propose`'s `op`). */
-export type FleetChange = FleetChangeAdd | FleetChangeRevoke | FleetChangeRotate;
+export type FleetChange = FleetChangeAdd | FleetChangeRevoke | FleetChangeRotate | FleetChangeHub;
 
 /** A proposal waiting on the authority (`proposals.json`). */
 export interface FleetProposal {
@@ -1075,6 +1081,19 @@ export interface MembershipRotateProposed extends FleetProposed {
 
 /** `membership.rotate`'s answer. */
 export type MembershipRotateResult = MembershipRotated | MembershipRotateProposed;
+
+/** `membership.hub` on the fleet's authority: the `hub` entry signed, pushed, then followed here (every link redials). */
+export interface MembershipHubSigned extends FleetSigned {
+  type: 'signed';
+}
+
+/** `membership.hub` on another member: the `hub` entry proposed to the authority, approved there. */
+export interface MembershipHubProposed extends FleetProposed {
+  type: 'proposed';
+}
+
+/** `membership.hub`'s answer. */
+export type MembershipHubResult = MembershipHubSigned | MembershipHubProposed;
 
 /** `machines.get`'s answer (a registered machine, an inbound or a routed one): what an ssh command to the machine needs. */
 export interface MachineInfo {
@@ -1805,6 +1824,14 @@ export interface ApiMethods {
    * authority; `invalid` when the log refuses it. Local only.
    */
   'membership.rotate': { params: {}; result: MembershipRotateResult };
+  /**
+   * Move the fleet's hub role to member `name`. On the authority the `hub` entry is signed, stored, pushed, and
+   * only then followed here (every link ends and redials saying the new hub); elsewhere it's proposed to the
+   * authority over any path (a pending one of the same name answers its id). `invalid` for a name not in the
+   * log (an introduced member can't be the hub) or the hub already; `denied` for a capped (introduced) member,
+   * `failed` in no fleet's log or with no path to the authority. Local only.
+   */
+  'membership.hub': { params: { name: string }; result: MembershipHubResult };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

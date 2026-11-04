@@ -1420,7 +1420,8 @@ mod tests {
         let old = SigningKey::from_seed([1; 32]);
         let by_old = crate::serve::fleet::membership::countersign_rotate(&g, "lap", &key, &old);
         assert_variant_kind("FleetChangeRotate", &to_value(Change::Rotate { name: "lap".into(), old: old.public_key(), new: key, by_old }).unwrap());
-        assert_eq!(union_members("FleetChange"), ["FleetChangeAdd", "FleetChangeRevoke", "FleetChangeRotate"]);
+        assert_variant_kind("FleetChangeHub", &to_value(Change::Hub { name: "lap".into() }).unwrap());
+        assert_eq!(union_members("FleetChange"), ["FleetChangeAdd", "FleetChangeRevoke", "FleetChangeRotate", "FleetChangeHub"]);
         use super::super::changes::{RotateProposed, Rotated, Rotation};
         let signed = Signed { name: "lap".into(), change: "rotate `lap`'s key".into(), pushed: vec![], unpushed: vec![], removed: None, error: None };
         let rotated = Rotation::Rotated(Rotated { key, fingerprint: key.fingerprint(), signed });
@@ -1432,6 +1433,14 @@ mod tests {
             assert_eq!(serde_json::from_value::<Rotation>(to_value(&r).unwrap()).unwrap(), r, "round trip");
         }
         assert_eq!(union_members("MembershipRotateResult"), ["MembershipRotated", "MembershipRotateProposed"]);
+        use super::super::changes::HubMove;
+        let signed = Signed { name: "lap".into(), change: "hub `lap`".into(), pushed: vec!["box".into()], unpushed: vec![], removed: None, error: None };
+        let proposed = Proposed { name: "box".into(), authority: "lap".into(), id: Some(4), error: None };
+        for (r, iface) in [(HubMove::Signed(signed), "MembershipHubSigned"), (HubMove::Proposed(proposed), "MembershipHubProposed")] {
+            assert_variant(iface, &to_value(&r).unwrap());
+            assert_eq!(serde_json::from_value::<HubMove>(to_value(&r).unwrap()).unwrap(), r, "round trip");
+        }
+        assert_eq!(union_members("MembershipHubResult"), ["MembershipHubSigned", "MembershipHubProposed"]);
         let synced = super::super::changes::Synced { changed: true, head: s.log.head() };
         assert_matches("FleetSynced", &to_value(synced).unwrap());
         assert_matches("FleetQueued", &to_value(super::super::changes::Queued { id: 1, pending: true }).unwrap());
@@ -1457,6 +1466,7 @@ mod tests {
             ("membership.approve", "MembershipApproved"),
             ("membership.deny", "OkResult"),
             ("membership.rotate", "MembershipRotateResult"),
+            ("membership.hub", "MembershipHubResult"),
             ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
         ] {

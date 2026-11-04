@@ -412,7 +412,7 @@ limitation means editing this file in the same commit.
   in its `member.toml`, so its `worker` trust refuses those of its roots
   no instance keeps in its `state.toml`. Fix: `devsandbox machine roots
   add <root>…` on the machine, or `machine unlink` + `machine add` it again.
-  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmpendingapprovedenykeytrustroots); `commands::machine::record_roots`
+  → [machines](architecture/daemon/machines.md#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots); `commands::machine::record_roots`
 - No command sets this host's member name (what the machines it dials
   know it by, `fleet-link --peer <name>`): it's `member.toml`'s `name`,
   set only through `member.set {name}` (API) or by hand, else the

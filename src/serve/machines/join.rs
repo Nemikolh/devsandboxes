@@ -121,7 +121,7 @@ pub fn plan(this: &This, target: &Target, asked: Option<&str>, target_hub: bool)
                 format!("{label} is in `{k}`'s fleet and isn't its hub")
             };
             return Err(ApiError::denied(format!(
-                "--hub: {at}; moving the hub role (`machine hub`) isn't available yet"
+                "--hub: {at}; move the hub role with `devsandbox machine hub <m>` instead"
             )));
         }
     }
@@ -415,7 +415,7 @@ mod tests {
         ] {
             let e = run_hub(this, Some("box"), target, None, true).unwrap_err();
             assert_eq!(e.code, "denied");
-            assert_eq!(e.message, format!("{m}; moving the hub role (`machine hub`) isn't available yet"));
+            assert_eq!(e.message, format!("{m}; move the hub role with `devsandbox machine hub <m>` instead"));
         }
         // The machine is the hub: the table as without `--hub`.
         for this in [Hub::None, other("box")] {
