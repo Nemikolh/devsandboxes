@@ -103,6 +103,8 @@ pub fn refuse_api(client: &UnixStream, why: &str) {
     while (line.len() as u64) < MAX_LINE {
         match (&mut &*client).read(&mut byte) {
             Ok(1) if byte[0] != b'\n' => line.push(byte[0]),
+            // A timed read fails with it even under `SA_RESTART`.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             _ => break,
         }
     }

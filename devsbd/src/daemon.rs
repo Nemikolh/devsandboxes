@@ -697,9 +697,11 @@ fn send_record(mux: &Arc<Mux>, stream: u32, record: &[u8], timeout: Duration) ->
             return Err(io::ErrorKind::TimedOut.into());
         }
         ours.set_read_timeout(Some(left))?;
-        match ours.read(&mut buf)? {
-            0 => return Err(io::Error::other("notify stream closed without a reply")),
-            n => reply.extend_from_slice(&buf[..n]),
+        match ours.read(&mut buf) {
+            Ok(0) => return Err(io::Error::other("notify stream closed without a reply")),
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     if reply.starts_with(notify::REPLY_OK) {

@@ -448,7 +448,12 @@ fn attach(dir: &Path, params: Value) -> Result<endpoint::Stream> {
     let mut answer = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        match stream.read(&mut byte).context("no link.attach answer")? {
+        let n = match stream.read(&mut byte) {
+            // A timed read fails with it even under `SA_RESTART`.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            n => n.context("no link.attach answer")?,
+        };
+        match n {
             0 => bail!("the daemon closed the connection before answering link.attach"),
             _ if byte[0] == b'\n' => break,
             _ if answer.len() as u64 >= crate::serve::proto::MAX_LINE => bail!("link.attach's answer is too long"),
