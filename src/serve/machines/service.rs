@@ -345,6 +345,9 @@ enum Cmd {
     /// Look at the carrier and the watchers again now (a watch came or
     /// went, the carrier moved, a stop).
     Wake,
+    /// The machine's roots are these now (its entry changed in nothing
+    /// else): the link stays up, its watch follows them.
+    Roots(Vec<PathBuf>),
 }
 
 /// A forwarded call: the remote's response (its `id` is the remote's; the
@@ -519,8 +522,9 @@ fn with_inbound(mut entries: Vec<Entry>, inbound: &Neighbors) -> Vec<Entry> {
 impl Handle {
     /// Re-read the registry and the inbound neighbors: start links for new
     /// machines, stop (and drop the rows of) removed ones, restart changed
-    /// ones. `machines.add` and `.rm` call it, as does the neighbors' hook;
-    /// a registry that doesn't load is logged and changes nothing.
+    /// ones (a change of roots alone goes to the running link instead).
+    /// `machines.add` and `.rm` call it, as does the neighbors' hook; a
+    /// registry that doesn't load is logged and changes nothing.
     pub fn reload(&self) {
         let inner = &self.inner;
         let _one = lock(&inner.reloading);
@@ -533,11 +537,22 @@ impl Handle {
         };
         let gone: Vec<LinkThread> = {
             let mut links = inner.lock_links();
-            let stale: Vec<String> = links
-                .iter()
-                .filter(|(name, l)| !entries.iter().any(|e| e.name == **name && *e == l.entry))
-                .map(|(name, _)| name.clone())
-                .collect();
+            let mut stale = Vec::new();
+            for (name, l) in links.iter_mut() {
+                match entries.iter().find(|e| e.name == *name) {
+                    Some(e) if *e == l.entry => {}
+                    // Only its roots moved: a restart would drop a link that's
+                    // fine, and every inbound neighbor's roots come just after
+                    // its announce (`daemon::inbound_roots`), so each new one's
+                    // link would go down once, failing whatever used it then
+                    // (a placement's `roots.list`).
+                    Some(e) if Entry { roots: e.roots.clone(), ..l.entry.clone() } == *e => {
+                        l.entry.roots.clone_from(&e.roots);
+                        let _ = l.tx.send(Cmd::Roots(e.roots.clone()));
+                    }
+                    _ => stale.push(name.clone()),
+                }
+            }
             stale.iter().filter_map(|name| links.remove(name)).collect()
         };
         // Joined outside the lock (a forwarded call looks links up), and
@@ -930,6 +945,7 @@ impl<'a> LinkLoop<'a> {
     fn recv(&mut self, rx: &Receiver<Cmd>, wait: Duration) -> bool {
         match rx.recv_timeout(wait) {
             Ok(Cmd::Call(call)) => self.pending.push_back(call),
+            Ok(Cmd::Roots(roots)) => self.entry.roots = roots,
             Ok(Cmd::Wake) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return false,
         }
@@ -975,6 +991,7 @@ impl<'a> LinkLoop<'a> {
             loop {
                 match rx.try_recv() {
                     Ok(Cmd::Call(call)) => self.pending.push_back(call),
+                    Ok(Cmd::Roots(roots)) => self.entry.roots = roots,
                     Ok(Cmd::Wake) => {}
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return End::Stopped,
@@ -989,7 +1006,7 @@ impl<'a> LinkLoop<'a> {
                 self.drop_fleet();
             }
             let want = Want { roots, fleet: roots && hub.is_some() };
-            if want != watched.asked {
+            if want != watched.asked || (want.roots && watched.roots != self.entry.roots) {
                 if let Err(why) = self.watch(link, &mut watched, want) {
                     return End::Lost(why);
                 }
@@ -1039,10 +1056,8 @@ impl<'a> LinkLoop<'a> {
                 .map_err(|e| format!("{name}: {e:#}"))?
                 .ok_or_else(|| format!("{name}: `{method}` timed out"))
         };
-        if watched.asked.roots {
-            for root in &self.entry.roots {
-                call(link, "instances.unwatch", json!({ "dir": root }))?;
-            }
+        for root in std::mem::take(&mut watched.roots) {
+            call(link, "instances.unwatch", json!({ "dir": root }))?;
         }
         if let Some(dir) = watched.fleet.take() {
             call(link, "instances.unwatch", json!({ "dir": dir }))?;
@@ -1064,6 +1079,7 @@ impl<'a> LinkLoop<'a> {
             }
         }
         if want.roots {
+            watched.roots.clone_from(&self.entry.roots);
             for root in &self.entry.roots {
                 // Watched federated already: its own rows come in that push.
                 if watched.fleet.as_ref() == Some(root) {
@@ -1151,6 +1167,9 @@ struct Watched {
     asked: Want,
     /// The hub's fleet root for this host, watched with `machines: true`.
     fleet: Option<PathBuf>,
+    /// The machine's roots as last watched: the ones to unwatch, and a
+    /// change of its roots ([`Cmd::Roots`]) watches again.
+    roots: Vec<PathBuf>,
 }
 
 /// Whether a link's `failed` goes to the log (`logged`: the last one that
@@ -1451,6 +1470,63 @@ mod tests {
         h.reload();
         drop(machines);
         assert_eq!(saved::load(&path).unwrap().machines.keys().collect::<Vec<_>>(), ["w"], "the hub now: saved");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A fake machine daemon answering every call `ok`, each call's
+    /// `method dir` kept in `calls`.
+    fn recording_peer(calls: &Arc<Mutex<Vec<String>>>) -> Duplex {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let calls = Arc::clone(calls);
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(theirs.try_clone().unwrap());
+            let mut line = String::new();
+            while r.read_line(&mut line).is_ok_and(|n| n > 0) {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let method = req["method"].as_str().unwrap_or_default();
+                calls.lock().unwrap().push(format!("{method} {}", req["params"]["dir"].as_str().unwrap_or_default()));
+                let result = match method {
+                    "hello" => json!({"version": "0.6.0", "build": 1, "protocol": 1}),
+                    _ => json!({"ok": true}),
+                };
+                if writeln!(&theirs, "{}", json!({"id": req["id"], "result": result})).is_err() {
+                    break;
+                }
+                line.clear();
+            }
+        });
+        Duplex::socket(ours)
+    }
+
+    /// An inbound neighbor's roots coming in once its link is up (as
+    /// `daemon::inbound_roots` sets them) keep that link: no redial, the
+    /// roots watched over it.
+    #[test]
+    fn a_change_of_roots_keeps_the_link() {
+        let base = short_scratch("roots");
+        let neighbors: Arc<inbound::Neighbors> = Arc::default();
+        let guard = neighbors.announce("w", "0.6.0 abc dev x/y member", false);
+        let (dials, calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())));
+        let dial: Dial = {
+            let (dials, calls) = (Arc::clone(&dials), Arc::clone(&calls));
+            Arc::new(move |_| {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Ok(recording_peer(&calls))
+            })
+        };
+        let hooks = Hooks { watching: Box::new(|| true), ..no_hooks() };
+        let hold = fake_hold(&Arc::new(AtomicBool::new(false)), &Arc::default());
+        let timing = opts(1, 0).machine_timing;
+        let machines = Machines::spawn(base.join("machines.toml"), neighbors, dial, no_route(), hold, timing, hooks, None, |_| {});
+        let h = machines.handle();
+        wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        guard.roots_setter()(vec![PathBuf::from("/r")]);
+        wait_for("/r watched", Duration::from_secs(5), || calls.lock().unwrap().iter().any(|c| c == "instances.watch /r"));
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "no redial");
+        assert_eq!(h.remotes().get("w").unwrap().state, LinkState::Connected);
+        assert_eq!(h.entries()[0].roots, [PathBuf::from("/r")]);
+        drop(machines);
+        drop(guard);
         let _ = std::fs::remove_dir_all(&base);
     }
 

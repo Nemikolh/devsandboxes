@@ -271,8 +271,9 @@ thread carrying its link, started, stopped or restarted when `add`/`set`/`rm`
 change the registry or a neighbor comes, goes or gets its roots
 (`Handle::reload`, which the neighbors' hook, `Neighbors::on_change`,
 calls; one reload at a time; a change to a machine's entry restarts its
-link). Agent grants aren't the registry's: a grant change reloads
-nothing.
+link, but a change of its roots alone, such as a neighbor's roots coming
+in, goes to the running link (`Cmd::Roots`), which watches them anew).
+Agent grants aren't the registry's: a grant change reloads nothing.
 `Handle::entries` is both sources (`service::with_inbound`). Every link is
 held from the start, wanted or not (fleet plan decision 7), an inbound
 one's while its neighbor is up.
