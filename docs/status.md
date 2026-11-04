@@ -27,6 +27,11 @@ limitation means editing this file in the same commit.
   over it shipped), in the order of
   [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
   → [plan](plans/active/helper-rpc.md)
+- **helper**: a container's `xdg-open` / `$BROWSER` opens on the user's
+  desktop: a shim, loopback and OAuth-callback forwards, profiles (config
+  collections of sandboxes, one per instance, switchable at runtime;
+  browser commands host-local), delivery to the member that last attached.
+  → [plan](plans/active/open-routing.md)
 - **machines**: VS Code on remote rows (spike),
   remote Inbox threads, nameless commands across every machine.
   → [plan](plans/active/machines-next.md)
