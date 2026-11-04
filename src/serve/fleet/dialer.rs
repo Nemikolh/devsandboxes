@@ -1666,6 +1666,16 @@ pub(crate) mod tests {
         g["reports"].as_array().unwrap().iter().any(|r| r["report"]["member"] == member && r["report"]["agent"] == json!(grantees))
     }
 
+    /// Whether `dir`'s daemon holds `member`'s report with a connected link
+    /// to each of `peers`.
+    fn links_in_graph(dir: &Path, member: &str, peers: &[&str]) -> bool {
+        let g = connect(dir).call("graph.get", json!({})).unwrap().result.unwrap();
+        g["reports"].as_array().unwrap().iter().filter(|r| r["report"]["member"] == member).any(|r| {
+            let links = r["report"]["links"].as_array().cloned().unwrap_or_default();
+            peers.iter().all(|p| links.iter().any(|l| l["peer"] == *p && l["state"] == "connected"))
+        })
+    }
+
     /// `lap` grants `b`, which it has no link to, agent (decision 66): B
     /// sees it in lap's report (through the hub), binds
     /// `agent-route-lap.sock`, and a client there reaches lap's agent over
@@ -1769,13 +1779,19 @@ pub(crate) mod tests {
         let report = Report { member: "m".into(), trust: Default::default(), always_on: true, links, agent: vec![] };
         let later = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 3_600_000;
         let (statement, report) = sign_report(&test_support::key_of(&m_member), &genesis, &report, 0, later);
-        // Carried to K, the hub, as `lap` over A's link: K pushes it on.
-        let mut k = routed_api(link::connect(&endpoint::fleet_socket(&trio.a_dir, "box"), channel::API).unwrap(), "box");
+        // Carried to K, the hub, as `b` over B's link: K pushes it on to
+        // `lap`. Not over A's: K's flood skips the peer a change came from
+        // (it holds it), and A never would.
+        let mut k = routed_api(link::connect(&endpoint::fleet_socket(&trio.b_dir, "box"), channel::API).unwrap(), "box");
         let params = serde_json::to_value(Reports { reports: vec![Signed { statement, report }] }).unwrap();
         let r = k.conn.call("fleet.graph", params).unwrap();
         assert!(r.error.is_none(), "{r:?}");
         let (to_b, to_m) = (endpoint::route_socket(&trio.a_dir, "b"), endpoint::route_socket(&trio.a_dir, "m"));
         wait_for("A's route sockets for b and m", Duration::from_secs(15), || to_b.exists() && to_m.exists());
+        // m's report alone binds both: A's `box → b` comes from box's.
+        wait_for("A holds box's report linking lap and b", Duration::from_secs(15), || {
+            links_in_graph(&trio.a_dir, "box", &["lap", "b"])
+        });
         assert!(!endpoint::route_socket(&trio.a_dir, "box").exists(), "box is linked: its fleet socket serves");
 
         let mut api = routed_api(route::connect(&trio.a_dir, "b", channel::API).unwrap(), "b");
