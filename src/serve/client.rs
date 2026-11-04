@@ -402,15 +402,7 @@ pub(crate) fn hello_with(stream: &mut Stream, version: &Version, client: &str, f
     if stream.write_all(&line).is_err() {
         return Ok(Hello::Closed);
     }
-    let mut reply = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(1) if byte[0] == b'\n' => break,
-            Ok(1) if (reply.len() as u64) < proto::MAX_LINE => reply.push(byte[0]),
-            _ => return Ok(Hello::Closed),
-        }
-    }
+    let Some(reply) = reply_line(stream) else { return Ok(Hello::Closed) };
     let response: Response = serde_json::from_slice(&reply).context("bad hello reply from devsandbox serve")?;
     if let Some(e) = response.error {
         bail!("devsandbox serve refused hello: {} ({})", e.message, e.code);
@@ -418,6 +410,25 @@ pub(crate) fn hello_with(stream: &mut Stream, version: &Version, client: &str, f
     let result: HelloResult = serde_json::from_value(response.result.unwrap_or(Value::Null))
         .context("bad hello result from devsandbox serve")?;
     Ok(if result.handoff { Hello::Handoff } else { Hello::Ready(result) })
+}
+
+/// The hello's reply line from `r`, byte by byte, without its newline;
+/// `None` at EOF, a timeout, any other read error or past `MAX_LINE`. An
+/// `EINTR` is read again, not the connection's end: a socket read with a
+/// timeout fails with it even under `SA_RESTART` (signal(7)) when a
+/// handler runs (the CLI's SIGINT/SIGTERM catch, the TUI's SIGWINCH) or
+/// the process is stopped and continued.
+fn reply_line(r: &mut impl Read) -> Option<Vec<u8>> {
+    let mut reply = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match r.read(&mut byte) {
+            Ok(1) if byte[0] == b'\n' => return Some(reply),
+            Ok(1) if (reply.len() as u64) < proto::MAX_LINE => reply.push(byte[0]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            _ => return None,
+        }
+    }
 }
 
 /// Start `devsandbox serve --socket-dir <dir>` detached: its own session
@@ -502,6 +513,27 @@ mod tests {
 
     fn join_all(daemons: Daemons) -> Vec<Exit> {
         daemons.into_inner().unwrap().into_iter().map(|d| d.join().unwrap().unwrap()).collect()
+    }
+
+    /// Its bytes, one `EINTR` before each.
+    struct Interrupting(std::collections::VecDeque<u8>, bool);
+
+    impl Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.1 = !self.1;
+            if self.1 {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            Ok(self.0.pop_front().map(|b| buf[0] = b).map_or(0, |()| 1))
+        }
+    }
+
+    #[test]
+    fn a_hello_reply_read_is_retried_after_eintr() {
+        let mut r = Interrupting(b"{\"id\":0}\nrest".iter().copied().collect(), false);
+        assert_eq!(reply_line(&mut r).as_deref(), Some(&b"{\"id\":0}"[..]));
+        assert_eq!(r.0, b"rest", "nothing past the newline read");
+        assert_eq!(reply_line(&mut Interrupting(b"{".iter().copied().collect(), false)), None, "EOF first");
     }
 
     #[test]
