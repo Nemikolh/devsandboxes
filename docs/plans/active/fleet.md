@@ -1,6 +1,6 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-10 shipped
+Status: in progress. Steps 1-11 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md),
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
@@ -18,7 +18,8 @@ prove both keys, changes made elsewhere approved on the authority;
 step 10b routed streams over the members' signed link graph, each
 proving its origin to its destination; step 10c made each routed
 stream an end-to-end session and agent access a per-member grant
-carried over any path. Step 11 is next. The rest is design. Builds on
+carried over any path; step 11 moves the hub role with `machine hub`,
+an authority-signed log entry. Step 12 is next. The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
 [machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
 its parked auto-update and PTY attach into steps 2 and 4.
@@ -783,7 +784,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
       a dialed end's `agent-link-<peer>.sock` (`Shared::fleet_peer`), and
       an agent grant isn't counted as exposure (both in
       `docs/status.md`).
-11. **Hub swap, pointer** (S–M). `machine hub <m>`: the role moves, links
+11. **Hub swap, pointer** (S–M, shipped as 11a-11c). `machine hub <m>`: the role moves, links
     stay; every reachable member rewrites `hub`, a late one learns it on
     reconnect.
 
@@ -833,6 +834,22 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
     - **11c Docs close.** `docs/status.md` (step 11 shipped, next 12;
       decision 70's limitation), this step's as-built note,
       `CHANGELOG.md`.
+
+    As built: `membership.hub {name}` answers `{"type": "signed"|
+    "proposed", …}` (`changes::HubMove`) over the pure `changes::plan_hub`,
+    which reuses `RotatePlan`; naming the hub, an introduced or an unknown
+    name is `invalid`, a capped asker `denied`. Every authority-signed
+    change now goes `changes::sign`, push, `changes::follow` (hub, then a
+    rotated key). A `fleet.sync` that moved this host's hub (read from
+    `member.toml` before the sync) floods before answering and returns
+    `leave::After::Hub`, which also stands for a rotate that came with it
+    (one cycle). Both ends of a link cycle it after a move, so it can
+    drop twice (`docs/status.md`). 11b found every role reader already
+    live: the federated watch (`service::Hooks::hub` each tick), link
+    reports (`reports::run` each round), the hub-only `fleet.*` calls
+    (`lent::admit_fleet` over the log read per call), `remotes.json`
+    (`save_loop`), the peer watch and keep-alive (`Shared::is_hub`) and
+    versions (each dial's hello); it added tests only.
 12. **Transfer v1** (L). Repo identity, WIP snapshot commits, bundles
     routed over the graph, repo caches, the hub mirror, fetch-back.
     Repos without a remote and unpushed work can be placed.

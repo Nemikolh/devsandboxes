@@ -34,7 +34,7 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 11 on. Steps 1-10 shipped: one kind of
+  re-placement: from fleet step 12 on. Steps 1-11 shipped: one kind of
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
@@ -64,7 +64,10 @@ limitation means editing this file in the same commit.
   host. End-to-end sessions (step 10c): each routed stream is encrypted
   between its two daemons, so a relay carries ciphertext only; agent
   access is a per-member grant (`machine set <m> agent on`), carried to
-  a granted member over any path. Next: hub swap (step 11).
+  a granted member over any path. Hub swap (step 11): `machine hub <m>`
+  moves the role by a `hub` entry the authority signs (proposed and
+  approved there when typed elsewhere), links unchanged. Next: transfer
+  v1 (step 12).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md), [ADR 0046](decisions/0046-routed-streams-are-end-to-end-sessions.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -335,6 +338,16 @@ limitation means editing this file in the same commit.
   dropped by a sync once it's no routed machine (no path in the graph,
   not in the hub's view).
   → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`, `snapshots::merge`
+- `machine hub` moves the role only (fleet plan decision 70): the new
+  hub's federated view is the machines it links to, and a member watches
+  its hub federated only over a direct link, so a hub off the routing
+  centre (A in `A → K ← B`) shows fewer rows than K would, and B none
+  of the fleet's; watches over routes are parked. A member whose only
+  links go to a hub that is down learns of a move only once one of them
+  is back. Right after a move a link can drop twice (both ends cycle
+  it: the authority after its push, the other end after its answer), so
+  a call made then may fail once.
+  → [fleet](architecture/daemon/fleet.md#hub-mode); `machines::changes::follow`, `leave::After::Hub`
 - A grant for an inbound or routed machine takes effect there once this
   host's link report reaches it (pushed by the hub or flooded by the
   links), then within a probe; while the report lists it, that machine

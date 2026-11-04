@@ -89,6 +89,12 @@ devsandbox machine add me@my-server   # my-server's key fingerprint is SHA256:â€
 
 - **`machine key rotate`.** Replaces this machine's key without leaving the fleet; its links reconnect with the new key once the change is approved.
 
+- **`machine hub <m>` moves the hub role.** The fleet's hub becomes member `m` with no link changing: on the machine that created the fleet it applies at once, typed elsewhere it waits for `machine approve` there. Every member it reaches follows within seconds, and one that was offline follows when it next connects. The old hub takes no part, so a hub that's down for good can be replaced; the new hub's fleet view is the machines it links to directly.
+
+```bash
+devsandbox machine hub my-server
+```
+
 - **Routing through the fleet.** Members report their links to each other, signed, so every member knows the fleet's link graph. A machine with no link to this host is a `routed` machine (`machine ls` says `routed via <machine>`): commands, verbs, terminals, port forwards and `run --place` reach it through the members between them, trying the next path when one is down. Each routed stream proves which member it came from with that member's key, so a machine in the middle can't speak for another member, and the far end applies its own trust to the member the stream came from. Membership changes reach the fleet's creator over any path too, so they no longer need a direct link to it. Routed streams are encrypted end to end between the two machines, so a machine in the middle carries only ciphertext it can't read, alter, replay or redirect. The ssh agent is a per-machine grant (`machine set <m> agent on`) that reaches the granted machine over any path, including a machine that dialed this one; a machine in the middle's own grant never carries over.
 
 - **`machine trust worker` says when it doesn't protect this machine.** When the hub, or a machine the hub's side controls, has an ssh link into this machine, it has a shell here and could change its trust; `machine trust` warns naming that machine, and `machine ls` and the dashboard's Machines tab mark such machines `exposed via <machine>`.

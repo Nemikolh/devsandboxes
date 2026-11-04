@@ -823,8 +823,9 @@ only from an accepted membership log (`membership.adopt`,
 `machines.add` adopting the log it makes, a link's
 [key proof](#key-proof) sync, a `fleet.sync` push;
 `member::set_fleet`) or cleared on leaving, and `Shared::set_hub` follows each write. Everything below asks
-`Shared::is_hub` at its use, so a change applies under a running
-daemon. A change also ends every link this host has, so both ends
+`Shared::is_hub` at its use (the hub-only `fleet.*` calls ask the
+stored log's hub instead, `lent::admit_fleet`), so a change applies
+under a running daemon. A change also ends every link this host has, so both ends
 redial saying the new hub ([Versions](#versions)): each ssh machine's
 carrier (`service::Handle::cycle`: its transport's socket shut, redialed
 at once, not after the backoff), and each `fleet-link --peer` it is
