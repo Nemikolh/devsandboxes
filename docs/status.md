@@ -560,7 +560,9 @@ limitation means editing this file in the same commit.
   fetch back), and its done blocks its daemon connection, snapshots
   included, while the fetch-back runs. A `placements.json` entry is
   dropped only by an `rm` typed on the placing host: one for an instance
-  removed elsewhere (on the worker, or from another host) stays. A bundle the worker made under `out/` for a host that never
+  removed elsewhere (on the worker, or from another host) stays. Entries
+  are keyed by the instance's name there: after a rename, an `rm` or
+  `done` of the new name (or of its id) doesn't fetch back. A bundle the worker made under `out/` for a host that never
   pulled it is swept only when the next one is made (after 1 h). A
   worker's instance whose history gained another root (an unrelated
   merge) no longer matches the placed repo and is refused.

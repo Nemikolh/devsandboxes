@@ -418,7 +418,9 @@ has it stripped and goes to that machine, but for the ones served here:
   `FANOUT_WAIT` (5 s). Remote matches come back qualified (`box/web-2`)
   with an additive `found: [{name, machine, root}]`; a machine that doesn't
   answer adds nothing, and an empty result names the unreachable ones.
-- **Served here** (`forward::HERE`: `forwards.add`): `machine` names where
+- **Served here** (`forward::HERE`: `forwards.add`, `placements.fetch`;
+  the latter's `machine` names the placement, see
+  [fleet](fleet.md#moving-code)): for `forwards.add`, `machine` names where
   the forward reaches, not where it runs. The daemon keeps the param and
   answers itself, binding the forward on this host with one `TUNNEL`
   stream per bridge over the machine's link, or a route, whatever its

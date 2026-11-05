@@ -1339,8 +1339,8 @@ fleet root here, which the caller pulls on a `TRANSFER` stream (kind
 "refs/devsandbox/wip/<instance_id>": "<commit>"}, "bundle": "<name>" | null}`
 (`InstancesFetched`; `bundle` `null` when the caller has every commit).
 On a link peer's connection only: under `worker` trust the instance's
-config root and `folder` must be under the caller's fleet root (never
-one of this host's own roots), under `full` any instance. Errors:
+recorded config root and `folder` must be under the caller's fleet root
+(not one of this host's own roots), under `full` any instance. Errors:
 `invalid` (bad params), `not-found` (no such instance, or not in
 reach), `denied` (a local client), `failed` (a detached `HEAD`, git).
 

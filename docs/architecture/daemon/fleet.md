@@ -768,8 +768,8 @@ working tree's snapshot (`RepoOffer::wip`); a detached `HEAD` is
 `NotMovable` (check out a branch first). Its identity
 (`RepoOffer::id`) is `repo::identity` of the branch, or, for a branch
 with no commit, of the devsandbox root `repo::ensure_root` makes there
-once (`refs/devsandbox/root`, the one ref devsandbox leaves in a user's
-repo). The offer only reads the checkouts; the snapshot is made by
+once (`refs/devsandbox/root`, kept; fetch-back's hidden refs, below,
+are the only others devsandbox leaves in a user's repo). The offer only reads the checkouts; the snapshot is made by
 `send`.
 
 **Ties** (`ties`, `ties_of`; fleet plan decision 40). What keeps a
@@ -1317,7 +1317,7 @@ destination the same way), so a placed run needs no ssh of its own. A
   checkout doesn't have was bundled as its current branch
   (`code::offer`), and the moved checkout has no remote for `run` to
   start a branch from (`worktree_start_point` falls back to `HEAD`,
-  whichever branch first landed there). So without the user's `--base`
+  whichever branch the checkout was last cut on). So without the user's `--base`
   the worker gets `--base <the bundled branch>`: the new branch starts
   at the source checkout's branch tip, where run in place it would
   start at `origin/HEAD` when there is one.
@@ -2318,9 +2318,10 @@ never hands the daemon off (below). Under **`worker`**:
   an instance whose `config_dir` and `folder` both canonicalize under
   the caller's fleet root (`lent::fetch_in_fleet_root`), else
   `not-found`: never one of this member's own roots, even one the
-  caller's quick calls reach, so an own root's code never moves off the
-  member for another machine (fleet plan decision 76). Under `full`, any
-  instance; the bundle goes under the caller's fleet root either way.
+  caller's quick calls reach (fleet plan decision 76). The check is on
+  those recorded paths; where the folder's `.git` (or its `commondir`)
+  points is `host_git`'s to follow. Under `full`, any instance; the
+  bundle goes under the caller's fleet root either way.
 - **Env**: a verb's `env` is replaced by the `Peer`'s when it has one:
   the daemon's own process env (`verbs_client::caller_env`,
   `Options::peer_env` in tests), never what the peer sent, its
