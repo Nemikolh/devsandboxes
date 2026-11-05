@@ -81,6 +81,7 @@ pub mod membership;
 pub mod membership_api;
 pub mod place;
 pub mod placed;
+pub mod placements;
 pub mod proof;
 pub mod proposals;
 pub mod reports;

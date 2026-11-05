@@ -68,7 +68,9 @@ pub fn is_quick(method: &str) -> bool {
 /// runs: the daemon answers them itself. `forwards.add` binds its listener
 /// here (a forward into a machine's instance is owned by this side,
 /// `docs/architecture/daemon/forwards.md`, *Remote bridges*).
-pub const HERE: &[&str] = &["forwards.add"];
+/// `placements.fetch` fetches back from the machine into this host's
+/// checkout (docs/architecture/daemon/fleet.md, *Fetch-back*).
+pub const HERE: &[&str] = &["forwards.add", "placements.fetch"];
 
 pub fn is_here(method: &str) -> bool {
     HERE.contains(&method)

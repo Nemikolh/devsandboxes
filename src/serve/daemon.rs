@@ -1065,6 +1065,12 @@ impl Shared {
             }
             lent::Channel::Transfer => {
                 let Some(root) = peer.fleet_root.clone() else { return false };
+                // Each read and write bounded: a body flows, a pull's
+                // answer comes once the puller checked the body.
+                let bounded = [stream.set_read_timeout(Some(fleet::transfer::STREAM_WAIT)), stream.set_write_timeout(Some(fleet::transfer::STREAM_WAIT))];
+                if bounded.iter().any(Result::is_err) {
+                    return false;
+                }
                 let state = self.state.clone();
                 // A state.toml that doesn't read: in use, so nothing is recut.
                 let in_use: fleet::code::InUse =
@@ -2007,6 +2013,22 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             },
             Table::Full => Err(api::ApiError::denied("`code.haves` answers a link peer about its fleet root here: a local client has none")),
         },
+        // A peer fetching back an instance it placed (`lent` admitted it:
+        // under its fleet root, or any under `full`); the bundle goes
+        // under its fleet root.
+        "instances.fetch" => match &conn.table {
+            Table::Peer(peer) => match peer.fleet_root.as_deref() {
+                Some(root) => crate::state::State::load_at(&shared.state)
+                    .map_err(api::ApiError::internal)
+                    .and_then(|state| fleet::code::fetch::fetch_call(&state, root, &req.params)),
+                None => Err(api::ApiError::denied("this host keeps no fleet root for the caller")),
+            },
+            Table::Full => Err(api::ApiError::denied(
+                "`instances.fetch` answers a link peer, under its fleet root here: a local client fetches back with `placements.fetch`",
+            )),
+        },
+        // Local only (`lent` refuses `placements.*` to every peer).
+        "placements.fetch" => placements_fetch(&req.params, shared),
         // Local only: no link's table admits `member.*` (`fleet::lent`).
         method if method.starts_with("member.") => match &shared.member {
             Some(path) => {
@@ -2515,14 +2537,18 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
             log(&format!("{}: run: {why}", conn.label()));
             Some(Some(Response::err_with(id, "failed", why, Some(json!({ "exit": null, "instance": null })))))
         }
-        Placed::Worker { name, root, base, lines } => {
-            log(&format!("{}: run placed on {name} ({})", conn.label(), root.display()));
+        Placed::Worker { name, root: remote_root, base, lines, folder } => {
+            log(&format!("{}: run placed on {name} ({})", conn.label(), remote_root.display()));
             for line in &lines {
                 say(line);
             }
-            let params = placed::forwarded(params.clone(), &name, &root, base.as_deref());
+            let params = placed::forwarded(params.clone(), &name, &remote_root, base.as_deref());
             let tagged = placed::Tagged { inner: &peer, machine: &name };
-            Some(remote_verb(id, "run", params, &name, shared, conn, &tagged).map(|r| placed::tag_answer(r, &name)))
+            let answer = remote_verb(id, "run", params, &name, shared, conn, &tagged);
+            if let (Some(r), Some(folder)) = (&answer, &folder) {
+                record_placement(shared, r, &name, sandbox, &root, folder);
+            }
+            Some(answer.map(|r| placed::tag_answer(r, &name)))
         }
     }
 }
@@ -2558,6 +2584,58 @@ fn move_code(
         }
     }
     Ok(prepared)
+}
+
+/// A placed run's answer `r` naming its instance on worker `machine` (a
+/// successful or detached one, never a failure): the placement into
+/// `placements.json` (`fleet::placements`), so fetch-back knows the local
+/// checkout it came from. A write that fails is logged; the run is the
+/// worker's either way.
+fn record_placement(shared: &Shared, r: &Response, machine: &str, sandbox: &str, root: &Path, folder: &fleet::placed::MovedFolder) {
+    use fleet::placements::{self, Entry};
+    if r.error.is_some() {
+        return;
+    }
+    let Some(instance) = r.result.as_ref().and_then(|v| v.get("instance")).and_then(Value::as_str) else { return };
+    let entry = Entry {
+        machine: machine.to_string(),
+        instance: instance.to_string(),
+        sandbox: sandbox.to_string(),
+        root: root.to_path_buf(),
+        folder: folder.local.clone(),
+        remote: folder.remote.clone(),
+        repo: folder.repo.clone(),
+        branch: folder.branch.clone(),
+    };
+    let path = placements::path_next_to(&shared.state);
+    if let Err(e) = placements::update(&path, |all| placements::record(all, entry)) {
+        log(&format!("run: cannot record the placement of {machine}/{instance} in {}: {e:#}", path.display()));
+    }
+}
+
+/// `placements.fetch {machine?, instance}` (a local client's; fleet plan
+/// decision 76): the `placements.json` entry it names (`not-found` when
+/// this host didn't place it; a bare `instance` when exactly one placement
+/// has that name), fetched back over the worker's link or a route
+/// (`fleet::code::fetch::fetch_back`: `instances.fetch` there, the pull,
+/// the hidden refs here); `failed` with why it didn't.
+fn placements_fetch(params: &Value, shared: &Shared) -> std::result::Result<Value, api::ApiError> {
+    use fleet::code::{LinkTransfer, fetch};
+    use fleet::placements;
+    let instance = params
+        .get("instance")
+        .and_then(Value::as_str)
+        .ok_or_else(|| api::ApiError::invalid(format!("`{}` needs `instance`", fetch::PLACEMENTS_FETCH)))?;
+    let machine = fwd::machine_of(params)?;
+    let entries = placements::load(&placements::path_next_to(&shared.state)).map_err(api::ApiError::internal)?;
+    let entry = placements::find(&entries, machine.as_deref(), instance).map_err(api::ApiError::not_found)?.clone();
+    let t = LinkTransfer::for_worker(&shared.socket_dir, &entry.machine);
+    let got = fetch::fetch_back(&entry, |haves| t.fetch_instance(&entry.instance, haves), &t).map_err(|e| {
+        log(&format!("fetch {}/{}: {e:#}", entry.machine, entry.instance));
+        api::ApiError::failed(format!("cannot fetch {}/{} back: {e:#}", entry.machine, entry.instance))
+    })?;
+    log(&format!("fetch {}/{}: {} bytes into {}", entry.machine, entry.instance, got.fetched, got.folder.display()));
+    serde_json::to_value(got).map_err(|e| api::ApiError::internal(e.into()))
 }
 
 /// The hub `hub`'s `fleet.place` answer to `ask`, over a fresh `API`

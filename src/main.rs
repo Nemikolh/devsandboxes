@@ -236,6 +236,18 @@ enum Command {
         #[arg(help = NAME_HELP)]
         name: String,
     },
+    /// Fetch an instance this host placed on a machine back into the local
+    /// checkout it came from, as hidden refs
+    ///
+    /// Its branch and a snapshot of its working tree land as
+    /// `refs/devsandbox/<machine>/<instance>/heads/<branch>` and
+    /// `…/wip`; your branches, index and working tree are left alone
+    /// (docs/architecture/daemon/fleet.md, *Fetch-back*). Needs devsandbox serve.
+    Fetch {
+        /// `<machine>/<instance>` (a bare `<instance>` when only one
+        /// placement has that name)
+        name: String,
+    },
     /// Show CPU/memory usage of running devsandbox containers
     Stats {
         /// Output JSON instead of a table
@@ -858,6 +870,17 @@ fn main() -> Result<()> {
         Command::Vscode { name, goto } => commands::vscode::vscode(&cli.dir, &name, goto.as_ref()),
         Command::Done { name } => commands::done::done(&name, true),
         Command::Undone { name } => commands::done::done(&name, false),
+        Command::Fetch { name } => {
+            #[cfg(unix)]
+            {
+                commands::fetch::fetch(&name)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = name;
+                anyhow::bail!("`devsandbox fetch` needs devsandbox serve, which is unix-only for now")
+            }
+        }
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
         Command::Exec { interactive, tty, attach, sessions, session, service, reserve_255, name, command } => {

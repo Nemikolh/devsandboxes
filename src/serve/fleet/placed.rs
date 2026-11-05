@@ -156,11 +156,35 @@ pub enum Placed {
     /// Here, where a member's hub placed it: the hub's [`lines`] first.
     Here(Vec<String>),
     /// On worker `name`, in its copy of the config root `root`; `base` is
-    /// the `--base` it gets ([`start_point`]); `lines` start the output.
-    Worker { name: String, root: PathBuf, base: Option<String>, lines: Vec<String> },
+    /// the `--base` it gets ([`start_point`]); `lines` start the output;
+    /// `folder` is what the sandbox's `folder` repo moved as, for the
+    /// placement's record (`placements.json`, fetch-back).
+    Worker { name: String, root: PathBuf, base: Option<String>, lines: Vec<String>, folder: Option<MovedFolder> },
     /// Moving the code failed: the verb fails with this, it doesn't run
     /// anywhere else.
     Failed(String),
+}
+
+/// The sandbox's `folder` repo as [`moved`] sent it: its first folder and
+/// repo of a [`Prepared`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedFolder {
+    /// The checkout here.
+    pub local: PathBuf,
+    /// Its path on the worker.
+    pub remote: PathBuf,
+    pub branch: String,
+    /// The repo's identity.
+    pub repo: String,
+}
+
+impl MovedFolder {
+    /// `prepared`'s `folder` repo: its first folder with the first repo
+    /// sent (`code::send` keeps them in the offer's order, `folder` first).
+    pub fn of(prepared: &Prepared) -> Option<MovedFolder> {
+        let ((local, remote, branch), sent) = prepared.folders.first().zip(prepared.sent.first())?;
+        (sent.host == *local).then(|| MovedFolder { local: local.clone(), remote: remote.clone(), branch: branch.clone(), repo: sent.id.clone() })
+    }
 }
 
 /// Where `run` goes: here when placement picks this host (or nothing,
@@ -189,6 +213,7 @@ pub fn moved(ask: &Ask, name: &str, lines: Vec<String>, prepare: impl FnOnce(&st
             name: name.to_string(),
             root: prepared.remote_root.clone(),
             base: start_point(ask, &prepared),
+            folder: MovedFolder::of(&prepared),
             lines: lines.into_iter().chain(prepared.notes).collect(),
         },
     }
@@ -653,8 +678,25 @@ mod tests {
         assert!(asked.borrow().is_empty());
 
         // The worker wins: moved, then there.
-        let Placed::Worker { name, root, base, lines } = decide(&ask, &s, &busy_here(), ok("main")) else { panic!() };
+        let Placed::Worker { name, root, base, lines, folder } = decide(&ask, &s, &busy_here(), ok("main")) else { panic!() };
         assert_eq!((name.as_str(), root, base), ("lap", PathBuf::from("/fleet/hub/roots/0123456789abcdef/cfg"), None));
+        assert_eq!(folder, None, "no repo sent");
+        // With its repo sent: the record's folder.
+        let sent = |_: &str| {
+            let p = prepared("main");
+            let sent = crate::serve::fleet::code::Sent { id: "fedcba9876543210".into(), host: "/w/web".into(), refs: Default::default() };
+            Ok(Prepared { sent: vec![sent], ..p })
+        };
+        let Placed::Worker { folder, .. } = decide(&ask, &s, &busy_here(), sent) else { panic!() };
+        assert_eq!(
+            folder,
+            Some(MovedFolder {
+                local: "/w/web".into(),
+                remote: "/fleet/hub/roots/0123456789abcdef/web".into(),
+                branch: "main".into(),
+                repo: "fedcba9876543210".into(),
+            })
+        );
         assert_eq!(lines, ["placed on lap (mem 87% free, disk 50% free, cpu 100% free)"]);
         assert_eq!(*asked.borrow(), ["lap"]);
         // The move's notes (the hub mirror's) follow the placement's lines.

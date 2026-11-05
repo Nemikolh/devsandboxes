@@ -935,6 +935,96 @@ pub(crate) mod tests {
         }
     }
 
+    /// Fetch-back end to end (fleet plan decision 76): a run on K placed on
+    /// L is recorded in K's `placements.json` once its answer names the
+    /// instance; the instance commits and leaves work uncommitted on L; K's
+    /// `placements.fetch` asks L's `instances.fetch` (under `worker` trust:
+    /// the instance is under K's fleet root there), pulls the bundle and
+    /// lands it in the source checkout as hidden refs only.
+    #[test]
+    fn a_placed_run_is_recorded_and_fetched_back() {
+        use crate::serve::capacity::Capacity;
+        use crate::serve::fleet::code::repo::tests::{git, repo_with_branches};
+        const G: u64 = 1 << 30;
+
+        let (k_runner, k_verbs) = crate::serve::verbs::tests::script_runner("dial-fetch-k", r#"echo "local $*""#);
+        let path = std::env::var("PATH").unwrap_or_default();
+        let src = scratch("dial-fetch-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let web = repo_with_branches(&src, "web");
+        let cfg = src.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join(crate::config::CONFIG_FILE), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n").unwrap();
+        let cfg = std::fs::canonicalize(&cfg).unwrap();
+        let mut l_verbs = PathBuf::new();
+        let pair = Pair::with(
+            "dial-fetch",
+            Vec::new(),
+            |k| {
+                let hub = crate::serve::fleet::member::Member { hub: "self".into(), ..Default::default() };
+                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);
+                k.verbs = Some(k_runner);
+            },
+            |l| {
+                // The "run" on L: an instance on the moved checkout, in L's
+                // daemon's state.toml; it commits, then leaves work uncommitted.
+                let state = l.state.clone().unwrap();
+                let script = format!(
+                    r#"S='{}'; W=$(cd "$3/../web" && pwd -P); printf '[instance.web-2]\nsandbox = "web"\ninstance_id = "web-2"\ncontainer = "c"\nworkspace = "/w"\ncreated_unix = 0\nfolder = "%s"\nconfig_dir = "%s"\n' "$W" "$3" > "$S"; echo worker > "$W/README"; git -C "$W" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -am worker; echo wip > "$W/later""#,
+                    state.display()
+                );
+                let (mut runner, dir) = crate::serve::verbs::tests::script_runner("dial-fetch-l", &script);
+                runner.state = state;
+                l_verbs = dir;
+                l.verbs = Some(runner);
+                l.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), path.clone())]));
+                let roomy = Capacity {
+                    cpus: Some(8),
+                    mem_total: Some(32 * G),
+                    mem_available: Some(28 * G),
+                    disk_free: Some(400 * G),
+                    disk_total: Some(500 * G),
+                    ..Capacity::default()
+                };
+                l.local_capacity = Some(Arc::new(move || roomy.clone()));
+            },
+        );
+        pair.wait_box("box connected", connected);
+        wait_for("lap connected on K", Duration::from_secs(10), || {
+            let rows = connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+            named(&rows, "lap").is_some_and(|r| connected(&r))
+        });
+        let mut k = connect(&pair.k_dir);
+        let (r, _, err) = verb(&mut k, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "place": true}));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!((&r.result.as_ref().unwrap()["machine"], &r.result.as_ref().unwrap()["instance"]), (&json!("lap"), &json!("web-2")), "{r:?}");
+        let placed = crate::serve::fleet::placements::load(&pair.base.join("k-data/placements.json")).unwrap();
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!((placed[0].machine.as_str(), placed[0].instance.as_str(), &placed[0].folder), ("lap", "web-2", &web));
+
+        let before = git(&web, &["status", "--porcelain=v1", "-uall"]) + &git(&web, &["for-each-ref", "refs/heads"]);
+        let r = k.call_within("placements.fetch", json!({"machine": "lap", "instance": "web-2"}), Duration::from_secs(120)).unwrap().unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let got = r.result.unwrap();
+        assert_eq!(got["folder"], json!(web));
+        assert_eq!(git(&web, &["show", "refs/devsandbox/lap/web-2/heads/main:README"]), "worker");
+        assert_eq!(git(&web, &["show", "refs/devsandbox/lap/web-2/wip:later"]), "wip");
+        assert_eq!(git(&web, &["status", "--porcelain=v1", "-uall"]) + &git(&web, &["for-each-ref", "refs/heads"]), before, "the user's work untouched");
+        // A bare name resolves among the placements; one never placed is `not-found`.
+        let r = k.call_within("placements.fetch", json!({"instance": "web-2"}), Duration::from_secs(120)).unwrap().unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        let r = k.call_within("placements.fetch", json!({"machine": "lap", "instance": "nope"}), Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(r.error.unwrap().code, "not-found");
+        // A local client can't ask `instances.fetch` itself.
+        let r = k.call_within("instances.fetch", json!({"instance": "web-2"}), Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(r.error.unwrap().code, "denied");
+        drop(k);
+        pair.finish();
+        for dir in [src, l_verbs, k_verbs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// A `run --place` on member L (`lap`, hub `box`) is placed by the hub K
     /// (`fleet.place`): L is over a cap, K has room, so L moves the code
     /// into its fleet root on K (as K's `roots.list` flags it) and forwards

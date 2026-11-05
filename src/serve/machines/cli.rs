@@ -90,6 +90,8 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         | Command::Exec { .. } => MachineUse::Named,
         Command::Inbox { .. } => MachineUse::Refused("inbox"),
         Command::Vscode { .. } => MachineUse::Refused("vscode"),
+        // Runs here, against this host's placements: `fetch <machine>/<instance>`.
+        Command::Fetch { .. } => MachineUse::Refused("fetch"),
         Command::Port { .. } if port_nameless(command) => MachineUse::Port,
         Command::Port { .. } => MachineUse::Named,
         Command::Serve { .. } => MachineUse::Refused("serve"),

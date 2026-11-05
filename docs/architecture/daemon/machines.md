@@ -541,6 +541,12 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   (`tunnel::remote_opener`; [forwards](forwards.md),
   [fleet](fleet.md#tunnel)). `vscode` on a machine's instance is refused
   (`calls::refusal`: not available over its link yet).
+- **`fetch <machine>/<instance>`** (`commands::fetch`) runs here: one
+  `placements.fetch` to this host's daemon, which fetches the instance
+  this host placed back into the local checkout it came from
+  ([fleet](fleet.md#moving-code), *Fetch-back*); a bare `<instance>`
+  resolves among this host's placements, `@/<name>` is refused.
+  `--machine` refuses it (`machine_use`).
 - **`--machine m`** is for nameless commands (`machine_use`): `ps`,
   `stats`, `ls`, `status`, `service ls` are API calls
   (`MachineUse::Calls`, below); `stop --all`, `rebuild --all`, `start

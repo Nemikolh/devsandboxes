@@ -22,6 +22,10 @@
 //!   from it; a `bundle` with no `to` into the cache only.
 //! - **mirror** ([`mirror`], on a member placing elsewhere than its hub):
 //!   the same refs again into the hub's cache, best effort (decision 75).
+//! - **pull** ([`Transfer::pull`], [`fetch`]): fetch-back (decision 76), a
+//!   placed instance's branch and WIP bundled on the worker for the host
+//!   that placed it, pulled by that host into its own checkout's hidden
+//!   refs.
 //!
 //! The layout keeps every `folder` where the config says, relative to the
 //! root: the tar's members sit under the root's last components on the hub
@@ -29,6 +33,7 @@
 //! `/w/cfg` is `<hash>/cfg` and `<hash>/web` on the worker.
 //! [`prepare`] is offer + send.
 
+pub mod fetch;
 pub mod repo;
 pub mod tar;
 pub mod wip;
@@ -134,8 +139,7 @@ pub struct Haves {
 
 /// The seam bodies cross: production sends through a worker's link
 /// ([`LinkTransfer`]); another implementation (a sync layer) replaces it
-/// without changing [`prepare`]'s callers. Fetch-back (`pull`) joins it
-/// in fleet step 12e.
+/// without changing [`prepare`]'s callers.
 pub trait Transfer {
     /// What the receiver has already, with the tips of its cache of each of
     /// `repos` (repo identities). The default: nothing, so everything is
@@ -147,6 +151,13 @@ pub trait Transfer {
     /// One transfer: `header`, then `body`; the receiver's refusal is the
     /// error.
     fn send(&self, header: &Header, body: &mut dyn Read) -> Result<()>;
+    /// One pull (`transfer::pull`): the file `name` the other end made for
+    /// this host, of `kind`, at most `limit` bytes, into `dest`; its size.
+    /// The default pulls nothing.
+    fn pull(&self, kind: &str, name: &str, limit: u64, dest: &Path) -> Result<u64> {
+        let _ = (kind, limit, dest);
+        bail!("this transfer pulls nothing (asked for {name})")
+    }
 }
 
 /// [`Transfer`] over a worker's link: each send one `TRANSFER` stream
@@ -189,6 +200,39 @@ impl Transfer for LinkTransfer {
         stream.set_write_timeout(Some(SEND_WRITE_WAIT)).context("cannot set a write timeout")?;
         stream.set_read_timeout(Some(ANSWER_WAIT)).context("cannot set a read timeout")?;
         transfer::send(stream, header, body)
+    }
+
+    /// A fresh `TRANSFER` stream of the same path, each read and write on
+    /// it bounded by [`SEND_WRITE_WAIT`]: the worker serves a file it made
+    /// already, so a stall that long is a stuck link.
+    fn pull(&self, kind: &str, name: &str, limit: u64, dest: &Path) -> Result<u64> {
+        let stream = super::route::connect(&self.dir, &self.worker, crate::devsbd::proto::channel::TRANSFER)
+            .with_context(|| format!("cannot reach the worker `{}`", self.worker))?;
+        stream.set_write_timeout(Some(SEND_WRITE_WAIT)).context("cannot set a write timeout")?;
+        stream.set_read_timeout(Some(SEND_WRITE_WAIT)).context("cannot set a read timeout")?;
+        transfer::pull(stream, kind, name, limit, dest)
+    }
+}
+
+impl LinkTransfer {
+    /// `instances.fetch {instance, haves}` on the worker ([`fetch::fetch_call`])
+    /// over a fresh `API` stream of the same path: the hello within
+    /// [`HAVES_HELLO_WAIT`], the answer within [`fetch::FETCH_WAIT`] (a
+    /// snapshot and a bundle there).
+    pub fn fetch_instance(&self, instance: &str, haves: &[String]) -> Result<fetch::Fetched> {
+        use crate::serve::machines::{link, ssh::Duplex};
+        let method = fetch::FETCH_METHOD;
+        let stream = super::route::connect(&self.dir, &self.worker, crate::devsbd::proto::channel::API)
+            .with_context(|| format!("cannot reach the worker `{}`", self.worker))?;
+        stream.set_write_timeout(Some(HAVES_WAIT)).context("cannot set a write timeout")?;
+        let mut link = link::handshake(&self.worker, Duplex::socket(stream), HAVES_HELLO_WAIT, link::Over::Link)
+            .map_err(|e| anyhow!("{e}"))?;
+        let r = link.conn.call_within(method, json!({ "instance": instance, "haves": haves }), fetch::FETCH_WAIT)?;
+        let r = r.with_context(|| format!("no `{method}` answer within {}s", fetch::FETCH_WAIT.as_secs()))?;
+        if let Some(e) = r.error {
+            bail!("{method} on {}: {}", self.worker, e.message);
+        }
+        serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("bad {method} answer"))
     }
 }
 
@@ -800,7 +844,10 @@ fn next_seq() -> u32 {
 ///
 /// Bodies wait in `roots/.in/` (`repos/.in/` for a cache-only bundle); the
 /// unpacking's error is the transfer's answer, so the sender hears it.
+/// It also serves the peer's fetch-back pulls ([`fetch::serves`]: the
+/// bundles `instances.fetch` made under `out/`).
 pub fn receivers(fleet_root: &Path, receivers: Receivers, in_use: InUse) -> Receivers {
+    let receivers = fetch::serves(fleet_root, receivers);
     let log = receivers.log();
     let roots = fleet_root.join("roots");
     let (tar_in, tar_roots, bundle_in, bundle_roots) = (roots.clone(), roots.clone(), roots.clone(), roots);
@@ -1264,7 +1311,9 @@ mod tests {
 
     /// The machine's end of one `API` stream, as the daemon answers a peer
     /// whose fleet root is `fleet`: a hello, then `code.haves`
-    /// ([`haves_call`]); anything else unknown. Reads bounded.
+    /// ([`haves_call`]) and `instances.fetch` ([`fetch::fetch_call`], over
+    /// the `state.toml` next to `fleet`'s parent); anything else unknown.
+    /// Reads bounded.
     fn serve_api(stream: UnixStream, fleet: &Path) {
         use std::io::{BufRead, BufReader, Write};
 
@@ -1284,6 +1333,13 @@ mod tests {
                     Ok(v) => Response::ok(req.id, v),
                     Err(e) => Response::err(req.id, e.code, e.message),
                 },
+                fetch::FETCH_METHOD => {
+                    let state = crate::state::State::load_at(&fleet.parent().unwrap().join("state.toml")).unwrap();
+                    match fetch::fetch_call(&state, fleet, &req.params) {
+                        Ok(v) => Response::ok(req.id, v),
+                        Err(e) => Response::err(req.id, e.code, e.message),
+                    }
+                }
                 m => Response::err(req.id, "unknown-method", m.to_string()),
             };
             if writeln!(out, "{}", serde_json::to_string(&resp).unwrap()).is_err() {
@@ -1678,6 +1734,54 @@ mod tests {
             }
         }
         assert_eq!(mirror(&got.sent, &NoHaves), [(web.clone(), "cannot ask the hub what it has: unreachable".to_string())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_placed_instance_is_fetched_back_over_the_link_into_hidden_refs() {
+        let dir = scratch("fetch-back-link");
+        let cfg = fixture(&dir);
+        let web = dir.join("web");
+        std::fs::write(web.join("README"), "dirty\n").unwrap();
+        let fleet = dir.join("worker/fleet/hub");
+        let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
+        let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
+        let moved = crate::serve::fleet::placed::MovedFolder::of(&got).unwrap();
+        assert_eq!((moved.local.as_path(), moved.branch.as_str()), (web.as_path(), "main"));
+        // On the worker: an instance on that checkout commits, then leaves work uncommitted.
+        let there = moved.remote.clone();
+        let instance = format!(
+            "[instance.web-2]\nsandbox = \"web\"\ninstance_id = \"web-2\"\ncontainer = \"c\"\nworkspace = \"/w\"\ncreated_unix = 0\nfolder = {:?}\n",
+            there.to_str().unwrap()
+        );
+        std::fs::write(fleet.parent().unwrap().join("state.toml"), instance).unwrap();
+        git(&there, &["commit", "-q", "-am", "on the worker"]);
+        std::fs::write(there.join("later"), "wip\n").unwrap();
+        let before = source_state(&web);
+        let entry = crate::serve::fleet::placements::Entry {
+            machine: "w".into(),
+            instance: "web-2".into(),
+            sandbox: "web".into(),
+            root: cfg.clone(),
+            folder: web.clone(),
+            remote: there.clone(),
+            repo: moved.repo.clone(),
+            branch: moved.branch.clone(),
+        };
+        let back = fetch::fetch_back(&entry, |haves| t.fetch_instance("web-2", haves), &t).unwrap();
+        assert!(back.fetched > 0);
+        let heads = "refs/devsandbox/w/web-2/heads/main";
+        assert_eq!(git(&web, &["rev-parse", heads]), git(&there, &["rev-parse", "main"]));
+        assert_eq!(git(&web, &["show", &format!("{heads}:README")]), "dirty", "the worker's commit");
+        assert_eq!(git(&web, &["show", "refs/devsandbox/w/web-2/wip:later"]), "wip");
+        let after = source_state(&web);
+        assert_eq!(after[..5], before[..5], "the user's index, status, HEAD, branches and stash untouched");
+        assert_eq!(git(&there, &["rev-parse", "refs/devsandbox/wip/web-2"]), back.refs["refs/devsandbox/w/web-2/wip"], "the WIP stays there");
+        assert_eq!(std::fs::read_dir(fleet.join(fetch::OUT_DIR)).unwrap().count(), 0, "pulled, so removed");
+        assert_no_leftovers(&web);
+        // Nothing new: no bundle.
+        let again = fetch::fetch_back(&entry, |haves| t.fetch_instance("web-2", haves), &t).unwrap();
+        assert_eq!((again.fetched, again.refs), (0, back.refs));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -683,6 +683,21 @@ opens `TRANSFER` streams only toward a peer that advertised it.
    loses its answer on the mux, the sender seeing only a broken pipe.
    `send` returns the receiver's why as `transfer refused: <why>`.
 
+**A pull** (`transfer::pull`) goes the other way on a stream the puller
+opened: it writes a `PullRequest` line, `{"pull":"<kind>","name":"<file>"}`
+(`kind` and `name` under a header's rules; `deny_unknown_fields`, and a
+`Header` needs `kind`, so neither line parses as the other). The serving
+end answers a `Header` line (that kind and name, the file's `size` and
+`sha256`) then exactly `size` raw bytes, or `error <why>` and nothing
+else. The puller refuses a header for another kind or name, or a `size`
+over its limit; reads exactly `size` bytes into a temp file next to its
+destination, checks the sha256 and renames it into place; then answers
+one line, `ok` or `error <why>` (the temp file removed on any error).
+The serving end keeps its stream open until that answer, so the puller
+never reads past the body (no half-close), and only a pull answered
+`ok` counts as sent. A refusal reaches the puller as `pull refused:
+<why>`.
+
 **Receivers.** A `TRANSFER` stream is handed to a `Receivers`: one entry
 per kind (`Receivers::with`: a size limit, `decide`, and a `done` run
 with each `Received` after its `ok`). The handler answers the `Open`
@@ -690,11 +705,18 @@ with one end of a socket pair (`Receivers::accept`) and receives on a
 `fleet-transfer` thread of its own; a kind with no entry is refused
 ("nothing here receives \`<kind>\` transfers").
 `Receivers::on_failure` adds a kind's hook for a transfer that failed
-after its `decide` took it. Each end's streams reach its daemon's
+after its `decide` took it. `Receivers::serves` adds a pull provider by
+kind (a `resolve` from the asked name to the file, its error the refusal,
+and a `sent` run once the puller answered `ok`); the file is opened
+`O_NOFOLLOW` and must be a regular one. `Receivers::receive` reads a
+stream's first line and serves a pull request or receives a transfer by
+it. Each read and write on such a stream is bounded by
+`transfer::STREAM_WAIT` (5 min: a body flows, a sender waits on a landing
+it doesn't read meanwhile). Each end's streams reach its daemon's
 `Shared::serve_channel` (the dialed end's through `link.attach`, the
-dialer's in-process), which receives `root-tar` / `bundle`
-([Moving code](#moving-code)) with `code::receivers` over the peer's
-fleet root. While an end waits for the hub's build, its link's own
+dialer's in-process), which receives `root-tar` / `bundle` and serves
+`fetch-bundle` ([Moving code](#moving-code)) with `code::receivers` over
+the peer's fleet root. While an end waits for the hub's build, its link's own
 `binary` receiver takes the one transfer instead (`update::BINARY_KIND`,
 at most `BINARY_LIMIT`, 256 MiB: the hub's dev build,
 `follow::Incoming::receiver`, [Versions](#versions)).
@@ -713,7 +735,7 @@ has it (dockerfiles, local features) on a checkout of the branch with
 the work not yet committed (fleet plan decision 72: straight from the
 folder's own checkout on the placing host, the one whose config it is,
 never from a remote; a worker never needs credentials). It sits behind one seam, `serve::fleet::code`'s
-`Transfer` (`haves`, `send`; `offer` builds what goes, `receivers` takes
+`Transfer` (`haves`, `send`, `pull`; `offer` builds what goes, `receivers` takes
 it), so a sync layer can replace the git + tar implementation;
 `LinkTransfer` asks `haves` as one `code.haves` on a fresh `API` stream
 of any path to the machine (`route::connect`: its link socket, else its
@@ -721,7 +743,8 @@ route socket; hello within `HAVES_HELLO_WAIT`, the answer within
 `HAVES_WAIT`) and sends each body as one `TRANSFER` along the same path,
 its writes bounded by `SEND_WRITE_WAIT` and the wait for the answer by
 `ANSWER_WAIT` (the worker lands the body before it answers, each git
-step bounded by `repo::WHOLE`).
+step bounded by `repo::WHOLE`); a `pull` is one `TRANSFER` of that path
+too, each read and write bounded by `SEND_WRITE_WAIT`.
 `prepare(transfer, worker root, config root, sandbox, branch)` is
 `offer` then `send`, answering `Prepared` (the config root on the
 worker, `remote_root`, and each moved folder with its branch) or
@@ -882,6 +905,64 @@ there). Bodies wait in `roots/.in/` (a cache-only bundle's in
 - `bundle` with no `to` (cache-only, the hub mirror): the same `repo`
   and `refs` checks, into `repos/<repo>.git` the same way (made if
   missing, `unbundle`, `set_refs`), no checkout and no root needed.
+
+`code::receivers` also serves the peer's `fetch-bundle` pulls
+(`fetch::serves`, below).
+
+**Fetch-back** (`code::fetch`; fleet plan decision 76). The host that
+placed an instance pulls its work back: `devsandbox fetch
+<machine>/<instance>` (`commands/fetch.rs`) asks this host's daemon
+`placements.fetch`, which needs a record of the placement:
+`placements.json` next to `state.toml` (`fleet::placements`, versioned,
+a locked read-modify-write renamed into place), one `placements::Entry`
+per placed run (the worker by this host's name for it, the instance's
+name there, the sandbox, the local config root, the local checkout of
+`folder`, its path on the worker, the repo identity and the branch
+sent), written by the daemon when the run's answer names the instance
+([In the `run` verb](#in-the-run-verb)); a repeat of the same name on
+the same machine replaces it; nothing prunes it. `placements::find`
+takes `machine` and `instance`, or a bare `instance` that exactly one
+entry has. Then (`fetch::fetch_back`):
+
+- The local checkout must still be the repo sent (`fetch::check_local`:
+  the identity of its placed branch, of its devsandbox root or of
+  `HEAD` is the entry's repo); its `repo::tips` are the haves.
+- `instances.fetch {instance, haves}` on the worker
+  (`LinkTransfer::fetch_instance`: an `API` stream of any path, hello
+  within `HAVES_HELLO_WAIT`, the answer within `fetch::FETCH_WAIT`, 65
+  min: a snapshot and a bundle there). The worker (`fetch::fetch_call`,
+  `fetch_of`) finds the instance in its `state.toml` by name or id;
+  under `worker` trust `lent` admitted it only under the caller's fleet
+  root ([The trust table](#the-trust-table)). Its `folder` (a worktree
+  instance's worktree) is snapshotted onto
+  `refs/devsandbox/wip/<instance_id>`, which stays there as the
+  instance's latest WIP (the previous commit kept when the tree and base
+  are the same, so nothing new carries nothing); its branch is a
+  worktree instance's recorded one, else the checkout's current one (a
+  detached `HEAD` is refused). `repo::bundle_refs` of
+  `refs/heads/<branch>` and that ref `--not` the haves goes to
+  `<the caller's fleet root>/out/<nonce>.bundle` (`out/` a real dir; its
+  files older than `fetch::OUT_STALE`, 1 h, swept first). The answer
+  (`fetch::Fetched`): the repo identity over the WIP's history, the
+  branch, both refs at their commits, and the bundle's name, `null` when
+  the caller has every commit.
+- The answer's repo must be the entry's. A bundle is pulled
+  (`Transfer::pull`, kind `fetch-bundle`, at most `BUNDLE_LIMIT`) into a
+  temp file in the local checkout's git dir, removed after. The worker
+  serves only a name it makes (`[0-9a-f-]` then `.bundle`) under the
+  caller's own `out/`, a regular file, and removes it once the pull is
+  answered `ok`.
+- `fetch::land`: the bundle's objects into the checkout
+  (`repo::unbundle_into`, no ref touched), then
+  `refs/devsandbox/<machine>/<instance>/heads/<branch>` and
+  `refs/devsandbox/<machine>/<instance>/wip` set to the answered
+  commits, each checked to be a commit there first. Machine and
+  instance names must be plain ref components (`fetch::hidden_prefix`;
+  `wip` and `root` are refused as machine names). The user's branches,
+  index, `HEAD`, working tree and stash never change, and the checkout
+  comes from `placements.json`, never from the worker's answer.
+
+Only the `folder` repo comes back.
 
 All of it is host git through `run::git`'s family
 ([ADR 0003](../../decisions/0003-host-git-never-runs-repo-controlled-code.md)):
@@ -1200,6 +1281,14 @@ destination the same way), so a placed run needs no ssh of its own. A
   answer carry `machine` (`placed::Tagged`, `placed::tag_answer`), so the
   CLI prints `<worker>/<instance>`, cancels there on Ctrl-C, and the
   dashboard's status line names it so.
+- **The record** (`daemon.rs` `record_placement`): an answer that names
+  the instance (a successful or a detached one; never a failure) adds
+  the placement to `placements.json`, from the `folder` repo
+  `placed::moved` carries (`Placed::Worker`'s `placed::MovedFolder`:
+  the local checkout, its path on the worker, the branch, the repo
+  identity), for fetch-back ([Moving code](#moving-code)). A write that
+  fails is a line in the daemon's log; the run is the worker's either
+  way.
 - **A new branch** (`placed::start_point`): a `--branch` the source
   checkout doesn't have was bundled as its current branch
   (`code::offer`), and the moved checkout has no remote for `run` to
@@ -2127,8 +2216,8 @@ when it exists, never with a `..`). Every gate below uses it.
 
 Each request goes through `lent::admit` at the top of `handle`, before
 any dispatch. Under either trust `member.*`, `membership.*`, `graph.*`,
-`link.*` and `links.*` are `denied`: this member's own settings,
-membership log, link graph and links are its local clients' only.
+`link.*`, `links.*` and `placements.*` are `denied`: this member's own settings,
+membership log, link graph, links and placements are its local clients' only.
 
 `fleet.*` (a removal from the fleet: *How a machine leaves*, at the top;
 a member's placed run) goes by the key the caller proved, not by trust:
@@ -2170,7 +2259,8 @@ never hands the daemon off (below). Under **`worker`**:
   `subscribe` / `unsubscribe` with only the `instances` topic,
   `instances.watch` / `unwatch`, the quick calls
   (`machines::forward::QUICK`), `capacity.get`, `code.haves` (about the
-  caller's own fleet root), `roots.list` (with or
+  caller's own fleet root), `instances.fetch` (fetch-back, below),
+  `roots.list` (with or
   without `paths`: read-only; `machines.add` checks typed roots through
   it) and the verbs (`verbs::is_verb`) but `gc`. It refuses
   (`denied`) any request with a `machine` param or `machines: true`
@@ -2200,6 +2290,13 @@ never hands the daemon off (below). Under **`worker`**:
   `all`: `--all` is every instance in `state.toml`, not the root's, so
   it is admitted only while the reach admits every one of them (an
   instance without a recorded `config_dir` stops it, `denied`).
+- **Fetch-back**: `instances.fetch`'s `instance` (name or id) must be
+  an instance whose `config_dir` and `folder` both canonicalize under
+  the caller's fleet root (`lent::fetch_in_fleet_root`), else
+  `not-found`: never one of this member's own roots, even one the
+  caller's quick calls reach, so an own root's code never moves off the
+  member for another machine (fleet plan decision 76). Under `full`, any
+  instance; the bundle goes under the caller's fleet root either way.
 - **Env**: a verb's `env` is replaced by the `Peer`'s when it has one:
   the daemon's own process env (`verbs_client::caller_env`,
   `Options::peer_env` in tests), never what the peer sent, its

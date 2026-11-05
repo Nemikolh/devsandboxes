@@ -32,7 +32,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `graph.get`, `capacity.get`, `code.haves` (peers only) | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `graph.get`, `capacity.get`, `code.haves` and `instances.fetch` (peers only), `placements.fetch` (local only) | no (`placements.fetch` names the machine it fetches from) |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -126,12 +126,12 @@ A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
 its `member.toml` per request: a link peer's channel streams (those the
 daemon answers in-process on the links it dials, and those after
-`link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*` and `links.*` are
+`link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*` and `placements.*` are
 `denied` under either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
-`code.haves`, `roots.list` and the verbs but `gc` (`all` only while every instance here
+`code.haves`, `instances.fetch` (an instance under the caller's fleet root only), `roots.list` and the verbs but `gc` (`all` only while every instance here
 is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true` but an `instances.watch`'s (a member watching its hub, which only the hub serves); every `root` / `dir`
 must be under this member's fleet root for the caller (a hub's, a fleet member's) or exactly one of its
 own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
@@ -1235,7 +1235,7 @@ connection under either trust (*Remote callers*).
   [fleet.md](../architecture/daemon/fleet.md#hub-mode)).
 - `trust`: `worker` (the default: a remote caller reaches this host's
   own roots and its fleet root, placed work under the worker policy) or
-  `full` (the whole API but `member.*`, `membership.*`, `graph.*`, `link.*` and `links.*`, no worker policy,
+  `full` (the whole API but `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*` and `placements.*`, no worker policy,
   the hub's dev builds taken)
   ([fleet.md](../architecture/daemon/fleet.md#trust)).
 - `dev_builds`: `member.toml`'s `dev-builds`, as the file says.
@@ -1303,6 +1303,48 @@ first); a repo with no cache is absent. On a link peer's connection
 only, under either trust, always about that peer's own fleet root.
 Errors: `invalid` (bad `repos`), `denied` (a local client: it has no
 fleet root), `internal`.
+
+### `instances.fetch`
+
+One of this host's instances bundled for the caller, which placed it
+(fetch-back, [fleet.md](../architecture/daemon/fleet.md#moving-code)).
+Params `{"instance": "<name or id>", "haves": ["<commit>", …]}`
+(`haves` optional, at most 256 commit ids: what the caller has). The
+instance's `folder` working tree is snapshotted onto
+`refs/devsandbox/wip/<instance_id>` (kept on this host), and its branch
+(a worktree instance's recorded one, else the checkout's current one)
+and that ref are bundled `--not` `haves` into a file under the caller's
+fleet root here, which the caller pulls on a `TRANSFER` stream (kind
+`fetch-bundle`; removed once pulled). Answer
+`{"repo": "<repo id>", "branch": "<b>", "refs": {"refs/heads/<b>": "<commit>",
+"refs/devsandbox/wip/<instance_id>": "<commit>"}, "bundle": "<name>" | null}`
+(`InstancesFetched`; `bundle` `null` when the caller has every commit).
+On a link peer's connection only: under `worker` trust the instance's
+config root and `folder` must be under the caller's fleet root (never
+one of this host's own roots), under `full` any instance. Errors:
+`invalid` (bad params), `not-found` (no such instance, or not in
+reach), `denied` (a local client), `failed` (a detached `HEAD`, git).
+
+### `placements.fetch`
+
+Fetch back an instance this host placed on a machine into the local
+checkout it was placed from, as hidden refs (`devsandbox fetch`;
+[fleet.md](../architecture/daemon/fleet.md#moving-code)). Params
+`{"machine": "<name>", "instance": "<name there>"}` (`machine` may be
+left out when exactly one placement has that instance name). The
+placement comes from `placements.json` (written when a placed run's
+answer named its instance), never from the machine; the daemon asks the
+machine's `instances.fetch` with the checkout's tips as `haves`, pulls
+the bundle and sets `refs/devsandbox/<machine>/<instance>/heads/<branch>`
+and `refs/devsandbox/<machine>/<instance>/wip` there. The user's
+branches, index, `HEAD` and working tree aren't touched. Answer
+`{"machine", "instance", "folder": "<the local checkout>", "refs": {"<ref>": "<commit>", …},
+"fetched": <bundle bytes>}` (`PlacementsFetched`). Local clients only
+(`denied` to link peers under either trust). Errors: `invalid`,
+`not-found` (this host didn't place it, or a bare name more than one
+placement has), `failed` (the machine unreachable or refusing, the pull,
+the checkout no longer the repo placed, a name that can't be a ref),
+`internal`.
 
 ### The `machine` param
 

@@ -2567,6 +2567,9 @@ mod tests {
             ("roots.list", "RootCandidate[]"),
             ("sandboxes.get", "SandboxConfig"),
             ("services.get", "ServiceConfig"),
+            ("code.haves", "CodeHaves"),
+            ("instances.fetch", "InstancesFetched"),
+            ("placements.fetch", "PlacementsFetched"),
         ] {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
             assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");

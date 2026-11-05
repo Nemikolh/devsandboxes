@@ -127,7 +127,13 @@ pub fn ensure_bare(cache: &Path) -> Result<()> {
 /// ref touched (`bundle unbundle`, refs are [`set_refs`]'). A bundle
 /// whose prerequisites `cache` lacks fails here, with git's why.
 pub fn unbundle(cache: &Path, bundle: &Path) -> Result<()> {
-    run(host_git_bare(cache)?.args(["bundle", "unbundle"]).arg(bundle), WHOLE).context("cannot take the bundle")?;
+    unbundle_into(Repo::Bare(cache), bundle)
+}
+
+/// [`unbundle`] into any repo: a checkout's object store too (fetch-back),
+/// its refs, index and working tree untouched.
+pub fn unbundle_into(repo: Repo, bundle: &Path) -> Result<()> {
+    run(repo.git()?.args(["bundle", "unbundle"]).arg(bundle), WHOLE).context("cannot take the bundle")?;
     Ok(())
 }
 

@@ -540,6 +540,15 @@ limitation means editing this file in the same commit.
   sent after the worker's (so a placement from a laptop uploads twice),
   never pruned and not yet read by anything (re-placement is fleet step
   14). → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::mirror`
+- Fetch-back (`devsandbox fetch <machine>/<instance>`) brings back only
+  the `folder` repo's branch and WIP (not `folders` entries'), only on
+  demand (not yet at `rm` / `done`, fleet step 12f), and not from the
+  dashboard. `placements.json` entries are never pruned yet (12f's `rm`
+  drops them). A bundle the worker made under `out/` for a host that never
+  pulled it is swept only when the next one is made (after 1 h). A
+  worker's instance whose history gained another root (an unrelated
+  merge) no longer matches the placed repo and is refused.
+  → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::fetch`
 - What ties a sandbox to its host (a bind outside the config root and its
   moved folders, `${localEnv:…}`, `caches`, `privileged`, …) keeps it
   home whatever a worker's trust or `member.toml` allowances: nothing

@@ -206,6 +206,32 @@ export interface CodeHaves {
 }
 
 /**
+ * `instances.fetch`' answer (a worker to the peer that placed the instance): `repo`, the repo identity;
+ * `branch`, the instance's branch; `refs`, `refs/heads/<branch>` and `refs/devsandbox/wip/<instance_id>`
+ * at their commits; `bundle`, the file under the peer's fleet root to pull on a `TRANSFER` stream, `null`
+ * when the peer has every commit already.
+ */
+export interface InstancesFetched {
+  repo: string;
+  branch: string;
+  refs: Record<string, string>;
+  bundle: string | null;
+}
+
+/**
+ * `placements.fetch`' answer: the refs set in `folder`, this host's checkout the placement came from
+ * (`refs/devsandbox/<machine>/<instance>/heads/<branch>` and `…/wip`, full name → commit); `fetched`, the
+ * bundle's size in bytes (0: nothing new).
+ */
+export interface PlacementsFetched {
+  machine: string;
+  instance: string;
+  folder: string;
+  refs: Record<string, string>;
+  fetched: number;
+}
+
+/**
  * A host's capacity report (fleet). Sizes in bytes; `null` is unknown. Free memory and disk are
  * reported for a native Linux engine only (a VM-backed engine's are the VM's, not known here).
  */
@@ -1797,6 +1823,18 @@ export interface ApiMethods {
    * tips of its cache of each of `repos`, at most 32 repo identities). `denied` from a local client.
    */
   'code.haves': { params: { repos: string[] }; result: CodeHaves };
+  /**
+   * From a link peer only: one of this host's instances (under the peer's fleet root under `worker`
+   * trust, any under `full`) snapshotted and bundled for the peer `--not` `haves` (commit ids, at most
+   * 256). `not-found`, `failed` (a detached `HEAD`, git), `denied` from a local client.
+   */
+  'instances.fetch': { params: { instance: string; haves?: string[] }; result: InstancesFetched };
+  /**
+   * Local only: fetch back an instance this host placed (`placements.json`) into the checkout it came
+   * from, as hidden refs. `machine` optional when one placement has that instance name. `not-found`
+   * (not placed from here, ambiguous), `failed` (the worker, the pull, the landing).
+   */
+  'placements.fetch': { params: { machine?: string; instance: string }; result: PlacementsFetched };
   /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. */
   'member.get': { params: {}; result: MemberInfo };
   /**

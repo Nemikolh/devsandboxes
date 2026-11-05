@@ -297,6 +297,9 @@ pub enum Gate {
     /// `code.haves`: what the caller's own fleet root here has (the daemon
     /// answers it about that root only).
     Code,
+    /// `instances.fetch`: an instance under the caller's fleet root (never
+    /// one of this member's own roots), bundled for it (fetch-back).
+    Fetch,
     /// `roots.list`, with or without `paths`: read-only (`machines.add`
     /// checks typed roots through it).
     Roots,
@@ -328,6 +331,7 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         m if fwd::is_quick(m) => Gate::Quick,
         "capacity.get" => Gate::Capacity,
         "code.haves" => Gate::Code,
+        "instances.fetch" => Gate::Fetch,
         "roots.list" => Gate::Roots,
         "gc" => return Err(ApiError::denied(format!(
             "`gc` is host maintenance: not open to remote callers under this member's `worker` trust ({FULL_HINT})"
@@ -554,7 +558,7 @@ pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Optio
 /// to run it with. `state` is this host's `state.toml`, read only when the
 /// request names an instance or a container under `worker`.
 pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
-    if ["member.", "membership.", "graph.", "link.", "links."].iter().any(|p| method.starts_with(p)) {
+    if ["member.", "membership.", "graph.", "link.", "links.", "placements."].iter().any(|p| method.starts_with(p)) {
         return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
     }
     // [`admit_fleet`]'s, which knows this host's hub: never through here.
@@ -609,6 +613,9 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
         return Err(ApiError::invalid(format!("`{method}` needs `{key}`")));
     }
 
+    if gate == Gate::Fetch {
+        fetch_in_fleet_root(obj, reach, state)?;
+    }
     let keys = instance_keys(method);
     let named_container = matches!(method, "containers.logs" | "containers.inspect");
     // `--all` is every instance in `state.toml`, not the root's.
@@ -659,6 +666,22 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
         peer_env(obj, peer)?;
     }
     Ok(params)
+}
+
+/// `instances.fetch`'s `instance` under `worker`: an instance in `state`
+/// whose config root and `folder` are both under the caller's fleet root
+/// (fleet plan decision 76: an own root's code never moves off this member
+/// for another machine); else `not-found`, as a quick call's unlent one.
+fn fetch_in_fleet_root(obj: &serde_json::Map<String, Value>, reach: &Reach, state: &Path) -> Result<(), ApiError> {
+    let Some(name) = obj.get("instance").and_then(Value::as_str) else {
+        return Err(ApiError::invalid("`instances.fetch` needs `instance`"));
+    };
+    let state = State::load_at(state).map_err(ApiError::internal)?;
+    let under = |p: &Path| !p.components().any(|c| c == Component::ParentDir) && reach.in_fleet_root(&std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+    match crate::serve::fleet::code::fetch::find_instance(&state, name) {
+        Some((_, i)) if i.config_dir.as_deref().is_some_and(under) && under(&i.folder) => Ok(()),
+        _ => Err(ApiError::not_found(format!("no instance `{name}` under this member's fleet root for the caller"))),
+    }
 }
 
 /// A verb's `env` replaced by the peer's, when it has one, its
@@ -862,6 +885,9 @@ mod tests {
             ("capacity.get", json!({"machine": "m"}), Err("denied")),
             ("code.haves", json!({"repos": []}), Ok(Code)),
             ("code.haves", json!({"repos": [], "machine": "m"}), Err("denied")),
+            ("instances.fetch", json!({"instance": "web-2"}), Ok(Fetch)),
+            ("instances.fetch", json!({"instance": "web-2", "machine": "m"}), Err("denied")),
+            ("placements.fetch", json!({"instance": "web-2"}), Err("denied")),
             ("run", json!({"root": "/x"}), Ok(Verb)),
             ("rm", json!({"root": "/x"}), Ok(Verb)),
             ("services.rebuild", json!({"root": "/x"}), Ok(Verb)),
@@ -1076,6 +1102,47 @@ mod tests {
         assert_eq!(code("rm", json!({"root": cfg})), "invalid");
         assert_eq!(code("start", json!({"root": cfg, "instance": null})), "invalid");
         assert!(admit("run", json!({"root": cfg, "sandbox": "web", "env": {}}), &s, &state).is_ok(), "run names none");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_fetch_reaches_the_callers_fleet_root_only() {
+        let base = scratch("fetch");
+        let root = base.join("fleet/hub");
+        for d in ["fleet/hub/roots/h/cfg", "fleet/hub/roots/h/web", "mine/cfg", "mine/web"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let state = base.join("state.toml");
+        let inst = |name: &str, cfg: &Path, folder: &Path| {
+            format!(
+                "[instance.{name}]\ninstance_id = \"id-{name}\"\nsandbox = \"web\"\ncontainer = \"devsandbox-{name}\"\n\
+                 folder = {:?}\nworkspace = \"/w\"\ncreated_unix = 1\nconfig_dir = {:?}\n",
+                folder.to_str().unwrap(),
+                cfg.to_str().unwrap()
+            )
+        };
+        let placed = (root.join("roots/h/cfg"), root.join("roots/h/web"));
+        let own = (base.join("mine/cfg"), base.join("mine/web"));
+        let text = inst("placed", &placed.0, &placed.1) + &inst("own", &own.0, &own.1) + &inst("mixed", &placed.0, &own.1);
+        std::fs::write(&state, text).unwrap();
+        // The own root is one of this member's roots: a quick call reaches it, a fetch doesn't.
+        let r = Reach { own: [own.0.canonicalize().unwrap()].into(), ..fleet(&root) };
+        let s = peer(&root);
+        let fetch = |name: &str, r: &Reach| admit("instances.fetch", json!({"instance": name}), &s, r, &state);
+        assert!(fetch("placed", &r).is_ok());
+        assert!(fetch("id-placed", &r).is_ok(), "by id");
+        assert!(admit("instances.done", json!({"instance": "own", "done": true}), &s, &r, &state).is_ok());
+        for name in ["own", "mixed", "nope"] {
+            assert_eq!(fetch(name, &r).unwrap_err().code, "not-found", "{name}");
+        }
+        assert_eq!(admit("instances.fetch", json!({}), &s, &r, &state).unwrap_err().code, "invalid");
+        // Under `full`: any instance.
+        let full = Reach { trust: Trust::Full, ..r.clone() };
+        assert!(fetch("own", &full).is_ok());
+        // `placements.*` is this host's own, under either trust.
+        for r in [&r, &full] {
+            assert_eq!(admit("placements.fetch", json!({"instance": "x"}), &s, r, &state).unwrap_err().code, "denied");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
