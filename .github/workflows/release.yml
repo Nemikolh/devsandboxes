@@ -115,8 +115,10 @@ jobs:
       # These binaries are what fleet members download to follow a published
       # hub, and the member checks the download's `fleet-hello` is the hub's
       # build: a wrong stamp (`dev`, `unknown` git, another platform) makes
-      # members re-download in a loop or refuse the hub.
+      # members re-download in a loop or refuse the hub. Not on Windows: it is
+      # never a fleet member (no `fleet-hello`, no `update::release_target`).
       - name: Check the fleet stamp
+        if: ${{ !contains(matrix.target, 'windows') }}
         shell: bash
         env:
           WANT: ${{ needs.version.outputs.version }} ${{ needs.version.outputs.git }} published ${{ matrix.platform }}
