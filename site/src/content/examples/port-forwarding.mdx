@@ -7,6 +7,8 @@ tags: [networking, services]
 related: [isolated-services, shared-postgres, vscode]
 ---
 
+import Experimental from '../../components/Experimental.astro';
+
 ## The problem
 
 An agent started a dev server on port 3000 inside instance `api` and you want it in your browser, or `psql` on your host against that instance's Postgres. Publishing ports with `-p` has to happen at create time, collides as soon as a second instance wants the same port, and can't reach a server listening on the container's `127.0.0.1`.
@@ -26,7 +28,7 @@ devsandbox port my-server/web 3000              # an instance on another machine
 
 - `--service`: forward a service's port instead of the instance's.
 - `--address`: the host address to bind (default `127.0.0.1`).
-- `--machine`: a global service on a [machine](/docs/host-daemon#other-machines) (`--machine my-server --service redis 6379`); the port still opens here.
+- `--machine` <Experimental />: a global service on a [machine](/docs/host-daemon#other-machines) (`--machine my-server --service redis 6379`); the port still opens here.
 
 From the dashboard: `p` on an instance or service, type the port; live forwards are on the **Ports** tab (`3`). The [host daemon](/docs/host-daemon) keeps them, so they last after you close the dashboard and come back on the same host port, until `d` stops them; `devsandbox port` forwards only while it runs. To forward a port whenever the instance runs, add `forwardPorts = [3000]` to the sandbox ([`forwardPorts`](/docs/config#implemented-devcontainer-properties)).
 
@@ -35,5 +37,5 @@ From the dashboard: `p` on an instance or service, type the port; live forwards 
 - Each connection is tunnelled through the in-container helper, so a server on the container's `127.0.0.1` is reachable and nothing is published.
 - `--service` goes through a running instance that uses the service ([services](/docs/config#services-servicesname)).
 - A bare port taken on the host falls back to the next free one; the printed line says which.
-- On a machine, the same tunnel runs over one `ssh` per forward, reconnecting if it drops; its own `forwardPorts` aren't copied here.
+- On a machine <Experimental />, the same tunnel runs over one `ssh` per forward, reconnecting if it drops; its own `forwardPorts` aren't copied here.
 - Unix hosts, TCP only.

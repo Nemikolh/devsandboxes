@@ -24,7 +24,9 @@ export function headingAnchors(): HastPluginEntry {
       element: {
         filter: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
         visit(node, ctx) {
-          const text = ctx.textContent(node);
+          // Trimmed: an inline component after the text (`## X <Experimental />`)
+          // leaves a trailing space that would slug to `x-`.
+          const text = ctx.textContent(node).trim();
           const existing = node.properties?.id;
           // Leading punctuation (`${…} variables`) would slug to `-variables`.
           const slug = typeof existing === 'string' ? existing : slugger.slug(text.replace(/^[^\p{L}\p{N}]+/u, ''));

@@ -6,6 +6,7 @@ order: 2
 ---
 
 import Callout from '../../components/Callout.astro';
+import Experimental from '../../components/Experimental.astro';
 import ResourceLink from '../../components/ResourceLink.astro';
 
 This page picks up where the [quick start](/docs/quick-start) ends: a config root at `~/code/sandboxes` with a `web` sandbox. The dashboard takes over the terminal. Scripts and agents use these plain commands instead, and their output is uncoloured when piped.
@@ -108,7 +109,7 @@ devsandbox -C ~/code/sandboxes run web
 devsandbox -C ~/code/sandboxes
 ```
 
-## On another machine
+## On another machine <Experimental />
 
 Sandboxes can also live on a server you reach over ssh. Register it once (`machine add` offers to install devsandbox there if it's missing), then use its names like local ones:
 

@@ -397,6 +397,24 @@
   }
 }
 
+/* ---------------------------------------------------------- Experimental */
+
+.experimental-badge {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 0.5em;
+  font: 500 9px/1 var(--font-mono);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: #e3c170;
+  border: 1px solid #54492f;
+  background: #221f16;
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  cursor: help;
+}
+
 /* --------------------------------------------------------------- Callout */
 
 .callout {

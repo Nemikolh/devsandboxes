@@ -5,6 +5,7 @@ eyebrow: GETTING STARTED
 order: 1.5
 ---
 
+import Experimental from '../../components/Experimental.astro';
 import ResourceLink from '../../components/ResourceLink.astro';
 import StacksDiagram from '../../components/StacksDiagram.astro';
 
@@ -13,7 +14,7 @@ devsandbox combines tools you'd otherwise wire together yourself into a single i
 - **devcontainer**: images, Features and lifecycle commands, from the same standard VS Code uses.
 - **docker compose**: the services a stack needs, one set per instance or shared by all.
 - **git worktrees**: every repeat instance of a repo gets its own worktree and branch.
-- **Multiple machines**: sandboxes on your other hosts, over ssh, in the same CLI and dashboard.
+- **Multiple machines** <Experimental />: sandboxes on your other hosts, over ssh, in the same CLI and dashboard.
 
 It runs on docker, podman or Apple container, with docker's verbs: `run`, `exec`, `ps`, `logs`, `rm`.
 
@@ -45,7 +46,7 @@ A compose file and a `devcontainer.json` become one sandbox: the app's container
 
 It builds on the devcontainer standard rather than replacing it: images, [Features](/examples/features) and lifecycle commands work as they do in VS Code, so the community's existing setups carry over.
 
-## Other machines, over ssh
+## Other machines, over ssh <Experimental />
 
 `devsandbox machine add me@my-server` registers a host you reach over ssh; its sandboxes then show next to yours and the CLI finds their names. Your keys don't need to be there: with the machine's `agent` on, your ssh-agent is relayed to it while you use it. See [Other machines](/docs/host-daemon#other-machines).
 
