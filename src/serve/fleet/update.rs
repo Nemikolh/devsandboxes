@@ -162,9 +162,9 @@ impl Build {
 pub enum Decision {
     /// The same build: serve the link.
     Same,
-    /// The hub runs published `version`, this worker another build: fetch
-    /// and install it, then hand off (an older version too).
-    Download { version: String },
+    /// The hub runs published `build`, this worker another build: fetch
+    /// and install its release asset, then hand off (an older version too).
+    Download { build: Build },
     /// The hub runs a dev build this worker isn't, for this platform, and
     /// this worker takes dev builds: take the binary the hub pushes, install
     /// it, then hand off.
@@ -183,7 +183,7 @@ pub fn decide(ours: &Build, hub: &Build, our_platform: &str, hub_platform: &str,
     if ours == hub {
         Decision::Same
     } else if hub.published {
-        Decision::Download { version: hub.semver.clone() }
+        Decision::Download { build: hub.clone() }
     } else if hub_platform != our_platform {
         Decision::Stop(format!("dev build: can't run on {our_platform} (the hub runs {} for {hub_platform})", hub.label()))
     } else if !dev_builds {
@@ -241,8 +241,6 @@ pub fn asset_url(version: &str, target: &str) -> Result<String> {
 pub trait Steps: Send + Sync {
     /// Download `url` and unpack it into `into` (an empty dir): the binary.
     fn fetch(&self, url: &str, into: &Path) -> Result<PathBuf>;
-    /// The semver `binary --version` reports.
-    fn version(&self, binary: &Path) -> Result<String>;
     /// The build `binary fleet-hello` reports: its [`HELLO`].
     fn build(&self, binary: &Path) -> Result<String>;
     /// Where this daemon's binary is (what to install over).
@@ -254,21 +252,23 @@ pub trait Steps: Send + Sync {
     fn handoff(&self) -> Result<()>;
 }
 
-/// Install published `version` over this daemon's binary and hand off to
-/// it: fetch the asset for `os`/`arch` into a scratch dir under `scratch`,
-/// check that it reports `version`, install it at [`Steps::dest`], check the
-/// installed binary reports `version`, then [`Steps::handoff`]. The scratch
+/// Install the hub's published `hub` build over this daemon's binary and
+/// hand off to it: fetch its release asset for `os`/`arch` into a scratch
+/// dir under `scratch`, check that its `fleet-hello` is `hub` (semver, git
+/// and kind: a release asset that isn't the hub's exact build would be
+/// downloaded again at every link), install it at [`Steps::dest`], check
+/// the installed binary is `hub` too, then [`Steps::handoff`]. The scratch
 /// dir is removed whatever happens.
-pub fn update(steps: &dyn Steps, version: &str, os: &str, arch: &str, scratch: &Path) -> Result<()> {
+pub fn update(steps: &dyn Steps, hub: &Build, os: &str, arch: &str, scratch: &Path) -> Result<()> {
     let target = release_target(os, arch).with_context(|| format!("no devsandbox release is built for {os}/{arch}"))?;
-    let url = asset_url(version, target)?;
+    let url = asset_url(&hub.semver, target)?;
     let dir = scratch_dir(scratch)?;
     let installed = (|| {
         let binary = steps.fetch(&url, &dir).with_context(|| format!("cannot download {url}"))?;
-        check_version(steps, &binary, version, "the downloaded binary")?;
+        check_release(steps, &binary, hub, "the downloaded binary")?;
         let dest = steps.dest()?;
         steps.install(&binary, &dest)?;
-        check_version(steps, &dest, version, "the installed binary")
+        check_release(steps, &dest, hub, "the installed binary")
     })();
     let _ = std::fs::remove_dir_all(&dir);
     installed?;
@@ -301,10 +301,13 @@ fn check_build(steps: &dyn Steps, binary: &Path, want: &str, what: &str) -> Resu
     Ok(())
 }
 
-fn check_version(steps: &dyn Steps, binary: &Path, want: &str, what: &str) -> Result<()> {
-    let got = steps.version(binary).with_context(|| format!("{what} ({}) doesn't run", binary.display()))?;
-    if got != want {
-        bail!("{what} ({}) reports {got}, not {want}", binary.display());
+/// `binary`'s `fleet-hello` is the build `want` (its platform aside: the
+/// asset is this host's, the hub's may be another).
+fn check_release(steps: &dyn Steps, binary: &Path, want: &Build, what: &str) -> Result<()> {
+    let got = steps.build(binary).with_context(|| format!("{what} ({}) doesn't run", binary.display()))?;
+    let got = Build::parse(&got);
+    if got != *want {
+        bail!("{what} ({}) is devsandbox {}, not the hub's {}", binary.display(), got.label(), want.label());
     }
     Ok(())
 }
@@ -366,11 +369,6 @@ impl Steps for Release {
             bail!("the archive has no devsandbox binary");
         }
         Ok(binary)
-    }
-
-    fn version(&self, binary: &Path) -> Result<String> {
-        let out = run(&[binary.into(), "--version".into()])?;
-        install::version_of(&out).with_context(|| format!("`--version` said {:?}", out.trim()))
     }
 
     fn build(&self, binary: &Path) -> Result<String> {
@@ -488,13 +486,16 @@ pub(crate) mod tests {
         assert_eq!(d(&ours, &ours.clone()), Decision::Same);
         assert_eq!(decide(&ours, &ours.clone(), lx, mac, false), Decision::Same, "one release, many platforms");
         let newer = build("0.9.0", "bbbb", true);
-        assert_eq!(d(&ours, &newer), Decision::Download { version: "0.9.0".into() });
-        assert_eq!(decide(&ours, &newer, lx, mac, false), Decision::Download { version: "0.9.0".into() }, "each its asset");
+        assert_eq!(d(&ours, &newer), Decision::Download { build: newer.clone() });
+        assert_eq!(decide(&ours, &newer, lx, mac, false), Decision::Download { build: newer.clone() }, "each its asset");
         let older = build("0.7.0", "cccc", true);
-        assert_eq!(d(&ours, &older), Decision::Download { version: "0.7.0".into() }, "a downgrade too");
+        assert_eq!(d(&ours, &older), Decision::Download { build: older.clone() }, "a downgrade too");
         // A dev worker of a published hub takes the release, same semver or not.
         let dev = build("0.8.0", "dddd", false);
-        assert_eq!(d(&dev, &ours), Decision::Download { version: "0.8.0".into() });
+        assert_eq!(d(&dev, &ours), Decision::Download { build: ours.clone() });
+        // A published worker of a published hub of the same semver but another
+        // commit (a moved tag): that release, not a `Same`.
+        assert_eq!(d(&ours, &build("0.8.0", "ffff", true)), Decision::Download { build: build("0.8.0", "ffff", true) });
         assert_eq!(d(&dev, &dev.clone()), Decision::Same);
         assert_eq!(decide(&dev, &dev.clone(), lx, mac, false), Decision::Same);
     }
@@ -586,24 +587,18 @@ pub(crate) mod tests {
     }
 
     /// Steps that touch nothing but a scratch dir: what each one was asked,
-    /// what `version` reports per path, and a step to fail.
+    /// what `build` reports per path, and a step to fail.
     #[derive(Default)]
     pub(crate) struct Fake {
         pub calls: Mutex<Vec<String>>,
-        /// `--version` of the fetched binary and of the installed one.
-        pub fetched_version: String,
-        pub installed_version: String,
-        /// `fleet-hello` of a received binary and of the installed one.
+        /// `fleet-hello` of a received (or fetched) binary and of the
+        /// installed one.
         pub received_build: String,
         pub installed_build: String,
         pub fail: Option<&'static str>,
     }
 
     impl Fake {
-        pub(crate) fn reporting(version: &str) -> Fake {
-            Fake { fetched_version: version.into(), installed_version: version.into(), ..Fake::default() }
-        }
-
         pub(crate) fn building(hello: &str) -> Fake {
             Fake { received_build: hello.into(), installed_build: hello.into(), ..Fake::default() }
         }
@@ -627,11 +622,6 @@ pub(crate) mod tests {
             let binary = into.join("devsandbox");
             std::fs::write(&binary, "new").unwrap();
             Ok(binary)
-        }
-        fn version(&self, binary: &Path) -> Result<String> {
-            let installed = binary == Path::new("/dest/devsandbox");
-            self.step("version", if installed { "dest".into() } else { "fetched".into() })?;
-            Ok(if installed { self.installed_version.clone() } else { self.fetched_version.clone() })
         }
         fn build(&self, binary: &Path) -> Result<String> {
             let installed = binary == Path::new("/dest/devsandbox");
@@ -661,15 +651,23 @@ pub(crate) mod tests {
         std::fs::read_dir(dir).unwrap().next().is_none()
     }
 
+    /// The hub's published 0.7.0, and what its release asset for this
+    /// host's platform says.
+    fn hub() -> Build {
+        build("0.7.0", "aaaa", true)
+    }
+    const ASSET: &str = "0.7.0 aaaa published linux/x86_64";
+
     #[test]
     fn an_update_installs_checks_and_hands_off() {
         let dir = scratch("ok");
-        let fake = Fake::reporting("0.7.0");
-        update(&fake, "0.7.0", "linux", "x86_64", &dir).unwrap();
+        // The hub on another platform: the asset says this one.
+        let fake = Fake::building(ASSET);
+        update(&fake, &Build::parse("0.7.0 aaaa published macos/aarch64 hub k"), "linux", "x86_64", &dir).unwrap();
         let url = "https://github.com/Nemikolh/devsandboxes/releases/download/v0.7.0/devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz";
         assert_eq!(
             fake.calls(),
-            [format!("fetch {url}"), "version fetched".into(), "install /dest/devsandbox".into(), "version dest".into(), "handoff ".into()]
+            [format!("fetch {url}"), "build received".into(), "install /dest/devsandbox".into(), "build dest".into(), "handoff ".into()]
         );
         assert!(empty(&dir), "the scratch dir is gone");
         let _ = std::fs::remove_dir_all(&dir);
@@ -678,8 +676,8 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_download_installs_nothing() {
         let dir = scratch("fetch");
-        let fake = Fake { fail: Some("fetch"), ..Fake::reporting("0.7.0") };
-        let err = update(&fake, "0.7.0", "linux", "aarch64", &dir).unwrap_err();
+        let fake = Fake { fail: Some("fetch"), ..Fake::building(ASSET) };
+        let err = update(&fake, &hub(), "linux", "aarch64", &dir).unwrap_err();
         assert!(format!("{err:#}").starts_with("cannot download https://github.com/"), "{err:#}");
         assert!(format!("{err:#}").ends_with("fetch broke"), "{err:#}");
         assert_eq!(fake.calls().len(), 1);
@@ -688,21 +686,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_wrong_version_is_a_failure_and_no_handoff() {
+    fn a_wrong_build_is_a_failure_and_no_handoff() {
         let dir = scratch("version");
-        // The asset isn't what it says: never installed.
-        let fake = Fake { fetched_version: "0.6.9".into(), ..Fake::reporting("0.7.0") };
-        let err = update(&fake, "0.7.0", "linux", "x86_64", &dir).unwrap_err();
-        assert!(format!("{err:#}").contains("reports 0.6.9, not 0.7.0"), "{err:#}");
-        assert!(!fake.calls().iter().any(|c| c.starts_with("install")));
+        // The asset isn't the hub's build: never installed, whichever word differs.
+        for asset in ["0.6.9 aaaa published linux/x86_64", "0.7.0 bbbb published linux/x86_64", "0.7.0 aaaa dev linux/x86_64"] {
+            let fake = Fake::building(asset);
+            let err = format!("{:#}", update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err());
+            assert!(err.ends_with("not the hub's 0.7.0 (published, aaaa)"), "{err}");
+            assert!(err.starts_with("the downloaded binary ("), "{err}");
+            assert!(!fake.calls().iter().any(|c| c.starts_with("install")), "{asset}");
+        }
         // The installed binary isn't (dest resolved elsewhere): no handoff.
-        let fake = Fake { installed_version: "0.8.0".into(), ..Fake::reporting("0.7.0") };
-        let err = update(&fake, "0.7.0", "linux", "x86_64", &dir).unwrap_err();
-        assert!(format!("{err:#}").starts_with("the installed binary (/dest/devsandbox) reports 0.8.0, not 0.7.0"), "{err:#}");
+        let fake = Fake { installed_build: "0.8.0 cccc published linux/x86_64".into(), ..Fake::building(ASSET) };
+        let err = update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "the installed binary (/dest/devsandbox) is devsandbox 0.8.0 (published, cccc), not the hub's 0.7.0 (published, aaaa)"
+        );
         assert!(!fake.calls().iter().any(|c| c.starts_with("handoff")));
+        // One that doesn't run.
+        let fake = Fake { fail: Some("build"), ..Fake::building(ASSET) };
+        let err = format!("{:#}", update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err());
+        assert!(err.starts_with("the downloaded binary (") && err.ends_with("doesn't run: build broke"), "{err}");
         // A failed handoff says so.
-        let fake = Fake { fail: Some("handoff"), ..Fake::reporting("0.7.0") };
-        let err = update(&fake, "0.7.0", "linux", "x86_64", &dir).unwrap_err();
+        let fake = Fake { fail: Some("handoff"), ..Fake::building(ASSET) };
+        let err = update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err();
         assert_eq!(format!("{err:#}"), "cannot hand this daemon off to it: handoff broke");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -748,8 +756,8 @@ pub(crate) mod tests {
     #[test]
     fn no_release_no_fetch() {
         let dir = scratch("target");
-        let fake = Fake::reporting("0.7.0");
-        let err = update(&fake, "0.7.0", "macos", "x86_64", &dir).unwrap_err();
+        let fake = Fake::building(ASSET);
+        let err = update(&fake, &hub(), "macos", "x86_64", &dir).unwrap_err();
         assert_eq!(format!("{err:#}"), "no devsandbox release is built for macos/x86_64");
         assert!(fake.calls().is_empty());
         let _ = std::fs::remove_dir_all(&dir);

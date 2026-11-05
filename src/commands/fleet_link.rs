@@ -218,8 +218,8 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         let label = Build::parse(&theirs.hash).label();
         match follows(spec.hello, &theirs.hash, (opts.follow.dev_builds)()) {
             Decision::Same => {}
-            Decision::Download { version } => {
-                wanted = Some(version);
+            Decision::Download { build } => {
+                wanted = Some(build);
                 bail!("{peer}, the hub, runs devsandbox {label}: updating this one first");
             }
             Decision::Stop(why) => bail!("{why}"),
@@ -284,9 +284,9 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         installed.with_context(|| format!("update to {label} failed"))?;
         bail!("updated to devsandbox {label}, handing off: the link ends so {peer} redials it");
     }
-    if let Some(version) = wanted {
-        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-        update::update(steps, &version, os, arch, &std::env::temp_dir()).with_context(|| format!("update to {version} failed"))?;
+    if let Some(build) = wanted {
+        let (os, arch, version) = (std::env::consts::OS, std::env::consts::ARCH, &build.semver);
+        update::update(steps, &build, os, arch, &std::env::temp_dir()).with_context(|| format!("update to {version} failed"))?;
         bail!("updated to devsandbox {version}, handing off: the link ends so {peer} redials it");
     }
     if let Some(why) = refused.lock().unwrap().take() {
@@ -877,7 +877,7 @@ mod tests {
         let semver = env!("CARGO_PKG_VERSION");
         let platform = update::PLATFORM;
         let published = format!("9.9.9 abc published {platform} hub");
-        assert_eq!(follows(ours, &published, false), Decision::Download { version: "9.9.9".into() });
+        assert_eq!(follows(ours, &published, false), Decision::Download { build: Build::parse("9.9.9 abc published") });
         assert_eq!(follows(ours, update::hello_of(true, None), false), Decision::Same, "the same build");
         let dev = format!("{semver} zzz dev {platform} hub");
         assert_eq!(follows(ours, &dev, true), Decision::Receive);
@@ -900,7 +900,7 @@ mod tests {
         let hub: &'static str = Box::leak(format!("9.9.9 abc published {} hub", update::PLATFORM).into_boxed_str());
         let (k_member, l_id) = ids(&base);
         let dialer = fake_dialer(dialer_io, hub, l_id, base.join("nowhere"), Arc::default());
-        let fake = Arc::new(update::tests::Fake::reporting("9.9.9"));
+        let fake = Arc::new(update::tests::Fake::building(&format!("9.9.9 abc published {}", update::PLATFORM)));
         let err = peer_link(k_io, base.clone(), k_member, fake.clone()).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").starts_with("updated to devsandbox 9.9.9, handing off"), "{err:#}");
         assert!(fake.calls().first().is_some_and(|c| c.starts_with("fetch https://") && c.contains("v9.9.9")), "{:?}", fake.calls());

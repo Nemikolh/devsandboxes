@@ -460,16 +460,21 @@ limitation means editing this file in the same commit.
   end's on the dialer get the daemon's own); fix: capture a login env
   once at the daemon's start.
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
-- No build is marked published yet: the release workflow doesn't set
-  `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a member's
-  download path never runs; a member on another build than its hub takes
-  the hub's binary over the link only with `dev-builds = true` in
-  `member.toml` (or trust `full`) and the same OS/arch, else drops the
-  link (redialed, refused again). Dev builds from
+- A member's download of a published hub build has not yet run against
+  a release built with `DEVSANDBOX_PUBLISHED=1` (the first is the next
+  tag). The asset is checked only by being the hub's build
+  (`fleet-hello`), over HTTPS: no checksum or signature, and no overall
+  time limit (only a 30 s stall gives up). A member with no release
+  asset for its platform (an Intel Mac, a source build elsewhere) can't
+  follow a published hub: the update fails and the link is redialed and
+  fails again. A hub on a dev build (from source, `cargo install`
+  included) is followed only with `dev-builds = true` in `member.toml`
+  (or trust `full`) and the same OS/arch, else the link drops
+  (redialed, refused again). Dev builds from
   the same commit with different local changes count as the same build
   (the git hash has no dirty marker). A mixed-platform dev fleet is built
   per platform by hand.
-  → [fleet](architecture/daemon/fleet.md#versions); `build.rs` `stamp_build`, `fleet::update::decide`
+  → [fleet](architecture/daemon/fleet.md#versions); `build.rs` `stamp_build`, `fleet::update::decide`, `fleet::update::update`
 - A member waiting for its hub's binary gives up only when the transfer
   hasn't started within 60 s (`PUSH_WAIT`) or fails; one that started and
   stalls while the link stays up waits until the link ends.

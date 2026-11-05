@@ -225,7 +225,7 @@ impl Dialer {
             .with(channel::TRANSFER, transfers);
         let ours = (self.hello)();
         let spec = link::Spec { hello: ours, ..LINK };
-        let wanted: Mutex<Option<String>> = Mutex::new(None);
+        let wanted: Mutex<Option<Build>> = Mutex::new(None);
         let mut end_link = duplex.stream.try_clone().ok().map(follow::shutting);
         let auth = proof::Auth { identity, expect: name.to_string(), log: self.log };
         let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: None, auth: Some(auth) };
@@ -251,8 +251,8 @@ impl Dialer {
                 let label = Build::parse(&peer.hash).label();
                 match fleet_link::follows(ours, &peer.hash, (self.follow.dev_builds)()) {
                     Decision::Same => {}
-                    Decision::Download { version } => {
-                        *wanted.lock().unwrap() = Some(version);
+                    Decision::Download { build } => {
+                        *wanted.lock().unwrap() = Some(build);
                         return Err(format!("{name}, the hub, runs devsandbox {label}: updating this one"));
                     }
                     Decision::Stop(why) => return Err(why),
@@ -281,7 +281,7 @@ impl Dialer {
             return Ended::Follow(Following::Dev(want, end));
         }
         match wanted.into_inner().unwrap() {
-            Some(version) => Ended::Follow(Following::Published(version)),
+            Some(build) => Ended::Follow(Following::Published(build)),
             None => Ended::Link(end),
         }
     }
@@ -310,11 +310,12 @@ impl Dialer {
                 let _ = std::fs::remove_dir_all(&want.dir);
                 why
             }
-            Following::Published(version) => {
+            Following::Published(build) => {
+                let version = &build.semver;
                 (self.log)(&format!("machine {name}, the hub, runs devsandbox {version}: updating this one"));
                 held.note(format!("updating to {version}"));
                 let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-                match update::update(steps, &version, os, arch, &std::env::temp_dir()) {
+                match update::update(steps, &build, os, arch, &std::env::temp_dir()) {
                     Ok(()) => format!("updated to {version}: handing off"),
                     Err(e) => format!("update to {version} failed: {e:#}"),
                 }
@@ -335,8 +336,8 @@ enum Ended {
 enum Following {
     /// A dev build pushed (or not, by the link's end) over `TRANSFER`.
     Dev(follow::Want, link::End),
-    /// A published version to download.
-    Published(String),
+    /// The hub's published build, to download.
+    Published(Build),
 }
 
 /// Why the link ended, with ssh's stderr tail.
@@ -1261,7 +1262,7 @@ pub(crate) mod tests {
             });
             Ok(Duplex::socket(ours))
         });
-        let fake = Arc::new(update::tests::Fake::reporting("9.9.9"));
+        let fake = Arc::new(update::tests::Fake::building(&format!("9.9.9 abc published {}", update::PLATFORM)));
         let mut o = opts(1, 60_000);
         o.machines = Some(registry);
         o.member = Some(base.join("member.toml"));

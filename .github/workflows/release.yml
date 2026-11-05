@@ -93,6 +93,10 @@ jobs:
           RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
           DEVSANDBOX_DEVSBD_DIR: ${{ runner.temp }}/devsbd
           DEVSANDBOX_DEVSBD_REQUIRED: "1"
+          # Stamps the fleet `Hello` as `published` (build.rs `stamp_build`):
+          # these archives are the release assets a fleet member downloads to
+          # follow a hub on this version (`fleet::update::asset_url`).
+          DEVSANDBOX_PUBLISHED: "1"
       - name: Package
         shell: bash
         run: |

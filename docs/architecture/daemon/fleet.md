@@ -1467,8 +1467,12 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   --short=12 HEAD` of the source tree (`unknown` when git or the repo is
   missing; the build never fails for it), watched through `HEAD`, the
   ref it names and `packed-refs`; `DEVSANDBOX_BUILD_KIND` is `published`
-  when the build ran with `DEVSANDBOX_PUBLISHED=1` (meant for the release
-  workflow), else `dev`. `Build::parse` reads the first three words back
+  when the build ran with `DEVSANDBOX_PUBLISHED=1`, else `dev`. The
+  release workflow (`.github/workflows/release.yml`, its `build` job) sets
+  it for every release asset, so the GitHub archives and the npm platform
+  packages (staged from those archives) are `published`, all of one tag's
+  commit; a crates.io build (`cargo install`) is `dev`, its git hash
+  whatever repo encloses cargo's source dir (`unknown` in none). `Build::parse` reads the first three words back
   (a missing one is `unknown` / dev), `update::platform_of` the fourth
   (`unknown` without one): the platform isn't part of the build, one
   release being built for several; both ignore the rest.
@@ -1492,7 +1496,7 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   (`member::Member::takes_dev_builds`), read at each link's `Hello`s
   through `follow::Follow::dev_builds`): the same semver, git and kind
   is `Same`, and the link serves; another build that is published is
-  `Download { version }`; another dev build is `Receive` when the
+  `Download { build }`; another dev build is `Receive` when the
   platforms are equal and dev builds are taken, else `Stop(why)`:
   `dev build: can't run on <our os>/<arch> (the hub runs <hub build>
   for <its os>/<arch>)`, checked first since `dev-builds` can't help
@@ -1537,11 +1541,14 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   is fetched into a private scratch dir under the temp dir with curl
   (`curl_argv`: `--fail --location --proto =https --proto-redir =https
   --tlsv1.2`, a stall of 30 s gives up) and unpacked with `tar`. Its
-  `--version` must report `<v>` (`install::version_of`); it is installed
+  `fleet-hello` (`Steps::build`) must be the hub's build, semver, git and
+  kind (`update::check_release`, the platform aside), so the new daemon's
+  hello is `Same` and an asset that isn't the hub's build is never
+  installed (else every link would download it again); it is installed
   over `exe::devsandbox()` (refused while that path is gone) by
   `install::install_local`, `machines::install::INSTALL` run locally as
   `sh -c INSTALL sh <dest>` (temp file next to it, its own `--version`
-  check, rename); the installed binary must report `<v>` too. The
+  check, rename); the installed binary must be the hub's build too. The
   scratch dir is removed either way. Then the handoff, below.
 - **The forced handoff** (`Release::handoff`): a hello on the daemon's
   own socket with `force` (`client::hello_with`, `HelloParams::force`)

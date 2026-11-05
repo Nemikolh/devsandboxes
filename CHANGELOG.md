@@ -79,7 +79,7 @@ devsandbox machine trust full
 devsandbox machine roots add ~/sandboxes
 ```
 
-- **Members follow the hub's build.** A member runs its hub's exact version, downgrades included, so a fleet never mixes protocols. A hub on a dev build hands its binary to members that set `dev-builds = true` in `member.toml` (or trust `full`) on the same OS/arch.
+- **Members follow the hub's build.** A member runs its hub's exact version, downgrades included, so a fleet never mixes protocols. A hub on a released build has its members download that release's binary from GitHub (linux x86_64/arm64, macOS arm64). A hub on a dev build (built from source, `cargo install` included) hands its binary to members that set `dev-builds = true` in `member.toml` (or trust `full`) on the same OS/arch.
 
 - **`machine rm` takes a machine out of the fleet; `machine unlink` only drops the link.** `machine rm <name>` removes a member from the fleet (`machine rm <this host>` leaves it); the old behaviour, forgetting the link while it stays a member, is `machine unlink <name>`.
 
