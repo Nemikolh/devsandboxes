@@ -2,18 +2,20 @@
 //! *Moving code*; fleet step 3c1). The plan's `Transfer` seam, in its git +
 //! tar implementation:
 //!
-//! - **offer** ([`offer`], on the hub): what a sandbox needs on the worker:
-//!   its config root as a tar ([`tar`], content-hashed) and, for its
-//!   `folder` and each `folders` entry outside the root, one branch of the
-//!   folder's `origin` as a bundle from the hub's repo cache ([`repo`]).
-//!   Anything that can't move yet is [`Unprepared::NotMovable`]: the run
-//!   stays where it is.
+//! - **offer** ([`offer`], on the placing host): what a sandbox needs on
+//!   the worker: its config root as a tar ([`tar`], content-hashed) and,
+//!   for its `folder` and each `folders` entry outside the root, one branch
+//!   of the folder's own checkout ([`repo`]; no remote involved, fleet plan
+//!   decision 72). Anything that can't move is [`Unprepared::NotMovable`]:
+//!   the run stays where it is.
 //! - **haves** ([`Transfer::haves`]): what the worker has already under its
 //!   fleet root for this host, one `code.haves` ([`haves_of`]): the roots
 //!   unpacked there and the tips of its cache of each repo.
 //! - **send** ([`send`]): the tar unless the worker has it, then each
-//!   repo's bundle `--not` its tips (0 bytes when it has everything), one
-//!   `TRANSFER` each, through the worker's link ([`LinkTransfer`]).
+//!   repo's branch and, for the checked-out one, a fresh WIP snapshot
+//!   ([`wip`], decision 73) as a bundle from the checkout `--not` its tips
+//!   (0 bytes when it has everything), one `TRANSFER` each, through the
+//!   worker's link ([`LinkTransfer`]).
 //! - **receive** ([`receivers`], on the worker): `root-tar` unpacked into
 //!   `<fleet root>/roots/<hash>/`; `bundle` into the repo's cache
 //!   `<fleet root>/repos/<repo id>.git`, then a checkout below the root cut
@@ -65,8 +67,8 @@ pub const ROOT_SKIPS: [&str; 3] = [".worktrees", "shared-volumes", "shared-files
 /// Why a sandbox doesn't go to a worker.
 #[derive(Debug)]
 pub enum Unprepared {
-    /// It can't move yet (a folder with no `origin`, …): it runs where it
-    /// is; the reason is for the user.
+    /// It can't move (a folder that isn't a checkout, a detached `HEAD`,
+    /// …): it runs where it is; the reason is for the user.
     NotMovable(String),
     /// Moving it failed.
     Failed(anyhow::Error),
@@ -250,15 +252,17 @@ pub fn layout(root: &Path, folders: &[PathBuf]) -> Result<Layout, String> {
 /// One repo an [`Offer`] carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoOffer {
-    /// The folder on the hub.
+    /// The folder on this host: the checkout the bundle is made from.
     pub host: PathBuf,
     /// Where it lands below `roots/<hash>/`.
     pub at: PathBuf,
-    /// The hub's cache of its `origin`.
-    pub cache: PathBuf,
     /// The branch the bundle carries.
     pub branch: String,
-    /// The repo's identity (`repo::identity` of the branch): which of the
+    /// `branch` is the one checked out: [`send`] snapshots the working
+    /// tree over it. A requested other branch goes as it is committed.
+    pub wip: bool,
+    /// The repo's identity (`repo::identity` of the branch, or of the
+    /// devsandbox root of a repo with no commit yet): which of the
     /// worker's caches it goes into.
     pub id: String,
 }
@@ -286,14 +290,16 @@ pub struct Prepared {
     pub folders: Vec<(PathBuf, PathBuf, String)>,
 }
 
-/// What sandbox `sandbox` of `config_root` needs on a worker, its repos
-/// fetched into the hub's cache under `repos` (`<data>/devsandbox/repos`).
-/// `branch` (a `run --branch`) is the `folder`'s branch when its origin
-/// has it; else, and for `folders` entries, the checkout's current branch.
-/// `folders` entries inside the config root travel in its tar (their
-/// `.git` doesn't); one with a `${…}` variable doesn't move yet; nor does
-/// a sandbox with [`ties`].
-pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&str>) -> Result<Offer, Unprepared> {
+/// What sandbox `sandbox` of `config_root` needs on a worker, each repo
+/// from its own checkout here (decision 72). `branch` (a `run --branch`) is
+/// the `folder`'s branch when its checkout has it; else, and for `folders`
+/// entries, the checkout's current branch (it may have no commit yet: its
+/// identity is then that of the devsandbox root, `repo::ensure_root`, made
+/// here once); a detached `HEAD` doesn't move. `folders` entries inside the
+/// config root travel in its tar (their `.git` doesn't); one with a `${…}`
+/// variable doesn't move; nor does a sandbox with [`ties`]. Only reads the
+/// checkouts (and maybe makes that root): the snapshot is [`send`]'s.
+pub fn offer(config_root: &Path, sandbox: &str, branch: Option<&str>) -> Result<Offer, Unprepared> {
     let root = config_root.canonicalize().with_context(|| format!("config root {} does not exist", config_root.display()))?;
     let config = Config::load(&root)?;
     let resolved = config.resolve_sandbox(sandbox)?;
@@ -302,7 +308,7 @@ pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&st
     let resolve = |f: &str| root.join(f).canonicalize().with_context(|| format!("sandbox folder `{f}` does not exist"));
     let main = resolve(folder)?;
     if main.starts_with(&root) {
-        return not_movable(format!("its folder {} is in the config root (a root that's a repo moves in fleet step 12)", main.display()));
+        return not_movable(format!("its folder {} is in the config root (the config root travels as a tar, without `.git`)", main.display()));
     }
     let mut outside = vec![main];
     for entry in props.folders.iter().flat_map(|f| f.values()) {
@@ -324,28 +330,29 @@ pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&st
         let Some(checkout) = repo::probe(host)? else {
             return not_movable(format!("{} isn't a git checkout", host.display()));
         };
-        let Some(origin) = checkout.origin else {
-            return not_movable(format!("{} has no `origin` (only committed, pushed work moves for now)", host.display()));
-        };
-        let cache = repo::cache_dir(repos, &origin);
-        if let Err(e) = repo::fetch(&cache, &origin) {
-            return not_movable(format!("{}'s origin isn't reachable from here: {e:#}", host.display()));
-        }
-        let wanted: Vec<&str> = (if i == 0 { branch } else { None }).into_iter().chain(checkout.branch.as_deref()).collect();
-        let mut found = None;
-        for b in &wanted {
+        let ask = if i == 0 { branch } else { None };
+        if let Some(b) = ask {
             repo::check_branch(b)?;
-            if repo::has_branch(&cache, b)? {
-                found = Some(b.to_string());
-                break;
-            }
         }
-        let Some(branch) = found else {
-            let names = if wanted.is_empty() { "no branch (detached)".to_string() } else { wanted.join(" / ") };
-            return not_movable(format!("{}: {names} isn't on origin (push it first)", host.display()));
+        let requested = match ask {
+            Some(b) if checkout.branch.as_deref() != Some(b) && repo::has_branch(Repo::Checkout(host), b)? => Some(b.to_string()),
+            _ => None,
         };
-        let id = repo::identity(Repo::Bare(&cache), &format!("refs/heads/{branch}"))?;
-        repos_out.push(RepoOffer { host: host.clone(), at: at.clone(), cache, branch, id });
+        let offered = if let Some(b) = requested {
+            let id = repo::identity(Repo::Checkout(host), &format!("refs/heads/{b}"))?;
+            RepoOffer { host: host.clone(), at: at.clone(), branch: b, wip: false, id }
+        } else {
+            let Some(current) = checkout.branch else {
+                return not_movable(format!("{} has a detached HEAD (check out a branch first)", host.display()));
+            };
+            repo::check_branch(&current)?;
+            let id = match repo::ensure_root(host)? {
+                Some(_) => repo::identity(Repo::Checkout(host), repo::ROOT_REF)?,
+                None => repo::identity(Repo::Checkout(host), "HEAD")?,
+            };
+            RepoOffer { host: host.clone(), at: at.clone(), branch: current, wip: true, id }
+        };
+        repos_out.push(offered);
     }
     let tar = pack_root(&root, &layout.root)?;
     let hash = short_hash(&tar);
@@ -516,11 +523,8 @@ fn walk(dir: &Path, rel: &str, at: &str, w: &mut tar::Writer) -> Result<()> {
 
 /// Send `offer` through `t`: first its haves (one ask, every repo's
 /// identity), then the root's tar unless the worker has it, then each
-/// repo's branch as a bundle `--not` the worker's tips of that repo
-/// (written to a temp file in the cache's parent first; a body of 0 bytes
-/// when the worker has every commit), its header naming the repo and the
-/// branch's commit; where it all is on the worker whose fleet root is
-/// `worker_root`.
+/// repo as a bundle `--not` the worker's tips of that repo ([`send_repo`]);
+/// where it all is on the worker whose fleet root is `worker_root`.
 pub fn send(offer: &Offer, worker_root: &Path, t: &dyn Transfer) -> Result<Prepared> {
     let ids: Vec<String> = offer.repos.iter().map(|r| r.id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
     let haves = t.haves(&ids).context("cannot ask the worker what it has")?;
@@ -533,29 +537,63 @@ pub fn send(offer: &Offer, worker_root: &Path, t: &dyn Transfer) -> Result<Prepa
     let tree = worker_root.join("roots").join(&offer.hash);
     let mut folders = Vec::new();
     for r in &offer.repos {
-        let full = format!("refs/heads/{}", r.branch);
-        let commit = repo::commit_at(Repo::Bare(&r.cache), &full)?.with_context(|| format!("{} has no {full}", r.cache.display()))?;
-        let dir = r.cache.parent().context("a repo cache has a parent")?;
-        let file = TempFile(dir.join(format!(".bundle-{}-{}.part", std::process::id(), next_seq())));
         let tips = haves.tips.get(&r.id).map(Vec::as_slice).unwrap_or_default();
-        let new = repo::bundle_refs(Repo::Bare(&r.cache), &[&full], tips, &file.0)?;
-        let open = || std::fs::File::open(&file.0).with_context(|| format!("cannot read {}", file.0.display()));
-        let mut body: Box<dyn Read> = if new { Box::new(open()?) } else { Box::new(std::io::empty()) };
-        let (size, sha256) = if new { transfer::digest(open()?)? } else { transfer::digest(std::io::empty())? };
-        let to = r.at.to_str().context("a folder's name isn't UTF-8")?;
-        let header = Header {
-            kind: BUNDLE_KIND.into(),
-            name: "repo.bundle".into(),
-            size,
-            sha256,
-            to: Some(format!("{}/{to}", offer.hash)),
-            repo: Some(r.id.clone()),
-            refs: Some([(full, commit)].into()),
-        };
-        t.send(&header, &mut body).with_context(|| format!("cannot send {}", r.host.display()))?;
+        send_repo(r, &offer.hash, tips, t).with_context(|| format!("cannot send {}", r.host.display()))?;
         folders.push((r.host.clone(), tree.join(&r.at), r.branch.clone()));
     }
     Ok(Prepared { remote_root: tree.join(&offer.layout.root), folders })
+}
+
+/// One repo of an offer of root `hash`, bundled from its checkout `--not`
+/// `tips` (the worker's of that repo): its branch and, when it's the one
+/// checked out ([`RepoOffer::wip`]), a snapshot of the working tree
+/// ([`wip::snapshot`]) made just now on a transient
+/// `refs/devsandbox/wip/send-<nonce>` (`repo::TempRef`), deleted once the
+/// bundle is written (and on any error). A branch with no commit yet is
+/// bundled as its devsandbox root ([`repo::ROOT_REF`]), so the worker's
+/// `refs/heads/<branch>` is that empty commit with the snapshot over it.
+/// The bundle goes to a temp file in the checkout's git dir (never its
+/// working tree, where the user or a snapshot's `add -A` would see it; on
+/// the objects' disk), removed after the send; a body of 0 bytes when the
+/// worker has every commit. The header names the repo,
+/// `refs/heads/<branch>` at the base commit and, with a snapshot,
+/// `refs/devsandbox/wip/<branch>` at it.
+fn send_repo(r: &RepoOffer, hash: &str, tips: &[String], t: &dyn Transfer) -> Result<()> {
+    let full = format!("refs/heads/{}", r.branch);
+    let checkout = Repo::Checkout(&r.host);
+    let file = repo::TempPath::new(&checkout.git_dir()?, "bundle");
+    let mut refs = BTreeMap::new();
+    let new = if r.wip {
+        let temp = repo::TempRef::new(&r.host);
+        let snap = wip::snapshot(&r.host, &temp.name)?;
+        if snap.branch.as_deref() != Some(r.branch.as_str()) {
+            bail!("{} isn't on {} any more", r.host.display(), r.branch);
+        }
+        let base_ref = if repo::has_branch(checkout, &r.branch)? { full.as_str() } else { repo::ROOT_REF };
+        refs.insert(full.clone(), snap.base);
+        refs.insert(repo::wip_ref(&r.branch), snap.wip);
+        let new = repo::bundle_refs(checkout, &[base_ref, &temp.name], tips, &file.0)?;
+        drop(temp); // the ref is gone before anything is sent
+        new
+    } else {
+        let commit = repo::commit_at(checkout, &full)?.with_context(|| format!("no {full}"))?;
+        refs.insert(full.clone(), commit);
+        repo::bundle_refs(checkout, &[&full], tips, &file.0)?
+    };
+    let open = || std::fs::File::open(&file.0).with_context(|| format!("cannot read {}", file.0.display()));
+    let mut body: Box<dyn Read> = if new { Box::new(open()?) } else { Box::new(std::io::empty()) };
+    let (size, sha256) = if new { transfer::digest(open()?)? } else { transfer::digest(std::io::empty())? };
+    let to = r.at.to_str().context("a folder's name isn't UTF-8")?;
+    let header = Header {
+        kind: BUNDLE_KIND.into(),
+        name: "repo.bundle".into(),
+        size,
+        sha256,
+        to: Some(format!("{hash}/{to}")),
+        repo: Some(r.id.clone()),
+        refs: Some(refs),
+    };
+    t.send(&header, &mut body)
 }
 
 /// `code.haves {repos}` from a peer whose fleet root here is `fleet_root`
@@ -654,37 +692,16 @@ fn is_hash(s: &str) -> bool {
 }
 
 /// Put sandbox `sandbox` of `config_root` on the worker whose fleet root is
-/// `worker_root`, through `t` ([`offer`], then [`send`]); `repos` is the
-/// hub's repo cache dir. The `run` verb's step before it runs there.
-pub fn prepare(
-    t: &dyn Transfer,
-    repos: &Path,
-    worker_root: &Path,
-    config_root: &Path,
-    sandbox: &str,
-    branch: Option<&str>,
-) -> Result<Prepared, Unprepared> {
-    let offer = offer(repos, config_root, sandbox, branch)?;
+/// `worker_root`, through `t` ([`offer`], then [`send`]). The `run` verb's
+/// step before it runs there.
+pub fn prepare(t: &dyn Transfer, worker_root: &Path, config_root: &Path, sandbox: &str, branch: Option<&str>) -> Result<Prepared, Unprepared> {
+    let offer = offer(config_root, sandbox, branch)?;
     Ok(send(&offer, worker_root, t)?)
-}
-
-/// `<data>/devsandbox/repos`, the hub's repo caches.
-pub fn repos_dir() -> Result<PathBuf> {
-    Ok(crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?.join("repos"))
 }
 
 fn next_seq() -> u32 {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
-}
-
-/// A file removed on drop.
-struct TempFile(PathBuf);
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// The worker's receivers for code, into fleet root `fleet_root`, added to
@@ -820,7 +837,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::repo::tests::{git, origin_and_checkout, scratch};
+    use super::repo::tests::{git, repo_with_branches, scratch};
     use super::*;
     use crate::serve::endpoint;
 
@@ -847,10 +864,10 @@ mod tests {
     }
 
     /// `<dir>/cfg` (the config root, sandbox `web` with `folder = "../web"`,
-    /// plus what must not travel) and `<dir>/web`, a checkout of
-    /// `<dir>/origin.git`.
+    /// plus what must not travel) and `<dir>/web`, a checkout with no
+    /// remote on `main` with a local `feature` ([`repo_with_branches`]).
     fn fixture(dir: &Path) -> PathBuf {
-        origin_and_checkout(dir, "web");
+        repo_with_branches(dir, "web");
         let cfg = dir.join("cfg");
         for d in ["dockerfiles", ".worktrees/web-2", "shared-volumes/h", "shared-files/x", ".git/objects", "features/f/.git"] {
             std::fs::create_dir_all(cfg.join(d)).unwrap();
@@ -1016,25 +1033,26 @@ mod tests {
     fn what_cant_move_says_why() {
         let dir = scratch("not-movable");
         let cfg = fixture(&dir);
-        let repos = dir.join("repos");
-        let why = |toml: &str| {
+        let why = |toml: &str, branch: Option<&str>| {
             std::fs::write(cfg.join("devsandboxes.toml"), toml).unwrap();
-            match offer(&repos, &cfg, "web", None) {
+            match offer(&cfg, "web", branch) {
                 Err(Unprepared::NotMovable(why)) => why,
                 other => panic!("{other:?}"),
             }
         };
         std::fs::create_dir_all(dir.join("plain")).unwrap();
-        assert!(why("[sandbox.web]\nfolder = \"../plain\"\nimage = \"i\"\n").contains("isn't a git checkout"));
-        std::fs::create_dir_all(dir.join("local")).unwrap();
-        git(&dir.join("local"), &["init", "-q"]);
-        assert!(why("[sandbox.web]\nfolder = \"../local\"\nimage = \"i\"\n").contains("has no `origin`"));
-        git(&dir.join("local"), &["remote", "add", "origin", dir.join("gone.git").to_str().unwrap()]);
-        assert!(why("[sandbox.web]\nfolder = \"../local\"\nimage = \"i\"\n").contains("origin isn't reachable"));
-        assert!(why("[sandbox.web]\nfolder = \"dockerfiles\"\nimage = \"i\"\n").contains("is in the config root"));
-        git(&dir.join("web"), &["checkout", "-q", "-b", "local-only"]);
-        assert!(why("[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\n").contains("local-only isn't on origin"));
-        assert!(why("[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\nfolders = { \"/w/x\" = \"../${localEnv:X}\" }\n")
+        assert!(why("[sandbox.web]\nfolder = \"../plain\"\nimage = \"i\"\n", None).contains("isn't a git checkout"));
+        let inside = why("[sandbox.web]\nfolder = \"dockerfiles\"\nimage = \"i\"\n", None);
+        assert!(inside.contains("is in the config root (the config root travels as a tar"), "{inside}");
+        let web = "[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\n";
+        git(&dir.join("web"), &["checkout", "-q", "--detach"]);
+        assert!(why(web, None).contains("web has a detached HEAD (check out a branch first)"));
+        assert!(why(web, Some("nope")).contains("detached HEAD"), "a missing branch falls back to the current one");
+        // A detached checkout's requested, existing branch moves as committed.
+        let got = offer(&cfg, "web", Some("feature")).unwrap();
+        assert_eq!((got.repos[0].branch.as_str(), got.repos[0].wip), ("feature", false));
+        git(&dir.join("web"), &["checkout", "-q", "main"]);
+        assert!(why("[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\nfolders = { \"/w/x\" = \"../${localEnv:X}\" }\n", None)
             .contains("uses a variable"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1117,7 +1135,7 @@ mod tests {
         let cfg = fixture(&dir);
         std::fs::write(cfg.join("devsandboxes.toml"), "[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\nprivileged = true\ncaches = [\"npm\"]\n")
             .unwrap();
-        match offer(&dir.join("repos"), &cfg, "web", None) {
+        match offer(&cfg, "web", None) {
             Err(Unprepared::NotMovable(why)) => assert_eq!(why, "`caches`, privileged"),
             other => panic!("{other:?}"),
         }
@@ -1192,6 +1210,31 @@ mod tests {
         socket
     }
 
+    /// What sending must leave alone in a source checkout: its index file
+    /// (hashed), status, what `HEAD` names, the branch tips, the stash and
+    /// devsandbox's refs.
+    fn source_state(repo: &Path) -> Vec<String> {
+        vec![
+            std::fs::read(repo.join(".git/index")).map(|b| short_hash(&b)).unwrap_or_default(),
+            git(repo, &["status", "--porcelain=v1", "-uall"]),
+            git(repo, &["symbolic-ref", "HEAD"]),
+            git(repo, &["for-each-ref", "refs/heads"]),
+            git(repo, &["stash", "list"]),
+            git(repo, &["for-each-ref", "refs/devsandbox"]),
+        ]
+    }
+
+    /// No transient ref and no temp file of a send left in `repo`.
+    fn assert_no_leftovers(repo: &Path) {
+        assert!(!git(repo, &["for-each-ref", "--format=%(refname)", "refs/devsandbox"]).contains("/wip/send-"));
+        let temps: Vec<_> = std::fs::read_dir(repo.join(".git"))
+            .unwrap()
+            .filter_map(|e| e.unwrap().file_name().into_string().ok())
+            .filter(|n| n.starts_with("devsandbox-"))
+            .collect();
+        assert_eq!(temps, Vec::<String>::new());
+    }
+
     #[test]
     fn prepare_moves_a_sandbox_onto_a_worker_over_its_link() {
         let dir = scratch("prepare");
@@ -1201,60 +1244,157 @@ mod tests {
             "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\nfolders = { \"/workspaces/lib\" = \"../lib\", \"/workspaces/cfg\" = \".\" }\n",
         )
         .unwrap();
-        // `../lib`: a second repo, same origin, on `feature`.
-        git(&dir, &["clone", "-q", "-b", "feature", dir.join("origin.git").to_str().unwrap(), "lib"]);
+        // `../lib`: a second repo, on `feature`; `../web` has uncommitted work on `main`.
+        let (web, lib) = (dir.join("web"), repo_with_branches(&dir, "lib"));
+        git(&lib, &["checkout", "-q", "feature"]);
+        std::fs::write(web.join("README"), "dirty\n").unwrap();
+        let before = (source_state(&web), source_state(&lib));
         let fleet = dir.join("worker/fleet/hub");
         let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
-        let repos = dir.join("hub-data/repos");
 
-        let got = prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
+        // `feature` isn't checked out in `web`: it moves as committed, no WIP.
+        let got = prepare(&t, &fleet, &cfg, "web", Some("feature")).unwrap();
         let tree = got.remote_root.parent().unwrap().to_path_buf();
         assert_eq!(got.remote_root, tree.join("cfg"));
         assert_eq!(tree.parent().unwrap(), fleet.join("roots"));
-        assert_eq!(
-            got.folders,
-            [(dir.join("web"), tree.join("web"), "feature".to_string()), (dir.join("lib"), tree.join("lib"), "feature".to_string())]
-        );
+        assert_eq!(got.folders, [(web.clone(), tree.join("web"), "feature".to_string()), (lib.clone(), tree.join("lib"), "feature".to_string())]);
         // `folder = "../web"` resolves from the moved root to the moved checkout.
         let moved = got.remote_root.join("../web").canonicalize().unwrap();
         assert_eq!(moved, tree.join("web").canonicalize().unwrap());
         assert_eq!(std::fs::read_to_string(moved.join("F")).unwrap(), "feature\n");
+        assert_eq!(std::fs::read_to_string(moved.join("README")).unwrap(), "main\n");
         assert_eq!(git(&moved, &["symbolic-ref", "--short", "HEAD"]), "feature");
+        assert_eq!(git(&moved, &["status", "--porcelain=v1", "-uall"]), "");
+        assert_eq!(git(&moved, &["remote"]), "");
         assert!(got.remote_root.join("dockerfiles/web.Dockerfile").exists());
         assert!(!got.remote_root.join(".worktrees").exists() && !got.remote_root.join(".git").exists());
-        // The hub's cache: one bare repo for the one origin.
-        let caches: Vec<_> = std::fs::read_dir(&repos).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-        assert_eq!(caches.len(), 1, "{caches:?}");
-        assert!(caches[0].ends_with(".git"));
 
-        // No `--branch`: the hub checkout's own (`main`); same root, kept.
-        let again = prepare(&t, &repos, &fleet, &cfg, "web", None).unwrap();
+        // No `--branch`: the checkout's own (`main`); same root, kept; the
+        // existing checkout gets `main` moved, not checked out.
+        let again = prepare(&t, &fleet, &cfg, "web", None).unwrap();
         assert_eq!(again.remote_root, got.remote_root);
         assert_eq!(again.folders[0].2, "main");
-        assert_eq!(git(&moved, &["rev-parse", "main"]), git(&dir.join("origin.git"), &["rev-parse", "main"]));
-        // A requested branch origin lacks: the checkout's own.
-        assert_eq!(prepare(&t, &repos, &fleet, &cfg, "web", Some("new-one")).unwrap().folders[0].2, "main");
+        assert_eq!(git(&moved, &["rev-parse", "main"]), git(&web, &["rev-parse", "main"]));
+        assert_eq!(git(&moved, &["symbolic-ref", "--short", "HEAD"]), "feature");
+        // A requested branch the checkout lacks: its own, which a new branch starts at.
+        let new = prepare(&t, &fleet, &cfg, "web", Some("new-one")).unwrap();
+        assert_eq!(new.folders[0].2, "main");
+        let ask = crate::serve::fleet::placed::Ask { branch: Some("new-one"), base: None };
+        assert_eq!(crate::serve::fleet::placed::start_point(&ask, &new).as_deref(), Some("main"));
+        assert_eq!((source_state(&web), source_state(&lib)), before, "the sources are untouched");
+        assert_no_leftovers(&web);
+        assert_no_leftovers(&lib);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkout_moves_with_its_unpushed_and_uncommitted_work() {
+        let dir = scratch("prepare-wip");
+        let cfg = fixture(&dir);
+        let web = dir.join("web");
+        // A local-only branch with a commit no remote has (there is none).
+        git(&web, &["checkout", "-q", "-b", "local-only"]);
+        for (f, body) in [("keep", "k\n"), ("edit", "e\n"), ("gone", "g\n"), ("staged", "s\n"), (".gitignore", "*.log\n")] {
+            std::fs::write(web.join(f), body).unwrap();
+        }
+        git(&web, &["add", "-A"]);
+        git(&web, &["commit", "-q", "-m", "local"]);
+        // A stash, then work: modified, deleted, staged, untracked, ignored.
+        std::fs::write(web.join("keep"), "stashed\n").unwrap();
+        git(&web, &["stash", "-q"]);
+        std::fs::write(web.join("edit"), "e2\n").unwrap();
+        std::fs::remove_file(web.join("gone")).unwrap();
+        std::fs::write(web.join("staged"), "s2\n").unwrap();
+        git(&web, &["add", "staged"]);
+        std::fs::create_dir_all(web.join("sub")).unwrap();
+        std::fs::write(web.join("sub/new"), "n\n").unwrap();
+        std::fs::write(web.join("x.log"), "ignored\n").unwrap();
+        assert_eq!(git(&web, &["remote"]), "", "no origin");
+        let before = source_state(&web);
+        let fleet = dir.join("worker/fleet/hub");
+        let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
+
+        let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
+        let moved = got.folders[0].1.clone();
+        assert_eq!(got.folders[0].2, "local-only");
+        assert_eq!(git(&moved, &["symbolic-ref", "--short", "HEAD"]), "local-only");
+        assert_eq!(git(&moved, &["rev-parse", "HEAD"]), git(&web, &["rev-parse", "local-only"]));
+        assert_eq!(git(&moved, &["status", "--porcelain=v1", "-uall"]), "M edit\n D gone\n M staged\n?? sub/new");
+        for f in ["keep", "edit", "staged", "sub/new", ".gitignore"] {
+            assert_eq!(std::fs::read(web.join(f)).unwrap(), std::fs::read(moved.join(f)).unwrap(), "{f}");
+        }
+        assert!(!moved.join("gone").exists() && !moved.join("x.log").exists(), "deleted stays deleted, ignored doesn't travel");
+        assert_eq!(git(&moved, &["for-each-ref", "refs/devsandbox"]), "");
+        assert_eq!(source_state(&web), before, "the source is untouched");
+        assert_no_leftovers(&web);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unborn_repo_moves_its_untracked_files() {
+        let dir = scratch("prepare-unborn");
+        let cfg = fixture(&dir);
+        let web = dir.join("fresh");
+        std::fs::create_dir_all(web.join("sub")).unwrap();
+        git(&web, &["init", "-q", "-b", "main"]);
+        std::fs::write(web.join("a"), "a\n").unwrap();
+        std::fs::write(web.join("sub/b"), "b\n").unwrap();
+        std::fs::write(cfg.join("devsandboxes.toml"), "[sandbox.web]\nfolder = \"../fresh\"\nimage = \"img\"\n").unwrap();
+        let fleet = dir.join("worker/fleet/hub");
+        let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
+
+        let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
+        let moved = got.folders[0].1.clone();
+        let root = git(&web, &["rev-parse", repo::ROOT_REF]);
+        assert_eq!(git(&web, &["for-each-ref", "--format=%(refname)", "refs/devsandbox"]), repo::ROOT_REF, "the one ref kept");
+        assert_eq!(git(&web, &["status", "--porcelain=v1", "-uall"]), "?? a\n?? sub/b", "still unborn");
+        assert_eq!(git(&web, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(git(&moved, &["rev-parse", "HEAD"]), root, "the worker's main is the devsandbox root");
+        assert_eq!(git(&moved, &["status", "--porcelain=v1", "-uall"]), "?? a\n?? sub/b");
+        assert_eq!(std::fs::read_to_string(moved.join("sub/b")).unwrap(), "b\n");
+        // Again: the same root, made once.
+        prepare(&t, &fleet, &cfg, "web", None).unwrap();
+        assert_eq!(git(&web, &["rev-parse", repo::ROOT_REF]), root);
+        assert_no_leftovers(&web);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_refused_transfer_fails_prepare() {
-        struct Refuse(Mutex<Vec<String>>);
+        /// Refuses every send of a kind in its list.
+        struct Refuse(&'static [&'static str], Mutex<Vec<String>>);
         impl Transfer for Refuse {
             fn send(&self, header: &Header, body: &mut dyn Read) -> Result<()> {
                 std::io::copy(body, &mut std::io::sink())?;
-                self.0.lock().unwrap().push(header.kind.clone());
-                bail!("transfer refused: full")
+                self.1.lock().unwrap().push(header.kind.clone());
+                if self.0.contains(&header.kind.as_str()) {
+                    bail!("transfer refused: full")
+                }
+                Ok(())
             }
         }
         let dir = scratch("refused");
         let cfg = fixture(&dir);
-        let t = Refuse(Mutex::default());
-        match prepare(&t, &dir.join("repos"), &dir.join("fleet"), &cfg, "web", None) {
+        let web = dir.join("web");
+        std::fs::write(web.join("README"), "dirty\n").unwrap();
+        let before = source_state(&web);
+        let t = Refuse(&[ROOT_TAR_KIND], Mutex::default());
+        match prepare(&t, &dir.join("fleet"), &cfg, "web", None) {
             Err(Unprepared::Failed(e)) => assert!(format!("{e:#}").contains("cannot send the config root: transfer refused: full")),
             other => panic!("{other:?}"),
         }
-        assert_eq!(*t.0.lock().unwrap(), ["root-tar"]);
+        assert_eq!(*t.1.lock().unwrap(), ["root-tar"]);
+        // The bundle refused: the snapshot's ref and the bundle are gone all the same.
+        let t = Refuse(&[BUNDLE_KIND], Mutex::default());
+        match prepare(&t, &dir.join("fleet"), &cfg, "web", None) {
+            Err(Unprepared::Failed(e)) => {
+                assert!(format!("{e:#}").contains(&format!("cannot send {}: transfer refused: full", web.display())), "{e:#}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(*t.1.lock().unwrap(), ["root-tar", "bundle"]);
+        assert_eq!(source_state(&web), before);
+        assert_no_leftovers(&web);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1284,45 +1424,58 @@ mod tests {
     fn repeat_sends_carry_only_what_the_worker_lacks() {
         let dir = scratch("repeat");
         let cfg = fixture(&dir);
+        let web = dir.join("web");
+        // Some bulk, so a delta is visibly smaller than the first send.
+        let bulk: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(web.join("bulk"), bulk).unwrap();
+        git(&web, &["add", "bulk"]);
+        git(&web, &["commit", "-q", "-m", "bulk"]);
         let fleet = dir.join("worker/fleet/hub");
         let link = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
         let t = Recorded { inner: &link, sent: Mutex::default() };
-        let repos = dir.join("hub-data/repos");
-        let origin = dir.join("origin.git");
-        let id = repo::identity(Repo::Bare(&origin), "refs/heads/main").unwrap();
+        let id = repo::identity(Repo::Checkout(&web), "HEAD").unwrap();
         // Nothing there yet: no roots, no tips.
         assert_eq!(link.haves(std::slice::from_ref(&id)).unwrap(), Haves::default());
 
-        let got = prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
+        let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
         let first = t.take();
         assert_eq!(first.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["root-tar", "bundle"]);
         let checkout = got.folders[0].1.clone();
-        assert_eq!(git(&checkout, &["symbolic-ref", "--short", "HEAD"]), "feature");
+        assert_eq!(git(&checkout, &["symbolic-ref", "--short", "HEAD"]), "main");
         assert_eq!(git(&checkout, &["remote"]), "", "no remote on the worker");
         let cache = cache_path(&fleet, &id);
-        assert_eq!(git(&cache, &["rev-parse", "refs/heads/feature"]), git(&origin, &["rev-parse", "feature"]));
+        let main = git(&web, &["rev-parse", "main"]);
+        assert_eq!(git(&cache, &["rev-parse", "refs/heads/main"]), main);
+        assert_eq!(git(&cache, &["rev-parse", &format!("{}^", repo::wip_ref("main"))]), main, "the snapshot sits on main");
         // The worker answers its root and the cache's tips, over the link.
         let haves = link.haves(std::slice::from_ref(&id)).unwrap();
         let hash = got.remote_root.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string();
         assert_eq!(haves.roots, [hash].into());
-        assert_eq!(haves.tips[&id], [git(&origin, &["rev-parse", "feature"])]);
+        assert!(haves.tips[&id].contains(&main), "{haves:?}");
 
-        // A new commit on origin: only the bundle goes, and only the delta.
-        let seed = dir.join("seed");
-        std::fs::write(seed.join("F"), "feature 2\n").unwrap();
-        git(&seed, &["commit", "-q", "-am", "two"]);
-        git(&seed, &["push", "-q", origin.to_str().unwrap(), "feature"]);
-        prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
+        // A new commit, then new uncommitted work: only the bundle goes,
+        // only the delta; the existing checkout fast-forwards and keeps its
+        // working tree (the new snapshot reaches the cache only).
+        std::fs::write(web.join("README"), "two\n").unwrap();
+        git(&web, &["commit", "-q", "-am", "two"]);
+        std::fs::write(web.join("later"), "wip\n").unwrap();
+        prepare(&t, &fleet, &cfg, "web", None).unwrap();
         let second = t.take();
         assert_eq!(second.len(), 1, "the root isn't sent again: {second:?}");
         assert!(second[0].1 > 0 && second[0].1 < first[1].1, "a delta: {second:?} after {first:?}");
-        assert_eq!(std::fs::read_to_string(checkout.join("F")).unwrap(), "feature 2\n", "fast-forwarded");
+        assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "two\n", "fast-forwarded");
+        assert!(!checkout.join("later").exists(), "no WIP applied to an existing checkout");
+        let wip = git(&cache, &["rev-parse", &repo::wip_ref("main")]);
+        assert_eq!(git(&cache, &["show", &format!("{wip}:later")]), "wip");
 
-        // Nothing new: an empty bundle, still answered `ok`.
-        prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
+        // A committed branch the worker has: an empty bundle, still answered `ok`.
+        prepare(&t, &fleet, &cfg, "web", Some("feature")).unwrap();
+        t.take();
+        prepare(&t, &fleet, &cfg, "web", Some("feature")).unwrap();
         assert_eq!(t.take(), [("bundle".to_string(), 0)]);
-        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), git(&origin, &["rev-parse", "feature"]));
+        assert_eq!(git(&checkout, &["rev-parse", "feature"]), git(&web, &["rev-parse", "feature"]));
         assert_eq!(std::fs::read_dir(fleet.join("roots/.in")).unwrap().count(), 0, "no body left behind");
+        assert_no_leftovers(&web);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

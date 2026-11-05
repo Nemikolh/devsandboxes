@@ -6,7 +6,6 @@
 //! snapshot's tree put back into a checkout as uncommitted changes. All
 //! through `host_git` (docs/decisions/0003-host-git-never-runs-repo-controlled-code.md),
 //! every child bounded as [`super::repo`]'s are.
-#![cfg_attr(not(test), allow(dead_code))] // callers in fleet steps 12c and 12e
 
 use std::path::Path;
 

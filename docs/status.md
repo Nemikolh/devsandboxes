@@ -510,27 +510,32 @@ limitation means editing this file in the same commit.
   Moving the
   code runs before the forward and isn't cancelled by a hang-up or Ctrl-C
   meanwhile (the run, once forwarded, is). A new `--branch` starts at the
-  hub checkout's branch tip, not `origin/HEAD` as on the hub; a `--base`
-  or `worktree-base` naming an `origin/…` ref fails on the worker (its
-  checkout has no `origin`).
+  source checkout's branch tip, not `origin/HEAD` as run in place; a
+  `--base` or `worktree-base` naming an `origin/…` ref fails on the
+  worker (its checkout has no remote).
   → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::start_point`
-- A placed `run` moves committed, pushed work
-  only: one branch of each folder's `origin`, fetched by the hub; a
-  folder with no `origin`, an unreachable one, a branch origin lacks, a
-  `folder` inside the config root (a root that's a repo), a `folders`
-  entry with a `${…}` variable or outside the root but not a checkout
-  doesn't move. `folders` entries inside the root travel in its tar
-  without their `.git`. The root's tar skips `.git`, `.worktrees`,
-  `shared-volumes` and `shared-files` but not git-ignored files, and a
-  symlink pointing out of the root refuses it. A repeat send carries only
-  what the worker lacks (`code.haves`: a root it has isn't sent again, a
-  bundle goes `--not` its cache's tips), but a first send goes whole.
-  The hub's repo cache is keyed by origin URL (not by root commits); it
-  and the worker's cache per repo under its fleet root are never pruned,
-  a worker's moved checkout keeps the branch it first checked out
-  (later bundles update other branches' refs), and `roots/<hash>/` trees
-  are never removed.
-  → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::repo::land_from`
+- A placed `run` moves each folder's committed and uncommitted work
+  from its checkout on the placing host, no remote needed: the branch
+  and a snapshot of the working tree (untracked files included, ignored
+  ones not, nor the `.worktreeinclude` ones a worktree wants), or a
+  requested branch that isn't checked out as committed. A detached
+  `HEAD`, a `folder` inside the config root (the root travels as a tar
+  without `.git`), a `folders` entry with a `${…}` variable or outside
+  the root but not a checkout doesn't move. `folders` entries inside the
+  root travel in its tar without their `.git`. The root's tar skips
+  `.git`, `.worktrees`, `shared-volumes` and `shared-files` but not
+  git-ignored files, and a symlink pointing out of the root refuses it.
+  The snapshot lands only in a checkout the transfer creates on the
+  worker; a later send updates an existing one's branches (fast-forwards
+  the checked-out one) and applies no snapshot to it. A repeat send
+  carries only what the worker lacks (`code.haves`: a root it has isn't
+  sent again, a bundle goes `--not` its cache's tips), but a first send
+  goes whole over the link. A repo with no commit yet gets
+  `refs/devsandbox/root` once and keeps it. The worker's cache per repo
+  under its fleet root is never pruned, a worker's moved checkout keeps
+  the branch it first checked out, and `roots/<hash>/` trees are never
+  removed.
+  → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::send`, `fleet::code::repo::land_from`
 - What ties a sandbox to its host (a bind outside the config root and its
   moved folders, `${localEnv:…}`, `caches`, `privileged`, …) keeps it
   home whatever a worker's trust or `member.toml` allowances: nothing

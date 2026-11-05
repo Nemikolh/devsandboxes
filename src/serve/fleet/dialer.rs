@@ -873,7 +873,7 @@ pub(crate) mod tests {
     #[test]
     fn a_run_is_placed_on_an_inbound_machine() {
         use crate::serve::capacity::Capacity;
-        use crate::serve::fleet::code::repo::tests::{git, origin_and_checkout};
+        use crate::serve::fleet::code::repo::tests::{git, repo_with_branches};
         const G: u64 = 1 << 30;
 
         let (l_runner, l_verbs) =
@@ -882,7 +882,7 @@ pub(crate) mod tests {
         let path = std::env::var("PATH").unwrap_or_default();
         let src = scratch("dial-place-src");
         std::fs::create_dir_all(&src).unwrap();
-        origin_and_checkout(&src, "web");
+        repo_with_branches(&src, "web");
         let cfg = src.join("cfg");
         std::fs::create_dir_all(cfg.join("dockerfiles")).unwrap();
         std::fs::write(cfg.join(crate::config::CONFIG_FILE), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n").unwrap();
@@ -896,7 +896,6 @@ pub(crate) mod tests {
                 let hub = crate::serve::fleet::member::Member { hub: "self".into(), ..Default::default() };
                 crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);
                 k.verbs = Some(k_runner);
-                k.repos = Some(src.join("k-repos"));
             },
             |l| {
                 l.verbs = Some(l_runner);
@@ -944,7 +943,7 @@ pub(crate) mod tests {
     #[test]
     fn a_members_run_is_placed_by_the_hub() {
         use crate::serve::capacity::{Capacity, Caps};
-        use crate::serve::fleet::code::repo::tests::{git, origin_and_checkout};
+        use crate::serve::fleet::code::repo::tests::{git, repo_with_branches};
         use crate::serve::fleet::member::{Member, write_for_test};
         const G: u64 = 1 << 30;
 
@@ -954,7 +953,7 @@ pub(crate) mod tests {
         let path = std::env::var("PATH").unwrap_or_default();
         let src = scratch("dial-hub-place-src");
         std::fs::create_dir_all(&src).unwrap();
-        origin_and_checkout(&src, "web");
+        repo_with_branches(&src, "web");
         let cfg = src.join("cfg");
         std::fs::create_dir_all(cfg.join("dockerfiles")).unwrap();
         std::fs::write(cfg.join(crate::config::CONFIG_FILE), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n").unwrap();
@@ -983,7 +982,6 @@ pub(crate) mod tests {
             |l| {
                 write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: "box".into(), ..Default::default() });
                 l.verbs = Some(l_runner);
-                l.repos = Some(src.join("l-repos"));
                 l.local_capacity = Some(Arc::new(move || busy.clone()));
             },
         );
@@ -1979,7 +1977,7 @@ pub(crate) mod tests {
     #[test]
     fn a_members_run_is_placed_on_a_routed_machine() {
         use crate::serve::capacity::{Capacity, Caps};
-        use crate::serve::fleet::code::repo::tests::{git, origin_and_checkout};
+        use crate::serve::fleet::code::repo::tests::{git, repo_with_branches};
         const G: u64 = 1 << 30;
         let (b_runner, b_verbs) =
             crate::serve::verbs::tests::script_runner("route-place-b", r#"echo "b $*"; cat "$3/dockerfiles/web.Dockerfile" "$3/../web/F""#);
@@ -1987,7 +1985,7 @@ pub(crate) mod tests {
         let path = std::env::var("PATH").unwrap_or_default();
         let src = scratch("route-place-src");
         std::fs::create_dir_all(&src).unwrap();
-        origin_and_checkout(&src, "web");
+        repo_with_branches(&src, "web");
         let cfg = src.join("cfg");
         std::fs::create_dir_all(cfg.join("dockerfiles")).unwrap();
         std::fs::write(cfg.join(crate::config::CONFIG_FILE), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n").unwrap();
@@ -2004,10 +2002,8 @@ pub(crate) mod tests {
         };
         let busy = capacity(4, 3, Some(Caps { instances: Some(1), ..Caps::default() }));
         let roomy = capacity(28, 0, None);
-        let repos = src.join("a-repos");
         let trio = Trio::build("route-place", false, Some("box"), |a, k, b| {
             a.verbs = Some(a_runner);
-            a.repos = Some(repos);
             let (busy_a, busy_k) = (busy.clone(), busy.clone());
             a.local_capacity = Some(Arc::new(move || busy_a.clone()));
             k.local_capacity = Some(Arc::new(move || busy_k.clone()));

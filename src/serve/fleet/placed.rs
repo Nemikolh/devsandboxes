@@ -345,11 +345,11 @@ pub fn by_hub(
     moved(ask, &name, a.lines, prepare)
 }
 
-/// The worker's `--base`: the user's, else, for a `--branch` its origin
-/// doesn't have (a new branch), the branch the bundle carried (the hub
-/// checkout's own, `code::offer`), so the new branch starts at that tip.
-/// The moved checkout has no `origin` to start one from, and its `HEAD`
-/// is whichever branch first landed there.
+/// The worker's `--base`: the user's, else, for a `--branch` the source
+/// checkout doesn't have (a new branch), the branch the bundle carried
+/// (the source checkout's current one, `code::offer`), so the new branch
+/// starts at that tip. The moved checkout has no remote to start one
+/// from, and its `HEAD` is whichever branch first landed there.
 pub fn start_point(ask: &Ask, prepared: &Prepared) -> Option<String> {
     if let Some(base) = ask.base {
         return Some(base.to_string());
@@ -657,10 +657,10 @@ mod tests {
         assert_eq!(*asked.borrow(), ["lap"]);
 
         // A sandbox that can't move: here, with the note.
-        let not_movable = |_: &str| Err(Unprepared::NotMovable("/w/web has no `origin`".into()));
+        let not_movable = |_: &str| Err(Unprepared::NotMovable("/w/web has a detached HEAD".into()));
         assert_eq!(
             decide(&ask, &s, &busy_here(), not_movable),
-            Placed::LocalWithNote("note: not placed on lap: /w/web has no `origin`; running here".into())
+            Placed::LocalWithNote("note: not placed on lap: /w/web has a detached HEAD; running here".into())
         );
         // A move that fails: the verb fails, nowhere else.
         let failed = |_: &str| Err(Unprepared::Failed(anyhow::anyhow!("transfer refused: full")));
@@ -769,10 +769,10 @@ mod tests {
             Placed::LocalWithNote("note: the hub `box` didn't place it (fleet.place: denied): running here".into())
         );
         // A sandbox that can't move to the hub's pick: here, as on the hub.
-        let not_movable = |_: &str| Err(Unprepared::NotMovable("/w/web has no `origin`".into()));
+        let not_movable = |_: &str| Err(Unprepared::NotMovable("/w/web has a detached HEAD".into()));
         assert_eq!(
             by_hub(&ask, "box", answer(PlaceOn::Hub, "box"), &reach, not_movable),
-            Placed::LocalWithNote("note: not placed on box: /w/web has no `origin`; running here".into())
+            Placed::LocalWithNote("note: not placed on box: /w/web has a detached HEAD; running here".into())
         );
         assert_eq!(*asked.borrow(), ["box", "srv"]);
     }

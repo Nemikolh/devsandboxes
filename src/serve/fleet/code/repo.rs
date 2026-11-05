@@ -1,10 +1,10 @@
 //! A sandbox folder's repo moved as a git bundle (docs/architecture/daemon/fleet.md,
-//! *Moving code*; fleet plan decision 12): the hub fetches the folder's
-//! `origin` into its own bare repo cache with its own credentials and
-//! bundles one branch from there, `--not` what the worker has; the worker
-//! takes the bundle into its own cache for that repo ([`unbundle`],
-//! [`set_refs`]) and cuts a checkout with no remote from it
-//! ([`land_from`]), never needing credentials. All git runs through
+//! *Moving code*; fleet plan decision 72): the placing host bundles one
+//! branch (and its WIP snapshot) straight from the folder's own checkout,
+//! `--not` what the worker has, no remote involved; the worker takes the
+//! bundle into its own cache for that repo ([`unbundle`], [`set_refs`])
+//! and cuts a checkout with no remote from it ([`land_from`]), never
+//! needing credentials. All git runs through
 //! `commands::run`'s `host_git` family
 //! (docs/decisions/0003-host-git-never-runs-repo-controlled-code.md):
 //! hooks and fsmonitor off, the repo's config checked first. Every git child
@@ -22,64 +22,56 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 
 use crate::commands::run::{host_git, host_git_bare, host_git_new};
 use crate::runtime::bounded;
 
-/// What a checkout on the hub says: its `origin` URL and its branch (`None`
-/// detached).
+/// What a checkout on the placing host says: the branch `HEAD` names
+/// (`None` detached; it may have no commit yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout {
-    pub origin: Option<String>,
     pub branch: Option<String>,
 }
 
-/// `folder`'s origin and current branch. A folder that isn't a checkout's
-/// root (no `.git` in it) is `None`.
+/// `folder`'s current branch. A folder that isn't a checkout's root (no
+/// `.git` in it) is `None`.
 pub fn probe(folder: &Path) -> Result<Option<Checkout>> {
     if folder.join(".git").symlink_metadata().is_err() {
         return Ok(None);
     }
-    let origin = optional(host_git(folder)?.args(["remote", "get-url", "origin"]))?;
     let branch = optional(host_git(folder)?.args(["symbolic-ref", "-q", "--short", "HEAD"]))?;
-    Ok(Some(Checkout { origin, branch }))
+    Ok(Some(Checkout { branch }))
 }
 
-/// The cache of `origin` in `repos` (`<data>/devsandbox/repos`): a bare
-/// repo named by a hash of the URL, `<sha256 prefix>.git`. (Repo identity
-/// by root commits, which needs no URL, is fleet step 12.)
-pub fn cache_dir(repos: &Path, origin: &str) -> PathBuf {
-    let hash: String = Sha256::digest(origin.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
-    repos.join(format!("{hash}.git"))
-}
-
-/// Make `cache` (bare) if it isn't there and fetch every branch of `origin`
-/// into it (`+refs/heads/*:refs/heads/*`, pruned, no tags). The hub's own
-/// credentials, no prompt; `ext::` transports off.
-pub fn fetch(cache: &Path, origin: &str) -> Result<()> {
-    if origin.starts_with('-') {
-        bail!("origin `{origin}` isn't a URL");
-    }
-    if !cache.join("HEAD").exists() {
-        std::fs::create_dir_all(cache).with_context(|| format!("cannot create {}", cache.display()))?;
-        run(host_git_new(cache)?.args(["init", "-q", "--bare"]), QUICK)?;
-    }
-    run(
-        host_git_bare(cache)?
-            .args(["-c", "protocol.ext.allow=never", "fetch", "-q", "--no-tags", "--prune", "--"])
-            .arg(origin)
-            .arg("+refs/heads/*:refs/heads/*"),
-        WHOLE,
-    )
-    .with_context(|| format!("cannot fetch {origin}"))?;
-    Ok(())
-}
-
-/// `branch` is in `cache`.
-pub fn has_branch(cache: &Path, branch: &str) -> Result<bool> {
+/// `refs/heads/<branch>` names a commit in `repo`.
+pub fn has_branch(repo: Repo, branch: &str) -> Result<bool> {
     check_branch(branch)?;
-    Ok(commit_at(Repo::Bare(cache), &format!("refs/heads/{branch}"))?.is_some())
+    Ok(commit_at(repo, &format!("refs/heads/{branch}"))?.is_some())
+}
+
+/// A ref devsandbox made in a user's checkout for one send (a snapshot's
+/// transient ref), deleted on drop, errors included: the user's repo keeps
+/// none of them (decision 73).
+pub(super) struct TempRef<'a> {
+    checkout: &'a Path,
+    pub(super) name: String,
+}
+
+impl<'a> TempRef<'a> {
+    /// A fresh name under `refs/devsandbox/wip/send-` in `checkout`; the
+    /// ref itself is the caller's to make.
+    pub(super) fn new(checkout: &'a Path) -> Self {
+        TempRef { checkout, name: format!("refs/devsandbox/wip/send-{}", nonce()) }
+    }
+}
+
+impl Drop for TempRef<'_> {
+    fn drop(&mut self) {
+        // A missing ref (the snapshot failed before making it) is fine.
+        if let Ok(mut cmd) = host_git(self.checkout) {
+            let _ = run(cmd.args(["update-ref", "-d", &self.name]), QUICK);
+        }
+    }
 }
 
 /// A branch name as devsandbox moves it: plain characters
@@ -267,7 +259,6 @@ pub fn identity(repo: Repo, rev: &str) -> Result<String> {
 /// [`IDENTITY`], the time and a nonce in its message, so two empty repos
 /// never share an identity; the snapshot starts there. `None` when `HEAD`
 /// has a commit (the history is its own root).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn ensure_root(checkout: &Path) -> Result<Option<String>> {
     if head_commit(checkout)?.is_some() {
         return Ok(None);
@@ -501,42 +492,34 @@ pub(crate) mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// A bare "origin" at `<dir>/origin.git` with `main` (one file) and
-    /// `feature`, and the hub's checkout of it at `<dir>/<name>` on `main`.
-    pub fn origin_and_checkout(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
-        let origin = dir.join("origin.git");
-        std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "-q", "--bare"]);
-        let seed = dir.join("seed");
-        std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init", "-q", "-b", "main"]);
-        std::fs::write(seed.join("README"), "main\n").unwrap();
-        git(&seed, &["add", "README"]);
-        git(&seed, &["commit", "-q", "-m", "main"]);
-        git(&seed, &["checkout", "-q", "-b", "feature"]);
-        std::fs::write(seed.join("F"), "feature\n").unwrap();
-        git(&seed, &["add", "F"]);
-        git(&seed, &["commit", "-q", "-m", "feature"]);
-        git(&seed, &["push", "-q", origin.to_str().unwrap(), "main", "feature"]);
-        let checkout = dir.join(name);
-        git(dir, &["clone", "-q", "-b", "main", origin.to_str().unwrap(), name]);
-        (origin, checkout)
+    /// A repo at `<dir>/<name>` with `main` (`README`) and a local
+    /// `feature` (`F` on top), no remote, checked out on `main`.
+    pub fn repo_with_branches(dir: &Path, name: &str) -> PathBuf {
+        let at = dir.join(name);
+        std::fs::create_dir_all(&at).unwrap();
+        git(&at, &["init", "-q", "-b", "main"]);
+        std::fs::write(at.join("README"), "main\n").unwrap();
+        git(&at, &["add", "README"]);
+        git(&at, &["commit", "-q", "-m", "main"]);
+        git(&at, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(at.join("F"), "feature\n").unwrap();
+        git(&at, &["add", "F"]);
+        git(&at, &["commit", "-q", "-m", "feature"]);
+        git(&at, &["checkout", "-q", "main"]);
+        at
     }
 
     #[test]
-    fn a_branch_goes_from_origin_through_the_cache_into_a_new_checkout() {
+    fn a_branch_goes_from_a_checkout_through_the_cache_into_a_new_checkout() {
         let dir = scratch("bundle");
-        let (origin, checkout) = origin_and_checkout(&dir, "web");
-        let probed = probe(&checkout).unwrap().unwrap();
-        assert_eq!(probed, Checkout { origin: Some(origin.to_str().unwrap().into()), branch: Some("main".into()) });
+        let src = repo_with_branches(&dir, "web");
+        assert_eq!(probe(&src).unwrap(), Some(Checkout { branch: Some("main".into()) }));
         assert_eq!(probe(&dir).unwrap(), None, "not a checkout");
-
-        let cache = cache_dir(&dir.join("repos"), probed.origin.as_deref().unwrap());
-        assert!(cache.file_name().unwrap().to_str().unwrap().ends_with(".git"));
-        fetch(&cache, probed.origin.as_deref().unwrap()).unwrap();
-        fetch(&cache, probed.origin.as_deref().unwrap()).unwrap();
-        assert!(has_branch(&cache, "feature").unwrap());
-        assert!(!has_branch(&cache, "nope").unwrap());
+        assert!(has_branch(Repo::Checkout(&src), "feature").unwrap());
+        assert!(!has_branch(Repo::Checkout(&src), "nope").unwrap());
+        git(&src, &["checkout", "-q", "--detach"]);
+        assert_eq!(probe(&src).unwrap(), Some(Checkout { branch: None }), "detached");
+        git(&src, &["checkout", "-q", "main"]);
 
         // The worker's cache, and a checkout cut from it.
         let worker = dir.join("worker/c.git");
@@ -546,10 +529,10 @@ pub(crate) mod tests {
         let send = |branch: &str, name: &str| {
             let full = format!("refs/heads/{branch}");
             let file = dir.join(name);
-            if bundle_refs(Repo::Bare(&cache), &[&full], &tips(Repo::Bare(&worker)).unwrap(), &file).unwrap() {
+            if bundle_refs(Repo::Checkout(&src), &[&full], &tips(Repo::Bare(&worker)).unwrap(), &file).unwrap() {
                 unbundle(&worker, &file).unwrap();
             }
-            let id = commit_at(Repo::Bare(&cache), &full).unwrap().unwrap();
+            let id = commit_at(Repo::Checkout(&src), &full).unwrap().unwrap();
             set_refs(&worker, &[(full, id)].into()).unwrap();
         };
         send("feature", "f.bundle");
@@ -560,12 +543,10 @@ pub(crate) mod tests {
         assert_eq!(git(&at, &["remote"]), "", "no remote on the worker");
         assert_eq!(git(&at, &["status", "--porcelain"]), "");
 
-        // Again, after a new commit on origin: the checked-out branch fast-forwards.
-        let seed = dir.join("seed");
-        std::fs::write(seed.join("F"), "feature 2\n").unwrap();
-        git(&seed, &["commit", "-q", "-am", "two"]);
-        git(&seed, &["push", "-q", origin.to_str().unwrap(), "feature"]);
-        fetch(&cache, origin.to_str().unwrap()).unwrap();
+        // Again, after a new commit: the checked-out branch fast-forwards.
+        git(&src, &["checkout", "-q", "feature"]);
+        std::fs::write(src.join("F"), "feature 2\n").unwrap();
+        git(&src, &["commit", "-q", "-am", "two"]);
         send("feature", "f2.bundle");
         land_from(&worker, &at, "feature", None).unwrap();
         assert_eq!(std::fs::read_to_string(at.join("F")).unwrap(), "feature 2\n");
@@ -575,7 +556,23 @@ pub(crate) mod tests {
         assert!(!dir.join("m.bundle").exists());
         land_from(&worker, &at, "main", None).unwrap();
         assert_eq!(git(&at, &["symbolic-ref", "--short", "HEAD"]), "feature");
-        assert_eq!(git(&at, &["rev-parse", "main"]), git(&origin, &["rev-parse", "main"]));
+        assert_eq!(git(&at, &["rev-parse", "main"]), git(&src, &["rev-parse", "main"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_temp_ref_is_gone_once_dropped() {
+        let dir = scratch("temp-ref");
+        let src = repo_with_branches(&dir, "web");
+        {
+            let r = TempRef::new(&src);
+            crate::serve::fleet::code::wip::check_wip_ref(&r.name).unwrap();
+            git(&src, &["update-ref", &r.name, "HEAD"]);
+            assert_eq!(git(&src, &["for-each-ref", "--format=%(refname)", "refs/devsandbox"]), r.name);
+        }
+        assert_eq!(git(&src, &["for-each-ref", "refs/devsandbox"]), "");
+        // Never made: dropping it is quiet.
+        drop(TempRef::new(&src));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

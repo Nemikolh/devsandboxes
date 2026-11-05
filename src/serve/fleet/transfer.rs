@@ -236,14 +236,19 @@ pub fn send(mut stream: impl Read + Write + HalfClose, header: &Header, body: im
 }
 
 /// One answer line into `line`, a byte at a time (it's short, and the body
-/// may follow it), at most `REPLY_MAX` bytes.
+/// may follow it), at most `REPLY_MAX` bytes. An `EINTR` is read again: a
+/// socket read with a timeout fails with it even under `SA_RESTART`
+/// (signal(7)) whenever a handler runs, and the wait for a landing's
+/// answer is long.
 fn read_reply(stream: &mut impl Read, line: &mut Vec<u8>) -> io::Result<()> {
     let mut byte = [0u8];
     while (line.len() as u64) < REPLY_MAX && !line.ends_with(b"\n") {
-        if stream.read(&mut byte)? == 0 {
-            break;
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
-        line.push(byte[0]);
     }
     Ok(())
 }

@@ -174,10 +174,10 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/serve/fleet/code/mod.rs` (`Transfer`, `LinkTransfer`, `Haves`,
 `offer`, `Offer`, `send`, `prepare`, `Prepared`, `Unprepared`, `layout`,
 `pack_root`, `receivers`, `haves_call`, `haves_of`, `cache_path`,
-`repos_dir`), `src/serve/fleet/code/tar.rs`
+`RepoOffer`, `send_repo`), `src/serve/fleet/code/tar.rs`
 (`Writer`, `read`, `extract`, `check_path`, `check_link`),
-`src/serve/fleet/code/repo.rs` (`probe`, `cache_dir`, `fetch`,
-`has_branch`, `unbundle`, `set_refs`, `land_from`, `check_branch`); peer links:
+`src/serve/fleet/code/repo.rs` (`probe`, `has_branch`, `TempRef`,
+`unbundle`, `set_refs`, `land_from`, `check_branch`); peer links:
 `src/commands/fleet_link.rs` (`fleet_link_peer`, `run_peer`,
 `PeerOptions`, `Announce`, `REANNOUNCE`, `attach_stream`),
 `src/serve/fleet/dialer.rs` (`Dialer`, `Dialer::hold`, `link_args`,
@@ -228,8 +228,7 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `spec`, `candidates`, `Ask`, `decide`, `Placed`, `start_point`, `lines`,
 `forwarded`, `tag_answer`, `Tagged`), `src/serve/daemon.rs`
 (`placed_run`, `fresh_capacities`, `fleet_root_on`, `remote_verb`,
-`Shared::capacity`, `Shared::own`, `Options::local_capacity`,
-`Options::repos`), `src/serve/verbs.rs` (`RunParams::place`),
+`Shared::capacity`, `Shared::own`, `Options::local_capacity`), `src/serve/verbs.rs` (`RunParams::place`),
 `src/serve/verbs_client.rs` (`run_target`, `Streaming`),
 `src/serve/machines/cli.rs` (`plan`); versions:
 `src/serve/fleet/update.rs` (`HELLO`, `hello_of`, `hello_for`, `is_hub`,
@@ -709,9 +708,10 @@ to `fleet-<peer>.sock` for `TRANSFER` (`link::connect`) and calls
 
 A sandbox goes to the machine it's placed on (the worker) as its config
 root and its folders' repos, so the worker runs the config as the hub
-has it (dockerfiles, local features) on a checkout of the branch (fleet
-plan decision 12: the hub reaches `origin` with its own credentials; a
-worker never needs any). It sits behind one seam, `serve::fleet::code`'s
+has it (dockerfiles, local features) on a checkout of the branch with
+the work not yet committed (fleet plan decision 72: straight from the
+folder's own checkout on the placing host, the one whose config it is,
+never from a remote; a worker never needs credentials). It sits behind one seam, `serve::fleet::code`'s
 `Transfer` (`haves`, `send`; `offer` builds what goes, `receivers` takes
 it), so a sync layer can replace the git + tar implementation;
 `LinkTransfer` asks `haves` as one `code.haves` on a fresh `API` stream
@@ -721,28 +721,32 @@ route socket; hello within `HAVES_HELLO_WAIT`, the answer within
 its writes bounded by `SEND_WRITE_WAIT` and the wait for the answer by
 `ANSWER_WAIT` (the worker lands the body before it answers, each git
 step bounded by `repo::WHOLE`).
-`prepare(transfer, repos, worker root, config root, sandbox, branch)` is
+`prepare(transfer, worker root, config root, sandbox, branch)` is
 `offer` then `send`, answering `Prepared` (the config root on the
 worker, `remote_root`, and each moved folder with its branch) or
 `Unprepared`: `NotMovable(why)` (it runs where it is, the why for the
 user) or `Failed`. The placed `run` calls it
 ([In the `run` verb](#in-the-run-verb)).
 
-**Offer** (`offer`, on the hub). The sandbox resolves from the config
-root (canonical) as `run` resolves it. Its `folder` and every `folders`
-entry outside the root must each be a checkout's root (`repo::probe`: a
-`.git` there) with an `origin`; a `folders` entry inside the root
-travels in its tar instead (its `.git` doesn't), one with a `${…}`
-variable doesn't move, nor does a `folder` in the root. Each origin is
-fetched (`repo::fetch`: every branch, `+refs/heads/*:refs/heads/*`,
-pruned, no tags, `protocol.ext.allow=never`) into the hub's repo cache,
-`<data>/devsandbox/repos/<sha256(url) prefix>.git` (bare, made by `git
-init --bare`; `repo::cache_dir`, `repos_dir`). The branch is the
-requested one (`run --branch`, for `folder` only) when origin has it,
-else the checkout's current branch when origin has it; neither is
-`NotMovable` (push it first), as is an origin the fetch can't reach.
-A sandbox with ties (below) is `NotMovable` before any fetch, its ties
-the why.
+**Offer** (`offer`, on the placing host). The sandbox resolves from the
+config root (canonical) as `run` resolves it. Its `folder` and every
+`folders` entry outside the root must each be a checkout's root
+(`repo::probe`: a `.git` there; no remote needed); a `folders` entry
+inside the root travels in its tar instead (its `.git` doesn't), one
+with a `${…}` variable doesn't move, nor does a `folder` in the root
+(fleet plan decision 74). A sandbox with ties (below) is `NotMovable`
+before any repo is read, its ties the why. The branch (`RepoOffer`) is
+the requested one (`run --branch`, for `folder` only) when the checkout
+has `refs/heads/<branch>` (`repo::has_branch`) and it isn't the one
+checked out: it goes as committed, no WIP. Else it's the checkout's
+current branch (what `HEAD` names, maybe with no commit yet), with the
+working tree's snapshot (`RepoOffer::wip`); a detached `HEAD` is
+`NotMovable` (check out a branch first). Its identity
+(`RepoOffer::id`) is `repo::identity` of the branch, or, for a branch
+with no commit, of the devsandbox root `repo::ensure_root` makes there
+once (`refs/devsandbox/root`, the one ref devsandbox leaves in a user's
+repo). The offer only reads the checkouts; the snapshot is made by
+`send`.
 
 **Ties** (`ties`, `ties_of`; fleet plan decision 40). What keeps a
 sandbox on its host, known from the merged config before anything
@@ -796,14 +800,24 @@ hashes unpacked under `roots/` (real dirs named as one, sorted, at most
 `repo::tips`. The daemon answers it on a peer's connection only, about
 that peer's fleet root (`lent::Peer::fleet_root`), under either trust.
 
-**Send** (`send`). Each repo's identity is `repo::identity` of its
-branch in the hub's cache (`RepoOffer::id`); one `haves` asks about them
-all. The tar goes unless `roots` lists its hash. Then per repo
-`repo::bundle_refs` of `refs/heads/<branch>` from the cache `--not` the
-worker's tips of that repo (a temp file next to the cache), sent as
-`bundle` with `to` = `<hash>/<folder's offset>`, `repo` its identity and
-`refs` the branch's commit; when the worker has every commit the body is
-0 bytes. A refusal is the receiver's why (`Failed`).
+**Send** (`send`, `send_repo`). One `haves` asks about every repo's
+identity. The tar goes unless `roots` lists its hash. Then per repo,
+from its checkout: for the checked-out branch a fresh `wip::snapshot`
+onto a transient `refs/devsandbox/wip/send-<nonce>` (`repo::TempRef`,
+deleted once the bundle is written and on any error, so the user's repo
+keeps none), then `repo::bundle_refs` of the branch (or
+`refs/devsandbox/root` for one with no commit) and that ref, `--not` the
+worker's tips of that repo; a requested other branch is bundled alone.
+The bundle is a temp file in the checkout's git dir (`repo::TempPath`:
+never in its working tree, on the objects' disk), removed after the
+send. It goes as `bundle` with `to` = `<hash>/<folder's offset>`,
+`repo` its identity and `refs` `refs/heads/<branch>` at the base commit
+plus, with a snapshot, `refs/devsandbox/wip/<branch>` at it (for a
+branch with no commit the worker's `refs/heads/<branch>` is the
+devsandbox root, the snapshot over it); when the worker has every
+commit the body is 0 bytes. Ignored files don't travel. The user's
+index, working tree, `HEAD`, branches and stash don't change. A refusal
+is the receiver's why (`Failed`).
 
 **Receive** (`receivers`, on the worker, into the hub's fleet root
 there). Bodies wait in `roots/.in/`.
@@ -1138,8 +1152,7 @@ destination the same way), so a placed run needs no ssh of its own. A
   path (`daemon::fleet_root_on` over `Handle::open_member`,
   `placed::fleet_root`; none, or no answer within `CAPACITY_WAIT`, is a
   `NotMovable`), the transfer its `LinkTransfer` (`route::connect`:
-  `fleet-<name>.sock`, else `route-<name>.sock`), the repo cache
-  `Options::repos` (default `code::repos_dir`), the config root the
+  `fleet-<name>.sock`, else `route-<name>.sock`), the config root the
   request's, the branch its `branch`. `NotMovable(why)` runs it here with
   `note: not placed on <worker>: <why>; running here` first in the
   output; `Failed` is the verb's `failed` error (`cannot place on
@@ -1154,17 +1167,17 @@ destination the same way), so a placed run needs no ssh of its own. A
   answer carry `machine` (`placed::Tagged`, `placed::tag_answer`), so the
   CLI prints `<worker>/<instance>`, cancels there on Ctrl-C, and the
   dashboard's status line names it so.
-- **A new branch** (`placed::start_point`): a `--branch` origin doesn't
-  have was bundled as the hub checkout's own branch (`code::offer`), and
-  the moved checkout has no `origin` for `run` to start a branch from
-  (`worktree_start_point` falls back to `HEAD`, whichever branch first
-  landed there). So without the user's `--base` the worker gets
-  `--base <the bundled branch>`: the new branch starts at the hub
-  checkout's branch tip, where on the hub it would start at
-  `origin/HEAD`.
+- **A new branch** (`placed::start_point`): a `--branch` the source
+  checkout doesn't have was bundled as its current branch
+  (`code::offer`), and the moved checkout has no remote for `run` to
+  start a branch from (`worktree_start_point` falls back to `HEAD`,
+  whichever branch first landed there). So without the user's `--base`
+  the worker gets `--base <the bundled branch>`: the new branch starts
+  at the source checkout's branch tip, where run in place it would
+  start at `origin/HEAD` when there is one.
 
 The moving runs on the request's connection thread before the forward
-(a fetch of each origin, the transfers), so a hang-up meanwhile is only
+(the snapshots, the transfers), so a hang-up meanwhile is only
 seen once the forward starts. Placement starts from this host's config:
 with `--place` the CLI resolves the sandbox among this host's only
 (`verbs_client::run_target`) and refuses a qualified one, and `--place`

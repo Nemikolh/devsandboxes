@@ -155,9 +155,6 @@ pub struct Options {
     /// read it; `None` is `capacity::HostCapacity` (the runtime's cached
     /// `info`, `HostFacts`, the poll's running count). Tests inject one.
     pub local_capacity: Option<LocalCapacity>,
-    /// The hub's repo caches a placed `run` fetches into; `None` is
-    /// `fleet::code::repos_dir`. Tests point it at a scratch dir.
-    pub repos: Option<PathBuf>,
     /// The agent a machine's `AGENT` streams reach while this host grants
     /// it agent ([`agent_for`]); `None` is `bridge::host_agent`. Tests inject one.
     pub host_agent: Option<HostAgent>,
@@ -198,7 +195,6 @@ impl Options {
             update_steps: None,
             peer_env: None,
             local_capacity: None,
-            repos: None,
             host_agent: None,
             agent_probe: fleet::agent::PROBE,
             pty_exec: None,
@@ -294,7 +290,6 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     shared.home = opts.home.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     shared.socket_dir = dir.to_path_buf();
     shared.local_capacity = opts.local_capacity.clone();
-    shared.repos = opts.repos.clone();
     shared.peer_env = opts.peer_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
     match member {
         Ok(path) => shared.member = Some(path),
@@ -788,8 +783,6 @@ struct Shared {
     /// This host's capacity on demand; the host poll keeps its running
     /// count.
     host_capacity: Arc<super::capacity::HostCapacity>,
-    /// [`Options::repos`].
-    repos: Option<PathBuf>,
     /// The env a fleet peer's verbs run with ([`Options::peer_env`], else
     /// this process's): `lent::Peer::env` of a machine's link streams and
     /// of a `link.attach {channel}`.
@@ -841,7 +834,6 @@ impl Shared {
             host_agent: Arc::new(crate::devsbd::bridge::host_agent),
             pty_exec: fleet::pty::runtime_exec,
             host_capacity: Arc::new(super::capacity::HostCapacity::new(Arc::new(|| crate::runtime::backend().engine_info()))),
-            repos: None,
             peer_env: BTreeMap::new(),
             channels: Arc::default(),
             graph: Arc::default(),
@@ -2545,12 +2537,8 @@ fn move_code(
     use fleet::code::{self, LinkTransfer, Unprepared};
     // The machine says where this host's fleet root is, over the same path.
     let worker_root = fleet_root_on(shared, worker).map_err(Unprepared::NotMovable)?;
-    let repos = match &shared.repos {
-        Some(repos) => repos.clone(),
-        None => code::repos_dir()?,
-    };
     let t = LinkTransfer::for_worker(&shared.socket_dir, worker);
-    code::prepare(&t, &repos, &worker_root, root, sandbox, branch)
+    code::prepare(&t, &worker_root, root, sandbox, branch)
 }
 
 /// The hub `hub`'s `fleet.place` answer to `ask`, over a fresh `API`
@@ -2931,8 +2919,6 @@ pub(crate) mod tests {
             peer_env: None,
             // Never the runtime's `info`: an empty report (caps aside).
             local_capacity: Some(Arc::new(crate::serve::capacity::Capacity::default)),
-            // Never the user's repo caches.
-            repos: Some(std::env::temp_dir().join(format!("dsv-repos-{}", std::process::id()))),
             // Never the user's agent.
             host_agent: Some(Arc::new(|| None)),
             // Short, but each probe of a routed member is a routed opening.
