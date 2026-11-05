@@ -66,6 +66,14 @@ jobs:
         env:
           DEVSANDBOX_SERVICE_MANAGER_E2E: "1"
 
+  # The release ships a Windows binary, and most of the code is cfg(unix):
+  # without this, a gate left wrong only shows up when a release tag builds.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo build --bin devsandbox
+
   # The docs site deploys only on release (release.yml); this keeps main
   # always deployable. It reads ../Cargo.toml, ../skills and ../npm, so
   # changes there can break it too.
