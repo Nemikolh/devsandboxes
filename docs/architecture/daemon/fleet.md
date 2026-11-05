@@ -173,10 +173,11 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `receive_then`, `check_size`, `encode_reply`, `parse_reply`, `digest`),
 `src/serve/fleet/code/mod.rs` (`Transfer`, `LinkTransfer`, `Haves`,
 `offer`, `Offer`, `send`, `prepare`, `Prepared`, `Unprepared`, `layout`,
-`pack_root`, `receivers`, `repos_dir`), `src/serve/fleet/code/tar.rs`
+`pack_root`, `receivers`, `haves_call`, `haves_of`, `cache_path`,
+`repos_dir`), `src/serve/fleet/code/tar.rs`
 (`Writer`, `read`, `extract`, `check_path`, `check_link`),
 `src/serve/fleet/code/repo.rs` (`probe`, `cache_dir`, `fetch`,
-`has_branch`, `bundle`, `land`, `check_branch`); peer links:
+`has_branch`, `unbundle`, `set_refs`, `land_from`, `check_branch`); peer links:
 `src/commands/fleet_link.rs` (`fleet_link_peer`, `run_peer`,
 `PeerOptions`, `Announce`, `REANNOUNCE`, `attach_stream`),
 `src/serve/fleet/dialer.rs` (`Dialer`, `Dialer::hold`, `link_args`,
@@ -658,6 +659,10 @@ opens `TRANSFER` streams only toward a peer that advertised it.
    an optional `to`, where below the receiver's tree the body belongs (a
    relative path of plain components, at most 1024 bytes; left out when
    unset), for a kind that places more than its file (`check_header`).
+   A `bundle` also names its `repo` (a repo identity, 16 lowercase hex)
+   and its `refs` (full ref name → commit id, at most `HEADER_REFS_MAX`
+   8, names `repo::check_ref`'s, ids `repo::check_oid`'s); both are left
+   out when unset. A body may be 0 bytes (a `bundle` with nothing new).
    At most `HEADER_MAX` (4 KiB) with its newline.
 2. The receiver (`receive`) checks the header and `size` against its
    limit (`check_size`), asks its `decide` where the body goes, creates a
@@ -709,8 +714,13 @@ plan decision 12: the hub reaches `origin` with its own credentials; a
 worker never needs any). It sits behind one seam, `serve::fleet::code`'s
 `Transfer` (`haves`, `send`; `offer` builds what goes, `receivers` takes
 it), so a sync layer can replace the git + tar implementation;
-`LinkTransfer` sends each body as one `TRANSFER` through the machine's
-link (a `TRANSFER` connection to `endpoint::fleet_socket`).
+`LinkTransfer` asks `haves` as one `code.haves` on a fresh `API` stream
+of any path to the machine (`route::connect`: its link socket, else its
+route socket; hello within `HAVES_HELLO_WAIT`, the answer within
+`HAVES_WAIT`) and sends each body as one `TRANSFER` along the same path,
+its writes bounded by `SEND_WRITE_WAIT` and the wait for the answer by
+`ANSWER_WAIT` (the worker lands the body before it answers, each git
+step bounded by `repo::WHOLE`).
 `prepare(transfer, repos, worker root, config root, sandbox, branch)` is
 `offer` then `send`, answering `Prepared` (the config root on the
 worker, `remote_root`, and each moved folder with its branch) or
@@ -778,11 +788,22 @@ more of them than it has parents in the root (`tar::check_link`), a
 non-UTF-8 name, or a tar over `ROOT_TAR_LIMIT` (256 MiB) refuses the
 root. Its name is `root-<hash>.tar`, `<hash>` the sha256's first 16 hex.
 
-**Send** (`send`). The tar, unless `haves` lists its hash (nothing asks
-yet: `Transfer::haves` is empty), then per repo `git bundle create` of
-`refs/heads/<branch>` from the cache (a temp file next to it), sent as
-`bundle` with `to` = `<hash>/<folder's offset>`. A refusal is the
-receiver's why (`Failed`).
+**Haves** (`haves_of`, on the worker; the `code.haves` API call,
+`haves_call`). What the caller's fleet root here has: `roots`, the root
+hashes unpacked under `roots/` (real dirs named as one, sorted, at most
+`ROOTS_CAP`), and `tips`, for each repo identity asked about (at most
+`HAVES_REPOS_MAX`) with a cache `repos/<id>.git` there, its
+`repo::tips`. The daemon answers it on a peer's connection only, about
+that peer's fleet root (`lent::Peer::fleet_root`), under either trust.
+
+**Send** (`send`). Each repo's identity is `repo::identity` of its
+branch in the hub's cache (`RepoOffer::id`); one `haves` asks about them
+all. The tar goes unless `roots` lists its hash. Then per repo
+`repo::bundle_refs` of `refs/heads/<branch>` from the cache `--not` the
+worker's tips of that repo (a temp file next to the cache), sent as
+`bundle` with `to` = `<hash>/<folder's offset>`, `repo` its identity and
+`refs` the branch's commit; when the worker has every commit the body is
+0 bytes. A refusal is the receiver's why (`Failed`).
 
 **Receive** (`receivers`, on the worker, into the hub's fleet root
 there). Bodies wait in `roots/.in/`.
@@ -796,12 +817,24 @@ there). Bodies wait in `roots/.in/`.
   directory it made (never through a symlink), never over a member,
   then renames it to `roots/<hash>/`; a hash already there is kept.
 - `bundle`: `to` must be `<hash>/<path>` with `roots/<hash>/` there (the
-  tar goes first) and no symlink on the way. `repo::land` makes the
-  checkout if missing (`git init`, HEAD to the bundle's one
-  `refs/heads/<branch>`, fetch, `reset --hard`) with no remote; an
-  existing checkout gets the branch fast-forwarded when it's the one
-  checked out, else moved to the bundle's. A dir that exists, isn't
-  empty and has no `.git` is refused.
+  tar goes first) and no symlink on the way; `repo` and `refs` must be
+  there, `refs` exactly one `refs/heads/<branch>` and at most that
+  branch's WIP ref, `refs/devsandbox/wip/<branch>` (`repo::wip_ref`).
+  The body goes into the repo's cache under the fleet root,
+  `repos/<repo>.git` (one per repo and sender: the fleet root is the
+  sender's), made by `git init --bare` if missing, `repos/` and the
+  cache real dirs (never through a symlink): `repo::unbundle` (`git
+  bundle unbundle`: objects only, no ref; a bundle whose prerequisites
+  the cache lacks fails with git's why) unless the body is 0 bytes, then
+  `repo::set_refs` sets each header ref, forced, once every one names a
+  commit the cache has. `repo::land_from` then cuts the checkout from
+  the cache, with no remote: a new one (no `.git`; a dir that exists and
+  isn't empty is refused) by `git init`, HEAD to `refs/heads/<branch>`,
+  a fetch from the cache, `reset --hard` and, with a WIP ref,
+  `wip::apply_wip` of it (the ref fetched for it then dropped); an
+  existing one only gets the branch fast-forwarded (its working tree
+  with it) when it's the one checked out, else moved to the cache's, and
+  no WIP applied (an instance may be using it). Caches are never pruned.
 
 All of it is host git through `run::git`'s family
 ([ADR 0003](../../decisions/0003-host-git-never-runs-repo-controlled-code.md)):
@@ -2088,7 +2121,8 @@ never hands the daemon off (below). Under **`worker`**:
 - **`decide`** (pure, over method and params) lets through `hello`,
   `subscribe` / `unsubscribe` with only the `instances` topic,
   `instances.watch` / `unwatch`, the quick calls
-  (`machines::forward::QUICK`), `capacity.get`, `roots.list` (with or
+  (`machines::forward::QUICK`), `capacity.get`, `code.haves` (about the
+  caller's own fleet root), `roots.list` (with or
   without `paths`: read-only; `machines.add` checks typed roots through
   it) and the verbs (`verbs::is_verb`) but `gc`. It refuses
   (`denied`) any request with a `machine` param or `machines: true`

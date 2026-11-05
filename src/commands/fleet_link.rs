@@ -932,7 +932,7 @@ mod tests {
         api.read_to_end(&mut got).unwrap();
         assert!(got.is_empty(), "refused");
         let (size, sha256) = transfer::digest(&b"new build"[..]).unwrap();
-        let header = Header { kind: update::BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None };
+        let header = Header { kind: update::BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None, repo: None, refs: None };
         transfer::send(outlet.open(channel::TRANSFER).unwrap(), &header, &b"new build"[..]).unwrap();
         let err = k_end.join().unwrap().unwrap_err();
         assert!(format!("{err:#}").starts_with("updated to devsandbox "), "{err:#}");

@@ -8,12 +8,16 @@
 //!   folder's `origin` as a bundle from the hub's repo cache ([`repo`]).
 //!   Anything that can't move yet is [`Unprepared::NotMovable`]: the run
 //!   stays where it is.
-//! - **haves** ([`Transfer::haves`]): what the worker has already; nothing
-//!   asks yet, the worker keeps a root it has.
-//! - **send** ([`send`]): the tar, then each bundle, one `TRANSFER` each,
-//!   through the worker's link ([`LinkTransfer`]).
+//! - **haves** ([`Transfer::haves`]): what the worker has already under its
+//!   fleet root for this host, one `code.haves` ([`haves_of`]): the roots
+//!   unpacked there and the tips of its cache of each repo.
+//! - **send** ([`send`]): the tar unless the worker has it, then each
+//!   repo's bundle `--not` its tips (0 bytes when it has everything), one
+//!   `TRANSFER` each, through the worker's link ([`LinkTransfer`]).
 //! - **receive** ([`receivers`], on the worker): `root-tar` unpacked into
-//!   `<fleet root>/roots/<hash>/`, `bundle` into a checkout below it.
+//!   `<fleet root>/roots/<hash>/`; `bundle` into the repo's cache
+//!   `<fleet root>/repos/<repo id>.git`, then a checkout below the root cut
+//!   from it.
 //!
 //! The layout keeps every `folder` where the config says, relative to the
 //! root: the tar's members sit under the root's last components on the hub
@@ -25,16 +29,22 @@ pub mod repo;
 pub mod tar;
 pub mod wip;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use self::repo::Repo;
 use super::transfer::{self, Header, Received, Receivers};
+use crate::serve::api::ApiError;
 use crate::config::{Build, Config, MountContext, Placement, ResolvedSandbox};
 use crate::worker_policy::{self, Allow, Policy, Refusal};
 
@@ -81,20 +91,53 @@ fn not_movable<T>(why: impl Into<String>) -> Result<T, Unprepared> {
     Err(Unprepared::NotMovable(why.into()))
 }
 
-/// What the receiver has already.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The API call a peer asks a worker's haves with (docs/reference/api.md,
+/// `code.haves`), answered by [`haves_call`].
+pub const HAVES_METHOD: &str = "code.haves";
+/// The most repos one `code.haves` asks about.
+pub const HAVES_REPOS_MAX: usize = 32;
+/// The most roots `code.haves` answers (by name): one past it is only sent
+/// again, and kept.
+pub const ROOTS_CAP: usize = 1024;
+/// How long [`LinkTransfer::haves`] waits for the worker's hello, then for
+/// its answer: listing a dir and each cache's tips (at most
+/// `repo::HAVES_CAP`) is quick.
+pub const HAVES_HELLO_WAIT: Duration = Duration::from_secs(5);
+pub const HAVES_WAIT: Duration = Duration::from_secs(30);
+/// How long one write of a transfer's body may block: the link's flow
+/// control holds it while the worker writes the body out, never this long
+/// unless the link is stuck.
+pub const SEND_WRITE_WAIT: Duration = Duration::from_secs(5 * 60);
+/// How long a sender waits for the worker's answer once the body is sent:
+/// the worker takes a bundle into its cache and cuts the checkout before it
+/// answers, each git step bounded by `repo::WHOLE`; a landing that takes
+/// longer than one such step and some is treated as stuck (the next
+/// `prepare` sends again).
+pub const ANSWER_WAIT: Duration = Duration::from_secs(35 * 60);
+
+/// What the receiver has already, under its fleet root for the sender: the
+/// `code.haves` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Haves {
-    /// Root hashes unpacked under `roots/`.
+    /// Root hashes unpacked under `roots/` (at most [`ROOTS_CAP`]).
+    #[serde(default)]
     pub roots: BTreeSet<String>,
+    /// Per repo identity asked about, its cache's tips (`repo::tips`); a
+    /// repo with no cache (or an empty one) is absent.
+    #[serde(default)]
+    pub tips: BTreeMap<String, Vec<String>>,
 }
 
 /// The seam bodies cross: production sends through a worker's link
 /// ([`LinkTransfer`]); another implementation (a sync layer) replaces it
-/// without changing [`prepare`]'s callers.
+/// without changing [`prepare`]'s callers. Fetch-back (`pull`) joins it
+/// in fleet step 12e.
 pub trait Transfer {
-    /// What the receiver has already (nothing is asked yet: an empty set,
-    /// and the receiver keeps a root it has).
-    fn haves(&self) -> Result<Haves> {
+    /// What the receiver has already, with the tips of its cache of each of
+    /// `repos` (repo identities). The default: nothing, so everything is
+    /// sent.
+    fn haves(&self, repos: &[String]) -> Result<Haves> {
+        let _ = repos;
         Ok(Haves::default())
     }
     /// One transfer: `header`, then `body`; the receiver's refusal is the
@@ -119,9 +162,28 @@ impl LinkTransfer {
 }
 
 impl Transfer for LinkTransfer {
+    /// `code.haves` over a fresh `API` stream of the same path (hello, then
+    /// the call), each step bounded ([`HAVES_HELLO_WAIT`], [`HAVES_WAIT`]).
+    fn haves(&self, repos: &[String]) -> Result<Haves> {
+        use crate::serve::machines::{link, ssh::Duplex};
+        let stream = super::route::connect(&self.dir, &self.worker, crate::devsbd::proto::channel::API)
+            .with_context(|| format!("cannot reach the worker `{}`", self.worker))?;
+        stream.set_write_timeout(Some(HAVES_WAIT)).context("cannot set a write timeout")?;
+        let mut link = link::handshake(&self.worker, Duplex::socket(stream), HAVES_HELLO_WAIT, link::Over::Link)
+            .map_err(|e| anyhow!("{e}"))?;
+        let r = link.conn.call_within(HAVES_METHOD, json!({ "repos": repos }), HAVES_WAIT)?;
+        let r = r.with_context(|| format!("no `{HAVES_METHOD}` answer within {}s", HAVES_WAIT.as_secs()))?;
+        if let Some(e) = r.error {
+            bail!("{HAVES_METHOD}: {}", e.message);
+        }
+        serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("bad {HAVES_METHOD} answer"))
+    }
+
     fn send(&self, header: &Header, body: &mut dyn Read) -> Result<()> {
         let stream = super::route::connect(&self.dir, &self.worker, crate::devsbd::proto::channel::TRANSFER)
             .with_context(|| format!("cannot reach the worker `{}`", self.worker))?;
+        stream.set_write_timeout(Some(SEND_WRITE_WAIT)).context("cannot set a write timeout")?;
+        stream.set_read_timeout(Some(ANSWER_WAIT)).context("cannot set a read timeout")?;
         transfer::send(stream, header, body)
     }
 }
@@ -196,6 +258,9 @@ pub struct RepoOffer {
     pub cache: PathBuf,
     /// The branch the bundle carries.
     pub branch: String,
+    /// The repo's identity (`repo::identity` of the branch): which of the
+    /// worker's caches it goes into.
+    pub id: String,
 }
 
 /// What [`send`] sends for one sandbox.
@@ -216,7 +281,8 @@ pub struct Prepared {
     pub remote_root: PathBuf,
     /// Each moved folder: its host path, its path there, the branch its
     /// bundle carried (checked out in a new checkout; an existing one keeps
-    /// what it has checked out and gets that branch updated, `repo::land`).
+    /// what it has checked out and gets that branch updated,
+    /// `repo::land_from`).
     pub folders: Vec<(PathBuf, PathBuf, String)>,
 }
 
@@ -278,7 +344,8 @@ pub fn offer(repos: &Path, config_root: &Path, sandbox: &str, branch: Option<&st
             let names = if wanted.is_empty() { "no branch (detached)".to_string() } else { wanted.join(" / ") };
             return not_movable(format!("{}: {names} isn't on origin (push it first)", host.display()));
         };
-        repos_out.push(RepoOffer { host: host.clone(), at: at.clone(), cache, branch });
+        let id = repo::identity(Repo::Bare(&cache), &format!("refs/heads/{branch}"))?;
+        repos_out.push(RepoOffer { host: host.clone(), at: at.clone(), cache, branch, id });
     }
     let tar = pack_root(&root, &layout.root)?;
     let hash = short_hash(&tar);
@@ -447,31 +514,143 @@ fn walk(dir: &Path, rel: &str, at: &str, w: &mut tar::Writer) -> Result<()> {
     Ok(())
 }
 
-/// Send `offer` through `t`: the root's tar (unless `t` has it), then each
-/// repo's bundle (written to a temp file in the cache's parent first);
-/// where it all is on the worker whose fleet root is `worker_root`.
+/// Send `offer` through `t`: first its haves (one ask, every repo's
+/// identity), then the root's tar unless the worker has it, then each
+/// repo's branch as a bundle `--not` the worker's tips of that repo
+/// (written to a temp file in the cache's parent first; a body of 0 bytes
+/// when the worker has every commit), its header naming the repo and the
+/// branch's commit; where it all is on the worker whose fleet root is
+/// `worker_root`.
 pub fn send(offer: &Offer, worker_root: &Path, t: &dyn Transfer) -> Result<Prepared> {
-    let haves = t.haves()?;
+    let ids: Vec<String> = offer.repos.iter().map(|r| r.id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+    let haves = t.haves(&ids).context("cannot ask the worker what it has")?;
     if !haves.roots.contains(&offer.hash) {
         let (size, sha256) = transfer::digest(&offer.tar[..])?;
-        let header = Header { kind: ROOT_TAR_KIND.into(), name: format!("root-{}.tar", offer.hash), size, sha256, to: None };
+        let name = format!("root-{}.tar", offer.hash);
+        let header = Header { kind: ROOT_TAR_KIND.into(), name, size, sha256, to: None, repo: None, refs: None };
         t.send(&header, &mut &offer.tar[..]).context("cannot send the config root")?;
     }
     let tree = worker_root.join("roots").join(&offer.hash);
     let mut folders = Vec::new();
     for r in &offer.repos {
+        let full = format!("refs/heads/{}", r.branch);
+        let commit = repo::commit_at(Repo::Bare(&r.cache), &full)?.with_context(|| format!("{} has no {full}", r.cache.display()))?;
         let dir = r.cache.parent().context("a repo cache has a parent")?;
         let file = TempFile(dir.join(format!(".bundle-{}-{}.part", std::process::id(), next_seq())));
-        repo::bundle(&r.cache, &r.branch, &file.0)?;
+        let tips = haves.tips.get(&r.id).map(Vec::as_slice).unwrap_or_default();
+        let new = repo::bundle_refs(Repo::Bare(&r.cache), &[&full], tips, &file.0)?;
         let open = || std::fs::File::open(&file.0).with_context(|| format!("cannot read {}", file.0.display()));
-        let (size, sha256) = transfer::digest(open()?)?;
+        let mut body: Box<dyn Read> = if new { Box::new(open()?) } else { Box::new(std::io::empty()) };
+        let (size, sha256) = if new { transfer::digest(open()?)? } else { transfer::digest(std::io::empty())? };
         let to = r.at.to_str().context("a folder's name isn't UTF-8")?;
-        let header =
-            Header { kind: BUNDLE_KIND.into(), name: "repo.bundle".into(), size, sha256, to: Some(format!("{}/{to}", offer.hash)) };
-        t.send(&header, &mut open()?).with_context(|| format!("cannot send {}", r.host.display()))?;
+        let header = Header {
+            kind: BUNDLE_KIND.into(),
+            name: "repo.bundle".into(),
+            size,
+            sha256,
+            to: Some(format!("{}/{to}", offer.hash)),
+            repo: Some(r.id.clone()),
+            refs: Some([(full, commit)].into()),
+        };
+        t.send(&header, &mut body).with_context(|| format!("cannot send {}", r.host.display()))?;
         folders.push((r.host.clone(), tree.join(&r.at), r.branch.clone()));
     }
     Ok(Prepared { remote_root: tree.join(&offer.layout.root), folders })
+}
+
+/// `code.haves {repos}` from a peer whose fleet root here is `fleet_root`
+/// (the daemon's `Table::Peer`): [`haves_params`], then [`haves_of`].
+pub fn haves_call(fleet_root: &Path, params: &Value) -> Result<Value, ApiError> {
+    let repos = haves_params(params)?;
+    let haves = haves_of(fleet_root, &repos).map_err(ApiError::internal)?;
+    serde_json::to_value(haves).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// `code.haves`' `repos`: at most [`HAVES_REPOS_MAX`] repo identities
+/// (`repo::check_id`).
+pub fn haves_params(params: &Value) -> Result<Vec<String>, ApiError> {
+    let Some(list) = params.get("repos").and_then(Value::as_array) else {
+        return Err(ApiError::invalid(format!("`{HAVES_METHOD}` needs `repos`, a list of repo identities")));
+    };
+    if list.len() > HAVES_REPOS_MAX {
+        return Err(ApiError::invalid(format!("`{HAVES_METHOD}` asks about at most {HAVES_REPOS_MAX} repos")));
+    }
+    list.iter()
+        .map(|v| {
+            let id = v.as_str().ok_or_else(|| ApiError::invalid("`repos` holds repo identities (strings)"))?;
+            repo::check_id(id).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
+            Ok(id.to_string())
+        })
+        .collect()
+}
+
+/// What fleet root `fleet_root` has: the root hashes unpacked under
+/// `roots/` (real dirs named as one, sorted, at most [`ROOTS_CAP`]) and,
+/// for each of `repos` with a cache under `repos/`, its tips.
+pub fn haves_of(fleet_root: &Path, repos: &[String]) -> Result<Haves> {
+    let mut out = Haves::default();
+    let roots = fleet_root.join("roots");
+    match std::fs::read_dir(&roots) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| is_hash(n))
+                .collect();
+            names.sort_unstable();
+            names.truncate(ROOTS_CAP);
+            out.roots = names.into_iter().collect();
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!(e).context(format!("cannot list {}", roots.display()))),
+    }
+    for id in repos {
+        repo::check_id(id)?;
+        let cache = cache_path(fleet_root, id);
+        if cache.symlink_metadata().is_ok_and(|m| m.is_dir()) && cache.join("HEAD").is_file() {
+            let tips = repo::tips(Repo::Bare(&cache))?;
+            if !tips.is_empty() {
+                out.tips.insert(id.clone(), tips);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Fleet root `fleet_root`'s cache of repo `id`: `repos/<id>.git`.
+pub fn cache_path(fleet_root: &Path, id: &str) -> PathBuf {
+    fleet_root.join("repos").join(format!("{id}.git"))
+}
+
+/// [`cache_path`], made a bare repo if it isn't one: `repos/` and the cache
+/// real dirs, never through a symlink.
+fn make_cache(fleet_root: &Path, id: &str) -> Result<PathBuf> {
+    repo::check_id(id)?;
+    let cache = cache_path(fleet_root, id);
+    real_dir(cache.parent().context("a cache has a parent")?)?;
+    real_dir(&cache)?;
+    repo::ensure_bare(&cache)?;
+    Ok(cache)
+}
+
+/// `dir` made if missing (its parent must exist); refused unless it's a
+/// real dir (a symlink is refused, whatever it points at).
+fn real_dir(dir: &Path) -> Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(anyhow!(e).context(format!("cannot create {}", dir.display()))),
+    }
+    if !dir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        bail!("{} isn't a directory", dir.display());
+    }
+    Ok(())
+}
+
+/// 16 lowercase hex: a root hash's (and a repo identity's) shape.
+fn is_hash(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Put sandbox `sandbox` of `config_root` on the worker whose fleet root is
@@ -514,15 +693,22 @@ impl Drop for TempFile {
 /// - `root-tar` named `root-<hash>.tar`, `<hash>` its sha256's first 16
 ///   hex: unpacked ([`tar::extract`]) into a temp dir renamed to
 ///   `roots/<hash>/`; a hash already there is kept.
-/// - `bundle` with `to` = `<hash>/<path>`, `<hash>` a root unpacked here:
-///   landed ([`repo::land`]) at `roots/<hash>/<path>`, every dir on the way
-///   a real one (no symlink).
+/// - `bundle` with `to` = `<hash>/<path>`, `<hash>` a root unpacked here,
+///   `repo` its repo identity and `refs` one `refs/heads/<branch>` and at
+///   most its WIP ref (`refs/devsandbox/wip/<branch>`, [`bundle_refs_of`]):
+///   its objects into the cache `repos/<repo>.git` (made, bare, if missing;
+///   a 0-byte body brings none), the refs set there (each a commit the
+///   cache now has, `repo::set_refs`), then the checkout at
+///   `roots/<hash>/<path>` cut from the cache ([`repo::land_from`]: a new
+///   one gets the WIP applied), every dir on the way a real one (no
+///   symlink).
 ///
 /// Bodies wait in `roots/.in/`; the unpacking's error is the transfer's
 /// answer, so the hub hears it.
 pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
     let roots = fleet_root.join("roots");
     let (tar_in, tar_roots, bundle_in, bundle_roots) = (roots.clone(), roots.clone(), roots.clone(), roots);
+    let fleet_root = fleet_root.to_path_buf();
     receivers
         .with(
             ROOT_TAR_KIND,
@@ -546,16 +732,19 @@ pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
             BUNDLE_LIMIT,
             move |h| {
                 let (hash, _) = bundle_target(h)?;
+                bundle_refs_of(h)?;
                 if !bundle_in.join(hash).is_dir() {
                     bail!("root {hash} isn't here (its tar goes first)");
                 }
-                Ok(bundle_in.join(".in").join(format!("{}.bundle", h.sha256)))
+                // Unique: two empty bodies share their sha256.
+                Ok(bundle_in.join(".in").join(format!("{}-{}.bundle", h.sha256, repo::nonce())))
             },
             |_| {},
         )
         .then(BUNDLE_KIND, move |r: &Received| {
             let landed = (|| {
                 let (hash, rest) = bundle_target(&r.header)?;
+                let (id, branch, wip) = bundle_refs_of(&r.header)?;
                 let tree = bundle_roots.join(hash);
                 let mut at = tree.clone();
                 for part in rest.split('/') {
@@ -564,7 +753,12 @@ pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
                         bail!("{} isn't a directory", at.display());
                     }
                 }
-                repo::land(&r.path, &at).map(|_| ())
+                let cache = make_cache(&fleet_root, id)?;
+                if r.header.size > 0 {
+                    repo::unbundle(&cache, &r.path)?;
+                }
+                repo::set_refs(&cache, r.header.refs.as_ref().context("a bundle names its refs")?)?;
+                repo::land_from(&cache, &at, branch, wip)
             })();
             let _ = std::fs::remove_file(&r.path);
             landed
@@ -575,10 +769,28 @@ pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
 fn bundle_target(h: &Header) -> Result<(&str, &str)> {
     let to = h.to.as_deref().context("a bundle names where it goes (`to`)")?;
     let (hash, rest) = to.split_once('/').with_context(|| format!("a bundle goes below a root, not to {to}"))?;
-    if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if !is_hash(hash) {
         bail!("`{hash}` isn't a root hash");
     }
     Ok((hash, rest))
+}
+
+/// A bundle header's `repo` and `refs` (both checked by
+/// `transfer::check_header`), as `(repo id, branch, its WIP commit)`:
+/// exactly one `refs/heads/<branch>`, besides it at most
+/// `refs/devsandbox/wip/<branch>` (the same branch's), nothing else.
+fn bundle_refs_of(h: &Header) -> Result<(&str, &str, Option<&str>)> {
+    let id = h.repo.as_deref().context("a bundle names its repo (`repo`)")?;
+    let refs = h.refs.as_ref().context("a bundle names its refs (`refs`)")?;
+    let mut branches = refs.keys().filter_map(|n| n.strip_prefix("refs/heads/"));
+    let (Some(branch), None) = (branches.next(), branches.next()) else {
+        bail!("a bundle carries one branch (`refs/heads/…`), not {}", refs.keys().cloned().collect::<Vec<_>>().join(", "));
+    };
+    let wip = repo::wip_ref(branch);
+    if let Some(other) = refs.keys().find(|n| !n.starts_with("refs/heads/") && **n != wip) {
+        bail!("a bundle carries its branch and that branch's WIP ref ({wip}), not {other}");
+    }
+    Ok((id, branch, refs.get(&wip).map(String::as_str)))
 }
 
 /// The root tar at `tar` into `roots/<hash>/` (kept if there).
@@ -698,7 +910,21 @@ mod tests {
 
     fn tar_header(tar: &[u8]) -> Header {
         let (size, sha256) = transfer::digest(tar).unwrap();
-        Header { kind: ROOT_TAR_KIND.into(), name: format!("root-{}.tar", short_hash(tar)), size, sha256, to: None }
+        Header { kind: ROOT_TAR_KIND.into(), name: format!("root-{}.tar", short_hash(tar)), size, sha256, to: None, repo: None, refs: None }
+    }
+
+    /// A `bundle` header for `body` into `to`, of repo `repo` with `refs`.
+    fn bundle_header(body: &[u8], to: &str, repo: &str, refs: &[(&str, &str)]) -> Header {
+        let (size, sha256) = transfer::digest(body).unwrap();
+        Header {
+            kind: BUNDLE_KIND.into(),
+            name: "repo.bundle".into(),
+            size,
+            sha256,
+            to: Some(to.into()),
+            repo: Some(repo.into()),
+            refs: Some(refs.iter().map(|(n, id)| (n.to_string(), id.to_string())).collect()),
+        }
     }
 
     #[test]
@@ -751,10 +977,28 @@ mod tests {
         let dir = scratch("recv-bundle");
         let fleet = dir.join("fleet");
         let r = Arc::new(receivers(&fleet, Receivers::new(|_| {})));
-        let (size, sha256) = transfer::digest(&b"x"[..]).unwrap();
-        let h = Header { kind: BUNDLE_KIND.into(), name: "repo.bundle".into(), size, sha256, to: Some("0123456789abcdef/web".into()) };
+        let oid = "a".repeat(40);
+        let h = bundle_header(b"x", "0123456789abcdef/web", "fedcba9876543210", &[("refs/heads/main", &oid)]);
         let err = format!("{:#}", deliver(&r, &h, b"x").unwrap_err());
         assert!(err.contains("root 0123456789abcdef isn't here"), "{err}");
+        // Its repo and refs: one branch, at most that branch's WIP ref.
+        let err = format!("{:#}", deliver(&r, &Header { repo: None, ..h.clone() }, b"x").unwrap_err());
+        assert!(err.contains("names its repo"), "{err}");
+        let err = format!("{:#}", deliver(&r, &Header { refs: None, ..h.clone() }, b"x").unwrap_err());
+        assert!(err.contains("names its refs"), "{err}");
+        for refs in [
+            vec![("refs/heads/main", oid.as_str()), ("refs/heads/b", oid.as_str())],
+            vec![("refs/devsandbox/wip/main", oid.as_str())],
+        ] {
+            let bad = bundle_header(b"x", "0123456789abcdef/web", "fedcba9876543210", &refs);
+            let err = format!("{:#}", deliver(&r, &bad, b"x").unwrap_err());
+            assert!(err.contains("carries one branch"), "{refs:?}: {err}");
+        }
+        for other in ["refs/devsandbox/wip/b", "refs/tags/v1", "refs/devsandbox/root"] {
+            let bad = bundle_header(b"x", "0123456789abcdef/web", "fedcba9876543210", &[("refs/heads/main", &oid), (other, &oid)]);
+            let err = format!("{:#}", deliver(&r, &bad, b"x").unwrap_err());
+            assert!(err.contains(&format!("not {other}")), "{other}: {err}");
+        }
         let err = format!("{:#}", deliver(&r, &Header { to: None, ..h.clone() }, b"x").unwrap_err());
         assert!(err.contains("names where it goes"), "{err}");
         let err = format!("{:#}", deliver(&r, &Header { to: Some("web".into()), ..h.clone() }, b"x").unwrap_err());
@@ -882,9 +1126,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The machine's end of one `API` stream, as the daemon answers a peer
+    /// whose fleet root is `fleet`: a hello, then `code.haves`
+    /// ([`haves_call`]); anything else unknown. Reads bounded.
+    fn serve_api(stream: UnixStream, fleet: &Path) {
+        use std::io::{BufRead, BufReader, Write};
+
+        use crate::serve::proto::{HelloResult, PROTOCOL, Request, Response};
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut out = stream;
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+            let req: Request = serde_json::from_str(&line).unwrap();
+            let resp = match req.method.as_str() {
+                "hello" => {
+                    let hello = HelloResult { version: "0.0.0".into(), build: 0, protocol: PROTOCOL, handoff: false };
+                    Response::ok(req.id, serde_json::to_value(hello).unwrap())
+                }
+                HAVES_METHOD => match haves_call(fleet, &req.params) {
+                    Ok(v) => Response::ok(req.id, v),
+                    Err(e) => Response::err(req.id, e.code, e.message),
+                },
+                m => Response::err(req.id, "unknown-method", m.to_string()),
+            };
+            if writeln!(out, "{}", serde_json::to_string(&resp).unwrap()).is_err() {
+                return;
+            }
+            line.clear();
+        }
+    }
+
     /// A link's two ends in-process (this host the opener, the machine the
-    /// answerer), the machine's receivers [`receivers`] into `fleet`; this
-    /// host's link socket.
+    /// answerer), the machine's receivers [`receivers`] into `fleet` and its
+    /// `API` [`serve_api`]; this host's link socket.
     fn link(dir: &Path, fleet: &Path) -> PathBuf {
         use crate::devsbd::proto::channel;
         use crate::serve::fleet::link::{Endpoint, Serves, answerer_with, opener_with};
@@ -892,7 +1167,14 @@ mod tests {
         std::fs::create_dir_all(&hub_dir).unwrap();
         let socket = endpoint::fleet_socket(&hub_dir, "w");
         let ours = Serves::default().transfers(Arc::new(Receivers::new(|_| {})));
-        let theirs = Serves::default().with(channel::API, || None).transfers(Arc::new(receivers(fleet, Receivers::new(|_| {}))));
+        let api_fleet = fleet.to_path_buf();
+        let api = move || {
+            let (mine, theirs) = UnixStream::pair().ok()?;
+            let fleet = api_fleet.clone();
+            std::thread::spawn(move || serve_api(mine, &fleet));
+            Some(theirs.into())
+        };
+        let theirs = Serves::default().with(channel::API, api).transfers(Arc::new(receivers(fleet, Receivers::new(|_| {}))));
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
         let path = socket.clone();
@@ -973,6 +1255,172 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(*t.0.lock().unwrap(), ["root-tar"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`Transfer`] recording each send's kind and size, passing it on.
+    struct Recorded<'a> {
+        inner: &'a dyn Transfer,
+        sent: Mutex<Vec<(String, u64)>>,
+    }
+
+    impl Transfer for Recorded<'_> {
+        fn haves(&self, repos: &[String]) -> Result<Haves> {
+            self.inner.haves(repos)
+        }
+        fn send(&self, header: &Header, body: &mut dyn Read) -> Result<()> {
+            self.sent.lock().unwrap().push((header.kind.clone(), header.size));
+            self.inner.send(header, body)
+        }
+    }
+
+    impl Recorded<'_> {
+        fn take(&self) -> Vec<(String, u64)> {
+            std::mem::take(&mut *self.sent.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn repeat_sends_carry_only_what_the_worker_lacks() {
+        let dir = scratch("repeat");
+        let cfg = fixture(&dir);
+        let fleet = dir.join("worker/fleet/hub");
+        let link = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
+        let t = Recorded { inner: &link, sent: Mutex::default() };
+        let repos = dir.join("hub-data/repos");
+        let origin = dir.join("origin.git");
+        let id = repo::identity(Repo::Bare(&origin), "refs/heads/main").unwrap();
+        // Nothing there yet: no roots, no tips.
+        assert_eq!(link.haves(std::slice::from_ref(&id)).unwrap(), Haves::default());
+
+        let got = prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
+        let first = t.take();
+        assert_eq!(first.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["root-tar", "bundle"]);
+        let checkout = got.folders[0].1.clone();
+        assert_eq!(git(&checkout, &["symbolic-ref", "--short", "HEAD"]), "feature");
+        assert_eq!(git(&checkout, &["remote"]), "", "no remote on the worker");
+        let cache = cache_path(&fleet, &id);
+        assert_eq!(git(&cache, &["rev-parse", "refs/heads/feature"]), git(&origin, &["rev-parse", "feature"]));
+        // The worker answers its root and the cache's tips, over the link.
+        let haves = link.haves(std::slice::from_ref(&id)).unwrap();
+        let hash = got.remote_root.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(haves.roots, [hash].into());
+        assert_eq!(haves.tips[&id], [git(&origin, &["rev-parse", "feature"])]);
+
+        // A new commit on origin: only the bundle goes, and only the delta.
+        let seed = dir.join("seed");
+        std::fs::write(seed.join("F"), "feature 2\n").unwrap();
+        git(&seed, &["commit", "-q", "-am", "two"]);
+        git(&seed, &["push", "-q", origin.to_str().unwrap(), "feature"]);
+        prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
+        let second = t.take();
+        assert_eq!(second.len(), 1, "the root isn't sent again: {second:?}");
+        assert!(second[0].1 > 0 && second[0].1 < first[1].1, "a delta: {second:?} after {first:?}");
+        assert_eq!(std::fs::read_to_string(checkout.join("F")).unwrap(), "feature 2\n", "fast-forwarded");
+
+        // Nothing new: an empty bundle, still answered `ok`.
+        prepare(&t, &repos, &fleet, &cfg, "web", Some("feature")).unwrap();
+        assert_eq!(t.take(), [("bundle".to_string(), 0)]);
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), git(&origin, &["rev-parse", "feature"]));
+        assert_eq!(std::fs::read_dir(fleet.join("roots/.in")).unwrap().count(), 0, "no body left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wip_snapshot_lands_in_a_new_checkout_only() {
+        let dir = scratch("recv-wip");
+        let fleet = dir.join("fleet");
+        std::fs::create_dir_all(fleet.join("roots/0123456789abcdef")).unwrap();
+        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {})));
+        // The sender's checkout: a commit, then uncommitted work.
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("f"), "one\n").unwrap();
+        git(&src, &["add", "f"]);
+        git(&src, &["commit", "-q", "-m", "one"]);
+        std::fs::write(src.join("f"), "changed\n").unwrap();
+        std::fs::write(src.join("u"), "untracked\n").unwrap();
+        let id = repo::identity(Repo::Checkout(&src), "HEAD").unwrap();
+        let wip_ref = repo::wip_ref("main");
+        let send = |name: &str, haves: &[String]| {
+            let snap = wip::snapshot(&src, &wip_ref).unwrap();
+            let file = dir.join(name);
+            let body = if repo::bundle_refs(Repo::Checkout(&src), &["refs/heads/main", &wip_ref], haves, &file).unwrap() {
+                std::fs::read(&file).unwrap()
+            } else {
+                Vec::new()
+            };
+            let h = bundle_header(&body, "0123456789abcdef/a", &id, &[("refs/heads/main", &snap.base), (&wip_ref, &snap.wip)]);
+            deliver(&r, &h, &body).unwrap();
+            snap
+        };
+        let first = send("1.bundle", &[]);
+        let at = fleet.join("roots/0123456789abcdef/a");
+        assert_eq!(git(&at, &["rev-parse", "HEAD"]), first.base);
+        assert_eq!(git(&at, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(std::fs::read_to_string(at.join("f")).unwrap(), "changed\n");
+        assert_eq!(git(&at, &["status", "--porcelain=v1", "-uall"]), "M f\n?? u");
+        assert_eq!(git(&at, &["for-each-ref", "refs/devsandbox"]), "", "the WIP ref isn't kept in the checkout");
+        let cache = cache_path(&fleet, &id);
+        assert_eq!(git(&cache, &["rev-parse", &wip_ref]), first.wip);
+
+        // Again, more work: the cache gets the new snapshot, the existing
+        // checkout's working tree is left alone.
+        std::fs::write(src.join("f"), "changed again\n").unwrap();
+        let tips = repo::tips(Repo::Bare(&cache)).unwrap();
+        let second = send("2.bundle", &tips);
+        assert_ne!(second.wip, first.wip);
+        assert_eq!(git(&cache, &["rev-parse", &wip_ref]), second.wip);
+        assert_eq!(std::fs::read_to_string(at.join("f")).unwrap(), "changed\n");
+
+        // A ref naming a commit neither the body nor the cache has.
+        let missing = "1".repeat(40);
+        let h = bundle_header(b"", "0123456789abcdef/a", &id, &[("refs/heads/main", &missing)]);
+        let err = format!("{:#}", deliver(&r, &h, b"").unwrap_err());
+        assert!(err.contains("is neither in the bundle nor already here"), "{err}");
+        assert_eq!(git(&cache, &["rev-parse", "refs/heads/main"]), second.base, "no ref moved");
+        // The cache is never reached through a symlink.
+        let other = dir.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&other, cache_path(&fleet, "fedcba9876543210")).unwrap();
+        let h = bundle_header(b"", "0123456789abcdef/b", "fedcba9876543210", &[("refs/heads/main", &second.base)]);
+        let err = format!("{:#}", deliver(&r, &h, b"").unwrap_err());
+        assert!(err.contains("isn't a directory"), "{err}");
+        assert_eq!(std::fs::read_dir(&other).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn haves_answer_the_fleet_roots_roots_and_caches() {
+        let dir = scratch("haves");
+        let fleet = dir.join("fleet");
+        assert_eq!(haves_of(&fleet, &[]).unwrap(), Haves::default(), "no fleet root yet");
+        for d in ["roots/0123456789abcdef", "roots/.in", "roots/.0123456789abcdef.1-2.part", "roots/not-a-hash"] {
+            std::fs::create_dir_all(fleet.join(d)).unwrap();
+        }
+        std::fs::write(fleet.join("roots/fedcba9876543210"), "a file").unwrap();
+        let cache = cache_path(&fleet, "00000000000000aa");
+        std::fs::create_dir_all(&cache).unwrap();
+        git(&cache, &["init", "-q", "--bare"]);
+        let ids = ["00000000000000aa".to_string(), "00000000000000bb".to_string()];
+        let got = haves_of(&fleet, &ids).unwrap();
+        assert_eq!(got, Haves { roots: ["0123456789abcdef".to_string()].into(), tips: BTreeMap::new() }, "an empty cache has no tips");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        git(&src, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&src, &["push", "-q", cache.to_str().unwrap(), "main"]);
+        let got = haves_call(&fleet, &json!({ "repos": ids })).unwrap();
+        assert_eq!(got, json!({"roots": ["0123456789abcdef"], "tips": {"00000000000000aa": [git(&src, &["rev-parse", "HEAD"])]}}));
+        crate::serve::dts::assert_matches("CodeHaves", &got);
+
+        let code = |params: Value| haves_call(&fleet, &params).unwrap_err().code;
+        assert_eq!(code(json!({})), "invalid");
+        assert_eq!(code(json!({"repos": "x"})), "invalid");
+        assert_eq!(code(json!({"repos": [1]})), "invalid");
+        assert_eq!(code(json!({"repos": ["../../etc"]})), "invalid");
+        assert_eq!(code(json!({"repos": vec!["0123456789abcdef"; HAVES_REPOS_MAX + 1]})), "invalid");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

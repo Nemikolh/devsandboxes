@@ -15,7 +15,7 @@
 //!
 //! - [`decide`] (pure, over the method and params): hello, `subscribe` /
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
-//!   quick calls (`machines::forward::QUICK`), `capacity.get`, `roots.list`
+//!   quick calls (`machines::forward::QUICK`), `capacity.get`, `code.haves`, `roots.list`
 //!   and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
 //!   true`) request but `instances.watch` (a member watching its hub);
 //!   everything else (`machines.*`,
@@ -294,6 +294,9 @@ pub enum Gate {
     Quick,
     /// `capacity.get`: this host's report, for the hub's placement.
     Capacity,
+    /// `code.haves`: what the caller's own fleet root here has (the daemon
+    /// answers it about that root only).
+    Code,
     /// `roots.list`, with or without `paths`: read-only (`machines.add`
     /// checks typed roots through it).
     Roots,
@@ -324,6 +327,7 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         "instances.unwatch" => Gate::Unwatch,
         m if fwd::is_quick(m) => Gate::Quick,
         "capacity.get" => Gate::Capacity,
+        "code.haves" => Gate::Code,
         "roots.list" => Gate::Roots,
         "gc" => return Err(ApiError::denied(format!(
             "`gc` is host maintenance: not open to remote callers under this member's `worker` trust ({FULL_HINT})"
@@ -856,6 +860,8 @@ mod tests {
             ("config.migrate", json!({"root": "/x"}), Ok(Quick)),
             ("capacity.get", p.clone(), Ok(Capacity)),
             ("capacity.get", json!({"machine": "m"}), Err("denied")),
+            ("code.haves", json!({"repos": []}), Ok(Code)),
+            ("code.haves", json!({"repos": [], "machine": "m"}), Err("denied")),
             ("run", json!({"root": "/x"}), Ok(Verb)),
             ("rm", json!({"root": "/x"}), Ok(Verb)),
             ("services.rebuild", json!({"root": "/x"}), Ok(Verb)),
@@ -1089,6 +1095,12 @@ mod tests {
         // Not a verb: params untouched.
         let got = admit("sandboxes.list", json!({"root": root.join("cfg"), "env": {"A": "b"}}), &peer(&root), &r, &state).unwrap();
         assert_eq!(got["env"], json!({"A": "b"}));
+        // `code.haves`: admitted as sent under either trust (the daemon
+        // answers it about the peer's own fleet root).
+        let haves = json!({"repos": ["0123456789abcdef"]});
+        assert_eq!(admit("code.haves", haves.clone(), &peer(&root), &r, &state).unwrap(), haves);
+        let full_reach = Reach { trust: Trust::Full, ..r.clone() };
+        assert_eq!(admit("code.haves", haves.clone(), &peer(&root), &full_reach, &state).unwrap(), haves);
         // A peer without one: the verb's as sent, under either trust.
         let as_sent = Peer { env: None, ..peer(&root) };
         assert_eq!(admit("stop", p.clone(), &as_sent, &r, &state).unwrap()["env"], p["env"]);

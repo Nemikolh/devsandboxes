@@ -18,7 +18,7 @@
 //! link hands each `TRANSFER` stream the peer opens (`link::opener_with`,
 //! `link::answerer_with`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -66,7 +66,19 @@ pub struct Header {
     /// unset; each receiver checks what it means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// A `bundle`'s repo identity (16 lowercase hex,
+    /// `code::repo::identity`): which cache it goes into. Left out unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// A `bundle`'s refs, full name → commit id: what the receiver's cache
+    /// sets once the body is in (at most [`HEADER_REFS_MAX`]). Left out
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<BTreeMap<String, String>>,
 }
+
+/// The most refs a header names.
+pub const HEADER_REFS_MAX: usize = 8;
 
 /// A transfer the receiver took: its header and where the body now is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +117,18 @@ pub fn check_header(h: &Header) -> Result<()> {
         let plain = |c: &str| !c.is_empty() && c != "." && c != ".." && !c.contains(['\0', '\n', '\\']);
         if to.len() > 1024 || !to.split('/').all(plain) {
             bail!("bad transfer path {to:?}");
+        }
+    }
+    if let Some(repo) = &h.repo {
+        super::code::repo::check_id(repo).context("bad transfer repo")?;
+    }
+    if let Some(refs) = &h.refs {
+        if refs.len() > HEADER_REFS_MAX {
+            bail!("a transfer names at most {HEADER_REFS_MAX} refs, not {}", refs.len());
+        }
+        for (name, id) in refs {
+            super::code::repo::check_ref(name).context("bad transfer ref")?;
+            super::code::repo::check_oid(id).context("bad transfer ref")?;
         }
     }
     Ok(())
@@ -489,7 +513,7 @@ mod tests {
 
     fn header_for(kind: &str, name: &str, body: &[u8]) -> Header {
         let (size, sha256) = digest(body).unwrap();
-        Header { kind: kind.into(), name: name.into(), size, sha256, to: None }
+        Header { kind: kind.into(), name: name.into(), size, sha256, to: None, repo: None, refs: None }
     }
 
     fn files(dir: &Path) -> Vec<String> {
@@ -540,6 +564,27 @@ mod tests {
         let line = encode_header(&to);
         assert!(line.contains("\"to\":\"0123/repos/web\""), "{line}");
         assert_eq!(parse_header(line.as_bytes()).unwrap(), to);
+        // A bundle's repo and refs.
+        let oid = "a".repeat(40);
+        let refs: BTreeMap<String, String> =
+            [("refs/heads/main".to_string(), oid.clone()), ("refs/devsandbox/wip/main".to_string(), "b".repeat(64))].into();
+        let bundle = Header { repo: Some("0123456789abcdef".into()), refs: Some(refs.clone()), ..to.clone() };
+        let line = encode_header(&bundle);
+        assert!(line.contains("\"repo\":\"0123456789abcdef\"") && line.contains(&format!("\"refs/heads/main\":\"{oid}\"")), "{line}");
+        assert_eq!(parse_header(line.as_bytes()).unwrap(), bundle);
+        for repo in ["", "0123", "0123456789ABCDEF", "../0123456789abc"] {
+            let h = Header { repo: Some(repo.into()), ..bundle.clone() };
+            let err = format!("{:#}", parse_header(encode_header(&h).as_bytes()).unwrap_err());
+            assert!(err.contains("bad transfer repo"), "{repo:?}: {err}");
+        }
+        for (name, id) in [("main", oid.as_str()), ("refs/heads/-x", oid.as_str()), ("refs/heads/main", "HEAD"), ("refs/heads/main", "abc")] {
+            let h = Header { refs: Some([(name.to_string(), id.to_string())].into()), ..bundle.clone() };
+            let err = format!("{:#}", parse_header(encode_header(&h).as_bytes()).unwrap_err());
+            assert!(err.contains("bad transfer ref"), "{name} {id}: {err}");
+        }
+        let many: BTreeMap<String, String> = (0..=HEADER_REFS_MAX).map(|i| (format!("refs/heads/b{i}"), oid.clone())).collect();
+        let err = format!("{:#}", parse_header(encode_header(&Header { refs: Some(many), ..bundle }).as_bytes()).unwrap_err());
+        assert!(err.contains("at most 8 refs"), "{err}");
         assert!(parse_header(b"{\"kind\":\"x\"}").is_err());
         assert!(parse_header(b"not json").is_err());
         assert!(check_size(10, 10).is_ok());

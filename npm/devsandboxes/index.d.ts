@@ -196,6 +196,16 @@ export interface SnapshotMachine {
 }
 
 /**
+ * `code.haves`' answer: what a member has under its fleet root for the caller. `roots`: the config
+ * root hashes unpacked there; `tips`: per repo identity asked about, its repo cache's tips (commit ids),
+ * absent for a repo with no cache there.
+ */
+export interface CodeHaves {
+  roots: string[];
+  tips: Record<string, string[]>;
+}
+
+/**
  * A host's capacity report (fleet). Sizes in bytes; `null` is unknown. Free memory and disk are
  * reported for a native Linux engine only (a VM-backed engine's are the VM's, not known here).
  */
@@ -1782,6 +1792,11 @@ export interface ApiMethods {
    * watched root needed. Placement asks each connected machine before placing a `run`.
    */
   'capacity.get': { params: {}; result: Capacity };
+  /**
+   * From a link peer only: what this host has under the caller's fleet root here (the roots unpacked, the
+   * tips of its cache of each of `repos`, at most 32 repo identities). `denied` from a local client.
+   */
+  'code.haves': { params: { repos: string[] }; result: CodeHaves };
   /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. */
   'member.get': { params: {}; result: MemberInfo };
   /**

@@ -2003,6 +2003,14 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Ok(json!({ "ok": true }))
         }
         "capacity.get" => serde_json::to_value(shared.capacity()).map_err(|e| api::ApiError::internal(e.into())),
+        // About the caller's own fleet root here, so only a peer has one.
+        "code.haves" => match &conn.table {
+            Table::Peer(peer) => match peer.fleet_root.as_deref() {
+                Some(root) => fleet::code::haves_call(root, &req.params),
+                None => Err(api::ApiError::denied("this host keeps no fleet root for the caller")),
+            },
+            Table::Full => Err(api::ApiError::denied("`code.haves` answers a link peer about its fleet root here: a local client has none")),
+        },
         // Local only: no link's table admits `member.*` (`fleet::lent`).
         method if method.starts_with("member.") => match &shared.member {
             Some(path) => {
@@ -3836,6 +3844,13 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), Some("denied".into()));
         assert_eq!(code(&mut conn, "machines.list", json!({})), Some("denied".into()));
         assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api", "key": attach_key()})), Some("denied".into()), "one-way");
+        // `code.haves`: about this peer's own fleet root only.
+        for (peer, hash) in [("lap.local", "0123456789abcdef"), ("other", "fedcba9876543210")] {
+            std::fs::create_dir_all(data.join("fleet").join(peer).join("roots").join(hash)).unwrap();
+        }
+        let r = conn.call("code.haves", json!({"repos": ["00000000000000aa"]})).unwrap();
+        assert_eq!(r.result, Some(json!({"roots": ["0123456789abcdef"], "tips": {}})), "{r:?}");
+        assert_eq!(code(&mut conn, "code.haves", json!({"repos": ["../x"]})), Some("invalid".into()));
 
         // `full` is read per request: the same connection opens up, but
         // `member.*` and `link.*` stay local.
@@ -3845,6 +3860,8 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
         assert_eq!(code(&mut conn, "membership.get", json!({})), Some("denied".into()));
         assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api", "key": attach_key()})), Some("denied".into()));
+        let r = conn.call("code.haves", json!({"repos": []})).unwrap();
+        assert_eq!(r.result, Some(json!({"roots": ["0123456789abcdef"], "tips": {}})), "full: still its own fleet root: {r:?}");
         drop(conn);
 
         // A bad `peer`, or no `channel`, leaves the connection as it was.
@@ -3854,6 +3871,7 @@ pub(crate) mod tests {
         // No proven key: no link stream.
         assert_eq!(code(&mut plain, "link.attach", json!({"peer": "lap", "channel": "api"})), Some("invalid".into()));
         assert_eq!(code(&mut plain, "member.get", json!({})), None, "still a local client");
+        assert_eq!(code(&mut plain, "code.haves", json!({"repos": []})), Some("denied".into()), "a local client has no fleet root");
         drop(plain);
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3943,6 +3961,8 @@ pub(crate) mod tests {
             size,
             sha256,
             to: None,
+            repo: None,
+            refs: None,
         };
         let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "transfer", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["ok"], true, "{answer}");

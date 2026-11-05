@@ -210,7 +210,7 @@ pub fn hub_pushes(hub: &str, worker: &str) -> bool {
 pub fn push(socket: &Path, binary: &Path) -> Result<()> {
     let open = || std::fs::File::open(binary).with_context(|| format!("cannot read {}", binary.display()));
     let (size, sha256) = transfer::digest(open()?).with_context(|| format!("cannot read {}", binary.display()))?;
-    let header = transfer::Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None };
+    let header = transfer::Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None, repo: None, refs: None };
     let stream = super::link::connect(socket, crate::devsbd::proto::channel::TRANSFER).with_context(|| format!("cannot connect to {}", socket.display()))?;
     transfer::send(stream, &header, open()?)
 }

@@ -32,7 +32,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `graph.get`, `capacity.get` | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `graph.get`, `capacity.get`, `code.haves` (peers only) | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -131,7 +131,7 @@ daemon answers in-process on the links it dials, and those after
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
-`roots.list` and the verbs but `gc` (`all` only while every instance here
+`code.haves`, `roots.list` and the verbs but `gc` (`all` only while every instance here
 is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true` but an `instances.watch`'s (a member watching its hub, which only the hub serves); every `root` / `dir`
 must be under this member's fleet root for the caller (a hub's, a fleet member's) or exactly one of its
 own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
@@ -1289,6 +1289,20 @@ This host's capacity report now, as its snapshots carry it (`Capacity`:
 `running`, `caps`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
 built on demand: no watched root needed. Params `{}`. On every link
 peer's connection: a host asks each machine before it places a `run --place`.
+
+### `code.haves`
+
+What this host has under the caller's fleet root here
+([fleet.md](../architecture/daemon/fleet.md#moving-code)), so a placing
+host sends only what's missing. Params `{"repos": ["<repo id>", …]}`:
+at most 32 repo identities (16 lowercase hex). Answer
+`{"roots": ["<hash>", …], "tips": {"<repo id>": ["<commit>", …]}}`
+(`CodeHaves`): the config root hashes unpacked there (at most 1024), and
+for each asked repo with a cache there its tips (at most 256, newest
+first); a repo with no cache is absent. On a link peer's connection
+only, under either trust, always about that peer's own fleet root.
+Errors: `invalid` (bad `repos`), `denied` (a local client: it has no
+fleet root), `internal`.
 
 ### The `machine` param
 

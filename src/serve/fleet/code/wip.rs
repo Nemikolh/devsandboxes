@@ -80,7 +80,7 @@ pub fn snapshot(checkout: &Path, wip_ref: &str) -> Result<Snapshot> {
 /// [`check_rev`]) and leave its index at `HEAD`: what the snapshot had
 /// modified, deleted or added shows as uncommitted changes (added files
 /// as untracked). `read-tree -u --reset` then a mixed `reset`, LFS smudge
-/// off as `repo::land`'s. It overwrites the working tree: meant for a
+/// off as `repo::land_from`'s. It overwrites the working tree: meant for a
 /// checkout the transfer just made (decision 73).
 pub fn apply_wip(checkout: &Path, wip: &str) -> Result<()> {
     check_rev(wip)?;

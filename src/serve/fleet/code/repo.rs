@@ -1,8 +1,10 @@
 //! A sandbox folder's repo moved as a git bundle (docs/architecture/daemon/fleet.md,
 //! *Moving code*; fleet plan decision 12): the hub fetches the folder's
 //! `origin` into its own bare repo cache with its own credentials and
-//! bundles one branch from there; the worker unpacks the bundle into a
-//! checkout with no remote, never needing credentials. All git runs through
+//! bundles one branch from there, `--not` what the worker has; the worker
+//! takes the bundle into its own cache for that repo ([`unbundle`],
+//! [`set_refs`]) and cuts a checkout with no remote from it
+//! ([`land_from`]), never needing credentials. All git runs through
 //! `commands::run`'s `host_git` family
 //! (docs/decisions/0003-host-git-never-runs-repo-controlled-code.md):
 //! hooks and fsmonitor off, the repo's config checked first. Every git child
@@ -80,14 +82,6 @@ pub fn has_branch(cache: &Path, branch: &str) -> Result<bool> {
     Ok(commit_at(Repo::Bare(cache), &format!("refs/heads/{branch}"))?.is_some())
 }
 
-/// A bundle of `cache`'s `branch` (every commit of it) at `out`.
-pub fn bundle(cache: &Path, branch: &str, out: &Path) -> Result<()> {
-    check_branch(branch)?;
-    run(host_git_bare(cache)?.args(["bundle", "create", "-q"]).arg(out).arg(format!("refs/heads/{branch}")), WHOLE)
-        .with_context(|| format!("cannot bundle {branch}"))?;
-    Ok(())
-}
-
 /// A branch name as devsandbox moves it: plain characters
 /// (`[A-Za-z0-9._+/-]`), `/`-separated components that don't start with
 /// `.` or `-`, no `..`, not ending `.lock`; at most 200 bytes. Narrower than
@@ -102,14 +96,71 @@ pub fn check_branch(branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// The worker's end: unpack `bundle` (one `refs/heads/<branch>`) into the
-/// checkout at `at`, made (with its parents) if missing; the branch's name.
-/// A new checkout gets the branch checked out; an existing one (a checkout
-/// a bundle made before) gets the branch updated: fast-forwarded when it's
-/// the one checked out, else moved to the bundle's (it's the hub's copy).
-/// The checkout has no remote. A dir that exists and isn't a checkout is
-/// refused, unless empty.
-pub fn land(bundle: &Path, at: &Path) -> Result<String> {
+/// A repo identity ([`identity`]) as caches are named by it: 16 lowercase
+/// hex.
+pub fn check_id(id: &str) -> Result<()> {
+    if id.len() != 16 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        bail!("`{id}` isn't a repo identity");
+    }
+    Ok(())
+}
+
+/// The WIP ref a branch's snapshot travels on (fleet plan decision 73),
+/// in a bundle and in the receiver's cache: `refs/devsandbox/wip/<branch>`.
+pub fn wip_ref(branch: &str) -> String {
+    format!("refs/devsandbox/wip/{branch}")
+}
+
+/// Make the bare repo cache at `cache` (an existing, real dir the caller
+/// made) if it isn't one yet.
+pub fn ensure_bare(cache: &Path) -> Result<()> {
+    if !cache.join("HEAD").exists() {
+        run(host_git_new(cache)?.args(["init", "-q", "--bare"]), QUICK)
+            .with_context(|| format!("cannot make the repo cache {}", cache.display()))?;
+    }
+    Ok(())
+}
+
+/// The objects of the bundle at `bundle` into the bare repo `cache`, no
+/// ref touched (`bundle unbundle`, refs are [`set_refs`]'). A bundle
+/// whose prerequisites `cache` lacks fails here, with git's why.
+pub fn unbundle(cache: &Path, bundle: &Path) -> Result<()> {
+    run(host_git_bare(cache)?.args(["bundle", "unbundle"]).arg(bundle), WHOLE).context("cannot take the bundle")?;
+    Ok(())
+}
+
+/// Set each of `refs` (full name → commit id, both checked) in the bare
+/// repo `cache`, forced: the sender's copy wins in its cache. Every commit
+/// must be one `cache` has, checked before any ref moves.
+pub fn set_refs(cache: &Path, refs: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    for (name, id) in refs {
+        check_ref(name)?;
+        check_oid(id)?;
+        if commit_at(Repo::Bare(cache), id)?.as_deref() != Some(id.as_str()) {
+            bail!("{name}'s commit {id} is neither in the bundle nor already here");
+        }
+    }
+    for (name, id) in refs {
+        run(host_git_bare(cache)?.args(["update-ref", name, id]), QUICK).with_context(|| format!("cannot set {name}"))?;
+    }
+    Ok(())
+}
+
+/// Cut the checkout at `at` from the bare repo `cache`: its `branch`
+/// (`refs/heads/<branch>` there). A new checkout (no `.git`; `at` made
+/// with its parents if missing, refused when it exists non-empty) gets the
+/// branch checked out and, with `wip` (a commit `cache` has, the branch's
+/// snapshot), that snapshot's tree applied as uncommitted changes
+/// (`wip::apply_wip`; the ref fetched for it is dropped after). An
+/// existing one (a checkout a transfer made before; an instance may be
+/// using it) only gets the branch moved: fast-forwarded when it's the one
+/// checked out, else set to the cache's; `wip` is left out (decision 73).
+/// The checkout has no remote.
+pub fn land_from(cache: &Path, at: &Path, branch: &str, wip: Option<&str>) -> Result<()> {
+    check_branch(branch)?;
+    if let Some(w) = wip {
+        check_oid(w)?;
+    }
     let fresh = !at.join(".git").exists();
     if fresh {
         std::fs::create_dir_all(at).with_context(|| format!("cannot create {}", at.display()))?;
@@ -118,44 +169,42 @@ pub fn land(bundle: &Path, at: &Path) -> Result<String> {
         }
         run(host_git_new(at)?.args(["init", "-q"]), QUICK)?;
     }
-    let heads = run(host_git(at)?.args(["bundle", "list-heads"]).arg(bundle), QUICK).context("not a git bundle")?;
-    let refs: Vec<&str> = heads.lines().filter_map(|l| l.split_whitespace().nth(1)).collect();
-    let branch = match refs.as_slice() {
-        [one] => one.strip_prefix("refs/heads/").with_context(|| format!("the bundle carries {one}, not a branch"))?,
-        _ => bail!("the bundle carries {} refs, not one branch", refs.len()),
-    };
-    check_branch(branch)?;
     let head = optional(host_git(at)?.args(["symbolic-ref", "-q", "HEAD"]))?;
     let full = format!("refs/heads/{branch}");
-    let fetch = |refspec: &str| -> Result<()> {
-        run(host_git(at)?.args(["fetch", "-q", "--no-tags", "--update-head-ok"]).arg(bundle).arg(refspec), WHOLE)
-            .with_context(|| format!("cannot fetch {branch} from the bundle"))?;
+    let fetch = |refspecs: &[String]| -> Result<()> {
+        run(host_git(at)?.args(["fetch", "-q", "--no-tags", "--update-head-ok"]).arg(cache).args(refspecs), WHOLE)
+            .with_context(|| format!("cannot fetch {branch} from the repo cache"))?;
         Ok(())
     };
     if fresh {
         run(host_git(at)?.args(["symbolic-ref", "HEAD"]).arg(&full), QUICK)?;
-        fetch(&format!("+{full}:{full}"))?;
+        let wip_at = wip.map(|_| wip_ref(branch));
+        let mut refspecs = vec![format!("+{full}:{full}")];
+        refspecs.extend(wip_at.iter().map(|w| format!("+{w}:{w}")));
+        fetch(&refspecs)?;
         run(host_git(at)?.args(["reset", "-q", "--hard"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)?;
+        if let (Some(w), Some(wip_at)) = (wip, wip_at) {
+            super::wip::apply_wip(at, w)?;
+            run(host_git(at)?.args(["update-ref", "-d", &wip_at]), QUICK)?;
+        }
     } else if head.as_deref() == Some(full.as_str()) {
-        fetch(&full)?;
+        fetch(std::slice::from_ref(&full))?;
         run(host_git(at)?.args(["merge", "-q", "--ff-only", "FETCH_HEAD"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)
             .with_context(|| format!("cannot fast-forward {branch} in {}", at.display()))?;
     } else {
-        fetch(&format!("+{full}:{full}"))?;
+        fetch(&[format!("+{full}:{full}")])?;
     }
-    Ok(branch.to_string())
+    Ok(())
 }
 
 /// Which repo a git call is for: a checkout ([`host_git`]) or a bare repo
 /// devsandbox keeps, as a repo cache ([`host_git_bare`]).
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))] // callers in fleet steps 12b-12e
 pub enum Repo<'a> {
     Checkout(&'a Path),
     Bare(&'a Path),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Repo<'_> {
     fn git(&self) -> Result<Command> {
         match self {
@@ -200,7 +249,6 @@ pub const HAVES_CAP: usize = 256;
 /// needed. A merge of an unrelated history adds a root and so changes it.
 /// `rev` is `HEAD`, a full ref or a commit id ([`check_rev`]). Not a trust
 /// boundary: it names caches.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn identity(repo: Repo, rev: &str) -> Result<String> {
     check_rev(rev)?;
     let out = run(repo.git()?.args(["rev-list", "--max-parents=0"]).arg(rev).arg("--"), WHOLE)
@@ -256,7 +304,7 @@ pub(super) fn head_commit(checkout: &Path) -> Result<Option<String>> {
 }
 
 /// The commit `rev` names in `repo`, `None` when there's none.
-fn commit_at(repo: Repo, rev: &str) -> Result<Option<String>> {
+pub(super) fn commit_at(repo: Repo, rev: &str) -> Result<Option<String>> {
     optional(repo.git()?.args(["rev-parse", "-q", "--verify"]).arg(format!("{rev}^{{commit}}")))
 }
 
@@ -265,7 +313,6 @@ fn commit_at(repo: Repo, rev: &str) -> Result<Option<String>> {
 /// considered) that name commits `repo` has: unknown ones are dropped, so a
 /// receiver's haves from elsewhere never fail the bundle. `false` and no
 /// file when the receiver has everything already.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn bundle_refs(repo: Repo, refs: &[&str], haves: &[String], out: &Path) -> Result<bool> {
     if refs.is_empty() {
         bail!("nothing to bundle");
@@ -312,7 +359,6 @@ fn known_commits(repo: Repo, haves: &[String]) -> Result<Vec<String>> {
 /// The commits `repo`'s refs point at (tags and other non-commits left
 /// out), deduped, the most recently committed first, at most
 /// [`HAVES_CAP`]: what a receiver answers as its haves.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn tips(repo: Repo) -> Result<Vec<String>> {
     let out = run(
         repo.git()?.args(["for-each-ref", "--sort=-committerdate", "--format=%(objecttype) %(objectname)"]),
@@ -491,10 +537,24 @@ pub(crate) mod tests {
         fetch(&cache, probed.origin.as_deref().unwrap()).unwrap();
         assert!(has_branch(&cache, "feature").unwrap());
         assert!(!has_branch(&cache, "nope").unwrap());
-        bundle(&cache, "feature", &dir.join("f.bundle")).unwrap();
 
+        // The worker's cache, and a checkout cut from it.
+        let worker = dir.join("worker/c.git");
+        std::fs::create_dir_all(&worker).unwrap();
+        ensure_bare(&worker).unwrap();
+        ensure_bare(&worker).unwrap();
+        let send = |branch: &str, name: &str| {
+            let full = format!("refs/heads/{branch}");
+            let file = dir.join(name);
+            if bundle_refs(Repo::Bare(&cache), &[&full], &tips(Repo::Bare(&worker)).unwrap(), &file).unwrap() {
+                unbundle(&worker, &file).unwrap();
+            }
+            let id = commit_at(Repo::Bare(&cache), &full).unwrap().unwrap();
+            set_refs(&worker, &[(full, id)].into()).unwrap();
+        };
+        send("feature", "f.bundle");
         let at = dir.join("worker/web");
-        assert_eq!(land(&dir.join("f.bundle"), &at).unwrap(), "feature");
+        land_from(&worker, &at, "feature", None).unwrap();
         assert_eq!(std::fs::read_to_string(at.join("F")).unwrap(), "feature\n");
         assert_eq!(git(&at, &["symbolic-ref", "--short", "HEAD"]), "feature");
         assert_eq!(git(&at, &["remote"]), "", "no remote on the worker");
@@ -506,28 +566,57 @@ pub(crate) mod tests {
         git(&seed, &["commit", "-q", "-am", "two"]);
         git(&seed, &["push", "-q", origin.to_str().unwrap(), "feature"]);
         fetch(&cache, origin.to_str().unwrap()).unwrap();
-        bundle(&cache, "feature", &dir.join("f2.bundle")).unwrap();
-        land(&dir.join("f2.bundle"), &at).unwrap();
+        send("feature", "f2.bundle");
+        land_from(&worker, &at, "feature", None).unwrap();
         assert_eq!(std::fs::read_to_string(at.join("F")).unwrap(), "feature 2\n");
-        // Another branch into it: updated, not checked out.
-        bundle(&cache, "main", &dir.join("m.bundle")).unwrap();
-        assert_eq!(land(&dir.join("m.bundle"), &at).unwrap(), "main");
+        // Another branch into it: updated, not checked out (`main` is in
+        // the worker's cache already: no bundle).
+        send("main", "m.bundle");
+        assert!(!dir.join("m.bundle").exists());
+        land_from(&worker, &at, "main", None).unwrap();
         assert_eq!(git(&at, &["symbolic-ref", "--short", "HEAD"]), "feature");
         assert_eq!(git(&at, &["rev-parse", "main"]), git(&origin, &["rev-parse", "main"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn land_refuses_a_dir_that_isnt_a_checkout_and_bad_bundles() {
+    fn the_cache_refuses_bad_bundles_and_missing_commits_and_land_a_dir_that_isnt_a_checkout() {
         let dir = scratch("land-refuses");
+        let cache = dir.join("c.git");
+        std::fs::create_dir_all(&cache).unwrap();
+        ensure_bare(&cache).unwrap();
+        std::fs::write(dir.join("junk.bundle"), "not a bundle").unwrap();
+        let err = format!("{:#}", unbundle(&cache, &dir.join("junk.bundle")).unwrap_err());
+        assert!(err.contains("cannot take the bundle"), "{err}");
+        // A delta whose prerequisite the cache lacks.
+        let a = one_commit(&dir, "a", "one\n");
+        let base = git(&a, &["rev-parse", "HEAD"]);
+        std::fs::write(a.join("f"), "two\n").unwrap();
+        git(&a, &["commit", "-q", "-am", "two"]);
+        let delta = dir.join("d.bundle");
+        assert!(bundle_refs(Repo::Checkout(&a), &["refs/heads/main"], &[base], &delta).unwrap());
+        assert!(unbundle(&cache, &delta).is_err());
+        // A ref naming a commit the cache doesn't have: no ref moves.
+        let head = git(&a, &["rev-parse", "HEAD"]);
+        let err = format!("{:#}", set_refs(&cache, &[("refs/heads/main".to_string(), head)].into()).unwrap_err());
+        assert!(err.contains("is neither in the bundle nor already here"), "{err}");
+        assert_eq!(tips(Repo::Bare(&cache)).unwrap(), Vec::<String>::new());
+
         std::fs::create_dir_all(dir.join("full")).unwrap();
         std::fs::write(dir.join("full/x"), "x").unwrap();
-        std::fs::write(dir.join("junk.bundle"), "not a bundle").unwrap();
-        let err = format!("{:#}", land(&dir.join("junk.bundle"), &dir.join("full")).unwrap_err());
+        let err = format!("{:#}", land_from(&cache, &dir.join("full"), "main", None).unwrap_err());
         assert!(err.contains("isn't a git checkout"), "{err}");
-        let err = format!("{:#}", land(&dir.join("junk.bundle"), &dir.join("empty")).unwrap_err());
-        assert!(err.contains("not a git bundle"), "{err}");
+        let err = format!("{:#}", land_from(&cache, &dir.join("empty"), "main", None).unwrap_err());
+        assert!(err.contains("cannot fetch main from the repo cache"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ids_are_checked() {
+        check_id("0123456789abcdef").unwrap();
+        for bad in ["", "0123456789abcde", "0123456789ABCDEF", "0123456789abcdefa", "../../../../etc/x"] {
+            assert!(check_id(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -522,13 +522,15 @@ limitation means editing this file in the same commit.
   doesn't move. `folders` entries inside the root travel in its tar
   without their `.git`. The root's tar skips `.git`, `.worktrees`,
   `shared-volumes` and `shared-files` but not git-ignored files, and a
-  symlink pointing out of the root refuses it. Everything is sent every
-  time (`Transfer::haves` asks nothing; the worker keeps a root it has),
-  the repo cache is keyed by origin URL (not by root commits) and never
-  pruned, a worker's moved checkout keeps the branch it first checked out
+  symlink pointing out of the root refuses it. A repeat send carries only
+  what the worker lacks (`code.haves`: a root it has isn't sent again, a
+  bundle goes `--not` its cache's tips), but a first send goes whole.
+  The hub's repo cache is keyed by origin URL (not by root commits); it
+  and the worker's cache per repo under its fleet root are never pruned,
+  a worker's moved checkout keeps the branch it first checked out
   (later bundles update other branches' refs), and `roots/<hash>/` trees
   are never removed.
-  → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::repo::land`
+  → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::repo::land_from`
 - What ties a sandbox to its host (a bind outside the config root and its
   moved folders, `${localEnv:…}`, `caches`, `privileged`, …) keeps it
   home whatever a worker's trust or `member.toml` allowances: nothing
