@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
+      git: ${{ steps.check.outputs.git }}
     steps:
       - uses: actions/checkout@v5
       - id: check
@@ -32,6 +33,15 @@ jobs:
             ' "$pkg" "$version"
           done
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # The git hash build.rs `stamp_build` puts in every build's fleet
+          # `Hello` (same command, same checkout): one value all four `build`
+          # runners are checked against.
+          git=$(git rev-parse --short=12 HEAD)
+          if ! [[ "$git" =~ ^[0-9a-f]{12}$ ]]; then
+            echo "git rev-parse --short=12 HEAD gave '$git', not a 12-digit hash" >&2
+            exit 1
+          fi
+          echo "git=$git" >> "$GITHUB_OUTPUT"
 
   devsbd:
     needs: version
@@ -62,14 +72,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # platform: the `<os>/<arch>` (std::env::consts) its fleet-hello says.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            platform: linux/x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
+            platform: linux/aarch64
           - target: aarch64-apple-darwin
             os: macos-latest
+            platform: macos/aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            platform: windows/x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -97,6 +112,22 @@ jobs:
           # these archives are the release assets a fleet member downloads to
           # follow a hub on this version (`fleet::update::asset_url`).
           DEVSANDBOX_PUBLISHED: "1"
+      # These binaries are what fleet members download to follow a published
+      # hub, and the member checks the download's `fleet-hello` is the hub's
+      # build: a wrong stamp (`dev`, `unknown` git, another platform) makes
+      # members re-download in a loop or refuse the hub.
+      - name: Check the fleet stamp
+        shell: bash
+        env:
+          WANT: ${{ needs.version.outputs.version }} ${{ needs.version.outputs.git }} published ${{ matrix.platform }}
+          BIN: target/${{ matrix.target }}/release/devsandbox${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+        run: |
+          got=$("$BIN" fleet-hello)
+          echo "fleet-hello: $got"
+          if [ "$got" != "$WANT" ]; then
+            echo "::error::fleet-hello is '$got', want '$WANT'"
+            exit 1
+          fi
       - name: Package
         shell: bash
         run: |

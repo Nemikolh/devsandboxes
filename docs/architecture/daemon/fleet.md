@@ -1471,7 +1471,10 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   release workflow (`.github/workflows/release.yml`, its `build` job) sets
   it for every release asset, so the GitHub archives and the npm platform
   packages (staged from those archives) are `published`, all of one tag's
-  commit; a crates.io build (`cargo install`) is `dev`, its git hash
+  commit; its `Check the fleet stamp` step fails the job unless each
+  binary's `fleet-hello` is exactly the tag's version, the `version` job's
+  `git rev-parse --short=12 HEAD`, `published` and the runner's
+  `<os>/<arch>`. A crates.io build (`cargo install`) is `dev`, its git hash
   whatever repo encloses cargo's source dir (`unknown` in none). `Build::parse` reads the first three words back
   (a missing one is `unknown` / dev), `update::platform_of` the fourth
   (`unknown` without one): the platform isn't part of the build, one
