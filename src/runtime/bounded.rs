@@ -59,7 +59,9 @@ pub fn human(d: Duration) -> String {
 /// Run `cmd` (stdin as the caller set it) with stdout and stderr piped:
 /// stdout is kept up to `cap` bytes — one more kills the child and sets
 /// `truncated` — and a child still running after `timeout` is killed and
-/// reaped ([`Error::TimedOut`]).
+/// reaped ([`Error::TimedOut`]). A child spawned as its own process group
+/// (`process_group(0)`) is killed with its group, so its own children
+/// (git's `pack-objects`, say) go too.
 pub fn run(cmd: &mut Command, cap: usize, timeout: Duration) -> Result<Output, Error> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(Error::Io)?;
     let over = Arc::new(AtomicBool::new(false));
@@ -68,17 +70,15 @@ pub fn run(cmd: &mut Command, cap: usize, timeout: Duration) -> Result<Output, E
     let status = match wait_until(&mut child, Instant::now() + timeout, || over.load(Ordering::Acquire)) {
         Ok(Some(status)) => status,
         Ok(None) if over.load(Ordering::Acquire) => {
-            let _ = child.kill();
+            kill_group(&mut child);
             child.wait().map_err(Error::Io)?
         }
         Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             return Err(Error::TimedOut(timeout));
         }
         Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             return Err(Error::Io(e));
         }
     };
@@ -143,7 +143,8 @@ pub fn wait_until(child: &mut Child, deadline: Instant, stop: impl Fn() -> bool)
 
 /// Kill `child`'s whole process group (on unix it must have been spawned with
 /// `process_group(0)`, so its pgid is its pid) and reap it, so grandchildren
-/// (docker, git) die with it. Elsewhere only `child` itself is killed.
+/// (docker, git) die with it. Elsewhere only `child` itself is killed; so is
+/// a unix child that isn't a group leader (no group has its pid as id).
 pub fn kill_group(child: &mut Child) {
     #[cfg(unix)]
     {

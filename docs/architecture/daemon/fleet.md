@@ -810,6 +810,44 @@ for `git init`; hooks and fsmonitor off, repo config checked. Branch
 names are `repo::check_branch`'s (plain characters, no `..`, no
 component starting `.` or `-`). Under the fleet root the moved root and
 checkouts fall under the [worker policy](#worker-policy) like any other.
+Every git child is bounded (`repo::run`, `repo::optional` over
+`runtime::bounded::run`): a stdout cap, `repo::QUICK` (1 min) for
+queries and plumbing, `repo::WHOLE` (30 min) for work over a whole repo
+or tree (fetch, bundle, `add -A`, a checkout's reset); each git is its
+own process group, killed whole at its timeout.
+
+**Git plumbing** (fleet plan decisions 71, 73; what the repo caches,
+sending from the checkout and fetch-back build on). Revisions reaching
+git's argv are checked first: `repo::check_rev` (`HEAD`, a full ref
+`repo::check_ref`, or a 40/64-hex commit id `repo::check_oid`).
+
+- `repo::identity` (a checkout or a bare cache, `repo::Repo`): the first
+  16 hex of the sha256 over the sorted root commit ids of a revision's
+  history, each followed by `\n`. The same in every clone; merging an
+  unrelated history changes it.
+- `repo::ensure_root`: for a checkout whose `HEAD` has no commit,
+  `refs/devsandbox/root` (`repo::ROOT_REF`), an empty-tree commit made
+  once (create-only `update-ref`) with devsandbox's fixed identity
+  (`repo::IDENTITY`), unsigned, a nonce in its message so two empty repos
+  differ.
+- `wip::snapshot`: the working tree as one commit (`wip::Snapshot`: base,
+  branch, wip) over `HEAD` (or the root), onto a `refs/devsandbox/…` ref
+  (`wip::check_wip_ref`). A temp index in the checkout's own git dir (a
+  linked worktree's for one), removed on drop, through `GIT_INDEX_FILE`:
+  `read-tree <base>`, `add -A` (tracked changes, deletions, untracked
+  non-ignored files), `write-tree`, `commit-tree` with `repo::IDENTITY`,
+  `update-ref`. The user's index, `HEAD`, branches, stash and working
+  tree don't change.
+- `wip::apply_wip`: a checkout's working tree set to a snapshot's tree
+  (`read-tree -u --reset`, LFS smudge off) and its index back at `HEAD`
+  (mixed `reset`), so the snapshot's changes show as uncommitted ones.
+  It overwrites the working tree.
+- `repo::bundle_refs`: full refs bundled `--not` the haves that are
+  commits there (`cat-file --batch-check` over a temp list; unknown ones
+  dropped, at most `repo::HAVES_CAP` considered); nothing new
+  (`rev-list --count` is 0) is no bundle.
+- `repo::tips`: the commits a repo's refs point at, newest first,
+  deduped, at most `repo::HAVES_CAP`.
 
 ## Hub mode
 

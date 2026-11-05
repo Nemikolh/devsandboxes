@@ -23,6 +23,7 @@
 
 pub mod repo;
 pub mod tar;
+pub mod wip;
 
 use std::collections::BTreeSet;
 use std::io::Read;
