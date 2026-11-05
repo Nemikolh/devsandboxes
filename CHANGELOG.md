@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 One user model on every runtime: inside a sandbox you are a user with your host uid/gid, so workspace files come out owned by you on rootful docker, rootless docker, rootless podman and VM-backed runtimes alike. Browsers keep their own sandbox wherever it can work, and tools are told when it can't. Interactive `exec` sessions survive a dropped connection: `--attach` gets the program back, and a machine's terminal reconnects by itself. Machines become one fleet: members with their own keys and trust, a hub, routing through other members, `run --place` to send a sandbox where there's room and `devsandbox fetch` to bring the work back. **Fleet is experimental in 0.9.0:** its commands, config, files and the protocol between machines may change between releases with no migration, so don't use it for anything you can't redo. Its entries are grouped under *Experimental: fleet* below.
 
