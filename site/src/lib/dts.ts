@@ -13,6 +13,8 @@ export interface Member {
   optional: boolean;
   readonly: boolean;
   doc: string;
+  /** JSDoc `@experimental` (fleet: may change between releases). */
+  experimental: boolean;
 }
 
 export interface Param {
@@ -35,6 +37,7 @@ export interface Signature {
   params: Param[];
   returns: string;
   doc: string;
+  experimental: boolean;
 }
 
 export interface FunctionDecl {
@@ -44,14 +47,15 @@ export interface FunctionDecl {
   signatures: Signature[];
 }
 
+/** `experimental`: as {@link Member.experimental}; a function's is per overload. */
 export type Decl =
-  | { kind: 'const'; name: string; type: string; doc: string }
-  | { kind: 'type'; name: string; typeParams: string; type: string; doc: string }
-  | { kind: 'interface'; name: string; typeParams: string; extends: string[]; members: Member[]; doc: string }
-  | { kind: 'class'; name: string; extends: string[]; members: Member[]; doc: string }
+  | { kind: 'const'; name: string; type: string; doc: string; experimental: boolean }
+  | { kind: 'type'; name: string; typeParams: string; type: string; doc: string; experimental: boolean }
+  | { kind: 'interface'; name: string; typeParams: string; extends: string[]; members: Member[]; doc: string; experimental: boolean }
+  | { kind: 'class'; name: string; extends: string[]; members: Member[]; doc: string; experimental: boolean }
   | FunctionDecl
   /** An exported const object of methods (`service.ls()`), shown like a namespace. */
-  | { kind: 'namespace'; name: string; functions: FunctionDecl[]; doc: string };
+  | { kind: 'namespace'; name: string; functions: FunctionDecl[]; doc: string; experimental: boolean };
 
 export interface Group {
   /** From the file's `// ----` / `// Title` banner; null before the first one. */
@@ -68,10 +72,18 @@ class DtsError extends Error {
 
 const collapse = (s: string) => s.replace(/\s+/g, ' ').trim();
 
+function lastDoc(node: ts.Node): ts.JSDoc | undefined {
+  return ts.getJSDocCommentsAndTags(node).filter(ts.isJSDoc).at(-1);
+}
+
 function docOf(node: ts.Node): string {
-  const docs = ts.getJSDocCommentsAndTags(node).filter(ts.isJSDoc);
-  const last = docs.at(-1);
+  const last = lastDoc(node);
   return last ? (ts.getTextOfJSDocComment(last.comment) ?? '').trim() : '';
+}
+
+/** `@experimental` in the same (last) JSDoc block {@link docOf} reads. */
+function experimentalOf(node: ts.Node): boolean {
+  return lastDoc(node)?.tags?.some((t) => t.tagName.text === 'experimental') ?? false;
 }
 
 function paramDoc(p: ts.ParameterDeclaration): string {
@@ -106,6 +118,7 @@ function membersOf(sf: ts.SourceFile, elements: readonly (ts.TypeElement | ts.Cl
       optional: !!m.questionToken,
       readonly: hasModifier(m, ts.SyntaxKind.ReadonlyKeyword),
       doc: docOf(m),
+      experimental: experimentalOf(m),
     };
   });
 }
@@ -136,6 +149,7 @@ function signatureOf(sf: ts.SourceFile, node: ts.FunctionDeclaration | ts.Method
     })),
     returns: typeText(sf, node, node.type),
     doc: docOf(node),
+    experimental: experimentalOf(node),
   };
 }
 
@@ -178,6 +192,7 @@ function declsOf(sf: ts.SourceFile, stmt: ts.Statement, out: Decl[]) {
       extends: extendsOf(sf, stmt),
       members: membersOf(sf, stmt.members),
       doc: docOf(stmt),
+      experimental: experimentalOf(stmt),
     });
   } else if (ts.isTypeAliasDeclaration(stmt)) {
     out.push({
@@ -187,6 +202,7 @@ function declsOf(sf: ts.SourceFile, stmt: ts.Statement, out: Decl[]) {
       // Kept as written: multi-line unions read better in their own layout.
       type: stmt.type.getText(sf),
       doc: docOf(stmt),
+      experimental: experimentalOf(stmt),
     });
   } else if (ts.isClassDeclaration(stmt) && stmt.name) {
     out.push({
@@ -195,11 +211,13 @@ function declsOf(sf: ts.SourceFile, stmt: ts.Statement, out: Decl[]) {
       extends: extendsOf(sf, stmt),
       members: membersOf(sf, stmt.members),
       doc: docOf(stmt),
+      experimental: experimentalOf(stmt),
     });
   } else if (ts.isFunctionDeclaration(stmt) && stmt.name) {
     pushFunction(out, stmt.name.text, signatureOf(sf, stmt));
   } else if (ts.isVariableStatement(stmt)) {
     const doc = docOf(stmt);
+    const experimental = experimentalOf(stmt);
     for (const d of stmt.declarationList.declarations) {
       const name = nameText(sf, d, d.name);
       const t = d.type;
@@ -208,9 +226,9 @@ function declsOf(sf: ts.SourceFile, stmt: ts.Statement, out: Decl[]) {
         for (const m of t.members as ts.NodeArray<ts.MethodSignature>) {
           pushFunction(functions, nameText(sf, m, m.name), signatureOf(sf, m));
         }
-        out.push({ kind: 'namespace', name, functions, doc });
+        out.push({ kind: 'namespace', name, functions, doc, experimental });
       } else {
-        out.push({ kind: 'const', name, type: typeText(sf, d, t), doc });
+        out.push({ kind: 'const', name, type: typeText(sf, d, t), doc, experimental });
       }
     }
   } else {

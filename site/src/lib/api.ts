@@ -203,6 +203,8 @@ export interface Row {
   readonly?: boolean;
   type: string;
   doc: string;
+  /** JSDoc `@experimental`: the row gets the Experimental badge. */
+  experimental?: boolean;
 }
 
 /** `<code>` list of names, declared ones linked. */
@@ -228,13 +230,21 @@ export function paramRows(sig: Signature, known: ReadonlyMap<string, string>): R
         optional: m.optional,
         type: m.type,
         doc: docHtml(m.doc, known),
+        experimental: m.experimental,
       })),
     ];
   });
 }
 
 export function memberRows(members: Member[], known: ReadonlyMap<string, string>): Row[] {
-  return members.map((m) => ({ name: m.name, optional: m.optional, readonly: m.readonly, type: m.type, doc: docHtml(m.doc, known) }));
+  return members.map((m) => ({
+    name: m.name,
+    optional: m.optional,
+    readonly: m.readonly,
+    type: m.type,
+    doc: docHtml(m.doc, known),
+    experimental: m.experimental,
+  }));
 }
 
 /** The first fenced block of `lang` under the `## heading` of a Markdown file. */

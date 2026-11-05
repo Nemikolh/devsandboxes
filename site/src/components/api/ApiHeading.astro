@@ -1,5 +1,8 @@
 ---
-// h3 of one declaration: permalink, monospace name, kind badge.
+// h3 of one declaration: permalink, monospace name, kind badge, and the
+// Experimental badge for a JSDoc `@experimental` declaration.
+import Experimental from '../Experimental.astro';
+
 interface Props {
   id: string;
   /** Qualifier shown dimmed before the name (`service.`). */
@@ -8,13 +11,15 @@ interface Props {
   /** Dimmed suffix: `()` for functions, type parameters for generics. */
   suffix?: string;
   kind: string;
+  experimental?: boolean;
 }
 
-const { id, prefix, name, suffix, kind } = Astro.props;
+const { id, prefix, name, suffix, kind, experimental } = Astro.props;
 ---
 
 <h3 id={id} class="api-name">
   <a class="heading-anchor" href={`#${id}`} aria-label={`Link to section: ${prefix ?? ''}${name}${suffix ?? ''}`}></a>
   <span class="api-name-text">{prefix && <span class="api-name-dim">{prefix}</span>}{name}{suffix && <span class="api-name-dim">{suffix}</span>}</span>
   <span class={`api-kind api-kind-${kind}`}>{kind}</span>
+  {experimental && <Experimental />}
 </h3>

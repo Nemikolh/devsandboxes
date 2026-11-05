@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { anchorId, docHtml, inherited, linkableTypes, markdownFence, signatureCode, typeHtml, usedBy } from './api';
+import { anchorId, docHtml, inherited, linkableTypes, markdownFence, memberRows, signatureCode, typeHtml, usedBy } from './api';
 import { parseDts } from './dts';
 
 const SAMPLE = `
@@ -10,13 +10,16 @@ export declare const SCHEMA: 1;
 // ----------------------------------------------------------------------------
 // Payloads
 
-/** Liveness. */
+/** Liveness. @experimental */
 export type Status =
   | { state: 'running'; text: string }
   | { state: 'missing' };
 
 export interface Base {
-  /** Config root. */
+  /**
+   * Config root.
+   * @experimental
+   */
   dir?: string;
 }
 
@@ -39,7 +42,7 @@ export declare function f(a: number, opts?: Base & { all?: boolean }): Promise<v
 export declare function g<T = unknown>(name: string, opts?: Opts): Promise<T>;
 
 export declare const svc: {
-  /** Listing. */
+  /** Listing. @experimental */
   ls(opts?: Base): Promise<Status[]>;
 };
 `;
@@ -89,6 +92,19 @@ describe('parseDts', () => {
     });
   });
 
+  it('reads @experimental tags apart from the doc text', () => {
+    const [status, base, opts] = groups[1].decls;
+    expect(status).toMatchObject({ doc: 'Liveness.', experimental: true });
+    expect(base).toMatchObject({ experimental: false, members: [{ name: 'dir', doc: 'Config root.', experimental: true }] });
+    expect(opts).toMatchObject({ experimental: false, members: [{ experimental: false }] });
+    expect(groups[2].decls[2]).toMatchObject({
+      experimental: false,
+      functions: [{ signatures: [{ doc: 'Listing.', experimental: true }] }],
+    });
+    if (base.kind !== 'interface') throw new Error('not an interface');
+    expect(memberRows(base.members, linkableTypes(groups))).toMatchObject([{ name: 'dir', experimental: true }]);
+  });
+
   it('fails on declarations it cannot render', () => {
     expect(() => parseDts('export declare enum E { A }')).toThrow(/index\.d\.ts:1: unsupported declaration/);
     expect(() => parseDts('interface Private {}')).toThrow(/non-exported/);
@@ -99,6 +115,20 @@ describe('parseDts', () => {
     const src = readFileSync(new URL('../../../npm/devsandboxes/index.d.ts', import.meta.url), 'utf8');
     const titles = parseDts(src).map((g) => g.title);
     expect(titles).toEqual([null, 'Payloads', 'Options & results', 'API', 'Daemon API']);
+  });
+
+  it('marks the published fleet typings experimental', () => {
+    const src = readFileSync(new URL('../../../npm/devsandboxes/index.d.ts', import.meta.url), 'utf8');
+    const decls = parseDts(src).flatMap((g) => g.decls);
+    const find = (name: string) => decls.find((d) => d.name === name);
+    expect(find('SnapshotMachine')).toMatchObject({ experimental: true });
+    expect(find('InstanceRow')).toMatchObject({
+      experimental: false,
+      members: expect.arrayContaining([
+        expect.objectContaining({ name: 'name', experimental: false }),
+        expect.objectContaining({ name: 'machine', experimental: true }),
+      ]),
+    });
   });
 });
 

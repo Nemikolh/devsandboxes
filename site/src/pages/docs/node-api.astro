@@ -4,6 +4,7 @@ import ApiFunction from '../../components/api/ApiFunction.astro';
 import ApiHeading from '../../components/api/ApiHeading.astro';
 import ApiTable from '../../components/api/ApiTable.astro';
 import Callout from '../../components/Callout.astro';
+import Experimental from '../../components/Experimental.astro';
 import CodeBlock from '../../components/CodeBlock.astro';
 import Docs from '../../layouts/Docs.astro';
 import {
@@ -202,6 +203,7 @@ const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
         <h2 id={anchorId(ns.name)}>
           <a class="heading-anchor" href={`#${anchorId(ns.name)}`} aria-label={`Link to section: ${ns.name}`} />
           <code class="api-h2-code">{ns.name}</code>
+          {ns.experimental && <Experimental />}
         </h2>
         {ns.doc ? (
           <Fragment set:html={docHtml(ns.doc, known)} />
@@ -236,7 +238,7 @@ const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
           const used = users.get(d.name) ?? [];
           return (
             <section class="api-item" aria-labelledby={id}>
-              <ApiHeading id={id} name={d.name} suffix={d.typeParams || undefined} kind={d.kind} />
+              <ApiHeading id={id} name={d.name} suffix={d.typeParams || undefined} kind={d.kind} experimental={d.experimental} />
               {d.doc && <div class="api-doc" set:html={docHtml(d.doc, known)} />}
               {d.kind === 'interface' && d.extends.length > 0 && (
                 <p class="api-meta">
@@ -275,7 +277,7 @@ const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
       const used = users.get(c.name) ?? [];
       return (
         <section class="api-item" aria-labelledby={id}>
-          <ApiHeading id={id} name={c.name} kind="class" />
+          <ApiHeading id={id} name={c.name} kind="class" experimental={c.experimental} />
           {c.doc && <div class="api-doc" set:html={docHtml(c.doc, known)} />}
           {c.extends.length > 0 && (
             <p class="api-meta">
@@ -307,7 +309,7 @@ const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
   {
     consts.map((c) => (
       <section class="api-item" aria-labelledby={anchorId(c.name)}>
-        <ApiHeading id={anchorId(c.name)} name={c.name} kind="const" />
+        <ApiHeading id={anchorId(c.name)} name={c.name} kind="const" experimental={c.experimental} />
         {c.doc && <div class="api-doc" set:html={docHtml(c.doc, known)} />}
         <div class="api-sig" set:html={constHtml.get(c.name)} />
       </section>

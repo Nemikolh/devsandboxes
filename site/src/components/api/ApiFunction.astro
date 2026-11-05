@@ -20,7 +20,14 @@ const id = anchorId(ns ? `${ns}.${fn.name}` : fn.name);
 ---
 
 <section class="api-item" aria-labelledby={id}>
-  <ApiHeading id={id} prefix={ns && `${ns}.`} name={fn.name} suffix="()" kind={ns ? 'method' : 'function'} />
+  <ApiHeading
+    id={id}
+    prefix={ns && `${ns}.`}
+    name={fn.name}
+    suffix="()"
+    kind={ns ? 'method' : 'function'}
+    experimental={fn.signatures.every((s) => s.experimental)}
+  />
   {
     fn.signatures.map((sig, n) => (
       <div class="api-signature">

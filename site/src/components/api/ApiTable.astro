@@ -2,6 +2,7 @@
 // Parameter / property table of the Node API page. The description column is
 // dropped when no row has one, rather than showing a column of dashes.
 import { typeHtml, type Row } from '../../lib/api';
+import Experimental from '../Experimental.astro';
 
 interface Props {
   rows: Row[];
@@ -31,6 +32,7 @@ const withDoc = rows.some((r) => r.doc);
               <code>{r.name}</code>
               {r.readonly && <span class="api-flag">readonly</span>}
               {r.optional && <span class="api-flag">optional</span>}
+              {r.experimental && <Experimental />}
             </td>
             <td class="api-cell-type">
               <code class="api-type" set:html={typeHtml(r.type, known)} />

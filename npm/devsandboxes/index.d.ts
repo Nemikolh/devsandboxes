@@ -54,7 +54,7 @@ export interface InstanceRow {
   phase?: PhaseRow;
   /** The config root it was made from; `null` for instances older than that record. */
   root: string | null;
-  /** The machine it's on, in a federated snapshot (`instances.watch` with `machines`); absent for this host's. */
+  /** The machine it's on, in a federated snapshot (`instances.watch` with `machines`); absent for this host's. @experimental */
   machine?: string;
 }
 
@@ -79,7 +79,7 @@ export interface SandboxRow {
   worktree_branch: string | null;
   /** The config root it was read from. */
   root: string | null;
-  /** As {@link InstanceRow.machine}. */
+  /** As {@link InstanceRow.machine}. @experimental */
   machine?: string;
 }
 
@@ -109,7 +109,7 @@ export interface ServiceRow {
   drift: boolean;
   /** The config root it was read from. */
   root: string | null;
-  /** As {@link InstanceRow.machine}. */
+  /** As {@link InstanceRow.machine}. @experimental */
   machine?: string;
 }
 
@@ -142,17 +142,18 @@ export interface InstancesList extends Snapshot {
 export interface InstancesSnapshot extends InstancesList {
   /** The config root, as `instances.watch` named it. */
   dir: string;
-  /** This host's capacity, the same in every root's snapshot; absent from a new watch's first (disk-only) push. */
+  /** This host's capacity, the same in every root's snapshot; absent from a new watch's first (disk-only) push. @experimental */
   capacity?: Capacity;
   /**
    * With `instances.watch`'s `machines`: every registered machine, sorted by
    * name. The rows then include each machine's (tagged `machine`), last known
    * while it isn't `connected`.
+   * @experimental
    */
   machines?: SnapshotMachine[];
 }
 
-/** Where a machine's link stands. `idle`: not attempted yet (every link is held). */
+/** Where a machine's link stands. `idle`: not attempted yet (every link is held). @experimental */
 export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
 
 /**
@@ -160,10 +161,11 @@ export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
  * this host was dialed from its end, a machine here while that link is up; no `target`, never in the
  * registry) or `routed` (a fleet member with no link of its own here, reached through other members;
  * no `target`, never in the registry).
+ * @experimental
  */
 export type MachineKind = 'ssh' | 'inbound' | 'routed';
 
-/** One machine of a federated {@link InstancesSnapshot}. */
+/** One machine of a federated {@link InstancesSnapshot}. @experimental */
 export interface SnapshotMachine {
   name: string;
   kind: MachineKind;
@@ -199,6 +201,7 @@ export interface SnapshotMachine {
  * `code.haves`' answer: what a member has under its fleet root for the caller. `roots`: the config
  * root hashes unpacked there; `tips`: per repo identity asked about, its repo cache's tips (commit ids),
  * absent for a repo with no cache there.
+ * @experimental
  */
 export interface CodeHaves {
   roots: string[];
@@ -210,6 +213,7 @@ export interface CodeHaves {
  * `branch`, the instance's branch; `refs`, `refs/heads/<branch>` and `refs/devsandbox/wip/<instance_id>`
  * at their commits; `bundle`, the file under the peer's fleet root to pull on a `TRANSFER` stream, `null`
  * when the peer has every commit already.
+ * @experimental
  */
 export interface InstancesFetched {
   repo: string;
@@ -222,6 +226,7 @@ export interface InstancesFetched {
  * `placements.fetch`' answer: the refs set in `folder`, this host's checkout the placement came from
  * (`refs/devsandbox/<machine>/<instance>/heads/<branch>` and `…/wip`, full name → commit); `fetched`, the
  * bundle's size in bytes (0: nothing new).
+ * @experimental
  */
 export interface PlacementsFetched {
   machine: string;
@@ -234,6 +239,7 @@ export interface PlacementsFetched {
 /**
  * A host's capacity report (fleet). Sizes in bytes; `null` is unknown. Free memory and disk are
  * reported for a native Linux engine only (a VM-backed engine's are the VM's, not known here).
+ * @experimental
  */
 export interface Capacity {
   /** The engine host's cpus (a VM's, for a VM-backed engine). */
@@ -251,7 +257,7 @@ export interface Capacity {
   caps: Caps | null;
 }
 
-/** Soft caps from `member.toml`'s `[caps]` (sizes in bytes): never enforced; over one is a note. */
+/** Soft caps from `member.toml`'s `[caps]` (sizes in bytes): never enforced; over one is a note. @experimental */
 export interface Caps {
   cpus: number | null;
   mem: number | null;
@@ -765,7 +771,7 @@ export interface ForwardRow {
   conns: number;
   /** From a sandbox's `forwardPorts`, not `forwards.add()`. */
   configured: boolean;
-  /** The machine whose instance or service it reaches (`forwards.add()` with `machine`); absent for this host's. */
+  /** The machine whose instance or service it reaches (`forwards.add()` with `machine`); absent for this host's. @experimental */
   machine?: string;
 }
 
@@ -781,7 +787,7 @@ export interface ForwardAddParams {
   address?: string;
   /** `port` (that host port or the next free one up) or `host:port` (exactly). */
   spec: string;
-  /** A registered machine's instance or service (then `dir` is its config root there and `instance` its name there); the forward still binds on this host. */
+  /** A registered machine's instance or service (then `dir` is its config root there and `instance` its name there); the forward still binds on this host. @experimental */
   machine?: string;
 }
 
@@ -805,7 +811,7 @@ export interface InstancesResolved {
 export interface ResolvedInstance {
   /** Its name on its own host (unqualified). */
   name: string;
-  /** `null`: this host. */
+  /** `null`: this host. @experimental */
   machine: string | null;
   /** Its config root on its host; `null` when not recorded. */
   root: string | null;
@@ -828,20 +834,20 @@ export interface InstanceRenamed {
 export interface InstanceDone {
   instance: string;
   done: boolean;
-  /** A `done` with `machine` of an instance this host placed there: why fetching it back first failed (the flag is set anyway). */
+  /** A `done` with `machine` of an instance this host placed there: why fetching it back first failed (the flag is set anyway). @experimental */
   warning?: string;
 }
 
 /** One `sandboxes.list` entry (not the snapshot's {@link SandboxRow}). */
 export interface SandboxEntry {
   name: string;
-  /** With `sandboxes.list`'s `machines`: the machine defining it; absent for this host's. */
+  /** With `sandboxes.list`'s `machines`: the machine defining it; absent for this host's. @experimental */
   machine?: string;
   /** The config root defining it: always in `sandboxes.list`, absent in `roots.list`. */
   root?: string;
 }
 
-/** One `roots.list` entry: a config root this host knows of. */
+/** One `roots.list` entry: a config root this host knows of. @experimental */
 export interface RootCandidate {
   /** Absolute, canonicalized (a root that's gone: as recorded). */
   root: string;
@@ -856,7 +862,7 @@ export interface RootCandidate {
   fleet?: boolean;
 }
 
-/** `machines.probe`'s answer: the machine's devsandbox, its candidate roots and its member key. */
+/** `machines.probe`'s answer: the machine's devsandbox, its candidate roots and its member key. @experimental */
 export interface MachineProbe {
   version: string;
   protocol: number;
@@ -867,7 +873,7 @@ export interface MachineProbe {
   fingerprint: string;
 }
 
-/** `machines.add`'s answer. */
+/** `machines.add`'s answer. @experimental */
 export interface MachineAdded {
   name: string;
   /** As saved: the machine's canonical paths, deduplicated. */
@@ -889,10 +895,11 @@ export interface MachineAdded {
  * Who joined at `machines.add`: `target` the machine joined this host's fleet, `this` this host
  * joined the machine's, `new` a fleet of two (`hub` says which end, the machine under `hub: true`), `same`
  * both were in it already.
+ * @experimental
  */
 export type FleetJoined = 'target' | 'this' | 'new' | 'same';
 
-/** `machines.add`'s `fleet`. */
+/** `machines.add`'s `fleet`. @experimental */
 export interface MachineFleet {
   /** The hub's member name. */
   hub: string;
@@ -902,16 +909,17 @@ export interface MachineFleet {
 /**
  * How a removed member heard of it: `told` it answered `fleet.leave`, `leaving` it asked itself,
  * `unreachable` it wasn't reached (it keeps its hub and entries until it is).
+ * @experimental
  */
 export type FleetHeard = 'told' | 'leaving' | 'unreachable';
 
-/** A member a removal didn't reach. */
+/** A member a removal didn't reach. @experimental */
 export interface FleetMissed {
   name: string;
   error: string;
 }
 
-/** `fleet.rm`'s answer: what a removal on the hub reached. */
+/** `fleet.rm`'s answer: what a removal on the hub reached. @experimental */
 export interface FleetRemoved {
   /** Who's out of the fleet. */
   name: string;
@@ -926,7 +934,7 @@ export interface FleetRemoved {
   missed: FleetMissed[];
 }
 
-/** What a member's `fleet.place` names of the sandbox it runs. */
+/** What a member's `fleet.place` names of the sandbox it runs. @experimental */
 export interface FleetPlaceSpec {
   sandbox: string;
   /** The sandbox's config hash as the member's snapshot has it; `null` unknown (no image locality). */
@@ -934,7 +942,7 @@ export interface FleetPlaceSpec {
   build_hash: string | null;
 }
 
-/** `fleet.place`'s params: a member's run, for the hub to place. */
+/** `fleet.place`'s params: a member's run, for the hub to place. @experimental */
 export interface FleetPlaceParams {
   spec: FleetPlaceSpec;
   /** The member's own capacity now. */
@@ -943,10 +951,10 @@ export interface FleetPlaceParams {
   reachable: string[];
 }
 
-/** Where the hub placed a member's run: the member that asked, the hub, or another machine. */
+/** Where the hub placed a member's run: the member that asked, the hub, or another machine. @experimental */
 export type FleetPlaceOn = 'requester' | 'hub' | 'machine';
 
-/** `fleet.place`'s answer. */
+/** `fleet.place`'s answer. @experimental */
 export interface FleetPlaced {
   on: FleetPlaceOn;
   /** The machine, by the hub's name for it (the hub's own member name for `hub`). */
@@ -955,7 +963,7 @@ export interface FleetPlaced {
   lines: string[];
 }
 
-/** A membership change proposed to the fleet's authority: its id there, or why it wasn't sent. */
+/** A membership change proposed to the fleet's authority: its id there, or why it wasn't sent. @experimental */
 export interface FleetProposed {
   /** The member the change is about. */
   name: string;
@@ -964,7 +972,7 @@ export interface FleetProposed {
   error: string | null;
 }
 
-/** A membership change signed on the authority: whom its push (`fleet.sync`) reached, and a revoke's removal. */
+/** A membership change signed on the authority: whom its push (`fleet.sync`) reached, and a revoke's removal. @experimental */
 export interface FleetSigned {
   /** The member the change is about. */
   name: string;
@@ -980,17 +988,17 @@ export interface FleetSigned {
   error: string | null;
 }
 
-/** `machines.rm` on the fleet's authority: the machine's key revoked, pushed, then removed by the hub. */
+/** `machines.rm` on the fleet's authority: the machine's key revoked, pushed, then removed by the hub. @experimental */
 export interface MachineRmRevoked extends FleetSigned {
   type: 'revoked';
 }
 
-/** `machines.rm` on another member: the revoke proposed to the authority, approved there. */
+/** `machines.rm` on another member: the revoke proposed to the authority, approved there. @experimental */
 export interface MachineRmProposed extends FleetProposed {
   type: 'proposed';
 }
 
-/** `machines.rm` of this host's own name: it left its fleet. */
+/** `machines.rm` of this host's own name: it left its fleet. @experimental */
 export interface MachineRmLeft {
   type: 'left';
   /** This host's member name. */
@@ -1007,22 +1015,22 @@ export interface MachineRmLeft {
   proposed: FleetProposed | null;
 }
 
-/** `machines.rm`'s answer. */
+/** `machines.rm`'s answer. @experimental */
 export type MachineRmResult = MachineRmRevoked | MachineRmProposed | MachineRmLeft;
 
-/** A proposed membership change: a held introduction promoted to an `add`. */
+/** A proposed membership change: a held introduction promoted to an `add`. @experimental */
 export interface FleetChangeAdd {
   kind: 'add';
   introduction: MembershipIntroduction;
 }
 
-/** A proposed membership change: `name` out of the fleet (its key revoked). */
+/** A proposed membership change: `name` out of the fleet (its key revoked). @experimental */
 export interface FleetChangeRevoke {
   kind: 'revoke';
   name: string;
 }
 
-/** A proposed membership change: the proposer's own key from `old` to `new`, countersigned by `old`. */
+/** A proposed membership change: the proposer's own key from `old` to `new`, countersigned by `old`. @experimental */
 export interface FleetChangeRotate {
   kind: 'rotate';
   name: string;
@@ -1032,16 +1040,16 @@ export interface FleetChangeRotate {
   by_old: string;
 }
 
-/** A proposed membership change: the fleet's hub role moved to member `name` (a `hub` entry). */
+/** A proposed membership change: the fleet's hub role moved to member `name` (a `hub` entry). @experimental */
 export interface FleetChangeHub {
   kind: 'hub';
   name: string;
 }
 
-/** A membership change proposed to the authority (`fleet.propose`'s `op`). */
+/** A membership change proposed to the authority (`fleet.propose`'s `op`). @experimental */
 export type FleetChange = FleetChangeAdd | FleetChangeRevoke | FleetChangeRotate | FleetChangeHub;
 
-/** A proposal waiting on the authority (`proposals.json`). */
+/** A proposal waiting on the authority (`proposals.json`). @experimental */
 export interface FleetProposal {
   id: number;
   /** The member that proposed it. */
@@ -1051,19 +1059,19 @@ export interface FleetProposal {
   at: number;
 }
 
-/** `fleet.propose`'s answer: the proposal's id on the authority. */
+/** `fleet.propose`'s answer: the proposal's id on the authority. @experimental */
 export interface FleetQueued {
   id: number;
   pending: boolean;
 }
 
-/** `fleet.sync`'s answer: whether this host's log took something, and its head after. */
+/** `fleet.sync`'s answer: whether this host's log took something, and its head after. @experimental */
 export interface FleetSynced {
   changed: boolean;
   head: MembershipHead;
 }
 
-/** One link of a {@link FleetLinkReport}: to `peer`, in `state` since `since_ms` (unix ms, the reporter's clock); `dials`: the reporter dials it (has a shell there). */
+/** One link of a {@link FleetLinkReport}: to `peer`, in `state` since `since_ms` (unix ms, the reporter's clock); `dials`: the reporter dials it (has a shell there). @experimental */
 export interface FleetLink {
   peer: string;
   dials: boolean;
@@ -1071,7 +1079,7 @@ export interface FleetLink {
   since_ms: number;
 }
 
-/** A member's word on its links: its trust, whether its daemon stays up (keep-alive, or the hub), each link it has, and the members it grants its ssh-agent to (sorted). */
+/** A member's word on its links: its trust, whether its daemon stays up (keep-alive, or the hub), each link it has, and the members it grants its ssh-agent to (sorted). @experimental */
 export interface FleetLinkReport {
   member: string;
   trust: MemberTrust;
@@ -1080,28 +1088,28 @@ export interface FleetLinkReport {
   agent: string[];
 }
 
-/** A link report as it travels: the member's signed statement (kind `links`, its version only going up) over it. */
+/** A link report as it travels: the member's signed statement (kind `links`, its version only going up) over it. @experimental */
 export interface FleetReport {
   statement: MembershipStatement;
   report: FleetLinkReport;
 }
 
-/** The link reports a host holds, one per member (`fleet.graph`, `graph.get`). */
+/** The link reports a host holds, one per member (`fleet.graph`, `graph.get`). @experimental */
 export interface FleetGraph {
   reports: FleetReport[];
 }
 
-/** `fleet.report`'s answer: whether the hub's graph took it as new. */
+/** `fleet.report`'s answer: whether the hub's graph took it as new. @experimental */
 export interface FleetReported {
   changed: boolean;
 }
 
-/** `membership.approve`'s answer: the proposal's id, and what signing it did. */
+/** `membership.approve`'s answer: the proposal's id, and what signing it did. @experimental */
 export interface MembershipApproved extends FleetSigned {
   id: number;
 }
 
-/** `membership.rotate` on the fleet's authority: the `rotate` signed with the old key, the new key this host's now, pushed. */
+/** `membership.rotate` on the fleet's authority: the `rotate` signed with the old key, the new key this host's now, pushed. @experimental */
 export interface MembershipRotated extends FleetSigned {
   type: 'rotated';
   /** The new key, `ed25519:<64 lowercase hex>`. */
@@ -1109,7 +1117,7 @@ export interface MembershipRotated extends FleetSigned {
   fingerprint: string;
 }
 
-/** `membership.rotate` on another member: the `rotate` proposed to the authority; the new key waits in `member.key.next`. */
+/** `membership.rotate` on another member: the `rotate` proposed to the authority; the new key waits in `member.key.next`. @experimental */
 export interface MembershipRotateProposed extends FleetProposed {
   type: 'proposed';
   /** The next key, this host's once the signed `rotate` reaches it. */
@@ -1117,23 +1125,23 @@ export interface MembershipRotateProposed extends FleetProposed {
   fingerprint: string;
 }
 
-/** `membership.rotate`'s answer. */
+/** `membership.rotate`'s answer. @experimental */
 export type MembershipRotateResult = MembershipRotated | MembershipRotateProposed;
 
-/** `membership.hub` on the fleet's authority: the `hub` entry signed, pushed, then followed here (every link redials). */
+/** `membership.hub` on the fleet's authority: the `hub` entry signed, pushed, then followed here (every link redials). @experimental */
 export interface MembershipHubSigned extends FleetSigned {
   type: 'signed';
 }
 
-/** `membership.hub` on another member: the `hub` entry proposed to the authority, approved there. */
+/** `membership.hub` on another member: the `hub` entry proposed to the authority, approved there. @experimental */
 export interface MembershipHubProposed extends FleetProposed {
   type: 'proposed';
 }
 
-/** `membership.hub`'s answer. */
+/** `membership.hub`'s answer. @experimental */
 export type MembershipHubResult = MembershipHubSigned | MembershipHubProposed;
 
-/** `machines.get`'s answer (a registered machine, an inbound or a routed one): what an ssh command to the machine needs. */
+/** `machines.get`'s answer (a registered machine, an inbound or a routed one): what an ssh command to the machine needs. @experimental */
 export interface MachineInfo {
   name: string;
   kind: MachineKind;
@@ -1150,6 +1158,7 @@ export interface MachineInfo {
 /**
  * One registered machine, or an inbound neighbor up now (`kind` `inbound`), with its held link's state, or a
  * routed machine (`kind` `routed`: `state` whether a path to it starts with a link up here) (`machines.list`).
+ * @experimental
  */
 export interface MachineRow {
   name: string;
@@ -1177,10 +1186,10 @@ export interface MachineRow {
   exposed_by: string[] | null;
 }
 
-/** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). */
+/** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). @experimental */
 export type MemberTrust = 'worker' | 'full';
 
-/** `member.get`'s answer (and `member.set`'s, after the change): this host as a fleet member (`member.toml`). */
+/** `member.get`'s answer (and `member.set`'s, after the change): this host as a fleet member (`member.toml`). @experimental */
 export interface MemberInfo {
   /** `member.toml`'s `name`, else the hostname's first label; `null` when neither is a valid name. */
   name: string | null;
@@ -1204,7 +1213,7 @@ export interface MemberInfo {
   exposed_by: string[] | null;
 }
 
-/** A signed statement (a membership entry's, an introduction's): `signer` says, with `key`, the payload of that hash. */
+/** A signed statement (a membership entry's, an introduction's): `signer` says, with `key`, the payload of that hash. @experimental */
 export interface MembershipStatement {
   signer: string;
   key: string;
@@ -1215,7 +1224,7 @@ export interface MembershipStatement {
   sig: string;
 }
 
-/** What every membership log entry carries besides its op's fields. */
+/** What every membership log entry carries besides its op's fields. @experimental */
 export interface MembershipEntryBase {
   /** The previous entry's hash (64 lowercase hex; zeros for the genesis). */
   prev: string;
@@ -1223,7 +1232,7 @@ export interface MembershipEntryBase {
   statement: MembershipStatement;
 }
 
-/** The first entry: the fleet's authority (its key signs every entry) and its hub; `id` is random (32 hex). */
+/** The first entry: the fleet's authority (its key signs every entry) and its hub; `id` is random (32 hex). @experimental */
 export interface MembershipGenesis extends MembershipEntryBase {
   op: 'genesis';
   id: string;
@@ -1232,19 +1241,21 @@ export interface MembershipGenesis extends MembershipEntryBase {
   hub: string;
 }
 
+/** @experimental */
 export interface MembershipAdd extends MembershipEntryBase {
   op: 'add';
   name: string;
   key: string;
 }
 
+/** @experimental */
 export interface MembershipRevoke extends MembershipEntryBase {
   op: 'revoke';
   name: string;
   key: string;
 }
 
-/** `name`'s key goes from `old` to `new`, countersigned by `old` (`by_old`). */
+/** `name`'s key goes from `old` to `new`, countersigned by `old` (`by_old`). @experimental */
 export interface MembershipRotate extends MembershipEntryBase {
   op: 'rotate';
   name: string;
@@ -1253,15 +1264,16 @@ export interface MembershipRotate extends MembershipEntryBase {
   by_old: string;
 }
 
+/** @experimental */
 export interface MembershipHub extends MembershipEntryBase {
   op: 'hub';
   name: string;
 }
 
-/** One entry of the membership log, a hash chain the fleet's authority signs. */
+/** One entry of the membership log, a hash chain the fleet's authority signs. @experimental */
 export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipHub;
 
-/** A member's signed word for a key the authority hasn't added: capped until it does. */
+/** A member's signed word for a key the authority hasn't added: capped until it does. @experimental */
 export interface MembershipIntroduction {
   name: string;
   key: string;
@@ -1269,32 +1281,33 @@ export interface MembershipIntroduction {
   statement: MembershipStatement;
 }
 
-/** A membership log and the introductions held beside it, as stored (`membership.json`). */
+/** A membership log and the introductions held beside it, as stored (`membership.json`). @experimental */
 export interface MembershipStored {
   entries: MembershipEntry[];
   introductions: MembershipIntroduction[];
 }
 
-/** Where a log stands: its length, last entry's hash and genesis hash (64 lowercase hex each; zeros when empty). */
+/** Where a log stands: its length, last entry's hash and genesis hash (64 lowercase hex each; zeros when empty). @experimental */
 export interface MembershipHead {
   len: number;
   hash: string;
   genesis: string;
 }
 
+/** @experimental */
 export interface MembershipKey {
   key: string;
   fingerprint: string;
 }
 
-/** A held introduction: who, by whom, the introduced key's fingerprint. */
+/** A held introduction: who, by whom, the introduced key's fingerprint. @experimental */
 export interface MembershipIntroduced {
   name: string;
   introducer: string;
   fingerprint: string;
 }
 
-/** What a stored log says; all empty in no fleet's log. */
+/** What a stored log says; all empty in no fleet's log. @experimental */
 export interface MembershipSummary {
   authority: string | null;
   hub: string | null;
@@ -1303,7 +1316,7 @@ export interface MembershipSummary {
   head: MembershipHead;
 }
 
-/** `membership.get`'s answer (and `membership.adopt`'s, after it). */
+/** `membership.get`'s answer (and `membership.adopt`'s, after it). @experimental */
 export interface MembershipInfo {
   /** `null` in no fleet's log. */
   stored: MembershipStored | null;
@@ -1489,6 +1502,7 @@ export interface VerbParams {
   /**
    * Run it on that machine (a fresh ssh); answered as it answers there. A
    * hang-up cancels it there unless `detach`, and so does this daemon exiting.
+   * @experimental
    */
   machine?: string;
 }
@@ -1522,6 +1536,7 @@ export interface RunParams extends VerbParams {
    * Ask the fleet's hub where to run it (`run --place`; not with `machine`).
    * Without it the run stays on this host. Placed on a machine, the code
    * moves there first and the answer and `progress` carry `machine`.
+   * @experimental
    */
   place?: boolean;
 }
@@ -1587,7 +1602,7 @@ export interface VerbResult {
   /** The instance it acted on; `null` for `all` or when unknown. */
   instance: string | null;
   exit: 0;
-  /** A `run` placed on another machine: that machine (the instance is `<machine>/<instance>`). */
+  /** A `run` placed on another machine: that machine (the instance is `<machine>/<instance>`). @experimental */
   machine?: string;
 }
 
@@ -1595,7 +1610,7 @@ export interface VerbResult {
 export interface VerbDetached {
   instance: string | null;
   detached: true;
-  /** As {@link VerbResult.machine}. */
+  /** As {@link VerbResult.machine}. @experimental */
   machine?: string;
   /** `run` with `json`: the in-flight instance's record. */
   record?: RunRecord;
@@ -1622,7 +1637,7 @@ export interface VerbProgress {
   instance: string;
   /** `preparing`, `building`, `creating`, a lifecycle step, or `failed`. */
   phase: string;
-  /** As {@link VerbResult.machine}. */
+  /** As {@link VerbResult.machine}. @experimental */
   machine?: string;
 }
 
@@ -1737,11 +1752,13 @@ export interface ApiMethods {
   /**
    * This host's config roots: every one its instances were made from, plus `~/.devsandboxes`; sorted.
    * With `paths`: exactly those, in order (`~` expanded here, canonicalized; a bad one has its `error`).
+   * @experimental
    */
   'roots.list': { params: { paths?: string[] }; result: RootCandidate[] };
   /**
    * Dial a target over ssh and list its candidate roots; `failed` when ssh or the hello fails. `command`: the
    * machine's devsandbox as shell text (default `devsandbox`); `invalid` when empty.
+   * @experimental
    */
   'machines.probe': { params: { target: string; command?: string }; result: MachineProbe };
   /**
@@ -1751,18 +1768,22 @@ export interface ApiMethods {
    * key as the user confirmed it (`machines.probe`'s); `denied` when the machine's differs. Writes both ends'
    * membership logs (`denied` for another fleet's log, a fork, a capped member letting a host in). `agent`:
    * grant this host's ssh-agent to the machine by `key` once it's added.
+   * @experimental
    */
   'machines.add': { params: { target: string; name?: string; roots: string[]; hub: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
+  /** @experimental */
   'machines.list': { params: {}; result: MachineRow[] };
   /**
    * Grant (`agent: true`) or withdraw this host's ssh-agent for a machine of any kind (registered, inbound,
    * routed), by the key its name has in this host's membership log; `not-found` for an unknown name, `failed`
    * for a machine with no key there (or no log).
+   * @experimental
    */
   'machines.set': { params: { name: string; agent: boolean }; result: OkResult };
   /**
    * Drop this host's link to a registered machine (it stays a fleet member); `not-found` for an unknown name,
    * `denied` for an inbound one (its link is dialed from there).
+   * @experimental
    */
   'machines.unlink': { params: { name: string }; result: OkResult };
   /**
@@ -1771,105 +1792,122 @@ export interface ApiMethods {
    * naming it when none reaches it). This host's own name leaves the fleet (its revoke proposed, best effort). `denied` for the
    * hub, the authority, or the hub leaving while it has machines; `not-found` for a name neither linked, in the
    * log, nor seen through the hub.
+   * @experimental
    */
   'machines.rm': { params: { name: string }; result: MachineRmResult };
   /**
    * On the hub, from one of its machines: the removal of a member the hub's log has revoked, or of the asking
    * member itself (leaving). Never from a local client.
+   * @experimental
    */
   'fleet.rm': { params: { name: string }; result: FleetRemoved };
   /**
    * On the hub, from one of its machines: where that member's `run --place` goes, among itself, the hub and the hub's
    * connected machines in `reachable`. Never from a local client.
+   * @experimental
    */
   'fleet.place': { params: FleetPlaceParams; result: FleetPlaced };
   /**
    * From this host's hub only, once this host's log revokes its key: clear `hub` and drop every registry entry
    * and the log; the links end once answered.
+   * @experimental
    */
   'fleet.leave': { params: {}; result: OkResult };
-  /** From this host's hub only, once this host's log revokes `name`: drop its entry, or end its inbound link. */
+  /** From this host's hub only, once this host's log revokes `name`: drop its entry, or end its inbound link. @experimental */
   'fleet.forget': { params: { name: string }; result: OkResult };
   /**
    * On the fleet's authority, from a member of its log (never a capped one): queue a membership change for the
    * user's approval there (a desktop notification). `invalid` for one that doesn't apply to the log.
+   * @experimental
    */
   'fleet.propose': { params: { op: FleetChange }; result: FleetQueued };
   /**
    * From a member or an introduced peer: take newer membership entries (self-verifying; `denied` for another
    * fleet's or a fork) and send them on to this host's other connected machines.
+   * @experimental
    */
   'fleet.sync': { params: MembershipStored; result: FleetSynced };
   /**
    * On the hub, from a member or an introduced peer: its own link report, taken into the hub's graph (`invalid`
    * for one refused: older, forged, another member's); a change is pushed to the hub's linked members.
+   * @experimental
    */
   'fleet.report': { params: FleetReport; result: FleetReported };
   /**
    * From a member or an introduced peer: the reports it carries taken (each verifies itself; refusals are
    * logged), answered with every report this host holds. On the hub a change is pushed on.
+   * @experimental
    */
   'fleet.graph': { params: { reports?: FleetReport[] }; result: FleetGraph };
   /**
    * One registered machine, to build an ssh command to it; `not-found` for an unknown name. `agent`, the
    * caller's absolute `SSH_AUTH_SOCK`, becomes the agent this host serves the machine's `AGENT` streams with.
+   * @experimental
    */
   'machines.get': { params: { name: string; agent?: string }; result: MachineInfo };
   /**
    * This host's capacity report now (the one its snapshots carry), built on demand: no
    * watched root needed. Placement asks each connected machine before placing a `run`.
+   * @experimental
    */
   'capacity.get': { params: {}; result: Capacity };
   /**
    * From a link peer only: what this host has under the caller's fleet root here (the roots unpacked, the
    * tips of its cache of each of `repos`, at most 32 repo identities). `denied` from a local client.
+   * @experimental
    */
   'code.haves': { params: { repos: string[] }; result: CodeHaves };
   /**
    * From a link peer only: one of this host's instances (under the peer's fleet root under `worker`
    * trust, any under `full`) snapshotted and bundled for the peer `--not` `haves` (commit ids, at most
    * 256). `not-found`, `failed` (a detached `HEAD`, git), `denied` from a local client.
+   * @experimental
    */
   'instances.fetch': { params: { instance: string; haves?: string[] }; result: InstancesFetched };
   /**
    * Local only: fetch back an instance this host placed (`placements.json`) into the checkout it came
    * from, as hidden refs. `machine` optional when one placement has that instance name. `not-found`
    * (not placed from here, ambiguous), `failed` (the worker, the pull, the landing).
+   * @experimental
    */
   'placements.fetch': { params: { machine?: string; instance: string }; result: PlacementsFetched };
-  /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. */
+  /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. @experimental */
   'member.get': { params: {}; result: MemberInfo };
   /**
    * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `trust`,
    * and `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root. `hub` isn't
    * settable: it comes from the membership log (`membership.adopt`).
+   * @experimental
    */
   'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
-  /** This host's membership log and the introductions it holds. Local only: never over a fleet link. */
+  /** This host's membership log and the introductions it holds. Local only: never over a fleet link. @experimental */
   'membership.get': { params: {}; result: MembershipInfo };
-  /** The link reports this host holds (in memory: rebuilt from its peers after a restart). Local only. */
+  /** The link reports this host holds (in memory: rebuilt from its peers after a restart). Local only. @experimental */
   'graph.get': { params: {}; result: FleetGraph };
   /**
    * Take a membership log: none here takes it, one behind takes its later entries, the same or ahead keeps
    * this host's; their introductions are held. `denied` for another fleet's log, a fork, or a log that lists
    * this host neither as a member nor introduced; `invalid` for one that doesn't verify. Writes `hub` from the
    * log (a change ends every link of this host, which redial). Local only.
+   * @experimental
    */
   'membership.adopt': { params: MembershipStored; result: MembershipInfo };
   /**
    * Let `name` (`key`) into this host's fleet: the authority signs an `add`, another member an introduction;
    * stored, the whole answered. `denied` in no fleet's log or as a capped (introduced) member; `invalid` for a
    * name or key the fleet knows. Local only.
+   * @experimental
    */
   'membership.sign': { params: { name: string; key: string }; result: MembershipStored };
-  /** The membership changes proposed to this host (the fleet's authority), oldest first. Local only. */
+  /** The membership changes proposed to this host (the fleet's authority), oldest first. Local only. @experimental */
   'membership.pending': { params: {}; result: FleetProposal[] };
   /**
    * Sign proposal `id` here, push it, and run a revoke's removal; dropped from the queue. `denied` off the
    * authority, `not-found` for no such proposal, `invalid` for one that no longer applies. Local only.
+   * @experimental
    */
   'membership.approve': { params: { id: number }; result: MembershipApproved };
-  /** Drop proposal `id`, signing nothing; `not-found` for no such proposal. Local only. */
+  /** Drop proposal `id`, signing nothing; `not-found` for no such proposal. Local only. @experimental */
   'membership.deny': { params: { id: number }; result: OkResult };
   /**
    * Rotate this host's member key: a next key (`member.key.next`, a pending one reused) countersigned by the key.
@@ -1877,6 +1915,7 @@ export interface ApiMethods {
    * proposed to the authority over any path, and the next key becomes the key when a log listing it is
    * taken. `denied` for a capped (introduced) member or one in no fleet's log, `failed` with no path to the
    * authority; `invalid` when the log refuses it. Local only.
+   * @experimental
    */
   'membership.rotate': { params: {}; result: MembershipRotateResult };
   /**
@@ -1885,6 +1924,7 @@ export interface ApiMethods {
    * authority over any path (a pending one of the same name answers its id). `invalid` for a name not in the
    * log (an introduced member can't be the hub) or the hub already; `denied` for a capped (introduced) member,
    * `failed` in no fleet's log or with no path to the authority. Local only.
+   * @experimental
    */
   'membership.hub': { params: { name: string }; result: MembershipHubResult };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
