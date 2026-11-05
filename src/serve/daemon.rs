@@ -1065,8 +1065,12 @@ impl Shared {
             }
             lent::Channel::Transfer => {
                 let Some(root) = peer.fleet_root.clone() else { return false };
+                let state = self.state.clone();
+                // A state.toml that doesn't read: in use, so nothing is recut.
+                let in_use: fleet::code::InUse =
+                    Arc::new(move |at| crate::state::State::load_at(&state).map(|s| fleet::code::mounted(&s, at)).unwrap_or(true));
                 self.spawn_channel("serve-transfer", move || {
-                    let receivers = fleet::code::receivers(&root, fleet::transfer::Receivers::new(log));
+                    let receivers = fleet::code::receivers(&root, fleet::transfer::Receivers::new(log), in_use);
                     if let Err(e) = receivers.receive(stream) {
                         log(&format!("fleet: a transfer from {} failed: {e:#}", peer.name));
                     }

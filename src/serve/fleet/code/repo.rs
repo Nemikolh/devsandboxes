@@ -148,17 +148,38 @@ pub fn set_refs(cache: &Path, refs: &std::collections::BTreeMap<String, String>)
     Ok(())
 }
 
+/// What [`land_from`] did to the checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    /// Cut new, or recut (an existing one no instance mounts): exactly
+    /// what was sent, its WIP applied.
+    Cut,
+    /// In use, on the sent branch: fast-forwarded on a clean tree.
+    FastForwarded,
+    /// In use, on another branch (or detached): the sent branch's ref
+    /// moved, the working tree untouched.
+    Moved,
+    /// In use, on the sent branch, but dirty or not an ancestor of the
+    /// sent tip: left where it is; the tip stays in the cache.
+    Kept,
+}
+
 /// Cut the checkout at `at` from the bare repo `cache`: its `branch`
-/// (`refs/heads/<branch>` there). A new checkout (no `.git`; `at` made
-/// with its parents if missing, refused when it exists non-empty) gets the
-/// branch checked out and, with `wip` (a commit `cache` has, the branch's
-/// snapshot), that snapshot's tree applied as uncommitted changes
-/// (`wip::apply_wip`; the ref fetched for it is dropped after). An
-/// existing one (a checkout a transfer made before; an instance may be
-/// using it) only gets the branch moved: fast-forwarded when it's the one
-/// checked out, else set to the cache's; `wip` is left out (decision 73).
-/// The checkout has no remote.
-pub fn land_from(cache: &Path, at: &Path, branch: &str, wip: Option<&str>) -> Result<()> {
+/// (`refs/heads/<branch>` there), with `wip` (a commit `cache` has, the
+/// branch's snapshot). A new checkout (no `.git`; `at` made with its
+/// parents if missing, refused when it exists non-empty), or an existing
+/// one (a checkout a transfer made before) with `in_use` false (no
+/// instance mounts it), is cut to exactly what was sent: the branch
+/// checked out (its ref set to the cache's), `reset --hard`, untracked
+/// files that aren't ignored removed (`clean -fd`: build outputs stay, so
+/// do nested checkouts), then the snapshot's tree applied as uncommitted
+/// changes (`wip::apply_wip`; the ref fetched for it is dropped after).
+/// One `in_use` keeps its working tree (decision 73): its checked-out
+/// branch is fast-forwarded only on a clean tree (`status --porcelain`
+/// empty, untracked files included) to a descendant, else [`Landed::Kept`],
+/// not an error; another branch's ref is set to the cache's; `wip` is left
+/// out. The checkout has no remote.
+pub fn land_from(cache: &Path, at: &Path, branch: &str, wip: Option<&str>, in_use: bool) -> Result<Landed> {
     check_branch(branch)?;
     if let Some(w) = wip {
         check_oid(w)?;
@@ -178,25 +199,40 @@ pub fn land_from(cache: &Path, at: &Path, branch: &str, wip: Option<&str>) -> Re
             .with_context(|| format!("cannot fetch {branch} from the repo cache"))?;
         Ok(())
     };
-    if fresh {
+    if fresh || !in_use {
         run(host_git(at)?.args(["symbolic-ref", "HEAD"]).arg(&full), QUICK)?;
         let wip_at = wip.map(|_| wip_ref(branch));
         let mut refspecs = vec![format!("+{full}:{full}")];
         refspecs.extend(wip_at.iter().map(|w| format!("+{w}:{w}")));
         fetch(&refspecs)?;
         run(host_git(at)?.args(["reset", "-q", "--hard"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)?;
+        run(host_git(at)?.args(["clean", "-q", "-f", "-d"]), WHOLE).with_context(|| format!("cannot clean {}", at.display()))?;
         if let (Some(w), Some(wip_at)) = (wip, wip_at) {
             super::wip::apply_wip(at, w)?;
             run(host_git(at)?.args(["update-ref", "-d", &wip_at]), QUICK)?;
         }
-    } else if head.as_deref() == Some(full.as_str()) {
-        fetch(std::slice::from_ref(&full))?;
-        run(host_git(at)?.args(["merge", "-q", "--ff-only", "FETCH_HEAD"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)
-            .with_context(|| format!("cannot fast-forward {branch} in {}", at.display()))?;
-    } else {
-        fetch(&[format!("+{full}:{full}")])?;
+        return Ok(Landed::Cut);
     }
-    Ok(())
+    if head.as_deref() != Some(full.as_str()) {
+        fetch(&[format!("+{full}:{full}")])?;
+        return Ok(Landed::Moved);
+    }
+    fetch(std::slice::from_ref(&full))?;
+    let clean = run(host_git(at)?.args(["status", "--porcelain"]), WHOLE)?.trim().is_empty();
+    let descends = || -> Result<bool> {
+        let out = bounded_git(host_git(at)?.args(["merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"]), QUICK)?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => bail!("git failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        }
+    };
+    if !clean || !descends()? {
+        return Ok(Landed::Kept);
+    }
+    run(host_git(at)?.args(["merge", "-q", "--ff-only", "FETCH_HEAD"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)
+        .with_context(|| format!("cannot fast-forward {branch} in {}", at.display()))?;
+    Ok(Landed::FastForwarded)
 }
 
 /// Which repo a git call is for: a checkout ([`host_git`]) or a bare repo
@@ -547,26 +583,87 @@ pub(crate) mod tests {
         };
         send("feature", "f.bundle");
         let at = dir.join("worker/web");
-        land_from(&worker, &at, "feature", None).unwrap();
+        assert_eq!(land_from(&worker, &at, "feature", None, false).unwrap(), Landed::Cut);
         assert_eq!(std::fs::read_to_string(at.join("F")).unwrap(), "feature\n");
         assert_eq!(git(&at, &["symbolic-ref", "--short", "HEAD"]), "feature");
         assert_eq!(git(&at, &["remote"]), "", "no remote on the worker");
         assert_eq!(git(&at, &["status", "--porcelain"]), "");
 
-        // Again, after a new commit: the checked-out branch fast-forwards.
+        // Again, after a new commit, in use and clean: the checked-out
+        // branch fast-forwards.
         git(&src, &["checkout", "-q", "feature"]);
         std::fs::write(src.join("F"), "feature 2\n").unwrap();
         git(&src, &["commit", "-q", "-am", "two"]);
         send("feature", "f2.bundle");
-        land_from(&worker, &at, "feature", None).unwrap();
+        assert_eq!(land_from(&worker, &at, "feature", None, true).unwrap(), Landed::FastForwarded);
         assert_eq!(std::fs::read_to_string(at.join("F")).unwrap(), "feature 2\n");
         // Another branch into it: updated, not checked out (`main` is in
         // the worker's cache already: no bundle).
         send("main", "m.bundle");
         assert!(!dir.join("m.bundle").exists());
-        land_from(&worker, &at, "main", None).unwrap();
+        assert_eq!(land_from(&worker, &at, "main", None, true).unwrap(), Landed::Moved);
         assert_eq!(git(&at, &["symbolic-ref", "--short", "HEAD"]), "feature");
         assert_eq!(git(&at, &["rev-parse", "main"]), git(&src, &["rev-parse", "main"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_checkout_is_recut_when_free_and_kept_when_in_use_and_dirty() {
+        let dir = scratch("land-modes");
+        let src = repo_with_branches(&dir, "web");
+        std::fs::write(src.join(".gitignore"), "*.log\n").unwrap();
+        git(&src, &["add", ".gitignore"]);
+        git(&src, &["commit", "-q", "-m", "ignore"]);
+        let cache = dir.join("c.git");
+        std::fs::create_dir_all(&cache).unwrap();
+        ensure_bare(&cache).unwrap();
+        // `main` at the source, plus a WIP commit on it with `files`.
+        let send = |files: &[(&str, &str)]| -> String {
+            let base = git(&src, &["rev-parse", "HEAD"]);
+            git(&src, &["checkout", "-q", "--detach"]);
+            for (f, body) in files {
+                std::fs::write(src.join(f), body).unwrap();
+                git(&src, &["add", f]);
+            }
+            git(&src, &["commit", "-q", "--allow-empty", "-m", "wip"]);
+            let wip = git(&src, &["rev-parse", "HEAD"]);
+            git(&src, &["checkout", "-q", "main"]);
+            let refs = ["refs/heads/main".to_string(), wip_ref("main")];
+            git(&src, &["update-ref", &refs[1], &wip]);
+            let file = dir.join(format!("{}.bundle", nonce()));
+            if bundle_refs(Repo::Checkout(&src), &[refs[0].as_str(), refs[1].as_str()], &tips(Repo::Bare(&cache)).unwrap(), &file).unwrap() {
+                unbundle(&cache, &file).unwrap();
+            }
+            set_refs(&cache, &[(refs[0].clone(), base), (refs[1].clone(), wip.clone())].into()).unwrap();
+            wip
+        };
+        let at = dir.join("worker/web");
+        let wip1 = send(&[("README", "wip 1\n"), ("U", "u\n")]);
+        assert_eq!(land_from(&cache, &at, "main", Some(&wip1), false).unwrap(), Landed::Cut);
+        assert_eq!(git(&at, &["status", "--porcelain=v1", "-uall"]), "M README\n?? U");
+        std::fs::write(at.join("x.log"), "built\n").unwrap();
+        let first = git(&at, &["rev-parse", "HEAD"]);
+
+        std::fs::write(src.join("README"), "two\n").unwrap();
+        git(&src, &["commit", "-q", "-am", "two"]);
+        let wip2 = send(&[("README", "wip 2\n")]);
+        // In use and dirty: nothing moves.
+        assert_eq!(land_from(&cache, &at, "main", Some(&wip2), true).unwrap(), Landed::Kept);
+        assert_eq!(git(&at, &["rev-parse", "HEAD"]), first);
+        assert_eq!(git(&at, &["status", "--porcelain=v1", "-uall"]), "M README\n?? U");
+        // Free: recut to what was sent, ignored files kept.
+        assert_eq!(land_from(&cache, &at, "main", Some(&wip2), false).unwrap(), Landed::Cut);
+        assert_eq!(git(&at, &["rev-parse", "HEAD"]), git(&src, &["rev-parse", "main"]));
+        assert_eq!(git(&at, &["status", "--porcelain=v1", "-uall"]), "M README");
+        assert_eq!(std::fs::read_to_string(at.join("README")).unwrap(), "wip 2\n");
+        assert_eq!(std::fs::read_to_string(at.join("x.log")).unwrap(), "built\n");
+        assert_eq!(git(&at, &["for-each-ref", "refs/devsandbox"]), "");
+        // In use and clean, but the sent tip isn't a descendant: kept.
+        git(&at, &["checkout", "-q", "--", "README"]);
+        git(&src, &["reset", "-q", "--hard", "HEAD~1"]);
+        let wip3 = send(&[]);
+        assert_eq!(land_from(&cache, &at, "main", Some(&wip3), true).unwrap(), Landed::Kept);
+        assert_ne!(git(&at, &["rev-parse", "HEAD"]), git(&src, &["rev-parse", "main"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -611,9 +708,9 @@ pub(crate) mod tests {
 
         std::fs::create_dir_all(dir.join("full")).unwrap();
         std::fs::write(dir.join("full/x"), "x").unwrap();
-        let err = format!("{:#}", land_from(&cache, &dir.join("full"), "main", None).unwrap_err());
+        let err = format!("{:#}", land_from(&cache, &dir.join("full"), "main", None, false).unwrap_err());
         assert!(err.contains("isn't a git checkout"), "{err}");
-        let err = format!("{:#}", land_from(&cache, &dir.join("empty"), "main", None).unwrap_err());
+        let err = format!("{:#}", land_from(&cache, &dir.join("empty"), "main", None, false).unwrap_err());
         assert!(err.contains("cannot fetch main from the repo cache"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

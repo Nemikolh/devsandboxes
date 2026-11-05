@@ -525,16 +525,16 @@ limitation means editing this file in the same commit.
   root travel in its tar without their `.git`. The root's tar skips
   `.git`, `.worktrees`, `shared-volumes` and `shared-files` but not
   git-ignored files, and a symlink pointing out of the root refuses it.
-  The snapshot lands only in a checkout the transfer creates on the
-  worker; a later send updates an existing one's branches (fast-forwards
-  the checked-out one) and applies no snapshot to it. A repeat send
+  On the worker, a checkout no instance mounts is recut to what was
+  sent, its snapshot applied; one an instance mounts keeps its working
+  tree and its branch unless it can fast-forward cleanly, so a new
+  worktree there may start from the older tip. A repeat send
   carries only what the worker lacks (`code.haves`: a root it has isn't
   sent again, a bundle goes `--not` its cache's tips), but a first send
   goes whole over the link. A repo with no commit yet gets
   `refs/devsandbox/root` once and keeps it. The worker's cache per repo
-  under its fleet root is never pruned, a worker's moved checkout keeps
-  the branch it first checked out, and `roots/<hash>/` trees are never
-  removed.
+  under its fleet root is never pruned, and `roots/<hash>/` trees are
+  never removed.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::send`, `fleet::code::repo::land_from`
 - The hub keeps a copy of each repo a member places on another machine,
   sent after the worker's (so a placement from a laptop uploads twice),

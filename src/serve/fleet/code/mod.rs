@@ -286,9 +286,9 @@ pub struct Prepared {
     /// `root` a placed `run` names.
     pub remote_root: PathBuf,
     /// Each moved folder: its host path, its path there, the branch its
-    /// bundle carried (checked out in a new checkout; an existing one keeps
-    /// what it has checked out and gets that branch updated,
-    /// `repo::land_from`).
+    /// bundle carried (checked out in a new checkout or one no instance
+    /// mounts; one in use keeps what it has checked out and gets that
+    /// branch updated, `repo::land_from`).
     pub folders: Vec<(PathBuf, PathBuf, String)>,
     /// What each repo's bundle carried, for the hub mirror ([`mirror`]).
     pub sent: Vec<Sent>,
@@ -791,15 +791,17 @@ fn next_seq() -> u32 {
 ///   a 0-byte body brings none), the refs set there (each a commit the
 ///   cache now has, `repo::set_refs`), then the checkout at
 ///   `roots/<hash>/<path>` cut from the cache ([`repo::land_from`]: a new
-///   one gets the WIP applied), every dir on the way a real one (no
-///   symlink).
+///   one, or one `in_use` says no instance mounts, is cut to what was sent,
+///   the WIP applied; one in use keeps its working tree, a line logged
+///   when its branch stays), every dir on the way a real one (no symlink).
 /// - `bundle` with no `to` (the hub mirror, [`mirror`]): cache-only, the
 ///   same checks of `repo` and `refs`, into `repos/<repo>.git` with its
 ///   refs set, no checkout and no root needed.
 ///
 /// Bodies wait in `roots/.in/` (`repos/.in/` for a cache-only bundle); the
 /// unpacking's error is the transfer's answer, so the sender hears it.
-pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
+pub fn receivers(fleet_root: &Path, receivers: Receivers, in_use: InUse) -> Receivers {
+    let log = receivers.log();
     let roots = fleet_root.join("roots");
     let (tar_in, tar_roots, bundle_in, bundle_roots) = (roots.clone(), roots.clone(), roots.clone(), roots);
     let cache_in = fleet_root.join("repos").join(".in");
@@ -867,11 +869,37 @@ pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
                     repo::unbundle(&cache, &r.path)?;
                 }
                 repo::set_refs(&cache, refs)?;
-                repo::land_from(&cache, &at, branch, wip)
+                let busy = at.join(".git").exists() && in_use(&at);
+                if repo::land_from(&cache, &at, branch, wip, busy)? == repo::Landed::Kept {
+                    log(&format!(
+                        "fleet: {} is in use (dirty, or not behind the sent tip): {branch} stays where it is there, the sent tip is in the repo cache",
+                        at.display()
+                    ));
+                }
+                Ok(())
             })();
             let _ = std::fs::remove_file(&r.path);
             landed
         })
+}
+
+/// Whether an instance on this host mounts a checkout ([`mounted`] over
+/// `state.toml`, the daemon's), as [`receivers`] asks before landing in an
+/// existing one.
+pub type InUse = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+/// Whether an instance in `state` mounts `checkout` directly: its `folder`,
+/// or a `folders` entry bind-mounted as is (no worktree), is the checkout,
+/// inside it or holds it. A worktree instance whose base is the checkout
+/// runs in its own working tree: it doesn't count. Paths compare
+/// canonicalized where they exist.
+pub fn mounted(state: &crate::state::State, checkout: &Path) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let checkout = canon(checkout);
+    state.instances.values().any(|i| {
+        let direct = i.folders.iter().filter(|f| f.worktree.is_none()).map(|f| &f.base);
+        std::iter::once(&i.folder).chain(direct).filter(|p| p.is_absolute()).map(|p| canon(p)).any(|p| p.starts_with(&checkout) || checkout.starts_with(&p))
+    })
 }
 
 /// A bundle header's `to`, as `(root hash, path below it)`.
@@ -1041,7 +1069,7 @@ mod tests {
         let dir = scratch("recv-root");
         let cfg = fixture(&dir);
         let fleet = dir.join("fleet");
-        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {})));
+        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {}), free()));
         let tar = pack_root(&cfg, &p("cfg")).unwrap();
         let h = tar_header(&tar);
         deliver(&r, &h, &tar).unwrap();
@@ -1085,7 +1113,7 @@ mod tests {
     fn a_bundle_needs_its_root_and_a_plain_target() {
         let dir = scratch("recv-bundle");
         let fleet = dir.join("fleet");
-        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {})));
+        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {}), free()));
         let oid = "a".repeat(40);
         let h = bundle_header(b"x", "0123456789abcdef/web", "fedcba9876543210", &[("refs/heads/main", &oid)]);
         let err = format!("{:#}", deliver(&r, &h, b"x").unwrap_err());
@@ -1265,10 +1293,20 @@ mod tests {
         }
     }
 
-    /// A link's two ends in-process (this host the opener, the machine the
-    /// answerer), the machine's receivers [`receivers`] into `fleet` and its
-    /// `API` [`serve_api`]; this host's link socket.
+    /// No checkout is in use.
+    fn free() -> InUse {
+        Arc::new(|_| false)
+    }
+
+    /// [`link_with`], no checkout in use.
     fn link(dir: &Path, fleet: &Path) -> PathBuf {
+        link_with(dir, fleet, free())
+    }
+
+    /// A link's two ends in-process (this host the opener, the machine the
+    /// answerer), the machine's receivers [`receivers`] into `fleet` (with
+    /// `in_use`) and its `API` [`serve_api`]; this host's link socket.
+    fn link_with(dir: &Path, fleet: &Path, in_use: InUse) -> PathBuf {
         use crate::devsbd::proto::channel;
         use crate::serve::fleet::link::{Endpoint, Serves, answerer_with, opener_with};
         let hub_dir = dir.join("hub");
@@ -1282,7 +1320,7 @@ mod tests {
             std::thread::spawn(move || serve_api(mine, &fleet));
             Some(theirs.into())
         };
-        let theirs = Serves::default().with(channel::API, api).transfers(Arc::new(receivers(fleet, Receivers::new(|_| {}))));
+        let theirs = Serves::default().with(channel::API, api).transfers(Arc::new(receivers(fleet, Receivers::new(|_| {}), in_use)));
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
         let path = socket.clone();
@@ -1360,12 +1398,14 @@ mod tests {
         assert!(!got.remote_root.join(".worktrees").exists() && !got.remote_root.join(".git").exists());
 
         // No `--branch`: the checkout's own (`main`); same root, kept; the
-        // existing checkout gets `main` moved, not checked out.
+        // existing checkout, which no instance mounts, is recut onto `main`
+        // with its WIP.
         let again = prepare(&t, &fleet, &cfg, "web", None).unwrap();
         assert_eq!(again.remote_root, got.remote_root);
         assert_eq!(again.folders[0].2, "main");
         assert_eq!(git(&moved, &["rev-parse", "main"]), git(&web, &["rev-parse", "main"]));
-        assert_eq!(git(&moved, &["symbolic-ref", "--short", "HEAD"]), "feature");
+        assert_eq!(git(&moved, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(std::fs::read_to_string(moved.join("README")).unwrap(), "dirty\n");
         // A requested branch the checkout lacks: its own, which a new branch starts at.
         let new = prepare(&t, &fleet, &cfg, "web", Some("new-one")).unwrap();
         assert_eq!(new.folders[0].2, "main");
@@ -1544,8 +1584,8 @@ mod tests {
         assert!(haves.tips[&id].contains(&main), "{haves:?}");
 
         // A new commit, then new uncommitted work: only the bundle goes,
-        // only the delta; the existing checkout fast-forwards and keeps its
-        // working tree (the new snapshot reaches the cache only).
+        // only the delta; the existing checkout, which no instance mounts,
+        // is recut to it, the new snapshot applied.
         std::fs::write(web.join("README"), "two\n").unwrap();
         git(&web, &["commit", "-q", "-am", "two"]);
         std::fs::write(web.join("later"), "wip\n").unwrap();
@@ -1553,8 +1593,8 @@ mod tests {
         let second = t.take();
         assert_eq!(second.len(), 1, "the root isn't sent again: {second:?}");
         assert!(second[0].1 > 0 && second[0].1 < first[1].1, "a delta: {second:?} after {first:?}");
-        assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "two\n", "fast-forwarded");
-        assert!(!checkout.join("later").exists(), "no WIP applied to an existing checkout");
+        assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "two\n");
+        assert_eq!(std::fs::read_to_string(checkout.join("later")).unwrap(), "wip\n", "the new WIP applied");
         let wip = git(&cache, &["rev-parse", &repo::wip_ref("main")]);
         assert_eq!(git(&cache, &["show", &format!("{wip}:later")]), "wip");
 
@@ -1645,7 +1685,7 @@ mod tests {
     fn a_cache_only_bundle_keeps_every_check() {
         let dir = scratch("recv-cache-only");
         let fleet = dir.join("fleet");
-        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {})));
+        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {}), free()));
         let oid = "a".repeat(40);
         let cache_only = |refs: &[(&str, &str)]| Header { to: None, ..bundle_header(b"", "x/y", "fedcba9876543210", refs) };
         let err = format!("{:#}", deliver(&r, &cache_only(&[("refs/heads/main", &oid)]), b"").unwrap_err());
@@ -1665,7 +1705,7 @@ mod tests {
         let dir = scratch("recv-wip");
         let fleet = dir.join("fleet");
         std::fs::create_dir_all(fleet.join("roots/0123456789abcdef")).unwrap();
-        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {})));
+        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {}), Arc::new(|_| true)));
         // The sender's checkout: a commit, then uncommitted work.
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1700,7 +1740,7 @@ mod tests {
         assert_eq!(git(&cache, &["rev-parse", &wip_ref]), first.wip);
 
         // Again, more work: the cache gets the new snapshot, the existing
-        // checkout's working tree is left alone.
+        // checkout (in use, dirty) is left alone, and the transfer is ok.
         std::fs::write(src.join("f"), "changed again\n").unwrap();
         let tips = repo::tips(Repo::Bare(&cache)).unwrap();
         let second = send("2.bundle", &tips);
@@ -1722,6 +1762,102 @@ mod tests {
         let err = format!("{:#}", deliver(&r, &h, b"").unwrap_err());
         assert!(err.contains("isn't a directory"), "{err}");
         assert_eq!(std::fs::read_dir(&other).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fixture`'s `web` with `.gitignore` (`*.log`) committed on `main`, a
+    /// placement of it (WIP-1: `README` changed, `U` untracked), then a
+    /// commit of `README` and WIP-2 (`README` changed again, no `U`) at the
+    /// source, and `x.log` made in the worker's checkout; `in_use` the
+    /// receivers'. The checkout, its first `HEAD`, the second placement's
+    /// result, the repo cache and `web`.
+    fn place_twice(tag: &str, in_use: bool) -> (PathBuf, PathBuf, String, Result<Prepared, Unprepared>, PathBuf, PathBuf) {
+        let dir = scratch(tag);
+        let cfg = fixture(&dir);
+        let web = dir.join("web");
+        std::fs::write(web.join(".gitignore"), "*.log\n").unwrap();
+        git(&web, &["add", ".gitignore"]);
+        git(&web, &["commit", "-q", "-m", "ignore"]);
+        let fleet = dir.join("worker/fleet/hub");
+        let t = LinkTransfer::for_worker(link_with(&dir, &fleet, Arc::new(move |_| in_use)).parent().unwrap(), "w");
+        std::fs::write(web.join("README"), "wip 1\n").unwrap();
+        std::fs::write(web.join("U"), "u\n").unwrap();
+        let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
+        let checkout = got.folders[0].1.clone();
+        assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "wip 1\n");
+        let first = git(&checkout, &["rev-parse", "HEAD"]);
+        std::fs::write(checkout.join("x.log"), "built\n").unwrap();
+        std::fs::remove_file(web.join("U")).unwrap();
+        std::fs::write(web.join("README"), "two\n").unwrap();
+        git(&web, &["commit", "-q", "-am", "two"]);
+        std::fs::write(web.join("README"), "wip 2\n").unwrap();
+        let again = prepare(&t, &fleet, &cfg, "web", None);
+        let cache = cache_path(&fleet, &repo::identity(Repo::Checkout(&web), "HEAD").unwrap());
+        (dir, checkout, first, again, cache, web)
+    }
+
+    #[test]
+    fn a_checkout_no_instance_mounts_is_recut_to_what_was_sent() {
+        let (dir, checkout, _, again, _, web) = place_twice("recut", false);
+        again.unwrap();
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), git(&web, &["rev-parse", "main"]));
+        assert_eq!(git(&checkout, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "wip 2\n");
+        assert!(!checkout.join("U").exists(), "WIP-1's untracked file is gone");
+        assert_eq!(std::fs::read_to_string(checkout.join("x.log")).unwrap(), "built\n", "ignored files stay");
+        assert_eq!(git(&checkout, &["status", "--porcelain=v1", "-uall"]), "M README");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkout_an_instance_mounts_keeps_its_tree_unless_it_can_fast_forward() {
+        let (dir, checkout, first, again, cache, web) = place_twice("in-use", true);
+        // README changed both in the WIP there and in the new commit: the
+        // fast-forward would clash, so the branch stays; still ok.
+        again.unwrap();
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), first);
+        assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "wip 1\n");
+        assert!(checkout.join("U").exists());
+        assert_eq!(git(&cache, &["rev-parse", "refs/heads/main"]), git(&web, &["rev-parse", "main"]), "the new tip is in the cache");
+
+        // Clean there, a descendant sent: fast-forwarded.
+        git(&checkout, &["checkout", "-q", "--", "README"]);
+        std::fs::remove_file(checkout.join("U")).unwrap();
+        std::fs::write(web.join("README"), "three\n").unwrap();
+        git(&web, &["commit", "-q", "-am", "three"]);
+        let cfg = dir.join("cfg");
+        let fleet = dir.join("worker/fleet/hub");
+        let t = LinkTransfer::for_worker(&dir.join("hub"), "w");
+        prepare(&t, &fleet, &cfg, "web", None).unwrap();
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), git(&web, &["rev-parse", "main"]));
+        assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "three\n");
+        assert_eq!(git(&checkout, &["status", "--porcelain=v1", "-uall"]), "", "no WIP applied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkout_is_in_use_when_an_instance_mounts_it_directly() {
+        let dir = scratch("mounted");
+        let (at, other) = (dir.join("roots/h/web"), dir.join("roots/h/lib"));
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let state = |body: &str| -> crate::state::State {
+            toml::from_str(&format!("[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nworkspace = \"/w\"\ncreated_unix = 0\n{body}")).unwrap()
+        };
+        let q = |p: &Path| p.display().to_string();
+        assert!(!mounted(&crate::state::State::default(), &at));
+        assert!(mounted(&state(&format!("folder = \"{}\"\n", q(&at))), &at));
+        // Through a symlink: compared canonicalized.
+        std::os::unix::fs::symlink(&at, dir.join("link")).unwrap();
+        assert!(mounted(&state(&format!("folder = \"{}\"\n", q(&dir.join("link")))), &at));
+        assert!(!mounted(&state(&format!("folder = \"{}\"\n", q(&other))), &at));
+        // A worktree instance based on it runs elsewhere.
+        let wt = format!("folder = \"{}\"\nbase_folder = \"{}\"\nworktree = \"{0}\"\n", q(&dir.join("wt")), q(&at));
+        assert!(!mounted(&state(&wt), &at));
+        // A `folders` entry: direct counts, a worktree of it doesn't.
+        let entry = |worktree: &str| format!("folder = \"{}\"\n[[instance.a.folders]]\ntarget = \"/w/web\"\nbase = \"{}\"\n{worktree}", q(&other), q(&at));
+        assert!(mounted(&state(&entry("")), &at));
+        assert!(!mounted(&state(&entry(&format!("worktree = \"{}\"\n", q(&dir.join("wt2"))))), &at));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

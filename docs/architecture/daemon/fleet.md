@@ -863,11 +863,22 @@ there). Bodies wait in `roots/.in/` (a cache-only bundle's in
   commit the cache has. `repo::land_from` then cuts the checkout from
   the cache, with no remote: a new one (no `.git`; a dir that exists and
   isn't empty is refused) by `git init`, HEAD to `refs/heads/<branch>`,
-  a fetch from the cache, `reset --hard` and, with a WIP ref,
-  `wip::apply_wip` of it (the ref fetched for it then dropped); an
-  existing one only gets the branch fast-forwarded (its working tree
-  with it) when it's the one checked out, else moved to the cache's, and
-  no WIP applied (an instance may be using it). Caches are never pruned.
+  a fetch from the cache, `reset --hard`, `clean -fd` and, with a WIP
+  ref, `wip::apply_wip` of it (the ref fetched for it then dropped). An
+  existing one is asked about first: `code::receivers` takes an
+  `code::InUse` predicate, the daemon's `code::mounted` over its
+  `state.toml` (an instance's `folder`, or a `folders` entry mounted
+  without a worktree, is the checkout, inside it or holds it; worktree
+  instances based on it don't count; an unreadable `state.toml` counts
+  as in use). One no instance mounts is recut the same way as a new one:
+  the sent branch checked out, untracked files removed but ignored ones
+  (build outputs) kept, the WIP applied, so it holds exactly what was
+  sent. One in use keeps its working tree: its checked-out branch is
+  fast-forwarded only when `status --porcelain` is empty and the sent
+  tip descends from it, else it stays where it is (`repo::Landed::Kept`,
+  a line in the worker's log; the transfer is still `ok`, the tip in the
+  cache); another branch's ref is moved to the cache's; no WIP applied.
+  Caches are never pruned.
 - `bundle` with no `to` (cache-only, the hub mirror): the same `repo`
   and `refs` checks, into `repos/<repo>.git` the same way (made if
   missing, `unbundle`, `set_refs`), no checkout and no root needed.

@@ -1321,6 +1321,15 @@ step 12 does.
     using it. A detached `HEAD` still doesn't move. Ignored files a
     worktree wants (`.worktreeinclude`, `worktree-include`) don't travel
     in v1 (parked).
+
+    Amended (after 12d): with every new checkout dirty from its WIP, "as
+    `land` does today" failed a repeat placement whose fast-forward hit
+    the WIP's files. An existing checkout that no instance in the
+    worker's `state.toml` mounts is recut like a new one (the sent branch,
+    `reset --hard`, untracked non-ignored files removed, the WIP
+    applied); one an instance mounts keeps its working tree, its branch
+    fast-forwarded only when clean, else left (the sent tip stays in the
+    cache), and the transfer doesn't fail.
 74. A config root that's a git repo keeps moving as a tar (its `.git`
     left out), so a `folder` inside the config root still doesn't move;
     moving such a root as a repo is parked.

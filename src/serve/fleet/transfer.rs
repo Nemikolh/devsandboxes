@@ -418,6 +418,11 @@ impl Receivers {
         Receivers { kinds: HashMap::new(), log }
     }
 
+    /// The log fn [`Receivers::new`] took, for a kind's own lines.
+    pub fn log(&self) -> fn(&str) {
+        self.log
+    }
+
     /// Receive `kind`, at most `limit` bytes, into where `decide` says;
     /// `done` runs with each one received (after its `ok` went out, on the
     /// transfer's thread).
