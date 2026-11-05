@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-One user model on every runtime: inside a sandbox you are a user with your host uid/gid, so workspace files come out owned by you on rootful docker, rootless docker, rootless podman and VM-backed runtimes alike. Browsers keep their own sandbox wherever it can work, and tools are told when it can't. Interactive `exec` sessions survive a dropped connection: `--attach` gets the program back, and a machine's terminal reconnects by itself after a network blip. Machines become one fleet: every machine is a member with its own key and trust setting, reached over its own link or through other members, and `run --place` asks the hub where a new sandbox has room.
+One user model on every runtime: inside a sandbox you are a user with your host uid/gid, so workspace files come out owned by you on rootful docker, rootless docker, rootless podman and VM-backed runtimes alike. Browsers keep their own sandbox wherever it can work, and tools are told when it can't. Interactive `exec` sessions survive a dropped connection: `--attach` gets the program back, and a machine's terminal reconnects by itself. Machines become one fleet: members with their own keys and trust, a hub, routing through other members, `run --place` to send a sandbox where there's room and `devsandbox fetch` to bring the work back. **Fleet is experimental in 0.9.0:** its commands, config, files and the protocol between machines may change between releases with no migration, so don't use it for anything you can't redo. Its entries are grouped under *Experimental: fleet* below.
 
 **Behaviour change: sandboxes run as the host user by default (`identity = "host"`).** The config's `remoteUser` (else `containerUser`, else the image's `USER`) is adopted with your host uid/gid, keeping its name, home and shell. A config that assumes root in the container (mounts or paths under `/root`, a root `remoteUser`/`containerUser`) can break under it, so `run`, `start` and `rebuild` now offer to update it first (the dashboard asks too), and `identity = "image"` keeps the old behaviour. Existing instances keep the user they were created with until rebuilt (`devsandbox rebuild --force <name>`).
 
@@ -11,17 +11,19 @@ One user model on every runtime: inside a sandbox you are a user with your host 
 identity = "image"   # users as written, no remapping
 ```
 
+**Machines added with 0.8.0 must be added again** with `machine add`: their old links are refused (see *Experimental: fleet*).
+
 ### Added
 
-- **Sandboxes run as the host user, planned per runtime mode.** `run` probes the runtime's user-namespace mode (rootful, rootless docker, rootless podman, VM-backed) once per runtime context and picks how to create and exec the container so the adopted account ends up with your ids; it prints the plan in one line (`identity: rootful: exec as vscode, remapped to 1000:1000`) plus any warning. On rootless docker, where root is the host user, execs run as root with `HOME` set to the account's home. With no account to adopt (root or no user), the sandbox runs as root with a warning recommending the `common-utils` feature. `--reprobe` on `run` and `rebuild` probes the mode again instead of using the cached result. A docker socket mount gets the right group, and SELinux-enforcing hosts get their binds relabelled.
+- **Sandboxes run as the host user, planned per runtime mode.** `run` probes the runtime's user-namespace mode (rootful, rootless docker, rootless podman, VM-backed) once per runtime context, picks how to create and exec the container so the adopted account ends up with your ids, and prints the plan in one line (`identity: rootful: exec as vscode, remapped to 1000:1000`) plus any warning. On rootless docker, where root is the host user, execs run as root with `HOME` set to the account's home. With no account to adopt, the sandbox runs as root with a warning recommending the `common-utils` feature. A docker socket mount gets the right group, and SELinux-enforcing hosts get their binds relabelled. `--reprobe` on `run` and `rebuild` probes the mode again.
 
 ```bash
 devsandbox run web --reprobe
 ```
 
-- **`identity` config field, with `updateRemoteUserUID` as its hint.** `identity = "host"` (default) or `"image"` (users taken literally, as before). When `identity` is unset, `updateRemoteUserUID = false` means `"image"`, so devcontainer configs that opt out of uid remapping keep doing so.
+- **`identity` config field.** `identity = "host"` (default) or `"image"` (users taken literally, as before). When it's unset, `updateRemoteUserUID = false` means `"image"`, so devcontainer configs that opt out of uid remapping keep doing so.
 
-- **Updating configs that mount into `/root`.** Before `run`, `start` and `rebuild`, on a terminal, devsandbox lists the config entries that break under host identity and asks `[u]pdate / [c]ontinue as is (don't ask again) / [s]kip this time`. Update rewrites the config file in place, comments and layout kept: `/root` becomes `${containerEnv:HOME}`, a root user is removed (or kept with `identity = "image"`), and it names the instances that now need a rebuild. A YAML config gets the edits to make by hand. Off a terminal, under `run --json` and from autostart, `run` prints one warning line instead. The dashboard flags these sandboxes in its header (`N sandboxes use /root (U to update)`) and Detail panel, offers the update when it opens and on `U`, and asks the same question before `run`, `start` and `rebuild`. Machines' configs are checked on the machine.
+- **Updating configs that mount into `/root`.** Before `run`, `start` and `rebuild`, on a terminal, devsandbox lists the config entries that break under host identity and asks `[u]pdate / [c]ontinue as is (don't ask again) / [s]kip this time`. Update rewrites the config file in place, comments and layout kept: `/root` becomes `${containerEnv:HOME}`, a root user is removed (or kept with `identity = "image"`), and it names the instances that now need a rebuild. A YAML config gets the edits to make by hand. Off a terminal, under `run --json` and from autostart, `run` prints one warning line instead. The dashboard flags these sandboxes in its header (`N sandboxes use /root (U to update)`) and Detail panel, and offers the same update when it opens, on `U`, and before `run`, `start` and `rebuild`. Machines' configs are checked on the machine. API: `config.findings`, `config.migrate`, `config.ack` (`docs/reference/api.md`, *Config*).
 
 - **`${containerEnv:NAME}`.** Resolves at create, once the image is built, from the sandbox's `containerEnv`, else the image's `ENV`, else for `HOME` the home of the account the container runs as. It works in `mounts`, `shell-rc`, feature mounts, `containerEnv` and `remoteEnv`, so a mount can land in the user's home whoever that is, and `PATH = "${containerEnv:PATH}:/opt/bin"` extends the image's `PATH`.
 
@@ -29,18 +31,16 @@ devsandbox run web --reprobe
 mounts = ["source=${sharedVolumes}/gh,target=${containerEnv:HOME}/.config/gh,type=bind"]
 ```
 
-- **Browsers keep their sandbox on docker.** Docker sandboxes are created with devsandbox's seccomp profile: docker's default plus user namespaces for unprivileged processes, which Chromium's and Electron's own sandbox needs (podman already allows it). That opens kernel surface docker's default closes; `userns = false` keeps docker's default profile.
+- **Browsers keep their sandbox.** Docker sandboxes are created with devsandbox's seccomp profile: docker's default plus user namespaces for unprivileged processes, which Chromium's and Electron's own sandbox needs (podman already allows it). That opens kernel surface docker's default closes; `userns = false` keeps docker's default profile. Where execs run as root (rootless docker, root images), `chrome`, `chromium` and `google-chrome` go through a wrapper that starts the real browser at a non-root uid; `DEVSANDBOX_CHROME` (and `CHROME_PATH`, `CHROME_BIN`, `PUPPETEER_EXECUTABLE_PATH`) point at it, so a Playwright script passes `executablePath: process.env.DEVSANDBOX_CHROME` and `chromiumSandbox: true`. Root plans also silence pip's and bundler's root warnings.
 
 ```toml
 [sandbox.web]
 userns = false
 ```
 
-- **Browser sandbox check and tool env.** Each new container checks whether a browser sandbox can start there, and `run` says so (`browser sandbox: on`, or `off (<why>); sandbox-off knobs set`). Where it works, every exec gets `DEVSANDBOX_BROWSER_SANDBOX=1`; where it doesn't, the tools' sandbox-off knobs (`PUPPETEER_DANGEROUS_NO_SANDBOX`, `ELECTRON_DISABLE_SANDBOX`, `QTWEBENGINE_DISABLE_SANDBOX`, `PLAYWRIGHT_MCP_SANDBOX=false`, `CHROMIUM_FLAGS=--no-sandbox`), so tools turn their sandbox off only where it can't work. Keys you set in `containerEnv` or `remoteEnv` win. `inspect` prints the recorded verdict. Instances created before this say `not recorded` until rebuilt.
+- **Tools are told whether a browser sandbox works.** Each new container checks whether a browser sandbox can start there, and `run` says so (`browser sandbox: on`, or `off (<why>); sandbox-off knobs set`). Where it works, every exec gets `DEVSANDBOX_BROWSER_SANDBOX=1`; where it doesn't, the tools' sandbox-off knobs (`PUPPETEER_DANGEROUS_NO_SANDBOX`, `ELECTRON_DISABLE_SANDBOX`, `QTWEBENGINE_DISABLE_SANDBOX`, `PLAYWRIGHT_MCP_SANDBOX=false`, `CHROMIUM_FLAGS=--no-sandbox`). Keys you set in `containerEnv` or `remoteEnv` win. `inspect` prints the verdict; instances created before this say `not recorded` until rebuilt.
 
-- **Browsers where execs run as root.** On plans where execs run as root (rootless docker, root images), `chrome`, `chromium` and `google-chrome` go through a wrapper in `/run/devsandbox/bin` that starts the real browser at a non-root uid, so Chromium keeps its sandbox. `DEVSANDBOX_CHROME` (and `CHROME_PATH`, `CHROME_BIN`, `PUPPETEER_EXECUTABLE_PATH`) point at it; a Playwright script passes `executablePath: process.env.DEVSANDBOX_CHROME` and `chromiumSandbox: true`. Root plans also silence pip's and bundler's root warnings.
-
-- **Resumable `exec` sessions.** On an instance with the helper, a tty `exec` runs in a session that outlives the client: if the terminal or connection goes, the program keeps running, and `exec --attach` gets back to it (the instance's one detached session, a pick list when there are several, or `--attach=<id>`). `--sessions` lists them, `--session <id>` runs in a named one, attaching if it's live. The dashboard's instance terminals run in sessions too, so a shell closed with the dashboard can be reattached from the CLI, and its Detail panel shows `sessions: N (M detached)` with a `▣N` badge on the instance's row. Ended sessions are cleaned up after a few minutes; detached ones nobody reattaches to stay until removed.
+- **Resumable `exec` sessions.** On an instance with the helper, a tty `exec` runs in a session that outlives the client: if the terminal or connection goes, the program keeps running, and `exec --attach` gets back to it (the one detached session, a pick list when there are several, or `--attach=<id>`). `--sessions` lists them, `--session <id>` runs in a named one, attaching if it's live. Dashboard terminals run in sessions too, so a shell closed with the dashboard can be reattached from the CLI; the Detail panel shows `sessions: N (M detached)` and the row a `▣N` badge. Ended sessions are cleaned up after a few minutes; detached ones stay until removed.
 
 ```bash
 devsandbox exec web --sessions
@@ -48,11 +48,53 @@ devsandbox exec web --attach
 devsandbox exec web --attach=1790000000-a1b2
 ```
 
-- **Machine terminals reconnect.** A tty `exec` on a machine's instance, and a dashboard terminal tab on one, reattach to their session when ssh drops (`connection lost, reconnecting… (Ctrl-C to stop)`, backing off up to 10 s between tries), instead of ending the program's terminal. To keep ssh's own failure apart, a program there that exits 255 reports 254.
+- **Machine terminals reconnect.** A tty `exec` on a machine's instance, and a dashboard terminal tab on one, reattach to their session when the connection drops (`connection lost, reconnecting… (Ctrl-C to stop)`, backing off up to 10 s), instead of ending the program's terminal. To keep the connection's own failure apart, a program there that exits 255 reports 254.
 
-- **Fleet: one pool of machines around a hub.** `machine add` now also joins fleets: the machine joins this host's fleet, this host joins the machine's, or (neither in one) the two make a new fleet with this host as its hub; two different fleets are refused. A laptop joins an always-on server's fleet with `machine add <server>` and dials it, so the server never needs ssh into the laptop. Every member sees the whole fleet: a machine it has no link to is reached through the members between them (see *Routing through the fleet*).
+- **`exec --service <name>`** opens a terminal in a service container the instance uses (its command, else a login shell).
 
-- **Placed runs: `run --place`.** A typed `run` always runs on the machine whose config it names. `run --place` (also `:run … --place` in the dashboard) asks the hub where the new instance goes: the hub or a machine with the most headroom against its soft caps (`[caps]` in `member.toml`; `over cap: …` warns, never refuses), and says where (`placed on <machine> (…)`). Placed on another machine, the config root and the folder's branch move there first, straight from your checkout with no remote needed: unpushed commits and a local-only branch go, and so does the uncommitted work of the branch you have checked out (untracked files included, ignored ones not), as uncommitted changes in that machine's copy of the folder (a new `--branch` starts from the committed tip, as a worktree); a repeat placement sends only what that machine lacks. The instance is that machine's, `<machine>/<instance>`. A sandbox whose config ties it to this host (binds outside what moves, `${localEnv:…}`, shared volumes, the runtime socket, `caches`, `privileged`, `initializeCommand`, global services, build paths outside the root) runs here with a note naming why, before the hub is asked; so does one with `placement = "home"`. An unreachable hub runs it here with a note.
+### Fixed
+
+- **Feature mounts under `${sharedVolumes}` work on a first run.** A feature's bind mount whose source is under `${sharedVolumes}` is now created when missing, like a config mount, instead of skipped with a warning. Other missing feature sources are still skipped.
+- **`caches` work for a non-root user.** Cache mounts now go to `/var/cache/devsandbox/<name>` instead of `/root/…`, which a non-root `remoteUser` couldn't reach. The tools find them through their env vars as before.
+- **Same-named sandboxes in two config roots no longer clobber each other's images, nor does sandbox `foo-feat` clobber sandbox `foo`'s features image.** Built images are tagged per config root, one prefix per kind (`devsandbox-img-<root>-<sandbox>`, `devsandbox-feat-<root>-<sandbox>`, `devsandbox-img-svc-<root>-<service>`), so the first `run` or `rebuild` after upgrading builds them again; images under the old tags are left for `docker image prune`.
+- **`${localEnv:NAME:default}` uses its default.** An unset `NAME` now expands to `default` (everything after the `:`) instead of empty; a set one, even to empty, to its value. `${containerEnv:NAME:default}` works the same.
+- **Running devsandbox as root on rootful docker or podman works.** Instead of failing to remap the adopted account to uid 0, execs run as root with `HOME` set to the account's home, as on rootless docker.
+- **The dashboard's build log follows a running build**, refreshing within about 100 ms instead of only on snapshots.
+- **Dashboard prefills no longer fail as ambiguous.** `r`'s prefill and tab completion, and `p`'s port prefills, write a local name a machine also has as `@/<name>`, so the line submits.
+- **Machines' rows stay current.** A late update from a machine could bring back a root that was dropped, or overwrite a newer snapshot with older rows.
+- **A signal no longer fails a command talking to the host daemon.** An interrupted read of the daemon's reply is retried instead of failing the command.
+
+### Experimental: fleet
+
+Everything in this group may change between releases (commands, `member.toml`, the fleet's files next to `state.toml`, the protocol between machines) with no migration. Don't use it for anything you can't redo.
+
+- **One link per pair of machines, under the machine's trust.** Everything done on a machine (CLI commands, verbs, terminals, port forwards, the ssh agent) rides one held link instead of an ssh connection per use; ssh carries only that link and `machine add`'s probe. Links from before this release are refused until both ends have keys and a signed member list, so add 0.8.0 machines again. What a link reaches is the machine's own `machine trust` (`worker` by default): a machine you drive freely needs `machine trust full` there.
+
+- **Machines form one fleet around a hub.** `machine add` joins fleets: the machine joins this host's fleet, this host joins the machine's, or (neither in one) the two start one with this host as hub, `--hub` making the target the hub instead; two different fleets are refused. A laptop joins an always-on server's fleet with `machine add <server>` and dials it, so the server never needs ssh into the laptop. A machine with no config roots (or none picked) can be added and runs only other members' configs. Every member sees the whole fleet. `machine rm <name>` takes a member out (`machine rm <this host>` leaves); forgetting only the link is `machine unlink <name>`. `machine hub <m>` moves the hub role with no link changing; members that were offline follow when they reconnect, and a hub that's down can be replaced unless it's the machine that created the fleet.
+
+```bash
+devsandbox machine add me@my-server --hub
+devsandbox machine hub my-server
+```
+
+- **Member keys and a signed member list.** Every machine has its own key (`machine key` prints its fingerprint, `machine key rotate` replaces it without leaving). Only the machine that created the fleet signs who belongs, and every member checks the list; every link checks both ends' keys against it, so no machine can pass itself off as another member or as the hub. `machine add` shows the other machine's fingerprint to confirm (`--yes` skips it off a terminal). `machine rm`, `machine key rotate`, `machine hub` and adds typed on another member go to the creating machine, which shows a desktop notification: `machine pending` lists them, `machine approve <id>` and `machine deny <id>` decide. A machine added by another member shows as `introduced by …` in `machine ls` and can't add others until approved.
+
+```bash
+devsandbox machine key
+devsandbox machine add me@my-server   # my-server's key fingerprint is SHA256:…
+devsandbox machine pending
+```
+
+- **Each machine decides what others reach on it: `machine trust` and `machine roots`.** `worker` (the default) admits only this host's own config roots (those with instances, plus the ones `machine roots add` picks) and the code placed on it, and holds placed configs to a worker policy: binds only under the placed code, no extra capabilities or devices, no `initializeCommand`, and host networking, the runtime socket, `${localEnv:…}`, public ports and the like only where `[allow]` in `member.toml` permits. `full` gives other machines what a local client has. When a machine on the hub's side has an ssh link into this one (a shell that could change its trust), `machine trust` warns and `machine ls` and the Machines tab mark it `exposed via <machine>`. On every machine and under any trust, `run`, `rebuild` and services refuse a bind mount, build context or build secret that would expose the machine's key (`$HOME`, the data dir, `/`, …), naming the path.
+
+```bash
+devsandbox machine trust full
+devsandbox machine roots add ~/sandboxes
+```
+
+- **Routing through the fleet.** Members share a signed graph of their links, so a machine with no link to this host is `routed via <machine>` in `machine ls`, and commands, verbs, terminals, port forwards and `run --place` reach it through the members in between, trying the next path when one is down. Routed streams are encrypted end to end and prove which member they came from, so a machine in the middle can't read, alter, replay or speak for them, and the far end applies its own trust to the real origin. The ssh agent is a per-machine grant (`machine set <m> --agent on`) that reaches the granted machine over any path; a machine in the middle's own grant never carries over.
+
+- **Placed runs: `run --place`.** A typed `run` always runs on the machine whose config it names. `run --place` (also `:run … --place` in the dashboard) asks the hub where the new instance goes: the hub or the machine with the most headroom against its soft caps (`[caps]` in `member.toml`; `over cap: …` warns, never refuses), and says where (`placed on <machine> (…)`). Placed elsewhere, the config root and the folder's branch move there first, straight from your checkout with no remote needed: unpushed commits, a local-only branch and the uncommitted work of the branch you have checked out (untracked files included, ignored ones not) all go; a repeat placement sends only what that machine lacks, and the hub keeps a copy of each repo placed elsewhere. The instance is that machine's, `<machine>/<instance>`. A sandbox whose config ties it to this host (binds outside what moves, `${localEnv:…}`, shared volumes, the runtime socket, `caches`, `privileged`, `initializeCommand`, global services, build paths outside the root) runs here with a note naming why, as does one with `placement = "home"` or when the hub is unreachable.
 
 ```bash
 devsandbox run web --place --branch fix-login   # placed on lap (mem 71% free, …)
@@ -63,78 +105,65 @@ devsandbox run web --place --branch fix-login   # placed on lap (mem 71% free, �
 placement = "home"   # run --place never moves it
 ```
 
-- **`devsandbox fetch`: placed work comes back.** `devsandbox fetch <machine>/<instance>`, on the host that placed it, brings the instance's branch and a snapshot of its working tree into the checkout it came from as hidden refs (`refs/devsandbox/<machine>/<instance>/heads/<branch>` and `…/wip`); your branches, index and working tree are never touched. `rm` of a placed instance from that host fetches it back first and refuses if it can't (`rm --force` skips it); `done` fetches back too, warning if it can't. The hub also keeps a copy of each repo a member places elsewhere.
+- **`devsandbox fetch`: placed work comes back.** `devsandbox fetch <machine>/<instance>`, on the host that placed it, brings the instance's branch and a snapshot of its working tree into the checkout it came from as hidden refs (`refs/devsandbox/<machine>/<instance>/heads/<branch>` and `…/wip`); your branches, index and working tree are never touched. `rm` of a placed instance fetches it back first and refuses if it can't (`rm --force` skips that); `done` fetches back too, warning if it can't.
 
 ```bash
 devsandbox fetch lap/web-2
 git log refs/devsandbox/lap/web-2/wip
 ```
 
-- **`machine add` without config roots, and `--hub`.** A machine with no config roots (or none picked) can be added: it runs only other members' configs. `machine add <server> --hub`, run on a laptop with neither in a fleet yet, makes the server the hub of the new fleet.
-
-- **`machine trust` and `machine roots`.** Each machine decides what the others reach on it. `worker` (the default) admits only this host's own config roots (those with instances, plus the ones `machine roots add` picks) and the code placed on it, and holds placed configs to a worker policy: binds only under the placed code, no extra capabilities or devices, no `initializeCommand`, and host networking, the runtime socket, `${localEnv:…}`, public ports and the like only where `[allow]` in `member.toml` permits them. `full` gives other machines the API a local client has.
-
-```bash
-devsandbox machine trust full
-devsandbox machine roots add ~/sandboxes
-```
-
-- **Members follow the hub's build.** A member runs its hub's exact version, downgrades included, so a fleet never mixes protocols. A hub on a released build has its members download that release's binary from GitHub (linux x86_64/arm64, macOS arm64), installed only once its signed checksums verify. A hub on a dev build (built from source, `cargo install` included) hands its binary to members that set `dev-builds = true` in `member.toml` (or trust `full`) on the same OS/arch.
-
-- **`machine rm` takes a machine out of the fleet; `machine unlink` only drops the link.** `machine rm <name>` removes a member from the fleet (`machine rm <this host>` leaves it); the old behaviour, forgetting the link while it stays a member, is `machine unlink <name>`.
-
-- **Member keys and a signed member list.** Every machine has its own key (`devsandbox machine key` prints its fingerprint). Who belongs to a fleet is a list only the machine that created the fleet can sign, and every member checks it. `machine add` shows the other machine's fingerprint and asks you to confirm it (compare it with `machine key` run there); `--yes` skips the question off a terminal.
-
-```bash
-devsandbox machine key
-devsandbox machine add me@my-server   # my-server's key fingerprint is SHA256:…
-```
-
-- **Fleet links prove both machines' keys.** Every link between two machines checks each end's key against the member list before anything goes over it, so a machine can't pass itself off as another member or as the hub. A machine added by a member other than the fleet's creator is shown as `introduced by …` in `machine ls` and can't add others until the creator approves it.
-
-- **Approving membership changes: `machine pending|approve|deny`.** `machine rm`, `machine key rotate` and adds typed on another member are sent to the machine that created the fleet, which shows a desktop notification; `devsandbox machine pending` lists them there, `machine approve <id>` applies one and `machine deny <id>` drops it. On the creating machine they apply at once.
-
-- **`machine key rotate`.** Replaces this machine's key without leaving the fleet; its links reconnect with the new key once the change is approved.
-
-- **`machine hub <m>` moves the hub role.** The fleet's hub becomes member `m` with no link changing: on the machine that created the fleet it applies at once, typed elsewhere it waits for `machine approve` there. Every member it reaches follows within seconds, and one that was offline follows when it next connects. The old hub takes no part, so a hub that's down can be replaced, unless it's the machine that created the fleet (that machine signs the move); the new hub's fleet view is the machines it links to directly.
-
-```bash
-devsandbox machine hub my-server
-```
-
-- **Routing through the fleet.** Members report their links to each other, signed, so every member knows the fleet's link graph. A machine with no link to this host is a `routed` machine (`machine ls` says `routed via <machine>`): commands, verbs, terminals, port forwards and `run --place` reach it through the members between them, trying the next path when one is down. Each routed stream proves which member it came from with that member's key, so a machine in the middle can't speak for another member, and the far end applies its own trust to the member the stream came from. Membership changes reach the fleet's creator over any path too, so they no longer need a direct link to it. Routed streams are encrypted end to end between the two machines, so a machine in the middle carries only ciphertext it can't read, alter, replay or redirect. The ssh agent is a per-machine grant (`machine set <m> agent on`) that reaches the granted machine over any path, including a machine that dialed this one; a machine in the middle's own grant never carries over.
-
-- **`machine trust worker` says when it doesn't protect this machine.** When the hub, or a machine the hub's side controls, has an ssh link into this machine, it has a shell here and could change its trust; `machine trust` warns naming that machine, and `machine ls` and the dashboard's Machines tab mark such machines `exposed via <machine>`.
-
-- **The member key never reaches a container.** `run`, `rebuild` and services refuse any bind mount, build context or build secret that would expose the machine's key (`$HOME`, the data dir, `/`, …), on every machine and whatever its trust; the error names the path and asks for a narrower one.
-
-- **API: `config.findings`, `config.migrate` and `config.ack`.** The `/root` findings of a config root, the in-place update (guarded by the file's hash: `conflict` when it changed since) and "continue as is", also on a machine (`machine`). Details: `docs/reference/api.md`, *Config*.
-
-### Changed
-
-- **Machines go over one link each, under the machine's trust.** Everything done on a machine (CLI commands, verbs, terminals, port forwards, the ssh agent) now rides one held link per pair of machines instead of an ssh connection per use; ssh is used only for that link and for `machine add`'s probe. What a link reaches is the machine's own `machine trust` setting (`worker` by default), so a machine that should be driven freely needs `machine trust full` there. Machines added before this release must be added again with `machine add`: their links are refused until both ends have keys and a signed member list.
-
-### Fixed
-
-- **Feature mounts under `${sharedVolumes}` work on a first run.** A feature's bind mount whose source is under `${sharedVolumes}` is now created when missing, like a config mount, instead of skipped with a warning. Other missing feature sources are still skipped.
-- **`caches` work for a non-root user.** Cache mounts now go to `/var/cache/devsandbox/<name>` instead of `/root/…`, which a non-root `remoteUser` couldn't reach. The tools find them through their env vars as before.
-- **Same-named sandboxes in two config roots no longer clobber each other's images, nor does sandbox `foo-feat` clobber sandbox `foo`'s features image.** Built images are tagged per config root, one prefix per kind (`devsandbox-img-<root>-<sandbox>`, `devsandbox-feat-<root>-<sandbox>`, `devsandbox-img-svc-<root>-<service>`), so the first `run` or `rebuild` after upgrading builds them again; images under the old tags are left for `docker image prune`.
-- **`${localEnv:NAME:default}` uses its default.** An unset `NAME` now expands to `default` (everything after the `:`) instead of empty; a set one, even to empty, to its value. `${containerEnv:NAME:default}` works the same.
-- **Running devsandbox as root on rootful docker or podman works.** Instead of failing to remap the adopted account to uid 0, execs run as root with `HOME` set to the account's home, as on rootless docker.
-- **The dashboard's build log follows a running build.** The modal re-reads an in-flight build's log as it's written instead of only on snapshots, and refreshes within about 100 ms.
-- **Dashboard prefills no longer fail as ambiguous.** `r`'s prefill and tab completion, and `p`'s port prefills, write a local name a machine also has as `@/<name>`, so the line submits.
+- **Members follow the hub's build.** A member runs its hub's exact build, downgrades included, so a fleet never mixes protocols. A hub on a release has its members download that release from GitHub (linux x86_64/arm64, macOS arm64), installed only once its checksums verify against the signing key built into devsandbox (releases now ship `SHA256SUMS.sig`); the download is time-bounded, and a member stops retrying where no release exists for its platform. A hub on a dev build (from source, `cargo install` included) hands its binary to members on the same OS/arch that set `dev-builds = true` in `member.toml` (or whose trust is `full`).
 
 ### Internal
 
 - **Gated tests run under rootless podman on CI**, alongside docker, so the rootless-podman identity mode is exercised.
 - **Host-to-helper RPC channel.** The host calls the in-container helper over the bridge instead of a fresh runtime exec per request; the dispatcher's `wait` and `follow` are one held stream instead of an exec per poll.
+- **Release builds are checked and signed.** CI refuses a release whose binaries don't report the tag's version, commit and platform, and signs `SHA256SUMS`.
 
 <details><summary>Commits</summary>
 
+- 85d19ce feat(release): sign the release checksums and have members verify them against an embedded key before installing, since a checksum from the same release would share the asset's trust root
+- 2fc706e ci(release): fail a release build whose fleet-hello isn't the tag's version, commit, published and platform, since members download these binaries and a wrong stamp makes them loop or refuse the hub
+- c87ff13 docs(fleet): tag the fleet api @experimental and mark placement in the config spec, so the generated node-api and config pages flag fleet like the hand-written ones
+- 391eb22 fix(fleet): bound a release download overall and stop following a published hub where no release exists for this platform, so a member never hangs on a trickle or retries a doomed download at every link
+- d82126a docs(site): badge fleet mentions on indexed pages as experimental, since 0.9.0 ships fleet before its design settles
+- 9074557 fix(fleet): mark release builds published and check a downloaded release's whole build, not just its version, so released members follow their hub instead of looping on a moved tag
+- 82639ea docs(site): draw the fleet architecture page's machines as a data-driven FleetDiagram, so the diagram stays in step with fleet-data.ts
+- c24c2ea feat(site): say what devsandboxes is in the home title, add schema.org app data, a robots.txt pointing at the sitemap and noindex on /architecture, so search engines rank the docs for what people search and keep the contributor pages out
+- 88476e4 docs(fleet): correct step 12's docs where a review found them claiming more than the code does (the fetch-back gate's guarantee, WIP reaching every placed run, the one ref left in a user's repo, a rename skipping fetch-back), so the docs say what is built
+- 4e40da8 docs(fleet): close step 12 with its as-built note, status (steps 1-12 shipped, next 13, the transfer extras parked) and the changelog, so step 13 starts from code that moves and comes back
+- fe9a6dc feat(fleet): rm and done of an instance this host placed fetch it back first (rm refused when that fails unless --force, done with a warning), so removing placed work never loses what was done there (fleet step 12f, decision 77)
+- e1479af feat(fleet): devsandbox fetch pulls a placed instance's branch and a WIP snapshot back into the checkout it was placed from as hidden refs, recorded in placements.json and admitted on the worker only under the caller's fleet root, so work done elsewhere comes home without touching the user's branches (fleet step 12e, decision 76)
+- 6ea2118 fix(fleet): recut a moved checkout no instance mounts and leave a mounted one's tree alone, since every new checkout is dirty from its WIP and a repeat placement's fast-forward either failed on it or moved code under a running instance (fleet decision 73 amended)
+- 306f625 feat(fleet): a member placing on another machine also sends the same refs into its hub's cache, best effort with a note, so a repo's latest work outlives the laptop it came from (fleet step 12d, decision 75)
+- 6db6684 feat(fleet): placement bundles each folder from its own checkout with a WIP snapshot and asks no origin, so repos without a remote, unpushed commits and uncommitted work can be placed (fleet step 12c, decisions 72, 73)
+- 8d54cb2 feat(fleet): a worker keeps one repo cache per repo and sender and cuts checkouts from it, and code.haves tells the sender what it has, so a repeat placement sends only the delta and never the same root twice (fleet step 12b)
+- 0122d17 feat(fleet): repo identity by root commits, WIP snapshots through a temp index, delta bundles over haves and every host git bounded with its process group, so transfer v1 builds on plumbing that never touches the user's index or hangs (fleet step 12a, decisions 71, 73)
+- cbe1a80 docs(fleet): break step 12 into seven sub-steps and record decisions 71-77 (identity by root commits, sends from the source checkout with no origin, WIP only into a fresh checkout, the hub mirror best effort, fetch-back pulled into hidden refs), and say step 13 is the one waiting on helper-rpc's runs, so transfer v1 starts from a settled design
+- f72872f docs(open): plan routing container url opens to the user's desktop, with per-instance profiles
+- 619bab2 docs(fleet): say a dead hub can be replaced only while the authority is up, since a fleet made without --hub has them on one machine and the step 11 docs promised more
+- 45cb4e7 docs(fleet): close step 11 with its as-built note, status (the swap moves the role only, a link can drop twice after it) and the changelog, so step 12 starts from the hub role as it moves
+- b97a0be test(fleet): a member down during a hub move follows at its next proof, hub-only calls follow the log's hub and an old hub stops saving remotes, so every role reader is shown to follow a live move (fleet step 11b)
+- 5b8a979 feat(machine): machine hub <m> moves the hub role by a hub entry signed on the authority or proposed and approved there, each host following only once the change has left it, so the role can move off a laptop or a dead hub without cutting the links that carry it (fleet decisions 68, 69)
+- b8aaed8 docs(fleet): break step 11 into three sub-steps and record decisions 68-70 (a hub entry signed only by the authority, followed once the change has left the host, the role moving without the view's reach), so the swap lands on a settled design
+- 73fa298 test(machines): hold the machine's daemon in the api tests' pair and shut both down over held connections, since with nothing holding it the machine idled out before finish
+- f976d60 fix(machines): store a pushed root's rows only while remotes lists the root, and send a roots change after the sync, so a late push can't revive a dropped root nor an early one be lost
+- efc868b test(fleet): wait for the no-log refusal as unreachable with its error, like the clash test, not just not connected
+- 92e436a fix(fleet): retry interrupted reads in the route refusal, link.attach and notify replies, since a timed socket read fails with eintr even under sa_restart
+- db5d07d fix(serve): retry an interrupted read of the hello reply, since a timed socket read fails with eintr even under sa_restart
+- f753d24 test(fleet): inject m's report over b's link and wait for box's report, since k's flood skips the peer a change came from
+- b75d33e fix(machines): send a roots-only entry change to the running link instead of restarting it, so a new inbound machine's link doesn't drop just after connecting
+- 9dd4828 fix(serve): add a watched root's local params and its watch under one lock, and publish machines one at a time, so a watch's snapshot isn't pruned or overwritten with older remotes
+- ecccddc test(fleet): ignore the forged proof's write, since the answerer may refuse an oversized one and hang up before the body
+- 27ccfd3 test(devsbd): wait for the hang-up after a peer's drop, since a concurrent fork keeps the socket open until its exec
+- d1c7575 test(fleet): wait_box returns the row its condition matched, since a re-read can see a link retry that cleared the error
+- b3a0ef3 docs(fleet): state what a transport owes a link, since links add no encryption of their own
+- 03e3baf docs(fleet): close step 10c with its as-built note, status (routed streams encrypted, agent grants over any path, grant-as-exposure parked) and the changelog, so step 11 starts from sessions as built
 - 4e08ea4 feat(fleet): an agent reaches a member it granted over any path, routed or a link the member dialed, through an agent-route socket probed only while the granter's report lists it, so agent consent is per member and never comes from a relay (fleet decisions 58, 66)
 - e0b890c feat(fleet): agent access is a per-member grant in member.toml, by key and following rotations, set by machines.set on any machine and published in the member's link report, so routed and direct agent streams can follow one consent rule (fleet decisions 65-67)
 - 24f68fb feat(fleet): routed streams are end-to-end sessions between their two daemons (ephemeral keys signed in the opening, sealed records), so a relay carries ciphertext it can't read, alter, replay or reflect; adr 0046
 - a87642d feat(fleet): session layer for routed streams (ephemeral x25519, per-direction hkdf keys, chacha20poly1305 records with an authenticated end), so 10c can make a relay carry ciphertext only; plan decisions 61-67 and the 10c sub-steps
+- 413d61d chore: update changelog
 - f10b5c9 docs(fleet): close step 10b with ADR 0045 (a routed stream proves its origin per stream), 0043 accepted and 0041 removed, the routing docs as one account, its limitations and an as-built note, so 10c starts from routing as it is
 - b4fdffc feat(machine): machine trust worker warns, and machine ls and the Machines tab show, when a machine the hub's side controls dials this one over ssh, worked out from the link graph, so a worker setting that a shell can rewrite isn't mistaken for protection
 - 08ac478 feat(fleet): proposals, removals, forgets and run --place reach their member over any path, and every member floods graph changes to its links, so the fleet works for members with no direct link to the authority, the hub or the worker (lifts decision 49's direct-link limit)
