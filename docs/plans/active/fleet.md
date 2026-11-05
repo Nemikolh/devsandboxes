@@ -1,6 +1,6 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-11 shipped
+Status: in progress. Steps 1-12 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md),
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),
@@ -19,7 +19,10 @@ step 10b routed streams over the members' signed link graph, each
 proving its origin to its destination; step 10c made each routed
 stream an end-to-end session and agent access a per-member grant
 carried over any path; step 11 moves the hub role with `machine hub`,
-an authority-signed log entry. Step 12 is next. The rest is design. Builds on
+an authority-signed log entry; step 12 moves code itself: each folder
+from its own checkout with a WIP snapshot (no remote needed), into
+per-repo caches, a copy on the hub, and `devsandbox fetch` back. Step
+13 is next. The rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
 [machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
 its parked auto-update and PTY attach into steps 2 and 4.
@@ -853,7 +856,7 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
     (`lent::admit_fleet` over the log read per call), `remotes.json`
     (`save_loop`), the peer watch and keep-alive (`Shared::is_hub`) and
     versions (each dial's hello); it added tests only.
-12. **Transfer v1** (L). Repo identity, WIP snapshot commits, bundles
+12. **Transfer v1** (L, shipped as 12a-12g). Repo identity, WIP snapshot commits, bundles
     routed over the graph, repo caches, the hub mirror, fetch-back.
     Repos without a remote and unpushed work can be placed.
 
@@ -925,6 +928,31 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
     - **12g Docs close.** `docs/status.md` (steps 1-12 shipped, next
       13; the parked items below), this step's as-built note,
       `CHANGELOG.md`.
+
+    As built: every host git child is bounded (`repo::QUICK` 1 min,
+    `repo::WHOLE` 30 min) and its own process group, killed whole at
+    its timeout. `Transfer` is `haves`, `send` and `pull`;
+    `LinkTransfer` asks `code.haves` (peer-only: the caller's own fleet
+    root's roots and each cache's tips) over `route::connect`'s `API`.
+    A `bundle` header names its `repo` and `refs`; a 0-byte body means
+    nothing new, and one with no `to` is cache-only (the hub mirror,
+    `code::mirror`, after the worker's transfer, failures a note line).
+    The source snapshots right before bundling, on a transient
+    `refs/devsandbox/wip/send-<nonce>` deleted before anything is sent;
+    a requested branch that isn't checked out moves without WIP, an
+    unborn branch as the devsandbox root. Decision 73 was amended
+    after 12d (a checkout no instance mounts is recut, a mounted one
+    left). Fetch-back: the worker's `instances.fetch` reuses the last
+    WIP commit when nothing changed, bundles into `<fleet root>/out/`
+    (swept after an hour), served by a pull on `TRANSFER`
+    (`Receivers::serves`) and removed once pulled; the asker's
+    `placements.fetch` is local-only, finds the entry (a bare instance
+    name when unique) and checks the local checkout's identity; machine
+    names `wip` and `root` can't name hidden refs. An `rm` fetches back
+    on every attempt, the `ask` round's included; a `placements.json`
+    that doesn't load refuses a placed-looking `rm` (`--force` gets
+    past). `place::Spec::repo` stays unfilled (nothing reads it). Not
+    built: fetch-back from the dashboard.
 13. **Dispatcher children on any machine** (M). Instances carry
     `origin_host` and repo identity; `ls`/the dashboard show where they
     run. The dispatcher (on the hub) keeps authorizing on its host

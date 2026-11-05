@@ -39,7 +39,7 @@ limitation means editing this file in the same commit.
   links routed over a graph, `worker`/`full` trust per member, a
   swappable hub), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
-  re-placement: from fleet step 12 on. Steps 1-11 shipped: one kind of
+  re-placement: from fleet step 13 on. Steps 1-12 shipped: one kind of
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
@@ -71,8 +71,13 @@ limitation means editing this file in the same commit.
   access is a per-member grant (`machine set <m> agent on`), carried to
   a granted member over any path. Hub swap (step 11): `machine hub <m>`
   moves the role by a `hub` entry the authority signs (proposed and
-  approved there when typed elsewhere), links unchanged. Next: transfer
-  v1 (step 12).
+  approved there when typed elsewhere), links unchanged. Transfer v1
+  (step 12): a placed run's folders move from their own checkouts with
+  a WIP snapshot, no remote needed, into per-repo caches on the worker
+  (repeat sends carry only the delta) and on the hub, and `devsandbox
+  fetch <machine>/<instance>` (also before `rm` / `done` there) brings
+  the work back as hidden refs. Next: dispatcher children on any
+  machine (step 13).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md), [ADR 0046](decisions/0046-routed-streams-are-end-to-end-sessions.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -123,6 +128,12 @@ limitation means editing this file in the same commit.
   ssh as the granter wherever its agent reaches; reports carry grants
   since step 10c, `fleet::graph::exposure` doesn't read them).
   → [fleet](architecture/daemon/fleet.md#exposure)
+- **machines**: code transfer extras (fleet plan decisions 72-74, 76): a
+  first send fetched from a reachable `origin` instead of the link; the
+  ignored files a worktree wants (`.worktreeinclude`, `worktree-include`)
+  carried with the snapshot; a config root that's a repo moved as one,
+  so a `folder` inside it can be placed; fetch-back of `folders`
+  entries; fetch-back from the dashboard. → [plan](plans/active/fleet.md)
 
 ## Known limitations
 
@@ -528,7 +539,9 @@ limitation means editing this file in the same commit.
   On the worker, a checkout no instance mounts is recut to what was
   sent, its snapshot applied; one an instance mounts keeps its working
   tree and its branch unless it can fast-forward cleanly, so a new
-  worktree there may start from the older tip. A repeat send
+  worktree there may start from the older tip; two placements of one
+  root at once can both see it unmounted (the instance is recorded only
+  once it runs), so the second may recut it under the first. A repeat send
   carries only what the worker lacks (`code.haves`: a root it has isn't
   sent again, a bundle goes `--not` its cache's tips), but a first send
   goes whole over the link. A repo with no commit yet gets

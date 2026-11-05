@@ -52,7 +52,7 @@ devsandbox exec web --attach=1790000000-a1b2
 
 - **Fleet: one pool of machines around a hub.** `machine add` now also joins fleets: the machine joins this host's fleet, this host joins the machine's, or (neither in one) the two make a new fleet with this host as its hub; two different fleets are refused. A laptop joins an always-on server's fleet with `machine add <server>` and dials it, so the server never needs ssh into the laptop. Every member sees the whole fleet: a machine it has no link to is reached through the members between them (see *Routing through the fleet*).
 
-- **Placed runs: `run --place`.** A typed `run` always runs on the machine whose config it names. `run --place` (also `:run … --place` in the dashboard) asks the hub where the new instance goes: the hub or a machine with the most headroom against its soft caps (`[caps]` in `member.toml`; `over cap: …` warns, never refuses), and says where (`placed on <machine> (…)`). Placed on another machine, the config root and the folder's branch move there first (committed, pushed work only; anything else runs here with a note), and the instance is that machine's, `<machine>/<instance>`. A sandbox whose config ties it to this host (binds outside what moves, `${localEnv:…}`, shared volumes, the runtime socket, `caches`, `privileged`, `initializeCommand`, global services, build paths outside the root) runs here with a note naming why, before the hub is asked; so does one with `placement = "home"`. An unreachable hub runs it here with a note.
+- **Placed runs: `run --place`.** A typed `run` always runs on the machine whose config it names. `run --place` (also `:run … --place` in the dashboard) asks the hub where the new instance goes: the hub or a machine with the most headroom against its soft caps (`[caps]` in `member.toml`; `over cap: …` warns, never refuses), and says where (`placed on <machine> (…)`). Placed on another machine, the config root and the folder's branch move there first, straight from your checkout with no remote needed: unpushed commits, a local-only branch and uncommitted work (untracked files included, ignored ones not) all go, the uncommitted part as uncommitted changes there; a repeat placement sends only what that machine lacks. The instance is that machine's, `<machine>/<instance>`. A sandbox whose config ties it to this host (binds outside what moves, `${localEnv:…}`, shared volumes, the runtime socket, `caches`, `privileged`, `initializeCommand`, global services, build paths outside the root) runs here with a note naming why, before the hub is asked; so does one with `placement = "home"`. An unreachable hub runs it here with a note.
 
 ```bash
 devsandbox run web --place --branch fix-login   # placed on lap (mem 71% free, …)
@@ -61,6 +61,13 @@ devsandbox run web --place --branch fix-login   # placed on lap (mem 71% free, �
 ```toml
 [sandbox.web]
 placement = "home"   # run --place never moves it
+```
+
+- **`devsandbox fetch`: placed work comes back.** `devsandbox fetch <machine>/<instance>`, on the host that placed it, brings the instance's branch and a snapshot of its working tree into the checkout it came from as hidden refs (`refs/devsandbox/<machine>/<instance>/heads/<branch>` and `…/wip`); your branches, index and working tree are never touched. `rm` of a placed instance from that host fetches it back first and refuses if it can't (`rm --force` skips it); `done` fetches back too, warning if it can't. The hub also keeps a copy of each repo a member places elsewhere.
+
+```bash
+devsandbox fetch lap/web-2
+git log refs/devsandbox/lap/web-2/wip
 ```
 
 - **`machine add` without config roots, and `--hub`.** A machine with no config roots (or none picked) can be added: it runs only other members' configs. `machine add <server> --hub`, run on a laptop with neither in a fleet yet, makes the server the hub of the new fleet.
