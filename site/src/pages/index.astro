@@ -2,6 +2,7 @@
 import { ArrowRight, ArrowUpRight, Boxes, Check, Copy, KeyRound, Layers, Puzzle } from '@lucide/astro';
 import HowItWorks from '../components/HowItWorks.astro';
 import Base from '../layouts/Base.astro';
+import { REPO_URL } from '../lib/nav';
 import { searchSection } from '../lib/search';
 import '../styles/home.css';
 import '../styles/how-it-works.css';
@@ -38,14 +39,24 @@ const benefits = [
     link: 'Port a devcontainer.json',
   },
 ];
+
+const description =
+  'Run many coding agents at once, on your own machines, each fully isolated in its own sandbox. You stay in control. On docker, podman and Apple container.';
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: 'devsandboxes',
+  description,
+  url: new URL('/', Astro.site).href,
+  applicationCategory: 'DeveloperApplication',
+  operatingSystem: 'Linux, macOS',
+  offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+  sameAs: [REPO_URL],
+};
 ---
 
-<Base
-  title="devsandboxes"
-  description="Run many coding agents at once, on your own machines, each fully isolated in its own sandbox. You stay in control. On docker, podman and Apple container."
-  fullTitle
-  ogType="website"
->
+{/* The title says what it is: nobody searches for the name yet. */}
+<Base title="devsandboxes: devcontainers for AI coding agents" {description} fullTitle ogType="website" {structuredData}>
   {/* Indexed at a lower weight: an overview, so the docs page on a topic should rank above it. */}
   <main
     id="main-content"

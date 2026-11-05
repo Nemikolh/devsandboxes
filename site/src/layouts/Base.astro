@@ -23,9 +23,13 @@ export interface Props {
   /** Home passes its own full title; other pages get the ` — devsandboxes` suffix. */
   fullTitle?: boolean;
   ogType?: 'website' | 'article';
+  /** Kept out of search results; leaving a page out of the sitemap alone doesn't stop a linked page being indexed. */
+  noindex?: boolean;
+  /** schema.org JSON-LD for the page, emitted as-is. */
+  structuredData?: Record<string, unknown>;
 }
 
-const { title, description, fullTitle = false, ogType = 'article' } = Astro.props;
+const { title, description, fullTitle = false, ogType = 'article', noindex = false, structuredData } = Astro.props;
 const pageTitle = fullTitle ? title : `${title} — devsandboxes`;
 const canonical = new URL(Astro.url.pathname, Astro.site);
 // One brand card for every page (`public/og.png`, 1200×630); crawlers need an absolute URL.
@@ -52,6 +56,7 @@ const OG_IMAGE_ALT = 'devsandboxes, devcontainers for AI agents: Let agents loos
     <meta name="theme-color" content="#0e1315" />
     <meta name="color-scheme" content="dark" />
     <link rel="canonical" href={canonical} />
+    {noindex && <meta name="robots" content="noindex" />}
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="sitemap" href="/sitemap-index.xml" />
     <meta name="generator" content={Astro.generator} />
@@ -71,6 +76,7 @@ const OG_IMAGE_ALT = 'devsandboxes, devcontainers for AI agents: Let agents loos
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={ogImage} />
     <meta name="twitter:image:alt" content={OG_IMAGE_ALT} />
+    {structuredData && <script type="application/ld+json" set:html={JSON.stringify(structuredData)} />}
   </head>
   <body>
     <a class="skip-link" href="#main-content">Skip to content</a>

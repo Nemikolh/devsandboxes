@@ -4,7 +4,7 @@
  * sidebar and prev/next, since they're outside the docs' reading order
  * (`nav.ts`), and a wider main column for the diagrams. No
  * `data-pagefind-body`, so search doesn't index them; the sitemap filters
- * them out (`astro.config.mjs`).
+ * them out (`astro.config.mjs`) and `noindex` keeps search engines off them.
  */
 import { getCollection } from 'astro:content';
 import { ArrowLeft, ArrowRight, ArrowUpRight, ChevronRight } from '@lucide/astro';
@@ -31,7 +31,7 @@ const prev = links[i - 1];
 const next = links[i + 1];
 ---
 
-<Base title={title} description={description}>
+<Base title={title} description={description} noindex>
   <div class="docs-shell arc-shell">
     <aside class="docs-sidebar">
       <nav class="sidebar-nav" aria-label="Architecture">
