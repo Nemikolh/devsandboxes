@@ -1,0 +1,186 @@
+---
+/**
+ * Machines side by side (`ThreeMachines.astro`'s states): each host a zone
+ * holding its processes as cards, the gaps between hosts the ssh links its
+ * left neighbour dials, numbered like the arrow list under the diagram. In
+ * `HelperDiagram.astro`'s language: purple the daemons, lime the CLI, green
+ * the agent, cyan forwards, grey a bundle of per-use ssh; a double line is
+ * one held link, a single line an ssh per use. Desktop is one row of hosts
+ * with the arrows pointing at the dialed host; narrow screens stack the
+ * hosts and turn the arrows down.
+ */
+import { Cable, Server, Terminal, UserRound } from '@lucide/astro';
+import '../../styles/architecture.css';
+
+export type Tone = 'serve' | 'cli' | 'helper' | 'agent' | 'runtime';
+
+export interface Socket {
+  name: string;
+  note?: string;
+}
+
+/** A process on a host: a card, or the CLI as a pill (`client`). */
+export interface Proc {
+  name: string;
+  sub?: string;
+  icon?: 'server' | 'cable' | 'terminal';
+  /** Purple card: a `devsandbox serve`. */
+  serve?: boolean;
+  client?: boolean;
+  /** Text rows and socket lists, in order. */
+  body?: (string | { sockets: Socket[] })[];
+}
+
+/** One down arrow between the cards around it, on the same host. */
+export interface Hop {
+  hop: { n?: number; label: string }[];
+  tone?: Tone;
+}
+
+export interface Host {
+  id: string;
+  role: string;
+  items: (Proc | Hop)[];
+}
+
+export interface Link {
+  /** The marker matching `(n)` in the arrow list. */
+  n?: number;
+  label: string;
+  /** What the link carries, one line each. */
+  carries?: string[];
+  /** One held link (double line) rather than an ssh per use. */
+  held?: boolean;
+  tone?: Tone;
+}
+
+/** The links between two neighbouring hosts; `dialer` runs the ssh. */
+export interface Gap {
+  dialer: string;
+  dialed: string;
+  links: Link[];
+}
+
+export interface Diagram {
+  hosts: Host[];
+  /** `gaps[i]` sits between `hosts[i]` and `hosts[i + 1]`. */
+  gaps: Gap[];
+  caption?: string;
+}
+
+interface Props {
+  diagram: Diagram;
+  label: string;
+}
+
+const { diagram, label } = Astro.props;
+const { hosts, gaps } = diagram;
+if (gaps.length !== hosts.length - 1) throw new Error(`${label}: ${hosts.length} hosts need ${hosts.length - 1} gaps`);
+gaps.forEach((g, i) => {
+  // Arrows point right (down when stacked): the dialer is the left host.
+  if (g.dialer !== hosts[i].id || g.dialed !== hosts[i + 1].id)
+    throw new Error(`${label}: gap ${i} must be dialed by ${hosts[i].id} to ${hosts[i + 1].id}`);
+});
+const links = gaps.flatMap((g) => g.links);
+const legend = [
+  links.some((l) => l.held) && { held: true, text: 'one held link' },
+  links.some((l) => !l.held) && { held: false, text: 'an ssh per use' },
+].filter((x) => x !== false);
+const icons = { server: Server, cable: Cable, terminal: Terminal };
+const isHop = (item: Proc | Hop): item is Hop => 'hop' in item;
+// Commands wrap between words only, a flag kept with its value (`--peer L`):
+// Chromium otherwise breaks after any hyphen (`--\nstdio`).
+const words = (text: string) => text.replace(/(^|\s)(-[\w-]*) (?=[^\s-])/g, '$1$2\u00a0').split(/ +/);
+---
+
+<div class="arc-fd" role="group" aria-label={`${label}: diagram, the arrows below explain it`}>
+  <div class="arc-fd-row" style={`--hosts: ${hosts.length}`}>
+    {
+      hosts.map((h, i) => (
+        <Fragment>
+          <div class="arc-zone arc-fd-host">
+            <div class="arc-zone-label arc-fd-host-label">
+              <span>{h.id}</span> {h.role}
+            </div>
+            {h.items.map((item) => {
+              if (isHop(item))
+                return (
+                  <div class="arc-fd-hop" data-tone={item.tone ?? 'serve'}>
+                    <span class="arc-fd-line" aria-hidden="true" />
+                    {item.hop.map((x) => (
+                      <span class="arc-fd-label">
+                        {x.n && <b class="arc-fd-n">{x.n}</b>}
+                        {words(x.label).map((w) => <Fragment><span>{w}</span>{" "}</Fragment>)}
+                      </span>
+                    ))}
+                  </div>
+                );
+              if (item.client)
+                return (
+                  <div class="arc-you arc-fd-you">
+                    <UserRound /> {item.name}
+                  </div>
+                );
+              const Icon = icons[item.icon ?? 'server'];
+              return (
+                <div class:list={['arc-card', 'arc-fd-card', { 'arc-card--serve': item.serve }]}>
+                  <div class="arc-head">
+                    <span class="arc-icon">
+                      <Icon />
+                    </span>
+                    <span class="arc-name">{words(item.name).map((w) => <Fragment><span>{w}</span>{" "}</Fragment>)}</span>
+                  </div>
+                  {item.sub && <div class="arc-sub">{item.sub}</div>}
+                  {item.body?.map((b) =>
+                    typeof b === 'string' ? (
+                      <div class="arc-fd-text">{words(b).map((w) => <Fragment><span>{w}</span>{" "}</Fragment>)}</div>
+                    ) : (
+                      <ul class="arc-sockets">
+                        {b.sockets.map((s) => (
+                          <li>
+                            {s.name}
+                            {s.note && <i>{s.note}</i>}
+                          </li>
+                        ))}
+                      </ul>
+                    ),
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {gaps[i] && (
+            <div class="arc-fd-gap">
+              <div class="arc-fd-dial">
+                <span>{gaps[i].dialer}</span> runs ssh to <span>{gaps[i].dialed}</span>
+              </div>
+              {gaps[i].links.map((l) => (
+                <div class="arc-fd-link" data-tone={l.tone ?? 'serve'} data-held={l.held ? '' : undefined}>
+                  <span class="arc-fd-label">
+                    {l.n && <b class="arc-fd-n">{l.n}</b>}
+                    {words(l.label).map((w) => <Fragment><span>{w}</span>{" "}</Fragment>)}
+                  </span>
+                  <span class="arc-fd-line" aria-hidden="true" />
+                  {l.carries?.map((c) => <small>{words(c).map((w) => <Fragment><span>{w}</span>{" "}</Fragment>)}</small>)}
+                </div>
+              ))}
+            </div>
+          )}
+        </Fragment>
+      ))
+    }
+  </div>
+  <div class="arc-fd-foot">
+    {diagram.caption && <p class="arc-fd-caption">{diagram.caption}</p>}
+    <div class="arc-fd-legend" aria-hidden="true">
+      {
+        legend.map((x) => (
+          <span data-tone="runtime" data-held={x.held ? '' : undefined}>
+            <span class="arc-fd-line" />
+            {x.text}
+          </span>
+        ))
+      }
+    </div>
+  </div>
+</div>

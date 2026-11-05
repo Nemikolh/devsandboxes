@@ -673,6 +673,338 @@
   }
 }
 
+/* ------------------------------------------------------ Fleet machines */
+
+/* `FleetDiagram.astro`: a row of host zones, the links in the gaps between
+   them. `.arc-fd` twice where it must beat `.prose ul` / `.prose p` and the
+   host-and-helper rules (`.arc-zone` hidden in its narrow query). */
+.arc-fd {
+  container-type: inline-size;
+}
+
+.arc-fd-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.arc-fd .arc-fd-host {
+  display: flex;
+  flex: 1.15 1 0;
+  flex-direction: column;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 12px;
+}
+
+/* A host with nothing drawn on it but its label. */
+.arc-fd .arc-fd-host:has(> :only-child) {
+  flex-grow: 0.6;
+}
+
+.arc-fd .arc-fd-host-label {
+  align-self: flex-start;
+  margin: 2px 0 12px;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+/* `words()` in the component: one span per word (a flag with its value). */
+.arc-fd .arc-name > span,
+.arc-fd-text > span,
+.arc-fd-label > span,
+.arc-fd-link > small > span {
+  white-space: nowrap;
+}
+
+.arc-fd-card + .arc-fd-card,
+.arc-fd-card + .arc-fd-you {
+  margin-top: 10px;
+}
+
+.arc-card.arc-fd-card .arc-sockets {
+  margin: 0;
+}
+
+.arc-card.arc-fd-card .arc-sockets li {
+  flex-wrap: wrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.arc-fd-text {
+  padding-left: 2px;
+  font: 10px / 1.35 var(--font-mono);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.arc-fd .arc-fd-you {
+  align-self: flex-start;
+  height: 30px;
+}
+
+.arc-fd-gap {
+  display: flex;
+  flex: 0.95 1 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 14px;
+  min-width: 150px;
+  padding: 12px 0;
+}
+
+.arc-fd-dial {
+  align-self: center;
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg);
+  font: 9.5px / 1.2 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+  white-space: nowrap;
+}
+
+.arc-fd-dial span {
+  color: var(--lime);
+}
+
+.arc-fd-link {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.arc-fd-label {
+  padding: 0 10px;
+  font: 10px / 1.35 var(--font-mono);
+  color: var(--label);
+  overflow-wrap: anywhere;
+}
+
+.arc-fd-link > small {
+  padding: 0 10px;
+  font: 9.5px / 1.25 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.arc-fd-n {
+  display: inline-grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  margin-right: 6px;
+  border: 1px solid var(--c);
+  border-radius: 50%;
+  background: #0d1517;
+  font: 500 9px / 1 var(--font-mono);
+  color: var(--label);
+  vertical-align: 1px;
+}
+
+/* The arrow: `::before` the line (double when held), `::after` the head,
+   pointing right; `.arc-fd-hop`'s points down. */
+.arc-fd-line {
+  position: relative;
+  display: block;
+  height: 9px;
+}
+
+.arc-fd-line::before,
+.arc-fd-line::after {
+  content: '';
+  position: absolute;
+}
+
+.arc-fd-line::before {
+  left: 0;
+  right: 1px;
+  top: 50%;
+  translate: 0 -50%;
+  border-top: 1.5px solid var(--c);
+}
+
+[data-held] > .arc-fd-line::before {
+  border-top: 4.5px double var(--c);
+}
+
+.arc-fd-line::after {
+  right: 1px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border: solid var(--c);
+  border-width: 1.5px 1.5px 0 0;
+  translate: 0 -50%;
+  rotate: 45deg;
+}
+
+[data-held] > .arc-fd-line::after {
+  width: 9px;
+  height: 9px;
+}
+
+/* Between two cards on one host; the rail under the card's icon. */
+.arc-fd-hop {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  min-height: 46px;
+  box-sizing: border-box;
+  padding: 8px 0 8px 36px;
+}
+
+.arc-fd-hop .arc-fd-label {
+  padding: 0;
+}
+
+.arc-fd-hop > .arc-fd-line {
+  position: absolute;
+  left: 23px;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  height: auto;
+  translate: -50% 0;
+}
+
+.arc-fd-hop > .arc-fd-line::before {
+  left: 50%;
+  right: auto;
+  top: 0;
+  bottom: 1px;
+  translate: -50% 0;
+  border-top: 0;
+  border-left: 1.5px solid var(--c);
+}
+
+.arc-fd-hop > .arc-fd-line::after {
+  right: auto;
+  left: 50%;
+  top: auto;
+  bottom: 2px;
+  translate: -50% 0;
+  rotate: 135deg;
+}
+
+.arc-fd-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  margin-top: 10px;
+  padding: 0 4px;
+}
+
+.arc-fd .arc-fd-caption {
+  margin: 0;
+  font: 10.5px / 1.3 var(--font-mono);
+  color: var(--text-subtle);
+}
+
+.arc-fd-legend {
+  display: flex;
+  gap: 16px;
+  margin-left: auto;
+  font: 9.5px / 1 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.arc-fd-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.arc-fd-legend .arc-fd-line {
+  width: 26px;
+}
+
+/* Narrow: hosts stacked, each gap one rail down from the dialer with its
+   links as labels beside it, each tied to the rail by a short stroke in its
+   own tone and style. */
+@container (max-width: 720px) {
+  .arc-fd-row {
+    flex-direction: column;
+  }
+
+  .arc-fd .arc-fd-host {
+    flex: none;
+  }
+
+  .arc-fd-gap {
+    position: relative;
+    flex: none;
+    gap: 9px;
+    min-width: 0;
+    padding: 12px 0 18px 52px;
+  }
+
+  .arc-fd-gap::before,
+  .arc-fd-gap::after {
+    content: '';
+    position: absolute;
+    left: 35px;
+  }
+
+  .arc-fd-gap::before {
+    top: 0;
+    bottom: 1px;
+    translate: -50% 0;
+    border-left: 1.5px solid #56706f;
+  }
+
+  .arc-fd-gap:not(:has(> .arc-fd-link:not([data-held])))::before {
+    border-left: 4.5px double #7f65c4;
+  }
+
+  .arc-fd-gap::after {
+    bottom: 2px;
+    width: 9px;
+    height: 9px;
+    border: solid #56706f;
+    border-width: 1.5px 1.5px 0 0;
+    translate: -50% 0;
+    rotate: 135deg;
+  }
+
+  .arc-fd-gap:not(:has(> .arc-fd-link:not([data-held])))::after {
+    border-color: #7f65c4;
+  }
+
+  .arc-fd-dial {
+    align-self: flex-start;
+  }
+
+  .arc-fd-link {
+    position: relative;
+  }
+
+  .arc-fd-label,
+  .arc-fd-link > small {
+    padding: 0;
+  }
+
+  .arc-fd-link > .arc-fd-line {
+    position: absolute;
+    left: -16px;
+    top: 3px;
+    width: 12px;
+  }
+
+  .arc-fd-link > .arc-fd-line::after {
+    display: none;
+  }
+
+  .arc-fd-legend {
+    margin-left: 0;
+  }
+}
+
 /* --------------------------------------------------- Sequence diagrams */
 
 .arc-seq {

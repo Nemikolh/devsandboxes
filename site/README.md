@@ -72,7 +72,8 @@ Contributor architecture pages are the `architecture` collection
 `src/pages/architecture/index.astro`, layout `layouts/Architecture.astro`).
 Reached by URL only: nothing links to them, and they're outside `nav.ts`, the
 search index and the sitemap. Their diagrams are data-driven components in
-`src/components/architecture/` (`Sequence`, `States`, `HelperDiagram`); keep
+`src/components/architecture/` (`Sequence`, `States`, `HelperDiagram`,
+`FleetDiagram`); keep
 them in step with the code they describe.
 
 Every config snippet on the site must be valid: write it to a temp dir as

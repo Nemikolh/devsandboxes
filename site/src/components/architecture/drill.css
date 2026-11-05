@@ -99,8 +99,7 @@
 .arc-tm-arrows summary:focus-visible,
 .arc-deck:focus-visible,
 .arc-deck-bar button:focus-visible,
-.arc-tm-switch button:focus-visible,
-.arc-tm-diagram:focus-visible {
+.arc-tm-switch button:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
@@ -530,20 +529,6 @@ details[open] > summary .arc-cmd-chevron {
 
 :root:not([data-js]) .arc-tm-state + .arc-tm-state {
   margin-top: 28px;
-}
-
-.prose .arc-tm .arc-tm-diagram {
-  margin: 0;
-  padding: 14px 16px;
-  overflow-x: auto;
-  white-space: pre;
-  overflow-wrap: normal;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--surface-code);
-  color: var(--code-base);
-  font: 12.5px / 1.45 var(--font-mono);
-  tab-size: 4;
 }
 
 .prose .arc-tm .arc-tm-arrows {

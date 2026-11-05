@@ -1,12 +1,13 @@
 ---
 /**
  * A few states of one picture (Before / Steps 1-6 / After), switched by a
- * segmented control (WAI-ARIA tabs, like `Tabs.astro`). Each state is an
- * ASCII diagram (never wrapped, scrolls sideways when narrow) and its arrows
- * as `<details>`: the list is the diagram's text alternative. Without JS
+ * segmented control (WAI-ARIA tabs, like `Tabs.astro`). Each state is a
+ * `FleetDiagram` and its arrows as `<details>`, numbered like the diagram's
+ * markers: the list is the diagram's long description. Without JS
  * every state shows, stacked under its own heading; the control is hidden.
  */
 import './drill.css';
+import FleetDiagram, { type Diagram } from './FleetDiagram.astro';
 
 export interface Arrow {
   from: string;
@@ -19,7 +20,7 @@ export interface Arrow {
 export interface MachinesState {
   id: string;
   label: string;
-  diagram: string;
+  diagram: Diagram;
   arrows: Arrow[];
   /** Short trusted HTML under the arrows. */
   note?: string;
@@ -57,7 +58,7 @@ const { states, id = 'machines', label = 'Diagram state' } = Astro.props;
     states.map((s, i) => (
       <section class="arc-tm-state" id={`${id}-panel-${s.id}`} data-current={i === 0 ? '' : undefined}>
         <h3 class="arc-tm-heading">{s.label}</h3>
-        <pre class="arc-tm-diagram" tabindex="0" aria-label={`${s.label}: diagram, described by the arrows below`}>{s.diagram.replace(/^\n|\n$/g, '')}</pre>
+        <FleetDiagram diagram={s.diagram} label={s.label} />
         <ul class="arc-tm-arrows">
           {s.arrows.map((a) => (
             <li>
