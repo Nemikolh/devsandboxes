@@ -5,14 +5,15 @@
 //! serves anything. A published hub build that differs (a downgrade
 //! included) is downloaded from the GitHub release and installed over this
 //! daemon's binary, which then takes over by a forced handoff ([`update`]
-//! over [`Steps`]). A dev build that differs comes over the link instead:
+//! over [`Steps`]); the release's `SHA256SUMS` must carry a signature by
+//! [`RELEASE_KEY`] and the archive's sha256 first (ADR 0047). A dev build that differs comes over the link instead:
 //! the hub pushes its own binary ([`hub_pushes`], [`push`]) and a worker
 //! that takes dev builds for its platform installs it the same way
 //! ([`install_received`]); else it stops offering, saying why.
 //!
 //! The steps are injectable ([`Steps`]): [`Release`] is production (curl,
-//! tar, `machines::install::INSTALL` run locally, the forced hello), tests
-//! fake every one.
+//! tar, `machines::install::INSTALL` run locally, the forced hello, the
+//! embedded key), tests fake every one.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -241,20 +242,107 @@ pub fn platform_target(platform: &str) -> Option<&'static str> {
     release_target(os, arch)
 }
 
-/// `https://github.com/<REPO>/releases/download/v<v>/devsandbox-<v>-<target>.tar.gz`.
-/// `version` comes from the hub: only a semver's characters go in the URL.
-pub fn asset_url(version: &str, target: &str) -> Result<String> {
+/// The release asset of `version` for `target`: `devsandbox-<v>-<target>.tar.gz`.
+pub fn asset_name(version: &str, target: &str) -> String {
+    format!("devsandbox-{version}-{target}.tar.gz")
+}
+
+/// `https://github.com/<REPO>/releases/download/v<v>/<file>`. `version`
+/// comes from the hub: only a semver's characters go in the URL.
+pub fn release_url(version: &str, file: &str) -> Result<String> {
     let ok = !version.is_empty() && version.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b));
     if !ok {
         bail!("`{version}` isn't a version");
     }
-    Ok(format!("https://github.com/{REPO}/releases/download/v{version}/devsandbox-{version}-{target}.tar.gz"))
+    Ok(format!("https://github.com/{REPO}/releases/download/v{version}/{file}"))
+}
+
+/// The release's checksums, `sha256sum`'s format over every archive, and
+/// their signature: raw ed25519 (64 bytes) over the file's bytes by the
+/// release key (`.github/workflows/release.yml`'s `release` job).
+pub const SUMS: &str = "SHA256SUMS";
+pub const SUMS_SIG: &str = "SHA256SUMS.sig";
+
+/// The release signing key's public half (ed25519, raw): the repo's
+/// `release-signing.pub`, one line of hex, the file the release workflow
+/// checks its secret key against. A release whose [`SUMS`] it didn't sign
+/// is never installed.
+pub const RELEASE_KEY: [u8; 32] = parse_key(include_str!("../../../release-signing.pub"));
+
+/// 64 hex digits and an optional trailing newline, as 32 bytes; anything
+/// else fails the build.
+const fn parse_key(text: &str) -> [u8; 32] {
+    const fn digit(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("release-signing.pub: not lowercase hex"),
+        }
+    }
+    let bytes = text.as_bytes();
+    let len = if !bytes.is_empty() && bytes[bytes.len() - 1] == b'\n' { bytes.len() - 1 } else { bytes.len() };
+    if len != 64 {
+        panic!("release-signing.pub: not 64 hex digits");
+    }
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = digit(bytes[2 * i]) << 4 | digit(bytes[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// Whether `sig` is `key`'s ed25519 signature over `sums` (pure; strict:
+/// canonical signatures, no small-order key).
+pub fn verify_sums(sums: &[u8], sig: &[u8], key: &[u8; 32]) -> Result<()> {
+    let Ok(sig) = <[u8; 64]>::try_from(sig) else {
+        bail!("{SUMS_SIG} is {} bytes, not a 64-byte ed25519 signature", sig.len());
+    };
+    let key = ed25519_dalek::VerifyingKey::from_bytes(key).map_err(|_| anyhow::anyhow!("the release key isn't an ed25519 public key"))?;
+    key.verify_strict(sums, &ed25519_dalek::Signature::from_bytes(&sig))
+        .map_err(|_| anyhow::anyhow!("{SUMS}'s signature doesn't verify against the release key"))
+}
+
+/// The sha256 [`SUMS`] gives `name` (pure): its one `<64 hex>  <name>`
+/// line (`sha256sum`'s text mode; ` *<name>`, binary mode, too). None or
+/// several is an error, and so is a line that isn't one.
+pub fn sum_of(sums: &[u8], name: &str) -> Result<[u8; 32]> {
+    let sums = std::str::from_utf8(sums).map_err(|_| anyhow::anyhow!("{SUMS} isn't text"))?;
+    let mut found = None;
+    for (n, line) in sums.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
+        let bad = || anyhow::anyhow!("{SUMS} line {} isn't `<sha256>  <name>`", n + 1);
+        let (hex, file) = line.split_once(' ').ok_or_else(bad)?;
+        let file = file.strip_prefix(' ').or_else(|| file.strip_prefix('*')).ok_or_else(bad)?;
+        let mut sum = [0u8; 32];
+        if hex.len() != 64 || hex::decode_to_slice(hex, &mut sum).is_err() {
+            return Err(bad());
+        }
+        if file == name && found.replace(sum).is_some() {
+            bail!("{SUMS} lists {name} more than once");
+        }
+    }
+    found.with_context(|| format!("{SUMS} doesn't list {name}"))
+}
+
+/// `archive`'s sha256 is `want`, [`SUMS`]'s for `name`.
+fn check_sum(archive: &Path, name: &str, want: &[u8; 32]) -> Result<()> {
+    let file = std::fs::File::open(archive).with_context(|| format!("cannot read {}", archive.display()))?;
+    let (_, got) = transfer::digest(file).with_context(|| format!("cannot read {}", archive.display()))?;
+    if got != hex::encode(want) {
+        bail!("{name}'s sha256 is {got}, not {SUMS}'s {}", hex::encode(want));
+    }
+    Ok(())
 }
 
 /// The steps of an update, injectable.
 pub trait Steps: Send + Sync {
-    /// Download `url` and unpack it into `into` (an empty dir): the binary.
-    fn fetch(&self, url: &str, into: &Path) -> Result<PathBuf>;
+    /// Download `url` into the file `out`.
+    fn download(&self, url: &str, out: &Path) -> Result<()>;
+    /// Unpack the binary of the release archive `archive` into `into`.
+    fn unpack(&self, archive: &Path, into: &Path) -> Result<PathBuf>;
+    /// The key a release's [`SUMS`] must be signed by ([`RELEASE_KEY`]).
+    fn release_key(&self) -> [u8; 32];
     /// The build `binary fleet-hello` reports: its [`HELLO`].
     fn build(&self, binary: &Path) -> Result<String>;
     /// Where this daemon's binary is (what to install over).
@@ -268,7 +356,8 @@ pub trait Steps: Send + Sync {
 
 /// Install the hub's published `hub` build over this daemon's binary and
 /// hand off to it: fetch its release asset for `os`/`arch` into a scratch
-/// dir under `scratch`, check that its `fleet-hello` is `hub` (semver, git
+/// dir under `scratch` ([`fetch_verified`]: signed checksums first), check
+/// that its `fleet-hello` is `hub` (semver, git
 /// and kind: a release asset that isn't the hub's exact build would be
 /// downloaded again at every link), install it at [`Steps::dest`], check
 /// the installed binary is `hub` too, then [`Steps::handoff`]. The scratch
@@ -276,10 +365,10 @@ pub trait Steps: Send + Sync {
 /// `os`/`arch` has no release; the check here stands in case it does.
 pub fn update(steps: &dyn Steps, hub: &Build, os: &str, arch: &str, scratch: &Path) -> Result<()> {
     let target = release_target(os, arch).with_context(|| format!("no devsandbox release is built for {os}/{arch}"))?;
-    let url = asset_url(&hub.semver, target)?;
+    let name = asset_name(&hub.semver, target);
     let dir = scratch_dir(scratch)?;
     let installed = (|| {
-        let binary = steps.fetch(&url, &dir).with_context(|| format!("cannot download {url}"))?;
+        let binary = fetch_verified(steps, &hub.semver, &name, &dir)?;
         check_release(steps, &binary, hub, "the downloaded binary")?;
         let dest = steps.dest()?;
         steps.install(&binary, &dest)?;
@@ -306,6 +395,28 @@ pub fn install_received(steps: &dyn Steps, binary: &Path, hub: &str) -> Result<(
     steps.install(binary, &dest)?;
     check_build(steps, &dest, hub, "the installed binary")?;
     steps.handoff().context("cannot hand this daemon off to it")
+}
+
+/// Release `version`'s asset `name`, unpacked in `dir`: [`SUMS`] and
+/// [`SUMS_SIG`] downloaded and the signature checked against
+/// [`Steps::release_key`] ([`verify_sums`]), `name`'s line found
+/// ([`sum_of`]), only then the archive downloaded, its sha256 checked, and
+/// unpacked. No signature, no install: there is no unsigned path.
+fn fetch_verified(steps: &dyn Steps, version: &str, name: &str, dir: &Path) -> Result<PathBuf> {
+    let get = |file: &str| -> Result<PathBuf> {
+        let url = release_url(version, file)?;
+        let out = dir.join(file);
+        steps.download(&url, &out).with_context(|| format!("cannot download {url}"))?;
+        Ok(out)
+    };
+    let read = |path: &Path| std::fs::read(path).with_context(|| format!("cannot read {}", path.display()));
+    let sums = read(&get(SUMS)?)?;
+    let sig = read(&get(SUMS_SIG)?)?;
+    verify_sums(&sums, &sig, &steps.release_key()).with_context(|| format!("release v{version} isn't signed by the release key"))?;
+    let want = sum_of(&sums, name).with_context(|| format!("release v{version}'s checksums"))?;
+    let archive = get(name)?;
+    check_sum(&archive, name, &want)?;
+    steps.unpack(&archive, dir)
 }
 
 fn check_build(steps: &dyn Steps, binary: &Path, want: &str, what: &str) -> Result<()> {
@@ -382,9 +493,11 @@ pub struct Release {
 }
 
 impl Steps for Release {
-    fn fetch(&self, url: &str, into: &Path) -> Result<PathBuf> {
-        let archive = into.join("devsandbox.tar.gz");
-        run(&curl_argv(url, &archive))?;
+    fn download(&self, url: &str, out: &Path) -> Result<()> {
+        run(&curl_argv(url, out)).map(drop)
+    }
+
+    fn unpack(&self, archive: &Path, into: &Path) -> Result<PathBuf> {
         let unpack: Vec<OsString> = vec!["tar".into(), "-xzf".into(), archive.into(), "-C".into(), into.into(), "devsandbox".into()];
         run(&unpack)?;
         let binary = into.join("devsandbox");
@@ -392,6 +505,10 @@ impl Steps for Release {
             bail!("the archive has no devsandbox binary");
         }
         Ok(binary)
+    }
+
+    fn release_key(&self) -> [u8; 32] {
+        RELEASE_KEY
     }
 
     fn build(&self, binary: &Path) -> Result<String> {
@@ -607,12 +724,12 @@ pub(crate) mod tests {
     #[test]
     fn asset_urls() {
         assert_eq!(
-            asset_url("0.7.0", "aarch64-apple-darwin").unwrap(),
+            release_url("0.7.0", &asset_name("0.7.0", "aarch64-apple-darwin")).unwrap(),
             "https://github.com/Nemikolh/devsandboxes/releases/download/v0.7.0/devsandbox-0.7.0-aarch64-apple-darwin.tar.gz"
         );
-        assert!(asset_url("0.7.0-rc.1", "x").is_ok());
+        assert!(release_url("0.7.0-rc.1", SUMS).is_ok());
         for bad in ["", "0.7.0/../../x", "0.7 0", "0.7.0?x"] {
-            assert!(asset_url(bad, "x").is_err(), "{bad:?}");
+            assert!(release_url(bad, SUMS).is_err(), "{bad:?}");
         }
     }
 
@@ -627,8 +744,27 @@ pub(crate) mod tests {
         assert_eq!(words[words.len() - 3..], ["-o", "/t/a.tar.gz", "https://x/y"]);
     }
 
+    /// The test release key (never the real one's secret).
+    fn test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+    }
+
+    /// What a fake release archive holds.
+    const ARCHIVE: &[u8] = b"a release archive";
+
+    /// A release's honest [`SUMS`] for `version`: every target's archive
+    /// is [`ARCHIVE`].
+    fn honest_sums(version: &str) -> Vec<u8> {
+        let sum = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ARCHIVE));
+        let targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"];
+        targets.iter().map(|t| format!("{sum}  {}\n", asset_name(version, t))).collect::<String>().into_bytes()
+    }
+
     /// Steps that touch nothing but a scratch dir: what each one was asked,
-    /// what `build` reports per path, and a step to fail.
+    /// what `build` reports per path, a step to fail, and a part of the
+    /// release to tamper with (`sums`: a byte flipped after signing; `sig`:
+    /// a signature one byte short; `key`: another release key; `archive`:
+    /// other bytes than the sums say).
     #[derive(Default)]
     pub(crate) struct Fake {
         pub calls: Mutex<Vec<String>>,
@@ -637,6 +773,7 @@ pub(crate) mod tests {
         pub received_build: String,
         pub installed_build: String,
         pub fail: Option<&'static str>,
+        pub tamper: Option<&'static str>,
     }
 
     impl Fake {
@@ -658,11 +795,42 @@ pub(crate) mod tests {
     }
 
     impl Steps for Fake {
-        fn fetch(&self, url: &str, into: &Path) -> Result<PathBuf> {
+        /// Recorded as `fetch <url>`; the release's files by the URL's last
+        /// two words, `v<version>/<file>`.
+        fn download(&self, url: &str, out: &Path) -> Result<()> {
+            use ed25519_dalek::Signer as _;
             self.step("fetch", url.into())?;
+            let mut words = url.rsplit('/');
+            let (file, version) = (words.next().unwrap(), words.next().unwrap().trim_start_matches('v'));
+            let tamper = |what| self.tamper == Some(what);
+            let body = match file {
+                SUMS => {
+                    let mut sums = honest_sums(version);
+                    if tamper("sums") {
+                        sums[0] ^= 1;
+                    }
+                    sums
+                }
+                SUMS_SIG => {
+                    let sig = test_key().sign(&honest_sums(version)).to_bytes().to_vec();
+                    if tamper("sig") { sig[..63].to_vec() } else { sig }
+                }
+                _ if tamper("archive") => b"another archive".to_vec(),
+                _ => ARCHIVE.to_vec(),
+            };
+            std::fs::write(out, body).unwrap();
+            Ok(())
+        }
+        fn unpack(&self, archive: &Path, into: &Path) -> Result<PathBuf> {
+            self.step("unpack", archive.file_name().unwrap().to_string_lossy().into_owned())?;
+            assert_eq!(std::fs::read(archive).unwrap(), ARCHIVE, "unpacks only what was checked");
             let binary = into.join("devsandbox");
             std::fs::write(&binary, "new").unwrap();
             Ok(binary)
+        }
+        fn release_key(&self) -> [u8; 32] {
+            let key = if self.tamper == Some("key") { ed25519_dalek::SigningKey::from_bytes(&[8; 32]) } else { test_key() };
+            key.verifying_key().to_bytes()
         }
         fn build(&self, binary: &Path) -> Result<String> {
             let installed = binary == Path::new("/dest/devsandbox");
@@ -705,10 +873,20 @@ pub(crate) mod tests {
         // The hub on another platform: the asset says this one.
         let fake = Fake::building(ASSET);
         update(&fake, &Build::parse("0.7.0 aaaa published macos/aarch64 hub k"), "linux", "x86_64", &dir).unwrap();
-        let url = "https://github.com/Nemikolh/devsandboxes/releases/download/v0.7.0/devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz";
+        let base = "https://github.com/Nemikolh/devsandboxes/releases/download/v0.7.0";
+        let asset = "devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz";
         assert_eq!(
             fake.calls(),
-            [format!("fetch {url}"), "build received".into(), "install /dest/devsandbox".into(), "build dest".into(), "handoff ".into()]
+            [
+                format!("fetch {base}/SHA256SUMS"),
+                format!("fetch {base}/SHA256SUMS.sig"),
+                format!("fetch {base}/{asset}"),
+                format!("unpack {asset}"),
+                "build received".into(),
+                "install /dest/devsandbox".into(),
+                "build dest".into(),
+                "handoff ".into()
+            ]
         );
         assert!(empty(&dir), "the scratch dir is gone");
         let _ = std::fs::remove_dir_all(&dir);
@@ -720,10 +898,100 @@ pub(crate) mod tests {
         let fake = Fake { fail: Some("fetch"), ..Fake::building(ASSET) };
         let err = update(&fake, &hub(), "linux", "aarch64", &dir).unwrap_err();
         assert!(format!("{err:#}").starts_with("cannot download https://github.com/"), "{err:#}");
-        assert!(format!("{err:#}").ends_with("fetch broke"), "{err:#}");
+        assert!(format!("{err:#}").ends_with("/SHA256SUMS: fetch broke"), "{err:#}");
         assert_eq!(fake.calls().len(), 1);
         assert!(empty(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unverified_release_is_never_unpacked() {
+        let dir = scratch("verify");
+        let cases = [
+            ("sums", "release v0.7.0 isn't signed by the release key: SHA256SUMS's signature doesn't verify against the release key", 2),
+            ("sig", "release v0.7.0 isn't signed by the release key: SHA256SUMS.sig is 63 bytes, not a 64-byte ed25519 signature", 2),
+            ("key", "release v0.7.0 isn't signed by the release key: SHA256SUMS's signature doesn't verify against the release key", 2),
+        ];
+        for (tamper, want, fetches) in cases {
+            let fake = Fake { tamper: Some(tamper), ..Fake::building(ASSET) };
+            let err = update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err();
+            assert_eq!(format!("{err:#}"), want, "{tamper}");
+            assert_eq!(fake.calls().len(), fetches, "{tamper}: the archive isn't even downloaded: {:?}", fake.calls());
+            assert!(empty(&dir));
+        }
+        let fake = Fake { tamper: Some("archive"), ..Fake::building(ASSET) };
+        let err = format!("{:#}", update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err());
+        assert!(err.starts_with("devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz's sha256 is "), "{err}");
+        assert!(err.contains(", not SHA256SUMS's "), "{err}");
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpack")), "{:?}", fake.calls());
+        assert!(empty(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sums_verify_only_with_their_key_and_bytes() {
+        use ed25519_dalek::Signer as _;
+        let sums = honest_sums("0.7.0");
+        let sig = test_key().sign(&sums).to_bytes();
+        let key = test_key().verifying_key().to_bytes();
+        verify_sums(&sums, &sig, &key).unwrap();
+        let mut flipped = sums.clone();
+        flipped[70] ^= 0x20;
+        assert!(verify_sums(&flipped, &sig, &key).is_err(), "a flipped byte");
+        let mut bad_sig = sig;
+        bad_sig[0] ^= 1;
+        assert!(verify_sums(&sums, &bad_sig, &key).is_err(), "a flipped signature byte");
+        assert_eq!(format!("{:#}", verify_sums(&sums, &sig[..63], &key).unwrap_err()), "SHA256SUMS.sig is 63 bytes, not a 64-byte ed25519 signature");
+        assert!(verify_sums(&sums, &[sig.as_slice(), &[0]].concat(), &key).is_err(), "65 bytes");
+        assert!(verify_sums(&sums, &[], &key).is_err(), "empty");
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes();
+        assert_eq!(
+            format!("{:#}", verify_sums(&sums, &sig, &other).unwrap_err()),
+            "SHA256SUMS's signature doesn't verify against the release key"
+        );
+        assert!(verify_sums(&sums, &sig, &RELEASE_KEY).is_err(), "not the real key's");
+    }
+
+    /// A signature `openssl pkeyutl -sign -rawin` made (the release
+    /// workflow's command), over `OPENSSL_SUMS`, with a throwaway key
+    /// (`openssl genpkey -algorithm ed25519`) whose public half is
+    /// `OPENSSL_PUB`: what CI makes, the member verifies.
+    #[test]
+    fn openssl_signatures_verify() {
+        let key: [u8; 32] = hex::decode(OPENSSL_PUB).unwrap().try_into().unwrap();
+        let sig = hex::decode(OPENSSL_SIG).unwrap();
+        verify_sums(OPENSSL_SUMS.as_bytes(), &sig, &key).unwrap();
+        let name = "devsandbox-0.9.0-aarch64-apple-darwin.tar.gz";
+        assert_eq!(hex::encode(sum_of(OPENSSL_SUMS.as_bytes(), name).unwrap()), OPENSSL_SUMS[..64]);
+        assert!(verify_sums(OPENSSL_SUMS.replace("0.9.0", "0.9.1").as_bytes(), &sig, &key).is_err());
+    }
+    const OPENSSL_PUB: &str = "b33161fae07cbbe9dfd5454999d2367ac3a1a0cf20cb17fbdfdfa886f1525066";
+    const OPENSSL_SIG: &str = "111bff9864e46e0890e1066f87a384820be8909fbd554eb57cb3596dcced7b5bd18c91824dd224282cb117342971cd02f69240264734152b58d88a7b28f3160b";
+    const OPENSSL_SUMS: &str = "19afaf54e1c73ed8d742a22e5ad23c0fc9875c0697df22365652435250dd2496  devsandbox-0.9.0-aarch64-apple-darwin.tar.gz\nf984e7480c12bb81a839eaad8d5036fbb7f0621371ec7186eeec726ada4eaf6f  devsandbox-0.9.0-x86_64-pc-windows-msvc.zip\n45e66ed30407ff38e59c2f40bb7bccf71fd854a42bb0c37ec6b380852d2778cf  devsandbox-0.9.0-x86_64-unknown-linux-musl.tar.gz\n";
+
+    #[test]
+    fn the_release_key_is_an_ed25519_key() {
+        assert!(ed25519_dalek::VerifyingKey::from_bytes(&RELEASE_KEY).is_ok());
+        assert_eq!(hex::encode(RELEASE_KEY), include_str!("../../../release-signing.pub").trim_end());
+        assert_eq!(parse_key("00".repeat(32).as_str()), [0; 32], "no newline is fine");
+    }
+
+    #[test]
+    fn a_sums_line_is_found_once_by_exact_name() {
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        let sums = format!("{a}  devsandbox-0.7.0-x.tar.gz\n{b} *devsandbox-0.7.0-y.tar.gz\n");
+        assert_eq!(sum_of(sums.as_bytes(), "devsandbox-0.7.0-x.tar.gz").unwrap(), [0xab; 32]);
+        assert_eq!(sum_of(sums.as_bytes(), "devsandbox-0.7.0-y.tar.gz").unwrap(), [0xcd; 32], "binary mode");
+        let err = |sums: &str, name| format!("{:#}", sum_of(sums.as_bytes(), name).unwrap_err());
+        assert_eq!(err(&sums, "devsandbox-0.7.0-x.tar"), "SHA256SUMS doesn't list devsandbox-0.7.0-x.tar", "exact names only");
+        assert_eq!(err(&sums, "x.tar.gz"), "SHA256SUMS doesn't list x.tar.gz");
+        assert_eq!(err("", "x"), "SHA256SUMS doesn't list x");
+        let twice = format!("{sums}{b}  devsandbox-0.7.0-x.tar.gz\n");
+        assert_eq!(err(&twice, "devsandbox-0.7.0-x.tar.gz"), "SHA256SUMS lists devsandbox-0.7.0-x.tar.gz more than once");
+        for bad in [format!("{a} x"), format!("{} x", &a[1..]), format!("{}  x", "zz".repeat(32)), "nonsense".into()] {
+            assert!(err(&bad, "x").contains("line 1 isn't"), "{bad}");
+        }
+        assert_eq!(format!("{:#}", sum_of(&[0xff], "x").unwrap_err()), "SHA256SUMS isn't text");
     }
 
     #[test]

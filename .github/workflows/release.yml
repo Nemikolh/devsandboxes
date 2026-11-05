@@ -110,7 +110,7 @@ jobs:
           DEVSANDBOX_DEVSBD_REQUIRED: "1"
           # Stamps the fleet `Hello` as `published` (build.rs `stamp_build`):
           # these archives are the release assets a fleet member downloads to
-          # follow a hub on this version (`fleet::update::asset_url`).
+          # follow a hub on this version (`fleet::update::asset_name`).
           DEVSANDBOX_PUBLISHED: "1"
       # These binaries are what fleet members download to follow a published
       # hub, and the member checks the download's `fleet-hello` is the hub's
@@ -160,6 +160,48 @@ jobs:
           pattern: devsandbox-*
           merge-multiple: true
       - run: scripts/changelog-section.sh ${{ needs.version.outputs.version }} > "$RUNNER_TEMP/notes.md"
+      # Fleet members install these archives only if SHA256SUMS verifies
+      # against the key embedded in the binary (release-signing.pub,
+      # `fleet::update::RELEASE_KEY`; ADR 0047). Raw pure-ed25519 over the
+      # file's bytes: what `update::verify_sums` checks.
+      - name: Sign the checksums
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          want=$(tr -d ' \n' < "$GITHUB_WORKSPACE/release-signing.pub")
+          cd "$RUNNER_TEMP/dist"
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            echo "::error::the RELEASE_SIGNING_KEY secret is empty or unset"
+            exit 1
+          fi
+          archives=(devsandbox-*.tar.gz devsandbox-*.zip)
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::no archives in $PWD"
+            exit 1
+          fi
+          printf '%s\n' "${archives[@]}" | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          tmp=$(umask 077 && mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$tmp/k.pem")
+          got=$(openssl pkey -in "$tmp/k.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')
+          if [ "$got" != "$want" ]; then
+            echo "::error::RELEASE_SIGNING_KEY's public key is $got, release-signing.pub says $want"
+            exit 1
+          fi
+          openssl pkeyutl -sign -inkey "$tmp/k.pem" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm -f "$tmp/k.pem"
+          # Verified against the committed key itself (its SPKI DER: the
+          # ed25519 prefix, then the 32 raw bytes), not one derived from the secret.
+          printf "$(printf '302a300506032b6570032100%s' "$want" | sed 's/../\\x&/g')" > "$tmp/pub.der"
+          openssl pkeyutl -verify -pubin -keyform DER -inkey "$tmp/pub.der" -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+          if [ "$(wc -c < SHA256SUMS.sig)" -ne 64 ]; then
+            echo "::error::SHA256SUMS.sig isn't a 64-byte ed25519 signature"
+            exit 1
+          fi
       - uses: softprops/action-gh-release@v3
         with:
           files: ${{ runner.temp }}/dist/*

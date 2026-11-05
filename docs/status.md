@@ -462,8 +462,11 @@ limitation means editing this file in the same commit.
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
 - A member's download of a published hub build has not yet run against
   a release built with `DEVSANDBOX_PUBLISHED=1` (the first is the next
-  tag). The asset is checked only by being the hub's build
-  (`fleet-hello`), over HTTPS: no checksum or signature. A member with
+  tag), nor has the release workflow's checksum signing run with the
+  real `RELEASE_SIGNING_KEY`. A member verifies against the release key
+  its binary embeds: a new key reaches members only with a new binary,
+  so after a rotation members on an older one refuse every newer
+  release until updated by hand. A member with
   no release asset for its platform (an Intel Mac, a source build
   elsewhere) can't follow a published hub: the link drops (redialed,
   refused again). A hub on a dev build (from source, `cargo install`

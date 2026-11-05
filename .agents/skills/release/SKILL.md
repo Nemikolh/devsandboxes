@@ -13,6 +13,7 @@ The GitHub release body comes straight from `CHANGELOG.md`. `release.sh` renames
 
 - On `main`, working tree clean, up to date with `origin/main`.
 - `cargo test --workspace` passes.
+- The repo has the `RELEASE_SIGNING_KEY` secret: the ed25519 private key (PKCS#8 PEM) whose public half is `release-signing.pub`. The Release workflow signs `SHA256SUMS` with it and fails without it, or with a key that doesn't match; fleet members refuse a release without a valid `SHA256SUMS.sig` (ADR 0047).
 - The user asked for a release. `release.sh` pushes a tag, which publishes to GitHub, crates.io and npm, and none of that can be undone.
 
 ## 2. Bring `## Unreleased` up to date
@@ -66,4 +67,4 @@ gh run watch "$(gh run list --workflow Release --limit 1 --json databaseId -q '.
 gh release view vX.Y.Z
 ```
 
-The release body must match the changelog section. If the workflow fails, report it to the user; don't re-tag or force-push without their approval.
+The release body must match the changelog section, and the assets must include `SHA256SUMS` and `SHA256SUMS.sig` next to the archives. If the workflow fails, report it to the user; don't re-tag or force-push without their approval.

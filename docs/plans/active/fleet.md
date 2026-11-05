@@ -1023,8 +1023,9 @@ step 12 does.
    `full`.
 10. Self-update: the hello carries git hash + `published`; a member
     follows the hub's exact version (a downgrade is a forced handoff);
-    installs in place at `exe::devsandbox()`. Verified by TLS + running
-    `--version`; no checksum asset (a `release.yml` change not approved).
+    installs in place at `exe::devsandbox()`. Verified by a signed
+    `SHA256SUMS` against the embedded release key, then `fleet-hello`
+    ([ADR 0047](../../decisions/0047-release-downloads-are-verified-by-signed-checksums.md)).
 11. Placement runs in the daemon.
 12. Step 3's code: the hub clones `origin` with its own credentials and
     sends a bundle over `TRANSFER`; a placed member never needs

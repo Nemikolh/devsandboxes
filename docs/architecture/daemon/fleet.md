@@ -233,8 +233,10 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/machines/cli.rs` (`plan`); versions:
 `src/serve/fleet/update.rs` (`HELLO`, `hello_of`, `hello_for`, `is_hub`,
 `hub_of`, `same_fleet`, `platform_of`, `Build`, `decide`, `Decision`, `hub_pushes`, `push`,
-`install_received`, `scratch_dir`, `release_target`, `asset_url`,
-`curl_argv`, `update`, `Steps`, `Release`), `src/serve/fleet/follow.rs`
+`install_received`, `scratch_dir`, `release_target`, `asset_name`,
+`release_url`, `SUMS`, `SUMS_SIG`, `RELEASE_KEY`,
+`verify_sums`, `sum_of`, `fetch_verified`, `curl_argv`, `update`,
+`Steps`, `Release`), `release-signing.pub`, `src/serve/fleet/follow.rs`
 (`Follow`, `Incoming`, `PUSH_WAIT`, `EndLink`, `shutting`),
 `src/commands/fleet_link.rs` (`follows`, `push_build`, `own_binary`),
 `src/serve/daemon.rs` (`follow_hub`, `Options::update_steps`),
@@ -1541,16 +1543,34 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   the forced handoff, below. The scratch dir is removed either way.
 - **`Download`**: `update::update` over `Follow::steps` (`update::Release`
   in production; `Options::update_steps` in tests): the asset
-  `devsandbox-<v>-<target>.tar.gz` of release `v<v>` (`asset_url`:
+  `devsandbox-<v>-<target>.tar.gz` of release `v<v>` (`asset_name`, `release_url`:
   `https://github.com/Nemikolh/devsandboxes/releases/download/…`, `<v>`
   limited to a semver's characters; `<target>` by `release_target` from
   `std::env::consts`: `x86_64-unknown-linux-musl`,
   `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, none elsewhere)
   is fetched into a private scratch dir under the temp dir with curl
-  (`curl_argv`: `--fail --location --proto =https --proto-redir =https
-  --tlsv1.2`, a stall of 30 s gives up, and so does a download still
-  running after `DOWNLOAD_MAX_TIME`, 600 s, `--max-time`) and unpacked
-  with `tar`. `update` refuses an `os`/`arch` with no release itself
+  (`Steps::download`, `curl_argv`: `--fail --location --proto =https
+  --proto-redir =https --tlsv1.2`, a stall of 30 s gives up, and so does
+  a download still running after `DOWNLOAD_MAX_TIME`, 600 s,
+  `--max-time`), verified, and unpacked with `tar` (`Steps::unpack`).
+  The verification ([ADR 0047](../../decisions/0047-release-downloads-are-verified-by-signed-checksums.md);
+  `update::fetch_verified`): the release's `SHA256SUMS` and
+  `SHA256SUMS.sig` (`SUMS`, `SUMS_SIG`, by `release_url`) are
+  downloaded first, the signature (raw ed25519, 64 bytes, over the
+  file's bytes) verified strictly against `Steps::release_key`
+  (`update::verify_sums`; in production `RELEASE_KEY`, the repo's
+  `release-signing.pub` parsed at build time by `parse_key`), then the
+  asset's one line found by exact name (`update::sum_of`: `<sha256>
+  <name>`, ` *<name>` too; none, several or a malformed line is an
+  error); only then is the archive downloaded and its sha256 checked
+  (`check_sum`), and only a matching one is unpacked. Each failure says
+  which check failed (`release v<v> isn't signed by the release key: …`,
+  `SHA256SUMS doesn't list …`, `<asset>'s sha256 is …, not
+  SHA256SUMS's …`). The release workflow's `release` job (`Sign the
+  checksums`) makes both files: `sha256sum` over every archive, signed
+  with `openssl pkeyutl -sign -rawin` by the `RELEASE_SIGNING_KEY`
+  secret, refused unless that key's public half is `release-signing.pub`,
+  and verified against `release-signing.pub` before publishing. `update` refuses an `os`/`arch` with no release itself
   too, though `decide` never says `Download` there. Its
   `fleet-hello` (`Steps::build`) must be the hub's build, semver, git and
   kind (`update::check_release`, the platform aside), so the new daemon's
