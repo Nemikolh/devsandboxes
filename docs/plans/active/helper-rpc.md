@@ -157,8 +157,11 @@ and `runs.rs`, so they unit-test without a container.
   check) and marks the rest `lost`. Supervisors stay separate processes,
   so replacing the daemon doesn't kill runs.
 - **Reporting**: on state change, an `event` on an open host subscription,
-  else a queued outbox record like `notify`. The host turns it into an
-  Inbox/events entry for the owning dispatcher, which stops polling.
+  else a queued outbox record like `notify`. The host publishes it on the
+  daemon API for the owning client (the orchestrator), which stops
+  polling. Not an Inbox/events entry: the Inbox is frozen and goes with
+  the in-repo dispatcher ([fleet](fleet.md#rollout)), so step 4 waits for
+  the orchestrator interface that says what that subscription is.
 - **Restart policy** on `run.start`: `restart = "no" | "on-failure" |
   "always"`, `max-restarts`, backoff. Applied on exit, and at boot to runs
   a restart left `lost` (`devsbd boot` already starts the daemon on every
@@ -337,9 +340,19 @@ design above, found in the code:
 3. Step 8 here (`session.attach`).
 4. Fleet step 4 (`PTY` over the RPC stream; shipped: the fleet
    worker's daemon is `session.attach`'s first caller, `fleet::pty`).
-5. Steps 4-5 here (daemon-owned runs, restart policy), before fleet step
-   13 so dispatcher children on workers don't poll across machines.
-6. Fleet steps 5-16 (5-12 don't wait for steps 4-5 here).
+5. Fleet steps 5-12 (shipped; they didn't wait for steps 4-5 here).
+6. [open-routing](open-routing.md) steps 1-4, then 5-6: independent of
+   the rest, kept off the Inbox by design.
+7. The orchestrator interface (to plan): run and instance events on the
+   daemon API, the capability replacing `dispatcher =`. It replaces the
+   Inbox's `events`/`thread-ls` for the dispatcher.
+8. Steps 4-5 here (daemon-owned runs, restart policy), reporting to
+   that interface, before fleet step 13 so children on workers don't
+   poll across machines.
+9. The dispatcher moved onto the interface, then the Inbox and the
+   dispatcher's thread/event ops removed, with fleet step 13 rewritten
+   for the orchestrator.
+10. Fleet steps 14-18.
 
 ## Open questions
 
@@ -349,7 +362,8 @@ design above, found in the code:
   with a PTY reuse that. `session.attach` needs no pty of its own (the
   supervisor holds it).
 - **Event delivery with no host attached**: reuse the notify outbox
-  (persisted, acked) or a separate run-events queue?
+  (persisted, acked; open-routing's `open` kind rides it too) or a
+  separate run-events queue?
 - **Scheduler policy source**: per-call `queue` key only, or sandbox
   config (`[sandbox.*].runs.max-concurrent`) passed at `run`?
 - **Lifecycle commands via `proc.spawn`?** Central log and queue, but makes

@@ -25,12 +25,11 @@ machine plus attach-to-container through its docker context, or Remote-SSH
 straight into the container through the helper. Low priority; nothing
 depends on it.
 
-## 2. Remote Inbox threads
+## 2. Remote Inbox threads (dropped)
 
-The Inbox is a local store (`inbox::store`); the dashboard reads it
-directly and `inbox.*` isn't in the forwarded quick-call list
-(`forward::QUICK`). Remote threads need the Inbox behind the daemon on both
-ends and a federated thread list, like the snapshot's `merge`.
+Not built: the Inbox is frozen and goes with the in-repo dispatcher
+([fleet](fleet.md#rollout)); threads and chats move to an external
+orchestrator.
 
 ## 3. Nameless commands across every machine
 

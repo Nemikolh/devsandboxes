@@ -22,10 +22,13 @@ carried over any path; step 11 moves the hub role with `machine hub`,
 an authority-signed log entry; step 12 moves code itself: each folder
 from its own checkout with a WIP snapshot (no remote needed), into
 per-repo caches, a copy on the hub, and `devsandbox fetch` back. Step
-13 is next. The rest is design. Builds on
+13 waits: it is re-scoped around an external orchestrator replacing
+the in-repo dispatcher and the Inbox (see [Rollout](#rollout)). The
+rest is design. Builds on
 [machines](../../architecture/daemon/machines.md);
-[machines-next](machines-next.md) items 2 and 3 fold into step 15 here,
-its parked auto-update and PTY attach into steps 2 and 4.
+[machines-next](machines-next.md) item 3 folds into step 15 here (item
+2, remote Inbox threads, is dropped with the Inbox), its parked
+auto-update and PTY attach into steps 2 and 4.
 
 ## Goal
 
@@ -324,7 +327,16 @@ member's own, as today (decision 18).
 Each step is usable on its own. Order with the other plans is in
 [helper-rpc](helper-rpc.md#order-across-plans): steps 1-3 run alongside
 helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
-13 for its daemon-owned runs.
+13 for its daemon-owned runs and for the orchestrator interface that
+replaces the Inbox's events.
+
+The Inbox is frozen (no new work) and goes once the dispatcher has
+moved off it: the in-repo dispatcher and its thread/event ops are
+replaced by an orchestrator, a client of the daemon API running in its
+own sandbox. Step 13 as first written (children placed by a dispatcher
+authorized on its host, events through each worker's Inbox, P8) would
+either federate the Inbox or leave a worker's events where the hub
+can't see them; both invest in what is being removed.
 
 1. **Fleet link and hub mode** (L, shipped). The frame-mux link with
    `API` channels, the confined table over a fleet root, the worker
@@ -953,7 +965,13 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
     that doesn't load refuses a placed-looking `rm` (`--force` gets
     past). `place::Spec::repo` stays unfilled (nothing reads it). Not
     built: fetch-back from the dashboard.
-13. **Dispatcher children on any machine** (M). Instances carry
+13. **Dispatcher children on any machine** (M; re-scoped, to be
+    rewritten as *orchestrator children on any machine* once the
+    orchestrator interface is decided: what it subscribes to in place
+    of `events`/`thread-ls`, the API capability that replaces
+    `dispatcher =` authorization, what it places and forwards. Mostly
+    built already: `run --place`, forwarded calls, verbs over the link.
+    Ships with the Inbox's removal). As first written: instances carry
     `origin_host` and repo identity; `ls`/the dashboard show where they
     run. The dispatcher (on the hub) keeps authorizing on its host
     ([ADR 0030](../../decisions/0030-dispatcher-control-is-authorized-on-the-host.md));
@@ -972,9 +990,9 @@ helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step
     manual form. Fencing a copy ends its sessions: live or detached
     sessions extend the grace period (or at least warn), and an attach to
     a moved instance says `moved to <machine>`, not `no session`.
-15. **The rest of the fleet view** (M). The Inbox behind the daemon on
-    every member, with a federated thread list (machines-next §2);
-    nameless commands across the fleet (machines-next §3).
+15. **The rest of the fleet view** (M). Nameless commands across the
+    fleet (machines-next §3). The Inbox behind the daemon on every
+    member (machines-next §2) is dropped with the Inbox.
 16. **Sync layer** (L, later). A second `Transfer` for state git doesn't
     carry: ignored outputs, volumes, caches, live editing. Then build-cache
     sharing (a registry on the hub, `--cache-from`) and services that span

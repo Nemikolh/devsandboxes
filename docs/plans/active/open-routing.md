@@ -1,6 +1,6 @@
 # Open routing: a container's `xdg-open` opens on the user's desktop
 
-Status: planned, nothing started.
+Status: planned, step 1 broken into 1a-1c (below), next.
 
 ## Problem
 
@@ -259,6 +259,64 @@ forwards through the existing registry):
 
 Steps 1-4 are useful without machines; 5 is what makes it work for a
 sandbox on the server.
+
+### Step 1 in sub-steps
+
+Each ships with its docs (see [Docs on shipping](#docs-on-shipping)).
+Record and host first: the host decodes with the same `notify.rs`, so a
+new kind can't reach a host that doesn't handle it.
+
+- **1a. The `open` record and the host's opener.**
+  - `src/devsbd/notify.rs`: `Kind::Open`, `Message::Open { at, url }`,
+    directives `kind open`, `at`, `url` (no `level`/`key`/`body`/`id`),
+    `Message::at` and `key` (none) arms, an `OPEN_FIXTURE` round trip.
+    `supersedes` never matches an `Open`: two opens are two tabs.
+  - Sink: `Bridges::spawn_worker`'s closure (`src/devsbd/bridge.rs`)
+    takes `Message::Open` before `apply_message`, hands it to the opener
+    and returns `Ok` (taken, not opened). `apply_message` and
+    `inbox::decide` refuse an `Open` they'd never see.
+  - `src/open.rs`, pure: `decide(url, at, now, limit) -> Verdict` with
+    `http`/`https` only, `OPEN_TTL` (30 s, from `at`) and the
+    per-instance limit; `opener_argv(os, url)` (`xdg-open` / `open`).
+    The limit reuses `desktop::RateLimit` with its burst and refill
+    passed in (`RateLimit::new`; notify keeps 3 per 10 s, open gets 5
+    per 10 s) instead of a second bucket.
+  - Display: on Linux, no `DISPLAY` / `WAYLAND_DISPLAY` in the daemon's
+    env refuses with `no display to open <url> on`. Check what
+    `serve::install`'s systemd unit gets on GNOME/KDE, add a
+    `PassEnvironment` line or document the `import-environment` step.
+  - Every refusal and drop is a `serve.log` line with the instance and
+    URL.
+  - The spawn is injectable (an `Opener` fn next to the sink, like
+    `serve::verbs`' `Runner`); the real one spawns with stdio null and
+    reaps on its own thread, like `desktop::notify_desktop`.
+  - Tests: the fixture (both crates), `decide` cases (scheme, TTL,
+    limit), `opener_argv`, a `notify_pair` test (`bridge.rs`) where an
+    `Open` reaches the fake opener and never the Inbox store.
+- **1b. The shim, its links and `BROWSER`.**
+  - `devsbd/src/open.rs`: `NAMES` (`xdg-open`, `sensible-browser`,
+    `x-www-browser`, `www-browser`), `invoked_as`, `run`: exactly one
+    argument, a scheme and a length cap (`notify::MAX_RECORD`), else
+    exit 1 (usage) or 3 (`devsbd: opening files isn't supported; open
+    URLs only`); queued with `outbox::enqueue` and poked like `notify`.
+    Dispatched by argv0 in `devsbd/src/main.rs` next to
+    `browser::invoked_as`; `devsbd open <url>` too; `open` in
+    `FEATURES`.
+  - `INSTALL_SCRIPT` (`src/devsbd.rs`): the four names linked in
+    `BIN_DIR` like the browser names, and `/usr/local/bin/xdg-open`
+    linked best-effort only when nothing is there or it already points
+    at devsbd.
+  - `tool_env::tool_env`: `BROWSER=/run/devsandbox/bin/xdg-open` on
+    every plan (outside the per-plan `match`, still under the
+    `user_keys` filter).
+  - Tests: `open.rs` argument cases, the `INSTALL_SCRIPT` assertions,
+    `tool_env_per_plan_and_verdict`; a `docker_test(helper)` where
+    `xdg-open https://example.test` and `$BROWSER https://…` in a
+    container reach the fake opener (model:
+    `delivers_container_notify_to_the_sink_with_docker`), and one where
+    an image's own `/usr/local/bin/xdg-open` survives the install.
+- **1c. Changelog** (`CHANGELOG.md` Unreleased) and `docs/status.md`
+  (step 1 shipped), with 1b's commit.
 
 ## Docs on shipping
 

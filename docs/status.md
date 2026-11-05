@@ -16,6 +16,12 @@ limitation means editing this file in the same commit.
 
 ## Planned
 
+Order: open routing, then the orchestrator interface (to plan), helper-rpc
+steps 4-5 reporting to it, then the Inbox's removal with fleet step 13
+rewritten for the orchestrator
+([helper-rpc](plans/active/helper-rpc.md#order-across-plans)). The Inbox
+is frozen: no new work on it.
+
 - **helper**: `exec` sessions after fleet step 1: surfacing detached
   sessions beyond the procs-fetched rows (maybe an Inbox note), a policy
   for sessions nobody reattaches to (`devsbd/src/sessions.rs`).
@@ -24,7 +30,8 @@ limitation means editing this file in the same commit.
 - **helper**: daemon-owned runs (registry, run-state events, a `queued`
   state) with a restart policy, worktree stand-ins, container → host
   `RPC` (helper-rpc steps 4-7; the `RPC` channel and runs and sessions
-  over it shipped), in the order of
+  over it shipped; run events go to the orchestrator interface, not the
+  Inbox), in the order of
   [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
   → [plan](plans/active/helper-rpc.md)
 - **helper**: a container's `xdg-open` / `$BROWSER` opens on the user's
@@ -32,8 +39,8 @@ limitation means editing this file in the same commit.
   collections of sandboxes, one per instance, switchable at runtime;
   browser commands host-local), delivery to the member that last attached.
   → [plan](plans/active/open-routing.md)
-- **machines**: VS Code on remote rows (spike),
-  remote Inbox threads, nameless commands across every machine.
+- **machines**: VS Code on remote rows (spike), nameless commands across
+  every machine (remote Inbox threads dropped with the Inbox).
   → [plan](plans/active/machines-next.md)
 - **machines**: a fleet: every machine a member (one `machine add`,
   links routed over a graph, `worker`/`full` trust per member, a
@@ -76,8 +83,9 @@ limitation means editing this file in the same commit.
   a WIP snapshot, no remote needed, into per-repo caches on the worker
   (repeat sends carry only the delta) and on the hub, and `devsandbox
   fetch <machine>/<instance>` (also before `rm` / `done` there) brings
-  the work back as hidden refs. Next: dispatcher children on any
-  machine (step 13).
+  the work back as hidden refs. Next: step 13, re-scoped to an
+  external orchestrator's children and waiting on its interface (see
+  the order above).
   → [plan](plans/active/fleet.md); [fleet](architecture/daemon/fleet.md#routed-streams), [ADR 0044](decisions/0044-one-fleet-authority-signs-membership.md), [ADR 0045](decisions/0045-a-routed-stream-proves-its-origin-per-stream.md), [ADR 0046](decisions/0046-routed-streams-are-end-to-end-sessions.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
@@ -120,8 +128,6 @@ limitation means editing this file in the same commit.
   for `:stop`/`:start`/`:rebuild`; `:logs`/`:inspect`; progress for
   `services.rebuild`.
 - **json**: raw-number cpu/mem (schema v2); plain `status` without `--json`.
-- **inbox**: listener grants (a child following a thread's events),
-  auto-withdraw older open forms, threads shared across users.
 - **machines**: OS keychain backends for the member key behind `KeyStore`
   (fleet plan decision 52). → [plan](plans/active/fleet.md)
 - **machines**: an agent grant counted as exposure (a granted member can
