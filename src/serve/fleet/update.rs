@@ -169,7 +169,8 @@ pub enum Decision {
     /// this worker takes dev builds: take the binary the hub pushes, install
     /// it, then hand off.
     Receive,
-    /// The hub runs a dev build this worker can't or won't take: stop
+    /// The hub runs a build this worker can't or won't take (a dev build,
+    /// or a published one with no release asset for this platform): stop
     /// offering, with why.
     Stop(String),
 }
@@ -179,11 +180,17 @@ pub enum Decision {
 /// only for this worker's platform and with `dev_builds` (`member.toml`'s
 /// `dev-builds`, or trust `full`: `fleet::member::Member::takes_dev_builds`);
 /// the platform is checked first, since `dev-builds` can't help there.
+/// Another published build is downloaded only where a release asset exists
+/// for `our_platform` ([`platform_target`]): else [`update`] would fail
+/// the same way at every link, so this stops offering instead.
 pub fn decide(ours: &Build, hub: &Build, our_platform: &str, hub_platform: &str, dev_builds: bool) -> Decision {
     if ours == hub {
         Decision::Same
     } else if hub.published {
-        Decision::Download { build: hub.clone() }
+        match platform_target(our_platform) {
+            Some(_) => Decision::Download { build: hub.clone() },
+            None => Decision::Stop(format!("published build: no devsandbox release is built for {our_platform} (the hub runs {})", hub.label())),
+        }
     } else if hub_platform != our_platform {
         Decision::Stop(format!("dev build: can't run on {our_platform} (the hub runs {} for {hub_platform})", hub.label()))
     } else if !dev_builds {
@@ -227,6 +234,13 @@ pub fn release_target(os: &str, arch: &str) -> Option<&'static str> {
     }
 }
 
+/// [`release_target`] of a `Hello`'s `<os>/<arch>` platform word
+/// ([`platform_of`]); `None` for one without a `/` (`unknown`).
+pub fn platform_target(platform: &str) -> Option<&'static str> {
+    let (os, arch) = platform.split_once('/')?;
+    release_target(os, arch)
+}
+
 /// `https://github.com/<REPO>/releases/download/v<v>/devsandbox-<v>-<target>.tar.gz`.
 /// `version` comes from the hub: only a semver's characters go in the URL.
 pub fn asset_url(version: &str, target: &str) -> Result<String> {
@@ -258,7 +272,8 @@ pub trait Steps: Send + Sync {
 /// and kind: a release asset that isn't the hub's exact build would be
 /// downloaded again at every link), install it at [`Steps::dest`], check
 /// the installed binary is `hub` too, then [`Steps::handoff`]. The scratch
-/// dir is removed whatever happens.
+/// dir is removed whatever happens. [`decide`] never says `Download` where
+/// `os`/`arch` has no release; the check here stands in case it does.
 pub fn update(steps: &dyn Steps, hub: &Build, os: &str, arch: &str, scratch: &Path) -> Result<()> {
     let target = release_target(os, arch).with_context(|| format!("no devsandbox release is built for {os}/{arch}"))?;
     let url = asset_url(&hub.semver, target)?;
@@ -322,9 +337,15 @@ pub fn scratch_dir(parent: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The most a release download may take, in seconds (`curl --max-time`):
+/// the stall bound alone lets a trickle hold the member's update, and its
+/// link, for ever.
+pub const DOWNLOAD_MAX_TIME: &str = "600";
+
 /// `curl` fetching `url` into `out`: HTTPS only (redirects included), TLS
 /// 1.2 at least, an HTTP error a failure; a stalled transfer (<1 B/s for
-/// 30 s) gives up.
+/// 30 s) gives up, and so does one still running after
+/// [`DOWNLOAD_MAX_TIME`].
 pub fn curl_argv(url: &str, out: &Path) -> Vec<OsString> {
     let mut argv: Vec<OsString> = [
         "curl",
@@ -343,6 +364,8 @@ pub fn curl_argv(url: &str, out: &Path) -> Vec<OsString> {
         "1",
         "--speed-time",
         "30",
+        "--max-time",
+        DOWNLOAD_MAX_TIME,
         "-o",
     ]
     .map(OsString::from)
@@ -501,6 +524,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_published_hub_build_needs_a_release_for_our_platform() {
+        let ours = build("0.8.0", "aaaa", true);
+        let newer = build("0.9.0", "bbbb", true);
+        for platform in ["linux/x86_64", "linux/aarch64", "macos/aarch64"] {
+            assert_eq!(decide(&ours, &newer, platform, "linux/x86_64", false), Decision::Download { build: newer.clone() }, "{platform}");
+        }
+        assert_eq!(
+            decide(&ours, &newer, "macos/x86_64", "macos/aarch64", true),
+            Decision::Stop("published build: no devsandbox release is built for macos/x86_64 (the hub runs 0.9.0 (published, bbbb))".into())
+        );
+        assert!(matches!(decide(&ours, &newer, "unknown", "linux/x86_64", true), Decision::Stop(_)), "no platform word");
+        assert_eq!(decide(&ours, &ours.clone(), "macos/x86_64", "linux/x86_64", false), Decision::Same, "the same build needs none");
+        assert!(!hub_pushes("0.9.0 bbbb published linux/x86_64", "0.8.0 aaaa published macos/x86_64"), "nothing to push");
+        assert_eq!(platform_target("linux/aarch64"), Some("aarch64-unknown-linux-musl"));
+        assert_eq!((platform_target("macos/x86_64"), platform_target("unknown"), platform_target("")), (None, None, None));
+    }
+
+    #[test]
     fn a_dev_hub_build_needs_the_platform_then_dev_builds() {
         let (lx, mac) = ("linux/x86_64", "macos/aarch64");
         let ours = build("0.8.0", "aaaa", true);
@@ -579,7 +620,7 @@ pub(crate) mod tests {
     fn the_curl_argv_is_https_only() {
         let argv = curl_argv("https://x/y", Path::new("/t/a.tar.gz"));
         let words: Vec<_> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        for want in [["--proto", "=https"], ["--proto-redir", "=https"]] {
+        for want in [["--proto", "=https"], ["--proto-redir", "=https"], ["--max-time", "600"], ["--speed-time", "30"]] {
             assert!(words.windows(2).any(|w| w == want), "{words:?}");
         }
         assert!(words.contains(&"--fail".into()) && words.contains(&"--tlsv1.2".into()) && words.contains(&"--location".into()));

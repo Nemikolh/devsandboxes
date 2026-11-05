@@ -1496,7 +1496,12 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   (`member::Member::takes_dev_builds`), read at each link's `Hello`s
   through `follow::Follow::dev_builds`): the same semver, git and kind
   is `Same`, and the link serves; another build that is published is
-  `Download { build }`; another dev build is `Receive` when the
+  `Download { build }` where a release asset exists for this platform
+  (`update::platform_target`: `release_target` of the `<os>/<arch>`
+  word), else `Stop(why)`: `published build: no devsandbox release is
+  built for <our os>/<arch> (the hub runs <hub build>)`, so a member
+  with no asset doesn't attempt a download that fails at every link;
+  another dev build is `Receive` when the
   platforms are equal and dev builds are taken, else `Stop(why)`:
   `dev build: can't run on <our os>/<arch> (the hub runs <hub build>
   for <its os>/<arch>)`, checked first since `dev-builds` can't help
@@ -1540,7 +1545,10 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, none elsewhere)
   is fetched into a private scratch dir under the temp dir with curl
   (`curl_argv`: `--fail --location --proto =https --proto-redir =https
-  --tlsv1.2`, a stall of 30 s gives up) and unpacked with `tar`. Its
+  --tlsv1.2`, a stall of 30 s gives up, and so does a download still
+  running after `DOWNLOAD_MAX_TIME`, 600 s, `--max-time`) and unpacked
+  with `tar`. `update` refuses an `os`/`arch` with no release itself
+  too, though `decide` never says `Download` there. Its
   `fleet-hello` (`Steps::build`) must be the hub's build, semver, git and
   kind (`update::check_release`, the platform aside), so the new daemon's
   hello is `Same` and an asset that isn't the hub's build is never

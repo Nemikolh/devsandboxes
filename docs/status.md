@@ -463,11 +463,10 @@ limitation means editing this file in the same commit.
 - A member's download of a published hub build has not yet run against
   a release built with `DEVSANDBOX_PUBLISHED=1` (the first is the next
   tag). The asset is checked only by being the hub's build
-  (`fleet-hello`), over HTTPS: no checksum or signature, and no overall
-  time limit (only a 30 s stall gives up). A member with no release
-  asset for its platform (an Intel Mac, a source build elsewhere) can't
-  follow a published hub: the update fails and the link is redialed and
-  fails again. A hub on a dev build (from source, `cargo install`
+  (`fleet-hello`), over HTTPS: no checksum or signature. A member with
+  no release asset for its platform (an Intel Mac, a source build
+  elsewhere) can't follow a published hub: the link drops (redialed,
+  refused again). A hub on a dev build (from source, `cargo install`
   included) is followed only with `dev-builds = true` in `member.toml`
   (or trust `full`) and the same OS/arch, else the link drops
   (redialed, refused again). Dev builds from
