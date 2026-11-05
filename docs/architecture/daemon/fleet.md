@@ -657,7 +657,8 @@ opens `TRANSFER` streams only toward a peer that advertised it.
    255 bytes); `size` the body's length; `sha256` its lowercase hex hash;
    an optional `to`, where below the receiver's tree the body belongs (a
    relative path of plain components, at most 1024 bytes; left out when
-   unset), for a kind that places more than its file (`check_header`).
+   unset), for a kind that places more than its file (`check_header`;
+   a `bundle` without one is cache-only, the hub mirror's).
    A `bundle` also names its `repo` (a repo identity, 16 lowercase hex)
    and its `refs` (full ref name → commit id, at most `HEADER_REFS_MAX`
    8, names `repo::check_ref`'s, ids `repo::check_oid`'s); both are left
@@ -817,10 +818,28 @@ branch with no commit the worker's `refs/heads/<branch>` is the
 devsandbox root, the snapshot over it); when the worker has every
 commit the body is 0 bytes. Ignored files don't travel. The user's
 index, working tree, `HEAD`, branches and stash don't change. A refusal
-is the receiver's why (`Failed`).
+is the receiver's why (`Failed`). `send` answers what each repo's bundle
+carried (`Prepared::sent`, `code::Sent`: the repo, its checkout, the
+header's `refs`) for the hub mirror.
 
-**Receive** (`receivers`, on the worker, into the hub's fleet root
-there). Bodies wait in `roots/.in/`.
+**Hub mirror** (`mirror`, `mirror_repo`; fleet plan decision 75). A
+member placing on a worker that isn't its hub sends the same refs into
+the hub's cache too, after the worker's transfer (`daemon.rs`
+`move_code`): one `code.haves` to the hub, then per repo a bundle from
+the same checkout of the same refs at the same commits, each on a
+transient ref (`repo::TempRef::at`: the snapshot has no ref left, but
+its objects are still in the repo), `--not` the hub's tips of that
+repo, 0 bytes when it has everything; no root tar, and the header has
+no `to`, so nothing is checked out there. Best effort: each repo that
+didn't make it is a line ``note: the hub `<hub>` has no copy of
+<folder>: <why>`` in the daemon's log and the run's output (after the
+placement's lines, `Prepared::notes` through `placed::moved`), and the
+run goes on. The hub's own placements and placements on the hub send
+nothing more.
+
+**Receive** (`receivers`, on the worker, into the sender's fleet root
+there). Bodies wait in `roots/.in/` (a cache-only bundle's in
+`repos/.in/`).
 
 - `root-tar`: the name must be `root-<its sha256's first 16 hex>.tar`.
   `tar::read` refuses an absolute path, a `.` / `..` / empty component, a
@@ -849,6 +868,9 @@ there). Bodies wait in `roots/.in/`.
   existing one only gets the branch fast-forwarded (its working tree
   with it) when it's the one checked out, else moved to the cache's, and
   no WIP applied (an instance may be using it). Caches are never pruned.
+- `bundle` with no `to` (cache-only, the hub mirror): the same `repo`
+  and `refs` checks, into `repos/<repo>.git` the same way (made if
+  missing, `unbundle`, `set_refs`), no checkout and no root needed.
 
 All of it is host git through `run::git`'s family
 ([ADR 0003](../../decisions/0003-host-git-never-runs-repo-controlled-code.md)):
@@ -1220,7 +1242,9 @@ over its own paths (`daemon.rs` `placed_run`, `placed::by_hub`):
   output (`Placed::Here`).
 - **The hub or another machine this host reaches**: `placed::moved`,
   the hub's own path for a worker: `daemon.rs` `move_code` moves the code
-  into this host's fleet root there (over its link, or a route), then the run is forwarded
+  into this host's fleet root there (over its link, or a route), on a
+  machine other than the hub then mirrors it into the hub's cache
+  ([Hub mirror](#moving-code), its failures notes in the output), then the run is forwarded
   (`placed::forwarded`, `remote_verb`), its output starting with the hub's
   lines. A sandbox that can't move runs here with `note: not placed on
   <worker>: …`.

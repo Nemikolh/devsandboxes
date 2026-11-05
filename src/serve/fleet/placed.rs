@@ -178,8 +178,8 @@ pub fn decide(
 }
 
 /// Placement picked worker `name` (`lines` start the output once there):
-/// `prepare(name)` moves the code, and its answer decides: there, here
-/// with a note (`NotMovable`), or failed. Shared by a hub's own placement
+/// `prepare(name)` moves the code, and its answer decides: there (its
+/// notes after `lines`), here with a note (`NotMovable`), or failed. Shared by a hub's own placement
 /// ([`decide`]) and a member's placed by the hub ([`by_hub`]).
 pub fn moved(ask: &Ask, name: &str, lines: Vec<String>, prepare: impl FnOnce(&str) -> Result<Prepared, Unprepared>) -> Placed {
     match prepare(name) {
@@ -189,7 +189,7 @@ pub fn moved(ask: &Ask, name: &str, lines: Vec<String>, prepare: impl FnOnce(&st
             name: name.to_string(),
             root: prepared.remote_root.clone(),
             base: start_point(ask, &prepared),
-            lines,
+            lines: lines.into_iter().chain(prepared.notes).collect(),
         },
     }
 }
@@ -473,6 +473,8 @@ mod tests {
         Prepared {
             remote_root: "/fleet/hub/roots/0123456789abcdef/cfg".into(),
             folders: vec![("/w/web".into(), "/fleet/hub/roots/0123456789abcdef/web".into(), branch.into())],
+            sent: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -655,6 +657,10 @@ mod tests {
         assert_eq!((name.as_str(), root, base), ("lap", PathBuf::from("/fleet/hub/roots/0123456789abcdef/cfg"), None));
         assert_eq!(lines, ["placed on lap (mem 87% free, disk 50% free, cpu 100% free)"]);
         assert_eq!(*asked.borrow(), ["lap"]);
+        // The move's notes (the hub mirror's) follow the placement's lines.
+        let noted = |_: &str| Ok(Prepared { notes: vec!["note: the hub has no copy".into()], ..prepared("main") });
+        let Placed::Worker { lines, .. } = decide(&ask, &s, &busy_here(), noted) else { panic!() };
+        assert_eq!(lines, ["placed on lap (mem 87% free, disk 50% free, cpu 100% free)", "note: the hub has no copy"]);
 
         // A sandbox that can't move: here, with the note.
         let not_movable = |_: &str| Err(Unprepared::NotMovable("/w/web has a detached HEAD".into()));

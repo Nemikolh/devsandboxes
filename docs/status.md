@@ -536,6 +536,10 @@ limitation means editing this file in the same commit.
   the branch it first checked out, and `roots/<hash>/` trees are never
   removed.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::send`, `fleet::code::repo::land_from`
+- The hub keeps a copy of each repo a member places on another machine,
+  sent after the worker's (so a placement from a laptop uploads twice),
+  never pruned and not yet read by anything (re-placement is fleet step
+  14). → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::mirror`
 - What ties a sandbox to its host (a bind outside the config root and its
   moved folders, `${localEnv:…}`, `caches`, `privileged`, …) keeps it
   home whatever a worker's trust or `member.toml` allowances: nothing

@@ -63,6 +63,16 @@ impl<'a> TempRef<'a> {
     pub(super) fn new(checkout: &'a Path) -> Self {
         TempRef { checkout, name: format!("refs/devsandbox/wip/send-{}", nonce()) }
     }
+
+    /// A fresh one ([`TempRef::new`]) made now, at commit `id` of
+    /// `checkout`: a commit no ref names any more (a sent snapshot) stays
+    /// bundleable while git keeps its objects.
+    pub(super) fn at(checkout: &'a Path, id: &str) -> Result<Self> {
+        check_oid(id)?;
+        let temp = TempRef::new(checkout);
+        run(host_git(checkout)?.args(["update-ref", &temp.name, id]), QUICK).with_context(|| format!("cannot point a ref at {id}"))?;
+        Ok(temp)
+    }
 }
 
 impl Drop for TempRef<'_> {

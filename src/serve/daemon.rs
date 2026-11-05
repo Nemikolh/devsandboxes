@@ -2440,7 +2440,7 @@ fn remote_verb(
 /// does (`fleet.place`, [`ask_hub`]), and the code moves over this host's
 /// own paths either way ([`move_code`]: a link, else a route); in no fleet
 /// it runs here. Moving the
-/// code (a fetch of each folder's origin, the transfers) runs on this
+/// code (each folder's snapshot and bundle, the transfers) runs on this
 /// connection's thread before anything is forwarded; a hang-up meanwhile
 /// is seen once the forward starts.
 fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState) -> Option<Option<Response>> {
@@ -2526,7 +2526,10 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
 /// Move the code of `sandbox` (config root `root`, `--branch` `branch`)
 /// into this host's fleet root on `worker`, over its link or a route
 /// (`route::connect`): the `prepare` of a placed run, the hub's own or a
-/// member's placed by the hub.
+/// member's placed by the hub. Then, on a member placing on a worker that
+/// isn't its hub, the hub mirror (fleet plan decision 75, `code::mirror`):
+/// the same refs into the hub's cache, best effort, each failure a note
+/// in the run's output (`Prepared::notes`) and the log.
 fn move_code(
     shared: &Shared,
     worker: &str,
@@ -2535,10 +2538,22 @@ fn move_code(
     branch: Option<&str>,
 ) -> std::result::Result<fleet::code::Prepared, fleet::code::Unprepared> {
     use fleet::code::{self, LinkTransfer, Unprepared};
+    use fleet::member::Hub;
     // The machine says where this host's fleet root is, over the same path.
     let worker_root = fleet_root_on(shared, worker).map_err(Unprepared::NotMovable)?;
     let t = LinkTransfer::for_worker(&shared.socket_dir, worker);
-    code::prepare(&t, &worker_root, root, sandbox, branch)
+    let mut prepared = code::prepare(&t, &worker_root, root, sandbox, branch)?;
+    let hub = lock_hub(&shared.hub).clone();
+    if let Hub::Other(k) = hub
+        && k != worker
+    {
+        for (folder, why) in code::mirror(&prepared.sent, &LinkTransfer::for_worker(&shared.socket_dir, &k)) {
+            let note = format!("note: the hub `{k}` has no copy of {}: {why}", folder.display());
+            log(&format!("run: {note}"));
+            prepared.notes.push(note);
+        }
+    }
+    Ok(prepared)
 }
 
 /// The hub `hub`'s `fleet.place` answer to `ask`, over a fresh `API`

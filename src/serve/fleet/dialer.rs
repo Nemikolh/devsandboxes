@@ -2013,6 +2013,7 @@ pub(crate) mod tests {
         });
         wait_for("b routed and connected on A", Duration::from_secs(15), || routed_up(&trio.a_dir, "b"));
         let fleet_root = trio.fleet_root("b", "lap");
+        let hub_root = trio.fleet_root("k", "lap");
         let mut a = connect(&trio.a_dir);
         let (r, out, err) = verb(&mut a, "run", json!({"root": cfg, "env": {"PATH": std::env::var("PATH").unwrap_or_default()}, "sandbox": "web", "branch": "feature", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
@@ -2024,6 +2025,12 @@ pub(crate) mod tests {
         let remote = fleet_root.join("roots").join(&roots[0]).join("cfg");
         assert_eq!(out, format!("b --in-process -C {} run --branch=feature -- web\nFROM x\nfeature\n", remote.display()));
         assert_eq!(git(&remote.join("../web"), &["symbolic-ref", "--short", "HEAD"]), "feature");
+        // The hub mirror: K's cache of the repo has `feature`, no checkout there.
+        assert!(!err.contains("has no copy"), "{err}");
+        let caches: Vec<_> = std::fs::read_dir(hub_root.join("repos")).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "git")).collect();
+        assert_eq!(caches.len(), 1, "{caches:?}");
+        assert_eq!(git(&caches[0], &["rev-parse", "refs/heads/feature"]), git(&src.join("web"), &["rev-parse", "feature"]));
+        assert!(!hub_root.join("roots").exists(), "no root on the hub");
         drop(a);
         trio.finish();
         for dir in [src, a_verbs, b_verbs] {

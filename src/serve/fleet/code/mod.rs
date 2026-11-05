@@ -19,7 +19,9 @@
 //! - **receive** ([`receivers`], on the worker): `root-tar` unpacked into
 //!   `<fleet root>/roots/<hash>/`; `bundle` into the repo's cache
 //!   `<fleet root>/repos/<repo id>.git`, then a checkout below the root cut
-//!   from it.
+//!   from it; a `bundle` with no `to` into the cache only.
+//! - **mirror** ([`mirror`], on a member placing elsewhere than its hub):
+//!   the same refs again into the hub's cache, best effort (decision 75).
 //!
 //! The layout keeps every `folder` where the config says, relative to the
 //! root: the tar's members sit under the root's last components on the hub
@@ -288,6 +290,23 @@ pub struct Prepared {
     /// what it has checked out and gets that branch updated,
     /// `repo::land_from`).
     pub folders: Vec<(PathBuf, PathBuf, String)>,
+    /// What each repo's bundle carried, for the hub mirror ([`mirror`]).
+    pub sent: Vec<Sent>,
+    /// Lines for the run's output after the placement's (the hub mirror's
+    /// failures); set by the caller, [`send`] leaves it empty.
+    pub notes: Vec<String>,
+}
+
+/// One repo [`send`] sent: the hub mirror sends the same refs again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sent {
+    /// The repo's identity.
+    pub id: String,
+    /// The checkout it was bundled from.
+    pub host: PathBuf,
+    /// The header's refs: `refs/heads/<branch>` and maybe its WIP ref, at
+    /// the commits sent (the snapshot no longer named by any ref here).
+    pub refs: BTreeMap<String, String>,
 }
 
 /// What sandbox `sandbox` of `config_root` needs on a worker, each repo
@@ -536,12 +555,66 @@ pub fn send(offer: &Offer, worker_root: &Path, t: &dyn Transfer) -> Result<Prepa
     }
     let tree = worker_root.join("roots").join(&offer.hash);
     let mut folders = Vec::new();
+    let mut sent = Vec::new();
     for r in &offer.repos {
         let tips = haves.tips.get(&r.id).map(Vec::as_slice).unwrap_or_default();
-        send_repo(r, &offer.hash, tips, t).with_context(|| format!("cannot send {}", r.host.display()))?;
+        let refs = send_repo(r, &offer.hash, tips, t).with_context(|| format!("cannot send {}", r.host.display()))?;
         folders.push((r.host.clone(), tree.join(&r.at), r.branch.clone()));
+        sent.push(Sent { id: r.id.clone(), host: r.host.clone(), refs });
     }
-    Ok(Prepared { remote_root: tree.join(&offer.layout.root), folders })
+    Ok(Prepared { remote_root: tree.join(&offer.layout.root), folders, sent, notes: Vec::new() })
+}
+
+/// The hub mirror (fleet plan decision 75): each of `sent` again, through
+/// `t` (the hub's link), into the hub's cache of that repo only: one
+/// `code.haves`, then per repo a bundle from its checkout `--not` the hub's
+/// tips of the same refs at the same commits (each pointed at by a
+/// transient `repo::TempRef`, so a snapshot no ref names any more still
+/// goes), a header with no `to` (no checkout there, no root needed); a
+/// body of 0 bytes when the hub has it all. Best effort: each repo that
+/// didn't make it, with why (all of them when the hub can't be asked).
+pub fn mirror(sent: &[Sent], t: &dyn Transfer) -> Vec<(PathBuf, String)> {
+    let ids: Vec<String> = sent.iter().map(|s| s.id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+    let haves = match t.haves(&ids) {
+        Ok(h) => h,
+        Err(e) => {
+            let why = format!("{:#}", e.context("cannot ask the hub what it has"));
+            return sent.iter().map(|s| (s.host.clone(), why.clone())).collect();
+        }
+    };
+    let mut failed = Vec::new();
+    for s in sent {
+        let tips = haves.tips.get(&s.id).map(Vec::as_slice).unwrap_or_default();
+        if let Err(e) = mirror_repo(s, tips, t) {
+            failed.push((s.host.clone(), format!("{e:#}")));
+        }
+    }
+    failed
+}
+
+/// One repo of [`mirror`]: its refs' commits on transient refs in its
+/// checkout, bundled `--not` `tips` into a temp file in its git dir (as
+/// [`send_repo`]), both gone once sent.
+fn mirror_repo(s: &Sent, tips: &[String], t: &dyn Transfer) -> Result<()> {
+    let checkout = Repo::Checkout(&s.host);
+    let file = repo::TempPath::new(&checkout.git_dir()?, "bundle");
+    let temps = s.refs.values().map(|id| repo::TempRef::at(&s.host, id)).collect::<Result<Vec<_>>>()?;
+    let names: Vec<&str> = temps.iter().map(|r| r.name.as_str()).collect();
+    let new = repo::bundle_refs(checkout, &names, tips, &file.0)?;
+    drop(temps);
+    let open = || std::fs::File::open(&file.0).with_context(|| format!("cannot read {}", file.0.display()));
+    let mut body: Box<dyn Read> = if new { Box::new(open()?) } else { Box::new(std::io::empty()) };
+    let (size, sha256) = if new { transfer::digest(open()?)? } else { transfer::digest(std::io::empty())? };
+    let header = Header {
+        kind: BUNDLE_KIND.into(),
+        name: "repo.bundle".into(),
+        size,
+        sha256,
+        to: None,
+        repo: Some(s.id.clone()),
+        refs: Some(s.refs.clone()),
+    };
+    t.send(&header, &mut body)
 }
 
 /// One repo of an offer of root `hash`, bundled from its checkout `--not`
@@ -557,8 +630,8 @@ pub fn send(offer: &Offer, worker_root: &Path, t: &dyn Transfer) -> Result<Prepa
 /// the objects' disk), removed after the send; a body of 0 bytes when the
 /// worker has every commit. The header names the repo,
 /// `refs/heads/<branch>` at the base commit and, with a snapshot,
-/// `refs/devsandbox/wip/<branch>` at it.
-fn send_repo(r: &RepoOffer, hash: &str, tips: &[String], t: &dyn Transfer) -> Result<()> {
+/// `refs/devsandbox/wip/<branch>` at it; those refs are the answer.
+fn send_repo(r: &RepoOffer, hash: &str, tips: &[String], t: &dyn Transfer) -> Result<BTreeMap<String, String>> {
     let full = format!("refs/heads/{}", r.branch);
     let checkout = Repo::Checkout(&r.host);
     let file = repo::TempPath::new(&checkout.git_dir()?, "bundle");
@@ -591,9 +664,10 @@ fn send_repo(r: &RepoOffer, hash: &str, tips: &[String], t: &dyn Transfer) -> Re
         sha256,
         to: Some(format!("{hash}/{to}")),
         repo: Some(r.id.clone()),
-        refs: Some(refs),
+        refs: Some(refs.clone()),
     };
-    t.send(&header, &mut body)
+    t.send(&header, &mut body)?;
+    Ok(refs)
 }
 
 /// `code.haves {repos}` from a peer whose fleet root here is `fleet_root`
@@ -719,12 +793,16 @@ fn next_seq() -> u32 {
 ///   `roots/<hash>/<path>` cut from the cache ([`repo::land_from`]: a new
 ///   one gets the WIP applied), every dir on the way a real one (no
 ///   symlink).
+/// - `bundle` with no `to` (the hub mirror, [`mirror`]): cache-only, the
+///   same checks of `repo` and `refs`, into `repos/<repo>.git` with its
+///   refs set, no checkout and no root needed.
 ///
-/// Bodies wait in `roots/.in/`; the unpacking's error is the transfer's
-/// answer, so the hub hears it.
+/// Bodies wait in `roots/.in/` (`repos/.in/` for a cache-only bundle); the
+/// unpacking's error is the transfer's answer, so the sender hears it.
 pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
     let roots = fleet_root.join("roots");
     let (tar_in, tar_roots, bundle_in, bundle_roots) = (roots.clone(), roots.clone(), roots.clone(), roots);
+    let cache_in = fleet_root.join("repos").join(".in");
     let fleet_root = fleet_root.to_path_buf();
     receivers
         .with(
@@ -748,20 +826,34 @@ pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
             BUNDLE_KIND,
             BUNDLE_LIMIT,
             move |h| {
+                // Unique: two empty bodies share their sha256.
+                let name = format!("{}-{}.bundle", h.sha256, repo::nonce());
+                if h.to.is_none() {
+                    let (id, _, _) = bundle_refs_of(h)?;
+                    repo::check_id(id)?;
+                    return Ok(cache_in.join(name));
+                }
                 let (hash, _) = bundle_target(h)?;
                 bundle_refs_of(h)?;
                 if !bundle_in.join(hash).is_dir() {
                     bail!("root {hash} isn't here (its tar goes first)");
                 }
-                // Unique: two empty bodies share their sha256.
-                Ok(bundle_in.join(".in").join(format!("{}-{}.bundle", h.sha256, repo::nonce())))
+                Ok(bundle_in.join(".in").join(name))
             },
             |_| {},
         )
         .then(BUNDLE_KIND, move |r: &Received| {
             let landed = (|| {
-                let (hash, rest) = bundle_target(&r.header)?;
                 let (id, branch, wip) = bundle_refs_of(&r.header)?;
+                let refs = r.header.refs.as_ref().context("a bundle names its refs")?;
+                if r.header.to.is_none() {
+                    let cache = make_cache(&fleet_root, id)?;
+                    if r.header.size > 0 {
+                        repo::unbundle(&cache, &r.path)?;
+                    }
+                    return repo::set_refs(&cache, refs);
+                }
+                let (hash, rest) = bundle_target(&r.header)?;
                 let tree = bundle_roots.join(hash);
                 let mut at = tree.clone();
                 for part in rest.split('/') {
@@ -774,7 +866,7 @@ pub fn receivers(fleet_root: &Path, receivers: Receivers) -> Receivers {
                 if r.header.size > 0 {
                     repo::unbundle(&cache, &r.path)?;
                 }
-                repo::set_refs(&cache, r.header.refs.as_ref().context("a bundle names its refs")?)?;
+                repo::set_refs(&cache, refs)?;
                 repo::land_from(&cache, &at, branch, wip)
             })();
             let _ = std::fs::remove_file(&r.path);
@@ -1016,8 +1108,6 @@ mod tests {
             let err = format!("{:#}", deliver(&r, &bad, b"x").unwrap_err());
             assert!(err.contains(&format!("not {other}")), "{other}: {err}");
         }
-        let err = format!("{:#}", deliver(&r, &Header { to: None, ..h.clone() }, b"x").unwrap_err());
-        assert!(err.contains("names where it goes"), "{err}");
         let err = format!("{:#}", deliver(&r, &Header { to: Some("web".into()), ..h.clone() }, b"x").unwrap_err());
         assert!(err.contains("below a root"), "{err}");
         // Through a symlink the root's tar made: refused.
@@ -1476,6 +1566,97 @@ mod tests {
         assert_eq!(git(&checkout, &["rev-parse", "feature"]), git(&web, &["rev-parse", "feature"]));
         assert_eq!(std::fs::read_dir(fleet.join("roots/.in")).unwrap().count(), 0, "no body left behind");
         assert_no_leftovers(&web);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hub_mirror_fills_the_hubs_cache_only() {
+        let dir = scratch("mirror");
+        let cfg = fixture(&dir);
+        let web = dir.join("web");
+        let bulk: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(web.join("bulk"), bulk).unwrap();
+        git(&web, &["add", "bulk"]);
+        git(&web, &["commit", "-q", "-m", "bulk"]);
+        std::fs::write(web.join("README"), "dirty\n").unwrap();
+        let before = source_state(&web);
+        let (worker, hub) = (dir.join("worker/fleet/m"), dir.join("hub/fleet/m"));
+        let to_worker = LinkTransfer::for_worker(link(&dir.join("w"), &worker).parent().unwrap(), "w");
+        let to_hub = LinkTransfer::for_worker(link(&dir.join("k"), &hub).parent().unwrap(), "w");
+        let t = Recorded { inner: &to_hub, sent: Mutex::default() };
+        let none = Vec::<(PathBuf, String)>::new();
+
+        let got = prepare(&to_worker, &worker, &cfg, "web", None).unwrap();
+        assert_eq!(got.notes, Vec::<String>::new());
+        let [sent] = got.sent.as_slice() else { panic!("{:?}", got.sent) };
+        assert_eq!(sent.host, web);
+        assert_eq!(mirror(&got.sent, &t), none);
+        let first = t.take();
+        assert!(matches!(first.as_slice(), [(k, n)] if k == "bundle" && *n > 0), "{first:?}");
+        // The same refs at the same commits as the worker's cache, nothing else.
+        let (hub_cache, worker_cache) = (cache_path(&hub, &sent.id), cache_path(&worker, &sent.id));
+        let refs = |c: &Path| git(c, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+        assert_eq!(refs(&hub_cache), refs(&worker_cache));
+        assert_eq!(git(&hub_cache, &["rev-parse", "refs/heads/main"]), git(&web, &["rev-parse", "main"]));
+        let wip = git(&hub_cache, &["rev-parse", &repo::wip_ref("main")]);
+        assert_eq!(git(&hub_cache, &["show", &format!("{wip}:README")]), "dirty");
+        assert!(!hub.join("roots").exists(), "no root, no checkout");
+        let mut entries: Vec<String> = std::fs::read_dir(hub.join("repos")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        entries.sort();
+        assert_eq!(entries, [".in".to_string(), format!("{}.git", sent.id)]);
+        assert_eq!(std::fs::read_dir(hub.join("repos/.in")).unwrap().count(), 0, "no body left behind");
+
+        // Nothing new: a 0-byte body, still ok.
+        assert_eq!(mirror(&got.sent, &t), none);
+        assert_eq!(t.take(), [("bundle".to_string(), 0)]);
+        assert_eq!(source_state(&web), before, "the source is untouched");
+        assert_no_leftovers(&web);
+        // A new commit: only the delta.
+        std::fs::write(web.join("two"), "two\n").unwrap();
+        git(&web, &["add", "two"]);
+        git(&web, &["commit", "-q", "-m", "two"]);
+        let again = prepare(&to_worker, &worker, &cfg, "web", None).unwrap();
+        assert_eq!(mirror(&again.sent, &t), none);
+        let second = t.take();
+        assert!(second.len() == 1 && second[0].1 > 0 && second[0].1 < first[0].1, "a delta: {second:?} after {first:?}");
+        assert_eq!(refs(&hub_cache), refs(&worker_cache));
+        assert_no_leftovers(&web);
+
+        // A commit the checkout doesn't have: that repo's failure, no ref left.
+        let gone = Sent { refs: [("refs/heads/main".to_string(), "1".repeat(40))].into(), ..sent.clone() };
+        let failed = mirror(std::slice::from_ref(&gone), &t);
+        assert!(matches!(failed.as_slice(), [(h, why)] if *h == web && why.contains("cannot point a ref at")), "{failed:?}");
+        assert_no_leftovers(&web);
+        // A hub that can't be asked: every repo's failure.
+        struct NoHaves;
+        impl Transfer for NoHaves {
+            fn haves(&self, _: &[String]) -> Result<Haves> {
+                bail!("unreachable")
+            }
+            fn send(&self, _: &Header, _: &mut dyn Read) -> Result<()> {
+                unreachable!()
+            }
+        }
+        assert_eq!(mirror(&got.sent, &NoHaves), [(web.clone(), "cannot ask the hub what it has: unreachable".to_string())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cache_only_bundle_keeps_every_check() {
+        let dir = scratch("recv-cache-only");
+        let fleet = dir.join("fleet");
+        let r = Arc::new(receivers(&fleet, Receivers::new(|_| {})));
+        let oid = "a".repeat(40);
+        let cache_only = |refs: &[(&str, &str)]| Header { to: None, ..bundle_header(b"", "x/y", "fedcba9876543210", refs) };
+        let err = format!("{:#}", deliver(&r, &cache_only(&[("refs/heads/main", &oid)]), b"").unwrap_err());
+        assert!(err.contains("is neither in the bundle nor already here"), "{err}");
+        let err = format!("{:#}", deliver(&r, &cache_only(&[("refs/heads/main", &oid), ("refs/tags/v1", &oid)]), b"").unwrap_err());
+        assert!(err.contains("not refs/tags/v1"), "{err}");
+        let err = format!("{:#}", deliver(&r, &cache_only(&[("refs/devsandbox/wip/main", &oid)]), b"").unwrap_err());
+        assert!(err.contains("carries one branch"), "{err}");
+        let err = format!("{:#}", deliver(&r, &Header { repo: None, ..cache_only(&[("refs/heads/main", &oid)]) }, b"").unwrap_err());
+        assert!(err.contains("names its repo"), "{err}");
+        assert!(!fleet.join("roots").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
