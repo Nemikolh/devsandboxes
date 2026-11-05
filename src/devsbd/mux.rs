@@ -1784,12 +1784,15 @@ mod tests {
         let fired = Arc::new(AtomicBool::new(false));
         for mux in [&f.host, &f.daemon] {
             let fired = Arc::clone(&fired);
-            mux.keepalive(Duration::from_millis(5), Duration::from_millis(300), move || {
+            // A 1 s timeout watched for 3 s: pings blocked behind the stalled
+            // stream would stay silent the whole time, while a loaded CI
+            // runner's scheduling gaps (300 ms was too tight) fit inside it.
+            mux.keepalive(Duration::from_millis(5), Duration::from_secs(1), move || {
                 fired.store(true, Ordering::Relaxed);
             });
         }
         let _ends = stalled(&f);
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(3));
         assert!(!fired.load(Ordering::Relaxed), "keepalive declared a live peer dead");
     }
 
