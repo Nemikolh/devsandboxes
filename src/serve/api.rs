@@ -694,6 +694,11 @@ struct DoneParams {
 pub struct DoneSet {
     pub instance: String,
     pub done: bool,
+    /// A `done` with `machine` of an instance this host placed there: why
+    /// fetching it back first failed (the daemon's `remote_done`; the flag
+    /// is set anyway).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Set or clear an instance's done flag (`done::set_saved`) by its exact
@@ -705,7 +710,7 @@ fn instances_done(p: DoneParams, state: &Path) -> Answer {
         Ok(unknown) => ApiError::not_found(unknown.to_string()),
         Err(e) => ApiError::internal(e),
     })?;
-    serde_json::to_value(DoneSet { instance: p.instance, done: p.done }).map_err(|e| ApiError::internal(e.into()))
+    serde_json::to_value(DoneSet { instance: p.instance, done: p.done, warning: None }).map_err(|e| ApiError::internal(e.into()))
 }
 
 #[derive(Deserialize)]
@@ -2523,7 +2528,8 @@ mod tests {
         assert_matches("SandboxConfig", &v(&cfg.sandbox_text("web")));
         assert_matches("ServiceConfig", &v(&ServiceConfig { original: "t".into() }));
         assert_matches("InstanceRenamed", &v(&Renamed { instance: "w".into() }));
-        assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true }));
+        assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true, warning: None }));
+        assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true, warning: Some("no link".into()) }));
         assert_matches("SessionsList", &v(&SessionsList { sessions: vec!["1700000000-ab12 running detached 2023-11-14T22:13:20Z sh".into()] }));
         {
             use crate::config_identity::ops::{ConfigAcked, ConfigFindings, ConfigMigrated, IdentityFinding};

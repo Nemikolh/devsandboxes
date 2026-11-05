@@ -940,7 +940,10 @@ pub(crate) mod tests {
     /// instance; the instance commits and leaves work uncommitted on L; K's
     /// `placements.fetch` asks L's `instances.fetch` (under `worker` trust:
     /// the instance is under K's fleet root there), pulls the bundle and
-    /// lands it in the source checkout as hidden refs only.
+    /// lands it in the source checkout as hidden refs only. Then (decision
+    /// 77) a `done` there fetches back first, best effort (a warning when the
+    /// checkout is gone); an `rm` fetches back first or is refused, unforwarded;
+    /// `rm --force` skips it; an `rm` answered `ok` drops the placement.
     #[test]
     fn a_placed_run_is_recorded_and_fetched_back() {
         use crate::serve::capacity::Capacity;
@@ -970,7 +973,7 @@ pub(crate) mod tests {
                 // daemon's state.toml; it commits, then leaves work uncommitted.
                 let state = l.state.clone().unwrap();
                 let script = format!(
-                    r#"S='{}'; W=$(cd "$3/../web" && pwd -P); printf '[instance.web-2]\nsandbox = "web"\ninstance_id = "web-2"\ncontainer = "c"\nworkspace = "/w"\ncreated_unix = 0\nfolder = "%s"\nconfig_dir = "%s"\n' "$W" "$3" > "$S"; echo worker > "$W/README"; git -C "$W" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -am worker; echo wip > "$W/later""#,
+                    r#"case "$4" in rm) echo "lap $*"; exit 0;; esac; S='{}'; W=$(cd "$3/../web" && pwd -P); printf '[instance.web-2]\nsandbox = "web"\ninstance_id = "web-2"\ncontainer = "c"\nworkspace = "/w"\ncreated_unix = 0\nfolder = "%s"\nconfig_dir = "%s"\n' "$W" "$3" > "$S"; echo worker > "$W/README"; git -C "$W" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -am worker; echo wip > "$W/later""#,
                     state.display()
                 );
                 let (mut runner, dir) = crate::serve::verbs::tests::script_runner("dial-fetch-l", &script);
@@ -1018,6 +1021,56 @@ pub(crate) mod tests {
         // A local client can't ask `instances.fetch` itself.
         let r = k.call_within("instances.fetch", json!({"instance": "web-2"}), Duration::from_secs(10)).unwrap().unwrap();
         assert_eq!(r.error.unwrap().code, "denied");
+
+        // Fleet plan decision 77. `done` there fetches back first.
+        let worker = placed[0].remote.clone();
+        let remote_root = worker.parent().unwrap().join("cfg");
+        let placements_now = || crate::serve::fleet::placements::load(&pair.base.join("k-data/placements.json")).unwrap();
+        let wip = |content: &str| std::fs::write(worker.join("later"), content).unwrap();
+        let done = |k: &mut Conn| {
+            let r = k.call_within("instances.done", json!({"machine": "lap", "instance": "web-2", "done": true}), Duration::from_secs(120));
+            r.unwrap().unwrap()
+        };
+        wip("at done");
+        let r = done(&mut k);
+        assert!(r.error.is_none(), "{r:?}");
+        assert_eq!(r.result.as_ref().unwrap().get("warning"), None, "{r:?}");
+        assert_eq!(git(&web, &["show", "refs/devsandbox/lap/web-2/wip:later"]), "at done");
+        // The local checkout gone: `done` still flags it, with a warning;
+        // `rm` is refused, nothing forwarded, the placement kept.
+        let moved = src.join("web.moved");
+        std::fs::rename(&web, &moved).unwrap();
+        let r = done(&mut k);
+        assert!(r.error.is_none(), "{r:?}");
+        let warning = r.result.as_ref().unwrap()["warning"].as_str().unwrap_or_default().to_string();
+        assert!(warning.starts_with("cannot fetch lap/web-2 back: "), "{r:?}");
+        let rm = |force: bool| json!({"root": remote_root, "env": {"PATH": path}, "instance": "web-2", "force": force, "machine": "lap"});
+        let (r, out, _) = verb(&mut k, "rm", rm(false));
+        let e = r.error.unwrap();
+        assert_eq!(e.code, "failed");
+        assert!(e.message.starts_with("cannot fetch lap/web-2 back, so it isn't removed: ") && e.message.contains("rm --force"), "{e:?}");
+        assert_eq!(out, "", "not forwarded");
+        assert_eq!(placements_now().len(), 1);
+        // `rm --force` skips the fetch-back: forwarded, the placement dropped.
+        let (r, out, err) = verb(&mut k, "rm", rm(true));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!(err, "not fetching lap/web-2 back (--force)\n");
+        assert_eq!(out, format!("lap --in-process -C {} rm --force -- web-2\n", remote_root.display()));
+        assert_eq!(placements_now(), vec![]);
+        // An `rm` of an instance not placed from here: forwarded as is.
+        let (r, out, err) = verb(&mut k, "rm", rm(false));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert_eq!((out, err.as_str()), (format!("lap --in-process -C {} rm -- web-2\n", remote_root.display()), ""));
+        // Back in place: `rm` fetches back first, then the placement goes.
+        std::fs::rename(&moved, &web).unwrap();
+        crate::serve::fleet::placements::update(&pair.base.join("k-data/placements.json"), |all| all.push(placed[0].clone())).unwrap();
+        wip("at rm");
+        let (r, out, err) = verb(&mut k, "rm", rm(false));
+        assert!(r.error.is_none(), "{r:?} {err}");
+        assert!(err.starts_with("fetched lap/web-2 into ") && err.contains("refs/devsandbox/lap/web-2/wip"), "{err}");
+        assert_eq!(out, format!("lap --in-process -C {} rm -- web-2\n", remote_root.display()));
+        assert_eq!(git(&web, &["show", "refs/devsandbox/lap/web-2/wip:later"]), "at rm");
+        assert_eq!(placements_now(), vec![]);
         drop(k);
         pair.finish();
         for dir in [src, l_verbs, k_verbs] {

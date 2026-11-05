@@ -920,7 +920,8 @@ name there, the sandbox, the local config root, the local checkout of
 `folder`, its path on the worker, the repo identity and the branch
 sent), written by the daemon when the run's answer names the instance
 ([In the `run` verb](#in-the-run-verb)); a repeat of the same name on
-the same machine replaces it; nothing prunes it. `placements::find`
+the same machine replaces it, and an `rm` typed here drops it (below).
+`placements::find`
 takes `machine` and `instance`, or a bare `instance` that exactly one
 entry has. Then (`fetch::fetch_back`):
 
@@ -963,6 +964,29 @@ entry has. Then (`fetch::fetch_back`):
   comes from `placements.json`, never from the worker's answer.
 
 Only the `folder` repo comes back.
+
+At `rm` and `done` (fleet plan decision 77; `serve::daemon`'s
+`remote_rm`, `remote_done`, the choice `fetch::before`): a request with
+`machine` typed on this host (the CLI's or the dashboard's, the same
+daemon paths) naming an instance that `placements.json` has for that
+machine fetches it back first (`fetch_placement`, the same as
+`placements.fetch`), on the request's connection thread before anything
+is forwarded (a hang-up meanwhile is seen once the forward starts).
+
+- `rm`: the fetch's lines (`commands::fetch::lines`) go into the rm's
+  output, then the `rm` is forwarded. A fetch-back that fails (or a
+  `placements.json` that doesn't load) refuses it, `failed`, naming why,
+  `devsandbox fetch <machine>/<instance>` to retry and `rm --force` to go
+  without; nothing is forwarded. `force` skips the fetch-back (it already
+  discards uncommitted work), a line saying so. Every attempt fetches,
+  rm's `ask` round's too (an `ask` that needs no question removes); a
+  second fetch brings nothing new. A forwarded `rm` answered `ok` drops
+  the entry (`placements::remove`); an instance removed any other way
+  (on the worker, or from another host) keeps its entry.
+- `instances.done` with `done: true`: best effort. A failure is logged
+  and the answer's `warning` (the flag is set either way), which `done
+  <machine>/<instance>` prints on stderr (`machines::cli::calls`) and the
+  dashboard shows as its status line. `undone` doesn't fetch.
 
 All of it is host git through `run::git`'s family
 ([ADR 0003](../../decisions/0003-host-git-never-runs-repo-controlled-code.md)):

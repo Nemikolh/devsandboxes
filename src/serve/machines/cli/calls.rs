@@ -176,7 +176,11 @@ pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, 
         Use::Done(done) => {
             // The line says whether it changed: the flag as the rows had it.
             let was = row_of(call, m, root, name)?.map(|r| r.done).unwrap_or(!*done);
-            let _: Value = call_on(call, m, "instances.done", json!({ "instance": name, "done": done }))?;
+            let set: crate::serve::api::DoneSet = call_on(call, m, "instances.done", json!({ "instance": name, "done": done }))?;
+            // A placed instance whose fetch-back (this host's daemon's) failed.
+            if let Some(warning) = &set.warning {
+                writeln!(err, "warning: {warning}")?;
+            }
             writeln!(out, "{}", crate::commands::done::status_line(name, *done, was))?;
         }
         Use::Rename(new_name) => {
@@ -592,6 +596,15 @@ mod tests {
             assert_eq!(out, format!("{}\n", crate::commands::done::status_line("web", done, was)));
             assert_eq!(calls[1], ("instances.done".into(), json!({"instance": "web", "done": done, "machine": "lap"})));
         }
+        let (r, out, err, _) = run_named(Use::Done(true), "web", |m, _| {
+            Ok(if m == "instances.list" {
+                listing(vec![row("web", "c", "/f/cfg", false)], vec![], None)
+            } else {
+                json!({"instance": "web", "done": true, "warning": "cannot fetch lap/web back: no link"})
+            })
+        });
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!((out, err.as_str()), (format!("{}\n", crate::commands::done::status_line("web", true, false)), "warning: cannot fetch lap/web back: no link\n"));
         let (_, out, _, calls) = run_named(Use::Rename(" api ".into()), "web", |_, _| Ok(json!({"instance": "api"})));
         assert_eq!(out, "renamed web -> api\n");
         assert_eq!(calls, [("instances.rename".into(), json!({"instance": "web", "newName": " api ", "machine": "lap"}))]);

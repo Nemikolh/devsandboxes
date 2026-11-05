@@ -540,11 +540,14 @@ limitation means editing this file in the same commit.
   sent after the worker's (so a placement from a laptop uploads twice),
   never pruned and not yet read by anything (re-placement is fleet step
   14). → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::mirror`
-- Fetch-back (`devsandbox fetch <machine>/<instance>`) brings back only
-  the `folder` repo's branch and WIP (not `folders` entries'), only on
-  demand (not yet at `rm` / `done`, fleet step 12f), and not from the
-  dashboard. `placements.json` entries are never pruned yet (12f's `rm`
-  drops them). A bundle the worker made under `out/` for a host that never
+- Fetch-back (`devsandbox fetch <machine>/<instance>`, and before an
+  `rm` or `done` of a placed instance typed on the host that placed it)
+  brings back only the `folder` repo's branch and WIP (not `folders`
+  entries'); the dashboard has no fetch of its own (its `rm` / done do
+  fetch back), and its done blocks its daemon connection, snapshots
+  included, while the fetch-back runs. A `placements.json` entry is
+  dropped only by an `rm` typed on the placing host: one for an instance
+  removed elsewhere (on the worker, or from another host) stays. A bundle the worker made under `out/` for a host that never
   pulled it is swept only when the next one is made (after 1 h). A
   worker's instance whose history gained another root (an unrelated
   merge) no longer matches the placed repo and is refused.

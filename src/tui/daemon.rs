@@ -530,6 +530,10 @@ fn done_call(req: &PendingDone) -> (&'static str, Value) {
 fn done_status(req: &PendingDone, answer: Answer) -> (String, bool) {
     let verb = if req.done { "done" } else { "undone" };
     match answer {
+        // A placed instance whose fetch-back failed: flagged, but said.
+        Answer::Ok(v) if v.get("warning").is_some_and(Value::is_string) => {
+            (format!("marked {} done; {}", req.instance, v["warning"].as_str().unwrap_or_default()), true)
+        }
         Answer::Ok(_) if req.done => (format!("marked {} done", req.instance), false),
         Answer::Ok(_) => (format!("marked {} not done", req.instance), false),
         Answer::Refused(msg) => (format!("{verb}: {msg}"), true),
@@ -1537,6 +1541,8 @@ mod tests {
         let ok = || Answer::Ok(json!({"instance": "a", "done": true}));
         assert_eq!(done_status(&done(true), ok()), ("marked a done".into(), false));
         assert_eq!(done_status(&done(false), ok()), ("marked a not done".into(), false));
+        let warned = Answer::Ok(json!({"instance": "a", "done": true, "warning": "cannot fetch lap/a back: no link"}));
+        assert_eq!(done_status(&done(true), warned), ("marked a done; cannot fetch lap/a back: no link".into(), true), "shown even unasked");
         assert_eq!(done_status(&done(false), Answer::Refused("no instance `a`".into())), ("undone: no instance `a`".into(), true));
         assert_eq!(done_status(&done(true), down()), ("x: needs devsandbox serve (down)".into(), true));
     }

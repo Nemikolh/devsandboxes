@@ -562,7 +562,13 @@ being built by a `run`/`rebuild`), each with the CLI's message;
 Params: `{"instance": "<name>", "done": true}`, an exact instance name.
 Sets (`true`) or clears its done flag, as `devsandbox done|undone`;
 idempotent (an instance already done keeps its original time). Result:
-`{"instance": "<name>", "done": true}`, the flag as it now is.
+`{"instance": "<name>", "done": true}`, the flag as it now is. With
+`machine` and `done: true`, an instance this host placed there
+(`placements.json`) is fetched back first, as `placements.fetch` does,
+best effort: a fetch-back that fails adds `"warning": "cannot fetch
+<machine>/<instance> back: <why>"` to the machine's answer, the flag set
+anyway ([fleet.md](../architecture/daemon/fleet.md#moving-code),
+*Fetch-back*).
 
 Errors: `not-found` (no such instance), `invalid` (a missing param),
 `internal` (`state.toml` doesn't read or write).
@@ -1005,6 +1011,19 @@ With `"ask": true` it answers the error `confirm` instead, `message` the
 question, having removed nothing; the client asks its user and resends with
 `deleteBranch` set. Without `ask`, the non-TTY default applies.
 
+**`rm` of a placed instance**: an `rm` with `machine` naming an instance
+this host placed there (`placements.json`) fetches it back first, as
+`placements.fetch` does, its lines (`fetched <machine>/<instance> into
+…`, the refs) streamed as `stderr` output before the forwarded `rm`'s;
+every attempt does, an `ask` round's too. A fetch-back that fails (or a
+`placements.json` that doesn't load) answers `failed`, `message`
+`` cannot fetch <machine>/<instance> back, so it isn't removed: <why>
+(`devsandbox fetch <machine>/<instance>` retries; `rm --force` removes it
+without) ``, `data` `{"exit": null, "instance": null}`, and nothing is
+forwarded. `force` skips the fetch-back (a `not fetching
+<machine>/<instance> back (--force)` line). An `rm` answered `ok` drops
+the placement.
+
 **Detach** (`run`, `rebuild`, `start`): `"detach": true` answers early,
 `{"instance": name | null, "detached": true}`, while the verb runs on:
 for `run` and a single `rebuild` once an instance records the verb's
@@ -1333,7 +1352,8 @@ checkout it was placed from, as hidden refs (`devsandbox fetch`;
 `{"machine": "<name>", "instance": "<name there>"}` (`machine` may be
 left out when exactly one placement has that instance name). The
 placement comes from `placements.json` (written when a placed run's
-answer named its instance), never from the machine; the daemon asks the
+answer named its instance, dropped by an `rm` of it with `machine`),
+never from the machine; the daemon asks the
 machine's `instances.fetch` with the checkout's tips as `haves`, pulls
 the bundle and sets `refs/devsandbox/<machine>/<instance>/heads/<branch>`
 and `refs/devsandbox/<machine>/<instance>/wip` there. The user's

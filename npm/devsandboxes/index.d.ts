@@ -828,6 +828,8 @@ export interface InstanceRenamed {
 export interface InstanceDone {
   instance: string;
   done: boolean;
+  /** A `done` with `machine` of an instance this host placed there: why fetching it back first failed (the flag is set anyway). */
+  warning?: string;
 }
 
 /** One `sandboxes.list` entry (not the snapshot's {@link SandboxRow}). */

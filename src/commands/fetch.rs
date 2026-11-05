@@ -38,8 +38,9 @@ fn target(name: &str) -> Result<(Option<String>, String)> {
     }
 }
 
-/// What `fetch` prints: the refs set, then how to look at them.
-fn lines(got: &FetchedBack) -> Vec<String> {
+/// What `fetch` prints (and a placed instance's `rm` says before it's
+/// forwarded): the refs set, then how to look at them.
+pub(crate) fn lines(got: &FetchedBack) -> Vec<String> {
     let who = format!("{}/{}", got.machine, got.instance);
     let mut out = vec![if got.fetched == 0 {
         format!("{who}: nothing new; refs in {}", got.folder.display())

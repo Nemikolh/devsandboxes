@@ -6,7 +6,9 @@
 //!
 //! Only the daemon writes it: `placed_run` adds an entry once a forwarded
 //! run's answer names its instance (a repeat placement of the same name on
-//! the same machine replaces it). Nothing prunes it yet. Every write is a
+//! the same machine replaces it), and drops it once an `rm` of that
+//! instance typed here is answered `ok` (`serve::daemon`'s `remote_rm`; one
+//! removed any other way stays). Every write is a
 //! read-modify-write under an exclusive lock on the sibling
 //! `placements.lock`, written to a temp file and renamed
 //! (`serve::locked_file`), as two daemons can overlap during a handoff.
@@ -88,6 +90,11 @@ pub fn record(entries: &mut Vec<Entry>, entry: Entry) {
     entries.push(entry);
 }
 
+/// Drop the entry of `machine` and `instance`, if any.
+pub fn remove(entries: &mut Vec<Entry>, machine: &str, instance: &str) {
+    entries.retain(|e| !(e.machine == machine && e.instance == instance));
+}
+
 /// The entry `machine/instance` names; with no `machine`, the one placed
 /// instance of that name, if exactly one. Why none, for the caller.
 pub fn find<'a>(entries: &'a [Entry], machine: Option<&str>, instance: &str) -> Result<&'a Entry, String> {
@@ -138,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn update_records_replaces_and_keeps_a_bad_file() {
+    fn update_records_replaces_removes_and_keeps_a_bad_file() {
         let dir = std::env::temp_dir().join(format!("devsandbox-placements-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("placements.json");
@@ -152,6 +159,9 @@ mod tests {
         let other = dir.join("sub/placements.json");
         update(&other, |_| ()).unwrap();
         assert!(!other.exists());
+        update(&path, |e| remove(e, "lap", "web-2")).unwrap();
+        update(&path, |e| remove(e, "lap", "nope")).unwrap();
+        assert_eq!(load(&path).unwrap(), vec![entry("box", "web-2")], "only lap/web-2 dropped");
         std::fs::write(&path, "{\"version\": 9}").unwrap();
         assert!(update(&path, |e| e.clear()).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\": 9}");

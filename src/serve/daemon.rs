@@ -1973,6 +1973,9 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
     // (docs/architecture/daemon/machines.md, *Forwarded requests*).
     match fwd::machine_of(&req.params) {
         Err(e) => return Some(Response::err(req.id, e.code, e.message)),
+        Ok(Some(machine)) if req.method == "instances.done" => {
+            return Some(remote_done(req.id, req.params, &machine, shared));
+        }
         Ok(Some(machine)) if fwd::is_quick(&req.method) => {
             return Some(forward(req.id, &req.method, req.params, &machine, shared));
         }
@@ -2368,6 +2371,7 @@ fn forward(id: Option<u64>, method: &str, params: Value, machine: &str, shared: 
 fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Option<Response> {
     match fwd::machine_of(&params) {
         Err(e) => return Some(Response::err(id, e.code, e.message)),
+        Ok(Some(machine)) if method == "rm" => return remote_rm(id, params, &machine, shared, conn),
         Ok(Some(machine)) => {
             let peer = ConnPeer { out: &conn.out, shared };
             return remote_verb(id, method, params, &machine, shared, conn, &peer);
@@ -2451,6 +2455,107 @@ fn remote_verb(
     let label = conn.label();
     let vctx = fwd::VerbCtx { links, held: &shared.remote_verbs, who: &label, log };
     fwd::verb(id, method, params, machine, &vctx, peer)
+}
+
+/// `rm` with `machine` (fleet plan decision 77; docs/architecture/daemon/fleet.md,
+/// *Fetch-back*): an instance this host placed there is fetched back first
+/// ([`fetch_placement`], its lines in the rm's output), and one that can't
+/// be refuses the `rm`, nothing forwarded; `force` skips it (a line says
+/// so). Every attempt fetches, the `ask` round's too (an `ask` that needs
+/// no question removes): a second one brings nothing new. The fetch runs
+/// on this connection's thread before the forward, so a hang-up meanwhile
+/// is seen once the forward starts. Once the forwarded `rm` is answered
+/// `ok`, the placement leaves `placements.json`. Any other instance's `rm`
+/// is [`remote_verb`]'s as is.
+fn remote_rm(id: Option<u64>, params: Value, machine: &str, shared: &Shared, conn: &ConnState) -> Option<Response> {
+    use fleet::code::fetch::{self, Before};
+    use fleet::placements;
+    let peer = ConnPeer { out: &conn.out, shared };
+    let say = |line: &str| {
+        let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
+    };
+    let instance = params.get("instance").and_then(Value::as_str).unwrap_or_default().to_string();
+    let name = format!("{machine}/{instance}");
+    let placement = placement_of(shared, machine, &instance);
+    let refuse = |why: &str| {
+        log(&format!("{}: rm {name}: refused: {why}", conn.label()));
+        let message = format!(
+            "cannot fetch {name} back, so it isn't removed: {why} (`devsandbox fetch {name}` retries; `rm --force` removes it without)"
+        );
+        Some(Some(Response::err_with(id, "failed", message, Some(json!({ "exit": null, "instance": null })))))
+    };
+    let refused = match (fetch::before("rm", &params, !matches!(placement, Ok(None))), &placement) {
+        (Before::Required, Ok(Some(entry))) => match fetch_placement(shared, entry) {
+            Ok(got) => {
+                crate::commands::fetch::lines(&got).iter().for_each(|l| say(l));
+                None
+            }
+            Err(e) => refuse(&format!("{e:#}")),
+        },
+        (Before::Required, Err(why)) => refuse(why),
+        (Before::Skipped, _) => {
+            say(&format!("not fetching {name} back (--force)"));
+            None
+        }
+        _ => None,
+    };
+    if let Some(answer) = refused {
+        return answer;
+    }
+    let answer = remote_verb(id, "rm", params, machine, shared, conn, &peer);
+    if let (Some(r), Ok(Some(_))) = (&answer, &placement)
+        && r.error.is_none()
+    {
+        let path = placements::path_next_to(&shared.state);
+        if let Err(e) = placements::update(&path, |all| placements::remove(all, machine, &instance)) {
+            log(&format!("rm: cannot drop the placement of {name} from {}: {e:#}", path.display()));
+        }
+    }
+    answer
+}
+
+/// `instances.done` with `machine` (fleet plan decision 77): a `done` of an
+/// instance this host placed there is fetched back first, best effort (a
+/// failure logged and the answer's `warning`, the flag set either way);
+/// then [`forward`]ed as any quick call.
+fn remote_done(id: Option<u64>, params: Value, machine: &str, shared: &Shared) -> Response {
+    use fleet::code::fetch::{self, Before};
+    let instance = params.get("instance").and_then(Value::as_str).unwrap_or_default().to_string();
+    let placement = placement_of(shared, machine, &instance);
+    let warning = match (fetch::before("instances.done", &params, !matches!(placement, Ok(None))), placement) {
+        (Before::BestEffort, Ok(Some(entry))) => fetch_placement(shared, &entry).err().map(|e| format!("{e:#}")),
+        (Before::BestEffort, Err(why)) => Some(why),
+        _ => None,
+    };
+    let mut r = forward(id, "instances.done", params, machine, shared);
+    if let (Some(why), Some(Value::Object(result))) = (warning, r.result.as_mut()) {
+        result.insert("warning".into(), json!(format!("cannot fetch {machine}/{instance} back: {why}")));
+    }
+    r
+}
+
+/// The `placements.json` entry of `machine/instance`, if this host placed
+/// it; why that isn't known (a file that doesn't load).
+fn placement_of(shared: &Shared, machine: &str, instance: &str) -> std::result::Result<Option<fleet::placements::Entry>, String> {
+    use fleet::placements;
+    let entries = placements::load(&placements::path_next_to(&shared.state)).map_err(|e| format!("{e:#}"))?;
+    Ok(placements::find(&entries, Some(machine), instance).ok().cloned())
+}
+
+/// Fetch `entry`'s instance back over its worker's link or a route
+/// (`fleet::code::fetch::fetch_back`: `instances.fetch` there, the pull,
+/// the hidden refs here), logged either way: `placements.fetch`'s, and a
+/// placed instance's `rm` and `done` typed here ([`remote_rm`],
+/// [`remote_done`]).
+fn fetch_placement(shared: &Shared, entry: &fleet::placements::Entry) -> anyhow::Result<fleet::code::fetch::FetchedBack> {
+    use fleet::code::{LinkTransfer, fetch};
+    let t = LinkTransfer::for_worker(&shared.socket_dir, &entry.machine);
+    let got = fetch::fetch_back(entry, |haves| t.fetch_instance(&entry.instance, haves), &t);
+    match &got {
+        Ok(got) => log(&format!("fetch {}/{}: {} bytes into {}", entry.machine, entry.instance, got.fetched, got.folder.display())),
+        Err(e) => log(&format!("fetch {}/{}: {e:#}", entry.machine, entry.instance)),
+    }
+    got
 }
 
 /// `run --place` without `machine`, placed (docs/architecture/daemon/fleet.md,
@@ -2620,7 +2725,7 @@ fn record_placement(shared: &Shared, r: &Response, machine: &str, sandbox: &str,
 /// (`fleet::code::fetch::fetch_back`: `instances.fetch` there, the pull,
 /// the hidden refs here); `failed` with why it didn't.
 fn placements_fetch(params: &Value, shared: &Shared) -> std::result::Result<Value, api::ApiError> {
-    use fleet::code::{LinkTransfer, fetch};
+    use fleet::code::fetch;
     use fleet::placements;
     let instance = params
         .get("instance")
@@ -2629,12 +2734,8 @@ fn placements_fetch(params: &Value, shared: &Shared) -> std::result::Result<Valu
     let machine = fwd::machine_of(params)?;
     let entries = placements::load(&placements::path_next_to(&shared.state)).map_err(api::ApiError::internal)?;
     let entry = placements::find(&entries, machine.as_deref(), instance).map_err(api::ApiError::not_found)?.clone();
-    let t = LinkTransfer::for_worker(&shared.socket_dir, &entry.machine);
-    let got = fetch::fetch_back(&entry, |haves| t.fetch_instance(&entry.instance, haves), &t).map_err(|e| {
-        log(&format!("fetch {}/{}: {e:#}", entry.machine, entry.instance));
-        api::ApiError::failed(format!("cannot fetch {}/{} back: {e:#}", entry.machine, entry.instance))
-    })?;
-    log(&format!("fetch {}/{}: {} bytes into {}", entry.machine, entry.instance, got.fetched, got.folder.display()));
+    let got = fetch_placement(shared, &entry)
+        .map_err(|e| api::ApiError::failed(format!("cannot fetch {}/{} back: {e:#}", entry.machine, entry.instance)))?;
     serde_json::to_value(got).map_err(|e| api::ApiError::internal(e.into()))
 }
 

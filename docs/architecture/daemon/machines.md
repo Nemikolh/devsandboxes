@@ -392,7 +392,11 @@ has it stripped and goes to that machine, but for the ones served here:
   (`<machine>: unreachable: …`; during the carrier's first attempt they
   wait for it). A routed machine's go over a stream of their own each
   ([Routed machines](#routed-machines)). The remote's answer, error code
-  and data included, is the answer.
+  and data included, is the answer. A `done` (`instances.done` with
+  `done: true`) of an instance this host placed there is fetched back
+  first, best effort, a failure the answer's `warning`
+  ([fleet](fleet.md#moving-code), *Fetch-back*: `serve::daemon`'s
+  `remote_done`).
 - **Verbs** get a fresh `API` stream per request (`Handle::dial`: the
   link's `Dial`, a routed machine's `RouteDial`), so a build
   never holds up the link. The requester's `SSH_AUTH_SOCK` (an absolute
@@ -404,6 +408,10 @@ has it stripped and goes to that machine, but for the ones served here:
   `request` rewritten to the local id. While its stream is open it's a
   `verbs` holder here. A hang-up, or a local drain, closes the stream,
   which the remote sees as a hang-up: cancelled there unless `detach`.
+  An `rm` of an instance this host placed there is fetched back first,
+  or refused unforwarded when that fails; `force` skips it
+  ([fleet](fleet.md#moving-code), *Fetch-back*: `serve::daemon`'s
+  `remote_rm`).
 - **Federated** `instances.resolve` / `sandboxes.list` with `machines:
   true` ask this host and every machine (routed ones too, at their roots
   as the hub's view has them) in parallel, each machine given
@@ -597,7 +605,8 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   record gone meanwhile ends it, as locally; `inspect [--json]` is
   `containers.inspect` (without the local one's browser sandbox line: that
   comes from this host's record); `done` / `undone` are `instances.done`,
-  worded from the row's `done` before; `rename` is `instances.rename`.
+  worded from the row's `done` before, the answer's `warning` (a placed
+  instance's failed fetch-back) on stderr first; `rename` is `instances.rename`.
   `--machine m ls [--json]` and `status --json` take each registered root
   for the config roots it stands for (`calls::config_roots`: itself, and
   the config roots under it its listing's instance rows name; a root

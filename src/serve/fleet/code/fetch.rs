@@ -84,6 +84,33 @@ pub struct FetchedBack {
     pub fetched: u64,
 }
 
+/// What a request with `machine`, typed on this host, does about fetch-back
+/// before it's forwarded (fleet plan decision 77).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Before {
+    /// Not a placement of this host's, or not a request that fetches back.
+    Nothing,
+    /// `rm`: fetched back first; one that fails refuses the `rm`.
+    Required,
+    /// `rm --force` (which already discards uncommitted work): none.
+    Skipped,
+    /// `done` (not `undone`): fetched back first, a failure a warning.
+    BestEffort,
+}
+
+/// [`Before`] for `method` with `params` (its `force` or `done`) when the
+/// instance it names is one this host placed (`placed`).
+pub fn before(method: &str, params: &Value, placed: bool) -> Before {
+    let flag = |k: &str| params.get(k).and_then(Value::as_bool);
+    match method {
+        _ if !placed => Before::Nothing,
+        "rm" if flag("force") == Some(true) => Before::Skipped,
+        "rm" => Before::Required,
+        "instances.done" if flag("done") == Some(true) => Before::BestEffort,
+        _ => Before::Nothing,
+    }
+}
+
 /// The instance `name` names in `state`: a state key, else an
 /// `instance_id` (one backfilled to its key when empty).
 pub fn find_instance<'a>(state: &'a State, name: &str) -> Option<(&'a String, &'a Instance)> {
@@ -465,6 +492,19 @@ mod tests {
         }
         assert!(fleet.join("secret.bundle").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_fetches_back_first_unless_forced_and_done_best_effort() {
+        assert_eq!(before("rm", &json!({"instance": "web-2"}), true), Before::Required);
+        assert_eq!(before("rm", &json!({"instance": "web-2", "force": false, "ask": true}), true), Before::Required);
+        assert_eq!(before("rm", &json!({"instance": "web-2", "force": true}), true), Before::Skipped);
+        assert_eq!(before("rm", &json!({"instance": "web-2"}), false), Before::Nothing, "not placed from here");
+        assert_eq!(before("rm", &json!({"instance": "web-2", "force": true}), false), Before::Nothing);
+        assert_eq!(before("instances.done", &json!({"instance": "web-2", "done": true}), true), Before::BestEffort);
+        assert_eq!(before("instances.done", &json!({"instance": "web-2", "done": false}), true), Before::Nothing, "undone");
+        assert_eq!(before("instances.done", &json!({"instance": "web-2", "done": true}), false), Before::Nothing);
+        assert_eq!(before("stop", &json!({"instance": "web-2"}), true), Before::Nothing);
     }
 
     #[test]
