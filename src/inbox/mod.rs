@@ -1103,10 +1103,16 @@ pub enum SinkAction {
 pub fn decide(instance: &str, declares_inbox: bool, message: Message) -> SinkAction {
     let message = match message {
         Message::Notify(record) => return SinkAction::Push(record),
+        // The bridge's sink hands opens to the opener before this; one that
+        // got here anyway is refused, not stored as a thread op.
+        Message::Open { at, url } => {
+            let msg = format!("open {url} refused: opens go to the opener, not the Inbox");
+            return SinkAction::Push(Record { level: Level::Error, key: None, link: None, msg, at });
+        }
         thread_op => thread_op,
     };
     let verb = match &message {
-        Message::Notify(_) => unreachable!("returned above"),
+        Message::Notify(_) | Message::Open { .. } => unreachable!("returned above"),
         Message::ThreadPut { .. } => "put",
         Message::ThreadRm { .. } => "rm",
         Message::ThreadSend { .. } => "send",
@@ -1119,7 +1125,7 @@ pub fn decide(instance: &str, declares_inbox: bool, message: Message) -> SinkAct
     }
     let rejected = |why: &str| refused(at, &key, &format!("thread {verb} rejected: {why}"));
     match message {
-        Message::Notify(_) => unreachable!("returned above"),
+        Message::Notify(_) | Message::Open { .. } => unreachable!("returned above"),
         Message::ThreadRm { key, .. } => SinkAction::Rm { key },
         Message::ThreadWithdraw { key, id, .. } => SinkAction::Withdraw { thread: key, id },
         Message::ThreadPut { body, .. } => match thread::parse(&body) {
@@ -1681,6 +1687,13 @@ mod tests {
         // A plain notify never needs `inbox = true`.
         let note = rec("hi", None, None);
         assert_eq!(decide("web", false, Message::Notify(note.clone())), SinkAction::Push(note));
+        // An open is the opener's: refused as an error record, never a thread op.
+        let open = Message::Open { at: 9, url: "https://x".into() };
+        for declares in [false, true] {
+            let SinkAction::Push(r) = decide("web", declares, open.clone()) else { panic!("not refused") };
+            assert_eq!((r.level, r.at), (Level::Error, 9));
+            assert!(r.msg.contains("open https://x refused"), "{}", r.msg);
+        }
     }
 
     #[test]

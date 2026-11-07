@@ -9,13 +9,14 @@
 //!
 //! ```text
 //! kind thread-put          optional, at most once: thread-put|thread-rm|
-//!                          thread-send|thread-withdraw. Absent = a plain
-//!                          notify record, which is why old helpers' records
-//!                          still decode byte for byte.
+//!                          thread-send|thread-withdraw|open. Absent = a
+//!                          plain notify record, which is why old helpers'
+//!                          records still decode byte for byte.
 //! at 1790000000            required, once: unix seconds when queued
 //! level warn               notify only, required: info|warn|error
 //! key pr-123               notify: optional dedupe key; thread-*: required
-//!                          (send/withdraw: the thread the message is in)
+//!                          (send/withdraw: the thread the message is in);
+//!                          open: not allowed
 //! id run-1791277117        thread-send|thread-withdraw only, required: the
 //!                          message id
 //! link https://…           notify only, optional
@@ -24,6 +25,8 @@
 //!                          body. The helper only syntax-checks it
 //!                          (docs/decisions/0022-helper-has-no-dependencies.md); the host
 //!                          owns the schema.
+//! url https://…            open only, required: the URL to open on the host
+//!                          (the host checks the scheme, see `src/open.rs`)
 //! ```
 //!
 //! A thread record repeats the `key` (and a message's `id`) the helper pulled
@@ -106,6 +109,9 @@ pub enum Message {
     ThreadSend { at: u64, key: String, id: String, body: String },
     /// `devsbd thread withdraw <key> <id>`.
     ThreadWithdraw { at: u64, key: String, id: String },
+    /// A URL the container asked to open (`xdg-open`); the host's sink hands
+    /// it to the opener, never to the Inbox.
+    Open { at: u64, url: String },
 }
 
 impl Message {
@@ -116,7 +122,8 @@ impl Message {
             Message::ThreadPut { at, .. }
             | Message::ThreadRm { at, .. }
             | Message::ThreadSend { at, .. }
-            | Message::ThreadWithdraw { at, .. } => *at,
+            | Message::ThreadWithdraw { at, .. }
+            | Message::Open { at, .. } => *at,
         }
     }
 
@@ -129,6 +136,7 @@ impl Message {
             | Message::ThreadRm { key, .. }
             | Message::ThreadSend { key, .. }
             | Message::ThreadWithdraw { key, .. } => Some(key),
+            Message::Open { .. } => None,
         }
     }
 
@@ -144,7 +152,8 @@ impl Message {
     ///
     /// A put never replaces a queued rm: rm then put is a fresh thread with an
     /// empty feed, not the old one re-headed. Plain notify records are a log
-    /// and are never dropped, even with the same key.
+    /// and are never dropped, even with the same key. Opens are never
+    /// coalesced either: two opens are two tabs.
     pub fn supersedes(&self, older: &Message) -> bool {
         use Message::*;
         match (self, older) {
@@ -173,10 +182,11 @@ enum Kind {
     ThreadRm,
     ThreadSend,
     ThreadWithdraw,
+    Open,
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [Kind::ThreadPut, Kind::ThreadRm, Kind::ThreadSend, Kind::ThreadWithdraw];
+    const ALL: [Kind; 5] = [Kind::ThreadPut, Kind::ThreadRm, Kind::ThreadSend, Kind::ThreadWithdraw, Kind::Open];
 
     fn as_str(self) -> &'static str {
         match self {
@@ -184,6 +194,7 @@ impl Kind {
             Kind::ThreadRm => "thread-rm",
             Kind::ThreadSend => "thread-send",
             Kind::ThreadWithdraw => "thread-withdraw",
+            Kind::Open => "open",
         }
     }
 
@@ -242,13 +253,18 @@ pub fn encode(m: &Message) -> String {
             line("key", key);
             line("id", id);
         }
+        Message::Open { at, url } => {
+            line("kind", Kind::Open.as_str());
+            line("at", &at.to_string());
+            line("url", url);
+        }
     }
     out
 }
 
 pub fn decode(text: &str) -> Result<Message, String> {
     let (mut kind, mut level, mut at) = (None, None, None);
-    let (mut key, mut link, mut msg, mut body, mut id) = (None, None, None, None, None);
+    let (mut key, mut link, mut msg, mut body, mut id, mut url) = (None, None, None, None, None, None);
     for (n, line) in text.split('\n').enumerate() {
         if line.is_empty() {
             continue;
@@ -279,12 +295,13 @@ pub fn decode(text: &str) -> Result<Message, String> {
                     return Err(repeated());
                 }
             }
-            "key" | "link" | "msg" | "body" | "id" => {
+            "key" | "link" | "msg" | "body" | "id" | "url" => {
                 let slot = match name {
                     "key" => &mut key,
                     "link" => &mut link,
                     "msg" => &mut msg,
                     "id" => &mut id,
+                    "url" => &mut url,
                     _ => &mut body,
                 };
                 if slot.replace(value).is_some() {
@@ -303,6 +320,9 @@ pub fn decode(text: &str) -> Result<Message, String> {
         if id.is_some() {
             return Err("`id` needs `kind thread-send|thread-withdraw`".into());
         }
+        if url.is_some() {
+            return Err("`url` needs `kind open`".into());
+        }
         return Ok(Message::Notify(Record {
             level: level.ok_or_else(|| missing("level"))?,
             at,
@@ -318,10 +338,19 @@ pub fn decode(text: &str) -> Result<Message, String> {
             return Err(format!("`{name}` is not allowed on a `{}` record", kind.as_str()));
         }
     }
-    for (name, present, allowed) in [("body", body.is_some(), kind.has_body()), ("id", id.is_some(), kind.has_id())] {
+    let is_open = kind == Kind::Open;
+    for (name, present, allowed) in [
+        ("body", body.is_some(), kind.has_body()),
+        ("id", id.is_some(), kind.has_id()),
+        ("key", key.is_some(), !is_open),
+        ("url", url.is_some(), is_open),
+    ] {
         if present && !allowed {
             return Err(format!("`{name}` is not allowed on a `{}` record", kind.as_str()));
         }
+    }
+    if is_open {
+        return Ok(Message::Open { at, url: url.ok_or_else(|| missing("url"))? });
     }
     let key = key.ok_or_else(|| missing("key"))?;
     let body = || body.ok_or_else(|| missing("body"));
@@ -334,6 +363,7 @@ pub fn decode(text: &str) -> Result<Message, String> {
             Message::ThreadSend { at, key, id, body: body()? }
         }
         Kind::ThreadWithdraw => Message::ThreadWithdraw { at, key, id: id()? },
+        Kind::Open => unreachable!("returned above"),
     })
 }
 
@@ -432,6 +462,40 @@ body {\"thread\":\"pr-123\",\"id\":\"run-1\",\"blocks\":[]}\n";
         assert_eq!(decode(WITHDRAW_FIXTURE), Ok(withdraw("pr-123", "run-1")));
         assert_eq!((send("pr-123", "a").at(), send("pr-123", "a").key()), (1_790_000_000, Some("pr-123")));
         assert_eq!(withdraw("pr-9", "a").key(), Some("pr-9"));
+    }
+
+    /// Checked from both crates, like the others: the shim queues it, the
+    /// host's sink decodes it.
+    const OPEN_FIXTURE: &str = "kind open\nat 1790000000\nurl https://example.com/a?b=c d\\n\n";
+
+    fn open(url: &str) -> Message {
+        Message::Open { at: 1_790_000_000, url: url.into() }
+    }
+
+    #[test]
+    fn open_fixture_round_trips() {
+        let o = open("https://example.com/a?b=c d\n");
+        assert_eq!(encode(&o), OPEN_FIXTURE);
+        assert_eq!(decode(OPEN_FIXTURE), Ok(o.clone()));
+        assert_eq!((o.at(), o.key()), (1_790_000_000, None));
+        // Two opens are two tabs, even of the same URL; nothing else drops one.
+        assert!(!o.supersedes(&o));
+        assert!(!Message::ThreadRm { at: 1, key: "t".into() }.supersedes(&o));
+        assert!(!o.supersedes(&fixture()));
+    }
+
+    #[test]
+    fn rejects_malformed_open_records() {
+        assert!(decode("kind open\nat 1\n").unwrap_err().contains("missing `url`"));
+        assert!(decode("kind open\nurl https://x\n").unwrap_err().contains("missing `at`"));
+        for bad in ["level info", "link https://x", "msg hi", "key k", "id a", "body {}"] {
+            let err = decode(&format!("{OPEN_FIXTURE}{bad}\n")).unwrap_err();
+            assert!(err.contains("is not allowed on a `open` record"), "{bad}: {err}");
+        }
+        assert!(decode(&format!("{OPEN_FIXTURE}url https://y\n")).unwrap_err().contains("repeated `url`"));
+        assert!(decode("level info\nat 1\nmsg hi\nurl https://x\n").unwrap_err().contains("`url` needs"));
+        let err = decode("kind thread-rm\nat 1\nkey k\nurl https://x\n").unwrap_err();
+        assert!(err.contains("`url` is not allowed on a `thread-rm` record"), "{err}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Open routing: a container's `xdg-open` opens on the user's desktop
 
-Status: planned, step 1 broken into 1a-1c (below), next.
+Status: step 1 in progress (1a landed), broken into 1a-1c (below).
 
 ## Problem
 
@@ -195,10 +195,11 @@ open = ["firefox"]
   local → open here if this host has a display; otherwise refused and
   logged (`no attached client to open <url> on`).
 - **Display**: a Linux host has one when the daemon's env has `DISPLAY` or
-  `WAYLAND_DISPLAY`. The systemd unit (`serve::install`) must carry the
-  session's display env: check what `import-environment` gives it on
-  GNOME/KDE, and if needed add a `PassEnvironment` line or document a
-  one-time `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY`.
+  `WAYLAND_DISPLAY`, else when the user manager's current env does
+  (`systemctl --user show-environment`, read at open time, passed to the
+  opener with `XAUTHORITY`). The unit's own env can't carry it: it starts
+  with `default.target`, before GNOME/Plasma import their display, and
+  `PassEnvironment` does nothing for a user unit (decided in 1a).
 - **Over the fleet**: a new `open.deliver {instance, root, url, profile}`
   fleet call to that member, which maps `profile` with its own
   `profiles.toml`.
@@ -282,9 +283,8 @@ new kind can't reach a host that doesn't handle it.
     passed in (`RateLimit::new`; notify keeps 3 per 10 s, open gets 5
     per 10 s) instead of a second bucket.
   - Display: on Linux, no `DISPLAY` / `WAYLAND_DISPLAY` in the daemon's
-    env refuses with `no display to open <url> on`. Check what
-    `serve::install`'s systemd unit gets on GNOME/KDE, add a
-    `PassEnvironment` line or document the `import-environment` step.
+    env nor the user manager's refuses with `no display to open <url> on`
+    (see *Delivery*, Display).
   - Every refusal and drop is a `serve.log` line with the instance and
     URL.
   - The spawn is injectable (an `Opener` fn next to the sink, like

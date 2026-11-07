@@ -165,7 +165,10 @@ absolute, symlink-resolved path with `serve --keep-alive --socket-dir
 at install time: `PATH`, `DEVSANDBOX_RUNTIME`, `DOCKER_HOST`,
 `DOCKER_CONTEXT`, `CONTAINER_HOST`, `XDG_DATA_HOME`, `XDG_STATE_HOME`. Not
 `SSH_AUTH_SOCK` (clients report theirs via `bridges.ensure`), not
-`DISPLAY`.
+`DISPLAY`: the unit starts with `default.target`, before a desktop session
+imports its display into the user manager, so the URL opener reads the
+manager's env when it opens (`open::open_on_desktop`,
+[bridges.md](../helper/bridges.md#opening-urls-kind-open)).
 
 `install`: write the unit; if a daemon answers, send it `shutdown` and wait
 up to `STOP_WAIT` (10 s); the manager calls; wait up to `START_WAIT` (5 s)

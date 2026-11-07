@@ -114,7 +114,9 @@ daemon treats like any non-`ok`: keep the file, retry later), and hands a `Notif
 the sink. Only after the sink succeeds does it reply `ok`, so delivery is
 durable: a host that dies between the two leaves the record in the outbox.
 
-The sink (`apply_message`) applies the record to the shared Inbox store
+The sink (`bridge::sink`, built by `Bridges::spawn_worker` from its
+`SinkHooks`) takes an `open` record first (see below); `apply_message` applies
+any other record to the shared Inbox store
 (`inbox::decide` → `inbox::ops::sink`); thread records are first checked with
 `dispatch::declares_inbox` (the sandbox must declare `inbox = true`). A store
 write that changed nothing shows nothing. Otherwise:
@@ -125,6 +127,39 @@ write that changed nothing shows nothing. Otherwise:
   for 60 s);
 - the status line `<instance>: <msg>` to `OnShown`, which the daemon
   publishes as `inbox.shown`.
+
+### Opening URLs (`kind open`)
+
+An `open` record (`notify::Message::Open`, a URL a container asked to open)
+never reaches the Inbox: `apply_message` and `inbox::decide` refuse one. The
+sink checks it with `open::decide`, pure over the URL, the record's `at`, the
+host's clock and a limiter:
+
+- scheme `http` or `https` followed by `://`; anything else is refused;
+- `open::OPEN_TTL` (30 s from `at`): the outbox keeps records while no host
+  is attached, and an OAuth URL opening much later is worse than none, so an
+  older one is dropped;
+- a per-instance `desktop::RateLimit` of its own (`RateLimit::new` with
+  `OPEN_RATE_BURST` 5 and one token per `OPEN_RATE_REFILL` 10 s), spent only
+  by a record that passed the other two.
+
+A refused or dropped record is a `serve.log` line naming the instance and the
+URL (`Verdict::log_line`, through `SinkHooks::log`). One that passes goes to
+the `SinkHooks::opener` (`bridge::Opener`, injectable so tests see the URL).
+Either way the sink returns `Ok` and the daemon gets `ok`: taken, not opened.
+
+The production opener, `open::open_on_desktop`, runs on its own thread: it
+finds a display, spawns `open::opener_argv` (`xdg-open <url>` on Linux,
+`open <url>` on macOS) with stdio null and reaps it. On Linux the display is
+`DISPLAY` or `WAYLAND_DISPLAY` in the daemon's env, else in the user
+manager's current env (`systemctl --user show-environment`,
+`open::session_display_env`, with `XAUTHORITY`), passed to the child: GNOME
+and Plasma import their display there at login, but a `serve install`ed
+daemon starts with `default.target`, before they do, so its own env has none.
+A session that doesn't import it needs `systemctl --user import-environment
+DISPLAY WAYLAND_DISPLAY XAUTHORITY` once per login. No display anywhere,
+no known opener or a failed spawn is a `serve.log` line too (`no display to
+open <url> on`).
 
 ### Control requests (`CONTROL`)
 

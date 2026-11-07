@@ -83,7 +83,8 @@ pub fn notify_desktop(instance: &str, popup: &ShownPopup) {
     }
 }
 
-/// Popups one instance may show back to back before [`RATE_REFILL`] applies.
+/// Popups one instance may show back to back before [`RATE_REFILL`] applies
+/// ([`RateLimit::default`]'s burst).
 const RATE_BURST: u32 = 3;
 
 /// One more popup per instance is allowed every this long.
@@ -94,18 +95,34 @@ const RATE_REFILL: Duration = Duration::from_secs(10);
 const COALESCE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Which notifications become desktop popups: a token bucket per instance
-/// ([`RATE_BURST`], refilled one per [`RATE_REFILL`]) plus coalescing of
-/// repeated keys, so a container can't flood the desktop. The clock is passed
-/// in, so it's testable; only popups are limited, never inbox delivery.
-#[derive(Default)]
+/// (`burst` tokens, refilled one per `refill`; [`RATE_BURST`] and
+/// [`RATE_REFILL`] by default) plus coalescing of repeated keys, so a
+/// container can't flood the desktop. The clock is passed in, so it's
+/// testable; only popups are limited, never inbox delivery. The bridge's sink
+/// keeps a second one, with its own burst, for opened URLs (`crate::open`).
 pub struct RateLimit {
+    burst: u32,
+    refill: Duration,
     // instance → (tokens left, when the last token was credited).
     buckets: HashMap<String, (u32, Instant)>,
     // (instance, key) → when it last popped.
     shown: HashMap<(String, String), Instant>,
 }
 
+/// The notification popups' limit: [`RATE_BURST`] per [`RATE_REFILL`].
+impl Default for RateLimit {
+    fn default() -> Self {
+        RateLimit::new(RATE_BURST, RATE_REFILL)
+    }
+}
+
 impl RateLimit {
+    /// A limiter allowing `burst` back to back per instance, then one more
+    /// every `refill`.
+    pub fn new(burst: u32, refill: Duration) -> Self {
+        RateLimit { burst, refill, buckets: HashMap::new(), shown: HashMap::new() }
+    }
+
     /// Whether a popup from `instance` with dedupe key `key` may show at
     /// `now`; a `true` consumes a token. Takes the two things it needs rather
     /// than a record, so thread popups go through the same bucket.
@@ -115,11 +132,12 @@ impl RateLimit {
         if key.as_ref().is_some_and(|k| self.shown.contains_key(k)) {
             return false;
         }
-        let (tokens, since) = self.buckets.entry(instance.to_string()).or_insert((RATE_BURST, now));
-        let earned = (now.saturating_duration_since(*since).as_nanos() / RATE_REFILL.as_nanos()) as u32;
+        let (burst, refill) = (self.burst, self.refill);
+        let (tokens, since) = self.buckets.entry(instance.to_string()).or_insert((burst, now));
+        let earned = (now.saturating_duration_since(*since).as_nanos() / refill.as_nanos()) as u32;
         if earned > 0 {
-            *tokens = (*tokens).saturating_add(earned).min(RATE_BURST);
-            *since += RATE_REFILL * earned;
+            *tokens = (*tokens).saturating_add(earned).min(burst);
+            *since += refill * earned;
         }
         if *tokens == 0 {
             return false;

@@ -1187,7 +1187,9 @@ impl Bridges {
     /// `Bridge` (killing its `exec`) before returning.
     ///
     /// `sink` set → every helper-capable running instance gets a notify-serving
-    /// bridge; each message is applied to the shared Inbox store first (that
+    /// bridge (see [`sink`] for what it does with each message). An `open`
+    /// record goes to the hooks' [`Opener`], never the Inbox; any other
+    /// message is applied to the shared Inbox store first (that
     /// write is what the daemon's `ok` acknowledges, so a failed one is
     /// retried), then shown on the desktop (from the stream's handler thread)
     /// unless [`RateLimit`](super::desktop::RateLimit) holds it back, and
@@ -1196,28 +1198,8 @@ impl Bridges {
     /// dispatcher re-asserting its threads is invisible.
     /// `board` gets every bridge's status and, after each reconcile, the
     /// newest ticket it covered (the `urgent` pairs' second half).
-    pub fn spawn_worker(sink: Option<Option<OnShown>>, board: BridgeBoard) -> BridgeWorker {
-        let sink = sink.map(|on_shown| -> Sink {
-            // One limiter for every bridge, keyed by instance inside.
-            let limit = Mutex::new(super::desktop::RateLimit::default());
-            Arc::new(move |n: Notification| {
-                let shown = apply_message(n)?;
-                let Some((instance, shown)) = shown else { return Ok(()) };
-                if let Some(popup) = shown.popup {
-                    let allowed = limit
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .allow(&instance, popup.key.as_deref(), Instant::now());
-                    if allowed {
-                        super::desktop::notify_desktop(&instance, &popup);
-                    }
-                }
-                if let Some(on_shown) = &on_shown {
-                    on_shown(&instance, shown.line);
-                }
-                Ok(())
-            })
-        });
+    pub fn spawn_worker(sink: Option<SinkHooks>, board: BridgeBoard) -> BridgeWorker {
+        let sink = sink.map(|hooks| self::sink(apply_message, hooks));
         let (tx, rx) = mpsc::channel::<(Vec<String>, Vec<(String, u64)>)>();
         let handle = std::thread::spawn(move || {
             let mut bridges = Bridges { sink, board, ..Bridges::default() };
@@ -1247,14 +1229,88 @@ impl Bridges {
 /// showed (see [`Bridges::spawn_worker`]). Runs on a bridge's handler thread.
 pub type OnShown = Box<dyn Fn(&str, String) + Send + Sync>;
 
+/// Opens `(instance, url)` for an `open` record that passed
+/// [`crate::open::decide`]. Runs on a bridge's handler thread before the
+/// daemon's `ok`, so it must not wait on the browser: the production one is
+/// [`crate::open::open_on_desktop`] (spawn, reap on its own thread).
+/// Injectable so tests see the URL instead of a browser opening.
+pub type Opener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// What a notify-serving [`Bridges`] does besides storing messages.
+pub struct SinkHooks {
+    /// See [`OnShown`]; `None` = nobody to tell.
+    pub on_shown: Option<OnShown>,
+    pub opener: Opener,
+    /// One `serve.log` line: every refused or dropped `open` record.
+    pub log: fn(&str),
+}
+
+/// [`apply_message`], injectable so a test can tell an `open` record never
+/// reaches the Inbox store.
+type Apply = fn(Notification) -> Result<Option<(String, crate::inbox::Shown)>, String>;
+
+/// The notify sink every bridge of one [`Bridges`] shares.
+///
+/// An `open` record is taken before `apply`: [`crate::open::decide`] (scheme,
+/// [`crate::open::OPEN_TTL`], one per-instance limiter of
+/// [`crate::open::OPEN_RATE_BURST`] per [`crate::open::OPEN_RATE_REFILL`]),
+/// then the opener or a `log` line, and `Ok` either way: the `ok` reply means
+/// taken, not opened, and a refused URL isn't worth a resend.
+///
+/// Anything else is `apply`'d (that store write is what the daemon's `ok`
+/// acknowledges, so a failed one is retried), shown on the desktop unless
+/// the popup [`RateLimit`](super::desktop::RateLimit) holds it back, and its
+/// status line goes to `on_shown`.
+fn sink(apply: Apply, hooks: SinkHooks) -> Sink {
+    use super::desktop::RateLimit;
+    let SinkHooks { on_shown, opener, log } = hooks;
+    // One limiter of each for every bridge, keyed by instance inside.
+    let popups = Mutex::new(RateLimit::default());
+    let opens = Mutex::new(RateLimit::new(crate::open::OPEN_RATE_BURST, crate::open::OPEN_RATE_REFILL));
+    Arc::new(move |n: Notification| {
+        if let notify::Message::Open { at, url } = &n.message {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let limit =
+                || opens.lock().unwrap_or_else(|e| e.into_inner()).allow(&n.instance, None, Instant::now());
+            match crate::open::decide(url, *at, now, limit).log_line(&n.instance, url) {
+                Some(line) => log(&line),
+                None => opener(&n.instance, url),
+            }
+            return Ok(());
+        }
+        let shown = apply(n)?;
+        let Some((instance, shown)) = shown else { return Ok(()) };
+        if let Some(popup) = shown.popup {
+            let allowed = popups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .allow(&instance, popup.key.as_deref(), Instant::now());
+            if allowed {
+                super::desktop::notify_desktop(&instance, &popup);
+            }
+        }
+        if let Some(on_shown) = &on_shown {
+            on_shown(&instance, shown.line);
+        }
+        Ok(())
+    })
+}
+
 /// Store one delivered message and report what to show, if anything. Split
 /// out of the sink closure so the store write (the thing the daemon's `ok`
 /// acknowledges) and the display decision are one read-modify-write.
 ///
 /// Authorization is only evaluated for thread messages: `declares_inbox`
 /// loads `state.toml` and the config, which a plain notify must not pay for.
+/// An `open` record never gets here ([`sink`] takes it first); one that did
+/// is refused rather than stored.
 fn apply_message(n: Notification) -> Result<Option<(String, crate::inbox::Shown)>, String> {
     use crate::commands::dispatch;
+    if matches!(n.message, notify::Message::Open { .. }) {
+        return Err("an `open` record is the opener's, not the Inbox's".into());
+    }
     let threaded = !matches!(n.message, notify::Message::Notify(_));
     let declares = threaded && dispatch::declares_inbox(&n.instance);
     let action = crate::inbox::decide(&n.instance, declares, n.message);
@@ -1671,18 +1727,23 @@ mod tests {
         control: ControlHandler,
         accept: bool,
     ) -> (Arc<Mux>, mpsc::Receiver<Notification>) {
+        let (to, rx) = services_with("web-1", control, accept);
+        (pair_with(to), rx)
+    }
+
+    /// A daemon-side mux and a host bridge serving `to`, joined by pipes.
+    fn pair_with(to: Services) -> Arc<Mux> {
         let (d_r, h_w) = std::io::pipe().unwrap();
         let (h_r, d_w) = std::io::pipe().unwrap();
         let daemon = Mux::new(d_w);
         let host = Mux::new(h_w);
-        let (to, rx) = services_with("web-1", control, accept);
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || d.serve(d_r, |_, _| None));
         std::thread::spawn(move || {
             let none: Option<fn() -> Option<PathBuf>> = None;
             host.serve(h_r, move |_, ch| open_stream(ch, none.as_ref(), Some(&to)))
         });
-        (daemon, rx)
+        daemon
     }
 
     /// What the daemon's `send_record` does: `Open(NOTIFY)`, the bytes as one
@@ -1747,6 +1808,69 @@ mod tests {
         let reply = send_notify(&daemon, 3, &big);
         assert!(reply.is_empty(), "oversized: closed without a reply");
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "nothing delivered");
+    }
+
+    /// The production sink takes an `open` record before the Inbox: a fresh
+    /// `https` one reaches the opener, an `ssh` one and a stale one only the
+    /// log, and each gets `ok` (taken). A plain notify still goes to `apply`.
+    #[test]
+    fn open_records_reach_the_opener_never_the_inbox() {
+        static APPLIED: Mutex<Vec<notify::Message>> = Mutex::new(Vec::new());
+        static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn apply(n: Notification) -> Result<Option<(String, crate::inbox::Shown)>, String> {
+            APPLIED.lock().unwrap().push(n.message);
+            Ok(None)
+        }
+        let (tx, opened) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let hooks = SinkHooks {
+            on_shown: None,
+            opener: Arc::new(move |instance: &str, url: &str| {
+                let _ = tx.lock().unwrap().send((instance.to_string(), url.to_string()));
+            }),
+            log: |line| LOGGED.lock().unwrap().push(line.to_string()),
+        };
+        let to = Services::new("web-1".into(), "web-1-id".into(), sink(apply, hooks), no_control());
+        let daemon = pair_with(to);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let send = |stream: u32, m: notify::Message| {
+            let reply = send_notify(&daemon, stream, notify::encode(&m).as_bytes());
+            assert!(reply.starts_with(notify::REPLY_OK), "reply: {reply:?}");
+        };
+        send(1, notify::Message::Open { at: now, url: "https://example.test/a".into() });
+        assert_eq!(
+            opened.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("web-1".to_string(), "https://example.test/a".to_string())
+        );
+        send(3, notify::Message::Open { at: now, url: "ssh://example.test".into() });
+        send(5, notify::Message::Open { at: now - 3600, url: "https://example.test/old".into() });
+        assert!(opened.recv_timeout(Duration::from_millis(200)).is_err(), "refused ones aren't opened");
+        let logged = LOGGED.lock().unwrap().clone();
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(logged[0].starts_with("web-1: open refused, scheme `ssh`") && logged[0].ends_with("ssh://example.test"));
+        assert!(logged[1].starts_with("web-1: open dropped") && logged[1].ends_with("https://example.test/old"));
+        assert!(APPLIED.lock().unwrap().is_empty(), "no open reached the Inbox");
+        let note = notify::Message::Notify(notify::Record {
+            level: notify::Level::Info,
+            key: None,
+            link: None,
+            msg: "m".into(),
+            at: now,
+        });
+        send(7, note.clone());
+        assert_eq!(*APPLIED.lock().unwrap(), vec![note]);
+    }
+
+    /// `apply_message` refuses an `open` record outright (the sink never
+    /// hands it one), before touching the store.
+    #[test]
+    fn apply_message_refuses_an_open() {
+        let n = Notification {
+            instance: "web-1".into(),
+            instance_id: "web-1-id".into(),
+            message: notify::Message::Open { at: 1, url: "https://x".into() },
+        };
+        assert!(apply_message(n).unwrap_err().contains("opener"));
     }
 
     /// Apply, then ack: a record the sink won't take (the Inbox store failed

@@ -9,6 +9,8 @@ mod features;
 mod inbox;
 mod json_stdout;
 mod key_guard;
+#[cfg(unix)]
+mod open;
 mod render;
 mod runtime;
 #[cfg(unix)]

@@ -44,7 +44,7 @@ use super::capacity::HostCapacity;
 use super::events::{EVENTS_RETRY, EventWatcher};
 use super::capacity::Own;
 use super::snapshots::{self, Join, Snapshots};
-use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness};
+use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness, SinkHooks};
 use crate::runtime::{ContainerRow, NAME_PREFIX};
 use crate::snapshot::RuntimeView;
 use crate::state::State;
@@ -261,7 +261,12 @@ fn poll(
     observers: &Observers,
     board: BridgeBoard,
 ) {
-    let worker = Bridges::spawn_worker(Some(Some(on_shown)), board.clone());
+    let hooks = SinkHooks {
+        on_shown: Some(on_shown),
+        opener: Arc::new(move |instance: &str, url: &str| crate::open::open_on_desktop(instance, url, log)),
+        log,
+    };
+    let worker = Bridges::spawn_worker(Some(hooks), board.clone());
     let rt = crate::runtime::backend();
     // Declared after `worker`, so it drops (child killed, thread joined) first.
     let events = {

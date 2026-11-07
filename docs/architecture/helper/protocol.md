@@ -263,11 +263,16 @@ command, argv split on NUL). Output goes to `/run/devsandbox/boot.log`.
 
 One record per file in `/var/lib/devsandbox/outbox` and per `NOTIFY` stream
 (≤ `MAX_RECORD` 64 KiB): optional `kind` (`thread-put|thread-rm|thread-send|
-thread-withdraw`; absent = plain notify), `at` (unix seconds), and per kind
+thread-withdraw|open`; absent = plain notify), `at` (unix seconds), and per kind
 `level`, `key`, `id`, `link`, `msg`, `body` (JSON, ≤ `MAX_SEND_BODY` 48 KiB
-for sends). Thread records repeat the `key`/`id` pulled from `body` so the
+for sends), `url`. An `open` record (`Message::Open`) carries only `at` and
+`url`: a URL to open on the host's desktop, which the host's sink hands to its
+opener instead of storing (see
+[bridges.md](bridges.md#opening-urls-kind-open)); it is never coalesced, two
+opens are two tabs. Thread records repeat the `key`/`id` pulled from `body` so the
 outbox can coalesce (`Message::supersedes`) without parsing JSON. The host
-replies `ok` (`REPLY_OK`) only after storing the record; anything else keeps
+replies `ok` (`REPLY_OK`) only after storing the record (an `open`: once it
+has taken it, opened or refused); anything else keeps
 it queued. `devsbd/src/json.rs` is only a syntax checker that extracts those
 top-level fields; the host owns the schema.
 
