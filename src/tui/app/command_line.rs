@@ -26,6 +26,7 @@ fn resolve_action(s: &crate::snapshot::Snapshot, action: PromptAction, services:
         PromptAction::Exec { instance, argv } => PromptAction::Exec { instance: inst(instance)?, argv },
         PromptAction::Code { instance, goto } => PromptAction::Code { instance: inst(instance)?, goto },
         PromptAction::Rename { instance, new_name } => PromptAction::Rename { instance: inst(instance)?, new_name },
+        PromptAction::Profile { instance, profile } => PromptAction::Profile { instance: inst(instance)?, profile },
         PromptAction::Rm { instance, force, delete_branch } => PromptAction::Rm { instance: inst(instance)?, force, delete_branch },
         PromptAction::Stop { instance } => PromptAction::Stop { instance: inst(instance)? },
         PromptAction::Start { instance } => PromptAction::Start { instance: inst(instance)? },
@@ -298,9 +299,10 @@ impl App {
                 let rows = self.snapshot.as_ref().map(|s| s.sandboxes.as_slice()).unwrap_or_default();
                 let sandboxes = self.snapshot.as_ref().map(|s| remote::candidates(s, remote::Kind::Sandbox)).unwrap_or_default();
                 let branches = Self::worktree_branches(rows);
+                let profiles = self.snapshot.as_ref().map(Self::instance_profiles).unwrap_or_default();
                 if let Some(prompt) = &mut self.prompt {
                     prompt.complete(|idx, tokens| {
-                        Self::candidates_for(tab, idx, tokens, &sandboxes, &instances, &services, &branches)
+                        Self::candidates_for(tab, idx, tokens, &sandboxes, &instances, &services, &branches, &profiles)
                     });
                 }
             }
@@ -343,6 +345,23 @@ impl App {
         rows.iter().filter_map(|r| Some((remote::sandbox_key(r), r.worktree_branch.clone()?))).collect()
     }
 
+    /// Each instance's allowed profiles (its sandbox row's, `remote::
+    /// instance_sandbox`), for `profile`'s second argument: keyed by the
+    /// name as completion writes it (`remote::typed`), and by the bare name
+    /// too where that resolves to the same instance.
+    fn instance_profiles(s: &crate::snapshot::Snapshot) -> BTreeMap<String, Vec<String>> {
+        let mut out = BTreeMap::new();
+        for r in &s.instances {
+            let Some(sandbox) = remote::instance_sandbox(s, r) else { continue };
+            let key = remote::instance_key(r);
+            if remote::resolve(s, &r.name, remote::Kind::Instance).as_deref() == Ok(key.as_str()) {
+                out.insert(r.name.clone(), sandbox.profiles.clone());
+            }
+            out.insert(remote::typed(s, &key, remote::Kind::Instance), sandbox.profiles.clone());
+        }
+        out
+    }
+
     /// Candidate list for the token at `idx` of the whitespace-split `tokens`
     /// (the token being completed is absent when empty). Command names for the
     /// first token; everything past it walks the command's [`spec::CommandSpec`]:
@@ -354,6 +373,9 @@ impl App {
     /// (the sandbox's `worktree-branch`, else the default pattern) so the user
     /// edits a base instead of typing from scratch; `${…}` variables stay
     /// unsubstituted, exactly as `run` would receive them.
+    /// [`spec::ArgValue::Profile`] offers the allowed profiles of the
+    /// instance on the line (`profiles`: [`Self::instance_profiles`]).
+    #[allow(clippy::too_many_arguments)]
     fn candidates_for(
         tab: Tab,
         idx: usize,
@@ -362,6 +384,7 @@ impl App {
         instances: &[String],
         services: &[String],
         branches: &BTreeMap<String, String>,
+        profiles: &BTreeMap<String, Vec<String>>,
     ) -> Vec<String> {
         if idx == 0 {
             return commands().map(str::to_string).collect();
@@ -388,6 +411,13 @@ impl App {
                         .unwrap_or_else(|| DEFAULT_WORKTREE_BRANCH.to_string());
                     vec![branch]
                 }
+                spec::ArgValue::Profile => cmd_spec
+                    .positionals
+                    .iter()
+                    .zip(Self::consumed_positionals(cmd_spec, tokens, idx))
+                    .find(|(v, _)| **v == spec::ArgValue::Instance)
+                    .and_then(|(_, t)| profiles.get(t).cloned())
+                    .unwrap_or_default(),
                 spec::ArgValue::Free => Vec::new(),
             }
         };
@@ -538,8 +568,42 @@ mod tests {
         let instances = app.instance_names();
         assert_eq!(sandboxes, ["@/s", "box/s"]);
         assert_eq!(instances, ["@/inst0", "@/inst1", "box/inst0", "box/inst1"]);
-        let got = App::candidates_for(Tab::Instances, 1, &toks("stop "), &sandboxes, &instances, &[], &BTreeMap::new());
+        let got = App::candidates_for(Tab::Instances, 1, &toks("stop "), &sandboxes, &instances, &[], &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(got, instances);
+    }
+
+    /// `profile`'s second argument completes the allowed profiles of the
+    /// instance named first, each machine's from its own sandbox row; the
+    /// line submits as `instances.setProfile`'s action.
+    #[test]
+    fn profile_completes_the_named_instances_profiles() {
+        let mut app = machine_app();
+        let s = app.snapshot.as_mut().unwrap();
+        s.sandboxes[0].profiles = vec!["work".into()];
+        s.sandboxes[1].profiles = vec!["home".into(), "office".into()];
+        s.instances.retain(|r| !(r.machine.is_none() && r.name == "inst1"));
+        let profiles = App::instance_profiles(s);
+        assert_eq!(profiles.get("@/inst0"), Some(&vec!["work".to_string()]));
+        assert_eq!(profiles.get("box/inst0"), Some(&vec!["home".to_string(), "office".to_string()]));
+        assert_eq!(profiles.get("inst1"), profiles.get("box/inst1"), "unique bare name");
+        assert_eq!(profiles.get("inst0"), None, "ambiguous bare name");
+        let instances = app.instance_names();
+        let complete = |line: &str, idx: usize| {
+            App::candidates_for(Tab::Instances, idx, &toks(line), &[], &instances, &[], &BTreeMap::new(), &profiles)
+        };
+        assert_eq!(complete("profile", 1), instances);
+        assert_eq!(complete("profile box/inst0", 2), ["home", "office"]);
+        assert_eq!(complete("profile @/inst0 w", 2), ["work"]);
+        assert!(complete("profile nope", 2).is_empty());
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "profile box/inst0 office".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Profile { instance: "box/inst0".into(), profile: "office".into() })
+        );
     }
 
     /// `r` and tab write a name a machine also has qualified, so the line
@@ -765,7 +829,7 @@ mod tests {
         let services = vec!["pg".to_string(), "redis".to_string()];
         // First positional completes instances.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 1, &toks("port"), &[], &instances, &services, &no_branches()),
+            App::candidates_for(Tab::Instances, 1, &toks("port"), &[], &instances, &services, &no_branches(), &BTreeMap::new()),
             instances
         );
         // `--service` value completes service names, on any tab.
@@ -777,7 +841,7 @@ mod tests {
                 &[],
                 &instances,
                 &services,
-                &no_branches(),
+                &no_branches(), &BTreeMap::new(),
             ),
             services
         );
@@ -932,12 +996,12 @@ mod tests {
     fn run_candidates_sandbox_position() {
         let sandboxes = vec!["api".to_string(), "web".to_string()];
         assert_eq!(
-            App::candidates_for(Tab::Instances, 1, &toks("run"), &sandboxes, &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 1, &toks("run"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             sandboxes
         );
         // Sandbox not on the line yet (only a flag pair) → still sandbox names.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 3, &toks("run --name x"), &sandboxes, &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 3, &toks("run --name x"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             sandboxes
         );
     }
@@ -947,17 +1011,17 @@ mod tests {
         let sandboxes = vec!["web".to_string()];
         // Empty token after the sandbox → the flags.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 2, &toks("run web"), &sandboxes, &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 2, &toks("run web"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--name".to_string(), "--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
         // A `--` stem too (the prompt then filters by the stem).
         assert_eq!(
-            App::candidates_for(Tab::Instances, 2, &toks("run web --"), &sandboxes, &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 2, &toks("run web --"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--name".to_string(), "--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
         // A flag already used is not offered again.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 4, &toks("run web --name x"), &sandboxes, &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 4, &toks("run web --name x"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
     }
@@ -970,16 +1034,16 @@ mod tests {
         let branches = App::worktree_branches(&rows);
         // Sandbox with `worktree-branch` → its pattern as the editable base.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 3, &toks("run web --branch"), &sandboxes, &[], &[], &branches),
+            App::candidates_for(Tab::Instances, 3, &toks("run web --branch"), &sandboxes, &[], &[], &branches, &BTreeMap::new()),
             vec!["wt/${instance}".to_string()]
         );
         // Without one → the built-in default pattern.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 3, &toks("run api --branch"), &sandboxes, &[], &[], &branches),
+            App::candidates_for(Tab::Instances, 3, &toks("run api --branch"), &sandboxes, &[], &[], &branches, &BTreeMap::new()),
             vec![DEFAULT_WORKTREE_BRANCH.to_string()]
         );
         // `--name` values are free-form: no candidates.
-        assert!(App::candidates_for(Tab::Instances, 3, &toks("run web --name"), &sandboxes, &[], &[], &branches)
+        assert!(App::candidates_for(Tab::Instances, 3, &toks("run web --name"), &sandboxes, &[], &[], &branches, &BTreeMap::new())
             .is_empty());
     }
 
@@ -1023,6 +1087,7 @@ mod tests {
             identity: Vec::new(),
             dispatcher: false,
             worktree_branch: worktree_branch.map(String::from),
+            profiles: Vec::new(),
             root: None,
             machine: None,
         }
@@ -1032,11 +1097,11 @@ mod tests {
     fn rebuild_completes_instance_names() {
         let instances = vec!["a".to_string(), "b".to_string()];
         assert_eq!(
-            App::candidates_for(Tab::Instances, 1, &toks("rebuild"), &[], &instances, &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 1, &toks("rebuild"), &[], &instances, &[], &no_branches(), &BTreeMap::new()),
             instances
         );
         assert_eq!(
-            App::candidates_for(Tab::Instances, 1, &toks("recreate"), &[], &instances, &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 1, &toks("recreate"), &[], &instances, &[], &no_branches(), &BTreeMap::new()),
             instances
         );
     }
@@ -1054,7 +1119,7 @@ mod tests {
                 &[],
                 &instances,
                 &services,
-                &no_branches(),
+                &no_branches(), &BTreeMap::new(),
             ),
             services
         );
@@ -1066,7 +1131,7 @@ mod tests {
                 &[],
                 &instances,
                 &services,
-                &no_branches(),
+                &no_branches(), &BTreeMap::new(),
             ),
             services
         );
@@ -1076,16 +1141,16 @@ mod tests {
     fn rebuild_offers_force_flag() {
         // `--` stem before or after the positional → the spec's flags.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 1, &toks("rebuild --"), &[], &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 1, &toks("rebuild --"), &[], &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--force".to_string()]
         );
         assert_eq!(
-            App::candidates_for(Tab::Instances, 2, &toks("rebuild box --"), &[], &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 2, &toks("rebuild box --"), &[], &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--force".to_string()]
         );
         // Positional filled, empty stem → unused flags too.
         assert_eq!(
-            App::candidates_for(Tab::Instances, 2, &toks("rebuild box"), &[], &[], &[], &no_branches()),
+            App::candidates_for(Tab::Instances, 2, &toks("rebuild box"), &[], &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--force".to_string()]
         );
     }
@@ -1099,7 +1164,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &no_branches(),
+            &no_branches(), &BTreeMap::new(),
         )
         .is_empty());
     }
@@ -1117,7 +1182,7 @@ mod tests {
                 &[],
                 &instances,
                 &services,
-                &no_branches(),
+                &no_branches(), &BTreeMap::new(),
             ),
             instances
         );
@@ -1130,7 +1195,7 @@ mod tests {
                 &[],
                 &instances,
                 &services,
-                &no_branches(),
+                &no_branches(), &BTreeMap::new(),
             ),
             services
         );
@@ -1140,10 +1205,10 @@ mod tests {
     fn exec_argv_offers_nothing() {
         let instances = vec!["box".to_string()];
         // Positional consumed → the rest of the line is verbatim argv.
-        assert!(App::candidates_for(Tab::Instances, 2, &toks("exec box"), &[], &instances, &[], &no_branches())
+        assert!(App::candidates_for(Tab::Instances, 2, &toks("exec box"), &[], &instances, &[], &no_branches(), &BTreeMap::new())
             .is_empty());
         assert!(
-            App::candidates_for(Tab::Instances, 3, &toks("exec box ls"), &[], &instances, &[], &no_branches())
+            App::candidates_for(Tab::Instances, 3, &toks("exec box ls"), &[], &instances, &[], &no_branches(), &BTreeMap::new())
                 .is_empty()
         );
     }

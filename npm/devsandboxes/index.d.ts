@@ -81,6 +81,8 @@ export interface SandboxRow {
   dispatcher: boolean;
   /** The resolved `worktree-branch`; `null` when unset or unresolved. */
   worktree_branch: string | null;
+  /** The profiles its instances may be in, in preference order; absent when the config declares none or it failed to resolve. */
+  profiles?: string[];
   /** The config root it was read from. */
   root: string | null;
   /** As {@link InstanceRow.machine}. @experimental */

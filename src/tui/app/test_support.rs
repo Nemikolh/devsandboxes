@@ -73,6 +73,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
         identity: Vec::new(),
         dispatcher: false,
         worktree_branch: None,
+        profiles: Vec::new(),
         root: None,
         machine: None,
     }];

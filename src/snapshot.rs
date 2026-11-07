@@ -179,6 +179,12 @@ pub struct SandboxRow {
     /// The resolved `worktree-branch`, for `run --branch` completion; `None`
     /// when unset or the sandbox failed to resolve.
     pub worktree_branch: Option<String>,
+    /// The profiles its instances may be in (`Config::allowed_profiles`), in
+    /// preference order: what the instance join flags a profile against and
+    /// what the dashboard's profile switch offers. Empty when the config
+    /// declares no profiles or the sandbox failed to resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
     /// The config root it was read from (canonical when it resolves), so a
     /// federated snapshot's rows say which of a machine's roots they're in.
     #[serde(default)]
@@ -622,6 +628,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config, acked: &BTreeSet<String>) -> (V
                 let services = rs.properties.services.clone().unwrap_or_default();
                 let issues = validate_sandbox(dir, &rs);
                 let build_hash = sandbox_build_hash(dir, &rs.properties);
+                let profiles = config.allowed_profiles(&rs);
                 rows.push(SandboxRow {
                     name: name.clone(),
                     source: rs.source(),
@@ -634,6 +641,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config, acked: &BTreeSet<String>) -> (V
                     identity,
                     dispatcher: rs.properties.dispatcher.is_some(),
                     worktree_branch: rs.properties.worktree_branch.clone(),
+                    profiles,
                     root: Some(root.clone()),
                     machine: None,
                 });
@@ -652,6 +660,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config, acked: &BTreeSet<String>) -> (V
                     identity,
                     dispatcher: false,
                     worktree_branch: None,
+                    profiles: Vec::new(),
                     root: Some(root.clone()),
                     machine: None,
                 });
@@ -852,21 +861,16 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
             // The instance join needs each sandbox's services + hash; take them
             // from the rows so nothing is resolved twice. Placeholder rows (empty
             // hash) are skipped to match the old resolved-only map: comparing a
-            // container's hash label against "" would flag phantom drift.
-            // The allowed profiles aren't on the rows: resolved again, only
-            // when the config declares profiles at all (else none is allowed).
+            // container's hash label against "" would flag phantom drift (and
+            // keeps an unresolved sandbox's profile unknown, never disallowed).
             for row in rows.iter().filter(|r| !r.config_hash.is_empty()) {
-                let profiles = match cfg.profiles.is_empty() {
-                    true => Vec::new(),
-                    false => cfg.resolve_sandbox(&row.name).map(|rs| cfg.allowed_profiles(&rs)).unwrap_or_default(),
-                };
                 resolved.insert(
                     row.name.clone(),
                     SandboxFacts {
                         services: row.services.clone(),
                         config_hash: row.config_hash.clone(),
                         build_hash: row.build_hash.clone(),
-                        profiles,
+                        profiles: row.profiles.clone(),
                     },
                 );
             }
@@ -1633,5 +1637,61 @@ extends = "does-not-exist"
 
         let broken = join(&dir, Err(anyhow::anyhow!("bad")), &view(Depth::Full));
         assert_eq!((broken.instances.len(), broken.error.as_deref()), (0, Some("state: bad")));
+    }
+
+    /// Sandbox rows carry their allowed profiles (none when unresolved, left
+    /// out of the JSON), and the instance join flags against them: an
+    /// unresolved sandbox's instance stays unflagged, one in a config that
+    /// declares no profiles any more is flagged.
+    #[test]
+    fn sandbox_rows_carry_the_allowed_profiles_the_join_flags_against() {
+        const STATE: &str = r#"
+            [instance.a]
+            sandbox = "web"
+            container = "devsandbox-a"
+            folder = "/w/a"
+            workspace = "/workspaces/a"
+            created_unix = 0
+            profile = "work"
+            [instance.b]
+            sandbox = "broken"
+            container = "devsandbox-b"
+            folder = "/w/b"
+            workspace = "/workspaces/b"
+            created_unix = 0
+            profile = "work"
+            [instance.c]
+            sandbox = "any"
+            container = "devsandbox-c"
+            folder = "/w/c"
+            workspace = "/workspaces/c"
+            created_unix = 0
+            profile = "work"
+        "#;
+        let dir = std::env::temp_dir().join(format!("dsv-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sandboxes = "[sandbox.web]\nimage = \"x\"\nprofiles = [\"personal\"]\n\
+                         [sandbox.any]\nimage = \"x\"\n\
+                         [sandbox.broken]\nextends = \"nope\"\nimage = \"x\"\n";
+        std::fs::write(dir.join("devsandboxes.toml"), format!("[profiles.work]\n[profiles.personal]\n{sandboxes}")).unwrap();
+        let load = || toml::from_str::<State>(STATE).unwrap();
+        let snap = join(&dir, Ok(load()), &RuntimeView::disk());
+        let row = |snap: &Snapshot, name: &str| snap.sandboxes.iter().find(|r| r.name == name).unwrap().clone();
+        assert_eq!(row(&snap, "web").profiles, vec!["personal".to_string()]);
+        assert_eq!(row(&snap, "any").profiles, vec!["personal".to_string(), "work".to_string()]);
+        assert!(row(&snap, "broken").profiles.is_empty());
+        assert!(serde_json::to_value(row(&snap, "broken")).unwrap().get("profiles").is_none());
+        assert_eq!(serde_json::to_value(row(&snap, "web")).unwrap()["profiles"], serde_json::json!(["personal"]));
+        let flags = |snap: &Snapshot| -> Vec<(String, bool)> {
+            snap.instances.iter().map(|i| (i.name.clone(), i.profile_disallowed)).collect()
+        };
+        assert_eq!(flags(&snap), vec![("a".into(), true), ("b".into(), false), ("c".into(), false)]);
+
+        // No `[profiles.*]` any more (web's `profiles` would name an undeclared one).
+        std::fs::write(dir.join("devsandboxes.toml"), sandboxes.replace("profiles = [\"personal\"]\n", "")).unwrap();
+        let snap = join(&dir, Ok(load()), &RuntimeView::disk());
+        assert!(row(&snap, "any").profiles.is_empty());
+        assert_eq!(flags(&snap), vec![("a".into(), true), ("b".into(), false), ("c".into(), true)]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

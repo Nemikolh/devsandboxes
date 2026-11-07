@@ -126,6 +126,9 @@ pub enum DaemonUpdate {
     Signalled(String),
     /// A rename's status line; the renamed row arrives with a push.
     Renamed(String),
+    /// A profile switch's status line; the row's new profile arrives with a
+    /// push.
+    ProfileSet(String),
     /// A done-flag write's status line, `failed` or not, and the request's
     /// `report` (`PendingDone`).
     Done { status: String, failed: bool, report: bool },
@@ -159,6 +162,8 @@ enum Cmd {
     Signal(PendingSignal),
     /// `instances.rename`.
     Rename { instance: String, new_name: String },
+    /// `instances.setProfile`.
+    SetProfile { instance: String, profile: String },
     /// `instances.done`.
     Done(PendingDone),
     /// `config.findings` for the offer, or an identity modal's answer.
@@ -245,6 +250,12 @@ impl DaemonWorker {
     /// [`DaemonUpdate::Renamed`].
     pub fn rename(&self, instance: String, new_name: String) {
         self.send(Cmd::Rename { instance, new_name });
+    }
+
+    /// Switch an instance's profile. Never blocks; answered by
+    /// [`DaemonUpdate::ProfileSet`].
+    pub fn set_profile(&self, instance: String, profile: String) {
+        self.send(Cmd::SetProfile { instance, profile });
     }
 
     /// Set or clear a done flag. Never blocks; answered by
@@ -517,6 +528,22 @@ fn rename_status(instance: &str, new_name: &str, answer: Answer) -> String {
     }
 }
 
+/// The API call for [`Cmd::SetProfile`].
+fn set_profile_call(key: &str, profile: &str) -> (&'static str, Value) {
+    let (machine, instance) = split(key);
+    on_machine(("instances.setProfile", json!({ "instance": instance, "profile": profile })), machine)
+}
+
+/// The status line for an `instances.setProfile` answer: the profile the
+/// daemon set, or why not.
+fn set_profile_status(instance: &str, profile: &str, answer: Answer) -> String {
+    match answer {
+        Answer::Ok(v) => format!("{instance}: profile {}", v.get("profile").and_then(Value::as_str).unwrap_or(profile)),
+        Answer::Refused(msg) => format!("profile failed: {msg}"),
+        Answer::Unreachable(line) => line,
+    }
+}
+
 /// The API call for [`Cmd::Done`].
 fn done_call(req: &PendingDone) -> (&'static str, Value) {
     let (machine, instance) = split(&req.instance);
@@ -745,6 +772,7 @@ fn run(dir: &Path, connector: &Connector, rx: Receiver<Cmd>, utx: Sender<DaemonU
             Ok(Cmd::BuildLog(id)) => w.build_log(id),
             Ok(Cmd::Signal(sig)) => w.signal(sig),
             Ok(Cmd::Rename { instance, new_name }) => w.rename(&instance, &new_name),
+            Ok(Cmd::SetProfile { instance, profile }) => w.set_profile(&instance, &profile),
             Ok(Cmd::Done(req)) => w.set_done(req),
             Ok(Cmd::Identity(req)) => w.identity(req),
             Err(RecvTimeoutError::Timeout) => {}
@@ -956,6 +984,11 @@ impl Worker<'_> {
     fn rename(&mut self, instance: &str, new_name: &str) {
         let answer = self.one_shot("rename", rename_call(instance, new_name));
         self.send(DaemonUpdate::Renamed(rename_status(instance, new_name, answer)));
+    }
+
+    fn set_profile(&mut self, instance: &str, profile: &str) {
+        let answer = self.one_shot("profile", set_profile_call(instance, profile));
+        self.send(DaemonUpdate::ProfileSet(set_profile_status(instance, profile, answer)));
     }
 
     fn set_done(&mut self, req: PendingDone) {
@@ -1340,11 +1373,13 @@ mod tests {
         worker.build_log("id0".into());
         worker.signal(sig("42"));
         worker.rename("a".into(), "b".into());
+        worker.set_profile("box/a".into(), "work".into());
         worker.set_done(done.clone());
         assert_eq!(rx.try_recv().unwrap(), Cmd::Fetch(logs, Route::default()));
         assert_eq!(rx.try_recv().unwrap(), Cmd::BuildLog("id0".into()));
         assert_eq!(rx.try_recv().unwrap(), Cmd::Signal(sig("42")));
         assert_eq!(rx.try_recv().unwrap(), Cmd::Rename { instance: "a".into(), new_name: "b".into() });
+        assert_eq!(rx.try_recv().unwrap(), Cmd::SetProfile { instance: "box/a".into(), profile: "work".into() });
         assert_eq!(rx.try_recv().unwrap(), Cmd::Done(done));
     }
 
@@ -1434,6 +1469,8 @@ mod tests {
         let remote_sig = PendingSignal { instance: "box/web-2".into(), ..sig("42") };
         assert_eq!(signal_call(&remote_sig).1, json!({"instance": "web-2", "pid": "42", "signal": "TERM", "machine": "box"}));
         assert_eq!(rename_call("box/a", "b").1, json!({"instance": "a", "newName": "b", "machine": "box"}));
+        assert_eq!(set_profile_call("a", "work"), ("instances.setProfile", json!({"instance": "a", "profile": "work"})));
+        assert_eq!(set_profile_call("box/a", "work").1, json!({"instance": "a", "profile": "work", "machine": "box"}));
         let done = PendingDone { instance: "box/a".into(), done: true, report: false };
         assert_eq!(done_call(&done).1, json!({"instance": "a", "done": true, "machine": "box"}));
     }
@@ -1537,6 +1574,9 @@ mod tests {
         assert_eq!(rename_status("a", " b ", Answer::Ok(json!({"instance": "b"}))), "renamed a -> b");
         assert_eq!(rename_status("a", "b", Answer::Refused("`b` is taken".into())), "rename failed: `b` is taken");
         assert_eq!(rename_status("a", "b", down()), "x: needs devsandbox serve (down)");
+        assert_eq!(set_profile_status("box/a", "work", Answer::Ok(json!({"instance": "a", "profile": "work"}))), "box/a: profile work");
+        assert_eq!(set_profile_status("a", "x", Answer::Refused("`x` isn't allowed".into())), "profile failed: `x` isn't allowed");
+        assert_eq!(set_profile_status("a", "work", down()), "x: needs devsandbox serve (down)");
         let done = |done| PendingDone { instance: "a".into(), done, report: true };
         let ok = || Answer::Ok(json!({"instance": "a", "done": true}));
         assert_eq!(done_status(&done(true), ok()), ("marked a done".into(), false));

@@ -37,6 +37,9 @@ pub enum PromptAction {
     /// `vscode` action's path/line/col).
     Code { instance: String, goto: Option<Goto> },
     Rename { instance: String, new_name: String },
+    /// `profile <instance> <profile>` (and `P`): `instances.setProfile`, a
+    /// one-shot call on the daemon worker, no suspend.
+    Profile { instance: String, profile: String },
     /// `delete_branch`: `None` sends rm with `ask` (its branch question comes
     /// back as a Confirm modal); `Some` is that modal's answer, resent.
     Rm { instance: String, force: bool, delete_branch: Option<bool> },
@@ -426,6 +429,13 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
                 new_name: pos.next().expect("spec guarantees two positionals"),
             })
         }
+        "profile" => {
+            let mut pos = args.positionals.into_iter();
+            Ok(PromptAction::Profile {
+                instance: pos.next().expect("spec guarantees two positionals"),
+                profile: pos.next().expect("spec guarantees two positionals"),
+            })
+        }
         "stop" => Ok(PromptAction::Stop { instance: args.positionals.remove(0) }),
         "start" => Ok(PromptAction::Start { instance: args.positionals.remove(0) }),
         "rebuild" => Ok(PromptAction::Rebuild {
@@ -712,6 +722,15 @@ mod tests {
         assert!(parse_line("rename").is_err());
         assert!(parse_line("rename old").is_err());
         assert!(parse_line("rename old new extra").is_err());
+    }
+
+    #[test]
+    fn parse_profile() {
+        assert_eq!(
+            parse_line("profile web work"),
+            Ok(PromptAction::Profile { instance: "web".into(), profile: "work".into() })
+        );
+        assert!(parse_line("profile web").is_err());
     }
 
     #[test]

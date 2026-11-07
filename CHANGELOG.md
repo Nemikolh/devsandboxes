@@ -6,7 +6,7 @@
 
 - **Links opened in a sandbox open on your desktop.** A program in a sandbox that opens a URL (`xdg-open`, `$BROWSER`, `sensible-browser`, Python's `webbrowser`, Node's `open`, a CLI's "press enter to open the browser") now opens it in the host's browser instead of failing. Only `http` and `https` URLs open; anything else, a URL more than 30 seconds old by the time it reaches the host, or more than 5 in 10 seconds from one instance is refused with a line in `serve.log`. Opening files (`xdg-open report.pdf`) isn't supported. The host needs a desktop session: a sandbox on a machine you reach over ssh can't open on your laptop yet. An image's own `/usr/local/bin/xdg-open` is never overwritten; `devsbd open <url>` does the same from scripts. Existing instances get `BROWSER` once rebuilt.
 
-- **Profiles.** Declare named profiles with `[profiles.<name>]` and list the ones a sandbox's instances may be in with `profiles = [...]` on the sandbox or a template it extends (absent: every declared profile). Each instance is in one, chosen at `run` with `--profile <p>`; without it, the profile last chosen for that sandbox if still allowed, else the first allowed. A dispatcher's children get its profile, and a child whose sandbox doesn't allow it is refused. `ps`, `inspect`, the dashboard and `instances.list` show an instance's profile, and flag one its sandbox no longer allows. For now a profile does nothing else.
+- **Profiles.** Declare named profiles with `[profiles.<name>]` and list the ones a sandbox's instances may be in with `profiles = [...]` on the sandbox or a template it extends (absent: every declared profile). Each instance is in one, chosen at `run` with `--profile <p>`; without it, the profile last chosen for that sandbox if still allowed, else the first allowed. A dispatcher's children get its profile, and a child whose sandbox doesn't allow it is refused. `ps`, `inspect`, the dashboard and `instances.list` show an instance's profile, and flag one its sandbox no longer allows. Switch it any time with `devsandbox profile <instance> <profile>` (without a profile it shows the current one and the allowed set), or in the dashboard with `P` (straight to the other one when two are allowed, a picker when more) or `:profile <instance> <profile>`; nothing restarts. A profile chooses the browser a URL from that instance opens in, per host, in `profiles.toml` next to `state.toml`; an instance with no profile, or one the file doesn't map, uses the system opener, and so does one whose sandbox no longer allows its profile, with a warning in `serve.log`.
 
 ```toml
 [profiles.work]
@@ -14,6 +14,12 @@
 
 [template.work]
 profiles = ["work"]
+```
+
+```toml
+# profiles.toml (per host)
+[work]
+open = ["google-chrome", "--profile-directory=Profile 2"]
 ```
 
 ## 0.9.0

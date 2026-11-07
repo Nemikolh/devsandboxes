@@ -16,6 +16,9 @@ pub enum ArgValue {
     Sandbox,
     /// The branch `run` would use (worktree-branch/default).
     Branch,
+    /// The profiles the instance named in the line's `Instance` positional
+    /// may be in (its sandbox row's `profiles`).
+    Profile,
     /// Free-form: parses fine, no candidates.
     Free,
 }
@@ -89,6 +92,14 @@ pub const SPECS: &[CommandSpec] = &[
         usage: "rename <instance> <new-name>",
         flags: &[],
         positionals: &[ArgValue::Instance, ArgValue::Free],
+        trailing: false,
+    },
+    CommandSpec {
+        name: "profile",
+        aliases: &[],
+        usage: "profile <instance> <profile>",
+        flags: &[],
+        positionals: &[ArgValue::Instance, ArgValue::Profile],
         trailing: false,
     },
     CommandSpec {
@@ -301,6 +312,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_profile() {
+        let args = parse("profile web work").unwrap();
+        assert_eq!(args.positionals, vec!["web".to_string(), "work".to_string()]);
+        assert_eq!(parse("profile web"), Err("usage: profile <instance> <profile>".into()));
+        assert_eq!(parse("profile web work x"), Err("unexpected argument `x`".into()));
+    }
+
+    #[test]
     fn parse_stop() {
         assert_eq!(parse("stop box").unwrap().positionals, vec!["box".to_string()]);
         assert_eq!(parse("stop"), Err("usage: stop <instance>".into()));
@@ -344,6 +363,6 @@ mod tests {
     #[test]
     fn specs_cover_all_commands_in_display_order() {
         let names: Vec<&str> = SPECS.iter().map(|s| s.name).collect();
-        assert_eq!(names, ["run", "exec", "code", "rm", "rename", "stop", "start", "rebuild", "port"]);
+        assert_eq!(names, ["run", "exec", "code", "rm", "rename", "profile", "stop", "start", "rebuild", "port"]);
     }
 }

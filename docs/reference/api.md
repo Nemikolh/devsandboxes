@@ -365,7 +365,10 @@ first:
 Each instance row carries `profile` (absent when it has none) and
 `profile_disallowed` (`true` when its sandbox no longer allows that
 profile; `false` when the sandbox doesn't resolve)
-([profiles](../architecture/instances/profiles.md#shown)).
+([profiles](../architecture/instances/profiles.md#shown)); each sandbox
+row carries `profiles`, the profiles its instances may be in, in
+preference order (absent when the config declares none or the sandbox
+doesn't resolve).
 
 `thread_children` maps each dispatcher's `instance_id` to its children by
 thread key, `{"<owner id>": {"<key>": "<instance name>"}}`: the child a

@@ -2458,7 +2458,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             // `r`, `s` and `d` mirror what the key would do to the
             // selection: run vs rename, stop vs start, rm vs cancel.
             Tab::Instances => format!(
-                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · d {} · l logs · b build log · p forward · t term · : cmd · ? help",
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · d {} · l logs · b build log · p forward · P profile · t term · : cmd · ? help",
                 app.run_rename_hint(),
                 app.stop_start_hint(),
                 app.remove_hint()
@@ -3185,6 +3185,7 @@ mod tests {
             identity: Vec::new(),
             dispatcher: false,
             worktree_branch: None,
+            profiles: Vec::new(),
             root: None,
             machine: None,
         };

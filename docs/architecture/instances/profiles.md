@@ -18,10 +18,15 @@ Code: `src/config.rs` (`Config::profiles`, `Profile`, `check_profile_name`,
 `src/serve/api.rs` (`instances_set_profile`, `ProfileSet`),
 `src/serve/machines/cli/calls.rs` (`Use::Profile`), `src/commands/dispatch.rs`
 (`handle_with`, `ensure_args`); shown by `src/snapshot.rs`
-(`InstanceRow::profile`, `profile_disallowed`, `allowed_now`),
+(`InstanceRow::profile`, `profile_disallowed`, `SandboxRow::profiles`,
+`allowed_now`),
 `src/commands/ps.rs` (`PsRow`, `join_state`, `cells`),
 `src/commands/inspect.rs` (`profile_line`) and `src/tui/ui.rs`
-(`instance_tree_row`, `profile_detail_line`); used to open URLs by
+(`instance_tree_row`, `profile_detail_line`); switched in the dashboard by
+`src/tui/app/actions.rs` (`switch_profile`, `profile_switch`),
+`src/tui/app/view.rs` (`Confirmed::Profile`, `profile_lines`),
+`src/tui/spec.rs` (`profile`, `ArgValue::Profile`) and `src/tui/daemon.rs`
+(`Cmd::SetProfile`, `set_profile_call`); used to open URLs by
 `src/open.rs` (`HostProfile`, `parse_profiles`, `load_profiles`,
 `open_argv`, `open_plan`, `open_on_desktop`).
 
@@ -116,9 +121,20 @@ one ([On the opening host](#on-the-opening-host)).
 - **On a machine**: `<machine>/<instance>` routes as `rename` does
   (`machines::cli`): the switch is the quick call `instances.setProfile`
   over the machine's link, under its trust like `instances.rename`
-  ([fleet](../daemon/fleet.md)); the show form reads the instance's
-  `instances.list` row, which has its profile and flag but not the
-  allowed set, so it prints the first line only.
+  ([fleet](../daemon/fleet.md)); the show form reads one
+  `instances.list` of the instance's root: its row for the profile and
+  flag, the same listing's sandbox row (`SandboxRow::profiles`, the one of
+  the instance's root; `calls.rs` `allowed_of`) for `allowed: …`.
+- **Dashboard**: `P` on an instance row switches within its sandbox row's
+  `profiles` (a machine's instance: that machine's sandbox row,
+  `remote::instance_sandbox`): with two allowed, straight to the other
+  one (the first when the current is neither); with more, a picker
+  listing them, the current one marked; with none other, a status line.
+  `:profile <instance> <profile>` does the same, its second argument
+  completing that set. Both send `instances.setProfile` on the daemon
+  worker's connection (`machine` for a remote row); the answer is a status
+  line (`<instance>: profile <p>`), the row follows with the next push
+  ([tabs-and-actions](../dashboard/tabs-and-actions.md#one-key-actions-and-the-pending-queue)).
 - **Only the user**: nothing a container sends reaches it; no control
   request names a profile.
 
@@ -133,9 +149,11 @@ profile; nothing moves it.
 
 - **Snapshots** (`instances.list`, `instances.watch`'s pushes,
   `status --json`): `InstanceRow::profile` and `profile_disallowed`.
-  `snapshot::join` already loads the root's config; it takes each
-  resolved sandbox's allowed set into its `SandboxFacts`, resolving again
-  only when the config declares profiles.
+  Each `SandboxRow` carries its allowed set (`profiles`, filled by
+  `sandbox_rows` while it resolves the sandbox; empty when it doesn't
+  resolve), and `snapshot::join` takes it from the row into its
+  `SandboxFacts`. A row that didn't resolve isn't in `SandboxFacts`, so
+  its instances stay unflagged.
 - **`ps`** (and `containers.list`, which shares `ps::rows`): `PsRow`
   carries `profile` and `profile_disallowed`. Only for an instance with a
   profile, `snapshot::allowed_now` loads its `Instance::config_dir`'s

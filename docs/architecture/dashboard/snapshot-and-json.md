@@ -29,8 +29,12 @@ state and `Snapshot.error` says why.
   `machine`.
 - `SandboxRow`: every configured sandbox, resolved or not (source `?`):
   source, folder, services, `extends`, config/build hashes, `issues`,
-  `identity`, `dispatcher`, `worktree_branch`, `root`, `machine`.
-  `identity` is the `IdentityNote`s (`id`, `text`, `acked`) of the
+  `identity`, `dispatcher`, `worktree_branch`, `profiles`, `root`,
+  `machine`. `profiles` is the sandbox's allowed set
+  (`Config::allowed_profiles`, absent when empty: no profiles declared, or
+  the sandbox doesn't resolve); the instance join flags
+  `profile_disallowed` against it (`SandboxFacts`), so nothing is
+  resolved twice, and the dashboard's `P` offers it. `identity` is the `IdentityNote`s (`id`, `text`, `acked`) of the
   identity findings reaching the sandbox (`identity_notes` over
   `config_identity::identity_findings`); `sandbox_rows` takes the root's
   acked ids (`State::identity_acks` under its project id) from its

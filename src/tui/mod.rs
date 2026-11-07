@@ -315,6 +315,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 // `instances.rename`, no suspend; the answer is a status line
                 // (`DaemonUpdate::Renamed`), the renamed row comes with a push.
                 PromptAction::Rename { instance, new_name } => daemon.rename(instance, new_name),
+                // `instances.setProfile` (`P`, `:profile`), the same way.
+                PromptAction::Profile { instance, profile } => daemon.set_profile(instance, profile),
                 other => {
                     let argv = match &other {
                         PromptAction::Exec { instance, argv } => app.exec_argv(instance, argv),
@@ -410,7 +412,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 }
                 // The row renames, dims or brightens with the next push (a
                 // `state.toml` write: within ~0.5 s).
-                daemon::DaemonUpdate::Renamed(line) => {
+                daemon::DaemonUpdate::Renamed(line) | daemon::DaemonUpdate::ProfileSet(line) => {
                     app.status = Some(line);
                     procs_after_snapshot = true;
                 }

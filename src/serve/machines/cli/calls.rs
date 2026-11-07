@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::serve::api::{ContainerLogs, ContainersList, ContainersStats, InstancesList, MAX_LINES, ProfileSet, Renamed};
 use crate::serve::proto::Response;
-use crate::snapshot::InstanceRow;
+use crate::snapshot::{InstanceRow, SandboxRow};
 use crate::{Command, ServiceCommand};
 
 /// One daemon request: method, params → its response.
@@ -133,6 +133,19 @@ fn row_of(call: &mut Call, m: &str, root: &Path, name: &str) -> Result<Option<In
     Ok(list(call, m, root, Some("disk"))?.snapshot.instances.into_iter().find(|r| r.name == name))
 }
 
+/// The profiles `row`'s sandbox allows, from the same listing's sandbox
+/// row (`SandboxRow::profiles`; the one of the instance's own root when
+/// several roots define it, else the first), or why that can't be told:
+/// `devsandbox profile`'s `allowed:` line, as the local form prints it.
+fn allowed_of(row: &InstanceRow, sandboxes: &[SandboxRow]) -> Result<Vec<String>, String> {
+    let named: Vec<&SandboxRow> = sandboxes.iter().filter(|s| s.name == row.sandbox).collect();
+    let own = named.iter().find(|s| row.root.is_some() && s.root == row.root).or(named.first());
+    match own {
+        Some(s) if !s.config_hash.is_empty() => Ok(s.profiles.clone()),
+        _ => Err(format!("sandbox `{}` isn't in its config any more", row.sandbox)),
+    }
+}
+
 /// The container of `name`: its row's (a rename keeps the container), else
 /// `name` taken as a container name, as `commands::resolve_container`
 /// matches one (with or without the prefix).
@@ -198,10 +211,12 @@ pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, 
         }
         Use::Profile(None) => {
             // Exact name, as the local form and `instances.setProfile` take it.
-            let Some(row) = row_of(call, m, root, name)? else {
+            let snapshot = list(call, m, root, Some("disk"))?.snapshot;
+            let Some(row) = snapshot.instances.iter().find(|r| r.name == *name) else {
                 bail!("no instance named `{name}` on machine `{m}` (see `devsandbox ps -a`)");
             };
-            for line in crate::commands::profile::show_lines(name, row.profile.as_deref(), row.profile_disallowed, None) {
+            let allowed = allowed_of(row, &snapshot.sandboxes);
+            for line in crate::commands::profile::show_lines(name, row.profile.as_deref(), row.profile_disallowed, Some(&allowed)) {
                 writeln!(out, "{line}")?;
             }
         }
@@ -634,7 +649,7 @@ mod tests {
 
     /// `profile` sets through `instances.setProfile` and prints the local
     /// line; without a profile it reads the row: the profile and its flag,
-    /// no allowed set.
+    /// and the allowed set from the same listing's sandbox row.
     #[test]
     fn profile_prints_as_the_local_command() {
         let (r, out, _, calls) = run_named(Use::Profile(Some("work".into())), "web", |_, _| Ok(json!({"instance": "web", "profile": "work"})));
@@ -646,9 +661,20 @@ mod tests {
         let mut flagged = row("web", "c", "/f/cfg", false);
         flagged["profile"] = json!("gone");
         flagged["profile_disallowed"] = json!(true);
-        let (r, out, _, calls) = run_named(Use::Profile(None), "web", |_, _| Ok(listing(vec![flagged.clone()], vec![], None)));
-        assert_eq!((r.unwrap(), out.as_str()), (0, "profile web: gone (its sandbox doesn't allow it any more)\n"));
+        let mut web = sandbox("web", "image x", None, &[], &[]);
+        web["profiles"] = json!(["work", "home"]);
+        let mut elsewhere = web.clone();
+        elsewhere["root"] = json!("/f/other");
+        elsewhere["profiles"] = json!(["x"]);
+        let (r, out, _, calls) =
+            run_named(Use::Profile(None), "web", |_, _| Ok(listing(vec![flagged.clone()], vec![elsewhere.clone(), web.clone()], None)));
+        assert_eq!((r.unwrap(), out.as_str()), (0, "profile web: gone (its sandbox doesn't allow it any more)\nallowed: work, home\n"));
         assert_eq!(calls.len(), 1, "read only");
+        let (_, out, ..) = run_named(Use::Profile(None), "web", |_, _| Ok(listing(vec![flagged.clone()], vec![], None)));
+        assert_eq!(out, "profile web: gone (its sandbox doesn't allow it any more)\nallowed: unknown (sandbox `web` isn't in its config any more)\n");
+        web["profiles"] = json!([]);
+        let (_, out, ..) = run_named(Use::Profile(None), "web", |_, _| Ok(listing(vec![flagged.clone()], vec![web.clone()], None)));
+        assert!(out.ends_with("allowed: (none: its sandbox has no profiles)\n"), "{out}");
         let (r, ..) = run_named(Use::Profile(None), "api", |_, _| Ok(listing(vec![flagged.clone()], vec![], None)));
         assert_eq!(r.unwrap_err().to_string(), "no instance named `api` on machine `lap` (see `devsandbox ps -a`)");
     }

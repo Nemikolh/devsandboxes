@@ -129,7 +129,9 @@ fills the modal if it is still the one open:
   log is read. It follows the bottom unless scrolled away.
 - `Confirm`: rm's branch question, "cancel the build?", and the identity
   modals (`Confirmed::Identity`/`IdentityOffer`, a listing under the
-  question: [Identity modals](#identity-modals)).
+  question: [Identity modals](#identity-modals)), and `P`'s profile
+  picker (`Confirmed::Profile`: the allowed profiles listed, the current
+  one marked, `↑↓`/`j`/`k` move, `enter` switches, `esc`/`q` cancel).
 - `?` → `Help`: settings toggles, then every key by context.
 
 ## One-key actions and the pending queue
@@ -149,6 +151,12 @@ event loop takes each once per pass and hands it to a thread.
   (`instances.cancel`) instead.
 - `o`: VS Code (`spawn_code`, reading `state.toml` locally); refused for
   a machine's row.
+- `P`: switch the instance's profile within its sandbox row's
+  `profiles` (`remote::instance_sandbox`: a machine's row its machine's
+  sandbox row; `actions.rs` `profile_switch`): with two allowed, the
+  other one (the first when the current is neither); with more, the
+  picker; with none other, a status line. It queues the same
+  `PromptAction::Profile` as `:profile <instance> <profile>`.
 - `r`/`p`/`:`: the prompt ([command-line.md](command-line.md)); `t`:
   a terminal ([terminal.md](terminal.md)).
 
@@ -170,7 +178,8 @@ for a machine's row carries `machine` and its remote root
 (`routed_verb_call`). No daemon, no verb: the dashboard never builds in
 its own process.
 
-`rename` (`instances.rename`), done flags (`instances.done`, from Inbox
+`rename` (`instances.rename`), profile switches (`instances.setProfile`,
+answered by `DaemonUpdate::ProfileSet`), done flags (`instances.done`, from Inbox
 thread actions), signals, cancel and the modal reads share the daemon
 worker's connection. Rows change with the next snapshot push, after which
 the processes are refetched.

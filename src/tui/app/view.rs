@@ -44,6 +44,8 @@ Tables (Instances / Services)
   b           build log of the instance (follows a build in flight;
               G sticks to the bottom again)
   p           forward a port (instance / service selection prefills the prompt)
+  P           switch the instance's profile: to the other one when its
+              sandbox allows two, a picker when more (like :profile)
   d           remove the instance now, no prompt (Instances; like :rm,
               so a dirty worktree still refuses); on an instance still
               building: cancel it, after a y/n (a cancelled run is undone)
@@ -139,6 +141,7 @@ Command prompt (:)
   exec <instance> <cmd…>
   code <instance> [--goto path[:line[:col]]]
   rm <instance>   rename <instance> <new-name>
+  profile <instance> <profile>
   stop <instance>   start <instance>
   port <instance> [--service s] [--address a] <[host:]port>
               (an instance is required; a global service is reached by
@@ -315,7 +318,9 @@ fn build_log_title(instance: &str, phase: Option<&PhaseRow>) -> String {
 /// doesn't. For rm, `n` is an answer too (keep the branch) and only
 /// `esc`/`q` abort. The identity ones (`identity.rs`) list `body` under the
 /// question and take `u`/`c`/`s` (the offer: `u`/`c`/`l`), `esc`/`q` being
-/// a skip.
+/// a skip. The profile picker (`P` with more than two allowed) lists the
+/// profiles as `body`, the cursor's marked: `↑↓`/`j`/`k` move, `enter`
+/// switches to it, `esc`/`q` cancel.
 pub struct ConfirmModal {
     pub question: String,
     /// Lines listed under the question (the identity findings).
@@ -335,6 +340,7 @@ impl ConfirmModal {
             Confirmed::RmBranch { .. } => "y/enter yes · n no · esc cancel",
             Confirmed::Identity { .. } => "u update · c continue as is · s/esc skip",
             Confirmed::IdentityOffer(_) => "u update · c continue as is · l/esc later",
+            Confirmed::Profile { .. } => "↑↓ move · enter switch · esc cancel",
         }
     }
 
@@ -344,6 +350,7 @@ impl ConfirmModal {
             Confirmed::CancelBuild(_) | Confirmed::RmBranch { .. } => "[y] yes  [n] no",
             Confirmed::Identity { .. } => "[u] update  [c] continue as is (don't ask again)  [s] skip this time",
             Confirmed::IdentityOffer(_) => "[u] update  [c] continue as is  [l] later",
+            Confirmed::Profile { .. } => "[enter] switch  [esc] cancel",
         }
     }
 
@@ -366,6 +373,23 @@ pub(super) enum Confirmed {
     Identity { route: Route, ids: Vec<String>, action: PromptAction },
     /// The offer's findings.
     IdentityOffer(Vec<Group>),
+    /// The profile picker for `instance` (a key): its sandbox's allowed
+    /// `profiles`, its `current` one, the `cursor` over them.
+    Profile { instance: String, profiles: Vec<String>, current: Option<String>, cursor: usize },
+}
+
+/// The profile picker's body: one line per allowed profile, the cursor's
+/// marked `›`, the instance's current one `(current)`.
+pub(super) fn profile_lines(profiles: &[String], current: Option<&str>, cursor: usize) -> Vec<String> {
+    profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mark = if i == cursor { '›' } else { ' ' };
+            let note = if Some(p.as_str()) == current { " (current)" } else { "" };
+            format!("{mark} {p}{note}")
+        })
+        .collect()
 }
 
 /// How many lines dropped off the top of a log's window between two reads,
@@ -646,6 +670,29 @@ impl App {
                     _ => {}
                 }
             }
+            Modal::Confirm(view) if matches!(view.action, Confirmed::Profile { .. }) => {
+                let Confirmed::Profile { instance, profiles, current, cursor } = &mut view.action else { return };
+                let n = profiles.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') if n > 0 => *cursor = (*cursor + n - 1) % n,
+                    KeyCode::Down | KeyCode::Char('j') if n > 0 => *cursor = (*cursor + 1) % n,
+                    KeyCode::Enter => {
+                        let pick = profiles.get(*cursor).cloned();
+                        let instance = instance.clone();
+                        self.modal = Modal::None;
+                        if let Some(profile) = pick {
+                            self.pending_action = Some(PromptAction::Profile { instance, profile });
+                        }
+                        return;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.modal = Modal::None;
+                        return;
+                    }
+                    _ => return,
+                }
+                view.body = profile_lines(profiles, current.as_deref(), *cursor);
+            }
             Modal::Confirm(view) => {
                 let yes = match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => Some(true),
@@ -667,7 +714,7 @@ impl App {
                     (Confirmed::RmBranch { instance, .. }, None) => {
                         self.status = Some(format!("rm {instance}: cancelled"));
                     }
-                    (Confirmed::Identity { .. } | Confirmed::IdentityOffer(_), _) => {}
+                    (Confirmed::Identity { .. } | Confirmed::IdentityOffer(_) | Confirmed::Profile { .. }, _) => {}
                 }
             }
         }

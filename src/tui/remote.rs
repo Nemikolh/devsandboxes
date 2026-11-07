@@ -50,6 +50,15 @@ pub fn find_instance<'a>(s: &'a Snapshot, key: &str) -> Option<&'a InstanceRow> 
     s.instances.iter().find(|r| instance_key(r) == key)
 }
 
+/// The sandbox row instance `r` was made from: its machine's row of that
+/// name, the one read from the instance's own root when several roots
+/// there define it (else the first).
+pub fn instance_sandbox<'a>(s: &'a Snapshot, r: &InstanceRow) -> Option<&'a SandboxRow> {
+    let mut rows = s.sandboxes.iter().filter(|b| b.machine == r.machine && b.name == r.sandbox).peekable();
+    let first = rows.peek().copied();
+    rows.find(|b| r.root.is_some() && b.root == r.root).or(first)
+}
+
 /// Machine `name`'s entry in the snapshot's `machines`.
 pub fn machine<'a>(machines: &'a [SnapshotMachine], name: &str) -> Option<&'a SnapshotMachine> {
     machines.iter().find(|m| m.name == name)
@@ -369,6 +378,21 @@ pub(crate) mod tests {
         assert_eq!(instance_route(&s, "box/old").root.as_deref(), Some("/r/one"));
         assert_eq!(sandbox_route(&s, "box/api").root.as_deref(), Some("/r/two"));
         assert_eq!(sandbox_route(&s, "web"), Route::default());
+    }
+
+    /// An instance's sandbox row: on its own machine, from its own root
+    /// when several roots there define it, else the first.
+    #[test]
+    fn an_instances_sandbox_row_is_its_machines_from_its_root() {
+        let s = snap(
+            &[("a", None, None), ("b", Some("box"), Some("/r/two")), ("c", Some("box"), None), ("d", Some("lap"), None)],
+            &[("s", None, Some("/here")), ("s", Some("box"), Some("/r/one")), ("s", Some("box"), Some("/r/two"))],
+        );
+        let of = |i: usize| instance_sandbox(&s, &s.instances[i]).map(|r| (r.machine.as_deref(), r.root.as_deref()));
+        assert_eq!(of(0), Some((None, Some("/here"))));
+        assert_eq!(of(1), Some((Some("box"), Some("/r/two"))));
+        assert_eq!(of(2), Some((Some("box"), Some("/r/one"))), "no root: the first");
+        assert_eq!(of(3), None);
     }
 
     #[test]

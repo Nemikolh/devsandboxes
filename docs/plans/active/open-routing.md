@@ -1,6 +1,6 @@
 # Open routing: a container's `xdg-open` opens on the user's desktop
 
-Status: steps 1 (1a-1c, below) and 2 landed; step 3 is next.
+Status: steps 1 (1a-1c, below), 2 and 3 landed; step 4 is next.
 
 ## Problem
 
@@ -99,7 +99,7 @@ extends = "work"
   checked against the allowed set, sets `profile` and `last_profile`. Nothing restarts: the container doesn't know its
   profile. It is a forwarded call for a remote instance, like
   `instances.rename`. The dashboard has a one-key action (a picker when
-  more than two profiles are allowed) and `:profile <p>`; the CLI has
+  more than two profiles are allowed) and `:profile <instance> <p>`; the CLI has
   `devsandbox profile <instance> [<p>]` (shows it without `<p>`).
 - **Only the user switches**: `setProfile` and `--profile` are API/CLI
   only. No control request (`devsbd` `ctl.rs`, `commands::dispatch`) can

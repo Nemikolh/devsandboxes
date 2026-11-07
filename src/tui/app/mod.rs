@@ -609,6 +609,7 @@ impl App {
                 self.stop_or_start_instance()
             }
             KeyCode::Char('d') if self.tab == Tab::Instances && !on_proc => self.remove_instance(),
+            KeyCode::Char('P') if self.tab == Tab::Instances && !on_proc => self.switch_profile(),
             KeyCode::Char('l') if !on_proc => self.open_logs(),
             KeyCode::Char('b') if self.tab == Tab::Instances && !on_proc => self.open_build_log(),
             // Forwarding: `p` opens the `port` prompt prefilled from the selected

@@ -16,10 +16,12 @@ limitation means editing this file in the same commit.
   `sensible-browser`, `x-www-browser` / `www-browser` and `$BROWSER`
   open `http(s)` URLs with the host's opener on the instance's own host.
   Step 2 shipped: profiles in the config, chosen at `run`, shown in `ps`,
-  `inspect`, the snapshots and the dashboard; they change nothing else
-  yet. Next: switching and `profiles.toml` (step 3), then loopback and
-  OAuth-callback forwards, delivery to the member that last attached,
-  dashboard feedback (steps 4-6). Meanwhile an
+  `inspect`, the snapshots and the dashboard. Step 3 shipped: switching
+  (`devsandbox profile`, `instances.setProfile`, the dashboard's `P` and
+  `:profile`) and the host's `profiles.toml` choosing the browser a URL
+  opens in. Next: loopback and OAuth-callback forwards (step 4), then
+  delivery to the member that last attached and dashboard feedback
+  (steps 5-6). Meanwhile an
   instance with no attached desktop on its host (a remote one) has its
   URLs refused (`no display to open <url> on` in `serve.log`).
   → [plan](plans/active/open-routing.md)
@@ -111,8 +113,8 @@ is frozen: no new work on it.
   service, or HTTP proxying over the helper. → [plan](plans/active/cli-proxy.md)
 - **instances**: auto-mount a shared `.agents/skills` folder read-only into
   every instance. → [plan](plans/active/agents-skills.md)
-- **daemon**: `rename`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
-  (they run in the CLI process; the API has `instances.rename`/`instances.done`,
+- **daemon**: `rename`, `profile`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
+  (they run in the CLI process; the API has `instances.rename`/`instances.setProfile`/`instances.done`,
   and `gc` is a verb for `--machine m gc`).
 - **npm**: typed verb helpers (`api.run(…)`); `ApiInstances` has only `list`.
 - **config**: `runArgs` pass-through, `envFile`, secrets; `devsandbox init`

@@ -21,11 +21,12 @@ some `ArgValue`), `positionals` (required, in order) and `trailing`
 
 Both parsing and completion read it, so a flag can't parse without
 completing or the other way round. Commands today: `run`, `exec`, `code`,
-`rm`, `rename`, `stop`, `start`, `rebuild` (alias `recreate`), `port`.
+`rm`, `rename`, `profile`, `stop`, `start`, `rebuild` (alias `recreate`), `port`.
 
 `ArgValue` says what a position holds and what completes there:
 `Instance`, `InstanceOrService` (services on the Services tab),
-`Service`, `Sandbox`, `Branch`, `Free` (no candidates).
+`Service`, `Sandbox`, `Branch`, `Profile` (the allowed profiles of the
+instance named on the line), `Free` (no candidates).
 
 ## Parsing
 
@@ -72,7 +73,10 @@ and sandbox names (`remote::candidates`, remote ones qualified and a
 local one `@/<name>` when a machine has the same name, `remote::typed`:
 what resolves back without ambiguity), and for
 `--branch` the sandbox row's `worktree_branch`, else
-`DEFAULT_WORKTREE_BRANCH`, with `${…}` left unsubstituted.
+`DEFAULT_WORKTREE_BRANCH`, with `${…}` left unsubstituted. `profile`'s
+second argument completes the `profiles` of the sandbox row of the
+instance typed first (`App::instance_profiles`, `remote::instance_sandbox`:
+that machine's row, from the instance's own root).
 
 ## History
 
@@ -98,6 +102,9 @@ The event loop takes `App::pending_action`
 - `code`: VS Code launch on a background thread (`spawn_code`); refused
   for a machine's instance.
 - `rename`: `instances.rename` on the daemon worker's connection.
+- `profile`: `instances.setProfile` the same way (`Cmd::SetProfile`, with
+  `machine` for a machine's instance), its answer a status line
+  (`x: profile work`).
 - `port`: `forwards.add` via the daemon worker; a machine's instance or
   service is the same call with `machine` and its root there as `dir`.
 

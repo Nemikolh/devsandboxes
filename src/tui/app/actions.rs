@@ -5,9 +5,10 @@
 use crate::snapshot::{InstanceRow, PhaseRow};
 use crate::tui::data::ContainerStatus;
 use crate::tui::prompt::PromptAction;
-use crate::tui::remote::instance_key;
+use crate::tui::remote::{self, instance_key};
 
-use super::{App, PortRequest};
+use super::view::{profile_lines, Confirmed, ConfirmModal};
+use super::{App, Modal, PortRequest};
 
 /// Why `row` is off-limits to the one-key actions: a live `run`/`rebuild`
 /// is materializing it, and anything else would race it (the CLI guards
@@ -24,6 +25,31 @@ fn busy(row: &InstanceRow) -> Option<String> {
 /// VS Code on a machine's instance: not yet (docs/plans/active/machines-next.md, *2. VS Code on a remote machine (rollout step 7, spike)*).
 pub fn not_yet_code(machine: &str, name: &str) -> String {
     format!("code {machine}/{name}: VS Code on a machine isn't supported yet")
+}
+
+/// What `P` does with an instance's `current` profile and its sandbox's
+/// `allowed` set.
+#[derive(Debug, PartialEq, Eq)]
+enum ProfileSwitch {
+    /// Switch to this one.
+    To(String),
+    /// More than two allowed: the picker.
+    Pick,
+    /// None other than the current one.
+    Nothing,
+}
+
+/// [`ProfileSwitch`] for `current` within `allowed`: more than two → the
+/// picker; else the first allowed one that isn't `current` (two allowed:
+/// the other one, or the first when `current` is neither), if any.
+fn profile_switch(current: Option<&str>, allowed: &[String]) -> ProfileSwitch {
+    if allowed.len() > 2 {
+        return ProfileSwitch::Pick;
+    }
+    match allowed.iter().find(|p| Some(p.as_str()) != current) {
+        Some(p) => ProfileSwitch::To(p.clone()),
+        None => ProfileSwitch::Nothing,
+    }
 }
 
 /// How a verb request the event loop sent for a [`PromptAction`] ended.
@@ -70,6 +96,41 @@ impl App {
             return;
         }
         self.pending_action = Some(PromptAction::Rm { instance: key, force: false, delete_branch: None });
+    }
+
+    /// `P` (Instances tab): switch the instance under the cursor to another
+    /// of its sandbox's allowed profiles (the sandbox row's `profiles`), as
+    /// the same `instances.setProfile` request `:profile` sends
+    /// ([`profile_switch`]): straight to the other one with two allowed, a
+    /// picker with more, a status line when there's none to switch to. A
+    /// no-op off an instance.
+    pub(super) fn switch_profile(&mut self) {
+        let Some(i) = self.selected_instance_index() else {
+            return;
+        };
+        let Some(s) = &self.snapshot else {
+            return;
+        };
+        let Some(row) = s.instances.get(i) else {
+            return;
+        };
+        let key = instance_key(row);
+        let Some(sandbox) = remote::instance_sandbox(s, row) else {
+            self.status = Some(format!("{key}: sandbox `{}` isn't listed, so its profiles aren't known", row.sandbox));
+            return;
+        };
+        let (profiles, current) = (sandbox.profiles.clone(), row.profile.clone());
+        match profile_switch(current.as_deref(), &profiles) {
+            ProfileSwitch::To(profile) => self.pending_action = Some(PromptAction::Profile { instance: key, profile }),
+            ProfileSwitch::Pick => {
+                let cursor = current.as_ref().and_then(|c| profiles.iter().position(|p| p == c)).unwrap_or(0);
+                let body = profile_lines(&profiles, current.as_deref(), cursor);
+                let question = format!("{key}: switch to profile");
+                let action = Confirmed::Profile { instance: key, profiles, current, cursor };
+                self.modal = Modal::Confirm(ConfirmModal::new(question, body, action));
+            }
+            ProfileSwitch::Nothing => self.status = Some(format!("{key}: no other profile to switch to")),
+        }
     }
 
     /// Queue a done-flag write for `instance` on behalf of an Inbox thread
@@ -282,6 +343,8 @@ impl App {
 mod tests {
     use crate::tui::app::test_support::*;
     use crate::tui::app::*;
+
+    use super::{profile_switch, ProfileSwitch};
 
     #[test]
     fn d_on_ports_sets_pending_unport() {
@@ -797,5 +860,97 @@ mod tests {
         // Instance row under the cursor → `rename`.
         app.on_key(key(KeyCode::Down)); // onto inst0
         assert_eq!(app.run_rename_hint(), "rename");
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn profile_switch_picks_the_other_or_asks() {
+        let two = strings(&["personal", "work"]);
+        assert_eq!(profile_switch(Some("work"), &two), ProfileSwitch::To("personal".into()));
+        assert_eq!(profile_switch(Some("personal"), &two), ProfileSwitch::To("work".into()));
+        assert_eq!(profile_switch(None, &two), ProfileSwitch::To("personal".into()), "none: the first");
+        assert_eq!(profile_switch(Some("gone"), &two), ProfileSwitch::To("personal".into()));
+        assert_eq!(profile_switch(Some("work"), &strings(&["work"])), ProfileSwitch::Nothing);
+        assert_eq!(profile_switch(Some("gone"), &strings(&["work"])), ProfileSwitch::To("work".into()), "out of a disallowed one");
+        assert_eq!(profile_switch(None, &[]), ProfileSwitch::Nothing);
+        assert_eq!(profile_switch(Some("a"), &strings(&["a", "b", "c"])), ProfileSwitch::Pick);
+    }
+
+    /// A snapshot app on `inst0` (`[Sandbox(0), inst0]`), its profile
+    /// `current`, sandbox `s` allowing `allowed`.
+    fn profile_app(current: Option<&str>, allowed: &[&str]) -> App {
+        let mut s = snapshot_with(1);
+        s.instances[0].profile = current.map(String::from);
+        s.sandboxes[0].profiles = strings(allowed);
+        let mut app = new_app();
+        app.set_snapshot(s);
+        app.on_key(key(KeyCode::Down));
+        app
+    }
+
+    #[test]
+    fn p_with_two_allowed_switches_to_the_other() {
+        let mut app = profile_app(Some("work"), &["personal", "work"]);
+        app.on_key(key(KeyCode::Char('P')));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Profile { instance: "inst0".into(), profile: "personal".into() }));
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn p_with_one_allowed_says_so() {
+        let mut app = profile_app(Some("work"), &["work"]);
+        app.on_key(key(KeyCode::Char('P')));
+        assert_eq!(app.take_pending_action(), None);
+        assert_eq!(app.status.as_deref(), Some("inst0: no other profile to switch to"));
+    }
+
+    #[test]
+    fn p_with_more_opens_the_picker_and_enter_switches() {
+        let mut app = profile_app(Some("b"), &["a", "b", "c"]);
+        app.on_key(key(KeyCode::Char('P')));
+        let Modal::Confirm(m) = &app.modal else { panic!("picker not open") };
+        assert_eq!(m.question, "inst0: switch to profile");
+        assert_eq!(m.body, ["  a", "› b (current)", "  c"]);
+        app.on_key(key(KeyCode::Down));
+        let Modal::Confirm(m) = &app.modal else { panic!("picker closed") };
+        assert_eq!(m.body, ["  a", "  b (current)", "› c"]);
+        assert_eq!(app.take_pending_action(), None);
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Profile { instance: "inst0".into(), profile: "c".into() }));
+
+        app.on_key(key(KeyCode::Char('P')));
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.take_pending_action(), None);
+    }
+
+    /// A machine's row: its own sandbox row's set, and the key qualified (the
+    /// daemon worker sends it with `machine`).
+    #[test]
+    fn p_on_a_machines_row_uses_its_sandbox_row() {
+        let mut app = machine_app();
+        let s = app.snapshot.as_mut().unwrap();
+        s.sandboxes[1].profiles = strings(&["home", "office"]);
+        s.instances[2].profile = Some("home".into());
+        app.selected[Tab::Instances.index()] = 4; // box/inst0
+        app.on_key(key(KeyCode::Char('P')));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Profile { instance: "box/inst0".into(), profile: "office".into() }));
+        // The local `inst0`'s sandbox allows none.
+        app.selected[Tab::Instances.index()] = 1;
+        app.on_key(key(KeyCode::Char('P')));
+        assert_eq!(app.status.as_deref(), Some("inst0: no other profile to switch to"));
+    }
+
+    #[test]
+    fn p_on_an_orphan_says_its_profiles_are_unknown() {
+        let mut app = new_app();
+        app.set_snapshot(orphan_snapshot());
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('P')));
+        assert_eq!(app.status.as_deref(), Some("orphan0: sandbox `gone` isn't listed, so its profiles aren't known"));
     }
 }

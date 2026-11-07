@@ -456,6 +456,7 @@ mod tests {
             identity: Vec::new(),
             dispatcher: false,
             worktree_branch: None,
+            profiles: Vec::new(),
             root: None,
             machine: None,
         }
