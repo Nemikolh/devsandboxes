@@ -2055,7 +2055,8 @@ fn source_folder_cell(sb: &SandboxRow) -> Line<'static> {
 /// `sessions`: the cached helper session count ([`App::session_count`]), a
 /// [`SESSION_BADGE`]`N` of the running ones when any, yellow while some are
 /// detached, else dim. `owner`: a dispatcher child's dim
-/// `⇠ <dispatcher>` suffix (`data::dispatcher_label`). `kind`: the TYPE cell,
+/// `⇠ <dispatcher>` suffix (`data::dispatcher_label`). Its profile follows
+/// as `[<p>]` ([`profile_style`]). `kind`: the TYPE cell,
 /// `None` when that column is hidden. `status`: the STATUS text
 /// ([`instance_status_label`]).
 fn instance_tree_row(
@@ -2089,6 +2090,9 @@ fn instance_tree_row(
     if let Some(owner) = owner {
         name.push(Span::styled(format!(" {owner}"), Style::default().add_modifier(Modifier::DIM)));
     }
+    if let Some(profile) = &r.profile {
+        name.push(Span::styled(format!(" [{profile}]"), profile_style(r)));
+    }
     if r.done {
         name.push(Span::raw(" ✓"));
     }
@@ -2106,6 +2110,24 @@ fn instance_tree_row(
     // Done: kept as is until removed, so it stays listed but recedes.
     let style = if r.done { Style::default().add_modifier(Modifier::DIM) } else { Style::default() };
     (cells, style)
+}
+
+/// An instance's profile: dim, yellow when its sandbox no longer allows it.
+fn profile_style(r: &InstanceRow) -> Style {
+    if r.profile_disallowed { Style::default().fg(Color::Yellow) } else { Style::default().add_modifier(Modifier::DIM) }
+}
+
+/// The `profile:` Detail line, `None` without one; one its sandbox no
+/// longer allows says so, in yellow (flagged, never moved).
+fn profile_detail_line(r: &InstanceRow) -> Option<Line<'static>> {
+    let profile = r.profile.as_deref()?;
+    if !r.profile_disallowed {
+        return Some(kv("profile", profile));
+    }
+    Some(Line::from(vec![
+        Span::styled("profile: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(format!("{profile} (not allowed by the config any more)"), profile_style(r)),
+    ]))
 }
 
 /// The tree-row badge before an instance's running session count.
@@ -2311,6 +2333,7 @@ fn instance_detail(
         agents_line(r, agent_count),
     ]);
     lines.extend(sessions_line(r, sessions));
+    lines.extend(profile_detail_line(r));
     if r.worktree {
         lines.push(kv2("base", &r.base_folder, "worktree", &r.folder));
     } else {
@@ -3143,6 +3166,8 @@ mod tests {
                 instance_id: name.into(),
                 dispatcher: None,
                 done: false,
+                profile: None,
+                profile_disallowed: false,
                 phase,
                 root: None,
                 machine: None,
@@ -3228,6 +3253,32 @@ mod tests {
         let mut stopped = r.clone();
         stopped.status = ContainerStatus::Missing;
         assert!(sessions_line(&stopped, Some(SessionCount::default())).is_none());
+    }
+
+    /// A profile follows the name in the tree (dim, yellow when no longer
+    /// allowed) and gets a Detail line; none, neither.
+    #[test]
+    fn profiles_show_in_the_tree_and_detail() {
+        let mut app = phase_app(vec![("web", running(), None), ("old", running(), None), ("bare", running(), None)]);
+        let mut s = app.snapshot.clone().unwrap();
+        s.instances[0].profile = Some("work".into());
+        s.instances[1].profile = Some("personal".into());
+        s.instances[1].profile_disallowed = true;
+        app.set_snapshot(s);
+        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `web`
+        let screen = render(&app, 140, 30);
+        let line = |name: &str| screen.lines().find(|l| l.contains(&format!("  {name} "))).unwrap().to_string();
+        assert!(line("web").contains("  web [work] "), "{screen}");
+        assert!(line("old").contains("  old [personal] "), "{screen}");
+        assert!(!line("bare").contains('['), "{screen}");
+        assert!(screen.contains("profile: work"), "{screen}");
+
+        let rows = &app.snapshot.as_ref().unwrap().instances;
+        let text = |l: Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        assert_eq!(profile_detail_line(&rows[1]).map(text).as_deref(), Some("profile: personal (not allowed by the config any more)"));
+        assert!(profile_detail_line(&rows[2]).is_none());
+        assert_eq!(profile_style(&rows[1]), Style::default().fg(Color::Yellow));
+        assert_eq!(profile_style(&rows[0]), Style::default().add_modifier(Modifier::DIM));
     }
 
     /// Un-acked identity notes put a yellow line above the table, in both

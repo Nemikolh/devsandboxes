@@ -2519,6 +2519,8 @@ mod tests {
             row: crate::runtime::ContainerRow { name: "devsandbox-w".into(), ..Default::default() },
             done: false,
             phase: Some(crate::snapshot::PhaseRow::InFlight { step: "building".into() }),
+            profile: Some("work".into()),
+            profile_disallowed: false,
         };
         assert_matches("ContainerRow", &v(&ps_row));
         assert_matches("ContainersList", &v(&ContainersList { rows: vec![ps_row] }));

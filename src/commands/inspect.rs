@@ -8,13 +8,18 @@ use crate::state::{Instance, State};
 /// Pretty-print the runtime's `inspect` JSON for an instance or service
 /// container, with the same light key highlighting as the TUI inspect pane
 /// (color only on a TTY; see `render::paint`). For an instance, its browser
-/// sandbox line goes first, on stderr, from the record ([`browser_line`]).
+/// sandbox line goes first, on stderr, from the record ([`browser_line`]),
+/// then its profile's when it has one ([`profile_line`]).
 pub fn inspect(name: &str, json: bool) -> Result<()> {
     let state = State::load()?;
     let container = resolve_container(&state, name)?;
     let raw = backend().inspect_json(&container)?;
     if let Some(info) = state.instances.values().find(|i| i.container == container) {
         eprintln!("{}", browser_line(info));
+        if info.profile.is_some() {
+            let allowed = crate::snapshot::allowed_now(&mut Default::default(), info);
+            eprintln!("{}", profile_line(info, allowed.as_deref()));
+        }
     }
     println!("{}", render(&raw, json));
     Ok(())
@@ -39,6 +44,16 @@ fn browser_line(info: &Instance) -> String {
     }
     use crate::commands::run::tool_env;
     tool_env::summary(tool_env::root_plan(info.remote_user.as_deref()), info.browser_sandbox.as_ref())
+}
+
+/// `profile: <p>`, with ` (no longer allowed by the config)` when `allowed`
+/// (its sandbox's allowed profiles now, `None` when unknown) lacks it.
+fn profile_line(info: &Instance, allowed: Option<&[String]>) -> String {
+    let profile = info.profile.as_deref().unwrap_or("-");
+    match crate::snapshot::profile_disallowed(info.profile.as_deref(), allowed) {
+        true => format!("profile: {profile} (no longer allowed by the config)"),
+        false => format!("profile: {profile}"),
+    }
 }
 
 /// Pretty-print raw `inspect` output. On JSON parse failure the raw output is
@@ -77,6 +92,18 @@ mod tests {
             pretty_inspect(r#"[{"Id":"abc"}]"#),
             "[\n  {\n    \"Id\": \"abc\"\n  }\n]"
         );
+    }
+
+    #[test]
+    fn profile_line_flags_a_disallowed_profile() {
+        let state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\nprofile = \"work\"\n",
+        )
+        .unwrap();
+        let info = &state.instances["a"];
+        assert_eq!(profile_line(info, Some(&["work".into()])), "profile: work");
+        assert_eq!(profile_line(info, None), "profile: work", "unknown: not flagged");
+        assert_eq!(profile_line(info, Some(&["personal".into()])), "profile: work (no longer allowed by the config)");
     }
 
     #[test]

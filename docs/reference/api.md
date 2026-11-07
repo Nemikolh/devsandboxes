@@ -362,6 +362,11 @@ first:
 | `listing` | container statuses, drift, `runtime_version` | tens of ms |
 | `full` (absent) | `cpu`/`mem` | about 1.5 s on docker (a stats sample) |
 
+Each instance row carries `profile` (absent when it has none) and
+`profile_disallowed` (`true` when its sandbox no longer allows that
+profile; `false` when the sandbox doesn't resolve)
+([profiles](../architecture/instances/profiles.md#shown)).
+
 `thread_children` maps each dispatcher's `instance_id` to its children by
 thread key, `{"<owner id>": {"<key>": "<instance name>"}}`: the child a
 thread's `child` key names, as the control ops resolve it (a key ambiguous
@@ -636,9 +641,13 @@ Params: `{"all": false}`, `all` optional (`false`: running ones only).
 Result: `{"rows": […]}`, every `devsandbox-` container, instances and
 services, sorted by name: `ps --json`'s rows (`commands::ps::rows`), each
 the runtime's `name`, `image`, `status`, `state`, `labels`, `host_ports`,
-plus `done` (its instance is marked done; `false` for a service) and
+plus `done` (its instance is marked done; `false` for a service),
 `phase` while its instance is being created or failed (absent once
-ready). `state.toml` is read best-effort: unreadable, no row is done.
+ready), `profile` (its instance's, absent when none) and
+`profile_disallowed` (that profile is one its sandbox no longer allows,
+read from the instance's config root; `false` when that doesn't read;
+[profiles](../architecture/instances/profiles.md#shown)). `state.toml` is
+read best-effort: unreadable, no row is done.
 On a link peer's connection under `worker` (*Remote callers*) the rows are
 cut to what it reaches: those instances' containers and their config
 roots' services ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)).

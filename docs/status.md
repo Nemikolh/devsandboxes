@@ -15,9 +15,11 @@ limitation means editing this file in the same commit.
 - **helper**: open routing. Step 1 shipped: a container's `xdg-open`,
   `sensible-browser`, `x-www-browser` / `www-browser` and `$BROWSER`
   open `http(s)` URLs with the host's opener on the instance's own host.
-  Next: profiles in the config and state (step 2), then switching and
-  `profiles.toml`, loopback and OAuth-callback forwards, delivery to the
-  member that last attached, dashboard feedback (steps 3-6). Meanwhile an
+  Step 2 shipped: profiles in the config, chosen at `run`, shown in `ps`,
+  `inspect`, the snapshots and the dashboard; they change nothing else
+  yet. Next: switching and `profiles.toml` (step 3), then loopback and
+  OAuth-callback forwards, delivery to the member that last attached,
+  dashboard feedback (steps 4-6). Meanwhile an
   instance with no attached desktop on its host (a remote one) has its
   URLs refused (`no display to open <url> on` in `serve.log`).
   → [plan](plans/active/open-routing.md)

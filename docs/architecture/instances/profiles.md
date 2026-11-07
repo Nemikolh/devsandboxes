@@ -13,7 +13,11 @@ Code: `src/config.rs` (`Config::profiles`, `Profile`, `check_profile_name`,
 (`Instance::profile`, `State::last_profile`), `src/commands/run/profile.rs`
 (`choose_profile`, `profile_note`), `src/commands/run/mod.rs` (`run`,
 `materialize`, `RunExtras::profile`), `src/commands/dispatch.rs`
-(`handle_with`, `ensure_args`).
+(`handle_with`, `ensure_args`); shown by `src/snapshot.rs`
+(`InstanceRow::profile`, `profile_disallowed`, `allowed_now`),
+`src/commands/ps.rs` (`PsRow`, `join_state`, `cells`),
+`src/commands/inspect.rs` (`profile_line`) and `src/tui/ui.rs`
+(`instance_tree_row`, `profile_detail_line`).
 
 ## Declaration
 
@@ -59,7 +63,8 @@ goes on the provisional record, and a user's `--profile` sets
 `run` hands `materialize` the chosen profile as `RunExtras::profile`;
 `rebuild` passes none, so `materialize` keeps the recorded one, like
 `dispatcher`. A recorded profile isn't re-checked: an instance whose
-profile its sandbox no longer allows keeps it.
+profile its sandbox no longer allows keeps it, flagged where it is shown
+([Shown](#shown)).
 
 `--profile` reaches `run` from the CLI and from the API's `run` verb
 (`RunParams::profile`, [verbs](../daemon/verbs.md)), local, forwarded to a
@@ -74,6 +79,34 @@ than falling back. A profile-less dispatcher passes none, so its child
 gets the default rule. An inherited `--profile` doesn't set
 `last_profile`: it isn't the user's choice. Existing children (`start`,
 `rebuild`) keep their own.
+
+## Shown
+
+`snapshot::profile_disallowed` is the one rule: an instance's profile is
+flagged when its sandbox's `Config::allowed_profiles`, as the config reads
+now, lacks it (including when the config declares no profiles any more).
+When the allowed set can't be told (the sandbox doesn't resolve, or is
+gone from the config) nothing is flagged. A flagged instance keeps its
+profile; nothing moves it.
+
+- **Snapshots** (`instances.list`, `instances.watch`'s pushes,
+  `status --json`): `InstanceRow::profile` and `profile_disallowed`.
+  `snapshot::join` already loads the root's config; it takes each
+  resolved sandbox's allowed set into its `SandboxFacts`, resolving again
+  only when the config declares profiles.
+- **`ps`** (and `containers.list`, which shares `ps::rows`): `PsRow`
+  carries `profile` and `profile_disallowed`. Only for an instance with a
+  profile, `snapshot::allowed_now` loads its `Instance::config_dir`'s
+  config (once per root, best-effort: unreadable, nothing flagged). The
+  table grows a PROFILE column only when some row has a profile; a
+  flagged one reads `<p> (not allowed)`.
+- **`inspect`**: after the browser sandbox line, on stderr,
+  `profile: <p>`, with ` (no longer allowed by the config)` when flagged
+  (`profile_line`); nothing for an instance without one.
+- **Dashboard**: the instance's tree row shows `[<p>]` after its name,
+  dim, yellow when flagged; Detail has a `profile: <p>` line, which says
+  `(not allowed by the config any more)` in yellow when flagged. The
+  dashboard reads the row's fields; it loads no config.
 
 ## Drift
 

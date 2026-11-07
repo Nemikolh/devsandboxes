@@ -680,11 +680,13 @@ mod tests {
         use crate::commands::ps::PsRow;
         use crate::runtime::{ContainerRow, StatsRow};
         let ps_rows = vec![
-            PsRow { row: ContainerRow { name: "devsandbox-a".into(), image: "img".into(), status: "Up 1 hour".into(), ..Default::default() }, done: true, phase: None },
+            PsRow { row: ContainerRow { name: "devsandbox-a".into(), image: "img".into(), status: "Up 1 hour".into(), ..Default::default() }, done: true, phase: None, profile: Some("work".into()), profile_disallowed: false },
             PsRow {
                 row: ContainerRow { name: "devsandbox-b".into(), image: "img".into(), status: "Up".into(), ..Default::default() },
                 done: false,
                 phase: Some(crate::snapshot::PhaseRow::Failed { step: "postStartCommand".into(), error: "exit 1".into() }),
+                profile: Some("work".into()),
+                profile_disallowed: true,
             },
         ];
         let stats_rows = vec![StatsRow { name: "devsandbox-a".into(), cpu: "1.5%".into(), mem: "20MiB / 1GiB".into() }];
@@ -709,6 +711,7 @@ mod tests {
         }
         let (_, out, _) = run(Use::Ps { all: false, json: false });
         assert!(out.contains("Up 1 hour (done)") && out.contains("failed (postStartCommand)"), "{out}");
+        assert!(out.contains("work (not allowed)"), "{out}");
 
         // A trust refusal is the error, naming the machine it's about.
         let denied = "`/x` isn't one of this member's roots (`devsandbox machine roots add <path>` there adds one)";

@@ -1,6 +1,6 @@
 # Open routing: a container's `xdg-open` opens on the user's desktop
 
-Status: step 1 landed (1a-1c, below); step 2 is next.
+Status: steps 1 (1a-1c, below) and 2 landed; step 3 is next.
 
 ## Problem
 

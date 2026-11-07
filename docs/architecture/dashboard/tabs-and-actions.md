@@ -34,7 +34,11 @@ for Instances when the last machine goes. Each keeps its own selected row.
   group for instances whose sandbox is gone) and `Proc`. With machines,
   groups are per (machine, sandbox) (`group_of`). Collapse state and
   expanded process layers survive snapshot refreshes. The Detail pane
-  shows the selected row. Done instances render dimmed. A sandbox's
+  shows the selected row. Done instances render dimmed. An instance's
+  profile follows its name as `[<p>]` and gets a `profile:` Detail line,
+  yellow with `(not allowed by the config any more)` when
+  `InstanceRow.profile_disallowed` (`ui.rs` `instance_tree_row`,
+  `profile_detail_line`; [profiles](../instances/profiles.md#shown)). A sandbox's
   Detail (`ui.rs` `sandbox_detail`) lists its validation `issues` in red,
   then its identity notes (`SandboxRow.identity`: what uses `/root` and
   breaks under `identity = "host"`) in yellow, dimmed once acked.

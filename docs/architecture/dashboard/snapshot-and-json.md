@@ -24,8 +24,9 @@ state and `Snapshot.error` says why.
   (`ContainerStatus`: `running`/`exited` with the runtime's text,
   `missing`, `unknown` before the runtime was asked), uptime, cpu/mem as
   the runtime's preformatted strings, folders, services, `drift`,
-  `instance_id`, `dispatcher`, `done`, `phase` (`PhaseRow`, absent once
-  ready), `root`, `machine`.
+  `instance_id`, `dispatcher`, `done`, `profile` (absent when none),
+  `profile_disallowed`, `phase` (`PhaseRow`, absent once ready), `root`,
+  `machine`.
 - `SandboxRow`: every configured sandbox, resolved or not (source `?`):
   source, folder, services, `extends`, config/build hashes, `issues`,
   `identity`, `dispatcher`, `worktree_branch`, `root`, `machine`.
@@ -78,7 +79,7 @@ number, a breaking change bumps it. Pretty-printed to stdout.
 | `status --json` (flag required) | `Snapshot` |
 | `ls --json` | `SandboxRow`s (`sandbox_rows`, no runtime call) |
 | `service ls --json` | `ServiceRow`s (`service_rows`) |
-| `ps --json` | runtime `ContainerRow`s + `done` + `phase` |
+| `ps --json` | runtime `ContainerRow`s + `done` + `phase` + `profile` + `profile_disallowed` |
 | `stats --json` | runtime `StatsRow`s |
 | `run --json` | `RunRecord` |
 | `inbox ls --json` / `inbox show --json` | `ThreadSummary`s / `ThreadDetail` |

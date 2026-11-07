@@ -50,6 +50,10 @@ export interface InstanceRow {
   drift: boolean;
   /** Marked done (`done()`); kept as is until removed. */
   done: boolean;
+  /** Its profile (docs/architecture/instances/profiles.md); absent when it has none. */
+  profile?: string;
+  /** `profile` is one its sandbox no longer allows (the config changed since); `false` when the sandbox doesn't resolve. */
+  profile_disallowed: boolean;
   /** Still being created, or failed; absent once ready. Shown instead of `status` while set. */
   phase?: PhaseRow;
   /** The config root it was made from; `null` for instances older than that record. */
@@ -302,6 +306,10 @@ export interface ContainerRow {
   done: boolean;
   /** The container's instance is still being created, or failed; absent once ready. */
   phase?: PhaseRow;
+  /** The container's instance's profile; absent when it has none (and for service containers). */
+  profile?: string;
+  /** As {@link InstanceRow.profile_disallowed}. */
+  profile_disallowed: boolean;
 }
 
 /** Resource usage of one running container (`stats()`), pre-rendered. */

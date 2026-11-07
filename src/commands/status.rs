@@ -66,6 +66,8 @@ mod tests {
             instance_id: String::new(),
             dispatcher: None,
             done: false,
+            profile: None,
+            profile_disallowed: false,
             phase: None,
             root: None,
             machine: None,

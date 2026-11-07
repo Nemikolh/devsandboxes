@@ -111,6 +111,15 @@ pub struct InstanceRow {
     pub dispatcher: Option<String>,
     /// Marked done (`state::Instance::done`): shown dimmed until removed.
     pub done: bool,
+    /// Its profile (`state::Instance::profile`,
+    /// docs/architecture/instances/profiles.md); `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// `profile` is one its sandbox no longer allows (the config changed
+    /// since): flagged, never moved ([`profile_disallowed`]). `false` when
+    /// the sandbox doesn't resolve: unknown isn't disallowed.
+    #[serde(default)]
+    pub profile_disallowed: bool,
     /// Still being materialized, or failed; absent once ready. Takes over
     /// the STATUS column from `status` while set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -828,9 +837,9 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
     let listed = view.depth != Depth::Disk;
 
     // Load config once; resolve every sandbox for the tree, services + drift
-    // hash. `resolved` maps sandbox name → (services, hash) for the instance join.
+    // hash. `resolved` maps sandbox name → its facts for the instance join.
     let config = Config::load(dir);
-    let mut resolved: BTreeMap<String, (Vec<String>, String, String)> = BTreeMap::new();
+    let mut resolved: BTreeMap<String, SandboxFacts> = BTreeMap::new();
     let mut sandboxes: Vec<SandboxRow> = Vec::new();
     match &config {
         Ok(cfg) => {
@@ -844,10 +853,21 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
             // from the rows so nothing is resolved twice. Placeholder rows (empty
             // hash) are skipped to match the old resolved-only map: comparing a
             // container's hash label against "" would flag phantom drift.
+            // The allowed profiles aren't on the rows: resolved again, only
+            // when the config declares profiles at all (else none is allowed).
             for row in rows.iter().filter(|r| !r.config_hash.is_empty()) {
+                let profiles = match cfg.profiles.is_empty() {
+                    true => Vec::new(),
+                    false => cfg.resolve_sandbox(&row.name).map(|rs| cfg.allowed_profiles(&rs)).unwrap_or_default(),
+                };
                 resolved.insert(
                     row.name.clone(),
-                    (row.services.clone(), row.config_hash.clone(), row.build_hash.clone()),
+                    SandboxFacts {
+                        services: row.services.clone(),
+                        config_hash: row.config_hash.clone(),
+                        build_hash: row.build_hash.clone(),
+                        profiles,
+                    },
                 );
             }
             sandboxes = rows;
@@ -872,7 +892,7 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
         .map(|(name, inst)| {
             let services = resolved
                 .get(&inst.sandbox)
-                .map(|(svcs, _, _)| svcs.clone())
+                .map(|f| f.services.clone())
                 .unwrap_or_default();
             (name.clone(), inst.instance_id.clone(), services)
         })
@@ -918,16 +938,50 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
     }
 }
 
+/// What the instance join needs of one resolved sandbox.
+struct SandboxFacts {
+    services: Vec<String>,
+    config_hash: String,
+    build_hash: String,
+    /// `Config::allowed_profiles`.
+    profiles: Vec<String>,
+}
+
+/// Whether an instance's `profile` is one its sandbox no longer allows
+/// (config drift: flagged, never moved; docs/architecture/instances/profiles.md).
+/// `allowed` is the sandbox's `Config::allowed_profiles`, `None` when it
+/// couldn't be told (the sandbox doesn't resolve): unknown, never flagged.
+pub fn profile_disallowed(profile: Option<&str>, allowed: Option<&[String]>) -> bool {
+    match (profile, allowed) {
+        (Some(p), Some(allowed)) => !allowed.iter().any(|a| a == p),
+        _ => false,
+    }
+}
+
+/// The profiles `inst`'s sandbox allows in its config root's config as it
+/// is now, for `ps` and `inspect`, which read no config otherwise; `configs`
+/// caches each root's load. `None` when that can't be told: no recorded
+/// root, an unreadable config, a sandbox that doesn't resolve.
+pub fn allowed_now(
+    configs: &mut BTreeMap<std::path::PathBuf, Option<Config>>,
+    inst: &crate::state::Instance,
+) -> Option<Vec<String>> {
+    let dir = inst.config_dir.as_ref()?;
+    let config = configs.entry(dir.clone()).or_insert_with(|| Config::load(dir).ok()).as_ref()?;
+    let resolved = config.resolve_sandbox(&inst.sandbox).ok()?;
+    Some(config.allowed_profiles(&resolved))
+}
+
 /// Join one state entry with its phase (`Instance::phase_view`, passed in so
 /// the join stays free of pid/boot probes), the runtime listing, stats and its
-/// resolved sandbox (`resolved`: name → (services, config hash, build hash)).
+/// resolved sandbox (`resolved`: name → [`SandboxFacts`]).
 fn instance_row(
     name: &str,
     inst: &crate::state::Instance,
     phase: Option<PhaseRow>,
     ps: &[ContainerRow],
     stats: &BTreeMap<String, (String, String)>,
-    resolved: &BTreeMap<String, (Vec<String>, String, String)>,
+    resolved: &BTreeMap<String, SandboxFacts>,
     now_unix: u64,
 ) -> InstanceRow {
     let status = classify(&inst.container, ps);
@@ -935,10 +989,12 @@ fn instance_row(
         Some((c, m)) => (Some(c.clone()), Some(m.clone())),
         None => (None, None),
     };
-    let (services, drift) = match resolved.get(&inst.sandbox) {
-        Some((svcs, hash, build)) => (svcs.clone(), listed_drifted(&inst.container, hash, build, ps)),
+    let facts = resolved.get(&inst.sandbox);
+    let (services, drift) = match facts {
+        Some(f) => (f.services.clone(), listed_drifted(&inst.container, &f.config_hash, &f.build_hash, ps)),
         None => (Vec::new(), false),
     };
+    let profile_disallowed = profile_disallowed(inst.profile.as_deref(), facts.map(|f| f.profiles.as_slice()));
     InstanceRow {
         name: name.to_string(),
         sandbox: inst.sandbox.clone(),
@@ -958,6 +1014,8 @@ fn instance_row(
         instance_id: inst.instance_id.clone(),
         dispatcher: inst.dispatcher.clone(),
         done: inst.done.is_some(),
+        profile: inst.profile.clone(),
+        profile_disallowed,
         phase,
         root: inst.config_dir.as_ref().map(|d| d.display().to_string()),
         machine: None,
@@ -1074,6 +1132,73 @@ extends = "does-not-exist"
         assert_eq!(serde_json::to_value(&row).unwrap()["done"], true);
     }
 
+    fn facts(services: &[&str], profiles: &[&str]) -> SandboxFacts {
+        SandboxFacts {
+            services: services.iter().map(|s| s.to_string()).collect(),
+            config_hash: "h".into(),
+            build_hash: String::new(),
+            profiles: profiles.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The profile rides along (absent from the JSON when none); one the
+    /// sandbox no longer allows is flagged, one whose sandbox didn't
+    /// resolve isn't.
+    #[test]
+    fn instance_row_carries_the_profile_and_flags_a_disallowed_one() {
+        let mut state: crate::state::State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let (ps, stats) = (Vec::new(), BTreeMap::new());
+        let row = |state: &crate::state::State, resolved: &BTreeMap<String, SandboxFacts>| {
+            instance_row("a", &state.instances["a"], None, &ps, &stats, resolved, 0)
+        };
+        let allows = |p: &[&str]| BTreeMap::from([("web".to_string(), facts(&[], p))]);
+
+        let none = row(&state, &allows(&["work"]));
+        assert_eq!((none.profile.as_deref(), none.profile_disallowed), (None, false));
+        assert!(serde_json::to_value(&none).unwrap().get("profile").is_none());
+
+        state.instances.get_mut("a").unwrap().profile = Some("work".into());
+        let allowed = row(&state, &allows(&["personal", "work"]));
+        assert_eq!((allowed.profile.as_deref(), allowed.profile_disallowed), (Some("work"), false));
+        assert_eq!(serde_json::to_value(&allowed).unwrap()["profile"], "work");
+        assert!(row(&state, &allows(&["personal"])).profile_disallowed);
+        assert!(row(&state, &allows(&[])).profile_disallowed, "no profiles declared any more");
+        assert!(!row(&state, &BTreeMap::new()).profile_disallowed, "unresolved: unknown");
+    }
+
+    /// `allowed_now` reads the instance's own root, once per root; no root
+    /// or a sandbox that doesn't resolve can't be told.
+    #[test]
+    fn allowed_now_reads_the_instance_root() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-allowed-now-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devsandboxes.toml"),
+            "[profiles.work]\n[profiles.personal]\n[sandbox.web]\nimage = \"x\"\nprofiles = [\"work\"]\n",
+        )
+        .unwrap();
+        let mut state: crate::state::State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let mut configs = BTreeMap::new();
+        assert_eq!(allowed_now(&mut configs, &state.instances["a"]), None, "no root");
+        let inst = state.instances.get_mut("a").unwrap();
+        inst.config_dir = Some(dir.clone());
+        assert_eq!(allowed_now(&mut configs, inst), Some(vec!["work".to_string()]));
+        inst.sandbox = "gone".into();
+        assert_eq!(allowed_now(&mut configs, inst), None, "not in the config");
+        assert_eq!(configs.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(profile_disallowed(Some("work"), Some(&["personal".to_string()])));
+        assert!(!profile_disallowed(Some("work"), None));
+        assert!(!profile_disallowed(None, Some(&[])));
+    }
+
     /// The phase rides along as given, takes over the STATUS label, and is
     /// serialized only while set.
     #[test]
@@ -1115,13 +1240,13 @@ extends = "does-not-exist"
     fn snapshot_round_trips_through_json() {
         let state: crate::state::State = toml::from_str(
             "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n\
-             dispatcher = \"d\"\ndone = 5\n\
+             dispatcher = \"d\"\ndone = 5\nprofile = \"work\"\n\
              [instance.b]\nsandbox = \"web\"\ncontainer = \"c2\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
         )
         .unwrap();
         let ps = vec![ps_line("c", "Up 1s", "running")];
         let stats = BTreeMap::from([("c".to_string(), ("1%".to_string(), "2MiB".to_string()))]);
-        let resolved = BTreeMap::from([("web".to_string(), (vec!["db".to_string()], "h".to_string(), String::new()))]);
+        let resolved = BTreeMap::from([("web".to_string(), facts(&["db"], &["work"]))]);
         let building = Some(PhaseRow::InFlight { step: "building".into() });
         let failed = Some(PhaseRow::Failed { step: "postCreateCommand".into(), error: "exit 1".into() });
         let cfg = Config::parse(
