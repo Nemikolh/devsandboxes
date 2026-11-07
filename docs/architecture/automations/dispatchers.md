@@ -17,7 +17,7 @@ Code: `src/commands/dispatch.rs` (`handle`, `handle_with`, `authorize`,
 `valid_key`, `denied_env`), `src/devsbd/bridge.rs` (`dispatch_control`,
 `writes_state`), `src/commands/run/mod.rs` (`RunExtras`, `orphan_check`,
 `DISPATCHER_LABEL`), `src/commands/done.rs`, `src/state.rs`
-(`Instance.dispatcher`, `extra_env`, `done`).
+(`Instance.dispatcher`, `extra_env`, `done`, `profile`).
 
 ## Config
 
@@ -81,7 +81,7 @@ suppresses autostart's `run` of their sandbox
 
 | child | action | subprocess |
 |---|---|---|
-| not in state | `Run` (cap checked) | `run <sandbox> --name <name> [--branch B] [--env K=V]… --dispatcher <owner id>` |
+| not in state | `Run` (cap and profile checked) | `run <sandbox> --name <name> [--branch B] [--profile P] [--env K=V]… --dispatcher <owner id>` |
 | stopped | `Start` | `start <name>` |
 | in state, no container | `Rebuild` (keeps its worktree, saved env) | `rebuild <name>` |
 | running | `Nothing` | — |
@@ -92,7 +92,12 @@ For an existing child, a given `env` replaces `extra_env` (replace, not
 merge; `replaced_env`), saved before the subprocess, so every later
 `devsandbox exec` applies it; the container's own env changes only on
 rebuild. `branch` is ignored for existing children. Reusing a `done` child
-clears its flag. After a run/start/rebuild, `wait_bridge` waits (bounded)
+clears its flag. A new child inherits the dispatcher's recorded
+`profile` (`--profile`); when the child's sandbox doesn't allow it, the
+`ensure` is `denied`, never a fallback, so a personal dispatcher can't
+create a work instance. No request field names a profile; existing
+children keep their own ([profiles](../instances/profiles.md#per-instance)).
+After a run/start/rebuild, `wait_bridge` waits (bounded)
 for the child's ssh-agent relay when execs there would use it. Answer:
 `{"name","key","sandbox","state":"running","created","started","note"?}`.
 

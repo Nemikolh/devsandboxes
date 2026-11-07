@@ -1519,6 +1519,12 @@ export interface RunParams extends VerbParams {
   name?: string | null;
   branch?: string | null;
   base?: string | null;
+  /**
+   * The new instance's profile (`--profile`), one the sandbox allows (its
+   * `profiles`); otherwise the run fails. Absent: the profile last chosen for
+   * this sandbox while still allowed, else its first.
+   */
+  profile?: string | null;
   /** The run record arrives on `stdout` (and in a detached answer's `record`). */
   json?: boolean;
   /** Probe the runtime's user-namespace mode again instead of using the cached result (`--reprobe`). */

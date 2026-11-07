@@ -937,13 +937,18 @@ and `HOME` are the caller's, never the daemon's.
 
 | method | params (besides `root`, `env`) |
 |---|---|
-| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `reprobe?`, `detach?`, `tty?`, `place?` |
+| `run` | `sandbox`, `name?`, `branch?`, `base?`, `profile?`, `json?`, `reprobe?`, `detach?`, `tty?`, `place?` |
 | `rebuild` | `instance` \| `all: true`, `force?`, `reprobe?`, `detach?`, `tty?` |
 | `start` | `instance` \| `all: true`, `detach?`, `tty?` |
 | `stop` | `instance` \| `all: true`, `detach?` |
 | `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?`, `detach?` |
 | `services.rebuild` | `name` (a service of the config root), `detach?` |
 | `gc` | `force?`, `detach?` |
+
+`profile` is the CLI's `--profile`: the new instance's profile, one the
+sandbox allows (else the run fails); absent, the profile last chosen for
+the sandbox while still allowed, else its first
+([profiles](../architecture/instances/profiles.md#per-instance)).
 
 `reprobe` is the CLI's `--reprobe`: the runtime's identity mode is probed
 again on the daemon's host instead of read from its cache

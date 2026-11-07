@@ -44,9 +44,10 @@ mounted), `workspace`, `workspace_file`, `remote_env`, `remote_user` and
 `home` (the exec user and its `HOME`, from the identity plan:
 [identity](identity.md)), `extra_env` (`run --env`, kept across rebuild), `volumes` (per-instance
 volumes `rm` deletes), `shell_history`, `ssh_auth_sock`, `devsbd_arch`,
-`dispatcher` (owning dispatcher's id), `forwarded_ports`, `done`,
-`progress`, `created_unix`. `State` also holds `autostart_boot` and
-`global_forwarded_ports` per project id.
+`dispatcher` (owning dispatcher's id), `profile`
+([profiles](profiles.md#per-instance)), `forwarded_ports`, `done`,
+`progress`, `created_unix`. `State` also holds `autostart_boot`,
+`global_forwarded_ports` and `last_profile` per project id.
 
 ## run
 
@@ -57,19 +58,23 @@ restarts, `rm` frees it). Steps:
    (prompt on a TTY), `resolve_sandbox`, warn on `ignored()` properties.
 2. Name and id. A container with that name but no state entry is refused,
    except a dispatcher's orphaned child with no worktree left
-   (`orphan_check`), which is removed.
+   (`orphan_check`), which is removed. The profile is chosen first
+   (`choose_profile`; [profiles](profiles.md#per-instance)): a `--profile`
+   the sandbox doesn't allow fails here.
 3. Worktree decision: a worktree when the base folder is already mounted
    directly by another instance, or always for a dispatcher's child (see
    [worktrees](worktrees.md)).
 4. **Record first**: a provisional `Instance` with `progress` (phase
    `preparing`) is inserted under the lock (`claim_name` re-checks the name
-   and id). From here a failure leaves a record `rm` can find.
+   and id), with the chosen `profile`; a user's `--profile` sets
+   `last_profile` in the same write. From here a failure leaves a record
+   `rm` can find.
 5. `prepare_worktree`, then `materialize`.
 
 ## materialize
 
 Shared by `run` and `rebuild`; replaces the record. Fields a previous record
-had (dispatcher, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
+had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
 `folders` worktrees, `volumes`) carry over.
 
 1. `initializeCommand` on the host (in the config dir).

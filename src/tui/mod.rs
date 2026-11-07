@@ -694,6 +694,7 @@ fn verb_call(
                 name,
                 branch,
                 base,
+                profile: None,
                 json: false,
                 reprobe: false,
                 detach: true,
@@ -1062,6 +1063,7 @@ mod tests {
                 name: Some("w2".into()),
                 branch: Some("feat/x".into()),
                 base: Some("-odd".into()),
+                profile: None,
                 json: false,
                 reprobe: false
             }

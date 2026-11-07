@@ -59,6 +59,7 @@ pub(crate) enum CliVerb {
         name: Option<String>,
         branch: Option<String>,
         base: Option<String>,
+        profile: Option<String>,
         json: bool,
         reprobe: bool,
         detach: bool,
@@ -114,11 +115,12 @@ pub(crate) fn from_command(command: &Command, machine: Option<&str>) -> Option<C
     Some(match command {
         Command::Gc { force } if machine.is_some() => CliVerb::Gc { force: *force },
         Command::Run { env, dispatcher, .. } if !env.is_empty() || dispatcher.is_some() => return None,
-        Command::Run { sandbox, name, branch, base, json, reprobe, detach, place, .. } => CliVerb::Run {
+        Command::Run { sandbox, name, branch, base, profile, json, reprobe, detach, place, .. } => CliVerb::Run {
             sandbox: sandbox.clone(),
             name: name.clone(),
             branch: branch.clone(),
             base: base.clone(),
+            profile: profile.clone(),
             json: *json,
             reprobe: *reprobe,
             detach: *detach,
@@ -412,7 +414,7 @@ fn prepare(
         banner: None,
     };
     let prepared = match verb.clone() {
-        CliVerb::Run { sandbox, name, branch, base, json, reprobe, detach, place } => {
+        CliVerb::Run { sandbox, name, branch, base, profile, json, reprobe, detach, place } => {
             let Some(target) = run_target(sandbox, place, &root, fed, call, ui, json)? else {
                 return Ok(Prep::Exit(0));
             };
@@ -432,6 +434,7 @@ fn prepare(
                 name,
                 branch,
                 base,
+                profile,
                 json,
                 reprobe,
                 detach,
@@ -1174,12 +1177,13 @@ mod tests {
     #[test]
     fn verbs_from_the_parsed_cli() {
         assert_eq!(
-            verb(&["run", "web", "--name", "w2", "--branch", "b", "--base", "origin/x", "--json", "--reprobe", "-d"]),
+            verb(&["run", "web", "--name", "w2", "--branch", "b", "--base", "origin/x", "--profile", "work", "--json", "--reprobe", "-d"]),
             Some(CliVerb::Run {
                 sandbox: Some("web".into()),
                 name: Some("w2".into()),
                 branch: Some("b".into()),
                 base: Some("origin/x".into()),
+                profile: Some("work".into()),
                 json: true,
                 reprobe: true,
                 detach: true,
@@ -1188,7 +1192,7 @@ mod tests {
         );
         assert_eq!(
             verb(&["run"]),
-            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, json: false, reprobe: false, detach: false, place: false })
+            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, profile: None, json: false, reprobe: false, detach: false, place: false })
         );
         // (`--place` with `--machine`: `machines::cli::plan` refuses it.)
         assert!(matches!(verb(&["run", "web", "--place"]), Some(CliVerb::Run { place: true, .. })));
@@ -1456,6 +1460,7 @@ mod tests {
             name: None,
             branch: None,
             base: None,
+            profile: None,
             json,
             reprobe: false,
             detach: false,
@@ -1484,7 +1489,7 @@ mod tests {
     /// (its stdout is the record) and not off a terminal.
     #[test]
     fn build_verbs_send_the_terminal_size() {
-        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, place: false };
+        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, profile: None, json, reprobe: false, detach: false, place: false };
         let rebuild = CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: false };
         let start = CliVerb::Start { target: None, detach: true };
         let list = [("sandboxes.list", ok(json!([{"name": "web"}])))];
@@ -1545,7 +1550,7 @@ mod tests {
     }
 
     fn run_of(sandbox: Option<&str>) -> CliVerb {
-        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, json: false, reprobe: false, detach: false, place: false }
+        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, profile: None, json: false, reprobe: false, detach: false, place: false }
     }
 
     fn row(name: &str, machine: Option<&str>, root: &str) -> SandboxEntry {
@@ -1616,6 +1621,7 @@ mod tests {
             name: None,
             branch: None,
             base: None,
+            profile: None,
             json: false,
             reprobe: false,
             detach: false,
@@ -1802,7 +1808,7 @@ mod tests {
     }
 
     fn run_web(json: bool) -> CliVerb {
-        CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, place: false }
+        CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, profile: None, json, reprobe: false, detach: false, place: false }
     }
 
     fn list() -> (&'static str, Response) {

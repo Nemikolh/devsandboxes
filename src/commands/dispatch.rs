@@ -398,21 +398,32 @@ pub(crate) fn handle_with(
             if !config.sandboxes.contains_key(sandbox) {
                 return denied(format!("unknown sandbox `{sandbox}`"));
             }
-            match config.resolve_sandbox(sandbox) {
+            let target = match config.resolve_sandbox(sandbox) {
                 Ok(target) if target.properties.dispatcher.is_some() => {
                     return denied(format!(
                         "sandbox `{sandbox}` declares `dispatcher`; children can't be dispatchers"
                     ));
                 }
-                Ok(_) => {}
+                Ok(target) => target,
                 Err(e) => return denied(format!("{e:#}")),
-            }
+            };
             let name = child_name(sandbox, key);
             let child = state.instances.get(&name);
             let owned = children(state, owner_id).count();
             let action = ensure_action(&name, child, owner_id, sandbox, owned, decl.cap(), |c| {
                 exec.is_running(c)
             });
+            // A new child is in its dispatcher's profile, never another
+            // (docs/architecture/instances/profiles.md): refused rather than
+            // defaulted. An existing one keeps its recorded profile.
+            let profile = owner.profile.as_deref().filter(|_| matches!(action, Ok(Ensure::Run)));
+            if let Some(p) = profile {
+                if !config.allowed_profiles(&target).iter().any(|a| a == p) {
+                    return denied(format!(
+                        "sandbox `{sandbox}` doesn't allow profile `{p}` (the dispatcher's)"
+                    ));
+                }
+            }
             if let (Ok(_), Some(child)) = (&action, child) {
                 if let Some(env) = replaced_env(child, &req.env) {
                     if let Err(e) = exec.save_env(&name, &env) {
@@ -442,7 +453,7 @@ pub(crate) fn handle_with(
                 Err(resp) => resp,
                 Ok(Ensure::Nothing) => ensured(&Ensure::Nothing, None),
                 Ok(action) => {
-                    let args = ensure_args(&action, sandbox, &name, req, owner_id);
+                    let args = ensure_args(&action, sandbox, &name, req, owner_id, profile);
                     match exec.devsandbox(config_dir, &args) {
                         // `start` without a `postStartCommand` never waits
                         // for the bridge, and the daemon's poll may not have
@@ -1095,14 +1106,25 @@ fn replaced_env(child: &Instance, given: &[(String, String)]) -> Option<BTreeMap
     (env != child.extra_env).then_some(env)
 }
 
-/// `devsandbox` argv (after `-C <dir>`) carrying out `action`.
-fn ensure_args(action: &Ensure, sandbox: &str, name: &str, req: &Request, owner: &str) -> Vec<String> {
+/// `devsandbox` argv (after `-C <dir>`) carrying out `action`; `profile` is
+/// the dispatcher's, which a new child inherits.
+fn ensure_args(
+    action: &Ensure,
+    sandbox: &str,
+    name: &str,
+    req: &Request,
+    owner: &str,
+    profile: Option<&str>,
+) -> Vec<String> {
     let s = |v: &str| v.to_string();
     match action {
         Ensure::Run => {
             let mut args = vec![s("run"), s(sandbox), s("--name"), s(name)];
             if let Some(branch) = &req.branch {
                 args.extend([s("--branch"), branch.clone()]);
+            }
+            if let Some(p) = profile {
+                args.extend([s("--profile"), s(p)]);
             }
             for (k, v) in &req.env {
                 args.extend([s("--env"), format!("{k}={v}")]);
@@ -1669,6 +1691,7 @@ folder = "."
             devsbd_arch: None,
             volumes: Vec::new(),
             dispatcher: owner.map(str::to_string),
+            profile: None,
             config_dir: Some("/cfg".into()),
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
@@ -1900,6 +1923,42 @@ folder = "."
         let resp = call(&s, "d", &req(Op::Ls, None, None), &mut Fake::new());
         assert_eq!(resp.status, Status::Denied);
         assert!(resp.body.contains("unknown sandbox `gone`"), "{resp:?}");
+    }
+
+    #[test]
+    fn ensure_child_inherits_the_dispatchers_profile() {
+        let profiles = format!("{CONFIG}\n[profiles.work]\n[profiles.personal]\n");
+        let mut s = state();
+        s.instances.remove("web-two");
+        s.instances.get_mut("d").unwrap().profile = Some("work".into());
+        let ensure = req(Op::Ensure, Some("web"), Some("pr-1"));
+
+        // `web` allows every declared profile: the child gets `work`.
+        let mut fake = Fake::new();
+        let resp = handle_with(&s, &Config::parse(&profiles).unwrap(), "d", &ensure, &mut fake);
+        assert_eq!(resp, ensured("web", "pr-1", true, false));
+        assert_eq!(
+            fake.calls,
+            vec![argv(&["run", "web", "--name", "web-pr-1", "--profile", "work", "--dispatcher", "d"])]
+        );
+
+        // `web` doesn't allow `work`: refused, no fallback, nothing run.
+        let personal_only = profiles.replace("[sandbox.web]\nfolder = \".\"", "[sandbox.web]\nfolder = \".\"\nprofiles = [\"personal\"]");
+        let mut fake = Fake::new();
+        let resp = handle_with(&s, &Config::parse(&personal_only).unwrap(), "d", &ensure, &mut fake);
+        assert_eq!(resp.status, Status::Denied);
+        assert!(resp.body.contains("doesn't allow profile `work` (the dispatcher's)"), "{resp:?}");
+        assert!(fake.calls.is_empty());
+
+        // An existing child keeps its own: started as is, no profile check.
+        let resp = handle_with(&s, &Config::parse(&personal_only).unwrap(), "d", &r_with(Op::Ensure, "one"), &mut fake);
+        assert_eq!(resp, ensured("web", "one", false, false));
+
+        // A profile-less dispatcher passes none: `run`'s default rule applies.
+        s.instances.get_mut("d").unwrap().profile = None;
+        let mut fake = Fake::new();
+        handle_with(&s, &Config::parse(&personal_only).unwrap(), "d", &ensure, &mut fake);
+        assert_eq!(fake.calls, vec![argv(&["run", "web", "--name", "web-pr-1", "--dispatcher", "d"])]);
     }
 
     #[test]

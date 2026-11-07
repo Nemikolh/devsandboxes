@@ -1218,7 +1218,6 @@ impl Config {
     /// The profiles `sandbox`'s instances may be in, in preference order: its
     /// `profiles` if set, else every declared profile by name; empty when
     /// the config declares none.
-    #[cfg_attr(not(test), allow(dead_code))] // `run --profile`, open-routing step 2b
     pub fn allowed_profiles(&self, sandbox: &ResolvedSandbox) -> Vec<String> {
         match &sandbox.properties.profiles {
             Some(listed) => listed.clone(),

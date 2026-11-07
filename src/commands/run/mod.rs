@@ -21,6 +21,7 @@ mod identity;
 mod image;
 mod lifecycle;
 mod mounts;
+mod profile;
 mod progress;
 mod ssh_agent;
 pub(crate) mod tool_env;
@@ -29,6 +30,7 @@ mod worktree;
 pub(crate) use editor::write_vscode_name_config;
 pub(crate) use git::{check_repo, host_git, host_git_bare, host_git_new};
 pub(crate) use lifecycle::exec_lifecycle;
+pub(crate) use profile::choose_profile;
 pub(crate) use ssh_agent::{
     ssh_agent_dir, ssh_agent_link_path, ssh_agent_refresh, SSH_AGENT_TARGET,
 };
@@ -50,8 +52,8 @@ pub(crate) use worktree::{instance_at, lock_instance_worktrees, parse_worktree_l
 pub const DEFAULT_WORKTREE_BRANCH: &str = "sandbox/${instance}";
 
 /// Per-instance additions from the hidden `run` flags, which a dispatcher's
-/// control requests use (`commands::dispatch`), plus `--reprobe`. Not part
-/// of the config, so not hashed.
+/// control requests use (`commands::dispatch`), plus `--reprobe` and
+/// `--profile`. Not part of the config, so not hashed.
 #[derive(Debug, Clone, Default)]
 pub struct RunExtras {
     /// `run`/`rebuild --reprobe`: probe the runtime's identity mode afresh
@@ -63,6 +65,11 @@ pub struct RunExtras {
     pub env: Vec<(String, String)>,
     /// `instance_id` of the owning dispatcher.
     pub dispatcher: Option<String>,
+    /// `run --profile`: the profile asked for, checked against the
+    /// sandbox's allowed set by `run`, which hands `materialize` the one it
+    /// chose ([`choose_profile`]). `None` into `materialize` (a `rebuild`)
+    /// keeps the recorded `Instance::profile`.
+    pub profile: Option<String>,
 }
 
 /// Create and start an instance; returns its name (state key), or `None` when
@@ -138,6 +145,19 @@ pub fn run(
     let shared_volumes = config_dir.join("shared-volumes").to_string_lossy().into_owned();
 
     let mut state = State::load()?;
+    // The profile before any work: a `--profile` the sandbox doesn't allow
+    // fails here (docs/architecture/instances/profiles.md).
+    let project = services::project_id(dir)?;
+    let allowed = config.allowed_profiles(&sandbox);
+    let last = state.last_profile.get(&project).and_then(|m| m.get(&sandbox_name));
+    let profile = choose_profile(&sandbox_name, &allowed, extras.profile.as_deref(), last.map(String::as_str))?;
+    if let Some(note) = profile::profile_note(&allowed, profile.as_deref(), extras.profile.is_some()) {
+        eprintln!("{note}");
+    }
+    // Only the user's own `--profile` is a choice to remember: a
+    // dispatcher's is its parent's, passed through.
+    let remember = extras.profile.is_some() && extras.dispatcher.is_none();
+    let extras = RunExtras { profile: profile.clone(), ..extras };
     // Deterministic name: explicit --name, or the sandbox name when free, else
     // the first free ordinal. `run` always creates a fresh instance; `start`
     // restarts a stopped one.
@@ -201,11 +221,10 @@ pub fn run(
     // prior entry to keep folders, ports or env from), and the
     // worktree/`folders` decisions below must see the other instances only,
     // as before.
-    let project = services::project_id(dir)?;
     let provisional = Instance {
         sandbox: sandbox_name.clone(),
         instance_id: instance_id.clone(),
-        project,
+        project: project.clone(),
         container: container_name.clone(),
         folder: if use_worktree { planned_worktree.clone() } else { folder.clone() },
         base_folder: folder.clone(),
@@ -226,6 +245,7 @@ pub fn run(
         devsbd_arch: None,
         volumes: Vec::new(),
         dispatcher: extras.dispatcher.clone(),
+        profile: profile.clone(),
         config_dir: Some(config_dir.clone()),
         extra_env: effective_extra_env(&extras.env, None),
         forwarded_ports: Default::default(),
@@ -242,6 +262,9 @@ pub fn run(
     State::update(|fresh| {
         claim_name(fresh, &instance, &instance_id)?;
         fresh.instances.insert(instance.clone(), provisional);
+        if let Some(p) = profile.filter(|_| remember) {
+            fresh.last_profile.entry(project).or_default().insert(sandbox_name.clone(), p);
+        }
         Ok(())
     })?;
     // From here everything printed (children's output included) also goes
@@ -485,9 +508,10 @@ fn effective_extra_env(
 /// call, `rebuild` included, so adding a pattern and rebuilding (the fix the
 /// resulting drift points at) actually delivers the file; the copy never
 /// overwrites, so edits in the worktree survive. `branch_created` is recorded for `rm` (see `Instance::branch_created`).
-/// `extras.dispatcher` falls back to the entry being replaced, as do the
-/// recorded `config_dir` and extra env (`effective_extra_env`), so a
-/// `rebuild` keeps all three.
+/// `extras.dispatcher` falls back to the entry being replaced, as do
+/// `extras.profile`, the recorded `config_dir` and extra env
+/// (`effective_extra_env`), so a `rebuild` keeps all four. A kept profile
+/// isn't re-checked against the config: one no longer allowed stays as is.
 ///
 /// `tracker` records each phase on the instance's record as it's entered, so
 /// on an error the caller reads where it stopped (and whether the container
@@ -529,6 +553,7 @@ pub(crate) fn materialize(
         .dispatcher
         .clone()
         .or_else(|| prior.and_then(|i| i.dispatcher.clone()));
+    let profile = extras.profile.clone().or_else(|| prior.and_then(|i| i.profile.clone()));
     let prior_config_dir = prior.and_then(|i| i.config_dir.clone());
     // A rebuild keeps the instance's host ports
     // (docs/architecture/daemon/forwards.md).
@@ -852,6 +877,7 @@ pub(crate) fn materialize(
         devsbd_arch,
         volumes,
         dispatcher,
+        profile,
         config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
         extra_env: run_env,
         forwarded_ports,
@@ -1278,6 +1304,7 @@ mod tests {
             devsbd_arch: None,
             volumes: Vec::new(),
             dispatcher: None,
+            profile: None,
             config_dir: None,
             extra_env: Default::default(),
             forwarded_ports: Default::default(),

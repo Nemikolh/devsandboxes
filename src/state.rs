@@ -113,6 +113,11 @@ pub struct Instance {
     /// `devsandbox.dispatcher` label. `None` for user-created instances.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatcher: Option<String>,
+    /// The profile this instance is in (docs/architecture/instances/profiles.md),
+    /// chosen at `run` (`commands::run::choose_profile`) and kept by
+    /// `rebuild`. `None` when its sandbox allowed none at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// Canonical config root this instance was created from, so a request
     /// arriving with only the instance (the control API) can re-read its
     /// config. `None` for instances created before it was recorded.
@@ -378,6 +383,12 @@ pub struct State {
     /// instances declare it, so its port can't live on any one instance.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub global_forwarded_ports: BTreeMap<String, BTreeMap<String, u16>>,
+    /// Project id (`services::project_id`) -> sandbox -> the profile last
+    /// chosen for it with `run --profile`: `run`'s default
+    /// (`commands::run::choose_profile`). Never pruned, so it outlives the
+    /// sandbox's last instance.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_profile: BTreeMap<String, BTreeMap<String, String>>,
     /// Runtime context key (`runtime::identity::context_key`) -> its probed
     /// user-namespace mode, so a context is probed once (until `--reprobe`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -538,6 +549,7 @@ mod tests {
                 devsbd_arch: None,
                 volumes: Vec::new(),
                 dispatcher: Some("pr-dispatcher".into()),
+                profile: Some("work".into()),
                 config_dir: Some("/home/u/.devsandboxes".into()),
                 extra_env: BTreeMap::from([("PR_NUMBER".into(), "42".into())]),
                 forwarded_ports: BTreeMap::from([("8080:3000".into(), 8081)]),
@@ -564,6 +576,17 @@ mod tests {
         assert_eq!(back.instances["repo-abc1"].forwarded_ports["8080:3000"], 8081);
         assert_eq!(back.instances["repo-abc1"].done, Some(1_790_900_000));
         assert_eq!(back.instances["repo-abc1"].home.as_deref(), Some("/home/vscode"));
+        assert_eq!(back.instances["repo-abc1"].profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn last_profile_roundtrips_and_empty_is_omitted() {
+        let text = toml::to_string_pretty(&State::default()).unwrap();
+        assert!(!text.contains("last_profile"), "{text}");
+        let mut state = State::default();
+        state.last_profile.entry("abc12345".into()).or_default().insert("web".into(), "work".into());
+        let back: State = toml::from_str(&toml::to_string_pretty(&state).unwrap()).unwrap();
+        assert_eq!(back.last_profile, state.last_profile);
     }
 
     #[test]
@@ -643,6 +666,7 @@ mod tests {
         .unwrap();
         assert_eq!(state.instances["repo"].instance_id, "");
         assert_eq!(state.instances["repo"].dispatcher, None);
+        assert_eq!(state.instances["repo"].profile, None);
         assert_eq!(state.instances["repo"].config_dir, None);
         assert!(state.instances["repo"].extra_env.is_empty());
         assert_eq!(state.instances["repo"].done, None);
@@ -650,6 +674,7 @@ mod tests {
         assert!(state.instances["repo"].branch_created);
         let text = toml::to_string_pretty(&state).unwrap();
         assert!(!text.contains("dispatcher") && !text.contains("config_dir"), "{text}");
+        assert!(!text.contains("profile"), "{text}");
         assert!(!text.contains("branch_created"), "{text}");
         assert!(!text.contains("extra_env"), "{text}");
         assert!(!text.contains("done"), "{text}");

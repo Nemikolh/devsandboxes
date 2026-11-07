@@ -1136,6 +1136,7 @@ ports = ["5432:5432"]
             devsbd_arch: None,
             volumes: Vec::new(),
             dispatcher: None,
+            profile: None,
             config_dir: None,
             extra_env: Default::default(),
             forwarded_ports: Default::default(),

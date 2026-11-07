@@ -67,8 +67,9 @@ extends = "work"
 ```
 
 - **`[profiles.<name>]`** declares a profile. Empty tables for now; later
-  fields (credentials, git policy) go there. Names follow sandbox-name
-  rules.
+  fields (credentials, git policy) go there. Names are
+  `[a-z0-9][a-z0-9_.-]*` (`config::check_profile_name`; sandbox names
+  have no rule to share).
 - **`profiles = [...]`** on a sandbox (or a template it extends: `extends`
   concatenates arrays, so a template is the collection) lists the
   profiles its instances may be in, in preference order. Absent: every

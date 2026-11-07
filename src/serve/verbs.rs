@@ -73,6 +73,11 @@ pub struct RunParams {
     pub branch: Option<String>,
     #[serde(default)]
     pub base: Option<String>,
+    /// The new instance's profile (`--profile`), checked by `run` against
+    /// the sandbox's allowed set; absent: `run`'s default rule
+    /// (docs/architecture/instances/profiles.md).
+    #[serde(default)]
+    pub profile: Option<String>,
     #[serde(default)]
     pub json: bool,
     /// Probe the runtime's identity mode afresh (`--reprobe`).
@@ -209,7 +214,15 @@ pub enum Target {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verb {
-    Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String>, json: bool, reprobe: bool },
+    Run {
+        sandbox: String,
+        name: Option<String>,
+        branch: Option<String>,
+        base: Option<String>,
+        profile: Option<String>,
+        json: bool,
+        reprobe: bool,
+    },
     Rebuild { target: Target, force: bool, reprobe: bool },
     Start { target: Target },
     Stop { target: Target },
@@ -275,8 +288,15 @@ pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
     let (root, env, verb, detach, tty) = match method {
         "run" => {
             let p: RunParams = api::parse(params)?;
-            let verb =
-                Verb::Run { sandbox: p.sandbox, name: p.name, branch: p.branch, base: p.base, json: p.json, reprobe: p.reprobe };
+            let verb = Verb::Run {
+                sandbox: p.sandbox,
+                name: p.name,
+                branch: p.branch,
+                base: p.base,
+                profile: p.profile,
+                json: p.json,
+                reprobe: p.reprobe,
+            };
             (p.root, p.env, verb, p.detach, p.tty)
         }
         "rebuild" => {
@@ -347,10 +367,11 @@ pub fn argv(req: &VerbRequest) -> Vec<String> {
         }
     };
     let target = match &req.verb {
-        Verb::Run { sandbox, name, branch, base, json, reprobe } => {
+        Verb::Run { sandbox, name, branch, base, profile, json, reprobe } => {
             flag(&mut args, "name", name);
             flag(&mut args, "branch", branch);
             flag(&mut args, "base", base);
+            flag(&mut args, "profile", profile);
             if *json {
                 args.push("--json".into());
             }
@@ -1077,19 +1098,20 @@ pub(crate) mod tests {
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let lead = ["--in-process", "-C", "/cfg"];
         let with = |rest: &[&str]| s(&[&lead[..], rest].concat());
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, profile: None, json: false, reprobe: false };
         assert_eq!(argv(&req(run, false)), with(&["run", "--", "web"]));
         let run = Verb::Run {
             sandbox: "-web".into(),
             name: Some("w2".into()),
             branch: Some("feat/x".into()),
             base: Some("-odd".into()),
+            profile: Some("work".into()),
             json: true,
             reprobe: true,
         };
         assert_eq!(
             argv(&req(run, true)),
-            with(&["run", "--name=w2", "--branch=feat/x", "--base=-odd", "--json", "--reprobe", "--", "-web"])
+            with(&["run", "--name=w2", "--branch=feat/x", "--base=-odd", "--profile=work", "--json", "--reprobe", "--", "-web"])
         );
         assert_eq!(argv(&req(Verb::Rebuild { target: one("w"), force: true, reprobe: false }, false)), with(&["rebuild", "--force", "--", "w"]));
         assert_eq!(
@@ -1128,12 +1150,14 @@ pub(crate) mod tests {
             name: Some("w2".into()),
             branch: Some("-b".into()),
             base: Some("origin/main".into()),
+            profile: Some("work".into()),
             json: true,
             reprobe: true,
         };
         match parse(run) {
-            Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, place } => {
+            Command::Run { sandbox, name, branch, base, profile, env, dispatcher, json, reprobe, detach, place } => {
                 assert_eq!(sandbox.as_deref(), Some("-web"));
+                assert_eq!(profile.as_deref(), Some("work"));
                 assert_eq!((name.as_deref(), branch.as_deref(), base.as_deref()), (Some("w2"), Some("-b"), Some("origin/main")));
                 // The daemon detaches by itself: the subprocess never gets `-d`.
                 // Nor `--place`: placement is the daemon's, the subprocess runs here.
@@ -1141,8 +1165,8 @@ pub(crate) mod tests {
             }
             _ => panic!("not run"),
         }
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
-        assert!(matches!(parse(run), Command::Run { name: None, branch: None, base: None, json: false, reprobe: false, .. }));
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, profile: None, json: false, reprobe: false };
+        assert!(matches!(parse(run), Command::Run { name: None, branch: None, base: None, profile: None, json: false, reprobe: false, .. }));
         match parse(Verb::Rebuild { target: one("-x"), force: true, reprobe: true }) {
             Command::Rebuild { name, all, force, reprobe, detach: false } => {
                 assert_eq!((name.as_deref(), all, force, reprobe), (Some("-x"), false, true, true))
@@ -1238,7 +1262,7 @@ pub(crate) mod tests {
 
     #[test]
     fn detach_answers_at_registration_or_spawn() {
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, profile: None, json: false, reprobe: false };
         assert_eq!(detach_at(&req(run.clone(), false)), DetachAt::Never);
         assert_eq!(detach_at(&req(run, true)), DetachAt::Registered);
         assert_eq!(detach_at(&req(Verb::Rebuild { target: one("w"), force: false, reprobe: false }, true)), DetachAt::Registered);
@@ -1532,7 +1556,7 @@ pub(crate) mod tests {
     #[test]
     fn progress_follows_the_childs_instance() {
         let (runner, dir) = script_runner("progress", &phase_script(&["preparing", "building", "ready"]));
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, profile: None, json: false, reprobe: false };
         let peer = FakePeer::default();
         let out = serve(&req(run, false), Some(3), &runner, &Arc::default(), &peer, "test", |_| {});
         assert_eq!(out.answer().unwrap(), json!({"instance": "web-2", "exit": 0}));
@@ -1547,7 +1571,7 @@ pub(crate) mod tests {
     fn detach_answers_once_registered_and_the_verb_runs_on() {
         let script = format!("{} touch \"$DIR/finished\"", phase_script(&["building", "building", "building", "ready"]));
         let (runner, dir) = script_runner("detach", &script);
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: true, reprobe: false };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, profile: None, json: true, reprobe: false };
         let table = Arc::new(InFlight::default());
         let peer = FakePeer::default();
         let started = Instant::now();
@@ -1653,6 +1677,7 @@ pub(crate) mod tests {
             name: None,
             branch: None,
             base: None,
+            profile: Some("work".into()),
             json: true,
             reprobe: true,
             detach: true,

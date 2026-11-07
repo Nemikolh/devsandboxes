@@ -90,6 +90,10 @@ enum Command {
         /// overrides the sandbox's `worktree-base` and default-branch detection
         #[arg(long)]
         base: Option<String>,
+        /// Profile for this instance (one of the sandbox's `profiles`);
+        /// default: the last one chosen for this sandbox, else its first
+        #[arg(long)]
+        profile: Option<String>,
         /// Extra container env var for this instance only (dispatcher use)
         #[arg(long = "env", hide = true, value_name = "K=V", value_parser = devsbd::control::parse_env)]
         env: Vec<(String, String)>,
@@ -766,7 +770,7 @@ fn main() -> Result<()> {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
         // Placement is the daemon's: here, `--place` can only say it isn't.
-        Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, place } => {
+        Command::Run { sandbox, name, branch, base, profile, env, dispatcher, json, reprobe, detach, place } => {
             if detach {
                 return Err(detach_refused());
             }
@@ -779,7 +783,7 @@ fn main() -> Result<()> {
             // A CLI process: the build log may tee fds 1/2 (on top of
             // `--json`'s redirect). Autostart's runs below get their own.
             build_log::enable();
-            let extras = commands::run::RunExtras { reprobe, env, dispatcher };
+            let extras = commands::run::RunExtras { reprobe, env, dispatcher, profile };
             let result = commands::run::run(&cli.dir, sandbox, name, branch, base, extras);
             if let (None, Ok(Some(key))) = (&json_out, &result) {
                 println!("{key}");

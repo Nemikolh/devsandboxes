@@ -2,12 +2,18 @@
 
 Named collections of sandboxes: a config declares profiles under
 `[profiles.*]`, and each sandbox lists the ones its instances may be in.
-Read before touching profile declaration or membership. Field reference:
+Each instance is in one of its sandbox's profiles, chosen at `run`.
+Read before touching profile declaration, membership or an instance's
+profile. Field reference:
 [config-toml-spec](../../../skills/config-toml-spec/SKILL.md).
 
 Code: `src/config.rs` (`Config::profiles`, `Profile`, `check_profile_name`,
 `Config::validate`, `SandboxProperties::profiles`, `Config::resolve_sandbox`,
-`Config::allowed_profiles`, `sandbox_hash`).
+`Config::allowed_profiles`, `sandbox_hash`); `src/state.rs`
+(`Instance::profile`, `State::last_profile`), `src/commands/run/profile.rs`
+(`choose_profile`, `profile_note`), `src/commands/run/mod.rs` (`run`,
+`materialize`, `RunExtras::profile`), `src/commands/dispatch.rs`
+(`handle_with`, `ensure_args`).
 
 ## Declaration
 
@@ -31,6 +37,43 @@ no `[profiles.<name>]` (including when the config declares none). Like
 `Config::allowed_profiles` is a resolved sandbox's set: its `profiles` if
 set, else every declared profile in name order (the `BTreeMap`'s), empty
 when the config declares none.
+
+## Per instance
+
+`Instance::profile` in `state.toml` is the instance's profile; `None` when
+its sandbox allowed none at creation. `State::last_profile` maps project id
+(`services::project_id`) and sandbox to the profile last chosen with
+`run --profile`. `rm` never prunes it, so it outlives the sandbox's last
+instance.
+
+`run` chooses with `choose_profile`, over `Config::allowed_profiles`,
+before any work: a `--profile` must be in the allowed set (else the run
+fails, naming the set, or saying the sandbox has no profiles); without
+one, the sandbox's `last_profile` while it is still allowed, else the first
+allowed; nothing when nothing is allowed. Never a prompt. When more than
+one profile was allowed, `run` prints `profile: <p> (--profile to choose)`
+on stderr (`profile: <p>` after a `--profile`; `profile_note`). The choice
+goes on the provisional record, and a user's `--profile` sets
+`last_profile` in that same `State::update`.
+
+`run` hands `materialize` the chosen profile as `RunExtras::profile`;
+`rebuild` passes none, so `materialize` keeps the recorded one, like
+`dispatcher`. A recorded profile isn't re-checked: an instance whose
+profile its sandbox no longer allows keeps it.
+
+`--profile` reaches `run` from the CLI and from the API's `run` verb
+(`RunParams::profile`, [verbs](../daemon/verbs.md)), local, forwarded to a
+machine or placed; the dashboard's `run` passes none. No control request
+(`devsbd` `ctl.rs`, `commands::dispatch`'s `Request`) carries a profile, so a
+container can never choose one.
+
+A dispatcher's new child inherits the dispatcher instance's recorded
+profile: `handle_with`'s `ensure` passes it as `--profile` (`ensure_args`),
+and refuses (`denied`) when the child's sandbox doesn't allow it rather
+than falling back. A profile-less dispatcher passes none, so its child
+gets the default rule. An inherited `--profile` doesn't set
+`last_profile`: it isn't the user's choice. Existing children (`start`,
+`rebuild`) keep their own.
 
 ## Drift
 
