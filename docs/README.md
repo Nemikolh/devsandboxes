@@ -34,7 +34,8 @@ User-facing docs live in `site/` (and the config reference in
   [services](architecture/instances/services.md),
   [images and features](architecture/instances/images-and-features.md),
   [mounts and state](architecture/instances/mounts-and-state.md),
-  [identity](architecture/instances/identity.md)
+  [identity](architecture/instances/identity.md),
+  [profiles](architecture/instances/profiles.md)
 - **Runtimes**: [architecture/runtimes.md](architecture/runtimes.md)
 - **Daemon**: [role](architecture/daemon/role.md),
   [client-server](architecture/daemon/client-server.md),

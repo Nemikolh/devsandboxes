@@ -80,6 +80,33 @@ pub struct Config {
     pub templates: BTreeMap<String, Table>,
     #[serde(default, rename = "sandbox")]
     pub sandboxes: BTreeMap<String, Table>,
+    /// `[profiles.<name>]`: the profiles a sandbox's instances may be in
+    /// (docs/architecture/instances/profiles.md). Names are checked by
+    /// [`check_profile_name`] at parse.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
+}
+
+/// A `[profiles.<name>]` table. Empty: any key in it is an error until
+/// profiles carry settings of their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {}
+
+/// `[a-z0-9][a-z0-9_.-]*`: a profile name. Config has no sandbox-name rule
+/// to share; this one is safe as a TOML bare key, a path segment and a
+/// container-name part, wherever a profile ends up later.
+pub fn check_profile_name(name: &str) -> Result<()> {
+    let lower_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(lower_alnum) && chars.all(|c| lower_alnum(c) || matches!(c, '_' | '.' | '-'));
+    if !ok {
+        bail!(
+            "profile name `{}`: lowercase letters, digits, `_`, `.` and `-`, starting with a letter or digit",
+            name.escape_debug()
+        );
+    }
+    Ok(())
 }
 
 /// A sandbox's config as text ([`Config::sandbox_text`]): what the
@@ -179,6 +206,12 @@ pub struct SandboxProperties {
     /// a tie by `serve::fleet::code::ties`). Host-side only, so excluded
     /// from `config_hash`.
     pub placement: Option<Placement>,
+    /// The `[profiles.*]` this sandbox's instances may be in, in preference
+    /// order (docs/architecture/instances/profiles.md); unset: every declared
+    /// one ([`Config::allowed_profiles`]). Deduplicated and checked against
+    /// the declared profiles by `resolve_sandbox`. Host-side only, so
+    /// excluded from `config_hash`.
+    pub profiles: Option<Vec<String>>,
 
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
@@ -978,7 +1011,17 @@ pub struct ResolvedService {
 
 impl Config {
     pub fn parse(contents: &str) -> Result<Self> {
-        toml::from_str(contents).context("invalid config")
+        let config: Self = toml::from_str(contents).context("invalid config")?;
+        config.validate()
+    }
+
+    /// Checks over the whole file rather than one sandbox, run by both
+    /// parsers so every consumer sees them.
+    fn validate(self) -> Result<Self> {
+        for name in self.profiles.keys() {
+            check_profile_name(name).context("invalid config")?;
+        }
+        Ok(self)
     }
 
     /// YAML lands in the same `toml::Table`s as TOML, so `extends`, merging
@@ -988,7 +1031,7 @@ impl Config {
         // An empty (or comment-only) document is an empty config, as in TOML.
         let config: Option<Self> =
             serde_saphyr::from_str(contents).map_err(|e| anyhow!("{e}")).context("invalid config")?;
-        Ok(config.unwrap_or_default())
+        config.unwrap_or_default().validate()
     }
 
     pub fn resolve_service(&self, name: &str) -> Result<ResolvedService> {
@@ -1049,6 +1092,14 @@ impl Config {
                 {
                     bail!("sandbox `{name}`: forwardPorts entry `{}` names `{svc}`, which isn't in its `services`", f.key());
                 }
+            }
+        }
+        if let Some(profiles) = &mut properties.profiles {
+            // Concatenated under `extends` too: first occurrence keeps its rank.
+            let mut seen = std::collections::BTreeSet::new();
+            profiles.retain(|p| seen.insert(p.clone()));
+            if let Some(p) = profiles.iter().find(|p| !self.profiles.contains_key(*p)) {
+                bail!("sandbox `{name}`: profile `{p}` in `profiles` isn't declared (no [profiles.{p}])");
             }
         }
 
@@ -1164,6 +1215,17 @@ impl Config {
         Ok(deep_merge(merged, body))
     }
 
+    /// The profiles `sandbox`'s instances may be in, in preference order: its
+    /// `profiles` if set, else every declared profile by name; empty when
+    /// the config declares none.
+    #[cfg_attr(not(test), allow(dead_code))] // `run --profile`, open-routing step 2b
+    pub fn allowed_profiles(&self, sandbox: &ResolvedSandbox) -> Vec<String> {
+        match &sandbox.properties.profiles {
+            Some(listed) => listed.clone(),
+            None => self.profiles.keys().cloned().collect(),
+        }
+    }
+
     pub fn resolve_all(&self) -> Result<Vec<ResolvedSandbox>> {
         let all = self
             .sandboxes
@@ -1251,7 +1313,7 @@ fn config_hash(table: &Table) -> String {
 
 /// [`config_hash`] of a merged sandbox table minus the keys that apply without
 /// recreating the container (`autostart`, `dispatcher`, `inbox`, `placement`,
-/// the host-side `forwardPorts`), so changing them isn't drift.
+/// the host-side `forwardPorts` and `profiles`), so changing them isn't drift.
 fn sandbox_hash(table: &Table) -> String {
     let mut table = table.clone();
     table.remove("autostart");
@@ -1259,6 +1321,7 @@ fn sandbox_hash(table: &Table) -> String {
     table.remove("dispatcher");
     table.remove("inbox");
     table.remove("forwardPorts");
+    table.remove("profiles");
     if let Some(toml::Value::Table(folders)) = table.get_mut("folders") {
         normalize_folders(folders);
     }
@@ -1788,6 +1851,86 @@ forwardPorts = [true]
         let err = config.resolve_sandbox("bad").unwrap_err().to_string();
         assert!(err.contains("isn't in its `services`"), "{err}");
         assert!(config.resolve_sandbox("worse").is_err());
+    }
+
+    #[test]
+    fn profiles_excluded_from_config_hash() {
+        let base = "[profiles.work]\n[sandbox.app]\nfolder = \"../app\"\n";
+        let plain = Config::parse(base).unwrap();
+        let with = Config::parse(&format!("{base}profiles = [\"work\"]\n")).unwrap();
+        let hash = plain.resolve_sandbox("app").unwrap().config_hash;
+        assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
+        assert_eq!(with.resolved_table("app").unwrap().1, hash);
+    }
+
+    #[test]
+    fn profiles_dedupe_and_must_be_declared() {
+        let config = Config::parse(
+            r#"
+[profiles.work]
+[profiles.personal]
+
+[template.t]
+profiles = ["work"]
+
+[sandbox.app]
+extends = "t"
+profiles = ["work", "personal"]
+
+[sandbox.bad]
+profiles = ["work", "x"]
+"#,
+        )
+        .unwrap();
+        let app = config.resolve_sandbox("app").unwrap();
+        assert_eq!(app.properties.profiles.as_deref().unwrap(), ["work", "personal"]);
+        assert!(app.properties.ignored().is_empty());
+        let err = config.resolve_sandbox("bad").unwrap_err().to_string();
+        assert_eq!(err, "sandbox `bad`: profile `x` in `profiles` isn't declared (no [profiles.x])");
+
+        let none = Config::parse("[sandbox.a]\nprofiles = [\"work\"]\n").unwrap();
+        let err = none.resolve_sandbox("a").unwrap_err().to_string();
+        assert!(err.contains("no [profiles.work]"), "{err}");
+    }
+
+    #[test]
+    fn profile_tables_and_names_are_checked_at_parse() {
+        let err = format!("{:#}", Config::parse("[profiles.work]\nbrowser = \"x\"\n").unwrap_err());
+        assert!(err.contains("browser"), "{err}");
+        for bad in ["Work", "-x", "_x", ".x", "a b", "a/b", "é"] {
+            let toml = format!("[profiles.\"{bad}\"]\n");
+            let err = format!("{:#}", Config::parse(&toml).unwrap_err());
+            assert!(err.contains("profile name"), "{bad}: {err}");
+            let yaml = format!("profiles: {{\"{bad}\": {{}}}}\n");
+            assert!(Config::parse_yaml(&yaml).is_err(), "{bad}");
+        }
+        for good in ["work", "0", "a_b.c-d"] {
+            Config::parse(&format!("[profiles.\"{good}\"]\n")).unwrap();
+        }
+        let yaml = Config::parse_yaml("profiles:\n  work: {}\n  personal: {}\n").unwrap();
+        assert_eq!(yaml.profiles.keys().collect::<Vec<_>>(), ["personal", "work"]);
+    }
+
+    #[test]
+    fn allowed_profiles_listed_or_every_declared() {
+        let config = Config::parse(
+            r#"
+[profiles.work]
+[profiles.personal]
+
+[sandbox.listed]
+profiles = ["work"]
+
+[sandbox.all]
+"#,
+        )
+        .unwrap();
+        let allowed = |name| config.allowed_profiles(&config.resolve_sandbox(name).unwrap());
+        assert_eq!(allowed("listed"), ["work"]);
+        assert_eq!(allowed("all"), ["personal", "work"]);
+
+        let bare = Config::parse("[sandbox.s]\n").unwrap();
+        assert!(bare.allowed_profiles(&bare.resolve_sandbox("s").unwrap()).is_empty());
     }
 
     #[test]

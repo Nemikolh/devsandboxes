@@ -15,7 +15,7 @@ Code: `src/commands/mod.rs` (`container_drifted`, `drift_decision`),
 
 Every instance and service container is created with
 `devsandbox.config_hash` and `devsandbox.build_hash` labels. How each hash is
-computed (merged table minus `autostart`/`dispatcher`/`inbox`/`forwardPorts`;
+computed (merged table minus `autostart`/`dispatcher`/`inbox`/`placement`/`forwardPorts`/`profiles`;
 dockerfile contents plus local-feature contents) is in
 [config.md](../config.md#hashing). The build context and OCI feature contents
 are not hashed; `rebuild --force` covers changes there and devsandbox-side

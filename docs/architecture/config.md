@@ -8,7 +8,8 @@ field, merge rule or variable change. This doc does not repeat it.
 
 Code: `src/config.rs` (`find`, `migrate_legacy`, `Config::load`,
 `Config::resolve_sandbox`, `resolve_extends`, `deep_merge`,
-`SandboxProperties`, `SandboxProperties::ignored`, `Service`,
+`SandboxProperties`, `SandboxProperties::ignored`, `Profile`,
+`Config::validate`, `Config::allowed_profiles`, `Service`,
 `resolve_service`, `substitute`, `MountContext`, `ContainerEnv`,
 `ContainerEnv::resolve`, `sandbox_hash`, `config_hash`, `build_hash`,
 `sandbox_build_hash`, `short_hash`), `src/config_identity.rs`,
@@ -42,6 +43,7 @@ records its `config_dir`).
 
 `Config` keeps `[template.*]`, `[sandbox.*]` and `[services.*]` as raw
 `toml::Table`s so `extends` can merge them untyped; typing happens after.
+A fourth table, `[profiles.*]`, is typed at parse.
 
 - **Sandboxes**: `resolve_sandbox` merges, drops `extends`, hashes, then
   deserializes into `SandboxProperties` (`deny_unknown_fields`: unknown keys
@@ -51,7 +53,12 @@ records its `config_dir`).
   container. `SandboxProperties::identity` folds devcontainer's
   `updateRemoteUserUID` into the `identity` field (`false` means `image`
   when `identity` is unset). `forwardPorts` entries are deduplicated after merge and each
-  named service must be in the sandbox's `services`.
+  named service must be in the sandbox's `services`. `profiles` entries are
+  deduplicated too and each must name a `[profiles.*]` table
+  ([profiles](instances/profiles.md)).
+- **Profiles**: `[profiles.*]` deserialize into `Profile` (no fields yet,
+  `deny_unknown_fields`); `Config::validate`, run by both parsers, checks
+  their names.
 - **Templates** are never validated on their own, only through the
   sandboxes that extend them.
 - **Services** have no `extends`. `resolve_service` hashes the raw table,
@@ -128,7 +135,8 @@ config ([rebuild and drift](instances/rebuild-and-drift.md)):
 
 - `sandbox_hash`: `short_hash` of the merged sandbox table's TOML (a
   `BTreeMap`, so key-sorted and stable) minus `autostart`, `dispatcher`,
-  `inbox` and `forwardPorts` (they apply without recreating the container).
+  `inbox`, `placement`, `forwardPorts` and `profiles` (they apply without
+  recreating the container).
   `folders` entries that only restate the default (`{ path = "x" }`,
   `worktree = "auto"`) are normalized to `"x"` first.
 - Service `config_hash`: the raw `[services.<name>]` table.
