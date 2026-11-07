@@ -9,6 +9,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
 `devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`,
+`devsbd/src/open.rs`,
 `devsbd/src/rpc_server.rs`, `devsbd/src/rpc_runs.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
@@ -18,12 +19,14 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 |---|---|
 | `/run/devsandbox/bin/devsbd` | the binary (symlinked as `/usr/local/bin/devsbd`) |
 | `/run/devsandbox/bin/chrome`, `chromium`, `chromium-browser`, `google-chrome`, `google-chrome-stable` | symlinks to `devsbd`: the browser wrapper |
+| `/run/devsandbox/bin/xdg-open`, `sensible-browser`, `x-www-browser`, `www-browser` | symlinks to `devsbd`: the opener |
+| `/usr/local/bin/xdg-open` | symlink to `/run/devsandbox/bin/devsbd`, made only when nothing was there |
 | `/run/devsandbox/devsbd.ctl` (0600) | bridges attach here (root only) |
 | `/run/devsandbox/ssh-agent.sock` (0666) | agent socket for container processes |
 | `/run/devsandbox/api.sock` (0666) | in-container clients: first byte `n` = outbox poke, `c` = control request |
 | `/run/devsandbox/devsbd.pid` | flock + `<pid> <build hash>` |
 | `/run/devsandbox/boot`, `boot.log` | boot file (host-written) and its commands' output |
-| `/var/lib/devsandbox/outbox/` (1777) | queued notify/thread records |
+| `/var/lib/devsandbox/outbox/` (1777) | queued notify/thread/open records |
 | `/var/lib/devsandbox/runs/` (1777) | tracked runs |
 | `/var/lib/devsandbox/sessions/` (1777) | interactive sessions; `<id>/sock` (0600) is a session's socket |
 
@@ -403,6 +406,34 @@ fails, the wrapper says so on stderr (`devsbd: <name>: no user namespace
 for the browser (<step>: <errno>); starting <path> with --no-sandbox`) and
 execs with `--no-sandbox` appended. A failed exec is exit 126.
 
+## Opener: `xdg-open <url>`, `devsbd open <url>`
+
+The container has no desktop, so `devsbd` stands in for the openers:
+when `argv[0]`'s basename is one of `open::NAMES` (`xdg-open`,
+`sensible-browser`, `x-www-browser`, `www-browser`), `main` runs
+`open::run` whatever the args; `devsbd open <url>` is the same for
+scripts that want it without the names. It queues the URL as a `kind
+open` record in the outbox and pokes the daemon, like `devsbd notify`;
+the host opens it on its desktop or drops it
+([bridges.md](bridges.md#opening-urls-kind-open)).
+
+Where the names are: the host's install (`INSTALL_SCRIPT`,
+`src/devsbd.rs`) links all four to `devsbd` in `/run/devsandbox/bin`, and
+links `/usr/local/bin/xdg-open` (ahead of `/usr/bin` on every default
+`PATH`, so processes outside `devsandbox exec`'s env find it too: VS Code
+terminals, lifecycle commands) only when nothing is there, not even a
+dangling link, so an image's own `xdg-open` is never clobbered. The exec
+env's `BROWSER` points at `/run/devsandbox/bin/xdg-open`
+(`devsbd::OPENER`; [identity](../instances/identity.md#tool-environment)),
+which Python's `webbrowser` and Node's `open` read.
+
+Only the syntax is checked (`open::message`); the host decides which
+schemes it opens. Exit codes are `xdg-open`'s: 0 queued (not opened);
+1 for usage (not exactly one argument, or a record over
+`notify::MAX_RECORD`); 3 for anything without an RFC 3986 scheme (a path,
+a bare word), with `devsbd: opening files isn't supported; open URLs only`
+on stderr; 4 when the record can't be written.
+
 ## `devsbd vscode-goto <abs>[:line[:col]] [--wait SECS]`
 
 Opens a file in the VS Code window attached to this container by running
@@ -415,7 +446,7 @@ vscode` (`src/commands/vscode.rs`).
 ## `devsbd features`
 
 Prints the append-only list of CLI capabilities (`thread-send`,
-`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`, `userns`) a dispatcher may probe
+`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`, `userns`, `open`) a dispatcher may probe
 before relying on them.
 
 Limitations: [status.md](../../status.md#helper)

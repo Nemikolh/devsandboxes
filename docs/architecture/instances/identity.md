@@ -160,7 +160,12 @@ an exec that can't run leaves it unknown (`None`).
 | root | `On` | `DEVSANDBOX_BROWSER_SANDBOX=1`; `DEVSANDBOX_CHROME`, `CHROME_PATH`, `CHROME_BIN`, `PUPPETEER_EXECUTABLE_PATH` = `/run/devsandbox/bin/chrome`; `PATH=/run/devsandbox/bin:<image PATH>` |
 | root | `Off`, unknown | the sandbox-off knobs |
 
-A root plan also gets `PIP_ROOT_USER_ACTION=ignore` and
+Every plan with the helper installed also gets `BROWSER=/run/devsandbox/bin/xdg-open`
+(`devsbd::OPENER`, the helper's opener:
+[in-container](../helper/in-container.md#opener-xdg-open-url-devsbd-open-url)),
+whatever the verdict: Python's `webbrowser` reads it first, and Node's
+`open` falls back to it with no desktop, so the `xdg-open` link on `PATH`
+alone misses both. A root plan also gets `PIP_ROOT_USER_ACTION=ignore` and
 `BUNDLE_SILENCE_ROOT_WARNING=1`, whatever the verdict. The sandbox-off
 knobs (`SANDBOX_OFF_KNOBS`) are `PUPPETEER_DANGEROUS_NO_SANDBOX=1`,
 `ELECTRON_DISABLE_SANDBOX=1`, `QTWEBENGINE_DISABLE_SANDBOX=1`,

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Links opened in a sandbox open on your desktop.** A program in a sandbox that opens a URL (`xdg-open`, `$BROWSER`, `sensible-browser`, Python's `webbrowser`, Node's `open`, a CLI's "press enter to open the browser") now opens it in the host's browser instead of failing. Only `http` and `https` URLs open; anything else, a URL more than 30 seconds old by the time it reaches the host, or more than 5 in 10 seconds from one instance is refused with a line in `serve.log`. Opening files (`xdg-open report.pdf`) isn't supported. The host needs a desktop session: a sandbox on a machine you reach over ssh can't open on your laptop yet. An image's own `/usr/local/bin/xdg-open` is never overwritten; `devsbd open <url>` does the same from scripts. Existing instances get `BROWSER` once rebuilt.
+
 ## 0.9.0
 
 One user model on every runtime: inside a sandbox you are a user with your host uid/gid, so workspace files come out owned by you on rootful docker, rootless docker, rootless podman and VM-backed runtimes alike. Browsers keep their own sandbox wherever it can work, and tools are told when it can't. Interactive `exec` sessions survive a dropped connection: `--attach` gets the program back, and a machine's terminal reconnects by itself. Machines become one fleet: members with their own keys and trust, a hub, routing through other members, `run --place` to send a sandbox where there's room and `devsandbox fetch` to bring the work back. **Fleet is experimental in 0.9.0:** its commands, config, files and the protocol between machines may change between releases with no migration, so don't use it for anything you can't redo. Its entries are grouped under *Experimental: fleet* below.

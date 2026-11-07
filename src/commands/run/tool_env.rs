@@ -114,10 +114,15 @@ pub(super) fn browser_sandbox(code: Option<i32>, stderr: &str) -> Option<Browser
 /// its sandbox) the browser vars and `PATH` pointed at the wrapper, its dir
 /// before the image's `PATH` (`image_path`; Debian's default when the image
 /// sets none). Otherwise the sandbox-off knobs. The root silencers on root
-/// plans. Keys the sandbox sets itself (`user_keys`: its
+/// plans. `BROWSER` at the helper's opener on every plan when the helper is
+/// installed (`helper`; without it the path wouldn't exist): Python's
+/// `webbrowser` reads it first, and Node's `open` falls back to it with no
+/// desktop, so the `xdg-open` link on `PATH` alone misses both. Keys the
+/// sandbox sets itself (`user_keys`: its
 /// `containerEnv`/`remoteEnv`, `PATH` included) are left out.
 pub(super) fn tool_env(
     root_plan: bool,
+    helper: bool,
     sandbox: Option<&BrowserSandbox>,
     image_path: Option<&str>,
     user_keys: &BTreeSet<&str>,
@@ -134,6 +139,9 @@ pub(super) fn tool_env(
     };
     if root_plan {
         env.extend(ROOT_SILENCERS.map(|(k, v)| (k, v.to_string())));
+    }
+    if helper {
+        env.push(("BROWSER", crate::devsbd::OPENER.to_string()));
     }
     env.into_iter().filter(|(k, _)| !user_keys.contains(k)).map(|(k, v)| (k.to_string(), v)).collect()
 }
@@ -204,7 +212,10 @@ mod tests {
         env.keys().map(String::as_str).collect()
     }
 
-    const KNOBS: [&str; 5] = [
+    const OPENER: &str = "/run/devsandbox/bin/xdg-open";
+
+    const KNOBS: [&str; 6] = [
+        "BROWSER",
         "CHROMIUM_FLAGS",
         "ELECTRON_DISABLE_SANDBOX",
         "PLAYWRIGHT_MCP_SANDBOX",
@@ -217,26 +228,31 @@ mod tests {
         let none = BTreeSet::new();
         let on = Some(BrowserSandbox::On);
         let seccomp = off("no user namespaces: seccomp");
-        // Non-root, on: the opt-in only.
-        let env = tool_env(false, on.as_ref(), Some("/usr/bin"), &none);
-        assert_eq!(env, BTreeMap::from([("DEVSANDBOX_BROWSER_SANDBOX".into(), "1".into())]));
-        // Non-root, off or unknown: the knobs.
+        // Non-root, on: the opt-in and the opener only.
+        let env = tool_env(false, true, on.as_ref(), Some("/usr/bin"), &none);
+        assert_eq!(
+            env,
+            BTreeMap::from([("BROWSER".into(), OPENER.into()), ("DEVSANDBOX_BROWSER_SANDBOX".into(), "1".into())])
+        );
+        // Non-root, off or unknown: the knobs (and the opener).
         for sandbox in [seccomp.as_ref(), None] {
-            let env = tool_env(false, sandbox, Some("/usr/bin"), &none);
+            let env = tool_env(false, true, sandbox, Some("/usr/bin"), &none);
             assert_eq!(keys(&env), KNOBS, "{sandbox:?}");
             assert_eq!((env["PLAYWRIGHT_MCP_SANDBOX"].as_str(), env["CHROMIUM_FLAGS"].as_str()), ("false", "--no-sandbox"));
+            assert_eq!(env["BROWSER"], OPENER);
         }
         // Root, off or unknown: the knobs and the silencers.
         let mut root = KNOBS.to_vec();
         root.extend(["PIP_ROOT_USER_ACTION", "BUNDLE_SILENCE_ROOT_WARNING"]);
         root.sort();
         for sandbox in [seccomp.as_ref(), None] {
-            let env = tool_env(true, sandbox, Some("/usr/bin"), &none);
+            let env = tool_env(true, true, sandbox, Some("/usr/bin"), &none);
             assert_eq!(keys(&env), root, "{sandbox:?}");
             assert_eq!(env["PIP_ROOT_USER_ACTION"], "ignore");
+            assert_eq!(env["BROWSER"], OPENER);
         }
         // Root, on: through the wrapper, no knobs; the silencers stay.
-        let env = tool_env(true, on.as_ref(), Some("/opt/x/bin:/usr/bin"), &none);
+        let env = tool_env(true, true, on.as_ref(), Some("/opt/x/bin:/usr/bin"), &none);
         let wrapper = "/run/devsandbox/bin/chrome";
         assert_eq!(
             env,
@@ -250,20 +266,30 @@ mod tests {
                     ("PATH", "/run/devsandbox/bin:/opt/x/bin:/usr/bin"),
                     ("PIP_ROOT_USER_ACTION", "ignore"),
                     ("BUNDLE_SILENCE_ROOT_WARNING", "1"),
+                    ("BROWSER", OPENER),
                 ]
                 .map(|(k, v)| (k.to_string(), v.to_string()))
             )
         );
         // No image PATH: Debian's default behind the wrapper's dir.
-        let env = tool_env(true, on.as_ref(), None, &none);
+        let env = tool_env(true, true, on.as_ref(), None, &none);
         assert_eq!(env["PATH"], "/run/devsandbox/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
         // The sandbox's own keys win by absence, PATH too.
         let user = BTreeSet::from(["CHROMIUM_FLAGS", "PIP_ROOT_USER_ACTION", "DEVSANDBOX_BROWSER_SANDBOX", "PATH", "CHROME_BIN"]);
-        let env = tool_env(true, None, None, &user);
+        let env = tool_env(true, true, None, None, &user);
         assert!(!env.contains_key("CHROMIUM_FLAGS") && !env.contains_key("PIP_ROOT_USER_ACTION"), "{env:?}");
-        assert!(tool_env(false, on.as_ref(), None, &user).is_empty());
-        let env = tool_env(true, on.as_ref(), Some("/usr/bin"), &user);
-        assert_eq!(keys(&env), ["BUNDLE_SILENCE_ROOT_WARNING", "CHROME_PATH", "DEVSANDBOX_CHROME", "PUPPETEER_EXECUTABLE_PATH"]);
+        assert_eq!(keys(&tool_env(false, true, on.as_ref(), None, &user)), ["BROWSER"]);
+        let env = tool_env(true, true, on.as_ref(), Some("/usr/bin"), &user);
+        assert_eq!(
+            keys(&env),
+            ["BROWSER", "BUNDLE_SILENCE_ROOT_WARNING", "CHROME_PATH", "DEVSANDBOX_CHROME", "PUPPETEER_EXECUTABLE_PATH"]
+        );
+        // A sandbox's own BROWSER wins too.
+        let user = BTreeSet::from(["BROWSER"]);
+        assert!(!tool_env(true, true, on.as_ref(), None, &user).contains_key("BROWSER"));
+        assert!(!tool_env(false, true, None, None, &user).contains_key("BROWSER"));
+        // No helper, no opener to point at.
+        assert!(!tool_env(false, false, None, None, &BTreeSet::new()).contains_key("BROWSER"));
     }
 
     #[test]

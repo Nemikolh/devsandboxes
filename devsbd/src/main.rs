@@ -9,6 +9,7 @@ mod daemon;
 mod identity;
 mod json;
 mod listeners;
+mod open;
 mod outbox;
 mod rpc_runs;
 mod rpc_server;
@@ -59,14 +60,19 @@ fn build_hash() -> String {
 /// which reads as "none of these". Append-only; separate from `version`,
 /// whose one-line output is the host's install check, and from the frame
 /// protocol's `caps`, which describe the host link, not the CLI.
-const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session", "userns"];
+const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session", "userns", "open"];
 
 fn main() {
     // Multicall: under a browser's name (the links in /run/devsandbox/bin)
-    // this is the browser wrapper, whatever the args.
+    // this is the browser wrapper, under an opener's (`xdg-open`, …) the
+    // opener, whatever the args.
     let mut argv = std::env::args_os();
-    if let Some(name) = argv.next().as_deref().and_then(browser::invoked_as) {
+    let argv0 = argv.next();
+    if let Some(name) = argv0.as_deref().and_then(browser::invoked_as) {
         std::process::exit(browser::run(name, argv.collect()));
+    }
+    if let Some(name) = argv0.as_deref().and_then(open::invoked_as) {
+        std::process::exit(open::run(name, argv.collect()));
     }
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -76,6 +82,7 @@ fn main() {
         Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         Some("boot") => exit_on_err(boot::run()),
         Some("notify") => exit_on_err(outbox::run(&args.collect::<Vec<_>>())),
+        Some("open") => std::process::exit(open::run("devsbd open", std::env::args_os().skip(2).collect())),
         // `put`/`send`/`withdraw`/`rm` queue in the outbox (no host needed);
         // `ls` asks the host.
         Some("thread") => {
@@ -107,7 +114,7 @@ fn main() {
         Some("userns") => std::process::exit(userns::run(&args.collect::<Vec<_>>())),
         _ => {
             eprintln!(
-                "usage: devsbd version|features|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|vscode-goto"
+                "usage: devsbd version|features|daemon|bridge|boot|notify|open|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|vscode-goto"
             );
             std::process::exit(2);
         }

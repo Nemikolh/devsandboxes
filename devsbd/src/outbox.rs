@@ -357,7 +357,7 @@ pub fn move_aside(path: &Path) -> io::Result<()> {
 
 /// Tell a running daemon there's something to flush. Best-effort: no daemon
 /// means the record waits for the next one (or its periodic retry).
-fn poke() {
+pub fn poke() {
     if let Ok(mut s) = UnixStream::connect(daemon::API_SOCK) {
         let _ = s.write_all(&[daemon::API_POKE]);
     }

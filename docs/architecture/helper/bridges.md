@@ -130,7 +130,9 @@ write that changed nothing shows nothing. Otherwise:
 
 ### Opening URLs (`kind open`)
 
-An `open` record (`notify::Message::Open`, a URL a container asked to open)
+An `open` record (`notify::Message::Open`, a URL a container asked to open
+through the helper's opener,
+[in-container](in-container.md#opener-xdg-open-url-devsbd-open-url))
 never reaches the Inbox: `apply_message` and `inbox::decide` refuse one. The
 sink checks it with `open::decide`, pure over the URL, the record's `at`, the
 host's clock and a limiter:

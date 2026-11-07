@@ -12,7 +12,15 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-(none)
+- **helper**: open routing. Step 1 shipped: a container's `xdg-open`,
+  `sensible-browser`, `x-www-browser` / `www-browser` and `$BROWSER`
+  open `http(s)` URLs with the host's opener on the instance's own host.
+  Next: profiles in the config and state (step 2), then switching and
+  `profiles.toml`, loopback and OAuth-callback forwards, delivery to the
+  member that last attached, dashboard feedback (steps 3-6). Meanwhile an
+  instance with no attached desktop on its host (a remote one) has its
+  URLs refused (`no display to open <url> on` in `serve.log`).
+  → [plan](plans/active/open-routing.md)
 
 ## Planned
 
@@ -34,11 +42,6 @@ is frozen: no new work on it.
   Inbox), in the order of
   [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
   → [plan](plans/active/helper-rpc.md)
-- **helper**: a container's `xdg-open` / `$BROWSER` opens on the user's
-  desktop: a shim, loopback and OAuth-callback forwards, profiles (config
-  collections of sandboxes, one per instance, switchable at runtime;
-  browser commands host-local), delivery to the member that last attached.
-  → [plan](plans/active/open-routing.md)
 - **machines**: VS Code on remote rows (spike), nameless commands across
   every machine (remote Inbox threads dropped with the Inbox).
   → [plan](plans/active/machines-next.md)

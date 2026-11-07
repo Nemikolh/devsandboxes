@@ -2250,6 +2250,104 @@ mod tests {
         })
     }
 
+    /// Docker-gated end to end: `xdg-open <url>` (the `/usr/local/bin` link,
+    /// found on the container's own `PATH`) and `$BROWSER <url>` (the exec
+    /// env's) in a container reach the production sink's opener; a path is
+    /// refused in the container with `xdg-open`'s exit 3.
+    #[test_utils::docker_test(helper)]
+    fn container_opens_reach_the_opener_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-open-test-{stamp}");
+        let cleanup = || {
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            fn apply(n: Notification) -> Result<Option<(String, crate::inbox::Shown)>, String> {
+                panic!("an open reached the Inbox: {:?}", n.message)
+            }
+            let (tx, opened) = mpsc::channel();
+            let tx = Mutex::new(tx);
+            let hooks = SinkHooks {
+                on_shown: None,
+                opener: Arc::new(move |instance: &str, url: &str| {
+                    let _ = tx.lock().unwrap().send((instance.to_string(), url.to_string()));
+                }),
+                log: |line| panic!("open refused or dropped: {line}"),
+            };
+            let to = Services::new("open-test".into(), "open-test-id".into(), sink(apply, hooks), no_control());
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+            let exec = |env: &[&str], script: &str| {
+                let mut cmd = crate::test_support::runtime_cmd();
+                cmd.arg("exec");
+                for e in env {
+                    cmd.args(["-e", e]);
+                }
+                cmd.args([name.as_str(), "sh", "-c", script]).output().unwrap()
+            };
+
+            let link = exec(&[], "readlink /usr/local/bin/xdg-open");
+            assert_eq!(String::from_utf8_lossy(&link.stdout).trim(), BIN, "linked where nothing was");
+            assert!(exec(&[], "xdg-open https://example.test/a").status.success());
+            assert_eq!(
+                opened.recv_timeout(Duration::from_secs(15)).expect("xdg-open delivered"),
+                ("open-test".to_string(), "https://example.test/a".to_string())
+            );
+            let browser = format!("BROWSER={}", crate::devsbd::OPENER);
+            assert!(exec(&[&browser], "$BROWSER 'https://example.test/b?x=1'").status.success());
+            assert_eq!(
+                opened.recv_timeout(Duration::from_secs(15)).expect("$BROWSER delivered"),
+                ("open-test".to_string(), "https://example.test/b?x=1".to_string())
+            );
+            let file = exec(&[], "xdg-open report.pdf");
+            assert_eq!(file.status.code(), Some(3));
+            assert_eq!(
+                String::from_utf8_lossy(&file.stderr).trim(),
+                "devsbd: opening files isn't supported; open URLs only"
+            );
+            assert_eq!(exec(&[], "xdg-open").status.code(), Some(1), "usage");
+            assert!(opened.recv_timeout(Duration::from_millis(300)).is_err(), "nothing else opened");
+            Ok(())
+        })
+    }
+
+    /// Docker-gated: an image's own `/usr/local/bin/xdg-open` (a file, or a
+    /// link even when it dangles) survives the install; the opener's names in
+    /// `/run/devsandbox/bin` are linked all the same.
+    #[test_utils::docker_test(helper)]
+    fn install_keeps_an_images_own_xdg_open_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let names = [format!("devsandbox-own-open-test-{stamp}"), format!("devsandbox-own-open-link-test-{stamp}")];
+        let cleanup = || {
+            for name in &names {
+                let _ = crate::test_support::runtime_cmd().args(["rm", "-f", name]).output();
+            }
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            let sh = |name: &str, script: &str| {
+                let out = crate::test_support::runtime_cmd().args(["exec", name, "sh", "-c", script]).output().unwrap();
+                assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            let mine = "printf '#!/bin/sh\\necho mine\\n' > /usr/local/bin/xdg-open && chmod 755 /usr/local/bin/xdg-open";
+            let dangling = "ln -s /opt/nowhere/xdg-open /usr/local/bin/xdg-open";
+            for (name, setup) in names.iter().zip([mine, dangling]) {
+                assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", name, "alpine:3.20", "sleep", "300"])));
+                sh(name, setup);
+                install(name, None).unwrap();
+                let opener = format!("readlink {}", crate::devsbd::OPENER);
+                assert_eq!(sh(name, &opener), "devsbd", "the BIN_DIR names are linked");
+            }
+            assert_eq!(sh(&names[0], "xdg-open https://example.test"), "mine", "the image's file kept");
+            assert_eq!(sh(&names[1], "readlink /usr/local/bin/xdg-open"), "/opt/nowhere/xdg-open", "the image's link kept");
+            Ok(())
+        })
+    }
+
     /// Docker-gated end to end: with no host attached, a second `devsbd thread
     /// put` for the same key replaces the queued first one, so a dispatcher
     /// re-asserting its threads for hours doesn't deliver a backlog when a

@@ -148,6 +148,10 @@ pub const BIN: &str = "/run/devsandbox/bin/devsbd";
 /// The browser wrapper (`devsbd` as `chrome`, linked by `INSTALL_SCRIPT`).
 pub const BROWSER_WRAPPER: &str = "/run/devsandbox/bin/chrome";
 
+/// The opener (`devsbd` as `xdg-open`, linked by `INSTALL_SCRIPT`), what
+/// the tool env's `BROWSER` points at.
+pub const OPENER: &str = "/run/devsandbox/bin/xdg-open";
+
 /// The dir of [`BIN`] and the wrapper's links, first on a root plan's `PATH`.
 pub const BIN_DIR: &str = "/run/devsandbox/bin";
 
@@ -159,16 +163,24 @@ pub const BIN_DIR: &str = "/run/devsandbox/bin";
 /// sandbox user; the `/usr/local/bin` symlink puts `devsbd` on `PATH` for scripts.
 /// The browser names next to it are the helper's browser wrapper
 /// (`devsbd/src/browser.rs` `NAMES`; [`BROWSER_WRAPPER`] is the one the tool env
-/// points at). The dirs and the `/usr/local/bin` link are best-effort (read-only or missing dirs), each wrapped in `{ …; }` so
-/// it can't turn a good install into a failure.
+/// points at), and so are the opener names (`devsbd/src/open.rs` `NAMES`;
+/// [`OPENER`] is `BROWSER`'s). `/usr/local/bin/xdg-open` (ahead of
+/// `/usr/bin` on every default `PATH`, so it covers processes outside
+/// `devsandbox exec`'s env too) is linked only when nothing is there, not
+/// even a dangling link: an image's own `xdg-open` is never clobbered, and
+/// one this script made already points at `devsbd`. The dirs and the
+/// `/usr/local/bin` links are best-effort (read-only or missing dirs), each
+/// wrapped in `{ …; }` so it can't turn a good install into a failure.
 const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
     && cat > /run/devsandbox/bin/devsbd.tmp \
     && chmod 755 /run/devsandbox/bin/devsbd.tmp \
     && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd \
     && for n in chrome chromium chromium-browser google-chrome google-chrome-stable; do ln -sf devsbd /run/devsandbox/bin/$n || exit; done \
+    && for n in xdg-open sensible-browser x-www-browser www-browser; do ln -sf devsbd /run/devsandbox/bin/$n || exit; done \
     && { { mkdir -p /var/lib/devsandbox/outbox && chmod 1777 /var/lib/devsandbox/outbox; } 2>/dev/null || true; } \
     && { { mkdir -p /var/lib/devsandbox/runs && chmod 1777 /var/lib/devsandbox/runs; } 2>/dev/null || true; } \
     && { { mkdir -p /var/lib/devsandbox/sessions && chmod 1777 /var/lib/devsandbox/sessions; } 2>/dev/null || true; } \
+    && { { [ -e /usr/local/bin/xdg-open ] || [ -L /usr/local/bin/xdg-open ] || ln -s /run/devsandbox/bin/devsbd /usr/local/bin/xdg-open; } 2>/dev/null || true; } \
     && { ln -sf /run/devsandbox/bin/devsbd /usr/local/bin/devsbd 2>/dev/null || true; }";
 
 /// Boot file write, atomic for the same reason as `INSTALL_SCRIPT`: a hook
@@ -790,6 +802,23 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains(
             "&& for n in chrome chromium chromium-browser google-chrome google-chrome-stable; \
              do ln -sf devsbd /run/devsandbox/bin/$n || exit; done &&"
+        ));
+    }
+
+    #[test]
+    fn install_links_the_opener_names() {
+        assert_eq!(OPENER, format!("{BIN_DIR}/xdg-open"));
+        // The helper's `open::NAMES`, required like the browser's (`BROWSER`
+        // points at one).
+        assert!(INSTALL_SCRIPT.contains(
+            "&& for n in xdg-open sensible-browser x-www-browser www-browser; \
+             do ln -sf devsbd /run/devsandbox/bin/$n || exit; done &&"
+        ));
+        // `/usr/local/bin/xdg-open` only where nothing (not even a dangling
+        // link) is, never forced, best-effort.
+        assert!(INSTALL_SCRIPT.contains(
+            "&& { { [ -e /usr/local/bin/xdg-open ] || [ -L /usr/local/bin/xdg-open ] \
+             || ln -s /run/devsandbox/bin/devsbd /usr/local/bin/xdg-open; } 2>/dev/null || true; } &&"
         ));
     }
 

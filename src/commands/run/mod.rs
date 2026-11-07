@@ -812,8 +812,13 @@ pub(crate) fn materialize(
         .collect();
     // A root plan's tool env puts the browser wrapper's dir before the
     // image's PATH (`exec -e PATH` replaces it); unreadable reads as unset.
-    let tool_env =
-        tool_env::tool_env(root_plan, browser_sandbox.as_ref(), tool_env::image_path(&facts.env), &user_keys);
+    let tool_env = tool_env::tool_env(
+        root_plan,
+        devsbd_arch.is_some(),
+        browser_sandbox.as_ref(),
+        tool_env::image_path(&facts.env),
+        &user_keys,
+    );
     eprintln!("{}", tool_env::summary(root_plan, browser_sandbox.as_ref()));
     let workspace_file = write_workspace_file(
         &container,
