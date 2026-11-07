@@ -17,7 +17,9 @@ Code: `src/config.rs` (`Config::profiles`, `Profile`, `check_profile_name`,
 (`InstanceRow::profile`, `profile_disallowed`, `allowed_now`),
 `src/commands/ps.rs` (`PsRow`, `join_state`, `cells`),
 `src/commands/inspect.rs` (`profile_line`) and `src/tui/ui.rs`
-(`instance_tree_row`, `profile_detail_line`).
+(`instance_tree_row`, `profile_detail_line`); used to open URLs by
+`src/open.rs` (`HostProfile`, `parse_profiles`, `load_profiles`,
+`open_argv`, `open_plan`, `open_on_desktop`).
 
 ## Declaration
 
@@ -107,6 +109,40 @@ profile; nothing moves it.
   dim, yellow when flagged; Detail has a `profile: <p>` line, which says
   `(not allowed by the config any more)` in yellow when flagged. The
   dashboard reads the row's fields; it loads no config.
+
+## On the opening host
+
+What a profile does on a host is that host's own `profiles.toml`, next to
+`state.toml` (`open::profiles_path`): one `[<profile>]` table per profile,
+with `open`, the command that opens a URL in it, a non-empty array of
+strings; the URL is appended as its last argument. Any other key, or a
+top-level key, is a parse error (`open::HostProfile` has
+`deny_unknown_fields`; `open::parse_profiles`).
+
+```toml
+[work]
+open = ["google-chrome", "--profile-directory=Profile 2"]
+
+[personal]
+open = ["firefox"]
+```
+
+`open::open_on_desktop` reads it (`open::load_profiles`) and `state.toml` on
+every open, so an edit applies without a daemon restart. A missing file is
+no profiles; an unreadable or invalid one is a `serve.log` line and counts
+as none. `open::open_plan` finds the instance by `instance_id` (a rename
+doesn't lose it) and opens with its profile's `open` (`open::open_argv`).
+No instance, no profile or a profile the file doesn't map: the host's
+opener (`xdg-open`, `open` on macOS). A profile `profile_disallowed` flags
+(its sandbox's allowed set loaded with `snapshot::allowed_now`) also gets
+the host's opener, with a `serve.log` warning (`<instance>: profile `<p>`
+no longer allowed by the config; opening <url> with the default opener`).
+The display rule is the same for every command
+([bridges.md](../helper/bridges.md#opening-urls-kind-open)).
+
+Commands only ever come from the opening host's own `profiles.toml`, never
+from a config: only a profile's name comes from `state.toml`, so no config
+(nor, over a fleet, any machine) can make this host run a command.
 
 ## Drift
 

@@ -263,7 +263,9 @@ fn poll(
 ) {
     let hooks = SinkHooks {
         on_shown: Some(on_shown),
-        opener: Arc::new(move |instance: &str, url: &str| crate::open::open_on_desktop(instance, url, log)),
+        opener: Arc::new(move |instance: &str, instance_id: &str, url: &str| {
+            crate::open::open_on_desktop(instance, instance_id, url, log)
+        }),
         log,
     };
     let worker = Bridges::spawn_worker(Some(hooks), board.clone());

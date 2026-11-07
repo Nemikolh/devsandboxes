@@ -1229,12 +1229,13 @@ impl Bridges {
 /// showed (see [`Bridges::spawn_worker`]). Runs on a bridge's handler thread.
 pub type OnShown = Box<dyn Fn(&str, String) + Send + Sync>;
 
-/// Opens `(instance, url)` for an `open` record that passed
-/// [`crate::open::decide`]. Runs on a bridge's handler thread before the
+/// Opens `(instance, instance_id, url)` for an `open` record that passed
+/// [`crate::open::decide`]; the id finds the instance's `state.toml` entry
+/// (its profile) whatever its name now. Runs on a bridge's handler thread before the
 /// daemon's `ok`, so it must not wait on the browser: the production one is
 /// [`crate::open::open_on_desktop`] (spawn, reap on its own thread).
 /// Injectable so tests see the URL instead of a browser opening.
-pub type Opener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+pub type Opener = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 /// What a notify-serving [`Bridges`] does besides storing messages.
 pub struct SinkHooks {
@@ -1276,7 +1277,7 @@ fn sink(apply: Apply, hooks: SinkHooks) -> Sink {
                 || opens.lock().unwrap_or_else(|e| e.into_inner()).allow(&n.instance, None, Instant::now());
             match crate::open::decide(url, *at, now, limit).log_line(&n.instance, url) {
                 Some(line) => log(&line),
-                None => opener(&n.instance, url),
+                None => opener(&n.instance, &n.instance_id, url),
             }
             return Ok(());
         }
@@ -1825,8 +1826,8 @@ mod tests {
         let tx = Mutex::new(tx);
         let hooks = SinkHooks {
             on_shown: None,
-            opener: Arc::new(move |instance: &str, url: &str| {
-                let _ = tx.lock().unwrap().send((instance.to_string(), url.to_string()));
+            opener: Arc::new(move |instance: &str, instance_id: &str, url: &str| {
+                let _ = tx.lock().unwrap().send((instance.to_string(), instance_id.to_string(), url.to_string()));
             }),
             log: |line| LOGGED.lock().unwrap().push(line.to_string()),
         };
@@ -1840,7 +1841,7 @@ mod tests {
         send(1, notify::Message::Open { at: now, url: "https://example.test/a".into() });
         assert_eq!(
             opened.recv_timeout(Duration::from_secs(5)).unwrap(),
-            ("web-1".to_string(), "https://example.test/a".to_string())
+            ("web-1".to_string(), "web-1-id".to_string(), "https://example.test/a".to_string())
         );
         send(3, notify::Message::Open { at: now, url: "ssh://example.test".into() });
         send(5, notify::Message::Open { at: now - 3600, url: "https://example.test/old".into() });
@@ -2272,7 +2273,7 @@ mod tests {
             let tx = Mutex::new(tx);
             let hooks = SinkHooks {
                 on_shown: None,
-                opener: Arc::new(move |instance: &str, url: &str| {
+                opener: Arc::new(move |instance: &str, _: &str, url: &str| {
                     let _ = tx.lock().unwrap().send((instance.to_string(), url.to_string()));
                 }),
                 log: |line| panic!("open refused or dropped: {line}"),

@@ -147,12 +147,18 @@ host's clock and a limiter:
 
 A refused or dropped record is a `serve.log` line naming the instance and the
 URL (`Verdict::log_line`, through `SinkHooks::log`). One that passes goes to
-the `SinkHooks::opener` (`bridge::Opener`, injectable so tests see the URL).
+the `SinkHooks::opener` (`bridge::Opener`, called with the instance's name,
+its `instance_id` and the URL; injectable so tests see the URL).
 Either way the sink returns `Ok` and the daemon gets `ok`: taken, not opened.
 
 The production opener, `open::open_on_desktop`, runs on its own thread: it
-finds a display, spawns `open::opener_argv` (`xdg-open <url>` on Linux,
-`open <url>` on macOS) with stdio null and reaps it. On Linux the display is
+finds a display, picks the command and spawns it with stdio null and reaps
+it. The command is the instance's profile's, from this host's
+`profiles.toml` ([profiles.md](../instances/profiles.md#on-the-opening-host)):
+`open::open_plan` finds the instance in `state.toml` by `instance_id` and maps
+its `profile` (`open::open_argv`); no instance, no profile, an unmapped or a
+no-longer-allowed one get `open::opener_argv` (`xdg-open <url>` on Linux,
+`open <url>` on macOS). The display rule below applies to either. On Linux the display is
 `DISPLAY` or `WAYLAND_DISPLAY` in the daemon's env, else in the user
 manager's current env (`systemctl --user show-environment`,
 `open::session_display_env`, with `XAUTHORITY`), passed to the child: GNOME

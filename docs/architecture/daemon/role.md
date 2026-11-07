@@ -33,7 +33,7 @@ Code: `src/serve/mod.rs` (module list), `endpoint.rs` (`socket_dir`,
 State lives on disk, next to `state.toml` in `<data-dir>/devsandbox/`
 (`$XDG_DATA_HOME`, else `~/.local/share`): `state.toml` (instances),
 `inbox.json`, `forwards.toml`, `machines.toml`, `daemon.config.toml`,
-`logs/verbs/`. The daemon keeps only caches (snapshots, links, bridges) and
+`profiles.toml` (the user's, read per open), `logs/verbs/`. The daemon keeps only caches (snapshots, links, bridges) and
 writes through the same locked read-modify-writes as the CLI. So any
 command still works without a daemon: verbs fall back to running in the
 CLI's process, Inbox mutations run locally, and a new daemon picks up

@@ -1,12 +1,20 @@
 //! Opening a container's URL on this host (docs/architecture/helper/bridges.md,
 //! "Opening URLs (`kind open`)"): the policy an `open` record passes before
 //! the bridge's sink hands it to the opener, and the system opener itself.
-//! The policy is pure (clocks and the limiter passed in); only
-//! [`open_on_desktop`] touches the environment and spawns.
+//! The policy is pure (clocks and the limiter passed in), and so is the
+//! choice of command ([`open_plan`] over this host's `profiles.toml`); only
+//! [`open_on_desktop`] touches the environment, the files and spawns.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+
+use crate::state::{Instance, State};
 
 /// An `open` record queued longer ago than this is dropped at delivery: the
 /// outbox keeps records while no host is attached, and an OAuth URL opening
@@ -85,6 +93,93 @@ pub fn opener_argv(os: &str, url: &str) -> Option<Vec<String>> {
     }
 }
 
+/// What one profile does on this host: a `[<profile>]` table of
+/// `profiles.toml` (docs/architecture/instances/profiles.md, *On the opening
+/// host*).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProfile {
+    /// The command that opens a URL in this profile (a browser and its
+    /// profile flag); the URL is appended as the last argument.
+    pub open: Vec<String>,
+}
+
+/// `profiles.toml`, by profile name. Commands only ever come from this
+/// host's own file: only a profile's *name* comes from `state.toml` (and,
+/// later, over a fleet link), so no config or machine can make this host run
+/// a command.
+pub type HostProfiles = BTreeMap<String, HostProfile>;
+
+/// `profiles.toml`, next to `state.toml`.
+pub fn profiles_path() -> Result<PathBuf> {
+    Ok(State::path()?.with_file_name("profiles.toml"))
+}
+
+/// Parse `profiles.toml`'s contents: `[<profile>]` tables with a non-empty
+/// `open` array of strings, nothing else. An empty file is no profiles.
+pub fn parse_profiles(contents: &str) -> Result<HostProfiles> {
+    let profiles: HostProfiles = toml::from_str(contents)?;
+    if let Some(name) = profiles.iter().find(|(_, p)| p.open.is_empty()).map(|(n, _)| n) {
+        bail!("[{name}]: `open` is empty (a command and its arguments)");
+    }
+    Ok(profiles)
+}
+
+/// The profiles in `path`; a missing file is none.
+pub fn load_profiles(path: &Path) -> Result<HostProfiles> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_profiles(&contents).with_context(|| format!("invalid {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HostProfiles::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// The argv that opens `url` in `profile` on `os`: the profile's `open`
+/// command from `profiles` with `url` appended when it maps one, else the
+/// system opener ([`opener_argv`]); also for no profile.
+pub fn open_argv(os: &str, profile: Option<&str>, profiles: &HostProfiles, url: &str) -> Option<Vec<String>> {
+    match profile.and_then(|p| profiles.get(p)) {
+        Some(p) => Some(p.open.iter().cloned().chain([url.to_string()]).collect()),
+        None => opener_argv(os, url),
+    }
+}
+
+/// How one URL opens: the argv ([`open_argv`]; `None`: no known opener on
+/// `os`) and a `serve.log` warning to write first, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPlan {
+    pub argv: Option<Vec<String>>,
+    pub warning: Option<String>,
+}
+
+/// Plan opening `url` for `instance` (its `state.toml` entry `inst`, found
+/// by id; `None` when it's gone): in the instance's profile, unless
+/// `snapshot::profile_disallowed` says its sandbox no longer allows that one
+/// (`allowed` is asked only then, it loads the config), in which case the
+/// system opener and a warning (config drift is flagged, never followed).
+/// No instance or no profile: the system opener.
+pub fn open_plan(
+    os: &str,
+    instance: &str,
+    url: &str,
+    inst: Option<&Instance>,
+    allowed: impl FnOnce(&Instance) -> Option<Vec<String>>,
+    profiles: &HostProfiles,
+) -> OpenPlan {
+    let Some((inst, profile)) = inst.and_then(|i| Some((i, i.profile.as_deref()?))) else {
+        return OpenPlan { argv: opener_argv(os, url), warning: None };
+    };
+    if crate::snapshot::profile_disallowed(Some(profile), allowed(inst).as_deref()) {
+        return OpenPlan {
+            argv: opener_argv(os, url),
+            warning: Some(format!(
+                "{instance}: profile `{profile}` no longer allowed by the config; opening {url} with the default opener"
+            )),
+        };
+    }
+    OpenPlan { argv: open_argv(os, Some(profile), profiles, url), warning: None }
+}
+
 /// The session variables a browser on this host needs: the display
 /// (X11 or Wayland) and X11's auth cookie (GNOME's Xwayland puts it under
 /// `$XDG_RUNTIME_DIR`, so `~/.Xauthority` isn't it).
@@ -138,19 +233,36 @@ fn display_env(os: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// The production opener (`devsbd::bridge::Opener`): open `url` from
-/// `instance` with the system opener and the [`display_env`], all stdio
-/// null. Runs on its own thread (which also reaps the child), so the
-/// bridge's handler never waits on it, like `desktop::notify_desktop`. No
-/// display, no known opener or a failed spawn is one `log` line naming the
-/// instance and the URL.
-pub fn open_on_desktop(instance: &str, url: &str, log: fn(&str)) {
-    let (instance, url) = (instance.to_string(), url.to_string());
+/// `instance` (`instance_id`, so a rename doesn't lose it) with the command
+/// [`open_plan`] picks and the [`display_env`], all stdio null. `state.toml`
+/// and `profiles.toml` are read on every open, so an edit applies without a
+/// daemon restart; either one unreadable is logged and opening goes on with
+/// the system opener. Runs on its own thread (which also reaps the child),
+/// so the bridge's handler never waits on it, like
+/// `desktop::notify_desktop`. No display, no known opener or a failed spawn
+/// is one `log` line naming the instance and the URL.
+pub fn open_on_desktop(instance: &str, instance_id: &str, url: &str, log: fn(&str)) {
+    let (instance, instance_id, url) = (instance.to_string(), instance_id.to_string(), url.to_string());
     std::thread::spawn(move || {
         let os = std::env::consts::OS;
         let Some(env) = display_env(os) else {
             return log(&format!("{instance}: no display to open {url} on"));
         };
-        let Some(argv) = opener_argv(os, &url) else {
+        let profiles = profiles_path().and_then(|p| load_profiles(&p)).unwrap_or_else(|e| {
+            log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
+            HostProfiles::new()
+        });
+        let state = State::load().unwrap_or_else(|e| {
+            log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
+            State::default()
+        });
+        let inst = state.instances.values().find(|i| i.instance_id == instance_id);
+        let allowed = |i: &Instance| crate::snapshot::allowed_now(&mut BTreeMap::new(), i);
+        let plan = open_plan(os, &instance, &url, inst, allowed, &profiles);
+        if let Some(warning) = &plan.warning {
+            log(warning);
+        }
+        let Some(argv) = plan.argv else {
             return log(&format!("{instance}: no opener on {os} for {url}"));
         };
         let spawned = Command::new(&argv[0])
@@ -241,6 +353,103 @@ mod tests {
         assert_eq!(opener_argv("linux", "https://x/?a=b c"), Some(vec!["xdg-open".into(), "https://x/?a=b c".into()]));
         assert_eq!(opener_argv("macos", "https://x"), Some(vec!["open".into(), "https://x".into()]));
         assert_eq!(opener_argv("windows", "https://x"), None);
+    }
+
+    #[test]
+    fn profiles_toml_parses_open_commands() {
+        let profiles = parse_profiles(
+            "[work]\nopen = [\"google-chrome\", \"--profile-directory=Profile 2\"]\n\n[personal]\nopen = [\"firefox\"]\n",
+        )
+        .unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles["work"].open, vec!["google-chrome", "--profile-directory=Profile 2"]);
+        assert_eq!(profiles["personal"].open, vec!["firefox"]);
+        assert!(parse_profiles("").unwrap().is_empty(), "an empty file is no profiles");
+        assert!(parse_profiles("# nothing yet\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn profiles_toml_refuses_bad_entries() {
+        let err = |s: &str| format!("{:#}", parse_profiles(s).unwrap_err());
+        assert!(err("[work]\nopen = []\n").contains("[work]: `open` is empty"));
+        err("[work]\nopen = [\"chrome\", 2]\n");
+        err("[work]\nopen = \"chrome\"\n");
+        err("[work]\n");
+        assert!(err("[work]\nopen = [\"chrome\"]\nicon = \"x\"\n").contains("icon"), "unknown keys refused");
+        err("open = [\"chrome\"]\n");
+    }
+
+    #[test]
+    fn a_missing_profiles_toml_is_none() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-open-test-{}", std::process::id()));
+        assert!(load_profiles(&dir.join("profiles.toml")).unwrap().is_empty());
+    }
+
+    fn profiles() -> HostProfiles {
+        parse_profiles("[work]\nopen = [\"chrome\", \"--profile-directory=Work\"]\n").unwrap()
+    }
+
+    #[test]
+    fn open_argv_uses_a_mapped_profile_else_the_system_opener() {
+        let url = "https://x/?a=b";
+        let argv = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(open_argv("linux", Some("work"), &profiles(), url), argv(&["chrome", "--profile-directory=Work", url]));
+        assert_eq!(open_argv("macos", Some("work"), &profiles(), url), argv(&["chrome", "--profile-directory=Work", url]));
+        assert_eq!(open_argv("linux", Some("personal"), &profiles(), url), argv(&["xdg-open", url]), "unmapped");
+        assert_eq!(open_argv("macos", None, &profiles(), url), argv(&["open", url]), "no profile");
+        assert_eq!(open_argv("linux", None, &HostProfiles::new(), url), argv(&["xdg-open", url]));
+    }
+
+    /// One state entry, as `state.toml` holds it, with `profile`.
+    fn instance(profile: Option<&str>) -> Instance {
+        let profile = profile.map_or(String::new(), |p| format!("profile = \"{p}\"\n"));
+        let state: State = toml::from_str(&format!(
+            "[instance.web-1]\nsandbox = \"web\"\ninstance_id = \"web-1\"\ncontainer = \"devsandbox-web-1\"\n\
+             folder = \"/src/web\"\nworkspace = \"/workspaces/web\"\ncreated_unix = 1\n{profile}"
+        ))
+        .unwrap();
+        state.instances.into_values().next().unwrap()
+    }
+
+    #[test]
+    fn open_plan_picks_the_instance_profile_command() {
+        let url = "https://x";
+        let allowed = |set: &'static [&'static str]| {
+            move |_: &Instance| Some(set.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        let plan = |inst: Option<&Instance>, set: &'static [&'static str]| {
+            open_plan("linux", "web-1", url, inst, allowed(set), &profiles())
+        };
+        let argv = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let default = OpenPlan { argv: argv(&["xdg-open", url]), warning: None };
+
+        let work = instance(Some("work"));
+        assert_eq!(
+            plan(Some(&work), &["work", "personal"]),
+            OpenPlan { argv: argv(&["chrome", "--profile-directory=Work", url]), warning: None },
+            "mapped"
+        );
+        assert_eq!(plan(Some(&instance(Some("personal"))), &["work", "personal"]), default, "unmapped");
+        assert_eq!(plan(Some(&instance(None)), &["work"]), default, "no profile");
+        assert_eq!(plan(None, &["work"]), default, "no instance");
+        assert_eq!(
+            open_plan("linux", "web-1", url, Some(&work), |_| None, &profiles()).argv,
+            argv(&["chrome", "--profile-directory=Work", url]),
+            "an allowed set that can't be told doesn't flag"
+        );
+        assert_eq!(
+            plan(Some(&work), &["personal"]),
+            OpenPlan {
+                argv: argv(&["xdg-open", url]),
+                warning: Some(
+                    "web-1: profile `work` no longer allowed by the config; opening https://x with the default opener"
+                        .into()
+                ),
+            },
+            "disallowed"
+        );
+        let unasked = |_: &Instance| -> Option<Vec<String>> { panic!("no profile: the config isn't loaded") };
+        open_plan("linux", "web-1", url, Some(&instance(None)), unasked, &profiles());
     }
 
     #[test]
