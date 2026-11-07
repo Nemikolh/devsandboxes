@@ -137,7 +137,7 @@ Sandboxes reach a service by its name as hostname (network alias, or `/etc/hosts
 
 Declares a profile: a named collection of sandboxes, whose members are the sandboxes listing it in `profiles` (or every sandbox that sets no `profiles`). The table takes no keys yet; any key errors. Names are `[a-z0-9][a-z0-9_.-]*`; anything else errors when the file loads. What a profile does on a host isn't set here.
 
-Each instance is in one of its sandbox's allowed profiles, picked at `devsandbox run`: `--profile <name>` (refused unless allowed), else the one last chosen with `--profile` for that sandbox while it's still allowed, else the first allowed. A dispatcher's children are in the dispatcher's profile.
+Each instance is in one of its sandbox's allowed profiles, picked at `devsandbox run`: `--profile <name>` (refused unless allowed), else the one last chosen with `--profile` (or `devsandbox profile`) for that sandbox while it's still allowed, else the first allowed. A dispatcher's children are in the dispatcher's profile. `devsandbox profile <instance> <name>` switches an existing instance to another allowed profile without restarting it.
 
 ```toml
 [profiles.work]

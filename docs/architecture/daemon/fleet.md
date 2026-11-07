@@ -627,7 +627,8 @@ there, the error names both sockets.
   (fleet plan decision 15), within the machine's trust: `logs`
   (`containers.logs`), `logs --build` (`instances.buildLog`; `--follow`,
   its pages by `offset`), `inspect` (`containers.inspect`), `done` /
-  `undone` (`instances.done`), `rename` (`instances.rename`), `--machine
+  `undone` (`instances.done`), `rename` (`instances.rename`), `profile`
+  (`instances.setProfile`; without a profile, the `instances.list` row), `--machine
   m ls` / `status --json` (`instances.list` per config root under the
   fleet root; `service ls` too, its service rows), `--machine m ps`
   (`containers.list`) and `stats` (`containers.stats`), printed as the
@@ -2341,7 +2342,8 @@ never hands the daemon off (below). Under **`worker`**:
   `sessions.*` and the verbs must carry theirs. `config.migrate` and
   `config.ack` edit a config, so their `root` must be under the fleet
   root: an own root's is `denied`, naming `machine trust full`.
-- **Instances**: an `instance` (exact name or id, `sessions.*`' included), `instances.procs`'
+- **Instances**: an `instance` (exact name or id, `sessions.*`' and
+  `instances.rename` / `setProfile`'s included: `lent::instance_keys`), `instances.procs`'
   `instances` and the `containers.*` `container` must be an instance whose
   `config_dir` the reach admits (`lent::lent_instances`, from
   `state.toml`), else `not-found`; a `containers.*` `container` may also

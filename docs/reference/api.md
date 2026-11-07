@@ -25,7 +25,7 @@ checks the typings against the wire structs).
 |---|---|---|
 | connection | `hello`, `subscribe`, `unsubscribe`, `shutdown`, `link.attach`, `links.inbound` (internal) | no |
 | Inbox | `inbox.threads.list`, `inbox.thread.get\|markRead\|act\|reply\|done\|reopen`, `inbox.form.saveDraft\|submit`, `inbox.notify.dismiss\|markRead` | no |
-| instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|done` | yes |
+| instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|setProfile\|done` | yes |
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
 | sessions | `sessions.list\|rm` | yes |
 | containers, config | `containers.logs\|inspect\|list\|stats`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
@@ -561,6 +561,23 @@ Errors: `not-found` (no such instance), `invalid` (an empty new name, one
 with spaces, the same name, one already taken, or the instance is still
 being built by a `run`/`rebuild`), each with the CLI's message;
 `internal` (`state.toml` doesn't read or write).
+
+### `instances.setProfile`
+
+Params: `{"instance": "<name>", "profile": "<profile>"}`, an exact
+instance name. Switches its profile, as `devsandbox profile <instance>
+<profile>`, checked against what its sandbox allows in its own config root
+(the one recorded on the instance, so no `root` param) as that config is
+now; also makes it the sandbox's last profile, `run`'s default
+([profiles.md](../architecture/instances/profiles.md#switching)). Nothing
+restarts. Result: `{"instance": "<name>", "profile": "<profile>"}`.
+
+Errors: `not-found` (no such instance), `invalid` (a missing param, a
+profile the sandbox doesn't allow, naming the allowed ones, a sandbox with
+no profiles, an allowed set that can't be told: no recorded config root,
+an unreadable config, a sandbox no longer in it, each saying which; or the
+instance is still being built by a `run`/`rebuild`), each with the CLI's
+message; `internal` (`state.toml` doesn't read or write).
 
 ### `instances.done`
 
@@ -1391,7 +1408,7 @@ machine, each with 15 s to answer:
 
 `instances.list`, `instances.resolve`, `instances.cancel`,
 `instances.procs`, `instances.signal`, `instances.rename`,
-`instances.done`, `instances.buildLog`, `sessions.list`, `sessions.rm`,
+`instances.setProfile`, `instances.done`, `instances.buildLog`, `sessions.list`, `sessions.rm`,
 `containers.logs`,
 `containers.inspect`, `containers.list`, `containers.stats`, `sandboxes.list`, `sandboxes.get`, `services.get`,
 and every verb (*Verbs on a machine*).

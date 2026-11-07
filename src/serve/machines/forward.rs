@@ -43,6 +43,7 @@ pub const QUICK: &[&str] = &[
     "instances.procs",
     "instances.signal",
     "instances.rename",
+    "instances.setProfile",
     "instances.done",
     "instances.buildLog",
     "instances.resolve",

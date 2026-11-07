@@ -349,8 +349,8 @@ const FULL_HINT: &str = "`devsandbox machine trust full` there opens it";
 /// take it), per method.
 fn instance_keys(method: &str) -> &'static [&'static str] {
     match method {
-        "instances.cancel" | "instances.signal" | "instances.rename" | "instances.done" | "instances.buildLog"
-        | "sessions.list" | "sessions.rm" => &["instance"],
+        "instances.cancel" | "instances.signal" | "instances.rename" | "instances.setProfile" | "instances.done"
+        | "instances.buildLog" | "sessions.list" | "sessions.rm" => &["instance"],
         "rebuild" | "start" | "stop" | "rm" => &["instance"],
         _ => &[],
     }
@@ -1070,6 +1070,8 @@ mod tests {
         assert_eq!(code("instances.done", json!({"instance": "own", "done": true})), "not-found");
         assert_eq!(code("instances.buildLog", json!({"instance": "id-own"})), "not-found");
         assert_eq!(code("instances.signal", json!({"instance": "own", "pid": "1", "signal": "TERM"})), "not-found");
+        assert!(admit("instances.setProfile", json!({"instance": "in", "profile": "work"}), &s, &state).is_ok());
+        assert_eq!(code("instances.setProfile", json!({"instance": "own", "profile": "work"})), "not-found");
         assert!(admit("instances.procs", json!({"instances": ["in"]}), &s, &state).is_ok());
         assert_eq!(code("instances.procs", json!({"instances": ["in", "own"]})), "not-found");
         assert!(admit("containers.logs", json!({"container": "devsandbox-in"}), &s, &state).is_ok());

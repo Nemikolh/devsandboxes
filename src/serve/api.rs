@@ -130,6 +130,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
             crate::runtime::backend().signal_proc(c, pid, n)
         }),
         "instances.rename" => instances_rename(parse(params)?, &host_state(ctx)?),
+        "instances.setProfile" => instances_set_profile(parse(params)?, &host_state(ctx)?),
         "instances.done" => instances_done(parse(params)?, &host_state(ctx)?),
         "instances.buildLog" => instances_build_log(parse(params)?, &host_state(ctx)?),
         "sessions.list" => sessions_list(parse(params)?, &host_state(ctx)?, |c, m, p| helper_rpc(c, m, p, ctx.client)),
@@ -681,6 +682,37 @@ fn instances_rename(p: RenameParams, state: &Path) -> Answer {
         Err(e) => ApiError::internal(e),
     })?;
     serde_json::to_value(Renamed { instance }).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct SetProfileParams {
+    instance: String,
+    profile: String,
+}
+
+/// `instances.setProfile`'s answer: the instance and the profile it's in now.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileSet {
+    pub instance: String,
+    pub profile: String,
+}
+
+/// Switch an instance's profile by its exact name
+/// (`profile::set_profile_at`), checked against what its sandbox allows in
+/// its recorded config root now; also its sandbox's `last_profile`. No
+/// `root`: the instance's own `config_dir` is the root. Refusals keep their
+/// CLI wording: `not-found` for no such instance, `invalid` for a profile
+/// not allowed (naming the allowed ones), an allowed set that can't be told
+/// (saying why) or an instance mid-`run`/`rebuild`. `state` is injected for
+/// the tests.
+fn instances_set_profile(p: SetProfileParams, state: &Path) -> Answer {
+    use crate::commands::profile::{Refused, set_profile_at};
+    let profile = set_profile_at(state, &p.instance, &p.profile).map_err(|e| match e.downcast::<Refused>() {
+        Ok(Refused::Unknown(m)) => ApiError::not_found(m),
+        Ok(Refused::Invalid(m)) => ApiError::invalid(m),
+        Err(e) => ApiError::internal(e),
+    })?;
+    serde_json::to_value(ProfileSet { instance: p.instance, profile }).map_err(|e| ApiError::internal(e.into()))
 }
 
 #[derive(Deserialize)]
@@ -2021,6 +2053,36 @@ mod tests {
     }
 
     #[test]
+    fn instances_set_profile_switches_and_maps_refusals() {
+        let state = store_path("set-profile").with_file_name("state.toml");
+        let cfg = state.with_file_name("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("devsandboxes.toml"),
+            "[profiles.work]\n[profiles.personal]\n[sandbox.web]\nimage = \"x\"\nprofiles = [\"work\", \"personal\"]\n",
+        )
+        .unwrap();
+        let rooted = format!("project = \"abc12345\"\nconfig_dir = {:?}\n", cfg.to_str().unwrap());
+        std::fs::write(&state, [instance("web", "web", &rooted), instance("bare", "web", "")].concat()).unwrap();
+        let set = |params: Value| instances_set_profile(parse(params)?, &state);
+        assert_eq!(set(json!({"instance": "web", "profile": "personal"})).unwrap(), json!({"instance": "web", "profile": "personal"}));
+        let s = crate::state::State::load_at(&state).unwrap();
+        assert_eq!(s.instances["web"].profile.as_deref(), Some("personal"));
+        assert_eq!(s.last_profile["abc12345"]["web"], "personal");
+        let other = set(json!({"instance": "web", "profile": "other"})).unwrap_err();
+        assert_eq!(
+            (other.code, other.message.as_str()),
+            ("invalid", "sandbox `web` doesn't allow profile `other`; allowed: work, personal")
+        );
+        assert_eq!(code(set(json!({"instance": "bare", "profile": "work"}))), "invalid", "no recorded root");
+        assert_eq!(code(set(json!({"instance": "nope", "profile": "work"}))), "not-found");
+        assert_eq!(code(set(json!({"instance": "web"}))), "invalid", "a profile is needed");
+        assert_eq!(crate::state::State::load_at(&state).unwrap().instances["web"].profile.as_deref(), Some("personal"));
+        std::fs::write(&state, "not = [toml").unwrap();
+        assert_eq!(code(set(json!({"instance": "web", "profile": "work"}))), "internal");
+    }
+
+    #[test]
     fn instances_done_sets_and_clears_the_flag() {
         let state = state_file("done", &instance("web", "web", ""));
         let done = |params: Value| instances_done(parse(params)?, &state);
@@ -2530,6 +2592,7 @@ mod tests {
         assert_matches("SandboxConfig", &v(&cfg.sandbox_text("web")));
         assert_matches("ServiceConfig", &v(&ServiceConfig { original: "t".into() }));
         assert_matches("InstanceRenamed", &v(&Renamed { instance: "w".into() }));
+        assert_matches("InstanceProfileSet", &v(&ProfileSet { instance: "w".into(), profile: "work".into() }));
         assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true, warning: None }));
         assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true, warning: Some("no link".into()) }));
         assert_matches("SessionsList", &v(&SessionsList { sessions: vec!["1700000000-ab12 running detached 2023-11-14T22:13:20Z sh".into()] }));
@@ -2566,6 +2629,7 @@ mod tests {
             ("sessions.list", "SessionsList"),
             ("sessions.rm", "OkResult"),
             ("instances.rename", "InstanceRenamed"),
+            ("instances.setProfile", "InstanceProfileSet"),
             ("instances.done", "InstanceDone"),
             ("containers.logs", "ContainerLogs"),
             ("containers.inspect", "unknown"),

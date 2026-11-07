@@ -2,7 +2,8 @@
 
 Named collections of sandboxes: a config declares profiles under
 `[profiles.*]`, and each sandbox lists the ones its instances may be in.
-Each instance is in one of its sandbox's profiles, chosen at `run`.
+Each instance is in one of its sandbox's profiles, chosen at `run` and
+switched by the user later.
 Read before touching profile declaration, membership or an instance's
 profile. Field reference:
 [config-toml-spec](../../../skills/config-toml-spec/SKILL.md).
@@ -12,7 +13,10 @@ Code: `src/config.rs` (`Config::profiles`, `Profile`, `check_profile_name`,
 `Config::allowed_profiles`, `sandbox_hash`); `src/state.rs`
 (`Instance::profile`, `State::last_profile`), `src/commands/run/profile.rs`
 (`choose_profile`, `profile_note`), `src/commands/run/mod.rs` (`run`,
-`materialize`, `RunExtras::profile`), `src/commands/dispatch.rs`
+`materialize`, `RunExtras::profile`), `src/commands/profile.rs`
+(`profile`, `set_profile_at`, `Refused`, `profile_line`, `show_lines`),
+`src/serve/api.rs` (`instances_set_profile`, `ProfileSet`),
+`src/serve/machines/cli/calls.rs` (`Use::Profile`), `src/commands/dispatch.rs`
 (`handle_with`, `ensure_args`); shown by `src/snapshot.rs`
 (`InstanceRow::profile`, `profile_disallowed`, `allowed_now`),
 `src/commands/ps.rs` (`PsRow`, `join_state`, `cells`),
@@ -49,7 +53,7 @@ when the config declares none.
 `Instance::profile` in `state.toml` is the instance's profile; `None` when
 its sandbox allowed none at creation. `State::last_profile` maps project id
 (`services::project_id`) and sandbox to the profile last chosen with
-`run --profile`. `rm` never prunes it, so it outlives the sandbox's last
+`run --profile` or switched to ([Switching](#switching)). `rm` never prunes it, so it outlives the sandbox's last
 instance.
 
 `run` chooses with `choose_profile`, over `Config::allowed_profiles`,
@@ -72,7 +76,7 @@ profile its sandbox no longer allows keeps it, flagged where it is shown
 (`RunParams::profile`, [verbs](../daemon/verbs.md)), local, forwarded to a
 machine or placed; the dashboard's `run` passes none. No control request
 (`devsbd` `ctl.rs`, `commands::dispatch`'s `Request`) carries a profile, so a
-container can never choose one.
+container can never choose one, nor switch one ([Switching](#switching)).
 
 A dispatcher's new child inherits the dispatcher instance's recorded
 profile: `handle_with`'s `ensure` passes it as `--profile` (`ensure_args`),
@@ -81,6 +85,42 @@ than falling back. A profile-less dispatcher passes none, so its child
 gets the default rule. An inherited `--profile` doesn't set
 `last_profile`: it isn't the user's choice. Existing children (`start`,
 `rebuild`) keep their own.
+
+## Switching
+
+`profile::set_profile_at` switches an instance, named by its exact state
+key (no sandbox/folder resolution, like `rename`), in one locked
+`State::update_at`: the record is read inside the update, so the check
+judges the record it writes. It refuses (`Refused`) an unknown name, an
+instance mid-`run`/`rebuild` (`commands::in_flight`: its final save would
+put the old profile back), and a profile not in the sandbox's allowed set,
+read from the instance's own `Instance::config_dir` as that config is now
+(`run --profile`'s wording: the allowed ones, or that the sandbox has no
+profiles). When the set can't be told (no recorded root, an unreadable
+config, a sandbox no longer in it) it refuses too, saying which. Then it
+sets `Instance::profile` and the sandbox's `last_profile` (under
+`Instance::project`), so the next `run` defaults to it. Nothing restarts:
+the container doesn't know its profile; the next URL it opens uses the new
+one ([On the opening host](#on-the-opening-host)).
+
+- **API**: `instances.setProfile {instance, profile}`
+  (`api::instances_set_profile`), `not-found` / `invalid` from `Refused`,
+  answering `{instance, profile}`
+  ([api.md](../../reference/api.md#instancessetprofile)). No `root`: the
+  recorded `config_dir` is the instance's root.
+- **CLI**: `devsandbox profile <instance> <profile>` switches and prints
+  `profile <instance>: <profile>` (`profile_line`); without `<profile>` it
+  prints that line for the current one (`(none)`, flagged as `ps` flags
+  it) and `allowed: …` (`show_lines`). It runs in the CLI process, like
+  `rename`.
+- **On a machine**: `<machine>/<instance>` routes as `rename` does
+  (`machines::cli`): the switch is the quick call `instances.setProfile`
+  over the machine's link, under its trust like `instances.rename`
+  ([fleet](../daemon/fleet.md)); the show form reads the instance's
+  `instances.list` row, which has its profile and flag but not the
+  allowed set, so it prints the first line only.
+- **Only the user**: nothing a container sends reaches it; no control
+  request names a profile.
 
 ## Shown
 

@@ -139,6 +139,15 @@ enum Command {
         /// New instance name
         new_name: String,
     },
+    /// Show or switch an instance's profile (one of its sandbox's `profiles`)
+    Profile {
+        /// Exact instance name (no sandbox/folder resolution);
+        /// `<machine>/<name>` for a machine's, `@/<name>` for this host's
+        name: String,
+        /// The profile to switch to (without it: show the current one and
+        /// what its sandbox allows)
+        profile: Option<String>,
+    },
     /// Remove a sandbox instance (container, worktree, state entry)
     Rm {
         #[arg(help = NAME_HELP)]
@@ -819,6 +828,7 @@ fn main() -> Result<()> {
             result
         }
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
+        Command::Profile { name, profile } => commands::profile::profile(&name, profile.as_deref()),
         Command::Rm { name, delete_branch, keep_branch, force, fail_on_ask } => {
             let result = commands::rm::rm(&name, rm_branch_flag(delete_branch, keep_branch), force, fail_on_ask);
             match result {
@@ -1009,6 +1019,20 @@ mod tests {
             assert!(parse(gone).is_err(), "{gone:?}");
         }
         assert!(matches!(parse(&["fleet-hello"]).unwrap().command, Some(Command::FleetHello)));
+    }
+
+    #[test]
+    fn profile_parses_with_and_without_a_profile() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()));
+        match parse(&["profile", "web-1", "work"]).unwrap().command {
+            Some(Command::Profile { name, profile }) => assert_eq!((name.as_str(), profile.as_deref()), ("web-1", Some("work"))),
+            _ => panic!("not profile"),
+        }
+        match parse(&["profile", "box/web-1"]).unwrap().command {
+            Some(Command::Profile { name, profile: None }) => assert_eq!(name, "box/web-1"),
+            _ => panic!("not profile without one"),
+        }
+        assert!(parse(&["profile"]).is_err(), "an instance is required");
     }
 
     /// `exec`'s (attach, sessions, session, name, command).

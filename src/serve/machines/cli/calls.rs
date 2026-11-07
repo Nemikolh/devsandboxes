@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::serve::api::{ContainerLogs, ContainersList, ContainersStats, InstancesList, MAX_LINES, Renamed};
+use crate::serve::api::{ContainerLogs, ContainersList, ContainersStats, InstancesList, MAX_LINES, ProfileSet, Renamed};
 use crate::serve::proto::Response;
 use crate::snapshot::InstanceRow;
 use crate::{Command, ServiceCommand};
@@ -40,6 +40,10 @@ pub(crate) enum Use {
     Done(bool),
     /// `rename`: `instances.rename` to this name.
     Rename(String),
+    /// `profile`: `instances.setProfile` to this profile; without one, the
+    /// instance's row (`instances.list`), which carries its profile and the
+    /// not-allowed flag but not its sandbox's allowed set.
+    Profile(Option<String>),
     /// `--machine m ls`: `instances.list` per config root, its sandboxes.
     Ls { json: bool },
     /// `--machine m status --json`: `instances.list` per config root.
@@ -74,6 +78,7 @@ pub(crate) fn use_of(command: &Command) -> Use {
         Command::Done { .. } => Use::Done(true),
         Command::Undone { .. } => Use::Done(false),
         Command::Rename { new_name, .. } => Use::Rename(new_name.clone()),
+        Command::Profile { profile, .. } => Use::Profile(profile.clone()),
         Command::Ls { json } => Use::Ls { json: *json },
         Command::Status { .. } => Use::Status,
         Command::Ps { all, json } => Use::Ps { all: *all, json: *json },
@@ -186,6 +191,19 @@ pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, 
         Use::Rename(new_name) => {
             let r: Renamed = call_on(call, m, "instances.rename", json!({ "instance": name, "newName": new_name }))?;
             writeln!(out, "{}", crate::commands::rename::renamed_line(name, &r.instance))?;
+        }
+        Use::Profile(Some(profile)) => {
+            let r: ProfileSet = call_on(call, m, "instances.setProfile", json!({ "instance": name, "profile": profile }))?;
+            writeln!(out, "{}", crate::commands::profile::profile_line(name, Some(&r.profile), false))?;
+        }
+        Use::Profile(None) => {
+            // Exact name, as the local form and `instances.setProfile` take it.
+            let Some(row) = row_of(call, m, root, name)? else {
+                bail!("no instance named `{name}` on machine `{m}` (see `devsandbox ps -a`)");
+            };
+            for line in crate::commands::profile::show_lines(name, row.profile.as_deref(), row.profile_disallowed, None) {
+                writeln!(out, "{line}")?;
+            }
         }
         Use::Ls { .. }
         | Use::Status
@@ -389,6 +407,8 @@ mod tests {
         assert_eq!(u(&["done", "lap/web"]), Use::Done(true));
         assert_eq!(u(&["undone", "lap/web"]), Use::Done(false));
         assert_eq!(u(&["rename", "lap/web", "api"]), Use::Rename("api".into()));
+        assert_eq!(u(&["profile", "lap/web", "work"]), Use::Profile(Some("work".into())));
+        assert_eq!(u(&["profile", "lap/web"]), Use::Profile(None));
         assert_eq!(u(&["ls"]), Use::Ls { json: false });
         assert_eq!(u(&["ls", "--json"]), Use::Ls { json: true });
         assert_eq!(u(&["status", "--json"]), Use::Status);
@@ -610,6 +630,27 @@ mod tests {
         assert_eq!(calls, [("instances.rename".into(), json!({"instance": "web", "newName": " api ", "machine": "lap"}))]);
         let (r, ..) = run_named(Use::Rename("x".into()), "web", |_, _| Err(("invalid", "`x` is taken".into())));
         assert_eq!(r.unwrap_err().to_string(), "`x` is taken");
+    }
+
+    /// `profile` sets through `instances.setProfile` and prints the local
+    /// line; without a profile it reads the row: the profile and its flag,
+    /// no allowed set.
+    #[test]
+    fn profile_prints_as_the_local_command() {
+        let (r, out, _, calls) = run_named(Use::Profile(Some("work".into())), "web", |_, _| Ok(json!({"instance": "web", "profile": "work"})));
+        assert_eq!((r.unwrap(), out.as_str()), (0, "profile web: work\n"));
+        assert_eq!(calls, [("instances.setProfile".into(), json!({"instance": "web", "profile": "work", "machine": "lap"}))]);
+        let (r, ..) = run_named(Use::Profile(Some("x".into())), "web", |_, _| Err(("invalid", "sandbox `web` doesn't allow profile `x`; allowed: work".into())));
+        assert_eq!(r.unwrap_err().to_string(), "sandbox `web` doesn't allow profile `x`; allowed: work");
+
+        let mut flagged = row("web", "c", "/f/cfg", false);
+        flagged["profile"] = json!("gone");
+        flagged["profile_disallowed"] = json!(true);
+        let (r, out, _, calls) = run_named(Use::Profile(None), "web", |_, _| Ok(listing(vec![flagged.clone()], vec![], None)));
+        assert_eq!((r.unwrap(), out.as_str()), (0, "profile web: gone (its sandbox doesn't allow it any more)\n"));
+        assert_eq!(calls.len(), 1, "read only");
+        let (r, ..) = run_named(Use::Profile(None), "api", |_, _| Ok(listing(vec![flagged.clone()], vec![], None)));
+        assert_eq!(r.unwrap_err().to_string(), "no instance named `api` on machine `lap` (see `devsandbox ps -a`)");
     }
 
     fn list_of(v: Value) -> InstancesList {

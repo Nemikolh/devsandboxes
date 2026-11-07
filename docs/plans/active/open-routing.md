@@ -93,9 +93,10 @@ extends = "work"
   still allowed, else the first allowed. Never a prompt. `run` says which
   one it picked when more than one was allowed (`profile: work (--profile
   to choose)`). A `--profile` choice sets `last_profile`.
-- **At runtime**: `instances.setProfile {root, instance, profile}` on the
-  instance's host, checked against the allowed set, sets `profile` and
-  `last_profile`. Nothing restarts: the container doesn't know its
+- **At runtime**: `instances.setProfile {instance, profile}` on the
+  instance's host (no `root`: like `instances.rename` it takes the exact
+  instance name, and the instance's recorded `config_dir` is its root),
+  checked against the allowed set, sets `profile` and `last_profile`. Nothing restarts: the container doesn't know its
   profile. It is a forwarded call for a remote instance, like
   `instances.rename`. The dashboard has a one-key action (a picker when
   more than two profiles are allowed) and `:profile <p>`; the CLI has

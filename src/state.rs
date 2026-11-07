@@ -384,7 +384,8 @@ pub struct State {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub global_forwarded_ports: BTreeMap<String, BTreeMap<String, u16>>,
     /// Project id (`services::project_id`) -> sandbox -> the profile last
-    /// chosen for it with `run --profile`: `run`'s default
+    /// chosen for it with `run --profile` or switched to
+    /// (`commands::profile::set_profile_at`): `run`'s default
     /// (`commands::run::choose_profile`). Never pruned, so it outlives the
     /// sandbox's last instance.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

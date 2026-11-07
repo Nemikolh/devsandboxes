@@ -83,6 +83,7 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         | Command::Start { .. }
         | Command::Rm { .. }
         | Command::Rename { .. }
+        | Command::Profile { .. }
         | Command::Logs { .. }
         | Command::Inspect { .. }
         | Command::Done { .. }
@@ -111,6 +112,7 @@ fn name_mut(command: &mut Command) -> Option<&mut String> {
         | Command::Start { name: Some(n), .. }
         | Command::Port { name: Some(n), .. }
         | Command::Rename { name: n, .. }
+        | Command::Profile { name: n, .. }
         | Command::Rm { name: n, .. }
         | Command::Logs { name: n, .. }
         | Command::Inspect { name: n, .. }
@@ -130,6 +132,7 @@ fn name_of(command: &Command) -> Option<&str> {
         | Command::Start { name: Some(n), .. }
         | Command::Port { name: Some(n), .. }
         | Command::Rename { name: n, .. }
+        | Command::Profile { name: n, .. }
         | Command::Rm { name: n, .. }
         | Command::Logs { name: n, .. }
         | Command::Inspect { name: n, .. }
@@ -732,9 +735,9 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         }
         (Some(e), _) => bail!("{}", e.message),
     };
-    // `rename` takes the exact name only (no sandbox/folder matching).
+    // `rename` and `profile` take the exact name only (no sandbox/folder matching).
     let found: Vec<Found> = match &command {
-        Command::Rename { .. } => found.into_iter().filter(|f| f.name == name).collect(),
+        Command::Rename { .. } | Command::Profile { .. } => found.into_iter().filter(|f| f.name == name).collect(),
         _ => found,
     };
     let chosen = match choose(&name, found, std::io::stdin().is_terminal(), &mut |prompt, options| {
@@ -879,7 +882,7 @@ mod tests {
     /// name runs as typed, `@/` drops, a qualified one or `--machine` fails.
     #[test]
     fn without_machines_everything_stays_here() {
-        for args in [&["exec", "web"][..], &["logs", "web"], &["stop", "web"], &["run", "web"], &["ps"], &["rename", "a", "b"]] {
+        for args in [&["exec", "web"][..], &["logs", "web"], &["stop", "web"], &["run", "web"], &["ps"], &["rename", "a", "b"], &["profile", "a"]] {
             assert_eq!(plan_of(args, None, &[]).unwrap(), Plan::Here, "{args:?}");
         }
         assert_eq!(plan_of(&["exec", "@/web"], None, &[]).unwrap(), Plan::HereAs("web".into()));
@@ -1015,6 +1018,14 @@ mod tests {
         assert_eq!(named(&["done", "box/web"]), Use::Done(true));
         assert_eq!(named(&["undone", "box/web"]), Use::Done(false));
         assert_eq!(named(&["rename", "box/web", "x"]), Use::Rename("x".into()));
+        assert_eq!(named(&["profile", "box/web", "work"]), Use::Profile(Some("work".into())));
+        assert_eq!(named(&["profile", "box/web"]), Use::Profile(None));
+        assert_eq!(
+            plan_of(&["profile", "box/web", "work"], None, &["box"]).unwrap(),
+            Plan::Resolve(Where::Machine("box".into()), "web".into())
+        );
+        assert_eq!(plan_of(&["profile", "@/web"], None, &["box"]).unwrap(), Plan::HereAs("web".into()));
+        assert!(plan_of(&["profile", "web"], Some("box"), &["box"]).is_err(), "qualify the name instead");
         assert_eq!(named(&["vscode", "box/web"]), Use::Refused(Refused::Vscode));
         // exec: a tty one dials a `PTY` session (`dials`), a non-tty one a
         // piped `PTY` after `reconnect_session` says it gets none.

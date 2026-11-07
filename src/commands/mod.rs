@@ -13,6 +13,7 @@ pub mod ls;
 #[cfg(unix)]
 pub mod machine;
 pub mod port;
+pub mod profile;
 pub mod ps;
 pub mod rebuild;
 pub mod rename;

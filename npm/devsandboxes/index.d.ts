@@ -838,6 +838,12 @@ export interface InstanceRenamed {
   instance: string;
 }
 
+/** `instances.setProfile`'s answer: the profile the instance is in now. */
+export interface InstanceProfileSet {
+  instance: string;
+  profile: string;
+}
+
 /** `instances.done`'s answer: the instance's done flag as it now is. */
 export interface InstanceDone {
   instance: string;
@@ -1741,6 +1747,8 @@ export interface ApiMethods {
   'instances.signal': { params: { instance: string; pid: string; signal: 'TERM' | 'KILL'; machine?: string }; result: OkResult };
   /** Exact name; `invalid` for a bad or taken name, or an instance mid-build. */
   'instances.rename': { params: { instance: string; newName: string; machine?: string }; result: InstanceRenamed };
+  /** Exact name; `invalid` for a profile its sandbox doesn't allow (or an allowed set that can't be told), or an instance mid-build. Also the sandbox's last profile. */
+  'instances.setProfile': { params: { instance: string; profile: string; machine?: string }; result: InstanceProfileSet };
   /** Set or clear the done flag (exact name); idempotent. */
   'instances.done': { params: { instance: string; done: boolean; machine?: string }; result: InstanceDone };
   /**

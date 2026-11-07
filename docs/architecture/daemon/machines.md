@@ -383,7 +383,7 @@ up now nor [routed](#routed-machines): `not-found`, `Handle::unknown`)
 has it stripped and goes to that machine, but for the ones served here:
 
 - **Quick calls** (`forward::QUICK`: `instances.list|cancel|procs|signal|
-  rename|done|buildLog|resolve`, `containers.logs|inspect`,
+  rename|setProfile|done|buildLog|resolve`, `containers.logs|inspect`,
   `sandboxes.list|get`, `services.get`) go over the held link, one in
   flight per machine, `Timing::call` (15 s) each. A timeout drops the link
   (its late answer would be read as the next call's), not its carrier; a
@@ -588,7 +588,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
 - **API calls** (`cli::calls`): printed by the local command's own render
   fns (`commands::logs::render_logs`, `inspect::render`, `ls::table` /
   `ls::render_json`, `status::render`, `done::status_line`,
-  `rename::renamed_line`, `ps::render`, `stats::render`,
+  `rename::renamed_line`, `profile::profile_line` / `show_lines`, `ps::render`, `stats::render`,
   `services::ls_render`), so the output reads the same; `calls::use_of`
   (pure) picks the call, `calls::named` / `calls::per_root` /
   `calls::listing` make them over an injected call; each exits 0, an
@@ -608,7 +608,10 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   `containers.inspect` (without the local one's browser sandbox line: that
   comes from this host's record); `done` / `undone` are `instances.done`,
   worded from the row's `done` before, the answer's `warning` (a placed
-  instance's failed fetch-back) on stderr first; `rename` is `instances.rename`.
+  instance's failed fetch-back) on stderr first; `rename` is `instances.rename`;
+  `profile <m>/<x> <p>` is `instances.setProfile`, and without `<p>` the
+  row's `profile` and `profile_disallowed` (no allowed set: the row has
+  none).
   `--machine m ls [--json]` and `status --json` take each registered root
   for the config roots it stands for (`calls::config_roots`: itself, and
   the config roots under it its listing's instance rows name; a root
