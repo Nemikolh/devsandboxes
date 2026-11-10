@@ -17,6 +17,9 @@
 //! opener for a URL's loopback port before the browser opens, reusing any
 //! forward of the same instance port, never persisted, stopped after
 //! [`OPEN_FORWARD_IDLE`] without a connection or when their instance stops.
+//! One into another member's instance (an open delivered from there) is a
+//! [`Remote`] like an ad-hoc one; its instance stopping isn't seen here, so
+//! it stops on idle or when its machine goes.
 //!
 //! Forwards are grouped per config root ([`Root`], keyed by the canonical
 //! `dir`); ids are unique daemon-wide. Configured forwards are reconciled for
@@ -32,12 +35,12 @@
 //! the thread leaves the file alone: dropping forwards on exit isn't removal.
 //!
 //! Forwards into a machine's instance or service ([`Remote`], `forwards.add`
-//! with `machine`) are ad-hoc only and live apart from the [`Root`]s (which
-//! load local config): bound here, each bridge a `TUNNEL` stream through
-//! the machine's link socket in the socket dir (`tunnel::remote_opener`,
-//! [`via`] per spawn), served under the machine's trust there. They persist
-//! like local ones; a sync drops those of a machine gone from
-//! `machines.toml`.
+//! with `machine`, or an open forward with one) live apart from the
+//! [`Root`]s (which load local config): bound here, each bridge a `TUNNEL`
+//! stream through the machine's link socket in the socket dir
+//! (`tunnel::remote_opener`, [`via`] per spawn), served under the machine's
+//! trust there. Ad-hoc ones persist like local ones; a sync drops those of a
+//! machine gone from `machines.toml`, open ones included.
 //!
 //! Each forward keeps its own self-healing bridge (`Forward::start`); riding
 //! the instance's daemon bridge mux instead is a later optimization.
@@ -443,28 +446,72 @@ impl Daemon {
         Ok(added)
     }
 
-    /// The opener's forward (see [`Root::open`]). A callback port that can't
-    /// be bound is also a status line: the OAuth redirect will miss.
+    /// The opener's forward: into this host's instance ([`Root::open`]) or,
+    /// with `machine`, into that member's ([`Daemon::open_remote`]). A
+    /// callback port that can't be bound is also a status line: the OAuth
+    /// redirect will miss.
     fn open(&mut self, req: OpenRequest) -> Result<OpenForward, ApiError> {
-        if let Some(machine) = &req.machine {
-            return Err(ApiError::invalid(format!(
-                "no open forwards into an instance on machine `{machine}` yet: port {} isn't forwarded",
-                req.container_port
-            )));
-        }
-        let dir = req
-            .dir
-            .canonicalize()
-            .map_err(|e| ApiError::not_found(format!("no directory {}: {e}", req.dir.display())))?;
-        let mut next_id = self.next_id;
-        let opened = self.root(&dir).open(&req, &mut next_id, Instant::now());
-        self.next_id = next_id;
+        let now = Instant::now();
+        let opened = match req.machine.clone() {
+            Some(machine) => self.open_remote(machine, &req, now),
+            None => self.open_local(&req, now),
+        };
         opened.map_err(|(e, note)| {
             if let Some(line) = note {
                 self.status(line);
             }
             e
         })
+    }
+
+    fn open_local(&mut self, req: &OpenRequest, now: Instant) -> Result<OpenForward, OpenError> {
+        let dir = req
+            .dir
+            .canonicalize()
+            .map_err(|e| (ApiError::not_found(format!("no directory {}: {e}", req.dir.display())), None))?;
+        let mut next_id = self.next_id;
+        let opened = self.root(&dir).open(req, &mut next_id, now);
+        self.next_id = next_id;
+        opened
+    }
+
+    /// An open forward into `machine`'s instance: `req.dir` is the root
+    /// there, as sent (never resolved here), `req.instance` its name there.
+    /// The machine must be known like for [`Daemon::add_remote`]. Reuse
+    /// follows [`Root::reusable`] over the remote forwards ([`Remote::reaches`],
+    /// an ad-hoc one included; an open one's `touched` refreshed), binding
+    /// follows [`bind_open`]. Its instance stopping there isn't visible
+    /// here: it stops on idle ([`Daemon::expire_open`]) or with its machine
+    /// ([`Daemon::drop_unregistered`]).
+    fn open_remote(&mut self, machine: String, req: &OpenRequest, now: Instant) -> Result<OpenForward, OpenError> {
+        let known = self.registered().map_err(|e| (ApiError::internal(e), None))?;
+        if !known.contains(&machine) {
+            return Err((ApiError::not_found(machines::no_machine(&machine).to_string()), None));
+        }
+        let (key, port) = (req.instance.as_str(), req.container_port);
+        let reusable = self.remote.iter_mut().find(|(_, r)| {
+            r.reaches(&machine, &req.dir, key, port) && (!req.callback || r.forward.status().local_addr.port() == port)
+        });
+        if let Some((_, r)) = reusable {
+            if let Some(touched) = &mut r.opened {
+                *touched = now;
+            }
+            return Ok(OpenForward { host_port: r.forward.status().local_addr.port(), reused: true });
+        }
+        let entry = Entry {
+            dir: req.dir.clone(),
+            instance: Some(key.to_string()),
+            service: None,
+            address: Entry::address_of(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            container_port: port,
+            host_port: 0,
+            machine: Some(machine),
+        };
+        let (id, entry) = bind_open(key, port, req.callback, |host_port| self.start_remote(entry.clone(), host_port))?;
+        if let Some(r) = self.remote.get_mut(&id) {
+            r.opened = Some(now);
+        }
+        Ok(OpenForward { host_port: entry.host_port, reused: false })
     }
 
     /// `forwards.add` into `machine`: it must be registered (or an inbound
@@ -518,7 +565,7 @@ impl Daemon {
         entry.host_port = forward.status().local_addr.port();
         let id = self.next_id;
         self.next_id += 1;
-        self.remote.insert(id, Remote { forward, entry: entry.clone() });
+        self.remote.insert(id, Remote { forward, entry: entry.clone(), opened: None });
         Ok((id, entry))
     }
 
@@ -527,9 +574,9 @@ impl Daemon {
         self.machines.names()
     }
 
-    /// Drop the remote forwards, and their store entries, of machines no
-    /// longer in `machines.toml` (`machine rm`) or up as an inbound
-    /// neighbor (its link went). A registry that doesn't load drops
+    /// Drop the remote forwards, and the ad-hoc ones' store entries, of
+    /// machines no longer in `machines.toml` (`machine rm`) or up as an
+    /// inbound neighbor (its link went). A registry that doesn't load drops
     /// nothing; with no remote forwards it isn't read.
     fn drop_unregistered(&mut self) {
         if self.remote.is_empty() {
@@ -549,7 +596,12 @@ impl Daemon {
                 describe(&r.entry),
                 r.machine()
             ));
-            entries.push(r.entry);
+            if r.opened.is_none() {
+                entries.push(r.entry);
+            }
+        }
+        if entries.is_empty() {
+            return;
         }
         self.persist(|saved| {
             for entry in &entries {
@@ -562,7 +614,8 @@ impl Daemon {
         let found = self.roots.values_mut().find_map(|root| root.remove(id)).or_else(|| {
             let r = self.remote.remove(&id)?;
             let local = r.forward.status().local_addr.to_string();
-            Some((Removed { local, configured: false }, Some(r.entry)))
+            // An open one has no store entry.
+            Some((Removed { local, configured: false }, r.opened.is_none().then_some(r.entry)))
         });
         let Some((removed, entry)) = found else {
             return Err(ApiError::not_found(format!("no forward {id}")));
@@ -749,18 +802,7 @@ impl Daemon {
     /// then drain each forward's notes and send the newest as a deduped
     /// [`Event::Status`].
     fn poll(&mut self) {
-        let now = Instant::now();
-        let expired: Vec<(String, String)> = self
-            .roots
-            .values_mut()
-            .flat_map(|root| root.stop_open(|o, status| open_expired(status.idle_since, o.touched, now)))
-            .collect();
-        for (target, local) in expired {
-            (self.log)(&format!(
-                "forwards: stopped open forward {target} on {local}: no connection for {} min",
-                OPEN_FORWARD_IDLE.as_secs() / 60
-            ));
-        }
+        self.expire_open(Instant::now());
         let rows = self.rows(None, true);
         self.active.store(rows.len(), Ordering::Release);
         if rows != self.last_rows {
@@ -784,6 +826,63 @@ impl Daemon {
             self.status(line);
         }
     }
+
+    /// Stop the open forwards, local and remote, idle for
+    /// [`OPEN_FORWARD_IDLE`] at `now` ([`open_expired`]); each one logged.
+    fn expire_open(&mut self, now: Instant) {
+        let mut expired: Vec<(String, String)> = self
+            .roots
+            .values_mut()
+            .flat_map(|root| root.stop_open(|o, status| open_expired(status.idle_since, o.touched, now)))
+            .collect();
+        let remote: Vec<u64> = self
+            .remote
+            .iter()
+            .filter(|(_, r)| r.opened.is_some_and(|touched| open_expired(r.forward.status().idle_since, touched, now)))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in remote {
+            let Some(r) = self.remote.remove(&id) else { continue };
+            expired.push((r.label(), r.forward.status().local_addr.to_string()));
+        }
+        for (target, local) in expired {
+            (self.log)(&format!(
+                "forwards: stopped open forward {target} on {local}: no connection for {} min",
+                OPEN_FORWARD_IDLE.as_secs() / 60
+            ));
+        }
+    }
+}
+
+/// An open forward's failure: the error, and a status line to send with it.
+type OpenError = (ApiError, Option<String>);
+
+/// Bind a new open forward to instance `key`'s `port` with `start`. A
+/// direct one prefers the container port, falling back to an automatic one
+/// when that can't bind for any reason but being taken (a privileged port
+/// say); a callback needs exactly that port, and failing that comes with a
+/// status line: the OAuth redirect will miss.
+fn bind_open<T>(
+    key: &str,
+    port: u16,
+    callback: bool,
+    mut start: impl FnMut(HostPort) -> std::io::Result<T>,
+) -> Result<T, OpenError> {
+    if callback {
+        return start(HostPort::Fixed(port)).map_err(|e| {
+            let note = if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!("{key}: port {port} is taken; an OAuth callback to it won't reach {key}")
+            } else {
+                format!("{key}: cannot bind port {port} ({}); an OAuth callback to it won't reach {key}", bind_reason(&e))
+            };
+            (bind_failed(HostPort::Fixed(port), &e), Some(note))
+        });
+    }
+    match start(HostPort::Prefer(port)) {
+        Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => start(HostPort::Prefer(0)),
+        started => started,
+    }
+    .map_err(|e| (bind_failed(HostPort::Prefer(port), &e), None))
 }
 
 /// The running instances (state keys) that may belong to config root `root`:
@@ -844,13 +943,17 @@ fn open_expired(idle_since: Option<Instant>, touched: Instant, now: Instant) -> 
     idle_since.is_some_and(|idle| now.saturating_duration_since(idle.max(touched)) >= OPEN_FORWARD_IDLE)
 }
 
-/// One forward into a machine's instance or service: ad-hoc only (a
+/// One forward into a machine's instance or service: ad-hoc or open (a
 /// machine's `forwardPorts` are never mirrored here), bound here, its bridge
 /// a `TUNNEL` stream over the machine's link.
 struct Remote {
     forward: Forward,
-    /// Its store entry (`machine` set): what `forwards.rm` removes.
+    /// What it reaches (`machine` set); an ad-hoc one's store entry, what
+    /// `forwards.rm` removes.
     entry: Entry,
+    /// `Some` for an open forward (never in the store): its start or last
+    /// reuse, like [`Opened::touched`].
+    opened: Option<Instant>,
 }
 
 impl Remote {
@@ -858,14 +961,30 @@ impl Remote {
         self.entry.machine.as_deref().unwrap_or_default()
     }
 
+    /// Whether it reaches instance `key`'s `port` (no service) in root `dir`
+    /// on `machine`: what an open there may reuse.
+    fn reaches(&self, machine: &str, dir: &Path, key: &str, port: u16) -> bool {
+        let e = &self.entry;
+        e.machine.as_deref() == Some(machine)
+            && e.dir == dir
+            && e.instance.as_deref() == Some(key)
+            && e.service.is_none()
+            && e.container_port == port
+    }
+
+    /// Its best-effort `<machine>/target:port`.
+    fn label(&self) -> String {
+        let e = &self.entry;
+        format!("{}/{}", self.machine(), target_label(e.service.as_deref(), e.instance.as_deref(), e.container_port))
+    }
+
     fn row(&self, id: u64) -> ForwardRow {
         let mut row = status_to_row(id, &self.entry.dir, &self.forward.status(), false);
         if row.target.is_empty() {
-            let e = &self.entry;
-            row.target =
-                format!("{}/{}", self.machine(), target_label(e.service.as_deref(), e.instance.as_deref(), e.container_port));
+            row.target = self.label();
         }
         row.machine = Some(self.machine().to_string());
+        row.open = self.opened.is_some();
         row
     }
 }
@@ -939,18 +1058,10 @@ impl Root {
 
     /// The opener's forward to `req`'s instance port: an existing one that
     /// fits ([`Root::reusable`]; an open one's `touched` refreshed), else a
-    /// new open forward on 127.0.0.1. A direct one prefers the container
-    /// port (falling back to an automatic one when that can't bind for any
-    /// reason but being taken, a privileged port say); a callback needs
-    /// exactly that port. The instance key is taken as given: a bad one is
-    /// the route's error, on the forward's own thread. An error may come
-    /// with a status line.
-    fn open(
-        &mut self,
-        req: &OpenRequest,
-        next_id: &mut u64,
-        now: Instant,
-    ) -> Result<OpenForward, (ApiError, Option<String>)> {
+    /// new open forward on 127.0.0.1 ([`bind_open`]). The instance key is
+    /// taken as given: a bad one is the route's error, on the forward's own
+    /// thread.
+    fn open(&mut self, req: &OpenRequest, next_id: &mut u64, now: Instant) -> Result<OpenForward, OpenError> {
         let (key, port) = (req.instance.as_str(), req.container_port);
         if let Some(id) = self.reusable(key, port, req.callback) {
             if let Some(o) = self.opened.get_mut(&id) {
@@ -958,30 +1069,14 @@ impl Root {
             }
             return Ok(OpenForward { host_port: self.live[&id].status().local_addr.port(), reused: true });
         }
-        let start = |host_port| {
+        let started = bind_open(key, port, req.callback, |host_port| {
             Forward::start(ForwardSpec {
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 host_port,
                 open: local_opener(port::resolver(self.dir.clone(), Some(key.to_string()), None, port)),
                 probe: Box::new(port::listening_procs),
             })
-        };
-        let started = if req.callback {
-            start(HostPort::Fixed(port)).map_err(|e| {
-                let note = if e.kind() == std::io::ErrorKind::AddrInUse {
-                    format!("{key}: port {port} is taken; an OAuth callback to it won't reach {key}")
-                } else {
-                    format!("{key}: cannot bind port {port} ({}); an OAuth callback to it won't reach {key}", bind_reason(&e))
-                };
-                (bind_failed(HostPort::Fixed(port), &e), Some(note))
-            })
-        } else {
-            match start(HostPort::Prefer(port)) {
-                Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => start(HostPort::Prefer(0)),
-                started => started,
-            }
-            .map_err(|e| (bind_failed(HostPort::Prefer(port), &e), None))
-        }?;
+        })?;
         let host_port = started.status().local_addr.port();
         let id = self.insert(started, next_id);
         self.opened.insert(id, Opened { instance: key.to_string(), container_port: port, touched: now });
@@ -1991,6 +2086,128 @@ forwardPorts = ["redis:6379"]
         let dir = Path::new("/run/devsandbox");
         let request = tunnel::Request { root: "/far/cfg".into(), instance: Some("web".into()), service: None, port: 5432 };
         assert_eq!(via(dir, request.clone()), tunnel::Via::Fleet { dir: dir.into(), request });
+    }
+
+    /// An open delivered from `box` for its `web`'s `port`.
+    fn remote_open(port: u16, callback: bool) -> OpenRequest {
+        OpenRequest {
+            machine: Some("box".into()),
+            dir: "/far/cfg".into(),
+            instance: "web".into(),
+            container_port: port,
+            callback,
+        }
+    }
+
+    #[test]
+    fn an_open_into_an_unknown_machine_is_not_found() {
+        let store = tmp("remote-open-unknown").join("forwards.toml");
+        let (reg, _) = registry_at(&store);
+        let e = reg.handle().open_forward(remote_open(3000, false)).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("not-found", "no machine named `box` (devsandbox machine ls)"));
+        assert!(reg.handle().list(None, true).unwrap().is_empty());
+    }
+
+    /// An open into a machine's instance is a remote `open` row, never in
+    /// the store, reused like a local one (a user's ad-hoc remote forward
+    /// too, a callback only on its own host port); `rm` leaves the store
+    /// alone. As above, no port is freed for a later bind.
+    #[test]
+    fn remote_open_forwards_reuse_never_persist_and_rm() {
+        let store = tmp("remote-open").join("forwards.toml");
+        std::fs::write(store.with_file_name("machines.toml"), MACHINES).unwrap();
+        let (reg, events) = registry_at(&store);
+        let h = reg.handle();
+        let unsaved = || !store.exists() || forward_store::load(&store).unwrap().is_empty();
+
+        let port = free_port();
+        let callback = h.open_forward(remote_open(port, true)).unwrap();
+        assert_eq!(callback, OpenForward { host_port: port, reused: false });
+        let rows = h.list(None, true).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            (row.open, row.configured, row.machine.as_deref(), row.dir.as_path(), port_of(&row.local)),
+            (true, false, Some("box"), Path::new("/far/cfg"), port)
+        );
+        assert_eq!(row.target, format!("box/web:{port}"));
+        assert!(h.list(None, false).unwrap().is_empty(), "remote: only with `machines`");
+        assert!(unsaved(), "never persisted");
+        assert_eq!(reg.active(), 1);
+        let reused = OpenForward { host_port: port, reused: true };
+        assert_eq!(h.open_forward(remote_open(port, true)).unwrap(), reused);
+        assert_eq!(h.open_forward(remote_open(port, false)).unwrap(), reused, "direct reuses it too");
+        let elsewhere = OpenRequest { dir: "/far/other".into(), ..remote_open(port, false) };
+        let other_root = h.open_forward(elsewhere).unwrap();
+        assert!(!other_root.reused && other_root.host_port != port, "another root's instance: {other_root:?}");
+
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let direct = h.open_forward(remote_open(taken, false)).unwrap();
+        assert!(!direct.reused);
+        assert_ne!(direct.host_port, taken, "taken: Prefer walks up");
+        assert_eq!(h.open_forward(remote_open(taken, false)).unwrap(), OpenForward { host_port: direct.host_port, reused: true });
+        let e = h.open_forward(remote_open(taken, true)).unwrap_err();
+        assert_eq!((e.code, e.message), ("bind-failed", format!("port {taken}: address in use")));
+        let want = format!("web: port {taken} is taken; an OAuth callback to it won't reach web");
+        assert!(events.lock().unwrap().contains(&Event::Status(want)));
+
+        // A user's ad-hoc forward of the same instance port answers an open.
+        let added = h.add(remote_request()).unwrap();
+        let saved_now = forward_store::load(&store).unwrap();
+        assert_eq!(saved_now, vec![remote_saved(port_of(&added.local))]);
+        assert_eq!(h.open_forward(remote_open(5432, false)).unwrap(), OpenForward { host_port: port_of(&added.local), reused: true });
+
+        let rows = h.list(None, true).unwrap();
+        assert_eq!(rows.iter().filter(|r| r.open).count(), 3, "{rows:?}");
+        let id = rows.iter().find(|r| port_of(&r.local) == port).unwrap().id;
+        assert_eq!(h.rm(id).unwrap(), Removed { local: format!("127.0.0.1:{port}"), configured: false });
+        assert_eq!(h.list(None, true).unwrap().len(), 3);
+        assert_eq!(forward_store::load(&store).unwrap(), saved_now, "an open forward's rm touches no entry");
+        drop(held);
+        drop(reg);
+
+        let (successor, _) = registry_at(&store);
+        let rows = successor.handle().list(None, true).unwrap();
+        assert_eq!(rows.len(), 1, "only the ad-hoc one is restored: {rows:?}");
+        assert!(!rows[0].open);
+    }
+
+    /// A remote open forward stops after the idle time (an ad-hoc one
+    /// doesn't), and with its machine, never touching the store. On a
+    /// [`Daemon`] directly, the sweep given a later `now`.
+    #[test]
+    fn remote_open_forwards_expire_and_go_with_their_machine() {
+        let store = tmp("remote-open-drop").join("forwards.toml");
+        let machines_toml = store.with_file_name("machines.toml");
+        std::fs::write(&machines_toml, MACHINES).unwrap();
+        let known = Known { registry: machines_toml.clone(), inbound: Arc::default(), routed: Arc::new(Vec::new) };
+        let mut d =
+            Daemon::new(quiet, store.clone(), known, tmp("remote-open-drop-sock"), Box::new(|_| {}), Arc::default());
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let first = d.open(remote_open(taken, false)).unwrap();
+        let adhoc = d.add(remote_request()).unwrap();
+        let ids = |d: &Daemon| d.rows(None, true).into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids(&d).len(), 2);
+
+        d.expire_open(Instant::now() + OPEN_FORWARD_IDLE - Duration::from_secs(60));
+        assert_eq!(ids(&d).len(), 2, "not idle long enough");
+        d.expire_open(Instant::now() + OPEN_FORWARD_IDLE);
+        assert_eq!(ids(&d), [adhoc.id], "the open one expired");
+        let saved_now = forward_store::load(&store).unwrap();
+        assert_eq!(saved_now.len(), 1);
+
+        let again = d.open(remote_open(taken, false)).unwrap();
+        assert!(!again.reused, "{again:?} after {first:?}");
+        d.remove(adhoc.id).unwrap();
+        assert!(forward_store::load(&store).unwrap().is_empty());
+        std::fs::remove_file(&store).unwrap();
+        std::fs::write(&machines_toml, "").unwrap();
+        d.drop_unregistered();
+        assert!(d.rows(None, true).is_empty(), "gone with its machine");
+        assert!(!store.exists(), "no store write for an open forward");
+        drop(held);
     }
 
     /// A forward into an ssh machine dials its link's socket (a `TUNNEL`

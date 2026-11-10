@@ -21,11 +21,10 @@ limitation means editing this file in the same commit.
   `:profile`) and the host's `profiles.toml` choosing the browser a URL
   opens in. Step 4 shipped: a URL on the container's localhost and an
   OAuth login's localhost callback get an open forward first. Step 5
-  delivery shipped: a URL opens on the member that last attached to the
-  instance (`open.deliver`, mapped by that member's `profiles.toml`).
-  Next: localhost forwards for those delivered URLs (step 5c; they open
-  as they are meanwhile, with a `cannot forward` line), then dashboard
-  feedback (step 6).
+  shipped: a URL opens on the member that last attached to the instance
+  (`open.deliver`, mapped by that member's `profiles.toml`), its
+  localhost ports and OAuth callbacks forwarded into the instance on the
+  sending member first. Next: dashboard feedback (step 6).
   → [plan](plans/active/open-routing.md)
 
 ## Planned

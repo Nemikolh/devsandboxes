@@ -915,7 +915,7 @@ forwards aren't listed here.
 | `state` | `active`, `connecting`, or `error: <reason>` |
 | `conns` | open connections |
 | `configured` | from a sandbox's `forwardPorts`, not `forwards.add` |
-| `open` | an open forward: made by the opener for a URL's loopback port, never saved, stopped when idle or when its instance stops |
+| `open` | an open forward: made by the opener for a URL's loopback port, never saved, stopped when idle or when its instance stops (one with `machine`: when idle or when the machine goes) |
 | `machine` | the machine whose instance or service it reaches; absent for this host's |
 
 ### `forwards.list`
@@ -1416,8 +1416,10 @@ host's own `profiles.toml` (none, or unmapped: the system opener). Taken
 only when `url` is `http`/`https`, within a rate limit per caller and
 instance, and this host attached to that instance on the caller (an
 `instances.attach` with `machine`) live or less than 10 min ago. Result
-`{"ok": true}`: taken, opened on a thread of its own (a missing display
-or a failed spawn is this host's `serve.log` line). On a link peer's
+`{"ok": true}`: taken, opened on a thread of its own after its loopback
+ports are forwarded into the instance on the caller (open forwards with
+`machine`; a missing display or a failed spawn is this host's
+`serve.log` line). On a link peer's
 connection only, under either trust. Errors: `denied` (a local client;
 not attached here; the rate limit), `invalid` (bad params, a scheme past
 `http(s)`), `failed` (this daemon opens nothing).

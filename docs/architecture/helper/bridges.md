@@ -198,7 +198,7 @@ exact port. Each goes through the `open::Forwarder` with the job's
 sending member and the root and name it gave. The daemon's
 (`serve::opens::forwarder`) asks the forwards registry for an
 [open forward](../daemon/forwards.md#open-forwards)
-(`Handle::open_forward`), which refuses one into another member's instance.
+(`Handle::open_forward`): a delivered one tunnels over that member's link.
 The seam keeps `src/open.rs` free of the unix-only `serve`.
 
 The URL that opens is rewritten (`open::rewrite_direct`) to the direct

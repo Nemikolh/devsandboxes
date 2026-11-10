@@ -835,8 +835,8 @@ mod tests {
     fn forward_loopbacks_hands_a_machines_target_through() {
         let calls = Default::default();
         let t = ForwardTarget { machine: Some("box".into()), dir: "/home/u/cfg".into(), instance: "web-1".into() };
-        let got = forward_loopbacks("web-1", "http://localhost:3000/", Ok(&t), forwarding(&calls, |_| Err(Some("not yet".into()))));
-        assert_eq!(got.1, vec!["web-1: cannot forward port 3000 for http://localhost:3000/: not yet".to_string()]);
+        let got = forward_loopbacks("web-1", "http://localhost:3000/", Ok(&t), forwarding(&calls, |_| Err(Some("no machine named `box`".into()))));
+        assert_eq!(got.1, vec!["web-1: cannot forward port 3000 for http://localhost:3000/: no machine named `box`".to_string()]);
         assert_eq!(calls.into_inner(), vec![(t, direct(3000))]);
     }
 

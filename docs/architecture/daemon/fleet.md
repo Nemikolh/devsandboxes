@@ -2714,10 +2714,13 @@ opened) and goes to `open::open_here` on a thread of its own
 instance (`open::ForwardTarget { machine: Some(peer), dir: root,
 instance }`). The profile name picks a command in **this host's**
 `profiles.toml` only (docs/architecture/instances/profiles.md): the
-sender never names a command. Loopback forwards into another member's
-instance aren't made: the registry refuses an open forward with a
-`machine` (`forwards::OpenRequest::machine`), so such a URL opens as it
-is, with a `cannot forward` line.
+sender never names a command. Before it opens, the receiver forwards the
+URL's loopback ports into the sender's instance: open forwards with a
+`machine` (`forwards::OpenRequest::machine`), bound on this host and
+tunnelled over the link to the sender
+([forwards](forwards.md#open-forwards)), so a dev server or an OAuth
+callback on the container's localhost is reached from this host's
+browser.
 
 ### TUNNEL
 

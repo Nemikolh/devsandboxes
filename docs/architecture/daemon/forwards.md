@@ -81,8 +81,9 @@ that doesn't answer in time is not retried through `lsof`
 ## Remote bridges
 
 A forward into a machine's instance (machines.md) is always asked for from
-this side (`devsandbox port`, `forwards.add` with `machine`) and owned
-here: a machine's `forwardPorts` are never mirrored locally, since a port
+this side (`devsandbox port`, `forwards.add` with `machine`, or the
+opener for a URL delivered from there, [open forwards](#open-forwards))
+and owned here: a machine's `forwardPorts` are never mirrored locally, since a port
 exposed there doesn't mean it's wanted here. Each bridge is one `TUNNEL`
 stream on the machine's link ([fleet.md](fleet.md#tunnel)), whatever kind
 of machine, so it goes through the machine's trust table there; a dead
@@ -204,9 +205,9 @@ the `open::Forwarder` that `serve::opens::forwarder` builds from the
 handle; see [bridges.md](../helper/bridges.md#loopback-forwards)). It asks
 `Handle::open_forward` with an `OpenRequest`: config root, instance state
 key as already resolved, container port, and whether it's an OAuth
-callback port. One with a `machine` (an open delivered from another fleet
-member, [fleet.md](fleet.md#opening-urls)) is refused (`invalid`): no open
-forward goes into another member's instance. `Root::open` answers an `OpenForward` (bound host port,
+callback port, and the `machine` it runs on for an open delivered from
+another fleet member ([fleet.md](fleet.md#opening-urls)). A local one goes
+to `Root::open`, which answers an `OpenForward` (bound host port,
 `reused`):
 
 - **Reuse** (`Root::reusable`): any live forward in that root of the same
@@ -215,8 +216,8 @@ forward goes into another member's instance. `Root::open` answers an `OpenForwar
   only reuses one bound on that same host port, since the provider
   redirects to exactly it. Reusing an open forward refreshes its
   `Opened.touched`.
-- **Binding**: `127.0.0.1`, routed like an ad-hoc instance forward
-  (`local_opener` over `port::resolver`). A direct one is
+- **Binding** (`bind_open`): `127.0.0.1`, routed like an ad-hoc instance
+  forward (`local_opener` over `port::resolver`). A direct one is
   `HostPort::Prefer(port)`, retried as `Prefer(0)` when the port can't be
   bound for any reason but `AddrInUse` (a privileged port). A callback is
   `HostPort::Fixed(port)`; when that fails the answer is `bind-failed` and
@@ -232,6 +233,21 @@ sync stops those whose instance isn't running, before the configured
 reconcile (which bails when config or state don't load). Both are logged.
 `forwards.rm` stops one like any other (no store entry, no suppression).
 Rows carry `open: true`; the Ports tab marks them ` (open)`.
+
+One with a `machine` is `Daemon::open_remote`'s, owned by this (the
+opening) host and tunnelled over the machine's link like any
+[remote forward](#remote-bridges): a `Remote` with `opened` set (its
+start or last reuse). The machine must be known as for `forwards.add`
+(registered, an inbound neighbor up, or routed; else `not-found`);
+`dir` is the root there as delivered, never canonicalized here. Reuse
+follows the same rules over the remote forwards (`Remote::reaches`: same
+machine, root, instance and port, no service; a user's ad-hoc one too;
+a callback only one bound on that host port), binding the same
+`bind_open`. It is never written to `forwards.toml` nor restored, its
+row carries `machine` and `open: true`, and `forwards.rm` touches no
+store entry. The far instance stopping isn't visible here, so it stops
+only when idle (`Daemon::expire_open`, the same sweep) or when its
+machine goes (`drop_unregistered`, with no store write for it).
 
 ## Foreground `devsandbox port`
 
