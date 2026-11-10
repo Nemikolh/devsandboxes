@@ -152,8 +152,9 @@ its `instance_id` and the URL; injectable so tests see the URL).
 Either way the sink returns `Ok` and the daemon gets `ok`: taken, not opened.
 
 The production opener, `open::open_on_desktop`, runs on its own thread: it
-finds a display, picks the command and spawns it with stdio null and reaps
-it. The command is the instance's profile's, from this host's
+finds a display, makes the URL's loopback forwards (below), picks the
+command and spawns it with stdio null and reaps it. The command is the
+instance's profile's, from this host's
 `profiles.toml` ([profiles.md](../instances/profiles.md#on-the-opening-host)):
 `open::open_plan` finds the instance in `state.toml` by `instance_id` and maps
 its `profile` (`open::open_argv`); no instance, no profile, an unmapped or a
@@ -168,6 +169,38 @@ A session that doesn't import it needs `systemctl --user import-environment
 DISPLAY WAYLAND_DISPLAY XAUTHORITY` once per login. No display anywhere,
 no known opener or a failed spawn is a `serve.log` line too (`no display to
 open <url> on`).
+
+#### Loopback forwards
+
+A container's `localhost` is its own, so before the command runs the opener
+makes the ports the URL points at reachable on this host
+(`open::forward_loopbacks`). `open::loopback_ports` reads, without
+following nested URLs:
+
+- **direct**: the URL's own port when its host is `localhost`,
+  `127.0.0.1`, `[::1]` or `0.0.0.0` (any case; no port is 80 for `http`,
+  443 for `https`; a port that isn't 1-65535 is none);
+- **callback**: the port of a loopback `http(s)` URL in the query under
+  `redirect_uri`, `redirect_url` or `callback` (percent-decoded). Only a
+  key's first value counts, so repeating a key can't make the host bind
+  many ports.
+
+One entry per port; a port that is both is a callback, since it needs that
+exact port. Each goes through the `open::Forwarder` with the instance's
+config root and state key (the `state.toml` entry with its `instance_id`):
+the daemon's (`serve::host`, handed the registry by `Host::start`) asks the
+forwards registry for an [open forward](../daemon/forwards.md#open-forwards)
+(`Handle::open_forward`). The seam keeps `src/open.rs` free of the
+unix-only `serve`.
+
+The URL that opens is rewritten (`open::rewrite_direct`) to the direct
+port's bound host port when it differs, and a `0.0.0.0` host becomes
+`localhost` (Chrome refuses to navigate to `0.0.0.0`). A callback's URL
+stays as it is: the provider redirects to its exact port. An instance not
+in `state.toml`, one with no config root or a forward that fails is a
+`serve.log` line naming the instance and the URL, and that port stays as
+it was; the URL still opens. A callback port the registry can't bind has
+its own `forwards.status` line, so the opener logs nothing more for it.
 
 ### Control requests (`CONTROL`)
 

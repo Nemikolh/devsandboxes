@@ -499,6 +499,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             }),
             observers,
+            registry.as_ref().map(Registry::handle),
         )
     });
     if let Some(host) = &host {

@@ -199,10 +199,14 @@ is excluded from `config_hash`: editing it is never drift.
 ### Open forwards
 
 The third kind, made by the host's opener for the loopback port of a URL a
-container opens, before the browser opens it (`Handle::open_forward`, an
-`OpenRequest`: config root, instance state key as already resolved,
-container port, and whether it's an OAuth callback port). `Root::open`
-answers an `OpenForward` (bound host port, `reused`):
+container opens, before the browser opens it (`open::open_on_desktop`
+through the `open::Forwarder` that `serve::host` builds from the handle
+`Host::start` is given; see
+[bridges.md](../helper/bridges.md#loopback-forwards)). It asks
+`Handle::open_forward` with an `OpenRequest`: config root, instance state
+key as already resolved, container port, and whether it's an OAuth
+callback port. `Root::open` answers an `OpenForward` (bound host port,
+`reused`):
 
 - **Reuse** (`Root::reusable`): any live forward in that root of the same
   instance port with no service, ad-hoc, configured (`ConfiguredLive`

@@ -1,6 +1,6 @@
 # Open routing: a container's `xdg-open` opens on the user's desktop
 
-Status: steps 1 (1a-1c, below), 2 and 3 landed; step 4 is next.
+Status: steps 1 (1a-1c, below), 2, 3 and 4 landed; step 5 is next.
 
 ## Problem
 
@@ -238,6 +238,19 @@ forwards through the existing registry):
   instance they are remote forwards (`forwards.add` with `machine`,
   `tunnel::remote_opener`) owned by the opening host, as today's remote
   forwards are.
+
+Decided in step 4:
+
+- A callback only reuses a forward bound on that same host port; a
+  direct one reuses any forward of the instance port.
+- A direct port that can't be bound for any reason but being taken (a
+  privileged port) falls back to an automatic one, and the URL is
+  rewritten to it.
+- Only the first value of each callback key counts, so a repeated key
+  can't fan out into many binds.
+- A `0.0.0.0` host is rewritten to `localhost` (Chrome refuses to
+  navigate to `0.0.0.0`).
+- The Ports tab marker is `open: bool` on the forward row.
 
 ## Steps
 

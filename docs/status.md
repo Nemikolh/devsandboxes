@@ -19,7 +19,8 @@ limitation means editing this file in the same commit.
   `inspect`, the snapshots and the dashboard. Step 3 shipped: switching
   (`devsandbox profile`, `instances.setProfile`, the dashboard's `P` and
   `:profile`) and the host's `profiles.toml` choosing the browser a URL
-  opens in. Next: loopback and OAuth-callback forwards (step 4), then
+  opens in. Step 4 shipped: a URL on the container's localhost and an
+  OAuth login's localhost callback get an open forward first. Next:
   delivery to the member that last attached and dashboard feedback
   (steps 5-6). Meanwhile an
   instance with no attached desktop on its host (a remote one) has its

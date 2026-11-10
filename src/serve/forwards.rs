@@ -126,7 +126,6 @@ pub struct AddRequest {
 
 /// The opener's ask for a forward to an instance port a URL names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct OpenRequest {
     /// Absolute config root; canonicalized by the registry.
     pub dir: PathBuf,
@@ -140,7 +139,6 @@ pub struct OpenRequest {
 
 /// [`Handle::open_forward`]'s answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct OpenForward {
     pub host_port: u16,
     /// An existing forward (of any kind) answered.
@@ -187,7 +185,6 @@ enum Cmd {
     List { dir: Option<PathBuf>, machines: bool, reply: Sender<Vec<ForwardRow>> },
     Add { req: AddRequest, reply: Sender<Result<Added, ApiError>> },
     Remove { id: u64, reply: Sender<Result<Removed, ApiError>> },
-    #[cfg_attr(not(test), allow(dead_code))]
     Open { req: OpenRequest, reply: Sender<Result<OpenForward, ApiError>> },
     /// The runtime's running containers, from the host poll.
     Sync(Vec<String>),
@@ -274,7 +271,6 @@ impl Handle {
 
     /// A forward for the opener: an existing one of the same instance port
     /// when one fits, else a new open forward.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_forward(&self, req: OpenRequest) -> Result<OpenForward, ApiError> {
         self.ask(|reply| Cmd::Open { req, reply })?
     }
