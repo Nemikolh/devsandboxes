@@ -72,6 +72,9 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
             // pre-start `info` snapshot recorded; use the arch it establishes
             // for the relay decision below, not the possibly-stale `info`.
             let arch = crate::devsbd::ensure_recorded(key, info, false);
+            if arch.is_some() {
+                run::cgroup::warn_if_outside(&info.container);
+            }
             // Services may have been recreated with new addresses (or gc'd)
             // since the instance last ran; bring them up and refresh resolution.
             let project = services::project_id(dir)?;
@@ -138,7 +141,9 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
         None => {
             let services = stop::service_containers(&info.project, &info.instance_id);
             start_containers(&info.container, &services);
-            crate::devsbd::ensure_recorded(key, info, false);
+            if crate::devsbd::ensure_recorded(key, info, false).is_some() {
+                run::cgroup::warn_if_outside(&info.container);
+            }
         }
     }
     println!("started {key}");

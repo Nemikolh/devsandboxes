@@ -13,6 +13,7 @@ use crate::state::{Instance, Phase, State};
 use super::{container_drifted, pick, services};
 
 pub(crate) mod cancel;
+pub(crate) mod cgroup;
 mod editor;
 mod facts;
 mod folders;
@@ -845,6 +846,9 @@ pub(crate) fn materialize(
         &user_keys,
     );
     eprintln!("{}", tool_env::summary(root_plan, browser_sandbox.as_ref()));
+    if devsbd_arch.is_some() {
+        cgroup::warn_if_outside(&container);
+    }
     let workspace_file = write_workspace_file(
         &container,
         instance,

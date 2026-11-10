@@ -657,6 +657,39 @@ mod tests {
         Ok(())
     }
 
+    /// `devsbd cgroup check` in a plain alpine container: an exec lands in
+    /// the container's cgroup (no nested controllers, so even a rootless runc
+    /// joins it), exit 0 with no output, which `run::cgroup` reads as inside.
+    #[test_utils::docker_test(helper)]
+    fn cgroup_check_passes_in_a_plain_container() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("devsandbox-devsbd-cgroup-{stamp}");
+        let cleanup = || {
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            let up = crate::test_support::runtime_cmd()
+                .args(["run", "-d", "--rm", "--name", &name, "alpine:3.20", "sleep", "300"])
+                .output()
+                .unwrap();
+            assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+            install(&name, None).unwrap();
+            let out = crate::test_support::runtime_cmd()
+                .args(["exec", &name, BIN, "cgroup", "check"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned()),
+                (Some(0), String::new())
+            );
+            assert_eq!(crate::commands::run::cgroup::outside(&name), None);
+        });
+        Ok(())
+    }
+
     /// The browser wrapper (`devsbd/src/browser.rs`) as root, in alpine with
     /// a fake `chrome` on `PATH`: under our profile it starts the browser at
     /// uid 1001 in its own user namespace, fd 3 still open; under docker's

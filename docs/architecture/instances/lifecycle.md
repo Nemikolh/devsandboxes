@@ -94,8 +94,8 @@ had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`
    `connect_networks`, `wire_service_dns`, install the `devsbd` helper,
    `devsbd identity apply` as root (a failure fails the create), `devsbd
    userns check` as the exec user (the tool env,
-   [identity](identity.md#the-check-and-the-env)), write the
-   `.code-workspace` file.
+   [identity](identity.md#the-check-and-the-env)), the exec cgroup check
+   (below), write the `.code-workspace` file.
 6. Save the record (still in flight), write the VS Code name config, sync the
    helper's boot file.
 7. Lifecycle (phase = step name): `shell-rc` wiring if any, then
@@ -125,7 +125,8 @@ the pid is dead or the boot id changed, so nobody rewrites records.
 - `start <name>|--all`: refreshes the ssh-agent link and worktree locks. If
   the config still resolves for this root: drift warning
   ([rebuild and drift](rebuild-and-drift.md)), `start` the container, apply
-  the restart policy, ensure the helper, `ensure_services` +
+  the restart policy, ensure the helper, the exec cgroup check,
+  `ensure_services` +
   `wire_service_dns`, sync the boot file, then exec `postStartCommand` itself
   unless the in-container boot hook already runs it (`autostart = "runtime"`
   on a runtime with restart policies; a container predating the hook warns
@@ -134,6 +135,18 @@ the pid is dead or the boot id changed, so nobody rewrites records.
   error (its message points at `devsandbox run`).
 - `stop <name>|--all`: stops the container, then its isolated services.
   Global services keep running.
+
+## The exec cgroup check
+
+With the helper installed, `run` (after create), `start` and `inspect`
+exec `devsbd cgroup check` (`run::cgroup::warn_if_outside`; contract in
+[in-container](../helper/in-container.md#devsbd-cgroup-check)) and warn
+when the exec landed outside the container's cgroup: a container runtime
+started from a shell or hook there (docker-in-docker's dockerd) can't
+start containers. The warning names the cause (runc before 1.4.1 on a
+rootless engine) and the workaround (restart the container so its
+entrypoint starts the daemon). The answer isn't recorded: the OCI runtime
+runs afresh for every exec, so upgrading it fixes existing containers.
 
 ## rm
 

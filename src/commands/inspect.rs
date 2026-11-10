@@ -9,7 +9,9 @@ use crate::state::{Instance, State};
 /// container, with the same light key highlighting as the TUI inspect pane
 /// (color only on a TTY; see `render::paint`). For an instance, its browser
 /// sandbox line goes first, on stderr, from the record ([`browser_line`]),
-/// then its profile's when it has one ([`profile_line`]).
+/// then its profile's when it has one ([`profile_line`]), then, when it has
+/// the helper, the exec cgroup warning if its execs land outside its cgroup
+/// (`run::cgroup`, checked live: no answer from a stopped container).
 pub fn inspect(name: &str, json: bool) -> Result<()> {
     let state = State::load()?;
     let container = resolve_container(&state, name)?;
@@ -19,6 +21,9 @@ pub fn inspect(name: &str, json: bool) -> Result<()> {
         if info.profile.is_some() {
             let allowed = crate::snapshot::allowed_now(&mut Default::default(), info);
             eprintln!("{}", profile_line(info, allowed.as_deref()));
+        }
+        if info.devsbd_arch.is_some() {
+            crate::commands::run::cgroup::warn_if_outside(&container);
         }
     }
     println!("{}", render(&raw, json));

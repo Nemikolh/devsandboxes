@@ -631,6 +631,13 @@ is frozen: no new work on it.
   (`cmd.uid/gid` clears them), unlike `docker exec -u`; fix: switch in
   `pre_exec` with `supplementary_groups`, as `rpc_runs::switch_user` does.
   → [in-container](architecture/helper/in-container.md); `boot::run_spec`
+- On a rootless engine whose runc predates 1.4.1, exec'd processes land
+  outside the container's cgroup once its root cgroup has controllers
+  enabled (docker-in-docker), so a nested dockerd restarted from a shell
+  or hook can't start containers. devsandbox only warns (`run`, `start`,
+  `inspect`); the fix is the host's runc. The check needs the helper.
+  → [lifecycle](architecture/instances/lifecycle.md#the-exec-cgroup-check);
+  `run::cgroup::warn_if_outside`
 - The helper's arch is found by a blind second try, no probe.
   → [helper](architecture/helper/overview.md); `devsbd::candidates`
 

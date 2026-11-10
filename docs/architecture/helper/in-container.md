@@ -376,6 +376,25 @@ also exit 1. 2 on a usage error. Off Linux it always exits 1 with
 (`ROOT_LINE`): Chromium refuses its sandbox there, whatever namespaces
 could be made.
 
+## `devsbd cgroup check`
+
+`devsbd cgroup check` (`cgroup::run`) tells whether a process exec'd into
+the container lands in the container's own cgroup. The host runs it as an
+exec, so it measures exactly that: it reads the cgroup v2 entry (`0::`) of
+`/proc/self/cgroup`, and a path starting with `/..` names an ancestor of
+the container's cgroup namespace root (`cgroup::outside`). That happens
+when the OCI runtime can't put the exec into the container's cgroup and
+doesn't fall back to init's: a rootless runc before 1.4.1, once the root
+cgroup has controllers enabled (docker-in-docker moves PID 1 to `/init`
+and enables them). A container runtime started from such a process can't
+place its own containers, and with `nsdelegate` nothing inside can move it
+back.
+
+Exit 0 with no output when inside, or with no v2 entry (cgroup v1 only);
+1 with `devsbd: cgroup: outside: <path>` on stderr when outside, or
+`devsbd: cgroup: /proc/self/cgroup: <error>` when it can't read it; 2 on a
+usage error.
+
 ## Browser wrapper
 
 `devsbd` is multicall: when `argv[0]`'s basename is one of
@@ -446,7 +465,7 @@ vscode` (`src/commands/vscode.rs`).
 ## `devsbd features`
 
 Prints the append-only list of CLI capabilities (`thread-send`,
-`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`, `userns`, `open`) a dispatcher may probe
+`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`, `userns`, `open`, `cgroup`) a dispatcher may probe
 before relying on them.
 
 Limitations: [status.md](../../status.md#helper)

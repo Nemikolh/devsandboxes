@@ -4,6 +4,7 @@
 mod boot;
 mod bridge;
 mod browser;
+mod cgroup;
 mod ctl;
 mod daemon;
 mod identity;
@@ -60,7 +61,7 @@ fn build_hash() -> String {
 /// which reads as "none of these". Append-only; separate from `version`,
 /// whose one-line output is the host's install check, and from the frame
 /// protocol's `caps`, which describe the host link, not the CLI.
-const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session", "userns", "open"];
+const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session", "userns", "open", "cgroup"];
 
 fn main() {
     // Multicall: under a browser's name (the links in /run/devsandbox/bin)
@@ -112,9 +113,10 @@ fn main() {
         Some("session") => std::process::exit(sessions::run(&args.collect::<Vec<_>>())),
         Some("identity") => std::process::exit(identity::run(&args.collect::<Vec<_>>())),
         Some("userns") => std::process::exit(userns::run(&args.collect::<Vec<_>>())),
+        Some("cgroup") => std::process::exit(cgroup::run(&args.collect::<Vec<_>>())),
         _ => {
             eprintln!(
-                "usage: devsbd version|features|daemon|bridge|boot|notify|open|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|vscode-goto"
+                "usage: devsbd version|features|daemon|bridge|boot|notify|open|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|cgroup|vscode-goto"
             );
             std::process::exit(2);
         }
