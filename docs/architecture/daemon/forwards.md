@@ -135,8 +135,9 @@ OS-assigned port. Spec `<port>` is `Prefer(port)`, `<host>:<port>` is
 
 One `serve-forwards` thread owns every daemon forward, so they outlive any
 dashboard. It blocks on a command channel with a `POLL` (500 ms) timeout:
-`forwards.list|add|rm` requests (each with a reply channel, waited up to
-`REPLY_TIMEOUT`, 10 s), the host poll's running containers, and the
+`forwards.list|add|rm` requests and the opener's open requests (each with
+a reply channel, waited up to `REPLY_TIMEOUT`, 10 s), the host poll's
+running containers, and the
 periodic status poll. All config/state work and binding happens on this
 thread, never a connection's. Forwards are grouped per canonical config
 root (`Root`), forwards into machines kept apart (`Remote`, by id: no local
@@ -194,6 +195,38 @@ own; each tried `Fixed`. The chosen port is saved in `state.toml`
 `State.global_forwarded_ports[project]`), keyed by the entry's canonical
 form; each sync prunes ports of entries no longer declared. `forwardPorts`
 is excluded from `config_hash`: editing it is never drift.
+
+### Open forwards
+
+The third kind, made by the host's opener for the loopback port of a URL a
+container opens, before the browser opens it (`Handle::open_forward`, an
+`OpenRequest`: config root, instance state key as already resolved,
+container port, and whether it's an OAuth callback port). `Root::open`
+answers an `OpenForward` (bound host port, `reused`):
+
+- **Reuse** (`Root::reusable`): any live forward in that root of the same
+  instance port with no service, ad-hoc, configured (`ConfiguredLive`
+  keeps the instance port it reaches) or open, lowest id first. A callback
+  only reuses one bound on that same host port, since the provider
+  redirects to exactly it. Reusing an open forward refreshes its
+  `Opened.touched`.
+- **Binding**: `127.0.0.1`, routed like an ad-hoc instance forward
+  (`local_opener` over `port::resolver`). A direct one is
+  `HostPort::Prefer(port)`, retried as `Prefer(0)` when the port can't be
+  bound for any reason but `AddrInUse` (a privileged port). A callback is
+  `HostPort::Fixed(port)`; when that fails the answer is `bind-failed` and
+  a `forwards.status` line (also in `serve.log`) says the callback won't
+  reach the instance.
+
+Open forwards are never written to `forwards.toml` nor restored. Each
+status poll stops those idle for `OPEN_FORWARD_IDLE` (10 min,
+`open_expired`): no connection open (`ForwardStatus.idle_since`, which the
+engine resets on every accept and whenever its last connection closes, so
+a short callback between two polls still counts) and no reuse since. Each
+sync stops those whose instance isn't running, before the configured
+reconcile (which bails when config or state don't load). Both are logged.
+`forwards.rm` stops one like any other (no store entry, no suppression).
+Rows carry `open: true`; the Ports tab marks them ` (open)`.
 
 ## Foreground `devsandbox port`
 

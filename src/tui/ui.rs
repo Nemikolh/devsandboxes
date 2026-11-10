@@ -658,6 +658,9 @@ fn port_row(r: &PortRow, show_machine: bool) -> Row<'_> {
     if r.configured {
         target.push(Span::styled(" (config)", Style::default().add_modifier(Modifier::DIM)));
     }
+    if r.open {
+        target.push(Span::styled(" (open)", Style::default().add_modifier(Modifier::DIM)));
+    }
     let mut cells = vec![Cell::from(r.local.clone())];
     if show_machine {
         cells.push(Cell::from(Span::styled(r.machine.clone().unwrap_or_default(), Style::default().fg(ACCENT))));
@@ -3425,6 +3428,7 @@ mod tests {
             state: "active".into(),
             conns: 0,
             configured: false,
+            open: false,
             machine: machine.map(String::from),
         };
         let mut app = phase_app(vec![("web", running(), None)]);

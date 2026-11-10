@@ -113,6 +113,8 @@ pub struct PortRow {
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by hand.
     pub configured: bool,
+    /// Made by the opener for a URL's loopback port, not by hand.
+    pub open: bool,
     /// The machine whose instance or service it reaches; `None` for this
     /// host's.
     pub machine: Option<String>,

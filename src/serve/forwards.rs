@@ -13,6 +13,11 @@
 //! [`Registry`] stops the thread and drops every forward (closing its
 //! listener, killing its bridge) before it returns.
 //!
+//! Open forwards ([`Handle::open_forward`]) are the third kind: made by the
+//! opener for a URL's loopback port before the browser opens, reusing any
+//! forward of the same instance port, never persisted, stopped after
+//! [`OPEN_FORWARD_IDLE`] without a connection or when their instance stops.
+//!
 //! Forwards are grouped per config root ([`Root`], keyed by the canonical
 //! `dir`); ids are unique daemon-wide. Configured forwards are reconciled for
 //! every config root recorded in `state.toml` against the host's poll of the
@@ -44,7 +49,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +72,9 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a restore retries a saved host port that's taken before it
 /// falls back to the next free one.
 const RESTORE_PORT_WAIT: Duration = Duration::from_secs(1);
+/// How long an open forward lives without a connection (counted from its
+/// last connection, or its last reuse, whichever is later).
+pub const OPEN_FORWARD_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// One row of `forwards.list`: the dashboard's Ports-tab row plus the forward's
 /// config root.
@@ -91,6 +99,8 @@ pub struct ForwardRow {
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by `forwards.add`.
     pub configured: bool,
+    /// Made by the opener for a URL's loopback port (an open forward).
+    pub open: bool,
     /// The machine whose instance or service it reaches; absent for this
     /// host's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +122,29 @@ pub struct AddRequest {
     pub container_port: u16,
     /// A registered machine: the forward still binds here.
     pub machine: Option<String>,
+}
+
+/// The opener's ask for a forward to an instance port a URL names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct OpenRequest {
+    /// Absolute config root; canonicalized by the registry.
+    pub dir: PathBuf,
+    /// Instance state key, already resolved.
+    pub instance: String,
+    pub container_port: u16,
+    /// An OAuth callback port: only a forward bound on the same host port
+    /// will do (the provider redirects to exactly that port).
+    pub callback: bool,
+}
+
+/// [`Handle::open_forward`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct OpenForward {
+    pub host_port: u16,
+    /// An existing forward (of any kind) answered.
+    pub reused: bool,
 }
 
 /// `forwards.add`'s answer.
@@ -154,6 +187,8 @@ enum Cmd {
     List { dir: Option<PathBuf>, machines: bool, reply: Sender<Vec<ForwardRow>> },
     Add { req: AddRequest, reply: Sender<Result<Added, ApiError>> },
     Remove { id: u64, reply: Sender<Result<Removed, ApiError>> },
+    #[cfg_attr(not(test), allow(dead_code))]
+    Open { req: OpenRequest, reply: Sender<Result<OpenForward, ApiError>> },
     /// The runtime's running containers, from the host poll.
     Sync(Vec<String>),
     Stop,
@@ -213,8 +248,8 @@ impl Registry {
         Handle { tx: self.tx.clone() }
     }
 
-    /// Live forwards, ad-hoc, configured and remote: the `forwards` holder
-    /// count.
+    /// Live forwards, ad-hoc, configured, open and remote: the `forwards`
+    /// holder count.
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
@@ -235,6 +270,13 @@ impl Handle {
     /// Hand the registry the running containers. Never blocks.
     pub fn sync(&self, running: Vec<String>) {
         let _ = self.tx.send(Cmd::Sync(running));
+    }
+
+    /// A forward for the opener: an existing one of the same instance port
+    /// when one fits, else a new open forward.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_forward(&self, req: OpenRequest) -> Result<OpenForward, ApiError> {
+        self.ask(|reply| Cmd::Open { req, reply })?
     }
 
     fn ask<T>(&self, cmd: impl FnOnce(Sender<T>) -> Cmd) -> Result<T, ApiError> {
@@ -342,6 +384,9 @@ impl Daemon {
                 Ok(Cmd::Remove { id, reply }) => {
                     let _ = reply.send(self.remove(id));
                 }
+                Ok(Cmd::Open { req, reply }) => {
+                    let _ = reply.send(self.open(req));
+                }
                 Ok(Cmd::Sync(running)) => self.sync(&running),
                 Err(RecvTimeoutError::Timeout) => {}
                 Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
@@ -396,6 +441,24 @@ impl Daemon {
         let (added, entry) = started?;
         self.persist(|entries| entries.push(entry));
         Ok(added)
+    }
+
+    /// The opener's forward (see [`Root::open`]). A callback port that can't
+    /// be bound is also a status line: the OAuth redirect will miss.
+    fn open(&mut self, req: OpenRequest) -> Result<OpenForward, ApiError> {
+        let dir = req
+            .dir
+            .canonicalize()
+            .map_err(|e| ApiError::not_found(format!("no directory {}: {e}", req.dir.display())))?;
+        let mut next_id = self.next_id;
+        let opened = self.root(&dir).open(&req, &mut next_id, Instant::now());
+        self.next_id = next_id;
+        opened.map_err(|(e, note)| {
+            if let Some(line) = note {
+                self.status(line);
+            }
+            e
+        })
     }
 
     /// `forwards.add` into `machine`: it must be registered (or an inbound
@@ -660,11 +723,17 @@ impl Daemon {
         }
         let mut next_id = self.next_id;
         let mut notes = Vec::new();
+        let mut stopped = Vec::new();
         for root in self.roots.values_mut() {
             let keys = running_keys(&state, running, &root.dir);
+            // Before `Root::sync`, which bails when config or state don't load.
+            stopped.extend(root.stop_open(|o, _| !keys.contains(&o.instance)));
             root.sync(&keys, &mut next_id, &mut notes);
         }
         self.next_id = next_id;
+        for (target, local) in stopped {
+            (self.log)(&format!("forwards: stopped open forward {target} on {local}: its instance stopped"));
+        }
         for line in notes {
             self.status(line);
         }
@@ -674,6 +743,18 @@ impl Daemon {
     /// then drain each forward's notes and send the newest as a deduped
     /// [`Event::Status`].
     fn poll(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(String, String)> = self
+            .roots
+            .values_mut()
+            .flat_map(|root| root.stop_open(|o, status| open_expired(status.idle_since, o.touched, now)))
+            .collect();
+        for (target, local) in expired {
+            (self.log)(&format!(
+                "forwards: stopped open forward {target} on {local}: no connection for {} min",
+                OPEN_FORWARD_IDLE.as_secs() / 60
+            ));
+        }
         let rows = self.rows(None, true);
         self.active.store(rows.len(), Ordering::Release);
         if rows != self.last_rows {
@@ -731,6 +812,32 @@ struct Configured {
     entry: String,
 }
 
+/// A live configured forward.
+struct ConfiguredLive {
+    /// Its id in `Root::live`.
+    id: u64,
+    /// The instance port it reaches when it has no service: what an open
+    /// request may reuse it for, without reloading config.
+    direct: Option<u16>,
+}
+
+/// A live open forward.
+struct Opened {
+    /// Instance state key.
+    instance: String,
+    container_port: u16,
+    /// Its start or last reuse: the idle stop counts from the later of this
+    /// and the forward's last connection.
+    touched: Instant,
+}
+
+/// Whether an open forward has been idle for [`OPEN_FORWARD_IDLE`]: no
+/// connection open (`idle_since` is `Some`) and nothing since, counting its
+/// last reuse (`touched`).
+fn open_expired(idle_since: Option<Instant>, touched: Instant, now: Instant) -> bool {
+    idle_since.is_some_and(|idle| now.saturating_duration_since(idle.max(touched)) >= OPEN_FORWARD_IDLE)
+}
+
 /// One forward into a machine's instance or service: ad-hoc only (a
 /// machine's `forwardPorts` are never mirrored here), bound here, its bridge
 /// a `TUNNEL` stream over the machine's link.
@@ -768,7 +875,9 @@ struct Root {
     /// removes from the store.
     adhoc: BTreeMap<u64, Entry>,
     /// Live configured forwards -> their id in `live`.
-    configured: BTreeMap<Configured, u64>,
+    configured: BTreeMap<Configured, ConfiguredLive>,
+    /// Live open forwards' ids -> what they reach. Never in the store.
+    opened: BTreeMap<u64, Opened>,
     /// Configured forwards stopped by `forwards.rm`: not restarted until their
     /// owner stops (drops out of the wanted set) and comes back.
     suppressed: BTreeSet<Configured>,
@@ -786,17 +895,109 @@ impl Root {
             live: BTreeMap::new(),
             adhoc: BTreeMap::new(),
             configured: BTreeMap::new(),
+            opened: BTreeMap::new(),
             suppressed: BTreeSet::new(),
             failed: BTreeSet::new(),
         }
     }
 
     fn rows(&self) -> Vec<ForwardRow> {
-        let configured: BTreeSet<u64> = self.configured.values().copied().collect();
+        let configured: BTreeSet<u64> = self.configured.values().map(|c| c.id).collect();
         self.live
             .iter()
-            .map(|(&id, f)| status_to_row(id, &self.dir, &f.status(), configured.contains(&id)))
+            .map(|(&id, f)| ForwardRow {
+                open: self.opened.contains_key(&id),
+                ..status_to_row(id, &self.dir, &f.status(), configured.contains(&id))
+            })
             .collect()
+    }
+
+    /// A live forward of instance `key`'s `port` with no service, of any
+    /// kind, lowest id first; with `callback`, only one bound on host port
+    /// `port` itself.
+    fn reusable(&self, key: &str, port: u16, callback: bool) -> Option<u64> {
+        let adhoc = self.adhoc.iter().filter(|(_, e)| {
+            e.instance.as_deref() == Some(key) && e.service.is_none() && e.container_port == port && e.machine.is_none()
+        });
+        let configured = self.configured.iter().filter_map(|(c, live)| {
+            (c.owner == Owner::Instance(key.to_string()) && live.direct == Some(port)).then_some(live.id)
+        });
+        let opened = self.opened.iter().filter(|(_, o)| o.instance == key && o.container_port == port);
+        let mut ids: Vec<u64> =
+            adhoc.map(|(&id, _)| id).chain(configured).chain(opened.map(|(&id, _)| id)).collect();
+        ids.sort_unstable();
+        ids.into_iter().find(|id| {
+            self.live.get(id).is_some_and(|f| !callback || f.status().local_addr.port() == port)
+        })
+    }
+
+    /// The opener's forward to `req`'s instance port: an existing one that
+    /// fits ([`Root::reusable`]; an open one's `touched` refreshed), else a
+    /// new open forward on 127.0.0.1. A direct one prefers the container
+    /// port (falling back to an automatic one when that can't bind for any
+    /// reason but being taken, a privileged port say); a callback needs
+    /// exactly that port. The instance key is taken as given: a bad one is
+    /// the route's error, on the forward's own thread. An error may come
+    /// with a status line.
+    fn open(
+        &mut self,
+        req: &OpenRequest,
+        next_id: &mut u64,
+        now: Instant,
+    ) -> Result<OpenForward, (ApiError, Option<String>)> {
+        let (key, port) = (req.instance.as_str(), req.container_port);
+        if let Some(id) = self.reusable(key, port, req.callback) {
+            if let Some(o) = self.opened.get_mut(&id) {
+                o.touched = now;
+            }
+            return Ok(OpenForward { host_port: self.live[&id].status().local_addr.port(), reused: true });
+        }
+        let start = |host_port| {
+            Forward::start(ForwardSpec {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                host_port,
+                open: local_opener(port::resolver(self.dir.clone(), Some(key.to_string()), None, port)),
+                probe: Box::new(port::listening_procs),
+            })
+        };
+        let started = if req.callback {
+            start(HostPort::Fixed(port)).map_err(|e| {
+                let note = if e.kind() == std::io::ErrorKind::AddrInUse {
+                    format!("{key}: port {port} is taken; an OAuth callback to it won't reach {key}")
+                } else {
+                    format!("{key}: cannot bind port {port} ({}); an OAuth callback to it won't reach {key}", bind_reason(&e))
+                };
+                (bind_failed(HostPort::Fixed(port), &e), Some(note))
+            })
+        } else {
+            match start(HostPort::Prefer(port)) {
+                Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => start(HostPort::Prefer(0)),
+                started => started,
+            }
+            .map_err(|e| (bind_failed(HostPort::Prefer(port), &e), None))
+        }?;
+        let host_port = started.status().local_addr.port();
+        let id = self.insert(started, next_id);
+        self.opened.insert(id, Opened { instance: key.to_string(), container_port: port, touched: now });
+        Ok(OpenForward { host_port, reused: false })
+    }
+
+    /// Drop the open forwards `stop` picks (given the forward's status).
+    /// Returns each one's `(target, local)` for the log.
+    fn stop_open(&mut self, stop: impl Fn(&Opened, &ForwardStatus) -> bool) -> Vec<(String, String)> {
+        let picked: Vec<u64> = self
+            .opened
+            .iter()
+            .filter(|(id, o)| self.live.get(id).is_some_and(|f| stop(o, &f.status())))
+            .map(|(&id, _)| id)
+            .collect();
+        let mut out = Vec::new();
+        for id in picked {
+            let Some(o) = self.opened.remove(&id) else { continue };
+            let Some(f) = self.live.remove(&id) else { continue };
+            out.push((target_label(None, Some(&o.instance), o.container_port), f.status().local_addr.to_string()));
+        }
+        out
     }
 
     fn insert(&mut self, forward: Forward, next_id: &mut u64) -> u64 {
@@ -853,13 +1054,14 @@ impl Root {
     /// Drop the forward with `id` (its `Drop` kills the bridge/`exec`), `None`
     /// when this root has no such forward. A configured forward stays stopped
     /// until its owner restarts instead of coming straight back on the next
-    /// sync. An ad-hoc one comes with its store entry.
+    /// sync. An ad-hoc one comes with its store entry; an open one has none.
     fn remove(&mut self, id: u64) -> Option<(Removed, Option<Entry>)> {
         let forward = self.live.remove(&id)?;
         let local = forward.status().local_addr.to_string();
         drop(forward);
         let entry = self.adhoc.remove(&id);
-        let configured = self.configured.iter().find(|(_, v)| **v == id).map(|(c, _)| c.clone());
+        self.opened.remove(&id);
+        let configured = self.configured.iter().find(|(_, v)| v.id == id).map(|(c, _)| c.clone());
         if let Some(c) = &configured {
             self.configured.remove(c);
             self.suppressed.insert(c.clone());
@@ -878,8 +1080,8 @@ impl Root {
 
         let gone: Vec<Configured> = self.configured.keys().filter(|c| !wanted.contains_key(c)).cloned().collect();
         for c in gone {
-            if let Some(id) = self.configured.remove(&c) {
-                self.live.remove(&id);
+            if let Some(live) = self.configured.remove(&c) {
+                self.live.remove(&live.id);
             }
         }
         self.failed.retain(|c| wanted.contains_key(c));
@@ -895,7 +1097,8 @@ impl Root {
             }
             match self.start_configured(&state, &project, c, fp, next_id) {
                 Ok((id, port, label)) => {
-                    self.configured.insert(c.clone(), id);
+                    let direct = fp.service.is_none().then_some(fp.port);
+                    self.configured.insert(c.clone(), ConfiguredLive { id, direct });
                     notes.push(format!("forwarding 127.0.0.1:{port} -> {label}"));
                     // Later allocations in this pass must see it as taken.
                     dirty |= save_port(&mut state, &project, c, port);
@@ -975,6 +1178,7 @@ fn status_to_row(id: u64, dir: &Path, status: &ForwardStatus, configured: bool) 
         state: state_string(&status.state),
         conns: status.open_conns,
         configured,
+        open: false,
         machine: None,
     }
 }
@@ -1317,6 +1521,7 @@ forwardPorts = ["redis:6379"]
             route_label: "api:3000".into(),
             state,
             open_conns: conns,
+            idle_since: None,
             process: process.map(str::to_string),
         }
     }
@@ -1354,6 +1559,7 @@ forwardPorts = ["redis:6379"]
             serde_json::json!({
                 "id": 7, "dir": "/cfg", "local": "127.0.0.1:3000", "target": "api:3000",
                 "process": null, "state": "active", "conns": 1, "configured": false,
+                "open": false,
             })
         );
         assert_eq!(serde_json::from_value::<ForwardRow>(v).unwrap(), row);
@@ -1501,6 +1707,101 @@ forwardPorts = ["redis:6379"]
         assert_eq!((e.code, e.message), ("bind-failed", format!("port {port}: address in use")));
         assert!(reg.handle().list(None, false).unwrap().is_empty());
         assert_eq!(reg.active(), 0);
+    }
+
+    // ---- open forwards ----
+
+    #[test]
+    fn open_forwards_expire_after_the_idle_time_from_the_later_of_close_and_reuse() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let idle = OPEN_FORWARD_IDLE.as_secs();
+        assert!(!open_expired(None, t0, at(idle * 10)), "a connection is open");
+        assert!(!open_expired(Some(t0), t0, at(idle - 1)));
+        assert!(open_expired(Some(t0), t0, at(idle)));
+        assert!(!open_expired(Some(t0), at(5), at(idle)), "reused since");
+        assert!(!open_expired(Some(at(5)), t0, at(idle)), "a connection closed since");
+        assert!(open_expired(Some(at(5)), at(3), at(idle + 5)));
+        // A clock before `touched` (never in practice) isn't expired.
+        assert!(!open_expired(Some(at(9)), at(9), t0));
+    }
+
+    fn open_req(dir: &Path, port: u16, callback: bool) -> OpenRequest {
+        // An instance no state has: the forward binds anyway, its route errors
+        // on its own thread.
+        OpenRequest { dir: dir.to_path_buf(), instance: "ghost-open-xyz".into(), container_port: port, callback }
+    }
+
+    /// A port free right now (bound and released).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A callback open binds its own port, makes an `open` row and no store
+    /// entry; the next callback and a direct open of the same instance port
+    /// reuse it. A direct open whose port is taken walks up, and a callback
+    /// won't reuse that one (wrong host port), so it tries its own port and
+    /// fails. `rm` stops one. No port is ever freed for a later bind, so a
+    /// parallel test can't take it in between.
+    #[test]
+    fn open_forwards_reuse_by_instance_port_never_persist_and_rm() {
+        let root = tmp("open-root");
+        let store = tmp("open").join("forwards.toml");
+        let (reg, _) = registry_at(&store);
+        let h = reg.handle();
+
+        let port = free_port();
+        let callback = h.open_forward(open_req(&root, port, true)).unwrap();
+        assert_eq!(callback, OpenForward { host_port: port, reused: false });
+        let rows = h.list(None, false).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].open && !rows[0].configured, "{rows:?}");
+        assert_eq!(port_of(&rows[0].local), port);
+        assert!(!store.exists() || forward_store::load(&store).unwrap().is_empty(), "never persisted");
+        assert_eq!(reg.active(), 1);
+        let reused = OpenForward { host_port: port, reused: true };
+        assert_eq!(h.open_forward(open_req(&root, port, true)).unwrap(), reused);
+        assert_eq!(h.open_forward(open_req(&root, port, false)).unwrap(), reused, "direct reuses it too");
+
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = held.local_addr().unwrap().port();
+        let direct = h.open_forward(open_req(&root, other, false)).unwrap();
+        assert!(!direct.reused);
+        assert_ne!(direct.host_port, other, "taken: Prefer walks up");
+        let again = h.open_forward(open_req(&root, other, false)).unwrap();
+        assert_eq!(again, OpenForward { host_port: direct.host_port, reused: true });
+        let e = h.open_forward(open_req(&root, other, true)).unwrap_err();
+        assert_eq!(e.code, "bind-failed", "a callback never reuses a forward on another host port");
+        let rows = h.list(None, false).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r.open));
+
+        let id = rows.iter().find(|r| port_of(&r.local) == port).unwrap().id;
+        let local = format!("127.0.0.1:{port}");
+        assert_eq!(h.rm(id).unwrap(), Removed { local, configured: false });
+        assert_eq!(h.list(None, false).unwrap().len(), 1);
+        drop(held);
+        assert!(!store.exists() || forward_store::load(&store).unwrap().is_empty());
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A callback port someone else holds is `bind-failed`, and a status
+    /// line says the callback won't arrive.
+    #[test]
+    fn a_taken_callback_port_is_bind_failed_with_a_status_line() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let (reg, events) = registry();
+        let e = reg.handle().open_forward(open_req(&std::env::temp_dir(), port, true)).unwrap_err();
+        assert_eq!((e.code, e.message), ("bind-failed", format!("port {port}: address in use")));
+        let want = format!("ghost-open-xyz: port {port} is taken; an OAuth callback to it won't reach ghost-open-xyz");
+        assert!(events.lock().unwrap().contains(&Event::Status(want)));
+        assert!(reg.handle().list(None, false).unwrap().is_empty());
+        assert_eq!(
+            reg.handle().open_forward(open_req(Path::new("/nonexistent/devsandbox-fwd"), port, false)).unwrap_err().code,
+            "not-found"
+        );
     }
 
     // ---- persistence (forwards.toml) ----

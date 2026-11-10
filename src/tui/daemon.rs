@@ -641,6 +641,7 @@ fn port_rows(result: Value) -> Result<Vec<PortRow>> {
             state: r.state,
             conns: r.conns,
             configured: r.configured,
+            open: r.open,
             machine: r.machine,
         })
         .collect())
@@ -1250,6 +1251,7 @@ mod tests {
                     state: "connecting".into(),
                     conns: 0,
                     configured: false,
+                    open: false,
                     machine: Some("box".into()),
                 };
                 Ok(vec![ForwardRow {
@@ -1261,6 +1263,7 @@ mod tests {
                     state: "active".into(),
                     conns: 2,
                     configured: true,
+                    open: false,
                     machine: None,
                 }, remote])
             }
@@ -1293,6 +1296,7 @@ mod tests {
                     state: "active".into(),
                     conns: 2,
                     configured: true,
+                    open: false,
                     machine: None,
                 },
                 PortRow {
@@ -1303,6 +1307,7 @@ mod tests {
                     state: "connecting".into(),
                     conns: 0,
                     configured: false,
+                    open: false,
                     machine: Some("box".into()),
                 },
             ]

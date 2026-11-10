@@ -891,6 +891,7 @@ forwards aren't listed here.
 | `state` | `active`, `connecting`, or `error: <reason>` |
 | `conns` | open connections |
 | `configured` | from a sandbox's `forwardPorts`, not `forwards.add` |
+| `open` | an open forward: made by the opener for a URL's loopback port, never saved, stopped when idle or when its instance stops |
 | `machine` | the machine whose instance or service it reaches; absent for this host's |
 
 ### `forwards.list`

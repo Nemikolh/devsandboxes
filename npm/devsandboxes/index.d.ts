@@ -781,6 +781,8 @@ export interface ForwardRow {
   conns: number;
   /** From a sandbox's `forwardPorts`, not `forwards.add()`. */
   configured: boolean;
+  /** Made by the daemon's opener for a URL's loopback port (an open forward), not `forwards.add()`. */
+  open: boolean;
   /** The machine whose instance or service it reaches (`forwards.add()` with `machine`); absent for this host's. @experimental */
   machine?: string;
 }

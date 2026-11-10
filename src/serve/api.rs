@@ -2691,6 +2691,7 @@ mod tests {
                 state: "active".into(),
                 conns: 0,
                 configured: true,
+                open: false,
                 machine: None,
             }])
         }
@@ -2836,6 +2837,7 @@ mod tests {
             state: "active".into(),
             conns: 0,
             configured: false,
+            open: false,
             machine: Some("box".into()),
         };
         let added = Added { id: 1, local: "127.0.0.1:3000".into(), target: "web:3000".into() };

@@ -176,6 +176,10 @@ pub struct ForwardStatus {
     // Read by the daemon's registry for the Ports tab (docs/architecture/daemon/forwards.md); the
     // CLI doesn't surface it.
     pub open_conns: usize,
+    /// `None` while a connection is open; else when the last one closed (or
+    /// was accepted), or the forward's start when it never had one. What the
+    /// registry's idle stop of open forwards reads.
+    pub idle_since: Option<Instant>,
     /// The process listening on the forwarded port, e.g. `node (pid 412)`, or
     /// `None` when unknown (no match, no answer, or not yet probed). Refreshed
     /// on the forward's own thread; cleared whenever the bridge isn't Active.
@@ -200,10 +204,8 @@ struct Shared {
     /// handshake succeeds. A single lock so a connection sees a consistent
     /// (state, bridge) pair.
     inner: Mutex<Inner>,
-    /// Open connections currently relayed through the bridge; also surfaced in
-    /// the status. An `AtomicUsize` so `on_close` (which may run on the mux
-    /// reader thread) can decrement it without taking the lock.
-    open_conns: AtomicUsize,
+    /// Open connections and the idle clock, surfaced in the status.
+    conns: Conns,
     /// Per-connection error notes for the UI, drained by `drain_notes`.
     notes: Mutex<Notes>,
     route_label: Mutex<String>,
@@ -222,6 +224,47 @@ struct Shared {
     /// socket to the mux, then exits). Kept so `Drop` joins them; finished ones
     /// are pruned as new connections arrive.
     handlers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+/// Open connections plus when the forward last went idle. The counter is an
+/// `AtomicUsize` so `closed` (which may run on the mux reader thread) is
+/// cheap; the clock is reset on every accept and whenever the count drops
+/// back to 0, so a connection that opens and closes between two status
+/// polls still shows as recent activity.
+struct Conns {
+    open: AtomicUsize,
+    last_idle: Mutex<Instant>,
+}
+
+impl Conns {
+    fn new(start: Instant) -> Self {
+        Self { open: AtomicUsize::new(0), last_idle: Mutex::new(start) }
+    }
+
+    fn open(&self) -> usize {
+        self.open.load(Ordering::Relaxed)
+    }
+
+    fn touch(&self, now: Instant) {
+        *self.last_idle.lock().unwrap() = now;
+    }
+
+    fn opened(&self) {
+        self.open.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn closed(&self, now: Instant) {
+        // Clock under the lock first, so a reader seeing 0 open sees it too.
+        let mut last = self.last_idle.lock().unwrap();
+        if self.open.fetch_sub(1, Ordering::Relaxed) == 1 {
+            *last = now;
+        }
+    }
+
+    fn idle_since(&self) -> Option<Instant> {
+        let last = self.last_idle.lock().unwrap();
+        (self.open.load(Ordering::Relaxed) == 0).then_some(*last)
+    }
 }
 
 struct Inner {
@@ -270,7 +313,7 @@ impl Forward {
 
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner { bridge: None, state: ForwardState::Connecting }),
-            open_conns: AtomicUsize::new(0),
+            conns: Conns::new(Instant::now()),
             notes: Mutex::new(Notes::default()),
             route_label: Mutex::new(String::new()),
             dial: Mutex::new((String::new(), 0)),
@@ -302,7 +345,8 @@ impl Forward {
             local_addr: self.local_addr,
             route_label: self.shared.route_label.lock().unwrap().clone(),
             state: inner.state.clone(),
-            open_conns: self.shared.open_conns.load(Ordering::Relaxed),
+            open_conns: self.shared.conns.open(),
+            idle_since: self.shared.conns.idle_since(),
             process: self.shared.process.lock().unwrap().clone(),
         }
     }
@@ -360,6 +404,9 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>, stop: Arc<AtomicBool>
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((sock, _)) => {
+                // Even a connection the bridge then drops is activity: a
+                // short one between two registry polls must still count.
+                shared.conns.touch(Instant::now());
                 // macOS (BSD) sockets inherit the listener's O_NONBLOCK on
                 // accept, Linux ones don't; the relay reads blocking, so clear
                 // it or every read fails with WouldBlock.
@@ -419,12 +466,12 @@ fn handle_conn(sock: TcpStream, shared: &Arc<Shared>, stop: &Arc<AtomicBool>) {
         }
     };
 
-    shared.open_conns.fetch_add(1, Ordering::Relaxed);
+    shared.conns.opened();
     let (host, port) = { shared.dial.lock().unwrap().clone() };
     let on_close = {
         let shared = Arc::clone(shared);
         move |reason: String| {
-            shared.open_conns.fetch_sub(1, Ordering::Relaxed);
+            shared.conns.closed(Instant::now());
             shared.notes.lock().unwrap().push(reason);
         }
     };
@@ -432,7 +479,7 @@ fn handle_conn(sock: TcpStream, shared: &Arc<Shared>, stop: &Arc<AtomicBool>) {
     if let Err(e) = result {
         // connect didn't take ownership of the callback, so undo the increment
         // and record why (a dead bridge, an outdated helper).
-        shared.open_conns.fetch_sub(1, Ordering::Relaxed);
+        shared.conns.closed(Instant::now());
         shared.notes.lock().unwrap().push(format!("connect failed: {e}"));
     }
 }
@@ -692,6 +739,27 @@ mod tests {
         assert_eq!(open(&AtomicBool::new(false)).err().as_deref(), Some("no running container"));
     }
 
+    // ---- pure: the idle clock ----
+
+    #[test]
+    fn idle_since_is_none_while_open_and_resets_on_accept_and_last_close() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let c = Conns::new(t0);
+        assert_eq!((c.open(), c.idle_since()), (0, Some(t0)), "never had one: the start");
+        c.touch(at(1));
+        c.opened();
+        c.opened();
+        assert_eq!((c.open(), c.idle_since()), (2, None));
+        c.closed(at(2));
+        assert_eq!(c.idle_since(), None, "one still open");
+        c.closed(at(3));
+        assert_eq!(c.idle_since(), Some(at(3)), "the last close");
+        // A connection accepted then dropped before it was counted.
+        c.touch(at(4));
+        assert_eq!(c.idle_since(), Some(at(4)));
+    }
+
     // ---- pure: note dedup ----
 
     #[test]
@@ -773,6 +841,7 @@ mod tests {
         .unwrap();
         let addr = forward.status().local_addr;
         assert_eq!(addr.ip(), LOOPBACK);
+        let started = forward.status().idle_since.expect("idle from the start");
 
         // Wait for the supervisor's first resolve to land us in Error.
         let mut errored = false;
@@ -800,6 +869,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(noted, "no note for the dropped connection");
+        // The dropped connection still reset the idle clock.
+        assert!(forward.status().idle_since.unwrap() > started);
         drop(forward); // joins without deadlock
     }
 

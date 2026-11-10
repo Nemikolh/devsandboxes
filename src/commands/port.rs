@@ -1200,6 +1200,7 @@ image = "node"
             route_label: "api:3000".into(),
             state: ForwardState::Active,
             open_conns: 0,
+            idle_since: None,
             process: process.map(str::to_string),
         };
         let hp = HostPort::Prefer(3000);
