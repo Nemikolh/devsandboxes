@@ -2325,7 +2325,8 @@ never hands the daemon off (below). Under **`worker`**:
   caller's own fleet root), `instances.fetch` (fetch-back, below),
   `roots.list` (with or
   without `paths`: read-only; `machines.add` checks typed roots through
-  it) and the verbs (`verbs::is_verb`) but `gc`. It refuses
+  it), `open.deliver` (a URL for this host's desktop: [Opening
+  URLs](#opening-urls)) and the verbs (`verbs::is_verb`) but `gc`. It refuses
   (`denied`) any request with a `machine` param or `machines: true`
   (nothing federates past the member) but an `instances.watch`'s, which
   the daemon serves on the hub only ([Hub mode](#hub-mode)), `gc` (host maintenance: it reaps
@@ -2338,6 +2339,11 @@ never hands the daemon off (below). Under **`worker`**:
   canonicalize (symlinks resolved) to a path the reach admits
   (`lent::confine_path`); it is rewritten to the canonical path. A path that
   doesn't exist is `not-found`, except an unwatch's, checked as written.
+  `open.deliver`'s `root` is the exception, passed as it came
+  (`lent::Gate::Open`): it is the caller's path, the instance being
+  there; under both trusts the daemon's own check gates it (only an
+  instance this host attached to on the caller, [Opening
+  URLs](#opening-urls)).
   `instances.list`, the watches, `sandboxes.*`, `services.get`, `config.*`,
   `sessions.*` and the verbs must carry theirs. `config.migrate` and
   `config.ack` edit a config, so their `root` must be under the fleet
@@ -2654,6 +2660,64 @@ begins and ends one at once, as `code` runs detached). The CLI's calls
 are best effort: no daemon start, no handoff (its hello says 0.0.0), a
 short wait, silent; a drain ends the connection, and with it only the
 record. A successor daemon starts with no records.
+
+### Opening URLs
+
+A container's `open` record (docs/architecture/helper/bridges.md,
+*Opening URLs*) opens where the user is: on the member of the
+instance's [last attach](#last-attach). The bridges' opener is
+`serve::opens::opener`; per record, on a thread of its own, the instance's
+host:
+
+1. **Prepares** it (`open::prepare`): the instance found in `state.toml`
+   by id, the profile to send (`open::profile_to_send`: the instance's,
+   none when the config no longer allows it, with the drift warning), its
+   state key and config root.
+2. **Routes** it (`opens::route` over `Attaches::latest`): nothing
+   attached yet, or this host's own attach last → opened here
+   (`open::open_here`); a member's `PTY` stream last → `open.deliver` to
+   that member (`service::Handle::call_member`: its link, else a route).
+3. A delivery that fails (the member's refusal, no path to it) is one
+   `serve.log` line, `<instance>: cannot deliver <url> to <member>:
+   <why>`, and **nothing opens here**: the user is at that member, so a
+   browser on this host would open where nobody looks (or, on a server,
+   nowhere).
+
+**`open.deliver {instance, root, url, profile}`**
+([api](../../reference/api.md#opendeliver)) carries the instance by its
+current name and its config root on the sending host, the URL as the
+container gave it (not rewritten) and the profile *name* (or `null`). The
+receiver (`daemon::open_deliver`, `opens::receive`) takes it from a fleet
+peer only (a local client is `denied`), under `worker` and `full` alike
+(`lent::Gate::Open`; [the trust table](#the-trust-table)), and checks, in
+order:
+
+- **Params**, strict (`opens::DeliverParams`, unknown keys refused, a
+  `machine` too: under `worker` the table already refuses one): a
+  non-empty instance, an absolute root, a URL within the record cap, a
+  profile that is a profile name (`config::check_profile_name`).
+- **Its own attach**, first so a request for an instance never attached
+  to spends no limit: `Attaches::attached_out(peer, instance)`: this host
+  attached to that instance on that peer, live or ended less than
+  `open::OPEN_ATTACH_WINDOW` (10 min) ago, else `denied` (`<peer> asked
+  to open <url> for <instance>, which this host hasn't attached to in the
+  last 10 min`). This host knows it without asking anyone (it made the
+  attach), so no member, whatever its trust, can drive this desktop by
+  naming an instance this host's user never reached.
+- **The policy again** (`open::decide`): `http`/`https` only (else
+  `invalid`), a rate limit per `(peer, instance)` (`Shared::open_limit`,
+  `open::OPEN_RATE_BURST` per `open::OPEN_RATE_REFILL`; spent, `denied`).
+
+Every refusal is logged. A taken one answers `{ok: true}` (taken, not
+opened) and goes to `open::open_here` on a thread of its own
+(`Options::open_here` in tests), its forward target the sender's
+instance (`open::ForwardTarget { machine: Some(peer), dir: root,
+instance }`). The profile name picks a command in **this host's**
+`profiles.toml` only (docs/architecture/instances/profiles.md): the
+sender never names a command. Loopback forwards into another member's
+instance aren't made: the registry refuses an open forward with a
+`machine` (`forwards::OpenRequest::machine`), so such a URL opens as it
+is, with a `cannot forward` line.
 
 ### TUNNEL
 

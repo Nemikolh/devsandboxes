@@ -42,10 +42,9 @@ use serde_json::Value;
 
 use super::capacity::HostCapacity;
 use super::events::{EVENTS_RETRY, EventWatcher};
-use super::forwards;
 use super::capacity::Own;
 use super::snapshots::{self, Join, Snapshots};
-use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness, SinkHooks};
+use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Opener, Readiness, SinkHooks};
 use crate::runtime::{ContainerRow, NAME_PREFIX};
 use crate::snapshot::RuntimeView;
 use crate::state::State;
@@ -158,15 +157,9 @@ impl Host {
     /// status line (the API's `inbox.shown`); `on_running` gets each poll's
     /// running containers (the forward registry's sync; it must not block);
     /// `observers` the watched roots the poll collects snapshots for;
-    /// `forwards` the registry the opener makes a URL's loopback forwards in
-    /// (`None`: URLs open without them).
-    pub fn start(
-        log: fn(&str),
-        on_shown: OnShown,
-        on_running: OnRunning,
-        observers: Observers,
-        forwards: Option<forwards::Handle>,
-    ) -> Host {
+    /// `opener` what the bridges' sink hands each admitted `open` record
+    /// (the daemon's routes it, `serve::opens`).
+    pub fn start(log: fn(&str), on_shown: OnShown, on_running: OnRunning, observers: Observers, opener: Opener) -> Host {
         let stop: Shared = Arc::default();
         let board = BridgeBoard::default();
         // A failed bridge unsettles the board: wake the poll so it drops to
@@ -182,7 +175,7 @@ impl Host {
             let (stop, live, changes, board) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes), board.clone());
             std::thread::Builder::new()
                 .name("serve-poll".into())
-                .spawn(move || poll(&stop, &live, &changes, log, on_shown, on_running, &observers, forwards, board))
+                .spawn(move || poll(&stop, &live, &changes, log, on_shown, on_running, &observers, opener, board))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -251,25 +244,6 @@ impl Drop for Host {
     }
 }
 
-/// The opener's [`crate::open::Forwarder`]: the registry's open forwards
-/// (`forwards::Handle::open_forward`). A callback port the registry couldn't
-/// bind is `Err(None)`: its status line already said which port blocked it.
-fn open_forwarder(forwards: Option<forwards::Handle>) -> crate::open::Forwarder {
-    Arc::new(move |dir: &Path, key: &str, lb: crate::open::Loopback| {
-        let Some(forwards) = &forwards else { return Err(Some("no forwards registry in this daemon".into())) };
-        let req = forwards::OpenRequest {
-            dir: dir.to_path_buf(),
-            instance: key.to_string(),
-            container_port: lb.port,
-            callback: lb.callback,
-        };
-        forwards
-            .open_forward(req)
-            .map(|o| o.host_port)
-            .map_err(|e| (!(lb.callback && e.code == "bind-failed")).then_some(e.message))
-    })
-}
-
 /// The poll loop: list, count, reconcile, collect the watched roots'
 /// snapshots, sleep (until [`tick`] passes, a [`Waker`] fires or a container
 /// event arrives), until stopped. The event watcher lives as long as the
@@ -287,17 +261,10 @@ fn poll(
     on_shown: OnShown,
     on_running: OnRunning,
     observers: &Observers,
-    forwards: Option<forwards::Handle>,
+    opener: Opener,
     board: BridgeBoard,
 ) {
-    let forward = open_forwarder(forwards);
-    let hooks = SinkHooks {
-        on_shown: Some(on_shown),
-        opener: Arc::new(move |instance: &str, instance_id: &str, url: &str| {
-            crate::open::open_on_desktop(instance, instance_id, url, Arc::clone(&forward), log)
-        }),
-        log,
-    };
+    let hooks = SinkHooks { on_shown: Some(on_shown), opener, log };
     let worker = Bridges::spawn_worker(Some(hooks), board.clone());
     let rt = crate::runtime::backend();
     // Declared after `worker`, so it drops (child killed, thread joined) first.

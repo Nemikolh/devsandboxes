@@ -33,7 +33,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `graph.get`, `capacity.get`, `code.haves` and `instances.fetch` (peers only), `placements.fetch` (local only) | no (`placements.fetch` names the machine it fetches from) |
+| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|pending\|approve\|deny\|rotate`, `graph.get`, `capacity.get`, `code.haves`, `instances.fetch` and `open.deliver` (peers only), `placements.fetch` (local only) | no (`placements.fetch` names the machine it fetches from) |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -132,7 +132,7 @@ daemon answers in-process on the links it dials, and those after
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
-`code.haves`, `instances.fetch` (an instance under the caller's fleet root only), `roots.list` and the verbs but `gc` (`all` only while every instance here
+`code.haves`, `instances.fetch` (an instance under the caller's fleet root only), `roots.list`, `open.deliver` (its `root` the caller's, never confined; under either trust its own check gates it) and the verbs but `gc` (`all` only while every instance here
 is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true` but an `instances.watch`'s (a member watching its hub, which only the hub serves); every `root` / `dir`
 must be under this member's fleet root for the caller (a hub's, a fleet member's) or exactly one of its
 own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
@@ -1402,6 +1402,25 @@ recorded config root and `folder` must be under the caller's fleet root
 (not one of this host's own roots), under `full` any instance. Errors:
 `invalid` (bad params), `not-found` (no such instance, or not in
 reach), `denied` (a local client), `failed` (a detached `HEAD`, git).
+
+### `open.deliver`
+
+A URL from an instance on the caller, to open on this host's desktop: the
+caller is the instance's host, and this host's user attached to the
+instance last ([fleet.md](../architecture/daemon/fleet.md#opening-urls)).
+Params `{"instance": "<name there>", "root": "<its config root there>",
+"url": "<url>", "profile": "<profile name>" | null}`, no other field
+(`opens::DeliverParams`; a `machine` is refused). The URL is the
+container's as it gave it; the profile is a name only, mapped by this
+host's own `profiles.toml` (none, or unmapped: the system opener). Taken
+only when `url` is `http`/`https`, within a rate limit per caller and
+instance, and this host attached to that instance on the caller (an
+`instances.attach` with `machine`) live or less than 10 min ago. Result
+`{"ok": true}`: taken, opened on a thread of its own (a missing display
+or a failed spawn is this host's `serve.log` line). On a link peer's
+connection only, under either trust. Errors: `denied` (a local client;
+not attached here; the rate limit), `invalid` (bad params, a scheme past
+`http(s)`), `failed` (this daemon opens nothing).
 
 ### `placements.fetch`
 

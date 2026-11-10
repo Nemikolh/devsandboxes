@@ -1,9 +1,13 @@
 //! Opening a container's URL on this host (docs/architecture/helper/bridges.md,
 //! "Opening URLs (`kind open`)"): the policy an `open` record passes before
 //! the bridge's sink hands it to the opener, and the system opener itself.
-//! The policy is pure (clocks and the limiter passed in), and so is the
-//! choice of command ([`open_plan`] over this host's `profiles.toml`); only
-//! [`open_on_desktop`] touches the environment, the files and spawns.
+//! The policy is pure (clocks and the limiter passed in), and so are the
+//! two halves' choices: on the instance's host, the profile name an open
+//! carries ([`profile_to_send`], [`local_job`]); on the opening host, which
+//! may be another fleet member (docs/architecture/daemon/fleet.md, *Opening
+//! URLs*), the command that name maps to in its own `profiles.toml`
+//! ([`open_argv`]). Only [`prepare`] (reads `state.toml`) and [`open_here`]
+//! (the display, `profiles.toml`, the spawn) touch the environment.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -150,40 +154,75 @@ pub fn open_argv(os: &str, profile: Option<&str>, profiles: &HostProfiles, url: 
     }
 }
 
-/// How one URL opens: the argv ([`open_argv`]; `None`: no known opener on
-/// `os`) and a `serve.log` warning to write first, if any.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenPlan {
-    pub argv: Option<Vec<String>>,
-    pub warning: Option<String>,
-}
-
-/// Plan opening `url` for `instance` (its `state.toml` entry `inst`, found
-/// by id; `None` when it's gone): in the instance's profile, unless
+/// The profile an open of `url` for `instance` (its `state.toml` entry
+/// `inst`, found by id; `None` when it's gone) carries to the opening host,
+/// decided on the instance's host: the instance's profile, unless
 /// `snapshot::profile_disallowed` says its sandbox no longer allows that one
-/// (`allowed` is asked only then, it loads the config), in which case the
-/// system opener and a warning (config drift is flagged, never followed).
-/// No instance or no profile: the system opener.
-pub fn open_plan(
-    os: &str,
+/// (`allowed` is asked only then, it loads the config), in which case none
+/// and a `serve.log` warning (config drift is flagged, never followed). No
+/// instance or no profile: none. Only this name ever leaves the host
+/// (`open.deliver`); the opening host maps it ([`open_argv`]).
+pub fn profile_to_send(
     instance: &str,
     url: &str,
     inst: Option<&Instance>,
     allowed: impl FnOnce(&Instance) -> Option<Vec<String>>,
-    profiles: &HostProfiles,
-) -> OpenPlan {
+) -> (Option<String>, Option<String>) {
     let Some((inst, profile)) = inst.and_then(|i| Some((i, i.profile.as_deref()?))) else {
-        return OpenPlan { argv: opener_argv(os, url), warning: None };
+        return (None, None);
     };
     if crate::snapshot::profile_disallowed(Some(profile), allowed(inst).as_deref()) {
-        return OpenPlan {
-            argv: opener_argv(os, url),
-            warning: Some(format!(
-                "{instance}: profile `{profile}` no longer allowed by the config; opening {url} with the default opener"
-            )),
-        };
+        let warning =
+            format!("{instance}: profile `{profile}` no longer allowed by the config; opening {url} with the default opener");
+        return (None, Some(warning));
     }
-    OpenPlan { argv: open_argv(os, Some(profile), profiles, url), warning: None }
+    (Some(profile.to_string()), None)
+}
+
+/// Where an open's loopback forwards go: an instance on this host
+/// (`machine` `None`: `dir` its `config_dir`, `instance` its state key) or
+/// on fleet member `machine` (an open delivered from there, `open.deliver`:
+/// `dir` and `instance` as it named them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardTarget {
+    pub machine: Option<String>,
+    pub dir: PathBuf,
+    pub instance: String,
+}
+
+impl ForwardTarget {
+    /// The target of a local instance (its state key and entry), or why it
+    /// has none.
+    pub fn local(inst: Option<(&str, &Instance)>) -> Result<ForwardTarget, String> {
+        let (key, i) = inst.ok_or_else(|| "not in state.toml".to_string())?;
+        let dir = i.config_dir.clone().ok_or_else(|| "no config root in state.toml".to_string())?;
+        Ok(ForwardTarget { machine: None, dir, instance: key.to_string() })
+    }
+}
+
+/// One URL for the opening host to open ([`open_here`]): `instance` its
+/// display name (for log lines), `profile` the name [`profile_to_send`]
+/// chose, `target` where its loopback forwards go (or why there is none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenJob {
+    pub instance: String,
+    pub url: String,
+    pub profile: Option<String>,
+    pub target: Result<ForwardTarget, String>,
+}
+
+/// The job for an open of `url` from local `instance`, whose `state.toml`
+/// entry (key and record) is `found`: [`profile_to_send`] (its warning
+/// second) and the [`ForwardTarget::local`].
+pub fn local_job(
+    instance: &str,
+    url: &str,
+    found: Option<(&str, &Instance)>,
+    allowed: impl FnOnce(&Instance) -> Option<Vec<String>>,
+) -> (OpenJob, Option<String>) {
+    let (profile, warning) = profile_to_send(instance, url, found.map(|(_, i)| i), allowed);
+    let job = OpenJob { instance: instance.to_string(), url: url.to_string(), profile, target: ForwardTarget::local(found) };
+    (job, warning)
 }
 
 /// A loopback port a URL needs reachable on this host: a container's
@@ -322,45 +361,40 @@ pub fn rewrite_direct(url: &str, port: Option<u16>) -> String {
     format!("{}{host}{port}{}", &url[..p.host_at], &url[p.rest_at..])
 }
 
-/// Forward one [`Loopback`] port of an instance: `(config root, instance
-/// state key, port)` → the bound host port. `Err(Some(why))` for the
-/// opener's log line, `Err(None)` when the forwarder already logged why
-/// (an OAuth callback port it couldn't bind). The daemon's is the forwards
-/// registry's open forwards (`serve::host`); a seam, so this module stays
-/// free of `serve` (unix-only) and tests fake it.
-pub type Forwarder = Arc<dyn Fn(&Path, &str, Loopback) -> Result<u16, Option<String>> + Send + Sync>;
+/// Forward one [`Loopback`] port of the instance at a [`ForwardTarget`] →
+/// the bound host port. `Err(Some(why))` for the opener's log line,
+/// `Err(None)` when the forwarder already logged why (an OAuth callback
+/// port it couldn't bind). The daemon's is the forwards registry's open
+/// forwards (`serve::opens`); a seam, so this module stays free of `serve`
+/// (unix-only) and tests fake it.
+pub type Forwarder = Arc<dyn Fn(&ForwardTarget, Loopback) -> Result<u16, Option<String>> + Send + Sync>;
 
 /// The forwarding step before an open: each of `url`'s [`loopback_ports`]
-/// forwarded for `inst` (its state key and entry) through `forward`, and the
-/// URL to open: rewritten to the direct port's bound host port when that
-/// differs, and off a `0.0.0.0` host ([`rewrite_direct`]). Anything that
-/// fails (no instance, no config root, a forward refused) leaves that port
-/// as it was and is a log line naming `instance` and `url`; the URL still
-/// opens.
+/// forwarded to `target` through `forward`, and the URL to open: rewritten
+/// to the direct port's bound host port when that differs, and off a
+/// `0.0.0.0` host ([`rewrite_direct`]). Anything that fails (no target, a
+/// forward refused) leaves that port as it was and is a log line naming
+/// `instance` and `url`; the URL still opens.
 pub fn forward_loopbacks(
     instance: &str,
     url: &str,
-    inst: Option<(&str, &Instance)>,
-    forward: impl Fn(&Path, &str, Loopback) -> Result<u16, Option<String>>,
+    target: Result<&ForwardTarget, &str>,
+    forward: impl Fn(&ForwardTarget, Loopback) -> Result<u16, Option<String>>,
 ) -> (String, Vec<String>) {
     let wanted = loopback_ports(url);
     let direct = loopback_port(url);
     let mut lines = Vec::new();
     let mut bound = None;
     if !wanted.is_empty() {
-        let target = match inst {
-            None => Err("not in state.toml".to_string()),
-            Some((key, i)) => i.config_dir.as_deref().map(|dir| (dir, key)).ok_or_else(|| "no config root in state.toml".to_string()),
-        };
         match target {
             Err(why) => {
                 let ports: Vec<String> = wanted.iter().map(|l| l.port.to_string()).collect();
                 let s = if ports.len() > 1 { "s" } else { "" };
                 lines.push(format!("{instance}: cannot forward port{s} {} for {url} ({why}); opening it as is", ports.join(", ")));
             }
-            Ok((dir, key)) => {
+            Ok(target) => {
                 for lb in wanted {
-                    match forward(dir, key, lb) {
+                    match forward(target, lb) {
                         Ok(host_port) if Some(lb.port) == direct => bound = Some(host_port),
                         Ok(_) | Err(None) => {}
                         Err(Some(why)) => {
@@ -433,59 +467,65 @@ fn display_env(os: &str) -> Option<Vec<(String, String)>> {
     has_display(os, lookup).then_some(env)
 }
 
-/// The production opener (`devsbd::bridge::Opener`): open `url` from
-/// `instance` (`instance_id`, so a rename doesn't lose it) with the command
-/// [`open_plan`] picks and the [`display_env`], all stdio null, after
-/// [`forward_loopbacks`] through `forward` (the URL the command gets is the
-/// rewritten one). `state.toml` and `profiles.toml` are read on every open,
-/// so an edit applies without a daemon restart; either one unreadable is logged and opening goes on with
-/// the system opener. Runs on its own thread (which also reaps the child),
-/// so the bridge's handler never waits on it (nor on the forwards), like
+/// The instance's host's half of an open from `instance` (`instance_id`, so
+/// a rename doesn't lose it): its `state.toml` entry, read on every open,
+/// made into an [`OpenJob`] ([`local_job`]; the drift warning logged). An
+/// unreadable `state.toml` is logged and the job goes on with no profile
+/// and no forward target.
+pub fn prepare(instance: &str, instance_id: &str, url: &str, log: fn(&str)) -> OpenJob {
+    let state = State::load().unwrap_or_else(|e| {
+        log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
+        State::default()
+    });
+    let found = state.instances.iter().find(|(_, i)| i.instance_id == instance_id).map(|(k, i)| (k.as_str(), i));
+    let allowed = |i: &Instance| crate::snapshot::allowed_now(&mut BTreeMap::new(), i);
+    let (job, warning) = local_job(instance, url, found, allowed);
+    if let Some(warning) = &warning {
+        log(warning);
+    }
+    job
+}
+
+/// The opening host's half: open `job`'s URL here with the command
+/// [`open_argv`] maps its profile to in this host's `profiles.toml` (read on
+/// every open, so an edit applies without a daemon restart; unreadable, it
+/// is logged and the system opener used) and the [`display_env`], all stdio
+/// null, after [`forward_loopbacks`] through `forward` (the URL the command
+/// gets is the rewritten one). Blocks until the child exits (it reaps it):
+/// callers run it on a thread of its own, so a bridge's handler or an API
+/// request never waits on it (nor on the forwards), like
 /// `desktop::notify_desktop`. No display, no known opener or a failed spawn
 /// is one `log` line naming the instance and the URL.
-pub fn open_on_desktop(instance: &str, instance_id: &str, url: &str, forward: Forwarder, log: fn(&str)) {
-    let (instance, instance_id, url) = (instance.to_string(), instance_id.to_string(), url.to_string());
-    std::thread::spawn(move || {
-        let os = std::env::consts::OS;
-        let Some(env) = display_env(os) else {
-            return log(&format!("{instance}: no display to open {url} on"));
-        };
-        let profiles = profiles_path().and_then(|p| load_profiles(&p)).unwrap_or_else(|e| {
-            log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
-            HostProfiles::new()
-        });
-        let state = State::load().unwrap_or_else(|e| {
-            log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
-            State::default()
-        });
-        let found = state.instances.iter().find(|(_, i)| i.instance_id == instance_id);
-        let (url, lines) = forward_loopbacks(&instance, &url, found.map(|(k, i)| (k.as_str(), i)), &*forward);
-        for line in &lines {
-            log(line);
-        }
-        let inst = found.map(|(_, i)| i);
-        let allowed = |i: &Instance| crate::snapshot::allowed_now(&mut BTreeMap::new(), i);
-        let plan = open_plan(os, &instance, &url, inst, allowed, &profiles);
-        if let Some(warning) = &plan.warning {
-            log(warning);
-        }
-        let Some(argv) = plan.argv else {
-            return log(&format!("{instance}: no opener on {os} for {url}"));
-        };
-        let spawned = Command::new(&argv[0])
-            .args(&argv[1..])
-            .envs(env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        match spawned {
-            Ok(mut child) => {
-                let _ = child.wait();
-            }
-            Err(e) => log(&format!("{instance}: cannot run `{}` to open {url}: {e}", argv[0])),
-        }
+pub fn open_here(job: OpenJob, forward: &Forwarder, log: fn(&str)) {
+    let OpenJob { instance, url, profile, target } = job;
+    let os = std::env::consts::OS;
+    let Some(env) = display_env(os) else {
+        return log(&format!("{instance}: no display to open {url} on"));
+    };
+    let profiles = profiles_path().and_then(|p| load_profiles(&p)).unwrap_or_else(|e| {
+        log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
+        HostProfiles::new()
     });
+    let (url, lines) = forward_loopbacks(&instance, &url, target.as_ref().map_err(String::as_str), &**forward);
+    for line in &lines {
+        log(line);
+    }
+    let Some(argv) = open_argv(os, profile.as_deref(), &profiles, &url) else {
+        return log(&format!("{instance}: no opener on {os} for {url}"));
+    };
+    let spawned = Command::new(&argv[0])
+        .args(&argv[1..])
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            let _ = child.wait();
+        }
+        Err(e) => log(&format!("{instance}: cannot run `{}` to open {url}: {e}", argv[0])),
+    }
 }
 
 #[cfg(test)]
@@ -619,44 +659,49 @@ mod tests {
     }
 
     #[test]
-    fn open_plan_picks_the_instance_profile_command() {
+    fn the_instances_profile_is_sent_unless_the_config_dropped_it() {
         let url = "https://x";
         let allowed = |set: &'static [&'static str]| {
             move |_: &Instance| Some(set.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         };
-        let plan = |inst: Option<&Instance>, set: &'static [&'static str]| {
-            open_plan("linux", "web-1", url, inst, allowed(set), &profiles())
-        };
-        let argv = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        let default = OpenPlan { argv: argv(&["xdg-open", url]), warning: None };
+        let send = |inst: Option<&Instance>, set: &'static [&'static str]| profile_to_send("web-1", url, inst, allowed(set));
+        let named = |p: &str| (Some(p.to_string()), None);
 
         let work = instance(Some("work"));
+        assert_eq!(send(Some(&work), &["work", "personal"]), named("work"));
+        assert_eq!(send(Some(&instance(Some("personal"))), &["work", "personal"]), named("personal"), "mapped or not: the opener's call");
+        assert_eq!(send(Some(&instance(None)), &["work"]), (None, None), "no profile");
+        assert_eq!(send(None, &["work"]), (None, None), "no instance");
+        assert_eq!(profile_to_send("web-1", url, Some(&work), |_| None), named("work"), "an allowed set that can't be told doesn't flag");
         assert_eq!(
-            plan(Some(&work), &["work", "personal"]),
-            OpenPlan { argv: argv(&["chrome", "--profile-directory=Work", url]), warning: None },
-            "mapped"
-        );
-        assert_eq!(plan(Some(&instance(Some("personal"))), &["work", "personal"]), default, "unmapped");
-        assert_eq!(plan(Some(&instance(None)), &["work"]), default, "no profile");
-        assert_eq!(plan(None, &["work"]), default, "no instance");
-        assert_eq!(
-            open_plan("linux", "web-1", url, Some(&work), |_| None, &profiles()).argv,
-            argv(&["chrome", "--profile-directory=Work", url]),
-            "an allowed set that can't be told doesn't flag"
-        );
-        assert_eq!(
-            plan(Some(&work), &["personal"]),
-            OpenPlan {
-                argv: argv(&["xdg-open", url]),
-                warning: Some(
-                    "web-1: profile `work` no longer allowed by the config; opening https://x with the default opener"
-                        .into()
-                ),
-            },
+            send(Some(&work), &["personal"]),
+            (
+                None,
+                Some("web-1: profile `work` no longer allowed by the config; opening https://x with the default opener".into())
+            ),
             "disallowed"
         );
         let unasked = |_: &Instance| -> Option<Vec<String>> { panic!("no profile: the config isn't loaded") };
-        open_plan("linux", "web-1", url, Some(&instance(None)), unasked, &profiles());
+        profile_to_send("web-1", url, Some(&instance(None)), unasked);
+    }
+
+    #[test]
+    fn a_local_job_carries_the_profile_and_the_instances_target() {
+        let inst = Instance { config_dir: Some("/cfg".into()), ..instance(Some("work")) };
+        let (job, warning) = local_job("web", "https://x", Some(("web-1", &inst)), |_| None);
+        assert_eq!(warning, None);
+        assert_eq!(
+            job,
+            OpenJob {
+                instance: "web".into(),
+                url: "https://x".into(),
+                profile: Some("work".into()),
+                target: Ok(ForwardTarget { machine: None, dir: "/cfg".into(), instance: "web-1".into() }),
+            }
+        );
+        let bare = instance(None);
+        assert_eq!(local_job("web", "https://x", Some(("web-1", &bare)), |_| None).0.target, Err("no config root in state.toml".into()));
+        assert_eq!(local_job("web", "https://x", None, |_| None).0.target, Err("not in state.toml".into()));
     }
 
     fn direct(port: u16) -> Loopback {
@@ -751,18 +796,20 @@ mod tests {
         }
     }
 
-    /// A state entry with a config root, under key `web-1`.
-    fn rooted() -> Instance {
-        Instance { config_dir: Some("/cfg".into()), ..instance(None) }
+    /// The local target of state key `web-1` with config root `/cfg`.
+    fn local() -> ForwardTarget {
+        ForwardTarget::local(Some(("web-1", &Instance { config_dir: Some("/cfg".into()), ..instance(None) }))).unwrap()
     }
+
+    type Call = (ForwardTarget, Loopback);
 
     /// A fake forwarder: bind `bound(port)`, recording each call.
     fn forwarding(
-        calls: &std::cell::RefCell<Vec<(PathBuf, String, Loopback)>>,
+        calls: &std::cell::RefCell<Vec<Call>>,
         bound: impl Fn(Loopback) -> Result<u16, Option<String>>,
-    ) -> impl Fn(&Path, &str, Loopback) -> Result<u16, Option<String>> {
-        move |dir, key, lb| {
-            calls.borrow_mut().push((dir.to_path_buf(), key.to_string(), lb));
+    ) -> impl Fn(&ForwardTarget, Loopback) -> Result<u16, Option<String>> {
+        move |t, lb| {
+            calls.borrow_mut().push((t.clone(), lb));
             bound(lb)
         }
     }
@@ -770,57 +817,65 @@ mod tests {
     #[test]
     fn forward_loopbacks_rewrites_a_moved_direct_port() {
         let calls = Default::default();
-        let inst = rooted();
-        let got = forward_loopbacks("web", "http://localhost:3000/x", Some(("web-1", &inst)), forwarding(&calls, |_| Ok(3001)));
+        let t = local();
+        let got = forward_loopbacks("web", "http://localhost:3000/x", Ok(&t), forwarding(&calls, |_| Ok(3001)));
         assert_eq!(got, ("http://localhost:3001/x".to_string(), vec![]));
-        assert_eq!(calls.into_inner(), vec![(PathBuf::from("/cfg"), "web-1".to_string(), direct(3000))]);
+        assert_eq!(calls.into_inner(), vec![(t.clone(), direct(3000))]);
 
-        let got = forward_loopbacks("web", "http://localhost:3000/x", Some(("web-1", &inst)), |_: &Path, _: &str, lb: Loopback| Ok(lb.port));
+        let got = forward_loopbacks("web", "http://localhost:3000/x", Ok(&t), |_: &ForwardTarget, lb: Loopback| Ok(lb.port));
         assert_eq!(got, ("http://localhost:3000/x".to_string(), vec![]), "bound on the same port");
 
-        let got = forward_loopbacks("web", "http://0.0.0.0:8000/", Some(("web-1", &inst)), |_: &Path, _: &str, lb: Loopback| Ok(lb.port));
+        let got = forward_loopbacks("web", "http://0.0.0.0:8000/", Ok(&t), |_: &ForwardTarget, lb: Loopback| Ok(lb.port));
         assert_eq!(got.0, "http://localhost:8000/", "0.0.0.0 made localhost");
-        let got = forward_loopbacks("web", "http://0.0.0.0:8000/", Some(("web-1", &inst)), |_: &Path, _: &str, _| Ok(8001));
+        let got = forward_loopbacks("web", "http://0.0.0.0:8000/", Ok(&t), |_: &ForwardTarget, _| Ok(8001));
         assert_eq!(got.0, "http://localhost:8001/");
+    }
+
+    #[test]
+    fn forward_loopbacks_hands_a_machines_target_through() {
+        let calls = Default::default();
+        let t = ForwardTarget { machine: Some("box".into()), dir: "/home/u/cfg".into(), instance: "web-1".into() };
+        let got = forward_loopbacks("web-1", "http://localhost:3000/", Ok(&t), forwarding(&calls, |_| Err(Some("not yet".into()))));
+        assert_eq!(got.1, vec!["web-1: cannot forward port 3000 for http://localhost:3000/: not yet".to_string()]);
+        assert_eq!(calls.into_inner(), vec![(t, direct(3000))]);
     }
 
     #[test]
     fn forward_loopbacks_leaves_a_callback_url_as_is() {
         let calls = Default::default();
-        let inst = rooted();
+        let t = local();
         let url = "https://github.com/login?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Fcb";
-        let got = forward_loopbacks("web", url, Some(("web-1", &inst)), forwarding(&calls, |lb| Ok(lb.port)));
+        let got = forward_loopbacks("web", url, Ok(&t), forwarding(&calls, |lb| Ok(lb.port)));
         assert_eq!(got, (url.to_string(), vec![]));
-        assert_eq!(calls.into_inner(), vec![(PathBuf::from("/cfg"), "web-1".to_string(), callback(8085))]);
+        assert_eq!(calls.into_inner(), vec![(t.clone(), callback(8085))]);
 
         // A callback the forwarder already reported: no second line.
-        let got = forward_loopbacks("web", url, Some(("web-1", &inst)), |_: &Path, _: &str, _| Err(None));
+        let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(None));
         assert_eq!(got, (url.to_string(), vec![]));
-        let got = forward_loopbacks("web", url, Some(("web-1", &inst)), |_: &Path, _: &str, _| Err(Some("registry stopped".into())));
+        let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(Some("registry stopped".into())));
         assert_eq!(got.1, vec![format!("web: cannot forward callback port 8085 for {url}: registry stopped")]);
     }
 
     #[test]
     fn forward_loopbacks_falls_back_to_the_url_as_is() {
-        let inst = rooted();
+        let t = local();
         let url = "http://localhost:3000/";
-        let got = forward_loopbacks("web", url, Some(("web-1", &inst)), |_: &Path, _: &str, _| Err(Some("port 3000: nope".into())));
+        let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(Some("port 3000: nope".into())));
         assert_eq!(got, (url.to_string(), vec![format!("web: cannot forward port 3000 for {url}: port 3000: nope")]));
 
-        let never = |_: &Path, _: &str, _| -> Result<u16, Option<String>> { panic!("nothing to forward to") };
-        let bare = instance(None);
-        let got = forward_loopbacks("web", url, Some(("web-1", &bare)), never);
+        let never = |_: &ForwardTarget, _| -> Result<u16, Option<String>> { panic!("nothing to forward to") };
+        let got = forward_loopbacks("web", url, Err("no config root in state.toml"), never);
         assert_eq!(got, (url.to_string(), vec![format!("web: cannot forward port 3000 for {url} (no config root in state.toml); opening it as is")]));
-        let got = forward_loopbacks("web", "http://0.0.0.0:3000/?callback=http://localhost:9", None, never);
+        let got = forward_loopbacks("web", "http://0.0.0.0:3000/?callback=http://localhost:9", Err("not in state.toml"), never);
         assert_eq!(
             got,
             (
                 "http://localhost:3000/?callback=http://localhost:9".to_string(),
                 vec!["web: cannot forward ports 3000, 9 for http://0.0.0.0:3000/?callback=http://localhost:9 (not in state.toml); opening it as is".to_string()]
             ),
-            "no instance; 0.0.0.0 still made localhost"
+            "no target; 0.0.0.0 still made localhost"
         );
-        assert_eq!(forward_loopbacks("web", "https://example.com/", None, never), ("https://example.com/".to_string(), vec![]));
+        assert_eq!(forward_loopbacks("web", "https://example.com/", Err("x"), never), ("https://example.com/".to_string(), vec![]));
     }
 
     #[test]

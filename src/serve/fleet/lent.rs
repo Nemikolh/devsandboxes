@@ -15,8 +15,8 @@
 //!
 //! - [`decide`] (pure, over the method and params): hello, `subscribe` /
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
-//!   quick calls (`machines::forward::QUICK`), `capacity.get`, `code.haves`, `roots.list`
-//!   and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
+//!   quick calls (`machines::forward::QUICK`), `capacity.get`, `code.haves`, `roots.list`,
+//!   `open.deliver` and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
 //!   true`) request but `instances.watch` (a member watching its hub);
 //!   everything else (`machines.*`,
 //!   `shutdown`, `helper.call`, `forwards.*`, the
@@ -27,7 +27,11 @@
 //!   service container: one of those roots'), a verb's `all` only while
 //!   every instance in `state.toml` is reached, `config.migrate` /
 //!   `config.ack` (edits of a config) only under the fleet root, and a
-//!   verb's `env` replaced by the peer's when it has one.
+//!   verb's `env` replaced by the peer's when it has one. `open.deliver`
+//!   is the exception: its `root` is the caller's path (the instance is
+//!   there), so it passes as it came; the daemon's own check gates it
+//!   under both trusts (`serve::opens::receive`: only for an instance this
+//!   host attached to on the caller, within the window).
 //!
 //! Under `trust = "full"` none of that: the peer has the API a local client
 //! has, except `member.*`, `membership.*`, `graph.*`, `link.*` and `links.*` (this member's own
@@ -304,6 +308,11 @@ pub enum Gate {
     /// checks typed roots through it).
     Roots,
     Verb,
+    /// `open.deliver`: a URL for this host's desktop, about an instance on
+    /// the caller (its `root` is the caller's path, never confined here).
+    /// The daemon's own check is its gate: only for an instance this host
+    /// attached to on that caller (`serve::opens::receive`).
+    Open,
 }
 
 /// Whether a `worker` member's peer may send `method` with `params` at all
@@ -333,6 +342,7 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         "code.haves" => Gate::Code,
         "instances.fetch" => Gate::Fetch,
         "roots.list" => Gate::Roots,
+        "open.deliver" => Gate::Open,
         "gc" => return Err(ApiError::denied(format!(
             "`gc` is host maintenance: not open to remote callers under this member's `worker` trust ({FULL_HINT})"
         ))),
@@ -574,6 +584,9 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
         return Ok(params);
     }
     let gate = decide(method, &params)?;
+    if gate == Gate::Open {
+        return Ok(params);
+    }
     let Some(obj) = params.as_object_mut() else {
         return Ok(params);
     };
@@ -913,6 +926,8 @@ mod tests {
             ("inbox.threads.list", p.clone(), Err("denied")),
             // Local only: a peer's attach is its `PTY` stream.
             ("instances.attach", json!({"instance": "w"}), Err("denied")),
+            ("open.deliver", json!({"instance": "w", "root": "/x", "url": "https://x", "profile": null}), Ok(Open)),
+            ("open.deliver", json!({"instance": "w", "machine": "m"}), Err("denied")),
             ("nope", p.clone(), Err("denied")),
         ];
         for (method, params, want) in cases {
@@ -1106,6 +1121,13 @@ mod tests {
         assert_eq!(code("rm", json!({"root": cfg})), "invalid");
         assert_eq!(code("start", json!({"root": cfg, "instance": null})), "invalid");
         assert!(admit("run", json!({"root": cfg, "sandbox": "web", "env": {}}), &s, &state).is_ok(), "run names none");
+
+        // `open.deliver`'s root is the caller's: as it came, even one this
+        // member doesn't reach or have.
+        let open = json!({"instance": "own", "root": base.join("mine"), "url": "https://x", "profile": null});
+        assert_eq!(ok("open.deliver", open.clone()), open);
+        let open = json!({"instance": "x", "root": "/no/such/dir", "url": "https://x", "profile": "work"});
+        assert_eq!(ok("open.deliver", open.clone()), open);
         let _ = std::fs::remove_dir_all(&base);
     }
 

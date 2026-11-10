@@ -127,9 +127,13 @@ pub struct AddRequest {
 /// The opener's ask for a forward to an instance port a URL names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
-    /// Absolute config root; canonicalized by the registry.
+    /// The machine the instance runs on (an open delivered over the fleet,
+    /// `open.deliver`); `None`: this host.
+    pub machine: Option<String>,
+    /// Absolute config root (on `machine`, as it gave it); canonicalized by
+    /// the registry for a local one.
     pub dir: PathBuf,
-    /// Instance state key, already resolved.
+    /// Instance state key, already resolved; with `machine`, its name there.
     pub instance: String,
     pub container_port: u16,
     /// An OAuth callback port: only a forward bound on the same host port
@@ -442,6 +446,12 @@ impl Daemon {
     /// The opener's forward (see [`Root::open`]). A callback port that can't
     /// be bound is also a status line: the OAuth redirect will miss.
     fn open(&mut self, req: OpenRequest) -> Result<OpenForward, ApiError> {
+        if let Some(machine) = &req.machine {
+            return Err(ApiError::invalid(format!(
+                "no open forwards into an instance on machine `{machine}` yet: port {} isn't forwarded",
+                req.container_port
+            )));
+        }
         let dir = req
             .dir
             .canonicalize()
@@ -1725,7 +1735,7 @@ forwardPorts = ["redis:6379"]
     fn open_req(dir: &Path, port: u16, callback: bool) -> OpenRequest {
         // An instance no state has: the forward binds anyway, its route errors
         // on its own thread.
-        OpenRequest { dir: dir.to_path_buf(), instance: "ghost-open-xyz".into(), container_port: port, callback }
+        OpenRequest { machine: None, dir: dir.to_path_buf(), instance: "ghost-open-xyz".into(), container_port: port, callback }
     }
 
     /// A port free right now (bound and released).

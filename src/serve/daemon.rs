@@ -70,6 +70,7 @@ use super::forwards::{self, Registry};
 use super::host::{Host, Observers, Waker};
 use super::idle::{self, Decision, Holders};
 use super::machines::{self, forward as fwd, link, service, ssh::{self, Dial}};
+use super::opens;
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
 use super::helper;
 use super::snapshots::{self, Join, Snapshots};
@@ -165,6 +166,10 @@ pub struct Options {
     /// The argv a peer's `PTY` stream runs for a piped or tty exec; `None`
     /// is the runtime's `exec` (`fleet::pty::runtime_exec`). Tests run `sh`.
     pub pty_exec: Option<fleet::pty::ExecCommand>,
+    /// How this host opens a URL (a bridge's `open` record routed here, an
+    /// `open.deliver` taken); `None` is `open::open_here` on a thread of its
+    /// own through the forwards registry. Tests record the job.
+    pub open_here: Option<opens::OpenHere>,
 }
 
 /// [`Options::host_agent`].
@@ -198,6 +203,7 @@ impl Options {
             host_agent: None,
             agent_probe: fleet::agent::PROBE,
             pty_exec: None,
+            open_here: None,
         }
     }
 }
@@ -475,6 +481,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     if let Some(registry) = &registry {
         let _ = shared.forwards.set(registry.handle());
     }
+    let open_here =
+        opts.open_here.clone().unwrap_or_else(|| opens::open_here(opens::forwarder(registry.as_ref().map(Registry::handle)), log));
+    let _ = shared.open_here.set(Arc::clone(&open_here));
     let host = opts.host.then(|| {
         let shared = Arc::clone(&shared);
         // Configured `forwardPorts` follow the running containers.
@@ -490,6 +499,21 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 capacity: Arc::clone(&shared.host_capacity),
             }
         };
+        let attaches = shared.attaches.clone();
+        let members = links.handle();
+        let opener = opens::opener(opens::Sender {
+            prepare: Arc::new(move |instance: &str, id: &str, url: &str| crate::open::prepare(instance, id, url, log)),
+            latest: Arc::new(move |id: &str| attaches.latest(id)),
+            call_member: Arc::new(move |m: &str, method: &str, params: Value| {
+                let r = members.call_member(m, method, params)?;
+                match r.error {
+                    Some(e) => Err(format!("{} ({})", e.message, e.code)),
+                    None => Ok(r.result.unwrap_or(Value::Null)),
+                }
+            }),
+            open_here,
+            log,
+        });
         Host::start(
             log,
             Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line)),
@@ -499,7 +523,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             }),
             observers,
-            registry.as_ref().map(Registry::handle),
+            opener,
         )
     });
     if let Some(host) = &host {
@@ -803,6 +827,13 @@ struct Shared {
     /// Who attached to which instance last: a `PTY` stream's origin
     /// ([`Shared::serve_channel`]) and `instances.attach`'s holders.
     attaches: super::attaches::Attaches,
+    /// How this host opens a URL ([`Options::open_here`], resolved): what
+    /// a taken `open.deliver` runs; unset in tests that build a bare
+    /// `Shared`.
+    open_here: OnceLock<opens::OpenHere>,
+    /// `open.deliver`'s limit, per `(peer, instance)`: as a bridge's sink
+    /// limits a container's own.
+    open_limit: Mutex<crate::devsbd::desktop::RateLimit>,
 }
 
 impl Shared {
@@ -843,6 +874,8 @@ impl Shared {
             graph: Arc::default(),
             route_budget: service::Timing::default().handshake,
             attaches: Default::default(),
+            open_here: OnceLock::new(),
+            open_limit: Mutex::new(crate::devsbd::desktop::RateLimit::new(crate::open::OPEN_RATE_BURST, crate::open::OPEN_RATE_REFILL)),
         }
     }
 
@@ -1978,6 +2011,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "links.inbound" => return Some(links_inbound(req.id, req.params, shared, conn)),
         // Before `machine` routing: its `machine` is where this host attaches.
         "instances.attach" => return Some(instances_attach(req.id, req.params, shared, conn)),
+        // A peer's only: never routed by a `machine` (it refuses one).
+        "open.deliver" => return Some(open_deliver(req.id, req.params, shared, conn)),
         _ => {}
     }
     // On a machine: the remote's answer as is
@@ -2311,6 +2346,37 @@ fn instances_attach(id: Option<u64>, params: Value, shared: &Shared, conn: &mut 
         }
     };
     conn.attaches.push(guard);
+    Response::ok(id, json!({ "ok": true }))
+}
+
+/// `open.deliver {instance, root, url, profile}` from a fleet peer
+/// (docs/architecture/daemon/fleet.md, *Opening URLs*): `opens::receive`'s
+/// checks against this host's [`Shared::open_limit`] and its own outgoing
+/// attaches, then the job handed to [`Shared::open_here`] (which doesn't
+/// wait for the browser): `{ok: true}` means taken. A local client is
+/// refused. Every refusal is logged.
+fn open_deliver(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) -> Response {
+    let Table::Peer(peer) = &conn.table else {
+        return Response::err(id, "denied", "`open.deliver` comes over a fleet link");
+    };
+    let from = peer.name.as_str();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let limit = |instance: &str| {
+        let mut limit = shared.open_limit.lock().unwrap_or_else(|e| e.into_inner());
+        limit.allow(&format!("{from}/{instance}"), None, Instant::now())
+    };
+    let attached = |instance: &str| shared.attaches.attached_out(from, instance, Instant::now(), crate::open::OPEN_ATTACH_WINDOW);
+    let job = match opens::receive(params, from, now, limit, attached) {
+        Ok(job) => job,
+        Err(e) => {
+            log(&format!("{}: refused open.deliver from {from}: {}", conn.label(), e.message));
+            return Response::err(id, e.code, e.message);
+        }
+    };
+    let Some(open_here) = shared.open_here.get() else {
+        return Response::err(id, "failed", "this daemon opens nothing");
+    };
+    open_here(job);
     Response::ok(id, json!({ "ok": true }))
 }
 
@@ -3177,6 +3243,8 @@ pub(crate) mod tests {
             // Short, but each probe of a routed member is a routed opening.
             agent_probe: Duration::from_millis(200),
             pty_exec: None,
+            // Never a browser on the test host: taken opens go nowhere.
+            open_here: Some(Arc::new(|_| {})),
         }
     }
 

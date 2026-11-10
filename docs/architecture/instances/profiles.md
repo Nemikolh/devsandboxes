@@ -28,7 +28,8 @@ Code: `src/config.rs` (`Config::profiles`, `Profile`, `check_profile_name`,
 `src/tui/spec.rs` (`profile`, `ArgValue::Profile`) and `src/tui/daemon.rs`
 (`Cmd::SetProfile`, `set_profile_call`); used to open URLs by
 `src/open.rs` (`HostProfile`, `parse_profiles`, `load_profiles`,
-`open_argv`, `open_plan`, `open_on_desktop`).
+`open_argv`, `profile_to_send`, `prepare`, `open_here`) and
+`src/serve/opens.rs` (`DeliverParams`, `receive`).
 
 ## Declaration
 
@@ -185,22 +186,29 @@ open = ["google-chrome", "--profile-directory=Profile 2"]
 open = ["firefox"]
 ```
 
-`open::open_on_desktop` reads it (`open::load_profiles`) and `state.toml` on
-every open, so an edit applies without a daemon restart. A missing file is
-no profiles; an unreadable or invalid one is a `serve.log` line and counts
-as none. `open::open_plan` finds the instance by `instance_id` (a rename
-doesn't lose it) and opens with its profile's `open` (`open::open_argv`).
-No instance, no profile or a profile the file doesn't map: the host's
-opener (`xdg-open`, `open` on macOS). A profile `profile_disallowed` flags
-(its sandbox's allowed set loaded with `snapshot::allowed_now`) also gets
-the host's opener, with a `serve.log` warning (`<instance>: profile `<p>`
-no longer allowed by the config; opening <url> with the default opener`).
+An open is decided in two halves, which may be on two hosts
+([fleet.md](../daemon/fleet.md#opening-urls)). On the instance's host
+`open::prepare` reads `state.toml` on every open, finds the instance by
+`instance_id` (a rename doesn't lose it) and picks the profile name to send
+(`open::profile_to_send`): its `profile`, or none when `profile_disallowed`
+flags it (its sandbox's allowed set loaded with `snapshot::allowed_now`),
+with a `serve.log` warning (`<instance>: profile `<p>` no longer allowed by
+the config; opening <url> with the default opener`). On the opening host
+`open::open_here` reads its own `profiles.toml` (`open::load_profiles`) on
+every open, so an edit applies without a daemon restart, and opens with the
+named profile's `open` (`open::open_argv`). A missing file is no profiles;
+an unreadable or invalid one is a `serve.log` line and counts as none. No
+profile or one the file doesn't map: the host's opener (`xdg-open`, `open`
+on macOS).
 The display rule is the same for every command
 ([bridges.md](../helper/bridges.md#opening-urls-kind-open)).
 
 Commands only ever come from the opening host's own `profiles.toml`, never
-from a config: only a profile's name comes from `state.toml`, so no config
-(nor, over a fleet, any machine) can make this host run a command.
+from a config: only a profile's name comes from `state.toml`, and only that
+name crosses machines (`open.deliver`'s `profile`, checked as a profile name
+and mapped by the receiver alone), so no config nor any fleet member can
+make this host run a command
+([ADR 0048](../../decisions/0048-a-profile-is-the-users-choice-and-only-its-name-crosses-machines.md)).
 
 ## Drift
 

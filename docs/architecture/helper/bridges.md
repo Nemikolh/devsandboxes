@@ -151,15 +151,21 @@ the `SinkHooks::opener` (`bridge::Opener`, called with the instance's name,
 its `instance_id` and the URL; injectable so tests see the URL).
 Either way the sink returns `Ok` and the daemon gets `ok`: taken, not opened.
 
-The production opener, `open::open_on_desktop`, runs on its own thread: it
-finds a display, makes the URL's loopback forwards (below), picks the
-command and spawns it with stdio null and reaps it. The command is the
-instance's profile's, from this host's
-`profiles.toml` ([profiles.md](../instances/profiles.md#on-the-opening-host)):
-`open::open_plan` finds the instance in `state.toml` by `instance_id` and maps
-its `profile` (`open::open_argv`); no instance, no profile, an unmapped or a
-no-longer-allowed one get `open::opener_argv` (`xdg-open <url>` on Linux,
-`open <url>` on macOS). The display rule below applies to either. On Linux the display is
+The production opener, `serve::opens::opener`, runs on its own thread.
+First it decides which host opens: `open::prepare` finds the instance in
+`state.toml` by `instance_id` and picks the profile to send
+(`open::profile_to_send`: the instance's `profile`, none when the config no
+longer allows it), then the instance's last attach routes it: this host's
+own (or none yet) opens here, a fleet member's goes to that member as
+`open.deliver`, with no local fallback
+([fleet.md](../daemon/fleet.md#opening-urls)). The opening host
+(`open::open_here`) finds a display, makes the URL's loopback forwards
+(below), picks the command and spawns it with stdio null and reaps it. The
+command is the profile's, from the opening host's own
+`profiles.toml` ([profiles.md](../instances/profiles.md#on-the-opening-host),
+`open::open_argv`); no profile or an unmapped one gets `open::opener_argv`
+(`xdg-open <url>` on Linux, `open <url>` on macOS). The display rule below
+applies to either. On Linux the display is
 `DISPLAY` or `WAYLAND_DISPLAY` in the daemon's env, else in the user
 manager's current env (`systemctl --user show-environment`,
 `open::session_display_env`, with `XAUTHORITY`), passed to the child: GNOME
@@ -186,12 +192,14 @@ following nested URLs:
   many ports.
 
 One entry per port; a port that is both is a callback, since it needs that
-exact port. Each goes through the `open::Forwarder` with the instance's
-config root and state key (the `state.toml` entry with its `instance_id`):
-the daemon's (`serve::host`, handed the registry by `Host::start`) asks the
-forwards registry for an [open forward](../daemon/forwards.md#open-forwards)
-(`Handle::open_forward`). The seam keeps `src/open.rs` free of the
-unix-only `serve`.
+exact port. Each goes through the `open::Forwarder` with the job's
+`open::ForwardTarget`: for a local instance its config root and state key
+(the `state.toml` entry with its `instance_id`), for a delivered one the
+sending member and the root and name it gave. The daemon's
+(`serve::opens::forwarder`) asks the forwards registry for an
+[open forward](../daemon/forwards.md#open-forwards)
+(`Handle::open_forward`), which refuses one into another member's instance.
+The seam keeps `src/open.rs` free of the unix-only `serve`.
 
 The URL that opens is rewritten (`open::rewrite_direct`) to the direct
 port's bound host port when it differs, and a `0.0.0.0` host becomes

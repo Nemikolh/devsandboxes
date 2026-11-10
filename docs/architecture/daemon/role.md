@@ -167,7 +167,7 @@ at install time: `PATH`, `DEVSANDBOX_RUNTIME`, `DOCKER_HOST`,
 `SSH_AUTH_SOCK` (clients report theirs via `bridges.ensure`), not
 `DISPLAY`: the unit starts with `default.target`, before a desktop session
 imports its display into the user manager, so the URL opener reads the
-manager's env when it opens (`open::open_on_desktop`,
+manager's env when it opens (`open::open_here`,
 [bridges.md](../helper/bridges.md#opening-urls-kind-open)).
 
 `install`: write the unit; if a daemon answers, send it `shutdown` and wait

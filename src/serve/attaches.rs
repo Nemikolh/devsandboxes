@@ -111,7 +111,6 @@ impl Attaches {
 
     /// Where the latest attach to instance `id` came from, live or ended;
     /// `None` when none was seen.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn latest(&self, id: &str) -> Option<Origin> {
         lock(&self.0).inbound.get(id).map(|l| l.origin.clone())
     }
@@ -136,7 +135,6 @@ impl Attaches {
 
     /// Whether this host is attached to `instance` on `machine`, or was
     /// until less than `window` before `now`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn attached_out(&self, machine: &str, instance: &str, now: Instant, window: Duration) -> bool {
         let m = lock(&self.0);
         let Some(o) = m.outgoing.get(&(machine.to_string(), instance.to_string())) else { return false };

@@ -43,6 +43,8 @@
 //!   bridges' links, and the internal `helper.call` method
 //! - `attaches`: who attached to which instance last (in memory): what
 //!   routes an instance's opens, and what a member checks before taking one
+//! - `opens`: which host opens a container's URL: the bridges' opener routing
+//!   to the last attach, and `open.deliver`'s check on the receiving member
 
 pub mod api;
 pub mod attaches;
@@ -60,6 +62,7 @@ pub mod idle;
 pub mod install;
 pub mod locked_file;
 pub mod machines;
+pub mod opens;
 pub mod proto;
 pub mod relay;
 pub mod snapshots;

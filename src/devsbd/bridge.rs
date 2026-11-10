@@ -1232,8 +1232,9 @@ pub type OnShown = Box<dyn Fn(&str, String) + Send + Sync>;
 /// Opens `(instance, instance_id, url)` for an `open` record that passed
 /// [`crate::open::decide`]; the id finds the instance's `state.toml` entry
 /// (its profile) whatever its name now. Runs on a bridge's handler thread before the
-/// daemon's `ok`, so it must not wait on the browser: the production one is
-/// [`crate::open::open_on_desktop`] (spawn, reap on its own thread).
+/// daemon's `ok`, so it must not wait on the browser (nor on a fleet link):
+/// the production one is `serve::opens::opener` (routes it to where the
+/// user last attached from, on a thread of its own).
 /// Injectable so tests see the URL instead of a browser opening.
 pub type Opener = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 

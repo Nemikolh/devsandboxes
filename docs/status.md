@@ -20,11 +20,12 @@ limitation means editing this file in the same commit.
   (`devsandbox profile`, `instances.setProfile`, the dashboard's `P` and
   `:profile`) and the host's `profiles.toml` choosing the browser a URL
   opens in. Step 4 shipped: a URL on the container's localhost and an
-  OAuth login's localhost callback get an open forward first. Next:
-  delivery to the member that last attached and dashboard feedback
-  (steps 5-6). Meanwhile an
-  instance with no attached desktop on its host (a remote one) has its
-  URLs refused (`no display to open <url> on` in `serve.log`).
+  OAuth login's localhost callback get an open forward first. Step 5
+  delivery shipped: a URL opens on the member that last attached to the
+  instance (`open.deliver`, mapped by that member's `profiles.toml`).
+  Next: localhost forwards for those delivered URLs (step 5c; they open
+  as they are meanwhile, with a `cannot forward` line), then dashboard
+  feedback (step 6).
   → [plan](plans/active/open-routing.md)
 
 ## Planned

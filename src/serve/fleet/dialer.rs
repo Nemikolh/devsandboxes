@@ -867,6 +867,71 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&l_verbs);
     }
 
+    /// `open.deliver` from K (`box`) to L, the member a user attached to
+    /// K's `web-1` from: taken while L holds an outgoing attach to it (and
+    /// after it ends, within the window), the job L's opener gets naming
+    /// `box` and K's root as the forward target; refused for an instance L
+    /// never attached to, a scheme past `http(s)` and a local client;
+    /// taken under L's `full` trust for K too, its `machine` key refused
+    /// under both.
+    #[test]
+    fn an_open_is_delivered_to_the_member_that_attached() {
+        use crate::open::{ForwardTarget, OpenJob};
+        let opened: Arc<Mutex<Vec<OpenJob>>> = Arc::default();
+        let seen = Arc::clone(&opened);
+        let pair = Pair::new("dial-open", Vec::new(), move |l| {
+            l.open_here = Some(Arc::new(move |job| seen.lock().unwrap().push(job)));
+        });
+        pair.wait_box("box connected", connected);
+        let lap = endpoint::fleet_socket(&pair.k_dir, "lap");
+        wait_for("lap's link socket on K", Duration::from_secs(10), || lap.exists());
+        // An `API` stream over K's link to L: L serves it as peer `box`.
+        let stream = link::connect(&lap, channel::API).unwrap();
+        let duplex = crate::serve::machines::ssh::Duplex::socket(stream);
+        let mut from_box =
+            crate::serve::machines::link::handshake("lap", duplex, Duration::from_secs(10), crate::serve::machines::link::Over::Link)
+                .unwrap()
+                .conn;
+        let url = "https://example.test/login";
+        let params = |instance: &str, url: &str| json!({"instance": instance, "root": pair.k_own, "url": url, "profile": "work"});
+        let mut deliver = |p: Value| from_box.call("open.deliver", p).unwrap();
+        let code = |r: crate::serve::proto::Response| r.error.map(|e| e.code);
+
+        let e = deliver(params("web-1", url)).error.unwrap();
+        assert_eq!(e.code, "denied", "nothing attached yet");
+        assert!(e.message.contains("hasn't attached to in the last 10 min"), "{}", e.message);
+        let mut hold = connect(&pair.l_dir);
+        let r = hold.call("instances.attach", json!({"instance": "web-1", "machine": "box"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+
+        let r = deliver(params("web-1", url));
+        assert_eq!(r.result, Some(json!({"ok": true})), "{r:?}");
+        let target = ForwardTarget { machine: Some("box".into()), dir: pair.k_own.clone(), instance: "web-1".into() };
+        let want = OpenJob { instance: "web-1".into(), url: url.into(), profile: Some("work".into()), target: Ok(target) };
+        assert_eq!(*opened.lock().unwrap(), vec![want.clone()]);
+        assert_eq!(code(deliver(params("web-2", url))), Some("denied".into()), "an instance L never attached to");
+        assert_eq!(code(deliver(params("web-1", "ssh://box"))), Some("invalid".into()));
+        let mut with_machine = params("web-1", url);
+        with_machine["machine"] = json!("srv");
+        assert_eq!(code(deliver(with_machine.clone())), Some("denied".into()), "worker: no `machine`");
+        let local = connect(&pair.l_dir).call("open.deliver", params("web-1", url)).unwrap();
+        assert_eq!(code(local), Some("denied".into()), "a local client");
+
+        // The attach ends: still within the window.
+        drop(hold);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(deliver(params("web-1", url)).result, Some(json!({"ok": true})));
+        // L trusts K fully: the same gate.
+        let r = connect(&pair.l_dir).call("member.set", json!({"trust": "full"})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        assert_eq!(deliver(params("web-1", url)).result, Some(json!({"ok": true})));
+        assert_eq!(code(deliver(params("web-2", url))), Some("denied".into()), "full: still only what L attached to");
+        assert_eq!(code(deliver(with_machine)), Some("invalid".into()), "full: strict params");
+        assert_eq!(*opened.lock().unwrap(), vec![want; 3], "nothing refused reached the opener");
+        drop(from_box);
+        pair.finish();
+    }
+
     /// A `run` on K (the dialed host) is placed on L, the inbound machine
     /// whose fresh `capacity.get` has room: the config root's tar and the
     /// branch's bundle land in L's fleet root for K (as L's `roots.list`
