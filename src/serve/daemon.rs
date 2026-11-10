@@ -800,6 +800,9 @@ struct Shared {
     /// (`fleet::routes`): the machine links' handshake wait
     /// (`service::Timing::handshake`), a client's hello waiting as long.
     route_budget: Duration,
+    /// Who attached to which instance last: a `PTY` stream's origin
+    /// ([`Shared::serve_channel`]) and `instances.attach`'s holders.
+    attaches: super::attaches::Attaches,
 }
 
 impl Shared {
@@ -839,6 +842,7 @@ impl Shared {
             channels: Arc::default(),
             graph: Arc::default(),
             route_budget: service::Timing::default().handshake,
+            attaches: Default::default(),
         }
     }
 
@@ -1029,7 +1033,8 @@ impl Shared {
     /// - `api`: a `Peer` connection ([`Table::Peer`]: every request
     ///   admitted, every answer and pushed snapshot filtered).
     /// - `pty`: `fleet::pty::serve` (a session attach or an exec in an
-    ///   instance the peer reaches); refused without a helper client.
+    ///   instance the peer reaches, its latest attach while it lasts);
+    ///   refused without a helper client.
     /// - `tunnel`: `fleet::tunnel::serve` (a forward's bridge into one).
     /// - `transfer`: one transfer into the peer's fleet root
     ///   (`fleet::code::receivers`); refused without one.
@@ -1055,9 +1060,9 @@ impl Shared {
             }
             lent::Channel::Pty => {
                 let Some(helper) = self.helper.get().cloned() else { return false };
-                let (files, exec) = (self.reach_files(), self.pty_exec);
+                let (files, exec, attaches) = (self.reach_files(), self.pty_exec, self.attaches.clone());
                 self.spawn_channel("serve-pty", move || {
-                    fleet::pty::serve(stream, &helper, &files, &peer, crate::commands::exec::has_host_agent, exec, log)
+                    fleet::pty::serve(stream, &helper, &files, &peer, &attaches, crate::commands::exec::has_host_agent, exec, log)
                 })
             }
             lent::Channel::Tunnel => {
@@ -1851,6 +1856,8 @@ struct ConnState {
     /// `links.inbound`'s announce: its neighbor is up while this
     /// connection is (a repeat replaces it).
     inbound: Option<machines::inbound::Guard>,
+    /// `instances.attach`'s records, each held until the connection ends.
+    attaches: Vec<super::attaches::Guard>,
     /// What the links do once this request's answer is out
     /// (`machines::leave::After`): a `fleet.*` call whose change ends the
     /// link it came on.
@@ -1881,6 +1888,7 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
         buffered: false,
         handoff: None,
         inbound: None,
+        attaches: Vec::new(),
         after: None,
     };
     let mut reader = BufReader::new(stream);
@@ -1968,6 +1976,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         // Only reached on `Full`: the trust table refuses `link.*`.
         "link.attach" => return Some(link_attach(req.id, &req.params, shared, conn)),
         "links.inbound" => return Some(links_inbound(req.id, req.params, shared, conn)),
+        // Before `machine` routing: its `machine` is where this host attaches.
+        "instances.attach" => return Some(instances_attach(req.id, req.params, shared, conn)),
         _ => {}
     }
     // On a machine: the remote's answer as is
@@ -2257,6 +2267,50 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
         Ok(roots) => set_roots(roots),
         Err(e) => log(&format!("links.inbound: cannot list {peer}'s roots: {e:#}")),
     });
+    Response::ok(id, json!({ "ok": true }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachParams {
+    /// An exact instance name or id: on this host, or on `machine`.
+    instance: String,
+    machine: Option<String>,
+}
+
+/// `instances.attach {instance, machine?}`: this user's client attaches to
+/// `instance` (a local `exec`, a dashboard tab, `devsandbox vscode`) for as
+/// long as this connection is (docs/reference/api.md, `instances.attach`).
+/// Without `machine`, `instance` (exact name or id in `state.toml`) is this
+/// host's: its latest attach is now from here. With `machine`, it's that
+/// machine's, by the name this host gave it: recorded as this host's own
+/// attach there. Local own-user connections only; never forwarded.
+fn instances_attach(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) -> Response {
+    if !matches!(conn.table, Table::Full) || !conn.own_user {
+        return Response::err(id, "denied", "`instances.attach` is for this user's own local clients");
+    }
+    let p: AttachParams = match api::parse(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, e.code, e.message),
+    };
+    if p.instance.is_empty() {
+        return Response::err(id, "invalid", "`instance` is empty");
+    }
+    let guard = match p.machine {
+        Some(machine) => shared.attaches.begin_out(&machine, &p.instance, Instant::now()),
+        None => {
+            let state = match crate::state::State::load_at(&shared.state) {
+                Ok(state) => state,
+                Err(e) => return Response::err(id, "internal", format!("{e:#}")),
+            };
+            let found = state.instances.get(&p.instance).or_else(|| state.instances.values().find(|i| i.instance_id == p.instance));
+            let Some(instance) = found else {
+                return Response::err(id, "not-found", format!("no instance `{}`", p.instance));
+            };
+            shared.attaches.begin_in(&instance.instance_id, super::attaches::Origin::Here)
+        }
+    };
+    conn.attaches.push(guard);
     Response::ok(id, json!({ "ok": true }))
 }
 
@@ -3470,6 +3524,63 @@ pub(crate) mod tests {
     fn bare_shared(tag: &str) -> Arc<Shared> {
         let store = scratch(tag);
         Arc::new(Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join()))
+    }
+
+    /// `instances.attach` records while its connection holds, and only for a
+    /// local client of this user.
+    #[test]
+    fn an_attach_records_while_its_connection_holds() {
+        use crate::serve::attaches::Origin;
+        use crate::serve::fleet::member::{self, Member};
+        let store = scratch("attach-rec");
+        std::fs::create_dir_all(&store).unwrap();
+        let instance = "[instance.w]\ninstance_id = \"id-w\"\nsandbox = \"web\"\ncontainer = \"devsandbox-w\"\n\
+                        folder = \"/w\"\nworkspace = \"/w\"\ncreated_unix = 1\n";
+        std::fs::write(store.join("state.toml"), instance).unwrap();
+        let mut s = Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join());
+        s.member = Some(store.join("member.toml"));
+        let shared = Arc::new(s);
+        let window = crate::open::OPEN_ATTACH_WINDOW;
+
+        let mut c = subscribed(&shared, 1, json!(["instances"]));
+        let mut attach = |params: Value| ask(&mut c, "instances.attach", params).0;
+        assert_eq!(attach(json!({"instance": "w"}))["result"], json!({"ok": true}));
+        assert_eq!(attach(json!({"instance": "id-w"}))["result"], json!({"ok": true}), "by id");
+        assert_eq!(attach(json!({"instance": "w-1", "machine": "box"}))["result"], json!({"ok": true}), "on a machine");
+        assert_eq!(attach(json!({"instance": "nope"}))["error"]["code"], "not-found");
+        assert_eq!(attach(json!({"instance": "w", "root": "/x"}))["error"]["code"], "invalid", "strict params");
+        assert_eq!(attach(json!({}))["error"]["code"], "invalid");
+        assert_eq!(attach(json!({"instance": ""}))["error"]["code"], "invalid");
+        assert_eq!((shared.attaches.latest("id-w"), shared.attaches.live_in("id-w")), (Some(Origin::Here), true));
+        assert!(shared.attaches.attached_out("box", "w-1", Instant::now() + 2 * window, window), "live");
+        drop(c);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while shared.attaches.live_in("id-w") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!shared.attaches.live_in("id-w"), "the hang-up ended it");
+        assert_eq!(shared.attaches.latest("id-w"), Some(Origin::Here), "ended, still the latest");
+        assert!(shared.attaches.attached_out("box", "w-1", Instant::now(), window), "ended just now");
+        assert!(!shared.attaches.attached_out("box", "w-1", Instant::now() + window, window), "ended");
+
+        // A link peer, `worker` or `full`: never.
+        let peer = |shared: &Arc<Shared>| {
+            let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let p = lent::Peer { name: "lap".into(), fleet_root: None, env: None, agent: None, key: None, introduced_by: None };
+            shared.spawn_conn_as(9, server, Table::Peer(Arc::new(p)));
+            let reader = BufReader::new(client);
+            reader.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            reader
+        };
+        let mut worker = peer(&shared);
+        assert_eq!(ask(&mut worker, "instances.attach", json!({"instance": "w"})).0["error"]["code"], "denied");
+        assert_eq!(ask(&mut worker, "instances.attach", json!({"instance": "w", "machine": "box"})).0["error"]["code"], "denied");
+        member::write_for_test(&store.join("member.toml"), &Member { trust: crate::worker_policy::Trust::Full, ..Default::default() });
+        let mut full = peer(&shared);
+        assert_eq!(ask(&mut full, "instances.attach", json!({"instance": "id-w"})).0["error"]["code"], "denied");
+        drop((worker, full));
+        assert!(!shared.attaches.live_in("id-w"));
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// A root dir that exists, for `instances.watch`.

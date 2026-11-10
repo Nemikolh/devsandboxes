@@ -911,6 +911,8 @@ mod tests {
             ("roots.list", json!({"machine": "m"}), Err("denied")),
             ("bridges.ensure", p.clone(), Err("denied")),
             ("inbox.threads.list", p.clone(), Err("denied")),
+            // Local only: a peer's attach is its `PTY` stream.
+            ("instances.attach", json!({"instance": "w"}), Err("denied")),
             ("nope", p.clone(), Err("denied")),
         ];
         for (method, params, want) in cases {

@@ -73,6 +73,9 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
             if !super::services::container_running(&container) {
                 bail!("service `{service}` of `{key}` isn't running ({container})");
             }
+            // Through its instance: where the instance's opens go.
+            #[cfg(unix)]
+            let _attach = crate::serve::client::attach_hold(&instance.instance_id, None);
             backend().run_inherit(&refs(&service_exec_argv(&container, command)))
         }
         Exec::Sessions => {
@@ -159,6 +162,10 @@ fn run_in(key: &str, instance: &Instance, interactive: bool, tty: bool, command:
     // (docs/architecture/helper/in-container.md).
     #[cfg(unix)]
     let relay = host_agent.then(|| AgentRelay::start(key));
+    // This host's user is at the instance while the command runs: its
+    // opens come here (`instances.attach`, best effort).
+    #[cfg(unix)]
+    let _attach = crate::serve::client::attach_hold(&instance.instance_id, None);
     let args = exec_argv_with(instance, interactive, tty, command, host_agent);
     let code = backend().run_inherit(&refs(&args))?;
     #[cfg(unix)]

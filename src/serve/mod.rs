@@ -41,8 +41,11 @@
 //!   Ctrl-C, exit codes, the in-process fallback
 //! - `helper`: host → container RPC calls (`HelperClient`) over the
 //!   bridges' links, and the internal `helper.call` method
+//! - `attaches`: who attached to which instance last (in memory): what
+//!   routes an instance's opens, and what a member checks before taking one
 
 pub mod api;
+pub mod attaches;
 pub mod capacity;
 pub mod client;
 pub mod daemon;

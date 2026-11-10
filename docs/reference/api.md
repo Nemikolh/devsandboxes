@@ -27,6 +27,7 @@ checks the typings against the wire structs).
 | Inbox | `inbox.threads.list`, `inbox.thread.get\|markRead\|act\|reply\|done\|reopen`, `inbox.form.saveDraft\|submit`, `inbox.notify.dismiss\|markRead` | no |
 | instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|setProfile\|done` | yes |
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
+| | `instances.attach` (local only) | its own (never forwarded) |
 | sessions | `sessions.list\|rm` | yes |
 | containers, config | `containers.logs\|inspect\|list\|stats`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
@@ -126,7 +127,7 @@ A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
 its `member.toml` per request: a link peer's channel streams (those the
 daemon answers in-process on the links it dials, and those after
-`link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*` and `placements.*` are
+`link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*`, `placements.*` and `instances.attach` are
 `denied` under either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
@@ -597,6 +598,29 @@ anyway ([fleet.md](../architecture/daemon/fleet.md#moving-code),
 
 Errors: `not-found` (no such instance), `invalid` (a missing param),
 `internal` (`state.toml` doesn't read or write).
+
+### `instances.attach`
+
+Params: `{"instance": "<name or id>", "machine"?: "<machine>"}`, no
+other field. This user's client attaches to the instance for as long as
+the connection stays open, and the daemon records it in memory
+(`serve::attaches`, [fleet.md](../architecture/daemon/fleet.md#last-attach)):
+
+- without `machine`, `instance` is this host's (an exact name or instance
+  id in `state.toml`), and its latest attach is from here;
+- with `machine`, it is that machine's instance, as the CLI named it there,
+  and the record is this host's own attach to it.
+
+The CLI holds one around a local `exec` (`exec --service` too), a
+`PTY` dial to a machine, and `devsandbox vscode` (opened and closed at
+once); best effort, never starting a daemon. A hang-up, a drain included,
+ends the record. A link peer's attach is its `PTY` stream, so the method
+is for local clients of this user only, never forwarded. Result:
+`{"ok": true}`.
+
+Errors: `denied` (a link peer, or another user), `not-found` (no such
+instance here), `invalid` (bad params), `internal` (`state.toml` doesn't
+read).
 
 ## Sessions
 

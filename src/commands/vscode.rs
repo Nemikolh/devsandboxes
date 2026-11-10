@@ -234,6 +234,10 @@ pub fn launch(dir: &Path, instance: &str, info: &Instance, goto: Option<&Goto>) 
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("code: failed to launch (`code` on PATH?)")?;
+    // A point-in-time attach (`code` runs detached): it begins and ends at
+    // once, so this host is the instance's latest attach.
+    #[cfg(unix)]
+    drop(crate::serve::client::attach_hold(&info.instance_id, None));
     let Some(goto) = goto else {
         return Ok(format!("opening VS Code → {instance}{hint}"));
     };

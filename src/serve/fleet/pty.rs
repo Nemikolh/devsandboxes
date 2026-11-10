@@ -49,6 +49,7 @@ use super::lent::{self, Files, Peer, Reach};
 use crate::commands::exec::{SHELL_FALLBACK_CMD, exec_argv_with, exec_context};
 use crate::devsbd::control::valid_run_id;
 use crate::devsbd::rpc::{self, Exit, Json, Obj, Record};
+use crate::serve::attaches::{Attaches, Origin};
 use crate::serve::endpoint::Stream;
 use crate::serve::helper::{Call, CallError, Cancel, HelperClient, Input};
 use crate::state::{Instance, State};
@@ -432,12 +433,17 @@ enum Started {
 /// peer's [`Reach`] is read from), `peer` the link's;
 /// `host_agent` probes for a host ssh-agent (`exec::has_host_agent`);
 /// `exec` builds a piped or tty exec's argv ([`runtime_exec`]). Refusals
-/// with `denied` are logged.
+/// with `denied` are logged. A stream that started (any mode, a service
+/// terminal's through its instance) is its instance's latest attach in
+/// `attaches`, from `peer` (the proven origin of a routed stream), until it
+/// ends: where that instance's opens go.
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     link: Stream,
     helper: &HelperClient,
     files: &Files,
     peer: &Peer,
+    attaches: &Attaches,
     host_agent: fn() -> bool,
     exec: ExecCommand,
     log: fn(&str),
@@ -452,9 +458,14 @@ pub fn serve(
         Err(e) => Err(bad(format!("no PTY header: {e}"))),
     };
     match started {
-        Ok(Started::Attach(call, input)) => pump(&link, call, input),
-        Ok(Started::Pipe(child)) => run_pipe(&link, child),
-        Ok(Started::Tty(tty, note)) => run_tty(&link, tty, note.as_deref()),
+        Ok((started, instance_id)) => {
+            let _attach = attaches.begin_in(&instance_id, Origin::Member(peer.name.clone()));
+            match started {
+                Started::Attach(call, input) => pump(&link, call, input),
+                Started::Pipe(child) => run_pipe(&link, child),
+                Started::Tty(tty, note) => run_tty(&link, tty, note.as_deref()),
+            }
+        }
         Err(rec) => {
             if let Record::Error { code: c, message } = &rec
                 && c == code::DENIED
@@ -468,7 +479,8 @@ pub fn serve(
 }
 
 /// Header, gate, then the call (the attach and its input), the piped
-/// exec's spawn or the tty exec's, or the `error` to end the stream with.
+/// exec's spawn or the tty exec's, with the instance's `instance_id`; or
+/// the `error` to end the stream with.
 #[allow(clippy::too_many_arguments)]
 fn start(
     first: Record,
@@ -480,7 +492,7 @@ fn start(
     exec: ExecCommand,
     caller: &str,
     log: fn(&str),
-) -> Result<Started, Record> {
+) -> Result<(Started, String), Record> {
     let h = parse_header(first)?;
     let state = State::load_at(&files.state).map_err(|e| Record::error(code::FAILED, format!("{e:#}")))?;
     let (reach, warning) = Reach::load(files, peer.fleet_root.as_deref());
@@ -488,6 +500,23 @@ fn start(
         log(&format!("fleet: a PTY stream from {}: {w}", peer.name));
     }
     let (name, instance) = gate(&h, &state, &reach)?;
+    let id = instance.instance_id.clone();
+    start_in(&h, &state, name, instance, link, helper, host_agent, exec, caller).map(|s| (s, id))
+}
+
+/// [`start`] past the gate: what instance `name` runs for header `h`.
+#[allow(clippy::too_many_arguments)]
+fn start_in(
+    h: &Header,
+    state: &State,
+    name: &str,
+    instance: &Instance,
+    link: &Stream,
+    helper: &HelperClient,
+    host_agent: fn() -> bool,
+    exec: ExecCommand,
+    caller: &str,
+) -> Result<Started, Record> {
     let tty = |argv: Vec<String>, note: Option<String>| {
         spawn_tty(argv)
             .map(|t| Started::Tty(t, note))
@@ -510,7 +539,7 @@ fn start(
                 .map_err(|e| Record::error(code::FAILED, format!("cannot run an exec in `{name}`: {e}")));
         }
         Mode::Service { name: service, argv } => {
-            let container = service_container(instance, name, &state, service)?;
+            let container = service_container(instance, name, state, service)?;
             return tty(exec(&Target::Service { container: &container, argv: &or_shell(argv) }), None);
         }
         Mode::Session { id, create } => (id, create),
@@ -1108,6 +1137,7 @@ mod tests {
         root: PathBuf,
         state: PathBuf,
         helper: HelperClient,
+        attaches: Attaches,
     }
 
     impl Drop for World {
@@ -1131,7 +1161,7 @@ mod tests {
         fake.add("devsandbox-web-1", caps::RPC, 1, sessions);
         let helper = HelperClient::new(fake.clone(), log);
         // `bare` has no helper in `state.toml`; `own` isn't lent.
-        World { state: base.join("state.toml"), base, root, helper }
+        World { state: base.join("state.toml"), base, root, helper, attaches: Attaches::default() }
     }
 
     /// The hub's end of a stream served on a thread, its header sent.
@@ -1139,7 +1169,8 @@ mod tests {
         let (hub, ours) = UnixStream::pair().unwrap();
         let peer = Peer { name: "me@hub".into(), fleet_root: Some(w.root.clone()), env: None, agent: None, key: None, introduced_by: None };
         let files = Files { state: w.state.clone(), member: None, home: None };
-        let t = std::thread::spawn(move || serve(ours, &helper, &files, &peer, || false, sh, log));
+        let attaches = w.attaches.clone();
+        let t = std::thread::spawn(move || serve(ours, &helper, &files, &peer, &attaches, || false, sh, log));
         rpc::write_record(&mut &hub, &header).unwrap();
         hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         (hub, t)
@@ -1175,6 +1206,48 @@ mod tests {
             [stdout(&format!("{SESSION} /workspaces/web-1\n")), stdout("ls\n"), stdout("120x40"), Record::Exit(Exit::Code(7))],
             "the helper's records, unchanged, then nothing"
         );
+    }
+
+    fn attached(w: &World, id: &str) -> Option<Origin> {
+        w.attaches.latest(id)
+    }
+
+    #[test]
+    fn a_stream_is_its_instances_latest_attach_from_its_origin() {
+        let w = world("attach");
+        assert_eq!(attached(&w, "id-web-1"), None);
+        let (hub, t) = open(&w, create_header(&w, SESSION), w.helper.clone());
+        assert!(matches!(rpc::read_record(&mut &hub), Ok(Some(Record::Stdout(_)))), "attached");
+        assert_eq!(attached(&w, "id-web-1"), Some(Origin::Member("me@hub".into())), "during the stream");
+        assert!(w.attaches.live_in("id-web-1"));
+        // A local attach begins later: the latest, and the stream's end
+        // doesn't clobber it.
+        let here = w.attaches.begin_in("id-web-1", Origin::Here);
+        rpc::write_record(&mut &hub, &Record::StdinEof).unwrap();
+        rest(&hub);
+        t.join().unwrap();
+        assert_eq!(attached(&w, "id-web-1"), Some(Origin::Here));
+        drop(here);
+
+        // A pipe (no helper needed) and a service terminal count too; a
+        // refusal doesn't.
+        let (hub, t) = open(&w, pipe_header(&w, "bare", "exit 0", false), w.helper.clone());
+        rest(&hub);
+        t.join().unwrap();
+        assert_eq!(attached(&w, "id-bare"), Some(Origin::Member("me@hub".into())), "after the stream: the latest still");
+        assert!(!w.attaches.live_in("id-bare"), "ended");
+        let cfg = w.root.join("cfg");
+        let create = Obj::new().with("argv", vec!["exit 0".to_string()]);
+        let h = header(pipe_base(cfg.to_str().unwrap()).with("service", "db").with("create", create));
+        let _ = w.attaches.begin_in("id-web-1", Origin::Here);
+        let (hub, t) = open(&w, h, w.helper.clone());
+        rest(&hub);
+        t.join().unwrap();
+        assert_eq!(attached(&w, "id-web-1"), Some(Origin::Member("me@hub".into())), "a service terminal: its instance's");
+        let (hub, t) = open(&w, header(base(cfg.to_str().unwrap()).with("instance", "own")), w.helper.clone());
+        rest(&hub);
+        t.join().unwrap();
+        assert_eq!(attached(&w, "id-own"), None, "refused: no attach");
     }
 
     #[test]

@@ -2615,6 +2615,46 @@ else not read at all (`pty_client::Terminal`'s `input` `None`);
 `exit_of`. It never goes through the reconnect loop: its 255 (a lost
 link, or `lost`) is reported once, with its line.
 
+Every stream that started, in any mode (a service terminal through its
+instance), is its instance's latest attach on the serving host, from the
+stream's peer (a routed stream's proven origin, never its relay), until
+it ends (*Last attach*); a refused one isn't. The calling CLI holds the
+matching record on its own host for the dial's length.
+
+### Last attach
+
+Every daemon keeps in memory who attached to what, last
+(`serve::attaches::Attaches`, one per daemon): what routes an instance's
+`open` records to the member whose user is at it, and what that member
+checks before opening one for an instance on another host. Two maps under
+one lock:
+
+- **Inbound**, on the instance's host, per instance id: the
+  `attaches::Origin` of the latest attach to begin. A `PTY` stream
+  (`fleet::pty::serve`) is `Origin::Member` of its peer; a local `exec`
+  (`exec --service` too), a dashboard terminal tab (a `devsandbox exec`)
+  and `devsandbox vscode` are `Origin::Here`, through `instances.attach`
+  ([api](../../reference/api.md#instancesattach)). The latest begin wins:
+  the same origin as the latest joins it, another replaces it, and an
+  older origin's attaches ending later never clobber the newer one's (each
+  `attaches::Guard` keeps the epoch it joined). Never pruned: one entry
+  per instance id attached in the daemon's life.
+- **Outgoing**, on the attaching host, per `(machine, instance)` as the
+  CLI named them: live attaches, or when the last one ended
+  (`Attaches::attached_out`, within a window: `open::OPEN_ATTACH_WINDOW`,
+  10 min). An `instances.attach` with `machine` records one: the CLI's
+  `PTY` dials to a machine (`machines::cli::resolve_and_route`) hold it on
+  their daemon connection. Entries ended past the window are pruned on
+  each begin.
+
+A record lasts while its guard does: a `PTY` stream's until `serve`
+returns, an `instances.attach` until its connection hangs up
+(`client::attach_hold` holds one around a local exec; `vscode::launch`
+begins and ends one at once, as `code` runs detached). The CLI's calls
+are best effort: no daemon start, no handoff (its hello says 0.0.0), a
+short wait, silent; a drain ends the connection, and with it only the
+record. A successor daemon starts with no records.
+
 ### TUNNEL
 
 A port forward's bridge into a lent instance over the link, every remote

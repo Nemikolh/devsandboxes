@@ -29,6 +29,11 @@ pub const OPEN_RATE_BURST: u32 = 5;
 /// One more open per instance is allowed every this long.
 pub const OPEN_RATE_REFILL: Duration = Duration::from_secs(10);
 
+/// How long after its attach to an instance on another host ended a member
+/// still takes that instance's opens (`serve::attaches`): a user who just
+/// closed the terminal may still be finishing the login it started.
+pub const OPEN_ATTACH_WINDOW: Duration = Duration::from_secs(10 * 60);
+
 /// What happens to one `open` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {

@@ -279,6 +279,38 @@ pub fn set_in_process() {
     IN_PROCESS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How long [`attach_hold`] waits for the hello, then for the answer.
+const ATTACH_WAIT: Duration = Duration::from_millis(500);
+
+/// Tell a running daemon this process attaches to `instance` (an exact name
+/// or id; on `machine` when given), for as long as the returned connection
+/// is held (`instances.attach`, docs/reference/api.md): where that
+/// instance's opens go. Best effort and silent: `None` when no daemon
+/// answers within [`ATTACH_WAIT`], it refuses, or under [`set_in_process`].
+/// Never starts a daemon, and says hello as version 0.0.0 (older than any)
+/// so it never triggers a handoff either: an attach record isn't worth a
+/// daemon's restart. Nothing else rides on the connection: a drain ending
+/// it ends only the record.
+pub fn attach_hold(instance: &str, machine: Option<&str>) -> Option<Conn> {
+    if IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let dir = endpoint::socket_dir().ok()?;
+    let version = Version { semver: "0.0.0".into(), build: 0 };
+    let mut conn = connect_running(&dir, "cli", &version, ATTACH_WAIT).ok()??;
+    let mut params = serde_json::json!({ "instance": instance });
+    if let Some(machine) = machine {
+        params["machine"] = machine.into();
+    }
+    attach_on(&mut conn, params).then_some(conn)
+}
+
+/// `instances.attach` with `params` on `conn`, within [`ATTACH_WAIT`]:
+/// whether it was taken.
+pub(crate) fn attach_on(conn: &mut Conn, params: Value) -> bool {
+    matches!(conn.call_within("instances.attach", params, ATTACH_WAIT), Ok(Some(r)) if r.error.is_none())
+}
+
 /// [`ensure_bridge`] without the lazy start (`None` when no daemon answers),
 /// for code running in the daemon itself (a dispatcher's child op), which
 /// reaches it over its own socket. While it drains nothing answers, and a
