@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Service networks no longer break DNS on rootless docker.** Rootless docker can't see the host's routes, so once its `172.x` pools ran out it could give a service network the LAN's range (say `192.168.0.0/20` on a `192.168.1.x` LAN), and from then on no container could reach the router or its DNS. A new service network that covers a host route, gateway or nameserver is now recreated on a free `/24` of `10.200.0.0/16`, with a warning. To clear an existing bad one, run `devsandbox gc`, or `docker network rm` it if a container still uses it.
+- **`devsandbox gc` removes unused service networks on docker.** It never matched any on docker before, so leaked networks piled up and used up docker's address pools. A network a stopped instance still uses is kept.
+
 ### Added
 
 - **Links opened in a sandbox open on your desktop.** A program in a sandbox that opens a URL (`xdg-open`, `$BROWSER`, `sensible-browser`, Python's `webbrowser`, Node's `open`, a CLI's "press enter to open the browser") now opens it in the host's browser instead of failing. Only `http` and `https` URLs open; anything else, a URL more than 30 seconds old by the time it reaches the host, or more than 5 in 10 seconds from one instance is refused with a line in `serve.log`. Opening files (`xdg-open report.pdf`) isn't supported. The host needs a desktop session: a sandbox on a machine you reach over ssh can't open on your laptop yet. An image's own `/usr/local/bin/xdg-open` is never overwritten; `devsbd open <url>` does the same from scripts. Existing instances get `BROWSER` once rebuilt.

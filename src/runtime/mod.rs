@@ -246,6 +246,25 @@ pub trait Backend: Send + Sync {
 
     fn network_exists(&self, network: &str) -> Result<bool>;
 
+    /// Every network's name. stderr is captured. The default is `network ls
+    /// -q`, which prints names on Apple `container` (docker prints IDs).
+    fn network_names(&self) -> Result<Vec<String>> {
+        let out = self.output_quiet(&["network", "ls", "-q"])?;
+        Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    }
+
+    /// The subnets (CIDR, IPv4 and IPv6 alike) `networks` were given; empty
+    /// on a runtime that doesn't say, which skips the host overlap check
+    /// (`services::ensure_network`). stderr is captured.
+    fn network_subnets(&self, _networks: &[&str]) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether any container, stopped ones included, is attached to
+    /// `network`: docker removes a network from under a stopped container.
+    /// stderr is captured.
+    fn network_in_use(&self, network: &str) -> Result<bool>;
+
     /// Raw `inspect` JSON for a container, for the dashboard's inspect pane.
     fn inspect_json(&self, container: &str) -> Result<String>;
 

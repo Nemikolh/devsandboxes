@@ -152,9 +152,11 @@ is frozen: no new work on it.
 
 ### instances
 
-- **Bug**: `gc` never removes networks on docker: it matches network names
-  against `network ls -q`, which prints IDs. → [services](architecture/instances/services.md);
-  `services::gc`
+- The host-overlap check on a new service network reads routes only on
+  Linux (macOS: nameservers only), is skipped on Apple `container`, and
+  never re-checks a network that already exists, e.g. one created before
+  the check. → [services](architecture/instances/services.md#networks);
+  `services::ensure_network`, `subnet::host_nets`
 - `gc` counts only running (or in-flight) instances as live, so it reaps a
   stopped instance's isolated services; the next `start` recreates them
   empty. → [services](architecture/instances/services.md); `services::gc`

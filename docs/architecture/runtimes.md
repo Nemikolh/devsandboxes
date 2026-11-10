@@ -20,6 +20,8 @@ process-wide backend, resolved once by `backend()`.
   the error: safe while the TUI owns the screen), `output_merged` (logs),
   `run_checked`, `run_with_stdin`.
 - **Queries** (per runtime): `is_running`, `label`, `network_exists`,
+  `network_names`, `network_subnets` (empty on Apple `container`),
+  `network_in_use` (stopped containers count),
   `inspect_json`, `list` (rows as `ContainerRow`: name, image, status,
   normalized `state`, labels, host ports), `stats`, `server_version`,
   `logs_tail`, `proc_list`, `image_entrypoint`, `events_argv` (see
@@ -247,8 +249,6 @@ reads them all again; the fact that failed reads as unset. Without an id
 
 A docker-CLI-compatible one is another `Dockerlike` constant plus its name in
 `backend_named` and `default_backend_name`. Anything else implements
-`Backend`; the query methods parse runtime output, with one exception:
-`services::gc` reads `network ls -q` itself and matches network names (which
-docker's `-q` doesn't print: it prints IDs).
+`Backend`; the query methods parse runtime output.
 
 Limitations: [status.md](../status.md#runtimes)

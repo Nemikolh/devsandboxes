@@ -63,6 +63,26 @@ impl Backend for Dockerlike {
         Ok(self.inspect_template(network, "{{.Id}}")?.is_some())
     }
 
+    /// `--format`: docker's `-q` prints IDs.
+    fn network_names(&self) -> Result<Vec<String>> {
+        let out = self.output_quiet(&["network", "ls", "--format", "{{.Name}}"])?;
+        Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    }
+
+    fn network_subnets(&self, networks: &[&str]) -> Result<Vec<String>> {
+        if networks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["network", "inspect"];
+        args.extend_from_slice(networks);
+        parse_network_subnets(&self.output_quiet(&args)?)
+    }
+
+    fn network_in_use(&self, network: &str) -> Result<bool> {
+        let filter = format!("network={network}");
+        Ok(!self.output_quiet(&["ps", "--all", "--quiet", "--filter", &filter])?.is_empty())
+    }
+
     fn inspect_json(&self, container: &str) -> Result<String> {
         self.output_quiet(&["inspect", container])
     }
@@ -261,6 +281,22 @@ impl Backend for Dockerlike {
         }
         Ok(Canary { as_root: owner(&dir.join("0"))?, as_1000: owner(&dir.join(identity::ASSUMED.uid.to_string()))? })
     }
+}
+
+/// Subnets in a `network inspect` array: docker's `IPAM.Config[].Subnet`,
+/// podman's `subnets[].subnet`.
+fn parse_network_subnets(json: &str) -> Result<Vec<String>> {
+    let nets: Vec<serde_json::Value> = serde_json::from_str(json).context("unexpected `network inspect` JSON")?;
+    let mut out = Vec::new();
+    for net in &nets {
+        let (list, key) = match net.pointer("/IPAM/Config") {
+            Some(config) => (config, "Subnet"),
+            None => (net.get("subnets").unwrap_or(&serde_json::Value::Null), "subnet"),
+        };
+        let subnets = list.as_array().into_iter().flatten().filter_map(|c| c.get(key)?.as_str());
+        out.extend(subnets.map(str::to_string));
+    }
+    Ok(out)
 }
 
 /// Where the canary's host dir is bound inside.
@@ -668,5 +704,41 @@ mod tests {
         let nets = vec!["a".to_string(), "b".to_string()];
         assert_eq!(Dockerlike::DOCKER.network_run_args(&nets), vec!["--network", "a"]);
         assert!(Dockerlike::DOCKER.network_run_args(&[]).is_empty());
+    }
+
+    /// gc's sweep and `ensure_network`'s overlap check against the runtime:
+    /// names (not docker's `-q` IDs), a stopped container counts as attached,
+    /// and the subnet the runtime gave reads back.
+    #[test_utils::docker_test]
+    fn network_names_subnets_and_use() -> Result<(), &'static str> {
+        let rt = crate::runtime::backend();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let (net, ctr) = (format!("devsandbox-net-test-{nanos}"), format!("devsandbox-nettest-{nanos}"));
+        rt.output_quiet(&["pull", "-q", "alpine:3.20"]).map_err(|_| "cannot pull alpine:3.20")?;
+        rt.output_quiet(&["network", "create", "--subnet", "10.251.7.0/24", &net]).map_err(|_| "network create failed")?;
+        crate::test_support::with_cleanup(
+            || {
+                let _ = rt.output_quiet(&["rm", "-f", &ctr]);
+                let _ = rt.output_quiet(&["network", "rm", &net]);
+            },
+            || {
+                assert!(rt.network_names().unwrap().contains(&net));
+                assert_eq!(rt.network_subnets(&[&net]).unwrap(), ["10.251.7.0/24"]);
+                assert!(!rt.network_in_use(&net).unwrap());
+                rt.output_quiet(&["create", "--name", &ctr, "--network", &net, "alpine:3.20", "true"]).unwrap();
+                assert!(rt.network_in_use(&net).unwrap(), "a stopped container is attached");
+            },
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn network_subnets_parse_docker_and_podman() {
+        let docker = r#"[{"Name":"a","IPAM":{"Config":[{"Subnet":"192.168.0.0/20","Gateway":"192.168.0.1"},{"Subnet":"fd00::/64"}]}},
+                        {"Name":"none","IPAM":{"Config":null}}]"#;
+        assert_eq!(parse_network_subnets(docker).unwrap(), ["192.168.0.0/20", "fd00::/64"]);
+        let podman = r#"[{"name":"b","subnets":[{"subnet":"10.89.0.0/24","gateway":"10.89.0.1"}]},{"name":"host"}]"#;
+        assert_eq!(parse_network_subnets(podman).unwrap(), ["10.89.0.0/24"]);
+        assert!(parse_network_subnets("nope").is_err());
     }
 }

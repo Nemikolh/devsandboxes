@@ -9,7 +9,9 @@ Code: `src/commands/services.rs` (`project_id`, `network_name`,
 `instance_network`, `service_container`, `isolated_service_container`,
 `ensure_services`, `ensure_service`, `service_image`, `build_args`,
 `service_run_args`, `prefer_same_host_ports`, `check_port_conflicts`,
-`service_refs`, `gc`, `rebuild`, `ls`), `src/commands/stop.rs`
+`ensure_network`, `service_refs`, `gc`, `rebuild`, `ls`),
+`src/commands/subnet.rs` (`host_nets`, `conflict`, `free_subnets`),
+`src/commands/stop.rs`
 (`service_containers`), `src/commands/rm.rs` (`remove_container`),
 `src/snapshot.rs` (`service_rows`).
 
@@ -39,7 +41,8 @@ Called by `materialize` (before the instance container is created), by
 `start`, and by `service rebuild`. For each listed service:
 
 1. `resolve_service` (exactly one of `image` / `build`).
-2. Create the scope's network if missing.
+2. Create the scope's network if missing (`ensure_network`, see
+   [networks](#networks)).
 3. `ensure_service`: exists → warn on drift, `start` if stopped; absent →
    create. Creating builds a `build` service into
    `devsandbox-img-svc-<project>-<name>` (`service_image_tag`; `build_args`,
@@ -51,6 +54,27 @@ Called by `materialize` (before the instance container is created), by
 
 It returns the networks the instance joins and the `ServiceEndpoint`s
 (`alias` = service name) it must resolve.
+
+## Networks
+
+`ensure_network` creates a missing network with the runtime's own subnet
+pick, then checks that pick against what the host reaches (`host_nets`):
+every up non-default route and every gateway in `/proc/net/route` (Linux),
+and the non-loopback nameservers of `/run/systemd/resolve/resolv.conf` and
+`/etc/resolv.conf`. A rootless runtime can't see the host's routes, so it
+can hand out a range that covers the LAN (`192.168.0.0/20` on a
+`192.168.1.0/24` LAN). The empty bridge's route then takes the host's
+gateway and DNS away from every container. The network's own bridge route,
+which rootful runtimes add to the host, equals its subnet exactly and
+doesn't count (`conflict`).
+
+On overlap, the network is removed and recreated with `--subnet` set to the
+first `/24` of `10.200.0.0/16` (`subnet::FALLBACK`) that is clear of the
+host and of every existing network's subnet (`free_subnets`). It tries up
+to 3 candidates, warns with the conflicting route, gateway or nameserver,
+and fails, pointing at the runtime's `default-address-pools`, when none
+works. Subnets come from `Backend::network_subnets`; Apple `container`
+reports none, so the check is skipped there.
 
 ## Reaching a service
 
@@ -85,11 +109,12 @@ config and whose container is running, or that are mid-`run` (in flight).
 - Removes this project's service containers not referenced: a global one no
   live instance lists, an isolated one whose instance isn't live or no longer
   lists it.
-- Network sweep: lists `network ls -q` and matches entries by name prefix,
-  dropping `devsandbox-net-<project>` when no live instance uses a global
-  service and each `devsandbox-net-<project>-<id>` whose instance isn't live
-  (`network rm` failures ignored). docker prints network IDs for `-q`, so on
-  docker no network matches and gc removes none.
+- Network sweep: lists network names (`Backend::network_names`), dropping
+  `devsandbox-net-<project>` when no live instance uses a global service
+  and each `devsandbox-net-<project>-<id>` whose instance isn't live, either
+  only once no container, stopped ones included, is attached
+  (`Backend::network_in_use`; docker would otherwise remove a network from
+  under a stopped container). A failed `network rm` is a warning.
 - Also reaps orphaned shell-history dirs under
   `shared-volumes/history/` (confirmed per entry unless `--force`) and
   dangling `<data-dir>/devsandbox/agent/<id>.sock` links.

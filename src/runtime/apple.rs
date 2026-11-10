@@ -88,6 +88,21 @@ impl ManagedContainer {
     }
 }
 
+/// Whether any container in a `ls --format json` array names `network` in its
+/// attachments: `status.networks` (a running one's) or
+/// `configuration.networks` (what a stopped one rejoins), as objects with a
+/// `network` key or bare names.
+fn attached_to(json: &str, network: &str) -> Result<bool> {
+    let containers: Vec<serde_json::Value> = serde_json::from_str(json).context("unexpected `container` JSON")?;
+    Ok(containers.iter().any(|c| {
+        ["/status/networks", "/configuration/networks"]
+            .iter()
+            .filter_map(|p| c.pointer(p)?.as_array())
+            .flatten()
+            .any(|a| a.as_str().or_else(|| a.get("network")?.as_str()) == Some(network))
+    }))
+}
+
 fn parse_containers(json: &str) -> Result<Vec<ManagedContainer>> {
     serde_json::from_str(json).context("unexpected `container` JSON")
 }
@@ -189,6 +204,10 @@ impl Backend for AppleContainer {
 
     fn network_exists(&self, network: &str) -> Result<bool> {
         Ok(self.output_quiet(&["network", "inspect", network]).is_ok())
+    }
+
+    fn network_in_use(&self, network: &str) -> Result<bool> {
+        attached_to(&self.output_quiet(&["ls", "--all", "--format", "json"])?, network)
     }
 
     fn inspect_json(&self, container: &str) -> Result<String> {
@@ -497,6 +516,16 @@ mod tests {
         assert!(row.is_running());
         assert_eq!(row.label("devsandbox.config_hash"), Some("abc"));
         assert_eq!(row.host_ports, vec!["5432"]);
+    }
+
+    #[test]
+    fn attached_to_reads_status_and_configuration() {
+        assert!(attached_to(INSPECT, "devsandbox-net-p").unwrap());
+        assert!(!attached_to(INSPECT, "devsandbox-net-q").unwrap());
+        let stopped = r#"[{"id":"x","configuration":{"networks":[{"network":"n1"},"n2"]},"status":{"state":"stopped"}}]"#;
+        assert!(attached_to(stopped, "n1").unwrap());
+        assert!(attached_to(stopped, "n2").unwrap());
+        assert!(!attached_to("[]", "n1").unwrap());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::container_drifted;
+use super::{container_drifted, subnet};
 use crate::commands::status::Envelope;
 use crate::config::{build_hash, short_hash, Build, Config, ResolvedService, ServiceScope};
 use crate::render::{bold_cyan, dim, green, magenta, yellow};
@@ -47,14 +47,54 @@ pub fn service_image_tag(project: &str, name: &str) -> String {
     format!("{NAME_PREFIX}img-svc-{project}-{name}")
 }
 
-/// Create the given network if it does not already exist.
+/// Create the given network if it does not already exist. A new network
+/// whose subnet covers something the host reaches (a route, its gateway, a
+/// nameserver) is recreated on a free /24 of [`subnet::FALLBACK`]: its
+/// bridge route would otherwise take that traffic from every container
+/// (rootless runtimes can't see the host's routes when they pick).
 pub fn ensure_network(network: &str) -> Result<()> {
     if backend().network_exists(network)? {
         return Ok(());
     }
     backend()
         .run_checked(&["network", "create", network])
-        .with_context(|| format!("cannot create network `{network}` (services need runtime network support)"))
+        .with_context(|| format!("cannot create network `{network}` (services need runtime network support)"))?;
+    let host = subnet::host_nets();
+    // Best-effort: a network whose subnets can't be read is kept as is.
+    let subnets = backend().network_subnets(&[network]).unwrap_or_default();
+    let Some((got, hit)) = subnets
+        .iter()
+        .filter_map(|s| subnet::Net::parse(s))
+        .find_map(|n| subnet::conflict(n, &host, true).map(|hit| (n, hit)))
+    else {
+        return Ok(());
+    };
+    backend()
+        .output_quiet(&["network", "rm", network])
+        .with_context(|| format!("network `{network}` got {got}, which overlaps the host's {hit}; removing it failed"))?;
+
+    let names = backend().network_names()?;
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let taken: Vec<subnet::Net> =
+        backend().network_subnets(&names)?.iter().filter_map(|s| subnet::Net::parse(s)).collect();
+    // A few tries: a concurrent create may take a candidate first.
+    let mut last = None;
+    for candidate in subnet::free_subnets(&taken, &host).take(3) {
+        let cidr = candidate.to_string();
+        match backend().output_quiet(&["network", "create", "--subnet", &cidr, network]) {
+            Ok(_) => {
+                eprintln!("warning: network `{network}` got {got}, which overlaps the host's {hit}; recreated on {cidr}");
+                return Ok(());
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let why = last.map(|e| format!(" ({e:#})")).unwrap_or_default();
+    bail!(
+        "network `{network}` got {got}, which overlaps the host's {hit}, and no /24 of {} could replace it{why}; \
+         set the runtime's `default-address-pools` to ranges clear of the host's networks",
+        subnet::FALLBACK
+    )
 }
 
 /// Ensure the networks exist and every service the sandbox declares is up:
@@ -524,10 +564,10 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
     }
 
     // Drop networks nothing needs: the shared net once no live instance uses a
-    // global service, and each instance net whose instance is gone.
+    // global service, and each instance net whose instance isn't live; either
+    // only once no container, stopped ones included, is still attached.
     let global_net = network_name(&project);
-    let nets = backend().output(&["network", "ls", "-q"])?;
-    for net in nets.lines().map(str::trim).filter(|l| l.starts_with(global_net.as_str())) {
+    for net in backend().network_names()? {
         let drop = if net == global_net {
             global_refs.is_empty()
         } else if let Some(instance) = net.strip_prefix(&format!("{global_net}-")) {
@@ -535,8 +575,12 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
         } else {
             false
         };
-        if drop {
-            let _ = backend().run_inherit(&["network", "rm", net]);
+        // A failed check keeps the network.
+        if drop && !backend().network_in_use(&net).unwrap_or(true) {
+            match backend().output_quiet(&["network", "rm", &net]) {
+                Ok(_) => println!("removed network {net}"),
+                Err(e) => eprintln!("warning: cannot remove network `{net}`: {e:#}"),
+            }
         }
     }
 
