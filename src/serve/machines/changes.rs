@@ -964,7 +964,19 @@ mod tests {
         });
         crate::serve::dts::assert_variant("MembershipHubProposed", &r);
         assert_eq!(r, json!({"type": "proposed", "name": "box", "authority": "lap", "id": 1, "error": null}));
-        assert_eq!(call(&pair.k_dir, "membership.hub", json!({"name": "box"})).unwrap()["id"], 1, "pending: the same id");
+        // The repeat may still land in that last cycle: retried the same way.
+        let mut again = Value::Null;
+        wait_for("K's repeat reaches L", Duration::from_secs(10), || match call(&pair.k_dir, "membership.hub", json!({"name": "box"})) {
+            Ok(v) => {
+                again = v;
+                true
+            }
+            Err((code, message)) => {
+                assert_eq!(code, "failed", "{message}");
+                false
+            }
+        });
+        assert_eq!(again["id"], 1, "pending: the same id");
         let pending = call(&pair.l_dir, "membership.pending", json!({})).unwrap();
         assert_eq!(pending.as_array().unwrap().len(), 1, "{pending}");
         assert_eq!((&pending[0]["from"], &pending[0]["op"]), (&json!("box"), &json!({"kind": "hub", "name": "box"})));
