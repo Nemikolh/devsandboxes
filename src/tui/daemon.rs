@@ -2,9 +2,10 @@
 //! worker thread that owns the [`Conn`], so the UI thread never waits on the
 //! socket or on a lazy start (up to 5 s).
 //!
-//! It connects lazily, subscribes to `inbox`, `instances` and `forwards`,
-//! and forwards what the daemon says as [`DaemonUpdate`]s the event loop
-//! drains. Holding the connection makes the dashboard a holder, so the worker
+//! It connects lazily, subscribes to `inbox`, `instances`, `forwards` and
+//! `opens`, and forwards what the daemon says as [`DaemonUpdate`]s the event
+//! loop drains (`opens.done`, what became of a URL a container opened, is a
+//! status line). Holding the connection makes the dashboard a holder, so the worker
 //! reconnects after a `closing`, an EOF or an error, on the [`Backoff`]
 //! schedule; after a version handoff it first waits for the successor
 //! without starting one (see [`open`]).
@@ -700,7 +701,7 @@ fn watch_call(dir: &Path) -> (&'static str, Value) {
 /// watch fails the connect, as a dashboard without its pushes isn't one.
 fn open(connect: &Connector, dir: &Path, after_handoff: bool) -> Result<Conn> {
     let mut conn = connect(after_handoff)?;
-    let r = conn.call("subscribe", json!({ "topics": ["inbox", "instances", "forwards"] }))?;
+    let r = conn.call("subscribe", json!({ "topics": ["inbox", "instances", "forwards", "opens"] }))?;
     if let Some(e) = r.error {
         anyhow::bail!("subscribe: {} ({})", e.message, e.code);
     }
@@ -723,6 +724,18 @@ fn snapshot_update(mut params: Value) -> DaemonUpdate {
     match (serde_json::from_value::<InstancesList>(params), machines) {
         (Ok(list), Ok(machines)) => DaemonUpdate::Snapshot(list, machines),
         (Err(e), _) | (_, Err(e)) => DaemonUpdate::Status(format!("bad instances.snapshot: {e}")),
+    }
+}
+
+/// A notification that is just a status line (its `line`): `inbox.shown`
+/// as [`DaemonUpdate::Shown`], `forwards.status` and `opens.done` as
+/// [`DaemonUpdate::Status`]. `None`: no `line`, or another method.
+fn line_update(method: &str, params: &Value) -> Option<DaemonUpdate> {
+    let line = params.get("line").and_then(Value::as_str)?.to_string();
+    match method {
+        "inbox.shown" => Some(DaemonUpdate::Shown(line)),
+        "forwards.status" | "opens.done" => Some(DaemonUpdate::Status(line)),
+        _ => None,
     }
 }
 
@@ -843,14 +856,9 @@ impl Worker<'_> {
             "instances.snapshot" => self.send(snapshot_update(note.params)),
             "instances.changed" => self.send(DaemonUpdate::InstancesChanged),
             "forwards.changed" => self.fetch_ports(),
-            "forwards.status" => {
-                if let Some(line) = note.params.get("line").and_then(Value::as_str) {
-                    self.send(DaemonUpdate::Status(line.to_string()));
-                }
-            }
-            "inbox.shown" => {
-                if let Some(line) = note.params.get("line").and_then(Value::as_str) {
-                    self.send(DaemonUpdate::Shown(line.to_string()));
+            "forwards.status" | "opens.done" | "inbox.shown" => {
+                if let Some(update) = line_update(&note.method, &note.params) {
+                    self.send(update);
                 }
             }
             "closing" => {
@@ -1675,6 +1683,25 @@ mod tests {
         });
         let DaemonUpdate::Snapshot(_, machines) = snapshot_update(federated) else { panic!("not parsed") };
         assert_eq!((machines[0].name.as_str(), machines[0].error.as_deref()), ("box", Some("refused")));
+    }
+
+    /// The daemon's own `opens.done` params (`serve::opens::DoneParams`)
+    /// become the status line as sent.
+    #[test]
+    fn line_notifications_are_status_lines() {
+        use crate::open::{OpenDone, Outcome};
+        let done = OpenDone { instance: "web".into(), url: "https://x".into(), profile: None, outcome: Outcome::Failed("no display on this host".into()) };
+        let params = serde_json::to_value(crate::serve::opens::DoneParams::new(&done)).unwrap();
+        let status = |m: &str, p: &Value| match line_update(m, p) {
+            Some(DaemonUpdate::Status(l)) => Some(format!("status {l}")),
+            Some(DaemonUpdate::Shown(l)) => Some(format!("shown {l}")),
+            _ => None,
+        };
+        assert_eq!(status("opens.done", &params).as_deref(), Some("status web: open failed: no display on this host"));
+        assert_eq!(status("forwards.status", &json!({"line": "3000: refused"})).as_deref(), Some("status 3000: refused"));
+        assert_eq!(status("inbox.shown", &json!({"instance": "a", "line": "a: hi"})).as_deref(), Some("shown a: hi"));
+        assert_eq!(status("opens.done", &json!({})), None, "no line");
+        assert_eq!(status("instances.changed", &json!({"line": "x"})), None);
     }
 
     #[test]

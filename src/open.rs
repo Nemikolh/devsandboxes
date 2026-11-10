@@ -51,22 +51,120 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// Why a record isn't opened (the [`Outcome::Refused`] text); `None`
+    /// for [`Verdict::Open`].
+    pub fn refusal(&self) -> Option<String> {
+        Some(match self {
+            Verdict::Open => return None,
+            Verdict::BadScheme(s) if s.is_empty() => "not a URL with a scheme".to_string(),
+            Verdict::BadScheme(s) => format!("scheme `{s}` (http and https only)"),
+            Verdict::Expired { age } => format!("queued {age}s ago (over {}s)", OPEN_TTL.as_secs()),
+            Verdict::Limited => format!("rate limit ({OPEN_RATE_BURST} per {}s)", OPEN_RATE_REFILL.as_secs()),
+        })
+    }
+
     /// The `serve.log` line for a refusal or drop, naming `instance` and
     /// `url`; `None` for [`Verdict::Open`].
     pub fn log_line(&self, instance: &str, url: &str) -> Option<String> {
-        let why = match self {
-            Verdict::Open => return None,
-            Verdict::BadScheme(s) if s.is_empty() => "refused, not a URL with a scheme".to_string(),
-            Verdict::BadScheme(s) => format!("refused, scheme `{s}` (http and https only)"),
-            Verdict::Expired { age } => format!("dropped, queued {age}s ago (over {}s)", OPEN_TTL.as_secs()),
-            Verdict::Limited => format!(
-                "refused, rate limit ({OPEN_RATE_BURST} per {}s)",
-                OPEN_RATE_REFILL.as_secs()
-            ),
-        };
-        Some(format!("{instance}: open {why}: {url}"))
+        let why = self.refusal()?;
+        let verb = if matches!(self, Verdict::Expired { .. }) { "dropped" } else { "refused" };
+        Some(format!("{instance}: open {verb}, {why}: {url}"))
     }
 }
+
+/// What became of one open, for the user (`opens.done`,
+/// docs/reference/api.md): each open ends in exactly one, reported by the
+/// host that knows: the instance's host for a refusal at intake or a failed
+/// delivery, the opening host for the rest ([`open_here`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The opener was started. `unforwarded`: loopback ports the URL needed
+    /// that couldn't be forwarded (an OAuth callback port taken, say); the
+    /// URL opened anyway, so this is still one `opened` line, naming them.
+    Opened { unforwarded: Vec<Loopback> },
+    /// The policy said no ([`Verdict::refusal`]).
+    Refused(String),
+    /// Nothing could open it: no display, no opener, a failed spawn, a
+    /// delivery the member didn't take.
+    Failed(String),
+}
+
+/// One open's [`Outcome`], with what it was about: `instance` as the line
+/// names it (`machine/name` for an instance on another member), `url` the one
+/// opened (rewritten to a forward's port) or, when nothing opened, the one
+/// given, `profile` the name it carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDone {
+    pub instance: String,
+    pub url: String,
+    pub profile: Option<String>,
+    pub outcome: Outcome,
+}
+
+/// The longest URL a [`OpenDone::line`] shows whole: a status line is one
+/// row, and an OAuth URL easily runs to a kilobyte.
+const LINE_URL: usize = 120;
+
+/// The longest reason a [`OpenDone::line`] shows whole (a member's refusal
+/// may quote the URL).
+const LINE_WHY: usize = 160;
+
+/// `s` cut to `max` chars, ending in `…` when cut.
+fn shorten(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max.saturating_sub(1)) {
+        Some((at, _)) if s.chars().count() > max => format!("{}…", &s[..at]),
+        _ => s.to_string(),
+    }
+}
+
+impl OpenDone {
+    /// The wire's `outcome`: `opened`, `refused` or `failed`.
+    pub fn kind(&self) -> &'static str {
+        match self.outcome {
+            Outcome::Opened { .. } => "opened",
+            Outcome::Refused(_) => "refused",
+            Outcome::Failed(_) => "failed",
+        }
+    }
+
+    /// The wire's `why`: the refusal or failure, or for an open the ports
+    /// it couldn't forward (`None` when there are none).
+    pub fn why(&self) -> Option<String> {
+        match &self.outcome {
+            Outcome::Opened { unforwarded } if unforwarded.is_empty() => None,
+            Outcome::Opened { unforwarded } => {
+                let ports: Vec<String> = unforwarded
+                    .iter()
+                    .map(|l| format!("{}port {}", if l.callback { "callback " } else { "" }, l.port))
+                    .collect();
+                Some(format!("cannot forward {}", ports.join(", ")))
+            }
+            Outcome::Refused(why) | Outcome::Failed(why) => Some(why.clone()),
+        }
+    }
+
+    /// The status line: `web: opened https://… (work)`, with `; cannot
+    /// forward callback port 8085` when a port didn't forward; `web: open
+    /// refused: <why>`; `web: open failed: <why>`. The URL and the reason are
+    /// [`shorten`]ed.
+    pub fn line(&self) -> String {
+        let why = self.why().map(|w| shorten(&w, LINE_WHY));
+        match (&self.outcome, why) {
+            (Outcome::Opened { .. }, why) => {
+                let profile = self.profile.as_ref().map_or(String::new(), |p| format!(" ({p})"));
+                let note = why.map_or(String::new(), |w| format!("; {w}"));
+                format!("{}: opened {}{profile}{note}", self.instance, shorten(&self.url, LINE_URL))
+            }
+            (Outcome::Refused(_), why) => format!("{}: open refused: {}", self.instance, why.unwrap_or_default()),
+            (Outcome::Failed(_), why) => format!("{}: open failed: {}", self.instance, why.unwrap_or_default()),
+        }
+    }
+}
+
+/// Gets every [`OpenDone`] this host reports. The daemon's pushes
+/// `opens.done` (`serve::opens`); a seam, so this module stays free of
+/// `serve` (unix-only) and tests record them.
+pub type OnDone = Arc<dyn Fn(OpenDone) + Send + Sync>;
 
 /// Decide whether `url`, queued at `at` (unix seconds), opens at `now` (unix
 /// seconds). Checked in order: the scheme (`http`/`https`, any case,
@@ -374,16 +472,19 @@ pub type Forwarder = Arc<dyn Fn(&ForwardTarget, Loopback) -> Result<u16, Option<
 /// to the direct port's bound host port when that differs, and off a
 /// `0.0.0.0` host ([`rewrite_direct`]). Anything that fails (no target, a
 /// forward refused) leaves that port as it was and is a log line naming
-/// `instance` and `url`; the URL still opens.
+/// `instance` and `url` (unless the forwarder logged it, `Err(None)`); the
+/// URL still opens. Third: every port that didn't forward, for the
+/// [`Outcome::Opened`] line.
 pub fn forward_loopbacks(
     instance: &str,
     url: &str,
     target: Result<&ForwardTarget, &str>,
     forward: impl Fn(&ForwardTarget, Loopback) -> Result<u16, Option<String>>,
-) -> (String, Vec<String>) {
+) -> (String, Vec<String>, Vec<Loopback>) {
     let wanted = loopback_ports(url);
     let direct = loopback_port(url);
     let mut lines = Vec::new();
+    let mut unforwarded = Vec::new();
     let mut bound = None;
     if !wanted.is_empty() {
         match target {
@@ -391,15 +492,18 @@ pub fn forward_loopbacks(
                 let ports: Vec<String> = wanted.iter().map(|l| l.port.to_string()).collect();
                 let s = if ports.len() > 1 { "s" } else { "" };
                 lines.push(format!("{instance}: cannot forward port{s} {} for {url} ({why}); opening it as is", ports.join(", ")));
+                unforwarded = wanted;
             }
             Ok(target) => {
                 for lb in wanted {
                     match forward(target, lb) {
                         Ok(host_port) if Some(lb.port) == direct => bound = Some(host_port),
-                        Ok(_) | Err(None) => {}
+                        Ok(_) => {}
+                        Err(None) => unforwarded.push(lb),
                         Err(Some(why)) => {
                             let what = if lb.callback { "callback port" } else { "port" };
                             lines.push(format!("{instance}: cannot forward {what} {} for {url}: {why}", lb.port));
+                            unforwarded.push(lb);
                         }
                     }
                 }
@@ -412,7 +516,7 @@ pub fn forward_loopbacks(
     } else {
         url.to_string()
     };
-    (opened, lines)
+    (opened, lines, unforwarded)
 }
 
 /// The session variables a browser on this host needs: the display
@@ -495,23 +599,32 @@ pub fn prepare(instance: &str, instance_id: &str, url: &str, log: fn(&str)) -> O
 /// callers run it on a thread of its own, so a bridge's handler or an API
 /// request never waits on it (nor on the forwards), like
 /// `desktop::notify_desktop`. No display, no known opener or a failed spawn
-/// is one `log` line naming the instance and the URL.
-pub fn open_here(job: OpenJob, forward: &Forwarder, log: fn(&str)) {
+/// is one `log` line naming the instance and the URL. Every open ends in
+/// one `done` ([`Outcome::Opened`] once the child is spawned, else
+/// [`Outcome::Failed`]), naming a delivered open's instance `machine/name`.
+pub fn open_here(job: OpenJob, forward: &Forwarder, log: fn(&str), done: &OnDone) {
     let OpenJob { instance, url, profile, target } = job;
+    let who = match &target {
+        Ok(ForwardTarget { machine: Some(m), .. }) => format!("{m}/{instance}"),
+        _ => instance.clone(),
+    };
+    let finish = |url: &str, outcome: Outcome| done(OpenDone { instance: who.clone(), url: url.to_string(), profile: profile.clone(), outcome });
     let os = std::env::consts::OS;
     let Some(env) = display_env(os) else {
-        return log(&format!("{instance}: no display to open {url} on"));
+        log(&format!("{instance}: no display to open {url} on"));
+        return finish(&url, Outcome::Failed("no display on this host".into()));
     };
     let profiles = profiles_path().and_then(|p| load_profiles(&p)).unwrap_or_else(|e| {
         log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
         HostProfiles::new()
     });
-    let (url, lines) = forward_loopbacks(&instance, &url, target.as_ref().map_err(String::as_str), &**forward);
+    let (url, lines, unforwarded) = forward_loopbacks(&instance, &url, target.as_ref().map_err(String::as_str), &**forward);
     for line in &lines {
         log(line);
     }
     let Some(argv) = open_argv(os, profile.as_deref(), &profiles, &url) else {
-        return log(&format!("{instance}: no opener on {os} for {url}"));
+        log(&format!("{instance}: no opener on {os} for {url}"));
+        return finish(&url, Outcome::Failed(format!("no opener on {os}")));
     };
     let spawned = Command::new(&argv[0])
         .args(&argv[1..])
@@ -522,9 +635,15 @@ pub fn open_here(job: OpenJob, forward: &Forwarder, log: fn(&str)) {
         .spawn();
     match spawned {
         Ok(mut child) => {
+            // Told before the wait: `xdg-open` may not exit until the
+            // browser does.
+            finish(&url, Outcome::Opened { unforwarded });
             let _ = child.wait();
         }
-        Err(e) => log(&format!("{instance}: cannot run `{}` to open {url}: {e}", argv[0])),
+        Err(e) => {
+            log(&format!("{instance}: cannot run `{}` to open {url}: {e}", argv[0]));
+            finish(&url, Outcome::Failed(format!("cannot run `{}`: {e}", argv[0])));
+        }
     }
 }
 
@@ -819,11 +938,11 @@ mod tests {
         let calls = Default::default();
         let t = local();
         let got = forward_loopbacks("web", "http://localhost:3000/x", Ok(&t), forwarding(&calls, |_| Ok(3001)));
-        assert_eq!(got, ("http://localhost:3001/x".to_string(), vec![]));
+        assert_eq!(got, ("http://localhost:3001/x".to_string(), vec![], vec![]));
         assert_eq!(calls.into_inner(), vec![(t.clone(), direct(3000))]);
 
         let got = forward_loopbacks("web", "http://localhost:3000/x", Ok(&t), |_: &ForwardTarget, lb: Loopback| Ok(lb.port));
-        assert_eq!(got, ("http://localhost:3000/x".to_string(), vec![]), "bound on the same port");
+        assert_eq!(got, ("http://localhost:3000/x".to_string(), vec![], vec![]), "bound on the same port");
 
         let got = forward_loopbacks("web", "http://0.0.0.0:8000/", Ok(&t), |_: &ForwardTarget, lb: Loopback| Ok(lb.port));
         assert_eq!(got.0, "http://localhost:8000/", "0.0.0.0 made localhost");
@@ -837,6 +956,7 @@ mod tests {
         let t = ForwardTarget { machine: Some("box".into()), dir: "/home/u/cfg".into(), instance: "web-1".into() };
         let got = forward_loopbacks("web-1", "http://localhost:3000/", Ok(&t), forwarding(&calls, |_| Err(Some("no machine named `box`".into()))));
         assert_eq!(got.1, vec!["web-1: cannot forward port 3000 for http://localhost:3000/: no machine named `box`".to_string()]);
+        assert_eq!(got.2, vec![direct(3000)]);
         assert_eq!(calls.into_inner(), vec![(t, direct(3000))]);
     }
 
@@ -846,14 +966,16 @@ mod tests {
         let t = local();
         let url = "https://github.com/login?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Fcb";
         let got = forward_loopbacks("web", url, Ok(&t), forwarding(&calls, |lb| Ok(lb.port)));
-        assert_eq!(got, (url.to_string(), vec![]));
+        assert_eq!(got, (url.to_string(), vec![], vec![]));
         assert_eq!(calls.into_inner(), vec![(t.clone(), callback(8085))]);
 
-        // A callback the forwarder already reported: no second line.
+        // A callback the forwarder already reported: no second log line,
+        // still unforwarded.
         let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(None));
-        assert_eq!(got, (url.to_string(), vec![]));
+        assert_eq!(got, (url.to_string(), vec![], vec![callback(8085)]));
         let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(Some("registry stopped".into())));
         assert_eq!(got.1, vec![format!("web: cannot forward callback port 8085 for {url}: registry stopped")]);
+        assert_eq!(got.2, vec![callback(8085)]);
     }
 
     #[test]
@@ -861,21 +983,62 @@ mod tests {
         let t = local();
         let url = "http://localhost:3000/";
         let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(Some("port 3000: nope".into())));
-        assert_eq!(got, (url.to_string(), vec![format!("web: cannot forward port 3000 for {url}: port 3000: nope")]));
+        assert_eq!(got, (url.to_string(), vec![format!("web: cannot forward port 3000 for {url}: port 3000: nope")], vec![direct(3000)]));
 
         let never = |_: &ForwardTarget, _| -> Result<u16, Option<String>> { panic!("nothing to forward to") };
         let got = forward_loopbacks("web", url, Err("no config root in state.toml"), never);
-        assert_eq!(got, (url.to_string(), vec![format!("web: cannot forward port 3000 for {url} (no config root in state.toml); opening it as is")]));
+        assert_eq!(
+            got,
+            (url.to_string(), vec![format!("web: cannot forward port 3000 for {url} (no config root in state.toml); opening it as is")], vec![direct(3000)])
+        );
         let got = forward_loopbacks("web", "http://0.0.0.0:3000/?callback=http://localhost:9", Err("not in state.toml"), never);
         assert_eq!(
             got,
             (
                 "http://localhost:3000/?callback=http://localhost:9".to_string(),
-                vec!["web: cannot forward ports 3000, 9 for http://0.0.0.0:3000/?callback=http://localhost:9 (not in state.toml); opening it as is".to_string()]
+                vec!["web: cannot forward ports 3000, 9 for http://0.0.0.0:3000/?callback=http://localhost:9 (not in state.toml); opening it as is".to_string()],
+                vec![direct(3000), callback(9)],
             ),
             "no target; 0.0.0.0 still made localhost"
         );
-        assert_eq!(forward_loopbacks("web", "https://example.com/", Err("x"), never), ("https://example.com/".to_string(), vec![]));
+        assert_eq!(forward_loopbacks("web", "https://example.com/", Err("x"), never), ("https://example.com/".to_string(), vec![], vec![]));
+    }
+
+    fn done(profile: Option<&str>, outcome: Outcome) -> OpenDone {
+        OpenDone { instance: "web".into(), url: "https://x.example/a".into(), profile: profile.map(Into::into), outcome }
+    }
+
+    #[test]
+    fn each_outcome_is_one_status_line() {
+        let opened = Outcome::Opened { unforwarded: vec![] };
+        assert_eq!(done(Some("work"), opened.clone()).line(), "web: opened https://x.example/a (work)");
+        assert_eq!(done(None, opened.clone()).line(), "web: opened https://x.example/a");
+        assert_eq!((done(None, opened).kind(), done(None, Outcome::Opened { unforwarded: vec![] }).why()), ("opened", None));
+        let blocked = done(Some("work"), Outcome::Opened { unforwarded: vec![callback(8085), direct(3000)] });
+        assert_eq!(blocked.line(), "web: opened https://x.example/a (work); cannot forward callback port 8085, port 3000");
+        assert_eq!(blocked.why().as_deref(), Some("cannot forward callback port 8085, port 3000"));
+
+        let why = Verdict::BadScheme("ssh".into()).refusal().unwrap();
+        let refused = done(None, Outcome::Refused(why));
+        assert_eq!((refused.kind(), refused.line().as_str()), ("refused", "web: open refused: scheme `ssh` (http and https only)"));
+        let failed = done(Some("work"), Outcome::Failed("no display on this host".into()));
+        assert_eq!((failed.kind(), failed.line().as_str()), ("failed", "web: open failed: no display on this host"));
+        assert_eq!(failed.why().as_deref(), Some("no display on this host"));
+    }
+
+    #[test]
+    fn long_urls_and_reasons_are_shortened_in_the_line_only() {
+        let url = format!("https://idp.example/auth?{}", "q".repeat(500));
+        let d = OpenDone { url: url.clone(), ..done(Some("work"), Outcome::Opened { unforwarded: vec![] }) };
+        let line = d.line();
+        let shown = line.strip_prefix("web: opened ").unwrap().strip_suffix(" (work)").unwrap();
+        assert_eq!(shown.chars().count(), LINE_URL);
+        assert!(shown.ends_with('…') && url.starts_with(shown.trim_end_matches('…')));
+        assert_eq!(d.url, url, "the wire keeps it whole");
+        let d = done(None, Outcome::Failed("é".repeat(400)));
+        assert_eq!(d.line().strip_prefix("web: open failed: ").unwrap().chars().count(), LINE_WHY);
+        assert_eq!(shorten("abc", 3), "abc");
+        assert_eq!(shorten("abcd", 3), "ab…");
     }
 
     #[test]

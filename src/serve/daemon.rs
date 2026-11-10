@@ -23,9 +23,10 @@
 //! which writes the flagged notifications.
 //! Flags coalesce (one pending `inbox.changed` however many writes; the
 //! host's sink posts `inbox.shown` the same way, latest line only, and the
-//! forward registry `forwards.changed` / `forwards.status`), so the
-//! queue is bounded by construction; every write to a connection, response
-//! or notification, goes through its one writer lock, and a client that
+//! forward registry `forwards.changed` / `forwards.status`; `opens.done`
+//! keeps the last [`OPENS_KEPT`]), so the queue is bounded by
+//! construction; every write to a connection, response or notification,
+//! goes through its one writer lock, and a client that
 //! doesn't drain its socket for [`WRITE_TIMEOUT`] is disconnected.
 //!
 //! `instances.watch` adds a config root to the connection's `Pending`; the
@@ -481,8 +482,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     if let Some(registry) = &registry {
         let _ = shared.forwards.set(registry.handle());
     }
-    let open_here =
-        opts.open_here.clone().unwrap_or_else(|| opens::open_here(opens::forwarder(registry.as_ref().map(Registry::handle)), log));
+    let on_open_done = open_done(&shared);
+    let open_here = opts.open_here.clone().unwrap_or_else(|| {
+        opens::open_here(opens::forwarder(registry.as_ref().map(Registry::handle)), log, Arc::clone(&on_open_done))
+    });
     let _ = shared.open_here.set(Arc::clone(&open_here));
     let host = opts.host.then(|| {
         let shared = Arc::clone(&shared);
@@ -512,18 +515,24 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             }),
             open_here,
+            done: Arc::clone(&on_open_done),
             log,
         });
+        let sink = crate::devsbd::bridge::SinkHooks {
+            on_shown: Some(Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line))),
+            opener,
+            on_open_done: Some(on_open_done),
+            log,
+        };
         Host::start(
             log,
-            Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line)),
+            sink,
             Box::new(move |running: &[String]| {
                 if let Some(sync) = &sync {
                     sync.sync(running.to_vec());
                 }
             }),
             observers,
-            opener,
         )
     });
     if let Some(host) = &host {
@@ -1438,6 +1447,13 @@ impl Shared {
         self.publish(Topic::Inbox, |p| p.shown = Some((instance.to_string(), line.clone())));
     }
 
+    /// `opens.done`, to `opens` subscribers: the last [`OPENS_KEPT`] of
+    /// them, so a burst of opens isn't one line.
+    fn publish_open(&self, done: &crate::open::OpenDone) {
+        let params = serde_json::to_value(opens::DoneParams::new(done)).unwrap_or_default();
+        self.publish(Topic::Opens, |p| p.push_open(params.clone()));
+    }
+
     /// `instances.snapshot` of root `dir`, to the connections watching it:
     /// `params` as is, or merged with the machines' rows for a `machines:
     /// true` watcher (merged once per asking peer: a link peer's own rows
@@ -1571,6 +1587,24 @@ impl Shared {
     }
 }
 
+/// The `opens.done` notifications a connection keeps while its notifier
+/// hasn't written them: opens are rare, but two in a burst are two lines,
+/// and a client that stops reading still costs a bounded few.
+const OPENS_KEPT: usize = 8;
+
+/// The daemon's `open::OnDone`: each outcome to `opens` subscribers
+/// ([`Shared::publish_open`]). Holds `shared` weakly: it ends up inside
+/// [`Shared::open_here`], and a strong one would keep a stopped daemon's
+/// `Shared` alive forever.
+fn open_done(shared: &Arc<Shared>) -> crate::open::OnDone {
+    let shared = Arc::downgrade(shared);
+    Arc::new(move |done: crate::open::OpenDone| {
+        if let Some(shared) = shared.upgrade() {
+            shared.publish_open(&done);
+        }
+    })
+}
+
 struct ConnEntry {
     /// For the drain's shutdown.
     stream: Stream,
@@ -1610,6 +1644,8 @@ struct Pending {
     forwards: bool,
     /// `forwards.status` with this line, the latest only.
     forwards_status: Option<String>,
+    /// `opens.done` params, oldest first, the last [`OPENS_KEPT`].
+    opens: Vec<Value>,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
     /// The connection holds a `links.inbound` announce (a `fleet-link
@@ -1634,6 +1670,14 @@ impl Pending {
         self.reach.as_ref().map(|(peer, _)| peer.name.clone())
     }
 
+    /// One more `opens.done`, the oldest dropped past [`OPENS_KEPT`].
+    fn push_open(&mut self, params: Value) {
+        if self.opens.len() == OPENS_KEPT {
+            self.opens.remove(0);
+        }
+        self.opens.push(params);
+    }
+
     fn any(&self) -> bool {
         self.inbox.is_some()
             || self.shown.is_some()
@@ -1641,6 +1685,7 @@ impl Pending {
             || !self.snapshots.is_empty()
             || self.forwards
             || self.forwards_status.is_some()
+            || !self.opens.is_empty()
             || self.closing.is_some()
             || self.cycle.is_some()
     }
@@ -1664,6 +1709,9 @@ impl Pending {
         }
         if let Some(line) = self.forwards_status.take() {
             out.push(Notification { method: "forwards.status".into(), params: json!({ "line": line }) });
+        }
+        for params in std::mem::take(&mut self.opens) {
+            out.push(Notification { method: "opens.done".into(), params });
         }
         if let Some(why) = self.cycle.take() {
             let params = match why {
@@ -3017,6 +3065,7 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
                         p.forwards = false;
                         p.forwards_status = None;
                     }
+                    Topic::Opens => p.opens.clear(),
                 }
             }
         }
@@ -3796,6 +3845,65 @@ pub(crate) mod tests {
         other.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
         line.clear();
         assert!(other.read_line(&mut line).is_err() || line.is_empty(), "{line}");
+    }
+
+    /// The daemon's `OnDone` pushes `opens.done` to `opens` subscribers
+    /// only, each open its own notification, typed as the npm package says.
+    #[test]
+    fn opens_subscribers_hear_every_outcome() {
+        use crate::open::{Loopback, OpenDone, Outcome};
+        let shared = Arc::new(Shared::new(v(1), scratch("opens-store").join("inbox.json"), scratch("opens-store").join("state.toml"), fake_join()));
+        let mut opens = subscribed(&shared, 1, json!(["opens"]));
+        let mut other = subscribed(&shared, 2, json!(["inbox", "instances", "forwards"]));
+        let done = open_done(&shared);
+        let at = |outcome| OpenDone { instance: "web".into(), url: "https://x.example/".into(), profile: Some("work".into()), outcome };
+        done(at(Outcome::Opened { unforwarded: vec![Loopback { port: 8085, callback: true }] }));
+        done(OpenDone { profile: None, ..at(Outcome::Refused("rate limit (5 per 10s)".into())) });
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let mut line = String::new();
+            opens.read_line(&mut line).unwrap();
+            let n: Notification = serde_json::from_str(&line).unwrap();
+            assert_eq!(n.method, "opens.done");
+            dts_check(&n);
+            crate::serve::dts::assert_matches("OpensDone", &n.params);
+            seen.push(n.params);
+        }
+        assert_eq!(
+            seen[0],
+            json!({"instance": "web", "url": "https://x.example/", "profile": "work", "outcome": "opened",
+                "why": "cannot forward callback port 8085",
+                "line": "web: opened https://x.example/ (work); cannot forward callback port 8085"})
+        );
+        assert_eq!(
+            seen[1],
+            json!({"instance": "web", "url": "https://x.example/", "profile": null, "outcome": "refused",
+                "why": "rate limit (5 per 10s)", "line": "web: open refused: rate limit (5 per 10s)"})
+        );
+        // Not subscribed to `opens`: nothing.
+        other.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut line = String::new();
+        assert!(other.read_line(&mut line).is_err() || line.is_empty(), "{line}");
+        // A stopped daemon's hook is a no-op, not a leak.
+        drop(shared);
+        done(at(Outcome::Failed("x".into())));
+    }
+
+    /// Unwritten `opens.done` pile up to [`OPENS_KEPT`], oldest dropped, and
+    /// go out in order; an unsubscribe drops them.
+    #[test]
+    fn pending_opens_keep_the_last_few_in_order() {
+        let mut p = Pending::default();
+        assert!(!p.any());
+        for n in 0..OPENS_KEPT + 3 {
+            p.push_open(json!({"n": n}));
+        }
+        assert!(p.any());
+        let out = p.take();
+        let ns: Vec<u64> = out.iter().map(|n| n.params["n"].as_u64().unwrap()).collect();
+        assert_eq!(ns, (3..OPENS_KEPT as u64 + 3).collect::<Vec<_>>());
+        assert!(out.iter().all(|n| n.method == "opens.done"));
+        assert!(!p.any() && p.take().is_empty());
     }
 
     #[test]

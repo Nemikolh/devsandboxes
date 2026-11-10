@@ -8,8 +8,14 @@
 //!   profile to send), then [`route`] over the instance's latest attach
 //!   (`serve::attaches`): this host ([`Route::Here`]) opens it with
 //!   `open::open_here`; a member ([`Route::Member`]) gets `open.deliver`
-//!   ([`DeliverParams`]). A failed delivery is a `serve.log` line, never a
-//!   local open: the user is at that member, not here.
+//!   ([`DeliverParams`]). A failed delivery (the member's refusal included)
+//!   is a `serve.log` line and a failed `opens.done` here, never a local
+//!   open: the user is at that member, not here.
+//! - **Feedback** ([`DoneParams`]): every open ends in one `opens.done`,
+//!   from the host that knows: the bridges' sink for a refusal at intake,
+//!   [`send`] for a failed delivery, `open::open_here` on the opening host
+//!   for the rest. A receiver's refusal goes back to the sender as the
+//!   call's error, so it is the sender's failed delivery.
 //! - **Receiving** ([`receive`], the daemon's `open.deliver`, from a fleet
 //!   peer only): strict params, the same `open::decide` policy again (with a
 //!   per-`(peer, instance)` limit), and only for an instance this host
@@ -28,7 +34,7 @@ use super::api::ApiError;
 use super::attaches::Origin;
 use super::forwards;
 use crate::devsbd::bridge::Opener;
-use crate::open::{self, ForwardTarget, Forwarder, Loopback, OpenJob};
+use crate::open::{self, ForwardTarget, Forwarder, Loopback, OnDone, OpenDone, OpenJob, Outcome};
 
 /// Opens a job on this host (`open::open_here` on a thread of its own, in
 /// production); a seam so the daemon's tests record the job instead.
@@ -75,26 +81,57 @@ pub struct Sender {
     pub latest: Arc<dyn Fn(&str) -> Option<Origin> + Send + Sync>,
     pub call_member: CallMember,
     pub open_here: OpenHere,
+    /// Told of a failed delivery (`opens.done`).
+    pub done: OnDone,
     pub log: fn(&str),
+}
+
+/// `opens.done`'s params: an [`OpenDone`] on the wire, `line` so clients
+/// show it without composing text (like `inbox.shown`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoneParams {
+    pub instance: String,
+    pub url: String,
+    pub profile: Option<String>,
+    /// `opened`, `refused` or `failed`.
+    pub outcome: &'static str,
+    pub why: Option<String>,
+    pub line: String,
+}
+
+impl DoneParams {
+    pub fn new(done: &OpenDone) -> DoneParams {
+        DoneParams {
+            instance: done.instance.clone(),
+            url: done.url.clone(),
+            profile: done.profile.clone(),
+            outcome: done.kind(),
+            why: done.why(),
+            line: done.line(),
+        }
+    }
+}
+
+fn failed(instance: &str, url: &str, profile: Option<String>, why: String) -> OpenDone {
+    OpenDone { instance: instance.to_string(), url: url.to_string(), profile, outcome: Outcome::Failed(why) }
 }
 
 /// The bridges' opener: [`send`] on a thread of its own per record, so the
 /// bridge's handler never waits on state, a link or a browser.
 pub fn opener(sender: Sender) -> Opener {
     Arc::new(move |instance: &str, instance_id: &str, url: &str| {
-        let log = sender.log;
-        let (sender, instance, instance_id, url) = (sender.clone(), instance.to_string(), instance_id.to_string(), url.to_string());
-        let spawned = std::thread::Builder::new()
-            .name("serve-open".into())
-            .spawn(move || send(&sender, &instance, &instance_id, &url));
+        let (log, done) = (sender.log, Arc::clone(&sender.done));
+        let (s, i, id, u) = (sender.clone(), instance.to_string(), instance_id.to_string(), url.to_string());
+        let spawned = std::thread::Builder::new().name("serve-open".into()).spawn(move || send(&s, &i, &id, &u));
         if let Err(e) = spawned {
             log(&format!("cannot start an open's thread: {e}"));
+            done(failed(instance, url, None, format!("cannot start an open's thread: {e}")));
         }
     })
 }
 
 /// One admitted `open` record from `instance` (`instance_id`): prepared,
-/// routed, opened here or delivered.
+/// routed, opened here or delivered (a failed delivery told to `done`).
 pub fn send(s: &Sender, instance: &str, instance_id: &str, url: &str) {
     let job = (s.prepare)(instance, instance_id, url);
     match route((s.latest)(instance_id)) {
@@ -106,6 +143,7 @@ pub fn send(s: &Sender, instance: &str, instance_id: &str, url: &str) {
             });
             if let Err(why) = delivered {
                 (s.log)(&format!("{instance}: cannot deliver {url} to {m}: {why}"));
+                (s.done)(failed(instance, url, job.profile, format!("cannot deliver to {m}: {why}")));
             }
         }
     }
@@ -197,13 +235,15 @@ pub fn forwarder(forwards: Option<forwards::Handle>) -> Forwarder {
 }
 
 /// The production [`OpenHere`]: `open::open_here` through `forward`, on a
-/// thread of its own.
-pub fn open_here(forward: Forwarder, log: fn(&str)) -> OpenHere {
+/// thread of its own, its outcome told to `done`.
+pub fn open_here(forward: Forwarder, log: fn(&str), done: OnDone) -> OpenHere {
     Arc::new(move |job: OpenJob| {
-        let forward = Arc::clone(&forward);
-        let spawned = std::thread::Builder::new().name("serve-open".into()).spawn(move || open::open_here(job, &forward, log));
+        let (forward, d) = (Arc::clone(&forward), Arc::clone(&done));
+        let (instance, url, profile) = (job.instance.clone(), job.url.clone(), job.profile.clone());
+        let spawned = std::thread::Builder::new().name("serve-open".into()).spawn(move || open::open_here(job, &forward, log, &d));
         if let Err(e) = spawned {
             log(&format!("cannot start an open's thread: {e}"));
+            done(failed(&instance, &url, profile, format!("cannot start an open's thread: {e}")));
         }
     })
 }
@@ -233,16 +273,18 @@ mod tests {
 
     type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
 
+    type Dones = Arc<Mutex<Vec<OpenDone>>>;
+
     /// A sender over fakes: `latest` is the instance's latest attach,
-    /// `answer` every member call's. Records the calls and the local opens;
-    /// log lines go to `LINES`.
+    /// `answer` every member call's. Records the calls, the local opens and
+    /// the outcomes told; log lines go to `LINES`.
     fn sender(
         target: Result<ForwardTarget, String>,
         latest: Option<Origin>,
         answer: Result<Value, String>,
-    ) -> (Sender, Calls, Arc<Mutex<Vec<OpenJob>>>) {
-        let (calls, opened): (Calls, Arc<Mutex<Vec<OpenJob>>>) = Default::default();
-        let (c, o) = (Arc::clone(&calls), Arc::clone(&opened));
+    ) -> (Sender, Calls, Arc<Mutex<Vec<OpenJob>>>, Dones) {
+        let (calls, opened, dones): (Calls, Arc<Mutex<Vec<OpenJob>>>, Dones) = Default::default();
+        let (c, o, d) = (Arc::clone(&calls), Arc::clone(&opened), Arc::clone(&dones));
         let s = Sender {
             prepare: Arc::new(move |_, _, _| job(target.clone())),
             latest: Arc::new(move |id| {
@@ -254,9 +296,10 @@ mod tests {
                 answer.clone()
             }),
             open_here: Arc::new(move |j| o.lock().unwrap().push(j)),
+            done: Arc::new(move |done| d.lock().unwrap().push(done)),
             log: record,
         };
-        (s, calls, opened)
+        (s, calls, opened, dones)
     }
 
     static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -272,34 +315,48 @@ mod tests {
     #[test]
     fn an_open_with_no_member_attach_opens_here() {
         for latest in [None, Some(Origin::Here)] {
-            let (s, calls, opened) = sender(Ok(local()), latest, Ok(json!({"ok": true})));
+            let (s, calls, opened, dones) = sender(Ok(local()), latest, Ok(json!({"ok": true})));
             send(&s, "web-1", "id-1", "http://localhost:3000/");
             assert_eq!(*opened.lock().unwrap(), vec![job(Ok(local()))]);
             assert!(calls.lock().unwrap().is_empty());
+            assert!(dones.lock().unwrap().is_empty(), "`open_here` tells its own");
         }
     }
 
     #[test]
     fn an_open_after_a_member_attach_is_delivered_there() {
-        let (s, calls, opened) = sender(Ok(local()), Some(Origin::Member("lap".into())), Ok(json!({"ok": true})));
+        let (s, calls, opened, dones) = sender(Ok(local()), Some(Origin::Member("lap".into())), Ok(json!({"ok": true})));
         send(&s, "web-1", "id-1", "http://localhost:3000/");
         let want = json!({"instance": "web-1", "root": "/cfg", "url": "http://localhost:3000/", "profile": "work"});
         assert_eq!(*calls.lock().unwrap(), vec![("lap".to_string(), "open.deliver".to_string(), want)]);
         assert!(opened.lock().unwrap().is_empty());
+        assert!(dones.lock().unwrap().is_empty(), "taken: the member tells its own");
     }
 
     #[test]
     fn a_failed_delivery_is_logged_and_never_opens_here() {
-        let (s, _, opened) =
+        let (s, _, opened, dones) =
             sender(Ok(local()), Some(Origin::Member("lap".into())), Err("open.deliver: nope (denied)".into()));
         send(&s, "web-1", "id-1", "https://a.example/");
         assert!(logged("web-1: cannot deliver https://a.example/ to lap: open.deliver: nope (denied)"));
         assert!(opened.lock().unwrap().is_empty(), "no fallback");
+        let told = dones.lock().unwrap().clone();
+        assert_eq!(
+            told,
+            vec![OpenDone {
+                instance: "web-1".into(),
+                url: "https://a.example/".into(),
+                profile: Some("work".into()),
+                outcome: Outcome::Failed("cannot deliver to lap: open.deliver: nope (denied)".into()),
+            }]
+        );
+        assert_eq!(told[0].line(), "web-1: open failed: cannot deliver to lap: open.deliver: nope (denied)");
 
-        let (s, calls, opened) = sender(Err("not in state.toml".into()), Some(Origin::Member("lap".into())), Ok(json!({})));
+        let (s, calls, opened, dones) = sender(Err("not in state.toml".into()), Some(Origin::Member("lap".into())), Ok(json!({})));
         send(&s, "gone", "id-1", "https://b.example/");
         assert!(logged("gone: cannot deliver https://b.example/ to lap: not in state.toml"));
         assert!(calls.lock().unwrap().is_empty() && opened.lock().unwrap().is_empty());
+        assert_eq!(dones.lock().unwrap()[0].line(), "gone: open failed: cannot deliver to lap: not in state.toml");
     }
 
     fn params() -> Value {

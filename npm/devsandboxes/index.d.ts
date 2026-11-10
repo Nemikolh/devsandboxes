@@ -516,7 +516,7 @@ export type ThreadState = 'needs-you' | 'active' | 'done';
 export type InboxView = 'needs-you' | 'active' | 'done' | 'all';
 
 /** A notification topic for `subscribe`. */
-export type ApiTopic = 'inbox' | 'instances' | 'forwards';
+export type ApiTopic = 'inbox' | 'instances' | 'forwards' | 'opens';
 
 /** One Inbox thread (`inbox.list()`), and the head of {@link ThreadDetail}. */
 export interface ThreadSummary {
@@ -1508,6 +1508,21 @@ export interface ForwardsStatus {
   line: string;
 }
 
+/** `opens.done` params: what became of one URL a container opened, told by the host that knows (the instance's host for a refusal at intake or a failed delivery, the opening host for the rest). */
+export interface OpensDone {
+  /** The instance, `machine/name` for one on another fleet member. */
+  instance: string;
+  /** The URL opened (rewritten to a forward's port), or the one given when nothing opened. */
+  url: string;
+  /** The profile it opened in; `null` for none, and for a refusal at intake. */
+  profile: string | null;
+  outcome: 'opened' | 'refused' | 'failed';
+  /** Why it was refused or failed; for `opened`, the loopback ports that couldn't be forwarded, else `null`. */
+  why: string | null;
+  /** The dashboard's status-line text. */
+  line: string;
+}
+
 /**
  * What every verb (`run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`) takes: the config
  * root and the env the verb runs with (the caller's whole env, never the
@@ -1692,6 +1707,8 @@ export interface ApiEvents {
   'instances.snapshot': InstancesSnapshot;
   'forwards.changed': {};
   'forwards.status': ForwardsStatus;
+  /** One open's outcome; needs the `opens` topic. */
+  'opens.done': OpensDone;
   /** A verb request's output; sent to its connection, no `subscribe` needed. */
   output: VerbOutput;
   /** A verb request's phase change; sent to its connection, no `subscribe` needed. */

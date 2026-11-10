@@ -60,12 +60,13 @@ works on the store alone.
 - **Daemon worker** (`DaemonWorker`): owns the long-lived connection
   (client `tui`), so the dashboard is a holder. Connects lazily (starting
   a daemon if none answers; after a version handoff it waits for the
-  successor first), subscribes to `inbox`, `instances`, `forwards`, and
-  watches this root (`instances.watch` with `machines: true`) on every
+  successor first), subscribes to `inbox`, `instances`, `forwards`,
+  `opens`, and watches this root (`instances.watch` with `machines: true`) on every
   (re)connect. Reconnects on the `Backoff` schedule (at once, then 1 s
   doubling to 30 s). Relays pushes as `DaemonUpdate`s
   (`Snapshot`, `Down`, `InboxChanged`, `InstancesChanged`, `Shown`,
-  `Ports`, …) and carries the one-shot `Cmd`s: `Fetch` (logs, config,
+  `Ports`, …; `forwards.status` and `opens.done` lines are `Status`,
+  `line_update`) and carries the one-shot `Cmd`s: `Fetch` (logs, config,
   inspect), `BuildLog`, `Signal`, `Rename`, `Done`, `Cancel`, `Inbox`
   ops, `ForwardAdd`/`ForwardRm`. Disconnected, each answers with a
   "needs devsandbox serve" line.

@@ -2679,7 +2679,8 @@ host:
    that member (`service::Handle::call_member`: its link, else a route).
 3. A delivery that fails (the member's refusal, no path to it) is one
    `serve.log` line, `<instance>: cannot deliver <url> to <member>:
-   <why>`, and **nothing opens here**: the user is at that member, so a
+   <why>`, a failed `opens.done` here (`open::Outcome::Failed`, the
+   receiver's refusal being the call's error), and **nothing opens here**: the user is at that member, so a
    browser on this host would open where nobody looks (or, on a server,
    nowhere).
 
@@ -2720,7 +2721,11 @@ URL's loopback ports into the sender's instance: open forwards with a
 tunnelled over the link to the sender
 ([forwards](forwards.md#open-forwards)), so a dev server or an OAuth
 callback on the container's localhost is reached from this host's
-browser.
+browser. What `open::open_here` makes of it (opened, or failed: no
+display, no opener) is an `opens.done` on **this** host, the instance
+named `<peer>/<instance>`: the user is here
+(docs/architecture/helper/bridges.md, *What the user sees*). A refusal
+isn't one here; the sender reports it.
 
 ### TUNNEL
 

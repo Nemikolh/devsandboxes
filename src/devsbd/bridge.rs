@@ -1243,6 +1243,11 @@ pub struct SinkHooks {
     /// See [`OnShown`]; `None` = nobody to tell.
     pub on_shown: Option<OnShown>,
     pub opener: Opener,
+    /// Gets every `open` record refused or dropped here, at intake
+    /// (`open::Outcome::Refused`, no profile: it isn't read yet); what
+    /// the opener does with the rest it reports itself. `None` = nobody to
+    /// tell.
+    pub on_open_done: Option<crate::open::OnDone>,
     /// One `serve.log` line: every refused or dropped `open` record.
     pub log: fn(&str),
 }
@@ -1256,8 +1261,9 @@ type Apply = fn(Notification) -> Result<Option<(String, crate::inbox::Shown)>, S
 /// An `open` record is taken before `apply`: [`crate::open::decide`] (scheme,
 /// [`crate::open::OPEN_TTL`], one per-instance limiter of
 /// [`crate::open::OPEN_RATE_BURST`] per [`crate::open::OPEN_RATE_REFILL`]),
-/// then the opener or a `log` line, and `Ok` either way: the `ok` reply means
-/// taken, not opened, and a refused URL isn't worth a resend.
+/// then the opener, or a `log` line and a refused `on_open_done`, and `Ok`
+/// either way: the `ok` reply means taken, not opened, and a refused URL
+/// isn't worth a resend.
 ///
 /// Anything else is `apply`'d (that store write is what the daemon's `ok`
 /// acknowledges, so a failed one is retried), shown on the desktop unless
@@ -1265,7 +1271,7 @@ type Apply = fn(Notification) -> Result<Option<(String, crate::inbox::Shown)>, S
 /// status line goes to `on_shown`.
 fn sink(apply: Apply, hooks: SinkHooks) -> Sink {
     use super::desktop::RateLimit;
-    let SinkHooks { on_shown, opener, log } = hooks;
+    let SinkHooks { on_shown, opener, on_open_done, log } = hooks;
     // One limiter of each for every bridge, keyed by instance inside.
     let popups = Mutex::new(RateLimit::default());
     let opens = Mutex::new(RateLimit::new(crate::open::OPEN_RATE_BURST, crate::open::OPEN_RATE_REFILL));
@@ -1276,9 +1282,15 @@ fn sink(apply: Apply, hooks: SinkHooks) -> Sink {
                 .map_or(0, |d| d.as_secs());
             let limit =
                 || opens.lock().unwrap_or_else(|e| e.into_inner()).allow(&n.instance, None, Instant::now());
-            match crate::open::decide(url, *at, now, limit).log_line(&n.instance, url) {
-                Some(line) => log(&line),
-                None => opener(&n.instance, &n.instance_id, url),
+            let verdict = crate::open::decide(url, *at, now, limit);
+            let (Some(line), Some(why)) = (verdict.log_line(&n.instance, url), verdict.refusal()) else {
+                opener(&n.instance, &n.instance_id, url);
+                return Ok(());
+            };
+            log(&line);
+            if let Some(done) = &on_open_done {
+                let outcome = crate::open::Outcome::Refused(why);
+                done(crate::open::OpenDone { instance: n.instance.clone(), url: url.clone(), profile: None, outcome });
             }
             return Ok(());
         }
@@ -1814,7 +1826,8 @@ mod tests {
 
     /// The production sink takes an `open` record before the Inbox: a fresh
     /// `https` one reaches the opener, an `ssh` one and a stale one only the
-    /// log, and each gets `ok` (taken). A plain notify still goes to `apply`.
+    /// log and a refused `on_open_done`, and each gets `ok` (taken). A plain
+    /// notify still goes to `apply`.
     #[test]
     fn open_records_reach_the_opener_never_the_inbox() {
         static APPLIED: Mutex<Vec<notify::Message>> = Mutex::new(Vec::new());
@@ -1825,11 +1838,14 @@ mod tests {
         }
         let (tx, opened) = mpsc::channel();
         let tx = Mutex::new(tx);
+        let dones: Arc<Mutex<Vec<crate::open::OpenDone>>> = Arc::default();
+        let d = Arc::clone(&dones);
         let hooks = SinkHooks {
             on_shown: None,
             opener: Arc::new(move |instance: &str, instance_id: &str, url: &str| {
                 let _ = tx.lock().unwrap().send((instance.to_string(), instance_id.to_string(), url.to_string()));
             }),
+            on_open_done: Some(Arc::new(move |done| d.lock().unwrap().push(done))),
             log: |line| LOGGED.lock().unwrap().push(line.to_string()),
         };
         let to = Services::new("web-1".into(), "web-1-id".into(), sink(apply, hooks), no_control());
@@ -1851,6 +1867,14 @@ mod tests {
         assert_eq!(logged.len(), 2, "{logged:?}");
         assert!(logged[0].starts_with("web-1: open refused, scheme `ssh`") && logged[0].ends_with("ssh://example.test"));
         assert!(logged[1].starts_with("web-1: open dropped") && logged[1].ends_with("https://example.test/old"));
+        // Refusals at intake are reported; the opened one is the opener's to
+        // report.
+        let dones = dones.lock().unwrap().clone();
+        assert_eq!(dones.len(), 2, "{dones:?}");
+        assert_eq!((dones[0].url.as_str(), dones[0].kind()), ("ssh://example.test", "refused"));
+        assert_eq!(dones[0].line(), "web-1: open refused: scheme `ssh` (http and https only)");
+        assert_eq!((dones[1].url.as_str(), dones[1].kind(), dones[1].profile.as_deref()), ("https://example.test/old", "refused", None));
+        assert!(dones[1].line().starts_with("web-1: open refused: queued 360"), "{}", dones[1].line());
         assert!(APPLIED.lock().unwrap().is_empty(), "no open reached the Inbox");
         let note = notify::Message::Notify(notify::Record {
             level: notify::Level::Info,
@@ -2277,6 +2301,7 @@ mod tests {
                 opener: Arc::new(move |instance: &str, _: &str, url: &str| {
                     let _ = tx.lock().unwrap().send((instance.to_string(), url.to_string()));
                 }),
+                on_open_done: None,
                 log: |line| panic!("open refused or dropped: {line}"),
             };
             let to = Services::new("open-test".into(), "open-test-id".into(), sink(apply, hooks), no_control());

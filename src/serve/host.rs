@@ -44,7 +44,7 @@ use super::capacity::HostCapacity;
 use super::events::{EVENTS_RETRY, EventWatcher};
 use super::capacity::Own;
 use super::snapshots::{self, Join, Snapshots};
-use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Opener, Readiness, SinkHooks};
+use crate::devsbd::bridge::{self, BridgeBoard, Bridges, Readiness, SinkHooks};
 use crate::runtime::{ContainerRow, NAME_PREFIX};
 use crate::snapshot::RuntimeView;
 use crate::state::State;
@@ -153,13 +153,14 @@ pub struct Host {
 
 impl Host {
     /// Start the poll (bridges) and autostart threads. `log` writes one
-    /// `serve.log` line; `on_shown` gets each stored container message's
-    /// status line (the API's `inbox.shown`); `on_running` gets each poll's
-    /// running containers (the forward registry's sync; it must not block);
-    /// `observers` the watched roots the poll collects snapshots for;
-    /// `opener` what the bridges' sink hands each admitted `open` record
-    /// (the daemon's routes it, `serve::opens`).
-    pub fn start(log: fn(&str), on_shown: OnShown, on_running: OnRunning, observers: Observers, opener: Opener) -> Host {
+    /// `serve.log` line; `sink` is the bridges' sink's hooks: `on_shown`
+    /// gets each stored container message's status line (the API's
+    /// `inbox.shown`), `opener` each admitted `open` record (the daemon's
+    /// routes it, `serve::opens`), `on_open_done` each one refused at intake
+    /// (`opens.done`); `on_running` gets each poll's running containers (the
+    /// forward registry's sync; it must not block); `observers` the watched
+    /// roots the poll collects snapshots for.
+    pub fn start(log: fn(&str), sink: SinkHooks, on_running: OnRunning, observers: Observers) -> Host {
         let stop: Shared = Arc::default();
         let board = BridgeBoard::default();
         // A failed bridge unsettles the board: wake the poll so it drops to
@@ -175,7 +176,7 @@ impl Host {
             let (stop, live, changes, board) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes), board.clone());
             std::thread::Builder::new()
                 .name("serve-poll".into())
-                .spawn(move || poll(&stop, &live, &changes, log, on_shown, on_running, &observers, opener, board))
+                .spawn(move || poll(&stop, &live, &changes, log, sink, on_running, &observers, board))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -258,14 +259,12 @@ fn poll(
     live: &AtomicUsize,
     changes: &AtomicU64,
     log: fn(&str),
-    on_shown: OnShown,
+    sink: SinkHooks,
     on_running: OnRunning,
     observers: &Observers,
-    opener: Opener,
     board: BridgeBoard,
 ) {
-    let hooks = SinkHooks { on_shown: Some(on_shown), opener, log };
-    let worker = Bridges::spawn_worker(Some(hooks), board.clone());
+    let worker = Bridges::spawn_worker(Some(sink), board.clone());
     let rt = crate::runtime::backend();
     // Declared after `worker`, so it drops (child killed, thread joined) first.
     let events = {

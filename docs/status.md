@@ -24,7 +24,9 @@ limitation means editing this file in the same commit.
   shipped: a URL opens on the member that last attached to the instance
   (`open.deliver`, mapped by that member's `profiles.toml`), its
   localhost ports and OAuth callbacks forwarded into the instance on the
-  sending member first. Next: dashboard feedback (step 6).
+  sending member first. Step 6 shipped: `opens.done` says what became
+  of each open (opened, refused, failed), shown on the dashboard's
+  status line.
   → [plan](plans/active/open-routing.md)
 
 ## Planned

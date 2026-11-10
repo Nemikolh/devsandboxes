@@ -146,7 +146,9 @@ host's clock and a limiter:
   by a record that passed the other two.
 
 A refused or dropped record is a `serve.log` line naming the instance and the
-URL (`Verdict::log_line`, through `SinkHooks::log`). One that passes goes to
+URL (`Verdict::log_line`, through `SinkHooks::log`) and a refused
+`open::OpenDone` to `SinkHooks::on_open_done` (`Verdict::refusal`, no
+profile: none is read yet). One that passes goes to
 the `SinkHooks::opener` (`bridge::Opener`, called with the instance's name,
 its `instance_id` and the URL; injectable so tests see the URL).
 Either way the sink returns `Ok` and the daemon gets `ok`: taken, not opened.
@@ -175,6 +177,30 @@ A session that doesn't import it needs `systemctl --user import-environment
 DISPLAY WAYLAND_DISPLAY XAUTHORITY` once per login. No display anywhere,
 no known opener or a failed spawn is a `serve.log` line too (`no display to
 open <url> on`).
+
+#### What the user sees: `opens.done`
+
+Every open ends in one `open::OpenDone` (an `open::Outcome`: opened,
+refused or failed), told to an `open::OnDone` by the host that knows, and
+pushed by its daemon as `opens.done` to `opens` subscribers
+(`Shared::publish_open`, [api](../../reference/api.md#subscribe--unsubscribe));
+the dashboard shows its `line` (`OpenDone::line`) as the status line:
+
+- the instance's host: a refusal at intake (above), and a delivery to a
+  member that failed (`serve::opens::send`; a member's refusal of
+  `open.deliver` comes back as the call's error, so it shows here, where
+  the open came from);
+- the opening host (`open::open_here`): opened once the command is
+  spawned (`web: opened https://… (work)`), else failed (no display, no
+  opener, the spawn's error). A delivered open names its instance
+  `machine/name`.
+
+Ports that didn't forward don't make an open fail (the URL still opens):
+they ride on its one `opened` line (`; cannot forward callback port
+8085`), as `forward_loopbacks` returns them. That includes a callback port
+the registry couldn't bind, whose own `forwards.status` line the `opened`
+one would otherwise replace on the status line. Each keeps its
+`serve.log` line.
 
 #### Loopback forwards
 

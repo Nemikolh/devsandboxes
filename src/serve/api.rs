@@ -197,6 +197,8 @@ pub enum Topic {
     /// `forwards.changed`: the forwards' rows changed, re-fetch; and
     /// `forwards.status` lines.
     Forwards,
+    /// `opens.done`: what became of each URL a container opened.
+    Opens,
 }
 
 impl Topic {
@@ -205,6 +207,7 @@ impl Topic {
             "inbox" => Some(Topic::Inbox),
             "instances" => Some(Topic::Instances),
             "forwards" => Some(Topic::Forwards),
+            "opens" => Some(Topic::Opens),
             _ => None,
         }
     }
@@ -220,7 +223,7 @@ pub fn topics(params: Value) -> Result<Vec<Topic>, ApiError> {
     let p: TopicsParams = parse(params)?;
     p.topics
         .iter()
-        .map(|t| Topic::parse(t).ok_or_else(|| ApiError::invalid(format!("unknown topic `{t}` (inbox, instances, forwards)"))))
+        .map(|t| Topic::parse(t).ok_or_else(|| ApiError::invalid(format!("unknown topic `{t}` (inbox, instances, forwards, opens)"))))
         .collect()
 }
 
@@ -2664,8 +2667,8 @@ mod tests {
     #[test]
     fn topics_parse_and_reject_unknown_ones() {
         assert_eq!(
-            topics(json!({"topics":["inbox","instances","forwards"]})).unwrap(),
-            [Topic::Inbox, Topic::Instances, Topic::Forwards]
+            topics(json!({"topics":["inbox","instances","forwards","opens"]})).unwrap(),
+            [Topic::Inbox, Topic::Instances, Topic::Forwards, Topic::Opens]
         );
         assert_eq!(topics(json!({"topics":["ports"]})).unwrap_err().code, "invalid");
         assert_eq!(topics(Value::Null).unwrap_err().code, "invalid");

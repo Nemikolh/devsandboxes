@@ -141,8 +141,8 @@ per request and uncached, for the CLI and scripts.
 
 ## Notifications
 
-`subscribe {topics}` / `unsubscribe`: `inbox`, `instances`, `forwards`
-(`Topic`). A connection's first `subscribe` starts its `serve-notify-<n>`
+`subscribe {topics}` / `unsubscribe`: `inbox`, `instances`, `forwards`,
+`opens` (`Topic`). A connection's first `subscribe` starts its `serve-notify-<n>`
 thread. One daemon-wide `serve-watch` thread (`Watcher`) notices changes
 (this process's store writes at once, other processes' within `WATCH`,
 500 ms, by file stamp; `state.toml` by its stamp; the poll's `changes`) and
@@ -150,7 +150,8 @@ only *flags* them on each subscribed connection's `Outbox`; it does no
 I/O, so a slow client can't stall the others. Flags coalesce in `Pending`:
 one `inbox.changed {generation}` however many writes, latest `inbox.shown`,
 one `instances.changed`, latest `instances.snapshot` per root,
-`forwards.changed`, latest `forwards.status`. Every write to a connection
+`forwards.changed`, latest `forwards.status`, the last 8 `opens.done`
+(`OPENS_KEPT`; each open is its own line). Every write to a connection
 goes through its one writer lock; a client that doesn't drain its socket
 for `WRITE_TIMEOUT` (5 s) is disconnected. Exiting, the daemon sends
 `closing {reason}` ([role.md](role.md#drain)).
