@@ -12,11 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **machines**: a fleet driven from a laptop with no runtime: the
-  signer proposes a joining host's introduction, `machine add` on the
-  authority signs its configs, a run from the authority brings the
-  repos over `TRANSFER`, a host with no runtime is a clean driver.
-  → [plan](plans/active/fleet-driver.md)
+Nothing.
 
 ## Planned
 
@@ -679,9 +675,10 @@ is frozen: no new work on it.
   `${…}` folders, folders inside the copy (`folder = "."`), nested
   folders, absolute ones, or a checkout with a detached `HEAD`; a
   `landed` checkout's WIP isn't applied again, its checked-out branch
-  only fast-forwarded on a clean tree. Parked: a
-  clone from `origin` when the authority has no checkout, and
-  fetch-back for these runs.
+  only fast-forwarded on a clean tree; a run's `--branch` goes to the
+  first folder `mesh.folders` answers, which is a `folders` value when
+  the sandbox has no `folder`. Parked: a clone from `origin` when the
+  authority has no checkout, and fetch-back for these runs.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `code::folders::classify`, `code::folders::receivers`
 - Temp files a crash leaves in `mesh/bundles/` and `mesh/` (a store's,
   an install's unpacking dir, a pull's) are never cleaned up.

@@ -1,6 +1,9 @@
+> Archived 2026-11-11. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/fleet.md](../../architecture/daemon/fleet.md), [ADR 0050](../../decisions/0050-machine-add-on-the-authority-signs-its-configs.md)
+
 # Fleet driver: a server runs it, a laptop drives it
 
-Status: in progress. Builds on [fleet](fleet.md) steps 1-12
+Status: shipped. Built on [fleet](../active/fleet.md) steps 1-12
 ([fleet](../../architecture/daemon/fleet.md),
 [machines](../../architecture/daemon/machines.md), ADRs
 [0044](../../decisions/0044-one-fleet-authority-signs-membership.md),
