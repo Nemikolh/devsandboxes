@@ -383,7 +383,8 @@ pub enum ConfigSigned {
     Resent { root: String, version: u64, unpushed: Vec<Missed> },
     Failed { root: String, error: String },
     /// This host is in a fleet but isn't its authority `authority`: what
-    /// it types signs nothing.
+    /// it types signs nothing. Never for a root that is a signed config
+    /// already ([`sign_config`], [`authority_elsewhere`]).
     NotAuthority { root: String, authority: String },
 }
 
@@ -442,12 +443,19 @@ impl ConfigSigned {
 }
 
 /// The fleet's authority, when this host is in a fleet (a membership log)
-/// but isn't it: what it types signs no config ([`sign_config`]).
-pub fn authority_elsewhere(ctx: &Ctx) -> Option<String> {
+/// but isn't it, and `name` (a machine's root's name) is no config in that
+/// log: what it types signs no config ([`sign_config`]). A name the log
+/// has is a config the authority signs, which the machine runs from its
+/// copy: the setup order is right, nothing to say. The name alone decides,
+/// not where the machine's path is: this host can't know that machine's
+/// data dir, so a `mesh/tree/` check on its path would be a guess.
+pub fn authority_elsewhere(ctx: &Ctx, name: &str) -> Option<String> {
     let path = leave::member_toml(ctx).ok()?;
     let (me, key) = membership_api::own(path, &ctx.hostname).ok()?;
     let stored = membership_api::load(path).ok()??;
-    stored.log.membership()?;
+    if stored.log.membership()?.config.contains_key(name) {
+        return None;
+    }
     match leave::authority_of(Some(&stored), &me, &key.public_key()) {
         Authority::Other(a) => Some(a.to_string()),
         Authority::This | Authority::None => None,
@@ -473,7 +481,9 @@ pub fn bound_root(ctx: &Ctx, name: &str) -> Option<PathBuf> {
 /// is stored again and the log pushed again (`Resent`; `None` with no
 /// links): a machine whose last install failed, or that the last push
 /// missed, retries it now, and one that has it answers at once. `NotAuthority` when
-/// this host is in a fleet whose authority is another member. A config
+/// this host is in a fleet whose authority is another member, unless
+/// `root` is a signed config's copy here ([`mesh::copy_of`], the copy
+/// itself): that one is signed, by the authority. A config
 /// that doesn't load is `Failed`, nothing signed. So is a name bound to
 /// another root: the first canonical path a name is signed from keeps it
 /// ([`mesh::bind`], recorded before that first entry is signed).
@@ -489,6 +499,10 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     crate::config::find(root).ok()??;
     let name = root.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     if let Authority::Other(a) = authority {
+        let data = path.parent().expect("member.toml has a parent");
+        if mesh::copy_of(data, root).is_some_and(|(_, exact)| exact) {
+            return None;
+        }
         return Some(ConfigSigned::NotAuthority { root: name.into(), authority: a.into() });
     }
     if let Err(e) = membership::check_root_name(name) {
@@ -1151,7 +1165,9 @@ mod tests {
     /// config file sign nothing. The first sign binds `cfg` to the root's
     /// path; another root named `cfg` is refused, nothing signed. A verb
     /// for machine `box` signs the local root bound to its remote root's
-    /// name; a name with no binding, nothing.
+    /// name; a name with no binding, nothing. K says it isn't the
+    /// authority, except for a signed config: its copy of `cfg`, or a verb
+    /// for a machine whose root is named `cfg`.
     #[test]
     fn the_authoritys_verbs_sign_config_versions() {
         let pair = pair("changes-config", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
@@ -1209,7 +1225,15 @@ mod tests {
             ["note: config `cfg` not signed: the fleet's authority is `lap`, not this host, and configs here aren't signed"]
         );
         assert_eq!(verb_notes(&pair.k_dir, "start", params.clone()).1, Vec::<String>::new(), "once per root");
+        let copy = mesh::tree_path(&pair.base.join("k-data"), "cfg");
+        assert!(copy.join("devsandboxes.toml").is_file(), "v1 installed on K");
+        let (answered, notes) = verb_notes(&pair.k_dir, "start", json!({"root": copy, "env": {}, "instance": "nope"}));
+        assert!(answered.is_some());
+        assert_eq!(notes, Vec::<String>::new(), "K's copy of a signed config: nothing said");
         let for_lap = |root: &str| json!({"root": root, "env": {}, "instance": "nope", "machine": "lap"});
+        let (answered, notes) = verb_notes(&pair.k_dir, "start", for_lap("/far/mesh/tree/cfg"));
+        assert!(answered.is_some());
+        assert_eq!(notes, Vec::<String>::new(), "a machine's root named like a signed config: nothing said");
         let (answered, notes) = verb_notes(&pair.k_dir, "start", for_lap("/far/other"));
         assert!(answered.is_some());
         assert_eq!(

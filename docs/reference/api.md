@@ -1049,8 +1049,10 @@ versions*): a `run`, `rebuild` or `start` output starts with `stderr`
 lines saying what signing did: ``note: signed config `<name>` v<N>``
 and ``note: `<machine>` doesn't have config `<name>` v<N>: <why>`` per
 machine the push missed, ``note: config `<name>` not signed: <why>``,
-or, once per root per daemon on a member that isn't the authority (a
-verb with `machine` too, its root by name),
+or, once per root per daemon on a member that isn't the authority, for
+a root that isn't a signed config (a local root that isn't its copy
+under `mesh/tree/`; with `machine`, a root whose name isn't a config in
+this host's log),
 ``note: config `<name>` not signed: the fleet's authority is
 `<authority>`, not this host, and configs here aren't signed``.
 

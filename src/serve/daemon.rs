@@ -2753,12 +2753,14 @@ fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) -> R
 /// (`changes::bound_root`, the root's last component); unbound, nothing.
 /// On a member that isn't the authority, bound or not, the verb is told
 /// so (`NotAuthority`, once per root name): a host only the authority
-/// binds names on is where a wrong setup order shows.
+/// binds names on is where a wrong setup order shows. Not for a name the
+/// log signs (`changes::authority_elsewhere`): that's the machine's copy
+/// of a signed config.
 fn sign_remote_config(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState) {
     use machines::changes::{self, ConfigSigned};
     let Some(ctx) = shared.machines.as_ref() else { return };
     let Some(name) = params["root"].as_str().and_then(|r| Path::new(r).file_name()).and_then(|n| n.to_str()) else { return };
-    if let Some(authority) = changes::authority_elsewhere(ctx) {
+    if let Some(authority) = changes::authority_elsewhere(ctx, name) {
         let signed = ConfigSigned::NotAuthority { root: name.into(), authority };
         return say_signed(id, &signed, name, shared, conn);
     }
@@ -3419,7 +3421,8 @@ pub(crate) mod tests {
     }
 
     /// Not the authority: said once per root; a sign or a failure every
-    /// time.
+    /// time. (A signed config's root is never `NotAuthority`: see
+    /// `changes`' `the_authoritys_verbs_sign_config_versions`.)
     #[test]
     fn not_the_authority_is_said_once_per_root() {
         use machines::changes::ConfigSigned;

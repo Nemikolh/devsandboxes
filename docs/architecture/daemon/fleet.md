@@ -2008,9 +2008,16 @@ it never signs on a remote request alone (decision 49;
   (`daemon::sign_remote_config` over `changes::bound_root`); a name with
   no binding signs nothing. Nothing is bundled off the authority or in
   no fleet. On a member that isn't the authority, a local root with a
-  config file is `ConfigSigned::NotAuthority`, and so is any verb aimed
-  at a machine, bound name or not (`changes::authority_elsewhere`), said
-  once per root per daemon process (`daemon::config_notes`,
+  config file is `ConfigSigned::NotAuthority` unless it is a signed
+  config's copy here (`mesh::copy_of`, the copy itself;
+  `changes::sign_config`), and so is any verb aimed at a machine, bound
+  name or not, unless its root's last component is a config name in
+  this host's log (`changes::authority_elsewhere`: that machine runs the
+  authority's signed copy; the name decides, as this host can't know
+  the machine's data dir). The note catches a wrong setup order (a
+  config typed on a host the user took for the authority), so it is
+  said only for a name the log doesn't sign, once per root per daemon
+  process (`daemon::config_notes`,
   `Shared::told_not_authority`; a local root by its path, a machine's
   by its name): ``note: config `<name>` not signed: the fleet's
   authority is `<authority>`, not this host, and configs here aren't
