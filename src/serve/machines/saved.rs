@@ -6,7 +6,7 @@
 //!
 //! Only the pieces `snapshots::merge` can't get from the registry are saved
 //! (the rows, their time, the machine's version and its roots as last
-//! listed, in order); kind, target and the rest come from `machines.toml`
+//! listed, in order, with their default); kind, target and the rest come from `machines.toml`
 //! as for any machine. The restored roots and rows stay until the
 //! machine's link lists again (`service::LinkLoop::apply_roots`). A file
 //! of another [`VERSION`], or one that doesn't parse, is ignored and
@@ -49,6 +49,9 @@ pub struct SavedMachine {
     /// Its roots as its link last listed them (`snapshots::Machine::roots`).
     #[serde(default)]
     pub roots: Vec<PathBuf>,
+    /// The default among them (`snapshots::Machine::default_root`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_root: Option<PathBuf>,
     /// Remote root → its last `instances.snapshot` params.
     #[serde(default)]
     pub rows: BTreeMap<PathBuf, Value>,
@@ -72,7 +75,8 @@ pub fn of(machines: &[Machine], now: u64) -> Saved {
         .filter(|m| !m.rows.is_empty() || m.version.is_some())
         .map(|m| {
             let rows = m.rows.iter().map(|(root, params)| (root.clone(), (**params).clone())).collect();
-            (m.name.clone(), SavedMachine { at: m.seen.unwrap_or(now), version: m.version.clone(), roots: m.roots.clone(), rows })
+            let (version, roots, default_root) = (m.version.clone(), m.roots.clone(), m.default_root.clone());
+            (m.name.clone(), SavedMachine { at: m.seen.unwrap_or(now), version, roots, default_root, rows })
         })
         .collect();
     Saved { version: VERSION, machines }
@@ -90,6 +94,7 @@ pub fn machines(saved: Saved) -> Vec<Machine> {
             name,
             version: s.version,
             roots: s.roots,
+            default_root: s.default_root,
             rows: s.rows.into_iter().map(|(root, params)| (root, Arc::new(params))).collect(),
             seen: Some(s.at),
             restored: true,
@@ -169,7 +174,8 @@ mod tests {
         assert_eq!(load(&path).unwrap(), Saved::default(), "missing: empty");
         let rows = json!({"dir": "/r", "instances": [{"name": "web-1"}], "runtime_name": "docker"});
         let never = Machine { name: "never".into(), ..Machine::default() };
-        let saved = of(&[machine("lap", &[("/r", rows.clone())], Some(1_761_550_000)), machine("box", &[], None), never], 42);
+        let lap = Machine { default_root: Some("/r".into()), ..machine("lap", &[("/r", rows.clone())], Some(1_761_550_000)) };
+        let saved = of(&[lap, machine("box", &[], None), never], 42);
         assert_eq!(saved.machines["lap"].roots, [PathBuf::from("/r")]);
         assert_eq!(saved.machines.keys().collect::<Vec<_>>(), ["box", "lap"], "nothing to save of `never`");
         assert_eq!(saved.machines["box"].at, 42, "no push yet: now");
@@ -177,7 +183,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let file: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(file["version"], VERSION);
-        assert_eq!(file["machines"]["lap"], json!({"at": 1_761_550_000u64, "version": "0.6.0", "roots": ["/r"], "rows": {"/r": rows}}));
+        assert_eq!(file["machines"]["lap"], json!({"at": 1_761_550_000u64, "version": "0.6.0", "roots": ["/r"], "default_root": "/r", "rows": {"/r": rows}}));
         assert!(dir.join("remotes.lock").exists());
         assert_eq!(load(&path).unwrap(), saved);
         let _ = std::fs::remove_dir_all(&dir);

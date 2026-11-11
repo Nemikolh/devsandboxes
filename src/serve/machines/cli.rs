@@ -56,7 +56,7 @@ pub(crate) enum MachineUse {
     /// `verbs_client` forwards it.
     Verb,
     /// `port --service <global-svc>` with no instance name: forwarded here
-    /// from the machine's first root ([`Routed::Port`]).
+    /// from the machine's default root ([`Routed::Port`]).
     Port,
     /// A command taking a `<name>`: qualify the name instead.
     Named,
@@ -323,8 +323,27 @@ pub(crate) fn choose(name: &str, mut found: Vec<Found>, tty: bool, pick: &mut Pi
     }
 }
 
+/// A machine as `machines.get` describes it: its entry, and the root a
+/// command on it that names none takes, or why there's none
+/// (`super::no_default_root`).
+#[derive(Debug)]
+pub(crate) struct Info {
+    pub entry: Entry,
+    pub default_root: Result<PathBuf, String>,
+}
+
+impl Info {
+    /// `root` (the instance's own there), else the machine's default root.
+    pub(crate) fn root_or_default(&self, root: Option<PathBuf>) -> Result<PathBuf> {
+        match root {
+            Some(root) => Ok(root),
+            None => self.default_root.clone().map_err(anyhow::Error::msg),
+        }
+    }
+}
+
 /// A machine as `machines.get` describes it.
-pub(crate) fn machine_info(call: &mut dyn FnMut(&str, Value) -> Result<crate::serve::proto::Response>, m: &str) -> Result<Entry> {
+pub(crate) fn machine_info(call: &mut dyn FnMut(&str, Value) -> Result<crate::serve::proto::Response>, m: &str) -> Result<Info> {
     machine_info_with(call, m, None)
 }
 
@@ -335,7 +354,7 @@ fn machine_info_with(
     call: &mut dyn FnMut(&str, Value) -> Result<crate::serve::proto::Response>,
     m: &str,
     own_agent: Option<PathBuf>,
-) -> Result<Entry> {
+) -> Result<Info> {
     let r = call("machines.get", info_params(m, own_agent))?;
     if let Some(e) = r.error {
         if e.code == "not-found" {
@@ -346,7 +365,8 @@ fn machine_info_with(
     let info: MachineInfo =
         serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad machines.get result from devsandbox serve")?;
     let kind = super::Kind::from_wire(info.kind, info.target).with_context(|| format!("machine `{m}`"))?;
-    Ok(Entry { name: info.name, kind, roots: info.roots, command: info.command })
+    let default_root = info.default_root.ok_or_else(|| super::no_default_root(m, &info.roots, info.listed));
+    Ok(Info { entry: Entry { name: info.name, kind, roots: info.roots, command: info.command }, default_root })
 }
 
 // ---- reconnecting a tty exec ------------------------------------------------
@@ -514,19 +534,12 @@ pub(crate) fn service_mode(command: &Command) -> Option<pty_client::Mode> {
     Some(pty_client::Mode::Service { name: name.clone(), argv: command.clone() })
 }
 
-/// Instance `name`'s config root on machine `m`, which every `PTY` dial
-/// and named call needs.
-fn root_on<'a>(m: &str, root: Option<&'a Path>) -> Result<&'a Path> {
-    root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))
-}
-
-/// The dials of session exec `command` (an `Exec`) in session `id` on
-/// machine `m`, instance `name` at `root` there: the first creating the
+/// The dials of session exec `command` (an `Exec`) in session `id` on a
+/// machine, instance `name` at `root` there: the first creating the
 /// session running the command (none: the login shell) or attaching to it,
 /// every re-dial attaching only (a reconnect never starts a second program).
-pub(crate) fn dials(m: &str, command: &Command, name: &str, root: Option<&Path>, id: &str) -> Result<(pty_client::Request, pty_client::Request)> {
+pub(crate) fn dials(command: &Command, name: &str, root: &Path, id: &str) -> Result<(pty_client::Request, pty_client::Request)> {
     let Command::Exec { command, .. } = command else { bail!("not an exec") };
-    let root = root_on(m, root)?;
     let request = |create| pty_client::Request {
         root: root.to_path_buf(),
         instance: name.to_string(),
@@ -683,7 +696,7 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
         Plan::Machine(m, usage) => {
             let mut conn = connect().context("--machine needs devsandbox serve")?;
             let own_agent = crate::devsbd::bridge::own_agent();
-            let entry = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
+            let info = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
             match usage {
                 MachineUse::Calls => {
                     let u = calls::use_of(&command);
@@ -691,14 +704,14 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
                     let call = &mut |method: &str, params| conn.call(method, params);
                     let code = match u {
                         calls::Use::Ps { .. } | calls::Use::Stats { .. } => calls::listing(call, &u, &m, &mut out)?,
-                        _ => calls::per_root(call, &u, &m, &entry.roots, &mut out, &mut err)?,
+                        _ => calls::per_root(call, &u, &m, &info.entry.roots, &mut out, &mut err)?,
                     };
                     Ok(Routed::Exit(code))
                 }
                 MachineUse::Port => {
                     drop(conn);
-                    let root = root_on(&m, entry.roots.first().map(PathBuf::as_path))?.to_path_buf();
-                    routed_port(command, entry, root, None)
+                    let root = info.root_or_default(None)?;
+                    routed_port(command, info.entry, root, None)
                 }
                 MachineUse::Verb | MachineUse::Named | MachineUse::Refused(_) => unreachable!("plan never routes these"),
             }
@@ -745,7 +758,7 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         crate::commands::pick(prompt, &refs)
     })? {
         Some(found) => found,
-        // A machine's container: as typed, at its first root.
+        // A machine's container: as typed, at its default root.
         None if qualified && containers => Found { name: name.clone(), machine: None, root: None, sandbox: None },
         None if !qualified => return Ok(Routed::Here(command)),
         None => bail!("{}", crate::commands::no_instance_matches(name_of(&command).unwrap_or_default())),
@@ -755,20 +768,20 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         (None, _) => return Ok(Routed::Here(renamed(command, chosen.name))),
     };
     let own_agent = crate::devsbd::bridge::own_agent();
-    let entry = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
+    let info = machine_info_with(&mut |method, params| conn.call(method, params), &m, own_agent)?;
     let u = calls::use_of(&command);
     if let calls::Use::Refused(what) = u {
         return Err(calls::refusal(&m, what));
     }
+    // The instance's own root there, else (a container, an older daemon's
+    // match) the machine's default.
+    let root = info.root_or_default(chosen.root.clone())?;
     if matches!(command, Command::Port { .. }) {
         drop(conn);
-        let root = chosen.root.clone().or_else(|| entry.roots.first().cloned());
-        let root = root_on(&m, root.as_deref())?.to_path_buf();
-        return routed_port(command, entry, root, Some(chosen.name));
+        return routed_port(command, info.entry, root, Some(chosen.name));
     }
-    let root = chosen.root.as_deref().or(entry.roots.first().map(PathBuf::as_path));
+    let root = root.as_path();
     if u != calls::Use::Link {
-        let root = root_on(&m, root)?;
         let tty = std::io::stdout().is_terminal();
         let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
         let call = &mut |method: &str, params| conn.call(method, params);
@@ -783,7 +796,7 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
     let attach = |mode: &pty_client::Mode| records_attach(mode).then(|| client::attach_hold(&chosen.name, Some(&m))).flatten();
     let one_dial = |mode: pty_client::Mode| -> Result<Routed> {
-        let request = pty_client::Request { root: root_on(&m, root)?.to_path_buf(), instance: chosen.name.clone(), mode };
+        let request = pty_client::Request { root: root.to_path_buf(), instance: chosen.name.clone(), mode };
         let _attach = attach(&request.mode);
         Ok(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, &m, &request, reserve_255)))
     };
@@ -806,7 +819,7 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     }
     drop(conn);
     if let Some(id) = reconnect_session(&command, terminal, || crate::commands::exec::mint_session_id(crate::state::Instance::now()))? {
-        let (first, again) = dials(&m, &command, &chosen.name, root, &id)?;
+        let (first, again) = dials(&command, &chosen.name, root, &id)?;
         let _attach = attach(&first.mode);
         let dir = endpoint::socket_dir()?;
         return reconnect_loop(&id, |redial| Ok(pty_client::dial(&dir, &m, if redial { &again } else { &first }, true)));
@@ -843,7 +856,7 @@ fn session_exec(
     conn: &mut Conn,
     m: &str,
     name: &str,
-    root: Option<&Path>,
+    root: &Path,
     terminal: bool,
 ) -> Result<Option<SessionExec>> {
     let Command::Exec { attach, sessions, .. } = command else { return Ok(None) };
@@ -851,7 +864,6 @@ fn session_exec(
         return Ok(None);
     }
     let key = format!("{m}/{name}");
-    let root = root_on(m, root)?;
     let mut list = || -> Result<Vec<String>> {
         let r = conn.call("sessions.list", json!({ "root": root, "instance": name, "machine": m }))?;
         if let Some(e) = r.error {
@@ -1262,19 +1274,45 @@ mod tests {
     /// login shell), then attach only, both at the instance's root there.
     #[test]
     fn tty_execs_dial_over_the_link() {
-        let root = Some(Path::new("/w/fleet/hub/cfg"));
+        let root = Path::new("/w/fleet/hub/cfg");
         let exec = command(&["exec", "-it", "box/web", "zidane", "-c"]);
         let request = |create: Option<Vec<String>>| pty_client::Request {
             root: "/w/fleet/hub/cfg".into(),
             instance: "web-2".into(),
             mode: pty_client::Mode::Session { id: ID.into(), create },
         };
-        assert_eq!(dials("box", &exec, "web-2", root, ID).unwrap(), (request(Some(ms(&["zidane", "-c"]))), request(None)));
-        let shell = dials("box", &command(&["exec", "box/web"]), "web-2", root, ID).unwrap();
+        assert_eq!(dials(&exec, "web-2", root, ID).unwrap(), (request(Some(ms(&["zidane", "-c"]))), request(None)));
+        let shell = dials(&command(&["exec", "box/web"]), "web-2", root, ID).unwrap();
         assert_eq!(shell, (request(Some(Vec::new())), request(None)));
-        let e = dials("box", &exec, "web-2", None, ID).unwrap_err().to_string();
-        assert_eq!(e, "machine `box` has no config roots (devsandbox machine ls)");
-        assert!(dials("box", &command(&["logs", "web"]), "web", root, ID).is_err());
+        assert!(dials(&command(&["logs", "web"]), "web", root, ID).is_err());
+    }
+
+    /// A command on a machine takes the instance's root there, else the
+    /// machine's default (`machines.get`'s), else fails with why: nothing
+    /// listed yet, or several roots none of which is the default.
+    #[test]
+    fn a_command_takes_the_machines_default_root() {
+        let info = |v: Value| {
+            let mut answer = Some(v);
+            let call = &mut |_: &str, _| Ok(crate::serve::proto::Response { id: None, result: answer.take(), error: None });
+            machine_info(call, "box").unwrap()
+        };
+        let base = json!({"name": "box", "kind": "ssh", "target": "box", "command": null, "agent": false});
+        let with = |extra: Value| {
+            let mut v = base.clone();
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            info(v)
+        };
+        let listed = with(json!({"roots": ["/a", "/t/cfg"], "default_root": "/t/cfg", "listed": true}));
+        assert_eq!(listed.root_or_default(None).unwrap(), PathBuf::from("/t/cfg"));
+        assert_eq!(listed.root_or_default(Some("/a".into())).unwrap(), PathBuf::from("/a"), "its own root wins");
+        assert_eq!(listed.entry.roots, [PathBuf::from("/a"), PathBuf::from("/t/cfg")]);
+        let several = with(json!({"roots": ["/a", "/b"], "listed": true}));
+        let e = several.root_or_default(None).unwrap_err().to_string();
+        assert_eq!(e, "machine `box` has 2 config roots and none is its default: box:/a, box:/b");
+        let unlisted = with(json!({"roots": []}));
+        let e = unlisted.root_or_default(None).unwrap_err().to_string();
+        assert_eq!(e, "machine `box`'s link hasn't listed its roots yet (devsandbox machine ls)");
     }
 
     #[test]

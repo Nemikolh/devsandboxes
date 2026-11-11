@@ -1099,20 +1099,22 @@ impl<'a> LinkLoop<'a> {
         };
         rows.retain(|c| c.error.is_none() || c.fleet);
         let listed: Vec<PathBuf> = rows.iter().map(|c| c.root.clone()).collect();
+        let default = super::default_root(&rows);
         self.listing = rows;
-        self.apply_roots(listed);
+        self.apply_roots(listed, default);
         Ok(())
     }
 
     /// Make `listed` (a `roots.list` answer) the machine's roots, here and
-    /// in `Remotes`: a root no longer listed loses its rows (a hub's
+    /// in `Remotes` with `default` (its [`super::default_root`]), the
+    /// machine `listed` from now on: a root no longer listed loses its rows (a hub's
     /// restored ones too). Under the links lock, as `reload` syncs
     /// `Remotes` under it, so a link no longer in the table (stopping)
     /// leaves `Remotes` to the reload. No deadlock: the lock order is
     /// `reload`'s (links, then `Remotes`), nothing holding the links lock
     /// waits on this thread (`stop_all` joins outside it), and the hooks
     /// run after it's released.
-    fn apply_roots(&mut self, listed: Vec<PathBuf>) {
+    fn apply_roots(&mut self, listed: Vec<PathBuf>, default: Option<PathBuf>) {
         let name = self.entry.name.clone();
         let inner = self.inner;
         let mut moved = false;
@@ -1122,8 +1124,10 @@ impl<'a> LinkLoop<'a> {
             if links.contains_key(&name) {
                 let roots = &self.entry.roots;
                 inner.remotes.update(&name, |m| {
-                    moved = m.roots != *roots;
+                    moved = m.roots != *roots || m.default_root != default;
                     m.roots.clone_from(roots);
+                    m.default_root = default;
+                    m.listed = true;
                     m.rows.retain(|root, _| roots.contains(root));
                 });
             }

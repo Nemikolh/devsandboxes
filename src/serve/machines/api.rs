@@ -547,6 +547,15 @@ pub struct MachineInfo {
     pub target: Option<String>,
     pub command: Option<String>,
     pub roots: Vec<PathBuf>,
+    /// The root a command on it with no root given takes
+    /// (`super::default_root` of its listing; a routed machine's only
+    /// root), `None` when there's none (`listed` says why).
+    #[serde(default)]
+    pub default_root: Option<PathBuf>,
+    /// Its link has answered `roots.list` since this daemon started
+    /// (always for a routed machine: its roots are the hub's view's).
+    #[serde(default)]
+    pub listed: bool,
     /// As [`MachineRow::agent`].
     pub agent: bool,
 }
@@ -560,7 +569,7 @@ struct GetParams {
 
 /// One machine (registered, inbound or routed: a routed one's roots as
 /// the hub's view has them, no `target`), its roots what its link last
-/// listed (`service::Handle::entries`). `agent` is the caller's `SSH_AUTH_SOCK`
+/// listed (`service::Handle::entries`), with their default. `agent` is the caller's `SSH_AUTH_SOCK`
 /// (absolute), reported to this daemon (`bridge::report_agent`), so the
 /// agent this host answers the machine's `AGENT` streams with
 /// (`bridge::host_agent`) is the caller's: what a CLI re-run over ssh on
@@ -585,12 +594,18 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
         crate::devsbd::bridge::report_agent(caller);
     }
     if let Some(r) = routed {
-        return to_value(MachineInfo { name: r.name, kind: MachineKind::Routed, target: None, command: None, roots: r.roots, agent });
+        let default_root = match r.roots.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
+        let (kind, roots) = (MachineKind::Routed, r.roots);
+        return to_value(MachineInfo { name: r.name, kind, target: None, command: None, roots, default_root, listed: true, agent });
     }
     let entry = entry.ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
     let (kind, target) = entry.kind.wire();
-    let roots = ctx.links.as_ref().map(|l| l.remotes().roots(&entry.name)).unwrap_or_default();
-    to_value(MachineInfo { name: entry.name, kind, target, command: entry.command, roots, agent })
+    let live = ctx.links.as_ref().and_then(|l| l.remotes().get(&entry.name)).unwrap_or_default();
+    let (roots, default_root, listed) = (live.roots, live.default_root, live.listed);
+    to_value(MachineInfo { name: entry.name, kind, target, command: entry.command, roots, default_root, listed, agent })
 }
 
 #[derive(Deserialize)]
@@ -1067,7 +1082,8 @@ mod tests {
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box"}));
-        assert_eq!(info, json!({"name": "box", "kind": "ssh", "target": "ssh://box:2200", "command": cmd, "roots": [], "agent": true}));
+        let unlisted = json!({"name": "box", "kind": "ssh", "target": "ssh://box:2200", "command": cmd, "roots": [], "default_root": null, "listed": false, "agent": true});
+        assert_eq!(info, unlisted, "no link: nothing listed");
         assert_eq!(err(&mut pair.local, "machines.get", json!({"name": "nope"})).0, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
         let (code, _) = err(&mut pair.local, "machines.unlink", json!({"name": "box"}));
@@ -1485,7 +1501,8 @@ mod tests {
         let row = to_value(row).unwrap();
         assert_matches("MachineRow", &row);
         assert_matches("Capacity", &row["capacity"]);
-        let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
+        let (roots, default_root) = (vec![PathBuf::from("/r")], Some(PathBuf::from("/r")));
+        let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots, default_root, listed: true, agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
         assert_eq!(union_members("MachineKind"), ["'ssh'", "'inbound'", "'routed'"]);
         use super::super::leave::{Heard, Left, Missed, Removed, RmAnswer};

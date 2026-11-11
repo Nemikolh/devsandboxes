@@ -360,6 +360,15 @@ pub struct RootCandidate {
     /// where code placed by that peer goes. Only written when set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fleet: bool,
+    /// The name of the signed config whose copy this root is, exactly
+    /// (`fleet::mesh::copy_of`): one of the roots a command on this host
+    /// with no root given defaults to (`machines::default_root`). Only
+    /// written when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<String>,
+    /// This root is this host's `~/.devsandboxes`. Only written when set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home: bool,
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -878,19 +887,25 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
 /// where they exist, deduped), sorted. Known roots only, no disk scan. A
 /// `member.toml` that doesn't load adds none (fail closed, as
 /// `fleet::lent::Reach::load`). A root that no longer exists or whose
-/// config doesn't load answers with its `error`.
+/// config doesn't load answers with its `error`. A row's `copy` names the
+/// signed config it is the copy of, `home` flags `~/.devsandboxes`.
 fn roots_list(state: &Path, home: Option<&Path>, data: Option<&Path>, member: Option<&Path>) -> Answer {
     let member = member.and_then(|m| crate::serve::fleet::member::load(m).ok().flatten());
     let roots = crate::serve::fleet::lent::listed_roots(member.as_ref(), &load_state(state)?, home, data);
+    let home_root = home.map(|h| h.join(".devsandboxes")).map(|d| std::fs::canonicalize(&d).unwrap_or(d));
     let rows: Vec<RootCandidate> = roots
         .into_iter()
-        .map(|root| match config_at(&root) {
-            Ok(config) => {
-                let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
-                let sandboxes = names.into_iter().map(SandboxEntry::named).collect();
-                RootCandidate { root, sandboxes, error: None, fleet: false }
+        .map(|root| {
+            let copy = data.and_then(|d| crate::serve::fleet::mesh::copy_of(d, &root)).filter(|(_, exact)| *exact).map(|(name, _)| name);
+            let home = home_root.as_ref() == Some(&root);
+            match config_at(&root) {
+                Ok(config) => {
+                    let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
+                    let sandboxes = names.into_iter().map(SandboxEntry::named).collect();
+                    RootCandidate { root, sandboxes, error: None, fleet: false, copy, home }
+                }
+                Err(e) => RootCandidate { root, sandboxes: Vec::new(), error: Some(e.message), fleet: false, copy, home },
             }
-            Err(e) => RootCandidate { root, sandboxes: Vec::new(), error: Some(e.message), fleet: false },
         })
         .collect();
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
@@ -2120,7 +2135,7 @@ mod tests {
             json!({"root": canon(&shared), "sandboxes": [{"name": "api"}, {"name": "web"}], "error": null}),
             json!({"root": canon(&bad), "sandboxes": [], "error": ""}),
             json!({"root": gone, "sandboxes": [], "error": format!("no directory {}", gone.display())}),
-            json!({"root": canon(&home.join(".devsandboxes")), "sandboxes": [], "error": null}),
+            json!({"root": canon(&home.join(".devsandboxes")), "sandboxes": [], "error": null, "home": true}),
         ];
         want.sort_by(|a, b| a["root"].as_str().cmp(&b["root"].as_str()));
         let mut got = roots_list(&state, Some(&home), None, None).unwrap();
@@ -2146,6 +2161,16 @@ mod tests {
         assert_eq!(roots, want.iter().collect::<Vec<_>>());
         let lost = listed.as_array().unwrap().iter().find(|r| r["root"] == json!(base.join("lost"))).unwrap();
         assert!(lost["error"].as_str().unwrap().starts_with("no directory"), "{lost}");
+        // A signed config's copy names it (the copy itself only, not a
+        // root inside it).
+        let (data, copy_member) = (base.join("data"), base.join("copy-member.toml"));
+        let copy = crate::serve::fleet::mesh::tree_path(&data, "cfg");
+        std::fs::create_dir_all(copy.join("sub")).unwrap();
+        let roots = vec![copy.clone(), copy.join("sub")];
+        crate::serve::fleet::member::write_for_test(&copy_member, &crate::serve::fleet::member::Member { roots, ..Default::default() });
+        let listed = roots_list(&state.with_file_name("absent.toml"), None, Some(&data), Some(&copy_member)).unwrap();
+        let copies: Vec<(&Value, &Value)> = listed.as_array().unwrap().iter().map(|r| (&r["root"], &r["copy"])).collect();
+        assert_eq!(copies, [(&json!(canon(&copy)), &json!("cfg")), (&json!(canon(&copy.join("sub"))), &Value::Null)]);
         // A member.toml that doesn't load adds none.
         std::fs::write(&member, "trust = \"most\"\n").unwrap();
         assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None, Some(&member)).unwrap(), json!([]));
@@ -2809,7 +2834,14 @@ mod tests {
         let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
         let error = ErrorBody { code: "failed".into(), message: "m".into(), data: Some(json!({"exit": 1})) };
 
-        let root = RootCandidate { root: "/cfg".into(), sandboxes: vec![SandboxEntry::named("web".into())], error: None, fleet: false };
+        let root = RootCandidate {
+            root: "/cfg".into(),
+            sandboxes: vec![SandboxEntry::named("web".into())],
+            error: None,
+            fleet: false,
+            copy: Some("cfg".into()),
+            home: true,
+        };
 
         let cases: [(&str, Value); 13] = [
             ("ThreadSummary", v(&summary())),

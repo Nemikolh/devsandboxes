@@ -315,6 +315,39 @@ pub fn registered_names() -> Vec<String> {
     path().and_then(|p| load(&p)).map(|entries| entries.into_iter().map(|e| e.name).collect()).unwrap_or_default()
 }
 
+/// The root a command on a machine takes when it names none, from the
+/// machine's `roots.list` `rows` (docs/architecture/daemon/machines.md,
+/// *Default root*; pure): its signed config's copy when there's one, of
+/// several the one named `.devsandboxes`; else its `~/.devsandboxes`; else
+/// its only root; else none (several, none of them the default).
+pub fn default_root(rows: &[crate::serve::api::RootCandidate]) -> Option<PathBuf> {
+    let copies: Vec<&crate::serve::api::RootCandidate> = rows.iter().filter(|r| r.copy.is_some()).collect();
+    let copy = match copies.as_slice() {
+        [one] => Some(*one),
+        _ => copies.iter().copied().find(|r| r.copy.as_deref() == Some(".devsandboxes")),
+    };
+    let row = copy.or_else(|| rows.iter().find(|r| r.home)).or(match rows {
+        [only] => Some(only),
+        _ => None,
+    })?;
+    Some(row.root.clone())
+}
+
+/// Why machine `m`, with `roots` (`listed`: its link has answered
+/// `roots.list` since this daemon started), has no [`default_root`]:
+/// nothing listed yet, no roots, or several with none the default (named
+/// as `m:<root>`, a command's root on a machine).
+pub fn no_default_root(m: &str, roots: &[PathBuf], listed: bool) -> String {
+    match roots {
+        [] if !listed => format!("machine `{m}`'s link hasn't listed its roots yet (devsandbox machine ls)"),
+        [] => format!("machine `{m}` has no config roots (devsandbox machine ls)"),
+        _ => {
+            let named: Vec<String> = roots.iter().map(|r| format!("{m}:{}", r.display())).collect();
+            format!("machine `{m}` has {} config roots and none is its default: {}", roots.len(), named.join(", "))
+        }
+    }
+}
+
 /// The error for a machine nobody registered.
 pub fn no_machine(name: &str) -> anyhow::Error {
     anyhow::anyhow!("no machine named `{name}` (devsandbox machine ls)")
@@ -460,5 +493,30 @@ mod tests {
             assert!(parse_name(bad).is_err(), "{bad:?} parsed");
         }
         assert_eq!(no_machine("m").to_string(), "no machine named `m` (devsandbox machine ls)");
+    }
+
+    /// The default root: the one signed copy (of several, `.devsandboxes`),
+    /// else `~/.devsandboxes`, else the only root, else none.
+    #[test]
+    fn the_default_root_on_a_machine() {
+        use crate::serve::api::RootCandidate;
+        let row = |root: &str| RootCandidate { root: root.into(), sandboxes: vec![], error: None, fleet: false, copy: None, home: false };
+        let copy = |root: &str, name: &str| RootCandidate { copy: Some(name.into()), ..row(root) };
+        let home = |root: &str| RootCandidate { home: true, ..row(root) };
+        let pick = |rows: Vec<RootCandidate>| default_root(&rows).map(|p| p.display().to_string());
+        assert_eq!(pick(vec![row("/a"), home("/h"), copy("/t/cfg", "cfg")]).as_deref(), Some("/t/cfg"), "one copy");
+        let two = vec![copy("/t/a", "a"), home("/h"), copy("/t/d", ".devsandboxes")];
+        assert_eq!(pick(two).as_deref(), Some("/t/d"), "two copies, one `.devsandboxes`");
+        assert_eq!(pick(vec![copy("/t/a", "a"), home("/h"), copy("/t/b", "b")]).as_deref(), Some("/h"), "two copies: home");
+        assert_eq!(pick(vec![copy("/t/a", "a"), copy("/t/b", "b")]), None, "two copies, no home");
+        assert_eq!(pick(vec![row("/a"), home("/h")]).as_deref(), Some("/h"), "home");
+        assert_eq!(pick(vec![row("/a")]).as_deref(), Some("/a"), "the only root");
+        assert_eq!(pick(vec![row("/a"), row("/b")]), None, "several");
+        assert_eq!(pick(vec![]), None, "none");
+
+        let roots = [PathBuf::from("/a"), PathBuf::from("/b")];
+        assert_eq!(no_default_root("m", &roots, true), "machine `m` has 2 config roots and none is its default: m:/a, m:/b");
+        assert_eq!(no_default_root("m", &[], false), "machine `m`'s link hasn't listed its roots yet (devsandbox machine ls)");
+        assert_eq!(no_default_root("m", &[], true), "machine `m` has no config roots (devsandbox machine ls)");
     }
 }

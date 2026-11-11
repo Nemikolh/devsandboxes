@@ -215,9 +215,15 @@ pub struct Machine {
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
     /// Its roots: what its link's last `roots.list` answered, in that order
-    /// (a hub's restored ones until it lists; none before): the first one
-    /// shows the instances whose root isn't among them.
+    /// (a hub's restored ones until it lists; none before).
     pub roots: Vec<PathBuf>,
+    /// The root a command on it with no root given takes
+    /// (`machines::default_root` of that listing; a hub's restored one until
+    /// it lists): it shows the instances whose root isn't among `roots`
+    /// (none: the first root does).
+    pub default_root: Option<PathBuf>,
+    /// Its link has answered `roots.list` since this daemon started.
+    pub listed: bool,
     pub state: LinkState,
     pub error: Option<String>,
     /// Its devsandbox semver, from the last hello.
@@ -482,8 +488,9 @@ pub fn fleet_view(params: &mut Value, me: Option<&str>) -> Value {
 ///
 /// Each remote instance appears once per machine: every remote root's
 /// snapshot lists all of that host's instances, so an instance is taken
-/// from the snapshot of its own `root` when that root is registered, else
-/// from the machine's first root's. Remote `thread_children` aren't merged:
+/// from the snapshot of its own `root` when that root is listed, else
+/// from its [default root](Machine::default_root)'s (none: its first
+/// root's). Remote `thread_children` aren't merged:
 /// the Inbox is this host's only.
 ///
 /// A machine with a [`Machine::fleet`] view (this host's hub) also lifts
@@ -514,8 +521,9 @@ pub fn merge(local: &Value, machines: &[Machine], except: Option<&str>, exposed:
             let root_text = root.to_string_lossy();
             for row in rows(params, "instances") {
                 let own = row.get("root").and_then(Value::as_str).map(Path::new);
-                let here = match own {
-                    Some(own) if m.roots.iter().any(|r| r == own) => own == root,
+                let here = match (own, &m.default_root) {
+                    (Some(own), _) if m.roots.iter().any(|r| r == own) => own == root,
+                    (_, Some(default)) if m.roots.contains(default) => default == root,
                     _ => i == 0,
                 };
                 if here {
@@ -831,6 +839,20 @@ pub(crate) mod tests {
         want["machines"] = serde_json::json!([]);
         want["sandbox_count"] = serde_json::json!(want["sandboxes"].as_array().unwrap().len());
         assert_eq!(alone, want);
+    }
+
+    /// An instance whose root isn't listed comes from the machine's default
+    /// root's snapshot, not its first's.
+    #[test]
+    fn merge_takes_rootless_instances_from_the_default_root() {
+        let local = serde_json::json!({"dir": "/here", "instances": [], "sandboxes": [], "services": []});
+        // `old` is only in `/r/two`'s rows: the first root's would miss it.
+        let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connected);
+        a.default_root = Some("/r/two".into());
+        a.rows.insert("/r/one".into(), remote("/r/one", &[("in-one", Some("/r/one"))]));
+        a.rows.insert("/r/two".into(), remote("/r/two", &[("old", None), ("in-one", Some("/r/one"))]));
+        let merged = merge(&local, &[a], None, &Default::default(), &Default::default());
+        assert_eq!(names(&merged, "instances"), ["in-one@a", "old@a"]);
     }
 
     /// A hub's federated push as a member gets it: the hub's own rows,

@@ -328,11 +328,23 @@ one's while its neighbor is up.
   this host picked. A listed row with an `error` (a root recorded there
   whose directory is gone) is left out unless it's the `fleet` row, so
   it's never watched and refused. A listing goes into `Remotes`
-  (`Machine::roots`; a root no longer listed loses its rows) under the
+  (`Machine::roots`; a root no longer listed loses its rows), with its
+  default root (`Machine::default_root`, below) and `Machine::listed`
+  set, under the
   links lock that `Handle::reload` syncs `Remotes` under
   (`LinkLoop::apply_roots`). Before a machine's link first lists, its
   roots are none, or on a hub the ones `remotes.json` restored with its
-  rows (`saved::SavedMachine::roots`), kept until it lists.
+  rows and default (`saved::SavedMachine::roots`, `default_root`), kept
+  until it lists.
+- **Default root.** The root a command on a machine with no root given
+  takes (`machines::default_root`, pure over the listing's rows): the
+  row `roots.list` flags `copy` (a signed config's copy, `mesh::copy_of`)
+  when there's one, of several the one named `.devsandboxes`; else the
+  row flagged `home` (its `~/.devsandboxes`); else its only root; else
+  none. A routed machine has no listing here: its only root as the hub's
+  view has it, else none. `machines.get` answers it as `default_root`,
+  with `listed`; `snapshots::merge` takes an instance whose root isn't
+  listed from the default root's snapshot (none: the first root's).
   `Handle::entries`, `machines.list` and `machines.get` answer them, so
   `forward::sandboxes_everywhere`, `forward::resolve_everywhere`,
   `verbs_client::run_target`'s `sandboxes.list` and the watch above all
@@ -559,6 +571,16 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
 `devsandbox …` run there).
 
 - Under `--in-process`: nothing fans out; `--machine` is an error.
+- **A command's root on a machine**: the match's own root there (the
+  instance's `instances.resolve` row), else the machine's [default
+  root](#held-links-machines) (`cli::Info::root_or_default`, from
+  `machines.get`'s `default_root`). With none the command fails before
+  any call (`machines::no_default_root`): the machine's link hasn't
+  listed its roots yet, it has none, or its roots, named as `m:<root>`,
+  hold none that is the default. `stop --all` / `start --all` take the
+  machine's first root (any root reaches its whole `state.toml`);
+  `rebuild --all`, `service rebuild`, `gc`, `ls` and `service ls` go by
+  each root.
 - **Verbs** (`run`, `rebuild`, `start`, `stop`, `rm`) keep their name;
   `verbs_client` resolves it across machines (`instances.resolve` /
   `sandboxes.list` with `machines: true`), picking on a TTY when ambiguous,
@@ -575,7 +597,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   this process for an `exec` (below). `logs` / `inspect` with a bare
   `devsandbox-…` container name stay local. `port` on a machine's instance
   runs here: `route` returns `Routed::Port` (the machine's `Entry`, the
-  match's root or else the machine's first, the instance as the machine
+  match's root or else the machine's default, the instance as the machine
   names it) and `commands::port::port_remote` forwards over one `TUNNEL`
   stream per bridge through `route::connect`
   (`tunnel::remote_opener`; [forwards](forwards.md),
@@ -594,7 +616,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   `CliVerb::Gc`, one `gc` request per config root, each after its `==>
   m:<root>` line, the roots as `ls` takes them); `port --service <svc>`
   naming no instance (`MachineUse::Port`) forwards the machine's global
-  service from its first registered root, as above. On a named command
+  service from its default root, as above. On a named command
   it's an error (qualify the name instead); refused for `inbox`, `vscode`,
   `serve`, `api`, `machine`, the dashboard.
 - **Trust**: every call and stream is served by the machine's daemon
@@ -661,7 +683,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   roots' services, [fleet](fleet.md#the-trust-table)).
 - **An `exec`** is `PTY` streams to the machine from this process
   (`fleet::pty_client::dial`, over `route::connect`; [fleet](fleet.md#pty)), at the
-  instance's root there (the match's, else the machine's first); a dial's
+  instance's root there (the match's, else the machine's default); a dial's
   end becomes this process's exit code (`pty_client::exit_of`: the
   program's, 255 only for a lost link, the helper's session codes).
 - **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /

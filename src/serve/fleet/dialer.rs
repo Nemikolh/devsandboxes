@@ -806,7 +806,11 @@ pub(crate) mod tests {
         crate::serve::dts::assert_matches("MachineRow", &lap);
         let mut k = connect(&pair.k_dir);
         let info = k.call("machines.get", json!({"name": "lap"})).unwrap().result.unwrap();
-        assert_eq!(info, json!({"name": "lap", "kind": "inbound", "target": null, "command": null, "roots": [fleet_root], "agent": false}));
+        assert_eq!(
+            info,
+            json!({"name": "lap", "kind": "inbound", "target": null, "command": null, "roots": [fleet_root], "default_root": fleet_root, "listed": true, "agent": false}),
+            "its only root is its default"
+        );
         let e = k.call("machines.unlink", json!({"name": "lap"})).unwrap().error.unwrap();
         assert!(e.code == "denied" && e.message.contains("links to this host from its end"), "{e:?}");
         // An agent grant by lap's key (fleet plan decision 67), in K's member.toml.
@@ -1481,7 +1485,10 @@ pub(crate) mod tests {
         crate::serve::dts::assert_matches("MachineRow", &row);
         assert_eq!(x["kind"], "routed");
         let info = connect(&pair.l_dir).call("machines.get", json!({"name": "x"})).unwrap().result.unwrap();
-        assert_eq!(info, json!({"name": "x", "kind": "routed", "target": null, "command": null, "roots": [], "agent": false}));
+        assert_eq!(
+            info,
+            json!({"name": "x", "kind": "routed", "target": null, "command": null, "roots": [], "default_root": null, "listed": true, "agent": false})
+        );
         // A machine, but not in the log: no key to grant agent by.
         let e = connect(&pair.l_dir).call("machines.set", json!({"name": "x", "agent": true})).unwrap().error.unwrap();
         assert!(e.code == "failed" && e.message.contains("no key to grant agent by"), "{e:?}");

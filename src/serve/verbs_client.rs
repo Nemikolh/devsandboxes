@@ -407,7 +407,7 @@ fn prepare(
     // per root.
     let machine_roots = |call: &mut Call| -> Result<Option<(String, Vec<PathBuf>)>> {
         let Some(m) = &fed.machine else { return Ok(None) };
-        let roots = machine_info(call, m)?.roots;
+        let roots = machine_info(call, m)?.entry.roots;
         if roots.is_empty() {
             bail!("machine `{m}` has no config roots (devsandbox machine ls)");
         }
@@ -650,11 +650,7 @@ fn target_of(name: &str, root: &Path, fed: &Fed, call: &mut Call, ui: &mut Ui) -
     };
     let root = match found.root {
         Some(root) => root,
-        None => machine_info(call, &m)?
-            .roots
-            .into_iter()
-            .next()
-            .with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?,
+        None => machine_info(call, &m)?.root_or_default(None)?,
     };
     Ok(Ok(Target { name: found.name, machine: Some(m), root, sandbox: found.sandbox }))
 }
@@ -1753,15 +1749,20 @@ mod tests {
         assert_eq!(p.params, json!({"root": "/cfg", "env": {"A": "1"}, "instance": "web-1", "all": false, "detach": false}));
 
         // Qualified: asked of that machine only; a root it didn't say is the
-        // machine's first.
-        let there = [
-            ("instances.resolve", ok(json!({"matches": ["w"], "found": [{"name": "w", "machine": null, "root": null}]}))),
-            ("machines.get", ok(json!({"name": "a", "kind": "ssh", "target": "me@a", "command": null, "roots": ["/r1", "/r2"], "agent": false}))),
-        ];
-        let (p, calls, _, _) = prep_fed(&CliVerb::Rm { name: "a/w".into(), delete_branch: None, force: true }, &FED, false, None, &there, 0);
+        // machine's default.
+        let resolved = || ("instances.resolve", ok(json!({"matches": ["w"], "found": [{"name": "w", "machine": null, "root": null}]})));
+        let info = |default: Value| {
+            let info = json!({"name": "a", "kind": "ssh", "target": "me@a", "command": null, "roots": ["/r1", "/r2"], "default_root": default, "listed": true, "agent": false});
+            ("machines.get", ok(info))
+        };
+        let rm = CliVerb::Rm { name: "a/w".into(), delete_branch: None, force: true };
+        let (p, calls, _, _) = prep_fed(&rm, &FED, false, None, &[resolved(), info(json!("/r2"))], 0);
         assert_eq!(calls, [r#"instances.resolve {"machine":"a","name":"w"}"#, r#"machines.get {"name":"a"}"#]);
         let p = sent(p);
-        assert_eq!((&p.params["root"], &p.params["machine"], &p.params["instance"]), (&json!("/r1"), &json!("a"), &json!("w")));
+        assert_eq!((&p.params["root"], &p.params["machine"], &p.params["instance"]), (&json!("/r2"), &json!("a"), &json!("w")));
+        // No default among several roots: the error names them.
+        let e = prep_fed(&rm, &FED, false, None, &[resolved(), info(Value::Null)], 0).0.unwrap_err();
+        assert_eq!(e.to_string(), "machine `a` has 2 config roots and none is its default: a:/r1, a:/r2");
         // `@/`: here only, plain.
         let here = [("instances.resolve", ok(json!({"matches": ["w"], "found": [{"name": "w", "machine": null, "root": "/x"}]})))];
         let (p, calls, _, _) = prep_fed(&stop("@/w"), &FED, false, None, &here, 0);

@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn the_fleet_root_is_the_flagged_row() {
-        let row = |root: &str, fleet| RootCandidate { root: root.into(), sandboxes: vec![], error: None, fleet };
+        let row = |root: &str, fleet| RootCandidate { root: root.into(), sandboxes: vec![], error: None, fleet, copy: None, home: false };
         assert_eq!(fleet_root(&[row("/own", false), row("/d/fleet/hub", true)]), Some(PathBuf::from("/d/fleet/hub")));
         assert_eq!(fleet_root(&[row("/own", false)]), None);
         // As the wire has it: absent is unflagged.

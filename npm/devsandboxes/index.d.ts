@@ -905,6 +905,10 @@ export interface RootCandidate {
    * own roots: where code that peer places here goes. Absent otherwise.
    */
   fleet?: boolean;
+  /** The name of the signed config this root is the copy of (exactly the copy, not a root inside it). Absent otherwise. */
+  copy?: string;
+  /** Set (`true`) on this host's `~/.devsandboxes`. Absent otherwise. */
+  home?: boolean;
 }
 
 /** `machines.probe`'s answer: the machine's devsandbox and its member key. @experimental */
@@ -1200,6 +1204,14 @@ export interface MachineInfo {
   command: string | null;
   /** Config roots on the machine: what its daemon's `roots.list` last answered over its link (a routed one's: the hub's view). */
   roots: string[];
+  /**
+   * The root a command on the machine with no root given takes: its signed config's copy (of several, the one
+   * named `.devsandboxes`), else its `~/.devsandboxes`, else its only root (a routed one: its only root);
+   * `null` when there's none (several roots, none of them the default; or none listed yet: `listed`).
+   */
+  default_root: string | null;
+  /** Its link has answered `roots.list` since this daemon started (always `true` for a routed machine). */
+  listed: boolean;
   /** This host grants its ssh-agent to this member, at its current key (`machines.set {agent}`, `member.toml`'s `[[agent]]`), whatever its kind. */
   agent: boolean;
 }
