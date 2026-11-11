@@ -346,9 +346,10 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
     let gate = match method {
         "hello" => Gate::Hello,
         "subscribe" | "unsubscribe" => {
+            // `roots` says no more than `roots.list`, which it may call.
             let topics = params.get("topics").and_then(Value::as_array);
-            if topics.is_some_and(|t| t.iter().any(|t| t.as_str() != Some("instances"))) {
-                return Err(ApiError::denied("a remote caller subscribes to `instances` only"));
+            if topics.is_some_and(|t| t.iter().any(|t| !matches!(t.as_str(), Some("instances" | "roots")))) {
+                return Err(ApiError::denied("a remote caller subscribes to `instances` and `roots` only"));
             }
             Gate::Subscribe
         }
@@ -897,6 +898,7 @@ mod tests {
             ("hello", p.clone(), Ok(Hello)),
             ("subscribe", json!({"topics": ["instances"]}), Ok(Subscribe)),
             ("unsubscribe", json!({"topics": ["instances"]}), Ok(Subscribe)),
+            ("subscribe", json!({"topics": ["instances", "roots"]}), Ok(Subscribe)),
             ("subscribe", json!({"topics": ["instances", "inbox"]}), Err("denied")),
             ("subscribe", json!({"topics": ["forwards"]}), Err("denied")),
             ("instances.watch", json!({"dir": "/x"}), Ok(Watch)),

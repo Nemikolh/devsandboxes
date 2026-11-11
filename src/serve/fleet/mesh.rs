@@ -198,7 +198,7 @@ pub fn tree_path(data: &Path, name: &str) -> PathBuf {
 /// so the next install removes only what this one listed and no longer
 /// does, and [`verify`] rehashes exactly what was installed and admits
 /// nothing else under its dirs.
-fn installed_path(data: &Path) -> PathBuf {
+pub fn installed_path(data: &Path) -> PathBuf {
     data.join("mesh").join("installed.toml")
 }
 

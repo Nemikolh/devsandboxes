@@ -1073,6 +1073,29 @@ impl Shared {
         self.member.as_deref()?.parent()
     }
 
+    /// The set `roots.list` lists here ([`local_call`]'s inputs to
+    /// `lent::listed_roots`), for the watcher's `roots.changed`; `None`
+    /// while `state.toml` or `member.toml` doesn't load (the next write
+    /// retries), so a torn read never looks like roots going away.
+    fn listed_roots(&self) -> Option<BTreeSet<PathBuf>> {
+        let member = match self.member.as_deref() {
+            Some(path) => fleet::member::load(path).ok()?,
+            None => None,
+        };
+        let state = crate::state::State::load_at(&self.state).ok()?;
+        let data = self.data_dir().filter(|_| (self.installed)());
+        Some(lent::listed_roots(member.as_ref(), &state, self.home.as_deref(), data))
+    }
+
+    /// What [`Shared::listed_roots`] reads, cheaply (stamps, one `stat`
+    /// each): the watcher re-reads the roots only when this moves.
+    fn roots_inputs(&self) -> RootsInputs {
+        let stamp = |p: &Path| crate::inbox::store::stamp_at(p);
+        let home = self.home.as_ref().is_some_and(|h| h.join(".devsandboxes").is_dir());
+        let installed = self.data_dir().map(|d| stamp(&fleet::mesh::installed_path(d)));
+        (stamp(&self.state), self.member.as_deref().map(stamp), installed, home)
+    }
+
     /// Fleet member `name` as this host serves its streams, whatever
     /// carried them (a machine link's, a `link.attach`'s, a routed stream's
     /// origin: fleet plan decision 57): the key it proved, its introducer,
@@ -1702,6 +1725,8 @@ struct Pending {
     forwards_status: Option<String>,
     /// `opens.done` params, oldest first, the last [`OPENS_KEPT`].
     opens: Vec<Value>,
+    /// `roots.changed`.
+    roots: bool,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
     /// The connection holds a `links.inbound` announce (a `fleet-link
@@ -1742,6 +1767,7 @@ impl Pending {
             || self.forwards
             || self.forwards_status.is_some()
             || !self.opens.is_empty()
+            || self.roots
             || self.closing.is_some()
             || self.cycle.is_some()
     }
@@ -1768,6 +1794,9 @@ impl Pending {
         }
         for params in std::mem::take(&mut self.opens) {
             out.push(Notification { method: "opens.done".into(), params });
+        }
+        if std::mem::take(&mut self.roots) {
+            out.push(Notification { method: "roots.changed".into(), params: json!({}) });
         }
         if let Some(why) = self.cycle.take() {
             let params = match why {
@@ -1880,6 +1909,8 @@ fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) 
     let mut state_stamp = crate::inbox::store::stamp_at(&shared.state);
     let mut recorded = recorded_roots(&shared.state);
     let mut configs = config_stamps(recorded.iter().chain(&shared.watched_roots()));
+    let mut roots_inputs = shared.roots_inputs();
+    let mut listed = shared.listed_roots().unwrap_or_default();
     let instances_now = || instances.as_ref().map_or(0, |c| c.load(Ordering::Acquire));
     let mut instances_seen = instances_now();
     while !stop.load(Ordering::SeqCst) {
@@ -1918,6 +1949,18 @@ fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) 
             }
             configs = configs_now;
         }
+        // Only an input that moved re-reads them, and only a listing that
+        // moved is told: a phase write mustn't have every link relist.
+        let inputs_now = shared.roots_inputs();
+        if inputs_now != roots_inputs {
+            roots_inputs = inputs_now;
+            if let Some(now) = shared.listed_roots()
+                && now != listed
+            {
+                listed = now;
+                shared.publish(Topic::Roots, |p| p.roots = true);
+            }
+        }
     }
 }
 
@@ -1939,6 +1982,11 @@ fn config_stamps<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> ConfigStamps {
 }
 
 type ConfigStamps = BTreeMap<PathBuf, Vec<Option<(std::time::SystemTime, u64)>>>;
+
+/// [`Shared::roots_inputs`]: `state.toml`'s, `member.toml`'s and the
+/// signed copies' `installed.toml`'s stamps, and whether `~/.devsandboxes`
+/// is a directory.
+type RootsInputs = (Option<(std::time::SystemTime, u64)>, Option<Option<(std::time::SystemTime, u64)>>, Option<Option<(std::time::SystemTime, u64)>>, bool);
 
 /// The agent a peer's `AGENT` stream gets ([`Shared::serve_channel`]):
 /// `host_agent`'s, while `member`'s `[[agent]]` grants member `peer` the
@@ -3400,6 +3448,7 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
                         p.forwards_status = None;
                     }
                     Topic::Opens => p.opens.clear(),
+                    Topic::Roots => p.roots = false,
                 }
             }
         }
@@ -3883,6 +3932,42 @@ pub(crate) mod tests {
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(state.parent().unwrap());
+    }
+
+    /// `roots.changed` follows what `roots.list` lists: an instance's root
+    /// coming and going, not a write that leaves the roots as they were.
+    #[test]
+    fn subscribers_hear_roots_changes() {
+        let dir = scratch("roots-watch");
+        let data = scratch("roots-watch-data");
+        let root = data.join("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = data.join("state.toml");
+        let instance = |name: &str| {
+            format!(
+                "[instance.{name}]\ninstance_id = \"id-{name}\"\nsandbox = \"web\"\ncontainer = \"devsandbox-{name}\"\n\
+                 folder = \"/w\"\nworkspace = \"/w\"\ncreated_unix = 1\nconfig_dir = {:?}\n",
+                root.to_str().unwrap()
+            )
+        };
+        let daemon = spawn_daemon(&dir, Options { state: Some(state.clone()), ..opts(1, 200) });
+        let mut conn = connect(&dir);
+        let r = conn.call("subscribe", json!({"topics": ["roots"]})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+
+        std::fs::write(&state, instance("a")).unwrap();
+        wait_for(&mut conn, "roots.changed");
+        // Another instance of the same root: the listing didn't move.
+        std::fs::write(&state, format!("{}{}", instance("a"), instance("b"))).unwrap();
+        assert!(conn.next_notification(Duration::from_millis(1200)).unwrap().is_none(), "same roots");
+        // Its last instance removed: the root goes.
+        std::fs::write(&state, "").unwrap();
+        wait_for(&mut conn, "roots.changed");
+
+        drop(conn);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     /// The next notification named `method`, skipping others (stray

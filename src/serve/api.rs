@@ -209,6 +209,8 @@ pub enum Topic {
     Forwards,
     /// `opens.done`: what became of each URL a container opened.
     Opens,
+    /// `roots.changed`: what `roots.list` lists moved, re-fetch.
+    Roots,
 }
 
 impl Topic {
@@ -218,6 +220,7 @@ impl Topic {
             "instances" => Some(Topic::Instances),
             "forwards" => Some(Topic::Forwards),
             "opens" => Some(Topic::Opens),
+            "roots" => Some(Topic::Roots),
             _ => None,
         }
     }
@@ -2652,8 +2655,8 @@ mod tests {
     #[test]
     fn topics_parse_and_reject_unknown_ones() {
         assert_eq!(
-            topics(json!({"topics":["inbox","instances","forwards","opens"]})).unwrap(),
-            [Topic::Inbox, Topic::Instances, Topic::Forwards, Topic::Opens]
+            topics(json!({"topics":["inbox","instances","forwards","opens","roots"]})).unwrap(),
+            [Topic::Inbox, Topic::Instances, Topic::Forwards, Topic::Opens, Topic::Roots]
         );
         assert_eq!(topics(json!({"topics":["ports"]})).unwrap_err().code, "invalid");
         assert_eq!(topics(Value::Null).unwrap_err().code, "invalid");

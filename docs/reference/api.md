@@ -37,7 +37,7 @@ checks the typings against the wire structs).
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`,
-`opens.done`, `closing` (*Notifications*); `output`, `progress` (a verb's, *Verbs*);
+`opens.done`, `roots.changed`, `closing` (*Notifications*); `output`, `progress` (a verb's, *Verbs*);
 `helper.record` (a `helper.call`'s).
 
 ## Transport
@@ -130,7 +130,7 @@ daemon answers in-process on the links it dials, and those after
 `link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*`, `placements.*` and `instances.attach` are
 `denied` under either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
-(`instances` only), `instances.watch` / `unwatch`, the quick calls (the
+(`instances` and `roots` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
 `code.haves`, `mesh.folders` (its `root` confined like a verb's), `instances.fetch` (an instance under the caller's fleet root only), `roots.list`, `open.deliver` (its `root` the caller's, never confined; under either trust its own check gates it) and the verbs but `gc` (`all` only while every instance here
 is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true` but an `instances.watch`'s (a member watching its hub, which only the hub serves); every `root` / `dir`
@@ -1246,7 +1246,8 @@ runs, an inbound neighbor's while it's up (it is a machine of kind
 `inbound` then; gone, its link and rows go): one `serve-machine-<name>`
 thread per machine (plus one carrying an
 ssh machine's peer link) connects at once and stays connected, whatever
-watches. Connected, it subscribes to `instances` and, while a connection
+watches. Connected, it subscribes to `instances` and `roots` (asking
+`roots.list` again on each `roots.changed`) and, while a connection
 watches with `machines: true`, watches each of the machine's roots; the
 machine that is this host's hub (`member.toml`'s `hub` naming it) also
 has its fleet root for this host (its `roots.list`'s `fleet` row)
@@ -1651,7 +1652,7 @@ A forwarded verb holds this daemon while its ssh runs (*Holders*).
 
 ### `subscribe` / `unsubscribe`
 
-Params: `{"topics": ["inbox", "instances", "forwards", "opens"]}`. Result: `{"ok": true}`.
+Params: `{"topics": ["inbox", "instances", "forwards", "opens", "roots"]}`. Result: `{"ok": true}`.
 Unknown topics are `invalid`. Notifications are coarse ("something
 changed, re-fetch"): subscribe first, then fetch, so nothing falls in
 between.
@@ -1665,6 +1666,7 @@ between.
 | `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
 | `opens.done` | `opens` | `{"instance": "<name>", "url": "…", "profile": "<p>" \| null, "outcome": "opened" \| "refused" \| "failed", "why": "…" \| null, "line": "…"}` | what became of one URL a container opened ([bridges](../architecture/helper/bridges.md#opening-urls-kind-open)), from the host that knows: the instance's host for a refusal at intake (control characters, scheme, too old, rate limit; `profile` `null`) or a failed delivery to a fleet member (the member's refusal included), the opening host when it opened it or couldn't (no display, the URL's own loopback port not forwarded, no opener, a failed spawn). `instance` is `machine/name` for an open delivered from another member; `url` the one opened (rewritten to a forward's port), else the one given; `why` the refusal or failure, or for `opened` the callback ports that couldn't be forwarded (`cannot forward callback port 8085`). `line` is the dashboard's status-line text (`web: opened https://… (work)`, `web: open refused: rate limit (5 per 10s)`, `web: open failed: no display on this host`; a URL past 120 characters is cut there with `…`). Every open is its own: up to the last 8 unwritten are kept |
+| `roots.changed` | `roots` | `{}` | what `roots.list` lists here moved (checked every 0.5 s, on a write of `state.toml`, `member.toml` or the signed copies' `installed.toml`, or `~/.devsandboxes` appearing or going): an instance's root recorded or its last instance removed, a root picked or dropped (`machine roots add\|rm`), a signed copy installed. A write that leaves the set as it was isn't one |
 | `closing` | any | `{"reason": "handoff" \| "idle" \| "shutdown"}` | the daemon is exiting; reconnect (which starts a new one) |
 
 Notifications coalesce: many changes before one is written are one line.

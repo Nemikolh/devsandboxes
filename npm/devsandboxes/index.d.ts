@@ -543,7 +543,7 @@ export type ThreadState = 'needs-you' | 'active' | 'done';
 export type InboxView = 'needs-you' | 'active' | 'done' | 'all';
 
 /** A notification topic for `subscribe`. */
-export type ApiTopic = 'inbox' | 'instances' | 'forwards' | 'opens';
+export type ApiTopic = 'inbox' | 'instances' | 'forwards' | 'opens' | 'roots';
 
 /** One Inbox thread (`inbox.list()`), and the head of {@link ThreadDetail}. */
 export interface ThreadSummary {
@@ -1762,6 +1762,8 @@ export interface ApiEvents {
   'forwards.status': ForwardsStatus;
   /** One open's outcome; needs the `opens` topic. */
   'opens.done': OpensDone;
+  /** What `roots.list` lists moved; needs the `roots` topic. */
+  'roots.changed': {};
   /** A verb request's output; sent to its connection, no `subscribe` needed. */
   output: VerbOutput;
   /** A verb request's phase change; sent to its connection, no `subscribe` needed. */

@@ -298,7 +298,7 @@ one's while its neighbor is up.
   announced it: no thread of its own (`service::carried`).
 - **The link.** Once the carrier is up (always, for an inbound machine)
   the machine thread dials `fleet-<name>.sock` (`Dial`) and says hello,
-  subscribes to `instances`, asks its `roots.list`, watches each of the
+  subscribes to `instances` and `roots`, asks its `roots.list`, watches each of the
   machine's roots while a
   local watcher wants machines (`Hooks::watching`), and stores pushed
   snapshots in `Remotes` (kept while the link is down; in memory only,
@@ -350,7 +350,11 @@ one's while its neighbor is up.
   `verbs_client::run_target`'s `sandboxes.list` and the watch above all
   see a root the machine got later (a [signed config copy](fleet.md) it
   installed since, under `mesh/tree/`) with nothing to do here, and
-  `Remotes` stores its pushes. The link lists at each link-up and again on `Handle::relist`:
+  `Remotes` stores its pushes. The link lists at each link-up, again on
+  the machine's `roots.changed` (its daemon's `serve-watch` saw the set
+  `roots.list` lists move: an instance's root recorded or its last
+  instance removed there, a root picked or dropped; `Shared::listed_roots`,
+  `Shared::roots_inputs`), and again on `Handle::relist`:
   after each `fleet.sync` this host's `changes::push` got through to the
   machine, and each one that came from it (`changes::sync`), since a
   member installs a moved config before answering a sync and sends the

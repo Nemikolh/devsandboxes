@@ -13,8 +13,9 @@
 //! the backoff below whenever it ends; an inbound neighbor's is the
 //! `fleet-link --peer <it>` that announced it. Once the carrier
 //! is up the link thread dials `fleet-<name>.sock` (the [`Dial`]) and says
-//! hello, subscribes to `instances`, asks its `roots.list` (its live
-//! roots, the machine's only ones: again on [`Handle::relist`]), watches
+//! hello, subscribes to `instances` and `roots`, asks its `roots.list` (its
+//! live roots, the machine's only ones: again on its `roots.changed` and
+//! on [`Handle::relist`]), watches
 //! each of them while a local connection watches with `machines: true`
 //! ([`Hooks::watching`]), and stores every pushed `instances.snapshot` in
 //! the shared [`Remotes`] ([`Hooks::changed`] then re-publishes). The link
@@ -1004,7 +1005,7 @@ impl<'a> LinkLoop<'a> {
     fn serve(&mut self, link: &mut Link, rx: &Receiver<Cmd>) -> End {
         let name = self.entry.name.clone();
         let t = self.inner.timing;
-        if let Err(why) = self.quick(link, "subscribe", json!({ "topics": ["instances"] })) {
+        if let Err(why) = self.quick(link, "subscribe", json!({ "topics": ["instances", "roots"] })) {
             return End::Lost(why);
         }
         // Every link-up lists: the machine may have new roots since.
@@ -1063,6 +1064,8 @@ impl<'a> LinkLoop<'a> {
             }
             match link.conn.next_notification(t.tick) {
                 Ok(Some(n)) if n.method == "instances.snapshot" => self.store(n.params, watched.fleet.as_deref()),
+                // An instance removed there, a root picked or dropped.
+                Ok(Some(n)) if n.method == "roots.changed" => self.relist = true,
                 Ok(Some(n)) if n.method == "closing" => {
                     let reason = n.params.get("reason").and_then(Value::as_str).unwrap_or("closing");
                     return End::Lost(format!("{name}: its devsandbox serve is exiting ({reason})"));
@@ -1652,8 +1655,9 @@ mod tests {
     /// then (a `!/x` entry: root `/x` with an `error`, as a recorded root
     /// whose directory is gone lists, its watch refused `not-found`) and
     /// whose `sandboxes.list {root}` answers one `s` there; every other
-    /// call `ok`, a watch followed by its root's (empty) snapshot, each
-    /// call's `method dir|root` kept in `calls`.
+    /// call `ok`, a watch followed by its root's (empty) snapshot, a
+    /// `test.rootsChanged` by a `roots.changed`, each call's `method
+    /// dir|root` kept in `calls`.
     fn listing_peer(calls: &Arc<Mutex<Vec<String>>>, listed: &Arc<Mutex<Vec<String>>>) -> Duplex {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (calls, listed) = (Arc::clone(calls), Arc::clone(listed));
@@ -1694,6 +1698,9 @@ mod tests {
                     if writeln!(&theirs, "{push}").is_err() {
                         break;
                     }
+                }
+                if method == "test.rootsChanged" && writeln!(&theirs, "{}", json!({"method": "roots.changed", "params": {}})).is_err() {
+                    break;
                 }
                 line.clear();
             }
@@ -1760,6 +1767,22 @@ mod tests {
         let machines = Machines::spawn(registry, Arc::default(), dial, no_route(), hold, opts(1, 0).machine_timing, hooks, None, |_| {});
         wait_for("/a watched", Duration::from_secs(5), || calls.lock().unwrap().iter().any(|c| c == "instances.watch /a"));
         (base, machines, calls, listed)
+    }
+
+    /// The machine's `roots.changed` (its last instance of a root removed
+    /// there) has the link list again: the root, and its rows, go.
+    #[test]
+    fn roots_changed_relists() {
+        let (base, machines, calls, listed) = listing_machine("roots-changed", vec!["/a".into(), "/b".into()]);
+        let h = machines.handle();
+        listed.lock().unwrap().retain(|r| r != "/b");
+        assert!(h.forward("b", "test.rootsChanged", json!({})).unwrap().error.is_none());
+        wait_for("/b gone", Duration::from_secs(5), || h.entries()[0].roots == [PathBuf::from("/a")]);
+        assert_eq!(h.remotes().get("b").unwrap().roots, [PathBuf::from("/a")]);
+        assert!(!h.remotes().get("b").unwrap().rows.contains_key(Path::new("/b")));
+        assert_eq!(calls.lock().unwrap().iter().filter(|c| c.starts_with("roots.list")).count(), 2);
+        drop(machines);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A listed root with an `error` (recorded there, its directory gone)
