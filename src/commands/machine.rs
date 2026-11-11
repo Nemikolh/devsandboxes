@@ -75,7 +75,7 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hu
     println!("added {} ({target}): {}", added.name, added_roots(&roots));
     println!("{}", fleet_line(&added.name, &added.fleet));
     if let Some(p) = &added.proposed {
-        println!("{}", proposed_line("its add", p));
+        println!("{}", added_proposal_line(&added.name, p));
     }
     if let Some(warning) = added.warning {
         eprintln!("warning: {warning}");
@@ -597,6 +597,13 @@ fn rm_lines(answer: &RmAnswer) -> Vec<String> {
             lines
         }
     }
+}
+
+/// `machine add`'s proposal: of the machine's add when this host
+/// introduced it, else of this host's join (the machine introduced this
+/// host and proposed it).
+fn added_proposal_line(machine: &str, p: &Proposed) -> String {
+    proposed_line(if p.name == machine { "its add" } else { "this host's join" }, p)
 }
 
 /// A proposal's outcome: where to approve it, or why it wasn't sent.
@@ -1139,6 +1146,16 @@ mod tests {
             rotation_lines(&r)[0],
             format!("proposed rotating this host's key to {} to lap: approve there with `devsandbox machine approve 4`", key.fingerprint())
         );
+    }
+
+    #[test]
+    fn an_adds_proposal_names_who_joins() {
+        let theirs = Proposed { name: "box".into(), authority: "lap".into(), id: Some(2), error: None };
+        assert_eq!(added_proposal_line("box", &theirs), "proposed its add to lap: approve there with `devsandbox machine approve 2`");
+        let ours = Proposed { name: "pi".into(), authority: "lap".into(), id: Some(3), error: None };
+        assert_eq!(added_proposal_line("box", &ours), "proposed this host's join to lap: approve there with `devsandbox machine approve 3`");
+        let failed = Proposed { error: Some("box: membership.propose: down (failed)".into()), id: None, ..ours };
+        assert_eq!(added_proposal_line("box", &failed), "this host's join not proposed to the authority lap: box: membership.propose: down (failed)");
     }
 
     #[test]

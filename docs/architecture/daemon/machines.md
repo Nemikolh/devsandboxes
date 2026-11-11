@@ -793,7 +793,13 @@ introduced the machine, `machines.add` then proposes that introduction
 to the authority over any path (`fleet.propose`, best effort; the
 answer's `proposed`), and the CLI prints `proposed its add to
 <authority>: approve there with devsandbox machine approve <id>`, or why
-not (`proposed_line`). `add --agent` grants the machine agent by its
+not (`proposed_line`). When the machine, not the authority, introduced
+this host (`membership.sign` there), `machines.add` keeps the probe open
+until this host's writes are done and asks the machine to propose it
+(`membership.propose {name}`, best effort; an error, an older machine's
+`unknown-method` included, is the answer's `proposed.error`, never a
+failed add), and the CLI prints `proposed this host's join to
+<authority>: …` (`added_proposal_line`). `add --agent` grants the machine agent by its
 confirmed key ([Agent](#agent)); a name the registry or an inbound
 neighbor has is refused. `set <name> --agent on|off` (`machines.set`;
 `--agent` is required) grants or withdraws it for a machine of any kind

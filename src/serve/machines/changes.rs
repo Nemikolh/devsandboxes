@@ -154,11 +154,12 @@ pub struct RotateProposed {
 }
 
 /// Run `method` if it's one of the local
-/// `membership.pending|approve|deny|rotate|hub`; `None` otherwise.
+/// `membership.pending|approve|deny|rotate|hub|propose`; `None` otherwise.
 pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
     let answer = match method {
         "membership.rotate" => parse::<Empty>(params).and_then(|_| rotate(ctx)).and_then(to_value),
         "membership.hub" => parse::<NameParams>(params).and_then(|p| hub(ctx, &p.name)).and_then(to_value),
+        "membership.propose" => parse::<NameParams>(params).and_then(|p| propose_introduction(ctx, &p.name)).and_then(to_value),
         "membership.pending" => pending(ctx),
         "membership.approve" => parse::<IdParams>(params).and_then(|p| approve(p.id, ctx)),
         "membership.deny" => parse::<IdParams>(params).and_then(|p| deny(p.id, ctx)),
@@ -686,6 +687,75 @@ pub fn hub(ctx: &Ctx, name: &str) -> Result<HubMove, ApiError> {
     }
 }
 
+/// What `membership.propose {name}` proposes (pure): the introduction of
+/// `name` that `me` (key `key`) signed and `stored` holds, as an `add`, and
+/// the log's authority to propose it to. `failed` in no log; `invalid` on
+/// the authority (it adds, it introduces no one) or with `name` in the log
+/// already; `not-found` with no such introduction held.
+pub fn plan_introduction(stored: Option<&Stored>, me: &str, key: &PublicKey, name: &str) -> Result<(String, Change), ApiError> {
+    let Some(s) = stored.filter(|s| s.log.membership().is_some()) else { return Err(no_log()) };
+    let m = s.log.membership().expect("filtered");
+    let authority = match leave::authority_of(Some(s), me, key) {
+        Authority::This => {
+            return Err(ApiError::invalid(format!(
+                "this host is the fleet's authority: it adds `{name}` itself (`machine add`), nothing to propose"
+            )));
+        }
+        Authority::Other(a) => a.to_string(),
+        Authority::None => return Err(no_log()),
+    };
+    if m.members.contains_key(name) {
+        return Err(ApiError::invalid(format!("`{name}` is in the fleet's membership log already: nothing to propose")));
+    }
+    let i = s.introductions.iter().find(|i| i.name == name && i.introducer == me).ok_or_else(|| {
+        ApiError::not_found(format!("this host (`{me}`) holds no introduction of `{name}` it signed: nothing to propose"))
+    })?;
+    Ok((authority, Change::Add { introduction: i.clone() }))
+}
+
+/// `membership.propose {name}`: the introduction of `name` this host signed
+/// (`membership.sign` on a joining host's request, fleet-driver plan step
+/// 1) proposed to the authority over any path ([`propose`], collapsing
+/// with a pending one), as `machines.add` proposes one it signs itself.
+pub fn propose_introduction(ctx: &Ctx, name: &str) -> Result<Proposed, ApiError> {
+    let path = leave::member_toml(ctx)?;
+    let (me, key) = membership_api::own(path, &ctx.hostname)?;
+    let stored = membership_api::load(path)?;
+    let (authority, change) = plan_introduction(stored.as_ref(), &me, &key.public_key(), name)?;
+    let id = propose(ctx, &authority, change)?;
+    Ok(Proposed { name: name.into(), authority, id: Some(id), error: None })
+}
+
+/// After `membership.sign` of `name` here: when this host's stored log
+/// holds the introduction of `name` it signed, the log sent to every
+/// machine this host holds ([`push`]), off the request thread and best
+/// effort, so the authority holds the introduction (its link graph takes
+/// the joiner's reports, routes reach it) before it approves the `add`.
+/// Logged.
+pub fn push_introduction(ctx: &Ctx, name: &str) {
+    let Some(links) = ctx.links.clone() else { return };
+    let Ok(path) = leave::member_toml(ctx) else { return };
+    let Ok((me, _)) = membership_api::own(path, &ctx.hostname) else { return };
+    let Ok(Some(stored)) = membership_api::load(path) else { return };
+    if !stored.introductions.iter().any(|i| i.name == name && i.introducer == me) {
+        return;
+    }
+    let joiner = name.to_string();
+    let thread = std::thread::Builder::new().name("serve-fleet-intro".into()).spawn(move || {
+        let name = joiner;
+        let (pushed, missed) = push(&links, &stored, None, false);
+        let missed: Vec<String> = missed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
+        crate::serve::daemon::log(&format!(
+            "introduced `{name}`: membership sent to [{}]{}",
+            pushed.join(", "),
+            if missed.is_empty() { String::new() } else { format!(", not to {}", missed.join(", ")) }
+        ));
+    });
+    if let Err(e) = thread {
+        crate::serve::daemon::log(&format!("introduced `{name}`: cannot send the membership on: {e}"));
+    }
+}
+
 /// `change` proposed to the fleet's authority `authority` over any path
 /// (`leave::call`: its direct link while up, else a route over this
 /// host's link graph): its id there. `failed` naming it when no path
@@ -869,7 +939,7 @@ mod tests {
     use crate::serve::endpoint;
     use crate::serve::fleet::mesh;
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
-    use super::{Change, ConfigSigned, Missed, Op, RotatePlan, can_rotate, configs_due, countersign_rotate, plan_hub, plan_rotate};
+    use super::{Change, ConfigSigned, Missed, Op, RotatePlan, can_rotate, configs_due, countersign_rotate, plan_hub, plan_introduction, plan_rotate};
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
     use crate::serve::fleet::member::{Member, write_for_test};
     use crate::serve::fleet::membership::{Introduction, Stored};
@@ -1544,6 +1614,28 @@ mod tests {
         assert_eq!(plan_rotate(&s, "box", &bx, &lap.public_key()).err().unwrap().code, "invalid");
     }
 
+    /// `lap` the authority, `box` and `pi` members, `new` introduced by box.
+    /// Box proposes its introduction of `new` to lap; pi (not its
+    /// introducer), lap (the authority) and a name with no introduction or
+    /// in the log already propose nothing; nor does a host in no fleet.
+    #[test]
+    fn an_introduction_is_planned_by_the_log() {
+        let (lap, bx) = (SigningKey::from_seed([1; 32]), SigningKey::from_seed([2; 32]));
+        let mut s = test_support::fleet("lap", &lap, "box", &[("box", bx.public_key()), ("pi", pk(3))]);
+        let g = s.log.membership().unwrap().genesis;
+        let i = Introduction::sign(&g, "new", pk(5), "box", &bx);
+        s.introduce(i.clone()).unwrap();
+        let (authority, change) = plan_introduction(Some(&s), "box", &bx.public_key(), "new").unwrap();
+        assert_eq!((authority.as_str(), change), ("lap", Change::Add { introduction: i }));
+        let e = plan_introduction(Some(&s), "pi", &pk(3), "new").unwrap_err();
+        assert!(e.code == "not-found" && e.message.contains("holds no introduction of `new` it signed"), "{}", e.message);
+        let e = plan_introduction(Some(&s), "lap", &lap.public_key(), "new").unwrap_err();
+        assert!(e.code == "invalid" && e.message.contains("is the fleet's authority"), "{}", e.message);
+        assert_eq!(plan_introduction(Some(&s), "box", &bx.public_key(), "zed").unwrap_err().code, "not-found");
+        assert_eq!(plan_introduction(Some(&s), "box", &bx.public_key(), "pi").unwrap_err().code, "invalid");
+        assert_eq!(plan_introduction(None, "box", &bx.public_key(), "new").unwrap_err().code, "failed");
+    }
+
     /// `lap` the authority, `box` the hub, `pi` a member, `new` introduced by
     /// box (capped).
     #[test]
@@ -1713,6 +1805,88 @@ mod tests {
 
         drop(lap);
         for (dir, daemon) in [&p_dir, &l_dir, &k_dir].into_iter().zip(daemons.into_iter().rev()) {
+            assert!(connect(dir).call("shutdown", json!({})).unwrap().error.is_none());
+            assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        }
+        for d in dialed {
+            d.cut();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Three daemons: K (`box`, the hub, a member), A (`lap`, the authority,
+    /// linked to K) and L (`pi`, in no fleet). L's `machine add box` has K
+    /// sign L's introduction over the add-time probe and propose it
+    /// (`membership.propose`): pending on A, which holds the introduction
+    /// from K's push; approved there, `pi` is a member of the log on all
+    /// three (L from K once its link is up).
+    #[test]
+    fn a_joining_hosts_introduction_is_proposed_by_its_signer() {
+        let base = scratch("changes-join-propose");
+        let (k_dir, a_dir, l_dir) = (base.join("k"), base.join("a"), base.join("l"));
+        let (k_opts, _) = daemon_opts(&base, "k");
+        let (mut a_opts, _) = daemon_opts(&base, "a");
+        let (mut l_opts, _) = daemon_opts(&base, "l");
+        let k_toml = k_opts.member.clone().unwrap();
+        let (a_toml, l_toml) = (a_opts.member.clone().unwrap(), l_opts.member.clone().unwrap());
+        let stored = test_support::fleet("lap", &key_of(&a_toml), "box", &[("box", key_of(&k_toml).public_key())]);
+        write_fleet(&stored, &[(&k_toml, "box", "self"), (&a_toml, "lap", "box")]);
+        write_for_test(&l_toml, &Member { name: "pi".into(), ..Default::default() });
+        crate::serve::machines::update(&base.join("a-data/machines.toml"), |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
+        let mut dialed = Vec::new();
+        for opts in [&mut a_opts, &mut l_opts] {
+            let (transport, d) = peer_transport(&k_dir, &k_toml);
+            opts.link_transport = Some(transport);
+            dialed.push(d);
+        }
+        let k_sock = k_dir.clone();
+        l_opts.probe = Some(std::sync::Arc::new(move |_: &Entry| {
+            crate::serve::machines::ssh::test_support::relayed(endpoint::connect(&k_sock)?)
+        }));
+        let mut daemons = vec![spawn_daemon(&k_dir, k_opts)];
+        drop(connect(&k_dir));
+        for (dir, opts) in [(&a_dir, a_opts), (&l_dir, l_opts)] {
+            daemons.push(spawn_daemon(dir, opts));
+            drop(connect(dir));
+        }
+        let on_k = |name: &str| {
+            let rows = connect(&k_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+            named(&rows, name).is_some_and(|r| connected(&r))
+        };
+        wait_for("lap connected on K", Duration::from_secs(10), || on_k("lap"));
+
+        let l_key = key_of(&l_toml).public_key();
+        let add = json!({"hub": false, "target": "me@box", "roots": [], "key": key_of(&k_toml).public_key()});
+        let r = call(&l_dir, "machines.add", add).unwrap();
+        assert_eq!(r["fleet"], json!({"hub": "box", "joined": "this"}));
+        assert_eq!(r["proposed"], json!({"name": "pi", "authority": "lap", "id": 1, "error": null}));
+        let i = test_support::read(&l_toml).unwrap().introductions;
+        assert_eq!((i.len(), i[0].name.as_str(), i[0].introducer.as_str()), (1, "pi", "box"));
+        wait_for("lap holds the introduction from box's push", Duration::from_secs(10), || {
+            test_support::read(&a_toml).unwrap().introductions.iter().any(|i| i.name == "pi" && i.key == l_key)
+        });
+        let pending = call(&a_dir, "membership.pending", json!({})).unwrap();
+        assert_eq!(pending.as_array().unwrap().len(), 1, "{pending}");
+        assert_eq!((&pending[0]["from"], &pending[0]["op"]["kind"]), (&json!("box"), &json!("add")));
+        // Asked again: the same pending proposal.
+        let again = call(&k_dir, "membership.propose", json!({"name": "pi"})).unwrap();
+        crate::serve::dts::assert_matches("FleetProposed", &again);
+        assert_eq!(again, json!({"name": "pi", "authority": "lap", "id": 1, "error": null}));
+        // Never on the authority, never for a name not introduced here.
+        assert_eq!(call(&a_dir, "membership.propose", json!({"name": "pi"})).unwrap_err().0, "invalid");
+        assert_eq!(call(&k_dir, "membership.propose", json!({"name": "zed"})).unwrap_err().0, "not-found");
+
+        let approved = call(&a_dir, "membership.approve", json!({"id": 1})).unwrap();
+        assert_eq!((&approved["change"], &approved["name"]), (&json!("add `pi`"), &json!("pi")));
+        for (what, toml) in [("lap", &a_toml), ("box", &k_toml), ("pi", &l_toml)] {
+            wait_for(&format!("pi a member on {what}"), Duration::from_secs(20), || {
+                let s = test_support::read(toml).unwrap();
+                s.log.membership().unwrap().key_of("pi") == Some(l_key) && s.introductions.is_empty()
+            });
+        }
+        assert_eq!(call(&a_dir, "membership.pending", json!({})).unwrap(), json!([]));
+
+        for (dir, daemon) in [&l_dir, &a_dir, &k_dir].into_iter().zip(daemons.into_iter().rev()) {
             assert!(connect(dir).call("shutdown", json!({})).unwrap().error.is_none());
             assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         }

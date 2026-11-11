@@ -85,7 +85,12 @@ rest of the add):
 - **H joins X's fleet**: X lets H in over the add-time probe
   (`membership.sign {name, key}` there: an `add` when X is the
   authority, else an introduction, refused when X is capped), and H
-  adopts X's answer.
+  adopts X's answer. An introduction X signed goes out to X's links at
+  once (`changes::push_introduction`), so the authority holds it before
+  it approves; once H's writes are done, H asks X over the same probe to
+  propose it (`membership.propose {name}`, [Approvals and
+  pushes](#approvals-and-pushes)), the answer's `proposed` saying the id
+  or why not, never failing the add.
 - **An extra link**: each end adopts the other's log (the end behind
   takes the later entries); another fleet's log or a fork is refused,
   and so is an end the merged log doesn't list (member or introduced).
@@ -1881,11 +1886,20 @@ hash chain of entries only the authority signs
     nothing (`Signs::Already`), so an add that failed after the target
     signed can be run again; a name or key the log or a held
     introduction has otherwise is `invalid`. Stored; it answers the whole `Wire`, for the
-    joining host to adopt.
+    joining host to adopt. When the stored log holds the introduction
+    of `name` this host signed, the daemon then sends it to every
+    machine it holds (`changes::push_introduction`: `fleet.sync`, on a
+    thread of its own, best effort, logged).
+  - `membership.propose {name}` (`changes::propose_introduction`, over
+    the pure `changes::plan_introduction`): the introduction of `name`
+    this host signed, proposed to the authority as an `add` (`not-found`
+    with none held, `invalid` on the authority or for a name in the log
+    already); it answers `changes::Proposed`.
   - `membership.pending`, `.approve {id}`, `.deny {id}` are the
     authority's proposal queue, `membership.rotate` this host's key
-    rotation, `membership.hub {name}` a move of the hub role
-    (`machines::changes::call`, needing the links: [Approvals
+    rotation, `membership.hub {name}` a move of the hub role; these and
+    `membership.propose` run in `machines::changes::call`, needing the
+    links ([Approvals
     and pushes](#approvals-and-pushes), *Rotation* above).
 
 #### Approvals and pushes
@@ -1900,8 +1914,11 @@ it never signs on a remote request alone (decision 49;
   graph, the authority admitting it by the routed origin's proven key;
   no path: `failed`, naming the authority and why), `op` `{"kind": "revoke", "name"}` (a member's
   `machine rm`, or its own when it leaves) or `{"kind": "add",
-  "introduction"}` (the introduction a non-authority member's `machine
-  add` signs: `machines.add` proposes it after the add, best effort, its
+  "introduction"}` (the introduction a non-authority member signs: its
+  own `machine add` of a machine (`machines.add` proposes it after the
+  add), or a joining host's `machine add` of it (`membership.sign` over
+  the add-time probe, then `membership.propose {name}` there,
+  `changes::propose_introduction`); best effort either way, the add's
   answer's `proposed` saying the id or why not). The authority admits it
   only from a member of its log by its key (a capped one proposes
   nothing, decision 51), checks it against its log now

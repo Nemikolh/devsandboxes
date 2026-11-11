@@ -12,7 +12,11 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **machines**: a fleet driven from a laptop with no runtime: the
+  signer proposes a joining host's introduction, `machine add` on the
+  authority signs its configs, a run from the authority brings the
+  repos over `TRANSFER`, a host with no runtime is a clean driver.
+  → [plan](plans/active/fleet-driver.md)
 
 ## Planned
 
@@ -357,15 +361,12 @@ is frozen: no new work on it.
   `agent-link-<host>.sock` or `agent-route-<host>.sock` there; processes
   there use the newest live socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
-- An introduction the machine signs for this host (this host joining a
-  non-authority member's fleet with `machine add`, `membership.sign`
-  there) isn't proposed to the authority: the joining host is capped and
-  proposes nothing, and the signer doesn't propose it. (One this host
-  signs for the machine is proposed after the add, over any path; with
-  none, the add's answer says why and the member stays capped until it's
-  proposed some other way.)
+- An introduction's proposal that fails at `machine add` (no path to
+  the authority then; the add's answer says why) has no CLI verb to
+  retry it: the member stays capped until `membership.propose {name}` is
+  called on its introducer.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes);
-  `machines::api::add`, `machines::changes::propose`
+  `machines::api::add`, `machines::changes::propose_introduction`
 - A member only introduced (capped, not in the log) can't be removed with
   `machine rm`: the log has no key of it to revoke; it goes once its
   introducer is revoked. → [fleet](architecture/daemon/fleet.md); `machines::changes::revoke`

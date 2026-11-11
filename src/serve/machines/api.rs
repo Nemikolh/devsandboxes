@@ -20,7 +20,9 @@
 //! every check first, then the machine's `member.set {name}` and its
 //! membership (`membership.adopt`, or `membership.sign` of this host),
 //! this host's registry entry, and this host's membership, whose adopt
-//! writes its `hub`.
+//! writes its `hub`; then the proposal of whichever end's introduction
+//! the add made, the machine's over the still-open probe
+//! (`membership.propose`).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -149,7 +151,9 @@ pub struct Added {
     pub fleet: Fleet,
     /// When this host (not the authority) introduced the machine: that
     /// introduction proposed to the authority (`fleet.propose`, best
-    /// effort), its id there or why not.
+    /// effort), its id there or why not. When the machine (not the
+    /// authority) introduced this host: that introduction, proposed by the
+    /// machine (`membership.propose` over the probe, best effort).
     #[serde(default)]
     pub proposed: Option<super::changes::Proposed>,
 }
@@ -322,6 +326,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         Ok(())
     };
     // What this host adopts once its entry is saved.
+    let signed_there = matches!(logs, Logs::Signed);
     let here: Stored = match logs {
         Logs::Both(next) => {
             adopt_there(&mut link, &next, &written)?;
@@ -339,7 +344,8 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         }
     };
     written.push(format!("{}'s membership.json", entry.name));
-    drop(link);
+    // The probe stays open: an introduction the machine signed is proposed
+    // over it once this host's writes are done.
 
     let saved = super::update(&ctx.registry, |entries| {
         if entries.iter().any(|e| e.name == entry.name) {
@@ -376,6 +382,19 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
             Err(e) => super::changes::Proposed { name, authority, id: None, error: Some(e.message) },
         }
     });
+    // This host introduced by the machine: the machine proposes it.
+    let proposed = proposed.or_else(|| {
+        let authority = signed_there.then(|| introduced_there(&here, &this_name, &signer.public_key())).flatten()?;
+        let asked: Result<super::changes::Proposed, ApiError> =
+            remote_call(&mut link, &entry.name, "membership.propose", json!({ "name": this_name }));
+        Some(asked.unwrap_or_else(|e| super::changes::Proposed {
+            name: this_name.clone(),
+            authority,
+            id: None,
+            error: Some(e.message),
+        }))
+    });
+    drop(link);
     let warning = (version != ctx.version)
         .then(|| format!("{} runs devsandbox {version}, this is {}", entry.name, ctx.version));
     to_value(Added { name: entry.name, roots: entry.roots, version, warning, fleet: plan.fleet, proposed })
@@ -387,6 +406,17 @@ fn introduced_here(before: &Stored, after: &Stored, me: &str, name: &str) -> Opt
     let i = after.introductions.iter().find(|i| i.name == name && i.introducer == me && !before.introductions.contains(i))?;
     let authority = after.log.membership()?.authority.0.clone();
     Some((authority, i.clone()))
+}
+
+/// The log's authority, when `here` holds `me` (`key`) as an introduction
+/// rather than in the log (pure): a `membership.sign` of this host by a
+/// member that isn't the authority, which that member proposes.
+fn introduced_there(here: &Stored, me: &str, key: &PublicKey) -> Option<String> {
+    let m = here.log.membership()?;
+    if m.key_of(me) == Some(*key) || !here.introductions.iter().any(|i| i.name == me && i.key == *key) {
+        return None;
+    }
+    Some(m.authority.0.clone())
 }
 
 /// This host's member name and hub, from its `member.toml`.
@@ -761,6 +791,18 @@ mod tests {
         let m = SigningKey::from_seed([8; 32]);
         let s = fleet("k", &k_key(), "k", &[("m", m.public_key())]);
         membership_api::sign_into(&s, &membership_api::Own { name: "m", key: m.public_key(), next: None }, &m, name, &key).unwrap()
+    }
+
+    /// Introduced (by `m`): the authority `k` proposes it. In the log, by
+    /// another key, under another name, or in no log: nothing.
+    #[test]
+    fn an_introduction_of_this_host_names_the_authority() {
+        let key = SigningKey::from_seed([5; 32]).public_key();
+        assert_eq!(introduced_there(&capped("lap", key), "lap", &key), Some("k".into()));
+        assert_eq!(introduced_there(&capped("lap", key), "lap", &SigningKey::from_seed([6; 32]).public_key()), None);
+        assert_eq!(introduced_there(&capped("lap", key), "pi", &key), None);
+        assert_eq!(introduced_there(&fleet("k", &k_key(), "k", &[("lap", key)]), "lap", &key), None);
+        assert_eq!(introduced_there(&Stored::default(), "lap", &key), None);
     }
 
     /// What a test fleet's setup writes: this host's and the machine's
@@ -1154,6 +1196,12 @@ mod tests {
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!(here, there);
         assert_eq!((here.introductions[0].name.as_str(), here.introductions[0].introducer.as_str()), ("lap", "box"));
+        // The machine proposes it (`membership.propose` over the probe); it
+        // has no path to `k`: the answer says why, the add stands.
+        let proposed = &r["proposed"];
+        assert_eq!((&proposed["name"], &proposed["authority"], &proposed["id"]), (&json!("lap"), &json!("k"), &Value::Null));
+        let error = proposed["error"].as_str().unwrap();
+        assert!(error.starts_with("box: membership.propose: the fleet's authority `k`: "), "{proposed}");
         pair.finish();
 
         let mut pair = Pair::fleets("mach-join-intro-capped", named("lap", ""), named("box", "k"), |_, machine| {

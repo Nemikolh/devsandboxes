@@ -904,7 +904,8 @@ export interface MachineAdded {
   fleet: MachineFleet;
   /**
    * When this host (not the fleet's authority) introduced the machine: the introduction proposed to the
-   * authority (`fleet.propose`, best effort), its id there or why not.
+   * authority (`fleet.propose`, best effort), its id there or why not. When the machine (not the authority)
+   * introduced this host: that introduction, which the machine proposed (`membership.propose`, best effort).
    */
   proposed: FleetProposed | null;
 }
@@ -1953,6 +1954,14 @@ export interface ApiMethods {
    * @experimental
    */
   'membership.sign': { params: { name: string; key: string }; result: MembershipStored };
+  /**
+   * Propose the introduction of `name` this host signed (`membership.sign`) to the fleet's authority as an `add`,
+   * over any path (a pending one of the same change answers its id). `not-found` when this host holds no
+   * introduction of `name` it signed, `invalid` on the authority or for a name in the log already, `failed`
+   * in no fleet's log or with no path to the authority. Local only.
+   * @experimental
+   */
+  'membership.propose': { params: { name: string }; result: FleetProposed };
   /** The membership changes proposed to this host (the fleet's authority), oldest first. Local only. @experimental */
   'membership.pending': { params: {}; result: FleetProposal[] };
   /**

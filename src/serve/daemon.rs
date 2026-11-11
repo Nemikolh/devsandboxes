@@ -2205,25 +2205,36 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             stored.and_then(|s| serde_json::to_value(shared.graph.reports(s.as_ref())).map_err(|e| api::ApiError::internal(e.into())))
         }
         // Local only too: the proposals queued here, approved over the links.
-        "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" | "membership.hub" if shared.machines.is_some() => {
+        "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" | "membership.hub" | "membership.propose"
+            if shared.machines.is_some() =>
+        {
             let ctx = shared.machines.as_ref().expect("checked");
-            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny|rotate|hub method")
+            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny|rotate|hub|propose method")
         }
         // Local only too; an adopt wrote `hub` from the log and may have
         // promoted this host's next key: both followed here.
         method if method.starts_with("membership.") => match &shared.member {
-            Some(path) => match fleet::membership_api::call(method, req.params, path, &shared.hostname) {
-                Some((answer, follow)) => {
-                    if let Some(follow) = follow {
-                        shared.set_hub(follow.hub);
-                        if follow.rotated {
-                            shared.key_rotated();
+            Some(path) => {
+                let signing = (method == "membership.sign").then(|| req.params.get("name").and_then(Value::as_str).map(str::to_string));
+                match fleet::membership_api::call(method, req.params, path, &shared.hostname) {
+                    Some((answer, follow)) => {
+                        // An introduction signed here (the sign's lock
+                        // released by now) goes out to the links, so the
+                        // authority holds it before it approves the add.
+                        if let (Ok(_), Some(Some(name)), Some(ctx)) = (&answer, &signing, &shared.machines) {
+                            machines::changes::push_introduction(ctx, name);
                         }
+                        if let Some(follow) = follow {
+                            shared.set_hub(follow.hub);
+                            if follow.rotated {
+                                shared.key_rotated();
+                            }
+                        }
+                        answer
                     }
-                    answer
+                    None => Err(api::ApiError::unknown_method(method)),
                 }
-                None => Err(api::ApiError::unknown_method(method)),
-            },
+            }
             None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
         method if method.starts_with("machines.") && shared.machines.is_some() => {
