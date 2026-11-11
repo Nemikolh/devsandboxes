@@ -46,8 +46,10 @@ written through `RawEntry`): `target` (`me@host`, an ssh-config alias, or
 the file, the error naming it (`machines::parse`: delete it by hand).
 `Kind::Inbound` is the other kind, never in the file: the service's
 entry for an [inbound neighbor](#inbound-neighbors) (`Entry::inbound`).
-Then `roots` (remote config roots; `machines.add` writes none, never
-rewritten by the link), an optional
+No roots: a machine's are what its own daemon lists
+([Live roots](#held-links-machines); `Entry::roots` holds them in
+memory, never written, and an older build's `roots` key is ignored and
+dropped by the next write). Then an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
@@ -86,9 +88,9 @@ only (`machines::inbound::Neighbors`, shared by `machines::api::Ctx`, the
 <name>` announces it (`links.inbound`) on a connection it holds; the
 neighbor lasts while that connection does (`Guard`, the newest announce
 of a name winning, so an older connection's close never removes a newer
-one's). Its roots are its own config roots and this host's fleet root
-there, as its daemon answered `roots.list` over the link once announced
-(`daemon::inbound_roots`; empty until then).
+one's). Its roots are its link's listing, as any machine's (its own
+config roots and this host's fleet root there, the `roots.list` the held
+link asks at each link-up; empty until then).
 
 An inbound neighbor is a machine like a registered one (fleet plan
 decision 28), of kind `inbound` (`Kind::Inbound`, `MachineKind::Inbound`,
@@ -242,8 +244,8 @@ settled below this, by the peer link's [key proof](fleet.md#key-proof);
 the add-time probe has no link and checks the confirmed key instead.
 
 `handshake` takes what the stream is (`Over`). A link's `API` stream
-(`Over::Link`: the held link, forwarded verbs, capacity asks,
-`daemon::inbound_roots`) is the remote daemon from its first byte: no
+(`Over::Link`: the held link, forwarded verbs, capacity asks) is the
+remote daemon from its first byte: no
 login shell in a mux stream, so no sentinel (fleet plan decision 27).
 The add-time probe (`Over::Ssh`) reads up to the relay's sentinel first:
 `api --stdio --sentinel` writes `\n` + `devsandbox-api 1\n`
@@ -264,11 +266,11 @@ The daemon runs a `Machines` service for its whole life: one
 `serve-machine-<name>` thread per registered machine and per inbound
 neighbor up now, plus, for an ssh machine, a `serve-machine-<name>-link`
 thread carrying its link, started, stopped or restarted when `add`/`set`/`rm`
-change the registry or a neighbor comes, goes or gets its roots
+change the registry or a neighbor comes or goes
 (`Handle::reload`, which the neighbors' hook, `Neighbors::on_change`,
 calls; one reload at a time; a change to a machine's entry restarts its
-link, but a change of its roots alone, such as a neighbor's roots coming
-in, goes to the running link (`Cmd::Roots`), which watches them anew).
+link, and a reload leaves a kept machine's roots and rows in `Remotes`
+as its link left them, `Remotes::sync`).
 Agent grants aren't the registry's: a grant change reloads nothing.
 `Handle::entries` is both sources (`service::with_inbound`). Every link is
 held from the start, wanted or not (fleet plan decision 7), an inbound
@@ -319,22 +321,24 @@ one's while its neighbor is up.
   down ends the link at once and is the machine's `error`; a carrier
   coming up is dialed at once; a connect that fails or a link lost over a
   live carrier is retried with the backoff.
-- **Live roots.** A machine's roots, as federation uses them, are its
-  entry's `roots` (the registry's, in order) then every root its last
-  `roots.list` over the link answered that isn't among them
-  (`service::live_roots`; the listing kept in the thread's `Ctl`). A
-  listed row with an `error` (a root recorded there whose directory is
-  gone) is left out unless it's the `fleet` row, so it's never watched
-  and refused. Each change of them, a listing's or a reload's
-  (`Cmd::Roots`), goes into `Remotes` under the links lock that
-  `Handle::reload` syncs `Remotes` under (`LinkLoop::apply_roots`), so
-  the last write is the newest roots:
-  `Handle::entries` returns them, so `forward::sandboxes_everywhere`,
-  `forward::resolve_everywhere`, `verbs_client::run_target`'s
-  `sandboxes.list` and the watch above all see a root the machine got
-  after `machine add` (a [signed config copy](fleet.md) it installed
-  since, under `mesh/tree/`) with no re-add, and `Remotes` stores its
-  pushes. The link lists at each link-up and again on `Handle::relist`:
+- **Live roots.** A machine's roots are what its last `roots.list`
+  over the link answered, in that order (sorted: `serve::api::roots_list`;
+  its state.toml `config_dir`s, `~/.devsandboxes`, its signed copies,
+  its `member.toml` `roots` and this host's fleet root there), nothing
+  this host picked. A listed row with an `error` (a root recorded there
+  whose directory is gone) is left out unless it's the `fleet` row, so
+  it's never watched and refused. A listing goes into `Remotes`
+  (`Machine::roots`; a root no longer listed loses its rows) under the
+  links lock that `Handle::reload` syncs `Remotes` under
+  (`LinkLoop::apply_roots`). Before a machine's link first lists, its
+  roots are none, or on a hub the ones `remotes.json` restored with its
+  rows (`saved::SavedMachine::roots`), kept until it lists.
+  `Handle::entries`, `machines.list` and `machines.get` answer them, so
+  `forward::sandboxes_everywhere`, `forward::resolve_everywhere`,
+  `verbs_client::run_target`'s `sandboxes.list` and the watch above all
+  see a root the machine got later (a [signed config copy](fleet.md) it
+  installed since, under `mesh/tree/`) with nothing to do here, and
+  `Remotes` stores its pushes. The link lists at each link-up and again on `Handle::relist`:
   after each `fleet.sync` this host's `changes::push` got through to the
   machine, and each one that came from it (`changes::sync`), since a
   member installs a moved config before answering a sync and sends the

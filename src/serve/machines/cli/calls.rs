@@ -321,7 +321,7 @@ pub(crate) fn listing(call: &mut Call, u: &Use, m: &str, out: &mut dyn Write) ->
 }
 
 /// The config roots a machine root `at` stands for, from a listing of it:
-/// `at` itself when it is one (an ssh machine's registered roots), and the
+/// `at` itself when it is one (a root the machine lists of its own), and the
 /// config roots under it its instance rows name (a fleet root's, one per
 /// placed config; a listing lists every admitted instance, so rows outside
 /// `at` are other roots'). A root without a config of its own (the
@@ -344,7 +344,7 @@ pub(crate) fn config_roots(at: &Path, list: &InstancesList) -> Vec<PathBuf> {
     roots
 }
 
-/// `--machine m ls|status|service ls` (`u`) on machine `m` with registered
+/// `--machine m ls|status|service ls` (`u`) on machine `m` with listed
 /// `roots`: one `instances.list` per config root ([`config_roots`]), each
 /// after its banner on `err` (`cli::root_banners`' rules: `--json` with
 /// several roots is an error). The exit code.

@@ -190,8 +190,8 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `link_agent_socket`, `accept_any`), `src/serve/fleet/link.rs`
 (`connect`),
 `src/serve/machines/inbound.rs` (`Neighbors`, `Neighbor`, `Guard`,
-`taken`), `src/serve/daemon.rs` (`machine_dialer`, `links_inbound`,
-`inbound_roots`), `src/serve/fleet/lent.rs` (`with_fleet_root`); over a
+`taken`), `src/serve/daemon.rs` (`machine_dialer`, `links_inbound`),
+`src/serve/fleet/lent.rs` (`with_fleet_root`); over a
 link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `exit_of`, `Terminal`, `attach`, `dial`), `src/serve/machines/cli.rs`
 (`dials`, `reconnect_loop`, `session_exec`, `pipe_mode`); hub mode:
@@ -480,13 +480,11 @@ dial is a process of its own).
   hub flag `update::is_hub` of it) and holds that connection for the
   link's life (`Announce`): K's daemon keeps L in its inbound neighbors
   (`machines::inbound::Neighbors`) while the connection lives, the newest
-  announce of a name winning (`Guard`), and asks L's roots over
-  `fleet-L.sock` on a thread (`daemon::inbound_roots`: the hello as
-  `0.0.0`, then `roots.list`, which L answers with its own roots and
-  K's fleet root there, flagged `fleet`, `lent::with_fleet_root`). L is
-  then a machine on K like a registered one, of kind `inbound`: K's
-  `Machines` service holds a link to it over `fleet-L.sock` while the
-  neighbor is up, so its rows, quick calls, verbs, the CLI's re-runs,
+  announce of a name winning (`Guard`). L is then a machine on K like a
+  registered one, of kind `inbound`: K's `Machines` service holds a link
+  to it over `fleet-L.sock` while the neighbor is up, whose `roots.list`
+  at link-up gives L's roots (L answers with its own roots and K's fleet
+  root there, flagged `fleet`, `lent::with_fleet_root`), so its rows, quick calls, verbs, the CLI's re-runs,
   terminal tabs, forwards and placement reach L through the socket this
   end binds ([over a link](#over-a-link)), each stream served by L's
   daemon under L's trust table for K
@@ -1119,11 +1117,12 @@ links to, one hop, as the old one's was. A hub:
 
   ```json
   {
-    "version": 1,
+    "version": 2,
     "machines": {
       "lap": {
         "at": 1761566400,
         "version": "0.6.0",
+        "roots": ["/remote/root"],
         "rows": { "/remote/root": { "dir": "/remote/root", "instances": [] } }
       }
     }
@@ -1131,15 +1130,19 @@ links to, one hop, as the old one's was. A hub:
   ```
 
   `at` is when the rows were pushed (unix seconds), `version` the
-  machine's devsandbox from its last hello, `rows` each remote root's last
-  `instances.snapshot` params, as `Remotes` holds them; a machine with
-  neither rows nor a version isn't saved. Kind, target, roots and the rest
-  come from `machines.toml`. A file of another `version` or one that
+  machine's devsandbox from its last hello, `roots` its roots as its link
+  last listed them (in order, `snapshots::Machine::roots`), `rows` each
+  remote root's last `instances.snapshot` params, as `Remotes` holds them;
+  a machine with neither rows nor a version isn't saved. Kind, target and
+  the rest come from `machines.toml`. A file of another `version` or one that
   doesn't parse is ignored and overwritten by the next save.
 - **At start** `Machines::spawn` loads the file (`saved::load`,
   `saved::machines`) into `Remotes` (`Remotes::restore`) before the first
-  registry sync, which drops the machines and roots no longer registered
-  (and the next save drops them from the file). Restored machines are
+  registry sync, which drops the machines no longer registered (and the
+  next save drops them from the file). A kept machine's restored roots
+  and rows stay until its link lists (`roots.list` at link-up:
+  `LinkLoop::apply_roots` drops the rows of roots no longer listed).
+  Restored machines are
   `restored`: `Machine::set_link` shows them `unreachable`, `error` saying
   why with the rows' time (`not reconnected since this daemon started
   (rows from Oct 27 12:00 UTC)`, or the link's failure with the same
@@ -2659,9 +2662,10 @@ a `lent::Reach` from this host's files (`Reach::load` over
 - **`trust`**, `member.toml`'s; no file (or no data dir) is `worker`. A
   `member.toml` that doesn't load fails closed: `worker`, no picked roots,
   the error logged.
-- **Own roots** (`Reach::own`): `lent::own_roots` (every `config_dir` in
-  `state.toml` plus `~/.devsandboxes`, what `roots.list` answers) and
-  `member.toml`'s `roots`, canonicalized where they exist (decision 17 of
+- **Own roots** (`Reach::own`): `lent::listed_roots`, what `roots.list`
+  answers: `lent::own_roots` (every `config_dir` in `state.toml`,
+  `~/.devsandboxes` and the signed configs' copies) and `member.toml`'s
+  `roots`, canonicalized where they exist (decision 17 of
   the [plan](../../plans/active/fleet.md#decisions)); those are written
   by `devsandbox machine roots add` (`commands::machine::roots`). Placed instances'
   config roots are in `state.toml` too.

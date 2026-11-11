@@ -214,9 +214,9 @@ pub struct Machine {
     pub target: Option<String>,
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
-    /// Its roots (the registry's, then the ones its last `roots.list`
-    /// added, `service::live_roots`), in order: the first one shows the
-    /// instances whose root isn't among them.
+    /// Its roots: what its link's last `roots.list` answered, in that order
+    /// (a hub's restored ones until it lists; none before): the first one
+    /// shows the instances whose root isn't among them.
     pub roots: Vec<PathBuf>,
     pub state: LinkState,
     pub error: Option<String>,
@@ -286,8 +286,10 @@ pub struct Remotes {
 
 impl Remotes {
     /// Follow the service's entries: new machines start
-    /// [`LinkState::Idle`], removed ones (an inbound neighbor gone too) go
-    /// with their rows, and a root no longer listed loses its.
+    /// [`LinkState::Idle`] with no roots, removed ones (an inbound neighbor
+    /// gone too) go with their rows. A kept machine's roots and rows are
+    /// left to its link (`service`'s listing): a hub's restored ones stay
+    /// until the machine lists.
     pub fn sync(&self, entries: &[Entry]) {
         let mut inner = self.lock();
         inner.retain(|name, _| entries.iter().any(|e| e.name == *name));
@@ -295,9 +297,12 @@ impl Remotes {
             let m = inner.entry(e.name.clone()).or_insert_with(|| Machine { name: e.name.clone(), ..Machine::default() });
             (m.kind, m.target) = e.kind.wire();
             m.command.clone_from(&e.command);
-            m.roots.clone_from(&e.roots);
-            m.rows.retain(|root, _| e.roots.contains(root));
         }
+    }
+
+    /// Machine `name`'s roots ([`Machine::roots`]); none for a name not here.
+    pub fn roots(&self, name: &str) -> Vec<PathBuf> {
+        self.lock().get(name).map(|m| m.roots.clone()).unwrap_or_default()
     }
 
     /// Put machines restored from a hub's `remotes.json` in (before the
@@ -963,22 +968,25 @@ pub(crate) mod tests {
     #[test]
     fn remotes_follow_the_registry() {
         let remotes = Remotes::default();
-        let entry = |name: &str, roots: &[&str]| Entry { roots: roots.iter().map(PathBuf::from).collect(), ..Entry::ssh(name, name) };
-        remotes.sync(&[entry("a", &["/1", "/2"]), entry("b", &["/b"]), Entry::inbound("w", Vec::new())]);
+        remotes.sync(&[Entry::ssh("a", "a"), Entry::ssh("b", "b"), Entry::inbound("w")]);
         let w = remotes.get("w").unwrap();
         assert_eq!((w.kind, w.target), (MachineKind::Inbound, None));
         assert_eq!(remotes.get("a").unwrap().target.as_deref(), Some("a"));
+        assert!(remotes.roots("a").is_empty(), "none until it lists");
         remotes.update("a", |m| {
             m.state = LinkState::Connected;
+            m.roots = vec!["/2".into(), "/1".into()];
             m.rows.insert("/1".into(), Arc::new(Value::Null));
             m.rows.insert("/2".into(), Arc::new(Value::Null));
         });
         remotes.update("nope", |_| panic!("not registered"));
-        remotes.sync(&[entry("a", &["/2"])]);
+        // Its entry has no roots: the link's listing stays, rows and all.
+        remotes.sync(&[Entry { command: Some("ds".into()), ..Entry::ssh("a", "a") }]);
         let all = remotes.all();
         assert_eq!(all.len(), 1);
-        assert_eq!((all[0].state, all[0].rows.keys().collect::<Vec<_>>()), (LinkState::Connected, vec![&PathBuf::from("/2")]));
-        assert!(remotes.get("b").is_none());
+        assert_eq!((all[0].state, all[0].rows.len(), all[0].command.as_deref()), (LinkState::Connected, 2, Some("ds")));
+        assert_eq!(remotes.roots("a"), [PathBuf::from("/2"), PathBuf::from("/1")]);
+        assert!(remotes.get("b").is_none() && remotes.roots("b").is_empty());
     }
 
     #[test]

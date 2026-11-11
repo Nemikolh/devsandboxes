@@ -169,8 +169,9 @@ pub struct Added {
 }
 
 /// One `machines.list` row: the registry entry, or an inbound neighbor up
-/// now (`kind` `inbound`: no `target`, `roots` its `roots.list`), and its
-/// held link's live state (`error` the last failure while `unreachable`;
+/// now (`kind` `inbound`: no `target`), `roots` what its link's last
+/// `roots.list` answered (`snapshots::Machine::roots`), and its held
+/// link's live state (`error` the last failure while `unreachable`;
 /// `version` from the last hello). Or a routed machine (`kind` `routed`,
 /// fleet plan decision 60; `snapshots::Routed`): no `target` or `command`,
 /// `roots`, `version` and `capacity` as the hub's view has them,
@@ -471,8 +472,9 @@ fn list(ctx: &Ctx) -> Answer {
     let rows: Vec<MachineRow> = machines(ctx)?
         .into_iter()
         .map(|e| {
-            let live = ctx.links.as_ref().and_then(|l| l.remotes().get(&e.name)).unwrap_or_default();
+            let mut live = ctx.links.as_ref().and_then(|l| l.remotes().get(&e.name)).unwrap_or_default();
             let (kind, target) = e.kind.wire();
+            let capacity = live.capacity();
             MachineRow {
                 introduced_by: introducer_of(stored.as_ref(), &e.name),
                 exposed_by: exposed.get(&e.name).cloned(),
@@ -480,9 +482,9 @@ fn list(ctx: &Ctx) -> Answer {
                 name: e.name,
                 kind,
                 target,
-                roots: e.roots,
+                roots: std::mem::take(&mut live.roots),
                 command: e.command,
-                capacity: live.capacity(),
+                capacity,
                 state: live.state,
                 error: live.error,
                 version: live.version,
@@ -527,7 +529,7 @@ pub(super) fn machines(ctx: &Ctx) -> Result<Vec<Entry>, ApiError> {
         .list()
         .into_iter()
         .filter(|n| !entries.iter().any(|e| e.name == n.name))
-        .map(|n| Entry::inbound(n.name, n.roots))
+        .map(|n| Entry::inbound(n.name))
         .collect();
     entries.extend(inbound);
     Ok(entries)
@@ -557,7 +559,8 @@ struct GetParams {
 }
 
 /// One machine (registered, inbound or routed: a routed one's roots as
-/// the hub's view has them, no `target`). `agent` is the caller's `SSH_AUTH_SOCK`
+/// the hub's view has them, no `target`), its roots what its link last
+/// listed (`service::Handle::entries`). `agent` is the caller's `SSH_AUTH_SOCK`
 /// (absolute), reported to this daemon (`bridge::report_agent`), so the
 /// agent this host answers the machine's `AGENT` streams with
 /// (`bridge::host_agent`) is the caller's: what a CLI re-run over ssh on
@@ -586,14 +589,8 @@ fn get(p: GetParams, ctx: &Ctx) -> Answer {
     }
     let entry = entry.ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
     let (kind, target) = entry.kind.wire();
-    to_value(MachineInfo {
-        name: entry.name,
-        kind,
-        target,
-        command: entry.command,
-        roots: entry.roots,
-        agent,
-    })
+    let roots = ctx.links.as_ref().map(|l| l.remotes().roots(&entry.name)).unwrap_or_default();
+    to_value(MachineInfo { name: entry.name, kind, target, command: entry.command, roots, agent })
 }
 
 #[derive(Deserialize)]
@@ -1380,7 +1377,7 @@ mod tests {
         }
         // This host joining: its name is one the machine's fleet knows.
         let mut pair = Pair::members("mach-name-known", "0.6.0", named("lap", ""), named("box", "self"), |_| {});
-        let theirs = Entry { roots: vec!["/r".into()], ..Entry::ssh("lap", "me@other") };
+        let theirs = Entry::ssh("lap", "me@other");
         crate::serve::machines::update(&pair.base.join("remote-machines.toml"), |e| e.push(theirs)).unwrap();
         let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
         assert_eq!(code, "invalid");
@@ -1413,7 +1410,7 @@ mod tests {
         let base = scratch("mach-set");
         let registry = base.join("machines.toml");
         let member_toml = base.join("member.toml");
-        let entry = Entry { roots: vec!["/r".into()], ..Entry::ssh("box", "me@box") };
+        let entry = Entry::ssh("box", "me@box");
         crate::serve::machines::update(&registry, |e| e.push(entry.clone())).unwrap();
         let daemon = spawn_daemon(&base.join("local"), local_opts(&base, None));
         let mut local = client_at(&base.join("local"));

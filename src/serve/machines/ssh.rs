@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn every_argv_refuses_an_inbound_machine() {
-        let e = Entry::inbound("lap", Vec::new());
+        let e = Entry::inbound("lap");
         let refusals = [probe_argv(&e, "c"), script_argv(&e, "true", &[] as &[&str])];
         for r in refusals {
             let err = format!("{:#}", r.unwrap_err());

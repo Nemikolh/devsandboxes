@@ -245,7 +245,7 @@ fn tidy(machine: &str, message: &str) -> String {
 }
 
 /// `sandboxes.list {root, machines: true}`: `local` (this root's entries)
-/// then each machine's roots' (registry and live, `Handle::entries`), tagged `machine` and `root` (a
+/// then each machine's roots' (what its link listed, `Handle::entries`), tagged `machine` and `root` (a
 /// routed machine's roots as the hub's view has them, `snapshots::Routed`).
 /// A machine or root that doesn't answer adds nothing: the result stays an
 /// array, and a client wanting to say why reads `machines.list`.
@@ -528,9 +528,7 @@ mod tests {
             std::fs::write(&local_state, instance("web-l", "web", &local_root)).unwrap();
 
             let registry = base.join("machines.toml");
-            let boxed = Entry { roots: vec![remote_root.clone()], ..Entry::ssh("box", "me@box") };
-            let down = Entry { roots: vec!["/nonexistent".into()], ..Entry::ssh("down", "me@down") };
-            crate::serve::machines::update(&registry, |e| e.extend([boxed, down])).unwrap();
+            crate::serve::machines::update(&registry, |e| e.extend([Entry::ssh("box", "me@box"), Entry::ssh("down", "me@down")])).unwrap();
 
             let remote_dir = base.join("remote");
             let (runner, verb_dir) = verbs::tests::script_runner(tag, script);
@@ -562,7 +560,10 @@ mod tests {
             drop(conn_at(&remote_dir));
             let mut local = conn_at(&base.join("local"));
             let deadline = Instant::now() + Duration::from_secs(10);
-            while machine_state(&mut local, "box") != "connected" || machine_state(&mut local, "down") != "unreachable" {
+            // Settled: box connected and its roots listed (its link's
+            // `roots.list`: the remote root), down unreachable.
+            let listed = |c: &mut Conn| machine_row(c, "box")["roots"].as_array().is_some_and(|a| a.contains(&json!(remote_root)));
+            while machine_state(&mut local, "box") != "connected" || !listed(&mut local) || machine_state(&mut local, "down") != "unreachable" {
                 assert!(Instant::now() < deadline, "the links never settled");
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -779,9 +780,12 @@ mod tests {
     }
 
     fn machine_state(c: &mut Conn, name: &str) -> String {
+        machine_row(c, name)["state"].as_str().unwrap().to_string()
+    }
+
+    fn machine_row(c: &mut Conn, name: &str) -> Value {
         let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
-        let row = rows.as_array().unwrap().iter().find(|r| r["name"] == name).unwrap().clone();
-        row["state"].as_str().unwrap().to_string()
+        rows.as_array().unwrap().iter().find(|r| r["name"] == name).unwrap().clone()
     }
 
     /// A verb reports the requester's agent to this daemon, which answers

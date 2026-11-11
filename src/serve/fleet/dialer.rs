@@ -536,8 +536,7 @@ pub(crate) mod tests {
             let (mut l_opts, l_data) = daemon_opts(&base, "l");
             std::fs::write(l_data.join("member.toml"), "name = \"lap\"\n").unwrap();
             let l_registry = l_data.join("machines.toml");
-            let entry = Entry { roots: vec![k_own.clone()], ..Entry::ssh("box", "me@box") };
-            crate::serve::machines::update(&l_registry, |e| e.push(entry)).unwrap();
+            crate::serve::machines::update(&l_registry, |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
             let k_member = k_opts.member.clone().unwrap();
             let (transport, dialed) = peer_transport(&k_dir, &k_member);
             l_opts.link_transport = Some(transport);
@@ -1391,6 +1390,7 @@ pub(crate) mod tests {
         let x_rows = json!({"dir": x_root, "instances": [{"name": "x-1", "root": x_root}], "sandboxes": [], "services": []});
         let x = crate::serve::snapshots::Machine {
             name: "x".into(),
+            roots: vec![x_root.clone()],
             rows: [(x_root.clone(), Arc::new(x_rows))].into(),
             seen: Some(1_761_566_400),
             ..Default::default()
@@ -1398,7 +1398,7 @@ pub(crate) mod tests {
         crate::serve::machines::saved::save(&k_remotes, &crate::serve::machines::saved::of(&[x], 0)).unwrap();
         let pair = Pair::with(
             "dial-via",
-            vec![Entry { roots: vec![x_root.clone()], ..Entry::ssh("x", "me@x") }],
+            vec![Entry::ssh("x", "me@x")],
             |k| {
                 let hub = crate::serve::fleet::member::Member { name: "box".into(), hub: "self".into(), ..Default::default() };
                 crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);

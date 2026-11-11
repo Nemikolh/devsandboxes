@@ -62,7 +62,9 @@ pub struct Entry {
     pub name: String,
     /// How this host reaches the machine.
     pub kind: Kind,
-    /// Config roots on the machine, as the remote canonicalized them.
+    /// The machine's live roots: what its daemon's last `roots.list` over
+    /// its link answered (`service::Handle::entries`, `machines.get`).
+    /// Never in `machines.toml`: empty as loaded.
     pub roots: Vec<PathBuf>,
     /// The remote devsandbox as shell text (`~/bin/devsandbox`); `None` is
     /// `devsandbox` on the login shell's `PATH`.
@@ -128,10 +130,9 @@ impl Entry {
         Entry { name: name.into(), kind: Kind::Ssh { target: target.into() }, roots: Vec::new(), command: None }
     }
 
-    /// Inbound neighbor `name` as the service holds it: its `roots` as its
-    /// daemon listed them (`inbound::Neighbor::roots`).
-    pub fn inbound(name: impl Into<String>, roots: Vec<PathBuf>) -> Entry {
-        Entry { name: name.into(), kind: Kind::Inbound, roots, command: None }
+    /// Inbound neighbor `name` as the service holds it, no roots yet.
+    pub fn inbound(name: impl Into<String>) -> Entry {
+        Entry { name: name.into(), kind: Kind::Inbound, roots: Vec::new(), command: None }
     }
 
     pub fn command(&self) -> &str {
@@ -166,15 +167,14 @@ impl Entry {
 /// [`Entry`] as the file holds it. `offered` is only read, to name an
 /// entry an older build wrote for a fleet worker ([`TryFrom`]). Unknown
 /// keys are ignored (an older build's `agent`: agent grants live in
-/// `member.toml`, `fleet::member::Grant`).
+/// `member.toml`, `fleet::member::Grant`; its `roots`: a machine's are
+/// what it lists), and dropped by the next write.
 #[derive(Serialize, Deserialize)]
 struct RawEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<String>,
     #[serde(default, skip_serializing)]
     offered: bool,
-    #[serde(default)]
-    roots: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     command: Option<String>,
 }
@@ -193,7 +193,7 @@ impl TryFrom<RawEntry> for Entry {
             (Some(target), false) => Kind::Ssh { target },
             (None, false) => return Err("no `target`".into()),
         };
-        Ok(Entry { name: String::new(), kind, roots: raw.roots, command: raw.command })
+        Ok(Entry { name: String::new(), kind, roots: Vec::new(), command: raw.command })
     }
 }
 
@@ -205,7 +205,7 @@ impl From<Entry> for RawEntry {
             // read back as an entry without a target.
             Kind::Inbound => None,
         };
-        RawEntry { target, offered: false, roots: e.roots, command: e.command }
+        RawEntry { target, offered: false, command: e.command }
     }
 }
 
@@ -325,7 +325,7 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, target: &str) -> Entry {
-        Entry { roots: vec!["/srv/a".into()], ..Entry::ssh(name, target) }
+        Entry::ssh(name, target)
     }
 
     #[test]
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn entries_round_trip_sorted_by_name() {
         let entries = vec![
-            Entry { command: Some("~/bin/devsandbox".into()), roots: vec!["/a".into(), "/b".into()], ..entry("b-box", "ssh://me@b:2200") },
+            Entry { command: Some("~/bin/devsandbox".into()), ..entry("b-box", "ssh://me@b:2200") },
             entry("a.box", "me@a"),
         ];
         let text = serialize(&entries).unwrap();
@@ -356,6 +356,12 @@ mod tests {
         assert_eq!(minimal, vec![Entry::ssh("m", "m")]);
         // An older build's `agent` is ignored (grants are member.toml's).
         assert_eq!(parse("[machine.m]\ntarget = \"m\"\nagent = true\n").unwrap(), vec![Entry::ssh("m", "m")]);
+        // An older build's `roots` too, and the next write drops it; live
+        // roots in memory are never written.
+        let old = parse("[machine.m]\ntarget = \"m\"\nroots = [\"/a\"]\n").unwrap();
+        assert_eq!(old, vec![Entry::ssh("m", "m")]);
+        let live = Entry { roots: vec!["/a".into()], ..Entry::ssh("m", "m") };
+        assert!(!serialize(&[live]).unwrap().contains("roots"));
         assert!(parse("[machine.\"a/b\"]\ntarget = \"m\"\n").is_err(), "a bad name fails the file");
         assert!(parse("[machine.m]\n").is_err(), "no target");
     }
@@ -383,7 +389,7 @@ mod tests {
         assert_eq!(Kind::from_wire(MachineKind::Inbound, None).unwrap(), Kind::Inbound);
         assert_eq!(serde_json::from_value::<MachineKind>(serde_json::json!("routed")).unwrap(), MachineKind::Routed);
         assert_eq!(Kind::from_wire(MachineKind::Routed, None).unwrap(), Kind::Inbound, "no ssh target either");
-        let lap = Entry::inbound("lap", vec!["/f".into()]);
+        let lap = Entry::inbound("lap");
         assert_eq!((lap.target(), lap.label(), lap.kind == Kind::Inbound, lap.kind.wire()), (None, "inbound", true, (MachineKind::Inbound, None)));
         assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("links to this host from its end"));
     }

@@ -61,6 +61,8 @@ pub struct HostPaths<'a> {
     /// The data dir the signed configs' copies are under (`fleet::mesh`);
     /// `None`: none listed.
     pub data: Option<&'a Path>,
+    /// `member.toml`, whose `roots` `roots.list` lists too; `None`: none.
+    pub member: Option<&'a Path>,
 }
 
 /// The daemon's forward registry as `forwards.*` sees it
@@ -150,15 +152,20 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "containers.stats" => containers_stats(|| crate::runtime::backend().stats().map_err(ApiError::internal)),
         "sandboxes.list" => sandboxes_list(parse(params)?),
         "roots.list" => {
-            let (state, home, data) = match ctx.host {
-                Some(host) => (host.state.to_path_buf(), host.home.map(Path::to_path_buf), host.data.map(Path::to_path_buf)),
+            let (state, home, data, member) = match ctx.host {
+                Some(host) => (
+                    host.state.to_path_buf(),
+                    host.home.map(Path::to_path_buf),
+                    host.data.map(Path::to_path_buf),
+                    host.member.map(Path::to_path_buf),
+                ),
                 None => {
                     let state = state_path()?;
                     let data = state.parent().map(Path::to_path_buf);
-                    (state, std::env::var_os("HOME").map(PathBuf::from), data)
+                    (state, std::env::var_os("HOME").map(PathBuf::from), data, crate::serve::fleet::member::path().ok())
                 }
             };
-            roots_list(&state, home.as_deref(), data.as_deref())
+            roots_list(&state, home.as_deref(), data.as_deref(), member.as_deref())
         }
         "sandboxes.get" => sandboxes_get(parse(params)?),
         "services.get" => services_get(parse(params)?),
@@ -863,15 +870,18 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
 }
 
-/// This host's candidate config roots (docs/architecture/daemon/machines.md,
-/// *`devsandbox machine add|ls|set|unlink|rm|trust|roots`*):
-/// `fleet::lent::own_roots` (every distinct `config_dir` in `state`,
-/// `~/.devsandboxes` when `home` has one and the signed configs' copies
-/// under data dir `data`, canonicalized), sorted. Known roots only, no disk
-/// scan. A root that no longer exists or whose config doesn't load answers
-/// with its `error`.
-fn roots_list(state: &Path, home: Option<&Path>, data: Option<&Path>) -> Answer {
-    let roots = crate::serve::fleet::lent::own_roots(&load_state(state)?, home, data);
+/// This host's config roots, what a machine's are to the hosts linked to
+/// it (docs/architecture/daemon/machines.md, *Live roots*):
+/// `fleet::lent::listed_roots` (every distinct `config_dir` in `state`,
+/// `~/.devsandboxes` when `home` has one, the signed configs' copies under
+/// data dir `data` and `member`'s (`member.toml`) `roots`, canonicalized
+/// where they exist, deduped), sorted. Known roots only, no disk scan. A
+/// `member.toml` that doesn't load adds none (fail closed, as
+/// `fleet::lent::Reach::load`). A root that no longer exists or whose
+/// config doesn't load answers with its `error`.
+fn roots_list(state: &Path, home: Option<&Path>, data: Option<&Path>, member: Option<&Path>) -> Answer {
+    let member = member.and_then(|m| crate::serve::fleet::member::load(m).ok().flatten());
+    let roots = crate::serve::fleet::lent::listed_roots(member.as_ref(), &load_state(state)?, home, data);
     let rows: Vec<RootCandidate> = roots
         .into_iter()
         .map(|root| match config_at(&root) {
@@ -2113,7 +2123,7 @@ mod tests {
             json!({"root": canon(&home.join(".devsandboxes")), "sandboxes": [], "error": null}),
         ];
         want.sort_by(|a, b| a["root"].as_str().cmp(&b["root"].as_str()));
-        let mut got = roots_list(&state, Some(&home), None).unwrap();
+        let mut got = roots_list(&state, Some(&home), None, None).unwrap();
         // The parse error's text is the config module's; that there is one is ours.
         for row in got.as_array_mut().unwrap() {
             if row["root"] == json!(canon(&bad)) {
@@ -2122,10 +2132,27 @@ mod tests {
             }
         }
         assert_eq!(got, Value::Array(want));
+        // `member.toml`'s roots too: canonicalized where they exist (one
+        // through a `..` path: the same as a recorded one, deduped), a gone
+        // one as written, with its error.
+        let (picked, member) = (base.join("picked"), base.join("member.toml"));
+        std::fs::create_dir_all(&picked).unwrap();
+        let roots = vec![picked.clone(), shared.join("../shared"), base.join("lost")];
+        crate::serve::fleet::member::write_for_test(&member, &crate::serve::fleet::member::Member { roots, ..Default::default() });
+        let listed = roots_list(&state.with_file_name("absent.toml"), None, None, Some(&member)).unwrap();
+        let roots: Vec<&Value> = listed.as_array().unwrap().iter().map(|r| &r["root"]).collect();
+        let mut want = vec![json!(base.join("lost")), json!(canon(&picked)), json!(canon(&shared))];
+        want.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        assert_eq!(roots, want.iter().collect::<Vec<_>>());
+        let lost = listed.as_array().unwrap().iter().find(|r| r["root"] == json!(base.join("lost"))).unwrap();
+        assert!(lost["error"].as_str().unwrap().starts_with("no directory"), "{lost}");
+        // A member.toml that doesn't load adds none.
+        std::fs::write(&member, "trust = \"most\"\n").unwrap();
+        assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None, Some(&member)).unwrap(), json!([]));
         // No home `.devsandboxes`, no state: nothing.
-        let none = roots_list(&state.with_file_name("absent.toml"), Some(&base), None).unwrap();
+        let none = roots_list(&state.with_file_name("absent.toml"), Some(&base), None, None).unwrap();
         assert_eq!(none, json!([]));
-        assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None).unwrap(), json!([]));
+        assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None, None).unwrap(), json!([]));
         let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 
@@ -2135,7 +2162,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let home = base.join("home");
         let state = base.join("state.toml");
-        let host = HostPaths { state: &state, home: Some(&home), data: None };
+        let host = HostPaths { state: &state, home: Some(&home), data: None, member: None };
         let ctx = Ctx { inbox: &base.join("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) };
         let candidates = call("roots.list", Value::Null, &ctx).unwrap();
         assert_eq!(candidates, json!([]), "no state, no ~/.devsandboxes");
@@ -2347,7 +2374,7 @@ mod tests {
         let state = state_file("identity", "");
         let root = state.with_file_name("cfg");
         std::fs::create_dir_all(&root).unwrap();
-        let host = HostPaths { state: &state, home: None, data: None };
+        let host = HostPaths { state: &state, home: None, data: None, member: None };
         let run = |method: &str, params: Value| {
             call(method, params, &Ctx { inbox: &state.with_file_name("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) })
         };

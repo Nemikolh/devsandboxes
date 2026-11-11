@@ -227,8 +227,8 @@ pub struct Reach {
 /// This host's own config roots: every distinct `config_dir` in `state`,
 /// plus `~/.devsandboxes` when `home` has one, plus each signed config's
 /// copy installed under data dir `data` (`mesh::roots`), canonicalized (a
-/// root that's gone stays as recorded). What `roots.list` answers, and the
-/// base of a [`Reach`]'s `own`. A copy is reached like any own root; the
+/// root that's gone stays as recorded). With `member.toml`'s `roots`,
+/// [`listed_roots`]: what `roots.list` answers and a [`Reach`]'s `own`. A copy is reached like any own root; the
 /// daemon checks it is the signed head before a verb builds from it
 /// (`mesh::verify`).
 pub fn own_roots(state: &State, home: Option<&Path>, data: Option<&Path>) -> BTreeSet<PathBuf> {
@@ -238,15 +238,23 @@ pub fn own_roots(state: &State, home: Option<&Path>, data: Option<&Path>) -> BTr
     recorded.chain(home).chain(mesh).map(|r| std::fs::canonicalize(&r).unwrap_or(r)).collect()
 }
 
+/// [`own_roots`] of `state`, `home` and data dir `data` plus `member`'s
+/// `roots` (the ones picked with `machine roots add`), canonicalized where
+/// they exist, deduped.
+pub fn listed_roots(member: Option<&Member>, state: &State, home: Option<&Path>, data: Option<&Path>) -> BTreeSet<PathBuf> {
+    let mut own = own_roots(state, home, data);
+    if let Some(m) = member {
+        own.extend(m.roots.iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone())));
+    }
+    own
+}
+
 impl Reach {
     /// Over what's read (pure but for canonicalizing): `member`'s `trust`
-    /// (none: `worker`), [`own_roots`] of `state`, `home` and data dir
-    /// `data` plus `member`'s `roots`.
+    /// (none: `worker`), [`listed_roots`] of `member`, `state`, `home` and
+    /// data dir `data`.
     pub fn of(member: Option<&Member>, state: &State, home: Option<&Path>, data: Option<&Path>, fleet_root: Option<&Path>) -> Reach {
-        let mut own = own_roots(state, home, data);
-        if let Some(m) = member {
-            own.extend(m.roots.iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone())));
-        }
+        let own = listed_roots(member, state, home, data);
         let trust = member.map(|m| m.trust).unwrap_or_default();
         Reach { trust, fleet_root: fleet_root.map(Path::to_path_buf), own }
     }

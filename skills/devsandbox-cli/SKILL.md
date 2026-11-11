@@ -264,8 +264,9 @@ devsandbox machine key                         # this host's member key (ed25519
 ## State
 
 - Instances: `~/.local/share/devsandbox/state.toml` (`$XDG_DATA_HOME` honored).
-- Machines: `machines.toml` next to it (`[machine.<name>]`: `target`, `roots`,
-  optional `command`, the remote devsandbox path, set by hand).
+- Machines: `machines.toml` next to it (`[machine.<name>]`: `target`,
+  optional `command`, the remote devsandbox path, set by hand). A machine's
+  config roots are what its own daemon lists, not stored here.
 - Persistent per-config-root data (caches, shell history, `${sharedVolumes}`):
   `<config dir>/shared-volumes/`.
 - Networks/containers are namespaced by a short hash of the config-root path, so

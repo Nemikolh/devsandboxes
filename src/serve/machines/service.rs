@@ -1,7 +1,7 @@
 //! The held link per machine (docs/architecture/daemon/machines.md, *Held
 //! links: `Machines`*): one `serve-machine-<name>` thread per registered
 //! machine and per inbound neighbor up now (`inbound::Neighbors`, whose
-//! hook reloads the service as one comes, goes or gets its roots), owned
+//! hook reloads the service as one comes or goes), owned
 //! by the [`Machines`] service the daemon runs for its whole life.
 //!
 //! Every link is held for as long as the service runs (fleet plan decision
@@ -14,8 +14,8 @@
 //! `fleet-link --peer <it>` that announced it. Once the carrier
 //! is up the link thread dials `fleet-<name>.sock` (the [`Dial`]) and says
 //! hello, subscribes to `instances`, asks its `roots.list` (its live
-//! roots, [`live_roots`]: again on [`Handle::relist`]), watches each of
-//! the machine's roots while a local connection watches with `machines: true`
+//! roots, the machine's only ones: again on [`Handle::relist`]), watches
+//! each of them while a local connection watches with `machines: true`
 //! ([`Hooks::watching`]), and stores every pushed `instances.snapshot` in
 //! the shared [`Remotes`] ([`Hooks::changed`] then re-publishes). The link
 //! to this host's hub ([`Hooks::hub`]: another member) also watches the
@@ -31,7 +31,8 @@
 //! A hub also saves `Remotes` to `remotes.json` (`machines::saved`) from a
 //! `serve-remotes` thread, at most every `saved::SAVE_EVERY` while rows
 //! change and once more at the stop, and restores it at the start: those
-//! rows show `unreachable` until their machine's link connects. Whether
+//! rows (and their machine's roots as last listed) show `unreachable`
+//! until their machine's link connects, and stay until it lists. Whether
 //! this host is the hub is asked each time ([`Hub::is_hub`]: `member.toml`'s
 //! `hub` can change under a running daemon), so a host that stops being
 //! the hub stops saving, one that becomes it saves from the next change.
@@ -235,9 +236,6 @@ struct Ctl {
     carrier: Mutex<Carrier>,
     /// Wakes the carrier thread's backoff at a stop.
     carrier_cv: Condvar,
-    /// The roots the machine's last `roots.list` answered (its live roots,
-    /// [`live_roots`]); empty before its link first came up.
-    listed: Mutex<Vec<PathBuf>>,
 }
 
 /// An ssh machine's carrier as its [`Hold`] last reported it.
@@ -349,10 +347,6 @@ enum Cmd {
     /// Look at the carrier and the watchers again now (a watch came or
     /// went, the carrier moved, a stop).
     Wake,
-    /// The machine's registered roots moved (its entry changed in nothing
-    /// else; the links table has the new ones): the link stays up, its
-    /// watch follows them.
-    Roots,
     /// Ask the machine's `roots.list` again ([`Handle::relist`]).
     Relist,
 }
@@ -515,41 +509,13 @@ impl Inner {
     }
 }
 
-/// A machine's roots as federation uses them (pure): the registry's
-/// `registered`, in order, then each root its last `roots.list` answered
-/// (`listed`) not among them. `machines.toml` stays as `machine add` wrote
-/// it; a root the machine lists later (a signed config copy it installed
-/// since) is asked about and watched without a re-add. Only names to ask
-/// about: the machine's trust table still decides every call.
-fn live_roots(registered: &[PathBuf], listed: &[PathBuf]) -> Vec<PathBuf> {
-    let mut roots = registered.to_vec();
-    for r in listed {
-        if !roots.contains(r) {
-            roots.push(r.clone());
-        }
-    }
-    roots
-}
-
-impl LinkThread {
-    /// Its entry with its live roots ([`live_roots`]).
-    fn live(&self) -> Entry {
-        Entry { roots: live_roots(&self.entry.roots, &lock(&self.ctl.listed)), ..self.entry.clone() }
-    }
-}
-
-/// Whether `a` and `b` differ in nothing but their roots.
-fn same_but_roots(a: &Entry, b: &Entry) -> bool {
-    *a == Entry { roots: a.roots.clone(), ..b.clone() }
-}
-
 /// The registry's `entries` and an inbound entry per neighbor up now
 /// (`Entry::inbound`), sorted by name; a registry name wins (the clash
 /// rules refuse one, this covers a race between them).
 fn with_inbound(mut entries: Vec<Entry>, inbound: &Neighbors) -> Vec<Entry> {
     for n in inbound.list() {
         if !entries.iter().any(|e| e.name == n.name) {
-            entries.push(Entry::inbound(n.name, n.roots));
+            entries.push(Entry::inbound(n.name));
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -559,7 +525,8 @@ fn with_inbound(mut entries: Vec<Entry>, inbound: &Neighbors) -> Vec<Entry> {
 impl Handle {
     /// Re-read the registry and the inbound neighbors: start links for new
     /// machines, stop (and drop the rows of) removed ones, restart changed
-    /// ones (a change of roots alone goes to the running link instead).
+    /// ones. A machine's roots and rows stay as its link (or a hub's
+    /// restore) left them: its roots are its listing's, not the registry's.
     /// `machines.add` and `.rm` call it, as does the neighbors' hook; a
     /// registry that doesn't load is logged and changes nothing.
     pub fn reload(&self) {
@@ -572,25 +539,10 @@ impl Handle {
                 return;
             }
         };
-        let mut moved = Vec::new();
         let gone: Vec<LinkThread> = {
             let mut links = inner.lock_links();
-            let mut stale = Vec::new();
-            for (name, l) in links.iter_mut() {
-                match entries.iter().find(|e| e.name == *name) {
-                    Some(e) if *e == l.entry => {}
-                    // Only its roots moved: a restart would drop a link that's
-                    // fine, and every inbound neighbor's roots come just after
-                    // its announce (`daemon::inbound_roots`), so each new one's
-                    // link would go down once, failing whatever used it then
-                    // (a placement's `roots.list`).
-                    Some(e) if same_but_roots(e, &l.entry) => {
-                        l.entry.roots.clone_from(&e.roots);
-                        moved.push(name.clone());
-                    }
-                    _ => stale.push(name.clone()),
-                }
-            }
+            let stale: Vec<String> =
+                links.iter().filter(|(name, l)| !entries.iter().any(|e| e.name == **name && *e == l.entry)).map(|(name, _)| name.clone()).collect();
             stale.iter().filter_map(|name| links.remove(name)).collect()
         };
         // Joined outside the lock (a forwarded call looks links up), and
@@ -600,18 +552,9 @@ impl Handle {
         if inner.stopped.load(Ordering::SeqCst) {
             return;
         }
-        // Before the new threads run: they record their state there. A
-        // running link's listed roots stay in.
-        let live: Vec<Entry> = entries.iter().map(|e| links.get(&e.name).map_or_else(|| e.clone(), LinkThread::live)).collect();
-        inner.remotes.sync(&live);
+        // Before the new threads run: they record their state there.
+        inner.remotes.sync(&entries);
         inner.rows_changed();
-        // After the sync: a link's push for a root it gained is only stored
-        // once `Remotes` lists that root (`LinkLoop::store`).
-        for name in &moved {
-            if let Some(l) = links.get(name) {
-                let _ = l.tx.send(Cmd::Roots);
-            }
-        }
         for e in &entries {
             if !links.contains_key(&e.name) {
                 let link = spawn_link(e.clone(), Arc::clone(inner));
@@ -642,12 +585,13 @@ impl Handle {
     }
 
     /// The machines as of the last reload (the registry's and the inbound
-    /// neighbors'), sorted by name, each with its live roots
-    /// ([`live_roots`]: the registry's and what its `roots.list` last
-    /// answered): what a forwarded verb dials and a federated call fans
-    /// out to, without a registry read per request.
+    /// neighbors'), sorted by name, each with its live roots (`Remotes`':
+    /// what its link's last `roots.list` answered, before that what a hub
+    /// restored, else none): what a forwarded verb dials and a federated
+    /// call fans out to, without a registry read per request.
     pub fn entries(&self) -> Vec<Entry> {
-        self.inner.lock_links().values().map(LinkThread::live).collect()
+        let links = self.inner.lock_links();
+        links.values().map(|l| Entry { roots: self.inner.remotes.roots(&l.entry.name), ..l.entry.clone() }).collect()
     }
 
     /// Machine `name`'s link asks its `roots.list` again (now if it's up,
@@ -898,8 +842,6 @@ struct LinkLoop<'a> {
     logged: Option<String>,
     /// The carrier generation this link last dialed.
     generation: u64,
-    /// The registry's roots (`entry.roots` is the live ones, [`live_roots`]).
-    registered: Vec<PathBuf>,
     /// The machine's last `roots.list` answer over this link (its `fleet`
     /// row is the hub's fleet root for this host).
     listing: Vec<crate::serve::api::RootCandidate>,
@@ -908,29 +850,16 @@ struct LinkLoop<'a> {
 }
 
 impl<'a> LinkLoop<'a> {
+    /// `entry`'s roots stay empty until the link lists: they are what this
+    /// link watches and stores pushes of.
     fn new(entry: Entry, inner: &'a Inner, ctl: &'a Ctl) -> Self {
-        let registered = entry.roots.clone();
-        let mut this = Self {
-            entry,
-            inner,
-            ctl,
-            pending: VecDeque::new(),
-            failures: 0,
-            logged: None,
-            generation: 0,
-            registered,
-            listing: Vec::new(),
-            relist: false,
-        };
-        this.entry.roots = live_roots(&this.registered, &lock(&ctl.listed));
-        this
+        Self { entry, inner, ctl, pending: VecDeque::new(), failures: 0, logged: None, generation: 0, listing: Vec::new(), relist: false }
     }
 
     /// A command for the loop (a call is queued).
     fn take(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Call(call) => self.pending.push_back(call),
-            Cmd::Roots => self.apply_roots(None),
             Cmd::Relist => self.relist = true,
             Cmd::Wake => {}
         }
@@ -1145,8 +1074,8 @@ impl<'a> LinkLoop<'a> {
     }
 
     /// Ask the machine's `roots.list`: its rows kept for the hub's fleet
-    /// root ([`Self::watch`]), its roots the live ones from now on
-    /// ([`Self::apply_roots`]). A row with an `error` (a recorded root
+    /// root ([`Self::watch`]), its roots the machine's from now on, in the
+    /// answer's order ([`Self::apply_roots`]). A row with an `error` (a recorded root
     /// whose directory is gone) is dropped unless it's the `fleet` one:
     /// its watch would only be refused. An error answer keeps the last
     /// listing (logged); a dead connection is lost.
@@ -1171,38 +1100,26 @@ impl<'a> LinkLoop<'a> {
         rows.retain(|c| c.error.is_none() || c.fleet);
         let listed: Vec<PathBuf> = rows.iter().map(|c| c.root.clone()).collect();
         self.listing = rows;
-        self.apply_roots(Some(listed));
+        self.apply_roots(listed);
         Ok(())
     }
 
-    /// Make the live roots ([`live_roots`]) the registry's, as the last
-    /// reload left them in the links table (ahead of its [`Cmd::Roots`]
-    /// here), and `listed` (a new `roots.list` answer, else the last), and
-    /// `Remotes`' too: a root no longer live loses its rows. All of it
-    /// under the links lock, as `reload` reads the listed roots and syncs
-    /// `Remotes` under it, so one of the two runs whole before the other
-    /// and `Remotes` ends with the newest roots. No deadlock: the lock
-    /// order is `reload`'s (links, then `listed`, then `Remotes`), nothing
-    /// holding the links lock waits on this thread (`stop_all` joins
-    /// outside it), and the hooks run after it's released. A link no
-    /// longer in the table is stopping: `Remotes` is left to the reload.
-    fn apply_roots(&mut self, listed: Option<Vec<PathBuf>>) {
+    /// Make `listed` (a `roots.list` answer) the machine's roots, here and
+    /// in `Remotes`: a root no longer listed loses its rows (a hub's
+    /// restored ones too). Under the links lock, as `reload` syncs
+    /// `Remotes` under it, so a link no longer in the table (stopping)
+    /// leaves `Remotes` to the reload. No deadlock: the lock order is
+    /// `reload`'s (links, then `Remotes`), nothing holding the links lock
+    /// waits on this thread (`stop_all` joins outside it), and the hooks
+    /// run after it's released.
+    fn apply_roots(&mut self, listed: Vec<PathBuf>) {
         let name = self.entry.name.clone();
         let inner = self.inner;
         let mut moved = false;
+        self.entry.roots = listed;
         {
             let links = inner.lock_links();
-            let here = links.get(&name);
-            if let Some(l) = here {
-                self.registered.clone_from(&l.entry.roots);
-            }
-            let mut have = lock(&self.ctl.listed);
-            if let Some(listed) = listed {
-                *have = listed;
-            }
-            self.entry.roots = live_roots(&self.registered, &have);
-            drop(have);
-            if here.is_some() {
+            if links.contains_key(&name) {
                 let roots = &self.entry.roots;
                 inner.remotes.update(&name, |m| {
                     moved = m.roots != *roots;
@@ -1221,8 +1138,8 @@ impl<'a> LinkLoop<'a> {
     /// unwatched, then each root `instances.watch`ed plain and, for the
     /// hub, its fleet root for this host (the last `roots.list`'s `fleet`
     /// row: there even on a hub with no config root of its own) with
-    /// `machines: true`. A root the remote refuses (gone since `machine
-    /// add`) is the machine's `error`, the others still watched; a dead
+    /// `machines: true`. A root the remote refuses (gone since it
+    /// listed) is the machine's `error`, the others still watched; a dead
     /// connection is lost.
     fn watch(&self, link: &mut Link, watched: &mut Watched, want: Want) -> Result<(), String> {
         let name = &self.entry.name;
@@ -1315,9 +1232,8 @@ impl<'a> LinkLoop<'a> {
         // A reconnect's first push is disk-depth: keep the last statuses.
         let mut stored = false;
         self.inner.remotes.update(&self.entry.name, |m| {
-            // The synced roots too, not only this thread's: a reload may
-            // have dropped `dir` (and its rows) with its `Cmd::Roots` not
-            // drained here yet, and a late push mustn't bring them back.
+            // The stored roots too, not only this thread's: a machine no
+            // longer in the table is the reload's to drop.
             if !m.roots.contains(&dir) {
                 return;
             }
@@ -1354,7 +1270,7 @@ struct Watched {
     /// The hub's fleet root for this host, watched with `machines: true`.
     fleet: Option<PathBuf>,
     /// The machine's roots as last watched: the ones to unwatch, and a
-    /// change of its roots ([`Cmd::Roots`]) watches again.
+    /// new listing of other roots watches again.
     roots: Vec<PathBuf>,
 }
 
@@ -1595,7 +1511,8 @@ mod tests {
     }
 
     /// A hub restores `remotes.json` (unreachable until the link connects,
-    /// machines no longer registered dropped) and saves it back at the stop.
+    /// machines no longer registered dropped; roots and rows kept until
+    /// the machine's link lists) and saves it back at the stop.
     #[test]
     fn a_hub_restores_and_saves_remotes() {
         let base = short_scratch("hub-save");
@@ -1603,29 +1520,36 @@ mod tests {
         let rows = json!({"dir": "/r", "instances": [{"name": "web-1"}]});
         let row = |name: &str| Machine {
             name: name.into(),
+            roots: vec![PathBuf::from("/r")],
             rows: [(PathBuf::from("/r"), Arc::new(rows.clone()))].into(),
             seen: Some(1_761_566_400),
             ..Machine::default()
         };
-        saved::save(&path, &saved::of(&[row("s"), row("gone")], 0)).unwrap();
+        saved::save(&path, &saved::of(&[row("s"), row("w"), row("gone")], 0)).unwrap();
         let hub = Hub { remotes: path.clone(), is_hub: Arc::new(|| true) };
         let (machines, _w, up, _, runs) = inbound_and_ssh(&base, Some(hub), |_| {});
         let h = machines.handle();
         assert!(h.remotes().get("gone").is_none(), "not registered: dropped");
+        // Nothing listed yet: the restored roots and rows stay.
         let s = h.remotes().get("s").unwrap();
-        // `s` has no `/r` registered: its rows go with the sync, the machine stays.
-        assert!(s.rows.is_empty() && s.restored);
+        assert!(s.restored && s.rows.contains_key(Path::new("/r")));
+        assert_eq!(h.entries().iter().map(|e| e.roots.clone()).collect::<Vec<_>>(), vec![vec![PathBuf::from("/r")], vec![PathBuf::from("/r")]]);
         wait_for("s's carrier failed", Duration::from_secs(5), || ran(&runs, "s") >= 1);
         wait_for("s unreachable", Duration::from_secs(5), || h.remotes().get("s").unwrap().error.is_some());
         let s = h.remotes().get("s").unwrap();
         assert_eq!(s.state, LinkState::Unreachable, "restored: unreachable");
         assert!(s.error.as_deref().unwrap().ends_with("(rows from Oct 27 12:00 UTC)"), "{:?}", s.error);
 
+        // `w` lists no roots once its link is up: its restored `/r` goes.
         up.store(true, Ordering::SeqCst);
-        wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        wait_for("w listed", Duration::from_secs(5), || h.remotes().get("w").unwrap().roots.is_empty());
+        let w = h.remotes().get("w").unwrap();
+        assert!(w.rows.is_empty() && h.remotes().get("s").unwrap().rows.contains_key(Path::new("/r")));
         drop(machines);
         let saved = saved::load(&path).unwrap();
-        assert_eq!(saved.machines.keys().collect::<Vec<_>>(), ["w"], "gone dropped; s has nothing left to save");
+        assert_eq!(saved.machines.keys().collect::<Vec<_>>(), ["s", "w"], "gone dropped");
+        assert_eq!(saved.machines["s"].roots, [PathBuf::from("/r")], "s never listed: as restored");
+        assert!(saved.machines["w"].rows.is_empty() && saved.machines["w"].roots.is_empty());
         assert_eq!(saved.machines["w"].version.as_deref(), Some("0.6.0"), "w's hello");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1690,45 +1614,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A fake machine daemon answering every call `ok`, each call's
-    /// `method dir` kept in `calls`.
-    fn recording_peer(calls: &Arc<Mutex<Vec<String>>>) -> Duplex {
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        let calls = Arc::clone(calls);
-        std::thread::spawn(move || {
-            let mut r = BufReader::new(theirs.try_clone().unwrap());
-            let mut line = String::new();
-            while r.read_line(&mut line).is_ok_and(|n| n > 0) {
-                let req: Value = serde_json::from_str(&line).unwrap();
-                let method = req["method"].as_str().unwrap_or_default();
-                calls.lock().unwrap().push(format!("{method} {}", req["params"]["dir"].as_str().unwrap_or_default()));
-                let result = match method {
-                    "hello" => json!({"version": "0.6.0", "build": 1, "protocol": 1}),
-                    _ => json!({"ok": true}),
-                };
-                if writeln!(&theirs, "{}", json!({"id": req["id"], "result": result})).is_err() {
-                    break;
-                }
-                line.clear();
-            }
-        });
-        Duplex::socket(ours)
-    }
-
-    /// An inbound neighbor's roots coming in once its link is up (as
-    /// `daemon::inbound_roots` sets them) keep that link: no redial, the
-    /// roots watched over it.
+    /// An inbound neighbor's roots are its link's listing, as any
+    /// machine's: listed and watched over that one link, no redial.
     #[test]
-    fn a_change_of_roots_keeps_the_link() {
+    fn an_inbound_neighbors_roots_are_its_links_listing() {
         let base = short_scratch("roots");
         let neighbors: Arc<inbound::Neighbors> = Arc::default();
         let guard = neighbors.announce("w", "0.6.0 abc dev x/y member", false);
         let (dials, calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())));
+        let listed = Arc::new(Mutex::new(vec!["/r".to_string()]));
         let dial: Dial = {
             let (dials, calls) = (Arc::clone(&dials), Arc::clone(&calls));
             Arc::new(move |_| {
                 dials.fetch_add(1, Ordering::SeqCst);
-                Ok(recording_peer(&calls))
+                Ok(listing_peer(&calls, &listed))
             })
         };
         let hooks = Hooks { watching: Box::new(|| true), ..no_hooks() };
@@ -1736,8 +1635,6 @@ mod tests {
         let timing = opts(1, 0).machine_timing;
         let machines = Machines::spawn(base.join("machines.toml"), neighbors, dial, no_route(), hold, timing, hooks, None, |_| {});
         let h = machines.handle();
-        wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
-        guard.roots_setter()(vec![PathBuf::from("/r")]);
         wait_for("/r watched", Duration::from_secs(5), || calls.lock().unwrap().iter().any(|c| c == "instances.watch /r"));
         assert_eq!(dials.load(Ordering::SeqCst), 1, "no redial");
         assert_eq!(h.remotes().get("w").unwrap().state, LinkState::Connected);
@@ -1800,17 +1697,16 @@ mod tests {
         Duplex::socket(ours)
     }
 
-    /// A root a machine lists after `machine add` (a signed config copy it
-    /// installed since) is, once its link lists again (`relist`, as a
-    /// `fleet.sync` does), among its entry's roots: watched, and asked by a
-    /// federated `sandboxes.list`, with no re-add; `machines.toml` keeps
-    /// what the add wrote.
+    /// A machine's roots are what its link lists: a root it lists later (a
+    /// signed config copy it installed since) is, once its link lists
+    /// again (`relist`, as a `fleet.sync` does), among its entry's roots:
+    /// watched, and asked by a federated `sandboxes.list`, in the
+    /// listing's order.
     #[test]
-    fn a_root_listed_after_add_is_watched_and_listed() {
+    fn a_root_listed_later_is_watched_and_listed() {
         let base = short_scratch("live-roots");
         let registry = base.join("machines.toml");
-        let added = Entry { roots: vec![PathBuf::from("/a")], ..Entry::ssh("b", "me@b") };
-        crate::serve::machines::update(&registry, |e| e.push(added)).unwrap();
+        crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("b", "me@b"))).unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let listed = Arc::new(Mutex::new(vec!["/a".to_string()]));
         let dial: Dial = {
@@ -1839,17 +1735,16 @@ mod tests {
                 {"name": "s", "machine": "b", "root": "/data/mesh/tree/bolt"},
             ])
         );
-        assert_eq!(crate::serve::machines::load(&registry).unwrap()[0].roots, [PathBuf::from("/a")], "the registry as written");
         drop(machines);
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A machine with `/a` registered: its link up, `/a` watched.
+    /// Machine `b` listing `listed` (`/a` among them): its link up, `/a`
+    /// watched.
     fn listing_machine(tag: &str, listed: Vec<String>) -> (PathBuf, Machines, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
         let base = short_scratch(tag);
         let registry = base.join("machines.toml");
-        let added = Entry { roots: vec![PathBuf::from("/a")], ..Entry::ssh("b", "me@b") };
-        crate::serve::machines::update(&registry, |e| e.push(added)).unwrap();
+        crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("b", "me@b"))).unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let listed = Arc::new(Mutex::new(listed));
         let dial: Dial = {
@@ -1880,37 +1775,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A re-listing that races a reload's `Remotes` sync (the sync read
-    /// the old listing; the links lock, held here as `reload` holds it,
-    /// orders the two) still leaves `Remotes` with the new root: its push
-    /// is stored.
+    /// A reload (the registry rewritten, the machine unchanged) keeps the
+    /// link and what it listed: roots, rows, no relisting.
     #[test]
-    fn a_relisting_racing_a_reload_still_stores_the_new_root() {
-        let (base, machines, calls, listed) = listing_machine("relist-race", vec!["/a".into()]);
+    fn a_reload_keeps_the_listed_roots() {
+        let (base, machines, calls, _) = listing_machine("reload-keeps", vec!["/a".into()]);
         let h = machines.handle();
-        let new = PathBuf::from("/data/mesh/tree/bolt");
-        let lists = || calls.lock().unwrap().iter().filter(|c| c.starts_with("roots.list")).count();
-        {
-            let links = h.inner.lock_links();
-            // What `reload` syncs: the listing as it is now.
-            let live: Vec<Entry> = links.values().map(LinkThread::live).collect();
-            listed.lock().unwrap().push(new.display().to_string());
-            links["b"].tx.send(Cmd::Relist).unwrap();
-            wait_for("the re-listing answered", Duration::from_secs(5), || lists() == 2);
-            h.inner.remotes.sync(&live);
-        }
-        wait_for("the new root's push stored", Duration::from_secs(5), || h.remotes().get("b").unwrap().rows.contains_key(&new));
-        assert_eq!(h.remotes().get("b").unwrap().roots, [PathBuf::from("/a"), new]);
+        let a = PathBuf::from("/a");
+        wait_for("/a's push stored", Duration::from_secs(5), || h.remotes().get("b").unwrap().rows.contains_key(&a));
+        h.reload();
+        let b = h.remotes().get("b").unwrap();
+        assert_eq!((b.roots, b.rows.contains_key(&a)), (vec![a.clone()], true));
+        assert_eq!(h.entries()[0].roots, [a]);
+        assert!(h.forward("b", "ping", json!({})).unwrap().error.is_none());
+        assert_eq!(calls.lock().unwrap().iter().filter(|c| c.starts_with("roots.list")).count(), 1);
         drop(machines);
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn live_roots_keep_the_registry_first() {
-        let p = |s: &str| PathBuf::from(s);
-        assert_eq!(live_roots(&[p("/b"), p("/a")], &[p("/a"), p("/c")]), [p("/b"), p("/a"), p("/c")]);
-        assert_eq!(live_roots(&[], &[p("/c")]), [p("/c")]);
-        assert_eq!(live_roots(&[p("/gone")], &[]), [p("/gone")], "a registered root stays, listed or not");
     }
 
     /// `cycle` ends a live carrier and redials it at once, not after the

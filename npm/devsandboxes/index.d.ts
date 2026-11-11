@@ -1198,7 +1198,7 @@ export interface MachineInfo {
   target: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
-  /** Config roots on the machine. */
+  /** Config roots on the machine: what its daemon's `roots.list` last answered over its link (a routed one's: the hub's view). */
   roots: string[];
   /** This host grants its ssh-agent to this member, at its current key (`machines.set {agent}`, `member.toml`'s `[[agent]]`), whatever its kind. */
   agent: boolean;
@@ -1214,7 +1214,7 @@ export interface MachineRow {
   kind: MachineKind;
   /** What ssh takes, or an `ssh://` URL; `null` for an `inbound` neighbor. */
   target: string | null;
-  /** Config roots on the machine (an `inbound` neighbor's as its `roots.list` answered; empty until then). */
+  /** Config roots on the machine: what its daemon's `roots.list` last answered over its link, in that order (empty until it has; a routed one's: the hub's view). */
   roots: string[];
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
@@ -1830,11 +1830,12 @@ export interface ApiMethods {
   'containers.stats': { params: { machine?: string }; result: ContainersStats };
   /**
    * The config root's sandboxes, sorted; `[]` without a config file. `machines`: then every
-   * machine's registered roots' (5 s; one that doesn't answer adds nothing, see `machines.list`).
+   * machine's listed roots' (5 s; one that doesn't answer adds nothing, see `machines.list`).
    */
   'sandboxes.list': { params: { root: string; machines?: boolean; machine?: string }; result: SandboxEntry[] };
   /**
-   * This host's config roots: every one its instances were made from, plus `~/.devsandboxes`; sorted.
+   * This host's config roots: every one its instances were made from, `~/.devsandboxes`, the signed configs'
+   * copies and `member.toml`'s `roots`; sorted. What a machine's roots are to the hosts linked to it.
    * @experimental
    */
   'roots.list': { params: {}; result: RootCandidate[] };

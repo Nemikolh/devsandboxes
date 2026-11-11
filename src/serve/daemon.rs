@@ -2394,9 +2394,9 @@ struct InboundParams {
 /// this user says the link `peer` dialed to this host is up, for as long as
 /// this connection is (docs/reference/api.md, `links.inbound`). Refused for
 /// a name `machines.toml` has (an inbound neighbor and a registry entry
-/// never share a name). Once announced, the neighbor's roots are asked over
-/// the link ([`inbound_roots`]) on a thread of its own, and the signed
-/// configs followed from it ([`follow_configs`]).
+/// never share a name). Once announced, the signed configs are followed
+/// from it ([`follow_configs`]); its roots are its link's listing, as any
+/// machine's (`machines::service`).
 fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) -> Response {
     if !matches!(conn.table, Table::Full) || !conn.own_user {
         return Response::err(id, "denied", "`links.inbound` is for this user's own `fleet-link`");
@@ -2431,9 +2431,7 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
     if let Err(e) = start_notifier(conn) {
         return Response::err(id, "internal", format!("cannot start this connection's notifier: {e}"));
     }
-    let guard = m.inbound.announce(&p.peer, &p.version, p.hub);
-    let set_roots = guard.roots_setter();
-    conn.inbound = Some(guard);
+    conn.inbound = Some(m.inbound.announce(&p.peer, &p.version, p.hub));
     let name = p.peer.clone();
     conn.out.post(|p| {
         p.inbound = Some(name);
@@ -2441,11 +2439,6 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
     });
     log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.hub { ", the hub" } else { "" }));
     follow_configs(shared.member.as_deref(), &shared.socket_dir, &p.peer);
-    let (socket, peer) = (endpoint::fleet_socket(&shared.socket_dir, &p.peer), p.peer);
-    let _ = std::thread::Builder::new().name("serve-inbound-roots".into()).spawn(move || match inbound_roots(&peer, &socket) {
-        Ok(roots) => set_roots(roots),
-        Err(e) => log(&format!("links.inbound: cannot list {peer}'s roots: {e:#}")),
-    });
     Response::ok(id, json!({ "ok": true }))
 }
 
@@ -2529,24 +2522,6 @@ fn open_deliver(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Conn
     Response::ok(id, json!({ "ok": true }))
 }
 
-/// How long [`inbound_roots`] waits for the neighbor's hello.
-const INBOUND_ROOTS_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Inbound neighbor `peer`'s config roots: `roots.list` over one `API`
-/// stream of its link, through `socket` (`fleet-<peer>.sock`, which its
-/// `fleet-link` binds before announcing).
-fn inbound_roots(peer: &str, socket: &Path) -> Result<Vec<PathBuf>> {
-    let stream = super::fleet::link::connect(socket, crate::devsbd::proto::channel::API)
-        .with_context(|| format!("cannot connect to {}", socket.display()))?;
-    let mut link = machines::link::handshake(peer, machines::ssh::Duplex::socket(stream), INBOUND_ROOTS_TIMEOUT, machines::link::Over::Link)?;
-    let r = link.conn.call("roots.list", json!({}))?;
-    if let Some(e) = r.error {
-        anyhow::bail!("roots.list: {}", e.message);
-    }
-    let rows: Vec<api::RootCandidate> = serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad roots.list answer")?;
-    Ok(rows.into_iter().map(|c| c.root).collect())
-}
-
 /// `link.attach {peer, channel, key, introduced_by?}`: a connection of this
 /// user (a `fleet-link --peer`'s, `commands::fleet_link::attach_stream`)
 /// says the rest of it is one `channel` stream of link peer `peer`'s, which
@@ -2619,7 +2594,7 @@ fn local_call(method: &str, params: Value, shared: &Shared, conn: &ConnState) ->
     // No runtime here: the signed copies aren't listed as roots (nothing
     // could run them; the copies stay, for relaying).
     let data = shared.data_dir().filter(|_| (shared.installed)());
-    let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref(), data });
+    let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref(), data, member: shared.member.as_deref() });
     api::call(method, params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, host })
 }
 

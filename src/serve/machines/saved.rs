@@ -4,9 +4,11 @@
 //! before its machines reconnect. Written by the link service's
 //! `serve-remotes` thread (debounced, [`save_wait`]), read once at start.
 //!
-//! Only the rows' pieces `snapshots::merge` can't get from the registry are
-//! saved (the rows, their time, the machine's version); kind, target,
-//! roots and the rest come from `machines.toml` as for any machine. A file
+//! Only the pieces `snapshots::merge` can't get from the registry are saved
+//! (the rows, their time, the machine's version and its roots as last
+//! listed, in order); kind, target and the rest come from `machines.toml`
+//! as for any machine. The restored roots and rows stay until the
+//! machine's link lists again (`service::LinkLoop::apply_roots`). A file
 //! of another [`VERSION`], or one that doesn't parse, is ignored and
 //! overwritten by the next save.
 
@@ -23,7 +25,7 @@ use serde_json::Value;
 use crate::serve::snapshots::{LinkState, Machine, restored_error};
 
 /// The file's format; another one is ignored.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// At most one write per this long while rows keep changing.
 pub const SAVE_EVERY: Duration = Duration::from_secs(5);
@@ -44,6 +46,9 @@ pub struct SavedMachine {
     /// Its devsandbox semver, from the last hello.
     #[serde(default)]
     pub version: Option<String>,
+    /// Its roots as its link last listed them (`snapshots::Machine::roots`).
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
     /// Remote root → its last `instances.snapshot` params.
     #[serde(default)]
     pub rows: BTreeMap<PathBuf, Value>,
@@ -67,14 +72,14 @@ pub fn of(machines: &[Machine], now: u64) -> Saved {
         .filter(|m| !m.rows.is_empty() || m.version.is_some())
         .map(|m| {
             let rows = m.rows.iter().map(|(root, params)| (root.clone(), (**params).clone())).collect();
-            (m.name.clone(), SavedMachine { at: m.seen.unwrap_or(now), version: m.version.clone(), rows })
+            (m.name.clone(), SavedMachine { at: m.seen.unwrap_or(now), version: m.version.clone(), roots: m.roots.clone(), rows })
         })
         .collect();
     Saved { version: VERSION, machines }
 }
 
 /// The saved machines as [`Remotes::restore`] takes them: `unreachable`,
-/// restored, their rows and time.
+/// restored, their roots, rows and time.
 ///
 /// [`Remotes::restore`]: crate::serve::snapshots::Remotes::restore
 pub fn machines(saved: Saved) -> Vec<Machine> {
@@ -84,6 +89,7 @@ pub fn machines(saved: Saved) -> Vec<Machine> {
         .map(|(name, s)| Machine {
             name,
             version: s.version,
+            roots: s.roots,
             rows: s.rows.into_iter().map(|(root, params)| (root, Arc::new(params))).collect(),
             seen: Some(s.at),
             restored: true,
@@ -142,6 +148,7 @@ mod tests {
         Machine {
             name: name.into(),
             version: Some("0.6.0".into()),
+            roots: rows.iter().map(|(r, _)| PathBuf::from(r)).collect(),
             rows: rows.iter().map(|(r, v)| (PathBuf::from(r), Arc::new(v.clone()))).collect(),
             seen,
             state: LinkState::Connected,
@@ -163,13 +170,14 @@ mod tests {
         let rows = json!({"dir": "/r", "instances": [{"name": "web-1"}], "runtime_name": "docker"});
         let never = Machine { name: "never".into(), ..Machine::default() };
         let saved = of(&[machine("lap", &[("/r", rows.clone())], Some(1_761_550_000)), machine("box", &[], None), never], 42);
+        assert_eq!(saved.machines["lap"].roots, [PathBuf::from("/r")]);
         assert_eq!(saved.machines.keys().collect::<Vec<_>>(), ["box", "lap"], "nothing to save of `never`");
         assert_eq!(saved.machines["box"].at, 42, "no push yet: now");
         save(&path, &saved).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let file: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(file["version"], VERSION);
-        assert_eq!(file["machines"]["lap"], json!({"at": 1_761_550_000u64, "version": "0.6.0", "rows": {"/r": rows}}));
+        assert_eq!(file["machines"]["lap"], json!({"at": 1_761_550_000u64, "version": "0.6.0", "roots": ["/r"], "rows": {"/r": rows}}));
         assert!(dir.join("remotes.lock").exists());
         assert_eq!(load(&path).unwrap(), saved);
         let _ = std::fs::remove_dir_all(&dir);
@@ -191,7 +199,8 @@ mod tests {
     }
 
     /// Restored rows show `unreachable` with their time until the link
-    /// connects; the registry still decides which machines and roots stay.
+    /// connects; the registry still decides which machines stay, their
+    /// roots and rows stay as saved (a sync doesn't touch them).
     #[test]
     fn restored_rows_are_unreachable_until_the_link_connects() {
         let rows = json!({"dir": "/r", "instances": [{"name": "web-1", "root": "/r"}], "runtime_name": "podman"});
@@ -199,11 +208,11 @@ mod tests {
         let saved = of(&[machine("lap", &[("/r", rows.clone()), ("/old", json!({}))], Some(at)), machine("gone", &[], None)], 0);
         let remotes = Remotes::default();
         remotes.restore(machines(saved));
-        let lap = Entry { roots: vec!["/r".into()], ..Entry::inbound("lap", Vec::new()) };
-        remotes.sync(&[lap]);
+        remotes.sync(&[Entry::inbound("lap")]);
         assert!(remotes.get("gone").is_none(), "no longer registered: dropped");
         let m = remotes.get("lap").unwrap();
-        assert_eq!((m.state, m.restored, m.rows.keys().collect::<Vec<_>>()), (LinkState::Unreachable, true, vec![&PathBuf::from("/r")]));
+        assert_eq!((m.state, m.restored, m.rows.len()), (LinkState::Unreachable, true, 2));
+        assert_eq!(m.roots, [PathBuf::from("/r"), PathBuf::from("/old")], "in the listed order");
         assert_eq!(m.error.as_deref(), Some("not reconnected since this daemon started (rows from Oct 27 12:00 UTC)"));
         let merged = crate::serve::snapshots::merge(&json!({"instances": []}), &remotes.all(), None, &Default::default(), &Default::default());
         assert_eq!((&merged["instances"][0]["name"], &merged["instances"][0]["machine"]), (&json!("web-1"), &json!("lap")));
