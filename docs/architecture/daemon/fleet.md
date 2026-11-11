@@ -1974,8 +1974,16 @@ it never signs on a remote request alone (decision 49;
   (`mesh::Bundle::tar`, written by `code::tar`, members at their relative
   paths, the config file as written) is stored by hash at
   `<data>/devsandbox/mesh/bundles/<hash>.tar` (`mesh::store`, next to
-  `member.toml`, outside `fleet/`; 0600, temp file + rename) before the
-  entry is signed, so the authority keeps every version it signed. A
+  `member.toml`, outside `fleet/`; 0600) before the entry is signed, so
+  the authority keeps every version it signed. `mesh::store` leaves a
+  file there alone only when it is a regular file with exactly the
+  bundle's tar bytes (the tar is deterministic) and replaces anything
+  else (cut short, garbage); it writes a temp name of its own (pid +
+  `next_seq`: two signings of one hash can run at once), syncs it,
+  renames it into place and syncs `bundles/`, so a crash leaves the old
+  file or the whole new one. A verb whose root is unchanged signs
+  nothing but still runs `mesh::store`, so a damaged bundle the
+  authority would serve is rewritten at its next verb. A
   config that doesn't load (`Config::load`, or a sandbox's merge, a
   `build`, `mounts` or `features` that doesn't read), a bundle over
   `code::ROOT_TAR_LIMIT` or a store that fails is logged too
@@ -2047,7 +2055,13 @@ it never signs on a remote request alone (decision 49;
   each name whose head isn't what `installed.toml` holds
   (`mesh::installed`) and that this host hasn't bound; its bundle is
   installed from `bundles/` when stored there, else pulled from the peer
-  (`code::LinkTransfer`), then `mesh::install`ed. Runs are one at a time
+  (`code::LinkTransfer`), then `mesh::install`ed. A stored bundle that
+  can't be read or that `install` refuses as not the head's
+  (`mesh::BadBundle`: over the limit, it won't unpack or collect, or it
+  hashes to another) is removed and pulled in the same pass
+  (`mesh::Due::dropped`, logged as ``dropped the stored bundle of config
+  `<name>` vN, pulling it: <why>``); any other failure (the copy can't be
+  written) keeps it. Runs are one at a time
   per process, the heads read inside, so an older log's run never
   installs after a newer one's. Each outcome goes to `serve.log`
   (installed config `<name>` vN from `<peer>`, or why not); a peer

@@ -99,26 +99,38 @@ pub fn bundle_path(data: &Path, hash: &[u8; 32]) -> PathBuf {
     data.join("mesh").join("bundles").join(format!("{}.tar", hex::encode(hash)))
 }
 
-/// `bundle` stored at [`bundle_path`] (temp file + rename, 0600: a
-/// referenced file may hold a token). Already there: left as is.
+/// `bundle` stored at [`bundle_path`] (0600: a referenced file may hold a
+/// token). Left as is when the file there is a regular file with exactly
+/// [`Bundle::tar`]'s bytes (the tar is deterministic, so that one hashes
+/// to its name without unpacking it); anything else there (cut short,
+/// garbage, another tar of the same hash) is replaced. Written to a temp
+/// name of this writer's own (pid + [`next_seq`]: two signings of one hash
+/// can run at once, see [`bind`]; a stale one is a dead process's),
+/// synced, renamed into place, then the dir synced: a crash leaves the
+/// old file or the whole new one.
 pub fn store(data: &Path, bundle: &Bundle) -> Result<PathBuf> {
     let path = bundle_path(data, &bundle.hash());
-    if path.is_file() {
+    let tar = bundle.tar()?;
+    if path.symlink_metadata().is_ok_and(|m| m.is_file()) && std::fs::read(&path).is_ok_and(|b| b == tar) {
         return Ok(path);
     }
     let dir = path.parent().expect("a bundle path has a parent");
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let tmp = dir.join(format!(".{}.{}.tmp", path.file_name().and_then(|n| n.to_str()).unwrap_or_default(), std::process::id()));
+    let leaf = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let tmp = dir.join(format!(".{leaf}.{}-{}.tmp", std::process::id(), next_seq()));
     let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::File::options()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("cannot create {}", tmp.display()))?;
-    f.write_all(&bundle.tar()?).with_context(|| format!("cannot write {}", tmp.display()))?;
-    drop(f);
-    std::fs::rename(&tmp, &path).with_context(|| format!("cannot write {}", path.display()))?;
+    let written = (|| {
+        let mut f = std::fs::File::options().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(&tar)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("cannot write {}", path.display()))?;
     Ok(path)
 }
 
@@ -235,6 +247,21 @@ fn save_installed(path: &Path, roots: &BTreeMap<String, InstalledRoot>) -> Resul
     crate::serve::locked_file::write_atomic_mode(path, &text, 0o644)
 }
 
+/// What [`install`] refuses a tar as: not the head's bundle (over the
+/// limit, it won't unpack or collect, or it hashes to another). [`follow`]
+/// drops a stored bundle refused so and pulls one instead; any other
+/// failure (the copy can't be written) keeps it.
+#[derive(Debug)]
+struct BadBundle(String);
+
+impl std::fmt::Display for BadBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadBundle {}
+
 /// A unique suffix for this process's temp names.
 fn next_seq() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -279,7 +306,7 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
         bail!("config root `{name}` is this host's own ({}): it gets no copy", root.display());
     }
     if tar.len() as u64 > ROOT_TAR_LIMIT {
-        bail!("the config's bundle is over {ROOT_TAR_LIMIT} bytes");
+        return Err(BadBundle(format!("the config's bundle is over {ROOT_TAR_LIMIT} bytes")).into());
     }
     let mesh = data.join("mesh");
     std::fs::create_dir_all(&mesh).with_context(|| format!("cannot create {}", mesh.display()))?;
@@ -290,10 +317,11 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
     let unpacked = temp.join(name);
     let bundle = tar::extract(tar, &unpacked).and_then(|()| collect(&unpacked));
     let _ = std::fs::remove_dir_all(&temp);
-    let bundle = bundle.with_context(|| format!("the bundle of config root `{name}`"))?;
+    let bundle = bundle.with_context(|| BadBundle(format!("the bundle of config root `{name}`")))?;
     let got = bundle.hash();
     if got != *head {
-        bail!("the bundle of config root `{name}` is {}, not the signed version ({})", hex::encode(got), hex::encode(head));
+        let why = format!("the bundle of config root `{name}` is {}, not the signed version ({})", hex::encode(got), hex::encode(head));
+        return Err(BadBundle(why).into());
     }
     store(data, &bundle)?;
 
@@ -656,6 +684,10 @@ pub struct Due {
     pub version: u64,
     pub hash: [u8; 32],
     pub stored: bool,
+    /// Why [`follow`] dropped the stored bundle (unreadable, or refused by
+    /// [`install`] as [`BadBundle`]) and pulled instead; `stored` is then
+    /// false.
+    pub dropped: Option<String>,
 }
 
 /// The names of `heads` (the log's `Membership::config`) to install (pure):
@@ -672,7 +704,7 @@ pub fn due(
     heads
         .iter()
         .filter(|(name, (_, hash))| !bound.contains_key(*name) && installed.get(*name) != Some(&hex::encode(hash)))
-        .map(|(name, (version, hash))| Due { name: name.clone(), version: *version, hash: *hash, stored: stored.contains(hash) })
+        .map(|(name, (version, hash))| Due { name: name.clone(), version: *version, hash: *hash, stored: stored.contains(hash), dropped: None })
         .collect()
 }
 
@@ -681,8 +713,12 @@ pub fn due(
 /// one pulled through `from` (a `code::LinkTransfer` to that peer). Runs
 /// one at a time in this process, `heads` (the log's `config` heads) read
 /// inside, so a run that read an older log never installs after one that
-/// read a newer. What each due name came to; a name whose bundle the peer
-/// doesn't have is an error there, the next sync or link-up tries again.
+/// read a newer. A stored bundle that can't be read or that `install`
+/// refuses as not the head's ([`BadBundle`]) is removed and pulled in the
+/// same pass ([`Due::dropped`]): left there, it would be installed from,
+/// and refused, forever. What each due name came to; a name whose bundle
+/// the peer doesn't have is an error there, the next sync or link-up tries
+/// again.
 pub fn follow(
     data: &Path,
     heads: impl FnOnce() -> Result<BTreeMap<String, (u64, [u8; 32])>>,
@@ -695,14 +731,24 @@ pub fn follow(
     let due = due(&heads, &installed(data)?, &load_roots(&roots_path(data))?, &stored);
     Ok(due
         .into_iter()
-        .map(|d| {
-            let tar = if d.stored {
+        .map(|mut d| {
+            if d.stored {
                 let path = bundle_path(data, &d.hash);
-                std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))
-            } else {
-                pull_bundle(from, data, &d.hash)
-            };
-            let r = tar.and_then(|tar| install(data, &d.name, &tar, &d.hash));
+                let r = std::fs::read(&path)
+                    .map_err(|e| anyhow::Error::new(e).context(BadBundle(format!("cannot read {}", path.display()))))
+                    .and_then(|tar| install(data, &d.name, &tar, &d.hash));
+                match r {
+                    Err(e) if e.downcast_ref::<BadBundle>().is_some() => {
+                        // A removal that fails is replaced anyway: the
+                        // pulled bundle's install stores over it.
+                        let _ = std::fs::remove_file(&path);
+                        d.stored = false;
+                        d.dropped = Some(format!("{e:#}"));
+                    }
+                    r => return (d, r),
+                }
+            }
+            let r = pull_bundle(from, data, &d.hash).and_then(|tar| install(data, &d.name, &tar, &d.hash));
             (d, r)
         })
         .collect())
@@ -1450,7 +1496,7 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
             [("done", hex::encode([1; 32])), ("behind", hex::encode([6; 32]))].into_iter().map(|(n, h)| (n.to_string(), h)).collect();
         let bound = BTreeMap::from([("own".to_string(), PathBuf::from("/a/own"))]);
         let stored = std::collections::BTreeSet::from([[3; 32], [2; 32]]);
-        let due = |name: &str, version, h, stored| Due { name: name.into(), version, hash: [h; 32], stored };
+        let due = |name: &str, version, h, stored| Due { name: name.into(), version, hash: [h; 32], stored, dropped: None };
         assert_eq!(
             super::due(&heads, &installed, &bound, &stored),
             [due("behind", 5, 5, false), due("local", 3, 3, true), due("pull", 1, 4, false)],
@@ -1479,7 +1525,7 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         let heads = || Ok(BTreeMap::from([("cfg".to_string(), (1, b.hash()))]));
         let done = follow(&member, heads, &Served(authority.clone())).unwrap();
         assert_eq!(done.len(), 1);
-        assert_eq!(done[0].0, Due { name: "cfg".into(), version: 1, hash: b.hash(), stored: false });
+        assert_eq!(done[0].0, Due { name: "cfg".into(), version: 1, hash: b.hash(), stored: false, dropped: None });
         assert_eq!(done[0].1.as_ref().unwrap().path, tree_path(&member, "cfg"));
         assert_eq!(installed(&member).unwrap()["cfg"], hex::encode(b.hash()));
         assert_eq!(hash(&tree_path(&member, "cfg")), b.hash());
@@ -1499,6 +1545,94 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
 
         // Bound: the authority's own, nothing to do.
         assert!(follow(&authority, || { bind(&authority, "cfg", &root).unwrap().unwrap(); heads() }, &NoPull).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The temp files left in `data`'s `bundles/`.
+    fn bundle_temps(data: &Path) -> Vec<PathBuf> {
+        let dir = data.join("mesh").join("bundles");
+        std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with(".tmp")).collect()
+    }
+
+    #[test]
+    fn store_replaces_a_bad_stored_bundle() {
+        let (base, root) = fixture("restore");
+        let data = base.join("data");
+        let b = collect(&root).unwrap();
+        let tar = b.tar().unwrap();
+        let path = store(&data, &b).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), tar);
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        for bad in [&tar[..tar.len() / 2], b"garbage", b""] {
+            std::fs::write(&path, bad).unwrap();
+            assert_eq!(store(&data, &b).unwrap(), path);
+            assert_eq!(std::fs::read(&path).unwrap(), tar, "replaced");
+        }
+        // Intact: left as is (same inode).
+        let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&p.metadata().unwrap());
+        let before = ino(&path);
+        store(&data, &b).unwrap();
+        assert_eq!(ino(&path), before);
+        assert!(bundle_temps(&data).is_empty());
+        install(&data, "cfg", &std::fs::read(&path).unwrap(), &b.hash()).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parallel_stores_of_one_bundle_leave_it_whole() {
+        let (base, root) = fixture("race");
+        let data = base.join("data");
+        let b = collect(&root).unwrap();
+        let path = bundle_path(&data, &b.hash());
+        for _ in 0..5 {
+            // Garbage there, so every store writes.
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"garbage").unwrap();
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (data, b) = (data.clone(), b.clone());
+                    std::thread::spawn(move || store(&data, &b).map(|_| ()))
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap().unwrap();
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b.tar().unwrap());
+            assert!(bundle_temps(&data).is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn follow_drops_a_bad_stored_bundle_and_pulls() {
+        let (base, root) = fixture("follow-bad");
+        let authority = base.join("auth");
+        let b = collect(&root).unwrap();
+        store(&authority, &b).unwrap();
+        let heads = || Ok(BTreeMap::from([("cfg".to_string(), (1, b.hash()))]));
+        let tar = b.tar().unwrap();
+        for (tag, bad) in [("cut", &tar[..tar.len() / 2]), ("garbage", b"garbage".as_slice())] {
+            let member = base.join(tag);
+            let path = bundle_path(&member, &b.hash());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bad).unwrap();
+            let done = follow(&member, heads, &Served(authority.clone())).unwrap();
+            assert_eq!(done.len(), 1);
+            assert!(!done[0].0.stored, "{tag}");
+            let why = done[0].0.dropped.as_deref().unwrap();
+            assert!(why.contains("the bundle of config root `cfg`"), "{tag}: {why}");
+            assert_eq!(done[0].1.as_ref().unwrap().path, tree_path(&member, "cfg"));
+            assert_eq!(installed(&member).unwrap()["cfg"], hex::encode(b.hash()));
+            assert_eq!(std::fs::read(&path).unwrap(), tar, "{tag}: the pulled one stored");
+        }
+
+        // The bundle is fine but the copy can't be written: kept, no pull.
+        let member = base.join("unwritable");
+        store(&member, &b).unwrap();
+        write(&member, "mesh/tree/cfg", "a file, not a dir");
+        let done = follow(&member, heads, &NoPull).unwrap();
+        assert!(done[0].0.stored && done[0].0.dropped.is_none() && done[0].1.is_err(), "{done:?}");
+        assert_eq!(std::fs::read(bundle_path(&member, &b.hash())).unwrap(), tar);
         let _ = std::fs::remove_dir_all(&base);
     }
 

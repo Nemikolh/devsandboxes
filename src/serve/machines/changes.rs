@@ -474,7 +474,10 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     let hash = bundle.hash();
     let current = stored.log.membership().expect("checked").config.get(name).copied();
     if current.is_some_and(|(_, h)| h == hash) {
-        return None;
+        // Nothing to sign, but the stored bundle peers pull is rewritten
+        // when it's missing or damaged (`mesh::store` keeps an intact
+        // one), else this host would serve a bad one until the next edit.
+        return mesh::store(data, &bundle).err().map(|e| ConfigSigned::failed(name, format!("{e:#}")));
     }
     match mesh::bind(data, name, &canon) {
         Ok(Ok(())) => {}
@@ -1102,7 +1105,9 @@ mod tests {
 
         std::fs::write(root.join("devsandboxes.toml"), "# a comment\n[sandbox.a]\n").unwrap();
         std::fs::write(root.join("notes.md"), "notes").unwrap();
+        std::fs::write(bundle(&v1), b"damaged").unwrap();
         let (answered, notes) = verb_notes(&pair.l_dir, "start", params.clone());
+        assert_ne!(std::fs::read(bundle(&v1)).unwrap(), b"damaged", "a damaged stored bundle rewritten though nothing signs");
         assert!(answered.is_some());
         assert_eq!(head(&l_toml), signed, "unchanged structure: nothing signed");
         assert_eq!(notes, Vec::<String>::new(), "nothing signed, nothing said");

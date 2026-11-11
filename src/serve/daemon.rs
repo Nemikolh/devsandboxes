@@ -2722,6 +2722,9 @@ fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) {
         Ok(done) => {
             for (due, r) in done {
                 let (name, v) = (&due.name, due.version);
+                if let Some(why) = &due.dropped {
+                    log(&format!("fleet: dropped the stored bundle of config `{name}` v{v}, pulling it: {why}"));
+                }
                 let from = if due.stored { "its stored bundle" } else { peer };
                 match r {
                     Ok(_) => log(&format!("fleet: installed config `{name}` v{v} from {from}")),
