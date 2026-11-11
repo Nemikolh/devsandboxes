@@ -447,12 +447,8 @@ enum MachineCommand {
     /// you in its containers (your ssh agent reaches it only with --agent),
     /// and its devsandbox socket is as powerful as docker.sock.
     ///
-    /// Without --config, its known config roots are offered to pick from
-    /// (on a TTY, none is fine; otherwise the only one is taken); with none
-    /// known, it gets no roots and runs only other members' configs.
-    /// --config is a path on
-    /// the machine: quote a `~` (`--config '~/sandboxes'`), or your local
-    /// shell expands it to your local home.
+    /// Its config roots are the ones its own daemon lists (its configs, and
+    /// those `devsandbox machine roots add` there names); add picks none.
     ///
     /// When the machine has no devsandbox or another version, add offers to
     /// copy this one there (to ~/.local/bin/devsandbox when missing, in
@@ -467,16 +463,13 @@ enum MachineCommand {
     ///
     ///     devsandbox machine add me@my-server
     ///
-    ///     devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
+    ///     devsandbox machine add ssh://me@box:2200 --name box
     Add {
         /// What ssh takes (`me@host`, an ssh-config alias) or `ssh://[user@]host[:port]`
         target: String,
         /// The machine's name (default: its member name; renames it only while it joins a fleet)
         #[arg(long)]
         name: Option<String>,
-        /// A config root on the machine (repeatable)
-        #[arg(long = "config", value_name = "PATH")]
-        configs: Vec<String>,
         /// Grant this host's ssh-agent to the machine, by its member key (off by default; see `machine set`)
         #[arg(long)]
         agent: bool,
@@ -937,8 +930,8 @@ fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
-            MachineCommand::Add { target, name, configs, agent, hub, auto_install, yes } => {
-                commands::machine::add(&target, name.as_deref(), &configs, agent, hub, auto_install, yes)
+            MachineCommand::Add { target, name, agent, hub, auto_install, yes } => {
+                commands::machine::add(&target, name.as_deref(), agent, hub, auto_install, yes)
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),

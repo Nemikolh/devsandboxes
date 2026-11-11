@@ -1591,7 +1591,7 @@ mod tests {
         std::fs::write(dot.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
         let k_toml = pair.base.join("k-data/member.toml");
         let key = key_of(&k_toml).public_key();
-        let added = call(&pair.l_dir, "machines.add", json!({"target": "me@box", "hub": false, "roots": [], "key": key})).unwrap();
+        let added = call(&pair.l_dir, "machines.add", json!({"target": "me@box", "hub": false, "key": key})).unwrap();
         assert_eq!(added["configs"], json!(["note: signed config `.devsandboxes` v1"]));
         let l_log = test_support::read(&pair.base.join("l-data/member.toml")).unwrap();
         let (_, hash) = l_log.log.membership().unwrap().config[".devsandboxes"];
@@ -2051,7 +2051,7 @@ mod tests {
         wait_for("lap connected on K", Duration::from_secs(10), || on_k("lap"));
 
         let l_key = key_of(&l_toml).public_key();
-        let add = json!({"hub": false, "target": "me@box", "roots": [], "key": key_of(&k_toml).public_key()});
+        let add = json!({"hub": false, "target": "me@box", "key": key_of(&k_toml).public_key()});
         let r = call(&l_dir, "machines.add", add).unwrap();
         assert_eq!(r["fleet"], json!({"hub": "box", "joined": "this"}));
         assert_eq!(r["proposed"], json!({"name": "pi", "authority": "lap", "id": 1, "error": null}));

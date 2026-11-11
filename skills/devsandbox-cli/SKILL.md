@@ -218,22 +218,20 @@ devsandbox on its login shell's `PATH`). The local host daemon keeps the list
 and talks to each machine's daemon; nothing else changes on the machine.
 
 ```bash
-devsandbox machine add me@my-server            # probe its config roots; pick on a TTY
-devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
+devsandbox machine add me@my-server            # link it; its config roots are the ones it lists
+devsandbox machine add ssh://me@box:2200 --name box
 devsandbox machine add me@my-server --agent    # with `agent` on
 devsandbox machine ls [--json]                 # NAME TARGET ROOTS AGENT STATE VERSION
 devsandbox machine set box --agent on|off      # change a machine's `agent`
 devsandbox machine unlink box                  # drop this host's link only (it stays in the fleet)
 devsandbox machine rm box                      # take it out of the fleet (this host's own name: leave)
 devsandbox machine trust [worker|full]         # this host's fleet trust (show / set)
-devsandbox machine roots [add|rm <path>…]      # this host's picked roots (add records them on the machine)
+devsandbox machine roots [add|rm <path>…]      # this host's picked roots (what it lists besides its instances')
 devsandbox machine key                         # this host's member key (ed25519:<hex>) and its fingerprint
 ```
 
-- `add` without `--config` offers the machine's known config roots (a
-  numbered multi-select on a TTY); off a TTY it takes the only one, and zero
-  or several is an error listing them: pass `--config <path on the machine>`
-  (repeatable). Quote a `~` so your local shell doesn't expand it. The name
+- `add` picks no config roots: a machine's are the ones its own daemon
+  lists (`machine roots add` run there names more). The name
   defaults to the target's host; a name already registered is refused.
   Adding a machine means trusting it. `--agent` / `machine set <name>
   --agent on|off` (off by default, shown in `machine ls`) decide whether

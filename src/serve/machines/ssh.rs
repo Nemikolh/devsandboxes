@@ -1,6 +1,6 @@
 //! The ssh transport to a machine (docs/architecture/daemon/machines.md,
-//! *ssh*): the add-time argvs (`machine add`'s probe, install script and
-//! `machine roots add`, before a link exists), the dial that spawns one,
+//! *ssh*): the add-time argvs (`machine add`'s probe and install script,
+//! before a link exists), the dial that spawns one,
 //! and the quoting every remote command goes through (the link's own ssh
 //! too: `fleet::transport` over [`target_argv`]).
 //!
@@ -135,16 +135,6 @@ pub fn remote_command(command: &str, args: &[impl AsRef<str>]) -> String {
 /// needs no agent.
 pub fn probe_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     argv(entry, &["-T", "-o", "BatchMode=yes"], &["api", "--stdio", "--client", client, "--sentinel"])
-}
-
-/// The argv of `machine add`'s `machine roots add` on `entry`
-/// (`commands::machine`), before it has a link: `ssh -T [-p N] -- <host>
-/// <devsandbox remote_args…>`. `-T`: piped bytes must stay bytes, not a
-/// pty's CRLFs. No `BatchMode`: a person is there to answer ssh's prompts.
-/// No `-A`. The CLI's other commands on a machine go over its link
-/// (docs/architecture/daemon/machines.md, *The CLI: `cli.rs`*).
-pub fn add_cli_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
-    argv(entry, &["-T"], remote_args)
 }
 
 /// The argv of a POSIX sh `script` run on `entry` by a person at the CLI
@@ -471,7 +461,7 @@ mod tests {
     #[test]
     fn every_argv_refuses_an_inbound_machine() {
         let e = Entry::inbound("lap", Vec::new());
-        let refusals = [probe_argv(&e, "c"), add_cli_argv(&e, &["ps"]), script_argv(&e, "true", &[] as &[&str])];
+        let refusals = [probe_argv(&e, "c"), script_argv(&e, "true", &[] as &[&str])];
         for r in refusals {
             let err = format!("{:#}", r.unwrap_err());
             assert!(err.contains("machine `lap` links to this host from its end") && err.contains("not ssh"), "{err}");
@@ -517,17 +507,12 @@ mod tests {
         let remote = remote_command("devsandbox", &["api", "--stdio", "--client", "machine:laptop", "--sentinel"]);
         assert_eq!(strs(&probe), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
 
-        let e = entry("box", Some("~/bin/devsandbox"));
-        let cli = add_cli_argv(&e, &["machine", "roots", "add", "/srv/it's here"]).unwrap();
-        let remote = remote_command("~/bin/devsandbox", &["machine", "roots", "add", "/srv/it's here"]);
-        assert_eq!(strs(&cli), ["ssh", "-T", "--", "box", remote.as_str()]);
-        assert!(remote.contains("~/bin/devsandbox"), "the command is shell text: {remote}");
         let script = script_argv(&entry("ssh://box:2200", Some("~/bin/devsandbox")), "echo \"$1\"", &["it's"]).unwrap();
         let remote = remote_command("sh", &["-c", "echo \"$1\"", "sh", "it's"]);
         assert_eq!(strs(&script), ["ssh", "-T", "-p", "2200", "--", "box", remote.as_str()]);
         assert!(!strs(&script).contains(&"BatchMode=yes"), "a person is there");
         // No ssh agent forwarding anywhere: nothing at add time needs one.
-        for argv in [&probe, &cli, &script] {
+        for argv in [&probe, &script] {
             assert!(!strs(argv).contains(&"-A"), "{argv:?}");
         }
         assert!(probe_argv(&entry("-oProxyCommand=x", None), "c").is_err());

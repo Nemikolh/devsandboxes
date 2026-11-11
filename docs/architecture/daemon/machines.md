@@ -20,7 +20,7 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 `After`, `apply`, `RmAnswer`, `Removed`, `Left`), `changes.rs`
 (`revoke`, `rotate`, `propose`, `push`, `call`, `Signed`, `Proposed`,
 `Rotation`), `ssh.rs`
-(`probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`,
+(`probe_argv`, `script_argv`, `target_argv`,
 `parse_target`, `Dial`, `RouteDial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
 `Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `api.rs`
@@ -46,9 +46,8 @@ written through `RawEntry`): `target` (`me@host`, an ssh-config alias, or
 the file, the error naming it (`machines::parse`: delete it by hand).
 `Kind::Inbound` is the other kind, never in the file: the service's
 entry for an [inbound neighbor](#inbound-neighbors) (`Entry::inbound`).
-Then `roots` (remote config roots, as the remote canonicalized them:
-the ones `machine add` picked, never rewritten by the link), an
-optional
+Then `roots` (remote config roots; `machines.add` writes none, never
+rewritten by the link), an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
@@ -142,12 +141,9 @@ target over ssh with the argvs in `ssh.rs`:
 - `probe_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … api --stdio
   --client <c> --sentinel` (the daemon has no TTY: ssh must fail, not
   prompt), what `machines.probe` and `machines.add` dial (`probe_dial`)
-  for the hello and `roots.list`. The relay there is a local client of
+  for the hello and `member.get`. The relay there is a local client of
   that daemon, under the user's own ssh login; `--sentinel` makes it write
   its sentinel line first ([Link handshake](#link-handshake)).
-- `add_cli_argv`: `-T`, no `BatchMode` (a person is there); `machine
-  add`'s `machine roots add` there
-  ([`devsandbox machine add…`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)).
 - `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
   POSIX script run for a person at the CLI ([Install](#install)); no
   `BatchMode`. A script is one line: the login shell may be csh, which
@@ -190,7 +186,7 @@ the remote daemon serves it with the machine's trust table
 default) this host reaches the machine's own roots and its fleet root
 for this host (`fleet/<this host>/` there) only (its own roots being
 those its instances name, plus its `member.toml` `roots`, which `machine
-add` records there), never `machines.*`, `member.*`, `shutdown` or an
+roots add` run there sets), never `machines.*`, `member.*`, `shutdown` or an
 edit of those configs (`fleet.*` goes by who the caller is, whatever the
 trust: [fleet](fleet.md#the-trust-table)); under `full`, everything but `member.*`,
 `membership.*`, `graph.*`, `link.*` and `links.*`. A verb this way runs with the machine daemon's
@@ -199,9 +195,8 @@ over a direct link its `SSH_AUTH_SOCK` this host's agent relayed there
 (`agent-link-<this host>.sock`, the peer's `agent`) while that socket
 answers, so host git on the machine uses the agent this host serves.
 No use of a machine bypasses the trust table: the only ssh shells on it
-are the add-time ones (`probe_argv`'s `roots.list`, `add_cli_argv`'s
-`machine roots add`, `script_argv`'s install), each the user's own
-login there.
+are the add-time ones (`probe_argv`'s probe, `script_argv`'s install),
+each the user's own login there.
 
 ## Install
 
@@ -737,35 +732,16 @@ directly and the machine's `command` becomes `LOCAL_COMMAND`
 login `PATH` resolves, an error naming what it resolves to. That
 `command` goes to both `machines.probe` and `machines.add`.
 
-`add` then always calls `machines.probe` (the remote's `roots.list`:
-every `config_dir` in its `state.toml` plus `~/.devsandboxes`; and its
+`add` then always calls `machines.probe` (the remote's version and its
 `member.get`'s `key` and `fingerprint`). It prints `<target>'s key
 fingerprint is SHA256:…` on stderr and has it confirmed (`confirm_key`,
 over `consent`): `--yes` takes it, a TTY asks `[y/N]` (to compare with
 `devsandbox machine key` run there), no TTY without `--yes` is an error
 naming the fingerprint and the flag (`key_refusal`). The confirmed key
-goes to `machines.add` as `key`. Without `--config`, the probe's roots
-are offered: no candidates, it takes no roots without asking;
-else it lets the user multi-select on a TTY (`pick_roots`, Enter for
-none), and off a TTY takes the one usable candidate, else errors listing
-them (`only_root`). A machine with no roots is one that only runs other
-members' configs (in their fleet roots), as a hub or worker can.
-`machines.add` then checks every given root on the machine
-(`roots.list {paths}`: `~` expanded with the remote home, canonicalized,
-config loaded); `roots: []` is valid. Between the two, `add` records
-every chosen root, probed or typed, as the
-machine's own (`record_roots`): `devsandbox machine roots add -- <roots…>`
-run there over a one-off ssh with the machine's `command`
-(`record_roots_argv`: `ssh::add_cli_argv`, `-T`, no `BatchMode`, each
-root quoted so its `~` reaches the remote command unexpanded), stdout
-dropped, stderr passed through. A probed root is recorded too: it may be
-an own root only through an instance, and stops being one when that
-instance goes. A failure (ssh, a non-zero exit, a devsandbox there without
-the command) is a `warning:` line (`roots_warning`) naming the target and
-the `machine roots add` to run there, since under the machine's `worker`
-trust the hub may be refused those roots
-([fleet.md](fleet.md#the-trust-table)); the add goes on. No roots
-chosen, nothing is recorded (no ssh).
+goes to `machines.add` as `key`. `add` picks no config roots: a
+machine's are the ones its own daemon lists (its `roots.list`), and a
+member names more of its own with `devsandbox machine roots add` run
+there. `add` prints `added <name> (<target>)`.
 
 `machines.add` also applies the join rule
 ([fleet.md](fleet.md), *How a machine joins*): on the same probe it asks
@@ -779,7 +755,7 @@ and a joining name the fleet already has. `add --hub` (`machines.add`'s
 neither end is in one, and is refused (`denied`) when either end is in a
 fleet whose hub the machine isn't. Then `join::logs` plans both ends'
 membership logs over this host's `membership.json`, its key, and the
-machine's `membership.get`. Every check (names, roots, the registry and
+machine's `membership.get`. Every check (names, the registry and
 the inbound neighbors, both logs) comes before any write; then the
 machine's `member.set {name}` when it joins, its membership over the
 still-open probe (`membership.adopt` of the log made here, or of this

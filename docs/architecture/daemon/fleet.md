@@ -274,7 +274,7 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `Shared::routed_reach`); `src/key_guard.rs`
 (`Guard`, `check_argv`, `check_mount`, `Exposure`),
 `src/serve/locked_file.rs` (`update`, `lock_at`, `write_atomic_mode`),
-`src/commands/machine.rs` (`trust`, `roots`, `record_roots`, `key`,
+`src/commands/machine.rs` (`trust`, `roots`, `key`,
 `rotate_key`, `confirm_key`, `pending`, `approve`, `deny`), `src/serve/fleet/lent.rs` (`Peer`,
 `Channel`, `attach_params`, `peer_fleet_root`, `Files`, `Reach`,
 `own_roots`, `decide`, `admit`, `confine_path`, `lent_instances`,
@@ -1429,8 +1429,7 @@ there only through the trust table.
   [Versions](#versions); absent is `false`, left out of the file while
   `false`), `roots` (config roots this host shows the fleet besides
   those its `state.toml` has instances in, absolute; `devsandbox machine
-  roots add|rm` on this host sets them, and `machine add` run elsewhere
-  records the roots it picks here that way:
+  roots add|rm` on this host sets them:
   [machines.md](machines.md#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)),
   an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
   and a `[caps]` table, the soft caps of the
@@ -2645,9 +2644,7 @@ a `lent::Reach` from this host's files (`Reach::load` over
   `state.toml` plus `~/.devsandboxes`, what `roots.list` answers) and
   `member.toml`'s `roots`, canonicalized where they exist (decision 17 of
   the [plan](../../plans/active/fleet.md#decisions)); those are written
-  by `devsandbox machine roots add` (`commands::machine::roots`), which
-  `machine add` runs here over ssh for every root it picks
-  (`commands::machine::record_roots`). Placed instances'
+  by `devsandbox machine roots add` (`commands::machine::roots`). Placed instances'
   config roots are in `state.toml` too.
 - **The fleet root**, the `Peer`'s: `fleet/<peer>/` in the data dir
   (`lent::peer_fleet_root`, decision 24 of the
@@ -2704,9 +2701,7 @@ never hands the daemon off (below). Under **`worker`**:
   `instances.watch` / `unwatch`, the quick calls
   (`machines::forward::QUICK`), `capacity.get`, `code.haves` (about the
   caller's own fleet root), `instances.fetch` (fetch-back, below),
-  `roots.list` (with or
-  without `paths`: read-only; `machines.add` checks typed roots through
-  it), `open.deliver` (a URL for this host's desktop: [Opening
+  `roots.list` (read-only), `open.deliver` (a URL for this host's desktop: [Opening
   URLs](#opening-urls)) and the verbs (`verbs::is_verb`) but `gc`. It refuses
   (`denied`) any request with a `machine` param or `machines: true`
   (nothing federates past the member) but an `instances.watch`'s, which

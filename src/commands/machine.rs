@@ -8,31 +8,22 @@
 //! `add` always probes the machine first (`machines.probe`): its member key's
 //! fingerprint is shown and confirmed on a TTY (`--yes` takes it without
 //! asking; off a TTY `--yes` is required), and the confirmed key goes to
-//! `machines.add`, which refuses a machine whose key differs. Without
-//! `--config` the user picks among the probe's candidate roots (a TTY;
-//! none is a pick too) or `add` takes the only usable one (no TTY); no
-//! candidates, it takes none without asking. The picked or
-//! typed roots, if any, are first recorded on the machine as its own
-//! (`devsandbox machine roots add` there over ssh, so its `worker` trust
-//! lets this host reach them even once no instance keeps them in its
-//! `state.toml`; a failure is a warning), then go to `machines.add`, which
-//! checks them on the machine itself.
+//! `machines.add`, which refuses a machine whose key differs. `add` picks
+//! no config roots: a machine's are what its own daemon lists
+//! (`machine roots add` there names more).
 //!
 //! Before probing, `add` checks the machine's devsandbox (`install`) and,
 //! when it's missing or another version, copies this binary there: asked on
 //! a TTY, without asking under `--auto-install`, refused otherwise.
 
-use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::render::table;
-use crate::serve::api::RootCandidate;
 use crate::serve::capacity;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
@@ -44,35 +35,17 @@ use crate::serve::fleet::proposals::Proposal;
 use crate::serve::machines::changes::{Approved, HubMove, Proposed, Rotation, Signed};
 use crate::serve::machines::leave::{Heard, Removed, RmAnswer};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
-use crate::serve::machines::ssh;
 
 const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
-pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hub: bool, auto_install: bool, yes: bool) -> Result<()> {
+pub fn add(target: &str, name: Option<&str>, agent: bool, hub: bool, auto_install: bool, yes: bool) -> Result<()> {
     let command = ensure_devsandbox(target, auto_install)?;
     let mut conn = connect()?;
     let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target, "command": command }))?;
     confirm_key(target, &probed.fingerprint, std::io::stdin().is_terminal(), yes)?;
-    let roots = if configs.is_empty() {
-        if probed.roots.is_empty() {
-            Vec::new()
-        } else if std::io::stdin().is_terminal() {
-            pick_roots(target, &probed.roots)?
-        } else {
-            only_root(target, &probed.roots)?
-        }
-    } else {
-        configs.to_vec()
-    };
-    if !roots.is_empty()
-        && let Err(e) = record_roots(target, command.as_deref(), &roots)
-    {
-        eprintln!("warning: {}", roots_warning(target, &roots, &e));
-    }
-    let params = json!({ "target": target, "name": name, "roots": roots, "hub": hub, "agent": agent, "command": command, "key": probed.key });
+    let params = json!({ "target": target, "name": name, "hub": hub, "agent": agent, "command": command, "key": probed.key });
     let added: Added = call(&mut conn, "machines.add", params)?;
-    let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
-    println!("added {} ({target}): {}", added.name, added_roots(&roots));
+    println!("added {} ({target})", added.name);
     println!("{}", fleet_line(&added.name, &added.fleet));
     if let Some(p) = &added.proposed {
         println!("{}", added_proposal_line(&added.name, p));
@@ -119,11 +92,6 @@ fn key_refusal(target: &str, fingerprint: &str) -> String {
     )
 }
 
-/// The roots `add` reports: listed, or that there are none.
-fn added_roots(roots: &[String]) -> String {
-    if roots.is_empty() { "no config roots".into() } else { roots.join(", ") }
-}
-
 /// What `add`'s join did, in one line.
 fn fleet_line(name: &str, fleet: &Fleet) -> String {
     let hub = &fleet.hub;
@@ -135,46 +103,6 @@ fn fleet_line(name: &str, fleet: &Fleet) -> String {
         Joined::New => format!("a fleet of two: this host ({hub}) is the hub"),
         Joined::Same => format!("an extra link in {hub}'s fleet"),
     }
-}
-
-/// Record `roots` as `target`'s own (its `member.toml` `roots`, decision 17
-/// of the fleet plan): `devsandbox machine roots add` there over a one-off
-/// ssh, its stderr (ssh's prompts and errors, the command's) passed through.
-fn record_roots(target: &str, command: Option<&str>, roots: &[String]) -> Result<()> {
-    let argv = record_roots_argv(target, command, roots)?;
-    let (program, args) = argv.split_first().context("empty argv")?;
-    let status = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
-    if !status.success() {
-        bail!("{} exited with {status}", program.to_string_lossy());
-    }
-    Ok(())
-}
-
-/// `ssh -T … <target> <command> machine roots add -- <roots…>`: `-T` and no
-/// `BatchMode`, a person is there. Each root goes quoted, so a `~` reaches
-/// `machine roots add` unexpanded and is resolved there ([`resolve_root`]).
-fn record_roots_argv(target: &str, command: Option<&str>, roots: &[String]) -> Result<Vec<OsString>> {
-    let mut entry = Entry::ssh(target, target);
-    entry.command = command.map(String::from);
-    let mut args = vec!["machine", "roots", "add", "--"];
-    args.extend(roots.iter().map(String::as_str));
-    ssh::add_cli_argv(&entry, &args)
-}
-
-/// The warning when [`record_roots`] fails: not a failed add, but under the
-/// machine's `worker` trust the roots it has no instance in may be refused.
-fn roots_warning(target: &str, roots: &[String], why: &anyhow::Error) -> String {
-    let quoted: Vec<String> = roots.iter().map(|r| ssh::quote(r)).collect();
-    format!(
-        "couldn't record the roots on {target} ({why:#}); under its `worker` trust the hub may be refused them until `devsandbox machine roots add {}` is run there",
-        quoted.join(" ")
-    )
 }
 
 /// [`install::DEFAULT_DEST`] as the registry's `command`: shell text, the
@@ -757,37 +685,6 @@ fn cells(r: MachineRow) -> [String; 7] {
     ]
 }
 
-/// A candidate as the picker shows it: `/home/me/.devsandboxes  (api, web)`.
-fn label(c: &RootCandidate) -> String {
-    let what = match &c.error {
-        Some(e) => format!("unusable: {e}"),
-        None if c.sandboxes.is_empty() => "no sandboxes".into(),
-        None => c.sandboxes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "),
-    };
-    format!("{}  ({what})", c.root.display())
-}
-
-/// The numbered multi-select on stderr: every candidate, then "other
-/// path…", which asks for a path typed as on the machine. Nothing typed
-/// picks no roots.
-fn pick_roots(target: &str, candidates: &[RootCandidate]) -> Result<Vec<String>> {
-    eprintln!("config roots on {target} (e.g. `1,3`; Enter for none):");
-    for (i, c) in candidates.iter().enumerate() {
-        eprintln!("  {}) {}", i + 1, label(c));
-    }
-    eprintln!("  {}) other path…", candidates.len() + 1);
-    let selection = parse_selection(&prompt("> ")?, candidates.len())?;
-    let mut roots = picked(candidates, &selection)?;
-    if selection.other {
-        let path = prompt(&format!("path on {target} (`~` is its home): "))?;
-        if path.is_empty() {
-            bail!("no path given");
-        }
-        roots.push(path);
-    }
-    Ok(roots)
-}
-
 fn prompt(text: &str) -> Result<String> {
     eprint!("{text}");
     std::io::stderr().flush()?;
@@ -796,113 +693,9 @@ fn prompt(text: &str) -> Result<String> {
     Ok(answer.trim().to_string())
 }
 
-/// What a typed selection picked: candidate indexes (0-based, in the order
-/// typed) and whether "other path…" was among them.
-#[derive(Debug, PartialEq, Eq)]
-struct Selection {
-    roots: Vec<usize>,
-    other: bool,
-}
-
-/// `1,3`, `1 3` or `1-3` over `candidates` numbered from 1, plus
-/// `candidates + 1` for "other path…". Repeats count once; nothing typed
-/// is an empty selection.
-fn parse_selection(input: &str, candidates: usize) -> Result<Selection> {
-    let mut sel = Selection { roots: Vec::new(), other: false };
-    let number = |s: &str| -> Result<usize> {
-        let n: usize = s.trim().parse().with_context(|| format!("invalid selection `{s}`"))?;
-        if n == 0 || n > candidates + 1 {
-            bail!("selection {n} out of range (1-{})", candidates + 1);
-        }
-        Ok(n)
-    };
-    for token in input.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
-        let (from, to) = match token.split_once('-') {
-            Some((a, b)) => (number(a)?, number(b)?),
-            None => (number(token)?, number(token)?),
-        };
-        if from > to {
-            bail!("invalid range `{token}`");
-        }
-        for n in from..=to {
-            if n == candidates + 1 {
-                sel.other = true;
-            } else if !sel.roots.contains(&(n - 1)) {
-                sel.roots.push(n - 1);
-            }
-        }
-    }
-    Ok(sel)
-}
-
-/// The selected candidates' roots; one with an `error` is refused, saying
-/// why (it's listed so the user sees it's there and why it can't be used).
-fn picked(candidates: &[RootCandidate], sel: &Selection) -> Result<Vec<String>> {
-    sel.roots
-        .iter()
-        .map(|&i| {
-            let c = &candidates[i];
-            match &c.error {
-                Some(e) => bail!("{} can't be used: {e}", c.root.display()),
-                None => Ok(c.root.display().to_string()),
-            }
-        })
-        .collect()
-}
-
-/// Off a TTY: no candidates, no roots; else the one usable candidate. None
-/// usable or several is an error that lists them and points at `--config`.
-fn only_root(target: &str, candidates: &[RootCandidate]) -> Result<Vec<String>> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let usable: Vec<&RootCandidate> = candidates.iter().filter(|c| c.error.is_none()).collect();
-    if let [one] = usable[..] {
-        return Ok(vec![one.root.display().to_string()]);
-    }
-    let listed: String = candidates.iter().map(|c| format!("\n  {}", label(c))).collect();
-    let how = "pass --config <path on the machine> (repeatable)";
-    if usable.is_empty() {
-        bail!("found no usable config root on {target}{listed}\n{how}");
-    }
-    bail!("{target} has several config roots, so none is taken without a TTY:{listed}\n{how}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::api::SandboxEntry;
-
-    fn cand(root: &str, sandboxes: &[&str], error: Option<&str>) -> RootCandidate {
-        RootCandidate {
-            root: root.into(),
-            sandboxes: sandboxes.iter().map(|s| SandboxEntry::named(s.to_string())).collect(),
-            error: error.map(String::from),
-            fleet: false,
-        }
-    }
-
-    #[test]
-    fn selections_take_lists_ranges_and_other() {
-        let sel = |roots: &[usize], other| Selection { roots: roots.to_vec(), other };
-        assert_eq!(parse_selection("1", 3).unwrap(), sel(&[0], false));
-        assert_eq!(parse_selection("3,1", 3).unwrap(), sel(&[2, 0], false));
-        assert_eq!(parse_selection(" 1 3 ", 3).unwrap(), sel(&[0, 2], false));
-        assert_eq!(parse_selection("1, 3,1", 3).unwrap(), sel(&[0, 2], false));
-        assert_eq!(parse_selection("2-4", 3).unwrap(), sel(&[1, 2], true));
-        assert_eq!(parse_selection("1", 0).unwrap(), sel(&[], true), "no candidates: only other");
-        assert_eq!(parse_selection("", 3).unwrap(), sel(&[], false), "nothing typed: no roots");
-        for bad in ["0", "5", "x", "3-1", "1-", "-2"] {
-            assert!(parse_selection(bad, 3).is_err(), "{bad:?} parsed");
-        }
-    }
-
-    #[test]
-    fn no_roots_read_as_none() {
-        assert_eq!(added_roots(&[]), "no config roots");
-        assert_eq!(added_roots(&["/a".into(), "/b".into()]), "/a, /b");
-    }
-
     #[test]
     fn the_join_is_one_line() {
         let line = |joined| fleet_line("box", &Fleet { hub: "k".into(), joined });
@@ -982,28 +775,6 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("ID") && lines[0].contains("FROM") && lines[0].contains("WHAT") && lines[0].contains("WHEN"), "{text}");
         assert!(lines[1].contains("box") && lines[1].contains("remove pi from the fleet") && lines[1].trim_end().ends_with("2m"), "{text}");
-    }
-
-    #[test]
-    fn an_unusable_pick_is_refused() {
-        let cands = [cand("/a", &["web"], None), cand("/b", &[], Some("no directory /b"))];
-        let sel = Selection { roots: vec![0], other: true };
-        assert_eq!(picked(&cands, &sel).unwrap(), ["/a"]);
-        let err = picked(&cands, &Selection { roots: vec![0, 1], other: false }).unwrap_err();
-        assert_eq!(err.to_string(), "/b can't be used: no directory /b");
-    }
-
-    #[test]
-    fn off_a_tty_only_one_usable_root_is_taken() {
-        let one = [cand("/a", &["web", "api"], None), cand("/b", &[], Some("bad config"))];
-        assert_eq!(only_root("box", &one).unwrap(), ["/a"]);
-        assert!(only_root("box", &[]).unwrap().is_empty(), "no candidates: no roots");
-        let err = only_root("box", &one[1..]).unwrap_err().to_string();
-        assert!(err.starts_with("found no usable config root on box") && err.contains("--config"), "{err}");
-        assert!(err.contains("/b  (unusable: bad config)"), "{err}");
-        let two = [cand("/a", &["web"], None), cand("/c", &[], None)];
-        let err = only_root("box", &two).unwrap_err().to_string();
-        assert!(err.contains("several") && err.contains("\n  /a  (web)\n  /c  (no sandboxes)\n") && err.contains("--config"), "{err}");
     }
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
@@ -1209,23 +980,6 @@ mod tests {
     fn roots_print_one_per_line_or_a_note() {
         assert_eq!(roots_text(&["/a".into(), "/b c".into()]), "/a\n/b c\n");
         assert!(roots_text(&[]).contains("machine roots add"));
-    }
-
-    #[test]
-    fn add_records_the_roots_on_the_machine() {
-        let strs = |argv: &[OsString]| argv.iter().map(|a| a.to_str().unwrap().to_string()).collect::<Vec<_>>();
-        let roots = ["/srv/it's".to_string(), "~/cfg".to_string()];
-        let argv = record_roots_argv("ssh://me@box:2200", Some("~/.local/bin/devsandbox"), &roots).unwrap();
-        let remote = ssh::remote_command("~/.local/bin/devsandbox", &["machine", "roots", "add", "--", "/srv/it's", "~/cfg"]);
-        assert_eq!(strs(&argv), ["ssh", "-T", "-p", "2200", "--", "me@box", remote.as_str()]);
-        assert!(!strs(&argv).iter().any(|a| a == "BatchMode=yes" || a == "-A"), "a person is there, no agent");
-        let plain = record_roots_argv("box", None, &roots[..1]).unwrap();
-        assert_eq!(strs(&plain)[4], ssh::remote_command("devsandbox", &["machine", "roots", "add", "--", "/srv/it's"]));
-        assert!(record_roots_argv("-oProxyCommand=x", None, &roots).is_err());
-
-        let warning = roots_warning("box", &roots, &anyhow::anyhow!("ssh exited with exit status: 2"));
-        assert!(warning.starts_with("couldn't record the roots on box (ssh exited with exit status: 2)"), "{warning}");
-        assert!(warning.contains("`worker` trust") && warning.contains(r"`devsandbox machine roots add '/srv/it'\''s' '~/cfg'` is run there"), "{warning}");
     }
 
     #[test]

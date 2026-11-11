@@ -30,8 +30,7 @@ Start with `docs/README.md` (reading order and map) and
   `member.*`, `membership.*` only (never in-process);
   `add`'s install check first (ask on a TTY, `--auto-install`, else
   refuse; `machines/install.rs`), the target's key fingerprint confirmed
-  (`--yes` off a TTY), its TTY multi-select of probed roots and
-  the off-TTY one-candidate rule.
+  (`--yes` off a TTY); it picks no config roots.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
   `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the
   host runs git — hooks/fsmonitor off, repo config allowlist-checked),
@@ -137,8 +136,8 @@ Start with `docs/README.md` (reading order and map) and
   the CLI only to know if any exist):
   `mod.rs` (the registry: `Entry`, locked atomic `update`, name rules,
   `parse_name` → `Where` for `m/x` | `@/x` | bare, `default_name`),
-  `ssh.rs` (the add-time argvs: `probe_argv`, `add_cli_argv`,
-  `script_argv`; login-shell quoting; the injectable `Dial` → `Duplex`,
+  `ssh.rs` (the add-time argvs: `probe_argv`, `script_argv`;
+  login-shell quoting; the injectable `Dial` → `Duplex`,
   ssh's stderr tail),
   `link.rs` (the hello as version 0.0.0, protocol must match, `LinkError`;
   `Over`: past the probe's sentinel over ssh, none on a link stream),

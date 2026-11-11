@@ -314,8 +314,7 @@ pub enum Gate {
     /// `instances.fetch`: an instance under the caller's fleet root (never
     /// one of this member's own roots), bundled for it (fetch-back).
     Fetch,
-    /// `roots.list`, with or without `paths`: read-only (`machines.add`
-    /// checks typed roots through it).
+    /// `roots.list`: read-only.
     Roots,
     Verb,
     /// `open.deliver`: a URL for this host's desktop, about an instance on
@@ -758,7 +757,7 @@ pub fn filter_answer(method: &str, mut answer: Value, reach: &Reach, state: &Pat
     Ok(answer)
 }
 
-/// A `roots.list` answer (the listing, not a `paths` check) to a peer with
+/// A `roots.list` answer to a peer with
 /// a fleet root, that root added last unless listed already (as
 /// `{root, sandboxes: [], error: null, fleet: true}`: the placed configs
 /// are under it), flagged `fleet` either way: what the peer reaches here
@@ -933,7 +932,6 @@ mod tests {
             ("forwards.add", p.clone(), Err("denied")),
             ("forwards.list", p.clone(), Err("denied")),
             ("roots.list", p.clone(), Ok(Roots)),
-            ("roots.list", json!({"paths": ["~/x"]}), Ok(Roots)),
             ("roots.list", json!({"machine": "m"}), Err("denied")),
             ("bridges.ensure", p.clone(), Err("denied")),
             ("inbox.threads.list", p.clone(), Err("denied")),
@@ -1270,7 +1268,7 @@ mod tests {
             assert!(admit(m, json!({"root": root.join("cfg")}), &s, &r, &state).is_ok(), "{m} under the fleet root");
         }
         assert!(admit("config.findings", json!({"root": mine}), &s, &r, &state).is_ok(), "reading is fine");
-        assert_eq!(ok("roots.list", json!({"paths": ["/anywhere"]})), json!({"paths": ["/anywhere"]}));
+        assert_eq!(ok("roots.list", json!({})), json!({}));
         let _ = std::fs::remove_dir_all(&base);
     }
 

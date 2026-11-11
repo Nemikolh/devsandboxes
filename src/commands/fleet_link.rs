@@ -680,7 +680,7 @@ mod tests {
         // A registry entry can't take a live neighbor's name.
         let mut k = conn_at(&k_dir);
         let key = crate::serve::fleet::identity::Signer::public_key(&crate::serve::fleet::identity::SigningKey::from_seed([9; 32]));
-        let add = json!({"hub": false, "target": "me@l", "name": "L", "roots": ["/x"], "key": key});
+        let add = json!({"hub": false, "target": "me@l", "name": "L", "key": key});
         let e = k.call("machines.add", add).unwrap().error.unwrap();
         assert!(e.code == "denied" && e.message.contains("inbound neighbor"), "{e:?}");
 

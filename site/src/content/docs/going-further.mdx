@@ -114,7 +114,7 @@ devsandbox -C ~/code/sandboxes
 Sandboxes can also live on a server you reach over ssh. Register it once (`machine add` offers to install devsandbox there if it's missing), then use its names like local ones:
 
 ```bash
-devsandbox machine add me@my-server   # pick its config roots
+devsandbox machine add me@my-server   # its config roots are the ones it lists
 devsandbox run api                    # defined only there: runs there, prints my-server/api
 devsandbox exec api pnpm test         # in the instance there
 devsandbox stop my-server/web         # qualified, when `web` exists here too

@@ -2156,8 +2156,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         }
         Ok(None) => {}
     }
-    // A peer's `roots.list` listing (not a `paths` check) gets its fleet root.
-    let lists_roots = req.method == "roots.list" && req.params.get("paths").is_none_or(Value::is_null);
+    // A peer's `roots.list` listing gets its fleet root.
+    let lists_roots = req.method == "roots.list";
     let answer = match req.method.as_str() {
         "subscribe" => subscribe(req.params, conn, true),
         "unsubscribe" => subscribe(req.params, conn, false),
@@ -2664,7 +2664,7 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
         sign_config(id, root, shared, conn);
     }
     if matches!(method, "run" | "rebuild" | "start" | "services.rebuild")
-        && let Err(why) = check_mesh_copy(&params, shared)
+        && let Err(why) = check_mesh_copy(&params, shared, matches!(conn.table, Table::Peer(_)))
     {
         log(&format!("{}: refused {method}: {why}", conn.label()));
         return Some(Response::err(id, "denied", why));
@@ -2738,11 +2738,15 @@ fn config_notes(signed: &machines::changes::ConfigSigned, key: &str, told: &mut 
 /// same function, so the two agree. `stop`/`rm` never come here: they
 /// build nothing, and keep working on a changed copy. A refused copy is
 /// repaired off the request thread ([`repair_config`]), so the next try
-/// can pass.
-fn check_mesh_copy(params: &Value, shared: &Shared) -> Result<(), String> {
+/// can pass. From a linked or routed `peer` (`Table::Peer`), also a root
+/// named like a signed config but not its copy
+/// (`fleet::mesh::check_peer_root_in`); a local client's own roots stay
+/// unchecked (ADR 0002).
+fn check_mesh_copy(params: &Value, shared: &Shared, peer: bool) -> Result<(), String> {
     let (Some(member), Some(data)) = (shared.member.as_deref(), shared.data_dir()) else { return Ok(()) };
     let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) else { return Ok(()) };
-    fleet::mesh::check_root_in(data, member, root).map_err(|e| {
+    let check = if peer { fleet::mesh::check_peer_root_in } else { fleet::mesh::check_root_in };
+    check(data, member, root).map_err(|e| {
         if let Some((name, true)) = fleet::mesh::copy_of(data, root) {
             repair_config(member, &name);
         }
@@ -4032,6 +4036,37 @@ pub(crate) mod tests {
     fn bare_shared(tag: &str) -> Arc<Shared> {
         let store = scratch(tag);
         Arc::new(Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join()))
+    }
+
+    /// A peer's build from a root named like a signed config but not its
+    /// copy is refused; a local client's isn't looked at (ADR 0002).
+    #[test]
+    fn a_peer_cant_build_a_non_copy_named_like_a_signed_config() {
+        use crate::serve::fleet::identity::{Signer, SigningKey};
+        use crate::serve::fleet::{membership, mesh};
+        let store = scratch("peer-named-root");
+        let own = store.join("home/.devsandboxes");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let b = mesh::collect(&own).unwrap();
+        mesh::install(&store, ".devsandboxes", &b.tar().unwrap(), &b.hash()).unwrap();
+        let key = SigningKey::from_seed([1; 32]);
+        let mut log = membership::Log::default();
+        log.append(membership::Op::genesis_with_id([1; 16], "lap", key.public_key(), "lap"), "lap", &key).unwrap();
+        log.append(membership::Op::Config { root: ".devsandboxes".into(), version: 1, hash: b.hash() }, "lap", &key).unwrap();
+        let member = store.join("member.toml");
+        let text = membership::serialize(&membership::Stored { log, introductions: vec![] }).unwrap();
+        std::fs::write(membership::path(&member), text).unwrap();
+        let mut s = Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join());
+        s.member = Some(member);
+
+        let params = json!({"root": own.display().to_string()});
+        let why = check_mesh_copy(&params, &s, true).unwrap_err();
+        assert!(why.contains("has the name of the signed config `.devsandboxes` but isn't its copy here"), "{why}");
+        check_mesh_copy(&params, &s, false).unwrap();
+        let copy = json!({"root": mesh::tree_path(&store, ".devsandboxes").display().to_string()});
+        check_mesh_copy(&copy, &s, true).unwrap();
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// No runtime here (a driver): `roots.list` lists no signed copy (still

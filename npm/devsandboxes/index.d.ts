@@ -907,11 +907,10 @@ export interface RootCandidate {
   fleet?: boolean;
 }
 
-/** `machines.probe`'s answer: the machine's devsandbox, its candidate roots and its member key. @experimental */
+/** `machines.probe`'s answer: the machine's devsandbox and its member key. @experimental */
 export interface MachineProbe {
   version: string;
   protocol: number;
-  roots: RootCandidate[];
   /** The machine's member key (`ed25519:<64 lowercase hex>`): what `machines.add`'s `key` confirms. */
   key: string;
   /** The key's fingerprint, to show the user. */
@@ -921,8 +920,6 @@ export interface MachineProbe {
 /** `machines.add`'s answer. @experimental */
 export interface MachineAdded {
   name: string;
-  /** As saved: the machine's canonical paths, deduplicated. */
-  roots: string[];
   /** The machine's devsandbox semver. */
   version: string;
   /** Set when that semver differs from this daemon's. */
@@ -1838,26 +1835,25 @@ export interface ApiMethods {
   'sandboxes.list': { params: { root: string; machines?: boolean; machine?: string }; result: SandboxEntry[] };
   /**
    * This host's config roots: every one its instances were made from, plus `~/.devsandboxes`; sorted.
-   * With `paths`: exactly those, in order (`~` expanded here, canonicalized; a bad one has its `error`).
    * @experimental
    */
-  'roots.list': { params: { paths?: string[] }; result: RootCandidate[] };
+  'roots.list': { params: {}; result: RootCandidate[] };
   /**
-   * Dial a target over ssh and list its candidate roots; `failed` when ssh or the hello fails. `command`: the
+   * Dial a target over ssh and read its member key; `failed` when ssh or the hello fails. `command`: the
    * machine's devsandbox as shell text (default `devsandbox`); `invalid` when empty.
    * @experimental
    */
   'machines.probe': { params: { target: string; command?: string }; result: MachineProbe };
   /**
-   * Check `roots` on the machine (a quoted `~` is its home) and register it; `invalid` for a taken name, a bad
-   * root or an empty `command`. `command` as `machines.probe`'s, saved as the machine's. `hub`: the machine is
+   * Register a machine (no config roots: its own daemon lists them); `invalid` for a taken name or an empty
+   * `command`. `command` as `machines.probe`'s, saved as the machine's. `hub`: the machine is
    * the hub of the new fleet; `denied` when either end is in a fleet whose hub it isn't. `key`: the machine's
    * key as the user confirmed it (`machines.probe`'s); `denied` when the machine's differs. Writes both ends'
    * membership logs (`denied` for another fleet's log, a fork, a capped member letting a host in). `agent`:
    * grant this host's ssh-agent to the machine by `key` once it's added.
    * @experimental
    */
-  'machines.add': { params: { target: string; name?: string; roots: string[]; hub: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
+  'machines.add': { params: { target: string; name?: string; hub: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
   /** @experimental */
   'machines.list': { params: {}; result: MachineRow[] };
   /**

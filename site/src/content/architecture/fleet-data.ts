@@ -462,7 +462,7 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
         label: 'Modules',
         body: ul([
           '`src/serve/machines/cli.rs` (`plan`, `route`, `machine_use`, `MachineUse::Calls`, `reconnect_loop`, `pipe_mode`, `service_mode`, `attach_mode`, `foreign_link_sockets`); `src/serve/machines/cli/calls.rs` (`use_of`, `Use`, `Refused`, `answer_error`, `named`, `per_root`, `listing`, `follow_build_log`)',
-          '`src/serve/machines/service.rs` (`Hold`, `Held`, `with_inbound`, `carried`); `src/serve/machines/inbound.rs`; `src/serve/machines/mod.rs` (`Kind::{Ssh,Inbound}`, `MachineKind`); `src/serve/machines/ssh.rs` (only `probe_argv`, `add_cli_argv`, `script_argv`, `target_argv`)',
+          '`src/serve/machines/service.rs` (`Hold`, `Held`, `with_inbound`, `carried`); `src/serve/machines/inbound.rs`; `src/serve/machines/mod.rs` (`Kind::{Ssh,Inbound}`, `MachineKind`); `src/serve/machines/ssh.rs` (only `probe_argv`, `script_argv`, `target_argv`)',
           '`src/tui/remote.rs` (`on_machine`, `service_argv`); `src/serve/forwards.rs` (`via`); `src/commands/port.rs`, `src/commands/tunnel.rs` (`Via::Fleet`, `remote_opener`)',
           '`src/serve/fleet/placed.rs` (`workers`); `src/serve/idle.rs` (`Holders::links`)',
         ]),

@@ -150,7 +150,6 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "containers.stats" => containers_stats(|| crate::runtime::backend().stats().map_err(ApiError::internal)),
         "sandboxes.list" => sandboxes_list(parse(params)?),
         "roots.list" => {
-            let p: RootsParams = parse(params)?;
             let (state, home, data) = match ctx.host {
                 Some(host) => (host.state.to_path_buf(), host.home.map(Path::to_path_buf), host.data.map(Path::to_path_buf)),
                 None => {
@@ -159,10 +158,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
                     (state, std::env::var_os("HOME").map(PathBuf::from), data)
                 }
             };
-            match p.paths {
-                Some(paths) => roots_check(&paths, home.as_deref()),
-                None => roots_list(&state, home.as_deref(), data.as_deref()),
-            }
+            roots_list(&state, home.as_deref(), data.as_deref())
         }
         "sandboxes.get" => sandboxes_get(parse(params)?),
         "services.get" => services_get(parse(params)?),
@@ -868,7 +864,7 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
 }
 
 /// This host's candidate config roots (docs/architecture/daemon/machines.md,
-/// *`devsandbox machine add|ls|set|unlink|rm|trust|roots`*; what `machine add` offers):
+/// *`devsandbox machine add|ls|set|unlink|rm|trust|roots`*):
 /// `fleet::lent::own_roots` (every distinct `config_dir` in `state`,
 /// `~/.devsandboxes` when `home` has one and the signed configs' copies
 /// under data dir `data`, canonicalized), sorted. Known roots only, no disk
@@ -885,50 +881,6 @@ fn roots_list(state: &Path, home: Option<&Path>, data: Option<&Path>) -> Answer 
                 RootCandidate { root, sandboxes, error: None, fleet: false }
             }
             Err(e) => RootCandidate { root, sandboxes: Vec::new(), error: Some(e.message), fleet: false },
-        })
-        .collect();
-    serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
-}
-
-#[derive(Deserialize)]
-struct RootsParams {
-    /// Check exactly these instead of answering the candidates.
-    #[serde(default)]
-    paths: Option<Vec<String>>,
-}
-
-/// `roots.list {paths}`: each of `paths` as a [`RootCandidate`], in order.
-/// This is how `machines.add` checks the roots a user typed on the machine
-/// they're on: `~` / `~/…` expand with *this* host's `home` (the user's
-/// local shell left a quoted `~` alone, and must have), then the path is
-/// canonicalized. A relative path, a missing directory or a config that
-/// doesn't load is that entry's `error`, with `root` as given (expanded).
-fn roots_check(paths: &[String], home: Option<&Path>) -> Answer {
-    let rows: Vec<RootCandidate> = paths
-        .iter()
-        .map(|given| {
-            let failed = |root: PathBuf, error: String| RootCandidate { root, sandboxes: Vec::new(), error: Some(error), fleet: false };
-            let rest = if given == "~" { Some("") } else { given.strip_prefix("~/") };
-            let root = match (rest, home) {
-                (Some(rest), Some(home)) => home.join(rest),
-                (Some(_), None) => return failed(given.into(), "no home directory to expand `~` with".into()),
-                (None, _) => PathBuf::from(given),
-            };
-            if !root.is_absolute() {
-                return failed(root, "not absolute".into());
-            }
-            let root = match std::fs::canonicalize(&root) {
-                Ok(canon) if canon.is_dir() => canon,
-                Ok(_) => return failed(root, "not a directory".into()),
-                Err(_) => return failed(root.clone(), format!("no directory {}", root.display())),
-            };
-            match config_at(&root) {
-                Ok(config) => {
-                    let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
-                    RootCandidate { root, sandboxes: names.into_iter().map(SandboxEntry::named).collect(), error: None, fleet: false }
-                }
-                Err(e) => failed(root, e.message),
-            }
         })
         .collect();
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
@@ -2178,47 +2130,18 @@ mod tests {
     }
 
     #[test]
-    fn roots_list_with_paths_checks_exactly_those() {
-        let base = store_path("roots-paths").with_file_name("roots-paths");
+    fn roots_list_through_call_uses_the_ctx_home() {
+        let base = store_path("roots-call").with_file_name("roots-call");
         let _ = std::fs::remove_dir_all(&base);
-        let (home, bad, file) = (base.join("home"), base.join("bad"), base.join("file"));
-        for d in [&home.join("sb"), &bad] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::write(home.join("sb").join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"a\"\n").unwrap();
-        std::fs::write(bad.join(crate::config::CONFIG_FILE), "[sandbox.web\n").unwrap();
-        std::fs::write(&file, "").unwrap();
-        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
-        let via_dotdot = format!("{}/../home/sb", home.display());
-        let paths: Vec<String> = ["~/sb", &via_dotdot, "~", "rel/x", "~/gone", bad.to_str().unwrap(), file.to_str().unwrap(), "~other/x"]
-            .map(String::from)
-            .into();
-        let got = roots_check(&paths, Some(&home)).unwrap();
-        let rows = got.as_array().unwrap();
-        assert_eq!(rows.len(), paths.len());
-        let web = json!([{"name": "web"}]);
-        assert_eq!(rows[0], json!({"root": canon(&home.join("sb")), "sandboxes": web, "error": null}));
-        assert_eq!(rows[1], rows[0], "canonicalized");
-        assert_eq!(rows[2], json!({"root": canon(&home), "sandboxes": [], "error": null}), "no config file: no sandboxes, no error");
-        assert_eq!(rows[3], json!({"root": "rel/x", "sandboxes": [], "error": "not absolute"}));
-        let gone = home.join("gone");
-        assert_eq!(rows[4], json!({"root": gone, "sandboxes": [], "error": format!("no directory {}", gone.display())}));
-        assert_eq!(rows[5]["root"], json!(canon(&bad)));
-        assert!(rows[5]["error"].as_str().unwrap().contains("devsandboxes.toml"), "{}", rows[5]);
-        assert_eq!(rows[6]["error"], "not a directory");
-        assert_eq!(rows[7]["error"], "not absolute", "`~user` isn't expanded");
-        // No home: `~` can't expand.
-        let none = roots_check(&["~/sb".into()], None).unwrap();
-        assert_eq!(none[0]["error"], "no home directory to expand `~` with");
-
-        // Through `call`, with the ctx's home rather than `$HOME`.
+        let home = base.join("home");
         let state = base.join("state.toml");
         let host = HostPaths { state: &state, home: Some(&home), data: None };
         let ctx = Ctx { inbox: &base.join("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) };
-        let r = call("roots.list", json!({"paths": ["~/sb"]}), &ctx).unwrap();
-        assert_eq!(r[0]["sandboxes"], web);
         let candidates = call("roots.list", Value::Null, &ctx).unwrap();
         assert_eq!(candidates, json!([]), "no state, no ~/.devsandboxes");
+        std::fs::create_dir_all(home.join(".devsandboxes")).unwrap();
+        let candidates = call("roots.list", json!({}), &ctx).unwrap();
+        assert_eq!(candidates[0]["root"], json!(std::fs::canonicalize(home.join(".devsandboxes")).unwrap()));
         let _ = std::fs::remove_dir_all(&base);
     }
 
