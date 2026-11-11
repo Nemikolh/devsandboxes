@@ -245,7 +245,7 @@ fn tidy(machine: &str, message: &str) -> String {
 }
 
 /// `sandboxes.list {root, machines: true}`: `local` (this root's entries)
-/// then each machine's registered roots', tagged `machine` and `root` (a
+/// then each machine's roots' (registry and live, `Handle::entries`), tagged `machine` and `root` (a
 /// routed machine's roots as the hub's view has them, `snapshots::Routed`).
 /// A machine or root that doesn't answer adds nothing: the result stays an
 /// array, and a client wanting to say why reads `machines.list`.

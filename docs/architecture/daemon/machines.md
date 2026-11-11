@@ -46,7 +46,8 @@ written through `RawEntry`): `target` (`me@host`, an ssh-config alias, or
 the file, the error naming it (`machines::parse`: delete it by hand).
 `Kind::Inbound` is the other kind, never in the file: the service's
 entry for an [inbound neighbor](#inbound-neighbors) (`Entry::inbound`).
-Then `roots` (remote config roots, as the remote canonicalized them), an
+Then `roots` (remote config roots, as the remote canonicalized them:
+the ones `machine add` picked, never rewritten by the link), an
 optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
@@ -300,14 +301,15 @@ one's while its neighbor is up.
   announced it: no thread of its own (`service::carried`).
 - **The link.** Once the carrier is up (always, for an inbound machine)
   the machine thread dials `fleet-<name>.sock` (`Dial`) and says hello,
-  subscribes to `instances`, watches each of the machine's roots while a
+  subscribes to `instances`, asks its `roots.list`, watches each of the
+  machine's roots while a
   local watcher wants machines (`Hooks::watching`), and stores pushed
   snapshots in `Remotes` (kept while the link is down; in memory only,
   but on a hub, which also saves them to `remotes.json`). The machine
   that is this host's hub (`Hooks::hub`: `member.toml`'s `hub` names
   another member, `daemon::Shared::hub_of`; asked at each look at the
   watchers, and a hub change redials every link anyway) is also watched
-  federated meanwhile: `roots.list` over the link gives its fleet root
+  federated meanwhile: the link's last `roots.list` gives its fleet root
   for this host (the `fleet` row, there whether or not the hub has a
   config root of its own), watched with `machines: true`
   (`LinkLoop::watch`, `Want`/`Watched`; a refusal is the machine's
@@ -322,6 +324,23 @@ one's while its neighbor is up.
   down ends the link at once and is the machine's `error`; a carrier
   coming up is dialed at once; a connect that fails or a link lost over a
   live carrier is retried with the backoff.
+- **Live roots.** A machine's roots, as federation uses them, are its
+  entry's `roots` (the registry's, in order) then every root its last
+  `roots.list` over the link answered that isn't among them
+  (`service::live_roots`; the listing kept in the thread's `Ctl`):
+  `Handle::entries` returns them, so `forward::sandboxes_everywhere`,
+  `forward::resolve_everywhere`, `verbs_client::run_target`'s
+  `sandboxes.list` and the watch above all see a root the machine got
+  after `machine add` (a [signed config copy](fleet.md) it installed
+  since, under `mesh/tree/`) with no re-add, and `Remotes` stores its
+  pushes. The link lists at each link-up and again on `Handle::relist`:
+  after each `fleet.sync` this host's `changes::push` got through to the
+  machine, and each one that came from it (`changes::sync`), since a
+  member installs a moved config before answering a sync and sends the
+  log on only after installing. They are names to ask about only: the
+  machine's trust table decides every call on them (a `sandboxes.list`
+  or watch of a root this host may not reach answers as the table says),
+  so listing a root reaches nothing the table didn't already admit.
 
 `LinkState`: `idle` (before the first attempt), `connecting`,
 `connected`, `unreachable` (with the reason). A failure is logged when it

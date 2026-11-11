@@ -274,7 +274,8 @@ fn sign_and_push(ctx: &Ctx, me: &str, stored: Stored, op: Op) -> Result<(Stored,
 /// (`fleet.sync`, one at a time, each answer waited for up to
 /// [`SYNC_WAIT`]): those it reached, and those it didn't, with why. A
 /// machine reached holds every config head `stored` moved there, installed
-/// (or its install failed, logged there).
+/// (or its install failed, logged there), so its link lists its roots again
+/// (`Handle::relist`).
 pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<String>, Vec<Missed>) {
     let params = match serde_json::to_value(stored.to_wire()) {
         Ok(v) => v,
@@ -286,7 +287,10 @@ pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<Strin
             continue;
         }
         match leave::call_on_within(links, &entry.name, "fleet.sync", params.clone(), SYNC_WAIT) {
-            Ok(_) => pushed.push(entry.name),
+            Ok(_) => {
+                links.relist(&entry.name);
+                pushed.push(entry.name);
+            }
             Err(error) => missed.push(Missed { name: entry.name, error }),
         }
     }
@@ -667,7 +671,10 @@ fn queue(params: Value, from: &str, ctx: &Ctx) -> Answer {
 /// installed, and every link ends once the answer is out
 /// (`After::Rotated`: redialing to prove the new key; `After::Hub`: the
 /// hub followed, redialing to say it); the redial's link-up follows the
-/// configs.
+/// configs. Changed or not, `from`'s link here lists its roots again
+/// (`Handle::relist`): it sends the log on only once it installed what the
+/// log moved, so a copy it installed since this host's link came up is
+/// listed.
 fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), ApiError> {
     let wire: Wire = parse(params)?;
     let theirs = Stored::from_wire(wire).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
@@ -675,6 +682,9 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
     let before = api::own_member(ctx).ok().map(|(_, hub)| hub);
     let configs_before = config_heads(membership_api::load(path).ok().flatten().as_ref());
     let taken = membership_api::sync(path, &ctx.hostname, &theirs)?;
+    if let Some(links) = &ctx.links {
+        links.relist(from);
+    }
     let head = taken.stored.log.head();
     let mut after = None;
     if taken.changed {

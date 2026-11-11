@@ -214,8 +214,9 @@ pub struct Machine {
     pub target: Option<String>,
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
-    /// The registered roots, in order: the first one shows the instances
-    /// whose root isn't registered.
+    /// Its roots (the registry's, then the ones its last `roots.list`
+    /// added, `service::live_roots`), in order: the first one shows the
+    /// instances whose root isn't among them.
     pub roots: Vec<PathBuf>,
     pub state: LinkState,
     pub error: Option<String>,

@@ -2075,7 +2075,9 @@ it never signs on a remote request alone (decision 49;
   canonical) under the data dir (`member.toml`'s for a `lent::Reach`,
   `api::HostPaths::data` for `roots.list`), so `roots.list` lists it and
   a `worker` peer reaches it exactly, like any own root, never what's
-  nested in it. A config dir under `mesh/tree/` is built from only
+  nested in it; a host that registered the member by `machine add`
+  before the copy was installed reaches it too, as one of the machine's
+  live roots ([machines.md](machines.md#held-links-machines)). A config dir under `mesh/tree/` is built from only
   while `mesh::check_root_in` admits it: a root inside a copy but not
   the copy is refused, else `mesh::verify` checks the copy against the
   log's head for its name (`Membership::config`). No head or no
