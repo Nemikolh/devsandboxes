@@ -12,9 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **machines**: `machine add` picks and records no roots; a machine's
-  roots are what it lists, with a default root (its signed copy first).
-  → [plan](plans/active/machine-roots.md)
+Nothing.
 
 ## Planned
 
@@ -197,6 +195,13 @@ is frozen: no new work on it.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `changes::sign_config`
 
 ## Known limitations
+
+- A command on a machine with several roots and no default (no signed
+  copy, no `~/.devsandboxes`) is refused: the CLI has no way to name a
+  root on a machine, and the dashboard's remote rows still take the
+  first listed root (`tui::remote::machine_root`; the snapshot's machine
+  entries don't carry the default).
+  → [machines](architecture/daemon/machines.md); `machines::default_root`, `machines::no_default_root`
 
 ### instances
 

@@ -1,6 +1,9 @@
+> Archived 2026-11-11. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/machines.md](../../architecture/daemon/machines.md)
+
 # Machine roots: what a machine lists, nothing picked at add
 
-Status: in progress.
+Status: shipped.
 
 ## Goal
 
