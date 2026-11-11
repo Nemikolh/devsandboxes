@@ -34,6 +34,7 @@
 //! [`prepare`] is offer + send.
 
 pub mod fetch;
+pub mod folders;
 pub mod repo;
 pub mod tar;
 pub mod wip;
@@ -683,6 +684,14 @@ fn mirror_repo(s: &Sent, tips: &[String], t: &dyn Transfer) -> Result<()> {
 /// `refs/heads/<branch>` at the base commit and, with a snapshot,
 /// `refs/devsandbox/wip/<branch>` at it; those refs are the answer.
 fn send_repo(r: &RepoOffer, hash: &str, tips: &[String], t: &dyn Transfer) -> Result<BTreeMap<String, String>> {
+    let to = r.at.to_str().context("a folder's name isn't UTF-8")?;
+    send_repo_as(r, BUNDLE_KIND, &format!("{hash}/{to}"), tips, t)
+}
+
+/// [`send_repo`]'s body, as a transfer of `kind` landing at `to` (what
+/// that kind's receiver resolves it against): a placed run's `bundle`
+/// below its root, a signed copy's `mesh-folder` ([`folders::send`]).
+fn send_repo_as(r: &RepoOffer, kind: &str, to: &str, tips: &[String], t: &dyn Transfer) -> Result<BTreeMap<String, String>> {
     let full = format!("refs/heads/{}", r.branch);
     let checkout = Repo::Checkout(&r.host);
     let file = repo::TempPath::new(&checkout.git_dir()?, "bundle");
@@ -707,13 +716,12 @@ fn send_repo(r: &RepoOffer, hash: &str, tips: &[String], t: &dyn Transfer) -> Re
     let open = || std::fs::File::open(&file.0).with_context(|| format!("cannot read {}", file.0.display()));
     let mut body: Box<dyn Read> = if new { Box::new(open()?) } else { Box::new(std::io::empty()) };
     let (size, sha256) = if new { transfer::digest(open()?)? } else { transfer::digest(std::io::empty())? };
-    let to = r.at.to_str().context("a folder's name isn't UTF-8")?;
     let header = Header {
-        kind: BUNDLE_KIND.into(),
+        kind: kind.into(),
         name: "repo.bundle".into(),
         size,
         sha256,
-        to: Some(format!("{hash}/{to}")),
+        to: Some(to.to_string()),
         repo: Some(r.id.clone()),
         refs: Some(refs.clone()),
     };

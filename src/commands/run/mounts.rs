@@ -146,7 +146,7 @@ pub(super) fn resolve_folders(
         let host = dir
             .join(&source)
             .canonicalize()
-            .with_context(|| format!("`folders` entry `{source}` does not exist"))?;
+            .with_context(|| super::missing_folder(dir, "`folders` entry", &source))?;
         out.push(ResolvedFolder { target, host, mode: entry.worktree_mode() });
     }
     Ok(out)

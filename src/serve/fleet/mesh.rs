@@ -241,6 +241,13 @@ pub fn installed(data: &Path) -> Result<BTreeMap<String, String>> {
     Ok(load_installed(&installed_path(data))?.into_iter().filter(|(_, r)| r.dirs.is_some()).map(|(name, r)| (name, r.hash)).collect())
 }
 
+/// Every name `installed.toml` under data dir `data` lists, whatever its
+/// entry's state: each one's [`tree_path`] is a copy's dir, which nothing
+/// else lands in (`code::folders`).
+pub fn copy_names(data: &Path) -> Result<std::collections::BTreeSet<String>> {
+    Ok(load_installed(&installed_path(data))?.into_keys().collect())
+}
+
 fn save_installed(path: &Path, roots: &BTreeMap<String, InstalledRoot>) -> Result<()> {
     let text = toml::to_string(roots).context("cannot serialize the installed config roots")?;
     crate::serve::locked_file::write_atomic_mode(path, &text, 0o644)

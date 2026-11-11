@@ -33,7 +33,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|propose\|pending\|approve\|deny\|rotate\|hub`, `graph.get`, `capacity.get`, `code.haves`, `instances.fetch` and `open.deliver` (peers only), `placements.fetch` (local only) | no (`placements.fetch` names the machine it fetches from) |
+| machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|propose\|pending\|approve\|deny\|rotate\|hub`, `graph.get`, `capacity.get`, `code.haves`, `instances.fetch` and `open.deliver` (peers only), `mesh.folders`, `placements.fetch` (local only) | no (`placements.fetch` names the machine it fetches from) |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`,
@@ -132,7 +132,7 @@ daemon answers in-process on the links it dials, and those after
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
-`code.haves`, `instances.fetch` (an instance under the caller's fleet root only), `roots.list`, `open.deliver` (its `root` the caller's, never confined; under either trust its own check gates it) and the verbs but `gc` (`all` only while every instance here
+`code.haves`, `mesh.folders` (its `root` confined like a verb's), `instances.fetch` (an instance under the caller's fleet root only), `roots.list`, `open.deliver` (its `root` the caller's, never confined; under either trust its own check gates it) and the verbs but `gc` (`all` only while every instance here
 is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true` but an `instances.watch`'s (a member watching its hub, which only the hub serves); every `root` / `dir`
 must be under this member's fleet root for the caller (a hub's, a fleet member's) or exactly one of its
 own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
@@ -1414,6 +1414,28 @@ first); a repo with no cache is absent. On a link peer's connection
 only, under either trust, always about that peer's own fleet root.
 Errors: `invalid` (bad `repos`), `denied` (a local client: it has no
 fleet root), `internal`.
+
+### `mesh.folders`
+
+The folders of a sandbox of a signed config's copy here, for the
+fleet's authority to land before it runs that copy
+([fleet.md](../architecture/daemon/fleet.md#approvals-and-pushes)).
+Params `{"root": "<path>", "sandbox": "<name>"}`: `root` exactly an
+installed copy (`<data>/devsandbox/mesh/tree/<name>`). Answer
+`{"folders": [{"config": "../x", "path": "x" | null, "state": "missing" | "landed" | "user" | "unsupported", "repo"?: "<repo id>", "why"?: "<text>"}, …]}`
+(`MeshFolders`, each a `MeshFolder`): the sandbox's `folder` first, then
+its `folders` values in key order; `config` as written, `path` relative
+to `mesh/tree/`, normalized (`null` when it resolves nowhere there);
+`landed` (a checkout devsandbox landed, `.git/devsandbox-landed`) with
+`repo`, the identity it was landed as; `user` anything else there,
+which devsandbox never touches; `unsupported` with `why` (a `${…}`
+variable, an absolute path, in the copy itself or another installed
+copy, out of `mesh/tree/`, entries nesting, a way there through a
+symlink, a file or a checkout). On a link peer's connection (under
+`worker` trust its `root` confined like a verb's) and a local client's.
+Errors: `invalid` (bad params), `denied` (`root` isn't an installed
+copy, or out of the peer's reach), `not-found` (no such sandbox),
+`failed` (the copy's config doesn't load, no data dir), `internal`.
 
 ### `instances.fetch`
 

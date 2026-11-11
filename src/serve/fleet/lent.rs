@@ -15,7 +15,7 @@
 //!
 //! - [`decide`] (pure, over the method and params): hello, `subscribe` /
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
-//!   quick calls (`machines::forward::QUICK`), `capacity.get`, `code.haves`, `roots.list`,
+//!   quick calls (`machines::forward::QUICK`), `capacity.get`, `code.haves`, `mesh.folders`, `roots.list`,
 //!   `open.deliver` and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
 //!   true`) request but `instances.watch` (a member watching its hub);
 //!   everything else (`machines.*`,
@@ -308,6 +308,9 @@ pub enum Gate {
     /// `code.haves`: what the caller's own fleet root here has (the daemon
     /// answers it about that root only).
     Code,
+    /// `mesh.folders`: a signed config's copy here (one of this member's
+    /// own roots), its folders' states for the authority's run.
+    Mesh,
     /// `instances.fetch`: an instance under the caller's fleet root (never
     /// one of this member's own roots), bundled for it (fetch-back).
     Fetch,
@@ -347,6 +350,7 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         m if fwd::is_quick(m) => Gate::Quick,
         "capacity.get" => Gate::Capacity,
         "code.haves" => Gate::Code,
+        "mesh.folders" => Gate::Mesh,
         "instances.fetch" => Gate::Fetch,
         "roots.list" => Gate::Roots,
         "open.deliver" => Gate::Open,
@@ -615,7 +619,7 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
     // one they'd fall back to something outside the scope, or fail anyway.
     let path_key = match gate {
         Gate::Watch | Gate::Unwatch => Some("dir"),
-        Gate::Verb => Some("root"),
+        Gate::Verb | Gate::Mesh => Some("root"),
         Gate::Quick if method == "instances.list" => Some("dir"),
         Gate::Quick
             if method.starts_with("sandboxes.")
@@ -905,6 +909,8 @@ mod tests {
             ("capacity.get", json!({"machine": "m"}), Err("denied")),
             ("code.haves", json!({"repos": []}), Ok(Code)),
             ("code.haves", json!({"repos": [], "machine": "m"}), Err("denied")),
+            ("mesh.folders", json!({"root": "/x", "sandbox": "web"}), Ok(Mesh)),
+            ("mesh.folders", json!({"root": "/x", "machine": "m"}), Err("denied")),
             ("instances.fetch", json!({"instance": "web-2"}), Ok(Fetch)),
             ("instances.fetch", json!({"instance": "web-2", "machine": "m"}), Err("denied")),
             ("placements.fetch", json!({"instance": "web-2"}), Err("denied")),
@@ -1201,6 +1207,11 @@ mod tests {
         assert_eq!(admit("code.haves", haves.clone(), &peer(&root), &r, &state).unwrap(), haves);
         let full_reach = Reach { trust: Trust::Full, ..r.clone() };
         assert_eq!(admit("code.haves", haves.clone(), &peer(&root), &full_reach, &state).unwrap(), haves);
+        // `mesh.folders`: its `root` needed and confined, as a verb's.
+        let got = admit("mesh.folders", json!({"root": root.join("cfg"), "sandbox": "web"}), &peer(&root), &r, &state).unwrap();
+        assert_eq!(got["root"], json!(root.join("cfg").canonicalize().unwrap()));
+        assert_eq!(admit("mesh.folders", json!({"sandbox": "web"}), &peer(&root), &r, &state).unwrap_err().code, "invalid");
+        assert_eq!(admit("mesh.folders", json!({"root": base, "sandbox": "web"}), &peer(&root), &r, &state).unwrap_err().code, "denied");
         // A peer without one: the verb's as sent, under either trust.
         let as_sent = Peer { env: None, ..peer(&root) };
         assert_eq!(admit("stop", p.clone(), &as_sent, &r, &state).unwrap()["env"], p["env"]);

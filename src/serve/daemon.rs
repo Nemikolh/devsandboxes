@@ -1093,7 +1093,9 @@ impl Shared {
     ///   refused without a helper client.
     /// - `tunnel`: `fleet::tunnel::serve` (a forward's bridge into one).
     /// - `transfer`: one transfer into the peer's fleet root
-    ///   (`fleet::code::receivers`); refused without one.
+    ///   (`fleet::code::receivers`); refused without one. With a data dir
+    ///   also the bundle pulls (`fleet::mesh::serves`) and a signed copy's
+    ///   folders from the authority (`fleet::code::folders::receivers`).
     /// - `agent`: `fleet::agent::answer` with this host's agent while
     ///   `member.toml` grants it to the key the peer proved
     ///   ([`agent_for`]), else with none (its `NOT_SERVING` byte, then the
@@ -1142,6 +1144,7 @@ impl Shared {
                     let mut receivers = fleet::code::receivers(&root, fleet::transfer::Receivers::new(log), in_use);
                     if let Some(data) = &data {
                         receivers = fleet::mesh::serves(data, receivers);
+                        receivers = fleet::code::folders::receivers(data, &root, &peer.name, peer.key, receivers);
                     }
                     if let Err(e) = receivers.receive(stream) {
                         log(&format!("fleet: a transfer from {} failed: {e:#}", peer.name));
@@ -2162,6 +2165,12 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
                 None => Err(api::ApiError::denied("this host keeps no fleet root for the caller")),
             },
             Table::Full => Err(api::ApiError::denied("`code.haves` answers a link peer about its fleet root here: a local client has none")),
+        },
+        // A signed copy's folders here, for the authority's run (`lent`
+        // confined `root` for a peer); a local client may ask too.
+        "mesh.folders" => match shared.data_dir() {
+            Some(data) => fleet::code::folders::folders_call(data, &req.params),
+            None => Err(api::ApiError::failed("this daemon has no member.toml (no data dir)")),
         },
         // A peer fetching back an instance it placed (`lent` admitted it:
         // under its fleet root, or any under `full`); the bundle goes

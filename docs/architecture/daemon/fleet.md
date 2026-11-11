@@ -660,14 +660,15 @@ opens `TRANSFER` streams only toward a peer that advertised it.
 
 1. The sender writes a header line, JSON (`Header`, `encode_header`):
    `{"kind":"root-tar","name":"cfg.tar","size":3,"sha256":"ba78…"}`.
-   `kind` (`[a-z0-9-]`, at most 32 bytes: `binary`, `root-tar`, `bundle`)
+   `kind` (`[a-z0-9-]`, at most 32 bytes: `binary`, `root-tar`, `bundle`,
+   `mesh-folder`)
    picks the receiver; `name` is a file name (no `/`, not `.`/`..`, at most
    255 bytes); `size` the body's length; `sha256` its lowercase hex hash;
    an optional `to`, where below the receiver's tree the body belongs (a
    relative path of plain components, at most 1024 bytes; left out when
    unset), for a kind that places more than its file (`check_header`;
    a `bundle` without one is cache-only, the hub mirror's).
-   A `bundle` also names its `repo` (a repo identity, 16 lowercase hex)
+   A `bundle` (and a `mesh-folder`) also names its `repo` (a repo identity, 16 lowercase hex)
    and its `refs` (full ref name → commit id, at most `HEADER_REFS_MAX`
    8, names `repo::check_ref`'s, ids `repo::check_oid`'s); both are left
    out when unset. A body may be 0 bytes (a `bundle` with nothing new).
@@ -724,7 +725,9 @@ it doesn't read meanwhile). Each end's streams reach its daemon's
 `Shared::serve_channel` (the dialed end's through `link.attach`, the
 dialer's in-process), which receives `root-tar` / `bundle` and serves
 `fetch-bundle` ([Moving code](#moving-code)) with `code::receivers` over
-the peer's fleet root. While an end waits for the hub's build, its link's own
+the peer's fleet root and, with a data dir, serves `mesh-bundle` pulls
+(`mesh::serves`) and receives `mesh-folder` from the fleet's authority
+(`code::folders::receivers`, [Config versions](#approvals-and-pushes)). While an end waits for the hub's build, its link's own
 `binary` receiver takes the one transfer instead (`update::BINARY_KIND`,
 at most `BINARY_LIMIT`, 256 MiB: the hub's dev build,
 `follow::Incoming::receiver`, [Versions](#versions)).
@@ -2071,9 +2074,49 @@ it never signs on a remote request alone (decision 49;
   checked against the sandbox. What hangs off the config dir
   (`${configDir}`, `${sharedVolumes}`, `.worktrees`, `shared-files`) is
   the copy's, per host; a relative `folder` or `folders` entry of `../x`
-  lands at `mesh/tree/x`, cloned there by the user (a symlink works:
-  folders are canonicalized; a missing one refuses the `run`, as
-  anywhere). `mesh::install` takes a bundle's tar only as
+  lands at `mesh/tree/x`. The bundle carries no code: the authority's
+  `run` brings it from its own checkout, or the user clones it there (a
+  symlink works: folders are canonicalized). `mesh.folders {root,
+  sandbox}` (`code::folders::folders_call`, peer-callable, `root`
+  confined by the trust table and required to be exactly an installed
+  copy) answers each entry's path relative to `mesh/tree/` and its state
+  (`code::folders::classify`, pure, over `code::folders::probe`):
+  `missing`; `landed`, a checkout devsandbox landed, marked by
+  `.git/devsandbox-landed` (`code::folders::MARKER`, in `.git/` so never
+  in the working tree) holding the repo identity it was landed as;
+  `user`, anything else there (a hand clone, a symlink, a file), never
+  touched; `unsupported` with why: a `${…}` variable, an absolute path,
+  one in the copy itself (`folder = "."`) or in another installed copy
+  (every name `mesh::copy_names` lists), one out of `mesh/tree/`, two
+  entries nesting, or a missing one whose way there crosses a symlink, a
+  file or a checkout. A `missing` or `landed` folder travels from the
+  authority as one `mesh-folder` [transfer](#transfer) (`code::folders::send`:
+  `code::send_repo`'s bundle of the branch and its WIP `--not` the
+  member's tips, `to` the path relative to `mesh/tree/`). The member's
+  receiver (`code::folders::receivers`, in `daemon`'s transfer channel
+  next to `code::receivers`) takes one only while the peer is the log's
+  authority, its name and its proven key both the log's (read per
+  transfer), with a `bundle`'s `repo` and `refs` and a `to` that passes
+  `code::folders::check_to` (plain components, its first no installed
+  copy's name) and whose probe is `missing`, or `landed` as the same
+  repo; it checks that before the body comes and again before landing.
+  The objects go into the authority's repo cache on the member,
+  `<data>/fleet/<authority>/repos/<id>.git` (`code::make_cache`,
+  `repo::set_refs`), so the authority's `code.haves` there is the next
+  delta's base. A `missing` path gets its parents made (real dirs), a
+  checkout cut fresh next to it (`.<name>.landing-<nonce>`,
+  `repo::land_from`: the branch checked out, the WIP applied), the
+  marker written, then renamed into place (removed on any error, so a
+  landing cut short leaves nothing seen as landed). A `landed` one goes
+  through `repo::land_from` as a checkout in use: another branch's ref
+  moved, the checked-out branch fast-forwarded on a clean tree only,
+  else kept (logged), the WIP left in the cache; never recut. A `user`
+  path or a marker naming another repo is refused. A `run` of a copy
+  with a folder still missing names it and its absolute path, says the
+  signed config carries no code and to run it from the fleet's
+  authority (named from the log) or clone it there
+  (`code::folders::missing_in`, from `commands::run::missing_folder`
+  for `folder` and `folders` alike). `mesh::install` takes a bundle's tar only as
   the version the log's head names: unpacked into a temp dir under
   `mesh/` (`code::tar`'s checks), re-collected there and refused unless
   it hashes to the head's hash, the guard against an older version's

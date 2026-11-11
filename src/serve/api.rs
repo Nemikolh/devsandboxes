@@ -2651,6 +2651,7 @@ mod tests {
             ("sandboxes.get", "SandboxConfig"),
             ("services.get", "ServiceConfig"),
             ("code.haves", "CodeHaves"),
+            ("mesh.folders", "MeshFolders"),
             ("instances.fetch", "InstancesFetched"),
             ("placements.fetch", "PlacementsFetched"),
         ] {

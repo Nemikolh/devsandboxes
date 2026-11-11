@@ -675,6 +675,15 @@ is frozen: no new work on it.
 - Relative folders and signed copies share `mesh/tree/`: a `folder =
   "../x"` and a signed root named `x` land in the same directory.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `mesh::tree_path`
+- A signed copy's folders land on a member (`mesh.folders`, the
+  `mesh-folder` receiver), but the authority's `run` doesn't send them
+  yet (fleet-driver step 3, in progress). Not landed at all: `${…}`
+  folders, folders inside the copy (`folder = "."`), nested folders, and
+  absolute ones; a `landed` checkout's WIP isn't applied again, its
+  checked-out branch only fast-forwarded on a clean tree. Parked: a
+  clone from `origin` when the authority has no checkout, and
+  fetch-back for these runs.
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `code::folders::classify`, `code::folders::receivers`
 - Temp files a crash leaves in `mesh/bundles/` and `mesh/` (a store's,
   an install's unpacking dir, a pull's) are never cleaned up.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `mesh::store`, `mesh::install`, `mesh::pull_bundle`

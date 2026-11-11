@@ -135,7 +135,7 @@ pub fn run(
     let folder = dir
         .join(folder)
         .canonicalize()
-        .with_context(|| format!("sandbox folder `{folder}` does not exist"))?;
+        .with_context(|| missing_folder(dir, "sandbox folder", folder))?;
     // Before its worktree: host git writes into the base repo.
     crate::worker_policy::enforce(dir, |p| p.check_path(&folder, "`folder`"))?;
     let basename = folder
@@ -325,6 +325,18 @@ pub fn run(
         }
     });
     log.outcome(result).map(|()| Some(instance))
+}
+
+/// The error for `what` (`sandbox folder`, `` `folders` entry ``) `config`
+/// missing under config dir `dir`: in a signed config's copy, where it is
+/// and how to get it there (`fleet::code::folders::missing_here`, unix:
+/// the fleet is the daemon's); else that it doesn't exist.
+pub(super) fn missing_folder(dir: &Path, what: &str, config: &str) -> String {
+    #[cfg(unix)]
+    if let Some(text) = crate::serve::fleet::code::folders::missing_here(dir, what, config) {
+        return text;
+    }
+    format!("{what} `{config}` does not exist")
 }
 
 /// `run`'s name check, against the current state: the name must be free (a

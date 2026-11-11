@@ -215,6 +215,29 @@ export interface CodeHaves {
 }
 
 /**
+ * One `folder` / `folders` entry of a sandbox of a signed config's copy, in `mesh.folders`' answer.
+ * `config`: the entry as written; `path`: where it resolves relative to `mesh/tree/`, normalized
+ * (`null` when nowhere there); `state`: `missing`, `landed` (a checkout devsandbox landed, `repo` its
+ * repo identity), `user` (something devsandbox didn't land: never touched) or `unsupported` (`why`).
+ * @experimental
+ */
+export interface MeshFolder {
+  config: string;
+  path: string | null;
+  state: 'missing' | 'landed' | 'user' | 'unsupported';
+  repo?: string;
+  why?: string;
+}
+
+/**
+ * `mesh.folders`' answer: the sandbox's `folder` first, then its `folders` values in key order.
+ * @experimental
+ */
+export interface MeshFolders {
+  folders: MeshFolder[];
+}
+
+/**
  * `instances.fetch`' answer (a worker to the peer that placed the instance): `repo`, the repo identity;
  * `branch`, the instance's branch; `refs`, `refs/heads/<branch>` and `refs/devsandbox/wip/<instance_id>`
  * at their commits; `bundle`, the file under the peer's fleet root to pull on a `TRANSFER` stream, `null`
@@ -1917,6 +1940,13 @@ export interface ApiMethods {
    * @experimental
    */
   'code.haves': { params: { repos: string[] }; result: CodeHaves };
+  /**
+   * The folders of `sandbox` of a signed config's copy here (`root`, exactly `mesh/tree/<name>`; else
+   * `denied`), each one's state: what the fleet's authority lands before it runs the copy. `not-found`
+   * for an unknown sandbox, `failed` for a config that doesn't load.
+   * @experimental
+   */
+  'mesh.folders': { params: { root: string; sandbox: string }; result: MeshFolders };
   /**
    * From a link peer only: one of this host's instances (under the peer's fleet root under `worker`
    * trust, any under `full`) snapshotted and bundled for the peer `--not` `haves` (commit ids, at most
