@@ -785,12 +785,16 @@ refuse, with the config root and the folders that move with it
 (`folder`, `folders` entries outside the root) as the only paths that
 travel. From the config, every `worker_policy::Policy::config_refusals`
 item (`initializeCommand`, `dispatcher`, `inbox`,
-`worktree-link`, `privileged`, `global` services, local features outside those paths, each `${localEnv:NAME}`
+`privileged`, `global` services, local features outside those paths, each `${localEnv:NAME}`
 in the merged sandbox or its services); from each `mounts` bind (its
 source substituted as `run` does, `${localWorkspaceFolder}` the
-`folder`), `Policy::check_bind`'s: a source outside those paths, one
-under `shared-volumes` or `shared-files` (`${sharedVolumes}`: they never
-travel, `ROOT_SKIPS`), a runtime socket. A bind whose source reads
+`folder`), `Policy::check_bind`'s: a source outside those paths, a
+runtime socket. `${sharedVolumes}` binds (whatever their dir resolves to
+here: a source under the root's `shared-volumes/` with no `..` is
+skipped), `caches`, `persist-shell-history` and `worktree-link` aren't
+ties: `shared-volumes/` and `shared-files/` never travel (`ROOT_SKIPS`),
+and on a worker `worktree-link` is skipped (see [the worker
+policy](#worker-policy)). A bind whose source reads
 `${localEnv:…}` counts once, as that variable. The sandbox's and its
 services' `build` context and dockerfile (relative to the config root)
 must be under those paths too (`Policy::check_path`). Each tie is a line for
@@ -2948,21 +2952,37 @@ applies under `trust = "full"` ([Trust](#trust)).
   under the fleet root or a `binds` entry. A runtime socket (named
   `docker.sock`, `podman.sock`, `containerd.sock`, one of
   `runtime_sockets`' paths, `DOCKER_HOST`'s and `CONTAINER_HOST`'s
-  included, or a dir holding one) needs `runtime-socket`. Under the fleet
-  root, a path through `shared-volumes/` needs `shared-volumes`, but a
-  cache's dir and the shell history's (`shared-volumes/history/…`) always
-  pass (`caches` and `persist-shell-history` are never refused: the dirs
-  are under the fleet root, start empty on a worker and hold only
-  downloads or the instance's own history), one through `shared-files/`
-  `worktree-link`.
+  included, or a dir holding one) needs `runtime-socket`. A path through
+  a config root's `shared-volumes/` (`${sharedVolumes}` mounts, caches,
+  the shell history) or `shared-files/` needs no allowance: like any
+  other source it need only resolve under the fleet root. A dangling or
+  looping symlink on the way doesn't resolve (`resolve`) and is refused.
+  Neither dir travels in a root's tar (`code::ROOT_SKIPS`), but a
+  placement of an unchanged root reuses its `roots/<hash>/` tree
+  (`code::unpack_root`), so they keep what earlier instances wrote there,
+  and `tar::extract` doesn't skip them: a peer's tar may pre-fill them,
+  its symlinks only ones that stay inside the root (`tar::check_link`).
   Named and anonymous volumes and `tmpfs` pass; `--mount` keys beyond the
   ones devsandbox writes (`volume-opt`, which can bind a host path) and
   other mount types are refused.
+- **Host-side guards.** A container writes `shared-volumes/` and its
+  worktree, so it can plant symlinks there between runs; under the
+  policy nothing on the host follows them out of the fleet root.
+  `commands::run::mounts::guard_create` runs `check_path` on every path
+  devsandbox creates before the argv check (a cache's dir, the shell
+  history's dir and file, a feature's `${sharedVolumes}` source;
+  `resolve_mounts` checks the config's binds before it creates them).
+  `worktree-link` and the worktree include copy don't run at all
+  (`materialize`, one warning from `worktree::worker_skip_warning`; the
+  link store isn't made nor mounted): they move and link files through
+  those paths, and a placed repo has no gitignored files to share. `gc`'s
+  shell history reaping (`services::gc_shell_history`) never follows a
+  symlink, policy or not.
 - **Before anything is done**: `Policy::check_config`, from `run` (right
   after the sandbox resolves, before the runtime is called or the
   instance recorded) and again at the top of `materialize` (so `rebuild`
   too), refuses `initializeCommand` (it runs on the host), `dispatcher`,
-  `inbox`, `worktree-link`, `privileged`, `global` services, and local features
+  `inbox`, `privileged`, `global` services, and local features
   whose folder, or any file in it, resolves outside the fleet root (they
   are copied into the image's build context). `folder` and `folders`
   hosts are checked (`check_path`) before their worktrees are made, and
@@ -2994,8 +3014,6 @@ applies under `trust = "full"` ([Trust](#trust)).
 | `privileged` | `--privileged` (the sandbox's or a feature's) |
 | `runtime-socket` | a bind of a runtime socket or a dir holding one |
 | `host-network` | `--network host` on `run` or `build` |
-| `shared-volumes` | binds under `shared-volumes/` but caches' and the shell history's |
-| `worktree-link` | `worktree-link` and its store's bind |
 | `global-services` | `scope = "global"` services |
 | `dispatcher` | `dispatcher` and its control ops |
 | `inbox` | `inbox = true` and its control ops |

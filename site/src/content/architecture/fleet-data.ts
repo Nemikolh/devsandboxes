@@ -78,7 +78,7 @@ export const why: Card[] = [
       '**Now `run --place` asks the hub to pick the machine:** every machine reports its CPUs, memory, disk and running count.',
     ),
     layers: howLayer(
-      "A plain `run` stays on the member whose config it names. `run --place`, typed on any member, asks the hub (`fleet.place`), which scores every machine both of them reach, by a link or a route (soft caps, image already built, a small preference for staying put); the member then moves the code there over its own links. With the hub out of reach it runs here, with a note. A sandbox tied to its host (a bind outside what moves, `${localEnv:…}`, shared volumes…) or pinned with `placement = \"home\"` stays home. See <a href='#phase-step-9'>Step 9</a>.",
+      "A plain `run` stays on the member whose config it names. `run --place`, typed on any member, asks the hub (`fleet.place`), which scores every machine both of them reach, by a link or a route (soft caps, image already built, a small preference for staying put); the member then moves the code there over its own links. With the hub out of reach it runs here, with a note. A sandbox tied to its host (a bind outside what moves, `${localEnv:…}`, the runtime socket…) or pinned with `placement = \"home\"` stays home. See <a href='#phase-step-9'>Step 9</a>.",
     ),
     links: [L.plan(BEFORE), L.src('Placement', 'src/serve/fleet/place.rs'), L.src('Candidates', 'src/serve/fleet/placed.rs'), L.src('Ties', 'src/serve/fleet/code/mod.rs'), L.src('Capacity report', 'src/serve/capacity.rs')],
   },

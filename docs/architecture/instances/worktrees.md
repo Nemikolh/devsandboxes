@@ -100,6 +100,13 @@ on `run` and every `rebuild`, for the primary repo only.
 
 `rm` and a rolled-back `run` leave the store alone.
 
+Under a worker policy (a config placed on this host,
+[fleet](../daemon/fleet.md#worker-policy)) neither runs: `materialize`
+prints one warning (`worker_skip_warning`) and makes and mounts no store.
+Both move, copy and link files through the store and the worktree, which a
+container can write, so a symlink planted there would lead them anywhere on
+the host; a placed repo's gitignored files stay on its home host anyway.
+
 ## Locking
 
 A container sees the base's whole `.git` but none of the other checkouts, so

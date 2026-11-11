@@ -392,6 +392,23 @@ pub(super) fn copy_worktree_includes(base: &Path, worktree: &Path, patterns: &[S
     }
 }
 
+/// The one warning `materialize` prints when, under a worker policy, it skips
+/// `worktree-link` (`links`) and the worktree include copy (`includes`);
+/// `None` when the sandbox asks for neither. Both move and link host files
+/// through paths a container can write (the store is mounted rw at its host
+/// path, a worktree is the container's), following any symlink planted there,
+/// so on a worker they don't run at all; nothing is lost, since a placed
+/// repo's gitignored files never travel.
+pub(super) fn worker_skip_warning(links: bool, includes: bool) -> Option<String> {
+    let what = match (links, includes) {
+        (false, false) => return None,
+        (true, false) => "worktree-link",
+        (false, true) => "worktree includes",
+        (true, true) => "worktree-link and worktree includes",
+    };
+    Some(format!("{what} skipped: this config was placed here, its gitignored files stay on its home host"))
+}
+
 /// Untracked paths (relative to `base`) matching the include patterns that git
 /// also ignores. `ls-files` given only these exclude sources ignores
 /// `.gitignore`, so negation behaves as written (command-line `--exclude`
@@ -905,6 +922,19 @@ mod tests {
         assert!(!wt.join(".env.local").exists(), "config negation must win over the file");
         assert!(wt.join(".env.test").is_file());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn worker_skip_warning_names_what_is_skipped() {
+        assert_eq!(worker_skip_warning(false, false), None);
+        for (links, includes, what) in [
+            (true, false, "worktree-link skipped"),
+            (false, true, "worktree includes skipped"),
+            (true, true, "worktree-link and worktree includes skipped"),
+        ] {
+            let w = worker_skip_warning(links, includes).unwrap();
+            assert!(w.starts_with(what), "{w}");
+        }
     }
 
     #[test]

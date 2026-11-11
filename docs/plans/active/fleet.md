@@ -1038,8 +1038,10 @@ step 12 does.
    `privileged`, runtime socket mounts, host network,
    `shared-volumes`, `worktree-link`, `global` services, inbox /
    dispatcher sockets. Allowances per member in `member.toml`; none under
-   `full`. (As built, `caches` and `persist-shell-history` always pass:
-   a placed instance gets its own empty ones on the worker.)
+   `full`. (As built, `shared-volumes` binds (`${sharedVolumes}`,
+   `caches`, `persist-shell-history`) always pass, the placed instance
+   getting the worker's own dirs, and `worktree-link` is skipped there
+   with a warning.)
 10. Self-update: the hello carries git hash + `published`; a member
     follows the hub's exact version (a downgrade is a forced handoff);
     installs in place at `exe::devsandbox()`. Verified by a signed
@@ -1181,7 +1183,9 @@ step 12 does.
     whatever a worker's trust or allowances (per-host satisfaction waits
     on decision 41), and a tied `run --place` runs here with a note
     before the hub is asked. The pin is `placement = "home"` only (no
-    member lists), reported as the first tie.
+    member lists), reported as the first tie. `shared-volumes/` paths
+    aren't ties (the worker has its own, decision 43), nor are
+    `worktree-link` and its `shared-files/` store (skipped on a worker).
 41. The target model is named host resources: a config names what it
     needs (a mount of resource `gh-auth`, say), each member maps names to
     its own paths, and a sandbox is placeable on members that provide

@@ -11,6 +11,7 @@ use crate::config::{
     ResolvedSandbox, SandboxProperties, SimpleCommand,
 };
 use crate::runtime::backend;
+use crate::worker_policy::Policy;
 
 /// Resolve the sandbox's `mounts` into `docker run --mount` values, substituting
 /// `${…}` variables and creating any missing bind sources so a first run doesn't
@@ -245,9 +246,12 @@ pub(super) fn write_workspace_file(
 /// Expand `caches` into (extra `--mount` args, extra `(key, value)` env vars).
 /// Each cache is a shared bind mount under `${configDir}/shared-volumes/<name>`
 /// (auto-created) plus the env vars that point the tool at its mount target.
+/// Under a worker `policy`, each source must resolve under the fleet root
+/// before it is created ([`guard_create`]).
 pub(super) fn resolve_caches(
     config_dir: &Path,
     props: &SandboxProperties,
+    policy: Option<&Policy>,
 ) -> Result<(Vec<String>, Vec<(String, String)>)> {
     let mut mounts = Vec::new();
     let mut env = Vec::new();
@@ -259,6 +263,7 @@ pub(super) fn resolve_caches(
             )
         })?;
         let source = config_dir.join("shared-volumes").join(source_sub);
+        guard_create(policy, &source)?;
         std::fs::create_dir_all(&source)
             .with_context(|| format!("cannot create {}", source.display()))?;
         mounts.push(format!("type=bind,source={},target={target}", source.display()));
@@ -278,16 +283,21 @@ const HISTORY_TARGET: &str = "/commandhistory";
 /// bind-mounted (Apple's `container` cannot bind a single file) and zsh is
 /// pointed at the file inside it via `HISTFILE`. An existing file is reused
 /// untouched, so history survives rm + run rebuilds; keying by the persistent
-/// id keeps it attached across renames too.
+/// id keeps it attached across renames too. Under a worker `policy`, the
+/// dir must resolve under the fleet root before it is created
+/// ([`guard_create`]).
 pub(super) fn provision_shell_history(
     dir: &Path,
     instance_id: &str,
+    policy: Option<&Policy>,
 ) -> Result<(PathBuf, String, (String, String))> {
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let history_dir = config_dir.join("shared-volumes").join("history").join(instance_id);
+    guard_create(policy, &history_dir)?;
     std::fs::create_dir_all(&history_dir)
         .with_context(|| format!("cannot create {}", history_dir.display()))?;
     let path = history_dir.join(".zsh_history");
+    guard_create(policy, &path)?;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -433,6 +443,18 @@ pub(super) fn feature_mount_decision(
     }
 }
 
+/// Under a worker `policy`, a host path devsandbox is about to create must
+/// resolve (symlinks, `..`) under the fleet root ([`Policy::check_path`]):
+/// the bind check on the final argv comes after the create, and a container
+/// that can write `shared-volumes/` could plant a symlink there pointing at
+/// any host dir.
+pub(super) fn guard_create(policy: Option<&Policy>, path: &Path) -> Result<()> {
+    if let Some(policy) = policy {
+        policy.check_path(path, "host path to create")?;
+    }
+    Ok(())
+}
+
 /// Whether a feature mount's missing bind source may be created: only inside
 /// `shared_volumes` (no `..` hop out of it), so a feature can't make devsandbox
 /// create arbitrary host paths.
@@ -549,7 +571,7 @@ mod tests {
             remote_user: Some("node".into()),
             ..Default::default()
         };
-        let (mounts, env) = resolve_caches(&dir, &props).unwrap();
+        let (mounts, env) = resolve_caches(&dir, &props, None).unwrap();
         let src = |sub: &str| dir.join("shared-volumes").join(sub);
         assert!(src("pnpm-store").is_dir() && src("cargo").is_dir());
         assert_eq!(
@@ -572,6 +594,47 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Under a worker policy, nothing is created through a symlink planted in
+    /// `shared-volumes/` that leads out of the fleet root.
+    #[test]
+    fn creates_under_a_policy_stay_in_the_fleet_root() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("devsandbox-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, outside) = (base.join("fleet"), base.join("outside"));
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(cfg.join("shared-volumes")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let (root, outside, cfg) = (root.canonicalize().unwrap(), outside.canonicalize().unwrap(), cfg.canonicalize().unwrap());
+        let policy = Policy { root: root.clone(), data: root.clone(), allow: Default::default(), sockets: Vec::new() };
+        let sv = cfg.join("shared-volumes");
+        // In the root: created as before.
+        guard_create(Some(&policy), &sv.join("gh")).unwrap();
+        provision_shell_history(&cfg, "ok1", Some(&policy)).unwrap();
+        assert!(sv.join("history/ok1/.zsh_history").is_file());
+        // `history/<id>` a dangling link out: its file isn't created there.
+        symlink(outside.join("planted"), sv.join("history/ok2")).unwrap();
+        assert!(provision_shell_history(&cfg, "ok2", Some(&policy)).is_err());
+        assert!(!outside.join("planted").exists());
+        // `history` itself a link out.
+        std::fs::remove_dir_all(sv.join("history")).unwrap();
+        symlink(&outside, sv.join("history")).unwrap();
+        let err = provision_shell_history(&cfg, "abc", Some(&policy)).unwrap_err();
+        assert!(err.to_string().contains("outside the fleet root"), "{err:#}");
+        assert!(!outside.join("abc").exists());
+        // A cache's dir.
+        symlink(&outside, sv.join("cargo")).unwrap();
+        let props = SandboxProperties { caches: Some(vec!["cargo".into()]), ..Default::default() };
+        assert!(resolve_caches(&cfg, &props, Some(&policy)).is_err());
+        // A feature's `${sharedVolumes}` source (what `feature_container_opts`
+        // guards before `ensure_bind_source`).
+        symlink(&outside, sv.join("feat")).unwrap();
+        assert!(guard_create(Some(&policy), &sv.join("feat/state.json")).is_err());
+        // No policy: no check.
+        guard_create(None, &sv.join("feat/state.json")).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // --- shell-rc ---

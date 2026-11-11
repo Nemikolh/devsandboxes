@@ -5,7 +5,7 @@
 ### Fixed
 
 - **Service networks no longer break DNS on rootless docker.** Rootless docker can't see the host's routes, so once its `172.x` pools ran out it could give a service network the LAN's range (say `192.168.0.0/20` on a `192.168.1.x` LAN), and from then on no container could reach the router or its DNS. A new service network that covers a host route, gateway or nameserver is now recreated on a free `/24` of `10.200.0.0/16`, with a warning. To clear an existing bad one, run `devsandbox gc`, or `docker network rm` it if a container still uses it.
-- **A sandbox with `caches` or `persist-shell-history` can be placed.** Neither keeps a sandbox home with `run --place` any more, and a worker always accepts both (`allow.caches` is gone from `member.toml`, and `persist-shell-history` no longer needs `shared-volumes`): the placed instance gets its own empty caches and shell history on the worker.
+- **A sandbox with `caches`, `persist-shell-history`, `${sharedVolumes}` mounts or `worktree-link` can be placed.** None of them keeps a sandbox home with `run --place` any more, and a worker always accepts them (`allow.caches`, `allow.shared-volumes` and `allow.worktree-link` are gone from `member.toml`). The placed instance gets the worker's own, empty the first time, shared volumes, caches and shell history, so what you keep in shared volumes at home (a `gh` login, say) doesn't follow it. On a worker `worktree-link` and `worktree-include` are skipped with a warning: gitignored files (a `.env`) stay home.
 - **`devsandbox gc` removes unused service networks on docker.** It never matched any on docker before, so leaked networks piled up and used up docker's address pools. A network a stopped instance still uses is kept.
 
 ### Added

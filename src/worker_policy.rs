@@ -60,13 +60,6 @@ pub struct Allow {
     /// `--network host` (`run` or `build`).
     #[serde(skip_serializing_if = "is_false")]
     pub host_network: bool,
-    /// Binds under a config root's `shared-volumes/` (`${sharedVolumes}`
-    /// mounts), but caches' and the shell history's dirs, which always pass.
-    #[serde(skip_serializing_if = "is_false")]
-    pub shared_volumes: bool,
-    /// `worktree-link`.
-    #[serde(skip_serializing_if = "is_false")]
-    pub worktree_link: bool,
     /// `scope = "global"` services.
     #[serde(skip_serializing_if = "is_false")]
     pub global_services: bool,
@@ -275,7 +268,7 @@ impl Policy {
 
     /// What the resolved sandbox `sandbox` of `config` (at `dir`) declares
     /// that never shows in a container's argv or is done on the host before
-    /// one: `initializeCommand`, `dispatcher`, `inbox`, `worktree-link`, `privileged`, `global`
+    /// one: `initializeCommand`, `dispatcher`, `inbox`, `privileged`, `global`
     /// services, local features outside the fleet root (or with a file
     /// resolving outside it), and `${localEnv:NAME}` in the merged sandbox
     /// or its services for a name `local-env` doesn't list.
@@ -297,7 +290,6 @@ impl Policy {
             (props.initialize_command.is_some(), a.initialize_command, "`initializeCommand`", "initialize-command"),
             (props.dispatcher.is_some(), a.dispatcher, "`dispatcher`", "dispatcher"),
             (props.inbox == Some(true), a.inbox, "`inbox`", "inbox"),
-            (props.worktree_link.as_ref().is_some_and(|l| !l.is_empty()), a.worktree_link, "`worktree-link`", "worktree-link"),
             (props.privileged == Some(true), a.privileged, "privileged", "privileged"),
         ];
         for (asked, allowed, what, key) in flags {
@@ -394,10 +386,12 @@ impl Policy {
 
     /// A bind's host source: a runtime socket (by name, as one of
     /// [`Self::sockets`], or a dir holding one) needs `runtime-socket`;
-    /// under the fleet root, a `shared-volumes` dir needs `shared-volumes`
-    /// unless it's a cache's or the shell history's (always fine: they live
-    /// under the fleet root and hold only what the placed sandboxes write),
-    /// a `shared-files` dir `worktree-link`; anything else must pass [`Self::check_path`].
+    /// anything else must pass [`Self::check_path`]. A source through a
+    /// config root's `shared-volumes/` or `shared-files/` needs no allowance:
+    /// what it resolves to must only be under the fleet root, like any
+    /// other. What a container can plant in those dirs is guarded host-side
+    /// (`commands::run::mounts::guard_create`, `worktree-link` skipped under
+    /// a policy).
     pub fn check_bind(&self, source: &str) -> Result<(), Refusal> {
         let path = Path::new(source);
         let what = "bind mount of";
@@ -412,23 +406,6 @@ impl Policy {
             });
         if socket && !self.allow.runtime_socket {
             return Err(Refusal::new(format!("runtime socket mount `{source}`"), "runtime-socket = true"));
-        }
-        if let Ok(rel) = resolved.strip_prefix(&self.root) {
-            let comps: Vec<&str> = rel.components().filter_map(|c| c.as_os_str().to_str()).collect();
-            if let Some(i) = comps.iter().position(|c| *c == "shared-volumes") {
-                let managed = comps.get(i + 1).is_some_and(|sub| {
-                    *sub == "history"
-                        || crate::config::SUPPORTED_CACHES
-                            .iter()
-                            .any(|c| crate::config::known_cache(c).is_some_and(|(dir, ..)| dir == *sub))
-                });
-                if !managed && !self.allow.shared_volumes {
-                    return Err(Refusal::new(format!("shared-volumes mount `{source}`"), "shared-volumes = true"));
-                }
-            }
-            if comps.contains(&"shared-files") && !self.allow.worktree_link {
-                return Err(Refusal::new(format!("`worktree-link` store mount `{source}`"), "worktree-link = true"));
-            }
         }
         self.check_path(path, what)
     }
@@ -694,7 +671,9 @@ pub(crate) fn volume_source(value: &str) -> Option<&str> {
 /// `path` as the host resolves it: made absolute, its deepest existing
 /// ancestor canonicalized (symlinks and `..` resolved), the rest appended.
 /// `None` for a `..` in the part that doesn't exist yet, which can't be
-/// resolved without it.
+/// resolved without it, and for an entry that is there but won't
+/// canonicalize (a dangling or looping symlink): creating a file through a
+/// dangling symlink creates its target, wherever it points.
 pub(crate) fn resolve(path: &Path) -> Option<PathBuf> {
     let path = std::path::absolute(path).ok()?;
     let mut existing = path.as_path();
@@ -706,6 +685,9 @@ pub(crate) fn resolve(path: &Path) -> Option<PathBuf> {
                 out.push(name);
             }
             return Some(out);
+        }
+        if existing.symlink_metadata().is_ok() {
+            return None;
         }
         match existing.components().next_back() {
             Some(Component::Normal(name)) => rest.push(name),
@@ -910,6 +892,8 @@ mod tests {
             vec!["-v".into(), "named:/data".into()],
             vec!["--mount".into(), format!("type=bind,source={},target=/c", sv.join("cargo").display())],
             vec!["--mount".into(), format!("type=bind,source={},target=/commandhistory", sv.join("history/x").display())],
+            vec!["--mount".into(), format!("type=bind,source={},target=/h", sv.join("skills/x").display())],
+            vec!["--mount".into(), format!("type=bind,source={},target=/l", root.join("cfg/shared-files/r-1").display())],
             vec!["--mount".into(), format!("type=bind,source={inside_s},target=/x,readonly")],
             vec!["--mount".into(), format!("type=bind,source={inside_s}/new/dir,target=/x,relabel=shared")],
             vec!["--mount".into(), "type=volume,source=devsandbox-x-cache,target=/c".into()],
@@ -934,8 +918,6 @@ mod tests {
                 privileged: true,
                 runtime_socket: true,
                 host_network: true,
-                shared_volumes: true,
-                worktree_link: true,
                 global_services: true,
                 dispatcher: true,
                 inbox: true,
@@ -977,16 +959,6 @@ mod tests {
             (argv(&["--publish=0.0.0.0:8080:80"]), "publish = true", None),
             (argv(&["-p", "[::]:8080:80"]), "publish = true", None),
             (argv(&["-p", "192.168.1.2:8080:80"]), "publish = true", None),
-            (
-                vec!["--mount".into(), format!("type=bind,source={},target=/h", sv.join("skills/x").display())],
-                "shared-volumes = true",
-                Some((|a| a.shared_volumes = true, |a| a.shared_volumes = false)),
-            ),
-            (
-                vec!["--mount".into(), format!("type=bind,source={},target=/l", root.join("cfg/shared-files/r-1").display())],
-                "worktree-link = true",
-                Some((|a| a.worktree_link = true, |a| a.worktree_link = false)),
-            ),
             // `..` and symlink escapes, nothing but `binds` permits them.
             (vec!["-v".into(), format!("{inside_s}/../../../../../../outside:/o")], "binds = [", None),
             (vec!["-v".into(), format!("{inside_s}/missing/../../x:/o")], "", None),
@@ -1010,6 +982,20 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let err = none.check_run(&run_with(&["-v", &format!("{}:/e", link.display())])).unwrap_err();
         assert!(err.to_string().contains("outside the fleet root"), "{err}");
+        // So is one in `shared-volumes/`: those binds pass only as paths.
+        std::fs::create_dir_all(&sv).unwrap();
+        let link = sv.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = none.check_run(&run_with(&["--mount", &format!("type=bind,source={},target=/e", link.display())])).unwrap_err();
+        assert!(err.to_string().contains("outside the fleet root"), "{err}");
+        // A dangling one doesn't resolve (creating the source would create
+        // its target), nor does a path through it.
+        let dangling = sv.join("dangling");
+        std::os::unix::fs::symlink(outside.join("missing.json"), &dangling).unwrap();
+        for p in [dangling.clone(), dangling.join("x")] {
+            let err = none.check_run(&run_with(&["--mount", &format!("type=bind,source={},target=/e", p.display())])).unwrap_err();
+            assert!(err.to_string().contains("cannot resolve"), "{err}");
+        }
         // A dir holding a runtime socket needs `runtime-socket` even when bound.
         let p = Policy { sockets: vec![sock.clone()], ..policy(&data, &root, Allow { binds: vec![outside.clone()], ..Default::default() }) };
         assert!(p.check_run(&run_with(&["-v", &format!("{outside_s}:/o")])).unwrap_err().to_string().contains("runtime-socket"));
@@ -1098,17 +1084,17 @@ mod tests {
             "privileged = false",
             "caches = [\"cargo\"]",
             "persist-shell-history = true",
+            "worktree-link = [\".env\"]",
             "features = { \"./features/ok\" = {} }",
             "features = { \"ghcr.io/devcontainers/features/node:1\" = {} }",
             "mounts = [\"source=/etc,target=/e\"]", // a bind: the mounts' own check
         ] {
             assert_eq!(check(&none, fine), Ok(()), "{fine}");
         }
-        let items: [(&str, &str, fn(&mut Allow)); 7] = [
+        let items: [(&str, &str, fn(&mut Allow)); 6] = [
             ("initializeCommand = \"true\"", "initialize-command = true", |a| a.initialize_command = true),
             ("dispatcher = {}", "dispatcher = true", |a| a.dispatcher = true),
             ("inbox = true", "inbox = true", |a| a.inbox = true),
-            ("worktree-link = [\".env\"]", "worktree-link = true", |a| a.worktree_link = true),
             ("privileged = true", "privileged = true", |a| a.privileged = true),
             ("services = [\"i\", \"g\"]", "global-services = true", |a| a.global_services = true),
             ("features = { \"./features/leak\" = {} }", "binds = [", |a| a.binds = vec![std::env::temp_dir()]),

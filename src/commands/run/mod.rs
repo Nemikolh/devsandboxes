@@ -44,7 +44,9 @@ use mounts::{
 pub(crate) use progress::{OnFailure, Tracker};
 pub(crate) use tool_env::BrowserSandbox;
 use ssh_agent::ssh_agent_forward;
-use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files, lock_worktree};
+use worktree::{
+    copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files, lock_worktree, worker_skip_warning,
+};
 pub(crate) use worktree::{instance_at, lock_instance_worktrees, parse_worktree_list, unlock_worktree};
 
 /// Branch pattern for worktree instances when neither `--branch` nor the
@@ -602,6 +604,8 @@ pub(crate) fn materialize(
         extra_folders.iter().try_for_each(|f| p.check_path(&f.host, &format!("`folders` entry `{}`", f.target)))
     })?;
 
+    let policy = crate::worker_policy::Policy::for_dir(dir)?;
+
     // initializeCommand runs on the host, before anything is created.
     if let Some(cmd) = &props.initialize_command {
         run_host_commands(dir, cmd).context("initializeCommand failed")?;
@@ -610,8 +614,19 @@ pub(crate) fn materialize(
     // Shared files (`worktree-link`), then per-worktree copies: after
     // initializeCommand so files it generates get adopted, before the
     // container so lifecycle commands see them. Links go first because the
-    // copy never overwrites, so a path in both lists ends up linked.
-    let links = props.worktree_link.clone().unwrap_or_default();
+    // copy never overwrites, so a path in both lists ends up linked. Under a
+    // worker policy neither runs (`worker_skip_warning`).
+    let mut links = props.worktree_link.clone().unwrap_or_default();
+    let include_patterns = props.worktree_include.clone().unwrap_or_default();
+    let mut copy_includes = worktree.is_some();
+    if policy.is_some() {
+        let includes = copy_includes && (!include_patterns.is_empty() || folder.join(".worktreeinclude").is_file());
+        if let Some(warning) = worker_skip_warning(!links.is_empty(), includes) {
+            eprintln!("warning: {warning}");
+        }
+        links.clear();
+        copy_includes = false;
+    }
     let link_store = if links.is_empty() {
         None
     } else {
@@ -623,9 +638,8 @@ pub(crate) fn materialize(
         link_shared_files(&store, &trees, &links)?;
         Some(store)
     };
-    if worktree.is_some() {
-        let patterns = props.worktree_include.clone().unwrap_or_default();
-        copy_worktree_includes(folder, source, &patterns);
+    if copy_includes {
+        copy_worktree_includes(folder, source, &include_patterns);
     }
 
     // `folders` worktrees: after initializeCommand (it may create the repos),
@@ -719,14 +733,14 @@ pub(crate) fn materialize(
         ));
     }
     // Package-manager caches: shared bind mounts + the env vars pointing at them.
-    let (cache_mounts, cache_env) = resolve_caches(&config_dir, props)?;
+    let (cache_mounts, cache_env) = resolve_caches(&config_dir, props, policy.as_ref())?;
     mounts.extend(cache_mounts);
     // Managed per-instance shell history: mount the host dir, point zsh at it
     // (env var for rc-less shells, rc export below for shells whose rc chain
     // clobbers the env, e.g. VS Code's injected shell integration).
     let mut extra_env = cache_env;
     let shell_history = if props.persist_shell_history == Some(true) {
-        let (path, mount, env) = provision_shell_history(dir, instance_id)?;
+        let (path, mount, env) = provision_shell_history(dir, instance_id, policy.as_ref())?;
         mounts.push(mount);
         extra_env.push(env);
         Some(path)
@@ -739,7 +753,7 @@ pub(crate) fn materialize(
     mounts.extend(shell_rc.iter().map(|(mount, _)| mount.clone()));
     // Feature-declared mounts come last: any target claimed above (or the
     // workspace itself) wins, so the config can override a feature's mount.
-    let feature = feature_container_opts(props, &var_ctx, &mounts, &workspace)?;
+    let feature = feature_container_opts(props, &var_ctx, &mounts, &workspace, policy.as_ref())?;
     mounts.extend(feature.mounts);
     instance_volumes.extend(feature.volumes);
     // Keep volumes a previous run recorded: a rebuild keeps them on disk even

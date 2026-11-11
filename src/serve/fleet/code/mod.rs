@@ -439,8 +439,8 @@ pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<Vec<String>> {
 /// the only paths that travel. From the config ([`Policy::config_refusals`]:
 /// `initializeCommand`, `privileged`, global services,
 /// `${localEnv:…}`, …) and each `mounts` bind ([`Policy::check_bind`]:
-/// sources outside those paths, `${sharedVolumes}` ones, which never travel
-/// ([`ROOT_SKIPS`]), runtime sockets) and each `build` context or
+/// sources outside those paths, runtime sockets; not `${sharedVolumes}`
+/// ones, a fresh dir on a worker whatever they point to here) and each `build` context or
 /// dockerfile, the sandbox's or a service's. Any tie keeps the sandbox home,
 /// whatever a worker's trust or allowances. Folders that can't move are
 /// [`offer`]'s to say (they need git).
@@ -486,6 +486,13 @@ pub fn ties(root: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Vec<Stri
         // `${localEnv:…}` is counted above; what's still a variable (or
         // relative) isn't a host path to judge.
         if source.contains("${") || !Path::new(source).is_absolute() || reads_local_env(mount) {
+            continue;
+        }
+        // `shared-volumes/` never travels: on a worker the source is a fresh
+        // dir under its fleet root, whatever it resolves to here (a symlink
+        // to `~/.config/gh`, say).
+        let source_path = Path::new(source);
+        if source_path.starts_with(&shared) && !source_path.components().any(|c| c == std::path::Component::ParentDir) {
             continue;
         }
         if let Err(r) = policy.check_bind(source) {
@@ -1259,14 +1266,23 @@ mod tests {
         assert_eq!(ties_of_toml("placement = \"home\""), ["`placement = \"home\"`"]);
         assert_eq!(ties_of_toml("privileged = true\nplacement = \"home\""), ["`placement = \"home\"`", "privileged"]);
         assert_eq!(ties_of_toml(""), Vec::<String>::new());
-        assert_eq!(ties_of_toml("caches = [\"cargo\"]\npersist-shell-history = true"), Vec::<String>::new());
+        assert_eq!(
+            ties_of_toml(
+                "caches = [\"cargo\"]\npersist-shell-history = true\nworktree-link = [\".env\"]\n\
+                 mounts = [{ source = \"${sharedVolumes}/x\", target = \"/x\" }]"
+            ),
+            Vec::<String>::new()
+        );
+        // Nor is one whose dir here is a symlink out of the root; a `..` out
+        // of `shared-volumes/` still counts.
+        std::fs::create_dir_all(cfg.join("shared-volumes")).unwrap();
+        std::fs::create_dir_all(dir.join("gh")).unwrap();
+        std::os::unix::fs::symlink(dir.join("gh"), cfg.join("shared-volumes/gh")).unwrap();
+        assert_eq!(ties_of_toml("mounts = [\"source=${sharedVolumes}/gh,target=/g\"]"), Vec::<String>::new());
+        assert_eq!(ties_of_toml("mounts = [\"source=${sharedVolumes}/../../gh,target=/g\"]").len(), 1);
         let out = dir.join("elsewhere").display().to_string();
         for (extra, want) in [
             (format!("mounts = [\"source={out},target=/o\"]"), format!("bind mount of `{out}` (outside the config root)")),
-            (
-                "mounts = [{ source = \"${sharedVolumes}/x\", target = \"/x\" }]".into(),
-                format!("shared-volumes mount `{}`", cfg.join("shared-volumes/x").display()),
-            ),
             (
                 "mounts = [\"source=/var/run/docker.sock,target=/s\"]".into(),
                 "runtime socket mount `/var/run/docker.sock`".into(),

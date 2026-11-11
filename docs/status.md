@@ -600,7 +600,12 @@ is frozen: no new work on it.
   checks whether another host could satisfy it until named host
   resources (fleet plan decision 41). X11 has no check of its own beyond
   its bind. A pin names only home (`placement = "home"`): a list of the
-  members a sandbox may run on isn't built.
+  members a sandbox may run on isn't built. Nothing in `shared-volumes/`
+  follows a placed instance (logins kept there): on the worker its
+  `${sharedVolumes}` dirs, caches and shell history are its fleet root's
+  (empty the first time; mesh state, fleet plan decision 43, isn't
+  built). `worktree-link` and `worktree-include` are skipped there with a
+  warning, so `.env`-style files don't follow either.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::ties`
 - After a worker's downgrade, a dashboard or other long-lived client still
   running the replaced, newer binary hands the new daemon off again at its

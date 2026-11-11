@@ -15,7 +15,7 @@ use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, NAME_PREFIX};
 
 use super::mounts::{
-    creatable_feature_source, ensure_bind_source, feature_mount_decision, MountDecision,
+    creatable_feature_source, ensure_bind_source, feature_mount_decision, guard_create, MountDecision,
 };
 
 /// What the sandbox's enabled features ask of the container itself (the image
@@ -60,12 +60,15 @@ pub(super) fn privileged_decision(sandbox: bool, features: &[String], supported:
 /// behavior) would hand the container an empty stub instead of a clear signal.
 /// The exception is a source under `${sharedVolumes}`: that is devsandbox's own
 /// persistent state, so it is created like a config mount's (a devsandbox
-/// feature's per-instance dirs don't exist before the first run).
+/// feature's per-instance dirs don't exist before the first run), once a
+/// worker `policy` has seen it resolve under the fleet root
+/// ([`guard_create`]).
 pub(super) fn feature_container_opts(
     props: &SandboxProperties,
     ctx: &MountContext,
     existing: &[String],
     workspace: &str,
+    policy: Option<&crate::worker_policy::Policy>,
 ) -> Result<FeatureContainerOpts> {
     let mut opts = FeatureContainerOpts {
         mounts: Vec::new(),
@@ -97,6 +100,7 @@ pub(super) fn feature_container_opts(
             let resolved = mount.resolve(ctx)?;
             if let Some(source) = resolved.source.as_deref() {
                 if creatable_feature_source(&resolved.kind, source, ctx.shared_volumes) {
+                    guard_create(policy, Path::new(source))?;
                     ensure_bind_source(Path::new(source))?;
                 }
             }

@@ -884,17 +884,37 @@ fn ls_format_row(colored: &[String; 6], plain: &[String; 6], widths: &[usize; 6]
 /// the key, so a renamed instance keeps its history. Kept on `rm` so history
 /// survives rebuilds; this is the explicit reaping path. Confirmed per entry
 /// unless `force`.
+///
+/// Symlinks are never followed (`shared-volumes/`, `history/` or an entry):
+/// a container that can write `shared-volumes/` could otherwise point them at
+/// any host dir and have its contents deleted. A symlinked entry is skipped.
 fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
-    let history_dir = dir.join("shared-volumes").join("history");
+    let volumes = dir.join("shared-volumes");
+    let history_dir = volumes.join("history");
+    for d in [&volumes, &history_dir] {
+        match std::fs::symlink_metadata(d) {
+            Ok(m) if m.is_dir() => {}
+            Ok(m) if m.file_type().is_symlink() => {
+                eprintln!("warning: not reaping shell history: `{}` is a symlink", d.display());
+                return Ok(());
+            }
+            _ => return Ok(()), // never provisioned
+        }
+    }
     let Ok(entries) = std::fs::read_dir(&history_dir) else {
-        return Ok(()); // never provisioned
+        return Ok(());
     };
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let is_dir = path.is_dir();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_symlink() {
+            eprintln!("warning: skipping shell history `{}`: a symlink", path.display());
+            continue;
+        }
+        let is_dir = kind.is_dir();
         let instance = if is_dir {
             name
         } else {
@@ -1279,5 +1299,35 @@ image = "node"
         assert_eq!(refs.isolated["app-1"], BTreeSet::from(["db".to_string()]));
         assert!(!refs.isolated.contains_key("app-renamed"));
         assert_eq!(refs.live_instances, BTreeSet::from(["app-1".to_string()]));
+    }
+
+    #[test]
+    fn gc_shell_history_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("dsv-gc-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (cfg, outside) = (base.join("cfg"), base.join("outside"));
+        std::fs::create_dir_all(outside.join("victim")).unwrap();
+        std::fs::create_dir_all(cfg.join("shared-volumes")).unwrap();
+        // `history` itself a symlink out: nothing behind it is touched.
+        symlink(&outside, cfg.join("shared-volumes/history")).unwrap();
+        gc_shell_history(&cfg, &State::default(), true).unwrap();
+        assert!(outside.join("victim").is_dir());
+        // A real `history` with a symlinked entry: the entry (and its target)
+        // stay, an orphaned real one goes.
+        std::fs::remove_file(cfg.join("shared-volumes/history")).unwrap();
+        std::fs::create_dir_all(cfg.join("shared-volumes/history/orphan")).unwrap();
+        symlink(outside.join("victim"), cfg.join("shared-volumes/history/linked")).unwrap();
+        gc_shell_history(&cfg, &State::default(), true).unwrap();
+        assert!(!cfg.join("shared-volumes/history/orphan").exists());
+        assert!(cfg.join("shared-volumes/history/linked").symlink_metadata().is_ok());
+        assert!(outside.join("victim").is_dir());
+        // `shared-volumes` a symlink: `history` under it isn't reaped either.
+        std::fs::remove_dir_all(cfg.join("shared-volumes")).unwrap();
+        std::fs::create_dir_all(outside.join("history/other")).unwrap();
+        symlink(&outside, cfg.join("shared-volumes")).unwrap();
+        gc_shell_history(&cfg, &State::default(), true).unwrap();
+        assert!(outside.join("history/other").is_dir());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
