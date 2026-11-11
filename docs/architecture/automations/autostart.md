@@ -53,6 +53,11 @@ changing it is never drift.
      their dispatcher `ensure`s them ([dispatchers.md](dispatchers.md));
    - no instance at all (children count) → `Run`: `run::run` creates one.
 
+Both `start::start_instance` and `run::run` first check a config root that
+is a signed config's copy against its signed head (`fleet::mesh::check_root`,
+[fleet](../daemon/fleet.md)); a copy changed in place is a warning, never
+built.
+
 Nothing is fatal: every problem is a `warning:`/`note:` on stderr.
 
 ## Triggers

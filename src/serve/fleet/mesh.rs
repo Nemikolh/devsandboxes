@@ -367,6 +367,36 @@ pub fn verify(data: &Path, name: &str, head: Option<(u64, [u8; 32])>) -> Result<
     }
 }
 
+/// Whether config root `root` may be built from here: [`check_root_in`]
+/// over the data dir and `member.toml` of the process env (`$XDG_DATA_HOME`
+/// / `$HOME`, as `fleet::member::path`). At the entry of every command that
+/// builds from a config dir (`run`, `rebuild`, `start`, `services
+/// rebuild`), so the dispatcher's subprocesses, autostart and the CLI's
+/// in-process fallback check what the daemon's verb path does; a verb's
+/// subprocess runs with its request's env, so it finds the same data dir
+/// the client's daemon does.
+pub fn check_root(root: &Path) -> Result<()> {
+    let data = crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
+    check_root_in(&data, &data.join("member.toml"), root)
+}
+
+/// Whether config root `root` may be built from under data dir `data`
+/// (`member_toml` the member file whose log holds the signed heads): when
+/// `root` is a signed config's copy here ([`copy_of`]), only while that
+/// copy is the log's head for its name ([`verify`]). A root inside a copy
+/// but not the copy itself is no signed config. Any other root: nothing to
+/// check. The daemon's early `denied` answer (`daemon::check_mesh_copy`)
+/// is this too.
+pub fn check_root_in(data: &Path, member_toml: &Path, root: &Path) -> Result<()> {
+    let Some((name, exact)) = copy_of(data, root) else { return Ok(()) };
+    if !exact {
+        bail!("`{}` is inside the copy of config root `{name}`, not a signed config", root.display());
+    }
+    let stored = super::membership_api::load(member_toml).map_err(|e| anyhow!("config root `{name}`: {}", e.message))?;
+    let head = stored.and_then(|s| s.log.membership().and_then(|m| m.config.get(&name).copied()));
+    verify(data, &name, head)
+}
+
 /// [`hash_parts`] over the copy at `tree` as `copy` lists it: the config
 /// file (the one `config::find` picks, which must be the installed one)
 /// and each listed file, a regular file reached through real dirs.
@@ -1070,6 +1100,67 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         verify(&data, "cfg", head).unwrap();
         write(&tree, "devsandboxes.yaml", "sandbox: {}\n");
         assert_eq!(err(head), changed, "a second config file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `member.toml`'s path under `data`, its log (`lap` the authority)
+    /// holding `heads` as `config` entries, in order.
+    fn log_with(data: &Path, heads: &[(u64, [u8; 32])]) -> PathBuf {
+        use crate::serve::fleet::identity::{Signer, SigningKey};
+        use crate::serve::fleet::membership::{self, Log, Op};
+        let key = SigningKey::from_seed([1; 32]);
+        let mut log = Log::default();
+        log.append(Op::genesis_with_id([1; 16], "lap", key.public_key(), "lap"), "lap", &key).unwrap();
+        for (version, hash) in heads {
+            log.append(Op::Config { root: "cfg".into(), version: *version, hash: *hash }, "lap", &key).unwrap();
+        }
+        let member = data.join("member.toml");
+        let text = membership::serialize(&membership::Stored { log, introductions: vec![] }).unwrap();
+        std::fs::write(membership::path(&member), text).unwrap();
+        member
+    }
+
+    #[test]
+    fn check_root_admits_only_the_copy_at_its_signed_head() {
+        let (base, root) = fixture("check");
+        let data = base.join("data");
+        let member = data.join("member.toml");
+        let err = |root: &Path| format!("{:#}", check_root_in(&data, &member, root).unwrap_err());
+        let tree = tree_path(&data, "cfg");
+        let v1 = collect(&root).unwrap();
+
+        // Not a copy: nothing to check, with or without a mesh dir or log.
+        check_root_in(&data, &member, &root).unwrap();
+        check_root_in(&data, &member, &base.join("nowhere")).unwrap();
+
+        // A copy, its version not in the log.
+        install(&data, "cfg", &v1.tar().unwrap(), &v1.hash()).unwrap();
+        assert_eq!(err(&tree), "config root `cfg` has no signed version here yet", "no log");
+        log_with(&data, &[]);
+        assert_eq!(err(&tree), "config root `cfg` has no signed version here yet", "no head for the name");
+
+        // At the head; also reached through a path that isn't canonical.
+        log_with(&data, &[(1, v1.hash())]);
+        check_root_in(&data, &member, &tree).unwrap();
+        check_root_in(&data, &member, &tree.join("mcps/..")).unwrap();
+        check_root_in(&data, &member, &root).unwrap();
+
+        // Older than the head: the next version isn't installed here yet.
+        log_with(&data, &[(1, v1.hash()), (2, [9; 32])]);
+        assert_eq!(err(&tree), "config root `cfg` v2 isn't here yet");
+        log_with(&data, &[(1, v1.hash())]);
+
+        // Inside the copy, not the copy.
+        let inside = err(&tree.join("mcps"));
+        assert!(inside.ends_with("is inside the copy of config root `cfg`, not a signed config"), "{inside}");
+
+        // Edited in place.
+        write(&tree, "mcps/common.json", "{\"evil\":1}");
+        assert_eq!(err(&tree), "config root `cfg` isn't the signed config (v1): its copy was changed here");
+
+        // A log that doesn't load is no answer either.
+        std::fs::write(crate::serve::fleet::membership::path(&member), "{").unwrap();
+        assert!(err(&tree).starts_with("config root `cfg`: "), "{}", err(&tree));
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -81,7 +81,8 @@ is frozen: no new work on it.
   peer that gave it the log and installs its own copy under
   `mesh/tree/<name>/`, kept while the authority is offline; that copy
   is one of the member's roots, and a `run`/`rebuild`/`start` there
-  runs only while it is the signed head (not changed in place). Open:
+  runs only while it is the signed head (not changed in place), from
+  the daemon, a dispatcher's child ops, autostart or the CLI alike. Open:
   whether `start` of a container whose config drifted, today a
   warning, is refused on a copy. Transfer v1
   (step 12): a placed run's folders move from their own checkouts with

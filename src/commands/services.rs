@@ -607,6 +607,9 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
 /// container. Either way the sandbox never restarts. Stopped sandboxes are
 /// rewired by their next `start`.
 pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
+    // A signed config's copy only at its signed head (as `run`).
+    #[cfg(unix)]
+    crate::serve::fleet::mesh::check_root(dir)?;
     let project = project_id(dir)?;
     let config = Config::load(dir)?;
     let service = config.resolve_service(name)?; // unknown service bails here

@@ -2682,24 +2682,15 @@ fn config_notes(signed: &machines::changes::ConfigSigned, key: &str, told: &mut 
 
 /// A `run`/`rebuild`/`start`/`services.rebuild` whose `root` is a signed config's copy here
 /// (under `mesh/tree/` in the data dir), from any client: admitted only
-/// while that copy is the log's head for its name (`fleet::mesh::verify`),
-/// else why not (answered `denied`). A root inside a copy but not the copy
-/// itself is no signed config. Any other root: nothing to check.
-/// `stop`/`rm` never come here: they build nothing, and keep working on a
-/// changed copy.
+/// while `fleet::mesh::check_root_in` admits it, else why not (answered
+/// `denied`) before a placement or the runner. The verb's subprocess
+/// checks again at its command's entry (`fleet::mesh::check_root`), the
+/// same function, so the two agree. `stop`/`rm` never come here: they
+/// build nothing, and keep working on a changed copy.
 fn check_mesh_copy(params: &Value, shared: &Shared) -> Result<(), String> {
-    let Some(data) = shared.data_dir() else { return Ok(()) };
+    let (Some(member), Some(data)) = (shared.member.as_deref(), shared.data_dir()) else { return Ok(()) };
     let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) else { return Ok(()) };
-    let Some((name, exact)) = fleet::mesh::copy_of(data, root) else { return Ok(()) };
-    if !exact {
-        return Err(format!("`{}` is inside the copy of config root `{name}`, not a signed config", root.display()));
-    }
-    let stored = match shared.member.as_deref() {
-        Some(member) => fleet::membership_api::load(member).map_err(|e| format!("config root `{name}`: {}", e.message))?,
-        None => None,
-    };
-    let head = stored.and_then(|s| s.log.membership().and_then(|m| m.config.get(&name).copied()));
-    fleet::mesh::verify(data, &name, head).map_err(|e| format!("{e:#}"))
+    fleet::mesh::check_root_in(data, member, root).map_err(|e| format!("{e:#}"))
 }
 
 /// This host's link to `peer` is up (where the handshake's newer log is

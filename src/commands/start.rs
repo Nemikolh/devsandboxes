@@ -17,6 +17,10 @@ use crate::state::{Instance, State};
 /// (docs/architecture/instances/lifecycle.md) is refused, and skipped with a
 /// note by `--all`.
 pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
+    // A signed config's copy only at its signed head (as `run`), once here
+    // for every instance this starts.
+    #[cfg(unix)]
+    crate::serve::fleet::mesh::check_root(dir)?;
     let state = State::load()?;
     if all {
         let mut started = 0;
@@ -26,7 +30,7 @@ pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
                 continue;
             }
             if backend().is_running(&info.container)? == Some(false) {
-                start_instance(dir, key, info)?;
+                start_one(dir, key, info)?;
                 started += 1;
             }
         }
@@ -45,12 +49,20 @@ pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     if backend().is_running(&info.container)?.is_none() {
         bail!("`{key}` has no container (see `devsandbox ps -a`); `devsandbox run` recreates it");
     }
-    start_instance(dir, &key, info)
+    start_one(dir, &key, info)
+}
+
+/// Start one instance from outside [`start`] (autostart's starts): config
+/// root `dir` checked as [`start`] does, then [`start_one`].
+pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
+    #[cfg(unix)]
+    crate::serve::fleet::mesh::check_root(dir)?;
+    start_one(dir, key, info)
 }
 
 /// Start one instance, its output going to its build log too (one log per
 /// instance under `--all`, and for autostart's starts when the CLI runs it).
-pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
+fn start_one(dir: &Path, key: &str, info: &Instance) -> Result<()> {
     let log = crate::build_log::open(&info.instance_id);
     log.outcome(start_logged(dir, key, info))
 }

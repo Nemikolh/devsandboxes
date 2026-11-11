@@ -28,6 +28,9 @@ use crate::state::{Instance, Phase, PhaseView, State};
 /// `reprobe` re-runs the identity probe (`RunExtras::reprobe`); it doesn't
 /// count as drift.
 pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool, reprobe: bool) -> Result<()> {
+    // A signed config's copy only at its signed head (as `run`).
+    #[cfg(unix)]
+    crate::serve::fleet::mesh::check_root(dir)?;
     // Ctrl-C/SIGTERM mid-rebuild leaves the instance `failed` ("cancelled").
     let _cancel = run::cancel::catch();
     let mut state = State::load()?;

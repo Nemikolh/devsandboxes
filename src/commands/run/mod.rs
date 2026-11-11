@@ -87,6 +87,10 @@ pub fn run(
     base_override: Option<String>,
     extras: RunExtras,
 ) -> Result<Option<String>> {
+    // A signed config's copy only at its signed head, before anything reads
+    // it (docs/architecture/daemon/fleet.md, *Config versions*).
+    #[cfg(unix)]
+    crate::serve::fleet::mesh::check_root(dir)?;
     // The dispatcher boundary (`commands::dispatch`) checks this too; `run`'s
     // hidden flags are callable directly, so check again before any work.
     if extras.dispatcher.is_some()

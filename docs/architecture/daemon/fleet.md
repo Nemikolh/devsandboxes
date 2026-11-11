@@ -2056,16 +2056,31 @@ it never signs on a remote request alone (decision 49;
   canonical) under the data dir (`member.toml`'s for a `lent::Reach`,
   `api::HostPaths::data` for `roots.list`), so `roots.list` lists it and
   a `worker` peer reaches it exactly, like any own root, never what's
-  nested in it. A `run`, `rebuild`, `start` or `services.rebuild` whose `root` is under
-  `mesh/tree/` is checked first, from any client, local or over a link,
-  before a placement or the runner (`daemon::check_mesh_copy`, after
-  signing): a root inside a copy but not the copy is refused, else
-  `mesh::verify` checks the copy against the log's head for its name
-  (`Membership::config`). No head or no install: ``config root `<name>`
-  has no signed version here yet``; installed hash not the head (not
-  pulled yet): ``config root `<name>` v<N> isn't here yet``; the copy
-  rehashed not the head: ``config root `<name>` isn't the signed config
-  (v<N>): its copy was changed here``; all answered `denied`. The rehash
+  nested in it. A config dir under `mesh/tree/` is built from only
+  while `mesh::check_root_in` admits it: a root inside a copy but not
+  the copy is refused, else `mesh::verify` checks the copy against the
+  log's head for its name (`Membership::config`). No head or no
+  install: ``config root `<name>` has no signed version here yet``;
+  installed hash not the head (not pulled yet): ``config root `<name>`
+  v<N> isn't here yet``; the copy rehashed not the head: ``config root
+  `<name>` isn't the signed config (v<N>): its copy was changed here``.
+  Two places run it. The daemon, for a `run`, `rebuild`, `start` or
+  `services.rebuild` from any client, local or over a link, before a
+  placement or the runner (`daemon::check_mesh_copy`, after signing,
+  answered `denied`). And every command that builds from a config dir,
+  at its entry, before it reads the config (`mesh::check_root`, over the
+  data dir and `member.toml` of the process env): `commands::run::run`,
+  `commands::rebuild::rebuild`, `commands::start::start` (once for
+  every instance it starts) and `start::start_instance` (autostart's
+  starts), `commands::services::rebuild`. So what never passes the
+  daemon's verb path is checked too: the dispatcher's child ops
+  (`devsandbox --in-process` subprocesses, `commands::dispatch`), the
+  autostart pass (`commands::autostart::autostart`, in-process in the
+  daemon and the CLI) and the CLI's in-process fallback; a process in a
+  sandbox that mounts its own copy read-write can't edit it and have it
+  built. A verb's own subprocess checks again, under the env it runs
+  with (a local client's, the daemon's own for a peer:
+  `lent::peer_env`). The rehash
   goes through `Bundle::hash`'s own encoding (`mesh::hash_parts`) over
   the config file's parsed table (the file `config::find` picks must be
   the installed one) and exactly the files `installed.toml` lists, each

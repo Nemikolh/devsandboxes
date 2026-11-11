@@ -55,6 +55,12 @@ recorded → `denied`, `rebuild --force` records it):
   child's env reaches root execs on its next `start`. `run` re-checks
   both env and branch for `--dispatcher` runs.
 
+A child op's `run`/`start`/`rebuild` subprocess checks its config root at
+the command's entry: a signed config's copy is built from only at its
+signed head (`fleet::mesh::check_root`, [fleet](../daemon/fleet.md)), so
+a dispatcher that mounts its own copy read-write can't edit it and have
+its children built from the edit.
+
 `Status` → helper exit code: `ok` 0, `failed` 1, `usage` 2, `no-host` 75
 (no host daemon reachable; answered in the container), `denied` 77.
 
