@@ -472,6 +472,14 @@ pub fn bound_root(ctx: &Ctx, name: &str) -> Option<PathBuf> {
     mesh::bound_root(data, name).ok()?
 }
 
+/// [`bound_root`], only while this host is the fleet's authority: where
+/// its `run` aimed at a machine's copy of `name` brings the folders from
+/// (`code::folders::bring`).
+pub fn authority_root(ctx: &Ctx, name: &str) -> Option<PathBuf> {
+    on_authority(ctx).ok()?;
+    bound_root(ctx, name)
+}
+
 /// Before a `run`/`rebuild`/`start` typed here: config root `root`
 /// (absolute) bundled ([`mesh::collect`]) and, when the bundle's hash isn't
 /// the root's latest `config` entry's, the bundle stored
@@ -1450,6 +1458,84 @@ mod tests {
         let inside = tree.join("mcps");
         let (code, message) = verb_answer(&pair.k_dir, "start", json!({"root": inside, "env": {}, "instance": "nope"})).unwrap().unwrap();
         assert!(code == "denied" && message.contains("inside the copy"), "{code}: {message}");
+        pair.finish();
+    }
+
+    /// `lap` (L), the authority, runs `web` on `box`'s (K) copy of `cfg`:
+    /// `folder = "../web"` (a commit and work not committed) is landed at
+    /// K's `mesh/tree/web` first, on `main` with the WIP, marked; a run after
+    /// a new commit moves the ref (fast-forward of a clean checkout), never
+    /// recut. `../mine`, a checkout of K's user, is left alone. A `start`
+    /// brings nothing, nor does K's own run.
+    #[test]
+    fn the_authoritys_run_brings_a_copys_folders() {
+        use crate::serve::fleet::code::folders::MARKER;
+        use crate::serve::fleet::code::repo::tests::{git, repo_with_branches};
+        let pair = pair("changes-folders", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
+        up(&pair);
+        let k_data = pair.base.join("k-data");
+        let root = pair.base.join("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("devsandboxes.toml"),
+            "[sandbox.web]\nimage = \"i\"\nfolder = \"../web\"\nfolders = { \"/w/mine\" = \"../mine\" }\n",
+        )
+        .unwrap();
+        let web = repo_with_branches(&pair.base, "web");
+        std::fs::write(web.join("README"), "dirty\n").unwrap();
+        repo_with_branches(&pair.base, "mine");
+        assert!(verb_answered(&pair.l_dir, "start", json!({"root": root, "env": {}, "instance": "nope"})), "signs and binds `cfg`");
+        let copy = mesh::tree_path(&k_data, "cfg");
+        assert!(copy.join("devsandboxes.toml").is_file(), "installed on K");
+        let tree = k_data.join("mesh/tree");
+        let mine = repo_with_branches(&tree, "mine");
+        std::fs::write(mine.join("README"), "mine\n").unwrap();
+        let mine_before = (git(&mine, &["status", "--porcelain=v1"]), git(&mine, &["rev-parse", "HEAD"]));
+        let run = json!({"root": copy, "env": {}, "sandbox": "web", "machine": "box"});
+
+        let (answered, notes) = verb_notes(&pair.l_dir, "run", run.clone());
+        assert!(answered.is_some());
+        assert_eq!(
+            notes,
+            [
+                "note: `../mine` on box is a checkout devsandbox didn't land: left as it is",
+                "note: sent `../web` (main) to box",
+            ]
+        );
+        let at = tree.join("web");
+        assert_eq!(git(&at, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(git(&at, &["rev-parse", "HEAD"]), git(&web, &["rev-parse", "main"]));
+        assert_eq!(std::fs::read_to_string(at.join("README")).unwrap(), "dirty\n", "the WIP applied");
+        let id = std::fs::read_to_string(at.join(".git").join(MARKER)).unwrap();
+        assert_eq!(id.trim().len(), 16, "marked");
+        assert_eq!((git(&mine, &["status", "--porcelain=v1"]), git(&mine, &["rev-parse", "HEAD"])), mine_before, "the user's: untouched");
+        assert!(!tree.join("mine/.git").join(MARKER).exists());
+
+        // A new commit: the checkout, clean, is fast-forwarded (not recut:
+        // its own commit of K's, on another branch, stays).
+        git(&at, &["checkout", "-q", "--", "README"]);
+        git(&at, &["branch", "k-own"]);
+        git(&web, &["checkout", "-q", "--", "README"]);
+        std::fs::write(web.join("N"), "n\n").unwrap();
+        git(&web, &["add", "N"]);
+        git(&web, &["commit", "-q", "-m", "n"]);
+        let (answered, notes) = verb_notes(&pair.l_dir, "run", run.clone());
+        assert!(answered.is_some());
+        assert!(notes.contains(&"note: sent `../web` (main) to box".to_string()), "{notes:?}");
+        assert_eq!(git(&at, &["rev-parse", "refs/heads/main"]), git(&web, &["rev-parse", "main"]), "the ref moved");
+        assert_eq!(std::fs::read_to_string(at.join("N")).unwrap(), "n\n", "fast-forwarded");
+        assert_eq!(git(&at, &["branch", "--list", "k-own"]), "k-own", "never recut");
+        assert_eq!(std::fs::read_to_string(at.join(".git").join(MARKER)).unwrap(), id);
+
+        // Not a run, or not from the authority: nothing sent.
+        std::fs::write(web.join("M"), "m\n").unwrap();
+        git(&web, &["add", "M"]);
+        git(&web, &["commit", "-q", "-m", "m"]);
+        let (_, notes) = verb_notes(&pair.l_dir, "start", json!({"root": copy, "env": {}, "instance": "nope", "machine": "box"}));
+        assert!(!notes.iter().any(|n| n.contains("sent")), "{notes:?}");
+        let (_, notes) = verb_notes(&pair.k_dir, "run", json!({"root": copy, "env": {}, "sandbox": "web"}));
+        assert!(!notes.iter().any(|n| n.contains("sent")), "{notes:?}");
+        assert_ne!(git(&at, &["rev-parse", "refs/heads/main"]), git(&web, &["rev-parse", "main"]));
         pair.finish();
     }
 

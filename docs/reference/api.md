@@ -1059,6 +1059,18 @@ this host's log),
 ``note: config `<name>` not signed: the fleet's authority is
 `<authority>`, not this host, and configs here aren't signed``.
 
+**Signed folders** (on the fleet's authority, a `run` from a local
+client with `machine`, its `root`'s name bound here;
+[fleet](../architecture/daemon/fleet.md#approvals-and-pushes), *Config
+versions*): before the run is forwarded, the folders `mesh.folders`
+there answers `missing` or `landed` are sent from this host's
+checkouts, each said in a `stderr` line ``note: sent `<config>`
+(<branch>) to <machine>``; a `user` one ``note: `<config>` on <machine>
+is a checkout devsandbox didn't land: left as it is``, an `unsupported`
+one ``note: `<config>` isn't sent to <machine>: <why>``. A folder that
+can't be sent fails the run, nothing forwarded: `failed` (`exit` and
+`instance` `null`), ``cannot bring `<config>` to <machine>: <why>``.
+
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no
 `progress` comes, and `ask` doesn't apply.
@@ -1418,7 +1430,8 @@ fleet root), `internal`.
 ### `mesh.folders`
 
 The folders of a sandbox of a signed config's copy here, for the
-fleet's authority to land before it runs that copy
+fleet's authority to land before it runs that copy (its `run`'s
+*Signed folders*, above)
 ([fleet.md](../architecture/daemon/fleet.md#approvals-and-pushes)).
 Params `{"root": "<path>", "sandbox": "<name>"}`: `root` exactly an
 installed copy (`<data>/devsandbox/mesh/tree/<name>`). Answer

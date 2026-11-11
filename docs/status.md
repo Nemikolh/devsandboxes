@@ -675,12 +675,11 @@ is frozen: no new work on it.
 - Relative folders and signed copies share `mesh/tree/`: a `folder =
   "../x"` and a signed root named `x` land in the same directory.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `mesh::tree_path`
-- A signed copy's folders land on a member (`mesh.folders`, the
-  `mesh-folder` receiver), but the authority's `run` doesn't send them
-  yet (fleet-driver step 3, in progress). Not landed at all: `${…}`
-  folders, folders inside the copy (`folder = "."`), nested folders, and
-  absolute ones; a `landed` checkout's WIP isn't applied again, its
-  checked-out branch only fast-forwarded on a clean tree. Parked: a
+- A signed copy's folders the authority's `run` lands on a member: not
+  `${…}` folders, folders inside the copy (`folder = "."`), nested
+  folders, absolute ones, or a checkout with a detached `HEAD`; a
+  `landed` checkout's WIP isn't applied again, its checked-out branch
+  only fast-forwarded on a clean tree. Parked: a
   clone from `origin` when the authority has no checkout, and
   fetch-back for these runs.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `code::folders::classify`, `code::folders::receivers`

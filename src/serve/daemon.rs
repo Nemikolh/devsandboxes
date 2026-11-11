@@ -2627,6 +2627,11 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
             if signs {
                 sign_remote_config(id, &params, shared, conn);
             }
+            if brings_folders(method, &conn.table)
+                && let Some(failed) = bring_folders(id, &params, &machine, shared, conn)
+            {
+                return Some(failed);
+            }
             let peer = ConnPeer { out: &conn.out, shared };
             return remote_verb(id, method, params, &machine, shared, conn, &peer);
         }
@@ -2788,6 +2793,48 @@ fn sign_remote_config(id: Option<u64>, params: &Value, shared: &Shared, conn: &C
     }
     if let Some(root) = machines::changes::bound_root(ctx, name) {
         sign_config(id, &root, shared, conn);
+    }
+}
+
+/// Whether a verb aimed at a machine brings a signed copy's folders first
+/// ([`bring_folders`]): a `run` (a `start`/`rebuild` has its instance, and
+/// its folders, there already) from a local client.
+fn brings_folders(method: &str, table: &Table) -> bool {
+    method == "run" && matches!(table, Table::Full)
+}
+
+/// A `run` aimed at `machine`, on the fleet's authority, whose remote
+/// `root`'s name is bound here (`changes::authority_root`): the sandbox's
+/// folders from this host's checkouts first (`fleet::code::folders::bring`,
+/// on this connection's thread, before the forward), each `note:` said in
+/// request `id`'s output and logged. Elsewhere nothing: a member that isn't
+/// the authority runs the copy as it is (its missing folders said there).
+/// `Some`: the run's failure answer, naming the folder and the machine.
+fn bring_folders(id: Option<u64>, params: &Value, machine: &str, shared: &Shared, conn: &ConnState) -> Option<Response> {
+    use fleet::code::folders::{self, Brought};
+    let ctx = shared.machines.as_ref()?;
+    let remote_root = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute())?;
+    let name = remote_root.file_name().and_then(|n| n.to_str())?;
+    let sandbox = params["sandbox"].as_str()?;
+    let bound = machines::changes::authority_root(ctx, name)?;
+    let t = fleet::code::LinkTransfer::for_worker(&shared.socket_dir, machine);
+    let peer = ConnPeer { out: &conn.out, shared };
+    match folders::bring(&t, remote_root, sandbox, &bound, params["branch"].as_str()) {
+        Ok(Brought::Nothing(why)) => {
+            log(&format!("{}: run on {machine}: no folders brought: {why}", conn.label()));
+            None
+        }
+        Ok(Brought::Notes(lines)) => {
+            for line in lines {
+                log(&format!("{}: run on {machine}: {line}", conn.label()));
+                let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
+            }
+            None
+        }
+        Err(why) => {
+            log(&format!("{}: run on {machine}: {why}", conn.label()));
+            Some(Response::err_with(id, "failed", why, Some(json!({ "exit": null, "instance": null }))))
+        }
     }
 }
 
@@ -3461,6 +3508,19 @@ pub(crate) mod tests {
             assert_eq!(config_notes(&signed, "/r/a", &mut told), signed.notes());
             assert_eq!(config_notes(&failed, "/r/a", &mut told), failed.notes());
         }
+    }
+
+    /// Only a local client's `run` brings a copy's folders: a `start` or
+    /// `rebuild` has its folders there, a link peer's run is the member's.
+    #[test]
+    fn only_a_local_run_brings_folders() {
+        let p = lent::Peer { name: "lap".into(), fleet_root: None, env: None, agent: None, key: None, introduced_by: None };
+        let peer = Table::Peer(Arc::new(p));
+        assert!(brings_folders("run", &Table::Full));
+        for method in ["start", "rebuild", "stop", "rm", "services.rebuild"] {
+            assert!(!brings_folders(method, &Table::Full), "{method}");
+        }
+        assert!(!brings_folders("run", &peer));
     }
 
     #[test]

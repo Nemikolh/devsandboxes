@@ -235,6 +235,26 @@ impl LinkTransfer {
         }
         serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("bad {method} answer"))
     }
+
+    /// `mesh.folders {root, sandbox}` on the machine ([`folders::folders_call`])
+    /// over a fresh `API` stream of the same path, each step bounded as
+    /// [`Transfer::haves`]' ([`HAVES_HELLO_WAIT`], [`HAVES_WAIT`]). The
+    /// machine's refusal is the inner error (its code, its message).
+    pub fn folders(&self, root: &Path, sandbox: &str) -> Result<Result<folders::Folders, (String, String)>> {
+        use crate::serve::machines::{link, ssh::Duplex};
+        let method = folders::FOLDERS_METHOD;
+        let stream = super::route::connect(&self.dir, &self.worker, crate::devsbd::proto::channel::API)
+            .with_context(|| format!("cannot reach `{}`", self.worker))?;
+        stream.set_write_timeout(Some(HAVES_WAIT)).context("cannot set a write timeout")?;
+        let mut link = link::handshake(&self.worker, Duplex::socket(stream), HAVES_HELLO_WAIT, link::Over::Link)
+            .map_err(|e| anyhow!("{e}"))?;
+        let r = link.conn.call_within(method, json!({ "root": root, "sandbox": sandbox }), HAVES_WAIT)?;
+        let r = r.with_context(|| format!("no `{method}` answer within {}s", HAVES_WAIT.as_secs()))?;
+        if let Some(e) = r.error {
+            return Ok(Err((e.code, e.message)));
+        }
+        Ok(Ok(serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("bad {method} answer"))?))
+    }
 }
 
 /// Where things land below `roots/<hash>/` on the worker ([`layout`]).
@@ -391,36 +411,44 @@ pub fn offer(config_root: &Path, sandbox: &str, branch: Option<&str>) -> Result<
     let layout = layout(&root, &outside).map_err(Unprepared::NotMovable)?;
     let mut repos_out = Vec::new();
     for (i, (host, at)) in outside.iter().zip(&layout.folders).enumerate() {
-        let Some(checkout) = repo::probe(host)? else {
-            return not_movable(format!("{} isn't a git checkout", host.display()));
-        };
-        let ask = if i == 0 { branch } else { None };
-        if let Some(b) = ask {
-            repo::check_branch(b)?;
-        }
-        let requested = match ask {
-            Some(b) if checkout.branch.as_deref() != Some(b) && repo::has_branch(Repo::Checkout(host), b)? => Some(b.to_string()),
-            _ => None,
-        };
-        let offered = if let Some(b) = requested {
-            let id = repo::identity(Repo::Checkout(host), &format!("refs/heads/{b}"))?;
-            RepoOffer { host: host.clone(), at: at.clone(), branch: b, wip: false, id }
-        } else {
-            let Some(current) = checkout.branch else {
-                return not_movable(format!("{} has a detached HEAD (check out a branch first)", host.display()));
-            };
-            repo::check_branch(&current)?;
-            let id = match repo::ensure_root(host)? {
-                Some(_) => repo::identity(Repo::Checkout(host), repo::ROOT_REF)?,
-                None => repo::identity(Repo::Checkout(host), "HEAD")?,
-            };
-            RepoOffer { host: host.clone(), at: at.clone(), branch: current, wip: true, id }
-        };
-        repos_out.push(offered);
+        repos_out.push(repo_offer(host, at, if i == 0 { branch } else { None })?);
     }
     let tar = pack_root(&root, &layout.root)?;
     let hash = short_hash(&tar);
     Ok(Offer { tar, hash, layout, repos: repos_out })
+}
+
+/// One repo of an [`offer`]: the checkout at `host` (its root, `.git` in
+/// it), landing at `at`. `branch` (a `run --branch`) when the checkout has
+/// it, committed, no WIP; else its current branch with its WIP (one with
+/// no commit yet as its devsandbox root, `repo::ensure_root`); a detached
+/// `HEAD` doesn't move. Also a signed copy's folder on a member
+/// (`folders::bring`), with no `ties` or layout checks: the signature is
+/// the consent.
+pub fn repo_offer(host: &Path, at: &Path, branch: Option<&str>) -> Result<RepoOffer, Unprepared> {
+    let Some(checkout) = repo::probe(host)? else {
+        return not_movable(format!("{} isn't a git checkout", host.display()));
+    };
+    if let Some(b) = branch {
+        repo::check_branch(b)?;
+    }
+    let requested = match branch {
+        Some(b) if checkout.branch.as_deref() != Some(b) && repo::has_branch(Repo::Checkout(host), b)? => Some(b.to_string()),
+        _ => None,
+    };
+    if let Some(b) = requested {
+        let id = repo::identity(Repo::Checkout(host), &format!("refs/heads/{b}"))?;
+        return Ok(RepoOffer { host: host.to_path_buf(), at: at.to_path_buf(), branch: b, wip: false, id });
+    }
+    let Some(current) = checkout.branch else {
+        return not_movable(format!("{} has a detached HEAD (check out a branch first)", host.display()));
+    };
+    repo::check_branch(&current)?;
+    let id = match repo::ensure_root(host)? {
+        Some(_) => repo::identity(Repo::Checkout(host), repo::ROOT_REF)?,
+        None => repo::identity(Repo::Checkout(host), "HEAD")?,
+    };
+    Ok(RepoOffer { host: host.to_path_buf(), at: at.to_path_buf(), branch: current, wip: true, id })
 }
 
 /// [`ties`] of sandbox `sandbox` of the config at `config_root`; a config

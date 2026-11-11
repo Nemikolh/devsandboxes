@@ -13,6 +13,10 @@
 //!   checkout (and its WIP) as a [`FOLDER_KIND`] transfer, `to` relative to
 //!   `mesh/tree/`, `--not` the member's tips of that repo (`code.haves`
 //!   about the authority's fleet root there, where its cache is).
+//! - **bring** ([`bring`], the authority's `run` aimed at a member's copy,
+//!   from `daemon::verb`): ask, [`plan`] (pure: what to send, what to say),
+//!   map each folder to this host's checkout under the root bound to the
+//!   copy's name, send.
 //! - **receive** ([`receivers`], on the member): only from the log's
 //!   authority by its proven key; the objects into the authority's repo
 //!   cache (`<data>/fleet/<authority>/repos/<id>.git`), then a missing
@@ -267,10 +271,139 @@ pub fn folders_call(data: &Path, params: &Value) -> Result<Value, ApiError> {
 /// `t` (its link) as a [`FOLDER_KIND`] transfer, bundled `--not` `tips`
 /// (the member's of that repo, `code.haves`): `code::send_repo`'s bundle
 /// and header, this kind and `to`. The refs sent.
-#[cfg_attr(not(test), allow(dead_code))] // the authority's `run` hook is still to come
 pub fn send(r: &RepoOffer, to: &str, tips: &[String], t: &dyn Transfer) -> Result<BTreeMap<String, String>> {
     check_to(to, &BTreeSet::new()).map_err(|e| anyhow!(e))?;
     super::send_repo_as(r, FOLDER_KIND, to, tips, t)
+}
+
+/// One folder [`bring`] sends ([`plan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    /// The entry as the config writes it.
+    pub config: String,
+    /// Where it lands, relative to `mesh/tree/` on the member.
+    pub to: String,
+    /// This host's checkout: the bound root joined with `config`, not
+    /// resolved yet.
+    pub host: PathBuf,
+    /// A `landed` one's repo identity there: this checkout's must be it.
+    pub landed: Option<String>,
+    /// The `run --branch` asked, for the first entry (the sandbox's
+    /// `folder`) only, as `code::offer`.
+    pub branch: Option<String>,
+}
+
+/// What [`bring`] does with a `mesh.folders` answer ([`plan`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub wanted: Vec<Wanted>,
+    /// The run's `note:` lines for what isn't sent.
+    pub notes: Vec<String>,
+}
+
+/// What the authority sends of `folders` (machine `machine`'s answer)
+/// from config root `bound` (pure): each `missing` or `landed` path once
+/// (the first entry naming it); a `user` one left alone and an
+/// `unsupported` one not sent, each with a note (the member's run says
+/// so itself if that folder is missing there). `branch` goes with the
+/// first entry.
+pub fn plan(folders: &[Folder], bound: &Path, machine: &str, branch: Option<&str>) -> Plan {
+    let mut out = Plan::default();
+    for (i, f) in folders.iter().enumerate() {
+        let config = &f.config;
+        match (f.state, &f.path) {
+            (FolderState::Missing | FolderState::Landed, Some(to)) => {
+                if out.wanted.iter().any(|w| &w.to == to) {
+                    continue;
+                }
+                let landed = if f.state == FolderState::Landed { f.repo.clone() } else { None };
+                let branch = if i == 0 { branch.map(str::to_string) } else { None };
+                out.wanted.push(Wanted { config: config.clone(), to: to.clone(), host: bound.join(config), landed, branch });
+            }
+            (FolderState::User, _) => {
+                out.notes.push(format!("note: `{config}` on {machine} is a checkout devsandbox didn't land: left as it is"))
+            }
+            (FolderState::Unsupported, _) => {
+                let why = f.why.as_deref().unwrap_or("unsupported");
+                out.notes.push(format!("note: `{config}` isn't sent to {machine}: {why}"));
+            }
+            (_, None) => out.notes.push(format!("note: `{config}` isn't sent to {machine}: it resolves nowhere below `mesh/tree/` there")),
+        }
+    }
+    out
+}
+
+/// What [`bring`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Brought {
+    /// The machine answered `mesh.folders` with an error (`root` isn't a
+    /// copy there, no such sandbox, a config that doesn't load there):
+    /// nothing to bring, the run says the rest itself. Why, for the log.
+    Nothing(String),
+    /// The `note:` lines for the run's output: what was sent, what wasn't.
+    Notes(Vec<String>),
+}
+
+/// The authority's `run` of sandbox `sandbox` of machine `machine`'s copy
+/// at `remote_root`, whose name is bound here to config root `bound`
+/// (fleet-driver decision 3): `mesh.folders` asked there over `t`, then
+/// [`plan`], then [`send_planned`]. `Err` is the run's: the machine can't
+/// be asked, or a folder can't be sent.
+pub fn bring(t: &super::LinkTransfer, remote_root: &Path, sandbox: &str, bound: &Path, branch: Option<&str>) -> Result<Brought, String> {
+    let machine = t.worker.as_str();
+    let answer = t
+        .folders(remote_root, sandbox)
+        .map_err(|e| format!("cannot ask {machine} which folders of `{sandbox}` it has: {e:#}"))?;
+    let folders = match answer {
+        Ok(f) => f,
+        Err((code, message)) => return Ok(Brought::Nothing(format!("{FOLDERS_METHOD}: {code}: {message}"))),
+    };
+    let plan = plan(&folders.folders, bound, machine, branch);
+    let mut notes = plan.notes.clone();
+    notes.extend(send_planned(&plan.wanted, machine, t)?);
+    Ok(Brought::Notes(notes))
+}
+
+/// Each of `wanted` sent to `machine` through `t`: its checkout resolved
+/// (canonical, a checkout's root: `code::repo_offer`, its branch or
+/// `--branch`, its WIP), a `landed` one's identity checked against it, one
+/// `code.haves` for every repo, then each [`send`] `--not` the member's
+/// tips. The notes saying what went; the first failure, naming its
+/// folder and the machine, stops it.
+pub fn send_planned(wanted: &[Wanted], machine: &str, t: &dyn Transfer) -> Result<Vec<String>, String> {
+    let fail = |w: &Wanted, why: String| format!("cannot bring `{}` to {machine}: {why}", w.config);
+    let mut offers = Vec::with_capacity(wanted.len());
+    for w in wanted {
+        let host = std::fs::canonicalize(&w.host).map_err(|e| fail(w, format!("{} doesn't resolve here: {e}", w.host.display())))?;
+        let offer = super::repo_offer(&host, Path::new(""), w.branch.as_deref()).map_err(|e| {
+            fail(
+                w,
+                match e {
+                    super::Unprepared::NotMovable(why) => why,
+                    super::Unprepared::Failed(e) => format!("{e:#}"),
+                },
+            )
+        })?;
+        if let Some(there) = w.landed.as_deref().filter(|there| *there != offer.id) {
+            return Err(fail(
+                w,
+                format!("mesh/tree/{} there was landed as repo {there}, and {} here is repo {}", w.to, host.display(), offer.id),
+            ));
+        }
+        offers.push(offer);
+    }
+    if offers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = offers.iter().map(|o| o.id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+    let haves = t.haves(&ids).map_err(|e| format!("cannot ask {machine} which commits it has: {e:#}"))?;
+    let mut notes = Vec::new();
+    for (w, o) in wanted.iter().zip(&offers) {
+        let tips = haves.tips.get(&o.id).map(Vec::as_slice).unwrap_or_default();
+        send(o, &w.to, tips, t).map_err(|e| fail(w, format!("{e:#}")))?;
+        notes.push(format!("note: sent `{}` ({}) to {machine}", w.config, o.branch));
+    }
+    Ok(notes)
 }
 
 /// Whether peer `peer` (key `key`, the one its link proved) is the
@@ -761,6 +894,86 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.join("elsewhere")).unwrap().count(), 0);
         let err = refused(&t, "mine/sub");
         assert!(err.contains("inside the checkout `mine`"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn entry(config: &str, path: Option<&str>, state: FolderState) -> Folder {
+        let repo = (state == FolderState::Landed).then(|| "0123456789abcdef".to_string());
+        let why = (state == FolderState::Unsupported).then(|| "it uses a variable".to_string());
+        Folder { config: config.into(), path: path.map(str::to_string), state, repo, why }
+    }
+
+    #[test]
+    fn the_authority_sends_missing_and_landed_folders_once() {
+        use FolderState::*;
+        let folders = [
+            entry("../web", Some("web"), Missing),
+            entry("../lib", Some("lib"), Landed),
+            entry("../mine", Some("mine"), User),
+            entry("../${localEnv:X}", None, Unsupported),
+            entry("./../web", Some("web"), Missing),
+        ];
+        let bound = Path::new("/h/cfg");
+        let got = plan(&folders, bound, "juchu", Some("feature"));
+        assert_eq!(
+            got.wanted,
+            [
+                Wanted { config: "../web".into(), to: "web".into(), host: bound.join("../web"), landed: None, branch: Some("feature".into()) },
+                Wanted {
+                    config: "../lib".into(),
+                    to: "lib".into(),
+                    host: bound.join("../lib"),
+                    landed: Some("0123456789abcdef".into()),
+                    branch: None,
+                },
+            ]
+        );
+        assert_eq!(
+            got.notes,
+            [
+                "note: `../mine` on juchu is a checkout devsandbox didn't land: left as it is",
+                "note: `../${localEnv:X}` isn't sent to juchu: it uses a variable",
+            ]
+        );
+        // `--branch` is the `folder`'s only, even when that one isn't sent.
+        let got = plan(&[folders[2].clone(), folders[0].clone()], bound, "juchu", Some("feature"));
+        assert_eq!(got.wanted.len(), 1);
+        assert!(got.wanted.iter().all(|w| w.branch.is_none()));
+        assert_eq!(plan(&[], bound, "juchu", None), Plan::default());
+    }
+
+    #[test]
+    fn a_folder_the_authority_cant_send_stops_the_run() {
+        let dir = scratch("folders-unsent");
+        let data = data_with_copies(&dir, "[sandbox.web]\nimage = \"i\"\nfolder = \"../web\"\n");
+        let (auth, _) = fleet(&data);
+        let (t, _) = member(&data, "auth", auth);
+        let bound = dir.join("src/cfg");
+        std::fs::create_dir_all(&bound).unwrap();
+        let src = repo_with_branches(&dir.join("src"), "web");
+        let want = |config: &str, landed: Option<&str>| Wanted {
+            config: config.into(),
+            to: "web".into(),
+            host: bound.join(config),
+            landed: landed.map(str::to_string),
+            branch: None,
+        };
+        let err = |w: Wanted| send_planned(&[w], "juchu", &t).unwrap_err();
+        let e = err(want("../gone", None));
+        assert!(e.starts_with("cannot bring `../gone` to juchu: ") && e.contains("doesn't resolve here"), "{e}");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let e = err(want("../web/sub", None));
+        assert!(e.contains("isn't a git checkout"), "a checkout's subdir: {e}");
+        let e = err(want("../web", Some("0123456789abcdef")));
+        assert!(e.contains("was landed as repo 0123456789abcdef") && e.contains("here is repo"), "{e}");
+        let head = git(&src, &["rev-parse", "HEAD"]);
+        git(&src, &["checkout", "-q", "--detach", &head]);
+        let e = err(want("../web", None));
+        assert!(e.contains("detached HEAD"), "{e}");
+        assert!(!data.join("mesh/tree/web").exists(), "nothing sent");
+        git(&src, &["checkout", "-q", "main"]);
+        assert_eq!(send_planned(&[want("../web", None)], "juchu", &t).unwrap(), ["note: sent `../web` (main) to juchu"]);
+        assert!(data.join("mesh/tree/web/.git").join(MARKER).is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

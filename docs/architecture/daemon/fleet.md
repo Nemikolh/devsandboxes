@@ -727,7 +727,10 @@ dialer's in-process), which receives `root-tar` / `bundle` and serves
 `fetch-bundle` ([Moving code](#moving-code)) with `code::receivers` over
 the peer's fleet root and, with a data dir, serves `mesh-bundle` pulls
 (`mesh::serves`) and receives `mesh-folder` from the fleet's authority
-(`code::folders::receivers`, [Config versions](#approvals-and-pushes)). While an end waits for the hub's build, its link's own
+(`code::folders::receivers`, [Config versions](#approvals-and-pushes)),
+which the authority sends for its `run` aimed at that member's copy
+(`code::folders::bring`, `TRANSFER` streams over its link or a route,
+`code::LinkTransfer`). While an end waits for the hub's build, its link's own
 `binary` receiver takes the one transfer instead (`update::BINARY_KIND`,
 at most `BINARY_LIMIT`, 256 MiB: the hub's dev build,
 `follow::Incoming::receiver`, [Versions](#versions)).
@@ -2075,7 +2078,7 @@ it never signs on a remote request alone (decision 49;
   (`${configDir}`, `${sharedVolumes}`, `.worktrees`, `shared-files`) is
   the copy's, per host; a relative `folder` or `folders` entry of `../x`
   lands at `mesh/tree/x`. The bundle carries no code: the authority's
-  `run` brings it from its own checkout, or the user clones it there (a
+  `run` on that copy brings it from its own checkout (below), or the user clones it there (a
   symlink works: folders are canonicalized). `mesh.folders {root,
   sandbox}` (`code::folders::folders_call`, peer-callable, `root`
   confined by the trust table and required to be exactly an installed
@@ -2100,6 +2103,33 @@ it never signs on a remote request alone (decision 49;
   `code::folders::check_to` (plain components, its first no installed
   copy's name) and whose probe is `missing`, or `landed` as the same
   repo; it checks that before the body comes and again before landing.
+  Who sends, and when: the authority, for a `run` a local client aims at
+  a machine (`daemon::bring_folders`, gated by `daemon::brings_folders`;
+  not `start` or `rebuild`, whose instance and folders are there
+  already, nor a link peer's run), whose remote `root`'s last component
+  is a name bound here while this host is the log's authority
+  (`changes::authority_root`), right after its config is signed and
+  before the run is forwarded, on the request's thread
+  (`code::folders::bring`). It asks `mesh.folders` over the machine's
+  link or a route (`code::LinkTransfer::folders`); an error answer (not
+  a copy there, no such sandbox, a config that doesn't load there)
+  brings nothing, only logged, and the run says the rest itself.
+  `code::folders::plan` (pure) sends each `missing` or `landed` path once
+  and says a `note:` for each `user` one (left alone) and `unsupported`
+  one (not sent, with why: the member's run reports it if it's missing
+  there); the run's `--branch` goes with the first entry, the `folder`.
+  `code::folders::send_planned` maps each to the checkout at the bound
+  root joined with the entry, canonicalized, which must be a checkout's
+  root, and reads it as a placed run's repo is (`code::repo_offer`, the
+  per-repo part of `code::offer` without its `ties` or layout checks:
+  the signature is the consent): `--branch` when the checkout has it,
+  else its current branch and WIP; a detached `HEAD` is refused, and so
+  is a `landed` one whose marker names another repo than this
+  checkout's. One `code.haves` asks the member's tips of every repo,
+  then each folder is sent ``note: sent `<config>` (<branch>) to
+  <machine>``. Any failure stops the run before it's forwarded, answered
+  `failed` naming the folder and the machine (``cannot bring `<config>`
+  to <machine>: …``).
   The objects go into the authority's repo cache on the member,
   `<data>/fleet/<authority>/repos/<id>.git` (`code::make_cache`,
   `repo::set_refs`), so the authority's `code.haves` there is the next
