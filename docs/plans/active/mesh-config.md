@@ -1,7 +1,9 @@
 # Mesh config: a signed config every member runs
 
-Status: in progress. Step 1's first cut shipped (`Op::Config`, signed
-from the authority's verbs); step 1's fixes are next.
+Status: in progress. Step 1 shipped (1a-1d: signed from the
+authority's verbs, local or aimed at a machine, over the config's
+structure and referenced files, the bundle kept, names bound to one
+path); step 2 is next.
 
 ## Goal
 

@@ -41,7 +41,7 @@
 //!   version when it differs from the latest, and pushes it. Never
 //!   proposed: only the authority's own verbs sign.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -346,6 +346,15 @@ impl ConfigSigned {
     fn failed(root: &str, error: String) -> ConfigSigned {
         ConfigSigned::Failed { root: root.into(), error }
     }
+}
+
+/// The local config root this host bound root name `name` to
+/// ([`mesh::bound_root`]): what a verb typed here for a machine signs
+/// ([`sign_config`]) when its remote root has that name. `None` when
+/// unbound, or this host is in no fleet.
+pub fn bound_root(ctx: &Ctx, name: &str) -> Option<PathBuf> {
+    let data = leave::member_toml(ctx).ok()?.parent()?;
+    mesh::bound_root(data, name).ok()?
 }
 
 /// Before a `run`/`rebuild`/`start` typed here: config root `root`
@@ -894,7 +903,9 @@ mod tests {
     /// that won't load signs nothing, the verb answered anyway. K's verbs
     /// (not the authority), `stop`, a relative root and a root with no
     /// config file sign nothing. The first sign binds `cfg` to the root's
-    /// path; another root named `cfg` is refused, nothing signed.
+    /// path; another root named `cfg` is refused, nothing signed. A verb
+    /// for machine `box` signs the local root bound to its remote root's
+    /// name; a name with no binding, nothing.
     #[test]
     fn the_authoritys_verbs_sign_config_versions() {
         let pair = pair("changes-config", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
@@ -946,6 +957,16 @@ mod tests {
         assert_ne!(Some(&v2), v1.as_ref());
         assert_eq!(config(&k_toml), Some(v2.clone()));
         assert!(bundle(&Some(v2.clone())).is_file());
+
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.d]\n").unwrap();
+        let signed = head(&l_toml);
+        assert!(verb_answered(&pair.l_dir, "start", json!({"root": "/far/other", "env": {}, "instance": "nope", "machine": "box"})));
+        assert_eq!(head(&l_toml), signed, "a remote root's name with no binding signs nothing");
+        assert!(verb_answered(&pair.l_dir, "start", json!({"root": "/far/cfg", "env": {}, "instance": "nope", "machine": "box"})));
+        let v3 = config(&l_toml).unwrap();
+        assert_eq!(v3.0, 3, "a verb for a machine signs the root bound to its root's name");
+        assert_eq!(config(&k_toml), Some(v3.clone()));
+        let v2 = v3;
 
         std::fs::write(root.join("devsandboxes.toml"), "[sandbox.c\n").unwrap();
         let signed = head(&l_toml);

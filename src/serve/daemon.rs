@@ -2578,17 +2578,21 @@ fn forward(id: Option<u64>, method: &str, params: Value, machine: &str, shared: 
 /// ends (or a `detach` answer), streaming its output. `None`: the client
 /// hung up, or the daemon drains; nothing is answered.
 fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Option<Response> {
+    let signs = matches!(method, "run" | "rebuild" | "start") && matches!(conn.table, Table::Full);
     match fwd::machine_of(&params) {
         Err(e) => return Some(Response::err(id, e.code, e.message)),
         Ok(Some(machine)) if method == "rm" => return remote_rm(id, params, &machine, shared, conn),
         Ok(Some(machine)) => {
+            if signs {
+                sign_remote_config(&params, shared, conn);
+            }
             let peer = ConnPeer { out: &conn.out, shared };
             return remote_verb(id, method, params, &machine, shared, conn, &peer);
         }
         Ok(None) => {}
     }
-    if matches!(method, "run" | "rebuild" | "start") && matches!(conn.table, Table::Full) {
-        sign_config(&params, shared, conn);
+    if signs && let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) {
+        sign_config(root, shared, conn);
     }
     if method == "run"
         && let Some(answer) = placed_run(id, &params, shared, conn)
@@ -2615,20 +2619,28 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
     }
 }
 
-/// A local `run`/`rebuild`/`start` on the fleet's authority: its config
-/// root's version signed first when the root changed
+/// A `run`/`rebuild`/`start` typed on the fleet's authority: config root
+/// `root`'s version signed first when the root changed
 /// (`changes::sign_config`), logged. Best effort: the verb runs whatever
 /// this does.
-fn sign_config(params: &Value, shared: &Shared, conn: &ConnState) {
+fn sign_config(root: &Path, shared: &Shared, conn: &ConnState) {
     use machines::changes::ConfigSigned;
-    let (Some(ctx), Some(root)) = (shared.machines.as_ref(), params["root"].as_str().map(Path::new)) else { return };
-    if !root.is_absolute() {
-        return;
-    }
+    let Some(ctx) = shared.machines.as_ref() else { return };
     match machines::changes::sign_config(ctx, root) {
         Some(ConfigSigned::Failed { root, error }) => log(&format!("{}: config `{root}` not signed: {error}", conn.label())),
         Some(ConfigSigned::Signed { root, version }) => log(&format!("{}: signed config `{root}` v{version}", conn.label())),
         None => {}
+    }
+}
+
+/// [`sign_config`] for a verb aimed at a machine: its `root` is that
+/// machine's path, so what signs is the local root bound to the same name
+/// (`changes::bound_root`, the root's last component); unbound, nothing.
+fn sign_remote_config(params: &Value, shared: &Shared, conn: &ConnState) {
+    let Some(ctx) = shared.machines.as_ref() else { return };
+    let Some(name) = params["root"].as_str().and_then(|r| Path::new(r).file_name()).and_then(|n| n.to_str()) else { return };
+    if let Some(root) = machines::changes::bound_root(ctx, name) {
+        sign_config(&root, shared, conn);
     }
 }
 

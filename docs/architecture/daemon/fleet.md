@@ -1938,8 +1938,8 @@ it never signs on a remote request alone (decision 49;
   needn't be reachable, so a dead hub can be replaced.
 - **Config versions.** The verbs typed on the authority sign them, the
   consent a local edit already takes effect by: a `run`, `rebuild` or
-  `start` from a local client (the CLI, the dashboard; `Table::Full`, no
-  `machine`) first bundles its config root, and when the bundle's hash
+  `start` from a local client (the CLI, the dashboard; `Table::Full`)
+  first bundles its config root, and when the bundle's hash
   isn't the root's latest `config` entry's, stores the bundle then signs
   the next version (1 for the first) and pushes it like any change
   (`daemon::sign_config` over `changes::sign_config`), logged in
@@ -1975,10 +1975,12 @@ it never signs on a remote request alone (decision 49;
   `<data>/devsandbox/mesh/roots.toml`, `name = "/path"`, written under
   `serve::locked_file` before that first entry is signed;
   `mesh::bound_root` looks one up): another root with that name is
-  refused the same way, its message naming both paths. Nothing is bundled
-  off the
-  authority or in no fleet; a verb from a link peer, one sent to a
-  machine, `--in-process` ones (the dispatcher's, the in-process
+  refused the same way, its message naming both paths. A verb aimed at a
+  machine names that machine's path as `root`, so it signs, before it is
+  forwarded, the local root bound to that path's last component
+  (`daemon::sign_remote_config` over `changes::bound_root`); a name with
+  no binding signs nothing. Nothing is bundled off the authority or in
+  no fleet; a verb from a link peer, `--in-process` ones (the dispatcher's, the in-process
   fallback) and the autostart pass never sign. Never proposed.
 - **Following a hub change** (decision 69). A host follows a hub change
   (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
