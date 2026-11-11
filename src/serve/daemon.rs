@@ -852,6 +852,9 @@ struct Shared {
     /// `open.deliver`'s limit, per `(peer, instance)`: as a bridge's sink
     /// limits a container's own.
     open_limit: Mutex<crate::devsbd::desktop::RateLimit>,
+    /// The config roots whose verbs already said this host isn't the
+    /// fleet's authority ([`config_notes`]).
+    told_not_authority: Mutex<BTreeSet<String>>,
 }
 
 impl Shared {
@@ -894,6 +897,7 @@ impl Shared {
             attaches: Default::default(),
             open_here: OnceLock::new(),
             open_limit: Mutex::new(crate::devsbd::desktop::RateLimit::new(crate::open::OPEN_RATE_BURST, crate::open::OPEN_RATE_REFILL)),
+            told_not_authority: Mutex::default(),
         }
     }
 
@@ -2599,7 +2603,7 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
         Ok(Some(machine)) if method == "rm" => return remote_rm(id, params, &machine, shared, conn),
         Ok(Some(machine)) => {
             if signs {
-                sign_remote_config(&params, shared, conn);
+                sign_remote_config(id, &params, shared, conn);
             }
             let peer = ConnPeer { out: &conn.out, shared };
             return remote_verb(id, method, params, &machine, shared, conn, &peer);
@@ -2607,7 +2611,7 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
         Ok(None) => {}
     }
     if signs && let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) {
-        sign_config(root, shared, conn);
+        sign_config(id, root, shared, conn);
     }
     if matches!(method, "run" | "rebuild" | "start" | "services.rebuild")
         && let Err(why) = check_mesh_copy(&params, shared)
@@ -2642,16 +2646,38 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
 
 /// A `run`/`rebuild`/`start` typed on the fleet's authority: config root
 /// `root`'s version signed first when the root changed
-/// (`changes::sign_config`), logged. Best effort: the verb runs whatever
-/// this does.
-fn sign_config(root: &Path, shared: &Shared, conn: &ConnState) {
-    use machines::changes::ConfigSigned;
+/// (`changes::sign_config`), logged, and said in request `id`'s output
+/// before the verb's own ([`config_notes`]). Best effort: the verb runs
+/// whatever this does.
+fn sign_config(id: Option<u64>, root: &Path, shared: &Shared, conn: &ConnState) {
     let Some(ctx) = shared.machines.as_ref() else { return };
-    match machines::changes::sign_config(ctx, root) {
-        Some(ConfigSigned::Failed { root, error }) => log(&format!("{}: config `{root}` not signed: {error}", conn.label())),
-        Some(ConfigSigned::Signed { root, version }) => log(&format!("{}: signed config `{root}` v{version}", conn.label())),
-        None => {}
+    if let Some(signed) = machines::changes::sign_config(ctx, root) {
+        say_signed(id, &signed, &root.display().to_string(), shared, conn);
     }
+}
+
+/// `signed` logged (`ConfigSigned::log_lines`) and said in request `id`'s
+/// output ([`config_notes`], `told` keyed by `key`).
+fn say_signed(id: Option<u64>, signed: &machines::changes::ConfigSigned, key: &str, shared: &Shared, conn: &ConnState) {
+    for line in signed.log_lines() {
+        log(&format!("{}: {line}", conn.label()));
+    }
+    let lines = config_notes(signed, key, &mut shared.told_not_authority.lock().unwrap_or_else(|e| e.into_inner()));
+    let peer = ConnPeer { out: &conn.out, shared };
+    for line in lines {
+        let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
+    }
+}
+
+/// What [`say_signed`] says in the verb's output (pure): `signed`'s
+/// notes, except a `NotAuthority` whose `key` is already in `told`, so a
+/// non-authority says it once per root per daemon. `key`: a local root's
+/// path, a machine's root's name (no `/`, so the two never meet).
+fn config_notes(signed: &machines::changes::ConfigSigned, key: &str, told: &mut BTreeSet<String>) -> Vec<String> {
+    if matches!(signed, machines::changes::ConfigSigned::NotAuthority { .. }) && !told.insert(key.to_string()) {
+        return Vec::new();
+    }
+    signed.notes()
 }
 
 /// A `run`/`rebuild`/`start`/`services.rebuild` whose `root` is a signed config's copy here
@@ -2719,11 +2745,19 @@ fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) {
 /// [`sign_config`] for a verb aimed at a machine: its `root` is that
 /// machine's path, so what signs is the local root bound to the same name
 /// (`changes::bound_root`, the root's last component); unbound, nothing.
-fn sign_remote_config(params: &Value, shared: &Shared, conn: &ConnState) {
+/// On a member that isn't the authority, bound or not, the verb is told
+/// so (`NotAuthority`, once per root name): a host only the authority
+/// binds names on is where a wrong setup order shows.
+fn sign_remote_config(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState) {
+    use machines::changes::{self, ConfigSigned};
     let Some(ctx) = shared.machines.as_ref() else { return };
     let Some(name) = params["root"].as_str().and_then(|r| Path::new(r).file_name()).and_then(|n| n.to_str()) else { return };
+    if let Some(authority) = changes::authority_elsewhere(ctx) {
+        let signed = ConfigSigned::NotAuthority { root: name.into(), authority };
+        return say_signed(id, &signed, name, shared, conn);
+    }
     if let Some(root) = machines::changes::bound_root(ctx, name) {
-        sign_config(&root, shared, conn);
+        sign_config(id, &root, shared, conn);
     }
 }
 
@@ -3376,6 +3410,26 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("dsv-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// Not the authority: said once per root; a sign or a failure every
+    /// time.
+    #[test]
+    fn not_the_authority_is_said_once_per_root() {
+        use machines::changes::ConfigSigned;
+        let mut told = BTreeSet::new();
+        let other = |root: &str| ConfigSigned::NotAuthority { root: root.into(), authority: "lap".into() };
+        assert_eq!(config_notes(&other("a"), "/r/a", &mut told), other("a").notes());
+        assert_eq!(config_notes(&other("a"), "/r/a", &mut told), Vec::<String>::new());
+        assert_eq!(config_notes(&other("b"), "/r/b", &mut told).len(), 1, "another root");
+        assert_eq!(config_notes(&other("a"), "a", &mut told).len(), 1, "a machine's root, by name");
+        assert_eq!(config_notes(&other("a"), "a", &mut told), Vec::<String>::new());
+        let signed = ConfigSigned::Signed { root: "a".into(), version: 1, unpushed: vec![] };
+        let failed = ConfigSigned::Failed { root: "a".into(), error: "x".into() };
+        for _ in 0..2 {
+            assert_eq!(config_notes(&signed, "/r/a", &mut told), signed.notes());
+            assert_eq!(config_notes(&failed, "/r/a", &mut told), failed.notes());
+        }
     }
 
     #[test]

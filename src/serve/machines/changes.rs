@@ -348,18 +348,72 @@ fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiErro
     Ok(Signed { name: change.subject().to_string(), change: what, pushed, unpushed, removed: None, error: None })
 }
 
-/// What a verb typed on the authority did to its config root's version
-/// ([`sign_config`]), for `serve.log`. `root` is the root's name in the
-/// log (its directory's name).
+/// What a verb typed here did to its config root's version
+/// ([`sign_config`]), for `serve.log` and the verb's own output
+/// ([`ConfigSigned::notes`]). `root` is the root's name in the log (its
+/// directory's name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSigned {
-    Signed { root: String, version: u64 },
+    /// Signed and pushed; `unpushed` are the machines the push didn't
+    /// reach, so they don't have `version` (a reached one installed it).
+    Signed { root: String, version: u64, unpushed: Vec<Missed> },
     Failed { root: String, error: String },
+    /// This host is in a fleet but isn't its authority `authority`: what
+    /// it types signs nothing.
+    NotAuthority { root: String, authority: String },
 }
 
 impl ConfigSigned {
     fn failed(root: &str, error: String) -> ConfigSigned {
         ConfigSigned::Failed { root: root.into(), error }
+    }
+
+    /// Its `serve.log` lines (pure): a sign, and in one more line the
+    /// machines its push missed; a failure. A non-authority logs nothing
+    /// (said to the verb only).
+    pub fn log_lines(&self) -> Vec<String> {
+        match self {
+            ConfigSigned::Signed { root, version, unpushed } => {
+                let mut lines = vec![format!("signed config `{root}` v{version}")];
+                if !unpushed.is_empty() {
+                    let missed: Vec<String> = unpushed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
+                    lines.push(format!("config `{root}` v{version} not pushed to {}", missed.join(", ")));
+                }
+                lines
+            }
+            ConfigSigned::Failed { root, error } => vec![format!("config `{root}` not signed: {error}")],
+            ConfigSigned::NotAuthority { .. } => Vec::new(),
+        }
+    }
+
+    /// The `note:` lines a verb's output starts with (pure).
+    pub fn notes(&self) -> Vec<String> {
+        match self {
+            ConfigSigned::Signed { root, version, unpushed } => {
+                let mut lines = vec![format!("note: signed config `{root}` v{version}")];
+                lines.extend(
+                    unpushed.iter().map(|m| format!("note: `{}` doesn't have config `{root}` v{version}: {}", m.name, m.error)),
+                );
+                lines
+            }
+            ConfigSigned::Failed { root, error } => vec![format!("note: config `{root}` not signed: {error}")],
+            ConfigSigned::NotAuthority { root, authority } => vec![format!(
+                "note: config `{root}` not signed: the fleet's authority is `{authority}`, not this host, and configs here aren't signed"
+            )],
+        }
+    }
+}
+
+/// The fleet's authority, when this host is in a fleet (a membership log)
+/// but isn't it: what it types signs no config ([`sign_config`]).
+pub fn authority_elsewhere(ctx: &Ctx) -> Option<String> {
+    let path = leave::member_toml(ctx).ok()?;
+    let (me, key) = membership_api::own(path, &ctx.hostname).ok()?;
+    let stored = membership_api::load(path).ok()??;
+    stored.log.membership()?;
+    match leave::authority_of(Some(&stored), &me, &key.public_key()) {
+        Authority::Other(a) => Some(a.to_string()),
+        Authority::This | Authority::None => None,
     }
 }
 
@@ -377,8 +431,9 @@ pub fn bound_root(ctx: &Ctx, name: &str) -> Option<PathBuf> {
 /// the root's latest `config` entry's, the bundle stored
 /// ([`mesh::store`], next to `member.toml`) then signed as the next
 /// version (1 for the first) and pushed. `None`, nothing bundled: this
-/// host isn't the authority of a fleet, or `root` holds no config file
-/// (the verb says why). `None` too when the hash is the latest's. A config
+/// host is in no fleet, or `root` holds no config file (the verb says
+/// why). `None` too when the hash is the latest's. `NotAuthority` when
+/// this host is in a fleet whose authority is another member. A config
 /// that doesn't load is `Failed`, nothing signed. So is a name bound to
 /// another root: the first canonical path a name is signed from keeps it
 /// ([`mesh::bind`], recorded before that first entry is signed).
@@ -387,11 +442,15 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     let (me, key) = membership_api::own(path, &ctx.hostname).ok()?;
     let stored = membership_api::load(path).ok()??;
     stored.log.membership()?;
-    if leave::authority_of(Some(&stored), &me, &key.public_key()) != Authority::This {
+    let authority = leave::authority_of(Some(&stored), &me, &key.public_key());
+    if authority == Authority::None {
         return None;
     }
     crate::config::find(root).ok()??;
     let name = root.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if let Authority::Other(a) = authority {
+        return Some(ConfigSigned::NotAuthority { root: name.into(), authority: a.into() });
+    }
     if let Err(e) = membership::check_root_name(name) {
         return Some(ConfigSigned::failed(name, format!("config root {}: {e:#}", root.display())));
     }
@@ -427,7 +486,7 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     }
     let version = current.map_or(1, |(v, _)| v + 1);
     match sign_and_push(ctx, &me, stored, Op::Config { root: name.into(), version, hash }) {
-        Ok(_) => Some(ConfigSigned::Signed { root: name.into(), version }),
+        Ok((_, _, unpushed)) => Some(ConfigSigned::Signed { root: name.into(), version, unpushed }),
         Err(e) => Some(ConfigSigned::failed(name, e.message)),
     }
 }
@@ -724,7 +783,7 @@ mod tests {
     use crate::serve::endpoint;
     use crate::serve::fleet::mesh;
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
-    use super::{Change, Op, RotatePlan, can_rotate, config_moved, countersign_rotate, plan_hub, plan_rotate};
+    use super::{Change, ConfigSigned, Missed, Op, RotatePlan, can_rotate, config_moved, countersign_rotate, plan_hub, plan_rotate};
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
     use crate::serve::fleet::member::{Member, write_for_test};
     use crate::serve::fleet::membership::{Introduction, Stored};
@@ -947,10 +1006,56 @@ mod tests {
     /// [`verb_answered`]'s answer: `None` unanswered, else its error's
     /// `(code, message)` if any.
     fn verb_answer(dir: &Path, method: &str, params: Value) -> Option<Option<(String, String)>> {
-        match connect(dir).call_streaming(method, params, Duration::from_secs(1), &mut |_| true).unwrap() {
+        verb_notes(dir, method, params).0
+    }
+
+    /// [`verb_answer`], with the `note:` lines its `stderr` output carried.
+    fn verb_notes(dir: &Path, method: &str, params: Value) -> (Option<Option<(String, String)>>, Vec<String>) {
+        let mut notes = Vec::new();
+        let streamed = connect(dir)
+            .call_streaming(method, params, Duration::from_secs(1), &mut |n| {
+                if let Some(n) = n.filter(|n| n.method == "output" && n.params["stream"] == "stderr") {
+                    let data = n.params["data"].as_str().unwrap_or_default();
+                    notes.extend(data.lines().filter(|l| l.starts_with("note: ")).map(str::to_string));
+                }
+                true
+            })
+            .unwrap();
+        let answer = match streamed {
             crate::serve::client::Streamed::Answer(r) => Some(r.error.map(|e| (e.code, e.message))),
             _ => None,
-        }
+        };
+        (answer, notes)
+    }
+
+    /// A sign's notes: the version, then each machine that doesn't have
+    /// it and why; a failure's error; a non-authority naming the authority.
+    /// Logged: the sign, the missed machines in one line, a failure.
+    #[test]
+    fn config_signed_notes() {
+        let signed = ConfigSigned::Signed { root: "cfg".into(), version: 3, unpushed: vec![] };
+        assert_eq!(signed.notes(), ["note: signed config `cfg` v3"]);
+        assert_eq!(signed.log_lines(), ["signed config `cfg` v3"]);
+        let missed = vec![Missed { name: "box".into(), error: "down".into() }, Missed { name: "pi".into(), error: "timed out".into() }];
+        let signed = ConfigSigned::Signed { root: "cfg".into(), version: 3, unpushed: missed };
+        assert_eq!(
+            signed.notes(),
+            [
+                "note: signed config `cfg` v3",
+                "note: `box` doesn't have config `cfg` v3: down",
+                "note: `pi` doesn't have config `cfg` v3: timed out",
+            ]
+        );
+        assert_eq!(signed.log_lines(), ["signed config `cfg` v3", "config `cfg` v3 not pushed to box (down), pi (timed out)"]);
+        let failed = ConfigSigned::Failed { root: "cfg".into(), error: "bad toml".into() };
+        assert_eq!(failed.notes(), ["note: config `cfg` not signed: bad toml"]);
+        assert_eq!(failed.log_lines(), ["config `cfg` not signed: bad toml"]);
+        let other = ConfigSigned::NotAuthority { root: "cfg".into(), authority: "lap".into() };
+        assert_eq!(
+            other.notes(),
+            ["note: config `cfg` not signed: the fleet's authority is `lap`, not this host, and configs here aren't signed"]
+        );
+        assert_eq!(other.log_lines(), Vec::<String>::new());
     }
 
     /// `lap` (L), the authority: a `start` typed there signs its root's
@@ -976,7 +1081,9 @@ mod tests {
 
         let head = |toml: &Path| test_support::read(toml).unwrap().log.head();
 
-        assert!(verb_answered(&pair.l_dir, "start", params.clone()));
+        let (answered, notes) = verb_notes(&pair.l_dir, "start", params.clone());
+        assert!(answered.is_some());
+        assert_eq!(notes, ["note: signed config `cfg` v1"], "said in the verb's output");
         let v1 = config(&l_toml);
         assert_eq!(v1.as_ref().map(|(v, h)| (*v, h.len())), Some((1, 64)), "{v1:?}");
         assert_eq!(config(&k_toml), v1, "signed and pushed");
@@ -995,8 +1102,10 @@ mod tests {
 
         std::fs::write(root.join("devsandboxes.toml"), "# a comment\n[sandbox.a]\n").unwrap();
         std::fs::write(root.join("notes.md"), "notes").unwrap();
-        assert!(verb_answered(&pair.l_dir, "start", params.clone()));
+        let (answered, notes) = verb_notes(&pair.l_dir, "start", params.clone());
+        assert!(answered.is_some());
         assert_eq!(head(&l_toml), signed, "unchanged structure: nothing signed");
+        assert_eq!(notes, Vec::<String>::new(), "nothing signed, nothing said");
         assert!(verb_answered(&pair.l_dir, "stop", params.clone()));
         assert_eq!(head(&l_toml), signed, "stop never signs");
         assert!(verb_answered(&pair.l_dir, "start", json!({"root": "cfg", "env": {}, "instance": "nope"})));
@@ -1006,8 +1115,23 @@ mod tests {
         assert!(verb_answered(&pair.l_dir, "start", json!({"root": bare, "env": {}, "instance": "nope"})));
         assert_eq!(head(&l_toml), signed, "no config file: nothing signed");
         std::fs::write(root.join("devsandboxes.toml"), "[sandbox.b]\n").unwrap();
-        assert!(verb_answered(&pair.k_dir, "start", params.clone()));
+        let (answered, notes) = verb_notes(&pair.k_dir, "start", params.clone());
+        assert!(answered.is_some());
         assert_eq!((head(&k_toml), config(&k_toml)), (signed, v1.clone()), "K isn't the authority");
+        assert_eq!(
+            notes,
+            ["note: config `cfg` not signed: the fleet's authority is `lap`, not this host, and configs here aren't signed"]
+        );
+        assert_eq!(verb_notes(&pair.k_dir, "start", params.clone()).1, Vec::<String>::new(), "once per root");
+        let for_lap = |root: &str| json!({"root": root, "env": {}, "instance": "nope", "machine": "lap"});
+        let (answered, notes) = verb_notes(&pair.k_dir, "start", for_lap("/far/other"));
+        assert!(answered.is_some());
+        assert_eq!(
+            notes,
+            ["note: config `other` not signed: the fleet's authority is `lap`, not this host, and configs here aren't signed"],
+            "a verb for a machine, no binding here: told too"
+        );
+        assert_eq!(verb_notes(&pair.k_dir, "start", for_lap("/elsewhere/other")).1, Vec::<String>::new(), "once per root name");
         assert!(verb_answered(&pair.l_dir, "rebuild", json!({"root": root, "env": {}, "instance": "nope"})));
         let v2 = config(&l_toml).unwrap();
         assert_eq!(v2.0, 2, "the bound path signs the next version");
@@ -1019,7 +1143,9 @@ mod tests {
         let signed = head(&l_toml);
         assert!(verb_answered(&pair.l_dir, "start", json!({"root": "/far/other", "env": {}, "instance": "nope", "machine": "box"})));
         assert_eq!(head(&l_toml), signed, "a remote root's name with no binding signs nothing");
-        assert!(verb_answered(&pair.l_dir, "start", json!({"root": "/far/cfg", "env": {}, "instance": "nope", "machine": "box"})));
+        let (answered, notes) = verb_notes(&pair.l_dir, "start", json!({"root": "/far/cfg", "env": {}, "instance": "nope", "machine": "box"}));
+        assert!(answered.is_some());
+        assert_eq!(notes, ["note: signed config `cfg` v3"], "a remote verb's output says it too");
         let v3 = config(&l_toml).unwrap();
         assert_eq!(v3.0, 3, "a verb for a machine signs the root bound to its root's name");
         assert_eq!(config(&k_toml), Some(v3.clone()));
@@ -1027,7 +1153,9 @@ mod tests {
 
         std::fs::write(root.join("devsandboxes.toml"), "[sandbox.c\n").unwrap();
         let signed = head(&l_toml);
-        assert!(verb_answered(&pair.l_dir, "start", params), "the verb runs anyway");
+        let (answered, notes) = verb_notes(&pair.l_dir, "start", params);
+        assert!(answered.is_some(), "the verb runs anyway");
+        assert!(notes.len() == 1 && notes[0].starts_with("note: config `cfg` not signed: "), "{notes:?}");
         assert_eq!((head(&l_toml), config(&l_toml)), (signed, Some(v2)), "won't load: nothing signed");
         pair.finish();
     }

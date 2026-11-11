@@ -1943,7 +1943,17 @@ it never signs on a remote request alone (decision 49;
   isn't the root's latest `config` entry's, stores the bundle then signs
   the next version (1 for the first) and pushes it like any change
   (`daemon::sign_config` over `changes::sign_config`), logged in
-  `serve.log` (the root's name and version); the client isn't told. The
+  `serve.log` (`changes::ConfigSigned::log_lines`: the root's name and
+  version, and one more line naming the machines the push missed and
+  why). The verb's output starts
+  with what it did, as `stderr` `output` lines under the verb's request
+  id (`changes::ConfigSigned::notes`): ``note: signed config `<name>`
+  v<N>``, then for each machine the push didn't reach (so it doesn't
+  have v<N>) ``note: `<machine>` doesn't have config `<name>` v<N>:
+  <why>``; or ``note: config `<name>` not signed: <why>``. The CLI
+  prints them under `-d` too (`verbs_client::held_notes`: of the output
+  held back, only its `note:` stderr lines); the dashboard drops a
+  verb's output, these lines included (`tui::spawn_verb`). The
   bundle (`fleet::mesh::collect`) is the config file plus each file
   under the root it references: sandboxes' (merged with their templates)
   and services' `build` dockerfile and context, bind sources written
@@ -1980,7 +1990,14 @@ it never signs on a remote request alone (decision 49;
   forwarded, the local root bound to that path's last component
   (`daemon::sign_remote_config` over `changes::bound_root`); a name with
   no binding signs nothing. Nothing is bundled off the authority or in
-  no fleet; a verb from a link peer, `--in-process` ones (the dispatcher's, the in-process
+  no fleet. On a member that isn't the authority, a local root with a
+  config file is `ConfigSigned::NotAuthority`, and so is any verb aimed
+  at a machine, bound name or not (`changes::authority_elsewhere`), said
+  once per root per daemon process (`daemon::config_notes`,
+  `Shared::told_not_authority`; a local root by its path, a machine's
+  by its name): ``note: config `<name>` not signed: the fleet's
+  authority is `<authority>`, not this host, and configs here aren't
+  signed``, not logged; in no fleet nothing is said. A verb from a link peer, `--in-process` ones (the dispatcher's, the in-process
   fallback) and the autostart pass never sign. Never proposed.
   Another member keeps its copy of a root at
   `<data>/devsandbox/mesh/tree/<name>/` (`mesh::tree_path`, outside

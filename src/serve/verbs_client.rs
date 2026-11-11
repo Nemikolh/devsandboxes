@@ -273,6 +273,9 @@ fn send(conn: &mut Conn, verb: &CliVerb, prepared: Prepared) -> Result<(Done, bo
     Ok(match ending? {
         Ending::Exit(code) => (Done::Exit(code), code != CANCELLED_EXIT),
         Ending::Detached(result) => {
+            for line in held_notes(last.held.as_deref().unwrap_or_default()) {
+                eprintln!("{line}");
+            }
             print_detached(verb, &result, machine.as_deref())?;
             (Done::Exit(0), true)
         }
@@ -909,7 +912,8 @@ struct Streaming {
     /// `-d` (and rm's `ask` round): output held back as `(stdout?, data)`
     /// instead of printed, so stdout is the name alone (`NAME=$(devsandbox
     /// run -d web)`). Dropped on the detached answer (the build log has it)
-    /// or a `confirm` (a resend follows), replayed otherwise.
+    /// but for its `note:` stderr lines ([`held_notes`]), or a `confirm` (a
+    /// resend follows), replayed otherwise.
     held: Option<Vec<(bool, String)>>,
     /// A remote `run`'s machine: the instance name it prints on stdout is
     /// printed qualified (`m/web-2`), so it can be pasted into the next
@@ -1037,6 +1041,15 @@ impl Streaming {
             print_output(stdout, &data);
         }
     }
+}
+
+/// What a detached verb still prints of its held output (pure): the
+/// `note:` lines on stderr, the daemon's own (config signing, placement)
+/// that no build log has. The build's progress and other stderr stay
+/// dropped. Chunks are joined first: a line may span two.
+fn held_notes(held: &[(bool, String)]) -> Vec<String> {
+    let stderr: String = held.iter().filter(|(stdout, _)| !stdout).map(|(_, d)| d.as_str()).collect();
+    stderr.lines().filter(|l| l.starts_with("note: ")).map(str::to_string).collect()
 }
 
 fn print_output(stdout: bool, data: &str) {
@@ -1531,6 +1544,21 @@ mod tests {
             s.held.as_deref(),
             Some(&[(true, "3c66ab93\n".to_string()), (false, "Preparing worktree\n".to_string())][..])
         );
+    }
+
+    /// Detached: only the held stderr's `note:` lines print, a line split
+    /// across chunks included; stdout and other stderr don't.
+    #[test]
+    fn detach_prints_held_notes() {
+        let held = |v: &[(bool, &str)]| v.iter().map(|(o, d)| (*o, d.to_string())).collect::<Vec<_>>();
+        let h = held(&[
+            (false, "note: signed config `cfg` v3\n"),
+            (true, "note: not this\n"),
+            (false, "Preparing worktree\nnote: not placed on b"),
+            (false, ": full; running here\n"),
+        ]);
+        assert_eq!(held_notes(&h), ["note: signed config `cfg` v3", "note: not placed on b: full; running here"]);
+        assert_eq!(held_notes(&[]), Vec::<String>::new());
     }
 
     #[test]

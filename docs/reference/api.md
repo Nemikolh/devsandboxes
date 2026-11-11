@@ -1040,6 +1040,17 @@ yet`` (a newer version not pulled yet), ``config root `<name>` isn't the
 signed config (v<N>): its copy was changed here``, or a root inside a
 copy, not the copy. `stop` and `rm` aren't checked.
 
+**Config signing** (on a fleet member, from a local client;
+[fleet](../architecture/daemon/fleet.md#approvals-and-pushes), *Config
+versions*): a `run`, `rebuild` or `start` output starts with `stderr`
+lines saying what signing did: ``note: signed config `<name>` v<N>``
+and ``note: `<machine>` doesn't have config `<name>` v<N>: <why>`` per
+machine the push missed, ``note: config `<name>` not signed: <why>``,
+or, once per root per daemon on a member that isn't the authority (a
+verb with `machine` too, its root by name),
+``note: config `<name>` not signed: the fleet's authority is
+`<authority>`, not this host, and configs here aren't signed``.
+
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no
 `progress` comes, and `ask` doesn't apply.

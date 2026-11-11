@@ -992,7 +992,8 @@ pub(crate) mod tests {
         let (r, out, err) = verb(&mut k, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
         assert_eq!(r.result.as_ref().unwrap()["machine"], "lap", "{r:?}");
-        assert!(err.starts_with("placed on lap ("), "{err}");
+        let not_authority = "note: config `cfg` not signed: the fleet's authority is `lap`, not this host, and configs here aren't signed\n";
+        assert!(err.strip_prefix(not_authority).is_some_and(|e| e.starts_with("placed on lap (")), "{err}");
         let roots: Vec<_> =
             std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != ".in").collect();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -1206,7 +1207,9 @@ pub(crate) mod tests {
         let (r, out, err) = verb(&mut l, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature"}));
         assert!(r.error.is_none(), "{r:?} {err}");
         assert_eq!(r.result.as_ref().unwrap().get("machine"), None, "{r:?}");
-        assert_eq!((out, err.as_str()), (format!("local --in-process -C {} run --branch=feature -- web\n", cfg.display()), ""));
+        // L is the fleet's authority: its first verb signs `cfg`.
+        let signed = "note: signed config `cfg` v1\n";
+        assert_eq!((out, err.as_str()), (format!("local --in-process -C {} run --branch=feature -- web\n", cfg.display()), signed));
         assert!(!fleet_root.join("roots").exists() || std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().all(|e| e.file_name() == ".in"));
         let (r, out, err) = verb(&mut l, "run", json!({"root": cfg, "env": {"PATH": path}, "sandbox": "web", "branch": "feature", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
@@ -2232,7 +2235,7 @@ pub(crate) mod tests {
         let (r, out, err) = verb(&mut a, "run", json!({"root": cfg, "env": {"PATH": std::env::var("PATH").unwrap_or_default()}, "sandbox": "web", "branch": "feature", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
         assert_eq!(r.result.as_ref().unwrap()["machine"], "b", "{r:?} {err}");
-        assert!(err.starts_with("placed on b ("), "{err}");
+        assert!(err.strip_prefix("note: signed config `cfg` v1\n").is_some_and(|e| e.starts_with("placed on b (")), "{err}");
         let roots: Vec<_> =
             std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != ".in").collect();
         assert_eq!(roots.len(), 1, "{roots:?}");
