@@ -61,7 +61,7 @@ pub struct Allow {
     #[serde(skip_serializing_if = "is_false")]
     pub host_network: bool,
     /// Binds under a config root's `shared-volumes/` (`${sharedVolumes}`
-    /// mounts, `persist-shell-history`).
+    /// mounts), but caches' and the shell history's dirs, which always pass.
     #[serde(skip_serializing_if = "is_false")]
     pub shared_volumes: bool,
     /// `worktree-link`.
@@ -275,8 +275,7 @@ impl Policy {
 
     /// What the resolved sandbox `sandbox` of `config` (at `dir`) declares
     /// that never shows in a container's argv or is done on the host before
-    /// one: `initializeCommand`, `dispatcher`, `inbox`,
-    /// `persist-shell-history`, `worktree-link`, `privileged`, `global`
+    /// one: `initializeCommand`, `dispatcher`, `inbox`, `worktree-link`, `privileged`, `global`
     /// services, local features outside the fleet root (or with a file
     /// resolving outside it), and `${localEnv:NAME}` in the merged sandbox
     /// or its services for a name `local-env` doesn't list.
@@ -298,7 +297,6 @@ impl Policy {
             (props.initialize_command.is_some(), a.initialize_command, "`initializeCommand`", "initialize-command"),
             (props.dispatcher.is_some(), a.dispatcher, "`dispatcher`", "dispatcher"),
             (props.inbox == Some(true), a.inbox, "`inbox`", "inbox"),
-            (props.persist_shell_history == Some(true), a.shared_volumes, "`persist-shell-history`", "shared-volumes"),
             (props.worktree_link.as_ref().is_some_and(|l| !l.is_empty()), a.worktree_link, "`worktree-link`", "worktree-link"),
             (props.privileged == Some(true), a.privileged, "privileged", "privileged"),
         ];
@@ -397,9 +395,9 @@ impl Policy {
     /// A bind's host source: a runtime socket (by name, as one of
     /// [`Self::sockets`], or a dir holding one) needs `runtime-socket`;
     /// under the fleet root, a `shared-volumes` dir needs `shared-volumes`
-    /// unless it's a cache's (always fine: it lives under the fleet root and
-    /// holds only what the placed sandboxes download), a `shared-files` dir
-    /// `worktree-link`; anything else must pass [`Self::check_path`].
+    /// unless it's a cache's or the shell history's (always fine: they live
+    /// under the fleet root and hold only what the placed sandboxes write),
+    /// a `shared-files` dir `worktree-link`; anything else must pass [`Self::check_path`].
     pub fn check_bind(&self, source: &str) -> Result<(), Refusal> {
         let path = Path::new(source);
         let what = "bind mount of";
@@ -418,12 +416,13 @@ impl Policy {
         if let Ok(rel) = resolved.strip_prefix(&self.root) {
             let comps: Vec<&str> = rel.components().filter_map(|c| c.as_os_str().to_str()).collect();
             if let Some(i) = comps.iter().position(|c| *c == "shared-volumes") {
-                let cache = comps.get(i + 1).is_some_and(|sub| {
-                    crate::config::SUPPORTED_CACHES
-                        .iter()
-                        .any(|c| crate::config::known_cache(c).is_some_and(|(dir, ..)| dir == *sub))
+                let managed = comps.get(i + 1).is_some_and(|sub| {
+                    *sub == "history"
+                        || crate::config::SUPPORTED_CACHES
+                            .iter()
+                            .any(|c| crate::config::known_cache(c).is_some_and(|(dir, ..)| dir == *sub))
                 });
-                if !cache && !self.allow.shared_volumes {
+                if !managed && !self.allow.shared_volumes {
                     return Err(Refusal::new(format!("shared-volumes mount `{source}`"), "shared-volumes = true"));
                 }
             }
@@ -910,6 +909,7 @@ mod tests {
             vec!["-v".into(), format!("{ws}:ro,z")],
             vec!["-v".into(), "named:/data".into()],
             vec!["--mount".into(), format!("type=bind,source={},target=/c", sv.join("cargo").display())],
+            vec!["--mount".into(), format!("type=bind,source={},target=/commandhistory", sv.join("history/x").display())],
             vec!["--mount".into(), format!("type=bind,source={inside_s},target=/x,readonly")],
             vec!["--mount".into(), format!("type=bind,source={inside_s}/new/dir,target=/x,relabel=shared")],
             vec!["--mount".into(), "type=volume,source=devsandbox-x-cache,target=/c".into()],
@@ -978,7 +978,7 @@ mod tests {
             (argv(&["-p", "[::]:8080:80"]), "publish = true", None),
             (argv(&["-p", "192.168.1.2:8080:80"]), "publish = true", None),
             (
-                vec!["--mount".into(), format!("type=bind,source={},target=/h", sv.join("history/x").display())],
+                vec!["--mount".into(), format!("type=bind,source={},target=/h", sv.join("skills/x").display())],
                 "shared-volumes = true",
                 Some((|a| a.shared_volumes = true, |a| a.shared_volumes = false)),
             ),
@@ -1097,17 +1097,17 @@ mod tests {
             "services = [\"i\"]",
             "privileged = false",
             "caches = [\"cargo\"]",
+            "persist-shell-history = true",
             "features = { \"./features/ok\" = {} }",
             "features = { \"ghcr.io/devcontainers/features/node:1\" = {} }",
             "mounts = [\"source=/etc,target=/e\"]", // a bind: the mounts' own check
         ] {
             assert_eq!(check(&none, fine), Ok(()), "{fine}");
         }
-        let items: [(&str, &str, fn(&mut Allow)); 8] = [
+        let items: [(&str, &str, fn(&mut Allow)); 7] = [
             ("initializeCommand = \"true\"", "initialize-command = true", |a| a.initialize_command = true),
             ("dispatcher = {}", "dispatcher = true", |a| a.dispatcher = true),
             ("inbox = true", "inbox = true", |a| a.inbox = true),
-            ("persist-shell-history = true", "shared-volumes = true", |a| a.shared_volumes = true),
             ("worktree-link = [\".env\"]", "worktree-link = true", |a| a.worktree_link = true),
             ("privileged = true", "privileged = true", |a| a.privileged = true),
             ("services = [\"i\", \"g\"]", "global-services = true", |a| a.global_services = true),

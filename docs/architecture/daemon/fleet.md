@@ -785,8 +785,7 @@ refuse, with the config root and the folders that move with it
 (`folder`, `folders` entries outside the root) as the only paths that
 travel. From the config, every `worker_policy::Policy::config_refusals`
 item (`initializeCommand`, `dispatcher`, `inbox`,
-`persist-shell-history`, `worktree-link`, `privileged`, `global`
-services, local features outside those paths, each `${localEnv:NAME}`
+`worktree-link`, `privileged`, `global` services, local features outside those paths, each `${localEnv:NAME}`
 in the merged sandbox or its services); from each `mounts` bind (its
 source substituted as `run` does, `${localWorkspaceFolder}` the
 `folder`), `Policy::check_bind`'s: a source outside those paths, one
@@ -2928,8 +2927,10 @@ applies under `trust = "full"` ([Trust](#trust)).
   `runtime_sockets`' paths, `DOCKER_HOST`'s and `CONTAINER_HOST`'s
   included, or a dir holding one) needs `runtime-socket`. Under the fleet
   root, a path through `shared-volumes/` needs `shared-volumes`, but a
-  cache's dir always passes (`caches` are never refused: the dir is under
-  the fleet root and holds only downloads), one through `shared-files/`
+  cache's dir and the shell history's (`shared-volumes/history/…`) always
+  pass (`caches` and `persist-shell-history` are never refused: the dirs
+  are under the fleet root, start empty on a worker and hold only
+  downloads or the instance's own history), one through `shared-files/`
   `worktree-link`.
   Named and anonymous volumes and `tmpfs` pass; `--mount` keys beyond the
   ones devsandbox writes (`volume-opt`, which can bind a host path) and
@@ -2938,8 +2939,7 @@ applies under `trust = "full"` ([Trust](#trust)).
   after the sandbox resolves, before the runtime is called or the
   instance recorded) and again at the top of `materialize` (so `rebuild`
   too), refuses `initializeCommand` (it runs on the host), `dispatcher`,
-  `inbox`, `persist-shell-history` (`shared-volumes`),
-  `worktree-link`, `privileged`, `global` services, and local features
+  `inbox`, `worktree-link`, `privileged`, `global` services, and local features
   whose folder, or any file in it, resolves outside the fleet root (they
   are copied into the image's build context). `folder` and `folders`
   hosts are checked (`check_path`) before their worktrees are made, and
@@ -2971,7 +2971,7 @@ applies under `trust = "full"` ([Trust](#trust)).
 | `privileged` | `--privileged` (the sandbox's or a feature's) |
 | `runtime-socket` | a bind of a runtime socket or a dir holding one |
 | `host-network` | `--network host` on `run` or `build` |
-| `shared-volumes` | binds under `shared-volumes/`, `persist-shell-history` |
+| `shared-volumes` | binds under `shared-volumes/` but caches' and the shell history's |
 | `worktree-link` | `worktree-link` and its store's bind |
 | `global-services` | `scope = "global"` services |
 | `dispatcher` | `dispatcher` and its control ops |

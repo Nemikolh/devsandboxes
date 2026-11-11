@@ -1035,10 +1035,11 @@ step 12 does.
    Linux runtime (`/proc/meminfo`, `statvfs` of the runtime's root), else
    unknown. VM-backed engines report the VM.
 9. The worker policy denies by default: binds outside the fleet root,
-   `privileged`, runtime socket mounts, host network, `caches`,
+   `privileged`, runtime socket mounts, host network,
    `shared-volumes`, `worktree-link`, `global` services, inbox /
    dispatcher sockets. Allowances per member in `member.toml`; none under
-   `full`.
+   `full`. (As built, `caches` and `persist-shell-history` always pass:
+   a placed instance gets its own empty ones on the worker.)
 10. Self-update: the hello carries git hash + `published`; a member
     follows the hub's exact version (a downgrade is a forced handoff);
     installs in place at `exe::devsandbox()`. Verified by a signed

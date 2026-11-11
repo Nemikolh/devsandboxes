@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(ties_of_toml("placement = \"home\""), ["`placement = \"home\"`"]);
         assert_eq!(ties_of_toml("privileged = true\nplacement = \"home\""), ["`placement = \"home\"`", "privileged"]);
         assert_eq!(ties_of_toml(""), Vec::<String>::new());
-        assert_eq!(ties_of_toml("caches = [\"cargo\"]"), Vec::<String>::new());
+        assert_eq!(ties_of_toml("caches = [\"cargo\"]\npersist-shell-history = true"), Vec::<String>::new());
         let out = dir.join("elsewhere").display().to_string();
         for (extra, want) in [
             (format!("mounts = [\"source={out},target=/o\"]"), format!("bind mount of `{out}` (outside the config root)")),

@@ -468,8 +468,8 @@ mod tests {
     fn a_tied_sandbox_runs_here_with_its_ties_named() {
         assert_eq!(tied(&[]), None);
         assert_eq!(
-            tied(&["`caches`".into(), "privileged".into()]),
-            Some(Placed::LocalWithNote("note: not placed: `caches`, privileged; running here".into()))
+            tied(&["`initializeCommand`".into(), "privileged".into()]),
+            Some(Placed::LocalWithNote("note: not placed: `initializeCommand`, privileged; running here".into()))
         );
     }
 
