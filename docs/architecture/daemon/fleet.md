@@ -2003,6 +2003,24 @@ it never signs on a remote request alone (decision 49;
   `daemon`'s transfer channel next to `code::receivers`; only a
   `<64 hex>.tar` name, a regular file); `mesh::pull_bundle` pulls one by
   hash through a `code::Transfer`, at most `code::ROOT_TAR_LIMIT`.
+  A member installs on two occasions: a `fleet.sync` from a peer that
+  made its log newer (`changes::sync`, through `Ctx::log_from`, unless
+  the sync cycles the links), and each link coming up, on either end
+  (`dialer::Dialer::linked` past the handshake, which takes a newer log
+  the peer carries; `links.inbound` on the dialed end). Each runs
+  `daemon::follow_configs` on a `serve-mesh` thread against that peer:
+  `mesh::follow` reads the log's `config` heads and picks (`mesh::due`)
+  each name whose head isn't what `installed.toml` holds
+  (`mesh::installed`) and that this host hasn't bound; its bundle is
+  installed from `bundles/` when stored there, else pulled from the peer
+  (`code::LinkTransfer`), then `mesh::install`ed. Runs are one at a time
+  per process, the heads read inside, so an older log's run never
+  installs after a newer one's. Each outcome goes to `serve.log`
+  (installed config `<name>` vN from `<peer>`, or why not); a peer
+  without the bundle is a logged failure, and the next sync or link-up
+  tries again. So a member keeps, and runs from, the latest version it
+  got while the authority is offline, and hands it on to the members
+  that link to it.
 - **Following a hub change** (decision 69). A host follows a hub change
   (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
   both ends redial saying it) only once the change has left it: cycling

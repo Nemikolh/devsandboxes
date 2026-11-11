@@ -139,6 +139,10 @@ pub struct Dialer {
     /// stored as `membership.adopt` stores them (`hub` written from the
     /// log, the daemon following it); `Err` says why not.
     pub adopt: Arc<dyn Fn(&Stored) -> Result<(), String> + Send + Sync>,
+    /// The link to machine `name` is up (its socket bound, any newer log it
+    /// carried taken): the daemon follows the signed configs from it
+    /// (`daemon::follow_configs`).
+    pub linked: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Dialer {
@@ -271,6 +275,7 @@ impl Dialer {
                     fleet_link::push_build(ours, &peer.hash, socket.clone(), fleet_link::own_binary);
                 }
                 held.up();
+                (self.linked)(name);
                 Ok(())
             },
             move || {

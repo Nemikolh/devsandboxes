@@ -77,8 +77,11 @@ is frozen: no new work on it.
   approved there when typed elsewhere), links unchanged. Config
   versions: a `run`/`rebuild`/`start` typed on the authority signs its
   config root's hash as the root's next `config` version when it
-  changed; nothing reads it yet (no member fetches or checks its root
-  against it). Transfer v1
+  changed, and every other member pulls that version's files from the
+  peer that gave it the log and installs its own copy under
+  `mesh/tree/<name>/`, kept while the authority is offline; nothing
+  runs from the copy yet (no admission against it, `roots.list`
+  doesn't list it). Transfer v1
   (step 12): a placed run's folders move from their own checkouts with
   a WIP snapshot, no remote needed, into per-repo caches on the worker
   (repeat sends carry only the delta) and on the hub, and `devsandbox

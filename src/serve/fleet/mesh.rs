@@ -166,7 +166,6 @@ pub fn bind(data: &Path, name: &str, path: &Path) -> Result<Result<(), PathBuf>>
 /// beside `bundles/` and `roots.toml` without colliding with them, outside
 /// `fleet/` (no worker policy: the authority's signature is the consent).
 /// A relative `folder` of `../x` lands at `mesh/tree/x`.
-#[cfg_attr(not(test), allow(dead_code))] // step 2b calls it on log adoption
 pub fn tree_path(data: &Path, name: &str) -> PathBuf {
     data.join("mesh").join("tree").join(name)
 }
@@ -191,6 +190,12 @@ fn load_installed(path: &Path) -> Result<BTreeMap<String, InstalledRoot>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
     }
+}
+
+/// The hash (hex) [`install`] last installed per name under data dir
+/// `data`. An install cut short still names the previous one.
+pub fn installed(data: &Path) -> Result<BTreeMap<String, String>> {
+    Ok(load_installed(&installed_path(data))?.into_iter().map(|(name, r)| (name, r.hash)).collect())
 }
 
 fn save_installed(path: &Path, roots: &BTreeMap<String, InstalledRoot>) -> Result<()> {
@@ -236,7 +241,6 @@ pub struct Installed {
 ///
 /// Refused for a name [`bound_root`] binds: the authority's original is
 /// the root, it never gets a copy.
-#[cfg_attr(not(test), allow(dead_code))] // step 2b calls it on log adoption
 pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<Installed> {
     super::membership::check_root_name(name).context("config root")?;
     if let Some(root) = bound_root(data, name)? {
@@ -398,7 +402,6 @@ pub fn serves(data: &Path, receivers: crate::serve::fleet::transfer::Receivers) 
 /// to the peer that gave this host the log), at most [`ROOT_TAR_LIMIT`]
 /// bytes, through a temp file under data dir `data`'s `mesh/` (removed):
 /// its bytes, for [`install`] to check against the head.
-#[cfg_attr(not(test), allow(dead_code))] // step 2b calls it on log adoption
 pub fn pull_bundle(t: &dyn crate::serve::fleet::code::Transfer, data: &Path, hash: &[u8; 32]) -> Result<Vec<u8>> {
     let mesh = data.join("mesh");
     std::fs::create_dir_all(&mesh).with_context(|| format!("cannot create {}", mesh.display()))?;
@@ -407,6 +410,67 @@ pub fn pull_bundle(t: &dyn crate::serve::fleet::code::Transfer, data: &Path, has
     let pulled = t.pull(BUNDLE_KIND, &name, ROOT_TAR_LIMIT, &dest).and_then(|_| std::fs::read(&dest).with_context(|| format!("cannot read {}", dest.display())));
     let _ = std::fs::remove_file(&dest);
     pulled.with_context(|| format!("cannot pull the config bundle {name}"))
+}
+
+/// A config root whose signed head this host's copy isn't at: version
+/// `version` (hash `hash`) to install, from its bundle stored here
+/// (`stored`) or pulled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Due {
+    pub name: String,
+    pub version: u64,
+    pub hash: [u8; 32],
+    pub stored: bool,
+}
+
+/// The names of `heads` (the log's `Membership::config`) to install (pure):
+/// those whose head isn't what `installed` ([`installed`]) holds, but not
+/// one `bound` ([`load_roots`]) binds (the authority's own: no copy).
+/// `stored`: the heads' bundles already in `bundles/`, installed without a
+/// pull.
+pub fn due(
+    heads: &BTreeMap<String, (u64, [u8; 32])>,
+    installed: &BTreeMap<String, String>,
+    bound: &BTreeMap<String, PathBuf>,
+    stored: &std::collections::BTreeSet<[u8; 32]>,
+) -> Vec<Due> {
+    heads
+        .iter()
+        .filter(|(name, (_, hash))| !bound.contains_key(*name) && installed.get(*name) != Some(&hex::encode(hash)))
+        .map(|(name, (version, hash))| Due { name: name.clone(), version: *version, hash: *hash, stored: stored.contains(hash) })
+        .collect()
+}
+
+/// After this host took a log from a peer (or linked to one): every
+/// [`due`] name installed ([`install`]) from its stored bundle, else from
+/// one pulled through `from` (a `code::LinkTransfer` to that peer). Runs
+/// one at a time in this process, `heads` (the log's `config` heads) read
+/// inside, so a run that read an older log never installs after one that
+/// read a newer. What each due name came to; a name whose bundle the peer
+/// doesn't have is an error there, the next sync or link-up tries again.
+pub fn follow(
+    data: &Path,
+    heads: impl FnOnce() -> Result<BTreeMap<String, (u64, [u8; 32])>>,
+    from: &dyn crate::serve::fleet::code::Transfer,
+) -> Result<Vec<(Due, Result<Installed>)>> {
+    static RUNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let heads = heads()?;
+    let stored = heads.values().map(|(_, h)| *h).filter(|h| bundle_path(data, h).is_file()).collect();
+    let due = due(&heads, &installed(data)?, &load_roots(&roots_path(data))?, &stored);
+    Ok(due
+        .into_iter()
+        .map(|d| {
+            let tar = if d.stored {
+                let path = bundle_path(data, &d.hash);
+                std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))
+            } else {
+                pull_bundle(from, data, &d.hash)
+            };
+            let r = tar.and_then(|tar| install(data, &d.name, &tar, &d.hash));
+            (d, r)
+        })
+        .collect())
 }
 
 /// The bundle of config root `root`. The config must load
@@ -966,6 +1030,69 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
             assert!(err.contains("isn't a config bundle's name"), "{bad}: {err}");
         }
         assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn due_names_are_unbound_heads_not_installed() {
+        let heads: BTreeMap<String, (u64, [u8; 32])> =
+            [("done", (2, [1; 32])), ("own", (1, [2; 32])), ("local", (3, [3; 32])), ("pull", (1, [4; 32])), ("behind", (5, [5; 32]))]
+                .into_iter()
+                .map(|(n, h)| (n.to_string(), h))
+                .collect();
+        let installed: BTreeMap<String, String> =
+            [("done", hex::encode([1; 32])), ("behind", hex::encode([6; 32]))].into_iter().map(|(n, h)| (n.to_string(), h)).collect();
+        let bound = BTreeMap::from([("own".to_string(), PathBuf::from("/a/own"))]);
+        let stored = std::collections::BTreeSet::from([[3; 32], [2; 32]]);
+        let due = |name: &str, version, h, stored| Due { name: name.into(), version, hash: [h; 32], stored };
+        assert_eq!(
+            super::due(&heads, &installed, &bound, &stored),
+            [due("behind", 5, 5, false), due("local", 3, 3, true), due("pull", 1, 4, false)],
+            "installed already and bound: nothing"
+        );
+        assert!(super::due(&BTreeMap::new(), &installed, &bound, &stored).is_empty());
+    }
+
+    /// A [`crate::serve::fleet::code::Transfer`] that must not be used.
+    struct NoPull;
+    impl crate::serve::fleet::code::Transfer for NoPull {
+        fn send(&self, _: &crate::serve::fleet::transfer::Header, _: &mut dyn std::io::Read) -> Result<()> {
+            unreachable!()
+        }
+        fn pull(&self, _: &str, name: &str, _: u64, _: &Path) -> Result<u64> {
+            panic!("pulled {name}")
+        }
+    }
+
+    #[test]
+    fn follow_pulls_installs_and_then_does_nothing() {
+        let (base, root) = fixture("follow");
+        let (authority, member) = (base.join("auth"), base.join("member"));
+        let b = collect(&root).unwrap();
+        store(&authority, &b).unwrap();
+        let heads = || Ok(BTreeMap::from([("cfg".to_string(), (1, b.hash()))]));
+        let done = follow(&member, heads, &Served(authority.clone())).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, Due { name: "cfg".into(), version: 1, hash: b.hash(), stored: false });
+        assert_eq!(done[0].1.as_ref().unwrap().path, tree_path(&member, "cfg"));
+        assert_eq!(installed(&member).unwrap()["cfg"], hex::encode(b.hash()));
+        assert_eq!(hash(&tree_path(&member, "cfg")), b.hash());
+        assert!(follow(&member, heads, &NoPull).unwrap().is_empty(), "installed: nothing");
+
+        // Stored here (a sibling's install, or kept): no pull.
+        let other = base.join("other");
+        store(&other, &b).unwrap();
+        let done = follow(&other, heads, &NoPull).unwrap();
+        assert!(done[0].0.stored && done[0].1.is_ok(), "{done:?}");
+
+        // The peer doesn't have it: an error for that name, nothing installed.
+        let missing = base.join("missing");
+        let done = follow(&missing, heads, &Served(base.join("empty"))).unwrap();
+        assert!(format!("{:#}", done[0].1.as_ref().unwrap_err()).contains("to pull here"));
+        assert!(installed(&missing).unwrap().is_empty());
+
+        // Bound: the authority's own, nothing to do.
+        assert!(follow(&authority, || { bind(&authority, "cfg", &root).unwrap().unwrap(); heads() }, &NoPull).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 

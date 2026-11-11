@@ -579,7 +579,8 @@ fn queue(params: Value, from: &str, ctx: &Ctx) -> Answer {
 /// handshake merges (self-verifying; another fleet's or a fork refused;
 /// a log revoking this host's own key taken, for the `fleet.leave` that
 /// follows it). When it made this host's log newer: `hub` followed, and
-/// the log sent on to every other machine this host holds, off the request
+/// the log sent on to every other machine this host holds and the signed
+/// configs followed from `from` (`Ctx::log_from`), off the request
 /// thread. When it promoted this host's next key (a rotate of it is in) or
 /// moved this host's hub, the log is sent on before answering, and every
 /// link ends once the answer is out (`After::Rotated`: redialing to prove
@@ -617,6 +618,8 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
         }
         if follow.is_none() {
             (ctx.hub_changed)(taken.hub);
+            // A cycle instead: the redial's link-up follows them.
+            (ctx.log_from)(from);
         }
         after = follow;
     }
@@ -972,6 +975,52 @@ mod tests {
         let signed = head(&l_toml);
         assert!(verb_answered(&pair.l_dir, "start", params), "the verb runs anyway");
         assert_eq!((head(&l_toml), config(&l_toml)), (signed, Some(v2)), "won't load: nothing signed");
+        pair.finish();
+    }
+
+    /// `lap` (L), the authority, signs `cfg` v1 then v2 (a structural edit
+    /// and a referenced file): K (`box`) takes each with the `fleet.sync`
+    /// push, pulls its bundle from L over the link and installs it at
+    /// `mesh/tree/cfg/`, `installed.toml` saying so. L, whose name it is,
+    /// gets no copy.
+    #[test]
+    fn a_member_installs_each_signed_version() {
+        let pair = pair("changes-install", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
+        up(&pair);
+        let l_toml = pair.base.join("l-data/member.toml");
+        let (k_data, l_data) = (pair.base.join("k-data"), pair.base.join("l-data"));
+        let root = pair.base.join("cfg");
+        std::fs::create_dir_all(root.join("mcps")).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let params = json!({"root": root, "env": {}, "instance": "nope"});
+        let signed = || test_support::read(&l_toml).unwrap().log.membership().unwrap().config.get("cfg").copied().unwrap();
+        let tree = mesh::tree_path(&k_data, "cfg");
+        let at = |hash: [u8; 32]| {
+            let (tree, k_data) = (tree.clone(), k_data.clone());
+            move || {
+                mesh::installed(&k_data).unwrap().get("cfg") == Some(&hex::encode(hash))
+                    && mesh::collect(&tree).is_ok_and(|b| b.hash() == hash)
+            }
+        };
+
+        assert!(verb_answered(&pair.l_dir, "start", params.clone()));
+        let (v, h1) = signed();
+        assert_eq!(v, 1);
+        wait_for("v1 installed on K", Duration::from_secs(20), at(h1));
+        assert_eq!(std::fs::read_to_string(tree.join("devsandboxes.toml")).unwrap(), "[sandbox.a]\n");
+
+        std::fs::write(
+            root.join("devsandboxes.toml"),
+            "[sandbox.b]\nmounts = [\"source=${configDir}/mcps/x.json,target=/x.json,type=bind\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("mcps/x.json"), "{}").unwrap();
+        assert!(verb_answered(&pair.l_dir, "start", params));
+        let (v, h2) = signed();
+        assert_eq!(v, 2);
+        wait_for("v2 installed on K", Duration::from_secs(20), at(h2));
+        assert_eq!(std::fs::read_to_string(tree.join("mcps/x.json")).unwrap(), "{}");
+        assert!(!mesh::tree_path(&l_data, "cfg").exists() && mesh::installed(&l_data).unwrap().is_empty(), "the authority's own: no copy");
         pair.finish();
     }
 

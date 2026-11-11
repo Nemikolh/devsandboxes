@@ -412,6 +412,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             })
         },
+        log_from: {
+            let (member, dir) = (shared.member.clone(), dir.to_path_buf());
+            Box::new(move |peer: &str| follow_configs(member.as_deref(), &dir, peer))
+        },
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
@@ -652,6 +656,7 @@ fn machine_dialer(
         let (member_toml, hostname) = (member_toml.clone(), hostname.clone());
         Arc::new(move || fleet::proof::Identity::load(member_toml.as_deref().context("this daemon has no member.toml")?, &hostname))
     };
+    let linked_member = member_toml.clone();
     // A machine's newer membership entries: what `membership.adopt` does,
     // `hub` followed the same way.
     let adopt: Arc<dyn Fn(&fleet::membership::Stored) -> Result<(), String> + Send + Sync> = {
@@ -702,6 +707,10 @@ fn machine_dialer(
         log,
         identity,
         adopt,
+        linked: {
+            let (member, dir) = (linked_member, dir.to_path_buf());
+            Arc::new(move |name: &str| follow_configs(member.as_deref(), &dir, name))
+        },
     };
     Arc::new(move |entry, held| dialer.hold(entry, held))
 }
@@ -2340,7 +2349,8 @@ struct InboundParams {
 /// this connection is (docs/reference/api.md, `links.inbound`). Refused for
 /// a name `machines.toml` has (an inbound neighbor and a registry entry
 /// never share a name). Once announced, the neighbor's roots are asked over
-/// the link ([`inbound_roots`]) on a thread of its own.
+/// the link ([`inbound_roots`]) on a thread of its own, and the signed
+/// configs followed from it ([`follow_configs`]).
 fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) -> Response {
     if !matches!(conn.table, Table::Full) || !conn.own_user {
         return Response::err(id, "denied", "`links.inbound` is for this user's own `fleet-link`");
@@ -2384,6 +2394,7 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
         false
     });
     log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.hub { ", the hub" } else { "" }));
+    follow_configs(shared.member.as_deref(), &shared.socket_dir, &p.peer);
     let (socket, peer) = (endpoint::fleet_socket(&shared.socket_dir, &p.peer), p.peer);
     let _ = std::thread::Builder::new().name("serve-inbound-roots".into()).spawn(move || match inbound_roots(&peer, &socket) {
         Ok(roots) => set_roots(roots),
@@ -2634,6 +2645,42 @@ fn sign_config(root: &Path, shared: &Shared, conn: &ConnState) {
         Some(ConfigSigned::Failed { root, error }) => log(&format!("{}: config `{root}` not signed: {error}", conn.label())),
         Some(ConfigSigned::Signed { root, version }) => log(&format!("{}: signed config `{root}` v{version}", conn.label())),
         None => {}
+    }
+}
+
+/// This host took a log from `peer` (`fleet.sync`), or its link to `peer`
+/// is up (where the handshake's newer log is taken, and the next try after
+/// a failed pull): each config root whose signed head this host's copy
+/// isn't at installed, from its stored bundle or one pulled from `peer`
+/// (`fleet::mesh::follow`), on a thread of its own, logged. Best effort:
+/// the next sync or link-up tries again. Nothing without a `member.toml`
+/// (no data dir, no log).
+fn follow_configs(member: Option<&Path>, socket_dir: &Path, peer: &str) {
+    let Some((member, data)) = member.and_then(|m| Some((m.to_path_buf(), m.parent()?.to_path_buf()))) else { return };
+    let (dir, from) = (socket_dir.to_path_buf(), peer.to_string());
+    let spawned = std::thread::Builder::new().name("serve-mesh".into()).spawn(move || {
+        let peer = from;
+        let heads = || -> Result<BTreeMap<String, (u64, [u8; 32])>> {
+            let stored = fleet::membership_api::load(&member).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            Ok(stored.and_then(|s| s.log.membership().map(|m| m.config.clone())).unwrap_or_default())
+        };
+        let t = fleet::code::LinkTransfer::for_worker(&dir, &peer);
+        match fleet::mesh::follow(&data, heads, &t) {
+            Ok(done) => {
+                for (due, r) in done {
+                    let (name, v) = (&due.name, due.version);
+                    let from = if due.stored { "its stored bundle".to_string() } else { peer.clone() };
+                    match r {
+                        Ok(_) => log(&format!("fleet: installed config `{name}` v{v} from {from}")),
+                        Err(e) => log(&format!("fleet: config `{name}` v{v} not installed (from {from}): {e:#}")),
+                    }
+                }
+            }
+            Err(e) => log(&format!("fleet: cannot follow the signed configs (after {peer}): {e:#}")),
+        }
+    });
+    if let Err(e) = spawned {
+        log(&format!("fleet: cannot follow the signed configs (after {peer}): {e}"));
     }
 }
 

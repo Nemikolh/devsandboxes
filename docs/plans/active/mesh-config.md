@@ -3,7 +3,8 @@
 Status: in progress. Step 1 shipped (1a-1d: signed from the
 authority's verbs, local or aimed at a machine, over the config's
 structure and referenced files, the bundle kept, names bound to one
-path); step 2 in progress (2a: receive and install).
+path); step 2 shipped (2a: receive and install; 2b: pulled and
+installed after a `fleet.sync` and at each link-up).
 
 ## Goal
 
