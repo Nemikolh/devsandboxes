@@ -285,6 +285,8 @@ Start with `docs/README.md` (reading order and map) and
 - Checks: `cargo test --workspace` (covers the `devsbd/` helper crate too;
   plain `cargo test` only runs the root package). clippy/rustfmt are not
   installed in the default toolchain here.
+- Commit each finished, checked change without being asked, staging only
+  your own hunks. Subagents never commit unless their brief says to.
 - Commits follow Conventional Commits, all lowercase:
   `<type>(<what>): <description>` where `<type>` is `feat`, `fix`, `chore`,
   `docs`, `test`, `refactor`, … and `<what>` is the module or concept touched
