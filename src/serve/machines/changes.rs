@@ -43,11 +43,14 @@
 //!   flood) leaves with a head not installed installs it from the sender
 //!   before it answers or sends the log on ([`sync`]), the answer saying
 //!   what didn't install, so a push that reached a machine left the config
-//!   there, and one that didn't names it. A verb on an unchanged root
-//!   pushes the log again: the retry.
+//!   there, and one that didn't names it. The machines a version's push
+//!   missed are kept in memory ([`CONFIG_MISSED`]): a verb on an unchanged
+//!   root pushes the log again to those only, the retry, and to none when
+//!   none is kept.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -273,45 +276,137 @@ fn follow(ctx: &Ctx, taken: &membership_api::Taken) {
 /// [`sign`], then [`push`] over the links as they are, then [`follow`].
 fn sign_and_push(ctx: &Ctx, me: &str, stored: Stored, op: Op) -> Result<(Stored, Vec<String>, Vec<Missed>), ApiError> {
     let taken = sign(ctx, me, stored, op)?;
-    let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None, false)).unwrap_or_default();
+    let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None)).unwrap_or_default();
     follow(ctx, &taken);
     Ok((taken.stored, pushed, unpushed))
 }
 
-/// `stored` sent to every machine `links` holds but `except`
+/// One machine's outcome of a `fleet.sync` ([`sync_each`]).
+enum Reply {
+    /// It answered: it took the log. Its answer, or why it doesn't parse.
+    Answered(Result<Synced, String>),
+    /// No answer: its link isn't up, or the call failed or timed out.
+    Unreached(String),
+}
+
+/// `stored` sent to each machine `links` holds that `to` picks
 /// (`fleet.sync`, one at a time, each answer waited for up to
-/// [`SYNC_WAIT`]): those it reached, and those it didn't, with why. An
-/// answered machine took the log, and holds every config head of `stored`
-/// installed unless its answer says an install failed
-/// (`Synced::install_error`). With `config` (a config version's push,
-/// [`sign_config`]) such a machine is a miss, its error the answer's;
-/// without (a membership change, a flood) it's reached: the change is
-/// there. Either way an answered one's link lists its roots again
-/// (`Handle::relist`).
-pub fn push(links: &Handle, stored: &Stored, except: Option<&str>, config: bool) -> (Vec<String>, Vec<Missed>) {
-    let params = match serde_json::to_value(stored.to_wire()) {
-        Ok(v) => v,
-        Err(e) => return (Vec::new(), vec![Missed { name: "*".into(), error: format!("cannot encode the log: {e}") }]),
-    };
-    let (mut pushed, mut missed) = (Vec::new(), Vec::new());
+/// [`SYNC_WAIT`]), with each one's [`Reply`]; an answered one's link
+/// lists its roots again (`Handle::relist`). `Err` when the log doesn't
+/// encode, nothing sent.
+fn sync_each(links: &Handle, stored: &Stored, to: impl Fn(&str) -> bool) -> Result<Vec<(String, Reply)>, String> {
+    let params = serde_json::to_value(stored.to_wire()).map_err(|e| format!("cannot encode the log: {e}"))?;
+    let mut replies = Vec::new();
     for entry in links.entries() {
-        if except == Some(entry.name.as_str()) {
+        if !to(&entry.name) {
             continue;
         }
-        match leave::call_on_within(links, &entry.name, "fleet.sync", params.clone(), SYNC_WAIT) {
+        let reply = match leave::call_on_within(links, &entry.name, "fleet.sync", params.clone(), SYNC_WAIT) {
             Ok(v) => {
                 links.relist(&entry.name);
-                match serde_json::from_value::<Synced>(v) {
-                    _ if !config => pushed.push(entry.name),
-                    Ok(Synced { install_error: Some(error), .. }) => missed.push(Missed { name: entry.name, error }),
-                    Ok(_) => pushed.push(entry.name),
-                    Err(e) => missed.push(Missed { name: entry.name, error: format!("fleet.sync: unexpected answer: {e}") }),
-                }
+                Reply::Answered(serde_json::from_value::<Synced>(v).map_err(|e| e.to_string()))
             }
-            Err(error) => missed.push(Missed { name: entry.name, error }),
+            Err(error) => Reply::Unreached(error),
+        };
+        replies.push((entry.name, reply));
+    }
+    Ok(replies)
+}
+
+/// `stored` sent to every machine `links` holds but `except`
+/// ([`sync_each`]): those it reached, and those it didn't, with why. An
+/// answered machine is reached (a membership change, a flood: the change
+/// is there), whatever its answer says of configs; a config version's push
+/// is [`push_config`].
+pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<String>, Vec<Missed>) {
+    let replies = match sync_each(links, stored, |n| except != Some(n)) {
+        Ok(r) => r,
+        Err(error) => return (Vec::new(), vec![Missed { name: "*".into(), error }]),
+    };
+    let (mut pushed, mut missed) = (Vec::new(), Vec::new());
+    for (name, reply) in replies {
+        match reply {
+            Reply::Answered(_) => pushed.push(name),
+            Reply::Unreached(error) => missed.push(Missed { name, error }),
         }
     }
     (pushed, missed)
+}
+
+/// Why a config version's push left a machine without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissKind {
+    /// No answer (its link down, the call failed or timed out): the log,
+    /// and so the version, may not be there.
+    NotReached,
+    /// It answered without the version installed (`Synced::install_error`),
+    /// or with an answer that doesn't parse.
+    NotInstalled,
+}
+
+/// A machine a config version's push ([`push_config`]) missed, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigMiss {
+    pub name: String,
+    pub error: String,
+    pub kind: MissKind,
+}
+
+/// A config version's push ([`sign_config`]): `stored` sent to every
+/// machine `links` holds, or only to `only`'s ([`sync_each`]). The
+/// machines it missed: not reached, or answered without every config head
+/// of `stored` installed. A machine missing from the answer has it.
+fn push_config(links: &Handle, stored: &Stored, only: Option<&BTreeSet<String>>) -> Vec<ConfigMiss> {
+    let replies = match sync_each(links, stored, |n| only.is_none_or(|o| o.contains(n))) {
+        Ok(r) => r,
+        Err(error) => return vec![ConfigMiss { name: "*".into(), error, kind: MissKind::NotReached }],
+    };
+    let miss = |name, error, kind| Some(ConfigMiss { name, error, kind });
+    replies
+        .into_iter()
+        .filter_map(|(name, reply)| match reply {
+            Reply::Unreached(error) => miss(name, error, MissKind::NotReached),
+            Reply::Answered(Ok(Synced { install_error: Some(error), .. })) => miss(name, error, MissKind::NotInstalled),
+            Reply::Answered(Ok(_)) => None,
+            Reply::Answered(Err(e)) => miss(name, format!("fleet.sync: unexpected answer: {e}"), MissKind::NotInstalled),
+        })
+        .collect()
+}
+
+/// Per `(member.toml, root name)` (one daemon's data dir, so daemons
+/// sharing a process, as tests do, keep theirs apart): the version a
+/// config root's last push was of, and the machines it missed
+/// ([`push_config`]); none kept when it missed none. What a verb on the
+/// unchanged root re-sends to ([`sign_config`]). In memory only: a
+/// restarted daemon forgets it, and a link-up follows the configs anyway
+/// (`Ctx::log_from`).
+static CONFIG_MISSED: Mutex<Missing> = Mutex::new(BTreeMap::new());
+
+type Missing = BTreeMap<(PathBuf, String), (u64, BTreeSet<String>)>;
+
+/// `key`'s machines kept in `map` as missing `version` (pure); none when
+/// what's kept is another version's.
+fn missing(map: &Missing, key: &(PathBuf, String), version: u64) -> BTreeSet<String> {
+    map.get(key).filter(|(v, _)| *v == version).map(|(_, m)| m.clone()).unwrap_or_default()
+}
+
+/// `missed`, a push of `key`'s `version`, kept in `map` as what it misses
+/// (pure), unless a newer version's is kept (a sign that raced a re-send);
+/// nothing missed drops the key.
+fn keep_missing(map: &mut Missing, key: (PathBuf, String), version: u64, missed: &[ConfigMiss]) {
+    if map.get(&key).is_some_and(|(v, _)| *v > version) {
+        return;
+    }
+    let names: BTreeSet<String> = missed.iter().map(|m| m.name.clone()).collect();
+    if names.is_empty() {
+        map.remove(&key);
+    } else {
+        map.insert(key, (version, names));
+    }
+}
+
+fn config_missed() -> std::sync::MutexGuard<'static, Missing> {
+    CONFIG_MISSED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// On the authority: `name`'s key revoked (signed, unless the log already
@@ -320,7 +415,7 @@ pub fn push(links: &Handle, stored: &Stored, except: Option<&str>, config: bool)
 pub fn revoke(ctx: &Ctx, name: &str) -> Result<Signed, ApiError> {
     let (me, stored) = on_authority(ctx)?;
     let (pushed, unpushed) = if stored.log.revoked_name(name) {
-        ctx.links.as_ref().map(|l| push(l, &stored, None, false)).unwrap_or_default()
+        ctx.links.as_ref().map(|l| push(l, &stored, None)).unwrap_or_default()
     } else {
         let m = stored.log.membership().expect("on_authority checked");
         if !m.members.contains_key(name) {
@@ -377,11 +472,12 @@ fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiErro
 pub enum ConfigSigned {
     /// Signed and pushed; `unpushed` are the machines that don't have
     /// `version`: the push didn't reach them, or their install failed
-    /// ([`push`]). A machine it reached installed it.
-    Signed { root: String, version: u64, unpushed: Vec<Missed> },
-    /// The root unchanged (`version` its head), the log pushed again: the
-    /// retry for a machine that lacks it. `unpushed` as for `Signed`.
-    Resent { root: String, version: u64, unpushed: Vec<Missed> },
+    /// ([`push_config`]). A machine it reached installed it.
+    Signed { root: String, version: u64, unpushed: Vec<ConfigMiss> },
+    /// The root unchanged (`version` its head), the log pushed again to
+    /// the machines the last push missed ([`CONFIG_MISSED`]): the retry.
+    /// `unpushed` as for `Signed`, those it missed again.
+    Resent { root: String, version: u64, unpushed: Vec<ConfigMiss> },
     Failed { root: String, error: String },
     /// This host is in a fleet but isn't its authority `authority`: what
     /// it types signs nothing. Never for a root that is a signed config
@@ -395,21 +491,29 @@ impl ConfigSigned {
     }
 
     /// Its `serve.log` lines (pure): a sign, and in one more line the
-    /// machines its push missed; a failure. A non-authority logs nothing
-    /// (said to the verb only).
+    /// machines its push missed; a re-send's misses; a failure. A
+    /// non-authority logs nothing (said to the verb only).
     pub fn log_lines(&self) -> Vec<String> {
+        let listed = |unpushed: &[ConfigMiss]| {
+            let missed: Vec<String> = unpushed
+                .iter()
+                .map(|m| match m.kind {
+                    MissKind::NotReached => format!("{} (not reached: {})", m.name, m.error),
+                    MissKind::NotInstalled => format!("{} ({})", m.name, m.error),
+                })
+                .collect();
+            missed.join(", ")
+        };
         match self {
             ConfigSigned::Signed { root, version, unpushed } => {
                 let mut lines = vec![format!("signed config `{root}` v{version}")];
                 if !unpushed.is_empty() {
-                    let missed: Vec<String> = unpushed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
-                    lines.push(format!("config `{root}` v{version} not pushed to {}", missed.join(", ")));
+                    lines.push(format!("config `{root}` v{version} not pushed to {}", listed(unpushed)));
                 }
                 lines
             }
             ConfigSigned::Resent { root, version, unpushed } if !unpushed.is_empty() => {
-                let missed: Vec<String> = unpushed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
-                vec![format!("config `{root}` v{version} re-sent, not installed on {}", missed.join(", "))]
+                vec![format!("config `{root}` v{version} re-sent, still missing on {}", listed(unpushed))]
             }
             ConfigSigned::Failed { root, error } => vec![format!("config `{root}` not signed: {error}")],
             ConfigSigned::Resent { .. } | ConfigSigned::NotAuthority { .. } => Vec::new(),
@@ -418,21 +522,21 @@ impl ConfigSigned {
 
     /// The `note:` lines a verb's output starts with (pure).
     pub fn notes(&self) -> Vec<String> {
+        let missed = |root: &str, version: u64, m: &ConfigMiss| match m.kind {
+            MissKind::NotReached => format!("note: `{}` not reached, config `{root}` v{version} not sent: {}", m.name, m.error),
+            MissKind::NotInstalled => format!("note: `{}` doesn't have config `{root}` v{version}: {}", m.name, m.error),
+        };
         match self {
             ConfigSigned::Signed { root, version, unpushed } => {
                 let mut lines = vec![format!("note: signed config `{root}` v{version}")];
-                lines.extend(
-                    unpushed.iter().map(|m| format!("note: `{}` doesn't have config `{root}` v{version}: {}", m.name, m.error)),
-                );
+                lines.extend(unpushed.iter().map(|m| missed(root, *version, m)));
                 lines
             }
-            // Every machine has it: nothing to say.
+            // Every machine it went to has it now: nothing to say.
             ConfigSigned::Resent { unpushed, .. } if unpushed.is_empty() => Vec::new(),
             ConfigSigned::Resent { root, version, unpushed } => {
                 let mut lines = vec![format!("note: config `{root}` v{version} re-sent")];
-                lines.extend(
-                    unpushed.iter().map(|m| format!("note: `{}` doesn't have config `{root}` v{version}: {}", m.name, m.error)),
-                );
+                lines.extend(unpushed.iter().map(|m| missed(root, *version, m)));
                 lines
             }
             ConfigSigned::Failed { root, error } => vec![format!("note: config `{root}` not signed: {error}")],
@@ -484,12 +588,15 @@ pub fn authority_root(ctx: &Ctx, name: &str) -> Option<PathBuf> {
 /// (absolute) bundled ([`mesh::collect`]) and, when the bundle's hash isn't
 /// the root's latest `config` entry's, the bundle stored
 /// ([`mesh::store`], next to `member.toml`) then signed as the next
-/// version (1 for the first) and pushed. `None`, nothing bundled: this
+/// version (1 for the first) and pushed, the machines the push missed
+/// kept ([`CONFIG_MISSED`]). `None`, nothing bundled: this
 /// host is in no fleet, or `root` holds no config file (the verb says
 /// why). When the hash is the latest's, nothing is signed but the bundle
-/// is stored again and the log pushed again (`Resent`; `None` with no
-/// links): a machine whose last install failed, or that the last push
-/// missed, retries it now, and one that has it answers at once. `NotAuthority` when
+/// is stored again, and the log pushed again to the machines the last
+/// push of the version missed, those it misses again kept (`Resent`;
+/// `None` with none kept or no links): a machine whose last install
+/// failed, or that the last push didn't reach, retries it now, and the
+/// verb waits on no other. `NotAuthority` when
 /// this host is in a fleet whose authority is another member, unless
 /// `root` is a signed config's copy here ([`mesh::copy_of`], the copy
 /// itself): that one is signed, by the authority. A config
@@ -543,7 +650,15 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
         if let Err(e) = mesh::store(data, &bundle) {
             return Some(ConfigSigned::failed(name, format!("{e:#}")));
         }
-        let (_, unpushed) = ctx.links.as_ref().map(|l| push(l, &stored, None, true))?;
+        let links = ctx.links.as_ref()?;
+        let key = (path.to_path_buf(), name.to_string());
+        let due = missing(&config_missed(), &key, version);
+        if due.is_empty() {
+            return None;
+        }
+        // `*`: the last push didn't encode the log, so it reached no one.
+        let unpushed = push_config(links, &stored, (!due.contains("*")).then_some(&due));
+        keep_missing(&mut config_missed(), key, version, &unpushed);
         return Some(ConfigSigned::Resent { root: name.into(), version, unpushed });
     }
     match mesh::bind(data, name, &canon) {
@@ -560,7 +675,8 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
         Ok(t) => t,
         Err(e) => return Some(ConfigSigned::failed(name, e.message)),
     };
-    let (_, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None, true)).unwrap_or_default();
+    let unpushed = ctx.links.as_ref().map(|l| push_config(l, &taken.stored, None)).unwrap_or_default();
+    keep_missing(&mut config_missed(), (path.to_path_buf(), name.to_string()), version, &unpushed);
     follow(ctx, &taken);
     Some(ConfigSigned::Signed { root: name.into(), version, unpushed })
 }
@@ -677,7 +793,7 @@ pub fn rotate(ctx: &Ctx) -> Result<Rotation, ApiError> {
             // and holds the old key, which its log still lists), so every
             // peer holds the `rotate` before the links end and redial
             // proving the new key.
-            let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None, false)).unwrap_or_default();
+            let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None)).unwrap_or_default();
             follow(ctx, &taken);
             let signed = Signed { name: me, change: what, pushed, unpushed, removed: None, error: None };
             Ok(Rotation::Rotated(Rotated { key: key_text, fingerprint, signed }))
@@ -794,7 +910,7 @@ pub fn push_introduction(ctx: &Ctx, name: &str) {
     let joiner = name.to_string();
     let thread = std::thread::Builder::new().name("serve-fleet-intro".into()).spawn(move || {
         let name = joiner;
-        let (pushed, missed) = push(&links, &stored, None, false);
+        let (pushed, missed) = push(&links, &stored, None);
         let missed: Vec<String> = missed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
         crate::serve::daemon::log(&format!(
             "introduced `{name}`: membership sent to [{}]{}",
@@ -849,8 +965,10 @@ fn queue(params: Value, from: &str, ctx: &Ctx) -> Answer {
 /// followed, and the log sent on to every other machine this host holds,
 /// off the request thread. When it promoted this host's next key (a
 /// rotate of it is in) or moved this host's hub, the log is sent on
-/// before answering, nothing installed, and every link ends once the
-/// answer is out
+/// before answering, nothing installed (a config due answers an
+/// `install_error` saying it installs after the link cycles, so a config
+/// push counts this host missed), and every link ends once the answer is
+/// out
 /// (`After::Rotated`: redialing to prove the new key; `After::Hub`: the
 /// hub followed, redialing to say it); the redial's link-up follows the
 /// configs. Changed or not, `from`'s link here lists its roots again
@@ -878,10 +996,10 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
         (false, false) => None,
     };
     let data = path.parent().expect("member.toml has a parent");
-    let install_error = if follow.is_none() && configs_due(data, &config_heads(Some(&taken.stored))) {
-        (ctx.log_from)(from).err()
-    } else {
-        None
+    let install_error = match (&follow, configs_due(data, &config_heads(Some(&taken.stored)))) {
+        (None, true) => (ctx.log_from)(from).err(),
+        (Some(_), true) => Some("its configs install after the link cycles (this sync moved its hub or rotated its key)".into()),
+        (_, false) => None,
     };
     if taken.changed {
         if let Some(links) = ctx.links.clone() {
@@ -929,7 +1047,7 @@ fn configs_due(data: &Path, heads: &BTreeMap<String, (u64, [u8; 32])>) -> bool {
 /// `stored`, newer than what `from` sent had here, sent on to every other
 /// machine `links` holds, logged.
 fn flood(links: &Handle, stored: &Stored, from: &str) {
-    let (pushed, missed) = push(links, stored, Some(from), false);
+    let (pushed, missed) = push(links, stored, Some(from));
     let missed: Vec<String> = missed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
     crate::serve::daemon::log(&format!(
         "fleet.sync from {from}: newer membership entries ({}) sent on to [{}]{}",
@@ -990,7 +1108,10 @@ mod tests {
     use crate::serve::endpoint;
     use crate::serve::fleet::mesh;
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
-    use super::{Change, ConfigSigned, Missed, Op, RotatePlan, can_rotate, configs_due, countersign_rotate, plan_hub, plan_introduction, plan_rotate};
+    use super::{
+        Change, ConfigMiss, ConfigSigned, MissKind, Missing, Op, RotatePlan, can_rotate, configs_due, countersign_rotate, keep_missing, missing,
+        plan_hub, plan_introduction, plan_rotate,
+    };
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
     use crate::serve::fleet::member::{Member, write_for_test};
     use crate::serve::fleet::membership::{Introduction, Stored};
@@ -1242,30 +1363,49 @@ mod tests {
         (answer, notes)
     }
 
-    /// A sign's notes: the version, then each machine that doesn't have
-    /// it and why; a failure's error; a non-authority naming the authority.
-    /// Logged: the sign, the missed machines in one line, a failure.
+    fn miss(name: &str, error: &str, kind: MissKind) -> ConfigMiss {
+        ConfigMiss { name: name.into(), error: error.into(), kind }
+    }
+
+    /// A sign's notes: the version, then each machine not reached or that
+    /// doesn't have it, and why; a failure's error; a non-authority naming
+    /// the authority. Logged: the sign, the missed machines in one line, a
+    /// failure.
     #[test]
     fn config_signed_notes() {
         let signed = ConfigSigned::Signed { root: "cfg".into(), version: 3, unpushed: vec![] };
         assert_eq!(signed.notes(), ["note: signed config `cfg` v3"]);
         assert_eq!(signed.log_lines(), ["signed config `cfg` v3"]);
-        let missed = vec![Missed { name: "box".into(), error: "down".into() }, Missed { name: "pi".into(), error: "timed out".into() }];
+        let missed = vec![miss("box", "its link isn't up", MissKind::NotReached), miss("pi", "no disk", MissKind::NotInstalled)];
         let signed = ConfigSigned::Signed { root: "cfg".into(), version: 3, unpushed: missed };
         assert_eq!(
             signed.notes(),
             [
                 "note: signed config `cfg` v3",
-                "note: `box` doesn't have config `cfg` v3: down",
-                "note: `pi` doesn't have config `cfg` v3: timed out",
+                "note: `box` not reached, config `cfg` v3 not sent: its link isn't up",
+                "note: `pi` doesn't have config `cfg` v3: no disk",
             ]
         );
-        assert_eq!(signed.log_lines(), ["signed config `cfg` v3", "config `cfg` v3 not pushed to box (down), pi (timed out)"]);
+        assert_eq!(
+            signed.log_lines(),
+            ["signed config `cfg` v3", "config `cfg` v3 not pushed to box (not reached: its link isn't up), pi (no disk)"]
+        );
         let resent = ConfigSigned::Resent { root: "cfg".into(), version: 3, unpushed: vec![] };
         assert_eq!((resent.notes(), resent.log_lines()), (Vec::<String>::new(), Vec::<String>::new()), "all have it");
-        let resent = ConfigSigned::Resent { root: "cfg".into(), version: 3, unpushed: vec![Missed { name: "box".into(), error: "no disk".into() }] };
-        assert_eq!(resent.notes(), ["note: config `cfg` v3 re-sent", "note: `box` doesn't have config `cfg` v3: no disk"]);
-        assert_eq!(resent.log_lines(), ["config `cfg` v3 re-sent, not installed on box (no disk)"]);
+        let resent = ConfigSigned::Resent {
+            root: "cfg".into(),
+            version: 3,
+            unpushed: vec![miss("box", "no disk", MissKind::NotInstalled), miss("pi", "timed out", MissKind::NotReached)],
+        };
+        assert_eq!(
+            resent.notes(),
+            [
+                "note: config `cfg` v3 re-sent",
+                "note: `box` doesn't have config `cfg` v3: no disk",
+                "note: `pi` not reached, config `cfg` v3 not sent: timed out",
+            ]
+        );
+        assert_eq!(resent.log_lines(), ["config `cfg` v3 re-sent, still missing on box (no disk), pi (not reached: timed out)"]);
         let failed = ConfigSigned::Failed { root: "cfg".into(), error: "bad toml".into() };
         assert_eq!(failed.notes(), ["note: config `cfg` not signed: bad toml"]);
         assert_eq!(failed.log_lines(), ["config `cfg` not signed: bad toml"]);
@@ -1275,6 +1415,25 @@ mod tests {
             ["note: config `cfg` not signed: the fleet's authority is `lap`, not this host, and configs here aren't signed"]
         );
         assert_eq!(other.log_lines(), Vec::<String>::new());
+    }
+
+    /// A push's misses are kept per key and version: another version's
+    /// aren't due, a push missing none drops them, an older version's
+    /// push (a re-send racing a sign) never overwrites a newer's.
+    #[test]
+    fn a_config_pushs_misses_are_kept_by_version() {
+        let mut map = Missing::new();
+        let (a, b) = (("/m".into(), "cfg".to_string()), ("/n".into(), "cfg".to_string()));
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<std::collections::BTreeSet<_>>();
+        assert!(missing(&map, &a, 1).is_empty());
+        keep_missing(&mut map, a.clone(), 1, &[miss("box", "down", MissKind::NotReached), miss("pi", "x", MissKind::NotInstalled)]);
+        assert_eq!(missing(&map, &a, 1), names(&["box", "pi"]));
+        assert!(missing(&map, &a, 2).is_empty() && missing(&map, &b, 1).is_empty(), "another version, another daemon");
+        keep_missing(&mut map, a.clone(), 2, &[miss("pi", "x", MissKind::NotInstalled)]);
+        keep_missing(&mut map, a.clone(), 1, &[]);
+        assert_eq!(missing(&map, &a, 2), names(&["pi"]), "v1's re-send raced v2's sign");
+        keep_missing(&mut map, a.clone(), 2, &[]);
+        assert!(map.is_empty(), "none missed: dropped");
     }
 
     /// `lap` (L), the authority: a `start` typed there signs its root's
@@ -1673,7 +1832,10 @@ mod tests {
     /// unchanged root: nothing signed, the log re-sent, box still named. A
     /// membership change (a revoke of `yan`) meanwhile counts box reached:
     /// it took the entry. Once box can install, the next verb's push gets
-    /// it installed, and says nothing.
+    /// it installed, and says nothing. Box then out of the missed set, a
+    /// verb on the unchanged root sends nothing: K's `installed.toml`,
+    /// removed, isn't rewritten, as a `fleet.sync` would (its install
+    /// retried).
     #[test]
     fn the_authoritys_verbs_resend_a_config_a_machine_lacks() {
         let pair = pair("changes-config-resend", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key()), ("yan", pk(8))]));
@@ -1710,10 +1872,18 @@ mod tests {
         let signed = head();
 
         std::fs::remove_file(k_data.join("mesh/tree")).unwrap();
-        let (_, notes) = verb_notes(&pair.l_dir, "start", params);
+        let (_, notes) = verb_notes(&pair.l_dir, "start", params.clone());
         assert_eq!(notes, Vec::<String>::new(), "every machine has it: nothing said");
         assert_eq!(head(), signed);
         assert_eq!(mesh::verify(&k_data, "cfg", Some((1, hash))).map_err(|e| format!("{e:#}")), Ok(()), "the re-send installed it");
+
+        let installed = k_data.join("mesh/installed.toml");
+        std::fs::remove_file(&installed).unwrap();
+        assert!(configs_due(&k_data, &[("cfg".to_string(), (1, hash))].into()), "a sync would install it again");
+        let (answered, notes) = verb_notes(&pair.l_dir, "start", params);
+        assert!(answered.is_some());
+        assert_eq!(notes, Vec::<String>::new());
+        assert!(!installed.exists(), "nothing missed: no fleet.sync sent");
         pair.finish();
     }
 

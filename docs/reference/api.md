@@ -1059,8 +1059,12 @@ feature), a root inside a copy, not the copy, or anything else under
 [fleet](../architecture/daemon/fleet.md#approvals-and-pushes), *Config
 versions*): a `run`, `rebuild` or `start` output starts with `stderr`
 lines saying what signing did: ``note: signed config `<name>` v<N>``
-and ``note: `<machine>` doesn't have config `<name>` v<N>: <why>`` per
-machine the push missed, ``note: config `<name>` not signed: <why>``,
+and, per machine the push missed, ``note: `<machine>` not reached,
+config `<name>` v<N> not sent: <why>`` or ``note: `<machine>` doesn't
+have config `<name>` v<N>: <why>`` (it answered, its install failed);
+``note: config `<name>` v<N> re-sent`` then the same lines when an
+unchanged root re-sends to machines the last push missed;
+``note: config `<name>` not signed: <why>``,
 or, once per root per daemon on a member that isn't the authority, for
 a root that isn't a signed config (a local root that isn't its copy
 under `mesh/tree/`; with `machine`, a root whose name isn't a config in

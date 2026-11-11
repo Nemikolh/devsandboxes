@@ -644,10 +644,12 @@ is frozen: no new work on it.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::ties`
 - A push of a signed config blocks the authority's verb until each
   machine has installed it, one machine after another (up to
-  `SYNC_WAIT`, 10 min, each). Every verb on an unchanged root re-sends
-  the log, so one blocks the same way while a machine retries a due
-  install.
-  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `changes::push`, `changes::SYNC_WAIT`
+  `SYNC_WAIT`, 10 min, each). That's a new version's push, and a verb on
+  an unchanged root re-sending to the machines the last push missed: one
+  of those whose link is half-open blocks each such verb the full wait
+  and stalls that link's other calls, and one whose link is down is
+  named on every such verb until it's reached.
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `changes::push_config`, `changes::SYNC_WAIT`
 - The dashboard drops a verb's config signing notes (all its output), and
   under `-d` the CLI shows only its `note:` lines.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `tui::spawn_verb`, `verbs_client::held_notes`
