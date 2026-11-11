@@ -53,11 +53,9 @@ use super::service::Handle;
 use crate::serve::api::{ApiError, parse};
 use crate::serve::fleet::identity::{FileKeyStore, KeyStore, PublicKey, Signer, SigningKey};
 use crate::serve::fleet::member::{self, Hub};
-use sha2::{Digest, Sha256};
-
-use crate::serve::fleet::code;
-use crate::serve::fleet::membership::{self, CONFIG_AT, Op, Stored, Wire, countersign_rotate};
+use crate::serve::fleet::membership::{self, Op, Stored, Wire, countersign_rotate};
 use crate::serve::fleet::membership_api;
+use crate::serve::fleet::mesh;
 use crate::serve::fleet::proposals::{self, Change, Proposal};
 
 type Answer = Result<Value, ApiError>;
@@ -351,11 +349,13 @@ impl ConfigSigned {
 }
 
 /// Before a `run`/`rebuild`/`start` typed here: config root `root`
-/// (absolute) packed (`code::pack_root` at [`CONFIG_AT`]) and, when its
-/// sha256 isn't the root's latest `config` entry's, signed as the next
-/// version (1 for the first) and pushed. `None`, nothing packed: this
+/// (absolute) bundled ([`mesh::collect`]) and, when the bundle's hash isn't
+/// the root's latest `config` entry's, the bundle stored
+/// ([`mesh::store`], next to `member.toml`) then signed as the next
+/// version (1 for the first) and pushed. `None`, nothing bundled: this
 /// host isn't the authority of a fleet, or `root` holds no config file
-/// (the verb says why). `None` too when the hash is the latest's.
+/// (the verb says why). `None` too when the hash is the latest's. A config
+/// that doesn't load is `Failed`, nothing signed.
 pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     let path = leave::member_toml(ctx).ok()?;
     let (me, key) = membership_api::own(path, &ctx.hostname).ok()?;
@@ -369,14 +369,18 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     if let Err(e) = membership::check_root_name(name) {
         return Some(ConfigSigned::failed(name, format!("config root {}: {e:#}", root.display())));
     }
-    let tar = match code::pack_root(root, Path::new(CONFIG_AT)) {
-        Ok(tar) => tar,
+    let bundle = match mesh::collect(root) {
+        Ok(b) => b,
         Err(e) => return Some(ConfigSigned::failed(name, format!("{e:#}"))),
     };
-    let hash: [u8; 32] = Sha256::digest(&tar).into();
+    let hash = bundle.hash();
     let current = stored.log.membership().expect("checked").config.get(name).copied();
     if current.is_some_and(|(_, h)| h == hash) {
         return None;
+    }
+    let data = path.parent().expect("member.toml has a parent");
+    if let Err(e) = mesh::store(data, &bundle) {
+        return Some(ConfigSigned::failed(name, format!("{e:#}")));
     }
     let version = current.map_or(1, |(v, _)| v + 1);
     match sign_and_push(ctx, &me, stored, Op::Config { root: name.into(), version, hash }) {
@@ -864,9 +868,10 @@ mod tests {
     }
 
     /// `lap` (L), the authority: a `start` typed there signs its root's
-    /// `config` v1 first and pushes it to K (`box`); the same contents sign
-    /// nothing; an edit is v2, signed by a `rebuild` as by `start`. A root
-    /// that won't pack signs nothing, the verb answered anyway. K's verbs
+    /// `config` v1 first, its bundle stored, and pushes it to K (`box`); the
+    /// same structure (a comment, a note in the root) signs nothing; a
+    /// structural edit is v2, signed by a `rebuild` as by `start`. A config
+    /// that won't load signs nothing, the verb answered anyway. K's verbs
     /// (not the authority), `stop`, a relative root and a root with no
     /// config file sign nothing.
     #[test]
@@ -888,9 +893,13 @@ mod tests {
         assert_eq!(config(&k_toml), v1, "signed and pushed");
         let signed = head(&l_toml);
         assert_eq!(head(&k_toml), signed);
+        let bundle = |v: &Option<(u64, String)>| pair.base.join(format!("l-data/mesh/bundles/{}.tar", v.as_ref().unwrap().1));
+        assert!(bundle(&v1).is_file(), "the bundle stored");
 
+        std::fs::write(root.join("devsandboxes.toml"), "# a comment\n[sandbox.a]\n").unwrap();
+        std::fs::write(root.join("notes.md"), "notes").unwrap();
         assert!(verb_answered(&pair.l_dir, "start", params.clone()));
-        assert_eq!(head(&l_toml), signed, "unchanged: nothing signed");
+        assert_eq!(head(&l_toml), signed, "unchanged structure: nothing signed");
         assert!(verb_answered(&pair.l_dir, "stop", params.clone()));
         assert_eq!(head(&l_toml), signed, "stop never signs");
         assert!(verb_answered(&pair.l_dir, "start", json!({"root": "cfg", "env": {}, "instance": "nope"})));
@@ -907,11 +916,12 @@ mod tests {
         assert_eq!(v2.0, 2);
         assert_ne!(Some(&v2), v1.as_ref());
         assert_eq!(config(&k_toml), Some(v2.clone()));
+        assert!(bundle(&Some(v2.clone())).is_file());
 
-        std::os::unix::fs::symlink("../elsewhere", root.join("out")).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.c\n").unwrap();
         let signed = head(&l_toml);
         assert!(verb_answered(&pair.l_dir, "start", params), "the verb runs anyway");
-        assert_eq!((head(&l_toml), config(&l_toml)), (signed, Some(v2)), "won't pack: nothing signed");
+        assert_eq!((head(&l_toml), config(&l_toml)), (signed, Some(v2)), "won't load: nothing signed");
         pair.finish();
     }
 

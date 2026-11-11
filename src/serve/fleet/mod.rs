@@ -79,6 +79,7 @@ pub mod link;
 pub mod member;
 pub mod membership;
 pub mod membership_api;
+pub mod mesh;
 pub mod place;
 pub mod placed;
 pub mod placements;

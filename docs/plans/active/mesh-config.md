@@ -142,6 +142,14 @@ env, bolt-restate's `packages/*/.env`.
 - Files a config reaches only through a command (the dispatcher's code
   in `dispatcher/`, started by `postStartCommand`) aren't referenced
   structurally, so they're neither hashed nor shipped (decision 2).
+  Nor is what a Dockerfile `COPY`s from a `build.context` of `.` (the
+  root itself is never bundled), nor a reference written as an absolute
+  path or through another variable (`mesh::collect`).
+- For step 3: `run`'s `ensure_bind_source` creates a missing
+  `${configDir}/…` source, and a read-write `${configDir}` mount lets a
+  container write one; either changes the recomputed hash of a copy, so
+  the admission check must recompute over the bundle's own file list
+  (or a marker), not re-collect blindly.
 
 ## Not in this plan
 

@@ -1788,10 +1788,10 @@ hash chain of entries only the authority signs
   member holding the first one's log), `add {name, key}`,
   `revoke {name, key}`, `rotate {name, old, new, by_old}`, `hub
   {name}` and `config {root, version, hash}` (a config root's version:
-  `root` its directory's name (`membership::check_root_name`), `hash` the
-  sha256 of the root packed by `code::pack_root` at
-  `membership::CONFIG_AT`, a fixed name, so the hash is the root's
-  contents, not where it is; `version` 8 bytes big-endian in the
+  `root` its directory's name (`membership::check_root_name`), `hash` its
+  bundle's (`mesh::Bundle::hash`, see *Config versions* below: the
+  config's structure and the files it references, by relative path, so
+  not where the root is); `version` 8 bytes big-endian in the
   payload).
   `rotate`'s `by_old` is the old key's signature
   (`countersign_rotate`, in `ROTATE_DOMAIN`) over the fleet's genesis
@@ -1939,13 +1939,38 @@ it never signs on a remote request alone (decision 49;
 - **Config versions.** The verbs typed on the authority sign them, the
   consent a local edit already takes effect by: a `run`, `rebuild` or
   `start` from a local client (the CLI, the dashboard; `Table::Full`, no
-  `machine`) first packs its config root, and when the hash isn't the
-  root's latest `config` entry's, signs the next version (1 for the
-  first) and pushes it like any change (`daemon::sign_config` over
-  `changes::sign_config`), logged in `serve.log` (the root's name
-  and version); the client isn't told. A root that won't pack or a
-  store that fails is logged too (`not signed: <why>`) and the verb runs
-  anyway. Nothing is packed off the
+  `machine`) first bundles its config root, and when the bundle's hash
+  isn't the root's latest `config` entry's, stores the bundle then signs
+  the next version (1 for the first) and pushes it like any change
+  (`daemon::sign_config` over `changes::sign_config`), logged in
+  `serve.log` (the root's name and version); the client isn't told. The
+  bundle (`fleet::mesh::collect`) is the config file plus each file
+  under the root it references: sandboxes' (merged with their templates)
+  and services' `build` dockerfile and context, bind sources written
+  `${configDir}/…` with no other variable, enabled local features. A
+  reference is bundled only when written relative to the config dir and
+  resolving (canonicalized, so a symlink out is left out) under the root,
+  not the root itself (a `build.context` of `.`), `code::ROOT_SKIPS` or a
+  `.git`; an absolute path or another variable is a host path, resolved
+  per host like `folder`; a missing one is skipped; a directory brings
+  its files. `folder`/`folders` never count. Notes, logs and other files
+  in the root are neither hashed nor bundled. The hash
+  (`mesh::Bundle::hash`) is sha256 over `mesh::HASH_DOMAIN`, the config
+  file's table as written (not merged; YAML read into the same table) in
+  a canonical encoding (key-sorted TOML: comments, whitespace and key
+  order don't count), then each referenced file in path order as
+  length-prefixed (path, exec bit, sha256 of contents); `collect` runs
+  over any dir, so the bundle's tar unpacked hashes the same. The tar
+  (`mesh::Bundle::tar`, written by `code::tar`, members at their relative
+  paths, the config file as written) is stored by hash at
+  `<data>/devsandbox/mesh/bundles/<hash>.tar` (`mesh::store`, next to
+  `member.toml`, outside `fleet/`; 0600, temp file + rename) before the
+  entry is signed, so the authority keeps every version it signed. A
+  config that doesn't load (`Config::load`, or a sandbox's merge, a
+  `build`, `mounts` or `features` that doesn't read), a bundle over
+  `code::ROOT_TAR_LIMIT` or a store that fails is logged too
+  (`not signed: <why>`) and the verb runs anyway. Nothing is bundled
+  off the
   authority or in no fleet; a verb from a link peer, one sent to a
   machine, `--in-process` ones (the dispatcher's, the in-process
   fallback) and the autostart pass never sign. Never proposed.

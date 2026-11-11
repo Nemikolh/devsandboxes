@@ -33,10 +33,6 @@ pub const INTRODUCTION_KIND: &str = "introduction";
 /// ([`countersign_rotate`]).
 pub const ROTATE_DOMAIN: &str = "devsandbox/membership-rotate/v1";
 
-/// Where a published config root sits in the tar its [`Op::Config`] hash
-/// is over: fixed, so the hash is the root's contents, not its path.
-pub const CONFIG_AT: &str = "cfg";
-
 /// A config root's name in the log: its directory's name, one path
 /// component (not `.` or `..`), no control characters.
 pub fn check_root_name(name: &str) -> Result<()> {
@@ -90,9 +86,10 @@ pub enum Op {
     /// The hub is now the member `name`.
     Hub { name: String },
     /// Config root `root` (its directory's name, [`check_root_name`]) is
-    /// now version `version`, the root packed (`code::pack_root` at
-    /// [`CONFIG_AT`]) hashing to `hash`. Versions only go up, per root: an
-    /// entry can't take a root back to an older one.
+    /// now version `version`, its bundle (`mesh::collect`: the config's
+    /// structure and the files it references) hashing to `hash`. Versions
+    /// only go up, per root: an entry can't take a root back to an older
+    /// one.
     Config {
         root: String,
         version: u64,
