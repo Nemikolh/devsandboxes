@@ -12,7 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing right now.
+- **machines**: mesh config, a signed config every member runs while
+  its authority is offline. → [plan](plans/active/mesh-config.md)
 
 ## Planned
 
