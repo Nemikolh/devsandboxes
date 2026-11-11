@@ -98,9 +98,10 @@ pub struct Ctx {
     /// link report is due at once and the snapshots' `agent` follow
     /// (`daemon::Shared`'s `graph.republish`, `publish_machines`).
     pub agent_changed: Box<dyn Fn() + Send + Sync>,
-    /// A `fleet.sync` from peer `name` made this host's log newer: the
-    /// daemon follows the signed configs from it
-    /// (`daemon::follow_configs`).
+    /// A `fleet.sync` from peer `name` moved a `config` head in this host's
+    /// log: the daemon follows the signed configs from it, returning once
+    /// they're installed or failed (`daemon::follow_configs_now`), before
+    /// the sync answers.
     pub log_from: Box<dyn Fn(&str) + Send + Sync>,
 }
 

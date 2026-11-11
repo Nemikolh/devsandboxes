@@ -39,10 +39,14 @@
 //!   authority ([`sign_config`], called by `serve::daemon`'s verb path)
 //!   first signs its config root's hash as the root's next `config`
 //!   version when it differs from the latest, and pushes it. Never
-//!   proposed: only the authority's own verbs sign.
+//!   proposed: only the authority's own verbs sign. A host the push (or a
+//!   flood) moves a head on installs it from the sender before it answers
+//!   or sends the log on ([`sync`]), so a push that reached a machine
+//!   left the config there.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,6 +63,14 @@ use crate::serve::fleet::mesh;
 use crate::serve::fleet::proposals::{self, Change, Proposal};
 
 type Answer = Result<Value, ApiError>;
+
+/// How long a push waits for each `fleet.sync` answer. A receiver whose
+/// log took a moved `config` head installs it before answering
+/// ([`sync`]): pulling a bundle of up to `code::ROOT_TAR_LIMIT` bytes from
+/// this host (each read bounded by `code::SEND_WRITE_WAIT`), unpacking and
+/// re-hashing it. Far over `Timing::call`, whose timeout would end the link
+/// mid-install; a 256 MiB bundle in 10 minutes needs about 0.45 MB/s.
+pub const SYNC_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// What a change signed on the authority did: `machines.rm`'s answer
 /// there (`type: revoked`), and `membership.approve`'s.
@@ -259,7 +271,10 @@ fn sign_and_push(ctx: &Ctx, me: &str, stored: Stored, op: Op) -> Result<(Stored,
 }
 
 /// `stored` sent to every machine `links` holds but `except`
-/// (`fleet.sync`): those it reached, and those it didn't, with why.
+/// (`fleet.sync`, one at a time, each answer waited for up to
+/// [`SYNC_WAIT`]): those it reached, and those it didn't, with why. A
+/// machine reached holds every config head `stored` moved there, installed
+/// (or its install failed, logged there).
 pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<String>, Vec<Missed>) {
     let params = match serde_json::to_value(stored.to_wire()) {
         Ok(v) => v,
@@ -270,7 +285,7 @@ pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<Strin
         if except == Some(entry.name.as_str()) {
             continue;
         }
-        match leave::call_on(links, &entry.name, "fleet.sync", params.clone()) {
+        match leave::call_on_within(links, &entry.name, "fleet.sync", params.clone(), SYNC_WAIT) {
             Ok(_) => pushed.push(entry.name),
             Err(error) => missed.push(Missed { name: entry.name, error }),
         }
@@ -578,18 +593,25 @@ fn queue(params: Value, from: &str, ctx: &Ctx) -> Answer {
 /// `fleet.sync {entries, introductions}` from `from`: merged as a link's
 /// handshake merges (self-verifying; another fleet's or a fork refused;
 /// a log revoking this host's own key taken, for the `fleet.leave` that
-/// follows it). When it made this host's log newer: `hub` followed, and
-/// the log sent on to every other machine this host holds and the signed
-/// configs followed from `from` (`Ctx::log_from`), off the request
+/// follows it). When it made this host's log newer: when it moved a
+/// `config` head ([`config_moved`]), the signed configs followed from
+/// `from` (`Ctx::log_from`: pulled and installed) before anything else, so
+/// the answer means this host has them and the hosts it sends the log on
+/// to can pull them from it; an install that fails is logged there, the
+/// sync answered all the same (the log is taken). Then `hub` followed, and
+/// the log sent on to every other machine this host holds, off the request
 /// thread. When it promoted this host's next key (a rotate of it is in) or
-/// moved this host's hub, the log is sent on before answering, and every
-/// link ends once the answer is out (`After::Rotated`: redialing to prove
-/// the new key; `After::Hub`: the hub followed, redialing to say it).
+/// moved this host's hub, the log is sent on before answering, nothing
+/// installed, and every link ends once the answer is out
+/// (`After::Rotated`: redialing to prove the new key; `After::Hub`: the
+/// hub followed, redialing to say it); the redial's link-up follows the
+/// configs.
 fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), ApiError> {
     let wire: Wire = parse(params)?;
     let theirs = Stored::from_wire(wire).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     let path = leave::member_toml(ctx)?;
     let before = api::own_member(ctx).ok().map(|(_, hub)| hub);
+    let configs_before = config_heads(membership_api::load(path).ok().flatten().as_ref());
     let taken = membership_api::sync(path, &ctx.hostname, &theirs)?;
     let head = taken.stored.log.head();
     let mut after = None;
@@ -603,6 +625,9 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
             (false, true) => Some(After::Rotated),
             (false, false) => None,
         };
+        if follow.is_none() && config_moved(&configs_before, &config_heads(Some(&taken.stored))) {
+            (ctx.log_from)(from);
+        }
         if let Some(links) = ctx.links.clone() {
             if follow.is_some() {
                 // The links end once the answer is out, so the log goes on
@@ -618,12 +643,21 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
         }
         if follow.is_none() {
             (ctx.hub_changed)(taken.hub);
-            // A cycle instead: the redial's link-up follows them.
-            (ctx.log_from)(from);
         }
         after = follow;
     }
     Ok((to_value(Synced { changed: taken.changed, head })?, after))
+}
+
+/// `stored`'s `config` heads (`Membership::config`), none without a log.
+fn config_heads(stored: Option<&Stored>) -> BTreeMap<String, (u64, [u8; 32])> {
+    stored.and_then(|s| s.log.membership()).map(|m| m.config.clone()).unwrap_or_default()
+}
+
+/// Whether a log's `config` heads went from `before` to `after` with one
+/// moved or added (pure): what [`sync`] installs before answering.
+fn config_moved(before: &BTreeMap<String, (u64, [u8; 32])>, after: &BTreeMap<String, (u64, [u8; 32])>) -> bool {
+    after.iter().any(|(name, head)| before.get(name) != Some(head))
 }
 
 /// `stored`, newer than what `from` sent had here, sent on to every other
@@ -690,7 +724,7 @@ mod tests {
     use crate::serve::endpoint;
     use crate::serve::fleet::mesh;
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
-    use super::{Change, Op, RotatePlan, can_rotate, countersign_rotate, plan_hub, plan_rotate};
+    use super::{Change, Op, RotatePlan, can_rotate, config_moved, countersign_rotate, plan_hub, plan_rotate};
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
     use crate::serve::fleet::member::{Member, write_for_test};
     use crate::serve::fleet::membership::{Introduction, Stored};
@@ -892,6 +926,18 @@ mod tests {
         pair.finish();
     }
 
+    /// A head moved or added is a move; one dropped or none changed isn't.
+    #[test]
+    fn a_config_head_moves() {
+        let heads = |list: &[(&str, u64, u8)]| list.iter().map(|(n, v, h)| (n.to_string(), (*v, [*h; 32]))).collect();
+        let before = heads(&[("a", 1, 1), ("b", 1, 2)]);
+        assert!(!config_moved(&before, &before));
+        assert!(!config_moved(&before, &heads(&[("a", 1, 1)])));
+        assert!(config_moved(&before, &heads(&[("a", 2, 3), ("b", 1, 2)])));
+        assert!(config_moved(&before, &heads(&[("a", 1, 1), ("b", 1, 2), ("c", 1, 4)])));
+        assert!(config_moved(&heads(&[]), &heads(&[("a", 1, 1)])));
+    }
+
     /// A verb `method` with `params` on the daemon at `dir`: whether it
     /// was answered (signing runs before the verb, so it's done by then).
     fn verb_answered(dir: &Path, method: &str, params: Value) -> bool {
@@ -989,7 +1035,8 @@ mod tests {
     /// `lap` (L), the authority, signs `cfg` v1 then v2 (a structural edit
     /// and a referenced file): K (`box`) takes each with the `fleet.sync`
     /// push, pulls its bundle from L over the link and installs it at
-    /// `mesh/tree/cfg/`, `installed.toml` saying so. L, whose name it is,
+    /// `mesh/tree/cfg/`, `installed.toml` saying so, before it answers: by
+    /// the time L's verb is answered, K's copy is the head. L, whose name it is,
     /// gets no copy. The copy is one of K's roots (`roots.list`); a verb
     /// that builds from it runs there while it is the head (here the test
     /// runner then fails), and is refused once it was changed in place,
@@ -1017,7 +1064,8 @@ mod tests {
         assert!(verb_answered(&pair.l_dir, "start", params.clone()));
         let (v, h1) = signed();
         assert_eq!(v, 1);
-        wait_for("v1 installed on K", Duration::from_secs(20), at(h1));
+        assert!(at(h1)(), "v1 installed on K once the push is answered");
+        assert_eq!(mesh::verify(&k_data, "cfg", Some((1, h1))).map_err(|e| format!("{e:#}")), Ok(()));
         assert_eq!(std::fs::read_to_string(tree.join("devsandboxes.toml")).unwrap(), "[sandbox.a]\n");
 
         std::fs::write(
@@ -1029,7 +1077,7 @@ mod tests {
         assert!(verb_answered(&pair.l_dir, "start", params));
         let (v, h2) = signed();
         assert_eq!(v, 2);
-        wait_for("v2 installed on K", Duration::from_secs(20), at(h2));
+        assert!(at(h2)(), "v2 installed on K once the push is answered");
         assert_eq!(std::fs::read_to_string(tree.join("mcps/x.json")).unwrap(), "{}");
         assert!(!mesh::tree_path(&l_data, "cfg").exists() && mesh::installed(&l_data).unwrap().is_empty(), "the authority's own: no copy");
 
@@ -1051,6 +1099,30 @@ mod tests {
         let inside = tree.join("mcps");
         let (code, message) = verb_answer(&pair.k_dir, "start", json!({"root": inside, "env": {}, "instance": "nope"})).unwrap().unwrap();
         assert!(code == "denied" && message.contains("inside the copy"), "{code}: {message}");
+        pair.finish();
+    }
+
+    /// A `fleet.sync` to K (`box`) moving `cfg`'s head, sent over L's link
+    /// (as L's push sends it, the bundle stored on L, L's own log left as
+    /// is): answered only once K pulled the bundle from L and installed it.
+    #[test]
+    fn a_sync_is_answered_once_its_config_is_installed() {
+        let pair = pair("changes-sync-install", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
+        up(&pair);
+        let l_toml = pair.base.join("l-data/member.toml");
+        let (k_data, l_data) = (pair.base.join("k-data"), pair.base.join("l-data"));
+        let root = pair.base.join("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let bundle = mesh::collect(&root).unwrap();
+        mesh::store(&l_data, &bundle).unwrap();
+        let mut stored = test_support::read(&l_toml).unwrap();
+        stored.log.append(Op::Config { root: "cfg".into(), version: 1, hash: bundle.hash() }, "lap", &key_of(&l_toml)).unwrap();
+
+        let r = api_to(&pair.l_dir, "box").call("fleet.sync", serde_json::to_value(stored.to_wire()).unwrap()).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        assert_eq!(r.result.unwrap()["changed"], json!(true));
+        assert_eq!(mesh::verify(&k_data, "cfg", Some((1, bundle.hash()))).map_err(|e| format!("{e:#}")), Ok(()), "installed by the answer");
         pair.finish();
     }
 
@@ -1253,7 +1325,8 @@ mod tests {
     /// Three daemons: K (`box`, the hub), L (`lap`, the authority) and P
     /// (`pi`), L and P each linked to K only. K's introduction of `new` is
     /// proposed to L and approved there; L pushes the `add` to K, which
-    /// sends it on to P (not back to L).
+    /// sends it on to P (not back to L). A config L signs is installed on K
+    /// once L's push is answered, and on P from K.
     #[test]
     fn a_sync_floods_to_a_third_host() {
         let base = scratch("changes-flood");
@@ -1299,6 +1372,18 @@ mod tests {
             test_support::read(&p_toml).unwrap().log.membership().unwrap().key_of("new") == Some(pk(8))
         });
         assert_eq!(test_support::read(&k_toml).unwrap().log.head(), test_support::read(&l_toml).unwrap().log.head());
+
+        // A config L signs: K installs it from L before answering, then
+        // sends the log on; P pulls the bundle from K (never linked to L),
+        // which has it by then.
+        let root = base.join("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        assert!(verb_answered(&l_dir, "start", json!({"root": root, "env": {}, "instance": "nope"})));
+        let (v, hash) = test_support::read(&l_toml).unwrap().log.membership().unwrap().config.get("cfg").copied().unwrap();
+        let (k_data, p_data) = (base.join("k-data"), base.join("p-data"));
+        assert_eq!(mesh::verify(&k_data, "cfg", Some((v, hash))).map_err(|e| format!("{e:#}")), Ok(()), "K installed before answering");
+        wait_for("pi installs cfg from box", Duration::from_secs(20), || mesh::verify(&p_data, "cfg", Some((v, hash))).is_ok());
 
         drop(lap);
         for (dir, daemon) in [&p_dir, &l_dir, &k_dir].into_iter().zip(daemons.into_iter().rev()) {

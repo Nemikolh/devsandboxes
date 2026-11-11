@@ -81,8 +81,7 @@ and `sign_config`. Its gaps, each a sub-step and a commit:
   never `ROOT_SKIPS`, never `.git`). References outside the root are
   host paths, resolved per host like `folder`. The hash: sha256 over the
   parsed table's canonical encoding then the sorted
-  `(relative path, sha256 of contents)` list, a fn the receiver (step
-  2) recomputes over what it unpacked. The config must load
+  `(relative path, sha256 of contents)` list, a fn the receiver (step 2) recomputes over what it unpacked. The config must load
   (`config::Config::load`) or nothing is signed (logged). The bundle
   (a tar via `code::tar`) is stored at signing by hash, under
   `<data>/devsandbox/mesh/` outside `fleet/`, so the authority can
@@ -117,7 +116,13 @@ refused by `Reach::admits`) and one dir per version.
   `mesh-bundle` (`mesh::serves`, `mesh::pull_bundle`).
 - **2b. On adoption.** Wire the pull + install into log adoption, once
   per moved head, from the peer that gave the log. No "who has hash X"
-  discovery, no `code.haves`.
+  discovery, no `code.haves`. A `fleet.sync` moving a head installs
+  before it answers and before it floods the log on
+  (`changes::sync` → `daemon::follow_configs_now`), the push waiting
+  `changes::SYNC_WAIT` per answer: a push that reached a host left the
+  config there, so the authority can go offline once it returns, and a
+  relay has the bundle before the next host pulls it. Link-up follows on
+  a thread (`daemon::follow_configs`).
 
 ### Step 3: admission on the running member
 

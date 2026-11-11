@@ -355,6 +355,8 @@ enum Cmd {
 struct Call {
     method: String,
     params: Value,
+    /// The wait for its answer ([`Timing::call`] unless the caller said).
+    wait: Duration,
     reply: Sender<Response>,
 }
 
@@ -655,19 +657,27 @@ impl Handle {
     /// response as is (its error code kept), or `not-found` for a name
     /// that's no machine here nor routed.
     pub fn forward(&self, machine: &str, method: &str, params: Value) -> Result<Response, ApiError> {
+        self.forward_within(machine, method, params, self.inner.timing.call)
+    }
+
+    /// [`Self::forward`], the answer waited for up to `wait` instead of
+    /// [`Timing::call`] (a call the far end answers only after slow work:
+    /// `fleet.sync`, which installs the configs it moved first). A call
+    /// that times out ends the link, as any does.
+    pub fn forward_within(&self, machine: &str, method: &str, params: Value, wait: Duration) -> Result<Response, ApiError> {
         let tx = self.inner.lock_links().get(machine).map(|l| l.tx.clone());
         let tx = match tx {
             Some(tx) => tx,
-            None if self.routed_one(machine).is_some() => return self.call_routed(machine, method, params),
+            None if self.routed_one(machine).is_some() => return self.call_routed(machine, method, params, wait),
             None => return Err(self.unknown(machine)),
         };
         let (reply, rx) = mpsc::channel();
         let stopping = || ApiError::internal(anyhow::anyhow!("{machine}: the link is stopping"));
-        tx.send(Cmd::Call(Call { method: method.into(), params, reply })).map_err(|_| stopping())?;
+        tx.send(Cmd::Call(Call { method: method.into(), params, wait, reply })).map_err(|_| stopping())?;
         // The thread always answers (in time or not); this bound only covers
         // a thread that's gone.
         let t = &self.inner.timing;
-        let bound = t.handshake * 2 + t.call + t.backoff_cap + Duration::from_secs(5);
+        let bound = t.handshake * 2 + wait + t.backoff_cap + Duration::from_secs(5);
         rx.recv_timeout(bound).map_err(|e| match e {
             RecvTimeoutError::Timeout => ApiError::internal(anyhow::anyhow!("{machine}: no answer")),
             RecvTimeoutError::Disconnected => stopping(),
@@ -730,20 +740,20 @@ impl Handle {
             Ok(()) => self.forward(machine, method, params).map_err(|e| e.message),
             Err(direct) => {
                 self.route_worth(machine, &direct)?;
-                self.call_routed(machine, method, params).map_err(|e| format!("{direct}; over a route: {}", e.message))
+                self.call_routed(machine, method, params, self.inner.timing.call).map_err(|e| format!("{direct}; over a route: {}", e.message))
             }
         }
     }
 
     /// `method` on routed machine `machine`: an `API` stream opened over
     /// the [`RouteDial`], the hello within [`Timing::handshake`], the call
-    /// within [`Timing::call`], then closed. No path or a failed hello is
-    /// `failed`, why.
-    fn call_routed(&self, machine: &str, method: &str, params: Value) -> Result<Response, ApiError> {
+    /// within `wait`, then closed. No path or a failed hello is `failed`,
+    /// why.
+    fn call_routed(&self, machine: &str, method: &str, params: Value, wait: Duration) -> Result<Response, ApiError> {
         let t = &self.inner.timing;
         let duplex = (self.inner.route)(machine).map_err(|e| ApiError::failed(format!("{machine}: unreachable: {e:#}")))?;
         let mut link = link::handshake(machine, duplex, t.handshake, link::Over::Link).map_err(|e| ApiError::failed(e.to_string()))?;
-        match link.conn.call_within(method, params, t.call) {
+        match link.conn.call_within(method, params, wait) {
             Ok(Some(r)) => Ok(r),
             Ok(None) => Err(ApiError::internal(anyhow::anyhow!("{machine}: timed out"))),
             Err(e) => Err(ApiError::failed(format!("{machine}: {e:#}"))),
@@ -1025,7 +1035,7 @@ impl<'a> LinkLoop<'a> {
                 }
             }
             if let Some(call) = self.pending.pop_front() {
-                let answer = link.conn.call_within(&call.method, call.params, t.call);
+                let answer = link.conn.call_within(&call.method, call.params, call.wait);
                 match answer {
                     Ok(Some(r)) => {
                         let _ = call.reply.send(r);

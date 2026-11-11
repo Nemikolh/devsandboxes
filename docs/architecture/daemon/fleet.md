@@ -2003,12 +2003,24 @@ it never signs on a remote request alone (decision 49;
   `daemon`'s transfer channel next to `code::receivers`; only a
   `<64 hex>.tar` name, a regular file); `mesh::pull_bundle` pulls one by
   hash through a `code::Transfer`, at most `code::ROOT_TAR_LIMIT`.
-  A member installs on two occasions: a `fleet.sync` from a peer that
-  made its log newer (`changes::sync`, through `Ctx::log_from`, unless
-  the sync cycles the links), and each link coming up, on either end
-  (`dialer::Dialer::linked` past the handshake, which takes a newer log
-  the peer carries; `links.inbound` on the dialed end). Each runs
-  `daemon::follow_configs` on a `serve-mesh` thread against that peer:
+  A member installs on two occasions. A `fleet.sync` from a peer that
+  moved a `config` head in its log (`changes::sync`, `changes::config_moved`,
+  unless the sync cycles the links) runs `daemon::follow_configs_now`
+  against that peer through `Ctx::log_from` on the request thread, before
+  the sync answers and before the log is sent on: the answer means the
+  receiver holds the configs (installed, or the failure logged there; the
+  sync is answered either way, the log being taken), and a relay has the
+  bundle in `bundles/` before the hosts it floods to pull from it. So an
+  authority whose push reached a machine can go offline. The push waits
+  `changes::SYNC_WAIT` (10 minutes) per answer
+  (`service::Handle::forward_within`), not `Timing::call`, whose timeout
+  ends the link. The sender's link thread is blocked meanwhile, but the
+  pull is a `TRANSFER` stream of its own that the sender's daemon serves
+  on a `serve-transfer` thread (`Shared::serve_channel`), reading
+  `bundles/` with no lock the push holds. Each link coming up, on either
+  end (`dialer::Dialer::linked` past the handshake, which takes a newer
+  log the peer carries; `links.inbound` on the dialed end), runs it on a
+  `serve-mesh` thread instead (`daemon::follow_configs`). Either way
   `mesh::follow` reads the log's `config` heads and picks (`mesh::due`)
   each name whose head isn't what `installed.toml` holds
   (`mesh::installed`) and that this host hasn't bound; its bundle is
@@ -2017,8 +2029,8 @@ it never signs on a remote request alone (decision 49;
   per process, the heads read inside, so an older log's run never
   installs after a newer one's. Each outcome goes to `serve.log`
   (installed config `<name>` vN from `<peer>`, or why not); a peer
-  without the bundle is a logged failure, and the next sync or link-up
-  tries again. So a member keeps, and runs from, the latest version it
+  without the bundle is a logged failure, and the next sync moving a
+  head or link-up tries again. So a member keeps, and runs from, the latest version it
   got while the authority is offline, and hands it on to the members
   that link to it. `mesh/installed.toml` also names the config file
   installed, apart from the referenced files the hash covers.
@@ -2063,8 +2075,9 @@ it never signs on a remote request alone (decision 49;
   merges it as a link's handshake does (self-verifying; another fleet's
   log or a fork refused; `membership_api::sync`), and when that made its
   log newer, sends it on to every other machine it holds, not back to
-  the sender: on a thread of its own, or before its answer when the
-  links end after it (a moved hub, a rotated key: above). A host that
+  the sender: on a thread of its own once any moved `config` head is
+  installed (above), or before its answer when the links end after it
+  (a moved hub, a rotated key: above). A host that
   takes nothing sends nothing on, so a push floods the connected graph
   once. A host not reached catches up at its next link's head comparison
   (`fleet::proof`).

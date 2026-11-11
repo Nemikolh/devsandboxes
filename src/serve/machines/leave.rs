@@ -404,12 +404,22 @@ pub(super) fn call(ctx: &Ctx, name: &str, method: &str, params: Value) -> Result
 /// connected: its result, or why not. What stays on direct links: a push's
 /// flood (`changes::push`) and the link reports (`fleet::reports`).
 pub(crate) fn call_on(links: &Handle, name: &str, method: &str, params: Value) -> Result<Value, String> {
-    match links.remotes().get(name) {
-        Some(m) if m.state == LinkState::Connected => {}
-        Some(m) => return Err(m.error.unwrap_or_else(|| "its link isn't up".into())),
-        None => return Err("no link to it".into()),
-    }
+    direct_up(links, name)?;
     answer_of(method, links.forward(name, method, params).map_err(|e| e.message)?)
+}
+
+/// [`call_on`], its answer waited for up to `wait` (`Handle::forward_within`).
+pub(crate) fn call_on_within(links: &Handle, name: &str, method: &str, params: Value, wait: std::time::Duration) -> Result<Value, String> {
+    direct_up(links, name)?;
+    answer_of(method, links.forward_within(name, method, params, wait).map_err(|e| e.message)?)
+}
+
+fn direct_up(links: &Handle, name: &str) -> Result<(), String> {
+    match links.remotes().get(name) {
+        Some(m) if m.state == LinkState::Connected => Ok(()),
+        Some(m) => Err(m.error.unwrap_or_else(|| "its link isn't up".into())),
+        None => Err("no link to it".into()),
+    }
 }
 
 fn answer_of(method: &str, r: crate::serve::proto::Response) -> Result<Value, String> {
