@@ -647,7 +647,9 @@ is frozen: no new work on it.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::ties`
 - A push of a signed config blocks the authority's verb until each
   machine has installed it, one machine after another (up to
-  `SYNC_WAIT`, 10 min, each).
+  `SYNC_WAIT`, 10 min, each). Every verb on an unchanged root re-sends
+  the log, so one blocks the same way while a machine retries a due
+  install.
   → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `changes::push`, `changes::SYNC_WAIT`
 - The dashboard drops a verb's config signing notes (all its output), and
   under `-d` the CLI shows only its `note:` lines.

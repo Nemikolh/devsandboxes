@@ -98,11 +98,13 @@ pub struct Ctx {
     /// link report is due at once and the snapshots' `agent` follow
     /// (`daemon::Shared`'s `graph.republish`, `publish_machines`).
     pub agent_changed: Box<dyn Fn() + Send + Sync>,
-    /// A `fleet.sync` from peer `name` moved a `config` head in this host's
-    /// log: the daemon follows the signed configs from it, returning once
-    /// they're installed or failed (`daemon::follow_configs_now`), before
-    /// the sync answers.
-    pub log_from: Box<dyn Fn(&str) + Send + Sync>,
+    /// A `fleet.sync` from peer `name` left a `config` head in this host's
+    /// log that isn't installed here: the daemon follows the signed configs
+    /// from it, returning once they're installed or failed
+    /// (`daemon::follow_configs_now`), before the sync answers. `Err` names
+    /// each config due and not installed, and why: the sync's answer
+    /// carries it (`changes::Synced::install_error`).
+    pub log_from: Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
 }
 
 /// Run `method` if it's a `machines.*` one; `None` otherwise.
@@ -1446,7 +1448,9 @@ mod tests {
             assert_eq!(serde_json::from_value::<HubMove>(to_value(&r).unwrap()).unwrap(), r, "round trip");
         }
         assert_eq!(union_members("MembershipHubResult"), ["MembershipHubSigned", "MembershipHubProposed"]);
-        let synced = super::super::changes::Synced { changed: true, head: s.log.head() };
+        let synced = super::super::changes::Synced { changed: true, head: s.log.head(), install_error: None };
+        assert_matches("FleetSynced", &to_value(synced).unwrap());
+        let synced = super::super::changes::Synced { changed: false, head: s.log.head(), install_error: Some("config `cfg` v1: x".into()) };
         assert_matches("FleetSynced", &to_value(synced).unwrap());
         assert_matches("FleetQueued", &to_value(super::super::changes::Queued { id: 1, pending: true }).unwrap());
         assert_eq!(union_members("FleetHeard"), ["'told'", "'leaving'", "'unreachable'"]);

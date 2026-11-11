@@ -39,10 +39,12 @@
 //!   authority ([`sign_config`], called by `serve::daemon`'s verb path)
 //!   first signs its config root's hash as the root's next `config`
 //!   version when it differs from the latest, and pushes it. Never
-//!   proposed: only the authority's own verbs sign. A host the push (or a
-//!   flood) moves a head on installs it from the sender before it answers
-//!   or sends the log on ([`sync`]), so a push that reached a machine
-//!   left the config there.
+//!   proposed: only the authority's own verbs sign. A host a push (or a
+//!   flood) leaves with a head not installed installs it from the sender
+//!   before it answers or sends the log on ([`sync`]), the answer saying
+//!   what didn't install, so a push that reached a machine left the config
+//!   there, and one that didn't names it. A verb on an unchanged root
+//!   pushes the log again: the retry.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -210,6 +212,11 @@ pub struct Queued {
 pub struct Synced {
     pub changed: bool,
     pub head: crate::serve::fleet::membership::Head,
+    /// Each config head due here (`mesh::due`) that the sync's install
+    /// (`Ctx::log_from`) left uninstalled, and why: [`push`] counts the
+    /// answer a miss.
+    #[serde(default)]
+    pub install_error: Option<String>,
 }
 
 fn now() -> u64 {
@@ -265,18 +272,22 @@ fn follow(ctx: &Ctx, taken: &membership_api::Taken) {
 /// [`sign`], then [`push`] over the links as they are, then [`follow`].
 fn sign_and_push(ctx: &Ctx, me: &str, stored: Stored, op: Op) -> Result<(Stored, Vec<String>, Vec<Missed>), ApiError> {
     let taken = sign(ctx, me, stored, op)?;
-    let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None)).unwrap_or_default();
+    let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None, false)).unwrap_or_default();
     follow(ctx, &taken);
     Ok((taken.stored, pushed, unpushed))
 }
 
 /// `stored` sent to every machine `links` holds but `except`
 /// (`fleet.sync`, one at a time, each answer waited for up to
-/// [`SYNC_WAIT`]): those it reached, and those it didn't, with why. A
-/// machine reached holds every config head `stored` moved there, installed
-/// (or its install failed, logged there), so its link lists its roots again
+/// [`SYNC_WAIT`]): those it reached, and those it didn't, with why. An
+/// answered machine took the log, and holds every config head of `stored`
+/// installed unless its answer says an install failed
+/// (`Synced::install_error`). With `config` (a config version's push,
+/// [`sign_config`]) such a machine is a miss, its error the answer's;
+/// without (a membership change, a flood) it's reached: the change is
+/// there. Either way an answered one's link lists its roots again
 /// (`Handle::relist`).
-pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<String>, Vec<Missed>) {
+pub fn push(links: &Handle, stored: &Stored, except: Option<&str>, config: bool) -> (Vec<String>, Vec<Missed>) {
     let params = match serde_json::to_value(stored.to_wire()) {
         Ok(v) => v,
         Err(e) => return (Vec::new(), vec![Missed { name: "*".into(), error: format!("cannot encode the log: {e}") }]),
@@ -287,9 +298,14 @@ pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<Strin
             continue;
         }
         match leave::call_on_within(links, &entry.name, "fleet.sync", params.clone(), SYNC_WAIT) {
-            Ok(_) => {
+            Ok(v) => {
                 links.relist(&entry.name);
-                pushed.push(entry.name);
+                match serde_json::from_value::<Synced>(v) {
+                    _ if !config => pushed.push(entry.name),
+                    Ok(Synced { install_error: Some(error), .. }) => missed.push(Missed { name: entry.name, error }),
+                    Ok(_) => pushed.push(entry.name),
+                    Err(e) => missed.push(Missed { name: entry.name, error: format!("fleet.sync: unexpected answer: {e}") }),
+                }
             }
             Err(error) => missed.push(Missed { name: entry.name, error }),
         }
@@ -303,7 +319,7 @@ pub fn push(links: &Handle, stored: &Stored, except: Option<&str>) -> (Vec<Strin
 pub fn revoke(ctx: &Ctx, name: &str) -> Result<Signed, ApiError> {
     let (me, stored) = on_authority(ctx)?;
     let (pushed, unpushed) = if stored.log.revoked_name(name) {
-        ctx.links.as_ref().map(|l| push(l, &stored, None)).unwrap_or_default()
+        ctx.links.as_ref().map(|l| push(l, &stored, None, false)).unwrap_or_default()
     } else {
         let m = stored.log.membership().expect("on_authority checked");
         if !m.members.contains_key(name) {
@@ -358,9 +374,13 @@ fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiErro
 /// directory's name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSigned {
-    /// Signed and pushed; `unpushed` are the machines the push didn't
-    /// reach, so they don't have `version` (a reached one installed it).
+    /// Signed and pushed; `unpushed` are the machines that don't have
+    /// `version`: the push didn't reach them, or their install failed
+    /// ([`push`]). A machine it reached installed it.
     Signed { root: String, version: u64, unpushed: Vec<Missed> },
+    /// The root unchanged (`version` its head), the log pushed again: the
+    /// retry for a machine that lacks it. `unpushed` as for `Signed`.
+    Resent { root: String, version: u64, unpushed: Vec<Missed> },
     Failed { root: String, error: String },
     /// This host is in a fleet but isn't its authority `authority`: what
     /// it types signs nothing.
@@ -385,8 +405,12 @@ impl ConfigSigned {
                 }
                 lines
             }
+            ConfigSigned::Resent { root, version, unpushed } if !unpushed.is_empty() => {
+                let missed: Vec<String> = unpushed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
+                vec![format!("config `{root}` v{version} re-sent, not installed on {}", missed.join(", "))]
+            }
             ConfigSigned::Failed { root, error } => vec![format!("config `{root}` not signed: {error}")],
-            ConfigSigned::NotAuthority { .. } => Vec::new(),
+            ConfigSigned::Resent { .. } | ConfigSigned::NotAuthority { .. } => Vec::new(),
         }
     }
 
@@ -395,6 +419,15 @@ impl ConfigSigned {
         match self {
             ConfigSigned::Signed { root, version, unpushed } => {
                 let mut lines = vec![format!("note: signed config `{root}` v{version}")];
+                lines.extend(
+                    unpushed.iter().map(|m| format!("note: `{}` doesn't have config `{root}` v{version}: {}", m.name, m.error)),
+                );
+                lines
+            }
+            // Every machine has it: nothing to say.
+            ConfigSigned::Resent { unpushed, .. } if unpushed.is_empty() => Vec::new(),
+            ConfigSigned::Resent { root, version, unpushed } => {
+                let mut lines = vec![format!("note: config `{root}` v{version} re-sent")];
                 lines.extend(
                     unpushed.iter().map(|m| format!("note: `{}` doesn't have config `{root}` v{version}: {}", m.name, m.error)),
                 );
@@ -436,7 +469,10 @@ pub fn bound_root(ctx: &Ctx, name: &str) -> Option<PathBuf> {
 /// ([`mesh::store`], next to `member.toml`) then signed as the next
 /// version (1 for the first) and pushed. `None`, nothing bundled: this
 /// host is in no fleet, or `root` holds no config file (the verb says
-/// why). `None` too when the hash is the latest's. `NotAuthority` when
+/// why). When the hash is the latest's, nothing is signed but the bundle
+/// is stored again and the log pushed again (`Resent`; `None` with no
+/// links): a machine whose last install failed, or that the last push
+/// missed, retries it now, and one that has it answers at once. `NotAuthority` when
 /// this host is in a fleet whose authority is another member. A config
 /// that doesn't load is `Failed`, nothing signed. So is a name bound to
 /// another root: the first canonical path a name is signed from keeps it
@@ -477,11 +513,15 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     };
     let hash = bundle.hash();
     let current = stored.log.membership().expect("checked").config.get(name).copied();
-    if current.is_some_and(|(_, h)| h == hash) {
+    if let Some((version, _)) = current.filter(|(_, h)| *h == hash) {
         // Nothing to sign, but the stored bundle peers pull is rewritten
         // when it's missing or damaged (`mesh::store` keeps an intact
         // one), else this host would serve a bad one until the next edit.
-        return mesh::store(data, &bundle).err().map(|e| ConfigSigned::failed(name, format!("{e:#}")));
+        if let Err(e) = mesh::store(data, &bundle) {
+            return Some(ConfigSigned::failed(name, format!("{e:#}")));
+        }
+        let (_, unpushed) = ctx.links.as_ref().map(|l| push(l, &stored, None, true))?;
+        return Some(ConfigSigned::Resent { root: name.into(), version, unpushed });
     }
     match mesh::bind(data, name, &canon) {
         Ok(Ok(())) => {}
@@ -492,10 +532,14 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
         return Some(ConfigSigned::failed(name, format!("{e:#}")));
     }
     let version = current.map_or(1, |(v, _)| v + 1);
-    match sign_and_push(ctx, &me, stored, Op::Config { root: name.into(), version, hash }) {
-        Ok((_, _, unpushed)) => Some(ConfigSigned::Signed { root: name.into(), version, unpushed }),
-        Err(e) => Some(ConfigSigned::failed(name, e.message)),
-    }
+    // `sign_and_push`, but a machine whose install failed is a miss.
+    let taken = match sign(ctx, &me, stored, Op::Config { root: name.into(), version, hash }) {
+        Ok(t) => t,
+        Err(e) => return Some(ConfigSigned::failed(name, e.message)),
+    };
+    let (_, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None, true)).unwrap_or_default();
+    follow(ctx, &taken);
+    Some(ConfigSigned::Signed { root: name.into(), version, unpushed })
 }
 
 /// Whether `me` (key `key`) can rotate its key in `stored`'s log (pure):
@@ -567,7 +611,7 @@ pub fn rotate(ctx: &Ctx) -> Result<Rotation, ApiError> {
             // and holds the old key, which its log still lists), so every
             // peer holds the `rotate` before the links end and redial
             // proving the new key.
-            let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None)).unwrap_or_default();
+            let (pushed, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None, false)).unwrap_or_default();
             follow(ctx, &taken);
             let signed = Signed { name: me, change: what, pushed, unpushed, removed: None, error: None };
             Ok(Rotation::Rotated(Rotated { key: key_text, fingerprint, signed }))
@@ -659,16 +703,19 @@ fn queue(params: Value, from: &str, ctx: &Ctx) -> Answer {
 /// `fleet.sync {entries, introductions}` from `from`: merged as a link's
 /// handshake merges (self-verifying; another fleet's or a fork refused;
 /// a log revoking this host's own key taken, for the `fleet.leave` that
-/// follows it). When it made this host's log newer: when it moved a
-/// `config` head ([`config_moved`]), the signed configs followed from
+/// follows it). Changed or not, when a `config` head of the log isn't
+/// installed here ([`configs_due`]), the signed configs are followed from
 /// `from` (`Ctx::log_from`: pulled and installed) before anything else, so
 /// the answer means this host has them and the hosts it sends the log on
-/// to can pull them from it; an install that fails is logged there, the
-/// sync answered all the same (the log is taken). Then `hub` followed, and
-/// the log sent on to every other machine this host holds, off the request
-/// thread. When it promoted this host's next key (a rotate of it is in) or
-/// moved this host's hub, the log is sent on before answering, nothing
-/// installed, and every link ends once the answer is out
+/// to can pull them from it; an install that fails is logged there and
+/// named in the answer (`Synced::install_error`), the sync answered all
+/// the same (the log is taken). A sync that changed nothing so retries a
+/// failed install. When it made this host's log newer: then `hub`
+/// followed, and the log sent on to every other machine this host holds,
+/// off the request thread. When it promoted this host's next key (a
+/// rotate of it is in) or moved this host's hub, the log is sent on
+/// before answering, nothing installed, and every link ends once the
+/// answer is out
 /// (`After::Rotated`: redialing to prove the new key; `After::Hub`: the
 /// hub followed, redialing to say it); the redial's link-up follows the
 /// configs. Changed or not, `from`'s link here lists its roots again
@@ -680,26 +727,28 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
     let theirs = Stored::from_wire(wire).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     let path = leave::member_toml(ctx)?;
     let before = api::own_member(ctx).ok().map(|(_, hub)| hub);
-    let configs_before = config_heads(membership_api::load(path).ok().flatten().as_ref());
     let taken = membership_api::sync(path, &ctx.hostname, &theirs)?;
     if let Some(links) = &ctx.links {
         links.relist(from);
     }
     let head = taken.stored.log.head();
     let mut after = None;
+    // Both end every link once the answer is out. A move that comes with
+    // a rotate needs one cycle only: `After::Hub` keeps the new hub, and
+    // the redial proves the key `member.key` holds by then.
+    let follow = match (before.as_ref() != Some(&taken.hub), taken.rotated) {
+        _ if !taken.changed => None,
+        (true, _) => Some(After::Hub(taken.hub.clone())),
+        (false, true) => Some(After::Rotated),
+        (false, false) => None,
+    };
+    let data = path.parent().expect("member.toml has a parent");
+    let install_error = if follow.is_none() && configs_due(data, &config_heads(Some(&taken.stored))) {
+        (ctx.log_from)(from).err()
+    } else {
+        None
+    };
     if taken.changed {
-        let moved = before.as_ref() != Some(&taken.hub);
-        // Both end every link once the answer is out. A move that comes
-        // with a rotate needs one cycle only: `After::Hub` keeps the new
-        // hub, and the redial proves the key `member.key` holds by then.
-        let follow = match (moved, taken.rotated) {
-            (true, _) => Some(After::Hub(taken.hub.clone())),
-            (false, true) => Some(After::Rotated),
-            (false, false) => None,
-        };
-        if follow.is_none() && config_moved(&configs_before, &config_heads(Some(&taken.stored))) {
-            (ctx.log_from)(from);
-        }
         if let Some(links) = ctx.links.clone() {
             if follow.is_some() {
                 // The links end once the answer is out, so the log goes on
@@ -718,7 +767,7 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
         }
         after = follow;
     }
-    Ok((to_value(Synced { changed: taken.changed, head })?, after))
+    Ok((to_value(Synced { changed: taken.changed, head, install_error })?, after))
 }
 
 /// `stored`'s `config` heads (`Membership::config`), none without a log.
@@ -726,16 +775,26 @@ fn config_heads(stored: Option<&Stored>) -> BTreeMap<String, (u64, [u8; 32])> {
     stored.and_then(|s| s.log.membership()).map(|m| m.config.clone()).unwrap_or_default()
 }
 
-/// Whether a log's `config` heads went from `before` to `after` with one
-/// moved or added (pure): what [`sync`] installs before answering.
-fn config_moved(before: &BTreeMap<String, (u64, [u8; 32])>, after: &BTreeMap<String, (u64, [u8; 32])>) -> bool {
-    after.iter().any(|(name, head)| before.get(name) != Some(head))
+/// Whether one of `heads` (a log's `config` heads) is due under data dir
+/// `data` (`mesh::due`: not what `installed.toml` holds, not a name this
+/// host bound): what [`sync`] installs before answering. Two small reads,
+/// none with no heads; a read that fails counts as due, so the install
+/// that follows says why.
+fn configs_due(data: &Path, heads: &BTreeMap<String, (u64, [u8; 32])>) -> bool {
+    if heads.is_empty() {
+        return false;
+    }
+    let read = || anyhow::Ok((mesh::installed(data)?, mesh::load_roots(&mesh::roots_path(data))?));
+    match read() {
+        Ok((installed, bound)) => !mesh::due(heads, &installed, &bound, &Default::default()).is_empty(),
+        Err(_) => true,
+    }
 }
 
 /// `stored`, newer than what `from` sent had here, sent on to every other
 /// machine `links` holds, logged.
 fn flood(links: &Handle, stored: &Stored, from: &str) {
-    let (pushed, missed) = push(links, stored, Some(from));
+    let (pushed, missed) = push(links, stored, Some(from), false);
     let missed: Vec<String> = missed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
     crate::serve::daemon::log(&format!(
         "fleet.sync from {from}: newer membership entries ({}) sent on to [{}]{}",
@@ -796,7 +855,7 @@ mod tests {
     use crate::serve::endpoint;
     use crate::serve::fleet::mesh;
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
-    use super::{Change, ConfigSigned, Missed, Op, RotatePlan, can_rotate, config_moved, countersign_rotate, plan_hub, plan_rotate};
+    use super::{Change, ConfigSigned, Missed, Op, RotatePlan, can_rotate, configs_due, countersign_rotate, plan_hub, plan_rotate};
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
     use crate::serve::fleet::member::{Member, write_for_test};
     use crate::serve::fleet::membership::{Introduction, Stored};
@@ -998,16 +1057,23 @@ mod tests {
         pair.finish();
     }
 
-    /// A head moved or added is a move; one dropped or none changed isn't.
+    /// A head not installed is due; none, or only a name this host bound,
+    /// isn't. An `installed.toml` that doesn't read counts as due.
     #[test]
-    fn a_config_head_moves() {
+    fn a_config_head_is_due() {
+        let data = scratch("changes-due");
         let heads = |list: &[(&str, u64, u8)]| list.iter().map(|(n, v, h)| (n.to_string(), (*v, [*h; 32]))).collect();
-        let before = heads(&[("a", 1, 1), ("b", 1, 2)]);
-        assert!(!config_moved(&before, &before));
-        assert!(!config_moved(&before, &heads(&[("a", 1, 1)])));
-        assert!(config_moved(&before, &heads(&[("a", 2, 3), ("b", 1, 2)])));
-        assert!(config_moved(&before, &heads(&[("a", 1, 1), ("b", 1, 2), ("c", 1, 4)])));
-        assert!(config_moved(&heads(&[]), &heads(&[("a", 1, 1)])));
+        assert!(!configs_due(&data, &heads(&[])));
+        assert!(configs_due(&data, &heads(&[("a", 1, 1)])));
+        let own = data.join("own");
+        std::fs::create_dir_all(data.join("mesh")).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        assert_eq!(mesh::bind(&data, "a", &own).unwrap(), Ok(()));
+        assert!(!configs_due(&data, &heads(&[("a", 1, 1)])), "bound here: the authority's own");
+        assert!(configs_due(&data, &heads(&[("a", 1, 1), ("b", 1, 2)])));
+        std::fs::write(data.join("mesh/installed.toml"), "not toml [").unwrap();
+        assert!(configs_due(&data, &heads(&[("b", 1, 2)])), "unreadable: due, the install says why");
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     /// A verb `method` with `params` on the daemon at `dir`: whether it
@@ -1060,6 +1126,11 @@ mod tests {
             ]
         );
         assert_eq!(signed.log_lines(), ["signed config `cfg` v3", "config `cfg` v3 not pushed to box (down), pi (timed out)"]);
+        let resent = ConfigSigned::Resent { root: "cfg".into(), version: 3, unpushed: vec![] };
+        assert_eq!((resent.notes(), resent.log_lines()), (Vec::<String>::new(), Vec::<String>::new()), "all have it");
+        let resent = ConfigSigned::Resent { root: "cfg".into(), version: 3, unpushed: vec![Missed { name: "box".into(), error: "no disk".into() }] };
+        assert_eq!(resent.notes(), ["note: config `cfg` v3 re-sent", "note: `box` doesn't have config `cfg` v3: no disk"]);
+        assert_eq!(resent.log_lines(), ["config `cfg` v3 re-sent, not installed on box (no disk)"]);
         let failed = ConfigSigned::Failed { root: "cfg".into(), error: "bad toml".into() };
         assert_eq!(failed.notes(), ["note: config `cfg` not signed: bad toml"]);
         assert_eq!(failed.log_lines(), ["config `cfg` not signed: bad toml"]);
@@ -1266,6 +1337,94 @@ mod tests {
         assert!(r.error.is_none(), "{r:?}");
         assert_eq!(r.result.unwrap()["changed"], json!(true));
         assert_eq!(mesh::verify(&k_data, "cfg", Some((1, bundle.hash()))).map_err(|e| format!("{e:#}")), Ok(()), "installed by the answer");
+        pair.finish();
+    }
+
+    /// K's copies can't be written: a file where `mesh/tree/` goes.
+    fn block_copies(k_data: &Path) {
+        std::fs::create_dir_all(k_data.join("mesh")).unwrap();
+        std::fs::write(k_data.join("mesh/tree"), "in the way").unwrap();
+    }
+
+    /// A `fleet.sync` to K (`box`) moving `cfg`'s head while K can't
+    /// install it: taken, answered with the install's error. The same log
+    /// again, nothing moved, once K can: the install retried, answered
+    /// with none.
+    #[test]
+    fn a_sync_retries_a_due_config() {
+        let pair = pair("changes-sync-retry", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
+        up(&pair);
+        let l_toml = pair.base.join("l-data/member.toml");
+        let (k_data, l_data) = (pair.base.join("k-data"), pair.base.join("l-data"));
+        let root = pair.base.join("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let bundle = mesh::collect(&root).unwrap();
+        mesh::store(&l_data, &bundle).unwrap();
+        let mut stored = test_support::read(&l_toml).unwrap();
+        stored.log.append(Op::Config { root: "cfg".into(), version: 1, hash: bundle.hash() }, "lap", &key_of(&l_toml)).unwrap();
+        let wire = serde_json::to_value(stored.to_wire()).unwrap();
+        block_copies(&k_data);
+
+        let r = api_to(&pair.l_dir, "box").call("fleet.sync", wire.clone()).unwrap().result.unwrap();
+        assert_eq!(r["changed"], json!(true));
+        let error = r["install_error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("config `cfg` v1 not installed (from "), "{r}");
+        assert!(mesh::verify(&k_data, "cfg", Some((1, bundle.hash()))).is_err());
+
+        std::fs::remove_file(k_data.join("mesh/tree")).unwrap();
+        let r = api_to(&pair.l_dir, "box").call("fleet.sync", wire).unwrap().result.unwrap();
+        assert_eq!((&r["changed"], &r["install_error"]), (&json!(false), &Value::Null), "{r}");
+        assert_eq!(mesh::verify(&k_data, "cfg", Some((1, bundle.hash()))).map_err(|e| format!("{e:#}")), Ok(()), "retried");
+        pair.finish();
+    }
+
+    /// `lap` (L), the authority, signs `cfg` v1 while K (`box`) can't
+    /// install it: the verb's notes name box and why. Re-run on the
+    /// unchanged root: nothing signed, the log re-sent, box still named. A
+    /// membership change (a revoke of `yan`) meanwhile counts box reached:
+    /// it took the entry. Once box can install, the next verb's push gets
+    /// it installed, and says nothing.
+    #[test]
+    fn the_authoritys_verbs_resend_a_config_a_machine_lacks() {
+        let pair = pair("changes-config-resend", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key()), ("yan", pk(8))]));
+        up(&pair);
+        let l_toml = pair.base.join("l-data/member.toml");
+        let k_data = pair.base.join("k-data");
+        let root = pair.base.join("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let params = json!({"root": root, "env": {}, "instance": "nope"});
+        let head = || test_support::read(&l_toml).unwrap().log.head();
+        block_copies(&k_data);
+
+        let (answered, notes) = verb_notes(&pair.l_dir, "start", params.clone());
+        assert!(answered.is_some());
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0], "note: signed config `cfg` v1");
+        // `from lap`, or `from its stored bundle` when a link-up's follow
+        // stored it first.
+        assert!(notes[1].starts_with("note: `box` doesn't have config `cfg` v1: config `cfg` v1 not installed (from "), "{notes:?}");
+        let (_, hash) = test_support::read(&l_toml).unwrap().log.membership().unwrap().config["cfg"];
+        let signed = head();
+
+        let (_, notes) = verb_notes(&pair.l_dir, "start", params.clone());
+        assert_eq!(head(), signed, "unchanged: nothing signed");
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0], "note: config `cfg` v1 re-sent");
+        assert!(notes[1].starts_with("note: `box` doesn't have config `cfg` v1: "), "{notes:?}");
+
+        let r = call(&pair.l_dir, "machines.rm", json!({"name": "yan"})).unwrap();
+        assert_eq!((&r["type"], &r["pushed"], &r["unpushed"]), (&json!("revoked"), &json!(["box"]), &json!([])), "{r}");
+        assert!(test_support::read(&pair.base.join("k-data/member.toml")).unwrap().log.revoked_name("yan"));
+        assert!(mesh::verify(&k_data, "cfg", Some((1, hash))).is_err(), "still not installed");
+        let signed = head();
+
+        std::fs::remove_file(k_data.join("mesh/tree")).unwrap();
+        let (_, notes) = verb_notes(&pair.l_dir, "start", params);
+        assert_eq!(notes, Vec::<String>::new(), "every machine has it: nothing said");
+        assert_eq!(head(), signed);
+        assert_eq!(mesh::verify(&k_data, "cfg", Some((1, hash))).map_err(|e| format!("{e:#}")), Ok(()), "the re-send installed it");
         pair.finish();
     }
 

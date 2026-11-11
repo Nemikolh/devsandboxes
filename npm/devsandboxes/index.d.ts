@@ -1083,10 +1083,11 @@ export interface FleetQueued {
   pending: boolean;
 }
 
-/** `fleet.sync`'s answer: whether this host's log took something, and its head after. @experimental */
+/** `fleet.sync`'s answer: whether this host's log took something, its head after, and each config due here and not installed (with why), if any. @experimental */
 export interface FleetSynced {
   changed: boolean;
   head: MembershipHead;
+  install_error: string | null;
 }
 
 /** One link of a {@link FleetLinkReport}: to `peer`, in `state` since `since_ms` (unix ms, the reporter's clock); `dials`: the reporter dials it (has a shell there). @experimental */

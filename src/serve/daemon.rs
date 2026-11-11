@@ -2698,7 +2698,9 @@ fn check_mesh_copy(params: &Value, shared: &Shared) -> Result<(), String> {
 /// a thread of its own.
 fn follow_configs(member: Option<&Path>, socket_dir: &Path, peer: &str) {
     let (member, dir, from) = (member.map(Path::to_path_buf), socket_dir.to_path_buf(), peer.to_string());
-    let spawned = std::thread::Builder::new().name("serve-mesh".into()).spawn(move || follow_configs_now(member.as_deref(), &dir, &from));
+    let spawned = std::thread::Builder::new().name("serve-mesh".into()).spawn(move || {
+        let _ = follow_configs_now(member.as_deref(), &dir, &from);
+    });
     if let Err(e) = spawned {
         log(&format!("fleet: cannot follow the signed configs (after {peer}): {e}"));
     }
@@ -2707,12 +2709,14 @@ fn follow_configs(member: Option<&Path>, socket_dir: &Path, peer: &str) {
 /// Each config root whose signed head this host's copy isn't at installed,
 /// from its stored bundle or one pulled from `peer` over the link
 /// (`fleet::mesh::follow`), logged; returns once each is installed or
-/// failed. On the request thread of a `fleet.sync` that moved a head
-/// (`Ctx::log_from`), so its answer means this host has them; at link-up
-/// through [`follow_configs`]. Best effort: the next such sync or link-up
-/// tries again. Nothing without a `member.toml` (no data dir, no log).
-fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) {
-    let Some((member, data)) = member.and_then(|m| Some((m, m.parent()?))) else { return };
+/// failed. On the request thread of a `fleet.sync` that left a head not
+/// installed here (`Ctx::log_from`), so its answer says whether this host
+/// has them; at link-up through [`follow_configs`]. `Err` names each due
+/// config not installed and why (`; `-joined), or why none was followed.
+/// The next sync or link-up tries again. Nothing without a `member.toml`
+/// (no data dir, no log).
+fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) -> Result<(), String> {
+    let Some((member, data)) = member.and_then(|m| Some((m, m.parent()?))) else { return Ok(()) };
     let heads = || -> Result<BTreeMap<String, (u64, [u8; 32])>> {
         let stored = fleet::membership_api::load(member).map_err(|e| anyhow::anyhow!("{}", e.message))?;
         Ok(stored.and_then(|s| s.log.membership().map(|m| m.config.clone())).unwrap_or_default())
@@ -2720,6 +2724,7 @@ fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) {
     let t = fleet::code::LinkTransfer::for_worker(socket_dir, peer);
     match fleet::mesh::follow(data, heads, &t) {
         Ok(done) => {
+            let mut failed = Vec::new();
             for (due, r) in done {
                 let (name, v) = (&due.name, due.version);
                 if let Some(why) = &due.dropped {
@@ -2728,11 +2733,18 @@ fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) {
                 let from = if due.stored { "its stored bundle" } else { peer };
                 match r {
                     Ok(_) => log(&format!("fleet: installed config `{name}` v{v} from {from}")),
-                    Err(e) => log(&format!("fleet: config `{name}` v{v} not installed (from {from}): {e:#}")),
+                    Err(e) => {
+                        log(&format!("fleet: config `{name}` v{v} not installed (from {from}): {e:#}"));
+                        failed.push(format!("config `{name}` v{v} not installed (from {from}): {e:#}"));
+                    }
                 }
             }
+            if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
         }
-        Err(e) => log(&format!("fleet: cannot follow the signed configs (after {peer}): {e:#}")),
+        Err(e) => {
+            log(&format!("fleet: cannot follow the signed configs (after {peer}): {e:#}"));
+            Err(format!("cannot follow the signed configs: {e:#}"))
+        }
     }
 }
 

@@ -1945,10 +1945,12 @@ it never signs on a remote request alone (decision 49;
   (`daemon::sign_config` over `changes::sign_config`), logged in
   `serve.log` (`changes::ConfigSigned::log_lines`: the root's name and
   version, and one more line naming the machines the push missed and
-  why). The verb's output starts
+  why). A machine the push missed is one it didn't reach, or one whose
+  `fleet.sync` answer says an install failed (`changes::Synced::install_error`,
+  `changes::push`). The verb's output starts
   with what it did, as `stderr` `output` lines under the verb's request
   id (`changes::ConfigSigned::notes`): ``note: signed config `<name>`
-  v<N>``, then for each machine the push didn't reach (so it doesn't
+  v<N>``, then for each machine the push missed (so it doesn't
   have v<N>) ``note: `<machine>` doesn't have config `<name>` v<N>:
   <why>``; or ``note: config `<name>` not signed: <why>``. The CLI
   prints them under `-d` too (`verbs_client::held_notes`: of the output
@@ -1983,7 +1985,14 @@ it never signs on a remote request alone (decision 49;
   renames it into place and syncs `bundles/`, so a crash leaves the old
   file or the whole new one. A verb whose root is unchanged signs
   nothing but still runs `mesh::store`, so a damaged bundle the
-  authority would serve is rewritten at its next verb. A
+  authority would serve is rewritten at its next verb, then pushes the
+  log again (`changes::ConfigSigned::Resent`): the retry for a machine
+  the last push missed, or whose install failed. A machine that has the
+  head answers at once; when every one does, nothing is said or logged,
+  else ``note: config `<name>` v<N> re-sent`` then the same
+  ``doesn't have`` line per machine missed, and one `serve.log` line
+  naming them. So each such verb costs one `fleet.sync` per linked
+  machine. A
   config that doesn't load (`Config::load`, or a sandbox's merge, a
   `build`, `mounts` or `features` that doesn't read), a bundle over
   `code::ROOT_TAR_LIMIT` or a store that fails is logged too
@@ -2046,15 +2055,20 @@ it never signs on a remote request alone (decision 49;
   `daemon`'s transfer channel next to `code::receivers`; only a
   `<64 hex>.tar` name, a regular file); `mesh::pull_bundle` pulls one by
   hash through a `code::Transfer`, at most `code::ROOT_TAR_LIMIT`.
-  A member installs on two occasions. A `fleet.sync` from a peer that
-  moved a `config` head in its log (`changes::sync`, `changes::config_moved`,
-  unless the sync cycles the links) runs `daemon::follow_configs_now`
-  against that peer through `Ctx::log_from` on the request thread, before
-  the sync answers and before the log is sent on: the answer means the
-  receiver holds the configs (installed, or the failure logged there; the
-  sync is answered either way, the log being taken), and a relay has the
-  bundle in `bundles/` before the hosts it floods to pull from it. So an
-  authority whose push reached a machine can go offline. The push waits
+  A member installs on two occasions. A `fleet.sync` from a peer, moving
+  the log or not, that leaves a `config` head in it not installed here
+  (`changes::sync`, `changes::configs_due` over `mesh::due`, unless the
+  sync cycles the links) runs `daemon::follow_configs_now` against that
+  peer through `Ctx::log_from` on the request thread, before the sync
+  answers and before the log is sent on. The answer names each config
+  due and not installed, and why (`Synced::install_error`; the sync is
+  answered either way, the log being taken), which a config version's
+  push (`changes::push` with `config`, from `changes::sign_config`)
+  counts as a miss; a membership change's push and a flood count the
+  machine reached, the entry being there. A relay has the bundle in `bundles/` before the hosts it
+  floods to pull from it. With nothing due the check is two small reads
+  (`mesh/installed.toml`, `mesh/roots.toml`). So an authority whose push
+  reached a machine with no miss can go offline. The push waits
   `changes::SYNC_WAIT` (10 minutes) per answer
   (`service::Handle::forward_within`), not `Timing::call`, whose timeout
   ends the link. The sender's link thread is blocked meanwhile, but the
@@ -2078,8 +2092,8 @@ it never signs on a remote request alone (decision 49;
   per process, the heads read inside, so an older log's run never
   installs after a newer one's. Each outcome goes to `serve.log`
   (installed config `<name>` vN from `<peer>`, or why not); a peer
-  without the bundle is a logged failure, and the next sync moving a
-  head or link-up tries again. So a member keeps, and runs from, the latest version it
+  without the bundle is a logged failure, and the next sync (the
+  authority's next verb re-sends one) or link-up tries again. So a member keeps, and runs from, the latest version it
   got while the authority is offline, and hands it on to the members
   that link to it. `mesh/installed.toml` also names the config file
   installed, apart from the referenced files the hash covers.
