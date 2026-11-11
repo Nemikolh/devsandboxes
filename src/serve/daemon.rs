@@ -2664,7 +2664,10 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
         sign_config(id, root, shared, conn);
     }
     if matches!(method, "run" | "rebuild" | "start" | "services.rebuild")
-        && let Err(why) = check_mesh_copy(&params, shared, matches!(conn.table, Table::Peer(_)))
+        && let Err(why) = check_mesh_copy(&params, shared, match &conn.table {
+            Table::Peer(peer) => Some(peer),
+            Table::Full => None,
+        })
     {
         log(&format!("{}: refused {method}: {why}", conn.label()));
         return Some(Response::err(id, "denied", why));
@@ -2739,14 +2742,17 @@ fn config_notes(signed: &machines::changes::ConfigSigned, key: &str, told: &mut 
 /// build nothing, and keep working on a changed copy. A refused copy is
 /// repaired off the request thread ([`repair_config`]), so the next try
 /// can pass. From a linked or routed `peer` (`Table::Peer`), also a root
-/// named like a signed config but not its copy
-/// (`fleet::mesh::check_peer_root_in`); a local client's own roots stay
-/// unchecked (ADR 0002).
-fn check_mesh_copy(params: &Value, shared: &Shared, peer: bool) -> Result<(), String> {
+/// named like a signed config but not its copy, outside the peer's fleet
+/// root (`fleet::mesh::check_peer_root_in`); a local client's own roots
+/// stay unchecked (ADR 0002).
+fn check_mesh_copy(params: &Value, shared: &Shared, peer: Option<&lent::Peer>) -> Result<(), String> {
     let (Some(member), Some(data)) = (shared.member.as_deref(), shared.data_dir()) else { return Ok(()) };
     let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) else { return Ok(()) };
-    let check = if peer { fleet::mesh::check_peer_root_in } else { fleet::mesh::check_root_in };
-    check(data, member, root).map_err(|e| {
+    let checked = match peer {
+        Some(peer) => fleet::mesh::check_peer_root_in(data, member, root, peer.fleet_root.as_deref()),
+        None => fleet::mesh::check_root_in(data, member, root),
+    };
+    checked.map_err(|e| {
         if let Some((name, true)) = fleet::mesh::copy_of(data, root) {
             repair_config(member, &name);
         }
@@ -4060,12 +4066,20 @@ pub(crate) mod tests {
         let mut s = Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join());
         s.member = Some(member);
 
+        let peer = lent::Peer {
+            name: "lap".into(),
+            fleet_root: Some(store.join("fleet/lap")),
+            env: None,
+            agent: None,
+            key: None,
+            introduced_by: None,
+        };
         let params = json!({"root": own.display().to_string()});
-        let why = check_mesh_copy(&params, &s, true).unwrap_err();
+        let why = check_mesh_copy(&params, &s, Some(&peer)).unwrap_err();
         assert!(why.contains("has the name of the signed config `.devsandboxes` but isn't its copy here"), "{why}");
-        check_mesh_copy(&params, &s, false).unwrap();
+        check_mesh_copy(&params, &s, None).unwrap();
         let copy = json!({"root": mesh::tree_path(&store, ".devsandboxes").display().to_string()});
-        check_mesh_copy(&copy, &s, true).unwrap();
+        check_mesh_copy(&copy, &s, Some(&peer)).unwrap();
         let _ = std::fs::remove_dir_all(&store);
     }
 

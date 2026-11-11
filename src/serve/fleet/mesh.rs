@@ -603,6 +603,46 @@ pub fn check_root_in(data: &Path, member_toml: &Path, root: &Path) -> Result<()>
     verify(data, &name, head)
 }
 
+/// Whether config root `root` may be built from here at a linked or
+/// routed peer's request: [`check_root_in`], and a root that isn't a copy
+/// but is named (its last component, as asked or canonical) like a
+/// `config` name in the log is refused. A peer's `<machine>/<sandbox>`
+/// names the signed config; this host's own dir of that name (say
+/// `~/.devsandboxes`, `fleet::lent::own_roots`) is unsigned, maybe stale,
+/// and nobody else checks it. A root in the peer's own `fleet_root`
+/// (`lent::Peer::fleet_root`: code it moved here, a placed run's) isn't
+/// this host's, so not refused. Local clients never come here (ADR 0002).
+pub fn check_peer_root_in(data: &Path, member_toml: &Path, root: &Path, fleet_root: Option<&Path>) -> Result<()> {
+    check_root_in(data, member_toml, root)?;
+    if copy_of(data, root).is_some() {
+        return Ok(());
+    }
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+    if let (Some(fleet), Some(at)) = (fleet_root.and_then(canonical), canonical(root))
+        && at.starts_with(fleet)
+    {
+        return Ok(());
+    }
+    let names: Vec<String> = [Some(root.to_path_buf()), std::fs::canonicalize(root).ok()]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let stored = super::membership_api::load(member_toml).map_err(|e| anyhow!("config root `{}`: {}", root.display(), e.message))?;
+    let Some(m) = stored.as_ref().and_then(|s| s.log.membership()) else { return Ok(()) };
+    if let Some(name) = names.iter().find(|n| m.config.contains_key(n.as_str())) {
+        bail!(
+            "config root `{}` has the name of the signed config `{name}` but isn't its copy here ({}): run it from the copy",
+            root.display(),
+            tree_path(data, name).display()
+        );
+    }
+    Ok(())
+}
+
 /// [`hash_parts`] over the copy at `tree` as `copy` lists it: the config
 /// file (the one `config::find` picks, which must be the installed one)
 /// and each listed file, a regular file reached through real dirs.
@@ -1483,6 +1523,50 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         // A log that doesn't load is no answer either.
         std::fs::write(crate::serve::fleet::membership::path(&member), "{").unwrap();
         assert!(err(&tree).starts_with("config root `cfg`: "), "{}", err(&tree));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_peer_cant_build_a_root_named_like_a_signed_config() {
+        let (base, root) = fixture("peer-name");
+        let data = base.join("data");
+        let member = data.join("member.toml");
+        let v1 = collect(&root).unwrap();
+        install(&data, "cfg", &v1.tar().unwrap(), &v1.hash()).unwrap();
+        let tree = tree_path(&data, "cfg");
+        let own = base.join("home/cfg");
+        write(&own, "devsandboxes.toml", CONFIG);
+
+        // No log, or no `cfg` in it: a name signs nothing.
+        check_peer_root_in(&data, &member, &own, None).unwrap();
+        log_with(&data, &[]);
+        check_peer_root_in(&data, &member, &own, None).unwrap();
+
+        log_with(&data, &[(1, v1.hash())]);
+        let want = format!(
+            "config root `{}` has the name of the signed config `cfg` but isn't its copy here ({}): run it from the copy",
+            own.display(),
+            tree.display()
+        );
+        assert_eq!(format!("{:#}", check_peer_root_in(&data, &member, &own, None).unwrap_err()), want);
+        assert!(check_peer_root_in(&data, &member, &own, Some(&base.join("elsewhere"))).is_err(), "another fleet root");
+        // In the peer's own fleet root (a placed run's moved code): its, not ours.
+        let moved = data.join("fleet/lap/roots/x/cfg");
+        write(&moved, "devsandboxes.toml", CONFIG);
+        check_peer_root_in(&data, &member, &moved, Some(&data.join("fleet/lap"))).unwrap();
+        assert!(check_peer_root_in(&data, &member, &moved, None).is_err());
+        // Through a link named otherwise, too.
+        let link = base.join("home/other");
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        assert!(format!("{:#}", check_peer_root_in(&data, &member, &link, None).unwrap_err()).contains("signed config `cfg`"));
+        // A local client's check doesn't look at names (ADR 0002).
+        check_root_in(&data, &member, &own).unwrap();
+        // The copy itself, and a root of another name, pass.
+        check_peer_root_in(&data, &member, &tree, None).unwrap();
+        check_peer_root_in(&data, &member, &root, None).unwrap();
+        // The copy's own checks still hold.
+        write(&tree, "mcps/common.json", "{\"evil\":1}");
+        assert!(check_peer_root_in(&data, &member, &tree, None).is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 

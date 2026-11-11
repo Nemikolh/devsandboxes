@@ -798,8 +798,15 @@ fn choose_sandbox(rows: Vec<SandboxEntry>, wanted: Option<(Where, String)>, runs
         },
         _ => {
             let labels: Vec<String> = candidates.iter().map(|r| sandbox_label(r, &candidates, true)).collect();
-            let error = format!("`{name}` is defined on several machines: {}; qualify it", labels.join(", "));
-            let prompt = format!("`{name}` is defined on several machines");
+            // One machine's roots, or several machines: qualifying the name
+            // tells machines apart, not one machine's roots.
+            let (prompt, hint) = match &candidates[0].machine {
+                one if candidates.iter().all(|r| &r.machine == one) => {
+                    (format!("`{name}` is defined in several roots of `{}`", one.as_deref().unwrap_or("@")), "")
+                }
+                _ => (format!("`{name}` is defined on several machines"), "; qualify it"),
+            };
+            let error = format!("{prompt}: {}{hint}", labels.join(", "));
             SandboxChoice::Pick { prompt, error, options: labels.into_iter().zip(candidates).collect() }
         }
     }
@@ -1621,8 +1628,10 @@ mod tests {
         assert_eq!(error, "no sandbox specified; available: api, web, a/web, a/db");
         // One machine defining it in two roots: the roots tell them apart.
         let two = vec![row("web", Some("a"), "/r1"), row("web", Some("a"), "/r2")];
-        let SandboxChoice::Pick { options, .. } = choose_sandbox(two, Some((Where::Any, "web".into())), true) else { panic!() };
+        let SandboxChoice::Pick { prompt, error, options } = choose_sandbox(two, Some((Where::Machine("a".into()), "web".into())), true) else { panic!() };
         assert_eq!(options.iter().map(|o| o.0.as_str()).collect::<Vec<_>>(), ["a/web (/r1)", "a/web (/r2)"]);
+        assert_eq!(prompt, "`web` is defined in several roots of `a`");
+        assert_eq!(error, "`web` is defined in several roots of `a`: a/web (/r1), a/web (/r2)");
         // No local config: the example, unless a machine has it.
         let remote_only = || vec![row("web", Some("a"), "/r")];
         assert_eq!(choose_sandbox(remote_only(), Some((Where::Any, "web".into())), true), SandboxChoice::There(row("web", Some("a"), "/r")));

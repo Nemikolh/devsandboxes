@@ -54,4 +54,7 @@ member verifying it entry by entry and taking a newer one from any peer.
 - Losing the authority's key freezes every signed config at its last
   version, as it freezes membership (0044).
 - Roots the authority never signs keep 0002 as is: their host's config is
-  the boundary.
+  the boundary. A peer's build from a root named like a signed config but
+  not its copy is refused (`fleet::mesh::check_peer_root_in`, from
+  `daemon::check_mesh_copy`): the peer asked for the signed config, not
+  this host's unsigned dir of the same name. A local client's isn't.

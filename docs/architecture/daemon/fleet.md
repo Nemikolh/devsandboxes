@@ -2263,7 +2263,15 @@ it never signs on a remote request alone (decision 49;
   Two places run it. The daemon, for a `run`, `rebuild`, `start` or
   `services.rebuild` from any client, local or over a link, before a
   placement or the runner (`daemon::check_mesh_copy`, after signing,
-  answered `denied`). And every command that builds from a config dir,
+  answered `denied`); for a linked or routed peer (`daemon::Table::Peer`)
+  it also refuses a root that isn't a copy but whose last path component
+  (as asked or canonical) is a `config` name in the log, unless it's in
+  that peer's own fleet root (`lent::Peer::fleet_root`, a placed run's
+  moved code) (`mesh::check_peer_root_in`: ``config root `<root>` has the name of the
+  signed config `<name>` but isn't its copy here (<copy>): run it from
+  the copy``), so a peer's `<machine>/<name>` that matches this host's own
+  dir of that name too (say `~/.devsandboxes`) never builds it unsigned.
+  And every command that builds from a config dir,
   at its entry, before it reads the config (`mesh::check_root`, over the
   data dir and `member.toml` of the process env): `commands::run::run`,
   `commands::rebuild::rebuild`, `commands::start::start` (once for
