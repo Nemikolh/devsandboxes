@@ -469,8 +469,12 @@ impl Daemon {
             .dir
             .canonicalize()
             .map_err(|e| (ApiError::not_found(format!("no directory {}: {e}", req.dir.display())), None))?;
+        // Unreadable state: nothing reserved (the configured forwards then
+        // can't start either).
+        let project = self.root(&dir).project.clone();
+        let reserved = project.and_then(|p| State::load().ok().map(|s| root_saved_ports(&s, &p))).unwrap_or_default();
         let mut next_id = self.next_id;
-        let opened = self.root(&dir).open(req, &mut next_id, now);
+        let opened = self.root(&dir).open(req, &reserved, &mut next_id, now);
         self.next_id = next_id;
         opened
     }
@@ -507,7 +511,9 @@ impl Daemon {
             host_port: 0,
             machine: Some(machine),
         };
-        let (id, entry) = bind_open(key, port, req.callback, |host_port| self.start_remote(entry.clone(), host_port))?;
+        // No reserved ports: a member's root has no configured forwards here.
+        let (id, entry) =
+            bind_open(key, port, req.callback, &BTreeSet::new(), |host_port| self.start_remote(entry.clone(), host_port))?;
         if let Some(r) = self.remote.get_mut(&id) {
             r.opened = Some(now);
         }
@@ -857,17 +863,26 @@ impl Daemon {
 /// An open forward's failure: the error, and a status line to send with it.
 type OpenError = (ApiError, Option<String>);
 
-/// Bind a new open forward to instance `key`'s `port` with `start`. A
-/// direct one prefers the container port, falling back to an automatic one
-/// when that can't bind for any reason but being taken (a privileged port
-/// say); a callback needs exactly that port, and failing that comes with a
-/// status line: the OAuth redirect will miss.
+/// Bind a new open forward to instance `key`'s `port` with `start`, never
+/// on a `reserved` host port (one saved for a configured forward of the
+/// root, [`root_saved_ports`]: it would take that forward's port away). A
+/// direct one prefers the container port, walking up past taken and
+/// reserved ones ([`candidates`]), falling back to an automatic one when
+/// none is free or one can't bind for any reason but being taken (a
+/// privileged port say); a callback needs exactly that port, and failing
+/// that (taken, reserved, or not bindable) comes with a status line: the
+/// OAuth redirect will miss.
 fn bind_open<T>(
     key: &str,
     port: u16,
     callback: bool,
+    reserved: &BTreeSet<u16>,
     mut start: impl FnMut(HostPort) -> std::io::Result<T>,
 ) -> Result<T, OpenError> {
+    if callback && reserved.contains(&port) {
+        let note = format!("{key}: port {port} is saved for a configured forward; an OAuth callback to it won't reach {key}");
+        return Err((ApiError::bind_failed(format!("port {port}: saved for a configured forward")), Some(note)));
+    }
     if callback {
         return start(HostPort::Fixed(port)).map_err(|e| {
             let note = if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -878,11 +893,14 @@ fn bind_open<T>(
             (bind_failed(HostPort::Fixed(port), &e), Some(note))
         });
     }
-    match start(HostPort::Prefer(port)) {
-        Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => start(HostPort::Prefer(0)),
-        started => started,
+    for p in candidates(None, port, reserved) {
+        match start(HostPort::Fixed(p)) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(_) => break,
+            Ok(started) => return Ok(started),
+        }
     }
-    .map_err(|e| (bind_failed(HostPort::Prefer(port), &e), None))
+    start(HostPort::Prefer(0)).map_err(|e| (bind_failed(HostPort::Prefer(port), &e), None))
 }
 
 /// The running instances (state keys) that may belong to config root `root`:
@@ -1058,10 +1076,11 @@ impl Root {
 
     /// The opener's forward to `req`'s instance port: an existing one that
     /// fits ([`Root::reusable`]; an open one's `touched` refreshed), else a
-    /// new open forward on 127.0.0.1 ([`bind_open`]). The instance key is
+    /// new open forward on 127.0.0.1 ([`bind_open`], never on a `reserved`
+    /// port: [`root_saved_ports`] of this root). The instance key is
     /// taken as given: a bad one is the route's error, on the forward's own
     /// thread.
-    fn open(&mut self, req: &OpenRequest, next_id: &mut u64, now: Instant) -> Result<OpenForward, OpenError> {
+    fn open(&mut self, req: &OpenRequest, reserved: &BTreeSet<u16>, next_id: &mut u64, now: Instant) -> Result<OpenForward, OpenError> {
         let (key, port) = (req.instance.as_str(), req.container_port);
         if let Some(id) = self.reusable(key, port, req.callback) {
             if let Some(o) = self.opened.get_mut(&id) {
@@ -1069,7 +1088,7 @@ impl Root {
             }
             return Ok(OpenForward { host_port: self.live[&id].status().local_addr.port(), reused: true });
         }
-        let started = bind_open(key, port, req.callback, |host_port| {
+        let started = bind_open(key, port, req.callback, reserved, |host_port| {
             Forward::start(ForwardSpec {
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 host_port,
@@ -1349,6 +1368,16 @@ fn reserved_ports(state: &State, project: &str, c: &Configured) -> BTreeSet<u16>
     out
 }
 
+/// Every host port `state.toml` saves for a configured forward of config
+/// root `project` (its instances' and its global services'): what an open
+/// forward there never binds, though the forward may be stopped now
+/// ([`bind_open`]).
+fn root_saved_ports(state: &State, project: &str) -> BTreeSet<u16> {
+    let instances = state.instances.values().filter(|i| i.project == project).flat_map(|i| i.forwarded_ports.values());
+    let global = state.global_forwarded_ports.get(project).into_iter().flat_map(|e| e.values());
+    instances.chain(global).copied().collect()
+}
+
 /// Host ports to try, in order: the saved one, then `base` upward over
 /// [`PREFER_SPAN`] ports, skipping ones other forwards hold.
 fn candidates(saved: Option<u16>, base: u16, reserved: &BTreeSet<u16>) -> Vec<u16> {
@@ -1580,6 +1609,64 @@ forwardPorts = ["redis:6379"]
         assert_eq!(&got[..4], &[3002, 3000, 3004, 3005]);
         assert_eq!(got.len(), PREFER_SPAN as usize - 2 - 1 + 1);
         assert_eq!(candidates(None, u16::MAX, &BTreeSet::new()), vec![u16::MAX]);
+    }
+
+    #[test]
+    fn root_saved_ports_are_the_roots_instances_and_globals() {
+        let (_, mut state) = fixture();
+        state.global_forwarded_ports.entry("p1".into()).or_default().insert("redis:6379".into(), 6379);
+        state.global_forwarded_ports.entry("p2".into()).or_default().insert("redis:6379".into(), 6380);
+        assert_eq!(root_saved_ports(&state, "p1"), [3001, 6379].into());
+        assert_eq!(root_saved_ports(&state, "p2"), [3000, 6380].into());
+        assert!(root_saved_ports(&state, "p3").is_empty());
+    }
+
+    /// A fake `start` for [`bind_open`]: `taken` ports are in use, port 80
+    /// is privileged, anything else binds (as the port asked for, 0 as
+    /// 40000). Records every attempt.
+    fn fake_start<'a>(attempts: &'a mut Vec<HostPort>, taken: &'a [u16]) -> impl FnMut(HostPort) -> std::io::Result<u16> + 'a {
+        move |hp| {
+            attempts.push(hp);
+            match hp {
+                HostPort::Fixed(p) | HostPort::Prefer(p) if taken.contains(&p) => Err(std::io::ErrorKind::AddrInUse.into()),
+                HostPort::Fixed(80) | HostPort::Prefer(80) => Err(std::io::ErrorKind::PermissionDenied.into()),
+                HostPort::Prefer(0) => Ok(40000),
+                HostPort::Fixed(p) | HostPort::Prefer(p) => Ok(p),
+            }
+        }
+    }
+
+    #[test]
+    fn bind_open_never_takes_a_reserved_port() {
+        let reserved: BTreeSet<u16> = [3000, 3001].into();
+        let mut attempts = Vec::new();
+        assert_eq!(bind_open("web", 3000, false, &reserved, fake_start(&mut attempts, &[3002])).unwrap(), 3003);
+        assert_eq!(attempts, vec![HostPort::Fixed(3002), HostPort::Fixed(3003)], "past reserved and taken");
+
+        let mut attempts = Vec::new();
+        assert_eq!(bind_open("web", 3000, false, &BTreeSet::new(), fake_start(&mut attempts, &[])).unwrap(), 3000);
+        assert_eq!(attempts, vec![HostPort::Fixed(3000)]);
+
+        let mut attempts = Vec::new();
+        assert_eq!(bind_open("web", 80, false, &reserved, fake_start(&mut attempts, &[])).unwrap(), 40000, "privileged");
+        assert_eq!(attempts, vec![HostPort::Fixed(80), HostPort::Prefer(0)]);
+
+        let all: Vec<u16> = (3000..3000 + PREFER_SPAN).collect();
+        let mut attempts = Vec::new();
+        assert_eq!(bind_open("web", 3000, false, &reserved, fake_start(&mut attempts, &all)).unwrap(), 40000, "none free");
+
+        let mut attempts = Vec::new();
+        let (e, note) = bind_open("web", 3001, true, &reserved, fake_start(&mut attempts, &[])).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("bind-failed", "port 3001: saved for a configured forward"));
+        assert_eq!(
+            note.as_deref(),
+            Some("web: port 3001 is saved for a configured forward; an OAuth callback to it won't reach web")
+        );
+        assert!(attempts.is_empty(), "never tried");
+
+        let mut attempts = Vec::new();
+        assert_eq!(bind_open("web", 3005, true, &reserved, fake_start(&mut attempts, &[])).unwrap(), 3005);
+        assert_eq!(attempts, vec![HostPort::Fixed(3005)]);
     }
 
     #[test]
@@ -1838,12 +1925,27 @@ forwardPorts = ["redis:6379"]
         std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
     }
 
+    /// A callback open (`Fixed`) of `req(port)` on a port that was free a
+    /// moment ago: another test may take it in between, so a `bind-failed`
+    /// is retried with a fresh port. The port it bound, and the answer.
+    fn first_callback(h: &Handle, req: impl Fn(u16) -> OpenRequest) -> (u16, OpenForward) {
+        for _ in 0..5 {
+            let port = free_port();
+            match h.open_forward(req(port)) {
+                Err(e) if e.code == "bind-failed" => continue,
+                answer => return (port, answer.unwrap()),
+            }
+        }
+        panic!("no free port bound in 5 tries");
+    }
+
     /// A callback open binds its own port, makes an `open` row and no store
     /// entry; the next callback and a direct open of the same instance port
     /// reuse it. A direct open whose port is taken walks up, and a callback
     /// won't reuse that one (wrong host port), so it tries its own port and
-    /// fails. `rm` stops one. No port is ever freed for a later bind, so a
-    /// parallel test can't take it in between.
+    /// fails. `rm` stops one. The first callback's port is picked free and
+    /// may be taken before it binds ([`first_callback`] retries); after that
+    /// no port is freed for a later bind, so a parallel test can't take it.
     #[test]
     fn open_forwards_reuse_by_instance_port_never_persist_and_rm() {
         let root = tmp("open-root");
@@ -1851,8 +1953,7 @@ forwardPorts = ["redis:6379"]
         let (reg, _) = registry_at(&store);
         let h = reg.handle();
 
-        let port = free_port();
-        let callback = h.open_forward(open_req(&root, port, true)).unwrap();
+        let (port, callback) = first_callback(&h, |port| open_req(&root, port, true));
         assert_eq!(callback, OpenForward { host_port: port, reused: false });
         let rows = h.list(None, false).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1903,6 +2004,37 @@ forwardPorts = ["redis:6379"]
             reg.handle().open_forward(open_req(Path::new("/nonexistent/devsandbox-fwd"), port, false)).unwrap_err().code,
             "not-found"
         );
+    }
+
+    /// A reserved port (saved for a configured forward of the root) is
+    /// never an open forward's: a direct open walks past it, a callback on
+    /// it is refused with a status line, unless a forward of that instance
+    /// port is live on it already (reuse comes first).
+    #[test]
+    fn open_forwards_never_take_a_reserved_port() {
+        let root = tmp("open-reserved");
+        let mut r = Root::new(root.clone());
+        let (mut next_id, now) = (1, Instant::now());
+        let reserved: BTreeSet<u16> = [free_port()].into();
+        let p = *reserved.first().unwrap();
+        let (e, note) = r.open(&open_req(&root, p, true), &reserved, &mut next_id, now).unwrap_err();
+        assert_eq!(e.code, "bind-failed");
+        assert!(note.unwrap().contains(&format!("port {p} is saved for a configured forward")));
+        let direct = r.open(&open_req(&root, p, false), &reserved, &mut next_id, now).unwrap();
+        assert!(!direct.reused && direct.host_port != p, "{direct:?}");
+
+        let (q, first) = (0..5)
+            .find_map(|_| {
+                let q = free_port();
+                r.open(&open_req(&root, q, true), &BTreeSet::new(), &mut next_id, now).ok().map(|f| (q, f))
+            })
+            .expect("no free port bound in 5 tries");
+        assert_eq!(first.host_port, q);
+        let now_reserved: BTreeSet<u16> = [q].into();
+        let again = r.open(&open_req(&root, q, true), &now_reserved, &mut next_id, now).unwrap();
+        assert_eq!(again, OpenForward { host_port: q, reused: true }, "live on it already: reused");
+        drop(r);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- persistence (forwards.toml) ----
@@ -2111,7 +2243,8 @@ forwardPorts = ["redis:6379"]
     /// An open into a machine's instance is a remote `open` row, never in
     /// the store, reused like a local one (a user's ad-hoc remote forward
     /// too, a callback only on its own host port); `rm` leaves the store
-    /// alone. As above, no port is freed for a later bind.
+    /// alone. As above, the first port is retried if taken, and no port is
+    /// freed for a later bind.
     #[test]
     fn remote_open_forwards_reuse_never_persist_and_rm() {
         let store = tmp("remote-open").join("forwards.toml");
@@ -2120,8 +2253,7 @@ forwardPorts = ["redis:6379"]
         let h = reg.handle();
         let unsaved = || !store.exists() || forward_store::load(&store).unwrap().is_empty();
 
-        let port = free_port();
-        let callback = h.open_forward(remote_open(port, true)).unwrap();
+        let (port, callback) = first_callback(&h, |port| remote_open(port, true));
         assert_eq!(callback, OpenForward { host_port: port, reused: false });
         let rows = h.list(None, true).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");

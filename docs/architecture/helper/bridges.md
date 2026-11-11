@@ -137,6 +137,9 @@ never reaches the Inbox: `apply_message` and `inbox::decide` refuse one. The
 sink checks it with `open::decide`, pure over the URL, the record's `at`, the
 host's clock and a limiter:
 
+- no control character or whitespace anywhere (`open::has_bad_chars`; a
+  real URL percent-encodes them, and a raw one could forge a log or status
+  line): refused;
 - scheme `http` or `https` followed by `://`; anything else is refused;
 - `open::OPEN_TTL` (30 s from `at`): the outbox keeps records while no host
   is attached, and an OAuth URL opening much later is worse than none, so an
@@ -146,7 +149,9 @@ host's clock and a limiter:
   by a record that passed the other two.
 
 A refused or dropped record is a `serve.log` line naming the instance and the
-URL (`Verdict::log_line`, through `SinkHooks::log`) and a refused
+URL (`Verdict::log_line`, through `SinkHooks::log`; both escaped by
+`open::printable`, as is every log and status line quoting what a
+container or a member sent) and a refused
 `open::OpenDone` to `SinkHooks::on_open_done` (`Verdict::refusal`, no
 profile: none is read yet). One that passes goes to
 the `SinkHooks::opener` (`bridge::Opener`, called with the instance's name,
@@ -175,8 +180,9 @@ and Plasma import their display there at login, but a `serve install`ed
 daemon starts with `default.target`, before they do, so its own env has none.
 A session that doesn't import it needs `systemctl --user import-environment
 DISPLAY WAYLAND_DISPLAY XAUTHORITY` once per login. No display anywhere,
-no known opener or a failed spawn is a `serve.log` line too (`no display to
-open <url> on`).
+a direct loopback port that can't forward (below), no known opener or a
+failed spawn is a `serve.log` line too (`no display to open <url> on`),
+and nothing opens.
 
 #### What the user sees: `opens.done`
 
@@ -191,13 +197,13 @@ the dashboard shows its `line` (`OpenDone::line`) as the status line:
   `open.deliver` comes back as the call's error, so it shows here, where
   the open came from);
 - the opening host (`open::open_here`): opened once the command is
-  spawned (`web: opened https://… (work)`), else failed (no display, no
-  opener, the spawn's error). A delivered open names its instance
-  `machine/name`.
+  spawned (`web: opened https://… (work)`), else failed (no display, the
+  URL's own port not forwarded, no opener, the spawn's error). A
+  delivered open names its instance `machine/name`.
 
-Ports that didn't forward don't make an open fail (the URL still opens):
-they ride on its one `opened` line (`; cannot forward callback port
-8085`), as `forward_loopbacks` returns them. That includes a callback port
+Callback ports that didn't forward don't make an open fail (the URL still
+opens): they ride on its one `opened` line (`; cannot forward callback
+port 8085`), as `forward_loopbacks` returns them. That includes a callback port
 the registry couldn't bind, whose own `forwards.status` line the `opened`
 one would otherwise replace on the status line. Each keeps its
 `serve.log` line.
@@ -209,9 +215,16 @@ makes the ports the URL points at reachable on this host
 (`open::forward_loopbacks`). `open::loopback_ports` reads, without
 following nested URLs:
 
-- **direct**: the URL's own port when its host is `localhost`,
-  `127.0.0.1`, `[::1]` or `0.0.0.0` (any case; no port is 80 for `http`,
-  443 for `https`; a port that isn't 1-65535 is none);
+- **direct**: the URL's own port when its host is loopback
+  (`open::is_loopback`): `localhost` (any case), any dotted quad in
+  `127.0.0.0/8`, `0.0.0.0` (each also with a trailing dot) or a bracketed
+  IPv6 loopback (`[::1]`). No port is 80 for `http`, 443 for `https`; a
+  port that isn't ASCII digits within 1-65535 is none. The authority ends
+  at `/`, `\`, `?` or `#` as a browser cuts an http(s) URL, so
+  `http://a.com\@localhost/` is `a.com`'s. Hosts a browser reads as
+  loopback but the opener doesn't parse (shorthand or non-decimal IPv4
+  such as `127.1` or `0x7f.0.0.1`, zone ids, percent-encoded hosts) count
+  as any other host: no forward, opened as given;
 - **callback**: the port of a loopback `http(s)` URL in the query under
   `redirect_uri`, `redirect_url` or `callback` (percent-decoded). Only a
   key's first value counts, so repeating a key can't make the host bind
@@ -228,13 +241,23 @@ sending member and the root and name it gave. The daemon's
 The seam keeps `src/open.rs` free of the unix-only `serve`.
 
 The URL that opens is rewritten (`open::rewrite_direct`) to the direct
-port's bound host port when it differs, and a `0.0.0.0` host becomes
-`localhost` (Chrome refuses to navigate to `0.0.0.0`). A callback's URL
-stays as it is: the provider redirects to its exact port. An instance not
-in `state.toml`, one with no config root or a forward that fails is a
-`serve.log` line naming the instance and the URL, and that port stays as
-it was; the URL still opens. A callback port the registry can't bind has
-its own `forwards.status` line, so the opener logs nothing more for it.
+port's bound host port when it differs, a `0.0.0.0` host becomes
+`localhost` (Chrome refuses to navigate to `0.0.0.0`), and IPv6's
+loopback or another `127.0.0.0/8` address becomes `127.0.0.1`, where the
+forward listens. A callback's
+URL stays as it is: the provider redirects to its exact port.
+
+The direct port must forward: when it can't (an instance not in
+`state.toml`, one with no config root, a forward that fails, a port that is
+also the callback whose exact bind failed), nothing opens and nothing else
+is forwarded: the browser would reach whatever this host runs on that
+port, and send it the URL, maybe with a token. That is a failed open
+(`cannot forward port 3000: <why>`), one `serve.log` line (`<instance>: not
+opening <url>: …`) and its `opens.done`. A callback-only port that fails
+doesn't stop the open (the page itself is remote): a `serve.log` line
+naming the instance and the URL, and the port rides on the `opened` line.
+A callback port the registry can't bind has its own `forwards.status`
+line, so the opener logs nothing more for it.
 
 ### Control requests (`CONTROL`)
 

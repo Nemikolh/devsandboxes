@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -42,6 +43,9 @@ pub const OPEN_ATTACH_WINDOW: Duration = Duration::from_secs(10 * 60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Open,
+    /// A control character or whitespace somewhere in the URL: a real one
+    /// percent-encodes them, and a raw one could forge a log or status line.
+    BadChars,
     /// Not `http`/`https`; the scheme as given (empty when there is none).
     BadScheme(String),
     /// Queued `age` seconds ago, past [`OPEN_TTL`].
@@ -56,6 +60,7 @@ impl Verdict {
     pub fn refusal(&self) -> Option<String> {
         Some(match self {
             Verdict::Open => return None,
+            Verdict::BadChars => "control characters or whitespace in the URL".to_string(),
             Verdict::BadScheme(s) if s.is_empty() => "not a URL with a scheme".to_string(),
             Verdict::BadScheme(s) => format!("scheme `{s}` (http and https only)"),
             Verdict::Expired { age } => format!("queued {age}s ago (over {}s)", OPEN_TTL.as_secs()),
@@ -64,12 +69,39 @@ impl Verdict {
     }
 
     /// The `serve.log` line for a refusal or drop, naming `instance` and
-    /// `url`; `None` for [`Verdict::Open`].
+    /// `url` ([`printable`]: both may come from a container or a peer);
+    /// `None` for [`Verdict::Open`].
     pub fn log_line(&self, instance: &str, url: &str) -> Option<String> {
         let why = self.refusal()?;
         let verb = if matches!(self, Verdict::Expired { .. }) { "dropped" } else { "refused" };
-        Some(format!("{instance}: open {verb}, {why}: {url}"))
+        Some(format!("{}: open {verb}, {why}: {}", printable(instance), printable(url)))
     }
+}
+
+/// Whether `c` may not appear raw in an opened URL ([`Verdict::BadChars`]).
+fn bad_char(c: char) -> bool {
+    c.is_control() || c.is_whitespace()
+}
+
+/// Whether `url` holds a control character or whitespace
+/// ([`Verdict::BadChars`]).
+pub fn has_bad_chars(url: &str) -> bool {
+    url.chars().any(bad_char)
+}
+
+/// `s` safe for one log or status line: control characters and whitespace
+/// other than a space escaped (`\n`, `\u{1b}`), the rest as is. For text a
+/// container or a fleet peer chose (a refused URL, a member's error).
+pub fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if bad_char(c) && c != ' ' {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// What became of one open, for the user (`opens.done`,
@@ -78,9 +110,9 @@ impl Verdict {
 /// delivery, the opening host for the rest ([`open_here`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The opener was started. `unforwarded`: loopback ports the URL needed
-    /// that couldn't be forwarded (an OAuth callback port taken, say); the
-    /// URL opened anyway, so this is still one `opened` line, naming them.
+    /// The opener was started. `unforwarded`: callback ports the URL named
+    /// that couldn't be forwarded (taken, say); the URL opened anyway (its
+    /// page isn't on them), so this is still one `opened` line, naming them.
     Opened { unforwarded: Vec<Loopback> },
     /// The policy said no ([`Verdict::refusal`]).
     Refused(String),
@@ -146,17 +178,19 @@ impl OpenDone {
     /// The status line: `web: opened https://… (work)`, with `; cannot
     /// forward callback port 8085` when a port didn't forward; `web: open
     /// refused: <why>`; `web: open failed: <why>`. The URL and the reason are
-    /// [`shorten`]ed.
+    /// [`shorten`]ed, and everything is [`printable`]: a refused URL or a
+    /// member's reason may carry anything.
     pub fn line(&self) -> String {
-        let why = self.why().map(|w| shorten(&w, LINE_WHY));
+        let why = self.why().map(|w| printable(&shorten(&w, LINE_WHY)));
+        let instance = printable(&self.instance);
         match (&self.outcome, why) {
             (Outcome::Opened { .. }, why) => {
-                let profile = self.profile.as_ref().map_or(String::new(), |p| format!(" ({p})"));
+                let profile = self.profile.as_ref().map_or(String::new(), |p| format!(" ({})", printable(p)));
                 let note = why.map_or(String::new(), |w| format!("; {w}"));
-                format!("{}: opened {}{profile}{note}", self.instance, shorten(&self.url, LINE_URL))
+                format!("{instance}: opened {}{profile}{note}", printable(&shorten(&self.url, LINE_URL)))
             }
-            (Outcome::Refused(_), why) => format!("{}: open refused: {}", self.instance, why.unwrap_or_default()),
-            (Outcome::Failed(_), why) => format!("{}: open failed: {}", self.instance, why.unwrap_or_default()),
+            (Outcome::Refused(_), why) => format!("{instance}: open refused: {}", why.unwrap_or_default()),
+            (Outcome::Failed(_), why) => format!("{instance}: open failed: {}", why.unwrap_or_default()),
         }
     }
 }
@@ -167,11 +201,15 @@ impl OpenDone {
 pub type OnDone = Arc<dyn Fn(OpenDone) + Send + Sync>;
 
 /// Decide whether `url`, queued at `at` (unix seconds), opens at `now` (unix
-/// seconds). Checked in order: the scheme (`http`/`https`, any case,
+/// seconds). Checked in order: its characters (no control character or
+/// whitespace, [`Verdict::BadChars`]), the scheme (`http`/`https`, any case,
 /// followed by `://`), then [`OPEN_TTL`], then `limit`, which is only asked
 /// (and only spends a token) once the others pass. A record from the future
 /// (clock skew between container and host) counts as fresh.
 pub fn decide(url: &str, at: u64, now: u64, limit: impl FnOnce() -> bool) -> Verdict {
+    if has_bad_chars(url) {
+        return Verdict::BadChars;
+    }
     let scheme = match url.split_once(':') {
         Some((s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) => s,
         _ => "",
@@ -337,7 +375,10 @@ pub struct Loopback {
 /// The query keys whose value may be a loopback callback URL.
 const CALLBACK_KEYS: [&str; 3] = ["redirect_uri", "redirect_url", "callback"];
 
-/// A `scheme://[userinfo@]host[:port]...` URL cut into byte ranges.
+/// A `scheme://[userinfo@]host[:port]...` URL cut into byte ranges, as a
+/// browser cuts an http(s) one: the authority ends at `/`, `\`, `?` or `#`
+/// (WHATWG reads `\` as `/` in an http(s) URL, so `http://a.com\@localhost/`
+/// is `a.com`'s).
 struct Parts<'a> {
     scheme: &'a str,
     /// Where the host starts (after any userinfo).
@@ -352,7 +393,7 @@ struct Parts<'a> {
 fn parts(url: &str) -> Option<Parts<'_>> {
     let (scheme, after) = url.split_once("://")?;
     let start = scheme.len() + 3;
-    let authority = &after[..after.find(['/', '?', '#']).unwrap_or(after.len())];
+    let authority = &after[..after.find(['/', '\\', '?', '#']).unwrap_or(after.len())];
     let host_at = start + authority.rfind('@').map_or(0, |i| i + 1);
     let host_port = &url[host_at..start + authority.len()];
     let (host, port) = match host_port.strip_prefix('[') {
@@ -370,12 +411,52 @@ fn parts(url: &str) -> Option<Parts<'_>> {
     Some(Parts { scheme, host_at, host, port, rest_at: start + authority.len() })
 }
 
-fn is_loopback(host: &str) -> bool {
-    ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].iter().any(|h| host.eq_ignore_ascii_case(h))
+/// A host's dotted-quad IPv4 address, a trailing dot allowed (`127.0.0.1.`).
+/// Only the four-decimal form: shorthand and hex/octal forms aren't parsed
+/// (`127.1`, `0x7f.0.0.1`), so they never count as loopback.
+fn ipv4(host: &str) -> Option<Ipv4Addr> {
+    host.strip_suffix('.').unwrap_or(host).parse().ok()
 }
 
-/// The port of an http(s) URL on a loopback host: given, else the scheme's
-/// default. `None`: not http(s), not loopback, or a port that isn't 1-65535.
+/// Whether `host` (as [`parts`] cuts it) is the container's own loopback:
+/// `localhost` (any case), any dotted quad in `127.0.0.0/8`, `0.0.0.0`
+/// (each with or without a trailing dot), or a bracketed IPv6 loopback
+/// (`[::1]`, also spelled out). Zone ids and percent-encoded hosts aren't
+/// parsed: not loopback.
+fn is_loopback(host: &str) -> bool {
+    if host.strip_suffix('.').unwrap_or(host).eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(ip) = ipv4(host) {
+        return ip.is_loopback() || ip.is_unspecified();
+    }
+    let v6 = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    v6.and_then(|h| h.parse::<Ipv6Addr>().ok()).is_some_and(|ip| ip.is_loopback())
+}
+
+/// The host a loopback host is opened as here, when it isn't kept: the
+/// forward listens on 127.0.0.1, so another `127.0.0.0/8` address or IPv6's
+/// loopback would miss it, and reach whatever the host itself runs there
+/// (127.0.0.1); Chrome refuses to navigate to 0.0.0.0, and a server
+/// listening on it takes localhost too (`localhost`).
+fn host_here(host: &str) -> Option<&'static str> {
+    let v6 = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    if v6.and_then(|h| h.parse::<Ipv6Addr>().ok()).is_some_and(|ip| ip.is_loopback()) {
+        return Some("127.0.0.1");
+    }
+    let ip = ipv4(host)?;
+    if ip.is_unspecified() {
+        Some("localhost")
+    } else if ip.is_loopback() && ip != Ipv4Addr::LOCALHOST {
+        Some("127.0.0.1")
+    } else {
+        None
+    }
+}
+
+/// The port of an http(s) URL on a loopback host: given (ASCII digits
+/// only), else the scheme's default. `None`: not http(s), not loopback, or
+/// a port that isn't 1-65535.
 fn loopback_port(url: &str) -> Option<u16> {
     let p = parts(url)?;
     if !is_loopback(p.host) {
@@ -388,7 +469,8 @@ fn loopback_port(url: &str) -> Option<u16> {
     };
     match p.port {
         None | Some("") => Some(default),
-        Some(port) => port.parse().ok().filter(|&p| p != 0),
+        Some(port) if port.bytes().all(|b| b.is_ascii_digit()) => port.parse().ok().filter(|&p| p != 0),
+        Some(_) => None,
     }
 }
 
@@ -414,7 +496,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// The loopback ports `url` needs forwarded: its own port when its host is
-/// `localhost`, `127.0.0.1`, `[::1]` or `0.0.0.0` (any case), and the port
+/// loopback ([`is_loopback`]), and the port
 /// of each loopback http(s) URL in its query under [`CALLBACK_KEYS`]
 /// (percent-decoded). Only a key's first value counts, so repeating a key
 /// can't make the host bind many ports; nested URLs aren't followed. One
@@ -445,12 +527,11 @@ pub fn loopback_ports(url: &str) -> Vec<Loopback> {
 
 /// `url` with its loopback host and port made right for this host: the port
 /// set to `port` (added, or replaced; userinfo, path, query and fragment
-/// kept), and a `0.0.0.0` host made `localhost`, also with `port` `None`
-/// (Chrome refuses to navigate to 0.0.0.0, and a server listening on it
-/// takes localhost too). A URL that doesn't parse is returned as is.
+/// kept), and the host [`host_here`] says, also with `port` `None`. A URL
+/// that doesn't parse is returned as is.
 pub fn rewrite_direct(url: &str, port: Option<u16>) -> String {
     let Some(p) = parts(url) else { return url.to_string() };
-    let host = if p.host == "0.0.0.0" { "localhost" } else { p.host };
+    let host = host_here(p.host).unwrap_or(p.host);
     let port = match (port, p.port) {
         (Some(n), _) => format!(":{n}"),
         (None, Some(text)) => format!(":{text}"),
@@ -469,18 +550,24 @@ pub type Forwarder = Arc<dyn Fn(&ForwardTarget, Loopback) -> Result<u16, Option<
 
 /// The forwarding step before an open: each of `url`'s [`loopback_ports`]
 /// forwarded to `target` through `forward`, and the URL to open: rewritten
-/// to the direct port's bound host port when that differs, and off a
-/// `0.0.0.0` host ([`rewrite_direct`]). Anything that fails (no target, a
-/// forward refused) leaves that port as it was and is a log line naming
-/// `instance` and `url` (unless the forwarder logged it, `Err(None)`); the
-/// URL still opens. Third: every port that didn't forward, for the
-/// [`Outcome::Opened`] line.
+/// to the direct port's bound host port when that differs, and to the host
+/// [`host_here`] says ([`rewrite_direct`]).
+///
+/// The URL's own loopback port (the direct one, first) must forward: when it
+/// can't (no target, a forward refused, a port that is also the callback
+/// and couldn't be bound), the URL isn't opened (`Err`, `cannot forward port
+/// N: <why>`) and nothing else is forwarded, since the browser would reach
+/// whatever this host runs on that port, the URL (maybe a token) with it. A
+/// callback port that fails is only a log line naming `instance` and `url`
+/// (unless the forwarder logged it, `Err(None)`): the page itself is
+/// remote, so the URL still opens. Third: every callback port that didn't
+/// forward, for the [`Outcome::Opened`] line.
 pub fn forward_loopbacks(
     instance: &str,
     url: &str,
     target: Result<&ForwardTarget, &str>,
     forward: impl Fn(&ForwardTarget, Loopback) -> Result<u16, Option<String>>,
-) -> (String, Vec<String>, Vec<Loopback>) {
+) -> (Result<String, String>, Vec<String>, Vec<Loopback>) {
     let wanted = loopback_ports(url);
     let direct = loopback_port(url);
     let mut lines = Vec::new();
@@ -489,20 +576,27 @@ pub fn forward_loopbacks(
     if !wanted.is_empty() {
         match target {
             Err(why) => {
+                if let Some(port) = direct {
+                    return (Err(format!("cannot forward port {port}: {why}")), lines, unforwarded);
+                }
                 let ports: Vec<String> = wanted.iter().map(|l| l.port.to_string()).collect();
                 let s = if ports.len() > 1 { "s" } else { "" };
-                lines.push(format!("{instance}: cannot forward port{s} {} for {url} ({why}); opening it as is", ports.join(", ")));
+                lines.push(format!("{instance}: cannot forward callback port{s} {} for {url} ({why}); opening it as is", ports.join(", ")));
                 unforwarded = wanted;
             }
             Ok(target) => {
                 for lb in wanted {
+                    let own = Some(lb.port) == direct;
                     match forward(target, lb) {
-                        Ok(host_port) if Some(lb.port) == direct => bound = Some(host_port),
+                        Ok(host_port) if own => bound = Some(host_port),
                         Ok(_) => {}
+                        Err(why) if own => {
+                            let why = why.unwrap_or_else(|| "it is also the callback port, which couldn't be bound".into());
+                            return (Err(format!("cannot forward port {}: {why}", lb.port)), lines, unforwarded);
+                        }
                         Err(None) => unforwarded.push(lb),
                         Err(Some(why)) => {
-                            let what = if lb.callback { "callback port" } else { "port" };
-                            lines.push(format!("{instance}: cannot forward {what} {} for {url}: {why}", lb.port));
+                            lines.push(format!("{instance}: cannot forward callback port {} for {url}: {why}", lb.port));
                             unforwarded.push(lb);
                         }
                     }
@@ -511,12 +605,12 @@ pub fn forward_loopbacks(
         }
     }
     let rewrite = bound.filter(|&b| Some(b) != direct);
-    let opened = if rewrite.is_some() || parts(url).is_some_and(|p| p.host == "0.0.0.0") && direct.is_some() {
+    let opened = if rewrite.is_some() || parts(url).is_some_and(|p| host_here(p.host).is_some()) && direct.is_some() {
         rewrite_direct(url, rewrite)
     } else {
         url.to_string()
     };
-    (opened, lines, unforwarded)
+    (Ok(opened), lines, unforwarded)
 }
 
 /// The session variables a browser on this host needs: the display
@@ -598,8 +692,9 @@ pub fn prepare(instance: &str, instance_id: &str, url: &str, log: fn(&str)) -> O
 /// gets is the rewritten one). Blocks until the child exits (it reaps it):
 /// callers run it on a thread of its own, so a bridge's handler or an API
 /// request never waits on it (nor on the forwards), like
-/// `desktop::notify_desktop`. No display, no known opener or a failed spawn
-/// is one `log` line naming the instance and the URL. Every open ends in
+/// `desktop::notify_desktop`. No display, a direct loopback port that can't
+/// forward, no known opener or a failed spawn is one `log` line naming the
+/// instance and the URL, and nothing opens. Every open ends in
 /// one `done` ([`Outcome::Opened`] once the child is spawned, else
 /// [`Outcome::Failed`]), naming a delivered open's instance `machine/name`.
 pub fn open_here(job: OpenJob, forward: &Forwarder, log: fn(&str), done: &OnDone) {
@@ -618,10 +713,17 @@ pub fn open_here(job: OpenJob, forward: &Forwarder, log: fn(&str), done: &OnDone
         log(&format!("{instance}: {e:#}; opening {url} with the default opener"));
         HostProfiles::new()
     });
-    let (url, lines, unforwarded) = forward_loopbacks(&instance, &url, target.as_ref().map_err(String::as_str), &**forward);
+    let (opened, lines, unforwarded) = forward_loopbacks(&instance, &url, target.as_ref().map_err(String::as_str), &**forward);
     for line in &lines {
         log(line);
     }
+    let url = match opened {
+        Ok(url) => url,
+        Err(why) => {
+            log(&format!("{instance}: not opening {url}: {why}"));
+            return finish(&url, Outcome::Failed(why));
+        }
+    };
     let Some(argv) = open_argv(os, profile.as_deref(), &profiles, &url) else {
         log(&format!("{instance}: no opener on {os} for {url}"));
         return finish(&url, Outcome::Failed(format!("no opener on {os}")));
@@ -678,6 +780,32 @@ mod tests {
     }
 
     #[test]
+    fn decide_refuses_control_characters_and_whitespace_first() {
+        for url in [
+            "https://x/a b",
+            "https://x/\n",
+            "https://x/\r\nweb: opened https://evil",
+            "https://x/\u{1b}[2J",
+            "https://x/\t",
+            "https://x/\u{7f}",
+            "https://x/\u{2028}",
+            "https://x/\u{a0}",
+            "ssh://x y",
+        ] {
+            assert_eq!(open_now(url), Verdict::BadChars, "{url:?}");
+        }
+        assert_eq!(decide("https://x/\n", AT, AT, || panic!("not asked")), Verdict::BadChars);
+        assert_eq!(open_now("https://x/a%20b%0A"), Verdict::Open, "percent-encoded is fine");
+        assert_eq!(open_now("https://x/é"), Verdict::Open);
+    }
+
+    #[test]
+    fn printable_escapes_controls_and_keeps_the_rest() {
+        assert_eq!(printable("web: a b é `x` hasn't"), "web: a b é `x` hasn't");
+        assert_eq!(printable("a\nb\r\t\u{1b}[2J\u{2028}"), "a\\nb\\r\\t\\u{1b}[2J\\u{2028}");
+    }
+
+    #[test]
     fn decide_drops_records_past_the_ttl() {
         let ttl = OPEN_TTL.as_secs();
         assert_eq!(decide("https://x", AT, AT + ttl, || true), Verdict::Open, "exactly the TTL still opens");
@@ -712,6 +840,11 @@ mod tests {
         assert_eq!(line(Verdict::BadScheme(String::new())), "web-1: open refused, not a URL with a scheme: ssh://x");
         assert_eq!(line(Verdict::Expired { age: 45 }), "web-1: open dropped, queued 45s ago (over 30s): ssh://x");
         assert_eq!(line(Verdict::Limited), "web-1: open refused, rate limit (5 per 10s): ssh://x");
+        assert_eq!(
+            Verdict::BadChars.log_line("web\n-1", "https://x/\nweb: opened").unwrap(),
+            "web\\n-1: open refused, control characters or whitespace in the URL: https://x/\\nweb: opened",
+            "one line, whatever the URL holds"
+        );
     }
 
     #[test]
@@ -837,6 +970,7 @@ mod tests {
             ("http://localhost:3000/app?x=1#top", &[direct(3000)]),
             ("http://127.0.0.1:8080", &[direct(8080)]),
             ("http://[::1]:5173/", &[direct(5173)]),
+            ("http://[0:0:0:0:0:0:0:1]:5173/", &[direct(5173)]),
             ("http://0.0.0.0:8000/", &[direct(8000)]),
             ("HTTP://LOCALHOST:3000/", &[direct(3000)]),
             ("http://[::1]/", &[direct(80)]),
@@ -844,15 +978,34 @@ mod tests {
             ("https://localhost", &[direct(443)]),
             ("http://localhost:/", &[direct(80)]),
             ("http://user:pw@localhost:9000/", &[direct(9000)]),
+            // A trailing dot, and the whole of 127.0.0.0/8.
+            ("http://localhost.:3000/", &[direct(3000)]),
+            ("http://127.0.0.1.:3000/", &[direct(3000)]),
+            ("http://0.0.0.0.:3000/", &[direct(3000)]),
+            ("http://127.0.0.2:3000/", &[direct(3000)]),
+            ("http://127.255.1.9/", &[direct(80)]),
+            // A browser reads `\` as `/`: the host is evil.com.
+            ("http://evil.com\\@localhost:3000/", &[]),
+            ("http://localhost\\@evil.com:3000/", &[direct(80)]),
             ("http://localhost@example.com:3000/", &[]),
             ("https://example.com/", &[]),
             ("http://localhost.evil.com:3000/", &[]),
-            ("http://127.0.0.2:3000/", &[]),
+            ("http://localhost..:3000/", &[]),
+            ("http://128.0.0.1:3000/", &[]),
             ("http://[::2]:3000/", &[]),
             ("http://localhost:0/", &[]),
             ("http://localhost:65536/", &[]),
             ("http://localhost:3x/", &[]),
+            ("http://localhost:+80/", &[]),
+            ("http://localhost:-1/", &[]),
+            ("http://localhost: 80/", &[]),
             ("http://[::1]x/", &[]),
+            // Not parsed, so not loopback (they open unforwarded).
+            ("http://127.1:3000/", &[]),
+            ("http://0x7f.0.0.1:3000/", &[]),
+            ("http://2130706433:3000/", &[]),
+            ("http://[fe80::1%25lo]:3000/", &[]),
+            ("http://%6cocalhost:3000/", &[]),
             ("not a url", &[]),
         ];
         for (url, want) in cases {
@@ -901,13 +1054,20 @@ mod tests {
             ("http://localhost/a", Some(3001), "http://localhost:3001/a"),
             ("https://localhost", Some(8443), "https://localhost:8443"),
             ("http://localhost?q=http://x:1", Some(5), "http://localhost:5?q=http://x:1"),
-            ("http://[::1]:3000/", Some(3001), "http://[::1]:3001/"),
-            ("http://[::1]/", Some(3001), "http://[::1]:3001/"),
+            ("http://[::1]:3000/", Some(3001), "http://127.0.0.1:3001/"),
+            ("http://[::1]/", Some(3001), "http://127.0.0.1:3001/"),
+            ("http://[::1]:3000/", None, "http://127.0.0.1:3000/"),
             ("http://u:p@127.0.0.1:3000/", Some(3001), "http://u:p@127.0.0.1:3001/"),
             ("http://0.0.0.0:8000/x", None, "http://localhost:8000/x"),
             ("http://0.0.0.0/x", None, "http://localhost/x"),
+            ("http://0.0.0.0.:8000/x", None, "http://localhost:8000/x"),
             ("http://0.0.0.0:8000/x", Some(8001), "http://localhost:8001/x"),
+            ("http://127.0.0.2:8000/x", None, "http://127.0.0.1:8000/x"),
+            ("http://127.9.9.9:8000/x", Some(8001), "http://127.0.0.1:8001/x"),
+            ("http://127.0.0.1.:8000/x", None, "http://127.0.0.1.:8000/x"),
+            ("http://localhost.:3000/", Some(3001), "http://localhost.:3001/"),
             ("http://localhost:3000/", None, "http://localhost:3000/"),
+            ("http://evil.com\\@localhost:3000/", None, "http://evil.com\\@localhost:3000/"),
             ("not a url", Some(1), "not a url"),
         ];
         for (url, port, want) in cases {
@@ -933,31 +1093,38 @@ mod tests {
         }
     }
 
+    fn opens(url: &str) -> Result<String, String> {
+        Ok(url.to_string())
+    }
+
     #[test]
     fn forward_loopbacks_rewrites_a_moved_direct_port() {
         let calls = Default::default();
         let t = local();
         let got = forward_loopbacks("web", "http://localhost:3000/x", Ok(&t), forwarding(&calls, |_| Ok(3001)));
-        assert_eq!(got, ("http://localhost:3001/x".to_string(), vec![], vec![]));
+        assert_eq!(got, (opens("http://localhost:3001/x"), vec![], vec![]));
         assert_eq!(calls.into_inner(), vec![(t.clone(), direct(3000))]);
 
         let got = forward_loopbacks("web", "http://localhost:3000/x", Ok(&t), |_: &ForwardTarget, lb: Loopback| Ok(lb.port));
-        assert_eq!(got, ("http://localhost:3000/x".to_string(), vec![], vec![]), "bound on the same port");
+        assert_eq!(got, (opens("http://localhost:3000/x"), vec![], vec![]), "bound on the same port");
 
         let got = forward_loopbacks("web", "http://0.0.0.0:8000/", Ok(&t), |_: &ForwardTarget, lb: Loopback| Ok(lb.port));
-        assert_eq!(got.0, "http://localhost:8000/", "0.0.0.0 made localhost");
+        assert_eq!(got.0, opens("http://localhost:8000/"), "0.0.0.0 made localhost");
         let got = forward_loopbacks("web", "http://0.0.0.0:8000/", Ok(&t), |_: &ForwardTarget, _| Ok(8001));
-        assert_eq!(got.0, "http://localhost:8001/");
+        assert_eq!(got.0, opens("http://localhost:8001/"));
+        let got = forward_loopbacks("web", "http://127.0.0.5:8000/", Ok(&t), |_: &ForwardTarget, lb: Loopback| Ok(lb.port));
+        assert_eq!(got.0, opens("http://127.0.0.1:8000/"), "onto the forward's 127.0.0.1");
     }
 
     #[test]
     fn forward_loopbacks_hands_a_machines_target_through() {
         let calls = Default::default();
         let t = ForwardTarget { machine: Some("box".into()), dir: "/home/u/cfg".into(), instance: "web-1".into() };
-        let got = forward_loopbacks("web-1", "http://localhost:3000/", Ok(&t), forwarding(&calls, |_| Err(Some("no machine named `box`".into()))));
-        assert_eq!(got.1, vec!["web-1: cannot forward port 3000 for http://localhost:3000/: no machine named `box`".to_string()]);
-        assert_eq!(got.2, vec![direct(3000)]);
-        assert_eq!(calls.into_inner(), vec![(t, direct(3000))]);
+        let url = "https://idp.example/a?redirect_uri=http://localhost:3000/";
+        let got = forward_loopbacks("web-1", url, Ok(&t), forwarding(&calls, |_| Err(Some("no machine named `box`".into()))));
+        assert_eq!(got.1, vec![format!("web-1: cannot forward callback port 3000 for {url}: no machine named `box`")]);
+        assert_eq!(got.2, vec![callback(3000)]);
+        assert_eq!(calls.into_inner(), vec![(t, callback(3000))]);
     }
 
     #[test]
@@ -966,42 +1133,59 @@ mod tests {
         let t = local();
         let url = "https://github.com/login?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Fcb";
         let got = forward_loopbacks("web", url, Ok(&t), forwarding(&calls, |lb| Ok(lb.port)));
-        assert_eq!(got, (url.to_string(), vec![], vec![]));
+        assert_eq!(got, (opens(url), vec![], vec![]));
         assert_eq!(calls.into_inner(), vec![(t.clone(), callback(8085))]);
 
         // A callback the forwarder already reported: no second log line,
-        // still unforwarded.
+        // still unforwarded, and the URL (its page remote) still opens.
         let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(None));
-        assert_eq!(got, (url.to_string(), vec![], vec![callback(8085)]));
+        assert_eq!(got, (opens(url), vec![], vec![callback(8085)]));
         let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(Some("registry stopped".into())));
         assert_eq!(got.1, vec![format!("web: cannot forward callback port 8085 for {url}: registry stopped")]);
-        assert_eq!(got.2, vec![callback(8085)]);
-    }
+        assert_eq!((got.0, got.2), (opens(url), vec![callback(8085)]));
 
-    #[test]
-    fn forward_loopbacks_falls_back_to_the_url_as_is() {
-        let t = local();
-        let url = "http://localhost:3000/";
-        let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(Some("port 3000: nope".into())));
-        assert_eq!(got, (url.to_string(), vec![format!("web: cannot forward port 3000 for {url}: port 3000: nope")], vec![direct(3000)]));
-
+        // No target: the same, one line for them all.
         let never = |_: &ForwardTarget, _| -> Result<u16, Option<String>> { panic!("nothing to forward to") };
-        let got = forward_loopbacks("web", url, Err("no config root in state.toml"), never);
-        assert_eq!(
-            got,
-            (url.to_string(), vec![format!("web: cannot forward port 3000 for {url} (no config root in state.toml); opening it as is")], vec![direct(3000)])
-        );
-        let got = forward_loopbacks("web", "http://0.0.0.0:3000/?callback=http://localhost:9", Err("not in state.toml"), never);
+        let url = "https://idp.example/a?redirect_uri=http://localhost:1&callback=http://localhost:2";
+        let got = forward_loopbacks("web", url, Err("not in state.toml"), never);
         assert_eq!(
             got,
             (
-                "http://localhost:3000/?callback=http://localhost:9".to_string(),
-                vec!["web: cannot forward ports 3000, 9 for http://0.0.0.0:3000/?callback=http://localhost:9 (not in state.toml); opening it as is".to_string()],
-                vec![direct(3000), callback(9)],
-            ),
-            "no target; 0.0.0.0 still made localhost"
+                opens(url),
+                vec![format!("web: cannot forward callback ports 1, 2 for {url} (not in state.toml); opening it as is")],
+                vec![callback(1), callback(2)]
+            )
         );
-        assert_eq!(forward_loopbacks("web", "https://example.com/", Err("x"), never), ("https://example.com/".to_string(), vec![], vec![]));
+    }
+
+    /// The URL's own port not forwarded: it isn't opened (the browser would
+    /// reach whatever this host runs there), and nothing else is forwarded.
+    #[test]
+    fn forward_loopbacks_never_opens_an_unforwarded_direct_port() {
+        let calls = Default::default();
+        let t = local();
+        let url = "http://localhost:3000/?redirect_uri=http://localhost:4000/cb";
+        let got = forward_loopbacks("web", url, Ok(&t), forwarding(&calls, |_| Err(Some("port 3000: nope".into()))));
+        assert_eq!(got, (Err("cannot forward port 3000: port 3000: nope".into()), vec![], vec![]));
+        assert_eq!(calls.into_inner(), vec![(t.clone(), direct(3000))], "the callback isn't bound");
+
+        // Direct and callback at once, its `Fixed` bind failed (the
+        // forwarder's status line said why).
+        let url = "http://localhost:3000/login?redirect_uri=http://localhost:3000/cb";
+        let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, _| Err(None));
+        assert_eq!(got.0, Err("cannot forward port 3000: it is also the callback port, which couldn't be bound".into()));
+
+        // A later callback failing doesn't matter once the direct one bound.
+        let url = "http://localhost:3000/?redirect_uri=http://localhost:4000/cb";
+        let got = forward_loopbacks("web", url, Ok(&t), |_: &ForwardTarget, lb: Loopback| if lb.callback { Err(None) } else { Ok(3001) });
+        assert_eq!(got, (opens("http://localhost:3001/?redirect_uri=http://localhost:4000/cb"), vec![], vec![callback(4000)]));
+
+        let never = |_: &ForwardTarget, _| -> Result<u16, Option<String>> { panic!("nothing to forward to") };
+        let got = forward_loopbacks("web", "http://0.0.0.0:3000/?callback=http://localhost:9", Err("not in state.toml"), never);
+        assert_eq!(got, (Err("cannot forward port 3000: not in state.toml".into()), vec![], vec![]));
+        assert_eq!(forward_loopbacks("web", "https://example.com/", Err("x"), never), (opens("https://example.com/"), vec![], vec![]));
+        let url = "http://evil.com\\@localhost:3000/";
+        assert_eq!(forward_loopbacks("web", url, Err("x"), never), (opens(url), vec![], vec![]), "not loopback, untouched");
     }
 
     fn done(profile: Option<&str>, outcome: Outcome) -> OpenDone {
@@ -1024,6 +1208,12 @@ mod tests {
         let failed = done(Some("work"), Outcome::Failed("no display on this host".into()));
         assert_eq!((failed.kind(), failed.line().as_str()), ("failed", "web: open failed: no display on this host"));
         assert_eq!(failed.why().as_deref(), Some("no display on this host"));
+
+        // Whatever a refused URL or a member's reason holds, one line.
+        let d = OpenDone { url: "https://x/\u{1b}[2J".into(), ..done(None, Outcome::Failed("nope\nweb: opened".into())) };
+        assert_eq!(d.line(), "web: open failed: nope\\nweb: opened");
+        let d = OpenDone { url: "https://x/\r\n".into(), ..done(None, Outcome::Opened { unforwarded: vec![] }) };
+        assert_eq!(d.line(), "web: opened https://x/\\r\\n");
     }
 
     #[test]

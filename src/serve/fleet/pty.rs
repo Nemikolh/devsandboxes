@@ -459,7 +459,12 @@ pub fn serve(
     };
     match started {
         Ok((started, instance_id)) => {
-            let _attach = attaches.begin_in(&instance_id, Origin::Member(peer.name.clone()));
+            // A terminal only: a piped exec (a script's, an agent's) is no
+            // user at the instance, and its origin records no attach of its
+            // own (`machines::cli::records_attach`), so it would only route
+            // opens to a member that refuses them.
+            let _attach = (!matches!(started, Started::Pipe(_)))
+                .then(|| attaches.begin_in(&instance_id, Origin::Member(peer.name.clone())));
             match started {
                 Started::Attach(call, input) => pump(&link, call, input),
                 Started::Pipe(child) => run_pipe(&link, child),
@@ -1209,7 +1214,7 @@ mod tests {
     }
 
     fn attached(w: &World, id: &str) -> Option<Origin> {
-        w.attaches.latest(id)
+        w.attaches.latest(id, std::time::Instant::now())
     }
 
     #[test]
@@ -1229,13 +1234,11 @@ mod tests {
         assert_eq!(attached(&w, "id-web-1"), Some(Origin::Here));
         drop(here);
 
-        // A pipe (no helper needed) and a service terminal count too; a
-        // refusal doesn't.
+        // A service terminal counts too; a pipe and a refusal don't.
         let (hub, t) = open(&w, pipe_header(&w, "bare", "exit 0", false), w.helper.clone());
         rest(&hub);
         t.join().unwrap();
-        assert_eq!(attached(&w, "id-bare"), Some(Origin::Member("me@hub".into())), "after the stream: the latest still");
-        assert!(!w.attaches.live_in("id-bare"), "ended");
+        assert_eq!(attached(&w, "id-bare"), None, "a pipe: no attach");
         let cfg = w.root.join("cfg");
         let create = Obj::new().with("argv", vec!["exit 0".to_string()]);
         let h = header(pipe_base(cfg.to_str().unwrap()).with("service", "db").with("create", create));

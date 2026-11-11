@@ -289,8 +289,10 @@ const ATTACH_WAIT: Duration = Duration::from_millis(500);
 /// answers within [`ATTACH_WAIT`], it refuses, or under [`set_in_process`].
 /// Never starts a daemon, and says hello as version 0.0.0 (older than any)
 /// so it never triggers a handoff either: an attach record isn't worth a
-/// daemon's restart. Nothing else rides on the connection: a drain ending
-/// it ends only the record.
+/// daemon's restart. Nothing else rides on the connection, so it is
+/// attach-only: it doesn't hold the daemon up, and a drain ending it ends
+/// only the record. For a terminal the user is at (a TTY `exec`, a
+/// dashboard tab), never a script's exec.
 pub fn attach_hold(instance: &str, machine: Option<&str>) -> Option<Conn> {
     if IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
@@ -307,7 +309,7 @@ pub fn attach_hold(instance: &str, machine: Option<&str>) -> Option<Conn> {
 
 /// `instances.attach` with `params` on `conn`, within [`ATTACH_WAIT`]:
 /// whether it was taken.
-pub(crate) fn attach_on(conn: &mut Conn, params: Value) -> bool {
+fn attach_on(conn: &mut Conn, params: Value) -> bool {
     matches!(conn.call_within("instances.attach", params, ATTACH_WAIT), Ok(Some(r)) if r.error.is_none())
 }
 

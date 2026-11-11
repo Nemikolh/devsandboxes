@@ -611,10 +611,13 @@ the connection stays open, and the daemon records it in memory
 - with `machine`, it is that machine's instance, as the CLI named it there,
   and the record is this host's own attach to it.
 
-The CLI holds one around a local `exec` (`exec --service` too), a
-`PTY` dial to a machine, and `devsandbox vscode` (opened and closed at
-once); best effort, never starting a daemon. A hang-up, a drain included,
-ends the record. A link peer's attach is its `PTY` stream, so the method
+The CLI holds one, on a connection of its own, around a TTY `exec`
+(`exec --service` too; a non-tty `exec` records nothing), a `PTY` dial
+to a machine with a terminal (not a piped one), and `devsandbox vscode`
+(opened and closed at once); best effort, never starting a daemon. A
+connection whose only requests are `hello` and `instances.attach`
+doesn't hold the daemon: no idle holder, and a drain cuts it without
+waiting. A hang-up, a drain included, ends the record. A link peer's attach is its `PTY` stream, so the method
 is for local clients of this user only, never forwarded. Result:
 `{"ok": true}`.
 
@@ -1413,16 +1416,19 @@ Params `{"instance": "<name there>", "root": "<its config root there>",
 (`opens::DeliverParams`; a `machine` is refused). The URL is the
 container's as it gave it; the profile is a name only, mapped by this
 host's own `profiles.toml` (none, or unmapped: the system opener). Taken
-only when `url` is `http`/`https`, within a rate limit per caller and
-instance, and this host attached to that instance on the caller (an
+only when `instance` is an instance name (ASCII
+`[A-Za-z0-9][A-Za-z0-9_.-]*`), `url` is `http`/`https` with no control
+character or whitespace, within a rate limit per caller and instance,
+and this host attached to that instance on the caller (an
 `instances.attach` with `machine`) live or less than 10 min ago. Result
 `{"ok": true}`: taken, opened on a thread of its own after its loopback
 ports are forwarded into the instance on the caller (open forwards with
-`machine`; a missing display or a failed spawn is this host's
-`serve.log` line). On a link peer's
-connection only, under either trust. Errors: `denied` (a local client;
-not attached here; the rate limit), `invalid` (bad params, a scheme past
-`http(s)`), `failed` (this daemon opens nothing).
+`machine`; a missing display, the URL's own port not forwarded (then it
+isn't opened) or a failed spawn is this host's `serve.log` line). On a
+link peer's connection only, under either trust. Errors: `denied` (a
+local client; not attached here; the rate limit), `invalid` (bad params,
+a bad instance name, control characters, a scheme past `http(s)`),
+`failed` (this daemon opens nothing).
 
 ### `placements.fetch`
 
@@ -1576,7 +1582,7 @@ between.
 | `instances.snapshot` | `instances` | `{"dir": "<abs>", "capacity"?, …}`: `instances.list`'s result plus the root and this host's [capacity](#capacity) | a root this connection watches (`instances.watch`) was collected: every poll pass (about every 2 s), changed or not, so its arrival says how fresh it is. Latest only per root |
 | `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
-| `opens.done` | `opens` | `{"instance": "<name>", "url": "…", "profile": "<p>" \| null, "outcome": "opened" \| "refused" \| "failed", "why": "…" \| null, "line": "…"}` | what became of one URL a container opened ([bridges](../architecture/helper/bridges.md#opening-urls-kind-open)), from the host that knows: the instance's host for a refusal at intake (scheme, too old, rate limit; `profile` `null`) or a failed delivery to a fleet member (the member's refusal included), the opening host when it opened it or couldn't (no display, no opener, a failed spawn). `instance` is `machine/name` for an open delivered from another member; `url` the one opened (rewritten to a forward's port), else the one given; `why` the refusal or failure, or for `opened` the loopback ports that couldn't be forwarded (`cannot forward callback port 8085`). `line` is the dashboard's status-line text (`web: opened https://… (work)`, `web: open refused: rate limit (5 per 10s)`, `web: open failed: no display on this host`; a URL past 120 characters is cut there with `…`). Every open is its own: up to the last 8 unwritten are kept |
+| `opens.done` | `opens` | `{"instance": "<name>", "url": "…", "profile": "<p>" \| null, "outcome": "opened" \| "refused" \| "failed", "why": "…" \| null, "line": "…"}` | what became of one URL a container opened ([bridges](../architecture/helper/bridges.md#opening-urls-kind-open)), from the host that knows: the instance's host for a refusal at intake (control characters, scheme, too old, rate limit; `profile` `null`) or a failed delivery to a fleet member (the member's refusal included), the opening host when it opened it or couldn't (no display, the URL's own loopback port not forwarded, no opener, a failed spawn). `instance` is `machine/name` for an open delivered from another member; `url` the one opened (rewritten to a forward's port), else the one given; `why` the refusal or failure, or for `opened` the callback ports that couldn't be forwarded (`cannot forward callback port 8085`). `line` is the dashboard's status-line text (`web: opened https://… (work)`, `web: open refused: rate limit (5 per 10s)`, `web: open failed: no display on this host`; a URL past 120 characters is cut there with `…`). Every open is its own: up to the last 8 unwritten are kept |
 | `closing` | any | `{"reason": "handoff" \| "idle" \| "shutdown"}` | the daemon is exiting; reconnect (which starts a new one) |
 
 Notifications coalesce: many changes before one is written are one line.

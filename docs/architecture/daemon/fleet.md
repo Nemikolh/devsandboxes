@@ -2621,11 +2621,14 @@ else not read at all (`pty_client::Terminal`'s `input` `None`);
 `exit_of`. It never goes through the reconnect loop: its 255 (a lost
 link, or `lost`) is reported once, with its line.
 
-Every stream that started, in any mode (a service terminal through its
-instance), is its instance's latest attach on the serving host, from the
-stream's peer (a routed stream's proven origin, never its relay), until
-it ends (*Last attach*); a refused one isn't. The calling CLI holds the
-matching record on its own host for the dial's length.
+Every stream with a terminal that started (a session, a service terminal
+through its instance) is its instance's latest attach on the serving
+host, from the stream's peer (a routed stream's proven origin, never its
+relay), until it ends (*Last attach*); a refused one isn't, nor a piped
+exec (a script's, an agent's: no user at it). The calling CLI holds the
+matching record on its own host for the dial's length; a piped one
+records nothing there either (`machines::cli::records_attach`), so the
+two sides always agree.
 
 ### Last attach
 
@@ -2636,30 +2639,39 @@ checks before opening one for an instance on another host. Two maps under
 one lock:
 
 - **Inbound**, on the instance's host, per instance id: the
-  `attaches::Origin` of the latest attach to begin. A `PTY` stream
-  (`fleet::pty::serve`) is `Origin::Member` of its peer; a local `exec`
-  (`exec --service` too), a dashboard terminal tab (a `devsandbox exec`)
-  and `devsandbox vscode` are `Origin::Here`, through `instances.attach`
-  ([api](../../reference/api.md#instancesattach)). The latest begin wins:
+  `attaches::Origin` of the latest attach to begin. A `PTY` stream with a
+  terminal (`fleet::pty::serve`) is `Origin::Member` of its peer; a local `exec`
+  with a TTY (`exec --service` too), a dashboard terminal tab (a
+  `devsandbox exec`) and `devsandbox vscode` are `Origin::Here`, through
+  `instances.attach` ([api](../../reference/api.md#instancesattach)); a
+  non-tty `exec` (a script, cron, an agent) records nothing, so it never
+  takes the user's opens. The latest begin wins:
   the same origin as the latest joins it, another replaces it, and an
   older origin's attaches ending later never clobber the newer one's (each
-  `attaches::Guard` keeps the epoch it joined). Never pruned: one entry
-  per instance id attached in the daemon's life.
+  `attaches::Guard` keeps the epoch it joined). It counts while one of
+  its attaches is live or the last ended less than
+  `open::OPEN_ATTACH_WINDOW` ago (`Attaches::latest` at the current time):
+  past that a member would refuse the instance's opens, so they open
+  here. Never pruned: one entry per instance id attached in the daemon's
+  life.
 - **Outgoing**, on the attaching host, per `(machine, instance)` as the
   CLI named them: live attaches, or when the last one ended
   (`Attaches::attached_out`, within a window: `open::OPEN_ATTACH_WINDOW`,
   10 min). An `instances.attach` with `machine` records one: the CLI's
-  `PTY` dials to a machine (`machines::cli::resolve_and_route`) hold it on
-  their daemon connection. Entries ended past the window are pruned on
-  each begin.
+  `PTY` dials to a machine with a terminal
+  (`machines::cli::resolve_and_route`) hold it on a daemon connection of
+  its own (`client::attach_hold`), the one that resolved the instance
+  dropped first. Entries ended past the window are pruned on each begin.
 
 A record lasts while its guard does: a `PTY` stream's until `serve`
 returns, an `instances.attach` until its connection hangs up
-(`client::attach_hold` holds one around a local exec; `vscode::launch`
+(`client::attach_hold` holds one around a local TTY exec; `vscode::launch`
 begins and ends one at once, as `code` runs detached). The CLI's calls
 are best effort: no daemon start, no handoff (its hello says 0.0.0), a
-short wait, silent; a drain ends the connection, and with it only the
-record. A successor daemon starts with no records.
+short wait, silent. Such an attach-only connection holds nothing: it's no
+`clients` holder and a drain cuts it without waiting
+([role.md](role.md#holders-and-idle-exit)), ending only the record. A
+successor daemon starts with no records.
 
 ### Opening URLs
 
@@ -2674,12 +2686,14 @@ host:
    none when the config no longer allows it, with the drift warning), its
    state key and config root.
 2. **Routes** it (`opens::route` over `Attaches::latest`): nothing
-   attached yet, or this host's own attach last → opened here
-   (`open::open_here`); a member's `PTY` stream last → `open.deliver` to
-   that member (`service::Handle::call_member`: its link, else a route).
+   attached yet (or a member's attach that ended the window ago or more),
+   or this host's own attach last → opened here (`open::open_here`); a
+   member's `PTY` stream last, live or within the window → `open.deliver`
+   to that member (`service::Handle::call_member`: its link, else a
+   route).
 3. A delivery that fails (the member's refusal, no path to it) is one
    `serve.log` line, `<instance>: cannot deliver <url> to <member>:
-   <why>`, a failed `opens.done` here (`open::Outcome::Failed`, the
+   <why>` (the member's text escaped, `open::printable`), a failed `opens.done` here (`open::Outcome::Failed`, the
    receiver's refusal being the call's error), and **nothing opens here**: the user is at that member, so a
    browser on this host would open where nobody looks (or, on a server,
    nowhere).
@@ -2694,9 +2708,12 @@ peer only (a local client is `denied`), under `worker` and `full` alike
 order:
 
 - **Params**, strict (`opens::DeliverParams`, unknown keys refused, a
-  `machine` too: under `worker` the table already refuses one): a
-  non-empty instance, an absolute root, a URL within the record cap, a
-  profile that is a profile name (`config::check_profile_name`).
+  `machine` too: under `worker` the table already refuses one): an
+  instance name (ASCII `[A-Za-z0-9][A-Za-z0-9_.-]*`, `opens::valid_instance`),
+  an absolute root, a URL within the record cap and with no control
+  character or whitespace (`open::has_bad_chars`, before the next check,
+  whose refusal quotes it), a profile that is a profile name
+  (`config::check_profile_name`).
 - **Its own attach**, first so a request for an instance never attached
   to spends no limit: `Attaches::attached_out(peer, instance)`: this host
   attached to that instance on that peer, live or ended less than
@@ -2705,11 +2722,12 @@ order:
   last 10 min`). This host knows it without asking anyone (it made the
   attach), so no member, whatever its trust, can drive this desktop by
   naming an instance this host's user never reached.
-- **The policy again** (`open::decide`): `http`/`https` only (else
-  `invalid`), a rate limit per `(peer, instance)` (`Shared::open_limit`,
-  `open::OPEN_RATE_BURST` per `open::OPEN_RATE_REFILL`; spent, `denied`).
+- **The policy again** (`open::decide`, minus the TTL: that was the
+  sender's): `http`/`https` only (else `invalid`), a rate limit per
+  `(peer, instance)` (`Shared::open_limit`, `open::OPEN_RATE_BURST` per
+  `open::OPEN_RATE_REFILL`; spent, `denied`).
 
-Every refusal is logged. A taken one answers `{ok: true}` (taken, not
+Every refusal is logged (escaped, `open::printable`). A taken one answers `{ok: true}` (taken, not
 opened) and goes to `open::open_here` on a thread of its own
 (`Options::open_here` in tests), its forward target the sender's
 instance (`open::ForwardTarget { machine: Some(peer), dir: root,
@@ -2722,7 +2740,7 @@ tunnelled over the link to the sender
 ([forwards](forwards.md#open-forwards)), so a dev server or an OAuth
 callback on the container's localhost is reached from this host's
 browser. What `open::open_here` makes of it (opened, or failed: no
-display, no opener) is an `opens.done` on **this** host, the instance
+display, the URL's own port not forwarded, no opener) is an `opens.done` on **this** host, the instance
 named `<peer>/<instance>`: the user is here
 (docs/architecture/helper/bridges.md, *What the user sees*). A refusal
 isn't one here; the sender reports it.

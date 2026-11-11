@@ -162,10 +162,12 @@ fn run_in(key: &str, instance: &Instance, interactive: bool, tty: bool, command:
     // (docs/architecture/helper/in-container.md).
     #[cfg(unix)]
     let relay = host_agent.then(|| AgentRelay::start(key));
-    // This host's user is at the instance while the command runs: its
-    // opens come here (`instances.attach`, best effort).
+    // On a terminal, this host's user is at the instance while the command
+    // runs: its opens come here (`instances.attach`, best effort). A
+    // non-tty exec (a script, cron, an agent) records nothing, so it can't
+    // take a user's opens away from where they are.
     #[cfg(unix)]
-    let _attach = crate::serve::client::attach_hold(&instance.instance_id, None);
+    let _attach = tty.then(|| crate::serve::client::attach_hold(&instance.instance_id, None)).flatten();
     let args = exec_argv_with(instance, interactive, tty, command, host_agent);
     let code = backend().run_inherit(&refs(&args))?;
     #[cfg(unix)]

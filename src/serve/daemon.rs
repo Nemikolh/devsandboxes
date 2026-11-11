@@ -506,7 +506,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let members = links.handle();
         let opener = opens::opener(opens::Sender {
             prepare: Arc::new(move |instance: &str, id: &str, url: &str| crate::open::prepare(instance, id, url, log)),
-            latest: Arc::new(move |id: &str| attaches.latest(id)),
+            latest: Arc::new(move |id: &str| attaches.latest(id, Instant::now())),
             call_member: Arc::new(move |m: &str, method: &str, params: Value| {
                 let r = members.call_member(m, method, params)?;
                 match r.error {
@@ -998,7 +998,7 @@ impl Shared {
     }
 
     fn holders(&self, host: Option<&Host>, registry: Option<&Registry>) -> Holders {
-        let clients = self.conns.lock().unwrap().len() + self.channels.load(Ordering::SeqCst);
+        let clients = self.conns.lock().unwrap().values().filter(|c| c.holds()).count() + self.channels.load(Ordering::SeqCst);
         let forwards = registry.map_or(0, Registry::active);
         let verbs = self.verbs.len() + self.remote_verbs.load(Ordering::SeqCst);
         let links = self.links().map_or(0, |l| l.entries().iter().filter(|e| matches!(e.kind, machines::Kind::Ssh { .. })).count());
@@ -1392,10 +1392,11 @@ impl Shared {
                 false
             });
         }
-        self.conns.lock().unwrap().insert(id, ConnEntry { stream: clone, out: Arc::clone(&out) });
+        let attach_only = Arc::new(AtomicBool::new(false));
+        self.conns.lock().unwrap().insert(id, ConnEntry { stream: clone, out: Arc::clone(&out), attach_only: Arc::clone(&attach_only) });
         let shared = Arc::clone(self);
         let spawned = std::thread::Builder::new().name(format!("serve-conn-{id}")).spawn(move || {
-            let handoff = serve_conn(id, stream, &shared, out, table);
+            let handoff = serve_conn(id, stream, &shared, out, table, attach_only);
             shared.conns.lock().unwrap().remove(&id);
             *shared.idle_since.lock().unwrap() = Instant::now();
             // A `link.attach {channel}`: out of `conns` (the drain no longer
@@ -1574,14 +1575,15 @@ impl Shared {
     }
 
     /// A verb's connection ends here too, leaving its verb running (the
-    /// [`draining`](Self::draining) flag), so verbs never hold the drain.
+    /// [`draining`](Self::draining) flag), so verbs never hold the drain;
+    /// an attach-only one is cut and never waited on ([`ConnEntry::holds`]).
     fn drain(&self, timeout: Duration) {
         self.draining.store(true, Ordering::SeqCst);
         for conn in self.conns.lock().unwrap().values() {
             let _ = conn.stream.shutdown(Shutdown::Read);
         }
         let deadline = Instant::now() + timeout;
-        while !self.conns.lock().unwrap().is_empty() && Instant::now() < deadline {
+        while self.conns.lock().unwrap().values().any(ConnEntry::holds) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -1609,6 +1611,19 @@ struct ConnEntry {
     /// For the drain's shutdown.
     stream: Stream,
     out: Arc<Outbox>,
+    /// Set while the connection's only business is `instances.attach`
+    /// ([`ConnState::attach_only`]).
+    attach_only: Arc<AtomicBool>,
+}
+
+impl ConnEntry {
+    /// Whether it holds the daemon: a `clients` holder, waited on by the
+    /// drain. An attach-only one doesn't: an `exec` left open in a
+    /// terminal for days mustn't keep the daemon up, nor a handoff waiting
+    /// (docs/architecture/daemon/role.md, *Holders and idle exit*).
+    fn holds(&self) -> bool {
+        !self.attach_only.load(Ordering::SeqCst)
+    }
 }
 
 /// Everything written to one connection goes through here: the writer lock
@@ -1939,6 +1954,13 @@ struct ConnState {
     inbound: Option<machines::inbound::Guard>,
     /// `instances.attach`'s records, each held until the connection ends.
     attaches: Vec<super::attaches::Guard>,
+    /// Set (with [`ConnEntry`]'s copy) once an `instances.attach` is taken on
+    /// a connection that did nothing else but say hello; any other request
+    /// clears it for good ([`ConnState::busy`]).
+    attach_only: Arc<AtomicBool>,
+    /// A request other than `hello` and `instances.attach` came: never
+    /// attach-only again.
+    busy: bool,
     /// What the links do once this request's answer is out
     /// (`machines::leave::After`): a `fleet.*` call whose change ends the
     /// link it came on.
@@ -1957,7 +1979,14 @@ impl ConnState {
 /// One connection: a request per line, a response per request, until EOF,
 /// or until a `link.attach {channel}` is answered: then the stream, with
 /// nothing read past the attach line, is returned for that channel.
-fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table: Table) -> Option<Handoff> {
+fn serve_conn(
+    id: u64,
+    stream: Stream,
+    shared: &Shared,
+    out: Arc<Outbox>,
+    table: Table,
+    attach_only: Arc<AtomicBool>,
+) -> Option<Handoff> {
     let mut conn = ConnState {
         id,
         own_user: endpoint::peer_is_own_user(&stream),
@@ -1970,6 +1999,8 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table:
         handoff: None,
         inbound: None,
         attaches: Vec::new(),
+        attach_only,
+        busy: false,
         after: None,
     };
     let mut reader = BufReader::new(stream);
@@ -2024,6 +2055,10 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         Ok(req) => req,
         Err(e) => return Some(Response::err(None, "invalid", format!("not a request: {e}"))),
     };
+    if !matches!(req.method.as_str(), "hello" | "instances.attach") {
+        conn.busy = true;
+        conn.attach_only.store(false, Ordering::SeqCst);
+    }
     // By who the peer is, not by the trust table.
     if req.method.starts_with("fleet.") {
         return Some(fleet_call(req, shared, conn));
@@ -2367,7 +2402,9 @@ struct AttachParams {
 /// Without `machine`, `instance` (exact name or id in `state.toml`) is this
 /// host's: its latest attach is now from here. With `machine`, it's that
 /// machine's, by the name this host gave it: recorded as this host's own
-/// attach there. Local own-user connections only; never forwarded.
+/// attach there. Local own-user connections only; never forwarded. A
+/// connection that did nothing else is attach-only from then on: no holder,
+/// not waited on by a drain ([`ConnEntry::holds`]).
 fn instances_attach(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) -> Response {
     if !matches!(conn.table, Table::Full) || !conn.own_user {
         return Response::err(id, "denied", "`instances.attach` is for this user's own local clients");
@@ -2394,6 +2431,9 @@ fn instances_attach(id: Option<u64>, params: Value, shared: &Shared, conn: &mut 
         }
     };
     conn.attaches.push(guard);
+    if !conn.busy {
+        conn.attach_only.store(true, Ordering::SeqCst);
+    }
     Response::ok(id, json!({ "ok": true }))
 }
 
@@ -2417,7 +2457,7 @@ fn open_deliver(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Conn
     let job = match opens::receive(params, from, now, limit, attached) {
         Ok(job) => job,
         Err(e) => {
-            log(&format!("{}: refused open.deliver from {from}: {}", conn.label(), e.message));
+            log(&format!("{}: refused open.deliver from {from}: {}", conn.label(), crate::open::printable(&e.message)));
             return Response::err(id, e.code, e.message);
         }
     };
@@ -3668,7 +3708,7 @@ pub(crate) mod tests {
         assert_eq!(attach(json!({"instance": "w", "root": "/x"}))["error"]["code"], "invalid", "strict params");
         assert_eq!(attach(json!({}))["error"]["code"], "invalid");
         assert_eq!(attach(json!({"instance": ""}))["error"]["code"], "invalid");
-        assert_eq!((shared.attaches.latest("id-w"), shared.attaches.live_in("id-w")), (Some(Origin::Here), true));
+        assert_eq!((shared.attaches.latest("id-w", Instant::now()), shared.attaches.live_in("id-w")), (Some(Origin::Here), true));
         assert!(shared.attaches.attached_out("box", "w-1", Instant::now() + 2 * window, window), "live");
         drop(c);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -3676,7 +3716,7 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!shared.attaches.live_in("id-w"), "the hang-up ended it");
-        assert_eq!(shared.attaches.latest("id-w"), Some(Origin::Here), "ended, still the latest");
+        assert_eq!(shared.attaches.latest("id-w", Instant::now()), Some(Origin::Here), "ended, still the latest");
         assert!(shared.attaches.attached_out("box", "w-1", Instant::now(), window), "ended just now");
         assert!(!shared.attaches.attached_out("box", "w-1", Instant::now() + window, window), "ended");
 
@@ -3697,6 +3737,59 @@ pub(crate) mod tests {
         assert_eq!(ask(&mut full, "instances.attach", json!({"instance": "id-w"})).0["error"]["code"], "denied");
         drop((worker, full));
         assert!(!shared.attaches.live_in("id-w"));
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// A connection whose only business is `instances.attach` (a hello
+    /// aside) is no `clients` holder and doesn't hold up a drain; one that
+    /// did anything else, before or after, is and does.
+    #[test]
+    fn an_attach_only_connection_holds_nothing() {
+        let store = scratch("attach-only");
+        std::fs::create_dir_all(&store).unwrap();
+        let instance = "[instance.w]\ninstance_id = \"id-w\"\nsandbox = \"web\"\ncontainer = \"devsandbox-w\"\n\
+                        folder = \"/w\"\nworkspace = \"/w\"\ncreated_unix = 1\n";
+        std::fs::write(store.join("state.toml"), instance).unwrap();
+        let shared = Arc::new(Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join()));
+        let open = |id: u64| {
+            let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+            shared.spawn_conn(id, server);
+            let reader = BufReader::new(client);
+            reader.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            reader
+        };
+        let clients = || shared.holders(None, None).clients;
+
+        let mut attach_only = open(1);
+        assert_eq!(clients(), 1, "not attached yet: a client");
+        assert!(ask(&mut attach_only, "hello", json!({"version": "0.0.0", "build": 0, "client": "cli"})).0.get("error").is_none());
+        assert_eq!(ask(&mut attach_only, "instances.attach", json!({"instance": "w"})).0["result"], json!({"ok": true}));
+        assert_eq!(ask(&mut attach_only, "instances.attach", json!({"instance": "w-1", "machine": "box"})).0["result"], json!({"ok": true}));
+        assert_eq!(clients(), 0, "attach-only");
+        assert!(shared.attaches.live_in("id-w"));
+
+        let mut busy_first = open(2);
+        ask(&mut busy_first, "subscribe", json!({"topics": ["instances"]}));
+        ask(&mut busy_first, "instances.attach", json!({"instance": "w"}));
+        assert_eq!(clients(), 1, "it subscribed first");
+        let mut busy_after = open(3);
+        ask(&mut busy_after, "instances.attach", json!({"instance": "w"}));
+        assert_eq!(clients(), 1);
+        ask(&mut busy_after, "inbox.list", json!({}));
+        assert_eq!(clients(), 2, "a call after the attach: a client again");
+        drop((busy_first, busy_after));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while clients() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(clients(), 0);
+
+        // The drain cuts it and doesn't wait on it.
+        let started = Instant::now();
+        shared.drain(DRAIN_TIMEOUT);
+        assert!(started.elapsed() < DRAIN_TIMEOUT / 2, "{:?}", started.elapsed());
+        let mut line = String::new();
+        assert_eq!(attach_only.read_line(&mut line).unwrap(), 0, "cut");
         let _ = std::fs::remove_dir_all(&store);
     }
 

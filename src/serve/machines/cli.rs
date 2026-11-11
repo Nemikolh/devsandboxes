@@ -774,14 +774,17 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         let call = &mut |method: &str, params| conn.call(method, params);
         return Ok(Routed::Exit(calls::named(call, &u, &m, &chosen.name, root, tty, &mut out, &mut err)?));
     }
-    // An exec: `PTY` dials from here, under this host's attach record on
-    // `conn` (`instances.attach`, best effort: the dials never use `conn`,
-    // a daemon draining just ends the record).
-    let attach = json!({ "instance": chosen.name, "machine": m });
+    // An exec: `PTY` dials from here. `conn` made calls, so it would hold
+    // the daemon for the exec's life: dropped first. A dial with a terminal
+    // runs under this host's attach record on a connection of its own
+    // (`client::attach_hold`, attach-only, best effort); a piped one records
+    // nothing ([`records_attach`]).
     let terminal = on_terminal();
     let reserve_255 = matches!(command, Command::Exec { reserve_255: true, .. });
-    let one_dial = |mode| -> Result<Routed> {
+    let attach = |mode: &pty_client::Mode| records_attach(mode).then(|| client::attach_hold(&chosen.name, Some(&m))).flatten();
+    let one_dial = |mode: pty_client::Mode| -> Result<Routed> {
         let request = pty_client::Request { root: root_on(&m, root)?.to_path_buf(), instance: chosen.name.clone(), mode };
+        let _attach = attach(&request.mode);
         Ok(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, &m, &request, reserve_255)))
     };
     if let Some(mode) = service_mode(&command) {
@@ -789,41 +792,61 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         if !terminal {
             bail!("`exec --service` on machine `{m}` opens a terminal in the service's container: it needs a TTY");
         }
-        client::attach_on(&mut conn, attach);
+        drop(conn);
         return one_dial(mode);
     }
-    if let Some(routed) = session_exec(&command, &mut conn, &attach, &m, &chosen.name, root, terminal)? {
-        return Ok(routed);
+    match session_exec(&command, &mut conn, &m, &chosen.name, root, terminal)? {
+        Some(SessionExec::Listed) => return Ok(Routed::Exit(0)),
+        Some(SessionExec::Dial(request)) => {
+            drop(conn);
+            let _attach = attach(&request.mode);
+            return Ok(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, &m, &request, reserve_255)));
+        }
+        None => {}
     }
+    drop(conn);
     if let Some(id) = reconnect_session(&command, terminal, || crate::commands::exec::mint_session_id(crate::state::Instance::now()))? {
         let (first, again) = dials(&m, &command, &chosen.name, root, &id)?;
-        client::attach_on(&mut conn, attach);
+        let _attach = attach(&first.mode);
         let dir = endpoint::socket_dir()?;
         return reconnect_loop(&id, |redial| Ok(pty_client::dial(&dir, &m, if redial { &again } else { &first }, true)));
     }
     // What's left: an exec without a tty, one piped dial (never re-dialed:
     // nothing to go back to).
     let mode = pipe_mode(&command, terminal)?.context("this command doesn't run on a machine")?;
-    client::attach_on(&mut conn, attach);
     one_dial(mode)
+}
+
+/// Whether a `PTY` dial in `mode` records this host's attach: one with a
+/// terminal (a session, a service terminal), where the user is at it; a
+/// piped exec (a script's, an agent's) never does, as a local non-tty
+/// `exec` doesn't.
+pub(crate) fn records_attach(mode: &pty_client::Mode) -> bool {
+    !matches!(mode, pty_client::Mode::Pipe { .. })
+}
+
+/// What [`session_exec`] did: listed the sessions (printed), or the dial
+/// of an attach to one, for the caller to make once `conn` is dropped.
+enum SessionExec {
+    Listed,
+    Dial(pty_client::Request),
 }
 
 /// `exec --sessions` and `exec --attach [ID]` of instance `name` on machine
 /// `m` (at `root` there): the session list through a `sessions.list` quick
 /// call on `conn`; the attach one `PTY` dial ([`attach_mode`]; no loop, as
-/// a local `--attach`: its 255 is the caller's to retry), under `record`'s
-/// attach on `conn`. `None` for any other exec, which [`resolve_and_route`]
+/// a local `--attach`: its 255 is the caller's to retry), returned for the
+/// caller to make. `None` for any other exec, which [`resolve_and_route`]
 /// goes on with.
 fn session_exec(
     command: &Command,
     conn: &mut Conn,
-    record: &Value,
     m: &str,
     name: &str,
     root: Option<&Path>,
     terminal: bool,
-) -> Result<Option<Routed>> {
-    let Command::Exec { attach, sessions, reserve_255, .. } = command else { return Ok(None) };
+) -> Result<Option<SessionExec>> {
+    let Command::Exec { attach, sessions, .. } = command else { return Ok(None) };
     if !*sessions && attach.is_none() {
         return Ok(None);
     }
@@ -845,7 +868,7 @@ fn session_exec(
         for line in lines {
             println!("{line}");
         }
-        return Ok(Some(Routed::Exit(0)));
+        return Ok(Some(SessionExec::Listed));
     }
     let id = match attach {
         Some(Some(id)) => crate::commands::exec::checked_session_id(id)?.to_string(),
@@ -856,9 +879,7 @@ fn session_exec(
             })?
         }
     };
-    let request = pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), mode: attach_mode(id, terminal) };
-    client::attach_on(conn, record.clone());
-    Ok(Some(Routed::Exit(pty_client::dial(&endpoint::socket_dir()?, m, &request, *reserve_255))))
+    Ok(Some(SessionExec::Dial(pty_client::Request { root: root.to_path_buf(), instance: name.to_string(), mode: attach_mode(id, terminal) })))
 }
 
 /// The `PTY` mode of an `--attach` to session `id`: the session itself on a
@@ -1224,6 +1245,17 @@ mod tests {
         assert_eq!(attach_mode(ID.into(), true), pty_client::Mode::Session { id: ID.into(), create: None });
         let piped = pty_client::Mode::Pipe { argv: crate::commands::exec::session_attach_command(ID), interactive: true };
         assert_eq!(attach_mode(ID.into(), false), piped);
+    }
+
+    /// Only a dial with a terminal records this host's attach: a piped exec
+    /// (a script's, an agent's) never takes the user's opens.
+    #[test]
+    fn only_terminal_dials_record_an_attach() {
+        assert!(records_attach(&attach_mode(ID.into(), true)));
+        assert!(!records_attach(&attach_mode(ID.into(), false)));
+        assert!(records_attach(&pty_client::Mode::Session { id: ID.into(), create: Some(vec![]) }));
+        assert!(records_attach(&pty_client::Mode::Service { name: "db".into(), argv: vec![] }));
+        assert!(!records_attach(&pty_client::Mode::Pipe { argv: vec!["make".into()], interactive: false }));
     }
 
     /// A tty exec's dials: create-or-attach with the command (none: the

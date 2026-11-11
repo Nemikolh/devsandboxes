@@ -17,8 +17,9 @@
 //!   for the rest. A receiver's refusal goes back to the sender as the
 //!   call's error, so it is the sender's failed delivery.
 //! - **Receiving** ([`receive`], the daemon's `open.deliver`, from a fleet
-//!   peer only): strict params, the same `open::decide` policy again (with a
-//!   per-`(peer, instance)` limit), and only for an instance this host
+//!   peer only): strict params (`instance` an instance name), `open::decide`'s
+//!   characters, scheme and limit again (per `(peer, instance)`; the TTL was
+//!   the sender's), and only for an instance this host
 //!   attached to itself on that peer within `open::OPEN_ATTACH_WINDOW`, so
 //!   no member can drive this desktop by naming an instance it was never
 //!   asked to open. Only the profile's *name* comes over: the command is
@@ -63,8 +64,10 @@ pub enum Route {
     Member(String),
 }
 
-/// The last attach decides: none yet, or this host's own, opens here; a
-/// member's goes to that member.
+/// The last attach decides: none (none yet, or a member's that ended
+/// `open::OPEN_ATTACH_WINDOW` ago or more: `Attaches::latest` drops it, as
+/// that member would refuse the delivery), or this host's own, opens here;
+/// a member's goes to that member.
 pub fn route(latest: Option<Origin>) -> Route {
     match latest {
         None | Some(Origin::Here) => Route::Here,
@@ -77,7 +80,8 @@ pub fn route(latest: Option<Origin>) -> Route {
 pub struct Sender {
     /// `(instance, instance_id, url)` → the job (`open::prepare`).
     pub prepare: Arc<dyn Fn(&str, &str, &str) -> OpenJob + Send + Sync>,
-    /// The latest attach to an instance id (`Attaches::latest`).
+    /// The latest attach to an instance id that still counts
+    /// (`Attaches::latest` at the current time).
     pub latest: Arc<dyn Fn(&str) -> Option<Origin> + Send + Sync>,
     pub call_member: CallMember,
     pub open_here: OpenHere,
@@ -142,6 +146,8 @@ pub fn send(s: &Sender, instance: &str, instance_id: &str, url: &str) {
                 (s.call_member)(&m, "open.deliver", params)
             });
             if let Err(why) = delivered {
+                // The member's error is its own text: one line here.
+                let why = open::printable(&why);
                 (s.log)(&format!("{instance}: cannot deliver {url} to {m}: {why}"));
                 (s.done)(failed(instance, url, job.profile, format!("cannot deliver to {m}: {why}")));
             }
@@ -165,12 +171,25 @@ const MAX_INSTANCE: usize = 256;
 /// The longest profile name taken.
 const MAX_PROFILE: usize = 64;
 
+/// Whether `name` can be an instance name in `open.deliver`: ASCII
+/// `[A-Za-z0-9][A-Za-z0-9_.-]*` (what `run` names instances; a rename that
+/// strays outside it can't open on another member). It ends up in this
+/// host's log and status lines.
+fn valid_instance(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+}
+
 /// `open.deliver` `params` from fleet peer `peer`, checked in order: the
-/// params (strict: a `machine` or any other key is refused), `attached`
-/// (whether this host attached to `instance` on `peer` within the window),
-/// then `open::decide` at `now` (unix seconds; `limit` spends this
-/// `(peer, instance)`'s token). The job to open here: `instance` as `peer` named it
-/// and its root there as the forward target.
+/// params (strict: a `machine` or any other key is refused; `instance` an
+/// instance name, [`valid_instance`]; a URL with no control character or
+/// whitespace), `attached` (whether this host attached to `instance` on
+/// `peer` within the window), then `open::decide` at `now` (unix seconds)
+/// for its scheme and `limit` (spends this `(peer, instance)`'s token): the
+/// TTL was the sender's, so `now` is the record's time too. The job to open
+/// here: `instance` as `peer` named it and its root there as the forward
+/// target.
 pub fn receive(
     params: Value,
     peer: &str,
@@ -182,8 +201,15 @@ pub fn receive(
     if p.instance.is_empty() || p.instance.len() > MAX_INSTANCE {
         return Err(ApiError::invalid(format!("`instance`: 1 to {MAX_INSTANCE} bytes")));
     }
+    if !valid_instance(&p.instance) {
+        return Err(ApiError::invalid(format!("`instance`: not an instance name: {}", open::printable(&p.instance))));
+    }
     if p.url.len() > MAX_URL {
         return Err(ApiError::invalid(format!("`url`: at most {MAX_URL} bytes")));
+    }
+    // Before `attached`, whose refusal quotes the URL.
+    if open::has_bad_chars(&p.url) {
+        return Err(ApiError::invalid(open::Verdict::BadChars.log_line(&p.instance, &p.url).unwrap_or_default()));
     }
     if !p.root.is_absolute() {
         return Err(ApiError::invalid(format!("`root` must be absolute: {}", p.root.display())));
@@ -206,7 +232,7 @@ pub fn receive(
     }
     let verdict = open::decide(&p.url, now, now, || limit(&p.instance));
     if let Some(line) = verdict.log_line(&p.instance, &p.url) {
-        let code = if matches!(verdict, open::Verdict::BadScheme(_)) { "invalid" } else { "denied" };
+        let code = if matches!(verdict, open::Verdict::BadScheme(_) | open::Verdict::BadChars) { "invalid" } else { "denied" };
         return Err(ApiError { code, message: line });
     }
     let target = ForwardTarget { machine: Some(peer.to_string()), dir: p.root, instance: p.instance.clone() };
@@ -418,5 +444,40 @@ mod tests {
         // never attached to.
         receive(with("url", json!("ssh://x")), "box", 1, |_| panic!("not asked"), |_| true).unwrap_err();
         receive(params(), "box", 1, |_| panic!("not asked"), |_| false).unwrap_err();
+    }
+
+    #[test]
+    fn a_delivery_takes_only_an_instance_name_and_a_clean_url() {
+        let with = |k: &str, v: Value| {
+            let mut p = params();
+            p[k] = v;
+            p
+        };
+        for name in ["web 1", "-web", ".web", "_web", "web\n1", "wéb", "web/1", "web\u{1b}[2J"] {
+            let e = take(with("instance", json!(name))).unwrap_err();
+            assert_eq!(e.code, "invalid", "{name:?}");
+            assert!(!e.message.contains(['\n', '\u{1b}']), "{:?}", e.message);
+        }
+        for name in ["web-1", "Web_2.x", "9"] {
+            let e = receive(with("instance", json!(name)), "box", 1_790_000_000, |_| true, |_| false).unwrap_err();
+            assert_eq!(e.code, "denied", "{name}: a name, just not attached");
+        }
+        // A URL with a control character: refused before `attached`, whose
+        // refusal would quote it, and escaped in the message.
+        let e = receive(with("url", json!("https://x/\r\nweb-1: opened")), "box", 1, |_| panic!("not asked"), |_| panic!("not asked"))
+            .unwrap_err();
+        assert_eq!(
+            (e.code, e.message.as_str()),
+            ("invalid", "web-1: open refused, control characters or whitespace in the URL: https://x/\\r\\nweb-1: opened")
+        );
+        assert_eq!(take(with("url", json!("https://x/a b"))).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn a_members_error_is_one_line_here() {
+        let (s, _, _, dones) = sender(Ok(local()), Some(Origin::Member("lap".into())), Err("nope\nweb-1: opened https://evil".into()));
+        send(&s, "web-1", "id-1", "https://c.example/");
+        assert!(logged("web-1: cannot deliver https://c.example/ to lap: nope\\nweb-1: opened https://evil"));
+        assert!(!dones.lock().unwrap()[0].line().contains('\n'));
     }
 }

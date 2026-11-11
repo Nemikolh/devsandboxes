@@ -56,3 +56,12 @@ or put pages on a desktop whose user never reached that instance.
 - The receiver checks the instance by the name the sender gives now
   against the name its user attached by, so a rename in between makes it
   refuse until the user attaches again.
+- A container's URL chooses host loopback ports on the opening host: its
+  own port and an OAuth callback's are bound there, the callback's exactly
+  (the provider redirects to it). So a sandbox can take a free well-known
+  port (11434, 5432) that host tools then connect to, reaching the
+  container. It is inherent to OAuth callbacks and stays, bounded: only
+  free ports, never one `state.toml` saves for a configured forward of
+  the root; no more than the URL names; the open rate limit; stopped
+  after 10 min without a connection (a host client connecting keeps it
+  alive).

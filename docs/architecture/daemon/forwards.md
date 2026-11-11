@@ -217,12 +217,32 @@ to `Root::open`, which answers an `OpenForward` (bound host port,
   redirects to exactly it. Reusing an open forward refreshes its
   `Opened.touched`.
 - **Binding** (`bind_open`): `127.0.0.1`, routed like an ad-hoc instance
-  forward (`local_opener` over `port::resolver`). A direct one is
-  `HostPort::Prefer(port)`, retried as `Prefer(0)` when the port can't be
-  bound for any reason but `AddrInUse` (a privileged port). A callback is
-  `HostPort::Fixed(port)`; when that fails the answer is `bind-failed` and
-  a `forwards.status` line (also in `serve.log`) says the callback won't
-  reach the instance.
+  forward (`local_opener` over `port::resolver`), never on a host port
+  `state.toml` saves for a configured forward of the root
+  (`root_saved_ports`: its instances' and its global services', running
+  or not), so an open never takes a configured forward's port away. A
+  direct one tries `HostPort::Fixed` from the container port up
+  (`candidates`, past taken and saved ports, `PREFER_SPAN` ports), then
+  `Prefer(0)`, also when a port can't be bound for any reason but
+  `AddrInUse` (a privileged port). A callback is `HostPort::Fixed(port)`;
+  when that port is saved (`<key>: port N is saved for a configured
+  forward; an OAuth callback to it won't reach <key>`) or the bind fails
+  (taken, or another error), the answer is `bind-failed` and a
+  `forwards.status` line (also in `serve.log`) says the callback won't
+  reach the instance. Reuse comes first, so a configured forward of that
+  instance port live on exactly that host port still answers it.
+
+The container chooses these host ports: a URL's own port, or a
+callback's, is bound on the opening host's loopback. That is what an
+OAuth callback needs (the provider redirects to exactly that port), and
+it lets a sandbox take a free well-known port (11434, 5432) that host
+tools then connect to, reaching the container instead. What bounds it:
+only free ports, never a configured forward's saved one; no more ports
+than the URL names (its own and the first value of each callback key);
+the open rate limit (5 per 10 s per instance,
+[bridges.md](../helper/bridges.md#opening-urls-kind-open)); and the
+idle stop below, 10 min without a connection. A host client connecting
+to it keeps it alive.
 
 Open forwards are never written to `forwards.toml` nor restored. Each
 status poll stops those idle for `OPEN_FORWARD_IDLE` (10 min,
@@ -243,7 +263,8 @@ start or last reuse). The machine must be known as for `forwards.add`
 follows the same rules over the remote forwards (`Remote::reaches`: same
 machine, root, instance and port, no service; a user's ad-hoc one too;
 a callback only one bound on that host port), binding the same
-`bind_open`. It is never written to `forwards.toml` nor restored, its
+`bind_open` with nothing reserved (the member's root has no configured
+forwards here). It is never written to `forwards.toml` nor restored, its
 row carries `machine` and `open: true`, and `forwards.rm` touches no
 store entry. The far instance stopping isn't visible here, so it stops
 only when idle (`Daemon::expire_open`, the same sweep) or when its

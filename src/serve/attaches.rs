@@ -12,8 +12,10 @@
 //!   `PTY` stream's proven origin member ([`Origin::Member`]). The latest
 //!   begin wins whatever the others do: an older origin's attaches ending
 //!   later never clobber a newer one's (each guard keeps the epoch it
-//!   joined). One entry per instance id ever attached, never pruned: that
-//!   is bounded by the instances this host had in a daemon's life.
+//!   joined). An origin whose attaches all ended [`OPEN_ATTACH_WINDOW`] ago
+//!   or more no longer counts ([`Attaches::latest`]). One entry per
+//!   instance id ever attached, never pruned: that is bounded by the
+//!   instances this host had in a daemon's life.
 //! - **outgoing**, on the attaching member: per `(machine, instance)` it
 //!   attached to there ([`Attaches::begin_out`]), whether an attach is live
 //!   or when the last one ended ([`Attaches::attached_out`]). An entry
@@ -109,10 +111,17 @@ impl Attaches {
         Guard { maps: Arc::clone(&self.0), key: Key::In { id: id.to_string(), epoch }, done: false }
     }
 
-    /// Where the latest attach to instance `id` came from, live or ended;
-    /// `None` when none was seen.
-    pub fn latest(&self, id: &str) -> Option<Origin> {
-        lock(&self.0).inbound.get(id).map(|l| l.origin.clone())
+    /// Where the latest attach to instance `id` came from, while one of its
+    /// attaches is live or the last ended less than [`OPEN_ATTACH_WINDOW`]
+    /// before `now`; `None` when none was seen or it ended longer ago. Past
+    /// the window a member would refuse the instance's opens (its
+    /// [`attached_out`](Self::attached_out) has the same window), so they
+    /// open here instead.
+    pub fn latest(&self, id: &str, now: Instant) -> Option<Origin> {
+        let m = lock(&self.0);
+        let l = m.inbound.get(id)?;
+        let counts = l.live > 0 || l.ended.is_some_and(|e| now.saturating_duration_since(e) < OPEN_ATTACH_WINDOW);
+        counts.then(|| l.origin.clone())
     }
 
     /// Whether an attach of instance `id`'s latest origin is live.
@@ -200,16 +209,16 @@ mod tests {
     #[test]
     fn the_latest_begin_wins_and_an_older_origin_ending_never_clobbers_it() {
         let (a, t0) = (Attaches::default(), Instant::now());
-        assert_eq!(a.latest("id-1"), None);
+        assert_eq!(a.latest("id-1", t0), None);
         let lap = a.begin_in("id-1", member("lap"));
-        assert_eq!((a.latest("id-1"), inbound(&a, "id-1")), (Some(member("lap")), Some((1, None))));
+        assert_eq!((a.latest("id-1", t0), inbound(&a, "id-1")), (Some(member("lap")), Some((1, None))));
         let here = a.begin_in("id-1", Origin::Here);
-        assert_eq!(a.latest("id-1"), Some(Origin::Here), "a new begin replaces the origin");
+        assert_eq!(a.latest("id-1", t0), Some(Origin::Here), "a new begin replaces the origin");
         lap.end(t0 + Duration::from_secs(2));
-        assert_eq!((a.latest("id-1"), inbound(&a, "id-1")), (Some(Origin::Here), Some((1, None))), "the older one's end doesn't count");
+        assert_eq!((a.latest("id-1", t0), inbound(&a, "id-1")), (Some(Origin::Here), Some((1, None))), "the older one's end doesn't count");
         let at = t0 + Duration::from_secs(3);
         here.end(at);
-        assert_eq!((a.latest("id-1"), inbound(&a, "id-1")), (Some(Origin::Here), Some((0, Some(at)))), "ended, still the latest");
+        assert_eq!((a.latest("id-1", at), inbound(&a, "id-1")), (Some(Origin::Here), Some((0, Some(at)))), "ended, still the latest");
 
         // The same origin joins; the last of its attaches ends it.
         let one = a.begin_in("id-1", member("lap"));
@@ -219,7 +228,24 @@ mod tests {
         assert_eq!(inbound(&a, "id-1"), Some((1, None)));
         drop(two);
         assert!(matches!(inbound(&a, "id-1"), Some((0, Some(_)))), "a drop stamps its end");
-        assert_eq!(a.latest("id-2"), None, "per instance");
+        assert_eq!(a.latest("id-2", t0), None, "per instance");
+    }
+
+    /// A member's attach routes opens while live and for the window after
+    /// its end, then no longer counts: the member would refuse them.
+    #[test]
+    fn the_latest_counts_while_live_and_for_the_window_after() {
+        let (a, t0) = (Attaches::default(), Instant::now());
+        let lap = a.begin_in("id-1", member("lap"));
+        assert_eq!(a.latest("id-1", t0 + 2 * W), Some(member("lap")), "live: any time");
+        lap.end(t0);
+        assert_eq!(a.latest("id-1", t0 + W - Duration::from_millis(1)), Some(member("lap")), "within the window");
+        assert_eq!(a.latest("id-1", t0 + W), None, "the window's edge: out");
+        let here = a.begin_in("id-1", Origin::Here);
+        here.end(t0);
+        assert_eq!(a.latest("id-1", t0 + W), None, "the same for this host's own");
+        let _live = a.begin_in("id-1", member("lap"));
+        assert_eq!(a.latest("id-1", t0 + 3 * W), Some(member("lap")), "a new attach counts again");
     }
 
     #[test]

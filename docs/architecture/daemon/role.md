@@ -116,7 +116,10 @@ The daemon exits `IDLE_TIMEOUT` (10 min) after its last holder left
 (`idle::decide`, pure). `Holders` (filled in `Shared::holders`):
 
 - `clients`: open connections (dashboard, `api --stdio` relay, a command
-  holding a bridge);
+  holding a bridge), but not attach-only ones: a connection whose only
+  requests are `hello` and `instances.attach` (`client::attach_hold`, a
+  TTY `exec` left open for days) holds nothing (`ConnEntry::holds`; any
+  other request makes it a holder for good);
 - `forwards`: every live forward, ad-hoc or configured, whatever its state;
 - `live_instances`: running instances declaring `dispatcher` or
   `inbox = true` (`host::holds_host`), as of the last poll;
@@ -142,7 +145,8 @@ listener and socket go, subscribers get `closing` (`reason`: `handoff`,
 `shutdown`, `idle`), connections drain up to `DRAIN_TIMEOUT` (5 s), then the
 machine links stop (ssh killed), then the bridges (`Host` dropped), then
 the forwards, and the start lock last, so a successor never overlaps
-bridges or forward ports. Local verbs in flight don't hold the drain and aren't
+bridges or forward ports. Attach-only connections are cut and never
+waited on. Local verbs in flight don't hold the drain and aren't
 cancelled; the successor adopts them ([verbs.md](verbs.md)). A
 non-`detach` verb forwarded to a machine is the exception: killing its ssh
 cancels it on the remote ([machines.md](machines.md)). Ad-hoc forwards
