@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A config can now belong to the whole fleet and keep running on an always-on server while the host it was written on is offline; links opened in a sandbox open on your desktop, in the browser of the instance's profile.
+
 ### Fixed
 
 - **Service networks no longer break DNS on rootless docker.** Rootless docker can't see the host's routes, so once its `172.x` pools ran out it could give a service network the LAN's range (say `192.168.0.0/20` on a `192.168.1.x` LAN), and from then on no container could reach the router or its DNS. A new service network that covers a host route, gateway or nameserver is now recreated on a free `/24` of `10.200.0.0/16`, with a warning. To clear an existing bad one, run `devsandbox gc`, or `docker network rm` it if a container still uses it.
@@ -10,7 +12,15 @@
 
 ### Added
 
-- **Signed config versions.** On the fleet's authority, a `run`, `rebuild` or `start` you type (CLI or dashboard) first checks whether its config changed since its last signed version: the config's structure (comments and formatting don't count) and the files under the config root it references (dockerfiles and build contexts, `${configDir}` mounts, local features), not notes or logs next to it. If it did, it keeps that version's files under the data dir's `mesh/bundles/` and signs the next version into the membership log, sends it to the machines it links to (those it misses take it on their next link), and logs it in `serve.log`. A verb aimed at another machine signs the local config root of the same name, once that name has been signed here. Versions only go up, an unchanged config signs nothing, a config that doesn't load isn't signed, and if signing fails the verb runs anyway (the log says why). Every other member then gets its own copy of that version (only once its files check out against the signed version), from whichever machine passed it the update, and keeps it while the authority is offline; `serve.log` says when a copy is installed or why not. That copy is one of the member's config roots (listed to the machines it links to, reachable under `worker` trust), and a `run`, `rebuild` or `start` there runs from it only while it is the latest signed version: a member that hasn't got the latest yet, or whose copy was changed in place (its config's structure or a file it references), refuses and says why. Files the config doesn't reference, such as bind sources created on first run, don't count; `stop` and `rm` keep working either way.
+- **A config every machine runs.** A config can now belong to your whole fleet instead of the host it was written on, so an always-on server keeps running its sandboxes while that host is off for days. On the fleet's authority (the host that ran the fleet's first `machine add`), a `run`, `rebuild` or `start` you type signs the config's next version whenever it changed. The signed version covers the config's structure (comments and formatting don't count) and the files under the root it references (dockerfiles and build contexts, `${configDir}` mounts, local features), not notes or logs next to it. The verb then sends it to every machine it links to, which installs its own copy under `~/.local/share/devsandbox/mesh/tree/<name>/` before answering. The verb's output says so, or names a machine that didn't get it and why; running any verb on the root again re-sends it. Every machine keeps the latest signed version while the authority is offline, never an older one, and builds only from a copy that is exactly that version. A copy edited in place, or with files added to a build context, is refused, from the CLI, the daemon, a dispatcher or autostart alike. Copies show up among a machine's roots on their own, so from a laptop:
+
+  ```bash
+  devsandbox machine add box --hub      # on the authority
+  devsandbox run web                    # on the authority: signs and sends to box
+  devsandbox run box/web                # on the laptop, even with the authority offline
+  ```
+
+  The setup steps (repos to clone next to the copy, what isn't sent) are in the host daemon docs. The authority's signature is the consent: a signed config runs on a `worker` member without its worker policy.
 
 - **A warning when a nested docker can't work from a shell.** On rootless docker with runc older than 1.4.1, processes started with `exec` (shells, VS Code, agents, lifecycle hooks) end up outside the container's cgroup, so a docker-in-docker `dockerd` restarted from one of them fails every `docker run` with `cgroup.procs: no such file or directory`. `run`, `start` and `inspect` now detect this and say so. The fix is upgrading the host's runc; until then, restart the container so its entrypoint starts `dockerd`.
 
@@ -31,6 +41,59 @@ profiles = ["work"]
 [work]
 open = ["google-chrome", "--profile-directory=Profile 2"]
 ```
+
+<details><summary>Commits</summary>
+
+- 6c94e8a docs(site): finish the signed-config setup steps with a matching release everywhere, box as hub, serve install, files only commands reach, empty shared volumes and how to retry a machine that missed the config
+- c135e02 fix(machines): skip a machine's listed roots that answer an error and write live roots into the snapshot store under the links lock, so a dead root no longer leaves a permanent error and a new copy's snapshots aren't dropped by a racing reload
+- ecd268c fix(fleet): refuse building from the signed-config store outside a copy and migrating a copy in place, and say the entry check doesn't stop a writer racing the build, so admission claims only what it enforces
+- e321422 fix(fleet): don't say configs aren't signed on a member driving a config the authority already signs, since that note is for a wrong setup order and read as a failure on the main flow
+- 9f1236e fix(fleet): count a machine whose config install failed as missed, retry a due install on any sync, and re-send an unchanged config on the authority's verbs, so a clean signing note means the machine has it and re-running the verb is the retry
+- 20a6449 docs(fleet): close the mesh config plan, recording in ADR 0049 that the authority's signature is a signed root's config authority, and parking the open calls so the rules live in the fleet docs and status instead of a finished plan
+- 3a76583 feat(machines): keep each machine's roots live from its roots.list at link-up and after every sync with it, so a signed config a machine installs after it was added is listed, watched and runnable without adding it again
+- acb000d fix(fleet): write stored config bundles atomically under unique names, replace a damaged one, and drop one that won't install to pull it again, so a bad bundle on disk can no longer block a config for good
+- 3ef7fb9 fix(fleet): refuse a signed config's copy with a file or .git added inside a bundled build context or local feature, since a build would copy it in though nothing signed it
+- b891969 fix(fleet): check a signed config's copy at the entry of every command that builds from it, so dispatcher children, autostart and the in-process fallback can't build a copy a container edited
+- dd42577 feat(fleet): say in a verb's output what signing its config did, which machines the push missed, and when this host isn't the fleet's authority, so a wrong setup order or a machine left without the config shows up before the authority goes offline
+- c0054f7 fix(fleet): install a pushed config before answering the sync and before sending the log on, so a push that reached a machine left the config there and a verb aimed at it right after signing isn't refused as not here yet
+- a7897a6 docs(plans): park GPU, isolation-level and sandbawks ideas, so the overlap with sandbawks is on record before fleet steps 13-14 build placement and checkpoints
+- 34e60f7 feat(fleet): run laptop-driven verbs on a member's signed config copy and refuse them while the copy isn't the log's head, so a request can only ever build what the authority signed, even after a container edited the copy
+- a0aff4a feat(fleet): pull and install each newly signed config from the peer that brought the log, on sync and at every link-up, so a member keeps the latest signed config even when the authority went offline right after signing
+- e5aa4e1 feat(fleet): install a signed config's bundle only when it hashes to the log's head, updating one copy per root in place, and serve stored bundles to peers, so any member can hand on the version it holds while the authority is offline
+- 8d00d1b feat(fleet): sign the bound local config root when the authority aims a verb at another machine, since driving the box is the main way a config reaches the mesh
+- 29c854a feat(fleet): bind a signed config name to the first root it came from, so two roots sharing a directory name can't take turns bumping each other's version
+- 0aef234 feat(fleet): sign a config's structure and the files it references, and keep that bundle, so notes and logs in the root no longer bump versions or ship, a broken config is never signed, and the signed version can be served after the root changes
+- a7545c1 refactor(fleet): log config signing instead of notifying the verb's client, since the note only announced a side effect and every client had to render it
+- 5a100c9 docs(plans): plan mesh config, so a signed config runs on every member while its authority is offline
+- 2e55b03 fix(fleet): accept shared-volumes binds and worktree-link on workers, guard host-side writes
+- da7fb77 docs(agents): commit finished changes unasked, subagents only when briefed
+- 6fe9c56 feat(fleet): sign a config root's version from the authority's verbs
+- e8a8d28 fix(fleet): accept persist-shell-history on workers so it no longer ties a sandbox home
+- 49a94a7 fix(fleet): accept caches on workers so they no longer tie a sandbox home
+- fe06f7c docs(plans): archive open routing now that all six steps shipped, moving its open questions to parked and its limits (container-chosen host ports, unrecognized loopback spellings, in-memory attach records, remote open forwards outliving their instance) to status
+- ea9c625 fix(open): never open a url whose own localhost port didn't forward, parse hosts as browsers do, refuse control characters, keep open forwards off configured forwards' ports, stop routing to a member whose attach expired, and record attaches for terminals only on connections that don't hold the daemon, so a sandbox's url can't reach the host's own services or leak a token and scripts don't take the user's opens
+- 498e7f3 feat(open): push opens.done for every open, opened, refused or failed, and show it on the dashboard's status line, so a url that didn't open (or opened without its callback forward) says why where the user looks instead of only in serve.log
+- 168e581 feat(forwards): make open forwards into another machine's instance for a delivered url, owned by the opening host and stopped when idle or when the machine goes, so a localhost link or oauth callback from a server sandbox works on the laptop that opens it
+- 6b3aded feat(open): send a container's url to the member that last attached to its instance with open.deliver, which opens it only for an instance it attached to itself in the last 10 min and maps the profile name with its own profiles.toml, so a server sandbox attached from the laptop opens on the laptop and no member can drive another's desktop
+- 8c9a47c feat(serve): record each instance's latest attach (local exec, vscode, a fleet pty stream's proven origin) and this host's own attaches to other machines' instances, so an open can go to the member whose user is at the instance and that member can check it asked for it
+- 1c06061 test(machines): retry the repeated hub proposal in the_hub_role_moves_and_back like the first, since the link redialed after the role move may still cycle once and fail it under a loaded suite
+- b70d004 feat(open): forward a url's localhost port and its oauth callback port before opening it, rewriting the url when the port moved, so a dev server link or a gh auth login style callback from a sandbox reaches the container instead of the host's own localhost
+- d8dc58c feat(forwards): add open forwards, made for a url's loopback port, reusing any forward of that instance port, never saved and stopped after 10 min idle or when the instance stops, so the opener can make a container's localhost url and its oauth callback reach the container
+- fcbf230 feat(devsbd): check whether exec'd processes land in the container's cgroup and warn on run, start and inspect when they don't, so a docker-in-docker dockerd that rootless runc before 1.4.1 left outside it fails with a reason instead of a bare cgroup.procs error
+- 60cb250 fix(services): recreate a new service network whose subnet covers a host route, gateway or nameserver, and let gc remove unused networks on docker, so rootless docker can no longer hand out the lan's range and cut every container off from the host's dns
+- fe83df6 feat(tui): switch an instance's profile from the dashboard with P or :profile, carrying each sandbox's allowed profiles on its row so the picker and the drift flag read one resolve
+- b66d3e7 feat(profile): switch a running instance's profile with devsandbox profile or instances.setProfile, checked against its sandbox's allowed set, so moving an instance between work and personal needs no rebuild and stays the user's call
+- 58ed3ac feat(open): open a url with the browser this host's profiles.toml maps the instance's profile to, so work sandboxes can open in a work browser and personal ones elsewhere; commands only ever come from the opening host's own file
+- 33efedc feat(profiles): show an instance's profile in ps, inspect, the snapshots and the dashboard, and flag one its sandbox no longer allows, so a config change that drops a profile is visible instead of silently moving the instance
+- 7896c4a feat(run): put every new instance in one of its sandbox's profiles (--profile, else the last one chosen, else the first), and dispatcher children in their parent's or nowhere, so the profile is always the user's choice and never the container's
+- 819915f feat(config): declare profiles and which ones a sandbox's instances may be in, so instances can later be placed in one (work, personal) that picks their browser and, later, their credentials; membership is host routing, so it stays out of the config hash
+- a89ba7b feat(devsbd): answer as xdg-open and the debian browser alternatives and point BROWSER at it, so programs in a sandbox that open a url hand it to the host instead of failing for want of a desktop; an image's own /usr/local/bin/xdg-open is left alone
+- 3db5833 feat(open): take a container's open record in the bridge's sink and open http(s) urls with the host's opener, so a url a sandbox asks for can land on the desktop instead of the inbox; ttl, scheme and rate limit guard it, and the display comes from the user manager since a serve install'd unit starts before the session imports it
+- 0a36137 docs(plans): freeze the inbox and order open routing, then an orchestrator interface, helper-rpc runs and the inbox's removal before fleet step 13, since step 13 as written would federate the inbox an external orchestrator replaces; split open routing step 1 into 1a-1c
+- fb6e3fe test(devsbd): widen the stalled-stream keepalive test's timeout to 1 s over a 3 s watch, since 300 ms failed on a loaded ci runner while still catching pings blocked for good
+- 7c8c780 ci(windows): build the windows binary on every push, since its cfg(unix) gates are otherwise first compiled by a release tag
+
+</details>
 
 ## 0.9.0
 
