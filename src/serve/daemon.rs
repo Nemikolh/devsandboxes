@@ -2570,7 +2570,7 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
 fn local_call(method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Result<Value, api::ApiError> {
     let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
     let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
-    let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref() });
+    let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref(), data: shared.data_dir() });
     api::call(method, params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, host })
 }
 
@@ -2609,6 +2609,12 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
     if signs && let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) {
         sign_config(root, shared, conn);
     }
+    if matches!(method, "run" | "rebuild" | "start" | "services.rebuild")
+        && let Err(why) = check_mesh_copy(&params, shared)
+    {
+        log(&format!("{}: refused {method}: {why}", conn.label()));
+        return Some(Response::err(id, "denied", why));
+    }
     if method == "run"
         && let Some(answer) = placed_run(id, &params, shared, conn)
     {
@@ -2646,6 +2652,28 @@ fn sign_config(root: &Path, shared: &Shared, conn: &ConnState) {
         Some(ConfigSigned::Signed { root, version }) => log(&format!("{}: signed config `{root}` v{version}", conn.label())),
         None => {}
     }
+}
+
+/// A `run`/`rebuild`/`start`/`services.rebuild` whose `root` is a signed config's copy here
+/// (under `mesh/tree/` in the data dir), from any client: admitted only
+/// while that copy is the log's head for its name (`fleet::mesh::verify`),
+/// else why not (answered `denied`). A root inside a copy but not the copy
+/// itself is no signed config. Any other root: nothing to check.
+/// `stop`/`rm` never come here: they build nothing, and keep working on a
+/// changed copy.
+fn check_mesh_copy(params: &Value, shared: &Shared) -> Result<(), String> {
+    let Some(data) = shared.data_dir() else { return Ok(()) };
+    let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) else { return Ok(()) };
+    let Some((name, exact)) = fleet::mesh::copy_of(data, root) else { return Ok(()) };
+    if !exact {
+        return Err(format!("`{}` is inside the copy of config root `{name}`, not a signed config", root.display()));
+    }
+    let stored = match shared.member.as_deref() {
+        Some(member) => fleet::membership_api::load(member).map_err(|e| format!("config root `{name}`: {}", e.message))?,
+        None => None,
+    };
+    let head = stored.and_then(|s| s.log.membership().and_then(|m| m.config.get(&name).copied()));
+    fleet::mesh::verify(data, &name, head).map_err(|e| format!("{e:#}"))
 }
 
 /// This host took a log from `peer` (`fleet.sync`), or its link to `peer`

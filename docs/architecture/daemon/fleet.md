@@ -2020,7 +2020,32 @@ it never signs on a remote request alone (decision 49;
   without the bundle is a logged failure, and the next sync or link-up
   tries again. So a member keeps, and runs from, the latest version it
   got while the authority is offline, and hands it on to the members
-  that link to it.
+  that link to it. `mesh/installed.toml` also names the config file
+  installed, apart from the referenced files the hash covers.
+  The copy is one of the member's own roots: `fleet::lent::own_roots`
+  adds `mesh::roots` (each installed name's `mesh/tree/<name>/`,
+  canonical) under the data dir (`member.toml`'s for a `lent::Reach`,
+  `api::HostPaths::data` for `roots.list`), so `roots.list` lists it and
+  a `worker` peer reaches it exactly, like any own root, never what's
+  nested in it. A `run`, `rebuild`, `start` or `services.rebuild` whose `root` is under
+  `mesh/tree/` is checked first, from any client, local or over a link,
+  before a placement or the runner (`daemon::check_mesh_copy`, after
+  signing): a root inside a copy but not the copy is refused, else
+  `mesh::verify` checks the copy against the log's head for its name
+  (`Membership::config`). No head or no install: ``config root `<name>`
+  has no signed version here yet``; installed hash not the head (not
+  pulled yet): ``config root `<name>` v<N> isn't here yet``; the copy
+  rehashed not the head: ``config root `<name>` isn't the signed config
+  (v<N>): its copy was changed here``; all answered `denied`. The rehash
+  goes through `Bundle::hash`'s own encoding (`mesh::hash_parts`) over
+  the config file's parsed table (the file `config::find` picks must be
+  the installed one) and exactly the files `installed.toml` lists, each
+  a regular file reached through real dirs; not a fresh `collect`, so a
+  bind source `run` creates under the copy (`ensure_bind_source`) or a
+  file a container writes through a read-write `${configDir}` mount
+  doesn't count, while an edit to the structure or to a listed file (or
+  its removal, or a link in its place) does. `stop` and `rm` aren't
+  checked: they build nothing.
 - **Following a hub change** (decision 69). A host follows a hub change
   (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
   both ends redial saying it) only once the change has left it: cycling

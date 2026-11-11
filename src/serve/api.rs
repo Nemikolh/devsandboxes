@@ -58,6 +58,9 @@ pub struct HostPaths<'a> {
     pub state: &'a Path,
     /// What `~` is; `None`: no `~/.devsandboxes` candidate, no `~` paths.
     pub home: Option<&'a Path>,
+    /// The data dir the signed configs' copies are under (`fleet::mesh`);
+    /// `None`: none listed.
+    pub data: Option<&'a Path>,
 }
 
 /// The daemon's forward registry as `forwards.*` sees it
@@ -148,13 +151,17 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "sandboxes.list" => sandboxes_list(parse(params)?),
         "roots.list" => {
             let p: RootsParams = parse(params)?;
-            let (state, home) = match ctx.host {
-                Some(host) => (host.state.to_path_buf(), host.home.map(Path::to_path_buf)),
-                None => (state_path()?, std::env::var_os("HOME").map(PathBuf::from)),
+            let (state, home, data) = match ctx.host {
+                Some(host) => (host.state.to_path_buf(), host.home.map(Path::to_path_buf), host.data.map(Path::to_path_buf)),
+                None => {
+                    let state = state_path()?;
+                    let data = state.parent().map(Path::to_path_buf);
+                    (state, std::env::var_os("HOME").map(PathBuf::from), data)
+                }
             };
             match p.paths {
                 Some(paths) => roots_check(&paths, home.as_deref()),
-                None => roots_list(&state, home.as_deref()),
+                None => roots_list(&state, home.as_deref(), data.as_deref()),
             }
         }
         "sandboxes.get" => sandboxes_get(parse(params)?),
@@ -862,12 +869,13 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
 
 /// This host's candidate config roots (docs/architecture/daemon/machines.md,
 /// *`devsandbox machine add|ls|set|unlink|rm|trust|roots`*; what `machine add` offers):
-/// `fleet::lent::own_roots` (every distinct `config_dir` in `state` plus
-/// `~/.devsandboxes` when `home` has one, canonicalized), sorted. Known
-/// roots only, no disk scan. A root that no longer exists or whose config
-/// doesn't load answers with its `error`.
-fn roots_list(state: &Path, home: Option<&Path>) -> Answer {
-    let roots = crate::serve::fleet::lent::own_roots(&load_state(state)?, home);
+/// `fleet::lent::own_roots` (every distinct `config_dir` in `state`,
+/// `~/.devsandboxes` when `home` has one and the signed configs' copies
+/// under data dir `data`, canonicalized), sorted. Known roots only, no disk
+/// scan. A root that no longer exists or whose config doesn't load answers
+/// with its `error`.
+fn roots_list(state: &Path, home: Option<&Path>, data: Option<&Path>) -> Answer {
+    let roots = crate::serve::fleet::lent::own_roots(&load_state(state)?, home, data);
     let rows: Vec<RootCandidate> = roots
         .into_iter()
         .map(|root| match config_at(&root) {
@@ -2152,7 +2160,7 @@ mod tests {
             json!({"root": canon(&home.join(".devsandboxes")), "sandboxes": [], "error": null}),
         ];
         want.sort_by(|a, b| a["root"].as_str().cmp(&b["root"].as_str()));
-        let mut got = roots_list(&state, Some(&home)).unwrap();
+        let mut got = roots_list(&state, Some(&home), None).unwrap();
         // The parse error's text is the config module's; that there is one is ours.
         for row in got.as_array_mut().unwrap() {
             if row["root"] == json!(canon(&bad)) {
@@ -2162,9 +2170,9 @@ mod tests {
         }
         assert_eq!(got, Value::Array(want));
         // No home `.devsandboxes`, no state: nothing.
-        let none = roots_list(&state.with_file_name("absent.toml"), Some(&base)).unwrap();
+        let none = roots_list(&state.with_file_name("absent.toml"), Some(&base), None).unwrap();
         assert_eq!(none, json!([]));
-        assert_eq!(roots_list(&state.with_file_name("absent.toml"), None).unwrap(), json!([]));
+        assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None).unwrap(), json!([]));
         let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 
@@ -2204,7 +2212,7 @@ mod tests {
 
         // Through `call`, with the ctx's home rather than `$HOME`.
         let state = base.join("state.toml");
-        let host = HostPaths { state: &state, home: Some(&home) };
+        let host = HostPaths { state: &state, home: Some(&home), data: None };
         let ctx = Ctx { inbox: &base.join("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) };
         let r = call("roots.list", json!({"paths": ["~/sb"]}), &ctx).unwrap();
         assert_eq!(r[0]["sandboxes"], web);
@@ -2415,7 +2423,7 @@ mod tests {
         let state = state_file("identity", "");
         let root = state.with_file_name("cfg");
         std::fs::create_dir_all(&root).unwrap();
-        let host = HostPaths { state: &state, home: None };
+        let host = HostPaths { state: &state, home: None, data: None };
         let run = |method: &str, params: Value| {
             call(method, params, &Ctx { inbox: &state.with_file_name("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) })
         };

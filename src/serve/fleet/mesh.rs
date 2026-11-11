@@ -50,21 +50,27 @@ fn put(out: &mut Sha256, field: &[u8]) {
     out.update(field);
 }
 
+/// sha256 over [`HASH_DOMAIN`], the config table's canonical encoding
+/// (`toml::Table` is a `BTreeMap`: its TOML is key-sorted, as
+/// `config::config_hash` relies on), then per referenced file in path
+/// order (`files` comes sorted) its path, exec bit and contents' sha256.
+/// [`Bundle::hash`] and [`verify`]'s recomputation both go through it.
+fn hash_parts<'a>(table: &Table, files: impl IntoIterator<Item = (&'a str, bool, [u8; 32])>) -> [u8; 32] {
+    let mut h = Sha256::new();
+    put(&mut h, HASH_DOMAIN.as_bytes());
+    put(&mut h, toml::to_string(table).expect("a parsed table serializes").as_bytes());
+    for (path, exec, digest) in files {
+        put(&mut h, path.as_bytes());
+        put(&mut h, &[u8::from(exec)]);
+        put(&mut h, &digest);
+    }
+    h.finalize().into()
+}
+
 impl Bundle {
-    /// sha256 over [`HASH_DOMAIN`], the config table's canonical encoding
-    /// (`toml::Table` is a `BTreeMap`: its TOML is key-sorted, as
-    /// `config::config_hash` relies on), then per referenced file in path
-    /// order its path, exec bit and contents' sha256.
+    /// [`hash_parts`] over the parsed config and the referenced files.
     pub fn hash(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        put(&mut h, HASH_DOMAIN.as_bytes());
-        put(&mut h, toml::to_string(&self.table).expect("a parsed table serializes").as_bytes());
-        for (path, f) in &self.files {
-            put(&mut h, path.as_bytes());
-            put(&mut h, &[u8::from(f.exec)]);
-            put(&mut h, &Sha256::digest(&f.data));
-        }
-        h.finalize().into()
+        hash_parts(&self.table, self.files.iter().map(|(path, f)| (path.as_str(), f.exec, Sha256::digest(&f.data).into())))
     }
 
     /// The bundle as a [`tar`]: the config file then the referenced files,
@@ -171,8 +177,9 @@ pub fn tree_path(data: &Path, name: &str) -> PathBuf {
 }
 
 /// What [`install`] wrote last per name: `<data>/devsandbox/mesh/installed.toml`,
-/// `[<name>] hash = "<hex>", files = [...]`, so the next install removes
-/// only what this one listed and no longer does.
+/// `[<name>] hash = "<hex>", config = "<file>", files = [...]`, so the next
+/// install removes only what this one listed and no longer does, and
+/// [`verify`] rehashes exactly what was installed.
 fn installed_path(data: &Path) -> PathBuf {
     data.join("mesh").join("installed.toml")
 }
@@ -181,7 +188,20 @@ fn installed_path(data: &Path) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 struct InstalledRoot {
     hash: String,
+    /// The config file's name in the copy.
+    config: String,
+    /// The bundle's referenced files (what the hash covers besides the
+    /// config's table; the config file itself only when it references
+    /// itself).
     files: Vec<String>,
+}
+
+impl InstalledRoot {
+    /// Every path this install wrote: the config file, then the files.
+    fn listed(&self) -> Vec<String> {
+        let config = Some(&self.config).filter(|c| !c.is_empty() && !self.files.contains(c)).cloned();
+        config.into_iter().chain(self.files.iter().cloned()).collect()
+    }
 }
 
 fn load_installed(path: &Path) -> Result<BTreeMap<String, InstalledRoot>> {
@@ -270,12 +290,13 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
     let previous = installed.get(name).cloned().unwrap_or_default();
     let mut listed: Vec<(&str, bool, &[u8])> = vec![(bundle.config_name.as_str(), false, &bundle.config)];
     listed.extend(bundle.files.iter().filter(|(p, _)| **p != bundle.config_name).map(|(p, f)| (p.as_str(), f.exec, f.data.as_slice())));
-    let files: Vec<String> = listed.iter().map(|(p, _, _)| p.to_string()).collect();
+    let entry = InstalledRoot { hash: hex::encode(got), config: bundle.config_name.clone(), files: bundle.files.keys().cloned().collect() };
+    let (before, files) = (previous.listed(), entry.listed());
     // First the union, so a write cut short still has every file listed
     // that the next install may have to remove.
-    let mut union = previous.files.clone();
-    union.extend(files.iter().filter(|f| !previous.files.contains(f)).cloned());
-    installed.insert(name.to_string(), InstalledRoot { hash: previous.hash.clone(), files: union });
+    let mut union = before.clone();
+    union.extend(files.iter().filter(|f| !before.contains(f)).cloned());
+    installed.insert(name.to_string(), InstalledRoot { hash: previous.hash.clone(), config: previous.config.clone(), files: union });
     save_installed(&installed_path(data), &installed)?;
 
     let tree = tree_path(data, name);
@@ -284,7 +305,7 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
         write_in(&tree, rel, *exec, bytes)?;
     }
     let mut removed = Vec::new();
-    for rel in previous.files.iter().filter(|f| !files.contains(f)) {
+    for rel in before.iter().filter(|f| !files.contains(f)) {
         if tar::check_path(rel).is_err() || skipped(rel) {
             continue;
         }
@@ -292,9 +313,95 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
             removed.push(rel.clone());
         }
     }
-    installed.insert(name.to_string(), InstalledRoot { hash: hex::encode(got), files });
+    installed.insert(name.to_string(), entry);
     save_installed(&installed_path(data), &installed)?;
     Ok(Installed { path: tree, removed })
+}
+
+/// The copies [`install`]ed under data dir `data` ([`tree_path`] of each
+/// name in `installed.toml` that exists), canonical: own config roots of
+/// this member (`fleet::lent::own_roots`). An `installed.toml` that doesn't
+/// load is none.
+pub fn roots(data: &Path) -> Vec<PathBuf> {
+    let names = load_installed(&installed_path(data)).map(|i| i.into_keys().collect()).unwrap_or_else(|_| Vec::new());
+    names.into_iter().filter_map(|name| std::fs::canonicalize(tree_path(data, &name)).ok()).collect()
+}
+
+/// The name of the copy config root `root` is in, when `root`
+/// (canonicalized) is under data dir `data`'s `mesh/tree/`: the dir right
+/// under it. Whether `root` is that copy itself, or somewhere inside it.
+pub fn copy_of(data: &Path, root: &Path) -> Option<(String, bool)> {
+    let tree = std::fs::canonicalize(data.join("mesh").join("tree")).ok()?;
+    let root = std::fs::canonicalize(root).ok()?;
+    let rel = root.strip_prefix(&tree).ok()?;
+    let mut parts = rel.components();
+    let name = parts.next()?.as_os_str().to_str()?.to_string();
+    Some((name, parts.next().is_none()))
+}
+
+/// Whether this member's copy of config root `name` (under data dir
+/// `data`) is the signed version `head` (the log's latest `config` entry
+/// for `name`, `(version, hash)`): what a `run` / `rebuild` / `start`
+/// against the copy needs. Refused when there is no head or no install,
+/// when what's installed isn't the head (not pulled yet), and when the
+/// copy, rehashed, isn't the head: the copy can be edited in place (a
+/// sandbox may mount its config dir read-write).
+///
+/// The rehash is over the config file's parsed table and exactly the
+/// files `installed.toml` lists for `name`, not a fresh [`collect`]: a
+/// bind source `run` creates under the copy, or a file a container writes
+/// there, isn't the config; an edit to the config's structure or to a
+/// listed file (or one removed, or turned into a link) is. Comments and
+/// formatting aren't, as for the signer.
+pub fn verify(data: &Path, name: &str, head: Option<(u64, [u8; 32])>) -> Result<()> {
+    let installed = load_installed(&installed_path(data))?;
+    let (Some((version, head)), Some(copy)) = (head, installed.get(name)) else {
+        bail!("config root `{name}` has no signed version here yet");
+    };
+    if copy.hash != hex::encode(head) {
+        bail!("config root `{name}` v{version} isn't here yet");
+    }
+    match rehash(&tree_path(data, name), copy) {
+        Ok(h) if h == head => Ok(()),
+        _ => bail!("config root `{name}` isn't the signed config (v{version}): its copy was changed here"),
+    }
+}
+
+/// [`hash_parts`] over the copy at `tree` as `copy` lists it: the config
+/// file (the one `config::find` picks, which must be the installed one)
+/// and each listed file, a regular file reached through real dirs.
+fn rehash(tree: &Path, copy: &InstalledRoot) -> Result<[u8; 32]> {
+    let path = config::find(tree)?.with_context(|| format!("no config file in {}", tree.display()))?;
+    if path.file_name().and_then(|n| n.to_str()) != Some(copy.config.as_str()) {
+        bail!("{} isn't the installed config file", path.display());
+    }
+    let real = |rel: &str| -> Result<PathBuf> {
+        tar::check_path(rel)?;
+        let mut at = tree.to_path_buf();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for p in &parts[..parts.len() - 1] {
+            at.push(p);
+            if !at.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                bail!("{} isn't a directory", at.display());
+            }
+        }
+        let path = tree.join(rel);
+        if !path.symlink_metadata().is_ok_and(|m| m.is_file()) {
+            bail!("{} isn't a file", path.display());
+        }
+        Ok(path)
+    };
+    let text = std::fs::read(real(&copy.config)?).with_context(|| format!("cannot read {}", path.display()))?;
+    let table = raw_table(&path, &text)?;
+    let mut files: Vec<(&str, bool, [u8; 32])> = Vec::new();
+    for rel in &copy.files {
+        let path = real(rel)?;
+        let meta = std::fs::metadata(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let data = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        files.push((rel.as_str(), meta.permissions().mode() & 0o100 != 0, Sha256::digest(&data).into()));
+    }
+    files.sort_by(|a, b| a.0.cmp(b.0));
+    Ok(hash_parts(&table, files))
 }
 
 /// `bytes` at `rel` under `tree` (temp file + rename, mode by `exec`),
@@ -913,6 +1020,56 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         }
         // Again: nothing to remove.
         assert_eq!(install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap().removed, Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn verify_rehashes_exactly_what_was_installed() {
+        let (base, root) = fixture("verify");
+        let data = base.join("data");
+        let v1 = collect(&root).unwrap();
+        let head = Some((3, v1.hash()));
+        let err = |head| format!("{:#}", verify(&data, "cfg", head).unwrap_err());
+        assert_eq!(err(head), "config root `cfg` has no signed version here yet", "not installed");
+        install(&data, "cfg", &v1.tar().unwrap(), &v1.hash()).unwrap();
+        verify(&data, "cfg", head).unwrap();
+        assert_eq!(err(None), "config root `cfg` has no signed version here yet", "no head");
+        assert_eq!(err(Some((4, [7; 32]))), "config root `cfg` v4 isn't here yet");
+        assert_eq!(copy_of(&data, &tree_path(&data, "cfg")), Some(("cfg".to_string(), true)));
+        assert_eq!(copy_of(&data, &tree_path(&data, "cfg").join("mcps")), Some(("cfg".to_string(), false)));
+        assert_eq!(copy_of(&data, &root), None);
+
+        let tree = tree_path(&data, "cfg");
+        let config = std::fs::read_to_string(tree.join("devsandboxes.toml")).unwrap();
+        // Not the config: a comment, a created bind source, local state.
+        write(&tree, "devsandboxes.toml", &format!("# a comment\n{config}"));
+        write(&tree, "missing.json", "{}");
+        write(&tree, "shared-volumes/x", "x");
+        write(&tree, "mcps/new.json", "{}");
+        write(&tree, ".leader", "me");
+        verify(&data, "cfg", head).unwrap();
+
+        let changed = "config root `cfg` isn't the signed config (v3): its copy was changed here";
+        write(&tree, "devsandboxes.toml", &format!("{config}\n[sandbox.more]\nimage = \"alpine\"\n"));
+        assert_eq!(err(head), changed, "a structural edit");
+        write(&tree, "devsandboxes.toml", &config);
+        verify(&data, "cfg", head).unwrap();
+        write(&tree, "mcps/common.json", "{\"evil\":1}");
+        assert_eq!(err(head), changed, "a listed file");
+        write(&tree, "mcps/common.json", "{}");
+        verify(&data, "cfg", head).unwrap();
+        std::fs::set_permissions(tree.join("dockerfiles/web/Dockerfile"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(err(head), changed, "an exec bit");
+        std::fs::set_permissions(tree.join("dockerfiles/web/Dockerfile"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_file(tree.join("mcps/far.json")).unwrap();
+        assert_eq!(err(head), changed, "a listed file removed");
+        std::os::unix::fs::symlink(root.join("mcps/far.json"), tree.join("mcps/far.json")).unwrap();
+        assert_eq!(err(head), changed, "a listed file turned into a link, even to the same bytes");
+        std::fs::remove_file(tree.join("mcps/far.json")).unwrap();
+        write(&tree, "mcps/far.json", "{\"far\":1}");
+        verify(&data, "cfg", head).unwrap();
+        write(&tree, "devsandboxes.yaml", "sandbox: {}\n");
+        assert_eq!(err(head), changed, "a second config file");
         let _ = std::fs::remove_dir_all(&base);
     }
 

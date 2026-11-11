@@ -79,9 +79,11 @@ is frozen: no new work on it.
   config root's hash as the root's next `config` version when it
   changed, and every other member pulls that version's files from the
   peer that gave it the log and installs its own copy under
-  `mesh/tree/<name>/`, kept while the authority is offline; nothing
-  runs from the copy yet (no admission against it, `roots.list`
-  doesn't list it). Transfer v1
+  `mesh/tree/<name>/`, kept while the authority is offline; that copy
+  is one of the member's roots, and a `run`/`rebuild`/`start` there
+  runs only while it is the signed head (not changed in place). Open:
+  whether `start` of a container whose config drifted, today a
+  warning, is refused on a copy. Transfer v1
   (step 12): a placed run's folders move from their own checkouts with
   a WIP snapshot, no remote needed, into per-repo caches on the worker
   (repeat sends carry only the delta) and on the hub, and `devsandbox

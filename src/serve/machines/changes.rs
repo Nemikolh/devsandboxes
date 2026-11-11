@@ -895,8 +895,16 @@ mod tests {
     /// A verb `method` with `params` on the daemon at `dir`: whether it
     /// was answered (signing runs before the verb, so it's done by then).
     fn verb_answered(dir: &Path, method: &str, params: Value) -> bool {
-        let r = connect(dir).call_streaming(method, params, Duration::from_secs(1), &mut |_| true).unwrap();
-        matches!(r, crate::serve::client::Streamed::Answer(_))
+        verb_answer(dir, method, params).is_some()
+    }
+
+    /// [`verb_answered`]'s answer: `None` unanswered, else its error's
+    /// `(code, message)` if any.
+    fn verb_answer(dir: &Path, method: &str, params: Value) -> Option<Option<(String, String)>> {
+        match connect(dir).call_streaming(method, params, Duration::from_secs(1), &mut |_| true).unwrap() {
+            crate::serve::client::Streamed::Answer(r) => Some(r.error.map(|e| (e.code, e.message))),
+            _ => None,
+        }
     }
 
     /// `lap` (L), the authority: a `start` typed there signs its root's
@@ -982,7 +990,10 @@ mod tests {
     /// and a referenced file): K (`box`) takes each with the `fleet.sync`
     /// push, pulls its bundle from L over the link and installs it at
     /// `mesh/tree/cfg/`, `installed.toml` saying so. L, whose name it is,
-    /// gets no copy.
+    /// gets no copy. The copy is one of K's roots (`roots.list`); a verb
+    /// that builds from it runs there while it is the head (here the test
+    /// runner then fails), and is refused once it was changed in place,
+    /// `stop` still running.
     #[test]
     fn a_member_installs_each_signed_version() {
         let pair = pair("changes-install", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
@@ -1021,6 +1032,25 @@ mod tests {
         wait_for("v2 installed on K", Duration::from_secs(20), at(h2));
         assert_eq!(std::fs::read_to_string(tree.join("mcps/x.json")).unwrap(), "{}");
         assert!(!mesh::tree_path(&l_data, "cfg").exists() && mesh::installed(&l_data).unwrap().is_empty(), "the authority's own: no copy");
+
+        let copy = tree.canonicalize().unwrap();
+        let rows = call(&pair.k_dir, "roots.list", json!({})).unwrap();
+        assert!(rows.as_array().unwrap().iter().any(|r| r["root"] == json!(copy)), "{rows}");
+        let on_copy = json!({"root": tree, "env": {}, "instance": "nope"});
+        // A file the bundle doesn't list isn't the config.
+        std::fs::write(tree.join("notes.md"), "notes").unwrap();
+        for method in ["start", "rebuild"] {
+            let (code, message) = verb_answer(&pair.k_dir, method, on_copy.clone()).unwrap().expect("the test runner fails");
+            assert!(code != "denied" && !message.contains("config root"), "{method}: admitted past the check: {code}: {message}");
+        }
+        std::fs::write(tree.join("mcps/x.json"), "{\"evil\":1}").unwrap();
+        let refused = verb_answer(&pair.k_dir, "start", on_copy.clone()).unwrap();
+        assert_eq!(refused, Some(("denied".into(), "config root `cfg` isn't the signed config (v2): its copy was changed here".into())));
+        let (code, _) = verb_answer(&pair.k_dir, "stop", on_copy.clone()).unwrap().expect("the test runner fails");
+        assert_ne!(code, "denied", "stop runs on a changed copy");
+        let inside = tree.join("mcps");
+        let (code, message) = verb_answer(&pair.k_dir, "start", json!({"root": inside, "env": {}, "instance": "nope"})).unwrap().unwrap();
+        assert!(code == "denied" && message.contains("inside the copy"), "{code}: {message}");
         pair.finish();
     }
 

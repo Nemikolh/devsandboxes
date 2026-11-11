@@ -225,20 +225,25 @@ pub struct Reach {
 }
 
 /// This host's own config roots: every distinct `config_dir` in `state`,
-/// plus `~/.devsandboxes` when `home` has one, canonicalized (a root that's
-/// gone stays as recorded). What `roots.list` answers, and the base of a
-/// [`Reach`]'s `own`.
-pub fn own_roots(state: &State, home: Option<&Path>) -> BTreeSet<PathBuf> {
+/// plus `~/.devsandboxes` when `home` has one, plus each signed config's
+/// copy installed under data dir `data` (`mesh::roots`), canonicalized (a
+/// root that's gone stays as recorded). What `roots.list` answers, and the
+/// base of a [`Reach`]'s `own`. A copy is reached like any own root; the
+/// daemon checks it is the signed head before a verb builds from it
+/// (`mesh::verify`).
+pub fn own_roots(state: &State, home: Option<&Path>, data: Option<&Path>) -> BTreeSet<PathBuf> {
     let recorded = state.instances.values().filter_map(|i| i.config_dir.clone());
     let home = home.map(|h| h.join(".devsandboxes")).filter(|d| d.is_dir());
-    recorded.chain(home).map(|r| std::fs::canonicalize(&r).unwrap_or(r)).collect()
+    let mesh = data.map(crate::serve::fleet::mesh::roots).unwrap_or_default();
+    recorded.chain(home).chain(mesh).map(|r| std::fs::canonicalize(&r).unwrap_or(r)).collect()
 }
 
 impl Reach {
     /// Over what's read (pure but for canonicalizing): `member`'s `trust`
-    /// (none: `worker`), [`own_roots`] of `state` plus `member`'s `roots`.
-    pub fn of(member: Option<&Member>, state: &State, home: Option<&Path>, fleet_root: Option<&Path>) -> Reach {
-        let mut own = own_roots(state, home);
+    /// (none: `worker`), [`own_roots`] of `state`, `home` and data dir
+    /// `data` plus `member`'s `roots`.
+    pub fn of(member: Option<&Member>, state: &State, home: Option<&Path>, data: Option<&Path>, fleet_root: Option<&Path>) -> Reach {
+        let mut own = own_roots(state, home, data);
         if let Some(m) = member {
             own.extend(m.roots.iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone())));
         }
@@ -246,7 +251,8 @@ impl Reach {
         Reach { trust, fleet_root: fleet_root.map(Path::to_path_buf), own }
     }
 
-    /// [`Reach::of`] this host's `files`. Fails closed: a `member.toml` that
+    /// [`Reach::of`] this host's `files` (the data dir: `member.toml`'s).
+    /// Fails closed: a `member.toml` that
     /// doesn't load is `worker` with no picked roots, a `state.toml` that
     /// doesn't load is no instances' roots; either comes back as the error
     /// to log.
@@ -264,7 +270,8 @@ impl Reach {
             warning = Some(format!("{e:#}; taken as no instances"));
             State::default()
         });
-        (Reach::of(member.as_ref(), &state, files.home.as_deref(), fleet_root), warning)
+        let data = files.member.as_deref().and_then(Path::parent);
+        (Reach::of(member.as_ref(), &state, files.home.as_deref(), data, fleet_root), warning)
     }
 
     /// Whether the peer reaches canonical path `real`: anything under
@@ -1233,7 +1240,7 @@ mod tests {
         // A peer without a fleet root: `in`'s root is reached as an own root
         // (it's in `state.toml`), and so is `all`.
         let ssh = Reach { fleet_root: None, ..r.clone() };
-        let own = own_roots(&State::load_at(&state).unwrap(), None);
+        let own = own_roots(&State::load_at(&state).unwrap(), None, None);
         let ssh = Reach { own: ssh.own.union(&own).cloned().collect(), ..ssh };
         assert!(admit("stop", json!({"root": root.join("cfg"), "all": true}), &s, &ssh, &state).is_ok());
         // Without a `Peer.env` its verbs keep the env they sent.
@@ -1500,6 +1507,33 @@ mod tests {
         // No data dir: `worker`.
         let (r, _) = Reach::load(&Files { member: None, ..files }, None);
         assert_eq!((r.trust, r.fleet_root), (Trust::Worker, None));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A signed config's installed copy (`mesh/tree/<name>/` under the data
+    /// dir, `member.toml`'s) is an own root: listed, reached exactly under
+    /// `worker`; what's nested in it and the rest of `mesh/` aren't.
+    #[test]
+    fn an_installed_mesh_copy_is_an_own_root() {
+        use crate::serve::fleet::mesh;
+        let base = scratch("mesh");
+        let (data, src) = (base.join("data"), base.join("src/cfg"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let b = mesh::collect(&src).unwrap();
+        let state = data.join("state.toml");
+        let files = Files { state: state.clone(), member: Some(data.join("member.toml")), home: None };
+        assert!(Reach::load(&files, None).0.own.is_empty(), "nothing installed");
+        mesh::install(&data, "cfg", &b.tar().unwrap(), &b.hash()).unwrap();
+        let copy = std::fs::canonicalize(mesh::tree_path(&data, "cfg")).unwrap();
+        std::fs::create_dir_all(copy.join("nested")).unwrap();
+        assert_eq!(own_roots(&State::default(), None, Some(&data)), BTreeSet::from([copy.clone()]));
+        let (r, _) = Reach::load(&files, None);
+        assert_eq!(r.trust, Trust::Worker);
+        assert!(r.admits(&copy));
+        assert!(!r.admits(&copy.join("nested")) && !r.admits(&data.join("mesh")));
+        let s = peer(&base.join("fleet/hub"));
+        assert!(admit("start", json!({"root": copy, "all": true}), &s, &r, &state).is_ok());
         let _ = std::fs::remove_dir_all(&base);
     }
 

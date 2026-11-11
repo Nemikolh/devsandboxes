@@ -4,7 +4,10 @@ Status: in progress. Step 1 shipped (1a-1d: signed from the
 authority's verbs, local or aimed at a machine, over the config's
 structure and referenced files, the bundle kept, names bound to one
 path); step 2 shipped (2a: receive and install; 2b: pulled and
-installed after a `fleet.sync` and at each link-up).
+installed after a `fleet.sync` and at each link-up); step 3 shipped
+(the copy an own root, listed by `roots.list`; `run`/`rebuild`/`start`
+on it checked against the signed head, `mesh::verify`; the `start`
+drift question below stays open); steps 4 and 5 need no code.
 
 ## Goal
 

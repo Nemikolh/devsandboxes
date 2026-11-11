@@ -1030,6 +1030,16 @@ can't move runs here, its output starting `note: not placed on <worker>:
 `null`), nothing runs. The request a worker gets carries no `place`, so
 it is never placed again.
 
+**A signed config's copy** (`root` under the data dir's `mesh/tree/`, a
+fleet member's copy of a config the authority signed;
+[fleet](../architecture/daemon/fleet.md#approvals-and-pushes), *Config
+versions*): a `run`, `rebuild`, `start` or `services.rebuild` there is `denied` unless the
+copy is the log's latest version for its name: ``config root `<name>`
+has no signed version here yet``, ``config root `<name>` v<N> isn't here
+yet`` (a newer version not pulled yet), ``config root `<name>` isn't the
+signed config (v<N>): its copy was changed here``, or a root inside a
+copy, not the copy. `stop` and `rm` aren't checked.
+
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no
 `progress` comes, and `ask` doesn't apply.
