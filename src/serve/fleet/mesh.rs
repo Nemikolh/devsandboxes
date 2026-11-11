@@ -41,6 +41,12 @@ pub struct Bundle {
     /// The parsed config file, what the hash covers of it.
     table: Table,
     pub files: BTreeMap<String, File>,
+    /// The build contexts and local features the config references under
+    /// the root (relative, as `files` keys them): what a build reads whole,
+    /// so [`verify`] admits nothing under them that `files` doesn't list.
+    /// Not hashed apart: it follows from the config's table alone, which
+    /// the hash covers, so both ends derive the same set.
+    pub dirs: std::collections::BTreeSet<String>,
 }
 
 /// `field` length-prefixed (u64 big-endian), so no two field lists encode
@@ -177,9 +183,10 @@ pub fn tree_path(data: &Path, name: &str) -> PathBuf {
 }
 
 /// What [`install`] wrote last per name: `<data>/devsandbox/mesh/installed.toml`,
-/// `[<name>] hash = "<hex>", config = "<file>", files = [...]`, so the next
-/// install removes only what this one listed and no longer does, and
-/// [`verify`] rehashes exactly what was installed.
+/// `[<name>] hash = "<hex>", config = "<file>", files = [...], dirs = [...]`,
+/// so the next install removes only what this one listed and no longer
+/// does, and [`verify`] rehashes exactly what was installed and admits
+/// nothing else under its dirs.
 fn installed_path(data: &Path) -> PathBuf {
     data.join("mesh").join("installed.toml")
 }
@@ -194,6 +201,10 @@ struct InstalledRoot {
     /// config's table; the config file itself only when it references
     /// itself).
     files: Vec<String>,
+    /// The bundle's [`Bundle::dirs`]. `None`: written before dirs were
+    /// recorded; [`installed`] leaves such an entry out, so the next
+    /// [`follow`] reinstalls it, and [`verify`] refuses it meanwhile.
+    dirs: Option<Vec<String>>,
 }
 
 impl InstalledRoot {
@@ -213,9 +224,10 @@ fn load_installed(path: &Path) -> Result<BTreeMap<String, InstalledRoot>> {
 }
 
 /// The hash (hex) [`install`] last installed per name under data dir
-/// `data`. An install cut short still names the previous one.
+/// `data`. An install cut short still names the previous one; an entry
+/// with no recorded dirs is none (to reinstall).
 pub fn installed(data: &Path) -> Result<BTreeMap<String, String>> {
-    Ok(load_installed(&installed_path(data))?.into_iter().map(|(name, r)| (name, r.hash)).collect())
+    Ok(load_installed(&installed_path(data))?.into_iter().filter(|(_, r)| r.dirs.is_some()).map(|(name, r)| (name, r.hash)).collect())
 }
 
 fn save_installed(path: &Path, roots: &BTreeMap<String, InstalledRoot>) -> Result<()> {
@@ -290,13 +302,21 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
     let previous = installed.get(name).cloned().unwrap_or_default();
     let mut listed: Vec<(&str, bool, &[u8])> = vec![(bundle.config_name.as_str(), false, &bundle.config)];
     listed.extend(bundle.files.iter().filter(|(p, _)| **p != bundle.config_name).map(|(p, f)| (p.as_str(), f.exec, f.data.as_slice())));
-    let entry = InstalledRoot { hash: hex::encode(got), config: bundle.config_name.clone(), files: bundle.files.keys().cloned().collect() };
+    let entry = InstalledRoot {
+        hash: hex::encode(got),
+        config: bundle.config_name.clone(),
+        files: bundle.files.keys().cloned().collect(),
+        dirs: Some(bundle.dirs.iter().cloned().collect()),
+    };
     let (before, files) = (previous.listed(), entry.listed());
     // First the union, so a write cut short still has every file listed
     // that the next install may have to remove.
     let mut union = before.clone();
     union.extend(files.iter().filter(|f| !before.contains(f)).cloned());
-    installed.insert(name.to_string(), InstalledRoot { hash: previous.hash.clone(), config: previous.config.clone(), files: union });
+    installed.insert(
+        name.to_string(),
+        InstalledRoot { hash: previous.hash.clone(), config: previous.config.clone(), files: union, dirs: previous.dirs.clone() },
+    );
     save_installed(&installed_path(data), &installed)?;
 
     let tree = tree_path(data, name);
@@ -352,19 +372,97 @@ pub fn copy_of(data: &Path, root: &Path) -> Option<(String, bool)> {
 /// bind source `run` creates under the copy, or a file a container writes
 /// there, isn't the config; an edit to the config's structure or to a
 /// listed file (or one removed, or turned into a link) is. Comments and
-/// formatting aren't, as for the signer.
+/// formatting aren't, as for the signer. Under the installed dirs (build
+/// contexts, local features: what a build reads whole) any entry the list
+/// doesn't name is refused too ([`unlisted`]): a file a container drops
+/// into a context would be built.
 pub fn verify(data: &Path, name: &str, head: Option<(u64, [u8; 32])>) -> Result<()> {
     let installed = load_installed(&installed_path(data))?;
     let (Some((version, head)), Some(copy)) = (head, installed.get(name)) else {
         bail!("config root `{name}` has no signed version here yet");
     };
-    if copy.hash != hex::encode(head) {
+    if copy.hash != hex::encode(head) || copy.dirs.is_none() {
         bail!("config root `{name}` v{version} isn't here yet");
     }
-    match rehash(&tree_path(data, name), copy) {
-        Ok(h) if h == head => Ok(()),
-        _ => bail!("config root `{name}` isn't the signed config (v{version}): its copy was changed here"),
+    let tree = tree_path(data, name);
+    let changed = || anyhow!("config root `{name}` isn't the signed config (v{version}): its copy was changed here");
+    match rehash(&tree, copy) {
+        Ok(h) if h == head => {}
+        _ => return Err(changed()),
     }
+    match unlisted(&tree, copy) {
+        Ok(None) => Ok(()),
+        Ok(Some(rel)) => bail!("config root `{name}` isn't the signed config (v{version}): `{rel}` was added to its copy here"),
+        Err(_) => Err(changed()),
+    }
+}
+
+/// The first entry under `copy`'s dirs in the copy at `tree` that `copy`
+/// doesn't list (a regular file, a symlink, anything but a real dir),
+/// walked as [`collect`]'s `add` walks them, but a `.git` in one is
+/// unlisted too (never bundled, yet a build reads it). A dir missing in the copy has nothing under it; a
+/// dir reached through anything but real dirs is an `Err`.
+fn unlisted(tree: &Path, copy: &InstalledRoot) -> Result<Option<String>> {
+    fn walk(tree: &Path, rel: &str, listed: &std::collections::BTreeSet<String>) -> Result<Option<String>> {
+        let path = tree.join(rel);
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        };
+        if !meta.is_dir() {
+            return Ok((!(meta.is_file() && listed.contains(rel))).then(|| rel.to_string()));
+        }
+        let mut names: Vec<String> = Vec::new();
+        for e in std::fs::read_dir(&path).with_context(|| format!("cannot list {}", path.display()))? {
+            let e = e.with_context(|| format!("cannot list {}", path.display()))?;
+            match e.file_name().into_string() {
+                Ok(n) => names.push(n),
+                Err(n) => return Ok(Some(format!("{rel}/{}", n.to_string_lossy()))),
+            }
+        }
+        names.sort();
+        for name in names {
+            let child = format!("{rel}/{name}");
+            // A `.git` is never bundled, yet a build's `COPY .` reads it:
+            // in a copy it can only have been put there.
+            if name == ".git" {
+                return Ok(Some(child));
+            }
+            if skipped(&child) {
+                continue;
+            }
+            if let Some(found) = walk(tree, &child, listed)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+    let listed: std::collections::BTreeSet<String> = copy.listed().into_iter().collect();
+    for rel in copy.dirs.iter().flatten() {
+        tar::check_path(rel)?;
+        let mut at = tree.to_path_buf();
+        let parts: Vec<&str> = rel.split('/').collect();
+        let mut missing = false;
+        for p in &parts[..parts.len() - 1] {
+            at.push(p);
+            match at.symlink_metadata() {
+                Ok(m) if m.is_dir() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing = true;
+                    break;
+                }
+                _ => bail!("{} isn't a directory", at.display()),
+            }
+        }
+        if missing {
+            continue;
+        }
+        if let Some(found) = walk(tree, rel, &listed)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether config root `root` may be built from here: [`check_root_in`]
@@ -633,10 +731,12 @@ pub fn collect(root: &Path) -> Result<Bundle> {
     let table = raw_table(&path, &text)?;
     let canon = root.canonicalize().with_context(|| format!("cannot resolve {}", root.display()))?;
 
-    let mut refs: Vec<PathBuf> = Vec::new();
-    let build_refs = |build: &Build, refs: &mut Vec<PathBuf>| {
-        refs.extend(build.dockerfile.as_deref().map(PathBuf::from));
-        refs.push(PathBuf::from(build.context.as_deref().unwrap_or(".")));
+    // Each reference, and whether a build reads it whole (a context, a
+    // local feature): those are [`Bundle::dirs`].
+    let mut refs: Vec<(PathBuf, bool)> = Vec::new();
+    let build_refs = |build: &Build, refs: &mut Vec<(PathBuf, bool)>| {
+        refs.extend(build.dockerfile.as_deref().map(|d| (PathBuf::from(d), false)));
+        refs.push((PathBuf::from(build.context.as_deref().unwrap_or(".")), true));
     };
     for name in config.sandboxes.keys() {
         let (merged, _) = config.resolved_table(name).with_context(|| format!("sandbox `{name}`"))?;
@@ -647,7 +747,7 @@ pub fn collect(root: &Path) -> Result<Bundle> {
         }
         if let Some(mounts) = field("mounts") {
             let mounts: Vec<Mount> = mounts.try_into().map_err(|e| anyhow!("sandbox `{name}`: mounts: {e}"))?;
-            refs.extend(mounts.iter().filter_map(|m| mount_ref(m, &canon)));
+            refs.extend(mounts.iter().filter_map(|m| mount_ref(m, &canon)).map(|r| (r, false)));
         }
         if let Some(features) = field("features") {
             let features: BTreeMap<String, FeatureOptions> =
@@ -657,7 +757,7 @@ pub fn collect(root: &Path) -> Result<Bundle> {
                     continue;
                 }
                 if let Ok(FeatureSource::Local(p)) = FeatureSource::parse(reference) {
-                    refs.push(p);
+                    refs.push((p, true));
                 }
             }
         }
@@ -670,12 +770,16 @@ pub fn collect(root: &Path) -> Result<Bundle> {
     }
 
     let mut files = BTreeMap::new();
+    let mut dirs = std::collections::BTreeSet::new();
     let mut size = text.len() as u64;
-    for r in refs {
+    for (r, whole) in refs {
         let Some(rel) = relative_under(&canon, &r) else { continue };
         add(&canon, &rel, &mut files, &mut size)?;
+        if whole {
+            dirs.insert(rel);
+        }
     }
-    Ok(Bundle { config_name, config: text, table, files })
+    Ok(Bundle { config_name, config: text, table, files, dirs })
 }
 
 /// The config file as a table, as written (not merged per sandbox: an
@@ -1100,6 +1204,60 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         verify(&data, "cfg", head).unwrap();
         write(&tree, "devsandboxes.yaml", "sandbox: {}\n");
         assert_eq!(err(head), changed, "a second config file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn verify_admits_nothing_unlisted_under_a_bundled_dir() {
+        let (base, root) = fixture("dirs");
+        let data = base.join("data");
+        let v1 = collect(&root).unwrap();
+        let dirs: Vec<&str> = v1.dirs.iter().map(String::as_str).collect();
+        assert_eq!(dirs, ["dockerfiles/web", "features/hello"], "contexts and local features under the root, not the root");
+        let head = Some((3, v1.hash()));
+        let err = |head| format!("{:#}", verify(&data, "cfg", head).unwrap_err());
+        install(&data, "cfg", &v1.tar().unwrap(), &v1.hash()).unwrap();
+        verify(&data, "cfg", head).unwrap();
+        let tree = tree_path(&data, "cfg");
+
+        // Outside any bundled dir: fine.
+        write(&tree, "notes.md", "a note");
+        write(&tree, "dockerfiles/other.txt", "x");
+        verify(&data, "cfg", head).unwrap();
+
+        let added = |rel: &str| format!("config root `cfg` isn't the signed config (v3): `{rel}` was added to its copy here");
+        // A `.git` in a context: never bundled, yet a build reads it.
+        write(&tree, "dockerfiles/web/.git/HEAD", "ref");
+        assert_eq!(err(head), added("dockerfiles/web/.git"), "a .git in a build context");
+        std::fs::remove_dir_all(tree.join("dockerfiles/web/.git")).unwrap();
+        write(&tree, "dockerfiles/web/evil.sh", "#!/bin/sh\n");
+        assert_eq!(err(head), added("dockerfiles/web/evil.sh"), "a file in a build context");
+        std::fs::remove_file(tree.join("dockerfiles/web/evil.sh")).unwrap();
+        write(&tree, "dockerfiles/web/files/deep/evil", "x");
+        assert_eq!(err(head), added("dockerfiles/web/files/deep/evil"), "nested");
+        std::fs::remove_dir_all(tree.join("dockerfiles/web/files/deep")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", tree.join("features/hello/passwd")).unwrap();
+        assert_eq!(err(head), added("features/hello/passwd"), "a symlink in a local feature");
+        std::fs::remove_file(tree.join("features/hello/passwd")).unwrap();
+        std::fs::create_dir(tree.join("dockerfiles/web/empty")).unwrap();
+        verify(&data, "cfg", head).unwrap();
+
+        // An update in place that drops a context's file stays verifiable.
+        std::fs::remove_file(root.join("dockerfiles/web/files/a.txt")).unwrap();
+        let v2 = collect(&root).unwrap();
+        assert_eq!(install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap().removed, ["dockerfiles/web/files/a.txt"]);
+        verify(&data, "cfg", Some((4, v2.hash()))).unwrap();
+
+        // An entry with no recorded dirs is reinstalled, refused meanwhile.
+        let path = installed_path(&data);
+        let mut roots = load_installed(&path).unwrap();
+        roots.get_mut("cfg").unwrap().dirs = None;
+        save_installed(&path, &roots).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("dirs"));
+        assert!(installed(&data).unwrap().is_empty(), "due again");
+        assert_eq!(err(Some((4, v2.hash()))), "config root `cfg` v4 isn't here yet");
+        install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap();
+        verify(&data, "cfg", Some((4, v2.hash()))).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 

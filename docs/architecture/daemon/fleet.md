@@ -2012,7 +2012,12 @@ it never signs on a remote request alone (decision 49;
   rename, parents real dirs), and the files the previous install listed
   and this one doesn't removed; `mesh/installed.toml` records per name
   the hash and file list installed (the union first, so a cut install
-  still lists what the next must remove). Nothing else in the copy is
+  still lists what the next must remove) and the bundle's dirs
+  (`Bundle::dirs`: the build contexts and local features it references
+  under the root, what a build reads whole; they follow from the config's
+  table, so the hash covers them without a field of its own). An entry
+  with no `dirs` isn't installed for `mesh::installed`, so the next
+  follow reinstalls it. Nothing else in the copy is
   touched (`ROOT_SKIPS`, `.git`, local files such as the dispatcher's
   `.leader`). A name `mesh::bind` bound on this host is refused: the
   authority's original is the root. Every host serves the bundles it
@@ -2088,7 +2093,14 @@ it never signs on a remote request alone (decision 49;
   bind source `run` creates under the copy (`ensure_bind_source`) or a
   file a container writes through a read-write `${configDir}` mount
   doesn't count, while an edit to the structure or to a listed file (or
-  its removal, or a link in its place) does. `stop` and `rm` aren't
+  its removal, or a link in its place) does. Then `mesh::unlisted` walks
+  each recorded dir in the copy (reached through real dirs; a missing one
+  holds nothing) and refuses any entry but a real dir that the list
+  doesn't name, a regular file, a symlink or anything else, a `.git`
+  included (`collect` never bundles one, yet a build reads it): ``config root `<name>`
+  isn't the signed config (v<N>): `<path>` was added to its copy here``,
+  since a file dropped into a context would be built. A copy whose entry
+  records no dirs is refused as not here yet. `stop` and `rm` aren't
   checked: they build nothing.
 - **Following a hub change** (decision 69). A host follows a hub change
   (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
