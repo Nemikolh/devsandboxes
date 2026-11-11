@@ -32,7 +32,6 @@ use serde_json::{Value, json};
 use super::api::SandboxEntry;
 use super::client::{self, Conn, Streamed};
 use super::endpoint;
-use super::machines::changes::ConfigSigned;
 use super::machines::cli::{choose, found_of, machine_info, resolve_params};
 use super::machines::{Where, parse_name};
 use super::proto::{Notification, Response, Version};
@@ -1000,29 +999,9 @@ impl Streaming {
                     }
                 }
             }
-            "config.signed" => {
-                if let Ok(signed) = serde_json::from_value::<ConfigSigned>(note.params.clone()) {
-                    for line in config_signed_lines(&signed) {
-                        print_output(false, &format!("{line}\n"));
-                    }
-                }
-            }
             _ => {}
         }
     }
-}
-
-/// What a `config.signed` note says, as lines (pure; the dashboard's
-/// status line joins them).
-pub(crate) fn config_signed_lines(s: &ConfigSigned) -> Vec<String> {
-    let (Some(version), Some(hash)) = (s.version, &s.hash) else {
-        return vec![format!("config not signed: {}", s.error.as_deref().unwrap_or("unknown"))];
-    };
-    let mut lines = vec![format!("signed config v{version} (sha256:{})", &hash[..hash.len().min(12)])];
-    for m in &s.unpushed {
-        lines.push(format!("not sent to {} ({}): it takes it on its next link", m.name, m.error));
-    }
-    lines
 }
 
 impl Streaming {
@@ -1188,25 +1167,6 @@ mod tests {
     use super::*;
     use crate::Cli;
     use crate::serve::proto::ErrorBody;
-
-    #[test]
-    fn a_config_signed_note_reads_as_lines() {
-        use crate::serve::machines::leave::Missed;
-        let signed = ConfigSigned {
-            root: "cfg".into(),
-            version: Some(7),
-            hash: Some("ab".repeat(32)),
-            pushed: vec!["box".into()],
-            unpushed: vec![Missed { name: "pi".into(), error: "down".into() }],
-            error: None,
-        };
-        assert_eq!(
-            config_signed_lines(&signed),
-            ["signed config v7 (sha256:abababababab)", "not sent to pi (down): it takes it on its next link"]
-        );
-        let failed = ConfigSigned { version: None, hash: None, unpushed: vec![], error: Some("too big".into()), ..signed };
-        assert_eq!(config_signed_lines(&failed), ["config not signed: too big"]);
-    }
 
     fn verb(args: &[&str]) -> Option<CliVerb> {
         let cli = Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()))

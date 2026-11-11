@@ -1058,7 +1058,6 @@ that connection only (no `subscribe`):
 |---|---|---|
 | `output` | `{"request": id, "stream": "stdout" \| "stderr", "data": "…"}` | the verb wrote; `data` is UTF-8 (lossy), chunked as read, in order per stream. `run` with `json` writes its document on `stdout` |
 | `progress` | `{"request": id, "instance": "<name>", "phase": "…"}` | an instance the verb is materializing changed phase (`state.toml`, read every 0.25 s): `preparing`, `building`, `creating`, a lifecycle step, or `failed` |
-| `config.signed` | `{"request": id, "root", "version", "hash", "pushed", "unpushed", "error"}` | before a local `run`/`rebuild`/`start` on the fleet's authority (no `machine`) whose config root changed since the root's latest `config` entry: the next version signed and pushed (`version`, `hash` 64 hex; `error` null), or not (`error`; `version`, `hash` null; the verb runs anyway). `root` the root's directory name. Not sent when nothing changed, off the authority or in no fleet ([fleet.md](../architecture/daemon/fleet.md#approvals-and-pushes)) |
 
 Result: `{"instance": name | null, "exit": 0}`. `instance` is the one the
 verb recorded its progress on, else (`run`) the one instance it added,

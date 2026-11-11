@@ -336,23 +336,17 @@ fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiErro
 }
 
 /// What a verb typed on the authority did to its config root's version
-/// ([`sign_config`]): the `config.signed` notification's params but
-/// `request`. Signed: `version` and `hash`; not: `error`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigSigned {
-    /// The root's name in the log (its directory's name).
-    pub root: String,
-    pub version: Option<u64>,
-    /// sha256 of the packed root, 64 hex.
-    pub hash: Option<String>,
-    pub pushed: Vec<String>,
-    pub unpushed: Vec<Missed>,
-    pub error: Option<String>,
+/// ([`sign_config`]), for `serve.log`. `root` is the root's name in the
+/// log (its directory's name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSigned {
+    Signed { root: String, version: u64 },
+    Failed { root: String, error: String },
 }
 
 impl ConfigSigned {
     fn failed(root: &str, error: String) -> ConfigSigned {
-        ConfigSigned { root: root.into(), version: None, hash: None, pushed: Vec::new(), unpushed: Vec::new(), error: Some(error) }
+        ConfigSigned::Failed { root: root.into(), error }
     }
 }
 
@@ -386,14 +380,7 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     }
     let version = current.map_or(1, |(v, _)| v + 1);
     match sign_and_push(ctx, &me, stored, Op::Config { root: name.into(), version, hash }) {
-        Ok((_, pushed, unpushed)) => Some(ConfigSigned {
-            root: name.into(),
-            version: Some(version),
-            hash: Some(hex::encode(hash)),
-            pushed,
-            unpushed,
-            error: None,
-        }),
+        Ok(_) => Some(ConfigSigned::Signed { root: name.into(), version }),
         Err(e) => Some(ConfigSigned::failed(name, e.message)),
     }
 }
@@ -869,25 +856,19 @@ mod tests {
         pair.finish();
     }
 
-    /// A verb `method` with `params` on the daemon at `dir`: the
-    /// `config.signed` notes it sent, and whether it was answered.
-    fn verb_notes(dir: &Path, method: &str, params: Value) -> (Vec<Value>, bool) {
-        let mut notes = Vec::new();
-        let r = connect(dir)
-            .call_streaming(method, params, Duration::from_secs(1), &mut |n| {
-                if let Some(n) = n.filter(|n| n.method == "config.signed") {
-                    notes.push(n.params.clone());
-                }
-                true
-            })
-            .unwrap();
-        (notes, matches!(r, crate::serve::client::Streamed::Answer(_)))
+    /// A verb `method` with `params` on the daemon at `dir`: whether it
+    /// was answered (signing runs before the verb, so it's done by then).
+    fn verb_answered(dir: &Path, method: &str, params: Value) -> bool {
+        let r = connect(dir).call_streaming(method, params, Duration::from_secs(1), &mut |_| true).unwrap();
+        matches!(r, crate::serve::client::Streamed::Answer(_))
     }
 
     /// `lap` (L), the authority: a `start` typed there signs its root's
     /// `config` v1 first and pushes it to K (`box`); the same contents sign
-    /// nothing; an edit is v2, signed by a `rebuild` as by `start`. A root that won't pack is said, the verb answered anyway. K's
-    /// verbs (not the authority) and `stop` sign nothing.
+    /// nothing; an edit is v2, signed by a `rebuild` as by `start`. A root
+    /// that won't pack signs nothing, the verb answered anyway. K's verbs
+    /// (not the authority), `stop`, a relative root and a root with no
+    /// config file sign nothing.
     #[test]
     fn the_authoritys_verbs_sign_config_versions() {
         let pair = pair("changes-config", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
@@ -899,30 +880,38 @@ mod tests {
         let params = json!({"root": root, "env": {}, "instance": "nope"});
         let config = |toml: &Path| test_support::read(toml).unwrap().log.membership().unwrap().config.get("cfg").map(|(v, h)| (*v, hex::encode(h)));
 
-        let (notes, answered) = verb_notes(&pair.l_dir, "start", params.clone());
-        assert!(answered);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        crate::serve::dts::assert_matches("ConfigSigned", &notes[0]);
-        let n = &notes[0];
-        assert_eq!((&n["root"], &n["version"], &n["pushed"], &n["unpushed"], &n["error"]), (&json!("cfg"), &json!(1), &json!(["box"]), &json!([]), &Value::Null));
-        assert!(n["request"].is_u64(), "{n}");
-        let v1 = Some((1, n["hash"].as_str().unwrap().to_string()));
-        assert_eq!((config(&l_toml), config(&k_toml)), (v1.clone(), v1.clone()), "signed and pushed");
+        let head = |toml: &Path| test_support::read(toml).unwrap().log.head();
 
-        assert!(verb_notes(&pair.l_dir, "start", params.clone()).0.is_empty(), "unchanged: nothing signed");
-        assert!(verb_notes(&pair.l_dir, "stop", params.clone()).0.is_empty(), "stop never signs");
+        assert!(verb_answered(&pair.l_dir, "start", params.clone()));
+        let v1 = config(&l_toml);
+        assert_eq!(v1.as_ref().map(|(v, h)| (*v, h.len())), Some((1, 64)), "{v1:?}");
+        assert_eq!(config(&k_toml), v1, "signed and pushed");
+        let signed = head(&l_toml);
+        assert_eq!(head(&k_toml), signed);
+
+        assert!(verb_answered(&pair.l_dir, "start", params.clone()));
+        assert_eq!(head(&l_toml), signed, "unchanged: nothing signed");
+        assert!(verb_answered(&pair.l_dir, "stop", params.clone()));
+        assert_eq!(head(&l_toml), signed, "stop never signs");
+        assert!(verb_answered(&pair.l_dir, "start", json!({"root": "cfg", "env": {}, "instance": "nope"})));
+        assert_eq!(head(&l_toml), signed, "a relative root never signs");
+        let bare = pair.base.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(verb_answered(&pair.l_dir, "start", json!({"root": bare, "env": {}, "instance": "nope"})));
+        assert_eq!(head(&l_toml), signed, "no config file: nothing signed");
         std::fs::write(root.join("devsandboxes.toml"), "[sandbox.b]\n").unwrap();
-        assert!(verb_notes(&pair.k_dir, "start", params.clone()).0.is_empty(), "K isn't the authority");
-        let (notes, _) = verb_notes(&pair.l_dir, "rebuild", json!({"root": root, "env": {}, "instance": "nope"}));
-        assert_eq!((notes.len(), &notes[0]["version"]), (1, &json!(2)));
-        assert_eq!(config(&k_toml).unwrap().0, 2);
+        assert!(verb_answered(&pair.k_dir, "start", params.clone()));
+        assert_eq!((head(&k_toml), config(&k_toml)), (signed, v1.clone()), "K isn't the authority");
+        assert!(verb_answered(&pair.l_dir, "rebuild", json!({"root": root, "env": {}, "instance": "nope"})));
+        let v2 = config(&l_toml).unwrap();
+        assert_eq!(v2.0, 2);
+        assert_ne!(Some(&v2), v1.as_ref());
+        assert_eq!(config(&k_toml), Some(v2.clone()));
 
         std::os::unix::fs::symlink("../elsewhere", root.join("out")).unwrap();
-        let (notes, answered) = verb_notes(&pair.l_dir, "start", params);
-        assert!(answered, "the verb runs anyway");
-        assert_eq!((notes.len(), &notes[0]["version"]), (1, &Value::Null));
-        assert!(notes[0]["error"].as_str().is_some_and(|e| !e.is_empty()), "{notes:?}");
-        assert_eq!(config(&l_toml).unwrap().0, 2, "nothing signed");
+        let signed = head(&l_toml);
+        assert!(verb_answered(&pair.l_dir, "start", params), "the verb runs anyway");
+        assert_eq!((head(&l_toml), config(&l_toml)), (signed, Some(v2)), "won't pack: nothing signed");
         pair.finish();
     }
 

@@ -1942,11 +1942,10 @@ it never signs on a remote request alone (decision 49;
   `machine`) first packs its config root, and when the hash isn't the
   root's latest `config` entry's, signs the next version (1 for the
   first) and pushes it like any change (`daemon::sign_config` over
-  `changes::sign_config`). The client gets a `config.signed`
-  notification (the CLI prints `signed config v7 (sha256:…)`, the
-  dashboard leads the verb's status line with it), `serve.log` a line.
-  A root that won't pack or a store that fails is said the same way
-  (`error`) and the verb runs anyway. Nothing is packed off the
+  `changes::sign_config`), logged in `serve.log` (the root's name
+  and version); the client isn't told. A root that won't pack or a
+  store that fails is logged too (`not signed: <why>`) and the verb runs
+  anyway. Nothing is packed off the
   authority or in no fleet; a verb from a link peer, one sent to a
   machine, `--in-process` ones (the dispatcher's, the in-process
   fallback) and the autostart pass never sign. Never proposed.

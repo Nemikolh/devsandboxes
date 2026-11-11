@@ -10,7 +10,7 @@
 
 ### Added
 
-- **Signed config versions.** On the fleet's authority, a `run`, `rebuild` or `start` you type (CLI or dashboard) first checks whether its config root changed since its last signed version. If it did, it signs the next version into the membership log, sends it to the machines it links to (those it misses take it on their next link), and says `signed config v7 (sha256:…)`. Versions only go up, an unchanged root signs nothing, and if signing fails the verb runs anyway with a warning. Nothing acts on the version yet.
+- **Signed config versions.** On the fleet's authority, a `run`, `rebuild` or `start` you type (CLI or dashboard) first checks whether its config root changed since its last signed version. If it did, it signs the next version into the membership log, sends it to the machines it links to (those it misses take it on their next link), and logs it in `serve.log`. Versions only go up, an unchanged root signs nothing, and if signing fails the verb runs anyway (the log says why). Nothing acts on the version yet.
 
 - **A warning when a nested docker can't work from a shell.** On rootless docker with runc older than 1.4.1, processes started with `exec` (shells, VS Code, agents, lifecycle hooks) end up outside the container's cgroup, so a docker-in-docker `dockerd` restarted from one of them fails every `docker run` with `cgroup.procs: no such file or directory`. `run`, `start` and `inspect` now detect this and say so. The fix is upgrading the host's runc; until then, restart the container so its entrypoint starts `dockerd`.
 
