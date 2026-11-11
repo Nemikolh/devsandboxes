@@ -578,10 +578,14 @@ fn why_without<'a>(machine: &str, error: &'a str) -> &'a str {
 }
 
 fn snapshot_machine(m: &Machine) -> SnapshotMachine {
-    let runtime = m
-        .roots
-        .iter()
-        .find_map(|r| m.rows.get(r)?.get("runtime_name")?.as_str().map(str::to_string));
+    // A host with no runtime names none.
+    let runtime = m.roots.iter().find_map(|r| {
+        let row = m.rows.get(r)?;
+        if row.get("no_runtime").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        row.get("runtime_name")?.as_str().map(str::to_string)
+    });
     SnapshotMachine {
         capacity: m.capacity(),
         name: m.name.clone(),
@@ -1007,6 +1011,7 @@ pub(crate) mod tests {
             runtime_version: None,
             errors: Vec::new(),
             at: Instant::now(),
+            no_runtime: false,
         }
     }
 

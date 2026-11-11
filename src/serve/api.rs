@@ -1875,6 +1875,7 @@ mod tests {
             collected_at: std::time::Instant::now(),
             stats: false,
             error: None,
+            no_runtime: false,
         }
     }
 

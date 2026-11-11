@@ -377,6 +377,12 @@ thread's `child` key names, as the control ops resolve it (a key ambiguous
 across sandboxes is left out). `{}` when there are none or the state
 doesn't read (the snapshot's `error` says why). Not in `status --json`.
 
+On a host with no container runtime installed (its binary isn't on
+`PATH`: a driver) any `depth` is `disk` and nothing is asked of a runtime;
+the snapshot's `no_runtime` is `true` and its `error` says nothing about
+the runtime ([host-poll.md](../architecture/daemon/host-poll.md#a-host-with-no-runtime)).
+`no_runtime` is `false` everywhere else.
+
 Errors: `invalid` (missing or relative `dir`, unknown `depth`), `not-found`
 (no such directory).
 
@@ -425,7 +431,7 @@ push (`null` before one carried it):
 #### Capacity
 
 ```json
-{"cpus": 8, "mem_total": 34359738368, "mem_available": 21474836480,
+{"runtime": true, "cpus": 8, "mem_total": 34359738368, "mem_available": 21474836480,
  "disk_free": 128849018880, "disk_total": 536870912000, "running": 3,
  "caps": {"cpus": null, "mem": 17179869184, "disk": null, "instances": 4}}
 ```
@@ -437,7 +443,10 @@ runtime's (`docker info` `NCPU` / `MemTotal`, podman's `host.cpus` /
 `disk_total` (the filesystem of the runtime's data root) only for a
 native Linux engine, else `null`. `running`: instances whose container
 runs. `caps`: `member.toml`'s `[caps]` soft caps (`null` when none is set): never enforced, over one is
-a note ([fleet.md](../architecture/daemon/fleet.md#capacity)).
+a note ([fleet.md](../architecture/daemon/fleet.md#capacity)). `runtime`:
+a container runtime is installed; `false` (a driver: every other field
+unknown, `running` 0, the caps kept) is never placed on. Absent reads as
+`true`.
 
 Errors: `invalid` (missing or relative `dir`; watch without the
 `instances` subscription), `not-found` (watch of a missing directory;
@@ -1257,7 +1266,9 @@ On every daemon: this host's candidate config roots, what `machines.probe`
 asks a machine. Params: `{}`, or `{"paths": ["~/sandboxes", "/srv/x"]}`.
 Result: `[{"root": "/abs", "sandboxes": [{"name": "web"}, …], "error":
 null}]`. Without `paths`: every distinct `config_dir` in `state.toml` plus
-`~/.devsandboxes` if it exists, canonicalized (a root that's gone stays as
+`~/.devsandboxes` if it exists, plus each signed config's installed copy
+unless this host has no container runtime (a driver lists none: it
+couldn't run them), canonicalized (a root that's gone stays as
 recorded), sorted; no disk scan. With `paths`: exactly those, in order,
 `~` / `~/…` expanded with this host's home, then canonicalized. A root that
 doesn't exist, isn't absolute or whose config doesn't load has `error` set
@@ -1408,7 +1419,7 @@ Errors: `internal` (`membership.json` doesn't verify).
 ### `capacity.get`
 
 This host's capacity report now, as its snapshots carry it (`Capacity`:
-`cpus`, `mem_total`, `mem_available`, `disk_free`, `disk_total`,
+`runtime`, `cpus`, `mem_total`, `mem_available`, `disk_free`, `disk_total`,
 `running`, `caps`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
 built on demand: no watched root needed. Params `{}`. On every link
 peer's connection: a host asks each machine before it places a `run --place`.
@@ -1580,7 +1591,7 @@ remote `thread_children` aren't merged. Plus, top-level:
 
 | field | |
 |---|---|
-| `machines` | every machine (registered, and the inbound neighbors up now), by name, then those seen through this host's hub: `{"name", "kind", "target", "command", "state", "error", "version", "runtime", "agent", "capacity", "via", "exposed_by"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` this host's grant (as `machines.list`'s), `capacity` its [capacity](#capacity) from its last push (`null` before one carried it), `via` `null`, `exposed_by` as `machines.list`'s (this host's graph, on a lifted entry too) |
+| `machines` | every machine (registered, and the inbound neighbors up now), by name, then those seen through this host's hub: `{"name", "kind", "target", "command", "state", "error", "version", "runtime", "agent", "capacity", "via", "exposed_by"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came (`null` for one with `no_runtime`), `agent` this host's grant (as `machines.list`'s), `capacity` its [capacity](#capacity) from its last push (`null` before one carried it), `via` `null`, `exposed_by` as `machines.list`'s (this host's graph, on a lifted entry too) |
 
 On a fleet member, the machines its hub sees (the hub's federated push to
 this host's watch of it, this host left out) follow, each one `via` the

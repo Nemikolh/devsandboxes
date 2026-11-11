@@ -88,6 +88,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
         collected_at: std::time::Instant::now(),
         stats: true,
         error: None,
+        no_runtime: false,
     }
 }
 
@@ -190,6 +191,7 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         collected_at: std::time::Instant::now(),
         stats: true,
         error: None,
+        no_runtime: false,
     }
 }
 
@@ -300,6 +302,7 @@ pub(super) fn service_snapshot(containers: Vec<(String, ContainerStatus)>) -> Sn
         collected_at: std::time::Instant::now(),
         stats: true,
         error: None,
+        no_runtime: false,
     }
 }
 

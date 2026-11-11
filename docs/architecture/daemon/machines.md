@@ -563,7 +563,13 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
 - **Verbs** (`run`, `rebuild`, `start`, `stop`, `rm`) keep their name;
   `verbs_client` resolves it across machines (`instances.resolve` /
   `sandboxes.list` with `machines: true`), picking on a TTY when ambiguous,
-  and sends the request with the match's `machine` and root.
+  and sends the request with the match's `machine` and root. On a host
+  with no container runtime (`Ui::runs_here`, `runtime::installed`),
+  `run`'s choice (`verbs_client::choose_sandbox`) leaves this host's rows
+  out whenever a machine's remain, so a bare `run x` defined here and on
+  one machine goes there without a pick; this host's rows alone are kept,
+  and `commands::run::run` refuses them before any work (`this host has
+  no container runtime …`).
 - **Other named commands** (`exec`, `logs`, `inspect`, `done`, `undone`,
   `rename`, …) are resolved through the daemon; one on a machine is API
   calls through this host's daemon with `machine` set, or `PTY` dials from

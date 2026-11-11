@@ -7,7 +7,8 @@
 //! Soft caps never refuse: a machine over one scores below every machine
 //! that isn't, and when all are over the best is still used with an
 //! `over cap: …` warning. New work never goes to a machine that is
-//! unreachable; a pin is refused only then (or when the machine is
+//! unreachable or has no container runtime (a driver, its capacity's
+//! `runtime: false`); a pin is refused only then (or when the machine is
 //! unknown).
 
 use std::cmp::Ordering;
@@ -161,6 +162,8 @@ pub enum NoPlace {
     UnknownPin(MachineRef),
     /// The pinned machine can't be reached.
     PinUnreachable(MachineRef),
+    /// The pinned machine has no container runtime.
+    PinNoRuntime(MachineRef),
     /// No candidate takes new work: each with why.
     NoCandidate(Vec<(MachineRef, &'static str)>),
 }
@@ -170,6 +173,7 @@ impl fmt::Display for NoPlace {
         match self {
             NoPlace::UnknownPin(m) => write!(f, "no machine `{m}`"),
             NoPlace::PinUnreachable(m) => write!(f, "{m} is unreachable"),
+            NoPlace::PinNoRuntime(m) => write!(f, "{m} has no container runtime"),
             NoPlace::NoCandidate(skipped) if skipped.is_empty() => f.write_str("no machine to place on"),
             NoPlace::NoCandidate(skipped) => {
                 let why: Vec<String> = skipped.iter().map(|(m, why)| format!("{m}: {why}")).collect();
@@ -198,13 +202,17 @@ pub const REPO: i64 = 150;
 pub const REQUESTER: i64 = 50;
 
 /// Pick the machine for `spec` among `candidates`. A pin wins (refused only
-/// unknown or unreachable; warned over cap); otherwise the highest
-/// [`score`] among reachable candidates, ties to the lowest [`MachineRef`].
+/// unknown, unreachable or without a runtime; warned over cap); otherwise
+/// the highest [`score`] among reachable candidates with a runtime, ties to
+/// the lowest [`MachineRef`].
 pub fn place(spec: &Spec, candidates: &[Candidate]) -> Result<Placement, NoPlace> {
     if let Some(pin) = &spec.pinned {
         let c = candidates.iter().find(|c| &c.machine == pin).ok_or_else(|| NoPlace::UnknownPin(pin.clone()))?;
         if !c.reachable {
             return Err(NoPlace::PinUnreachable(pin.clone()));
+        }
+        if !has_runtime(c) {
+            return Err(NoPlace::PinNoRuntime(pin.clone()));
         }
         return Ok(scored(spec, c));
     }
@@ -213,6 +221,10 @@ pub fn place(spec: &Spec, candidates: &[Candidate]) -> Result<Placement, NoPlace
     for c in candidates {
         if !c.reachable {
             skipped.push((c.machine.clone(), "unreachable"));
+            continue;
+        }
+        if !has_runtime(c) {
+            skipped.push((c.machine.clone(), "no container runtime"));
             continue;
         }
         let p = scored(spec, c);
@@ -226,6 +238,12 @@ pub fn place(spec: &Spec, candidates: &[Candidate]) -> Result<Placement, NoPlace
         }
     }
     best.ok_or(NoPlace::NoCandidate(skipped))
+}
+
+/// Whether `c` can run containers: its report says so, or there's none
+/// yet (unknown is assumed to).
+fn has_runtime(c: &Candidate) -> bool {
+    c.capacity.as_ref().is_none_or(|cap| cap.runtime)
 }
 
 fn scored(spec: &Spec, c: &Candidate) -> Placement {
@@ -343,6 +361,7 @@ mod tests {
     /// 8 cpus, 32G with `avail` free, 500G disk with `free_disk` free.
     fn cap(avail: u64, free_disk: u64, running: usize) -> Capacity {
         Capacity {
+            runtime: true,
             cpus: Some(8),
             mem_total: Some(32 * G),
             mem_available: Some(avail * G),
@@ -484,6 +503,30 @@ mod tests {
                 want: Err(NoPlace::PinUnreachable(m("big"))),
                 warnings: &[],
             },
+            Case {
+                name: "a host without a runtime takes no new work, even as the requester with all the room",
+                spec: Spec { requester: m("laptop"), ..spec() },
+                candidates: vec![
+                    Candidate { has_image: true, ..cand(m("laptop"), Some(Capacity { runtime: false, ..cap(30, 490, 0) })) },
+                    cand(m("juchu"), Some(cap(4, 40, 6))),
+                ],
+                want: Ok(m("juchu")),
+                warnings: &[],
+            },
+            Case {
+                name: "only drivers: nothing takes new work",
+                spec: spec(),
+                candidates: vec![cand(MachineRef::Local, Some(Capacity { runtime: false, ..Capacity::default() })), Candidate { reachable: false, ..roomy() }],
+                want: Err(NoPlace::NoCandidate(vec![(MachineRef::Local, "no container runtime"), (m("big"), "unreachable")])),
+                warnings: &[],
+            },
+            Case {
+                name: "a pin on a host without a runtime is refused",
+                spec: pinned(m("laptop")),
+                candidates: vec![local(), cand(m("laptop"), Some(Capacity { runtime: false, ..Capacity::default() }))],
+                want: Err(NoPlace::PinNoRuntime(m("laptop"))),
+                warnings: &[],
+            },
             Case { name: "a pin on an unknown machine is refused", spec: pinned(m("nope")), candidates: vec![local()], want: Err(NoPlace::UnknownPin(m("nope"))), warnings: &[] },
         ];
         for case in cases {
@@ -603,6 +646,7 @@ mod tests {
     fn no_place_says_why() {
         assert_eq!(NoPlace::UnknownPin(m("x")).to_string(), "no machine `x`");
         assert_eq!(NoPlace::PinUnreachable(m("x")).to_string(), "x is unreachable");
+        assert_eq!(NoPlace::PinNoRuntime(m("x")).to_string(), "x has no container runtime");
         assert_eq!(NoPlace::NoCandidate(vec![]).to_string(), "no machine to place on");
         assert_eq!(
             NoPlace::NoCandidate(vec![(m("a"), "unreachable"), (MachineRef::Local, "unreachable")]).to_string(),

@@ -226,7 +226,8 @@ pub fn humanize_secs(secs: u64) -> String {
 pub const STALE_AFTER_SECS: u64 = 10;
 
 /// Right-aligned totals summary for the header, e.g.
-/// `3 sandboxes · 1 running / 2 stopped · 2 service containers · docker 24.0.7`.
+/// `3 sandboxes · 1 running / 2 stopped · 2 service containers · docker 24.0.7`
+/// (`· no runtime` on a host without one, `Snapshot::no_runtime`).
 /// A trailing ` (stale Ns)` is appended when `collected_at` is older than
 /// [`STALE_AFTER_SECS`], or ` (stale Ns: why)` as soon as the last refresh
 /// failed (`error`, e.g. the daemon is down). Pure over the snapshot so it is
@@ -250,14 +251,16 @@ pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration, error: Option<
         .flat_map(|s| &s.containers)
         .filter(|(_, st)| !matches!(st, ContainerStatus::Missing | ContainerStatus::Unknown))
         .count();
-    let version = snapshot.runtime_version.as_deref().unwrap_or("?");
+    let runtime = match snapshot.no_runtime {
+        true => "no runtime".to_string(),
+        false => format!("{} {}", snapshot.runtime_name, snapshot.runtime_version.as_deref().unwrap_or("?")),
+    };
 
     let mut line = format!(
-        "{} {} · {running} running / {stopped} stopped · {service_containers} service {} · {} {version}",
+        "{} {} · {running} running / {stopped} stopped · {service_containers} service {} · {runtime}",
         snapshot.sandbox_count,
         plural(snapshot.sandbox_count, "sandbox", "sandboxes"),
         plural(service_containers, "container", "containers"),
-        snapshot.runtime_name,
     );
     match error {
         Some(e) => line.push_str(&format!(" (stale {}s: {})", age.as_secs(), e.short())),
@@ -366,6 +369,7 @@ mod tests {
             collected_at: Instant::now(),
             stats: true,
             error: None,
+            no_runtime: false,
         }
     }
 
@@ -411,6 +415,15 @@ mod tests {
         assert_eq!(
             totals_line(&s, std::time::Duration::from_secs(0), None),
             "1 sandbox · 1 running / 0 stopped · 0 service containers · docker ?",
+        );
+    }
+
+    #[test]
+    fn totals_line_names_no_runtime_on_a_driver() {
+        let s = Snapshot { no_runtime: true, ..snap(Vec::new(), Vec::new(), 1, None) };
+        assert_eq!(
+            totals_line(&s, std::time::Duration::from_secs(0), None),
+            "1 sandbox · 0 running / 0 stopped · 0 service containers · no runtime",
         );
     }
 

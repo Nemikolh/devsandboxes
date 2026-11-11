@@ -3203,6 +3203,7 @@ mod tests {
             collected_at: std::time::Instant::now(),
             stats: true,
             error: None,
+            no_runtime: false,
         });
         app
     }
@@ -3386,6 +3387,7 @@ mod tests {
         down.exposed_by = Some(vec!["hub".into(), "box".into(), "down".into()]);
         let g = 1u64 << 30;
         up.capacity = Some(crate::serve::capacity::Capacity {
+            runtime: true,
             cpus: Some(8),
             mem_total: Some(32 * g),
             mem_available: Some(14 * g),

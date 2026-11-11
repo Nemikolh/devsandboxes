@@ -129,6 +129,8 @@ export interface Snapshot {
   runtime_version: string | null;
   /** Collection problem (e.g. runtime down); rows still come from local state. */
   error: string | null;
+  /** No container runtime is installed on this host (a driver): nothing was asked of one, `error` says nothing about it. */
+  no_runtime: boolean;
 }
 
 /** How much of the runtime `instances.list` asks: `full` (the default) adds cpu/mem. */
@@ -182,7 +184,7 @@ export interface SnapshotMachine {
   error: string | null;
   /** Its devsandbox semver, once reached. */
   version: string | null;
-  /** Its runtime (`runtime_name`), once a snapshot came. */
+  /** Its runtime (`runtime_name`), once a snapshot came; `null` for a host with none installed (`no_runtime`). */
   runtime: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH` (for an ssh argv). */
   command: string | null;
@@ -271,6 +273,8 @@ export interface PlacementsFetched {
  * @experimental
  */
 export interface Capacity {
+  /** A container runtime is installed there; `false`: a driver, never placed on. */
+  runtime: boolean;
   /** The engine host's cpus (a VM's, for a VM-backed engine). */
   cpus: number | null;
   mem_total: number | null;

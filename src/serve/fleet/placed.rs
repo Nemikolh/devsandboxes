@@ -475,6 +475,7 @@ mod tests {
 
     fn cap(avail: u64, running: usize, caps: Option<Caps>) -> Capacity {
         Capacity {
+            runtime: true,
             cpus: Some(8),
             mem_total: Some(32 * G),
             mem_available: Some(avail * G),

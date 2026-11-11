@@ -157,6 +157,12 @@ pub struct Options {
     /// read it; `None` is `capacity::HostCapacity` (the runtime's cached
     /// `info`, `HostFacts`, the poll's running count). Tests inject one.
     pub local_capacity: Option<LocalCapacity>,
+    /// Whether this host has a container runtime; `None` is
+    /// `runtime::installed::installed` (the backend's binary on `PATH`).
+    /// Without one the poll asks no runtime, the capacity says
+    /// `runtime: false` and `roots.list` lists no signed copies. Tests
+    /// inject one.
+    pub runtime_installed: Option<super::capacity::InstalledFn>,
     /// The agent a machine's `AGENT` streams reach while this host grants
     /// it agent ([`agent_for`]); `None` is `bridge::host_agent`. Tests inject one.
     pub host_agent: Option<HostAgent>,
@@ -178,6 +184,11 @@ pub type HostAgent = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
 /// [`Options::local_capacity`].
 pub type LocalCapacity = Arc<dyn Fn() -> super::capacity::Capacity + Send + Sync>;
+
+/// The runtime's `info`, as the capacity report asks it.
+fn engine_info() -> super::capacity::EngineInfoFn {
+    Arc::new(|| crate::runtime::backend().engine_info())
+}
 
 impl Options {
     pub fn new(keep_alive: bool) -> Self {
@@ -201,6 +212,7 @@ impl Options {
             update_steps: None,
             peer_env: None,
             local_capacity: None,
+            runtime_installed: None,
             host_agent: None,
             agent_probe: fleet::agent::PROBE,
             pty_exec: None,
@@ -297,6 +309,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     shared.home = opts.home.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     shared.socket_dir = dir.to_path_buf();
     shared.local_capacity = opts.local_capacity.clone();
+    if let Some(installed) = &opts.runtime_installed {
+        shared.installed = Arc::clone(installed);
+        shared.host_capacity = Arc::new(super::capacity::HostCapacity::new(engine_info(), Arc::clone(installed)));
+    }
     shared.peer_env = opts.peer_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
     match member {
         Ok(path) => shared.member = Some(path),
@@ -505,6 +521,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 on_snapshot: Box::new(move |dir, params| publishing.publish_snapshot(dir, params)),
                 own: Box::new(move || owning.own()),
                 capacity: Arc::clone(&shared.host_capacity),
+                installed: Arc::clone(&shared.installed),
             }
         };
         let attaches = shared.attaches.clone();
@@ -827,6 +844,8 @@ struct Shared {
     /// This host's capacity on demand; the host poll keeps its running
     /// count.
     host_capacity: Arc<super::capacity::HostCapacity>,
+    /// [`Options::runtime_installed`], resolved.
+    installed: super::capacity::InstalledFn,
     /// The env a fleet peer's verbs run with ([`Options::peer_env`], else
     /// this process's): `lent::Peer::env` of a machine's link streams and
     /// of a `link.attach {channel}`.
@@ -890,7 +909,8 @@ impl Shared {
             local_capacity: None,
             host_agent: Arc::new(crate::devsbd::bridge::host_agent),
             pty_exec: fleet::pty::runtime_exec,
-            host_capacity: Arc::new(super::capacity::HostCapacity::new(Arc::new(|| crate::runtime::backend().engine_info()))),
+            host_capacity: Arc::new(super::capacity::HostCapacity::new(engine_info(), Arc::new(crate::runtime::installed::installed))),
+            installed: Arc::new(crate::runtime::installed::installed),
             peer_env: BTreeMap::new(),
             channels: Arc::default(),
             graph: Arc::default(),
@@ -2596,7 +2616,10 @@ fn link_attach(id: Option<u64>, params: &Value, shared: &Shared, conn: &mut Conn
 fn local_call(method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Result<Value, api::ApiError> {
     let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
     let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
-    let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref(), data: shared.data_dir() });
+    // No runtime here: the signed copies aren't listed as roots (nothing
+    // could run them; the copies stay, for relaying).
+    let data = shared.data_dir().filter(|_| (shared.installed)());
+    let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref(), data });
     api::call(method, params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, host })
 }
 
@@ -3377,7 +3400,13 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
     let cached = shared.snapshots.cached(&dir);
     let first = match &cached {
         Some(params) => Some(Arc::clone(params)),
-        None => snapshots::params(&dir, &(shared.join)(&dir, &crate::snapshot::RuntimeView::disk())),
+        None => {
+            let view = match (shared.installed)() {
+                true => crate::snapshot::RuntimeView::disk(),
+                false => crate::snapshot::RuntimeView::driver(),
+            };
+            snapshots::params(&dir, &(shared.join)(&dir, &view))
+        }
     };
     // Under `locals`, the root's params, its watch and the first push's
     // merge go in together: `watched_roots` can't prune the params before
@@ -3587,6 +3616,8 @@ pub(crate) mod tests {
             peer_env: None,
             // Never the runtime's `info`: an empty report (caps aside).
             local_capacity: Some(Arc::new(crate::serve::capacity::Capacity::default)),
+            // Never this host's `PATH`: a runtime, whatever is installed.
+            runtime_installed: Some(Arc::new(|| true)),
             // Never the user's agent.
             host_agent: Some(Arc::new(|| None)),
             // Short, but each probe of a routed member is a routed opening.
@@ -3941,6 +3972,44 @@ pub(crate) mod tests {
     fn bare_shared(tag: &str) -> Arc<Shared> {
         let store = scratch(tag);
         Arc::new(Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join()))
+    }
+
+    /// No runtime here (a driver): `roots.list` lists no signed copy (still
+    /// installed) and `capacity.get` says `runtime: false`; once one is
+    /// installed, both come back.
+    #[test]
+    fn a_driver_lists_no_signed_copies_and_reports_no_runtime() {
+        use crate::serve::fleet::mesh;
+        let store = scratch("driver-roots");
+        let src = store.join("src/cfg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let b = mesh::collect(&src).unwrap();
+        mesh::install(&store, "cfg", &b.tar().unwrap(), &b.hash()).unwrap();
+        let copy = std::fs::canonicalize(mesh::tree_path(&store, "cfg")).unwrap();
+        let installed = Arc::new(AtomicBool::new(false));
+        let mut s = Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join());
+        s.member = Some(store.join("member.toml"));
+        let flag = Arc::clone(&installed);
+        s.installed = Arc::new(move || flag.load(Ordering::SeqCst));
+        let flag = Arc::clone(&installed);
+        s.host_capacity = Arc::new(super::super::capacity::HostCapacity::new(
+            Arc::new(|| anyhow::bail!("no info in a test")),
+            Arc::new(move || flag.load(Ordering::SeqCst)),
+        ));
+        let shared = Arc::new(s);
+        let mut c = subscribed(&shared, 1, json!(["instances"]));
+        let roots = |c: &mut BufReader<std::os::unix::net::UnixStream>| -> Vec<PathBuf> {
+            let r = ask(c, "roots.list", json!({})).0;
+            r["result"].as_array().unwrap().iter().map(|row| PathBuf::from(row["root"].as_str().unwrap())).collect()
+        };
+        assert_eq!(roots(&mut c), Vec::<PathBuf>::new(), "the copy isn't offered");
+        assert!(copy.is_dir(), "still installed");
+        assert_eq!(ask(&mut c, "capacity.get", json!({})).0["result"]["runtime"], json!(false));
+        installed.store(true, Ordering::SeqCst);
+        assert_eq!(roots(&mut c), [copy]);
+        assert_eq!(ask(&mut c, "capacity.get", json!({})).0["result"]["runtime"], json!(true));
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// `instances.attach` records while its connection holds, and only for a

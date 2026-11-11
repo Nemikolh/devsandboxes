@@ -20,8 +20,9 @@
 //! event stream ([`EventWatcher`], `events.rs`): each relevant container
 //! event wakes it at once. The sleep is [`tick`]:
 //! [`snapshots::LISTING_INTERVAL`] while anything is watched, else
-//! [`QUIET_POLL`] while the event stream is live and every bridge is settled,
-//! else [`POLL`]. A [`Waker`] (the API's `bridges.ensure`) cuts the poll's sleep
+//! [`QUIET_POLL`] while the event stream is live (or no runtime is
+//! installed: then nothing is asked of one, [`poll`]) and every bridge is
+//! settled, else [`POLL`]. A [`Waker`] (the API's `bridges.ensure`) cuts the poll's sleep
 //! short and marks its container urgent, so a CLI command or a dashboard
 //! terminal gets its bridge now rather than within [`POLL`]; the bridges are
 //! handed their list before any stats or snapshot work.
@@ -40,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::capacity::HostCapacity;
+use super::capacity::{HostCapacity, InstalledFn};
 use super::events::{EVENTS_RETRY, EventWatcher};
 use super::capacity::Own;
 use super::snapshots::{self, Join, Snapshots};
@@ -77,6 +78,10 @@ pub struct Observers {
     /// This host's capacity: the poll keeps its running count, and asks it
     /// for the report while a root is watched (the daemon asks it too).
     pub capacity: Arc<HostCapacity>,
+    /// Whether a container runtime is installed, asked each pass
+    /// (`runtime::installed::installed`, cached there): without one the
+    /// poll asks no runtime ([`poll`]).
+    pub installed: InstalledFn,
 }
 
 /// What the poll thread sleeps on: stop, containers a client asked a
@@ -253,6 +258,14 @@ impl Drop for Host {
 /// the holder count are kept, not torn down on a blip); the outage is logged
 /// once, and urgent containers wait for the next list. Watched roots still
 /// get a snapshot then, saying the runtime is down.
+///
+/// With no runtime installed ([`Observers::installed`]) the pass asks
+/// nothing of one: no listing, version or stats, no event stream (started
+/// once one is installed, dropped if it goes), the bridges and forwards
+/// left as they are; watched roots get a driver snapshot
+/// (`RuntimeView::driver`: no `error`, `no_runtime`), and the sleep is the
+/// quiet one ([`tick`]'s `quiet`), as nothing changes but the config.
+/// The absence is logged once.
 #[allow(clippy::too_many_arguments)]
 fn poll(
     stop: &Shared,
@@ -266,20 +279,38 @@ fn poll(
 ) {
     let worker = Bridges::spawn_worker(Some(sink), board.clone());
     let rt = crate::runtime::backend();
-    // Declared after `worker`, so it drops (child killed, thread joined) first.
-    let events = {
-        let argv = rt.events_argv().map(|a| a.into_iter().map(String::from).collect());
-        let shared = Arc::clone(stop);
-        EventWatcher::start(rt.bin(), argv, Box::new(move || refresh(&shared)), log, EVENTS_RETRY)
-    };
+    // Declared after `worker`, so it drops (child killed, thread joined)
+    // first. Started once a runtime is installed.
+    let mut events: Option<EventWatcher> = None;
     let mut down = false;
+    let mut absent = false;
     let mut last: Vec<String> = Vec::new();
     let mut urgent: Vec<(String, u64)> = Vec::new();
     loop {
+        let installed = (observers.installed)();
+        if installed == absent {
+            log(&match installed {
+                true => "a container runtime is installed".to_string(),
+                false => format!(
+                    "no container runtime ({}): this host drives other machines and runs nothing",
+                    crate::runtime::installed::missing_note()
+                ),
+            });
+            absent = !installed;
+        }
+        if !installed {
+            events = None;
+        } else if events.is_none() {
+            let argv = rt.events_argv().map(|a| a.into_iter().map(String::from).collect());
+            let shared = Arc::clone(stop);
+            events = Some(EventWatcher::start(rt.bin(), argv, Box::new(move || refresh(&shared)), log, EVENTS_RETRY));
+        }
         // Quiet: the backend captures stderr.
-        let listing = rt.list(true, NAME_PREFIX);
-        match listing.as_ref().map(|rows| running(rows)) {
-            Ok(mut running) => {
+        let listing = installed.then(|| rt.list(true, NAME_PREFIX));
+        match listing.as_ref().map(|l| l.as_ref().map(|rows| running(rows))) {
+            // No container to bridge: an urgent one waits out its timeout.
+            None => urgent.clear(),
+            Some(Ok(mut running)) => {
                 running.sort();
                 if running != last {
                     changes.fetch_add(1, Ordering::Release);
@@ -299,7 +330,7 @@ fn poll(
                 on_running(&running);
                 worker.send(running, std::mem::take(&mut urgent));
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 if !down {
                     log(&format!("cannot list containers ({e:#}); retrying every {}s", POLL.as_secs()));
                     down = true;
@@ -319,8 +350,12 @@ fn poll(
             // while someone watches.
             let own = (observers.own)();
             observers.cache.set_capacity(&observers.capacity.report(&own));
-            let due = listing.is_ok() && observers.cache.stats_due(&watched, Instant::now());
-            let mut view = RuntimeView::from_parts(rt, Some(listing), None);
+            let listed = matches!(listing, Some(Ok(_)));
+            let due = listed && observers.cache.stats_due(&watched, Instant::now());
+            let mut view = match listing {
+                Some(listing) => RuntimeView::from_parts(rt, Some(listing), None),
+                None => RuntimeView::driver(),
+            };
             if due {
                 // A new watch's root shows its statuses before the stats
                 // pass (~1.5 s on docker): Disk, Listing, then Full.
@@ -331,7 +366,8 @@ fn poll(
         }
         // Read before the lock: a stream lost after this read sets `refresh`,
         // which the wait sees at once.
-        let sleep = tick(!watched.is_empty(), events.is_live(), board.settled());
+        let quiet = !installed || events.as_ref().is_some_and(EventWatcher::is_live);
+        let sleep = tick(!watched.is_empty(), quiet, board.settled());
         let (lock, cvar) = &**stop;
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let (mut guard, _) = cvar
@@ -348,16 +384,17 @@ fn poll(
 }
 
 /// The poll's sleep: the dashboards' cadence while a root is watched; else
-/// the long [`QUIET_POLL`] while container events wake the poll and the
+/// the long [`QUIET_POLL`] while it's `quiet` (container events wake the
+/// poll, or no runtime is installed: nothing to list) and the
 /// bridges are settled (`BridgeBoard::settled`), since a pending handshake
 /// and a dead bridge's retry (`bridge::retry_decision`, `bridge::RETRY`) are
 /// only acted on by a poll pass; else [`POLL`]. A bridge failing during a
 /// quiet sleep wakes the poll (`BridgeBoard::on_failed`), so its retry
 /// keeps the `POLL` schedule.
-fn tick(watched: bool, events_live: bool, bridges_settled: bool) -> Duration {
+fn tick(watched: bool, quiet: bool, bridges_settled: bool) -> Duration {
     if watched {
         snapshots::LISTING_INTERVAL
-    } else if events_live && bridges_settled {
+    } else if quiet && bridges_settled {
         QUIET_POLL
     } else {
         POLL
@@ -501,10 +538,84 @@ mod tests {
         for (live, settled) in [(false, false), (false, true), (true, false), (true, true)] {
             assert_eq!(tick(true, live, settled), snapshots::LISTING_INTERVAL, "watched wins");
         }
-        assert_eq!(tick(false, true, true), QUIET_POLL);
+        assert_eq!(tick(false, true, true), QUIET_POLL, "events live, or no runtime installed");
         assert_eq!(tick(false, false, true), POLL, "no event stream");
         assert_eq!(tick(false, true, false), POLL, "a bridge pending or failed");
         assert_eq!(tick(false, false, false), POLL);
+    }
+
+    static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn logged(line: &str) {
+        LOGGED.lock().unwrap().push(line.to_string());
+    }
+
+    /// No runtime installed: the poll lists nothing (no running list, no
+    /// bridge hand-off), asks no `info`, and a watched root's snapshot
+    /// carries `no_runtime`, no `error` and `runtime: false`; the absence
+    /// is logged once.
+    #[test]
+    fn without_a_runtime_the_poll_asks_none() {
+        use serde_json::json;
+        use std::sync::atomic::AtomicBool;
+        let stop: Shared = Arc::default();
+        let (live, changes) = (AtomicUsize::new(0), AtomicU64::new(0));
+        let listed = Arc::new(AtomicBool::new(false));
+        let on_running: OnRunning = {
+            let listed = Arc::clone(&listed);
+            Box::new(move |_| listed.store(true, Ordering::SeqCst))
+        };
+        let asked = Arc::new(AtomicUsize::new(0));
+        let pushed: Arc<Mutex<Vec<Arc<Value>>>> = Arc::default();
+        let observers = {
+            let (asked, pushed) = (Arc::clone(&asked), Arc::clone(&pushed));
+            Observers {
+                watched: Box::new(|| BTreeSet::from([PathBuf::from("/r")])),
+                cache: Arc::default(),
+                join: Arc::new(|_, view: &RuntimeView| super::super::api::InstancesList {
+                    snapshot: {
+                        let mut s = snapshots::tests::snapshot(Vec::new(), view.depth == crate::snapshot::Depth::Full);
+                        s.no_runtime = view.no_runtime;
+                        s.error = (!view.errors.is_empty()).then(|| view.errors.join("; "));
+                        s
+                    },
+                    thread_children: Default::default(),
+                }),
+                on_snapshot: Box::new(move |_, params| pushed.lock().unwrap().push(params)),
+                own: Box::new(Own::default),
+                capacity: Arc::new(HostCapacity::new(Arc::new(|| panic!("info asked")), Arc::new(|| false))),
+                installed: Arc::new(move || {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    false
+                }),
+            }
+        };
+        let sink = SinkHooks { on_shown: None, opener: Arc::new(|_, _, _| {}), on_open_done: None, log: logged };
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || poll(&stop, &live, &changes, logged, sink, on_running, &observers, BridgeBoard::default()))
+        };
+        // Two passes: a refresh cuts the 2 s sleep short.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pushed.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            refresh(&stop);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        {
+            let (lock, cvar) = &*stop;
+            lock.lock().unwrap().stop = true;
+            cvar.notify_all();
+        }
+        thread.join().unwrap();
+        let pushed = pushed.lock().unwrap();
+        assert!(pushed.len() >= 2, "{pushed:?}");
+        for p in pushed.iter() {
+            assert_eq!((&p["no_runtime"], &p["error"], &p["capacity"]["runtime"]), (&json!(true), &Value::Null, &json!(false)), "{p}");
+        }
+        assert!(!listed.load(Ordering::SeqCst), "nothing listed");
+        assert!(asked.load(Ordering::SeqCst) >= 2, "asked each pass");
+        let lines = LOGGED.lock().unwrap();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("no container runtime")).count(), 1, "{lines:?}");
     }
 
     #[test]

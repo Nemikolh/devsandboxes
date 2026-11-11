@@ -48,8 +48,13 @@ impl Caps {
 }
 
 /// One host's capacity, as a snapshot carries it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capacity {
+    /// A container runtime is installed there (`runtime::installed`);
+    /// `false` is a driver, which placement never picks. Absent reads as
+    /// installed.
+    #[serde(default = "installed")]
+    pub runtime: bool,
     /// The engine host's (a VM's, for a VM-backed engine); `None` unknown.
     pub cpus: Option<u64>,
     /// Bytes, the engine host's.
@@ -65,6 +70,26 @@ pub struct Capacity {
     pub running: usize,
     /// `member.toml`'s soft caps; `None` when none is set.
     pub caps: Option<Caps>,
+}
+
+fn installed() -> bool {
+    true
+}
+
+/// Nothing known, a runtime installed.
+impl Default for Capacity {
+    fn default() -> Self {
+        Capacity {
+            runtime: true,
+            cpus: None,
+            mem_total: None,
+            mem_available: None,
+            disk_free: None,
+            disk_total: None,
+            running: 0,
+            caps: None,
+        }
+    }
 }
 
 /// What this host's own files put in its report: `member.toml`'s `[caps]`.
@@ -96,9 +121,10 @@ impl HostFacts {
 }
 
 impl Capacity {
-    /// The report from its parts (pure).
+    /// The report from its parts (pure), a runtime installed.
     pub fn build(engine: Option<&EngineInfo>, host: HostFacts, running: usize, own: &Own) -> Capacity {
         Capacity {
+            runtime: true,
             cpus: engine.and_then(|e| e.cpus),
             mem_total: engine.and_then(|e| e.mem_total),
             mem_available: host.mem_available,
@@ -118,6 +144,10 @@ impl Capacity {
 /// How the runtime's `info` is asked (`Backend::engine_info` outside tests).
 pub type EngineInfoFn = Arc<dyn Fn() -> Result<EngineInfo> + Send + Sync>;
 
+/// Whether a runtime is installed (`runtime::installed::installed`
+/// outside tests).
+pub type InstalledFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// This host's report, on demand: one [`EngineCache`] and the running
 /// count, shared by the poll (which sets the count from each listing and
 /// asks for the report while a root is watched) and the daemon
@@ -126,11 +156,12 @@ pub struct HostCapacity {
     engine: Mutex<EngineCache>,
     running: AtomicUsize,
     info: EngineInfoFn,
+    installed: InstalledFn,
 }
 
 impl HostCapacity {
-    pub fn new(info: EngineInfoFn) -> HostCapacity {
-        HostCapacity { engine: Mutex::default(), running: AtomicUsize::new(0), info }
+    pub fn new(info: EngineInfoFn, installed: InstalledFn) -> HostCapacity {
+        HostCapacity { engine: Mutex::default(), running: AtomicUsize::new(0), info, installed }
     }
 
     /// The poll's latest running count (`host::running_instances`).
@@ -139,8 +170,12 @@ impl HostCapacity {
     }
 
     /// The report now: the cached `info` (asked again past [`ENGINE_TTL`]),
-    /// [`HostFacts::read`], the last running count, `own`.
+    /// [`HostFacts::read`], the last running count, `own`. With no runtime
+    /// installed: `runtime: false` and nothing asked of one.
     pub fn report(&self, own: &Own) -> Capacity {
+        if !(self.installed)() {
+            return Capacity { runtime: false, ..Capacity::build(None, HostFacts::default(), 0, own) };
+        }
         let info = self.engine.lock().unwrap_or_else(|e| e.into_inner()).get(Instant::now(), || (self.info)()).cloned();
         Capacity::build(info.as_ref(), HostFacts::read(info.as_ref()), self.running.load(Ordering::Acquire), own)
     }
@@ -278,9 +313,12 @@ pub fn over_note(c: &Capacity) -> Option<String> {
 
 /// The CAPACITY column: `8 cpu · 12/32G · 120G free · 3 run`, each part
 /// left out while unknown (memory as `32G` without `mem_available`); `-`
-/// without a report.
+/// without a report, `no runtime` for a driver.
 pub fn summary(c: Option<&Capacity>) -> String {
     let Some(c) = c else { return "-".into() };
+    if !c.runtime {
+        return "no runtime".into();
+    }
     let mut parts = Vec::new();
     if let Some(n) = c.cpus {
         parts.push(format!("{n} cpu"));
@@ -339,10 +377,13 @@ mod tests {
     fn the_host_report_on_demand() {
         let asked = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&asked);
-        let host = HostCapacity::new(Arc::new(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-            Ok(EngineInfo { cpus: Some(4), mem_total: Some(8 * G), root_dir: None, native: false })
-        }));
+        let host = HostCapacity::new(
+            Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(EngineInfo { cpus: Some(4), mem_total: Some(8 * G), root_dir: None, native: false })
+            }),
+            Arc::new(|| true),
+        );
         host.set_running(2);
         let capped = Own { caps: SoftCaps { cpus: Some(2), ..SoftCaps::default() } };
         let r = host.report(&capped);
@@ -353,9 +394,32 @@ mod tests {
         assert_eq!(r.clone().with_own(&capped), r.clone());
         assert_eq!(r.clone().with_own(&Own::default()), Capacity { caps: None, ..r });
         // A runtime that won't answer: no engine part, the count still.
-        let down = HostCapacity::new(Arc::new(|| bail!("no runtime")));
+        let down = HostCapacity::new(Arc::new(|| bail!("no runtime")), Arc::new(|| true));
         down.set_running(1);
         assert_eq!(down.report(&Own::default()), Capacity { running: 1, ..Capacity::default() });
+    }
+
+    /// No runtime installed: `runtime: false`, its `info` never asked, the
+    /// caps still; the column says so; a report without the field (or
+    /// `Capacity::default()`) has one.
+    #[test]
+    fn a_host_without_a_runtime_reports_none() {
+        let host = HostCapacity::new(Arc::new(|| panic!("info asked")), Arc::new(|| false));
+        host.set_running(3);
+        let capped = Own { caps: SoftCaps { instances: Some(2), ..SoftCaps::default() } };
+        let r = host.report(&capped);
+        assert!(!r.runtime);
+        assert_eq!((r.cpus, r.mem_total, r.running), (None, None, 0));
+        assert_eq!(r.caps.as_ref().and_then(|c| c.instances), Some(2));
+        assert_eq!(summary(Some(&r)), "no runtime");
+        assert_eq!(serde_json::to_value(&r).unwrap()["runtime"], serde_json::json!(false));
+        let old: Capacity = serde_json::from_value(serde_json::json!({
+            "cpus": 4, "mem_total": null, "mem_available": null, "disk_free": null, "disk_total": null,
+            "running": 1, "caps": null,
+        }))
+        .unwrap();
+        assert!(old.runtime, "absent: installed");
+        assert!(Capacity::default().runtime);
     }
 
     #[test]
@@ -422,6 +486,7 @@ mod tests {
         assert_eq!(
             c,
             Capacity {
+                runtime: true,
                 cpus: Some(8),
                 mem_total: Some(32 * G),
                 mem_available: Some(20 * G),

@@ -41,7 +41,9 @@ state and `Snapshot.error` says why.
   caller: the join's loaded state, `ls --json`'s own `State::load`.
 - `ServiceRow`: scope, source, ports, backing `containers` with status,
   `used_by`, `drift`, `root`, `machine`.
-- Header data: `sandbox_count`, `runtime_name`, `runtime_version`.
+- Header data: `sandbox_count`, `runtime_name`, `runtime_version`,
+  `no_runtime` (no runtime installed here: `RuntimeView::driver`, nothing
+  asked, no runtime `error`).
   `collected_at` and `stats` are `#[serde(skip)]`.
 
 `root` is the config root a row came from; `machine` is set only on a

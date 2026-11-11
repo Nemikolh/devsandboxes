@@ -428,6 +428,7 @@ mod tests {
             collected_at: std::time::Instant::now(),
             stats: true,
             error: None,
+            no_runtime: false,
         };
         app.set_snapshot(snap);
         app.expanded_procs.insert("up".into());
@@ -547,6 +548,7 @@ mod tests {
             collected_at: std::time::Instant::now(),
             stats: true,
             error: None,
+            no_runtime: false,
         });
 
         // Cursor on the sandbox node: no instance selected, nothing expanded.

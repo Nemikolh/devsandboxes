@@ -77,11 +77,16 @@ for Instances when the last machine goes. Each keeps its own selected row.
   ([../daemon/machines.md](../daemon/machines.md) *Dashboard*). A
   routed machine's actions and tabs work as on any machine's rows.
 
-The header's totals line marks the snapshot stale with why when the daemon
+The header's totals line (`data.rs` `totals_line`) ends with the runtime
+and its version (`docker 24.0.7`, `docker ?` while unknown), or `no
+runtime` on a host without one (`Snapshot.no_runtime`, a driver:
+[../daemon/host-poll.md](../daemon/host-poll.md#a-host-with-no-runtime)).
+It marks the snapshot stale with why when the daemon
 connection is down, or after `STALE_AFTER_SECS` without a push.
 
 Above the Instances and Services tables (`ui.rs` `draw_status_lines`),
-each one row and only while set: `Snapshot.error` in red, then
+each one row and only while set: `Snapshot.error` in red (a driver's
+says nothing about the runtime), then
 `identity_line` in yellow, `N sandboxes use /root (U to update)`,
 counting the rows (a machine's included) with an un-acked identity note.
 `U` opens the offer ([Identity modals](#identity-modals)).

@@ -190,6 +190,7 @@ pub(crate) fn run(dir: &Path, verb: CliVerb, fed: &Fed) -> Result<Done> {
     let mut ui = Ui {
         tty,
         term,
+        runs_here: crate::runtime::installed::installed(),
         pick: &mut |prompt, options| {
             let refs: Vec<&str> = options.iter().map(String::as_str).collect();
             crate::commands::pick(prompt, &refs)
@@ -330,6 +331,9 @@ struct Ui<'a> {
     ask: &'a mut dyn FnMut(&str) -> Result<String>,
     /// A line for the user (stderr).
     say: &'a mut dyn FnMut(&str),
+    /// This host has a container runtime (`runtime::installed`): `run`'s
+    /// pick offers its rows ([`choose_sandbox`]).
+    runs_here: bool,
 }
 
 /// What [`prepare`] decided.
@@ -695,7 +699,7 @@ fn run_target(
         let root = row.root.context("bad sandboxes.list entry from devsandbox serve: no root")?;
         Ok(Target { sandbox: Some(row.name.clone()), name: row.name, machine: row.machine, root })
     };
-    let target = match choose_sandbox(rows, wanted) {
+    let target = match choose_sandbox(rows, wanted, ui.runs_here) {
         SandboxChoice::Example { unmatched } => {
             if let Some(name) = unmatched.filter(|_| fed.machines && !place) {
                 note_unreachable(&name, call);
@@ -752,9 +756,19 @@ enum SandboxChoice {
     Pick { prompt: String, error: String, options: Vec<(String, SandboxEntry)> },
 }
 
-fn choose_sandbox(rows: Vec<SandboxEntry>, wanted: Option<(Where, String)>) -> SandboxChoice {
+/// `runs_here`: this host has a container runtime. Without one, a choice
+/// between this host's rows and machines' leaves this host's out (it can't
+/// run them); alone, they're kept, so `run`'s own error says why.
+fn choose_sandbox(rows: Vec<SandboxEntry>, wanted: Option<(Where, String)>, runs_here: bool) -> SandboxChoice {
     let local_empty = !rows.iter().any(|r| r.machine.is_none());
+    let drop_local = |rows: Vec<SandboxEntry>| -> Vec<SandboxEntry> {
+        if runs_here || rows.iter().all(|r| r.machine.is_none()) {
+            return rows;
+        }
+        rows.into_iter().filter(|r| r.machine.is_some()).collect()
+    };
     let Some((wherever, name)) = wanted else {
+        let rows = drop_local(rows);
         if rows.is_empty() {
             return SandboxChoice::Example { unmatched: None };
         }
@@ -771,7 +785,7 @@ fn choose_sandbox(rows: Vec<SandboxEntry>, wanted: Option<(Where, String)>) -> S
                 Where::Machine(m) => r.machine.as_ref() == Some(m),
             }
     };
-    let mut candidates: Vec<SandboxEntry> = rows.iter().filter(|r| fits(r)).cloned().collect();
+    let mut candidates: Vec<SandboxEntry> = drop_local(rows.iter().filter(|r| fits(r)).cloned().collect());
     match candidates.len() {
         0 => match wherever {
             Where::Machine(machine) => SandboxChoice::Missing { machine, sandbox: name },
@@ -1388,6 +1402,7 @@ mod tests {
         let mut ui = Ui {
             tty,
             term,
+            runs_here: true,
             pick: &mut |_, options| {
                 assert!(options.len() > 1);
                 picks.borrow_mut().push(options.to_vec());
@@ -1588,7 +1603,7 @@ mod tests {
     #[test]
     fn run_chooses_where_the_sandbox_is() {
         let rows = || vec![row("api", None, "/cfg"), row("web", None, "/cfg"), row("web", Some("a"), "/r"), row("db", Some("a"), "/r")];
-        let pick = |w: Where, n: &str| choose_sandbox(rows(), Some((w, n.into())));
+        let pick = |w: Where, n: &str| choose_sandbox(rows(), Some((w, n.into())), true);
         assert_eq!(pick(Where::Any, "api"), SandboxChoice::Here { sandbox: "api".into(), matched: true });
         assert_eq!(pick(Where::Any, "db"), SandboxChoice::There(row("db", Some("a"), "/r")));
         assert_eq!(pick(Where::Machine("a".into()), "web"), SandboxChoice::There(row("web", Some("a"), "/r")));
@@ -1602,17 +1617,35 @@ mod tests {
         assert_eq!(pick(Where::Local, "db"), SandboxChoice::Here { sandbox: "db".into(), matched: false });
         assert_eq!(pick(Where::Machine("a".into()), "api"), SandboxChoice::Missing { machine: "a".into(), sandbox: "api".into() });
         // None asked: all of them, a machine's qualified.
-        let SandboxChoice::Pick { error, .. } = choose_sandbox(rows(), None) else { panic!() };
+        let SandboxChoice::Pick { error, .. } = choose_sandbox(rows(), None, true) else { panic!() };
         assert_eq!(error, "no sandbox specified; available: api, web, a/web, a/db");
         // One machine defining it in two roots: the roots tell them apart.
         let two = vec![row("web", Some("a"), "/r1"), row("web", Some("a"), "/r2")];
-        let SandboxChoice::Pick { options, .. } = choose_sandbox(two, Some((Where::Any, "web".into()))) else { panic!() };
+        let SandboxChoice::Pick { options, .. } = choose_sandbox(two, Some((Where::Any, "web".into())), true) else { panic!() };
         assert_eq!(options.iter().map(|o| o.0.as_str()).collect::<Vec<_>>(), ["a/web (/r1)", "a/web (/r2)"]);
         // No local config: the example, unless a machine has it.
         let remote_only = || vec![row("web", Some("a"), "/r")];
-        assert_eq!(choose_sandbox(remote_only(), Some((Where::Any, "web".into()))), SandboxChoice::There(row("web", Some("a"), "/r")));
-        assert_eq!(choose_sandbox(remote_only(), Some((Where::Any, "x".into()))), SandboxChoice::Example { unmatched: Some("x".into()) });
-        assert_eq!(choose_sandbox(vec![], None), SandboxChoice::Example { unmatched: None });
+        assert_eq!(choose_sandbox(remote_only(), Some((Where::Any, "web".into())), true), SandboxChoice::There(row("web", Some("a"), "/r")));
+        assert_eq!(choose_sandbox(remote_only(), Some((Where::Any, "x".into())), true), SandboxChoice::Example { unmatched: Some("x".into()) });
+        assert_eq!(choose_sandbox(vec![], None, true), SandboxChoice::Example { unmatched: None });
+    }
+
+    /// No runtime here (a driver): this host's rows give way to a
+    /// machine's, never to nothing.
+    #[test]
+    fn a_driver_offers_the_machines_sandboxes() {
+        let rows = || vec![row("api", None, "/cfg"), row("web", None, "/cfg"), row("web", Some("a"), "/r"), row("db", Some("a"), "/r")];
+        let pick = |w: Where, n: &str| choose_sandbox(rows(), Some((w, n.into())), false);
+        assert_eq!(pick(Where::Any, "web"), SandboxChoice::There(row("web", Some("a"), "/r")), "not ambiguous");
+        // Only here: kept (`run` says there's no runtime), never the example.
+        assert_eq!(pick(Where::Any, "api"), SandboxChoice::Here { sandbox: "api".into(), matched: true });
+        assert_eq!(pick(Where::Local, "web"), SandboxChoice::Here { sandbox: "web".into(), matched: true });
+        assert_eq!(pick(Where::Any, "zzz"), SandboxChoice::Here { sandbox: "zzz".into(), matched: false });
+        let SandboxChoice::Pick { error, .. } = choose_sandbox(rows(), None, false) else { panic!() };
+        assert_eq!(error, "no sandbox specified; available: a/web, a/db");
+        let local_only = vec![row("api", None, "/cfg")];
+        let SandboxChoice::Pick { error, .. } = choose_sandbox(local_only, None, false) else { panic!() };
+        assert_eq!(error, "no sandbox specified; available: api");
     }
 
     #[test]

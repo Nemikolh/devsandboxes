@@ -1175,6 +1175,7 @@ pub(crate) mod tests {
         std::fs::write(cfg.join("dockerfiles/web.Dockerfile"), "FROM x\n").unwrap();
         let cfg = std::fs::canonicalize(&cfg).unwrap();
         let capacity = |avail: u64, running: usize, caps: Option<Caps>| Capacity {
+            runtime: true,
             cpus: Some(8),
             mem_total: Some(32 * G),
             mem_available: Some(avail * G),
@@ -2209,6 +2210,7 @@ pub(crate) mod tests {
         std::fs::write(cfg.join("dockerfiles/web.Dockerfile"), "FROM x\n").unwrap();
         let cfg = std::fs::canonicalize(&cfg).unwrap();
         let capacity = |avail: u64, running: usize, caps: Option<Caps>| Capacity {
+            runtime: true,
             cpus: Some(8),
             mem_total: Some(32 * G),
             mem_available: Some(avail * G),

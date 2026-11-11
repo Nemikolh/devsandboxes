@@ -123,6 +123,15 @@ pub fn run(
     // Under a fleet root: refused before anything is done, on the host or
     // the runtime (`materialize` checks again for `rebuild`).
     crate::worker_policy::enforce(dir, |p| p.check_config(dir, &config, &sandbox))?;
+    // A driver (docs/architecture/daemon/fleet.md, *Placement*): said once,
+    // before any work, rather than at the first runtime call.
+    if !crate::runtime::installed::installed() {
+        bail!(
+            "this host has no container runtime ({}): it drives other machines \
+             (`devsandbox run <machine>/{sandbox_name}`) but runs no sandbox itself",
+            crate::runtime::installed::missing_note()
+        );
+    }
 
     let ignored = props.ignored();
     if !ignored.is_empty() {
@@ -1749,6 +1758,9 @@ mod tests {
         std::fs::write(data.join("member.toml"), "[allow]\nprivileged = true\n").unwrap();
         let err = run(&cfg, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
         assert!(!format!("{err:#}").contains("worker policy"), "{err:#}");
+        // No runtime on `PATH`: a driver, refused before any work.
+        assert!(format!("{err:#}").starts_with("this host has no container runtime (`"), "{err:#}");
+        assert!(State::load().unwrap().instances.is_empty(), "nothing recorded");
     }
 
     /// The child's root when this process is [`isolated`]'s child for `test`.

@@ -8,6 +8,8 @@ the runtime periodically: it should ride this poll, not start its own.
 Code: `src/serve/host.rs` (`Host`, `poll`, `tick`, `POLL`, `QUIET_POLL`,
 `Waker`, `Observers`, `holds_host`, the `serve-autostart` thread),
 `src/serve/events.rs` (`EventWatcher`, `EVENTS_RETRY`),
+`src/runtime/installed.rs` (`installed`, `on_path`, `InstallCache`,
+`INSTALL_TTL`),
 `src/runtime/events.rs` (`parse`, `relevant`), `src/serve/snapshots.rs`
 (`Snapshots`, `LISTING_INTERVAL`, `STATS_INTERVAL`, `stats_due`, `Join`,
 `Remotes`, `merge`), `src/serve/daemon.rs` (`Watcher`, `Outbox`, `Pending`,
@@ -93,6 +95,35 @@ With the runtime unreachable the last list stands (bridges and holder
 count kept, not torn down on a blip); the outage and the recovery are one
 `serve.log` line each. Watched roots still get a snapshot, saying the
 runtime is down.
+
+## A host with no runtime
+
+A host whose runtime binary isn't installed is a driver: it drives other
+machines (`run <machine>/<sandbox>`, terminals, forwards) and runs
+nothing itself. `runtime::installed::installed` tells: the backend's
+binary (`Backend::bin`) resolves to an executable on `PATH`
+(`installed::on_path`, no spawn), the answer cached for `INSTALL_TTL`
+(60 s, `InstallCache`) so a runtime installed later is picked up without
+a daemon restart. The poll asks it each pass (`Observers::installed`;
+`daemon::Options::runtime_installed` injects it in tests). While it's
+false a pass asks nothing of a runtime:
+
+- no listing, version or stats call; the bridges, forwards, holders and
+  `instances.changed` stay as they are; urgent containers are dropped
+  (their `bridges.ensure` waits out its timeout);
+- no `EventWatcher`: it starts on the first pass that finds a runtime,
+  and is dropped if the runtime goes;
+- `tick` takes the quiet branch as if the stream were live (`QUIET_POLL`
+  when nothing is watched), since nothing but the config changes;
+- watched roots are joined against `RuntimeView::driver` (a `Disk` view):
+  the snapshot's `no_runtime` is true and its `error` says nothing about
+  the runtime; a new watch's first push is that view too;
+- the capacity report says `runtime: false`
+  ([fleet.md](fleet.md#capacity)).
+
+The absence, and a runtime appearing, are one `serve.log` line each.
+Outside the daemon, `RuntimeView::gather` (`instances.list`, `status`)
+answers the same driver view.
 
 ## Bridges
 

@@ -89,6 +89,7 @@ mod tests {
             collected_at: Instant::now(),
             stats: true,
             error: None,
+            no_runtime: false,
         };
 
         let json = serde_json::to_string(&Envelope::new(snapshot)).unwrap();

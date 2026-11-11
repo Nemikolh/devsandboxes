@@ -1187,6 +1187,13 @@ a host asks its machines before it places.
 - **`caps`**: `member.toml`'s `[caps]` in bytes (`Caps::of`; none when
   no cap is set), read through `Shared::own` (`capacity::Own`) each
   time, so a hand edit shows on the next report.
+- **`runtime`**: a container runtime is installed
+  (`runtime::installed::installed`, `HostCapacity`'s injected
+  `InstalledFn`; [host-poll.md](host-poll.md#a-host-with-no-runtime)).
+  Without one the report is `runtime: false` with the caps and nothing
+  else (no `info` asked, `running` 0); placement never picks it. A report
+  without the field reads as `true` (serde default), as does
+  `Capacity::default`.
 
 **Soft caps never refuse.** `capacity::over_caps` (pure) lists what
 exceeds one: memory in use (`mem_total - mem_available`) over `mem`,
@@ -1204,7 +1211,7 @@ stores each pushed root's params (`service.rs` `LinkLoop::store`), and
 (`lent::filter_snapshot`) leaves it as is. The dashboard's Machines tab
 and `devsandbox machine ls` show it as CAPACITY (`capacity::summary`:
 `8 cpu · 12/32G · 120G free · 3 run`, memory in use / total, then the
-over-cap note).
+over-cap note; `no runtime` for a driver).
 
 ## Placement
 
@@ -1220,10 +1227,14 @@ for the hub's own runs and, through `fleet.place`, for its members'
 
 - **A pin wins** (`Spec::pinned`: `--machine m` or a qualified name).
   It is refused only when the machine isn't a candidate
-  (`NoPlace::UnknownPin`) or is unreachable (`NoPlace::PinUnreachable`);
-  over a cap, it is used with a warning.
-- **New work never goes** to an unreachable machine. None left:
-  `NoPlace::NoCandidate`, each skipped one with why.
+  (`NoPlace::UnknownPin`), is unreachable (`NoPlace::PinUnreachable`) or
+  has no container runtime (`NoPlace::PinNoRuntime`); over a cap, it is
+  used with a warning.
+- **New work never goes** to an unreachable machine, nor to one whose
+  capacity says `runtime: false` (a driver, skipped as `no container
+  runtime`, the requester's own host included; no report yet is taken to
+  have one). None left: `NoPlace::NoCandidate`, each skipped one with
+  why.
 - **Soft caps never refuse.** Among the rest, the highest `place::score`
   wins; ties go to the lowest `MachineRef` (this host first, then
   machines by name). Every exceeded cap (`capacity::over_caps`)
@@ -2216,7 +2227,12 @@ it never signs on a remote request alone (decision 49;
   canonical) under the data dir (`member.toml`'s for a `lent::Reach`,
   `api::HostPaths::data` for `roots.list`), so `roots.list` lists it and
   a `worker` peer reaches it exactly, like any own root, never what's
-  nested in it; a host that registered the member by `machine add`
+  nested in it. A host with no container runtime (a driver,
+  [host-poll.md](host-poll.md#a-host-with-no-runtime)) keeps its copies
+  (it still hands bundles on) but `roots.list` lists none: the daemon's
+  `local_call` passes no `HostPaths::data` then, so no machine watches
+  or offers `<driver>/<sandbox>` rows it couldn't run, and a bare `run
+  <sandbox>` elsewhere isn't ambiguous with it. A host that registered the member by `machine add`
   before the copy was installed reaches it too, as one of the machine's
   live roots ([machines.md](machines.md#held-links-machines)). A config dir under `mesh/tree/` is built from only
   while `mesh::check_root_in` admits it: a root inside a copy but not

@@ -271,6 +271,11 @@ pub struct Snapshot {
     #[serde(skip)]
     pub stats: bool,
     pub error: Option<String>,
+    /// This host has no container runtime (its binary isn't on `PATH`,
+    /// `runtime::installed`): a driver. Nothing was asked of a runtime and
+    /// `error` says nothing about it.
+    #[serde(default)]
+    pub no_runtime: bool,
 }
 
 /// Pre-extracted service definition fed into [`build_service_rows`]. Keeping the
@@ -735,6 +740,8 @@ pub struct RuntimeView {
     pub errors: Vec<String>,
     /// When the runtime was asked: the snapshots' `collected_at`.
     pub at: Instant,
+    /// No runtime installed ([`RuntimeView::driver`]).
+    pub no_runtime: bool,
 }
 
 impl RuntimeView {
@@ -743,8 +750,18 @@ impl RuntimeView {
         Self::from_parts(backend(), None, None)
     }
 
-    /// Ask the runtime down to `depth`: one listing, one stats call.
+    /// A host with no runtime installed (`runtime::installed`): a
+    /// [`Depth::Disk`] view that asked nothing and reports no error.
+    pub fn driver() -> Self {
+        Self { no_runtime: true, ..Self::disk() }
+    }
+
+    /// Ask the runtime down to `depth`: one listing, one stats call; nothing
+    /// when none is installed ([`RuntimeView::driver`]).
     pub fn gather(depth: Depth) -> Self {
+        if depth != Depth::Disk && !crate::runtime::installed::installed() {
+            return Self::driver();
+        }
         let rt = backend();
         let listing = (depth != Depth::Disk).then(|| rt.list(true, NAME_PREFIX));
         let stats = (depth == Depth::Full).then(|| rt.stats());
@@ -775,8 +792,16 @@ impl RuntimeView {
         // call per tick on it.
         let runtime_version = if listed { runtime_version(rt) } else { None };
         let depth = if listed { Depth::Listing } else { Depth::Disk };
-        let mut view =
-            Self { depth, ps, stats: BTreeMap::new(), runtime_name: rt.name().to_string(), runtime_version, errors, at };
+        let mut view = Self {
+            depth,
+            ps,
+            stats: BTreeMap::new(),
+            runtime_name: rt.name().to_string(),
+            runtime_version,
+            errors,
+            at,
+            no_runtime: false,
+        };
         if let Some(stats) = stats {
             view.add_stats(stats);
         }
@@ -837,6 +862,7 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
                 collected_at,
                 stats: false,
                 error: Some(format!("state: {e:#}")),
+                no_runtime: view.no_runtime,
             };
         }
     };
@@ -939,6 +965,7 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
         collected_at,
         stats: view.depth == Depth::Full,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+        no_runtime: view.no_runtime,
     }
 }
 
@@ -1279,6 +1306,7 @@ extends = "does-not-exist"
             collected_at: Instant::now(),
             stats: true,
             error: Some("e".into()),
+            no_runtime: false,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         let back: Snapshot = serde_json::from_value(json.clone()).unwrap();
@@ -1612,6 +1640,7 @@ extends = "does-not-exist"
             runtime_version: (depth != Depth::Disk).then(|| "27.0".to_string()),
             errors: Vec::new(),
             at: Instant::now(),
+            no_runtime: false,
         };
         let load = || toml::from_str::<State>(STATE).unwrap();
 

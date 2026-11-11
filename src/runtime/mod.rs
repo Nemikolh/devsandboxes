@@ -13,6 +13,7 @@ mod dockerlike;
 #[cfg(unix)]
 pub mod events;
 pub mod identity;
+pub mod installed;
 // Only the daemon and the dashboard list processes (both unix-only).
 #[cfg(unix)]
 pub mod procs;
