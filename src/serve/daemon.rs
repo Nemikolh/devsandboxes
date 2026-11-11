@@ -1123,8 +1123,12 @@ impl Shared {
                 // A state.toml that doesn't read: in use, so nothing is recut.
                 let in_use: fleet::code::InUse =
                     Arc::new(move |at| crate::state::State::load_at(&state).map(|s| fleet::code::mounted(&s, at)).unwrap_or(true));
+                let data = self.data_dir().map(Path::to_path_buf);
                 self.spawn_channel("serve-transfer", move || {
-                    let receivers = fleet::code::receivers(&root, fleet::transfer::Receivers::new(log), in_use);
+                    let mut receivers = fleet::code::receivers(&root, fleet::transfer::Receivers::new(log), in_use);
+                    if let Some(data) = &data {
+                        receivers = fleet::mesh::serves(data, receivers);
+                    }
                     if let Err(e) = receivers.receive(stream) {
                         log(&format!("fleet: a transfer from {} failed: {e:#}", peer.name));
                     }

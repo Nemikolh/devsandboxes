@@ -1982,6 +1982,27 @@ it never signs on a remote request alone (decision 49;
   no binding signs nothing. Nothing is bundled off the authority or in
   no fleet; a verb from a link peer, `--in-process` ones (the dispatcher's, the in-process
   fallback) and the autostart pass never sign. Never proposed.
+  Another member keeps its copy of a root at
+  `<data>/devsandbox/mesh/tree/<name>/` (`mesh::tree_path`, outside
+  `fleet/`, so no worker policy covers it; a relative `folder` of `../x`
+  lands at `mesh/tree/x`). `mesh::install` takes a bundle's tar only as
+  the version the log's head names: unpacked into a temp dir under
+  `mesh/` (`code::tar`'s checks), re-collected there and refused unless
+  it hashes to the head's hash, the guard against an older version's
+  bundle or a tampered one (a transfer checks only its sender's header).
+  The re-collected bundle, not the tar's members, is what lands: stored
+  in `bundles/`, then each file written into the copy in place (temp +
+  rename, parents real dirs), and the files the previous install listed
+  and this one doesn't removed; `mesh/installed.toml` records per name
+  the hash and file list installed (the union first, so a cut install
+  still lists what the next must remove). Nothing else in the copy is
+  touched (`ROOT_SKIPS`, `.git`, local files such as the dispatcher's
+  `.leader`). A name `mesh::bind` bound on this host is refused: the
+  authority's original is the root. Every host serves the bundles it
+  keeps as `TRANSFER` pulls of kind `mesh-bundle` (`mesh::serves`, in
+  `daemon`'s transfer channel next to `code::receivers`; only a
+  `<64 hex>.tar` name, a regular file); `mesh::pull_bundle` pulls one by
+  hash through a `code::Transfer`, at most `code::ROOT_TAR_LIMIT`.
 - **Following a hub change** (decision 69). A host follows a hub change
   (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
   both ends redial saying it) only once the change has left it: cycling

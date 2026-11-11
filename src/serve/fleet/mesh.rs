@@ -159,6 +159,256 @@ pub fn bind(data: &Path, name: &str, path: &Path) -> Result<Result<(), PathBuf>>
     )
 }
 
+/// Where a member keeps its copy of the config root named `name` in the
+/// log, under data dir `data`: `<data>/devsandbox/mesh/tree/<name>/`, one
+/// path per name whatever the version (so worktrees, `shared-volumes`, the
+/// services project id and instances' recorded roots survive a new one),
+/// beside `bundles/` and `roots.toml` without colliding with them, outside
+/// `fleet/` (no worker policy: the authority's signature is the consent).
+/// A relative `folder` of `../x` lands at `mesh/tree/x`.
+#[cfg_attr(not(test), allow(dead_code))] // step 2b calls it on log adoption
+pub fn tree_path(data: &Path, name: &str) -> PathBuf {
+    data.join("mesh").join("tree").join(name)
+}
+
+/// What [`install`] wrote last per name: `<data>/devsandbox/mesh/installed.toml`,
+/// `[<name>] hash = "<hex>", files = [...]`, so the next install removes
+/// only what this one listed and no longer does.
+fn installed_path(data: &Path) -> PathBuf {
+    data.join("mesh").join("installed.toml")
+}
+
+/// One name's [`installed_path`] entry.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+struct InstalledRoot {
+    hash: String,
+    files: Vec<String>,
+}
+
+fn load_installed(path: &Path) -> Result<BTreeMap<String, InstalledRoot>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+fn save_installed(path: &Path, roots: &BTreeMap<String, InstalledRoot>) -> Result<()> {
+    let text = toml::to_string(roots).context("cannot serialize the installed config roots")?;
+    crate::serve::locked_file::write_atomic_mode(path, &text, 0o644)
+}
+
+/// A unique suffix for this process's temp names.
+fn next_seq() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What [`install`] did: the copy's path and the files it removed (the
+/// previous version's, no longer listed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub path: PathBuf,
+    pub removed: Vec<String>,
+}
+
+/// Install `tar` (a [`Bundle::tar`], pulled from a peer) as the copy of
+/// config root `name` ([`tree_path`]) under data dir `data`, when it is
+/// the version `head` (the log's latest `config` entry's hash for `name`).
+///
+/// The guard against rollback and tampering is here: a transfer checks
+/// only that the body is what its sender's header says, so the tar is
+/// unpacked into a temp dir under `mesh/` (`code::tar`'s checks: no
+/// absolute path, no `..`, no symlink out of the tree, never through a
+/// link), [`collect`]ed there, and refused unless that bundle hashes to
+/// `head`: an older version's bundle, a tampered file or a stray member
+/// doesn't get in, and the tree is left as it was.
+///
+/// Then the re-collected bundle (not the tar's members: what isn't
+/// referenced doesn't travel) is stored ([`store`]) to serve pulls, and
+/// the copy updated in place: each of its files written (temp + rename,
+/// every parent a real dir), then the files the previous install listed
+/// and this bundle doesn't removed. Nothing else in the copy is touched:
+/// `ROOT_SKIPS`, `.git` and local files no bundle listed (the dispatcher's
+/// `.leader`, logs) stay. Installs run one at a time per data dir (a
+/// lock next to [`installed_path`]).
+///
+/// Refused for a name [`bound_root`] binds: the authority's original is
+/// the root, it never gets a copy.
+#[cfg_attr(not(test), allow(dead_code))] // step 2b calls it on log adoption
+pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<Installed> {
+    super::membership::check_root_name(name).context("config root")?;
+    if let Some(root) = bound_root(data, name)? {
+        bail!("config root `{name}` is this host's own ({}): it gets no copy", root.display());
+    }
+    if tar.len() as u64 > ROOT_TAR_LIMIT {
+        bail!("the config's bundle is over {ROOT_TAR_LIMIT} bytes");
+    }
+    let mesh = data.join("mesh");
+    std::fs::create_dir_all(&mesh).with_context(|| format!("cannot create {}", mesh.display()))?;
+    let temp = mesh.join(format!(".in-{}-{}", std::process::id(), next_seq()));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir(&temp).with_context(|| format!("cannot create {}", temp.display()))?;
+    // Under its own name, as the authority's root is.
+    let unpacked = temp.join(name);
+    let bundle = tar::extract(tar, &unpacked).and_then(|()| collect(&unpacked));
+    let _ = std::fs::remove_dir_all(&temp);
+    let bundle = bundle.with_context(|| format!("the bundle of config root `{name}`"))?;
+    let got = bundle.hash();
+    if got != *head {
+        bail!("the bundle of config root `{name}` is {}, not the signed version ({})", hex::encode(got), hex::encode(head));
+    }
+    store(data, &bundle)?;
+
+    let _lock = crate::serve::locked_file::lock_at(&installed_path(data).with_extension("lock"))?;
+    let mut installed = load_installed(&installed_path(data))?;
+    let previous = installed.get(name).cloned().unwrap_or_default();
+    let mut listed: Vec<(&str, bool, &[u8])> = vec![(bundle.config_name.as_str(), false, &bundle.config)];
+    listed.extend(bundle.files.iter().filter(|(p, _)| **p != bundle.config_name).map(|(p, f)| (p.as_str(), f.exec, f.data.as_slice())));
+    let files: Vec<String> = listed.iter().map(|(p, _, _)| p.to_string()).collect();
+    // First the union, so a write cut short still has every file listed
+    // that the next install may have to remove.
+    let mut union = previous.files.clone();
+    union.extend(files.iter().filter(|f| !previous.files.contains(f)).cloned());
+    installed.insert(name.to_string(), InstalledRoot { hash: previous.hash.clone(), files: union });
+    save_installed(&installed_path(data), &installed)?;
+
+    let tree = tree_path(data, name);
+    std::fs::create_dir_all(&tree).with_context(|| format!("cannot create {}", tree.display()))?;
+    for (rel, exec, bytes) in &listed {
+        write_in(&tree, rel, *exec, bytes)?;
+    }
+    let mut removed = Vec::new();
+    for rel in previous.files.iter().filter(|f| !files.contains(f)) {
+        if tar::check_path(rel).is_err() || skipped(rel) {
+            continue;
+        }
+        if remove_in(&tree, rel)? {
+            removed.push(rel.clone());
+        }
+    }
+    installed.insert(name.to_string(), InstalledRoot { hash: hex::encode(got), files });
+    save_installed(&installed_path(data), &installed)?;
+    Ok(Installed { path: tree, removed })
+}
+
+/// `bytes` at `rel` under `tree` (temp file + rename, mode by `exec`),
+/// every parent a real directory (made if missing; a symlink or a file
+/// on the way is refused).
+fn write_in(tree: &Path, rel: &str, exec: bool, bytes: &[u8]) -> Result<()> {
+    tar::check_path(rel)?;
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    let leaf = parts.pop().expect("a checked path has a component");
+    let mut dir = tree.to_path_buf();
+    for p in parts {
+        dir.push(p);
+        match dir.symlink_metadata() {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => bail!("{} isn't a directory", dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&dir).with_context(|| format!("cannot create {}", dir.display()))?
+            }
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+        }
+    }
+    let path = dir.join(leaf);
+    if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        bail!("{} is a directory", path.display());
+    }
+    let tmp = dir.join(format!(".{leaf}.{}-{}.tmp", std::process::id(), next_seq()));
+    let _ = std::fs::remove_file(&tmp);
+    let mode = if exec { 0o755 } else { 0o644 };
+    let written = (|| {
+        let mut f = std::fs::File::options().write(true).create_new(true).mode(mode).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// `rel` under `tree` removed when it is a file or a symlink reached
+/// through real directories only, then its parents up to `tree` while
+/// empty. Whether it was there.
+fn remove_in(tree: &Path, rel: &str) -> Result<bool> {
+    let mut at = tree.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for p in &parts[..parts.len() - 1] {
+        at.push(p);
+        if !at.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            return Ok(false);
+        }
+    }
+    let path = tree.join(rel);
+    match path.symlink_metadata() {
+        Ok(m) if !m.is_dir() => std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?,
+        _ => return Ok(false),
+    }
+    let mut dir = path.parent().map(Path::to_path_buf);
+    while let Some(d) = dir.filter(|d| d != tree && d.starts_with(tree)) {
+        if std::fs::remove_dir(&d).is_err() {
+            break;
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    Ok(true)
+}
+
+/// The transfer kind a member pulls a stored bundle by.
+pub const BUNDLE_KIND: &str = "mesh-bundle";
+
+/// A name [`bundle_path`] makes: 64 lowercase hex then `.tar`.
+fn is_bundle_name(name: &str) -> bool {
+    name.strip_suffix(".tar").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// `receivers` serving [`BUNDLE_KIND`] pulls out of data dir `data`'s
+/// `mesh/bundles/`: only a name [`bundle_path`] makes, a regular file (no
+/// symlink, `bundles/` a real dir), kept once sent. Every host keeps the
+/// bundles it signed or installed, so whoever gave a member the log can
+/// give it the bundle too.
+pub fn serves(data: &Path, receivers: crate::serve::fleet::transfer::Receivers) -> crate::serve::fleet::transfer::Receivers {
+    let bundles = data.join("mesh").join("bundles");
+    receivers.serves(
+        BUNDLE_KIND,
+        move |name| {
+            if !is_bundle_name(name) {
+                bail!("`{name}` isn't a config bundle's name");
+            }
+            if !bundles.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                bail!("no {name} to pull here");
+            }
+            let path = bundles.join(name);
+            match path.symlink_metadata() {
+                Ok(m) if m.is_file() => Ok(path),
+                Ok(_) => bail!("{name} isn't a file"),
+                Err(_) => bail!("no {name} to pull here"),
+            }
+        },
+        |_| {},
+    )
+}
+
+/// The bundle hashing to `hash` pulled through `t` (a `code::LinkTransfer`
+/// to the peer that gave this host the log), at most [`ROOT_TAR_LIMIT`]
+/// bytes, through a temp file under data dir `data`'s `mesh/` (removed):
+/// its bytes, for [`install`] to check against the head.
+#[cfg_attr(not(test), allow(dead_code))] // step 2b calls it on log adoption
+pub fn pull_bundle(t: &dyn crate::serve::fleet::code::Transfer, data: &Path, hash: &[u8; 32]) -> Result<Vec<u8>> {
+    let mesh = data.join("mesh");
+    std::fs::create_dir_all(&mesh).with_context(|| format!("cannot create {}", mesh.display()))?;
+    let name = format!("{}.tar", hex::encode(hash));
+    let dest = mesh.join(format!(".pull-{}-{}.tar", std::process::id(), next_seq()));
+    let pulled = t.pull(BUNDLE_KIND, &name, ROOT_TAR_LIMIT, &dest).and_then(|_| std::fs::read(&dest).with_context(|| format!("cannot read {}", dest.display())));
+    let _ = std::fs::remove_file(&dest);
+    pulled.with_context(|| format!("cannot pull the config bundle {name}"))
+}
+
 /// The bundle of config root `root`. The config must load
 /// (`Config::load`), and every sandbox's merged table and every service's
 /// `build` must read, else there is no bundle: what it references isn't
@@ -530,6 +780,193 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         assert_eq!(bound_root(&data, "cfg").unwrap(), Some(PathBuf::from("/a/cfg")));
         assert_eq!(bound_root(&data, "x.y").unwrap(), Some(PathBuf::from("/a/x.y")));
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Every file under `dir` (relative paths), sorted.
+    fn files_under(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, at: &Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(at).unwrap().flatten() {
+                let p = e.path();
+                if p.symlink_metadata().unwrap().is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    out.push(p.strip_prefix(base).unwrap().to_str().unwrap().to_string());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn install_checks_the_head_then_updates_the_copy_in_place() {
+        let (base, root) = fixture("install");
+        let data = base.join("data");
+        let v1 = collect(&root).unwrap();
+        let tar1 = v1.tar().unwrap();
+        let got = install(&data, "cfg", &tar1, &v1.hash()).unwrap();
+        let tree = tree_path(&data, "cfg");
+        assert_eq!(got, Installed { path: tree.clone(), removed: vec![] });
+        assert_eq!(tree, data.join("mesh/tree/cfg"));
+        assert_eq!(hash(&tree), v1.hash(), "the copy re-collects to the head");
+        assert!(bundle_path(&data, &v1.hash()).is_file(), "kept to serve");
+        assert!(!tree.join("notes.md").exists());
+        assert!(std::fs::metadata(tree.join("features/hello/install.sh")).unwrap().permissions().mode() & 0o100 != 0);
+        let mesh_entries: Vec<_> = std::fs::read_dir(data.join("mesh")).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+        assert!(mesh_entries.iter().all(|n| !n.starts_with('.') || n.ends_with(".lock")), "no temp left: {mesh_entries:?}");
+
+        // Local state in the copy.
+        write(&tree, ".leader", "me");
+        write(&tree, "shared-volumes/state/db", "rows");
+        write(&tree, "dispatcher/dispatch.log", "log");
+
+        // v2: one referenced file dropped, one changed.
+        write(&root, "devsandboxes.toml", &CONFIG.replace("[services.db]\nbuild = { dockerfile = \"dockerfiles/db/Dockerfile\" }\n", ""));
+        write(&root, "mcps/common.json", "{\"v\":2}");
+        let v2 = collect(&root).unwrap();
+        let before = files_under(&tree);
+
+        // Refused, the tree untouched: v1's bundle against v2's head (a
+        // rollback), and v2's tar with a file tampered.
+        let err = format!("{:#}", install(&data, "cfg", &tar1, &v2.hash()).unwrap_err());
+        assert!(err.contains("not the signed version"), "{err}");
+        let mut tampered = v2.clone();
+        tampered.files.get_mut("mcps/common.json").unwrap().data = b"{\"evil\":1}".to_vec();
+        assert!(install(&data, "cfg", &tampered.tar().unwrap(), &v2.hash()).is_err());
+        assert_eq!(files_under(&tree), before);
+        assert_eq!(hash(&tree), v1.hash());
+        assert!(!bundle_path(&data, &tampered.hash()).exists(), "a refused bundle isn't kept");
+
+        let got = install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap();
+        assert_eq!(got.removed, ["dockerfiles/db/Dockerfile"]);
+        assert!(!tree.join("dockerfiles/db").exists(), "its emptied dir too");
+        assert_eq!(hash(&tree), v2.hash());
+        assert_eq!(std::fs::read_to_string(tree.join("mcps/common.json")).unwrap(), "{\"v\":2}");
+        for kept in [".leader", "shared-volumes/state/db", "dispatcher/dispatch.log"] {
+            assert!(tree.join(kept).is_file(), "{kept} stays");
+        }
+        // Again: nothing to remove.
+        assert_eq!(install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap().removed, Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stray_tar_member_isnt_installed() {
+        let (base, root) = fixture("stray");
+        let data = base.join("data");
+        let b = collect(&root).unwrap();
+        let mut w = tar::Writer::default();
+        w.file(&b.config_name, false, &b.config).unwrap();
+        for (p, f) in b.files.iter() {
+            w.file(p, f.exec, &f.data).unwrap();
+        }
+        w.file("dispatcher/evil.sh", true, b"#!/bin/sh\n").unwrap();
+        w.file("shared-volumes/x", false, b"x").unwrap();
+        install(&data, "cfg", &w.finish(), &b.hash()).unwrap();
+        let tree = tree_path(&data, "cfg");
+        assert!(!tree.join("dispatcher").exists() && !tree.join("shared-volumes").exists(), "only what the config references");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_bound_name_or_a_bad_name_gets_no_copy() {
+        let (base, root) = fixture("bound");
+        let data = base.join("data");
+        let b = collect(&root).unwrap();
+        bind(&data, "root", &root).unwrap().unwrap();
+        let err = format!("{:#}", install(&data, "root", &b.tar().unwrap(), &b.hash()).unwrap_err());
+        assert!(err.contains("this host's own"), "{err}");
+        assert!(!tree_path(&data, "root").exists());
+        for bad in ["..", "a/b", ""] {
+            assert!(install(&data, bad, &b.tar().unwrap(), &b.hash()).is_err(), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `tar` with the first occurrence of `from` in its first header
+    /// replaced by `to` (same length) and the checksum fixed: members
+    /// `tar::Writer` won't write.
+    fn patched(mut tar: Vec<u8>, from: &[u8], to: &[u8]) -> Vec<u8> {
+        let at = tar[..512].windows(from.len()).position(|w| w == from).unwrap();
+        tar[at..at + to.len()].copy_from_slice(to);
+        tar[148..156].copy_from_slice(b"        ");
+        let sum: u32 = tar[..512].iter().map(|&b| u32::from(b)).sum();
+        tar[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        tar
+    }
+
+    #[test]
+    fn traversal_and_links_out_are_refused() {
+        let (base, root) = fixture("unsafe");
+        let data = base.join("data");
+        let b = collect(&root).unwrap();
+        let with = |first: Box<dyn Fn(&mut tar::Writer)>| {
+            let mut w = tar::Writer::default();
+            first(&mut w);
+            w.file(&b.config_name, false, &b.config).unwrap();
+            w.finish()
+        };
+        let cases = [
+            ("unsafe path", patched(with(Box::new(|w| w.file("ab/x", false, b"x").unwrap())), b"ab/x", b"../x")),
+            ("unsafe path", patched(with(Box::new(|w| w.file("_x", false, b"x").unwrap())), b"_x", b"/x")),
+            ("points outside", patched(with(Box::new(|w| w.link("l", "xx/y").unwrap())), b"xx/y", b"../y")),
+        ];
+        for (why, t) in cases {
+            let err = format!("{:#}", install(&data, "cfg", &t, &b.hash()).unwrap_err());
+            assert!(err.contains(why), "{why}: {err}");
+        }
+        assert!(!tree_path(&data, "cfg").exists());
+        assert!(!base.join("x").exists() && !base.join("data/mesh/x").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A [`crate::serve::fleet::code::Transfer`] pulling straight from
+    /// [`serves`] over a socket pair.
+    struct Served(PathBuf);
+    impl crate::serve::fleet::code::Transfer for Served {
+        fn send(&self, _: &crate::serve::fleet::transfer::Header, _: &mut dyn std::io::Read) -> Result<()> {
+            unreachable!()
+        }
+        fn pull(&self, kind: &str, name: &str, limit: u64, dest: &Path) -> Result<u64> {
+            let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+            for s in [&a, &b] {
+                s.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+                s.set_write_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+            }
+            let r = serves(&self.0, crate::serve::fleet::transfer::Receivers::new(|_| {}));
+            let server = std::thread::spawn(move || r.receive(b).map(|_| ()));
+            let got = crate::serve::fleet::transfer::pull(a, kind, name, limit, dest);
+            let served = server.join().unwrap();
+            got.and_then(|n| served.map(|()| n))
+        }
+    }
+
+    #[test]
+    fn a_stored_bundle_is_served_by_its_hash() {
+        let (base, root) = fixture("serve");
+        let (authority, member) = (base.join("auth"), base.join("member"));
+        let b = collect(&root).unwrap();
+        store(&authority, &b).unwrap();
+        let tar = pull_bundle(&Served(authority.clone()), &member, &b.hash()).unwrap();
+        assert_eq!(tar, b.tar().unwrap());
+        assert!(bundle_path(&authority, &b.hash()).is_file(), "kept once sent");
+        let temps: Vec<_> = std::fs::read_dir(member.join("mesh")).unwrap().flatten().collect();
+        assert!(temps.is_empty(), "{temps:?}");
+        install(&member, "cfg", &tar, &b.hash()).unwrap();
+
+        let err = format!("{:#}", pull_bundle(&Served(authority.clone()), &member, &[1; 32]).unwrap_err());
+        assert!(err.contains("no ") && err.contains("to pull here"), "{err}");
+        // A name that isn't a bundle's: refused before any path is made.
+        let t = Served(authority.clone());
+        let dest = base.join("out.tar");
+        for bad in ["roots.toml", "x.tar", &format!("{}.tar", "A".repeat(64)), &format!("{}", hex::encode(b.hash()))] {
+            let err = format!("{:#}", crate::serve::fleet::code::Transfer::pull(&t, BUNDLE_KIND, bad, ROOT_TAR_LIMIT, &dest).unwrap_err());
+            assert!(err.contains("isn't a config bundle's name"), "{bad}: {err}");
+        }
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

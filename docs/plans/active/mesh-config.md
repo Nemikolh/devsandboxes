@@ -3,7 +3,7 @@
 Status: in progress. Step 1 shipped (1a-1d: signed from the
 authority's verbs, local or aimed at a machine, over the config's
 structure and referenced files, the bundle kept, names bound to one
-path); step 2 is next.
+path); step 2 in progress (2a: receive and install).
 
 ## Goal
 
@@ -90,31 +90,35 @@ and `sign_config`. Its gaps, each a sub-step and a commit:
   bound (1c) to the last component of the remote `root`; no binding,
   nothing signed. Today `verb()` returns through `remote_verb` first.
 
-### Step 2: distribution, push on sign
+### Step 2: distribution, pulled on adoption
 
-- After `sign_and_push`, the authority sends the bundle as a new
-  transfer kind (`mesh-config`) over `LinkTransfer` to the hosts the
-  entry reached. Not the placement receiver: that writes into the
-  sender's fleet root (`fleet/<authority>/roots/<hash>/`, under the
-  worker policy, refused by `Reach::admits`) and one dir per version.
-- The receiver accepts it only when the hash it recomputes equals the
-  log head's for that root (transfer today checks only the sender's
-  own header: this check is the rollback guard), keeps the bundle to
-  serve it, and updates the copy at `<base>/<root name>/`
-  (`<base>` = `<data>/devsandbox/mesh` by default, never under
-  `fleet/`), named as the log names it (not `CONFIG_AT`), in place:
-  only the bundle's files change, `ROOT_SKIPS` and local files
-  (`.leader`, `dispatch.log`) stay. One path per root, so worktrees,
-  `shared-volumes`, the services project id and instances' recorded
-  roots survive a new version.
-- A host that got the entry without the bundle asks the host that
-  pushed the entry, once. No "who has hash X" discovery, no
-  `code.haves`, no copy on hosts that never run anything.
+One mechanism, no authority push code: every host that adopts a log
+moving a `config` head pulls the missing bundle from the peer that gave
+it the log; every host keeps the bundles it has and serves pulls of
+them. Not the placement receiver: that writes into the sender's fleet
+root (`fleet/<authority>/roots/<hash>/`, under the worker policy,
+refused by `Reach::admits`) and one dir per version.
+
+- **2a. Receive and install.** `mesh::install` unpacks into a temp dir,
+  re-collects, and refuses unless the hash equals the log head's for
+  that root (transfer checks only the sender's own header: this is the
+  rollback guard); stores the bundle in `bundles/`; updates the copy at
+  `<data>/devsandbox/mesh/tree/<name>/` (never under `fleet/`, named as
+  the log names it, not `CONFIG_AT`) in place: the bundle's files
+  written, the previous install's no longer listed removed,
+  `ROOT_SKIPS` and local files (`.leader`, `dispatch.log`) left. One
+  path per root, so worktrees, `shared-volumes`, the services project
+  id and instances' recorded roots survive a new version. The
+  authority never unpacks a name it has bound. Pulls: transfer kind
+  `mesh-bundle` (`mesh::serves`, `mesh::pull_bundle`).
+- **2b. On adoption.** Wire the pull + install into log adoption, once
+  per moved head, from the peer that gave the log. No "who has hash X"
+  discovery, no `code.haves`.
 
 ### Step 3: admission on the running member
 
 - `Reach::admits` (`src/serve/fleet/lent.rs`) admits
-  `<base>/<root>` only while the copy matches the signed head: the
+  `mesh/tree/<root>` only while the copy matches the signed head: the
   structural hash recomputed (or a marker written at verified update),
   else `not the signed config`. Needed because the copy can be edited
   in place: the `devsandboxes` sandbox mounts its own config root
@@ -134,7 +138,8 @@ answers none for it.
 No new keys. `${localEnv:…}` already resolves from the running daemon's
 env; `${configDir}`, `${sharedVolumes}`, `.worktrees` and
 `shared-files` hang off the config dir, which is the per-host copy.
-Relative `folder`s land at `<base>/<x>`: the user clones there once (or
+Relative `folder`s (`../x`) land at `<data>/devsandbox/mesh/tree/x`:
+the user clones there once (or
 symlinks; folders are canonicalized). Box setup the user does: clones,
 `~/.zidane`, rootless docker with `XDG_RUNTIME_DIR` in the daemon's
 env, bolt-restate's `packages/*/.env`.
