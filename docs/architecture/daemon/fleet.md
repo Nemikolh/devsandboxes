@@ -2009,7 +2009,24 @@ it never signs on a remote request alone (decision 49;
   else ``note: config `<name>` v<N> re-sent`` then the same
   ``doesn't have`` line per machine missed, and one `serve.log` line
   naming them. So each such verb costs one `fleet.sync` per linked
-  machine. A
+  machine. A `machine add` from a local client on the authority signs
+  too ([ADR 0050](../../decisions/0050-machine-add-on-the-authority-signs-its-configs.md)),
+  so a new member gets the configs with no verb typed first: after this
+  host's adopt and `hub_changed`, before the links reload
+  (`machines::api::add`), `changes::sign_configs` runs `sign_config` over
+  `changes::add_roots` (`changes::roots_to_sign`: `~/.devsandboxes` when
+  it's a directory, then `member.toml`'s `roots`, canonicalized, once
+  each, never a signed config's copy, never `state.toml`'s other config
+  dirs, since the first sign binds a name for good), dropping no-fleet,
+  no-config and `NotAuthority` results (an add on another member signs
+  nothing and says nothing of it). The lines go to `serve.log` as a
+  verb's, prefixed ``machine add `<name>` ``, and their notes are the
+  answer's `configs`, which `machine add` prints on stderr; a failure is
+  a note, never a failed add. The push reaches the members already
+  linked; the new machine isn't in `links.entries()` yet, so it isn't a
+  miss: its first link-up carries the newer log and it installs the
+  bundles from there (`daemon::follow_configs`, below). An add from a
+  link peer (`trust = "full"` reaches `machines.*`) signs nothing. A
   config that doesn't load (`Config::load`, or a sandbox's merge, a
   `build`, `mounts` or `features` that doesn't read), a bundle over
   `code::ROOT_TAR_LIMIT` or a store that fails is logged too

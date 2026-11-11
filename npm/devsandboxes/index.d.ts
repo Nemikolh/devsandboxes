@@ -908,6 +908,11 @@ export interface MachineAdded {
    * introduced this host: that introduction, which the machine proposed (`membership.propose`, best effort).
    */
   proposed: FleetProposed | null;
+  /**
+   * On the fleet's authority, from a local client: what signing this host's configs (`~/.devsandboxes` and
+   * `member.toml`'s `roots`) did, as `note:` lines. A failure is a note here, never a failed add.
+   */
+  configs: string[];
 }
 
 /**

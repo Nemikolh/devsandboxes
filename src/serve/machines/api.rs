@@ -20,7 +20,9 @@
 //! every check first, then the machine's `member.set {name}` and its
 //! membership (`membership.adopt`, or `membership.sign` of this host),
 //! this host's registry entry, and this host's membership, whose adopt
-//! writes its `hub`; then the proposal of whichever end's introduction
+//! writes its `hub`; on the authority, from a local client, this host's
+//! configs signed (`changes::sign_configs`, ADR 0050) before the links
+//! reload; then the proposal of whichever end's introduction
 //! the add made, the machine's over the still-open probe
 //! (`membership.propose`).
 
@@ -76,6 +78,9 @@ pub struct Ctx {
     pub member: Option<PathBuf>,
     /// What names this host when `member.toml` doesn't.
     pub hostname: String,
+    /// The home `~/.devsandboxes` is found in: one of the config roots an
+    /// `add` on the authority signs (`changes::add_roots`).
+    pub home: Option<PathBuf>,
     /// `add` (an adopted log) or a leave wrote this host's `hub`: the
     /// daemon follows it as after a `membership.adopt`
     /// (`daemon::Shared::set_hub`).
@@ -109,11 +114,14 @@ pub struct Ctx {
     pub log_from: Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
 }
 
-/// Run `method` if it's a `machines.*` one; `None` otherwise.
-pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
+/// Run `method` if it's a `machines.*` one; `None` otherwise. `local`: from
+/// a local client, not a peer (a `full` one reaches `machines.*`): only
+/// then does an `add` on the authority sign this host's configs, as only a
+/// local client's verbs do (ADR 0049, 0050).
+pub fn call(method: &str, params: Value, ctx: &Ctx, local: bool) -> Option<Answer> {
     let answer = match method {
         "machines.probe" => parse(params).and_then(|p| probe(p, ctx)),
-        "machines.add" => parse(params).and_then(|p| add(p, ctx)),
+        "machines.add" => parse(params).and_then(|p| add(p, ctx, local)),
         "machines.list" => list(ctx),
         "machines.get" => parse(params).and_then(|p| get(p, ctx)),
         "machines.set" => parse(params).and_then(|p| set(p, ctx)),
@@ -156,6 +164,12 @@ pub struct Added {
     /// machine (`membership.propose` over the probe, best effort).
     #[serde(default)]
     pub proposed: Option<super::changes::Proposed>,
+    /// On the authority, from a local client: what signing this host's
+    /// configs did (`changes::sign_configs` of `changes::add_roots`), as
+    /// `note:` lines (`ConfigSigned::notes`). A failure is a note, never a
+    /// failed add.
+    #[serde(default)]
+    pub configs: Vec<String>,
 }
 
 /// One `machines.list` row: the registry entry, or an inbound neighbor up
@@ -243,7 +257,7 @@ struct AddParams {
     command: Option<String>,
 }
 
-fn add(p: AddParams, ctx: &Ctx) -> Answer {
+fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
     let invalid = |e: anyhow::Error| ApiError::invalid(format!("{e:#}"));
     ssh::parse_target(&p.target).map_err(invalid)?;
     if let Some(name) = &p.name {
@@ -366,6 +380,12 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         (ctx.key_rotated)();
     }
     (ctx.hub_changed)(hub);
+    // This host's configs, when it's the authority: signed now the log
+    // exists here (at fleet creation, only since the adopt) and before the
+    // reload, so the new entry isn't a push miss; its first link-up carries
+    // the newer log and the machine pulls the bundles
+    // (`daemon::follow_configs`).
+    let configs = if local { sign_configs(ctx, &entry.name) } else { Vec::new() };
     if let Some(links) = &ctx.links {
         links.reload();
     }
@@ -397,7 +417,21 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
     drop(link);
     let warning = (version != ctx.version)
         .then(|| format!("{} runs devsandbox {version}, this is {}", entry.name, ctx.version));
-    to_value(Added { name: entry.name, roots: entry.roots, version, warning, fleet: plan.fleet, proposed })
+    to_value(Added { name: entry.name, roots: entry.roots, version, warning, fleet: plan.fleet, proposed, configs })
+}
+
+/// [`super::changes::sign_configs`] over [`super::changes::add_roots`],
+/// each result logged as a verb's is: the `note:` lines `add` answers.
+fn sign_configs(ctx: &Ctx, machine: &str) -> Vec<String> {
+    let roots = super::changes::add_roots(ctx);
+    let mut notes = Vec::new();
+    for signed in super::changes::sign_configs(ctx, &roots) {
+        for line in signed.log_lines() {
+            crate::serve::daemon::log(&format!("machine add `{machine}`: {line}"));
+        }
+        notes.extend(signed.notes());
+    }
+    notes
 }
 
 /// The introduction of `name` this add signed here (by `me`, in `after`, not
@@ -714,6 +748,7 @@ mod tests {
     use crate::serve::fleet::member::Member;
     use crate::serve::fleet::membership_api::test_support::{self, fleet};
     use crate::serve::machines::ssh;
+    use crate::serve::fleet::mesh;
     use crate::serve::proto::Version;
 
     /// Connect to the test daemon in `dir` as a client, retrying while it binds.
@@ -756,6 +791,8 @@ mod tests {
         let mut o = opts(1, 1500);
         o.machines = Some(base.join("machines.toml"));
         o.member = Some(base.join("member.toml"));
+        // No `.devsandboxes` in it unless a test writes one ([`own_config`]).
+        o.home = Some(base.join("local-home"));
         o.probe = Some(match remote {
             Some(remote) => Arc::new(move |_: &Entry| ssh::test_support::relayed(endpoint::connect(&remote)?)),
             None => Arc::new(|e: &Entry| anyhow::bail!("ssh: Could not resolve hostname {}", e.label())),
@@ -772,6 +809,25 @@ mod tests {
     fn err(conn: &mut Conn, method: &str, params: Value) -> (String, String) {
         let e = conn.call(method, params).unwrap().error.unwrap_or_else(|| panic!("{method} succeeded"));
         (e.code, e.message)
+    }
+
+    /// This host's `~/.devsandboxes` (in [`local_opts`]' home) holding a
+    /// config, for an add on the authority to sign: its path.
+    fn own_config(base: &Path) -> PathBuf {
+        let dot = base.join("local-home/.devsandboxes");
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::write(dot.join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"a\"\n").unwrap();
+        dot
+    }
+
+    /// `.devsandboxes` signed here at `version`: in this host's log, its
+    /// bundle stored and its name bound to `dot` (`mesh/roots.toml`).
+    fn assert_signed(base: &Path, dot: &Path, version: u64) {
+        let stored = test_support::read(&base.join("member.toml")).unwrap();
+        let (v, hash) = stored.log.membership().unwrap().config.get(".devsandboxes").copied().expect("a config entry");
+        assert_eq!(v, version);
+        assert!(mesh::bundle_path(base, &hash).is_file(), "the bundle stored");
+        assert_eq!(mesh::bound_root(base, ".devsandboxes").unwrap(), Some(dot.canonicalize().unwrap()));
     }
 
     /// A member file naming its host `name`, in hub `hub` (`""`: none).
@@ -990,7 +1046,10 @@ mod tests {
         let via = format!("{}/broken/../.devsandboxes", pair.home.display());
         let r = pair.add(json!({"hub": false, "target": "me@box", "roots": ["~/.devsandboxes", "~", via]}));
         let fleet = json!({"hub": "lap", "joined": "new"});
-        assert_eq!(r, json!({"name": "box", "roots": [dot, home], "version": "0.6.0", "warning": null, "fleet": fleet, "proposed": null}));
+        assert_eq!(
+            r,
+            json!({"name": "box", "roots": [dot, home], "version": "0.6.0", "warning": null, "fleet": fleet, "proposed": null, "configs": []})
+        );
         assert_eq!(pair.registry(), vec![Entry { roots: vec![dot.clone(), home.clone()], ..Entry::ssh("box", "me@box") }]);
         assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
         // One log on both ends, signed here: `lap` the authority and the
@@ -1073,14 +1132,20 @@ mod tests {
         let (code, _) = pair.add_err(json!({"target": "me@box", "roots": []}));
         assert_eq!(code, "invalid");
         assert!(!pair.base.join("machines.toml").exists(), "nothing saved");
+        let dot = own_config(&pair.base);
         let r = pair.add(json!({"hub": true, "target": "me@box", "roots": []}));
         assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "box", "joined": "new"})));
+        // The fleet's log exists here only since the adopt: signed after it.
+        assert_eq!(r["configs"], json!(["note: signed config `.devsandboxes` v1"]));
+        assert_signed(&pair.base, &dot, 1);
         assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
         assert_eq!(ok(&mut pair.local, "member.get", Value::Null)["hub"], "box");
         // Decision 48: the laptop that made the fleet is its authority, the
         // machine it added the hub.
+        // The machine's log is the one before the sign (its link-up brings
+        // the config entry).
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
-        assert_eq!(here, there);
+        assert_eq!(&here.log.entries()[..2], there.log.entries());
         let m = here.log.membership().unwrap();
         assert_eq!((m.authority.0.as_str(), m.hub.as_str(), m.members.len()), ("lap", "box", 2));
         pair.finish();
@@ -1138,13 +1203,53 @@ mod tests {
         let mut pair = Pair::fleets("mach-join-auth", named("lap", "self"), named("box", ""), |this, _| {
             test_support::write(this, &fleet("lap", &test_support::key_of(this), "lap", &[]));
         });
+        let dot = own_config(&pair.base);
+        // A picked root too, and one that is `~/.devsandboxes` again: once.
+        let picked = pair.base.join("picked");
+        std::fs::create_dir_all(&picked).unwrap();
+        std::fs::write(picked.join(crate::config::CONFIG_FILE), "[sandbox.api]\nimage = \"a\"\n").unwrap();
+        member::write_for_test(
+            &pair.base.join("member.toml"),
+            &Member { roots: vec![picked.clone(), dot.clone()], ..named("lap", "self") },
+        );
         let r = pair.add(json!({"hub": false, "target": "me@box", "roots": []}));
         assert_eq!(r["fleet"], json!({"hub": "lap", "joined": "target"}));
         assert_eq!(r["proposed"], Value::Null, "signed here: nothing to propose");
-        assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
+        assert_eq!(r["configs"], json!(["note: signed config `.devsandboxes` v1", "note: signed config `picked` v1"]));
+        assert_signed(&pair.base, &dot, 1);
+        crate::serve::dts::assert_matches("MachineAdded", &r);
+        let this = Member { roots: vec![picked, dot.clone()], ..named("lap", "self") };
+        assert_eq!((pair.this(), pair.machine()), (this, named("box", "lap")));
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
-        assert_eq!(here, there);
+        assert_eq!(here.log.membership().unwrap().config.get("picked").map(|c| c.0), Some(1));
+        // The machine took the log before the signs: it gets them at its
+        // first link-up (none in this harness).
+        assert_eq!(there.log.membership().unwrap().members, here.log.membership().unwrap().members);
+        assert!(there.log.membership().unwrap().config.is_empty());
         assert_eq!(here.log.membership().unwrap().key_of("box"), Some(pair.machine_key().public_key()));
+
+        // Added again (unlinked first), the roots unchanged: no new version.
+        assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
+        let r = pair.add(json!({"hub": false, "target": "me@box", "roots": []}));
+        assert_eq!(r["fleet"], json!({"hub": "lap", "joined": "same"}));
+        assert_signed(&pair.base, &dot, 1);
+        assert_eq!(pair.logs().0.unwrap().log, here.log, "nothing signed");
+        pair.finish();
+    }
+
+    /// A member of the fleet that isn't its authority signs nothing at an
+    /// add, and says nothing of it.
+    #[test]
+    fn a_member_that_isnt_the_authority_signs_nothing() {
+        let mut pair = Pair::fleets("mach-join-member", named("lap", "self"), named("box", ""), |this, _| {
+            test_support::write(this, &fleet("k", &k_key(), "lap", &[("lap", test_support::key_of(this).public_key())]));
+        });
+        own_config(&pair.base);
+        let r = pair.add(json!({"hub": false, "target": "me@box", "roots": []}));
+        assert_eq!(r["configs"], json!([]));
+        let (Some(here), _) = pair.logs() else { panic!("no log") };
+        assert!(here.log.membership().unwrap().config.is_empty());
+        assert!(!mesh::roots_path(&pair.base).exists(), "nothing bound");
         pair.finish();
     }
 
@@ -1402,7 +1507,7 @@ mod tests {
         assert_matches("MachineProbe", &to_value(probed).unwrap());
         let fleet = Fleet { hub: "k".into(), joined: join::Joined::Target };
         let proposed = super::super::changes::Proposed { name: "m".into(), authority: "lap".into(), id: Some(1), error: None };
-        let added = Added { name: "m".into(), roots: vec!["/cfg".into()], version: "0.6.0".into(), warning: None, fleet, proposed: Some(proposed) };
+        let added = Added { name: "m".into(), roots: vec!["/cfg".into()], version: "0.6.0".into(), warning: None, fleet, proposed: Some(proposed), configs: vec!["note: signed config `cfg` v1".into()] };
         let added = to_value(added).unwrap();
         assert_matches("MachineAdded", &added);
         assert_matches("FleetProposed", &added["proposed"]);

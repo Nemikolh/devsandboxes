@@ -80,7 +80,10 @@ is frozen: no new work on it.
   approved there when typed elsewhere), links unchanged. Config
   versions: a `run`/`rebuild`/`start` typed on the authority signs its
   config root's hash as the root's next `config` version when it
-  changed, and every other member pulls that version's files from the
+  changed (a `machine add` there signs `~/.devsandboxes` and
+  `member.toml`'s `roots` the same way, [ADR
+  0050](decisions/0050-machine-add-on-the-authority-signs-its-configs.md)),
+  and every other member pulls that version's files from the
   peer that gave it the log and installs its own copy under
   `mesh/tree/<name>/`, kept while the authority is offline; that copy
   is one of the member's roots, and a `run`/`rebuild`/`start`/`services

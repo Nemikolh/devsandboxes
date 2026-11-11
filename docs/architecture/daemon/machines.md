@@ -782,9 +782,16 @@ the machine's fleet), this host's registry entry, this host's
 membership (`membership_api::adopt` of the same log, the machine's, or
 the machine's signed answer: it writes `hub` and the name the log knows
 this host by, then `Ctx::hub_changed`, which is
-`daemon::Shared::set_hub` as after a `membership.adopt` call), and the
-links reload. A write that fails after an earlier one says what was
-already written. Each end's name is pinned as it adopts, so a name that
+`daemon::Shared::set_hub` as after a `membership.adopt` call), on the
+authority from a local client this host's configs signed
+(`changes::sign_configs` of `changes::add_roots`: `~/.devsandboxes` and
+`member.toml`'s `roots`; [fleet.md](fleet.md#approvals-and-pushes),
+*Config versions*), and the links reload, so the machine's first link-up
+carries the log with them and it installs them. Each sign's notes are
+the answer's `configs` (``note: signed config `<name>` v<N>``, or why
+not), printed by `machine add` on stderr after its other lines; a
+failed sign never fails the add. A write that fails after an earlier one
+says what was already written. Each end's name is pinned as it adopts, so a name that
 came from the hostname stays the one the fleet knows it by.
 The answer's `fleet` is the
 fleet both ends are in and who joined; the CLI prints it on a line after

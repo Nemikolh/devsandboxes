@@ -77,6 +77,9 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, hu
     if let Some(p) = &added.proposed {
         println!("{}", added_proposal_line(&added.name, p));
     }
+    for note in &added.configs {
+        eprintln!("{note}");
+    }
     if let Some(warning) = added.warning {
         eprintln!("warning: {warning}");
     }

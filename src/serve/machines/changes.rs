@@ -369,9 +369,9 @@ fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiErro
     Ok(Signed { name: change.subject().to_string(), change: what, pushed, unpushed, removed: None, error: None })
 }
 
-/// What a verb typed here did to its config root's version
-/// ([`sign_config`]), for `serve.log` and the verb's own output
-/// ([`ConfigSigned::notes`]). `root` is the root's name in the log (its
+/// What a verb or a `machine add` typed here did to a config root's
+/// version ([`sign_config`], [`sign_configs`]), for `serve.log` and the
+/// verb's own output or the add's `configs` ([`ConfigSigned::notes`]). `root` is the root's name in the log (its
 /// directory's name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSigned {
@@ -555,6 +555,49 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     let (_, unpushed) = ctx.links.as_ref().map(|l| push(l, &taken.stored, None, true)).unwrap_or_default();
     follow(ctx, &taken);
     Some(ConfigSigned::Signed { root: name.into(), version, unpushed })
+}
+
+/// [`sign_config`] of each of `roots`, in order, keeping what's worth
+/// saying: no `None` (no fleet, no config file) and no `NotAuthority` (a
+/// `machine add` on a member that isn't the authority signs nothing, and
+/// says nothing of it). `machine add` on the authority (ADR 0050).
+pub fn sign_configs(ctx: &Ctx, roots: &[PathBuf]) -> Vec<ConfigSigned> {
+    roots
+        .iter()
+        .filter_map(|r| sign_config(ctx, r))
+        .filter(|s| !matches!(s, ConfigSigned::NotAuthority { .. }))
+        .collect()
+}
+
+/// The config roots a `machine add` here signs ([`roots_to_sign`] over
+/// `ctx`'s home, `member.toml`'s `roots` and its data dir). A
+/// `member.toml` that doesn't load picks no roots.
+pub fn add_roots(ctx: &Ctx) -> Vec<PathBuf> {
+    let member = ctx.member.as_deref();
+    let picked = member.and_then(|m| member::load(m).ok().flatten()).map(|m| m.roots).unwrap_or_default();
+    roots_to_sign(ctx.home.as_deref(), &picked, member.and_then(Path::parent))
+}
+
+/// What a `machine add` on the authority signs (fleet driver decision 1):
+/// `~/.devsandboxes` under `home` when it's a directory, then `picked`
+/// (`member.toml`'s `roots`), canonicalized (one that doesn't resolve kept
+/// as given: [`sign_config`] says why), deduplicated in order, less a
+/// signed config's copy under data dir `data` ([`mesh::copy_of`]). Never
+/// `state.toml`'s other config dirs: the first sign binds a root's name
+/// for good ([`mesh::bind`]), so only roots the user put forward are.
+pub fn roots_to_sign(home: Option<&Path>, picked: &[PathBuf], data: Option<&Path>) -> Vec<PathBuf> {
+    let home = home.map(|h| h.join(".devsandboxes")).filter(|d| d.is_dir());
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for root in home.into_iter().chain(picked.iter().cloned()) {
+        if data.is_some_and(|d| mesh::copy_of(d, &root).is_some()) {
+            continue;
+        }
+        let root = root.canonicalize().unwrap_or(root);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 /// Whether `me` (key `key`) can rotate its key in `stored`'s log (pure):
@@ -1407,6 +1450,72 @@ mod tests {
         let inside = tree.join("mcps");
         let (code, message) = verb_answer(&pair.k_dir, "start", json!({"root": inside, "env": {}, "instance": "nope"})).unwrap().unwrap();
         assert!(code == "denied" && message.contains("inside the copy"), "{code}: {message}");
+        pair.finish();
+    }
+
+    /// `~/.devsandboxes` when it's a directory, then the picked roots:
+    /// canonical, once each, never a signed config's copy; a picked root
+    /// that doesn't resolve kept as given.
+    #[test]
+    fn add_signs_the_home_config_and_the_picked_roots() {
+        let base = scratch("changes-add-roots");
+        let (home, data) = (base.join("home"), base.join("data"));
+        let dot = home.join(".devsandboxes");
+        let copy = mesh::tree_path(&data, "cfg");
+        for dir in [&dot, &base.join("picked"), &copy] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let canon = |p: &Path| p.canonicalize().unwrap();
+        let via = base.join("picked/../home/.devsandboxes");
+        let picked = vec![base.join("picked"), via, copy.clone(), base.join("gone")];
+        assert_eq!(
+            super::roots_to_sign(Some(&home), &picked, Some(&data)),
+            [canon(&dot), canon(&base.join("picked")), base.join("gone")]
+        );
+        assert_eq!(super::roots_to_sign(Some(&base), &[], Some(&data)), Vec::<std::path::PathBuf>::new(), "no ~/.devsandboxes");
+        assert_eq!(super::roots_to_sign(None, &[copy.clone()], None), [canon(&copy)], "no data dir: no copies to tell");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// L (`lap`), its fleet's authority and hub, adds K over the add-time
+    /// probe: its `~/.devsandboxes` is signed v1 during the add, and K
+    /// installs it at its first link-up, from the log that link carries.
+    #[test]
+    fn a_machine_the_authority_adds_installs_its_config() {
+        // `Pair::build`'s K: the machine the add-time probe reaches.
+        let k_dir = scratch("changes-add-install").join("k");
+        let pair = Pair::build(
+            "changes-add-install",
+            vec![],
+            |_| {},
+            |o| {
+                crate::serve::machines::update(o.machines.as_ref().unwrap(), Vec::clear).unwrap();
+                o.probe = Some(std::sync::Arc::new(move |_: &Entry| {
+                    crate::serve::machines::ssh::test_support::relayed(endpoint::connect(&k_dir)?)
+                }));
+            },
+            |k, l| {
+                write_for_test(k, &Member { name: "box".into(), ..Default::default() });
+                write_for_test(l, &Member { name: "lap".into(), hub: "self".into(), ..Default::default() });
+                test_support::write(l, &test_support::fleet("lap", &key_of(l), "lap", &[]));
+            },
+        );
+        let dot = pair.base.join("l-home/.devsandboxes");
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::write(dot.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let k_toml = pair.base.join("k-data/member.toml");
+        let key = key_of(&k_toml).public_key();
+        let added = call(&pair.l_dir, "machines.add", json!({"target": "me@box", "hub": false, "roots": [], "key": key})).unwrap();
+        assert_eq!(added["configs"], json!(["note: signed config `.devsandboxes` v1"]));
+        let l_log = test_support::read(&pair.base.join("l-data/member.toml")).unwrap();
+        let (_, hash) = l_log.log.membership().unwrap().config[".devsandboxes"];
+        let k_data = pair.base.join("k-data");
+        wait_for("K installs .devsandboxes v1", Duration::from_secs(10), || {
+            mesh::installed(&k_data).unwrap_or_default().get(".devsandboxes") == Some(&hex::encode(hash))
+        });
+        assert_eq!(mesh::verify(&k_data, ".devsandboxes", Some((1, hash))).map_err(|e| format!("{e:#}")), Ok(()));
+        let tree = mesh::tree_path(&k_data, ".devsandboxes");
+        assert_eq!(std::fs::read_to_string(tree.join("devsandboxes.toml")).unwrap(), "[sandbox.a]\n");
         pair.finish();
     }
 

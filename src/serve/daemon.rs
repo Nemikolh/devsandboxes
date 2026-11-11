@@ -361,6 +361,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         inbound: Arc::clone(&inbound),
         member: shared.member.clone(),
         hostname: shared.hostname.clone(),
+        home: shared.home.clone(),
         // `machines.add` or a leave wrote this host's `hub`: the same
         // follow-up as a `membership.adopt` call's.
         hub_changed: {
@@ -2239,7 +2240,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         },
         method if method.starts_with("machines.") && shared.machines.is_some() => {
             let ctx = shared.machines.as_ref().expect("checked");
-            machines::api::call(method, req.params, ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
+            let local = matches!(conn.table, Table::Full);
+            machines::api::call(method, req.params, ctx, local).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
         }
         method => local_call(method, req.params, shared, conn),
     };
