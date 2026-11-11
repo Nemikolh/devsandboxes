@@ -1,9 +1,9 @@
 //! The fleet's membership log (docs/architecture/daemon/fleet.md,
 //! *Membership log*; fleet plan step 10a, decisions 45, 46, 50, 51): a hash
 //! chain of entries the authority signs, each one [`Op`] (`genesis`, `add`,
-//! `revoke`, `rotate`, `hub`), that [`apply`] verifies into a
-//! [`Membership`]: the members and their keys, the hub, the revoked keys and
-//! the [`Head`]. [`compare`] says how a peer's head stands to ours.
+//! `revoke`, `rotate`, `hub`, `config`), that [`apply`] verifies into a
+//! [`Membership`]: the members and their keys, the hub, the revoked keys,
+//! each config root's signed version and the [`Head`]. [`compare`] says how a peer's head stands to ours.
 //!
 //! Introductions (decision 50) sit outside the chain: a member's signed word
 //! for a key the authority hasn't added yet, checked against the log
@@ -32,6 +32,19 @@ pub const INTRODUCTION_KIND: &str = "introduction";
 /// The domain of a `rotate`'s countersignature by the old key
 /// ([`countersign_rotate`]).
 pub const ROTATE_DOMAIN: &str = "devsandbox/membership-rotate/v1";
+
+/// Where a published config root sits in the tar its [`Op::Config`] hash
+/// is over: fixed, so the hash is the root's contents, not its path.
+pub const CONFIG_AT: &str = "cfg";
+
+/// A config root's name in the log: its directory's name, one path
+/// component (not `.` or `..`), no control characters.
+pub fn check_root_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.chars().any(char::is_control) {
+        bail!("`{}` isn't a directory name", name.escape_debug());
+    }
+    Ok(())
+}
 
 /// The `prev` of the genesis entry, and an empty log's head hash.
 const ZERO: [u8; 32] = [0; 32];
@@ -76,6 +89,16 @@ pub enum Op {
     Rotate { name: String, old: PublicKey, new: PublicKey, by_old: Signature },
     /// The hub is now the member `name`.
     Hub { name: String },
+    /// Config root `root` (its directory's name, [`check_root_name`]) is
+    /// now version `version`, the root packed (`code::pack_root` at
+    /// [`CONFIG_AT`]) hashing to `hash`. Versions only go up, per root: an
+    /// entry can't take a root back to an older one.
+    Config {
+        root: String,
+        version: u64,
+        #[serde(with = "hex32")]
+        hash: [u8; 32],
+    },
 }
 
 impl Op {
@@ -121,6 +144,11 @@ impl Op {
                     put(out, f);
                 }
             }
+            Op::Config { root, version, hash } => {
+                for f in [&b"config"[..], root.as_bytes(), &version.to_be_bytes(), hash] {
+                    put(out, f);
+                }
+            }
         }
     }
 }
@@ -135,6 +163,7 @@ impl fmt::Display for Op {
             Op::Revoke { name, .. } => write!(f, "revoke `{name}`"),
             Op::Rotate { name, .. } => write!(f, "rotate `{name}`'s key"),
             Op::Hub { name } => write!(f, "hub `{name}`"),
+            Op::Config { root, version, hash } => write!(f, "config `{root}` v{version} ({})", short(hash)),
         }
     }
 }
@@ -258,6 +287,8 @@ pub struct Membership {
     /// The genesis entry's hash: which fleet this is. Introductions and
     /// rotations are bound to it.
     pub genesis: [u8; 32],
+    /// Each config root's latest [`Op::Config`]: its version and hash.
+    pub config: BTreeMap<String, (u64, [u8; 32])>,
 }
 
 impl Membership {
@@ -360,6 +391,14 @@ impl Membership {
                 }
                 self.hub = name.clone();
             }
+            Op::Config { root, version, hash } => {
+                check_root_name(root).context("config root")?;
+                let current = self.config.get(root).map_or(0, |(v, _)| *v);
+                if *version <= current {
+                    bail!("config `{root}` version {version} doesn't follow the current one ({current}): versions only go up");
+                }
+                self.config.insert(root.clone(), (*version, *hash));
+            }
         }
         Ok(())
     }
@@ -398,6 +437,7 @@ fn next(before: Option<&Membership>, entry: &Entry) -> Result<Membership> {
                 revoked: BTreeSet::new(),
                 head: Head::EMPTY,
                 genesis: entry.hash(),
+                config: BTreeMap::new(),
             }
         }
         Some(m) => {
@@ -883,14 +923,24 @@ mod tests {
 
     #[test]
     fn tampering_with_any_field_is_refused() {
-        let log = fleet();
+        let mut log = fleet();
+        log.append(Op::Config { root: "cfg".into(), version: 1, hash: [7; 32] }, "lap", &key(1)).unwrap();
         let entries = log.entries().to_vec();
         let mutations: Vec<(&str, Box<dyn Fn(&mut Entry)>)> = vec![
             ("op name", Box::new(|e| match &mut e.op {
-                Op::Genesis { authority: n, .. } | Op::Add { name: n, .. } | Op::Revoke { name: n, .. } | Op::Rotate { name: n, .. } | Op::Hub { name: n } => n.push('x'),
+                Op::Genesis { authority: n, .. } | Op::Add { name: n, .. } | Op::Revoke { name: n, .. } | Op::Rotate { name: n, .. } | Op::Hub { name: n } | Op::Config { root: n, .. } => n.push('x'),
+            })),
+            ("config version", Box::new(|e| match &mut e.op {
+                Op::Config { version, .. } => *version += 1,
+                _ => e.prev[2] ^= 1,
+            })),
+            ("config hash", Box::new(|e| match &mut e.op {
+                Op::Config { hash, .. } => hash[0] ^= 1,
+                _ => e.prev[1] ^= 1,
             })),
             ("op key", Box::new(|e| match &mut e.op {
                 Op::Genesis { key: k, .. } | Op::Add { key: k, .. } | Op::Revoke { key: k, .. } => *k = pk(9),
+                Op::Config { hash, .. } => hash[31] ^= 1,
                 _ => unreachable!(),
             })),
             ("genesis id", Box::new(|e| match &mut e.op {
@@ -934,6 +984,41 @@ mod tests {
             tried += 1;
         }
         assert!(tried > 200, "{tried}");
+    }
+
+    #[test]
+    fn config_versions_only_go_up_per_root_and_only_the_authority_signs() {
+        let mut log = fleet();
+        assert!(log.membership().unwrap().config.is_empty());
+        let config = |root: &str, version, h| Op::Config { root: root.into(), version, hash: [h; 32] };
+        assert!(refused(&log, config("cfg", 0, 1)).contains("doesn't follow the current one (0)"));
+        log.append(config("cfg", 1, 1), "lap", &key(1)).unwrap();
+        log.append(config("cfg", 3, 2), "lap", &key(1)).unwrap();
+        let latest = BTreeMap::from([("cfg".to_string(), (3, [2; 32]))]);
+        assert_eq!(log.membership().unwrap().config, latest);
+        for v in [3, 2] {
+            let e = refused(&log, config("cfg", v, 9));
+            assert!(e.contains("versions only go up") && e.contains("membership entry 5"), "{e}");
+        }
+        for bad in ["", ".", "..", "a/b", "a\nb"] {
+            assert!(refused(&log, config(bad, 9, 9)).contains("isn't a directory name"), "{bad:?}");
+        }
+        assert_eq!(apply(log.entries()).unwrap().config, latest);
+        // Another root has its own versions.
+        let mut two = log.clone();
+        two.append(config("other", 1, 5), "lap", &key(1)).unwrap();
+        assert_eq!(two.membership().unwrap().config.get("other"), Some(&(1, [5; 32])));
+        assert_eq!(two.membership().unwrap().config.get("cfg"), Some(&(3, [2; 32])));
+        let h = log.head();
+        let by_box = Entry::sign(h.len, h.hash, config("cfg", 4, 3), "box", &key(2));
+        let mut l = log.clone();
+        assert!(format!("{:#}", l.extend(vec![by_box]).unwrap_err()).contains("not the authority `lap`"));
+        assert_eq!(l, log);
+        // Behind takes the later entries, the version with them.
+        let mut behind = fleet();
+        behind.extend(log.entries_after(3).to_vec()).unwrap();
+        assert_eq!(behind.membership().unwrap().config, latest);
+        assert_eq!(config("cfg", 3, 2).to_string(), format!("config `cfg` v3 ({})", hex::encode([2; 6])));
     }
 
     #[test]
@@ -1175,6 +1260,10 @@ mod tests {
         assert_eq!(serde_json::from_value::<Op>(w).unwrap(), rot);
         assert_eq!(serde_json::to_value(Op::Hub { name: "pi".into() }).unwrap(), json!({"op": "hub", "name": "pi"}));
         assert!(serde_json::from_value::<Op>(json!({"op": "promote", "name": "pi"})).is_err());
+        let config = json!({"op": "config", "root": "cfg", "version": 2, "hash": "ab".repeat(32)});
+        let op = Op::Config { root: "cfg".into(), version: 2, hash: [0xab; 32] };
+        assert_eq!(serde_json::to_value(&op).unwrap(), config);
+        assert_eq!(serde_json::from_value::<Op>(config).unwrap(), op);
         let head = log.head();
         let head_wire = json!({"len": 3, "hash": hex::encode(head.hash), "genesis": hex::encode(log.entries()[0].hash())});
         assert_eq!(serde_json::to_value(head).unwrap(), head_wire);

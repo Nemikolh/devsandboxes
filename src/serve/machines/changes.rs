@@ -35,7 +35,13 @@
 //!   onward push and its answer (`After::Hub`). Cycling first would cut
 //!   the links carrying it; a host it misses learns it at its next link's
 //!   proof (`fleet::proof::hub_moved`).
+//! - **Config versions.** A `run`/`rebuild`/`start` typed on the
+//!   authority ([`sign_config`], called by `serve::daemon`'s verb path)
+//!   first signs its config root's hash as the root's next `config`
+//!   version when it differs from the latest, and pushes it. Never
+//!   proposed: only the authority's own verbs sign.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +53,10 @@ use super::service::Handle;
 use crate::serve::api::{ApiError, parse};
 use crate::serve::fleet::identity::{FileKeyStore, KeyStore, PublicKey, Signer, SigningKey};
 use crate::serve::fleet::member::{self, Hub};
-use crate::serve::fleet::membership::{Op, Stored, Wire, countersign_rotate};
+use sha2::{Digest, Sha256};
+
+use crate::serve::fleet::code;
+use crate::serve::fleet::membership::{self, CONFIG_AT, Op, Stored, Wire, countersign_rotate};
 use crate::serve::fleet::membership_api;
 use crate::serve::fleet::proposals::{self, Change, Proposal};
 
@@ -324,6 +333,69 @@ fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiErro
     let what = op.to_string();
     let (_, pushed, unpushed) = sign_and_push(ctx, &me, stored, op)?;
     Ok(Signed { name: change.subject().to_string(), change: what, pushed, unpushed, removed: None, error: None })
+}
+
+/// What a verb typed on the authority did to its config root's version
+/// ([`sign_config`]): the `config.signed` notification's params but
+/// `request`. Signed: `version` and `hash`; not: `error`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSigned {
+    /// The root's name in the log (its directory's name).
+    pub root: String,
+    pub version: Option<u64>,
+    /// sha256 of the packed root, 64 hex.
+    pub hash: Option<String>,
+    pub pushed: Vec<String>,
+    pub unpushed: Vec<Missed>,
+    pub error: Option<String>,
+}
+
+impl ConfigSigned {
+    fn failed(root: &str, error: String) -> ConfigSigned {
+        ConfigSigned { root: root.into(), version: None, hash: None, pushed: Vec::new(), unpushed: Vec::new(), error: Some(error) }
+    }
+}
+
+/// Before a `run`/`rebuild`/`start` typed here: config root `root`
+/// (absolute) packed (`code::pack_root` at [`CONFIG_AT`]) and, when its
+/// sha256 isn't the root's latest `config` entry's, signed as the next
+/// version (1 for the first) and pushed. `None`, nothing packed: this
+/// host isn't the authority of a fleet, or `root` holds no config file
+/// (the verb says why). `None` too when the hash is the latest's.
+pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
+    let path = leave::member_toml(ctx).ok()?;
+    let (me, key) = membership_api::own(path, &ctx.hostname).ok()?;
+    let stored = membership_api::load(path).ok()??;
+    stored.log.membership()?;
+    if leave::authority_of(Some(&stored), &me, &key.public_key()) != Authority::This {
+        return None;
+    }
+    crate::config::find(root).ok()??;
+    let name = root.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if let Err(e) = membership::check_root_name(name) {
+        return Some(ConfigSigned::failed(name, format!("config root {}: {e:#}", root.display())));
+    }
+    let tar = match code::pack_root(root, Path::new(CONFIG_AT)) {
+        Ok(tar) => tar,
+        Err(e) => return Some(ConfigSigned::failed(name, format!("{e:#}"))),
+    };
+    let hash: [u8; 32] = Sha256::digest(&tar).into();
+    let current = stored.log.membership().expect("checked").config.get(name).copied();
+    if current.is_some_and(|(_, h)| h == hash) {
+        return None;
+    }
+    let version = current.map_or(1, |(v, _)| v + 1);
+    match sign_and_push(ctx, &me, stored, Op::Config { root: name.into(), version, hash }) {
+        Ok((_, pushed, unpushed)) => Some(ConfigSigned {
+            root: name.into(),
+            version: Some(version),
+            hash: Some(hex::encode(hash)),
+            pushed,
+            unpushed,
+            error: None,
+        }),
+        Err(e) => Some(ConfigSigned::failed(name, e.message)),
+    }
 }
 
 /// Whether `me` (key `key`) can rotate its key in `stored`'s log (pure):
@@ -794,6 +866,63 @@ mod tests {
         assert!(k_log.log.revoked_name("yan"));
         assert_eq!(k_log.log.entries().last().unwrap().statement.key, new, "signed with the new key");
         assert_eq!(k_log.log.head(), test_support::read(&l_toml).unwrap().log.head());
+        pair.finish();
+    }
+
+    /// A verb `method` with `params` on the daemon at `dir`: the
+    /// `config.signed` notes it sent, and whether it was answered.
+    fn verb_notes(dir: &Path, method: &str, params: Value) -> (Vec<Value>, bool) {
+        let mut notes = Vec::new();
+        let r = connect(dir)
+            .call_streaming(method, params, Duration::from_secs(1), &mut |n| {
+                if let Some(n) = n.filter(|n| n.method == "config.signed") {
+                    notes.push(n.params.clone());
+                }
+                true
+            })
+            .unwrap();
+        (notes, matches!(r, crate::serve::client::Streamed::Answer(_)))
+    }
+
+    /// `lap` (L), the authority: a `start` typed there signs its root's
+    /// `config` v1 first and pushes it to K (`box`); the same contents sign
+    /// nothing; an edit is v2, signed by a `rebuild` as by `start`. A root that won't pack is said, the verb answered anyway. K's
+    /// verbs (not the authority) and `stop` sign nothing.
+    #[test]
+    fn the_authoritys_verbs_sign_config_versions() {
+        let pair = pair("changes-config", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
+        up(&pair);
+        let (k_toml, l_toml) = (pair.base.join("k-data/member.toml"), pair.base.join("l-data/member.toml"));
+        let root = pair.base.join("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let params = json!({"root": root, "env": {}, "instance": "nope"});
+        let config = |toml: &Path| test_support::read(toml).unwrap().log.membership().unwrap().config.get("cfg").map(|(v, h)| (*v, hex::encode(h)));
+
+        let (notes, answered) = verb_notes(&pair.l_dir, "start", params.clone());
+        assert!(answered);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        crate::serve::dts::assert_matches("ConfigSigned", &notes[0]);
+        let n = &notes[0];
+        assert_eq!((&n["root"], &n["version"], &n["pushed"], &n["unpushed"], &n["error"]), (&json!("cfg"), &json!(1), &json!(["box"]), &json!([]), &Value::Null));
+        assert!(n["request"].is_u64(), "{n}");
+        let v1 = Some((1, n["hash"].as_str().unwrap().to_string()));
+        assert_eq!((config(&l_toml), config(&k_toml)), (v1.clone(), v1.clone()), "signed and pushed");
+
+        assert!(verb_notes(&pair.l_dir, "start", params.clone()).0.is_empty(), "unchanged: nothing signed");
+        assert!(verb_notes(&pair.l_dir, "stop", params.clone()).0.is_empty(), "stop never signs");
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.b]\n").unwrap();
+        assert!(verb_notes(&pair.k_dir, "start", params.clone()).0.is_empty(), "K isn't the authority");
+        let (notes, _) = verb_notes(&pair.l_dir, "rebuild", json!({"root": root, "env": {}, "instance": "nope"}));
+        assert_eq!((notes.len(), &notes[0]["version"]), (1, &json!(2)));
+        assert_eq!(config(&k_toml).unwrap().0, 2);
+
+        std::os::unix::fs::symlink("../elsewhere", root.join("out")).unwrap();
+        let (notes, answered) = verb_notes(&pair.l_dir, "start", params);
+        assert!(answered, "the verb runs anyway");
+        assert_eq!((notes.len(), &notes[0]["version"]), (1, &Value::Null));
+        assert!(notes[0]["error"].as_str().is_some_and(|e| !e.is_empty()), "{notes:?}");
+        assert_eq!(config(&l_toml).unwrap().0, 2, "nothing signed");
         pair.finish();
     }
 

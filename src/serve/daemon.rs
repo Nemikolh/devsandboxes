@@ -2587,6 +2587,9 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
         }
         Ok(None) => {}
     }
+    if matches!(method, "run" | "rebuild" | "start") && matches!(conn.table, Table::Full) {
+        sign_config(id, &params, shared, conn);
+    }
     if method == "run"
         && let Some(answer) = placed_run(id, &params, shared, conn)
     {
@@ -2610,6 +2613,26 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
         }
         verbs::Outcome::Gone => None,
     }
+}
+
+/// A local `run`/`rebuild`/`start` on the fleet's authority: its config
+/// root's version signed first when the root changed
+/// (`changes::sign_config`), said to the client as `config.signed` and
+/// logged. Best effort: the verb runs whatever this does.
+fn sign_config(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState) {
+    let (Some(ctx), Some(root)) = (shared.machines.as_ref(), params["root"].as_str().map(Path::new)) else { return };
+    if !root.is_absolute() {
+        return;
+    }
+    let Some(signed) = machines::changes::sign_config(ctx, root) else { return };
+    match (&signed.error, signed.version) {
+        (Some(e), _) => log(&format!("{}: config `{}` not signed: {e}", conn.label(), signed.root)),
+        (None, Some(v)) => log(&format!("{}: signed config `{}` v{v}", conn.label(), signed.root)),
+        (None, None) => {}
+    }
+    let Ok(mut params) = serde_json::to_value(&signed) else { return };
+    params["request"] = json!(id);
+    let _ = conn.out.send(&Notification { method: "config.signed".into(), params });
 }
 
 /// `helper.call` (`serve::helper`): held on this connection like a verb,

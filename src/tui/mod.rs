@@ -828,6 +828,17 @@ fn verb_end(action: &PromptAction, sent: Result<crate::serve::client::Streamed>)
     VerbEnd::Done { status, failed }
 }
 
+/// `end`'s status line led by what the verb's `config.signed` note said
+/// (`signed config v7 (sha256:…)`), if it sent one.
+fn with_config(end: VerbEnd, config: &[String]) -> VerbEnd {
+    match end {
+        VerbEnd::Done { status, failed } if !config.is_empty() => {
+            VerbEnd::Done { status: format!("{}; {status}", config.join("; ")), failed }
+        }
+        end => end,
+    }
+}
+
 /// The status line (and whether it's a failure) for a verb request's end:
 /// the detached answer names the instance and where its build log is; a
 /// held verb's says what it did. A `failed` verb quotes its error; a build
@@ -907,11 +918,19 @@ fn spawn_verb(
     std::thread::spawn(move || {
         use crate::serve::{client, endpoint, verbs_client};
         let env = verbs_client::caller_env(std::env::vars_os());
+        let mut config = Vec::new();
         let sent = routed_verb_call(&action, &root, &route, env, tty).and_then(|(method, params)| {
             let mut conn = endpoint::socket_dir().and_then(|socket| client::connect(&socket, "tui"))?;
-            conn.call_streaming(method, params, Duration::from_secs(1), &mut |_| true)
+            conn.call_streaming(method, params, Duration::from_secs(1), &mut |note| {
+                if let Some(n) = note.filter(|n| n.method == "config.signed")
+                    && let Ok(signed) = serde_json::from_value(n.params.clone())
+                {
+                    config.extend(verbs_client::config_signed_lines(&signed));
+                }
+                true
+            })
         });
-        let _ = tx.send(verb_end(&action, sent));
+        let _ = tx.send(with_config(verb_end(&action, sent), &config));
     });
     rx
 }
@@ -1194,5 +1213,12 @@ mod tests {
         );
         let ok = Ok(Streamed::Answer(Response { id: Some(1), result: Some(json!({"instance": "web-2", "exit": 0})), error: None }));
         assert_eq!(verb_end(&rm(None), ok), VerbEnd::Done { status: "removed web-2".into(), failed: false });
+        let done = || VerbEnd::Done { status: "started web-2".into(), failed: false };
+        assert_eq!(with_config(done(), &[]), done());
+        assert_eq!(
+            with_config(done(), &["signed config v7 (sha256:abcdef012345)".into()]),
+            VerbEnd::Done { status: "signed config v7 (sha256:abcdef012345); started web-2".into(), failed: false }
+        );
+        assert_eq!(with_config(VerbEnd::Confirm(q.into()), &["x".into()]), VerbEnd::Confirm(q.into()));
     }
 }

@@ -73,7 +73,11 @@ is frozen: no new work on it.
   access is a per-member grant (`machine set <m> agent on`), carried to
   a granted member over any path. Hub swap (step 11): `machine hub <m>`
   moves the role by a `hub` entry the authority signs (proposed and
-  approved there when typed elsewhere), links unchanged. Transfer v1
+  approved there when typed elsewhere), links unchanged. Config
+  versions: a `run`/`rebuild`/`start` typed on the authority signs its
+  config root's hash as the root's next `config` version when it
+  changed; nothing reads it yet (no member fetches or checks its root
+  against it). Transfer v1
   (step 12): a placed run's folders move from their own checkouts with
   a WIP snapshot, no remote needed, into per-repo caches on the worker
   (repeat sends carry only the delta) and on the hub, and `devsandbox

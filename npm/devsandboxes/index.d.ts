@@ -1288,8 +1288,18 @@ export interface MembershipHub extends MembershipEntryBase {
   name: string;
 }
 
+/** Config root `root` is now `version` (only ever higher, per root), its packed root hashing to `hash`. @experimental */
+export interface MembershipConfig extends MembershipEntryBase {
+  op: 'config';
+  /** The config root's directory name. */
+  root: string;
+  version: number;
+  /** sha256 of the packed root, 64 lowercase hex. */
+  hash: string;
+}
+
 /** One entry of the membership log, a hash chain the fleet's authority signs. @experimental */
-export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipHub;
+export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipHub | MembershipConfig;
 
 /** A member's signed word for a key the authority hasn't added: capped until it does. @experimental */
 export interface MembershipIntroduction {
@@ -1661,6 +1671,26 @@ export interface VerbFailedData {
   instance: string | null;
 }
 
+/**
+ * `config.signed` params: before a local `run`/`rebuild`/`start` on the fleet's authority, its config root
+ * changed since the root's latest `config` entry, so the next version was signed and pushed (`version`, `hash`),
+ * or wasn't (`error`; the verb runs anyway). Not sent when nothing changed or off the authority. @experimental
+ */
+export interface ConfigSigned {
+  /** The verb request's id. */
+  request: number;
+  /** The config root's directory name, as the log names it. */
+  root: string;
+  version: number | null;
+  /** sha256 of the packed root, 64 lowercase hex. */
+  hash: string | null;
+  /** The machines the push reached. */
+  pushed: string[];
+  /** Those it didn't: they catch up on their next link. */
+  unpushed: FleetMissed[];
+  error: string | null;
+}
+
 /** `output` params: a chunk of a verb's stdout or stderr. */
 export interface VerbOutput {
   /** The verb request's id. */
@@ -1713,6 +1743,8 @@ export interface ApiEvents {
   output: VerbOutput;
   /** A verb request's phase change; sent to its connection, no `subscribe` needed. */
   progress: VerbProgress;
+  /** A `run`/`rebuild`/`start` on the fleet's authority signed its config root's next version first, or failed to; sent to its connection. */
+  'config.signed': ConfigSigned;
   closing: Closing;
   /** Every notification, including ones this package doesn't know yet. */
   notification: ApiNotification;

@@ -1782,8 +1782,14 @@ hash chain of entries only the authority signs
   signing is deterministic and a fleet one authority makes again with the
   same hub would otherwise have the same genesis, the same fleet to a
   member holding the first one's log), `add {name, key}`,
-  `revoke {name, key}`, `rotate {name, old, new, by_old}` and `hub
-  {name}`. `rotate`'s `by_old` is the old key's signature
+  `revoke {name, key}`, `rotate {name, old, new, by_old}`, `hub
+  {name}` and `config {root, version, hash}` (a config root's version:
+  `root` its directory's name (`membership::check_root_name`), `hash` the
+  sha256 of the root packed by `code::pack_root` at
+  `membership::CONFIG_AT`, a fixed name, so the hash is the root's
+  contents, not where it is; `version` 8 bytes big-endian in the
+  payload).
+  `rotate`'s `by_old` is the old key's signature
   (`countersign_rotate`, in `ROTATE_DOMAIN`) over the fleet's genesis
   hash, the name and the new key, so the authority's key alone can't
   swap a member's.
@@ -1798,9 +1804,12 @@ hash chain of entries only the authority signs
   `by_old`, and a `new` neither revoked nor in use, and revokes `old`;
   `hub` names a current member (never an introduced one): `devsandbox
   machine hub <m>` signs it ([Approvals and
-  pushes](#approvals-and-pushes)). The result, `Membership`: the authority
-  (name and key), the hub, the members and their keys, the revoked keys,
-  the head and the genesis hash (which fleet this is).
+  pushes](#approvals-and-pushes)); `config` needs a `version` above its
+  root's current one (none: 0), so a log never takes a root back. The
+  result, `Membership`: the authority (name and key), the hub, the
+  members and their keys, the revoked keys, each root's latest config
+  version and hash (`config`), the head and the genesis hash (which
+  fleet this is).
   `membership::hub_for` is what this host's `member.toml` `hub` reads as
   from it (`self` when the log's hub is this host).
 - **The log** (`Log`) is kept verified: `Log::append` signs the next
@@ -1923,6 +1932,20 @@ it never signs on a remote request alone (decision 49;
   be the hub) and isn't the hub already (`invalid` otherwise: nothing to
   sign); only a member by its key asks (a capped host is `denied`). `m`
   needn't be reachable, so a dead hub can be replaced.
+- **Config versions.** The verbs typed on the authority sign them, the
+  consent a local edit already takes effect by: a `run`, `rebuild` or
+  `start` from a local client (the CLI, the dashboard; `Table::Full`, no
+  `machine`) first packs its config root, and when the hash isn't the
+  root's latest `config` entry's, signs the next version (1 for the
+  first) and pushes it like any change (`daemon::sign_config` over
+  `changes::sign_config`). The client gets a `config.signed`
+  notification (the CLI prints `signed config v7 (sha256:…)`, the
+  dashboard leads the verb's status line with it), `serve.log` a line.
+  A root that won't pack or a store that fails is said the same way
+  (`error`) and the verb runs anyway. Nothing is packed off the
+  authority or in no fleet; a verb from a link peer, one sent to a
+  machine, `--in-process` ones (the dispatcher's, the in-process
+  fallback) and the autostart pass never sign. Never proposed.
 - **Following a hub change** (decision 69). A host follows a hub change
   (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
   both ends redial saying it) only once the change has left it: cycling
