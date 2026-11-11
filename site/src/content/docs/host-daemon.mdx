@@ -48,10 +48,16 @@ A config can belong to all your machines instead of the one it was written on, s
 
 To run a config written on your desktop on a server `box`, driven from your laptop, in this order:
 
-1. On the desktop: `devsandbox machine add box`.
-2. On the desktop: any `run`, `rebuild` or `start` on the root. Its output starts with `note: signed config` and the version, or a `note:` naming a machine that didn't get it and why. `box`'s `serve.log` says `installed config` once it has the copy.
-3. On `box`: clone what the config's relative `folder` and `folders` point at, next to the copy. `folders = { "/workspaces/multipass" = "../stackblitz/multipass" }` needs `~/.local/share/devsandbox/mesh/tree/stackblitz/multipass`; a symlink to a clone elsewhere works, and a missing one refuses the `run`. Add what the config reads from the host: ignored files it links in (`worktree-link`), `${localEnv:…}` variables and a reachable runtime (rootless docker: `XDG_RUNTIME_DIR`) in that daemon's environment.
-4. On the laptop: `devsandbox machine add box`. Its copies show up as `box`'s roots on their own, even one installed after the add: `devsandbox run box/<sandbox>`.
+1. Install the same devsandbox release on all three machines. `machine add` only compares version numbers, and every machine must understand the signed config entries.
+2. On the desktop: `devsandbox machine add box --hub`. The desktop becomes the authority. `--hub` makes the always-on `box` the hub, since a hub that's offline can only be replaced while the authority is up.
+3. On the desktop: any `run`, `rebuild` or `start` on the root (one aimed at `box`, such as `run box/<sandbox>`, works too). Its output starts with `note: signed config` and the version. A `note:` naming a machine means that machine doesn't have it yet; it says why. Fix the cause and run any verb on the root again: an unchanged config is sent again. The dashboard doesn't show these notes; use the CLI. With no such note, `box` has installed the copy and the desktop can go offline.
+4. On `box`:
+   - `devsandbox serve install`, so its daemon runs without a login (needed by `autostart = "runtime"`).
+   - Clone what the config's relative `folder` and `folders` point at, next to the copy. `folders = { "/workspaces/multipass" = "../stackblitz/multipass" }` needs `~/.local/share/devsandbox/mesh/tree/stackblitz/multipass`. A symlink to a clone elsewhere works; a missing one refuses the `run`.
+   - Copy into the copy what the config only reaches through a command (a script a `postStartCommand` runs, its `node_modules`): those files aren't signed or sent. Files added outside build contexts and local features are allowed.
+   - Add what the config reads from the host: ignored files it links in (`worktree-link`), `${localEnv:…}` variables, and a reachable runtime (rootless docker: `XDG_RUNTIME_DIR`) in that daemon's environment.
+   - `shared-volumes/` starts empty on `box`, so log in again to whatever keeps its credentials there.
+5. On the laptop: `devsandbox machine add box`. Its copies show up as `box`'s roots on their own, even one installed after the add: `devsandbox run box/<sandbox>`.
 
 ## Start it at login
 
