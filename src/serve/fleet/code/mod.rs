@@ -437,7 +437,7 @@ pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<Vec<String>> {
 /// worker policy with no allowances would refuse, over the config root and
 /// the folders that move with it (`folder`, `folders` outside the root) as
 /// the only paths that travel. From the config ([`Policy::config_refusals`]:
-/// `initializeCommand`, `caches`, `privileged`, global services,
+/// `initializeCommand`, `privileged`, global services,
 /// `${localEnv:…}`, …) and each `mounts` bind ([`Policy::check_bind`]:
 /// sources outside those paths, `${sharedVolumes}` ones, which never travel
 /// ([`ROOT_SKIPS`]), runtime sockets) and each `build` context or
@@ -1259,6 +1259,7 @@ mod tests {
         assert_eq!(ties_of_toml("placement = \"home\""), ["`placement = \"home\"`"]);
         assert_eq!(ties_of_toml("privileged = true\nplacement = \"home\""), ["`placement = \"home\"`", "privileged"]);
         assert_eq!(ties_of_toml(""), Vec::<String>::new());
+        assert_eq!(ties_of_toml("caches = [\"cargo\"]"), Vec::<String>::new());
         let out = dir.join("elsewhere").display().to_string();
         for (extra, want) in [
             (format!("mounts = [\"source={out},target=/o\"]"), format!("bind mount of `{out}` (outside the config root)")),
@@ -1271,7 +1272,6 @@ mod tests {
                 "runtime socket mount `/var/run/docker.sock`".into(),
             ),
             ("containerEnv = { T = \"${localEnv:X}\" }".into(), "`${localEnv:X}` (this host's env)".into()),
-            ("caches = [\"cargo\"]".into(), "`caches`".into()),
             ("privileged = true".into(), "privileged".into()),
             ("initializeCommand = \"true\"".into(), "`initializeCommand`".into()),
             ("services = [\"i\", \"g\"]".into(), "global service `g`".into()),
@@ -1280,13 +1280,12 @@ mod tests {
         }
         // All of them, a `${localEnv:…}` mount counted once, as its variable.
         let all = ties_of_toml(&format!(
-            "privileged = true\ncaches = [\"cargo\"]\nmounts = [\"source=${{localEnv:HOME}}/.gh,target=/g\", \"source={out},target=/o\"]"
+            "privileged = true\nmounts = [\"source=${{localEnv:HOME}}/.gh,target=/g\", \"source={out},target=/o\"]"
         ));
         assert_eq!(
             all,
             [
-                "`caches`".to_string(),
-                "privileged".into(),
+                "privileged".to_string(),
                 "`${localEnv:HOME}` (this host's env)".into(),
                 format!("bind mount of `{out}` (outside the config root)"),
             ]
@@ -1298,13 +1297,13 @@ mod tests {
     fn offer_refuses_a_tied_sandbox() {
         let dir = scratch("offer-tied");
         let cfg = fixture(&dir);
-        std::fs::write(cfg.join("devsandboxes.toml"), "[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\nprivileged = true\ncaches = [\"npm\"]\n")
+        std::fs::write(cfg.join("devsandboxes.toml"), "[sandbox.web]\nfolder = \"../web\"\nimage = \"i\"\ninitializeCommand = \"true\"\nprivileged = true\n")
             .unwrap();
         match offer(&cfg, "web", None) {
-            Err(Unprepared::NotMovable(why)) => assert_eq!(why, "`caches`, privileged"),
+            Err(Unprepared::NotMovable(why)) => assert_eq!(why, "`initializeCommand`, privileged"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(ties_of(&cfg, "web").unwrap(), ["`caches`", "privileged"]);
+        assert_eq!(ties_of(&cfg, "web").unwrap(), ["`initializeCommand`", "privileged"]);
         assert!(ties_of(&cfg, "nope").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

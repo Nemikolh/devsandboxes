@@ -60,9 +60,6 @@ pub struct Allow {
     /// `--network host` (`run` or `build`).
     #[serde(skip_serializing_if = "is_false")]
     pub host_network: bool,
-    /// `caches`.
-    #[serde(skip_serializing_if = "is_false")]
-    pub caches: bool,
     /// Binds under a config root's `shared-volumes/` (`${sharedVolumes}`
     /// mounts, `persist-shell-history`).
     #[serde(skip_serializing_if = "is_false")]
@@ -278,7 +275,7 @@ impl Policy {
 
     /// What the resolved sandbox `sandbox` of `config` (at `dir`) declares
     /// that never shows in a container's argv or is done on the host before
-    /// one: `initializeCommand`, `dispatcher`, `inbox`, `caches`,
+    /// one: `initializeCommand`, `dispatcher`, `inbox`,
     /// `persist-shell-history`, `worktree-link`, `privileged`, `global`
     /// services, local features outside the fleet root (or with a file
     /// resolving outside it), and `${localEnv:NAME}` in the merged sandbox
@@ -301,7 +298,6 @@ impl Policy {
             (props.initialize_command.is_some(), a.initialize_command, "`initializeCommand`", "initialize-command"),
             (props.dispatcher.is_some(), a.dispatcher, "`dispatcher`", "dispatcher"),
             (props.inbox == Some(true), a.inbox, "`inbox`", "inbox"),
-            (props.caches.as_ref().is_some_and(|c| !c.is_empty()), a.caches, "`caches`", "caches"),
             (props.persist_shell_history == Some(true), a.shared_volumes, "`persist-shell-history`", "shared-volumes"),
             (props.worktree_link.as_ref().is_some_and(|l| !l.is_empty()), a.worktree_link, "`worktree-link`", "worktree-link"),
             (props.privileged == Some(true), a.privileged, "privileged", "privileged"),
@@ -400,9 +396,10 @@ impl Policy {
 
     /// A bind's host source: a runtime socket (by name, as one of
     /// [`Self::sockets`], or a dir holding one) needs `runtime-socket`;
-    /// under the fleet root, a `shared-volumes` dir needs `caches` (a cache's
-    /// dir) or `shared-volumes`, a `shared-files` dir `worktree-link`;
-    /// anything else must pass [`Self::check_path`].
+    /// under the fleet root, a `shared-volumes` dir needs `shared-volumes`
+    /// unless it's a cache's (always fine: it lives under the fleet root and
+    /// holds only what the placed sandboxes download), a `shared-files` dir
+    /// `worktree-link`; anything else must pass [`Self::check_path`].
     pub fn check_bind(&self, source: &str) -> Result<(), Refusal> {
         let path = Path::new(source);
         let what = "bind mount of";
@@ -426,9 +423,6 @@ impl Policy {
                         .iter()
                         .any(|c| crate::config::known_cache(c).is_some_and(|(dir, ..)| dir == *sub))
                 });
-                if cache && !self.allow.caches && !self.allow.shared_volumes {
-                    return Err(Refusal::new(format!("cache mount `{source}` (`caches`)"), "caches = true"));
-                }
                 if !cache && !self.allow.shared_volumes {
                     return Err(Refusal::new(format!("shared-volumes mount `{source}`"), "shared-volumes = true"));
                 }
@@ -915,6 +909,7 @@ mod tests {
             vec!["-v".into(), ws.clone()],
             vec!["-v".into(), format!("{ws}:ro,z")],
             vec!["-v".into(), "named:/data".into()],
+            vec!["--mount".into(), format!("type=bind,source={},target=/c", sv.join("cargo").display())],
             vec!["--mount".into(), format!("type=bind,source={inside_s},target=/x,readonly")],
             vec!["--mount".into(), format!("type=bind,source={inside_s}/new/dir,target=/x,relabel=shared")],
             vec!["--mount".into(), "type=volume,source=devsandbox-x-cache,target=/c".into()],
@@ -939,7 +934,6 @@ mod tests {
                 privileged: true,
                 runtime_socket: true,
                 host_network: true,
-                caches: true,
                 shared_volumes: true,
                 worktree_link: true,
                 global_services: true,
@@ -983,14 +977,6 @@ mod tests {
             (argv(&["--publish=0.0.0.0:8080:80"]), "publish = true", None),
             (argv(&["-p", "[::]:8080:80"]), "publish = true", None),
             (argv(&["-p", "192.168.1.2:8080:80"]), "publish = true", None),
-            (
-                vec!["--mount".into(), format!("type=bind,source={},target=/c", sv.join("cargo").display())],
-                "caches = true",
-                Some((|a| a.caches = true, |a| {
-                    a.caches = false;
-                    a.shared_volumes = false;
-                })),
-            ),
             (
                 vec!["--mount".into(), format!("type=bind,source={},target=/h", sv.join("history/x").display())],
                 "shared-volumes = true",
@@ -1110,17 +1096,17 @@ mod tests {
             "",
             "services = [\"i\"]",
             "privileged = false",
+            "caches = [\"cargo\"]",
             "features = { \"./features/ok\" = {} }",
             "features = { \"ghcr.io/devcontainers/features/node:1\" = {} }",
             "mounts = [\"source=/etc,target=/e\"]", // a bind: the mounts' own check
         ] {
             assert_eq!(check(&none, fine), Ok(()), "{fine}");
         }
-        let items: [(&str, &str, fn(&mut Allow)); 9] = [
+        let items: [(&str, &str, fn(&mut Allow)); 8] = [
             ("initializeCommand = \"true\"", "initialize-command = true", |a| a.initialize_command = true),
             ("dispatcher = {}", "dispatcher = true", |a| a.dispatcher = true),
             ("inbox = true", "inbox = true", |a| a.inbox = true),
-            ("caches = [\"cargo\"]", "caches = true", |a| a.caches = true),
             ("persist-shell-history = true", "shared-volumes = true", |a| a.shared_volumes = true),
             ("worktree-link = [\".env\"]", "worktree-link = true", |a| a.worktree_link = true),
             ("privileged = true", "privileged = true", |a| a.privileged = true),

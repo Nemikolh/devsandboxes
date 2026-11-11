@@ -23,7 +23,7 @@ rewritten for the orchestrator
 is frozen: no new work on it.
 
 - **helper**: `exec` sessions after fleet step 1: surfacing detached
-  sessions beyond the procs-fetched rows (maybe an Inbox note), a policy
+  sessions beyond the procs-fetched rows (not through the Inbox), a policy
   for sessions nobody reattaches to (`devsbd/src/sessions.rs`).
   → [plan](plans/active/resumable-exec.md)
 
@@ -591,7 +591,7 @@ is frozen: no new work on it.
   merge) no longer matches the placed repo and is refused.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::fetch`
 - What ties a sandbox to its host (a bind outside the config root and its
-  moved folders, `${localEnv:…}`, `caches`, `privileged`, …) keeps it
+  moved folders, `${localEnv:…}`, `privileged`, …) keeps it
   home whatever a worker's trust or `member.toml` allowances: nothing
   checks whether another host could satisfy it until named host
   resources (fleet plan decision 41). X11 has no check of its own beyond

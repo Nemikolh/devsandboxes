@@ -784,7 +784,7 @@ Then what's inferred: what a [worker policy](#worker-policy) with no allowances 
 refuse, with the config root and the folders that move with it
 (`folder`, `folders` entries outside the root) as the only paths that
 travel. From the config, every `worker_policy::Policy::config_refusals`
-item (`initializeCommand`, `dispatcher`, `inbox`, `caches`,
+item (`initializeCommand`, `dispatcher`, `inbox`,
 `persist-shell-history`, `worktree-link`, `privileged`, `global`
 services, local features outside those paths, each `${localEnv:NAME}`
 in the merged sandbox or its services); from each `mounts` bind (its
@@ -796,7 +796,7 @@ travel, `ROOT_SKIPS`), a runtime socket. A bind whose source reads
 services' `build` context and dockerfile (relative to the config root)
 must be under those paths too (`Policy::check_path`). Each tie is a line for
 the user (``bind mount of `/home/u/.config/gh` (outside the config
-root)``, `` `${localEnv:HOME}` (this host's env) ``, `` `caches` ``). Any
+root)``, `` `${localEnv:HOME}` (this host's env) ``, `` privileged ``). Any
 tie keeps the sandbox home whatever a worker's trust or allowances.
 
 **Layout** (`layout`, pure). Paths stay as the config says: each folder
@@ -2927,8 +2927,10 @@ applies under `trust = "full"` ([Trust](#trust)).
   `docker.sock`, `podman.sock`, `containerd.sock`, one of
   `runtime_sockets`' paths, `DOCKER_HOST`'s and `CONTAINER_HOST`'s
   included, or a dir holding one) needs `runtime-socket`. Under the fleet
-  root, a path through `shared-volumes/` needs `shared-volumes` (or
-  `caches` for a cache's dir), one through `shared-files/` `worktree-link`.
+  root, a path through `shared-volumes/` needs `shared-volumes`, but a
+  cache's dir always passes (`caches` are never refused: the dir is under
+  the fleet root and holds only downloads), one through `shared-files/`
+  `worktree-link`.
   Named and anonymous volumes and `tmpfs` pass; `--mount` keys beyond the
   ones devsandbox writes (`volume-opt`, which can bind a host path) and
   other mount types are refused.
@@ -2936,7 +2938,7 @@ applies under `trust = "full"` ([Trust](#trust)).
   after the sandbox resolves, before the runtime is called or the
   instance recorded) and again at the top of `materialize` (so `rebuild`
   too), refuses `initializeCommand` (it runs on the host), `dispatcher`,
-  `inbox`, `caches`, `persist-shell-history` (`shared-volumes`),
+  `inbox`, `persist-shell-history` (`shared-volumes`),
   `worktree-link`, `privileged`, `global` services, and local features
   whose folder, or any file in it, resolves outside the fleet root (they
   are copied into the image's build context). `folder` and `folders`
@@ -2969,7 +2971,6 @@ applies under `trust = "full"` ([Trust](#trust)).
 | `privileged` | `--privileged` (the sandbox's or a feature's) |
 | `runtime-socket` | a bind of a runtime socket or a dir holding one |
 | `host-network` | `--network host` on `run` or `build` |
-| `caches` | `caches` and their dirs' binds |
 | `shared-volumes` | binds under `shared-volumes/`, `persist-shell-history` |
 | `worktree-link` | `worktree-link` and its store's bind |
 | `global-services` | `scope = "global"` services |
