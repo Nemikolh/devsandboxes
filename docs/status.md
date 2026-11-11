@@ -79,12 +79,12 @@ is frozen: no new work on it.
   changed (a `machine add` there signs `~/.devsandboxes` and
   `member.toml`'s `roots` the same way, [ADR
   0050](decisions/0050-machine-add-on-the-authority-signs-its-configs.md)),
-  and every other member pulls that version's files from the
-  peer that gave it the log and installs its own copy under
+  and every other member installs that version's files from a bundle
+  it stored, else pulls them from the peer that gave it the log, as its own copy under
   `mesh/tree/<name>/`, kept while the authority is offline; that copy
   is one of the member's roots, and a `run`/`rebuild`/`start`/`services
-  rebuild` there runs only while it is the signed head (not changed in
-  place), from the daemon, a dispatcher's child ops, autostart or the
+  rebuild` there runs only while it is the signed head (a copy changed in
+  place is reinstalled from its stored bundle), from the daemon, a dispatcher's child ops, autostart or the
   CLI alike ([ADR 0049](decisions/0049-the-authority-signs-a-config-every-member-runs.md)). Transfer v1
   (step 12): a placed run's folders move from their own checkouts with
   a WIP snapshot, no remote needed, into per-repo caches on the worker

@@ -2164,17 +2164,20 @@ it never signs on a remote request alone (decision 49;
   bundle or a tampered one (a transfer checks only its sender's header).
   The re-collected bundle, not the tar's members, is what lands: stored
   in `bundles/`, then each file written into the copy in place (temp +
-  rename, parents real dirs), and the files the previous install listed
-  and this one doesn't removed; `mesh/installed.toml` records per name
+  rename, parents real dirs: a file or a symlink in the way of a parent,
+  or a dir where a file goes, is removed first, a link itself and never
+  what it points to; `mesh::write_in`), the files the previous install
+  listed and this one doesn't removed, then every entry under the
+  bundle's dirs that its list doesn't name (`mesh::strays`, what
+  `mesh::unlisted` refuses, a `.git` included), so a file added to a
+  context in the copy doesn't outlive the next install; `mesh/installed.toml` records per name
   the hash and file list installed (the union first, so a cut install
   still lists what the next must remove) and the bundle's dirs
   (`Bundle::dirs`: the build contexts and local features it references
   under the root, what a build reads whole; they follow from the config's
-  table, so the hash covers them without a field of its own). An entry
-  with no `dirs` isn't installed for `mesh::installed`, so the next
-  follow reinstalls it. Nothing else in the copy is
-  touched (`ROOT_SKIPS`, `.git`, local files such as the dispatcher's
-  `.leader`). A name `mesh::bind` bound on this host is refused: the
+  table, so the hash covers them without a field of its own). Nothing
+  else in the copy is touched (`ROOT_SKIPS`, local files outside the
+  bundle's dirs such as the dispatcher's `.leader`). A name `mesh::bind` bound on this host is refused: the
   authority's original is the root. Every host serves the bundles it
   keeps as `TRANSFER` pulls of kind `mesh-bundle` (`mesh::serves`, in
   `daemon`'s transfer channel next to `code::receivers`; only a
@@ -2205,7 +2208,11 @@ it never signs on a remote request alone (decision 49;
   `serve-mesh` thread instead (`daemon::follow_configs`). Either way
   `mesh::follow` reads the log's `config` heads and picks (`mesh::due`)
   each name whose head isn't what `installed.toml` holds
-  (`mesh::installed`) and that this host hasn't bound; its bundle is
+  (`mesh::installed`) and that this host hasn't bound, plus each name
+  whose head is installed but whose copy fails `mesh::verify` (edited in
+  place, a file added to a context, a dir turned into a link:
+  `mesh::Due::changed`, logged as ``config `<name>` vN is installed but
+  its copy isn't the signed one, reinstalling: <why>``); its bundle is
   installed from `bundles/` when stored there, else pulled from the peer
   (`code::LinkTransfer`), then `mesh::install`ed. A stored bundle that
   can't be read or that `install` refuses as not the head's
@@ -2213,12 +2220,23 @@ it never signs on a remote request alone (decision 49;
   hashes to another) is removed and pulled in the same pass
   (`mesh::Due::dropped`, logged as ``dropped the stored bundle of config
   `<name>` vN, pulling it: <why>``); any other failure (the copy can't be
-  written) keeps it. Runs are one at a time
+  written) keeps it. Every install is `mesh::verify`d after; one that
+  still fails (a second config file next to the installed one, outside
+  what an install touches) is that name's error (``installed, but still
+  not the signed config``), retried only by the next follow. The repair
+  rehashes every installed copy once per follow (its listed files, a
+  walk of its dirs, at most `code::ROOT_TAR_LIMIT` bytes read), so it
+  runs where a follow does: at link-up, at a sync with a head due (not
+  at every sync: `changes::configs_due` reads only the hashes), and when
+  the daemon refuses a build from a copy (`daemon::check_mesh_copy` →
+  `daemon::repair_config`: that name's head followed on a `serve-mesh`
+  thread with no peer, `daemon::NoPeer`, so from its stored bundle; the
+  refused verb's next try can pass). Runs are one at a time
   per process, the heads read inside, so an older log's run never
   installs after a newer one's. Each outcome goes to `serve.log`
   (installed config `<name>` vN from `<peer>`, or why not); a peer
   without the bundle is a logged failure, and the next sync (the
-  authority's next verb re-sends one) or link-up tries again. So a member keeps, and runs from, the latest version it
+  authority's next `run`, `rebuild` or `start` there re-sends one) or link-up tries again. So a member keeps, and runs from, the latest version it
   got while the authority is offline, and hands it on to the members
   that link to it. `mesh/installed.toml` also names the config file
   installed, apart from the referenced files the hash covers.
@@ -2279,11 +2297,13 @@ it never signs on a remote request alone (decision 49;
   each recorded dir in the copy (reached through real dirs; a missing one
   holds nothing) and refuses any entry but a real dir that the list
   doesn't name, a regular file, a symlink or anything else, a `.git`
-  included (`collect` never bundles one, yet a build reads it): ``config root `<name>`
+  included (`collect` never bundles one, yet a build reads it), and a
+  recorded dir's parent that isn't a real dir: ``config root `<name>`
   isn't the signed config (v<N>): `<path>` was added to its copy here``,
-  since a file dropped into a context would be built. A copy whose entry
-  records no dirs is refused as not here yet. `stop` and `rm` aren't
-  checked: they build nothing.
+  since a file dropped into a context would be built. A copy refused so
+  is not stuck until the authority signs again: the daemon's refusal
+  repairs it from the stored bundle (above), as does the next link-up.
+  `stop` and `rm` aren't checked: they build nothing.
 - **Following a hub change** (decision 69). A host follows a hub change
   (`Ctx::hub_changed`, `Shared::set_hub`: `hub` kept, every link ended so
   both ends redial saying it) only once the change has left it: cycling

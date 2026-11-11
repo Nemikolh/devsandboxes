@@ -45,7 +45,9 @@ member verifying it entry by entry and taking a newer one from any peer.
   sandbox with the runtime socket on the authority can read that key
   (`key_guard` covers binds and builds only).
 - A member's own user can't change a signed config on that member: a copy
-  edited in place is refused until the authority signs the next version.
+  edited in place is refused, then reinstalled from the bundle the member
+  stored (`fleet::mesh::follow`), with no new signature and the authority
+  offline or not.
 - A copy is checked once, when a build starts: a writer racing the build
   (a privileged sandbox mounting the copy read-write) isn't stopped.
   That sandbox is root on the host anyway.

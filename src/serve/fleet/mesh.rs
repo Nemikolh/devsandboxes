@@ -212,10 +212,8 @@ struct InstalledRoot {
     /// config's table; the config file itself only when it references
     /// itself).
     files: Vec<String>,
-    /// The bundle's [`Bundle::dirs`]. `None`: written before dirs were
-    /// recorded; [`installed`] leaves such an entry out, so the next
-    /// [`follow`] reinstalls it, and [`verify`] refuses it meanwhile.
-    dirs: Option<Vec<String>>,
+    /// The bundle's [`Bundle::dirs`].
+    dirs: Vec<String>,
 }
 
 impl InstalledRoot {
@@ -235,10 +233,9 @@ fn load_installed(path: &Path) -> Result<BTreeMap<String, InstalledRoot>> {
 }
 
 /// The hash (hex) [`install`] last installed per name under data dir
-/// `data`. An install cut short still names the previous one; an entry
-/// with no recorded dirs is none (to reinstall).
+/// `data`. An install cut short still names the previous one.
 pub fn installed(data: &Path) -> Result<BTreeMap<String, String>> {
-    Ok(load_installed(&installed_path(data))?.into_iter().filter(|(_, r)| r.dirs.is_some()).map(|(name, r)| (name, r.hash)).collect())
+    Ok(load_installed(&installed_path(data))?.into_iter().map(|(name, r)| (name, r.hash)).collect())
 }
 
 /// Every name `installed.toml` under data dir `data` lists, whatever its
@@ -275,8 +272,9 @@ fn next_seq() -> u32 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// What [`install`] did: the copy's path and the files it removed (the
-/// previous version's, no longer listed).
+/// What [`install`] did: the copy's path and what it removed (the
+/// previous version's files no longer listed, then every entry under the
+/// bundle's dirs the list doesn't name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub path: PathBuf,
@@ -298,11 +296,14 @@ pub struct Installed {
 /// Then the re-collected bundle (not the tar's members: what isn't
 /// referenced doesn't travel) is stored ([`store`]) to serve pulls, and
 /// the copy updated in place: each of its files written (temp + rename,
-/// every parent a real dir), then the files the previous install listed
-/// and this bundle doesn't removed. Nothing else in the copy is touched:
-/// `ROOT_SKIPS`, `.git` and local files no bundle listed (the dispatcher's
-/// `.leader`, logs) stay. Installs run one at a time per data dir (a
-/// lock next to [`installed_path`]).
+/// every parent a real dir, whatever was in the way replaced), then the
+/// files the previous install listed and this bundle doesn't removed, then
+/// every entry under the bundle's dirs that it doesn't list ([`strays`]:
+/// what [`verify`] would refuse, a `.git` included), so a file added to a
+/// context here doesn't outlive the next install. Nothing else in the copy
+/// is touched: `ROOT_SKIPS` and local files outside the bundle's dirs that
+/// no bundle listed (the dispatcher's `.leader`, logs) stay. Installs run
+/// one at a time per data dir (a lock next to [`installed_path`]).
 ///
 /// Refused for a name [`bound_root`] binds: the authority's original is
 /// the root, it never gets a copy.
@@ -340,7 +341,7 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
         hash: hex::encode(got),
         config: bundle.config_name.clone(),
         files: bundle.files.keys().cloned().collect(),
-        dirs: Some(bundle.dirs.iter().cloned().collect()),
+        dirs: bundle.dirs.iter().cloned().collect(),
     };
     let (before, files) = (previous.listed(), entry.listed());
     // First the union, so a write cut short still has every file listed
@@ -366,6 +367,10 @@ pub fn install(data: &Path, name: &str, tar: &[u8], head: &[u8; 32]) -> Result<I
         if remove_in(&tree, rel)? {
             removed.push(rel.clone());
         }
+    }
+    for rel in strays(&tree, &entry, false)? {
+        remove_entry(&tree, &rel)?;
+        removed.push(rel);
     }
     installed.insert(name.to_string(), entry);
     save_installed(&installed_path(data), &installed)?;
@@ -424,7 +429,7 @@ pub fn verify(data: &Path, name: &str, head: Option<(u64, [u8; 32])>) -> Result<
     let (Some((version, head)), Some(copy)) = (head, installed.get(name)) else {
         bail!("config root `{name}` has no signed version here yet");
     };
-    if copy.hash != hex::encode(head) || copy.dirs.is_none() {
+    if copy.hash != hex::encode(head) {
         bail!("config root `{name}` v{version} isn't here yet");
     }
     let tree = tree_path(data, name);
@@ -440,72 +445,124 @@ pub fn verify(data: &Path, name: &str, head: Option<(u64, [u8; 32])>) -> Result<
     }
 }
 
-/// The first entry under `copy`'s dirs in the copy at `tree` that `copy`
-/// doesn't list (a regular file, a symlink, anything but a real dir),
-/// walked as [`collect`]'s `add` walks them, but a `.git` in one is
-/// unlisted too (never bundled, yet a build reads it). A dir missing in the copy has nothing under it; a
-/// dir reached through anything but real dirs is an `Err`.
+/// The first of [`strays`].
 fn unlisted(tree: &Path, copy: &InstalledRoot) -> Result<Option<String>> {
-    fn walk(tree: &Path, rel: &str, listed: &std::collections::BTreeSet<String>) -> Result<Option<String>> {
+    Ok(strays(tree, copy, true)?.into_iter().next())
+}
+
+/// The entries under `copy`'s dirs in the copy at `tree` that `copy`
+/// doesn't list (a regular file, a symlink, anything but a real dir; only
+/// the first when `first`), walked as [`collect`]'s `add` walks them, but
+/// a `.git` in one is unlisted too (never bundled, yet a build reads it),
+/// as one entry. A dir missing in the copy has nothing under it; one whose
+/// parent is anything but a real dir has that parent unlisted (a listed
+/// file there: nothing, the dir can't be). Never descends through a link,
+/// never into [`skipped`] places.
+fn strays(tree: &Path, copy: &InstalledRoot, first: bool) -> Result<Vec<String>> {
+    fn walk(tree: &Path, rel: &str, listed: &std::collections::BTreeSet<String>, first: bool, out: &mut Vec<String>) -> Result<()> {
         let path = tree.join(rel);
         let meta = match path.symlink_metadata() {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
         if !meta.is_dir() {
-            return Ok((!(meta.is_file() && listed.contains(rel))).then(|| rel.to_string()));
+            if !(meta.is_file() && listed.contains(rel)) {
+                out.push(rel.to_string());
+            }
+            return Ok(());
         }
         let mut names: Vec<String> = Vec::new();
         for e in std::fs::read_dir(&path).with_context(|| format!("cannot list {}", path.display()))? {
             let e = e.with_context(|| format!("cannot list {}", path.display()))?;
             match e.file_name().into_string() {
                 Ok(n) => names.push(n),
-                Err(n) => return Ok(Some(format!("{rel}/{}", n.to_string_lossy()))),
+                Err(n) => {
+                    out.push(format!("{rel}/{}", n.to_string_lossy()));
+                    if first {
+                        return Ok(());
+                    }
+                }
             }
         }
         names.sort();
         for name in names {
+            if first && !out.is_empty() {
+                return Ok(());
+            }
             let child = format!("{rel}/{name}");
             // A `.git` is never bundled, yet a build's `COPY .` reads it:
             // in a copy it can only have been put there.
             if name == ".git" {
-                return Ok(Some(child));
+                out.push(child);
+                continue;
             }
             if skipped(&child) {
                 continue;
             }
-            if let Some(found) = walk(tree, &child, listed)? {
-                return Ok(Some(found));
-            }
+            walk(tree, &child, listed, first, out)?;
         }
-        Ok(None)
+        Ok(())
     }
     let listed: std::collections::BTreeSet<String> = copy.listed().into_iter().collect();
-    for rel in copy.dirs.iter().flatten() {
+    let mut out = Vec::new();
+    for rel in &copy.dirs {
+        if first && !out.is_empty() {
+            break;
+        }
         tar::check_path(rel)?;
-        let mut at = tree.to_path_buf();
+        let mut at = String::new();
         let parts: Vec<&str> = rel.split('/').collect();
-        let mut missing = false;
+        let mut reached = true;
         for p in &parts[..parts.len() - 1] {
-            at.push(p);
-            match at.symlink_metadata() {
+            at = if at.is_empty() { p.to_string() } else { format!("{at}/{p}") };
+            match tree.join(&at).symlink_metadata() {
                 Ok(m) if m.is_dir() => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    missing = true;
+                    reached = false;
                     break;
                 }
-                _ => bail!("{} isn't a directory", at.display()),
+                Ok(m) => {
+                    if !(m.is_file() && listed.contains(&at)) && !out.contains(&at) {
+                        out.push(at.clone());
+                    }
+                    reached = false;
+                    break;
+                }
+                Err(e) => return Err(e).with_context(|| format!("cannot read {}", tree.join(&at).display())),
             }
         }
-        if missing {
-            continue;
-        }
-        if let Some(found) = walk(tree, rel, &listed)? {
-            return Ok(Some(found));
+        if reached {
+            walk(tree, rel, &listed, first, &mut out)?;
         }
     }
-    Ok(None)
+    if first {
+        out.truncate(1);
+    }
+    Ok(out)
+}
+
+/// `rel` under `tree` removed, whatever it is (a link itself, never what
+/// it points to; a dir with what's in it), when reached through real
+/// directories only. Its parents stay.
+fn remove_entry(tree: &Path, rel: &str) -> Result<()> {
+    tar::check_path(rel)?;
+    let mut at = tree.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for p in &parts[..parts.len() - 1] {
+        at.push(p);
+        if !at.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            bail!("{} isn't a directory", at.display());
+        }
+    }
+    let path = tree.join(rel);
+    match path.symlink_metadata() {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+    .with_context(|| format!("cannot remove {}", path.display()))
 }
 
 /// Whether config root `root` may be built from here: [`check_root_in`]
@@ -584,8 +641,10 @@ fn rehash(tree: &Path, copy: &InstalledRoot) -> Result<[u8; 32]> {
 }
 
 /// `bytes` at `rel` under `tree` (temp file + rename, mode by `exec`),
-/// every parent a real directory (made if missing; a symlink or a file
-/// on the way is refused).
+/// every parent a real directory: made if missing, and a symlink or a
+/// file on the way removed first (the link itself, never followed), as is
+/// a directory at `rel`. It's this host's copy: what's in the way of the
+/// signed version goes.
 fn write_in(tree: &Path, rel: &str, exec: bool, bytes: &[u8]) -> Result<()> {
     tar::check_path(rel)?;
     let mut parts: Vec<&str> = rel.split('/').collect();
@@ -595,7 +654,10 @@ fn write_in(tree: &Path, rel: &str, exec: bool, bytes: &[u8]) -> Result<()> {
         dir.push(p);
         match dir.symlink_metadata() {
             Ok(m) if m.is_dir() => {}
-            Ok(_) => bail!("{} isn't a directory", dir.display()),
+            Ok(_) => {
+                std::fs::remove_file(&dir).with_context(|| format!("cannot remove {}", dir.display()))?;
+                std::fs::create_dir(&dir).with_context(|| format!("cannot create {}", dir.display()))?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir(&dir).with_context(|| format!("cannot create {}", dir.display()))?
             }
@@ -604,7 +666,7 @@ fn write_in(tree: &Path, rel: &str, exec: bool, bytes: &[u8]) -> Result<()> {
     }
     let path = dir.join(leaf);
     if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        bail!("{} is a directory", path.display());
+        std::fs::remove_dir_all(&path).with_context(|| format!("cannot remove {}", path.display()))?;
     }
     let tmp = dir.join(format!(".{leaf}.{}-{}.tmp", std::process::id(), next_seq()));
     let _ = std::fs::remove_file(&tmp);
@@ -698,9 +760,9 @@ pub fn pull_bundle(t: &dyn crate::serve::fleet::code::Transfer, data: &Path, has
     pulled.with_context(|| format!("cannot pull the config bundle {name}"))
 }
 
-/// A config root whose signed head this host's copy isn't at: version
-/// `version` (hash `hash`) to install, from its bundle stored here
-/// (`stored`) or pulled.
+/// A config root whose signed head this host's copy isn't at, or is at but
+/// changed here: version `version` (hash `hash`) to install, from its
+/// bundle stored here (`stored`) or pulled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Due {
     pub name: String,
@@ -711,6 +773,9 @@ pub struct Due {
     /// [`install`] as [`BadBundle`]) and pulled instead; `stored` is then
     /// false.
     pub dropped: Option<String>,
+    /// Why the copy, installed at the head, failed [`verify`] ([`follow`]
+    /// reinstalls it); `None` when the head isn't installed.
+    pub changed: Option<String>,
 }
 
 /// The names of `heads` (the log's `Membership::config`) to install (pure):
@@ -727,13 +792,30 @@ pub fn due(
     heads
         .iter()
         .filter(|(name, (_, hash))| !bound.contains_key(*name) && installed.get(*name) != Some(&hex::encode(hash)))
-        .map(|(name, (version, hash))| Due { name: name.clone(), version: *version, hash: *hash, stored: stored.contains(hash), dropped: None })
+        .map(|(name, (version, hash))| Due {
+            name: name.clone(),
+            version: *version,
+            hash: *hash,
+            stored: stored.contains(hash),
+            dropped: None,
+            changed: None,
+        })
         .collect()
 }
 
-/// After this host took a log from a peer (or linked to one): every
-/// [`due`] name installed ([`install`]) from its stored bundle, else from
-/// one pulled through `from` (a `code::LinkTransfer` to that peer). Runs
+/// After this host took a log from a peer (or linked to one, or a build
+/// from a copy was refused): every [`due`] name installed ([`install`])
+/// from its stored bundle, else from one pulled through `from` (a
+/// `code::LinkTransfer` to that peer). A name whose head is installed but
+/// whose copy fails [`verify`] (edited in place, a file added to a
+/// context, a dir turned into a link) is due too ([`Due::changed`]), so a
+/// member repairs its copy from the bundle it stored when it installed
+/// it, with no peer and no new signature. That rehashes each installed
+/// copy once per run (its listed files and a walk of its dirs, at most
+/// `ROOT_TAR_LIMIT` bytes read), which the callers keep to link-up, a
+/// sync with a head due, and a refused build. Every install is verified
+/// after: one that still fails is that name's error, not retried until
+/// the next run. Runs
 /// one at a time in this process, `heads` (the log's `config` heads) read
 /// inside, so a run that read an older log never installs after one that
 /// read a newer. A stored bundle that can't be read or that `install`
@@ -751,7 +833,21 @@ pub fn follow(
     let _one = RUNS.lock().unwrap_or_else(|e| e.into_inner());
     let heads = heads()?;
     let stored = heads.values().map(|(_, h)| *h).filter(|h| bundle_path(data, h).is_file()).collect();
-    let due = due(&heads, &installed(data)?, &load_roots(&roots_path(data))?, &stored);
+    let (installed, bound) = (installed(data)?, load_roots(&roots_path(data))?);
+    let mut due = due(&heads, &installed, &bound, &stored);
+    for (name, (version, hash)) in &heads {
+        if bound.contains_key(name) || installed.get(name) != Some(&hex::encode(hash)) {
+            continue;
+        }
+        if let Err(e) = verify(data, name, Some((*version, *hash))) {
+            let (stored, changed) = (stored.contains(hash), Some(format!("{e:#}")));
+            due.push(Due { name: name.clone(), version: *version, hash: *hash, stored, dropped: None, changed });
+        }
+    }
+    due.sort_by(|a, b| a.name.cmp(&b.name));
+    let checked = |d: &Due, r: Result<Installed>| {
+        r.and_then(|i| verify(data, &d.name, Some((d.version, d.hash))).map(|()| i).context("installed, but still not the signed config"))
+    };
     Ok(due
         .into_iter()
         .map(|mut d| {
@@ -768,10 +864,14 @@ pub fn follow(
                         d.stored = false;
                         d.dropped = Some(format!("{e:#}"));
                     }
-                    r => return (d, r),
+                    r => {
+                        let r = checked(&d, r);
+                        return (d, r);
+                    }
                 }
             }
             let r = pull_bundle(from, data, &d.hash).and_then(|tar| install(data, &d.name, &tar, &d.hash));
+            let r = checked(&d, r);
             (d, r)
         })
         .collect())
@@ -1316,17 +1416,6 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         let v2 = collect(&root).unwrap();
         assert_eq!(install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap().removed, ["dockerfiles/web/files/a.txt"]);
         verify(&data, "cfg", Some((4, v2.hash()))).unwrap();
-
-        // An entry with no recorded dirs is reinstalled, refused meanwhile.
-        let path = installed_path(&data);
-        let mut roots = load_installed(&path).unwrap();
-        roots.get_mut("cfg").unwrap().dirs = None;
-        save_installed(&path, &roots).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("dirs"));
-        assert!(installed(&data).unwrap().is_empty(), "due again");
-        assert_eq!(err(Some((4, v2.hash()))), "config root `cfg` v4 isn't here yet");
-        install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap();
-        verify(&data, "cfg", Some((4, v2.hash()))).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1525,7 +1614,7 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
             [("done", hex::encode([1; 32])), ("behind", hex::encode([6; 32]))].into_iter().map(|(n, h)| (n.to_string(), h)).collect();
         let bound = BTreeMap::from([("own".to_string(), PathBuf::from("/a/own"))]);
         let stored = std::collections::BTreeSet::from([[3; 32], [2; 32]]);
-        let due = |name: &str, version, h, stored| Due { name: name.into(), version, hash: [h; 32], stored, dropped: None };
+        let due = |name: &str, version, h, stored| Due { name: name.into(), version, hash: [h; 32], stored, dropped: None, changed: None };
         assert_eq!(
             super::due(&heads, &installed, &bound, &stored),
             [due("behind", 5, 5, false), due("local", 3, 3, true), due("pull", 1, 4, false)],
@@ -1554,7 +1643,7 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         let heads = || Ok(BTreeMap::from([("cfg".to_string(), (1, b.hash()))]));
         let done = follow(&member, heads, &Served(authority.clone())).unwrap();
         assert_eq!(done.len(), 1);
-        assert_eq!(done[0].0, Due { name: "cfg".into(), version: 1, hash: b.hash(), stored: false, dropped: None });
+        assert_eq!(done[0].0, Due { name: "cfg".into(), version: 1, hash: b.hash(), stored: false, dropped: None, changed: None });
         assert_eq!(done[0].1.as_ref().unwrap().path, tree_path(&member, "cfg"));
         assert_eq!(installed(&member).unwrap()["cfg"], hex::encode(b.hash()));
         assert_eq!(hash(&tree_path(&member, "cfg")), b.hash());
@@ -1662,6 +1751,103 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         let done = follow(&member, heads, &NoPull).unwrap();
         assert!(done[0].0.stored && done[0].0.dropped.is_none() && done[0].1.is_err(), "{done:?}");
         assert_eq!(std::fs::read(bundle_path(&member, &b.hash())).unwrap(), tar);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn follow_repairs_a_changed_copy_from_the_stored_bundle() {
+        let (base, root) = fixture("repair");
+        let data = base.join("data");
+        let b = collect(&root).unwrap();
+        install(&data, "cfg", &b.tar().unwrap(), &b.hash()).unwrap();
+        let heads = || Ok(BTreeMap::from([("cfg".to_string(), (1, b.hash()))]));
+        assert!(follow(&data, heads, &NoPull).unwrap().is_empty(), "intact: nothing");
+
+        let tree = tree_path(&data, "cfg");
+        write(&tree, "mcps/common.json", "{\"evil\":1}");
+        write(&tree, "dockerfiles/web/evil.sh", "#!/bin/sh\n");
+        write(&tree, "dispatcher/dispatch.log", "log");
+        write(&tree, ".leader", "me");
+        assert!(verify(&data, "cfg", Some((1, b.hash()))).is_err());
+        // At the head, so no pull: the stored bundle.
+        let done = follow(&data, heads, &NoPull).unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].0.stored && done[0].0.changed.as_deref().unwrap().contains("its copy was changed here"), "{done:?}");
+        assert_eq!(done[0].1.as_ref().unwrap().removed, ["dockerfiles/web/evil.sh"]);
+        verify(&data, "cfg", Some((1, b.hash()))).unwrap();
+        assert_eq!(std::fs::read_to_string(tree.join("mcps/common.json")).unwrap(), "{}");
+        for kept in [".leader", "dispatcher/dispatch.log"] {
+            assert!(tree.join(kept).is_file(), "{kept} stays");
+        }
+        assert!(follow(&data, heads, &NoPull).unwrap().is_empty(), "repaired: nothing");
+
+        // What a reinstall can't fix (a second config file, outside the
+        // bundle's dirs) is that name's error, once per run.
+        write(&tree, "devsandboxes.yaml", "sandbox: {}\n");
+        for _ in 0..2 {
+            let done = follow(&data, heads, &NoPull).unwrap();
+            let err = format!("{:#}", done[0].1.as_ref().unwrap_err());
+            assert!(err.starts_with("installed, but still not the signed config"), "{err}");
+        }
+        assert!(tree.join("devsandboxes.yaml").is_file(), "not a file the bundle's dirs hold: left");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_removes_what_its_dirs_dont_list() {
+        let (base, root) = fixture("strays");
+        let data = base.join("data");
+        let v1 = collect(&root).unwrap();
+        install(&data, "cfg", &v1.tar().unwrap(), &v1.hash()).unwrap();
+        let tree = tree_path(&data, "cfg");
+        write(&tree, "dockerfiles/web/evil.sh", "#!/bin/sh\n");
+        write(&tree, "dockerfiles/web/files/deep/evil", "x");
+        write(&tree, "dockerfiles/web/.git/HEAD", "ref");
+        write(&base, "target/keep", "outside");
+        std::os::unix::fs::symlink(base.join("target"), tree.join("features/hello/out")).unwrap();
+        // Local files outside the bundle's dirs.
+        for local in ["notes.md", "dockerfiles/other.txt", "dispatcher/dispatch.log", "shared-volumes/x", ".worktrees/w/f"] {
+            write(&tree, local, "local");
+        }
+        assert!(verify(&data, "cfg", Some((1, v1.hash()))).is_err());
+
+        // The next version's install.
+        write(&root, "mcps/common.json", "{\"v\":2}");
+        let v2 = collect(&root).unwrap();
+        let got = install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap();
+        assert_eq!(got.removed, ["dockerfiles/web/.git", "dockerfiles/web/evil.sh", "dockerfiles/web/files/deep/evil", "features/hello/out"]);
+        verify(&data, "cfg", Some((2, v2.hash()))).unwrap();
+        assert_eq!(std::fs::read_to_string(base.join("target/keep")).unwrap(), "outside", "the link removed, not its target");
+        for local in ["notes.md", "dockerfiles/other.txt", "dispatcher/dispatch.log", "shared-volumes/x", ".worktrees/w/f"] {
+            assert!(tree.join(local).is_file(), "{local} stays");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_replaces_what_is_in_the_way() {
+        let (base, root) = fixture("blocked");
+        let data = base.join("data");
+        let b = collect(&root).unwrap();
+        install(&data, "cfg", &b.tar().unwrap(), &b.hash()).unwrap();
+        let tree = tree_path(&data, "cfg");
+        write(&base, "target/Dockerfile", "FROM evil\n");
+        // A context dir turned into a link out, a parent into a file, a
+        // listed file into a dir.
+        std::fs::remove_dir_all(tree.join("dockerfiles/web")).unwrap();
+        std::os::unix::fs::symlink(base.join("target"), tree.join("dockerfiles/web")).unwrap();
+        std::fs::remove_dir_all(tree.join("mcps")).unwrap();
+        write(&tree, "mcps", "a file");
+        std::fs::remove_file(tree.join("dockerfiles/db/Dockerfile")).unwrap();
+        write(&tree, "dockerfiles/db/Dockerfile/x", "x");
+        assert!(verify(&data, "cfg", Some((1, b.hash()))).is_err());
+
+        let done = follow(&data, || Ok(BTreeMap::from([("cfg".to_string(), (1, b.hash()))])), &NoPull).unwrap();
+        assert!(done[0].1.is_ok(), "{done:?}");
+        verify(&data, "cfg", Some((1, b.hash()))).unwrap();
+        assert!(tree.join("dockerfiles/web").symlink_metadata().unwrap().is_dir());
+        assert_eq!(std::fs::read_to_string(base.join("target/Dockerfile")).unwrap(), "FROM evil\n", "never written through");
+        assert_eq!(files_under(&base.join("target")), ["Dockerfile"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -2736,11 +2736,60 @@ fn config_notes(signed: &machines::changes::ConfigSigned, key: &str, told: &mut 
 /// `denied`) before a placement or the runner. The verb's subprocess
 /// checks again at its command's entry (`fleet::mesh::check_root`), the
 /// same function, so the two agree. `stop`/`rm` never come here: they
-/// build nothing, and keep working on a changed copy.
+/// build nothing, and keep working on a changed copy. A refused copy is
+/// repaired off the request thread ([`repair_config`]), so the next try
+/// can pass.
 fn check_mesh_copy(params: &Value, shared: &Shared) -> Result<(), String> {
     let (Some(member), Some(data)) = (shared.member.as_deref(), shared.data_dir()) else { return Ok(()) };
     let Some(root) = params["root"].as_str().map(Path::new).filter(|r| r.is_absolute()) else { return Ok(()) };
-    fleet::mesh::check_root_in(data, member, root).map_err(|e| format!("{e:#}"))
+    fleet::mesh::check_root_in(data, member, root).map_err(|e| {
+        if let Some((name, true)) = fleet::mesh::copy_of(data, root) {
+            repair_config(member, &name);
+        }
+        format!("{e:#}")
+    })
+}
+
+/// A [`fleet::code::Transfer`] with no peer behind it: what
+/// [`repair_config`] installs through, from stored bundles only.
+struct NoPeer;
+
+impl fleet::code::Transfer for NoPeer {
+    fn send(&self, _: &fleet::transfer::Header, _: &mut dyn std::io::Read) -> Result<()> {
+        bail!("no peer to send to")
+    }
+    fn pull(&self, _: &str, name: &str, _: u64, _: &Path) -> Result<u64> {
+        bail!("{name} isn't stored here and no peer was asked: the next link-up or sync pulls it")
+    }
+}
+
+/// The copy of config root `name` refused for a build: followed
+/// (`fleet::mesh::follow`, the log's head for `name` only) on a
+/// `serve-mesh` thread from its stored bundle, with no peer: a copy at the
+/// head but changed here is reinstalled from the bundle stored when it was
+/// installed; a head not installed yet is left to the next link-up or
+/// sync. Logged as [`follow_configs_now`] logs.
+fn repair_config(member: &Path, name: &str) {
+    let (member, name) = (member.to_path_buf(), name.to_string());
+    let spawned = std::thread::Builder::new().name("serve-mesh".into()).spawn(move || {
+        let Some(data) = member.parent() else { return };
+        let heads = || -> Result<BTreeMap<String, (u64, [u8; 32])>> {
+            let mut heads = config_heads(&member)?;
+            heads.retain(|n, _| *n == name);
+            Ok(heads)
+        };
+        let _ = follow_logged(data, heads, &NoPeer, "no peer");
+    });
+    if let Err(e) = spawned {
+        log(&format!("fleet: cannot repair the signed configs: {e}"));
+    }
+}
+
+/// The `config` heads of the log in `member` (`member.toml`), none without
+/// a log.
+fn config_heads(member: &Path) -> Result<BTreeMap<String, (u64, [u8; 32])>> {
+    let stored = fleet::membership_api::load(member).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    Ok(stored.and_then(|s| s.log.membership().map(|m| m.config.clone())).unwrap_or_default())
 }
 
 /// This host's link to `peer` is up (where the handshake's newer log is
@@ -2767,16 +2816,27 @@ fn follow_configs(member: Option<&Path>, socket_dir: &Path, peer: &str) {
 /// (no data dir, no log).
 fn follow_configs_now(member: Option<&Path>, socket_dir: &Path, peer: &str) -> Result<(), String> {
     let Some((member, data)) = member.and_then(|m| Some((m, m.parent()?))) else { return Ok(()) };
-    let heads = || -> Result<BTreeMap<String, (u64, [u8; 32])>> {
-        let stored = fleet::membership_api::load(member).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-        Ok(stored.and_then(|s| s.log.membership().map(|m| m.config.clone())).unwrap_or_default())
-    };
     let t = fleet::code::LinkTransfer::for_worker(socket_dir, peer);
-    match fleet::mesh::follow(data, heads, &t) {
+    follow_logged(data, || config_heads(member), &t, peer)
+}
+
+/// `fleet::mesh::follow` under data dir `data` through `t` (`peer` its
+/// name in the log lines), each outcome logged; `Err` as
+/// [`follow_configs_now`]'s.
+fn follow_logged(
+    data: &Path,
+    heads: impl FnOnce() -> Result<BTreeMap<String, (u64, [u8; 32])>>,
+    t: &dyn fleet::code::Transfer,
+    peer: &str,
+) -> Result<(), String> {
+    match fleet::mesh::follow(data, heads, t) {
         Ok(done) => {
             let mut failed = Vec::new();
             for (due, r) in done {
                 let (name, v) = (&due.name, due.version);
+                if let Some(why) = &due.changed {
+                    log(&format!("fleet: config `{name}` v{v} is installed but its copy isn't the signed one, reinstalling: {why}"));
+                }
                 if let Some(why) = &due.dropped {
                     log(&format!("fleet: dropped the stored bundle of config `{name}` v{v}, pulling it: {why}"));
                 }
