@@ -341,8 +341,9 @@ design above, found in the code:
 4. Fleet step 4 (`PTY` over the RPC stream; shipped: the fleet
    worker's daemon is `session.attach`'s first caller, `fleet::pty`).
 5. Fleet steps 5-12 (shipped; they didn't wait for steps 4-5 here).
-6. [open-routing](open-routing.md) steps 1-4, then 5-6: independent of
-   the rest, kept off the Inbox by design.
+6. Open routing (shipped,
+   [bridges](../../architecture/helper/bridges.md#opening-urls-kind-open)):
+   independent of the rest, kept off the Inbox by design.
 7. The orchestrator interface (to plan): run and instance events on the
    daemon API, the capability replacing `dispatcher =`. It replaces the
    Inbox's `events`/`thread-ls` for the dispatcher.

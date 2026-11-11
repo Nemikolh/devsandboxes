@@ -12,26 +12,11 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **helper**: open routing. Step 1 shipped: a container's `xdg-open`,
-  `sensible-browser`, `x-www-browser` / `www-browser` and `$BROWSER`
-  open `http(s)` URLs with the host's opener on the instance's own host.
-  Step 2 shipped: profiles in the config, chosen at `run`, shown in `ps`,
-  `inspect`, the snapshots and the dashboard. Step 3 shipped: switching
-  (`devsandbox profile`, `instances.setProfile`, the dashboard's `P` and
-  `:profile`) and the host's `profiles.toml` choosing the browser a URL
-  opens in. Step 4 shipped: a URL on the container's localhost and an
-  OAuth login's localhost callback get an open forward first. Step 5
-  shipped: a URL opens on the member that last attached to the instance
-  (`open.deliver`, mapped by that member's `profiles.toml`), its
-  localhost ports and OAuth callbacks forwarded into the instance on the
-  sending member first. Step 6 shipped: `opens.done` says what became
-  of each open (opened, refused, failed), shown on the dashboard's
-  status line.
-  → [plan](plans/active/open-routing.md)
+Nothing right now.
 
 ## Planned
 
-Order: open routing, then the orchestrator interface (to plan), helper-rpc
+Order: the orchestrator interface (to plan), helper-rpc
 steps 4-5 reporting to it, then the Inbox's removal with fleet step 13
 rewritten for the orchestrator
 ([helper-rpc](plans/active/helper-rpc.md#order-across-plans)). The Inbox
@@ -108,6 +93,19 @@ is frozen: no new work on it.
   (built, never tested there).
 
 ## Parked
+
+- **helper**: opening files (`xdg-open report.pdf`): to the VS Code window
+  attached to the instance, or the host's opener for a path in a
+  bind-mounted workspace. Refused today (exit 3).
+  → [in-container](architecture/helper/in-container.md); `devsbd` `open.rs`
+- **dashboard**: an OSC 8 link clicked in the embedded terminal opening
+  like a container's URL (the row's profile, `profiles.toml`); it never
+  reaches the container. → [terminal](architecture/dashboard/terminal.md)
+- **helper**: schemes beyond `http(s)` (`mailto:`, `vscode:`) behind a
+  confirmation routed to the user (the broker's "ask" route).
+  → [bridges](architecture/helper/bridges.md#opening-urls-kind-open); `open::decide`
+- **daemon**: opening on every member attached right now instead of the
+  last attach only. → [fleet](architecture/daemon/fleet.md#last-attach); `serve::opens::route`
 
 - **instances**: repeat-instance worktrees in a container volume instead
   of a host bind (ownership stops mattering, faster I/O on VM-backed
@@ -643,6 +641,21 @@ is frozen: no new work on it.
   `run::cgroup::warn_if_outside`
 - The helper's arch is found by a blind second try, no probe.
   → [helper](architecture/helper/overview.md); `devsbd::candidates`
+- A container's URL chooses which free loopback ports the opening host
+  binds for it (its own port, an OAuth callback's): a sandbox can hold a
+  free well-known port a host tool then connects to, for as long as the
+  forward lives. → [forwards](architecture/daemon/forwards.md#open-forwards); `forwards::bind_open`
+- Loopback hosts in shorthand (`127.1`), with a zone id or
+  percent-encoded aren't recognized: such a URL opens unforwarded, on the
+  host's own loopback. → [bridges](architecture/helper/bridges.md#opening-urls-kind-open); `open::loopback_ports`
+- Attach records live in the daemon's memory: after a restart or handoff
+  on either side, a remote instance's URLs open on its own host (or are
+  refused) until the user attaches again. Renaming the instance between
+  the attach and an open makes the opening member refuse it.
+  → [fleet](architecture/daemon/fleet.md#last-attach); `serve::attaches`
+- An open forward into another machine's instance doesn't stop when that
+  instance stops, only when idle for 10 min or when the machine goes.
+  → [forwards](architecture/daemon/forwards.md#open-forwards); `forwards::Daemon::expire_open`
 
 ### inbox
 

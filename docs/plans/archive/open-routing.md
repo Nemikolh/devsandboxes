@@ -1,6 +1,13 @@
+> Archived 2026-11-10. Historical, may be wrong; do not use as a reference.
+> Current: [helper/bridges.md](../../architecture/helper/bridges.md#opening-urls-kind-open),
+> [daemon/fleet.md](../../architecture/daemon/fleet.md#opening-urls),
+> [daemon/forwards.md](../../architecture/daemon/forwards.md#open-forwards),
+> [instances/profiles.md](../../architecture/instances/profiles.md),
+> [ADR 0048](../../decisions/0048-a-profile-is-the-users-choice-and-only-its-name-crosses-machines.md)
+
 # Open routing: a container's `xdg-open` opens on the user's desktop
 
-Status: steps 1 (1a-1c, below), 2, 3 and 4 landed; step 5 is next.
+Status: shipped (steps 1-6).
 
 ## Problem
 
