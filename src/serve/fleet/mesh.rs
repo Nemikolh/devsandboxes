@@ -386,6 +386,15 @@ pub fn copy_of(data: &Path, root: &Path) -> Option<(String, bool)> {
     Some((name, parts.next().is_none()))
 }
 
+/// Whether `root` (canonicalized) is data dir `data`'s `mesh/` or under
+/// it: where the signed copies live, so never a config root of its own.
+fn in_mesh(data: &Path, root: &Path) -> bool {
+    let (Ok(mesh), Ok(root)) = (std::fs::canonicalize(data.join("mesh")), std::fs::canonicalize(root)) else {
+        return false;
+    };
+    root.starts_with(mesh)
+}
+
 /// Whether this member's copy of config root `name` (under data dir
 /// `data`) is the signed version `head` (the log's latest `config` entry
 /// for `name`, `(version, hash)`): what a `run` / `rebuild` / `start`
@@ -497,9 +506,11 @@ fn unlisted(tree: &Path, copy: &InstalledRoot) -> Result<Option<String>> {
 /// / `$HOME`, as `fleet::member::path`). At the entry of every command that
 /// builds from a config dir (`run`, `rebuild`, `start`, `services
 /// rebuild`), so the dispatcher's subprocesses, autostart and the CLI's
-/// in-process fallback check what the daemon's verb path does; a verb's
-/// subprocess runs with its request's env, so it finds the same data dir
-/// the client's daemon does.
+/// in-process fallback check what the daemon's verb path does. A verb's
+/// subprocess runs with its request's env: for a peer that's the daemon's
+/// own (`lent::peer_env`), the same data dir; a local client whose env
+/// names another data dir has this look there, and only the daemon's
+/// check (`daemon::check_mesh_copy`, over its own data dir) holds.
 pub fn check_root(root: &Path) -> Result<()> {
     let data = crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
     check_root_in(&data, &data.join("member.toml"), root)
@@ -509,11 +520,17 @@ pub fn check_root(root: &Path) -> Result<()> {
 /// (`member_toml` the member file whose log holds the signed heads): when
 /// `root` is a signed config's copy here ([`copy_of`]), only while that
 /// copy is the log's head for its name ([`verify`]). A root inside a copy
-/// but not the copy itself is no signed config. Any other root: nothing to
-/// check. The daemon's early `denied` answer (`daemon::check_mesh_copy`)
-/// is this too.
+/// but not the copy itself is no signed config, nor is anything else under
+/// `mesh/` ([`in_mesh`]: `mesh/tree` itself, `mesh`) that isn't a copy.
+/// Any other root: nothing to check. The daemon's early `denied` answer
+/// (`daemon::check_mesh_copy`) is this too.
 pub fn check_root_in(data: &Path, member_toml: &Path, root: &Path) -> Result<()> {
-    let Some((name, exact)) = copy_of(data, root) else { return Ok(()) };
+    let Some((name, exact)) = copy_of(data, root) else {
+        if in_mesh(data, root) {
+            bail!("`{}` is in the store of signed configs, not a config root: build from a copy, `mesh/tree/<name>`", root.display());
+        }
+        return Ok(());
+    };
     if !exact {
         bail!("`{}` is inside the copy of config root `{name}`, not a signed config", root.display());
     }
@@ -1356,6 +1373,12 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         // Inside the copy, not the copy.
         let inside = err(&tree.join("mcps"));
         assert!(inside.ends_with("is inside the copy of config root `cfg`, not a signed config"), "{inside}");
+
+        // The store itself, and what's in it but not a copy.
+        for at in [data.join("mesh/tree"), data.join("mesh"), data.join("mesh/tree/.."), data.join("mesh/installed.toml")] {
+            let got = err(&at);
+            assert!(got.ends_with("is in the store of signed configs, not a config root: build from a copy, `mesh/tree/<name>`"), "{got}");
+        }
 
         // Edited in place.
         write(&tree, "mcps/common.json", "{\"evil\":1}");

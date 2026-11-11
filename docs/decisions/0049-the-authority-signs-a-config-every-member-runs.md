@@ -46,6 +46,9 @@ member verifying it entry by entry and taking a newer one from any peer.
   (`key_guard` covers binds and builds only).
 - A member's own user can't change a signed config on that member: a copy
   edited in place is refused until the authority signs the next version.
+- A copy is checked once, when a build starts: a writer racing the build
+  (a privileged sandbox mounting the copy read-write) isn't stopped.
+  That sandbox is root on the host anyway.
 - Losing the authority's key freezes every signed config at its last
   version, as it freezes membership (0044).
 - Roots the authority never signs keep 0002 as is: their host's config is

@@ -132,7 +132,11 @@ fn wire(f: Finding, acks: Option<&BTreeSet<String>>) -> IdentityFinding {
 /// `root`'s config file, then the instances it drifted. Errors: `conflict`
 /// (the file changed since `file_hash`), `unsupported` (YAML; the message
 /// lists the edits), `invalid` (unknown ids, a kept non-root-user, a rewrite
-/// that didn't come out right), `internal` (the write; names a `.bak` left).
+/// that didn't come out right), `internal` (the write; names a `.bak` left),
+/// `denied` (a signed config's copy, or inside one: `fleet::mesh::copy_of`
+/// under `state`'s dir, the data dir. An edit there would refuse every
+/// build until the authority signs again, so for every caller, the
+/// daemon's API and the CLI's no-daemon fallback alike).
 pub fn migrate(
     root: &Path,
     state: &Path,
@@ -140,6 +144,15 @@ pub fn migrate(
     keep: &[String],
     expected_hash: &str,
 ) -> Result<ConfigMigrated, ApiError> {
+    #[cfg(unix)]
+    if let Some(data) = state.parent()
+        && let Some((name, _)) = crate::serve::fleet::mesh::copy_of(data, root)
+    {
+        return Err(ApiError::denied(format!(
+            "{} is this member's copy of config root `{name}`, signed by the fleet's authority: edit the config on the authority",
+            root.display()
+        )));
+    }
     let (file, _, _, before) = read(root)?;
     let migrated = migrate_file(&file, ids, keep, expected_hash).map_err(|e| match e {
         MigrateError::Conflict => ApiError::conflict(e.to_string()),
@@ -258,6 +271,27 @@ mod tests {
         std::fs::write(root.join("devsandboxes.toml"), "[sandbox.ok]\nimage = \"img\"\n").unwrap();
         assert_eq!(ack(&root, &state, &[]).unwrap().acked, Vec::<String>::new());
         assert!(State::load_at(&state).unwrap().identity_acks.is_empty());
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_refuses_a_signed_configs_copy() {
+        let (root, state) = scratch("copy");
+        let data = state.parent().unwrap();
+        let copy = crate::serve::fleet::mesh::tree_path(data, "cfg");
+        std::fs::create_dir_all(copy.join("mcps")).unwrap();
+        std::fs::write(copy.join("devsandboxes.toml"), CONFIG).unwrap();
+        std::fs::write(root.join("devsandboxes.toml"), CONFIG).unwrap();
+        let hash = findings(&copy, &state, None).unwrap().file_hash;
+        for at in [copy.clone(), copy.join("mcps")] {
+            let err = migrate(&at, &state, None, &[], &hash).unwrap_err();
+            assert_eq!(err.code, "denied");
+            assert!(err.message.ends_with("copy of config root `cfg`, signed by the fleet's authority: edit the config on the authority"), "{}", err.message);
+        }
+        assert_eq!(std::fs::read_to_string(copy.join("devsandboxes.toml")).unwrap(), CONFIG, "nothing written");
+        // Any other root is still rewritten.
+        assert_eq!(migrate(&root, &state, None, &[], &hash).unwrap().edits, 2);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

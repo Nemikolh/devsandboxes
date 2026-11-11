@@ -2113,7 +2113,8 @@ it never signs on a remote request alone (decision 49;
   before the copy was installed reaches it too, as one of the machine's
   live roots ([machines.md](machines.md#held-links-machines)). A config dir under `mesh/tree/` is built from only
   while `mesh::check_root_in` admits it: a root inside a copy but not
-  the copy is refused, else `mesh::verify` checks the copy against the
+  the copy is refused, as is anything else under `mesh/` that isn't a
+  copy (`mesh/tree` itself, `mesh`: `mesh::in_mesh`), else `mesh::verify` checks the copy against the
   log's head for its name (`Membership::config`). No head or no
   install: ``config root `<name>` has no signed version here yet``;
   installed hash not the head (not pulled yet): ``config root `<name>`
@@ -2131,11 +2132,19 @@ it never signs on a remote request alone (decision 49;
   daemon's verb path is checked too: the dispatcher's child ops
   (`devsandbox --in-process` subprocesses, `commands::dispatch`), the
   autostart pass (`commands::autostart::autostart`, in-process in the
-  daemon and the CLI) and the CLI's in-process fallback; a process in a
-  sandbox that mounts its own copy read-write can't edit it and have it
-  built. A verb's own subprocess checks again, under the env it runs
-  with (a local client's, the daemon's own for a peer:
-  `lent::peer_env`). The rehash
+  daemon and the CLI) and the CLI's in-process fallback. A copy edited
+  before a build starts is refused. The check runs once, at entry;
+  `Config::load` and the image build read the copy after it, so a
+  writer racing the build (a process in a sandbox that mounts its copy
+  read-write) isn't stopped. Such a sandbox is privileged, root on the
+  host regardless. A verb's own subprocess checks again, under the env
+  it runs with: the daemon's own for a peer (`lent::peer_env`), a local
+  client's, which can name another data dir; then only the daemon's
+  check is over this member's copies. `config.migrate` never edits a
+  copy: `config_identity::ops::migrate` answers `denied` for a root
+  `mesh::copy_of` matches (the data dir `state.toml`'s), for every
+  caller, saying to edit the config on the authority. `config.ack`
+  writes only `state.toml`. The rehash
   goes through `Bundle::hash`'s own encoding (`mesh::hash_parts`) over
   the config file's parsed table (the file `config::find` picks must be
   the installed one) and exactly the files `installed.toml` lists, each

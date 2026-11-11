@@ -797,7 +797,9 @@ Errors: `conflict` (the file's hash isn't `fileHash`), `unsupported` (a
 YAML config; the message lists the edits to make by hand), `invalid` (as
 `config.findings`, an id that isn't a current finding, a `keep` that
 isn't a `root-user`, an id in both), `not-found` (as `config.findings`),
-`internal` (the write failed; the message names a `.bak` left behind).
+`internal` (the write failed; the message names a `.bak` left behind),
+`denied` (`root` is a signed config's copy under the data dir's
+`mesh/tree/`, or inside one: edit the config on the fleet's authority).
 The hash is checked first, so a YAML config changed since `fileHash` is
 `conflict`, not `unsupported`.
 
@@ -1040,8 +1042,9 @@ yet`` (a newer version not pulled yet), ``config root `<name>` isn't the
 signed config (v<N>): its copy was changed here``, ``config root
 `<name>` isn't the signed config (v<N>): `<path>` was added to its copy
 here`` (an unlisted file or a `.git` in a bundled build context or local
-feature), or a root inside a copy, not the copy. `stop` and `rm` aren't
-checked.
+feature), a root inside a copy, not the copy, or anything else under
+`mesh/` (``… is in the store of signed configs, not a config root``).
+`stop` and `rm` aren't checked.
 
 **Config signing** (on a fleet member, from a local client;
 [fleet](../architecture/daemon/fleet.md#approvals-and-pushes), *Config
