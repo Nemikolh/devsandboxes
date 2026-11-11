@@ -1,3 +1,7 @@
+> Archived 2026-11-11. Historical, may be wrong; do not use as a reference.
+> Current: [daemon/fleet.md](../../architecture/daemon/fleet.md#approvals-and-pushes) (*Config versions*),
+> [ADR 0049](../../decisions/0049-the-authority-signs-a-config-every-member-runs.md)
+
 # Mesh config: a signed config every member runs
 
 Status: in progress. Step 1 shipped (1a-1d: signed from the

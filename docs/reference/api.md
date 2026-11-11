@@ -1037,8 +1037,11 @@ versions*): a `run`, `rebuild`, `start` or `services.rebuild` there is `denied` 
 copy is the log's latest version for its name: ``config root `<name>`
 has no signed version here yet``, ``config root `<name>` v<N> isn't here
 yet`` (a newer version not pulled yet), ``config root `<name>` isn't the
-signed config (v<N>): its copy was changed here``, or a root inside a
-copy, not the copy. `stop` and `rm` aren't checked.
+signed config (v<N>): its copy was changed here``, ``config root
+`<name>` isn't the signed config (v<N>): `<path>` was added to its copy
+here`` (an unlisted file or a `.git` in a bundled build context or local
+feature), or a root inside a copy, not the copy. `stop` and `rm` aren't
+checked.
 
 **Config signing** (on a fleet member, from a local client;
 [fleet](../architecture/daemon/fleet.md#approvals-and-pushes), *Config

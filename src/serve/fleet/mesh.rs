@@ -138,8 +138,7 @@ pub fn store(data: &Path, bundle: &Bundle) -> Result<PathBuf> {
 /// `name = "/canonical/path"`. A config root is named in the log by its
 /// directory's name, so two roots with one name would bump each other's
 /// version: the first path a name is signed from keeps it ([`bind`]).
-/// Baby step (mesh-config plan, decision 3): the name may become a full
-/// path or another identity later.
+/// The name may become a full path or another identity later.
 pub fn roots_path(data: &Path) -> PathBuf {
     data.join("mesh").join("roots.toml")
 }

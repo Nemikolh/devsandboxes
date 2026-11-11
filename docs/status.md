@@ -12,8 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **machines**: mesh config, a signed config every member runs while
-  its authority is offline. → [plan](plans/active/mesh-config.md)
+Nothing.
 
 ## Planned
 
@@ -80,11 +79,10 @@ is frozen: no new work on it.
   changed, and every other member pulls that version's files from the
   peer that gave it the log and installs its own copy under
   `mesh/tree/<name>/`, kept while the authority is offline; that copy
-  is one of the member's roots, and a `run`/`rebuild`/`start` there
-  runs only while it is the signed head (not changed in place), from
-  the daemon, a dispatcher's child ops, autostart or the CLI alike. Open:
-  whether `start` of a container whose config drifted, today a
-  warning, is refused on a copy. Transfer v1
+  is one of the member's roots, and a `run`/`rebuild`/`start`/`services
+  rebuild` there runs only while it is the signed head (not changed in
+  place), from the daemon, a dispatcher's child ops, autostart or the
+  CLI alike ([ADR 0049](decisions/0049-the-authority-signs-a-config-every-member-runs.md)). Transfer v1
   (step 12): a placed run's folders move from their own checkouts with
   a WIP snapshot, no remote needed, into per-repo caches on the worker
   (repeat sends carry only the delta) and on the hub, and `devsandbox
@@ -168,6 +166,30 @@ is frozen: no new work on it.
   carried with the snapshot; a config root that's a repo moved as one,
   so a `folder` inside it can be placed; fetch-back of `folders`
   entries; fetch-back from the dashboard. → [plan](plans/active/fleet.md)
+- **machines**: the dispatcher's code (`dispatcher/`,
+  `dispatcher.config.mts`) is reached only through `postStartCommand`,
+  so a signed config neither hashes nor ships it: an explicit include
+  key, or left to box setup?
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `fleet::mesh::collect`
+- **machines**: `start` of an instance whose config drifted only warns,
+  on a signed config's copy too: refuse it there?
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `run::warn_on_drift` (from `start::start_instance`)
+- **machines**: cutting config versions' bloat: fleet.md's long *Config
+  versions* down to rules; `mesh.rs`'s two temp-then-rename writers
+  (`mesh::store`, `write_in`) and two "TOML file or empty" loaders
+  (`load_roots`, `load_installed`); `Installed.removed`, read by tests
+  only. → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `fleet::mesh`
+- **machines**: signing on a verb aimed at another machine (the local
+  root bound to the remote root's name) stays for now; drop it?
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `daemon::sign_remote_config`
+- **machines**: a self-defined canonical encoding for the config bundle's
+  hash: it serializes the table with the `toml` crate, so a build with
+  another `toml` version may stop matching a signed head.
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `mesh::hash_parts`
+- **machines**: a signed root's name is its path's last component as
+  typed, not canonicalized, so two symlinks to one root are two names
+  (each bound to the same path).
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `changes::sign_config`
 
 ## Known limitations
 
@@ -623,6 +645,33 @@ is frozen: no new work on it.
   built). `worktree-link` and `worktree-include` are skipped there with a
   warning, so `.env`-style files don't follow either.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::ties`
+- A push of a signed config blocks the authority's verb until each
+  machine has installed it, one machine after another (up to
+  `SYNC_WAIT`, 10 min, each).
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `changes::push`, `changes::SYNC_WAIT`
+- The dashboard drops a verb's config signing notes (all its output), and
+  under `-d` the CLI shows only its `note:` lines.
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `tui::spawn_verb`, `verbs_client::held_notes`
+- Autostart records the boot before acting, so a signed config's copy
+  that is edited in place at boot refuses that pass's starts until the
+  next boot.
+  → [autostart](architecture/automations/autostart.md); `commands::autostart::autostart`
+- A machine offline when a config was signed, which installs it after
+  linking to a host that already has the log, sends that host no sync,
+  so the host lists the new copy among its roots only at the next sync
+  with it or link-up.
+  → [machines](architecture/daemon/machines.md#held-links-machines); `daemon::follow_configs`, `Handle::relist`
+- A signed config doesn't bundle a `build.context` of `.` (the root) or
+  the files a Dockerfile copies from the root, and a `${configDir}` dir
+  bind mount's directory isn't walked for files added to the copy (only
+  build contexts and local features are).
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `mesh::collect`, `Bundle::dirs`
+- Relative folders and signed copies share `mesh/tree/`: a `folder =
+  "../x"` and a signed root named `x` land in the same directory.
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `mesh::tree_path`
+- Temp files a crash leaves in `mesh/bundles/` and `mesh/` (a store's,
+  an install's unpacking dir, a pull's) are never cleaned up.
+  → [fleet](architecture/daemon/fleet.md#approvals-and-pushes); `mesh::store`, `mesh::install`, `mesh::pull_bundle`
 - After a worker's downgrade, a dashboard or other long-lived client still
   running the replaced, newer binary hands the new daemon off again at its
   next hello (its version is newer), restarting the older binary each

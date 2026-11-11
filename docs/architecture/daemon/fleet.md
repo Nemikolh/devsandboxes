@@ -2008,9 +2008,22 @@ it never signs on a remote request alone (decision 49;
   signed``, not logged; in no fleet nothing is said. A verb from a link peer, `--in-process` ones (the dispatcher's, the in-process
   fallback) and the autostart pass never sign. Never proposed.
   Another member keeps its copy of a root at
-  `<data>/devsandbox/mesh/tree/<name>/` (`mesh::tree_path`, outside
-  `fleet/`, so no worker policy covers it; a relative `folder` of `../x`
-  lands at `mesh/tree/x`). `mesh::install` takes a bundle's tar only as
+  `<data>/devsandbox/mesh/tree/<name>/` (`mesh::tree_path`), outside
+  `fleet/`, so no [worker policy](#worker-policy) covers it, `worker`
+  trust or not: the authority's signature is the consent
+  ([ADR 0049](../../decisions/0049-the-authority-signs-a-config-every-member-runs.md)),
+  and the authority's key is worth root on every member (a privileged
+  sandbox with the runtime socket on the authority can read it:
+  `key_guard` covers binds and builds only, and runs on copies as
+  everywhere). No request field carries config: the receiver resolves
+  `root` on its own disk, a peer's verb runs with the receiver daemon's
+  env (`lent::peer_env`, so `${localEnv:…}` is that host's), `profile` is
+  checked against the sandbox. What hangs off the config dir
+  (`${configDir}`, `${sharedVolumes}`, `.worktrees`, `shared-files`) is
+  the copy's, per host; a relative `folder` or `folders` entry of `../x`
+  lands at `mesh/tree/x`, cloned there by the user (a symlink works:
+  folders are canonicalized; a missing one refuses the `run`, as
+  anywhere). `mesh::install` takes a bundle's tar only as
   the version the log's head names: unpacked into a temp dir under
   `mesh/` (`code::tar`'s checks), re-collected there and refused unless
   it hashes to the head's hash, the guard against an older version's
@@ -3092,7 +3105,9 @@ applies under `trust = "full"` ([Trust](#trust)).
   `$HOME`, as `state.toml`'s) itself, and reads `trust` and `[allow]` off
   `member.toml` next to `state.toml` (`load_member`: those only, so it is
   read without `serve`; one that doesn't parse fails the verb). Under
-  `full`, `Policy::detect` answers no policy.
+  `full`, `Policy::detect` answers no policy, and a signed config's copy
+  (`mesh/tree/`, [Config versions](#approvals-and-pushes)) is outside
+  `fleet/`, so none applies to it either.
 - **The final argv is the authority.** `Policy::check_run` checks the
   `run` argv of every container right before it reaches the runtime: the
   sandbox's in `commands::run::run_container` (after features, identity,
