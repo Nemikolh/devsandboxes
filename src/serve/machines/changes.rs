@@ -355,7 +355,9 @@ impl ConfigSigned {
 /// version (1 for the first) and pushed. `None`, nothing bundled: this
 /// host isn't the authority of a fleet, or `root` holds no config file
 /// (the verb says why). `None` too when the hash is the latest's. A config
-/// that doesn't load is `Failed`, nothing signed.
+/// that doesn't load is `Failed`, nothing signed. So is a name bound to
+/// another root: the first canonical path a name is signed from keeps it
+/// ([`mesh::bind`], recorded before that first entry is signed).
 pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     let path = leave::member_toml(ctx).ok()?;
     let (me, key) = membership_api::own(path, &ctx.hostname).ok()?;
@@ -369,6 +371,19 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     if let Err(e) = membership::check_root_name(name) {
         return Some(ConfigSigned::failed(name, format!("config root {}: {e:#}", root.display())));
     }
+    let canon = match root.canonicalize() {
+        Ok(c) => c,
+        Err(e) => return Some(ConfigSigned::failed(name, format!("cannot resolve {}: {e}", root.display()))),
+    };
+    let data = path.parent().expect("member.toml has a parent");
+    let elsewhere = |bound: &Path| {
+        ConfigSigned::failed(name, format!("the name `{name}` is bound to {}, not {}", bound.display(), canon.display()))
+    };
+    match mesh::bound_root(data, name) {
+        Ok(Some(bound)) if bound != canon => return Some(elsewhere(&bound)),
+        Ok(_) => {}
+        Err(e) => return Some(ConfigSigned::failed(name, format!("{e:#}"))),
+    }
     let bundle = match mesh::collect(root) {
         Ok(b) => b,
         Err(e) => return Some(ConfigSigned::failed(name, format!("{e:#}"))),
@@ -378,7 +393,11 @@ pub fn sign_config(ctx: &Ctx, root: &Path) -> Option<ConfigSigned> {
     if current.is_some_and(|(_, h)| h == hash) {
         return None;
     }
-    let data = path.parent().expect("member.toml has a parent");
+    match mesh::bind(data, name, &canon) {
+        Ok(Ok(())) => {}
+        Ok(Err(bound)) => return Some(elsewhere(&bound)),
+        Err(e) => return Some(ConfigSigned::failed(name, format!("{e:#}"))),
+    }
     if let Err(e) = mesh::store(data, &bundle) {
         return Some(ConfigSigned::failed(name, format!("{e:#}")));
     }
@@ -657,6 +676,7 @@ mod tests {
     use crate::serve::daemon::Exit;
     use crate::serve::daemon::tests::{scratch, spawn_daemon};
     use crate::serve::endpoint;
+    use crate::serve::fleet::mesh;
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
     use super::{Change, Op, RotatePlan, can_rotate, countersign_rotate, plan_hub, plan_rotate};
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
@@ -873,7 +893,8 @@ mod tests {
     /// structural edit is v2, signed by a `rebuild` as by `start`. A config
     /// that won't load signs nothing, the verb answered anyway. K's verbs
     /// (not the authority), `stop`, a relative root and a root with no
-    /// config file sign nothing.
+    /// config file sign nothing. The first sign binds `cfg` to the root's
+    /// path; another root named `cfg` is refused, nothing signed.
     #[test]
     fn the_authoritys_verbs_sign_config_versions() {
         let pair = pair("changes-config", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
@@ -895,6 +916,14 @@ mod tests {
         assert_eq!(head(&k_toml), signed);
         let bundle = |v: &Option<(u64, String)>| pair.base.join(format!("l-data/mesh/bundles/{}.tar", v.as_ref().unwrap().1));
         assert!(bundle(&v1).is_file(), "the bundle stored");
+        let l_data = pair.base.join("l-data");
+        assert_eq!(mesh::bound_root(&l_data, "cfg").unwrap(), Some(root.canonicalize().unwrap()), "bound on first sign");
+        let twin = pair.base.join("twin/cfg");
+        std::fs::create_dir_all(&twin).unwrap();
+        std::fs::write(twin.join("devsandboxes.toml"), "[sandbox.twin]\n").unwrap();
+        assert!(verb_answered(&pair.l_dir, "start", json!({"root": twin, "env": {}, "instance": "nope"})));
+        assert_eq!((head(&l_toml), config(&l_toml)), (signed.clone(), v1.clone()), "another root named `cfg`: refused");
+        assert_eq!(mesh::bound_root(&l_data, "cfg").unwrap(), Some(root.canonicalize().unwrap()));
 
         std::fs::write(root.join("devsandboxes.toml"), "# a comment\n[sandbox.a]\n").unwrap();
         std::fs::write(root.join("notes.md"), "notes").unwrap();
@@ -913,7 +942,7 @@ mod tests {
         assert_eq!((head(&k_toml), config(&k_toml)), (signed, v1.clone()), "K isn't the authority");
         assert!(verb_answered(&pair.l_dir, "rebuild", json!({"root": root, "env": {}, "instance": "nope"})));
         let v2 = config(&l_toml).unwrap();
-        assert_eq!(v2.0, 2);
+        assert_eq!(v2.0, 2, "the bound path signs the next version");
         assert_ne!(Some(&v2), v1.as_ref());
         assert_eq!(config(&k_toml), Some(v2.clone()));
         assert!(bundle(&Some(v2.clone())).is_file());

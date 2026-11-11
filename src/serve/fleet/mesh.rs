@@ -110,6 +110,55 @@ pub fn store(data: &Path, bundle: &Bundle) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The authority's name → root bindings: `<data>/devsandbox/mesh/roots.toml`,
+/// `name = "/canonical/path"`. A config root is named in the log by its
+/// directory's name, so two roots with one name would bump each other's
+/// version: the first path a name is signed from keeps it ([`bind`]).
+/// Baby step (mesh-config plan, decision 3): the name may become a full
+/// path or another identity later.
+pub fn roots_path(data: &Path) -> PathBuf {
+    data.join("mesh").join("roots.toml")
+}
+
+/// The bindings at `path`; a missing file is none.
+pub fn load_roots(path: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// The path `name` is bound to under data dir `data`, if any.
+pub fn bound_root(data: &Path, name: &str) -> Result<Option<PathBuf>> {
+    Ok(load_roots(&roots_path(data))?.remove(name))
+}
+
+/// `name` bound to `path` in `roots` when unbound (pure). `Err`: the path
+/// it is bound to, another one.
+pub fn bind_in(roots: &mut BTreeMap<String, PathBuf>, name: &str, path: &Path) -> Result<(), PathBuf> {
+    match roots.get(name) {
+        Some(bound) if bound != path => Err(bound.clone()),
+        Some(_) => Ok(()),
+        None => {
+            roots.insert(name.to_string(), path.to_path_buf());
+            Ok(())
+        }
+    }
+}
+
+/// [`bind_in`] over [`roots_path`] under data dir `data`, under its lock
+/// (`serve::locked_file`: two verbs can sign at once); written only when
+/// `name` is newly bound.
+pub fn bind(data: &Path, name: &str, path: &Path) -> Result<Result<(), PathBuf>> {
+    crate::serve::locked_file::update(
+        &roots_path(data),
+        load_roots,
+        |r| toml::to_string(r).context("cannot serialize the config roots"),
+        |r| bind_in(r, name, path),
+    )
+}
+
 /// The bundle of config root `root`. The config must load
 /// (`Config::load`), and every sandbox's merged table and every service's
 /// `build` must read, else there is no bundle: what it references isn't
@@ -456,6 +505,31 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         assert_eq!(std::fs::read_to_string(copy.join("devsandboxes.toml")).unwrap(), CONFIG, "the config as written");
         assert!(!copy.join("notes.md").exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_name_binds_to_its_first_path() {
+        let mut roots = BTreeMap::new();
+        assert_eq!(bind_in(&mut roots, "cfg", Path::new("/a/cfg")), Ok(()));
+        assert_eq!(bind_in(&mut roots, "cfg", Path::new("/a/cfg")), Ok(()));
+        assert_eq!(bind_in(&mut roots, "cfg", Path::new("/b/cfg")), Err(PathBuf::from("/a/cfg")));
+        assert_eq!(bind_in(&mut roots, "other", Path::new("/b/other")), Ok(()));
+        assert_eq!(roots.len(), 2);
+    }
+
+    #[test]
+    fn the_bindings_round_trip() {
+        let data = scratch("roots");
+        assert!(load_roots(&roots_path(&data)).unwrap().is_empty(), "a missing file is empty");
+        assert_eq!(bound_root(&data, "cfg").unwrap(), None);
+        assert_eq!(bind(&data, "cfg", Path::new("/a/cfg")).unwrap(), Ok(()));
+        assert_eq!(bind(&data, "x.y", Path::new("/a/x.y")).unwrap(), Ok(()));
+        let text = std::fs::read_to_string(roots_path(&data)).unwrap();
+        assert!(text.contains("cfg = \"/a/cfg\""), "{text}");
+        assert_eq!(bind(&data, "cfg", Path::new("/b/cfg")).unwrap(), Err(PathBuf::from("/a/cfg")));
+        assert_eq!(bound_root(&data, "cfg").unwrap(), Some(PathBuf::from("/a/cfg")));
+        assert_eq!(bound_root(&data, "x.y").unwrap(), Some(PathBuf::from("/a/x.y")));
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

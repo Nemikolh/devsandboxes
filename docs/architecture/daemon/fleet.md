@@ -1969,7 +1969,13 @@ it never signs on a remote request alone (decision 49;
   config that doesn't load (`Config::load`, or a sandbox's merge, a
   `build`, `mounts` or `features` that doesn't read), a bundle over
   `code::ROOT_TAR_LIMIT` or a store that fails is logged too
-  (`not signed: <why>`) and the verb runs anyway. Nothing is bundled
+  (`not signed: <why>`) and the verb runs anyway. The log names a root
+  by its directory's name, so the authority binds a name to the
+  canonical path it first signs it from (`mesh::bind`, in
+  `<data>/devsandbox/mesh/roots.toml`, `name = "/path"`, written under
+  `serve::locked_file` before that first entry is signed;
+  `mesh::bound_root` looks one up): another root with that name is
+  refused the same way, its message naming both paths. Nothing is bundled
   off the
   authority or in no fleet; a verb from a link peer, one sent to a
   machine, `--in-process` ones (the dispatcher's, the in-process
