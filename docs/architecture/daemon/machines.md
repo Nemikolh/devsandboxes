@@ -327,7 +327,13 @@ one's while its neighbor is up.
 - **Live roots.** A machine's roots, as federation uses them, are its
   entry's `roots` (the registry's, in order) then every root its last
   `roots.list` over the link answered that isn't among them
-  (`service::live_roots`; the listing kept in the thread's `Ctl`):
+  (`service::live_roots`; the listing kept in the thread's `Ctl`). A
+  listed row with an `error` (a root recorded there whose directory is
+  gone) is left out unless it's the `fleet` row, so it's never watched
+  and refused. Each change of them, a listing's or a reload's
+  (`Cmd::Roots`), goes into `Remotes` under the links lock that
+  `Handle::reload` syncs `Remotes` under (`LinkLoop::apply_roots`), so
+  the last write is the newest roots:
   `Handle::entries` returns them, so `forward::sandboxes_everywhere`,
   `forward::resolve_everywhere`, `verbs_client::run_target`'s
   `sandboxes.list` and the watch above all see a root the machine got
