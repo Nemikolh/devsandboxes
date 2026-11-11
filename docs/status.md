@@ -130,6 +130,15 @@ is frozen: no new work on it.
 - **npm**: typed verb helpers (`api.run(…)`); `ApiInstances` has only `list`.
 - **config**: `runArgs` pass-through, `envFile`, secrets; `devsandbox init`
   scaffolding.
+- **runtimes**: GPUs (`hostRequirements.gpu`, `--gpus` / CDI) as a backend
+  capability. → [plan](plans/active/gpus.md)
+- **runtimes**: isolation levels per sandbox (gVisor `runsc`, Kata),
+  refused when the host can't satisfy them. → [plan](plans/active/isolation.md)
+- **runtimes**: sandbawks (Kubernetes, gVisor, memory checkpoints) as a
+  backend or a fleet member. → [plan](plans/active/sandbawks-runtime.md)
+- **instances**: ideas from sandbawks: process checkpoints, idle pause,
+  warm pools, clone, egress policy, not-ready signals for agents.
+  → [plan](plans/active/sandbawks-ideas.md)
 - **instances**: `.worktreeinclude.local`, `**`/`[...]` in `worktree-link`,
   read-only store mounts, an unlink/restore command, shared files served by
   `devsbd` from tmpfs.
