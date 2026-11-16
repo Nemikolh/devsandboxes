@@ -2,14 +2,16 @@
 //! every registered machine's rows (`instances.watch {machines: true}`), so
 //! an instance is (machine, name), not a name.
 //!
-//! The one key everywhere the dashboard keys by name (the tree's groups,
-//! the process cache, the in-flight sets, the pending actions, the terminal
-//! tabs) is [`qualify`]'s: the bare name for this host's rows, `box/web-2`
+//! The one key everywhere the dashboard keys by name (the process cache,
+//! the in-flight sets, the pending actions, the terminal tabs, a sandbox
+//! row's route) is [`qualify`]'s: the bare name for this host's rows, `box/web-2`
 //! for machine `box`'s. A name can't hold `/` (docker container names
 //! can't), so the key is unambiguous and a local one is exactly what it was
 //! before machines. `App` queues keys; the I/O edges ([`route`] in the event
 //! loop, the daemon worker, the poll) split them back into the request's
-//! `machine` and the row's remote `root`.
+//! `machine` and the row's remote `root`. The tree's groups are keyed by
+//! config root instead (`super::data::GroupKey`): a signed root's rows are
+//! one group across machines.
 //!
 //! Pure over the snapshot and its `machines` entries, tested here.
 

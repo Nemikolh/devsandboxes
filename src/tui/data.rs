@@ -72,44 +72,115 @@ pub enum Node {
     Proc { instance: usize, row: usize },
 }
 
-/// The sandbox row instance `inst` groups under: the same machine's sandbox
-/// of its name (docs/architecture/daemon/machines.md: a group per (machine, sandbox)), the one
-/// from its own root when a machine has two roots defining it. `None`: an
-/// orphan.
-pub fn group_of(sandboxes: &[SandboxRow], inst: &InstanceRow) -> Option<usize> {
-    let same = |s: &SandboxRow| s.machine == inst.machine && s.name == inst.sandbox;
-    if inst.machine.is_some() && inst.root.is_some() {
-        if let Some(i) = sandboxes.iter().position(|s| same(s) && s.root == inst.root) {
-            return Some(i);
-        }
-    }
-    sandboxes.iter().position(same)
+/// A group of the Instances tree (docs/architecture/dashboard/tabs-and-actions.md,
+/// *Tabs*): one config root's sandbox. A signed root's rows merge
+/// across machines; an unsigned root is its host's, so two roots defining
+/// one sandbox name are two groups either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupKey {
+    /// A signed config root (`mesh_root`, its signed name).
+    Mesh { root: String, sandbox: String },
+    /// An unsigned root: its machine (`None`: this host) and path there.
+    Host { machine: Option<String>, root: Option<String>, sandbox: String },
 }
 
-/// The sandbox rows in tree order: this host's in config order, then each
-/// machine's, by machine and name.
+impl GroupKey {
+    /// The key in the dashboard's `collapsed` set. Fields are joined by a
+    /// control character, which no root name, machine name or sandbox name
+    /// holds, so no two groups (nor [`ORPHANS_NAME`]) share one.
+    pub fn collapse_key(&self) -> String {
+        const SEP: char = '\u{1f}';
+        match self {
+            GroupKey::Mesh { root, sandbox } => format!("mesh{SEP}{root}{SEP}{sandbox}"),
+            GroupKey::Host { machine, root, sandbox } => format!(
+                "host{SEP}{}{SEP}{}{SEP}{sandbox}",
+                machine.as_deref().unwrap_or(""),
+                root.as_deref().unwrap_or("")
+            ),
+        }
+    }
+}
+
+/// The group sandbox row `r` belongs to.
+pub fn group_key(r: &SandboxRow) -> GroupKey {
+    match &r.mesh_root {
+        Some(root) => GroupKey::Mesh { root: root.clone(), sandbox: r.name.clone() },
+        None => GroupKey::Host { machine: r.machine.clone(), root: r.root.clone(), sandbox: r.name.clone() },
+    }
+}
+
+/// Where row `i` sits in tree order: this host's (`None` sorts first) in
+/// config order, then each machine's by machine and name.
+fn tree_rank(sandboxes: &[SandboxRow], i: usize) -> (Option<&str>, &str, usize) {
+    match &sandboxes[i].machine {
+        None => (None, "", i),
+        Some(m) => (Some(m.as_str()), sandboxes[i].name.as_str(), i),
+    }
+}
+
+/// The representative of row `i`'s group: its first row in tree order, so
+/// this host's when it has the root. A merged group's header is that row,
+/// and actions on the header take its route (`remote::sandbox_route`).
+fn representative(sandboxes: &[SandboxRow], i: usize) -> usize {
+    let key = group_key(&sandboxes[i]);
+    (0..sandboxes.len())
+        .filter(|&j| group_key(&sandboxes[j]) == key)
+        .min_by(|&a, &b| tree_rank(sandboxes, a).cmp(&tree_rank(sandboxes, b)))
+        .unwrap_or(i)
+}
+
+/// The group instance `inst` sits in, as its representative row
+/// ([`sandbox_order`]); `None`: an orphan. In order: its `mesh_root`'s
+/// group of its sandbox; else the group of its machine's row from its own
+/// root; else, with no recorded root (an instance older than
+/// `state::Instance::config_dir`), the first mesh group in tree order
+/// defining its sandbox (nothing on disk is rewritten). Failing those, its machine's first
+/// row of its sandbox's name.
+pub fn group_of(sandboxes: &[SandboxRow], inst: &InstanceRow) -> Option<usize> {
+    let named = |s: &SandboxRow| s.name == inst.sandbox;
+    let same = |s: &SandboxRow| named(s) && s.machine == inst.machine;
+    let found = inst
+        .mesh_root
+        .as_ref()
+        .and_then(|m| sandboxes.iter().position(|s| named(s) && s.mesh_root.as_ref() == Some(m)))
+        .or_else(|| match &inst.root {
+            Some(root) => sandboxes.iter().position(|s| same(s) && s.root.as_ref() == Some(root)),
+            None => sandbox_order(sandboxes)
+                .into_iter()
+                .find(|&i| named(&sandboxes[i]) && sandboxes[i].mesh_root.is_some()),
+        })
+        .or_else(|| sandboxes.iter().position(same))?;
+    Some(representative(sandboxes, found))
+}
+
+/// The groups in tree order, as their representative rows: this host's
+/// rows in config order, then each machine's, by machine and name, a group
+/// at its first row in that order.
 pub fn sandbox_order(sandboxes: &[SandboxRow]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..sandboxes.len()).collect();
-    // Stable: local rows (`None` sorts first) keep their config order.
-    order.sort_by(|&a, &b| {
-        let key = |i: usize| match &sandboxes[i].machine {
-            None => (None, ""),
-            Some(m) => (Some(m.as_str()), sandboxes[i].name.as_str()),
-        };
-        key(a).cmp(&key(b))
+    order.sort_by(|&a, &b| tree_rank(sandboxes, a).cmp(&tree_rank(sandboxes, b)));
+    let mut seen: Vec<GroupKey> = Vec::new();
+    order.retain(|&i| {
+        let key = group_key(&sandboxes[i]);
+        let new = !seen.contains(&key);
+        if new {
+            seen.push(key);
+        }
+        new
     });
     order
 }
 
 /// Flatten the tree into the visible node list, in render/selection order.
 ///
-/// Sandboxes appear in [`sandbox_order`]; an expanded sandbox lists its
-/// instances ([`group_of`], in `instances` order) as children, or one
+/// Groups appear in [`sandbox_order`], each as its representative's
+/// [`Node::Sandbox`]; an expanded group lists its instances ([`group_of`],
+/// in `instances` order, whatever machine they're on) as children, or one
 /// [`Node::Empty`] child when it has none. Instances with no sandbox row group
 /// under a trailing [`Node::Orphans`] header (keyed by [`ORPHANS_NAME`] in
 /// `collapsed`), which only appears when such instances exist: one group for
-/// every machine, this host's first (a machine column says whose). A sandbox's
-/// key (`remote::sandbox_key`) in `collapsed` hides its children; processes
+/// every machine, this host's first (a machine column says whose). A group's
+/// [`GroupKey::collapse_key`] in `collapsed` hides its children; processes
 /// are keyed by `remote::instance_key`.
 pub fn visible_nodes(
     sandboxes: &[SandboxRow],
@@ -123,7 +194,7 @@ pub fn visible_nodes(
 
     for si in sandbox_order(sandboxes) {
         nodes.push(Node::Sandbox(si));
-        if collapsed.contains(&super::remote::sandbox_key(&sandboxes[si])) {
+        if collapsed.contains(&group_key(&sandboxes[si]).collapse_key()) {
             continue;
         }
         let mut any = false;
@@ -526,6 +597,11 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The collapse key of this host's root-less group of sandbox `name`.
+    fn local_key(name: &str) -> String {
+        group_key(&sb(name)).collapse_key()
+    }
+
     /// The no-processes-expanded argument pair for `visible_nodes` callers that
     /// only exercise the sandbox/instance levels.
     fn no_procs() -> (BTreeSet<String>, BTreeMap<String, ProcState>) {
@@ -567,7 +643,7 @@ mod tests {
         let sandboxes = vec![sb("a"), sb("b")];
         let instances = vec![inst_in("a1", "a"), inst_in("b1", "b")];
         let (ep, pm) = no_procs();
-        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]), &ep, &pm);
+        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&[&local_key("a")]), &ep, &pm);
         // a is collapsed (no children, not even a marker); b stays expanded.
         assert_eq!(
             nodes,
@@ -670,8 +746,90 @@ mod tests {
             ProcState::Rows { rows: vec![proc_row("1")], signalable: true, sessions: None },
         );
         // Sandbox collapsed → its instance and procs are hidden entirely.
-        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]), &expanded, &procs);
+        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&[&local_key("a")]), &expanded, &procs);
         assert_eq!(nodes, vec![Node::Sandbox(0)]);
+    }
+
+    /// Sandbox `name` read from `root` on `machine`, signed as `mesh`.
+    fn sb_at(name: &str, machine: Option<&str>, root: &str, mesh: Option<&str>) -> SandboxRow {
+        let mut row = sb(name);
+        row.machine = machine.map(str::to_string);
+        row.root = Some(root.into());
+        row.mesh_root = mesh.map(str::to_string);
+        row
+    }
+
+    /// Instance `name` of `sandbox` made on `machine` from `root`.
+    fn inst_at(name: &str, sandbox: &str, machine: Option<&str>, root: Option<&str>, mesh: Option<&str>) -> InstanceRow {
+        let mut row = inst_in(name, sandbox);
+        row.machine = machine.map(str::to_string);
+        row.root = root.map(str::to_string);
+        row.mesh_root = mesh.map(str::to_string);
+        row
+    }
+
+    #[test]
+    fn group_keys_are_distinct_and_never_the_orphans() {
+        let keys = [
+            group_key(&sb_at("s", None, "/a", Some("tree"))),
+            group_key(&sb_at("s", Some("box"), "/a", Some("tree"))),
+            group_key(&sb_at("s", None, "/a", None)),
+            group_key(&sb_at("s", Some("box"), "/a", None)),
+            group_key(&sb_at("s", None, "/b", None)),
+            group_key(&sb("s")),
+        ];
+        assert_eq!(keys[0], keys[1], "one mesh root across machines");
+        let strings: BTreeSet<String> = keys[1..].iter().map(GroupKey::collapse_key).collect();
+        assert_eq!(strings.len(), 5);
+        assert!(!strings.contains(ORPHANS_NAME));
+    }
+
+    /// One representative per group, local first in config order, then
+    /// machines by machine and name; a mesh group at its first row.
+    #[test]
+    fn sandbox_order_yields_one_representative_per_group() {
+        let rows = vec![
+            sb_at("z", Some("box"), "/r", Some("tree")), // 0: merges with 3
+            sb_at("b", Some("box"), "/r", None),         // 1
+            sb_at("y", Some("ant"), "/r", Some("tree")), // 2: merges with 5
+            sb_at("z", None, "/here", Some("tree")),     // 3
+            sb_at("a", None, "/here", None),             // 4
+            sb_at("y", Some("box"), "/r", Some("tree")), // 5
+            sb_at("a", None, "/other", None),            // 6: a second root's `a`
+        ];
+        assert_eq!(sandbox_order(&rows), vec![3, 4, 6, 2, 1]);
+    }
+
+    #[test]
+    fn group_of_returns_the_groups_representative() {
+        let rows = vec![
+            sb_at("s", Some("box"), "/r", Some("tree")), // 0
+            sb_at("s", None, "/here", Some("tree")),     // 1: the mesh group's representative
+            sb_at("u", Some("box"), "/r", None),         // 2
+            sb_at("u", None, "/here", None),             // 3
+            sb_at("u", None, "/two", None),              // 4
+            sb_at("t", Some("lap"), "/l", None),         // 5
+            sb_at("t", Some("box"), "/r", Some("tree")), // 6
+        ];
+        let of = |i: InstanceRow| group_of(&rows, &i);
+        // A mesh instance: its mesh group's representative, whatever its host.
+        assert_eq!(of(inst_at("a", "s", Some("box"), Some("/r"), Some("tree"))), Some(1));
+        assert_eq!(of(inst_at("b", "s", None, Some("/here"), Some("tree"))), Some(1));
+        // Unsigned: its own host's row from its root.
+        assert_eq!(of(inst_at("c", "u", Some("box"), Some("/r"), None)), Some(2));
+        assert_eq!(of(inst_at("d", "u", None, Some("/two"), None)), Some(4));
+        // A root no row matches: the machine's first of that name.
+        assert_eq!(of(inst_at("e", "u", None, Some("/gone"), None)), Some(3));
+        // A mesh root with no group of that sandbox: as a rooted instance.
+        assert_eq!(of(inst_at("f", "u", None, Some("/two"), Some("tree"))), Some(4));
+        // No root: the first mesh group in tree order defining it...
+        assert_eq!(of(inst_at("g", "s", Some("lap"), None, None)), Some(1));
+        assert_eq!(of(inst_at("h", "t", Some("lap"), None, None)), Some(6));
+        // ...else the machine's first of that name.
+        assert_eq!(of(inst_at("i", "u", Some("box"), None, None)), Some(2));
+        // Nothing of its name on its machine: an orphan.
+        assert_eq!(of(inst_at("j", "u", Some("lap"), Some("/l"), None)), None);
+        assert_eq!(of(inst_at("k", "gone", None, None, None)), None);
     }
 
     #[test]

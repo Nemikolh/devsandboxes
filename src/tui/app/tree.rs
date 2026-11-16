@@ -1,8 +1,8 @@
 //! Instances-tree selection and navigation: clamping, collapse/expand, and
 //! parent jumps.
 
-use crate::tui::data::{Node, ORPHANS_NAME};
-use crate::tui::remote::{instance_key, sandbox_key};
+use crate::tui::data::{Node, ORPHANS_NAME, group_key};
+use crate::tui::remote::instance_key;
 
 use super::{App, Tab};
 
@@ -25,12 +25,13 @@ impl App {
         self.needs_proc_fetch = true;
     }
 
-    /// The collapse-set key for a collapsible node (sandbox name / orphan group),
+    /// The collapse-set key for a collapsible node (its group's
+    /// [`GroupKey::collapse_key`](crate::tui::data::GroupKey::collapse_key) / the orphan group),
     /// or `None` for leaf nodes (instances, empty markers).
     fn collapse_key(&self, node: Node) -> Option<String> {
         let snapshot = self.snapshot.as_ref()?;
         match node {
-            Node::Sandbox(i) => snapshot.sandboxes.get(i).map(sandbox_key),
+            Node::Sandbox(i) => snapshot.sandboxes.get(i).map(|r| group_key(r).collapse_key()),
             Node::Orphans => Some(ORPHANS_NAME.to_string()),
             Node::Instance(_) | Node::Empty(_) | Node::Proc { .. } => None,
         }
@@ -309,10 +310,24 @@ mod tests {
         assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
     }
 
-    /// The same sandbox and instance names on two machines are two groups,
-    /// the machine's after this host's, folded and expanded on their own.
+    /// `machine_app` with both hosts' rows signed as mesh root `tree`.
+    fn mesh_app() -> App {
+        let mut app = machine_app();
+        let mut s = app.snapshot.clone().unwrap();
+        for r in &mut s.sandboxes {
+            r.mesh_root = Some("tree".into());
+        }
+        for r in &mut s.instances {
+            r.mesh_root = Some("tree".into());
+        }
+        app.set_snapshot(s);
+        app
+    }
+
+    /// Unsigned roots: the same sandbox and instance names on two machines
+    /// are two groups, the machine's after this host's, folded on their own.
     #[test]
-    fn same_names_on_two_machines_are_separate_groups() {
+    fn unsigned_roots_on_two_machines_are_separate_groups() {
         let mut app = machine_app();
         let tree = [Node::Sandbox(0), Node::Instance(0), Node::Instance(1), Node::Sandbox(1), Node::Instance(2), Node::Instance(3)];
         assert_eq!(app.visible_nodes(), tree);
@@ -327,15 +342,79 @@ mod tests {
         // Fold box's `s`: the local one stays open.
         app.selected[Tab::Instances.index()] = 3;
         app.on_key(key(KeyCode::Char(' ')));
-        assert!(app.collapsed.contains("box/s"));
+        let boxed = crate::tui::data::group_key(&app.snapshot.as_ref().unwrap().sandboxes[1]).collapse_key();
+        assert!(app.collapsed.contains(&boxed));
         assert_eq!(app.visible_nodes(), tree[..4]);
+    }
+
+    /// One mesh root's rows on this host and on `box` are one group: the
+    /// local row heads it, both hosts' instances under it, whatever order
+    /// the rows come in; it folds as one.
+    #[test]
+    fn a_mesh_roots_rows_merge_across_machines() {
+        let mut app = mesh_app();
+        let tree = [Node::Sandbox(0), Node::Instance(0), Node::Instance(1), Node::Instance(2), Node::Instance(3)];
+        assert_eq!(app.visible_nodes(), tree);
+        let mut s = app.snapshot.clone().unwrap();
+        s.sandboxes.reverse();
+        app.set_snapshot(s);
+        // The local row (now index 1) still heads the group.
+        assert_eq!(app.visible_nodes()[..2], [Node::Sandbox(1), Node::Instance(0)]);
+        assert_eq!(app.visible_nodes().len(), 5);
+        let mut app = mesh_app();
+
+        // Fold the group: every host's instances hide.
+        app.on_key(key(KeyCode::Char(' ')));
+        let mesh = crate::tui::data::GroupKey::Mesh { root: "tree".into(), sandbox: "s".into() };
+        assert!(app.collapsed.contains(&mesh.collapse_key()));
+        assert_eq!(app.visible_nodes(), [Node::Sandbox(0)]);
         app.on_key(key(KeyCode::Char(' ')));
 
         // box/inst0's processes are its own.
-        app.selected[Tab::Instances.index()] = 4;
+        app.selected[Tab::Instances.index()] = 3;
         assert_eq!(app.selected_instance_name().as_deref(), Some("box/inst0"));
         app.on_key(key(KeyCode::Right));
         assert!(app.expanded_procs.contains("box/inst0") && !app.expanded_procs.contains("inst0"));
-        assert_eq!(app.visible_nodes()[5], Node::Proc { instance: 2, row: crate::tui::procs::MESSAGE_ROW });
+        assert_eq!(app.visible_nodes()[4], Node::Proc { instance: 2, row: crate::tui::procs::MESSAGE_ROW });
+        // Left from box/inst0 (procs folded) goes to the merged header.
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
+    }
+
+    /// Two roots on one host defining `s` are two groups, each with its
+    /// own instances.
+    #[test]
+    fn two_roots_on_one_host_are_separate_groups() {
+        let mut app = machine_app();
+        let mut s = app.snapshot.clone().unwrap();
+        // box's second instance came from a second root there.
+        let mut second = s.sandboxes[1].clone();
+        second.root = Some("/r/two".into());
+        s.sandboxes.push(second);
+        s.instances[3].root = Some("/r/two".into());
+        app.set_snapshot(s);
+        assert_eq!(
+            app.visible_nodes(),
+            [Node::Sandbox(0), Node::Instance(0), Node::Instance(1), Node::Sandbox(1), Node::Instance(2), Node::Sandbox(2), Node::Instance(3)]
+        );
+    }
+
+    /// An instance with no recorded root joins the first mesh group in
+    /// tree order defining its sandbox, not its host's unsigned row.
+    #[test]
+    fn a_rootless_instance_backfills_into_the_mesh_group() {
+        let mut app = machine_app();
+        let mut s = app.snapshot.clone().unwrap();
+        // Only the local root is signed; box's is unsigned.
+        s.sandboxes[0].mesh_root = Some("tree".into());
+        s.instances[0].mesh_root = Some("tree".into());
+        s.instances[1].mesh_root = Some("tree".into());
+        s.instances[3].root = None;
+        app.set_snapshot(s);
+        assert_eq!(
+            app.visible_nodes(),
+            [Node::Sandbox(0), Node::Instance(0), Node::Instance(1), Node::Instance(3), Node::Sandbox(1), Node::Instance(2)]
+        );
     }
 }

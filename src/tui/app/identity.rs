@@ -14,9 +14,9 @@
 
 use crate::serve::verbs_client::identity::{self, Choice, Group};
 use crate::snapshot::SandboxRow;
-use crate::tui::data::{Snapshot, group_of};
+use crate::tui::data::Snapshot;
 use crate::tui::prompt::PromptAction;
-use crate::tui::remote::{Route, find_instance, machine_root, sandbox_key};
+use crate::tui::remote::{Route, find_instance, instance_sandbox, machine_root, sandbox_key};
 
 use super::view::{ConfirmModal, Confirmed};
 use super::{App, Modal, VerbEnd};
@@ -43,14 +43,15 @@ pub enum IdentityOn {
 }
 
 /// The sandbox row verb `action` creates or rebuilds an instance of:
-/// `run`'s sandbox, `rebuild`/`start`'s instance's group. `None` for the
-/// other verbs (and an orphan).
+/// `run`'s sandbox, `rebuild`/`start`'s instance's own row
+/// (`remote::instance_sandbox`: its machine's, not its merged group's
+/// representative). `None` for the other verbs (and an orphan).
 fn target<'a>(s: &'a Snapshot, action: &PromptAction) -> Option<&'a SandboxRow> {
     match action {
         PromptAction::Run { sandbox, .. } => s.sandboxes.iter().find(|r| sandbox_key(r) == *sandbox),
         PromptAction::Rebuild { instance, .. } | PromptAction::Start { instance } => {
             let inst = find_instance(s, instance)?;
-            s.sandboxes.get(group_of(&s.sandboxes, inst)?)
+            instance_sandbox(s, inst)
         }
         _ => None,
     }

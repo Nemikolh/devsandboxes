@@ -901,7 +901,11 @@ reaches it (`rotation_lines`).
 ## Dashboard
 
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
-routed back to a request's `machine` + remote `root`; on every machine,
+routed back to a request's `machine` + remote `root`. The Instances tree
+groups by config root, not machine: rows of one signed root (`mesh_root`)
+are one group whatever host they're on, headed by this host's row when it
+has the root (`tui::data::group_of`, `sandbox_order`;
+[tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*). On every machine,
 whatever its kind, an instance tab runs this host's `devsandbox exec …
 -- <m>/<name>` (`on_machine`, the executable `ExecCli::exe`), whose tty
 `exec` dials the machine ([The CLI](#the-cli-clirs)), and a

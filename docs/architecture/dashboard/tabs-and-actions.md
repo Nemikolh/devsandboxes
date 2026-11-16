@@ -31,8 +31,18 @@ for Instances when the last machine goes. Each keeps its own selected row.
 - **Instances**: a tree. `visible_nodes` flattens sandboxes (config
   order) → instances → processes into `Node`s: `Sandbox`, `Instance`,
   `Empty` (a sandbox with no instances), `Orphans` (the `(not in config)`
-  group for instances whose sandbox is gone) and `Proc`. With machines,
-  groups are per (machine, sandbox) (`group_of`). Collapse state and
+  group for instances whose sandbox is gone) and `Proc`. A group is one
+  config root's sandbox (`GroupKey`, `group_key`): a signed root's
+  (`mesh_root`) rows merge across machines, an unsigned root's stay its
+  host's (machine, root path), so two roots defining one name are two
+  groups. `sandbox_order` yields each group's representative row (its
+  first in tree order: this host's in config order, then machines by
+  machine and name), which the `Sandbox` node indexes and header actions
+  route by; `group_of` puts an instance in its `mesh_root`'s group, else
+  its root's on its machine, else (no recorded root) the first mesh group
+  defining its sandbox, else its machine's first row of that name. A
+  mesh group with rows from several hosts leaves the MACHINE cell blank
+  (`ui.rs` `node_machine`). Collapse state (by `GroupKey::collapse_key`) and
   expanded process layers survive snapshot refreshes. The Detail pane
   shows the selected row. Done instances render dimmed. An instance's
   profile follows its name as `[<p>]` and gets a `profile:` Detail line,
@@ -201,8 +211,8 @@ machine (`machine`, `config.*` being forwarded quick calls).
 
 - **Verb modal.** `take_pending_action` passes every queued action
   through `identity_gate`, so a key and the `:` prompt alike get it: a
-  `run` (its sandbox) or `rebuild`/`start` (its instance's group,
-  `group_of`) whose sandbox row has un-acked notes isn't returned; a
+  `run` (its sandbox) or `rebuild`/`start` (its instance's own row,
+  `remote::instance_sandbox`) whose sandbox row has un-acked notes isn't returned; a
   `Confirm` modal holds it instead, listing those notes, `[u] update /
   [c] continue as is (don't ask again) / [s] skip this time` (`esc`/`q`
   skip too). Decided from the snapshot alone. `s` releases the verb

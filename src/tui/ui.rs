@@ -1941,10 +1941,16 @@ fn draw_tree(
 }
 
 /// The MACHINE cell's text for `node`: its machine's name, blank for this
-/// host's rows and for rows that span machines (the orphan group).
+/// host's rows and for rows that span machines (the orphan group, a mesh
+/// root's group with rows from more than one host).
 fn node_machine(snapshot: &Snapshot, node: Node) -> Option<String> {
     match node {
-        Node::Sandbox(i) => snapshot.sandboxes.get(i)?.machine.clone(),
+        Node::Sandbox(i) => {
+            let row = snapshot.sandboxes.get(i)?;
+            let key = super::data::group_key(row);
+            let spans = snapshot.sandboxes.iter().any(|r| r.machine != row.machine && super::data::group_key(r) == key);
+            if spans { None } else { row.machine.clone() }
+        }
         Node::Instance(i) => snapshot.instances.get(i)?.machine.clone(),
         Node::Empty(_) | Node::Proc { .. } | Node::Orphans => None,
     }
@@ -2027,7 +2033,7 @@ fn group_counts(snapshot: &Snapshot, si: usize) -> (usize, usize) {
 }
 
 fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, si: usize, sb: &'a SandboxRow) -> Vec<Cell<'a>> {
-    let collapsed = app.is_collapsed_group(&super::remote::sandbox_key(sb));
+    let collapsed = app.is_collapsed_group(&super::data::group_key(sb).collapse_key());
     let marker = if collapsed { '▸' } else { '▾' };
     let (total, running) = group_counts(snapshot, si);
     let stats = sandbox_stats(total, running);
