@@ -23,7 +23,7 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 (`probe_argv`, `script_argv`, `target_argv`,
 `parse_target`, `Dial`, `RouteDial`, `Duplex`, `probe_dial`), `link.rs`
 (`handshake`, `Over`, `LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Hold`,
-`Held`, `Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `api.rs`
+`Held`, `Timing`, `Hooks`, `ControlPlane`), `saved.rs` (`remotes.json`), `api.rs`
 (`machines.*`, `Ctx`, `introducer_of`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`machine_names`, `plan`, `Plan`, `machine_use`, `route`,
 `localize`, `Reconnect`, `dials`, `pipe_mode`, `attach_mode`), `cli/calls.rs` (`use_of`, `Use`,
@@ -53,13 +53,13 @@ dropped by the next write). Then an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
-[`machine add`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)) through `machines.add`'s
+[`machine add`](#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
 dials with the same param). An older build's `agent` key is ignored:
 whom this host's ssh-agent reaches is `member.toml`'s grants
 ([Agent](#agent)). Only the daemon writes it
 (`machines.add`/`set`/`unlink`/`rm`, and `fleet.leave`/`fleet.forget`
-from the hub, [fleet.md](fleet.md), *How a machine leaves*): locked read-modify-write on `machines.lock`, temp
+from the control plane, [fleet.md](fleet.md), *How a machine leaves*): locked read-modify-write on `machines.lock`, temp
 file + rename (`serve::locked_file::update`), since two daemons overlap during a handoff. A file that
 doesn't parse is logged and changes nothing. The CLI reads it only to know
 which machines exist (`cli::machine_names`), adding the inbound ones a
@@ -73,7 +73,7 @@ Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
 A machine's registry name is its member name (fleet plan decision 35):
 without `--name`, `machines.add` takes it from the machine's `member.get`;
 `--name` renames the machine only while it joins a fleet by that add
-([`machine add`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)). `parse_name` splits a CLI
+([`machine add`](#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)). `parse_name` splits a CLI
 `<name>`: `m/x` → `Where::Machine`, `@/x` → `Where::Local`, bare →
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
@@ -204,7 +204,7 @@ each the user's own login there.
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
 copies this binary there, for `machine add`
-([`devsandbox machine …`](#devsandbox-machine-addlssetunlinkrmhubpendingapprovedenykeytrustroots)). The
+([`devsandbox machine …`](#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)). The
 CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
@@ -290,9 +290,9 @@ one's while its neighbor is up.
   fleet root `fleet/<name>/` under the data dir). It reports through
   `Held`: `up` once the `Hello`s are through (the link's sentinel and
   the `Hello`s within `Timing::handshake`), `note` for a link up but serving
-  nothing yet (waiting for the hub's build), and returns why it ended,
+  nothing yet (waiting for the control plane's build), and returns why it ended,
   with ssh's stderr tail (where the far end's refusal is, such as a name
-  clash: [inbound neighbors](#inbound-neighbors) there). A hub machine on
+  clash: [inbound neighbors](#inbound-neighbors) there). A control-plane machine on
   another build is followed first ([fleet](fleet.md#versions)). An
   inbound machine's carrier is the `fleet-link --peer <name>` that
   announced it: no thread of its own (`service::carried`).
@@ -302,22 +302,22 @@ one's while its neighbor is up.
   machine's roots while a
   local watcher wants machines (`Hooks::watching`), and stores pushed
   snapshots in `Remotes` (kept while the link is down; in memory only,
-  but on a hub, which also saves them to `remotes.json`). The machine
-  that is this host's hub (`Hooks::hub`: `member.toml`'s `hub` names
-  another member, `daemon::Shared::hub_of`; asked at each look at the
-  watchers, and a hub change redials every link anyway) is also watched
+  but on a control plane, which also saves them to `remotes.json`). The machine
+  that is this host's control plane (`Hooks::control_plane`: `member.toml`'s `control_plane` names
+  another member, `daemon::Shared::control_plane_of`; asked at each look at the
+  watchers, and a control-plane change redials every link anyway) is also watched
   federated meanwhile: the link's last `roots.list` gives its fleet root
-  for this host (the `fleet` row, there whether or not the hub has a
+  for this host (the `fleet` row, there whether or not the control plane has a
   config root of its own), watched with `machines: true`
   (`LinkLoop::watch`, `Want`/`Watched`; a refusal is the machine's
   `error`, asked again at the next change). That push is split
   (`snapshots::fleet_view`): its rows tagged `machine` and its `machines`
-  array, this host's own name left out (guarded: the hub leaves it out
-  already) and entries the hub itself sees `via` another dropped (the
-  machines the hub links to), are the hub's `Machine::fleet`, whose
+  array, this host's own name left out (guarded: the control plane leaves it out
+  already) and entries the control plane itself sees `via` another dropped (the
+  machines the control plane links to), are the control plane's `Machine::fleet`, whose
   machines are [routed](#routed-machines) here; the rest is that root's
   own rows when it is one of the entry's roots. A machine that stops being
-  the hub loses its view. A carrier going
+  the control plane loses its view. A carrier going
   down ends the link at once and is the machine's `error`; a carrier
   coming up is dialed at once; a connect that fails or a link lost over a
   live carrier is retried with the backoff.
@@ -333,7 +333,7 @@ one's while its neighbor is up.
   set, under the
   links lock that `Handle::reload` syncs `Remotes` under
   (`LinkLoop::apply_roots`). Before a machine's link first lists, its
-  roots are none, or on a hub the ones `remotes.json` restored with its
+  roots are none, or on a control plane the ones `remotes.json` restored with its
   rows and default (`saved::SavedMachine::roots`, `default_root`), kept
   until it lists.
 - **Default root.** The root a command on a machine with no root given
@@ -341,7 +341,7 @@ one's while its neighbor is up.
   row `roots.list` flags `copy` (a signed config's copy, `mesh::copy_of`)
   when there's one, of several the one named `.devsandboxes`; else the
   row flagged `home` (its `~/.devsandboxes`); else its only root; else
-  none. A routed machine has no listing here: its only root as the hub's
+  none. A routed machine has no listing here: its only root as the control plane's
   view has it, else none. `machines.get` answers it as `default_root`,
   with `listed`; `snapshots::merge` takes an instance whose root isn't
   listed from the default root's snapshot (none: the first root's).
@@ -390,17 +390,17 @@ decision 60) is a fleet member this host has no link of its own to,
 reached through other members (`snapshots::routed`, pure, over the
 daemon's `Shared::routed_reach`, the service's `Hooks::routed`): each
 member it binds a route socket for that its link graph has a path to,
-plus each machine its hub's federated view lists, neither a machine
+plus each machine its control plane's federated view lists, neither a machine
 here. It has no registry entry, no `serve-machine-*` thread and no watch:
-its rows are the hub's view's. `Handle::routed` lists them
+its rows are the control plane's view's. `Handle::routed` lists them
 (`snapshots::Routed`): `via` the first hop of the first graph path whose
-first hop is a link up here (`fleet::routes::reach`), else the hub whose
+first hop is a link up here (`fleet::routes::reach`), else the control plane whose
 view lists it; `state` `connected` while there is such a path, else
 `unreachable` with why (a path that's there may still fail past its
 first hop: the call says so); `roots` the `root`s of its sandboxes rows
-in the hub's view, `version` and `capacity` the view's. `machines.list`
+in the control plane's view, `version` and `capacity` the view's. `machines.list`
 and `machine ls` list them all; the federated snapshot (and so the
-dashboard) has only those the hub's view lists, `via` the hub
+dashboard) has only those the control plane's view lists, `via` the control plane
 ([Federated snapshots](#federated-snapshots)).
 
 Everything that acts on a machine works on a routed one the same way,
@@ -454,7 +454,7 @@ has it stripped and goes to that machine, but for the ones served here:
   `remote_rm`).
 - **Federated** `instances.resolve` / `sandboxes.list` with `machines:
   true` ask this host and every machine (routed ones too, at their roots
-  as the hub's view has them) in parallel, each machine given
+  as the control plane's view has them) in parallel, each machine given
   `FANOUT_WAIT` (5 s). Remote matches come back qualified (`box/web-2`)
   with an additive `found: [{name, machine, root}]`; a machine that doesn't
   answer adds nothing, and an empty result names the unreachable ones.
@@ -489,21 +489,21 @@ array carries each machine's `name`, `kind` (`ssh` |
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
 
-On a fleet member, `merge` also lifts the hub's `Machine::fleet` view:
+On a fleet member, `merge` also lifts the control plane's `Machine::fleet` view:
 each machine it lists becomes an entry of its own after the direct ones,
-kind `routed`, `via` the hub, with no `target` or `command` (no link of
-its own here reaches it), its `agent` this host's grant (not the hub's),
-its rows as the hub tagged them; while the hub's link isn't
-connected it takes the hub's state, `error` `through <hub>: <why>`, rows
+kind `routed`, `via` the control plane, with no `target` or `command` (no link of
+its own here reaches it), its `agent` this host's grant (not the control plane's),
+its rows as the control plane tagged them; while the control plane's link isn't
+connected it takes the control plane's state, `error` `through <control-plane>: <why>`, rows
 last known. A machine this host links to wins over the same name seen
-via the hub. The view lives in `Remotes` only (never in `remotes.json`:
+via the control plane. The view lives in `Remotes` only (never in `remotes.json`:
 `saved::of` takes rows and versions), and isn't a machine of the
 service's: its machines are [routed](#routed-machines)
 (`Remotes::routed`), which is how `machines.list`, placement, the
 federated calls and forwarded requests reach them.
 
-On a hub, a link peer's federated watch (a member watching it,
-[fleet](fleet.md#hub-mode)) is merged with `merge`'s `except` the peer's
+On a control plane, a link peer's federated watch (a member watching it,
+[fleet](fleet.md#control-plane-mode)) is merged with `merge`'s `except` the peer's
 name: its own rows and entry never go back to it. `publish_snapshot` and
 `publish_machines` merge once per root and asking peer
 (`Pending::except`: `None` for local clients, which share one merge).
@@ -735,10 +735,10 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   shell; [fleet](fleet.md#pty), *Service terminals*), never re-dialed (no
   session), refused without a terminal.
 
-## `devsandbox machine add|ls|set|unlink|rm|hub|pending|approve|deny|key|trust|roots`
+## `devsandbox machine add|ls|set|unlink|rm|control-plane|pending|approve|deny|key|trust|roots`
 
 A client of `machines.*` (and, for `trust`, `roots` and `key`,
-`member.*`; for `key rotate`, `hub`, `pending`, `approve` and `deny`,
+`member.*`; for `key rotate`, `control_plane`, `pending`, `approve` and `deny`,
 `membership.*`) only, never in-process (`src/commands/machine.rs`).
 
 `add` first checks the machine's devsandbox (`ensure_devsandbox`, over
@@ -779,11 +779,11 @@ the machine's `member.get` (refusing, `denied` and naming both
 fingerprints, a `key` that isn't the one there) and `machines.list`,
 reads this host's `member.toml` (`Ctx::member`, the name
 `Member::name_or` the hostname), and `join::plan` decides from both
-ends' hubs who joins and the registry name, refusing two hubs (`denied`)
-and a joining name the fleet already has. `add --hub` (`machines.add`'s
-`hub`, always sent) makes the machine the hub of the new fleet when
+ends' control planes who joins and the registry name, refusing two control planes (`denied`)
+and a joining name the fleet already has. `add --control-plane` (`machines.add`'s
+`control_plane`, always sent) makes the machine the control plane of the new fleet when
 neither end is in one, and is refused (`denied`) when either end is in a
-fleet whose hub the machine isn't. Then `join::logs` plans both ends'
+fleet whose control plane the machine isn't. Then `join::logs` plans both ends'
 membership logs over this host's `membership.json`, its key, and the
 machine's `membership.get`. Every check (names, the registry and
 the inbound neighbors, both logs) comes before any write; then the
@@ -792,9 +792,9 @@ still-open probe (`membership.adopt` of the log made here, or of this
 host's on an extra link; `membership.sign` of this host when it joins
 the machine's fleet), this host's registry entry, this host's
 membership (`membership_api::adopt` of the same log, the machine's, or
-the machine's signed answer: it writes `hub` and the name the log knows
-this host by, then `Ctx::hub_changed`, which is
-`daemon::Shared::set_hub` as after a `membership.adopt` call), on the
+the machine's signed answer: it writes `control_plane` and the name the log knows
+this host by, then `Ctx::control_plane_changed`, which is
+`daemon::Shared::set_control_plane` as after a `membership.adopt` call), on the
 authority from a local client this host's configs signed
 (`changes::sign_configs` of `changes::add_roots`: `~/.devsandboxes` and
 `member.toml`'s `roots`; [fleet.md](fleet.md#approvals-and-pushes),
@@ -844,12 +844,12 @@ the machine was told or not reached (and why), each member that forgot
 it or wasn't reached; on another member `proposed removing <name> to
 <authority>: approve there with devsandbox machine approve <id>`; on a
 leave its own proposal's outcome and the entries this host dropped.
-`hub <name>` (`commands::machine::hub`, `membership.hub`) moves the
-fleet's hub role to member `name` ([fleet.md](fleet.md#approvals-and-pushes)):
-on the authority it prints `<name> is the fleet's hub` then
+`control-plane <name>` (`commands::machine::control_plane`, `membership.controlPlane`) moves the
+fleet's control-plane role to member `name` ([fleet.md](fleet.md#approvals-and-pushes)):
+on the authority it prints `<name> is the fleet's control plane` then
 `signed_lines` (whom the push reached); on another member `proposed
-making <name> the fleet's hub to <authority>: approve there with
-devsandbox machine approve <id>` (`hub_lines`).
+making <name> the fleet's control plane to <authority>: approve there with
+devsandbox machine approve <id>` (`control_plane_lines`).
 `pending`, `approve <id>` and `deny <id>` are the authority's side of a
 proposal ([fleet.md](fleet.md#approvals-and-pushes)), local only:
 `pending` (`membership.pending`) prints an `ID FROM WHAT WHEN` table
@@ -910,7 +910,7 @@ listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while there is a machine, shows every machine from the snapshot's
 `machines` with its target (dimmed `inbound` for an inbound one, dimmed
-`via <hub>` for a routed one, which the snapshot has only from the hub's
+`via <control-plane>` for a routed one, which the snapshot has only from the control plane's
 view), link state (and error), `agent` (this host's grant, any kind),
 and its
 CAPACITY ([capacity](fleet.md#capacity)); a machine `worker` and exposed

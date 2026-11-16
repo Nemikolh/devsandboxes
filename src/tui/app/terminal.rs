@@ -1192,7 +1192,7 @@ mod tests {
             // `:exec` too.
             assert_eq!(app.exec_argv("box/inst1", &["uname".into()]).unwrap(), ["/opt/bin/devsandbox", "exec", "-i", "-t", "--", "box/inst1", "uname"]);
             assert_eq!(app.exec_argv("nope/x", &[]), Err("no machine named `nope`".into()));
-            // Seen only through the hub (routed): the same tab, its dial
+            // Seen only through the control plane (routed): the same tab, its dial
             // routed.
             let mut seen = app.machines.clone();
             seen[0].via = Some("k".into());

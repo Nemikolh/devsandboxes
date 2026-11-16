@@ -63,7 +63,7 @@ pub(crate) enum CliVerb {
         json: bool,
         reprobe: bool,
         detach: bool,
-        /// `--place`: this host's sandbox, where the fleet's hub says.
+        /// `--place`: this host's sandbox, where the fleet's control plane says.
         place: bool,
     },
     Rebuild { target: Option<String>, force: bool, reprobe: bool, detach: bool },
@@ -683,7 +683,7 @@ fn run_target(
     };
     let wanted = match (wanted, place) {
         (Some((Where::Machine(m), name)), true) => {
-            bail!("--place asks the hub where to run this host's sandbox; `{m}/{name}` is on machine `{m}`")
+            bail!("--place asks the control plane where to run this host's sandbox; `{m}/{name}` is on machine `{m}`")
         }
         (Some((_, name)), true) => Some((Where::Local, name)),
         (wanted, _) => wanted,
@@ -1707,7 +1707,7 @@ mod tests {
         assert_eq!(sent(p).params["sandbox"], "web");
         // A machine's name is refused.
         let e = prep_fed(&here(Some("a/web")), &FED, false, None, &list, 0).0.unwrap_err();
-        assert_eq!(e.to_string(), "--place asks the hub where to run this host's sandbox; `a/web` is on machine `a`");
+        assert_eq!(e.to_string(), "--place asks the control plane where to run this host's sandbox; `a/web` is on machine `a`");
         // Without it: `place: false` on the wire, so the daemon runs it here.
         assert_eq!(sent(prep_fed(&run_of(Some("@/web")), &FED, false, None, &list, 0).0).params["place"], false);
     }

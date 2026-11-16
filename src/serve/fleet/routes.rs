@@ -281,7 +281,7 @@ mod tests {
         p.iter().map(|s| s.to_string()).collect()
     }
 
-    /// `lap` (1, the authority), `k` (2, the hub), `b` (3), `m` (4).
+    /// `lap` (1, the authority), `k` (2, the control plane), `b` (3), `m` (4).
     fn stored() -> Stored {
         let mut log = Log::default();
         log.append(Op::genesis_with_id([1; 16], "lap", key(1).public_key(), "k"), "lap", &key(1)).unwrap();

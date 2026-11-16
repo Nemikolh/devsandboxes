@@ -1705,7 +1705,7 @@ mod tests {
     fn fleet_policy_child() {
         let Some(root) = isolated_root("fleet_policy_child") else { return };
         let data = root.join("data/devsandbox");
-        let cfg = data.join("fleet/me@hub/cfg");
+        let cfg = data.join("fleet/me@control_plane/cfg");
         std::fs::create_dir_all(cfg.join("repo")).unwrap();
         std::fs::write(
             cfg.join(CONFIG_FILE),
@@ -1724,7 +1724,7 @@ mod tests {
 
         // `${localEnv:…}`: refused by `run`, and never expanded for a config
         // under the root unless its name is allowed.
-        let env_cfg = data.join("fleet/me@hub/env");
+        let env_cfg = data.join("fleet/me@control_plane/env");
         std::fs::create_dir_all(env_cfg.join("repo")).unwrap();
         std::fs::write(
             env_cfg.join(CONFIG_FILE),

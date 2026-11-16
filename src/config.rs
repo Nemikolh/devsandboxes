@@ -826,10 +826,10 @@ fn resolve_var_with(
 ) -> Option<String> {
     if let Some(rest) = expr.strip_prefix("localEnv:") {
         let (name, default) = env_name_and_default(rest);
-        // Under a fleet root the config is the hub's: the worker's env only
+        // Under a fleet root the config is the control plane's: the worker's env only
         // for names `member.toml` allows, else left verbatim (`run` refuses
         // such a config before this, `worker_policy::Policy::check_config`;
-        // this is for what no check saw, e.g. a hub's `run --branch`).
+        // this is for what no check saw, e.g. a control plane's `run --branch`).
         if !local_env_allowed(name) {
             return None;
         }

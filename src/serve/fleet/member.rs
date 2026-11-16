@@ -1,6 +1,6 @@
 //! `member.toml`, next to `state.toml`: this host as a fleet member
 //! (docs/architecture/daemon/fleet.md, *Member file*): the name it goes by,
-//! its fleet's hub, its trust, the config roots it shows the fleet, and the
+//! its fleet's control plane, its trust, the config roots it shows the fleet, and the
 //! hand-edited `[allow]`, `[caps]` and `dev-builds`. Next to it,
 //! `member.key` ([`key_path`]) is this member's private key
 //! (`fleet::identity::FileKeyStore`), whose public half `member.get` answers.
@@ -8,7 +8,7 @@
 //! Written by the daemon only (decision 3 of the fleet plan), through
 //! `member.set` ([`call`]; `devsandbox machine trust` and `machine roots`
 //! are its clients), with [`update`]: under the sibling
-//! `member.lock`, a temp file and a rename (`serve::locked_file`). `hub`
+//! `member.lock`, a temp file and a rename (`serve::locked_file`). `control_plane`
 //! has no call: it's written from an accepted membership log
 //! (`membership.adopt`, `super::membership_api`) and cleared on leaving,
 //! both through [`set_fleet`].
@@ -42,14 +42,14 @@ pub struct Member {
     /// of the hostname.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// The fleet's hub ([`Member::hub`]): `self` on the hub, else the hub's
+    /// The fleet's control plane ([`Member::control_plane`]): `self` on the control plane, else the control plane's
     /// member name; empty is in no fleet (fleet plan decision 1).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub hub: String,
+    #[serde(rename = "control_plane", skip_serializing_if = "String::is_empty")]
+    pub control_plane: String,
     /// What a remote caller reaches here (`worker_policy::Trust`).
     pub trust: Trust,
-    /// Take the hub's own binary when it runs an unpublished build
-    /// (`fleet::update::Decision::Receive`): code the hub chooses, run
+    /// Take the control plane's own binary when it runs an unpublished build
+    /// (`fleet::update::Decision::Receive`): code the control plane chooses, run
     /// outside a container. Edited by hand, as `[allow]` is; `full` implies
     /// it ([`Member::takes_dev_builds`]).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -114,69 +114,69 @@ impl SoftCaps {
     }
 }
 
-/// `hub` in `member.toml`, typed.
+/// `control_plane` in `member.toml`, typed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Hub {
+pub enum ControlPlane {
     /// In no fleet.
     #[default]
     None,
-    /// This host is the hub (`self`).
+    /// This host is the control plane (`self`).
     This,
-    /// The hub is the member of this name.
+    /// The control plane is the member of this name.
     Other(String),
 }
 
-/// The `hub` value naming this host.
-pub const HUB_SELF: &str = "self";
+/// The `control_plane` value naming this host.
+pub const CONTROL_PLANE_SELF: &str = "self";
 
-impl Hub {
-    /// The file's `hub` value read (`""`: none). Unchecked: [`check`] is.
-    pub fn of(field: &str) -> Hub {
+impl ControlPlane {
+    /// The file's `control_plane` value read (`""`: none). Unchecked: [`check`] is.
+    pub fn of(field: &str) -> ControlPlane {
         match field {
-            "" => Hub::None,
-            HUB_SELF => Hub::This,
-            name => Hub::Other(name.to_string()),
+            "" => ControlPlane::None,
+            CONTROL_PLANE_SELF => ControlPlane::This,
+            name => ControlPlane::Other(name.to_string()),
         }
     }
 
     /// What the file and `member.get` say: `None` in no fleet.
     pub fn field(&self) -> Option<String> {
         match self {
-            Hub::None => None,
-            Hub::This => Some(HUB_SELF.into()),
-            Hub::Other(name) => Some(name.clone()),
+            ControlPlane::None => None,
+            ControlPlane::This => Some(CONTROL_PLANE_SELF.into()),
+            ControlPlane::Other(name) => Some(name.clone()),
         }
     }
 
     pub fn is_this(&self) -> bool {
-        *self == Hub::This
+        *self == ControlPlane::This
     }
 }
 
-/// A member name: a valid machine name but `self`, which `hub = "self"`
+/// A member name: a valid machine name but `self`, which `control_plane = "self"`
 /// reads as this host.
 pub fn check_member_name(name: &str) -> Result<()> {
     check_name(name)?;
-    if name == HUB_SELF {
-        bail!("`{HUB_SELF}` is reserved (`hub = \"{HUB_SELF}\"` means this host)");
+    if name == CONTROL_PLANE_SELF {
+        bail!("`{CONTROL_PLANE_SELF}` is reserved (`control_plane = \"{CONTROL_PLANE_SELF}\"` means this host)");
     }
     Ok(())
 }
 
-/// `hub` is empty, `self` or a valid machine name.
-fn check_hub(hub: &str) -> Result<()> {
-    if !hub.is_empty() && hub != HUB_SELF {
-        check_name(hub).context("`hub`")?;
+/// `control_plane` is empty, `self` or a valid machine name.
+fn check_control_plane(control_plane: &str) -> Result<()> {
+    if !control_plane.is_empty() && control_plane != CONTROL_PLANE_SELF {
+        check_name(control_plane).context("`control_plane`")?;
     }
     Ok(())
 }
 
 impl Member {
-    pub fn hub(&self) -> Hub {
-        Hub::of(&self.hub)
+    pub fn control_plane(&self) -> ControlPlane {
+        ControlPlane::of(&self.control_plane)
     }
 
-    /// Whether a hub's dev build is taken (fleet plan, *Versions*:
+    /// Whether a control plane's dev build is taken (fleet plan, *Versions*:
     /// `dev-builds`, or `full`).
     pub fn takes_dev_builds(&self) -> bool {
         self.dev_builds || self.trust == Trust::Full
@@ -220,7 +220,7 @@ pub fn check(member: &Member) -> Result<()> {
     if !member.name.is_empty() {
         check_member_name(&member.name).context("`name`")?;
     }
-    check_hub(&member.hub)?;
+    check_control_plane(&member.control_plane)?;
     if let Some(bad) = member.roots.iter().find(|r| !r.is_absolute()) {
         bail!("`roots`: `{}` is not an absolute path", bad.display());
     }
@@ -271,9 +271,9 @@ pub struct MemberInfo {
     /// `member.toml`'s `name`, else the hostname's first label; `None`
     /// when neither is a valid name.
     pub name: Option<String>,
-    /// `hub` as the file says: `self` on the hub, else the hub's member
+    /// `control_plane` as the file says: `self` on the control plane, else the control plane's member
     /// name; `None` in no fleet.
-    pub hub: Option<String>,
+    pub control_plane: Option<String>,
     pub trust: Trust,
     /// `dev-builds` as the file says (`full` takes dev builds either way).
     pub dev_builds: bool,
@@ -289,7 +289,7 @@ pub struct MemberInfo {
     pub next: Option<KeyInfo>,
     /// While this host is `worker` and exposed through another machine
     /// (`fleet::graph::exposed_workers`, over this host's link graph): the
-    /// chain from the hub, its last but one dialing this host (a shell
+    /// chain from the control plane, its last but one dialing this host (a shell
     /// here). `None` otherwise.
     pub exposed_by: Option<Vec<String>>,
 }
@@ -349,7 +349,7 @@ fn info(member: &Member, path: &Path, hostname: &str, exposure: Exposure) -> Res
         next,
         exposed_by: name.as_deref().and_then(|n| exposure(n, member.trust)),
         name,
-        hub: member.hub().field(),
+        control_plane: member.control_plane().field(),
         trust: member.trust,
         dev_builds: member.dev_builds,
         roots: member.roots.clone(),
@@ -378,17 +378,17 @@ pub fn set(path: &Path, hostname: &str, p: &SetParams, exposure: Exposure) -> Re
     info(&after, path, hostname, exposure)
 }
 
-/// `hub` written as `hub` (from an accepted membership log, or
-/// [`Hub::None`] on leaving), and with it `name` when given (the name the
+/// `control_plane` written as `control_plane` (from an accepted membership log, or
+/// [`ControlPlane::None`] on leaving), and with it `name` when given (the name the
 /// log knows this host by, pinned). Not an API call: the daemon follows a
-/// change itself (`daemon::Shared::set_hub`).
-pub fn set_fleet(path: &Path, name: Option<&str>, hub: &Hub) -> Result<Member> {
+/// change itself (`daemon::Shared::set_control_plane`).
+pub fn set_fleet(path: &Path, name: Option<&str>, control_plane: &ControlPlane) -> Result<Member> {
     update(path, |cur| -> Result<Member> {
         let mut next = cur.clone();
         if let Some(name) = name {
             next.name = name.to_string();
         }
-        next.hub = hub.field().unwrap_or_default();
+        next.control_plane = control_plane.field().unwrap_or_default();
         check(&next)?;
         *cur = next;
         Ok(cur.clone())
@@ -477,16 +477,16 @@ mod tests {
     }
 
     #[test]
-    fn hub_is_self_a_name_or_none() {
-        assert_eq!(parse("").unwrap().hub(), Hub::None);
-        assert_eq!(parse("hub = \"self\"\n").unwrap().hub(), Hub::This);
-        assert_eq!(parse("hub = \"box\"\n").unwrap().hub(), Hub::Other("box".into()));
-        assert!(parse("hub = \"a/b\"\n").is_err());
-        assert!(parse("hub = \"-x\"\n").is_err());
-        assert_eq!(serialize(&Member { hub: "self".into(), ..Default::default() }).unwrap(), "hub = \"self\"\ntrust = \"worker\"\n\n[allow]\n");
-        assert!(!serialize(&Member::default()).unwrap().contains("hub"), "no fleet: left out");
-        assert_eq!((Hub::None.field(), Hub::This.field(), Hub::Other("k".into()).field()), (None, Some("self".into()), Some("k".into())));
-        assert!(Hub::This.is_this() && !Hub::Other("self2".into()).is_this());
+    fn control_plane_is_self_a_name_or_none() {
+        assert_eq!(parse("").unwrap().control_plane(), ControlPlane::None);
+        assert_eq!(parse("control_plane = \"self\"\n").unwrap().control_plane(), ControlPlane::This);
+        assert_eq!(parse("control_plane = \"box\"\n").unwrap().control_plane(), ControlPlane::Other("box".into()));
+        assert!(parse("control_plane = \"a/b\"\n").is_err());
+        assert!(parse("control_plane = \"-x\"\n").is_err());
+        assert_eq!(serialize(&Member { control_plane: "self".into(), ..Default::default() }).unwrap(), "control_plane = \"self\"\ntrust = \"worker\"\n\n[allow]\n");
+        assert!(!serialize(&Member::default()).unwrap().contains("control_plane"), "no fleet: left out");
+        assert_eq!((ControlPlane::None.field(), ControlPlane::This.field(), ControlPlane::Other("k".into()).field()), (None, Some("self".into()), Some("k".into())));
+        assert!(ControlPlane::This.is_this() && !ControlPlane::Other("self2".into()).is_this());
     }
 
     #[test]
@@ -523,9 +523,9 @@ mod tests {
         assert_eq!(code(json!({"name": "a/b"})), "invalid");
         assert_eq!(code(json!({"name": "self"})), "invalid");
         assert_eq!(code(json!({"roots_add": ["rel"]})), "invalid");
-        // Hand-edited parts aren't settable, nor `hub` (only an accepted
+        // Hand-edited parts aren't settable, nor `control_plane` (only an accepted
         // membership log writes it).
-        for bad in [json!({"trust": "most"}), json!({"dev_builds": true}), json!({"allow": {}}), json!({"caps": {}}), json!({"hub": "self"})] {
+        for bad in [json!({"trust": "most"}), json!({"dev_builds": true}), json!({"allow": {}}), json!({"caps": {}}), json!({"control_plane": "self"})] {
             assert!(serde_json::from_value::<SetParams>(bad.clone()).is_err(), "{bad}");
         }
     }
@@ -536,7 +536,7 @@ mod tests {
         let key = crate::serve::fleet::identity::SigningKey::from_seed([1; 32]).public_key();
         let info = MemberInfo {
             name: Some("lap".into()),
-            hub: Some("self".into()),
+            control_plane: Some("self".into()),
             trust: Trust::Full,
             dev_builds: true,
             roots: vec!["/srv/cfg".into()],
@@ -548,7 +548,7 @@ mod tests {
         assert_matches("MemberInfo", &serde_json::to_value(&info).unwrap());
         assert_eq!(serde_json::to_value(&info).unwrap()["exposed_by"], json!(["box", "lap"]));
         assert_matches("MembershipKey", &serde_json::to_value(&info).unwrap()["next"]);
-        assert_matches("MemberInfo", &serde_json::to_value(MemberInfo { hub: None, ..info }).unwrap());
+        assert_matches("MemberInfo", &serde_json::to_value(MemberInfo { control_plane: None, ..info }).unwrap());
         assert_eq!(union_members("MemberTrust"), ["'worker'", "'full'"]);
         assert!(prop_type("ApiMethods", "member.get").is_some());
         assert!(prop_type("ApiMethods", "member.set").is_some());
@@ -573,7 +573,7 @@ mod tests {
         }
         assert_eq!(
             got,
-            json!({"name": "lap", "hub": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null, "exposed_by": ["k", "lap"]})
+            json!({"name": "lap", "control_plane": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null, "exposed_by": ["k", "lap"]})
         );
         // A pending rotation shows.
         let next = FileKeyStore::new(key_path(&path)).next_key().unwrap().public_key();
@@ -590,16 +590,16 @@ mod tests {
 
         let set = call("member.set", json!({"name": "box"}));
         assert_eq!(set.unwrap().unwrap()["name"], "box");
-        assert_eq!(call("member.set", json!({"hub": "self"})).unwrap().unwrap_err().code, "invalid");
-        // The log's hub, written internally; the name pinned with it.
-        set_fleet(&path, Some("box2"), &Hub::This).unwrap();
+        assert_eq!(call("member.set", json!({"control_plane": "self"})).unwrap().unwrap_err().code, "invalid");
+        // The log's control plane, written internally; the name pinned with it.
+        set_fleet(&path, Some("box2"), &ControlPlane::This).unwrap();
         let m = load(&path).unwrap().unwrap();
-        assert_eq!((m.hub(), m.name.as_str()), (Hub::This, "box2"), "written");
-        assert!(set_fleet(&path, Some("a/b"), &Hub::None).is_err());
-        set_fleet(&path, None, &Hub::Other("k".into())).unwrap();
-        assert_eq!(call("member.get", Value::Null).unwrap().unwrap()["hub"], "k");
-        set_fleet(&path, Some("box"), &Hub::None).unwrap();
-        assert_eq!(load(&path).unwrap().unwrap().hub(), Hub::None, "cleared");
+        assert_eq!((m.control_plane(), m.name.as_str()), (ControlPlane::This, "box2"), "written");
+        assert!(set_fleet(&path, Some("a/b"), &ControlPlane::None).is_err());
+        set_fleet(&path, None, &ControlPlane::Other("k".into())).unwrap();
+        assert_eq!(call("member.get", Value::Null).unwrap().unwrap()["control_plane"], "k");
+        set_fleet(&path, Some("box"), &ControlPlane::None).unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().control_plane(), ControlPlane::None, "cleared");
 
         // Hand edits survive a set; a refused set changes nothing.
         update(&path, |m| m.dev_builds = true).unwrap();

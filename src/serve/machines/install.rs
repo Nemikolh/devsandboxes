@@ -217,7 +217,7 @@ pub fn install(entry: &Entry, dest: Option<&str>, binary: &Path) -> Result<Strin
 
 /// [`INSTALL`] run on this host (`sh -c INSTALL sh <dest>`), `binary` on its
 /// stdin: the same temp file, `--version` check and rename over `dest`.
-/// For a fleet worker following its hub (`fleet::update`).
+/// For a fleet worker following its control plane (`fleet::update`).
 pub fn install_local(dest: &Path, binary: &Path) -> Result<String> {
     install_with(&local_install_argv(dest), binary).with_context(|| format!("cannot install devsandbox at {}", dest.display()))
 }

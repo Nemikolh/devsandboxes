@@ -20,15 +20,15 @@
 //!   `<fleet root>/roots/<hash>/`; `bundle` into the repo's cache
 //!   `<fleet root>/repos/<repo id>.git`, then a checkout below the root cut
 //!   from it; a `bundle` with no `to` into the cache only.
-//! - **mirror** ([`mirror`], on a member placing elsewhere than its hub):
-//!   the same refs again into the hub's cache, best effort (decision 75).
+//! - **mirror** ([`mirror`], on a member placing elsewhere than its control plane):
+//!   the same refs again into the control plane's cache, best effort (decision 75).
 //! - **pull** ([`Transfer::pull`], [`fetch`]): fetch-back (decision 76), a
 //!   placed instance's branch and WIP bundled on the worker for the host
 //!   that placed it, pulled by that host into its own checkout's hidden
 //!   refs.
 //!
 //! The layout keeps every `folder` where the config says, relative to the
-//! root: the tar's members sit under the root's last components on the hub
+//! root: the tar's members sit under the root's last components on the control plane
 //! (as many as the folders climb with `..`, [`layout`]), so `../web` from
 //! `/w/cfg` is `<hash>/cfg` and `<hash>/web` on the worker.
 //! [`prepare`] is offer + send.
@@ -270,7 +270,7 @@ pub struct Layout {
 /// canonical) below the transferred tree, pure. Each folder's path relative
 /// to `root` climbs `n` times (`..`) then goes down; the root sits under
 /// its last `max(n)` components (at least one, its own name), so every
-/// folder's relative path resolves inside the tree, with the hub's names.
+/// folder's relative path resolves inside the tree, with the control plane's names.
 /// Refused (as why): a folder at or in the root, one holding the root, two
 /// folders where one holds the other, a root too shallow for its folders.
 pub fn layout(root: &Path, folders: &[PathBuf]) -> Result<Layout, String> {
@@ -355,14 +355,14 @@ pub struct Prepared {
     /// mounts; one in use keeps what it has checked out and gets that
     /// branch updated, `repo::land_from`).
     pub folders: Vec<(PathBuf, PathBuf, String)>,
-    /// What each repo's bundle carried, for the hub mirror ([`mirror`]).
+    /// What each repo's bundle carried, for the control-plane mirror ([`mirror`]).
     pub sent: Vec<Sent>,
-    /// Lines for the run's output after the placement's (the hub mirror's
+    /// Lines for the run's output after the placement's (the control-plane mirror's
     /// failures); set by the caller, [`send`] leaves it empty.
     pub notes: Vec<String>,
 }
 
-/// One repo [`send`] sent: the hub mirror sends the same refs again.
+/// One repo [`send`] sent: the control-plane mirror sends the same refs again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sent {
     /// The repo's identity.
@@ -645,20 +645,20 @@ pub fn send(offer: &Offer, worker_root: &Path, t: &dyn Transfer) -> Result<Prepa
     Ok(Prepared { remote_root: tree.join(&offer.layout.root), folders, sent, notes: Vec::new() })
 }
 
-/// The hub mirror (fleet plan decision 75): each of `sent` again, through
-/// `t` (the hub's link), into the hub's cache of that repo only: one
-/// `code.haves`, then per repo a bundle from its checkout `--not` the hub's
+/// The control-plane mirror (fleet plan decision 75): each of `sent` again, through
+/// `t` (the control plane's link), into the control plane's cache of that repo only: one
+/// `code.haves`, then per repo a bundle from its checkout `--not` the control plane's
 /// tips of the same refs at the same commits (each pointed at by a
 /// transient `repo::TempRef`, so a snapshot no ref names any more still
 /// goes), a header with no `to` (no checkout there, no root needed); a
-/// body of 0 bytes when the hub has it all. Best effort: each repo that
-/// didn't make it, with why (all of them when the hub can't be asked).
+/// body of 0 bytes when the control plane has it all. Best effort: each repo that
+/// didn't make it, with why (all of them when the control plane can't be asked).
 pub fn mirror(sent: &[Sent], t: &dyn Transfer) -> Vec<(PathBuf, String)> {
     let ids: Vec<String> = sent.iter().map(|s| s.id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
     let haves = match t.haves(&ids) {
         Ok(h) => h,
         Err(e) => {
-            let why = format!("{:#}", e.context("cannot ask the hub what it has"));
+            let why = format!("{:#}", e.context("cannot ask the control plane what it has"));
             return sent.iter().map(|s| (s.host.clone(), why.clone())).collect();
         }
     };
@@ -881,7 +881,7 @@ fn next_seq() -> u32 {
 ///   one, or one `in_use` says no instance mounts, is cut to what was sent,
 ///   the WIP applied; one in use keeps its working tree, a line logged
 ///   when its branch stays), every dir on the way a real one (no symlink).
-/// - `bundle` with no `to` (the hub mirror, [`mirror`]): cache-only, the
+/// - `bundle` with no `to` (the control-plane mirror, [`mirror`]): cache-only, the
 ///   same checks of `repo` and `refs`, into `repos/<repo>.git` with its
 ///   refs set, no checkout and no root needed.
 ///
@@ -1416,9 +1416,9 @@ mod tests {
     fn link_with(dir: &Path, fleet: &Path, in_use: InUse) -> PathBuf {
         use crate::devsbd::proto::channel;
         use crate::serve::fleet::link::{Endpoint, Serves, answerer_with, opener_with};
-        let hub_dir = dir.join("hub");
-        std::fs::create_dir_all(&hub_dir).unwrap();
-        let socket = endpoint::fleet_socket(&hub_dir, "w");
+        let control_plane_dir = dir.join("cp");
+        std::fs::create_dir_all(&control_plane_dir).unwrap();
+        let socket = endpoint::fleet_socket(&control_plane_dir, "w");
         let ours = Serves::default().transfers(Arc::new(Receivers::new(|_| {})));
         let api_fleet = fleet.to_path_buf();
         let api = move || {
@@ -1484,7 +1484,7 @@ mod tests {
         git(&lib, &["checkout", "-q", "feature"]);
         std::fs::write(web.join("README"), "dirty\n").unwrap();
         let before = (source_state(&web), source_state(&lib));
-        let fleet = dir.join("worker/fleet/hub");
+        let fleet = dir.join("worker/fleet/control_plane");
         let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
 
         // `feature` isn't checked out in `web`: it moves as committed, no WIP.
@@ -1548,7 +1548,7 @@ mod tests {
         std::fs::write(web.join("x.log"), "ignored\n").unwrap();
         assert_eq!(git(&web, &["remote"]), "", "no origin");
         let before = source_state(&web);
-        let fleet = dir.join("worker/fleet/hub");
+        let fleet = dir.join("worker/fleet/control_plane");
         let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
 
         let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
@@ -1577,7 +1577,7 @@ mod tests {
         std::fs::write(web.join("a"), "a\n").unwrap();
         std::fs::write(web.join("sub/b"), "b\n").unwrap();
         std::fs::write(cfg.join("devsandboxes.toml"), "[sandbox.web]\nfolder = \"../fresh\"\nimage = \"img\"\n").unwrap();
-        let fleet = dir.join("worker/fleet/hub");
+        let fleet = dir.join("worker/fleet/control_plane");
         let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
 
         let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
@@ -1667,7 +1667,7 @@ mod tests {
         std::fs::write(web.join("bulk"), bulk).unwrap();
         git(&web, &["add", "bulk"]);
         git(&web, &["commit", "-q", "-m", "bulk"]);
-        let fleet = dir.join("worker/fleet/hub");
+        let fleet = dir.join("worker/fleet/control_plane");
         let link = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
         let t = Recorded { inner: &link, sent: Mutex::default() };
         let id = repo::identity(Repo::Checkout(&web), "HEAD").unwrap();
@@ -1717,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn the_hub_mirror_fills_the_hubs_cache_only() {
+    fn the_control_plane_mirror_fills_the_control_planes_cache_only() {
         let dir = scratch("mirror");
         let cfg = fixture(&dir);
         let web = dir.join("web");
@@ -1727,10 +1727,10 @@ mod tests {
         git(&web, &["commit", "-q", "-m", "bulk"]);
         std::fs::write(web.join("README"), "dirty\n").unwrap();
         let before = source_state(&web);
-        let (worker, hub) = (dir.join("worker/fleet/m"), dir.join("hub/fleet/m"));
+        let (worker, control_plane) = (dir.join("worker/fleet/m"), dir.join("cp/fleet/m"));
         let to_worker = LinkTransfer::for_worker(link(&dir.join("w"), &worker).parent().unwrap(), "w");
-        let to_hub = LinkTransfer::for_worker(link(&dir.join("k"), &hub).parent().unwrap(), "w");
-        let t = Recorded { inner: &to_hub, sent: Mutex::default() };
+        let to_control_plane = LinkTransfer::for_worker(link(&dir.join("k"), &control_plane).parent().unwrap(), "w");
+        let t = Recorded { inner: &to_control_plane, sent: Mutex::default() };
         let none = Vec::<(PathBuf, String)>::new();
 
         let got = prepare(&to_worker, &worker, &cfg, "web", None).unwrap();
@@ -1741,17 +1741,17 @@ mod tests {
         let first = t.take();
         assert!(matches!(first.as_slice(), [(k, n)] if k == "bundle" && *n > 0), "{first:?}");
         // The same refs at the same commits as the worker's cache, nothing else.
-        let (hub_cache, worker_cache) = (cache_path(&hub, &sent.id), cache_path(&worker, &sent.id));
+        let (control_plane_cache, worker_cache) = (cache_path(&control_plane, &sent.id), cache_path(&worker, &sent.id));
         let refs = |c: &Path| git(c, &["for-each-ref", "--format=%(refname) %(objectname)"]);
-        assert_eq!(refs(&hub_cache), refs(&worker_cache));
-        assert_eq!(git(&hub_cache, &["rev-parse", "refs/heads/main"]), git(&web, &["rev-parse", "main"]));
-        let wip = git(&hub_cache, &["rev-parse", &repo::wip_ref("main")]);
-        assert_eq!(git(&hub_cache, &["show", &format!("{wip}:README")]), "dirty");
-        assert!(!hub.join("roots").exists(), "no root, no checkout");
-        let mut entries: Vec<String> = std::fs::read_dir(hub.join("repos")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert_eq!(refs(&control_plane_cache), refs(&worker_cache));
+        assert_eq!(git(&control_plane_cache, &["rev-parse", "refs/heads/main"]), git(&web, &["rev-parse", "main"]));
+        let wip = git(&control_plane_cache, &["rev-parse", &repo::wip_ref("main")]);
+        assert_eq!(git(&control_plane_cache, &["show", &format!("{wip}:README")]), "dirty");
+        assert!(!control_plane.join("roots").exists(), "no root, no checkout");
+        let mut entries: Vec<String> = std::fs::read_dir(control_plane.join("repos")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         entries.sort();
         assert_eq!(entries, [".in".to_string(), format!("{}.git", sent.id)]);
-        assert_eq!(std::fs::read_dir(hub.join("repos/.in")).unwrap().count(), 0, "no body left behind");
+        assert_eq!(std::fs::read_dir(control_plane.join("repos/.in")).unwrap().count(), 0, "no body left behind");
 
         // Nothing new: a 0-byte body, still ok.
         assert_eq!(mirror(&got.sent, &t), none);
@@ -1766,7 +1766,7 @@ mod tests {
         assert_eq!(mirror(&again.sent, &t), none);
         let second = t.take();
         assert!(second.len() == 1 && second[0].1 > 0 && second[0].1 < first[0].1, "a delta: {second:?} after {first:?}");
-        assert_eq!(refs(&hub_cache), refs(&worker_cache));
+        assert_eq!(refs(&control_plane_cache), refs(&worker_cache));
         assert_no_leftovers(&web);
 
         // A commit the checkout doesn't have: that repo's failure, no ref left.
@@ -1774,7 +1774,7 @@ mod tests {
         let failed = mirror(std::slice::from_ref(&gone), &t);
         assert!(matches!(failed.as_slice(), [(h, why)] if *h == web && why.contains("cannot point a ref at")), "{failed:?}");
         assert_no_leftovers(&web);
-        // A hub that can't be asked: every repo's failure.
+        // A control plane that can't be asked: every repo's failure.
         struct NoHaves;
         impl Transfer for NoHaves {
             fn haves(&self, _: &[String]) -> Result<Haves> {
@@ -1784,7 +1784,7 @@ mod tests {
                 unreachable!()
             }
         }
-        assert_eq!(mirror(&got.sent, &NoHaves), [(web.clone(), "cannot ask the hub what it has: unreachable".to_string())]);
+        assert_eq!(mirror(&got.sent, &NoHaves), [(web.clone(), "cannot ask the control plane what it has: unreachable".to_string())]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1794,7 +1794,7 @@ mod tests {
         let cfg = fixture(&dir);
         let web = dir.join("web");
         std::fs::write(web.join("README"), "dirty\n").unwrap();
-        let fleet = dir.join("worker/fleet/hub");
+        let fleet = dir.join("worker/fleet/control_plane");
         let t = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
         let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
         let moved = crate::serve::fleet::placed::MovedFolder::of(&got).unwrap();
@@ -1933,7 +1933,7 @@ mod tests {
         std::fs::write(web.join(".gitignore"), "*.log\n").unwrap();
         git(&web, &["add", ".gitignore"]);
         git(&web, &["commit", "-q", "-m", "ignore"]);
-        let fleet = dir.join("worker/fleet/hub");
+        let fleet = dir.join("worker/fleet/control_plane");
         let t = LinkTransfer::for_worker(link_with(&dir, &fleet, Arc::new(move |_| in_use)).parent().unwrap(), "w");
         std::fs::write(web.join("README"), "wip 1\n").unwrap();
         std::fs::write(web.join("U"), "u\n").unwrap();
@@ -1981,8 +1981,8 @@ mod tests {
         std::fs::write(web.join("README"), "three\n").unwrap();
         git(&web, &["commit", "-q", "-am", "three"]);
         let cfg = dir.join("cfg");
-        let fleet = dir.join("worker/fleet/hub");
-        let t = LinkTransfer::for_worker(&dir.join("hub"), "w");
+        let fleet = dir.join("worker/fleet/control_plane");
+        let t = LinkTransfer::for_worker(&dir.join("cp"), "w");
         prepare(&t, &fleet, &cfg, "web", None).unwrap();
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), git(&web, &["rev-parse", "main"]));
         assert_eq!(std::fs::read_to_string(checkout.join("README")).unwrap(), "three\n");

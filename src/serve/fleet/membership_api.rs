@@ -8,8 +8,8 @@
 //! [`adopt_into`], [`can_sign`] and [`sign_into`] are the pure rules, which
 //! `machines.add` also runs over both ends' logs before writing anything
 //! (`machines::join::logs`); [`call`] does the I/O. An adopt writes
-//! `member.toml`'s `hub` from the log it accepted (`member::set_fleet`): the
-//! only way a hub is set. [`sync`] is the same store for a pushed log
+//! `member.toml`'s `control_plane` from the log it accepted (`member::set_fleet`): the
+//! only way a control plane is set. [`sync`] is the same store for a pushed log
 //! (`fleet.sync`, `machines::changes`), which may revoke this host.
 //!
 //! A pending key rotation (`member.key.next`, `machine key rotate`) is
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::identity::{FileKeyStore, KeyStore, PublicKey, Signer, SigningKey};
-use super::member::{self, Hub, check_member_name};
+use super::member::{self, ControlPlane, check_member_name};
 use super::membership::{self, Compare, Head, Introduction, Op, Stored, Wire};
 use crate::serve::api::{ApiError, parse};
 
@@ -51,7 +51,7 @@ pub struct IntroInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub authority: Option<String>,
-    pub hub: Option<String>,
+    pub control_plane: Option<String>,
     pub members: BTreeMap<String, KeyInfo>,
     pub introductions: Vec<IntroInfo>,
     pub head: Head,
@@ -81,7 +81,7 @@ impl MembershipInfo {
         let key_info = KeyInfo::of;
         let summary = Summary {
             authority: m.map(|m| m.authority.0.clone()),
-            hub: m.map(|m| m.hub.clone()),
+            control_plane: m.map(|m| m.control_plane.clone()),
             members: m.map(|m| m.members.iter().map(|(n, k)| (n.clone(), key_info(k))).collect()).unwrap_or_default(),
             introductions: stored
                 .map(|s| {
@@ -138,7 +138,7 @@ pub fn adopt_into(ours: &Stored, theirs: &Stored, own: &Own) -> Result<Stored, A
 }
 
 /// [`adopt_into`] for a pushed log (`fleet.sync`): one that revokes this
-/// host's own key is taken too, so the hub's `fleet.leave` that follows a
+/// host's own key is taken too, so the control plane's `fleet.leave` that follows a
 /// revoke finds it here (decision 32; fleet plan 10a.6).
 pub fn sync_into(ours: &Stored, theirs: &Stored, own: &Own) -> Result<Stored, ApiError> {
     take_into(ours, theirs, own, true)
@@ -207,10 +207,10 @@ pub fn can_sign(ours: &Stored, own: &Own, name: &str, key: &PublicKey) -> Result
         return Ok(Signs::Already);
     }
     if m.members.contains_key(name) || ours.introductions.iter().any(|i| i.name == name) {
-        return Err(ApiError::invalid(format!("`{name}` is already in `{}`'s fleet", m.hub)));
+        return Err(ApiError::invalid(format!("`{name}` is already in `{}`'s fleet", m.control_plane)));
     }
     if m.is_member_key(key) || m.revoked.contains(key) || ours.introductions.iter().any(|i| i.key == *key) {
-        return Err(ApiError::invalid(format!("key {} is already known to `{}`'s fleet", key.fingerprint(), m.hub)));
+        return Err(ApiError::invalid(format!("key {} is already known to `{}`'s fleet", key.fingerprint(), m.control_plane)));
     }
     if m.authority.0 == own.name && m.is_authority(&own.key) {
         return Ok(Signs::Add);
@@ -311,8 +311,8 @@ pub fn load(member_toml: &Path) -> Result<Option<Stored>, ApiError> {
 pub struct Taken {
     /// What's stored now.
     pub stored: Stored,
-    /// The hub written from it, for the daemon to follow.
-    pub hub: Hub,
+    /// The control plane written from it, for the daemon to follow.
+    pub control_plane: ControlPlane,
     /// The store changed the log or its introductions.
     pub changed: bool,
     /// It promoted this host's pending next key (a rotate of it is in): the
@@ -322,7 +322,7 @@ pub struct Taken {
 }
 
 /// `membership.adopt`: `theirs` taken ([`adopt_into`]) and stored, then
-/// `member.toml`'s `hub` (and the name the log knows this host by) written
+/// `member.toml`'s `control_plane` (and the name the log knows this host by) written
 /// from the log, and a pending rotation the log lists promoted.
 pub fn adopt(member_toml: &Path, hostname: &str, theirs: &Stored) -> Result<Taken, ApiError> {
     take(member_toml, hostname, theirs, adopt_into)
@@ -348,9 +348,9 @@ fn take(member_toml: &Path, hostname: &str, theirs: &Stored, rule: Take) -> Resu
     .map_err(ApiError::internal)??;
     // A rotate of this host's key is in: the next key is the key now.
     let settled = settle(&FileKeyStore::new(member::key_path(member_toml)), &name, Some(&after)).map_err(ApiError::internal)?;
-    let hub = membership::hub_for(after.log.membership().expect("adopted"), &name);
-    member::set_fleet(member_toml, Some(&name), &hub).map_err(ApiError::internal)?;
-    Ok(Taken { stored: after, hub, changed, rotated: settled.promoted })
+    let control_plane = membership::control_plane_for(after.log.membership().expect("adopted"), &name);
+    member::set_fleet(member_toml, Some(&name), &control_plane).map_err(ApiError::internal)?;
+    Ok(Taken { stored: after, control_plane, changed, rotated: settled.promoted })
 }
 
 /// `membership.sign`: `name` (`key`) let in here ([`sign_into`]), stored;
@@ -377,11 +377,11 @@ fn to_value(x: impl Serialize) -> Answer {
     serde_json::to_value(x).map_err(|e| ApiError::internal(e.into()))
 }
 
-/// What the daemon follows after an adopt: the hub it wrote, and whether it
+/// What the daemon follows after an adopt: the control plane it wrote, and whether it
 /// promoted this host's next key (every link then ends and redials).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Follow {
-    pub hub: Hub,
+    pub control_plane: ControlPlane,
     pub rotated: bool,
 }
 
@@ -399,7 +399,7 @@ pub fn call(method: &str, params: Value, member_toml: &Path, hostname: &str) -> 
                 .and_then(|theirs| adopt(member_toml, hostname, &theirs))
                 .and_then(|t| Ok((MembershipInfo { next: pending_next(member_toml)?, ..MembershipInfo::of(Some(&t.stored)) }, t)));
             match adopted {
-                Ok((info, t)) => (to_value(info), Some(Follow { hub: t.hub, rotated: t.rotated })),
+                Ok((info, t)) => (to_value(info), Some(Follow { control_plane: t.control_plane, rotated: t.rotated })),
                 Err(e) => (Err(e), None),
             }
         }
@@ -424,11 +424,11 @@ pub mod test_support {
         FileKeyStore::new(member::key_path(member_toml)).signing_key().unwrap()
     }
 
-    /// A fleet whose authority is `authority` (signing with `key`), hub
-    /// `hub`, then `members` added in order.
-    pub fn fleet(authority: &str, key: &SigningKey, hub: &str, members: &[(&str, PublicKey)]) -> Stored {
+    /// A fleet whose authority is `authority` (signing with `key`), control plane
+    /// `control_plane`, then `members` added in order.
+    pub fn fleet(authority: &str, key: &SigningKey, control_plane: &str, members: &[(&str, PublicKey)]) -> Stored {
         let mut log = Log::default();
-        log.append(Op::genesis(authority, key.public_key(), hub).unwrap(), authority, key).unwrap();
+        log.append(Op::genesis(authority, key.public_key(), control_plane).unwrap(), authority, key).unwrap();
         for (name, k) in members {
             log.append(Op::Add { name: name.to_string(), key: *k }, authority, key).unwrap();
         }
@@ -441,11 +441,11 @@ pub mod test_support {
     }
 
     /// A fleet of `members` (each a name and its `member.toml`, the first
-    /// the authority), hub `hub`, written as every member's
+    /// the authority), control plane `control_plane`, written as every member's
     /// `membership.json`: each `member.toml` gets its name (its other
     /// fields kept), each member its `member.key`, as a fleet-creating
     /// `machine add` leaves them. The log, for a test to extend.
-    pub fn fleet_of(hub: &str, members: &[(&str, &Path)]) -> Stored {
+    pub fn fleet_of(control_plane: &str, members: &[(&str, &Path)]) -> Stored {
         for (name, toml) in members {
             let mut m = member::load(toml).unwrap().unwrap_or_default();
             m.name = name.to_string();
@@ -453,7 +453,7 @@ pub mod test_support {
         }
         let (authority, first) = members[0];
         let added: Vec<(&str, PublicKey)> = members[1..].iter().map(|(n, t)| (*n, key_of(t).public_key())).collect();
-        let stored = fleet(authority, &key_of(first), hub, &added);
+        let stored = fleet(authority, &key_of(first), control_plane, &added);
         for (_, toml) in members {
             write(toml, &stored);
         }
@@ -485,7 +485,7 @@ mod tests {
         Own { name, key: pk(n), next: None }
     }
 
-    /// `lap` (1) the authority, `box` (2) the hub, `pi` (3) a member.
+    /// `lap` (1) the authority, `box` (2) the control plane, `pi` (3) a member.
     fn three() -> Stored {
         fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", pk(3))])
     }
@@ -562,7 +562,7 @@ mod tests {
         assert!(e.code == "denied" && e.message.contains("introduction of `new` by `box`"), "{}", e.message);
     }
 
-    /// A pushed log revoking this host's own key is taken (the hub's
+    /// A pushed log revoking this host's own key is taken (the control plane's
     /// `fleet.leave` follows it); an adopt refuses it, as it does any log
     /// that doesn't list this host.
     #[test]
@@ -652,22 +652,22 @@ mod tests {
         let mine = test_support::key_of(&member_toml);
         let call = |m: &str, p: Value| super::call(m, p, &member_toml, "host").unwrap();
         // Nothing stored: an empty summary.
-        let (got, hub) = call("membership.get", Value::Null);
-        assert_eq!(hub, None);
+        let (got, control_plane) = call("membership.get", Value::Null);
+        assert_eq!(control_plane, None);
         let head = serde_json::to_value(Head::EMPTY).unwrap();
-        assert_eq!(got.unwrap(), json!({"stored": null, "summary": {"authority": null, "hub": null, "members": {}, "introductions": [], "head": head}, "next": null}));
+        assert_eq!(got.unwrap(), json!({"stored": null, "summary": {"authority": null, "control_plane": null, "members": {}, "introductions": [], "head": head}, "next": null}));
         let (e, _) = call("membership.sign", json!({"name": "new", "key": pk(5)}));
         assert_eq!(e.unwrap_err().code, "denied", "in no fleet");
 
-        // Adopted: stored, the hub written from it, the name pinned.
+        // Adopted: stored, the control plane written from it, the name pinned.
         let s = fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", mine.public_key())]);
-        let (got, hub) = call("membership.adopt", serde_json::to_value(s.to_wire()).unwrap());
+        let (got, control_plane) = call("membership.adopt", serde_json::to_value(s.to_wire()).unwrap());
         let got = got.unwrap();
-        assert_eq!(hub, Some(Follow { hub: Hub::Other("box".into()), rotated: false }));
-        assert_eq!((&got["summary"]["authority"], &got["summary"]["hub"]), (&json!("lap"), &json!("box")));
+        assert_eq!(control_plane, Some(Follow { control_plane: ControlPlane::Other("box".into()), rotated: false }));
+        assert_eq!((&got["summary"]["authority"], &got["summary"]["control_plane"]), (&json!("lap"), &json!("box")));
         assert_eq!(got["summary"]["members"]["pi"]["fingerprint"], mine.public_key().fingerprint());
         assert_eq!(test_support::read(&member_toml).unwrap(), s);
-        assert_eq!(member::load(&member_toml).unwrap().unwrap().hub(), Hub::Other("box".into()));
+        assert_eq!(member::load(&member_toml).unwrap().unwrap().control_plane(), ControlPlane::Other("box".into()));
         assert_eq!(call("membership.get", Value::Null).0.unwrap(), got);
 
         // A member signs an introduction, stores it and answers the whole.
@@ -682,8 +682,8 @@ mod tests {
 
         // Refused: another fleet's log, one without this host, a bad one.
         let other = fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", mine.public_key())]);
-        let (e, hub) = call("membership.adopt", serde_json::to_value(other.to_wire()).unwrap());
-        assert_eq!((e.unwrap_err().code, hub), ("denied", None));
+        let (e, control_plane) = call("membership.adopt", serde_json::to_value(other.to_wire()).unwrap());
+        assert_eq!((e.unwrap_err().code, control_plane), ("denied", None));
         let without = fleet("lap", &key(1), "lap", &[]);
         assert_eq!(call("membership.adopt", serde_json::to_value(without.to_wire()).unwrap()).0.unwrap_err().code, "denied");
         let mut bad = serde_json::to_value(s.to_wire()).unwrap();

@@ -1,6 +1,6 @@
 //! Membership changes proposed to the authority (docs/architecture/daemon/fleet.md,
 //! *Approvals*; fleet plan step 10a.6, decision 49): a member's `machine rm`,
-//! its `machine key rotate`, its `machine hub`, or the introduction its
+//! its `machine key rotate`, its `machine control-plane`, or the introduction its
 //! `machine add` signed reaches the authority as
 //! `fleet.propose {op}` and waits in `proposals.json` (next to
 //! `membership.json`, [`path`]) until the user runs `devsandbox machine
@@ -22,7 +22,7 @@ use super::membership::{Introduction, Membership, Op, check_introduction};
 
 /// A proposed change. On the wire tagged by `kind`: `{"kind": "revoke",
 /// "name": "pi"}`, `{"kind": "add", "introduction": {…}}`, `{"kind":
-/// "rotate", "name": "pi", "old": …, "new": …, "by_old": …}`, `{"kind": "hub",
+/// "rotate", "name": "pi", "old": …, "new": …, "by_old": …}`, `{"kind": "control plane",
 /// "name": "pi"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -34,17 +34,17 @@ pub enum Change {
     /// The proposer's own key from `old` to `new`, countersigned by `old`
     /// (`membership::countersign_rotate`): a `rotate` entry as is.
     Rotate { name: String, old: PublicKey, new: PublicKey, by_old: Signature },
-    /// The fleet's hub role moved to member `name`: a `hub` entry.
-    Hub { name: String },
+    /// The fleet's control-plane role moved to member `name`: a `control_plane` entry.
+    ControlPlane { name: String },
 }
 
 impl Change {
     /// The same change as `other`: a revoke of the same name, an add of the
-    /// same name and key, a rotate of the same name to the same key, a hub
+    /// same name and key, a rotate of the same name to the same key, a control plane
     /// of the same name.
     fn same(&self, other: &Change) -> bool {
         match (self, other) {
-            (Change::Revoke { name: a }, Change::Revoke { name: b }) | (Change::Hub { name: a }, Change::Hub { name: b }) => a == b,
+            (Change::Revoke { name: a }, Change::Revoke { name: b }) | (Change::ControlPlane { name: a }, Change::ControlPlane { name: b }) => a == b,
             (Change::Add { introduction: a }, Change::Add { introduction: b }) => a.name == b.name && a.key == b.key,
             (Change::Rotate { name: a, new: x, .. }, Change::Rotate { name: b, new: y, .. }) => a == b && x == y,
             _ => false,
@@ -55,7 +55,7 @@ impl Change {
     pub fn subject(&self) -> &str {
         match self {
             Change::Add { introduction } => &introduction.name,
-            Change::Revoke { name } | Change::Rotate { name, .. } | Change::Hub { name } => name,
+            Change::Revoke { name } | Change::Rotate { name, .. } | Change::ControlPlane { name } => name,
         }
     }
 }
@@ -68,19 +68,19 @@ impl fmt::Display for Change {
             }
             Change::Revoke { name } => write!(f, "remove {name} from the fleet"),
             Change::Rotate { name, new, .. } => write!(f, "rotate {name}'s key to {}", new.fingerprint()),
-            Change::Hub { name } => write!(f, "make {name} the fleet's hub"),
+            Change::ControlPlane { name } => write!(f, "make {name} the fleet's control plane"),
         }
     }
 }
 
 /// The entry `change`, proposed by member `from`, makes the authority sign,
 /// checked against `m` (pure): a revoke of a member's current key (not the
-/// authority's, not the hub's), an add of an introduction that holds
+/// authority's, not the control plane's), an add of an introduction that holds
 /// ([`check_introduction`]: its introducer a member of the log, its name
 /// and key new), or a rotate of `from`'s own key (a member rotates only its
 /// own): from its current key, countersigned by it, to a key the log
-/// doesn't know; a hub of a member of the log that isn't the hub already
-/// (an introduced member can't be the hub). Why not, else.
+/// doesn't know; a control plane of a member of the log that isn't the control plane already
+/// (an introduced member can't be the control plane). Why not, else.
 pub fn check(m: &Membership, from: &str, change: &Change) -> Result<Op, String> {
     match change {
         Change::Rotate { name, old, new, by_old } => {
@@ -98,8 +98,8 @@ pub fn check(m: &Membership, from: &str, change: &Change) -> Result<Op, String> 
             if *name == m.authority.0 {
                 return Err(format!("`{name}` is the fleet's authority: it can't be removed"));
             }
-            if *name == m.hub {
-                return Err(format!("`{name}` is the hub: move the role first (`devsandbox machine hub <m>`)"));
+            if *name == m.control_plane {
+                return Err(format!("`{name}` is the control plane: move the role first (`devsandbox machine control-plane <m>`)"));
             }
             let key = m.key_of(name).ok_or_else(|| format!("`{name}` is not a member of the fleet's membership log"))?;
             Ok(Op::Revoke { name: name.clone(), key })
@@ -108,14 +108,14 @@ pub fn check(m: &Membership, from: &str, change: &Change) -> Result<Op, String> 
             check_introduction(m, introduction).map_err(|e| format!("introduction of `{}` by `{}`: {e:#}", introduction.name, introduction.introducer))?;
             Ok(Op::Add { name: introduction.name.clone(), key: introduction.key })
         }
-        Change::Hub { name } => {
-            if *name == m.hub {
-                return Err(format!("`{name}` is the hub already"));
+        Change::ControlPlane { name } => {
+            if *name == m.control_plane {
+                return Err(format!("`{name}` is the control plane already"));
             }
             if !m.members.contains_key(name) {
-                return Err(format!("`{name}` is not a member of the fleet's membership log: only a member can be the hub"));
+                return Err(format!("`{name}` is not a member of the fleet's membership log: only a member can be the control plane"));
             }
-            Ok(Op::Hub { name: name.clone() })
+            Ok(Op::ControlPlane { name: name.clone() })
         }
     }
 }
@@ -206,7 +206,7 @@ mod tests {
         key(n).public_key()
     }
 
-    /// `lap` (1) the authority, `box` (2) the hub, `pi` (3).
+    /// `lap` (1) the authority, `box` (2) the control plane, `pi` (3).
     fn three() -> Membership {
         fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", pk(3))]).log.membership().unwrap().clone()
     }
@@ -220,7 +220,7 @@ mod tests {
         let m = three();
         assert_eq!(check(&m, "box", &revoke("pi")), Ok(Op::Revoke { name: "pi".into(), key: pk(3) }));
         assert!(check(&m, "box", &revoke("lap")).unwrap_err().contains("the fleet's authority"));
-        assert!(check(&m, "pi", &revoke("box")).unwrap_err().contains("is the hub: move the role first (`devsandbox machine hub <m>`)"));
+        assert!(check(&m, "pi", &revoke("box")).unwrap_err().contains("is the control plane: move the role first (`devsandbox machine control-plane <m>`)"));
         assert!(check(&m, "pi", &revoke("zed")).unwrap_err().contains("not a member"));
         let by_pi = Introduction::sign(&m.genesis, "new", pk(5), "pi", &key(3));
         assert_eq!(check(&m, "pi", &Change::Add { introduction: by_pi }), Ok(Op::Add { name: "new".into(), key: pk(5) }));
@@ -278,29 +278,29 @@ mod tests {
     }
 
     #[test]
-    fn a_hub_is_a_member_of_the_log_not_the_hub_already() {
+    fn a_control_plane_is_a_member_of_the_log_not_the_control_plane_already() {
         let mut s = fleet("lap", &key(1), "box", &[("box", pk(2)), ("pi", pk(3))]);
         let g = s.log.membership().unwrap().genesis;
         s.introduce(Introduction::sign(&g, "new", pk(5), "pi", &key(3))).unwrap();
         let m = s.log.membership().unwrap();
-        let hub = |name: &str| Change::Hub { name: name.into() };
-        // Any member proposes it; the authority can be the hub too.
-        assert_eq!(check(m, "pi", &hub("pi")), Ok(Op::Hub { name: "pi".into() }));
-        assert_eq!(check(m, "box", &hub("lap")), Ok(Op::Hub { name: "lap".into() }));
-        assert_eq!(check(m, "pi", &hub("box")), Err("`box` is the hub already".into()));
+        let control_plane = |name: &str| Change::ControlPlane { name: name.into() };
+        // Any member proposes it; the authority can be the control plane too.
+        assert_eq!(check(m, "pi", &control_plane("pi")), Ok(Op::ControlPlane { name: "pi".into() }));
+        assert_eq!(check(m, "box", &control_plane("lap")), Ok(Op::ControlPlane { name: "lap".into() }));
+        assert_eq!(check(m, "pi", &control_plane("box")), Err("`box` is the control plane already".into()));
         // Introduced (capped) or unknown: not in the log.
         for name in ["new", "zed"] {
-            assert!(check(m, "pi", &hub(name)).unwrap_err().contains("is not a member of the fleet's membership log"), "{name}");
+            assert!(check(m, "pi", &control_plane(name)).unwrap_err().contains("is not a member of the fleet's membership log"), "{name}");
         }
         let mut q = Proposals::default();
-        assert_eq!(q.queue("pi", hub("pi"), 1), (1, true));
-        assert_eq!(q.queue("box", hub("pi"), 2), (1, false), "the same name: its id");
-        assert_eq!(q.queue("pi", hub("lap"), 3), (2, true));
-        assert_eq!(q.queue("pi", revoke("pi"), 4), (3, true), "a revoke of the name isn't a hub of it");
-        assert_eq!((hub("pi").subject(), hub("pi").to_string()), ("pi", "make pi the fleet's hub".to_string()));
-        let wire = serde_json::to_value(hub("pi")).unwrap();
-        assert_eq!(wire, json!({"kind": "hub", "name": "pi"}));
-        assert_eq!(serde_json::from_value::<Change>(wire).unwrap(), hub("pi"));
+        assert_eq!(q.queue("pi", control_plane("pi"), 1), (1, true));
+        assert_eq!(q.queue("box", control_plane("pi"), 2), (1, false), "the same name: its id");
+        assert_eq!(q.queue("pi", control_plane("lap"), 3), (2, true));
+        assert_eq!(q.queue("pi", revoke("pi"), 4), (3, true), "a revoke of the name isn't a control plane of it");
+        assert_eq!((control_plane("pi").subject(), control_plane("pi").to_string()), ("pi", "make pi the fleet's control plane".to_string()));
+        let wire = serde_json::to_value(control_plane("pi")).unwrap();
+        assert_eq!(wire, json!({"kind": "control_plane", "name": "pi"}));
+        assert_eq!(serde_json::from_value::<Change>(wire).unwrap(), control_plane("pi"));
     }
 
     #[test]

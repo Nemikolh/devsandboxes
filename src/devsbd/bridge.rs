@@ -190,7 +190,7 @@ const MAX_AGENTS: usize = 8;
 /// `machines.get {agent}` (docs/reference/api.md). Only the daemon
 /// gets reports; everywhere else the list stays empty and [`pick`](Self::pick)
 /// goes on to the relayed agents' sockets in the socket dir (a linking
-/// host's `agent-link-<host>.sock`, a hub's `agent-fleet-<hub>.sock`)
+/// host's `agent-link-<host>.sock`, a control plane's `agent-fleet-<control-plane>.sock`)
 /// (docs/architecture/daemon/machines.md, *Agent*), then the own
 /// `$SSH_AUTH_SOCK`. The reports are what keep the daemon's relay working
 /// when the agent it inherited is gone or rotated (a new `ssh -A` session):

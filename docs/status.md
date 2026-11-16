@@ -39,22 +39,22 @@ is frozen: no new work on it.
   → [plan](plans/active/machines-next.md)
 - **machines**: a fleet: every machine a member (one `machine add`,
   links routed over a graph, `worker`/`full` trust per member, a
-  swappable hub), soft-cap placement, devsandbox-owned code transfer
+  swappable control plane), soft-cap placement, devsandbox-owned code transfer
   between hosts, dispatcher children on any machine, checkpoints and
   re-placement: from fleet step 13 on. Steps 1-12 shipped: one kind of
   machine, one peer link per pair (`fleet-link --peer` on the dialed
   end, where the dialer is an inbound machine), every use over the
   link's channels and trust, ssh only for the link and `machine add`'s
-  probe; a laptop joins a hub with `machine add <hub>`; a hub (`hub =
+  probe; a laptop joins a control plane with `machine add <control-plane>`; a control plane (`control_plane =
   "self"` in `member.toml`, step 9a) places over every connected
-  machine, and a link between two hosts naming different hubs is
+  machine, and a link between two hosts naming different control planes is
   refused. `machine add` joins (step 9b): the end in no fleet takes the
-  other's hub, two ends in none make a fleet of two, two hubs are
-  refused. A member sees the fleet through its hub (step 9c: the
-  machines the hub links to show `via` it). `machine rm <m>` takes `m`
-  out of the fleet on the hub (a member's is sent there), `machine rm
+  other's control plane, two ends in none make a fleet of two, two control planes are
+  refused. A member sees the fleet through its control plane (step 9c: the
+  machines the control plane links to show `via` it). `machine rm <m>` takes `m`
+  out of the fleet on the control plane (a member's is sent there), `machine rm
   <this host>` leaves, `machine unlink <m>` only drops this host's link
-  (step 9d). A member's `run --place` is placed by the hub (step 9e,
+  (step 9d). A member's `run --place` is placed by the control plane (step 9e,
   `fleet.place`); a typed `run` without it stays on its member
   (decision 38). Member identity (step 10a): every member has a key,
   the fleet's membership is a log only its authority (the host that
@@ -67,12 +67,12 @@ is frozen: no new work on it.
   origin to its destination, which serves it under its trust for that
   origin; members reached only that way are routed machines, with
   actions, terminals, forwards, placement and fleet calls; `machine
-  trust worker` warns when a machine the hub's side controls dials this
+  trust worker` warns when a machine the control plane's side controls dials this
   host. End-to-end sessions (step 10c): each routed stream is encrypted
   between its two daemons, so a relay carries ciphertext only; agent
   access is a per-member grant (`machine set <m> agent on`), carried to
-  a granted member over any path. Hub swap (step 11): `machine hub <m>`
-  moves the role by a `hub` entry the authority signs (proposed and
+  a granted member over any path. Control-plane swap (step 11): `machine control-plane <m>`
+  moves the role by a `control_plane` entry the authority signs (proposed and
   approved there when typed elsewhere), links unchanged. Config
   versions: a `run`/`rebuild`/`start` typed on the authority signs its
   config root's hash as the root's next `config` version when it
@@ -88,7 +88,7 @@ is frozen: no new work on it.
   CLI alike ([ADR 0049](decisions/0049-the-authority-signs-a-config-every-member-runs.md)). Transfer v1
   (step 12): a placed run's folders move from their own checkouts with
   a WIP snapshot, no remote needed, into per-repo caches on the worker
-  (repeat sends carry only the delta) and on the hub, and `devsandbox
+  (repeat sends carry only the delta) and on the control plane, and `devsandbox
   fetch <machine>/<instance>` (also before `rm` / `done` there) brings
   the work back as hidden refs. Next: step 13, re-scoped to an
   external orchestrator's children and waiting on its interface (see
@@ -410,21 +410,21 @@ is frozen: no new work on it.
   that's a symlink replaces the link with a file (`install::INSTALL`'s
   `mv -f`). → [machines](architecture/daemon/machines.md#install)
 - Routed machines (no link of their own here) have no rows but the
-  hub's federated view's, one hop only (the machines the hub itself links
-  to), and a member watches its hub federated only while one of its own
+  control plane's federated view's, one hop only (the machines the control plane itself links
+  to), and a member watches its control plane federated only while one of its own
   watchers wants machines; a graph member the view doesn't list is a
   `machine ls` row with no roots, so the federated `sandboxes.list`
   doesn't ask it, and isn't on the dashboard's Machines tab, whose routed
-  rows are the view's, `via` the hub. A routed machine's forward is
+  rows are the view's, `via` the control plane. A routed machine's forward is
   dropped by a sync once it's no routed machine (no path in the graph,
-  not in the hub's view).
+  not in the control plane's view).
   → [machines](architecture/daemon/machines.md#routed-machines); `snapshots::routed`, `snapshots::fleet_view`, `snapshots::merge`
-- `machine hub` moves the role only (fleet plan decision 70): the new
-  hub's federated view is the machines it links to, and a member watches
-  its hub federated only over a direct link, so a hub off the routing
+- `machine control-plane` moves the role only (fleet plan decision 70): the new
+  control plane's federated view is the machines it links to, and a member watches
+  its control plane federated only over a direct link, so a control plane off the routing
   centre (A in `A → K ← B`) shows fewer rows than K would, and B none
   of the fleet's; watches over routes are parked. A member whose only
-  links go to a hub that is down learns of a move only once one of them
+  links go to a control plane that is down learns of a move only once one of them
   is back. Right after a move a link can drop twice (both ends cycle
   it: the authority after its push, the other end after its answer), so
   a call made then may fail once. Only the authority signs a move, so a
@@ -433,7 +433,7 @@ is frozen: no new work on it.
   the role can't move (fleet plan step 18).
   → [fleet](architecture/daemon/fleet.md#hub-mode); `machines::changes::follow`, `leave::After::Hub`
 - A grant for an inbound or routed machine takes effect there once this
-  host's link report reaches it (pushed by the hub or flooded by the
+  host's link report reaches it (pushed by the control plane or flooded by the
   links), then within a probe; while the report lists it, that machine
   probes this host every 2 s, a routed probe being a full routed
   opening, even while this host has no agent to serve.
@@ -444,10 +444,10 @@ is frozen: no new work on it.
   end's `agent-link-<peer>.sock`), so host git there doesn't use this
   host's agent; the machine's instances do (`bridge::host_agent`).
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `daemon::Shared::fleet_peer`
-- Remote rows live in memory except on a hub (which reloads them from
-  `remotes.json`): a fresh non-hub daemon shows a machine without rows
-  until its link connects (machines seen via the hub too, until it
-  connects). → [machines](architecture/daemon/machines.md), [fleet](architecture/daemon/fleet.md#hub-mode); `snapshots::Remotes`, `machines::saved`
+- Remote rows live in memory except on a control plane (which reloads them from
+  `remotes.json`): a fresh non-control-plane daemon shows a machine without rows
+  until its link connects (machines seen via the control plane too, until it
+  connects). → [machines](architecture/daemon/machines.md), [fleet](architecture/daemon/fleet.md#control-plane-mode); `snapshots::Remotes`, `machines::saved`
 - `vscode` and `inbox` are refused for a machine's instances on the CLI;
   the dashboard's `o` on a remote row answers "not supported yet" (its
   `p` and the CLI's `port` work); nameless commands are local only; no
@@ -520,7 +520,7 @@ is frozen: no new work on it.
   end's on the dialer get the daemon's own); fix: capture a login env
   once at the daemon's start.
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
-- A member's download of a published hub build has not yet run against
+- A member's download of a published control-plane build has not yet run against
   a release built with `DEVSANDBOX_PUBLISHED=1` (the first is the next
   tag), nor has the release workflow's checksum signing run with the
   real `RELEASE_SIGNING_KEY`. A member verifies against the release key
@@ -528,8 +528,8 @@ is frozen: no new work on it.
   so after a rotation members on an older one refuse every newer
   release until updated by hand. A member with
   no release asset for its platform (an Intel Mac, a source build
-  elsewhere) can't follow a published hub: the link drops (redialed,
-  refused again). A hub on a dev build (from source, `cargo install`
+  elsewhere) can't follow a published control plane: the link drops (redialed,
+  refused again). A control plane on a dev build (from source, `cargo install`
   included) is followed only with `dev-builds = true` in `member.toml`
   (or trust `full`) and the same OS/arch, else the link drops
   (redialed, refused again). Dev builds from
@@ -537,13 +537,13 @@ is frozen: no new work on it.
   (the git hash has no dirty marker). A mixed-platform dev fleet is built
   per platform by hand.
   → [fleet](architecture/daemon/fleet.md#versions); `build.rs` `stamp_build`, `fleet::update::decide`, `fleet::update::update`
-- A member waiting for its hub's binary gives up only when the transfer
+- A member waiting for its control plane's binary gives up only when the transfer
   hasn't started within 60 s (`PUSH_WAIT`) or fails; one that started and
   stalls while the link stays up waits until the link ends.
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::follow` `Incoming::watch`
-- A member that won't follow its hub (dev build, failed update) drops
-  the link at each dial: a hub that dialed it sees the reason as its
-  row's error (ssh's stderr tail), a hub it dialed only sees the inbound
+- A member that won't follow its control plane (dev build, failed update) drops
+  the link at each dial: a control plane that dialed it sees the reason as its
+  row's error (ssh's stderr tail), a control plane it dialed only sees the inbound
   machine come and go (the reason is in the member's `machine ls` and
   `serve.log`).
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::dialer`, `commands::fleet_link::run_peer`
@@ -553,20 +553,20 @@ is frozen: no new work on it.
   not) when it dials again.
   → [machines](architecture/daemon/machines.md#inbound-neighbors); `forwards::Known`
 - A member removed while unreachable (`leave` `unreachable`) keeps its
-  `hub` and its registry entries; its links are refused once the peer
+  `control_plane` and its registry entries; its links are refused once the peer
   holds the revoke, and it never takes a log that revokes it except from
   a push (`fleet.sync`). `machine rm` it again on the authority once it's
   reachable, or run `machine rm <its name>` on it.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::rm`
-- Members the hub reaches by no path (no link up, no path in its link
+- Members the control plane reaches by no path (no link up, no path in its link
   graph) keep their registry entry for a removed member: `fleet.forget`
-  goes once, to the hub's machines and its routed members. The revoke
+  goes once, to the control plane's machines and its routed members. The revoke
   reaches them (a push, or their next link's head comparison), so that
   entry's link is refused.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::remove`
 - A member that leaves (`machine rm <itself>`) is forgotten by the other
   members only once the authority approves its proposed revoke; until
-  then only the hub drops its entry.
+  then only the control plane drops its entry.
   → [fleet](architecture/daemon/fleet.md); `machines::leave::rm`
 - Placement's `has_image` reads only watched roots' snapshots (this
   host's while watched, a machine's last pushed; a routed machine has
@@ -576,11 +576,11 @@ is frozen: no new work on it.
 - Only `run --place` is placed, and only by the daemon's `run` verb: a
   `run --place` with no daemon to reach and `--in-process` runs stay
   here, with a note; the dispatcher's children aren't placed yet (fleet step 13). A
-  hub (`hub = "self"` in `member.toml`) places its own; a member's is
-  placed by the hub (`fleet.place`, up to 2 s for the dial and 6 s for
-  the answer) among the machines both the member and the hub reach (a
-  link or a route), and runs on the member with a note when the hub
-  can't be reached. On a hub every connected machine is a candidate (ssh
+  control plane (`control_plane = "self"` in `member.toml`) places its own; a member's is
+  placed by the control plane (`fleet.place`, up to 2 s for the dial and 6 s for
+  the answer) among the machines both the member and the control plane reach (a
+  link or a route), and runs on the member with a note when the control plane
+  can't be reached. On a control plane every connected machine is a candidate (ssh
   and inbound), and every routed one a path reaches, each asked a
   `capacity.get` (2 s at most) first.
   The placing host's `state.toml` doesn't record a placed instance (it's the
@@ -616,7 +616,7 @@ is frozen: no new work on it.
   under its fleet root is never pruned, and `roots/<hash>/` trees are
   never removed.
   → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::send`, `fleet::code::repo::land_from`
-- The hub keeps a copy of each repo a member places on another machine,
+- The control plane keeps a copy of each repo a member places on another machine,
   sent after the worker's (so a placement from a laptop uploads twice),
   never pruned and not yet read by anything (re-placement is fleet step
   14). → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::mirror`

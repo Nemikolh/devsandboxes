@@ -3,13 +3,13 @@
 //! into a lent instance, or into a service one of them uses, what `devsandbox
 //! tunnel` is at the far end of an ssh machine's forward.
 //!
-//! The hub's first line is a `commands::tunnel::Request` (`{"root",
+//! The control plane's first line is a `commands::tunnel::Request` (`{"root",
 //! "instance"?, "service"?, "port"}`). The worker answers one
 //! `commands::tunnel::Header` line, `{"error"}` for any refusal, then runs
 //! the in-container `devsbd bridge` (`bridge::bridge_command`) with the
 //! stream itself as its stdin and stdout, so the bridge's handshake and mux
 //! follow the header as over ssh. The bridge is killed and reaped once the
-//! hub closes the stream.
+//! control plane closes the stream.
 //!
 //! The gate: the root confined to the peer's reach (`lent::confine_path`:
 //! the fleet root or an own root under `worker`, any under `full`); routes
@@ -40,17 +40,17 @@ use crate::serve::api::ApiError;
 use crate::serve::endpoint::Stream;
 use crate::state::State;
 
-/// How long the hub has to send its request once it opened the stream.
+/// How long the control plane has to send its request once it opened the stream.
 const REQUEST_WAIT: Duration = Duration::from_secs(30);
 
 /// The longest request line taken.
 const REQUEST_LIMIT: usize = 64 * 1024;
 
-/// How often a running bridge is checked for its exit and the hub's
+/// How often a running bridge is checked for its exit and the control plane's
 /// hang-up.
 const WATCH_TICK: Duration = Duration::from_millis(200);
 
-/// The hub's request, its first line: read one byte at a time, so nothing
+/// The control plane's request, its first line: read one byte at a time, so nothing
 /// past its newline is taken (there's nothing before the bridge's bytes, but
 /// the stream is the bridge's stdin next). Bounded by [`REQUEST_LIMIT`].
 pub fn read_request(r: &mut impl Read) -> Result<Request, String> {
@@ -115,7 +115,7 @@ pub fn serve(link: Stream, files: &Files, peer: &Peer, log: fn(&str)) {
     if let Ok(route) = route {
         match spawn_bridge(&link, &route, log) {
             Ok(child) => watch(&link, child),
-            Err(e) => log(&format!("fleet: cannot start a TUNNEL bridge into {} for hub {}: {e}", route.container, peer.name)),
+            Err(e) => log(&format!("fleet: cannot start a TUNNEL bridge into {} for control plane {}: {e}", route.container, peer.name)),
         }
     }
     let _ = link.shutdown(Shutdown::Both);
@@ -165,7 +165,7 @@ fn spawn_bridge(link: &Stream, route: &Route, log: fn(&str)) -> std::io::Result<
     Ok(child)
 }
 
-/// Until the bridge exits or the hub closes its end (then it's killed),
+/// Until the bridge exits or the control plane closes its end (then it's killed),
 /// then reap it.
 fn watch(link: &Stream, mut child: Child) {
     loop {
@@ -247,7 +247,7 @@ services = ["cache"]
     #[test]
     fn the_gate_confines_the_root_and_scopes_the_instances() {
         let b = scratch("gate");
-        let root = b.join("fleet/hub");
+        let root = b.join("fleet/control_plane");
         for d in ["cfg", "elsewhere"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
@@ -275,7 +275,7 @@ services = ["cache"]
     #[test]
     fn a_service_must_be_one_a_reachable_instance_uses() {
         let b = scratch("service");
-        let root = b.join("fleet/hub");
+        let root = b.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         let config = Config::parse(CONFIG).unwrap();
         let state = scoped(state_with(&b, &root), &root.join("cfg"), &fleet(&root, &[]));
@@ -300,16 +300,16 @@ services = ["cache"]
         }
     }
 
-    /// The hub's end of a stream served on a thread, its request sent;
+    /// The control plane's end of a stream served on a thread, its request sent;
     /// what it reads back to the end.
     fn served(peer: &Peer, state: &Path, request: &str) -> String {
-        let (hub, ours) = UnixStream::pair().unwrap();
+        let (control_plane, ours) = UnixStream::pair().unwrap();
         let (peer, files) = (peer.clone(), Files { state: state.to_path_buf(), member: None, home: None });
         let t = std::thread::spawn(move || serve(ours, &files, &peer, crate::serve::helper::tests::log));
-        (&hub).write_all(request.as_bytes()).unwrap();
-        hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        (&control_plane).write_all(request.as_bytes()).unwrap();
+        control_plane.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut out = String::new();
-        (&hub).read_to_string(&mut out).unwrap();
+        (&control_plane).read_to_string(&mut out).unwrap();
         t.join().unwrap();
         out
     }
@@ -319,13 +319,13 @@ services = ["cache"]
     #[test]
     fn refusals_are_one_error_header() {
         let b = scratch("refuse");
-        let root = b.join("fleet/hub");
+        let root = b.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(b.join("mine")).unwrap();
         std::fs::write(root.join("cfg").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
         state_with(&b, &root);
         let state = b.join("state.toml");
-        let scope = Peer { name: "me@hub".into(), fleet_root: Some(root.clone()), env: None, agent: None, key: None, introduced_by: None };
+        let scope = Peer { name: "me@control_plane".into(), fleet_root: Some(root.clone()), env: None, agent: None, key: None, introduced_by: None };
         let error = |out: &str| match crate::commands::tunnel::read_header(&mut out.as_bytes()) {
             Ok(Header::Error { error }) => {
                 assert!(out.ends_with("}\n"), "nothing after the header: {out:?}");
@@ -344,7 +344,7 @@ services = ["cache"]
         // service no instance of it uses is the refusal.
         std::fs::write(b.join("mine").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
         assert_eq!(error(&served(&scope, &state, &line(Some("own"), Some("cache"), &b.join("mine")))), "instance `own` doesn't use service `cache`");
-        assert!(crate::serve::helper::tests::logged("fleet: refused a TUNNEL stream from me@hub"));
+        assert!(crate::serve::helper::tests::logged("fleet: refused a TUNNEL stream from me@control_plane"));
         assert!(error(&served(&scope, &state, &line(Some("own"), None, &cfg))).contains("own"), "not lent: no such instance");
         assert!(error(&served(&scope, &state, &line(Some("far"), None, &cfg))).contains("far"), "another root's");
         assert_eq!(error(&served(&scope, &state, &line(None, Some("nope"), &cfg))), "no instance here uses service `nope`");

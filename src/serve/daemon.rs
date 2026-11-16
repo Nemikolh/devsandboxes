@@ -99,8 +99,8 @@ pub struct Options {
     /// it) or `[serve] keep-alive = true` in the per-user global config
     /// ([`crate::daemon_config`]), resolved once by [`serve`].
     pub keep_alive: bool,
-    /// A hub's `remotes.json` (this host is the hub while `member.toml`'s
-    /// `hub` is `self`, [`Shared::hub`]); `None` is the default
+    /// A control plane's `remotes.json` (this host is the control plane while `member.toml`'s
+    /// `control_plane` is `self`, [`Shared::control_plane`]); `None` is the default
     /// ([`machines::saved::path`]). Tests point it at their own file.
     pub remotes: Option<PathBuf>,
     /// [`idle::IDLE_TIMEOUT`] outside tests.
@@ -146,7 +146,7 @@ pub struct Options {
     /// roots. `None` is the default ([`fleet::member::path`]). Tests point
     /// it at their own file.
     pub member: Option<PathBuf>,
-    /// How the ssh machines' links follow a hub's version; `None` is the
+    /// How the ssh machines' links follow a control plane's version; `None` is the
     /// release download and a forced handoff on this daemon's socket
     /// (`fleet::update::Release`). Tests fake it.
     pub update_steps: Option<Arc<dyn fleet::update::Steps>>,
@@ -281,24 +281,24 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let listener = Listener::bind(dir)?;
     let member = member_path(opts);
     // The daemon is `member.toml`'s only writer (fleet plan decision 3): its
-    // `hub` is read once here, then kept by each write of it (an adopted
-    // membership log, a leave: [`Shared::set_hub`]).
-    let hub = match &member {
+    // `control_plane` is read once here, then kept by each write of it (an adopted
+    // membership log, a leave: [`Shared::set_control_plane`]).
+    let control_plane = match &member {
         Ok(path) => fleet::member::load(path).unwrap_or_else(|e| {
             log(&format!("warning: {e:#}; in no fleet until it's fixed"));
             None
         }),
         Err(_) => None,
     };
-    let hub = hub.map(|m| m.hub()).unwrap_or_default();
+    let control_plane = control_plane.map(|m| m.control_plane()).unwrap_or_default();
     log(&format!(
         "listening on {} (pid {}, version {} build {}{})",
         endpoint::socket_path(dir).display(),
         std::process::id(),
         opts.version.semver,
         opts.version.build,
-        match (hub.is_this(), opts.keep_alive) {
-            (true, _) => ", fleet hub (keep-alive)",
+        match (control_plane.is_this(), opts.keep_alive) {
+            (true, _) => ", fleet control plane (keep-alive)",
             (false, true) => ", keep-alive",
             (false, false) => "",
         },
@@ -318,7 +318,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         Ok(path) => shared.member = Some(path),
         Err(e) => log(&format!("warning: no member.toml (no peer is served, `member.*` fails): {e:#}")),
     }
-    shared.hub = Arc::new(Mutex::new(hub));
+    shared.control_plane = Arc::new(Mutex::new(control_plane));
     shared.hostname = link::hostname();
     shared.route_budget = opts.machine_timing.handshake;
     let registry_path = match &opts.machines {
@@ -335,7 +335,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // one). The hooks reach `shared` once it exists; until then nothing
     // watches, there's nobody to tell and a machine's streams are refused.
     let hooked: Arc<OnceLock<std::sync::Weak<Shared>>> = Arc::default();
-    let hold = machine_dialer(dir, opts, &hooked, &shared.hub);
+    let hold = machine_dialer(dir, opts, &hooked, &shared.control_plane);
     let hooks = {
         let (a, b, c, d) = (Arc::clone(&hooked), Arc::clone(&hooked), Arc::clone(&hooked), Arc::clone(&hooked));
         service::Hooks {
@@ -346,22 +346,22 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                     s.graph.poke();
                 }
             }),
-            hub: Box::new(move || c.get().and_then(std::sync::Weak::upgrade).and_then(|s| s.hub_of())),
+            control_plane: Box::new(move || c.get().and_then(std::sync::Weak::upgrade).and_then(|s| s.control_plane_of())),
             routed: Box::new(move || d.get().and_then(std::sync::Weak::upgrade).map(|s| s.routed_reach()).unwrap_or_default()),
         }
     };
-    let hub = {
+    let control_plane = {
         let remotes = match &opts.remotes {
             Some(path) => path.clone(),
             None => machines::saved::path()?,
         };
-        let hub = Arc::clone(&shared.hub);
-        service::Hub { remotes, is_hub: Arc::new(move || lock_hub(&hub).is_this()) }
+        let control_plane = Arc::clone(&shared.control_plane);
+        service::ControlPlane { remotes, is_control_plane: Arc::new(move || lock_control_plane(&control_plane).is_this()) }
     };
     // Inbound neighbors are machines too: the service follows them.
     let inbound: Arc<machines::inbound::Neighbors> = Arc::default();
     let links =
-        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial, route, hold, opts.machine_timing, hooks, Some(hub), log);
+        service::Machines::spawn(registry_path.clone(), Arc::clone(&inbound), dial, route, hold, opts.machine_timing, hooks, Some(control_plane), log);
     let forwards_machines = registry_path.clone();
     if let Some(agent) = &opts.host_agent {
         shared.host_agent = Arc::clone(agent);
@@ -378,13 +378,13 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         member: shared.member.clone(),
         hostname: shared.hostname.clone(),
         home: shared.home.clone(),
-        // `machines.add` or a leave wrote this host's `hub`: the same
+        // `machines.add` or a leave wrote this host's `control_plane`: the same
         // follow-up as a `membership.adopt` call's.
-        hub_changed: {
+        control_plane_changed: {
             let hooked = Arc::clone(&hooked);
-            Box::new(move |hub| {
+            Box::new(move |control_plane| {
                 if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
-                    s.set_hub(hub);
+                    s.set_control_plane(control_plane);
                 }
             })
         },
@@ -439,14 +439,14 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // This host's link report and the published graph (fleet plan step
     // 10b.2): only with a `member.toml`, beside which the log and key are.
     let publisher = shared.member.clone().map(|member| {
-        let (hub, always) = (Arc::clone(&shared.hub), Arc::clone(&shared.hub));
+        let (control_plane, always) = (Arc::clone(&shared.control_plane), Arc::clone(&shared.control_plane));
         let keep_alive = opts.keep_alive;
         fleet::reports::Publisher::spawn(Arc::clone(&shared.graph), fleet::reports::Io {
             member,
             hostname: shared.hostname.clone(),
             links: links.handle(),
-            hub: Arc::new(move || lock_hub(&hub).clone()),
-            always_on: Arc::new(move || keep_alive || lock_hub(&always).is_this()),
+            control_plane: Arc::new(move || lock_control_plane(&control_plane).clone()),
+            always_on: Arc::new(move || keep_alive || lock_control_plane(&always).is_this()),
             log,
         })
     });
@@ -578,8 +578,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             *shared.idle_since.lock().unwrap() = now;
         }
         let idle_since = *shared.idle_since.lock().unwrap();
-        // A hub holds its members' links: it never idles out.
-        let keep_alive = opts.keep_alive || shared.is_hub();
+        // A control plane holds its members' links: it never idles out.
+        let keep_alive = opts.keep_alive || shared.is_control_plane();
         if idle::decide(&holders, idle_since, now, keep_alive, opts.idle_timeout) == Decision::Exit {
             break Exit::Idle;
         }
@@ -626,8 +626,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     Ok(exit)
 }
 
-fn lock_hub(hub: &Mutex<fleet::member::Hub>) -> std::sync::MutexGuard<'_, fleet::member::Hub> {
-    hub.lock().unwrap_or_else(|e| e.into_inner())
+fn lock_control_plane(control_plane: &Mutex<fleet::member::ControlPlane>) -> std::sync::MutexGuard<'_, fleet::member::ControlPlane> {
+    control_plane.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `member.toml`: [`Options::member`], else the data dir's.
@@ -638,10 +638,10 @@ fn member_path(opts: &Options) -> Result<PathBuf> {
     }
 }
 
-/// How this host follows a hub's build (the ssh machines' links):
+/// How this host follows a control plane's build (the ssh machines' links):
 /// [`Options::update_steps`], dev builds as `member` (`member.toml`) says
 /// at each `Hello`.
-fn follow_hub(dir: &Path, opts: &Options, member: PathBuf) -> fleet::follow::Follow {
+fn follow_control_plane(dir: &Path, opts: &Options, member: PathBuf) -> fleet::follow::Follow {
     let steps = opts
         .update_steps
         .clone()
@@ -658,16 +658,16 @@ fn follow_hub(dir: &Path, opts: &Options, member: PathBuf) -> fleet::follow::Fol
 /// in-process ([`Shared::open_lent`]) as peer `<entry name>`, with its
 /// fleet root `fleet/<entry name>/` under the data dir and the daemon's env
 /// (decision 24 of the fleet plan). Without a data dir no stream is served.
-/// Its hello says `hub` as it is at each dial.
+/// Its hello says `control_plane` as it is at each dial.
 fn machine_dialer(
     dir: &Path,
     opts: &Options,
     hooked: &Arc<OnceLock<std::sync::Weak<Shared>>>,
-    hub: &Arc<Mutex<fleet::member::Hub>>,
+    control_plane: &Arc<Mutex<fleet::member::ControlPlane>>,
 ) -> service::Hold {
     let member = member_path(opts);
     let data = member.as_ref().ok().and_then(|m| m.parent()).map(Path::to_path_buf);
-    let follow = follow_hub(dir, opts, member.as_ref().cloned().unwrap_or_default());
+    let follow = follow_control_plane(dir, opts, member.as_ref().cloned().unwrap_or_default());
     let hostname = link::hostname();
     let member_toml = member.as_ref().ok().cloned();
     let identity: Arc<dyn Fn() -> Result<fleet::proof::Identity> + Send + Sync> = {
@@ -676,14 +676,14 @@ fn machine_dialer(
     };
     let linked_member = member_toml.clone();
     // A machine's newer membership entries: what `membership.adopt` does,
-    // `hub` followed the same way.
+    // `control_plane` followed the same way.
     let adopt: Arc<dyn Fn(&fleet::membership::Stored) -> Result<(), String> + Send + Sync> = {
         let (hooked, hostname) = (Arc::clone(hooked), hostname.clone());
         Arc::new(move |newer| {
             let path = member_toml.as_deref().ok_or("this daemon has no member.toml")?;
             let taken = fleet::membership_api::adopt(path, &hostname, newer).map_err(|e| e.message)?;
             if let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade) {
-                s.set_hub(taken.hub);
+                s.set_control_plane(taken.control_plane);
                 if taken.rotated {
                     s.key_rotated();
                 }
@@ -696,10 +696,10 @@ fn machine_dialer(
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     });
     let hello = {
-        let (hub, name) = (Arc::clone(hub), Arc::clone(&member_name));
+        let (control_plane, name) = (Arc::clone(control_plane), Arc::clone(&member_name));
         Arc::new(move || {
-            let hub = lock_hub(&hub).clone();
-            fleet::update::hello_for(&hub, name().ok().as_deref())
+            let control_plane = lock_control_plane(&control_plane).clone();
+            fleet::update::hello_for(&control_plane, name().ok().as_deref())
         })
     };
     let open: fleet::dialer::Open = {
@@ -811,12 +811,12 @@ struct Shared {
     join: Join,
     /// What `roots.list` reads `~` as.
     home: Option<PathBuf>,
-    /// `member.toml`'s `hub`: read at the start, then set by each write of
-    /// it (`membership.adopt`, `machines.add`, a leave: [`Shared::set_hub`]);
+    /// `member.toml`'s `control_plane`: read at the start, then set by each write of
+    /// it (`membership.adopt`, `machines.add`, a leave: [`Shared::set_control_plane`]);
     /// the daemon is the file's only writer (fleet plan decision 3), so
     /// nothing re-reads it. The keep-alive, placement,
-    /// `remotes.json` (`service::Hub`) and the links' hellos follow it.
-    hub: Arc<Mutex<fleet::member::Hub>>,
+    /// `remotes.json` (`service::ControlPlane`) and the links' hellos follow it.
+    control_plane: Arc<Mutex<fleet::member::ControlPlane>>,
     /// The `machines.*` methods' registry and probe, and the machine links;
     /// unset only in tests that build a bare `Shared` (the methods are then
     /// unknown, and no machine exists).
@@ -899,7 +899,7 @@ impl Shared {
             snapshots: Arc::default(),
             join,
             home: None,
-            hub: Arc::default(),
+            control_plane: Arc::default(),
             machines: None,
             locals: Mutex::default(),
             publishing: Mutex::default(),
@@ -948,44 +948,44 @@ impl Shared {
         self.machines.as_ref()?.links.as_ref()
     }
 
-    /// This host is its fleet's hub ([`Shared::hub`] is `self`).
-    fn is_hub(&self) -> bool {
-        lock_hub(&self.hub).is_this()
+    /// This host is its fleet's control plane ([`Shared::control_plane`] is `self`).
+    fn is_control_plane(&self) -> bool {
+        lock_control_plane(&self.control_plane).is_this()
     }
 
-    /// This host's hub when another member is, and this host's own member
-    /// name: what the machine links watch the hub's fleet with
-    /// (`service::Hooks::hub`).
-    fn hub_of(&self) -> Option<service::HubOf> {
-        let fleet::member::Hub::Other(hub) = lock_hub(&self.hub).clone() else { return None };
-        // No name of its own: nothing to guard against (the hub leaves the
+    /// This host's control plane when another member is, and this host's own member
+    /// name: what the machine links watch the control plane's fleet with
+    /// (`service::Hooks::control_plane`).
+    fn control_plane_of(&self) -> Option<service::ControlPlaneOf> {
+        let fleet::member::ControlPlane::Other(control_plane) = lock_control_plane(&self.control_plane).clone() else { return None };
+        // No name of its own: nothing to guard against (the control plane leaves the
         // asking member out anyway).
         let me = self.member.as_deref().and_then(|p| fleet::dialer::member_name(p, &self.hostname).ok()).unwrap_or_default();
-        Some(service::HubOf { hub, me })
+        Some(service::ControlPlaneOf { control_plane, me })
     }
 
-    /// `hub` was written (from an adopted membership log, or cleared on
+    /// `control_plane` was written (from an adopted membership log, or cleared on
     /// leaving): keep it, and when it changed end every
     /// link this host holds and every one it's dialed on, so both ends
-    /// redial saying the new hub (`fleet::update::hello_of`). Held links:
+    /// redial saying the new control plane (`fleet::update::hello_of`). Held links:
     /// `service::Handle::cycle`. Dialed ones: each `fleet-link --peer`'s
     /// held `links.inbound` connection gets `links.cycle`
     /// (`commands::fleet_link::LINKS_CYCLE`), on which it hangs up.
-    fn set_hub(&self, hub: fleet::member::Hub) {
+    fn set_control_plane(&self, control_plane: fleet::member::ControlPlane) {
         {
-            let mut cur = lock_hub(&self.hub);
-            if *cur == hub {
+            let mut cur = lock_control_plane(&self.control_plane);
+            if *cur == control_plane {
                 return;
             }
-            *cur = hub.clone();
+            *cur = control_plane.clone();
         }
-        log(&format!("this host's hub is now {}: its links end and redial", hub.field().as_deref().unwrap_or("none")));
+        log(&format!("this host's control plane is now {}: its links end and redial", control_plane.field().as_deref().unwrap_or("none")));
         self.cycle_links();
     }
 
     /// This host's pending next key was promoted to `member.key` (fleet
     /// plan step 10a.6, `membership_api::Taken::rotated`): every link it's
-    /// on ends, as on a hub change, so both ends redial and the link proves
+    /// on ends, as on a control-plane change, so both ends redial and the link proves
     /// the new key (a peer keeps the key a link proved, `lent::Peer::key`).
     pub(crate) fn key_rotated(&self) {
         log("this host's member key rotated: its links end and redial proving the new key");
@@ -1119,8 +1119,8 @@ impl Shared {
     /// `link.attach` connection (fleet plan decision 27). `None` when
     /// refused.
     fn open_lent(self: &Arc<Self>, channel: lent::Channel, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
-        let (hub, ours) = Stream::pair().ok()?;
-        self.serve_channel(channel, scope, ours).then(|| hub.into())
+        let (control_plane, ours) = Stream::pair().ok()?;
+        self.serve_channel(channel, scope, ours).then(|| control_plane.into())
     }
 
     /// Serve `stream` as one `channel` stream of `peer`'s, under this
@@ -1730,10 +1730,10 @@ struct Pending {
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
     /// The connection holds a `links.inbound` announce (a `fleet-link
-    /// --peer`'s) of this neighbor: [`Shared::set_hub`] cycles it, as
+    /// --peer`'s) of this neighbor: [`Shared::set_control_plane`] cycles it, as
     /// [`Shared::end_inbound`] does for its name.
     inbound: Option<String>,
-    /// `links.cycle`, with why when it isn't this host's hub changing: the
+    /// `links.cycle`, with why when it isn't this host's control plane changing: the
     /// `fleet-link` hangs up.
     cycle: Option<Option<String>>,
     /// A `Peer` connection's peer, and where its reach is read from: its
@@ -2283,13 +2283,13 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             stored.and_then(|s| serde_json::to_value(shared.graph.reports(s.as_ref())).map_err(|e| api::ApiError::internal(e.into())))
         }
         // Local only too: the proposals queued here, approved over the links.
-        "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" | "membership.hub" | "membership.propose"
+        "membership.pending" | "membership.approve" | "membership.deny" | "membership.rotate" | "membership.controlPlane" | "membership.propose"
             if shared.machines.is_some() =>
         {
             let ctx = shared.machines.as_ref().expect("checked");
-            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny|rotate|hub|propose method")
+            machines::changes::call(&req.method, req.params, ctx).expect("a membership.pending|approve|deny|rotate|control plane|propose method")
         }
-        // Local only too; an adopt wrote `hub` from the log and may have
+        // Local only too; an adopt wrote `control_plane` from the log and may have
         // promoted this host's next key: both followed here.
         method if method.starts_with("membership.") => match &shared.member {
             Some(path) => {
@@ -2303,7 +2303,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
                             machines::changes::push_introduction(ctx, name);
                         }
                         if let Some(follow) = follow {
-                            shared.set_hub(follow.hub);
+                            shared.set_control_plane(follow.control_plane);
                             if follow.rotated {
                                 shared.key_rotated();
                             }
@@ -2405,25 +2405,25 @@ fn fleet_call(req: Request, shared: &Shared, conn: &mut ConnState) -> Response {
     }
 }
 
-/// `fleet.place` on the hub, from member `from` (fleet plan decision 31):
+/// `fleet.place` on the control plane, from member `from` (fleet plan decision 31):
 /// where its run goes, by `placed::for_member` over this host (its
 /// capacity now, its watched roots), the member's own report, and the
 /// machines this host reaches (a link up, or a route) that the member
-/// reaches too, each asked a fresh `capacity.get` as the hub's own
+/// reaches too, each asked a fresh `capacity.get` as the control plane's own
 /// placement does.
 fn fleet_place(params: Value, from: &str, shared: &Shared) -> Result<Value, api::ApiError> {
     use fleet::placed;
     let ask: placed::PlaceParams = api::parse(params)?;
-    let hub = shared
+    let control_plane = shared
         .member
         .as_deref()
         .and_then(|p| fleet::dialer::member_name(p, &shared.hostname).ok())
-        .ok_or_else(|| api::ApiError::failed("this hub has no member name"))?;
+        .ok_or_else(|| api::ApiError::failed("this control plane has no member name"))?;
     let machines = shared.remotes();
     let routed = shared.links().map(|l| l.routed()).unwrap_or_default();
     let fresh = fresh_capacities(shared, &placed::member_workers(&ask, from, &machines, &routed));
     let local_roots: Vec<Arc<Value>> = shared.locals.lock().unwrap().values().cloned().collect();
-    let answer = placed::for_member(&ask, from, &hub, shared.capacity(), &local_roots, &machines, &routed, &fresh)
+    let answer = placed::for_member(&ask, from, &control_plane, shared.capacity(), &local_roots, &machines, &routed, &fresh)
         .map_err(|e| api::ApiError::failed(e.to_string()))?;
     log(&format!("fleet.place from {from}: {} on {}", ask.spec.sandbox, answer.machine));
     serde_json::to_value(answer).map_err(|e| api::ApiError::internal(e.into()))
@@ -2435,10 +2435,10 @@ struct InboundParams {
     /// Its link `Hello` (`fleet::update::hello_of`).
     version: String,
     #[serde(default)]
-    hub: bool,
+    control_plane: bool,
 }
 
-/// `links.inbound {peer, version, hub}`: a `fleet-link --peer <peer>` of
+/// `links.inbound {peer, version, control_plane}`: a `fleet-link --peer <peer>` of
 /// this user says the link `peer` dialed to this host is up, for as long as
 /// this connection is (docs/reference/api.md, `links.inbound`). Refused for
 /// a name `machines.toml` has (an inbound neighbor and a registry entry
@@ -2479,13 +2479,13 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
     if let Err(e) = start_notifier(conn) {
         return Response::err(id, "internal", format!("cannot start this connection's notifier: {e}"));
     }
-    conn.inbound = Some(m.inbound.announce(&p.peer, &p.version, p.hub));
+    conn.inbound = Some(m.inbound.announce(&p.peer, &p.version, p.control_plane));
     let name = p.peer.clone();
     conn.out.post(|p| {
         p.inbound = Some(name);
         false
     });
-    log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.hub { ", the hub" } else { "" }));
+    log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.control_plane { ", the control plane" } else { "" }));
     follow_configs(shared.member.as_deref(), &shared.socket_dir, &p.peer);
     Response::ok(id, json!({ "ok": true }))
 }
@@ -3112,34 +3112,34 @@ fn fetch_placement(shared: &Shared, entry: &fleet::placements::Entry) -> anyhow:
 /// `run --place` without `machine`, placed (docs/architecture/daemon/fleet.md,
 /// *Placement*; `fleet::placed`): `None` when it runs here (a note, if
 /// any, already in its output), as every run without `place` does
-/// ([`fleet::placed::asked`]: a typed run never asks the hub), else the
+/// ([`fleet::placed::asked`]: a typed run never asks the control plane), else the
 /// answer of the run forwarded to
 /// the worker it was placed on, in the worker's copy of the config root,
-/// or the failure to move the code there. On the hub (`member.toml`'s
-/// `hub = "self"`, [`Shared::is_hub`]) this host places it, looking
+/// or the failure to move the code there. On the control plane (`member.toml`'s
+/// `control_plane = "self"`, [`Shared::is_control_plane`]) this host places it, looking
 /// further than itself only when some machine's link is up or a routed
-/// one has a path (`placed::worth_placing`: any kind); on a member the hub
-/// does (`fleet.place`, [`ask_hub`]), and the code moves over this host's
+/// one has a path (`placed::worth_placing`: any kind); on a member the control plane
+/// does (`fleet.place`, [`ask_control_plane`]), and the code moves over this host's
 /// own paths either way ([`move_code`]: a link, else a route); in no fleet
 /// it runs here. Moving the
 /// code (each folder's snapshot and bundle, the transfers) runs on this
 /// connection's thread before anything is forwarded; a hang-up meanwhile
 /// is seen once the forward starts.
 fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState) -> Option<Option<Response>> {
-    use fleet::member::Hub;
+    use fleet::member::ControlPlane;
     use fleet::placed::{self, Placed};
     let str_of = |k: &str| params.get(k).and_then(Value::as_str);
     if !placed::asked(params) {
         return None;
     }
-    let hub = lock_hub(&shared.hub).clone();
-    if hub == Hub::None {
+    let control_plane = lock_control_plane(&shared.control_plane).clone();
+    if control_plane == ControlPlane::None {
         return None;
     }
     let sandbox = str_of("sandbox")?;
     let machines = shared.remotes();
     let routed = shared.links().map(|l| l.routed()).unwrap_or_default();
-    if hub.is_this() && !placed::worth_placing(&machines, &routed) {
+    if control_plane.is_this() && !placed::worth_placing(&machines, &routed) {
         return None;
     }
     // A bad `root` is the local parse's to refuse.
@@ -3163,11 +3163,11 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
     let local_roots: Vec<Arc<Value>> = locals.into_iter().map(|(_, v)| v).collect();
     let ask = placed::Ask { branch: str_of("branch"), base: str_of("base") };
     let prepare = |worker: &str| move_code(shared, worker, &root, sandbox, ask.branch);
-    let decided = match &hub {
-        Hub::Other(k) => {
+    let decided = match &control_plane {
+        ControlPlane::Other(k) => {
             let reachable = placed::reachable_workers(&machines, &routed);
-            let answer = ask_hub(shared, k, &placed::PlaceParams::of(&spec, shared.capacity(), reachable.clone()));
-            placed::by_hub(&ask, k, answer, &reachable, prepare)
+            let answer = ask_control_plane(shared, k, &placed::PlaceParams::of(&spec, shared.capacity(), reachable.clone()));
+            placed::by_control_plane(&ask, k, answer, &reachable, prepare)
         }
         _ => {
             let fresh = fresh_capacities(shared, &placed::reachable_workers(&machines, &routed));
@@ -3183,7 +3183,7 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
             None
         }
         Placed::Here(lines) => {
-            log(&format!("{}: run placed here by the hub", conn.label()));
+            log(&format!("{}: run placed here by the control plane", conn.label()));
             for line in &lines {
                 say(line);
             }
@@ -3211,10 +3211,10 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
 
 /// Move the code of `sandbox` (config root `root`, `--branch` `branch`)
 /// into this host's fleet root on `worker`, over its link or a route
-/// (`route::connect`): the `prepare` of a placed run, the hub's own or a
-/// member's placed by the hub. Then, on a member placing on a worker that
-/// isn't its hub, the hub mirror (fleet plan decision 75, `code::mirror`):
-/// the same refs into the hub's cache, best effort, each failure a note
+/// (`route::connect`): the `prepare` of a placed run, the control plane's own or a
+/// member's placed by the control plane. Then, on a member placing on a worker that
+/// isn't its control plane, the control-plane mirror (fleet plan decision 75, `code::mirror`):
+/// the same refs into the control plane's cache, best effort, each failure a note
 /// in the run's output (`Prepared::notes`) and the log.
 fn move_code(
     shared: &Shared,
@@ -3224,17 +3224,17 @@ fn move_code(
     branch: Option<&str>,
 ) -> std::result::Result<fleet::code::Prepared, fleet::code::Unprepared> {
     use fleet::code::{self, LinkTransfer, Unprepared};
-    use fleet::member::Hub;
+    use fleet::member::ControlPlane;
     // The machine says where this host's fleet root is, over the same path.
     let worker_root = fleet_root_on(shared, worker).map_err(Unprepared::NotMovable)?;
     let t = LinkTransfer::for_worker(&shared.socket_dir, worker);
     let mut prepared = code::prepare(&t, &worker_root, root, sandbox, branch)?;
-    let hub = lock_hub(&shared.hub).clone();
-    if let Hub::Other(k) = hub
+    let control_plane = lock_control_plane(&shared.control_plane).clone();
+    if let ControlPlane::Other(k) = control_plane
         && k != worker
     {
         for (folder, why) in code::mirror(&prepared.sent, &LinkTransfer::for_worker(&shared.socket_dir, &k)) {
-            let note = format!("note: the hub `{k}` has no copy of {}: {why}", folder.display());
+            let note = format!("note: the control plane `{k}` has no copy of {}: {why}", folder.display());
             log(&format!("run: {note}"));
             prepared.notes.push(note);
         }
@@ -3290,21 +3290,21 @@ fn placements_fetch(params: &Value, shared: &Shared) -> std::result::Result<Valu
     serde_json::to_value(got).map_err(|e| api::ApiError::internal(e.into()))
 }
 
-/// The hub `hub`'s `fleet.place` answer to `ask`, over a fresh `API`
+/// The control plane `control_plane`'s `fleet.place` answer to `ask`, over a fresh `API`
 /// stream of any path to it (`Handle::open_member`: its link while up,
 /// else a route; the dial and hello bounded by `placed::CAPACITY_WAIT`,
 /// the answer by `placed::PLACE_WAIT`); why none, for the note of a run
 /// that then stays here.
-fn ask_hub(
+fn ask_control_plane(
     shared: &Shared,
-    hub: &str,
+    control_plane: &str,
     ask: &fleet::placed::PlaceParams,
 ) -> std::result::Result<fleet::placed::PlaceAnswer, fleet::placed::Unplaced> {
     use fleet::placed::{CAPACITY_WAIT, PLACE_WAIT, Unplaced};
     let down = |why: String| Unplaced::Unreachable(why);
     let links = shared.links().ok_or_else(|| down("this daemon has no machines".into()))?;
-    let duplex = links.open_member(hub).map_err(down)?;
-    let mut link = link::handshake(hub, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| down(e.to_string()))?;
+    let duplex = links.open_member(control_plane).map_err(down)?;
+    let mut link = link::handshake(control_plane, duplex, CAPACITY_WAIT, link::Over::Link).map_err(|e| down(e.to_string()))?;
     let params = serde_json::to_value(ask).map_err(|e| Unplaced::Refused(e.to_string()))?;
     let r = link.conn.call_within("fleet.place", params, PLACE_WAIT).map_err(|e| down(format!("{e:#}")))?;
     let r = r.ok_or_else(|| down(format!("no `fleet.place` answer within {}s", PLACE_WAIT.as_secs())))?;
@@ -3469,13 +3469,13 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
 fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value, api::ApiError> {
     let machines = api::watch_machines(&params)?;
     let dir = api::watch_dir(params, true)?;
-    // A link peer's federated watch: a member watching its hub. Only the
-    // hub federates for a peer (it watches its members plain), so no two
+    // A link peer's federated watch: a member watching its control plane. Only the
+    // control plane federates for a peer (it watches its members plain), so no two
     // members re-export each other's rows.
     let except = match &conn.table {
         Table::Peer(peer) if machines => {
-            if !shared.is_hub() {
-                return Err(api::ApiError::denied("only the fleet's hub serves a federated watch to a link peer"));
+            if !shared.is_control_plane() {
+                return Err(api::ApiError::denied("only the fleet's control plane serves a federated watch to a link peer"));
             }
             Some(peer.name.clone())
         }
@@ -3566,9 +3566,9 @@ fn hello(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) 
     conn.client.clone_from(&params.client);
     conn.audit = api::audit_client(&params.client);
     let client = Version { semver: params.version, build: params.build };
-    // A fleet hub's hello never hands this daemon off: only a local client's
+    // A fleet control plane's hello never hands this daemon off: only a local client's
     // newer binary replaces it, or any binary of this user's that forces it
-    // (a fleet worker following its hub's version, a downgrade included:
+    // (a fleet worker following its control plane's version, a downgrade included:
     // ADR 0042).
     let local = matches!(conn.table, Table::Full);
     let forced = params.force && local && conn.own_user;
@@ -3670,7 +3670,7 @@ pub(crate) mod tests {
         Options {
             version: Version { semver: "0.6.0".into(), build },
             keep_alive: false,
-            // Never the user's: a test hub that checks it sets its own.
+            // Never the user's: a test control plane that checks it sets its own.
             remotes: Some(std::env::temp_dir().join(format!("dsv-remotes-{}", std::process::id())).join("remotes.json")),
             idle_timeout: Duration::from_millis(idle_ms),
             host: false,
@@ -4995,9 +4995,9 @@ pub(crate) mod tests {
         let (state, own, other) = attach_fixture(&data);
         let options = Options { state: Some(state), member: Some(data.join("member.toml")), ..opts(1, 1000) };
         let daemon = spawn_daemon(&dir, options);
-        let fleet = data.join("fleet/hub");
+        let fleet = data.join("fleet/control_plane");
 
-        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "api", "key": attach_key()}), b"");
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "control_plane", "channel": "api", "key": attach_key()}), b"");
         assert_eq!(answer, json!({"id": 0, "result": {"ok": true, "trust": "worker"}}));
         assert!(fleet.is_dir(), "the fleet root is created");
         let cfg = fleet.join("cfg");
@@ -5011,7 +5011,7 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
         drop(conn);
 
-        // A transfer: a root tar, unpacked under `fleet/hub/roots/`.
+        // A transfer: a root tar, unpacked under `fleet/control_plane/roots/`.
         use crate::serve::fleet::{code as fcode, transfer};
         let src = data.join("src/cfg");
         std::fs::create_dir_all(&src).unwrap();
@@ -5027,7 +5027,7 @@ pub(crate) mod tests {
             repo: None,
             refs: None,
         };
-        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "transfer", "key": attach_key()}), b"");
+        let (stream, answer) = attach_raw(&dir, json!({"peer": "control_plane", "channel": "transfer", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["ok"], true, "{answer}");
         transfer::send(stream, &header, &tar[..]).unwrap();
         let landed = fleet.join("roots").join(fcode::short_hash(&tar)).join("cfg/devsandboxes.toml");
@@ -5040,16 +5040,16 @@ pub(crate) mod tests {
             answer["error"]["code"].as_str().map(str::to_string)
         };
         assert_eq!(refused(json!({"peer": "a/b", "channel": "api", "key": attach_key()}), b""), Some("invalid".into()), "not a machine name");
-        assert_eq!(refused(json!({"peer": "hub", "channel": "rpc", "key": attach_key()}), b""), Some("invalid".into()));
+        assert_eq!(refused(json!({"peer": "control_plane", "channel": "rpc", "key": attach_key()}), b""), Some("invalid".into()));
         assert!(!data.join("fleet/a").exists());
         assert_eq!(
-            refused(json!({"peer": "hub", "channel": "tunnel", "key": attach_key()}), b"{\"root\":\"/\"}\n"),
+            refused(json!({"peer": "control_plane", "channel": "tunnel", "key": attach_key()}), b"{\"root\":\"/\"}\n"),
             Some("invalid".into()),
             "bytes past the attach line"
         );
         let mut subscribed = connect(&dir);
         assert!(subscribed.call("subscribe", json!({"topics": ["inbox"]})).unwrap().error.is_none());
-        let r = subscribed.call("link.attach", json!({"peer": "hub", "channel": "pty", "key": attach_key()})).unwrap();
+        let r = subscribed.call("link.attach", json!({"peer": "control_plane", "channel": "pty", "key": attach_key()})).unwrap();
         assert_eq!(r.error.map(|e| e.code), Some("invalid".into()), "a subscribed connection");
         assert_eq!(subscribed.call("member.get", json!({})).unwrap().error, None, "still a local client");
         drop(subscribed);
@@ -5074,7 +5074,7 @@ pub(crate) mod tests {
         let daemon = spawn_daemon(&dir, options);
         let other = other.to_str().unwrap();
 
-        let (stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "pty", "key": attach_key()}), b"");
+        let (stream, answer) = attach_raw(&dir, json!({"peer": "control_plane", "channel": "pty", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["trust"], "worker", "{answer}");
         let params = Obj::new().with("root", other).with("instance", "w").with("session", "1700000000-ab12");
         let header = Record::Call(Call { method: crate::serve::fleet::pty::METHOD.into(), params, meta: Obj::new() });
@@ -5085,7 +5085,7 @@ pub(crate) mod tests {
         }
         drop(stream);
 
-        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "tunnel", "key": attach_key()}), b"");
+        let (mut stream, answer) = attach_raw(&dir, json!({"peer": "control_plane", "channel": "tunnel", "key": attach_key()}), b"");
         assert_eq!(answer["result"]["ok"], true, "{answer}");
         stream.write_all(format!("{}\n", json!({"root": other, "instance": "w", "port": 80})).as_bytes()).unwrap();
         let mut reply = String::new();
@@ -5140,23 +5140,23 @@ pub(crate) mod tests {
         let member = data.join("member.toml");
         let pk = |n: u8| SigningKey::from_seed([n; 32]).public_key();
         let attached = || {
-            let (mut stream, answer) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent", "key": attach_key()}), b"");
+            let (mut stream, answer) = attach_raw(&dir, json!({"peer": "control_plane", "channel": "agent", "key": attach_key()}), b"");
             assert_eq!(answer["result"]["ok"], true, "{answer}");
             let got = status(&mut stream);
             (stream, got)
         };
-        // No log, no grant; then a log (`hub` is key 7) and no grant, a
-        // grant for another member, one for `hub` by another key.
+        // No log, no grant; then a log (`control_plane` is key 7) and no grant, a
+        // grant for another member, one for `control_plane` by another key.
         let (mut stream, got) = attached();
         assert_eq!(got, NOT_SERVING, "nothing");
         assert!(closed(&mut stream));
-        grants::grant(&member, "hub", pk(7)).unwrap();
+        grants::grant(&member, "control_plane", pk(7)).unwrap();
         let (mut stream, got) = attached();
         assert_eq!(got, NOT_SERVING, "a grant but no log");
         assert!(closed(&mut stream));
-        grants::withdraw(&member, "hub").unwrap();
-        test_support::write(&member, &test_support::fleet("me", &SigningKey::from_seed([9; 32]), "me", &[("hub", pk(7)), ("other", pk(8))]));
-        for (name, key) in [(None, 0), (Some("other"), 8), (Some("hub"), 8)] {
+        grants::withdraw(&member, "control_plane").unwrap();
+        test_support::write(&member, &test_support::fleet("me", &SigningKey::from_seed([9; 32]), "me", &[("control_plane", pk(7)), ("other", pk(8))]));
+        for (name, key) in [(None, 0), (Some("other"), 8), (Some("control_plane"), 8)] {
             if let Some(name) = name {
                 grants::grant(&member, name, pk(key)).unwrap();
             }
@@ -5165,8 +5165,8 @@ pub(crate) mod tests {
             assert!(closed(&mut stream));
         }
 
-        grants::grant(&member, "hub", pk(7)).unwrap();
-        let (mut stream, _) = attach_raw(&dir, json!({"peer": "hub", "channel": "agent", "key": attach_key()}), b"");
+        grants::grant(&member, "control_plane", pk(7)).unwrap();
+        let (mut stream, _) = attach_raw(&dir, json!({"peer": "control_plane", "channel": "agent", "key": attach_key()}), b"");
         assert_eq!(status(&mut stream), SERVING);
         stream.write_all(b"ping").unwrap();
         let mut back = [0u8; 4];
@@ -5179,45 +5179,45 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// `hub = "self"` in member.toml implies keep-alive.
+    /// `control_plane = "self"` in member.toml implies keep-alive.
     #[test]
-    fn a_hub_never_idles() {
+    fn a_control_plane_never_idles() {
         use crate::serve::fleet::member::{self, Member};
-        let dir = scratch("hub-idle");
-        let data = scratch("hub-idle-data");
-        member::write_for_test(&data.join("member.toml"), &Member { hub: "self".into(), ..Default::default() });
-        let hub = Options { remotes: Some(data.join("remotes.json")), member: Some(data.join("member.toml")), ..opts(1, 50) };
-        let daemon = spawn_daemon(&dir, hub);
+        let dir = scratch("cp-idle");
+        let data = scratch("cp-idle-data");
+        member::write_for_test(&data.join("member.toml"), &Member { control_plane: "self".into(), ..Default::default() });
+        let control_plane = Options { remotes: Some(data.join("remotes.json")), member: Some(data.join("member.toml")), ..opts(1, 50) };
+        let daemon = spawn_daemon(&dir, control_plane);
         let _ = hello_at(&dir, &v(1));
         std::thread::sleep(Duration::from_millis(400));
-        assert!(!daemon.is_finished(), "a hub idled out");
+        assert!(!daemon.is_finished(), "a control plane idled out");
         assert!(connect(&dir).call("shutdown", json!({})).unwrap().error.is_none());
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// An adopted membership log flips the hub under a running daemon: no
-    /// longer the hub lets the daemon idle out again; a change sends
+    /// An adopted membership log flips the control plane under a running daemon: no
+    /// longer the control plane lets the daemon idle out again; a change sends
     /// `links.cycle` on each held `links.inbound` connection (and nothing on
     /// a repeat).
     #[test]
-    fn a_hub_change_cycles_the_inbound_links_and_the_keep_alive_follows() {
+    fn a_control_plane_change_cycles_the_inbound_links_and_the_keep_alive_follows() {
         use crate::serve::fleet::identity::{Signer, SigningKey};
         use crate::serve::fleet::member::{self, Member};
         use crate::serve::fleet::membership::Op;
         use crate::serve::fleet::membership_api::test_support;
-        let dir = scratch("hub-flip");
-        let data = scratch("hub-flip-data");
+        let dir = scratch("cp-flip");
+        let data = scratch("cp-flip-data");
         let member_toml = data.join("member.toml");
-        member::write_for_test(&member_toml, &Member { name: "lap".into(), hub: "self".into(), ..Default::default() });
-        // `lap` the authority and the hub; then `box` added and made the hub.
+        member::write_for_test(&member_toml, &Member { name: "lap".into(), control_plane: "self".into(), ..Default::default() });
+        // `lap` the authority and the control plane; then `box` added and made the control plane.
         let lap = test_support::key_of(&member_toml);
         let box_key = SigningKey::from_seed([2; 32]).public_key();
         let first = test_support::fleet("lap", &lap, "lap", &[]);
         let mut second = first.clone();
         second.log.append(Op::Add { name: "box".into(), key: box_key }, "lap", &lap).unwrap();
-        second.log.append(Op::Hub { name: "box".into() }, "lap", &lap).unwrap();
+        second.log.append(Op::ControlPlane { name: "box".into() }, "lap", &lap).unwrap();
         assert_ne!(lap.public_key(), box_key);
         let options = Options {
             remotes: Some(data.join("remotes.json")),
@@ -5231,15 +5231,15 @@ pub(crate) mod tests {
         assert!(r.error.is_none(), "{r:?}");
         let mut local = connect(&dir);
         let r = local.call("membership.adopt", serde_json::to_value(first.to_wire()).unwrap()).unwrap();
-        assert_eq!(r.result.unwrap()["summary"]["hub"], "lap");
-        assert_eq!(member::load(&member_toml).unwrap().unwrap().hub(), member::Hub::This);
+        assert_eq!(r.result.unwrap()["summary"]["control_plane"], "lap");
+        assert_eq!(member::load(&member_toml).unwrap().unwrap().control_plane(), member::ControlPlane::This);
         assert!(inbound.next_notification(Duration::from_millis(300)).unwrap().is_none(), "no change, no cycle");
         let r = local.call("membership.adopt", serde_json::to_value(second.to_wire()).unwrap()).unwrap();
-        assert_eq!(r.result.unwrap()["summary"]["hub"], "box");
+        assert_eq!(r.result.unwrap()["summary"]["control_plane"], "box");
         let n = inbound.next_notification(Duration::from_secs(5)).unwrap().expect("no links.cycle");
         assert_eq!(n.method, crate::commands::fleet_link::LINKS_CYCLE);
-        assert_eq!(member::load(&member_toml).unwrap().unwrap().hub(), member::Hub::Other("box".into()));
-        // No longer the hub: it idles out once nobody holds it.
+        assert_eq!(member::load(&member_toml).unwrap().unwrap().control_plane(), member::ControlPlane::Other("box".into()));
+        // No longer the control plane: it idles out once nobody holds it.
         drop((inbound, local));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&dir);

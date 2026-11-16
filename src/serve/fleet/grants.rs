@@ -105,7 +105,7 @@ mod tests {
         SigningKey::from_seed([n; 32])
     }
 
-    /// `lap` (1) the authority and hub, `box` (2), `pi` (3).
+    /// `lap` (1) the authority and control plane, `box` (2), `pi` (3).
     fn stored() -> Stored {
         test_support::fleet("lap", &k(1), "lap", &[("box", k(2).public_key()), ("pi", k(3).public_key())])
     }

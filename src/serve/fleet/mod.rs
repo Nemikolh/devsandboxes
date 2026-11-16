@@ -29,7 +29,7 @@
 //!   `Hello`s, with the membership heads compared and synced.
 //! - `graph`: the members' signed link reports and the paths over them
 //!   (pure); `reports`: this host's own report built from its links and
-//!   sent to the hub (`fleet.report`), the reports exchanged and pushed
+//!   sent to the control plane (`fleet.report`), the reports exchanged and pushed
 //!   (`fleet.graph`), the graph the daemon holds (`graph.get`).
 //! - `route`: a routed stream (`ROUTE`): its header, the origin's and the
 //!   destination's proof and their session's keys, how a link end relays
@@ -56,8 +56,8 @@
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a member
-//!   follows its hub's (download, install, forced handoff); `follow`: the
-//!   wait for a hub's pushed dev build, and [`follow::Follow`].
+//!   follows its control plane's (download, install, forced handoff); `follow`: the
+//!   wait for a control plane's pushed dev build, and [`follow::Follow`].
 //! - `code`: a config root and its repos moved onto a machine (the root as
 //!   a tar, each folder's branch as a git bundle from this host's repo
 //!   cache), and the receivers for them.
@@ -105,7 +105,7 @@ use crate::devsbd::proto::channel;
 /// daemon's (decision 27 of the fleet plan). Both ends
 /// also serve `TRANSFER` streams ([`transfer`], `link::Serves::transfers`).
 /// Its `Hello` hash is this build
-/// ([`update::HELLO`]); a peer link's says its end's role and hub too
+/// ([`update::HELLO`]); a peer link's says its end's role and control plane too
 /// (`update::hello_of`).
 pub const LINK: link::Spec = link::Spec {
     name: "fleet link",

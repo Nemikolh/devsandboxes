@@ -1,6 +1,6 @@
-//! Waiting for a hub's dev build on a link (docs/architecture/daemon/fleet.md,
+//! Waiting for a control plane's dev build on a link (docs/architecture/daemon/fleet.md,
 //! *Versions*): once a link's `Hello`s say `update::Decision::Receive`, the
-//! end that follows serves nothing but the one `binary` transfer the hub
+//! end that follows serves nothing but the one `binary` transfer the control plane
 //! pushes (`update::push`), into a private scratch dir, then ends the link
 //! so the binary can be installed and handed off to
 //! (`update::install_received`). Shared by a peer link's two ends: the
@@ -17,7 +17,7 @@ use super::transfer::Receivers;
 use super::update::{BINARY_KIND, BINARY_LIMIT, Steps};
 use crate::serve::endpoint::Stream;
 
-/// How this host follows a hub's build on a peer link.
+/// How this host follows a control plane's build on a peer link.
 #[derive(Clone)]
 pub struct Follow {
     /// The update's steps (`update::Release` in production).
@@ -28,7 +28,7 @@ pub struct Follow {
     pub dev_builds: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
-/// How long a link waiting for the hub's binary waits for its transfer to
+/// How long a link waiting for the control plane's binary waits for its transfer to
 /// start; then it ends (and is redialed).
 pub const PUSH_WAIT: Duration = Duration::from_secs(60);
 
@@ -43,7 +43,7 @@ pub fn shutting(stream: Stream) -> EndLink {
     })
 }
 
-/// The hub's binary on its way (`Decision::Receive`): what the `binary`
+/// The control plane's binary on its way (`Decision::Receive`): what the `binary`
 /// receiver takes, for the one link waiting for it.
 #[derive(Default)]
 pub struct Incoming {
@@ -54,7 +54,7 @@ pub struct Incoming {
 
 pub struct Want {
     seq: u64,
-    /// The hub's `Hello` hash: what the binary must report.
+    /// The control plane's `Hello` hash: what the binary must report.
     pub hello: String,
     /// The private scratch dir it lands in.
     pub dir: PathBuf,
@@ -74,7 +74,7 @@ impl Want {
 }
 
 impl Incoming {
-    /// Wait for the hub's binary on the link `end` ends; the wait's `seq`.
+    /// Wait for the control plane's binary on the link `end` ends; the wait's `seq`.
     pub fn expect(&self, hello: String, dir: PathBuf, end: Option<EndLink>) -> u64 {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         *self.want.lock().unwrap() = Some(Want { seq, hello, dir, end, started: false, received: None, why: None });
@@ -108,12 +108,12 @@ impl Incoming {
             let (guard, _) = me.wake.wait_timeout_while(guard, wait, |w| current(w)).unwrap();
             if current(&guard) {
                 drop(guard);
-                me.finish(|w| w.why = Some(format!("the hub sent no binary within {wait:?}")));
+                me.finish(|w| w.why = Some(format!("the control plane sent no binary within {wait:?}")));
             }
         });
     }
 
-    /// `receivers` taking the hub's binary ([`BINARY_KIND`]) into the
+    /// `receivers` taking the control plane's binary ([`BINARY_KIND`]) into the
     /// current wait's dir, once; with no wait, refused at the header.
     pub fn receiver(self: &Arc<Self>, receivers: Receivers) -> Receivers {
         let (take, done, failed) = (Arc::clone(self), Arc::clone(self), Arc::clone(self));
@@ -134,7 +134,7 @@ impl Incoming {
                 },
                 move |r| done.finish(|w| w.received = Some(r.path)),
             )
-            .on_failure(BINARY_KIND, move |why| failed.finish(|w| w.why = Some(format!("the hub's binary didn't arrive: {why}"))))
+            .on_failure(BINARY_KIND, move |why| failed.finish(|w| w.why = Some(format!("the control plane's binary didn't arrive: {why}"))))
     }
 }
 
@@ -178,7 +178,7 @@ mod tests {
         incoming.watch(seq, Duration::from_millis(20));
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         assert_eq!(std::io::Read::read(&mut &peer, &mut [0u8; 1]).unwrap(), 0, "shut by the watch");
-        assert_eq!(incoming.take().unwrap().why.as_deref(), Some("the hub sent no binary within 20ms"));
+        assert_eq!(incoming.take().unwrap().why.as_deref(), Some("the control plane sent no binary within 20ms"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

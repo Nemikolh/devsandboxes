@@ -17,7 +17,7 @@
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
 //!   quick calls (`machines::forward::QUICK`), `capacity.get`, `code.haves`, `mesh.folders`, `roots.list`,
 //!   `open.deliver` and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
-//!   true`) request but `instances.watch` (a member watching its hub);
+//!   true`) request but `instances.watch` (a member watching its control plane);
 //!   everything else (`machines.*`,
 //!   `shutdown`, `helper.call`, `forwards.*`, the
 //!   Inbox, …) is `denied`.
@@ -40,7 +40,7 @@
 //!
 //! `fleet.*` (a removal from the fleet, `machines::leave`; a membership
 //! change proposed to the authority or pushed from it, `machines::changes`;
-//! a member's run placed by the hub, `fleet.place`; link reports,
+//! a member's run placed by the control plane, `fleet.place`; link reports,
 //! `fleet.report` / `fleet.graph`) goes by who the peer proved it is
 //! (its key, [`Peer::key`], against this host's membership log), not by
 //! trust: [`admit_fleet`], before any of the above.
@@ -311,7 +311,7 @@ pub enum Gate {
     Watch,
     Unwatch,
     Quick,
-    /// `capacity.get`: this host's report, for the hub's placement.
+    /// `capacity.get`: this host's report, for the control plane's placement.
     Capacity,
     /// `code.haves`: what the caller's own fleet root here has (the daemon
     /// answers it about that root only).
@@ -338,7 +338,7 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
     if fwd::machine_of(params)?.is_some() {
         return Err(ApiError::denied("a remote caller can't reach past this member (`machine`)"));
     }
-    // But a federated watch: a member watching its hub, which only a hub
+    // But a federated watch: a member watching its control plane, which only a control plane
     // serves (the daemon's `watch_root`).
     if fwd::federated(params) && method != "instances.watch" {
         return Err(ApiError::denied("a remote caller can't reach past this member (`machines`)"));
@@ -385,7 +385,7 @@ fn instance_keys(method: &str) -> &'static [&'static str] {
     }
 }
 
-/// The verbs that act on an existing instance, which a hub must name.
+/// The verbs that act on an existing instance, which a control plane must name.
 fn needs_instance(method: &str) -> bool {
     matches!(method, "rebuild" | "start" | "stop" | "rm")
 }
@@ -479,11 +479,11 @@ pub const FLEET_METHODS: &[&str] =
 /// `machines.*`) against `log` (`None`: this host is in no fleet's log).
 /// Fleet plan decisions 31, 32 and 49, step 10a.6:
 ///
-/// - `fleet.leave` / `fleet.forget` come only from the log's hub (its name
+/// - `fleet.leave` / `fleet.forget` come only from the log's control plane (its name
 ///   and its key in the log, never the name alone), and follow a revoke:
 ///   `leave` only once the log revokes this host's own key, `forget
 ///   {name}` only once it revokes `name`.
-/// - `fleet.rm` and `fleet.place` run only on the hub (the log's hub is this
+/// - `fleet.rm` and `fleet.place` run only on the control plane (the log's control plane is this
 ///   host): `fleet.rm {name}` from a member of the log (name and key), of
 ///   itself (leaving) or of a member the log has revoked; `fleet.place` from
 ///   a member or a held introduction's (a capped member runs work as the
@@ -492,7 +492,7 @@ pub const FLEET_METHODS: &[&str] =
 ///   log's authority's), from a member of the log; never from a capped one.
 /// - `fleet.sync` and `fleet.graph` from a member of the log or an
 ///   introduced (capped) one: what they carry verifies itself.
-/// - `fleet.report` runs only on the hub, from a member of the log or a
+/// - `fleet.report` runs only on the control plane, from a member of the log or a
 ///   held introduction's (name and key): a capped member's links route too.
 pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Option<Log>) -> Result<(), ApiError> {
     let Some(peer) = from else {
@@ -517,9 +517,9 @@ pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Optio
     };
     match method {
         "fleet.leave" | "fleet.forget" => {
-            if m.hub != from || m.hub_key() != Some(key) {
+            if m.control_plane != from || m.control_plane_key() != Some(key) {
                 return Err(ApiError::denied(format!(
-                    "`{method}` is taken from this host's hub only (by its key in the log), and `{from}` isn't it"
+                    "`{method}` is taken from this host's control plane only (by its key in the log), and `{from}` isn't it"
                 )));
             }
             if method == "fleet.leave" {
@@ -561,14 +561,14 @@ pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Optio
         "fleet.sync" | "fleet.graph" => {
             Err(ApiError::denied(format!("`{method}` from `{from}`, which is neither a member nor introduced")))
         }
-        _ if m.hub != log.own => Err(ApiError::denied(format!("`{method}` runs on the hub, and this host isn't it"))),
+        _ if m.control_plane != log.own => Err(ApiError::denied(format!("`{method}` runs on the control plane, and this host isn't it"))),
         "fleet.rm" if member => {
             let name = name()?;
             if name == from || log.stored.log.revoked_name(name) {
                 Ok(())
             } else {
                 Err(ApiError::denied(format!(
-                    "`fleet.rm` of `{name}`: its key isn't revoked in the hub's membership log \
+                    "`fleet.rm` of `{name}`: its key isn't revoked in the control plane's membership log \
                      (the authority `{}` signs that: `devsandbox machine rm {name}` there)",
                     m.authority.0
                 )))
@@ -590,9 +590,9 @@ pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state:
     if ["member.", "membership.", "graph.", "link.", "links.", "placements."].iter().any(|p| method.starts_with(p)) {
         return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
     }
-    // [`admit_fleet`]'s, which knows this host's hub: never through here.
+    // [`admit_fleet`]'s, which knows this host's control plane: never through here.
     if method.starts_with("fleet.") {
-        return Err(ApiError::denied(format!("`{method}` goes by this host's hub, not its trust table")));
+        return Err(ApiError::denied(format!("`{method}` goes by this host's control plane, not its trust table")));
     }
     if reach.trust == Trust::Full {
         if verbs::is_verb(method)
@@ -819,7 +819,7 @@ fn row_lent(row: &Value, reach: &Reach) -> bool {
 /// gone, and their names from services' `used_by` and from
 /// `thread_children`. The snapshot lists every instance in `state.toml`,
 /// whatever `dir`, so this is what keeps what isn't reached out. Rows
-/// tagged `machine` (a hub's federated push: other machines' rows, their
+/// tagged `machine` (a control plane's federated push: other machines' rows, their
 /// `root` a path there) aren't this host's and stay. Nothing is cut under
 /// `full`.
 pub fn filter_snapshot(snapshot: &mut Value, reach: &Reach) {
@@ -902,7 +902,7 @@ mod tests {
             ("subscribe", json!({"topics": ["instances", "inbox"]}), Err("denied")),
             ("subscribe", json!({"topics": ["forwards"]}), Err("denied")),
             ("instances.watch", json!({"dir": "/x"}), Ok(Watch)),
-            // A member watching its hub: the daemon serves it on a hub only.
+            // A member watching its control plane: the daemon serves it on a control plane only.
             ("instances.watch", json!({"dir": "/x", "machines": true}), Ok(Watch)),
             ("instances.unwatch", json!({"dir": "/x"}), Ok(Unwatch)),
             ("instances.list", json!({"dir": "/x"}), Ok(Quick)),
@@ -1032,7 +1032,7 @@ mod tests {
     #[test]
     fn paths_are_confined_to_the_fleet_root() {
         let base = scratch("paths");
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg/sub")).unwrap();
         std::fs::create_dir_all(base.join("mine")).unwrap();
         std::os::unix::fs::symlink(base.join("mine"), root.join("escape")).unwrap();
@@ -1053,8 +1053,8 @@ mod tests {
         assert_eq!(confine_path(&reach, &root.join("gone"), false).unwrap(), root.join("gone"), "an unwatch");
         assert_eq!(code(&base.join("gone"), false), "denied");
         // A sibling whose name extends the root's isn't under it.
-        std::fs::create_dir_all(base.join("fleet/hub2")).unwrap();
-        assert_eq!(code(&base.join("fleet/hub2"), true), "denied");
+        std::fs::create_dir_all(base.join("fleet/control_plane2")).unwrap();
+        assert_eq!(code(&base.join("fleet/control_plane2"), true), "denied");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1075,7 +1075,7 @@ mod tests {
     /// A link peer: this host's env.
     fn peer(root: &Path) -> Peer {
         Peer {
-            name: "me@hub".into(),
+            name: "me@control_plane".into(),
             fleet_root: Some(root.to_path_buf()),
             env: Some(BTreeMap::from([("PATH".into(), "/worker/bin".into())])),
             agent: None,
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn admit_confines_paths_instances_and_containers() {
         let base = scratch("admit");
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(base.join("mine")).unwrap();
         let state = state_with(&base, &root);
@@ -1155,8 +1155,8 @@ mod tests {
     #[test]
     fn a_fetch_reaches_the_callers_fleet_root_only() {
         let base = scratch("fetch");
-        let root = base.join("fleet/hub");
-        for d in ["fleet/hub/roots/h/cfg", "fleet/hub/roots/h/web", "mine/cfg", "mine/web"] {
+        let root = base.join("fleet/control_plane");
+        for d in ["fleet/control_plane/roots/h/cfg", "fleet/control_plane/roots/h/web", "mine/cfg", "mine/web"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
         let state = base.join("state.toml");
@@ -1196,10 +1196,10 @@ mod tests {
     #[test]
     fn a_verbs_env_is_this_hosts() {
         let base = scratch("env");
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         let state = state_with(&base, &root);
-        let p = json!({"root": root.join("cfg"), "instance": "in", "env": {"PATH": "/hub/bin", "SSH_AUTH_SOCK": "/hub/agent"}});
+        let p = json!({"root": root.join("cfg"), "instance": "in", "env": {"PATH": "/control_plane/bin", "SSH_AUTH_SOCK": "/control_plane/agent"}});
         let r = fleet(&root);
         let got = admit("stop", p.clone(), &peer(&root), &r, &state).unwrap();
         assert_eq!(got["env"], json!({"PATH": "/worker/bin"}));
@@ -1241,7 +1241,7 @@ mod tests {
     #[test]
     fn worker_admits_own_roots_exactly() {
         let base = scratch("own");
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(base.join("mine/nested")).unwrap();
         std::fs::create_dir_all(base.join("other")).unwrap();
@@ -1286,7 +1286,7 @@ mod tests {
     #[test]
     fn full_skips_the_table_but_not_member_or_link() {
         let base = scratch("full");
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(&root).unwrap();
         let state = base.join("absent.toml");
         let (s, r) = (peer(&root), Reach { trust: Trust::Full, ..fleet(&root) });
@@ -1304,7 +1304,7 @@ mod tests {
             assert_eq!(admit(m, p.clone(), &as_sent, &r, &state).unwrap(), p, "{m}: as sent");
         }
         // `gc`: a verb, so the peer's env; under `worker` refused whatever the root.
-        let gc = json!({"root": root, "env": {"PATH": "/hub/bin"}});
+        let gc = json!({"root": root, "env": {"PATH": "/control_plane/bin"}});
         assert_eq!(admit("gc", gc.clone(), &s, &r, &state).unwrap()["env"], json!({"PATH": "/worker/bin"}));
         let e = admit("gc", gc, &s, &fleet(&root), &state).unwrap_err();
         assert_eq!(e.code, "denied");
@@ -1330,7 +1330,7 @@ mod tests {
         Peer { name: name.into(), fleet_root: None, env: None, agent: None, key: Some(pk(n)), introduced_by: None }
     }
 
-    /// `lap` (1) the authority, `box` (2) the hub, `pi` (3) a member; `new`
+    /// `lap` (1) the authority, `box` (2) the control plane, `pi` (3) a member; `new`
     /// (5) introduced by `pi`.
     fn fleet_log() -> Stored {
         use crate::serve::fleet::membership::Introduction;
@@ -1341,7 +1341,7 @@ mod tests {
     }
 
     /// `fleet.*` goes by the key the peer proved: `leave` / `forget` from
-    /// the log's hub (name and key), `rm` and `place` to the hub from a
+    /// the log's control plane (name and key), `rm` and `place` to the control plane from a
     /// member (`place` from an introduced one too); never from a local
     /// client, nor from a peer that proved no key.
     /// The key of each member of [`fleet_log`] by name (seeds 1, 2, 3, 5).
@@ -1368,12 +1368,12 @@ mod tests {
         let code = |m: &str, p: &Peer, log: Option<Log>| admit_fleet(m, &pi, Some(p), log).unwrap_err().code;
         let capped = Peer { introduced_by: Some("pi".into()), ..proved("new", 5) };
         for (m, params) in [("fleet.leave", &none), ("fleet.forget", &pi)] {
-            assert_eq!(admit_fleet(m, params, Some(&proved("box", 2)), after("pi")), Ok(()), "{m} from the hub, after the revoke");
+            assert_eq!(admit_fleet(m, params, Some(&proved("box", 2)), after("pi")), Ok(()), "{m} from the control plane, after the revoke");
             let e = admit_fleet(m, params, Some(&proved("box", 2)), on("pi")).unwrap_err();
             assert!(e.code == "denied" && e.message.contains("follows a revoke"), "{m}: no revoke yet: {}", e.message);
-            assert_eq!(code(m, &proved("box", 9), after("pi")), "denied", "{m}: the hub's name, another key");
-            assert_eq!(code(m, &proved("lap", 2), after("pi")), "denied", "{m}: the hub's key, another name");
-            assert_eq!(code(m, &proved("lap", 1), after("pi")), "denied", "{m}: the authority isn't the hub");
+            assert_eq!(code(m, &proved("box", 9), after("pi")), "denied", "{m}: the control plane's name, another key");
+            assert_eq!(code(m, &proved("lap", 2), after("pi")), "denied", "{m}: the control plane's key, another name");
+            assert_eq!(code(m, &proved("lap", 1), after("pi")), "denied", "{m}: the authority isn't the control plane");
             assert_eq!(code(m, &capped, after("pi")), "denied");
             assert_eq!(code(m, &Peer { key: None, ..proved("box", 2) }, after("pi")), "denied", "{m}: no key");
             assert_eq!(admit_fleet(m, params, Some(&proved("box", 2)), None).unwrap_err().code, "denied", "{m}: no log");
@@ -1387,7 +1387,7 @@ mod tests {
             assert_eq!(admit_fleet(m, &pi, Some(&proved("pi", 3)), on("box")), Ok(()), "{m} from a member (`rm` of itself)");
             assert_eq!(admit_fleet(m, &pi, Some(&proved("lap", 1)), log), Ok(()), "{m} from the authority");
             let e = admit_fleet(m, &pi, Some(&proved("pi", 3)), on("lap")).unwrap_err();
-            assert_eq!((e.code, e.message), ("denied", format!("`{m}` runs on the hub, and this host isn't it")));
+            assert_eq!((e.code, e.message), ("denied", format!("`{m}` runs on the control plane, and this host isn't it")));
             assert_eq!(code(m, &proved("pi", 1), on("box")), "denied", "{m}: a member's name, another's key");
             assert_eq!(code(m, &proved("stranger", 9), on("box")), "denied");
             assert_eq!(code(m, &Peer { key: None, ..proved("pi", 3) }, on("box")), "denied", "{m}: no key");
@@ -1395,7 +1395,7 @@ mod tests {
         }
         // `fleet.rm` of another member: only once the log revokes it.
         let e = admit_fleet("fleet.rm", &pi, Some(&proved("lap", 1)), on("box")).unwrap_err();
-        assert!(e.code == "denied" && e.message.contains("isn't revoked in the hub's membership log"), "{}", e.message);
+        assert!(e.code == "denied" && e.message.contains("isn't revoked in the control plane's membership log"), "{}", e.message);
         // A capped member's run is placed; it removes no one.
         assert_eq!(admit_fleet("fleet.place", &none, Some(&capped), on("box")), Ok(()));
         assert_eq!(admit_fleet("fleet.place", &none, Some(&Peer { key: Some(pk(9)), ..capped.clone() }), on("box")).unwrap_err().code, "denied");
@@ -1405,31 +1405,31 @@ mod tests {
         assert_eq!(admit_fleet("fleet.other", &none, Some(&proved("box", 2)), on("pi")).unwrap_err().code, "unknown-method");
     }
 
-    /// The hub is the one the log names at the call: once a `hub` entry
+    /// The control plane is the one the log names at the call: once a `control_plane` entry
     /// moves it from `box` to `pi`, `box`'s key no longer sends `fleet.forget`
     /// and `pi`'s does; `rm` / `place` / `report` run on `pi`, not `box`.
     #[test]
-    fn the_hub_only_calls_follow_the_logs_hub() {
+    fn the_control_plane_only_calls_follow_the_logs_control_plane() {
         use crate::serve::fleet::membership::Op;
         let mut before = fleet_log();
         before.log.append(Op::Add { name: "zed".into(), key: pk(4) }, "lap", &sk(1)).unwrap();
         before.log.append(Op::Revoke { name: "zed".into(), key: pk(4) }, "lap", &sk(1)).unwrap();
         let mut moved = before.clone();
-        moved.log.append(Op::Hub { name: "pi".into() }, "lap", &sk(1)).unwrap();
+        moved.log.append(Op::ControlPlane { name: "pi".into() }, "lap", &sk(1)).unwrap();
         let (zed, none) = (json!({"name": "zed"}), json!({}));
         fn at<'a>(stored: &'a Stored, own: &'a str) -> Option<Log<'a>> {
             Some(Log { stored, own, key: own_key(own) })
         }
         assert_eq!(admit_fleet("fleet.forget", &zed, Some(&proved("box", 2)), at(&before, "lap")), Ok(()));
         assert_eq!(admit_fleet("fleet.forget", &zed, Some(&proved("pi", 3)), at(&before, "lap")).unwrap_err().code, "denied");
-        assert_eq!(admit_fleet("fleet.forget", &zed, Some(&proved("pi", 3)), at(&moved, "lap")), Ok(()), "the new hub's key");
+        assert_eq!(admit_fleet("fleet.forget", &zed, Some(&proved("pi", 3)), at(&moved, "lap")), Ok(()), "the new control plane's key");
         let e = admit_fleet("fleet.forget", &zed, Some(&proved("box", 2)), at(&moved, "lap")).unwrap_err();
-        assert!(e.code == "denied" && e.message.contains("`box` isn't it"), "the old hub's key: {}", e.message);
+        assert!(e.code == "denied" && e.message.contains("`box` isn't it"), "the old control plane's key: {}", e.message);
         for (m, params) in [("fleet.rm", &zed), ("fleet.place", &none), ("fleet.report", &none)] {
-            assert_eq!(admit_fleet(m, params, Some(&proved("lap", 1)), at(&before, "box")), Ok(()), "{m} on the hub");
-            assert_eq!(admit_fleet(m, params, Some(&proved("lap", 1)), at(&moved, "pi")), Ok(()), "{m} on the new hub");
+            assert_eq!(admit_fleet(m, params, Some(&proved("lap", 1)), at(&before, "box")), Ok(()), "{m} on the control plane");
+            assert_eq!(admit_fleet(m, params, Some(&proved("lap", 1)), at(&moved, "pi")), Ok(()), "{m} on the new control plane");
             let e = admit_fleet(m, params, Some(&proved("lap", 1)), at(&moved, "box")).unwrap_err();
-            assert_eq!((e.code, e.message), ("denied", format!("`{m}` runs on the hub, and this host isn't it")), "{m} on the old hub");
+            assert_eq!((e.code, e.message), ("denied", format!("`{m}` runs on the control plane, and this host isn't it")), "{m} on the old control plane");
         }
     }
 
@@ -1443,7 +1443,7 @@ mod tests {
         let p = json!({"op": {"kind": "revoke", "name": "pi"}});
         let capped = Peer { introduced_by: Some("pi".into()), ..proved("new", 5) };
         assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("pi", 3)), on("lap")), Ok(()));
-        assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("box", 2)), on("lap")), Ok(()), "the hub is a member too");
+        assert_eq!(admit_fleet("fleet.propose", &p, Some(&proved("box", 2)), on("lap")), Ok(()), "the control plane is a member too");
         let e = admit_fleet("fleet.propose", &p, Some(&proved("pi", 3)), on("box")).unwrap_err();
         assert_eq!((e.code, e.message.as_str()), ("denied", "`fleet.propose` goes to the fleet's authority `lap`, and this host isn't it"));
         // The authority's name with another key (a stale `member.toml`).
@@ -1462,22 +1462,22 @@ mod tests {
         assert_eq!(admit_fleet("fleet.sync", &sync, None, on("pi")).unwrap_err().code, "denied");
     }
 
-    /// `fleet.report` on the hub only, from a member or a held
+    /// `fleet.report` on the control plane only, from a member or a held
     /// introduction by its key; `fleet.graph` anywhere from either.
     #[test]
-    fn link_reports_go_to_the_hub_and_graphs_come_from_members() {
+    fn link_reports_go_to_the_control_plane_and_graphs_come_from_members() {
         let stored = fleet_log();
         let on = |own| Some(Log { stored: &stored, own, key: own_key(own) });
         let p = json!({});
         let capped = Peer { introduced_by: Some("pi".into()), ..proved("new", 5) };
         for from in [proved("pi", 3), proved("lap", 1), capped.clone()] {
-            assert_eq!(admit_fleet("fleet.report", &p, Some(&from), on("box")), Ok(()), "{} to the hub", from.name);
+            assert_eq!(admit_fleet("fleet.report", &p, Some(&from), on("box")), Ok(()), "{} to the control plane", from.name);
             for own in ["lap", "box", "pi"] {
                 assert_eq!(admit_fleet("fleet.graph", &p, Some(&from), on(own)), Ok(()), "{} on {own}", from.name);
             }
         }
         let e = admit_fleet("fleet.report", &p, Some(&proved("pi", 3)), on("lap")).unwrap_err();
-        assert_eq!((e.code, e.message.as_str()), ("denied", "`fleet.report` runs on the hub, and this host isn't it"));
+        assert_eq!((e.code, e.message.as_str()), ("denied", "`fleet.report` runs on the control plane, and this host isn't it"));
         for m in ["fleet.report", "fleet.graph"] {
             let on = if m == "fleet.report" { on("box") } else { on("pi") };
             assert_eq!(admit_fleet(m, &p, Some(&proved("pi", 9)), on).unwrap_err().code, "denied", "{m}: a member's name, another key");
@@ -1498,7 +1498,7 @@ mod tests {
     #[test]
     fn the_reach_comes_from_member_toml_and_state_toml() {
         let base = scratch("load");
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(base.join("mine")).unwrap();
         std::fs::create_dir_all(base.join("picked")).unwrap();
@@ -1551,19 +1551,19 @@ mod tests {
         assert_eq!(r.trust, Trust::Worker);
         assert!(r.admits(&copy));
         assert!(!r.admits(&copy.join("nested")) && !r.admits(&data.join("mesh")));
-        let s = peer(&base.join("fleet/hub"));
+        let s = peer(&base.join("fleet/control_plane"));
         assert!(admit("start", json!({"root": copy, "all": true}), &s, &r, &state).is_ok());
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn rows_are_cut_to_the_fleet_root() {
-        let root = Path::new("/nonexistent/fleet/hub");
+        let root = Path::new("/nonexistent/fleet/control_plane");
         let mut snap = json!({
             "instances": [
-                {"name": "in", "root": "/nonexistent/fleet/hub/cfg", "instance_id": "i1"},
+                {"name": "in", "root": "/nonexistent/fleet/control_plane/cfg", "instance_id": "i1"},
                 {"name": "own", "root": "/nonexistent/mine", "instance_id": "o1"},
-                {"name": "sneaky", "root": "/nonexistent/fleet/hub/../../mine"},
+                {"name": "sneaky", "root": "/nonexistent/fleet/control_plane/../../mine"},
                 {"name": "old", "root": null},
             ],
             "services": [
@@ -1586,7 +1586,7 @@ mod tests {
         assert_eq!(own["thread_children"], json!({"id-own": {"k": "own"}, "id-in": {"k": "in", "j": "own"}}));
         let root = &fleet(root);
         filter_snapshot(&mut snap, root);
-        assert_eq!(snap["instances"], json!([{"name": "in", "root": "/nonexistent/fleet/hub/cfg", "instance_id": "i1"}]));
+        assert_eq!(snap["instances"], json!([{"name": "in", "root": "/nonexistent/fleet/control_plane/cfg", "instance_id": "i1"}]));
         assert_eq!(snap["services"][0]["used_by"], json!(["in"]));
         assert_eq!(snap["services"][1]["containers"], json!([["devsandbox-svc-p-i1-cache", {"Running": "Up"}]]), "another root's isolated copy cut");
         assert_eq!(snap["services"][2]["containers"].as_array().unwrap().len(), 1, "a global one kept");
@@ -1594,24 +1594,24 @@ mod tests {
         assert_eq!(snap["sandboxes"], json!([{"name": "web"}]), "the root's own config, as is");
 
         let resolved = json!({"matches": ["in", "own"], "found": [
-            {"name": "in", "root": "/nonexistent/fleet/hub/cfg"}, {"name": "own", "root": "/nonexistent/mine"}]});
+            {"name": "in", "root": "/nonexistent/fleet/control_plane/cfg"}, {"name": "own", "root": "/nonexistent/mine"}]});
         let got = filter_answer("instances.resolve", resolved, root, Path::new("/nonexistent/state.toml")).unwrap();
-        assert_eq!(got, json!({"matches": ["in"], "found": [{"name": "in", "root": "/nonexistent/fleet/hub/cfg"}]}));
+        assert_eq!(got, json!({"matches": ["in"], "found": [{"name": "in", "root": "/nonexistent/fleet/control_plane/cfg"}]}));
         let own = json!({"matches": ["own"], "found": [{"name": "own", "root": "/nonexistent/mine"}]});
         assert_eq!(filter_answer("instances.resolve", own, root, Path::new("/nonexistent/state.toml")).unwrap_err().code, "not-found");
         assert_eq!(filter_answer("sandboxes.list", json!({"a": 1}), root, Path::new("/nonexistent/state.toml")).unwrap(), json!({"a": 1}));
     }
 
-    /// A hub's federated push: other machines' rows (tagged, their `root` a
+    /// A control plane's federated push: other machines' rows (tagged, their `root` a
     /// path there) stay, their services untouched; this host's own rows are
     /// cut as ever, and a remote instance of the same name keeps no local
     /// row's service user.
     #[test]
     fn a_federated_push_keeps_other_machines_rows() {
-        let root = Path::new("/nonexistent/fleet/hub");
+        let root = Path::new("/nonexistent/fleet/control_plane");
         let mut snap = json!({
             "instances": [
-                {"name": "in", "root": "/nonexistent/fleet/hub/cfg", "instance_id": "i1"},
+                {"name": "in", "root": "/nonexistent/fleet/control_plane/cfg", "instance_id": "i1"},
                 {"name": "own", "root": "/nonexistent/mine", "instance_id": "o1"},
                 {"name": "own", "root": "/x/cfg", "machine": "x", "instance_id": "x1"},
             ],
@@ -1660,7 +1660,7 @@ mod tests {
     #[test]
     fn container_answers_are_cut_by_the_state() {
         let base = scratch("containers");
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(base.join("mine")).unwrap();
         let state = state_with(&base, &root);
@@ -1683,14 +1683,14 @@ mod tests {
 
     #[test]
     fn a_peers_roots_listing_gets_its_fleet_root_once() {
-        let reach = worker(Path::new("/d/fleet/hub"), &[]);
+        let reach = worker(Path::new("/d/fleet/control_plane"), &[]);
         let own = json!([{"root": "/own", "sandboxes": [{"name": "web"}], "error": null}]);
         let got = with_fleet_root(own.clone(), &reach);
-        assert_eq!(got, json!([own[0], {"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": true}]));
+        assert_eq!(got, json!([own[0], {"root": "/d/fleet/control_plane", "sandboxes": [], "error": null, "fleet": true}]));
         assert_eq!(with_fleet_root(got.clone(), &reach), got, "listed already");
         // Listed among the own roots already: flagged there.
-        let listed = json!([{"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": false}]);
-        assert_eq!(with_fleet_root(listed, &reach), json!([{"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": true}]));
+        let listed = json!([{"root": "/d/fleet/control_plane", "sandboxes": [], "error": null, "fleet": false}]);
+        assert_eq!(with_fleet_root(listed, &reach), json!([{"root": "/d/fleet/control_plane", "sandboxes": [], "error": null, "fleet": true}]));
         let relay = Reach { fleet_root: None, ..reach.clone() };
         assert_eq!(with_fleet_root(own.clone(), &relay), own, "no fleet root: as is");
         assert_eq!(with_fleet_root(json!({"x": 1}), &reach), json!({"x": 1}), "not a listing");

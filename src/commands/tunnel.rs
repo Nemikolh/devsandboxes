@@ -446,7 +446,7 @@ mod tests {
     }
 
     fn web_request() -> Request {
-        Request { root: "/worker/fleet/hub/cfg".into(), instance: Some("web".into()), service: None, port: 3000 }
+        Request { root: "/worker/fleet/control_plane/cfg".into(), instance: Some("web".into()), service: None, port: 3000 }
     }
 
     /// The worker's route header, then its end of the bridge handshake; it
@@ -478,11 +478,11 @@ mod tests {
 
     #[test]
     fn a_fleet_tunnels_refusals_are_the_error() {
-        let refusal = Header::Error { error: "no instance `web` in /worker/fleet/hub/cfg".into() };
+        let refusal = Header::Error { error: "no instance `web` in /worker/fleet/control_plane/cfg".into() };
         let line = refusal.line();
         let (socket, worker) = fake_worker("refused", move |s, _| (&s).write_all(line.as_bytes()).unwrap());
         let got = remote_opener("lap".into(), fleet(&socket, &web_request()))(&AtomicBool::new(false));
-        assert_eq!(got.err().as_deref(), Some("no instance `web` in /worker/fleet/hub/cfg"));
+        assert_eq!(got.err().as_deref(), Some("no instance `web` in /worker/fleet/control_plane/cfg"));
         worker.join().unwrap();
 
         // The link refused the stream (or the worker went away): no header.

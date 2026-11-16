@@ -789,9 +789,9 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
     Row::new([
         Cell::from(name),
         // An inbound machine has no ssh target: its kind instead; one seen
-        // through the hub, the hub.
+        // through the control plane, the control plane.
         match (&m.via, &m.target) {
-            (Some(hub), _) => Cell::from(Span::styled(format!("via {hub}"), Style::default().add_modifier(Modifier::DIM))),
+            (Some(control_plane), _) => Cell::from(Span::styled(format!("via {control_plane}"), Style::default().add_modifier(Modifier::DIM))),
             (None, Some(target)) => Cell::from(target.clone()),
             (None, None) => Cell::from(Span::styled("inbound", Style::default().add_modifier(Modifier::DIM))),
         },
@@ -3384,7 +3384,7 @@ mod tests {
         let mut up = sm("box", LinkState::Connected);
         up.agent = true;
         up.version = Some("0.9.1".into());
-        down.exposed_by = Some(vec!["hub".into(), "box".into(), "down".into()]);
+        down.exposed_by = Some(vec!["control_plane".into(), "box".into(), "down".into()]);
         let g = 1u64 << 30;
         up.capacity = Some(crate::serve::capacity::Capacity {
             runtime: true,

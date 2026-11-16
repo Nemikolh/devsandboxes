@@ -614,7 +614,7 @@ mod tests {
         let tampered: [(&str, Box<dyn Fn(&mut Statement)>); 6] = [
             ("signer", Box::new(|s| s.signer = "box".into())),
             ("key", Box::new(|s| s.key = key(6).public_key())),
-            ("kind", Box::new(|s| s.kind = "hub".into())),
+            ("kind", Box::new(|s| s.kind = "control_plane".into())),
             ("payload_sha256", Box::new(|s| s.payload_sha256[0] ^= 1)),
             ("version", Box::new(|s| s.version += 1)),
             ("sig", Box::new(|s| s.sig = key(5).sign(STATEMENT_DOMAIN, b"else"))),
@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(seen.accept(&s(&a, "membership", b"three", 5)), Ok(Accepted::Newer), "gaps are fine");
         assert_eq!(seen.latest(&a.public_key(), "membership"), Some(5));
         // Per kind and per key: the same name with another key is another signer.
-        assert_eq!(seen.accept(&s(&a, "hub", b"x", 1)), Ok(Accepted::Newer));
+        assert_eq!(seen.accept(&s(&a, "control_plane", b"x", 1)), Ok(Accepted::Newer));
         assert_eq!(seen.accept(&s(&b, "membership", b"x", 1)), Ok(Accepted::Newer));
         // A bad signature is refused before the versions.
         let mut bad = s(&a, "membership", b"four", 9);

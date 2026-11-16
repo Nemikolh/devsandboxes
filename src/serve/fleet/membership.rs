@@ -1,8 +1,8 @@
 //! The fleet's membership log (docs/architecture/daemon/fleet.md,
 //! *Membership log*; fleet plan step 10a, decisions 45, 46, 50, 51): a hash
 //! chain of entries the authority signs, each one [`Op`] (`genesis`, `add`,
-//! `revoke`, `rotate`, `hub`, `config`), that [`apply`] verifies into a
-//! [`Membership`]: the members and their keys, the hub, the revoked keys,
+//! `revoke`, `rotate`, `control_plane`, `config`), that [`apply`] verifies into a
+//! [`Membership`]: the members and their keys, the control plane, the revoked keys,
 //! each config root's signed version and the [`Head`]. [`compare`] says how a peer's head stands to ours.
 //!
 //! Introductions (decision 50) sit outside the chain: a member's signed word
@@ -63,18 +63,18 @@ fn short(hash: &[u8; 32]) -> String {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     /// The first entry, only there: the fleet's authority (a member with
-    /// `key`, which signs this and every later entry) and its hub, which
+    /// `key`, which signs this and every later entry) and its control plane, which
     /// may be a member the next entries add. `id` is random
     /// ([`Op::genesis`]; 32 hex digits on the wire): signing is
     /// deterministic, so without it two fleets one authority makes with
-    /// the same hub would have the same genesis, the same fleet to a
+    /// the same control plane would have the same genesis, the same fleet to a
     /// member that held the first one's log.
     Genesis {
         #[serde(with = "hex16")]
         id: [u8; 16],
         authority: String,
         key: PublicKey,
-        hub: String,
+        control_plane: String,
     },
     Add { name: String, key: PublicKey },
     /// `name`, whose key is `key`, leaves; `key` is revoked for good.
@@ -83,8 +83,8 @@ pub enum Op {
     /// signature over the change ([`countersign_rotate`]), so the
     /// authority's key alone can't swap a member's. `old` is revoked.
     Rotate { name: String, old: PublicKey, new: PublicKey, by_old: Signature },
-    /// The hub is now the member `name`.
-    Hub { name: String },
+    /// The control plane is now the member `name`.
+    ControlPlane { name: String },
     /// Config root `root` (its directory's name, [`check_root_name`]) is
     /// now version `version`, its bundle (`mesh::collect`: the config's
     /// structure and the files it references) hashing to `hash`. Versions
@@ -100,23 +100,23 @@ pub enum Op {
 
 impl Op {
     /// A new fleet's genesis, its `id` from the OS RNG.
-    pub fn genesis(authority: &str, key: PublicKey, hub: &str) -> Result<Op> {
+    pub fn genesis(authority: &str, key: PublicKey, control_plane: &str) -> Result<Op> {
         let mut id = [0u8; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("cannot read the OS random source: {e}"))?;
-        Ok(Op::genesis_with_id(id, authority, key, hub))
+        Ok(Op::genesis_with_id(id, authority, key, control_plane))
     }
 
     /// [`Op::genesis`] with a given `id` (tests: a deterministic fleet).
-    pub fn genesis_with_id(id: [u8; 16], authority: &str, key: PublicKey, hub: &str) -> Op {
-        Op::Genesis { id, authority: authority.to_string(), key, hub: hub.to_string() }
+    pub fn genesis_with_id(id: [u8; 16], authority: &str, key: PublicKey, control_plane: &str) -> Op {
+        Op::Genesis { id, authority: authority.to_string(), key, control_plane: control_plane.to_string() }
     }
 
     /// What the entry's payload encodes after `prev`: a tag, then each
     /// field, length-prefixed, keys and signatures raw.
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            Op::Genesis { id, authority, key, hub } => {
-                for f in [&b"genesis"[..], id, authority.as_bytes(), key.as_bytes(), hub.as_bytes()] {
+            Op::Genesis { id, authority, key, control_plane } => {
+                for f in [&b"genesis"[..], id, authority.as_bytes(), key.as_bytes(), control_plane.as_bytes()] {
                     put(out, f);
                 }
             }
@@ -136,8 +136,8 @@ impl Op {
                     put(out, f);
                 }
             }
-            Op::Hub { name } => {
-                for f in [&b"hub"[..], name.as_bytes()] {
+            Op::ControlPlane { name } => {
+                for f in [&b"control_plane"[..], name.as_bytes()] {
                     put(out, f);
                 }
             }
@@ -153,13 +153,13 @@ impl Op {
 impl fmt::Display for Op {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Op::Genesis { id, authority, hub, .. } => {
-                write!(f, "genesis of fleet {} (authority `{authority}`, hub `{hub}`)", hex::encode(&id[..4]))
+            Op::Genesis { id, authority, control_plane, .. } => {
+                write!(f, "genesis of fleet {} (authority `{authority}`, control plane `{control_plane}`)", hex::encode(&id[..4]))
             }
             Op::Add { name, .. } => write!(f, "add `{name}`"),
             Op::Revoke { name, .. } => write!(f, "revoke `{name}`"),
             Op::Rotate { name, .. } => write!(f, "rotate `{name}`'s key"),
-            Op::Hub { name } => write!(f, "hub `{name}`"),
+            Op::ControlPlane { name } => write!(f, "control plane `{name}`"),
             Op::Config { root, version, hash } => write!(f, "config `{root}` v{version} ({})", short(hash)),
         }
     }
@@ -275,8 +275,8 @@ pub struct Membership {
     /// The authority's name and current key (a `rotate` of it changes the
     /// key that signs later entries).
     pub authority: (String, PublicKey),
-    /// The hub's member name.
-    pub hub: String,
+    /// The control plane's member name.
+    pub control_plane: String,
     pub members: BTreeMap<String, PublicKey>,
     /// Keys revoked or rotated away: never a member's again.
     pub revoked: BTreeSet<PublicKey>,
@@ -301,9 +301,9 @@ impl Membership {
         self.name_of(key).is_some()
     }
 
-    /// The hub's key; `None` while genesis's hub isn't added yet.
-    pub fn hub_key(&self) -> Option<PublicKey> {
-        self.key_of(&self.hub)
+    /// The control plane's key; `None` while genesis's control plane isn't added yet.
+    pub fn control_plane_key(&self) -> Option<PublicKey> {
+        self.key_of(&self.control_plane)
     }
 
     pub fn is_authority(&self, key: &PublicKey) -> bool {
@@ -357,8 +357,8 @@ impl Membership {
                 if *name == self.authority.0 {
                     bail!("`{name}` is the authority: it can't be revoked (rotate its key instead)");
                 }
-                if *name == self.hub {
-                    bail!("`{name}` is the hub: name another hub first");
+                if *name == self.control_plane {
+                    bail!("`{name}` is the control plane: name another control plane first");
                 }
                 self.members.remove(name);
                 self.revoked.insert(*key);
@@ -382,11 +382,11 @@ impl Membership {
                     self.authority.1 = *new;
                 }
             }
-            Op::Hub { name } => {
+            Op::ControlPlane { name } => {
                 if !self.members.contains_key(name) {
-                    bail!("`{name}` is not a member: it can't be the hub");
+                    bail!("`{name}` is not a member: it can't be the control plane");
                 }
-                self.hub = name.clone();
+                self.control_plane = name.clone();
             }
             Op::Config { root, version, hash } => {
                 check_root_name(root).context("config root")?;
@@ -419,17 +419,17 @@ fn next(before: Option<&Membership>, entry: &Entry) -> Result<Membership> {
     s.verify_payload(&encode(&entry.prev, &entry.op)).with_context(at)?;
     let mut m = match before {
         None => {
-            let Op::Genesis { authority, key, hub, .. } = &entry.op else {
+            let Op::Genesis { authority, key, control_plane, .. } = &entry.op else {
                 bail!("{}: the first entry must be `genesis`", at());
             };
             check_member_name(authority).with_context(|| format!("{}: authority `{authority}`", at()))?;
-            check_member_name(hub).with_context(|| format!("{}: hub `{hub}`", at()))?;
+            check_member_name(control_plane).with_context(|| format!("{}: control plane `{control_plane}`", at()))?;
             if s.key != *key || s.signer != *authority {
                 bail!("{}: signed by `{}` ({}), not the authority it names", at(), s.signer, s.key);
             }
             Membership {
                 authority: (authority.clone(), *key),
-                hub: hub.clone(),
+                control_plane: control_plane.clone(),
                 members: BTreeMap::from([(authority.clone(), *key)]),
                 revoked: BTreeSet::new(),
                 head: Head::EMPTY,
@@ -670,10 +670,10 @@ pub fn check_introduction(m: &Membership, i: &Introduction) -> Result<()> {
         .context("not signed for this fleet (another fleet's introduction, or tampered)")
 }
 
-/// This host's `hub` in `member.toml`, from the log's (`own`: this host's
+/// This host's `control_plane` in `member.toml`, from the log's (`own`: this host's
 /// member name).
-pub fn hub_for(m: &Membership, own: &str) -> member::Hub {
-    if m.hub == own { member::Hub::This } else { member::Hub::Other(m.hub.clone()) }
+pub fn control_plane_for(m: &Membership, own: &str) -> member::ControlPlane {
+    if m.control_plane == own { member::ControlPlane::This } else { member::ControlPlane::Other(m.control_plane.clone()) }
 }
 
 /// `membership.json`'s contents, verified: the log and the introductions
@@ -810,12 +810,12 @@ mod tests {
         dir
     }
 
-    /// A genesis by `lap` (key 1) with hub `hub`, fleet id `[id; 16]`.
-    fn genesis(id: u8, hub: &str) -> Op {
-        Op::genesis_with_id([id; 16], "lap", pk(1), hub)
+    /// A genesis by `lap` (key 1) with control plane `control_plane`, fleet id `[id; 16]`.
+    fn genesis(id: u8, control_plane: &str) -> Op {
+        Op::genesis_with_id([id; 16], "lap", pk(1), control_plane)
     }
 
-    /// `lap` (key 1) the authority, `box` (key 2) the hub, `pi` (key 3);
+    /// `lap` (key 1) the authority, `box` (key 2) the control plane, `pi` (key 3);
     /// fleet id `[1; 16]`.
     fn fleet() -> Log {
         let mut log = Log::default();
@@ -837,33 +837,33 @@ mod tests {
         let mut log = fleet();
         let m = log.membership().unwrap().clone();
         assert_eq!(m.authority, ("lap".to_string(), pk(1)));
-        assert_eq!(m.hub, "box");
+        assert_eq!(m.control_plane, "box");
         assert_eq!(m.members, BTreeMap::from([("lap".into(), pk(1)), ("box".into(), pk(2)), ("pi".into(), pk(3))]));
         assert!(m.revoked.is_empty());
         assert_eq!(m.head, Head { len: 3, hash: log.entries()[2].hash(), genesis: log.entries()[0].hash() });
         assert_eq!(m.genesis, log.entries()[0].hash());
-        assert_eq!((m.key_of("pi"), m.name_of(&pk(2)), m.hub_key()), (Some(pk(3)), Some("box"), Some(pk(2))));
+        assert_eq!((m.key_of("pi"), m.name_of(&pk(2)), m.control_plane_key()), (Some(pk(3)), Some("box"), Some(pk(2))));
         assert!(m.is_member_key(&pk(3)) && !m.is_member_key(&pk(4)));
         assert!(m.is_authority(&pk(1)) && !m.is_authority(&pk(2)));
         assert_eq!(apply(log.entries()).unwrap(), m);
         assert_eq!(Log::new(log.entries().to_vec()).unwrap(), log);
-        assert_eq!((hub_for(&m, "box"), hub_for(&m, "lap")), (member::Hub::This, member::Hub::Other("box".into())));
+        assert_eq!((control_plane_for(&m, "box"), control_plane_for(&m, "lap")), (member::ControlPlane::This, member::ControlPlane::Other("box".into())));
 
-        log.append(Op::Hub { name: "pi".into() }, "lap", &key(1)).unwrap();
+        log.append(Op::ControlPlane { name: "pi".into() }, "lap", &key(1)).unwrap();
         assert!(!log.revoked_name("box"));
         log.append(Op::Revoke { name: "box".into(), key: pk(2) }, "lap", &key(1)).unwrap();
         let m = log.membership().unwrap();
-        assert_eq!((m.hub.as_str(), m.key_of("box"), m.head.len), ("pi", None, 5));
+        assert_eq!((m.control_plane.as_str(), m.key_of("box"), m.head.len), ("pi", None, 5));
         assert!(m.revoked.contains(&pk(2)));
         assert!(log.revoked_name("box") && !log.revoked_name("pi") && !log.revoked_name("nope"));
         // A revoked name may come back with a new key.
         log.append(Op::Add { name: "box".into(), key: pk(4) }, "lap", &key(1)).unwrap();
         assert_eq!(log.membership().unwrap().key_of("box"), Some(pk(4)));
         assert!(!log.revoked_name("box"), "a member again");
-        // Genesis's hub need not be added yet: no hub key until it is.
+        // Genesis's control plane need not be added yet: no control-plane key until it is.
         let mut early = Log::default();
         early.append(genesis(1, "box"), "lap", &key(1)).unwrap();
-        assert_eq!(early.membership().unwrap().hub_key(), None);
+        assert_eq!(early.membership().unwrap().control_plane_key(), None);
     }
 
     #[test]
@@ -883,14 +883,14 @@ mod tests {
             (&log, Op::Revoke { name: "nope".into(), key: pk(3) }, "not a member"),
             (&log, Op::Revoke { name: "pi".into(), key: pk(2) }, "not ed25519"),
             (&log, Op::Revoke { name: "lap".into(), key: pk(1) }, "is the authority"),
-            (&log, Op::Revoke { name: "box".into(), key: pk(2) }, "is the hub"),
+            (&log, Op::Revoke { name: "box".into(), key: pk(2) }, "is the control plane"),
             (&log, Op::Rotate { name: "nope".into(), old: pk(3), new: pk(9), by_old: countersign_rotate(&g, "nope", &pk(9), &key(3)) }, "not a member"),
             (&log, Op::Rotate { name: "pi".into(), old: pk(2), new: pk(9), by_old: countersign_rotate(&g, "pi", &pk(9), &key(2)) }, "`pi`'s key is"),
             (&log, Op::Rotate { name: "pi".into(), old: pk(3), new: pk(9), by_old: countersign_rotate(&g, "pi", &pk(8), &key(3)) }, "isn't countersigned"),
             (&log, Op::Rotate { name: "pi".into(), old: pk(3), new: pk(9), by_old: countersign_rotate(&g, "pi", &pk(9), &key(1)) }, "isn't countersigned"),
             (&log, Op::Rotate { name: "pi".into(), old: pk(3), new: pk(9), by_old: countersign_rotate(&[7; 32], "pi", &pk(9), &key(3)) }, "isn't countersigned"),
             (&log, Op::Rotate { name: "pi".into(), old: pk(3), new: pk(2), by_old: countersign_rotate(&g, "pi", &pk(2), &key(3)) }, "already `box`'s key"),
-            (&log, Op::Hub { name: "nope".into() }, "can't be the hub"),
+            (&log, Op::ControlPlane { name: "nope".into() }, "can't be the control plane"),
         ];
         for (l, op, want) in cases {
             let e = refused(l, op.clone());
@@ -913,7 +913,7 @@ mod tests {
         let e = l.append(genesis(1, "lap"), "box", &key(1)).unwrap_err();
         assert!(format!("{e:#}").contains("not the authority it names"), "{e:#}");
         let e = l.append(genesis(1, "self"), "lap", &key(1)).unwrap_err();
-        assert!(format!("{e:#}").contains("hub `self`"), "{e:#}");
+        assert!(format!("{e:#}").contains("control plane `self`"), "{e:#}");
         assert_eq!(l, Log::default());
         assert!(format!("{:#}", apply(&[]).unwrap_err()).contains("no genesis"));
     }
@@ -925,7 +925,7 @@ mod tests {
         let entries = log.entries().to_vec();
         let mutations: Vec<(&str, Box<dyn Fn(&mut Entry)>)> = vec![
             ("op name", Box::new(|e| match &mut e.op {
-                Op::Genesis { authority: n, .. } | Op::Add { name: n, .. } | Op::Revoke { name: n, .. } | Op::Rotate { name: n, .. } | Op::Hub { name: n } | Op::Config { root: n, .. } => n.push('x'),
+                Op::Genesis { authority: n, .. } | Op::Add { name: n, .. } | Op::Revoke { name: n, .. } | Op::Rotate { name: n, .. } | Op::ControlPlane { name: n } | Op::Config { root: n, .. } => n.push('x'),
             })),
             ("config version", Box::new(|e| match &mut e.op {
                 Op::Config { version, .. } => *version += 1,
@@ -944,7 +944,7 @@ mod tests {
                 Op::Genesis { id, .. } => id[15] ^= 1,
                 _ => e.prev[0] ^= 1,
             })),
-            ("op kind", Box::new(|e| if let Op::Add { name, key } = e.op.clone() { e.op = Op::Revoke { name, key } } else { e.op = Op::Hub { name: "lap".into() } })),
+            ("op kind", Box::new(|e| if let Op::Add { name, key } = e.op.clone() { e.op = Op::Revoke { name, key } } else { e.op = Op::ControlPlane { name: "lap".into() } })),
             ("prev", Box::new(|e| e.prev[31] ^= 1)),
             ("signer", Box::new(|e| e.statement.signer = "box".into())),
             ("key", Box::new(|e| e.statement.key = pk(2))),
@@ -1021,7 +1021,7 @@ mod tests {
     #[test]
     fn reordered_or_missing_entries_are_refused() {
         let mut log = fleet();
-        log.append(Op::Hub { name: "pi".into() }, "lap", &key(1)).unwrap();
+        log.append(Op::ControlPlane { name: "pi".into() }, "lap", &key(1)).unwrap();
         let e = log.entries().to_vec();
         let msg = |v: Vec<Entry>| format!("{:#}", apply(&v).unwrap_err());
         assert!(msg(vec![e[0].clone(), e[2].clone(), e[1].clone(), e[3].clone()]).contains("out of order"));
@@ -1066,7 +1066,7 @@ mod tests {
     fn compare_says_same_behind_ahead_or_fork() {
         let log = fleet();
         let mut longer = log.clone();
-        longer.append(Op::Hub { name: "pi".into() }, "lap", &key(1)).unwrap();
+        longer.append(Op::ControlPlane { name: "pi".into() }, "lap", &key(1)).unwrap();
         let mut other = log.clone();
         other.append(Op::Add { name: "x".into(), key: pk(9) }, "lap", &key(1)).unwrap();
         assert_eq!(compare(&log, log.head()), Compare::Same);
@@ -1074,7 +1074,7 @@ mod tests {
         assert_eq!(compare(&longer, log.head()), Compare::Ahead);
         let fork = Compare::Fork { another_fleet: false };
         assert_eq!(compare(&longer, other.head()), fork, "same length, another entry");
-        other.append(Op::Hub { name: "x".into() }, "lap", &key(1)).unwrap();
+        other.append(Op::ControlPlane { name: "x".into() }, "lap", &key(1)).unwrap();
         assert_eq!(compare(&other, longer.head()), fork, "shorter, not a prefix");
         assert_eq!(compare(&Log::default(), log.head()), Compare::Behind);
         assert_eq!(compare(&log, Head::EMPTY), Compare::Ahead);
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!(compare(&log, Head { hash: [1; 32], ..Head::EMPTY }), fork);
         assert!(fork.to_string().contains("two histories"));
 
-        // The same authority, key and hub, made again: another fleet id,
+        // The same authority, key and control plane, made again: another fleet id,
         // another genesis, another fleet, whatever the lengths.
         let mut again = Log::default();
         again.append(genesis(2, "box"), "lap", &key(1)).unwrap();
@@ -1114,7 +1114,7 @@ mod tests {
     #[test]
     fn extend_takes_what_continues_ours_and_refuses_forks() {
         let mut ahead = fleet();
-        ahead.append(Op::Hub { name: "pi".into() }, "lap", &key(1)).unwrap();
+        ahead.append(Op::ControlPlane { name: "pi".into() }, "lap", &key(1)).unwrap();
         ahead.append(Op::Add { name: "x".into(), key: pk(9) }, "lap", &key(1)).unwrap();
         let mut behind = fleet();
         behind.extend(ahead.entries_after(behind.head().len).to_vec()).unwrap();
@@ -1137,16 +1137,16 @@ mod tests {
         assert!(e.contains("missing"), "{e}");
         assert_eq!(l, fleet());
         let mut l = fleet();
-        l.append(Op::Hub { name: "pi".into() }, "lap", &key(1)).unwrap();
+        l.append(Op::ControlPlane { name: "pi".into() }, "lap", &key(1)).unwrap();
         let before = l.clone();
         let mut fork = fleet();
         fork.append(Op::Add { name: "y".into(), key: pk(8) }, "lap", &key(1)).unwrap();
-        fork.append(Op::Hub { name: "y".into() }, "lap", &key(1)).unwrap();
+        fork.append(Op::ControlPlane { name: "y".into() }, "lap", &key(1)).unwrap();
         let e = format!("{:#}", l.extend(fork.entries_after(3).to_vec()).unwrap_err());
         assert!(e.contains("fork at entry 3"), "an entry we have differs: {e}");
         let e = format!("{:#}", l.extend(fork.entries_after(4).to_vec()).unwrap_err());
         assert!(e.contains("fork at entry 4"), "doesn't follow our head: {e}");
-        // The same authority and hub made again: another fleet's entries.
+        // The same authority and control plane made again: another fleet's entries.
         let mut two = Log::default();
         two.append(genesis(2, "box"), "lap", &key(1)).unwrap();
         two.append(Op::Add { name: "box".into(), key: pk(2) }, "lap", &key(1)).unwrap();
@@ -1154,7 +1154,7 @@ mod tests {
         assert!(e.contains("another fleet's") && e.contains("another genesis"), "{e}");
         // An entry that continues ours but doesn't verify.
         let h = l.head();
-        let bad = Entry::sign(h.len, h.hash, Op::Hub { name: "nope".into() }, "lap", &key(1));
+        let bad = Entry::sign(h.len, h.hash, Op::ControlPlane { name: "nope".into() }, "lap", &key(1));
         assert!(l.extend(vec![bad]).is_err());
         assert_eq!(l, before);
     }
@@ -1179,7 +1179,7 @@ mod tests {
         assert!(err(&Introduction::sign(&g, "new", pk(5), "box", &key(3))).contains("not `box`'s key"));
         assert!(err(&Introduction::sign(&g, "pi", pk(5), "box", &key(2))).contains("already a member"));
         assert!(err(&Introduction::sign(&g, "new", pk(3), "box", &key(2))).contains("already `pi`'s key"));
-        // Replayed into another fleet: the same authority, key and hub made
+        // Replayed into another fleet: the same authority, key and control plane made
         // again, only the fleet id differs.
         let mut two = Log::default();
         two.append(genesis(2, "box"), "lap", &key(1)).unwrap();
@@ -1243,7 +1243,7 @@ mod tests {
         assert_eq!(wire["statement"]["version"], 1);
         assert_eq!(serde_json::from_value::<Entry>(wire).unwrap(), *e);
         let g = serde_json::to_value(&log.entries()[0]).unwrap();
-        assert_eq!((&g["op"], &g["authority"], &g["hub"], &g["prev"]), (&json!("genesis"), &json!("lap"), &json!("box"), &json!("0".repeat(64))));
+        assert_eq!((&g["op"], &g["authority"], &g["control_plane"], &g["prev"]), (&json!("genesis"), &json!("lap"), &json!("box"), &json!("0".repeat(64))));
         assert_eq!(g["id"], "01".repeat(16));
         assert_eq!(serde_json::from_value::<Entry>(g.clone()).unwrap(), log.entries()[0]);
         let mut bad = g.clone();
@@ -1255,7 +1255,7 @@ mod tests {
         let w = serde_json::to_value(&rot).unwrap();
         assert_eq!(w.as_object().unwrap().keys().collect::<Vec<_>>(), ["by_old", "name", "new", "old", "op"]);
         assert_eq!(serde_json::from_value::<Op>(w).unwrap(), rot);
-        assert_eq!(serde_json::to_value(Op::Hub { name: "pi".into() }).unwrap(), json!({"op": "hub", "name": "pi"}));
+        assert_eq!(serde_json::to_value(Op::ControlPlane { name: "pi".into() }).unwrap(), json!({"op": "control_plane", "name": "pi"}));
         assert!(serde_json::from_value::<Op>(json!({"op": "promote", "name": "pi"})).is_err());
         let config = json!({"op": "config", "root": "cfg", "version": 2, "hash": "ab".repeat(32)});
         let op = Op::Config { root: "cfg".into(), version: 2, hash: [0xab; 32] };

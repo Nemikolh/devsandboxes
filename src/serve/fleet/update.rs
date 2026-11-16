@@ -1,13 +1,13 @@
-//! A fleet worker follows its hub's version (docs/architecture/daemon/fleet.md,
+//! A fleet worker follows its control plane's version (docs/architecture/daemon/fleet.md,
 //! *Versions*; ADR 0042). Each end of the fleet link says its build in its
 //! `Hello` ([`HELLO`]: semver, git hash, `published` or `dev`, platform);
-//! the worker compares the hub's with its own ([`decide`], pure) before it
-//! serves anything. A published hub build that differs (a downgrade
+//! the worker compares the control plane's with its own ([`decide`], pure) before it
+//! serves anything. A published control-plane build that differs (a downgrade
 //! included) is downloaded from the GitHub release and installed over this
 //! daemon's binary, which then takes over by a forced handoff ([`update`]
 //! over [`Steps`]); the release's `SHA256SUMS` must carry a signature by
 //! [`RELEASE_KEY`] and the archive's sha256 first (ADR 0047). A dev build that differs comes over the link instead:
-//! the hub pushes its own binary ([`hub_pushes`], [`push`]) and a worker
+//! the control plane pushes its own binary ([`control_plane_pushes`], [`push`]) and a worker
 //! that takes dev builds for its platform installs it the same way
 //! ([`install_received`]); else it stops offering, saying why.
 //!
@@ -44,18 +44,18 @@ pub const HELLO: &str = concat!(
 );
 
 /// What this build says on a peer link (`fleet-link --peer`,
-/// docs/architecture/daemon/fleet.md, *Peer links*): [`HELLO`], then `hub`
-/// when this host is the fleet's hub, else `member`, then the fleet's hub
-/// by member name (on the hub, its own), `-` in no fleet (fleet plan
-/// decision 34). Read back by [`is_hub`] and [`hub_of`]. A name that would
+/// docs/architecture/daemon/fleet.md, *Peer links*): [`HELLO`], then `control_plane`
+/// when this host is the fleet's control plane, else `member`, then the fleet's control plane
+/// by member name (on the control plane, its own), `-` in no fleet (fleet plan
+/// decision 34). Read back by [`is_control_plane`] and [`control_plane_of`]. A name that would
 /// overflow a `Hello` hash (255 bytes) is said as `-`.
 ///
 /// Interned: `link::Spec::hello` is `&'static`, and a process only ever
-/// says a handful of these (one per hub it's had), so each distinct one is
+/// says a handful of these (one per control plane it's had), so each distinct one is
 /// leaked once.
-pub fn hello_of(hub: bool, fleet: Option<&str>) -> &'static str {
+pub fn hello_of(control_plane: bool, fleet: Option<&str>) -> &'static str {
     static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-    let role = if hub { "hub" } else { "member" };
+    let role = if control_plane { "control_plane" } else { "member" };
     let mut hello = format!("{HELLO} {role} {}", fleet.unwrap_or("-"));
     if hello.len() > u8::MAX as usize {
         hello = format!("{HELLO} {role} -");
@@ -69,36 +69,36 @@ pub fn hello_of(hub: bool, fleet: Option<&str>) -> &'static str {
     s
 }
 
-/// [`hello_of`] for this host as `member.toml` says: its `hub`
-/// ([`super::member::Hub`]) and its own member name `own` (what the hub
+/// [`hello_of`] for this host as `member.toml` says: its `control_plane`
+/// ([`super::member::ControlPlane`]) and its own member name `own` (what the control plane
 /// says as its fleet's).
-pub fn hello_for(hub: &super::member::Hub, own: Option<&str>) -> &'static str {
-    use super::member::Hub;
-    match hub {
-        Hub::None => hello_of(false, None),
-        Hub::This => hello_of(true, own),
-        Hub::Other(name) => hello_of(false, Some(name)),
+pub fn hello_for(control_plane: &super::member::ControlPlane, own: Option<&str>) -> &'static str {
+    use super::member::ControlPlane;
+    match control_plane {
+        ControlPlane::None => hello_of(false, None),
+        ControlPlane::This => hello_of(true, own),
+        ControlPlane::Other(name) => hello_of(false, Some(name)),
     }
 }
 
 /// Whether a peer link's `Hello` hash ([`hello_of`]) says its end is the
-/// hub: its fifth word is `hub`. [`HELLO`] alone (four words) never is.
-pub fn is_hub(hello: &str) -> bool {
-    hello.split_whitespace().nth(4) == Some("hub")
+/// control plane: its fifth word is `control_plane`. [`HELLO`] alone (four words) never is.
+pub fn is_control_plane(hello: &str) -> bool {
+    hello.split_whitespace().nth(4) == Some("control_plane")
 }
 
 /// The fleet a peer link's `Hello` hash ([`hello_of`]) says its end is in,
-/// by its hub's member name: its sixth word; `None` for `-` or none.
-pub fn hub_of(hello: &str) -> Option<&str> {
+/// by its control plane's member name: its sixth word; `None` for `-` or none.
+pub fn control_plane_of(hello: &str) -> Option<&str> {
     hello.split_whitespace().nth(5).filter(|w| *w != "-")
 }
 
-/// A link whose two ends name different hubs is refused (fleet plan
+/// A link whose two ends name different control planes is refused (fleet plan
 /// decision 34; pure): `Err` with why, `peer` the far end's name. One end
 /// in no fleet, or both, is fine (`machine add`'s join rule puts them in
 /// one).
 pub fn same_fleet(peer: &str, ours: &str, theirs: &str) -> Result<(), String> {
-    match (hub_of(ours), hub_of(theirs)) {
+    match (control_plane_of(ours), control_plane_of(theirs)) {
         (Some(ours), Some(theirs)) if ours != theirs => {
             Err(format!("`{peer}` is in `{theirs}`'s fleet, this host in `{ours}`'s: a link between two fleets is refused"))
         }
@@ -107,7 +107,7 @@ pub fn same_fleet(peer: &str, ours: &str, theirs: &str) -> Result<(), String> {
 }
 
 /// The words of a `Hello` hash that are the build (and platform): the first
-/// four, without a peer link's hub words.
+/// four, without a peer link's control plane words.
 fn build_words(hello: &str) -> impl Iterator<Item = &str> {
     hello.split_whitespace().take(4)
 }
@@ -117,7 +117,7 @@ fn build_words(hello: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 pub const PLATFORM: &str = env!("DEVSANDBOX_BUILD_PLATFORM");
 
-/// The transfer kind of a hub's binary, and the most a member takes of it.
+/// The transfer kind of a control plane's binary, and the most a member takes of it.
 pub const BINARY_KIND: &str = "binary";
 pub const BINARY_LIMIT: u64 = 256 << 20;
 
@@ -158,25 +158,25 @@ impl Build {
     }
 }
 
-/// What a member does about its hub's build.
+/// What a member does about its control plane's build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// The same build: serve the link.
     Same,
-    /// The hub runs published `build`, this worker another build: fetch
+    /// The control plane runs published `build`, this worker another build: fetch
     /// and install its release asset, then hand off (an older version too).
     Download { build: Build },
-    /// The hub runs a dev build this worker isn't, for this platform, and
-    /// this worker takes dev builds: take the binary the hub pushes, install
+    /// The control plane runs a dev build this worker isn't, for this platform, and
+    /// this worker takes dev builds: take the binary the control plane pushes, install
     /// it, then hand off.
     Receive,
-    /// The hub runs a build this worker can't or won't take (a dev build,
+    /// The control plane runs a build this worker can't or won't take (a dev build,
     /// or a published one with no release asset for this platform): stop
     /// offering, with why.
     Stop(String),
 }
 
-/// The worker follows the hub's exact build (pure): semver, git hash and
+/// The worker follows the control plane's exact build (pure): semver, git hash and
 /// `published` all equal is the same build. Another dev build is taken
 /// only for this worker's platform and with `dev_builds` (`member.toml`'s
 /// `dev-builds`, or trust `full`: `fleet::member::Member::takes_dev_builds`);
@@ -184,35 +184,35 @@ pub enum Decision {
 /// Another published build is downloaded only where a release asset exists
 /// for `our_platform` ([`platform_target`]): else [`update`] would fail
 /// the same way at every link, so this stops offering instead.
-pub fn decide(ours: &Build, hub: &Build, our_platform: &str, hub_platform: &str, dev_builds: bool) -> Decision {
-    if ours == hub {
+pub fn decide(ours: &Build, control_plane: &Build, our_platform: &str, control_plane_platform: &str, dev_builds: bool) -> Decision {
+    if ours == control_plane {
         Decision::Same
-    } else if hub.published {
+    } else if control_plane.published {
         match platform_target(our_platform) {
-            Some(_) => Decision::Download { build: hub.clone() },
-            None => Decision::Stop(format!("published build: no devsandbox release is built for {our_platform} (the hub runs {})", hub.label())),
+            Some(_) => Decision::Download { build: control_plane.clone() },
+            None => Decision::Stop(format!("published build: no devsandbox release is built for {our_platform} (the control plane runs {})", control_plane.label())),
         }
-    } else if hub_platform != our_platform {
-        Decision::Stop(format!("dev build: can't run on {our_platform} (the hub runs {} for {hub_platform})", hub.label()))
+    } else if control_plane_platform != our_platform {
+        Decision::Stop(format!("dev build: can't run on {our_platform} (the control plane runs {} for {control_plane_platform})", control_plane.label()))
     } else if !dev_builds {
         Decision::Stop(format!(
-            "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the hub runs {})",
-            hub.label()
+            "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the control plane runs {})",
+            control_plane.label()
         ))
     } else {
         Decision::Receive
     }
 }
 
-/// Whether a hub saying `hub` pushes its binary to a worker saying `worker`
+/// Whether a control plane saying `control_plane` pushes its binary to a worker saying `worker`
 /// (both `Hello` hashes): when that worker, taking dev builds, would
 /// [`Decision::Receive`] it. A worker with `dev-builds` off refuses the link
-/// before the push opens, so the hub needn't know.
-pub fn hub_pushes(hub: &str, worker: &str) -> bool {
-    decide(&Build::parse(worker), &Build::parse(hub), platform_of(worker), platform_of(hub), true) == Decision::Receive
+/// before the push opens, so the control plane needn't know.
+pub fn control_plane_pushes(control_plane: &str, worker: &str) -> bool {
+    decide(&Build::parse(worker), &Build::parse(control_plane), platform_of(worker), platform_of(control_plane), true) == Decision::Receive
 }
 
-/// The hub's end of a dev build's update: `binary` (this process's own) as
+/// The control plane's end of a dev build's update: `binary` (this process's own) as
 /// one [`BINARY_KIND`] transfer, a `TRANSFER` stream through the link's
 /// socket at `socket` (`endpoint::fleet_socket`), named `devsandbox`.
 pub fn push(socket: &Path, binary: &Path) -> Result<()> {
@@ -248,7 +248,7 @@ pub fn asset_name(version: &str, target: &str) -> String {
 }
 
 /// `https://github.com/<REPO>/releases/download/v<v>/<file>`. `version`
-/// comes from the hub: only a semver's characters go in the URL.
+/// comes from the control plane: only a semver's characters go in the URL.
 pub fn release_url(version: &str, file: &str) -> Result<String> {
     let ok = !version.is_empty() && version.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b));
     if !ok {
@@ -354,46 +354,46 @@ pub trait Steps: Send + Sync {
     fn handoff(&self) -> Result<()>;
 }
 
-/// Install the hub's published `hub` build over this daemon's binary and
+/// Install the control plane's published `control_plane` build over this daemon's binary and
 /// hand off to it: fetch its release asset for `os`/`arch` into a scratch
 /// dir under `scratch` ([`fetch_verified`]: signed checksums first), check
-/// that its `fleet-hello` is `hub` (semver, git
-/// and kind: a release asset that isn't the hub's exact build would be
+/// that its `fleet-hello` is `control_plane` (semver, git
+/// and kind: a release asset that isn't the control plane's exact build would be
 /// downloaded again at every link), install it at [`Steps::dest`], check
-/// the installed binary is `hub` too, then [`Steps::handoff`]. The scratch
+/// the installed binary is `control_plane` too, then [`Steps::handoff`]. The scratch
 /// dir is removed whatever happens. [`decide`] never says `Download` where
 /// `os`/`arch` has no release; the check here stands in case it does.
-pub fn update(steps: &dyn Steps, hub: &Build, os: &str, arch: &str, scratch: &Path) -> Result<()> {
+pub fn update(steps: &dyn Steps, control_plane: &Build, os: &str, arch: &str, scratch: &Path) -> Result<()> {
     let target = release_target(os, arch).with_context(|| format!("no devsandbox release is built for {os}/{arch}"))?;
-    let name = asset_name(&hub.semver, target);
+    let name = asset_name(&control_plane.semver, target);
     let dir = scratch_dir(scratch)?;
     let installed = (|| {
-        let binary = fetch_verified(steps, &hub.semver, &name, &dir)?;
-        check_release(steps, &binary, hub, "the downloaded binary")?;
+        let binary = fetch_verified(steps, &control_plane.semver, &name, &dir)?;
+        check_release(steps, &binary, control_plane, "the downloaded binary")?;
         let dest = steps.dest()?;
         steps.install(&binary, &dest)?;
-        check_release(steps, &dest, hub, "the installed binary")
+        check_release(steps, &dest, control_plane, "the installed binary")
     })();
     let _ = std::fs::remove_dir_all(&dir);
     installed?;
     steps.handoff().context("cannot hand this daemon off to it")
 }
 
-/// Install the hub's dev build, received at `binary`, over this daemon's
+/// Install the control plane's dev build, received at `binary`, over this daemon's
 /// binary and hand off to it: make it executable, check that it reports
-/// `hub` (the hub's `Hello` hash, every word), install it at
-/// [`Steps::dest`], check the installed binary reports `hub` too, then
-/// [`Steps::handoff`]. A peer link's hub words in `hub` aren't part of the
+/// `control_plane` (the control plane's `Hello` hash, every word), install it at
+/// [`Steps::dest`], check the installed binary reports `control_plane` too, then
+/// [`Steps::handoff`]. A peer link's control plane words in `control_plane` aren't part of the
 /// build (`fleet-hello` prints [`HELLO`]). Removing `binary`'s scratch dir
 /// is the caller's.
-pub fn install_received(steps: &dyn Steps, binary: &Path, hub: &str) -> Result<()> {
+pub fn install_received(steps: &dyn Steps, binary: &Path, control_plane: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("cannot make {} executable", binary.display()))?;
-    check_build(steps, binary, hub, "the hub's binary")?;
+    check_build(steps, binary, control_plane, "the control plane's binary")?;
     let dest = steps.dest()?;
     steps.install(binary, &dest)?;
-    check_build(steps, &dest, hub, "the installed binary")?;
+    check_build(steps, &dest, control_plane, "the installed binary")?;
     steps.handoff().context("cannot hand this daemon off to it")
 }
 
@@ -428,12 +428,12 @@ fn check_build(steps: &dyn Steps, binary: &Path, want: &str, what: &str) -> Resu
 }
 
 /// `binary`'s `fleet-hello` is the build `want` (its platform aside: the
-/// asset is this host's, the hub's may be another).
+/// asset is this host's, the control plane's may be another).
 fn check_release(steps: &dyn Steps, binary: &Path, want: &Build, what: &str) -> Result<()> {
     let got = steps.build(binary).with_context(|| format!("{what} ({}) doesn't run", binary.display()))?;
     let got = Build::parse(&got);
     if got != *want {
-        bail!("{what} ({}) is devsandbox {}, not the hub's {}", binary.display(), got.label(), want.label());
+        bail!("{what} ({}) is devsandbox {}, not the control plane's {}", binary.display(), got.label(), want.label());
     }
     Ok(())
 }
@@ -587,23 +587,23 @@ pub(crate) mod tests {
         assert_eq!(platform_of("0.7.0 1a2b dev"), "unknown");
         assert_eq!(Build::parse("0.7.0 1a2b dev linux/x86_64"), build("0.7.0", "1a2b", false), "the platform isn't the build");
         assert_eq!(build("0.7.0", "1a2b", true).label(), "0.7.0 (published, 1a2b)");
-        // A peer link's hub words: the role, then the hub, not part of the build.
-        assert_eq!(hello_of(true, Some("box")), format!("{HELLO} hub box"));
+        // A peer link's control plane words: the role, then the control plane, not part of the build.
+        assert_eq!(hello_of(true, Some("box")), format!("{HELLO} control_plane box"));
         assert_eq!(hello_of(false, Some("box")), format!("{HELLO} member box"));
         assert_eq!(hello_of(false, None), format!("{HELLO} member -"));
         assert!(std::ptr::eq(hello_of(false, Some("box")), hello_of(false, Some("box"))), "leaked once");
         assert!(hello_of(true, Some("box")).len() <= u8::MAX as usize, "fits a `Hello` hash");
-        assert_eq!(hello_of(true, Some(&"x".repeat(250))), format!("{HELLO} hub -"), "too long a name isn't said");
-        assert!(is_hub(hello_of(true, None)) && !is_hub(hello_of(false, Some("hub"))));
-        assert!(!is_hub(HELLO), "a hello without the flag never says hub");
-        assert!(!is_hub("0.7.0 1a2b dev hub"), "the fifth word, not any");
+        assert_eq!(hello_of(true, Some(&"x".repeat(250))), format!("{HELLO} control_plane -"), "too long a name isn't said");
+        assert!(is_control_plane(hello_of(true, None)) && !is_control_plane(hello_of(false, Some("control_plane"))));
+        assert!(!is_control_plane(HELLO), "a hello without the flag never says control plane");
+        assert!(!is_control_plane("0.7.0 1a2b dev control_plane"), "the fifth word, not any");
         assert_eq!((Build::parse(hello_of(true, None)), platform_of(hello_of(false, None))), (ours, PLATFORM));
-        assert_eq!((hub_of(hello_of(true, Some("k"))), hub_of(hello_of(false, Some("k")))), (Some("k"), Some("k")));
-        assert_eq!((hub_of(hello_of(false, None)), hub_of(HELLO), hub_of("0.7.0 a dev x/y hub")), (None, None, None));
-        use crate::serve::fleet::member::Hub;
-        assert_eq!(hello_for(&Hub::This, Some("k")), hello_of(true, Some("k")));
-        assert_eq!(hello_for(&Hub::Other("k".into()), Some("lap")), hello_of(false, Some("k")));
-        assert_eq!(hello_for(&Hub::None, Some("lap")), hello_of(false, None));
+        assert_eq!((control_plane_of(hello_of(true, Some("k"))), control_plane_of(hello_of(false, Some("k")))), (Some("k"), Some("k")));
+        assert_eq!((control_plane_of(hello_of(false, None)), control_plane_of(HELLO), control_plane_of("0.7.0 a dev x/y control_plane")), (None, None, None));
+        use crate::serve::fleet::member::ControlPlane;
+        assert_eq!(hello_for(&ControlPlane::This, Some("k")), hello_of(true, Some("k")));
+        assert_eq!(hello_for(&ControlPlane::Other("k".into()), Some("lap")), hello_of(false, Some("k")));
+        assert_eq!(hello_for(&ControlPlane::None, Some("lap")), hello_of(false, None));
     }
 
     #[test]
@@ -611,7 +611,7 @@ pub(crate) mod tests {
         let (k, l, none) = (hello_of(true, Some("k")), hello_of(false, Some("l")), hello_of(false, None));
         assert_eq!(same_fleet("box", k, l), Err("`box` is in `l`'s fleet, this host in `k`'s: a link between two fleets is refused".into()));
         assert!(same_fleet("box", l, k).unwrap_err().starts_with("`box` is in `k`'s fleet, this host in `l`'s"));
-        assert_eq!(same_fleet("box", k, hello_of(false, Some("k"))), Ok(()), "the same hub");
+        assert_eq!(same_fleet("box", k, hello_of(false, Some("k"))), Ok(()), "the same control plane");
         assert_eq!(same_fleet("box", k, none), Ok(()), "one end in no fleet");
         assert_eq!(same_fleet("box", none, l), Ok(()));
         assert_eq!(same_fleet("box", none, none), Ok(()));
@@ -619,9 +619,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_worker_follows_its_hub_exactly() {
+    fn the_worker_follows_its_control_plane_exactly() {
         let (lx, mac) = ("linux/x86_64", "macos/aarch64");
-        let d = |ours: &Build, hub: &Build| decide(ours, hub, lx, lx, false);
+        let d = |ours: &Build, control_plane: &Build| decide(ours, control_plane, lx, lx, false);
         let ours = build("0.8.0", "aaaa", true);
         assert_eq!(d(&ours, &ours.clone()), Decision::Same);
         assert_eq!(decide(&ours, &ours.clone(), lx, mac, false), Decision::Same, "one release, many platforms");
@@ -630,10 +630,10 @@ pub(crate) mod tests {
         assert_eq!(decide(&ours, &newer, lx, mac, false), Decision::Download { build: newer.clone() }, "each its asset");
         let older = build("0.7.0", "cccc", true);
         assert_eq!(d(&ours, &older), Decision::Download { build: older.clone() }, "a downgrade too");
-        // A dev worker of a published hub takes the release, same semver or not.
+        // A dev worker of a published control plane takes the release, same semver or not.
         let dev = build("0.8.0", "dddd", false);
         assert_eq!(d(&dev, &ours), Decision::Download { build: ours.clone() });
-        // A published worker of a published hub of the same semver but another
+        // A published worker of a published control plane of the same semver but another
         // commit (a moved tag): that release, not a `Same`.
         assert_eq!(d(&ours, &build("0.8.0", "ffff", true)), Decision::Download { build: build("0.8.0", "ffff", true) });
         assert_eq!(d(&dev, &dev.clone()), Decision::Same);
@@ -641,7 +641,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_published_hub_build_needs_a_release_for_our_platform() {
+    fn a_published_control_plane_build_needs_a_release_for_our_platform() {
         let ours = build("0.8.0", "aaaa", true);
         let newer = build("0.9.0", "bbbb", true);
         for platform in ["linux/x86_64", "linux/aarch64", "macos/aarch64"] {
@@ -649,17 +649,17 @@ pub(crate) mod tests {
         }
         assert_eq!(
             decide(&ours, &newer, "macos/x86_64", "macos/aarch64", true),
-            Decision::Stop("published build: no devsandbox release is built for macos/x86_64 (the hub runs 0.9.0 (published, bbbb))".into())
+            Decision::Stop("published build: no devsandbox release is built for macos/x86_64 (the control plane runs 0.9.0 (published, bbbb))".into())
         );
         assert!(matches!(decide(&ours, &newer, "unknown", "linux/x86_64", true), Decision::Stop(_)), "no platform word");
         assert_eq!(decide(&ours, &ours.clone(), "macos/x86_64", "linux/x86_64", false), Decision::Same, "the same build needs none");
-        assert!(!hub_pushes("0.9.0 bbbb published linux/x86_64", "0.8.0 aaaa published macos/x86_64"), "nothing to push");
+        assert!(!control_plane_pushes("0.9.0 bbbb published linux/x86_64", "0.8.0 aaaa published macos/x86_64"), "nothing to push");
         assert_eq!(platform_target("linux/aarch64"), Some("aarch64-unknown-linux-musl"));
         assert_eq!((platform_target("macos/x86_64"), platform_target("unknown"), platform_target("")), (None, None, None));
     }
 
     #[test]
-    fn a_dev_hub_build_needs_the_platform_then_dev_builds() {
+    fn a_dev_control_plane_build_needs_the_platform_then_dev_builds() {
         let (lx, mac) = ("linux/x86_64", "macos/aarch64");
         let ours = build("0.8.0", "aaaa", true);
         let dev = build("0.8.0", "dddd", false);
@@ -668,24 +668,24 @@ pub(crate) mod tests {
         assert_eq!(
             decide(&ours, &dev, lx, lx, false),
             Decision::Stop(
-                "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the hub runs 0.8.0 (dev, dddd))"
+                "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the control plane runs 0.8.0 (dev, dddd))"
                     .into()
             )
         );
-        let mismatch = Decision::Stop("dev build: can't run on linux/x86_64 (the hub runs 0.8.0 (dev, dddd) for macos/aarch64)".into());
+        let mismatch = Decision::Stop("dev build: can't run on linux/x86_64 (the control plane runs 0.8.0 (dev, dddd) for macos/aarch64)".into());
         assert_eq!(decide(&ours, &dev, lx, mac, true), mismatch);
         assert_eq!(decide(&ours, &dev, lx, mac, false), mismatch, "the platform first: dev-builds can't help");
         assert!(matches!(decide(&ours, &dev, lx, "unknown", true), Decision::Stop(_)), "no platform word");
     }
 
     #[test]
-    fn the_hub_pushes_to_a_worker_that_would_receive() {
-        let hub = "0.8.0 dddd dev linux/x86_64";
-        assert!(hub_pushes(hub, "0.8.0 aaaa published linux/x86_64"));
-        assert!(hub_pushes(hub, "0.7.0 eeee dev linux/x86_64"));
-        assert!(!hub_pushes(hub, hub), "the same build");
-        assert!(!hub_pushes(hub, "0.8.0 aaaa published macos/aarch64"), "another platform");
-        assert!(!hub_pushes("0.8.0 dddd published linux/x86_64", "0.7.0 eeee dev linux/x86_64"), "a release is downloaded");
+    fn the_control_plane_pushes_to_a_worker_that_would_receive() {
+        let control_plane = "0.8.0 dddd dev linux/x86_64";
+        assert!(control_plane_pushes(control_plane, "0.8.0 aaaa published linux/x86_64"));
+        assert!(control_plane_pushes(control_plane, "0.7.0 eeee dev linux/x86_64"));
+        assert!(!control_plane_pushes(control_plane, control_plane), "the same build");
+        assert!(!control_plane_pushes(control_plane, "0.8.0 aaaa published macos/aarch64"), "another platform");
+        assert!(!control_plane_pushes("0.8.0 dddd published linux/x86_64", "0.7.0 eeee dev linux/x86_64"), "a release is downloaded");
     }
 
     #[test]
@@ -694,7 +694,7 @@ pub(crate) mod tests {
         let socket = dir.join("t.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let binary = dir.join("exe");
-        std::fs::write(&binary, b"the hub's build").unwrap();
+        std::fs::write(&binary, b"the control plane's build").unwrap();
         let into = dir.join("in");
         let receiver = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -705,8 +705,8 @@ pub(crate) mod tests {
         });
         push(&socket, &binary).unwrap();
         let got = receiver.join().unwrap().unwrap();
-        assert_eq!((got.header.kind.as_str(), got.header.name.as_str(), got.header.size), (BINARY_KIND, "devsandbox", 15));
-        assert_eq!(std::fs::read(&got.path).unwrap(), b"the hub's build");
+        assert_eq!((got.header.kind.as_str(), got.header.name.as_str(), got.header.size), (BINARY_KIND, "devsandbox", 25));
+        assert_eq!(std::fs::read(&got.path).unwrap(), b"the control plane's build");
         assert!(format!("{:#}", push(&socket, &dir.join("nope")).unwrap_err()).starts_with("cannot read"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -860,9 +860,9 @@ pub(crate) mod tests {
         std::fs::read_dir(dir).unwrap().next().is_none()
     }
 
-    /// The hub's published 0.7.0, and what its release asset for this
+    /// The control plane's published 0.7.0, and what its release asset for this
     /// host's platform says.
-    fn hub() -> Build {
+    fn control_plane() -> Build {
         build("0.7.0", "aaaa", true)
     }
     const ASSET: &str = "0.7.0 aaaa published linux/x86_64";
@@ -870,9 +870,9 @@ pub(crate) mod tests {
     #[test]
     fn an_update_installs_checks_and_hands_off() {
         let dir = scratch("ok");
-        // The hub on another platform: the asset says this one.
+        // The control plane on another platform: the asset says this one.
         let fake = Fake::building(ASSET);
-        update(&fake, &Build::parse("0.7.0 aaaa published macos/aarch64 hub k"), "linux", "x86_64", &dir).unwrap();
+        update(&fake, &Build::parse("0.7.0 aaaa published macos/aarch64 control_plane k"), "linux", "x86_64", &dir).unwrap();
         let base = "https://github.com/Nemikolh/devsandboxes/releases/download/v0.7.0";
         let asset = "devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz";
         assert_eq!(
@@ -896,7 +896,7 @@ pub(crate) mod tests {
     fn a_failed_download_installs_nothing() {
         let dir = scratch("fetch");
         let fake = Fake { fail: Some("fetch"), ..Fake::building(ASSET) };
-        let err = update(&fake, &hub(), "linux", "aarch64", &dir).unwrap_err();
+        let err = update(&fake, &control_plane(), "linux", "aarch64", &dir).unwrap_err();
         assert!(format!("{err:#}").starts_with("cannot download https://github.com/"), "{err:#}");
         assert!(format!("{err:#}").ends_with("/SHA256SUMS: fetch broke"), "{err:#}");
         assert_eq!(fake.calls().len(), 1);
@@ -914,13 +914,13 @@ pub(crate) mod tests {
         ];
         for (tamper, want, fetches) in cases {
             let fake = Fake { tamper: Some(tamper), ..Fake::building(ASSET) };
-            let err = update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err();
+            let err = update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err();
             assert_eq!(format!("{err:#}"), want, "{tamper}");
             assert_eq!(fake.calls().len(), fetches, "{tamper}: the archive isn't even downloaded: {:?}", fake.calls());
             assert!(empty(&dir));
         }
         let fake = Fake { tamper: Some("archive"), ..Fake::building(ASSET) };
-        let err = format!("{:#}", update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err());
+        let err = format!("{:#}", update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err());
         assert!(err.starts_with("devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz's sha256 is "), "{err}");
         assert!(err.contains(", not SHA256SUMS's "), "{err}");
         assert!(!fake.calls().iter().any(|c| c.starts_with("unpack")), "{:?}", fake.calls());
@@ -997,29 +997,29 @@ pub(crate) mod tests {
     #[test]
     fn a_wrong_build_is_a_failure_and_no_handoff() {
         let dir = scratch("version");
-        // The asset isn't the hub's build: never installed, whichever word differs.
+        // The asset isn't the control plane's build: never installed, whichever word differs.
         for asset in ["0.6.9 aaaa published linux/x86_64", "0.7.0 bbbb published linux/x86_64", "0.7.0 aaaa dev linux/x86_64"] {
             let fake = Fake::building(asset);
-            let err = format!("{:#}", update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err());
-            assert!(err.ends_with("not the hub's 0.7.0 (published, aaaa)"), "{err}");
+            let err = format!("{:#}", update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err());
+            assert!(err.ends_with("not the control plane's 0.7.0 (published, aaaa)"), "{err}");
             assert!(err.starts_with("the downloaded binary ("), "{err}");
             assert!(!fake.calls().iter().any(|c| c.starts_with("install")), "{asset}");
         }
         // The installed binary isn't (dest resolved elsewhere): no handoff.
         let fake = Fake { installed_build: "0.8.0 cccc published linux/x86_64".into(), ..Fake::building(ASSET) };
-        let err = update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err();
+        let err = update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
-            "the installed binary (/dest/devsandbox) is devsandbox 0.8.0 (published, cccc), not the hub's 0.7.0 (published, aaaa)"
+            "the installed binary (/dest/devsandbox) is devsandbox 0.8.0 (published, cccc), not the control plane's 0.7.0 (published, aaaa)"
         );
         assert!(!fake.calls().iter().any(|c| c.starts_with("handoff")));
         // One that doesn't run.
         let fake = Fake { fail: Some("build"), ..Fake::building(ASSET) };
-        let err = format!("{:#}", update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err());
+        let err = format!("{:#}", update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err());
         assert!(err.starts_with("the downloaded binary (") && err.ends_with("doesn't run: build broke"), "{err}");
         // A failed handoff says so.
         let fake = Fake { fail: Some("handoff"), ..Fake::building(ASSET) };
-        let err = update(&fake, &hub(), "linux", "x86_64", &dir).unwrap_err();
+        let err = update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err();
         assert_eq!(format!("{err:#}"), "cannot hand this daemon off to it: handoff broke");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1033,30 +1033,30 @@ pub(crate) mod tests {
             std::fs::write(&binary, "new").unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
         };
-        let hub = "0.8.0 dddd dev linux/x86_64";
+        let control_plane = "0.8.0 dddd dev linux/x86_64";
         received();
-        let fake = Fake::building(hub);
-        install_received(&fake, &binary, hub).unwrap();
+        let fake = Fake::building(control_plane);
+        install_received(&fake, &binary, control_plane).unwrap();
         assert_eq!(std::fs::metadata(&binary).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(fake.calls(), ["build received", "install /dest/devsandbox", "build dest", "handoff "]);
-        // A peer link's hub said its hub flag too: not part of the build.
+        // A peer link's control plane said its control-plane flag too: not part of the build.
         received();
-        let fake = Fake::building(hub);
-        install_received(&fake, &binary, &format!("{hub} hub")).unwrap();
+        let fake = Fake::building(control_plane);
+        install_received(&fake, &binary, &format!("{control_plane} control plane")).unwrap();
         assert_eq!(fake.calls().len(), 4);
-        // Not the hub's build: never installed.
+        // Not the control plane's build: never installed.
         received();
-        let fake = Fake { received_build: "0.8.0 eeee dev linux/x86_64".into(), ..Fake::building(hub) };
-        let err = format!("{:#}", install_received(&fake, &binary, hub).unwrap_err());
+        let fake = Fake { received_build: "0.8.0 eeee dev linux/x86_64".into(), ..Fake::building(control_plane) };
+        let err = format!("{:#}", install_received(&fake, &binary, control_plane).unwrap_err());
         assert!(err.contains("reports \"0.8.0 eeee dev linux/x86_64\", not \"0.8.0 dddd dev linux/x86_64\""), "{err}");
         assert_eq!(fake.calls(), ["build received"]);
         // One that doesn't run.
-        let fake = Fake { fail: Some("build"), ..Fake::building(hub) };
-        let err = format!("{:#}", install_received(&fake, &binary, hub).unwrap_err());
-        assert!(err.starts_with("the hub's binary (") && err.ends_with("doesn't run: build broke"), "{err}");
+        let fake = Fake { fail: Some("build"), ..Fake::building(control_plane) };
+        let err = format!("{:#}", install_received(&fake, &binary, control_plane).unwrap_err());
+        assert!(err.starts_with("the control plane's binary (") && err.ends_with("doesn't run: build broke"), "{err}");
         // The installed one isn't it: no handoff.
-        let fake = Fake { installed_build: "0.8.0 dddd dev".into(), ..Fake::building(hub) };
-        let err = format!("{:#}", install_received(&fake, &binary, hub).unwrap_err());
+        let fake = Fake { installed_build: "0.8.0 dddd dev".into(), ..Fake::building(control_plane) };
+        let err = format!("{:#}", install_received(&fake, &binary, control_plane).unwrap_err());
         assert!(err.starts_with("the installed binary (/dest/devsandbox) reports"), "{err}");
         assert!(!fake.calls().iter().any(|c| c.starts_with("handoff")));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1066,7 +1066,7 @@ pub(crate) mod tests {
     fn no_release_no_fetch() {
         let dir = scratch("target");
         let fake = Fake::building(ASSET);
-        let err = update(&fake, &hub(), "macos", "x86_64", &dir).unwrap_err();
+        let err = update(&fake, &control_plane(), "macos", "x86_64", &dir).unwrap_err();
         assert_eq!(format!("{err:#}"), "no devsandbox release is built for macos/x86_64");
         assert!(fake.calls().is_empty());
         let _ = std::fs::remove_dir_all(&dir);

@@ -29,7 +29,7 @@ every `run`/`rebuild`; the runtime's layer cache makes it cheap.
 `<project>` is the config root's `services::project_id` (8 hex chars of
 the canonical root path's hash, the same key that scopes networks and
 service containers), so two roots with a same-named sandbox (two
-checkouts of one config, a hub's config next to a local one) build into
+checkouts of one config, a control plane's config next to a local one) build into
 tags and build contexts of their own.
 
 ## Feature image

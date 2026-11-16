@@ -1,6 +1,6 @@
 //! The `session.*` RPC methods (docs/architecture/helper/in-container.md,
 //! *Sessions over RPC*): `sessions.rs`' operations for callers that run no
-//! CLI in the container (the serve daemon, for a fleet hub's `PTY`). The
+//! CLI in the container (the serve daemon, for a fleet control plane's `PTY`). The
 //! daemon is then the session's client, like `devsbd session new|attach`
 //! without the terminal: the same `meta` and hello checks, the same one-client
 //! takeover.

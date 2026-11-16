@@ -16,11 +16,11 @@
 //! ([`forwarded`]), its answer tagged ([`tag_answer`]) and the lines the
 //! verb's output starts with.
 //!
-//! On a member (fleet plan decision 31) the hub decides: the member sends
+//! On a member (fleet plan decision 31) the control plane decides: the member sends
 //! `fleet.place` ([`PlaceParams`]: its spec, capacity and the machines it
-//! reaches, over a link or a route), the hub scores those it reaches too
+//! reaches, over a link or a route), the control plane scores those it reaches too
 //! among them ([`for_member`]) and answers a [`PlaceAnswer`], and the
-//! member moves the code and forwards over its own paths ([`by_hub`]).
+//! member moves the code and forwards over its own paths ([`by_control_plane`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -55,21 +55,21 @@ pub fn fleet_root(rows: &[RootCandidate]) -> Option<PathBuf> {
 /// take before its saved report is used instead.
 pub const CAPACITY_WAIT: Duration = Duration::from_secs(2);
 
-/// How long a member waits for the hub's `fleet.place` answer once its
-/// hello is through: the hub asks its own machines' `capacity.get` first,
+/// How long a member waits for the control plane's `fleet.place` answer once its
+/// hello is through: the control plane asks its own machines' `capacity.get` first,
 /// each up to twice [`CAPACITY_WAIT`].
 pub const PLACE_WAIT: Duration = Duration::from_secs(6);
 
 /// Whether the `run` request `params` asks to be placed (`place`, `run
 /// --place`). A run the user typed without it runs on this host, whose
-/// config it names (fleet plan decision 38): nothing asks the hub or
+/// config it names (fleet plan decision 38): nothing asks the control plane or
 /// probes a worker's capacity for it.
 pub fn asked(params: &Value) -> bool {
     params.get("place").and_then(Value::as_bool) == Some(true)
 }
 
 /// A placed run whose sandbox has `ties` (`code::ties`, fleet plan decision
-/// 40) runs here with a note naming them, before the hub is asked or any
+/// 40) runs here with a note naming them, before the control plane is asked or any
 /// worker scored; none: placement goes on (`None`).
 pub fn tied(ties: &[String]) -> Option<Placed> {
     (!ties.is_empty()).then(|| Placed::LocalWithNote(format!("note: not placed: {}; running here", ties.join(", "))))
@@ -150,10 +150,10 @@ pub enum Placed {
     /// Here, as without a fleet.
     Local,
     /// Here, after placement picked a worker the sandbox can't move to
-    /// (or a member's hub couldn't place it, or the sandbox is tied here,
+    /// (or a member's control plane couldn't place it, or the sandbox is tied here,
     /// [`tied`]): this note first in the verb's output.
     LocalWithNote(String),
-    /// Here, where a member's hub placed it: the hub's [`lines`] first.
+    /// Here, where a member's control plane placed it: the control plane's [`lines`] first.
     Here(Vec<String>),
     /// On worker `name`, in its copy of the config root `root`; `base` is
     /// the `--base` it gets ([`start_point`]); `lines` start the output;
@@ -203,8 +203,8 @@ pub fn decide(
 
 /// Placement picked worker `name` (`lines` start the output once there):
 /// `prepare(name)` moves the code, and its answer decides: there (its
-/// notes after `lines`), here with a note (`NotMovable`), or failed. Shared by a hub's own placement
-/// ([`decide`]) and a member's placed by the hub ([`by_hub`]).
+/// notes after `lines`), here with a note (`NotMovable`), or failed. Shared by a control plane's own placement
+/// ([`decide`]) and a member's placed by the control plane ([`by_control_plane`]).
 pub fn moved(ask: &Ask, name: &str, lines: Vec<String>, prepare: impl FnOnce(&str) -> Result<Prepared, Unprepared>) -> Placed {
     match prepare(name) {
         Err(Unprepared::NotMovable(why)) => Placed::LocalWithNote(format!("note: not placed on {name}: {why}; running here")),
@@ -220,7 +220,7 @@ pub fn moved(ask: &Ask, name: &str, lines: Vec<String>, prepare: impl FnOnce(&st
 }
 
 /// What a member's `fleet.place` names of its spec: the sandbox and its
-/// hashes ([`spec`]); the hub fills in the requester.
+/// hashes ([`spec`]); the control plane fills in the requester.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceSpec {
     pub sandbox: String,
@@ -230,7 +230,7 @@ pub struct PlaceSpec {
 
 /// `fleet.place`'s params (docs/reference/api.md, *fleet*): the member's
 /// spec, its own capacity now, and the machines it reaches
-/// ([`reachable_workers`]: a connected link, or a route; its hub among
+/// ([`reachable_workers`]: a connected link, or a route; its control plane among
 /// them): those it can move code to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceParams {
@@ -247,20 +247,20 @@ impl PlaceParams {
     }
 }
 
-/// Where the hub placed a member's run.
+/// Where the control plane placed a member's run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PlaceOn {
     /// The member that asked.
     Requester,
-    /// The hub itself.
-    Hub,
+    /// The control plane itself.
+    ControlPlane,
     /// Another machine (`PlaceAnswer::machine`).
     Machine,
 }
 
-/// `fleet.place`'s answer: where, by the hub's name for it (the
-/// requester's, the hub's own member name, or the machine's), and the
+/// `fleet.place`'s answer: where, by the control plane's name for it (the
+/// requester's, the control plane's own member name, or the machine's), and the
 /// lines the verb's output starts with ([`lines`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceAnswer {
@@ -269,7 +269,7 @@ pub struct PlaceAnswer {
     pub lines: Vec<String>,
 }
 
-/// The hub's machines `fleet.place` from `from` asks a fresh
+/// The control plane's machines `fleet.place` from `from` asks a fresh
 /// `capacity.get`: those it reaches ([`reachable_workers`]: a link up
 /// here, or a route), that the requester reaches too (`ask.reachable`),
 /// the requester itself left out (it sent its own).
@@ -277,21 +277,21 @@ pub fn member_workers(ask: &PlaceParams, from: &str, machines: &[Machine], route
     reachable_workers(machines, routed).into_iter().filter(|m| m != from && ask.reachable.contains(m)).collect()
 }
 
-/// The hub's placement of member `from`'s run (pure): the candidates are
-/// the requester (its own `capacity`, its image as the hub's view of its
-/// rows shows; `place`'s [`place::REQUESTER`] bias), the hub `hub` itself
-/// (`capacity`, its watched roots `hub_roots`) and each of
-/// [`member_workers`] (among `machines` and the hub's `routed` ones) with
+/// The control plane's placement of member `from`'s run (pure): the candidates are
+/// the requester (its own `capacity`, its image as the control plane's view of its
+/// rows shows; `place`'s [`place::REQUESTER`] bias), the control plane `control_plane` itself
+/// (`capacity`, its watched roots `control_plane_roots`) and each of
+/// [`member_workers`] (among `machines` and the control plane's `routed` ones) with
 /// its `fresh` report. Every candidate is named as
-/// the hub knows it, the hub by its member name, so the answer's lines
+/// the control plane knows it, the control plane by its member name, so the answer's lines
 /// read the same on the member.
 #[allow(clippy::too_many_arguments)]
 pub fn for_member(
     ask: &PlaceParams,
     from: &str,
-    hub: &str,
+    control_plane: &str,
     capacity: Capacity,
-    hub_roots: &[Arc<Value>],
+    control_plane_roots: &[Arc<Value>],
     machines: &[Machine],
     routed: &[Routed],
     fresh: &BTreeMap<String, Capacity>,
@@ -310,7 +310,7 @@ pub fn for_member(
         Some(m) => Candidate { reachable: true, capacity: Some(ask.capacity.clone()), ..Candidate::from_machine(&spec, m) },
         None => Candidate { machine: requester.clone(), reachable: true, capacity: Some(ask.capacity.clone()), has_image: false, has_repo: false },
     };
-    let this = Candidate { machine: MachineRef::Machine(hub.to_string()), ..Candidate::local(&spec, Some(capacity), hub_roots.iter().map(|v| v.as_ref())) };
+    let this = Candidate { machine: MachineRef::Machine(control_plane.to_string()), ..Candidate::local(&spec, Some(capacity), control_plane_roots.iter().map(|v| v.as_ref())) };
     let others = member_workers(ask, from, machines, routed);
     let mut candidates = vec![asker, this];
     candidates.extend(
@@ -325,15 +325,15 @@ pub fn for_member(
     let MachineRef::Machine(name) = &placement.machine else { unreachable!("every candidate is named") };
     let on = if placement.machine == requester {
         PlaceOn::Requester
-    } else if name == hub {
-        PlaceOn::Hub
+    } else if name == control_plane {
+        PlaceOn::ControlPlane
     } else {
         PlaceOn::Machine
     };
     Ok(PlaceAnswer { on, machine: name.clone(), lines: lines(&placement) })
 }
 
-/// Why a member's hub didn't place its run.
+/// Why a member's control plane didn't place its run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unplaced {
     /// Its link is down, or the call didn't make it or timed out.
@@ -342,30 +342,30 @@ pub enum Unplaced {
     Refused(String),
 }
 
-/// A member's `run` as hub `hub` answered it (`reachable`: the machines
-/// this host reaches, [`reachable_workers`]): here (the hub's lines
+/// A member's `run` as control plane `control_plane` answered it (`reachable`: the machines
+/// this host reaches, [`reachable_workers`]): here (the control plane's lines
 /// first), or on a worker this host reaches, `prepare` moving the code
-/// there as for a hub's own placement ([`moved`]). No answer, or a worker
-/// this host can't reach: here, with a note naming the hub.
-pub fn by_hub(
+/// there as for a control plane's own placement ([`moved`]). No answer, or a worker
+/// this host can't reach: here, with a note naming the control plane.
+pub fn by_control_plane(
     ask: &Ask,
-    hub: &str,
+    control_plane: &str,
     answer: Result<PlaceAnswer, Unplaced>,
     reachable: &[String],
     prepare: impl FnOnce(&str) -> Result<Prepared, Unprepared>,
 ) -> Placed {
     let a = match answer {
         Ok(a) => a,
-        Err(Unplaced::Unreachable(why)) => return Placed::LocalWithNote(format!("note: the hub `{hub}` is unreachable ({why}): running here")),
-        Err(Unplaced::Refused(why)) => return Placed::LocalWithNote(format!("note: the hub `{hub}` didn't place it ({why}): running here")),
+        Err(Unplaced::Unreachable(why)) => return Placed::LocalWithNote(format!("note: the control plane `{control_plane}` is unreachable ({why}): running here")),
+        Err(Unplaced::Refused(why)) => return Placed::LocalWithNote(format!("note: the control plane `{control_plane}` didn't place it ({why}): running here")),
     };
     let name = match a.on {
         PlaceOn::Requester => return Placed::Here(a.lines),
-        PlaceOn::Hub => hub.to_string(),
+        PlaceOn::ControlPlane => control_plane.to_string(),
         PlaceOn::Machine => a.machine,
     };
     if !reachable.contains(&name) {
-        return Placed::LocalWithNote(format!("note: the hub `{hub}` placed it on {name}, which this host has no path to: running here"));
+        return Placed::LocalWithNote(format!("note: the control plane `{control_plane}` placed it on {name}, which this host has no path to: running here"));
     }
     moved(ask, &name, a.lines, prepare)
 }
@@ -487,7 +487,7 @@ mod tests {
     }
 
     fn worker(name: &str, kind: MachineKind, state: LinkState, capacity: Option<Capacity>) -> Machine {
-        let root = PathBuf::from("/fleet/hub");
+        let root = PathBuf::from("/fleet/control_plane");
         let mut rows = BTreeMap::new();
         if let Some(c) = capacity {
             rows.insert(root.clone(), Arc::new(json!({ "dir": root, "capacity": c })));
@@ -497,8 +497,8 @@ mod tests {
 
     fn prepared(branch: &str) -> Prepared {
         Prepared {
-            remote_root: "/fleet/hub/roots/0123456789abcdef/cfg".into(),
-            folders: vec![("/w/web".into(), "/fleet/hub/roots/0123456789abcdef/web".into(), branch.into())],
+            remote_root: "/fleet/control_plane/roots/0123456789abcdef/cfg".into(),
+            folders: vec![("/w/web".into(), "/fleet/control_plane/roots/0123456789abcdef/web".into(), branch.into())],
             sent: Vec::new(),
             notes: Vec::new(),
         }
@@ -530,15 +530,15 @@ mod tests {
     #[test]
     fn the_fleet_root_is_the_flagged_row() {
         let row = |root: &str, fleet| RootCandidate { root: root.into(), sandboxes: vec![], error: None, fleet, copy: None, home: false };
-        assert_eq!(fleet_root(&[row("/own", false), row("/d/fleet/hub", true)]), Some(PathBuf::from("/d/fleet/hub")));
+        assert_eq!(fleet_root(&[row("/own", false), row("/d/fleet/control_plane", true)]), Some(PathBuf::from("/d/fleet/control_plane")));
         assert_eq!(fleet_root(&[row("/own", false)]), None);
         // As the wire has it: absent is unflagged.
         let rows: Vec<RootCandidate> = serde_json::from_value(json!([
             {"root": "/own", "sandboxes": [], "error": null},
-            {"root": "/d/fleet/hub", "sandboxes": [], "error": null, "fleet": true},
+            {"root": "/d/fleet/control_plane", "sandboxes": [], "error": null, "fleet": true},
         ]))
         .unwrap();
-        assert_eq!(fleet_root(&rows), Some(PathBuf::from("/d/fleet/hub")));
+        assert_eq!(fleet_root(&rows), Some(PathBuf::from("/d/fleet/control_plane")));
         crate::serve::dts::assert_matches("RootCandidate", &serde_json::to_value(&rows[1]).unwrap());
         crate::serve::dts::assert_matches("RootCandidate", &serde_json::to_value(&rows[0]).unwrap());
     }
@@ -585,13 +585,13 @@ mod tests {
         let want = [("this host", true), ("srv", true), ("lap", true), ("nb", true), ("off", false)];
         assert_eq!(names, want.map(|(n, r)| (n.to_string(), r)));
 
-        // A hub's view of its machines (on a member) adds no candidate of
+        // A control plane's view of its machines (on a member) adds no candidate of
         // itself: those are the routed ones (`Handle::routed`), passed apart.
-        let mut hub = worker("k", MachineKind::Ssh, LinkState::Connected, None);
-        hub.fleet = Some(Arc::new(json!({"machines": [{"name": "x", "state": "connected"}], "instances": []})));
-        let seen = candidates(&spec("web", None), None, &[], std::slice::from_ref(&hub), &[], &BTreeMap::new());
+        let mut control_plane = worker("k", MachineKind::Ssh, LinkState::Connected, None);
+        control_plane.fleet = Some(Arc::new(json!({"machines": [{"name": "x", "state": "connected"}], "instances": []})));
+        let seen = candidates(&spec("web", None), None, &[], std::slice::from_ref(&control_plane), &[], &BTreeMap::new());
         assert_eq!(seen.iter().map(|c| c.machine.to_string()).collect::<Vec<_>>(), ["this host", "k"]);
-        assert_eq!(reachable_workers(std::slice::from_ref(&hub), &[]), ["k"]);
+        assert_eq!(reachable_workers(std::slice::from_ref(&control_plane), &[]), ["k"]);
         assert_eq!(c[0].capacity.as_ref().map(|c| c.running), Some(2));
 
         // An inbound or ssh machine with more room wins over a busy host.
@@ -610,7 +610,7 @@ mod tests {
 
     /// Routed machines (no link of their own, a path in the graph) are
     /// workers too: reachable while a path starts with a link up here,
-    /// scored by the hub view's capacity or a fresh one, picked and moved
+    /// scored by the control-plane view's capacity or a fresh one, picked and moved
     /// to like any other.
     #[test]
     fn routed_machines_are_candidates() {
@@ -623,7 +623,7 @@ mod tests {
         let c = candidates(&s, Some(cap(16, 2, None)), &[], &machines, &r, &BTreeMap::new());
         let names: Vec<_> = c.iter().map(|c| (c.machine.to_string(), c.reachable, c.has_image)).collect();
         assert_eq!(names, [("this host", true, false), ("k", true, false), ("b", true, false), ("far", false, false)].map(|(n, r, i)| (n.to_string(), r, i)));
-        assert_eq!(c[3].capacity.as_ref().map(|c| c.running), Some(0), "the hub view's report");
+        assert_eq!(c[3].capacity.as_ref().map(|c| c.running), Some(0), "the control-plane view's report");
 
         // A busy host, b roomy by its fresh report: placed on b, moved there.
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
@@ -639,10 +639,10 @@ mod tests {
         assert_eq!(decide(&Ask::default(), &s, &c, |_| unreachable!()), Placed::Local);
     }
 
-    /// On the hub: a member's run may go to a machine the hub reaches over
+    /// On the control plane: a member's run may go to a machine the control plane reaches over
     /// a route, when the member reaches it too (it says so in `reachable`).
     #[test]
-    fn the_hub_places_on_a_routed_machine_both_reach() {
+    fn the_control_plane_places_on_a_routed_machine_both_reach() {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
         let machines = [worker("lap", MachineKind::Inbound, LinkState::Connected, None)];
         let r = [routed("b", LinkState::Connected, None), routed("c", LinkState::Connected, None)];
@@ -652,7 +652,7 @@ mod tests {
         let got = for_member(&a, "lap", "box", cap(4, 3, over), &[], &machines, &r, &fresh).unwrap();
         assert_eq!((got.on, got.machine.as_str()), (PlaceOn::Machine, "b"));
         // The member moves the code there: b is among what it reaches.
-        let Placed::Worker { name, .. } = by_hub(&Ask::default(), "box", Ok(got), &a.reachable, |_| Ok(prepared("main"))) else { panic!() };
+        let Placed::Worker { name, .. } = by_control_plane(&Ask::default(), "box", Ok(got), &a.reachable, |_| Ok(prepared("main"))) else { panic!() };
         assert_eq!(name, "b");
     }
 
@@ -680,7 +680,7 @@ mod tests {
 
         // The worker wins: moved, then there.
         let Placed::Worker { name, root, base, lines, folder } = decide(&ask, &s, &busy_here(), ok("main")) else { panic!() };
-        assert_eq!((name.as_str(), root, base), ("lap", PathBuf::from("/fleet/hub/roots/0123456789abcdef/cfg"), None));
+        assert_eq!((name.as_str(), root, base), ("lap", PathBuf::from("/fleet/control_plane/roots/0123456789abcdef/cfg"), None));
         assert_eq!(folder, None, "no repo sent");
         // With its repo sent: the record's folder.
         let sent = |_: &str| {
@@ -693,17 +693,17 @@ mod tests {
             folder,
             Some(MovedFolder {
                 local: "/w/web".into(),
-                remote: "/fleet/hub/roots/0123456789abcdef/web".into(),
+                remote: "/fleet/control_plane/roots/0123456789abcdef/web".into(),
                 branch: "main".into(),
                 repo: "fedcba9876543210".into(),
             })
         );
         assert_eq!(lines, ["placed on lap (mem 87% free, disk 50% free, cpu 100% free)"]);
         assert_eq!(*asked.borrow(), ["lap"]);
-        // The move's notes (the hub mirror's) follow the placement's lines.
-        let noted = |_: &str| Ok(Prepared { notes: vec!["note: the hub has no copy".into()], ..prepared("main") });
+        // The move's notes (the control-plane mirror's) follow the placement's lines.
+        let noted = |_: &str| Ok(Prepared { notes: vec!["note: the control plane has no copy".into()], ..prepared("main") });
         let Placed::Worker { lines, .. } = decide(&ask, &s, &busy_here(), noted) else { panic!() };
-        assert_eq!(lines, ["placed on lap (mem 87% free, disk 50% free, cpu 100% free)", "note: the hub has no copy"]);
+        assert_eq!(lines, ["placed on lap (mem 87% free, disk 50% free, cpu 100% free)", "note: the control plane has no copy"]);
 
         // A sandbox that can't move: here, with the note.
         let not_movable = |_: &str| Err(Unprepared::NotMovable("/w/web has a detached HEAD".into()));
@@ -726,11 +726,11 @@ mod tests {
         n.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The hub's side of `fleet.place`: the requester (its own report, the
-    /// bias), the hub (by its member name) and the hub's connected machines
+    /// The control plane's side of `fleet.place`: the requester (its own report, the
+    /// bias), the control plane (by its member name) and the control plane's connected machines
     /// the requester also links to, each with its fresh report.
     #[test]
-    fn the_hub_places_a_members_run() {
+    fn the_control_plane_places_a_members_run() {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
         let ask = |capacity: Capacity, reachable: &[&str]| PlaceParams::of(&spec("web", None), capacity, names(reachable));
         let machines = [
@@ -739,15 +739,15 @@ mod tests {
             worker("nb", MachineKind::Inbound, LinkState::Connected, None),
             worker("off", MachineKind::Ssh, LinkState::Unreachable, None),
         ];
-        // Asked afresh: the hub's connected ones lap reaches, never lap itself.
+        // Asked afresh: the control plane's connected ones lap reaches, never lap itself.
         let a = ask(cap(4, 3, over.clone()), &["box", "srv", "off", "lap"]);
         assert_eq!(member_workers(&a, "lap", &machines, &[]), ["srv"]);
 
-        // A busy requester (its own report, not the hub's saved one), a roomy hub.
+        // A busy requester (its own report, not the control plane's saved one), a roomy control plane.
         let none = BTreeMap::new();
         let busy_srv = BTreeMap::from([("srv".to_string(), cap(2, 6, over.clone()))]);
         let got = for_member(&a, "lap", "box", cap(28, 0, None), &[], &machines, &[], &busy_srv).unwrap();
-        assert_eq!((got.on, got.machine.as_str()), (PlaceOn::Hub, "box"));
+        assert_eq!((got.on, got.machine.as_str()), (PlaceOn::ControlPlane, "box"));
         assert_eq!(got.lines, ["placed on box (mem 87% free, disk 50% free, cpu 100% free)"]);
 
         // A roomy requester: it stays there, the bias among its reasons.
@@ -764,7 +764,7 @@ mod tests {
         // One lap doesn't link to is no candidate, however roomy.
         let a = ask(cap(4, 3, over.clone()), &["box"]);
         let got = for_member(&a, "lap", "box", cap(16, 1, None), &[], &machines, &[], &roomy_srv).unwrap();
-        assert_eq!(got.on, PlaceOn::Hub);
+        assert_eq!(got.on, PlaceOn::ControlPlane);
 
         // Every candidate over a cap: the best, warned by name.
         let a = ask(cap(4, 3, over.clone()), &["box"]);
@@ -777,19 +777,19 @@ mod tests {
         assert_eq!(serde_json::from_value::<PlaceParams>(params.clone()).unwrap(), a);
         crate::serve::dts::assert_matches("FleetPlaceParams", &params);
         let answer = serde_json::to_value(&got).unwrap();
-        assert_eq!(answer["on"], "hub");
+        assert_eq!(answer["on"], "control_plane");
         crate::serve::dts::assert_matches("FleetPlaced", &answer);
         crate::serve::dts::assert_matches("FleetPlaceSpec", &params["spec"]);
-        let on: Vec<String> = [PlaceOn::Requester, PlaceOn::Hub, PlaceOn::Machine]
+        let on: Vec<String> = [PlaceOn::Requester, PlaceOn::ControlPlane, PlaceOn::Machine]
             .iter()
             .map(|o| format!("'{}'", serde_json::to_value(o).unwrap().as_str().unwrap()))
             .collect();
         assert_eq!(crate::serve::dts::union_members("FleetPlaceOn"), on);
     }
 
-    /// The member's side: the hub's answer, or why none came.
+    /// The member's side: the control plane's answer, or why none came.
     #[test]
-    fn a_member_runs_where_the_hub_says() {
+    fn a_member_runs_where_the_control_plane_says() {
         let ask = Ask::default();
         let answer = |on, machine: &str| Ok(PlaceAnswer { on, machine: machine.into(), lines: names(&[&format!("placed on {machine}")]) });
         let reach = names(&["box", "srv"]);
@@ -798,29 +798,29 @@ mod tests {
             asked.borrow_mut().push(w.to_string());
             Ok(prepared("main"))
         };
-        assert_eq!(by_hub(&ask, "box", answer(PlaceOn::Requester, "lap"), &reach, ok), Placed::Here(names(&["placed on lap"])));
+        assert_eq!(by_control_plane(&ask, "box", answer(PlaceOn::Requester, "lap"), &reach, ok), Placed::Here(names(&["placed on lap"])));
         assert!(asked.borrow().is_empty());
-        let Placed::Worker { name, lines, .. } = by_hub(&ask, "box", answer(PlaceOn::Hub, "k-name"), &reach, ok) else { panic!() };
-        assert_eq!((name.as_str(), lines), ("box", names(&["placed on k-name"])), "the hub, by this host's name for it");
-        let Placed::Worker { name, .. } = by_hub(&ask, "box", answer(PlaceOn::Machine, "srv"), &reach, ok) else { panic!() };
+        let Placed::Worker { name, lines, .. } = by_control_plane(&ask, "box", answer(PlaceOn::ControlPlane, "k-name"), &reach, ok) else { panic!() };
+        assert_eq!((name.as_str(), lines), ("box", names(&["placed on k-name"])), "the control plane, by this host's name for it");
+        let Placed::Worker { name, .. } = by_control_plane(&ask, "box", answer(PlaceOn::Machine, "srv"), &reach, ok) else { panic!() };
         assert_eq!(name, "srv");
         assert_eq!(*asked.borrow(), ["box", "srv"]);
         assert_eq!(
-            by_hub(&ask, "box", answer(PlaceOn::Machine, "nb"), &reach, ok),
-            Placed::LocalWithNote("note: the hub `box` placed it on nb, which this host has no path to: running here".into())
+            by_control_plane(&ask, "box", answer(PlaceOn::Machine, "nb"), &reach, ok),
+            Placed::LocalWithNote("note: the control plane `box` placed it on nb, which this host has no path to: running here".into())
         );
         assert_eq!(
-            by_hub(&ask, "box", Err(Unplaced::Unreachable("its link is down".into())), &reach, ok),
-            Placed::LocalWithNote("note: the hub `box` is unreachable (its link is down): running here".into())
+            by_control_plane(&ask, "box", Err(Unplaced::Unreachable("its link is down".into())), &reach, ok),
+            Placed::LocalWithNote("note: the control plane `box` is unreachable (its link is down): running here".into())
         );
         assert_eq!(
-            by_hub(&ask, "box", Err(Unplaced::Refused("fleet.place: denied".into())), &reach, ok),
-            Placed::LocalWithNote("note: the hub `box` didn't place it (fleet.place: denied): running here".into())
+            by_control_plane(&ask, "box", Err(Unplaced::Refused("fleet.place: denied".into())), &reach, ok),
+            Placed::LocalWithNote("note: the control plane `box` didn't place it (fleet.place: denied): running here".into())
         );
-        // A sandbox that can't move to the hub's pick: here, as on the hub.
+        // A sandbox that can't move to the control plane's pick: here, as on the control plane.
         let not_movable = |_: &str| Err(Unprepared::NotMovable("/w/web has a detached HEAD".into()));
         assert_eq!(
-            by_hub(&ask, "box", answer(PlaceOn::Hub, "box"), &reach, not_movable),
+            by_control_plane(&ask, "box", answer(PlaceOn::ControlPlane, "box"), &reach, not_movable),
             Placed::LocalWithNote("note: not placed on box: /w/web has a detached HEAD; running here".into())
         );
         assert_eq!(*asked.borrow(), ["box", "srv"]);
@@ -852,11 +852,11 @@ mod tests {
     #[test]
     fn the_worker_gets_the_request_in_its_root() {
         let params = json!({"root": "/w/cfg", "env": {}, "sandbox": "web", "branch": "new-one", "base": null, "place": true});
-        let p = forwarded(params, "lap", Path::new("/fleet/hub/roots/h/cfg"), Some("main"));
+        let p = forwarded(params, "lap", Path::new("/fleet/control_plane/roots/h/cfg"), Some("main"));
         // No `place`: the worker runs it, never places it again.
         assert_eq!(
             p,
-            json!({"root": "/fleet/hub/roots/h/cfg", "env": {}, "sandbox": "web", "branch": "new-one", "base": "main", "machine": "lap"})
+            json!({"root": "/fleet/control_plane/roots/h/cfg", "env": {}, "sandbox": "web", "branch": "new-one", "base": "main", "machine": "lap"})
         );
         assert!(!asked(&p));
         let p = forwarded(json!({"root": "/w/cfg", "base": "v1"}), "lap", Path::new("/x"), None);

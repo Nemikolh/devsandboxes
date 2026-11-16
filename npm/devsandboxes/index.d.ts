@@ -193,13 +193,13 @@ export interface SnapshotMachine {
   /** Its host's capacity, from its last snapshot (last known while not `connected`); `null` before one carried it. */
   capacity: Capacity | null;
   /**
-   * The fleet hub this machine is seen through (a member's view of the hub's other machines, kind
+   * The fleet control plane this machine is seen through (a member's view of the control plane's other machines, kind
    * `routed`: acted on over a route); `null` for a machine this host links to.
    */
   via: string | null;
   /**
    * While it's `worker` and exposed through another machine, as this host's link graph says: the chain
-   * from the hub (each member dials, or reaches a `full` one, the next), its last but one dialing it (a
+   * from the control plane (each member dials, or reaches a `full` one, the next), its last but one dialing it (a
    * shell there `worker` doesn't stop); `null` otherwise.
    */
   exposed_by: string[] | null;
@@ -945,7 +945,7 @@ export interface MachineAdded {
 
 /**
  * Who joined at `machines.add`: `target` the machine joined this host's fleet, `this` this host
- * joined the machine's, `new` a fleet of two (`hub` says which end, the machine under `hub: true`), `same`
+ * joined the machine's, `new` a fleet of two (`control_plane` says which end, the machine under `control_plane: true`), `same`
  * both were in it already.
  * @experimental
  */
@@ -953,14 +953,14 @@ export type FleetJoined = 'target' | 'this' | 'new' | 'same';
 
 /** `machines.add`'s `fleet`. @experimental */
 export interface MachineFleet {
-  /** The hub's member name. */
-  hub: string;
+  /** The control plane's member name. */
+  control_plane: string;
   joined: FleetJoined;
 }
 
 /**
  * How a removed member heard of it: `told` it answered `fleet.leave`, `leaving` it asked itself,
- * `unreachable` it wasn't reached (it keeps its hub and entries until it is).
+ * `unreachable` it wasn't reached (it keeps its control plane and entries until it is).
  * @experimental
  */
 export type FleetHeard = 'told' | 'leaving' | 'unreachable';
@@ -971,16 +971,16 @@ export interface FleetMissed {
   error: string;
 }
 
-/** `fleet.rm`'s answer: what a removal on the hub reached. @experimental */
+/** `fleet.rm`'s answer: what a removal on the control plane reached. @experimental */
 export interface FleetRemoved {
   /** Who's out of the fleet. */
   name: string;
-  /** The hub that ran it. */
-  hub: string;
+  /** The control plane that ran it. */
+  control_plane: string;
   leave: FleetHeard;
   /** Why `name` wasn't reached (`leave` is `unreachable`). */
   error: string | null;
-  /** The other members the hub links to that dropped it. */
+  /** The other members the control plane links to that dropped it. */
   forgot: string[];
   /** Those it couldn't reach. */
   missed: FleetMissed[];
@@ -994,22 +994,22 @@ export interface FleetPlaceSpec {
   build_hash: string | null;
 }
 
-/** `fleet.place`'s params: a member's run, for the hub to place. @experimental */
+/** `fleet.place`'s params: a member's run, for the control plane to place. @experimental */
 export interface FleetPlaceParams {
   spec: FleetPlaceSpec;
   /** The member's own capacity now. */
   capacity: Capacity;
-  /** The machines the member reaches (a connected link, or a route over the link graph), its hub among them: the only other candidates. */
+  /** The machines the member reaches (a connected link, or a route over the link graph), its control plane among them: the only other candidates. */
   reachable: string[];
 }
 
-/** Where the hub placed a member's run: the member that asked, the hub, or another machine. @experimental */
-export type FleetPlaceOn = 'requester' | 'hub' | 'machine';
+/** Where the control plane placed a member's run: the member that asked, the control plane, or another machine. @experimental */
+export type FleetPlaceOn = 'requester' | 'control_plane' | 'machine';
 
 /** `fleet.place`'s answer. @experimental */
 export interface FleetPlaced {
   on: FleetPlaceOn;
-  /** The machine, by the hub's name for it (the hub's own member name for `hub`). */
+  /** The machine, by the control plane's name for it (the control plane's own member name for `control_plane`). */
   machine: string;
   /** What the run's output starts with: `placed on <machine> (<reasons>)`, then `warning: … over cap: …` lines. */
   lines: string[];
@@ -1034,13 +1034,13 @@ export interface FleetSigned {
   pushed: string[];
   /** Those it didn't: they catch up on their next link. */
   unpushed: FleetMissed[];
-  /** A revoke's removal: run here on the hub, or the hub's answer to `fleet.rm`. */
+  /** A revoke's removal: run here on the control plane, or the control plane's answer to `fleet.rm`. */
   removed: FleetRemoved | null;
-  /** Why a revoke has no `removed` (the hub not reached, or refusing). */
+  /** Why a revoke has no `removed` (the control plane not reached, or refusing). */
   error: string | null;
 }
 
-/** `machines.rm` on the fleet's authority: the machine's key revoked, pushed, then removed by the hub. @experimental */
+/** `machines.rm` on the fleet's authority: the machine's key revoked, pushed, then removed by the control plane. @experimental */
 export interface MachineRmRevoked extends FleetSigned {
   type: 'revoked';
 }
@@ -1055,11 +1055,11 @@ export interface MachineRmLeft {
   type: 'left';
   /** This host's member name. */
   name: string;
-  /** The hub of the fleet it left (its own name when it was the hub). */
-  hub: string;
-  /** The hub's answer to this host's `fleet.rm`; `null` when this host was the hub, or the hub wasn't reached. */
+  /** The control plane of the fleet it left (its own name when it was the control plane). */
+  control_plane: string;
+  /** The control plane's answer to this host's `fleet.rm`; `null` when this host was the control plane, or the control plane wasn't reached. */
   removed: FleetRemoved | null;
-  /** Why the hub wasn't reached. */
+  /** Why the control plane wasn't reached. */
   error: string | null;
   /** This host's registry entries, dropped. */
   dropped: string[];
@@ -1092,14 +1092,14 @@ export interface FleetChangeRotate {
   by_old: string;
 }
 
-/** A proposed membership change: the fleet's hub role moved to member `name` (a `hub` entry). @experimental */
-export interface FleetChangeHub {
-  kind: 'hub';
+/** A proposed membership change: the fleet's control-plane role moved to member `name` (a `control_plane` entry). @experimental */
+export interface FleetChangeControlPlane {
+  kind: 'control_plane';
   name: string;
 }
 
 /** A membership change proposed to the authority (`fleet.propose`'s `op`). @experimental */
-export type FleetChange = FleetChangeAdd | FleetChangeRevoke | FleetChangeRotate | FleetChangeHub;
+export type FleetChange = FleetChangeAdd | FleetChangeRevoke | FleetChangeRotate | FleetChangeControlPlane;
 
 /** A proposal waiting on the authority (`proposals.json`). @experimental */
 export interface FleetProposal {
@@ -1132,7 +1132,7 @@ export interface FleetLink {
   since_ms: number;
 }
 
-/** A member's word on its links: its trust, whether its daemon stays up (keep-alive, or the hub), each link it has, and the members it grants its ssh-agent to (sorted). @experimental */
+/** A member's word on its links: its trust, whether its daemon stays up (keep-alive, or the control plane), each link it has, and the members it grants its ssh-agent to (sorted). @experimental */
 export interface FleetLinkReport {
   member: string;
   trust: MemberTrust;
@@ -1152,7 +1152,7 @@ export interface FleetGraph {
   reports: FleetReport[];
 }
 
-/** `fleet.report`'s answer: whether the hub's graph took it as new. @experimental */
+/** `fleet.report`'s answer: whether the control plane's graph took it as new. @experimental */
 export interface FleetReported {
   changed: boolean;
 }
@@ -1181,18 +1181,18 @@ export interface MembershipRotateProposed extends FleetProposed {
 /** `membership.rotate`'s answer. @experimental */
 export type MembershipRotateResult = MembershipRotated | MembershipRotateProposed;
 
-/** `membership.hub` on the fleet's authority: the `hub` entry signed, pushed, then followed here (every link redials). @experimental */
-export interface MembershipHubSigned extends FleetSigned {
+/** `membership.controlPlane` on the fleet's authority: the `control_plane` entry signed, pushed, then followed here (every link redials). @experimental */
+export interface MembershipControlPlaneSigned extends FleetSigned {
   type: 'signed';
 }
 
-/** `membership.hub` on another member: the `hub` entry proposed to the authority, approved there. @experimental */
-export interface MembershipHubProposed extends FleetProposed {
+/** `membership.controlPlane` on another member: the `control_plane` entry proposed to the authority, approved there. @experimental */
+export interface MembershipControlPlaneProposed extends FleetProposed {
   type: 'proposed';
 }
 
-/** `membership.hub`'s answer. @experimental */
-export type MembershipHubResult = MembershipHubSigned | MembershipHubProposed;
+/** `membership.controlPlane`'s answer. @experimental */
+export type MembershipControlPlaneResult = MembershipControlPlaneSigned | MembershipControlPlaneProposed;
 
 /** `machines.get`'s answer (a registered machine, an inbound or a routed one): what an ssh command to the machine needs. @experimental */
 export interface MachineInfo {
@@ -1202,7 +1202,7 @@ export interface MachineInfo {
   target: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
-  /** Config roots on the machine: what its daemon's `roots.list` last answered over its link (a routed one's: the hub's view). */
+  /** Config roots on the machine: what its daemon's `roots.list` last answered over its link (a routed one's: the control plane's view). */
   roots: string[];
   /**
    * The root a command on the machine with no root given takes: its signed config's copy (of several, the one
@@ -1226,7 +1226,7 @@ export interface MachineRow {
   kind: MachineKind;
   /** What ssh takes, or an `ssh://` URL; `null` for an `inbound` neighbor. */
   target: string | null;
-  /** Config roots on the machine: what its daemon's `roots.list` last answered over its link, in that order (empty until it has; a routed one's: the hub's view). */
+  /** Config roots on the machine: what its daemon's `roots.list` last answered over its link, in that order (empty until it has; a routed one's: the control plane's view). */
   roots: string[];
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
@@ -1241,9 +1241,9 @@ export interface MachineRow {
   capacity: Capacity | null;
   /** Who introduced it, while this host's membership holds it as an introduction (capped: it introduces no one); `null` for a member of the log. */
   introduced_by: string | null;
-  /** A routed machine's first hop (or the hub whose view lists it); `null` for a machine this host links to. */
+  /** A routed machine's first hop (or the control plane whose view lists it); `null` for a machine this host links to. */
   via: string | null;
-  /** As {@link SnapshotMachine.exposed_by}: the chain from the hub while it's `worker` and exposed through another machine; `null` otherwise. */
+  /** As {@link SnapshotMachine.exposed_by}: the chain from the control plane while it's `worker` and exposed through another machine; `null` otherwise. */
   exposed_by: string[] | null;
 }
 
@@ -1254,10 +1254,10 @@ export type MemberTrust = 'worker' | 'full';
 export interface MemberInfo {
   /** `member.toml`'s `name`, else the hostname's first label; `null` when neither is a valid name. */
   name: string | null;
-  /** The fleet's hub: `'self'` on the hub, else the hub's member name; `null` in no fleet. */
-  hub: string | null;
+  /** The fleet's control plane: `'self'` on the control plane, else the control plane's member name; `null` in no fleet. */
+  control_plane: string | null;
   trust: MemberTrust;
-  /** `dev-builds` as the file says (`full` takes the hub's dev builds either way). */
+  /** `dev-builds` as the file says (`full` takes the control plane's dev builds either way). */
   dev_builds: boolean;
   /** Config roots shown to the fleet besides those with instances (absolute). */
   roots: string[];
@@ -1269,7 +1269,7 @@ export interface MemberInfo {
   next: MembershipKey | null;
   /**
    * While this host is `worker` and exposed through another machine (this host's link graph): the chain
-   * from the hub, its last but one dialing this host (a shell here `worker` doesn't stop); `null` otherwise.
+   * from the control plane, its last but one dialing this host (a shell here `worker` doesn't stop); `null` otherwise.
    */
   exposed_by: string[] | null;
 }
@@ -1293,13 +1293,13 @@ export interface MembershipEntryBase {
   statement: MembershipStatement;
 }
 
-/** The first entry: the fleet's authority (its key signs every entry) and its hub; `id` is random (32 hex). @experimental */
+/** The first entry: the fleet's authority (its key signs every entry) and its control plane; `id` is random (32 hex). @experimental */
 export interface MembershipGenesis extends MembershipEntryBase {
   op: 'genesis';
   id: string;
   authority: string;
   key: string;
-  hub: string;
+  control_plane: string;
 }
 
 /** @experimental */
@@ -1326,8 +1326,8 @@ export interface MembershipRotate extends MembershipEntryBase {
 }
 
 /** @experimental */
-export interface MembershipHub extends MembershipEntryBase {
-  op: 'hub';
+export interface MembershipControlPlane extends MembershipEntryBase {
+  op: 'control_plane';
   name: string;
 }
 
@@ -1342,7 +1342,7 @@ export interface MembershipConfig extends MembershipEntryBase {
 }
 
 /** One entry of the membership log, a hash chain the fleet's authority signs. @experimental */
-export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipHub | MembershipConfig;
+export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipControlPlane | MembershipConfig;
 
 /** A member's signed word for a key the authority hasn't added: capped until it does. @experimental */
 export interface MembershipIntroduction {
@@ -1381,7 +1381,7 @@ export interface MembershipIntroduced {
 /** What a stored log says; all empty in no fleet's log. @experimental */
 export interface MembershipSummary {
   authority: string | null;
-  hub: string | null;
+  control_plane: string | null;
   members: Record<string, MembershipKey>;
   introductions: MembershipIntroduced[];
   head: MembershipHead;
@@ -1625,7 +1625,7 @@ export interface RunParams extends VerbParams {
    */
   tty?: TtySize | null;
   /**
-   * Ask the fleet's hub where to run it (`run --place`; not with `machine`).
+   * Ask the fleet's control plane where to run it (`run --place`; not with `machine`).
    * Without it the run stays on this host. Placed on a machine, the code
    * moves there first and the answer and `progress` carry `machine`.
    * @experimental
@@ -1861,14 +1861,14 @@ export interface ApiMethods {
   'machines.probe': { params: { target: string; command?: string }; result: MachineProbe };
   /**
    * Register a machine (no config roots: its own daemon lists them); `invalid` for a taken name or an empty
-   * `command`. `command` as `machines.probe`'s, saved as the machine's. `hub`: the machine is
-   * the hub of the new fleet; `denied` when either end is in a fleet whose hub it isn't. `key`: the machine's
+   * `command`. `command` as `machines.probe`'s, saved as the machine's. `control_plane`: the machine is
+   * the control plane of the new fleet; `denied` when either end is in a fleet whose control plane it isn't. `key`: the machine's
    * key as the user confirmed it (`machines.probe`'s); `denied` when the machine's differs. Writes both ends'
    * membership logs (`denied` for another fleet's log, a fork, a capped member letting a host in). `agent`:
    * grant this host's ssh-agent to the machine by `key` once it's added.
    * @experimental
    */
-  'machines.add': { params: { target: string; name?: string; hub: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
+  'machines.add': { params: { target: string; name?: string; control_plane: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
   /** @experimental */
   'machines.list': { params: {}; result: MachineRow[] };
   /**
@@ -1885,33 +1885,33 @@ export interface ApiMethods {
    */
   'machines.unlink': { params: { name: string }; result: OkResult };
   /**
-   * Take a machine out of the fleet. On the authority: its key revoked, pushed, then removed by the hub. On
+   * Take a machine out of the fleet. On the authority: its key revoked, pushed, then removed by the control plane. On
    * another member: proposed to the authority over any path, its direct link while up, else a route (`failed`
    * naming it when none reaches it). This host's own name leaves the fleet (its revoke proposed, best effort). `denied` for the
-   * hub, the authority, or the hub leaving while it has machines; `not-found` for a name neither linked, in the
-   * log, nor seen through the hub.
+   * control plane, the authority, or the control plane leaving while it has machines; `not-found` for a name neither linked, in the
+   * log, nor seen through the control plane.
    * @experimental
    */
   'machines.rm': { params: { name: string }; result: MachineRmResult };
   /**
-   * On the hub, from one of its machines: the removal of a member the hub's log has revoked, or of the asking
+   * On the control plane, from one of its machines: the removal of a member the control plane's log has revoked, or of the asking
    * member itself (leaving). Never from a local client.
    * @experimental
    */
   'fleet.rm': { params: { name: string }; result: FleetRemoved };
   /**
-   * On the hub, from one of its machines: where that member's `run --place` goes, among itself, the hub and the hub's
+   * On the control plane, from one of its machines: where that member's `run --place` goes, among itself, the control plane and the control plane's
    * connected machines in `reachable`. Never from a local client.
    * @experimental
    */
   'fleet.place': { params: FleetPlaceParams; result: FleetPlaced };
   /**
-   * From this host's hub only, once this host's log revokes its key: clear `hub` and drop every registry entry
+   * From this host's control plane only, once this host's log revokes its key: clear `control_plane` and drop every registry entry
    * and the log; the links end once answered.
    * @experimental
    */
   'fleet.leave': { params: {}; result: OkResult };
-  /** From this host's hub only, once this host's log revokes `name`: drop its entry, or end its inbound link. @experimental */
+  /** From this host's control plane only, once this host's log revokes `name`: drop its entry, or end its inbound link. @experimental */
   'fleet.forget': { params: { name: string }; result: OkResult };
   /**
    * On the fleet's authority, from a member of its log (never a capped one): queue a membership change for the
@@ -1926,14 +1926,14 @@ export interface ApiMethods {
    */
   'fleet.sync': { params: MembershipStored; result: FleetSynced };
   /**
-   * On the hub, from a member or an introduced peer: its own link report, taken into the hub's graph (`invalid`
-   * for one refused: older, forged, another member's); a change is pushed to the hub's linked members.
+   * On the control plane, from a member or an introduced peer: its own link report, taken into the control plane's graph (`invalid`
+   * for one refused: older, forged, another member's); a change is pushed to the control plane's linked members.
    * @experimental
    */
   'fleet.report': { params: FleetReport; result: FleetReported };
   /**
    * From a member or an introduced peer: the reports it carries taken (each verifies itself; refusals are
-   * logged), answered with every report this host holds. On the hub a change is pushed on.
+   * logged), answered with every report this host holds. On the control plane a change is pushed on.
    * @experimental
    */
   'fleet.graph': { params: { reports?: FleetReport[] }; result: FleetGraph };
@@ -1980,7 +1980,7 @@ export interface ApiMethods {
   'member.get': { params: {}; result: MemberInfo };
   /**
    * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `trust`,
-   * and `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root. `hub` isn't
+   * and `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root. `control_plane` isn't
    * settable: it comes from the membership log (`membership.adopt`).
    * @experimental
    */
@@ -1992,7 +1992,7 @@ export interface ApiMethods {
   /**
    * Take a membership log: none here takes it, one behind takes its later entries, the same or ahead keeps
    * this host's; their introductions are held. `denied` for another fleet's log, a fork, or a log that lists
-   * this host neither as a member nor introduced; `invalid` for one that doesn't verify. Writes `hub` from the
+   * this host neither as a member nor introduced; `invalid` for one that doesn't verify. Writes `control_plane` from the
    * log (a change ends every link of this host, which redial). Local only.
    * @experimental
    */
@@ -2032,14 +2032,14 @@ export interface ApiMethods {
    */
   'membership.rotate': { params: {}; result: MembershipRotateResult };
   /**
-   * Move the fleet's hub role to member `name`. On the authority the `hub` entry is signed, stored, pushed, and
-   * only then followed here (every link ends and redials saying the new hub); elsewhere it's proposed to the
+   * Move the fleet's control-plane role to member `name`. On the authority the `control_plane` entry is signed, stored, pushed, and
+   * only then followed here (every link ends and redials saying the new control plane); elsewhere it's proposed to the
    * authority over any path (a pending one of the same name answers its id). `invalid` for a name not in the
-   * log (an introduced member can't be the hub) or the hub already; `denied` for a capped (introduced) member,
+   * log (an introduced member can't be the control plane) or the control plane already; `denied` for a capped (introduced) member,
    * `failed` in no fleet's log or with no path to the authority. Local only.
    * @experimental
    */
-  'membership.hub': { params: { name: string }; result: MembershipHubResult };
+  'membership.controlPlane': { params: { name: string }; result: MembershipControlPlaneResult };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

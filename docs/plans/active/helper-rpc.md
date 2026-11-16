@@ -70,7 +70,7 @@ local interactive `exec -it` paths (the CLI's and the dashboard's own
 `exec`, and anything without `serve`, keep them); non-unix hosts (`serve`
 is unix-only, they keep exec). Attaching to an existing helper session
 (`session.attach`, below) is in scope: [fleet](fleet.md) step 4's `PTY`
-needs a daemon-side attach, since a fleet worker runs no CLI for the hub.
+needs a daemon-side attach, since a fleet worker runs no CLI for the control plane.
 
 ## Design
 

@@ -90,7 +90,7 @@ pub struct RunParams {
     /// TTY progress, as on the caller's terminal. Absent: pipes.
     #[serde(default)]
     pub tty: Option<TtySize>,
-    /// Ask the fleet's hub where to run it (`run --place`;
+    /// Ask the fleet's control plane where to run it (`run --place`;
     /// docs/architecture/daemon/fleet.md, *Placement*). Absent, it runs on
     /// this host: a typed run is never placed. Only the daemon reads it:
     /// the subprocess runs here either way.

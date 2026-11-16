@@ -134,7 +134,7 @@ half-way.
 
 Two siblings cover the git the fleet's code moving runs
 ([fleet](../daemon/fleet.md#moving-code)), with the same flags and env:
-`host_git_bare` for a bare repo devsandbox keeps (the hub's repo cache: the
+`host_git_bare` for a bare repo devsandbox keeps (the control plane's repo cache: the
 dir is the git dir, its `config` and alternates checked as `check_repo`
 checks a checkout's) and `host_git_new` for a dir with no `.git` yet (`git
 init`; refused once one is there).

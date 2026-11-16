@@ -324,7 +324,7 @@ mod tests {
     const ID: &str = "1700000000-ab12";
 
     fn req(create: Option<Vec<String>>) -> Request {
-        Request { root: "/w/fleet/hub/cfg".into(), instance: "web-1".into(), mode: Mode::Session { id: ID.into(), create } }
+        Request { root: "/w/fleet/control_plane/cfg".into(), instance: "web-1".into(), mode: Mode::Session { id: ID.into(), create } }
     }
 
     fn pipe(interactive: bool) -> Request {
@@ -338,7 +338,7 @@ mod tests {
         let services = [Vec::new(), vec!["psql".to_string()]].map(|argv| Mode::Service { name: "db".into(), argv });
         for mode in sessions.into_iter().chain([pipe(false).mode, pipe(true).mode]).chain(services) {
             let h = pty::parse_header(header(&Request { mode: mode.clone(), ..req(None) })).unwrap();
-            assert_eq!(h, pty::Header { root: "/w/fleet/hub/cfg".into(), instance: "web-1".into(), mode });
+            assert_eq!(h, pty::Header { root: "/w/fleet/control_plane/cfg".into(), instance: "web-1".into(), mode });
         }
         // The login shell is `create` without an argv.
         let Record::Call(c) = header(&req(Some(Vec::new()))) else { panic!() };
@@ -408,7 +408,7 @@ mod tests {
     /// the rest in turn). Returns what was written, how it ended, and what
     /// the worker read.
     fn run(then: Option<Option<Record>>, typed: &[u8], sizes: Vec<Option<(u16, u16)>>) -> (String, End, Vec<Record>) {
-        let (hub, w) = UnixStream::pair().unwrap();
+        let (control_plane, w) = UnixStream::pair().unwrap();
         let worker = worker(w, then);
         let (keys, input) = UnixStream::pair().unwrap();
         let sizes = Mutex::new(sizes);
@@ -427,7 +427,7 @@ mod tests {
         });
         let mut err = Vec::new();
         let term = Terminal { input: Some(input.as_raw_fd()), output: &mut out, errors: &mut err, size: &size };
-        let end = attach(hub, &header(&req(Some(Vec::new()))), term);
+        let end = attach(control_plane, &header(&req(Some(Vec::new()))), term);
         typist.join().unwrap();
         (String::from_utf8(out).unwrap(), end, worker.join().unwrap())
     }
@@ -490,7 +490,7 @@ mod tests {
     /// pair's end holding `abc` then closed: stdout, stderr, the end, and
     /// what the worker read after the header.
     fn pipe_run(interactive: bool, end: Option<Record>) -> (String, String, End, Vec<Record>) {
-        let (hub, w) = UnixStream::pair().unwrap();
+        let (control_plane, w) = UnixStream::pair().unwrap();
         let worker = pipe_worker(w, end);
         let (keys, input) = UnixStream::pair().unwrap();
         (&keys).write_all(b"abc").unwrap();
@@ -498,7 +498,7 @@ mod tests {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let r = pipe(interactive);
         let term = Terminal { input: interactive.then_some(input.as_raw_fd()), output: &mut out, errors: &mut err, size: &|| None };
-        let end = attach(hub, &header(&r), term);
+        let end = attach(control_plane, &header(&r), term);
         let mut seen = worker.join().unwrap();
         assert!(matches!(seen.remove(0), Record::Call(c) if c.params.obj("pipe").is_some()));
         (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap(), end, seen)
@@ -539,11 +539,11 @@ mod tests {
 
     #[test]
     fn a_closed_stdout_ends_a_pipe_as_sigpipe() {
-        let (hub, w) = UnixStream::pair().unwrap();
+        let (control_plane, w) = UnixStream::pair().unwrap();
         let worker = pipe_worker(w, Some(Record::Exit(Exit::Code(0))));
         let (mut out, mut err) = (Closed, Vec::new());
         let r = pipe(false);
-        let end = attach(hub, &header(&r), Terminal { input: None, output: &mut out, errors: &mut err, size: &|| None });
+        let end = attach(control_plane, &header(&r), Terminal { input: None, output: &mut out, errors: &mut err, size: &|| None });
         let _ = worker.join();
         assert_eq!(end, End::Exit(Exit::Signal(libc::SIGPIPE)));
         assert_eq!(exit_of(&end, true), (128 + libc::SIGPIPE, None), "quiet, like a local exec");

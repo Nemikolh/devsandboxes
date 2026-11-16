@@ -328,7 +328,7 @@ pub fn resolver(
 
 /// How a [`resolver`] reads `state.toml` on each call: the instances it may
 /// route through. A fleet worker's `TUNNEL` passes only the instances its
-/// hub may reach (`serve::fleet::tunnel::scoped`).
+/// control plane may reach (`serve::fleet::tunnel::scoped`).
 #[cfg(unix)]
 pub type LoadState = std::sync::Arc<dyn Fn() -> Result<State, String> + Send + Sync>;
 

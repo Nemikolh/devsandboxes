@@ -56,13 +56,13 @@ for Instances when the last machine goes. Each keeps its own selected row.
   ([inbox-tab.md](inbox-tab.md)).
 - **Machines**: one row per machine, in the snapshot's `machines` order
   (`SnapshotMachine`, `ui.rs` `draw_machines`; on a fleet member those
-  seen through the hub last): NAME (then `exposed via <dialer>` in
+  seen through the control plane last): NAME (then `exposed via <dialer>` in
   yellow while it's `worker` and exposed through another machine,
   `ui.rs` `machine_name_text`;
   [../daemon/fleet.md](../daemon/fleet.md#exposure)), TARGET (dimmed `inbound` for an
-  inbound one, `via <hub>` for a routed one, seen through the hub), STATE
+  inbound one, `via <control-plane>` for a routed one, seen through the control plane), STATE
   (`LinkState::as_str`, with `: <error>` when set), AGENT
-  (`on`/`off`, `-` for an inbound one or one via the hub), VERSION (`-` before a link) and
+  (`on`/`off`, `-` for an inbound one or one via the control plane), VERSION (`-` before a link) and
   CAPACITY (`ui.rs` `capacity_text`: `capacity::summary`, e.g. `8 cpu ·
   12/32G · 120G free · 3 run`, then `over cap: mem 18G/16G` in yellow
   when `capacity::over_caps` finds a soft cap exceeded), from the

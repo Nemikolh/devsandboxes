@@ -105,8 +105,8 @@ client then starts its own, which waits for the lock. Equal or older
 clients proceed, but for a **forced** hello (`HelloParams::force`), which
 hands off whatever its version: honored only on a local (`Full`)
 connection whose peer runs as the daemon's uid
-(`endpoint::peer_is_own_user`), never on a fleet hub's `Worker` one. A
-fleet worker sends it after installing its hub's version, older or newer
+(`endpoint::peer_is_own_user`), never on a fleet control plane's `Worker` one. A
+fleet worker sends it after installing its control plane's version, older or newer
 ([fleet](fleet.md#versions),
 [ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
 
@@ -135,7 +135,7 @@ The daemon exits `IDLE_TIMEOUT` (10 min) after its last holder left
   through its `fleet-link`'s `links.inbound` connection (`clients`). `--keep-alive` or `[serve] keep-alive = true` in
 `daemon.config.toml` (read once at start; a bad file is logged, defaults
 used) disables the idle exit, as does being a
-[fleet hub](fleet.md#hub-mode) (`hub = "self"` in `member.toml`, asked
+[fleet control plane](fleet.md#control-plane-mode) (`control_plane = "self"` in `member.toml`, asked
 at each pass of the loop).
 
 ## Drain

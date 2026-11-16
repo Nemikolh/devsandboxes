@@ -1,6 +1,6 @@
 //! The published link graph (docs/architecture/daemon/fleet.md, *Link
 //! graph*; fleet plan step 10b.2, decision 59): this host's own report built
-//! from its links ([`Tracker`], pure), signed and sent to the hub
+//! from its links ([`Tracker`], pure), signed and sent to the control plane
 //! (`fleet.report`); every member's exchanges of the reports it holds
 //! (`fleet.graph`): on a link coming up, and a flood of each change to
 //! its linked peers ([`Flood`]), all on one `serve-fleet-graph` thread
@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::serve::api::{ApiError, parse};
 use crate::serve::fleet::graph::{self, Graph, LinkReport, Report};
 use crate::serve::fleet::identity::Statement;
-use crate::serve::fleet::member::{self, Hub};
+use crate::serve::fleet::member::{self, ControlPlane};
 use crate::serve::fleet::membership::Stored;
 use crate::serve::fleet::{grants, membership_api, proof};
 use crate::serve::machines::MachineKind;
@@ -52,7 +52,7 @@ pub struct Reports {
     pub reports: Vec<Signed>,
 }
 
-/// `fleet.report`'s answer: whether the hub's graph took it as new.
+/// `fleet.report`'s answer: whether the control plane's graph took it as new.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Took {
     pub changed: bool,
@@ -122,7 +122,7 @@ impl Tracker {
         up
     }
 
-    /// A report due at `at`, whatever was pending (the hub link came up).
+    /// A report due at `at`, whatever was pending (the control-plane link came up).
     pub fn now(&mut self, at: Instant) {
         self.due = Some(at);
     }
@@ -324,10 +324,10 @@ fn to_value(x: impl Serialize) -> Result<Value, ApiError> {
     serde_json::to_value(x).map_err(|e| ApiError::internal(e.into()))
 }
 
-/// `fleet.report {statement, report}` on the hub, from link peer `from`
+/// `fleet.report {statement, report}` on the control plane, from link peer `from`
 /// (admitted, `lent::admit_fleet`): its own report only, taken into the
-/// hub's graph (`invalid` saying why when refused, an older one included);
-/// a change is sent on to the hub's other linked peers ([`Flood`]).
+/// control plane's graph (`invalid` saying why when refused, an older one included);
+/// a change is sent on to the control plane's other linked peers ([`Flood`]).
 pub fn report_call(params: Value, from: &str, published: &Published, stored: &Stored, me: &str, log: fn(&str)) -> Result<Value, ApiError> {
     let s: Signed = parse(params)?;
     if s.report.member != from {
@@ -370,9 +370,9 @@ pub struct Io {
     pub member: PathBuf,
     pub hostname: String,
     pub links: Handle,
-    /// This host's hub, as the daemon keeps it (`Shared::hub`).
-    pub hub: Arc<dyn Fn() -> Hub + Send + Sync>,
-    /// Whether this daemon stays up: a keep-alive daemon or the hub, which
+    /// This host's control plane, as the daemon keeps it (`Shared::control_plane`).
+    pub control_plane: Arc<dyn Fn() -> ControlPlane + Send + Sync>,
+    /// Whether this daemon stays up: a keep-alive daemon or the control plane, which
     /// never idles out.
     pub always_on: Arc<dyn Fn() -> bool + Send + Sync>,
     pub log: fn(&str),
@@ -443,10 +443,10 @@ fn run(p: &Published, io: &Io) {
             st = p.cv.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner()).0;
             continue;
         }
-        let hub = (io.hub)();
+        let control_plane = (io.control_plane)();
         if std::mem::take(&mut st.dirty) {
             let came_up = st.tracker.observe(&links_of(&io.links.remotes().all()), at, now_ms());
-            if let Hub::Other(h) = &hub
+            if let ControlPlane::Other(h) = &control_plane
                 && came_up.contains(h)
             {
                 st.tracker.now(at);
@@ -459,7 +459,7 @@ fn run(p: &Published, io: &Io) {
         drop(st);
         if let Some(own) = own(io) {
             if report {
-                publish_own(p, io, &own, &hub);
+                publish_own(p, io, &own, &control_plane);
             }
             for peer in &exchange {
                 exchange_with(p, io, &own, peer);
@@ -477,9 +477,9 @@ fn run(p: &Published, io: &Io) {
 }
 
 /// This host's report signed, taken into its own graph, and sent to its
-/// hub while that link is up; when it changed the graph, flooded to every
+/// control plane while that link is up; when it changed the graph, flooded to every
 /// linked peer too ([`Flood`]).
-fn publish_own(p: &Published, io: &Io, own: &Own, hub: &Hub) {
+fn publish_own(p: &Published, io: &Io, own: &Own, control_plane: &ControlPlane) {
     let Some(genesis) = own.stored.log.membership().map(|m| m.genesis) else { return };
     let file = member::load(&io.member).ok().flatten().unwrap_or_default();
     let agent = grants::granted_names(&file.agent, &own.stored).into_iter().collect();
@@ -500,16 +500,16 @@ fn publish_own(p: &Published, io: &Io, own: &Own, hub: &Hub) {
     for why in refused {
         (io.log)(&format!("this host's own link report: refused: {why}"));
     }
-    let Hub::Other(hub) = hub else { return };
-    if !up(io, hub) {
+    let ControlPlane::Other(control_plane) = control_plane else { return };
+    if !up(io, control_plane) {
         return;
     }
     let params = match serde_json::to_value(&signed) {
         Ok(v) => v,
         Err(e) => return (io.log)(&format!("cannot encode this host's link report: {e}")),
     };
-    if let Err(e) = crate::serve::machines::leave::call_on(&io.links, hub, "fleet.report", params) {
-        (io.log)(&format!("link report to the hub {hub}: {e}"));
+    if let Err(e) = crate::serve::machines::leave::call_on(&io.links, control_plane, "fleet.report", params) {
+        (io.log)(&format!("link report to the control plane {control_plane}: {e}"));
     }
 }
 
@@ -568,7 +568,7 @@ mod tests {
         // Nothing moved: nothing due.
         assert!(t.observe(&[link("box", true, LinkState::Connected)], t0 + DEBOUNCE, 3).is_empty());
         assert_eq!(t.due(), None);
-        // Sent now (the hub link came up), whatever was pending.
+        // Sent now (the control-plane link came up), whatever was pending.
         t.observe(&[link("box", true, LinkState::Unreachable)], t0 + DEBOUNCE, 4);
         t.now(t0);
         assert!(t.take_due(t0));
@@ -607,7 +607,7 @@ mod tests {
         assert!(st.tracker.take_due(at));
     }
 
-    /// `lap` (1) the authority, `box` (2) the hub, `pi` (3).
+    /// `lap` (1) the authority, `box` (2) the control plane, `pi` (3).
     fn stored() -> Stored {
         let k = |n: u8| SigningKey::from_seed([n; 32]);
         test_support::fleet("lap", &k(1), "box", &[("box", k(2).public_key()), ("pi", k(3).public_key())])
@@ -656,18 +656,18 @@ mod tests {
     }
 
     /// A [`Pair`](crate::serve::fleet::dialer::tests::Pair): L (`lap`, the
-    /// authority) dials K (`box`, the hub). L's report reaches K
+    /// authority) dials K (`box`, the control plane). L's report reaches K
     /// (`fleet.report`), K's reaches L (K's push, or L's exchange on its link
     /// coming up), each saying who dials.
     #[test]
-    fn a_members_report_reaches_the_hub_and_the_hubs_reaches_the_member() {
+    fn a_members_report_reaches_the_control_plane_and_the_control_planes_reaches_the_member() {
         use crate::serve::fleet::dialer::tests::{Pair, connect, wait_for};
         use serde_json::json;
         let pair = Pair::build("reports-pair", Vec::new(), |_| {}, |_| {}, |k, l| {
             test_support::fleet_of("box", &[("lap", l), ("box", k)]);
-            for (toml, hub) in [(k, "self"), (l, "box")] {
+            for (toml, control_plane) in [(k, "self"), (l, "box")] {
                 let mut m = member::load(toml).unwrap().unwrap();
-                m.hub = hub.into();
+                m.control_plane = control_plane.into();
                 member::write_for_test(toml, &m);
             }
         });
@@ -684,7 +684,7 @@ mod tests {
         let on_k = get(&pair.k_dir);
         assert_eq!(link(&on_k, "lap", "box").unwrap()["dials"], json!(true));
         let always_on = |g: &Value, member: &str| g["reports"].as_array().unwrap().iter().find(|r| r["report"]["member"] == member).unwrap()["report"]["always_on"].clone();
-        assert_eq!((always_on(&on_l, "box"), always_on(&on_k, "lap")), (json!(true), json!(false)), "the hub never idles out");
+        assert_eq!((always_on(&on_l, "box"), always_on(&on_k, "lap")), (json!(true), json!(false)), "the control plane never idles out");
 
         // A trust change on L reaches K's graph with no link change.
         let trust = |g: &Value, member: &str| {

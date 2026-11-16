@@ -69,7 +69,7 @@ arrives on reader threads and only shows on the next draw.
   the container's index, a global one's first user; a global service no
   instance uses gets no tab); the machine derives the container itself.
   It isn't a session: no `Redial`, it just ends. A machine seen only
-  through the fleet's hub (its `via`, kind `routed`) gets the same tabs:
+  through the fleet's control plane (its `via`, kind `routed`) gets the same tabs:
   the CLI's `PTY` dial goes over a route (`fleet::route::connect`).
 
 ## Remote tabs reconnect
