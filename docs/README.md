@@ -22,7 +22,8 @@ User-facing docs live in `site/` (and the config reference in
 | `reference/` | exhaustive specs | true now; same commit as the code |
 | `decisions/` | decisions that still hold (ADRs) | append-only; a new ADR supersedes an old one |
 | `status.md` | in progress, planned, parked, known limitations | the only place for state |
-| `plans/active/` | work not done yet | one per topic; leaves once shipped |
+| `plans/explore/` | ideas being explored, direction not agreed | one per topic; moves to `active/` once agreed, deleted if dropped |
+| `plans/active/` | work agreed, not done yet | one per topic; leaves once shipped |
 | `plans/archive/` | shipped plans kept for history | may be wrong; skip unless asked about history; deleted once outdated |
 
 ## Map
@@ -64,4 +65,5 @@ User-facing docs live in `site/` (and the config reference in
   [inbox tab](architecture/dashboard/inbox-tab.md),
   [snapshot and json](architecture/dashboard/snapshot-and-json.md)
 - **Reference**: [daemon API](reference/api.md),
-  [`devsandbox inbox` CLI](reference/inbox-cli.md)
+  [`devsandbox inbox` CLI](reference/inbox-cli.md),
+  [Kubernetes concepts](reference/kubernetes.md)

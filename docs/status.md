@@ -8,7 +8,7 @@ limitation means editing this file in the same commit.
 - A **limitation** is a fact about today's code (verified, with a symbol
   to check). Its fix idea, if any, rides on the same line.
 - A **parked** item is a feature nobody is building. **Planned** has a plan
-  in `plans/active/`.
+  in `plans/active/`; a parked one may have an idea in `plans/explore/`.
 
 ## In progress
 
@@ -24,8 +24,22 @@ is frozen: no new work on it.
 
 - **helper**: `exec` sessions after fleet step 1: surfacing detached
   sessions beyond the procs-fetched rows (not through the Inbox), a policy
-  for sessions nobody reattaches to (`devsbd/src/sessions.rs`).
+  for sessions nobody reattaches to (`devsbd/src/sessions.rs`); link
+  terminals of a non-root helper as sessions (step 5).
   → [plan](plans/active/resumable-exec.md)
+- **machines**: the authority no longer a single point of failure: a
+  recovery key made at genesis, a scoped, expiring delegation to the
+  control plane (`members`, `configs`); then machine → node.
+  → [plan](plans/active/control-plane.md)
+- **machines**: fleet-wide `global` services: one container per signed
+  root's service, reached from any member over the links.
+  → [plan](plans/active/mesh-services.md)
+- **machines**: peer links over mutual TLS instead of ssh (ssh kept for
+  `machine add`'s install and first contact); routed streams on inner
+  TLS. → [plan](plans/active/mtls-links.md)
+- **runtimes**: `isolation = "gvisor"` on a sandbox or template (runsc on
+  docker/podman, refused where the host can't), Kata after.
+  → [plan](plans/active/isolation.md)
 
 - **helper**: daemon-owned runs (registry, run-state events, a `queued`
   state) with a restart policy, worktree stand-ins, container → host
@@ -134,13 +148,17 @@ is frozen: no new work on it.
   scaffolding.
 - **runtimes**: GPUs (`hostRequirements.gpu`, `--gpus` / CDI) as a backend
   capability. → [plan](plans/active/gpus.md)
-- **runtimes**: isolation levels per sandbox (gVisor `runsc`, Kata),
-  refused when the host can't satisfy them. → [plan](plans/active/isolation.md)
-- **runtimes**: sandbawks (Kubernetes, gVisor, memory checkpoints) as a
-  backend or a fleet member. → [plan](plans/active/sandbawks-runtime.md)
+- **runtimes**: an E2B-compatible API served by devsandbox, and
+  E2B-compatible clusters (sandbawks) as a backend or fleet member.
+  → [explore](plans/explore/e2b-api.md)
+- **machines**: k3s-style join tokens as an alternative to ssh first
+  contact. → [explore](plans/explore/join-tokens.md)
+- **machines**: how resilient fleet state should be (single writer,
+  opt-in Raft among always-on members, gossip for observed state).
+  → [explore](plans/explore/mesh-state.md)
 - **instances**: ideas from sandbawks: process checkpoints, idle pause,
   warm pools, clone, egress policy, not-ready signals for agents.
-  → [plan](plans/active/sandbawks-ideas.md)
+  → [explore](plans/explore/sandbawks-ideas.md)
 - **instances**: `.worktreeinclude.local`, `**`/`[...]` in `worktree-link`,
   read-only store mounts, an unlink/restore command, shared files served by
   `devsbd` from tmpfs.
@@ -351,7 +369,8 @@ is frozen: no new work on it.
   remote verb (every CLI verb): there is no spool to adopt it by.
   → [machines](architecture/daemon/machines.md); `machines::forward::verb`
 - Daemon-side ssh (each machine's link, `machine add`'s probe) is
-  `BatchMode=yes`: passphrase-prompting keys fail.
+  `BatchMode=yes`: passphrase-prompting keys fail; links over mTLS are
+  [planned](plans/active/mtls-links.md).
   → [machines](architecture/daemon/machines.md#ssh); `fleet::transport::Transport::ssh`, `ssh::probe_argv`
 - A CLI re-run reports its terminal's agent once (`machines.get
   {agent}`): a daemon that hands over while the ssh session runs leaves
@@ -428,10 +447,11 @@ is frozen: no new work on it.
   is back. Right after a move a link can drop twice (both ends cycle
   it: the authority after its push, the other end after its answer), so
   a call made then may fail once. Only the authority signs a move, so a
-  hub that is down can be replaced only while the authority is up; a
-  fleet made without `--hub` has them on one machine, and with it down
-  the role can't move (fleet plan step 18).
-  → [fleet](architecture/daemon/fleet.md#hub-mode); `machines::changes::follow`, `leave::After::Hub`
+  control plane that is down can be replaced only while the authority is up; a
+  fleet made without `--control-plane` has them on one machine, and with it down
+  the role can't move (fleet plan step 18); a delegation is
+  [planned](plans/active/control-plane.md).
+  → [fleet](architecture/daemon/fleet.md#control-plane-mode); `machines::changes::follow`, `leave::After::ControlPlane`
 - A grant for an inbound or routed machine takes effect there once this
   host's link report reaches it (pushed by the control plane or flooded by the
   links), then within a probe; while the report lists it, that machine
@@ -488,7 +508,8 @@ is frozen: no new work on it.
   `containerUser`), and service terminals there are a plain `exec -it`
   under a host pty on the machine: not resumable, a dropped link ends
   them (it kills the runtime's exec client; the in-container process
-  may run on, as before resumable exec). → [fleet](architecture/daemon/fleet.md#pty); `fleet::pty::decide`, `fleet::pty::run_tty`
+  may run on, as before resumable exec); a non-root helper's are
+  [planned](plans/active/resumable-exec.md) as sessions. → [fleet](architecture/daemon/fleet.md#pty); `fleet::pty::decide`, `fleet::pty::run_tty`
 - The dashboard opens no terminal in a machine's global service that no
   instance there uses ("no instance on `m` uses service `s`"): a `PTY`
   service dial names the instance whose service it opens, and `exec

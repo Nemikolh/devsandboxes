@@ -260,8 +260,9 @@ Start with `docs/README.md` (reading order and map) and
   `docs/status.md` (the only place for in progress / planned / parked /
   known limitations) when it adds, fixes or parks something. Decisions
   that still hold are ADRs in `decisions/` (a new one supersedes, old ones
-  aren't rewritten). Plans live in `plans/active/<topic>.md`; once shipped,
-  their content moves into the living docs and the plan goes to
+  aren't rewritten). Ideas not agreed yet live in
+  `plans/explore/<topic>.md` and move to `plans/active/<topic>.md` once
+  agreed (deleted if dropped); once shipped, an active plan's content moves into the living docs and the plan goes to
   `plans/archive/` (banner on top), deleted once outdated. Skip
   `plans/archive/` unless asked about history. Names are topics, no
   `plan-` prefix or `-plan` suffix. `docs_links` (`tests/docs_links.rs`)
