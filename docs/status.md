@@ -12,9 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- The dashboard groups sandboxes by config root (a signed mesh root's
-  name across hosts) instead of per machine:
-  [mesh-root-groups](plans/active/mesh-root-groups.md).
+Nothing.
 
 ## Planned
 
@@ -814,6 +812,9 @@ is frozen: no new work on it.
 - Service terminal tabs run `<runtime> exec -i -t` directly, not
   `devsandbox exec` (two terminal paths). `TERM=xterm-256color` reaches
   only the host-side child. → [terminal](architecture/dashboard/terminal.md); `term_argv`
+- The Instances tree doesn't show a group's config root: two roots
+  defining one sandbox name are two groups that look alike.
+  → [tabs](architecture/dashboard/tabs-and-actions.md); `tui::data::GroupKey`
 - Kitty keyboard emulation implements only "disambiguate".
   → [terminal](architecture/dashboard/terminal.md); `kitty::DISAMBIGUATE`
 - OSC 52 is the only clipboard path: copies are cut at 1 MiB, and terminal

@@ -1,3 +1,6 @@
+> Archived 2026-11-16. Historical, may be wrong; do not use as a reference.
+> Current: [decisions/0052-rows-name-their-signed-config-root.md](../../decisions/0052-rows-name-their-signed-config-root.md), [architecture/dashboard/tabs-and-actions.md](../../architecture/dashboard/tabs-and-actions.md)
+
 # Mesh root groups
 
 The dashboard's Instances tree groups by (machine, sandbox name), so a
