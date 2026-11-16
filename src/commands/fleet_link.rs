@@ -885,7 +885,7 @@ mod tests {
         let elsewhere = format!("{semver} zzz dev other/os control_plane");
         assert!(matches!(follows(ours, &elsewhere, true), Decision::Stop(why) if why.contains("can't run on")));
         // No control plane, or this end is it: nothing to follow.
-        assert_eq!(follows(ours, &published.replace(" control plane", " member"), false), Decision::Same);
+        assert_eq!(follows(ours, &published.replace(" control_plane", " member"), false), Decision::Same);
         assert_eq!(follows(update::hello_of(true, None), &published, false), Decision::Same);
         assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", false), Decision::Same, "a hello without the flag says no control plane");
     }
