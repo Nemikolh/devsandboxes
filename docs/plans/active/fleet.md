@@ -291,6 +291,10 @@ its callers: the plan keeps the seam, the git implementation is v1.
 
 ### Versions
 
+Replaced by [authority sets the fleet's version](authority-sets-fleet-version.md):
+the authority pins the build, members follow the pin. What follows is
+the current, control-plane-led scheme.
+
 Every member runs the control plane's exact build, and updates itself: it learns
 the control plane's version from the link hellos, and when it differs fetches that
 version, installs it and lets its own version handoff restart its daemon
@@ -1098,6 +1102,7 @@ step 12 does.
     the end that isn't the control plane follows a control-plane peer, whichever end dialed
     (an ssh machine of a control plane self-updates too; a dev build only with
     `dev-builds` or `full`); two non-control-planes need a protocol match.
+    Superseded by [authority sets the fleet's version](authority-sets-fleet-version.md).
 26. `lend.toml` goes with lending (step 8); `[serve] control_plane` stays the control plane
     flag until step 9 puts `control_plane` in `member.toml`.
 27. A link `API` stream carries no relay sentinel: inside a mux stream
