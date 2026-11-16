@@ -479,7 +479,7 @@ has it stripped and goes to that machine, but for the ones served here:
 
 `instances.watch {dir, machines: true}` (the dashboard always sends it)
 gets every push merged with each machine's rows (`snapshots::merge`): rows
-gain `machine` and keep their remote `root`, and a top-level `machines`
+gain `machine` and keep their remote `root` and `mesh_root`, and a top-level `machines`
 array carries each machine's `name`, `kind` (`ssh` |
 `inbound` | `routed`, fleet plan decisions 29, 60), `target` (`null` for an inbound one), `state`,
 `error`, `version`, `command`,
@@ -488,6 +488,15 @@ array carries each machine's `name`, `kind` (`ssh` |
 `exposed_by` ([exposure](fleet.md#exposure)). A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
+
+A row's `mesh_root` is the name the membership log signs its config root
+under, so one signed root's rows are recognizable across hosts whatever
+their paths. Only the host that makes a row knows its bindings and
+copies, so each host tags its own (`api::InstancesList::of`, behind both
+`instances.list` and its `instances.snapshot` pushes; `tag_mesh_roots`
+over `fleet::mesh::root_id`: the authority's `mesh/roots.toml` binding
+for the root, else the member's copy the root is exactly); `merge`
+passes it through. An unsigned root's rows have none.
 
 On a fleet member, `merge` also lifts the control plane's `Machine::fleet` view:
 each machine it lists becomes an entry of its own after the direct ones,

@@ -70,6 +70,7 @@ mod tests {
             profile_disallowed: false,
             phase: None,
             root: None,
+            mesh_root: None,
             machine: None,
         }
     }

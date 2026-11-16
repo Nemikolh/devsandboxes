@@ -398,6 +398,7 @@ mod tests {
             profile_disallowed: false,
             phase: None,
             root: None,
+            mesh_root: None,
             machine: None,
         };
         let snap = Snapshot {
@@ -419,6 +420,7 @@ mod tests {
                 worktree_branch: None,
                 profiles: Vec::new(),
                 root: None,
+                mesh_root: None,
                 machine: None,
             }],
             services: Vec::new(),
@@ -521,6 +523,7 @@ mod tests {
             profile_disallowed: false,
             phase: None,
             root: None,
+            mesh_root: None,
             machine: None,
         };
         app.set_snapshot(Snapshot {
@@ -539,6 +542,7 @@ mod tests {
                 worktree_branch: None,
                 profiles: Vec::new(),
                 root: None,
+                mesh_root: None,
                 machine: None,
             }],
             services: Vec::new(),

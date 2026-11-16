@@ -58,6 +58,8 @@ export interface InstanceRow {
   phase?: PhaseRow;
   /** The config root it was made from; `null` for instances older than that record. */
   root: string | null;
+  /** The name the membership log signs `root` under (the authority's binding, or a member's exact copy), set by the row's own host; absent for an unsigned root. @experimental */
+  mesh_root?: string;
   /** The machine it's on, in a federated snapshot (`instances.watch` with `machines`); absent for this host's. @experimental */
   machine?: string;
 }
@@ -85,6 +87,8 @@ export interface SandboxRow {
   profiles?: string[];
   /** The config root it was read from. */
   root: string | null;
+  /** As {@link InstanceRow.mesh_root}. @experimental */
+  mesh_root?: string;
   /** As {@link InstanceRow.machine}. @experimental */
   machine?: string;
 }
@@ -115,6 +119,8 @@ export interface ServiceRow {
   drift: boolean;
   /** The config root it was read from. */
   root: string | null;
+  /** As {@link InstanceRow.mesh_root}. @experimental */
+  mesh_root?: string;
   /** As {@link InstanceRow.machine}. @experimental */
   machine?: string;
 }

@@ -59,6 +59,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
             profile_disallowed: false,
             phase: None,
             root: None,
+            mesh_root: None,
             machine: None,
         })
         .collect();
@@ -76,6 +77,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
         worktree_branch: None,
         profiles: Vec::new(),
         root: None,
+        mesh_root: None,
         machine: None,
     }];
     Snapshot {
@@ -179,6 +181,7 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         profile_disallowed: false,
         phase: None,
         root: None,
+        mesh_root: None,
         machine: None,
     }];
     Snapshot {
@@ -294,6 +297,7 @@ pub(super) fn service_snapshot(containers: Vec<(String, ContainerStatus)>) -> Sn
             config_hash: "hash".into(),
             drift: false,
             root: None,
+            mesh_root: None,
             machine: None,
         }],
         sandbox_count: 0,

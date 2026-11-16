@@ -566,13 +566,35 @@ fn instances_list_with(
 impl InstancesList {
     /// `snapshot` plus `thread_children` from `state`: what `instances.list`
     /// answers and `instances.snapshot` pushes.
-    pub(crate) fn of(snapshot: crate::snapshot::Snapshot, state: &Path) -> Self {
+    /// Every row's `mesh_root` is set here, on the host that made it
+    /// ([`tag_mesh_roots`] over the data dir next to `state`).
+    pub(crate) fn of(mut snapshot: crate::snapshot::Snapshot, state: &Path) -> Self {
         // An unreadable state resolves no child, like the dashboard's own
         // collection; the snapshot's `error` already says why.
         let thread_children = crate::state::State::load_at(state)
             .map(|s| crate::commands::dispatch::thread_children(&s))
             .unwrap_or_default();
+        let data = state.parent().unwrap_or(Path::new("."));
+        // Bindings that don't load name no root: the rows stay unsigned.
+        let bindings = crate::serve::fleet::mesh::load_roots(&crate::serve::fleet::mesh::roots_path(data)).unwrap_or_default();
+        tag_mesh_roots(&mut snapshot, &bindings, data);
         InstancesList { snapshot, thread_children }
+    }
+}
+
+/// Sets each instance, sandbox and service row's `mesh_root` from its
+/// `root` (`fleet::mesh::root_id` over the authority's `bindings` and the
+/// copies under data dir `data`); a row with no `root` has none.
+fn tag_mesh_roots(snapshot: &mut crate::snapshot::Snapshot, bindings: &std::collections::BTreeMap<String, PathBuf>, data: &Path) {
+    let id = |root: &Option<String>| root.as_deref().and_then(|r| crate::serve::fleet::mesh::root_id(bindings, data, Path::new(r)));
+    for row in &mut snapshot.instances {
+        row.mesh_root = id(&row.root);
+    }
+    for row in &mut snapshot.sandboxes {
+        row.mesh_root = id(&row.root);
+    }
+    for row in &mut snapshot.services {
+        row.mesh_root = id(&row.root);
     }
 }
 
@@ -1857,6 +1879,54 @@ mod tests {
             error: None,
             no_runtime: false,
         }
+    }
+
+    #[test]
+    fn rows_are_tagged_with_their_signed_root() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-api-mesh-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        let bound = dir.join("cfg");
+        let copy = crate::serve::fleet::mesh::tree_path(&data, "lent");
+        let other = dir.join("other");
+        for d in [&bound, &copy.join("sub"), &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            crate::serve::fleet::mesh::roots_path(&data),
+            format!("cfg = {:?}\n", std::fs::canonicalize(&bound).unwrap().display().to_string()),
+        )
+        .unwrap();
+        let roots = [Some(bound.clone()), Some(copy.clone()), Some(copy.join("sub")), Some(other), None];
+        let text = |r: &Option<PathBuf>| r.as_ref().map(|r| r.display().to_string());
+        let mut snapshot = empty_snapshot();
+        snapshot.instances = roots
+            .iter()
+            .map(|r| crate::snapshot::InstanceRow { root: text(r), ..crate::serve::snapshots::tests::row("i", true, None) })
+            .collect();
+        let sandbox = |r: &Option<PathBuf>| -> crate::snapshot::SandboxRow {
+            serde_json::from_value(json!({"name": "s", "source": "?", "services": [], "extends": [], "config_hash": "",
+                "build_hash": "", "issues": [], "dispatcher": false, "root": text(r)}))
+            .unwrap()
+        };
+        let service = |r: &Option<PathBuf>| -> crate::snapshot::ServiceRow {
+            serde_json::from_value(json!({"name": "db", "scope": "global", "source": "?", "ports": [], "containers": [],
+                "used_by": [], "env_len": 0, "config_hash": "", "drift": false, "root": text(r)}))
+            .unwrap()
+        };
+        snapshot.sandboxes = roots.iter().map(sandbox).collect();
+        snapshot.services = roots.iter().map(service).collect();
+        let list = InstancesList::of(snapshot, &data.join("state.toml"));
+
+        let want = [Some("cfg"), Some("lent"), None, None, None].map(|n| n.map(str::to_string));
+        assert_eq!(list.snapshot.instances.iter().map(|r| r.mesh_root.clone()).collect::<Vec<_>>(), want);
+        assert_eq!(list.snapshot.sandboxes.iter().map(|r| r.mesh_root.clone()).collect::<Vec<_>>(), want);
+        assert_eq!(list.snapshot.services.iter().map(|r| r.mesh_root.clone()).collect::<Vec<_>>(), want);
+        // On the wire it's there when set, absent otherwise.
+        let v = serde_json::to_value(&list).unwrap();
+        assert_eq!(v["sandboxes"][0]["mesh_root"], json!("cfg"));
+        assert!(v["sandboxes"][2].get("mesh_root").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

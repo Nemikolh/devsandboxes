@@ -129,6 +129,13 @@ pub struct InstanceRow {
     /// de-duplicated by it (docs/architecture/daemon/machines.md, *Federated snapshots*).
     #[serde(default)]
     pub root: Option<String>,
+    /// The name the membership log signs `root` under (the authority's
+    /// binding, or a member's exact copy: `serve::fleet::mesh::root_id`,
+    /// docs/decisions/0049-the-authority-signs-a-config-every-member-runs.md);
+    /// set by the row's own host (`serve::api::InstancesList::of`), `None`
+    /// for an unsigned root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_root: Option<String>,
     /// The machine it's on: set only in a federated snapshot
     /// (`instances.watch {machines: true}`), absent for this host's rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +196,9 @@ pub struct SandboxRow {
     /// federated snapshot's rows say which of a machine's roots they're in.
     #[serde(default)]
     pub root: Option<String>,
+    /// As [`InstanceRow::mesh_root`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_root: Option<String>,
     /// As [`InstanceRow::machine`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
@@ -235,6 +245,9 @@ pub struct ServiceRow {
     /// As [`SandboxRow::root`].
     #[serde(default)]
     pub root: Option<String>,
+    /// As [`InstanceRow::mesh_root`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_root: Option<String>,
     /// As [`InstanceRow::machine`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
@@ -464,6 +477,7 @@ fn build_service_rows(
                 config_hash,
                 drift,
                 root: None,
+                mesh_root: None,
                 machine: None,
             }
         })
@@ -648,6 +662,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config, acked: &BTreeSet<String>) -> (V
                     worktree_branch: rs.properties.worktree_branch.clone(),
                     profiles,
                     root: Some(root.clone()),
+                    mesh_root: None,
                     machine: None,
                 });
             }
@@ -667,6 +682,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config, acked: &BTreeSet<String>) -> (V
                     worktree_branch: None,
                     profiles: Vec::new(),
                     root: Some(root.clone()),
+                    mesh_root: None,
                     machine: None,
                 });
             }
@@ -1049,6 +1065,7 @@ fn instance_row(
         profile_disallowed,
         phase,
         root: inst.config_dir.as_ref().map(|d| d.display().to_string()),
+        mesh_root: None,
         machine: None,
     }
 }

@@ -497,6 +497,7 @@ pub(crate) mod tests {
             config_hash: String::new(),
             drift: false,
             root: None,
+            mesh_root: None,
             machine: Some("lap".into()),
         }
     }

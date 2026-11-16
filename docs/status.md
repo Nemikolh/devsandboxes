@@ -12,7 +12,9 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- The dashboard groups sandboxes by config root (a signed mesh root's
+  name across hosts) instead of per machine:
+  [mesh-root-groups](plans/active/mesh-root-groups.md).
 
 ## Planned
 

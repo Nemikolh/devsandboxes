@@ -328,6 +328,7 @@ mod tests {
             profile_disallowed: false,
             phase: None,
             root: None,
+            mesh_root: None,
             machine: None,
         }
     }
@@ -349,6 +350,7 @@ mod tests {
             config_hash: String::new(),
             drift: false,
             root: None,
+            mesh_root: None,
             machine: None,
         }
     }
@@ -471,6 +473,7 @@ mod tests {
             worktree_branch: None,
             profiles: Vec::new(),
             root: None,
+            mesh_root: None,
             machine: None,
         }
     }

@@ -371,6 +371,16 @@ row carries `profiles`, the profiles its instances may be in, in
 preference order (absent when the config declares none or the sandbox
 doesn't resolve).
 
+Every instance, sandbox and service row carries `root`, the config root
+it's from (`null` for an instance older than that record), and
+`mesh_root`, the name the membership log signs that root under
+([ADR 0049](../decisions/0049-the-authority-signs-a-config-every-member-runs.md)):
+on the authority the name `mesh/roots.toml` binds to it, on a member the
+signed copy the root is exactly (`fleet::mesh::root_id`). Absent for an
+unsigned root, and in `status --json` (the daemon tags rows,
+`InstancesList::of`). A federated snapshot's rows also carry `machine`
+(*Federated snapshots*).
+
 `thread_children` maps each dispatcher's `instance_id` to its children by
 thread key, `{"<owner id>": {"<key>": "<instance name>"}}`: the child a
 thread's `child` key names, as the control ops resolve it (a key ambiguous

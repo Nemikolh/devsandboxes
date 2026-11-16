@@ -2067,7 +2067,9 @@ it never signs on a remote request alone (decision 49;
   forwarded, the local root bound to that path's last component
   (`daemon::sign_remote_config` over `changes::bound_root`); a name with
   no binding signs nothing. Nothing is bundled off the authority or in
-  no fleet. On a member that isn't the authority, a local root with a
+  no fleet. Snapshot rows carry the name as `mesh_root` (`mesh::root_id`:
+  the binding, else the copy the root is exactly;
+  [machines](machines.md#federated-snapshots)). On a member that isn't the authority, a local root with a
   config file is `ConfigSigned::NotAuthority` unless it is a signed
   config's copy here (`mesh::copy_of`, the copy itself;
   `changes::sign_config`), and so is any verb aimed at a machine, bound

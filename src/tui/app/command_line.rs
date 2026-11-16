@@ -1089,6 +1089,7 @@ mod tests {
             worktree_branch: worktree_branch.map(String::from),
             profiles: Vec::new(),
             root: None,
+            mesh_root: None,
             machine: None,
         }
     }

@@ -3186,6 +3186,7 @@ mod tests {
                 profile_disallowed: false,
                 phase,
                 root: None,
+                mesh_root: None,
                 machine: None,
             })
             .collect();
@@ -3203,6 +3204,7 @@ mod tests {
             worktree_branch: None,
             profiles: Vec::new(),
             root: None,
+            mesh_root: None,
             machine: None,
         };
         let mut app = App::new(PathBuf::from("/tmp"));

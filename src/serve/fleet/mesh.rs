@@ -398,6 +398,22 @@ pub fn copy_of(data: &Path, root: &Path) -> Option<(String, bool)> {
     Some((name, parts.next().is_none()))
 }
 
+/// The name the membership log signs config root `root` under, here: the
+/// binding (`bindings`, [`load_roots`]) whose path is `root`
+/// (canonicalized, as [`bind`] stores them; as given when it doesn't
+/// resolve), else the copy under data dir `data` that `root` is exactly
+/// ([`copy_of`]). `None` for an unsigned root, and for a dir inside a copy.
+pub fn root_id(bindings: &BTreeMap<String, PathBuf>, data: &Path, root: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Some((name, _)) = bindings.iter().find(|(_, path)| **path == canonical) {
+        return Some(name.clone());
+    }
+    match copy_of(data, root) {
+        Some((name, true)) => Some(name),
+        _ => None,
+    }
+}
+
 /// Whether `root` (canonicalized) is data dir `data`'s `mesh/` or under
 /// it: where the signed copies live, so never a config root of its own.
 fn in_mesh(data: &Path, root: &Path) -> bool {
@@ -1413,6 +1429,27 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         verify(&data, "cfg", head).unwrap();
         write(&tree, "devsandboxes.yaml", "sandbox: {}\n");
         assert_eq!(err(head), changed, "a second config file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_root_id_is_its_binding_or_its_exact_copy() {
+        let base = scratch("root-id");
+        let data = base.join("data");
+        let bound = base.join("cfg");
+        std::fs::create_dir_all(&bound).unwrap();
+        std::fs::create_dir_all(tree_path(&data, "lent").join("mcps")).unwrap();
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let bindings = BTreeMap::from([("cfg".to_string(), std::fs::canonicalize(&bound).unwrap())]);
+
+        assert_eq!(root_id(&bindings, &data, &bound), Some("cfg".to_string()));
+        assert_eq!(root_id(&bindings, &data, &bound.join("../cfg")), Some("cfg".to_string()), "canonicalized");
+        assert_eq!(root_id(&bindings, &data, &tree_path(&data, "lent")), Some("lent".to_string()));
+        assert_eq!(root_id(&bindings, &data, &tree_path(&data, "lent").join("mcps")), None, "inside a copy");
+        assert_eq!(root_id(&bindings, &data, &other), None);
+        let gone = BTreeMap::from([("gone".to_string(), base.join("gone"))]);
+        assert_eq!(root_id(&gone, &data, &base.join("gone")), Some("gone".to_string()), "as given when it doesn't resolve");
         let _ = std::fs::remove_dir_all(&base);
     }
 
