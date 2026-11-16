@@ -217,17 +217,37 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
 ///
 /// Returns `(top, detail, Some(terms))` when `!app.terms.is_empty()`: the bottom
 /// section is 50% of the content area, split `[Detail 30%, terminal Min(0)]`.
-/// Returns `(top, detail, None)` otherwise: today's `Length(9)` full-width
-/// Detail, no terminal panel.
+/// Returns `(top, detail, None)` otherwise: a [`DETAIL_HEIGHT`] full-width
+/// Detail (the Instances tab grows it to fit, [`fit_detail`]), no terminal
+/// panel.
 fn content_areas(app: &App, area: Rect) -> (Rect, Rect, Option<Rect>) {
     if app.terms.is_empty() {
         let [top, detail] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(9)]).areas(area);
+            Layout::vertical([Constraint::Min(0), Constraint::Length(DETAIL_HEIGHT)]).areas(area);
         (top, detail, None)
     } else {
         let (top, detail, terms) = open_bottom_split(area);
         (top, detail, Some(terms))
     }
+}
+
+/// The full-width Detail panel's height (borders included) when no terminal
+/// is open: [`fit_detail`] only ever grows it.
+const DETAIL_HEIGHT: u16 = 9;
+
+/// Grow a full-width Detail panel (`terms` closed) upward into `top` until
+/// its `lines` all show, so a late line (drift) is never clipped; never
+/// below [`DETAIL_HEIGHT`], and `top` keeps at least one row. With a
+/// terminal open the panel is half the content area and stays as laid out.
+fn fit_detail(top: Rect, detail: Rect, terms: Option<Rect>, lines: usize) -> (Rect, Rect) {
+    if terms.is_some() {
+        return (top, detail);
+    }
+    let all = top.union(detail);
+    let want = u16::try_from(lines).unwrap_or(u16::MAX).saturating_add(2).max(DETAIL_HEIGHT);
+    let height = want.min(all.height.saturating_sub(1)).max(detail.height);
+    let [top, detail] = Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(all);
+    (top, detail)
 }
 
 /// The terminals-open split of a content area: `(top, detail, terminal panel)`.
@@ -1774,14 +1794,13 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let nodes = app.visible_nodes();
 
     let (top, detail_area, terms_area) = content_areas(app, area);
-    // Optional status lines reserved above the table, carved out of the top part
-    // (never the bottom) so the terminal panel geometry is snapshot-independent.
-    let table_area = draw_status_lines(frame, snapshot, top);
-
     // Terminal focused ⇒ the terminal panel is the accented one; dim the rest.
     let panel_focused = app.focus == Focus::Terminal;
 
     if nodes.is_empty() {
+        // Optional status lines reserved above the table, carved out of the top part
+        // (never the bottom) so the terminal panel geometry is snapshot-independent.
+        let table_area = draw_status_lines(frame, snapshot, top);
         // No snapshot yet means the first one is still on its way (or the
         // daemon can't be reached: say why), not that the config is empty.
         let message = match (snapshot, &app.snapshot_error) {
@@ -1790,12 +1809,11 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             (None, None) => "loading…".to_string(),
         };
         draw_empty(frame, table_area, panel_focused, &message);
-        draw_detail(frame, snapshot, None, None, None, &app.machines, detail_area, panel_focused);
+        draw_detail(frame, Vec::new(), detail_area, panel_focused);
         selectable(app, RegionId::InstancesTree, table_area);
         selectable(app, RegionId::Detail, detail_area);
     } else {
         let snapshot = snapshot.expect("non-empty nodes imply a snapshot");
-        draw_tree(frame, app, snapshot, &nodes, table_area, panel_focused);
         let selected = nodes.get(app.selected()).copied();
         // Agent count for the selected instance (or a proc row's parent), read
         // from the proc cache; `None` until its forest is fetched.
@@ -1811,16 +1829,12 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             }
             _ => None,
         };
-        draw_detail(
-            frame,
-            Some(snapshot),
-            selected,
-            agent_count,
-            sessions,
-            &app.machines,
-            detail_area,
-            panel_focused,
-        );
+        let lines = detail_lines(Some(snapshot), selected, agent_count, sessions, &app.machines);
+        let (top, detail_area) = fit_detail(top, detail_area, terms_area, lines.len());
+        // Status lines come out of the top part only (as above).
+        let table_area = draw_status_lines(frame, Some(snapshot), top);
+        draw_tree(frame, app, snapshot, &nodes, table_area, panel_focused);
+        draw_detail(frame, lines, detail_area, panel_focused);
         selectable(app, RegionId::InstancesTree, table_area);
         selectable(app, RegionId::Detail, detail_area);
     }
@@ -2217,25 +2231,18 @@ fn status_style(status: &ContainerStatus) -> Style {
     }
 }
 
-/// Detail panel for the selected tree node: sandbox summary for sandbox / empty
-/// nodes, the existing instance detail for instances, and a hint for the orphan
-/// group. Empty when nothing is selected.
-fn draw_detail(
-    frame: &mut Frame,
-    snapshot: Option<&Snapshot>,
+/// The Detail panel's lines for the selected tree node: sandbox summary for
+/// sandbox / empty nodes, the existing instance detail for instances, and a
+/// hint for the orphan group. Empty when nothing is selected. Built before the
+/// layout so the panel can be sized to them ([`fit_detail`]).
+fn detail_lines<'a>(
+    snapshot: Option<&'a Snapshot>,
     node: Option<Node>,
     agent_count: Option<usize>,
     sessions: Option<crate::runtime::procs::SessionCount>,
     machines: &[crate::serve::snapshots::SnapshotMachine],
-    area: Rect,
-    term_focused: bool,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(dash_border_style(term_focused))
-        .title("Detail");
-
-    let lines: Vec<Line> = match (snapshot, node) {
+) -> Vec<Line<'a>> {
+    match (snapshot, node) {
         (Some(s), Some(Node::Sandbox(i))) | (Some(s), Some(Node::Empty(i))) => {
             match s.sandboxes.get(i) {
                 Some(sb) => sandbox_detail(s, i, sb),
@@ -2256,8 +2263,14 @@ fn draw_detail(
             Style::default().add_modifier(Modifier::DIM),
         ))],
         _ => Vec::new(),
-    };
+    }
+}
 
+fn draw_detail(frame: &mut Frame, lines: Vec<Line>, area: Rect, term_focused: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(term_focused))
+        .title("Detail");
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -3258,6 +3271,34 @@ mod tests {
         let mut stopped = r.clone();
         stopped.status = ContainerStatus::Missing;
         assert!(sessions_line(&stopped, Some(SessionCount::default())).is_none());
+    }
+
+    /// The Detail panel grows to its lines: a running instance with sessions,
+    /// a profile and drift shows them all, drift (the last line) included.
+    #[test]
+    fn detail_grows_so_drift_is_never_clipped() {
+        use crate::runtime::procs::SessionCount;
+        let mut app = phase_app(vec![("web", running(), None)]);
+        let mut s = app.snapshot.clone().unwrap();
+        s.instances[0].profile = Some("work".into());
+        s.instances[0].drift = true;
+        app.set_snapshot(s);
+        let rows = ProcState::Rows { rows: Vec::new(), signalable: true, sessions: Some(SessionCount::default()) };
+        app.procs.insert("web".into(), rows);
+        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `web`
+        let screen = render(&app, 140, 30);
+        assert!(screen.contains("base folder: /f"), "{screen}");
+        assert!(screen.contains("drift: config or dockerfile changed"), "{screen}");
+
+        // A short row keeps the usual height: the tree doesn't move.
+        let (top, detail) = (Rect::new(0, 0, 80, 21), Rect::new(0, 21, 80, DETAIL_HEIGHT));
+        assert_eq!(fit_detail(top, detail, None, 3), (top, detail));
+        let (top2, detail2) = fit_detail(top, detail, None, 9);
+        assert_eq!((top2.height, detail2.height), (19, 11));
+        let (_, tiny) = fit_detail(Rect::new(0, 0, 80, 0), Rect::new(0, 0, 80, 9), None, 40);
+        assert_eq!(tiny.height, 9, "never below the usual height");
+        let terms = Some(Rect::new(40, 15, 40, 15));
+        assert_eq!(fit_detail(top, detail, terms, 40), (top, detail), "a terminal open: as laid out");
     }
 
     /// A profile follows the name in the tree (dim, yellow when no longer
