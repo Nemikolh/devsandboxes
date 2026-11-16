@@ -816,7 +816,7 @@ pub(crate) mod tests {
     fn a_call_with_input_sends_stdin_resize_and_eof() {
         let (c, fake) = client(4);
         fake.add("c5", caps::RPC, 1, respond);
-        let (mut call, mut input) = c.call_with_input("c5", "cat", no(), no(), "hub", &|| false).unwrap();
+        let (mut call, mut input) = c.call_with_input("c5", "cat", no(), no(), "control_plane", &|| false).unwrap();
         let big = vec![b'x'; rpc::MAX_RECORD as usize + 10];
         let writer = std::thread::spawn(move || {
             input.stdin(b"hi").unwrap();
@@ -836,13 +836,13 @@ pub(crate) mod tests {
         assert_eq!(sizes, [rpc::MAX_RECORD as usize, 10], "chunked at MAX_RECORD");
         assert_eq!(recs[4..], [Record::Exit(Exit::Code(0))]);
         drop((input, call));
-        assert!(logged("helper c5: cat from hub: exit 0 ("));
+        assert!(logged("helper c5: cat from control_plane: exit 0 ("));
 
-        let (mut call, input) = c.call_with_input("c5", "cat", no(), no(), "hub", &|| false).unwrap();
+        let (mut call, input) = c.call_with_input("c5", "cat", no(), no(), "control_plane", &|| false).unwrap();
         drop(input);
         assert_eq!(call.next().unwrap(), Some(Record::Exit(Exit::Code(1))), "dropped: Eof");
         // Plain calls still send none: `cat` sees the Eof at once.
-        let mut call = c.call("c5", "cat", no(), no(), "hub", &|| false).unwrap();
+        let mut call = c.call("c5", "cat", no(), no(), "control_plane", &|| false).unwrap();
         assert_eq!(call.next().unwrap(), Some(Record::Exit(Exit::Code(1))));
     }
 

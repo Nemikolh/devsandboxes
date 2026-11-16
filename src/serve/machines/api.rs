@@ -20,7 +20,7 @@
 //! every check first, then the machine's `member.set {name}` and its
 //! membership (`membership.adopt`, or `membership.sign` of this host),
 //! this host's registry entry, and this host's membership, whose adopt
-//! writes its `hub`; on the authority, from a local client, this host's
+//! writes its `control_plane`; on the authority, from a local client, this host's
 //! configs signed (`changes::sign_configs`, ADR 0050) before the links
 //! reload; then the proposal of whichever end's introduction
 //! the add made, the machine's over the still-open probe
@@ -44,7 +44,7 @@ use super::{Entry, MachineKind, check_name};
 use crate::serve::api::{ApiError, parse};
 use crate::serve::capacity::Capacity;
 use crate::serve::fleet::identity::{PublicKey, Signer};
-use crate::serve::fleet::member::{self, Hub, MemberInfo};
+use crate::serve::fleet::member::{self, ControlPlane, MemberInfo};
 use crate::serve::fleet::membership::{Introduction, Stored, Wire};
 use crate::serve::fleet::proposals::Change;
 use crate::serve::fleet::membership_api::{self, MembershipInfo};
@@ -72,8 +72,8 @@ pub struct Ctx {
     /// `add` refuses their names.
     pub inbound: Arc<Neighbors>,
     /// This host's `member.toml` (the daemon's): `add` reads its name and
-    /// hub, its key (`member.key`) and membership log (`membership.json`)
-    /// beside it, and adopts the log the add makes, which writes `hub`.
+    /// control plane, its key (`member.key`) and membership log (`membership.json`)
+    /// beside it, and adopts the log the add makes, which writes `control_plane`.
     /// `None` without a data dir (`add` refuses).
     pub member: Option<PathBuf>,
     /// What names this host when `member.toml` doesn't.
@@ -81,10 +81,10 @@ pub struct Ctx {
     /// The home `~/.devsandboxes` is found in: one of the config roots an
     /// `add` on the authority signs (`changes::add_roots`).
     pub home: Option<PathBuf>,
-    /// `add` (an adopted log) or a leave wrote this host's `hub`: the
+    /// `add` (an adopted log) or a leave wrote this host's `control_plane`: the
     /// daemon follows it as after a `membership.adopt`
-    /// (`daemon::Shared::set_hub`).
-    pub hub_changed: Box<dyn Fn(Hub) + Send + Sync>,
+    /// (`daemon::Shared::set_control_plane`).
+    pub control_plane_changed: Box<dyn Fn(ControlPlane) + Send + Sync>,
     /// This host's next key was promoted (a rotate of it stored): every
     /// link it's on ends and redials proving the new key
     /// (`daemon::Shared::key_rotated`).
@@ -174,7 +174,7 @@ pub struct Added {
 /// link's live state (`error` the last failure while `unreachable`;
 /// `version` from the last hello). Or a routed machine (`kind` `routed`,
 /// fleet plan decision 60; `snapshots::Routed`): no `target` or `command`,
-/// `roots`, `version` and `capacity` as the hub's view has them,
+/// `roots`, `version` and `capacity` as the control plane's view has them,
 /// `via` the first hop its streams take, `state` `connected` while this
 /// host's link graph has a path to it starting with a link up here.
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,13 +200,13 @@ pub struct MachineRow {
     /// plan decision 51).
     #[serde(default)]
     pub introduced_by: Option<String>,
-    /// A routed machine's first hop (or the hub whose view lists it);
+    /// A routed machine's first hop (or the control plane whose view lists it);
     /// `None` for a machine this host links to.
     #[serde(default)]
     pub via: Option<String>,
     /// While it's `worker` and exposed through another machine, as this
     /// host's link graph says (`fleet::graph::exposed_workers`): the chain
-    /// from the hub, its last but one dialing it. `None` otherwise.
+    /// from the control plane, its last but one dialing it. `None` otherwise.
     #[serde(default)]
     pub exposed_by: Option<Vec<String>>,
 }
@@ -240,8 +240,8 @@ struct AddParams {
     target: String,
     #[serde(default)]
     name: Option<String>,
-    /// `--hub`: the machine is to be the hub (`join::plan`).
-    hub: bool,
+    /// `--control-plane`: the machine is to be the control plane (`join::plan`).
+    control_plane: bool,
     /// The machine's member key as the user confirmed it (its fingerprint,
     /// from `machines.probe`): the add is refused if the machine's differs.
     key: PublicKey,
@@ -264,7 +264,7 @@ fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
     if let Some(name) = &p.name {
         check_free(ctx, name, true)?;
     }
-    let (this_name, this_hub) = own_member(ctx)?;
+    let (this_name, this_control_plane) = own_member(ctx)?;
     let member_toml = ctx.member.as_deref().expect("own_member checked it");
 
     // No name yet: until the machine says its own, errors say the target.
@@ -282,12 +282,12 @@ fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
     let target_rows: Vec<MachineRow> = remote_call(&mut link, &p.target, "machines.list", Value::Null)?;
     let target_known: Vec<String> = target_rows.into_iter().map(|r| r.name).collect();
     let this_known: Vec<String> = machines(ctx)?.into_iter().map(|e| e.name).collect();
-    let target_hub = Hub::of(target.hub.as_deref().unwrap_or_default());
+    let target_control_plane = ControlPlane::of(target.control_plane.as_deref().unwrap_or_default());
     let plan = join::plan(
-        &join::This { name: &this_name, hub: &this_hub, known: &this_known },
-        &join::Target { label: &p.target, name: target.name.as_deref(), hub: &target_hub, known: &target_known },
+        &join::This { name: &this_name, control_plane: &this_control_plane, known: &this_known },
+        &join::Target { label: &p.target, name: target.name.as_deref(), control_plane: &target_control_plane, known: &target_known },
         p.name.as_deref(),
-        p.hub,
+        p.control_plane,
     )?;
     check_free(ctx, &plan.name, plan.target_set.is_some())?;
 
@@ -351,13 +351,13 @@ fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
     });
     saved.map_err(ApiError::internal).and_then(|r| r).map_err(|e| after(e, &written))?;
     written.push(format!("this host's machines.toml (`{}`)", entry.name));
-    // Its `hub` (and the name the fleet knows it by) from the log.
+    // Its `control_plane` (and the name the fleet knows it by) from the log.
     let taken = membership_api::adopt(member_toml, &ctx.hostname, &here).map_err(|e| after(e, &written))?;
-    let hub = taken.hub;
+    let control_plane = taken.control_plane;
     if taken.rotated {
         (ctx.key_rotated)();
     }
-    (ctx.hub_changed)(hub);
+    (ctx.control_plane_changed)(control_plane);
     // This host's configs, when it's the authority: signed now the log
     // exists here (at fleet creation, only since the adopt) and before the
     // reload, so the new entry isn't a push miss; its first link-up carries
@@ -431,14 +431,14 @@ fn introduced_there(here: &Stored, me: &str, key: &PublicKey) -> Option<String> 
     Some(m.authority.0.clone())
 }
 
-/// This host's member name and hub, from its `member.toml`.
-pub(super) fn own_member(ctx: &Ctx) -> Result<(String, Hub), ApiError> {
+/// This host's member name and control plane, from its `member.toml`.
+pub(super) fn own_member(ctx: &Ctx) -> Result<(String, ControlPlane), ApiError> {
     let Some(path) = &ctx.member else {
         return Err(ApiError::failed("this daemon has no member.toml (no data dir)"));
     };
     let own = member::load(path).map_err(ApiError::internal)?.unwrap_or_default();
     let name = own.name_or(&ctx.hostname).map_err(|e| ApiError::failed(format!("{e:#}")))?;
-    Ok((name, own.hub()))
+    Ok((name, own.control_plane()))
 }
 
 /// `name` is neither a registered machine's nor an inbound neighbor's.
@@ -553,7 +553,7 @@ pub struct MachineInfo {
     #[serde(default)]
     pub default_root: Option<PathBuf>,
     /// Its link has answered `roots.list` since this daemon started
-    /// (always for a routed machine: its roots are the hub's view's).
+    /// (always for a routed machine: its roots are the control plane's view's).
     #[serde(default)]
     pub listed: bool,
     /// As [`MachineRow::agent`].
@@ -568,7 +568,7 @@ struct GetParams {
 }
 
 /// One machine (registered, inbound or routed: a routed one's roots as
-/// the hub's view has them, no `target`), its roots what its link last
+/// the control plane's view has them, no `target`), its roots what its link last
 /// listed (`service::Handle::entries`), with their default. `agent` is the caller's `SSH_AUTH_SOCK`
 /// (absolute), reported to this daemon (`bridge::report_agent`), so the
 /// agent this host answers the machine's `AGENT` streams with
@@ -819,9 +819,9 @@ mod tests {
         assert_eq!(mesh::bound_root(base, ".devsandboxes").unwrap(), Some(dot.canonicalize().unwrap()));
     }
 
-    /// A member file naming its host `name`, in hub `hub` (`""`: none).
-    fn named(name: &str, hub: &str) -> Member {
-        Member { name: name.into(), hub: hub.into(), ..Default::default() }
+    /// A member file naming its host `name`, in control plane `control_plane` (`""`: none).
+    fn named(name: &str, control_plane: &str) -> Member {
+        Member { name: name.into(), control_plane: control_plane.into(), ..Default::default() }
     }
 
     /// `k`, a third member's key (the authority of the fleets the pair
@@ -996,9 +996,9 @@ mod tests {
         let (code, message) = err(&mut local, "machines.probe", json!({"target": "me@box"}));
         assert_eq!((code.as_str(), message.as_str()), ("failed", "me@box: ssh: Could not resolve hostname me@box"));
         let key = SigningKey::from_seed([2; 32]).public_key();
-        let (code, _) = err(&mut local, "machines.add", json!({"hub": false, "target": "me@box", "key": key}));
+        let (code, _) = err(&mut local, "machines.add", json!({"control_plane": false, "target": "me@box", "key": key}));
         assert_eq!(code, "failed");
-        let (code, _) = err(&mut local, "machines.add", json!({"hub": false, "target": "me@box"}));
+        let (code, _) = err(&mut local, "machines.add", json!({"control_plane": false, "target": "me@box"}));
         assert_eq!(code, "invalid", "`key` is mandatory");
         assert!(!base.join("machines.toml").exists(), "nothing saved");
         drop(local);
@@ -1010,7 +1010,7 @@ mod tests {
     fn add_joins_the_machine_then_saves() {
         let mut pair = Pair::new("mach-add", "0.6.0");
         let registry = pair.base.join("machines.toml");
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box", "command": " "}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box", "command": " "}));
         assert!(code == "invalid" && message.contains("`command`"), "{code}: {message}");
         assert!(!registry.exists(), "nothing saved");
 
@@ -1018,9 +1018,9 @@ mod tests {
         assert_eq!(pair.logs(), (None, None), "no log");
 
         // The default name is the machine's member name; no roots saved.
-        // Neither in a fleet: a fleet of two, this host the hub.
-        let r = pair.add(json!({"hub": false, "target": "me@box"}));
-        let fleet = json!({"hub": "lap", "joined": "new"});
+        // Neither in a fleet: a fleet of two, this host the control plane.
+        let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
+        let fleet = json!({"control_plane": "lap", "joined": "new"});
         assert_eq!(
             r,
             json!({"name": "box", "version": "0.6.0", "warning": null, "fleet": fleet, "proposed": null, "configs": []})
@@ -1028,24 +1028,24 @@ mod tests {
         assert_eq!(pair.registry(), vec![Entry::ssh("box", "me@box")]);
         assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
         // One log on both ends, signed here: `lap` the authority and the
-        // hub, `box` added by it.
+        // control plane, `box` added by it.
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!(here, there);
         let m = here.log.membership().unwrap();
-        assert_eq!((&m.authority, m.hub.as_str(), m.head.len), (&("lap".to_string(), pair.this_key().public_key()), "lap", 2));
+        assert_eq!((&m.authority, m.control_plane.as_str(), m.head.len), (&("lap".to_string(), pair.this_key().public_key()), "lap", 2));
         assert_eq!(m.key_of("box"), Some(pair.machine_key().public_key()));
         assert!(here.introductions.is_empty());
 
         // Taken: the machine is `box` in this fleet, whatever the target
         // or `--name` says.
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "ssh://box:2200"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "ssh://box:2200"}));
         assert_eq!((code.as_str(), message.as_str()), ("invalid", "a machine named `box` exists"));
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "ssh://box:2200", "name": "box2"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "ssh://box:2200", "name": "box2"}));
         assert_eq!(code, "invalid");
         assert_eq!(message, "ssh://box:2200 is in `lap`'s fleet as `box`: pass --name box, or no --name");
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "x", "name": "box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "x", "name": "box"}));
         assert_eq!((code.as_str(), message.as_str()), ("invalid", "a machine named `box` exists; pass --name"), "fast, before the ssh");
-        let (code, _) = pair.add_err(json!({"hub": false, "target": "x", "name": "a/b"}));
+        let (code, _) = pair.add_err(json!({"control_plane": false, "target": "x", "name": "a/b"}));
         assert_eq!(code, "invalid");
 
         // Unregistered (the fleet stays), added again: an extra link in the
@@ -1053,8 +1053,8 @@ mod tests {
         // the entry.
         assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
         let cmd = "~/.local/bin/devsandbox";
-        let r = pair.add(json!({"hub": false, "target": "ssh://box:2200", "name": "box", "agent": true, "command": cmd}));
-        assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "lap", "joined": "same"})));
+        let r = pair.add(json!({"control_plane": false, "target": "ssh://box:2200", "name": "box", "agent": true, "command": cmd}));
+        assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"control_plane": "lap", "joined": "same"})));
         // `agent`: granted by the confirmed key, in this host's member.toml.
         let grant = member::Grant { name: "box".into(), key: pair.machine_key().public_key() };
         assert_eq!((pair.this(), pair.machine()), (Member { agent: vec![grant], ..named("lap", "self") }, named("box", "lap")));
@@ -1093,54 +1093,54 @@ mod tests {
     }
 
     #[test]
-    fn add_hub_makes_the_machine_the_hub() {
-        let mut pair = Pair::new("mach-add-hub", "0.6.0");
-        // `hub` is mandatory.
+    fn add_control_plane_makes_the_machine_the_control_plane() {
+        let mut pair = Pair::new("mach-add-cp", "0.6.0");
+        // `control_plane` is mandatory.
         let (code, _) = pair.add_err(json!({"target": "me@box"}));
         assert_eq!(code, "invalid");
         assert!(!pair.base.join("machines.toml").exists(), "nothing saved");
         let dot = own_config(&pair.base);
-        let r = pair.add(json!({"hub": true, "target": "me@box"}));
-        assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "box", "joined": "new"})));
+        let r = pair.add(json!({"control_plane": true, "target": "me@box"}));
+        assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"control_plane": "box", "joined": "new"})));
         // The fleet's log exists here only since the adopt: signed after it.
         assert_eq!(r["configs"], json!(["note: signed config `.devsandboxes` v1"]));
         assert_signed(&pair.base, &dot, 1);
         assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
-        assert_eq!(ok(&mut pair.local, "member.get", Value::Null)["hub"], "box");
+        assert_eq!(ok(&mut pair.local, "member.get", Value::Null)["control_plane"], "box");
         // Decision 48: the laptop that made the fleet is its authority, the
-        // machine it added the hub.
+        // machine it added the control plane.
         // The machine's log is the one before the sign (its link-up brings
         // the config entry).
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!(&here.log.entries()[..2], there.log.entries());
         let m = here.log.membership().unwrap();
-        assert_eq!((m.authority.0.as_str(), m.hub.as_str(), m.members.len()), ("lap", "box", 2));
+        assert_eq!((m.authority.0.as_str(), m.control_plane.as_str(), m.members.len()), ("lap", "box", 2));
         pair.finish();
     }
 
     #[test]
-    fn add_hub_in_a_fleet_is_refused_unless_the_machine_is_its_hub() {
+    fn add_control_plane_in_a_fleet_is_refused_unless_the_machine_is_its_control_plane() {
         let (this, machine) = (named("lap", "self"), named("box", ""));
-        let mut pair = Pair::members("mach-add-hub-fleet", "0.6.0", this.clone(), machine.clone(), |_| {});
-        let (code, message) = pair.add_err(json!({"hub": true, "target": "me@box"}));
+        let mut pair = Pair::members("mach-add-cp-fleet", "0.6.0", this.clone(), machine.clone(), |_| {});
+        let (code, message) = pair.add_err(json!({"control_plane": true, "target": "me@box"}));
         assert_eq!(code, "denied");
-        assert!(message.starts_with("--hub: this host is in `lap`'s fleet and me@box isn't its hub"), "{message}");
+        assert!(message.starts_with("--control-plane: this host is in `lap`'s fleet and me@box isn't its control plane"), "{message}");
         assert_eq!((pair.this(), pair.machine()), (this, machine), "nothing written");
         assert!(!pair.base.join("machines.toml").exists(), "no entry");
         pair.finish();
-        // The machine is the hub already: this host joins, as without it.
-        let mut pair = Pair::fleets("mach-add-hub-is", named("lap", ""), named("box", "self"), |_, machine| {
+        // The machine is the control plane already: this host joins, as without it.
+        let mut pair = Pair::fleets("mach-add-cp-is", named("lap", ""), named("box", "self"), |_, machine| {
             test_support::write(machine, &fleet("box", &test_support::key_of(machine), "box", &[]));
         });
-        let r = pair.add(json!({"hub": true, "target": "me@box"}));
-        assert_eq!(r["fleet"], json!({"hub": "box", "joined": "this"}));
+        let r = pair.add(json!({"control_plane": true, "target": "me@box"}));
+        assert_eq!(r["fleet"], json!({"control_plane": "box", "joined": "this"}));
         assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
         pair.finish();
     }
 
     /// A member of `k`'s fleet (not its authority) adds a machine: it
     /// introduces it (signed here), and the machine takes the log and the
-    /// introduction, its hub `k` from the log. The introduction isn't
+    /// introduction, its control plane `k` from the log. The introduction isn't
     /// proposed to `k`, which this host has no link nor path to: the answer
     /// says why.
     #[test]
@@ -1148,9 +1148,9 @@ mod tests {
         let mut pair = Pair::fleets("mach-join-target", named("lap", "k"), named("box", ""), |this, _| {
             test_support::write(this, &fleet("k", &k_key(), "k", &[("lap", test_support::key_of(this).public_key())]));
         });
-        let r = pair.add(json!({"hub": false, "target": "me@box", "name": "b2"}));
-        assert_eq!((&r["name"], &r["fleet"]), (&json!("b2"), &json!({"hub": "k", "joined": "target"})));
-        assert_eq!(pair.machine(), named("b2", "k"), "renamed as it joined; its hub from the log");
+        let r = pair.add(json!({"control_plane": false, "target": "me@box", "name": "b2"}));
+        assert_eq!((&r["name"], &r["fleet"]), (&json!("b2"), &json!({"control_plane": "k", "joined": "target"})));
+        assert_eq!(pair.machine(), named("b2", "k"), "renamed as it joined; its control plane from the log");
         assert_eq!(pair.this(), named("lap", "k"), "this host unchanged");
         assert_eq!(pair.registry()[0].name, "b2");
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
@@ -1179,8 +1179,8 @@ mod tests {
             &pair.base.join("member.toml"),
             &Member { roots: vec![picked.clone(), dot.clone()], ..named("lap", "self") },
         );
-        let r = pair.add(json!({"hub": false, "target": "me@box"}));
-        assert_eq!(r["fleet"], json!({"hub": "lap", "joined": "target"}));
+        let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
+        assert_eq!(r["fleet"], json!({"control_plane": "lap", "joined": "target"}));
         assert_eq!(r["proposed"], Value::Null, "signed here: nothing to propose");
         assert_eq!(r["configs"], json!(["note: signed config `.devsandboxes` v1", "note: signed config `picked` v1"]));
         assert_signed(&pair.base, &dot, 1);
@@ -1197,8 +1197,8 @@ mod tests {
 
         // Added again (unlinked first), the roots unchanged: no new version.
         assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
-        let r = pair.add(json!({"hub": false, "target": "me@box"}));
-        assert_eq!(r["fleet"], json!({"hub": "lap", "joined": "same"}));
+        let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
+        assert_eq!(r["fleet"], json!({"control_plane": "lap", "joined": "same"}));
         assert_signed(&pair.base, &dot, 1);
         assert_eq!(pair.logs().0.unwrap().log, here.log, "nothing signed");
         pair.finish();
@@ -1212,7 +1212,7 @@ mod tests {
             test_support::write(this, &fleet("k", &k_key(), "lap", &[("lap", test_support::key_of(this).public_key())]));
         });
         own_config(&pair.base);
-        let r = pair.add(json!({"hub": false, "target": "me@box"}));
+        let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
         assert_eq!(r["configs"], json!([]));
         let (Some(here), _) = pair.logs() else { panic!("no log") };
         assert!(here.log.membership().unwrap().config.is_empty());
@@ -1228,7 +1228,7 @@ mod tests {
             test_support::write(this, &capped("lap", test_support::key_of(this).public_key()));
         });
         let before = pair.logs();
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
         assert!(code == "denied" && message.contains("capped"), "{code}: {message}");
         assert_eq!(pair.logs(), before, "nothing written");
         assert_eq!(pair.machine(), named("box", ""));
@@ -1236,18 +1236,18 @@ mod tests {
         pair.finish();
     }
 
-    /// The machine is the hub and authority: it signs this host's `add`
-    /// over the probe; this host takes the log, its hub from it.
+    /// The machine is the control plane and authority: it signs this host's `add`
+    /// over the probe; this host takes the log, its control plane from it.
     #[test]
     fn this_host_joins_the_machines_fleet() {
         let mut pair = Pair::fleets("mach-join-this", named("lap", ""), named("box", "self"), |_, machine| {
             test_support::write(machine, &fleet("box", &test_support::key_of(machine), "box", &[]));
         });
-        let r = pair.add(json!({"hub": false, "target": "me@box"}));
-        assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"hub": "box", "joined": "this"})));
+        let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
+        assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"control_plane": "box", "joined": "this"})));
         assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
         // Through the daemon's own path: `member.get` says it.
-        assert_eq!(ok(&mut pair.local, "member.get", Value::Null)["hub"], "box");
+        assert_eq!(ok(&mut pair.local, "member.get", Value::Null)["control_plane"], "box");
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!(here, there);
         let m = here.log.membership().unwrap();
@@ -1262,8 +1262,8 @@ mod tests {
         let mut pair = Pair::fleets("mach-join-intro", named("lap", ""), named("box", "k"), |_, machine| {
             test_support::write(machine, &fleet("k", &k_key(), "k", &[("box", test_support::key_of(machine).public_key())]));
         });
-        let r = pair.add(json!({"hub": false, "target": "me@box"}));
-        assert_eq!(r["fleet"], json!({"hub": "k", "joined": "this"}));
+        let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
+        assert_eq!(r["fleet"], json!({"control_plane": "k", "joined": "this"}));
         assert_eq!((pair.this(), pair.machine()), (named("lap", "k"), named("box", "k")));
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!(here, there);
@@ -1280,7 +1280,7 @@ mod tests {
             test_support::write(machine, &capped("box", test_support::key_of(machine).public_key()));
         });
         let before = pair.logs();
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
         assert!(code == "denied" && message.starts_with("box: ") && message.contains("capped"), "{code}: {message}");
         assert_eq!(pair.logs(), before, "nothing written");
         assert_eq!(pair.this(), named("lap", ""));
@@ -1293,7 +1293,7 @@ mod tests {
     fn another_key_is_refused() {
         let mut pair = Pair::new("mach-add-key", "0.6.0");
         let wrong = SigningKey::from_seed([9; 32]).public_key();
-        let params = json!({"hub": false, "target": "me@box", "key": wrong});
+        let params = json!({"control_plane": false, "target": "me@box", "key": wrong});
         let (code, message) = err(&mut pair.local, "machines.add", params);
         assert_eq!(code, "denied");
         let theirs = pair.machine_key().public_key().fingerprint();
@@ -1308,14 +1308,14 @@ mod tests {
     /// doesn't list the other end: refused before anything is written.
     #[test]
     fn an_extra_link_needs_one_fleet_both_known() {
-        // The same hub by name, another fleet by its log (made again).
+        // The same control plane by name, another fleet by its log (made again).
         let mut pair = Pair::fleets("mach-same-fork", named("lap", "self"), named("box", "lap"), |this, machine| {
             let (lap, box_key) = (test_support::key_of(this), test_support::key_of(machine).public_key());
             test_support::write(this, &fleet("lap", &lap, "lap", &[("box", box_key)]));
             test_support::write(machine, &fleet("lap", &lap, "lap", &[("box", box_key)]));
         });
         let before = pair.logs();
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
         assert!(code == "denied" && message.contains("another fleet"), "{code}: {message}");
         assert_eq!(pair.logs(), before);
         assert!(!pair.base.join("machines.toml").exists());
@@ -1328,7 +1328,7 @@ mod tests {
             test_support::write(this, &s);
             test_support::write(machine, &s);
         });
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
         assert!(code == "denied" && message.contains("doesn't list this host"), "{code}: {message}");
         assert!(!pair.base.join("machines.toml").exists());
         // Asked directly, the machine refuses that log too.
@@ -1341,7 +1341,7 @@ mod tests {
 
         // A fleet made before member keys: no logs.
         let mut pair = Pair::members("mach-same-nolog", "0.6.0", named("lap", "self"), named("box", "lap"), |_| {});
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
         assert!(code == "failed" && message.contains("no membership log"), "{code}: {message}");
         pair.finish();
     }
@@ -1358,18 +1358,18 @@ mod tests {
             test_support::write(this, &longer);
             test_support::write(machine, &s);
         });
-        let r = pair.add(json!({"hub": false, "target": "me@box"}));
-        assert_eq!(r["fleet"], json!({"hub": "lap", "joined": "same"}));
+        let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
+        assert_eq!(r["fleet"], json!({"control_plane": "lap", "joined": "same"}));
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!((here.log.head().len, there), (3, here.clone()));
         pair.finish();
     }
 
     #[test]
-    fn two_hubs_are_refused_and_nothing_written() {
+    fn two_control_planes_are_refused_and_nothing_written() {
         let (this, machine) = (named("lap", "self"), named("box", "k"));
-        let mut pair = Pair::members("mach-two-hubs", "0.6.0", this.clone(), machine.clone(), |_| {});
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+        let mut pair = Pair::members("mach-two-control planes", "0.6.0", this.clone(), machine.clone(), |_| {});
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
         assert_eq!(code, "denied");
         assert_eq!(message, "this host is in `lap`'s fleet, me@box in `k`'s: a machine is in one fleet only");
         assert_eq!((pair.this(), pair.machine()), (this, machine));
@@ -1379,13 +1379,13 @@ mod tests {
 
     #[test]
     fn a_name_already_in_the_fleet_is_refused() {
-        // The machine's name is this host's, or its hub's.
+        // The machine's name is this host's, or its control plane's.
         for (tag, this, machine, says) in [
             ("mach-name-this", named("lap", "self"), named("lap", ""), "me@box's member name `lap` is this host's too: pass --name"),
-            ("mach-name-hub", named("lap", "k"), named("k", ""), "`k` (me@box) is already a member of `k`'s fleet: pass --name"),
+            ("mach-name-cp", named("lap", "k"), named("k", ""), "`k` (me@box) is already a member of `k`'s fleet: pass --name"),
         ] {
             let mut pair = Pair::members(tag, "0.6.0", this.clone(), machine.clone(), |_| {});
-            let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+            let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
             assert_eq!((code.as_str(), message.as_str()), ("invalid", says));
             assert_eq!((pair.this(), pair.machine()), (this, machine), "nothing written");
             assert!(!pair.base.join("machines.toml").exists());
@@ -1395,7 +1395,7 @@ mod tests {
         let mut pair = Pair::members("mach-name-known", "0.6.0", named("lap", ""), named("box", "self"), |_| {});
         let theirs = Entry::ssh("lap", "me@other");
         crate::serve::machines::update(&pair.base.join("remote-machines.toml"), |e| e.push(theirs)).unwrap();
-        let (code, message) = pair.add_err(json!({"hub": false, "target": "me@box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
         assert_eq!(code, "invalid");
         assert!(message.starts_with("this host's member name `lap` is already in `box`'s fleet"), "{message}");
         assert_eq!(pair.this(), named("lap", ""), "nothing written");
@@ -1416,7 +1416,7 @@ mod tests {
         let cmd = "~/.local/bin/devsandbox";
         ok(&mut pair.local, "machines.probe", json!({"target": "me@box", "command": cmd}));
         ok(&mut pair.local, "machines.probe", json!({"target": "me@box"}));
-        pair.add(json!({"hub": false, "target": "me@box", "command": cmd}));
+        pair.add(json!({"control_plane": false, "target": "me@box", "command": cmd}));
         assert_eq!(*dialed.lock().unwrap(), [Some(cmd.to_string()), None, Some(cmd.to_string())]);
         pair.finish();
     }
@@ -1460,7 +1460,7 @@ mod tests {
     #[test]
     fn another_semver_is_a_warning() {
         let mut pair = Pair::new("mach-skew", "0.5.0");
-        let r = pair.add(json!({"hub": false, "target": "box"}));
+        let r = pair.add(json!({"control_plane": false, "target": "box"}));
         assert_eq!(r["warning"], "box runs devsandbox 0.5.0, this is 0.6.0");
         pair.finish();
     }
@@ -1471,7 +1471,7 @@ mod tests {
         let key = SigningKey::from_seed([1; 32]).public_key();
         let probed = Probed { version: "0.6.0".into(), protocol: 1, key, fingerprint: key.fingerprint() };
         assert_matches("MachineProbe", &to_value(probed).unwrap());
-        let fleet = Fleet { hub: "k".into(), joined: join::Joined::Target };
+        let fleet = Fleet { control_plane: "k".into(), joined: join::Joined::Target };
         let proposed = super::super::changes::Proposed { name: "m".into(), authority: "lap".into(), id: Some(1), error: None };
         let added = Added { name: "m".into(), version: "0.6.0".into(), warning: None, fleet, proposed: Some(proposed), configs: vec!["note: signed config `cfg` v1".into()] };
         let added = to_value(added).unwrap();
@@ -1511,7 +1511,7 @@ mod tests {
         assert_matches("FleetMissed", &to_value(missed.clone()).unwrap());
         let removed = Removed {
             name: "m".into(),
-            hub: "k".into(),
+            control_plane: "k".into(),
             leave: Heard::Unreachable,
             error: Some("down".into()),
             forgot: vec!["y".into()],
@@ -1532,7 +1532,7 @@ mod tests {
         assert_matches("MembershipApproved", &to_value(Approved { id: 2, signed }).unwrap());
         let proposed = Proposed { name: "m".into(), authority: "lap".into(), id: Some(2), error: None };
         assert_variant("MachineRmProposed", &to_value(RmAnswer::Proposed(proposed.clone())).unwrap());
-        let left = Left { name: "lap".into(), hub: "k".into(), removed: Some(removed), error: None, dropped: vec!["k".into()], proposed: Some(proposed) };
+        let left = Left { name: "lap".into(), control_plane: "k".into(), removed: Some(removed), error: None, dropped: vec!["k".into()], proposed: Some(proposed) };
         assert_variant("MachineRmLeft", &to_value(RmAnswer::Left(left)).unwrap());
         assert_eq!(union_members("MachineRmResult"), ["MachineRmRevoked", "MachineRmProposed", "MachineRmLeft"]);
         use crate::serve::fleet::proposals::{Change, Proposal};
@@ -1547,8 +1547,8 @@ mod tests {
         let old = SigningKey::from_seed([1; 32]);
         let by_old = crate::serve::fleet::membership::countersign_rotate(&g, "lap", &key, &old);
         assert_variant_kind("FleetChangeRotate", &to_value(Change::Rotate { name: "lap".into(), old: old.public_key(), new: key, by_old }).unwrap());
-        assert_variant_kind("FleetChangeHub", &to_value(Change::Hub { name: "lap".into() }).unwrap());
-        assert_eq!(union_members("FleetChange"), ["FleetChangeAdd", "FleetChangeRevoke", "FleetChangeRotate", "FleetChangeHub"]);
+        assert_variant_kind("FleetChangeControlPlane", &to_value(Change::ControlPlane { name: "lap".into() }).unwrap());
+        assert_eq!(union_members("FleetChange"), ["FleetChangeAdd", "FleetChangeRevoke", "FleetChangeRotate", "FleetChangeControlPlane"]);
         use super::super::changes::{RotateProposed, Rotated, Rotation};
         let signed = Signed { name: "lap".into(), change: "rotate `lap`'s key".into(), pushed: vec![], unpushed: vec![], removed: None, error: None };
         let rotated = Rotation::Rotated(Rotated { key, fingerprint: key.fingerprint(), signed });
@@ -1560,14 +1560,14 @@ mod tests {
             assert_eq!(serde_json::from_value::<Rotation>(to_value(&r).unwrap()).unwrap(), r, "round trip");
         }
         assert_eq!(union_members("MembershipRotateResult"), ["MembershipRotated", "MembershipRotateProposed"]);
-        use super::super::changes::HubMove;
-        let signed = Signed { name: "lap".into(), change: "hub `lap`".into(), pushed: vec!["box".into()], unpushed: vec![], removed: None, error: None };
+        use super::super::changes::ControlPlaneMove;
+        let signed = Signed { name: "lap".into(), change: "control plane `lap`".into(), pushed: vec!["box".into()], unpushed: vec![], removed: None, error: None };
         let proposed = Proposed { name: "box".into(), authority: "lap".into(), id: Some(4), error: None };
-        for (r, iface) in [(HubMove::Signed(signed), "MembershipHubSigned"), (HubMove::Proposed(proposed), "MembershipHubProposed")] {
+        for (r, iface) in [(ControlPlaneMove::Signed(signed), "MembershipControlPlaneSigned"), (ControlPlaneMove::Proposed(proposed), "MembershipControlPlaneProposed")] {
             assert_variant(iface, &to_value(&r).unwrap());
-            assert_eq!(serde_json::from_value::<HubMove>(to_value(&r).unwrap()).unwrap(), r, "round trip");
+            assert_eq!(serde_json::from_value::<ControlPlaneMove>(to_value(&r).unwrap()).unwrap(), r, "round trip");
         }
-        assert_eq!(union_members("MembershipHubResult"), ["MembershipHubSigned", "MembershipHubProposed"]);
+        assert_eq!(union_members("MembershipControlPlaneResult"), ["MembershipControlPlaneSigned", "MembershipControlPlaneProposed"]);
         let synced = super::super::changes::Synced { changed: true, head: s.log.head(), install_error: None };
         assert_matches("FleetSynced", &to_value(synced).unwrap());
         let synced = super::super::changes::Synced { changed: false, head: s.log.head(), install_error: Some("config `cfg` v1: x".into()) };
@@ -1595,7 +1595,7 @@ mod tests {
             ("membership.approve", "MembershipApproved"),
             ("membership.deny", "OkResult"),
             ("membership.rotate", "MembershipRotateResult"),
-            ("membership.hub", "MembershipHubResult"),
+            ("membership.controlPlane", "MembershipControlPlaneResult"),
             ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
         ] {

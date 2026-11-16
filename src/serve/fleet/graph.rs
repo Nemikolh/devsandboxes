@@ -2,7 +2,7 @@
 //! fleet plan step 10b, decisions 55, 59), pure: each member's signed
 //! [`Report`] of its links, a [`Graph`] holding the latest verified one per
 //! member, [`Graph::paths`], the routes from one member to another in
-//! the order a requester tries them, and [`exposure`], whom the hub's
+//! the order a requester tries them, and [`exposure`], whom the control plane's
 //! shells and `full` members put beyond `worker`'s protection (*Trust*,
 //! *Exposure*).
 //!
@@ -314,15 +314,15 @@ impl Graph {
 
 /// Who controls whom beyond `worker`'s reach (fleet plan, *What `worker`
 /// protects*; step 10b.8), pure: every exposed member of `stored`'s log or
-/// held introductions, by name, with its chain from the hub. The hub is
-/// exposed (chain `[hub]`); so is each member an exposed one dials (it has
+/// held introductions, by name, with its chain from the control plane. The control plane is
+/// exposed (chain `[control_plane]`); so is each member an exposed one dials (it has
 /// a shell there, over ssh: a dialed link is a standing credential, up or
 /// not), and each `full` member (by its report) an exposed one reaches
 /// over links in any state within [`MAX_HOPS`] (a `full` member gives its
 /// whole API to any caller), to a fixed point. A chain is the steps, each
 /// member dialing or reaching the next (`["box", "lap"]`: box dials lap):
 /// the fewest steps, ties to the smallest chain by name. Empty outside a
-/// fleet's log or before its hub is added.
+/// fleet's log or before its control plane is added.
 // The daemon asks [`exposed_workers`] (this host's trust its own); this is
 // the plain fixed point it's built on.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -334,16 +334,16 @@ pub fn exposure(graph: &Graph, stored: &Stored) -> BTreeMap<String, Vec<String>>
 /// not `full`).
 fn exposure_with(graph: &Graph, stored: &Stored, trust: impl Fn(&str) -> Option<Trust>) -> BTreeMap<String, Vec<String>> {
     let mut out = BTreeMap::new();
-    let Some(hub) = stored.log.membership().map(|m| m.hub.clone()) else { return out };
+    let Some(control_plane) = stored.log.membership().map(|m| m.control_plane.clone()) else { return out };
     let known = |n: &str| proof::resolve(stored, n).is_some();
-    if !known(&hub) {
+    if !known(&control_plane) {
         return out;
     }
     let members = graph.members();
     let mut nodes: BTreeSet<&str> = members.iter().map(String::as_str).filter(|n| known(n)).collect();
-    nodes.insert(&hub);
-    out.insert(hub.clone(), vec![hub.clone()]);
-    let mut frontier = vec![hub.clone()];
+    nodes.insert(&control_plane);
+    out.insert(control_plane.clone(), vec![control_plane.clone()]);
+    let mut frontier = vec![control_plane.clone()];
     while !frontier.is_empty() {
         // Each level in chain order: the first exposed member to get to a
         // new one gives it the smallest chain of the fewest steps.
@@ -370,7 +370,7 @@ fn exposure_with(graph: &Graph, stored: &Stored, trust: impl Fn(&str) -> Option<
 
 /// The members `worker` buys little for, by name, with their [`exposure`]
 /// chains: exposed through another machine (a chain of two or more; the
-/// hub itself isn't), and `worker` (or no report: the default), a `full`
+/// control plane itself isn't), and `worker` (or no report: the default), a `full`
 /// one being exposed by design. `me` overrides one member's trust: this
 /// host's own as `member.toml` has it now, its report maybe older.
 pub fn exposed_workers(graph: &Graph, stored: &Stored, me: Option<(&str, Trust)>) -> BTreeMap<String, Vec<String>> {
@@ -416,7 +416,7 @@ mod tests {
         MEMBERS.iter().chain(&[("new", 6)]).find(|(n, _)| *n == name).unwrap().1
     }
 
-    /// `lap` (key 1) the authority, `box` (key 2) the hub, then `pi`, `k`,
+    /// `lap` (key 1) the authority, `box` (key 2) the control plane, then `pi`, `k`,
     /// `m` (keys 3-5); fleet id `[id; 16]`.
     fn fleet(id: u8) -> Stored {
         let mut log = Log::default();
@@ -660,9 +660,9 @@ mod tests {
     use Trust::{Full, Worker};
 
     #[test]
-    fn the_hub_and_whom_it_dials_are_exposed() {
+    fn the_control_plane_and_whom_it_dials_are_exposed() {
         let stored = fleet(1);
-        assert_eq!(chains(&exposure(&Graph::default(), &stored)), ["box=box"], "the hub alone");
+        assert_eq!(chains(&exposure(&Graph::default(), &stored)), ["box=box"], "the control plane alone");
         // box dials pi (down: still a shell credential); lap dials box (no
         // shell for box on lap).
         let g = exposed_graph(&stored, &[("box", Worker, &[("pi", true, false), ("lap", false, true)])]);
@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn exposed_workers_leave_out_the_hub_and_full_members() {
+    fn exposed_workers_leave_out_the_control_plane_and_full_members() {
         let stored = fleet(1);
         let g = exposed_graph(&stored, &[("box", Worker, &[("pi", true, true), ("k", true, true)]), ("k", Full, &[("box", false, true)])]);
         assert_eq!(chains(&exposed_workers(&g, &stored, None)), ["pi=box>pi"]);

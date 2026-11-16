@@ -2,9 +2,9 @@
 //! (docs/architecture/daemon/fleet.md, *Peer links*): the dialed end of a
 //! link `machine add <this host>` made on `<dialer>` ([`fleet_link_peer`],
 //! [`run_peer`]). The opener (it writes the sentinel), saying
-//! `update::hello_of` (its build, whether this host is the hub, and its
-//! fleet's hub, as `member.toml` says when it starts); a dialer naming
-//! another hub is refused (`update::same_fleet`). IN:
+//! `update::hello_of` (its build, whether this host is the control plane, and its
+//! fleet's control plane, as `member.toml` says when it starts); a dialer naming
+//! another control plane is refused (`update::same_fleet`). IN:
 //! each stream the dialer opens on `API`, `PTY`, `TUNNEL`, `TRANSFER`,
 //! `AGENT` (answered by this host's agent grant for the key the dialer
 //! proved, `fleet::agent`) or `ROUTE` (a routed stream to relay or answer,
@@ -17,7 +17,7 @@
 //! key `<dialer>` has in the membership log (or a held introduction), and
 //! when this host's log is behind, the dialer's newer entries are stored
 //! through this host's daemon (`membership.adopt`) before anything is
-//! announced, the link ending if they moved the hub. OUT: `fleet-<dialer>.sock` and
+//! announced, the link ending if they moved the control plane. OUT: `fleet-<dialer>.sock` and
 //! its `.pty`, `.tunnel`, `.transfer` siblings, each accept a stream to the
 //! dialer; `agent-link-<dialer>.sock` (`endpoint::link_agent_socket`,
 //! `fleet::agent::serve`) while the dialer serves `AGENT`. Once the
@@ -25,11 +25,11 @@
 //! (`links.inbound`, a refusal ends the link with why) and holds that
 //! connection for the link's life, re-announcing on a new one when it drops
 //! (a version handoff of this host's daemon) ([`Announce`]); a
-//! `links.cycle` notification on it (this host's hub changed) ends the
-//! link, so the dialer redials and both ends say the new hub. Versions
-//! follow the hub flag ([`follows`]): this end, not the hub, follows a hub
+//! `links.cycle` notification on it (this host's control plane changed) ends the
+//! link, so the dialer redials and both ends say the new control plane. Versions
+//! follow the control-plane flag ([`follows`]): this end, not the control plane, follows a control plane
 //! dialer's build, then ends the link (the dialer redials the new binary);
-//! this end, the hub, pushes its dev build to a dialer that would take it.
+//! this end, the control plane, pushes its dev build to a dialer that would take it.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -62,8 +62,8 @@ pub(crate) fn own_binary() -> io::Result<std::path::PathBuf> {
     std::env::current_exe()
 }
 
-/// When a hub saying `ours` pushes to a member saying `theirs`
-/// (`update::hub_pushes`), `binary()`'s file to it on a thread of its own
+/// When a control plane saying `ours` pushes to a member saying `theirs`
+/// (`update::control_plane_pushes`), `binary()`'s file to it on a thread of its own
 /// through the link's socket `socket` (`update::push`; its
 /// connection waits in the backlog until the opener's accept loop runs).
 /// A failure is on stderr; the member's wait ends on its own.
@@ -73,7 +73,7 @@ pub fn push_build(
     socket: std::path::PathBuf,
     binary: impl FnOnce() -> io::Result<std::path::PathBuf> + Send + 'static,
 ) -> Option<std::thread::JoinHandle<Result<()>>> {
-    if !update::hub_pushes(ours, theirs) {
+    if !update::control_plane_pushes(ours, theirs) {
         return None;
     }
     let pushed = std::thread::Builder::new().name("fleet-push".into()).spawn(move || {
@@ -100,16 +100,16 @@ pub struct PeerOptions {
     /// sockets are bound.
     pub dir: PathBuf,
     /// What this end says (`update::hello_of`): its role and its fleet's
-    /// hub, as `member.toml` said when this process started.
+    /// control plane, as `member.toml` said when this process started.
     pub hello: &'static str,
     /// A fresh connection to this host's daemon (lazy start), for
     /// `links.inbound`.
     pub daemon: Arc<dyn Fn() -> Result<Conn> + Send + Sync>,
-    /// How this end follows a hub dialer's build.
+    /// How this end follows a control-plane dialer's build.
     pub follow: Follow,
     /// The re-announce backoff's first wait ([`REANNOUNCE`]).
     pub reannounce: Duration,
-    /// How long a wait for the hub's binary waits ([`PUSH_WAIT`]).
+    /// How long a wait for the control plane's binary waits ([`PUSH_WAIT`]).
     pub push_wait: Duration,
     /// This host's `member.toml`: its name, and the `member.key` and
     /// `membership.json` next to it the link proves with
@@ -118,9 +118,9 @@ pub struct PeerOptions {
 }
 
 /// The `--peer` CLI entry: the socket dir (created 0700 if missing), this
-/// end's hello from `member.toml`'s `hub` and name (each dial is a process
+/// end's hello from `member.toml`'s `control_plane` and name (each dial is a process
 /// of its own: read once), then [`run_peer`] on stdin/stdout. Following the
-/// hub uses the release steps (`update::Release`) and `member.toml`'s
+/// control plane uses the release steps (`update::Release`) and `member.toml`'s
 /// `dev-builds` / trust `full`, read at the `Hello`s.
 pub fn fleet_link_peer(peer: &str) -> Result<()> {
     check_name(peer)?;
@@ -132,7 +132,7 @@ pub fn fleet_link_peer(peer: &str) -> Result<()> {
     let daemon_dir = dir.clone();
     let opts = PeerOptions {
         dir: dir.clone(),
-        hello: update::hello_for(&this.hub(), own.as_deref()),
+        hello: update::hello_for(&this.control_plane(), own.as_deref()),
         daemon: Arc::new(move || client::connect(&daemon_dir, "fleet-link").context("cannot reach this host's devsandbox serve")),
         follow: Follow {
             steps: Arc::new(update::Release { socket_dir: dir }),
@@ -150,12 +150,12 @@ pub fn fleet_link_peer(peer: &str) -> Result<()> {
 
 /// What the end saying `ours` does about a peer saying `theirs` (both peer
 /// link `Hello`s, `update::hello_of`; pure): it follows `theirs` only when
-/// that says hub and `ours` doesn't (`update::decide`, `dev_builds` as
-/// `member.toml` says); any other pair is [`Decision::Same`] (two non-hubs
-/// need only the frame protocol's match, which the `Hello`s checked; a hub
+/// that says control plane and `ours` doesn't (`update::decide`, `dev_builds` as
+/// `member.toml` says); any other pair is [`Decision::Same`] (two non-control-planes
+/// need only the frame protocol's match, which the `Hello`s checked; a control plane
 /// is followed, never follows).
 pub fn follows(ours: &str, theirs: &str, dev_builds: bool) -> Decision {
-    if update::is_hub(ours) || !update::is_hub(theirs) {
+    if update::is_control_plane(ours) || !update::is_control_plane(theirs) {
         return Decision::Same;
     }
     update::decide(&Build::parse(ours), &Build::parse(theirs), update::platform_of(ours), update::platform_of(theirs), dev_builds)
@@ -164,14 +164,14 @@ pub fn follows(ours: &str, theirs: &str, dev_builds: bool) -> Decision {
 /// The dialed end of a peer link with `peer` (its dialer) over
 /// `reader`/`writer` (see the module doc). `Ok` when the dialer went away;
 /// an error when `links.inbound` was refused, the link failed, or this end
-/// followed the hub (the update's outcome: handed off, or why not). Either
+/// followed the control plane (the update's outcome: handed off, or why not). Either
 /// way the link has ended, so the dialer redials.
 pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, peer: &str, opts: PeerOptions) -> Result<()> {
     check_name(peer)?;
     let identity = fleet::proof::Identity::load(&opts.member, &crate::serve::machines::link::hostname())?;
     let dir = opts.dir.clone();
     let socket = endpoint::fleet_socket(&dir, peer);
-    // While the hub's binary is on its way nothing but it is served.
+    // While the control plane's binary is on its way nothing but it is served.
     let receiving = Arc::new(AtomicBool::new(false));
     let incoming = Arc::new(Incoming::default());
     let binary = Arc::new(incoming.receiver(Receivers::new(|m| eprintln!("{m}"))));
@@ -210,7 +210,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         if let Some(newer) = theirs.proven.as_ref().and_then(|p| p.newer.as_ref()) {
             adopt(&mut (opts.daemon)()?, newer).with_context(|| format!("cannot take {peer}'s newer membership entries"))?;
             eprintln!("fleet-link: took {peer}'s newer membership log ({})", newer.log.head());
-            if let Some(why) = fleet::proof::hub_moved(spec.hello, newer) {
+            if let Some(why) = fleet::proof::control_plane_moved(spec.hello, newer) {
                 bail!("{why}");
             }
         }
@@ -220,20 +220,20 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
             Decision::Same => {}
             Decision::Download { build } => {
                 wanted = Some(build);
-                bail!("{peer}, the hub, runs devsandbox {label}: updating this one first");
+                bail!("{peer}, the control plane, runs devsandbox {label}: updating this one first");
             }
             Decision::Stop(why) => bail!("{why}"),
             Decision::Receive => {
-                let scratch = update::scratch_dir(&std::env::temp_dir()).context("cannot take the hub's build")?;
+                let scratch = update::scratch_dir(&std::env::temp_dir()).context("cannot take the control plane's build")?;
                 receiving.store(true, Ordering::Relaxed);
                 let hang_up = Arc::clone(&outlet);
                 let seq = incoming.expect(theirs.hash.clone(), scratch, Some(Box::new(move || hang_up.hang_up())));
                 incoming.watch(seq, opts.push_wait);
-                eprintln!("fleet-link: {peer}, the hub, runs devsandbox {label}: receiving its binary");
+                eprintln!("fleet-link: {peer}, the control plane, runs devsandbox {label}: receiving its binary");
                 return Ok(());
             }
         }
-        let params = json!({ "peer": peer, "version": theirs.hash, "hub": update::is_hub(&theirs.hash) });
+        let params = json!({ "peer": peer, "version": theirs.hash, "control_plane": update::is_control_plane(&theirs.hash) });
         let mut conn = (opts.daemon)()?;
         if let Err(why) = announce(&mut conn, &params)? {
             bail!("refused: {why}");
@@ -244,7 +244,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
                 let why = match end {
                     AnnounceEnd::Refused(why) => format!("refused: {why}"),
                     AnnounceEnd::Cycled(Some(why)) => why,
-                    AnnounceEnd::Cycled(None) => format!("this host's hub changed: the link ends so {peer} redials it"),
+                    AnnounceEnd::Cycled(None) => format!("this host's control plane changed: the link ends so {peer} redials it"),
                 };
                 eprintln!("fleet-link: {why}");
                 *refused.lock().unwrap() = Some(why);
@@ -263,7 +263,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
                 })
                 .ok();
         }
-        if update::is_hub(spec.hello) && !update::is_hub(&theirs.hash) {
+        if update::is_control_plane(spec.hello) && !update::is_control_plane(&theirs.hash) {
             push_build(spec.hello, &theirs.hash, socket.clone(), own_binary);
         }
         Ok(())
@@ -278,7 +278,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         let label = Build::parse(&want.hello).label();
         let installed = match &want.received {
             Some(binary) => update::install_received(steps, binary, &want.hello),
-            None => Err(anyhow!("{}", want.why.as_deref().unwrap_or("the link ended before the hub's binary arrived"))),
+            None => Err(anyhow!("{}", want.why.as_deref().unwrap_or("the link ended before the control plane's binary arrived"))),
         };
         let _ = std::fs::remove_dir_all(&want.dir);
         installed.with_context(|| format!("update to {label} failed"))?;
@@ -296,7 +296,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
 }
 
 /// `membership.adopt` of `newer` on `conn` (this host's daemon writes the
-/// log, and `hub` from it).
+/// log, and `control_plane` from it).
 fn adopt(conn: &mut Conn, newer: &fleet::membership::Stored) -> Result<()> {
     let r = conn.call("membership.adopt", serde_json::to_value(newer.to_wire())?)?;
     match r.error {
@@ -306,7 +306,7 @@ fn adopt(conn: &mut Conn, newer: &fleet::membership::Stored) -> Result<()> {
 }
 
 /// The notification on the held `links.inbound` connection that ends the
-/// link: `daemon::Shared::set_hub` (this host's hub changed, so both ends
+/// link: `daemon::Shared::set_control_plane` (this host's control plane changed, so both ends
 /// redial saying the new one), or `daemon::Shared::end_inbound` (the peer
 /// is out of this host's fleet; params `{why}`).
 pub const LINKS_CYCLE: &str = "links.cycle";
@@ -553,7 +553,7 @@ mod tests {
     }
 
     /// K (`k_member`, its `member.toml`) and L (`l_member`) in one fleet,
-    /// K its authority and hub; the fleet's log and L's identity (the fake
+    /// K its authority and control plane; the fleet's log and L's identity (the fake
     /// dialer's).
     fn fleet(k_member: &Path, l_member: &Path) -> (crate::serve::fleet::membership::Stored, Identity) {
         for m in [k_member, l_member] {
@@ -680,7 +680,7 @@ mod tests {
         // A registry entry can't take a live neighbor's name.
         let mut k = conn_at(&k_dir);
         let key = crate::serve::fleet::identity::Signer::public_key(&crate::serve::fleet::identity::SigningKey::from_seed([9; 32]));
-        let add = json!({"hub": false, "target": "me@l", "name": "L", "key": key});
+        let add = json!({"control_plane": false, "target": "me@l", "name": "L", "key": key});
         let e = k.call("machines.add", add).unwrap().error.unwrap();
         assert!(e.code == "denied" && e.message.contains("inbound neighbor"), "{e:?}");
 
@@ -775,18 +775,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// K's hub changes (a newer membership log adopted on K's daemon): K's
+    /// K's control plane changes (a newer membership log adopted on K's daemon): K's
     /// end gets `links.cycle` on its held announce and ends the link,
     /// saying why.
     #[test]
-    fn a_hub_change_on_the_dialed_host_ends_the_link() {
+    fn a_control_plane_change_on_the_dialed_host_ends_the_link() {
         use crate::serve::fleet::membership::Op;
         let base = scratch("peer-cycle");
         let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
         let k_member = k_opts.member.clone().unwrap();
         let (l_dir, _, _, l_opts) = peer_daemon(&base, "l");
         let (mut k_fleet, l_id) = fleet(&k_member, l_opts.member.as_ref().unwrap());
-        k_fleet.log.append(Op::Hub { name: "L".into() }, "K", &test_support::key_of(&k_member)).unwrap();
+        k_fleet.log.append(Op::ControlPlane { name: "L".into() }, "K", &test_support::key_of(&k_member)).unwrap();
         let daemons = [spawn_daemon(&k_dir, k_opts), spawn_daemon(&l_dir, l_opts)];
         drop((conn_at(&k_dir), conn_at(&l_dir)));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
@@ -796,7 +796,7 @@ mod tests {
         let adopt = serde_json::to_value(k_fleet.to_wire()).unwrap();
         assert!(conn_at(&k_dir).call("membership.adopt", adopt).unwrap().error.is_none());
         let err = k_end.join().unwrap().unwrap_err();
-        assert_eq!(format!("{err:#}"), "this host's hub changed: the link ends so L redials it");
+        assert_eq!(format!("{err:#}"), "this host's control plane changed: the link ends so L redials it");
         // `fleet-link` exits there: its stdio closes.
         k_io.shutdown(Shutdown::Both).unwrap();
         assert!(matches!(dialer.join().unwrap(), link::End::Closed));
@@ -809,27 +809,27 @@ mod tests {
     }
 
     /// K's membership log is behind the dialer's, whose newer entry makes
-    /// `L` the hub: K's end stores it through its daemon (`membership.adopt`:
-    /// K's `member.toml` hub follows) before announcing anything, then ends
-    /// the link so both ends redial saying the new hub.
+    /// `L` the control plane: K's end stores it through its daemon (`membership.adopt`:
+    /// K's `member.toml` control plane follows) before announcing anything, then ends
+    /// the link so both ends redial saying the new control plane.
     #[test]
     fn the_dialed_end_behind_takes_the_dialers_entries() {
-        use crate::serve::fleet::member::{self, Hub};
+        use crate::serve::fleet::member::{self, ControlPlane};
         use crate::serve::fleet::membership::Op;
         let base = scratch("peer-behind");
         let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
         let k_member = k_opts.member.clone().unwrap();
         let (mut ahead, mut l_id) = fleet(&k_member, &base.join("l-id/member.toml"));
-        ahead.log.append(Op::Hub { name: "L".into() }, "K", &test_support::key_of(&k_member)).unwrap();
+        ahead.log.append(Op::ControlPlane { name: "L".into() }, "K", &test_support::key_of(&k_member)).unwrap();
         l_id.stored = ahead.clone();
         let daemon = spawn_daemon(&k_dir, k_opts);
         drop(conn_at(&k_dir));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, base.join("nowhere"), Arc::default());
         let err = peer_link(k_io, k_dir.clone(), k_member.clone(), Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
-        assert!(format!("{err:#}").contains("the fleet's hub is now `L`"), "{err:#}");
+        assert!(format!("{err:#}").contains("the fleet's control plane is now `L`"), "{err:#}");
         assert_eq!(test_support::read(&k_member).unwrap(), ahead, "K took L's entries");
-        assert_eq!(member::load(&k_member).unwrap().unwrap().hub(), Hub::Other("L".into()));
+        assert_eq!(member::load(&k_member).unwrap().unwrap().control_plane(), ControlPlane::Other("L".into()));
         assert!(matches!(dialer.join().unwrap(), link::End::Closed));
         assert!(inbound_row(&k_dir).is_none(), "nothing announced");
         assert!(conn_at(&k_dir).call("shutdown", json!({})).unwrap().error.is_none());
@@ -854,7 +854,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A dialer naming another hub than K's: refused before anything is
+    /// A dialer naming another control plane than K's: refused before anything is
     /// announced, naming both.
     #[test]
     fn a_dialer_in_another_fleet_is_refused() {
@@ -872,34 +872,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_non_hub_follows_a_hub() {
+    fn only_a_non_control_plane_follows_a_control_plane() {
         let ours = update::hello_of(false, None);
         let semver = env!("CARGO_PKG_VERSION");
         let platform = update::PLATFORM;
-        let published = format!("9.9.9 abc published {platform} hub");
+        let published = format!("9.9.9 abc published {platform} control_plane");
         assert_eq!(follows(ours, &published, false), Decision::Download { build: Build::parse("9.9.9 abc published") });
         assert_eq!(follows(ours, update::hello_of(true, None), false), Decision::Same, "the same build");
-        let dev = format!("{semver} zzz dev {platform} hub");
+        let dev = format!("{semver} zzz dev {platform} control_plane");
         assert_eq!(follows(ours, &dev, true), Decision::Receive);
         assert!(matches!(follows(ours, &dev, false), Decision::Stop(_)));
-        let elsewhere = format!("{semver} zzz dev other/os hub");
+        let elsewhere = format!("{semver} zzz dev other/os control_plane");
         assert!(matches!(follows(ours, &elsewhere, true), Decision::Stop(why) if why.contains("can't run on")));
-        // No hub, or this end is it: nothing to follow.
-        assert_eq!(follows(ours, &published.replace(" hub", " member"), false), Decision::Same);
+        // No control plane, or this end is it: nothing to follow.
+        assert_eq!(follows(ours, &published.replace(" control_plane", " member"), false), Decision::Same);
         assert_eq!(follows(update::hello_of(true, None), &published, false), Decision::Same);
-        assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", false), Decision::Same, "a hello without the flag says no hub");
+        assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", false), Decision::Same, "a hello without the flag says no control plane");
     }
 
-    /// A hub dialer on a published build: K's end drops the link, installs
+    /// A control-plane dialer on a published build: K's end drops the link, installs
     /// that version and hands off, and says so.
     #[test]
-    fn a_member_follows_a_published_hub_dialer() {
+    fn a_member_follows_a_published_control_plane_dialer() {
         let base = scratch("peer-follow");
         std::fs::create_dir_all(&base).unwrap();
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let hub: &'static str = Box::leak(format!("9.9.9 abc published {} hub", update::PLATFORM).into_boxed_str());
+        let control_plane: &'static str = Box::leak(format!("9.9.9 abc published {} control_plane", update::PLATFORM).into_boxed_str());
         let (k_member, l_id) = ids(&base);
-        let dialer = fake_dialer(dialer_io, hub, l_id, base.join("nowhere"), Arc::default());
+        let dialer = fake_dialer(dialer_io, control_plane, l_id, base.join("nowhere"), Arc::default());
         let fake = Arc::new(update::tests::Fake::building(&format!("9.9.9 abc published {}", update::PLATFORM)));
         let err = peer_link(k_io, base.clone(), k_member, fake.clone()).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").starts_with("updated to devsandbox 9.9.9, handing off"), "{err:#}");
@@ -910,19 +910,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A hub dialer on another dev build for this platform: K's end serves
+    /// A control-plane dialer on another dev build for this platform: K's end serves
     /// only the binary it pushes, then ends the link and installs it.
     #[test]
-    fn a_member_takes_a_dev_hub_dialers_pushed_build() {
+    fn a_member_takes_a_dev_control_plane_dialers_pushed_build() {
         use crate::serve::fleet::transfer::{self, Header};
         let base = scratch("peer-dev");
         std::fs::create_dir_all(&base).unwrap();
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let hub: &'static str = Box::leak(format!("{} zzz dev {} hub", env!("CARGO_PKG_VERSION"), update::PLATFORM).into_boxed_str());
+        let control_plane: &'static str = Box::leak(format!("{} zzz dev {} control_plane", env!("CARGO_PKG_VERSION"), update::PLATFORM).into_boxed_str());
         let outlet = Arc::new(link::Outlet::default());
         let (k_member, l_id) = ids(&base);
-        let dialer = fake_dialer(dialer_io, hub, l_id, base.join("nowhere"), Arc::clone(&outlet));
-        let fake = Arc::new(update::tests::Fake::building(hub.trim_end_matches(" hub")));
+        let dialer = fake_dialer(dialer_io, control_plane, l_id, base.join("nowhere"), Arc::clone(&outlet));
+        let fake = Arc::new(update::tests::Fake::building(control_plane.trim_end_matches(" control plane")));
         let k_end = peer_link(k_io.try_clone().unwrap(), base.clone(), k_member, fake.clone());
         wait_for(|| outlet.is_up(), "the link is up");
         // Waiting for the binary: nothing else is served.

@@ -9,19 +9,19 @@ Status: in progress. Steps 1-12 shipped
 [0046](../../decisions/0046-routed-streams-are-end-to-end-sessions.md)):
 steps 1-6 on two kinds of machine (ssh machines and lending workers),
 steps 7-8 down to one: every machine one peer link per pair, reached
-only over its channels, a laptop joining with `machine add <hub>`;
-step 9 made it a fleet: the hub in `member.toml`, `machine add`'s join
+only over its channels, a laptop joining with `machine add <control-plane>`;
+step 9 made it a fleet: the control plane in `member.toml`, `machine add`'s join
 rule, `machine unlink|rm`, every member seeing the fleet through the
-hub and its runs placed there; step 10a gave members identity: a key
+control plane and its runs placed there; step 10a gave members identity: a key
 each, a membership log only the fleet's authority signs, links that
 prove both keys, changes made elsewhere approved on the authority;
 step 10b routed streams over the members' signed link graph, each
 proving its origin to its destination; step 10c made each routed
 stream an end-to-end session and agent access a per-member grant
-carried over any path; step 11 moves the hub role with `machine hub`,
+carried over any path; step 11 moves the control-plane role with `machine control-plane`,
 an authority-signed log entry; step 12 moves code itself: each folder
 from its own checkout with a WIP snapshot (no remote needed), into
-per-repo caches, a copy on the hub, and `devsandbox fetch` back. Step
+per-repo caches, a copy on the control plane, and `devsandbox fetch` back. Step
 13 waits: it is re-scoped around an external orchestrator replacing
 the in-repo dispatcher and the Inbox (see [Rollout](#rollout)). The
 rest is design. Builds on
@@ -52,34 +52,34 @@ setting.
 | P1 | A sandbox is a path on one host: `folder` is relative to a config root there; each machine has its own `roots`. Running `web` elsewhere needs its config and checkout mirrored by hand. | `config.rs`, `machines::Entry` |
 | P2 | No placement: `run` resolves a name and, matched on several machines, asks on a TTY. No capacity is reported. | `verbs_client`, `snapshots::merge` |
 | P3 | Dispatcher children live on the dispatcher's host: child ops are `--in-process` subprocesses that never reach a machine; ownership, `max-instances` and `state.toml` are per host. | `commands::dispatch` `Subprocess` |
-| P4 | Links are held only while a client wants them (+ 60 s linger); remote rows are memory only. Nothing makes a daemon a standing hub. | `service.rs` `Want`, `snapshots::Remotes` |
-| P5 | Federation is one hop: a laptop linked to the hub doesn't see the hub's machines. | `snapshots::merge` |
+| P4 | Links are held only while a client wants them (+ 60 s linger); remote rows are memory only. Nothing makes a daemon a standing control plane. | `service.rs` `Want`, `snapshots::Remotes` |
+| P5 | Federation is one hop: a laptop linked to the control plane doesn't see the control plane's machines. | `snapshots::merge` |
 | P6 | A protocol mismatch makes a machine unreachable; nothing updates it. | `link.rs`, `install` |
-| P7 | Credentials: the agent relay flows from the linking host to the machine; a hub-placed child has no obvious agent. | [Agent](../../architecture/daemon/machines.md#agent) |
+| P7 | Credentials: the agent relay flows from the linking host to the machine; a control-plane-placed child has no obvious agent. | [Agent](../../architecture/daemon/machines.md#agent) |
 | P8 | The Inbox is a per-host store. | `inbox::store` |
 | P9 | Images are built per machine, no shared cache; image tags aren't namespaced by root, so shared configs clobber. | `run::image::base_image_for` |
 | P10 | `scope = "global"` services are per host: children on two machines see two postgres. | `commands::services` |
 | P11 | Every path to a machine is a fresh ssh *to* it: each forwarded verb, terminal tabs and CLI re-runs (`tty_argv`, `cli_argv`), forwards (`tunnel_argv`), the agent relay (`agent_argv`). | `machines::ssh` |
 | P12 | The API a link reaches is the machine's whole daemon: every root, every instance, `machines.*`. A member must be able to expose less. | `serve::api` |
-| P13 | Two ways to add a machine: `machine add` (this host sshes to it, sees its own roots, never places on it) and `fleet join` (it dials the hub, lends a fleet root, its own roots invisible). | `machines::Kind`, `commands::lend` |
+| P13 | Two ways to add a machine: `machine add` (this host sshes to it, sees its own roots, never places on it) and `fleet join` (it dials the control plane, lends a fleet root, its own roots invisible). | `machines::Kind`, `commands::lend` |
 
 ## Design decisions
 
-### Members, links and the hub
+### Members, links and the control plane
 
-**Every machine is a fleet member; one member is the hub.** A fleet is
-one user's machines with one hub, the director: it holds the member list
-and the link graph, the federated view and placement. Being the hub is a
+**Every machine is a fleet member; one member is the control plane.** A fleet is
+one user's machines with one control plane, the director: it holds the member list
+and the link graph, the federated view and placement. Being the control plane is a
 role, not a kind of machine, and has nothing to do with who dials whom.
 Every member's daemon stays up while it's in a fleet (it holds links;
-`serve install` keeps it up across logins), and the hub saves remote rows
-(`remotes.json`) so a restarted hub shows the fleet before members
+`serve install` keeps it up across logins), and the control plane saves remote rows
+(`remotes.json`) so a restarted control plane shows the fleet before members
 reconnect.
 
 **A link is an ssh pair.** `machine add X` run on A makes a link A → X:
 A's daemon holds `ssh -T -o BatchMode=yes X devsandbox fleet-link`,
 always while both are up, retried with the links' backoff. That's the
-only way a link forms, whichever end is (or later becomes) the hub. ssh
+only way a link forms, whichever end is (or later becomes) the control plane. ssh
 stays the transport
 ([ADR 0020](../../decisions/0020-machines-over-plain-ssh-with-protocol-match.md)).
 Each host's `machines.toml` lists the links it dials (name, target).
@@ -94,13 +94,13 @@ would be a bandwidth detail behind the seam, never a second path.
 is a star around one always-on machine (every laptop linked to K), with
 some extra links between members. A request to X takes a path through
 the graph: each hop's daemon splices the stream onto its next link (an
-`Open` naming its destination). The hub learns the graph (each member
+`Open` naming its destination). The control plane learns the graph (each member
 reports its links and their states) and publishes it; the requester
 tries paths in order (a direct link first, then fewest hops, preferring
 hops that stay up) and on a failure tries the next one. With every path
 down, X is `unreachable`: placement skips it, re-placement (step 14) may
 move its children. Picking the fastest path (measured latency) is later.
-If the hub is A in `A → K ← B, K ← C`, K relays everything for A: the
+If the control plane is A in `A → K ← B, K ← C`, K relays everything for A: the
 role and the routing centre need not be the same machine.
 
 **One link, many channels.** The link carries the helper's frame
@@ -126,7 +126,7 @@ stay as they are. The ssh at `machine add` time (install check,
 **Configs live on any member.** A member's own config roots (those it
 has instances in, plus those picked at `machine add`, as probed roots are
 picked today) are part of the fleet: every member sees every member's
-sandboxes and instances (a member's daemon watches the hub with
+sandboxes and instances (a member's daemon watches the control plane with
 `machines: true`; rows of the asking machine are never re-exported, so no
 cycles), and can run a member's config on that member, or elsewhere as
 [Trust](#trust-worker-or-full) allows. Config authority for a member's
@@ -137,25 +137,25 @@ a config placed elsewhere runs as its home member resolved it.
 ### Joining and leaving
 
 **`machine add <target>`**, run on host H, makes the link H → X (the
-install check first, as today) and asks both for their hub:
+install check first, as today) and asks both for their control plane:
 
 | H | X | result |
 |---|---|---|
-| in a fleet (hub K) | in none | X joins K's fleet |
-| in none | in a fleet (hub K) | H joins K's fleet: the laptop case, `machine add <any member>` run on the laptop |
-| in none | in none | a fleet of two, H the hub |
-| hub K | hub K | an extra link in the same fleet |
-| hub K | hub L | refused, naming both |
+| in a fleet (control plane K) | in none | X joins K's fleet |
+| in none | in a fleet (control plane K) | H joins K's fleet: the laptop case, `machine add <any member>` run on the laptop |
+| in none | in none | a fleet of two, H the control plane |
+| control plane K | control plane K | an extra link in the same fleet |
+| control plane K | control plane L | refused, naming both |
 
-The link is H → X in every row; joining only writes `hub` in the
+The link is H → X in every row; joining only writes `control_plane` in the
 joiner's member file. ssh login is the authentication (the user's own
 account). `machine unlink <m>` drops this host's link to `m` (`m` stays a
 member while another link reaches it); `machine rm <m>` takes `m` out of
 the fleet (every link to it closed, the dialers' entries dropped);
 `machine rm` of the host it runs on leaves the fleet.
 
-**The member file** (`member.toml` next to `state.toml`): `hub` (the
-hub's member name, or `self` on the hub), `name`, `trust`, `[caps]`,
+**The member file** (`member.toml` next to `state.toml`): `control_plane` (the
+control plane's member name, or `self` on the control plane), `name`, `trust`, `[caps]`,
 `[allow]`, `dev-builds`. Written by the daemon only, through `member.*`
 calls; `machine` is its client. There's no lending toggle: a member takes
 work while it's reachable, and leaving is `machine rm`.
@@ -165,8 +165,8 @@ work while it's reachable, and leaving is `machine rm`.
 A member's own setting, `worker` by default, changed only on that
 machine (`devsandbox machine trust worker|full`, a local `member.set`; no
 link's table carries `member.*`, and a `--machine` or a qualified name
-refuses it). It applies to every remote caller, the hub included: the
-hub's role adds the member list, the graph and placement, not access.
+refuses it). It applies to every remote caller, the control plane included: the
+control plane's role adds the member list, the graph and placement, not access.
 
 - `worker`: a remote caller reaches
   - **the member's own roots**: snapshots, quick calls, verbs (`run`,
@@ -177,7 +177,7 @@ hub's role adds the member list, the graph and placement, not access.
     member itself: a `run` typed on the laptop may send the laptop's
     config elsewhere, another machine asking may not;
   - **placed work** (another member's config), in the member's **fleet
-    root** (`<data>/devsandbox/fleet/<hub>/`: placed config roots and
+    root** (`<data>/devsandbox/fleet/<control-plane>/`: placed config roots and
     their repo caches), under the **worker policy**: every resolved config
     is checked before it runs (decision 9's denials), allowances in
     `member.toml`'s `[allow]`;
@@ -191,36 +191,36 @@ hub's role adds the member list, the graph and placement, not access.
   devsandbox. Nothing against an ssh into it: a machine holding a link
   *into* B has a shell on B and could rewrite B's `member.toml`. The
   graph says exactly when that bites: B's `worker` buys little when the
-  hub, or a `full` member the hub reaches, dials B. `machine trust
+  control plane, or a `full` member the control plane reaches, dials B. `machine trust
   worker` says so then, naming the machine, and `machine ls` and the
   Machines tab show it on B's row.
 
-### Swapping the hub
+### Swapping the control plane
 
-`machine hub <m>` (step 11; a pointer swap for now). Links don't change:
-the role moves. It's a `hub` entry the authority signs (decision 68:
+`machine control-plane <m>` (step 11; a pointer swap for now). Links don't change:
+the role moves. It's a `control_plane` entry the authority signs (decision 68:
 typed elsewhere, proposed and approved there), pushed to every
-reachable member (each rewrites `hub`); a member unreachable then learns
-it from the first member it reconnects to. A dead hub can be replaced
-only while the authority is up, so not in a fleet made without `--hub`,
+reachable member (each rewrites `control_plane`); a member unreachable then learns
+it from the first member it reconnects to. A dead control plane can be replaced
+only while the authority is up, so not in a fleet made without `--control-plane`,
 where they're one machine (step 18). `m` starts empty: rows and the
 graph come back as members report, the repo cache refills as code moves.
-Handing the hub's state over (repo cache, saved rows, dispatcher records,
+Handing the control plane's state over (repo cache, saved rows, dispatcher records,
 checkpoints) is step 17, once steps 13-14 make that state matter; the
-pointer swap stays for a dead hub.
+pointer swap stays for a dead control plane.
 
-**A fallback hub** (step 18, later). An ordered list of members that take
-the role when the hub has been unreachable for a while (minutes to hours,
-a setting), so a fleet whose hub is a laptop keeps placing. Open: who
-decides the hub is gone (the fallback itself, or a majority of the
-members that can see each other), and what happens when the old hub
+**A fallback control plane** (step 18, later). An ordered list of members that take
+the role when the control plane has been unreachable for a while (minutes to hours,
+a setting), so a fleet whose control plane is a laptop keeps placing. Open: who
+decides the control plane is gone (the fallback itself, or a majority of the
+members that can see each other), and what happens when the old control plane
 comes back (it rejoins as a member, or takes the role back) without two
-hubs placing at once.
+control planes placing at once.
 
 ### Placement: soft caps, a pure `place`
 
-Runs on the hub: a `run` typed on any member goes to the hub, which
-places it; with the hub unreachable it runs where it was typed, with a
+Runs on the control plane: a `run` typed on any member goes to the control plane, which
+places it; with the control plane unreachable it runs where it was typed, with a
 note. Today nothing is limited, so v0 is mostly the seam: a capacity
 report, a pure `place(spec, &[Candidate]) -> Placement`, and soft caps.
 
@@ -263,13 +263,13 @@ git remote, when there is one, is only a shortcut for the bulk.
   fleet root for placed work) and cuts the worktree from it. With a
   reachable `origin`, the receiver fetches from it first so the bundle
   carries only the delta.
-- **Route**: along the graph's path (A → K → B in a star); the hub also
+- **Route**: along the graph's path (A → K → B in a star); the control plane also
   keeps a copy (below), which is what makes re-placement possible.
 - **Back**: the placed instance's branch and WIP are fetched back into the
   source repo as `refs/devsandbox/<machine>/<instance>/…` on demand
   (`devsandbox fetch <instance>`, the dashboard) and at `done`/`rm`;
   never a silent rewrite of the user's branches.
-- **Hub mirror**: the hub keeps the repo cache for every repo it has
+- **Control-plane mirror**: the control plane keeps the repo cache for every repo it has
   placed and receives periodic checkpoints (step 14), so a repo's latest
   WIP survives its laptop going to sleep.
 - **Config roots** move the same way (a config root that's a git repo
@@ -291,8 +291,8 @@ its callers: the plan keeps the seam, the git implementation is v1.
 
 ### Versions
 
-Every member runs the hub's exact build, and updates itself: it learns
-the hub's version from the link hellos, and when it differs fetches that
+Every member runs the control plane's exact build, and updates itself: it learns
+the control plane's version from the link hellos, and when it differs fetches that
 version, installs it and lets its own version handoff restart its daemon
 ([ADR 0015](../../decisions/0015-newest-binary-wins-version-handoff.md)):
 
@@ -300,7 +300,7 @@ version, installs it and lets its own version handoff restart its daemon
   GitHub (`devsandbox-<v>-<target>.tar.gz`, as
   `.github/workflows/release.yml` names them), verified, installed
   atomically (the existing `install::INSTALL` steps).
-- **Local build** (not a published version): the hub's own binary over
+- **Local build** (not a published version): the control plane's own binary over
   `TRANSFER` (along the path) when the OS and arch match
   (`install::platform_matches`) and the member accepts dev builds
   (`dev-builds`, or `full`: it's another machine choosing code this one
@@ -312,10 +312,10 @@ version, installs it and lets its own version handoff restart its daemon
 
 ### Credentials
 
-The hub's agent reaches the member's instances over `AGENT` while
-the hub's registry entry for the member has `agent = true`, as the agent
+The control plane's agent reaches the member's instances over `AGENT` while
+the control plane's registry entry for the member has `agent = true`, as the agent
 relay does for a machine today: every instance on the member, not only
-placed ones (decision 14). The hub's agent is whatever the hub has: a
+placed ones (decision 14). The control plane's agent is whatever the control plane has: a
 dedicated key on the server (deploy or user key), not a laptop's. A
 member's own agent never leaves it. With one link per pair (step 7)
 that holds for the dialer: its agent reaches every instance on the
@@ -335,17 +335,17 @@ moved off it: the in-repo dispatcher and its thread/event ops are
 replaced by an orchestrator, a client of the daemon API running in its
 own sandbox. Step 13 as first written (children placed by a dispatcher
 authorized on its host, events through each worker's Inbox, P8) would
-either federate the Inbox or leave a worker's events where the hub
+either federate the Inbox or leave a worker's events where the control plane
 can't see them; both invest in what is being removed.
 
-1. **Fleet link and hub mode** (L, shipped). The frame-mux link with
+1. **Fleet link and control-plane mode** (L, shipped). The frame-mux link with
    `API` channels, the confined table over a fleet root, the worker
    policy, persisted remote rows, capacity in the snapshot.
-2. **Self-update** (S–M, shipped). A published hub build downloaded, a
+2. **Self-update** (S–M, shipped). A published control-plane build downloaded, a
    dev build pushed when accepted.
 3. **Placement v0 + minimal transfer** (M, shipped). `place`, soft caps
    and warnings; a placed run gets the config root as a tar and a bundle
-   the hub cloned from `origin` (committed, pushed work only); `--here`;
+   the control plane cloned from `origin` (committed, pushed work only); `--here`;
    image tags and feature build dirs namespaced by config root (P9).
 4. **Interactive over the link** (M, shipped on offered workers' links). `PTY` (exec, terminal tabs, the
    reconnecting `exec`), `TUNNEL` forwards, `AGENT`, CLI re-runs as
@@ -375,14 +375,14 @@ can't see them; both invest in what is being removed.
    member's own roots plus the fleet root, placed work under the worker
    policy (decision 9); `full` skips the table and the policy. Applied to
    every remote connection, ssh machines' (`api --stdio`) too. Lending
-   state (`state`, `hub`) stays in `lend.toml` until step 8. As built:
+   state (`state`, `control_plane`) stays in `lend.toml` until step 8. As built:
    an ssh machine's relay attaches its connection with `link.attach
    {peer}`; `machine add` records the picked roots on the member
    (`machine roots add` there over its add-time ssh); `gc` is a daemon
    verb, `full` only; the per-use ssh argvs still bypass trust until
    step 8.
 7. **One link per machine pair** (L, shipped as 7a-7e).
-   [Members, links and the hub](#members-links-and-the-hub): a
+   [Members, links and the control plane](#members-links-and-the-control-plane): a
    `Transport` seam (dial → `Duplex`), ssh its only implementation;
    several connections would only ever be a bandwidth detail behind it,
    never a second path in the code. Every registry entry is held by its
@@ -416,7 +416,7 @@ can't see them; both invest in what is being removed.
    ```
 
    `AGENT` opens only member → dialer: L answers it while L's entry for K
-   has `agent` on. The hello carries the hub flag and versions follow it
+   has `agent` on. The hello carries the control-plane flag and versions follow it
    (decision 25). Ssh machines move onto the link here; offered workers
    (lending) keep theirs until step 8, as do the per-use ssh argvs.
    - **7a Transport seam + symmetric link body** (refactor).
@@ -455,13 +455,13 @@ can't see them; both invest in what is being removed.
    isn't a holder).
 8. **One kind of machine** (L, shipped as 8a-8f). Every entry reached through
    its channel forms; inbound neighbors are machines (decision 28);
-   lending removed (decision 26): a laptop joins with `machine add <hub>`.
+   lending removed (decision 26): a laptop joins with `machine add <control-plane>`.
 
    ```
-    laptop ──machine add hub──► hub      (the laptop dials; the hub lists
-      fleet-hub.sock ◄═link═► fleet-lap.sock         "inbound lap")
+    laptop ──machine add box──► box      (the laptop dials; box, the control plane,
+      fleet-box.sock ◄═link═► fleet-lap.sock         lists "inbound lap")
       every client on either end: API / PTY / TUNNEL / TRANSFER there;
-      the hub places on lap through fleet-lap.sock; AGENT only lap → hub
+      the control plane places on lap through fleet-lap.sock; AGENT only lap → box
    ```
 
    Nothing is deleted before its replacement is used:
@@ -494,7 +494,7 @@ can't see them; both invest in what is being removed.
      (decision 29).
    - **8f Docs close.**
 
-   As built: a hub only places (`[serve] hub`; a `run` elsewhere stays
+   As built: a control plane only places (`[serve] control_plane`; a `run` elsewhere stays
    there until step 9), over every connected machine; an inbound
    machine that goes takes its rows and forwards with it; each link a
    host dials holds its daemon up (`idle::Holders::links`); `machine
@@ -502,71 +502,71 @@ can't see them; both invest in what is being removed.
    the link's; `roots.list` marks the caller's fleet root (`fleet:
    true`), which placement moves code into; no command sets the member
    name (`member.set {name}` only), and `drain` went with lending.
-9. **Membership and the hub** (M).
-   [Joining and leaving](#joining-and-leaving): `hub` in `member.toml`
-   (decision 1), `[serve] hub` gone; `machine add`'s join rule (a name
-   already in the fleet refused, decision 2; two hubs refused, decision
-   19), `machine unlink|rm`. The hub holds the member list; members watch
+9. **Membership and the control plane** (M).
+   [Joining and leaving](#joining-and-leaving): `control_plane` in `member.toml`
+   (decision 1), `[serve] control_plane` gone; `machine add`'s join rule (a name
+   already in the fleet refused, decision 2; two control planes refused, decision
+   19), `machine unlink|rm`. The control plane holds the member list; members watch
    it with `machines: true` (the asking machine's rows never
    re-exported), so every member's snapshot is federated. A `run` typed
-   on a member is placed by the hub (decision 20; with the hub
+   on a member is placed by the control plane (decision 20; with the control plane
    unreachable it runs where it was typed, with a note); `remotes.json`
-   saved rows on the hub; versions follow the hub as `member.toml` names
-   it (step 7 reads `[serve] hub`).
+   saved rows on the control plane; versions follow the control plane as `member.toml` names
+   it (step 7 reads `[serve] control_plane`).
    Decisions 31-35 settle what the design above left open. Sub-steps,
    each a commit:
-   - **9a `hub` in `member.toml`.** `hub = "self" | "<name>"` (absent:
-     no fleet), `member.get`/`member.set {hub}`; `[serve] hub` goes and
+   - **9a `control_plane` in `member.toml`.** `control_plane = "self" | "<name>"` (absent:
+     no fleet), `member.get`/`member.set {control_plane}`; `[serve] control_plane` goes and
      every reader reads the member file at its use (hello, keep-alive,
-     placement, `remotes.json`); the hello names the hub (decision 34);
-     a hub change ends this host's links so both ends redial.
+     placement, `remotes.json`); the hello names the control plane (decision 34);
+     a control-plane change ends this host's links so both ends redial.
    - **9b `machine add`'s join rule.** The table in
      [Joining and leaving](#joining-and-leaving) over both ends'
      `member.get` (the target's over the add-time probe), the joiner's
-     `hub` written; names (decision 35) and two hubs refused.
-   - **9c Members see the fleet through the hub.** A member watches the
-     hub with `machines: true`, the asking member's rows never
+     `control_plane` written; names (decision 35) and two control planes refused.
+   - **9c Members see the fleet through the control plane.** A member watches the
+     control plane with `machines: true`, the asking member's rows never
      re-exported; machines seen only that way are view-only (decision
      33).
    - **9d `machine unlink|rm`, leaving.** Today's `rm` becomes
      `unlink`; `rm` per decision 32; `rm` of this host leaves.
-   - **9e A member's `run` placed by the hub** (decision 31).
+   - **9e A member's `run` placed by the control plane** (decision 31).
    - **9f Docs close.**
 
-   As built: the daemon keeps `hub` in memory (`Shared::hub`, read at
+   As built: the daemon keeps `control_plane` in memory (`Shared::control_plane`, read at
    start, set by `member.set`); a change cycles the links it holds
    (`service::Handle::cycle`) and sends `links.cycle` to each
-   `fleet-link` it's dialed on. The hello is `<build> <hub|member>
-   <hub name|->` (`update::same_fleet`). `machine add` pins both
+   `fleet-link` it's dialed on. The hello is `<build> <control_plane|member>
+   <control-plane name|->` (`update::same_fleet`). `machine add` pins both
    joiners' member names and reserves `self`; `--name` renames the
-   target only while it joins. A member watches the hub's fleet root
+   target only while it joins. A member watches the control plane's fleet root
    for it with `machines: true` (a peer's federated watch is served on
-   the hub only); machines seen that way are `via` the hub, one hop,
+   the control plane only); machines seen that way are `via` the control plane, one hop,
    and the federated `instances.resolve` / `sandboxes.list` don't ask
    them. `machine unlink` is the old `rm`; `machine rm` runs
-   `fleet.leave` / `fleet.forget` from the hub (`machines::leave`,
+   `fleet.leave` / `fleet.forget` from the control plane (`machines::leave`,
    admitted by `lent::admit_fleet`), a member's sent there as
    `fleet.rm`; the links a call ends go after its answer is written.
-   `fleet.place` answers `{on: requester|hub|machine, machine,
+   `fleet.place` answers `{on: requester|control_plane|machine, machine,
    lines}`; a member asks it on every unpinned `run`.
 10. **Identity, then routing over the graph** (L). Identity first
     (decision 44). Sub-steps:
     - **10a Member identity.** Each member holds a private key; a link
       proves both ends' keys in its handshake, so no device acts as
-      another member, or as the hub, without that member's key.
+      another member, or as the control plane, without that member's key.
       - **Signed statements:** signer, payload hash, a version that only
         goes up per signer; every verifier keeps the highest version it
         has seen and refuses older (rollback). What's signed: membership,
-        keys, revocations, the hub, config snapshots (the whole config
+        keys, revocations, the control plane, config snapshots (the whole config
         root's hash plus each moved repo's commit ids, checked by the
         worker against what arrives; decision 39, steps 12-13) and
         delegated config edits.
       - **The authority** (decision 45) signs membership, key changes,
-        revocations and hub changes. The hub stores and serves them,
-        vouching for nothing: a key the hub (or a relay) hands over with
+        revocations and control plane changes. The control plane stores and serves them,
+        vouching for nothing: a key the control plane (or a relay) hands over with
         no authority's or introducer's signature is refused.
       - **Membership is a hash-chained log** whose head members compare
-        with each other directly on every link, so a hub showing two
+        with each other directly on every link, so a control plane showing two
         members different lists is seen.
       - **Joining:** `machine add` shows the joining key's fingerprint
         to check (ssh's first-use trust is the root). A member added by
@@ -580,7 +580,7 @@ can't see them; both invest in what is being removed.
         under the worker policy) nor through an ssh-agent that is
         relayed (decision 30); the OS keychain where there is one.
       - **No fallback:** a link that doesn't prove its keys is refused.
-        Decision 32's hub-only calls check the hub's key, not the name
+        Decision 32's control-plane-only calls check the control plane's key, not the name
         the link announced.
 
       Sub-steps, each a commit (decisions 48-52 settle what the above
@@ -597,12 +597,12 @@ can't see them; both invest in what is being removed.
       - **10a.2 The membership log** (`fleet/membership.rs`, pure;
         `membership.json` next to `state.toml`, daemon-written). A hash
         chain of authority-signed entries: `Genesis {authority, key,
-        hub}`, `Add {name, key}`, `Revoke {name, key}`, `Rotate {name,
-        old, new}` (the new key countersigned by the old) and `Hub
-        {name}`. `apply` verifies every entry into the members, the hub,
+        control_plane}`, `Add {name, key}`, `Revoke {name, key}`, `Rotate {name,
+        old, new}` (the new key countersigned by the old) and `ControlPlane
+        {name}`. `apply` verifies every entry into the members, the control plane,
         the revoked keys and the head; `compare` says same, behind, ahead
         or fork. Introductions sit outside the chain (decision 50).
-        `member.toml`'s `hub` is written only from an accepted log.
+        `member.toml`'s `control_plane` is written only from an accepted log.
       - **10a.3 `machine add` writes the log.** A fleet-creating add
         signs `Genesis` and the target's `Add` here (decision 48); an add
         by the authority signs `Add`; an add by another member signs an
@@ -623,13 +623,13 @@ can't see them; both invest in what is being removed.
       - **10a.5 Trust by the proven key.** `lent::Peer` carries the
         proven key and its introducer (`link.attach` from `fleet-link`,
         the dialer's in-process peer); `lent::admit_fleet` admits the
-        hub-only calls by the log's hub key; a capped member introduces
+        control-plane-only calls by the log's control-plane key; a capped member introduces
         no one (decision 51).
       - **10a.6 Revocation, rotation, approvals.** `machine rm` is a
         `Revoke`, `machine key rotate` a `Rotate`; typed on the
         authority they're signed there, elsewhere proposed to it
         (`fleet.propose`) and approved there (decision 49). A signed
-        change is pushed to the hub and the authority's linked members,
+        change is pushed to the control plane and the authority's linked members,
         the rest catch up on their next link's head comparison; step 9's
         `fleet.leave`/`fleet.forget` follow a valid `Revoke`.
       - **10a.7 Key at rest.** A bind whose source covers `member.key` is
@@ -647,20 +647,20 @@ can't see them; both invest in what is being removed.
       sentinel at version 2. A signed change is pushed to every machine
       the authority holds and flooded on by each host whose log it made
       newer (`fleet.sync`, `membership_api::sync`). `member.set` takes no
-      `hub`; `machines.add` takes a mandatory `key` (the fingerprint the
+      `control_plane`; `machines.add` takes a mandatory `key` (the fingerprint the
       user confirmed, checked against the target's `member.get`) and
-      `hub`, and `membership.sign` answers unchanged for a name already in
+      `control_plane`, and `membership.sign` answers unchanged for a name already in
       under that key, so a failed add can be run again. `membership.json`
       and `proposals.json` sit next to `member.toml`. A rotation makes
       `member.key.next`, promoted over `member.key` once a log the host
       takes lists it (`membership_api::settle`), after which the host's
       links cycle and redial (`Shared::key_rotated`). Introductions made
       by a non-authority `machine add` are proposed as `fleet.propose
-      {kind: add}` after the add. No command signs a `hub` entry yet
+      {kind: add}` after the add. No command signs a `control_plane` entry yet
       (step 11). The key guard (`key_guard`) also refuses a build whose
       context, dockerfile, `--build-context`, `--secret` or `--ssh` path
       covers the key.
-    - **10b Routing.** Members report their links and the hub publishes
+    - **10b Routing.** Members report their links and the control plane publishes
       the graph; routed streams are spliced hop by hop toward a
       destination (an `Open` naming it), each naming the member it
       started on, proven by that member's key (10a), so a relay can't
@@ -684,13 +684,13 @@ can't see them; both invest in what is being removed.
         through always-on members, the oldest `since`; an edge is up when
         the newer of its two ends' reports says so.
       - **10b.2 Reports and the published graph.** Each member sends
-        `fleet.report` to the hub on a link-state change (debounced) and
-        when its hub link comes up; the hub collects them and pushes the
+        `fleet.report` to the control plane on a link-state change (debounced) and
+        when its control-plane link comes up; the control plane collects them and pushes the
         graph to its linked members as `changes::push` does the log.
         Every member keeps the graph it has and answers `fleet.graph`
         with it (the reports verify themselves, so a member with no link
-        to the hub gets it from a neighbor); `graph.get` for local
-        clients. `lent::admit_fleet`: `fleet.report` on the hub only,
+        to the control plane gets it from a neighbor); `graph.get` for local
+        clients. `lent::admit_fleet`: `fleet.report` on the control plane only,
         `fleet.graph` from any log member or held introduction.
       - **10b.3 The routed opening** (`fleet/route.rs`). `channel::ROUTE`
         and `caps::ROUTE` (decision 53; the helper never sees it),
@@ -713,16 +713,16 @@ can't see them; both invest in what is being removed.
         `route::connect(dir, name, channel)`: `fleet-<name>.sock` first,
         else `route-<name>.sock`; every link-socket caller uses it.
       - **10b.6 Routed machines get actions** (decision 60). Routed
-        entries in `Machines` (no link of their own; rows still the hub's
+        entries in `Machines` (no link of their own; rows still the control plane's
         view), quick calls, verbs, terminals and forwards over
         `route::connect`; decision 33's `seen_via` refusals go, except
         the agent toggle's (decision 58).
       - **10b.7 Fleet calls over any path.** `changes::propose` (lifting
         decision 49's direct-link limit) and an add's introduction,
-        `leave::remove`'s `fleet.forget`, `ask_hub`; `run --place`
+        `leave::remove`'s `fleet.forget`, `ask_control_plane`; `run --place`
         candidates and code moves to routed machines
         (`placed::reachable_workers`, `member_workers`).
-      - **10b.8 Exposure from the graph.** `graph::exposure`: the hub is
+      - **10b.8 Exposure from the graph.** `graph::exposure`: the control plane is
         exposed; so is every member an exposed one dials (it has a shell
         there) and every `full` member an exposed one reaches, to a fixed
         point, each with its chain. `member.get`'s `exposed_by`, `machine
@@ -734,9 +734,9 @@ can't see them; both invest in what is being removed.
         step's as-built note.
 
       As built: `fleet.graph {reports}` is both the link-up exchange
-      and the push, and every member, not only the hub, floods a graph
+      and the push, and every member, not only the control plane, floods a graph
       change to its connected links (not back to the one peer it came
-      from). A member's report is due at once on its hub link coming up
+      from). A member's report is due at once on its control-plane link coming up
       and on a `member.set` that changes `trust`. `route-<name>.sock` is
       bound only for members with no connected link here, and
       `route::connect` tries `fleet-<name>.sock` first; the held link's
@@ -747,9 +747,9 @@ can't see them; both invest in what is being removed.
       read of an opening waits at most `route::OPENING` (10 s) at a hop,
       each path's attempt `routes::ATTEMPT` (5 s), all within the hello
       wait. Routed machines are the graph's members with a path and no
-      link here plus the hub view's (`snapshots::routed`), `via` the
-      first hop that's up (the hub for one only the view lists); the
-      dashboard's Machines tab shows only the view's, `via` the hub.
+      link here plus the control-plane view's (`snapshots::routed`), `via` the
+      first hop that's up (the control plane for one only the view lists); the
+      dashboard's Machines tab shows only the view's, `via` the control plane.
       Exposure counts a link that dials whatever its state, and a
       reach over links in any state.
     - **10c End-to-end sessions** (its own step, decision 47). Each
@@ -802,74 +802,74 @@ can't see them; both invest in what is being removed.
       a dialed end's `agent-link-<peer>.sock` (`Shared::fleet_peer`), and
       an agent grant isn't counted as exposure (both in
       `docs/status.md`).
-11. **Hub swap, pointer** (S–M, shipped as 11a-11c). `machine hub <m>`: the role moves, links
-    stay; every reachable member rewrites `hub`, a late one learns it on
+11. **Control-plane swap, pointer** (S–M, shipped as 11a-11c). `machine control-plane <m>`: the role moves, links
+    stay; every reachable member rewrites `control_plane`, a late one learns it on
     reconnect.
 
-    Most of it is there from 10a: the log's `hub` entry (`Op::Hub`,
-    `membership::Membership` checks its target is a member), `hub`
-    written from an adopted log (`membership_api::adopt`, `hub_for`), a
-    live hub change cycling every link (`daemon::Shared::set_hub`), a
+    Most of it is there from 10a: the log's `control_plane` entry (`Op::ControlPlane`,
+    `membership::Membership` checks its target is a member), `control_plane`
+    written from an adopted log (`membership_api::adopt`, `control_plane_for`), a
+    live control-plane change cycling every link (`daemon::Shared::set_control_plane`), a
     late member taking the newer log at its next link's proof and
-    redialing (`proof::hub_moved`), and every role reader asking the hub
+    redialing (`proof::control_plane_moved`), and every role reader asking the control plane
     at its use. What's missing is a way to sign the entry, and an order:
-    `changes::sign` follows the hub (cycling links) before the push, and
+    `changes::sign` follows the control plane (cycling links) before the push, and
     `changes::sync` before its answer is written. Sub-steps, each a
     commit (decisions 68-70 settle what the above left open):
-    - **11a `machine hub <m>`** (decisions 68, 69).
-      `proposals::Change::Hub {name}` and its `check` (a member of the
-      log, not already the hub; an introduced or unknown name `invalid`);
-      `membership.hub {name}` in `machines::changes`, modeled on
-      `membership.rotate`: on the authority the `hub` entry signed, stored,
+    - **11a `machine control-plane <m>`** (decisions 68, 69).
+      `proposals::Change::ControlPlane {name}` and its `check` (a member of the
+      log, not already the control plane; an introduced or unknown name `invalid`);
+      `membership.controlPlane {name}` in `machines::changes`, modeled on
+      `membership.rotate`: on the authority the `control_plane` entry signed, stored,
       pushed, then followed here; elsewhere proposed (`propose`, a pending
       one of the same name answering its id), answered `{"type":
-      "signed"|"proposed", …}`; `membership.approve` signs a `hub`
-      proposal (`sign_change`). Decision 69's order: a host follows a hub
+      "signed"|"proposed", …}`; `membership.approve` signs a `control_plane`
+      proposal (`sign_change`). Decision 69's order: a host follows a control plane
       change only after its push (the authority) or after its flood and
       written answer (a `fleet.sync` that made its log newer: a
       `leave::After` variant, as `After::Rotated` does for a key).
-      `devsandbox machine hub <m>` (`commands::machine`, `main.rs`)
+      `devsandbox machine control-plane <m>` (`commands::machine`, `main.rs`)
       prints what the push reached or the proposal's id and the
       `machine approve` to run on the authority. The refusals that point
-      at step 11 name `machine hub` (`leave::hub_named`, `proposals::check`'s revoke of the hub, `join.rs`'s
-      `--hub` refusal). Docs: `docs/reference/api.md` (`membership.hub`,
-      `fleet.propose`'s `hub` kind, `membership.approve`),
+      at step 11 name `machine control-plane` (`leave::control_plane_named`, `proposals::check`'s revoke of the control plane, `join.rs`'s
+      `--control-plane` refusal). Docs: `docs/reference/api.md` (`membership.controlPlane`,
+      `fleet.propose`'s `control_plane` kind, `membership.approve`),
       `npm/devsandboxes/index.d.ts` (the `dts` check),
       `docs/architecture/daemon/fleet.md` (*Membership log*, *Approvals and
-      pushes*, *Hub mode*), `docs/architecture/daemon/machines.md` (the
+      pushes*, *Control-plane mode*), `docs/architecture/daemon/machines.md` (the
       `machine` CLI section).
     - **11b The role follows on every host.** A member the push missed
       (down while the authority signed) learns at its next link's proof
-      and redials saying the new hub; everything that reads the role
+      and redials saying the new control plane; everything that reads the role
       follows a live change with no restart: the federated watch moves to
-      the new hub (`service::Hooks::hub`), link reports go to it
-      (`fleet::reports`), the hub-only `fleet.*` calls are admitted by the
-      new hub's key (`lent::admit_fleet`), the old hub stops saving
+      the new control plane (`service::Hooks::control_plane`), link reports go to it
+      (`fleet::reports`), the control-plane-only `fleet.*` calls are admitted by the
+      new control plane's key (`lent::admit_fleet`), the old control plane stops saving
       `remotes.json` and the new one starts from none
-      (`service::save_loop`), members linked to the new hub follow its
+      (`service::save_loop`), members linked to the new control plane follow its
       build (`fleet_link::follows`). A test for each that has none, a fix
       for any reader that takes the role once.
     - **11c Docs close.** `docs/status.md` (step 11 shipped, next 12;
       decision 70's limitation), this step's as-built note,
       `CHANGELOG.md`.
 
-    As built: `membership.hub {name}` answers `{"type": "signed"|
-    "proposed", …}` (`changes::HubMove`) over the pure `changes::plan_hub`,
-    which reuses `RotatePlan`; naming the hub, an introduced or an unknown
+    As built: `membership.controlPlane {name}` answers `{"type": "signed"|
+    "proposed", …}` (`changes::ControlPlaneMove`) over the pure `changes::plan_control_plane`,
+    which reuses `RotatePlan`; naming the control plane, an introduced or an unknown
     name is `invalid`, a capped asker `denied`. Every authority-signed
-    change now goes `changes::sign`, push, `changes::follow` (hub, then a
-    rotated key). A `fleet.sync` that moved this host's hub (read from
+    change now goes `changes::sign`, push, `changes::follow` (control plane, then a
+    rotated key). A `fleet.sync` that moved this host's control plane (read from
     `member.toml` before the sync) floods before answering and returns
-    `leave::After::Hub`, which also stands for a rotate that came with it
+    `leave::After::ControlPlane`, which also stands for a rotate that came with it
     (one cycle). Both ends of a link cycle it after a move, so it can
     drop twice (`docs/status.md`). 11b found every role reader already
-    live: the federated watch (`service::Hooks::hub` each tick), link
-    reports (`reports::run` each round), the hub-only `fleet.*` calls
+    live: the federated watch (`service::Hooks::control_plane` each tick), link
+    reports (`reports::run` each round), the control-plane-only `fleet.*` calls
     (`lent::admit_fleet` over the log read per call), `remotes.json`
-    (`save_loop`), the peer watch and keep-alive (`Shared::is_hub`) and
+    (`save_loop`), the peer watch and keep-alive (`Shared::is_control_plane`) and
     versions (each dial's hello); it added tests only.
 12. **Transfer v1** (L, shipped as 12a-12g). Repo identity, WIP snapshot commits, bundles
-    routed over the graph, repo caches, the hub mirror, fetch-back.
+    routed over the graph, repo caches, the control-plane mirror, fetch-back.
     Repos without a remote and unpushed work can be placed.
 
     Today (step 3, decision 12) the placing host fetches each folder's
@@ -914,14 +914,14 @@ can't see them; both invest in what is being removed.
       one when the checkout has it, else its current one; a detached
       `HEAD` doesn't move) and a fresh WIP snapshot, on a transient ref
       removed once bundled, `--not` the worker's haves. No `origin`
-      anywhere: `repo::fetch`, `cache_dir` by URL and the hub's
+      anywhere: `repo::fetch`, `cache_dir` by URL and the control plane's
       `Options::repos` go, and the `NotMovable` reasons for a missing,
       unreachable or behind origin with them. `place::Spec::repo` is the
       identity. `start_point` keeps a new `--branch` starting at the
       bundled branch.
-    - **12d The hub mirror** (decision 75). A placing host that isn't the
-      hub, placing on a worker that isn't the hub, sends the same refs
-      to the hub's cache for it too (no checkout), best effort.
+    - **12d The control-plane mirror** (decision 75). A placing host that isn't the
+      control plane, placing on a worker that isn't the control plane, sends the same refs
+      to the control plane's cache for it too (no checkout), best effort.
     - **12e Fetch-back** (decision 76). A pull on `TRANSFER`
       (`transfer.rs`: the opener names what it wants, the other end
       answers a `Header` and the body, or `error`); `instances.fetch
@@ -947,7 +947,7 @@ can't see them; both invest in what is being removed.
     `LinkTransfer` asks `code.haves` (peer-only: the caller's own fleet
     root's roots and each cache's tips) over `route::connect`'s `API`.
     A `bundle` header names its `repo` and `refs`; a 0-byte body means
-    nothing new, and one with no `to` is cache-only (the hub mirror,
+    nothing new, and one with no `to` is cache-only (the control-plane mirror,
     `code::mirror`, after the worker's transfer, failures a note line).
     The source snapshots right before bundling, on a transient
     `refs/devsandbox/wip/send-<nonce>` deleted before anything is sent;
@@ -973,14 +973,14 @@ can't see them; both invest in what is being removed.
     built already: `run --place`, forwarded calls, verbs over the link.
     Ships with the Inbox's removal). As first written: instances carry
     `origin_host` and repo identity; `ls`/the dashboard show where they
-    run. The dispatcher (on the hub) keeps authorizing on its host
+    run. The dispatcher (on the control plane) keeps authorizing on its host
     ([ADR 0030](../../decisions/0030-dispatcher-control-is-authorized-on-the-host.md));
     `dispatch::Executor`'s subprocess becomes a placed, forwarded verb;
-    the hub's `state.toml` records child → machine; `exec`/`run-*` ops go
-    through forwarded calls; `branches` reads the hub's repo cache.
+    the control plane's `state.toml` records child → machine; `exec`/`run-*` ops go
+    through forwarded calls; `branches` reads the control plane's repo cache.
     `max-instances` stays per dispatcher, fleet-wide.
 14. **Checkpoints and re-placement** (M–L). Placed instances checkpoint
-    WIP to the hub's mirror (on idle, every few minutes while dirty, at
+    WIP to the control plane's mirror (on idle, every few minutes while dirty, at
     stop). A child whose member is unreachable past a grace period, or
     `machine rm`'d, is re-ensured on another machine from its last
     checkpoint: same name and `instance_id`, the old copy fenced (its
@@ -995,14 +995,14 @@ can't see them; both invest in what is being removed.
     member (machines-next §2) is dropped with the Inbox.
 16. **Sync layer** (L, later). A second `Transfer` for state git doesn't
     carry: ignored outputs, volumes, caches, live editing. Then build-cache
-    sharing (a registry on the hub, `--cache-from`) and services that span
+    sharing (a registry on the control plane, `--cache-from`) and services that span
     machines (P10) can be revisited.
-17. **Hub handoff** (M). `machine hub <m>` with the old hub alive ships
+17. **Control-plane handoff** (M). `machine control-plane <m>` with the old control plane alive ships
     its state to `m` over `TRANSFER` (repo cache, saved rows, dispatcher
     and placement records, checkpoints) before the role moves; the
-    pointer swap (step 11) stays for a dead hub.
-18. **Fallback hub** (M, later). [A fallback hub](#swapping-the-hub):
-    settle who decides and the old hub's return first.
+    pointer swap (step 11) stays for a dead control plane.
+18. **Fallback control plane** (M, later). [A fallback control plane](#swapping-the-control-plane):
+    settle who decides and the old control plane's return first.
 
 ## Decisions
 
@@ -1014,7 +1014,7 @@ and 16 do, 44-47 as step 10 does, 48-52 as step 10a does, 53-60 as
 step 10b does, 61-67 as step 10c does, 68-70 as step 11 does, 71-77 as
 step 12 does.
 
-1. The hub is `hub = "self"` in `member.toml`; no separate daemon
+1. The control plane is `control_plane = "self"` in `member.toml`; no separate daemon
    setting.
 2. ssh login is the authentication (the user's own account); `machine
    add` refuses a name already in the fleet.
@@ -1023,7 +1023,7 @@ step 12 does.
 4. A fleet root is one pseudo-root per member; the `worker` table lists
    the config roots under it.
 5. Step 1's acceptance test: a config copied by hand under
-   `<data>/devsandbox/fleet/<hub>/`, `run --machine <member>`.
+   `<data>/devsandbox/fleet/<control-plane>/`, `run --machine <member>`.
 6. Until step 4, paths that need ssh to the machine (`exec`, terminal
    tabs, forwards, CLI re-runs) refuse on an offered machine with
    `needs fleet step 4` wording; `logs` / `inspect` use the
@@ -1043,12 +1043,12 @@ step 12 does.
    getting the worker's own dirs, and `worktree-link` is skipped there
    with a warning.)
 10. Self-update: the hello carries git hash + `published`; a member
-    follows the hub's exact version (a downgrade is a forced handoff);
+    follows the control plane's exact version (a downgrade is a forced handoff);
     installs in place at `exe::devsandbox()`. Verified by a signed
     `SHA256SUMS` against the embedded release key, then `fleet-hello`
     ([ADR 0047](../../decisions/0047-release-downloads-are-verified-by-signed-checksums.md)).
 11. Placement runs in the daemon.
-12. Step 3's code: the hub clones `origin` with its own credentials and
+12. Step 3's code: the control plane clones `origin` with its own credentials and
     sends a bundle over `TRANSFER`; a placed member never needs
     credentials. Pulls a slice of step 12 forward (bundle of committed
     refs only).
@@ -1075,10 +1075,10 @@ step 12 does.
     reaches every instance on the member while the dialer's entry has
     `agent` on (relayed sockets picked before the member's own, as
     today).
-19. One fleet per member: `machine add` refuses two hubs.
+19. One fleet per member: `machine add` refuses two control planes.
 20. Once a fleet exists, `run` places by default; `--here` /
     `--machine` / a qualified name override.
-21. Routing is the full graph form (step 10), not hub-relay only.
+21. Routing is the full graph form (step 10), not control-plane-relay only.
 22. Link shape: the dialer's daemon is the answerer and binds the
     per-link sockets; the far end's `fleet-link --peer <dialer>` hands
     each stream to its daemon with `link.attach`; the peer's name is
@@ -1093,69 +1093,69 @@ step 12 does.
     dialer reads it) say nothing about who binds, so every client reaches
     every machine the same way (`fleet-<name>.sock`).
 24. A peer's fleet root is `fleet/<peer member name>/` under the data
-    dir, replacing `lend::fleet_dir_name(<hub target>)`; no migration.
-25. Versions follow the hello's hub flag (`[serve] hub` until step 9):
-    the end that isn't the hub follows a hub peer, whichever end dialed
-    (an ssh machine of a hub self-updates too; a dev build only with
-    `dev-builds` or `full`); two non-hubs need a protocol match.
-26. `lend.toml` goes with lending (step 8); `[serve] hub` stays the hub
-    flag until step 9 puts `hub` in `member.toml`.
+    dir, replacing `lend::fleet_dir_name(<control-plane target>)`; no migration.
+25. Versions follow the hello's control-plane flag (`[serve] control_plane` until step 9):
+    the end that isn't the control plane follows a control-plane peer, whichever end dialed
+    (an ssh machine of a control plane self-updates too; a dev build only with
+    `dev-builds` or `full`); two non-control-planes need a protocol match.
+26. `lend.toml` goes with lending (step 8); `[serve] control_plane` stays the control plane
+    flag until step 9 puts `control_plane` in `member.toml`.
 27. A link `API` stream carries no relay sentinel: inside a mux stream
     there's no login shell to skip; `machines::link::handshake` reads a
     plain hello.
 28. Inbound neighbors are machines from step 8 (rows, forwarding,
     placement), so lending can go without a laptop losing its way to
-    lend; the join rule and hub membership stay step 9.
+    lend; the join rule and control plane membership stay step 9.
 29. `MachineRow.kind` after `machines::Kind`: `ssh` (this host dials
     it) or `inbound` (it dials this host).
 30. The agent keeps decision 18's direction: a laptop that joined with
-    `machine add <hub>` is the dialer, so its agent reaches the hub's
-    instances (while its entry has `agent` on) and the hub's never
+    `machine add <control-plane>` is the dialer, so its agent reaches the control plane's
+    instances (while its entry has `agent` on) and the control plane's never
     reaches the laptop's.
-31. A `run` typed on a member is placed by the hub's decision only:
+31. A `run` typed on a member is placed by the control plane's decision only:
     the member asks `fleet.place` (its spec, capacity and the machines
-    it reaches), the hub answers a machine with its fleet-wide view,
+    it reaches), the control plane answers a machine with its fleet-wide view,
     and the member moves the code and forwards over its own links. Until
     step 10 the candidates are the machines the member links to
-    directly. With the hub unreachable the member runs here, with a
+    directly. With the control plane unreachable the member runs here, with a
     note.
-32. `machine rm <m>` runs on the hub (a member's is sent there as
-    `fleet.rm`): the hub sends `fleet.leave` to `m` (it clears `hub` and
+32. `machine rm <m>` runs on the control plane (a member's is sent there as
+    `fleet.rm`): the control plane sends `fleet.leave` to `m` (it clears `control_plane` and
     drops its own entries) and `fleet.forget {m}` to every member it
     links (each drops its entry for `m`, refuses `m`'s inbound link). A
     member admits `fleet.leave` / `fleet.forget` only from the peer its
-    `member.toml` names as hub; members the hub has no link to learn it
+    `member.toml` names as control plane; members the control plane has no link to learn it
     in step 10.
-33. Machines a member sees only through the hub's federated view are
+33. Machines a member sees only through the control plane's federated view are
     view-only until step 10: their rows and state show, actions,
-    terminals and forwards on them are refused naming the hub. (Spent:
+    terminals and forwards on them are refused naming the control plane. (Spent:
     10b.6 makes them routed machines, decision 60.)
-34. A link's hello names its end's hub (not only a hub flag); a link
-    whose two ends name different hubs is refused.
+34. A link's hello names its end's control plane (not only a control-plane flag); a link
+    whose two ends name different control planes is refused.
 35. A machine's registry name defaults to its member name (`member.get`
     over the add-time probe), so the name `machine add` checks against
     the fleet is the one the fleet knows it by.
-36. `machine add --hub` makes the target the hub: `machines.add` takes a
-    mandatory `hub: boolean`. With neither end in a fleet, `true` makes a
-    fleet of two with the target as hub (the target's `member.set {hub:
-    "self"}`, this host's `hub` the target's name), `false` with this
-    host as hub, as before. With either end in a fleet the join table
+36. `machine add --control-plane` makes the target the control plane: `machines.add` takes a
+    mandatory `control_plane: boolean`. With neither end in a fleet, `true` makes a
+    fleet of two with the target as control plane (the target's `member.set {control_plane:
+    "self"}`, this host's `control_plane` the target's name), `false` with this
+    host as control plane, as before. With either end in a fleet the join table
     decides as before ([Joining and leaving](#joining-and-leaving)); `true`
-    there is refused unless the target already is the hub (moving the
-    role is step 11's `machine hub`). So a laptop holding the configs
-    makes an always-on server the hub with no ssh into the laptop.
+    there is refused unless the target already is the control plane (moving the
+    role is step 11's `machine control-plane`). So a laptop holding the configs
+    makes an always-on server the control plane with no ssh into the laptop.
 37. A member may have no picked roots (amends decision 17): `machines.add`
     takes `roots: []`. When the probe finds no candidate roots, `machine
     add` takes none without asking; with candidates, the picker accepts an
     empty pick, and off a TTY one candidate is taken, several are an
     error as before. No roots picked, nothing is recorded on the machine
-    (no `machine roots add` ssh). A hub or worker that only runs other
+    (no `machine roots add` ssh). A control plane or worker that only runs other
     members' configs (in their fleet roots) is added that way.
 38. A run typed by the user (CLI, dashboard) runs on the member whose
     config it names, never placed (amends decision 20, narrows decision
     31): the user's own sandboxes stay on their machine and nothing waits
-    on the hub. Placement is for dispatcher children (step 13) and an
-    explicit `run --place`, which asks the hub as decision 31 says.
+    on the control plane. Placement is for dispatcher children (step 13) and an
+    explicit `run --place`, which asks the control plane as decision 31 says.
     `--machine` and qualified names still pick the machine. `run --here`
     is dropped: with nothing placed by default there is nothing to opt
     out of.
@@ -1165,7 +1165,7 @@ step 12 does.
     down, the last copy the mesh holds is the current config
     ([ADR 0030](../../decisions/0030-dispatcher-control-is-authorized-on-the-host.md)'s
     check runs against it). When the member running a dispatcher goes
-    down, a per-dispatcher setting says what the hub does: move it to
+    down, a per-dispatcher setting says what the control plane does: move it to
     another member, or notify that it is down.
 40. What ties a sandbox to a host is known before anything moves, two
     ways, both before step 13:
@@ -1182,7 +1182,7 @@ step 12 does.
     As built (`code::ties`): any tie keeps the sandbox home,
     whatever a worker's trust or allowances (per-host satisfaction waits
     on decision 41), and a tied `run --place` runs here with a note
-    before the hub is asked. The pin is `placement = "home"` only (no
+    before the control plane is asked. The pin is `placement = "home"` only (no
     member lists), reported as the first tie. `shared-volumes/` paths
     aren't ties (the worker has its own, decision 43), nor are
     `worktree-link` and its `shared-files/` store (skipped on a worker).
@@ -1205,12 +1205,12 @@ step 12 does.
     for the end of a direct link, and a routed stream reaches its
     destination through other members, so without keys a relay could
     claim to carry another member's stream and get that member's trust.
-    Steps 11-13 lean on the same proof (the hub's calls, signed config
+    Steps 11-13 lean on the same proof (the control plane's calls, signed config
     snapshots), so they build on keys rather than names.
 45. The fleet's authority is one member, H (the user's trusted machine),
     for now: its key alone signs membership, key changes, revocations and
-    hub changes, step 11's included (a hub can't hand its role over by
-    itself). The hub, even always-on, is availability, not authority.
+    control plane changes, step 11's included (a control plane can't hand its role over by
+    itself). The control plane, even always-on, is availability, not authority.
     Adding or revoking a member waits until H is reachable, except
     through an introducer (decision 46).
 46. A member that a non-authority member adds (B joining through
@@ -1222,8 +1222,8 @@ step 12 does.
     routing (10b): proving who opened a stream doesn't stop a relay from
     altering it afterward.
 48. The authority (decision 45) is the host that ran the fleet-creating
-    `machine add`; with `--hub` (decision 36) that's the laptop, the
-    server it adds the hub.
+    `machine add`; with `--control-plane` (decision 36) that's the laptop, the
+    server it adds the control plane.
 49. A membership change typed on another member is forwarded to the
     authority (`fleet.propose`) and waits there for the user's approval
     (`devsandbox machine pending|approve|deny` on the authority, with a
@@ -1277,14 +1277,14 @@ step 12 does.
 59. The graph is the members' own signed link reports (each link's
     peer, who dials, its state and since when, plus the member's trust
     and whether it's always on), one `identity::Statement` per member
-    whose version only goes up. The hub collects and pushes them; every
+    whose version only goes up. The control plane collects and pushes them; every
     member keeps them and serves them to any log member, and a report
     verifies by its signer's key whoever carried it. As built (10b.7):
     every member floods what made its copy newer to its direct links,
-    not only the hub, so a member with no link to the hub stays current.
+    not only the control plane, so a member with no link to the control plane stays current.
 60. Machines reached only over a route are rows of their own
     (`machine ls`, `machines.list`), their instances still from the
-    hub's federated view.
+    control plane's federated view.
 61. A routed stream's session is SIGMA-style over the opening of
     decision 54, with no extra round trip: the destination's challenge
     carries a fresh ephemeral x25519 key and the origin's proof its own,
@@ -1326,25 +1326,25 @@ step 12 does.
     registered, inbound or routed. Decisions 18 and 30 hold as "never
     implicitly": an agent goes where the user granted it, whichever end
     dialed.
-68. `machine hub <m>` is a `hub` entry in the membership log, signed by
+68. `machine control-plane <m>` is a `control_plane` entry in the membership log, signed by
     the authority only (decision 45): typed there it's signed at once
     (the user typing it is the approval), typed on another member it's a
-    `fleet.propose {kind: hub}` approved there with `machine approve`.
+    `fleet.propose {kind: control_plane}` approved there with `machine approve`.
     Its target is a member of the log (an introduced member can't be the
-    hub); it needn't be reachable, so a dead hub can be replaced while the
-    authority is up (not when the dead hub is the authority, the default
-    for a fleet made without `--hub`). Naming the current hub is refused
+    control plane); it needn't be reachable, so a dead control plane can be replaced while the
+    authority is up (not when the dead control plane is the authority, the default
+    for a fleet made without `--control-plane`). Naming the current control plane is refused
     as `invalid` (nothing to sign).
-69. A host follows a hub change (its `hub` rewritten, every link cycled
+69. A host follows a control-plane change (its `control_plane` rewritten, every link cycled
     so both ends redial saying it) only once the change has left it: the
     authority after its push, a host a `fleet.sync` made newer after
     sending the log on and writing its answer. Cycling first would cut
     the links carrying the change; a host it misses still learns it at
-    its next link's proof (`proof::hub_moved`).
-70. The swap moves the role only, not links nor what the hub's view
-    reaches: the new hub's federated view is the machines it links to
+    its next link's proof (`proof::control_plane_moved`).
+70. The swap moves the role only, not links nor what the control plane's view
+    reaches: the new control plane's federated view is the machines it links to
     (one hop, as before), and members watch it federated only over a
-    direct link. A hub off the routing centre (A in `A → K ← B`) shows
+    direct link. A control plane off the routing centre (A in `A → K ← B`) shows
     fewer rows than K would until watches go over routes, which is
     parked, not step 11.
 71. A repo's identity is the first 16 hex of the sha256 over the sorted
@@ -1385,8 +1385,8 @@ step 12 does.
 74. A config root that's a git repo keeps moving as a tar (its `.git`
     left out), so a `folder` inside the config root still doesn't move;
     moving such a root as a repo is parked.
-75. The hub mirror: a placing host that isn't the hub, placing on a
-    worker that isn't the hub, also sends the same refs into the hub's
+75. The control-plane mirror: a placing host that isn't the control plane, placing on a
+    worker that isn't the control plane, also sends the same refs into the control plane's
     cache for it (`fleet/<source>/repos/<id>.git` there, no checkout),
     after the worker's transfer. Best effort: a failure is a note line in
     the run's output and the log, and the run goes on. Nothing prunes it
@@ -1414,19 +1414,19 @@ step 12 does.
 
 ## Open questions
 
-- Withholding (parked): a hub that hides a member's newer signed
+- Withholding (parked): a control plane that hides a member's newer signed
   snapshot can't be told from "there is none" while that member is
   offline, and decision 39 runs the last copy meanwhile. Pushing heads
   directly to every linked member, or a snapshot lifetime, are the
   candidates if it matters later.
 - Fencing in step 14: is "the member stops the stale copy when it
   reconnects" enough, or must a placed instance hold a lease it renews
-  with the hub and stop itself when the lease lapses (laptop offline but
+  with the control plane and stop itself when the lease lapses (laptop offline but
   awake, e.g. off the tailnet)? Either way it ends that copy's sessions,
   which a user may still mean to reattach to (step 14).
 - Checkpoint cadence and size: big untracked files in WIP commits; a size
   cap with a warning, or `.devsandboxignore`?
-- Hub mirror retention: when are WIP refs and repo caches of removed
+- Control-plane mirror retention: when are WIP refs and repo caches of removed
   instances pruned?
 - Services: does a placed child's `global` service move with it, or must
   `global` services pin their dependents to one machine?
@@ -1436,7 +1436,7 @@ step 12 does.
 - Authenticating peers without ssh (later): a transport over the
   tailnet, say, where no ssh login vouches for `--peer` (decision 22).
 - A dispatcher's down-host setting (decision 39): in its sandbox config
-  or the hub's `member.toml`, and after how long a member counts as
+  or the control plane's `member.toml`, and after how long a member counts as
   down? And the worker policy denies dispatcher sockets (decision 9): a
   dispatcher moved onto another member runs under that member's trust
   for its home member, so does each member that may run it need the

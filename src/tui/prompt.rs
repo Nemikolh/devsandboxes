@@ -29,7 +29,7 @@ const HISTORY_CAP: usize = 200;
 /// `exec`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptAction {
-    /// `place`: `--place`, the fleet's hub picks where (else it runs where
+    /// `place`: `--place`, the fleet's control plane picks where (else it runs where
     /// its config is).
     Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String>, place: bool },
     Exec { instance: String, argv: Vec<String> },

@@ -121,7 +121,7 @@ mod tests {
             sandbox: "web".into(),
             root: "/w/cfg".into(),
             folder: "/w/web".into(),
-            remote: "/d/fleet/hub/roots/0123456789abcdef/web".into(),
+            remote: "/d/fleet/control_plane/roots/0123456789abcdef/web".into(),
             repo: "fedcba9876543210".into(),
             branch: "main".into(),
         }

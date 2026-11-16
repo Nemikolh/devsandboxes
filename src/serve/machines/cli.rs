@@ -186,7 +186,7 @@ pub(crate) fn plan(command: &Command, machine: Option<&str>, in_process: bool, m
     if let Some(m) = machine {
         check_name(m)?;
         if matches!(command, Command::Run { place: true, .. }) {
-            bail!("--place asks the hub where to run it; it doesn't go with --machine {m}");
+            bail!("--place asks the control plane where to run it; it doesn't go with --machine {m}");
         }
         let named = name_of(command).is_some();
         let usage = machine_use(Some(command));
@@ -378,7 +378,7 @@ pub(crate) const SSH_FAILED: i32 = 255;
 /// exits [`SSH_FAILED`], as a lost dial does, instead of failing: for a
 /// qualified name under `--reserve-255` (a dashboard tab's dials, which
 /// re-dial on a 255: `tui::app::terminal::Redial`), any failure but
-/// `not-found` and `denied` (a machine seen only through the hub, say) is
+/// `not-found` and `denied` (a machine seen only through the control plane, say) is
 /// the machine's link being down, an outage to wait out.
 pub(crate) fn resolve_lost(qualified: bool, command: &Command, code: &str) -> bool {
     qualified && matches!(command, Command::Exec { reserve_255: true, .. }) && !matches!(code, "not-found" | "denied")
@@ -999,7 +999,7 @@ mod tests {
         assert!(e.ends_with("qualify the name instead: box/<name>"), "{e}");
         for args in [&["run", "web", "--place"][..], &["run", "--place"]] {
             let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
-            assert_eq!(e, "--place asks the hub where to run it; it doesn't go with --machine box", "{args:?}");
+            assert_eq!(e, "--place asks the control plane where to run it; it doesn't go with --machine box", "{args:?}");
         }
         for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["machine", "trust", "full"], "machine"),
             (&["machine", "roots", "add", "/x"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api")]
@@ -1274,10 +1274,10 @@ mod tests {
     /// login shell), then attach only, both at the instance's root there.
     #[test]
     fn tty_execs_dial_over_the_link() {
-        let root = Path::new("/w/fleet/hub/cfg");
+        let root = Path::new("/w/fleet/control_plane/cfg");
         let exec = command(&["exec", "-it", "box/web", "zidane", "-c"]);
         let request = |create: Option<Vec<String>>| pty_client::Request {
-            root: "/w/fleet/hub/cfg".into(),
+            root: "/w/fleet/control_plane/cfg".into(),
             instance: "web-2".into(),
             mode: pty_client::Mode::Session { id: ID.into(), create },
         };

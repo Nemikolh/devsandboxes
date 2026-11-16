@@ -79,7 +79,7 @@ pub struct HelloParams {
     #[serde(default)]
     pub client: String,
     /// Hand off to this client's binary whatever its version, an older one
-    /// included: a fleet worker that installed its hub's version
+    /// included: a fleet worker that installed its control plane's version
     /// (`fleet::update`, ADR 0042). Honored only on a local connection from
     /// this daemon's own uid (`daemon::hello`), never on a `Worker` one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

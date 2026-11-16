@@ -311,11 +311,11 @@ mod tests {
         use super::super::link::{self, Serves};
         let dir = scratch("w");
         let (agent, _) = echo_agent(&dir);
-        let (worker_io, hub_io) = UnixStream::pair().unwrap();
-        let cut = hub_io.try_clone().unwrap();
+        let (worker_io, control_plane_io) = UnixStream::pair().unwrap();
+        let cut = control_plane_io.try_clone().unwrap();
         let api = dir.join("fleet-w.sock");
         let on = Arc::new(AtomicBool::new(false));
-        let hub = {
+        let control_plane = {
             let (on, agent) = (Arc::clone(&on), agent.clone());
             std::thread::spawn(move || {
                 let open = move || {
@@ -326,7 +326,7 @@ mod tests {
                 };
                 let serves = Serves::default().with(channel::AGENT, open);
                 let endpoint = link::Endpoint { socket: Some(&api), serves, outlet: None, auth: None };
-                link::opener_with(&LINK, hub_io.try_clone().unwrap(), hub_io, endpoint, |_| Ok(()))
+                link::opener_with(&LINK, control_plane_io.try_clone().unwrap(), control_plane_io, endpoint, |_| Ok(()))
             })
         };
         let outlet = Arc::new(Outlet::default());
@@ -336,7 +336,7 @@ mod tests {
             let endpoint = link::Endpoint { serves, outlet: Some(&answering), ..link::Endpoint::default() };
             link::answerer_with(&LINK, worker_io.try_clone().unwrap(), worker_io, endpoint, |_| Ok(()), || {})
         });
-        let path = endpoint::link_agent_socket(&dir, "hub");
+        let path = endpoint::link_agent_socket(&dir, "control_plane");
         let over = Arc::new(AtomicBool::new(false));
         let serving = {
             let (path, outlet, over) = (path.clone(), Arc::clone(&outlet), Arc::clone(&over));
@@ -376,7 +376,7 @@ mod tests {
         assert!(!path.exists(), "unlinked");
         assert!(endpoint::agent_sockets(&dir).is_empty(), "no stale socket for a bridge to pick");
         assert!(matches!(worker.join().unwrap(), link::End::Closed));
-        hub.join().unwrap().unwrap();
+        control_plane.join().unwrap().unwrap();
         assert!(!over.load(Ordering::Relaxed), "it ended with the outlet, not the flag");
         let _ = std::fs::remove_dir_all(&dir);
     }

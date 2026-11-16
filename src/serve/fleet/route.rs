@@ -543,7 +543,7 @@ mod tests {
         key(n).public_key()
     }
 
-    /// `lap` (1) the authority, `k` (2) the hub, `b` (3), `m` (4); one
+    /// `lap` (1) the authority, `k` (2) the control plane, `b` (3), `m` (4); one
     /// fleet id, so every call is the same fleet.
     fn stored() -> Stored {
         let mut log = Log::default();

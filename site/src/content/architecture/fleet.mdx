@@ -1,6 +1,6 @@
 ---
 title: Machines to fleet
-description: How remote machines went from per-use ssh to one held link per machine pair, with a hub that places work, in steps 1 to 8, and what is still planned.
+description: How remote machines went from per-use ssh to one held link per machine pair, with a control plane that places work, in steps 1 to 8, and what is still planned.
 eyebrow: ARCHITECTURE · 04
 order: 4
 ---
@@ -12,7 +12,7 @@ import ThreeMachines from '../../components/architecture/ThreeMachines.astro';
 import { why, phases, commands, machines, steps, limits } from './fleet-data';
 
 A machine used to be a remote you drove over ssh. Now every machine you add is a member of one fleet: it stays
-connected, a hub can run work on it, and it decides how much other machines may do there. This page goes from
+connected, a control plane can run work on it, and it decides how much other machines may do there. This page goes from
 why, to how it got here (`7716cb8` to `main`), down to the code.
 
 ## Why
@@ -38,7 +38,7 @@ including the steps 1–6 behavior where it differed.
 
 ## Three machines
 
-One hub K, one laptop L that accepts no ssh, one box B reached from K. Each tab is the same setup at one stage;
+One control plane K, one laptop L that accepts no ssh, one box B reached from K. Each tab is the same setup at one stage;
 the arrows below each diagram explain it.
 
 <ThreeMachines states={machines} id="tm" label="Stage" />

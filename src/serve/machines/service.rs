@@ -19,27 +19,27 @@
 //! each of them while a local connection watches with `machines: true`
 //! ([`Hooks::watching`]), and stores every pushed `instances.snapshot` in
 //! the shared [`Remotes`] ([`Hooks::changed`] then re-publishes). The link
-//! to this host's hub ([`Hooks::hub`]: another member) also watches the
-//! hub's fleet root for this host (its `roots.list`'s `fleet` row) with
+//! to this host's control plane ([`Hooks::control_plane`]: another member) also watches the
+//! control plane's fleet root for this host (its `roots.list`'s `fleet` row) with
 //! `machines: true`, the federated view, whose other machines are kept as
-//! the hub's `snapshots::Machine::fleet` (`snapshots::fleet_view`). A carrier
+//! the control plane's `snapshots::Machine::fleet` (`snapshots::fleet_view`). A carrier
 //! that's down, a failed connect or a lost link is `unreachable` with the
 //! reason, rows kept; a failed connect or lost link over a live carrier is
 //! retried with a doubling backoff, a carrier coming back is dialed at
 //! once. A failure is logged when it differs from the last one logged since
 //! the link (or carrier) was last up, not per retry.
 //!
-//! A hub also saves `Remotes` to `remotes.json` (`machines::saved`) from a
+//! A control plane also saves `Remotes` to `remotes.json` (`machines::saved`) from a
 //! `serve-remotes` thread, at most every `saved::SAVE_EVERY` while rows
 //! change and once more at the stop, and restores it at the start: those
 //! rows (and their machine's roots as last listed) show `unreachable`
 //! until their machine's link connects, and stay until it lists. Whether
-//! this host is the hub is asked each time ([`Hub::is_hub`]: `member.toml`'s
-//! `hub` can change under a running daemon), so a host that stops being
-//! the hub stops saving, one that becomes it saves from the next change.
+//! this host is the control plane is asked each time ([`ControlPlane::is_control_plane`]: `member.toml`'s
+//! `control_plane` can change under a running daemon), so a host that stops being
+//! the control plane stops saving, one that becomes it saves from the next change.
 //!
 //! [`Handle::cycle`] ends every ssh machine's carrier and redials it at
-//! once, with no backoff (this host's hub changed: its hello did).
+//! once, with no backoff (this host's control plane changed: its hello did).
 //!
 //! Forwarded calls reach the thread over its channel, one in flight
 //! per machine, each with [`Timing::call`] to answer. A timed-out call drops
@@ -48,9 +48,9 @@
 //! (or waits for the carrier's first attempt to end).
 //!
 //! Routed machines ([`Handle::routed`], fleet plan decision 60: members of
-//! this host's link graph with no link up here, or ones its hub's view
+//! this host's link graph with no link up here, or ones its control plane's view
 //! lists) have no thread: nothing holds or watches them (their rows are the
-//! hub's view's). A call forwarded to one opens an `API` stream of its own
+//! control plane's view's). A call forwarded to one opens an `API` stream of its own
 //! over the [`RouteDial`] (`fleet::route::connect`), says hello, makes the
 //! call within [`Timing::call`] and closes it, on the caller's thread.
 //!
@@ -121,9 +121,9 @@ pub struct Hooks {
     /// A machine's rows or state changed: re-publish the federated
     /// snapshots.
     pub changed: Box<dyn Fn() + Send + Sync>,
-    /// This host's hub, when another member is (`member.toml`'s `hub`, as
+    /// This host's control plane, when another member is (`member.toml`'s `control_plane`, as
     /// the daemon keeps it): asked at each look at the watchers.
-    pub hub: Box<dyn Fn() -> Option<HubOf> + Send + Sync>,
+    pub control_plane: Box<dyn Fn() -> Option<ControlPlaneOf> + Send + Sync>,
     /// The members this host's link graph routes to (no link up here),
     /// each with the first hop of its first usable path or why there is
     /// none. Called on API threads (it may read `membership.json`), never
@@ -131,13 +131,13 @@ pub struct Hooks {
     pub routed: Box<dyn Fn() -> Vec<(String, Result<String, String>)> + Send + Sync>,
 }
 
-/// This host as a member of a fleet whose hub is another member.
+/// This host as a member of a fleet whose control plane is another member.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubOf {
-    /// The hub's member name: the machine whose link watches with
+pub struct ControlPlaneOf {
+    /// The control plane's member name: the machine whose link watches with
     /// `machines: true`.
-    pub hub: String,
-    /// This host's own member name: never taken from the hub's view.
+    pub control_plane: String,
+    /// This host's own member name: never taken from the control plane's view.
     pub me: String,
 }
 
@@ -146,27 +146,27 @@ pub struct HubOf {
 /// is `fleet::dialer::Dialer::hold`; tests fake it.
 pub type Hold = Arc<dyn Fn(&Entry, &Held) -> String + Send + Sync>;
 
-/// Where a fleet hub's `Remotes` lives on, and whether this host is the
-/// hub now (`member.toml`'s `hub = "self"`, as the daemon keeps it).
-pub struct Hub {
+/// Where a fleet control plane's `Remotes` lives on, and whether this host is the
+/// control plane now (`member.toml`'s `control_plane = "self"`, as the daemon keeps it).
+pub struct ControlPlane {
     /// `remotes.json` (`saved::path`; a scratch file in tests).
     pub remotes: PathBuf,
-    pub is_hub: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub is_control_plane: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// The service, owned by the daemon's `run`. Dropping it stops and joins
 /// every link (closing its connection, killing its carrier's ssh), then a
-/// hub's last save.
+/// control plane's last save.
 pub struct Machines {
     inner: Arc<Inner>,
     saver: Option<JoinHandle<()>>,
 }
 
-/// A hub's save of `Remotes`: the file and the `serve-remotes` thread's
+/// A control plane's save of `Remotes`: the file and the `serve-remotes` thread's
 /// wake-ups.
-struct HubSave {
+struct ControlPlaneSave {
     path: PathBuf,
-    is_hub: Arc<dyn Fn() -> bool + Send + Sync>,
+    is_control_plane: Arc<dyn Fn() -> bool + Send + Sync>,
     state: Mutex<SaveState>,
     cv: Condvar,
 }
@@ -205,8 +205,8 @@ struct Inner {
     remotes: Arc<Remotes>,
     links: Mutex<BTreeMap<String, LinkThread>>,
     stopped: AtomicBool,
-    /// `Some` on a daemon that may be a fleet hub ([`HubSave::is_hub`]).
-    hub: Option<HubSave>,
+    /// `Some` on a daemon that may be a fleet control plane ([`ControlPlaneSave::is_control_plane`]).
+    control_plane: Option<ControlPlaneSave>,
 }
 
 /// One machine's threads, as the service holds them.
@@ -323,7 +323,7 @@ impl Held<'_> {
     }
 
     /// The carrier is connected but serves nothing yet, with why (it
-    /// waits for the hub's build): the machine shows `unreachable`, why.
+    /// waits for the control plane's build): the machine shows `unreachable`, why.
     pub fn note(&self, why: String) {
         self.set(false, Some(why));
     }
@@ -367,8 +367,8 @@ impl Machines {
     /// of `inbound` (from now on as they come and go), each held at once.
     /// `dial` opens a machine's link (its `fleet-<name>.sock`, or a test
     /// daemon's socket), `route` a routed machine's stream, `hold` carries
-    /// an ssh machine's link. A `hub`'s saved
-    /// rows are restored before the links start when this host is the hub
+    /// an ssh machine's link. A `control_plane`'s saved
+    /// rows are restored before the links start when this host is the control plane
     /// then.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -379,10 +379,10 @@ impl Machines {
         hold: Hold,
         timing: Timing,
         hooks: Hooks,
-        hub: Option<Hub>,
+        control_plane: Option<ControlPlane>,
         log: fn(&str),
     ) -> Machines {
-        let hub = hub.map(|h| HubSave { path: h.remotes, is_hub: h.is_hub, state: Mutex::default(), cv: Condvar::new() });
+        let control_plane = control_plane.map(|h| ControlPlaneSave { path: h.remotes, is_control_plane: h.is_control_plane, state: Mutex::default(), cv: Condvar::new() });
         let inner = Arc::new(Inner {
             registry,
             inbound,
@@ -396,10 +396,10 @@ impl Machines {
             remotes: Arc::default(),
             links: Mutex::new(BTreeMap::new()),
             stopped: AtomicBool::new(false),
-            hub,
+            control_plane,
         });
-        let saver = inner.hub.as_ref().and_then(|h| {
-            if (h.is_hub)() {
+        let saver = inner.control_plane.as_ref().and_then(|h| {
+            if (h.is_control_plane)() {
                 match saved::load(&h.path) {
                     Ok(s) => inner.remotes.restore(saved::machines(s)),
                     Err(e) => log(&format!("machines: {e:#}")),
@@ -435,9 +435,9 @@ impl Drop for Machines {
         self.inner.stopped.store(true, Ordering::SeqCst);
         let links = std::mem::take(&mut *self.inner.lock_links());
         stop_all(links.into_values().collect());
-        if let Some(hub) = &self.inner.hub {
-            lock(&hub.state).stop = true;
-            hub.cv.notify_all();
+        if let Some(control_plane) = &self.inner.control_plane {
+            lock(&control_plane.state).stop = true;
+            control_plane.cv.notify_all();
         }
         if let Some(saver) = self.saver.take() {
             let _ = saver.join();
@@ -450,33 +450,33 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// A hub's `serve-remotes` thread: each change of the rows saves them,
+/// A control plane's `serve-remotes` thread: each change of the rows saves them,
 /// at most every `saved::SAVE_EVERY` ([`saved::save_wait`]); the stop saves
 /// what's left at once. A failed save is logged; the next change retries.
-/// Changes while this host isn't the hub are dropped.
+/// Changes while this host isn't the control plane are dropped.
 fn save_loop(inner: &Inner) {
-    let Some(hub) = &inner.hub else { return };
+    let Some(control_plane) = &inner.control_plane else { return };
     let mut last: Option<Instant> = None;
     loop {
         {
-            let mut s = lock(&hub.state);
+            let mut s = lock(&control_plane.state);
             while !s.dirty && !s.stop {
-                s = hub.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+                s = control_plane.cv.wait(s).unwrap_or_else(|e| e.into_inner());
             }
             if !s.dirty {
                 return;
             }
             let wait = saved::save_wait(last, Instant::now());
             if !wait.is_zero() && !s.stop {
-                drop(hub.cv.wait_timeout(s, wait));
+                drop(control_plane.cv.wait_timeout(s, wait));
                 continue;
             }
             s.dirty = false;
         }
-        if !(hub.is_hub)() {
+        if !(control_plane.is_control_plane)() {
             continue;
         }
-        if let Err(e) = saved::save(&hub.path, &saved::of(&inner.remotes.all(), now_unix())) {
+        if let Err(e) = saved::save(&control_plane.path, &saved::of(&inner.remotes.all(), now_unix())) {
             (inner.log)(&format!("machines: cannot save remotes: {e:#}"));
         }
         last = Some(Instant::now());
@@ -501,11 +501,11 @@ impl Inner {
         lock(&self.links)
     }
 
-    /// The rows changed: a hub saves them soon.
+    /// The rows changed: a control plane saves them soon.
     fn rows_changed(&self) {
-        if let Some(hub) = &self.hub {
-            lock(&hub.state).dirty = true;
-            hub.cv.notify_all();
+        if let Some(control_plane) = &self.control_plane {
+            lock(&control_plane.state).dirty = true;
+            control_plane.cv.notify_all();
         }
     }
 }
@@ -526,7 +526,7 @@ fn with_inbound(mut entries: Vec<Entry>, inbound: &Neighbors) -> Vec<Entry> {
 impl Handle {
     /// Re-read the registry and the inbound neighbors: start links for new
     /// machines, stop (and drop the rows of) removed ones, restart changed
-    /// ones. A machine's roots and rows stay as its link (or a hub's
+    /// ones. A machine's roots and rows stay as its link (or a control plane's
     /// restore) left them: its roots are its listing's, not the registry's.
     /// `machines.add` and `.rm` call it, as does the neighbors' hook; a
     /// registry that doesn't load is logged and changes nothing.
@@ -567,7 +567,7 @@ impl Handle {
     }
 
     /// End every ssh machine's carrier and redial it at once (this host's
-    /// hub changed, so its hello did; the far end's `fleet-link` exits with
+    /// control plane changed, so its hello did; the far end's `fleet-link` exits with
     /// it). An inbound machine's carrier is its `fleet-link` here, which the
     /// daemon ends itself (`links.cycle`).
     pub fn cycle(&self) {
@@ -587,7 +587,7 @@ impl Handle {
 
     /// The machines as of the last reload (the registry's and the inbound
     /// neighbors'), sorted by name, each with its live roots (`Remotes`':
-    /// what its link's last `roots.list` answered, before that what a hub
+    /// what its link's last `roots.list` answered, before that what a control plane
     /// restored, else none): what a forwarded verb dials and a federated
     /// call fans out to, without a registry read per request.
     pub fn entries(&self) -> Vec<Entry> {
@@ -619,7 +619,7 @@ impl Handle {
     }
 
     /// The routed machines now (`snapshots::routed`): the graph's
-    /// ([`Hooks::routed`]) and the hub view's, none with a link here.
+    /// ([`Hooks::routed`]) and the control-plane view's, none with a link here.
     pub fn routed(&self) -> Vec<snapshots::Routed> {
         self.inner.remotes.routed((self.inner.hooks.routed)())
     }
@@ -704,7 +704,7 @@ impl Handle {
     /// A fresh `API` stream to member `machine`'s daemon over any path:
     /// its own link while that's connected, else a route (the
     /// [`RouteDial`]). Why neither, naming the link's and the route's
-    /// failures. What the fleet's calls to a member dial (the hub's
+    /// failures. What the fleet's calls to a member dial (the control plane's
     /// `fleet.place`, a placement's `capacity.get` and `roots.list`).
     pub fn open_member(&self, machine: &str) -> Result<Duplex, String> {
         let direct = match self.direct_up(machine) {
@@ -797,7 +797,7 @@ fn carry(entry: &Entry, inner: &Inner, ctl: &Ctl, tx: &Sender<Cmd>) {
         let mut why = (inner.hold)(entry, &held);
         let cycled = ctl.cycled.swap(false, Ordering::SeqCst);
         if cycled {
-            why = "this host's hub changed: redialing".into();
+            why = "this host's control plane changed: redialing".into();
         }
         {
             let mut c = lock(&ctl.carrier);
@@ -844,7 +844,7 @@ struct LinkLoop<'a> {
     /// The carrier generation this link last dialed.
     generation: u64,
     /// The machine's last `roots.list` answer over this link (its `fleet`
-    /// row is the hub's fleet root for this host).
+    /// row is the control plane's fleet root for this host).
     listing: Vec<crate::serve::api::RootCandidate>,
     /// A [`Cmd::Relist`] came: list again on the connected loop.
     relist: bool,
@@ -1032,14 +1032,14 @@ impl<'a> LinkLoop<'a> {
                 return End::Lost(why);
             }
             // The remote polls its runtime for a watch: only while a local
-            // watcher wants machines. This host's hub is watched federated
+            // watcher wants machines. This host's control plane is watched federated
             // too, for the machines it sees.
             let roots = (self.inner.hooks.watching)();
-            let hub = (self.inner.hooks.hub)().filter(|h| h.hub == name);
-            if hub.is_none() {
+            let control_plane = (self.inner.hooks.control_plane)().filter(|h| h.control_plane == name);
+            if control_plane.is_none() {
                 self.drop_fleet();
             }
-            let want = Want { roots, fleet: roots && hub.is_some() };
+            let want = Want { roots, fleet: roots && control_plane.is_some() };
             if want != watched.asked || (want.roots && watched.roots != self.entry.roots) {
                 if let Err(why) = self.watch(link, &mut watched, want) {
                     return End::Lost(why);
@@ -1076,7 +1076,7 @@ impl<'a> LinkLoop<'a> {
         }
     }
 
-    /// Ask the machine's `roots.list`: its rows kept for the hub's fleet
+    /// Ask the machine's `roots.list`: its rows kept for the control plane's fleet
     /// root ([`Self::watch`]), its roots the machine's from now on, in the
     /// answer's order ([`Self::apply_roots`]). A row with an `error` (a recorded root
     /// whose directory is gone) is dropped unless it's the `fleet` one:
@@ -1110,7 +1110,7 @@ impl<'a> LinkLoop<'a> {
 
     /// Make `listed` (a `roots.list` answer) the machine's roots, here and
     /// in `Remotes` with `default` (its [`super::default_root`]), the
-    /// machine `listed` from now on: a root no longer listed loses its rows (a hub's
+    /// machine `listed` from now on: a root no longer listed loses its rows (a control plane's
     /// restored ones too). Under the links lock, as `reload` syncs
     /// `Remotes` under it, so a link no longer in the table (stopping)
     /// leaves `Remotes` to the reload. No deadlock: the lock order is
@@ -1143,8 +1143,8 @@ impl<'a> LinkLoop<'a> {
 
     /// Go from what `watched` has to `want`: everything watched is
     /// unwatched, then each root `instances.watch`ed plain and, for the
-    /// hub, its fleet root for this host (the last `roots.list`'s `fleet`
-    /// row: there even on a hub with no config root of its own) with
+    /// control plane, its fleet root for this host (the last `roots.list`'s `fleet`
+    /// row: there even on a control plane with no config root of its own) with
     /// `machines: true`. A root the remote refuses (gone since it
     /// listed) is the machine's `error`, the others still watched; a dead
     /// connection is lost.
@@ -1195,7 +1195,7 @@ impl<'a> LinkLoop<'a> {
         Ok(())
     }
 
-    /// This machine is no longer this host's hub: its fleet view goes.
+    /// This machine is no longer this host's control plane: its fleet view goes.
     fn drop_fleet(&self) {
         let mut had = false;
         self.inner.remotes.update(&self.entry.name, |m| had = m.fleet.take().is_some());
@@ -1219,13 +1219,13 @@ impl<'a> LinkLoop<'a> {
     }
 
     /// A pushed snapshot of one of the machine's roots: its rows now. The
-    /// push of `fleet` (the hub's fleet root, watched federated) is split:
-    /// the machines it sees are the hub's fleet view
+    /// push of `fleet` (the control plane's fleet root, watched federated) is split:
+    /// the machines it sees are the control plane's fleet view
     /// (`snapshots::fleet_view`), the rest that root's own rows.
     fn store(&self, mut params: Value, fleet: Option<&std::path::Path>) {
         let Some(dir) = params.get("dir").and_then(Value::as_str).map(PathBuf::from) else { return };
         if fleet == Some(dir.as_path()) {
-            let me = (self.inner.hooks.hub)().map(|h| h.me);
+            let me = (self.inner.hooks.control_plane)().map(|h| h.me);
             let view = Arc::new(snapshots::fleet_view(&mut params, me.as_deref()));
             self.inner.remotes.update(&self.entry.name, |m| m.fleet = Some(view));
             if !self.entry.roots.contains(&dir) {
@@ -1264,7 +1264,7 @@ impl<'a> LinkLoop<'a> {
 struct Want {
     /// Each of the machine's roots (a local watcher wants machines).
     roots: bool,
-    /// The fleet through it (it's this host's hub, and `roots`).
+    /// The fleet through it (it's this host's control plane, and `roots`).
     fleet: bool,
 }
 
@@ -1274,7 +1274,7 @@ struct Watched {
     /// What it last asked for (a refused fleet watch isn't retried every
     /// tick: only once the want changes, or on the next connect).
     asked: Want,
-    /// The hub's fleet root for this host, watched with `machines: true`.
+    /// The control plane's fleet root for this host, watched with `machines: true`.
     fleet: Option<PathBuf>,
     /// The machine's roots as last watched: the ones to unwatch, and a
     /// new listing of other roots watches again.
@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     fn no_hooks() -> Hooks {
-        Hooks { watching: Box::new(|| false), changed: Box::new(|| {}), hub: Box::new(|| None), routed: Box::new(Vec::new) }
+        Hooks { watching: Box::new(|| false), changed: Box::new(|| {}), control_plane: Box::new(|| None), routed: Box::new(Vec::new) }
     }
 
     /// No routed machine is ever dialed in these tests.
@@ -1454,9 +1454,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ---- inbound machines and a hub -----------------------------------------
+    // ---- inbound machines and a control plane -----------------------------------------
 
-    static HUB_LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static CONTROL_PLANE_LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     /// Inbound neighbor `w` (announced: the returned guard) and ssh machine
     /// `s`, nobody watching; `w`'s fleet-link socket is "up" while the flag
@@ -1466,7 +1466,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn inbound_and_ssh(
         base: &Path,
-        hub: Option<Hub>,
+        control_plane: Option<ControlPlane>,
         log: fn(&str),
     ) -> (Machines, inbound::Guard, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
         let registry = base.join("machines.toml");
@@ -1487,7 +1487,7 @@ mod tests {
         };
         let runs = Arc::new(Mutex::new(Vec::new()));
         let hold = fake_hold(&Arc::new(AtomicBool::new(false)), &runs);
-        let machines = Machines::spawn(registry, neighbors, dial, no_route(), hold, opts(1, 0).machine_timing, no_hooks(), hub, log);
+        let machines = Machines::spawn(registry, neighbors, dial, no_route(), hold, opts(1, 0).machine_timing, no_hooks(), control_plane, log);
         (machines, guard, up, dials, runs)
     }
 
@@ -1498,11 +1498,11 @@ mod tests {
     #[test]
     fn every_link_is_held() {
         let base = short_scratch("held");
-        let (machines, _w, up, dials, runs) = inbound_and_ssh(&base, None, |l| HUB_LOGGED.lock().unwrap().push(l.into()));
+        let (machines, _w, up, dials, runs) = inbound_and_ssh(&base, None, |l| CONTROL_PLANE_LOGGED.lock().unwrap().push(l.into()));
         let h = machines.handle();
         wait_for("the inbound link retrying", Duration::from_secs(5), || ran(&dials, "w") >= 3);
         assert_eq!(h.remotes().get("w").unwrap().state, LinkState::Unreachable);
-        let logged: Vec<_> = HUB_LOGGED.lock().unwrap().iter().filter(|l| l.starts_with("machine w: ")).cloned().collect();
+        let logged: Vec<_> = CONTROL_PLANE_LOGGED.lock().unwrap().iter().filter(|l| l.starts_with("machine w: ")).cloned().collect();
         assert_eq!(logged.len(), 1, "one line for one way of failing: {logged:?}");
         assert!(logged[0].contains("its link isn't up"), "{}", logged[0]);
 
@@ -1512,17 +1512,17 @@ mod tests {
         assert!(ran(&runs, "s") >= 1, "the ssh machine's carrier runs");
         assert_eq!(ran(&dials, "s"), 0, "nothing dialed over a down carrier");
         assert_eq!(h.remotes().get("s").unwrap().state, LinkState::Unreachable);
-        assert!(!base.join("remotes.json").exists(), "only a hub saves");
+        assert!(!base.join("remotes.json").exists(), "only a control plane saves");
         drop(machines);
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A hub restores `remotes.json` (unreachable until the link connects,
+    /// A control plane restores `remotes.json` (unreachable until the link connects,
     /// machines no longer registered dropped; roots and rows kept until
     /// the machine's link lists) and saves it back at the stop.
     #[test]
-    fn a_hub_restores_and_saves_remotes() {
-        let base = short_scratch("hub-save");
+    fn a_control_plane_restores_and_saves_remotes() {
+        let base = short_scratch("cp-save");
         let path = base.join("remotes.json");
         let rows = json!({"dir": "/r", "instances": [{"name": "web-1"}]});
         let row = |name: &str| Machine {
@@ -1533,8 +1533,8 @@ mod tests {
             ..Machine::default()
         };
         saved::save(&path, &saved::of(&[row("s"), row("w"), row("gone")], 0)).unwrap();
-        let hub = Hub { remotes: path.clone(), is_hub: Arc::new(|| true) };
-        let (machines, _w, up, _, runs) = inbound_and_ssh(&base, Some(hub), |_| {});
+        let control_plane = ControlPlane { remotes: path.clone(), is_control_plane: Arc::new(|| true) };
+        let (machines, _w, up, _, runs) = inbound_and_ssh(&base, Some(control_plane), |_| {});
         let h = machines.handle();
         assert!(h.remotes().get("gone").is_none(), "not registered: dropped");
         // Nothing listed yet: the restored roots and rows stay.
@@ -1561,53 +1561,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Not the hub at the start: nothing restored, nothing saved; the flag
+    /// Not the control plane at the start: nothing restored, nothing saved; the flag
     /// flipping on (member.set) saves from the next change.
     #[test]
-    fn only_while_the_hub_are_remotes_saved() {
-        let base = short_scratch("hub-flip");
+    fn only_while_the_control_plane_are_remotes_saved() {
+        let base = short_scratch("cp-flip");
         let path = base.join("remotes.json");
         let rows = json!({"dir": "/r", "instances": []});
         let saved_s = Machine { name: "s".into(), rows: [(PathBuf::from("/r"), Arc::new(rows))].into(), seen: Some(1), ..Machine::default() };
         saved::save(&path, &saved::of(&[saved_s], 0)).unwrap();
         let before = std::fs::read(&path).unwrap();
         let flag = Arc::new(AtomicBool::new(false));
-        let is_hub = {
+        let is_control_plane = {
             let flag = Arc::clone(&flag);
             Arc::new(move || flag.load(Ordering::SeqCst))
         };
-        let (machines, _w, up, _, _) = inbound_and_ssh(&base, Some(Hub { remotes: path.clone(), is_hub }), |_| {});
+        let (machines, _w, up, _, _) = inbound_and_ssh(&base, Some(ControlPlane { remotes: path.clone(), is_control_plane }), |_| {});
         let h = machines.handle();
-        assert!(!h.remotes().get("s").unwrap().restored, "not the hub: nothing restored");
+        assert!(!h.remotes().get("s").unwrap().restored, "not the control plane: nothing restored");
         up.store(true, Ordering::SeqCst);
         wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(std::fs::read(&path).unwrap(), before, "not the hub: nothing saved");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "not the control plane: nothing saved");
 
         flag.store(true, Ordering::SeqCst);
         h.reload();
         drop(machines);
-        assert_eq!(saved::load(&path).unwrap().machines.keys().collect::<Vec<_>>(), ["w"], "the hub now: saved");
+        assert_eq!(saved::load(&path).unwrap().machines.keys().collect::<Vec<_>>(), ["w"], "the control plane now: saved");
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The hub at the start, then not (the role moved): restored, then
+    /// The control plane at the start, then not (the role moved): restored, then
     /// nothing saved from the flip on, the stop included.
     #[test]
-    fn a_hub_no_longer_the_hub_stops_saving_remotes() {
-        let base = short_scratch("hub-unflip");
+    fn a_control_plane_no_longer_the_control_plane_stops_saving_remotes() {
+        let base = short_scratch("cp-unflip");
         let path = base.join("remotes.json");
         let rows = json!({"dir": "/r", "instances": []});
         let saved_s = Machine { name: "s".into(), rows: [(PathBuf::from("/r"), Arc::new(rows))].into(), seen: Some(1), ..Machine::default() };
         saved::save(&path, &saved::of(&[saved_s], 0)).unwrap();
         let flag = Arc::new(AtomicBool::new(true));
-        let is_hub = {
+        let is_control_plane = {
             let flag = Arc::clone(&flag);
             Arc::new(move || flag.load(Ordering::SeqCst))
         };
-        let (machines, _w, up, _, _) = inbound_and_ssh(&base, Some(Hub { remotes: path.clone(), is_hub }), |_| {});
+        let (machines, _w, up, _, _) = inbound_and_ssh(&base, Some(ControlPlane { remotes: path.clone(), is_control_plane }), |_| {});
         let h = machines.handle();
-        assert!(h.remotes().get("s").unwrap().restored, "the hub: restored");
+        assert!(h.remotes().get("s").unwrap().restored, "the control plane: restored");
         flag.store(false, Ordering::SeqCst);
         // A save already past its check lands now; none after it.
         std::thread::sleep(Duration::from_millis(100));
@@ -1616,7 +1616,7 @@ mod tests {
         wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
         h.reload();
         drop(machines);
-        assert_eq!(std::fs::read(&path).unwrap(), before, "no longer the hub: nothing saved");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no longer the control plane: nothing saved");
         assert!(!saved::load(&path).unwrap().machines.contains_key("w"));
         let _ = std::fs::remove_dir_all(&base);
     }

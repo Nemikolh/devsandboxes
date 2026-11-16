@@ -803,7 +803,7 @@ fn routed_verb_call(
     };
     // Placement starts from this host's config, as the CLI's `run --place`.
     if let PromptAction::Run { sandbox, place: true, .. } = action {
-        anyhow::bail!("--place asks the hub where to run this host's sandbox; `{sandbox}` is on machine `{machine}`");
+        anyhow::bail!("--place asks the control plane where to run this host's sandbox; `{sandbox}` is on machine `{machine}`");
     }
     let Some(remote_root) = &route.root else {
         anyhow::bail!("no config root known on machine `{machine}`");
@@ -1018,7 +1018,7 @@ mod tests {
         let remote_run = PromptAction::Run { sandbox: "box/web".into(), name: None, branch: None, base: None, place: false };
         // `--place` starts from this host's config: not a machine's.
         let e = call(&PromptAction::Run { sandbox: "box/web".into(), name: None, branch: None, base: None, place: true }).unwrap_err();
-        assert_eq!(e.to_string(), "--place asks the hub where to run this host's sandbox; `box/web` is on machine `box`");
+        assert_eq!(e.to_string(), "--place asks the control plane where to run this host's sandbox; `box/web` is on machine `box`");
         let (_, root_param, machine, params) = call(&remote_run).unwrap();
         assert_eq!((root_param, machine, &params["sandbox"]), ("/r/one".into(), "box".into(), &"web".into()));
         // Minus the routing param, the request the machine would get from

@@ -168,14 +168,14 @@ while it runs, and a drain cuts it like a hang-up (cancelled there unless
 ## A placed `run`
 
 A `run` request without `machine` or `here` is placed first
-(`daemon.rs` `placed_run`, `fleet::placed`): on a hub, when a connected
+(`daemon.rs` `placed_run`, `fleet::placed`): on a control plane, when a connected
 machine (ssh or inbound) scores above this host, the sandbox's code moves there and
 the request goes on as a machine verb would (`remote_verb`, `root`
 rewritten to the machine's copy, `here` set), its `progress` and answer
 tagged with the machine (`placed::Tagged`, `placed::tag_answer`) so the
 CLI prints the name qualified and sends its Ctrl-C there. Otherwise it is
-the local verb above, maybe after a `note:` line. Only a hub places, so
-elsewhere this is one check and nothing more; on a hub with no machine
+the local verb above, maybe after a `note:` line. Only a control plane places, so
+elsewhere this is one check and nothing more; on a control plane with no machine
 connected, one check of the machines' state. → [fleet.md](fleet.md#placement)
 
 Limitations: [status.md](../../status.md#daemon)

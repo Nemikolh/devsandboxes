@@ -98,7 +98,7 @@ impl Candidate {
 
     /// A routed machine (no link of its own here, fleet plan decision 60):
     /// reachable while a path to it starts with a link up here, its
-    /// capacity as the hub's view reports it. No rows of its own are
+    /// capacity as the control plane's view reports it. No rows of its own are
     /// watched, so no image locality.
     pub fn from_routed(r: &Routed) -> Candidate {
         Candidate {

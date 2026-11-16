@@ -22,7 +22,7 @@
 //!   command's calls and `PTY` dials over the machine's link
 //! - `install`: the CLI's check of a machine's devsandbox and the copy of
 //!   this binary there
-//! - `saved`: a hub's `remotes.json`, the machines' last known rows
+//! - `saved`: a control plane's `remotes.json`, the machines' last known rows
 //!
 //! Only the daemon writes the registry (`machines.add` / `set` / `rm`);
 //! the CLI reads it later to know whether any machine exists. Two

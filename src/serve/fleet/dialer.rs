@@ -23,24 +23,24 @@
 //! prove the key its entry's name has in the membership log (or a held
 //! introduction), and a log behind the machine's takes its newer entries
 //! through the daemon's `membership.adopt` path ([`Dialer::adopt`]), the
-//! link then redialed if they moved the hub (`proof::hub_moved`). No
+//! link then redialed if they moved the control plane (`proof::control_plane_moved`). No
 //! identity, no dial.
 //!
-//! This host's hello (`update::hello_of`: its role and its fleet's hub) is
-//! read at each dial, so a hub change counts from the next one
+//! This host's hello (`update::hello_of`: its role and its fleet's control plane) is
+//! read at each dial, so a control-plane change counts from the next one
 //! (`service::Handle::cycle` ends every link then); a machine naming
-//! another hub is refused (`update::same_fleet`, fleet plan decision 34).
+//! another control plane is refused (`update::same_fleet`, fleet plan decision 34).
 //!
-//! Versions follow the hello's hub flag (fleet plan decision 25,
-//! `commands::fleet_link::follows`): a machine that is the hub while this
+//! Versions follow the hello's control-plane flag (fleet plan decision 25,
+//! `commands::fleet_link::follows`): a machine that is the control plane while this
 //! host isn't is followed before anything is served. Another published
 //! build is downloaded, installed and handed off to (`update::update`),
 //! the link refused meanwhile; another dev build for this platform, with
 //! `member.toml`'s `dev-builds` on or trust `full`, keeps the link up
-//! serving only the `binary` transfer the hub pushes, then installs it and
-//! hands off (`update::install_received`). This host, the hub, pushes its
+//! serving only the `binary` transfer the control plane pushes, then installs it and
+//! hands off (`update::install_received`). This host, the control plane, pushes its
 //! dev build to a machine that would take it (`fleet_link::push_build`
-//! through `fleet-<entry>.sock`). Two non-hubs follow nothing.
+//! through `fleet-<entry>.sock`). Two non-control-planes follow nothing.
 //!
 //! The link's socket is bound as `link::Socket` binds one (the newest
 //! binder wins), so after a version handoff the next daemon's links take
@@ -125,9 +125,9 @@ pub struct Dialer {
     /// IN: the daemon's answer to each of the machine's streams.
     pub open: Open,
     /// What this host says on a peer link (`update::hello_for` of its
-    /// `hub`, as the daemon keeps it), read at each dial.
+    /// `control_plane`, as the daemon keeps it), read at each dial.
     pub hello: Arc<dyn Fn() -> &'static str + Send + Sync>,
-    /// How this host follows a hub machine's build.
+    /// How this host follows a control-plane machine's build.
     pub follow: Follow,
     /// The sentinel's, the `Hello`s' and the key proof's wait
     /// (`service::Timing::handshake`).
@@ -136,7 +136,7 @@ pub struct Dialer {
     /// This host's identity, read at each dial ([`Identity::load`]).
     pub identity: Arc<dyn Fn() -> Result<Identity> + Send + Sync>,
     /// Newer membership entries (and introductions) a machine carried,
-    /// stored as `membership.adopt` stores them (`hub` written from the
+    /// stored as `membership.adopt` stores them (`control_plane` written from the
     /// log, the daemon following it); `Err` says why not.
     pub adopt: Arc<dyn Fn(&Stored) -> Result<(), String> + Send + Sync>,
     /// The link to machine `name` is up (its socket bound, any newer log it
@@ -205,7 +205,7 @@ impl Dialer {
         let name = entry.name.as_str();
         let dir = &self.dir;
         let socket = endpoint::fleet_socket(dir, name);
-        // While the hub's binary is on its way nothing but it is served.
+        // While the control plane's binary is on its way nothing but it is served.
         let receiving = AtomicBool::new(false);
         let incoming = Arc::new(Incoming::default());
         let binary = Arc::new(incoming.receiver(Receivers::new(self.log)));
@@ -247,7 +247,7 @@ impl Dialer {
                 if let Some(newer) = peer.proven.as_ref().and_then(|p| p.newer.as_ref()) {
                     (self.adopt)(newer).map_err(|e| format!("cannot take {name}'s newer membership entries: {e}"))?;
                     (self.log)(&format!("machine {name}: took its newer membership log ({})", newer.log.head()));
-                    if let Some(why) = proof::hub_moved(ours, newer) {
+                    if let Some(why) = proof::control_plane_moved(ours, newer) {
                         return Err(why);
                     }
                 }
@@ -257,21 +257,21 @@ impl Dialer {
                     Decision::Same => {}
                     Decision::Download { build } => {
                         *wanted.lock().unwrap() = Some(build);
-                        return Err(format!("{name}, the hub, runs devsandbox {label}: updating this one"));
+                        return Err(format!("{name}, the control plane, runs devsandbox {label}: updating this one"));
                     }
                     Decision::Stop(why) => return Err(why),
                     Decision::Receive => {
-                        let scratch = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the hub's build: {e:#}"))?;
+                        let scratch = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the control plane's build: {e:#}"))?;
                         receiving.store(true, Ordering::Relaxed);
                         let seq = incoming.expect(peer.hash.clone(), scratch, end_link.take());
                         incoming.watch(seq, PUSH_WAIT);
-                        let why = format!("{name}, the hub, runs devsandbox {label}: receiving its binary");
+                        let why = format!("{name}, the control plane, runs devsandbox {label}: receiving its binary");
                         (self.log)(&format!("machine {why}"));
                         held.note(why);
                         return Ok(());
                     }
                 }
-                if update::is_hub(ours) {
+                if update::is_control_plane(ours) {
                     fleet_link::push_build(ours, &peer.hash, socket.clone(), fleet_link::own_binary);
                 }
                 held.up();
@@ -291,7 +291,7 @@ impl Dialer {
         }
     }
 
-    /// Follow the hub machine `name`'s build (module doc); the outcome is
+    /// Follow the control-plane machine `name`'s build (module doc); the outcome is
     /// why the link ended (the machine's `error` until the handoff, or the
     /// next attempt).
     fn follow(&self, name: &str, following: Following, duplex: &Duplex, held: &Held) -> String {
@@ -308,7 +308,7 @@ impl Dialer {
                         }
                     }
                     None => {
-                        let why = want.why.clone().unwrap_or_else(|| format!("{} before the hub's binary arrived", end_why(end, duplex)));
+                        let why = want.why.clone().unwrap_or_else(|| format!("{} before the control plane's binary arrived", end_why(end, duplex)));
                         format!("update to {label} failed: {why}")
                     }
                 };
@@ -317,7 +317,7 @@ impl Dialer {
             }
             Following::Published(build) => {
                 let version = &build.semver;
-                (self.log)(&format!("machine {name}, the hub, runs devsandbox {version}: updating this one"));
+                (self.log)(&format!("machine {name}, the control plane, runs devsandbox {version}: updating this one"));
                 held.note(format!("updating to {version}"));
                 let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
                 match update::update(steps, &build, os, arch, &std::env::temp_dir()) {
@@ -334,14 +334,14 @@ impl Dialer {
 /// How [`Dialer::answer`] ended.
 enum Ended {
     Link(link::End),
-    /// The machine is the hub, on another build: follow it.
+    /// The machine is the control plane, on another build: follow it.
     Follow(Following),
 }
 
 enum Following {
     /// A dev build pushed (or not, by the link's end) over `TRANSFER`.
     Dev(follow::Want, link::End),
-    /// The hub's published build, to download.
+    /// The control plane's published build, to download.
     Published(Build),
 }
 
@@ -471,7 +471,7 @@ pub(crate) mod tests {
     /// instance, its data in `base/k-data`) and L (`base/l`, member name
     /// `lap`, its data in `base/l-data`) whose registry has ssh machine
     /// `box` (K, its root K's own), reached through [`peer_transport`]. Both
-    /// in one membership log (`lap` its authority, `box` its hub), K named
+    /// in one membership log (`lap` its authority, `box` its control plane), K named
     /// `box` there.
     pub(crate) struct Pair {
         pub(crate) base: PathBuf,
@@ -966,9 +966,9 @@ pub(crate) mod tests {
             "dial-place",
             Vec::new(),
             |k| {
-                // Placement runs on the hub.
-                let hub = crate::serve::fleet::member::Member { hub: "self".into(), ..Default::default() };
-                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);
+                // Placement runs on the control plane.
+                let control_plane = crate::serve::fleet::member::Member { control_plane: "self".into(), ..Default::default() };
+                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &control_plane);
                 k.verbs = Some(k_runner);
             },
             |l| {
@@ -1039,8 +1039,8 @@ pub(crate) mod tests {
             "dial-fetch",
             Vec::new(),
             |k| {
-                let hub = crate::serve::fleet::member::Member { hub: "self".into(), ..Default::default() };
-                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);
+                let control_plane = crate::serve::fleet::member::Member { control_plane: "self".into(), ..Default::default() };
+                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &control_plane);
                 k.verbs = Some(k_runner);
             },
             |l| {
@@ -1153,23 +1153,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// A `run --place` on member L (`lap`, hub `box`) is placed by the hub K
+    /// A `run --place` on member L (`lap`, control plane `box`) is placed by the control plane K
     /// (`fleet.place`): L is over a cap, K has room, so L moves the code
     /// into its fleet root on K (as K's `roots.list` flags it) and forwards
-    /// the run there, the hub's lines first. Without `place` it runs on L,
-    /// whatever the hub would say.
+    /// the run there, the control plane's lines first. Without `place` it runs on L,
+    /// whatever the control plane would say.
     #[test]
-    fn a_members_run_is_placed_by_the_hub() {
+    fn a_members_run_is_placed_by_the_control_plane() {
         use crate::serve::capacity::{Capacity, Caps};
         use crate::serve::fleet::code::repo::tests::{git, repo_with_branches};
         use crate::serve::fleet::member::{Member, write_for_test};
         const G: u64 = 1 << 30;
 
         let (k_runner, k_verbs) =
-            crate::serve::verbs::tests::script_runner("dial-hub-place-k", r#"echo "box $*"; cat "$3/dockerfiles/web.Dockerfile" "$3/../web/F""#);
-        let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-hub-place-l", r#"echo "local $*""#);
+            crate::serve::verbs::tests::script_runner("dial-cp-place-k", r#"echo "box $*"; cat "$3/dockerfiles/web.Dockerfile" "$3/../web/F""#);
+        let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-cp-place-l", r#"echo "local $*""#);
         let path = std::env::var("PATH").unwrap_or_default();
-        let src = scratch("dial-hub-place-src");
+        let src = scratch("dial-cp-place-src");
         std::fs::create_dir_all(&src).unwrap();
         repo_with_branches(&src, "web");
         let cfg = src.join("cfg");
@@ -1190,16 +1190,16 @@ pub(crate) mod tests {
         let roomy = capacity(28, 0, None);
         let busy = capacity(4, 3, Some(Caps { instances: Some(1), ..Caps::default() }));
         let pair = Pair::with(
-            "dial-hub-place",
+            "dial-cp-place",
             Vec::new(),
             |k| {
-                write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), hub: "self".into(), ..Default::default() });
+                write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), control_plane: "self".into(), ..Default::default() });
                 k.verbs = Some(k_runner);
                 k.peer_env = Some(std::collections::BTreeMap::from([("PATH".into(), path.clone())]));
                 k.local_capacity = Some(Arc::new(move || roomy.clone()));
             },
             |l| {
-                write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: "box".into(), ..Default::default() });
+                write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), control_plane: "box".into(), ..Default::default() });
                 l.verbs = Some(l_runner);
                 l.local_capacity = Some(Arc::new(move || busy.clone()));
             },
@@ -1232,19 +1232,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// Member L's hub `box` can't be reached (its ssh fails): a `run
+    /// Member L's control plane `box` can't be reached (its ssh fails): a `run
     /// --place` on L runs on L, its output starting with a note naming the
-    /// hub.
+    /// control plane.
     #[test]
-    fn a_members_run_stays_here_when_its_hub_is_unreachable() {
+    fn a_members_run_stays_here_when_its_control_plane_is_unreachable() {
         use crate::serve::fleet::member::{Member, write_for_test};
-        let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-hub-down-l", r#"echo "local $*""#);
+        let (l_runner, l_verbs) = crate::serve::verbs::tests::script_runner("dial-cp-down-l", r#"echo "local $*""#);
         let pair = Pair::with(
-            "dial-hub-down",
+            "dial-cp-down",
             Vec::new(),
-            |k| write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), hub: "self".into(), ..Default::default() }),
+            |k| write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), control_plane: "self".into(), ..Default::default() }),
             |l| {
-                write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: "box".into(), ..Default::default() });
+                write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), control_plane: "box".into(), ..Default::default() });
                 l.verbs = Some(l_runner);
                 l.link_transport = Some(Transport::new(|_, _| anyhow::bail!("ssh: connect to host box port 22: Connection refused")));
             },
@@ -1255,25 +1255,25 @@ pub(crate) mod tests {
         let (r, out, err) = verb(&mut connect(&pair.l_dir), "run", json!({"root": cfg, "env": {}, "sandbox": "web", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
         assert_eq!(r.result.as_ref().unwrap().get("machine"), None, "{r:?}");
-        assert!(err.starts_with("note: the hub `box` is unreachable (") && err.contains("): running here\n"), "{err}");
+        assert!(err.starts_with("note: the control plane `box` is unreachable (") && err.contains("): running here\n"), "{err}");
         assert_eq!(out, format!("local --in-process -C {} run -- web\n", cfg.display()));
         pair.finish();
         let _ = std::fs::remove_dir_all(&l_verbs);
     }
 
     /// L's membership log is behind K's, whose last entry makes `lap` the
-    /// hub: the link's proof carries the entry to L, L's daemon adopts it
-    /// (its `member.toml` hub follows: this host), the link ends since L's
-    /// `Hello` said no hub, and the redial comes up.
+    /// control plane: the link's proof carries the entry to L, L's daemon adopts it
+    /// (its `member.toml` control plane follows: this host), the link ends since L's
+    /// `Hello` said no control plane, and the redial comes up.
     #[test]
-    fn the_end_behind_takes_the_newer_entries_and_follows_their_hub() {
-        use crate::serve::fleet::member::Hub;
+    fn the_end_behind_takes_the_newer_entries_and_follows_their_control_plane() {
+        use crate::serve::fleet::member::ControlPlane;
         use crate::serve::fleet::membership::Op;
         let newer = Arc::new(Mutex::new(None));
         let kept = Arc::clone(&newer);
         let pair = Pair::build("dial-behind", Vec::new(), |_| {}, |_| {}, move |k_member, l_member| {
             let mut ahead = test_support::fleet_of("box", &[("lap", l_member), ("box", k_member)]);
-            ahead.log.append(Op::Hub { name: "lap".into() }, "lap", &test_support::key_of(l_member)).unwrap();
+            ahead.log.append(Op::ControlPlane { name: "lap".into() }, "lap", &test_support::key_of(l_member)).unwrap();
             test_support::write(k_member, &ahead);
             *kept.lock().unwrap() = Some(ahead);
         });
@@ -1281,8 +1281,8 @@ pub(crate) mod tests {
         pair.wait_box("box connected after a redial", |r| connected(r) && pair.dialed.count.load(Ordering::SeqCst) >= 2);
         let l_member = pair.base.join("l-data/member.toml");
         assert_eq!(test_support::read(&l_member).unwrap(), ahead, "L took K's entries");
-        assert_eq!(crate::serve::fleet::member::load(&l_member).unwrap().unwrap().hub(), Hub::This, "L's hub follows its log");
-        assert_eq!(connect(&pair.l_dir).call("member.get", json!({})).unwrap().result.unwrap()["hub"], "self");
+        assert_eq!(crate::serve::fleet::member::load(&l_member).unwrap().unwrap().control_plane(), ControlPlane::This, "L's control plane follows its log");
+        assert_eq!(connect(&pair.l_dir).call("member.get", json!({})).unwrap().result.unwrap()["control_plane"], "self");
         pair.finish();
     }
 
@@ -1315,11 +1315,11 @@ pub(crate) mod tests {
         pair.finish();
     }
 
-    /// A hub machine on another published build: this host refuses the
+    /// A control-plane machine on another published build: this host refuses the
     /// link, installs that version and hands off, and says so as box's
     /// error.
     #[test]
-    fn this_host_follows_a_published_hub_machine() {
+    fn this_host_follows_a_published_control_plane_machine() {
         let base = scratch("dial-follow");
         std::fs::create_dir_all(&base).unwrap();
         let registry = base.join("machines.toml");
@@ -1327,7 +1327,7 @@ pub(crate) mod tests {
         let box_member = base.join("box-data/member.toml");
         std::fs::create_dir_all(box_member.parent().unwrap()).unwrap();
         test_support::fleet_of("box", &[("lap", &base.join("member.toml")), ("box", &box_member)]);
-        let hello: &'static str = Box::leak(format!("9.9.9 abc published {} hub", update::PLATFORM).into_boxed_str());
+        let hello: &'static str = Box::leak(format!("9.9.9 abc published {} control_plane", update::PLATFORM).into_boxed_str());
         let transport = Transport::new(move |_, _| {
             let (ours, theirs) = UnixStream::pair()?;
             let (r, w) = (theirs.try_clone()?, theirs);
@@ -1377,16 +1377,16 @@ pub(crate) mod tests {
         rows.iter().filter(|r| r["machine"] == machine).map(|r| r["name"].as_str().unwrap_or_default().to_string()).collect()
     }
 
-    /// A fleet: K (member `box`) is the hub, with a third machine `x` it
+    /// A fleet: K (member `box`) is the control plane, with a third machine `x` it
     /// knows rows of (restored from its `remotes.json`; x itself is never
-    /// reached); L (`lap`) is a member whose hub is `box`. L's federated
+    /// reached); L (`lap`) is a member whose control plane is `box`. L's federated
     /// snapshot shows K's rows and, through K, x's (`via: box`, kind
     /// `routed`), never its own as K sees them; x is a routed machine on L
     /// (`machines.list`/`get`), acted on over a route (none reaches it: the
     /// route's error), its agent refused. K serves a federated watch only
-    /// as the hub.
+    /// as the control plane.
     #[test]
-    fn a_member_sees_the_fleet_through_its_hub() {
+    fn a_member_sees_the_fleet_through_its_control_plane() {
         let base_remotes = scratch("dial-via-files");
         std::fs::create_dir_all(&base_remotes).unwrap();
         let (k_remotes, l_remotes) = (base_remotes.join("k-remotes.json"), base_remotes.join("l-remotes.json"));
@@ -1404,12 +1404,12 @@ pub(crate) mod tests {
             "dial-via",
             vec![Entry::ssh("x", "me@x")],
             |k| {
-                let hub = crate::serve::fleet::member::Member { name: "box".into(), hub: "self".into(), ..Default::default() };
-                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &hub);
+                let control_plane = crate::serve::fleet::member::Member { name: "box".into(), control_plane: "self".into(), ..Default::default() };
+                crate::serve::fleet::member::write_for_test(k.member.as_ref().unwrap(), &control_plane);
                 k.remotes = Some(k_remotes.clone());
             },
             |l| {
-                let member = crate::serve::fleet::member::Member { name: "lap".into(), hub: "box".into(), ..Default::default() };
+                let member = crate::serve::fleet::member::Member { name: "lap".into(), control_plane: "box".into(), ..Default::default() };
                 crate::serve::fleet::member::write_for_test(l.member.as_ref().unwrap(), &member);
                 l.remotes = Some(l_remotes.clone());
                 // L's join: one instance in the watched root, which K sees.
@@ -1505,7 +1505,7 @@ pub(crate) mod tests {
         // A name nobody sees is still unknown.
         assert_eq!(connect(&pair.l_dir).call("machines.get", json!({"name": "nope"})).unwrap().error.unwrap().code, "not-found");
 
-        // Only the hub federates for a peer: L refuses K's federated watch.
+        // Only the control plane federates for a peer: L refuses K's federated watch.
         let fleet_root = std::fs::canonicalize(pair.base.join("l-data/fleet/box")).unwrap();
         let mut k_on_l = api_to(&endpoint::fleet_socket(&pair.k_dir, "lap"), "lap");
         k_on_l.conn.call("subscribe", json!({"topics": ["instances"]})).unwrap();
@@ -1518,57 +1518,57 @@ pub(crate) mod tests {
     }
 
     /// A [`Pair`] in one fleet: K (`box`, with a registry entry `x` it never
-    /// reaches) and L (`lap`), `k_hub` / `l_hub` their `hub`s, the log's hub
+    /// reaches) and L (`lap`), `k_control_plane` / `l_control_plane` their `control_plane`s, the log's control plane
     /// the one they name (`lap` when L says `self`, else `box`).
-    fn fleet_pair(tag: &str, k_hub: &str, l_hub: &str) -> Pair {
+    fn fleet_pair(tag: &str, k_control_plane: &str, l_control_plane: &str) -> Pair {
         use crate::serve::fleet::member::{Member, write_for_test};
-        let hub = if l_hub == "self" { "lap" } else { "box" };
-        let (k_hub, l_hub) = (k_hub.to_string(), l_hub.to_string());
+        let control_plane = if l_control_plane == "self" { "lap" } else { "box" };
+        let (k_control_plane, l_control_plane) = (k_control_plane.to_string(), l_control_plane.to_string());
         Pair::build(
             tag,
             vec![Entry::ssh("x", "me@x")],
-            move |k| write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), hub: k_hub, ..Default::default() }),
-            move |l| write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), hub: l_hub, ..Default::default() }),
+            move |k| write_for_test(k.member.as_ref().unwrap(), &Member { name: "box".into(), control_plane: k_control_plane, ..Default::default() }),
+            move |l| write_for_test(l.member.as_ref().unwrap(), &Member { name: "lap".into(), control_plane: l_control_plane, ..Default::default() }),
             |k_member, l_member| {
-                test_support::fleet_of(hub, &[("lap", l_member), ("box", k_member)]);
+                test_support::fleet_of(control_plane, &[("lap", l_member), ("box", k_member)]);
             },
         )
     }
 
-    /// `who`'s (`k` or `l`) `member.toml` hub, and its registry's names.
-    pub(crate) fn member_and_registry(pair: &Pair, who: &str) -> (crate::serve::fleet::member::Hub, Vec<String>) {
+    /// `who`'s (`k` or `l`) `member.toml` control plane, and its registry's names.
+    pub(crate) fn member_and_registry(pair: &Pair, who: &str) -> (crate::serve::fleet::member::ControlPlane, Vec<String>) {
         let data = pair.base.join(format!("{who}-data"));
-        let hub = crate::serve::fleet::member::load(&data.join("member.toml")).unwrap().unwrap().hub();
+        let control_plane = crate::serve::fleet::member::load(&data.join("member.toml")).unwrap().unwrap().control_plane();
         let names = crate::serve::machines::load(&data.join("machines.toml")).unwrap().into_iter().map(|e| e.name).collect();
-        (hub, names)
+        (control_plane, names)
     }
 
     pub(crate) fn lap_on_k(pair: &Pair) -> Option<Value> {
         named(&connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap(), "lap")
     }
 
-    /// L, the authority and the hub, removes member K: it signs K's
+    /// L, the authority and the control plane, removes member K: it signs K's
     /// revoke, pushes it to K (`fleet.sync`), then K hears `fleet.leave`
     /// over the link, which it follows since its log revokes its key: its
-    /// `hub` is cleared, its log and its own entries dropped; L unlinks it,
+    /// `control_plane` is cleared, its log and its own entries dropped; L unlinks it,
     /// and the link ends.
     #[test]
     fn the_authoritys_rm_of_a_member_revokes_and_removes_it() {
-        use crate::serve::fleet::member::Hub;
+        use crate::serve::fleet::member::ControlPlane;
         let pair = fleet_pair("dial-rm", "lap", "self");
         pair.wait_box("box connected", connected);
         let r = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap();
         assert!(r.error.is_none(), "{r:?}");
         let answer = r.result.unwrap();
-        let removed = json!({"name": "box", "hub": "lap", "leave": "told", "error": null, "forgot": [], "missed": []});
+        let removed = json!({"name": "box", "control_plane": "lap", "leave": "told", "error": null, "forgot": [], "missed": []});
         assert_eq!(
             answer,
             json!({"type": "revoked", "name": "box", "change": "revoke `box`", "pushed": ["box"], "unpushed": [], "removed": removed, "error": null})
         );
         crate::serve::dts::assert_variant("MachineRmRevoked", &answer);
-        assert_eq!(member_and_registry(&pair, "k"), (Hub::None, vec![]), "K left: no hub, no entries");
+        assert_eq!(member_and_registry(&pair, "k"), (ControlPlane::None, vec![]), "K left: no control plane, no entries");
         assert!(test_support::read(&pair.base.join("k-data/member.toml")).is_none(), "K dropped its log");
-        assert_eq!(member_and_registry(&pair, "l"), (Hub::This, vec![]), "L unlinked it");
+        assert_eq!(member_and_registry(&pair, "l"), (ControlPlane::This, vec![]), "L unlinked it");
         let l_log = test_support::read(&pair.base.join("l-data/member.toml")).unwrap();
         assert!(l_log.log.revoked_name("box"), "L's log revokes box");
         wait_for("lap gone on K", Duration::from_secs(10), || lap_on_k(&pair).is_none());
@@ -1579,14 +1579,14 @@ pub(crate) mod tests {
         pair.finish();
     }
 
-    /// `fleet.*` goes by who asks: from a peer that isn't this host's hub
+    /// `fleet.*` goes by who asks: from a peer that isn't this host's control plane
     /// (or from a local client) `fleet.forget` / `fleet.leave` are refused
-    /// and nothing changes; from the hub they still follow only a revoke.
-    /// The hub removes no member its log hasn't revoked, and the hub itself
+    /// and nothing changes; from the control plane they still follow only a revoke.
+    /// The control plane removes no member its log hasn't revoked, and the control plane itself
     /// isn't removed.
     #[test]
-    fn fleet_forget_from_a_non_hub_peer_is_refused() {
-        use crate::serve::fleet::member::Hub;
+    fn fleet_forget_from_a_non_control_plane_peer_is_refused() {
+        use crate::serve::fleet::member::ControlPlane;
         let pair = fleet_pair("dial-forget", "self", "box");
         pair.wait_box("box connected", connected);
         wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(&pair).is_some_and(|r| connected(&r)));
@@ -1595,7 +1595,7 @@ pub(crate) mod tests {
             let duplex = crate::serve::machines::ssh::Duplex::socket(stream);
             crate::serve::machines::link::handshake(name, duplex, Duration::from_secs(10), crate::serve::machines::link::Over::Link).unwrap()
         };
-        // lap on K: not K's hub (K is the hub).
+        // lap on K: not K's control plane (K is the control plane).
         let mut lap = api_to(&endpoint::fleet_socket(&pair.l_dir, "box"), "box");
         for (method, params) in [("fleet.forget", json!({"name": "x"})), ("fleet.leave", json!({}))] {
             let e = lap.conn.call(method, params.clone()).unwrap().error.unwrap();
@@ -1605,12 +1605,12 @@ pub(crate) mod tests {
         }
         let e = lap.conn.call("fleet.rm", json!({"name": "box"})).unwrap().error.unwrap();
         assert_eq!(e.code, "denied");
-        assert!(e.message.contains("`box`: its key isn't revoked in the hub's membership log"), "{}", e.message);
-        assert_eq!(member_and_registry(&pair, "k"), (Hub::This, vec!["x".to_string()]), "nothing changed on K");
+        assert!(e.message.contains("`box`: its key isn't revoked in the control plane's membership log"), "{}", e.message);
+        assert_eq!(member_and_registry(&pair, "k"), (ControlPlane::This, vec!["x".to_string()]), "nothing changed on K");
         // From the member's own `machine rm`, too.
         let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "box"})).unwrap().error.unwrap();
         assert_eq!(e.code, "denied");
-        // K on L: L's hub, but `fleet.forget` follows a revoke L's log hasn't.
+        // K on L: L's control plane, but `fleet.forget` follows a revoke L's log hasn't.
         let mut k = api_to(&endpoint::fleet_socket(&pair.k_dir, "lap"), "lap");
         let e = k.conn.call("fleet.forget", json!({"name": "nobody"})).unwrap().error.unwrap();
         assert!(e.code == "denied" && e.message.contains("follows a revoke"), "{e:?}");
@@ -1618,12 +1618,12 @@ pub(crate) mod tests {
         pair.finish();
     }
 
-    /// Member L leaves: it tells the hub K (`fleet.rm` of itself: K forgets
-    /// it, `x` unreached), then clears its `hub` and drops its entries; the
+    /// Member L leaves: it tells the control plane K (`fleet.rm` of itself: K forgets
+    /// it, `x` unreached), then clears its `control_plane` and drops its entries; the
     /// link ends.
     #[test]
     fn a_member_leaves_its_fleet() {
-        use crate::serve::fleet::member::Hub;
+        use crate::serve::fleet::member::ControlPlane;
         let pair = fleet_pair("dial-leave", "self", "box");
         pair.wait_box("box connected", connected);
         wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(&pair).is_some_and(|r| connected(&r)));
@@ -1636,14 +1636,14 @@ pub(crate) mod tests {
         assert_eq!(
             answer,
             json!({
-                "type": "left", "name": "lap", "hub": "box", "error": null, "dropped": ["box"], "proposed": null,
-                "removed": {"name": "lap", "hub": "box", "leave": "leaving", "error": null, "forgot": [], "missed": null},
+                "type": "left", "name": "lap", "control_plane": "box", "error": null, "dropped": ["box"], "proposed": null,
+                "removed": {"name": "lap", "control_plane": "box", "leave": "leaving", "error": null, "forgot": [], "missed": null},
             })
         );
-        assert_eq!(member_and_registry(&pair, "l"), (Hub::None, vec![]), "L left");
-        assert_eq!(member_and_registry(&pair, "k"), (Hub::This, vec!["x".to_string()]), "K stays the hub");
+        assert_eq!(member_and_registry(&pair, "l"), (ControlPlane::None, vec![]), "L left");
+        assert_eq!(member_and_registry(&pair, "k"), (ControlPlane::This, vec!["x".to_string()]), "K stays the control plane");
         wait_for("lap gone on K", Duration::from_secs(10), || lap_on_k(&pair).is_none());
-        assert_eq!(connect(&pair.l_dir).call("member.get", json!({})).unwrap().result.unwrap()["hub"], Value::Null);
+        assert_eq!(connect(&pair.l_dir).call("member.get", json!({})).unwrap().result.unwrap()["control_plane"], Value::Null);
         // Out of every fleet: nothing more to leave.
         let e = connect(&pair.l_dir).call("machines.rm", json!({"name": "lap"})).unwrap().error.unwrap();
         assert_eq!(e.code, "failed");
@@ -1654,8 +1654,8 @@ pub(crate) mod tests {
     /// `lap`) dials K (`base/k`, `box`), K dials B (`base/b`, `b`), each
     /// through [`peer_transport`], so each of K's links has one end of each
     /// kind (A → K reaches K's `fleet-link`, B → K K's dialer). The log
-    /// (authority `lap`, hub `box`) also has `m`, who has no daemon. With
-    /// `introduced`, the log is `b`'s (hub `box`) without `lap`, which every
+    /// (authority `lap`, control plane `box`) also has `m`, who has no daemon. With
+    /// `introduced`, the log is `b`'s (control plane `box`) without `lap`, which every
     /// host holds as `box`'s introduction (capped).
     struct Trio {
         base: PathBuf,
@@ -1675,15 +1675,15 @@ pub(crate) mod tests {
         }
 
         /// [`Trio::new`] (not introduced) whose `member.toml`s also name
-        /// the hub (`box`): the members report their links to it and it
+        /// the control plane (`box`): the members report their links to it and it
         /// pushes the graph (`fleet::reports`).
-        fn hubbed(tag: &str) -> Trio {
+        fn with_control_plane(tag: &str) -> Trio {
             Trio::build(tag, false, Some("box"), |_, _, _| {})
         }
 
-        /// A's, K's and B's options set by `set` too; with `hub`, the log's
-        /// hub (not introduced) and every `member.toml`'s.
-        fn build(tag: &str, introduced: bool, hub: Option<&str>, set: impl FnOnce(&mut Options, &mut Options, &mut Options)) -> Trio {
+        /// A's, K's and B's options set by `set` too; with `control_plane`, the log's
+        /// control plane (not introduced) and every `member.toml`'s.
+        fn build(tag: &str, introduced: bool, control_plane: Option<&str>, set: impl FnOnce(&mut Options, &mut Options, &mut Options)) -> Trio {
             use crate::serve::fleet::member::{Member, write_for_test};
             use crate::serve::fleet::identity::Signer;
             use crate::serve::fleet::membership::Introduction;
@@ -1713,12 +1713,12 @@ pub(crate) mod tests {
                     test_support::write(toml, &s);
                 }
             } else {
-                test_support::fleet_of(hub.unwrap_or("box"), &members);
+                test_support::fleet_of(control_plane.unwrap_or("box"), &members);
             }
-            if let Some(hub) = hub {
+            if let Some(control_plane) = control_plane {
                 for (name, toml) in members {
                     let mut m = crate::serve::fleet::member::load(toml).unwrap().unwrap();
-                    m.hub = if name == hub { "self" } else { hub }.into();
+                    m.control_plane = if name == control_plane { "self" } else { control_plane }.into();
                     write_for_test(toml, &m);
                 }
             }
@@ -1901,7 +1901,7 @@ pub(crate) mod tests {
     }
 
     /// `lap` grants `b`, which it has no link to, agent (decision 66): B
-    /// sees it in lap's report (through the hub), binds
+    /// sees it in lap's report (through the control plane), binds
     /// `agent-route-lap.sock`, and a client there reaches lap's agent over
     /// a routed `AGENT` stream through K; K, not granted, binds nothing.
     /// Withdrawn, B's socket goes.
@@ -1996,14 +1996,14 @@ pub(crate) mod tests {
         use crate::serve::fleet::reports::{Reports, Signed};
         use crate::serve::machines::link::{Over, handshake};
         use crate::serve::snapshots::LinkState;
-        let trio = Trio::hubbed("route-socket");
+        let trio = Trio::with_control_plane("route-socket");
         let m_member = trio.base.join("m-data/member.toml");
         let genesis = test_support::read(&trio.a_member).unwrap().log.membership().unwrap().genesis;
         let links = ["lap", "box", "b"].map(|p| LinkReport { peer: p.into(), dials: false, state: LinkState::Connected, since_ms: 1 }).to_vec();
         let report = Report { member: "m".into(), trust: Default::default(), always_on: true, links, agent: vec![] };
         let later = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 3_600_000;
         let (statement, report) = sign_report(&test_support::key_of(&m_member), &genesis, &report, 0, later);
-        // Carried to K, the hub, as `b` over B's link: K pushes it on to
+        // Carried to K, the control plane, as `b` over B's link: K pushes it on to
         // `lap`. Not over A's: K's flood skips the peer a change came from
         // (it holds it), and A never would.
         let mut k = routed_api(link::connect(&endpoint::fleet_socket(&trio.b_dir, "box"), channel::API).unwrap(), "box");
@@ -2127,7 +2127,7 @@ pub(crate) mod tests {
     /// pending list; the same again collapses with it.
     #[test]
     fn a_proposal_reaches_the_authority_over_a_route() {
-        let trio = Trio::hubbed("route-propose");
+        let trio = Trio::with_control_plane("route-propose");
         wait_for("lap routed and connected on B", Duration::from_secs(15), || routed_up(&trio.b_dir, "lap"));
         let r = call(&trio.b_dir, "machines.rm", json!({"name": "m"})).unwrap();
         assert_eq!(r, json!({"type": "proposed", "name": "m", "authority": "lap", "id": 1, "error": null}));
@@ -2139,11 +2139,11 @@ pub(crate) mod tests {
         trio.finish();
     }
 
-    /// `b` is the hub, A (`lap`, the authority) not linked to it: A's
+    /// `b` is the control plane, A (`lap`, the authority) not linked to it: A's
     /// `machine rm m` signs the revoke, pushes it to K (which floods it to
     /// B) and asks B's `fleet.rm` over a route; B's removal tells `box`
     /// over its link and `lap`, a routed member, over a route
-    /// (`fleet.forget`, admitted there as from the hub `b`).
+    /// (`fleet.forget`, admitted there as from the control plane `b`).
     #[test]
     fn a_removal_forgets_on_a_routed_member() {
         let trio = Trio::build("route-forget", false, Some("b"), |_, _, _| {});
@@ -2160,18 +2160,18 @@ pub(crate) mod tests {
             r = call(&trio.a_dir, "machines.rm", json!({"name": "m"})).unwrap();
         }
         let removed = &r["removed"];
-        assert_eq!((&removed["hub"], &removed["leave"], &removed["forgot"]), (&json!("b"), &json!("unreachable"), &json!(["box", "lap"])), "{r}");
+        assert_eq!((&removed["control_plane"], &removed["leave"], &removed["forgot"]), (&json!("b"), &json!("unreachable"), &json!(["box", "lap"])), "{r}");
         assert_eq!(removed["missed"], json!([]), "{r}");
         trio.finish();
     }
 
-    /// `b` is the hub, A linked only to K (not the hub): B's link reports
+    /// `b` is the control plane, A linked only to K (not the control plane): B's link reports
     /// reach A through K's flood, with no exchange of A's own. B starts
     /// with a registry entry `m` it can't reach (its report lists the link
     /// down); `machine unlink m` there changes its report, and the newer
     /// one, without `m`, reaches A the same way.
     #[test]
-    fn a_report_change_on_the_hub_reaches_a_member_it_has_no_link_to() {
+    fn a_report_change_on_the_control_plane_reaches_a_member_it_has_no_link_to() {
         let trio = Trio::build("graph-flood", false, Some("b"), |_, _, b| {
             crate::serve::machines::update(b.machines.as_ref().unwrap(), |e| e.push(Entry::ssh("m", "me@m"))).unwrap();
             b.link_transport = Some(Transport::new(|_, _| anyhow::bail!("ssh: connect to host m port 22: Connection refused")));
@@ -2195,8 +2195,8 @@ pub(crate) mod tests {
         trio.finish();
     }
 
-    /// A `run --place` on member A (`lap`, hub `box`), A and K busy, B
-    /// roomy: A tells the hub it reaches `b` over a route, the hub places it
+    /// A `run --place` on member A (`lap`, control plane `box`), A and K busy, B
+    /// roomy: A tells the control plane it reaches `b` over a route, the control plane places it
     /// there (its fresh `capacity.get` of B), and A moves the code into its
     /// fleet root on B and forwards the run, both over the route.
     #[test]
@@ -2239,7 +2239,7 @@ pub(crate) mod tests {
         });
         wait_for("b routed and connected on A", Duration::from_secs(15), || routed_up(&trio.a_dir, "b"));
         let fleet_root = trio.fleet_root("b", "lap");
-        let hub_root = trio.fleet_root("k", "lap");
+        let control_plane_root = trio.fleet_root("k", "lap");
         let mut a = connect(&trio.a_dir);
         let (r, out, err) = verb(&mut a, "run", json!({"root": cfg, "env": {"PATH": std::env::var("PATH").unwrap_or_default()}, "sandbox": "web", "branch": "feature", "place": true}));
         assert!(r.error.is_none(), "{r:?} {err}");
@@ -2251,12 +2251,12 @@ pub(crate) mod tests {
         let remote = fleet_root.join("roots").join(&roots[0]).join("cfg");
         assert_eq!(out, format!("b --in-process -C {} run --branch=feature -- web\nFROM x\nfeature\n", remote.display()));
         assert_eq!(git(&remote.join("../web"), &["symbolic-ref", "--short", "HEAD"]), "feature");
-        // The hub mirror: K's cache of the repo has `feature`, no checkout there.
+        // The control-plane mirror: K's cache of the repo has `feature`, no checkout there.
         assert!(!err.contains("has no copy"), "{err}");
-        let caches: Vec<_> = std::fs::read_dir(hub_root.join("repos")).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "git")).collect();
+        let caches: Vec<_> = std::fs::read_dir(control_plane_root.join("repos")).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "git")).collect();
         assert_eq!(caches.len(), 1, "{caches:?}");
         assert_eq!(git(&caches[0], &["rev-parse", "refs/heads/feature"]), git(&src.join("web"), &["rev-parse", "feature"]));
-        assert!(!hub_root.join("roots").exists(), "no root on the hub");
+        assert!(!control_plane_root.join("roots").exists(), "no root on the control plane");
         drop(a);
         trio.finish();
         for dir in [src, a_verbs, b_verbs] {

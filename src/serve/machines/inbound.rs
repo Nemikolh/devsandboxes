@@ -25,10 +25,10 @@ use crate::serve::api::ApiError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Neighbor {
     pub name: String,
-    /// Its link `Hello` (`fleet::update::hello_of`: build, platform, role, hub).
+    /// Its link `Hello` (`fleet::update::hello_of`: build, platform, role, control plane).
     pub version: String,
-    /// It said it's the fleet's hub.
-    pub hub: bool,
+    /// It said it's the fleet's control plane.
+    pub control_plane: bool,
     /// Which announce this is: what its [`Guard`] removes.
     seq: u64,
 }
@@ -75,9 +75,9 @@ impl Drop for Guard {
 impl Neighbors {
     /// Announce `name` (replacing an older announce of it); up until the
     /// guard drops.
-    pub fn announce(self: &Arc<Self>, name: &str, version: &str, hub: bool) -> Guard {
+    pub fn announce(self: &Arc<Self>, name: &str, version: &str, control_plane: bool) -> Guard {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let neighbor = Neighbor { name: name.into(), version: version.into(), hub, seq };
+        let neighbor = Neighbor { name: name.into(), version: version.into(), control_plane, seq };
         self.live.lock().unwrap().insert(name.into(), neighbor);
         self.changed();
         Guard { neighbors: Arc::clone(self), name: name.into(), seq }
@@ -125,11 +125,11 @@ mod tests {
         let old = n.announce("lap", "0.7.0 a dev linux/x86_64 member", false);
         assert!(n.contains("lap"));
         // A newer announce replaces it; the old one's close doesn't touch it.
-        let new = n.announce("lap", "0.7.0 b dev linux/x86_64 hub", true);
+        let new = n.announce("lap", "0.7.0 b dev linux/x86_64 control_plane", true);
         drop(old);
         let listed = n.list();
-        assert_eq!((listed.len(), listed[0].hub), (1, true));
-        assert_eq!(listed[0].version, "0.7.0 b dev linux/x86_64 hub");
+        assert_eq!((listed.len(), listed[0].control_plane), (1, true));
+        assert_eq!(listed[0].version, "0.7.0 b dev linux/x86_64 control_plane");
         let other = n.announce("srv", "v", false);
         assert_eq!(n.list().iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["lap", "srv"]);
         drop(new);

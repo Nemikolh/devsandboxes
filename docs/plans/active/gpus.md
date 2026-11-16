@@ -43,4 +43,4 @@ it, refused with a clear reason elsewhere.
 - GPU under gVisor: needs `runsc --nvproxy` and a supported host driver
   version; see [isolation](isolation.md).
 - Checkpointing GPU state (`cuda-checkpoint`) is out of scope here; see
-  [sandbawks-ideas](sandbawks-ideas.md).
+  [sandbawks-ideas](../explore/sandbawks-ideas.md).

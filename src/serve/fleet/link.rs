@@ -85,7 +85,7 @@ pub struct Spec {
     /// it.
     pub channel: u8,
     /// What both ends say in their `Hello` (the frame protocol's `VERSION`
-    /// is what has to match; a fleet worker follows the build its hub says
+    /// is what has to match; a fleet worker follows the build its control plane says
     /// here, `fleet::update`).
     pub hello: &'static str,
 }
@@ -345,7 +345,7 @@ impl Outlet {
     }
 
     /// End the live link from this end (a peer link's end that must follow
-    /// its hub's build, `fleet::follow`): its body ends as when the peer's
+    /// its control plane's build, `fleet::follow`): its body ends as when the peer's
     /// stream ends ([`opener_with`] returns `Ok`, [`answerer_with`]
     /// `End::Closed`), its socket unlinked. Nothing when no link is up.
     pub fn hang_up(&self) {
@@ -475,7 +475,7 @@ pub fn answerer(
 /// a channel not there, refuses it with `Close`). `on_ready` gets the
 /// opener's `Hello` (its `hash` is the far end's `spec.hello`); an `Err`
 /// ends the link at once, before anything is served, as [`End::Refused`]
-/// (a fleet worker that must first follow its hub's version,
+/// (a fleet worker that must first follow its control plane's version,
 /// `fleet::worker`). Keepalive pings go out every `mux::KEEPALIVE_INTERVAL`;
 /// after `mux::KEEPALIVE_TIMEOUT` without a frame `on_dead` runs once: it
 /// must end `reader` (kill the ssh) so this returns. A failed listener
@@ -861,15 +861,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file each way over a real link: the hub (opener) sends to the
-    /// worker (answerer) through its socket (a `TRANSFER` stream), the worker to the hub
+    /// A file each way over a real link: the control plane (opener) sends to the
+    /// worker (answerer) through its socket (a `TRANSFER` stream), the worker to the control plane
     /// through its outlet; each end's receivers by kind.
     #[test]
     fn transfers_cross_the_link_both_ways() {
         use crate::serve::fleet::transfer::{self, Header, Received};
         let dir = scratch("fleet-transfer");
-        let (hub_dir, worker_dir) = (dir.join("hub"), dir.join("worker"));
-        std::fs::create_dir_all(&hub_dir).unwrap();
+        let (control_plane_dir, worker_dir) = (dir.join("cp"), dir.join("worker"));
+        std::fs::create_dir_all(&control_plane_dir).unwrap();
         let receivers = |into: PathBuf, tx: mpsc::Sender<Received>| {
             let tx = std::sync::Mutex::new(tx);
             Arc::new(Receivers::new(|_| {}).with(
@@ -879,10 +879,10 @@ mod tests {
                 move |r| tx.lock().unwrap().send(r).unwrap(),
             ))
         };
-        let (hub_tx, hub_rx) = mpsc::channel();
+        let (control_plane_tx, control_plane_rx) = mpsc::channel();
         let (worker_tx, worker_rx) = mpsc::channel();
-        let socket = endpoint::fleet_socket(&hub_dir, "w");
-        let ours = Serves::default().transfers(receivers(hub_dir.join("in"), hub_tx));
+        let socket = endpoint::fleet_socket(&control_plane_dir, "w");
+        let ours = Serves::default().transfers(receivers(control_plane_dir.join("in"), control_plane_tx));
         let theirs = Serves::default().with(channel::API, || None).transfers(receivers(worker_dir.clone(), worker_tx));
         let outlet = Arc::new(Outlet::default());
         let (a_r, o_w) = std::io::pipe().unwrap();
@@ -896,7 +896,7 @@ mod tests {
         wait_for(|| UnixStream::connect(&socket).is_ok(), "the socket accepts");
         let xfer = || connect(&socket, channel::TRANSFER).unwrap();
 
-        // Hub → worker: bigger than a window, so credit has to flow.
+        // Control plane → worker: bigger than a window, so credit has to flow.
         let body: Vec<u8> = (0..600_000u32).map(|i| i as u8).collect();
         let (size, sha256) = transfer::digest(&body[..]).unwrap();
         let header = Header { kind: "root-tar".into(), name: "cfg.tar".into(), size, sha256, to: None, repo: None, refs: None };
@@ -918,11 +918,11 @@ mod tests {
         assert!(format!("{err:#}").contains("the body is longer than its 600000 bytes"), "{err:#}");
         assert_eq!(std::fs::read_dir(&worker_dir).unwrap().count(), 1, "only cfg.tar, no temp files");
 
-        // Worker → hub, once the outlet is set (the `Hello`s are through).
+        // Worker → control plane, once the outlet is set (the `Hello`s are through).
         wait_for(|| outlet.is_up(), "the outlet is up");
         transfer::send(outlet.open(channel::TRANSFER).unwrap(), &header, &body[..]).unwrap();
-        let got = hub_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(got.path, hub_dir.join("in/cfg.tar"));
+        let got = control_plane_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got.path, control_plane_dir.join("in/cfg.tar"));
         assert_eq!(std::fs::read(&got.path).unwrap(), body);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -988,7 +988,7 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         let socket = endpoint::fleet_socket(dir, "w");
         let path = socket.clone();
-        let ours = Serves::default().with(channel::PTY, tagged(b"hub pty"));
+        let ours = Serves::default().with(channel::PTY, tagged(b"control-plane pty"));
         let theirs = Serves::default().with(channel::API, tagged(b"worker api")).with(channel::PTY, tagged(b"worker pty"));
         let outlet = Arc::new(Outlet::default());
         let (a_r, o_w) = std::io::pipe().unwrap();
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(read_all(dial(&socket, channel::PTY)), b"worker pty");
         assert_eq!(read_all(dial(&socket, channel::API)), b"worker api");
         // Answerer → opener, through the outlet.
-        assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"hub pty");
+        assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"control-plane pty");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1035,7 +1035,7 @@ mod tests {
         // Nor a legacy channel, even served.
         assert!(outlet.open(channel::SSH_AGENT).is_err());
         assert_eq!(read_all(dial(&socket, channel::API)), b"worker api");
-        assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"hub pty");
+        assert_eq!(read_all(timed(outlet.open(channel::PTY).unwrap())), b"control-plane pty");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1047,7 +1047,7 @@ mod tests {
         let (mut a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, mut a_w) = std::io::pipe().unwrap();
         let socket = dir.join("fleet-w.sock");
-        let ours = Serves::default().with(channel::PTY, tagged(b"hub pty"));
+        let ours = Serves::default().with(channel::PTY, tagged(b"control-plane pty"));
         let path = socket.clone();
         std::thread::spawn(move || opener_with(&LINK, o_r, o_w, Endpoint { socket: Some(&path), serves: ours, outlet: None, auth: None }, |_| Ok(())));
         let mut noise = None;
@@ -1068,7 +1068,7 @@ mod tests {
         // A served one is answered: its handler's bytes come back.
         proto::write_frame(&mut a_w, &Frame::Open { stream: high | 4, channel: channel::PTY }).unwrap();
         let mut got = Vec::new();
-        while got != b"hub pty" {
+        while got != b"control-plane pty" {
             match proto::read_frame(&mut a_r).unwrap() {
                 Some(Frame::Data { stream, bytes }) if stream == high | 4 => got.extend(bytes),
                 Some(Frame::Window { .. } | Frame::Ping(_) | Frame::Pong(_)) => {}

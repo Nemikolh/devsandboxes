@@ -132,7 +132,7 @@ pub type Exe<'a> = &'a dyn Fn() -> Result<String, String>;
 /// onto the machine's link (`machines::cli`: the instance's root resolved
 /// there with `instances.resolve`, then a `PTY` dial through
 /// `fleet::pty_client`), so the terminal goes through the machine's trust
-/// like any other use of it. A machine seen only through the hub (`routed`)
+/// like any other use of it. A machine seen only through the control plane (`routed`)
 /// is dialed the same way: the dial goes over a route
 /// (`fleet::route::connect`, fleet plan decision 60).
 fn on_machine(m: &SnapshotMachine, flags: &[&str], name: &str, command: &[String], exe: Exe) -> Result<Vec<String>, String> {
@@ -441,7 +441,7 @@ pub(crate) mod tests {
         ssh.target = Some("ssh://me@box:2222".into());
         ssh.command = Some("~/bin/devsandbox".into());
         let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Inbound, target: None, ..sm("lap", LinkState::Connected) };
-        // Seen through the hub: routed, a tab like any other.
+        // Seen through the control plane: routed, a tab like any other.
         let via = SnapshotMachine {
             kind: crate::serve::machines::MachineKind::Routed,
             via: Some("k".into()),

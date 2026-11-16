@@ -202,7 +202,7 @@ session new --id <id> -- <cmd>...` (`commands::exec::session_for`,
 `--session`'s; the runtime exec's `-w`/`-u`/`-e` give the supervisor the
 cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
 [<id>]` runs `session attach`, `exec --sessions` `session ls`. A caller
-that runs no CLI in the container (the serve daemon, for a fleet hub)
+that runs no CLI in the container (the serve daemon, for a fleet control plane)
 attaches over RPC instead ([Sessions over RPC](#sessions-over-rpc)), the
 daemon then being the session's client.
 

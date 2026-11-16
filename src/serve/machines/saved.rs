@@ -1,6 +1,6 @@
-//! A hub's saved remote rows, `remotes.json` next to `state.toml`
-//! (docs/architecture/daemon/fleet.md, *Hub mode*): what the machine links
-//! last stored in `snapshots::Remotes`, so a restarted hub shows the fleet
+//! A control plane's saved remote rows, `remotes.json` next to `state.toml`
+//! (docs/architecture/daemon/fleet.md, *Control-plane mode*): what the machine links
+//! last stored in `snapshots::Remotes`, so a restarted control plane shows the fleet
 //! before its machines reconnect. Written by the link service's
 //! `serve-remotes` thread (debounced, [`save_wait`]), read once at start.
 //!

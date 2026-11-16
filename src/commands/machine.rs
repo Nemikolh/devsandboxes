@@ -32,18 +32,18 @@ use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::join::{Fleet, Joined};
 use crate::serve::fleet::proposals::Proposal;
-use crate::serve::machines::changes::{Approved, HubMove, Proposed, Rotation, Signed};
+use crate::serve::machines::changes::{Approved, ControlPlaneMove, Proposed, Rotation, Signed};
 use crate::serve::machines::leave::{Heard, Removed, RmAnswer};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
 
 const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
-pub fn add(target: &str, name: Option<&str>, agent: bool, hub: bool, auto_install: bool, yes: bool) -> Result<()> {
+pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, auto_install: bool, yes: bool) -> Result<()> {
     let command = ensure_devsandbox(target, auto_install)?;
     let mut conn = connect()?;
     let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target, "command": command }))?;
     confirm_key(target, &probed.fingerprint, std::io::stdin().is_terminal(), yes)?;
-    let params = json!({ "target": target, "name": name, "hub": hub, "agent": agent, "command": command, "key": probed.key });
+    let params = json!({ "target": target, "name": name, "control_plane": control_plane, "agent": agent, "command": command, "key": probed.key });
     let added: Added = call(&mut conn, "machines.add", params)?;
     println!("added {} ({target})", added.name);
     println!("{}", fleet_line(&added.name, &added.fleet));
@@ -94,14 +94,14 @@ fn key_refusal(target: &str, fingerprint: &str) -> String {
 
 /// What `add`'s join did, in one line.
 fn fleet_line(name: &str, fleet: &Fleet) -> String {
-    let hub = &fleet.hub;
+    let control_plane = &fleet.control_plane;
     match fleet.joined {
-        Joined::Target => format!("{name} joined {hub}'s fleet"),
-        Joined::This => format!("this host joined {hub}'s fleet"),
-        // `--hub` made the machine the hub: the hub is its name.
-        Joined::New if *hub == name => format!("a fleet of two: {name} is the hub"),
-        Joined::New => format!("a fleet of two: this host ({hub}) is the hub"),
-        Joined::Same => format!("an extra link in {hub}'s fleet"),
+        Joined::Target => format!("{name} joined {control_plane}'s fleet"),
+        Joined::This => format!("this host joined {control_plane}'s fleet"),
+        // `--control-plane` made the machine the control plane: the control plane is its name.
+        Joined::New if *control_plane == name => format!("a fleet of two: {name} is the control plane"),
+        Joined::New => format!("a fleet of two: this host ({control_plane}) is the control plane"),
+        Joined::Same => format!("an extra link in {control_plane}'s fleet"),
     }
 }
 
@@ -297,7 +297,7 @@ pub fn trust(to: Option<Trust>) -> Result<()> {
 }
 
 /// What `machine trust` warns of while this host is `worker` and exposed
-/// (`member.get`'s `exposed_by`, the chain from the hub): the machine that
+/// (`member.get`'s `exposed_by`, the chain from the control plane): the machine that
 /// dials this host has a shell here, which `worker` doesn't stop.
 fn exposure_warning(chain: &[String]) -> Option<String> {
     let dialer = crate::serve::fleet::graph::dialer(chain)?;
@@ -351,25 +351,25 @@ fn rotation_lines(r: &Rotation) -> Vec<String> {
     }
 }
 
-/// `machine hub <name>`: the fleet's hub role moved to member `name`
-/// (`membership.hub`), signed here on the authority or proposed to it.
-pub fn hub(name: &str) -> Result<()> {
+/// `machine control-plane <name>`: the fleet's control-plane role moved to member `name`
+/// (`membership.controlPlane`), signed here on the authority or proposed to it.
+pub fn control_plane(name: &str) -> Result<()> {
     let mut conn = connect()?;
-    let r: HubMove = call(&mut conn, "membership.hub", json!({ "name": name }))?;
-    for line in hub_lines(&r) {
+    let r: ControlPlaneMove = call(&mut conn, "membership.controlPlane", json!({ "name": name }))?;
+    for line in control_plane_lines(&r) {
         println!("{line}");
     }
     Ok(())
 }
 
-fn hub_lines(r: &HubMove) -> Vec<String> {
+fn control_plane_lines(r: &ControlPlaneMove) -> Vec<String> {
     match r {
-        HubMove::Signed(s) => {
-            let mut lines = vec![format!("{} is the fleet's hub", s.name)];
+        ControlPlaneMove::Signed(s) => {
+            let mut lines = vec![format!("{} is the fleet's control plane", s.name)];
             lines.extend(signed_lines(s));
             lines
         }
-        HubMove::Proposed(p) => vec![proposed_line(&format!("making {} the fleet's hub", p.name), p)],
+        ControlPlaneMove::Proposed(p) => vec![proposed_line(&format!("making {} the fleet's control plane", p.name), p)],
     }
 }
 
@@ -510,17 +510,17 @@ fn rm_lines(answer: &RmAnswer) -> Vec<String> {
             if let Some(p) = &l.proposed {
                 lines.push(proposed_line("its own removal", p));
             }
-            if l.hub == l.name {
-                lines.push(format!("this host ({}) was the hub, alone: no fleet now", l.name));
+            if l.control_plane == l.name {
+                lines.push(format!("this host ({}) was the control plane, alone: no fleet now", l.name));
             } else {
                 match (&l.removed, &l.error) {
                     (Some(r), _) => lines.extend(removed_lines(r).into_iter().skip(1)),
                     (None, Some(why)) => {
-                        lines.push(format!("the hub {} wasn't reached ({why}): it still lists this host until `machine rm {}` there", l.hub, l.name))
+                        lines.push(format!("the control plane {} wasn't reached ({why}): it still lists this host until `machine rm {}` there", l.control_plane, l.name))
                     }
                     (None, None) => {}
                 }
-                lines.push(format!("this host ({}) left {}'s fleet", l.name, l.hub));
+                lines.push(format!("this host ({}) left {}'s fleet", l.name, l.control_plane));
             }
             if !l.dropped.is_empty() {
                 lines.push(format!("unlinked {}", l.dropped.join(", ")));
@@ -609,7 +609,7 @@ pub fn deny(id: u64) -> Result<()> {
 }
 
 fn removed_lines(r: &Removed) -> Vec<String> {
-    let mut lines = vec![format!("removed {} from {}'s fleet", r.name, r.hub)];
+    let mut lines = vec![format!("removed {} from {}'s fleet", r.name, r.control_plane)];
     match r.leave {
         Heard::Told => lines.push(format!("{} left the fleet", r.name)),
         Heard::Leaving => {}
@@ -698,11 +698,11 @@ mod tests {
     use super::*;
     #[test]
     fn the_join_is_one_line() {
-        let line = |joined| fleet_line("box", &Fleet { hub: "k".into(), joined });
+        let line = |joined| fleet_line("box", &Fleet { control_plane: "k".into(), joined });
         assert_eq!(line(Joined::Target), "box joined k's fleet");
         assert_eq!(line(Joined::This), "this host joined k's fleet");
-        assert_eq!(line(Joined::New), "a fleet of two: this host (k) is the hub");
-        assert_eq!(fleet_line("box", &Fleet { hub: "box".into(), joined: Joined::New }), "a fleet of two: box is the hub");
+        assert_eq!(line(Joined::New), "a fleet of two: this host (k) is the control plane");
+        assert_eq!(fleet_line("box", &Fleet { control_plane: "box".into(), joined: Joined::New }), "a fleet of two: box is the control plane");
         assert_eq!(line(Joined::Same), "an extra link in k's fleet");
     }
 
@@ -711,7 +711,7 @@ mod tests {
         use crate::serve::machines::leave::{Left, Missed};
         let removed = |leave, error: Option<&str>| Removed {
             name: "box".into(),
-            hub: "k".into(),
+            control_plane: "k".into(),
             leave,
             error: error.map(String::from),
             forgot: vec!["y".into()],
@@ -739,28 +739,28 @@ mod tests {
         );
         let lines = rm_lines(&RmAnswer::Revoked(signed(Some(removed(Heard::Unreachable, Some("down"))), None)));
         assert!(lines[4].starts_with("box wasn't reached (down): "), "{lines:?}");
-        let lines = rm_lines(&RmAnswer::Revoked(signed(None, Some("the hub `k` didn't remove it"))));
-        assert_eq!(lines.last().unwrap(), "the hub `k` didn't remove it");
+        let lines = rm_lines(&RmAnswer::Revoked(signed(None, Some("the control plane `k` didn't remove it"))));
+        assert_eq!(lines.last().unwrap(), "the control plane `k` didn't remove it");
         let proposed = Proposed { name: "box".into(), authority: "lap".into(), id: Some(3), error: None };
         assert_eq!(
             rm_lines(&RmAnswer::Proposed(proposed)),
             ["proposed removing box to lap: approve there with `devsandbox machine approve 3`"]
         );
-        let mut by_hub = removed(Heard::Leaving, None);
-        (by_hub.name, by_hub.forgot, by_hub.missed) = ("lap".into(), vec![], vec![]);
+        let mut by_control_plane = removed(Heard::Leaving, None);
+        (by_control_plane.name, by_control_plane.forgot, by_control_plane.missed) = ("lap".into(), vec![], vec![]);
         let left = |removed, error: Option<&str>| Left {
             name: "lap".into(),
-            hub: "k".into(),
+            control_plane: "k".into(),
             removed,
             error: error.map(String::from),
             dropped: vec!["k".into()],
             proposed: None,
         };
-        assert_eq!(rm_lines(&RmAnswer::Left(left(Some(by_hub), None))), ["this host (lap) left k's fleet", "unlinked k"]);
+        assert_eq!(rm_lines(&RmAnswer::Left(left(Some(by_control_plane), None))), ["this host (lap) left k's fleet", "unlinked k"]);
         let lines = rm_lines(&RmAnswer::Left(left(None, Some("no link to it"))));
-        assert_eq!(lines[0], "the hub k wasn't reached (no link to it): it still lists this host until `machine rm lap` there");
-        let alone = Left { name: "k".into(), hub: "k".into(), removed: None, error: None, dropped: vec![], proposed: None };
-        assert_eq!(rm_lines(&RmAnswer::Left(alone)), ["this host (k) was the hub, alone: no fleet now"]);
+        assert_eq!(lines[0], "the control plane k wasn't reached (no link to it): it still lists this host until `machine rm lap` there");
+        let alone = Left { name: "k".into(), control_plane: "k".into(), removed: None, error: None, dropped: vec![], proposed: None };
+        assert_eq!(rm_lines(&RmAnswer::Left(alone)), ["this host (k) was the control plane, alone: no fleet now"]);
         let not_linked = Proposed { name: "lap".into(), authority: "a".into(), id: None, error: Some("not linked".into()) };
         let lines = rm_lines(&RmAnswer::Left(Left { proposed: Some(not_linked), ..left(None, None) }));
         assert_eq!(lines[0], "its own removal not proposed to the authority a: not linked");
@@ -890,7 +890,7 @@ mod tests {
         let key = SigningKey::from_seed([2; 32]).public_key();
         let info = MemberInfo {
             name: Some("lap".into()),
-            hub: None,
+            control_plane: None,
             trust: Trust::Worker,
             dev_builds: false,
             roots: Vec::new(),
@@ -933,13 +933,13 @@ mod tests {
     }
 
     #[test]
-    fn a_hub_move_says_where_it_went() {
-        let signed = Signed { name: "lap".into(), change: "hub `lap`".into(), pushed: vec!["box".into()], unpushed: vec![], removed: None, error: None };
-        assert_eq!(hub_lines(&HubMove::Signed(signed)), ["lap is the fleet's hub", "signed hub `lap`", "sent to box"]);
+    fn a_control_plane_move_says_where_it_went() {
+        let signed = Signed { name: "lap".into(), change: "control plane `lap`".into(), pushed: vec!["box".into()], unpushed: vec![], removed: None, error: None };
+        assert_eq!(control_plane_lines(&ControlPlaneMove::Signed(signed)), ["lap is the fleet's control plane", "signed control plane `lap`", "sent to box"]);
         let proposed = Proposed { name: "box".into(), authority: "lap".into(), id: Some(3), error: None };
         assert_eq!(
-            hub_lines(&HubMove::Proposed(proposed)),
-            ["proposed making box the fleet's hub to lap: approve there with `devsandbox machine approve 3`"]
+            control_plane_lines(&ControlPlaneMove::Proposed(proposed)),
+            ["proposed making box the fleet's control plane to lap: approve there with `devsandbox machine approve 3`"]
         );
     }
 
@@ -1039,6 +1039,6 @@ mod tests {
         );
         let w = exposure_warning(&chain(&["box", "k", "lap"])).unwrap();
         assert!(w.starts_with("k dials this host") && w.ends_with("(exposed through box > k > lap)"), "{w}");
-        assert_eq!(exposure_warning(&chain(&["box"])), None, "the hub itself");
+        assert_eq!(exposure_warning(&chain(&["box"])), None, "the control plane itself");
     }
 }

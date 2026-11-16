@@ -78,7 +78,7 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
   (`agent-*.sock`, `endpoint::agent_sockets`: on a machine a granting
   host's `agent-link-<host>.sock` or `agent-route-<host>.sock`,
   [machines.md](../daemon/machines.md#agent);
-  on a fleet worker its link's `agent-fleet-<hub>.sock`, bound only while the hub serves its agent, [fleet.md](../daemon/fleet.md#agent)), else the
+  on a fleet worker its link's `agent-fleet-<control-plane>.sock`, bound only while the control plane serves its agent, [fleet.md](../daemon/fleet.md#agent)), else the
   daemon's own `$SSH_AUTH_SOCK`. Every client that asks for a bridge
   (`bridges.ensure`) reports its own `$SSH_AUTH_SOCK`, as does every verb
   forwarded to a machine (`machines::forward::verb`), so agent rotation (a

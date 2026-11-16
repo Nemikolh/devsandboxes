@@ -108,7 +108,7 @@ enum Command {
         reprobe: bool,
         #[arg(short, long, help = DETACH_HELP)]
         detach: bool,
-        /// Ask the fleet's hub where to run this host's sandbox (not with
+        /// Ask the fleet's control plane where to run this host's sandbox (not with
         /// `--machine` or a `<machine>/<sandbox>`)
         #[arg(long)]
         place: bool,
@@ -399,7 +399,7 @@ enum Command {
     },
     /// Print the build this binary says in a fleet link's `Hello`
     /// (docs/architecture/daemon/fleet.md, *Versions*): what a member
-    /// checks the hub's binary by
+    /// checks the control plane's binary by
     #[cfg(unix)]
     #[command(hide = true)]
     FleetHello,
@@ -459,7 +459,7 @@ enum MachineCommand {
     ///
     /// Both ends end up in one fleet: the machine joins this host's, this
     /// host joins the machine's, or (neither in one) a fleet of two with
-    /// this host the hub. Two different fleets are refused.
+    /// this host the control plane. Two different fleets are refused.
     ///
     ///     devsandbox machine add me@my-server
     ///
@@ -473,9 +473,9 @@ enum MachineCommand {
         /// Grant this host's ssh-agent to the machine, by its member key (off by default; see `machine set`)
         #[arg(long)]
         agent: bool,
-        /// Make the machine the hub of the new fleet (neither end in a fleet yet; in one, only if it already is the hub)
+        /// Make the machine the control plane of the new fleet (neither end in a fleet yet; in one, only if it already is the control plane)
         #[arg(long)]
-        hub: bool,
+        control_plane: bool,
         /// Install or update devsandbox on the machine without asking (copies this binary)
         #[arg(long)]
         auto_install: bool,
@@ -503,26 +503,26 @@ enum MachineCommand {
     /// Take a machine out of the fleet; this host's own name leaves it
     ///
     /// On the fleet's authority it revokes the machine's key, sends the
-    /// change to the machines it links to, then the hub removes it: the
-    /// machine clears its hub and drops its links, every other member the
-    /// hub reaches forgets it. On another member it's proposed to the
+    /// change to the machines it links to, then the control plane removes it: the
+    /// machine clears its control plane and drops its links, every other member the
+    /// control plane reaches forgets it. On another member it's proposed to the
     /// authority (linked directly), approved there with `machine approve`.
     /// Each outcome is printed; an unreachable machine or member is
     /// reported, not an error.
     ///
     ///     devsandbox machine rm my-server
     Rm { name: String },
-    /// Make a member of the fleet its hub
+    /// Make a member of the fleet its control plane
     ///
     /// The role moves, links stay. On the fleet's authority it's signed at
     /// once and sent to the machines it links to; each then redials saying
-    /// the new hub, and a member not reached learns it on its next link.
+    /// the new control plane, and a member not reached learns it on its next link.
     /// On another member it's proposed to the authority, approved there
     /// with `machine approve`. The member needn't be reachable, so a dead
-    /// hub can be replaced.
+    /// control plane can be replaced.
     ///
-    ///     devsandbox machine hub my-server
-    Hub { name: String },
+    ///     devsandbox machine control-plane my-server
+    ControlPlane { name: String },
     /// List the membership changes proposed to this host, the fleet's
     /// authority, waiting for `machine approve` or `machine deny`
     ///
@@ -540,7 +540,7 @@ enum MachineCommand {
     ///
     /// `worker` (the default): this host's own roots and its fleet root,
     /// placed work under the worker policy. `full`: its whole API, as a
-    /// local client has it (any root, any path, no worker policy, the hub's
+    /// local client has it (any root, any path, no worker policy, the control plane's
     /// dev builds taken). Only ever set here, on this host.
     ///
     ///     devsandbox machine trust full
@@ -777,7 +777,7 @@ fn main() -> Result<()> {
                 return Err(detach_refused());
             }
             if place {
-                eprintln!("note: --place needs devsandbox serve to ask the hub: running here");
+                eprintln!("note: --place needs devsandbox serve to ask the control plane: running here");
             }
             // Taken before any work so every child process (and autostart
             // below) writes to stderr; only the final document hits stdout.
@@ -930,14 +930,14 @@ fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
-            MachineCommand::Add { target, name, agent, hub, auto_install, yes } => {
-                commands::machine::add(&target, name.as_deref(), agent, hub, auto_install, yes)
+            MachineCommand::Add { target, name, agent, control_plane, auto_install, yes } => {
+                commands::machine::add(&target, name.as_deref(), agent, control_plane, auto_install, yes)
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
             MachineCommand::Unlink { name } => commands::machine::unlink(&name),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
-            MachineCommand::Hub { name } => commands::machine::hub(&name),
+            MachineCommand::ControlPlane { name } => commands::machine::control_plane(&name),
             MachineCommand::Pending => commands::machine::pending(),
             MachineCommand::Approve { id } => commands::machine::approve(id),
             MachineCommand::Deny { id } => commands::machine::deny(id),
@@ -1008,7 +1008,7 @@ mod tests {
             _ => panic!("not fleet-link --peer"),
         }
         assert!(parse(&["fleet-link"]).is_err(), "a peer is required");
-        for gone in [&["fleet-link", "--worker", "w", "--root", "/r"][..], &["lend"], &["fleet", "join", "me@hub"]] {
+        for gone in [&["fleet-link", "--worker", "w", "--root", "/r"][..], &["lend"], &["fleet", "join", "me@control_plane"]] {
             assert!(parse(gone).is_err(), "{gone:?}");
         }
         assert!(matches!(parse(&["fleet-hello"]).unwrap().command, Some(Command::FleetHello)));

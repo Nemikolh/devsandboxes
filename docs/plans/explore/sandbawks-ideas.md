@@ -4,12 +4,12 @@ Status: ideas, none agreed. Each would get its own plan if picked up.
 
 Things [sandbawks](https://github.com/hypotheosis/Sandbawks) does that
 devsandbox could borrow, independent of running on it
-([sandbawks-runtime](sandbawks-runtime.md)).
+([e2b-api](e2b-api.md#the-reverse-direction-running-on-an-e2b-compatible-cluster)).
 
 - **Process checkpoints.** sandbawks pauses a sandbox with
   `runsc checkpoint` (memory, processes, files) and resumes it elsewhere.
   Fleet step 14 checkpoints WIP only: "Process state is lost"
-  ([fleet](fleet.md)). Options: gVisor sandboxes ([isolation](isolation.md)),
+  ([fleet](../active/fleet.md)). Options: gVisor sandboxes ([isolation](../active/isolation.md)),
   or CRIU via `podman container checkpoint --export` (fragile with open TCP
   connections; nothing on Apple `container`). Would make `devsandbox move`
   keep a running agent.
@@ -30,7 +30,7 @@ devsandbox could borrow, independent of running on it
 - **Egress policy.** Every sandbawks sandbox starts deny-all, with an
   `egressAllow` list per template/request. devsandbox has no egress
   control; a natural part of an `untrusted` level
-  ([isolation](isolation.md)), e.g. an internal network plus an allowlisting
+  ([isolation](../active/isolation.md)), e.g. an internal network plus an allowlisting
   proxy service.
 - **"Not ready" signals for agents.** sandbawks' gateway answers a call to a
   sandbox that's still starting with an in-band `NOTICE` (exit 75 transient,

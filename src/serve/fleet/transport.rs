@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn the_ssh_argv() {
         let link = args(&["fleet-link", "--peer", "lap"]);
-        let argv = ssh_argv("ssh://me@hub:2200", "devsandbox", &link).unwrap();
+        let argv = ssh_argv("ssh://me@control_plane:2200", "devsandbox", &link).unwrap();
         let want = [
             "ssh",
             "-T",
@@ -74,13 +74,13 @@ mod tests {
             "-p",
             "2200",
             "--",
-            "me@hub",
+            "me@control_plane",
             r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--peer'\'' '\''lap'\'''"#,
         ];
         assert_eq!(argv, want.map(OsString::from));
-        assert_eq!(ssh_argv("hub", "devsandbox", &link).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
+        assert_eq!(ssh_argv("control_plane", "devsandbox", &link).unwrap()[4..6], [OsString::from("--"), "control_plane".into()]);
         assert!(ssh_argv("-oProxyCommand=x", "devsandbox", &link).is_err());
-        let custom = ssh_argv("hub", "~/bin/ds", &args(&["fleet-link"])).unwrap();
+        let custom = ssh_argv("control_plane", "~/bin/ds", &args(&["fleet-link"])).unwrap();
         assert_eq!(custom.last().unwrap(), r#"exec "$SHELL" -lc 'exec ~/bin/ds '\''fleet-link'\'''"#);
     }
 
@@ -92,8 +92,8 @@ mod tests {
             *saw.lock().unwrap() = Some((target.to_string(), args.to_vec()));
             anyhow::bail!("no route")
         });
-        let err = transport.clone().dial("me@hub", "devsandbox", &args(&["fleet-link"])).err().unwrap();
+        let err = transport.clone().dial("me@control_plane", "devsandbox", &args(&["fleet-link"])).err().unwrap();
         assert_eq!(err.to_string(), "no route");
-        assert_eq!(*seen.lock().unwrap(), Some(("me@hub".to_string(), args(&["fleet-link"]))));
+        assert_eq!(*seen.lock().unwrap(), Some(("me@control_plane".to_string(), args(&["fleet-link"]))));
     }
 }

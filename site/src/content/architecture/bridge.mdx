@@ -132,7 +132,7 @@ bridge.
 
 `start` on a running container after a CLI upgrade rewrites the binary and starts a daemon of the new build. So does
 the serve daemon before it respawns a bridge, which is how a daemon that took over after an upgrade (or a machine
-that followed its hub's version) reaches containers already running. The last start wins, upgrade or downgrade:
+that followed its control plane's version) reaches containers already running. The last start wins, upgrade or downgrade:
 
 <Sequence title="A new build's daemon taking over a running container" lanes={takeoverLanes} steps={takeoverSteps} />
 

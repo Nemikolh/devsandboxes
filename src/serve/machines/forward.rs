@@ -246,7 +246,7 @@ fn tidy(machine: &str, message: &str) -> String {
 
 /// `sandboxes.list {root, machines: true}`: `local` (this root's entries)
 /// then each machine's roots' (what its link listed, `Handle::entries`), tagged `machine` and `root` (a
-/// routed machine's roots as the hub's view has them, `snapshots::Routed`).
+/// routed machine's roots as the control plane's view has them, `snapshots::Routed`).
 /// A machine or root that doesn't answer adds nothing: the result stays an
 /// array, and a client wanting to say why reads `machines.list`.
 pub fn sandboxes_everywhere(local: Result<Value, ApiError>, links: Option<&Handle>) -> Result<Value, ApiError> {

@@ -5,7 +5,7 @@
 //!   `machine key rotate` ([`rotate`]) or an approved proposal
 //!   ([`approve`]) appends the entry, signed with this host's key, and
 //!   stores it through the adopt path (`membership_api::adopt`, which
-//!   writes `hub` from the log and promotes a rotated key); a revoke then
+//!   writes `control_plane` from the log and promotes a rotated key); a revoke then
 //!   runs the removal (`super::leave`).
 //! - **Pushed.** After every signed change the authority sends its log to
 //!   every connected machine ([`push`], `fleet.sync`). A host that takes
@@ -27,14 +27,14 @@
 //!   A host that promoted ends every link it's on (`Ctx::key_rotated`),
 //!   after its push (the authority) or its answer and onward push (a
 //!   member's `fleet.sync`), so each redials proving the new key.
-//! - **Hub move.** `membership.hub {name}` ([`hub`]) signs a `hub` entry on
-//!   the authority, else proposes it there. A host follows a hub change
-//!   (`Ctx::hub_changed`: `hub` kept, every link ended so both ends redial
+//! - **Control-plane move.** `membership.controlPlane {name}` ([`control_plane`]) signs a `control_plane` entry on
+//!   the authority, else proposes it there. A host follows a control-plane change
+//!   (`Ctx::control_plane_changed`: `control_plane` kept, every link ended so both ends redial
 //!   saying it) only once the change has left it (fleet plan decision 69):
 //!   the authority after its push, a member a `fleet.sync` moved after its
-//!   onward push and its answer (`After::Hub`). Cycling first would cut
+//!   onward push and its answer (`After::ControlPlane`). Cycling first would cut
 //!   the links carrying it; a host it misses learns it at its next link's
-//!   proof (`fleet::proof::hub_moved`).
+//!   proof (`fleet::proof::control_plane_moved`).
 //! - **Config versions.** A `run`/`rebuild`/`start` typed on the
 //!   authority ([`sign_config`], called by `serve::daemon`'s verb path)
 //!   first signs its config root's hash as the root's next `config`
@@ -61,7 +61,7 @@ use super::leave::{self, After, Authority, Missed, Removed};
 use super::service::Handle;
 use crate::serve::api::{ApiError, parse};
 use crate::serve::fleet::identity::{FileKeyStore, KeyStore, PublicKey, Signer, SigningKey};
-use crate::serve::fleet::member::{self, Hub};
+use crate::serve::fleet::member::{self, ControlPlane};
 use crate::serve::fleet::membership::{self, Op, Stored, Wire, countersign_rotate};
 use crate::serve::fleet::membership_api;
 use crate::serve::fleet::mesh;
@@ -89,10 +89,10 @@ pub struct Signed {
     pub pushed: Vec<String>,
     /// Those it didn't (they catch up on their next link).
     pub unpushed: Vec<Missed>,
-    /// A revoke's removal: run here on the hub, or the hub's answer to
+    /// A revoke's removal: run here on the control plane, or the control plane's answer to
     /// `fleet.rm`.
     pub removed: Option<Removed>,
-    /// Why a revoke has no `removed` (the hub not reached, or refusing).
+    /// Why a revoke has no `removed` (the control plane not reached, or refusing).
     pub error: Option<String>,
 }
 
@@ -114,11 +114,11 @@ pub struct Approved {
     pub signed: Signed,
 }
 
-/// `membership.hub`'s answer.
+/// `membership.controlPlane`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-pub enum HubMove {
-    /// On the authority: the `hub` entry signed, stored, pushed, then
+pub enum ControlPlaneMove {
+    /// On the authority: the `control_plane` entry signed, stored, pushed, then
     /// followed here.
     Signed(Signed),
     /// On another member: proposed to the authority.
@@ -157,11 +157,11 @@ pub struct RotateProposed {
 }
 
 /// Run `method` if it's one of the local
-/// `membership.pending|approve|deny|rotate|hub|propose`; `None` otherwise.
+/// `membership.pending|approve|deny|rotate|controlPlane|propose`; `None` otherwise.
 pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
     let answer = match method {
         "membership.rotate" => parse::<Empty>(params).and_then(|_| rotate(ctx)).and_then(to_value),
-        "membership.hub" => parse::<NameParams>(params).and_then(|p| hub(ctx, &p.name)).and_then(to_value),
+        "membership.controlPlane" => parse::<NameParams>(params).and_then(|p| control_plane(ctx, &p.name)).and_then(to_value),
         "membership.propose" => parse::<NameParams>(params).and_then(|p| propose_introduction(ctx, &p.name)).and_then(to_value),
         "membership.pending" => pending(ctx),
         "membership.approve" => parse::<IdParams>(params).and_then(|p| approve(p.id, ctx)),
@@ -251,8 +251,8 @@ fn on_authority(ctx: &Ctx) -> Result<(String, Stored), ApiError> {
 }
 
 /// `op` signed with this host's key (the authority's) and stored through
-/// the adopt path (`hub` written from the log). What the store did, for the
-/// caller to [`follow`] once it has pushed: the hub written (`Taken::hub`),
+/// the adopt path (`control_plane` written from the log). What the store did, for the
+/// caller to [`follow`] once it has pushed: the control plane written (`Taken::control_plane`),
 /// a `rotate` of this host's own key promoting its next key
 /// (`Taken::rotated`).
 fn sign(ctx: &Ctx, me: &str, mut stored: Stored, op: Op) -> Result<membership_api::Taken, ApiError> {
@@ -263,11 +263,11 @@ fn sign(ctx: &Ctx, me: &str, mut stored: Stored, op: Op) -> Result<membership_ap
 }
 
 /// What a [`sign`] stored, followed by the links once its push is out
-/// (fleet plan decision 69): the hub (a move ends every link, so both ends
+/// (fleet plan decision 69): the control plane (a move ends every link, so both ends
 /// redial saying it), a promoted key (every link ends, redialing to prove
 /// it). Each entry does one or neither.
 fn follow(ctx: &Ctx, taken: &membership_api::Taken) {
-    (ctx.hub_changed)(taken.hub.clone());
+    (ctx.control_plane_changed)(taken.control_plane.clone());
     if taken.rotated {
         (ctx.key_rotated)();
     }
@@ -411,7 +411,7 @@ fn config_missed() -> std::sync::MutexGuard<'static, Missing> {
 
 /// On the authority: `name`'s key revoked (signed, unless the log already
 /// revokes `name`: a retry), the log pushed, then the removal: here when
-/// this host is the hub, else the hub's `fleet.rm` (which the push let in).
+/// this host is the control plane, else the control plane's `fleet.rm` (which the push let in).
 pub fn revoke(ctx: &Ctx, name: &str) -> Result<Signed, ApiError> {
     let (me, stored) = on_authority(ctx)?;
     let (pushed, unpushed) = if stored.log.revoked_name(name) {
@@ -432,28 +432,28 @@ pub fn revoke(ctx: &Ctx, name: &str) -> Result<Signed, ApiError> {
         let (_, pushed, unpushed) = sign_and_push(ctx, &me, stored, op)?;
         (pushed, unpushed)
     };
-    let (_, hub) = api::own_member(ctx)?;
-    let (removed, error) = match hub {
-        Hub::This => {
+    let (_, control_plane) = api::own_member(ctx)?;
+    let (removed, error) = match control_plane {
+        ControlPlane::This => {
             let machines: Vec<String> = api::machines(ctx)?.into_iter().map(|e| e.name).collect();
             let (removed, after) = leave::remove(ctx, &me, name, true, &machines)?;
             leave::apply(after, ctx);
             (Some(removed), None)
         }
-        Hub::Other(hub) => match leave::call(ctx, &hub, "fleet.rm", json!({ "name": name })) {
+        ControlPlane::Other(control_plane) => match leave::call(ctx, &control_plane, "fleet.rm", json!({ "name": name })) {
             Ok(v) => match serde_json::from_value::<Removed>(v) {
                 Ok(r) => (Some(r), None),
-                Err(e) => (None, Some(format!("{hub}: fleet.rm: unexpected answer: {e}"))),
+                Err(e) => (None, Some(format!("{control_plane}: fleet.rm: unexpected answer: {e}"))),
             },
-            Err(why) => (None, Some(format!("the hub `{hub}` didn't remove it ({why}): it does once the revoke reaches it and `machine rm {name}` runs here again"))),
+            Err(why) => (None, Some(format!("the control plane `{control_plane}` didn't remove it ({why}): it does once the revoke reaches it and `machine rm {name}` runs here again"))),
         },
-        Hub::None => (None, Some("this host has no hub: nothing removes it from the links".into())),
+        ControlPlane::None => (None, Some("this host has no control plane: nothing removes it from the links".into())),
     };
     Ok(Signed { name: name.into(), change: format!("revoke `{name}`"), pushed, unpushed, removed, error })
 }
 
 /// On the authority: `change` from member `from` (an introduction promoted
-/// to an `add`, a member's `rotate` of its own key, a `hub`) signed, the log
+/// to an `add`, a member's `rotate` of its own key, a `control_plane`) signed, the log
 /// pushed, then followed here.
 fn sign_change(ctx: &Ctx, from: &str, change: &Change) -> Result<Signed, ApiError> {
     let (me, stored) = on_authority(ctx)?;
@@ -743,8 +743,8 @@ pub fn can_rotate(stored: Option<&Stored>, me: &str, key: &PublicKey) -> Result<
     Err(ApiError::denied(format!("`{me}` (this key) isn't a member of its fleet's membership log: it has no key there to rotate")))
 }
 
-/// What `membership.rotate` ([`plan_rotate`]) or `membership.hub`
-/// ([`plan_hub`]) does (pure): the entry checked against the log, signed
+/// What `membership.rotate` ([`plan_rotate`]) or `membership.controlPlane`
+/// ([`plan_control_plane`]) does (pure): the entry checked against the log, signed
 /// here on the authority, else proposed to it.
 pub enum RotatePlan {
     Sign(Op),
@@ -806,24 +806,24 @@ pub fn rotate(ctx: &Ctx) -> Result<Rotation, ApiError> {
     }
 }
 
-/// `membership.hub`'s plan (pure): a `hub` entry moving the role to `name`,
+/// `membership.controlPlane`'s plan (pure): a `control_plane` entry moving the role to `name`,
 /// asked by `me` (key `key`), a member of `stored`'s log by that key (an
 /// introduced host or one in no log has no say in it), checked against the
-/// log ([`proposals::check`]: `name` a member, not the hub already).
-pub fn plan_hub(stored: Option<&Stored>, me: &str, key: &PublicKey, name: &str) -> Result<RotatePlan, ApiError> {
+/// log ([`proposals::check`]: `name` a member, not the control plane already).
+pub fn plan_control_plane(stored: Option<&Stored>, me: &str, key: &PublicKey, name: &str) -> Result<RotatePlan, ApiError> {
     let Some(s) = stored.filter(|s| s.log.membership().is_some()) else { return Err(no_log()) };
     let m = s.log.membership().expect("filtered");
     if m.key_of(me) != Some(*key) {
         return Err(match s.introductions.iter().find(|i| i.name == me && i.key == *key) {
             Some(i) => ApiError::denied(format!(
-                "`{me}` is introduced by `{}`, not in the fleet's membership log: it can't move the hub role until the \
+                "`{me}` is introduced by `{}`, not in the fleet's membership log: it can't move the control-plane role until the \
                  authority `{}` adds it (`machine approve` there)",
                 i.introducer, m.authority.0
             )),
-            None => ApiError::denied(format!("`{me}` (this key) isn't a member of its fleet's membership log: it can't move the hub role")),
+            None => ApiError::denied(format!("`{me}` (this key) isn't a member of its fleet's membership log: it can't move the control-plane role")),
         });
     }
-    let change = Change::Hub { name: name.to_string() };
+    let change = Change::ControlPlane { name: name.to_string() };
     let op = proposals::check(m, me, &change).map_err(ApiError::invalid)?;
     Ok(match leave::authority_of(Some(s), me, key) {
         Authority::This => RotatePlan::Sign(op),
@@ -832,24 +832,24 @@ pub fn plan_hub(stored: Option<&Stored>, me: &str, key: &PublicKey, name: &str) 
     })
 }
 
-/// `membership.hub {name}`: the fleet's hub role moved to member `name`. On
-/// the authority the `hub` entry is signed, stored, pushed over the links as
+/// `membership.controlPlane {name}`: the fleet's control-plane role moved to member `name`. On
+/// the authority the `control_plane` entry is signed, stored, pushed over the links as
 /// they are, and only then followed here (every link cycled, so the push
 /// isn't cut); elsewhere it's proposed to the authority over any path
 /// ([`propose`], collapsing with a pending one of the same name).
-pub fn hub(ctx: &Ctx, name: &str) -> Result<HubMove, ApiError> {
+pub fn control_plane(ctx: &Ctx, name: &str) -> Result<ControlPlaneMove, ApiError> {
     let path = leave::member_toml(ctx)?;
     let (me, key) = membership_api::own(path, &ctx.hostname)?;
     let stored = membership_api::load(path)?;
-    match plan_hub(stored.as_ref(), &me, &key.public_key(), name)? {
+    match plan_control_plane(stored.as_ref(), &me, &key.public_key(), name)? {
         RotatePlan::Sign(op) => {
             let what = op.to_string();
-            let (_, pushed, unpushed) = sign_and_push(ctx, &me, stored.expect("plan_hub checked"), op)?;
-            Ok(HubMove::Signed(Signed { name: name.into(), change: what, pushed, unpushed, removed: None, error: None }))
+            let (_, pushed, unpushed) = sign_and_push(ctx, &me, stored.expect("plan_control_plane checked"), op)?;
+            Ok(ControlPlaneMove::Signed(Signed { name: name.into(), change: what, pushed, unpushed, removed: None, error: None }))
         }
         RotatePlan::Propose { authority, change } => {
             let id = propose(ctx, &authority, change)?;
-            Ok(HubMove::Proposed(Proposed { name: name.into(), authority, id: Some(id), error: None }))
+            Ok(ControlPlaneMove::Proposed(Proposed { name: name.into(), authority, id: Some(id), error: None }))
         }
     }
 }
@@ -961,16 +961,16 @@ fn queue(params: Value, from: &str, ctx: &Ctx) -> Answer {
 /// to can pull them from it; an install that fails is logged there and
 /// named in the answer (`Synced::install_error`), the sync answered all
 /// the same (the log is taken). A sync that changed nothing so retries a
-/// failed install. When it made this host's log newer: then `hub`
+/// failed install. When it made this host's log newer: then `control_plane`
 /// followed, and the log sent on to every other machine this host holds,
 /// off the request thread. When it promoted this host's next key (a
-/// rotate of it is in) or moved this host's hub, the log is sent on
+/// rotate of it is in) or moved this host's control plane, the log is sent on
 /// before answering, nothing installed (a config due answers an
 /// `install_error` saying it installs after the link cycles, so a config
 /// push counts this host missed), and every link ends once the answer is
 /// out
-/// (`After::Rotated`: redialing to prove the new key; `After::Hub`: the
-/// hub followed, redialing to say it); the redial's link-up follows the
+/// (`After::Rotated`: redialing to prove the new key; `After::ControlPlane`: the
+/// control plane followed, redialing to say it); the redial's link-up follows the
 /// configs. Changed or not, `from`'s link here lists its roots again
 /// (`Handle::relist`): it sends the log on only once it installed what the
 /// log moved, so a copy it installed since this host's link came up is
@@ -979,7 +979,7 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
     let wire: Wire = parse(params)?;
     let theirs = Stored::from_wire(wire).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     let path = leave::member_toml(ctx)?;
-    let before = api::own_member(ctx).ok().map(|(_, hub)| hub);
+    let before = api::own_member(ctx).ok().map(|(_, control_plane)| control_plane);
     let taken = membership_api::sync(path, &ctx.hostname, &theirs)?;
     if let Some(links) = &ctx.links {
         links.relist(from);
@@ -987,18 +987,18 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
     let head = taken.stored.log.head();
     let mut after = None;
     // Both end every link once the answer is out. A move that comes with
-    // a rotate needs one cycle only: `After::Hub` keeps the new hub, and
+    // a rotate needs one cycle only: `After::ControlPlane` keeps the new control plane, and
     // the redial proves the key `member.key` holds by then.
-    let follow = match (before.as_ref() != Some(&taken.hub), taken.rotated) {
+    let follow = match (before.as_ref() != Some(&taken.control_plane), taken.rotated) {
         _ if !taken.changed => None,
-        (true, _) => Some(After::Hub(taken.hub.clone())),
+        (true, _) => Some(After::ControlPlane(taken.control_plane.clone())),
         (false, true) => Some(After::Rotated),
         (false, false) => None,
     };
     let data = path.parent().expect("member.toml has a parent");
     let install_error = match (&follow, configs_due(data, &config_heads(Some(&taken.stored)))) {
         (None, true) => (ctx.log_from)(from).err(),
-        (Some(_), true) => Some("its configs install after the link cycles (this sync moved its hub or rotated its key)".into()),
+        (Some(_), true) => Some("its configs install after the link cycles (this sync moved its control plane or rotated its key)".into()),
         (_, false) => None,
     };
     if taken.changed {
@@ -1016,7 +1016,7 @@ fn sync(params: Value, from: &str, ctx: &Ctx) -> Result<(Value, Option<After>), 
             }
         }
         if follow.is_none() {
-            (ctx.hub_changed)(taken.hub);
+            (ctx.control_plane_changed)(taken.control_plane);
         }
         after = follow;
     }
@@ -1077,7 +1077,7 @@ fn approve(id: u64, ctx: &Ctx) -> Answer {
     let p = q.get(id).cloned().ok_or_else(|| ApiError::not_found(format!("no pending proposal {id}")))?;
     let signed = match &p.op {
         Change::Revoke { name } => revoke(ctx, name),
-        Change::Add { .. } | Change::Rotate { .. } | Change::Hub { .. } => sign_change(ctx, &p.from, &p.op),
+        Change::Add { .. } | Change::Rotate { .. } | Change::ControlPlane { .. } => sign_change(ctx, &p.from, &p.op),
     };
     let signed = signed.map_err(|mut e| {
         e.message = format!("proposal {id} ({}): {}; `devsandbox machine deny {id}` drops it", p.op, e.message);
@@ -1110,7 +1110,7 @@ mod tests {
     use crate::serve::fleet::dialer::tests::{Pair, connect, connected, daemon_opts, lap_on_k, named, peer_transport, wait_for};
     use super::{
         Change, ConfigMiss, ConfigSigned, MissKind, Missing, Op, RotatePlan, can_rotate, configs_due, countersign_rotate, keep_missing, missing,
-        plan_hub, plan_introduction, plan_rotate,
+        plan_control_plane, plan_introduction, plan_rotate,
     };
     use crate::serve::fleet::identity::{PublicKey, Signer, SigningKey};
     use crate::serve::fleet::member::{Member, write_for_test};
@@ -1125,16 +1125,16 @@ mod tests {
         SigningKey::from_seed([n; 32]).public_key()
     }
 
-    /// Each `(member.toml, name, hub field)` named and hubbed so, and given
+    /// Each `(member.toml, name, control_plane field)` named and given a control plane so, and given
     /// `stored` as its `membership.json`.
     fn write_fleet(stored: &Stored, members: &[(&Path, &str, &str)]) {
-        for (toml, name, hub) in members {
-            write_for_test(toml, &Member { name: name.to_string(), hub: hub.to_string(), ..Default::default() });
+        for (toml, name, control_plane) in members {
+            write_for_test(toml, &Member { name: name.to_string(), control_plane: control_plane.to_string(), ..Default::default() });
             test_support::write(toml, stored);
         }
     }
 
-    /// A [`Pair`]: K (`box`, the hub, with a registry entry `x` it never
+    /// A [`Pair`]: K (`box`, the control plane, with a registry entry `x` it never
     /// reaches) and L (`lap`), in the fleet `log` makes from K's and L's
     /// `member.toml`.
     fn pair(tag: &str, log: impl FnOnce(&Path, &Path) -> Stored + Send + 'static) -> Pair {
@@ -1164,7 +1164,7 @@ mod tests {
         wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(pair).is_some_and(|r| connected(&r)));
     }
 
-    /// `lap` (L) the authority, `box` (K) the hub; `zed` and `yan` members
+    /// `lap` (L) the authority, `box` (K) the control plane; `zed` and `yan` members
     /// never running. K's `machine rm zed` is proposed to L over K's link to
     /// it, collapses while pending, is denied, proposed again and approved:
     /// L signs the revoke, pushes it to K, and K's removal (asked with
@@ -1206,20 +1206,20 @@ mod tests {
             json!({
                 "id": 2, "name": "zed", "change": "revoke `zed`", "pushed": ["box"], "unpushed": [], "error": null,
                 "removed": {
-                    "name": "zed", "hub": "box", "leave": "unreachable",
+                    "name": "zed", "control_plane": "box", "leave": "unreachable",
                     "error": "no link to it, and no path to it in this host's link graph", "forgot": ["lap"], "missed": null,
                 },
             })
         );
         assert!(test_support::read(&l_toml).unwrap().log.revoked_name("zed"));
-        assert!(test_support::read(&k_toml).unwrap().log.revoked_name("zed"), "the push reached the hub");
+        assert!(test_support::read(&k_toml).unwrap().log.revoked_name("zed"), "the push reached the control plane");
         assert_eq!(call(&pair.l_dir, "membership.pending", json!({})).unwrap(), json!([]));
 
         // Typed on the authority: signed at once.
         let r = call(&pair.l_dir, "machines.rm", json!({"name": "yan"})).unwrap();
         assert_eq!((&r["type"], &r["pushed"], &r["removed"]["forgot"]), (&json!("revoked"), &json!(["box"]), &json!(["lap"])));
         assert!(test_support::read(&k_toml).unwrap().log.revoked_name("yan"));
-        // Neither the hub nor the authority goes this way.
+        // Neither the control plane nor the authority goes this way.
         let e = call(&pair.k_dir, "machines.rm", json!({"name": "lap"})).unwrap_err();
         assert_eq!(e, ("denied".into(), "`lap` is the fleet's authority: it can't be removed".into()));
         assert_eq!(call(&pair.l_dir, "machines.rm", json!({"name": "box"})).unwrap_err().0, "denied");
@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     /// `box` (K) is only introduced (by `pi`, a member never running) into
-    /// `lap`'s fleet, `lap` (L) the authority and the hub: the link comes up
+    /// `lap`'s fleet, `lap` (L) the authority and the control plane: the link comes up
     /// with box capped, and its `fleet.propose` to L is refused.
     #[test]
     fn a_capped_peer_proposes_nothing() {
@@ -1276,7 +1276,7 @@ mod tests {
     }
 
     /// `lap` (L), the authority, rotates its own key: signed with the old
-    /// key, the next key promoted, pushed to K (`box`, the hub), which takes
+    /// key, the next key promoted, pushed to K (`box`, the control plane), which takes
     /// the new authority key; then L ends its links, and the redial proves
     /// the new key. L's next entry (a revoke of `yan`), signed with it, is
     /// taken by K, its `fleet.rm` admitted there.
@@ -1722,7 +1722,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// L (`lap`), its fleet's authority and hub, adds K over the add-time
+    /// L (`lap`), its fleet's authority and control plane, adds K over the add-time
     /// probe: its `~/.devsandboxes` is signed v1 during the add, and K
     /// installs it at its first link-up, from the log that link carries.
     #[test]
@@ -1741,7 +1741,7 @@ mod tests {
             },
             |k, l| {
                 write_for_test(k, &Member { name: "box".into(), ..Default::default() });
-                write_for_test(l, &Member { name: "lap".into(), hub: "self".into(), ..Default::default() });
+                write_for_test(l, &Member { name: "lap".into(), control_plane: "self".into(), ..Default::default() });
                 test_support::write(l, &test_support::fleet("lap", &key_of(l), "lap", &[]));
             },
         );
@@ -1750,7 +1750,7 @@ mod tests {
         std::fs::write(dot.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
         let k_toml = pair.base.join("k-data/member.toml");
         let key = key_of(&k_toml).public_key();
-        let added = call(&pair.l_dir, "machines.add", json!({"target": "me@box", "hub": false, "key": key})).unwrap();
+        let added = call(&pair.l_dir, "machines.add", json!({"target": "me@box", "control_plane": false, "key": key})).unwrap();
         assert_eq!(added["configs"], json!(["note: signed config `.devsandboxes` v1"]));
         let l_log = test_support::read(&pair.base.join("l-data/member.toml")).unwrap();
         let (_, hash) = l_log.log.membership().unwrap().config[".devsandboxes"];
@@ -1887,7 +1887,7 @@ mod tests {
         pair.finish();
     }
 
-    /// K (`box`, a member and the hub) rotates its key: proposed to L
+    /// K (`box`, a member and the control plane) rotates its key: proposed to L
     /// (`lap`, the authority), the same next key and id when run again,
     /// shown by `member.get`; approved on L, pushed to K, which promotes it
     /// and ends its links: the redial proves the new key, and K proposes
@@ -2001,42 +2001,42 @@ mod tests {
         assert_eq!(plan_introduction(None, "box", &bx.public_key(), "new").unwrap_err().code, "failed");
     }
 
-    /// `lap` the authority, `box` the hub, `pi` a member, `new` introduced by
+    /// `lap` the authority, `box` the control plane, `pi` a member, `new` introduced by
     /// box (capped).
     #[test]
-    fn a_hub_move_is_planned_by_the_log() {
+    fn a_control_plane_move_is_planned_by_the_log() {
         let (lap, bx) = (SigningKey::from_seed([1; 32]), SigningKey::from_seed([2; 32]));
         let mut s = test_support::fleet("lap", &lap, "box", &[("box", bx.public_key()), ("pi", pk(3))]);
         let g = s.log.membership().unwrap().genesis;
         s.introduce(Introduction::sign(&g, "new", pk(5), "box", &bx)).unwrap();
-        let Ok(RotatePlan::Sign(op)) = plan_hub(Some(&s), "lap", &lap.public_key(), "pi") else { panic!("the authority signs") };
-        assert_eq!(op, Op::Hub { name: "pi".into() });
-        let Ok(RotatePlan::Propose { authority, change }) = plan_hub(Some(&s), "box", &bx.public_key(), "lap") else { panic!("a member proposes") };
-        assert_eq!((authority.as_str(), change), ("lap", Change::Hub { name: "lap".into() }));
-        // The hub already, an introduced name, an unknown one: `invalid`.
+        let Ok(RotatePlan::Sign(op)) = plan_control_plane(Some(&s), "lap", &lap.public_key(), "pi") else { panic!("the authority signs") };
+        assert_eq!(op, Op::ControlPlane { name: "pi".into() });
+        let Ok(RotatePlan::Propose { authority, change }) = plan_control_plane(Some(&s), "box", &bx.public_key(), "lap") else { panic!("a member proposes") };
+        assert_eq!((authority.as_str(), change), ("lap", Change::ControlPlane { name: "lap".into() }));
+        // The control plane already, an introduced name, an unknown one: `invalid`.
         for name in ["box", "new", "zed"] {
-            assert_eq!(plan_hub(Some(&s), "lap", &lap.public_key(), name).err().unwrap().code, "invalid", "{name}");
+            assert_eq!(plan_control_plane(Some(&s), "lap", &lap.public_key(), name).err().unwrap().code, "invalid", "{name}");
         }
         // Asked by a capped member, by a key the log doesn't list, in no fleet.
-        let e = plan_hub(Some(&s), "new", &pk(5), "pi").err().unwrap();
+        let e = plan_control_plane(Some(&s), "new", &pk(5), "pi").err().unwrap();
         assert!(e.code == "denied" && e.message.contains("introduced by `box`"), "{}", e.message);
-        assert_eq!(plan_hub(Some(&s), "box", &pk(6), "pi").err().unwrap().code, "denied");
-        assert_eq!(plan_hub(None, "box", &bx.public_key(), "pi").err().unwrap().code, "failed");
+        assert_eq!(plan_control_plane(Some(&s), "box", &pk(6), "pi").err().unwrap().code, "denied");
+        assert_eq!(plan_control_plane(None, "box", &bx.public_key(), "pi").err().unwrap().code, "failed");
     }
 
-    /// The `hub` field of the `member.toml` at `toml`.
-    fn hub_field(toml: &Path) -> String {
-        crate::serve::fleet::member::load(toml).unwrap().unwrap().hub
+    /// The `control_plane` field of the `member.toml` at `toml`.
+    fn control_plane_field(toml: &Path) -> String {
+        crate::serve::fleet::member::load(toml).unwrap().unwrap().control_plane
     }
 
-    /// `lap` (L) the authority, `box` (K) the hub. `machine hub lap` on L is
-    /// signed at once, pushed to K, then followed: both rewrite `hub` and
-    /// the links redial. `machine hub box` on K is proposed to L, approved
-    /// there, and the role moves back the same way. Naming the hub, or a
+    /// `lap` (L) the authority, `box` (K) the control plane. `machine control-plane lap` on L is
+    /// signed at once, pushed to K, then followed: both rewrite `control_plane` and
+    /// the links redial. `machine control-plane box` on K is proposed to L, approved
+    /// there, and the role moves back the same way. Naming the control plane, or a
     /// name not in the log, is `invalid`.
     #[test]
-    fn the_hub_role_moves_and_back() {
-        let pair = pair("changes-hub", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
+    fn the_control_plane_role_moves_and_back() {
+        let pair = pair("changes-cp", |k, l| test_support::fleet("lap", &key_of(l), "box", &[("box", key_of(k).public_key())]));
         up(&pair);
         let (k_toml, l_toml) = (pair.base.join("k-data/member.toml"), pair.base.join("l-data/member.toml"));
         let dials = || pair.dialed.count.load(std::sync::atomic::Ordering::SeqCst);
@@ -2045,26 +2045,26 @@ mod tests {
             wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(&pair).is_some_and(|r| connected(&r)));
         };
         for (dir, name) in [(&pair.l_dir, "box"), (&pair.k_dir, "box"), (&pair.l_dir, "zed")] {
-            assert_eq!(call(dir, "membership.hub", json!({"name": name})).unwrap_err().0, "invalid", "{name}");
+            assert_eq!(call(dir, "membership.controlPlane", json!({"name": name})).unwrap_err().0, "invalid", "{name}");
         }
-        assert_eq!(call(&pair.l_dir, "membership.hub", json!({"name": "lap", "later": 1})).unwrap_err().0, "invalid");
+        assert_eq!(call(&pair.l_dir, "membership.controlPlane", json!({"name": "lap", "later": 1})).unwrap_err().0, "invalid");
 
         let before = dials();
-        let r = call(&pair.l_dir, "membership.hub", json!({"name": "lap"})).unwrap();
-        crate::serve::dts::assert_variant("MembershipHubSigned", &r);
-        assert_eq!(r, json!({"type": "signed", "name": "lap", "change": "hub `lap`", "pushed": ["box"], "unpushed": [], "removed": null, "error": null}));
-        assert_eq!((hub_field(&l_toml), hub_field(&k_toml)), ("self".to_string(), "lap".to_string()), "the push reached K before the links ended");
+        let r = call(&pair.l_dir, "membership.controlPlane", json!({"name": "lap"})).unwrap();
+        crate::serve::dts::assert_variant("MembershipControlPlaneSigned", &r);
+        assert_eq!(r, json!({"type": "signed", "name": "lap", "change": "control plane `lap`", "pushed": ["box"], "unpushed": [], "removed": null, "error": null}));
+        assert_eq!((control_plane_field(&l_toml), control_plane_field(&k_toml)), ("self".to_string(), "lap".to_string()), "the push reached K before the links ended");
         for toml in [&l_toml, &k_toml] {
-            assert_eq!(test_support::read(toml).unwrap().log.membership().unwrap().hub, "lap");
+            assert_eq!(test_support::read(toml).unwrap().log.membership().unwrap().control_plane, "lap");
         }
         redialed(before);
-        assert_eq!(call(&pair.l_dir, "membership.hub", json!({"name": "lap"})).unwrap_err().0, "invalid", "the hub already");
+        assert_eq!(call(&pair.l_dir, "membership.controlPlane", json!({"name": "lap"})).unwrap_err().0, "invalid", "the control plane already");
 
         // Both ends cycle (K once its answer is out, `AFTER_ANSWER` later):
         // the link L redialed first may end once more. A retry collapses
         // with a pending proposal.
         let mut r = Value::Null;
-        wait_for("K's proposal reaches L", Duration::from_secs(10), || match call(&pair.k_dir, "membership.hub", json!({"name": "box"})) {
+        wait_for("K's proposal reaches L", Duration::from_secs(10), || match call(&pair.k_dir, "membership.controlPlane", json!({"name": "box"})) {
             Ok(v) => {
                 r = v;
                 true
@@ -2074,11 +2074,11 @@ mod tests {
                 false
             }
         });
-        crate::serve::dts::assert_variant("MembershipHubProposed", &r);
+        crate::serve::dts::assert_variant("MembershipControlPlaneProposed", &r);
         assert_eq!(r, json!({"type": "proposed", "name": "box", "authority": "lap", "id": 1, "error": null}));
         // The repeat may still land in that last cycle: retried the same way.
         let mut again = Value::Null;
-        wait_for("K's repeat reaches L", Duration::from_secs(10), || match call(&pair.k_dir, "membership.hub", json!({"name": "box"})) {
+        wait_for("K's repeat reaches L", Duration::from_secs(10), || match call(&pair.k_dir, "membership.controlPlane", json!({"name": "box"})) {
             Ok(v) => {
                 again = v;
                 true
@@ -2091,21 +2091,21 @@ mod tests {
         assert_eq!(again["id"], 1, "pending: the same id");
         let pending = call(&pair.l_dir, "membership.pending", json!({})).unwrap();
         assert_eq!(pending.as_array().unwrap().len(), 1, "{pending}");
-        assert_eq!((&pending[0]["from"], &pending[0]["op"]), (&json!("box"), &json!({"kind": "hub", "name": "box"})));
-        crate::serve::dts::assert_matches("FleetChangeHub", &pending[0]["op"]);
-        assert_eq!(hub_field(&l_toml), "self", "never signed on the request alone");
+        assert_eq!((&pending[0]["from"], &pending[0]["op"]), (&json!("box"), &json!({"kind": "control_plane", "name": "box"})));
+        crate::serve::dts::assert_matches("FleetChangeControlPlane", &pending[0]["op"]);
+        assert_eq!(control_plane_field(&l_toml), "self", "never signed on the request alone");
 
         let before = dials();
         let approved = call(&pair.l_dir, "membership.approve", json!({"id": 1})).unwrap();
         crate::serve::dts::assert_matches("MembershipApproved", &approved);
-        assert_eq!((&approved["change"], &approved["name"], &approved["pushed"]), (&json!("hub `box`"), &json!("box"), &json!(["box"])));
-        assert_eq!((hub_field(&l_toml), hub_field(&k_toml)), ("box".to_string(), "self".to_string()));
+        assert_eq!((&approved["change"], &approved["name"], &approved["pushed"]), (&json!("control plane `box`"), &json!("box"), &json!(["box"])));
+        assert_eq!((control_plane_field(&l_toml), control_plane_field(&k_toml)), ("box".to_string(), "self".to_string()));
         assert_eq!(call(&pair.l_dir, "membership.pending", json!({})).unwrap(), json!([]));
         redialed(before);
         pair.finish();
     }
 
-    /// Three daemons: K (`box`, the hub), L (`lap`, the authority) and P
+    /// Three daemons: K (`box`, the control plane), L (`lap`, the authority) and P
     /// (`pi`), L and P each linked to K only. K's introduction of `new` is
     /// proposed to L and approved there; L pushes the `add` to K, which
     /// sends it on to P (not back to L). A config L signs is installed on K
@@ -2179,7 +2179,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Three daemons: K (`box`, the hub, a member), A (`lap`, the authority,
+    /// Three daemons: K (`box`, the control plane, a member), A (`lap`, the authority,
     /// linked to K) and L (`pi`, in no fleet). L's `machine add box` has K
     /// sign L's introduction over the add-time probe and propose it
     /// (`membership.propose`): pending on A, which holds the introduction
@@ -2221,9 +2221,9 @@ mod tests {
         wait_for("lap connected on K", Duration::from_secs(10), || on_k("lap"));
 
         let l_key = key_of(&l_toml).public_key();
-        let add = json!({"hub": false, "target": "me@box", "key": key_of(&k_toml).public_key()});
+        let add = json!({"control_plane": false, "target": "me@box", "key": key_of(&k_toml).public_key()});
         let r = call(&l_dir, "machines.add", add).unwrap();
-        assert_eq!(r["fleet"], json!({"hub": "box", "joined": "this"}));
+        assert_eq!(r["fleet"], json!({"control_plane": "box", "joined": "this"}));
         assert_eq!(r["proposed"], json!({"name": "pi", "authority": "lap", "id": 1, "error": null}));
         let i = test_support::read(&l_toml).unwrap().introductions;
         assert_eq!((i.len(), i[0].name.as_str(), i[0].introducer.as_str()), (1, "pi", "box"));
@@ -2261,15 +2261,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// K (`box`, the hub), L (`lap`, the authority) and P (`pi`), L and P
-    /// each linked to K only. P is down while L signs `machine hub lap`
+    /// K (`box`, the control plane), L (`lap`, the authority) and P (`pi`), L and P
+    /// each linked to K only. P is down while L signs `machine control-plane lap`
     /// (pushed to K alone); P's daemon starts later, behind: its link's
-    /// proof carries the entry, P adopts it (`hub = "lap"`), the link ends
+    /// proof carries the entry, P adopts it (`control_plane = "lap"`), the link ends
     /// since P's `Hello` named `box`, and the redial, saying `lap`, comes up
     /// (K, saying `lap` too, takes it: the same fleet).
     #[test]
-    fn a_member_down_during_a_hub_move_follows_at_its_next_proof() {
-        let base = scratch("changes-hub-late");
+    fn a_member_down_during_a_control_plane_move_follows_at_its_next_proof() {
+        let base = scratch("changes-cp-late");
         let (k_dir, l_dir, p_dir) = (base.join("k"), base.join("l"), base.join("p"));
         let (k_opts, _) = daemon_opts(&base, "k");
         let (mut l_opts, _) = daemon_opts(&base, "l");
@@ -2296,19 +2296,19 @@ mod tests {
         drop(connect(&l_dir));
         wait_for("lap connected on K", Duration::from_secs(10), || on(&k_dir, "lap"));
 
-        let r = call(&l_dir, "membership.hub", json!({"name": "lap"})).unwrap();
+        let r = call(&l_dir, "membership.controlPlane", json!({"name": "lap"})).unwrap();
         assert_eq!((&r["type"], &r["pushed"]), (&json!("signed"), &json!(["box"])), "{r}");
-        assert_eq!(hub_field(&k_toml), "lap", "K followed");
-        assert_eq!(hub_field(&p_toml), "box", "P, down, missed it");
+        assert_eq!(control_plane_field(&k_toml), "lap", "K followed");
+        assert_eq!(control_plane_field(&p_toml), "box", "P, down, missed it");
 
         daemons.push(spawn_daemon(&p_dir, p_opts));
         drop(connect(&p_dir));
         wait_for("box connected on P after a redial", Duration::from_secs(20), || {
             dialed[1].count.load(std::sync::atomic::Ordering::SeqCst) >= 2 && on(&p_dir, "box") && on(&k_dir, "pi")
         });
-        assert_eq!(hub_field(&p_toml), "lap", "P's hub follows the log it took");
+        assert_eq!(control_plane_field(&p_toml), "lap", "P's control plane follows the log it took");
         assert_eq!(test_support::read(&p_toml).unwrap().log.head(), test_support::read(&l_toml).unwrap().log.head());
-        assert_eq!(call(&p_dir, "member.get", json!({})).unwrap()["hub"], "lap");
+        assert_eq!(call(&p_dir, "member.get", json!({})).unwrap()["control_plane"], "lap");
 
         for (dir, daemon) in [&p_dir, &l_dir, &k_dir].into_iter().zip(daemons.into_iter().rev()) {
             assert!(connect(dir).call("shutdown", json!({})).unwrap().error.is_none());

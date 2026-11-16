@@ -9,7 +9,9 @@ part (4a-4d) shipped too: `session prune` and the prune on `new`, a
 displaced client that never blocks, the session wire version
 (`VERSION_EXIT`), the session count in `instances.procs`. The living docs
 describe all of it. Left: step 4's items after fleet step 1 (surfacing
-detached sessions, a policy for abandoned ones).
+detached sessions, a policy for abandoned ones), and step 5 (link
+terminals resumable when the helper isn't root; from *Compared with
+Kubernetes attach*).
 
 ## Problem
 
@@ -323,13 +325,130 @@ The "now" part shipped as four commits (4a-4d). Landmarks are from recon
   `docs/architecture/dashboard/tabs-and-actions.md`,
   `docs/architecture/runtimes.md` where it describes the procs listing.
 
+## Step 5: link terminals resumable when the helper isn't root
+
+From *Compared with Kubernetes attach* below. A `PTY` session header for
+an instance whose helper is there but doesn't offer `session.attach`
+(`fleet::pty::NotResumable::HelperNotRoot`: `containerUser`) gets the
+*Tty fallback*, a plain `<runtime> exec -it` that a dropped link ends.
+The same instance's local `exec` is resumable: it runs the helper's
+session client through `exec -it` as the container user
+(`commands::exec::session_for`), which needs no root daemon. Over the
+link only the daemon-side attach (`session.attach`, `needs_root`) was
+considered.
+
+- `fleet::pty::decide`: a third `Terminal`, a session client under a
+  host pty, for `HelperNotRoot`: with `create` the argv
+  `exec_argv_with(instance, true, true, session_new_command(id, argv))`
+  (what a local tty exec runs), attach-only
+  `session_attach_command(id)` instead of `no-session`. `NoHelper`
+  keeps today's fallback and refusal.
+- `fleet::pty::run_tty` runs it as today (host pty, `resize`, hang-up
+  kills the runtime's exec client). The in-container client a lost link
+  leaves behind is displaced by the next attach, as over ssh. No
+  `NotResumable` note for it.
+- The end: the client's `NO_SESSION_EXIT` / `DETACHED_EXIT` /
+  `VERSION_EXIT` map to the `no-session` / `detached` / `version` error
+  records a `Terminal::Attach` ends with (`pty::tty_exit_record`, or a
+  wrapper of it), so the caller's `Reconnect` and the dashboard's
+  `Redial` treat both alike. The program's own 250-252 read as those, as
+  they do for a local session exec.
+- Tests: `decide`'s table (the `HelperNotRoot` rows), the argv, the
+  code mapping.
+- Docs: `docs/architecture/daemon/fleet.md` *PTY* (*The gate*, *Tty
+  fallback*), `docs/status.md` (the not-resumable line keeps only no
+  helper and services).
+
+## Compared with Kubernetes attach
+
+How Kubernetes reattaches to a terminal, against what this plan built.
+Sources: kubectl's `attach`
+([attach.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/kubectl/pkg/cmd/attach/attach.go)),
+client-go's `remotecommand`
+([v4.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/client-go/tools/remotecommand/v4.go),
+channel ids in apimachinery's
+[constants.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apimachinery/pkg/util/remotecommand/constants.go)),
+containerd's CRI
+([container_io.go](https://github.com/containerd/containerd/blob/main/internal/cri/io/container_io.go)),
+[KEP-4006](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/4006-transition-spdy-to-websockets),
+the [kubelet config](https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/),
+[kubernetes#89031](https://github.com/kubernetes/kubernetes/issues/89031).
+
+**Kubernetes' model.**
+
+- Only a container's main process is attachable, and usefully only one
+  started with `stdin` (and `tty`) in its spec: kubectl turns `-t` off
+  when the container allocated no TTY, and forces it on when it did. The
+  runtime (containerd's shim, CRI-O's conmon) holds the stdio or pty for
+  the container's life.
+- Several attachers at once: containerd's `ContainerIO.Attach` adds each
+  attacher's stdout/stderr to a writer group under a fresh key and copies
+  each one's stdin into the container's; output fans out to all, input
+  merges.
+- A new attacher sees only what comes next: no replay, no redraw. kubectl
+  prints `If you don't see a command prompt, try pressing enter.` The
+  main process's output is in the container log meanwhile (kubectl warns
+  it is "recorded in container logs"), readable with `kubectl logs`.
+- `stdinOnce`: the container's stdin closes when the first attacher's
+  stdin ends (containerd: only without a tty).
+- Wire: channels 0-4 (stdin, stdout, stderr, error, resize), 255 `CLOSE`
+  (v5, KEP-4006: half-close of stdin). The exit code comes on the error
+  channel as a `metav1.Status` (`NonZeroExitCode`, cause `ExitCode`;
+  `errorDecoderV4`).
+- Idle: the kubelet's `streamingConnectionIdleTimeout` (4h) is
+  deprecated and has no effect.
+- Client gone: an attacher leaving changes nothing for the main process.
+  An `exec` process is not killed (#89031: bash left running after
+  kubectl was killed) and nothing can reattach to it: exec is not
+  resumable, the leak this plan's *Problem* describes. The way to get a
+  reattachable shell is a new container whose main process it is
+  (`kubectl run -it`, `kubectl debug`), then `kubectl attach`; kubectl
+  prints `Session ended, resume using 'kubectl attach …'` (for an
+  ephemeral container, only while it still runs).
+- kubectl never reconnects by itself: `attach` streams once and returns.
+  It now has `--detach-keys` (default `ctrl-p,ctrl-q`, docker's),
+  through `term.NewDetachableReader`.
+
+**Against ours.**
+
+| | Kubernetes | devsandbox | verdict |
+|---|---|---|---|
+| What is attachable | the main process, if spec'd with `stdin`/`tty` | every tty exec with a helper (`commands::exec::session_for`) | ahead |
+| Several attachers | all at once, output fanned out, input merged | one; a new one takes over (`Supervisor::take_over`, `DETACHED_EXIT`) | deliberate (displaces the stale `exec -it` client ssh leaves); a read-only watcher is an open question |
+| Output while detached | main process: container log | dropped past `OUT_CAP` | deliberate (no unbounded log); a bounded replay is an open question |
+| Screen on reattach | nothing ("press enter") | resize one row off, then the real size: the program redraws | ahead |
+| Resize | resize channel | `size` record, `SIZE_POLL` | parity |
+| Exit status after a detached end | exec: lost; main: pod status | `meta` keeps it, an attach returns it; kept `ENDED_GRACE` past the end | ahead |
+| Stdin end | `stdinOnce`, v5 `CLOSE` | `stdin-eof` (RPC / `PTY`); a session's pty input never closes with a client | parity (as `stdinOnce: false`) |
+| Keepalive / idle | no idle timeout (deprecated) | the link mux's `KEEPALIVE_INTERVAL` / `KEEPALIVE_TIMEOUT` (15 s / 45 s) for `PTY` streams; no idle end of sessions | parity; abandoned sessions are step 4's policy |
+| Auto-reconnect | none | `machines::cli::Reconnect`, `tui::app::terminal::Redial` | ahead |
+| Client gone, not resumable | exec process leaks | *Tty fallback*: the runtime exec is killed; a local exec without a helper as before | ahead / parity |
+| Not resumable: no helper, Apple `container` | — | plain exec (`Instance::devsbd_arch` `None`) | deliberate (non-goal) |
+| Not resumable: helper not root, over the link | — | *Tty fallback* (`NotResumable::HelperNotRoot`), though a local exec of the same instance is a session | **gap**: step 5 |
+| Service terminals | `kubectl debug` + attach | plain `exec -it`, never a session | deliberate (services run no helper) |
+| Piped exec | not resumable | not resumable (`shell_flags`, `pipe_mode`) | parity |
+| Discovery | the pod spec says what's attachable; exec processes invisible | `exec --sessions`, `--attach`'s pick (`detached_sessions`), `sessions.list`, the procs count | ahead; the dashboard rows are step 4's |
+| Resume hint | `Session ended, resume using …` | `session <id> was attached elsewhere` on 251; nothing when the terminal itself went | minor: the host CLI could print the `exec --attach` line on 251 |
+| Detach key | `--detach-keys`, `ctrl-p,ctrl-q` | none (open question) | see *Detach key* |
+
 ## Open questions
 
 - **Detach key**: a key (dtach's `Ctrl-\`) that leaves the session running
   and returns to the host shell, rather than only closing the terminal.
   Every key it takes is a key the program can't get, and closing the
   tab/terminal already detaches. Proposal: none for now, an opt-in later
-  if missed.
+  if missed. kubectl's `attach --detach-keys` (default `ctrl-p,ctrl-q`)
+  is the model if one comes: the same default and flag.
+- **Watchers**: Kubernetes fans a container's output out to every
+  attacher. A read-only attach (`--attach --watch`: output only, no
+  takeover, no size) would let a dashboard look at an agent's session
+  while a terminal elsewhere holds it. Costs the supervisor a client
+  list and a size owner. Proposal: not until asked.
+- **Replay on attach**: Kubernetes' detached output is the container
+  log, for the main process only. A bounded tail (a few KiB per session,
+  in memory) replayed before the redraw would show a plain shell's last
+  lines; full-screen programs redraw anyway and agents' questions reach
+  the Inbox. Proposal: no; the non-goal stands.
 - ~~Relation to [helper-rpc](helper-rpc.md)'s `run.attach`~~ settled by
   [fleet](fleet.md) step 4 (decision 13): a fleet worker's daemon
   attaches through `session.attach` over `RPC`; local execs stay on

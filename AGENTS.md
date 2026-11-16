@@ -25,7 +25,7 @@ Start with `docs/README.md` (reading order and map) and
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `inbox.rs` is `devsandbox inbox …` (docs/reference/inbox-cli.md): reads from the
   store, mutations via a running daemon's API, else the same `wire::decide_*`
-  ops locally. `machine.rs` is `devsandbox machine add|ls|set|unlink|rm|hub|pending|approve|deny|key [rotate]|trust|roots`
+  ops locally. `machine.rs` is `devsandbox machine add|ls|set|unlink|rm|control-plane|pending|approve|deny|key [rotate]|trust|roots`
   (docs/architecture/daemon/machines.md): a client of `machines.*`,
   `member.*`, `membership.*` only (never in-process);
   `add`'s install check first (ask on a TTY, `--auto-install`, else
@@ -163,7 +163,7 @@ Start with `docs/README.md` (reading order and map) and
   `fleet.sync`'s store), `proof.rs` (a peer link's key proof),
   `proposals.rs` (`proposals.json`), `graph.rs` (members' signed link
   reports, `Graph::paths` over them and `exposure`, pure), `reports.rs`
-  (this host's report from its links, debounced, sent to the hub as
+  (this host's report from its links, debounced, sent to the control plane as
   `fleet.report`; every member's `fleet.graph` floods and link-up
   exchanges on the `serve-fleet-graph` thread; the in-memory graph
   `graph.get` answers), `route.rs` (a `ROUTE` stream's opening: the
@@ -260,8 +260,9 @@ Start with `docs/README.md` (reading order and map) and
   `docs/status.md` (the only place for in progress / planned / parked /
   known limitations) when it adds, fixes or parks something. Decisions
   that still hold are ADRs in `decisions/` (a new one supersedes, old ones
-  aren't rewritten). Plans live in `plans/active/<topic>.md`; once shipped,
-  their content moves into the living docs and the plan goes to
+  aren't rewritten). Ideas not agreed yet live in
+  `plans/explore/<topic>.md` and move to `plans/active/<topic>.md` once
+  agreed (deleted if dropped); once shipped, an active plan's content moves into the living docs and the plan goes to
   `plans/archive/` (banner on top), deleted once outdated. Skip
   `plans/archive/` unless asked about history. Names are topics, no
   `plan-` prefix or `-plan` suffix. `docs_links` (`tests/docs_links.rs`)

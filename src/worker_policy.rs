@@ -76,7 +76,7 @@ pub struct Allow {
     #[serde(skip_serializing_if = "is_false")]
     pub publish: bool,
     /// Names of this host's env vars a config may read with
-    /// `${localEnv:NAME}` (exact names; the hub writes the config, so any
+    /// `${localEnv:NAME}` (exact names; the control plane writes the config, so any
     /// other would hand it this host's env).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub local_env: Vec<String>,
@@ -779,13 +779,13 @@ pub fn enforce_argv(dir: &Path, argv: &[String]) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A temp `<data>/devsandbox` with `fleet/me@hub/cfg` and an `outside`
+    /// A temp `<data>/devsandbox` with `fleet/me@control_plane/cfg` and an `outside`
     /// dir next to it. Returns (data, fleet root, outside).
     fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!("dsv-policy-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let data = base.join("data/devsandbox");
-        let root = data.join("fleet/me@hub");
+        let root = data.join("fleet/me@control_plane");
         std::fs::create_dir_all(root.join("cfg/repo")).unwrap();
         std::fs::create_dir_all(base.join("outside")).unwrap();
         (data.canonicalize().unwrap(), root.canonicalize().unwrap(), base.join("outside").canonicalize().unwrap())

@@ -4,22 +4,22 @@
 //! (`HelperClient::call_with_input`, decision 13 of
 //! docs/plans/active/fleet.md: no `exec -it`, no in-container client).
 //!
-//! The stream carries `rpc` records (`src/devsbd/rpc.rs`). The hub's first
+//! The stream carries `rpc` records (`src/devsbd/rpc.rs`). The control plane's first
 //! is a `call` of [`METHOD`] whose params are the [`Header`]; then its
 //! `stdin`, `resize` and `stdin-eof` records go into the attach, and the
 //! helper's records come back unchanged: `stdout`…, then one end record,
 //! `exit` or `error`. A stream refused before the attach gets one `error`
-//! record ([`code`]). The hub closing the stream detaches (the call is
+//! record ([`code`]). The control plane closing the stream detaches (the call is
 //! cancelled; the session runs on in the container); an attach that ends
 //! without an end record is [`code::LOST`].
 //!
 //! A header with `pipe` instead of `session` is a piped exec ([`Mode::Pipe`],
 //! a non-tty `exec`): no session and no helper, a `<runtime> exec` without
-//! `-t` on this host ([`runtime_exec`]) with its stdio piped. The hub's
+//! `-t` on this host ([`runtime_exec`]) with its stdio piped. The control plane's
 //! `stdin` records go to its stdin (`stdin-eof` closes it; only when
 //! `interactive`, else its stdin is empty); its stdout and stderr come back
 //! as `stdout` and `stderr` records, then one `exit` once both are drained
-//! and it was reaped ([`exit_record`]). The hub closing the stream first
+//! and it was reaped ([`exit_record`]). The control plane closing the stream first
 //! kills and reaps it, and nothing more is written.
 //!
 //! A session header for an instance whose helper can't attach (none, or its
@@ -29,8 +29,8 @@
 //! note says so first); an attach-only one gets `no-session`. A header with
 //! `service` ([`Mode::Service`]) is the same tty exec into a service
 //! container the instance uses ([`service_container`]). The pty's output
-//! comes back as `stdout` records, the hub's `stdin` and `resize` go into
-//! it, its exit is one `exit` record; the hub closing first kills and reaps
+//! comes back as `stdout` records, the control plane's `stdin` and `resize` go into
+//! it, its exit is one `exit` record; the control plane closing first kills and reaps
 //! it.
 //!
 //! [`parse_header`], [`gate`], [`decide`], [`attach_params`],
@@ -63,7 +63,7 @@ pub const METHOD: &str = "session.attach";
 /// `bad-request` and `failed` too.
 pub mod code {
     pub use crate::devsbd::rpc::code::{BAD_REQUEST, FAILED};
-    /// The header's root is outside the fleet root, or not this hub's to
+    /// The header's root is outside the fleet root, or not this control plane's to
     /// reach.
     pub const DENIED: &str = "denied";
     /// No such root, or no lent instance by that name or id in it.
@@ -78,16 +78,16 @@ pub mod code {
     pub const LOST: &str = "lost";
 }
 
-/// How long the hub has to send the header once it opened the stream.
+/// How long the control plane has to send the header once it opened the stream.
 const HEADER_WAIT: Duration = Duration::from_secs(30);
 
-/// How often a piped exec is checked for its exit and the hub's hang-up.
+/// How often a piped exec is checked for its exit and the control plane's hang-up.
 const PIPE_TICK: Duration = Duration::from_millis(100);
 
 /// The most bytes one `stdout` / `stderr` record of a piped exec carries.
 const PIPE_CHUNK: usize = 64 * 1024;
 
-/// What the hub asks: `{"root", "instance", "session", "create"?:
+/// What the control plane asks: `{"root", "instance", "session", "create"?:
 /// {"argv"?}}`, `{"root", "instance", "pipe": {"argv",
 /// "interactive"?}}`, or `{"root", "instance", "service", "create":
 /// {"argv"?}}`.
@@ -107,8 +107,8 @@ pub enum Mode {
     /// only; `Some(argv)`, create it running `argv` (empty: the login shell,
     /// `SHELL_FALLBACK_CMD`) unless it exists, then attach.
     Session { id: String, create: Option<Vec<String>> },
-    /// A non-tty exec of `argv` (never empty: the hub sends the login shell
-    /// itself), the hub's stdin forwarded when `interactive` (`exec -i`).
+    /// A non-tty exec of `argv` (never empty: the control plane sends the login shell
+    /// itself), the control plane's stdin forwarded when `interactive` (`exec -i`).
     Pipe { argv: Vec<String>, interactive: bool },
     /// A tty exec of `argv` (empty: the login shell) in the container of
     /// service `name` that the header's instance uses; always a new
@@ -137,7 +137,7 @@ fn kind(rec: &Record) -> &'static str {
     }
 }
 
-/// The hub's first record as a [`Header`], or the `bad-request` to end the
+/// The control plane's first record as a [`Header`], or the `bad-request` to end the
 /// stream with.
 pub fn parse_header(rec: Record) -> Result<Header, Record> {
     let call = match rec {
@@ -249,7 +249,7 @@ impl NotResumable {
     }
 
     /// The `stderr` record's text a fallback terminal starts with (`\r\n`:
-    /// the hub's terminal is raw by then).
+    /// the control plane's terminal is raw by then).
     pub fn note(self) -> String {
         format!("this terminal isn't resumable ({}): a dropped link ends it\r\n", self.why())
     }
@@ -292,7 +292,7 @@ fn refusal(e: CallError, name: &str) -> Record {
 /// The container of service `service` that lent instance `name` uses: the
 /// config read from the instance's own config root (`gate` put it under
 /// the header's), named as the forwards name it
-/// (`port::service_container_for`), never by the hub.
+/// (`port::service_container_for`), never by the control plane.
 pub fn service_container(instance: &Instance, name: &str, state: &State, service: &str) -> Result<String, Record> {
     let failed = |e: anyhow::Error| Record::error(code::FAILED, format!("{e:#}"));
     let dir = instance
@@ -404,7 +404,7 @@ pub struct Tty {
     writer: Box<dyn Write + Send>,
 }
 
-/// Spawn `argv` on a fresh host pty (80×24 until the hub's first `resize`),
+/// Spawn `argv` on a fresh host pty (80×24 until the control plane's first `resize`),
 /// as the dashboard's terminal tabs do (`tui::term`).
 pub fn spawn_tty(argv: Vec<String>) -> anyhow::Result<Tty> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -448,7 +448,7 @@ pub fn serve(
     exec: ExecCommand,
     log: fn(&str),
 ) {
-    let caller = format!("fleet hub {}", peer.name);
+    let caller = format!("fleet control plane {}", peer.name);
     let _ = link.set_read_timeout(Some(HEADER_WAIT));
     let first = rpc::read_record(&mut &link);
     let _ = link.set_read_timeout(None);
@@ -556,7 +556,7 @@ fn start_in(
         return tty(exec(&target), Some(why.note()));
     }
     let params = attach_params(id, create.as_deref(), instance, host_agent());
-    // While it queues: whether the hub closed its end.
+    // While it queues: whether the control plane closed its end.
     let abandoned = || crate::serve::daemon::hung_up(link, Duration::ZERO);
     let (call, input) = helper.call_with_input(&instance.container, METHOD, params, Obj::new(), caller, &abandoned).map_err(|e| match e {
         CallError::NoBridge(_) | CallError::Unsupported(_) => refusal(e, name),
@@ -566,9 +566,9 @@ fn start_in(
     Ok(Started::Attach(call, input))
 }
 
-/// A piped exec to its end: the hub's input into its stdin and its stdout
+/// A piped exec to its end: the control plane's input into its stdin and its stdout
 /// and stderr out as records, each on a thread of its own; once it exited
-/// and both pipes are drained, its `exit` record. The hub hanging up first
+/// and both pipes are drained, its `exit` record. The control plane hanging up first
 /// (`feed_pipe` reads the stream's end, or a peek between waits does)
 /// kills and reaps it, and nothing more is written.
 fn run_pipe(link: &Stream, mut child: Child) {
@@ -623,10 +623,10 @@ fn run_pipe(link: &Stream, mut child: Child) {
 }
 
 /// A tty exec to its end: `note` first (as a `stderr` record), then the
-/// pty's output as `stdout` records on a thread of its own, the hub's
+/// pty's output as `stdout` records on a thread of its own, the control plane's
 /// `stdin` into the pty and its `resize`s onto it on another; once the
 /// child exited and the output is drained, its `exit` record
-/// ([`tty_exit_record`]). The hub hanging up first kills (SIGHUP, then
+/// ([`tty_exit_record`]). The control plane hanging up first kills (SIGHUP, then
 /// SIGKILL: portable-pty's `kill`) and reaps it, and nothing more is
 /// written.
 fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
@@ -682,7 +682,7 @@ fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
     });
 }
 
-/// The hub's records into a tty exec until the hub closes its end, which
+/// The control plane's records into a tty exec until the control plane closes its end, which
 /// flags `gone` unless the exec is over (`done`): `stdin` to the pty,
 /// `resize` onto it. `stdin-eof` is ignored (a terminal has no end of its
 /// own to give), as is anything else.
@@ -714,7 +714,7 @@ fn feed_tty(
 }
 
 /// One of a piped exec's outputs to its end, each read as one `wrap`
-/// record, until the hub refuses a write (a tty's too).
+/// record, until the control plane refuses a write (a tty's too).
 fn drain(mut r: impl Read, wrap: fn(Vec<u8>) -> Record, send: &(dyn Fn(&Record) -> bool + Sync)) {
     let mut buf = vec![0u8; PIPE_CHUNK];
     loop {
@@ -731,8 +731,8 @@ fn drain(mut r: impl Read, wrap: fn(Vec<u8>) -> Record, send: &(dyn Fn(&Record) 
     }
 }
 
-/// The hub's records into a piped exec's `stdin` (`None`: not interactive,
-/// its input ignored) until the hub closes its end, which flags `gone`
+/// The control plane's records into a piped exec's `stdin` (`None`: not interactive,
+/// its input ignored) until the control plane closes its end, which flags `gone`
 /// unless the exec is over (`done`). `stdin-eof`, or a write the exec
 /// refuses, closes its stdin.
 fn feed_pipe(mut reader: Stream, mut stdin: Option<std::process::ChildStdin>, done: &AtomicBool, gone: &AtomicBool) {
@@ -762,9 +762,9 @@ fn is_end(rec: &Record) -> bool {
     matches!(rec, Record::Exit(_) | Record::Error { .. } | Record::Result(_))
 }
 
-/// Relay until the attach ends: the hub's records into `input` on a thread
-/// of their own, the call's records back to the hub, unchanged, up to and
-/// including its end record. The hub closing its end cancels the call; a
+/// Relay until the attach ends: the control plane's records into `input` on a thread
+/// of their own, the call's records back to the control plane, unchanged, up to and
+/// including its end record. The control plane closing its end cancels the call; a
 /// call that ends without an end record is answered with [`code::LOST`].
 fn pump(link: &Stream, mut call: Call, input: Input) {
     let done = AtomicBool::new(false);
@@ -779,7 +779,7 @@ fn pump(link: &Stream, mut call: Call, input: Input) {
             match call.next() {
                 Ok(Some(rec)) => {
                     let end = is_end(&rec);
-                    // A failed write: the hub is gone; dropping the call
+                    // A failed write: the control plane is gone; dropping the call
                     // (unfinished) cancels it.
                     if rpc::write_record(&mut &*link, &rec).is_err() || end {
                         break None;
@@ -799,7 +799,7 @@ fn pump(link: &Stream, mut call: Call, input: Input) {
     });
 }
 
-/// The hub's records into the attach until the hub closes its end (or
+/// The control plane's records into the attach until the control plane closes its end (or
 /// sends something undecodable), which cancels the call unless it is over.
 /// Records other than input are ignored, as the helper ignores them.
 fn feed(mut reader: Stream, mut input: Input, done: &AtomicBool, gone: &AtomicBool, cancel: &Cancel) {
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn the_gate_takes_lent_instances_with_a_helper() {
         let b = scratch("gate");
-        let root = b.join("fleet/hub");
+        let root = b.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(root.join("other")).unwrap();
         std::fs::create_dir_all(b.join("mine")).unwrap();
@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn the_exec_argv_is_a_local_execs() {
         let b = scratch("argv");
-        let root = b.join("fleet/hub");
+        let root = b.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         let state = state_with(&b, &root);
         let bin = crate::runtime::backend().bin().to_string();
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn create_runs_as_an_exec_would() {
         let b = scratch("params");
-        let root = b.join("fleet/hub");
+        let root = b.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         let state = state_with(&b, &root);
         let mut inst = state.instances["web-1"].clone();
@@ -1158,7 +1158,7 @@ mod tests {
 
     fn world(tag: &str) -> World {
         let base = scratch(tag);
-        let root = base.join("fleet/hub");
+        let root = base.join("fleet/control_plane");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::write(root.join("cfg").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
         state_with(&base, &root);
@@ -1169,21 +1169,21 @@ mod tests {
         World { state: base.join("state.toml"), base, root, helper, attaches: Attaches::default() }
     }
 
-    /// The hub's end of a stream served on a thread, its header sent.
+    /// The control plane's end of a stream served on a thread, its header sent.
     fn open(w: &World, header: Record, helper: HelperClient) -> (UnixStream, std::thread::JoinHandle<()>) {
-        let (hub, ours) = UnixStream::pair().unwrap();
-        let peer = Peer { name: "me@hub".into(), fleet_root: Some(w.root.clone()), env: None, agent: None, key: None, introduced_by: None };
+        let (control_plane, ours) = UnixStream::pair().unwrap();
+        let peer = Peer { name: "me@control_plane".into(), fleet_root: Some(w.root.clone()), env: None, agent: None, key: None, introduced_by: None };
         let files = Files { state: w.state.clone(), member: None, home: None };
         let attaches = w.attaches.clone();
         let t = std::thread::spawn(move || serve(ours, &helper, &files, &peer, &attaches, || false, sh, log));
-        rpc::write_record(&mut &hub, &header).unwrap();
-        hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        (hub, t)
+        rpc::write_record(&mut &control_plane, &header).unwrap();
+        control_plane.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        (control_plane, t)
     }
 
-    fn rest(mut hub: &UnixStream) -> Vec<Record> {
+    fn rest(mut control_plane: &UnixStream) -> Vec<Record> {
         let mut recs = Vec::new();
-        while let Ok(Some(rec)) = rpc::read_record(&mut hub) {
+        while let Ok(Some(rec)) = rpc::read_record(&mut control_plane) {
             recs.push(rec);
         }
         recs
@@ -1197,13 +1197,13 @@ mod tests {
     #[test]
     fn a_stream_relays_input_and_output_to_the_end_record() {
         let w = world("relay");
-        let (hub, t) = open(&w, create_header(&w, SESSION), w.helper.clone());
-        let mut out = &hub;
+        let (control_plane, t) = open(&w, create_header(&w, SESSION), w.helper.clone());
+        let mut out = &control_plane;
         rpc::write_record(&mut out, &Record::Stdin(b"ls\n".to_vec())).unwrap();
         rpc::write_record(&mut out, &Record::Resize { cols: 120, rows: 40 }).unwrap();
         rpc::write_record(&mut out, &Record::Signal(2)).unwrap();
         rpc::write_record(&mut out, &Record::StdinEof).unwrap();
-        let recs = rest(&hub);
+        let recs = rest(&control_plane);
         t.join().unwrap();
         let stdout = |s: &str| Record::Stdout(s.as_bytes().to_vec());
         assert_eq!(
@@ -1221,34 +1221,34 @@ mod tests {
     fn a_stream_is_its_instances_latest_attach_from_its_origin() {
         let w = world("attach");
         assert_eq!(attached(&w, "id-web-1"), None);
-        let (hub, t) = open(&w, create_header(&w, SESSION), w.helper.clone());
-        assert!(matches!(rpc::read_record(&mut &hub), Ok(Some(Record::Stdout(_)))), "attached");
-        assert_eq!(attached(&w, "id-web-1"), Some(Origin::Member("me@hub".into())), "during the stream");
+        let (control_plane, t) = open(&w, create_header(&w, SESSION), w.helper.clone());
+        assert!(matches!(rpc::read_record(&mut &control_plane), Ok(Some(Record::Stdout(_)))), "attached");
+        assert_eq!(attached(&w, "id-web-1"), Some(Origin::Member("me@control_plane".into())), "during the stream");
         assert!(w.attaches.live_in("id-web-1"));
         // A local attach begins later: the latest, and the stream's end
         // doesn't clobber it.
         let here = w.attaches.begin_in("id-web-1", Origin::Here);
-        rpc::write_record(&mut &hub, &Record::StdinEof).unwrap();
-        rest(&hub);
+        rpc::write_record(&mut &control_plane, &Record::StdinEof).unwrap();
+        rest(&control_plane);
         t.join().unwrap();
         assert_eq!(attached(&w, "id-web-1"), Some(Origin::Here));
         drop(here);
 
         // A service terminal counts too; a pipe and a refusal don't.
-        let (hub, t) = open(&w, pipe_header(&w, "bare", "exit 0", false), w.helper.clone());
-        rest(&hub);
+        let (control_plane, t) = open(&w, pipe_header(&w, "bare", "exit 0", false), w.helper.clone());
+        rest(&control_plane);
         t.join().unwrap();
         assert_eq!(attached(&w, "id-bare"), None, "a pipe: no attach");
         let cfg = w.root.join("cfg");
         let create = Obj::new().with("argv", vec!["exit 0".to_string()]);
         let h = header(pipe_base(cfg.to_str().unwrap()).with("service", "db").with("create", create));
         let _ = w.attaches.begin_in("id-web-1", Origin::Here);
-        let (hub, t) = open(&w, h, w.helper.clone());
-        rest(&hub);
+        let (control_plane, t) = open(&w, h, w.helper.clone());
+        rest(&control_plane);
         t.join().unwrap();
-        assert_eq!(attached(&w, "id-web-1"), Some(Origin::Member("me@hub".into())), "a service terminal: its instance's");
-        let (hub, t) = open(&w, header(base(cfg.to_str().unwrap()).with("instance", "own")), w.helper.clone());
-        rest(&hub);
+        assert_eq!(attached(&w, "id-web-1"), Some(Origin::Member("me@control_plane".into())), "a service terminal: its instance's");
+        let (control_plane, t) = open(&w, header(base(cfg.to_str().unwrap()).with("instance", "own")), w.helper.clone());
+        rest(&control_plane);
         t.join().unwrap();
         assert_eq!(attached(&w, "id-own"), None, "refused: no attach");
     }
@@ -1256,19 +1256,19 @@ mod tests {
     #[test]
     fn a_lost_bridge_ends_with_lost_and_a_hang_up_cancels() {
         let w = world("lost");
-        let (hub, t) = open(&w, create_header(&w, "1700000000-0105"), w.helper.clone());
-        let recs = rest(&hub);
+        let (control_plane, t) = open(&w, create_header(&w, "1700000000-0105"), w.helper.clone());
+        let recs = rest(&control_plane);
         t.join().unwrap();
         assert_eq!(recs.len(), 2, "{recs:?}");
         assert!(matches!(&recs[1], Record::Error { code, .. } if code == code::LOST), "{recs:?}");
 
-        // The hub closes mid-attach: the call is cancelled (the session
+        // The control plane closes mid-attach: the call is cancelled (the session
         // detaches and runs on), nothing more is written.
-        let (hub, t) = open(&w, create_header(&w, "1700000000-0106"), w.helper.clone());
-        assert!(matches!(rpc::read_record(&mut &hub), Ok(Some(Record::Stdout(_)))));
-        drop(hub);
+        let (control_plane, t) = open(&w, create_header(&w, "1700000000-0106"), w.helper.clone());
+        assert!(matches!(rpc::read_record(&mut &control_plane), Ok(Some(Record::Stdout(_)))));
+        drop(control_plane);
         t.join().unwrap();
-        assert!(logged("helper devsandbox-web-1: session.attach from fleet hub me@hub: cancelled ("));
+        assert!(logged("helper devsandbox-web-1: session.attach from fleet control plane me@control_plane: cancelled ("));
     }
 
     /// The tests' exec: `sh -c <argv[0]>` on this host; into a service,
@@ -1304,16 +1304,16 @@ mod tests {
     fn a_pipe_splits_its_outputs_and_ends_with_its_exit() {
         let w = world("pipe-out");
         // `bare` has no helper: a pipe doesn't need one.
-        let (hub, t) = open(&w, pipe_header(&w, "bare", "echo out; echo err >&2; cat; exit 5", false), w.helper.clone());
+        let (control_plane, t) = open(&w, pipe_header(&w, "bare", "echo out; echo err >&2; cat; exit 5", false), w.helper.clone());
         // It may be over already: the write's outcome doesn't matter.
-        let _ = rpc::write_record(&mut &hub, &Record::Stdin(b"ignored\n".to_vec()));
-        let recs = rest(&hub);
+        let _ = rpc::write_record(&mut &control_plane, &Record::Stdin(b"ignored\n".to_vec()));
+        let recs = rest(&control_plane);
         t.join().unwrap();
         assert_eq!(split(&recs), ("out\n".into(), "err\n".into(), Some(Record::Exit(Exit::Code(5)))), "not interactive: empty stdin");
         assert_eq!(recs.iter().filter(|r| matches!(r, Record::Exit(_))).count(), 1);
 
-        let (hub, t) = open(&w, pipe_header(&w, "web-1", "kill -9 $$", false), w.helper.clone());
-        let recs = rest(&hub);
+        let (control_plane, t) = open(&w, pipe_header(&w, "web-1", "kill -9 $$", false), w.helper.clone());
+        let recs = rest(&control_plane);
         t.join().unwrap();
         assert_eq!(recs, [Record::Exit(Exit::Signal(9))]);
     }
@@ -1321,12 +1321,12 @@ mod tests {
     #[test]
     fn a_pipe_forwards_stdin_to_its_eof() {
         let w = world("pipe-in");
-        let (hub, t) = open(&w, pipe_header(&w, "web-1", "cat; echo done", true), w.helper.clone());
-        rpc::write_record(&mut &hub, &Record::Stdin(b"abc".to_vec())).unwrap();
-        rpc::write_record(&mut &hub, &Record::Resize { cols: 80, rows: 24 }).unwrap();
-        rpc::write_record(&mut &hub, &Record::Stdin(b"def\n".to_vec())).unwrap();
-        rpc::write_record(&mut &hub, &Record::StdinEof).unwrap();
-        let recs = rest(&hub);
+        let (control_plane, t) = open(&w, pipe_header(&w, "web-1", "cat; echo done", true), w.helper.clone());
+        rpc::write_record(&mut &control_plane, &Record::Stdin(b"abc".to_vec())).unwrap();
+        rpc::write_record(&mut &control_plane, &Record::Resize { cols: 80, rows: 24 }).unwrap();
+        rpc::write_record(&mut &control_plane, &Record::Stdin(b"def\n".to_vec())).unwrap();
+        rpc::write_record(&mut &control_plane, &Record::StdinEof).unwrap();
+        let recs = rest(&control_plane);
         t.join().unwrap();
         assert_eq!(split(&recs), ("abcdef\ndone\n".into(), String::new(), Some(Record::Exit(Exit::Code(0)))));
     }
@@ -1334,12 +1334,12 @@ mod tests {
     #[test]
     fn a_hang_up_kills_the_pipe() {
         let w = world("pipe-hup");
-        let (hub, t) = open(&w, pipe_header(&w, "web-1", "echo $$; exec sleep 30", true), w.helper.clone());
-        let Ok(Some(Record::Stdout(pid))) = rpc::read_record(&mut &hub) else { panic!("no pid") };
+        let (control_plane, t) = open(&w, pipe_header(&w, "web-1", "echo $$; exec sleep 30", true), w.helper.clone());
+        let Ok(Some(Record::Stdout(pid))) = rpc::read_record(&mut &control_plane) else { panic!("no pid") };
         let pid = String::from_utf8(pid).unwrap();
         let pid: libc::pid_t = pid.trim().parse().unwrap_or_else(|_| panic!("{pid:?}"));
         let started = std::time::Instant::now();
-        drop(hub);
+        drop(control_plane);
         t.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(10), "killed, not waited out");
         // SAFETY: signal 0 only checks the pid; reaped, it's gone.
@@ -1350,8 +1350,8 @@ mod tests {
     fn refusals_are_one_error_record() {
         let w = world("refuse");
         let refusal = |header: Record, helper: HelperClient| {
-            let (hub, t) = open(&w, header, helper);
-            let recs = rest(&hub);
+            let (control_plane, t) = open(&w, header, helper);
+            let recs = rest(&control_plane);
             t.join().unwrap();
             match recs.as_slice() {
                 [Record::Error { code, .. }] => code.clone(),
@@ -1365,7 +1365,7 @@ mod tests {
         let other = w.base.join("other");
         std::fs::create_dir_all(&other).unwrap();
         assert_eq!(refusal(header(base(other.to_str().unwrap()).with("instance", "own")), w.helper.clone()), code::DENIED);
-        assert!(logged("fleet: refused a PTY stream from me@hub"));
+        assert!(logged("fleet: refused a PTY stream from me@control_plane"));
         // An own root's instance is reached (its helper isn't running here).
         let mine = w.base.join("mine");
         std::fs::create_dir_all(&mine).unwrap();
@@ -1396,10 +1396,10 @@ mod tests {
     #[test]
     fn a_helperless_instance_gets_a_tty_that_says_it_isnt_resumable() {
         let w = world("tty");
-        let (hub, t) = open(&w, tty_header(&w, "bare", "read x; stty size; echo got $x; exit 3"), w.helper.clone());
-        rpc::write_record(&mut &hub, &Record::Resize { cols: 100, rows: 30 }).unwrap();
-        rpc::write_record(&mut &hub, &Record::Stdin(b"hi\n".to_vec())).unwrap();
-        let recs = rest(&hub);
+        let (control_plane, t) = open(&w, tty_header(&w, "bare", "read x; stty size; echo got $x; exit 3"), w.helper.clone());
+        rpc::write_record(&mut &control_plane, &Record::Resize { cols: 100, rows: 30 }).unwrap();
+        rpc::write_record(&mut &control_plane, &Record::Stdin(b"hi\n".to_vec())).unwrap();
+        let recs = rest(&control_plane);
         t.join().unwrap();
         assert_eq!(recs[0], Record::Stderr(NotResumable::NoHelper.note().into_bytes()), "the note first: {recs:?}");
         let (out, err, last) = split(&recs);
@@ -1408,8 +1408,8 @@ mod tests {
         assert!(out.contains("got hi"), "{out:?}");
         assert_eq!(last, Some(Record::Exit(Exit::Code(3))));
 
-        let (hub, t) = open(&w, tty_header(&w, "bare", "kill -9 $$"), w.helper.clone());
-        let recs = rest(&hub);
+        let (control_plane, t) = open(&w, tty_header(&w, "bare", "kill -9 $$"), w.helper.clone());
+        let recs = rest(&control_plane);
         t.join().unwrap();
         assert_eq!(recs.last(), Some(&Record::Exit(Exit::Signal(9))));
     }
@@ -1419,8 +1419,8 @@ mod tests {
         let w = world("tty-root");
         let fake = Fake::default();
         fake.add("devsandbox-web-1", caps::RPC, 1, not_root);
-        let (hub, t) = open(&w, tty_header(&w, "web-1", "echo ok"), HelperClient::new(fake, log));
-        let recs = rest(&hub);
+        let (control_plane, t) = open(&w, tty_header(&w, "web-1", "echo ok"), HelperClient::new(fake, log));
+        let recs = rest(&control_plane);
         t.join().unwrap();
         assert_eq!(recs[0], Record::Stderr(NotResumable::HelperNotRoot.note().into_bytes()));
         let (out, _, last) = split(&recs);
@@ -1431,10 +1431,10 @@ mod tests {
     #[test]
     fn a_hang_up_kills_the_tty() {
         let w = world("tty-hup");
-        let (hub, t) = open(&w, tty_header(&w, "bare", "echo $$; exec sleep 30"), w.helper.clone());
+        let (control_plane, t) = open(&w, tty_header(&w, "bare", "echo $$; exec sleep 30"), w.helper.clone());
         let mut out = String::new();
         let pid: libc::pid_t = loop {
-            match rpc::read_record(&mut &hub) {
+            match rpc::read_record(&mut &control_plane) {
                 Ok(Some(Record::Stdout(b))) => out.push_str(&String::from_utf8_lossy(&b)),
                 Ok(Some(Record::Stderr(_))) => {}
                 other => panic!("{other:?} after {out:?}"),
@@ -1444,7 +1444,7 @@ mod tests {
             }
         };
         let started = std::time::Instant::now();
-        drop(hub);
+        drop(control_plane);
         t.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(10), "killed, not waited out");
         // SAFETY: signal 0 only checks the pid; reaped, it's gone.
@@ -1457,8 +1457,8 @@ mod tests {
         let cfg = w.root.join("cfg");
         let create = Obj::new().with("argv", vec!["exit 4".to_string()]);
         let h = header(pipe_base(cfg.to_str().unwrap()).with("service", "db").with("create", create));
-        let (hub, t) = open(&w, h, w.helper.clone());
-        let recs = rest(&hub);
+        let (control_plane, t) = open(&w, h, w.helper.clone());
+        let recs = rest(&control_plane);
         t.join().unwrap();
         let (out, err, last) = split(&recs);
         let project = crate::commands::services::project_id(&cfg).unwrap();

@@ -510,13 +510,13 @@ pub fn prove(side: Side, r: &mut impl Read, w: &mut impl Write, auth: &Auth, our
     Ok(Proven { name: peer.to_string(), key: expected, introduced_by, newer })
 }
 
-/// Why a link ends after `newer` was adopted: the hub its log names isn't
+/// Why a link ends after `newer` was adopted: the control plane its log names isn't
 /// the one this end's `Hello` (`hello`) said, so both ends redial saying
 /// it. `None` when it is.
-pub fn hub_moved(hello: &str, newer: &Stored) -> Option<String> {
-    let hub = &newer.log.membership()?.hub;
-    (update::hub_of(hello) != Some(hub.as_str()))
-        .then(|| format!("took newer membership entries: the fleet's hub is now `{hub}`; the link ends so both ends redial saying it"))
+pub fn control_plane_moved(hello: &str, newer: &Stored) -> Option<String> {
+    let control_plane = &newer.log.membership()?.control_plane;
+    (update::control_plane_of(hello) != Some(control_plane.as_str()))
+        .then(|| format!("took newer membership entries: the fleet's control plane is now `{control_plane}`; the link ends so both ends redial saying it"))
 }
 
 #[cfg(test)]
@@ -534,7 +534,7 @@ pub mod tests {
         key(n).public_key()
     }
 
-    /// `lap` (key 1) the authority, `box` (key 2) the hub; fleet id `id`.
+    /// `lap` (key 1) the authority, `box` (key 2) the control plane; fleet id `id`.
     fn two(id: u8) -> Stored {
         let mut log = Log::default();
         log.append(Op::genesis_with_id([id; 16], "lap", pk(1), "box"), "lap", &key(1)).unwrap();
@@ -640,7 +640,7 @@ pub mod tests {
     #[test]
     fn the_end_behind_gets_the_entries_it_lacks() {
         let s = two(1);
-        let ahead = with(with(s.clone(), Op::Add { name: "pi".into(), key: pk(3) }), Op::Hub { name: "pi".into() });
+        let ahead = with(with(s.clone(), Op::Add { name: "pi".into(), key: pk(3) }), Op::ControlPlane { name: "pi".into() });
         let (o, a) = run(auth("box", 2, s.clone(), "lap"), auth("lap", 1, ahead.clone(), "box"));
         assert_eq!(o.unwrap().newer, Some(ahead.clone()));
         assert_eq!(a.unwrap().newer, None);
@@ -648,8 +648,8 @@ pub mod tests {
         let (o, a) = run(auth("pi", 3, ahead.clone(), "lap"), auth("lap", 1, s.clone(), "pi"));
         assert_eq!(a.unwrap().newer, Some(ahead.clone()));
         assert_eq!(o.unwrap().newer, None);
-        assert!(hub_moved(&update::hello_of(false, Some("box")), &ahead).unwrap().contains("hub is now `pi`"));
-        assert_eq!(hub_moved(&update::hello_of(false, Some("pi")), &ahead), None);
+        assert!(control_plane_moved(&update::hello_of(false, Some("box")), &ahead).unwrap().contains("control plane is now `pi`"));
+        assert_eq!(control_plane_moved(&update::hello_of(false, Some("pi")), &ahead), None);
     }
 
     #[test]
