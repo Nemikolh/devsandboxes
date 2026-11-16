@@ -101,7 +101,8 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
    sandbox. `--` is only needed when the command's first word is a devsandbox
    flag (`-i`, `-t`, `-h`/`--help`, `-C`/`--dir`): those are parsed as flags
    anywhere before the command (`exec web -- -t`). Non-interactive commands
-   need neither `-i` nor `-t`.
+   need neither `-i` nor `-t`: with neither flag, a command gets `-i -t` only
+   when stdin and stdout are both TTYs, else plain piped stdio.
 
    Without `cmd` it opens a login shell (zsh, else bash, else sh). With neither
    flag given that shell gets `-i`, plus `-t` when stdin is a TTY; any explicit

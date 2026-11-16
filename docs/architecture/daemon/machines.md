@@ -692,7 +692,8 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   program's, 255 only for a lost link, the helper's session codes).
 - **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /
   `--sessions` / `--service`, and a tty by a local `exec`'s rule,
-  `shell_flags`, with this process on a terminal standing for its stdin).
+  `shell_flags` or with a command `command_flags`, with this process on a
+  terminal standing for its stdin and stdout).
   The id is this process's (`--session` as given, else
   `exec::mint_session_id`); the first dial creates the session (or
   attaches) running the command (none: the login shell), each re-dial
@@ -726,8 +727,9 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   that lost its link.
 - **An `exec` without a tty** is one piped `PTY` dial ([fleet](fleet.md#pty),
   *Pipe mode*), never re-dialed: `cli::pipe_mode` (pure) gives its argv
-  and `-i` as a local `exec` decides them (the command as typed with `-i`
-  as given; none, the login shell with `exec::shell_flags`' `-i`); with
+  and `-i` as a local `exec` decides them (the command as typed with
+  `exec::command_flags`' `-i`; none, the login shell with
+  `exec::shell_flags`' `-i`); with
   `--session <id>` that argv in the helper's session `id`
   (`exec::session_new_command`), as a local `exec --session` without a tty
   runs it. `exec --service <name>` is one service `PTY` dial

@@ -62,6 +62,7 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
         bail!("{why}");
     }
     let stdin_tty = std::io::stdin().is_terminal();
+    let terminal = stdin_tty && std::io::stdout().is_terminal();
     let helper = instance.devsbd_arch.is_some();
 
     match what {
@@ -114,7 +115,8 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
                 let (i, t) = shell_flags(interactive, tty, stdin_tty);
                 (shell.as_slice(), i, t)
             } else {
-                (command, interactive, tty)
+                let (i, t) = command_flags(interactive, tty, terminal);
+                (command, i, t)
             };
             let wrapped = session_for(helper, tty, session, || mint_session_id(Instance::now()))
                 .map(|id| session_new_command(&id, command));
@@ -284,6 +286,15 @@ pub(crate) fn shell_flags(interactive: bool, tty: bool, stdin_tty: bool) -> (boo
     } else {
         (true, stdin_tty)
     }
+}
+
+/// `-i`/`-t` for an exec with a command. Explicit flags are taken as given.
+/// With neither, both when this process is on a terminal (`terminal`: stdin
+/// and stdout), so `exec web claude` gets a TTY (its size, raw input, mouse)
+/// and a session like the shell does; any redirect (`exec web cat f > out`,
+/// a script, an agent's tool call) keeps plain piped stdio.
+pub(crate) fn command_flags(interactive: bool, tty: bool, terminal: bool) -> (bool, bool) {
+    if interactive || tty { (interactive, tty) } else { (terminal, terminal) }
 }
 
 /// The session a `Run` exec goes through, if any: none without the helper
@@ -767,6 +778,16 @@ mod tests {
             assert_eq!(reported_code(code, true), code);
         }
         assert_eq!(reported_code(255, false), 255, "off: as is");
+    }
+
+    #[test]
+    fn command_flags_default_to_a_tty_only_on_a_terminal() {
+        assert_eq!(command_flags(false, false, true), (true, true));
+        assert_eq!(command_flags(false, false, false), (false, false));
+        // Any explicit flag is honored exactly, terminal or not.
+        assert_eq!(command_flags(true, false, true), (true, false));
+        assert_eq!(command_flags(false, true, true), (false, true));
+        assert_eq!(command_flags(true, true, false), (true, true));
     }
 
     #[test]

@@ -478,14 +478,18 @@ pub(crate) fn gone_note(id: &str) -> String {
 /// The session id a machine `exec` reconnects with: `None` when it gets no
 /// tty (a piped exec, nothing to re-attach to) or is an `--attach` /
 /// `--sessions` already, or a `--service` terminal (never a session). The
-/// tty rule is a local `exec`'s (`commands::exec::shell_flags`), `terminal`
-/// standing for its stdin: a `PTY` dial has a terminal exactly when this
-/// process is on one. A `--session` given is kept, else one is minted here.
+/// tty rule is a local `exec`'s (`commands::exec::shell_flags`, with a
+/// command `command_flags`), `terminal` standing for its stdin and stdout: a
+/// `PTY` dial has a terminal exactly when this process is on one. A `--session` given is kept, else one is minted here.
 pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl FnOnce() -> String) -> Result<Option<String>> {
     let Command::Exec { interactive, tty, attach: None, sessions: false, session, service: None, command, .. } = command else {
         return Ok(None);
     };
-    let tty = if command.is_empty() { crate::commands::exec::shell_flags(*interactive, *tty, terminal).1 } else { *tty };
+    let tty = if command.is_empty() {
+        crate::commands::exec::shell_flags(*interactive, *tty, terminal).1
+    } else {
+        crate::commands::exec::command_flags(*interactive, *tty, terminal).1
+    };
     if !tty {
         return Ok(None);
     }
@@ -496,7 +500,8 @@ pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl Fn
 }
 
 /// The piped `PTY` mode of a machine `exec` that gets no tty (the rule
-/// [`reconnect_session`]'s): `argv` as typed, `-i` as given; no command,
+/// [`reconnect_session`]'s): `argv` as typed with `exec::command_flags`'
+/// `-i`; no command,
 /// the login shell (`exec::SHELL_FALLBACK_CMD`) with `exec::shell_flags`'
 /// `-i`, as a local `exec` runs it. With `--session <id>`, that `argv` in
 /// the helper's session `id` (`exec::session_new_command`), as a local
@@ -514,10 +519,11 @@ pub(crate) fn pipe_mode(command: &Command, terminal: bool) -> Result<Option<pty_
         }
         (crate::commands::exec::SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect(), interactive)
     } else {
-        if *tty {
+        let (interactive, tty) = crate::commands::exec::command_flags(*interactive, *tty, terminal);
+        if tty {
             return Ok(None);
         }
-        (command.clone(), *interactive)
+        (command.clone(), interactive)
     };
     let argv = match session {
         Some(id) => crate::commands::exec::session_new_command(crate::commands::exec::checked_session_id(id)?, &argv),
@@ -1077,8 +1083,8 @@ mod tests {
         // piped `PTY` after `reconnect_session` says it gets none.
         let ls = command(&["exec", "box/web", "--", "ls"]);
         assert_eq!(named(&["exec", "box/web", "--", "ls"]), Use::Link);
-        assert_eq!(reconnect_session(&ls, true, || ID.into()).unwrap(), None);
-        assert_eq!(pipe_mode(&ls, true).unwrap(), Some(pty_client::Mode::Pipe { argv: ms(&["ls"]), interactive: false }));
+        assert_eq!(reconnect_session(&ls, false, || ID.into()).unwrap(), None);
+        assert_eq!(pipe_mode(&ls, false).unwrap(), Some(pty_client::Mode::Pipe { argv: ms(&["ls"]), interactive: false }));
     }
 
     fn entry() -> Entry {
@@ -1212,7 +1218,9 @@ mod tests {
         assert_eq!(rs(&["exec", "box/web"], false), None, "piped: no tty");
         assert_eq!(rs(&["exec", "-i", "box/web"], true), None, "explicit flags as given");
         assert_eq!(rs(&["exec", "-t", "box/web"], false).as_deref(), Some(ID));
-        assert_eq!(rs(&["exec", "box/web", "zidane"], true), None, "a command takes -t as given");
+        assert_eq!(rs(&["exec", "box/web", "zidane"], true).as_deref(), Some(ID), "a command on a terminal too");
+        assert_eq!(rs(&["exec", "box/web", "zidane"], false), None);
+        assert_eq!(rs(&["exec", "-i", "box/web", "zidane"], true), None, "explicit flags as given");
         assert_eq!(rs(&["exec", "-it", "box/web", "zidane"], true).as_deref(), Some(ID));
         assert_eq!(rs(&["exec", "--session", "1790000000-0000", "box/web"], true).as_deref(), Some("1790000000-0000"));
         assert_eq!(rs(&["exec", "box/web", "--attach"], true), None);
@@ -1231,7 +1239,8 @@ mod tests {
         let pm = |args: &[&str], terminal| pipe_mode(&command(args), terminal).unwrap();
         let shell: Vec<String> = crate::commands::exec::SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
         assert_eq!(pm(&["exec", "box/web", "ls"], false), Some(Pipe { argv: ms(&["ls"]), interactive: false }));
-        assert_eq!(pm(&["exec", "box/web", "ls"], true), Some(Pipe { argv: ms(&["ls"]), interactive: false }), "no -t: none");
+        assert_eq!(pm(&["exec", "box/web", "ls"], true), None, "a command on a terminal: a session");
+        assert_eq!(pm(&["exec", "-i", "box/web", "ls"], true), Some(Pipe { argv: ms(&["ls"]), interactive: true }), "explicit -i: no tty");
         assert_eq!(pm(&["exec", "-i", "box/web", "cat"], false), Some(Pipe { argv: ms(&["cat"]), interactive: true }));
         assert_eq!(pm(&["exec", "box/web"], false), Some(Pipe { argv: shell.clone(), interactive: true }), "the shell keeps stdin");
         assert_eq!(pm(&["exec", "-i", "box/web"], true), Some(Pipe { argv: shell.clone(), interactive: true }), "explicit -i: no tty");
