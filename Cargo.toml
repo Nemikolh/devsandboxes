@@ -59,3 +59,9 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# `fleet::update::own_sha256` hashes this binary (hundreds of MB in a debug
+# build) in every daemon and `fleet-link` process: unoptimized sha2 takes
+# seconds over it, enough to slow every link's handshake.
+[profile.dev.package.sha2]
+opt-level = 3

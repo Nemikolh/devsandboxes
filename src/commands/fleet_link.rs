@@ -137,7 +137,7 @@ pub fn fleet_link_peer(peer: &str) -> Result<()> {
     let daemon_dir = dir.clone();
     let opts = PeerOptions {
         dir: dir.clone(),
-        hello: update::hello_for(&this.control_plane(), own.as_deref()),
+        hello: update::hello_for(&this.control_plane(), own.as_deref(), this.takes_dev_builds()),
         daemon: Arc::new(move || client::connect(&daemon_dir, "fleet-link").context("cannot reach this host's devsandbox serve")),
         follow: Follow {
             steps: Arc::new(update::Release { socket_dir: dir }),
@@ -643,7 +643,7 @@ mod tests {
     /// its `member.toml` `member`, a member; following through `steps` (dev
     /// builds taken).
     fn peer_link(io: UnixStream, dir: PathBuf, member: PathBuf, steps: Arc<dyn update::Steps>) -> std::thread::JoinHandle<Result<()>> {
-        peer_link_saying(io, dir, member, steps, update::hello_of(false, None))
+        peer_link_saying(io, dir, member, steps, update::hello_of(false, None, false))
     }
 
     /// [`peer_link`], K saying `hello`.
@@ -708,7 +708,7 @@ mod tests {
 
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let outlet = Arc::new(link::Outlet::default());
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, l_dir.clone(), Arc::clone(&outlet));
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None, false), l_id, l_dir.clone(), Arc::clone(&outlet));
         let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), k_member, Arc::new(update::tests::Fake::default()));
         let l_fleet = l_data.join("fleet/K");
         let want = json!([l_own, l_fleet]);
@@ -775,7 +775,7 @@ mod tests {
         let daemon = spawn_daemon(&k_dir, k_opts);
         drop(conn_at(&k_dir));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, base.join("nowhere"), Arc::default());
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None, false), l_id, base.join("nowhere"), Arc::default());
         let err = peer_link(k_io, k_dir.clone(), k_member, Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("refused: `L` is already a machine here (me@l)"), "{err:#}");
         assert!(!endpoint::fleet_socket(&k_dir, "L").exists());
@@ -801,7 +801,7 @@ mod tests {
         let l_daemon = spawn_daemon(&l_dir, l_opts);
         drop((conn_at(&k_dir), conn_at(&l_dir)));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, l_dir.clone(), Arc::default());
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None, false), l_id, l_dir.clone(), Arc::default());
         let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), k_member, Arc::new(update::tests::Fake::default()));
         wait_for(|| inbound_row(&k_dir).is_some(), "L listed");
         assert!(conn_at(&k_dir).call("shutdown", json!({})).unwrap().error.is_none());
@@ -834,7 +834,7 @@ mod tests {
         let daemons = [spawn_daemon(&k_dir, k_opts), spawn_daemon(&l_dir, l_opts)];
         drop((conn_at(&k_dir), conn_at(&l_dir)));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, l_dir.clone(), Arc::default());
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None, false), l_id, l_dir.clone(), Arc::default());
         let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), k_member, Arc::new(update::tests::Fake::default()));
         wait_for(|| inbound_row(&k_dir).is_some(), "L listed");
         let adopt = serde_json::to_value(k_fleet.to_wire()).unwrap();
@@ -869,7 +869,7 @@ mod tests {
         let daemon = spawn_daemon(&k_dir, k_opts);
         drop(conn_at(&k_dir));
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, base.join("nowhere"), Arc::default());
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None, false), l_id, base.join("nowhere"), Arc::default());
         let err = peer_link(k_io, k_dir.clone(), k_member.clone(), Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("the fleet's control plane is now `L`"), "{err:#}");
         assert_eq!(test_support::read(&k_member).unwrap(), ahead, "K took L's entries");
@@ -890,7 +890,7 @@ mod tests {
         let (k_member, mut l_id) = ids(&base);
         l_id.key = crate::serve::fleet::identity::SigningKey::from_seed([7; 32]);
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(false, None), l_id, base.join("nowhere"), Arc::default());
+        let dialer = fake_dialer(dialer_io, update::hello_of(false, None, false), l_id, base.join("nowhere"), Arc::default());
         let err = peer_link(k_io, base.clone(), k_member, Arc::new(update::tests::Fake::default())).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("`L` proved key"), "{err:#}");
         assert!(matches!(dialer.join().unwrap(), link::End::Refused(why) if why.contains("`K` refused the link")));
@@ -906,8 +906,8 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let (k_member, l_id) = ids(&base);
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
-        let dialer = fake_dialer(dialer_io, update::hello_of(true, Some("lap")), l_id, base.join("nowhere"), Arc::default());
-        let k_end = peer_link_saying(k_io.try_clone().unwrap(), base.clone(), k_member, Arc::new(update::tests::Fake::default()), update::hello_of(false, Some("box")));
+        let dialer = fake_dialer(dialer_io, update::hello_of(true, Some("lap"), false), l_id, base.join("nowhere"), Arc::default());
+        let k_end = peer_link_saying(k_io.try_clone().unwrap(), base.clone(), k_member, Arc::new(update::tests::Fake::default()), update::hello_of(false, Some("box"), false));
         let err = k_end.join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("`L` is in `lap`'s fleet, this host in `box`'s"), "{err:#}");
         k_io.shutdown(Shutdown::Both).unwrap();
@@ -917,13 +917,13 @@ mod tests {
 
     #[test]
     fn only_a_non_control_plane_follows_a_control_plane() {
-        let ours = update::hello_of(false, None);
+        let ours = update::hello_of(false, None, false);
         let member = Authority::default();
         let semver = env!("CARGO_PKG_VERSION");
         let platform = update::PLATFORM;
         let published = format!("9.9.9 abc published {platform} control_plane");
         assert_eq!(follows(ours, &published, member, false), Decision::Download { build: Build::parse("9.9.9 abc published") });
-        assert_eq!(follows(ours, update::hello_of(true, None), member, false), Decision::Same, "the same build");
+        assert_eq!(follows(ours, update::hello_of(true, None, false), member, false), Decision::Same, "the same build");
         let dev = format!("{semver} zzz dev {platform} control_plane");
         assert_eq!(follows(ours, &dev, member, true), Decision::Receive);
         assert!(matches!(follows(ours, &dev, member, false), Decision::Stop(_)));
@@ -931,7 +931,7 @@ mod tests {
         assert!(matches!(follows(ours, &elsewhere, member, true), Decision::Stop(why) if why.contains("can't run on")));
         // No control plane, or this end is it: nothing to follow.
         assert_eq!(follows(ours, &published.replace(" control_plane", " member"), member, false), Decision::Same);
-        assert_eq!(follows(update::hello_of(true, None), &published, member, false), Decision::Same);
+        assert_eq!(follows(update::hello_of(true, None, false), &published, member, false), Decision::Same);
         assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", member, false), Decision::Same, "a hello without the flag says no control plane");
         // The peer being the authority changes nothing for this end.
         assert_eq!(follows(ours, &dev, Authority { ours: false, theirs: true }, true), Decision::Receive);
@@ -942,7 +942,7 @@ mod tests {
     /// silent downgrade).
     #[test]
     fn the_authority_follows_no_one() {
-        let ours = update::hello_of(false, None);
+        let ours = update::hello_of(false, None, false);
         let authority = Authority { ours: true, theirs: false };
         let platform = update::PLATFORM;
         for control_plane in [
@@ -957,7 +957,7 @@ mod tests {
             }
         }
         let old_dev = format!("0.0.1 old dev {platform} control_plane");
-        assert_eq!(follows(update::hello_of(true, None), &old_dev, authority, true), Decision::Same, "the authority as control plane");
+        assert_eq!(follows(update::hello_of(true, None, false), &old_dev, authority, true), Decision::Same, "the authority as control plane");
     }
 
     #[test]

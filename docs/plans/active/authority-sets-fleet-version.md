@@ -76,9 +76,20 @@ membership log.**
    dev build is not pinned while the control plane's platform differs
    from the authority's (the authority could only pin a build the
    control plane can never run); the daemon logs why and `machine ls`
-   shows it. At signing the authority keeps a copy of the binary under
-   `<data>/fleet/builds/<sha256>`, since a later `cargo build` replaces
+   shows it. The control plane's platform is what its link's `Hello`
+   says, so the check runs at daemon start and again whenever the
+   authority's link to the control plane comes up; unknown (no link
+   yet) pins nothing until then. A published build's `SHA256SUMS` is
+   fetched and verified at signing; offline, the next trigger retries. At signing the authority keeps a copy of the binary under
+   `<data>/fleet/.builds/<sha256>` (a dot name, never a machine's fleet
+   root), since a later `cargo build` replaces
    the file its `current_exe()` points at.
+   **The `Hello` says the bytes.** A peer link's `Hello`
+   (`update::hello_of`) also carries a prefix of this binary's sha256
+   (16 hex) and whether this end takes dev builds, so both ends compute
+   who pushes from the `Hello`s alone, as `control_plane_pushes` does
+   today, and no binary is sent to a host that won't take it. The full
+   sha256 is checked at install.
 4. **Who follows.** Every member but the authority follows the latest
    `Op::Build`, the control plane included, never a peer's `Hello`.
    The authority follows no one. `update::decide` compares this host

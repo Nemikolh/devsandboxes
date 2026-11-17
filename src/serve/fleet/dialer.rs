@@ -142,10 +142,12 @@ pub struct Dialer {
     /// stored as `membership.adopt` stores them (`control_plane` written from the
     /// log, the daemon following it); `Err` says why not.
     pub adopt: Arc<dyn Fn(&Stored) -> Result<(), String> + Send + Sync>,
-    /// The link to machine `name` is up (its socket bound, any newer log it
-    /// carried taken): the daemon follows the signed configs from it
-    /// (`daemon::follow_configs`).
-    pub linked: Arc<dyn Fn(&str) + Send + Sync>,
+    /// The link to machine `name`, whose `Hello` is the second argument, is
+    /// up (its socket bound, any newer log it carried taken): the daemon
+    /// follows the signed configs from it (`daemon::follow_configs`) and, on
+    /// the authority, pins its build once the control plane's platform is
+    /// known (`daemon::Shared::pin_build`).
+    pub linked: Arc<dyn Fn(&str, &str) + Send + Sync>,
 }
 
 impl Dialer {
@@ -280,7 +282,7 @@ impl Dialer {
                     fleet_link::push_build(ours, &peer.hash, authority.theirs, socket.clone(), fleet_link::own_binary);
                 }
                 held.up();
-                (self.linked)(name);
+                (self.linked)(name, &peer.hash);
                 Ok(())
             },
             move || {
@@ -442,7 +444,7 @@ pub(crate) mod tests {
             let (daemon_dir, peer) = (k_dir.clone(), peer.to_string());
             let opts = PeerOptions {
                 dir: k_dir.clone(),
-                hello: update::hello_of(false, None),
+                hello: update::hello_of(false, None, false),
                 daemon: Arc::new(move || Ok(connect(&daemon_dir))),
                 follow: Follow { steps: Arc::new(update::tests::Fake::default()), dev_builds: Arc::new(|| false) },
                 reannounce: Duration::from_millis(20),

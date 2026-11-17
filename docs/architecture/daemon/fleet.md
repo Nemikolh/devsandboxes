@@ -1480,15 +1480,23 @@ on a [peer link](#peer-links), whichever end dialed (decision 25); the
 fleet's authority, like the control plane, follows no one:
 
 - **The build in the `Hello`.** A peer link's `hello` is
-  `update::hello_of(control_plane, fleet)`: `fleet::update::HELLO`, `<semver> <git>
+  `update::hello_of(control_plane, fleet, dev_builds)`: `fleet::update::HELLO`, `<semver> <git>
   <published|dev> <os>/<arch>` (`0.8.0 1a2b3c4d5e6f dev linux/x86_64`),
   then a fifth word, `control_plane` when that end's host is the control plane, else
-  `member` (`update::is_control_plane` reads it), and a sixth, the fleet's control plane by
+  `member` (`update::is_control_plane` reads it), a sixth, the fleet's control plane by
   member name (the control plane's own name on the control plane), `-` in no fleet
-  (`update::control_plane_of` reads it; decision 34): `<build> control_plane k`, `<build>
-  member k`, `<build> member -`. `update::hello_for` makes it of
-  `member.toml`'s `control_plane` and this host's member name; a name that would
-  overflow the `Hello` hash (255 bytes) is said as `-`. `link::Spec`'s
+  (`update::control_plane_of` reads it; decision 34), a seventh, the first 16 hex
+  digits of the sha256 of that end's own binary (`update::own_sha_word`
+  over `update::own_sha256`: `commands::fleet_link::own_binary` hashed
+  once per process; `-` when it can't be read; `update::sha_of` reads
+  it), and an eighth, `dev` when that end takes dev builds
+  (`member::Member::takes_dev_builds`), else `nodev`
+  (`update::takes_dev_builds` reads it): `<build> control_plane k
+  0123456789abcdef nodev`, `<build> member - 0123456789abcdef dev`.
+  `update::hello_for` makes it of `member.toml`'s `control_plane`, this
+  host's member name and its dev builds (the dialer reads them at each
+  dial, `fleet-link --peer` at its start); a name that would overflow the
+  `Hello` hash (255 bytes) is said as `-`, the other words kept. `link::Spec`'s
   `hello` is `&'static`: each distinct one a process says is leaked once
   (`hello_of` interns them). `HELLO` alone is `fleet::LINK`'s and what
   `fleet-hello` prints. `HELLO` is from
@@ -1510,7 +1518,10 @@ fleet's authority, like the control plane, follows no one:
   (a missing one is `unknown` / dev), `update::platform_of` the fourth
   (`unknown` without one): the platform isn't part of the build, one
   release being built for several; both ignore the rest.
-  `devsandbox fleet-hello` (hidden) prints `HELLO`.
+  `devsandbox fleet-hello` (hidden) prints `HELLO`, without the sha256
+  (the release workflow's stamp check compares it whole); what a
+  machine's binary is, `machine upgrade` reads from `install::CHECK`'s
+  own `sha256` line ([machines.md](machines.md#install)).
 - **Two fleets never link** (`update::same_fleet`, pure, over both
   `Hello`s): when both ends name a control plane and the names differ the link is
   refused before anything else, on both ends (the dialer's answerer
@@ -1622,6 +1633,36 @@ fleet's authority, like the control plane, follows no one:
   `sh -c INSTALL sh <dest>` (temp file next to it, its own `--version`
   check, rename); the installed binary must be the control plane's build too. The
   scratch dir is removed either way. Then the handoff, below.
+- **The authority pins its build** (`machines::changes::sign_build`):
+  the fleet's authority signs its daemon's own build into the
+  [membership log](#membership-log) as the next `build` entry, and
+  pushes the log as a membership change goes (`changes::push`). What is
+  pinned is `changes::plan_pin`'s (pure, over the daemon's `HELLO`, its
+  platform, `update::own_sha256`, the log's latest pin and what is known
+  of the control plane): a published build is pinned by release
+  (`Pin::Published`, with the sha256 of that release's `SHA256SUMS`,
+  fetched and its signature checked against the release key by
+  `update::release_sums_sha256`) unless the latest pin is that release;
+  a dev build is its bytes (`Pin::Dev`: semver, git, platform, sha256),
+  pinned unless the latest pin is exactly it, and only where the control
+  plane can run it: this host is the control plane, or the control
+  plane's platform as its link's `Hello` says is this host's. With no
+  link to the control plane up the platform is unknown and nothing is
+  pinned; another platform pins nothing either; `serve.log` says why
+  (`changes::BuildSigned::log_lines`, as `fleet: build: dev build … not
+  pinned: …`). Before a dev pin is signed the binary is copied to
+  `<data>/fleet/.builds/<sha256 hex>` (`update::keep_build`: dir 0700,
+  file 0755, through a temp file whose sha256 must be the pin's, then
+  renamed; `update::KEPT_BUILDS`, 3, newest kept), since a later
+  `cargo build` replaces the file `current_exe()` names; a dot name, so
+  no machine's fleet root (`fleet/<name>/`) can be it. The triggers, on
+  the daemon's `serve-pin` thread (`daemon::Shared::pin_build`, one at a
+  time, best effort, logged; `daemon::Options::pin_builds`, off in
+  tests): the daemon's start, and a link coming up to a peer whose
+  `Hello` says it is the control plane (the dialer's `linked` hook, given
+  the peer's `Hello`; `links.inbound` with `control_plane`), its platform
+  then known. A failure (no copy, an offline `SHA256SUMS` fetch, a
+  signing error) signs nothing; the next trigger tries again.
 - **The forced handoff** (`Release::handoff`): a hello on the daemon's
   own socket with `force` (`client::hello_with`, `HelloParams::force`)
   as client `fleet-update`. `daemon::hello` hands off on a forced hello
@@ -1824,7 +1865,12 @@ hash chain of entries only the authority signs
   same control plane would otherwise have the same genesis, the same fleet to a
   member holding the first one's log), `add {name, key}`,
   `revoke {name, key}`, `rotate {name, old, new, by_old}`, `control_plane
-  {name}` and `config {root, version, hash}` (a config root's version:
+  {name}`, `build {version, pin}` (the fleet's build, `pin` a `Pin`:
+  `{kind: dev, semver, git, platform, sha256}` or `{kind: published,
+  semver, sums_sha256}`, the sha256 of the binary or of the release's
+  `SHA256SUMS`, 64 hex on the wire; encoded as `build`, the version 8
+  bytes big-endian, then `dev` or `published` and the pin's fields; the
+  authority's daemon signs it, [Versions](#versions)) and `config {root, version, hash}` (a config root's version:
   `root` its directory's name (`membership::check_root_name`), `hash` its
   bundle's (`mesh::Bundle::hash`, see *Config versions* below: the
   config's structure and the files it references, by relative path, so
@@ -1846,10 +1892,16 @@ hash chain of entries only the authority signs
   `control_plane` names a current member (never an introduced one): `devsandbox
   machine control-plane <m>` signs it ([Approvals and
   pushes](#approvals-and-pushes)); `config` needs a `version` above its
-  root's current one (none: 0), so a log never takes a root back. The
+  root's current one (none: 0), so a log never takes a root back;
+  `build` needs a `version` exactly the latest one + 1 (1 for the
+  first) and each of the pin's words non-empty with no whitespace or
+  control character; it is never proposed (`fleet::proposals` has no
+  such change), so only the authority's own daemon signs one. The
   result, `Membership`: the authority (name and key), the control plane, the
   members and their keys, the revoked keys, each root's latest config
-  version and hash (`config`), the head and the genesis hash (which
+  version and hash (`config`), the latest `build` entry's version and
+  pin (`build`; only the latest counts, an older build is pinned again
+  only as a newer entry), the head and the genesis hash (which
   fleet this is).
   `membership::control_plane_for` is what this host's `member.toml` `control_plane` reads as
   from it (`self` when the log's control plane is this host).

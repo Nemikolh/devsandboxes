@@ -37,7 +37,9 @@ pub const DEFAULT_DEST: &str = "$HOME/.local/bin/devsandbox";
 /// shell text: `~/.local/bin/devsandbox`). Prints [`CHECK_MARKER`], then
 /// `os <uname -s>`, `arch <uname -m>`, and when the program is found
 /// `path <path>`, `offpath yes` when that's the fallback and, when they
-/// run, `version <its --version>` and `hello <its fleet-hello>`.
+/// run, `version <its --version>`, `hello <its fleet-hello>` and
+/// `sha256 <its sha256>` (`sha256sum`, else `shasum -a 256`: what the
+/// bytes are, an uncommitted rebuild's included).
 pub const CHECK: &str = "case \"$1\" in \"~/\"*) set -- \"$HOME/${1#??}\";; esac; \
     p=$(command -v \"${1:-devsandbox}\" 2>/dev/null) || p=; \
     o=; if [ -z \"$p\" ] && [ -z \"$1\" ]; then p=$HOME/.local/bin/devsandbox; o=1; fi; \
@@ -49,6 +51,7 @@ pub const CHECK: &str = "case \"$1\" in \"~/\"*) set -- \"$HOME/${1#??}\";; esac
     if [ -n \"$o\" ]; then echo 'offpath yes'; fi; \
     v=$(\"$p\" --version </dev/null 2>/dev/null) && printf 'version %s\\n' \"$v\"; \
     h=$(\"$p\" fleet-hello </dev/null 2>/dev/null) && printf 'hello %s\\n' \"$h\"; \
+    s=$({ sha256sum -- \"$p\" || shasum -a 256 -- \"$p\"; } 2>/dev/null </dev/null) && printf 'sha256 %s\\n' \"${s%% *}\"; \
     fi; \
     exit 0";
 
@@ -94,6 +97,9 @@ pub struct Remote {
     /// Its `fleet-hello` (`update::HELLO`: `<semver> <git> <published|dev>
     /// <os>/<arch>`); `None` when that failed (a build from before it).
     pub hello: Option<String>,
+    /// Its binary's sha256 (64 lowercase hex); `None` when neither
+    /// `sha256sum` nor `shasum` ran there.
+    pub sha256: Option<String>,
 }
 
 /// [`CHECK`]'s stdout: the lines after its marker. Keys after the first of
@@ -101,7 +107,7 @@ pub struct Remote {
 pub fn parse_check(stdout: &str) -> Result<Remote> {
     let report = after_marker(stdout, CHECK_MARKER)
         .with_context(|| format!("unexpected output from the check: {}", first_line(stdout)))?;
-    let (mut os, mut arch, mut path, mut version, mut off_path, mut hello) = (None, None, None, None, None, None);
+    let (mut os, mut arch, mut path, mut version, mut off_path, mut hello, mut sha256) = (None, None, None, None, None, None, None);
     for line in report {
         let Some((key, value)) = line.split_once(' ') else { continue };
         let slot = match key {
@@ -111,6 +117,7 @@ pub fn parse_check(stdout: &str) -> Result<Remote> {
             "version" => &mut version,
             "offpath" => &mut off_path,
             "hello" => &mut hello,
+            "sha256" => &mut sha256,
             _ => continue,
         };
         slot.get_or_insert_with(|| value.trim().to_string());
@@ -122,7 +129,8 @@ pub fn parse_check(stdout: &str) -> Result<Remote> {
     let path = path.filter(|p| !p.is_empty());
     let off_path = path.is_some() && off_path.is_some();
     let hello = hello.filter(|h| !h.is_empty());
-    Ok(Remote { os, arch, path, off_path, version, hello })
+    let sha256 = sha256.filter(|s| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    Ok(Remote { os, arch, path, off_path, version, hello, sha256 })
 }
 
 /// The semver in a `devsandbox --version` line (`devsandbox 0.7.0`); `None`
@@ -223,16 +231,20 @@ pub enum Upgrade {
 }
 
 /// `machine upgrade`'s decision, `ours` being this binary's `fleet-hello`
-/// (`update::HELLO`). Only an existing install is updated (the machine's
-/// devsandbox is what its `command` names): not found is a refusal. The
-/// same build and platform words as `ours` is [`Upgrade::Nothing`];
-/// another or an unknown build is replaced, when [`platform_matches`].
-pub fn decide_upgrade(remote: &Remote, ours: &str) -> Upgrade {
+/// (`update::HELLO`) and `our_sha256` the sha256 (64 hex) of the binary it
+/// copies. Only an existing install is updated (the machine's devsandbox
+/// is what its `command` names): not found is a refusal. The same build
+/// and platform words as `ours` and the same sha256 (or none reported:
+/// the words decide) is [`Upgrade::Nothing`]; another or an unknown build,
+/// or other bytes (a rebuild from uncommitted edits keeps its words), is
+/// replaced, when [`platform_matches`].
+pub fn decide_upgrade(remote: &Remote, ours: &str, our_sha256: &str) -> Upgrade {
     let Some(path) = &remote.path else {
         return Upgrade::Refuse("no devsandbox found there: `machine upgrade` only updates an existing install".into());
     };
     let words = |hello: &str| hello.split_whitespace().take(4).map(str::to_string).collect::<Vec<_>>();
-    if remote.hello.as_deref().is_some_and(|h| words(h) == words(ours)) {
+    let same_bytes = remote.sha256.as_deref().is_none_or(|s| s == our_sha256);
+    if same_bytes && remote.hello.as_deref().is_some_and(|h| words(h) == words(ours)) {
         return Upgrade::Nothing;
     }
     if !platform_matches(&remote.os, &remote.arch) {
@@ -325,7 +337,7 @@ mod tests {
     use super::*;
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
-        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into), hello: None }
+        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into), hello: None, sha256: None }
     }
 
     #[test]
@@ -338,7 +350,7 @@ mod tests {
         let odd = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /x\nversion error: unexpected\n").unwrap();
         assert_eq!(odd.version, None);
         let missing = parse_check("@devsandbox-check@\nos Darwin\narch arm64\n").unwrap();
-        assert_eq!(missing, Remote { os: "Darwin".into(), arch: "arm64".into(), path: None, off_path: false, version: None, hello: None });
+        assert_eq!(missing, Remote { os: "Darwin".into(), arch: "arm64".into(), path: None, off_path: false, version: None, hello: None, sha256: None });
         let fallback = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /h/.local/bin/devsandbox\noffpath yes\n").unwrap();
         assert_eq!(fallback, Remote { off_path: true, ..remote(Some("/h/.local/bin/devsandbox"), None) });
         // A motd before the marker; a multi-line `--version` after.
@@ -355,6 +367,14 @@ mod tests {
         assert_eq!(hello, Remote { hello: Some("1.0.0 abc dev linux/x86_64".into()), ..remote(Some("/p"), Some("1.0.0")) });
         let empty = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /p\nhello  \n").unwrap();
         assert_eq!(empty.hello, None);
+        // The binary's sha256: 64 lowercase hex, else none.
+        let sha = "0a".repeat(32);
+        let with_sha = parse_check(&format!("@devsandbox-check@\nos Linux\narch x86_64\npath /p\nsha256 {sha}\n")).unwrap();
+        assert_eq!(with_sha.sha256, Some(sha.clone()));
+        for bad in ["0A".repeat(32), "0a".repeat(31), format!("{sha}  /p"), String::new()] {
+            let r = parse_check(&format!("@devsandbox-check@\nos Linux\narch x86_64\npath /p\nsha256 {bad}\n")).unwrap();
+            assert_eq!(r.sha256, None, "{bad:?}");
+        }
         for bad in ["", "garbage\n", "os Linux\narch x86_64\n", "@devsandbox-check@\nos Linux\n"] {
             assert!(parse_check(bad).is_err(), "{bad:?} parsed");
         }
@@ -406,20 +426,28 @@ mod tests {
         let install = |from: Option<&str>| Upgrade::Install { path: "/b/devsandbox".into(), from: from.map(Into::into) };
         // Our build: nothing, whatever follows its four words.
         let ours_remote = |hello: &str| Remote { os: uname_os().into(), arch: std::env::consts::ARCH.into(), ..with(Some(hello)) };
-        assert_eq!(decide_upgrade(&ours_remote(ours), ours), Upgrade::Nothing);
-        assert_eq!(decide_upgrade(&ours_remote(&format!("{ours} member box")), ours), Upgrade::Nothing);
+        let (sha, other_sha) = ("ab".repeat(32), "cd".repeat(32));
+        assert_eq!(decide_upgrade(&ours_remote(ours), ours, &sha), Upgrade::Nothing, "no sha256 reported: the words decide");
+        assert_eq!(decide_upgrade(&ours_remote(&format!("{ours} member box")), ours, &sha), Upgrade::Nothing);
+        let same_bytes = Remote { sha256: Some(sha.clone()), ..ours_remote(ours) };
+        assert_eq!(decide_upgrade(&same_bytes, ours, &sha), Upgrade::Nothing);
+        // The same words, other bytes (a rebuild from uncommitted edits): replaced.
+        let rebuilt = Remote { sha256: Some(other_sha), ..ours_remote(ours) };
+        assert_eq!(decide_upgrade(&rebuilt, ours, &sha), install(Some(ours)));
         // Another git, kind or platform word, or no hello: replaced.
         let other = "0.0.1 abc dev linux/x86_64";
-        assert_eq!(decide_upgrade(&ours_remote(other), "0.0.1 abd dev linux/x86_64"), install(Some(other)));
-        assert_eq!(decide_upgrade(&ours_remote(other), "0.0.1 abc published linux/x86_64"), install(Some(other)));
+        assert_eq!(decide_upgrade(&ours_remote(other), "0.0.1 abd dev linux/x86_64", &sha), install(Some(other)));
+        assert_eq!(decide_upgrade(&ours_remote(other), "0.0.1 abc published linux/x86_64", &sha), install(Some(other)));
+        let other_words = Remote { sha256: Some(sha.clone()), ..ours_remote(other) };
+        assert_eq!(decide_upgrade(&other_words, "0.0.1 abd dev linux/x86_64", &sha), install(Some(other)), "the words too");
         let unknown = Remote { hello: None, ..ours_remote("") };
-        assert_eq!(decide_upgrade(&unknown, ours), install(None));
+        assert_eq!(decide_upgrade(&unknown, ours, &sha), install(None));
         // Not found: refused, never installed to the default.
-        let Upgrade::Refuse(why) = decide_upgrade(&remote(None, None), ours) else { panic!() };
+        let Upgrade::Refuse(why) = decide_upgrade(&remote(None, None), ours, &sha) else { panic!() };
         assert!(why.contains("only updates an existing install"), "{why}");
         // Another platform: refused with why.
         let elsewhere = Remote { os: "FreeBSD".into(), ..with(None) };
-        let Upgrade::Refuse(why) = decide_upgrade(&elsewhere, ours) else { panic!() };
+        let Upgrade::Refuse(why) = decide_upgrade(&elsewhere, ours, &sha) else { panic!() };
         assert!(why.starts_with("it is FreeBSD x86_64; this devsandbox is built for "), "{why}");
     }
 
@@ -519,6 +547,8 @@ mod tests {
         let after = b.check("");
         assert_eq!((after.path.as_deref(), after.version.as_deref()), (Some(installed.as_str()), Some("9.9.9")));
         assert_eq!(after.hello.as_deref(), Some("9.9.9 abc dev linux/x86_64"));
+        let sha = hex::encode(crate::serve::fleet::update::sha256_of(&want).unwrap());
+        assert_eq!(after.sha256.as_deref(), Some(sha.as_str()), "the installed bytes' sha256");
         assert!(!after.off_path);
         // A `command` as the registry has it: `~/` is the home.
         assert_eq!(b.check("~/.local/bin/devsandbox"), after);

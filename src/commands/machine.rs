@@ -279,7 +279,10 @@ pub fn upgrade(name: &str, yes: bool) -> Result<()> {
     // what the link runs.
     let program = entry.command().to_string();
     let remote = install::check(&entry, Some(&program))?;
-    let (path, from) = match install::decide_upgrade(&remote, ours) {
+    // What is copied, so what the machine's bytes must be.
+    let binary = crate::exe::devsandbox()?;
+    let sha = hex::encode(update::sha256_of(&binary)?);
+    let (path, from) = match install::decide_upgrade(&remote, ours, &sha) {
         Upgrade::Nothing => {
             println!("{name} already runs devsandbox {}", label(Some(ours)));
             return Ok(());
@@ -298,9 +301,9 @@ pub fn upgrade(name: &str, yes: bool) -> Result<()> {
         }
     }
     eprintln!("copying devsandbox {} to {target}:{path}…", label(Some(ours)));
-    let installed = install::install(&entry, Some(&path), &crate::exe::devsandbox()?)?;
+    let installed = install::install(&entry, Some(&path), &binary)?;
     let after = install::check(&entry, Some(&program))?;
-    if install::decide_upgrade(&after, ours) != Upgrade::Nothing {
+    if install::decide_upgrade(&after, ours, &sha) != Upgrade::Nothing {
         bail!("{installed} on {target} doesn't run as devsandbox {} after the copy (it says {})", label(Some(ours)), label(after.hello.as_deref()));
     }
     install::handoff(&entry, &installed)?;
@@ -864,7 +867,7 @@ mod tests {
     }
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
-        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into), hello: None }
+        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into), hello: None, sha256: None }
     }
 
     #[test]
@@ -919,7 +922,7 @@ mod tests {
             question("box", Some("/b/devsandbox"), None, "1.0.0"),
             "box runs devsandbox (unknown version) at /b/devsandbox. Replace it with this one (1.0.0)? [y/N] "
         );
-        let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, off_path: false, version: None, hello: None };
+        let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, off_path: false, version: None, hello: None, sha256: None };
         let why = platform_mismatch("box", &mismatch);
         assert!(why.starts_with("box is FreeBSD riscv64; this devsandbox is built for "), "{why}");
         assert!(!install::platform_matches(&mismatch.os, &mismatch.arch));

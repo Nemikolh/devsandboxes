@@ -31,10 +31,11 @@ is frozen: no new work on it.
   recovery key made at genesis, a scoped, expiring delegation to the
   control plane (`members`, `configs`); then machine → node.
   → [plan](plans/active/control-plane.md)
-- **machines**: the authority pins the fleet's build (`Op::Build`, by
-  sha256) instead of members following the control plane; the authority
-  follows no one, so upgrading it first no longer locks it out or
-  downgrades it. → [plan](plans/active/authority-sets-fleet-version.md)
+- **machines**: members follow the build the authority pins
+  (`Op::Build`, by sha256; signed by `changes::sign_build`) instead of the
+  control plane's: today every member but the authority still follows the
+  control plane (`fleet_link::follows`) and the pin is only recorded.
+  → [plan](plans/active/authority-sets-fleet-version.md)
 - **machines**: fleet-wide `global` services: one container per signed
   root's service, reached from any member over the links.
   → [plan](plans/active/mesh-services.md)

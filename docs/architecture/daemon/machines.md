@@ -215,10 +215,12 @@ line, past whatever the login shell printed first.
   resolved with `command -v`; empty and not on the login `PATH`, it falls back to
   `$HOME/.local/bin/devsandbox` (`Remote::off_path`), since a login shell
   often misses that dir (added in `.bashrc`). It reports `uname -s`,
-  `uname -m`, the path and the output of its `--version` and its
-  `fleet-hello` ([fleet.md](fleet.md#versions)). `parse_check` makes it a `Remote`, whose
+  `uname -m`, the path, the output of its `--version` and its
+  `fleet-hello` ([fleet.md](fleet.md#versions)), and its sha256
+  (`sha256sum`, else `shasum -a 256`). `parse_check` makes it a `Remote`, whose
   `version` is `None` when `--version` fails (a build from before it
-  existed), and `hello` `None` when `fleet-hello` does.
+  existed), `hello` `None` when `fleet-hello` does, and `sha256` `None`
+  unless one of the two tools printed 64 lowercase hex digits.
 - `platform_matches`: `uname` against this binary's
   `std::env::consts::{OS, ARCH}` (`Linux`↔`linux`, `Darwin`↔`macos`;
   `x86_64`|`amd64`↔`x86_64`, `aarch64`|`arm64`↔`aarch64`); copying
@@ -227,10 +229,13 @@ line, past whatever the login shell printed first.
   with another or no version is updated in place (`Dest::Found`); a
   missing one goes to `$HOME/.local/bin/devsandbox` (`Dest::Default`).
 - `decide_upgrade` (pure, `machine upgrade`): against this binary's
-  `update::HELLO`. A devsandbox that isn't found is refused
+  `update::HELLO` and the sha256 of the binary it copies
+  (`exe::devsandbox()`, `update::sha256_of`). A devsandbox that isn't found is refused
   (`Upgrade::Refuse`: only an existing install is updated); the same
   first four `fleet-hello` words (semver, git, `published|dev`, platform)
-  is `Upgrade::Nothing`; another or no `fleet-hello` is
+  and the same sha256 (no sha256 reported: the words alone) is
+  `Upgrade::Nothing`; other bytes (a rebuild from uncommitted edits keeps
+  its words), another or no `fleet-hello` is
   `Upgrade::Install` over the found path, unless `platform_matches`
   fails (refused, saying both platforms).
 - `INSTALL` (`install`): `$1` is the destination (empty: the default).
@@ -917,10 +922,10 @@ another semver. It asks `machines.get` for the machine's `target` and
 `command` (an inbound or routed machine has no target: refused, `no_ssh`,
 since the copy is over ssh), then `install::check` of that `command`
 (always named, so no `~/.local/bin` fallback) and
-`install::decide_upgrade`. Same build: it prints `<name> already runs
+`install::decide_upgrade`. Same build and bytes: it prints `<name> already runs
 devsandbox <build>`. Otherwise `consent` over `--yes` (`[y/N]` on a
 TTY, an error off one without it), `install::install` over the found
-path, a second `install::check` that must now say this build, then
+path, a second `install::check` that must now say this build and its sha256, then
 `install::handoff` (the daemon there hands off to the copy) and
 `machines.cycle` (this host's link to the machine ends and redials at
 once, `service::Handle::cycle_one`, so the far end's `fleet-link` runs

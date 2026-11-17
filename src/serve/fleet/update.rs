@@ -48,18 +48,22 @@ pub const HELLO: &str = concat!(
 /// docs/architecture/daemon/fleet.md, *Peer links*): [`HELLO`], then `control_plane`
 /// when this host is the fleet's control plane, else `member`, then the fleet's control plane
 /// by member name (on the control plane, its own), `-` in no fleet (fleet plan
-/// decision 34). Read back by [`is_control_plane`] and [`control_plane_of`]. A name that would
-/// overflow a `Hello` hash (255 bytes) is said as `-`.
+/// decision 34), then this binary's sha256 prefix ([`own_sha_word`]), then
+/// `dev` when this host takes dev builds (`dev_builds`), else `nodev`. Read
+/// back by [`is_control_plane`], [`control_plane_of`], [`sha_of`] and
+/// [`takes_dev_builds`]. A name that would overflow a `Hello` hash (255
+/// bytes) is said as `-`.
 ///
 /// Interned: `link::Spec::hello` is `&'static`, and a process only ever
 /// says a handful of these (one per control plane it's had), so each distinct one is
 /// leaked once.
-pub fn hello_of(control_plane: bool, fleet: Option<&str>) -> &'static str {
+pub fn hello_of(control_plane: bool, fleet: Option<&str>, dev_builds: bool) -> &'static str {
     static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let role = if control_plane { "control_plane" } else { "member" };
-    let mut hello = format!("{HELLO} {role} {}", fleet.unwrap_or("-"));
+    let tail = format!("{} {}", own_sha_word(), if dev_builds { "dev" } else { "nodev" });
+    let mut hello = format!("{HELLO} {role} {} {tail}", fleet.unwrap_or("-"));
     if hello.len() > u8::MAX as usize {
-        hello = format!("{HELLO} {role} -");
+        hello = format!("{HELLO} {role} - {tail}");
     }
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = said.iter().find(|s| **s == hello) {
@@ -71,15 +75,64 @@ pub fn hello_of(control_plane: bool, fleet: Option<&str>) -> &'static str {
 }
 
 /// [`hello_of`] for this host as `member.toml` says: its `control_plane`
-/// ([`super::member::ControlPlane`]) and its own member name `own` (what the control plane
-/// says as its fleet's).
-pub fn hello_for(control_plane: &super::member::ControlPlane, own: Option<&str>) -> &'static str {
+/// ([`super::member::ControlPlane`]), its own member name `own` (what the control plane
+/// says as its fleet's) and whether it takes dev builds
+/// (`member::Member::takes_dev_builds`).
+pub fn hello_for(control_plane: &super::member::ControlPlane, own: Option<&str>, dev_builds: bool) -> &'static str {
     use super::member::ControlPlane;
     match control_plane {
-        ControlPlane::None => hello_of(false, None),
-        ControlPlane::This => hello_of(true, own),
-        ControlPlane::Other(name) => hello_of(false, Some(name)),
+        ControlPlane::None => hello_of(false, None, dev_builds),
+        ControlPlane::This => hello_of(true, own, dev_builds),
+        ControlPlane::Other(name) => hello_of(false, Some(name), dev_builds),
     }
+}
+
+/// The sha256 of this process's own binary (`commands::fleet_link::own_binary`:
+/// the inode it runs on Linux, even after the path was replaced), hashed
+/// once per process. A dev build is its bytes: a rebuild from uncommitted
+/// edits keeps its [`Build`] label.
+pub fn own_sha256() -> Result<[u8; 32]> {
+    static SHA: std::sync::OnceLock<Result<[u8; 32], String>> = std::sync::OnceLock::new();
+    let sha = SHA.get_or_init(|| {
+        let binary = crate::commands::fleet_link::own_binary().map_err(|e| format!("cannot locate this binary: {e}"))?;
+        sha256_of(&binary).map_err(|e| format!("{e:#}"))
+    });
+    sha.clone().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The sha256 of the file at `path`.
+pub fn sha256_of(path: &Path) -> Result<[u8; 32]> {
+    let file = std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let (_, hex) = transfer::digest(file).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut sha = [0u8; 32];
+    hex::decode_to_slice(&hex, &mut sha).expect("digest says 64 hex digits");
+    Ok(sha)
+}
+
+/// How many hex digits of a binary's sha256 a `Hello` says.
+pub const SHA_WORD: usize = 16;
+
+/// [`own_sha256`]'s first [`SHA_WORD`] hex digits, `-` when it can't be
+/// read: a `Hello`'s seventh word.
+pub fn own_sha_word() -> String {
+    match own_sha256() {
+        Ok(sha) => hex::encode(sha)[..SHA_WORD].to_string(),
+        Err(_) => "-".into(),
+    }
+}
+
+/// The sha256 prefix a peer link's `Hello` hash ([`hello_of`]) says its
+/// end's binary has: its seventh word; `None` for `-` or none.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sha_of(hello: &str) -> Option<&str> {
+    hello.split_whitespace().nth(6).filter(|w| *w != "-")
+}
+
+/// Whether a peer link's `Hello` hash ([`hello_of`]) says its end takes
+/// dev builds: its eighth word is `dev`. A `Hello` without one doesn't.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn takes_dev_builds(hello: &str) -> bool {
+    hello.split_whitespace().nth(7) == Some("dev")
 }
 
 /// Whether a peer link's `Hello` hash ([`hello_of`]) says its end is the
@@ -401,24 +454,109 @@ pub fn install_received(steps: &dyn Steps, binary: &Path, control_plane: &str) -
     steps.handoff().context("cannot hand this daemon off to it")
 }
 
+/// Release `version`'s file `file`, downloaded into `dir`.
+fn fetch(steps: &dyn Steps, version: &str, file: &str, dir: &Path) -> Result<PathBuf> {
+    let url = release_url(version, file)?;
+    let out = dir.join(file);
+    steps.download(&url, &out).with_context(|| format!("cannot download {url}"))?;
+    Ok(out)
+}
+
+/// Release `version`'s [`SUMS`], downloaded into `dir` with [`SUMS_SIG`]
+/// and only returned once the signature checks against
+/// [`Steps::release_key`] ([`verify_sums`]).
+fn fetch_sums(steps: &dyn Steps, version: &str, dir: &Path) -> Result<Vec<u8>> {
+    let read = |path: &Path| std::fs::read(path).with_context(|| format!("cannot read {}", path.display()));
+    let sums = read(&fetch(steps, version, SUMS, dir)?)?;
+    let sig = read(&fetch(steps, version, SUMS_SIG, dir)?)?;
+    verify_sums(&sums, &sig, &steps.release_key()).with_context(|| format!("release v{version} isn't signed by the release key"))?;
+    Ok(sums)
+}
+
+/// The sha256 of release `version`'s [`SUMS`], fetched into a scratch dir
+/// under `scratch` and signature-checked ([`fetch_sums`]): what a published
+/// build's pin (`membership::Pin::Published`) binds. The scratch dir is
+/// removed whatever happens.
+pub fn release_sums_sha256(steps: &dyn Steps, version: &str, scratch: &Path) -> Result<[u8; 32]> {
+    use sha2::Digest;
+    let dir = scratch_dir(scratch)?;
+    let sums = fetch_sums(steps, version, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(sha2::Sha256::digest(sums?).into())
+}
+
+/// Where the authority keeps the binaries it pinned, under data dir `data`
+/// (`member.toml`'s): `fleet/.builds/`, a dot name no machine's fleet root
+/// (`fleet/<name>/`) can have.
+pub fn builds_dir(data: &Path) -> PathBuf {
+    data.join("fleet").join(".builds")
+}
+
+/// How many kept builds [`keep_build`] leaves, the new one included.
+pub const KEPT_BUILDS: usize = 3;
+
+/// `binary`, whose sha256 is `sha256`, copied to
+/// `<builds_dir>/<sha256 hex>` (dir 0700, file 0755; through a temp file
+/// whose sha256 must be `sha256`, then renamed), unless an intact copy is
+/// there already. The oldest other copies are removed past
+/// [`KEPT_BUILDS`]. A later `cargo build` replaces the file a running
+/// binary's path names: this copy is what the pin's bytes stay as.
+pub fn keep_build(data: &Path, binary: &Path, sha256: &[u8; 32]) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = builds_dir(data);
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).with_context(|| format!("cannot restrict {}", dir.display()))?;
+    let name = hex::encode(sha256);
+    let dest = dir.join(&name);
+    if sha256_of(&dest).ok() != Some(*sha256) {
+        let tmp = dir.join(format!(".{name}.{}", std::process::id()));
+        let copied = (|| {
+            std::fs::copy(binary, &tmp).with_context(|| format!("cannot copy {} to {}", binary.display(), tmp.display()))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).with_context(|| format!("cannot chmod {}", tmp.display()))?;
+            let got = sha256_of(&tmp)?;
+            if got != *sha256 {
+                bail!("the copy of {} hashes to {}, not {name}: it changed meanwhile", binary.display(), hex::encode(got));
+            }
+            std::fs::rename(&tmp, &dest).with_context(|| format!("cannot rename {} to {}", tmp.display(), dest.display()))
+        })();
+        if copied.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        copied?;
+    }
+    prune_builds(&dir, &name);
+    Ok(dest)
+}
+
+/// The kept builds in `dir` but `keep` and the newest others, oldest
+/// first removed until [`KEPT_BUILDS`] are left. Only `<64 hex>` names.
+fn prune_builds(dir: &Path, keep: &str) {
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = read
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n != keep && n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    others.sort();
+    let extra = others.len().saturating_sub(KEPT_BUILDS - 1);
+    for (_, path) in others.into_iter().take(extra) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Release `version`'s asset `name`, unpacked in `dir`: [`SUMS`] and
 /// [`SUMS_SIG`] downloaded and the signature checked against
-/// [`Steps::release_key`] ([`verify_sums`]), `name`'s line found
+/// [`Steps::release_key`] ([`fetch_sums`]), `name`'s line found
 /// ([`sum_of`]), only then the archive downloaded, its sha256 checked, and
 /// unpacked. No signature, no install: there is no unsigned path.
 fn fetch_verified(steps: &dyn Steps, version: &str, name: &str, dir: &Path) -> Result<PathBuf> {
-    let get = |file: &str| -> Result<PathBuf> {
-        let url = release_url(version, file)?;
-        let out = dir.join(file);
-        steps.download(&url, &out).with_context(|| format!("cannot download {url}"))?;
-        Ok(out)
-    };
-    let read = |path: &Path| std::fs::read(path).with_context(|| format!("cannot read {}", path.display()));
-    let sums = read(&get(SUMS)?)?;
-    let sig = read(&get(SUMS_SIG)?)?;
-    verify_sums(&sums, &sig, &steps.release_key()).with_context(|| format!("release v{version} isn't signed by the release key"))?;
+    let sums = fetch_sums(steps, version, dir)?;
     let want = sum_of(&sums, name).with_context(|| format!("release v{version}'s checksums"))?;
-    let archive = get(name)?;
+    let archive = fetch(steps, version, name, dir)?;
     check_sum(&archive, name, &want)?;
     steps.unpack(&archive, dir)
 }
@@ -591,31 +729,96 @@ pub(crate) mod tests {
         assert_eq!(platform_of("0.7.0 1a2b dev"), "unknown");
         assert_eq!(Build::parse("0.7.0 1a2b dev linux/x86_64"), build("0.7.0", "1a2b", false), "the platform isn't the build");
         assert_eq!(build("0.7.0", "1a2b", true).label(), "0.7.0 (published, 1a2b)");
-        // A peer link's control plane words: the role, then the control plane, not part of the build.
-        assert_eq!(hello_of(true, Some("box")), format!("{HELLO} control_plane box"));
-        assert_eq!(hello_of(false, Some("box")), format!("{HELLO} member box"));
-        assert_eq!(hello_of(false, None), format!("{HELLO} member -"));
-        assert!(std::ptr::eq(hello_of(false, Some("box")), hello_of(false, Some("box"))), "leaked once");
-        assert!(hello_of(true, Some("box")).len() <= u8::MAX as usize, "fits a `Hello` hash");
-        assert_eq!(hello_of(true, Some(&"x".repeat(250))), format!("{HELLO} control_plane -"), "too long a name isn't said");
-        assert!(is_control_plane(hello_of(true, None)) && !is_control_plane(hello_of(false, Some("control_plane"))));
+        // A peer link's control plane words: the role, then the control plane, not part of the build;
+        // then this binary's sha256 prefix and whether this end takes dev builds.
+        let sha = own_sha_word();
+        assert_eq!(sha.len(), SHA_WORD);
+        assert_eq!(sha, hex::encode(own_sha256().unwrap())[..SHA_WORD]);
+        let own = sha256_of(&crate::commands::fleet_link::own_binary().unwrap()).unwrap();
+        assert_eq!(own_sha256().unwrap(), own, "this binary's bytes");
+        assert_eq!(hello_of(true, Some("box"), false), format!("{HELLO} control_plane box {sha} nodev"));
+        assert_eq!(hello_of(false, Some("box"), true), format!("{HELLO} member box {sha} dev"));
+        assert_eq!(hello_of(false, None, false), format!("{HELLO} member - {sha} nodev"));
+        assert!(std::ptr::eq(hello_of(false, Some("box"), true), hello_of(false, Some("box"), true)), "leaked once");
+        assert!(hello_of(true, Some(&"x".repeat(63)), true).len() <= u8::MAX as usize, "fits a `Hello` hash");
+        assert_eq!(hello_of(true, Some(&"x".repeat(250)), true), format!("{HELLO} control_plane - {sha} dev"), "too long a name isn't said");
+        let longest = 255 - format!("{HELLO} control_plane  {sha} nodev").len();
+        assert_eq!(hello_of(true, Some(&"x".repeat(longest)), false).len(), 255, "a name that just fits is said");
+        assert!(hello_of(true, Some(&"x".repeat(longest + 1)), false).contains(" - "));
+        assert!(is_control_plane(hello_of(true, None, true)) && !is_control_plane(hello_of(false, Some("control_plane"), true)));
         assert!(!is_control_plane(HELLO), "a hello without the flag never says control plane");
         assert!(!is_control_plane("0.7.0 1a2b dev control_plane"), "the fifth word, not any");
-        assert_eq!((Build::parse(hello_of(true, None)), platform_of(hello_of(false, None))), (ours, PLATFORM));
-        assert_eq!((control_plane_of(hello_of(true, Some("k"))), control_plane_of(hello_of(false, Some("k")))), (Some("k"), Some("k")));
-        assert_eq!((control_plane_of(hello_of(false, None)), control_plane_of(HELLO), control_plane_of("0.7.0 a dev x/y control_plane")), (None, None, None));
+        assert_eq!((Build::parse(hello_of(true, None, true)), platform_of(hello_of(false, None, false))), (ours, PLATFORM));
+        assert_eq!((control_plane_of(hello_of(true, Some("k"), true)), control_plane_of(hello_of(false, Some("k"), false))), (Some("k"), Some("k")));
+        assert_eq!((control_plane_of(hello_of(false, None, true)), control_plane_of(HELLO), control_plane_of("0.7.0 a dev x/y control_plane")), (None, None, None));
+        // The two new words.
+        assert_eq!((sha_of(hello_of(false, None, true)), takes_dev_builds(hello_of(false, None, true))), (Some(sha.as_str()), true));
+        assert!(!takes_dev_builds(hello_of(true, Some("k"), false)));
+        assert_eq!(sha_of(hello_of(true, Some(&"x".repeat(250)), true)), Some(sha.as_str()), "a dropped name keeps the words");
+        assert_eq!((sha_of("0.7.0 a dev x/y member k - dev"), sha_of("0.7.0 a dev x/y member k"), sha_of(HELLO)), (None, None, None));
+        assert!(!takes_dev_builds("0.7.0 a dev x/y member k 0123456789abcdef") && !takes_dev_builds("0.7.0 a dev x/y member k dev"), "the eighth word, not any");
         use crate::serve::fleet::member::ControlPlane;
-        assert_eq!(hello_for(&ControlPlane::This, Some("k")), hello_of(true, Some("k")));
-        assert_eq!(hello_for(&ControlPlane::Other("k".into()), Some("lap")), hello_of(false, Some("k")));
-        assert_eq!(hello_for(&ControlPlane::None, Some("lap")), hello_of(false, None));
+        assert_eq!(hello_for(&ControlPlane::This, Some("k"), true), hello_of(true, Some("k"), true));
+        assert_eq!(hello_for(&ControlPlane::Other("k".into()), Some("lap"), false), hello_of(false, Some("k"), false));
+        assert_eq!(hello_for(&ControlPlane::None, Some("lap"), true), hello_of(false, None, true));
+    }
+
+    #[test]
+    fn a_release_s_sums_are_hashed_once_signed() {
+        use sha2::Digest;
+        let dir = scratch("sums");
+        let fake = Fake::default();
+        let want: [u8; 32] = sha2::Sha256::digest(honest_sums("0.9.0")).into();
+        assert_eq!(release_sums_sha256(&fake, "0.9.0", &dir).unwrap(), want);
+        let base = "https://github.com/Nemikolh/devsandboxes/releases/download/v0.9.0";
+        assert_eq!(fake.calls(), [format!("fetch {base}/SHA256SUMS"), format!("fetch {base}/SHA256SUMS.sig")]);
+        assert!(empty(&dir), "the scratch dir is gone");
+        for tamper in ["sums", "sig", "key"] {
+            let fake = Fake { tamper: Some(tamper), ..Fake::default() };
+            let e = format!("{:#}", release_sums_sha256(&fake, "0.9.0", &dir).unwrap_err());
+            assert!(e.contains("release v0.9.0 isn't signed by the release key"), "{tamper}: {e}");
+        }
+        let offline = Fake { fail: Some("fetch"), ..Fake::default() };
+        assert!(format!("{:#}", release_sums_sha256(&offline, "0.9.0", &dir).unwrap_err()).contains("cannot download"));
+        assert!(empty(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kept_build_is_an_exact_private_copy_and_old_ones_go() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = scratch("keep");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mut kept = Vec::new();
+        for i in 0..5u8 {
+            let binary = data.join(format!("bin{i}"));
+            std::fs::write(&binary, [i; 10]).unwrap();
+            let sha = sha256_of(&binary).unwrap();
+            let at = keep_build(&data, &binary, &sha).unwrap();
+            assert_eq!(at, builds_dir(&data).join(hex::encode(sha)));
+            assert_eq!((std::fs::read(&at).unwrap(), mode(&at), mode(&builds_dir(&data))), ([i; 10].to_vec(), 0o755, 0o700));
+            // Again: the intact copy stays.
+            assert_eq!(keep_build(&data, &binary, &sha).unwrap(), at);
+            kept.push(at);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let left: Vec<bool> = kept.iter().map(|p| p.exists()).collect();
+        assert_eq!(left, [false, false, true, true, true], "the newest {KEPT_BUILDS}");
+        // A binary that isn't what the pin says: nothing kept.
+        let binary = data.join("bin0");
+        let e = format!("{:#}", keep_build(&data, &binary, &[9; 32]).unwrap_err());
+        assert!(e.contains("it changed meanwhile"), "{e}");
+        assert!(!builds_dir(&data).join(hex::encode([9; 32])).exists());
+        assert_eq!(std::fs::read_dir(builds_dir(&data)).unwrap().count(), KEPT_BUILDS, "no temp file left");
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
     fn two_fleets_never_link() {
-        let (k, l, none) = (hello_of(true, Some("k")), hello_of(false, Some("l")), hello_of(false, None));
+        let (k, l, none) = (hello_of(true, Some("k"), false), hello_of(false, Some("l"), false), hello_of(false, None, false));
         assert_eq!(same_fleet("box", k, l), Err("`box` is in `l`'s fleet, this host in `k`'s: a link between two fleets is refused".into()));
         assert!(same_fleet("box", l, k).unwrap_err().starts_with("`box` is in `k`'s fleet, this host in `l`'s"));
-        assert_eq!(same_fleet("box", k, hello_of(false, Some("k"))), Ok(()), "the same control plane");
+        assert_eq!(same_fleet("box", k, hello_of(false, Some("k"), false)), Ok(()), "the same control plane");
         assert_eq!(same_fleet("box", k, none), Ok(()), "one end in no fleet");
         assert_eq!(same_fleet("box", none, l), Ok(()));
         assert_eq!(same_fleet("box", none, none), Ok(()));

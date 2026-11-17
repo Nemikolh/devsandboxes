@@ -177,6 +177,10 @@ pub struct Options {
     /// `open.deliver` taken); `None` is `open::open_here` on a thread of its
     /// own through the forwards registry. Tests record the job.
     pub open_here: Option<opens::OpenHere>,
+    /// On the fleet's authority, pin this daemon's build in the membership
+    /// log ([`Shared::pin_build`]). Off in tests, whose binary is the test
+    /// harness.
+    pub pin_builds: bool,
 }
 
 /// [`Options::host_agent`].
@@ -217,6 +221,7 @@ impl Options {
             agent_probe: fleet::agent::PROBE,
             pty_exec: None,
             open_here: None,
+            pin_builds: true,
         }
     }
 }
@@ -436,6 +441,12 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
+    // On the authority: this build pinned, once the control plane's platform
+    // allows (now if this host is the control plane; else at the link to it).
+    if opts.pin_builds {
+        Shared::start_pinning(&shared);
+        shared.pin_build(None);
+    }
     // This host's link report and the published graph (fleet plan step
     // 10b.2): only with a `member.toml`, beside which the log and key are.
     let publisher = shared.member.clone().map(|member| {
@@ -696,10 +707,10 @@ fn machine_dialer(
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     });
     let hello = {
-        let (control_plane, name) = (Arc::clone(control_plane), Arc::clone(&member_name));
+        let (control_plane, name, dev_builds) = (Arc::clone(control_plane), Arc::clone(&member_name), Arc::clone(&follow.dev_builds));
         Arc::new(move || {
             let control_plane = lock_control_plane(&control_plane).clone();
-            fleet::update::hello_for(&control_plane, name().ok().as_deref())
+            fleet::update::hello_for(&control_plane, name().ok().as_deref(), dev_builds())
         })
     };
     let open: fleet::dialer::Open = {
@@ -726,8 +737,15 @@ fn machine_dialer(
         identity,
         adopt,
         linked: {
-            let (member, dir) = (linked_member, dir.to_path_buf());
-            Arc::new(move |name: &str| follow_configs(member.as_deref(), &dir, name))
+            let (member, dir, hooked) = (linked_member, dir.to_path_buf(), Arc::clone(hooked));
+            Arc::new(move |name: &str, hello: &str| {
+                follow_configs(member.as_deref(), &dir, name);
+                if fleet::update::is_control_plane(hello)
+                    && let Some(s) = hooked.get().and_then(std::sync::Weak::upgrade)
+                {
+                    s.pin_build(Some((name.to_string(), fleet::update::platform_of(hello).to_string())));
+                }
+            })
         },
     };
     Arc::new(move |entry, held| dialer.hold(entry, held))
@@ -875,7 +893,15 @@ struct Shared {
     /// The config roots whose verbs already said this host isn't the
     /// fleet's authority ([`config_notes`]).
     told_not_authority: Mutex<BTreeSet<String>>,
+    /// The `serve-pin` thread's queue ([`Shared::pin_build`]); unset
+    /// without [`Options::pin_builds`].
+    pin: OnceLock<Mutex<std::sync::mpsc::Sender<PinTrigger>>>,
 }
+
+/// Why [`Shared::pin_build`] runs: the daemon's start (`None`), or a link
+/// to a peer whose `Hello` says it's the control plane coming up: its
+/// member name and platform.
+type PinTrigger = Option<(String, String)>;
 
 impl Shared {
     fn new(version: Version, inbox: PathBuf, state: PathBuf, join: Join) -> Self {
@@ -919,6 +945,58 @@ impl Shared {
             open_here: OnceLock::new(),
             open_limit: Mutex::new(crate::devsbd::desktop::RateLimit::new(crate::open::OPEN_RATE_BURST, crate::open::OPEN_RATE_REFILL)),
             told_not_authority: Mutex::default(),
+            pin: OnceLock::new(),
+        }
+    }
+
+    /// Pin this daemon's build, on the fleet's authority
+    /// (`machines::changes::sign_build`), on the `serve-pin` thread: one at
+    /// a time, best effort, logged. `trigger`: see [`PinTrigger`]. Nothing
+    /// without [`Options::pin_builds`].
+    fn pin_build(&self, trigger: PinTrigger) {
+        if let Some(pin) = self.pin.get() {
+            let _ = pin.lock().unwrap_or_else(|e| e.into_inner()).send(trigger);
+        }
+    }
+
+    /// Start the `serve-pin` thread [`Shared::pin_build`] sends to. It
+    /// holds `shared` weakly and ends with it (its queue's sender is
+    /// `shared`'s).
+    fn start_pinning(shared: &Arc<Shared>) {
+        let (tx, rx) = std::sync::mpsc::channel::<PinTrigger>();
+        let weak = Arc::downgrade(shared);
+        let spawned = std::thread::Builder::new().name("serve-pin".into()).spawn(move || {
+            while let Ok(trigger) = rx.recv() {
+                let Some(shared) = weak.upgrade() else { return };
+                shared.pin_now(trigger);
+            }
+        });
+        match spawned {
+            Ok(_) => {
+                let _ = shared.pin.set(Mutex::new(tx));
+            }
+            Err(e) => log(&format!("fleet: cannot start the build pinning thread: {e}")),
+        }
+    }
+
+    /// [`Shared::pin_build`]'s work, on its thread.
+    fn pin_now(&self, trigger: PinTrigger) {
+        let Some(ctx) = self.machines.as_ref() else { return };
+        let sha256 = match fleet::update::own_sha256() {
+            Ok(sha) => sha,
+            Err(e) => return log(&format!("fleet: build not pinned: {e:#}")),
+        };
+        let binary = match crate::commands::fleet_link::own_binary() {
+            Ok(b) => b,
+            Err(e) => return log(&format!("fleet: build not pinned: cannot locate this binary: {e}")),
+        };
+        let release = fleet::update::Release { socket_dir: self.socket_dir.clone() };
+        let own = machines::changes::OwnBuild { hello: fleet::update::HELLO, binary: &binary, sha256, release: &release };
+        let control_plane = trigger.as_ref().map(|(name, platform)| (name.as_str(), platform.as_str()));
+        if let Some(signed) = machines::changes::sign_build(ctx, control_plane, &own) {
+            for line in signed.log_lines() {
+                log(&format!("fleet: {line}"));
+            }
         }
     }
 
@@ -2487,6 +2565,9 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
     });
     log(&format!("{}: link from {} (devsandbox {}{})", conn.label(), p.peer, p.version, if p.control_plane { ", the control plane" } else { "" }));
     follow_configs(shared.member.as_deref(), &shared.socket_dir, &p.peer);
+    if p.control_plane {
+        shared.pin_build(Some((p.peer.clone(), fleet::update::platform_of(&p.version).to_string())));
+    }
     Response::ok(id, json!({ "ok": true }))
 }
 
@@ -3719,6 +3800,8 @@ pub(crate) mod tests {
             pty_exec: None,
             // Never a browser on the test host: taken opens go nowhere.
             open_here: Some(Arc::new(|_| {})),
+            // Never this test binary pinned in a test fleet's log.
+            pin_builds: false,
         }
     }
 

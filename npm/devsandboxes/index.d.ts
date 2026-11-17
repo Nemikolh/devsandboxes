@@ -1347,8 +1347,32 @@ export interface MembershipConfig extends MembershipEntryBase {
   hash: string;
 }
 
+/** A dev build: its label, the one platform it runs on, and the sha256 of the binary (64 lowercase hex). @experimental */
+export interface MembershipPinDev {
+  kind: 'dev';
+  semver: string;
+  git: string;
+  /** `<os>/<arch>`. */
+  platform: string;
+  sha256: string;
+}
+
+/** A release, and the sha256 of its `SHA256SUMS` file (64 lowercase hex). @experimental */
+export interface MembershipPinPublished {
+  kind: 'published';
+  semver: string;
+  sums_sha256: string;
+}
+
+/** The fleet's build is now `pin`, the `version`th pin (each the one before + 1); only the latest counts. @experimental */
+export interface MembershipBuild extends MembershipEntryBase {
+  op: 'build';
+  version: number;
+  pin: MembershipPinDev | MembershipPinPublished;
+}
+
 /** One entry of the membership log, a hash chain the fleet's authority signs. @experimental */
-export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipControlPlane | MembershipConfig;
+export type MembershipEntry = MembershipGenesis | MembershipAdd | MembershipRevoke | MembershipRotate | MembershipControlPlane | MembershipConfig | MembershipBuild;
 
 /** A member's signed word for a key the authority hasn't added: capped until it does. @experimental */
 export interface MembershipIntroduction {

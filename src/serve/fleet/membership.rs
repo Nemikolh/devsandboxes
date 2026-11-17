@@ -1,9 +1,9 @@
 //! The fleet's membership log (docs/architecture/daemon/fleet.md,
 //! *Membership log*; fleet plan step 10a, decisions 45, 46, 50, 51): a hash
 //! chain of entries the authority signs, each one [`Op`] (`genesis`, `add`,
-//! `revoke`, `rotate`, `control_plane`, `config`), that [`apply`] verifies into a
+//! `revoke`, `rotate`, `control_plane`, `config`, `build`), that [`apply`] verifies into a
 //! [`Membership`]: the members and their keys, the control plane, the revoked keys,
-//! each config root's signed version and the [`Head`]. [`compare`] says how a peer's head stands to ours.
+//! each config root's signed version, the fleet's pinned build and the [`Head`]. [`compare`] says how a peer's head stands to ours.
 //!
 //! Introductions (decision 50) sit outside the chain: a member's signed word
 //! for a key the authority hasn't added yet, checked against the log
@@ -96,6 +96,60 @@ pub enum Op {
         #[serde(with = "hex32")]
         hash: [u8; 32],
     },
+    /// The fleet's build is now `pin`, the `version`th pin (1 for the
+    /// first, each the one before + 1). Only the latest counts.
+    Build { version: u64, pin: Pin },
+}
+
+/// A build the authority pins ([`Op::Build`]). On the wire tagged by
+/// `kind`: `{"kind": "dev", "semver", "git", "platform", "sha256"}`,
+/// `{"kind": "published", "semver", "sums_sha256"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Pin {
+    /// A dev build: its label (`fleet::update::Build`: semver, git), the
+    /// one platform it runs on (`<os>/<arch>`) and the sha256 of the
+    /// binary, which is what the build is.
+    Dev {
+        semver: String,
+        git: String,
+        platform: String,
+        #[serde(with = "hex32")]
+        sha256: [u8; 32],
+    },
+    /// Release `semver`, its `SHA256SUMS` file hashing to `sums_sha256`:
+    /// one hash over the signed checksums of every target's archive.
+    Published {
+        semver: String,
+        #[serde(with = "hex32")]
+        sums_sha256: [u8; 32],
+    },
+}
+
+impl Pin {
+    /// Its words are one each: non-empty, no whitespace or control
+    /// characters (what a `Hello` could say).
+    fn check(&self) -> Result<()> {
+        let words: &[(&str, &str)] = match self {
+            Pin::Dev { semver, git, platform, .. } => &[("semver", semver), ("git", git), ("platform", platform)],
+            Pin::Published { semver, .. } => &[("semver", semver)],
+        };
+        for (what, w) in words {
+            if w.is_empty() || w.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                bail!("build {what} `{}` isn't one word", w.escape_debug());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Pin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Pin::Dev { semver, git, platform, sha256 } => write!(f, "dev {semver} ({git}, {platform}, {})", short(sha256)),
+            Pin::Published { semver, sums_sha256 } => write!(f, "published {semver} (sums {})", short(sums_sha256)),
+        }
+    }
 }
 
 impl Op {
@@ -146,6 +200,18 @@ impl Op {
                     put(out, f);
                 }
             }
+            Op::Build { version, pin: Pin::Dev { semver, git, platform, sha256 } } => {
+                let v = version.to_be_bytes();
+                for f in [&b"build"[..], &v, b"dev", semver.as_bytes(), git.as_bytes(), platform.as_bytes(), sha256] {
+                    put(out, f);
+                }
+            }
+            Op::Build { version, pin: Pin::Published { semver, sums_sha256 } } => {
+                let v = version.to_be_bytes();
+                for f in [&b"build"[..], &v, b"published", semver.as_bytes(), sums_sha256] {
+                    put(out, f);
+                }
+            }
         }
     }
 }
@@ -161,6 +227,7 @@ impl fmt::Display for Op {
             Op::Rotate { name, .. } => write!(f, "rotate `{name}`'s key"),
             Op::ControlPlane { name } => write!(f, "control plane `{name}`"),
             Op::Config { root, version, hash } => write!(f, "config `{root}` v{version} ({})", short(hash)),
+            Op::Build { version, pin } => write!(f, "build v{version}: {pin}"),
         }
     }
 }
@@ -286,6 +353,8 @@ pub struct Membership {
     pub genesis: [u8; 32],
     /// Each config root's latest [`Op::Config`]: its version and hash.
     pub config: BTreeMap<String, (u64, [u8; 32])>,
+    /// The latest [`Op::Build`]: its version and pin.
+    pub build: Option<(u64, Pin)>,
 }
 
 impl Membership {
@@ -396,6 +465,14 @@ impl Membership {
                 }
                 self.config.insert(root.clone(), (*version, *hash));
             }
+            Op::Build { version, pin } => {
+                pin.check()?;
+                let current = self.build.as_ref().map_or(0, |(v, _)| *v);
+                if *version != current + 1 {
+                    bail!("build version {version} doesn't follow the current one ({current}): each is the one before + 1");
+                }
+                self.build = Some((*version, pin.clone()));
+            }
         }
         Ok(())
     }
@@ -435,6 +512,7 @@ fn next(before: Option<&Membership>, entry: &Entry) -> Result<Membership> {
                 head: Head::EMPTY,
                 genesis: entry.hash(),
                 config: BTreeMap::new(),
+                build: None,
             }
         }
         Some(m) => {
@@ -922,22 +1000,32 @@ mod tests {
     fn tampering_with_any_field_is_refused() {
         let mut log = fleet();
         log.append(Op::Config { root: "cfg".into(), version: 1, hash: [7; 32] }, "lap", &key(1)).unwrap();
+        log.append(Op::Build { version: 1, pin: dev_pin(1) }, "lap", &key(1)).unwrap();
+        log.append(Op::Build { version: 2, pin: Pin::Published { semver: "0.9.0".into(), sums_sha256: [3; 32] } }, "lap", &key(1)).unwrap();
         let entries = log.entries().to_vec();
         let mutations: Vec<(&str, Box<dyn Fn(&mut Entry)>)> = vec![
             ("op name", Box::new(|e| match &mut e.op {
-                Op::Genesis { authority: n, .. } | Op::Add { name: n, .. } | Op::Revoke { name: n, .. } | Op::Rotate { name: n, .. } | Op::ControlPlane { name: n } | Op::Config { root: n, .. } => n.push('x'),
+                Op::Genesis { authority: n, .. }
+                | Op::Add { name: n, .. }
+                | Op::Revoke { name: n, .. }
+                | Op::Rotate { name: n, .. }
+                | Op::ControlPlane { name: n }
+                | Op::Config { root: n, .. }
+                | Op::Build { pin: Pin::Dev { semver: n, .. } | Pin::Published { semver: n, .. }, .. } => n.push('x'),
             })),
             ("config version", Box::new(|e| match &mut e.op {
-                Op::Config { version, .. } => *version += 1,
+                Op::Config { version, .. } | Op::Build { version, .. } => *version += 1,
                 _ => e.prev[2] ^= 1,
             })),
             ("config hash", Box::new(|e| match &mut e.op {
-                Op::Config { hash, .. } => hash[0] ^= 1,
+                Op::Config { hash, .. } | Op::Build { pin: Pin::Dev { sha256: hash, .. } | Pin::Published { sums_sha256: hash, .. }, .. } => hash[0] ^= 1,
                 _ => e.prev[1] ^= 1,
             })),
             ("op key", Box::new(|e| match &mut e.op {
                 Op::Genesis { key: k, .. } | Op::Add { key: k, .. } | Op::Revoke { key: k, .. } => *k = pk(9),
                 Op::Config { hash, .. } => hash[31] ^= 1,
+                Op::Build { pin: Pin::Dev { git, .. }, .. } => git.push('x'),
+                Op::Build { pin: Pin::Published { semver, .. }, .. } => *semver = "0.9.1".into(),
                 _ => unreachable!(),
             })),
             ("genesis id", Box::new(|e| match &mut e.op {
@@ -1016,6 +1104,46 @@ mod tests {
         behind.extend(log.entries_after(3).to_vec()).unwrap();
         assert_eq!(behind.membership().unwrap().config, latest);
         assert_eq!(config("cfg", 3, 2).to_string(), format!("config `cfg` v3 ({})", hex::encode([2; 6])));
+    }
+
+    fn dev_pin(h: u8) -> Pin {
+        Pin::Dev { semver: "0.9.0".into(), git: "1a2b3c4d5e6f".into(), platform: "linux/x86_64".into(), sha256: [h; 32] }
+    }
+
+    #[test]
+    fn builds_go_up_by_one_only_the_authority_signs_and_the_latest_counts() {
+        let mut log = fleet();
+        assert_eq!(log.membership().unwrap().build, None);
+        let build = |version, pin| Op::Build { version, pin };
+        for v in [0, 2] {
+            let e = refused(&log, build(v, dev_pin(1)));
+            assert!(e.contains(&format!("build version {v} doesn't follow the current one (0)")), "{e}");
+        }
+        log.append(build(1, dev_pin(1)), "lap", &key(1)).unwrap();
+        let published = Pin::Published { semver: "0.9.1".into(), sums_sha256: [4; 32] };
+        log.append(build(2, published.clone()), "lap", &key(1)).unwrap();
+        assert_eq!(log.membership().unwrap().build, Some((2, published.clone())), "the latest");
+        for v in [1, 2, 4] {
+            assert!(refused(&log, build(v, dev_pin(2))).contains("each is the one before + 1"), "v{v}");
+        }
+        // A downgrade is only a newer entry.
+        log.append(build(3, dev_pin(1)), "lap", &key(1)).unwrap();
+        assert_eq!(apply(log.entries()).unwrap().build, Some((3, dev_pin(1))));
+        for (bad, what) in [("", "semver"), ("a b", "semver"), ("a\nb", "semver")] {
+            let pin = Pin::Published { semver: bad.into(), sums_sha256: [0; 32] };
+            assert!(refused(&log, build(4, pin)).contains(&format!("build {what}")), "{bad:?}");
+        }
+        let Pin::Dev { semver, git, sha256, .. } = dev_pin(1) else { unreachable!() };
+        let no_platform = Pin::Dev { semver, git, platform: String::new(), sha256 };
+        assert!(refused(&log, build(4, no_platform)).contains("build platform `` isn't one word"));
+        // Signed by anyone but the authority: refused.
+        let h = log.head();
+        let by_box = Entry::sign(h.len, h.hash, build(4, dev_pin(5)), "box", &key(2));
+        let mut l = log.clone();
+        assert!(format!("{:#}", l.extend(vec![by_box]).unwrap_err()).contains("not the authority `lap`"));
+        assert_eq!(l, log);
+        assert_eq!(build(3, dev_pin(2)).to_string(), format!("build v3: dev 0.9.0 (1a2b3c4d5e6f, linux/x86_64, {})", hex::encode([2; 6])));
+        assert_eq!(build(2, published).to_string(), format!("build v2: published 0.9.1 (sums {})", hex::encode([4; 6])));
     }
 
     #[test]
@@ -1261,6 +1389,24 @@ mod tests {
         let op = Op::Config { root: "cfg".into(), version: 2, hash: [0xab; 32] };
         assert_eq!(serde_json::to_value(&op).unwrap(), config);
         assert_eq!(serde_json::from_value::<Op>(config).unwrap(), op);
+        let dev = json!({"op": "build", "version": 1, "pin": {"kind": "dev", "semver": "0.9.0", "git": "1a2b3c4d5e6f", "platform": "linux/x86_64", "sha256": "01".repeat(32)}});
+        let op = Op::Build { version: 1, pin: dev_pin(1) };
+        assert_eq!(serde_json::to_value(&op).unwrap(), dev);
+        assert_eq!(serde_json::from_value::<Op>(dev).unwrap(), op);
+        let published = json!({"op": "build", "version": 2, "pin": {"kind": "published", "semver": "0.9.0", "sums_sha256": "ab".repeat(32)}});
+        let op = Op::Build { version: 2, pin: Pin::Published { semver: "0.9.0".into(), sums_sha256: [0xab; 32] } };
+        assert_eq!(serde_json::to_value(&op).unwrap(), published);
+        assert_eq!(serde_json::from_value::<Op>(published.clone()).unwrap(), op);
+        // Flattened into an entry, as `membership.json` holds it.
+        let mut l = fleet();
+        l.append(op, "lap", &key(1)).unwrap_err();
+        l.append(Op::Build { version: 1, pin: dev_pin(1) }, "lap", &key(1)).unwrap();
+        let e = l.entries().last().unwrap();
+        let wire = serde_json::to_value(e).unwrap();
+        assert_eq!(serde_json::from_value::<Entry>(wire.clone()).unwrap(), *e);
+        crate::serve::dts::assert_matches("MembershipBuild", &wire);
+        crate::serve::dts::assert_matches("MembershipPinDev", &wire["pin"]);
+        crate::serve::dts::assert_matches("MembershipPinPublished", &published["pin"]);
         let head = log.head();
         let head_wire = json!({"len": 3, "hash": hex::encode(head.hash), "genesis": hex::encode(log.entries()[0].hash())});
         assert_eq!(serde_json::to_value(head).unwrap(), head_wire);

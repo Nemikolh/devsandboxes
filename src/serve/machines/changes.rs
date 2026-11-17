@@ -47,6 +47,10 @@
 //!   missed are kept in memory ([`CONFIG_MISSED`]): a verb on an unchanged
 //!   root pushes the log again to those only, the retry, and to none when
 //!   none is kept.
+//! - **The fleet's build.** The authority's daemon pins its own build as
+//!   the next `build` entry ([`sign_build`], over the pure [`plan_pin`]) at
+//!   its start and when its link to the control plane comes up, and pushes
+//!   it; a dev build only where the control plane can run it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -62,7 +66,8 @@ use super::service::Handle;
 use crate::serve::api::{ApiError, parse};
 use crate::serve::fleet::identity::{FileKeyStore, KeyStore, PublicKey, Signer, SigningKey};
 use crate::serve::fleet::member::{self, ControlPlane};
-use crate::serve::fleet::membership::{self, Op, Stored, Wire, countersign_rotate};
+use crate::serve::fleet::membership::{self, Op, Pin, Stored, Wire, countersign_rotate};
+use crate::serve::fleet::update::{self, Build};
 use crate::serve::fleet::membership_api;
 use crate::serve::fleet::mesh;
 use crate::serve::fleet::proposals::{self, Change, Proposal};
@@ -693,6 +698,146 @@ pub fn sign_configs(ctx: &Ctx, roots: &[PathBuf]) -> Vec<ConfigSigned> {
         .collect()
 }
 
+/// What the authority does about pinning its own build ([`plan_pin`], pure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinPlan {
+    /// The latest pin is this build already.
+    Nothing,
+    /// Pin this dev build (its copy kept first).
+    Dev(Pin),
+    /// Pin release `semver`, once its `SHA256SUMS` is fetched and verified.
+    Published { semver: String },
+    /// Not pinned, and why.
+    Skip(String),
+}
+
+/// Whether the authority pins its build (pure): `own` its [`Build`] on
+/// `platform` (`update::platform_of`) with binary sha256 `sha256`, against
+/// the log's `latest` pin. A published build is pinned by release unless
+/// the latest pin is that release. A dev build is its bytes: pinned unless
+/// the latest pin is it, and only where the control plane can run it: this
+/// host is the control plane (`is_control_plane`), or the control plane's
+/// platform, as its link's `Hello` says (`control_plane_platform`; `None`:
+/// no link up to it, unknown), is `platform`.
+pub fn plan_pin(
+    own: &Build,
+    platform: &str,
+    sha256: &[u8; 32],
+    latest: Option<&Pin>,
+    control_plane_platform: Option<&str>,
+    is_control_plane: bool,
+) -> PinPlan {
+    if own.published {
+        if matches!(latest, Some(Pin::Published { semver, .. }) if *semver == own.semver) {
+            return PinPlan::Nothing;
+        }
+        return PinPlan::Published { semver: own.semver.clone() };
+    }
+    let pin = Pin::Dev { semver: own.semver.clone(), git: own.git.clone(), platform: platform.to_string(), sha256: *sha256 };
+    if latest == Some(&pin) {
+        return PinPlan::Nothing;
+    }
+    if !is_control_plane {
+        let label = own.label();
+        match control_plane_platform {
+            None => return PinPlan::Skip(format!("dev build {label} not pinned: the control plane's platform isn't known (no link to it is up)")),
+            Some(theirs) if theirs != platform => {
+                return PinPlan::Skip(format!("dev build {label} not pinned: it runs on {platform}, the control plane on {theirs}"));
+            }
+            Some(_) => {}
+        }
+    }
+    PinPlan::Dev(pin)
+}
+
+/// This daemon's own build, as [`sign_build`] pins it.
+pub struct OwnBuild<'a> {
+    /// Its `fleet::update::HELLO`.
+    pub hello: &'a str,
+    /// Its binary (`commands::fleet_link::own_binary`), what a dev pin keeps
+    /// a copy of, and that binary's sha256.
+    pub binary: &'a Path,
+    pub sha256: [u8; 32],
+    /// How a published build's `SHA256SUMS` is fetched (`update::Release`).
+    pub release: &'a dyn update::Steps,
+}
+
+/// What [`sign_build`] did, for `serve.log` ([`BuildSigned::log_lines`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildSigned {
+    /// Signed as the `version`th pin and pushed; `unpushed` the machines the
+    /// push missed (they catch up at their next link).
+    Signed { version: u64, pin: Pin, unpushed: Vec<Missed> },
+    /// Not pinned ([`PinPlan::Skip`]).
+    Skipped(String),
+    /// The pin couldn't be made or signed; the next trigger tries again.
+    Failed(String),
+}
+
+impl BuildSigned {
+    /// Its `serve.log` lines (pure).
+    pub fn log_lines(&self) -> Vec<String> {
+        match self {
+            BuildSigned::Signed { version, pin, unpushed } => {
+                let mut lines = vec![format!("signed build v{version}: {pin}")];
+                if !unpushed.is_empty() {
+                    let missed: Vec<String> = unpushed.iter().map(|m| format!("{} ({})", m.name, m.error)).collect();
+                    lines.push(format!("build v{version} not pushed to {}", missed.join(", ")));
+                }
+                lines
+            }
+            BuildSigned::Skipped(why) => vec![format!("build: {why}")],
+            BuildSigned::Failed(why) => vec![format!("build not pinned: {why}")],
+        }
+    }
+}
+
+/// On the fleet's authority: this daemon's build `own` pinned as the next
+/// `build` entry when [`plan_pin`] says so, then pushed like a membership
+/// change ([`push`]). `control_plane`: the control plane's member name
+/// and platform, from its link's `Hello`, when that link just came up
+/// (`None`: unknown; one naming another member than the log's control
+/// plane counts as unknown). A dev pin keeps a copy of the binary first
+/// (`update::keep_build`, under the data dir); a published pin fetches
+/// the release's `SHA256SUMS` and checks its signature
+/// (`update::release_sums_sha256`). `None`: this host is in no fleet,
+/// isn't its authority, or the latest pin is this build.
+pub fn sign_build(ctx: &Ctx, control_plane: Option<(&str, &str)>, own: &OwnBuild) -> Option<BuildSigned> {
+    let path = leave::member_toml(ctx).ok()?;
+    let (me, key) = membership_api::own(path, &ctx.hostname).ok()?;
+    let stored = membership_api::load(path).ok()??;
+    if leave::authority_of(Some(&stored), &me, &key.public_key()) != Authority::This {
+        return None;
+    }
+    let m = stored.log.membership()?;
+    let platform = control_plane.filter(|(name, _)| *name == m.control_plane).map(|(_, p)| p);
+    let latest = m.build.as_ref();
+    let plan = plan_pin(&Build::parse(own.hello), update::platform_of(own.hello), &own.sha256, latest.map(|(_, p)| p), platform, m.control_plane == me);
+    let pin = match plan {
+        PinPlan::Nothing => return None,
+        PinPlan::Skip(why) => return Some(BuildSigned::Skipped(why)),
+        PinPlan::Dev(pin) => {
+            let data = path.parent().expect("member.toml has a parent");
+            if let Err(e) = update::keep_build(data, own.binary, &own.sha256) {
+                return Some(BuildSigned::Failed(format!("cannot keep a copy of {}: {e:#}", own.binary.display())));
+            }
+            pin
+        }
+        PinPlan::Published { semver } => match update::release_sums_sha256(own.release, &semver, &std::env::temp_dir()) {
+            Ok(sums_sha256) => Pin::Published { semver, sums_sha256 },
+            Err(e) => return Some(BuildSigned::Failed(format!("release v{semver}'s checksums: {e:#}"))),
+        },
+    };
+    let version = latest.map_or(1, |(v, _)| v + 1);
+    let taken = match sign(ctx, &me, stored, Op::Build { version, pin: pin.clone() }) {
+        Ok(t) => t,
+        Err(e) => return Some(BuildSigned::Failed(e.message)),
+    };
+    let unpushed = ctx.links.as_ref().map(|l| push(l, &taken.stored, None).1).unwrap_or_default();
+    follow(ctx, &taken);
+    Some(BuildSigned::Signed { version, pin, unpushed })
+}
+
 /// The config roots a `machine add` here signs ([`roots_to_sign`] over
 /// `ctx`'s home, `member.toml`'s `roots` and its data dir). A
 /// `member.toml` that doesn't load picks no roots.
@@ -1162,6 +1307,46 @@ mod tests {
     fn up(pair: &Pair) {
         pair.wait_box("box connected", connected);
         wait_for("lap connected on K", Duration::from_secs(10), || lap_on_k(pair).is_some_and(|r| connected(&r)));
+    }
+
+    #[test]
+    fn the_authority_pins_its_build_where_the_control_plane_runs_it() {
+        use super::{BuildSigned, Missed, Pin, PinPlan, plan_pin};
+        use crate::serve::fleet::update::Build;
+        let (lx, mac) = ("linux/x86_64", "macos/aarch64");
+        let dev = Build { semver: "0.9.0".into(), git: "1a2b".into(), published: false };
+        let pin = |sha: u8| Pin::Dev { semver: "0.9.0".into(), git: "1a2b".into(), platform: lx.into(), sha256: [sha; 32] };
+        // A dev build: on the control plane, or with the control plane on its platform.
+        assert_eq!(plan_pin(&dev, lx, &[1; 32], None, None, true), PinPlan::Dev(pin(1)), "this host is the control plane");
+        assert_eq!(plan_pin(&dev, lx, &[1; 32], Some(&pin(2)), Some(lx), false), PinPlan::Dev(pin(1)), "other bytes, the same label");
+        assert_eq!(plan_pin(&dev, lx, &[1; 32], Some(&pin(1)), Some(lx), false), PinPlan::Nothing);
+        assert_eq!(plan_pin(&dev, lx, &[1; 32], Some(&pin(1)), None, false), PinPlan::Nothing, "pinned already: the guard isn't asked");
+        assert_eq!(
+            plan_pin(&dev, lx, &[1; 32], None, Some(mac), false),
+            PinPlan::Skip("dev build 0.9.0 (dev, 1a2b) not pinned: it runs on linux/x86_64, the control plane on macos/aarch64".into())
+        );
+        assert_eq!(
+            plan_pin(&dev, lx, &[1; 32], Some(&pin(2)), None, false),
+            PinPlan::Skip("dev build 0.9.0 (dev, 1a2b) not pinned: the control plane's platform isn't known (no link to it is up)".into())
+        );
+        // A published build: by release, on any platform.
+        let published = Build { published: true, ..dev.clone() };
+        let release = |semver: &str| Pin::Published { semver: semver.into(), sums_sha256: [7; 32] };
+        let want = PinPlan::Published { semver: "0.9.0".into() };
+        assert_eq!(plan_pin(&published, lx, &[1; 32], None, None, false), want, "the control plane unknown");
+        assert_eq!(plan_pin(&published, lx, &[1; 32], Some(&pin(1)), Some(mac), false), want);
+        assert_eq!(plan_pin(&published, lx, &[1; 32], Some(&release("0.8.0")), None, false), want, "another release, a downgrade too");
+        assert_eq!(plan_pin(&published, mac, &[3; 32], Some(&release("0.9.0")), None, false), PinPlan::Nothing);
+        // What `serve.log` says.
+        let missed = vec![Missed { name: "pi".into(), error: "its link isn't up".into() }];
+        let signed = BuildSigned::Signed { version: 4, pin: pin(1), unpushed: missed };
+        assert_eq!(
+            signed.log_lines(),
+            [format!("signed build v4: dev 0.9.0 (1a2b, linux/x86_64, {})", hex::encode([1; 6])), "build v4 not pushed to pi (its link isn't up)".into()]
+        );
+        assert_eq!(BuildSigned::Signed { version: 1, pin: release("0.9.0"), unpushed: vec![] }.log_lines().len(), 1);
+        assert_eq!(BuildSigned::Skipped("dev build x not pinned: y".into()).log_lines(), ["build: dev build x not pinned: y"]);
+        assert_eq!(BuildSigned::Failed("offline".into()).log_lines(), ["build not pinned: offline"]);
     }
 
     /// `lap` (L) the authority, `box` (K) the control plane; `zed` and `yan` members

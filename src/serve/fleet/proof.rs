@@ -654,8 +654,8 @@ pub mod tests {
         let (o, a) = run(auth("pi", 3, ahead.clone(), "lap"), auth("lap", 1, s.clone(), "pi"));
         assert_eq!(a.unwrap().newer, Some(ahead.clone()));
         assert_eq!(o.unwrap().newer, None);
-        assert!(control_plane_moved(&update::hello_of(false, Some("box")), &ahead).unwrap().contains("control plane is now `pi`"));
-        assert_eq!(control_plane_moved(&update::hello_of(false, Some("pi")), &ahead), None);
+        assert!(control_plane_moved(&update::hello_of(false, Some("box"), false), &ahead).unwrap().contains("control plane is now `pi`"));
+        assert_eq!(control_plane_moved(&update::hello_of(false, Some("pi"), false), &ahead), None);
     }
 
     #[test]
