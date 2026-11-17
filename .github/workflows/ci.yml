@@ -41,6 +41,12 @@ jobs:
         working-directory: .zidane/extensions
       - run: pnpm check
         working-directory: .zidane/extensions
+      # zidane runs extensions under bun; their tests use bun:test.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: pnpm test
+        working-directory: .zidane/extensions
 
   # The same suite under rootless podman (the runner user), the runtime mode
   # the docker job can't reach. Gated tests follow DEVSANDBOX_RUNTIME

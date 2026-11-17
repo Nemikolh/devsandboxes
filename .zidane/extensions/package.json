@@ -4,7 +4,8 @@
   "type": "module",
   "packageManager": "pnpm@12.21.0",
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "^1.4.4",
