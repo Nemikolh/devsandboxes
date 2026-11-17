@@ -268,6 +268,10 @@ Start with `docs/README.md` (reading order and map) and
   `plan-` prefix or `-plan` suffix. `docs_links` (`tests/docs_links.rs`)
   checks every `docs/…` path cited in code and every relative link in docs.
 - Doc comments explain _why_; keep them current when moving logic.
+- Comments say why or state a contract, never what the code does. Before
+  committing a change that adds or edits comments, run the
+  `simplify-comments` skill (`.agents/skills/simplify-comments/SKILL.md`)
+  over it.
 - Tests live in `#[cfg(test)]` modules per file; most logic is factored to be
   testable without a container runtime.
 - Tests that need a container runtime or the embedded helper use
