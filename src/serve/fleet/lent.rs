@@ -1604,7 +1604,7 @@ mod tests {
 
     /// A control plane's federated push: other machines' rows (tagged, their `root` a
     /// path there) stay, their services untouched; this host's own rows are
-    /// cut as ever, and a remote instance of the same name keeps no local
+    /// cut, and a remote instance of the same name keeps no local
     /// row's service user.
     #[test]
     fn a_federated_push_keeps_other_machines_rows() {

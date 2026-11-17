@@ -1736,6 +1736,7 @@ folder = "."
         inbox: Option<PathBuf>,
         /// `wait_bridge` calls, by child name.
         bridge_waits: Vec<String>,
+        /// What `wait_bridge` answers.
         bridge_note: Option<String>,
         /// RPC methods the children's helpers offer (none: the exec path).
         rpc: BTreeSet<String>,
@@ -1743,6 +1744,7 @@ folder = "."
         rpc_reply: Vec<Record>,
         /// `helper_call` calls, `(container, method, params)`.
         rpc_calls: Vec<(String, String, Obj)>,
+        /// What `host_agent` answers.
         agent: bool,
     }
 

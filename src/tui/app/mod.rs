@@ -109,6 +109,7 @@ pub struct PortRow {
     pub process: Option<String>,
     /// Coarse state: `"active"`, `"connecting"`, or `"error: …"`.
     pub state: String,
+    /// Open connection count.
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by hand.
     pub configured: bool,

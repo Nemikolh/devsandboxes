@@ -984,6 +984,7 @@ mod tests {
         // 20 rows in 5: a focus below the window pulls it down to show it.
         assert_eq!(forms_offset(0, Some(8..10), 20, 5, true), 5);
         assert_eq!(forms_offset(9, Some(2..4), 20, 5, true), 2);
+        // Taller than the window: its start shows.
         assert_eq!(forms_offset(0, Some(8..16), 20, 5, true), 8);
         assert_eq!(forms_offset(3, Some(8..10), 20, 5, false), 3);
         assert_eq!(forms_offset(30, None, 20, 5, false), 15);

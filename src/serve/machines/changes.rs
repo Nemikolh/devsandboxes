@@ -2227,7 +2227,6 @@ mod tests {
         assert_eq!(plan_control_plane(None, "box", &bx.public_key(), "pi").err().unwrap().code, "failed");
     }
 
-    /// The `control_plane` field of the `member.toml` at `toml`.
     fn control_plane_field(toml: &Path) -> String {
         crate::serve::fleet::member::load(toml).unwrap().unwrap().control_plane
     }
