@@ -27,9 +27,10 @@
 //! (a version handoff of this host's daemon) ([`Announce`]); a
 //! `links.cycle` notification on it (this host's control plane changed) ends the
 //! link, so the dialer redials and both ends say the new control plane. Versions
-//! follow the control-plane flag ([`follows`]): this end, not the control plane, follows a control plane
-//! dialer's build, then ends the link (the dialer redials the new binary);
-//! this end, the control plane, pushes its dev build to a dialer that would take it.
+//! follow the control-plane flag ([`follows`]): this end, neither the control plane nor
+//! the fleet's authority ([`Authority`]), follows a control plane dialer's build, then
+//! ends the link (the dialer redials the new binary); this end, the control plane,
+//! pushes its dev build to a dialer that would take it (never to the authority).
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,8 @@ use crate::serve::fleet::lent::Channel;
 use crate::serve::fleet::transfer::Receivers;
 use crate::serve::fleet::update::{Build, Decision};
 use crate::serve::fleet::follow::Follow;
+use crate::serve::fleet::identity::PublicKey;
+use crate::serve::fleet::membership::Stored;
 use crate::serve::fleet::{self, agent, link, update};
 use crate::serve::machines::check_name;
 
@@ -63,17 +66,19 @@ pub(crate) fn own_binary() -> io::Result<std::path::PathBuf> {
 }
 
 /// When a control plane saying `ours` pushes to a member saying `theirs`
-/// (`update::control_plane_pushes`), `binary()`'s file to it on a thread of its own
+/// (`update::control_plane_pushes`, `theirs_authority` whether that member is the
+/// fleet's authority, which follows no one), `binary()`'s file to it on a thread of its own
 /// through the link's socket `socket` (`update::push`; its
 /// connection waits in the backlog until the opener's accept loop runs).
 /// A failure is on stderr; the member's wait ends on its own.
 pub fn push_build(
     ours: &str,
     theirs: &str,
+    theirs_authority: bool,
     socket: std::path::PathBuf,
     binary: impl FnOnce() -> io::Result<std::path::PathBuf> + Send + 'static,
 ) -> Option<std::thread::JoinHandle<Result<()>>> {
-    if !update::control_plane_pushes(ours, theirs) {
+    if !update::control_plane_pushes(ours, theirs, theirs_authority) {
         return None;
     }
     let pushed = std::thread::Builder::new().name("fleet-push".into()).spawn(move || {
@@ -148,14 +153,39 @@ pub fn fleet_link_peer(peer: &str) -> Result<()> {
     run_peer(io::stdin(), io::stdout(), peer, opts)
 }
 
+/// Which ends of a peer link are the fleet's authority, the member whose key
+/// signs the membership log (`Membership::is_authority`; pure). `log` is the
+/// newest log this end holds once the key proof is through (the peer's
+/// `Proven::newer` when it carried newer entries, else this end's stored
+/// one), `ours` this end's keys (`proof::Identity::public_keys`: a pending
+/// rotation's next key too, which the log names once the rotation is in),
+/// `theirs` the key the peer proved. Neither, in no fleet's log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Authority {
+    pub ours: bool,
+    pub theirs: bool,
+}
+
+impl Authority {
+    pub fn of(log: &Stored, ours: &[PublicKey], theirs: &PublicKey) -> Authority {
+        let Some(m) = log.log.membership() else {
+            return Authority::default();
+        };
+        Authority { ours: ours.iter().any(|k| m.is_authority(k)), theirs: m.is_authority(theirs) }
+    }
+}
+
 /// What the end saying `ours` does about a peer saying `theirs` (both peer
 /// link `Hello`s, `update::hello_of`; pure): it follows `theirs` only when
-/// that says control plane and `ours` doesn't (`update::decide`, `dev_builds` as
+/// that says control plane and `ours` doesn't, and this end isn't the fleet's
+/// authority (`authority.ours`) (`update::decide`, `dev_builds` as
 /// `member.toml` says); any other pair is [`Decision::Same`] (two non-control-planes
 /// need only the frame protocol's match, which the `Hello`s checked; a control plane
-/// is followed, never follows).
-pub fn follows(ours: &str, theirs: &str, dev_builds: bool) -> Decision {
-    if update::is_control_plane(ours) || !update::is_control_plane(theirs) {
+/// is followed, never follows). The authority follows no one either:
+/// upgrading it first must neither lock it out of an older control plane nor
+/// downgrade it.
+pub fn follows(ours: &str, theirs: &str, authority: Authority, dev_builds: bool) -> Decision {
+    if authority.ours || update::is_control_plane(ours) || !update::is_control_plane(theirs) {
         return Decision::Same;
     }
     update::decide(&Build::parse(ours), &Build::parse(theirs), update::platform_of(ours), update::platform_of(theirs), dev_builds)
@@ -169,6 +199,7 @@ pub fn follows(ours: &str, theirs: &str, dev_builds: bool) -> Decision {
 pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, peer: &str, opts: PeerOptions) -> Result<()> {
     check_name(peer)?;
     let identity = fleet::proof::Identity::load(&opts.member, &crate::serve::machines::link::hostname())?;
+    let (stored, own_keys) = (identity.stored.clone(), identity.public_keys());
     let dir = opts.dir.clone();
     let socket = endpoint::fleet_socket(&dir, peer);
     // While the control plane's binary is on its way nothing but it is served.
@@ -215,8 +246,9 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
             }
         }
         update::same_fleet(peer, spec.hello, &theirs.hash).map_err(|why| anyhow!("{why}"))?;
+        let authority = Authority::of(p.newer.as_ref().unwrap_or(&stored), &own_keys, &p.key);
         let label = Build::parse(&theirs.hash).label();
-        match follows(spec.hello, &theirs.hash, (opts.follow.dev_builds)()) {
+        match follows(spec.hello, &theirs.hash, authority, (opts.follow.dev_builds)()) {
             Decision::Same => {}
             Decision::Download { build } => {
                 wanted = Some(build);
@@ -264,7 +296,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
                 .ok();
         }
         if update::is_control_plane(spec.hello) && !update::is_control_plane(&theirs.hash) {
-            push_build(spec.hello, &theirs.hash, socket.clone(), own_binary);
+            push_build(spec.hello, &theirs.hash, authority.theirs, socket.clone(), own_binary);
         }
         Ok(())
     });
@@ -571,6 +603,18 @@ mod tests {
         (k, l)
     }
 
+    /// [`ids`] with L the fleet's authority and control plane: K, an ordinary
+    /// member, follows L's build (the authority follows no one).
+    fn ids_led_by_l(base: &Path) -> (PathBuf, Identity) {
+        let (k, l) = (base.join("k-id/member.toml"), base.join("l-id/member.toml"));
+        for m in [&k, &l] {
+            std::fs::create_dir_all(m.parent().unwrap()).unwrap();
+        }
+        test_support::fleet_of("L", &[("L", &l), ("K", &k)]);
+        let l_id = Identity::load(&l, "L").unwrap();
+        (k, l_id)
+    }
+
     /// The dialer's end, faked as 7d's daemon answers it: the answerer of a
     /// peer link saying `hello`, proving `identity` (L's) and expecting `K`,
     /// each `API` stream K opens handed to the daemon in `daemon` as peer
@@ -874,20 +918,59 @@ mod tests {
     #[test]
     fn only_a_non_control_plane_follows_a_control_plane() {
         let ours = update::hello_of(false, None);
+        let member = Authority::default();
         let semver = env!("CARGO_PKG_VERSION");
         let platform = update::PLATFORM;
         let published = format!("9.9.9 abc published {platform} control_plane");
-        assert_eq!(follows(ours, &published, false), Decision::Download { build: Build::parse("9.9.9 abc published") });
-        assert_eq!(follows(ours, update::hello_of(true, None), false), Decision::Same, "the same build");
+        assert_eq!(follows(ours, &published, member, false), Decision::Download { build: Build::parse("9.9.9 abc published") });
+        assert_eq!(follows(ours, update::hello_of(true, None), member, false), Decision::Same, "the same build");
         let dev = format!("{semver} zzz dev {platform} control_plane");
-        assert_eq!(follows(ours, &dev, true), Decision::Receive);
-        assert!(matches!(follows(ours, &dev, false), Decision::Stop(_)));
+        assert_eq!(follows(ours, &dev, member, true), Decision::Receive);
+        assert!(matches!(follows(ours, &dev, member, false), Decision::Stop(_)));
         let elsewhere = format!("{semver} zzz dev other/os control_plane");
-        assert!(matches!(follows(ours, &elsewhere, true), Decision::Stop(why) if why.contains("can't run on")));
+        assert!(matches!(follows(ours, &elsewhere, member, true), Decision::Stop(why) if why.contains("can't run on")));
         // No control plane, or this end is it: nothing to follow.
-        assert_eq!(follows(ours, &published.replace(" control_plane", " member"), false), Decision::Same);
-        assert_eq!(follows(update::hello_of(true, None), &published, false), Decision::Same);
-        assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", false), Decision::Same, "a hello without the flag says no control plane");
+        assert_eq!(follows(ours, &published.replace(" control_plane", " member"), member, false), Decision::Same);
+        assert_eq!(follows(update::hello_of(true, None), &published, member, false), Decision::Same);
+        assert_eq!(follows(ours, "9.9.9 abc published linux/x86_64", member, false), Decision::Same, "a hello without the flag says no control plane");
+        // The peer being the authority changes nothing for this end.
+        assert_eq!(follows(ours, &dev, Authority { ours: false, theirs: true }, true), Decision::Receive);
+    }
+
+    /// The authority follows no one: an older or newer control plane, dev or
+    /// published, is `Same` whatever `dev-builds` says (no lockout, no
+    /// silent downgrade).
+    #[test]
+    fn the_authority_follows_no_one() {
+        let ours = update::hello_of(false, None);
+        let authority = Authority { ours: true, theirs: false };
+        let platform = update::PLATFORM;
+        for control_plane in [
+            format!("0.0.1 old published {platform} control_plane"),
+            format!("99.0.0 new published {platform} control_plane"),
+            format!("0.0.1 old dev {platform} control_plane"),
+            format!("99.0.0 new dev {platform} control_plane"),
+            format!("99.0.0 new dev other/os control_plane"),
+        ] {
+            for dev_builds in [false, true] {
+                assert_eq!(follows(ours, &control_plane, authority, dev_builds), Decision::Same, "{control_plane}, dev-builds {dev_builds}");
+            }
+        }
+        let old_dev = format!("0.0.1 old dev {platform} control_plane");
+        assert_eq!(follows(update::hello_of(true, None), &old_dev, authority, true), Decision::Same, "the authority as control plane");
+    }
+
+    #[test]
+    fn the_authority_is_whoever_the_newest_log_names() {
+        use crate::serve::fleet::identity::{Signer, SigningKey};
+        let (a, c, m) = (SigningKey::from_seed([1; 32]), SigningKey::from_seed([2; 32]), SigningKey::from_seed([3; 32]));
+        let (a_pub, c_pub, m_pub) = (a.public_key(), c.public_key(), m.public_key());
+        let log = test_support::fleet("A", &a, "C", &[("C", c_pub), ("M", m_pub)]);
+        assert_eq!(Authority::of(&log, &[a_pub], &c_pub), Authority { ours: true, theirs: false }, "the authority dials the control plane");
+        assert_eq!(Authority::of(&log, &[c_pub], &a_pub), Authority { ours: false, theirs: true }, "the control plane dialed by the authority");
+        assert_eq!(Authority::of(&log, &[m_pub], &c_pub), Authority::default(), "an ordinary member");
+        assert!(Authority::of(&log, &[m_pub, a_pub], &c_pub).ours, "a pending rotation's next key");
+        assert_eq!(Authority::of(&Stored::default(), &[a_pub], &c_pub), Authority::default(), "no fleet's log");
     }
 
     /// A control-plane dialer on a published build: K's end drops the link, installs
@@ -898,7 +981,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let control_plane: &'static str = Box::leak(format!("9.9.9 abc published {} control_plane", update::PLATFORM).into_boxed_str());
-        let (k_member, l_id) = ids(&base);
+        let (k_member, l_id) = ids_led_by_l(&base);
         let dialer = fake_dialer(dialer_io, control_plane, l_id, base.join("nowhere"), Arc::default());
         let fake = Arc::new(update::tests::Fake::building(&format!("9.9.9 abc published {}", update::PLATFORM)));
         let err = peer_link(k_io, base.clone(), k_member, fake.clone()).join().unwrap().unwrap_err();
@@ -920,7 +1003,7 @@ mod tests {
         let (dialer_io, k_io) = UnixStream::pair().unwrap();
         let control_plane: &'static str = Box::leak(format!("{} zzz dev {} control_plane", env!("CARGO_PKG_VERSION"), update::PLATFORM).into_boxed_str());
         let outlet = Arc::new(link::Outlet::default());
-        let (k_member, l_id) = ids(&base);
+        let (k_member, l_id) = ids_led_by_l(&base);
         let dialer = fake_dialer(dialer_io, control_plane, l_id, base.join("nowhere"), Arc::clone(&outlet));
         let fake = Arc::new(update::tests::Fake::building(control_plane.trim_end_matches(" control plane")));
         let k_end = peer_link(k_io.try_clone().unwrap(), base.clone(), k_member, fake.clone());

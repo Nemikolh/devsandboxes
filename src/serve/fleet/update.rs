@@ -1,5 +1,6 @@
 //! A fleet worker follows its control plane's version (docs/architecture/daemon/fleet.md,
-//! *Versions*; ADR 0042). Each end of the fleet link says its build in its
+//! *Versions*; ADR 0042); the fleet's authority, like the control plane, follows
+//! no one (`commands::fleet_link::follows`). Each end of the fleet link says its build in its
 //! `Hello` ([`HELLO`]: semver, git hash, `published` or `dev`, platform);
 //! the worker compares the control plane's with its own ([`decide`], pure) before it
 //! serves anything. A published control-plane build that differs (a downgrade
@@ -207,9 +208,12 @@ pub fn decide(ours: &Build, control_plane: &Build, our_platform: &str, control_p
 /// Whether a control plane saying `control_plane` pushes its binary to a worker saying `worker`
 /// (both `Hello` hashes): when that worker, taking dev builds, would
 /// [`Decision::Receive`] it. A worker with `dev-builds` off refuses the link
-/// before the push opens, so the control plane needn't know.
-pub fn control_plane_pushes(control_plane: &str, worker: &str) -> bool {
-    decide(&Build::parse(worker), &Build::parse(control_plane), platform_of(worker), platform_of(control_plane), true) == Decision::Receive
+/// before the push opens, so the control plane needn't know. Never to the
+/// fleet's authority (`worker_authority`): it follows no one, so it waits for
+/// no binary and the push would land on an ordinary `TRANSFER`.
+pub fn control_plane_pushes(control_plane: &str, worker: &str, worker_authority: bool) -> bool {
+    !worker_authority
+        && decide(&Build::parse(worker), &Build::parse(control_plane), platform_of(worker), platform_of(control_plane), true) == Decision::Receive
 }
 
 /// The control plane's end of a dev build's update: `binary` (this process's own) as
@@ -653,7 +657,7 @@ pub(crate) mod tests {
         );
         assert!(matches!(decide(&ours, &newer, "unknown", "linux/x86_64", true), Decision::Stop(_)), "no platform word");
         assert_eq!(decide(&ours, &ours.clone(), "macos/x86_64", "linux/x86_64", false), Decision::Same, "the same build needs none");
-        assert!(!control_plane_pushes("0.9.0 bbbb published linux/x86_64", "0.8.0 aaaa published macos/x86_64"), "nothing to push");
+        assert!(!control_plane_pushes("0.9.0 bbbb published linux/x86_64", "0.8.0 aaaa published macos/x86_64", false), "nothing to push");
         assert_eq!(platform_target("linux/aarch64"), Some("aarch64-unknown-linux-musl"));
         assert_eq!((platform_target("macos/x86_64"), platform_target("unknown"), platform_target("")), (None, None, None));
     }
@@ -681,11 +685,14 @@ pub(crate) mod tests {
     #[test]
     fn the_control_plane_pushes_to_a_worker_that_would_receive() {
         let control_plane = "0.8.0 dddd dev linux/x86_64";
-        assert!(control_plane_pushes(control_plane, "0.8.0 aaaa published linux/x86_64"));
-        assert!(control_plane_pushes(control_plane, "0.7.0 eeee dev linux/x86_64"));
-        assert!(!control_plane_pushes(control_plane, control_plane), "the same build");
-        assert!(!control_plane_pushes(control_plane, "0.8.0 aaaa published macos/aarch64"), "another platform");
-        assert!(!control_plane_pushes("0.8.0 dddd published linux/x86_64", "0.7.0 eeee dev linux/x86_64"), "a release is downloaded");
+        assert!(control_plane_pushes(control_plane, "0.8.0 aaaa published linux/x86_64", false));
+        assert!(control_plane_pushes(control_plane, "0.7.0 eeee dev linux/x86_64", false));
+        assert!(!control_plane_pushes(control_plane, control_plane, false), "the same build");
+        assert!(!control_plane_pushes(control_plane, "0.8.0 aaaa published macos/aarch64", false), "another platform");
+        assert!(!control_plane_pushes("0.8.0 dddd published linux/x86_64", "0.7.0 eeee dev linux/x86_64", false), "a release is downloaded");
+        // The authority follows no one: nothing is pushed to it, older or newer.
+        assert!(!control_plane_pushes(control_plane, "0.7.0 eeee dev linux/x86_64", true), "an older authority");
+        assert!(!control_plane_pushes(control_plane, "0.9.0 ffff dev linux/x86_64", true), "a newer authority");
     }
 
     #[test]

@@ -293,7 +293,8 @@ one's while its neighbor is up.
   nothing yet (waiting for the control plane's build), and returns why it ended,
   with ssh's stderr tail (where the far end's refusal is, such as a name
   clash: [inbound neighbors](#inbound-neighbors) there). A control-plane machine on
-  another build is followed first ([fleet](fleet.md#versions)). An
+  another build is followed first, unless this host is the fleet's
+  authority ([fleet](fleet.md#versions)). An
   inbound machine's carrier is the `fleet-link --peer <name>` that
   announced it: no thread of its own (`service::carried`).
 - **The link.** Once the carrier is up (always, for an inbound machine)

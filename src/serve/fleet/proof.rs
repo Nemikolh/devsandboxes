@@ -99,6 +99,12 @@ impl Identity {
         Ok(Identity { name, key, stored, next })
     }
 
+    /// This member's public keys: its key's, then a pending rotation's next
+    /// key's (what a log names it by once the rotation is in).
+    pub fn public_keys(&self) -> Vec<PublicKey> {
+        std::iter::once(&self.key).chain(&self.next).map(|k| k.public_key()).collect()
+    }
+
     /// The key to prove with against `merged` (the log after this link's
     /// sync): the pending next one when `merged` lists this host under it,
     /// else the key. A routed stream's destination proves with the key

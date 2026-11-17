@@ -33,14 +33,17 @@
 //!
 //! Versions follow the hello's control-plane flag (fleet plan decision 25,
 //! `commands::fleet_link::follows`): a machine that is the control plane while this
-//! host isn't is followed before anything is served. Another published
+//! host isn't, and this host isn't the fleet's authority (`fleet_link::Authority`, by
+//! the newest log after the proof), is followed before anything is served. Another published
 //! build is downloaded, installed and handed off to (`update::update`),
 //! the link refused meanwhile; another dev build for this platform, with
 //! `member.toml`'s `dev-builds` on or trust `full`, keeps the link up
 //! serving only the `binary` transfer the control plane pushes, then installs it and
 //! hands off (`update::install_received`). This host, the control plane, pushes its
 //! dev build to a machine that would take it (`fleet_link::push_build`
-//! through `fleet-<entry>.sock`). Two non-control-planes follow nothing.
+//! through `fleet-<entry>.sock`), never to the authority. Two non-control-planes
+//! follow nothing; the authority follows no one, so upgrading it first neither
+//! locks it out of an older control plane nor downgrades it.
 //!
 //! The link's socket is bound as `link::Socket` binds one (the newest
 //! binder wins), so after a version handoff the next daemon's links take
@@ -231,6 +234,7 @@ impl Dialer {
         let spec = link::Spec { hello: ours, ..LINK };
         let wanted: Mutex<Option<Build>> = Mutex::new(None);
         let mut end_link = duplex.stream.try_clone().ok().map(follow::shutting);
+        let (stored, own_keys) = (identity.stored.clone(), identity.public_keys());
         let auth = proof::Auth { identity, expect: name.to_string(), log: self.log };
         let endpoint = link::Endpoint { socket: Some(&socket), serves, outlet: None, auth: Some(auth) };
         let end = link::answerer_with(
@@ -252,8 +256,9 @@ impl Dialer {
                     }
                 }
                 update::same_fleet(name, ours, &peer.hash)?;
+                let authority = fleet_link::Authority::of(p.newer.as_ref().unwrap_or(&stored), &own_keys, &p.key);
                 let label = Build::parse(&peer.hash).label();
-                match fleet_link::follows(ours, &peer.hash, (self.follow.dev_builds)()) {
+                match fleet_link::follows(ours, &peer.hash, authority, (self.follow.dev_builds)()) {
                     Decision::Same => {}
                     Decision::Download { build } => {
                         *wanted.lock().unwrap() = Some(build);
@@ -272,7 +277,7 @@ impl Dialer {
                     }
                 }
                 if update::is_control_plane(ours) {
-                    fleet_link::push_build(ours, &peer.hash, socket.clone(), fleet_link::own_binary);
+                    fleet_link::push_build(ours, &peer.hash, authority.theirs, socket.clone(), fleet_link::own_binary);
                 }
                 held.up();
                 (self.linked)(name);
@@ -1326,7 +1331,8 @@ pub(crate) mod tests {
         crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
         let box_member = base.join("box-data/member.toml");
         std::fs::create_dir_all(box_member.parent().unwrap()).unwrap();
-        test_support::fleet_of("box", &[("lap", &base.join("member.toml")), ("box", &box_member)]);
+        // box the authority: lap, an ordinary member, follows it.
+        test_support::fleet_of("box", &[("box", &box_member), ("lap", &base.join("member.toml"))]);
         let hello: &'static str = Box::leak(format!("9.9.9 abc published {} control_plane", update::PLATFORM).into_boxed_str());
         let transport = Transport::new(move |_, _| {
             let (ours, theirs) = UnixStream::pair()?;

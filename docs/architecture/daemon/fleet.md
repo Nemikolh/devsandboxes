@@ -1476,7 +1476,8 @@ there only through the trust table.
 
 A member follows its control plane's exact build, an older one included
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
-on a [peer link](#peer-links), whichever end dialed (decision 25):
+on a [peer link](#peer-links), whichever end dialed (decision 25); the
+fleet's authority, like the control plane, follows no one:
 
 - **The build in the `Hello`.** A peer link's `hello` is
   `update::hello_of(control_plane, fleet)`: `fleet::update::HELLO`, `<semver> <git>
@@ -1519,10 +1520,19 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   [Control-plane mode](#control-plane-mode)'s change of `control_plane` ends the links so both ends
   say the new one.
 - **Who follows** (`commands::fleet_link::follows`, pure, over both
-  `Hello`s): the end that isn't the control plane follows a control-plane peer through
+  `Hello`s and `commands::fleet_link::Authority`): the end that is neither the
+  control plane nor the authority follows a control-plane peer through
   `update::decide`; two non-control-planes only need the frame protocol's match; a
-  control plane never follows. The dialed end runs it in `run_peer`'s `on_ready`,
-  the dialer (`fleet::dialer`) in the answerer's.
+  control plane never follows, and neither does the authority, so upgrading the
+  authority first neither locks it out of an older control plane (`Stop` on a dev
+  build) nor downgrades it (`Download`, `Receive`). Which ends are the authority
+  (`Authority::of`) is read off the newest log the end holds once the
+  [key proof](#key-proof) is through (`proof::Proven`'s `newer`, else the
+  identity's stored log): its authority key (`Membership::is_authority`)
+  against this end's keys (`proof::Identity::public_keys`, a pending
+  rotation's next key included) and the key the peer proved. The dialed end
+  runs it in `run_peer`'s `on_ready`, the dialer (`fleet::dialer`) in the
+  answerer's.
 - **The decision** (`update::decide`, pure, over this build and
   platform, the control plane's, and whether this host takes dev builds:
   `member.toml`'s `dev-builds`, or trust `full`
@@ -1544,7 +1554,8 @@ on a [peer link](#peer-links), whichever end dialed (decision 25):
   stream; `Receive` keeps it up serving only the control plane's binary.
 - **The push**: the control plane's end, once the `Hello`s are through, pushes its
   own binary when `update::control_plane_pushes` (over both `Hello`s: the member,
-  taking dev builds, would `Receive`), from a thread of its own
+  taking dev builds, would `Receive`; never to the authority, which waits for
+  no binary, so a push would land on an ordinary `TRANSFER`), from a thread of its own
   (`commands::fleet_link::push_build`): `update::push`, one `binary`
   transfer named `devsandbox` through `fleet-<member>.sock`.
   On a dialed control plane the binary is the `fleet-link` process's
