@@ -1,6 +1,13 @@
+> Archived 2026-11-17. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/runtimes.md#gpus](../../architecture/runtimes.md#gpus),
+> [architecture/daemon/fleet.md#placement](../../architecture/daemon/fleet.md#placement),
+> [ADR 0055](../../decisions/0055-gpus-follow-the-devcontainer-spec-and-a-required-one-refuses.md),
+> [ADR 0056](../../decisions/0056-a-gpu-is-placed-where-a-worker-lends-one.md)
+
 # GPUs
 
-Status: agreed, in progress (steps below).
+Status: shipped (c121bc0, 06bf906, 6951613, 91aebf5, 7663a16, 58f8e67,
+2c25b8b, 855d759, c308945).
 
 No sandbox can use a GPU today. `runArgs` (where a devcontainer puts
 `--gpus all`) and `hostRequirements` (`gpu`) parse but are ignored with a
@@ -45,7 +52,7 @@ has a GPU and lends it.
    `machine add` asks and applies them on the target through its own ssh
    session.
 
-Out of scope: gVisor (`runsc --nvproxy`, see [isolation](isolation.md)),
+Out of scope: gVisor (`runsc --nvproxy`, see [isolation](../active/isolation.md)),
 GPU checkpointing (see [sandbawks-ideas](../explore/sandbawks-ideas.md)),
 GPU CI (a self-hosted runner, later).
 

@@ -12,10 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **runtimes**: GPUs through the devcontainer spec's
-  `hostRequirements.gpu` (sandboxes and services), placement onto workers
-  that lend one, and allowances set at `machine add`.
-  → [plan](plans/active/gpus.md)
+Nothing.
 
 ## Planned
 
@@ -118,6 +115,18 @@ is frozen: no new work on it.
 
 ## Parked
 
+- **runtimes**: GPU CI: a job on a self-hosted GPU runner running a
+  sandbox and a service with `hostRequirements.gpu` on docker, rootless
+  docker and podman, behind a test gate of its own (the `CI` rule would
+  fail every other job). → [ADR 0055](decisions/0055-gpus-follow-the-devcontainer-spec-and-a-required-one-refuses.md)
+- **runtimes**: GPU device selection (some GPUs, not every one), other
+  vendors, and GPUs under gVisor (`runsc --nvproxy`,
+  [isolation](plans/active/isolation.md)).
+- **machines**: `machine add` asking what this host lends too when it
+  joins the target's fleet or starts one with it (today it only prints a
+  `devsandbox machine allow` hint); `machine add`'s `--allow` flags name
+  the target's allowances. → [ADR 0056](decisions/0056-a-gpu-is-placed-where-a-worker-lends-one.md);
+  `commands::machine::own_allow_hint`
 - **machines**: compacting superseded `Op::Build` entries out of the
   membership log; keeping the previous binary and rolling back when a
   pinned build can't link within some minutes; pinning a build made on

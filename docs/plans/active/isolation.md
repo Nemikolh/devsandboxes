@@ -43,7 +43,7 @@ it refuses the `run`, never falls back silently.
   require it for placed work.
 - **What runsc changes**: networking is its own netstack by default
   (`--network=host` is the opt-out); GPUs need `--nvproxy` and a supported
-  host driver ([gpus](gpus.md)); `runsc checkpoint|restore` exists, which
+  host driver ([GPUs](../../architecture/runtimes.md#gpus)); `runsc checkpoint|restore` exists, which
   runc can't do for fleet step 14 ([fleet](fleet.md)).
 - **Cost**: CPU-bound work is near native; syscall-heavy work (`git
   status` on big trees, `npm install`, many forks) is noticeably slower;

@@ -1422,7 +1422,7 @@ step 12 does.
     (`[allow] gpus = true`, or `trust = "full"`), a required GPU is
     placed only there, and it stops being a tie. Nothing in it needs a
     host path, so 41's open question doesn't block it
-    ([gpus](gpus.md)).
+    ([ADR 0056](../../decisions/0056-a-gpu-is-placed-where-a-worker-lends-one.md)).
 
 ## Open questions
 

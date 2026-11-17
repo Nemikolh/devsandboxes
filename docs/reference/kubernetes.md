@@ -38,7 +38,7 @@ runtime.
 | `restartPolicy` | `autostart = "runtime"` (the runtime's restart policy where the backend has one) or `true` (the daemon's once-per-boot pass) | `commands::autostart`, `Backend::set_restart_policy` |
 | CRI, containerd | the `Backend` trait over docker, podman and Apple `container`; differences are capabilities ([ADR 0012](../decisions/0012-runtime-differences-are-backend-capabilities.md)) | `runtime::Backend`; [runtimes.md](../architecture/runtimes.md) |
 | RuntimeClass | none ([isolation](../plans/active/isolation.md)) | |
-| Device plugins, extended resources | none ([gpus](../plans/active/gpus.md)) | |
+| Device plugins, extended resources | GPUs only: `hostRequirements.gpu`, a worker's capacity report says whether it lends one, placement filters on it | `runtime::gpu`, `place::gpu_check`; [ADR 0056](../decisions/0056-a-gpu-is-placed-where-a-worker-lends-one.md) |
 | CNI | per-instance (or per-root, `global`) networks on one host | `commands::services`, `commands::subnet`; [Networks](../architecture/instances/services.md#networks) |
 | Service, kube-proxy | none across machines ([mesh services](../plans/active/mesh-services.md)); on one host a service is reached by its network alias | [Reaching a service](../architecture/instances/services.md#reaching-a-service) |
 | `kubectl port-forward` | the daemon's forwards (ad-hoc and `forwardPorts`) and `devsandbox port`, tunnelled through the helper, over `TUNNEL` streams to another machine | `serve::forwards`, `commands::port`, `commands::tunnel`; [forwards.md](../architecture/daemon/forwards.md) |
