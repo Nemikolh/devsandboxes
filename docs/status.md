@@ -31,11 +31,6 @@ is frozen: no new work on it.
   recovery key made at genesis, a scoped, expiring delegation to the
   control plane (`members`, `configs`); then machine → node.
   → [plan](plans/active/control-plane.md)
-- **machines**: a host behind the fleet's pinned build (another
-  platform, no release asset, dev builds not taken) links anyway, but only
-  its log says so (`Decision::Behind`): `machine ls` and the dashboard
-  header don't show `behind: <why>` yet.
-  → [plan](plans/active/authority-sets-fleet-version.md)
 - **machines**: fleet-wide `global` services: one container per signed
   root's service, reached from any member over the links.
   → [plan](plans/active/mesh-services.md)

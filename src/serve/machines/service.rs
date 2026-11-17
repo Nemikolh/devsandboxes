@@ -82,6 +82,7 @@ use super::saved;
 use super::ssh::{Dial, Duplex, RouteDial};
 use crate::serve::api::ApiError;
 use crate::serve::endpoint::Stream;
+use crate::serve::fleet::update::Behind;
 use crate::serve::proto::Response;
 use crate::serve::snapshots::{self, LinkState, Remotes};
 
@@ -248,6 +249,9 @@ struct Carrier {
     generation: u64,
     /// Why it's down; `None` before its first attempt ended.
     why: Option<String>,
+    /// Who is behind the fleet's pinned build on it ([`Held::behind`]),
+    /// until it ends.
+    behind: Behind,
     /// Its transport's socket while one is open, to shut it down.
     stream: Option<Stream>,
 }
@@ -320,6 +324,13 @@ impl Held<'_> {
     pub fn up(&self) {
         self.came_up.store(true, Ordering::SeqCst);
         self.set(true, None);
+    }
+
+    /// Who is behind the fleet's pinned build on this carrier, as its
+    /// decision says (before [`Held::up`]): the machine shows it while
+    /// connected, beside its state.
+    pub fn behind(&self, behind: Behind) {
+        lock(&self.ctl.carrier).behind = behind;
     }
 
     /// The carrier is connected but serves nothing yet, with why (it
@@ -816,6 +827,7 @@ fn carry(entry: &Entry, inner: &Inner, ctl: &Ctl, tx: &Sender<Cmd>) {
             let mut c = lock(&ctl.carrier);
             c.up = false;
             c.why = Some(why.clone());
+            c.behind = Behind::default();
             c.stream = None;
         }
         let _ = tx.send(Cmd::Wake);
@@ -904,7 +916,7 @@ impl<'a> LinkLoop<'a> {
                     let remote = link.remote().version.clone();
                     self.inner.remotes.update(&self.entry.name, |m| m.version = Some(remote));
                     self.inner.rows_changed();
-                    self.set(LinkState::Connected, None);
+                    self.set_up();
                     let end = self.serve(&mut link, rx);
                     self.ctl.hold(None);
                     drop(link);
@@ -997,6 +1009,18 @@ impl<'a> LinkLoop<'a> {
     fn set(&self, state: LinkState, error: Option<String>) {
         let mut moved = false;
         self.inner.remotes.update(&self.entry.name, |m| moved = m.set_link(state, error));
+        if moved {
+            (self.inner.hooks.changed)();
+        }
+    }
+
+    /// Connected, with who is behind on the link: an ssh machine's as its
+    /// carrier's decision said ([`Held::behind`]), an inbound one's as its
+    /// `fleet-link`'s announce did (`inbound::Neighbor::behind`).
+    fn set_up(&self) {
+        let behind = if carried(&self.entry) { lock(&self.ctl.carrier).behind.clone() } else { self.inner.inbound.behind(&self.entry.name) };
+        let mut moved = false;
+        self.inner.remotes.update(&self.entry.name, |m| moved = m.set_up(behind));
         if moved {
             (self.inner.hooks.changed)();
         }
@@ -1485,7 +1509,7 @@ mod tests {
         let registry = base.join("machines.toml");
         crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("s", "me@s"))).unwrap();
         let neighbors: Arc<inbound::Neighbors> = Arc::default();
-        let guard = neighbors.announce("w", "0.6.0 abc dev x/y member", false);
+        let guard = neighbors.announce("w", "0.6.0 abc dev x/y member", false, Default::default());
         let up = Arc::new(AtomicBool::new(false));
         let dials = Arc::new(Mutex::new(Vec::new()));
         let dial: Dial = {
@@ -1640,7 +1664,7 @@ mod tests {
     fn an_inbound_neighbors_roots_are_its_links_listing() {
         let base = short_scratch("roots");
         let neighbors: Arc<inbound::Neighbors> = Arc::default();
-        let guard = neighbors.announce("w", "0.6.0 abc dev x/y member", false);
+        let guard = neighbors.announce("w", "0.6.0 abc dev x/y member", false, Default::default());
         let (dials, calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())));
         let listed = Arc::new(Mutex::new(vec!["/r".to_string()]));
         let dial: Dial = {

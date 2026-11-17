@@ -226,6 +226,10 @@ pub struct Machine {
     pub listed: bool,
     pub state: LinkState,
     pub error: Option<String>,
+    /// Who is behind the fleet's pinned build on its link, as the link's
+    /// decision said when it came up (`fleet::update::Behind`: `here` this
+    /// host, `peer` it); no one while it isn't connected.
+    pub behind: crate::serve::fleet::update::Behind,
     /// Its devsandbox semver, from the last hello.
     pub version: Option<String>,
     /// Remote root → the last `instances.snapshot` params it pushed. Kept
@@ -254,8 +258,22 @@ impl Machine {
     /// Record the link's `state` and `error`; whether what's shown changed.
     /// A [`restored`](Self::restored) machine shows `unreachable` with the
     /// rows' time until the link connects; meanwhile `connecting` changes
-    /// nothing, so a retrying link doesn't flap.
+    /// nothing, so a retrying link doesn't flap. A link not connected has
+    /// no one [`behind`](Self::behind).
     pub fn set_link(&mut self, state: LinkState, error: Option<String>) -> bool {
+        let behind = state != LinkState::Connected && std::mem::take(&mut self.behind) != Default::default();
+        self.set_state(state, error) || behind
+    }
+
+    /// [`Self::set_link`] connected, `behind` who is behind on the link.
+    pub fn set_up(&mut self, behind: crate::serve::fleet::update::Behind) -> bool {
+        let moved = self.set_state(LinkState::Connected, None);
+        let behind_moved = self.behind != behind;
+        self.behind = behind;
+        moved || behind_moved
+    }
+
+    fn set_state(&mut self, state: LinkState, error: Option<String>) -> bool {
         let (state, error) = match (self.restored, state) {
             (false, _) => (state, error),
             (true, LinkState::Connected) => {
@@ -356,6 +374,15 @@ pub struct SnapshotMachine {
     pub target: Option<String>,
     pub state: LinkState,
     pub error: Option<String>,
+    /// Why it is behind the fleet's pinned build while connected (its link
+    /// works; `fleet::update::peer_behind`), else `None`.
+    #[serde(default)]
+    pub behind: Option<String>,
+    /// Why this host is behind the fleet's pinned build, as its link to this
+    /// machine decided (`None` on one seen through the control plane: that
+    /// would be the control plane's).
+    #[serde(default)]
+    pub behind_here: Option<String>,
     pub version: Option<String>,
     /// The remote's runtime (`runtime_name`), once a snapshot came.
     pub runtime: Option<String>,
@@ -575,7 +602,9 @@ fn lift(m: &mut SnapshotMachine, control_plane: &Machine) {
     m.via = Some(control_plane.name.clone());
     m.target = None;
     m.command = None;
+    m.behind_here = None;
     if control_plane.state != LinkState::Connected {
+        m.behind = None;
         let why = control_plane.error.as_deref().unwrap_or(control_plane.state.as_str());
         m.state = match control_plane.state {
             LinkState::Idle => LinkState::Connecting,
@@ -606,6 +635,8 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         target: m.target.clone(),
         state: m.state,
         error: m.error.clone(),
+        behind: m.behind.peer.clone(),
+        behind_here: m.behind.here.clone(),
         version: m.version.clone(),
         runtime,
         command: m.command.clone(),
@@ -784,6 +815,8 @@ pub(crate) mod tests {
         });
         let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connected);
         a.version = Some("0.6.1".into());
+        // Behind, and this host behind, as its link decided.
+        a.set_up(crate::serve::fleet::update::Behind { here: Some("here why".into()), peer: Some("its why".into()) });
         // Every root's snapshot lists all of the machine's instances, and
         // carries its host's capacity.
         let all = [("in-one", Some("/r/one")), ("in-two", Some("/r/two")), ("orphan", Some("/r/gone")), ("old", None)];
@@ -825,10 +858,10 @@ pub(crate) mod tests {
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap, "via": null, "exposed_by": null},
-                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
-                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null, "via": null, "exposed_by": null},
-                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "behind": "its why", "behind_here": "here why", "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap, "via": null, "exposed_by": null},
+                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "behind": null, "behind_here": null, "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "behind": null, "behind_here": null, "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "behind": null, "behind_here": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
             ])
         );
         crate::serve::dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
@@ -861,7 +894,7 @@ pub(crate) mod tests {
     fn control_plane_push() -> Value {
         let entry = |name: &str, via: Option<&str>| {
             serde_json::json!({"name": name, "kind": "ssh", "target": format!("me@{name}"), "state": "connected", "error": null,
-                "version": "0.6.0", "runtime": "docker", "command": "~/ds", "agent": true, "capacity": null, "via": via})
+                "behind": "its why", "behind_here": "the control plane's why", "version": "0.6.0", "runtime": "docker", "command": "~/ds", "agent": true, "capacity": null, "via": via})
         };
         serde_json::json!({
             "dir": "/fleet/me", "runtime_name": "docker",
@@ -904,6 +937,8 @@ pub(crate) mod tests {
         let x = &merged["machines"][1];
         assert_eq!((&x["name"], &x["via"], &x["target"], &x["command"], &x["agent"]), (&"x".into(), &"k".into(), &Value::Null, &Value::Null, &false.into()));
         assert_eq!((&x["state"], &x["version"], &x["kind"]), (&"connected".into(), &"0.6.0".into(), &"routed".into()));
+        // Behind as the control plane's link to it says; the control plane's own word isn't this host's.
+        assert_eq!((&x["behind"], &x["behind_here"]), (&"its why".into(), &Value::Null));
         assert_eq!(merged["machines"][0]["via"], Value::Null);
         crate::serve::dts::assert_matches("SnapshotMachine", x);
         assert_eq!((&merged["machines"][0]["exposed_by"], &x["exposed_by"]), (&Value::Null, &Value::Null));
@@ -933,6 +968,24 @@ pub(crate) mod tests {
         let merged = merge(&local, &[k], None, &Default::default(), &Default::default());
         assert_eq!(names(&merged, "instances"), ["control-plane-own@k", "xi@x"]);
         assert_eq!((&merged["machines"][1]["state"], &merged["machines"][1]["error"]), (&"unreachable".into(), &"through k: ssh: no route".into()));
+        assert_eq!(merged["machines"][1]["behind"], Value::Null, "not connected: no one behind");
+    }
+
+    /// Who is behind is a connected link's word: kept while up, gone with it.
+    #[test]
+    fn behind_lasts_while_the_link_is_up() {
+        use crate::serve::fleet::update::Behind;
+        let behind = Behind { here: None, peer: Some("dev build: not taken".into()) };
+        let mut m = machine("m", &[], LinkState::Connecting);
+        assert!(m.set_up(behind.clone()), "connected, behind");
+        assert!(!m.set_up(behind.clone()), "no change");
+        assert!(m.set_up(Behind::default()), "no longer behind");
+        assert!(m.set_up(behind.clone()));
+        assert!(m.set_link(LinkState::Unreachable, Some("lost".into())));
+        assert_eq!(m.behind, Behind::default());
+        m.set_up(behind.clone());
+        assert!(!m.set_link(LinkState::Connected, None), "connected stays behind");
+        assert_eq!(m.behind, behind);
     }
 
     /// The routed machines: the graph's members (a path's first hop, or

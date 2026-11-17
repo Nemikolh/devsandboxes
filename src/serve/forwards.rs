@@ -2178,7 +2178,7 @@ forwardPorts = ["redis:6379"]
         assert!(d.rows(None, true).is_empty(), "gone with it");
         let into_nb = || AddRequest { machine: Some("nb".into()), ..remote_request() };
         assert_eq!(d.add(into_nb()).unwrap_err().code, "not-found", "no neighbor `nb` yet");
-        let up = inbound.announce("nb", "v", false);
+        let up = inbound.announce("nb", "v", false, Default::default());
         d.add(into_nb()).unwrap();
         d.drop_unregistered();
         assert_eq!(d.rows(None, true).len(), 1, "a neighbor's forward lasts while it's up");

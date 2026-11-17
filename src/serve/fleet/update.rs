@@ -241,6 +241,39 @@ pub enum Decision {
     Behind(String),
 }
 
+impl Decision {
+    /// Why this host is behind, on [`Decision::Behind`].
+    pub fn behind(&self) -> Option<&str> {
+        match self {
+            Decision::Behind(why) => Some(why),
+            _ => None,
+        }
+    }
+}
+
+/// Who is behind the fleet's pin on one peer link, as that link's end sees
+/// it from both `Hello`s: this host ([`decide`]'s [`Decision::Behind`]) and
+/// the peer ([`peer_behind`]), each with why. A behind link is still up: it
+/// is served as on [`Decision::Same`] (docs/architecture/daemon/fleet.md,
+/// *Versions*).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Behind {
+    pub here: Option<String>,
+    pub peer: Option<String>,
+}
+
+/// Why the peer saying `theirs` is behind the fleet's `pin` on its link to
+/// the end saying `ours` (pure): [`decide`] over the peer's own `Hello`, its
+/// dev builds as its eighth word says ([`takes_dev_builds`]), and the
+/// mirrored `authority`, as [`pushes`] mirrors it; `None` when it isn't.
+pub fn peer_behind(pin: Option<&Pin>, ours: &str, theirs: &str, authority: Authority) -> Option<String> {
+    let mirrored = Authority { ours: authority.theirs, theirs: authority.ours };
+    match decide(theirs, takes_dev_builds(theirs), mirrored, pin, ours) {
+        Decision::Behind(why) => Some(why),
+        _ => None,
+    }
+}
+
 /// Whether a `Hello` hash says release `semver`: published, that semver.
 fn on_release(hello: &str, semver: &str) -> bool {
     let build = Build::parse(hello);
@@ -1076,6 +1109,52 @@ pub(crate) mod tests {
                     for y in &hellos {
                         let receives = decide(y, takes_dev_builds(y), flip(a), Some(&pin), x) == Decision::Receive;
                         assert_eq!(pushes(Some(&pin), x, y, a).is_some(), receives, "{pin} {a:?}: {x} → {y}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each end says the other behind exactly when the other's own
+    /// decision does: both from the `Hello`s alone.
+    #[test]
+    fn each_end_knows_whether_the_peer_is_behind() {
+        let pin = dev_pin(7);
+        let has = sha_word(&[7; 32]);
+        let on_it = hello("0.8.0 dddd dev", LX, &has, false);
+        let mac = hello("0.8.0 dddd dev", "macos/aarch64", "1111111111111111", true);
+        let elsewhere = format!("dev build: can't run on macos/aarch64 (the fleet's build is {pin})");
+        assert_eq!(peer_behind(Some(&pin), &on_it, &mac, MEMBER), Some(elsewhere.clone()));
+        assert_eq!(peer_behind(Some(&pin), &mac, &on_it, MEMBER), None, "the other way: on it");
+        assert_eq!(decide(&mac, true, MEMBER, Some(&pin), &on_it).behind(), Some(elsewhere.as_str()), "the behind end's own word");
+        // Its dev builds as its `Hello` says.
+        let nodev = hello("0.7.0 eeee dev", LX, "1111111111111111", false);
+        assert!(peer_behind(Some(&pin), &on_it, &nodev, MEMBER).unwrap().starts_with("dev build: not taken"));
+        assert_eq!(peer_behind(Some(&pin), &on_it, &hello("0.7.0 eeee dev", LX, "1111111111111111", true), MEMBER), None, "it takes it");
+        assert_eq!(peer_behind(Some(&pin), &on_it, &mac, TO_AUTHORITY), None, "the authority is never behind");
+        assert_eq!(peer_behind(None, &on_it, &mac, MEMBER), None, "no pin");
+        assert_eq!(Decision::Same.behind(), None);
+
+        // Symmetry with `decide`, as `pushes`' test.
+        let mut hellos = Vec::new();
+        for build in ["0.8.0 dddd dev", "0.9.0 aaaa published"] {
+            for platform in [LX, "macos/aarch64", "other/os"] {
+                for sha in ["1111111111111111", has.as_str()] {
+                    for dev in [false, true] {
+                        hellos.push(hello(build, platform, sha, dev));
+                    }
+                }
+            }
+        }
+        let flip = |a: Authority| Authority { ours: a.theirs, theirs: a.ours };
+        for pin in [dev_pin(7), published_pin("0.9.0")] {
+            for a in [MEMBER, TO_AUTHORITY, AUTHORITY] {
+                for x in &hellos {
+                    for y in &hellos {
+                        let theirs = decide(y, takes_dev_builds(y), flip(a), Some(&pin), x);
+                        assert_eq!(peer_behind(Some(&pin), x, y, a).as_deref(), theirs.behind(), "{pin} {a:?}: {x} sees {y}");
+                        let ours = decide(x, takes_dev_builds(x), a, Some(&pin), y);
+                        assert_eq!(peer_behind(Some(&pin), y, x, flip(a)).as_deref(), ours.behind(), "{pin} {a:?}: {y} sees {x}");
                     }
                 }
             }

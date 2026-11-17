@@ -44,7 +44,9 @@
 //! update lock (`update::under_lock`). This host, having the pin, pushes it
 //! to a machine that would take it (`fleet_link::push_build` through
 //! `fleet-<entry>.sock`). A host that can't or won't take the pin is
-//! behind: the link is served, why logged. The authority follows no one.
+//! behind: the link is served, why logged, and who is behind on it (this
+//! host, the machine: `update::Behind`) goes to the machine's state
+//! (`service::Held::behind`). The authority follows no one.
 //!
 //! The link's socket is bound as `link::Socket` binds one (the newest
 //! binder wins), so after a version handoff the next daemon's links take
@@ -267,6 +269,10 @@ impl Dialer {
                 let authority = fleet_link::Authority::of(log, &own_keys, &p.key);
                 let pin = fleet_link::pinned(log);
                 let decision = update::decide(ours, (self.follow.dev_builds)(), authority, pin.as_ref(), &peer.hash);
+                let behind = update::Behind {
+                    here: decision.behind().map(str::to_string),
+                    peer: update::peer_behind(pin.as_ref(), ours, &peer.hash, authority),
+                };
                 let (decision, lock, busy) = update::under_lock(decision, dir);
                 if let Some(why) = busy {
                     (self.log)(&format!("machine {name}: {why}"));
@@ -293,6 +299,7 @@ impl Dialer {
                     (Decision::Receive, None) => unreachable!("`decide` receives only a pin"),
                 }
                 fleet_link::push_build(pin.as_ref(), ours, &peer.hash, authority, socket.clone(), &self.follow.builds);
+                held.behind(behind);
                 held.up();
                 (self.linked)(name, &peer.hash);
                 Ok(())
@@ -1389,6 +1396,44 @@ pub(crate) mod tests {
         assert!(connect(&dir).call("shutdown", json!({})).unwrap().error.is_none());
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dev pin for another platform than box's: box is behind and the
+    /// link works anyway. lap (the authority, the dialer) shows box
+    /// `connected` and behind; box shows lap connected and itself behind,
+    /// as its `fleet-link`'s announce said; both with why.
+    #[test]
+    fn a_behind_machine_is_up_and_both_ends_say_so() {
+        let pin = crate::serve::fleet::membership::Pin::Dev { semver: "9.9.9".into(), git: "zzz".into(), platform: "other/os".into(), sha256: [7; 32] };
+        let pinned = pin.clone();
+        let pair = Pair::build("dial-behind-pin", Vec::new(), |_| {}, |_| {}, move |k_member, l_member| {
+            let mut stored = test_support::fleet_of("box", &[("lap", l_member), ("box", k_member)]);
+            stored.log.append(crate::serve::fleet::membership::Op::Build { version: 1, pin: pinned }, "lap", &test_support::key_of(l_member)).unwrap();
+            for m in [k_member, l_member] {
+                test_support::write(m, &stored);
+            }
+        });
+        let why = format!("dev build: can't run on {} (the fleet's build is {pin})", update::PLATFORM);
+        let row = pair.wait_box("box connected and behind", |r| connected(r) && !r["behind"].is_null());
+        assert_eq!((&row["behind"], &row["behind_here"]), (&json!(why), &Value::Null), "{row}");
+        crate::serve::dts::assert_matches("MachineRow", &row);
+        let lap_on_k = || {
+            let rows = connect(&pair.k_dir).call("machines.list", Value::Null).unwrap().result.unwrap();
+            rows.as_array().unwrap().iter().find(|r| r["name"] == "lap").cloned()
+        };
+        wait_for("lap connected on box", Duration::from_secs(10), || lap_on_k().is_some_and(|r| connected(&r)));
+        let lap = lap_on_k().unwrap();
+        assert_eq!((&lap["behind"], &lap["behind_here"]), (&Value::Null, &json!(why)), "{lap}");
+        // The federated snapshot carries it too.
+        let mut watch = connect(&pair.l_dir);
+        let own = pair.base.join("l-own");
+        std::fs::create_dir_all(&own).unwrap();
+        watch.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        watch.call("instances.watch", json!({"dir": own, "machines": true})).unwrap();
+        let seen = snapshot_where(&mut watch, "box behind", |p| named(&p["machines"], "box").is_some_and(|m| !m["behind"].is_null()));
+        assert_eq!(named(&seen["machines"], "box").unwrap()["behind"], json!(why));
+        drop(watch);
+        pair.finish();
     }
 
     /// The next `instances.snapshot` on `conn` that `pick` takes, within

@@ -898,6 +898,9 @@ struct Shared {
     /// The `serve-pin` thread's queue ([`Shared::pin_build`]); unset
     /// without [`Options::pin_builds`].
     pin: OnceLock<Mutex<std::sync::mpsc::Sender<PinTrigger>>>,
+    /// Why the last [`Shared::pin_now`] didn't pin this build
+    /// (`machines::changes::pin_skipped`): `member.get`'s `pin_skipped`.
+    pin_skipped: Mutex<Option<String>>,
 }
 
 /// Why [`Shared::pin_build`] runs: the daemon's start (`None`), or a link
@@ -948,6 +951,7 @@ impl Shared {
             open_limit: Mutex::new(crate::devsbd::desktop::RateLimit::new(crate::open::OPEN_RATE_BURST, crate::open::OPEN_RATE_REFILL)),
             told_not_authority: Mutex::default(),
             pin: OnceLock::new(),
+            pin_skipped: Mutex::default(),
         }
     }
 
@@ -995,11 +999,12 @@ impl Shared {
         let release = fleet::update::Release { socket_dir: self.socket_dir.clone() };
         let own = machines::changes::OwnBuild { hello: fleet::update::HELLO, binary: &binary, sha256, release: &release };
         let control_plane = trigger.as_ref().map(|(name, platform)| (name.as_str(), platform.as_str()));
-        if let Some(signed) = machines::changes::sign_build(ctx, control_plane, &own) {
-            for line in signed.log_lines() {
-                log(&format!("fleet: {line}"));
-            }
+        let signed = machines::changes::sign_build(ctx, control_plane, &own);
+        for line in signed.iter().flat_map(|s| s.log_lines()) {
+            log(&format!("fleet: {line}"));
         }
+        let mut skipped = self.pin_skipped.lock().unwrap_or_else(|e| e.into_inner());
+        *skipped = machines::changes::pin_skipped(skipped.take(), signed.as_ref());
     }
 
     /// This host's capacity now (`capacity.get`, a placed `run`'s own
@@ -2341,9 +2346,9 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Some(path) => {
                 let trust = |p: &Path| fleet::member::load(p).ok().map(Option::unwrap_or_default).map(|m| m.trust);
                 let before = trust(path);
-                let answer = fleet::member::call(method, req.params, path, &shared.hostname, &|name, trust| {
-                    shared.exposed_workers(Some((name, trust))).remove(name)
-                })
+                let pin_skipped = shared.pin_skipped.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let exposure = |name: &str, trust: fleet::member::Trust| shared.exposed_workers(Some((name, trust))).remove(name);
+                let answer = fleet::member::call(method, req.params, path, &shared.hostname, &exposure, pin_skipped.as_deref())
                 .unwrap_or_else(|| Err(api::ApiError::unknown_method(method)));
                 // A changed trust is in this host's link report at once,
                 // so the other members' exposure of it follows.
@@ -2516,9 +2521,16 @@ struct InboundParams {
     version: String,
     #[serde(default)]
     control_plane: bool,
+    /// Why this host is behind the fleet's pinned build, as the
+    /// `fleet-link`'s decision on this link says.
+    #[serde(default)]
+    behind_here: Option<String>,
+    /// Why `peer` is (`fleet::update::peer_behind`).
+    #[serde(default)]
+    behind: Option<String>,
 }
 
-/// `links.inbound {peer, version, control_plane}`: a `fleet-link --peer <peer>` of
+/// `links.inbound {peer, version, control_plane, behind_here?, behind?}`: a `fleet-link --peer <peer>` of
 /// this user says the link `peer` dialed to this host is up, for as long as
 /// this connection is (docs/reference/api.md, `links.inbound`). Refused for
 /// a name `machines.toml` has (an inbound neighbor and a registry entry
@@ -2559,7 +2571,8 @@ fn links_inbound(id: Option<u64>, params: Value, shared: &Shared, conn: &mut Con
     if let Err(e) = start_notifier(conn) {
         return Response::err(id, "internal", format!("cannot start this connection's notifier: {e}"));
     }
-    conn.inbound = Some(m.inbound.announce(&p.peer, &p.version, p.control_plane));
+    let behind = fleet::update::Behind { here: p.behind_here.clone(), peer: p.behind.clone() };
+    conn.inbound = Some(m.inbound.announce(&p.peer, &p.version, p.control_plane, behind));
     let name = p.peer.clone();
     conn.out.post(|p| {
         p.inbound = Some(name);

@@ -109,7 +109,10 @@ keys; the I/O edges split them back (`remote::split`) into the request's
 - Rows of a machine whose link isn't `connected` show `unreachable`
   (`remote::unreachable`).
 - The header notes machines with no rows yet: `box: connecting` /
-  `box: unreachable: <why>` (`pending_note`).
+  `box: unreachable: <why>`; a connected machine behind the fleet's
+  pinned build, rows or not: `box: behind: <why>`; and this host behind,
+  as a connected link decided: `this host: behind: <why>`
+  (`machines_note`).
 - Typed names resolve against the snapshot: bare when unique across
   machines, else `box/web` or `@/web` for this host (`remote::resolve`).
 - Remote terminals and `:exec` run this host's `devsandbox exec` on the

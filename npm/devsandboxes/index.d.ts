@@ -188,6 +188,10 @@ export interface SnapshotMachine {
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
   error: string | null;
+  /** While `connected`: why it is behind the fleet's pinned build (it can't or won't take it; its link works); `null` otherwise. */
+  behind: string | null;
+  /** While `connected`: why this host is behind the fleet's pinned build, as its link to this machine decided; `null` otherwise and on a `routed` machine seen through the control plane. */
+  behind_here: string | null;
   /** Its devsandbox semver, once reached. */
   version: string | null;
   /** Its runtime (`runtime_name`), once a snapshot came; `null` for a host with none installed (`no_runtime`). */
@@ -1251,6 +1255,10 @@ export interface MachineRow {
   via: string | null;
   /** As {@link SnapshotMachine.exposed_by}: the chain from the control plane while it's `worker` and exposed through another machine; `null` otherwise. */
   exposed_by: string[] | null;
+  /** While `connected`: why it is behind the fleet's pinned build (it can't or won't take it; its link works); `null` otherwise. */
+  behind: string | null;
+  /** While `connected`: why this host is behind the fleet's pinned build, as its link to this machine decided; `null` otherwise. */
+  behind_here: string | null;
 }
 
 /** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). @experimental */
@@ -1263,7 +1271,7 @@ export interface MemberInfo {
   /** The fleet's control plane: `'self'` on the control plane, else the control plane's member name; `null` in no fleet. */
   control_plane: string | null;
   trust: MemberTrust;
-  /** `dev-builds` as the file says (`full` takes the control plane's dev builds either way). */
+  /** `dev-builds` as the file says (`full` takes the fleet's pinned dev builds either way). */
   dev_builds: boolean;
   /** Config roots shown to the fleet besides those with instances (absolute). */
   roots: string[];
@@ -1278,6 +1286,11 @@ export interface MemberInfo {
    * from the control plane, its last but one dialing this host (a shell here `worker` doesn't stop); `null` otherwise.
    */
   exposed_by: string[] | null;
+  /**
+   * On the fleet's authority: why the daemon's last try didn't pin this build (a dev build while the
+   * control plane's platform differs or isn't known yet), until a pin is signed or none is due; `null` otherwise.
+   */
+  pin_skipped: string | null;
 }
 
 /** A signed statement (a membership entry's, an introduction's): `signer` says, with `key`, the payload of that hash. @experimental */

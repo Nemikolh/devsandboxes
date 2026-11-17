@@ -292,6 +292,12 @@ pub struct MemberInfo {
     /// chain from the control plane, its last but one dialing this host (a shell
     /// here). `None` otherwise.
     pub exposed_by: Option<Vec<String>>,
+    /// On the fleet's authority: why the daemon's last try didn't pin this
+    /// build (`machines::changes::BuildSigned::Skipped`, the control
+    /// plane's platform guard), until a pin is signed or none is due.
+    /// `None` otherwise.
+    #[serde(default)]
+    pub pin_skipped: Option<String>,
 }
 
 /// The [`MemberInfo::exposed_by`] chain of the member of this name at this
@@ -341,13 +347,14 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
 
 /// The answer for `member`, its key loaded (or created) from `member.key`
 /// next to `path`.
-fn info(member: &Member, path: &Path, hostname: &str, exposure: Exposure) -> Result<MemberInfo, ApiError> {
+fn info(member: &Member, path: &Path, hostname: &str, exposure: Exposure, pin_skipped: Option<&str>) -> Result<MemberInfo, ApiError> {
     let key = FileKeyStore::new(key_path(path)).public_key().map_err(ApiError::internal)?;
     let next = crate::serve::fleet::membership_api::pending_next(path)?;
     let name = member.name_or(hostname).ok();
     Ok(MemberInfo {
         next,
         exposed_by: name.as_deref().and_then(|n| exposure(n, member.trust)),
+        pin_skipped: pin_skipped.map(str::to_string),
         name,
         control_plane: member.control_plane().field(),
         trust: member.trust,
@@ -359,23 +366,24 @@ fn info(member: &Member, path: &Path, hostname: &str, exposure: Exposure) -> Res
 }
 
 /// `member.get` over the file at `path`; `hostname` names this host when
-/// the file doesn't. The first one creates `member.key`.
-pub fn get(path: &Path, hostname: &str, exposure: Exposure) -> Result<MemberInfo, ApiError> {
+/// the file doesn't. The first one creates `member.key`. `pin_skipped` is
+/// the daemon's ([`MemberInfo::pin_skipped`]).
+pub fn get(path: &Path, hostname: &str, exposure: Exposure, pin_skipped: Option<&str>) -> Result<MemberInfo, ApiError> {
     let member = load(path).map_err(ApiError::internal)?.unwrap_or_default();
-    info(&member, path, hostname, exposure)
+    info(&member, path, hostname, exposure, pin_skipped)
 }
 
 /// `member.set`: `p` merged into the file, checked, written. Nothing else
 /// follows it: a peer link reads the name at its next dial
 /// (`fleet::dialer::member_name`), the rest is read at each use. The
 /// answer's `exposed_by` is at the new trust.
-pub fn set(path: &Path, hostname: &str, p: &SetParams, exposure: Exposure) -> Result<MemberInfo, ApiError> {
+pub fn set(path: &Path, hostname: &str, p: &SetParams, exposure: Exposure, pin_skipped: Option<&str>) -> Result<MemberInfo, ApiError> {
     let after = update(path, |cur| -> Result<Member, ApiError> {
         *cur = merge(cur.clone(), p)?;
         Ok(cur.clone())
     })
     .map_err(ApiError::internal)??;
-    info(&after, path, hostname, exposure)
+    info(&after, path, hostname, exposure, pin_skipped)
 }
 
 /// `control_plane` written as `control_plane` (from an accepted membership log, or
@@ -396,11 +404,11 @@ pub fn set_fleet(path: &Path, name: Option<&str>, control_plane: &ControlPlane) 
 }
 
 /// Run `method` if it's a `member.*` one; `None` otherwise.
-pub fn call(method: &str, params: Value, path: &Path, hostname: &str, exposure: Exposure) -> Option<Answer> {
+pub fn call(method: &str, params: Value, path: &Path, hostname: &str, exposure: Exposure, pin_skipped: Option<&str>) -> Option<Answer> {
     let to_value = |info: MemberInfo| serde_json::to_value(info).map_err(|e| ApiError::internal(e.into()));
     let answer = match method {
-        "member.get" => get(path, hostname, exposure).and_then(to_value),
-        "member.set" => parse_params(params).and_then(|p: SetParams| set(path, hostname, &p, exposure)).and_then(to_value),
+        "member.get" => get(path, hostname, exposure, pin_skipped).and_then(to_value),
+        "member.set" => parse_params(params).and_then(|p: SetParams| set(path, hostname, &p, exposure, pin_skipped)).and_then(to_value),
         _ => return None,
     };
     Some(answer)
@@ -544,6 +552,7 @@ mod tests {
             key,
             next: Some(KeyInfo::of(&key)),
             exposed_by: Some(vec!["box".into(), "lap".into()]),
+            pin_skipped: Some("dev build 0.9.0 (dev, abc) not pinned: it runs on linux/x86_64, the control plane on macos/aarch64".into()),
         };
         assert_matches("MemberInfo", &serde_json::to_value(&info).unwrap());
         assert_eq!(serde_json::to_value(&info).unwrap()["exposed_by"], json!(["box", "lap"]));
@@ -561,7 +570,7 @@ mod tests {
         let host = "lap.local";
         // Exposed while `worker`, as the daemon's graph would say.
         let exposure = |name: &str, trust: Trust| (trust == Trust::Worker).then(|| vec!["k".to_string(), name.to_string()]);
-        let call = |method: &str, params: Value| super::call(method, params, &path, host, &exposure);
+        let call = |method: &str, params: Value| super::call(method, params, &path, host, &exposure, Some("not pinned: x"));
         let mut got = call("member.get", Value::Null).unwrap().unwrap();
         assert!(!path.exists(), "a get writes no member.toml");
         // The first get makes the key; every answer says the same one.
@@ -573,7 +582,7 @@ mod tests {
         }
         assert_eq!(
             got,
-            json!({"name": "lap", "control_plane": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null, "exposed_by": ["k", "lap"]})
+            json!({"name": "lap", "control_plane": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null, "exposed_by": ["k", "lap"], "pin_skipped": "not pinned: x"})
         );
         // A pending rotation shows.
         let next = FileKeyStore::new(key_path(&path)).next_key().unwrap().public_key();

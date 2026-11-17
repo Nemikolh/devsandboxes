@@ -210,6 +210,14 @@ pub struct MachineRow {
     /// from the control plane, its last but one dialing it. `None` otherwise.
     #[serde(default)]
     pub exposed_by: Option<Vec<String>>,
+    /// While connected: why it is behind the fleet's pinned build (its
+    /// link works; `fleet::update::peer_behind`), else `None`.
+    #[serde(default)]
+    pub behind: Option<String>,
+    /// While connected: why this host is behind the fleet's pinned build,
+    /// as its link to this machine decided, else `None`.
+    #[serde(default)]
+    pub behind_here: Option<String>,
 }
 
 /// Who introduced member `name`, when `stored` holds it as an introduction
@@ -490,6 +498,8 @@ fn list(ctx: &Ctx) -> Answer {
                 error: live.error,
                 version: live.version,
                 via: None,
+                behind: live.behind.peer,
+                behind_here: live.behind.here,
             }
         })
         .collect();
@@ -509,6 +519,8 @@ fn list(ctx: &Ctx) -> Answer {
         version: r.version,
         capacity: r.capacity,
         via: r.via,
+        behind: None,
+        behind_here: None,
     }));
     to_value(rows)
 }
@@ -1095,7 +1107,7 @@ mod tests {
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null, "via": null},
+                {"name": "box", "kind": "ssh", "target": "ssh://box:2200", "roots": [], "command": cmd, "agent": true, "version": null, "capacity": null, "introduced_by": null, "via": null, "behind": null, "behind_here": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box"}));
@@ -1517,6 +1529,8 @@ mod tests {
             introduced_by: Some("lap".into()),
             via: Some("k".into()),
             exposed_by: Some(vec!["k".into(), "m".into()]),
+            behind: Some("dev build: not taken".into()),
+            behind_here: Some("dev build: can't run on macos/aarch64".into()),
         };
         let row = to_value(row).unwrap();
         assert_matches("MachineRow", &row);

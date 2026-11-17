@@ -792,6 +792,18 @@ impl BuildSigned {
     }
 }
 
+/// The skip reason the daemon keeps after a [`sign_build`] that answered
+/// `outcome`, `last` the one kept before (pure; `member.get`'s
+/// `pin_skipped`): a skip's why; cleared by a signed pin or none due
+/// (`None`); a failure keeps the last (it says nothing of the guard).
+pub fn pin_skipped(last: Option<String>, outcome: Option<&BuildSigned>) -> Option<String> {
+    match outcome {
+        Some(BuildSigned::Skipped(why)) => Some(why.clone()),
+        Some(BuildSigned::Failed(_)) => last,
+        Some(BuildSigned::Signed { .. }) | None => None,
+    }
+}
+
 /// On the fleet's authority: this daemon's build `own` pinned as the next
 /// `build` entry when [`plan_pin`] says so, then pushed like a membership
 /// change ([`push`]). `control_plane`: the control plane's member name
@@ -1347,6 +1359,12 @@ mod tests {
         assert_eq!(BuildSigned::Signed { version: 1, pin: release("0.9.0"), unpushed: vec![] }.log_lines().len(), 1);
         assert_eq!(BuildSigned::Skipped("dev build x not pinned: y".into()).log_lines(), ["build: dev build x not pinned: y"]);
         assert_eq!(BuildSigned::Failed("offline".into()).log_lines(), ["build not pinned: offline"]);
+        // What `machine ls` keeps saying: the last skip, until a pin or none due.
+        let (skip, failed) = (BuildSigned::Skipped("guard".into()), BuildSigned::Failed("offline".into()));
+        assert_eq!(super::pin_skipped(None, Some(&skip)).as_deref(), Some("guard"));
+        assert_eq!(super::pin_skipped(Some("guard".into()), Some(&failed)).as_deref(), Some("guard"), "a failure says nothing of the guard");
+        assert_eq!(super::pin_skipped(Some("guard".into()), Some(&signed)), None);
+        assert_eq!(super::pin_skipped(Some("guard".into()), None), None, "nothing due");
     }
 
     /// `lap` (L) the authority, `box` (K) the control plane; `zed` and `yan` members

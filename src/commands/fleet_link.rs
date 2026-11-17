@@ -33,7 +33,8 @@
 //! then ends the link (the dialer redials the new binary); this end, having
 //! the pin, pushes it to a dialer that would take it ([`push_build`]); this
 //! end behind (it can't or won't take the pin) links anyway, saying why on
-//! stderr.
+//! stderr; the announce says who is behind on the link, this end and the
+//! dialer (`update::Behind`), for `machine ls` and the dashboard there.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -249,6 +250,10 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         let authority = Authority::of(log, &own_keys, &p.key);
         let pin = pinned(log);
         let decision = update::decide(spec.hello, (opts.follow.dev_builds)(), authority, pin.as_ref(), &theirs.hash);
+        let behind = update::Behind {
+            here: decision.behind().map(str::to_string),
+            peer: update::peer_behind(pin.as_ref(), spec.hello, &theirs.hash, authority),
+        };
         let (decision, lock, busy) = update::under_lock(decision, &dir);
         if let Some(why) = busy {
             eprintln!("fleet-link: {why}");
@@ -272,7 +277,7 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
             }
             (Decision::Receive, None) => unreachable!("`decide` receives only a pin"),
         }
-        let params = json!({ "peer": peer, "version": theirs.hash, "control_plane": update::is_control_plane(&theirs.hash) });
+        let params = inbound_params(peer, &theirs.hash, &behind);
         let mut conn = (opts.daemon)()?;
         if let Err(why) = announce(&mut conn, &params)? {
             bail!("refused: {why}");
@@ -331,6 +336,19 @@ pub fn run_peer(reader: impl Read + Send + 'static, writer: impl Write + Send + 
         bail!("{why}");
     }
     end
+}
+
+/// `links.inbound`'s params for the link to `peer`, whose `Hello` is
+/// `theirs`: who it is, and who is behind the fleet's pin on it
+/// (`behind_here` this host, `behind` the peer; `null` when not).
+fn inbound_params(peer: &str, theirs: &str, behind: &update::Behind) -> Value {
+    json!({
+        "peer": peer,
+        "version": theirs,
+        "control_plane": update::is_control_plane(theirs),
+        "behind_here": behind.here,
+        "behind": behind.peer,
+    })
 }
 
 /// `membership.adopt` of `newer` on `conn` (this host's daemon writes the
@@ -964,7 +982,13 @@ mod tests {
         assert_eq!(fake.calls().last().map(String::as_str), Some("handoff "));
         assert!(!endpoint::fleet_socket(&base, "L").exists());
         assert!(matches!(dialer.join().unwrap(), link::End::Closed));
-        assert!(update::lock_update(&base).unwrap().is_some(), "the update lock is let go");
+        // Retried: a child another test forks meanwhile shares the lock's
+        // open file until it execs (`O_CLOEXEC`), so a single try can miss.
+        let let_go = (0..100).any(|_| update::lock_update(&base).unwrap().is_some() || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
+        assert!(let_go, "the update lock is let go");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1060,5 +1084,46 @@ mod tests {
         assert!(conn_at(&k_dir).call("shutdown", json!({})).unwrap().error.is_none());
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dev pin for another platform: both ends are behind, the link is
+    /// served anyway, and K's daemon shows L `connected`, behind, and this
+    /// host behind, each with why, as K's end announced it.
+    #[test]
+    fn a_link_where_both_ends_are_behind_is_up_and_says_so() {
+        let base = scratch("peer-behind-pin");
+        let (k_dir, _, _, k_opts) = peer_daemon(&base, "k");
+        let (l_dir, _, _, l_opts) = peer_daemon(&base, "l");
+        let (k_member, l_member) = (k_opts.member.clone().unwrap(), l_opts.member.clone().unwrap());
+        let a_member = base.join("a-id/member.toml");
+        let pin = Pin::Dev { semver: "9.9.9".into(), git: "zzz".into(), platform: "other/os".into(), sha256: [7; 32] };
+        pinned_fleet(&[("A", &a_member), ("L", &l_member), ("K", &k_member)], pin.clone());
+        let daemons = [spawn_daemon(&k_dir, k_opts), spawn_daemon(&l_dir, l_opts)];
+        drop((conn_at(&k_dir), conn_at(&l_dir)));
+        let (dialer_io, k_io) = UnixStream::pair().unwrap();
+        let dialer = fake_dialer(dialer_io, saying("9.9.8 yyy dev", "1111111111111111"), Identity::load(&l_member, "L").unwrap(), l_dir.clone(), Arc::default());
+        let fake = Arc::new(update::tests::Fake::default());
+        let k_end = peer_link(k_io.try_clone().unwrap(), k_dir.clone(), k_member, fake.clone());
+        wait_for(|| inbound_row(&k_dir).is_some_and(|r| r["state"] == "connected"), "L connected");
+        let row = inbound_row(&k_dir).unwrap();
+        let why = format!("dev build: can't run on {} (the fleet's build is {pin})", update::PLATFORM);
+        assert_eq!((&row["behind"], &row["behind_here"]), (&json!(why), &json!(why)), "{row}");
+        crate::serve::dts::assert_matches("MachineRow", &row);
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        k_io.shutdown(Shutdown::Both).unwrap();
+        k_end.join().unwrap().unwrap();
+        assert!(matches!(dialer.join().unwrap(), link::End::Closed));
+        for (dir, daemon) in [&k_dir, &l_dir].into_iter().zip(daemons) {
+            assert!(conn_at(dir).call("shutdown", json!({})).unwrap().error.is_none());
+            assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_announce_says_who_is_behind() {
+        let behind = update::Behind { here: Some("mine".into()), peer: None };
+        let p = inbound_params("L", "0.9.0 a dev linux/x86_64 control_plane L - nodev", &behind);
+        assert_eq!(p, json!({"peer": "L", "version": "0.9.0 a dev linux/x86_64 control_plane L - nodev", "control_plane": true, "behind_here": "mine", "behind": null}));
     }
 }

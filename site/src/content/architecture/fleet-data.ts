@@ -63,7 +63,7 @@ export const why: Card[] = [
       "<br><a href='#why-one-connection'>**Every use opened a new ssh connection, with nothing limiting it.**</a> One connection per pair of machines carries everything, both ends prove who they are on it, and each machine sets its own limits.",
       "<br><a href='#why-always-on'>**Connections only lasted while someone was looking.**</a> They stay up, every member sees the fleet through the control plane, and the control plane remembers what it last saw.",
       "<br><a href='#why-code'>**A sandbox only ran where its config and code were.**</a> The control plane sends what's needed.",
-      "<br><a href='#why-versions'>**Versions had to be upgraded by hand on every machine.**</a> Machines follow the control plane's exact build.",
+      "<br><a href='#why-versions'>**Versions had to be upgraded by hand on every machine.**</a> Machines follow the build the authority pinned.",
       "<br><a href='#why-keys'>**SSH keys needed a connection of their own.**</a> Your agent is a grant to a member, reaching it over the fleet's own streams (optional).",
       "<br><a href='#why-lending'>**Why the lending detour was dropped.**</a> Two kinds of machine became one.",
     ),
@@ -140,10 +140,10 @@ export const why: Card[] = [
     title: 'Versions had to be upgraded by hand on every machine',
     summary: md(
       "If two machines' protocols didn't match, the machine just showed as unreachable.",
-      "**Now machines follow the control plane's exact build, downgrades included.**",
+      "**Now machines follow the build the fleet's authority pinned, downgrades included.**",
     ),
     layers: howLayer(
-      'A machine that connects to the control plane and sees another build updates itself (a release is downloaded, a dev build is copied over the connection) and restarts its daemon. No build is marked published yet, so only the dev-build copy works today, and only on a machine that accepts dev builds (`dev-builds = true` or `full` trust) and runs the same OS and CPU type.',
+      'The authority (the member whose key signs the membership log) pins its own build in the log whenever its daemon starts on a new one. Every other member, the control plane included, compares itself with that pin on each link: a pinned release is downloaded and checked against its signed checksums; a pinned dev build is copied over a link from any peer that has it, checked against the pin\'s sha256, and taken only by a machine that accepts dev builds (`dev-builds = true` or `full` trust) on the same OS and CPU type. Then it restarts its daemon. A machine that can\'t or won\'t take the pin keeps its build and stays linked, shown `behind: <why>` (`machine ls`, the dashboard header) on both ends, not unreachable.',
     ),
     links: [L.adr20, L.src('Update decision', 'src/serve/fleet/update.rs'), L.status],
   },
@@ -366,7 +366,7 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
           '`fleet/transport.rs` `Transport::dial(target, program, args) -> Duplex` is the only way bytes cross (ssh its one impl). `link::opener_with`/`answerer_with` share one post-handshake body over an `Endpoint` (OUT sockets + `Serves` table).',
           "The dialer (`fleet::dialer::Dialer::hold`, thread `serve-machine-<m>-link`) dials `fleet-link --peer <own member name>`, binds `fleet-<m>.{sock,pty,tunnel,transfer}.sock`, and serves the peer's streams in-process (`Shared::open_lent`).",
           'The dialed end (`commands::fleet_link::run_peer`) binds `fleet-<dialer>.*.sock` (+ `agent-link-<dialer>.sock` while the dialer serves AGENT) and hands each stream to its daemon with `link.attach {peer, channel}` as the first line (`attach_stream`). It announces the dialer as an inbound neighbor (`links.inbound`).',
-          "Both sides end in `Shared::serve_channel` under the receiving host's trust table, with fleet root `fleet/<peer>/`. Versions follow the hello's `control_plane` flag whichever end dialed.",
+          "Both sides end in `Shared::serve_channel` under the receiving host's trust table, with fleet root `fleet/<peer>/`. Each end compares itself with the fleet's pinned build, whichever dialed.",
           "A daemon with machines still idled out after step 7 alone; step 8 made each dialed link a holder (`idle::Holders::links`).",
         ]),
       },
@@ -374,7 +374,7 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
         label: 'Modules',
         body: ul([
           '`src/serve/fleet/transport.rs` (`Transport`, `Transport::ssh`); `src/serve/fleet/link.rs` (`Endpoint`, `Serves`, `Outlet`, `connect`, `opener_with`, `answerer_with`, `run`, `splice`); `src/serve/fleet/dialer.rs` (`Dialer::hold`, `link_args`, `member_name`, `dial`, `Open`)',
-          '`src/commands/fleet_link.rs` (`fleet_link_peer`, `run_peer`, `attach_stream`, `Announce`, `follows`, `push_build`)',
+          '`src/commands/fleet_link.rs` (`fleet_link_peer`, `run_peer`, `attach_stream`, `Announce`, `pinned`, `push_build`)',
           '`src/serve/daemon.rs` (`link_attach`, `links_inbound`, `machine_dialer`, `Shared::serve_channel`, `Shared::open_lent`, `agent_for`); `src/serve/fleet/lent.rs` (`Peer`, `Channel`, `attach_params`, `peer_fleet_root`)',
           '`src/serve/machines/inbound.rs` (`Neighbors`, `Guard`); `src/serve/endpoint.rs` (`fleet_socket`, `link_agent_socket`)',
         ]),
@@ -1225,15 +1225,15 @@ export const commands: CommandRow[] = [
   {
     cmd: 'self-update',
     before: md('None: the protocol must match; `machine add` copies this binary if versions differ.'),
-    after: md('Either end follows its control plane, as each hello names it, whichever dialed.'),
-    change: md('Automatic in design; today only a dev build copy works.'),
+    after: md('Every member but the authority follows the build the authority pinned in the membership log, whichever end dialed; one that can\'t is `behind: <why>`.'),
+    change: md('Automatic: the authority pins each new build its daemon starts on.'),
     card: cmdCard(
       'cmd-update',
       [
         {
           label: 'Today',
           body: md(
-            '`commands::fleet_link::follows`, `update::decide`: `Download` (published) / `Receive` (dev, same platform, `dev-builds` or `full`) / `Stop(why)`, with a forced handoff (`HelloParams::force`). The hello is `<build> <control_plane|member> <control-plane name|->`, and `update::same_fleet` refuses a link between two fleets (step 9). No build is published yet, so `Download` never runs. Steps 1–6 had a worker follow its control plane (`2b2bb3c`, `b214318`).',
+            '`update::decide` against the log\'s latest `Op::Build` pin (`machines::changes::sign_build` signs it on the authority): `Download` (published, checked against `SHA256SUMS`) / `Receive` (dev, its sha256 the pin\'s, same platform, `dev-builds` or `full`, pushed by any peer on the pin: `update::pushes`) / `Behind(why)` (the link served anyway; `update::peer_behind` says the peer\'s, both shown in `machine ls` and the dashboard), with a forced handoff (`HelloParams::force`). The hello is `<build> <os>/<arch> <control_plane|member> <control-plane name|-> <sha256 prefix|-> <dev|nodev>`, and `update::same_fleet` refuses a link between two fleets (step 9). Steps 1–6 had a worker follow its control plane (`2b2bb3c`, `b214318`).',
           ),
         },
       ],

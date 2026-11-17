@@ -1566,6 +1566,20 @@ can take it from; the authority follows no one:
 - **Behind**: the link is served as on `Same`, the host keeping its
   build; why goes to the log (`fleet-link: behind: <why>` on `run_peer`'s
   stderr, `machine <name>: behind: <why>` in `serve.log` on the dialer).
+  Each end also knows whether the peer is behind, from the peer's `Hello`
+  alone (`update::peer_behind`: `decide` over its `Hello`, its eighth
+  word's dev builds and the mirrored `Authority`, as `pushes` mirrors
+  it), and records both (`update::Behind`) in the machine's state: the
+  dialer through `service::Held::behind`, the dialed end in its
+  `links.inbound` announce (`behind_here`, `behind`). A behind machine
+  stays `connected`, not `unreachable`: `machines.list` and the
+  federated snapshot carry `behind` (the machine) and `behind_here`
+  (this host), `machine ls` shows `connected (behind: <why>)` and `note:
+  this host is behind: <why>`, the dashboard header `box: behind: <why>`
+  and `this host: behind: <why>`
+  ([machines.md](machines.md#held-links-machines)). The authority's pin
+  guard's skip (below, *The authority pins its build*) is `member.get`'s
+  `pin_skipped`, a `note:` under `machine ls`.
   The links between hosts on different builds work by the frame
   protocol's match alone, so what the update path itself rides on stays
   compatible across versions, an exception to breaking the wire freely:
@@ -1670,7 +1684,10 @@ can take it from; the authority follows no one:
   link to the control plane up the platform is unknown and nothing is
   pinned; another platform pins nothing either; `serve.log` says why
   (`changes::BuildSigned::log_lines`, as `fleet: build: dev build … not
-  pinned: …`). Before a dev pin is signed the binary is copied to
+  pinned: …`), and the daemon keeps the last such why
+  (`changes::pin_skipped`: cleared once a pin is signed or none is due,
+  kept over a failure) as `member.get`'s `pin_skipped`, which `machine ls`
+  shows as a `note:`. Before a dev pin is signed the binary is copied to
   `<data>/fleet/.builds/<sha256 hex>` (`update::keep_build`: dir 0700,
   file 0755, through a temp file whose sha256 must be the pin's, then
   renamed; `update::KEPT_BUILDS`, 3, newest kept), since a later

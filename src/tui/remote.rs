@@ -196,27 +196,32 @@ pub fn service_argv(m: &SnapshotMachine, row: &ServiceRow, container: &str, exe:
     on_machine(m, &["exec", &service], instance, &[], exe)
 }
 
-/// The machines with no rows in `s` yet, one dim note each: `box:
-/// connecting`, `box (agent): unreachable: <why>` ([`label`]). Joined with ` · `; `None` when
-/// every machine has rows (or none is registered). Without `why`, an
-/// unreachable one doesn't say why (the header's short of room).
-pub fn pending_note(machines: &[SnapshotMachine], s: &Snapshot, why: bool) -> Option<String> {
+/// The header's dim notes on the machines, joined with ` · `: this host
+/// behind the fleet's pinned build, as a connected link decided (`this
+/// host: behind: <why>`, once); each connected machine that's behind
+/// (`box: behind: <why>`, rows or not: its link works); each other machine
+/// with no rows in `s` yet (`box: connecting`, `box (agent): unreachable:
+/// <why>`; [`label`]). `None` when there's nothing to say. Without `why`,
+/// none says why (the header's short of room).
+pub fn machines_note(machines: &[SnapshotMachine], s: &Snapshot, why: bool) -> Option<String> {
     let has_rows = |name: &str| {
         let on = |m: &Option<String>| m.as_deref() == Some(name);
         s.instances.iter().any(|r| on(&r.machine))
             || s.sandboxes.iter().any(|r| on(&r.machine))
             || s.services.iter().any(|r| on(&r.machine))
     };
-    let notes: Vec<String> = machines
-        .iter()
-        .filter(|m| !has_rows(&m.name))
-        .filter_map(|m| match (m.state, &m.error) {
+    let behind = |who: String, because: &str| if why { format!("{who}: behind: {}", short(because)) } else { format!("{who}: behind") };
+    let here = machines.iter().filter(|m| m.state == LinkState::Connected).find_map(|m| m.behind_here.as_deref());
+    let notes: Vec<String> = here
+        .map(|because| behind("this host".into(), because))
+        .into_iter()
+        .chain(machines.iter().filter_map(|m| match (m.state, &m.error) {
+            (LinkState::Connected, _) => m.behind.as_deref().map(|because| behind(label(m), because)),
+            _ if has_rows(&m.name) => None,
             (LinkState::Unreachable, Some(e)) if why => Some(format!("{}: unreachable: {}", label(m), short(&why_of(&m.name, e)))),
             (LinkState::Unreachable, _) => Some(format!("{}: unreachable", label(m))),
-            // Connected with nothing in its roots: nothing to say.
-            (LinkState::Connected, _) => None,
             _ => Some(format!("{}: connecting", label(m))),
-        })
+        }))
         .collect();
     (!notes.is_empty()).then(|| notes.join(" · "))
 }
@@ -332,6 +337,8 @@ pub(crate) mod tests {
             capacity: None,
             via: None,
             exposed_by: None,
+            behind: None,
+            behind_here: None,
         }
     }
 
@@ -515,16 +522,40 @@ pub(crate) mod tests {
         assert!(unreachable(&machines, Some("new")));
         assert!(unreachable(&machines, Some("gone")));
         let s = snap(&[("web", Some("up"), None)], &[]);
-        assert_eq!(pending_note(&machines, &s, true).as_deref(), Some("down: unreachable: Permission denied · new: connecting"));
-        assert_eq!(pending_note(&machines, &s, false).as_deref(), Some("down: unreachable · new: connecting"));
-        assert_eq!(pending_note(&machines[..1], &s, true), None);
+        assert_eq!(machines_note(&machines, &s, true).as_deref(), Some("down: unreachable: Permission denied · new: connecting"));
+        assert_eq!(machines_note(&machines, &s, false).as_deref(), Some("down: unreachable · new: connecting"));
+        assert_eq!(machines_note(&machines[..1], &s, true), None);
         // `agent` on marks the name; the error's own `<machine>: ` still goes.
         let mut machines = machines;
         machines[1].agent = true;
         machines[1].error = Some("down: Permission denied".into());
-        assert_eq!(pending_note(&machines, &s, true).as_deref(), Some("down (agent): unreachable: Permission denied · new: connecting"));
+        assert_eq!(machines_note(&machines, &s, true).as_deref(), Some("down (agent): unreachable: Permission denied · new: connecting"));
         assert_eq!(why_of("box", "box: ssh: refused"), "ssh: refused");
         assert_eq!(why_of("box", "boxer: x"), "boxer: x");
         assert_eq!(short(&"é".repeat(50)), format!("{}…", "é".repeat(40)));
+    }
+
+    /// A behind machine is still up: said beside its rows, not as
+    /// unreachable; this host behind is said once, first.
+    #[test]
+    fn behind_machines_and_this_host_are_noted() {
+        let up = |name: &str, behind: Option<&str>, here: Option<&str>| SnapshotMachine {
+            behind: behind.map(String::from),
+            behind_here: here.map(String::from),
+            ..sm(name, LinkState::Connected)
+        };
+        let s = snap(&[("web", Some("box"), None)], &[]);
+        let machines = [up("box", Some("dev build: not taken"), None), up("pi", None, None)];
+        assert_eq!(machines_note(&machines, &s, true).as_deref(), Some("box: behind: dev build: not taken"), "rows or not");
+        assert_eq!(machines_note(&machines, &s, false).as_deref(), Some("box: behind"));
+        let here = "dev build: can't run on macos/aarch64";
+        let mut machines = [up("box", None, Some(here)), up("pi", Some("x"), Some(here)), sm("new", LinkState::Connecting)];
+        machines[1].agent = true;
+        let want = format!("this host: behind: {} · pi (agent): behind: x · new: connecting", short(here));
+        assert_eq!(machines_note(&machines, &s, true), Some(want));
+        assert_eq!(machines_note(&machines, &s, false).as_deref(), Some("this host: behind · pi (agent): behind · new: connecting"));
+        // Only a connected link's word counts.
+        let down = SnapshotMachine { behind: Some("x".into()), behind_here: Some(here.into()), ..sm("far", LinkState::Unreachable) };
+        assert_eq!(machines_note(&[down], &s, false).as_deref(), Some("far: unreachable"));
     }
 }

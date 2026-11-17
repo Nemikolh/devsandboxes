@@ -384,7 +384,18 @@ one's while its neighbor is up.
   so listing a root reaches nothing the table didn't already admit.
 
 `LinkState`: `idle` (before the first attempt), `connecting`,
-`connected`, `unreachable` (with the reason). A failure is logged when it
+`connected`, `unreachable` (with the reason). Beside it, while
+`connected`, who is behind the fleet's pinned build on the link
+(`fleet::update::Behind`, [fleet](fleet.md#versions) *Versions*): the
+machine (`behind`, its why: `update::peer_behind` over its `Hello`) and
+this host (`behind_here`: the link's own `update::decide`). A behind link
+stays `connected`: it works. Each end decides both from the `Hello`s
+once, when the link comes up: on an ssh machine's link the dialer
+(`fleet::dialer`, `service::Held::behind` before `Held::up`), on an
+inbound one the `fleet-link` here, in its `links.inbound` announce
+(`behind_here`, `behind`; `inbound::Neighbor::behind`); the link thread
+records them as it connects (`snapshots::Machine::set_up`) and drops them
+when it isn't connected (`Machine::set_link`). A failure is logged when it
 differs from the last one logged since the link (or carrier) was up, so
 a machine that's away logs once. Each registered machine's link holds
 the local daemon up (`idle::Holders::links`). On the machine it's an [inbound neighbor](#inbound-neighbors)
@@ -502,7 +513,8 @@ gets every push merged with each machine's rows (`snapshots::merge`): rows
 gain `machine` and keep their remote `root` and `mesh_root`, and a top-level `machines`
 array carries each machine's `name`, `kind` (`ssh` |
 `inbound` | `routed`, fleet plan decisions 29, 60), `target` (`null` for an inbound one), `state`,
-`error`, `version`, `command`,
+`error`, `behind`, `behind_here` (as `machines.list`'s, [Held links](#held-links-machines); a
+lifted entry's `behind_here` is `null`, the control plane's own word), `version`, `command`,
 `runtime`, `agent` (this host's grant, [Agent](#agent)), `capacity` (its host's
 [capacity report](fleet.md#capacity), from its last push), `via`,
 `exposed_by` ([exposure](fleet.md#exposure)). A machine's push or state change re-publishes those
@@ -864,7 +876,16 @@ introduces no one, fleet plan decision 51) is named `<name> (introduced
 by <introducer>)`, and one `worker` and exposed through another machine
 (`machines.list`'s `exposed_by`, [exposure](fleet.md#exposure)) `<name>
 (exposed via <dialer>)`, the machine that dials it (`graph::exposed_note`;
-both notes joined by a comma) (`commands::machine::cells`). `unlink <name>` (`machines.unlink`) drops this host's link to
+both notes joined by a comma); a machine behind the fleet's pinned build
+has `STATE` `connected (behind: <why>)` (`machines.list`'s `behind`)
+(`commands::machine::cells`). Under the table, on stderr
+(`commands::machine::ls_notes`): `note: this host is behind: <why>` for
+each distinct `behind_here` of the rows, and on the authority, while its
+build isn't pinned (`member.get`'s `pin_skipped`, the daemon's last
+`changes::sign_build` skip, kept by `changes::pin_skipped` until a pin is
+signed or none is due), `note: <why>` (`dev build … not pinned: it runs on
+<os>/<arch>, the control plane on <os>/<arch>`, or `… the control plane's
+platform isn't known (no link to it is up)`). `unlink <name>` (`machines.unlink`) drops this host's link to
 a registered machine, which stays a fleet member; refused for an inbound
 one, prints `unlinked <name>`. `rm <name>` (`machines.rm`) takes the
 machine out of the fleet, and `rm` of this host's own member name leaves
@@ -960,8 +981,11 @@ dial exits 255 (a lost link, or the link down when it resolves the name),
 re-dials an attach to it into the same tab (`attach_argv`,
 `tui::app::terminal::Redial`, the CLI's `Reconnect` rule;
 [terminal.md](../dashboard/terminal.md) *Remote tabs reconnect*); a machine without rows shows `box: connecting` or `box:
-unreachable: <why>` in the header (`pending_note`), the name as `box
-(agent)` while this host grants it agent. `p` / `:port` on a remote row sends
+unreachable: <why>` in the header, a connected one behind the fleet's
+pinned build `box: behind: <why>` (rows or not: its link works), and
+this host behind, as a connected link's entry says, `this host: behind:
+<why>` once, first (`remote::machines_note`; without room, no whys), the
+name as `box (agent)` while this host grants it agent. `p` / `:port` on a remote row sends
 `forwards.add` with `machine` and the row's root (the forward binds here,
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,

@@ -112,10 +112,11 @@ fn tab_bar_areas(app: &App, area: Rect) -> (Rect, Rect, Option<String>) {
         .as_ref()
         .map(|s| {
             let line = totals_line(s, s.collected_at.elapsed(), app.snapshot_error.as_ref());
-            // A machine with no rows yet says why in place of its rows, when
-            // that leaves the tabs their room.
+            // A machine with no rows yet says why in place of its rows, and a
+            // behind one (or this host) why it's behind, when that leaves the
+            // tabs their room.
             let tabs_w = tab_spans(app).last().map_or(0, |(_, _, r)| r.end);
-            let with = |why| super::remote::pending_note(&app.machines, s, why).map(|note| format!("{note} · {line}"));
+            let with = |why| super::remote::machines_note(&app.machines, s, why).map(|note| format!("{note} · {line}"));
             match with(true) {
                 Some(full) if tabs_w + full.chars().count() as u16 + 2 <= area.width => full,
                 _ => with(false).unwrap_or(line),

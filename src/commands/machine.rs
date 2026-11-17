@@ -358,9 +358,31 @@ pub fn ls(json: bool) -> Result<()> {
         println!("no machines; `devsandbox machine add <target>` adds one");
         return Ok(());
     }
+    // Best effort: a daemon without a member.toml has no skip to say.
+    let member: Option<MemberInfo> = call(&mut conn, "member.get", Value::Null).ok();
+    let notes = ls_notes(&rows, member.as_ref().and_then(|m| m.pin_skipped.as_deref()));
     let cells: Vec<[String; 7]> = rows.into_iter().map(cells).collect();
     print!("{}", table(&HEADERS, &cells));
+    for note in notes {
+        eprintln!("note: {note}");
+    }
     Ok(())
+}
+
+/// `machine ls`'s lines under the table (pure): this host behind the
+/// fleet's pinned build, as its links decided (each distinct why once),
+/// and, on the authority, why its build isn't pinned (`member.get`'s
+/// `pin_skipped`).
+fn ls_notes(rows: &[MachineRow], pin_skipped: Option<&str>) -> Vec<String> {
+    let mut notes: Vec<String> = Vec::new();
+    for why in rows.iter().filter_map(|r| r.behind_here.as_deref()) {
+        let note = format!("this host is behind: {why}");
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    notes.extend(pin_skipped.map(str::to_string));
+    notes
 }
 
 pub fn set(name: &str, agent: bool) -> Result<()> {
@@ -768,7 +790,10 @@ fn cells(r: MachineRow) -> [String; 7] {
         target,
         roots,
         agent.into(),
-        r.state.as_str().into(),
+        match &r.behind {
+            Some(why) => format!("{} (behind: {why})", r.state.as_str()),
+            None => r.state.as_str().into(),
+        },
         r.version.unwrap_or_else(|| "-".into()),
         room,
     ]
@@ -1007,6 +1032,7 @@ mod tests {
             key,
             next: None,
             exposed_by: None,
+            pin_skipped: None,
         };
         assert_eq!(key_text(&info), format!("lap {key}\n{}\n", key.fingerprint()));
         assert!(key_text(&MemberInfo { name: None, ..info.clone() }).starts_with("- ed25519:"));
@@ -1107,6 +1133,8 @@ mod tests {
             introduced_by: None,
             via: None,
             exposed_by: None,
+            behind: None,
+            behind_here: None,
         };
         assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "off", "idle", "-", "-"].map(String::from));
         assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..6], ["/a +2", "off", "idle", "0.7.0"].map(String::from));
@@ -1137,6 +1165,17 @@ mod tests {
         assert_eq!(cells(MachineRow { exposed_by: chain.clone(), ..row(&[], None) })[0], "m (exposed via k)");
         let both = MachineRow { exposed_by: chain, introduced_by: Some("lap".into()), ..row(&[], None) };
         assert_eq!(cells(both)[0], "m (introduced by lap, exposed via k)");
+        // Behind: still connected, with why; this host behind is a note.
+        let connected = crate::serve::snapshots::LinkState::Connected;
+        let behind = MachineRow { state: connected, behind: Some("dev build: not taken".into()), ..row(&[], None) };
+        assert_eq!(cells(behind)[4], "connected (behind: dev build: not taken)");
+        let here = |why: &str| MachineRow { state: connected, behind_here: Some(why.into()), ..row(&[], None) };
+        let rows = [here("dev build: can't run on macos/aarch64"), row(&[], None), here("dev build: can't run on macos/aarch64")];
+        assert_eq!(cells(here("x"))[4], "connected");
+        assert_eq!(ls_notes(&rows, None), ["this host is behind: dev build: can't run on macos/aarch64"], "once");
+        let skipped = "dev build 0.9.0 (dev, 1a2b) not pinned: it runs on linux/x86_64, the control plane on macos/aarch64";
+        assert_eq!(ls_notes(&rows[1..2], Some(skipped)), [skipped]);
+        assert!(ls_notes(&rows[1..2], None).is_empty());
     }
 
     #[test]

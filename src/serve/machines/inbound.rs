@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::serve::api::ApiError;
+use crate::serve::fleet::update::Behind;
 
 /// One inbound neighbor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,9 @@ pub struct Neighbor {
     pub version: String,
     /// It said it's the fleet's control plane.
     pub control_plane: bool,
+    /// Who is behind the fleet's pinned build on its link, as the
+    /// `fleet-link` here decided (`here`: this host; `peer`: it).
+    pub behind: Behind,
     /// Which announce this is: what its [`Guard`] removes.
     seq: u64,
 }
@@ -75,9 +79,9 @@ impl Drop for Guard {
 impl Neighbors {
     /// Announce `name` (replacing an older announce of it); up until the
     /// guard drops.
-    pub fn announce(self: &Arc<Self>, name: &str, version: &str, control_plane: bool) -> Guard {
+    pub fn announce(self: &Arc<Self>, name: &str, version: &str, control_plane: bool, behind: Behind) -> Guard {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let neighbor = Neighbor { name: name.into(), version: version.into(), control_plane, seq };
+        let neighbor = Neighbor { name: name.into(), version: version.into(), control_plane, behind, seq };
         self.live.lock().unwrap().insert(name.into(), neighbor);
         self.changed();
         Guard { neighbors: Arc::clone(self), name: name.into(), seq }
@@ -101,6 +105,12 @@ impl Neighbors {
         self.live.lock().unwrap().contains_key(name)
     }
 
+    /// Who is behind on `name`'s link ([`Neighbor::behind`]); no one for a
+    /// name not up.
+    pub fn behind(&self, name: &str) -> Behind {
+        self.live.lock().unwrap().get(name).map(|n| n.behind.clone()).unwrap_or_default()
+    }
+
     /// Every neighbor up now, by name.
     pub fn list(&self) -> Vec<Neighbor> {
         self.live.lock().unwrap().values().cloned().collect()
@@ -122,15 +132,17 @@ mod tests {
     #[test]
     fn a_neighbor_lasts_while_its_newest_announce_is_held() {
         let n = Arc::new(Neighbors::default());
-        let old = n.announce("lap", "0.7.0 a dev linux/x86_64 member", false);
+        let old = n.announce("lap", "0.7.0 a dev linux/x86_64 member", false, Behind::default());
         assert!(n.contains("lap"));
         // A newer announce replaces it; the old one's close doesn't touch it.
-        let new = n.announce("lap", "0.7.0 b dev linux/x86_64 control_plane", true);
+        let behind = Behind { here: None, peer: Some("dev build: not taken".into()) };
+        let new = n.announce("lap", "0.7.0 b dev linux/x86_64 control_plane", true, behind.clone());
         drop(old);
         let listed = n.list();
         assert_eq!((listed.len(), listed[0].control_plane), (1, true));
         assert_eq!(listed[0].version, "0.7.0 b dev linux/x86_64 control_plane");
-        let other = n.announce("srv", "v", false);
+        assert_eq!((n.behind("lap"), n.behind("gone")), (behind, Behind::default()));
+        let other = n.announce("srv", "v", false, Behind::default());
         assert_eq!(n.list().iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["lap", "srv"]);
         drop(new);
         assert!(!n.contains("lap"));
@@ -150,9 +162,9 @@ mod tests {
             let now = weak.upgrade().map(|n| n.list().into_iter().map(|n| n.name).collect()).unwrap_or_default();
             log.lock().unwrap().push(now);
         }));
-        let lap = n.announce("lap", "v", false);
-        let old = n.announce("srv", "v", false);
-        let new = n.announce("srv", "v", false);
+        let lap = n.announce("lap", "v", false, Behind::default());
+        let old = n.announce("srv", "v", false, Behind::default());
+        let new = n.announce("srv", "v", false, Behind::default());
         drop(old);
         drop((lap, new));
         let seen = seen.lock().unwrap().clone();
