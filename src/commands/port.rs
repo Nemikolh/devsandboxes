@@ -699,8 +699,6 @@ fn forward_until_interrupted(
                 eprintln!("{line}");
             }
             *prev = status.state.clone();
-            // Re-print the mapping (on stdout) when the listening process is
-            // first discovered or changes to a new pid.
             if let Some(line) = process_reprint_line(prev_proc, &status, *host_port) {
                 println!("{line}");
             }
@@ -1182,7 +1180,6 @@ image = "node"
         };
         let hp = HostPort::Prefer(3000);
 
-        // First discovery (None → Some) re-prints the mapping with the suffix.
         assert_eq!(
             process_reprint_line(&None, &status(Some("node (pid 412)")), hp),
             Some("127.0.0.1:3000 -> api:3000 [node (pid 412)]".to_string())
@@ -1195,7 +1192,6 @@ image = "node"
             process_reprint_line(&Some("node (pid 412)".into()), &status(Some("node (pid 999)")), hp),
             Some("127.0.0.1:3000 -> api:3000 [node (pid 999)]".to_string())
         );
-        // Back to None → nothing (don't print when it disappears).
         assert_eq!(process_reprint_line(&Some("node (pid 412)".into()), &status(None), hp), None);
     }
 

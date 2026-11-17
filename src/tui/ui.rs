@@ -2545,7 +2545,6 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     let col = input_area.x + prefix.len() as u16 + caret;
     frame.set_cursor_position((col.min(input_area.right().saturating_sub(1)), input_area.y));
 
-    // Hint line: parse error (red) takes precedence over completion candidates.
     let hint = if let Some(err) = &prompt.error {
         Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red)))
     } else {

@@ -1665,7 +1665,6 @@ mod tests {
         ];
         let e = prep_fed(&run_of(Some("a/loc")), &FED, false, None, &down, 0).0.unwrap_err();
         assert_eq!(e.to_string(), "no sandbox `loc` on machine `a`; unreachable: a (ssh: no route)");
-        // Without machines: the request of before, byte for byte.
         let (_, calls, _, _) = prep_fed(&run_of(Some("loc")), &Fed::default(), false, None, &list, 0);
         assert_eq!(calls, [r#"sandboxes.list {"root":"/cfg"}"#]);
     }

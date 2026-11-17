@@ -366,6 +366,7 @@ mod tests {
         assert_eq!(viewport_top(2, 4, 10, 3), 2);
         assert_eq!(viewport_top(0, 7, 10, 3), 5);
         assert_eq!(viewport_top(5, 1, 10, 3), 1);
+        // Never past the end (text got shorter).
         assert_eq!(viewport_top(8, 2, 4, 3), 1);
     }
 
