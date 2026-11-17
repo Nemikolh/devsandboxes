@@ -55,6 +55,9 @@ describe('extension', () => {
     const blocked = await host.intercept('tool.call', call('cargo test --workspace'), 'allow', { matchKey: 'shell' })
     expect(blocked).toMatchObject({ block: expect.stringContaining('timeout -k 10 300 cargo test --workspace') })
 
+    const redirected = await host.intercept('tool.call', call('cargo test --workspace 2>&1 >&2'), 'allow', { matchKey: 'shell' })
+    expect(redirected).toMatchObject({ block: expect.stringContaining('`timeout -k 10 300 cargo test --workspace 2>&1 >&2`') })
+
     expect(await host.intercept('tool.call', call('timeout 300 cargo test'), 'allow', { matchKey: 'shell' })).toBe('allow')
     expect(await host.intercept('tool.call', call('ls'), 'allow', { matchKey: 'shell' })).toBe('allow')
     expect(await host.intercept('tool.call', call(undefined), 'allow', { matchKey: 'shell' })).toBe('allow')

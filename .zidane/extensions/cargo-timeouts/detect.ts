@@ -72,6 +72,12 @@ function lex(src: string): Token[] {
       i += c === '`' ? 1 : 2
       continue
     }
+    // `2>&1`, `>&2`, `<&0`: a redirection's `&`, not a control operator.
+    if (c === '&' && /[<>]$/.test(word)) {
+      word += c
+      i++
+      continue
+    }
     const op = OPS.find(o => src.startsWith(o, i))
     if (op) {
       flush()
