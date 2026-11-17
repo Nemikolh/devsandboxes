@@ -82,31 +82,50 @@ fn parse_run(line: &str) -> Run {
     }
 }
 
-/// How many of a container's helper sessions are running, and how many of
-/// those have no client attached (docs/architecture/helper/in-container.md,
-/// *Sessions*).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionCount {
-    pub running: usize,
-    pub detached: usize,
+/// One of a container's helper sessions (docs/architecture/helper/in-container.md,
+/// *Sessions*), as a `devsbd session ls` line `<id> <state>
+/// <attached|detached|-> <started> <argv…>` says it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    /// As a run's: `running`, `lost`, `exited 0`, `killed 9`.
+    pub state: String,
+    /// A client is attached (only ever while running).
+    pub attached: bool,
+    /// RFC 3339, as the helper wrote it.
+    pub started: String,
+    /// The command, space-joined as the helper printed it.
+    pub argv: String,
 }
 
-/// The count in `devsbd session ls` output: lines `<id> <state>
-/// <attached|detached|-> …`, a running session's state being the one word
-/// `running`. Anything else (ended, lost, malformed) isn't counted.
-pub fn count_sessions(ls: &str) -> SessionCount {
-    let mut count = SessionCount::default();
-    for line in ls.lines() {
-        let mut words = line.split(' ').skip(1);
-        if words.next() != Some("running") {
-            continue;
-        }
-        count.running += 1;
-        if words.next() == Some("detached") {
-            count.detached += 1;
-        }
+impl Session {
+    pub fn running(&self) -> bool {
+        self.state == "running"
     }
-    count
+}
+
+/// The sessions in `devsbd session ls` output, oldest first; blank lines
+/// skipped, short lines kept with empty fields, as [`parse_runs`].
+pub fn parse_sessions(ls: &str) -> Vec<Session> {
+    ls.lines().filter(|l| !l.trim().is_empty()).map(parse_session).collect()
+}
+
+/// One `devsbd session ls` line: a run line with the attach word after
+/// the state.
+fn parse_session(line: &str) -> Session {
+    let words: Vec<&str> = line.split(' ').collect();
+    let state_len = match words.get(1) {
+        Some(&"exited" | &"killed") => 2,
+        _ => 1,
+    };
+    let join = |from: usize, to: usize| words.get(from..to.min(words.len())).unwrap_or(&[]).join(" ");
+    Session {
+        id: words.first().copied().unwrap_or("").to_string(),
+        state: join(1, 1 + state_len),
+        attached: words.get(1 + state_len) == Some(&"attached"),
+        started: words.get(2 + state_len).copied().unwrap_or("").to_string(),
+        argv: join(3 + state_len, words.len()),
+    }
 }
 
 /// Stdout kept from a child's `devsbd run ls` / `session ls` before it's
@@ -127,7 +146,7 @@ pub fn run_ls(container: &str) -> Option<String> {
 
 /// `devsbd session ls` in `container`, bounded and `None` on failure as
 /// [`run_ls`] is (a helper predating sessions included): the instance then
-/// shows no session count.
+/// shows no sessions.
 pub fn session_ls(container: &str) -> Option<String> {
     helper_ls(container, "session")
 }
@@ -198,17 +217,29 @@ mod tests {
         assert_eq!(parse_runs("x"), [run("x", "", "", "")]);
     }
 
+    fn session(id: &str, state: &str, attached: bool, started: &str, argv: &str) -> Session {
+        Session { id: id.into(), state: state.into(), attached, started: started.into(), argv: argv.into() }
+    }
+
     #[test]
-    fn count_sessions_counts_running_and_detached() {
+    fn parse_sessions_reads_state_attach_and_argv() {
         let ls = "1790000000-a1b2 exited 0 - 2026-09-21T14:13:20Z bash\n\
-1790000001-0000 running attached 2026-09-21T14:13:21Z zidane\n\
+1790000001-0000 running attached 2026-09-21T14:13:21Z zidane -p  fix\n\
 \n\
 1790000002-ffff running detached 2026-09-21T14:13:22Z claude\n\
-1790000003-eeee lost - 2026-09-21T14:13:23Z sh\n\
-1790000004-dddd running detached 2026-09-21T14:13:24Z\n\
-1790000005-cccc running\n";
-        assert_eq!(count_sessions(ls), SessionCount { running: 4, detached: 2 });
-        assert_eq!(count_sessions(""), SessionCount::default());
-        assert_eq!(count_sessions("running detached"), SessionCount::default(), "state is the 2nd word");
+1790000003-eeee lost - 2026-09-21T14:13:23Z sh\n";
+        assert_eq!(
+            parse_sessions(ls),
+            [
+                session("1790000000-a1b2", "exited 0", false, "2026-09-21T14:13:20Z", "bash"),
+                session("1790000001-0000", "running", true, "2026-09-21T14:13:21Z", "zidane -p  fix"),
+                session("1790000002-ffff", "running", false, "2026-09-21T14:13:22Z", "claude"),
+                session("1790000003-eeee", "lost", false, "2026-09-21T14:13:23Z", "sh"),
+            ]
+        );
+        assert!(parse_sessions("").is_empty());
+        assert_eq!(parse_sessions("x running"), [session("x", "running", false, "", "")]);
+        assert!(parse_sessions("x running attached")[0].running());
+        assert!(!parse_sessions("running detached")[0].running(), "state is the 2nd word");
     }
 }

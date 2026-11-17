@@ -109,10 +109,13 @@ selected one (for the Detail agent count), on expand, after a change, and
 every 5 s (`PROC_TICK`), one request at a time and only on the Instances
 tab. `proc_state` turns each answer into a `ps --forest`-style
 `ProcState::Rows` (then up to 5 tracked `devsbd run` rows, `run` in the
-pid column) or a placeholder `Message`. `is_agent` counts coding-agent
-processes by argv basename (`AGENT_NAMES`) for Detail. The answer's
-helper session count rides on `ProcState::Rows` (`sessions`,
-`App::session_count`): Detail shows `sessions: N (M detached)`
+pid column, then a row per running helper session, `session` in the pid
+column and `<id> attached|detached <argv>`: `session_rows`; ended and
+`lost` ones can't be attached, so aren't rows) or a placeholder
+`Message`. `is_agent` counts coding-agent processes by argv basename
+(`AGENT_NAMES`) for Detail, run and session rows left out. The answer's
+sessions, counted (`SessionCount::of`), ride on `ProcState::Rows`
+(`sessions`, `App::session_count`): Detail shows `sessions: N (M detached)`
 (`ui.rs` `sessions_line`, the detached part only when some are), and the
 instance's tree row a `▣N` badge of the running ones (`SESSION_BADGE`,
 yellow while some are detached) when the count is above zero. Only
@@ -121,7 +124,14 @@ others show none, as with a helper predating sessions.
 
 On a process row only navigation and signals apply: `t` SIGTERM, `K`
 SIGKILL, sent as `instances.signal`, and only when the rows are
-container-namespace pids (`signalable`).
+container-namespace pids (`signalable`). A session row
+(`App::selected_session`, its id from `tui::procs::session_id`) isn't a
+process: `a`/`enter` attach it (`App::open_attach`,
+[terminal.md](terminal.md)), `K` ends it (`pending_session_rm` →
+`Cmd::SessionRm`, `sessions.rm` in the dashboard's root, a machine's
+instance in its route's root there, `remote::instance_route`; the
+answer's status line and a procs refetch come as a signal's,
+`DaemonUpdate::Signalled`), and `t` is a status line saying so.
 
 ## Modals
 
@@ -154,7 +164,7 @@ fills the modal if it is still the one open:
 ## One-key actions and the pending queue
 
 `App` never sends anything. A key sets a pending field (`pending_action`,
-`pending_signal`, `pending_done`, `pending_fetch`, `pending_cancel`,
+`pending_signal`, `pending_session_rm`, `pending_done`, `pending_fetch`, `pending_cancel`,
 `pending_port`/`pending_unport`, `pending_machine_set`, `pending_inbox`,
 `pending_open`, `pending_identity`), and the
 event loop takes each once per pass and hands it to a thread.

@@ -11,6 +11,7 @@ Code: `src/tui/term.rs` (`TermSession`, `TermTabs`, `TermParser`,
 `DISAMBIGUATE`), `src/tui/app/terminal.rs` (`ExecCli`, `on_key_terminal`,
 `terminal_mouse`, `open_terminal`, `term_argv`, `exec_argv`,
 `attach_session`, `sessions_listed`, `open_attach`, `attach_argvs`,
+`attach_selected_session` (in `app/procs.rs`),
 `Redial`, `redial_terminals`), `src/tui/remote.rs` (`exec_argv`,
 `session_exec_argv`, `attach_argv`, `service_argv`), `src/tui/ui.rs`
 (`open_bottom_split`, `terminal_panel_rect`, `term_pane_size`,
@@ -86,6 +87,11 @@ arrives on reader threads and only shows on the next draw.
   <instance>` (`ExecCli::attach_argv`, no `-i -t`: the session has its
   pty) with no re-dial; on a machine `remote::attach_argv`, which is also
   its `Redial`'s, so a lost attach tab re-dials the same session.
+- An attach from a session row (`a`/`enter` on a `session` row under an
+  expanded instance; `App::attach_selected_session`): the same
+  `open_attach` tab on that row's id, no listing first. An attached
+  session is offered too, unlike the picker: the user chose it, and the
+  attach takes it over (the other client gets `DETACHED_EXIT`).
 
 ## Remote tabs reconnect
 

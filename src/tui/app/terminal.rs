@@ -1589,6 +1589,28 @@ mod tests {
         assert_eq!(app.focus, Focus::Terminal);
     }
 
+    /// `a` and `enter` on a session row attach that id, an attached one too
+    /// (it takes over); a machine's tab re-dials it.
+    #[test]
+    fn a_or_enter_on_a_session_row_attaches_it() {
+        let mut app = select_session_row(attach_app(), "inst0", "1790000000-a1b2 attached bash -l");
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.terms.sessions().len(), 1);
+        assert_eq!(app.focus, Focus::Terminal);
+        app.focus = Focus::Dashboard;
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.terms.sessions().len(), 2, "never deduped");
+        assert!(matches!(app.modal, Modal::None), "enter isn't the config view here");
+
+        let mut app = machine_app();
+        app.exec_cli = Ok(ExecCli { exe: Some("/bin/true".into()), root: "/home/u/cfg".into() });
+        let mut app = select_session_row(app, "box/inst1", "1790000100-c3d4 detached vim");
+        app.on_key(key(KeyCode::Enter));
+        let tab = &app.terms.sessions()[0];
+        assert_eq!(tab.title, "box/inst1");
+        assert_eq!(tab.redial.as_ref().unwrap().attach[3], "--attach=1790000100-c3d4");
+    }
+
     #[test]
     fn find_dedup_vs_force_new() {
         // TermTabs dedup: an exited tab for a container is not a target, a live

@@ -256,6 +256,20 @@ pub(super) fn app_on_proc_row(pids: &[&str]) -> App {
     app
 }
 
+/// Instance `key` of `app`'s snapshot expanded with one session row
+/// (`args` as `tui::procs::session_rows` writes them), selected.
+pub(super) fn select_session_row(mut app: App, key: &str, args: &str) -> App {
+    use crate::tui::procs::{ProcRow, ProcState, SESSION_PID};
+    let rows = vec![ProcRow { pid: SESSION_PID.into(), depth: 0, args: args.into() }];
+    app.expanded_procs.insert(key.into());
+    app.procs.insert(key.into(), ProcState::Rows { rows, signalable: false, sessions: None });
+    let snapshot = app.snapshot.as_ref().unwrap();
+    let i = snapshot.instances.iter().position(|r| crate::tui::remote::instance_key(r) == key).unwrap();
+    let at = app.visible_nodes().iter().position(|n| *n == Node::Proc { instance: i, row: 0 }).unwrap();
+    app.selected[Tab::Instances.index()] = at;
+    app
+}
+
 pub(super) fn mouse(kind: MouseEventKind, column: u16) -> MouseEvent {
     MouseEvent { kind, column, row: 0, modifiers: KeyModifiers::NONE }
 }

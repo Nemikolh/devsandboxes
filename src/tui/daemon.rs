@@ -47,9 +47,10 @@
 //! One-shot reads and writes: the logs modal (`containers.logs`), the config
 //! view (`sandboxes.get`/`services.get`, `containers.inspect`), the build
 //! log (`instances.buildLog`), process signals (`instances.signal`),
-//! `:rename` (`instances.rename`) and done/undone (`instances.done`) are
-//! quick, so they share this connection ([`Cmd::Fetch`], [`Cmd::Signal`],
-//! [`Cmd::Rename`], [`Cmd::Done`]). Each is answered by one
+//! ending a session (`sessions.rm`), `:rename` (`instances.rename`) and
+//! done/undone (`instances.done`) are quick, so they share this connection
+//! ([`Cmd::Fetch`], [`Cmd::Signal`], [`Cmd::SessionRm`], [`Cmd::Rename`],
+//! [`Cmd::Done`]). Each is answered by one
 //! [`DaemonUpdate`] naming its target; disconnected, that answer says the
 //! dashboard needs devsandbox serve ([`needs_serve`]), as `cancel`'s does.
 //!
@@ -72,7 +73,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::app::{ConfigKind, Fetch, IdentityOn, IdentityReq, PendingDone, PendingSignal, PortRequest, PortRow};
+use super::app::{
+    ConfigKind, Fetch, IdentityOn, IdentityReq, PendingDone, PendingSessionRm, PendingSignal, PortRequest, PortRow,
+};
 use super::prompt::PromptAction;
 use crate::serve::verbs_client::identity::{self, Ask, Group, Scope};
 use crate::build_log::Tail;
@@ -126,7 +129,8 @@ pub enum DaemonUpdate {
     Sessions { instance: String, lines: Result<Vec<String>, String> },
     /// [`Cmd::BuildLog`]'s answer, for `App::set_build_log`.
     BuildLog { instance: String, read: Result<Option<Tail>, String> },
-    /// A process signal's status line; the process rows are stale.
+    /// A process signal's or a session end's status line; the process rows
+    /// are stale.
     Signalled(String),
     /// A rename's status line; the renamed row arrives with a push.
     Renamed(String),
@@ -164,6 +168,8 @@ enum Cmd {
     BuildLog(String),
     /// `instances.signal`.
     Signal(PendingSignal),
+    /// `sessions.rm`, and where its instance is (a remote one's root).
+    SessionRm(PendingSessionRm, Route),
     /// `instances.rename`.
     Rename { instance: String, new_name: String },
     /// `instances.setProfile`.
@@ -248,6 +254,12 @@ impl DaemonWorker {
     /// [`DaemonUpdate::Signalled`].
     pub fn signal(&self, sig: PendingSignal) {
         self.send(Cmd::Signal(sig));
+    }
+
+    /// End a helper session. Never blocks; answered by
+    /// [`DaemonUpdate::Signalled`].
+    pub fn session_rm(&self, rm: PendingSessionRm, route: Route) {
+        self.send(Cmd::SessionRm(rm, route));
     }
 
     /// Rename an instance. Never blocks; answered by
@@ -528,6 +540,26 @@ fn signal_status(sig: &PendingSignal, answer: Answer) -> String {
     }
 }
 
+/// The API call for [`Cmd::SessionRm`] in config root `root`, a remote
+/// instance's in `route`'s root there (as [`Fetch::Sessions`]).
+fn session_rm_call(root: &Path, rm: &PendingSessionRm, route: &Route) -> (&'static str, Value) {
+    let (machine, instance) = split(&rm.instance);
+    let root = match (machine, &route.root) {
+        (Some(_), Some(remote)) => remote.clone(),
+        _ => root.to_string_lossy().into_owned(),
+    };
+    on_machine(("sessions.rm", json!({ "root": root, "instance": instance, "id": rm.id })), machine)
+}
+
+/// The status line for a `sessions.rm` answer.
+fn session_rm_status(rm: &PendingSessionRm, answer: Answer) -> String {
+    match answer {
+        Answer::Ok(_) => format!("ended session {} in {}", rm.id, rm.instance),
+        Answer::Refused(msg) => format!("end session: {msg}"),
+        Answer::Unreachable(line) => line,
+    }
+}
+
 /// The API call for [`Cmd::Rename`].
 fn rename_call(key: &str, new_name: &str) -> (&'static str, Value) {
     let (machine, instance) = split(key);
@@ -803,6 +835,7 @@ fn run(dir: &Path, connector: &Connector, rx: Receiver<Cmd>, utx: Sender<DaemonU
             Ok(Cmd::Fetch(fetch, route)) => w.fetch(fetch, &route),
             Ok(Cmd::BuildLog(id)) => w.build_log(id),
             Ok(Cmd::Signal(sig)) => w.signal(sig),
+            Ok(Cmd::SessionRm(rm, route)) => w.session_rm(rm, &route),
             Ok(Cmd::Rename { instance, new_name }) => w.rename(&instance, &new_name),
             Ok(Cmd::SetProfile { instance, profile }) => w.set_profile(&instance, &profile),
             Ok(Cmd::Done(req)) => w.set_done(req),
@@ -1006,6 +1039,11 @@ impl Worker<'_> {
     fn signal(&mut self, sig: PendingSignal) {
         let answer = self.one_shot(sig.signal.name(), signal_call(&sig));
         self.send(DaemonUpdate::Signalled(signal_status(&sig, answer)));
+    }
+
+    fn session_rm(&mut self, rm: PendingSessionRm, route: &Route) {
+        let answer = self.one_shot("end session", session_rm_call(self.dir, &rm, route));
+        self.send(DaemonUpdate::Signalled(session_rm_status(&rm, answer)));
     }
 
     fn rename(&mut self, instance: &str, new_name: &str) {
@@ -1386,6 +1424,10 @@ mod tests {
         PendingSignal { instance: "web-2".into(), pid: pid.into(), signal: super::super::app::Signal::Term }
     }
 
+    fn rm(instance: &str) -> PendingSessionRm {
+        PendingSessionRm { instance: instance.into(), id: "1790000000-a1b2".into() }
+    }
+
     fn response(result: Option<Value>, error: Option<(&str, &str)>) -> Response {
         use crate::serve::proto::ErrorBody;
         let error = error.map(|(code, message)| ErrorBody { code: code.into(), message: message.into(), data: None });
@@ -1403,12 +1445,14 @@ mod tests {
         worker.fetch(logs.clone(), Route::default());
         worker.build_log("id0".into());
         worker.signal(sig("42"));
+        worker.session_rm(rm("web-2"), Route::default());
         worker.rename("a".into(), "b".into());
         worker.set_profile("box/a".into(), "work".into());
         worker.set_done(done.clone());
         assert_eq!(rx.try_recv().unwrap(), Cmd::Fetch(logs, Route::default()));
         assert_eq!(rx.try_recv().unwrap(), Cmd::BuildLog("id0".into()));
         assert_eq!(rx.try_recv().unwrap(), Cmd::Signal(sig("42")));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::SessionRm(rm("web-2"), Route::default()));
         assert_eq!(rx.try_recv().unwrap(), Cmd::Rename { instance: "a".into(), new_name: "b".into() });
         assert_eq!(rx.try_recv().unwrap(), Cmd::SetProfile { instance: "box/a".into(), profile: "work".into() });
         assert_eq!(rx.try_recv().unwrap(), Cmd::Done(done));
@@ -1469,6 +1513,12 @@ mod tests {
             signal_call(&PendingSignal { signal: super::super::app::Signal::Kill, ..sig("42") }),
             ("instances.signal", json!({"instance": "web-2", "pid": "42", "signal": "KILL"}))
         );
+        assert_eq!(
+            session_rm_call(root, &rm("web-2"), &Route::default()),
+            ("sessions.rm", json!({"root": "/cfg", "instance": "web-2", "id": "1790000000-a1b2"}))
+        );
+        assert_eq!(session_rm_status(&rm("web-2"), Answer::Ok(json!({"ok": true}))), "ended session 1790000000-a1b2 in web-2");
+        assert_eq!(session_rm_status(&rm("web-2"), Answer::Refused("no session".into())), "end session: no session");
         assert_eq!(rename_call("a", "b"), ("instances.rename", json!({"instance": "a", "newName": "b"})));
         assert_eq!(
             done_call(&PendingDone { instance: "a".into(), done: false, report: true }),
@@ -1501,6 +1551,10 @@ mod tests {
         assert_eq!(
             fetch_call(root, &Fetch::Sessions { instance: "box/web-2".into() }, &remote).1,
             ("sessions.list", json!({"root": "/r/one", "instance": "web-2", "machine": "box"}))
+        );
+        assert_eq!(
+            session_rm_call(root, &rm("box/web-2"), &remote),
+            ("sessions.rm", json!({"root": "/r/one", "instance": "web-2", "id": "1790000000-a1b2", "machine": "box"}))
         );
         assert_eq!(cancel_call("box/web-2"), ("instances.cancel", json!({"instance": "web-2", "machine": "box"})));
         assert_eq!(build_log_call("box/id0").1, json!({"instance": "id0", "lines": 500, "ansi": true, "machine": "box"}));
@@ -1563,6 +1617,8 @@ mod tests {
         let (_, call) = fetch_call(&dir, &Fetch::Inspect { container: "web".into() }, &Route::default());
         assert!(matches!(ask(call), Answer::Refused(m) if m.contains("not a devsandbox container")));
         assert!(matches!(ask(signal_call(&sig("0"))), Answer::Refused(m) if m.contains("`pid` must be a process id")));
+        let bad = PendingSessionRm { id: "x".into(), ..rm("web-2") };
+        assert!(matches!(ask(session_rm_call(&dir, &bad, &Route::default())), Answer::Refused(m) if m.contains("bad session id `x`")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

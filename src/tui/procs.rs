@@ -19,11 +19,26 @@ pub struct ProcRow {
 /// true when the rows' pids are container-namespace (from `exec ps`), so the
 /// SIGTERM/SIGKILL shortcuts can target them; false for a host-side `top`
 /// fallback (see [`ProcList`](super::super::runtime::ProcList)). `sessions`:
-/// the helper's session count, `None` when it didn't answer one.
+/// the helper's session count, `None` when it didn't answer a list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcState {
-    Rows { rows: Vec<ProcRow>, signalable: bool, sessions: Option<crate::runtime::procs::SessionCount> },
+    Rows { rows: Vec<ProcRow>, signalable: bool, sessions: Option<SessionCount> },
     Message(String),
+}
+
+/// How many of an instance's helper sessions are running, and how many of
+/// those have no client attached: the Detail line and the tree badge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionCount {
+    pub running: usize,
+    pub detached: usize,
+}
+
+impl SessionCount {
+    pub fn of(sessions: &[crate::runtime::procs::Session]) -> SessionCount {
+        let running = sessions.iter().filter(|s| s.running());
+        SessionCount { running: running.clone().count(), detached: running.filter(|s| !s.attached).count() }
+    }
 }
 
 /// The `row` payload of a [`Node::Proc`](super::data::Node::Proc) that stands for
@@ -138,6 +153,10 @@ pub fn build_forest(rows: Vec<(String, String, String)>) -> Vec<ProcRow> {
 /// so the signal shortcuts and the agent count skip it.
 pub const RUN_PID: &str = "run";
 
+/// The gutter label of a session row: not a pid either; `a`/`enter`
+/// attach it, `K` ends it ([`session_id`]).
+pub const SESSION_PID: &str = "session";
+
 /// Runs shown under an instance's processes, newest kept.
 pub const MAX_RUN_ROWS: usize = 5;
 
@@ -158,10 +177,38 @@ pub fn proc_state(entry: crate::serve::api::InstanceProcs) -> ProcState {
             let triples = listing.processes.into_iter().map(|p| (p.pid, p.ppid, p.args)).collect();
             let mut rows = build_forest(triples);
             rows.extend(run_rows(&listing.runs));
-            ProcState::Rows { rows, signalable: listing.signalable, sessions: listing.sessions }
+            let sessions = listing.sessions.map(|list| {
+                rows.extend(session_rows(&list));
+                SessionCount::of(&list)
+            });
+            ProcState::Rows { rows, signalable: listing.signalable, sessions }
         }
         InstanceProcs::Failed { error } => ProcState::Message(format!("(processes unavailable: {error})")),
     }
+}
+
+/// Rows for the running `sessions` (attached or not), after the runs:
+/// `session` in the gutter, `<id> attached|detached <argv>` as args. Ended
+/// and `lost` ones can't be attached, so aren't rows.
+pub fn session_rows(sessions: &[crate::runtime::procs::Session]) -> Vec<ProcRow> {
+    sessions
+        .iter()
+        .filter(|s| s.running() && !s.id.is_empty())
+        .map(|s| {
+            let mut args = format!("{} {}", s.id, if s.attached { "attached" } else { "detached" });
+            if !s.argv.is_empty() {
+                args.push(' ');
+                args.push_str(&s.argv);
+            }
+            ProcRow { pid: SESSION_PID.to_string(), depth: 0, args }
+        })
+        .collect()
+}
+
+/// The session id of a [`session_rows`] row (its args' first word), `None`
+/// for any other row.
+pub fn session_id(row: &ProcRow) -> Option<&str> {
+    (row.pid == SESSION_PID).then(|| row.args.split(' ').next()).flatten().filter(|id| !id.is_empty())
 }
 
 /// `<id> <state> <argv…>`: the line as the helper printed it, start time left out.
@@ -215,7 +262,12 @@ mod tests {
             processes: vec![p("1", "0", "init"), p("7", "1", "claude")],
             signalable: true,
             runs: runs("1790000000-a1b2 running 2026-09-21T14:13:20Z sleep 9"),
-            sessions: Some(crate::runtime::procs::SessionCount { running: 1, detached: 1 }),
+            sessions: Some(crate::runtime::procs::parse_sessions(
+                "1790000001-0000 running detached 2026-09-21T14:13:21Z bash -l\n\
+1790000002-0000 exited 0 - 2026-09-21T14:13:22Z vim\n\
+1790000003-0000 running attached 2026-09-21T14:13:23Z claude\n\
+1790000004-0000 lost - 2026-09-21T14:13:24Z sh",
+            )),
         };
         assert_eq!(
             proc_state(InstanceProcs::Listed(listing)),
@@ -224,17 +276,31 @@ mod tests {
                     ProcRow { pid: "1".into(), depth: 0, args: "init".into() },
                     ProcRow { pid: "7".into(), depth: 1, args: "claude".into() },
                     ProcRow { pid: RUN_PID.into(), depth: 0, args: "1790000000-a1b2 running sleep 9".into() },
+                    ProcRow { pid: SESSION_PID.into(), depth: 0, args: "1790000001-0000 detached bash -l".into() },
+                    ProcRow { pid: SESSION_PID.into(), depth: 0, args: "1790000003-0000 attached claude".into() },
                 ],
                 signalable: true,
-                sessions: Some(crate::runtime::procs::SessionCount { running: 1, detached: 1 }),
+                sessions: Some(SessionCount { running: 2, detached: 1 }),
             }
         );
+        let none = ProcsListing { processes: Vec::new(), signalable: true, runs: runs("x running y z"), sessions: Some(Vec::new()) };
+        let ProcState::Rows { rows, sessions, .. } = proc_state(InstanceProcs::Listed(none)) else { panic!() };
+        assert_eq!((rows.len(), sessions), (1, Some(SessionCount::default())), "no sessions, no session rows");
         let top = ProcsListing { processes: vec![p("660011", "1", "x")], signalable: false, runs: Vec::new(), sessions: None };
         assert!(matches!(proc_state(InstanceProcs::Listed(top)), ProcState::Rows { signalable: false, sessions: None, .. }));
         assert_eq!(
             proc_state(InstanceProcs::Failed { error: "not running".into() }),
             ProcState::Message("(processes unavailable: not running)".into())
         );
+    }
+
+    #[test]
+    fn session_ids_come_from_session_rows_only() {
+        let row = |pid: &str, args: &str| ProcRow { pid: pid.into(), depth: 0, args: args.into() };
+        assert_eq!(session_id(&row(SESSION_PID, "1790000001-0000 detached bash")), Some("1790000001-0000"));
+        assert_eq!(session_id(&row(RUN_PID, "1790000001-0000 running bash")), None);
+        assert_eq!(session_id(&row("42", "bash")), None);
+        assert_eq!(session_id(&row(SESSION_PID, "")), None);
     }
 
     fn row(pid: &str, ppid: &str, args: &str) -> (String, String, String) {

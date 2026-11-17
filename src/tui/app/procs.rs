@@ -47,7 +47,58 @@ pub struct PendingSignal {
     pub signal: Signal,
 }
 
+/// A pending `sessions.rm` the event loop should send: end helper session
+/// `id` of `instance` (a key). Set by `K` on a session row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSessionRm {
+    pub instance: String,
+    pub id: String,
+}
+
 impl App {
+    /// The selected session row (`tui::procs::session_rows`) as `(instance
+    /// key, session id)`; `None` on every other selection. Not gated on
+    /// `signalable`: the sessions come from the helper, not `ps`.
+    pub(super) fn selected_session(&self) -> Option<(String, String)> {
+        let Node::Proc { instance, row } = self.selected_node()? else {
+            return None;
+        };
+        let inst = self.snapshot.as_ref()?.instances.get(instance)?;
+        let key = instance_key(inst);
+        let ProcState::Rows { rows, .. } = self.procs.get(&key)? else {
+            return None;
+        };
+        let id = crate::tui::procs::session_id(rows.get(row)?)?.to_string();
+        Some((key, id))
+    }
+
+    /// `a`/`enter` on a session row: a tab attached to it, taking it over
+    /// when another client is attached (the row was chosen).
+    pub(super) fn attach_selected_session(&mut self) {
+        if let Some((key, id)) = self.selected_session() {
+            self.open_attach(&key, &id);
+        }
+    }
+
+    /// `K` on a session row: queue its `sessions.rm` for the event loop.
+    pub(super) fn end_selected_session(&mut self) {
+        let Some((instance, id)) = self.selected_session() else {
+            return;
+        };
+        self.status = Some(format!("ending session {id}…"));
+        self.pending_session_rm = Some(PendingSessionRm { instance, id });
+    }
+
+    /// Take the pending session end for the event loop to send, if any.
+    pub fn take_pending_session_rm(&mut self) -> Option<PendingSessionRm> {
+        self.pending_session_rm.take()
+    }
+
+    /// Whether the cursor is on a session row (drives the help bar's legend).
+    pub fn on_session_row(&self) -> bool {
+        self.on_proc_row() && self.selected_session().is_some()
+    }
+
     /// The selected process row as `(instance, pid)`, when the cursor is on a
     /// real process (not a `(message)` placeholder) with a numeric pid. Backs the
     /// SIGTERM/SIGKILL shortcuts; `None` on every other selection.
@@ -113,10 +164,13 @@ impl App {
     /// fetch is still in flight), which the Detail panel renders as `…`/`-`.
     pub fn agent_count(&self, instance: &str) -> Option<usize> {
         match self.procs.get(instance) {
-            // Run rows (`RUN_PID`) repeat a live agent's argv: count processes only.
+            // Run and session rows repeat a live agent's argv: count processes only.
             Some(ProcState::Rows { rows, .. }) => Some(
                 rows.iter()
-                    .filter(|r| r.pid != crate::tui::procs::RUN_PID && crate::tui::procs::is_agent(&r.args))
+                    .filter(|r| {
+                        ![crate::tui::procs::RUN_PID, crate::tui::procs::SESSION_PID].contains(&r.pid.as_str())
+                            && crate::tui::procs::is_agent(&r.args)
+                    })
                     .count(),
             ),
             _ => None,
@@ -126,7 +180,7 @@ impl App {
     /// The helper's session count for a cached instance (`instances.procs`'
     /// `sessions`). `None` when nothing is cached, the cache is a message, or
     /// the helper didn't answer one (missing or predating sessions).
-    pub fn session_count(&self, instance: &str) -> Option<crate::runtime::procs::SessionCount> {
+    pub fn session_count(&self, instance: &str) -> Option<crate::tui::procs::SessionCount> {
         match self.procs.get(instance) {
             Some(ProcState::Rows { sessions, .. }) => *sessions,
             _ => None,
@@ -454,6 +508,36 @@ mod tests {
         assert!(app.take_pending_signal().is_none());
     }
 
+    /// `K` on a session row ends it (its key's instance, machine included),
+    /// `t` says what the row's keys are; neither signals.
+    #[test]
+    fn session_rows_end_on_shift_k_and_never_signal() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        let mut app = select_session_row(app, "inst0", "1790000000-a1b2 attached bash -l");
+        assert!(app.on_session_row() && !app.proc_row_signalable());
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(app.status.as_deref(), Some("a attaches, K ends the session"));
+        assert!(app.take_pending_signal().is_none());
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(app.status.as_deref(), Some("ending session 1790000000-a1b2…"));
+        assert_eq!(
+            app.take_pending_session_rm(),
+            Some(PendingSessionRm { instance: "inst0".into(), id: "1790000000-a1b2".into() })
+        );
+        assert!(app.take_pending_signal().is_none());
+
+        let mut app = select_session_row(machine_app(), "box/inst1", "1790000000-a1b2 detached vim");
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(app.take_pending_session_rm().unwrap().instance, "box/inst1");
+
+        // A run row isn't a session.
+        let mut app = app_on_proc_row(&[crate::tui::procs::RUN_PID]);
+        assert!(!app.on_session_row());
+        app.on_key(key(KeyCode::Char('K')));
+        assert!(app.take_pending_session_rm().is_none());
+    }
+
     #[test]
     fn agent_count_counts_agent_rows_in_cache() {
         use crate::tui::procs::{ProcRow, ProcState};
@@ -471,6 +555,12 @@ mod tests {
                 depth: 0,
                 args: "1790000000-a1b2 running claude -p x".into(),
             },
+            // Nor a session row.
+            ProcRow {
+                pid: crate::tui::procs::SESSION_PID.into(),
+                depth: 0,
+                args: "1790000001-a1b2 attached claude".into(),
+            },
         ];
         app.procs.insert("x".into(), ProcState::Rows { rows, signalable: true, sessions: None });
         assert_eq!(app.agent_count("x"), Some(2));
@@ -482,7 +572,7 @@ mod tests {
 
     #[test]
     fn session_count_reads_the_cached_listing() {
-        use crate::runtime::procs::SessionCount;
+        use crate::tui::procs::SessionCount;
         use crate::tui::procs::ProcState;
         let mut app = new_app();
         assert_eq!(app.session_count("x"), None);

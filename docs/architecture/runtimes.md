@@ -129,9 +129,9 @@ a container controls: dispatcher run ops, `devsbd run ls` / `session ls`, the di
 `runtime::procs` (unix-only) is what the daemon's `instances.procs` answers
 from: `parse_top` (the `ps -eo pid,ppid,args` listing), `parse_runs` and
 `run_ls` (the helper's `devsbd run ls`, bounded to 64 KiB / 5 s; any failure
-means "no runs"), `count_sessions` and `session_ls` (the helper's `devsbd
-session ls` under the same bounds, counted as running and detached
-`SessionCount`; any failure means no count). The dashboard's process forest
+means "no runs"), `parse_sessions` and `session_ls` (the helper's `devsbd
+session ls` under the same bounds, as `Session`s; any failure means no
+sessions). The dashboard's process forest
 lives in `tui::procs`.
 
 ## events

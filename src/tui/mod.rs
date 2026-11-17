@@ -335,6 +335,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(sig) = app.take_pending_signal() {
             daemon.signal(sig);
         }
+        // `K` on a session row: `sessions.rm`, answered as a signal is.
+        if let Some(rm) = app.take_pending_session_rm() {
+            let route = app.snapshot.as_ref().map(|s| remote::instance_route(s, &rm.instance)).unwrap_or_default();
+            daemon.session_rm(rm, route);
+        }
         // The identity offer's read, or an identity modal's answer (the
         // verb it holds comes back with the answer).
         if let Some(req) = app.take_pending_identity() {
@@ -405,8 +410,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 daemon::DaemonUpdate::Inspect { container, body } => app.set_inspect(&container, body),
                 daemon::DaemonUpdate::Sessions { instance, lines } => app.sessions_listed(&instance, lines),
                 daemon::DaemonUpdate::BuildLog { instance, read } => app.set_build_log(&instance, read),
-                // Refresh the processes now so a killed one drops off the
-                // forest without waiting for the next tick.
+                // Refresh the processes now so a killed one (or an ended
+                // session) drops off the tree without waiting for the next
+                // tick.
                 daemon::DaemonUpdate::Signalled(line) => {
                     app.status = Some(line);
                     app.needs_proc_fetch = true;

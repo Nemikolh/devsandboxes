@@ -505,7 +505,7 @@ then:
     "processes": [{"pid": "1", "ppid": "0", "args": "sleep infinity"}],
     "signalable": true,
     "runs": [{"id": "1790000000-a1b2", "state": "exited 4", "started": "2026-09-21T14:13:20Z", "argv": "sh -c make"}],
-    "sessions": {"running": 2, "detached": 1}
+    "sessions": [{"id": "1790000001-c3d4", "state": "running", "attached": false, "started": "2026-09-21T14:13:21Z", "argv": "bash -l"}]
   },
   "api-2": {"error": "not running"}
 }
@@ -517,9 +517,10 @@ no `ps` and the runtime's host-side `top` listed it instead (host pids,
 which can't be signalled from inside). `runs` are the helper's tracked runs
 (`devsbd run ls`), oldest first: `state` is `running`,
 `lost`, `exited <code>` or `killed <signal>`; `[]` without a helper that
-tracks runs. `sessions` counts the helper's sessions (`devsbd session
-ls`, what `devsandbox exec` runs in): `running`, and `detached`, those of
-them with no client attached; absent without a helper that has sessions.
+tracks runs. `sessions` are the helper's sessions (`devsbd session ls`,
+what `devsandbox exec` runs in), oldest first: `state` as a run's,
+`attached` whether a client is; absent without a helper that has
+sessions.
 An instance that isn't in `state.toml`, isn't running, or
 whose listing failed is an `{"error": "…"}` entry, never a failed call.
 Up to three `exec`s per instance (`ps`, `run ls`, `session ls`): seconds

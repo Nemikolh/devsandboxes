@@ -2087,7 +2087,7 @@ fn instance_tree_row(
     r: &InstanceRow,
     status: &str,
     unread: usize,
-    sessions: Option<crate::runtime::procs::SessionCount>,
+    sessions: Option<crate::tui::procs::SessionCount>,
     owner: Option<String>,
     kind: Option<&'static str>,
 ) -> (Vec<Cell<'static>>, Style) {
@@ -2246,7 +2246,7 @@ fn detail_lines<'a>(
     snapshot: Option<&'a Snapshot>,
     node: Option<Node>,
     agent_count: Option<usize>,
-    sessions: Option<crate::runtime::procs::SessionCount>,
+    sessions: Option<crate::tui::procs::SessionCount>,
     machines: &[crate::serve::snapshots::SnapshotMachine],
 ) -> Vec<Line<'a>> {
     match (snapshot, node) {
@@ -2337,7 +2337,7 @@ fn machine_detail(machines: &[crate::serve::snapshots::SnapshotMachine], machine
 fn instance_detail(
     r: &InstanceRow,
     agent_count: Option<usize>,
-    sessions: Option<crate::runtime::procs::SessionCount>,
+    sessions: Option<crate::tui::procs::SessionCount>,
 ) -> Vec<Line<'_>> {
     let mut lines: Vec<Line> = Vec::new();
     // First, so the panel's few rows never clip it: what failed and why.
@@ -2398,7 +2398,7 @@ fn agents_line(r: &InstanceRow, agent_count: Option<usize>) -> Line<'static> {
 /// helper answered a count; none otherwise (stopped, not fetched yet, or a
 /// helper predating sessions). The detached part is yellow and only there
 /// when some are.
-fn sessions_line(r: &InstanceRow, sessions: Option<crate::runtime::procs::SessionCount>) -> Option<Line<'static>> {
+fn sessions_line(r: &InstanceRow, sessions: Option<crate::tui::procs::SessionCount>) -> Option<Line<'static>> {
     let s = sessions.filter(|_| matches!(r.status, ContainerStatus::Running(_)))?;
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut spans = vec![
@@ -2469,9 +2469,12 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Modal::None => match app.tab {
             // A process row acts only on itself: signals, nothing forwarded to
             // the parent instance. Signals need container-namespace pids, so a
-            // `top` fallback listing (or a placeholder row) drops them.
+            // `top` fallback listing (or a placeholder row) drops them. A
+            // session row attaches or ends its session.
             Tab::Instances if app.on_proc_row() => {
-                if app.proc_row_signalable() {
+                if app.on_session_row() {
+                    "q quit · tab switch · ↑↓ select · ← parent · a attach · K end session · : cmd · ? help".to_string()
+                } else if app.proc_row_signalable() {
                     "q quit · tab switch · ↑↓ select · ← parent · t SIGTERM · K SIGKILL · : cmd · ? help"
                         .to_string()
                 } else {
@@ -3259,7 +3262,7 @@ mod tests {
     /// unknown) and a `sessions:` line in the selected instance's Detail.
     #[test]
     fn session_counts_show_in_the_tree_and_detail() {
-        use crate::runtime::procs::SessionCount;
+        use crate::tui::procs::SessionCount;
         let mut app = phase_app(vec![("web", running(), None), ("idle", running(), None), ("old", running(), None)]);
         let rows = |sessions| ProcState::Rows { rows: Vec::new(), signalable: true, sessions };
         app.procs.insert("web".into(), rows(Some(SessionCount { running: 2, detached: 1 })));
@@ -3286,7 +3289,7 @@ mod tests {
     /// a profile and drift shows them all, drift (the last line) included.
     #[test]
     fn detail_grows_so_drift_is_never_clipped() {
-        use crate::runtime::procs::SessionCount;
+        use crate::tui::procs::SessionCount;
         let mut app = phase_app(vec![("web", running(), None)]);
         let mut s = app.snapshot.clone().unwrap();
         s.instances[0].profile = Some("work".into());

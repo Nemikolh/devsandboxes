@@ -41,7 +41,7 @@ pub use inbox::{
 pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
 pub use actions::{PendingDone, VerbEnd, not_yet_code};
 pub use identity::{IdentityOn, IdentityReq};
-pub use procs::{PendingSignal, Signal};
+pub use procs::{PendingSessionRm, PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
 pub use terminal::{ExecCli, Redial};
 pub use view::{
@@ -198,6 +198,8 @@ pub struct App {
     /// An `instances.signal` request the event loop should send (the
     /// SIGTERM/SIGKILL shortcuts on a process row). Runs without suspending.
     pub pending_signal: Option<PendingSignal>,
+    /// A `sessions.rm` the event loop should send (`K` on a session row).
+    pub pending_session_rm: Option<PendingSessionRm>,
     /// Instance whose `run`/`rebuild`/`start` the event loop should cancel
     /// (`d` on an in-flight row, confirmed): `instances.cancel` through the
     /// daemon, which SIGINTs its recorded pid's group.
@@ -334,6 +336,7 @@ impl App {
             starting: BTreeSet::new(),
             after_start: None,
             pending_signal: None,
+            pending_session_rm: None,
             pending_cancel: None,
             pending_build_log: None,
             build_log_in_flight: false,
@@ -559,8 +562,10 @@ impl App {
         // A selected process row has its own action set: signals only. The
         // instance-forwarding shortcuts (rename/vscode/stop/logs/config/terminal)
         // are disabled here, leaving navigation and the SIGTERM/SIGKILL keys.
+        // A session row's are attach and end instead.
         let on_proc = self.tab == Tab::Instances
             && matches!(self.selected_node(), Some(Node::Proc { .. }));
+        let on_session = on_proc && self.selected_session().is_some();
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
@@ -583,6 +588,9 @@ impl App {
             }
             // Process-row signals; `t` doubles as SIGTERM there, otherwise it
             // opens a terminal.
+            KeyCode::Char('a') | KeyCode::Enter if on_session => self.attach_selected_session(),
+            KeyCode::Char('K') if on_session => self.end_selected_session(),
+            KeyCode::Char('t') if on_session => self.status = Some("a attaches, K ends the session".into()),
             KeyCode::Char('t') if on_proc => self.signal_selected_proc(Signal::Term),
             KeyCode::Char('K') if on_proc => self.signal_selected_proc(Signal::Kill),
             KeyCode::Char('t') => self.open_terminal(false),

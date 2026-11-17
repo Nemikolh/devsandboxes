@@ -113,6 +113,8 @@ Process rows (expanded instance)
   t           SIGTERM          K   SIGKILL
   (the instance shortcuts above are disabled on a process row;
    signals need `ps` in the image — a `top` fallback listing hides them)
+  a / enter   on a `session` row: attach it (takes it over if attached)
+  K           on a `session` row: end the session
 
 Terminals
   t           open terminal (instance / service)
