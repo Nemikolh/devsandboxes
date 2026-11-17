@@ -8,7 +8,8 @@ field, merge rule or variable change. This doc does not repeat it.
 
 Code: `src/config.rs` (`find`, `migrate_legacy`, `Config::load`,
 `Config::resolve_sandbox`, `resolve_extends`, `deep_merge`,
-`SandboxProperties`, `SandboxProperties::ignored`, `Profile`,
+`SandboxProperties`, `SandboxProperties::ignored`, `HostRequirements`,
+`GpuRequirement`, `Profile`,
 `Config::validate`, `Config::allowed_profiles`, `Service`,
 `resolve_service`, `substitute`, `MountContext`, `ContainerEnv`,
 `ContainerEnv::resolve`, `sandbox_hash`, `config_hash`, `build_hash`,
@@ -50,7 +51,11 @@ A fourth table, `[profiles.*]`, is typed at parse.
   are hard errors). `SandboxProperties` is the devcontainer.json schema plus
   devsandbox extras. Valid devcontainer properties devsandbox doesn't act on
   still parse; `ignored()` lists them and `run` warns before creating the
-  container. `SandboxProperties::identity` folds devcontainer's
+  container. `hostRequirements` is typed anyway (`HostRequirements`, with
+  `GpuRequirement`'s own `Deserialize` for `gpu`'s bool | `"optional"` |
+  table forms; `HostRequirements::gpu_need` reads it as a `GpuNeed`), and
+  `ignored()` names each of its set keys. `Service` takes the same
+  `hostRequirements`. `SandboxProperties::identity` folds devcontainer's
   `updateRemoteUserUID` into the `identity` field (`false` means `image`
   when `identity` is unset). `forwardPorts` entries are deduplicated after merge and each
   named service must be in the sandbox's `services`. `profiles` entries are

@@ -268,7 +268,9 @@ pub struct SandboxProperties {
     pub shutdown_action: Option<Value>,
     pub cap_add: Option<Value>,
     pub security_opt: Option<Value>,
-    pub host_requirements: Option<Value>,
+    /// devcontainer `hostRequirements`: typed, but every set key is still
+    /// [`Self::ignored`].
+    pub host_requirements: Option<HostRequirements>,
     pub wait_for: Option<Value>,
     pub secrets: Option<Value>,
 }
@@ -381,6 +383,113 @@ impl FolderEntry {
     }
 }
 
+/// devcontainer `hostRequirements`, on a sandbox or (a devsandbox extension)
+/// a `[services.*]` table. Spelled as the spec spells it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequirements {
+    pub gpu: Option<GpuRequirement>,
+    pub cpus: Option<Value>,
+    pub memory: Option<Value>,
+    pub storage: Option<Value>,
+}
+
+/// `hostRequirements.gpu`: `true` | `false` | `"optional"` |
+/// `{ cores, memory }` (the table form counts as required).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuRequirement {
+    /// `false`: no GPU asked for.
+    No,
+    Required,
+    Optional,
+    /// The spec's minimums; parsed, not enforced.
+    Min { cores: Option<u64>, memory: Option<String> },
+}
+
+/// What a sandbox or service needs of a GPU, from [`HostRequirements::gpu_need`].
+#[allow(dead_code)] // nothing acts on a GPU need yet
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuNeed {
+    Required,
+    Optional,
+}
+
+impl HostRequirements {
+    /// The GPU asked for, `None` when unset or `false`.
+    #[allow(dead_code)] // nothing acts on a GPU need yet
+    pub fn gpu_need(&self) -> Option<GpuNeed> {
+        match self.gpu.as_ref()? {
+            GpuRequirement::No => None,
+            GpuRequirement::Required | GpuRequirement::Min { .. } => Some(GpuNeed::Required),
+            GpuRequirement::Optional => Some(GpuNeed::Optional),
+        }
+    }
+
+    /// Dotted names (under `hostRequirements.`) of the keys set.
+    fn set_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // `false` asks for nothing, so there is nothing to ignore.
+        if let Some(gpu) = self.gpu.as_ref().filter(|g| **g != GpuRequirement::No) {
+            out.push("hostRequirements.gpu".to_string());
+            if let GpuRequirement::Min { cores, memory } = gpu {
+                if cores.is_some() {
+                    out.push("hostRequirements.gpu.cores".into());
+                }
+                if memory.is_some() {
+                    out.push("hostRequirements.gpu.memory".into());
+                }
+            }
+        }
+        for (set, name) in [
+            (self.cpus.is_some(), "cpus"),
+            (self.memory.is_some(), "memory"),
+            (self.storage.is_some(), "storage"),
+        ] {
+            if set {
+                out.push(format!("hostRequirements.{name}"));
+            }
+        }
+        out
+    }
+}
+
+impl<'de> Deserialize<'de> for GpuRequirement {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        /// The table form, its own struct so unknown keys error.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Min {
+            cores: Option<u64>,
+            memory: Option<String>,
+        }
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = GpuRequirement;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("`true`, `false`, `\"optional\"` or `{ cores = …, memory = \"…\" }`")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<GpuRequirement, E> {
+                Ok(if v { GpuRequirement::Required } else { GpuRequirement::No })
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<GpuRequirement, E> {
+                match v {
+                    "optional" => Ok(GpuRequirement::Optional),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<GpuRequirement, A::Error> {
+                let Min { cores, memory } =
+                    Min::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(GpuRequirement::Min { cores, memory })
+            }
+        }
+        de.deserialize_any(V)
+    }
+}
+
 impl<'de> Deserialize<'de> for Autostart {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
         struct V;
@@ -442,10 +551,12 @@ impl SandboxProperties {
             shutdown_action => "shutdownAction",
             cap_add => "capAdd",
             security_opt => "securityOpt",
-            host_requirements => "hostRequirements",
             wait_for => "waitFor",
             secrets => "secrets",
         );
+        if let Some(host) = &self.host_requirements {
+            out.extend(host.set_keys());
+        }
         if let Some(customizations) = &self.customizations {
             if let Some(vscode) = &customizations.vscode {
                 if vscode.settings.is_some() {
@@ -999,6 +1110,11 @@ pub struct Service {
     pub ports: Vec<String>,
     #[serde(default)]
     pub command: Option<StringOrList>,
+    /// The sandbox key, on a service (a devsandbox extension); in the
+    /// service's `config_hash` like every key.
+    #[serde(default, rename = "hostRequirements")]
+    #[allow(dead_code)] // nothing acts on a service's GPU need yet
+    pub host_requirements: Option<HostRequirements>,
 }
 
 /// A validated service with a stable hash of its definition.
@@ -2081,6 +2197,7 @@ profiles = ["work"]
 image = "alpine"
 appPort = [3000]
 runArgs = ["--gpus", "all"]
+hostRequirements = { gpu = { cores = 2, memory = "8gb" }, cpus = 4, storage = "32gb" }
 customizations.vscode.settings = { "editor.formatOnSave" = true }
 customizations.jetbrains.plugins = ["x"]
 "#,
@@ -2092,10 +2209,80 @@ customizations.jetbrains.plugins = ["x"]
             vec![
                 "appPort",
                 "runArgs",
+                "hostRequirements.gpu",
+                "hostRequirements.gpu.cores",
+                "hostRequirements.gpu.memory",
+                "hostRequirements.cpus",
+                "hostRequirements.storage",
                 "customizations.vscode.settings",
                 "customizations.jetbrains",
             ]
         );
+    }
+
+    fn host_requirements(body: &str) -> Result<HostRequirements> {
+        let props = identity_props(&format!("[sandbox.app.hostRequirements]\n{body}"))?;
+        Ok(props.host_requirements.unwrap_or_default())
+    }
+
+    #[test]
+    fn host_requirements_gpu_forms() {
+        let gpu = |body: &str| host_requirements(body).unwrap();
+        assert_eq!(gpu("gpu = true").gpu, Some(GpuRequirement::Required));
+        assert_eq!(gpu("gpu = true").gpu_need(), Some(GpuNeed::Required));
+        assert_eq!(gpu("gpu = false").gpu, Some(GpuRequirement::No));
+        assert_eq!(gpu("gpu = false").gpu_need(), None);
+        assert!(gpu("gpu = false").set_keys().is_empty(), "`false` is nothing to warn about");
+        assert_eq!(gpu("gpu = \"optional\"").gpu_need(), Some(GpuNeed::Optional));
+        let min = gpu("gpu = { cores = 2, memory = \"8gb\" }");
+        assert_eq!(
+            min.gpu,
+            Some(GpuRequirement::Min { cores: Some(2), memory: Some("8gb".into()) })
+        );
+        assert_eq!(min.gpu_need(), Some(GpuNeed::Required));
+        assert_eq!(gpu("gpu = {}").gpu_need(), Some(GpuNeed::Required));
+        assert_eq!(gpu("cpus = 4").gpu_need(), None);
+        assert_eq!(identity_props("").unwrap().host_requirements, None);
+    }
+
+    #[test]
+    fn host_requirements_rejects_bad_values() {
+        let err = |body: &str| format!("{:#}", host_requirements(body).unwrap_err());
+        let bad = err("gpu = \"always\"");
+        assert!(bad.contains("always") && bad.contains("optional"), "{bad}");
+        assert!(err("gpus = true").contains("gpus"));
+        assert!(err("gpu = { core = 2 }").contains("core"));
+        assert!(err("gpu = 1").contains("optional"));
+    }
+
+    #[test]
+    fn host_requirements_gpu_merges_through_extends() {
+        let config = Config::parse(
+            r#"
+[template.t]
+hostRequirements = { gpu = true, cpus = 2 }
+[sandbox.s]
+extends = "t"
+image = "alpine"
+hostRequirements.gpu = "optional"
+"#,
+        )
+        .unwrap();
+        let host = config.resolve_sandbox("s").unwrap().properties.host_requirements.unwrap();
+        assert_eq!(host.gpu_need(), Some(GpuNeed::Optional));
+        assert!(host.cpus.is_some(), "template's other keys stay");
+    }
+
+    #[test]
+    fn host_requirements_gpu_is_drift() {
+        let hash = sandbox_hash_of;
+        assert_ne!(hash(""), hash("hostRequirements.gpu = true"));
+        assert_ne!(hash("hostRequirements.gpu = true"), hash("hostRequirements.gpu = \"optional\""));
+    }
+
+    fn sandbox_hash_of(body: &str) -> String {
+        let config = Config::parse(&format!("[sandbox.app]\nfolder = \"../app\"\n{body}")).unwrap();
+        config.resolve_sandbox("app").unwrap().config_hash
     }
 
     #[test]
@@ -2706,5 +2893,37 @@ extends = "a"
         )
         .unwrap();
         assert!(both.resolve_service("db").unwrap_err().to_string().contains("only one"));
+    }
+
+    #[test]
+    fn service_host_requirements_parse_and_hash() {
+        let svc = |toml: &str| {
+            Config::parse(&format!("[services.db]\nimage = \"postgres:16\"\n{toml}"))
+                .unwrap()
+                .resolve_service("db")
+                .unwrap()
+        };
+        let plain = svc("");
+        assert_eq!(plain.spec.host_requirements, None);
+        let gpu = svc("hostRequirements.gpu = \"optional\"");
+        assert_eq!(
+            gpu.spec.host_requirements.as_ref().and_then(HostRequirements::gpu_need),
+            Some(GpuNeed::Optional)
+        );
+        assert_ne!(plain.config_hash, gpu.config_hash);
+        let yaml = Config::parse_yaml(
+            "services:\n  db:\n    image: postgres:16\n    hostRequirements:\n      gpu: optional\n",
+        )
+        .unwrap()
+        .resolve_service("db")
+        .unwrap();
+        assert_eq!(yaml.spec.host_requirements, gpu.spec.host_requirements);
+        assert_eq!(yaml.config_hash, gpu.config_hash);
+        let bad = Config::parse("[services.db]\nimage = \"x\"\nhostRequirements.gpu = \"yes\"")
+            .unwrap()
+            .resolve_service("db")
+            .unwrap_err()
+            .to_string();
+        assert!(bad.contains("optional"), "{bad}");
     }
 }

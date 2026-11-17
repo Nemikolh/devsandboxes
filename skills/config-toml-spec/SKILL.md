@@ -99,7 +99,9 @@ Lifecycle command forms: `"shell string"` (→ `sh -c`), `["argv", "..."]`, or a
 
 ### Accepted but ignored (warned at `run`)
 
-`name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, `customizations.vscode.settings`, any other `customizations.vscode.*` or `customizations.<tool>`.
+`name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements` (each set key warned by name, `gpu = false` not: `hostRequirements.gpu`, `.gpu.cores`, `.gpu.memory`, `.cpus`, `.memory`, `.storage`), `waitFor`, `secrets`, `customizations.vscode.settings`, any other `customizations.vscode.*` or `customizations.<tool>`.
+
+`hostRequirements` is still typed: unknown keys error, and `gpu` must be `true` (required), `false` (none), `"optional"`, or a table `{ cores = int, memory = "8gb" }` (counts as required; nothing else allowed in it). `cpus` / `memory` / `storage` take any value. `extends` merges it like any table (a sandbox's `hostRequirements.gpu` overrides a template's, the template's other keys stay). It is hashed for drift.
 
 Not accepted at all (hard error): compose keys (`dockerComposeFile`, `service`, `runServices`) — compose support was removed.
 
@@ -130,6 +132,7 @@ Unknown keys error. No `extends` for services.
 | `env` | {string = string} | `-e` vars. |
 | `ports` | [string] | `docker run -p` specs (`"5432"`, `"5432:5432"`, `"127.0.0.1:5432:5432"`). A bare container port (`"5432"`, `"53/udp"`, `"127.0.0.1::5432"`) gets the same host port when it's free, else one picked by the runtime. An explicit host port already published by another container errors. |
 | `command` | string \| [string] | Appended after the image. A string is passed as **one** argv item, not shell-split. |
+| `hostRequirements` | table | The sandbox key and forms (devsandbox extension: the spec has none for services). Parsed and hashed for drift; not acted on, and not warned. |
 
 Sandboxes reach a service by its name as hostname (network alias, or `/etc/hosts` on runtimes without aliases). `devsandbox gc` reaps unreferenced containers; `devsandbox service rebuild <name>` recreates and rewires in place, without restarting the sandboxes.
 
