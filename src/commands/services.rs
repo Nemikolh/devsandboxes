@@ -615,8 +615,7 @@ pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
     let service = config.resolve_service(name)?; // unknown service bails here
     let state = State::load()?;
 
-    // Remove every backing container of this project+service; the referencing
-    // instances (or the global arm below) recreate them fresh.
+    // The referencing instances (or the global arm below) recreate them fresh.
     let mut removed = 0;
     for row in backend().list(true, NAME_PREFIX)? {
         if row.label("devsandbox.project") != Some(project.as_str())

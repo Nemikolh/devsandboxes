@@ -791,6 +791,7 @@ mod tests {
         app.terms.open(term_sess("web-1", "devsandbox-web-1"));
         assert_eq!(app.focus, Focus::Dashboard);
         let panel = crate::tui::ui::terminal_panel_rect(FRAME, false);
+        // A click in the panel body (below the title row) focuses the terminal.
         let click = mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             panel.x + 2,

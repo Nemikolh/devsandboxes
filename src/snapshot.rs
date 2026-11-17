@@ -1543,7 +1543,6 @@ extends = "does-not-exist"
     fn validate_sandbox_flags_folder_and_mount_problems() {
         use crate::config::{Mount, ResolvedSandbox, SandboxProperties};
 
-        // Unique temp config dir with real `repo` and `data` folders inside it.
         let root = std::env::temp_dir().join(format!("devsandbox-validate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("repo")).unwrap();

@@ -171,6 +171,7 @@ pub struct Removed {
 /// `machines.rm`'s answer when this host left its fleet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Left {
+    /// This host's member name.
     pub name: String,
     /// The control plane of the fleet it left (its own name when it was the control plane).
     pub control_plane: String,
@@ -240,7 +241,6 @@ struct NameParams {
     name: String,
 }
 
-/// This host's `member.toml`.
 pub(super) fn member_toml(ctx: &Ctx) -> Result<&std::path::Path, ApiError> {
     ctx.member.as_deref().ok_or_else(|| ApiError::failed("this daemon has no member.toml (no data dir)"))
 }

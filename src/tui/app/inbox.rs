@@ -2297,9 +2297,9 @@ mod tests {
         click(&mut app, 16, 1);
         assert_eq!(app.inbox.view, View::Active);
         assert_eq!(selected(&app).as_deref(), Some("busy"));
-        click(&mut app, 35, 1);
+        click(&mut app, 35, 1); // ›
         assert_eq!(app.inbox.view, View::Done);
-        click(&mut app, 2, 1);
+        click(&mut app, 2, 1); // ‹
         assert_eq!(app.inbox.view, View::Active);
         click(&mut app, 32, 1);
         assert_eq!(app.inbox.view, View::All);

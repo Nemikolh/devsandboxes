@@ -1450,7 +1450,6 @@ pub(crate) fn ls(root: &Path) -> io::Result<String> {
     Ok(out)
 }
 
-/// Wait up to `timeout` for session `id` to stop running.
 fn wait_stopped(dir: &Path, id: &str, timeout: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {

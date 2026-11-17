@@ -48,7 +48,6 @@ enum Incoming {
 /// How [`Conn::call_streaming`] ended.
 #[derive(Debug)]
 pub enum Streamed {
-    /// The request's response.
     Answer(Response),
     /// The callback asked to hang up; the caller drops the connection.
     HungUp,

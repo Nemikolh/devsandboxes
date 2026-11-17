@@ -277,6 +277,7 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Resource usage of running containers.
     fn stats(&self) -> Result<Vec<StatsRow>>;
 
     fn server_version(&self) -> Result<String>;

@@ -2244,6 +2244,7 @@ mod tests {
         // A member.toml that doesn't load adds none.
         std::fs::write(&member, "trust = \"most\"\n").unwrap();
         assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None, Some(&member)).unwrap(), json!([]));
+        // No home `.devsandboxes`, no state: nothing.
         let none = roots_list(&state.with_file_name("absent.toml"), Some(&base), None, None).unwrap();
         assert_eq!(none, json!([]));
         assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None, None).unwrap(), json!([]));

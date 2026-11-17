@@ -1226,7 +1226,7 @@ image = "node"
             // lsof + a *real* nc (netcat-openbsd, so lsof reports the command
             // as `nc`, not `busybox`) and start the listener as a distinct pid.
             assert!(run_ok(&["run", "-d", "--name", &with, "alpine:3.20", "sleep", "300"]));
-            // Add lsof + nc; if apk can't reach the network, skip cleanly.
+            // If apk can't reach the network, skip cleanly.
             if !run_ok(&["exec", "-u", "root", &with, "apk", "add", "--no-cache", "lsof", "netcat-openbsd"]) {
                 return Err("apk add failed (no network?)");
             }

@@ -42,6 +42,7 @@ pub struct KeyInfo {
 pub struct IntroInfo {
     pub name: String,
     pub introducer: String,
+    /// The introduced key's fingerprint.
     pub fingerprint: String,
 }
 

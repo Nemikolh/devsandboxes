@@ -1119,8 +1119,6 @@ fn unique_instance_id(state: &State, name: &str) -> String {
 pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandbox) -> Result<()> {
     let build = sandbox_build_hash(dir, &sandbox.properties);
     if container_drifted(container, &sandbox.config_hash, &build)? {
-        // Suggest a copy-pasteable command: strip the container prefix to the
-        // instance name, falling back to the container name if it is unprefixed.
         let instance = container.strip_prefix(NAME_PREFIX).unwrap_or(container);
         eprintln!(
             "warning: config for `{container}` changed since it was created; \

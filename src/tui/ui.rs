@@ -327,7 +327,7 @@ pub(crate) fn terminal_tab_hit(
     }
     for (i, label) in terminal_tab_labels(app).into_iter().enumerate() {
         if i > 0 {
-            x += TAB_SEP_WIDTH; // the two-space separator between tabs
+            x += TAB_SEP_WIDTH;
         }
         let width = label.chars().count() as u16;
         if col >= x && col < x + width {
@@ -2172,7 +2172,6 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
     let key = snapshot.instances.get(instance).map(super::remote::instance_key);
     let state = key.and_then(|k| app.procs.get(&k));
 
-    // A real process row: only when we have a Rows state and a valid index.
     if row != MESSAGE_ROW {
         if let Some(ProcState::Rows { rows, .. }) = state {
             if let Some(p) = rows.get(row) {

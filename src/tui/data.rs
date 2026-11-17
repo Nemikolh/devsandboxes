@@ -315,7 +315,6 @@ pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration, error: Option<
         .iter()
         .filter(|r| matches!(r.status, ContainerStatus::Exited(_) | ContainerStatus::Missing))
         .count();
-    // Service containers that actually exist (any non-Missing backing container).
     let service_containers: usize = snapshot
         .services
         .iter()
