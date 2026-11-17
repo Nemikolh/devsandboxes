@@ -12,7 +12,10 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **runtimes**: GPUs through the devcontainer spec's
+  `hostRequirements.gpu` (sandboxes and services), placement onto workers
+  that lend one, and allowances set at `machine add`.
+  → [plan](plans/active/gpus.md)
 
 ## Planned
 
@@ -153,8 +156,6 @@ is frozen: no new work on it.
 - **npm**: typed verb helpers (`api.run(…)`); `ApiInstances` has only `list`.
 - **config**: `runArgs` pass-through, `envFile`, secrets; `devsandbox init`
   scaffolding.
-- **runtimes**: GPUs (`hostRequirements.gpu`, `--gpus` / CDI) as a backend
-  capability. → [plan](plans/active/gpus.md)
 - **runtimes**: an E2B-compatible API served by devsandbox, and
   E2B-compatible clusters (sandbawks) as a backend or fleet member.
   → [explore](plans/explore/e2b-api.md)

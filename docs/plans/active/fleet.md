@@ -1417,6 +1417,12 @@ step 12 does.
     back first: a fetch-back that fails refuses the `rm`, naming why, and
     `rm --force` (which already discards uncommitted work) skips it. A
     `done` there fetches back best effort (a warning on failure).
+78. A GPU is placed ahead of decision 41's named resources: a worker's
+    capacity report says whether it has a usable GPU and lends it
+    (`[allow] gpus = true`, or `trust = "full"`), a required GPU is
+    placed only there, and it stops being a tie. Nothing in it needs a
+    host path, so 41's open question doesn't block it
+    ([gpus](gpus.md)).
 
 ## Open questions
 

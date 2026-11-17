@@ -1,6 +1,6 @@
 # GPUs
 
-Status: idea, nothing built, direction not agreed.
+Status: agreed, in progress (steps below).
 
 No sandbox can use a GPU today. `runArgs` (where a devcontainer puts
 `--gpus all`) and `hostRequirements` (`gpu`) parse but are ignored with a
@@ -10,37 +10,84 @@ backend emits `--gpus` or `--device`.
 
 ## Goal
 
-A sandbox asks for a GPU in config and gets one on runtimes that can give
-it, refused with a clear reason elsewhere.
+A sandbox (or a service) asks for a GPU in config with the devcontainer
+spec's `hostRequirements.gpu` and gets one on runtimes that can give it,
+refused with a clear reason elsewhere. Placed runs go only where a worker
+has a GPU and lends it.
 
-## Shape
+## Decisions
 
-- **Config**: honor `hostRequirements.gpu` (`true` | `"optional"` |
-  `{ cores, memory }`) instead of warning, and/or a devsandbox key
-  (`gpus = "all" | ["0", "1"]`). Config stays the security boundary
-  ([ADR 0002](../../decisions/0002-config-is-the-security-boundary.md)):
-  device access comes only from config, never from the repo's
-  `.devcontainer.json` unchecked.
-- **Runtime capability**: `supports_gpus` on `Backend`, callers branch on it
-  ([ADR 0012](../../decisions/0012-runtime-differences-are-backend-capabilities.md)).
-  - docker: `--gpus <spec>` (NVIDIA Container Toolkit).
-  - podman: CDI, `--device nvidia.com/gpu=all`.
-  - Apple `container`: none.
-- **Probe**: detect a usable toolkit/CDI spec once per host (like the
-  identity probe) so `run` fails early instead of at `docker run`.
-- **Drift**: the GPU request is part of the hashed config, so changing it
-  is drift (`rebuild`).
-- **Fleet**: a GPU is a named host resource (fleet plan decision 41);
-  placement must only pick members that have one, and the capacity report
-  needs a GPU count. Until then a GPU sandbox stays home.
+1. Config is the spec's `hostRequirements.gpu` only, compatible with
+   devcontainer.json: `true` | `false` | `"optional"` |
+   `{ cores, memory }` (a table counts as required; `cores` / `memory`
+   parse and are warned as not enforced). `hostRequirements.cpus`,
+   `memory`, `storage` keep the "ignored" warning. No devsandbox key, no
+   `runArgs` pass-through: GPUs go through the backend capability model
+   ([ADR 0012](../../decisions/0012-runtime-differences-are-backend-capabilities.md)).
+2. Required and no usable GPU: `run` refuses, naming why (stricter than
+   the devcontainers CLI, which warns and runs). `"optional"`: a warning,
+   the container runs without one.
+3. Services take the same `hostRequirements.gpu` key under
+   `[services.*]` (a devsandbox extension: the spec has none for
+   services). A required GPU a service can't get fails the run.
+4. NVIDIA only, every GPU: docker `--gpus all` when its `nvidia` runtime
+   is registered, else CDI `--device nvidia.com/gpu=all`; podman CDI;
+   Apple `container` none. No device selection.
+5. Worker policy: `[allow] gpus = true` lets exactly those two flags
+   through `check_run`; any other `--device` stays refused.
+6. Placement: a required GPU goes only to a candidate whose capacity
+   report has a usable GPU **and** lends it (`gpus = true` allowed, or
+   `trust = "full"`); the requester's own host needs only the GPU (its
+   own config is under no worker policy). A GPU is handled ahead of fleet
+   decision 41's general named resources (fleet plan decision 78).
+7. Allowances are the worker's to grant: no peer or control plane sets
+   them over a link. `devsandbox machine allow` acts on its own host only;
+   `machine add` asks and applies them on the target through its own ssh
+   session.
 
-## Open questions
+Out of scope: gVisor (`runsc --nvproxy`, see [isolation](isolation.md)),
+GPU checkpointing (see [sandbawks-ideas](../explore/sandbawks-ideas.md)),
+GPU CI (a self-hosted runner, later).
 
-- `hostRequirements` only, a devsandbox key, or both?
-- `runArgs` pass-through (parked in [status](../../status.md)) would
-  give GPUs for free on docker but bypasses the capability model; take
-  this narrower path instead?
-- GPU under gVisor: needs `runsc --nvproxy` and a supported host driver
-  version; see [isolation](isolation.md).
-- Checkpointing GPU state (`cuda-checkpoint`) is out of scope here; see
-  [sandbawks-ideas](../explore/sandbawks-ideas.md).
+## Steps
+
+Phase 1, local GPUs:
+
+1. **config**: a typed `HostRequirements` / `GpuRequirement` on
+   `SandboxProperties` and on `Service` (`src/config.rs`). Still listed by
+   `ignored()`: nothing acts on it yet. Docs: `config-toml-spec` skill,
+   `docs/architecture/config.md`.
+2. **runtime**: `GpuSupport` (`Gpus` | `Cdi` | `None(reason)`) in a pure
+   `src/runtime/gpu.rs`, read with the backend's existing engine info
+   (docker: `Runtimes.nvidia`, else an `nvidia.com/gpu` CDI spec in
+   `CDISpecDirs` on a native engine; podman: a CDI spec in `/etc/cdi`,
+   `/var/run/cdi`; Apple: none). Docs: `docs/architecture/runtimes.md`.
+3. **run**: a pure decision (flags | refusal | warning), the flags next
+   to `--privileged` in `run_container`; `gpu` leaves `ignored()`.
+   Worker policy `Allow.gpus` in `check_run` and `config_refusals` (so a
+   GPU sandbox is a placement tie until step 7). Docs:
+   `instances/lifecycle.md`, fleet.md *Worker policy*, `status.md`,
+   CHANGELOG.
+4. **services**: the same decision in `ensure_services` /
+   `service_run_args`; `config_refusals` covers services. Docs:
+   `instances/services.md`.
+
+Phase 3, placement:
+
+5. **capacity**: `Capacity` gains `gpus` (count) and `gpus_lent`; wire
+   (`api.md`, `index.d.ts`), `capacity::summary`. Docs: fleet.md
+   *Capacity*.
+6. **place**: `Spec` / `PlaceSpec` carry the GPU need; `place::place`
+   filters (required; a pin without one is `NoPlace::PinNoGpu`) or
+   scores (optional). Docs: fleet.md *Placement*.
+7. **ties**: the GPU stops being a tie in `code::ties`; the worker's
+   `check_run` still enforces it. Docs: fleet.md *In the run verb*.
+
+Phase 4, allowances at add and join:
+
+8. **`devsandbox machine allow`**: a `member.allow` method answered only
+   for local clients, writing `[allow]` through `member::update`; one CLI
+   flag per allowance. Docs: machines.md, api.md.
+9. **prompts**: `machine add` asks which allowances the target lends (or
+   takes the same flags off a TTY) and applies them on the target over
+   its ssh session; an inbound join asks on the joining host.
