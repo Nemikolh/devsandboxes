@@ -361,6 +361,10 @@ impl Backend for AppleContainer {
         Ok(identity::EngineInfo::default())
     }
 
+    fn gpu_support(&self) -> Result<super::gpu::GpuSupport> {
+        Ok(super::gpu::GpuSupport::None("Apple `container` has no GPU passthrough".into()))
+    }
+
     fn identity_canary(&self, _image: &str, _dir: &std::path::Path, _relabel: bool) -> Result<identity::Canary> {
         bail!("no identity canary on Apple `container`: it is always VM-backed")
     }

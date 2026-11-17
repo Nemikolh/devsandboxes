@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use super::gpu;
 use super::identity::{self, Canary, FastPath, Ids};
 use super::{
     split_kv, without_self_ps, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow,
@@ -263,6 +264,20 @@ impl Backend for Dockerlike {
         } else {
             let out = self.output_quiet(&["info", "--format", "{{json .}}"])?;
             identity::docker_engine_info(&out, var("DOCKER_HOST").as_deref(), linux)
+        }
+    }
+
+    fn gpu_support(&self) -> Result<gpu::GpuSupport> {
+        let linux = cfg!(target_os = "linux");
+        let var = |key| std::env::var(key).ok().filter(|v| !v.is_empty());
+        if self.name == "podman" {
+            let out = self.output_quiet(&["info", "--format", "json"])?;
+            let native = identity::podman_engine_info(&out, var("CONTAINER_HOST").as_deref(), linux)?.native;
+            Ok(gpu::podman(native, gpu::read_cdi_dir))
+        } else {
+            let out = self.output_quiet(&["info", "--format", "{{json .}}"])?;
+            let native = identity::docker_engine_info(&out, var("DOCKER_HOST").as_deref(), linux)?.native;
+            gpu::docker(&out, native, gpu::read_cdi_dir)
         }
     }
 

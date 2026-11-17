@@ -7,7 +7,7 @@ Code: `src/runtime/mod.rs` (`Backend`, `backend()`, `default_backend_name`,
 `backend_named`, `NAME_PREFIX`, `fixed_path`), `src/runtime/dockerlike.rs`
 (`Dockerlike::DOCKER`/`PODMAN`), `src/runtime/apple.rs` (`AppleContainer`),
 `src/runtime/bounded.rs`, `src/runtime/procs.rs`, `src/runtime/events.rs`,
-`src/runtime/identity.rs`, `src/commands/run/identity.rs`.
+`src/runtime/identity.rs`, `src/runtime/gpu.rs`, `src/commands/run/identity.rs`.
 
 ## Backend
 
@@ -245,6 +245,29 @@ drops the oldest by `at`. Caching is all or nothing (`facts::decide`):
 when any of the three reads fails, nothing is cached and the next `run`
 reads them all again; the fact that failed reads as unset. Without an id
 (Apple `container`) they're read on every `run`.
+
+## GPUs
+
+`Backend::gpu_support` answers whether a container can get every NVIDIA GPU
+here, as a `runtime::gpu::GpuSupport`, whose `run_args` are the flags:
+
+- `Gpus`: `--gpus all`. docker only, when its `info` lists an `nvidia`
+  runtime under `Runtimes` (`gpu::docker`): the devcontainers CLI's own
+  check (`docker info -f '{{.Runtimes.nvidia}}'`).
+- `Cdi`: `--device nvidia.com/gpu=all`, when a CDI spec of kind
+  `nvidia.com/gpu` sits in the engine's spec dirs: docker's `CDISpecDirs`
+  (none listed means docker has CDI off), podman's `gpu::PODMAN_CDI_DIRS`
+  (`/etc/cdi`, `/var/run/cdi`; `gpu::podman`). The dirs are read on
+  this host (`gpu::read_cdi_dir`: `*.yaml`, `*.yml`, `*.json`, each
+  parsed as YAML, which covers JSON; a file that isn't a spec is skipped),
+  so only when the engine runs on this host's kernel
+  (`identity::EngineInfo::native`, from the same `info` call as
+  `engine_info`).
+- `None(reason)`: neither; the reason names what was checked. Apple
+  `container` always answers this (no GPU passthrough).
+
+`gpu::cdi_gpu_count` counts the GPUs those specs name: distinct device
+names but `all`.
 
 ## Adding a runtime
 

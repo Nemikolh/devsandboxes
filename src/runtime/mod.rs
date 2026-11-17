@@ -9,6 +9,8 @@
 mod apple;
 pub mod bounded;
 mod dockerlike;
+#[allow(dead_code)] // nothing asks for a GPU yet
+pub mod gpu;
 // Only the daemon follows events (unix-only).
 #[cfg(unix)]
 pub mod events;
@@ -379,6 +381,13 @@ pub trait Backend: Send + Sync {
     /// docs/architecture/daemon/fleet.md, *Capacity*): the same `info` the
     /// fast path reads. stderr is captured.
     fn engine_info(&self) -> Result<identity::EngineInfo>;
+
+    /// Whether a container can get NVIDIA GPUs here, and with which `run`
+    /// flags (docs/architecture/runtimes.md, *GPUs*): the same `info` as
+    /// [`Backend::engine_info`], plus the engine's CDI specs when it runs on
+    /// this host's kernel. stderr is captured.
+    #[allow(dead_code)] // nothing asks for a GPU yet
+    fn gpu_support(&self) -> Result<gpu::GpuSupport>;
 
     /// The identity probe's canary: from `image` (local, never pulled), with
     /// host dir `dir` (empty, writable by any uid) bound in, write one file
