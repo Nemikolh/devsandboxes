@@ -12,10 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **helper**: `exec` sessions' last steps: sessions as rows in the
-  dashboard's tree (4f), ending them explicitly with `exec --end`, no
-  idle timeout (4g), link terminals of a non-root helper as sessions
-  (5). → [plan](plans/active/resumable-exec.md)
+Nothing.
 
 ## Planned
 
@@ -136,6 +133,12 @@ is frozen: no new work on it.
   → [bridges](architecture/helper/bridges.md#opening-urls-kind-open); `open::decide`
 - **daemon**: opening on every member attached right now instead of the
   last attach only. → [fleet](architecture/daemon/fleet.md#last-attach); `serve::opens::route`
+- **helper**: more for `exec` sessions: a detach key (kubectl's
+  `--detach-keys`, `ctrl-p,ctrl-q`, as the model), a read-only watcher
+  attach (output only, no takeover), a bounded replay of what a session
+  printed while detached, an opt-in idle timeout, and printing the
+  `exec --attach` line when a client is displaced.
+  → [ADR 0054](decisions/0054-interactive-execs-are-helper-sessions-ended-only-on-purpose.md); `devsbd` `sessions.rs`
 
 - **instances**: repeat-instance worktrees in a container volume instead
   of a host bind (ownership stops mattering, faster I/O on VM-backed
@@ -758,6 +761,15 @@ is frozen: no new work on it.
   `inspect`); the fix is the host's runc. The check needs the helper.
   → [lifecycle](architecture/instances/lifecycle.md#the-exec-cgroup-check);
   `run::cgroup::warn_if_outside`
+- A session's program exiting 250, 251 or 252 reads as the session's own
+  end (`NO_SESSION_EXIT`, `DETACHED_EXIT`, `VERSION_EXIT`): over a machine
+  the reconnect loop stops and says the session is gone, was attached
+  elsewhere, or is another devsbd's.
+  → [in-container](architecture/helper/in-container.md); `serve::machines::cli::Reconnect`
+- A session whose client's terminal went keeps listing as `attached`
+  (the in-container client docker leaves behind stays connected and
+  can't tell) until the next attach displaces it.
+  → [in-container](architecture/helper/in-container.md); `commands::exec::choose_session`
 - The helper's arch is found by a blind second try, no probe.
   → [helper](architecture/helper/overview.md); `devsbd::candidates`
 - A container's URL chooses which free loopback ports the opening host

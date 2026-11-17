@@ -126,7 +126,7 @@ boundaries mean nothing).
 | `run.logs` | `stdout` from `offset`; with `follow`, until the run ends | polling |
 | `run.wait` | `event`s on state changes, then `result` | polling |
 | `run.attach` | live run I/O (`stdin`/`stdout`/`resize`/`signal`) | — (interactive runs) |
-| `session.attach` | params: session id, `create` (+ argv, cwd, env, user) or attach only; live session I/O (`stdin`/`stdout`/`resize`), then `exit`, or `error` `no-session` / `detached` | `exec -it … devsbd session new\|attach` for daemon-side callers ([resumable-exec](resumable-exec.md)) |
+| `session.attach` | params: session id, `create` (+ argv, cwd, env, user) or attach only; live session I/O (`stdin`/`stdout`/`resize`), then `exit`, or `error` `no-session` / `detached` | `exec -it … devsbd session new\|attach` for daemon-side callers ([sessions](../../architecture/helper/in-container.md#sessions-devsbd-session-newattachlsrmprune)) |
 | `session.ls` / `session.rm` | result | `devsbd session ls\|rm` |
 | `proc.spawn` | untracked process, I/O + `exit`, optional PTY | lifecycle / `vscode-goto` exec (optional) |
 | `fs.write` | path, mode, owner, atomic; body in `stdin` | boot file, workspace file (optional) |
@@ -334,7 +334,7 @@ design above, found in the code:
 
 ## Order across plans
 
-1. [resumable-exec](resumable-exec.md) step 4, "now" part.
+1. Resumable exec's step 4, "now" part (shipped: [sessions](../../architecture/helper/in-container.md#sessions-devsbd-session-newattachlsrmprune)).
 2. Step 1 here first (fleet's link needs its flow-controlled `Open`),
    then steps 2-3 here and [fleet](fleet.md) steps 1-3.
 3. Step 8 here (`session.attach`).

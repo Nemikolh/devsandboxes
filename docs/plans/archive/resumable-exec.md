@@ -1,18 +1,15 @@
+> Archived 2026-11-17. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/helper/in-container.md#sessions…](../../architecture/helper/in-container.md#sessions-devsbd-session-newattachlsrmprune),
+> [architecture/daemon/fleet.md#pty](../../architecture/daemon/fleet.md#pty),
+> [architecture/dashboard/terminal.md](../../architecture/dashboard/terminal.md),
+> [ADR 0054](../../decisions/0054-interactive-execs-are-helper-sessions-ended-only-on-purpose.md)
+
 # Resumable exec: interactive sessions that outlive their connection
 
-Status: in progress (steps 4f, 4g, 5)
-Steps 1-3 shipped: helper sessions (`devsbd/src/sessions.rs`), `exec`
-through them with `--attach` / `--sessions` / `--session`
-(`src/commands/exec.rs`), reconnect over ssh and in remote dashboard tabs
-(`serve::machines::cli` `Reconnect`, `tui::app::terminal`). Step 4's "now"
-part (4a-4d) shipped too: `session prune` and the prune on `new`, a
-displaced client that never blocks, the session wire version
-(`VERSION_EXIT`), the session count in `instances.procs`; and 4e, the
-dashboard's `a` (attach to a detached session). The living docs
-describe all of it. Left: 4f (sessions as rows in the dashboard's tree),
-4g (ending sessions: the policy, `exec --end`), and step 5 (link
-terminals resumable when the helper isn't root; from *Compared with
-Kubernetes attach*).
+Status: shipped. Steps 1-4d earlier; 4e 1fe5add, 4f 2daf452, 4g b7dcb02,
+5 1b8efda, 6 8233ee1, 7 9200a98. What's left is parked in
+`docs/status.md` (*helper*: detach key, watchers, replay, an opt-in idle
+timeout, a resume hint).
 
 ## Problem
 

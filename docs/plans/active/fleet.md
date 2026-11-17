@@ -356,7 +356,7 @@ can't see them; both invest in what is being removed.
    reconnecting `exec`), `TUNNEL` forwards, `AGENT`, CLI re-runs as
    API calls. Step 8 needs
    it: the per-use ssh argvs go there.
-   `PTY` is a session attach ([resumable-exec](resumable-exec.md)): the
+   `PTY` is a session attach ([sessions](../../architecture/helper/in-container.md#sessions-devsbd-session-newattachlsrmprune)): the
    channel opens with `{instance, session id, create|attach}` and ends
    with a structured record (`exit <code>` | `no-session` | `detached` | `version` |
    `lost`); a link drop is `lost`, never an exit, and records are
