@@ -1,4 +1,4 @@
-/* ------------------------------------------------ How it works (01) */
+/* How it works (01) */
 
 /*
  * Two pictures of one idea: the desktop stage (diagram + mini dashboard, the
@@ -41,8 +41,6 @@
   background: radial-gradient(closest-side, #1f7d851f, transparent);
   pointer-events: none;
 }
-
-/* --------------------------------------------------------- Diagram */
 
 .hiw-diagram {
   container-type: inline-size;
@@ -175,7 +173,6 @@
   }
 }
 
-/* Host frame. */
 .hiw-host {
   border: 1px dashed #2f474b;
   border-radius: calc(var(--u) * 16);
@@ -327,7 +324,6 @@
   letter-spacing: 0;
 }
 
-/* Sandbox cards. */
 .hiw-sandbox {
   display: flex;
   flex-direction: column;
@@ -644,7 +640,7 @@
   white-space: nowrap;
 }
 
-/* -------------------------------------------- Stacked flow (≤ 980px) */
+/* Stacked flow (≤ 980px) */
 
 .hiw-flow {
   /* The shared sandbox/agent styles are written in canvas units; 1:1 here. */
@@ -886,8 +882,6 @@
   color: var(--vsc-blue);
 }
 
-/* ---------------------------------------------------------- Captions */
-
 .hiw-steps {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -941,8 +935,6 @@
   border-radius: var(--radius-sm);
   padding: 0 4px;
 }
-
-/* -------------------------------------------------------- Breakpoints */
 
 @media (max-width: 1180px) {
   .hiw-stage {

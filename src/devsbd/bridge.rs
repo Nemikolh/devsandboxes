@@ -887,7 +887,7 @@ fn retry_decision(entry: Option<(bool, bool, Duration)>, urgent: bool) -> Retry 
 
 /// Whether `reconcile` wants a bridge for one running instance, and if so
 /// whether it serves the host agent: `None` = no bridge, `Some(with_agent)`.
-/// The agent is relayed as ever (`relay_mode` + a host agent); a sink adds a
+/// The agent is relayed (`relay_mode` + a host agent); a sink adds a
 /// bridge to every helper-capable instance so its notify outbox drains.
 fn wanted(helper: bool, relay: bool, host_agent: bool, has_sink: bool) -> Option<bool> {
     let with_agent = host_agent && relay;

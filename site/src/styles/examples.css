@@ -1,4 +1,4 @@
-/* ============================================================ /examples */
+/* /examples */
 
 .examples-hero {
   position: relative;
@@ -271,13 +271,9 @@
   }
 }
 
-/* ======================================================= Example pages */
-
 .article-topline .example-page-tags {
   justify-content: flex-end;
 }
-
-/* ------------------------------------------------- Related + prev / next */
 
 .example-related h2 {
   font: 600 20px/1.2 var(--font-heading);

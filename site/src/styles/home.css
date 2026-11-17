@@ -1,5 +1,3 @@
-/* ------------------------------------------------------------------ Hero */
-
 .hero {
   position: relative;
   overflow: hidden;
@@ -121,7 +119,6 @@
   padding: 72px var(--gutter) 96px;
 }
 
-/* Hero entrance. */
 .reveal {
   animation: reveal-up 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
   animation-delay: var(--d, 0s);
@@ -139,8 +136,6 @@
     animation: none;
   }
 }
-
-/* ------------------------------------------------------------- Sections */
 
 .overview-section {
   max-width: var(--page-max);
@@ -174,8 +169,6 @@
   min-height: 0;
 }
 
-/* ------------------------------------------------------- Section links */
-
 .section-links {
   display: flex;
   flex-wrap: wrap;
@@ -199,8 +192,6 @@
 .section-link:hover svg:last-child {
   translate: 3px 0;
 }
-
-/* ----------------------------------------------------------- Breakpoints */
 
 @media (max-width: 1180px) {
   .benefit-grid {

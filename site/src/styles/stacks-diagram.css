@@ -1,4 +1,4 @@
-/* ------------------------------------ Stacks diagram (/docs/vs-docker) */
+/* Stacks diagram (/docs/vs-docker) */
 
 /*
  * `StacksDiagram.astro`. Same colours as the landing diagram
@@ -116,8 +116,6 @@
 .sd-edge {
   grid-row: 5;
 }
-
-/* ------------------------------------------------------------ Nodes */
 
 .sd-repos,
 .sd-box {
@@ -472,8 +470,6 @@
   display: none;
 }
 
-/* ------------------------------------------------------------ Links */
-
 /* A CSS arrow: `::before` the line, `::after` the head; `--c` its colour. */
 .sd-link {
   --c: var(--dash-line);
@@ -582,8 +578,6 @@
 .sd-link--creds::before {
   border-left-style: dashed;
 }
-
-/* ------------------------------------------------------ Breakpoints */
 
 @container (max-width: 1100px) {
   .sd .sd-stacks {

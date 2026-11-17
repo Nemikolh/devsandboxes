@@ -1,5 +1,3 @@
-/* ---------------------------------------------------------------- Header */
-
 .site-header {
   height: var(--header-h);
   border-bottom: 1px solid var(--border);
@@ -203,8 +201,6 @@
   }
 }
 
-/* --------------------------------------------------------------- Buttons */
-
 .button-primary,
 .button-secondary {
   height: 46px;
@@ -252,8 +248,6 @@
     font-size: 12px;
   }
 }
-
-/* ------------------------------------------------------------ Code block */
 
 .code-block {
   border: 1px solid var(--border-strong);
@@ -397,8 +391,6 @@
   }
 }
 
-/* ---------------------------------------------------------- Experimental */
-
 .experimental-badge {
   display: inline-block;
   vertical-align: middle;
@@ -414,8 +406,6 @@
   padding: 4px 6px;
   cursor: help;
 }
-
-/* --------------------------------------------------------------- Callout */
 
 .callout {
   --callout-accent: #a8ef72;
@@ -485,8 +475,6 @@
 .callout-body p {
   margin: 0 0 8px;
 }
-
-/* ---------------------------------------------------------- Coding agent */
 
 /* Only the picked agent's variants show (one rule per agent in src/lib/agents.ts). */
 html[data-agent='claude'] [data-agent-only]:not([data-agent-only='claude']),
@@ -612,8 +600,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   font-weight: 600;
 }
 
-/* ------------------------------------------------------------------ Tabs */
-
 .tabs {
   margin: 26px 0;
 }
@@ -686,8 +672,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   margin-top: -12px;
 }
 
-/* --------------------------------------------------------- Resource link */
-
 .resource-link {
   display: flex;
   align-items: center;
@@ -728,7 +712,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   flex-shrink: 0;
 }
 
-/* Side-by-side resource links (e.g. "Next steps"). */
 .resource-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -744,8 +727,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
 .resource-grid .resource-link small {
   line-height: 1.5;
 }
-
-/* ------------------------------------------------------------ Card grid */
 
 .feature-grid {
   display: grid;
@@ -850,8 +831,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   }
 }
 
-/* ------------------------------------------------------------- Next page */
-
 .next-page {
   display: flex;
   flex-direction: column;
@@ -914,8 +893,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
     align-items: flex-start;
   }
 }
-
-/* --------------------------------------------------------- Search dialog */
 
 /* A modal <dialog> covering the viewport; the panel inside is the visible box. */
 .dialog-overlay {
@@ -1136,8 +1113,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   }
 }
 
-/* ---------------------------------------------------------- Mobile drawer */
-
 .mobile-drawer {
   margin: 0 0 0 auto;
   height: 100%;
@@ -1320,8 +1295,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   font-size: 13px;
 }
 
-/* ---------------------------------------------------------------- Footer */
-
 .site-footer-wrap {
   border-top: 1px solid var(--border);
 }
@@ -1386,8 +1359,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
     gap: 14px;
   }
 }
-
-/* ---------------------------------------------------------- Window chrome */
 
 /* The fake app window around the landing's hero terminal and every mini
    dashboard (`MiniTui.astro`, on the landing and in the docs). */
@@ -1473,8 +1444,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   display: inline-block;
   flex-shrink: 0;
 }
-
-/* ----------------------------------------------------------- Agent prompt */
 
 .agent-prompt-link {
   display: inline-flex;

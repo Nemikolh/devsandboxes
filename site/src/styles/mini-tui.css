@@ -1,5 +1,3 @@
-/* ------------------------------------------------- Mini dashboard */
-
 /*
  * The playable mini dashboard (`components/MiniTui.astro`): a ratatui screen
  * in a window. Colours are the real TUI's; the landing diagram repeats the

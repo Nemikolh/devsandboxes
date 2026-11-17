@@ -1716,7 +1716,7 @@ mod tests {
         // Still needs-you, new status: shown, but no second popup.
         let shown = inbox.apply_sink("web-id", "web", 1000, action("needs-you", "merged", 13)).unwrap();
         assert!(shown.popup.is_none());
-        // A notify record still pops up as ever.
+        // A notify record still pops up.
         let note = decide("web", false, Message::Notify(rec("hi", None, Some("https://x"))));
         let shown = inbox.apply_sink("web-id", "web", 1000, note).unwrap();
         assert_eq!(shown.line, "web: hi");

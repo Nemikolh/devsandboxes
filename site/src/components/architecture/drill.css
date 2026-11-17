@@ -1,4 +1,4 @@
-/* --------------------------------------- Drill-down components (architecture) */
+/* Drill-down components (architecture) */
 
 /*
  * `Drill`, `Deck`, `CommandTable`, `ThreeMachines`. Tokens only
@@ -24,8 +24,6 @@
   font: 10px / 1.4 var(--font-mono);
   white-space: nowrap;
 }
-
-/* ------------------------------------------------------------------ Drill */
 
 .arc-drill {
   position: relative;
@@ -218,8 +216,6 @@
   overflow-wrap: anywhere;
 }
 
-/* ------------------------------------------------------------------- Deck */
-
 .arc-deck {
   margin: 24px 0 30px;
   border-radius: var(--radius-lg);
@@ -293,8 +289,6 @@
 :root:not([data-js]) .arc-deck-slide + .arc-deck-slide {
   margin-top: 16px;
 }
-
-/* ----------------------------------------------------------- CommandTable */
 
 .arc-cmds {
   container-type: inline-size;
@@ -471,8 +465,6 @@ details[open] > summary .arc-cmd-chevron {
     padding: 6px 14px 14px;
   }
 }
-
-/* ---------------------------------------------------------- ThreeMachines */
 
 .arc-tm {
   margin: 24px 0 30px;

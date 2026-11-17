@@ -1,8 +1,6 @@
 /* Node API reference (src/pages/docs/node-api.astro). Builds on docs.css:
    prose, .table-scroll and heading anchors come from there. */
 
-/* ------------------------------------------------------------ Headings */
-
 .prose h2 .api-h2-code {
   font: 500 0.9em var(--font-mono);
   letter-spacing: -0.02em;
@@ -36,8 +34,6 @@
   height: 1px;
   background: linear-gradient(90deg, #3b5733, transparent);
 }
-
-/* --------------------------------------------------------------- Items */
 
 .api-item {
   margin-top: 30px;
@@ -116,8 +112,6 @@
   color: var(--text-subtle);
 }
 
-/* ----------------------------------------------------------- Signature */
-
 .api-sig pre {
   margin: 14px 0 16px;
   padding: 13px 17px;
@@ -163,8 +157,6 @@
   text-decoration: underline solid var(--lime);
 }
 
-/* ---------------------------------------------------- Type expressions */
-
 .prose .api-type {
   font: 12px/1.7 var(--font-mono);
   color: var(--code-punctuation);
@@ -191,8 +183,6 @@
 .api-t-str {
   color: var(--code-string);
 }
-
-/* --------------------------------------------------------------- Meta */
 
 .prose .api-meta {
   display: flex;
@@ -236,8 +226,6 @@
   background: none;
   border-color: #253336;
 }
-
-/* -------------------------------------------------------------- Tables */
 
 .prose .api-table-wrap {
   margin: 16px 0 0;
@@ -356,8 +344,6 @@
   width: 24%;
   white-space: nowrap;
 }
-
-/* ---------------------------------------------------------- Breakpoints */
 
 /* Narrow screens: rows become stacked cards (name + type, then the
    description) instead of a sideways-scrolling three-column grid. */

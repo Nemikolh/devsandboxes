@@ -1,5 +1,3 @@
-/* ------------------------------------------------ Architecture diagrams */
-
 /*
  * `components/architecture/*`. The landing diagrams' palette
  * (`babysit-diagram.css`): purple the host daemon, cyan the container side,
@@ -56,8 +54,6 @@
   color: var(--text-faint);
   text-align: center;
 }
-
-/* ------------------------------------------------------------ Arrows */
 
 /* A CSS arrow: `::before` the line, `::after` the head (`.arc-link--both`
    adds a tail head on `> i`). Same construction as `.bsd-link`. */
@@ -162,8 +158,6 @@
   font: 9.5px / 1.2 var(--font-mono);
   color: var(--text-faint);
 }
-
-/* -------------------------------------------------------- Shared nodes */
 
 .arc-zone {
   border: 1px dashed #2f474b;
@@ -383,8 +377,6 @@
 .arc-client svg {
   color: var(--cyan);
 }
-
-/* ------------------------------------------------ Host ↔ helper overview */
 
 .arc-helper {
   --row: 70px;
@@ -672,8 +664,6 @@
     justify-self: stretch;
   }
 }
-
-/* ------------------------------------------------------ Fleet machines */
 
 /* `FleetDiagram.astro`: a row of host zones, the links in the gaps between
    them. `.arc-fd` twice where it must beat `.prose ul` / `.prose p` and the
@@ -1005,8 +995,6 @@
   }
 }
 
-/* --------------------------------------------------- Sequence diagrams */
-
 .arc-seq {
   margin: 28px 0 34px;
 }
@@ -1191,8 +1179,6 @@
   border-radius: 999px;
   background: var(--bg);
 }
-
-/* ------------------------------------------------------- State machine */
 
 .arc-states {
   margin: 28px 0 34px;
