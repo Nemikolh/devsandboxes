@@ -164,6 +164,7 @@ pub trait Transfer {
 /// through its link's socket, else its route socket
 /// (`fleet::route::connect`).
 pub struct LinkTransfer {
+    /// The socket dir.
     pub dir: PathBuf,
     pub worker: String,
 }
@@ -361,6 +362,7 @@ pub struct Prepared {
 /// One repo [`send`] sent: the control-plane mirror sends the same refs again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sent {
+    /// The repo's identity.
     pub id: String,
     /// The checkout it was bundled from.
     pub host: PathBuf,

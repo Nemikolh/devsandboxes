@@ -144,7 +144,7 @@ fn recreate(
     let branch = info.branch.clone();
     let branch_created = info.branch_created;
 
-    // Remove the old container; ignore failure (it may already be gone).
+    // ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
 
     // In flight from here (docs/architecture/instances/lifecycle.md). The

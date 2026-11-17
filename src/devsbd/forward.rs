@@ -829,7 +829,6 @@ mod tests {
         assert_eq!(addr.ip(), LOOPBACK);
         let started = forward.status().idle_since.expect("idle from the start");
 
-        // Wait for the supervisor's first resolve to land us in Error.
         let mut errored = false;
         for _ in 0..200 {
             if let ForwardState::Error(reason) = forward.status().state {

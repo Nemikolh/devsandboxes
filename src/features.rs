@@ -574,7 +574,6 @@ fn download_blob(
     Ok(())
 }
 
-/// Find the feature layer's digest in a manifest.
 fn feature_layer_digest(manifest: &serde_json::Value) -> Option<String> {
     manifest
         .get("layers")?
@@ -985,6 +984,7 @@ mod tests {
             ("./features/ok".to_string(), FeatureOptions::Enabled(true)),
             ("./features/nope".to_string(), FeatureOptions::Enabled(true)),
             ("./features/empty".to_string(), FeatureOptions::Enabled(true)),
+            // Disabled: not checked.
             ("./features/off".to_string(), FeatureOptions::Enabled(false)),
             ("ghcr.io/devcontainers/features/node:1".to_string(), FeatureOptions::Enabled(true)),
         ]);

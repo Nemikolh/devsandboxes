@@ -419,7 +419,6 @@ mod tests {
         assert!(matches!(&got[..], [r] if is_error(r, code::BAD_REQUEST)), "{got:?}");
         let got = round_trip(&host, 6, &[attach_call("1790000000-0002", Some(Obj::new()))]);
         assert!(matches!(&got[..], [r] if is_error(r, code::BAD_REQUEST)), "{got:?}");
-        // `session.ls` / `session.rm`.
         let ls = Record::Call(Call { method: "session.ls".into(), ..Call::default() });
         let got = round_trip(&host, 7, &[ls]);
         let [Record::Result(o)] = &got[..] else { panic!("{got:?}") };

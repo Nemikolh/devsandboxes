@@ -559,7 +559,6 @@ impl ConfigView {
     }
 }
 
-/// Clamp a split percentage into the allowed range.
 fn clamp_split(pct: i16) -> u16 {
     pct.clamp(SPLIT_MIN as i16, SPLIT_MAX as i16) as u16
 }
@@ -1927,9 +1926,7 @@ mod tests {
 
     #[test]
     fn divider_pct_maps_column_to_clamped_percentage() {
-        // Mid-column of a 100-wide modal → 50%.
         assert_eq!(divider_pct(50, 100), 50);
-        // Extremes clamp into [SPLIT_MIN, SPLIT_MAX].
         assert_eq!(divider_pct(0, 100), SPLIT_MIN);
         assert_eq!(divider_pct(100, 100), SPLIT_MAX);
         assert_eq!(divider_pct(5, 100), SPLIT_MIN);
@@ -1943,7 +1940,6 @@ mod tests {
         open_modal(&mut app);
         // Width 100, split 50 → divider at column 50. Press on it starts a drag.
         app.on_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 50), MODAL_AREA);
-        // Drag to column 30 → 30%.
         app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 30), MODAL_AREA);
         assert_eq!(view(&app).split_pct, 30);
         // Release; a later drag with no press does nothing.

@@ -892,7 +892,7 @@ mod tests {
         app.tab = Tab::Ports;
         app.set_ports(port_rows(3));
         app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down)); // last row (idx 2)
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected(), 2);
 
         app.set_ports(port_rows(1));
@@ -912,7 +912,6 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
 
-        // Plain 'c' must not quit.
         let mut app = new_app();
         app.on_key(key(KeyCode::Char('c')));
         assert!(!app.should_quit);

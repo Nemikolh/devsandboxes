@@ -497,9 +497,11 @@ mod tests {
     #[test]
     fn the_authority_adds_a_member_introduces_a_capped_one_refuses() {
         let s = three();
+        // The authority: an `add` entry.
         assert_eq!(can_sign(&s, &own("lap", 1), "new", &pk(5)), Ok(Signs::Add));
         let added = sign_into(&s, &own("lap", 1), &key(1), "new", &pk(5)).unwrap();
         assert_eq!(added.log.membership().unwrap().key_of("new"), Some(pk(5)));
+        // Another member: an introduction by it.
         assert_eq!(can_sign(&s, &own("pi", 3), "new", &pk(5)), Ok(Signs::Introduction));
         let introduced = sign_into(&s, &own("pi", 3), &key(3), "new", &pk(5)).unwrap();
         assert_eq!(introduced.log, s.log);

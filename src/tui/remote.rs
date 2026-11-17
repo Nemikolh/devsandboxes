@@ -47,7 +47,6 @@ pub fn service_key(r: &ServiceRow) -> String {
     qualify(r.machine.as_deref(), &r.name)
 }
 
-/// The instance row keyed `key`.
 pub fn find_instance<'a>(s: &'a Snapshot, key: &str) -> Option<&'a InstanceRow> {
     s.instances.iter().find(|r| instance_key(r) == key)
 }
@@ -61,7 +60,6 @@ pub fn instance_sandbox<'a>(s: &'a Snapshot, r: &InstanceRow) -> Option<&'a Sand
     rows.find(|b| r.root.is_some() && b.root == r.root).or(first)
 }
 
-/// Machine `name`'s entry in the snapshot's `machines`.
 pub fn machine<'a>(machines: &'a [SnapshotMachine], name: &str) -> Option<&'a SnapshotMachine> {
     machines.iter().find(|m| m.name == name)
 }
@@ -112,7 +110,6 @@ pub fn sandbox_route(s: &Snapshot, key: &str) -> Route {
     Route { machine: Some(machine.to_string()), root }
 }
 
-/// The route of the service keyed `key`.
 pub fn service_route(s: &Snapshot, key: &str) -> Route {
     let (machine, _) = split(key);
     let Some(machine) = machine else { return Route::default() };

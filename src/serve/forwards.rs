@@ -98,6 +98,7 @@ pub struct ForwardRow {
     pub process: Option<String>,
     /// `"active"`, `"connecting"`, or `"error: …"`.
     pub state: String,
+    /// Open connections.
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by `forwards.add`.
     pub configured: bool,
@@ -942,7 +943,6 @@ struct ConfiguredLive {
     direct: Option<u16>,
 }
 
-/// A live open forward.
 struct Opened {
     /// Instance state key.
     instance: String,

@@ -140,6 +140,7 @@ pub fn table_text(table: &Table) -> String {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SandboxProperties {
+    // devsandbox extras
     pub folder: Option<String>,
     pub services: Option<Vec<String>>,
     /// Package-manager caches to persist and share across the config root (e.g.
@@ -212,6 +213,7 @@ pub struct SandboxProperties {
     /// excluded from `config_hash`.
     pub profiles: Option<Vec<String>>,
 
+    // implemented devcontainer properties
     pub image: Option<String>,
     pub build: Option<Build>,
     pub workspace_folder: Option<String>,

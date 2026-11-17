@@ -166,6 +166,7 @@ mod tests {
         for (_, e) in &events {
             assert!((before..=after).contains(&e.at), "{} not in {before}..={after}", e.at);
         }
+        // One `now` for the whole batch.
         assert_eq!(events[0].1.at, events[1].1.at);
         let inbox = load(&path).unwrap();
         assert!(!inbox.threads[0].unread);

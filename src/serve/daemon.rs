@@ -3896,6 +3896,7 @@ pub(crate) mod tests {
         // Nothing answers once the handoff reply is out.
         assert!(endpoint::connect(&dir).is_err());
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Handoff);
+        // Idle connections are closed, not waited out.
         assert!(started.elapsed() < DRAIN_TIMEOUT);
         let mut buf = [0u8; 1];
         assert_eq!(idle_client.read(&mut buf).unwrap(), 0);
@@ -4666,6 +4667,7 @@ pub(crate) mod tests {
         let closing = wait_for(&mut sub, "closing");
         assert_eq!(closing.params, json!({"reason": "shutdown"}));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        // Idle connections are closed, not waited out.
         assert!(started.elapsed() < DRAIN_TIMEOUT);
         let mut buf = [0u8; 1];
         assert_eq!(idle_client.read(&mut buf).unwrap(), 0);

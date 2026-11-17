@@ -205,11 +205,11 @@ mod tests {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
         app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down)); // on inst1
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected(), 2);
         assert_eq!(app.selected_node(), Some(Node::Instance(1)));
 
-        app.on_key(key(KeyCode::Left)); // jumps to the sandbox node
+        app.on_key(key(KeyCode::Left));
         assert_eq!(app.selected(), 0);
         assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
     }
@@ -219,7 +219,7 @@ mod tests {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
         app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down)); // on inst1 (pos 2)
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected(), 2);
 
         app.on_key(key(KeyCode::Left));
@@ -241,7 +241,7 @@ mod tests {
         app.set_snapshot(snapshot_with(3)); // 4 nodes
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down)); // last instance, pos 3
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected(), 3);
         app.on_key(key(KeyCode::Left)); // to sandbox, pos 0
         app.on_key(key(KeyCode::Left));
@@ -281,9 +281,9 @@ mod tests {
         app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
         expand_with_rows(&mut app, "inst0", &["10", "20"]);
         // Tree: [Sandbox(0), Instance(0), Proc r0, Proc r1].
-        app.on_key(key(KeyCode::Down)); // inst0 (pos 1)
-        app.on_key(key(KeyCode::Down)); // proc r0 (pos 2)
-        app.on_key(key(KeyCode::Down)); // proc r1 (pos 3)
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected_node(), Some(Node::Proc { instance: 0, row: 1 }));
 
         app.on_key(key(KeyCode::Left));

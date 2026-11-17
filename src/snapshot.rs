@@ -233,7 +233,6 @@ pub struct ServiceRow {
     pub used_by: Vec<String>,
     /// Number of `env` entries in the service spec (`0` when unresolved).
     pub env_len: usize,
-    /// Service command, if set.
     pub command: Option<String>,
     /// Short config hash, empty when unresolved.
     pub config_hash: String,

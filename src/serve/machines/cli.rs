@@ -976,6 +976,7 @@ mod tests {
         assert_eq!(plan_of(&["run", "@/web"], None, m).unwrap(), Plan::Here);
         assert_eq!(plan_of(&["rm", "@/web"], None, m).unwrap(), Plan::Here);
         assert!(plan_of(&["rm", "nope/web"], None, m).is_err());
+        // A container name stays local unless qualified.
         assert_eq!(plan_of(&["logs", "devsandbox-web"], None, m).unwrap(), Plan::Here);
         assert_eq!(
             plan_of(&["inspect", "box/devsandbox-web"], None, m).unwrap(),

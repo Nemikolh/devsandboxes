@@ -69,6 +69,7 @@ pub struct Header {
     pub kind: String,
     /// The body's file name for the receiver (no `/`, not `.` or `..`).
     pub name: String,
+    /// The body's length in bytes.
     pub size: u64,
     /// The body's sha256, lowercase hex.
     pub sha256: String,

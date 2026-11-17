@@ -674,6 +674,7 @@ mod tests {
         };
         let mut port_zero = base.clone();
         port_zero[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0u16.to_le_bytes());
+        // Window with a payload that isn't four bytes.
         let mut bad_window = Frame::Window { stream: 1, credit: 1 }.encode();
         bad_window[5..9].copy_from_slice(&3u32.to_le_bytes());
         bad_window.truncate(HEADER_LEN + 3);

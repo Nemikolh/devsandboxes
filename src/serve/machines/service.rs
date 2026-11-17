@@ -1366,7 +1366,6 @@ mod tests {
         Duplex::socket(ours)
     }
 
-    /// A short scratch dir.
     fn short_scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dsv-ms-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

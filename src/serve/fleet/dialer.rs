@@ -654,6 +654,7 @@ pub(crate) mod tests {
         let r = connect(&pair.l_dir).call("machines.hold", json!({"name": "box"})).unwrap();
         assert_eq!(r.error.unwrap().code, "unknown-method");
 
+        // K's side goes (its `fleet-link` exits): redialed.
         pair.dialed.cut();
         pair.wait_box("box redialed", |r| connected(r) && pair.dialed.count.load(Ordering::SeqCst) == 2);
         drop((k.call("machines.list", Value::Null), l));
@@ -796,7 +797,6 @@ pub(crate) mod tests {
         (r, out, err)
     }
 
-    /// `rows`' entry named `name`, if any.
     pub(crate) fn named(rows: &Value, name: &str) -> Option<Value> {
         rows.as_array()?.iter().find(|r| r["name"] == name).cloned()
     }
@@ -856,6 +856,7 @@ pub(crate) mod tests {
         assert!(r.error.is_none(), "{r:?}");
         assert!(crate::serve::fleet::member::load(&k_member).unwrap().unwrap().agent.is_empty(), "withdrawn");
 
+        // A quick call: L's answer, within L's trust for K.
         let r = k.call("instances.list", json!({"dir": fleet_root, "machine": "lap"})).unwrap();
         assert!(r.error.is_none(), "{r:?}");
         let r = k.call("instances.list", json!({"dir": pair.base, "machine": "lap"})).unwrap();

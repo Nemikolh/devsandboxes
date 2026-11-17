@@ -121,6 +121,7 @@ pub enum GotoOutcome {
     NotReady,
     /// No helper recorded for the instance: nothing to exec.
     NoHelper,
+    /// Anything else, with a one-line reason.
     Failed(String),
 }
 

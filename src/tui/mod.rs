@@ -476,9 +476,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Err(TryRecvError::Disconnected) => false,
         });
 
-        // Drain answered verb requests: hand the answer to `App`. The row's
-        // phase, stop or removal comes with the pushes; the processes are
-        // refetched after the next one.
+        // The row's phase, stop or removal comes with the pushes; the processes
+        // are refetched after the next one.
         verbs.retain_mut(|(action, rx)| {
             let end = match rx.try_recv() {
                 Ok(end) => end,

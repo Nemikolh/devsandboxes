@@ -236,6 +236,7 @@ mod tests {
         let started = Instant::now();
         wait_changed(generation(), Duration::from_millis(200));
         assert!(started.elapsed() < Duration::from_secs(2));
+        // An already-passed generation returns at once.
         let started = Instant::now();
         assert!(wait_changed(seen, Duration::from_secs(10)) > seen);
         assert!(started.elapsed() < Duration::from_millis(100));

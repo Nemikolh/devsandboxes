@@ -904,7 +904,6 @@ pub(crate) mod tests {
         assert_eq!((Build::parse(hello_of(true, None, true)), platform_of(hello_of(false, None, false))), (ours, PLATFORM));
         assert_eq!((control_plane_of(hello_of(true, Some("k"), true)), control_plane_of(hello_of(false, Some("k"), false))), (Some("k"), Some("k")));
         assert_eq!((control_plane_of(hello_of(false, None, true)), control_plane_of(HELLO), control_plane_of("0.7.0 a dev x/y control_plane")), (None, None, None));
-        // The two new words.
         assert_eq!((sha_of(hello_of(false, None, true)), takes_dev_builds(hello_of(false, None, true))), (Some(sha.as_str()), true));
         assert!(!takes_dev_builds(hello_of(true, Some("k"), false)));
         assert_eq!(sha_of(hello_of(true, Some(&"x".repeat(250)), true)), Some(sha.as_str()), "a dropped name keeps the words");

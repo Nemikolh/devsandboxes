@@ -174,6 +174,7 @@ pub struct MovedFolder {
     /// Its path on the worker.
     pub remote: PathBuf,
     pub branch: String,
+    /// The repo's identity.
     pub repo: String,
 }
 

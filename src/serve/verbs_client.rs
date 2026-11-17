@@ -1448,6 +1448,7 @@ mod tests {
         let old = [("instances.resolve", err("unknown-method", "unknown method", None))];
         assert!(matches!(prep(&stop, true, &old, 0).0.unwrap(), Prep::Old(_)));
 
+        // `--all` resolves nothing.
         let (p, calls, _) = prep(&CliVerb::Rebuild { target: None, force: true, reprobe: false, detach: true }, true, &[], 0);
         assert!(calls.is_empty());
         let p = sent(p);

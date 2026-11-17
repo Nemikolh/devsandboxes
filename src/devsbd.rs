@@ -793,6 +793,7 @@ mod tests {
         );
         let bare = boot_spec(&w.c, "/w", None, None, None);
         assert_eq!((bare.user, bare.env), (None, vec![]));
+        // What the host writes is what the helper reads.
         assert_eq!(bootfile::parse(&bootfile::serialize(&spec)), Ok(spec));
     }
 

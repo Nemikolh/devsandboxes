@@ -1506,6 +1506,7 @@ mod tests {
             want.sort();
             assert_eq!(got, want, "{view:?}");
         }
+        // Default view is all.
         let all = run(&path, "inbox.threads.list", Value::Null).unwrap();
         assert_eq!(all.as_array().unwrap().len(), 5);
         let needs = run(&path, "inbox.threads.list", json!({"view":"needs-you"})).unwrap();

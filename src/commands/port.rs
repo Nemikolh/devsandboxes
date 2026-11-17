@@ -671,9 +671,8 @@ fn forward_until_interrupted(
         }
     }
 
-    // All active: print the mappings, then announce we're blocking. The
-    // listening process usually isn't known yet at this point (the first probe
-    // lands ~100ms later), so the suffix is re-printed by the loop below.
+    // The listening process usually isn't known yet at this point (the first
+    // probe lands ~100ms later), so the suffix is re-printed by the loop below.
     let mut prev_states: Vec<ForwardState> = Vec::with_capacity(forwards.len());
     let mut prev_procs: Vec<Option<String>> = Vec::with_capacity(forwards.len());
     for (forward, (host_port, _)) in forwards.iter().zip(specs) {
@@ -1199,7 +1198,6 @@ image = "node"
         // Back to None → nothing (don't print when it disappears).
         assert_eq!(process_reprint_line(&Some("node (pid 412)".into()), &status(None), hp), None);
     }
-
 
     /// Docker-gated: a container with `lsof` running a loopback listener yields
     /// the listening process; a container without `lsof` yields `None`. Skips

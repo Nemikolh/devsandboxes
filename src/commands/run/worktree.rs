@@ -1273,6 +1273,7 @@ mod tests {
         let branches = git(&base, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
         let wt = root.join("wt");
 
+        // An explicit base is ignored (noted), not an error.
         let created = create_worktree(&base, &wt, "feat/a", Some("main"), true, &Default::default()).unwrap();
 
         assert!(!created);

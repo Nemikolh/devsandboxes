@@ -276,6 +276,7 @@ mod tests {
         assert!(a.is_current(), "another owner doesn't replace it");
         let b = f.claim("o");
         assert!(!a.is_current() && b.is_current());
+        // The superseded one leaving doesn't forget the newer one.
         drop(a);
         assert!(b.is_current());
         assert_eq!(f.current("o"), Some(b.generation));
@@ -321,6 +322,7 @@ mod tests {
         assert_eq!(next(&rx), format!("{}\n", control::FOLLOW_REPLACED_LINE));
         assert_eq!(first.join().unwrap(), Ok(()));
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "nothing after replaced");
+        // The new stream gets everything unacked again.
         assert_eq!(next(&rx2), "status ok\nbody \n");
         assert_eq!(text_of(&next(&rx2)), "one");
         assert_eq!(text_of(&next(&rx2)), "two");

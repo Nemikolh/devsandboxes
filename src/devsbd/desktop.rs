@@ -162,6 +162,7 @@ mod tests {
             assert!(rl.allow("a", None, t0));
         }
         assert!(!rl.allow("a", None, t0), "burst spent");
+        // Another instance has its own bucket.
         assert!(rl.allow("b", None, t0));
         assert!(!rl.allow("a", None, t0 + RATE_REFILL - Duration::from_millis(1)));
         assert!(rl.allow("a", None, t0 + RATE_REFILL), "one token refilled");

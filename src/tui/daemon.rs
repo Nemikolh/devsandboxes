@@ -524,7 +524,6 @@ fn build_log_call(key: &str) -> (&'static str, Value) {
     on_machine(call, machine)
 }
 
-/// The API call for [`Cmd::Signal`].
 fn signal_call(sig: &PendingSignal) -> (&'static str, Value) {
     let (machine, instance) = split(&sig.instance);
     let call = ("instances.signal", json!({ "instance": instance, "pid": sig.pid, "signal": sig.signal.wire() }));
@@ -560,7 +559,6 @@ fn session_rm_status(rm: &PendingSessionRm, answer: Answer) -> String {
     }
 }
 
-/// The API call for [`Cmd::Rename`].
 fn rename_call(key: &str, new_name: &str) -> (&'static str, Value) {
     let (machine, instance) = split(key);
     on_machine(("instances.rename", json!({ "instance": instance, "newName": new_name })), machine)
@@ -579,7 +577,6 @@ fn rename_status(instance: &str, new_name: &str, answer: Answer) -> String {
     }
 }
 
-/// The API call for [`Cmd::SetProfile`].
 fn set_profile_call(key: &str, profile: &str) -> (&'static str, Value) {
     let (machine, instance) = split(key);
     on_machine(("instances.setProfile", json!({ "instance": instance, "profile": profile })), machine)
@@ -595,7 +592,6 @@ fn set_profile_status(instance: &str, profile: &str, answer: Answer) -> String {
     }
 }
 
-/// The API call for [`Cmd::Done`].
 fn done_call(req: &PendingDone) -> (&'static str, Value) {
     let (machine, instance) = split(&req.instance);
     on_machine(("instances.done", json!({ "instance": instance, "done": req.done })), machine)
@@ -669,7 +665,6 @@ fn rm_call(id: u64) -> (&'static str, Value) {
     ("forwards.rm", json!({ "id": id }))
 }
 
-/// The API call for [`Cmd::MachineSet`].
 fn machine_set_call(name: &str, agent: bool) -> (&'static str, Value) {
     ("machines.set", json!({ "name": name, "agent": agent }))
 }

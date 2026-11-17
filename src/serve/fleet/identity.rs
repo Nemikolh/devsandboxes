@@ -34,7 +34,6 @@ pub const STATEMENT_DOMAIN: &str = "devsandbox/statement/v1";
 const KEY_PREFIX: &str = "ed25519:";
 /// `member.key`'s one line's prefix: `ed25519-seed:<64 lowercase hex>`.
 const SEED_PREFIX: &str = "ed25519-seed:";
-/// A fingerprint's prefix.
 const FINGERPRINT_PREFIX: &str = "SHA256:";
 
 /// The bytes a signature in `domain` covers: `domain || 0x00 || message`.

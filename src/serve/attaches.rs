@@ -220,6 +220,7 @@ mod tests {
         here.end(at);
         assert_eq!((a.latest("id-1", at), inbound(&a, "id-1")), (Some(Origin::Here), Some((0, Some(at)))), "ended, still the latest");
 
+        // The same origin joins; the last of its attaches ends it.
         let one = a.begin_in("id-1", member("lap"));
         let two = a.begin_in("id-1", member("lap"));
         assert_eq!(inbound(&a, "id-1"), Some((2, None)));

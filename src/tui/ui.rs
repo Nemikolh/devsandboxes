@@ -1764,8 +1764,8 @@ fn draw_terminal_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    // Lock the active screen to render it. A poisoned lock (a reader thread
-    // panicked) is unrecoverable here — skip the body but still show the block.
+    // A poisoned lock (a reader thread panicked) is unrecoverable here — skip
+    // the body but still show the block.
     let Ok(mut parser) = session.parser().lock() else {
         frame.render_widget(block, area);
         return;

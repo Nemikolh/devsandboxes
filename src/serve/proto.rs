@@ -169,6 +169,7 @@ mod tests {
         assert!(!v("0.6.0", 0).is_newer_than(&v("0.6.0", 1)));
         // Numeric, not string: 0.10 > 0.9.
         assert!(v("0.10.0", 0).is_newer_than(&v("0.9.0", 99)));
+        // Semver wins over build.
         assert!(!v("0.5.9", 999).is_newer_than(&v("0.6.0", 1)));
     }
 

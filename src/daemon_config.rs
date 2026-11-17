@@ -55,7 +55,6 @@ pub fn member_key(data: &Path) -> PathBuf {
     data.join(MEMBER_KEY)
 }
 
-/// The member key's file name.
 pub const MEMBER_KEY: &str = "member.key";
 
 /// The sibling of the key file `key` named with `suffix` appended

@@ -967,6 +967,7 @@ mod tests {
         // ST terminator; a later copy replaces an unrelayed one.
         s.feed_output(b"\x1b]52;c;b2xk\x1b\\\x1b]52;p;bmV3\x1b\\");
         assert_eq!(s.take_clipboard().as_deref(), Some(&b"bmV3"[..]));
+        // Nothing is ever answered on the PTY.
         assert_eq!(s.take_written(), b"");
     }
 
