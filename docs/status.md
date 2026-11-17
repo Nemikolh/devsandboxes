@@ -507,13 +507,11 @@ is frozen: no new work on it.
   its instances name (placed configs without an instance left don't
   show).
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::calls::config_roots`
-- Terminals on a machine's instances without a helper, or whose
-  helper daemon isn't root (`session.attach` is `needs_root`, e.g.
-  `containerUser`), and service terminals there are a plain `exec -it`
-  under a host pty on the machine: not resumable, a dropped link ends
-  them (it kills the runtime's exec client; the in-container process
-  may run on, as before resumable exec); a non-root helper's are
-  [planned](plans/active/resumable-exec.md) as sessions. → [fleet](architecture/daemon/fleet.md#pty); `fleet::pty::decide`, `fleet::pty::run_tty`
+- Terminals on a machine's instances without a helper, and service
+  terminals there, are a plain `exec -it` under a host pty on the
+  machine: not resumable, a dropped link ends them (it kills the
+  runtime's exec client; the in-container process may run on, as before
+  resumable exec). → [fleet](architecture/daemon/fleet.md#pty); `fleet::pty::decide`, `fleet::pty::run_tty`
 - The dashboard opens no terminal in a machine's global service that no
   instance there uses ("no instance on `m` uses service `s`"): a `PTY`
   service dial names the instance whose service it opens, and `exec

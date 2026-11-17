@@ -106,7 +106,9 @@ pub enum End {
 /// `reserve_255` (as `exec::reported_code`: 255 then only means a lost
 /// link); `no-session` / `detached` / `version` the helper's codes
 /// ([`NO_SESSION_EXIT`], [`DETACHED_EXIT`], [`VERSION_EXIT`]) with its note
-/// as its own session client prints it; `lost` and an end without a record
+/// as its own session client prints it (none for an empty message: the
+/// worker ran that client, `fleet::pty::client_exit_record`, and its note
+/// came as output already); `lost` and an end without a record
 /// [`SSH_FAILED`]; any other error [`REFUSED_EXIT`] with the worker's
 /// message.
 pub fn exit_of(end: &End, reserve_255: bool) -> (i32, Option<String>) {
@@ -114,7 +116,7 @@ pub fn exit_of(end: &End, reserve_255: bool) -> (i32, Option<String>) {
         End::Exit(Exit::Code(n)) => (crate::commands::exec::reported_code(*n, reserve_255), None),
         End::Exit(Exit::Signal(n)) => (128 + n, None),
         End::Error { code: c, message } => {
-            let session = |exit: i32| (exit, Some(format!("devsbd session: {message}")));
+            let session = |exit: i32| (exit, (!message.is_empty()).then(|| format!("devsbd session: {message}")));
             match c.as_str() {
                 helper::NO_SESSION => session(NO_SESSION_EXIT),
                 helper::DETACHED => session(DETACHED_EXIT),
@@ -355,6 +357,9 @@ mod tests {
         assert_eq!(exit_of(&err("no-session"), true), (250, Some("devsbd session: why no-session".into())));
         assert_eq!(exit_of(&err("detached"), true).0, 251);
         assert_eq!(exit_of(&err("version"), true).0, 252);
+        let quiet = |c: &str| End::Error { code: c.into(), message: String::new() };
+        assert_eq!(exit_of(&quiet("detached"), true), (251, None), "a worker-run client's note came as output");
+        assert_eq!(exit_of(&quiet("no-session"), true), (250, None));
         assert_eq!(exit_of(&err("lost"), true).0, 255);
         assert_eq!(exit_of(&End::Lost("gone".into()), true), (255, Some("gone".into())));
         for c in ["bad-request", "failed", "denied", "not-found", "not-running", "unsupported"] {

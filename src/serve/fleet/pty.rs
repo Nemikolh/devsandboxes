@@ -22,20 +22,27 @@
 //! and it was reaped ([`exit_record`]). The control plane closing the stream first
 //! kills and reaps it, and nothing more is written.
 //!
-//! A session header for an instance whose helper can't attach (none, or its
-//! daemon doesn't offer `session.attach`: not root, or older) runs a tty
-//! exec instead when it creates ([`decide`], [`Terminal::Tty`]): `<runtime>
-//! exec -it` under a host pty ([`run_tty`]), not resumable (one `stderr`
-//! note says so first); an attach-only one gets `no-session`. A header with
-//! `service` ([`Mode::Service`]) is the same tty exec into a service
-//! container the instance uses ([`service_container`]). The pty's output
-//! comes back as `stdout` records, the control plane's `stdin` and `resize` go into
-//! it, its exit is one `exit` record; the control plane closing first kills and reaps
-//! it.
+//! A session header for an instance whose helper's daemon doesn't offer
+//! `session.attach` (not root, or older) runs the helper's session client
+//! instead ([`decide`], [`Terminal::Client`]): `<runtime> exec -it …
+//! devsbd session new|attach` under a host pty ([`run_tty`]), what a local
+//! tty exec runs ([`client_command`]), so it is resumable too; its
+//! `no-session` / `detached` / `version` exits end the stream as the
+//! attach's error records do ([`client_exit_record`]). One without a helper
+//! runs a plain tty exec when it creates ([`Terminal::Tty`]): `<runtime>
+//! exec -it` under a host pty, not resumable (one `stderr` note says so
+//! first, [`TTY_NOTE`]); an attach-only one gets `no-session`. A header
+//! with `service` ([`Mode::Service`]) is the same plain tty exec into a
+//! service container the instance uses ([`service_container`]). The pty's
+//! output comes back as `stdout` records, the control plane's `stdin` and
+//! `resize` go into it, its exit is one `exit` record; the control plane
+//! closing first kills and reaps the runtime's exec client (a session
+//! client it leaves in the container is displaced by the next attach).
 //!
 //! [`parse_header`], [`gate`], [`decide`], [`attach_params`],
-//! [`exit_record`] and [`tty_exit_record`] are pure (`gate` canonicalizes
-//! the header's root); [`serve`] is the I/O.
+//! [`client_command`], [`exit_record`], [`tty_exit_record`] and
+//! [`client_exit_record`] are pure (`gate` canonicalizes the header's
+//! root); [`serve`] is the I/O.
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -46,12 +53,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::lent::{self, Files, Peer, Reach};
-use crate::commands::exec::{SHELL_FALLBACK_CMD, exec_argv_with, exec_context};
+use crate::commands::exec::{SHELL_FALLBACK_CMD, exec_argv_with, exec_context, session_attach_command, session_new_command};
 use crate::devsbd::control::valid_run_id;
 use crate::devsbd::rpc::{self, Exit, Json, Obj, Record};
 use crate::serve::attaches::{Attaches, Origin};
 use crate::serve::endpoint::Stream;
 use crate::serve::helper::{Call, CallError, Cancel, HelperClient, Input};
+use crate::serve::machines::cli::{DETACHED_EXIT, NO_SESSION_EXIT, VERSION_EXIT};
 use crate::state::{Instance, State};
 
 /// The header's method, and the helper's.
@@ -224,58 +232,52 @@ pub fn gate<'a>(h: &Header, state: &'a State, reach: &Reach) -> Result<(&'a str,
 /// How a session header's terminal runs ([`decide`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Terminal {
-    /// A session attach through the helper (resumable).
+    /// A session attach through the helper's daemon (`session.attach`).
     Attach,
-    /// A tty exec under a host pty ([`run_tty`]): not resumable, and why.
-    Tty(NotResumable),
+    /// The helper's session client through a tty exec under a host pty
+    /// ([`client_command`], [`run_tty`]): a session as a local tty exec
+    /// makes one, which needs no root daemon. For a helper whose daemon
+    /// doesn't offer `session.attach` (decision 13: it is root only; a
+    /// `containerUser` instance, or an older helper).
+    Client,
+    /// A plain tty exec under a host pty ([`run_tty`]): no helper, not
+    /// resumable ([`TTY_NOTE`]).
+    Tty,
 }
 
-/// Why an instance's terminals over the link aren't sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotResumable {
-    /// No devsbd helper in it.
-    NoHelper,
-    /// Its helper's daemon doesn't offer `session.attach` (decision 13: it
-    /// is root only; a `containerUser` instance, or an older helper).
-    HelperNotRoot,
-}
-
-impl NotResumable {
-    pub fn why(self) -> &'static str {
-        match self {
-            NotResumable::NoHelper => "no helper",
-            NotResumable::HelperNotRoot => "helper not root",
-        }
-    }
-
-    /// The `stderr` record's text a fallback terminal starts with (`\r\n`:
-    /// the control plane's terminal is raw by then).
-    pub fn note(self) -> String {
-        format!("this terminal isn't resumable ({}): a dropped link ends it\r\n", self.why())
-    }
-}
+/// The `stderr` record's text a [`Terminal::Tty`] starts with (`\r\n`: the
+/// control plane's terminal is raw by then).
+pub const TTY_NOTE: &str = "this terminal isn't resumable (no helper): a dropped link ends it\r\n";
 
 /// The terminal a session header for instance `name` gets: `create`
 /// whether it creates one; `offers` the helper's answer to whether it
 /// offers `session.attach` (`HelperClient::offers`), `None` without a
-/// helper. A helper that takes it: [`Terminal::Attach`]. One that can't
-/// (none, not offered): a creating header falls back to
-/// [`Terminal::Tty`], an attach-only one gets `no-session` (nothing
-/// resumable exists). No bridge is `not-running`.
+/// helper. A helper that takes it: [`Terminal::Attach`]; one that doesn't:
+/// [`Terminal::Client`], creating or not. Without a helper a creating
+/// header falls back to [`Terminal::Tty`], an attach-only one gets
+/// `no-session` (nothing resumable exists). No bridge is `not-running`.
 pub fn decide(create: bool, offers: Option<Result<bool, CallError>>, name: &str) -> Result<Terminal, Record> {
-    let why = match offers {
-        Some(Ok(true)) => return Ok(Terminal::Attach),
-        None => NotResumable::NoHelper,
-        Some(Ok(false) | Err(CallError::Unsupported(_))) => NotResumable::HelperNotRoot,
-        Some(Err(e)) => return Err(refusal(e, name)),
-    };
-    if create {
-        return Ok(Terminal::Tty(why));
+    match offers {
+        Some(Ok(true)) => Ok(Terminal::Attach),
+        Some(Ok(false) | Err(CallError::Unsupported(_))) => Ok(Terminal::Client),
+        Some(Err(e)) => Err(refusal(e, name)),
+        None if create => Ok(Terminal::Tty),
+        None => Err(Record::error(
+            rpc::code::NO_SESSION,
+            format!("`{name}`'s terminals over the fleet link aren't resumable (no helper): no session to attach to"),
+        )),
     }
-    Err(Record::error(
-        rpc::code::NO_SESSION,
-        format!("`{name}`'s terminals over the fleet link aren't resumable ({}): no session to attach to", why.why()),
-    ))
+}
+
+/// The in-container command of a [`Terminal::Client`] for session `id`:
+/// with `create`, the helper's `session new` running it (empty: the login
+/// shell), which attaches instead to a live `id`; without, `session
+/// attach`. What a local tty exec runs (`exec::session_new_command`).
+pub fn client_command(id: &str, create: Option<&[String]>) -> Vec<String> {
+    match create {
+        Some(argv) => session_new_command(id, &or_shell(argv)),
+        None => session_attach_command(id),
+    }
 }
 
 /// The refusal for a helper call that couldn't be made.
@@ -381,6 +383,28 @@ pub fn tty_exit_record(status: &portable_pty::ExitStatus) -> Record {
     })
 }
 
+/// The last record of a [`Terminal::Client`] that ended with `status`: the
+/// session client's `NO_SESSION_EXIT` / `DETACHED_EXIT` / `VERSION_EXIT`
+/// as the `no-session` / `detached` / `version` error a
+/// [`Terminal::Attach`] ends with, so the caller (`pty_client::exit_of`)
+/// treats both alike; anything else as [`tty_exit_record`]. The message is
+/// empty: the client already printed its note into the pty, which the
+/// caller got as `stdout`. A program's own 250-252 read as those, as for a
+/// local session exec.
+pub fn client_exit_record(status: &portable_pty::ExitStatus) -> Record {
+    let code = match i32::try_from(status.exit_code()) {
+        _ if status.signal().is_some() => None,
+        Ok(NO_SESSION_EXIT) => Some(rpc::code::NO_SESSION),
+        Ok(DETACHED_EXIT) => Some(rpc::code::DETACHED),
+        Ok(VERSION_EXIT) => Some(rpc::code::VERSION),
+        _ => None,
+    };
+    match code {
+        Some(code) => Record::error(code, ""),
+        None => tty_exit_record(status),
+    }
+}
+
 /// The signal `strsignal` names `name` (portable-pty's `Signal <n>` for one
 /// it doesn't).
 fn signal_number(name: &str) -> Option<i32> {
@@ -424,8 +448,9 @@ pub fn spawn_tty(argv: Vec<String>) -> anyhow::Result<Tty> {
 enum Started {
     Attach(Call, Input),
     Pipe(Child),
-    /// A tty exec, and the note to send before its output.
-    Tty(Tty, Option<String>),
+    /// A tty exec, the note to send before its output, and its last
+    /// record ([`tty_exit_record`], [`client_exit_record`]).
+    Tty(Tty, Option<String>, EndOf),
 }
 
 /// Serve one `PTY` stream, `link` the worker's end, to its end (see the
@@ -468,7 +493,7 @@ pub fn serve(
             match started {
                 Started::Attach(call, input) => pump(&link, call, input),
                 Started::Pipe(child) => run_pipe(&link, child),
-                Started::Tty(tty, note) => run_tty(&link, tty, note.as_deref()),
+                Started::Tty(tty, note, end) => run_tty(&link, tty, note.as_deref(), end),
             }
         }
         Err(rec) => {
@@ -522,9 +547,9 @@ fn start_in(
     exec: ExecCommand,
     caller: &str,
 ) -> Result<Started, Record> {
-    let tty = |argv: Vec<String>, note: Option<String>| {
+    let tty = |argv: Vec<String>, note: Option<String>, end: EndOf| {
         spawn_tty(argv)
-            .map(|t| Started::Tty(t, note))
+            .map(|t| Started::Tty(t, note, end))
             .map_err(|e| Record::error(code::FAILED, format!("cannot run a terminal in `{name}`: {e:#}")))
     };
     let (id, create) = match &h.mode {
@@ -545,15 +570,19 @@ fn start_in(
         }
         Mode::Service { name: service, argv } => {
             let container = service_container(instance, name, state, service)?;
-            return tty(exec(&Target::Service { container: &container, argv: &or_shell(argv) }), None);
+            return tty(exec(&Target::Service { container: &container, argv: &or_shell(argv) }), None, tty_exit_record);
         }
         Mode::Session { id, create } => (id, create),
     };
     let offers = instance.devsbd_arch.is_some().then(|| helper.offers(&instance.container, METHOD, caller));
-    if let Terminal::Tty(why) = decide(create.is_some(), offers, name)? {
-        let argv = or_shell(create.as_deref().unwrap_or_default());
+    let (argv, note, end): (_, _, EndOf) = match decide(create.is_some(), offers, name)? {
+        Terminal::Attach => (None, None, tty_exit_record),
+        Terminal::Client => (Some(client_command(id, create.as_deref())), None, client_exit_record),
+        Terminal::Tty => (Some(or_shell(create.as_deref().unwrap_or_default())), Some(TTY_NOTE.to_string()), tty_exit_record),
+    };
+    if let Some(argv) = argv {
         let target = Target::Instance { instance, interactive: true, tty: true, argv: &argv, host_agent: host_agent() };
-        return tty(exec(&target), Some(why.note()));
+        return tty(exec(&target), note, end);
     }
     let params = attach_params(id, create.as_deref(), instance, host_agent());
     // While it queues: whether the control plane closed its end.
@@ -622,14 +651,17 @@ fn run_pipe(link: &Stream, mut child: Child) {
     });
 }
 
+/// How a tty exec's exit becomes its last record.
+type EndOf = fn(&portable_pty::ExitStatus) -> Record;
+
 /// A tty exec to its end: `note` first (as a `stderr` record), then the
 /// pty's output as `stdout` records on a thread of its own, the control plane's
 /// `stdin` into the pty and its `resize`s onto it on another; once the
-/// child exited and the output is drained, its `exit` record
-/// ([`tty_exit_record`]). The control plane hanging up first kills (SIGHUP, then
-/// SIGKILL: portable-pty's `kill`) and reaps it, and nothing more is
-/// written.
-fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
+/// child exited and the output is drained, its last record (`end`:
+/// [`tty_exit_record`], [`client_exit_record`]). The control plane hanging
+/// up first kills (SIGHUP, then SIGKILL: portable-pty's `kill`) and reaps
+/// it, and nothing more is written.
+fn run_tty(link: &Stream, tty: Tty, note: Option<&str>, end: EndOf) {
     let Tty { master, mut child, reader, writer } = tty;
     let master = Mutex::new(master);
     // One writer at a time: a record is one write, never interleaved.
@@ -646,10 +678,8 @@ fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
     std::thread::scope(|s| {
         let send = &send;
         let out = s.spawn(move || drain(reader, Record::Stdout, send));
-        if let Ok(r) = link.try_clone() {
-            let (master, done, gone) = (&master, &done, &gone);
-            s.spawn(move || feed_tty(r, writer, master, done, gone));
-        }
+        let (m, d, g) = (&master, &done, &gone);
+        let feeder = link.try_clone().ok().map(|r| s.spawn(move || feed_tty(r, writer, m, d, g)));
         let ended = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
@@ -667,7 +697,7 @@ fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
         let _ = out.join();
         if !gone.load(Ordering::SeqCst) {
             let last = match ended {
-                Ok(status) => tty_exit_record(&status),
+                Ok(status) => end(&status),
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -679,20 +709,28 @@ fn run_tty(link: &Stream, tty: Tty, note: Option<&str>) {
         done.store(true, Ordering::SeqCst);
         // Ends `feed_tty`'s read.
         let _ = link.shutdown(Shutdown::Both);
+        // Only now, the child reaped: dropping the writer types `\n` and
+        // EOF into the pty (portable-pty's `UnixMasterWriter`), which the
+        // runtime's raw exec client would relay to the program, ending a
+        // session's shell on every hang-up.
+        if let Some(feeder) = feeder {
+            drop(feeder.join());
+        }
     });
 }
 
 /// The control plane's records into a tty exec until the control plane closes its end, which
 /// flags `gone` unless the exec is over (`done`): `stdin` to the pty,
 /// `resize` onto it. `stdin-eof` is ignored (a terminal has no end of its
-/// own to give), as is anything else.
+/// own to give), as is anything else. Returns `writer` undropped, for
+/// [`run_tty`] to drop once the child is gone.
 fn feed_tty(
     mut reader: Stream,
     mut writer: Box<dyn Write + Send>,
     master: &Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     done: &AtomicBool,
     gone: &AtomicBool,
-) {
+) -> Box<dyn Write + Send> {
     loop {
         match rpc::read_record(&mut reader) {
             Ok(Some(Record::Stdin(bytes))) => {
@@ -707,7 +745,7 @@ fn feed_tty(
                 if !done.load(Ordering::SeqCst) {
                     gone.store(true, Ordering::SeqCst);
                 }
-                return;
+                return writer;
             }
         }
     }
@@ -1008,23 +1046,34 @@ mod tests {
     }
 
     #[test]
-    fn a_helper_that_cant_attach_falls_back_to_a_tty_when_creating() {
-        use NotResumable::*;
+    fn a_helper_that_cant_attach_runs_its_session_client() {
         assert_eq!(decide(true, Some(Ok(true)), "w"), Ok(Terminal::Attach));
         assert_eq!(decide(false, Some(Ok(true)), "w"), Ok(Terminal::Attach), "an attach is the helper's");
-        assert_eq!(decide(true, None, "w"), Ok(Terminal::Tty(NoHelper)));
-        assert_eq!(decide(true, Some(Ok(false)), "w"), Ok(Terminal::Tty(HelperNotRoot)));
-        assert_eq!(decide(true, Some(Err(CallError::Unsupported("c".into()))), "w"), Ok(Terminal::Tty(HelperNotRoot)), "an older helper");
-        // Attach only: nothing resumable exists.
-        for offers in [None, Some(Ok(false))] {
-            let Err(Record::Error { code, message }) = decide(false, offers, "w") else { panic!() };
-            assert_eq!(code, rpc::code::NO_SESSION);
-            assert!(message.contains("aren't resumable"), "{message}");
+        // Not root (or an older helper): the session client, creating or not.
+        for create in [true, false] {
+            assert_eq!(decide(create, Some(Ok(false)), "w"), Ok(Terminal::Client));
+            assert_eq!(decide(create, Some(Err(CallError::Unsupported("c".into()))), "w"), Ok(Terminal::Client), "an older helper");
         }
+        // No helper: a plain tty; attach only, nothing resumable exists.
+        assert_eq!(decide(true, None, "w"), Ok(Terminal::Tty));
+        let Err(Record::Error { code, message }) = decide(false, None, "w") else { panic!() };
+        assert_eq!(code, rpc::code::NO_SESSION);
+        assert!(message.contains("aren't resumable (no helper)"), "{message}");
         assert_eq!(code_of(decide(true, Some(Err(CallError::NoBridge("c".into()))), "w")), code::NOT_RUNNING);
         assert_eq!(code_of(decide(true, Some(Err(CallError::Io(std::io::Error::other("x")))), "w")), code::FAILED);
-        assert_eq!(NoHelper.note(), "this terminal isn't resumable (no helper): a dropped link ends it\r\n");
-        assert!(HelperNotRoot.note().contains("(helper not root)"));
+    }
+
+    #[test]
+    fn session_client_ends_read_as_an_attachs() {
+        use std::os::unix::process::ExitStatusExt;
+        let of = |raw| client_exit_record(&portable_pty::ExitStatus::from(ExitStatus::from_raw(raw)));
+        assert_eq!(of(250 << 8), Record::error(rpc::code::NO_SESSION, ""));
+        assert_eq!(of(251 << 8), Record::error(rpc::code::DETACHED, ""));
+        assert_eq!(of(252 << 8), Record::error(rpc::code::VERSION, ""));
+        assert_eq!(of(0), Record::Exit(Exit::Code(0)));
+        assert_eq!(of(3 << 8), Record::Exit(Exit::Code(3)));
+        assert_eq!(of(253 << 8), Record::Exit(Exit::Code(253)));
+        assert_eq!(of(9), Record::Exit(Exit::Signal(9)), "a signal stays one");
     }
 
     #[test]
@@ -1052,6 +1101,15 @@ mod tests {
         let svc = runtime_exec(&Target::Service { container: "devsandbox-svc-p-db", argv: &argv });
         assert_eq!(svc, [bin.as_str(), "exec", "-i", "-t", "devsandbox-svc-p-db", "ls"]);
         assert_eq!(or_shell(&[]), SHELL_FALLBACK_CMD);
+
+        // A session client's: what a local tty exec of a session runs.
+        let client = |create: Option<&[String]>| {
+            runtime_exec(&Target::Instance { instance: inst, interactive: true, tty: true, argv: &client_command(SESSION, create), host_agent: false })
+        };
+        let shell: Vec<String> = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+        assert_eq!(client(Some(&[]))[1..], exec_argv_with(inst, true, true, &session_new_command(SESSION, &shell), false), "the login shell");
+        assert_eq!(client(Some(&argv))[1..], exec_argv_with(inst, true, true, &session_new_command(SESSION, &argv), false));
+        assert_eq!(client(None)[1..], exec_argv_with(inst, true, true, &session_attach_command(SESSION), false), "attach only");
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -1272,9 +1330,16 @@ mod tests {
     }
 
     /// The tests' exec: `sh -c <argv[0]>` on this host; into a service,
-    /// its container's name echoed first.
+    /// its container's name echoed first. A session client: `session new`
+    /// runs its command's `argv[0]` (after a `new <id>` line), `session
+    /// attach` says `attach <id>` and exits `DETACHED_EXIT`.
     fn sh(t: &Target) -> Vec<String> {
         let script = match t {
+            Target::Instance { argv, .. } if argv[0] == crate::devsbd::BIN => match &argv[1..] {
+                [_, new, _, id, _, command, ..] if new == "new" => format!("echo new {id}; {command}"),
+                [_, attach, id] if attach == "attach" => format!("echo attach {id}; exit {DETACHED_EXIT}"),
+                other => panic!("{other:?}"),
+            },
             Target::Instance { argv, .. } => argv[0].clone(),
             Target::Service { container, argv } => format!("echo {container}; {}", argv[0]),
         };
@@ -1373,12 +1438,9 @@ mod tests {
         // Attach only, without a helper that attaches: nothing to resume.
         assert_eq!(refusal(header(base(cfg).with("instance", "bare")), w.helper.clone()), rpc::code::NO_SESSION);
 
-        // Not running: no bridge; not root: `session.attach` not offered.
+        // Not running: no bridge.
         let none = HelperClient::new(Fake::default(), log);
         assert_eq!(refusal(header(base(cfg)), none), code::NOT_RUNNING);
-        let fake = Fake::default();
-        fake.add("devsandbox-web-1", caps::RPC, 1, not_root);
-        assert_eq!(refusal(header(base(cfg)), HelperClient::new(fake, log)), rpc::code::NO_SESSION);
 
         let svc = |service: &str| header(pipe_base(cfg).with("service", service).with("create", Obj::new()));
         assert_eq!(refusal(svc("cache"), w.helper.clone()), code::NOT_FOUND, "not one `web-1` uses");
@@ -1401,9 +1463,9 @@ mod tests {
         rpc::write_record(&mut &control_plane, &Record::Stdin(b"hi\n".to_vec())).unwrap();
         let recs = rest(&control_plane);
         t.join().unwrap();
-        assert_eq!(recs[0], Record::Stderr(NotResumable::NoHelper.note().into_bytes()), "the note first: {recs:?}");
+        assert_eq!(recs[0], Record::Stderr(TTY_NOTE.as_bytes().to_vec()), "the note first: {recs:?}");
         let (out, err, last) = split(&recs);
-        assert_eq!(err, NotResumable::NoHelper.note(), "only the note");
+        assert_eq!(err, TTY_NOTE, "only the note");
         assert!(out.contains("30 100"), "the resize reached the pty: {out:?}");
         assert!(out.contains("got hi"), "{out:?}");
         assert_eq!(last, Some(Record::Exit(Exit::Code(3))));
@@ -1415,23 +1477,41 @@ mod tests {
     }
 
     #[test]
-    fn a_non_root_helper_falls_back_too() {
+    fn a_non_root_helper_runs_its_session_client() {
         let w = world("tty-root");
-        let fake = Fake::default();
-        fake.add("devsandbox-web-1", caps::RPC, 1, not_root);
-        let (control_plane, t) = open(&w, tty_header(&w, "web-1", "echo ok"), HelperClient::new(fake, log));
-        let recs = rest(&control_plane);
-        t.join().unwrap();
-        assert_eq!(recs[0], Record::Stderr(NotResumable::HelperNotRoot.note().into_bytes()));
-        let (out, _, last) = split(&recs);
-        assert!(out.contains("ok"), "{out:?}");
-        assert_eq!(last, Some(Record::Exit(Exit::Code(0))));
+        let not_root = || {
+            let fake = Fake::default();
+            fake.add("devsandbox-web-1", caps::RPC, 1, not_root);
+            HelperClient::new(fake, log)
+        };
+        let run = |header: Record| {
+            let (control_plane, t) = open(&w, header, not_root());
+            let recs = rest(&control_plane);
+            t.join().unwrap();
+            split(&recs)
+        };
+        let (out, err, last) = run(tty_header(&w, "web-1", "echo ok"));
+        assert!(out.contains(&format!("new {SESSION}")) && out.contains("ok"), "{out:?}");
+        assert_eq!((err.as_str(), last), ("", Some(Record::Exit(Exit::Code(0)))), "no note: it is a session");
+        // The client's own codes end it as an attach would.
+        let (_, _, last) = run(tty_header(&w, "web-1", &format!("exit {VERSION_EXIT}")));
+        assert_eq!(last, Some(Record::error(rpc::code::VERSION, "")));
+        // Attach only: the client's `session attach`, not a refusal.
+        let (out, _, last) = run(header(base(w.root.join("cfg").to_str().unwrap())));
+        assert!(out.contains(&format!("attach {SESSION}")), "{out:?}");
+        assert_eq!(last, Some(Record::error(rpc::code::DETACHED, "")));
     }
 
     #[test]
     fn a_hang_up_kills_the_tty() {
         let w = world("tty-hup");
-        let (control_plane, t) = open(&w, tty_header(&w, "bare", "echo $$; exec sleep 30"), w.helper.clone());
+        // `read` ends only if the hang-up types a line or EOF into the pty,
+        // which a session client would relay to its program. HUP ignored:
+        // only the SIGKILL after portable-pty's grace ends it, time enough
+        // for `touch`.
+        let typed = w.base.join("typed");
+        let script = format!("trap '' HUP; echo $$; read x; touch {}; exec sleep 30", typed.display());
+        let (control_plane, t) = open(&w, tty_header(&w, "bare", &script), w.helper.clone());
         let mut out = String::new();
         let pid: libc::pid_t = loop {
             match rpc::read_record(&mut &control_plane) {
@@ -1449,6 +1529,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10), "killed, not waited out");
         // SAFETY: signal 0 only checks the pid; reaped, it's gone.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "killed and reaped");
+        assert!(!typed.exists(), "nothing typed into the pty on the hang-up");
     }
 
     #[test]
@@ -1466,5 +1547,93 @@ mod tests {
         assert!(out.contains(&container), "{out:?}");
         assert_eq!(err, "", "no note: a service terminal was never a session");
         assert_eq!(last, Some(Record::Exit(Exit::Code(4))));
+    }
+
+    /// A [`Terminal::Client`] for real, as a worker runs it for a
+    /// `containerUser` instance: the helper installed in an alpine container,
+    /// the session client run as `nobody` (no root daemon involved) through
+    /// `runtime_exec` under a host pty ([`run_tty`]). The caller hanging up
+    /// kills the runtime's exec client; an attach-only one reaches the same
+    /// program (its pid), a second attach takes over (`detached`, the
+    /// client's own note as output), and the program's exit ends the last.
+    #[test_utils::docker_test(helper)]
+    fn a_session_client_outlives_its_callers_hang_up_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-pty-client-test-{stamp}");
+        let up = crate::test_support::runtime_cmd()
+            .args(["run", "-d", "--rm", "--name", &name, "alpine:3.20", "sleep", "300"])
+            .output()
+            .unwrap();
+        assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+        let cleanup = || {
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            crate::devsbd::install(&name, None).unwrap();
+            let base = scratch("client-docker");
+            let text = format!(
+                "[instance.c]\ninstance_id = \"id-c\"\nsandbox = \"c\"\ncontainer = {name:?}\nfolder = \"/w\"\n\
+                 workspace = \"/\"\ncreated_unix = 1\nremote_user = \"nobody\"\ndevsbd_arch = \"x86_64\"\n"
+            );
+            std::fs::write(base.join("state.toml"), text).unwrap();
+            let state = State::load_at(&base.join("state.toml")).unwrap();
+            let inst = state.instances["c"].clone();
+            const ID: &str = "1700000000-c11e";
+            let open = |create: Option<&[String]>| {
+                let argv = client_command(ID, create);
+                let argv = runtime_exec(&Target::Instance { instance: &inst, interactive: true, tty: true, argv: &argv, host_agent: false });
+                let tty = spawn_tty(argv).unwrap();
+                let (control_plane, ours) = UnixStream::pair().unwrap();
+                let t = std::thread::spawn(move || run_tty(&ours, tty, None, client_exit_record));
+                control_plane.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                (control_plane, t)
+            };
+            // The pty's output until it holds `needle`.
+            let until = |mut s: &UnixStream, needle: &str| {
+                let mut out = String::new();
+                while !out.contains(needle) {
+                    match rpc::read_record(&mut s) {
+                        Ok(Some(Record::Stdout(b))) => out.push_str(&String::from_utf8_lossy(&b)),
+                        other => panic!("{other:?} before {needle:?}, after {out:?}"),
+                    }
+                }
+                out
+            };
+            let say = |s: &UnixStream, text: &str| rpc::write_record(&mut &*s, &Record::Stdin(text.as_bytes().to_vec())).unwrap();
+
+            // Answers each line with its pid. Input, not a banner: output
+            // before the client connects is dropped (no client yet).
+            let program = vec!["sh".to_string(), "-c".into(), "while read l; do echo \"got $l $$.\"; done".into()];
+            let (first, t) = open(Some(&program));
+            say(&first, "zero\n");
+            // The hang-up must type nothing into the pty: an EOF would
+            // reach the program through the raw client and end it.
+            let out = until(&first, ".\r\n");
+            let pid = out.split("got zero ").nth(1).and_then(|r| r.split('.').next()).unwrap_or_else(|| panic!("{out:?}")).to_string();
+            let started = std::time::Instant::now();
+            drop(first);
+            t.join().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10), "the runtime's exec client killed, not waited out");
+
+            let (a, ta) = open(None);
+            say(&a, "one\n");
+            until(&a, &format!("got one {pid}."));
+            let (b, tb) = open(None);
+            let rest_a = rest(&a);
+            ta.join().unwrap();
+            let (out, _, last) = split(&rest_a);
+            assert_eq!(last, Some(Record::error(rpc::code::DETACHED, "")), "{rest_a:?}");
+            assert!(out.contains("attached elsewhere"), "the client's own note, as output: {out:?}");
+
+            say(&b, "two\n");
+            until(&b, &format!("got two {pid}."));
+            // Ctrl-D: `read` sees its end, the program exits 0.
+            say(&b, "\x04");
+            let rest_b = rest(&b);
+            tb.join().unwrap();
+            assert_eq!(rest_b.last(), Some(&Record::Exit(Exit::Code(0))), "{rest_b:?}");
+            let _ = std::fs::remove_dir_all(&base);
+        });
+        Ok(())
     }
 }

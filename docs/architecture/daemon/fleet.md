@@ -2944,11 +2944,12 @@ subscribed connection (its notifier could still write past the answer).
 ### PTY
 
 A terminal into a lent instance over the link: each `PTY` stream a link
-peer (the caller) opens is one session attach (or a piped exec: *Pipe mode*; a tty exec
-where the helper can't attach: *Tty fallback*; a service container's
-terminal: *Service terminals*, all below), the serving host's daemon calling the instance
-helper's `session.attach` itself over its bridge
-(`HelperClient::call_with_input`; decision 13 of the
+peer (the caller) opens is one session attach (or the helper's session
+client where its daemon can't attach: *Session client*; a piped exec:
+*Pipe mode*; a tty exec without a helper: *Tty fallback*; a service
+container's terminal: *Service terminals*, all below), the serving host's
+daemon calling the instance helper's `session.attach` itself over its
+bridge (`HelperClient::call_with_input`; decision 13 of the
 [plan](../../plans/active/fleet.md#decisions)): no `exec -it`, no client
 in the container. The stream carries `rpc` records
 (`src/devsbd/rpc.rs`, [protocol](../helper/protocol.md)), and
@@ -2969,12 +2970,14 @@ in the container. The stream carries `rpc` records
   exact name, else by id, among the lent ones (`lent::lent_instances`)
   whose config root is under `root`. Then `pty::decide` (pure) picks the terminal from whether the
   instance has the helper (`Instance::devsbd_arch`) and whether it offers
-  `session.attach` (`HelperClient::offers`): offered, the attach below; no
-  bridge up, `not-running`; no helper, or a helper whose daemon isn't root
-  (`session.attach` is `needs_root`: a `containerUser` instance, or an
-  older helper), the *Tty fallback* for a header with `create`, and for an
-  attach-only one `no-session` (nothing resumable exists), its message
-  saying the instance's terminals over the link aren't resumable.
+  `session.attach` (`HelperClient::offers`): offered, the attach below
+  (`pty::Terminal::Attach`); no bridge up, `not-running`; a helper whose
+  daemon doesn't offer it (`session.attach` is `needs_root`: a
+  `containerUser` instance, or an older helper), the *Session client*,
+  with `create` or without; no helper, the *Tty fallback* for a header
+  with `create`, and for an attach-only one `no-session` (nothing
+  resumable exists), its message saying the instance's terminals over
+  the link aren't resumable.
 - **The attach**: `session.attach {id, create?: {argv, cwd, env, user?}}`
   (`pty::attach_params`), `create` as an exec into the instance runs
   (`exec::exec_context`, which `exec_argv_with` builds its argv from too:
@@ -2996,8 +2999,8 @@ in the container. The stream carries `rpc` records
   `bad-request` (no or a malformed header, a relative `root`), `denied`
   (`root` outside the fleet root; logged), `not-found` (no such root, no
   such lent instance in it, a service it doesn't use), `not-running` (no
-  live bridge to its helper), `no-session` (attach only, without a helper
-  that attaches), `unsupported` (the helper stopped offering
+  live bridge to its helper), `no-session` (attach only, without a
+  helper), `unsupported` (the helper stopped offering
   `session.attach` between the check and the call), `failed`
   (`state.toml` or the config doesn't read, the helper couldn't be asked,
   a terminal couldn't be spawned), and `lost`: the attach ended without an end record
@@ -3034,9 +3037,37 @@ no helper, a `<runtime> exec` on the serving host with its stdio piped.
   stdout's reader went away (`| head`): `pty_client::attach` then ends
   as `SIGPIPE` (exit 141, no note), as a local exec would.
 
-**Tty fallback** is a session header's terminal for an instance whose
-helper can't attach (`pty::Terminal::Tty`): `<runtime> exec -it` on the
-serving host under a host pty, not resumable.
+**Session client** is a session header's terminal for an instance whose
+helper's daemon doesn't offer `session.attach` (`pty::Terminal::Client`):
+the helper's own session client through `<runtime> exec -it` on the
+serving host under a host pty, what a local tty exec of the instance
+runs, so it is resumable without a root daemon.
+
+- **The exec** is `pty::runtime_exec` of `exec_argv_with(instance, true,
+  true, command, host_agent)` with `command` `pty::client_command`: with
+  `create`, `exec::session_new_command(id, argv)` (`argv` the header's
+  `create.argv`, else the login shell; a live `id` attaches instead),
+  without, `exec::session_attach_command(id)`. As the container user, in
+  the workspace, with the exec's env, as for a local exec. Spawned and
+  relayed as the *Tty fallback* below (`pty::spawn_tty`, `pty::run_tty`),
+  without the note.
+- **The end** (`pty::client_exit_record`): the client's
+  `NO_SESSION_EXIT` / `DETACHED_EXIT` / `VERSION_EXIT` (250 / 251 /
+  252) become the `no-session` / `detached` / `version` error record an
+  attach ends with, with an empty message: the client printed its note
+  into the pty already, so the caller got it as output and
+  `pty_client::exit_of` adds none. Any other code or a signal is
+  `pty::tty_exit_record`'s `exit`; a program's own 250-252 read as the
+  client's, as for a local session exec.
+- **Hang-up**: as the *Tty fallback*'s, which kills the runtime's exec
+  client only; the session runs on. The session client it leaves in the
+  container is displaced by the next attach (`detached` to it, the
+  supervisor's takeover), as after a dropped ssh, so the caller's
+  reconnect re-dial (attach only) reaches the same program.
+
+**Tty fallback** is a session header's terminal for an instance without
+the helper (`pty::Terminal::Tty`): `<runtime> exec -it` on the serving
+host under a host pty, not resumable.
 
 - **The exec** is `pty::runtime_exec` of `exec_argv_with(instance, true,
   true, argv, host_agent)` (the local tty exec's argv; `argv` the
@@ -3046,18 +3077,21 @@ serving host under a host pty, not resumable.
   is resumable. An instance that isn't running is the runtime exec's own
   error, on the terminal.
 - **Records** (`pty::run_tty`): first one `stderr` record,
-  `this terminal isn't resumable (no helper | helper not root): a dropped
-  link ends it` (`pty::NotResumable::note`, ending `\r\n`: the caller's
-  terminal is raw by then), then the pty's output as `stdout` records;
-  caller → server `stdin` into the pty, `resize` onto it (`MasterPty::resize`;
+  `this terminal isn't resumable (no helper): a dropped link ends it`
+  (`pty::TTY_NOTE`, ending `\r\n`: the caller's terminal is raw by
+  then), then the pty's output as `stdout` records; caller → server
+  `stdin` into the pty, `resize` onto it (`MasterPty::resize`;
   `stdin-eof` and anything else ignored); once the child exited and the
   pty's output is drained, one `exit` (`pty::tty_exit_record`: its code,
   or its signal, mapped back from portable-pty's `strsignal` name). Then
   the server closes the stream.
 - **Hang-up**: the caller closing its end first kills the child
   (portable-pty's `kill`: SIGHUP, then SIGKILL after a grace) and reaps
-  it; nothing more is written. A lost link is that hang-up too, so the
-  caller's reconnect re-dials an attach, answered `no-session`.
+  it; nothing more is written. The pty's writer is dropped only after
+  that: portable-pty's drops type a newline and EOF into the pty, which a
+  session client would relay to its program. A lost link is that hang-up
+  too, so the caller's reconnect re-dials an attach, answered
+  `no-session`.
 
 **Service terminals** are a `PTY` stream into the container of a service
 a lent instance uses (`exec --service`, the dashboard's service tabs):
@@ -3104,7 +3138,8 @@ would give (`pty_client::exit_of`), so the CLI's `Reconnect` and the
 dashboard's `Redial` apply unchanged: `exit` its code (`128 + n` for a
 signal; 255 as 254 under `--reserve-255`); `no-session` 250, `detached`
 251, `version` 252 (`cli::NO_SESSION_EXIT`, `DETACHED_EXIT`,
-`VERSION_EXIT`) with the helper's note after `devsbd session: `;
+`VERSION_EXIT`) with the helper's note after `devsbd session: ` (none
+for an empty message: a *Session client*'s note came as output);
 `lost`, a stream that ends without an end record, and an absent socket
 255; the other refusals (`bad-request`, `denied`, `not-found`,
 `not-running`, `unsupported`, `failed`) `pty_client::REFUSED_EXIT` (1)

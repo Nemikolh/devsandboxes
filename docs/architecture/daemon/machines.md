@@ -749,11 +749,12 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   ends the loop with it; `NO_SESSION_EXIT` (250) also prints that the
   session is gone (`gone_note`); the helper's 251 (attached elsewhere) and
   252 (`VERSION_EXIT`: started by another devsbd, still running) end it
-  too, the helper's own note on stderr. A fallback terminal
-  ([fleet](fleet.md#pty), *Tty fallback*: no helper, a non-root one) is
-  dialed as a session, so a lost link re-dials its attach, which the
-  machine answers with `no-session`: the loop ends with 250 and the
-  machine's not-resumable message. Ctrl-C during a wait ends the process.
+  too, the helper's own note on stderr. An instance whose helper's daemon
+  isn't root gets the helper's session client there ([fleet](fleet.md#pty),
+  *Session client*), which reconnects the same way. A fallback terminal
+  (*Tty fallback*: no helper) is dialed as a session, so a lost link
+  re-dials its attach, which the machine answers with `no-session`: the
+  loop ends with 250 and the machine's not-resumable message. Ctrl-C during a wait ends the process.
 - **Sessions**: `--sessions` is a `sessions.list` quick call with
   `machine` (the lines printed, or `no sessions in \`m/x\`` on stderr);
   `--end ID` a `sessions.rm` one (`ended session <id> in m/x`, the

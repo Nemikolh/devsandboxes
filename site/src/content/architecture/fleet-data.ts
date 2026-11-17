@@ -1618,7 +1618,7 @@ export const limits: Card = {
           "Remote rows live in memory except on the control plane, so a fresh daemon shows machines without rows until they connect.",
           "Verbs from a linked host run with the daemon's own process env (systemd/LaunchAgent), not a login shell's, so `PATH` additions are missing.",
           'Machines added before roots were recorded have none in `member.toml`, so `worker` trust refuses those roots.',
-          'Terminals on helper-less or non-root-helper instances, and service terminals, are not resumable over the link.',
+          'Terminals on helper-less instances, and service terminals, are not resumable over the link.',
           'Daemon-side ssh is `BatchMode=yes`, so passphrase-prompting keys fail.',
           '`vscode` and `inbox` are refused on machines, and nameless commands are local only.',
         ]),
