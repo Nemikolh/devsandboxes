@@ -232,8 +232,7 @@ pub fn run(
     // interrupted run leaves something `rm` finds. `state` stays the snapshot
     // *without* it: `materialize` reads its absence as "not a rebuild" (no
     // prior entry to keep folders, ports or env from), and the
-    // worktree/`folders` decisions below must see the other instances only,
-    // as before.
+    // worktree/`folders` decisions below must see the other instances only.
     let provisional = Instance {
         sandbox: sandbox_name.clone(),
         instance_id: instance_id.clone(),

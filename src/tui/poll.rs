@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(states["web"], ProcState::Message("None".into()));
         assert_eq!(states["box/web"], ProcState::Message("Some(\"box\")".into()));
         assert_eq!(states["down/x"], ProcState::Message("(processes unavailable: down: timed out)".into()));
-        // Alone, a refusal is the answer, as before machines.
+        // Alone, a refusal is the answer.
         let alone = procs_by_machine(&keys[..1], |_, _| Answer::Api("no".into()));
         assert!(matches!(alone, Answer::Api(why) if why == "no"));
     }
