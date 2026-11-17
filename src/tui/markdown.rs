@@ -583,7 +583,6 @@ fn char_width(c: char) -> usize {
     Span::raw(&*c.encode_utf8(&mut buf)).width()
 }
 
-/// Append `c` to `spans`, extending the last span when it has the same style.
 fn push_char(spans: &mut Vec<Span<'static>>, c: char, style: Style) {
     match spans.last_mut() {
         Some(last) if last.style == style => last.content.to_mut().push(c),

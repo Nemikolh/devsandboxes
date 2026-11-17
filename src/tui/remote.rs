@@ -256,7 +256,7 @@ pub enum Kind {
 /// against the snapshot's rows of `kind` (exact names). A bare name matching
 /// rows on one machine (or only here) is that one; on several it's an
 /// error listing the qualified names. No exact match passes the name on as
-/// typed (the daemon resolves sandbox / folder names, as before machines).
+/// typed (the daemon resolves sandbox / folder names).
 pub fn resolve(s: &Snapshot, arg: &str, kind: Kind) -> Result<String, String> {
     let (place, name) = parse_name(arg).map_err(|e| format!("{e:#}"))?;
     let mut found: Vec<Option<&str>> = machines_of(s, &name, kind)

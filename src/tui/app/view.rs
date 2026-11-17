@@ -587,7 +587,6 @@ pub(super) fn point_in(rect: Rect, col: u16, row: u16) -> bool {
         && row < rect.y + rect.height
 }
 
-/// Add `delta` (may be negative) to `scroll`, clamped to `[0, max]`.
 fn apply_delta(scroll: u16, delta: i16, max: u16) -> u16 {
     let next = scroll as i32 + delta as i32;
     next.clamp(0, max as i32) as u16

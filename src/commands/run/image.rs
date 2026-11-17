@@ -551,7 +551,7 @@ chmod +x ./devcontainer-features-install.sh && \
 }
 
 /// Recursively copy `src` into `dst` (created if missing), using plain `std::fs`
-/// (no external deps). Files are copied; nested dirs recursed.
+/// (no external deps).
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("cannot create {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("cannot read {}", src.display()))? {

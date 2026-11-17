@@ -46,7 +46,6 @@ pub(crate) fn warning(container: &str, path: &str) -> String {
     )
 }
 
-/// Check `container` and print [`warning`] if its execs land outside.
 pub(crate) fn warn_if_outside(container: &str) {
     if let Some(path) = outside(container) {
         eprintln!("{}", warning(container, &path));

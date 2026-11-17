@@ -151,7 +151,7 @@ pub struct ParsedArgs {
     /// Boolean flags present on the line.
     pub flags: Vec<&'static str>,
     /// Value-taking flags with their values; repeats keep every occurrence,
-    /// [`Self::value`] returns the last (last-one-wins, like the old parser).
+    /// [`Self::value`] returns the last (last-one-wins).
     pub values: Vec<(&'static str, String)>,
     /// Positional arguments, in spec order. Always exactly `spec.positionals.len()`.
     pub positionals: Vec<String>,
@@ -173,8 +173,7 @@ impl ParsedArgs {
 /// Generic token walk over `spec`'s grammar. Flags are position-independent;
 /// only `--`-prefixed tokens count as flags (so `exec box ls -la` keeps `-la`),
 /// and once a trailing spec's positionals are filled the rest of the line is
-/// captured verbatim, flags included. Errors mirror the hand-rolled parser's
-/// wording so the step-2 rewire changes no user-visible messages.
+/// captured verbatim, flags included.
 pub fn parse_args(spec: &CommandSpec, tokens: &[&str]) -> Result<ParsedArgs, String> {
     let mut out = ParsedArgs::default();
     let mut i = 0;
