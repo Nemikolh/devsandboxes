@@ -1,6 +1,7 @@
-//! `machine add`'s install (docs/architecture/daemon/machines.md,
-//! *Install*): check which devsandbox a machine runs, decide whether to
-//! copy this binary there, and copy it.
+//! `machine add`'s and `machine upgrade`'s install
+//! (docs/architecture/daemon/machines.md, *Install*): check which
+//! devsandbox a machine runs, decide whether to copy this binary there,
+//! copy it, and have the machine's daemon hand off to it.
 //!
 //! The CLI does this, not the daemon: the daemon's ssh is `BatchMode` with
 //! nobody to answer a prompt or to ask whether to install, and the bytes to
@@ -32,11 +33,13 @@ pub const DEFAULT_DEST: &str = "$HOME/.local/bin/devsandbox";
 /// program to check, a path or a name looked up on `PATH`; empty is
 /// `devsandbox`, then [`DEFAULT_DEST`] when the login `PATH` has none (it
 /// often misses `~/.local/bin`: added in `.bashrc`, which a login shell
-/// skips). Prints [`CHECK_MARKER`], then `os <uname -s>`, `arch <uname
-/// -m>`, and when the program is found `path <path>`, `offpath yes` when
-/// that's the fallback and, when its `--version` runs, `version <its
-/// output>`.
-pub const CHECK: &str = "p=$(command -v \"${1:-devsandbox}\" 2>/dev/null) || p=; \
+/// skips). A leading `~/` in `$1` is `$HOME/` (a machine's `command` is
+/// shell text: `~/.local/bin/devsandbox`). Prints [`CHECK_MARKER`], then
+/// `os <uname -s>`, `arch <uname -m>`, and when the program is found
+/// `path <path>`, `offpath yes` when that's the fallback and, when they
+/// run, `version <its --version>` and `hello <its fleet-hello>`.
+pub const CHECK: &str = "case \"$1\" in \"~/\"*) set -- \"$HOME/${1#??}\";; esac; \
+    p=$(command -v \"${1:-devsandbox}\" 2>/dev/null) || p=; \
     o=; if [ -z \"$p\" ] && [ -z \"$1\" ]; then p=$HOME/.local/bin/devsandbox; o=1; fi; \
     echo @devsandbox-check@; \
     printf 'os %s\\n' \"$(uname -s)\"; \
@@ -45,6 +48,7 @@ pub const CHECK: &str = "p=$(command -v \"${1:-devsandbox}\" 2>/dev/null) || p=;
     printf 'path %s\\n' \"$p\"; \
     if [ -n \"$o\" ]; then echo 'offpath yes'; fi; \
     v=$(\"$p\" --version </dev/null 2>/dev/null) && printf 'version %s\\n' \"$v\"; \
+    h=$(\"$p\" fleet-hello </dev/null 2>/dev/null) && printf 'hello %s\\n' \"$h\"; \
     fi; \
     exit 0";
 
@@ -87,6 +91,9 @@ pub struct Remote {
     /// Its semver; `None` when `--version` failed (a build from before it
     /// existed) or said something else.
     pub version: Option<String>,
+    /// Its `fleet-hello` (`update::HELLO`: `<semver> <git> <published|dev>
+    /// <os>/<arch>`); `None` when that failed (a build from before it).
+    pub hello: Option<String>,
 }
 
 /// [`CHECK`]'s stdout: the lines after its marker. Keys after the first of
@@ -94,7 +101,7 @@ pub struct Remote {
 pub fn parse_check(stdout: &str) -> Result<Remote> {
     let report = after_marker(stdout, CHECK_MARKER)
         .with_context(|| format!("unexpected output from the check: {}", first_line(stdout)))?;
-    let (mut os, mut arch, mut path, mut version, mut off_path) = (None, None, None, None, None);
+    let (mut os, mut arch, mut path, mut version, mut off_path, mut hello) = (None, None, None, None, None, None);
     for line in report {
         let Some((key, value)) = line.split_once(' ') else { continue };
         let slot = match key {
@@ -103,6 +110,7 @@ pub fn parse_check(stdout: &str) -> Result<Remote> {
             "path" => &mut path,
             "version" => &mut version,
             "offpath" => &mut off_path,
+            "hello" => &mut hello,
             _ => continue,
         };
         slot.get_or_insert_with(|| value.trim().to_string());
@@ -113,7 +121,8 @@ pub fn parse_check(stdout: &str) -> Result<Remote> {
     let version = version.and_then(|v| version_of(&v));
     let path = path.filter(|p| !p.is_empty());
     let off_path = path.is_some() && off_path.is_some();
-    Ok(Remote { os, arch, path, off_path, version })
+    let hello = hello.filter(|h| !h.is_empty());
+    Ok(Remote { os, arch, path, off_path, version, hello })
 }
 
 /// The semver in a `devsandbox --version` line (`devsandbox 0.7.0`); `None`
@@ -201,6 +210,55 @@ pub fn decide(remote: &Remote, ours: &str) -> Plan {
     }
 }
 
+/// What [`decide_upgrade`] says to do about a machine's devsandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Upgrade {
+    /// It runs our build already.
+    Nothing,
+    /// Replace the devsandbox at `path`; `from`: its `fleet-hello`, when
+    /// known.
+    Install { path: String, from: Option<String> },
+    /// Why this binary can't go there.
+    Refuse(String),
+}
+
+/// `machine upgrade`'s decision, `ours` being this binary's `fleet-hello`
+/// (`update::HELLO`). Only an existing install is updated (the machine's
+/// devsandbox is what its `command` names): not found is a refusal. The
+/// same build and platform words as `ours` is [`Upgrade::Nothing`];
+/// another or an unknown build is replaced, when [`platform_matches`].
+pub fn decide_upgrade(remote: &Remote, ours: &str) -> Upgrade {
+    let Some(path) = &remote.path else {
+        return Upgrade::Refuse("no devsandbox found there: `machine upgrade` only updates an existing install".into());
+    };
+    let words = |hello: &str| hello.split_whitespace().take(4).map(str::to_string).collect::<Vec<_>>();
+    if remote.hello.as_deref().is_some_and(|h| words(h) == words(ours)) {
+        return Upgrade::Nothing;
+    }
+    if !platform_matches(&remote.os, &remote.arch) {
+        return Upgrade::Refuse(format!(
+            "it is {} {}; this devsandbox is built for {} {}, so it can't be copied there",
+            remote.os,
+            remote.arch,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+    }
+    Upgrade::Install { path: path.clone(), from: remote.hello.clone() }
+}
+
+/// POSIX sh, one line. `$1`: the devsandbox just installed. Its `machine ls`
+/// is a client of the daemon there whose hello carries the new binary's
+/// build stamp, so a daemon on an older build hands off to it (ADR 0015),
+/// and the client waits for the successor to answer.
+pub const HANDOFF: &str = "\"$1\" machine ls --json </dev/null >/dev/null";
+
+/// Run [`HANDOFF`] on `entry` for the devsandbox at `program`.
+pub fn handoff(entry: &Entry, program: &str) -> Result<()> {
+    let argv = ssh::script_argv(entry, HANDOFF, &[program])?;
+    run(&argv, Stdio::null()).map(drop).with_context(|| format!("cannot restart the devsandbox daemon on {}", entry.label()))
+}
+
 /// Run [`CHECK`] on `entry` for `program` (`None`: `devsandbox` on the
 /// login `PATH`).
 pub fn check(entry: &Entry, program: Option<&str>) -> Result<Remote> {
@@ -267,7 +325,7 @@ mod tests {
     use super::*;
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
-        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into) }
+        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into), hello: None }
     }
 
     #[test]
@@ -280,7 +338,7 @@ mod tests {
         let odd = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /x\nversion error: unexpected\n").unwrap();
         assert_eq!(odd.version, None);
         let missing = parse_check("@devsandbox-check@\nos Darwin\narch arm64\n").unwrap();
-        assert_eq!(missing, Remote { os: "Darwin".into(), arch: "arm64".into(), path: None, off_path: false, version: None });
+        assert_eq!(missing, Remote { os: "Darwin".into(), arch: "arm64".into(), path: None, off_path: false, version: None, hello: None });
         let fallback = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /h/.local/bin/devsandbox\noffpath yes\n").unwrap();
         assert_eq!(fallback, Remote { off_path: true, ..remote(Some("/h/.local/bin/devsandbox"), None) });
         // A motd before the marker; a multi-line `--version` after.
@@ -289,6 +347,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(noisy, remote(Some("/p"), Some("1.0.0")));
+        // `fleet-hello`'s line, first one wins; an empty one is none.
+        let hello = parse_check(
+            "@devsandbox-check@\nos Linux\narch x86_64\npath /p\nversion devsandbox 1.0.0\nhello 1.0.0 abc dev linux/x86_64\nhello 2.0.0 x dev linux/x86_64\n",
+        )
+        .unwrap();
+        assert_eq!(hello, Remote { hello: Some("1.0.0 abc dev linux/x86_64".into()), ..remote(Some("/p"), Some("1.0.0")) });
+        let empty = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /p\nhello  \n").unwrap();
+        assert_eq!(empty.hello, None);
         for bad in ["", "garbage\n", "os Linux\narch x86_64\n", "@devsandbox-check@\nos Linux\n"] {
             assert!(parse_check(bad).is_err(), "{bad:?} parsed");
         }
@@ -331,6 +397,35 @@ mod tests {
         );
         assert_eq!(Dest::Found("/b".into()).path(), Some("/b"));
         assert_eq!(Dest::Default.path(), None);
+    }
+
+    #[test]
+    fn upgrade_decisions() {
+        let ours = crate::serve::fleet::update::HELLO;
+        let with = |hello: Option<&str>| Remote { hello: hello.map(Into::into), ..remote(Some("/b/devsandbox"), Some("1.0.0")) };
+        let install = |from: Option<&str>| Upgrade::Install { path: "/b/devsandbox".into(), from: from.map(Into::into) };
+        // Our build: nothing, whatever follows its four words.
+        let ours_remote = |hello: &str| Remote { os: uname_os().into(), arch: std::env::consts::ARCH.into(), ..with(Some(hello)) };
+        assert_eq!(decide_upgrade(&ours_remote(ours), ours), Upgrade::Nothing);
+        assert_eq!(decide_upgrade(&ours_remote(&format!("{ours} member box")), ours), Upgrade::Nothing);
+        // Another git, kind or platform word, or no hello: replaced.
+        let other = "0.0.1 abc dev linux/x86_64";
+        assert_eq!(decide_upgrade(&ours_remote(other), "0.0.1 abd dev linux/x86_64"), install(Some(other)));
+        assert_eq!(decide_upgrade(&ours_remote(other), "0.0.1 abc published linux/x86_64"), install(Some(other)));
+        let unknown = Remote { hello: None, ..ours_remote("") };
+        assert_eq!(decide_upgrade(&unknown, ours), install(None));
+        // Not found: refused, never installed to the default.
+        let Upgrade::Refuse(why) = decide_upgrade(&remote(None, None), ours) else { panic!() };
+        assert!(why.contains("only updates an existing install"), "{why}");
+        // Another platform: refused with why.
+        let elsewhere = Remote { os: "FreeBSD".into(), ..with(None) };
+        let Upgrade::Refuse(why) = decide_upgrade(&elsewhere, ours) else { panic!() };
+        assert!(why.starts_with("it is FreeBSD x86_64; this devsandbox is built for "), "{why}");
+    }
+
+    /// This host's `uname -s`, as [`platform_matches`] maps it.
+    fn uname_os() -> &'static str {
+        if cfg!(target_os = "macos") { "Darwin" } else { "Linux" }
     }
 
     /// A temp home for the real-shell tests, its `.profile` setting the
@@ -385,7 +480,10 @@ mod tests {
         /// A devsandbox reporting `9.9.9`.
         fn binary(&self) -> PathBuf {
             let path = self.base.join("new-devsandbox");
-            self.script(&path, "case \"$1\" in --version) echo 'devsandbox 9.9.9';; *) exit 2;; esac");
+            self.script(
+                &path,
+                "case \"$1\" in --version) echo 'devsandbox 9.9.9';; fleet-hello) echo '9.9.9 abc dev linux/x86_64';; *) exit 2;; esac",
+            );
             path
         }
     }
@@ -420,7 +518,10 @@ mod tests {
 
         let after = b.check("");
         assert_eq!((after.path.as_deref(), after.version.as_deref()), (Some(installed.as_str()), Some("9.9.9")));
+        assert_eq!(after.hello.as_deref(), Some("9.9.9 abc dev linux/x86_64"));
         assert!(!after.off_path);
+        // A `command` as the registry has it: `~/` is the home.
+        assert_eq!(b.check("~/.local/bin/devsandbox"), after);
         assert_eq!(decide(&after, "9.9.9"), Plan::Nothing);
     }
 
@@ -444,7 +545,7 @@ mod tests {
         b.script(&old, "exit 2");
         let path = old.to_str().unwrap();
         let before = b.check("");
-        assert_eq!((before.path.as_deref(), before.version.as_deref()), (Some(path), None));
+        assert_eq!((before.path.as_deref(), before.version.as_deref(), before.hello.as_deref()), (Some(path), None, None));
         assert_eq!(b.check(path), before, "an explicit program checks the same");
         let Plan::Install { dest, from: None } = decide(&before, "9.9.9") else { panic!("{before:?}") };
 

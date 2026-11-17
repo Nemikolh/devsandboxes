@@ -43,7 +43,7 @@ reaches L's only while K grants L agent.
 The add is also the join (`machines::join::plan`, run by `machines.add`
 over this host's `member.toml` and the target's `member.get` and
 `machines.list` on the add-time probe;
-[machines.md](machines.md#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)).
+[machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)).
 `machine add X` run on H, with "control plane K" a member's control plane by name (its own
 name when it's `self`):
 
@@ -101,7 +101,7 @@ X's key is the one the user confirmed: `machine add` shows the
 fingerprint `machines.probe` answers and asks (`--yes` off a TTY), and
 `machines.add {key}` refuses (`denied`, naming both fingerprints) when
 X's `member.get` says another
-([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)).
+([machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)).
 ssh's first-use trust of the target is the root of this check.
 
 **How a machine leaves** (decisions 32 and 49 of the plan, step
@@ -1433,7 +1433,7 @@ there only through the trust table.
   `false`), `roots` (config roots this host shows the fleet besides
   those its `state.toml` has instances in, absolute; `devsandbox machine
   roots add|rm` on this host sets them:
-  [machines.md](machines.md#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)),
+  [machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)),
   an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
   and a `[caps]` table, the soft caps of the
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
@@ -1525,7 +1525,9 @@ fleet's authority, like the control plane, follows no one:
   `update::decide`; two non-control-planes only need the frame protocol's match; a
   control plane never follows, and neither does the authority, so upgrading the
   authority first neither locks it out of an older control plane (`Stop` on a dev
-  build) nor downgrades it (`Download`, `Receive`). Which ends are the authority
+  build) nor downgrades it (`Download`, `Receive`); `devsandbox machine upgrade
+  <control-plane>` then copies the authority's build there over ssh
+  ([machines.md](machines.md#install)). Which ends are the authority
   (`Authority::of`) is read off the newest log the end holds once the
   [key proof](#key-proof) is through (`proof::Proven`'s `newer`, else the
   identity's stored log): its authority key (`Membership::is_authority`)
@@ -1700,7 +1702,7 @@ signatures, signed statements and the rollback rule.
   (naming the path and `chmod 600`) and a malformed one (never echoing
   its text); neither is replaced. `member.get` (and `member.set`) answer
   its public half, making the key on the first ask; `devsandbox machine
-  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)).
+  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)).
 - **Rotation**: `devsandbox machine key rotate` (`membership.rotate`,
   `machines::changes::rotate`) makes the next key, `member.key.next`
   (`FileKeyStore::next_path`, `KeyStore::next_key`: the same format and

@@ -498,6 +498,20 @@ enum MachineCommand {
         #[arg(long, required = true, action = clap::ArgAction::Set, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
         agent: bool,
     },
+    /// Copy this devsandbox over a registered machine's, when its build differs
+    ///
+    /// Replaces the devsandbox the machine's `command` names (ssh, as at
+    /// `machine add`; on the same platform only), then the daemon there
+    /// hands off to the copy and this host's link to the machine redials
+    /// onto it. Asks first on a TTY; off one it fails unless --yes.
+    ///
+    ///     devsandbox machine upgrade my-server
+    Upgrade {
+        name: String,
+        /// Replace it without asking
+        #[arg(long)]
+        yes: bool,
+    },
     /// Drop this host's link to a registered machine (it stays a fleet member; nothing on it changes)
     Unlink { name: String },
     /// Take a machine out of the fleet; this host's own name leaves it
@@ -935,6 +949,7 @@ fn main() -> Result<()> {
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
+            MachineCommand::Upgrade { name, yes } => commands::machine::upgrade(&name, yes),
             MachineCommand::Unlink { name } => commands::machine::unlink(&name),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
             MachineCommand::ControlPlane { name } => commands::machine::control_plane(&name),
@@ -1012,6 +1027,20 @@ mod tests {
             assert!(parse(gone).is_err(), "{gone:?}");
         }
         assert!(matches!(parse(&["fleet-hello"]).unwrap().command, Some(Command::FleetHello)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_upgrade_parses() {
+        use super::MachineCommand;
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()));
+        let upgrade = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Machine { cmd: MachineCommand::Upgrade { name, yes } }) => (name, yes),
+            _ => panic!("not machine upgrade"),
+        };
+        assert_eq!(upgrade(&["machine", "upgrade", "box"]), ("box".into(), false));
+        assert_eq!(upgrade(&["machine", "upgrade", "box", "--yes"]), ("box".into(), true));
+        assert!(parse(&["machine", "upgrade"]).is_err(), "a name is required");
     }
 
     #[test]

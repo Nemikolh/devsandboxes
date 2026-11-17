@@ -32,6 +32,7 @@ devsandbox exec test                  # an instance there, over your daemon's li
 devsandbox stop my-server/test        # qualified, when the name exists here too
 devsandbox ps --machine my-server     # a command without a name, run there
 devsandbox machine ls                 # each machine's state: connected, unreachable, …
+devsandbox machine upgrade my-server  # copy this build over its devsandbox, when it runs another
 ```
 
 Commands on a machine reach only what it lets your host reach: by default its own config roots, and `gc --machine` is refused there until you run `devsandbox machine trust full` on it.

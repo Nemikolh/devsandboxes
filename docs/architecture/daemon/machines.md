@@ -53,7 +53,7 @@ dropped by the next write). Then an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
-[`machine add`](#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)) through `machines.add`'s
+[`machine add`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
 dials with the same param). An older build's `agent` key is ignored:
 whom this host's ssh-agent reaches is `member.toml`'s grants
@@ -73,7 +73,7 @@ Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
 A machine's registry name is its member name (fleet plan decision 35):
 without `--name`, `machines.add` takes it from the machine's `member.get`;
 `--name` renames the machine only while it joins a fleet by that add
-([`machine add`](#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)). `parse_name` splits a CLI
+([`machine add`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)). `parse_name` splits a CLI
 `<name>`: `m/x` → `Where::Machine`, `@/x` → `Where::Local`, bare →
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
@@ -203,20 +203,22 @@ each the user's own login there.
 ## Install
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
-copies this binary there, for `machine add`
-([`devsandbox machine …`](#devsandbox-machine-addlssetunlinkrmcontrol-planependingapprovedenykeytrustroots)). The
+copies this binary there, for `machine add` and `machine upgrade`
+([`devsandbox machine …`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)). The
 CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
 line, past whatever the login shell printed first.
 
-- `CHECK` (`check`): `$1` is the program (empty: `devsandbox`), resolved
-  with `command -v`; empty and not on the login `PATH`, it falls back to
+- `CHECK` (`check`): `$1` is the program (empty: `devsandbox`), a
+  leading `~/` taken as `$HOME/` (a machine's `command`, shell text),
+  resolved with `command -v`; empty and not on the login `PATH`, it falls back to
   `$HOME/.local/bin/devsandbox` (`Remote::off_path`), since a login shell
   often misses that dir (added in `.bashrc`). It reports `uname -s`,
-  `uname -m`, the path and the output of its `--version`. `parse_check` makes it a `Remote`, whose
+  `uname -m`, the path and the output of its `--version` and its
+  `fleet-hello` ([fleet.md](fleet.md#versions)). `parse_check` makes it a `Remote`, whose
   `version` is `None` when `--version` fails (a build from before it
-  existed).
+  existed), and `hello` `None` when `fleet-hello` does.
 - `platform_matches`: `uname` against this binary's
   `std::env::consts::{OS, ARCH}` (`Linux`↔`linux`, `Darwin`↔`macos`;
   `x86_64`|`amd64`↔`x86_64`, `aarch64`|`arm64`↔`aarch64`); copying
@@ -224,6 +226,13 @@ line, past whatever the login shell printed first.
 - `decide` (pure): the same semver is `Plan::Nothing`; a devsandbox found
   with another or no version is updated in place (`Dest::Found`); a
   missing one goes to `$HOME/.local/bin/devsandbox` (`Dest::Default`).
+- `decide_upgrade` (pure, `machine upgrade`): against this binary's
+  `update::HELLO`. A devsandbox that isn't found is refused
+  (`Upgrade::Refuse`: only an existing install is updated); the same
+  first four `fleet-hello` words (semver, git, `published|dev`, platform)
+  is `Upgrade::Nothing`; another or no `fleet-hello` is
+  `Upgrade::Install` over the found path, unless `platform_matches`
+  fails (refused, saying both platforms).
 - `INSTALL` (`install`): `$1` is the destination (empty: the default).
   ssh's stdin, the binary, goes into a `mktemp` file next to it,
   `chmod 755`, then its `--version` must run (a binary linked against a
@@ -231,6 +240,12 @@ line, past whatever the login shell printed first.
   atomic, no "text file busy" over a running binary. Any failure removes
   the temp file and leaves the destination as it was. It prints the
   installed path, expanded.
+- `HANDOFF` (`handoff`): `$1` is the devsandbox just installed; it runs
+  its `machine ls --json`, a client of the daemon there whose hello
+  carries the copy's newer build stamp, so a daemon on an older build
+  hands off to it ([ADR 0015](../../decisions/0015-newest-binary-wins-version-handoff.md))
+  and the client waits for the successor. A daemon on a newer semver
+  doesn't hand off: it runs the copy once restarted.
 
 A failed ssh or script is an error carrying the tail of its stderr.
 
@@ -747,7 +762,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   shell; [fleet](fleet.md#pty), *Service terminals*), never re-dialed (no
   session), refused without a terminal.
 
-## `devsandbox machine add|ls|set|unlink|rm|control-plane|pending|approve|deny|key|trust|roots`
+## `devsandbox machine add|ls|set|upgrade|unlink|rm|control-plane|pending|approve|deny|key|trust|roots`
 
 A client of `machines.*` (and, for `trust`, `roots` and `key`,
 `member.*`; for `key rotate`, `control_plane`, `pending`, `approve` and `deny`,
@@ -896,6 +911,28 @@ authority `this host's key is now <fingerprint> (<key>)` then
 <fingerprint> to <authority>: approve there with devsandbox machine
 approve <id>` and that this host keeps its key until the signed change
 reaches it (`rotation_lines`).
+`upgrade <name> [--yes]` (`commands::machine::upgrade`) updates a
+machine's devsandbox to this binary's build, which `add` does only on
+another semver. It asks `machines.get` for the machine's `target` and
+`command` (an inbound or routed machine has no target: refused, `no_ssh`,
+since the copy is over ssh), then `install::check` of that `command`
+(always named, so no `~/.local/bin` fallback) and
+`install::decide_upgrade`. Same build: it prints `<name> already runs
+devsandbox <build>`. Otherwise `consent` over `--yes` (`[y/N]` on a
+TTY, an error off one without it), `install::install` over the found
+path, a second `install::check` that must now say this build, then
+`install::handoff` (the daemon there hands off to the copy) and
+`machines.cycle` (this host's link to the machine ends and redials at
+once, `service::Handle::cycle_one`, so the far end's `fleet-link` runs
+the copy too). It prints `upgraded <name>: devsandbox <from> → <to>`
+(`update::Build::label`s), and a note when `<to>` is an older semver,
+whose daemon doesn't hand off. Links other machines hold to it keep
+their `fleet-link` until they redial. A machine that is neither the
+control plane nor the authority still follows the control plane's build
+([fleet](fleet.md#versions)), so upgrading it before the control plane is
+undone at its next link to the control plane: the control plane is
+upgraded first.
+
 `--machine` and qualified names refuse `machine` as a whole
 (`serve::machines::cli::machine_use`).
 

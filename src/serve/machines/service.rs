@@ -578,6 +578,19 @@ impl Handle {
         }
     }
 
+    /// [`Handle::cycle`] for ssh machine `name` alone (`machine upgrade`
+    /// copied a new binary there: the redial runs it as the far end's
+    /// `fleet-link`). `false`: no ssh machine by that name here.
+    pub fn cycle_one(&self, name: &str) -> bool {
+        match self.inner.lock_links().get(name) {
+            Some(l) if carried(&l.entry) => {
+                l.ctl.cycle();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Every link looks at its watchers now (a `machines: true` watch came).
     pub fn wake(&self) {
         for l in self.inner.lock_links().values() {
@@ -1862,6 +1875,11 @@ mod tests {
         fail.store(false, Ordering::SeqCst);
         h.cycle();
         wait_for("redialed out of the backoff", Duration::from_secs(5), || runs.load(Ordering::SeqCst) == 4);
+        // One machine's alone; a name with no ssh link does nothing.
+        wait_for("up again", Duration::from_secs(5), || lock(&h.inner.lock_links()["c"].ctl.carrier).up);
+        assert!(h.cycle_one("c"));
+        wait_for("redialed by name", Duration::from_secs(5), || runs.load(Ordering::SeqCst) == 5);
+        assert!(!h.cycle_one("nope"));
         drop(machines);
         let _ = std::fs::remove_dir_all(&base);
     }

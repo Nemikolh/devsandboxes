@@ -1,6 +1,6 @@
-//! `devsandbox machine add|ls|set|unlink|rm|trust|roots|key`
+//! `devsandbox machine add|ls|set|upgrade|unlink|rm|trust|roots|key`
 //! (docs/architecture/daemon/machines.md, *`devsandbox machine
-//! add|ls|set|unlink|rm|trust|roots`*): a client of the daemon's `machines.*`,
+//! add|ls|set|upgrade|unlink|rm|…`*): a client of the daemon's `machines.*`,
 //! never in-process, since the registry and the links are the daemon's.
 //! `machine trust`, `machine roots` and `machine key` are likewise clients of `member.*`
 //! (this host's `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
@@ -15,6 +15,12 @@
 //! Before probing, `add` checks the machine's devsandbox (`install`) and,
 //! when it's missing or another version, copies this binary there: asked on
 //! a TTY, without asking under `--auto-install`, refused otherwise.
+//!
+//! `upgrade` copies this binary over a registered machine's devsandbox when
+//! its build differs (`install::decide_upgrade`; asked on a TTY, `--yes`
+//! required off one), then has its daemon hand off to it
+//! (`install::handoff`) and redials this host's link to it
+//! (`machines.cycle`), so the far end's `fleet-link` runs it too.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -28,13 +34,14 @@ use crate::serve::capacity;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
 use crate::serve::fleet::member::{MemberInfo, Trust};
-use crate::serve::machines::Entry;
-use crate::serve::machines::api::{Added, MachineRow, Probed};
+use crate::serve::fleet::update::{self, Build};
+use crate::serve::machines::{Entry, MachineKind};
+use crate::serve::machines::api::{Added, MachineInfo, MachineRow, Probed};
 use crate::serve::machines::join::{Fleet, Joined};
 use crate::serve::fleet::proposals::Proposal;
 use crate::serve::machines::changes::{Approved, ControlPlaneMove, Proposed, Rotation, Signed};
 use crate::serve::machines::leave::{Heard, Removed, RmAnswer};
-use crate::serve::machines::install::{self, Dest, Plan, Remote};
+use crate::serve::machines::install::{self, Dest, Plan, Remote, Upgrade};
 
 const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
@@ -255,6 +262,85 @@ fn rechecked(after: &Remote, dest: &Dest, ours: &str, target: &str, installed: &
             version_text(after.version.as_deref())
         ),
     }
+}
+
+/// `machine upgrade <name>`: copy this binary over registered machine
+/// `name`'s devsandbox (the one its `command` names) when its build
+/// differs (docs/architecture/daemon/machines.md, *Install*), then have the
+/// daemon there hand off to it and this host's link to it redial.
+pub fn upgrade(name: &str, yes: bool) -> Result<()> {
+    let ours = update::HELLO;
+    let info: MachineInfo = call(&mut connect()?, "machines.get", json!({ "name": name }))?;
+    let Some(target) = info.target.as_deref() else {
+        bail!("{}", no_ssh(name, info.kind));
+    };
+    let entry = Entry { command: info.command.clone(), ..Entry::ssh(&info.name, target) };
+    // Named, so the check never falls back to `~/.local/bin`: that isn't
+    // what the link runs.
+    let program = entry.command().to_string();
+    let remote = install::check(&entry, Some(&program))?;
+    let (path, from) = match install::decide_upgrade(&remote, ours) {
+        Upgrade::Nothing => {
+            println!("{name} already runs devsandbox {}", label(Some(ours)));
+            return Ok(());
+        }
+        Upgrade::Refuse(why) => bail!("cannot upgrade {name} ({target}): {why}"),
+        Upgrade::Install { path, from } => (path, from),
+    };
+    let what = upgrade_what(name, &path, from.as_deref(), ours);
+    match consent(std::io::stdin().is_terminal(), yes) {
+        Consent::Install => {}
+        Consent::Refuse => bail!("{what}: pass --yes to replace it without a TTY to confirm on"),
+        Consent::Ask => {
+            if !is_yes(&prompt(&format!("{what}. Replace it? [y/N] "))?) {
+                bail!("nothing changed on {name}");
+            }
+        }
+    }
+    eprintln!("copying devsandbox {} to {target}:{path}…", label(Some(ours)));
+    let installed = install::install(&entry, Some(&path), &crate::exe::devsandbox()?)?;
+    let after = install::check(&entry, Some(&program))?;
+    if install::decide_upgrade(&after, ours) != Upgrade::Nothing {
+        bail!("{installed} on {target} doesn't run as devsandbox {} after the copy (it says {})", label(Some(ours)), label(after.hello.as_deref()));
+    }
+    install::handoff(&entry, &installed)?;
+    let _: Value = call(&mut connect()?, "machines.cycle", json!({ "name": info.name }))?;
+    println!("upgraded {name}: devsandbox {} → {}", label(from.as_deref()), label(Some(ours)));
+    if let Some(note) = from.as_deref().and_then(|from| older_note(name, from, ours)) {
+        eprintln!("note: {note}");
+    }
+    Ok(())
+}
+
+/// A `fleet-hello` as a build label (`0.7.0 (dev, 1a2b)`); unknown: an
+/// older build, from before `fleet-hello`.
+fn label(hello: Option<&str>) -> String {
+    hello.map_or_else(|| "of an unknown (older) build".into(), |h| Build::parse(h).label())
+}
+
+/// What `upgrade` is about to do, in a clause.
+fn upgrade_what(name: &str, path: &str, from: Option<&str>, ours: &str) -> String {
+    format!("{name} runs devsandbox {} at {path}; this is {}", label(from), label(Some(ours)))
+}
+
+/// Why `upgrade` can't reach `name`: no ssh target here.
+fn no_ssh(name: &str, kind: MachineKind) -> String {
+    let how = match kind {
+        MachineKind::Routed => "is reached over a route",
+        MachineKind::Inbound | MachineKind::Ssh => "links to this host from its end (inbound)",
+    };
+    format!(
+        "{name} {how}: `machine upgrade` copies over ssh, and this host has none to it; run it on a host that registered {name} (`machine add`)"
+    )
+}
+
+/// A downgrade by semver: the daemon there doesn't hand off to an older
+/// semver (ADR 0015), so it keeps its build until restarted.
+fn older_note(name: &str, from: &str, ours: &str) -> Option<String> {
+    let semver = |hello: &str| crate::serve::proto::semver_triple(hello.split_whitespace().next().unwrap_or(""));
+    (semver(ours) < semver(from)).then(|| {
+        format!("this is an older semver than {name} ran: its daemon doesn't hand off to an older one, so it runs the copy once restarted there")
+    })
 }
 
 pub fn ls(json: bool) -> Result<()> {
@@ -778,7 +864,7 @@ mod tests {
     }
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
-        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into) }
+        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into), hello: None }
     }
 
     #[test]
@@ -833,10 +919,30 @@ mod tests {
             question("box", Some("/b/devsandbox"), None, "1.0.0"),
             "box runs devsandbox (unknown version) at /b/devsandbox. Replace it with this one (1.0.0)? [y/N] "
         );
-        let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, off_path: false, version: None };
+        let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, off_path: false, version: None, hello: None };
         let why = platform_mismatch("box", &mismatch);
         assert!(why.starts_with("box is FreeBSD riscv64; this devsandbox is built for "), "{why}");
         assert!(!install::platform_matches(&mismatch.os, &mismatch.arch));
+    }
+
+    #[test]
+    fn upgrade_messages_name_both_builds() {
+        let ours = "1.0.0 abc dev linux/x86_64";
+        assert_eq!(
+            upgrade_what("box", "/b/devsandbox", Some("0.9.0 def published linux/x86_64"), ours),
+            "box runs devsandbox 0.9.0 (published, def) at /b/devsandbox; this is 1.0.0 (dev, abc)"
+        );
+        assert_eq!(
+            upgrade_what("box", "/b/devsandbox", None, ours),
+            "box runs devsandbox of an unknown (older) build at /b/devsandbox; this is 1.0.0 (dev, abc)"
+        );
+        let inbound = no_ssh("box", MachineKind::Inbound);
+        assert!(inbound.starts_with("box links to this host from its end (inbound): `machine upgrade` copies over ssh"), "{inbound}");
+        assert!(no_ssh("pi", MachineKind::Routed).starts_with("pi is reached over a route: "));
+        // Only an older semver can't hand the daemon off.
+        assert!(older_note("box", "1.1.0 x dev linux/x86_64", ours).is_some());
+        assert_eq!(older_note("box", "0.9.0 x dev linux/x86_64", ours), None);
+        assert_eq!(older_note("box", "1.0.0 x dev linux/x86_64", ours), None);
     }
 
     #[test]

@@ -224,6 +224,7 @@ devsandbox machine add ssh://me@box:2200 --name box
 devsandbox machine add me@my-server --agent    # with `agent` on
 devsandbox machine ls [--json]                 # NAME TARGET ROOTS AGENT STATE VERSION
 devsandbox machine set box --agent on|off      # change a machine's `agent`
+devsandbox machine upgrade box [--yes]         # copy this build over its devsandbox (ssh), its daemon and link follow
 devsandbox machine unlink box                  # drop this host's link only (it stays in the fleet)
 devsandbox machine rm box                      # take it out of the fleet (this host's own name: leave)
 devsandbox machine trust [worker|full]         # this host's fleet trust (show / set)

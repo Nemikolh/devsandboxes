@@ -1891,6 +1891,12 @@ export interface ApiMethods {
    */
   'machines.unlink': { params: { name: string }; result: OkResult };
   /**
+   * End this host's link to a registered ssh machine and redial it at once (`machine upgrade`, after copying a new
+   * binary there); `not-found` for no such ssh machine, `denied` for an inbound one (its link is dialed from there).
+   * @experimental
+   */
+  'machines.cycle': { params: { name: string }; result: OkResult };
+  /**
    * Take a machine out of the fleet. On the authority: its key revoked, pushed, then removed by the control plane. On
    * another member: proposed to the authority over any path, its direct link while up, else a route (`failed`
    * naming it when none reaches it). This host's own name leaves the fleet (its revoke proposed, best effort). `denied` for the

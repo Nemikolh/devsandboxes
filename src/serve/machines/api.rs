@@ -1,7 +1,7 @@
 //! The `machines.*` methods (docs/architecture/daemon/machines.md,
-//! *`devsandbox machine add|ls|set|unlink|rm|trust|roots`*): `probe`, `add`,
-//! `list`, `get`, `set`, `unlink`, and `rm` (taking a machine out of the
-//! fleet, [`super::leave`]).
+//! *`devsandbox machine add|ls|set|upgrade|unlink|rm|…`*): `probe`, `add`,
+//! `list`, `get`, `set`, `unlink`, `cycle` (a link redialed, for `machine
+//! upgrade`), and `rm` (taking a machine out of the fleet, [`super::leave`]).
 //! Connection-free like `serve::api`: a function of the method, its params
 //! and a [`Ctx`] (the registry path and the [`Dial`]s), so tests run them
 //! against a second test daemon standing in as the machine.
@@ -126,6 +126,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx, local: bool) -> Option<Answe
         "machines.get" => parse(params).and_then(|p| get(p, ctx)),
         "machines.set" => parse(params).and_then(|p| set(p, ctx)),
         "machines.unlink" => parse(params).and_then(|p| unlink(p, ctx)),
+        "machines.cycle" => parse(params).and_then(|p| cycle(p, ctx)),
         "machines.rm" => super::leave::rm(params, ctx),
         _ => return None,
     };
@@ -683,6 +684,22 @@ fn unlink(p: NameParams, ctx: &Ctx) -> Answer {
     Ok(json!({ "ok": true }))
 }
 
+/// End this host's link to ssh machine `name` and redial it at once
+/// (`service::Handle::cycle_one`): `machine upgrade` copied a new binary
+/// there, which the redial's `fleet-link` runs.
+fn cycle(p: NameParams, ctx: &Ctx) -> Answer {
+    let Some(links) = &ctx.links else {
+        return Err(ApiError::failed("this daemon holds no machine links"));
+    };
+    if links.cycle_one(&p.name) {
+        return Ok(json!({ "ok": true }));
+    }
+    if ctx.inbound.contains(&p.name) {
+        return Err(ApiError::denied(format!("`{}` links to this host from its end (inbound): its link is dialed from there", p.name)));
+    }
+    Err(ApiError::not_found(format!("no ssh machine named `{}`", p.name)))
+}
+
 fn registered(ctx: &Ctx) -> Result<Vec<Entry>, ApiError> {
     super::load(&ctx.registry).map_err(ApiError::internal)
 }
@@ -1085,7 +1102,10 @@ mod tests {
         let unlisted = json!({"name": "box", "kind": "ssh", "target": "ssh://box:2200", "command": cmd, "roots": [], "default_root": null, "listed": false, "agent": true});
         assert_eq!(info, unlisted, "no link: nothing listed");
         assert_eq!(err(&mut pair.local, "machines.get", json!({"name": "nope"})).0, "not-found");
+        assert_eq!(ok(&mut pair.local, "machines.cycle", json!({"name": "box"})), json!({"ok": true}));
+        assert_eq!(err(&mut pair.local, "machines.cycle", json!({"name": "nope"})).0, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
+        assert_eq!(err(&mut pair.local, "machines.cycle", json!({"name": "box"})).0, "not-found");
         let (code, _) = err(&mut pair.local, "machines.unlink", json!({"name": "box"}));
         assert_eq!(code, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.list", Value::Null).as_array().unwrap().len(), 0);
@@ -1584,6 +1604,7 @@ mod tests {
             ("machines.add", "MachineAdded"),
             ("machines.list", "MachineRow[]"),
             ("machines.unlink", "OkResult"),
+            ("machines.cycle", "OkResult"),
             ("machines.rm", "MachineRmResult"),
             ("fleet.rm", "FleetRemoved"),
             ("fleet.place", "FleetPlaced"),
