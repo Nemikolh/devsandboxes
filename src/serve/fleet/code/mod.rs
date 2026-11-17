@@ -465,9 +465,9 @@ pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<(Vec<String>, Option
 /// worker policy with no allowances would refuse, over the config root and
 /// the folders that move with it (`folder`, `folders` outside the root) as
 /// the only paths that travel. From the config ([`Policy::config_refusals`]:
-/// `initializeCommand`, `privileged`, a required GPU (the sandbox's or a
-/// service's), global services,
-/// `${localEnv:…}`, …) and each `mounts` bind ([`Policy::check_bind`]:
+/// `initializeCommand`, `privileged`, global services,
+/// `${localEnv:…}`, …; a required GPU isn't a tie, since placement filters
+/// for it) and each `mounts` bind ([`Policy::check_bind`]:
 /// sources outside those paths, runtime sockets; not `${sharedVolumes}`
 /// ones, a fresh dir on a worker whatever they point to here) and each `build` context or
 /// dockerfile, the sandbox's or a service's. Any tie keeps the sandbox home,
@@ -494,7 +494,15 @@ pub fn ties(root: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Vec<Stri
     if props.placement == Some(Placement::Home) {
         out.push("`placement = \"home\"`".into());
     }
-    out.extend(policy.config_refusals(root, config, sandbox).into_iter().map(tie));
+    // GPU refusals aren't ties: placement keeps a required GPU to machines
+    // that lend one, and the worker's `check_run` still enforces it.
+    out.extend(
+        policy
+            .config_refusals(root, config, sandbox)
+            .into_iter()
+            .filter(|r| r.allow.as_deref() != Some("gpus = true"))
+            .map(tie),
+    );
     let root_s = root.to_string_lossy();
     let shared = root.join("shared-volumes");
     let shared_s = shared.to_string_lossy();
@@ -1301,9 +1309,12 @@ mod tests {
         assert_eq!(ties_of_toml("placement = \"home\""), ["`placement = \"home\"`"]);
         assert_eq!(ties_of_toml("privileged = true\nplacement = \"home\""), ["`placement = \"home\"`", "privileged"]);
         assert_eq!(ties_of_toml(""), Vec::<String>::new());
-        // An optional GPU runs without one anywhere.
+        // An optional GPU runs without one anywhere; a required GPU is not a tie
+        // (placement filters for it).
         assert_eq!(ties_of_toml("hostRequirements.gpu = \"optional\""), Vec::<String>::new());
         assert_eq!(ties_of_toml("services = [\"opt\"]"), Vec::<String>::new());
+        assert_eq!(ties_of_toml("hostRequirements.gpu = true"), Vec::<String>::new());
+        assert_eq!(ties_of_toml("services = [\"gpu\"]"), Vec::<String>::new());
         assert_eq!(
             ties_of_toml(
                 "caches = [\"cargo\"]\npersist-shell-history = true\nworktree-link = [\".env\"]\n\
@@ -1327,8 +1338,6 @@ mod tests {
             ),
             ("containerEnv = { T = \"${localEnv:X}\" }".into(), "`${localEnv:X}` (this host's env)".into()),
             ("privileged = true".into(), "privileged".into()),
-            ("hostRequirements.gpu = true".into(), "a required GPU (`hostRequirements.gpu`)".into()),
-            ("services = [\"gpu\"]".into(), "service `gpu`'s required GPU (`hostRequirements.gpu`)".into()),
             ("initializeCommand = \"true\"".into(), "`initializeCommand`".into()),
             ("services = [\"i\", \"g\"]".into(), "global service `g`".into()),
         ] {

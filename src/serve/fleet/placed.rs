@@ -206,8 +206,9 @@ impl MovedFolder {
     }
 }
 
-/// Where `run` goes: here when placement picks this host (or nothing,
-/// which a candidate list with this host in it never gives); else `prepare(worker)` moves the code there, and its
+/// Where `run` goes: here when placement picks this host; here with a note
+/// naming why when nothing qualifies (a required GPU no candidate lends, or
+/// this host a driver); else `prepare(worker)` moves the code there, and its
 /// answer decides: there, here with a note (`NotMovable`), or failed.
 pub fn decide(
     ask: &Ask,
@@ -215,7 +216,10 @@ pub fn decide(
     candidates: &[Candidate],
     prepare: impl FnOnce(&str) -> Result<Prepared, Unprepared>,
 ) -> Placed {
-    let Ok(placement) = place::place(spec, candidates) else { return Placed::Local };
+    let placement = match place::place(spec, candidates) {
+        Ok(placement) => placement,
+        Err(why) => return Placed::LocalWithNote(format!("note: not placed: {why}; running here")),
+    };
     let MachineRef::Machine(name) = &placement.machine else { return Placed::Local };
     moved(ask, name, lines(&placement), prepare)
 }
@@ -589,6 +593,17 @@ mod tests {
         let fresh_map = BTreeMap::from([("lap".to_string(), fresh)]);
         let c = candidates(&s, None, &[], &[neutral], &[], &fresh_map);
         assert!(matches!(decide(&Ask::default(), &s, &c, |_| Ok(prepared("main"))), Placed::Worker { .. }));
+    }
+
+    /// A required GPU nothing takes runs here, saying why (the run itself
+    /// then refuses it unless this host has one).
+    #[test]
+    fn a_required_gpu_nothing_takes_runs_here_with_why() {
+        let s = spec("web", Some(GpuNeed::Required), None);
+        let m = worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, None)));
+        let c = candidates(&s, None, &[], &[m], &[], &BTreeMap::new());
+        let Placed::LocalWithNote(note) = decide(&Ask::default(), &s, &c, |_| unreachable!()) else { panic!() };
+        assert!(note.starts_with("note: not placed: ") && note.contains("no GPU") && note.ends_with("; running here"), "{note}");
     }
 
     #[test]

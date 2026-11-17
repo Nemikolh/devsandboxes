@@ -793,9 +793,9 @@ refuse, with the config root and the folders that move with it
 (`folder`, `folders` entries outside the root) as the only paths that
 travel. From the config, every `worker_policy::Policy::config_refusals`
 item (`initializeCommand`, `dispatcher`, `inbox`,
-`privileged`, a required GPU (`hostRequirements.gpu`, the sandbox's or a
-listed service's; an optional one isn't a tie), `global` services, local features outside those paths, each `${localEnv:NAME}`
-in the merged sandbox or its services); from each `mounts` bind (its
+`privileged`, `global` services, local features outside those paths, each `${localEnv:NAME}`
+in the merged sandbox or its services; a required GPU isn't a tie,
+since [Placement](#placement) filters for it); from each `mounts` bind (its
 source substituted as `run` does, `${localWorkspaceFolder}` the
 `folder`), `Policy::check_bind`'s: a source outside those paths, a
 runtime socket. `${sharedVolumes}` binds (whatever their dir resolves to
@@ -1342,7 +1342,10 @@ destination the same way), so a placed run needs no ssh of its own. A
   (`code::ties_of`; none when it doesn't load), and the requester is
   this host.
 - **Decide** (`placed::decide`): this host wins (the `REQUESTER` bias
-  breaks a tie) → the local verb, unchanged. A machine wins →
+  breaks a tie) → the local verb, unchanged. Nothing qualifies (a
+  required GPU no candidate lends, `NoPlace`) → the local verb with
+  `note: not placed: <why>; running here` first, whose GPU check then
+  refuses it unless this host has one. A machine wins →
   `code::prepare` for it: its fleet root for this host is the row its
   `roots.list` flags `fleet`, asked over a fresh `API` stream of any
   path (`daemon::fleet_root_on` over `Handle::open_member`,

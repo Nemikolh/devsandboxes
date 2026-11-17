@@ -688,7 +688,8 @@ is frozen: no new work on it.
   moved folders, `${localEnv:…}`, `privileged`, …) keeps it
   home whatever a worker's trust or `member.toml` allowances: nothing
   checks whether another host could satisfy it until named host
-  resources (fleet plan decision 41). X11 has no check of its own beyond
+  resources (fleet plan decision 41). GPUs are the exception: placement
+  filters them, so a required GPU is not a tie. X11 has no check of its own beyond
   its bind. A pin names only home (`placement = "home"`): a list of the
   members a sandbox may run on isn't built. Nothing in `shared-volumes/`
   follows a placed instance (logins kept there): on the worker its
