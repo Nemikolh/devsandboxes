@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Block;
 
 use crate::runtime::NAME_PREFIX;
-use crate::tui::data::{ContainerStatus, InstanceRow};
+use crate::tui::data::{ContainerStatus, InstanceRow, Node};
 use crate::tui::kitty;
 use crate::tui::remote::{self, instance_key, qualify, service_key};
 use crate::commands::exec::SHELL_FALLBACK_CMD;
@@ -18,7 +18,7 @@ use crate::tui::select;
 use crate::serve::machines::cli::{Next, Reconnect};
 use crate::tui::term::{encode_key, encode_mouse, encode_wheel, TermSession};
 
-use super::view::{point_in, Modal};
+use super::view::{point_in, session_lines, ConfirmModal, Confirmed, Fetch, Modal};
 use super::{App, Focus, Tab};
 
 /// Lines one wheel notch scrolls, as scrollback or as arrow keys.
@@ -58,6 +58,22 @@ impl ExecCli {
         ];
         argv.extend(command.iter().cloned());
         Ok(argv)
+    }
+
+    /// `devsandbox -C <root> exec --attach=<id> -- <instance>`: an attach tab
+    /// (`a`) on helper session `id`. No `-i -t`, which `--attach` doesn't
+    /// take (the session already has its pty); the `=` form, as
+    /// `--attach`'s value is optional and the name comes after `--`.
+    pub fn attach_argv(&self, instance: &str, id: &str) -> Result<Vec<String>, String> {
+        Ok(vec![
+            self.exe()?,
+            "-C".into(),
+            self.root.to_string_lossy().into_owned(),
+            "exec".into(),
+            format!("--attach={id}"),
+            "--".into(),
+            instance.into(),
+        ])
     }
 
     /// The devsandbox executable these argvs start with (also a machine's
@@ -460,7 +476,7 @@ impl App {
                     .instances
                     .get(idx)
                     .ok_or_else(|| "terminal: select an instance".to_string())?;
-                instance_term_target(row)
+                instance_term_target(row, "terminal")
             }
             Tab::Services => {
                 let row = snapshot
@@ -510,9 +526,97 @@ impl App {
         let target = match self.snapshot.as_ref().map(|s| remote::find_instance(s, name)) {
             None => Err("terminal: no data yet".to_string()),
             Some(None) => Err(format!("terminal: `{name}` not in the snapshot")),
-            Some(Some(row)) => instance_term_target(row),
+            Some(Some(row)) => instance_term_target(row, "terminal"),
         };
         self.open_terminal_to(target, false);
+    }
+
+    /// `a` (Instances tab, an instance row): attach a tab to one of the
+    /// instance's detached helper sessions. A row that isn't running or
+    /// whose machine is unreachable says so; else the event loop asks the
+    /// daemon for its sessions ([`Fetch::Sessions`]), answered through
+    /// [`Self::sessions_listed`]. A no-op off an instance row.
+    pub(super) fn attach_session(&mut self) {
+        let Some(Node::Instance(i)) = self.selected_node() else { return };
+        let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else { return };
+        let key = instance_key(row);
+        if let Err(msg) = instance_term_target(row, "attach") {
+            self.status = Some(msg);
+        } else if remote::unreachable(&self.machines, row.machine.as_deref()) {
+            self.status = Some(format!("attach: `{key}`'s machine is unreachable"));
+        } else {
+            self.status = Some(format!("attach: listing `{key}`'s sessions…"));
+            self.pending_fetch.push(Fetch::Sessions { instance: key });
+        }
+    }
+
+    /// [`Fetch::Sessions`]' answer for `instance` (a key): its `session ls`
+    /// lines, or the line to show. The running, detached ones
+    /// (`commands::exec::detached_sessions`, `exec --attach`'s rule): none
+    /// is a status line, one opens its tab, several a picker
+    /// ([`Confirmed::Attach`]).
+    pub fn sessions_listed(&mut self, instance: &str, lines: Result<Vec<String>, String>) {
+        let listing = match lines {
+            Ok(lines) => lines.join("\n"),
+            Err(msg) => {
+                self.status = Some(msg);
+                return;
+            }
+        };
+        let found: Vec<(String, String)> = crate::commands::exec::detached_sessions(&listing)
+            .into_iter()
+            .map(|(id, line)| (id.to_string(), line.to_string()))
+            .collect();
+        match found.as_slice() {
+            [] => self.status = Some(format!("attach: no detached session in `{instance}`")),
+            [(id, _)] => {
+                let id = id.clone();
+                self.open_attach(instance, &id);
+            }
+            // Another modal opened while the list was on its way: don't
+            // replace it.
+            _ if !matches!(self.modal, Modal::None) => {
+                self.status = Some(format!("attach: `{instance}` has {} detached sessions (a again to pick)", found.len()));
+            }
+            _ => {
+                self.status = None;
+                let body = session_lines(&found, 0);
+                let question = format!("{instance}: attach to a detached session");
+                let action = Confirmed::Attach { instance: instance.to_string(), sessions: found, cursor: 0 };
+                self.modal = Modal::Confirm(ConfirmModal::new(question, body, action));
+            }
+        }
+    }
+
+    /// Open a new tab attached to helper session `id` of instance `key`
+    /// (never deduped: a `t` tab on the same container is another session).
+    /// The row is looked up again, as it may have stopped since `a`.
+    pub(super) fn open_attach(&mut self, key: &str, id: &str) {
+        let target = match self.snapshot.as_ref().map(|s| remote::find_instance(s, key)) {
+            None => Err("attach: no data yet".to_string()),
+            Some(None) => Err(format!("attach: `{key}` not in the snapshot")),
+            Some(Some(row)) => instance_term_target(row, "attach"),
+        };
+        match target {
+            Ok((title, container, _)) => {
+                let argvs = self.attach_argvs(&title, id);
+                self.spawn_tab(title, container, argvs);
+            }
+            Err(msg) => self.status = Some(msg),
+        }
+    }
+
+    /// What an attach tab runs: this host's [`ExecCli::attach_argv`], no
+    /// re-dial; on a machine `remote::attach_argv`, both its first dial and
+    /// its [`Redial`] (a reconnect never starts a second process).
+    fn attach_argvs(&self, key: &str, id: &str) -> Result<(Vec<String>, Option<Vec<String>>), String> {
+        let attach = |e: String| format!("attach: {e}");
+        if let (Some(machine), name) = remote::split(key) {
+            let m = self.machine_entry(machine).map_err(attach)?;
+            let argv = remote::attach_argv(m, name, id, &|| self.local_exe()).map_err(attach)?;
+            return Ok((argv.clone(), Some(argv)));
+        }
+        self.exec_cli.as_ref().map_err(|e| attach(e.clone()))?.attach_argv(key, id).map(|argv| (argv, None)).map_err(attach)
     }
 
     /// The shared tail of [`Self::open_terminal`] and
@@ -537,8 +641,15 @@ impl App {
         }
 
         let id = crate::commands::exec::mint_session_id(crate::state::Instance::now());
-        let (argv, attach) = match self.term_argv(&title, &container, is_instance, &id) {
-            Ok(argv) => argv,
+        let argvs = self.term_argv(&title, &container, is_instance, &id);
+        self.spawn_tab(title, container, argvs);
+    }
+
+    /// Spawn a tab running `argvs` (its first dial, and the re-dial of a
+    /// [`Redial`] tab), focused; or the status says why not.
+    fn spawn_tab(&mut self, title: String, container: String, argvs: Result<(Vec<String>, Option<Vec<String>>), String>) {
+        let (argv, attach) = match argvs {
+            Ok(argvs) => argvs,
             Err(msg) => {
                 self.status = Some(msg);
                 return;
@@ -642,11 +753,12 @@ fn body_cell(body: Rect, ev: &MouseEvent) -> (u16, u16) {
 }
 
 /// Terminal target for an instance row, which must be running: its key
-/// (the title, `box/web-2` on a machine) and its container's.
-fn instance_term_target(row: &InstanceRow) -> Result<(String, String, bool), String> {
+/// (the title, `box/web-2` on a machine) and its container's. `what`
+/// prefixes the refusal (`terminal`, `attach`).
+fn instance_term_target(row: &InstanceRow, what: &str) -> Result<(String, String, bool), String> {
     let key = instance_key(row);
     if !matches!(row.status, ContainerStatus::Running(_)) {
-        return Err(format!("terminal: `{key}` is not running"));
+        return Err(format!("{what}: `{key}` is not running"));
     }
     Ok((key, qualify(row.machine.as_deref(), &row.container), true))
 }
@@ -1350,6 +1462,131 @@ mod tests {
         assert_eq!(argv[5..], SHELL_FALLBACK_CMD);
         // The exec CLI isn't needed for a service.
         assert!(app.exec_cli.is_err());
+    }
+
+    #[test]
+    fn exec_cli_attach_argv_is_an_attach_only_exec() {
+        use clap::Parser;
+        let argv = cli().attach_argv("-web", ID).unwrap();
+        assert_eq!(argv, ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec", "--attach=1790000000-a1b2", "--", "-web"]);
+        let parsed = crate::Cli::try_parse_from(std::iter::once("devsandbox").chain(argv[1..].iter().map(String::as_str))).unwrap();
+        assert!(matches!(
+            parsed.command.unwrap(),
+            crate::Command::Exec { attach: Some(Some(ref a)), session: None, ref name, ref command, .. }
+                if a == ID && name == "-web" && command.is_empty()
+        ));
+    }
+
+    /// `a` on a running instance row asks for its sessions; a stopped
+    /// row, an unreachable machine's, a process row or another tab don't.
+    #[test]
+    fn a_queues_a_sessions_fetch_for_a_running_instance_row() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
+        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_fetch(), []);
+        assert_eq!(app.status.as_deref(), Some("attach: `inst0` is not running"));
+
+        app.set_snapshot(snapshot_with_status(1, running()));
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_fetch(), [Fetch::Sessions { instance: "inst0".into() }]);
+
+        let mut app = app_on_proc_row(&["7"]);
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_fetch(), []);
+
+        let mut app = machine_app();
+        app.selected[Tab::Instances.index()] = 5; // box/inst1
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_fetch(), [Fetch::Sessions { instance: "box/inst1".into() }]);
+        app.machines[0].state = crate::serve::snapshots::LinkState::Unreachable;
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_fetch(), []);
+        assert_eq!(app.status.as_deref(), Some("attach: `box/inst1`'s machine is unreachable"));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_fetch(), []);
+    }
+
+    const RUNNING: &str = "1790000000-a1b2 running detached 2026-01-01T00:00:00Z bash -l";
+    const OTHER: &str = "1790000100-c3d4 running detached 2026-01-01T00:01:40Z vim";
+
+    /// A tab-spawning app: `/bin/true` stands in for devsandbox, so the PTY
+    /// child exits at once.
+    fn attach_app() -> App {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        app.exec_cli = Ok(ExecCli { exe: Some("/bin/true".into()), root: "/home/u/cfg".into() });
+        app
+    }
+
+    #[test]
+    fn sessions_listed_reports_an_error_or_none() {
+        let mut app = attach_app();
+        app.sessions_listed("inst0", Err("attach: no instance `inst0`".into()));
+        assert_eq!(app.status.as_deref(), Some("attach: no instance `inst0`"));
+        let lines = vec![
+            "1790000000-a1b2 running attached 2026-01-01T00:00:00Z bash -l".to_string(),
+            "1790000100-c3d4 exited - 2026-01-01T00:01:40Z vim".to_string(),
+        ];
+        app.sessions_listed("inst0", Ok(lines));
+        assert_eq!(app.status.as_deref(), Some("attach: no detached session in `inst0`"));
+        assert!(app.terms.is_empty() && matches!(app.modal, Modal::None));
+    }
+
+    /// One detached session: a new tab on it, beside a `t` tab of the same
+    /// container. A remote one re-dials the same attach.
+    #[test]
+    fn one_detached_session_opens_an_attach_tab() {
+        let mut app = attach_app();
+        app.terms.open(term_sess("inst0", "devsandbox-inst0"));
+        assert_eq!(app.attach_argvs("inst0", ID), Ok((ExecCli { exe: Some("/bin/true".into()), root: "/home/u/cfg".into() }.attach_argv("inst0", ID).unwrap(), None)));
+        app.sessions_listed("inst0", Ok(vec![RUNNING.into()]));
+        assert_eq!(app.status, None);
+        let tabs = app.terms.sessions();
+        assert_eq!(tabs.len(), 2, "not deduped against the `t` tab");
+        assert_eq!((tabs[1].title.as_str(), tabs[1].container.as_str()), ("inst0", "devsandbox-inst0"));
+        assert!(tabs[1].redial.is_none());
+        assert_eq!(app.focus, Focus::Terminal);
+
+        let mut app = machine_app();
+        app.exec_cli = Ok(ExecCli { exe: Some("/bin/true".into()), root: "/home/u/cfg".into() });
+        app.sessions_listed("box/inst1", Ok(vec![RUNNING.into()]));
+        let tab = &app.terms.sessions()[0];
+        assert_eq!((tab.title.as_str(), tab.container.as_str()), ("box/inst1", "box/devsandbox-inst1"));
+        let attach = ["/bin/true", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "box/inst1"].map(String::from).to_vec();
+        assert_eq!(tab.redial.as_ref().unwrap().attach, attach);
+        assert_eq!(app.attach_argvs("box/inst1", ID), Ok((attach.clone(), Some(attach))));
+    }
+
+    /// Several: a picker over them; `j`/`k` move, `enter` attaches the
+    /// cursor's, `esc` closes it without a tab.
+    #[test]
+    fn several_detached_sessions_open_a_picker() {
+        let mut app = attach_app();
+        app.sessions_listed("inst0", Ok(vec![RUNNING.into(), OTHER.into()]));
+        let Modal::Confirm(view) = &app.modal else { panic!("no picker") };
+        assert_eq!(view.body, [format!("› {RUNNING}"), format!("  {OTHER}")]);
+        assert_eq!(view.keys_hint(), "↑↓ move · enter attach · esc cancel");
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None) && app.terms.is_empty());
+
+        // On a machine, so the tab's re-dial shows the id it attached.
+        let mut app = machine_app();
+        app.exec_cli = Ok(ExecCli { exe: Some("/bin/true".into()), root: "/home/u/cfg".into() });
+        app.sessions_listed("box/inst1", Ok(vec![RUNNING.into(), OTHER.into()]));
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('k')));
+        let Modal::Confirm(view) = &app.modal else { panic!("no picker") };
+        assert_eq!(view.body[1], format!("› {OTHER}"));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::None));
+        let tabs = app.terms.sessions();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].redial.as_ref().unwrap().attach[3], "--attach=1790000100-c3d4");
+        assert_eq!(app.focus, Focus::Terminal);
     }
 
     #[test]

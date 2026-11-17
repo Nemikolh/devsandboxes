@@ -121,6 +121,9 @@ pub enum DaemonUpdate {
     Config { kind: ConfigKind, name: String, text: Result<SandboxText, String> },
     /// [`Fetch::Inspect`]'s answer: the inspect pane's body.
     Inspect { container: String, body: String },
+    /// [`Fetch::Sessions`]' answer: the instance's `session ls` lines
+    /// (`Err`: the status line).
+    Sessions { instance: String, lines: Result<Vec<String>, String> },
     /// [`Cmd::BuildLog`]'s answer, for `App::set_build_log`.
     BuildLog { instance: String, read: Result<Option<Tail>, String> },
     /// A process signal's status line; the process rows are stale.
@@ -449,6 +452,14 @@ fn fetch_call(root: &Path, fetch: &Fetch, route: &Route) -> (&'static str, (&'st
             };
             ("config", on_machine((method, json!({ "root": root, "name": name })), machine))
         }
+        Fetch::Sessions { instance } => {
+            let (machine, instance) = split(instance);
+            let root = match (machine, &route.root) {
+                (Some(_), Some(remote)) => remote.clone(),
+                _ => root.to_string_lossy().into_owned(),
+            };
+            ("attach", on_machine(("sessions.list", json!({ "root": root, "instance": instance })), machine))
+        }
     }
 }
 
@@ -471,6 +482,13 @@ fn fetch_update(fetch: Fetch, answer: Answer) -> DaemonUpdate {
                 hash: String::new(),
             });
             DaemonUpdate::Config { kind: ConfigKind::Service, name, text }
+        }
+        Fetch::Sessions { instance } => {
+            let lines = match answer {
+                Answer::Refused(msg) => Err(format!("attach: {msg}")),
+                answer => answer.parse::<crate::serve::api::SessionsList>("attach").map(|s| s.sessions),
+            };
+            DaemonUpdate::Sessions { instance, lines }
         }
     }
 }
@@ -1442,6 +1460,10 @@ mod tests {
             fetch(Fetch::Config { kind: ConfigKind::Service, name: "db".into() }),
             ("config", ("services.get", json!({"root": "/cfg", "name": "db"})))
         );
+        assert_eq!(
+            fetch(Fetch::Sessions { instance: "web-2".into() }),
+            ("attach", ("sessions.list", json!({"root": "/cfg", "instance": "web-2"})))
+        );
         assert_eq!(build_log_call("id0"), ("instances.buildLog", json!({"instance": "id0", "lines": 500, "ansi": true})));
         assert_eq!(
             signal_call(&PendingSignal { signal: super::super::app::Signal::Kill, ..sig("42") }),
@@ -1475,6 +1497,10 @@ mod tests {
         assert_eq!(
             fetch_call(root, &Fetch::Inspect { container: "box/devsandbox-web".into() }, &Route::default()).1,
             ("containers.inspect", json!({"container": "devsandbox-web", "machine": "box"}))
+        );
+        assert_eq!(
+            fetch_call(root, &Fetch::Sessions { instance: "box/web-2".into() }, &remote).1,
+            ("sessions.list", json!({"root": "/r/one", "instance": "web-2", "machine": "box"}))
         );
         assert_eq!(cancel_call("box/web-2"), ("instances.cancel", json!({"instance": "web-2", "machine": "box"})));
         assert_eq!(build_log_call("box/id0").1, json!({"instance": "id0", "lines": 500, "ansi": true, "machine": "box"}));
@@ -1573,6 +1599,15 @@ mod tests {
         };
         assert_eq!(config(down()), Err("x: needs devsandbox serve (down)".into()));
         assert!(config(Answer::Ok(json!({"surprise": 1}))).unwrap_err().starts_with("config: unexpected answer"));
+        // Sessions: the lines, else the status line.
+        let sessions = |a| match fetch_update(Fetch::Sessions { instance: "box/web".into() }, a) {
+            DaemonUpdate::Sessions { instance, lines } if instance == "box/web" => lines,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(sessions(Answer::Ok(json!({"sessions": ["a running detached t sh"]}))), Ok(vec!["a running detached t sh".into()]));
+        assert_eq!(sessions(Answer::Refused("no instance `web`".into())), Err("attach: no instance `web`".into()));
+        assert_eq!(sessions(down()), Err("x: needs devsandbox serve (down)".into()));
+        assert!(sessions(Answer::Ok(json!({}))).unwrap_err().starts_with("attach: unexpected answer"));
 
         // The build log: `null` is none yet.
         let read = |a: Answer| a.parse::<Option<Tail>>("build log");

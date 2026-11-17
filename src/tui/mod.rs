@@ -403,6 +403,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 daemon::DaemonUpdate::Logs { container, body } => app.set_logs(&container, body),
                 daemon::DaemonUpdate::Config { kind, name, text } => app.set_config(kind, &name, text),
                 daemon::DaemonUpdate::Inspect { container, body } => app.set_inspect(&container, body),
+                daemon::DaemonUpdate::Sessions { instance, lines } => app.sessions_listed(&instance, lines),
                 daemon::DaemonUpdate::BuildLog { instance, read } => app.set_build_log(&instance, read),
                 // Refresh the processes now so a killed one drops off the
                 // forest without waiting for the next tick.
@@ -764,6 +765,7 @@ fn fetch_route(s: &data::Snapshot, fetch: &app::Fetch) -> remote::Route {
     match fetch {
         app::Fetch::Config { kind: app::ConfigKind::Sandbox, name } => remote::sandbox_route(s, name),
         app::Fetch::Config { kind: app::ConfigKind::Service, name } => remote::service_route(s, name),
+        app::Fetch::Sessions { instance } => remote::instance_route(s, instance),
         app::Fetch::Logs { .. } | app::Fetch::Inspect { .. } => remote::Route::default(),
     }
 }
@@ -1035,6 +1037,9 @@ mod tests {
         assert_eq!(fetch_route(&s, &config), remote::Route { machine: Some("box".into()), root: Some("/r/one".into()) });
         let logs = app::Fetch::Logs { container: "box/devsandbox-web-2".into() };
         assert_eq!(fetch_route(&s, &logs), remote::Route::default());
+        let sessions = app::Fetch::Sessions { instance: "box/web-2".into() };
+        assert_eq!(fetch_route(&s, &sessions), remote::Route { machine: Some("box".into()), root: Some("/r/two".into()) });
+        assert_eq!(fetch_route(&s, &app::Fetch::Sessions { instance: "web-2".into() }), remote::Route::default());
     }
 
     /// Each verb action's request carries the root and env and is what the

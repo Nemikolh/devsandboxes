@@ -587,6 +587,7 @@ impl App {
             KeyCode::Char('K') if on_proc => self.signal_selected_proc(Signal::Kill),
             KeyCode::Char('t') => self.open_terminal(false),
             KeyCode::Char('T') if !on_proc => self.open_terminal(true),
+            KeyCode::Char('a') if self.tab == Tab::Instances && !on_proc => self.attach_session(),
             KeyCode::Char(']') => self.terms.next(),
             KeyCode::Char('[') => self.terms.prev(),
             KeyCode::Char('x') => self.terms.close_active(),

@@ -358,7 +358,7 @@ pub(crate) fn checked_session_id(id: &str) -> Result<&str> {
 
 /// The running, detached sessions in a `devsbd session ls` listing (lines
 /// `<id> <state> <attached|detached|-> <started> <argv…>`): `(id, line)`.
-fn detached_sessions(listing: &str) -> Vec<(&str, &str)> {
+pub(crate) fn detached_sessions(listing: &str) -> Vec<(&str, &str)> {
     listing
         .lines()
         .filter_map(|line| {

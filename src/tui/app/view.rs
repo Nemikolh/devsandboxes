@@ -117,6 +117,7 @@ Process rows (expanded instance)
 Terminals
   t           open terminal (instance / service)
   T           force a new terminal for the same target
+  a           attach to a detached session (Instances; a picker when several)
   [ / ]       previous / next terminal tab
   x           close the active terminal
   ctrl-] / F12  focus terminal ⇄ back to dashboard
@@ -230,6 +231,9 @@ pub enum Fetch {
     Config { kind: ConfigKind, name: String },
     /// `containers.inspect` for the config view's inspect pane.
     Inspect { container: String },
+    /// `sessions.list` for instance `instance` (a key): `a`'s detached
+    /// sessions, answered through [`App::sessions_listed`].
+    Sessions { instance: String },
 }
 
 /// What a [`ConfigView`] shows: a sandbox or a service (their names may
@@ -320,7 +324,8 @@ fn build_log_title(instance: &str, phase: Option<&PhaseRow>) -> String {
 /// question and take `u`/`c`/`s` (the offer: `u`/`c`/`l`), `esc`/`q` being
 /// a skip. The profile picker (`P` with more than two allowed) lists the
 /// profiles as `body`, the cursor's marked: `↑↓`/`j`/`k` move, `enter`
-/// switches to it, `esc`/`q` cancel.
+/// switches to it, `esc`/`q` cancel. The session picker (`a` with several
+/// detached sessions) is the same, `enter` attaching.
 pub struct ConfirmModal {
     pub question: String,
     /// Lines listed under the question (the identity findings).
@@ -341,6 +346,7 @@ impl ConfirmModal {
             Confirmed::Identity { .. } => "u update · c continue as is · s/esc skip",
             Confirmed::IdentityOffer(_) => "u update · c continue as is · l/esc later",
             Confirmed::Profile { .. } => "↑↓ move · enter switch · esc cancel",
+            Confirmed::Attach { .. } => "↑↓ move · enter attach · esc cancel",
         }
     }
 
@@ -351,6 +357,7 @@ impl ConfirmModal {
             Confirmed::Identity { .. } => "[u] update  [c] continue as is (don't ask again)  [s] skip this time",
             Confirmed::IdentityOffer(_) => "[u] update  [c] continue as is  [l] later",
             Confirmed::Profile { .. } => "[enter] switch  [esc] cancel",
+            Confirmed::Attach { .. } => "[enter] attach  [esc] cancel",
         }
     }
 
@@ -376,6 +383,19 @@ pub(super) enum Confirmed {
     /// The profile picker for `instance` (a key): its sandbox's allowed
     /// `profiles`, its `current` one, the `cursor` over them.
     Profile { instance: String, profiles: Vec<String>, current: Option<String>, cursor: usize },
+    /// The session picker for `instance` (a key, `a` with several
+    /// detached): its `sessions` as `(id, line)`, the `cursor` over them.
+    Attach { instance: String, sessions: Vec<(String, String)>, cursor: usize },
+}
+
+/// The session picker's body: one `session ls` line per detached session,
+/// the cursor's marked `›`.
+pub(super) fn session_lines(sessions: &[(String, String)], cursor: usize) -> Vec<String> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(i, (_, line))| format!("{} {line}", if i == cursor { '›' } else { ' ' }))
+        .collect()
 }
 
 /// The profile picker's body: one line per allowed profile, the cursor's
@@ -693,6 +713,29 @@ impl App {
                 }
                 view.body = profile_lines(profiles, current.as_deref(), *cursor);
             }
+            Modal::Confirm(view) if matches!(view.action, Confirmed::Attach { .. }) => {
+                let Confirmed::Attach { instance, sessions, cursor } = &mut view.action else { return };
+                let n = sessions.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') if n > 0 => *cursor = (*cursor + n - 1) % n,
+                    KeyCode::Down | KeyCode::Char('j') if n > 0 => *cursor = (*cursor + 1) % n,
+                    KeyCode::Enter => {
+                        let pick = sessions.get(*cursor).map(|(id, _)| id.clone());
+                        let instance = instance.clone();
+                        self.modal = Modal::None;
+                        if let Some(id) = pick {
+                            self.open_attach(&instance, &id);
+                        }
+                        return;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.modal = Modal::None;
+                        return;
+                    }
+                    _ => return,
+                }
+                view.body = session_lines(sessions, *cursor);
+            }
             Modal::Confirm(view) => {
                 let yes = match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => Some(true),
@@ -714,7 +757,13 @@ impl App {
                     (Confirmed::RmBranch { instance, .. }, None) => {
                         self.status = Some(format!("rm {instance}: cancelled"));
                     }
-                    (Confirmed::Identity { .. } | Confirmed::IdentityOffer(_) | Confirmed::Profile { .. }, _) => {}
+                    (
+                        Confirmed::Identity { .. }
+                        | Confirmed::IdentityOffer(_)
+                        | Confirmed::Profile { .. }
+                        | Confirmed::Attach { .. },
+                        _,
+                    ) => {}
                 }
             }
         }

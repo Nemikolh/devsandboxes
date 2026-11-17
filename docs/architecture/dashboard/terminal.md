@@ -9,8 +9,9 @@ Code: `src/tui/term.rs` (`TermSession`, `TermTabs`, `TermParser`,
 `spawn_reader`, `process_output`, `encode_key`, `encode_mouse`,
 `encode_wheel`), `src/tui/kitty.rs` (`KittyState`, `encode_key`,
 `DISAMBIGUATE`), `src/tui/app/terminal.rs` (`ExecCli`, `on_key_terminal`,
-`terminal_mouse`, `open_terminal`, `term_argv`, `exec_argv`, `Redial`,
-`redial_terminals`), `src/tui/remote.rs` (`exec_argv`,
+`terminal_mouse`, `open_terminal`, `term_argv`, `exec_argv`,
+`attach_session`, `sessions_listed`, `open_attach`, `attach_argvs`,
+`Redial`, `redial_terminals`), `src/tui/remote.rs` (`exec_argv`,
 `session_exec_argv`, `attach_argv`, `service_argv`), `src/tui/ui.rs`
 (`open_bottom_split`, `terminal_panel_rect`, `term_pane_size`,
 `terminal_tab_hit`), `src/tui/mod.rs` (`setup`/`enter`/`restore`,
@@ -26,13 +27,15 @@ writes back the replies the callbacks queued. EOF sets `exited`: the tab
 shows `(exited)`, keeps its screen, swallows keys, and `x` closes it.
 Dropping a session kills and waits the child, so quitting the dashboard
 leaks no `exec` client. An instance tab's shell lives on in its helper
-session (see *What a tab runs*), there for `devsandbox exec --attach`.
+session (see *What a tab runs*), there for `devsandbox exec --attach`
+and the dashboard's `a`.
 
 `TermTabs` is the pure tab strip (open, `find`, next/prev, close; the
 active index). One strip serves every dashboard tab. `t` focuses a live
 tab for the same container (`find` skips exited ones), `T` always opens a
-new one. The spawn happens inline in `App::open_terminal`, an accepted
-exception to `App`'s I/O-free rule.
+new one, and so does `a` (an attach is another session than a `t` tab's).
+The spawn happens inline in `App::open_terminal` (`App::open_attach`
+for `a`), an accepted exception to `App`'s I/O-free rule.
 
 The event loop sizes every PTY to the panel before each draw
 (`term_pane_size`, `resize_all`; a no-op when unchanged) and polls every
@@ -71,6 +74,18 @@ arrives on reader threads and only shows on the next draw.
   It isn't a session: no `Redial`, it just ends. A machine seen only
   through the fleet's control plane (its `via`, kind `routed`) gets the same tabs:
   the CLI's `PTY` dial goes over a route (`fleet::route::connect`).
+- An attach (`a` on a running instance row, Instances tab;
+  `App::attach_session`): the event loop asks the daemon for the
+  instance's `sessions.list` (`Fetch::Sessions`, routed to its machine
+  like the row's other reads), and `App::sessions_listed` keeps the
+  running, detached ones (`commands::exec::detached_sessions`, the CLI's
+  `--attach` rule): none is a status line, one opens its tab, several a
+  picker (`Confirmed::Attach`: the `session ls` lines, `↑↓`/`j`/`k`
+  move, `enter` attaches, `esc`/`q` cancel). The tab
+  (`App::attach_argvs`) runs `devsandbox -C <root> exec --attach=<id> --
+  <instance>` (`ExecCli::attach_argv`, no `-i -t`: the session has its
+  pty) with no re-dial; on a machine `remote::attach_argv`, which is also
+  its `Redial`'s, so a lost attach tab re-dials the same session.
 
 ## Remote tabs reconnect
 
@@ -103,6 +118,7 @@ the same `devsandbox exec` with inherited stdio
 `App::focus` is `Dashboard` or `Terminal`. Key order in
 `App::dispatch_key`: selection `esc`/copy keys, the prompt, a modal, a
 focused terminal, then dashboard bindings. Dashboard focus: `t`/`T` open,
+`a` attaches (Instances),
 `[`/`]` switch tabs, `x` closes, `ctrl-]` or `F12` focuses. Terminal
 focus: `ctrl-]`/`F12` leave, everything else is encoded and written to the
 PTY (`on_key_terminal`): `kitty::encode_key` when the app on that screen

@@ -146,7 +146,9 @@ fills the modal if it is still the one open:
   modals (`Confirmed::Identity`/`IdentityOffer`, a listing under the
   question: [Identity modals](#identity-modals)), and `P`'s profile
   picker (`Confirmed::Profile`: the allowed profiles listed, the current
-  one marked, `↑↓`/`j`/`k` move, `enter` switches, `esc`/`q` cancel).
+  one marked, `↑↓`/`j`/`k` move, `enter` switches, `esc`/`q` cancel),
+  and `a`'s session picker (`Confirmed::Attach`, the same keys, `enter`
+  attaching).
 - `?` → `Help`: settings toggles, then every key by context.
 
 ## One-key actions and the pending queue
@@ -172,6 +174,11 @@ event loop takes each once per pass and hands it to a thread.
   other one (the first when the current is neither); with more, the
   picker; with none other, a status line. It queues the same
   `PromptAction::Profile` as `:profile <instance> <profile>`.
+- `a` (an instance row, not a process row): attach a terminal tab to one
+  of the running instance's detached helper sessions, through a
+  `Fetch::Sessions` (`sessions.list`); a stopped row or an unreachable
+  machine's is a status line ([terminal.md](terminal.md), *What a tab
+  runs*).
 - `r`/`p`/`:`: the prompt ([command-line.md](command-line.md)); `t`:
   a terminal ([terminal.md](terminal.md)).
 
