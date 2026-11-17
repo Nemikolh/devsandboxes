@@ -31,10 +31,10 @@ is frozen: no new work on it.
   recovery key made at genesis, a scoped, expiring delegation to the
   control plane (`members`, `configs`); then machine → node.
   → [plan](plans/active/control-plane.md)
-- **machines**: members follow the build the authority pins
-  (`Op::Build`, by sha256; signed by `changes::sign_build`) instead of the
-  control plane's: today every member but the authority still follows the
-  control plane (`fleet_link::follows`) and the pin is only recorded.
+- **machines**: a host behind the fleet's pinned build (another
+  platform, no release asset, dev builds not taken) links anyway, but only
+  its log says so (`Decision::Behind`): `machine ls` and the dashboard
+  header don't show `behind: <why>` yet.
   → [plan](plans/active/authority-sets-fleet-version.md)
 - **machines**: fleet-wide `global` services: one container per signed
   root's service, reached from any member over the links.
@@ -546,7 +546,7 @@ is frozen: no new work on it.
   end's on the dialer get the daemon's own); fix: capture a login env
   once at the daemon's start.
   → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
-- A member's download of a published control-plane build has not yet run against
+- A member's download of a published pinned build has not yet run against
   a release built with `DEVSANDBOX_PUBLISHED=1` (the first is the next
   tag), nor has the release workflow's checksum signing run with the
   real `RELEASE_SIGNING_KEY`. A member verifies against the release key
@@ -554,24 +554,22 @@ is frozen: no new work on it.
   so after a rotation members on an older one refuse every newer
   release until updated by hand. A member with
   no release asset for its platform (an Intel Mac, a source build
-  elsewhere) can't follow a published control plane: the link drops (redialed,
-  refused again). A control plane on a dev build (from source, `cargo install`
-  included) is followed only with `dev-builds = true` in `member.toml`
-  (or trust `full`) and the same OS/arch, else the link drops
-  (redialed, refused again). Dev builds from
-  the same commit with different local changes count as the same build
-  (the git hash has no dirty marker). A mixed-platform dev fleet is built
-  per platform by hand.
+  elsewhere) stays behind a published pin. A dev pin (from source,
+  `cargo install` included) is taken only with `dev-builds = true` in
+  `member.toml` (or trust `full`) and the pin's OS/arch, else the member
+  stays behind; a mixed-platform dev fleet is built per platform by hand.
+  A member taking dev builds waits for a link to a peer that has the pin:
+  with none (the authority unreachable, no member on it yet) it stays on
+  its build.
   → [fleet](architecture/daemon/fleet.md#versions); `build.rs` `stamp_build`, `fleet::update::decide`, `fleet::update::update`
-- A member waiting for its control plane's binary gives up only when the transfer
+- A member waiting for the pinned binary gives up only when the transfer
   hasn't started within 60 s (`PUSH_WAIT`) or fails; one that started and
   stalls while the link stays up waits until the link ends.
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::follow` `Incoming::watch`
-- A member that won't follow its control plane (dev build, failed update) drops
-  the link at each dial: a control plane that dialed it sees the reason as its
-  row's error (ssh's stderr tail), a control plane it dialed only sees the inbound
-  machine come and go (the reason is in the member's `machine ls` and
-  `serve.log`).
+- A member whose update to the pin fails drops the link at each dial: a
+  peer that dialed it sees the reason as its row's error (ssh's stderr
+  tail), a peer it dialed only sees the inbound machine come and go (the
+  reason is in the member's `machine ls` and `serve.log`).
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::dialer`, `commands::fleet_link::run_peer`
 - An inbound machine lasts while its link is up: when it goes (a
   laptop asleep, its network down) its rows and its forwards on this

@@ -310,11 +310,10 @@ one's while its neighbor is up.
   fleet root `fleet/<name>/` under the data dir). It reports through
   `Held`: `up` once the `Hello`s are through (the link's sentinel and
   the `Hello`s within `Timing::handshake`), `note` for a link up but serving
-  nothing yet (waiting for the control plane's build), and returns why it ended,
+  nothing yet (waiting for the fleet's pinned build), and returns why it ended,
   with ssh's stderr tail (where the far end's refusal is, such as a name
-  clash: [inbound neighbors](#inbound-neighbors) there). A control-plane machine on
-  another build is followed first, unless this host is the fleet's
-  authority ([fleet](fleet.md#versions)). An
+  clash: [inbound neighbors](#inbound-neighbors) there). The fleet's pinned build is followed first over the link, unless this
+  host is the fleet's authority or already on it ([fleet](fleet.md#versions)). An
   inbound machine's carrier is the `fleet-link --peer <name>` that
   announced it: no thread of its own (`service::carried`).
 - **The link.** Once the carrier is up (always, for an inbound machine)
@@ -932,11 +931,11 @@ once, `service::Handle::cycle_one`, so the far end's `fleet-link` runs
 the copy too). It prints `upgraded <name>: devsandbox <from> → <to>`
 (`update::Build::label`s), and a note when `<to>` is an older semver,
 whose daemon doesn't hand off. Links other machines hold to it keep
-their `fleet-link` until they redial. A machine that is neither the
-control plane nor the authority still follows the control plane's build
-([fleet](fleet.md#versions)), so upgrading it before the control plane is
-undone at its next link to the control plane: the control plane is
-upgraded first.
+their `fleet-link` until they redial. Every machine but the authority follows the fleet's pinned build
+([fleet](fleet.md#versions)), so an upgrade to anything but the pin is
+followed back to the pin at its next link to a peer that has it (the
+authority, or a member on the pin), a dev pin with `dev-builds` on, a
+published one always; the authority's own build is what gets pinned.
 
 `--machine` and qualified names refuse `machine` as a whole
 (`serve::machines::cli::machine_use`).

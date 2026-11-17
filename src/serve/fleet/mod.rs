@@ -56,8 +56,9 @@
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a member
-//!   follows its control plane's (download, install, forced handoff); `follow`: the
-//!   wait for a control plane's pushed dev build, and [`follow::Follow`].
+//!   follows the fleet's pinned build (download, push, checks, install,
+//!   forced handoff); `follow`: the wait for a pushed dev pin, and
+//!   [`follow::Follow`].
 //! - `code`: a config root and its repos moved onto a machine (the root as
 //!   a tar, each folder's branch as a git bundle from this host's repo
 //!   cache), and the receivers for them.

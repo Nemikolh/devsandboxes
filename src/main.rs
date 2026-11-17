@@ -399,7 +399,7 @@ enum Command {
     },
     /// Print the build this binary says in a fleet link's `Hello`
     /// (docs/architecture/daemon/fleet.md, *Versions*): what a member
-    /// checks the control plane's binary by
+    /// checks a received pinned binary by
     #[cfg(unix)]
     #[command(hide = true)]
     FleetHello,

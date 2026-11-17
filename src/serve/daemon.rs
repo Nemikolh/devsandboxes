@@ -649,17 +649,19 @@ fn member_path(opts: &Options) -> Result<PathBuf> {
     }
 }
 
-/// How this host follows a control plane's build (the ssh machines' links):
-/// [`Options::update_steps`], dev builds as `member` (`member.toml`) says
-/// at each `Hello`.
-fn follow_control_plane(dir: &Path, opts: &Options, member: PathBuf) -> fleet::follow::Follow {
+/// How this host follows the fleet's pinned build (the ssh machines'
+/// links): [`Options::update_steps`], dev builds as `member`
+/// (`member.toml`) says at each `Hello`, the kept builds next to it.
+fn follow_pin(dir: &Path, opts: &Options, member: PathBuf) -> fleet::follow::Follow {
     let steps = opts
         .update_steps
         .clone()
         .unwrap_or_else(|| Arc::new(fleet::update::Release { socket_dir: dir.to_path_buf() }));
+    let builds = fleet::update::builds_dir(member.parent().unwrap_or(Path::new(".")));
     fleet::follow::Follow {
         steps,
         dev_builds: Arc::new(move || fleet::member::load(&member).ok().flatten().is_some_and(|m| m.takes_dev_builds())),
+        builds,
     }
 }
 
@@ -678,7 +680,7 @@ fn machine_dialer(
 ) -> service::Hold {
     let member = member_path(opts);
     let data = member.as_ref().ok().and_then(|m| m.parent()).map(Path::to_path_buf);
-    let follow = follow_control_plane(dir, opts, member.as_ref().cloned().unwrap_or_default());
+    let follow = follow_pin(dir, opts, member.as_ref().cloned().unwrap_or_default());
     let hostname = link::hostname();
     let member_toml = member.as_ref().ok().cloned();
     let identity: Arc<dyn Fn() -> Result<fleet::proof::Identity> + Send + Sync> = {

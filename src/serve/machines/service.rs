@@ -323,7 +323,7 @@ impl Held<'_> {
     }
 
     /// The carrier is connected but serves nothing yet, with why (it
-    /// waits for the control plane's build): the machine shows `unreachable`, why.
+    /// waits for the fleet's pinned build): the machine shows `unreachable`, why.
     pub fn note(&self, why: String) {
         self.set(false, Some(why));
     }

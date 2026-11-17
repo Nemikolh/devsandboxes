@@ -345,7 +345,7 @@ impl Outlet {
     }
 
     /// End the live link from this end (a peer link's end that must follow
-    /// its control plane's build, `fleet::follow`): its body ends as when the peer's
+    /// the fleet's pinned build, `fleet::follow`): its body ends as when the peer's
     /// stream ends ([`opener_with`] returns `Ok`, [`answerer_with`]
     /// `End::Closed`), its socket unlinked. Nothing when no link is up.
     pub fn hang_up(&self) {

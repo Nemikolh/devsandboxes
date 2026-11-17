@@ -9,10 +9,9 @@ it, which carry every machine; what goes over a machine's link
 [placement](#placement), which scores it and which the control plane's `run` verb
 follows; the link's [`TRANSFER`](#transfer) streams, both ways, with
 [moving code](#moving-code) on them (a config root and its repos onto
-the machine a `run` is placed on); [versions](#versions): a member
-follows its control plane's build, a published one downloaded, a dev one received
-over `TRANSFER`
-([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md));
+the machine a `run` is placed on); [versions](#versions): every member but the authority
+follows the build the authority pins in the membership log, a published one
+downloaded, a dev one received over `TRANSFER` from a peer that has it;
 and the [member side](#member-side): `member.toml`, `member.*` with
 `devsandbox machine trust|roots|key`, the trust table and the worker
 policy that every remote caller goes through; and [member
@@ -237,14 +236,14 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `src/serve/verbs_client.rs` (`run_target`, `Streaming`),
 `src/serve/machines/cli.rs` (`plan`); versions:
 `src/serve/fleet/update.rs` (`HELLO`, `hello_of`, `hello_for`, `is_control_plane`,
-`control_plane_of`, `same_fleet`, `platform_of`, `Build`, `decide`, `Decision`, `control_plane_pushes`, `push`,
-`install_received`, `scratch_dir`, `release_target`, `asset_name`,
+`control_plane_of`, `same_fleet`, `platform_of`, `Build`, `decide`, `Decision`, `pushes`, `Source`, `push`,
+`install_received`, `lock_update`, `under_lock`, `scratch_dir`, `release_target`, `asset_name`,
 `release_url`, `SUMS`, `SUMS_SIG`, `RELEASE_KEY`,
 `verify_sums`, `sum_of`, `fetch_verified`, `curl_argv`, `update`,
 `Steps`, `Release`), `release-signing.pub`, `src/serve/fleet/follow.rs`
 (`Follow`, `Incoming`, `PUSH_WAIT`, `EndLink`, `shutting`),
-`src/commands/fleet_link.rs` (`follows`, `push_build`, `own_binary`),
-`src/serve/daemon.rs` (`follow_control_plane`, `Options::update_steps`),
+`src/commands/fleet_link.rs` (`Authority`, `pinned`, `push_build`, `own_binary`),
+`src/serve/daemon.rs` (`follow_pin`, `Options::update_steps`),
 `src/main.rs` (`Command::FleetHello`), `build.rs` (`stamp_build`),
 `src/serve/machines/install.rs` (`install_local`, `version_of`),
 `src/serve/proto.rs` (`HelloParams::force`), `src/serve/client.rs`
@@ -728,9 +727,9 @@ the peer's fleet root and, with a data dir, serves `mesh-bundle` pulls
 (`code::folders::receivers`, [Config versions](#approvals-and-pushes)),
 which the authority sends for its `run` aimed at that member's copy
 (`code::folders::bring`, `TRANSFER` streams over its link or a route,
-`code::LinkTransfer`). While an end waits for the control plane's build, its link's own
+`code::LinkTransfer`). While an end waits for the fleet's pinned build, its link's own
 `binary` receiver takes the one transfer instead (`update::BINARY_KIND`,
-at most `BINARY_LIMIT`, 256 MiB: the control plane's dev build,
+at most `BINARY_LIMIT`, 256 MiB: the pinned dev build,
 `follow::Incoming::receiver`, [Versions](#versions)).
 
 **Directions.** The opener's streams carry ids below 2^31, the
@@ -1428,7 +1427,7 @@ there only through the trust table.
   (`self` on the control plane, else the control plane's member name; absent is in no fleet:
   [Control-plane mode](#control-plane-mode)),
   `trust` (`worker` | `full`, absent is `worker`: [Trust](#trust)),
-  `dev-builds` (take a control plane's own binary when it runs a dev build,
+  `dev-builds` (take the fleet's pinned dev build from a peer that has it,
   [Versions](#versions); absent is `false`, left out of the file while
   `false`), `roots` (config roots this host shows the fleet besides
   those its `state.toml` has instances in, absolute; `devsandbox machine
@@ -1474,10 +1473,10 @@ there only through the trust table.
 
 ### Versions
 
-A member follows its control plane's exact build, an older one included
-([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)),
-on a [peer link](#peer-links), whichever end dialed (decision 25); the
-fleet's authority, like the control plane, follows no one:
+Every member but the fleet's authority runs the build the authority
+pinned in the [membership log](#membership-log) (the latest `build`
+entry, `membership::Pin`), on whichever [peer link](#peer-links) it
+can take it from; the authority follows no one:
 
 - **The build in the `Hello`.** A peer link's `hello` is
   `update::hello_of(control_plane, fleet, dev_builds)`: `fleet::update::HELLO`, `<semver> <git>
@@ -1530,69 +1529,89 @@ fleet's authority, like the control plane, follows no one:
   refused ``. One end in no fleet, or both, links.
   [Control-plane mode](#control-plane-mode)'s change of `control_plane` ends the links so both ends
   say the new one.
-- **Who follows** (`commands::fleet_link::follows`, pure, over both
-  `Hello`s and `commands::fleet_link::Authority`): the end that is neither the
-  control plane nor the authority follows a control-plane peer through
-  `update::decide`; two non-control-planes only need the frame protocol's match; a
-  control plane never follows, and neither does the authority, so upgrading the
-  authority first neither locks it out of an older control plane (`Stop` on a dev
-  build) nor downgrades it (`Download`, `Receive`); `devsandbox machine upgrade
-  <control-plane>` then copies the authority's build there over ssh
-  ([machines.md](machines.md#install)). Which ends are the authority
-  (`Authority::of`) is read off the newest log the end holds once the
-  [key proof](#key-proof) is through (`proof::Proven`'s `newer`, else the
-  identity's stored log): its authority key (`Membership::is_authority`)
-  against this end's keys (`proof::Identity::public_keys`, a pending
-  rotation's next key included) and the key the peer proved. The dialed end
-  runs it in `run_peer`'s `on_ready`, the dialer (`fleet::dialer`) in the
-  answerer's.
-- **The decision** (`update::decide`, pure, over this build and
-  platform, the control plane's, and whether this host takes dev builds:
-  `member.toml`'s `dev-builds`, or trust `full`
-  (`member::Member::takes_dev_builds`), read at each link's `Hello`s
-  through `follow::Follow::dev_builds`): the same semver, git and kind
-  is `Same`, and the link serves; another build that is published is
-  `Download { build }` where a release asset exists for this platform
+- **The pin of a link** (`commands::fleet_link::pinned`): the latest
+  `build` entry (`Membership::build`) of the newest log the end holds
+  once the [key proof](#key-proof) is through (`proof::Proven`'s
+  `newer`, else the identity's stored log), the same log `Authority::of`
+  reads which ends are the authority: its authority key
+  (`Membership::is_authority`) against this end's keys
+  (`proof::Identity::public_keys`, a pending rotation's next key
+  included) and the key the peer proved. The dialed end decides in
+  `run_peer`'s `on_ready`, the dialer (`fleet::dialer`) in the
+  answerer's; both ends decide, whichever dialed.
+- **The decision** (`update::decide`, pure, over this end's `Hello`,
+  whether it takes dev builds (`member.toml`'s `dev-builds`, or trust
+  `full`: `member::Member::takes_dev_builds`, read at each link's
+  `Hello`s through `follow::Follow::dev_builds`), the `Authority`, the
+  pin and the peer's `Hello`): the authority, or a log with no pin, is
+  `Same`. A published pin: a host running that release (published, that
+  semver) is `Same`; else one with no release asset for its platform
   (`update::platform_target`: `release_target` of the `<os>/<arch>`
-  word), else `Stop(why)`: `published build: no devsandbox release is
-  built for <our os>/<arch> (the control plane runs <control-plane build>)`, so a member
-  with no asset doesn't attempt a download that fails at every link;
-  another dev build is `Receive` when the
-  platforms are equal and dev builds are taken, else `Stop(why)`:
-  `dev build: can't run on <our os>/<arch> (the control plane runs <control-plane build>
-  for <its os>/<arch>)`, checked first since `dev-builds` can't help
-  there, else `` dev build: not taken (`dev-builds = true` in
-  member.toml or `devsandbox machine trust full` takes it; the control plane runs
-  <control-plane build>) ``. `Download` and `Stop` end the link before the first
-  stream; `Receive` keeps it up serving only the control plane's binary.
-- **The push**: the control plane's end, once the `Hello`s are through, pushes its
-  own binary when `update::control_plane_pushes` (over both `Hello`s: the member,
-  taking dev builds, would `Receive`; never to the authority, which waits for
-  no binary, so a push would land on an ordinary `TRANSFER`), from a thread of its own
+  word) is `Behind` (`published build: no devsandbox release is built
+  for <os>/<arch> (the fleet's build is <pin>)`), since the download
+  would fail the same way at every link; else `Download { semver,
+  sums_sha256 }`, only on a link whose peer runs that release or is the
+  authority, so one link starts it, not each. A dev pin: a host whose
+  binary's sha256 prefix (the `Hello`'s seventh word, `update::sha_of`)
+  is the pin's (`update::sha_word`) is `Same`, the build being its bytes
+  and its label only for display; else another platform than the pin's
+  is `Behind` (`dev build: can't run on <os>/<arch> (the fleet's build
+  is <pin>)`), checked first since `dev-builds` can't help there; else
+  dev builds not taken is `Behind` (`` dev build: not taken
+  (`dev-builds = true` in member.toml or `devsandbox machine trust full`
+  takes it; the fleet's build is <pin>) ``); else `Receive` when the peer
+  has the pin (its sha256 prefix is the pin's, or it is the authority,
+  which keeps a copy of every dev build it pinned), and `Same` otherwise:
+  the host waits for a link to a peer that has it.
+- **Behind**: the link is served as on `Same`, the host keeping its
+  build; why goes to the log (`fleet-link: behind: <why>` on `run_peer`'s
+  stderr, `machine <name>: behind: <why>` in `serve.log` on the dialer).
+  The links between hosts on different builds work by the frame
+  protocol's match alone, so what the update path itself rides on stays
+  compatible across versions, an exception to breaking the wire freely:
+  the frame `VERSION`, `sentinel_version`, the proof's hello and sync
+  messages, `Op` serde and the `TRANSFER` header.
+- **One update at a time** (`update::under_lock`): a `Download` or
+  `Receive` takes this host's update lock first (`update::lock_update`:
+  `update.lock` in the socket dir, `endpoint::update_lock_path`,
+  `flock`ed), held to the handoff; a link that finds it held serves as
+  `Same` and logs `an update is already under way`.
+- **The push** (`update::pushes`, pure, over the pin, both `Hello`s and
+  the `Authority`): an end pushes when it has the pin, its own binary
+  when its sha256 prefix is the pin's (`update::Source::Own`:
+  `commands::fleet_link::own_binary`), else the authority's kept copy
+  (`Source::Kept`: `<data>/fleet/.builds/<sha256 hex>`,
+  `follow::Follow::builds`), and the peer would `Receive` by the
+  decision over its own `Hello` (its dev builds as its eighth word says,
+  `update::takes_dev_builds`) and the mirrored `Authority`: the exact
+  mirror of the receiver's rule, so both ends agree from the `Hello`s
+  alone and no binary goes to a host that won't take it. Either end of
+  a link pushes, whichever dialed, from a thread of its own
   (`commands::fleet_link::push_build`): `update::push`, one `binary`
-  transfer named `devsandbox` through `fleet-<member>.sock`.
-  On a dialed control plane the binary is the `fleet-link` process's
-  (`own_binary`: `/proc/self/exe` on Linux, the inode it runs even if
-  the path was replaced since; `current_exe()` elsewhere), not the control plane
-  daemon's: it is the one that said the link's `Hello`, so the build the
-  member decided on. The control plane pushes rather than waiting to be asked: the
-  member's decision stands either way, since it refuses the header (no
-  body sent) unless it waits for a binary, and a member taking no dev
-  builds has ended the link before the push opens; no request kind or
-  round trip is needed.
-- **`Receive`**, the member's side: every stream but the `binary`
-  transfer is refused and a wait is set up (`follow::Incoming`: a
-  private scratch dir under the temp dir, `update::scratch_dir`). The
-  `binary` receiver takes one transfer while a wait is on (else `this
-  member isn't waiting for a binary`) into `<scratch>/devsandbox` (0600,
-  as every transfer lands), then ends the link. No transfer started
-  within `PUSH_WAIT` (60 s: `Incoming::watch`) or one that failed ends
-  it too, with why. With the link down, `update::install_received` over
-  `Follow::steps`: the file made 0755, its `fleet-hello` (`Steps::build`)
-  must report the control plane's `Hello` word for word (semver, git, kind,
-  platform: the first four), installed by `install::install_local` as a
-  download is, the installed binary's `fleet-hello` checked again, then
-  the forced handoff, below. The scratch dir is removed either way.
+  transfer named `devsandbox` through the link's `fleet-<peer>.sock`,
+  never over a route (a host waiting for the binary serves nothing
+  else, `ROUTE` included, so a routed push through waiting hosts would
+  deadlock). A host that took the pin then pushes it to its own
+  neighbours. On a dialed end the binary is the `fleet-link` process's
+  (`own_binary`: `/proc/self/exe` on Linux, the inode it runs even if the
+  path was replaced since; `current_exe()` elsewhere): the one that said
+  the link's `Hello`.
+- **`Receive`**, the follower's side: every stream but the `binary`
+  transfer is refused and a wait is set up (`follow::Incoming`, carrying
+  the pin: a private scratch dir under the temp dir,
+  `update::scratch_dir`). The `binary` receiver takes one transfer while
+  a wait is on (else `this member isn't waiting for a binary`) into
+  `<scratch>/devsandbox` (0600, as every transfer lands), then ends the
+  link. No transfer started within `PUSH_WAIT` (60 s: `Incoming::watch`)
+  or one that failed ends it too, with why. With the link down,
+  `update::install_received` over `Follow::steps`: the file's sha256 must
+  be the pin's, whole, before anything else (the transfer header's comes
+  from the sender), so bytes other than the pin's are never run; then
+  it is made 0755, its `fleet-hello` (`Steps::build`) must say the pin's
+  build (semver, git, `dev`, platform), it is installed by
+  `install::install_local` as a download is, the installed binary's
+  `fleet-hello` checked again, then the forced handoff, below. The
+  scratch dir is removed either way.
 - **`Download`**: `update::update` over `Follow::steps` (`update::Release`
   in production; `Options::update_steps` in tests): the asset
   `devsandbox-<v>-<target>.tar.gz` of release `v<v>` (`asset_name`, `release_url`:
@@ -1611,7 +1630,9 @@ fleet's authority, like the control plane, follows no one:
   downloaded first, the signature (raw ed25519, 64 bytes, over the
   file's bytes) verified strictly against `Steps::release_key`
   (`update::verify_sums`; in production `RELEASE_KEY`, the repo's
-  `release-signing.pub` parsed at build time by `parse_key`), then the
+  `release-signing.pub` parsed at build time by `parse_key`), the file's
+  sha256 checked against the pin's `sums_sha256` (`release v<v>'s
+  SHA256SUMS hashes to …, not the fleet's build's …`), then the
   asset's one line found by exact name (`update::sum_of`: `<sha256>
   <name>`, ` *<name>` too; none, several or a malformed line is an
   error); only then is the archive downloaded and its sha256 checked
@@ -1624,14 +1645,13 @@ fleet's authority, like the control plane, follows no one:
   secret, refused unless that key's public half is `release-signing.pub`,
   and verified against `release-signing.pub` before publishing. `update` refuses an `os`/`arch` with no release itself
   too, though `decide` never says `Download` there. Its
-  `fleet-hello` (`Steps::build`) must be the control plane's build, semver, git and
-  kind (`update::check_release`, the platform aside), so the new daemon's
-  hello is `Same` and an asset that isn't the control plane's build is never
-  installed (else every link would download it again); it is installed
+  `fleet-hello` (`Steps::build`) must be the pinned release, published
+  and that semver (`update::check_release`), so the new daemon is on the
+  pin (else every link would download it again); it is installed
   over `exe::devsandbox()` (refused while that path is gone) by
   `install::install_local`, `machines::install::INSTALL` run locally as
   `sh -c INSTALL sh <dest>` (temp file next to it, its own `--version`
-  check, rename); the installed binary must be the control plane's build too. The
+  check, rename); the installed binary must be the pinned release too. The
   scratch dir is removed either way. Then the handoff, below.
 - **The authority pins its build** (`machines::changes::sign_build`):
   the fleet's authority signs its daemon's own build into the
@@ -1673,22 +1693,22 @@ fleet's authority, like the control plane, follows no one:
   client's handoff starts it (`install::lazy_start` with
   `StartReason::Handoff`: the service manager's unit, rewritten to this
   path, when installed; else detached), and waits for the lock while the
-  old daemon drains ([role](role.md#version-handoff)). The new daemon's
-  hello matches the control plane's.
-- **On the dialed end** (`run_peer`): `Download` and `Stop` end the link
-  from `on_ready`, then `Download` installs and hands off; `Receive`
-  ends the link with `Outlet::hang_up` once the binary is in or the wait
-  is over, then `install_received`. Either way `fleet-link` then exits
-  with what happened (`updated to devsandbox <build>, handing off`, or
-  the failure), so the dialer redials and reaches the new binary.
+  old daemon drains ([role](role.md#version-handoff)). The new daemon is
+  on the pin.
+- **On the dialed end** (`run_peer`): `Download` ends the link from
+  `on_ready`, then installs and hands off; `Receive` ends the link with
+  `Outlet::hang_up` once the binary is in or the wait is over, then
+  `install_received`. Either way `fleet-link` then exits with what
+  happened (`updated to devsandbox <build>, handing off`, or the
+  failure), so the dialer redials and reaches the new binary.
 - **On the dialer** (`fleet::dialer`, its `Follow` from
-  `daemon::follow_control_plane`): `Download` and `Stop` refuse the link
-  (`End::Refused`), then `Download` kills the ssh, installs and hands
-  off; `Receive` ends the link once the binary is in or the wait is
-  over, then `install_received` and the handoff. The outcome (`updating
-  to <build>`, `updated to <build>: handing off`, `update to <build>
-  failed: <why>`) is the machine's `error` until the next attempt, after
-  the backoff, which decides again.
+  `daemon::follow_pin`): `Download` refuses the link (`End::Refused`),
+  then kills the ssh, installs and hands off; `Receive` ends the link
+  once the binary is in or the wait is over, then `install_received`
+  and the handoff. The outcome (`updating to <build>`, `updated to
+  <build>: handing off`, `update to <build> failed: <why>`) is the
+  machine's `error` until the next attempt, after the backoff, which
+  decides again.
 
 ### Member: `member.*`
 

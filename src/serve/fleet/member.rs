@@ -48,8 +48,8 @@ pub struct Member {
     pub control_plane: String,
     /// What a remote caller reaches here (`worker_policy::Trust`).
     pub trust: Trust,
-    /// Take the control plane's own binary when it runs an unpublished build
-    /// (`fleet::update::Decision::Receive`): code the control plane chooses, run
+    /// Take the fleet's pinned dev build from a peer that has it
+    /// (`fleet::update::Decision::Receive`): code the authority chooses, run
     /// outside a container. Edited by hand, as `[allow]` is; `full` implies
     /// it ([`Member::takes_dev_builds`]).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -176,7 +176,7 @@ impl Member {
         ControlPlane::of(&self.control_plane)
     }
 
-    /// Whether a control plane's dev build is taken (fleet plan, *Versions*:
+    /// Whether a pinned dev build is taken (fleet plan, *Versions*:
     /// `dev-builds`, or `full`).
     pub fn takes_dev_builds(&self) -> bool {
         self.dev_builds || self.trust == Trust::Full

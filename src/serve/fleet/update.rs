@@ -1,16 +1,20 @@
-//! A fleet worker follows its control plane's version (docs/architecture/daemon/fleet.md,
-//! *Versions*; ADR 0042); the fleet's authority, like the control plane, follows
-//! no one (`commands::fleet_link::follows`). Each end of the fleet link says its build in its
-//! `Hello` ([`HELLO`]: semver, git hash, `published` or `dev`, platform);
-//! the worker compares the control plane's with its own ([`decide`], pure) before it
-//! serves anything. A published control-plane build that differs (a downgrade
-//! included) is downloaded from the GitHub release and installed over this
-//! daemon's binary, which then takes over by a forced handoff ([`update`]
-//! over [`Steps`]); the release's `SHA256SUMS` must carry a signature by
-//! [`RELEASE_KEY`] and the archive's sha256 first (ADR 0047). A dev build that differs comes over the link instead:
-//! the control plane pushes its own binary ([`control_plane_pushes`], [`push`]) and a worker
-//! that takes dev builds for its platform installs it the same way
-//! ([`install_received`]); else it stops offering, saying why.
+//! Every member but the fleet's authority follows the build the authority
+//! pinned in the membership log (`membership::Pin`, the latest
+//! `Op::Build`; docs/architecture/daemon/fleet.md, *Versions*). Each end of
+//! a peer link says its build in its `Hello` ([`hello_of`]: [`HELLO`]'s
+//! semver, git hash, `published` or `dev` and platform, then its binary's
+//! sha256 prefix and whether it takes dev builds); each end compares
+//! itself with the pin ([`decide`], pure) before it serves anything. A
+//! published pin this host isn't on is downloaded from the GitHub release
+//! and installed over this daemon's binary, which then takes over by a
+//! forced handoff ([`update`] over [`Steps`]); the release's `SHA256SUMS`
+//! must hash to the pin's and carry a signature by [`RELEASE_KEY`], and the
+//! archive's sha256 must be its line (ADR 0047). A dev pin comes over a
+//! link instead, from a peer that has it ([`pushes`], [`push`]), and a
+//! host taking dev builds on the pin's platform installs it once its
+//! sha256 is the pin's ([`install_received`]); a host that can't or won't
+//! take the pin is behind ([`Decision::Behind`]) and keeps linking. One
+//! update at a time per host ([`lock_update`]).
 //!
 //! The steps are injectable ([`Steps`]): [`Release`] is production (curl,
 //! tar, `machines::install::INSTALL` run locally, the forced hello, the
@@ -24,7 +28,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
 
+use super::membership::Pin;
 use super::transfer;
+use crate::commands::fleet_link::Authority;
 use crate::serve::client::{self, Hello, StartReason};
 use crate::serve::endpoint;
 use crate::serve::machines::install;
@@ -116,21 +122,24 @@ pub const SHA_WORD: usize = 16;
 /// read: a `Hello`'s seventh word.
 pub fn own_sha_word() -> String {
     match own_sha256() {
-        Ok(sha) => hex::encode(sha)[..SHA_WORD].to_string(),
+        Ok(sha) => sha_word(&sha),
         Err(_) => "-".into(),
     }
 }
 
+/// A sha256 as a `Hello` says it: its first [`SHA_WORD`] hex digits.
+pub fn sha_word(sha256: &[u8; 32]) -> String {
+    hex::encode(sha256)[..SHA_WORD].to_string()
+}
+
 /// The sha256 prefix a peer link's `Hello` hash ([`hello_of`]) says its
 /// end's binary has: its seventh word; `None` for `-` or none.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn sha_of(hello: &str) -> Option<&str> {
     hello.split_whitespace().nth(6).filter(|w| *w != "-")
 }
 
 /// Whether a peer link's `Hello` hash ([`hello_of`]) says its end takes
 /// dev builds: its eighth word is `dev`. A `Hello` without one doesn't.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn takes_dev_builds(hello: &str) -> bool {
     hello.split_whitespace().nth(7) == Some("dev")
 }
@@ -171,7 +180,7 @@ fn build_words(hello: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 pub const PLATFORM: &str = env!("DEVSANDBOX_BUILD_PLATFORM");
 
-/// The transfer kind of a control plane's binary, and the most a member takes of it.
+/// The transfer kind of a pinned dev build's binary, and the most a member takes of it.
 pub const BINARY_KIND: &str = "binary";
 pub const BINARY_LIMIT: u64 = 256 << 20;
 
@@ -212,72 +221,172 @@ impl Build {
     }
 }
 
-/// What a member does about its control plane's build.
+/// What a host does about the fleet's pinned build on one peer link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// The same build: serve the link.
+    /// On the pin, nothing to follow, or nothing to do on this link: serve
+    /// it.
     Same,
-    /// The control plane runs published `build`, this worker another build: fetch
-    /// and install its release asset, then hand off (an older version too).
-    Download { build: Build },
-    /// The control plane runs a dev build this worker isn't, for this platform, and
-    /// this worker takes dev builds: take the binary the control plane pushes, install
-    /// it, then hand off.
+    /// The pin is release `semver`, whose `SHA256SUMS` hashes to
+    /// `sums_sha256`, and this host runs another build: fetch and install
+    /// its release asset ([`update`]), then hand off (an older version too).
+    Download { semver: String, sums_sha256: [u8; 32] },
+    /// The pin is a dev build this host isn't on, for this platform, this
+    /// host takes dev builds and the peer has the pin: take the binary it
+    /// pushes ([`pushes`]), install it ([`install_received`]), then hand off.
     Receive,
-    /// The control plane runs a build this worker can't or won't take (a dev build,
-    /// or a published one with no release asset for this platform): stop
-    /// offering, with why.
-    Stop(String),
+    /// This host can't or won't take the pin (another platform, no release
+    /// target, dev builds not taken): it keeps its build and the link is
+    /// served as [`Decision::Same`], with why.
+    Behind(String),
 }
 
-/// The worker follows the control plane's exact build (pure): semver, git hash and
-/// `published` all equal is the same build. Another dev build is taken
-/// only for this worker's platform and with `dev_builds` (`member.toml`'s
-/// `dev-builds`, or trust `full`: `fleet::member::Member::takes_dev_builds`);
-/// the platform is checked first, since `dev-builds` can't help there.
-/// Another published build is downloaded only where a release asset exists
-/// for `our_platform` ([`platform_target`]): else [`update`] would fail
-/// the same way at every link, so this stops offering instead.
-pub fn decide(ours: &Build, control_plane: &Build, our_platform: &str, control_plane_platform: &str, dev_builds: bool) -> Decision {
-    if ours == control_plane {
-        Decision::Same
-    } else if control_plane.published {
-        match platform_target(our_platform) {
-            Some(_) => Decision::Download { build: control_plane.clone() },
-            None => Decision::Stop(format!("published build: no devsandbox release is built for {our_platform} (the control plane runs {})", control_plane.label())),
+/// Whether a `Hello` hash says release `semver`: published, that semver.
+fn on_release(hello: &str, semver: &str) -> bool {
+    let build = Build::parse(hello);
+    build.published && build.semver == semver
+}
+
+/// What the end saying `ours` (a peer link `Hello`, [`hello_of`]) does
+/// about the fleet's `pin` on its link to the peer saying `theirs` (pure).
+/// The authority (`authority.ours`) follows no one, and with no pin there
+/// is nothing to follow: [`Decision::Same`].
+///
+/// - A published pin: on it when this host runs that release. Else, with
+///   no release asset for this platform ([`platform_target`]), behind
+///   ([`update`] would fail the same way at every link). Else
+///   [`Decision::Download`], but only on a link whose peer is on the pin
+///   or is the authority: one link starts the download, not each.
+/// - A dev pin: on it when this binary's sha256 prefix ([`sha_of`]) is the
+///   pin's (a build is its bytes; the label is for display). Else behind on
+///   another platform (checked first: `dev_builds` can't help there) or
+///   without `dev_builds` (`member.toml`'s `dev-builds`, or trust `full`:
+///   `fleet::member::Member::takes_dev_builds`). Else [`Decision::Receive`]
+///   when the peer has the pin (its sha256 prefix is the pin's, or it is
+///   the authority, which keeps a copy of what it pinned), else `Same`: a
+///   peer that has it pushes it ([`pushes`] is this rule's mirror).
+pub fn decide(ours: &str, dev_builds: bool, authority: Authority, pin: Option<&Pin>, theirs: &str) -> Decision {
+    let Some(pin) = pin.filter(|_| !authority.ours) else {
+        return Decision::Same;
+    };
+    let platform = platform_of(ours);
+    match pin {
+        Pin::Published { semver, sums_sha256 } => {
+            if on_release(ours, semver) {
+                Decision::Same
+            } else if platform_target(platform).is_none() {
+                Decision::Behind(format!("published build: no devsandbox release is built for {platform} (the fleet's build is {pin})"))
+            } else if authority.theirs || on_release(theirs, semver) {
+                Decision::Download { semver: semver.clone(), sums_sha256: *sums_sha256 }
+            } else {
+                Decision::Same
+            }
         }
-    } else if control_plane_platform != our_platform {
-        Decision::Stop(format!("dev build: can't run on {our_platform} (the control plane runs {} for {control_plane_platform})", control_plane.label()))
-    } else if !dev_builds {
-        Decision::Stop(format!(
-            "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the control plane runs {})",
-            control_plane.label()
-        ))
-    } else {
-        Decision::Receive
+        Pin::Dev { platform: pinned, sha256, .. } => {
+            let word = sha_word(sha256);
+            if sha_of(ours) == Some(word.as_str()) {
+                Decision::Same
+            } else if pinned != platform {
+                Decision::Behind(format!("dev build: can't run on {platform} (the fleet's build is {pin})"))
+            } else if !dev_builds {
+                Decision::Behind(format!(
+                    "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the fleet's build is {pin})"
+                ))
+            } else if authority.theirs || sha_of(theirs) == Some(word.as_str()) {
+                Decision::Receive
+            } else {
+                Decision::Same
+            }
+        }
     }
 }
 
-/// Whether a control plane saying `control_plane` pushes its binary to a worker saying `worker`
-/// (both `Hello` hashes): when that worker, taking dev builds, would
-/// [`Decision::Receive`] it. A worker with `dev-builds` off refuses the link
-/// before the push opens, so the control plane needn't know. Never to the
-/// fleet's authority (`worker_authority`): it follows no one, so it waits for
-/// no binary and the push would land on an ordinary `TRANSFER`.
-pub fn control_plane_pushes(control_plane: &str, worker: &str, worker_authority: bool) -> bool {
-    !worker_authority
-        && decide(&Build::parse(worker), &Build::parse(control_plane), platform_of(worker), platform_of(control_plane), true) == Decision::Receive
+/// Which binary an end pushes ([`pushes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Its own (`commands::fleet_link::own_binary`): it is on the pin.
+    Own,
+    /// The authority's kept copy of the pin, `<builds_dir>/<sha256 hex>`
+    /// ([`keep_build`]): the authority runs another build since.
+    Kept { sha256: [u8; 32] },
 }
 
-/// The control plane's end of a dev build's update: `binary` (this process's own) as
-/// one [`BINARY_KIND`] transfer, a `TRANSFER` stream through the link's
-/// socket at `socket` (`endpoint::fleet_socket`), named `devsandbox`.
+impl Source {
+    /// The file to push; `builds` is [`builds_dir`].
+    pub fn path(&self, builds: &Path) -> std::io::Result<PathBuf> {
+        match self {
+            Source::Own => crate::commands::fleet_link::own_binary(),
+            Source::Kept { sha256 } => Ok(builds.join(hex::encode(sha256))),
+        }
+    }
+}
+
+/// Whether the end saying `ours` pushes the fleet's dev `pin` to the peer
+/// saying `theirs` on their link, and which binary (pure): when this end has
+/// the pin (its sha256 prefix is the pin's: [`Source::Own`]; or it is the
+/// authority: [`Source::Kept`]) and the peer would [`Decision::Receive`] it
+/// by [`decide`] over its own `Hello` (its dev builds as its eighth word
+/// says, [`takes_dev_builds`]) and the mirrored `authority`. Both ends thus
+/// agree from the `Hello`s alone, and nothing is sent to a host that won't
+/// take it; a published pin is downloaded, never pushed.
+pub fn pushes(pin: Option<&Pin>, ours: &str, theirs: &str, authority: Authority) -> Option<Source> {
+    let Some(Pin::Dev { sha256, .. }) = pin else {
+        return None;
+    };
+    let source = if sha_of(ours) == Some(sha_word(sha256).as_str()) {
+        Source::Own
+    } else if authority.ours {
+        Source::Kept { sha256: *sha256 }
+    } else {
+        return None;
+    };
+    let mirrored = Authority { ours: authority.theirs, theirs: authority.ours };
+    (decide(theirs, takes_dev_builds(theirs), mirrored, pin, ours) == Decision::Receive).then_some(source)
+}
+
+/// The pushing end of a dev pin's update: `binary` as one [`BINARY_KIND`]
+/// transfer, a `TRANSFER` stream through the link's socket at `socket`
+/// (`endpoint::fleet_socket`), named `devsandbox`.
 pub fn push(socket: &Path, binary: &Path) -> Result<()> {
     let open = || std::fs::File::open(binary).with_context(|| format!("cannot read {}", binary.display()));
     let (size, sha256) = transfer::digest(open()?).with_context(|| format!("cannot read {}", binary.display()))?;
     let header = transfer::Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None, repo: None, refs: None };
     let stream = super::link::connect(socket, crate::devsbd::proto::channel::TRANSFER).with_context(|| format!("cannot connect to {}", socket.display()))?;
     transfer::send(stream, &header, open()?)
+}
+
+/// This host's update lock (`endpoint::update_lock_path` in the socket dir
+/// `dir`, `flock`ed): held from a link's [`Decision::Download`] or
+/// [`Decision::Receive`] to the handoff, so one update runs at a time
+/// whichever links decided one. `None` while another holds it.
+pub fn lock_update(dir: &Path) -> Result<Option<std::fs::File>> {
+    let path = endpoint::update_lock_path(dir);
+    let file = std::fs::File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("cannot lock {}", path.display())),
+    }
+}
+
+/// `decision` with this host's update lock ([`lock_update`]) when it is an
+/// update: the lock, to hold until the handoff; when another link holds it
+/// (or it can't be taken), [`Decision::Same`] and why, for the log.
+pub fn under_lock(decision: Decision, dir: &Path) -> (Decision, Option<std::fs::File>, Option<String>) {
+    if !matches!(decision, Decision::Download { .. } | Decision::Receive) {
+        return (decision, None, None);
+    }
+    match lock_update(dir) {
+        Ok(Some(lock)) => (decision, Some(lock), None),
+        Ok(None) => (Decision::Same, None, Some("an update is already under way".into())),
+        Err(e) => (Decision::Same, None, Some(format!("no update: {e:#}"))),
+    }
 }
 
 /// The release target of a host (`std::env::consts` `OS`, `ARCH`), as
@@ -305,7 +414,7 @@ pub fn asset_name(version: &str, target: &str) -> String {
 }
 
 /// `https://github.com/<REPO>/releases/download/v<v>/<file>`. `version`
-/// comes from the control plane: only a semver's characters go in the URL.
+/// comes from the fleet's pin: only a semver's characters go in the URL.
 pub fn release_url(version: &str, file: &str) -> Result<String> {
     let ok = !version.is_empty() && version.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b));
     if !ok {
@@ -411,46 +520,54 @@ pub trait Steps: Send + Sync {
     fn handoff(&self) -> Result<()>;
 }
 
-/// Install the control plane's published `control_plane` build over this daemon's binary and
-/// hand off to it: fetch its release asset for `os`/`arch` into a scratch
-/// dir under `scratch` ([`fetch_verified`]: signed checksums first), check
-/// that its `fleet-hello` is `control_plane` (semver, git
-/// and kind: a release asset that isn't the control plane's exact build would be
-/// downloaded again at every link), install it at [`Steps::dest`], check
-/// the installed binary is `control_plane` too, then [`Steps::handoff`]. The scratch
-/// dir is removed whatever happens. [`decide`] never says `Download` where
+/// Install pinned release `semver` over this daemon's binary and hand off
+/// to it: fetch its release asset for `os`/`arch` into a scratch dir under
+/// `scratch` ([`fetch_verified`]: checksums hashing to the pin's
+/// `sums_sha256` and signed first), check that its `fleet-hello` is that
+/// release (published, `semver`: else the new daemon would download it
+/// again at every link), install it at [`Steps::dest`], check the installed
+/// binary is that release too, then [`Steps::handoff`]. The scratch dir is
+/// removed whatever happens. [`decide`] never says `Download` where
 /// `os`/`arch` has no release; the check here stands in case it does.
-pub fn update(steps: &dyn Steps, control_plane: &Build, os: &str, arch: &str, scratch: &Path) -> Result<()> {
+pub fn update(steps: &dyn Steps, semver: &str, sums_sha256: &[u8; 32], os: &str, arch: &str, scratch: &Path) -> Result<()> {
     let target = release_target(os, arch).with_context(|| format!("no devsandbox release is built for {os}/{arch}"))?;
-    let name = asset_name(&control_plane.semver, target);
+    let name = asset_name(semver, target);
     let dir = scratch_dir(scratch)?;
     let installed = (|| {
-        let binary = fetch_verified(steps, &control_plane.semver, &name, &dir)?;
-        check_release(steps, &binary, control_plane, "the downloaded binary")?;
+        let binary = fetch_verified(steps, semver, sums_sha256, &name, &dir)?;
+        check_release(steps, &binary, semver, "the downloaded binary")?;
         let dest = steps.dest()?;
         steps.install(&binary, &dest)?;
-        check_release(steps, &dest, control_plane, "the installed binary")
+        check_release(steps, &dest, semver, "the installed binary")
     })();
     let _ = std::fs::remove_dir_all(&dir);
     installed?;
     steps.handoff().context("cannot hand this daemon off to it")
 }
 
-/// Install the control plane's dev build, received at `binary`, over this daemon's
-/// binary and hand off to it: make it executable, check that it reports
-/// `control_plane` (the control plane's `Hello` hash, every word), install it at
-/// [`Steps::dest`], check the installed binary reports `control_plane` too, then
-/// [`Steps::handoff`]. A peer link's control plane words in `control_plane` aren't part of the
-/// build (`fleet-hello` prints [`HELLO`]). Removing `binary`'s scratch dir
-/// is the caller's.
-pub fn install_received(steps: &dyn Steps, binary: &Path, control_plane: &str) -> Result<()> {
+/// Install the fleet's dev `pin`, received at `binary`, over this daemon's
+/// binary and hand off to it: its sha256 must be the pin's before anything
+/// else (a binary from a peer is never run otherwise), then it is made
+/// executable, its `fleet-hello` must say the pin's build (semver, git,
+/// `dev`, platform: [`HELLO`]'s four words), it is installed at
+/// [`Steps::dest`], the installed binary must say it too, then
+/// [`Steps::handoff`]. Removing `binary`'s scratch dir is the caller's.
+pub fn install_received(steps: &dyn Steps, binary: &Path, pin: &Pin) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let Pin::Dev { semver, git, platform, sha256 } = pin else {
+        bail!("the fleet's build is {pin}: a release is downloaded, not received");
+    };
+    let got = sha256_of(binary)?;
+    if got != *sha256 {
+        bail!("the received binary's sha256 is {}, not the fleet's build's {}", hex::encode(got), hex::encode(sha256));
+    }
     std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("cannot make {} executable", binary.display()))?;
-    check_build(steps, binary, control_plane, "the control plane's binary")?;
+    let want = format!("{semver} {git} dev {platform}");
+    check_build(steps, binary, &want, "the received binary")?;
     let dest = steps.dest()?;
     steps.install(binary, &dest)?;
-    check_build(steps, &dest, control_plane, "the installed binary")?;
+    check_build(steps, &dest, &want, "the installed binary")?;
     steps.handoff().context("cannot hand this daemon off to it")
 }
 
@@ -550,11 +667,17 @@ fn prune_builds(dir: &Path, keep: &str) {
 
 /// Release `version`'s asset `name`, unpacked in `dir`: [`SUMS`] and
 /// [`SUMS_SIG`] downloaded and the signature checked against
-/// [`Steps::release_key`] ([`fetch_sums`]), `name`'s line found
-/// ([`sum_of`]), only then the archive downloaded, its sha256 checked, and
-/// unpacked. No signature, no install: there is no unsigned path.
-fn fetch_verified(steps: &dyn Steps, version: &str, name: &str, dir: &Path) -> Result<PathBuf> {
+/// [`Steps::release_key`] ([`fetch_sums`]), [`SUMS`]'s sha256 checked
+/// against the pin's `sums_sha256`, `name`'s line found ([`sum_of`]), only
+/// then the archive downloaded, its sha256 checked, and unpacked. No
+/// signature, no install: there is no unsigned path.
+fn fetch_verified(steps: &dyn Steps, version: &str, sums_sha256: &[u8; 32], name: &str, dir: &Path) -> Result<PathBuf> {
+    use sha2::Digest;
     let sums = fetch_sums(steps, version, dir)?;
+    let got: [u8; 32] = sha2::Sha256::digest(&sums).into();
+    if got != *sums_sha256 {
+        bail!("release v{version}'s {SUMS} hashes to {}, not the fleet's build's {}", hex::encode(got), hex::encode(sums_sha256));
+    }
     let want = sum_of(&sums, name).with_context(|| format!("release v{version}'s checksums"))?;
     let archive = fetch(steps, version, name, dir)?;
     check_sum(&archive, name, &want)?;
@@ -569,13 +692,12 @@ fn check_build(steps: &dyn Steps, binary: &Path, want: &str, what: &str) -> Resu
     Ok(())
 }
 
-/// `binary`'s `fleet-hello` is the build `want` (its platform aside: the
-/// asset is this host's, the control plane's may be another).
-fn check_release(steps: &dyn Steps, binary: &Path, want: &Build, what: &str) -> Result<()> {
+/// `binary`'s `fleet-hello` is release `semver`: published, that semver
+/// (its platform this host's; the pin binds every platform's asset).
+fn check_release(steps: &dyn Steps, binary: &Path, semver: &str, what: &str) -> Result<()> {
     let got = steps.build(binary).with_context(|| format!("{what} ({}) doesn't run", binary.display()))?;
-    let got = Build::parse(&got);
-    if got != *want {
-        bail!("{what} ({}) is devsandbox {}, not the control plane's {}", binary.display(), got.label(), want.label());
+    if !on_release(&got, semver) {
+        bail!("{what} ({}) is devsandbox {}, not the fleet's release {semver}", binary.display(), Build::parse(&got).label());
     }
     Ok(())
 }
@@ -825,77 +947,158 @@ pub(crate) mod tests {
         assert_eq!(same_fleet("box", k, HELLO), Ok(()), "a hello without the words");
     }
 
-    #[test]
-    fn the_worker_follows_its_control_plane_exactly() {
-        let (lx, mac) = ("linux/x86_64", "macos/aarch64");
-        let d = |ours: &Build, control_plane: &Build| decide(ours, control_plane, lx, lx, false);
-        let ours = build("0.8.0", "aaaa", true);
-        assert_eq!(d(&ours, &ours.clone()), Decision::Same);
-        assert_eq!(decide(&ours, &ours.clone(), lx, mac, false), Decision::Same, "one release, many platforms");
-        let newer = build("0.9.0", "bbbb", true);
-        assert_eq!(d(&ours, &newer), Decision::Download { build: newer.clone() });
-        assert_eq!(decide(&ours, &newer, lx, mac, false), Decision::Download { build: newer.clone() }, "each its asset");
-        let older = build("0.7.0", "cccc", true);
-        assert_eq!(d(&ours, &older), Decision::Download { build: older.clone() }, "a downgrade too");
-        // A dev worker of a published control plane takes the release, same semver or not.
-        let dev = build("0.8.0", "dddd", false);
-        assert_eq!(d(&dev, &ours), Decision::Download { build: ours.clone() });
-        // A published worker of a published control plane of the same semver but another
-        // commit (a moved tag): that release, not a `Same`.
-        assert_eq!(d(&ours, &build("0.8.0", "ffff", true)), Decision::Download { build: build("0.8.0", "ffff", true) });
-        assert_eq!(d(&dev, &dev.clone()), Decision::Same);
-        assert_eq!(decide(&dev, &dev.clone(), lx, mac, false), Decision::Same);
+    const LX: &str = "linux/x86_64";
+
+    /// A peer link `Hello` of `build` (`<semver> <git> <kind>`) on
+    /// `platform`, its binary's sha256 prefix `sha` and dev builds `dev`.
+    fn hello(build: &str, platform: &str, sha: &str, dev: bool) -> String {
+        format!("{build} {platform} member k {sha} {}", if dev { "dev" } else { "nodev" })
     }
 
+    fn dev_pin(h: u8) -> Pin {
+        Pin::Dev { semver: "0.8.0".into(), git: "dddd".into(), platform: LX.into(), sha256: [h; 32] }
+    }
+
+    fn published_pin(semver: &str) -> Pin {
+        Pin::Published { semver: semver.into(), sums_sha256: [5; 32] }
+    }
+
+    const MEMBER: Authority = Authority { ours: false, theirs: false };
+    const TO_AUTHORITY: Authority = Authority { ours: false, theirs: true };
+    const AUTHORITY: Authority = Authority { ours: true, theirs: false };
+
     #[test]
-    fn a_published_control_plane_build_needs_a_release_for_our_platform() {
-        let ours = build("0.8.0", "aaaa", true);
-        let newer = build("0.9.0", "bbbb", true);
-        for platform in ["linux/x86_64", "linux/aarch64", "macos/aarch64"] {
-            assert_eq!(decide(&ours, &newer, platform, "linux/x86_64", false), Decision::Download { build: newer.clone() }, "{platform}");
+    fn the_authority_and_a_fleet_without_a_pin_follow_nothing() {
+        let ours = hello("0.1.0 aaaa dev", LX, "1111111111111111", true);
+        let peer = hello("0.9.0 bbbb dev", LX, &sha_word(&[7; 32]), true);
+        let elsewhere = Pin::Dev { semver: "0.8.0".into(), git: "dddd".into(), platform: "other/os".into(), sha256: [7; 32] };
+        for pin in [dev_pin(7), published_pin("0.9.0"), elsewhere] {
+            for dev in [false, true] {
+                assert_eq!(decide(&ours, dev, AUTHORITY, Some(&pin), &peer), Decision::Same, "{pin}, dev builds {dev}");
+            }
         }
-        assert_eq!(
-            decide(&ours, &newer, "macos/x86_64", "macos/aarch64", true),
-            Decision::Stop("published build: no devsandbox release is built for macos/x86_64 (the control plane runs 0.9.0 (published, bbbb))".into())
-        );
-        assert!(matches!(decide(&ours, &newer, "unknown", "linux/x86_64", true), Decision::Stop(_)), "no platform word");
-        assert_eq!(decide(&ours, &ours.clone(), "macos/x86_64", "linux/x86_64", false), Decision::Same, "the same build needs none");
-        assert!(!control_plane_pushes("0.9.0 bbbb published linux/x86_64", "0.8.0 aaaa published macos/x86_64", false), "nothing to push");
-        assert_eq!(platform_target("linux/aarch64"), Some("aarch64-unknown-linux-musl"));
-        assert_eq!((platform_target("macos/x86_64"), platform_target("unknown"), platform_target("")), (None, None, None));
+        assert_eq!(decide(&ours, true, MEMBER, None, &peer), Decision::Same, "no pin");
+        assert_eq!(decide(&ours, true, TO_AUTHORITY, None, &peer), Decision::Same, "no pin, the authority's peer");
     }
 
     #[test]
-    fn a_dev_control_plane_build_needs_the_platform_then_dev_builds() {
-        let (lx, mac) = ("linux/x86_64", "macos/aarch64");
-        let ours = build("0.8.0", "aaaa", true);
-        let dev = build("0.8.0", "dddd", false);
-        assert_eq!(decide(&ours, &dev, lx, lx, true), Decision::Receive);
-        assert_eq!(decide(&build("0.8.0", "eeee", false), &dev, lx, lx, true), Decision::Receive, "another dev build");
-        assert_eq!(
-            decide(&ours, &dev, lx, lx, false),
-            Decision::Stop(
-                "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the control plane runs 0.8.0 (dev, dddd))"
-                    .into()
-            )
-        );
-        let mismatch = Decision::Stop("dev build: can't run on linux/x86_64 (the control plane runs 0.8.0 (dev, dddd) for macos/aarch64)".into());
-        assert_eq!(decide(&ours, &dev, lx, mac, true), mismatch);
-        assert_eq!(decide(&ours, &dev, lx, mac, false), mismatch, "the platform first: dev-builds can't help");
-        assert!(matches!(decide(&ours, &dev, lx, "unknown", true), Decision::Stop(_)), "no platform word");
+    fn a_published_pin_is_downloaded_from_a_link_to_a_peer_on_it() {
+        let pin = published_pin("0.9.0");
+        let sums = [5; 32];
+        let download = Decision::Download { semver: "0.9.0".into(), sums_sha256: sums };
+        let on_it = hello("0.9.0 aaaa published", "macos/aarch64", "-", false);
+        let off_it = hello("0.8.0 aaaa published", LX, "-", false);
+        // On it: this host runs that release, whatever its platform or commit.
+        assert_eq!(decide(&hello("0.9.0 ffff published", LX, "-", false), false, MEMBER, Some(&pin), &off_it), Decision::Same);
+        // Not on it: a dev build of the same semver, another release, an older one.
+        for ours in ["0.9.0 aaaa dev", "0.8.0 aaaa published", "1.0.0 aaaa published"] {
+            let ours = hello(ours, LX, "-", false);
+            assert_eq!(decide(&ours, false, MEMBER, Some(&pin), &on_it), download, "{ours}: from a peer on it");
+            assert_eq!(decide(&ours, false, TO_AUTHORITY, Some(&pin), &off_it), download, "{ours}: from the authority");
+            assert_eq!(decide(&ours, false, MEMBER, Some(&pin), &off_it), Decision::Same, "{ours}: not this link");
+            assert_eq!(decide(&ours, false, MEMBER, Some(&pin), &hello("0.9.0 aaaa dev", LX, "-", false)), Decision::Same, "a dev 0.9.0 isn't on it");
+        }
+        // No release for this platform: behind, on any link.
+        let ours = hello("0.8.0 aaaa published", "macos/x86_64", "-", false);
+        let behind = Decision::Behind(format!("published build: no devsandbox release is built for macos/x86_64 (the fleet's build is {pin})"));
+        assert_eq!(decide(&ours, true, TO_AUTHORITY, Some(&pin), &on_it), behind);
+        assert!(matches!(decide("0.8.0 aaaa published", true, MEMBER, Some(&pin), &on_it), Decision::Behind(_)), "no platform word");
+        assert_eq!(decide(&hello("0.9.0 aaaa published", "macos/x86_64", "-", false), true, MEMBER, Some(&pin), &on_it), Decision::Same, "on it needs none");
     }
 
     #[test]
-    fn the_control_plane_pushes_to_a_worker_that_would_receive() {
-        let control_plane = "0.8.0 dddd dev linux/x86_64";
-        assert!(control_plane_pushes(control_plane, "0.8.0 aaaa published linux/x86_64", false));
-        assert!(control_plane_pushes(control_plane, "0.7.0 eeee dev linux/x86_64", false));
-        assert!(!control_plane_pushes(control_plane, control_plane, false), "the same build");
-        assert!(!control_plane_pushes(control_plane, "0.8.0 aaaa published macos/aarch64", false), "another platform");
-        assert!(!control_plane_pushes("0.8.0 dddd published linux/x86_64", "0.7.0 eeee dev linux/x86_64", false), "a release is downloaded");
-        // The authority follows no one: nothing is pushed to it, older or newer.
-        assert!(!control_plane_pushes(control_plane, "0.7.0 eeee dev linux/x86_64", true), "an older authority");
-        assert!(!control_plane_pushes(control_plane, "0.9.0 ffff dev linux/x86_64", true), "a newer authority");
+    fn a_dev_pin_is_received_from_a_peer_that_has_it() {
+        let pin = dev_pin(7);
+        let has = sha_word(&[7; 32]);
+        let ours = hello("0.8.0 dddd dev", LX, "1111111111111111", true);
+        let peer_on_it = hello("0.8.0 dddd dev", "macos/aarch64", &has, false);
+        let peer_off_it = hello("0.8.0 dddd dev", LX, "2222222222222222", true);
+        // On it: the bytes, not the label.
+        assert_eq!(decide(&hello("0.1.0 x published", LX, &has, false), false, MEMBER, Some(&pin), &peer_off_it), Decision::Same);
+        assert_eq!(decide(&ours, true, MEMBER, Some(&pin), &peer_on_it), Decision::Receive, "the same label, other bytes");
+        assert_eq!(decide(&ours, true, TO_AUTHORITY, Some(&pin), &peer_off_it), Decision::Receive, "the authority keeps a copy");
+        assert_eq!(decide(&ours, true, MEMBER, Some(&pin), &peer_off_it), Decision::Same, "a peer without it: wait for one that has it");
+        assert_eq!(decide(&ours, true, MEMBER, Some(&pin), "0.8.0 dddd dev linux/x86_64"), Decision::Same, "a hello without the words");
+        // Dev builds not taken: behind, saying how to opt in.
+        let not_taken = format!(
+            "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the fleet's build is {pin})"
+        );
+        assert_eq!(decide(&ours, false, TO_AUTHORITY, Some(&pin), &peer_on_it), Decision::Behind(not_taken));
+        // Another platform: behind, checked first.
+        let mac = hello("0.8.0 dddd dev", "macos/aarch64", "1111111111111111", true);
+        let elsewhere = Decision::Behind(format!("dev build: can't run on macos/aarch64 (the fleet's build is {pin})"));
+        assert_eq!(decide(&mac, true, TO_AUTHORITY, Some(&pin), &peer_on_it), elsewhere);
+        assert_eq!(decide(&mac, false, TO_AUTHORITY, Some(&pin), &peer_on_it), elsewhere, "dev-builds can't help");
+        assert!(matches!(decide("0.8.0 dddd dev", true, MEMBER, Some(&pin), &peer_on_it), Decision::Behind(_)), "no platform word");
+    }
+
+    /// The end that has the pin pushes it exactly when the other would
+    /// receive it: both from the `Hello`s alone.
+    #[test]
+    fn a_peer_that_has_the_pin_pushes_it_to_one_that_would_receive_it() {
+        let pin = dev_pin(7);
+        let has = sha_word(&[7; 32]);
+        let on_it = hello("0.8.0 dddd dev", LX, &has, false);
+        let taker = hello("0.7.0 eeee dev", LX, "1111111111111111", true);
+        assert_eq!(pushes(Some(&pin), &on_it, &taker, MEMBER), Some(Source::Own));
+        assert_eq!(pushes(Some(&pin), &taker, &on_it, MEMBER), None, "the other way");
+        assert_eq!(pushes(Some(&pin), &on_it, &hello("0.7.0 eeee dev", LX, "1111111111111111", false), MEMBER), None, "takes no dev builds");
+        assert_eq!(pushes(Some(&pin), &on_it, &hello("0.7.0 eeee dev", "macos/aarch64", "1111111111111111", true), MEMBER), None, "another platform");
+        assert_eq!(pushes(Some(&pin), &on_it, &hello("0.8.0 dddd dev", LX, &has, true), MEMBER), None, "on it already");
+        assert_eq!(pushes(Some(&pin), &on_it, &taker, TO_AUTHORITY), None, "never to the authority");
+        // The authority on another build since: its kept copy.
+        let moved_on = hello("0.9.0 ffff dev", LX, "3333333333333333", false);
+        assert_eq!(pushes(Some(&pin), &moved_on, &taker, AUTHORITY), Some(Source::Kept { sha256: [7; 32] }));
+        assert_eq!(pushes(Some(&pin), &on_it, &taker, AUTHORITY), Some(Source::Own), "on it: its own");
+        assert_eq!(pushes(Some(&pin), &moved_on, &taker, MEMBER), None, "a member off the pin has nothing to push");
+        assert_eq!(pushes(Some(&published_pin("0.9.0")), &on_it, &taker, MEMBER), None, "a release is downloaded");
+        assert_eq!(pushes(None, &on_it, &taker, MEMBER), None);
+        let dir = Path::new("/kept");
+        assert_eq!(Source::Kept { sha256: [7; 32] }.path(dir).unwrap(), dir.join(hex::encode([7; 32])));
+        assert_eq!(Source::Own.path(dir).unwrap(), crate::commands::fleet_link::own_binary().unwrap());
+
+        // Symmetry: every pair of hellos, every authority, both pins.
+        let shas = ["1111111111111111".to_string(), has.clone(), "-".into()];
+        let mut hellos = Vec::new();
+        for build in ["0.8.0 dddd dev", "0.9.0 aaaa published"] {
+            for platform in [LX, "macos/aarch64"] {
+                for sha in &shas {
+                    for dev in [false, true] {
+                        hellos.push(hello(build, platform, sha, dev));
+                    }
+                }
+            }
+        }
+        let flip = |a: Authority| Authority { ours: a.theirs, theirs: a.ours };
+        for pin in [dev_pin(7), published_pin("0.9.0")] {
+            for a in [MEMBER, TO_AUTHORITY, AUTHORITY] {
+                for x in &hellos {
+                    for y in &hellos {
+                        let receives = decide(y, takes_dev_builds(y), flip(a), Some(&pin), x) == Decision::Receive;
+                        assert_eq!(pushes(Some(&pin), x, y, a).is_some(), receives, "{pin} {a:?}: {x} → {y}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_update_at_a_time() {
+        let dir = scratch("lock");
+        let first = lock_update(&dir).unwrap().expect("free");
+        assert!(lock_update(&dir).unwrap().is_none(), "held");
+        let (d, lock, why) = under_lock(Decision::Receive, &dir);
+        assert_eq!((d, lock.is_none(), why.as_deref()), (Decision::Same, true, Some("an update is already under way")));
+        let (d, lock, why) = under_lock(Decision::Behind("x".into()), &dir);
+        assert_eq!((d, lock.is_none(), why), (Decision::Behind("x".into()), true, None), "no update, no lock");
+        drop(first);
+        let (d, lock, why) = under_lock(Decision::Receive, &dir);
+        assert_eq!((d, lock.is_some(), why), (Decision::Receive, true, None));
+        assert!(lock_update(&dir).unwrap().is_none(), "held until dropped");
+        drop(lock);
+        let download = Decision::Download { semver: "0.9.0".into(), sums_sha256: [0; 32] };
+        assert!(under_lock(download, &dir).1.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -964,7 +1167,7 @@ pub(crate) mod tests {
 
     /// A release's honest [`SUMS`] for `version`: every target's archive
     /// is [`ARCHIVE`].
-    fn honest_sums(version: &str) -> Vec<u8> {
+    pub(crate) fn honest_sums(version: &str) -> Vec<u8> {
         let sum = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ARCHIVE));
         let targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"];
         targets.iter().map(|t| format!("{sum}  {}\n", asset_name(version, t))).collect::<String>().into_bytes()
@@ -1070,19 +1273,24 @@ pub(crate) mod tests {
         std::fs::read_dir(dir).unwrap().next().is_none()
     }
 
-    /// The control plane's published 0.7.0, and what its release asset for this
-    /// host's platform says.
-    fn control_plane() -> Build {
-        build("0.7.0", "aaaa", true)
+    /// The sha256 of [`honest_sums`] of `version`: what its pin says.
+    pub(crate) fn sums_sha256(version: &str) -> [u8; 32] {
+        <sha2::Sha256 as sha2::Digest>::digest(honest_sums(version)).into()
     }
+
+    /// [`update`] to the pinned release 0.7.0.
+    fn update_to(fake: &Fake, os: &str, arch: &str, dir: &Path) -> Result<()> {
+        update(fake, "0.7.0", &sums_sha256("0.7.0"), os, arch, dir)
+    }
+
+    /// What release 0.7.0's asset for this host's platform says.
     const ASSET: &str = "0.7.0 aaaa published linux/x86_64";
 
     #[test]
     fn an_update_installs_checks_and_hands_off() {
         let dir = scratch("ok");
-        // The control plane on another platform: the asset says this one.
         let fake = Fake::building(ASSET);
-        update(&fake, &Build::parse("0.7.0 aaaa published macos/aarch64 control_plane k"), "linux", "x86_64", &dir).unwrap();
+        update_to(&fake, "linux", "x86_64", &dir).unwrap();
         let base = "https://github.com/Nemikolh/devsandboxes/releases/download/v0.7.0";
         let asset = "devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz";
         assert_eq!(
@@ -1106,7 +1314,7 @@ pub(crate) mod tests {
     fn a_failed_download_installs_nothing() {
         let dir = scratch("fetch");
         let fake = Fake { fail: Some("fetch"), ..Fake::building(ASSET) };
-        let err = update(&fake, &control_plane(), "linux", "aarch64", &dir).unwrap_err();
+        let err = update_to(&fake, "linux", "aarch64", &dir).unwrap_err();
         assert!(format!("{err:#}").starts_with("cannot download https://github.com/"), "{err:#}");
         assert!(format!("{err:#}").ends_with("/SHA256SUMS: fetch broke"), "{err:#}");
         assert_eq!(fake.calls().len(), 1);
@@ -1124,16 +1332,30 @@ pub(crate) mod tests {
         ];
         for (tamper, want, fetches) in cases {
             let fake = Fake { tamper: Some(tamper), ..Fake::building(ASSET) };
-            let err = update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err();
+            let err = update_to(&fake, "linux", "x86_64", &dir).unwrap_err();
             assert_eq!(format!("{err:#}"), want, "{tamper}");
             assert_eq!(fake.calls().len(), fetches, "{tamper}: the archive isn't even downloaded: {:?}", fake.calls());
             assert!(empty(&dir));
         }
         let fake = Fake { tamper: Some("archive"), ..Fake::building(ASSET) };
-        let err = format!("{:#}", update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err());
+        let err = format!("{:#}", update_to(&fake, "linux", "x86_64", &dir).unwrap_err());
         assert!(err.starts_with("devsandbox-0.7.0-x86_64-unknown-linux-musl.tar.gz's sha256 is "), "{err}");
         assert!(err.contains(", not SHA256SUMS's "), "{err}");
         assert!(!fake.calls().iter().any(|c| c.starts_with("unpack")), "{:?}", fake.calls());
+        assert!(empty(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Signed checksums that aren't the ones the fleet pinned (another
+    /// build of that release, re-signed): refused before the archive.
+    #[test]
+    fn sums_other_than_the_pins_are_refused() {
+        let dir = scratch("pinned-sums");
+        let fake = Fake::building(ASSET);
+        let err = format!("{:#}", update(&fake, "0.7.0", &[9; 32], "linux", "x86_64", &dir).unwrap_err());
+        let got = hex::encode(sums_sha256("0.7.0"));
+        assert_eq!(err, format!("release v0.7.0's SHA256SUMS hashes to {got}, not the fleet's build's {}", hex::encode([9; 32])));
+        assert_eq!(fake.calls().len(), 2, "the archive isn't even downloaded: {:?}", fake.calls());
         assert!(empty(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1207,68 +1429,76 @@ pub(crate) mod tests {
     #[test]
     fn a_wrong_build_is_a_failure_and_no_handoff() {
         let dir = scratch("version");
-        // The asset isn't the control plane's build: never installed, whichever word differs.
-        for asset in ["0.6.9 aaaa published linux/x86_64", "0.7.0 bbbb published linux/x86_64", "0.7.0 aaaa dev linux/x86_64"] {
+        // The asset isn't the pinned release: never installed.
+        for asset in ["0.6.9 aaaa published linux/x86_64", "0.7.0 aaaa dev linux/x86_64"] {
             let fake = Fake::building(asset);
-            let err = format!("{:#}", update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err());
-            assert!(err.ends_with("not the control plane's 0.7.0 (published, aaaa)"), "{err}");
+            let err = format!("{:#}", update_to(&fake, "linux", "x86_64", &dir).unwrap_err());
+            assert!(err.ends_with("not the fleet's release 0.7.0"), "{err}");
             assert!(err.starts_with("the downloaded binary ("), "{err}");
             assert!(!fake.calls().iter().any(|c| c.starts_with("install")), "{asset}");
         }
         // The installed binary isn't (dest resolved elsewhere): no handoff.
         let fake = Fake { installed_build: "0.8.0 cccc published linux/x86_64".into(), ..Fake::building(ASSET) };
-        let err = update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err();
+        let err = update_to(&fake, "linux", "x86_64", &dir).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
-            "the installed binary (/dest/devsandbox) is devsandbox 0.8.0 (published, cccc), not the control plane's 0.7.0 (published, aaaa)"
+            "the installed binary (/dest/devsandbox) is devsandbox 0.8.0 (published, cccc), not the fleet's release 0.7.0"
         );
         assert!(!fake.calls().iter().any(|c| c.starts_with("handoff")));
         // One that doesn't run.
         let fake = Fake { fail: Some("build"), ..Fake::building(ASSET) };
-        let err = format!("{:#}", update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err());
+        let err = format!("{:#}", update_to(&fake, "linux", "x86_64", &dir).unwrap_err());
         assert!(err.starts_with("the downloaded binary (") && err.ends_with("doesn't run: build broke"), "{err}");
         // A failed handoff says so.
         let fake = Fake { fail: Some("handoff"), ..Fake::building(ASSET) };
-        let err = update(&fake, &control_plane(), "linux", "x86_64", &dir).unwrap_err();
+        let err = update_to(&fake, "linux", "x86_64", &dir).unwrap_err();
         assert_eq!(format!("{err:#}"), "cannot hand this daemon off to it: handoff broke");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_received_build_is_made_executable_checked_installed_and_handed_off_to() {
+    fn a_received_build_is_hashed_then_made_executable_checked_installed_and_handed_off_to() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("received");
         let binary = dir.join("devsandbox");
-        let received = || {
-            std::fs::write(&binary, "new").unwrap();
+        let received = |bytes: &str| {
+            std::fs::write(&binary, bytes).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
         };
-        let control_plane = "0.8.0 dddd dev linux/x86_64";
-        received();
-        let fake = Fake::building(control_plane);
-        install_received(&fake, &binary, control_plane).unwrap();
-        assert_eq!(std::fs::metadata(&binary).unwrap().permissions().mode() & 0o777, 0o755);
+        let mode = || std::fs::metadata(&binary).unwrap().permissions().mode() & 0o777;
+        let pin = Pin::Dev { semver: "0.8.0".into(), git: "dddd".into(), platform: LX.into(), sha256: <sha2::Sha256 as sha2::Digest>::digest(b"new").into() };
+        let says = "0.8.0 dddd dev linux/x86_64";
+        received("new");
+        let fake = Fake::building(says);
+        install_received(&fake, &binary, &pin).unwrap();
+        assert_eq!(mode(), 0o755);
         assert_eq!(fake.calls(), ["build received", "install /dest/devsandbox", "build dest", "handoff "]);
-        // A peer link's control plane said its control-plane flag too: not part of the build.
-        received();
-        let fake = Fake::building(control_plane);
-        install_received(&fake, &binary, &format!("{control_plane} control plane")).unwrap();
-        assert_eq!(fake.calls().len(), 4);
-        // Not the control plane's build: never installed.
-        received();
-        let fake = Fake { received_build: "0.8.0 eeee dev linux/x86_64".into(), ..Fake::building(control_plane) };
-        let err = format!("{:#}", install_received(&fake, &binary, control_plane).unwrap_err());
+        // Other bytes than the pin's: refused before anything runs, not even made executable.
+        received("evil");
+        let fake = Fake::building(says);
+        let err = format!("{:#}", install_received(&fake, &binary, &pin).unwrap_err());
+        assert!(err.starts_with("the received binary's sha256 is ") && err.contains(", not the fleet's build's "), "{err}");
+        assert!(fake.calls().is_empty(), "never run: {:?}", fake.calls());
+        assert_eq!(mode(), 0o600);
+        // The pin's bytes saying another build: never installed.
+        received("new");
+        let fake = Fake { received_build: "0.8.0 eeee dev linux/x86_64".into(), ..Fake::building(says) };
+        let err = format!("{:#}", install_received(&fake, &binary, &pin).unwrap_err());
         assert!(err.contains("reports \"0.8.0 eeee dev linux/x86_64\", not \"0.8.0 dddd dev linux/x86_64\""), "{err}");
         assert_eq!(fake.calls(), ["build received"]);
         // One that doesn't run.
-        let fake = Fake { fail: Some("build"), ..Fake::building(control_plane) };
-        let err = format!("{:#}", install_received(&fake, &binary, control_plane).unwrap_err());
-        assert!(err.starts_with("the control plane's binary (") && err.ends_with("doesn't run: build broke"), "{err}");
+        let fake = Fake { fail: Some("build"), ..Fake::building(says) };
+        let err = format!("{:#}", install_received(&fake, &binary, &pin).unwrap_err());
+        assert!(err.starts_with("the received binary (") && err.ends_with("doesn't run: build broke"), "{err}");
         // The installed one isn't it: no handoff.
-        let fake = Fake { installed_build: "0.8.0 dddd dev".into(), ..Fake::building(control_plane) };
-        let err = format!("{:#}", install_received(&fake, &binary, control_plane).unwrap_err());
+        let fake = Fake { installed_build: "0.8.0 dddd dev".into(), ..Fake::building(says) };
+        let err = format!("{:#}", install_received(&fake, &binary, &pin).unwrap_err());
         assert!(err.starts_with("the installed binary (/dest/devsandbox) reports"), "{err}");
         assert!(!fake.calls().iter().any(|c| c.starts_with("handoff")));
+        // A published pin is never received.
+        let fake = Fake::building(says);
+        assert!(install_received(&fake, &binary, &published_pin("0.9.0")).is_err());
+        assert!(fake.calls().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1276,7 +1506,7 @@ pub(crate) mod tests {
     fn no_release_no_fetch() {
         let dir = scratch("target");
         let fake = Fake::building(ASSET);
-        let err = update(&fake, &control_plane(), "macos", "x86_64", &dir).unwrap_err();
+        let err = update_to(&fake, "macos", "x86_64", &dir).unwrap_err();
         assert_eq!(format!("{err:#}"), "no devsandbox release is built for macos/x86_64");
         assert!(fake.calls().is_empty());
         let _ = std::fs::remove_dir_all(&dir);

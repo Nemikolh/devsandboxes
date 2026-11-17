@@ -31,19 +31,20 @@
 //! (`service::Handle::cycle` ends every link then); a machine naming
 //! another control plane is refused (`update::same_fleet`, fleet plan decision 34).
 //!
-//! Versions follow the hello's control-plane flag (fleet plan decision 25,
-//! `commands::fleet_link::follows`): a machine that is the control plane while this
-//! host isn't, and this host isn't the fleet's authority (`fleet_link::Authority`, by
-//! the newest log after the proof), is followed before anything is served. Another published
-//! build is downloaded, installed and handed off to (`update::update`),
-//! the link refused meanwhile; another dev build for this platform, with
-//! `member.toml`'s `dev-builds` on or trust `full`, keeps the link up
-//! serving only the `binary` transfer the control plane pushes, then installs it and
-//! hands off (`update::install_received`). This host, the control plane, pushes its
-//! dev build to a machine that would take it (`fleet_link::push_build`
-//! through `fleet-<entry>.sock`), never to the authority. Two non-control-planes
-//! follow nothing; the authority follows no one, so upgrading it first neither
-//! locks it out of an older control plane nor downgrades it.
+//! Versions follow the fleet's pinned build (`update::decide` over the
+//! newest log's `Membership::build` after the proof, `fleet_link::pinned`,
+//! and `fleet_link::Authority`), before anything is served: this host, not
+//! the authority and not on the pin, downloads a published pin, installs
+//! it and hands off (`update::update`), the link refused meanwhile, when
+//! the machine is on it or is the authority; a dev pin for this platform,
+//! with `member.toml`'s `dev-builds` on or trust `full`, from a machine
+//! that has it, keeps the link up serving only the `binary` transfer the
+//! machine pushes, then is checked, installed and handed off to
+//! (`update::install_received`). One update at a time, under this host's
+//! update lock (`update::under_lock`). This host, having the pin, pushes it
+//! to a machine that would take it (`fleet_link::push_build` through
+//! `fleet-<entry>.sock`). A host that can't or won't take the pin is
+//! behind: the link is served, why logged. The authority follows no one.
 //!
 //! The link's socket is bound as `link::Socket` binds one (the newest
 //! binder wins), so after a version handoff the next daemon's links take
@@ -64,7 +65,7 @@ use super::proof::{self, Identity, Proven};
 use super::lent::Channel;
 use super::transfer::Receivers;
 use super::transport::Transport;
-use super::update::{self, Build, Decision};
+use super::update::{self, Decision};
 use super::follow::Follow;
 use super::{LINK, link};
 use crate::commands::fleet_link;
@@ -130,7 +131,7 @@ pub struct Dialer {
     /// What this host says on a peer link (`update::hello_for` of its
     /// `control_plane`, as the daemon keeps it), read at each dial.
     pub hello: Arc<dyn Fn() -> &'static str + Send + Sync>,
-    /// How this host follows a control-plane machine's build.
+    /// How this host follows the fleet's pinned build, and pushes it.
     pub follow: Follow,
     /// The sentinel's, the `Hello`s' and the key proof's wait
     /// (`service::Timing::handshake`).
@@ -182,13 +183,15 @@ impl Dialer {
         let end = self.answer(entry, identity, &duplex, reader, writer, killer, held);
         let why = match end {
             Ended::Link(end) => end_why(end, &duplex),
-            Ended::Follow(follow) => {
+            Ended::Follow(follow, lock) => {
                 // The ssh goes first: nothing is served while this binary changes.
                 duplex.peer.close();
                 if held.stopped() {
                     return "stopping".into();
                 }
-                self.follow(&entry.name, follow, &duplex, held)
+                let why = self.follow(&entry.name, follow, &duplex, held);
+                drop(lock);
+                why
             }
         };
         duplex.peer.close();
@@ -210,7 +213,7 @@ impl Dialer {
         let name = entry.name.as_str();
         let dir = &self.dir;
         let socket = endpoint::fleet_socket(dir, name);
-        // While the control plane's binary is on its way nothing but it is served.
+        // While the pinned binary is on its way nothing but it is served.
         let receiving = AtomicBool::new(false);
         let incoming = Arc::new(Incoming::default());
         let binary = Arc::new(incoming.receiver(Receivers::new(self.log)));
@@ -234,7 +237,9 @@ impl Dialer {
             .with(channel::TRANSFER, transfers);
         let ours = (self.hello)();
         let spec = link::Spec { hello: ours, ..LINK };
-        let wanted: Mutex<Option<Build>> = Mutex::new(None);
+        let wanted: Mutex<Option<(String, [u8; 32])>> = Mutex::new(None);
+        // This host's update lock, from the decision to the handoff.
+        let update_lock: Mutex<Option<std::fs::File>> = Mutex::new(None);
         let mut end_link = duplex.stream.try_clone().ok().map(follow::shutting);
         let (stored, own_keys) = (identity.stored.clone(), identity.public_keys());
         let auth = proof::Auth { identity, expect: name.to_string(), log: self.log };
@@ -258,29 +263,36 @@ impl Dialer {
                     }
                 }
                 update::same_fleet(name, ours, &peer.hash)?;
-                let authority = fleet_link::Authority::of(p.newer.as_ref().unwrap_or(&stored), &own_keys, &p.key);
-                let label = Build::parse(&peer.hash).label();
-                match fleet_link::follows(ours, &peer.hash, authority, (self.follow.dev_builds)()) {
-                    Decision::Same => {}
-                    Decision::Download { build } => {
-                        *wanted.lock().unwrap() = Some(build);
-                        return Err(format!("{name}, the control plane, runs devsandbox {label}: updating this one"));
+                let log = p.newer.as_ref().unwrap_or(&stored);
+                let authority = fleet_link::Authority::of(log, &own_keys, &p.key);
+                let pin = fleet_link::pinned(log);
+                let decision = update::decide(ours, (self.follow.dev_builds)(), authority, pin.as_ref(), &peer.hash);
+                let (decision, lock, busy) = update::under_lock(decision, dir);
+                if let Some(why) = busy {
+                    (self.log)(&format!("machine {name}: {why}"));
+                }
+                *update_lock.lock().unwrap() = lock;
+                match (decision, &pin) {
+                    (Decision::Same, _) => {}
+                    (Decision::Behind(why), _) => (self.log)(&format!("machine {name}: behind: {why}")),
+                    (Decision::Download { semver, sums_sha256 }, _) => {
+                        let why = format!("the fleet's build is devsandbox {semver}: updating this one");
+                        *wanted.lock().unwrap() = Some((semver, sums_sha256));
+                        return Err(why);
                     }
-                    Decision::Stop(why) => return Err(why),
-                    Decision::Receive => {
-                        let scratch = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the control plane's build: {e:#}"))?;
+                    (Decision::Receive, Some(pin)) => {
+                        let scratch = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the fleet's build: {e:#}"))?;
                         receiving.store(true, Ordering::Relaxed);
-                        let seq = incoming.expect(peer.hash.clone(), scratch, end_link.take());
+                        let seq = incoming.expect(pin.clone(), scratch, end_link.take());
                         incoming.watch(seq, PUSH_WAIT);
-                        let why = format!("{name}, the control plane, runs devsandbox {label}: receiving its binary");
-                        (self.log)(&format!("machine {why}"));
+                        let why = format!("the fleet's build is {pin}: receiving it from {name}");
+                        (self.log)(&format!("machine {name}: {why}"));
                         held.note(why);
                         return Ok(());
                     }
+                    (Decision::Receive, None) => unreachable!("`decide` receives only a pin"),
                 }
-                if update::is_control_plane(ours) {
-                    fleet_link::push_build(ours, &peer.hash, authority.theirs, socket.clone(), fleet_link::own_binary);
-                }
+                fleet_link::push_build(pin.as_ref(), ours, &peer.hash, authority, socket.clone(), &self.follow.builds);
                 held.up();
                 (self.linked)(name, &peer.hash);
                 Ok(())
@@ -289,47 +301,47 @@ impl Dialer {
                 let _ = killer.shutdown(Shutdown::Both);
             },
         );
+        let lock = update_lock.into_inner().unwrap();
         if let Some(want) = incoming.take() {
-            return Ended::Follow(Following::Dev(want, end));
+            return Ended::Follow(Following::Dev(want, end), lock);
         }
         match wanted.into_inner().unwrap() {
-            Some(build) => Ended::Follow(Following::Published(build)),
+            Some((semver, sums_sha256)) => Ended::Follow(Following::Published { semver, sums_sha256 }, lock),
             None => Ended::Link(end),
         }
     }
 
-    /// Follow the control-plane machine `name`'s build (module doc); the outcome is
-    /// why the link ended (the machine's `error` until the handoff, or the
-    /// next attempt).
+    /// Follow the fleet's pinned build from machine `name`'s link (module
+    /// doc); the outcome is why the link ended (the machine's `error` until
+    /// the handoff, or the next attempt).
     fn follow(&self, name: &str, following: Following, duplex: &Duplex, held: &Held) -> String {
         let steps = self.follow.steps.as_ref();
         let why = match following {
             Following::Dev(want, end) => {
-                let label = Build::parse(&want.hello).label();
+                let label = want.pin.to_string();
                 let why = match &want.received {
                     Some(binary) => {
                         held.note(format!("updating to {label}"));
-                        match update::install_received(steps, binary, &want.hello) {
+                        match update::install_received(steps, binary, &want.pin) {
                             Ok(()) => format!("updated to {label}: handing off"),
                             Err(e) => format!("update to {label} failed: {e:#}"),
                         }
                     }
                     None => {
-                        let why = want.why.clone().unwrap_or_else(|| format!("{} before the control plane's binary arrived", end_why(end, duplex)));
+                        let why = want.why.clone().unwrap_or_else(|| format!("{} before the fleet's build arrived", end_why(end, duplex)));
                         format!("update to {label} failed: {why}")
                     }
                 };
                 let _ = std::fs::remove_dir_all(&want.dir);
                 why
             }
-            Following::Published(build) => {
-                let version = &build.semver;
-                (self.log)(&format!("machine {name}, the control plane, runs devsandbox {version}: updating this one"));
-                held.note(format!("updating to {version}"));
+            Following::Published { semver, sums_sha256 } => {
+                (self.log)(&format!("machine {name}: the fleet's build is devsandbox {semver}: updating this one"));
+                held.note(format!("updating to {semver}"));
                 let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-                match update::update(steps, &build, os, arch, &std::env::temp_dir()) {
-                    Ok(()) => format!("updated to {version}: handing off"),
-                    Err(e) => format!("update to {version} failed: {e:#}"),
+                match update::update(steps, &semver, &sums_sha256, os, arch, &std::env::temp_dir()) {
+                    Ok(()) => format!("updated to {semver}: handing off"),
+                    Err(e) => format!("update to {semver} failed: {e:#}"),
                 }
             }
         };
@@ -341,15 +353,16 @@ impl Dialer {
 /// How [`Dialer::answer`] ended.
 enum Ended {
     Link(link::End),
-    /// The machine is the control plane, on another build: follow it.
-    Follow(Following),
+    /// This host follows the fleet's pin from this link, holding its update
+    /// lock (`update::under_lock`) until the handoff.
+    Follow(Following, Option<std::fs::File>),
 }
 
 enum Following {
-    /// A dev build pushed (or not, by the link's end) over `TRANSFER`.
+    /// A dev pin pushed (or not, by the link's end) over `TRANSFER`.
     Dev(follow::Want, link::End),
-    /// The control plane's published build, to download.
-    Published(Build),
+    /// A published pin, to download.
+    Published { semver: String, sums_sha256: [u8; 32] },
 }
 
 /// Why the link ended, with ssh's stderr tail.
@@ -446,7 +459,11 @@ pub(crate) mod tests {
                 dir: k_dir.clone(),
                 hello: update::hello_of(false, None, false),
                 daemon: Arc::new(move || Ok(connect(&daemon_dir))),
-                follow: Follow { steps: Arc::new(update::tests::Fake::default()), dev_builds: Arc::new(|| false) },
+                follow: Follow {
+                    steps: Arc::new(update::tests::Fake::default()),
+                    dev_builds: Arc::new(|| false),
+                    builds: update::builds_dir(k_member.parent().unwrap()),
+                },
                 reannounce: Duration::from_millis(20),
                 push_wait: Duration::from_secs(5),
                 member: k_member.clone(),
@@ -1322,19 +1339,26 @@ pub(crate) mod tests {
         pair.finish();
     }
 
-    /// A control-plane machine on another published build: this host refuses the
-    /// link, installs that version and hands off, and says so as box's
-    /// error.
+    /// The fleet's pin is a release this host isn't on, and the machine is
+    /// the authority: this host refuses the link, installs that release and
+    /// hands off, and says so as box's error.
     #[test]
-    fn this_host_follows_a_published_control_plane_machine() {
+    fn this_host_follows_a_published_pin() {
         let base = scratch("dial-follow");
         std::fs::create_dir_all(&base).unwrap();
         let registry = base.join("machines.toml");
         crate::serve::machines::update(&registry, |e| e.push(Entry::ssh("box", "me@box"))).unwrap();
         let box_member = base.join("box-data/member.toml");
         std::fs::create_dir_all(box_member.parent().unwrap()).unwrap();
-        // box the authority: lap, an ordinary member, follows it.
-        test_support::fleet_of("box", &[("box", &box_member), ("lap", &base.join("member.toml"))]);
+        // box the authority, its log pinning release 9.9.9: lap, an
+        // ordinary member, follows it.
+        let lap_member = base.join("member.toml");
+        let mut stored = test_support::fleet_of("box", &[("box", &box_member), ("lap", &lap_member)]);
+        let pin = crate::serve::fleet::membership::Pin::Published { semver: "9.9.9".into(), sums_sha256: update::tests::sums_sha256("9.9.9") };
+        stored.log.append(crate::serve::fleet::membership::Op::Build { version: 1, pin }, "box", &test_support::key_of(&box_member)).unwrap();
+        for m in [&box_member, &lap_member] {
+            test_support::write(m, &stored);
+        }
         let hello: &'static str = Box::leak(format!("9.9.9 abc published {} control_plane", update::PLATFORM).into_boxed_str());
         let transport = Transport::new(move |_, _| {
             let (ours, theirs) = UnixStream::pair()?;

@@ -26,6 +26,8 @@ pub type Stream = std::os::unix::net::UnixStream;
 pub const SOCKET_FILE: &str = "serve.sock";
 pub const LOCK_FILE: &str = "serve.lock";
 pub const LOG_FILE: &str = "serve.log";
+/// Held while this host updates its binary (`fleet::update::lock_update`).
+pub const UPDATE_LOCK_FILE: &str = "update.lock";
 
 /// The socket dir from the environment's values: `$XDG_RUNTIME_DIR/devsandbox`,
 /// else the state dir ([`state_dir_from`]). The path stays short on purpose:
@@ -68,6 +70,10 @@ pub fn socket_path(dir: &Path) -> PathBuf {
 
 pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join(LOCK_FILE)
+}
+
+pub fn update_lock_path(dir: &Path) -> PathBuf {
+    dir.join(UPDATE_LOCK_FILE)
 }
 
 /// How many bytes of a client name a link socket's name keeps before
