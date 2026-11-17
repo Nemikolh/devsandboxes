@@ -283,8 +283,10 @@ Start with `docs/README.md` (reading order and map) and
   (not applicable elsewhere, so it passes there). A test child with its
   own `XDG_*` dirs calls `test_support::share_runtime_dirs`.
 - Checks: `cargo test --workspace` (covers the `devsbd/` helper crate too;
-  plain `cargo test` only runs the root package). clippy/rustfmt are not
-  installed in the default toolchain here.
+  plain `cargo test` only runs the root package). `cargo clippy --workspace
+  --all-targets` is available (a `rust-toolchain.toml` component) but not
+  clean yet, so check only that your change adds no warnings. rustfmt is not
+  installed.
 - Commit each finished, checked change without being asked, staging only
   your own hunks. Subagents never commit unless their brief says to.
 - Commits follow Conventional Commits, all lowercase:
