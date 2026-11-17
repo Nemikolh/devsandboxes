@@ -117,6 +117,24 @@ const OUT_QUEUE: usize = OUT_CAP / (16 * 1024);
 /// unread pty).
 const TERMINAL_WAIT: Duration = Duration::from_secs(1);
 
+/// How long the supervisor waits for its creator's hello before spawning the
+/// command anyway (the creator died between `create_with` and its connect):
+/// output with no client is dropped, so a program spawned first would lose
+/// what it prints before the creator connects. The creator dials within
+/// milliseconds; this is `connect`'s own patience (`runs::STARTING_GRACE`),
+/// past which the creator has given up anyway. Short under test, where
+/// sessions with no client are started on purpose.
+#[cfg(not(test))]
+const CREATOR_WAIT: Duration = Duration::from_secs(runs::STARTING_GRACE);
+#[cfg(test)]
+const CREATOR_WAIT: Duration = Duration::from_secs(1);
+
+/// After the creator's hello, how long the supervisor waits for its first
+/// size before spawning, so the program starts at the client's size. A
+/// client sends it with its hello, in one write ([`relay`]); this covers a
+/// split read, and a client with no size (not a terminal) costs only this.
+const SIZE_WAIT: Duration = Duration::from_millis(50);
+
 /// How long a supervisor whose command couldn't be spawned waits for the
 /// client to collect the error.
 const FAILED_WAIT: Duration = Duration::from_secs(2);
@@ -612,13 +630,20 @@ struct Supervisor {
     client: Option<Client>,
     /// Connections waiting for their hello, oldest first.
     pending: Vec<Pending>,
+    /// A client has said hello since the start (the creator, normally).
+    hello_seen: bool,
 }
 
-/// `session supervise`: bind `sock`, open a pty, run the command on it (cwd
-/// and env inherited from `new`, its own session with the pty as controlling
+/// `session supervise`: bind `sock`, open a pty, wait for the creator
+/// ([`Supervisor::await_creator`]), run the command on the pty (cwd and env
+/// inherited from `new`, its own session with the pty as controlling
 /// terminal, so its pid is its pgid, what `rm` signals), relay until it
 /// exits, then record the end and tell the client. A command that can't be
 /// spawned ends at once with exit 127, its error shown to the client.
+///
+/// Until the spawn the session is running by its supervisor (`meta` has
+/// `supervisor`, no `pid`): `ls` lists it, an attach connects, `rm` signals
+/// the supervisor's own group (`runs::kill_target`).
 fn supervise(root: &Path, id: &str) -> io::Result<()> {
     let dir = session_dir(root, id)?;
     let argv = runs::read_argv(&dir)?;
@@ -631,9 +656,19 @@ fn supervise(root: &Path, id: &str) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let (master, slave) = open_pty()?;
     set_nonblocking(master.as_raw_fd())?;
+    let mut sup = Supervisor {
+        dir: dir.clone(),
+        listener,
+        master,
+        master_open: true,
+        input: Vec::new(),
+        client: None,
+        pending: Vec::new(),
+        hello_seen: false,
+    };
+    sup.await_creator(CREATOR_WAIT);
     let spawned = spawn_on(&slave, program, rest);
     drop(slave);
-    let mut sup = Supervisor { dir: dir.clone(), listener, master, master_open: true, input: Vec::new(), client: None, pending: Vec::new() };
     let end = match spawned {
         Ok(mut child) => {
             let pid = child.id();
@@ -691,6 +726,68 @@ fn pollfd(fd: RawFd, events: i16) -> sys::PollFd {
 }
 
 impl Supervisor {
+    /// Before the spawn: serve connections as [`Supervisor::relay`] does
+    /// (mismatched and bad hellos answered and closed, a later hello takes
+    /// over) until a client said hello and sent its first size (applied to
+    /// the pty, so the program starts at it), or [`SIZE_WAIT`] passed after
+    /// the hello, or `wait` passed with none. The pty isn't read or written
+    /// (nothing runs on it): client input waits in `input`, capped by
+    /// [`INPUT_CAP`] as later.
+    fn await_creator(&mut self, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut hello_at = None;
+        loop {
+            let now = Instant::now();
+            if self.hello_seen && hello_at.is_none() {
+                hello_at = Some(now);
+            }
+            let until = match hello_at {
+                Some(_) if self.client.as_ref().is_none_or(|c| c.sized) => return,
+                Some(at) => at + SIZE_WAIT,
+                None => deadline,
+            };
+            if now >= until {
+                return;
+            }
+            let mut fds = vec![pollfd(self.listener.as_raw_fd(), sys::POLLIN)];
+            let client_at = self.push_client(&mut fds);
+            let pending_at = self.push_pending(&mut fds);
+            let timeout = (until - now).as_millis().min(TICK as u128) as c_int;
+            if poll(&mut fds, timeout.max(1)).is_err() {
+                return;
+            }
+            if fds[0].revents & sys::POLLIN != 0 {
+                self.accept();
+            }
+            if let Some(i) = client_at.filter(|_| self.client.is_some()) {
+                self.serve_client(fds[i].revents, &mut buf);
+            }
+            self.serve_pending(&fds[pending_at..], &mut buf);
+        }
+    }
+
+    /// Add the client's socket to `fds` (reading while `input` has room,
+    /// writing while output is queued); returns where.
+    fn push_client(&self, fds: &mut Vec<sys::PollFd>) -> Option<usize> {
+        self.client.as_ref().map(|c| {
+            let read = if self.input.len() < INPUT_CAP { sys::POLLIN } else { 0 };
+            let write = if c.out.is_empty() { 0 } else { sys::POLLOUT };
+            fds.push(pollfd(c.sock.as_raw_fd(), read | write));
+            fds.len() - 1
+        })
+    }
+
+    /// The client's turn after a poll that reported `ev` on its socket.
+    fn serve_client(&mut self, ev: i16, buf: &mut [u8]) {
+        if ev & (sys::POLLIN | sys::POLLHUP | sys::POLLERR | sys::POLLNVAL) != 0 {
+            self.read_client(buf);
+        }
+        if ev & sys::POLLOUT != 0 {
+            self.flush_client();
+        }
+    }
+
     /// The relay loop, until the command exits; returns how it ended.
     fn relay(&mut self, child: &mut Child) -> io::Result<ExitStatus> {
         let mut buf = vec![0u8; 16 * 1024];
@@ -705,12 +802,7 @@ impl Supervisor {
                 fds.push(pollfd(self.master.as_raw_fd(), sys::POLLIN | out));
                 fds.len() - 1
             });
-            let client_at = self.client.as_ref().map(|c| {
-                let read = if self.input.len() < INPUT_CAP { sys::POLLIN } else { 0 };
-                let write = if c.out.is_empty() { 0 } else { sys::POLLOUT };
-                fds.push(pollfd(c.sock.as_raw_fd(), read | write));
-                fds.len() - 1
-            });
+            let client_at = self.push_client(&mut fds);
             let pending_at = self.push_pending(&mut fds);
             poll(&mut fds, TICK)?;
             if fds[0].revents & sys::POLLIN != 0 {
@@ -727,13 +819,7 @@ impl Supervisor {
             }
             // Its pty read may have dropped it (a failed flush).
             if let Some(i) = client_at.filter(|_| self.client.is_some()) {
-                let ev = fds[i].revents;
-                if ev & (sys::POLLIN | sys::POLLHUP | sys::POLLERR | sys::POLLNVAL) != 0 {
-                    self.read_client(&mut buf);
-                }
-                if ev & sys::POLLOUT != 0 {
-                    self.flush_client();
-                }
+                self.serve_client(fds[i].revents, &mut buf);
             }
             // After the client's turn: one promoted now isn't in `fds` either.
             self.serve_pending(&fds[pending_at..], &mut buf);
@@ -810,6 +896,7 @@ impl Supervisor {
                 let _ = old.out.flush(&mut old.sock);
             });
         }
+        self.hello_seen = true;
         let _ = File::create(self.dir.join("client"));
         let mut out = Out::default();
         out.push_always(encode(&Record::Hello(WIRE_VERSION)));
@@ -872,7 +959,8 @@ impl Supervisor {
     }
 
     /// One read of client records: sizes go to the pty (the first one with
-    /// the redraw nudge), data is queued for it. EOF or a bad record drops
+    /// the redraw nudge; before the spawn it only sets the size the program
+    /// starts at), data is queued for it. EOF or a bad record drops
     /// the client; the command runs on.
     fn read_client(&mut self, buf: &mut [u8]) {
         let Some(c) = &mut self.client else { return };
@@ -1085,13 +1173,17 @@ fn relay(
     let done = Arc::new(AtomicBool::new(false));
     let send = |w: &Mutex<UnixStream>, record: &[u8]| w.lock().is_ok_and(|mut s| s.write_all(record).is_ok());
     // First, before anything the supervisor would act on: it takes nothing
-    // from a connection, nor displaces anyone for it, before this.
-    send(&writer, &encode(&Record::Hello(WIRE_VERSION)));
+    // from a connection, nor displaces anyone for it, before this. The size
+    // in the same write, so a supervisor waiting to spawn (`await_creator`)
+    // reads both at once.
+    let mut size = size;
+    let mut last = size.as_mut().and_then(|size| size());
+    let mut first = encode(&Record::Hello(WIRE_VERSION));
+    if let Some((cols, rows)) = last {
+        first.extend(encode(&Record::Size { cols, rows }));
+    }
+    send(&writer, &first);
     if let Some(mut size) = size {
-        let mut last = size();
-        if let Some((cols, rows)) = last {
-            send(&writer, &encode(&Record::Size { cols, rows }));
-        }
         let (w, done) = (writer.clone(), done.clone());
         std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
@@ -1698,6 +1790,48 @@ pub(crate) mod tests {
         let id = "1790000000-0005";
         assert!(create_test(&root, id, &strings(&["true"]), Some("/nonexistent/dir")).is_err());
         assert!(!root.join(id).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The supervisor spawns the command only once its creator said hello:
+    /// what a program prints at once (and exits) reaches the creator whole,
+    /// and the program starts at the creator's size.
+    #[test]
+    fn the_creator_sees_the_first_output_at_its_size() {
+        let root = temp_root("first");
+        for n in 0..5 {
+            let id = format!("1790000000-000{n}");
+            let child = create_test(&root, &id, &strings(&["echo", "hello-early"]), None).unwrap();
+            let c = client(&root, &id, child, None);
+            assert_eq!(c.wait(), Done { code: 0, note: None }, "{:?}", c.output.text());
+            assert!(c.output.text().contains("hello-early"), "{:?}", c.output.text());
+        }
+        let id = "1790000000-0010";
+        let c = client(&root, id, Some(start(&root, id, "echo at-once; exit 6")), None);
+        assert_eq!(c.wait().code, 6);
+        assert!(c.output.text().contains("at-once"), "{:?}", c.output.text());
+
+        let id = "1790000000-0011";
+        let size_fn: SizeFn = Box::new(|| Some((100, 30)));
+        let c = client(&root, id, Some(start(&root, id, "stty size")), Some(size_fn));
+        assert_eq!(c.wait().code, 0);
+        assert!(c.output.text().contains("30 100"), "{:?}", c.output.text());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// No client within [`CREATOR_WAIT`]: the command runs anyway, and ends.
+    #[test]
+    fn with_no_creator_the_command_still_runs() {
+        let root = temp_root("nocreator");
+        let id = "1790000000-0001";
+        let t = Instant::now();
+        let mut sup = start(&root, id, "exit 9");
+        let status = sup.wait().unwrap();
+        assert!(status.success(), "{status:?}");
+        assert!(t.elapsed() >= CREATOR_WAIT, "spawned after the wait: {:?}", t.elapsed());
+        let m = meta(&root, id);
+        assert!(m.ended.is_some() && m.pid.is_some(), "{m:?}");
+        assert_eq!(m.exit, Some(State::Exited(9)));
         let _ = fs::remove_dir_all(&root);
     }
 

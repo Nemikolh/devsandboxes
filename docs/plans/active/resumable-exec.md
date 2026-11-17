@@ -425,6 +425,36 @@ considered.
   fallback*), `docs/status.md` (the not-resumable line keeps only no
   helper and services).
 
+## Step 6: fix: the creator sees the program's first output
+
+Found while reviewing step 5: `Supervisor` (`devsbd/src/sessions.rs`
+`supervise`) spawns the command before the creating client has
+connected, and output with no client is dropped, so whatever the
+program prints first is lost (probe in a container: `session new --
+echo hello-early` showed nothing 0/10 times, the same echo after 0.5 s
+10/10). A short `exec -t -- cmd` can print nothing; a shell's first
+prompt or motd can vanish. A program that exits that fast also ends
+the session before the client connects (it reads only `meta`'s code).
+
+- The supervisor binds and listens first, and spawns the command once
+  the first client's hello matched (`take_over`), with its first `size`
+  applied to the pty before the spawn when it came with the hello
+  (so the program starts at the client's size, no redraw nudge needed
+  for the creator). Bounded: past a constant wait with no client (the
+  creator died between `create` and `connect`) it spawns anyway, as
+  today. Output after a client has once attached and left is still
+  dropped (the design's *always drained*).
+- Every creator goes through this: `session new` (the local exec, the
+  step 5 client) and the helper daemon's `session.attach` with
+  `create` (`rpc_sessions`): check both connect as a hello'd client.
+- Tests in `sessions.rs`: a program that prints at once and exits is
+  seen whole with its code; the size reaches the program before it
+  runs (`stty size` as the command); no client within the wait still
+  runs the command. Fix the step 5 docker test's comment in
+  `src/serve/fleet/pty.rs` that works around the loss.
+- Docs: `docs/architecture/helper/in-container.md` (*Sessions*:
+  supervisor).
+
 ## Compared with Kubernetes attach
 
 How Kubernetes reattaches to a terminal, against what this plan built.

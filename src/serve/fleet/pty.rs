@@ -1601,8 +1601,8 @@ mod tests {
             };
             let say = |s: &UnixStream, text: &str| rpc::write_record(&mut &*s, &Record::Stdin(text.as_bytes().to_vec())).unwrap();
 
-            // Answers each line with its pid. Input, not a banner: output
-            // before the client connects is dropped (no client yet).
+            // Answers each line with its pid, so later attaches can tell they
+            // reached the same program.
             let program = vec!["sh".to_string(), "-c".into(), "while read l; do echo \"got $l $$.\"; done".into()];
             let (first, t) = open(Some(&program));
             say(&first, "zero\n");

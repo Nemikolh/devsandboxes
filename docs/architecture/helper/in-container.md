@@ -222,9 +222,22 @@ daemon then being the session's client.
   own (not the daemon, `boot` or `ls`). `meta`'s first line is `proto
   <N>`, the session wire's `WIRE_VERSION`.
 - The supervisor (`supervise`) binds `sock`, opens a pty (`open_pty`,
-  libc through `extern "C"`, per-OS ioctl numbers in `sessions::sys`) and
-  runs the command on it as a session leader with the pty as its
-  controlling terminal, so its pid is its pgid. One `poll` loop over
+  libc through `extern "C"`, per-OS ioctl numbers in `sessions::sys`),
+  waits for its creator, and runs the command on it as a session leader
+  with the pty as its controlling terminal, so its pid is its pgid. The
+  wait (`Supervisor::await_creator`) is why the creator sees the program's
+  first output: output with no client is dropped, so a program spawned
+  before the creator connected would lose what it prints first (all of it,
+  for a quick `echo`). It serves connections as later and spawns once a
+  client's `hello` matched and its first `size` came (the client sends
+  both in one write; `SIZE_WAIT`, 50 ms, for one that sends none), that
+  size applied first so the program starts at it; input sent meanwhile
+  waits for the program. With no `hello` within `CREATOR_WAIT` (10 s, the
+  creator's own patience in `connect`: it died between creating and
+  dialing) the command is spawned anyway. Until then the session is
+  running by its supervisor (`meta` has `supervisor`, no `pid`): `ls`
+  lists it, an attach connects, `rm` signals the supervisor's group
+  (`runs::kill_target`). One `poll` loop over
   non-blocking fds (`Supervisor::relay`): the pty is always read, its
   output queued for the client up to `OUT_CAP` and dropped past it or with
   no client, so neither the program nor the supervisor ever waits on a
@@ -306,7 +319,9 @@ other (`sessions::join_end`, without `terminal`'s raw mode): `meta`'s
 `proto` and the `hello` are checked, and a later attach (CLI or RPC) takes
 over. The stream's `stdin` records go through a pipe into the relay's
 input, `stdin-eof` closes it, `resize` sets what the relay's size fn
-answers (sent on the next `SIZE_POLL` check), the session's output comes
+answers (sent on the next `SIZE_POLL` check; when this attach created the
+session, its first size read waits up to `FIRST_SIZE_WAIT` for the first
+`resize`, so the program starts at the caller's size), the session's output comes
 back as `stdout` records (`rpc_sessions::Stdout`, closed before the last
 record). `signal` is ignored (a session's program gets signals from its
 terminal, as input bytes).

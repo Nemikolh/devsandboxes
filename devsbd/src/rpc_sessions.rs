@@ -25,7 +25,7 @@ use std::path::Path;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::boot::Account;
 use crate::control::valid_run_id;
@@ -37,6 +37,13 @@ use crate::sessions::{self, End, SizeFn};
 /// How often an attach whose caller sent its `Eof` checks whether the caller
 /// hung up altogether (the stream's `Close`, or the bridge gone).
 const HANGUP_POLL: Duration = Duration::from_millis(100);
+
+/// When this attach created the session, how long its first size read waits
+/// for the caller's first `resize` (sent right after the call, but read on
+/// another thread): the supervisor spawns the command once the hello and
+/// size come in (`sessions::Supervisor::await_creator`), so the program
+/// starts at the caller's size. A caller that sends none costs this once.
+const FIRST_SIZE_WAIT: Duration = Duration::from_millis(500);
 
 fn bad(msg: impl Into<String>) -> Record {
     Record::error(code::BAD_REQUEST, msg)
@@ -220,7 +227,16 @@ fn relay(root: &Path, id: &str, child: Option<&mut Child>, stream: UnixStream) -
     }
     let size_fn: SizeFn = {
         let size = Arc::clone(&size);
-        Box::new(move || *size.lock().unwrap_or_else(|e| e.into_inner()))
+        let mut first = child.is_some().then(|| Instant::now() + FIRST_SIZE_WAIT);
+        Box::new(move || {
+            let now = || *size.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(until) = first.take() {
+                while now().is_none() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            now()
+        })
     };
     let l = Arc::clone(&link);
     let end = sessions::join_end(root, id, child, stdin_r, Box::new(stdout.clone()), Some(size_fn), move |sock| {
@@ -454,6 +470,26 @@ mod tests {
         c.stdin("\n");
         c.wait_output("40 120");
         assert_eq!(c.finish(), Record::Exit(Exit::Code(0)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The creating caller is the session's client before the command runs:
+    /// it gets what the program prints at once, at the caller's first size
+    /// even when that `resize` comes a moment after the call.
+    #[test]
+    fn the_creator_sees_the_first_output_at_its_size() {
+        let root = temp_root("rpc-first");
+        let host = host(&root, true);
+        let id = "1790000000-0001";
+        let mut c = Caller::open(&host, 1, attach_call(id, Some(sh("echo at-once; exit 6"))));
+        assert_eq!(c.finish(), Record::Exit(Exit::Code(6)), "{:?}", c.recs);
+        assert!(c.stdout().contains("at-once"), "{:?}", c.stdout());
+        let id = "1790000000-0002";
+        let mut c = Caller::open(&host, 2, attach_call(id, Some(sh("stty size"))));
+        std::thread::sleep(Duration::from_millis(100));
+        c.send(Record::Resize { cols: 100, rows: 30 });
+        assert_eq!(c.finish(), Record::Exit(Exit::Code(0)), "{:?}", c.recs);
+        assert!(c.stdout().contains("30 100"), "{:?}", c.stdout());
         let _ = fs::remove_dir_all(&root);
     }
 
