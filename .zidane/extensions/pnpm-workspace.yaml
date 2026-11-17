@@ -1,0 +1,4 @@
+# Only types are needed from these; their install scripts never have to run.
+allowBuilds:
+  '@google/genai': false
+  protobufjs: false

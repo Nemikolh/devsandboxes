@@ -1,2 +1,4 @@
 /target
-/.zidane
+/.zidane/*
+!/.zidane/extensions/
+/.zidane/extensions/node_modules/

@@ -28,6 +28,19 @@ jobs:
         env:
           DEVSANDBOX_DEVSBD_REQUIRED: "1"
           DEVSANDBOX_SERVICE_MANAGER_E2E: "1"
+      # The zidane agent extensions (.zidane/extensions) used in this repo.
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: .zidane/extensions/package.json
+          cache: true
+          cache_dependency_path: .zidane/extensions/pnpm-lock.yaml
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+        working-directory: .zidane/extensions
+      - run: pnpm check
+        working-directory: .zidane/extensions
 
   # The same suite under rootless podman (the runner user), the runtime mode
   # the docker job can't reach. Gated tests follow DEVSANDBOX_RUNTIME
