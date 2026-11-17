@@ -7,7 +7,7 @@ progress; the rest is design.
 The fleet's roles map onto Kubernetes' ([kubernetes](../../reference/kubernetes.md)):
 the control plane federates and places; the authority is the cluster CA's
 analog, and pins the build members follow
-([authority sets the fleet's version](authority-sets-fleet-version.md)). The authority is also the fleet's
+([ADR 0053](../../decisions/0053-the-authority-pins-the-fleets-build.md)). The authority is also the fleet's
 one hard single point of failure, which this plan removes.
 
 ## Problem
@@ -70,7 +70,7 @@ Standard PKI's shape: an offline root, an online intermediate.
     it's a scope of its own.
   - Never delegated: genesis, `recover`, the authority's own `rotate`,
     `control_plane` moves, `delegate`/`undelegate`, `build` pins
-    ([authority sets the fleet's version](authority-sets-fleet-version.md)).
+    ([ADR 0053](../../decisions/0053-the-authority-pins-the-fleets-build.md)).
 - **Rules** (`membership::apply`, pure): an entry the delegate signs
   applies when a live delegation names its key, the op is in its scopes,
   and the entry's signed time is before `until`. A `control_plane` move

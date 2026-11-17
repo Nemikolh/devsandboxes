@@ -120,6 +120,12 @@ is frozen: no new work on it.
 
 ## Parked
 
+- **machines**: compacting superseded `Op::Build` entries out of the
+  membership log; keeping the previous binary and rolling back when a
+  pinned build can't link within some minutes; pinning a build made on
+  another platform (`devsandbox machine build sign <path>`), for a
+  mixed-platform dev fleet.
+  → [ADR 0053](decisions/0053-the-authority-pins-the-fleets-build.md)
 - **helper**: opening files (`xdg-open report.pdf`): to the VS Code window
   attached to the instance, or the host's opener for a path in a
   bind-mounted workspace. Refused today (exit 3).
@@ -561,6 +567,15 @@ is frozen: no new work on it.
   hasn't started within 60 s (`PUSH_WAIT`) or fails; one that started and
   stalls while the link stays up waits until the link ends.
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::follow` `Incoming::watch`
+- The authority pins every new binary its daemon starts on (each
+  `cargo build` run once), so members taking dev builds hand off with
+  each, and each pin adds a log entry (synced within `proof::SYNC_LIMIT`);
+  a pinned build whose update path is broken strands them until fixed by
+  hand. When the authority's kept copy of a dev pin is gone, its push
+  fails and a member waiting on it redials every `PUSH_WAIT`; so does a
+  host that can't hash its own binary (its `Hello` says `-`), which is
+  never on a dev pin.
+  → [fleet](architecture/daemon/fleet.md#versions); `machines::changes::sign_build`, `fleet::update::pushes`, `fleet::update::keep_build`
 - A member whose update to the pin fails drops the link at each dial: a
   peer that dialed it sees the reason as its row's error (ssh's stderr
   tail), a peer it dialed only sees the inbound machine come and go (the

@@ -1,8 +1,10 @@
+> Archived 2026-11-17. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/fleet.md#versions](../../architecture/daemon/fleet.md#versions),
+> [ADR 0053](../../decisions/0053-the-authority-pins-the-fleets-build.md)
+
 # The authority sets the fleet's version
 
-Status: agreed direction, nothing built. Supersedes
-[ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)
-once step 2 ships (a new ADR then).
+Status: shipped (1f19141, 770e9be, da38bf6, c2bbb2a, 62dbd40).
 
 ## Why
 

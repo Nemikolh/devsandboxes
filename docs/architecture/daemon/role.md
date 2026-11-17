@@ -106,9 +106,9 @@ clients proceed, but for a **forced** hello (`HelloParams::force`), which
 hands off whatever its version: honored only on a local (`Full`)
 connection whose peer runs as the daemon's uid
 (`endpoint::peer_is_own_user`), never on a fleet control plane's `Worker` one. A
-fleet worker sends it after installing its control plane's version, older or newer
+fleet member sends it after installing the fleet's pinned build, older or newer
 ([fleet](fleet.md#versions),
-[ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
+[ADR 0053](../../decisions/0053-the-authority-pins-the-fleets-build.md)).
 
 ## Holders and idle exit
 
