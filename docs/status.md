@@ -273,7 +273,7 @@ is frozen: no new work on it.
 - Many devcontainer properties parse but are ignored with a warning at
   `run` (`runArgs`, `appPort`, `portsAttributes`, `workspaceMount`,
   `capAdd`, `securityOpt`, `overrideCommand`, `shutdownAction`,
-  `hostRequirements`, `waitFor`, `secrets`, `userEnvProbe`,
+  `hostRequirements` but `gpu`, `waitFor`, `secrets`, `userEnvProbe`,
   `overrideFeatureInstallOrder`, `name`,
   `customizations.vscode.settings`). → [config](architecture/config.md);
   `SandboxProperties::ignored`
@@ -287,6 +287,19 @@ is frozen: no new work on it.
   `true`), no file binds (feature file mounts skipped, no ssh-agent mount
   fallback), CPU shows `-`. → [runtimes](architecture/runtimes.md);
   `AppleContainer::supports_*`
+- GPUs: NVIDIA only, and every GPU (`--gpus all`, `--device
+  nvidia.com/gpu=all`): no device selection, and `hostRequirements.gpu`'s
+  `cores` / `memory` aren't enforced (warned). `GpuSupport::run_args`
+- GPUs on rootless docker: the NVIDIA toolkit needs `no-cgroups = true` in
+  the host's nvidia-container-runtime config, which `gpu_support` can't
+  see, so without it the create fails at the runtime.
+  `runtime::gpu::docker`
+- GPUs on podman: CDI specs are looked for in `/etc/cdi` and
+  `/var/run/cdi` only; containers.conf's `cdi_spec_dirs` isn't read.
+  `runtime::gpu::PODMAN_CDI_DIRS`
+- GPUs have never been run end to end on a GPU host (no GPU CI): only
+  the detection over fixtures and the flags are tested.
+  `run::gpu::gpu_decision`
 - Podman: `autostart = "runtime"` restarts at boot only with
   `podman-restart.service`, which devsandbox never installs.
   → [runtimes](architecture/runtimes.md); `autostart::restart_decision`

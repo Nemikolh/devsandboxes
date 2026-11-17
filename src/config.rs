@@ -268,7 +268,8 @@ pub struct SandboxProperties {
     pub shutdown_action: Option<Value>,
     pub cap_add: Option<Value>,
     pub security_opt: Option<Value>,
-    /// devcontainer `hostRequirements`: typed, but every set key is still
+    /// devcontainer `hostRequirements`: `gpu` decides the run's GPU flags
+    /// (`commands::run::gpu_decision`); every other set key is
     /// [`Self::ignored`].
     pub host_requirements: Option<HostRequirements>,
     pub wait_for: Option<Value>,
@@ -407,7 +408,6 @@ pub enum GpuRequirement {
 }
 
 /// What a sandbox or service needs of a GPU, from [`HostRequirements::gpu_need`].
-#[allow(dead_code)] // nothing acts on a GPU need yet
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuNeed {
     Required,
@@ -416,7 +416,6 @@ pub enum GpuNeed {
 
 impl HostRequirements {
     /// The GPU asked for, `None` when unset or `false`.
-    #[allow(dead_code)] // nothing acts on a GPU need yet
     pub fn gpu_need(&self) -> Option<GpuNeed> {
         match self.gpu.as_ref()? {
             GpuRequirement::No => None,
@@ -425,19 +424,16 @@ impl HostRequirements {
         }
     }
 
-    /// Dotted names (under `hostRequirements.`) of the keys set.
+    /// Dotted names (under `hostRequirements.`) of the keys set that
+    /// nothing acts on: `gpu` itself is, its minimums aren't.
     fn set_keys(&self) -> Vec<String> {
         let mut out = Vec::new();
-        // `false` asks for nothing, so there is nothing to ignore.
-        if let Some(gpu) = self.gpu.as_ref().filter(|g| **g != GpuRequirement::No) {
-            out.push("hostRequirements.gpu".to_string());
-            if let GpuRequirement::Min { cores, memory } = gpu {
-                if cores.is_some() {
-                    out.push("hostRequirements.gpu.cores".into());
-                }
-                if memory.is_some() {
-                    out.push("hostRequirements.gpu.memory".into());
-                }
+        if let Some(GpuRequirement::Min { cores, memory }) = &self.gpu {
+            if cores.is_some() {
+                out.push("hostRequirements.gpu.cores".to_string());
+            }
+            if memory.is_some() {
+                out.push("hostRequirements.gpu.memory".into());
             }
         }
         for (set, name) in [
@@ -2209,7 +2205,6 @@ customizations.jetbrains.plugins = ["x"]
             vec![
                 "appPort",
                 "runArgs",
-                "hostRequirements.gpu",
                 "hostRequirements.gpu.cores",
                 "hostRequirements.gpu.memory",
                 "hostRequirements.cpus",
@@ -2232,7 +2227,9 @@ customizations.jetbrains.plugins = ["x"]
         assert_eq!(gpu("gpu = true").gpu_need(), Some(GpuNeed::Required));
         assert_eq!(gpu("gpu = false").gpu, Some(GpuRequirement::No));
         assert_eq!(gpu("gpu = false").gpu_need(), None);
-        assert!(gpu("gpu = false").set_keys().is_empty(), "`false` is nothing to warn about");
+        for body in ["gpu = false", "gpu = true", "gpu = \"optional\"", "gpu = {}"] {
+            assert!(gpu(body).set_keys().is_empty(), "{body}: `gpu` is acted on");
+        }
         assert_eq!(gpu("gpu = \"optional\"").gpu_need(), Some(GpuNeed::Optional));
         let min = gpu("gpu = { cores = 2, memory = \"8gb\" }");
         assert_eq!(
@@ -2296,6 +2293,7 @@ postCreateCommand = "npm install"
 customizations.vscode.extensions = ["rust-lang.rust-analyzer"]
 privileged = true
 placement = "home"
+hostRequirements.gpu = true
 "#,
         )
         .unwrap();

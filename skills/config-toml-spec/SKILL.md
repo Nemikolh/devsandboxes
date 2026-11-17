@@ -90,6 +90,7 @@ Keys are devcontainer camelCase, except devsandbox extras noted in kebab-case. *
 | `updateRemoteUserUID` | bool; a hint for `identity` when that's unset: `false` means `identity = "image"`, `true` changes nothing. A non-bool errors. Hashed for drift. |
 | `init` | `true` → `docker run --init`. |
 | `privileged` | bool; `true` → `docker run --privileged`. OR-ed with any enabled feature's `privileged`, so `false` can't veto a feature that needs it. Skipped with a warning on Apple `container` (no such flag). |
+| `hostRequirements.gpu` | `true` (required), `false` (none), `"optional"`, or a table `{ cores = int, memory = "8gb" }` (counts as required; `cores` / `memory` warned as not enforced, nothing else allowed in it). Every NVIDIA GPU, no device selection: docker `--gpus all` when its `nvidia` runtime is registered, else `--device nvidia.com/gpu=all` with an NVIDIA CDI spec (docker's `CDISpecDirs`; podman's `/etc/cdi`, `/var/run/cdi`); none on Apple `container`. Decided before anything is built: required with no usable GPU fails `run` / `rebuild` naming why; `"optional"` warns and runs without. On a fleet worker it needs `[allow] gpus = true` in its `member.toml` (required without it is refused; optional runs without). The other `hostRequirements` keys are warned (below). Hashed for drift. |
 | `initializeCommand` | Runs on the **host**, cwd = config dir, before anything is created. |
 | `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, `postStartCommand`, `postAttachCommand` | Run in that order in the container after create (as the exec user `remoteUser` describes, in `workspaceFolder`, with `remoteEnv`). `start` re-runs only `postStartCommand`. |
 | `customizations.vscode.extensions` | [string]; installed via VS Code (workspace recommendations on Apple `container`). |
@@ -99,9 +100,9 @@ Lifecycle command forms: `"shell string"` (→ `sh -c`), `["argv", "..."]`, or a
 
 ### Accepted but ignored (warned at `run`)
 
-`name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements` (each set key warned by name, `gpu = false` not: `hostRequirements.gpu`, `.gpu.cores`, `.gpu.memory`, `.cpus`, `.memory`, `.storage`), `waitFor`, `secrets`, `customizations.vscode.settings`, any other `customizations.vscode.*` or `customizations.<tool>`.
+`name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements` but `gpu` (each set key warned by name: `hostRequirements.gpu.cores`, `.gpu.memory`, `.cpus`, `.memory`, `.storage`), `waitFor`, `secrets`, `customizations.vscode.settings`, any other `customizations.vscode.*` or `customizations.<tool>`.
 
-`hostRequirements` is still typed: unknown keys error, and `gpu` must be `true` (required), `false` (none), `"optional"`, or a table `{ cores = int, memory = "8gb" }` (counts as required; nothing else allowed in it). `cpus` / `memory` / `storage` take any value. `extends` merges it like any table (a sandbox's `hostRequirements.gpu` overrides a template's, the template's other keys stay). It is hashed for drift.
+`hostRequirements` is typed: unknown keys error, `gpu` takes the forms above, `cpus` / `memory` / `storage` take any value. `extends` merges it like any table (a sandbox's `hostRequirements.gpu` overrides a template's, the template's other keys stay). It is hashed for drift.
 
 Not accepted at all (hard error): compose keys (`dockerComposeFile`, `service`, `runServices`) — compose support was removed.
 

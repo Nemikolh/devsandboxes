@@ -464,7 +464,7 @@ pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<Vec<String>> {
 /// worker policy with no allowances would refuse, over the config root and
 /// the folders that move with it (`folder`, `folders` outside the root) as
 /// the only paths that travel. From the config ([`Policy::config_refusals`]:
-/// `initializeCommand`, `privileged`, global services,
+/// `initializeCommand`, `privileged`, a required GPU, global services,
 /// `${localEnv:…}`, …) and each `mounts` bind ([`Policy::check_bind`]:
 /// sources outside those paths, runtime sockets; not `${sharedVolumes}`
 /// ones, a fresh dir on a worker whatever they point to here) and each `build` context or
@@ -1297,6 +1297,8 @@ mod tests {
         assert_eq!(ties_of_toml("placement = \"home\""), ["`placement = \"home\"`"]);
         assert_eq!(ties_of_toml("privileged = true\nplacement = \"home\""), ["`placement = \"home\"`", "privileged"]);
         assert_eq!(ties_of_toml(""), Vec::<String>::new());
+        // An optional GPU runs without one anywhere.
+        assert_eq!(ties_of_toml("hostRequirements.gpu = \"optional\""), Vec::<String>::new());
         assert_eq!(
             ties_of_toml(
                 "caches = [\"cargo\"]\npersist-shell-history = true\nworktree-link = [\".env\"]\n\
@@ -1320,6 +1322,7 @@ mod tests {
             ),
             ("containerEnv = { T = \"${localEnv:X}\" }".into(), "`${localEnv:X}` (this host's env)".into()),
             ("privileged = true".into(), "privileged".into()),
+            ("hostRequirements.gpu = true".into(), "a required GPU (`hostRequirements.gpu`)".into()),
             ("initializeCommand = \"true\"".into(), "`initializeCommand`".into()),
             ("services = [\"i\", \"g\"]".into(), "global service `g`".into()),
         ] {

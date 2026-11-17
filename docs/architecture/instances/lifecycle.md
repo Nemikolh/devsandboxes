@@ -7,7 +7,8 @@ instance verb or `state.toml`.
 Code: `src/commands/run/mod.rs` (`run`, `claim_name`, `prepare_worktree`,
 `materialize`, `run_container`, `container_command`, `default_instance_name`,
 `unique_instance_id`, `orphan_check`, `RunExtras`, `RunRecord`),
-`src/commands/run/lifecycle.rs`, `src/commands/run/progress.rs` (`Tracker`,
+`src/commands/run/lifecycle.rs`, `src/commands/run/gpu.rs` (`gpu_decision`),
+`src/commands/run/progress.rs` (`Tracker`,
 `on_failure`, `rollback`), `src/commands/run/cancel.rs`,
 `src/commands/{start,stop,rm,rename,done}.rs`, `src/commands/mod.rs`
 (`resolve_instance`, `not_ready`, `in_flight`), `src/state.rs` (`State`,
@@ -77,7 +78,8 @@ Shared by `run` and `rebuild`; replaces the record. Fields a previous record
 had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
 `folders` worktrees, `volumes`) carry over.
 
-1. `initializeCommand` on the host (in the config dir).
+1. The GPU decision (below), then `initializeCommand` on the host (in the
+   config dir).
 2. `worktree-link` store and links, `.worktreeinclude` copies, `folders`
    worktrees, worktree locks ([worktrees](worktrees.md)).
 3. `ensure_services` ([services](services.md)).
@@ -87,7 +89,8 @@ had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`
 5. Phase `building`: `image_for`, then the identity plan
    (`identity::plan_for`: probe, plan, its summary and warnings on
    stderr; [identity](identity.md)). Phase `creating`: `run_container`
-   (`run -d`, labels, the plan's `--user`/`--userns` and relabeled binds,
+   (`run -d`, labels, `--privileged`, the GPU flags, the plan's
+   `--user`/`--userns` and relabeled binds,
    `--mount`s, env, first network; command
    `sh -c '[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity'`,
    `container_command`), then
@@ -104,6 +107,21 @@ had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`
    workspace as workdir, the recorded exec user (`remote_user`),
    `exec_env` (the tool env and the plan's `HOME`, `remoteEnv`, `extra_env`) and the
    ssh-agent socket. Then `progress` is cleared.
+
+## GPUs
+
+`gpu::gpu_decision` turns `hostRequirements.gpu` (`HostRequirements::gpu_need`)
+into `run` flags, first thing in `materialize`, so a required GPU fails
+before anything is built or pulled. Nothing asked: no flags, and
+`Backend::gpu_support` isn't called. Else, when the worker policy lends
+GPUs (no policy for the config dir, or `[allow] gpus = true`), the
+runtime's `GpuSupport::run_args` (`--gpus all` or
+`--device nvidia.com/gpu=all`; [runtimes](../runtimes.md#gpus)).
+No usable GPU (`GpuSupport::None`'s reason, a failed detection, or the
+policy): a required one fails the run naming why, with the hint to set
+`hostRequirements.gpu = "optional"`; an optional one is one warning and
+the container runs without. `run_container` puts the flags right after
+`--privileged`. `start` restarts the container with its create flags.
 
 ## Phases and failure
 

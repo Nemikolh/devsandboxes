@@ -18,6 +18,7 @@ mod editor;
 mod facts;
 mod folders;
 mod git;
+mod gpu;
 mod identity;
 mod image;
 mod lifecycle;
@@ -627,6 +628,16 @@ pub(crate) fn materialize(
 
     let policy = crate::worker_policy::Policy::for_dir(dir)?;
 
+    // Before anything is built or created, so a required GPU fails fast.
+    let (gpu_args, warnings) = gpu::gpu_decision(
+        props.host_requirements.as_ref().and_then(|h| h.gpu_need()),
+        || backend().gpu_support(),
+        policy.as_ref().is_none_or(|p| p.allow.gpus),
+    )?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+
     // initializeCommand runs on the host, before anything is created.
     if let Some(cmd) = &props.initialize_command {
         run_host_commands(dir, cmd).context("initializeCommand failed")?;
@@ -817,6 +828,7 @@ pub(crate) fn materialize(
         &extra_env,
         &networks,
         privileged,
+        &gpu_args,
         restart,
         dispatcher.as_deref(),
         &plan,
@@ -1134,6 +1146,7 @@ pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandb
 /// namespace, the seccomp profile (`seccomp`, its path) and the binds'
 /// SELinux labels (`identity::create_args`). `container_env` is the
 /// sandbox's `containerEnv`, substituted (`ContainerEnv::resolve`).
+/// `gpu_args` are `gpu::gpu_decision`'s flags.
 #[allow(clippy::too_many_arguments)]
 fn run_container(
     dir: &Path,
@@ -1149,6 +1162,7 @@ fn run_container(
     extra_env: &[(String, String)],
     networks: &[String],
     privileged: bool,
+    gpu_args: &[String],
     restart: Option<&str>,
     dispatcher: Option<&str>,
     plan: &crate::runtime::identity::Plan,
@@ -1181,6 +1195,7 @@ fn run_container(
     if privileged {
         args.push("--privileged".into());
     }
+    args.extend(gpu_args.iter().cloned());
     if let Some(policy) = restart {
         args.push("--restart".into());
         args.push(policy.into());

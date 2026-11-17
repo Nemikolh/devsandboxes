@@ -27,7 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ResolvedSandbox, ResolvedService, ServiceScope};
+use crate::config::{Config, GpuNeed, ResolvedSandbox, ResolvedService, ServiceScope};
 use crate::runtime::NAME_PREFIX;
 
 /// `member.toml`'s `trust`: what a remote caller of this member's daemon
@@ -75,6 +75,10 @@ pub struct Allow {
     /// A published port (`-p`) on more than loopback.
     #[serde(skip_serializing_if = "is_false")]
     pub publish: bool,
+    /// `hostRequirements.gpu`: every NVIDIA GPU (`--gpus all`,
+    /// `--device nvidia.com/gpu=all`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub gpus: bool,
     /// Names of this host's env vars a config may read with
     /// `${localEnv:NAME}` (exact names; the control plane writes the config, so any
     /// other would hand it this host's env).
@@ -268,8 +272,8 @@ impl Policy {
 
     /// What the resolved sandbox `sandbox` of `config` (at `dir`) declares
     /// that never shows in a container's argv or is done on the host before
-    /// one: `initializeCommand`, `dispatcher`, `inbox`, `privileged`, `global`
-    /// services, local features outside the fleet root (or with a file
+    /// one: `initializeCommand`, `dispatcher`, `inbox`, `privileged`, a
+    /// required GPU (an optional one runs without), `global` services, local features outside the fleet root (or with a file
     /// resolving outside it), and `${localEnv:NAME}` in the merged sandbox
     /// or its services for a name `local-env` doesn't list.
     pub fn check_config(&self, dir: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Result<(), Refusal> {
@@ -291,6 +295,12 @@ impl Policy {
             (props.dispatcher.is_some(), a.dispatcher, "`dispatcher`", "dispatcher"),
             (props.inbox == Some(true), a.inbox, "`inbox`", "inbox"),
             (props.privileged == Some(true), a.privileged, "privileged", "privileged"),
+            (
+                props.host_requirements.as_ref().and_then(|h| h.gpu_need()) == Some(GpuNeed::Required),
+                a.gpus,
+                "a required GPU (`hostRequirements.gpu`)",
+                "gpus",
+            ),
         ];
         for (asked, allowed, what, key) in flags {
             if asked && !allowed {
@@ -449,7 +459,8 @@ impl Policy {
     /// with their values checked: `--privileged`, binds (`-v`, `--mount`),
     /// `--network` (devsandbox's networks; `host` needs `host-network`),
     /// `--userns` (`keep-id…`), `--security-opt` (devsandbox's own seccomp
-    /// profile). Every other flag (`--cap-add`, `--device`, `--pid`,
+    /// profile), `--gpus all` / `--device nvidia.com/gpu=all` (`gpus`).
+    /// Every other flag (`--cap-add`, any other `--device`, `--pid`,
     /// `--ipc`, …) is refused. The first positional is the image; what
     /// follows is its command.
     pub fn check_run(&self, argv: &[String]) -> Result<(), Refusal> {
@@ -496,6 +507,16 @@ impl Policy {
                 "--network" | "--net" => {
                     let v = value()?;
                     self.check_network(&v)?;
+                }
+                "--gpus" | "--device" => {
+                    let v = value()?;
+                    let gpus = matches!((flag, v.as_str()), ("--gpus", "all") | ("--device", "nvidia.com/gpu=all"));
+                    if !gpus {
+                        return Err(Refusal::always(format!("`{flag} {v}`")));
+                    }
+                    if !self.allow.gpus {
+                        return Err(Refusal::new("GPUs", "gpus = true"));
+                    }
                 }
                 "-v" | "--volume" => self.check_volume(&value()?)?,
                 "--mount" => self.check_mount(&value()?)?,
@@ -829,9 +850,9 @@ mod tests {
         std::fs::remove_dir_all(data2.join("fleet")).unwrap();
         assert_eq!(fleet_root_of(&data2, &outside2).unwrap(), None);
         // `detect` reads `[allow]` off member.toml next to it.
-        std::fs::write(data.join("member.toml"), "name = \"lap\"\n[allow]\nprivileged = true\n").unwrap();
+        std::fs::write(data.join("member.toml"), "name = \"lap\"\n[allow]\nprivileged = true\ngpus = true\n").unwrap();
         let p = Policy::detect(&data, &cfg, Vec::new()).unwrap().unwrap();
-        assert!(p.allow.privileged && !p.allow.host_network);
+        assert!(p.allow.privileged && p.allow.gpus && !p.allow.host_network);
         assert!(Policy::detect(&data, &outside, Vec::new()).unwrap().is_none());
         std::fs::write(data.join("member.toml"), "trust = \"worker\"\n").unwrap();
         assert_eq!(Policy::detect(&data, &cfg, Vec::new()).unwrap().unwrap().allow, Allow::default());
@@ -922,6 +943,7 @@ mod tests {
                 inbox: true,
                 initialize_command: true,
                 publish: true,
+                gpus: true,
                 local_env: vec!["X".into()],
                 binds: vec![outside.clone()],
             };
@@ -954,6 +976,10 @@ mod tests {
             ),
             (argv(&["--network", "host"]), "host-network = true", Some((|a| a.host_network = true, |a| a.host_network = false))),
             (argv(&["-p", "5432"]), "publish = true", Some((|a| a.publish = true, |a| a.publish = false))),
+            (argv(&["--gpus", "all"]), "gpus = true", Some((|a| a.gpus = true, |a| a.gpus = false))),
+            (argv(&["--gpus=all"]), "gpus = true", Some((|a| a.gpus = true, |a| a.gpus = false))),
+            (argv(&["--device", "nvidia.com/gpu=all"]), "gpus = true", Some((|a| a.gpus = true, |a| a.gpus = false))),
+            (argv(&["--device=nvidia.com/gpu=all"]), "gpus = true", Some((|a| a.gpus = true, |a| a.gpus = false))),
             (argv(&["-p", "8080:80"]), "publish = true", None),
             (argv(&["--publish=0.0.0.0:8080:80"]), "publish = true", None),
             (argv(&["-p", "[::]:8080:80"]), "publish = true", None),
@@ -1003,6 +1029,11 @@ mod tests {
         for extra in [
             &["--cap-add", "SYS_ADMIN"][..],
             &["--device", "/dev/kvm"],
+            &["--device", "nvidia.com/gpu=0"],
+            &["--device=/dev/nvidia0"],
+            &["--gpus", "1"],
+            &["--gpus=device=0"],
+            &["--gpus", "all,capabilities=utility"],
             &["--pid", "host"],
             &["--ipc=host"],
             &["--userns", "host"],
@@ -1081,6 +1112,8 @@ mod tests {
             "",
             "services = [\"i\"]",
             "privileged = false",
+            "hostRequirements.gpu = false",
+            "hostRequirements.gpu = \"optional\"",
             "caches = [\"cargo\"]",
             "persist-shell-history = true",
             "worktree-link = [\".env\"]",
@@ -1090,11 +1123,13 @@ mod tests {
         ] {
             assert_eq!(check(&none, fine), Ok(()), "{fine}");
         }
-        let items: [(&str, &str, fn(&mut Allow)); 6] = [
+        let items: [(&str, &str, fn(&mut Allow)); 8] = [
             ("initializeCommand = \"true\"", "initialize-command = true", |a| a.initialize_command = true),
             ("dispatcher = {}", "dispatcher = true", |a| a.dispatcher = true),
             ("inbox = true", "inbox = true", |a| a.inbox = true),
             ("privileged = true", "privileged = true", |a| a.privileged = true),
+            ("hostRequirements.gpu = true", "gpus = true", |a| a.gpus = true),
+            ("hostRequirements.gpu = { cores = 2 }", "gpus = true", |a| a.gpus = true),
             ("services = [\"i\", \"g\"]", "global-services = true", |a| a.global_services = true),
             ("features = { \"./features/leak\" = {} }", "binds = [", |a| a.binds = vec![std::env::temp_dir()]),
         ];
@@ -1104,8 +1139,8 @@ mod tests {
             let mut own = Allow::default();
             grant(&mut own);
             assert_eq!(check(&policy(&data, &root, own), extra), Ok(()), "{extra}");
-            for (j, (_, _, other)) in items.iter().enumerate() {
-                if i != j {
+            for (j, (_, theirs, other)) in items.iter().enumerate() {
+                if i != j && theirs != allowance {
                     let mut a = Allow::default();
                     other(&mut a);
                     assert!(check(&policy(&data, &root, a), extra).is_err(), "{extra} permitted by item {j}");

@@ -9,7 +9,6 @@
 mod apple;
 pub mod bounded;
 mod dockerlike;
-#[allow(dead_code)] // nothing asks for a GPU yet
 pub mod gpu;
 // Only the daemon follows events (unix-only).
 #[cfg(unix)]
@@ -386,7 +385,6 @@ pub trait Backend: Send + Sync {
     /// flags (docs/architecture/runtimes.md, *GPUs*): the same `info` as
     /// [`Backend::engine_info`], plus the engine's CDI specs when it runs on
     /// this host's kernel. stderr is captured.
-    #[allow(dead_code)] // nothing asks for a GPU yet
     fn gpu_support(&self) -> Result<gpu::GpuSupport>;
 
     /// The identity probe's canary: from `image` (local, never pulled), with

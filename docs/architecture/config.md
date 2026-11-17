@@ -51,10 +51,12 @@ A fourth table, `[profiles.*]`, is typed at parse.
   are hard errors). `SandboxProperties` is the devcontainer.json schema plus
   devsandbox extras. Valid devcontainer properties devsandbox doesn't act on
   still parse; `ignored()` lists them and `run` warns before creating the
-  container. `hostRequirements` is typed anyway (`HostRequirements`, with
+  container. `hostRequirements` is typed (`HostRequirements`, with
   `GpuRequirement`'s own `Deserialize` for `gpu`'s bool | `"optional"` |
-  table forms; `HostRequirements::gpu_need` reads it as a `GpuNeed`), and
-  `ignored()` names each of its set keys. `Service` takes the same
+  table forms; `HostRequirements::gpu_need` reads it as a `GpuNeed`, which
+  `run` acts on: [lifecycle](instances/lifecycle.md#gpus)), and `ignored()`
+  names each of its other set keys (`gpu.cores`, `gpu.memory`, `cpus`,
+  `memory`, `storage`). `Service` takes the same
   `hostRequirements`. `SandboxProperties::identity` folds devcontainer's
   `updateRemoteUserUID` into the `identity` field (`false` means `image`
   when `identity` is unset). `forwardPorts` entries are deduplicated after merge and each
