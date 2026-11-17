@@ -732,7 +732,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   end becomes this process's exit code (`pty_client::exit_of`: the
   program's, 255 only for a lost link, the helper's session codes).
 - **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /
-  `--sessions` / `--service`, and a tty by a local `exec`'s rule,
+  `--sessions` / `--end` / `--service`, and a tty by a local `exec`'s rule,
   `shell_flags` or with a command `command_flags`, with this process on a
   terminal standing for its stdin and stdout).
   The id is this process's (`--session` as given, else
@@ -756,6 +756,8 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   machine's not-resumable message. Ctrl-C during a wait ends the process.
 - **Sessions**: `--sessions` is a `sessions.list` quick call with
   `machine` (the lines printed, or `no sessions in \`m/x\`` on stderr);
+  `--end ID` a `sessions.rm` one (`ended session <id> in m/x`, the
+  machine's error as `` `m/x`: <message> ``), never a dial;
   `--attach [ID]` is one dial attaching only (no id:
   `exec::choose_detached` over that list), no loop, as a local
   `--attach` (`session_exec`): on a terminal a session dial, else the

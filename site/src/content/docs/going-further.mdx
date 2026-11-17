@@ -50,10 +50,15 @@ An interactive `exec` (one with a terminal) runs in a session inside the instanc
 devsandbox exec web --sessions                # id, state, attached or detached, started, command
 devsandbox exec web --attach                  # the one detached session; a pick list if several
 devsandbox exec web --attach=1790000000-a1b2  # a given one
-devsandbox exec web --session dev pnpm dev    # run in session `dev`, or attach if it's live
+devsandbox exec web --session 1790000000-a1b2 pnpm dev  # run in that session, or attach if it's live
+devsandbox exec web --end 1790000000-a1b2     # end a session (its program gets SIGHUP)
 ```
 
+A session id is `<unix seconds, 10 digits>-<4 hex digits>`, as `--sessions` lists them.
+
 The dashboard's terminals run in sessions too, so a shell still open when you quit the dashboard is there for `--attach`.
+
+Sessions never time out: one ends when its program exits, when you end it (`--end`, or `K` on its row in the dashboard), or when its container stops. Stopping the sandbox ends them all. All of these work on a machine too (`devsandbox exec box/web --end …`).
 
 ## Who you are inside
 

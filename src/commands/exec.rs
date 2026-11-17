@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use super::resolve_instance;
 use crate::devsbd::control::valid_run_id;
@@ -29,6 +29,8 @@ pub enum Exec<'a> {
     Attach(Option<&'a str>),
     /// `--sessions`: the helper's `session ls`.
     Sessions,
+    /// `--end ID`: end session `ID` (the helper's `session rm`).
+    End(&'a str),
     /// `--service NAME`: `command` (empty: the login shell) in the container
     /// of service `service` the instance uses, `-i -t`, never a session.
     Service { service: &'a str, command: &'a [String] },
@@ -83,12 +85,27 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
             if !helper {
                 bail!("`{key}` has no devsbd helper, so no sessions");
             }
-            let listing = backend().output(&refs(&session_ls_argv(instance)))?;
+            let listing = backend().output(&refs(&session_argv(instance, &["ls"])))?;
             if listing.is_empty() {
                 eprintln!("no sessions in `{key}`");
             } else {
                 print!("{listing}");
             }
+            Ok(0)
+        }
+        Exec::End(id) => {
+            let id = checked_session_id(id)?;
+            if !helper {
+                bail!("`{key}` has no devsbd helper, so no sessions");
+            }
+            let argv = session_argv(instance, &["rm", id]);
+            let out = std::process::Command::new(backend().bin())
+                .args(&argv)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("failed to run {} (is it installed?)", backend().bin()))?;
+            ended(&key, id, out.status.code().unwrap_or(1), &String::from_utf8_lossy(&out.stderr))?;
+            println!("ended session {id} in {key}");
             Ok(0)
         }
         Exec::Attach(id) => {
@@ -98,7 +115,7 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
             let id = match id {
                 Some(id) => checked_session_id(id)?.to_string(),
                 None => {
-                    let listing = backend().output(&refs(&session_ls_argv(instance)))?;
+                    let listing = backend().output(&refs(&session_argv(instance, &["ls"])))?;
                     choose_detached(&key, &listing, stdin_tty, &mut |prompt, options| super::pick(prompt, options))?
                 }
             };
@@ -327,11 +344,31 @@ pub(crate) fn session_attach_command(id: &str) -> Vec<String> {
     [crate::devsbd::BIN, "session", "attach", id].iter().map(|s| s.to_string()).collect()
 }
 
-/// The runtime argv listing `instance`'s sessions (as its user: a session's
-/// socket is its user's).
-fn session_ls_argv(instance: &Instance) -> Vec<String> {
-    let ls: Vec<String> = [crate::devsbd::BIN, "session", "ls"].iter().map(|s| s.to_string()).collect();
-    exec_argv_with(instance, false, false, &ls, false)
+/// The runtime argv of the helper's `session <args>` in `instance` (`ls`,
+/// `rm <id>`), as its user: a session's socket and dir are its user's.
+fn session_argv(instance: &Instance, args: &[&str]) -> Vec<String> {
+    let command: Vec<String> =
+        [crate::devsbd::BIN, "session"].iter().chain(args).map(|s| s.to_string()).collect();
+    exec_argv_with(instance, false, false, &command, false)
+}
+
+/// The helper's `NO_SESSION_EXIT` (`devsbd/src/sessions.rs`): no such
+/// session, for an attach (unknown or `lost`) and for `session rm`.
+pub(crate) const NO_SESSION_EXIT: i32 = 250;
+
+/// How `--end`'s `session rm <id>` in instance `key` went, from its exit
+/// `code` and `stderr`: the exit code, not the text, says the session isn't
+/// there ([`NO_SESSION_EXIT`]); any other failure carries stderr's last
+/// line (the helper's or the runtime's own reason).
+fn ended(key: &str, id: &str, code: i32, stderr: &str) -> Result<()> {
+    match code {
+        0 => Ok(()),
+        NO_SESSION_EXIT => bail!("no session {id} in {key} (devsandbox exec {key} --sessions)"),
+        _ => {
+            let why = stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("non-zero exit");
+            bail!("ending session {id} in {key} failed (exit {code}): {why}")
+        }
+    }
 }
 
 /// A fresh session id at `now` (unix secs), in `control::valid_run_id`'s
@@ -716,10 +753,22 @@ mod tests {
         want.extend(shell);
         assert_eq!(argv, want);
         assert_eq!(session_attach_command(ID), [crate::devsbd::BIN, "session", "attach", ID]);
-        assert_eq!(
-            session_ls_argv(&inst),
-            ["exec", "-w", "/workspaces/repository-1", "-u", "vscode", "-e", "FOO=bar", "devsandbox-repo-abc1", crate::devsbd::BIN, "session", "ls"]
-        );
+        let plain = ["exec", "-w", "/workspaces/repository-1", "-u", "vscode", "-e", "FOO=bar", "devsandbox-repo-abc1", crate::devsbd::BIN, "session"];
+        assert_eq!(session_argv(&inst, &["ls"]), [&plain[..], &["ls"][..]].concat());
+        // `--end`'s: the same user, no -i/-t.
+        assert_eq!(session_argv(&inst, &["rm", ID]), [&plain[..], &["rm", ID][..]].concat());
+    }
+
+    /// `--end`'s outcome comes from `session rm`'s code: 250 is no such
+    /// session (pointing at `--sessions`), any other failure says why.
+    #[test]
+    fn ending_a_session_reads_the_code() {
+        assert!(ended("web", ID, 0, "").is_ok());
+        let gone = ended("web", ID, NO_SESSION_EXIT, "devsbd session: no session `x`\n").unwrap_err();
+        assert_eq!(gone.to_string(), format!("no session {ID} in web (devsandbox exec web --sessions)"));
+        let failed = ended("web", ID, 1, "devsbd session: permission denied\n\n").unwrap_err();
+        assert_eq!(failed.to_string(), format!("ending session {ID} in web failed (exit 1): devsbd session: permission denied"));
+        assert!(ended("web", ID, 126, "").unwrap_err().to_string().ends_with("(exit 126): non-zero exit"));
     }
 
     #[test]

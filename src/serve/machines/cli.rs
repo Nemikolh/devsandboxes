@@ -21,7 +21,7 @@
 //! A tty `exec` on a machine runs in a helper session this process names
 //! ([`reconnect_session`]), in a loop: a lost link (the dial's 255) re-dials
 //! an attach to it ([`Reconnect`], [`dials`]). Its `--attach` is one dial,
-//! `--sessions` a `sessions.list` quick call. An exec without a tty is one
+//! `--sessions` a `sessions.list` quick call, `--end` a `sessions.rm` one. An exec without a tty is one
 //! piped dial ([`pipe_mode`]; a session one, `--attach` or `--session`,
 //! runs the helper's session client piped, as a local `exec` does), an
 //! `exec --service` one service dial ([`service_mode`]); neither is
@@ -384,11 +384,11 @@ pub(crate) fn resolve_lost(qualified: bool, command: &Command, code: &str) -> bo
     qualified && matches!(command, Command::Exec { reserve_255: true, .. }) && !matches!(code, "not-found" | "denied")
 }
 
-/// The helper's `NO_SESSION_EXIT` (`devsbd/src/sessions.rs`): an attach to
-/// a session that is unknown or `lost`. Like every code but 255 it ends
-/// [`Reconnect`]'s loop as the session's answer, with the helper's own note
-/// on stderr; this one also says the session is gone ([`gone_note`]).
-pub(crate) const NO_SESSION_EXIT: i32 = 250;
+/// The helper's `NO_SESSION_EXIT` (`commands::exec::NO_SESSION_EXIT`): an
+/// attach to a session that is unknown or `lost`. Like every code but 255 it
+/// ends [`Reconnect`]'s loop as the session's answer, with the helper's own
+/// note on stderr; this one also says the session is gone ([`gone_note`]).
+pub(crate) const NO_SESSION_EXIT: i32 = crate::commands::exec::NO_SESSION_EXIT;
 
 /// The helper's `DETACHED_EXIT`: another client took the session over (it
 /// runs on, attached elsewhere). What a `PTY` stream's `detached` end
@@ -477,12 +477,12 @@ pub(crate) fn gone_note(id: &str) -> String {
 
 /// The session id a machine `exec` reconnects with: `None` when it gets no
 /// tty (a piped exec, nothing to re-attach to) or is an `--attach` /
-/// `--sessions` already, or a `--service` terminal (never a session). The
+/// `--sessions` / `--end` already, or a `--service` terminal (never a session). The
 /// tty rule is a local `exec`'s (`commands::exec::shell_flags`, with a
 /// command `command_flags`), `terminal` standing for its stdin and stdout: a
 /// `PTY` dial has a terminal exactly when this process is on one. A `--session` given is kept, else one is minted here.
 pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl FnOnce() -> String) -> Result<Option<String>> {
-    let Command::Exec { interactive, tty, attach: None, sessions: false, session, service: None, command, .. } = command else {
+    let Command::Exec { interactive, tty, attach: None, sessions: false, end: None, session, service: None, command, .. } = command else {
         return Ok(None);
     };
     let tty = if command.is_empty() {
@@ -506,10 +506,10 @@ pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl Fn
 /// `-i`, as a local `exec` runs it. With `--session <id>`, that `argv` in
 /// the helper's session `id` (`exec::session_new_command`), as a local
 /// `exec --session` without a tty runs it. `None` for one that gets a tty,
-/// an `--attach` / `--sessions` one ([`session_exec`]), a `--service` one
+/// an `--attach` / `--sessions` / `--end` one ([`session_exec`]), a `--service` one
 /// ([`service_mode`]) and any other command.
 pub(crate) fn pipe_mode(command: &Command, terminal: bool) -> Result<Option<pty_client::Mode>> {
-    let Command::Exec { interactive, tty, attach: None, sessions: false, session, service: None, command, .. } = command else {
+    let Command::Exec { interactive, tty, attach: None, sessions: false, end: None, session, service: None, command, .. } = command else {
         return Ok(None);
     };
     let (argv, interactive) = if command.is_empty() {
@@ -814,8 +814,9 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         drop(conn);
         return one_dial(mode);
     }
-    match session_exec(&command, &mut conn, &m, &chosen.name, root, terminal)? {
-        Some(SessionExec::Listed) => return Ok(Routed::Exit(0)),
+    let session = session_exec(&command, &mut |method, params| conn.call(method, params), &m, &chosen.name, root, terminal)?;
+    match session {
+        Some(SessionExec::Done) => return Ok(Routed::Exit(0)),
         Some(SessionExec::Dial(request)) => {
             drop(conn);
             let _attach = attach(&request.mode);
@@ -844,34 +845,45 @@ pub(crate) fn records_attach(mode: &pty_client::Mode) -> bool {
     !matches!(mode, pty_client::Mode::Pipe { .. })
 }
 
-/// What [`session_exec`] did: listed the sessions (printed), or the dial
-/// of an attach to one, for the caller to make once `conn` is dropped.
+/// What [`session_exec`] did: listed the sessions or ended one (printed),
+/// or the dial of an attach to one, for the caller to make once its
+/// connection is dropped.
+#[derive(Debug, PartialEq)]
 enum SessionExec {
-    Listed,
+    Done,
     Dial(pty_client::Request),
 }
 
-/// `exec --sessions` and `exec --attach [ID]` of instance `name` on machine
-/// `m` (at `root` there): the session list through a `sessions.list` quick
-/// call on `conn`; the attach one `PTY` dial ([`attach_mode`]; no loop, as
-/// a local `--attach`: its 255 is the caller's to retry), returned for the
-/// caller to make. `None` for any other exec, which [`resolve_and_route`]
-/// goes on with.
+/// `exec --sessions`, `exec --end ID` and `exec --attach [ID]` of instance
+/// `name` on machine `m` (at `root` there): the session list through a
+/// `sessions.list` quick call through `call`, the end a `sessions.rm` one;
+/// the attach one `PTY` dial ([`attach_mode`]; no loop, as a local
+/// `--attach`: its 255 is the caller's to retry), returned for the caller to
+/// make. `None` for any other exec, which [`resolve_and_route`] goes on with.
 fn session_exec(
     command: &Command,
-    conn: &mut Conn,
+    call: &mut calls::Call,
     m: &str,
     name: &str,
     root: &Path,
     terminal: bool,
 ) -> Result<Option<SessionExec>> {
-    let Command::Exec { attach, sessions, .. } = command else { return Ok(None) };
-    if !*sessions && attach.is_none() {
+    let Command::Exec { attach, sessions, end, .. } = command else { return Ok(None) };
+    if !*sessions && attach.is_none() && end.is_none() {
         return Ok(None);
     }
     let key = format!("{m}/{name}");
+    if let Some(id) = end {
+        let id = crate::commands::exec::checked_session_id(id)?;
+        let r = call("sessions.rm", json!({ "root": root, "instance": name, "id": id, "machine": m }))?;
+        if let Some(e) = r.error {
+            bail!("`{key}`: {}", e.message);
+        }
+        println!("ended session {id} in {key}");
+        return Ok(Some(SessionExec::Done));
+    }
     let mut list = || -> Result<Vec<String>> {
-        let r = conn.call("sessions.list", json!({ "root": root, "instance": name, "machine": m }))?;
+        let r = call("sessions.list", json!({ "root": root, "instance": name, "machine": m }))?;
         if let Some(e) = r.error {
             bail!("`{key}`: {}", e.message);
         }
@@ -886,7 +898,7 @@ fn session_exec(
         for line in lines {
             println!("{line}");
         }
-        return Ok(Some(SessionExec::Listed));
+        return Ok(Some(SessionExec::Done));
     }
     let id = match attach {
         Some(Some(id)) => crate::commands::exec::checked_session_id(id)?.to_string(),
@@ -1225,6 +1237,7 @@ mod tests {
         assert_eq!(rs(&["exec", "--session", "1790000000-0000", "box/web"], true).as_deref(), Some("1790000000-0000"));
         assert_eq!(rs(&["exec", "box/web", "--attach"], true), None);
         assert_eq!(rs(&["exec", "box/web", "--sessions"], true), None);
+        assert_eq!(rs(&["exec", "box/web", "--end", ID], true), None, "an end is no session of its own");
         assert_eq!(rs(&["logs", "box/web"], true), None);
         assert!(reconnect_session(&command(&["exec", "--session", "nope", "box/web"]), true, mint).is_err());
     }
@@ -1256,6 +1269,7 @@ mod tests {
         assert!(pipe_mode(&command(&["exec", "--session", "nope", "box/web", "ls"]), false).is_err());
         assert_eq!(pm(&["exec", "box/web", "--attach"], false), None);
         assert_eq!(pm(&["exec", "box/web", "--sessions"], false), None);
+        assert_eq!(pm(&["exec", "box/web", "--end", ID], false), None, "never dialed");
         assert_eq!(pm(&["logs", "box/web"], false), None);
     }
 
@@ -1266,6 +1280,47 @@ mod tests {
         assert_eq!(attach_mode(ID.into(), true), pty_client::Mode::Session { id: ID.into(), create: None });
         let piped = pty_client::Mode::Pipe { argv: crate::commands::exec::session_attach_command(ID), interactive: true };
         assert_eq!(attach_mode(ID.into(), false), piped);
+    }
+
+    /// `--end` is one `sessions.rm` quick call, never a dial; its id is
+    /// checked first and a refusal there is the command's error. Any other
+    /// exec makes no call here.
+    #[test]
+    fn end_is_a_sessions_rm_call() {
+        use crate::serve::proto::{ErrorBody, Response};
+        let run = |args: &[&str], answer: Option<&str>| {
+            let mut calls: Vec<(String, Value)> = Vec::new();
+            let r = session_exec(
+                &command(args),
+                &mut |method, params| {
+                    calls.push((method.to_string(), params));
+                    Ok(match answer {
+                        None => Response { id: None, result: Some(json!({})), error: None },
+                        Some(why) => Response {
+                            id: None,
+                            result: None,
+                            error: Some(ErrorBody { code: "failed".into(), message: why.into(), data: Default::default() }),
+                        },
+                    })
+                },
+                "box",
+                "web",
+                Path::new("/r/cfg"),
+                true,
+            );
+            (r, calls)
+        };
+        let (r, calls) = run(&["exec", "box/web", "--end", ID], None);
+        assert_eq!(r.unwrap(), Some(SessionExec::Done));
+        assert_eq!(calls, [("sessions.rm".to_string(), json!({"root": "/r/cfg", "instance": "web", "id": ID, "machine": "box"}))]);
+        let (r, _) = run(&["exec", "box/web", "--end", ID], Some("no session `1790000000-a1b2`"));
+        assert_eq!(r.unwrap_err().to_string(), "`box/web`: no session `1790000000-a1b2`");
+        let (r, calls) = run(&["exec", "box/web", "--end", "nope"], None);
+        assert!(r.is_err());
+        assert!(calls.is_empty(), "a bad id fails before any call");
+        let (r, calls) = run(&["exec", "box/web"], None);
+        assert_eq!(r.unwrap(), None);
+        assert!(calls.is_empty());
     }
 
     /// Only a dial with a terminal records this host's attach: a piped exec

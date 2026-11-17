@@ -286,6 +286,7 @@ enum Command {
     ///     devsandbox exec web --sessions
     ///     devsandbox exec web --attach
     ///     devsandbox exec web --attach=1790000000-a1b2
+    ///     devsandbox exec web --end 1790000000-a1b2
     ///     devsandbox exec web --service db
     Exec {
         /// Keep stdin open
@@ -297,12 +298,18 @@ enum Command {
         /// Attach to session ID; without ID, to the instance's one detached
         /// session (several: a pick list on a TTY). Give ID as `--attach=ID`
         /// before the name, or after it
-        #[arg(long, value_name = "ID", num_args = 0..=1, conflicts_with_all = ["command", "sessions", "session", "interactive", "tty"])]
+        #[arg(long, value_name = "ID", num_args = 0..=1, conflicts_with_all = ["command", "sessions", "session", "interactive", "tty", "end"])]
         attach: Option<Option<String>>,
         /// List the instance's sessions: id, state, attached or detached,
         /// started (UTC), command
-        #[arg(long, conflicts_with_all = ["command", "session", "interactive", "tty"])]
+        #[arg(long, conflicts_with_all = ["command", "session", "interactive", "tty", "end"])]
         sessions: bool,
+        /// End session ID: SIGHUP to its program (SIGKILL if still there
+        /// after 2 s), then the session is gone. Sessions have no idle
+        /// timeout: they end this way, when their program exits, or with the
+        /// container
+        #[arg(long, value_name = "ID", conflicts_with_all = ["command", "session", "interactive", "tty"])]
+        end: Option<String>,
         /// Run in session ID, attaching if it is live (even without a TTY);
         /// without the helper, a plain exec
         #[arg(long, value_name = "ID")]
@@ -310,7 +317,7 @@ enum Command {
         /// Open a terminal in service NAME's container, the one this instance
         /// uses (the command, else a login shell; always -i -t, never a
         /// session); needs a TTY
-        #[arg(long, value_name = "NAME", conflicts_with_all = ["attach", "sessions", "session"])]
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["attach", "sessions", "session", "end"])]
         service: Option<String>,
         /// Report a command's exit code 255 as 254, so 255 only ever means
         /// ssh's own failure: what the reconnect loops over ssh pass
@@ -906,13 +913,14 @@ fn main() -> Result<()> {
         }
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
-        Command::Exec { interactive, tty, attach, sessions, session, service, reserve_255, name, command } => {
+        Command::Exec { interactive, tty, attach, sessions, end, session, service, reserve_255, name, command } => {
             use commands::exec::Exec;
-            let what = match (&attach, sessions, &service) {
-                (_, _, Some(service)) => Exec::Service { service, command: &command },
-                (Some(id), _, _) => Exec::Attach(id.as_deref()),
-                (None, true, _) => Exec::Sessions,
-                (None, false, None) => Exec::Run { interactive, tty, command: &command, session: session.as_deref() },
+            let what = match (&attach, sessions, &end, &service) {
+                (_, _, _, Some(service)) => Exec::Service { service, command: &command },
+                (Some(id), _, _, _) => Exec::Attach(id.as_deref()),
+                (None, true, _, _) => Exec::Sessions,
+                (None, false, Some(id), None) => Exec::End(id),
+                (None, false, None, None) => Exec::Run { interactive, tty, command: &command, session: session.as_deref() },
             };
             commands::exec::exec(&name, what, reserve_255)
         }
@@ -1070,6 +1078,14 @@ mod tests {
         }
     }
 
+    /// `exec`'s `--end`.
+    fn end_of(args: &[&str]) -> Result<Option<String>, clap::Error> {
+        match Cli::try_parse_from(["devsandbox", "exec"].iter().chain(args))?.command {
+            Some(Command::Exec { end, .. }) => Ok(end),
+            _ => panic!("not exec"),
+        }
+    }
+
     #[test]
     fn exec_session_flags_parse() {
         let s = |v: &str| v.to_string();
@@ -1087,8 +1103,19 @@ mod tests {
         // After the command starts, the flags are the command's.
         assert_eq!(exec_args(&["web", "--", "cmd", "--attach"]).unwrap(), (None, false, None, s("web"), vec![s("cmd"), s("--attach")]));
         assert_eq!(exec_args(&["web", "ls", "--sessions"]).unwrap().4, vec![s("ls"), s("--sessions")]);
+        assert_eq!(end_of(&["web", "--end", id]).unwrap(), Some(s(id)));
+        assert_eq!(end_of(&["--end=1790000000-a1b2", "web"]).unwrap(), Some(s(id)));
+        assert_eq!(end_of(&["web"]).unwrap(), None);
+        assert!(end_of(&["web", "--end"]).is_err(), "--end needs its ID");
         for conflict in [
-            &["web", "--attach", "--", "ls"][..],
+            &["web", "--end", id, "--", "ls"][..],
+            &["web", "--end", id, "--attach"],
+            &["web", "--end", id, "--sessions"],
+            &["--session", id, "web", "--end", id],
+            &["-i", "web", "--end", id],
+            &["-t", "web", "--end", id],
+            &["web", "--end", id, "--service", "db"],
+            &["web", "--attach", "--", "ls"],
             &["web", "--sessions", "--", "ls"],
             &["web", "--attach", "--sessions"],
             &["--session", id, "web", "--attach"],

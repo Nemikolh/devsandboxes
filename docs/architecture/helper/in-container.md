@@ -201,7 +201,9 @@ session new --id <id> -- <cmd>...` (`commands::exec::session_for`,
 `session_new_command`), with a fresh id (`mint_session_id`) or
 `--session`'s; the runtime exec's `-w`/`-u`/`-e` give the supervisor the
 cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
-[<id>]` runs `session attach`, `exec --sessions` `session ls`. A caller
+[<id>]` runs `session attach`, `exec --sessions` `session ls`, `exec
+--end <id>` `session rm <id>` (`commands::exec::session_argv`, as the
+instance's user, without `-i`/`-t`). A caller
 that runs no CLI in the container (the serve daemon, for a fleet control plane)
 attaches over RPC instead ([Sessions over RPC](#sessions-over-rpc)), the
 daemon then being the session's client.
@@ -266,9 +268,21 @@ daemon then being the session's client.
   newest `runs::MAX_LS_RUNS`, states as in `run ls`. `rm <id>`: a running
   session's command group gets SIGHUP, then SIGKILL after `HUP_WAIT`
   (verified with `runs::kill_target`), the supervisor records the end, the
-  dir is deleted. `prune [--keep N]` (`runs::prune`, as `run prune`):
+  dir is deleted; an unknown id exits `NO_SESSION_EXIT` (`rm_code`), which
+  `exec --end` reports as no such session (`commands::exec::ended`), any
+  other failure `EXIT_FAILED`. `prune [--keep N]` (`runs::prune`, as `run prune`):
   deletes every ended or `lost` session but the newest `N` (default 0),
   never a running one, and prints `removed <n>`.
+
+A session ends three ways: its program exits; `session rm` ends it,
+reached from the host by `devsandbox exec <instance> --end <id>`, the
+API's `sessions.rm` (`session.rm` over RPC) and the dashboard's `K` on a
+session row; or its container stops (its processes go, `ls` then reads it
+`lost`). Nothing ends one for being idle: an idle session can't be told
+from one working unwatched (an agent left running, a shell over a
+weekend), and that unwatched one is the one a session exists to keep. An
+abandoned one shows instead, in `exec --sessions`, the dashboard's
+session rows and `instances.procs`' count.
 
 ### Sessions over RPC
 

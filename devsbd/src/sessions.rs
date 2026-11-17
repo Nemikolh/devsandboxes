@@ -163,7 +163,7 @@ pub fn run(args: &[String]) -> i32 {
         Cmd::Attach { id } => return terminal(|input, out, size| attach(root, &id, input, out, size)),
         Cmd::Supervise { id } => supervise(root, &id),
         Cmd::Ls => ls(root).and_then(|text| io::stdout().write_all(text.as_bytes())),
-        Cmd::Rm { id } => rm(root, &id),
+        Cmd::Rm { id } => return rm_code(root, &id),
         Cmd::Prune { keep } => runs::prune(root, keep).map(|n| println!("removed {n}")),
     };
     match result {
@@ -182,6 +182,20 @@ pub(crate) fn supervisor_cmd(exe: &Path, id: &str) -> Command {
 fn failed(e: io::Error) -> i32 {
     eprintln!("devsbd session: {e}");
     control::EXIT_FAILED
+}
+
+/// `session rm <id>`'s exit code: [`rm`]'s, with no such session
+/// [`NO_SESSION_EXIT`] (as an attach to it reports), so the host's
+/// `exec --end` tells "not there" from a failed end without reading stderr.
+fn rm_code(root: &Path, id: &str) -> i32 {
+    match rm(root, id) {
+        Ok(()) => control::EXIT_OK,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!("devsbd session: {e}");
+            NO_SESSION_EXIT
+        }
+        Err(e) => failed(e),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1969,6 +1983,20 @@ pub(crate) mod tests {
         // The supervisor reaped it before recording the end.
         assert!(runs::proc_stat(pgid).is_none(), "command {pgid} still there");
         assert_eq!(rm(&root, id).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `session rm`'s code: an ended session's dir goes with 0; an unknown
+    /// id (or one just removed) is [`NO_SESSION_EXIT`], not a failure.
+    #[test]
+    fn rm_of_an_unknown_session_is_no_session() {
+        let root = temp_root("rmcode");
+        let id = "1790000000-0001";
+        fake_session(&root, id, "started 1790000000\nended 1790000001\nexit 0\n");
+        assert_eq!(rm_code(&root, id), control::EXIT_OK);
+        assert!(!root.join(id).exists());
+        assert_eq!(rm_code(&root, id), NO_SESSION_EXIT);
+        assert_eq!(rm_code(&root, "1790000000-0002"), NO_SESSION_EXIT);
         let _ = fs::remove_dir_all(&root);
     }
 }
