@@ -1,13 +1,14 @@
 //! A host's capacity report (docs/architecture/daemon/fleet.md, *Capacity*;
 //! fleet plan decision 8): cpus and memory from the runtime's `info`
 //! (cached [`ENGINE_TTL`]), free memory and disk only for a native Linux
-//! engine, the running instance count and `member.toml`'s soft caps. The host poll (`host.rs`) builds one per watched tick and the
+//! engine, the running instance count and `member.toml`'s soft caps, and
+//! whether a GPU is usable and lent ([`GpuReport`]). The host poll (`host.rs`) builds one per watched tick and the
 //! snapshots carry it (`Snapshots::set_capacity`); a machine's comes from
 //! its pushed snapshot (`snapshots::SnapshotMachine::capacity`). On demand,
 //! `capacity.get` and a placed `run` build one through [`HostCapacity`],
 //! the same engine cache and running count the poll uses, watched or not.
 //!
-//! Everything but [`HostFacts::read`] and the injected `info` call is pure:
+//! Everything but [`HostFacts::read`] and the injected runtime calls is pure:
 //! the parsers, the cache over [`Instant`]s, [`over_caps`] (what placement
 //! will score against) and the dashboard's and `machine ls`' text.
 
@@ -21,9 +22,11 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::fleet::member::SoftCaps;
+use crate::runtime::gpu::GpuSupport;
 use crate::runtime::identity::EngineInfo;
 
-/// How long one `info` answer is used: cpus and total memory rarely move.
+/// How long one `info` answer is used: cpus, total memory and GPU support
+/// rarely move.
 pub const ENGINE_TTL: Duration = Duration::from_secs(60);
 
 /// `member.toml`'s `[caps]` in bytes and counts (the wire's).
@@ -70,6 +73,22 @@ pub struct Capacity {
     pub running: usize,
     /// `member.toml`'s soft caps; `None` when none is set.
     pub caps: Option<Caps>,
+    /// A GPU the runtime can give a container; `None`: none usable, or
+    /// unknown (placement treats both as none). Absent reads as `None`.
+    #[serde(default)]
+    pub gpu: Option<GpuReport>,
+}
+
+/// The [`Capacity::gpu`] of a host whose runtime can give a container
+/// every NVIDIA GPU (`GpuSupport::Gpus` | `Cdi`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuReport {
+    /// `/dev/nvidia<N>` nodes on a native engine; `None` on any other
+    /// (a VM's devices aren't seen here).
+    pub count: Option<u64>,
+    /// Placed work may use it here: `trust = "full"` or `[allow] gpus =
+    /// true` in `member.toml` ([`Own::lends_gpu`]).
+    pub lent: bool,
 }
 
 fn installed() -> bool {
@@ -88,14 +107,17 @@ impl Default for Capacity {
             disk_total: None,
             running: 0,
             caps: None,
+            gpu: None,
         }
     }
 }
 
-/// What this host's own files put in its report: `member.toml`'s `[caps]`.
+/// What this host's own files put in its report: `member.toml`'s `[caps]`
+/// and whether it lends its GPU (`Member::lends_gpu`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Own {
     pub caps: SoftCaps,
+    pub lends_gpu: bool,
 }
 
 /// What this host says about itself beyond the runtime's `info`.
@@ -104,25 +126,36 @@ pub struct HostFacts {
     pub mem_available: Option<u64>,
     pub disk_free: Option<u64>,
     pub disk_total: Option<u64>,
+    /// NVIDIA GPU device nodes in `/dev` (`gpu::nvidia_device_count`).
+    pub gpus: Option<u64>,
 }
 
 impl HostFacts {
     /// Read for a native Linux engine only (`engine.native` on Linux):
-    /// anywhere else this host's memory and disk aren't the engine's. The
-    /// disk is the filesystem of `root_dir`, when it exists here.
+    /// anywhere else this host's memory, disk and devices aren't the
+    /// engine's. The disk is the filesystem of `root_dir`, when it exists
+    /// here.
     pub fn read(engine: Option<&EngineInfo>) -> HostFacts {
         let Some(engine) = engine.filter(|e| e.native && cfg!(target_os = "linux")) else {
             return HostFacts::default();
         };
         let mem_available = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| parse_meminfo(&t));
         let (disk_free, disk_total) = engine.root_dir.as_deref().and_then(statvfs).map_or((None, None), |(f, t)| (Some(f), Some(t)));
-        HostFacts { mem_available, disk_free, disk_total }
+        let gpus = std::fs::read_dir("/dev").ok().map(|entries| {
+            let names = entries.filter_map(|e| e.ok()?.file_name().into_string().ok());
+            crate::runtime::gpu::nvidia_device_count(names)
+        });
+        HostFacts { mem_available, disk_free, disk_total, gpus }
     }
 }
 
 impl Capacity {
-    /// The report from its parts (pure), a runtime installed.
-    pub fn build(engine: Option<&EngineInfo>, host: HostFacts, running: usize, own: &Own) -> Capacity {
+    /// The report from its parts (pure), a runtime installed. A `gpu`
+    /// support but `None` is no GPU. A native engine with no device node
+    /// yet (`host.gpus` `Some(0)`) has an unknown count: the driver creates
+    /// `/dev/nvidia<N>` on first use, so a usable runtime outweighs it.
+    pub fn build(engine: Option<&EngineInfo>, host: HostFacts, gpu: Option<&GpuSupport>, running: usize, own: &Own) -> Capacity {
+        let usable = matches!(gpu, Some(GpuSupport::Gpus | GpuSupport::Cdi));
         Capacity {
             runtime: true,
             cpus: engine.and_then(|e| e.cpus),
@@ -132,36 +165,51 @@ impl Capacity {
             disk_total: host.disk_total,
             running,
             caps: Caps::of(&own.caps),
+            gpu: usable.then_some(GpuReport { count: host.gpus.filter(|n| *n > 0), lent: own.lends_gpu }),
         }
     }
 
-    /// This report with `own`'s caps instead of its own (pure).
+    /// This report with `own`'s caps and GPU lending instead of its own
+    /// (pure).
     pub fn with_own(self, own: &Own) -> Capacity {
-        Capacity { caps: Caps::of(&own.caps), ..self }
+        let gpu = self.gpu.map(|g| GpuReport { lent: own.lends_gpu, ..g });
+        Capacity { caps: Caps::of(&own.caps), gpu, ..self }
     }
 }
 
 /// How the runtime's `info` is asked (`Backend::engine_info` outside tests).
 pub type EngineInfoFn = Arc<dyn Fn() -> Result<EngineInfo> + Send + Sync>;
 
+/// How GPU support is asked (`Backend::gpu_support` outside tests).
+pub type GpuSupportFn = Arc<dyn Fn() -> Result<GpuSupport> + Send + Sync>;
+
 /// Whether a runtime is installed (`runtime::installed::installed`
 /// outside tests).
 pub type InstalledFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// This host's report, on demand: one [`EngineCache`] and the running
-/// count, shared by the poll (which sets the count from each listing and
+/// This host's report, on demand: one [`EngineCache`] each for `info` and
+/// GPU support, and the running count, shared by the poll (which sets the count from each listing and
 /// asks for the report while a root is watched) and the daemon
 /// (`capacity.get`, a placed `run`), so asking needs no watched root.
 pub struct HostCapacity {
     engine: Mutex<EngineCache>,
+    gpu_cache: Mutex<EngineCache<GpuSupport>>,
     running: AtomicUsize,
     info: EngineInfoFn,
+    gpu: GpuSupportFn,
     installed: InstalledFn,
 }
 
 impl HostCapacity {
-    pub fn new(info: EngineInfoFn, installed: InstalledFn) -> HostCapacity {
-        HostCapacity { engine: Mutex::default(), running: AtomicUsize::new(0), info, installed }
+    pub fn new(info: EngineInfoFn, gpu: GpuSupportFn, installed: InstalledFn) -> HostCapacity {
+        HostCapacity {
+            engine: Mutex::default(),
+            gpu_cache: Mutex::default(),
+            running: AtomicUsize::new(0),
+            info,
+            gpu,
+            installed,
+        }
     }
 
     /// The poll's latest running count (`host::running_instances`).
@@ -169,29 +217,40 @@ impl HostCapacity {
         self.running.store(running, Ordering::Release);
     }
 
-    /// The report now: the cached `info` (asked again past [`ENGINE_TTL`]),
-    /// [`HostFacts::read`], the last running count, `own`. With no runtime
-    /// installed: `runtime: false` and nothing asked of one.
+    /// The report now: the cached `info` and GPU support (each asked again
+    /// past [`ENGINE_TTL`]), [`HostFacts::read`], the last running count,
+    /// `own`. With no runtime installed: `runtime: false`, no GPU, and
+    /// nothing asked of one.
     pub fn report(&self, own: &Own) -> Capacity {
         if !(self.installed)() {
-            return Capacity { runtime: false, ..Capacity::build(None, HostFacts::default(), 0, own) };
+            return Capacity { runtime: false, ..Capacity::build(None, HostFacts::default(), None, 0, own) };
         }
-        let info = self.engine.lock().unwrap_or_else(|e| e.into_inner()).get(Instant::now(), || (self.info)()).cloned();
-        Capacity::build(info.as_ref(), HostFacts::read(info.as_ref()), self.running.load(Ordering::Acquire), own)
+        let now = Instant::now();
+        let info = self.engine.lock().unwrap_or_else(|e| e.into_inner()).get(now, || (self.info)()).cloned();
+        let gpu = self.gpu_cache.lock().unwrap_or_else(|e| e.into_inner()).get(now, || (self.gpu)()).cloned();
+        let host = HostFacts::read(info.as_ref());
+        Capacity::build(info.as_ref(), host, gpu.as_ref(), self.running.load(Ordering::Acquire), own)
     }
 }
 
-/// The runtime's last `info`, asked again every [`ENGINE_TTL`].
-#[derive(Debug, Default)]
-pub struct EngineCache {
-    last: Option<(Instant, Option<EngineInfo>)>,
+/// The runtime's last `info` (or GPU support), asked again every
+/// [`ENGINE_TTL`].
+#[derive(Debug)]
+pub struct EngineCache<T = EngineInfo> {
+    last: Option<(Instant, Option<T>)>,
 }
 
-impl EngineCache {
+impl<T> Default for EngineCache<T> {
+    fn default() -> Self {
+        EngineCache { last: None }
+    }
+}
+
+impl<T> EngineCache<T> {
     /// The cached answer, `fetch`ed first when there's none or it's
     /// [`ENGINE_TTL`] old. A failed fetch keeps the last answer and waits
     /// out the same interval (a runtime that's down isn't asked every tick).
-    pub fn get(&mut self, now: Instant, fetch: impl FnOnce() -> Result<EngineInfo>) -> Option<&EngineInfo> {
+    pub fn get(&mut self, now: Instant, fetch: impl FnOnce() -> Result<T>) -> Option<&T> {
         let due = self.last.as_ref().is_none_or(|(at, _)| now >= *at + ENGINE_TTL);
         if due {
             let prev = self.last.take().and_then(|(_, info)| info);
@@ -311,9 +370,10 @@ pub fn over_note(c: &Capacity) -> Option<String> {
     (!over.is_empty()).then(|| format!("over cap: {}", over.iter().map(Over::to_string).collect::<Vec<_>>().join(", ")))
 }
 
-/// The CAPACITY column: `8 cpu · 12/32G · 120G free · 3 run`, each part
-/// left out while unknown (memory as `32G` without `mem_available`); `-`
-/// without a report, `no runtime` for a driver.
+/// The CAPACITY column: `8 cpu · 12/32G · 120G free · 3 run · 2 gpu`, each
+/// part left out while unknown (memory as `32G` without `mem_available`,
+/// the GPU as `gpu` without a count, `(not lent)` after it unless lent);
+/// `-` without a report, `no runtime` for a driver.
 pub fn summary(c: Option<&Capacity>) -> String {
     let Some(c) = c else { return "-".into() };
     if !c.runtime {
@@ -335,6 +395,10 @@ pub fn summary(c: Option<&Capacity>) -> String {
         parts.push(format!("{} free", size(free)));
     }
     parts.push(format!("{} run", c.running));
+    if let Some(gpu) = &c.gpu {
+        let n = gpu.count.map(|n| format!("{n} ")).unwrap_or_default();
+        parts.push(format!("{n}gpu{}", if gpu.lent { "" } else { " (not lent)" }));
+    }
     parts.join(" · ")
 }
 
@@ -382,10 +446,11 @@ mod tests {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Ok(EngineInfo { cpus: Some(4), mem_total: Some(8 * G), root_dir: None, native: false })
             }),
+            Arc::new(|| Ok(GpuSupport::None("none here".into()))),
             Arc::new(|| true),
         );
         host.set_running(2);
-        let capped = Own { caps: SoftCaps { cpus: Some(2), ..SoftCaps::default() } };
+        let capped = Own { caps: SoftCaps { cpus: Some(2), ..SoftCaps::default() }, ..Own::default() };
         let r = host.report(&capped);
         assert_eq!((r.cpus, r.mem_total, r.mem_available, r.running), (Some(4), Some(8 * G), None, 2));
         assert_eq!(r.caps.as_ref().and_then(|c| c.cpus), Some(2));
@@ -394,7 +459,7 @@ mod tests {
         assert_eq!(r.clone().with_own(&capped), r.clone());
         assert_eq!(r.clone().with_own(&Own::default()), Capacity { caps: None, ..r });
         // A runtime that won't answer: no engine part, the count still.
-        let down = HostCapacity::new(Arc::new(|| bail!("no runtime")), Arc::new(|| true));
+        let down = HostCapacity::new(Arc::new(|| bail!("no runtime")), Arc::new(|| bail!("no runtime")), Arc::new(|| true));
         down.set_running(1);
         assert_eq!(down.report(&Own::default()), Capacity { running: 1, ..Capacity::default() });
     }
@@ -404,11 +469,12 @@ mod tests {
     /// `Capacity::default()`) has one.
     #[test]
     fn a_host_without_a_runtime_reports_none() {
-        let host = HostCapacity::new(Arc::new(|| panic!("info asked")), Arc::new(|| false));
+        let host = HostCapacity::new(Arc::new(|| panic!("info asked")), Arc::new(|| panic!("gpu asked")), Arc::new(|| false));
         host.set_running(3);
-        let capped = Own { caps: SoftCaps { instances: Some(2), ..SoftCaps::default() } };
+        let capped = Own { caps: SoftCaps { instances: Some(2), ..SoftCaps::default() }, lends_gpu: true };
         let r = host.report(&capped);
         assert!(!r.runtime);
+        assert_eq!(r.gpu, None);
         assert_eq!((r.cpus, r.mem_total, r.running), (None, None, 0));
         assert_eq!(r.caps.as_ref().and_then(|c| c.instances), Some(2));
         assert_eq!(summary(Some(&r)), "no runtime");
@@ -419,6 +485,7 @@ mod tests {
         }))
         .unwrap();
         assert!(old.runtime, "absent: installed");
+        assert_eq!(old.gpu, None, "absent: no GPU");
         assert!(Capacity::default().runtime);
     }
 
@@ -468,20 +535,20 @@ mod tests {
         let t1 = t0 + 2 * ENGINE_TTL;
         assert_eq!(cache.get(t1, || bail!("down")).unwrap().cpus, Some(8));
         assert_eq!(cache.get(t1 + Duration::from_secs(1), never).unwrap().cpus, Some(8));
-        let mut empty = EngineCache::default();
+        let mut empty = EngineCache::<EngineInfo>::default();
         assert!(empty.get(t0, || bail!("down")).is_none());
     }
 
     fn own(caps: SoftCaps) -> Own {
-        Own { caps }
+        Own { caps, ..Own::default() }
     }
 
     #[test]
     fn the_report_from_its_parts() {
         let engine = EngineInfo { cpus: Some(8), mem_total: Some(32 * G), root_dir: None, native: true };
-        let host = HostFacts { mem_available: Some(20 * G), disk_free: Some(120 * G), disk_total: Some(500 * G) };
+        let host = HostFacts { mem_available: Some(20 * G), disk_free: Some(120 * G), disk_total: Some(500 * G), gpus: Some(0) };
         let soft = SoftCaps { mem: Some("16G".into()), instances: Some(3), ..SoftCaps::default() };
-        let c = Capacity::build(Some(&engine), host, 3, &own(soft));
+        let c = Capacity::build(Some(&engine), host, None, 3, &own(soft));
         assert_eq!(
             c,
             Capacity {
@@ -493,18 +560,19 @@ mod tests {
                 disk_total: Some(500 * G),
                 running: 3,
                 caps: Some(Caps { cpus: None, mem: Some(16 * G), disk: None, instances: Some(3) }),
+                gpu: None,
             }
         );
         assert_eq!(summary(Some(&c)), "8 cpu · 12/32G · 120G free · 3 run");
         // No engine answer, no member.toml.
-        let bare = Capacity::build(None, HostFacts::default(), 0, &Own::default());
+        let bare = Capacity::build(None, HostFacts::default(), None, 0, &Own::default());
         assert_eq!((bare.cpus, bare.caps.as_ref()), (None, None));
         assert_eq!(summary(Some(&bare)), "0 run");
         assert_eq!(summary(None), "-");
         // A VM's memory without what's free.
         let vm = Capacity { mem_total: Some(8 * G), ..bare.clone() };
         assert_eq!(summary(Some(&vm)), "8G · 0 run");
-        assert_eq!(Capacity::build(None, HostFacts::default(), 0, &own(SoftCaps::default())).caps, None);
+        assert_eq!(Capacity::build(None, HostFacts::default(), None, 0, &own(SoftCaps::default())).caps, None);
         // Not native: never read.
         let vm_engine = EngineInfo { native: false, root_dir: Some("/".into()), ..engine };
         assert_eq!(HostFacts::read(Some(&vm_engine)), HostFacts::default());
@@ -523,14 +591,70 @@ mod tests {
         assert_eq!(HostFacts::read(Some(&gone)).disk_free, None);
     }
 
+    /// A usable GPU is reported with the device count a native engine
+    /// gives and `own`'s lending; none usable, or a native engine with no
+    /// device node, is no GPU; `with_own` swaps the lending; the cache asks
+    /// GPU support once within the TTL.
+    #[test]
+    fn the_gpu_report() {
+        let native = HostFacts { gpus: Some(2), ..HostFacts::default() };
+        let lends = Own { lends_gpu: true, ..Own::default() };
+        for support in [GpuSupport::Gpus, GpuSupport::Cdi] {
+            let c = Capacity::build(None, native, Some(&support), 0, &lends);
+            assert_eq!(c.gpu, Some(GpuReport { count: Some(2), lent: true }));
+        }
+        let c = Capacity::build(None, native, Some(&GpuSupport::Cdi), 1, &Own::default());
+        assert_eq!(c.gpu, Some(GpuReport { count: Some(2), lent: false }));
+        assert_eq!(summary(Some(&c)), "1 run · 2 gpu (not lent)");
+        assert_eq!(c.clone().with_own(&lends).gpu, Some(GpuReport { count: Some(2), lent: true }));
+        assert_eq!(summary(Some(&c.with_own(&lends))), "1 run · 2 gpu");
+        // Not native: usable, count unknown.
+        let vm = Capacity::build(None, HostFacts::default(), Some(&GpuSupport::Gpus), 0, &lends);
+        assert_eq!(vm.gpu, Some(GpuReport { count: None, lent: true }));
+        assert_eq!(summary(Some(&vm)), "0 run · gpu");
+        let one = Capacity { gpu: Some(GpuReport { count: Some(1), lent: false }), ..Capacity::default() };
+        assert_eq!(summary(Some(&one)), "0 run · 1 gpu (not lent)");
+        // None usable, unknown, or no device node.
+        let none = GpuSupport::None("no".into());
+        assert_eq!(Capacity::build(None, native, Some(&none), 0, &lends).gpu, None);
+        assert_eq!(Capacity::build(None, native, None, 0, &lends).gpu, None);
+        let no_node = HostFacts { gpus: Some(0), ..HostFacts::default() };
+        assert_eq!(
+            Capacity::build(None, no_node, Some(&GpuSupport::Gpus), 0, &lends).gpu,
+            Some(GpuReport { count: None, lent: true }),
+            "no node yet: the count is unknown"
+        );
+        assert_eq!(Capacity::default().with_own(&lends).gpu, None, "lending adds no GPU");
+        // Through the host report: asked once within the TTL.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let host = HostCapacity::new(
+            Arc::new(|| Ok(EngineInfo::default())),
+            Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(GpuSupport::Gpus)
+            }),
+            Arc::new(|| true),
+        );
+        assert_eq!(host.report(&lends).gpu, Some(GpuReport { count: None, lent: true }));
+        assert_eq!(host.report(&Own::default()).gpu, Some(GpuReport { count: None, lent: false }));
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "cached");
+        // A report round-trips.
+        let back: Capacity = serde_json::from_value(serde_json::to_value(&one).unwrap()).unwrap();
+        assert_eq!(back, one);
+    }
+
     #[test]
     fn npm_typings_match() {
         use crate::serve::dts::assert_matches;
         let caps = Caps { cpus: Some(4), mem: Some(G), disk: None, instances: Some(2) };
-        let c = Capacity { caps: Some(caps), ..Capacity::default() };
+        let gpu = GpuReport { count: Some(1), lent: true };
+        let c = Capacity { caps: Some(caps), gpu: Some(gpu), ..Capacity::default() };
         let v = serde_json::to_value(&c).unwrap();
         assert_matches("Capacity", &v);
         assert_matches("Caps", &v["caps"]);
+        assert_matches("GpuReport", &v["gpu"]);
+        assert_matches("Capacity", &serde_json::to_value(Capacity::default()).unwrap());
         assert!(v.get("lending").is_none());
         assert_eq!(crate::serve::dts::prop_type("InstancesSnapshot", "capacity").as_deref(), Some("Capacity"));
     }

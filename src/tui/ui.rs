@@ -3425,6 +3425,7 @@ mod tests {
             disk_total: Some(500 * g),
             running: 3,
             caps: Some(crate::serve::capacity::Caps { mem: Some(16 * g), ..Default::default() }),
+            gpu: None,
         });
         app.set_machines(vec![up, down]);
         app.on_key(KeyEvent::from(KeyCode::Char('5')));

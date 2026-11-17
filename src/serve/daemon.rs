@@ -194,6 +194,11 @@ fn engine_info() -> super::capacity::EngineInfoFn {
     Arc::new(|| crate::runtime::backend().engine_info())
 }
 
+/// The runtime's GPU support, as the capacity report asks it.
+fn gpu_support() -> super::capacity::GpuSupportFn {
+    Arc::new(|| crate::runtime::backend().gpu_support())
+}
+
 impl Options {
     pub fn new(keep_alive: bool) -> Self {
         Self {
@@ -316,7 +321,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     shared.local_capacity = opts.local_capacity.clone();
     if let Some(installed) = &opts.runtime_installed {
         shared.installed = Arc::clone(installed);
-        shared.host_capacity = Arc::new(super::capacity::HostCapacity::new(engine_info(), Arc::clone(installed)));
+        shared.host_capacity = Arc::new(super::capacity::HostCapacity::new(engine_info(), gpu_support(), Arc::clone(installed)));
     }
     shared.peer_env = opts.peer_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
     match member {
@@ -940,7 +945,11 @@ impl Shared {
             local_capacity: None,
             host_agent: Arc::new(crate::devsbd::bridge::host_agent),
             pty_exec: fleet::pty::runtime_exec,
-            host_capacity: Arc::new(super::capacity::HostCapacity::new(engine_info(), Arc::new(crate::runtime::installed::installed))),
+            host_capacity: Arc::new(super::capacity::HostCapacity::new(
+                engine_info(),
+                gpu_support(),
+                Arc::new(crate::runtime::installed::installed),
+            )),
             installed: Arc::new(crate::runtime::installed::installed),
             peer_env: BTreeMap::new(),
             channels: Arc::default(),
@@ -1022,11 +1031,14 @@ impl Shared {
     }
 
     /// What the capacity report carries of this host's own files:
-    /// `member.toml`'s `[caps]` (none while it's missing or doesn't parse).
-    /// Read each time, so a hand edit shows on the next poll.
+    /// `member.toml`'s `[caps]` and whether it lends its GPU
+    /// (`Member::lends_gpu`; none and not lent while it's missing or
+    /// doesn't parse). Read each time, so a hand edit shows on the next
+    /// poll.
     fn own(&self) -> super::capacity::Own {
         let member = self.member.as_deref().and_then(|p| fleet::member::load(p).ok().flatten());
-        super::capacity::Own { caps: member.map(|m| m.caps).unwrap_or_default() }
+        let lends_gpu = member.as_ref().is_some_and(fleet::member::Member::lends_gpu);
+        super::capacity::Own { caps: member.map(|m| m.caps).unwrap_or_default(), lends_gpu }
     }
 
     fn links(&self) -> Option<&service::Handle> {
@@ -4260,6 +4272,7 @@ pub(crate) mod tests {
         s.installed = Arc::new(move || flag.load(Ordering::SeqCst));
         let flag = Arc::clone(&installed);
         s.host_capacity = Arc::new(super::super::capacity::HostCapacity::new(
+            Arc::new(|| anyhow::bail!("no info in a test")),
             Arc::new(|| anyhow::bail!("no info in a test")),
             Arc::new(move || flag.load(Ordering::SeqCst)),
         ));

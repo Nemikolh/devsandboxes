@@ -483,6 +483,7 @@ mod tests {
             disk_total: Some(500 * G),
             running,
             caps,
+            gpu: None,
         }
     }
 

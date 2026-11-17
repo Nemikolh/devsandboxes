@@ -74,7 +74,7 @@ Phase 1, local GPUs:
 
 Phase 3, placement:
 
-5. **capacity**: `Capacity` gains `gpus` (count) and `gpus_lent`; wire
+5. **capacity**: `Capacity` gains `gpu: Option<GpuReport { count, lent }>`; wire
    (`api.md`, `index.d.ts`), `capacity::summary`. Docs: fleet.md
    *Capacity*.
 6. **place**: `Spec` / `PlaceSpec` carry the GPU need; `place::place`

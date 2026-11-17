@@ -443,7 +443,8 @@ push (`null` before one carried it):
 ```json
 {"runtime": true, "cpus": 8, "mem_total": 34359738368, "mem_available": 21474836480,
  "disk_free": 128849018880, "disk_total": 536870912000, "running": 3,
- "caps": {"cpus": null, "mem": 17179869184, "disk": null, "instances": 4}}
+ "caps": {"cpus": null, "mem": 17179869184, "disk": null, "instances": 4},
+ "gpu": {"count": 1, "lent": false}}
 ```
 
 Sizes in bytes; `null` is unknown. `cpus` and `mem_total` are the
@@ -456,7 +457,11 @@ runs. `caps`: `member.toml`'s `[caps]` soft caps (`null` when none is set): neve
 a note ([fleet.md](../architecture/daemon/fleet.md#capacity)). `runtime`:
 a container runtime is installed; `false` (a driver: every other field
 unknown, `running` 0, the caps kept) is never placed on. Absent reads as
-`true`.
+`true`. `gpu`: the runtime can give a container every NVIDIA GPU
+(`null`: none usable, or unknown; absent reads as `null`); `count` its
+`/dev/nvidia<N>` nodes, for a native Linux engine only (else `null`),
+`lent` whether placed work may use it there (`member.toml`'s `[allow]
+gpus = true`, or `trust = "full"`).
 
 Errors: `invalid` (missing or relative `dir`; watch without the
 `instances` subscription), `not-found` (watch of a missing directory;
@@ -1438,7 +1443,7 @@ Errors: `internal` (`membership.json` doesn't verify).
 
 This host's capacity report now, as its snapshots carry it (`Capacity`:
 `runtime`, `cpus`, `mem_total`, `mem_available`, `disk_free`, `disk_total`,
-`running`, `caps`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
+`running`, `caps`, `gpu`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
 built on demand: no watched root needed. Params `{}`. On every link
 peer's connection: a host asks each machine before it places a `run --place`.
 

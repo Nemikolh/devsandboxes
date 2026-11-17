@@ -266,8 +266,11 @@ here, as a `runtime::gpu::GpuSupport`, whose `run_args` are the flags:
 - `None(reason)`: neither; the reason names what was checked. Apple
   `container` always answers this (no GPU passthrough).
 
-`gpu::cdi_gpu_count` counts the GPUs those specs name: distinct device
-names but `all`.
+`gpu::nvidia_device_count` counts the GPUs in a `/dev` listing: its
+`nvidia<N>` nodes (not `nvidiactl`, `nvidia-uvm`, `nvidia-modeset`), what
+the capacity report's `gpu.count` reads on a native engine
+([fleet.md](daemon/fleet.md#capacity)). Specs aren't counted: one may
+name a GPU by both index and UUID.
 
 ## Adding a runtime
 

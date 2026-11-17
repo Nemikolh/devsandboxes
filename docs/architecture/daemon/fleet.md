@@ -218,7 +218,7 @@ link: `src/serve/fleet/pty_client.rs` (`Request`, `header`, `End`,
 `Remotes::restore`); channels: `src/devsbd/proto.rs` (`channel::API`,
 `channel::PTY`, `channel::TUNNEL`, `channel::AGENT`, `channel::ROUTE` and their `caps`,
 `channel::flows`); capacity: `src/serve/capacity.rs` (`Capacity`,
-`Caps`, `Own`, `HostFacts`, `EngineCache`, `HostCapacity`,
+`Caps`, `GpuReport`, `Own`, `HostFacts`, `EngineCache`, `HostCapacity`,
 `Capacity::with_own`, `parse_meminfo`, `parse_size`, `over_caps`,
 `over_note`, `summary`), `src/runtime/identity.rs` (`EngineInfo`,
 `docker_engine_info`, `podman_engine_info`), `Backend::engine_info`,
@@ -1162,7 +1162,7 @@ next; a new watch's first, disk-depth push has none. On demand,
 ([api](../../reference/api.md#capacityget)): `capacity::HostCapacity`
 holds the one `EngineCache` and the running count the poll sets from
 every listing (watched or not), and the daemon adds `member.toml`'s caps
-(`Shared::capacity`, `Capacity::with_own`); tests replace the
+and GPU lending (`Shared::capacity`, `Capacity::with_own`); tests replace the
 rest with `Options::local_capacity`. It is on the trust table under either trust, so
 a host asks its machines before it places.
 
@@ -1190,6 +1190,18 @@ a host asks its machines before it places.
 - **`caps`**: `member.toml`'s `[caps]` in bytes (`Caps::of`; none when
   no cap is set), read through `Shared::own` (`capacity::Own`) each
   time, so a hand edit shows on the next report.
+- **`gpu`**: present when the runtime can give a container every NVIDIA
+  GPU (`Backend::gpu_support` answers `Gpus` or `Cdi`;
+  [runtimes.md](../runtimes.md#gpus)), asked at most every `ENGINE_TTL`
+  through an `EngineCache` of its own (`HostCapacity`'s injected
+  `GpuSupportFn`), else `None`, which placement reads as no GPU; a
+  report without the field reads as `None`. `count` (`GpuReport`) is the
+  `/dev/nvidia<N>` nodes for a native Linux engine (`HostFacts::read`,
+  `gpu::nvidia_device_count`), `None` otherwise or while none exists yet
+  (the driver makes them on first use; `Capacity::build`). `lent`: placed work may use it
+  here, `member.toml`'s `[allow] gpus = true` or `trust = "full"`
+  (`Member::lends_gpu`, read through `Shared::own` each time like the
+  caps). A host with no runtime reports none and asks nothing.
 - **`runtime`**: a container runtime is installed
   (`runtime::installed::installed`, `HostCapacity`'s injected
   `InstalledFn`; [host-poll.md](host-poll.md#a-host-with-no-runtime)).

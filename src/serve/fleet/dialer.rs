@@ -1216,6 +1216,7 @@ pub(crate) mod tests {
             disk_total: Some(500 * G),
             running,
             caps,
+            gpu: None,
         };
         let roomy = capacity(28, 0, None);
         let busy = capacity(4, 3, Some(Caps { instances: Some(1), ..Caps::default() }));
@@ -2301,6 +2302,7 @@ pub(crate) mod tests {
             disk_total: Some(500 * G),
             running,
             caps,
+            gpu: None,
         };
         let busy = capacity(4, 3, Some(Caps { instances: Some(1), ..Caps::default() }));
         let roomy = capacity(28, 0, None);

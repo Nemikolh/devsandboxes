@@ -582,7 +582,7 @@ mod tests {
                 }),
                 on_snapshot: Box::new(move |_, params| pushed.lock().unwrap().push(params)),
                 own: Box::new(Own::default),
-                capacity: Arc::new(HostCapacity::new(Arc::new(|| panic!("info asked")), Arc::new(|| false))),
+                capacity: Arc::new(HostCapacity::new(Arc::new(|| panic!("info asked")), Arc::new(|| panic!("gpu asked")), Arc::new(|| false))),
                 installed: Arc::new(move || {
                     asked.fetch_add(1, Ordering::SeqCst);
                     false

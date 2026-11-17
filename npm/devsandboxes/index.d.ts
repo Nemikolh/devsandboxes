@@ -298,6 +298,19 @@ export interface Capacity {
   running: number;
   /** `member.toml`'s soft caps; `null` when none is set. */
   caps: Caps | null;
+  /** A GPU the runtime can give a container; `null`: none usable, or unknown. */
+  gpu: GpuReport | null;
+}
+
+/**
+ * A host's usable NVIDIA GPU, in its {@link Capacity}. `count`: its `/dev/nvidia<N>` nodes, for a
+ * native Linux engine only (`null` elsewhere). `lent`: placed work may use it there (`member.toml`'s
+ * `[allow] gpus = true`, or `trust = "full"`).
+ * @experimental
+ */
+export interface GpuReport {
+  count: number | null;
+  lent: boolean;
 }
 
 /** Soft caps from `member.toml`'s `[caps]` (sizes in bytes): never enforced; over one is a note. @experimental */

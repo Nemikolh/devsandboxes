@@ -3,7 +3,7 @@
 //! engine's `info` and the CDI spec files' contents; the one read of spec
 //! files is [`read_cdi_dir`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::de::IgnoredAny;
@@ -53,14 +53,6 @@ struct DockerGpuInfo {
 #[derive(Debug, Deserialize)]
 struct CdiSpec {
     kind: String,
-    #[serde(default)]
-    devices: Vec<CdiDevice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdiDevice {
-    #[serde(default)]
-    name: String,
 }
 
 /// The NVIDIA specs among a dir's files; a file that doesn't parse as a
@@ -123,18 +115,13 @@ pub fn podman(native: bool, cdi: impl Fn(&Path) -> Vec<String>) -> GpuSupport {
     GpuSupport::Cdi
 }
 
-/// The GPUs the NVIDIA CDI specs in `dirs` name: distinct device names
-/// but `all` (which every generated spec adds). A spec generated with
-/// both index and UUID names counts each GPU twice.
-#[allow(dead_code)] // the capacity report's, later
-pub fn cdi_gpu_count<P: AsRef<Path>>(dirs: &[P], cdi: impl Fn(&Path) -> Vec<String>) -> usize {
-    let names: BTreeSet<String> = nvidia_specs(dirs, &cdi)
-        .into_iter()
-        .flat_map(|spec| spec.devices)
-        .map(|d| d.name)
-        .filter(|n| !n.is_empty() && n != "all")
-        .collect();
-    names.len()
+/// The NVIDIA GPUs among a `/dev` listing's names: one `nvidia<N>` node
+/// per GPU (digits only; `nvidiactl`, `nvidia-uvm`, `nvidia-modeset` are
+/// the driver's). Counted here rather than from CDI specs, which may name
+/// one GPU twice (by index and by UUID).
+pub fn nvidia_device_count<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> u64 {
+    let gpu = |n: &str| n.strip_prefix("nvidia").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+    names.into_iter().filter(|n| gpu(n.as_ref())).count() as u64
 }
 
 /// The contents of the `*.yaml`, `*.yml` and `*.json` files in `dir`, in
@@ -248,12 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn cdi_gpu_count_counts_distinct_named_devices() {
-        assert_eq!(cdi_gpu_count(&PODMAN_CDI_DIRS, fs(&[("/etc/cdi", NVIDIA_YAML)])), 2);
-        // The same GPU in two specs counts once; `all` and other kinds never.
-        let both = fs(&[("/etc/cdi", NVIDIA_YAML), ("/var/run/cdi", NVIDIA_JSON), ("/etc/cdi", OTHER_YAML)]);
-        assert_eq!(cdi_gpu_count(&PODMAN_CDI_DIRS, both), 3);
-        assert_eq!(cdi_gpu_count(&PODMAN_CDI_DIRS, fs(&[])), 0);
+    fn nvidia_device_count_counts_numbered_nodes_only() {
+        let dev = ["null", "nvidia0", "nvidia1", "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset", "nvidia", "nvidia12", "nvidia2a", "tty0"];
+        assert_eq!(nvidia_device_count(dev), 3);
+        assert_eq!(nvidia_device_count(["nvidiactl"]), 0);
+        assert_eq!(nvidia_device_count(Vec::<String>::new()), 0);
     }
 
     #[test]

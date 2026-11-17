@@ -300,6 +300,9 @@ is frozen: no new work on it.
 - GPUs have never been run end to end on a GPU host (no GPU CI): only
   the detection over fixtures and the flags are tested.
   `run::gpu::gpu_decision`
+- GPU count in the capacity report: unknown (`gpu.count` `null`) on any
+  engine that isn't native Linux (a VM's or a remote engine's devices
+  aren't seen here). `capacity::HostFacts::read`
 - Podman: `autostart = "runtime"` restarts at boot only with
   `podman-restart.service`, which devsandbox never installs.
   → [runtimes](architecture/runtimes.md); `autostart::restart_decision`

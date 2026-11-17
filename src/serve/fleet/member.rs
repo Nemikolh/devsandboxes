@@ -182,6 +182,13 @@ impl Member {
         self.dev_builds || self.trust == Trust::Full
     }
 
+    /// Whether placed work may use this host's GPU (`[allow] gpus`, or
+    /// `full`, under which no worker policy applies): the capacity
+    /// report's `gpu.lent`.
+    pub fn lends_gpu(&self) -> bool {
+        self.allow.gpus || self.trust == Trust::Full
+    }
+
     /// `name`, else [`default_name`] of `hostname`.
     pub fn name_or(&self, hostname: &str) -> Result<String> {
         match self.name.as_str() {
@@ -501,6 +508,16 @@ mod tests {
         assert!(!Member::default().takes_dev_builds());
         assert!(Member { dev_builds: true, ..Default::default() }.takes_dev_builds());
         assert!(Member { trust: Trust::Full, ..Default::default() }.takes_dev_builds());
+    }
+
+    #[test]
+    fn allow_gpus_or_full_lend_the_gpu() {
+        assert!(!Member::default().lends_gpu());
+        assert!(!Member { dev_builds: true, ..Default::default() }.lends_gpu());
+        assert!(Member { allow: Allow { gpus: true, ..Default::default() }, ..Default::default() }.lends_gpu());
+        assert!(Member { trust: Trust::Full, ..Default::default() }.lends_gpu());
+        let m = parse("[allow]\ngpus = true\n").unwrap();
+        assert!(m.lends_gpu(), "from the file");
     }
 
     #[test]
