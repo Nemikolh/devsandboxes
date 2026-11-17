@@ -112,7 +112,7 @@ pub fn parse_sessions(ls: &str) -> Vec<Session> {
 
 /// One `devsbd session ls` line: a run line with the attach word after
 /// the state.
-fn parse_session(line: &str) -> Session {
+pub fn parse_session(line: &str) -> Session {
     let words: Vec<&str> = line.split(' ').collect();
     let state_len = match words.get(1) {
         Some(&"exited" | &"killed") => 2,

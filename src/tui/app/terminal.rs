@@ -532,7 +532,7 @@ impl App {
     }
 
     /// `a` (Instances tab, an instance row): attach a tab to one of the
-    /// instance's detached helper sessions. A row that isn't running or
+    /// instance's running helper sessions. A row that isn't running or
     /// whose machine is unreachable says so; else the event loop asks the
     /// daemon for its sessions ([`Fetch::Sessions`]), answered through
     /// [`Self::sessions_listed`]. A no-op off an instance row.
@@ -551,10 +551,10 @@ impl App {
     }
 
     /// [`Fetch::Sessions`]' answer for `instance` (a key): its `session ls`
-    /// lines, or the line to show. The running, detached ones
-    /// (`commands::exec::detached_sessions`, `exec --attach`'s rule): none
-    /// is a status line, one opens its tab, several a picker
-    /// ([`Confirmed::Attach`]).
+    /// lines, or the line to show. `exec --attach`'s rule
+    /// (`commands::exec::attach_candidates`: the one detached, else the
+    /// running ones, detached first): none is a status line, one opens its
+    /// tab, several a picker ([`Confirmed::Attach`]).
     pub fn sessions_listed(&mut self, instance: &str, lines: Result<Vec<String>, String>) {
         let listing = match lines {
             Ok(lines) => lines.join("\n"),
@@ -563,12 +563,12 @@ impl App {
                 return;
             }
         };
-        let found: Vec<(String, String)> = crate::commands::exec::detached_sessions(&listing)
+        let found: Vec<(String, String)> = crate::commands::exec::attach_candidates(&listing)
             .into_iter()
-            .map(|(id, line)| (id.to_string(), line.to_string()))
+            .map(|(s, line)| (s.id, line.to_string()))
             .collect();
         match found.as_slice() {
-            [] => self.status = Some(format!("attach: no detached session in `{instance}`")),
+            [] => self.status = Some(format!("attach: no running session in `{instance}`")),
             [(id, _)] => {
                 let id = id.clone();
                 self.open_attach(instance, &id);
@@ -576,12 +576,12 @@ impl App {
             // Another modal opened while the list was on its way: don't
             // replace it.
             _ if !matches!(self.modal, Modal::None) => {
-                self.status = Some(format!("attach: `{instance}` has {} detached sessions (a again to pick)", found.len()));
+                self.status = Some(format!("attach: `{instance}` has {} running sessions (a again to pick)", found.len()));
             }
             _ => {
                 self.status = None;
                 let body = session_lines(&found, 0);
-                let question = format!("{instance}: attach to a detached session");
+                let question = format!("{instance}: attach to a session");
                 let action = Confirmed::Attach { instance: instance.to_string(), sessions: found, cursor: 0 };
                 self.modal = Modal::Confirm(ConfirmModal::new(question, body, action));
             }
@@ -1511,6 +1511,7 @@ mod tests {
 
     const RUNNING: &str = "1790000000-a1b2 running detached 2026-01-01T00:00:00Z bash -l";
     const OTHER: &str = "1790000100-c3d4 running detached 2026-01-01T00:01:40Z vim";
+    const ATTACHED: &str = "1790000200-e5f6 running attached 2026-01-01T00:03:20Z zsh -l";
 
     /// A tab-spawning app: `/bin/true` stands in for devsandbox, so the PTY
     /// child exits at once.
@@ -1527,12 +1528,30 @@ mod tests {
         app.sessions_listed("inst0", Err("attach: no instance `inst0`".into()));
         assert_eq!(app.status.as_deref(), Some("attach: no instance `inst0`"));
         let lines = vec![
-            "1790000000-a1b2 running attached 2026-01-01T00:00:00Z bash -l".to_string(),
-            "1790000100-c3d4 exited - 2026-01-01T00:01:40Z vim".to_string(),
+            "1790000100-c3d4 exited 0 - 2026-01-01T00:01:40Z vim".to_string(),
+            "1790000200-e5f6 lost - 2026-01-01T00:03:20Z sh".to_string(),
         ];
         app.sessions_listed("inst0", Ok(lines));
-        assert_eq!(app.status.as_deref(), Some("attach: no detached session in `inst0`"));
+        assert_eq!(app.status.as_deref(), Some("attach: no running session in `inst0`"));
         assert!(app.terms.is_empty() && matches!(app.modal, Modal::None));
+    }
+
+    /// One running session, attached (a client docker left behind, say):
+    /// a tab on it, taking it over. One detached beside attached ones:
+    /// that one, no picker.
+    #[test]
+    fn a_single_attached_session_opens_a_tab() {
+        let mut app = attach_app();
+        app.sessions_listed("inst0", Ok(vec![ATTACHED.into(), "1790000100-c3d4 exited 0 - 2026-01-01T00:01:40Z vim".into()]));
+        assert_eq!(app.status, None);
+        assert_eq!(app.terms.sessions().len(), 1);
+        assert!(matches!(app.modal, Modal::None));
+
+        let mut app = machine_app();
+        app.exec_cli = Ok(ExecCli { exe: Some("/bin/true".into()), root: "/home/u/cfg".into() });
+        app.sessions_listed("box/inst1", Ok(vec![ATTACHED.into(), OTHER.into()]));
+        assert!(matches!(app.modal, Modal::None), "the one detached wins");
+        assert_eq!(app.terms.sessions()[0].redial.as_ref().unwrap().attach[3], "--attach=1790000100-c3d4");
     }
 
     /// One detached session: a new tab on it, beside a `t` tab of the same
@@ -1560,15 +1579,27 @@ mod tests {
         assert_eq!(app.attach_argvs("box/inst1", ID), Ok((attach.clone(), Some(attach))));
     }
 
-    /// Several: a picker over them; `j`/`k` move, `enter` attaches the
+    /// Several: a picker over them, detached first, each line its `ls`
+    /// line (attached or detached); `j`/`k` move, `enter` attaches the
     /// cursor's, `esc` closes it without a tab.
     #[test]
-    fn several_detached_sessions_open_a_picker() {
+    fn several_sessions_open_a_picker() {
         let mut app = attach_app();
-        app.sessions_listed("inst0", Ok(vec![RUNNING.into(), OTHER.into()]));
+        app.sessions_listed("inst0", Ok(vec![ATTACHED.into(), RUNNING.into(), OTHER.into()]));
         let Modal::Confirm(view) = &app.modal else { panic!("no picker") };
-        assert_eq!(view.body, [format!("› {RUNNING}"), format!("  {OTHER}")]);
+        assert_eq!(view.question, "inst0: attach to a session");
+        assert_eq!(view.body, [format!("› {RUNNING}"), format!("  {OTHER}"), format!("  {ATTACHED}")]);
         assert_eq!(view.keys_hint(), "↑↓ move · enter attach · esc cancel");
+        assert_eq!(view.choices(), "[enter] attach (an attached one is taken over)  [esc] cancel");
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None) && app.terms.is_empty());
+
+        // No detached one: a picker over the attached ones.
+        let mut app = attach_app();
+        let other_attached = OTHER.replace("detached", "attached");
+        app.sessions_listed("inst0", Ok(vec![ATTACHED.into(), other_attached.clone()]));
+        let Modal::Confirm(view) = &app.modal else { panic!("no picker") };
+        assert_eq!(view.body, [format!("› {ATTACHED}"), format!("  {other_attached}")]);
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.modal, Modal::None) && app.terms.is_empty());
 

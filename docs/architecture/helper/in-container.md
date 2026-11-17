@@ -278,7 +278,14 @@ daemon then being the session's client.
   `data`, `exit` (`i32`) and `detached` from the supervisor. Only the
   helper speaks it.
 - `ls`: `<id> <state> <attached|detached|-> <started, UTC> <argv…>`, the
-  newest `runs::MAX_LS_RUNS`, states as in `run ls`. `rm <id>`: a running
+  newest `runs::MAX_LS_RUNS`, states as in `run ls`. `attached` means a
+  client is connected, not that anyone watches it: the client a runtime
+  leaves behind after its exec's terminal went (docker keeps the exec
+  running) stays connected, and nothing in the container can tell (its
+  stdin gets no EOF and no signal) until the next attach displaces it.
+  So an attach without an id (`commands::exec::attach_candidates`) takes
+  the one detached session, else the one running one, else offers them
+  all, detached first. `rm <id>`: a running
   session's command group gets SIGHUP, then SIGKILL after `HUP_WAIT`
   (verified with `runs::kill_target`), the supervisor records the end, the
   dir is deleted; an unknown id exits `NO_SESSION_EXIT` (`rm_code`), which

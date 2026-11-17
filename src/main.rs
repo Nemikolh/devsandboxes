@@ -296,8 +296,9 @@ enum Command {
         #[arg(short)]
         tty: bool,
         /// Attach to session ID; without ID, to the instance's one detached
-        /// session (several: a pick list on a TTY). Give ID as `--attach=ID`
-        /// before the name, or after it
+        /// session, else its one running session, taking it over (several:
+        /// a pick list on a TTY). Give ID as `--attach=ID` before the name,
+        /// or after it
         #[arg(long, value_name = "ID", num_args = 0..=1, conflicts_with_all = ["command", "sessions", "session", "interactive", "tty", "end"])]
         attach: Option<Option<String>>,
         /// List the instance's sessions: id, state, attached or detached,

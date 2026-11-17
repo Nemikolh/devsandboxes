@@ -70,7 +70,7 @@ A sandbox whose config [assumes root in the container](/docs/going-further#confi
 
 ## Terminal
 
-`t` opens a shell in the selected instance, inside the dashboard: the bottom half splits into Detail and the terminal, one tab per shell. While the terminal has focus, every key goes to the shell. `ctrl-]` (or `F12`) goes back and forth. The shell runs in a [session](/docs/going-further#get-a-shell-back), so one still open when you quit is there for later: `a` on the instance attaches a tab to its detached session (a picker when there are several), and an expanded instance lists its running sessions as `session` rows, where `a` or `enter` attaches and `K` ends one.
+`t` opens a shell in the selected instance, inside the dashboard: the bottom half splits into Detail and the terminal, one tab per shell. While the terminal has focus, every key goes to the shell. `ctrl-]` (or `F12`) goes back and forth. The shell runs in a [session](/docs/going-further#get-a-shell-back), so one still open when you quit is there for later: `a` on the instance attaches a tab to its session, as `exec --attach` picks it (the detached one, else the one running; a picker when there are several, an attached one being taken over), and an expanded instance lists its running sessions as `session` rows, where `a` or `enter` attaches and `K` ends one.
 
 <Try>type `ls` and `enter`, `esc` back to the dashboard (`ctrl-]` in the real one), `↓` `t` for a second shell, `esc` again, then `[` `]` to switch and `x` to close.</Try>
 
@@ -218,7 +218,7 @@ An open form is pinned under the thread's header. Your answers are saved as you 
 | ---------------- | ---------------------------------------- | ------------------------- |
 | `t`              | Open a terminal (instance or service)    | instances only            |
 | `T`              | Force a new terminal for the same target | no                        |
-| `a`              | Attach to a detached session (Instances) | no                        |
+| `a`              | Attach to a session (Instances)          | no                        |
 | `[` / `]`        | Previous / next terminal tab             | yes                       |
 | `x`              | Close the active terminal                | yes                       |
 | `ctrl-]`, `F12`  | Terminal ⇄ dashboard                     | also `esc`                |

@@ -78,11 +78,15 @@ arrives on reader threads and only shows on the next draw.
 - An attach (`a` on a running instance row, Instances tab;
   `App::attach_session`): the event loop asks the daemon for the
   instance's `sessions.list` (`Fetch::Sessions`, routed to its machine
-  like the row's other reads), and `App::sessions_listed` keeps the
-  running, detached ones (`commands::exec::detached_sessions`, the CLI's
-  `--attach` rule): none is a status line, one opens its tab, several a
-  picker (`Confirmed::Attach`: the `session ls` lines, `↑↓`/`j`/`k`
-  move, `enter` attaches, `esc`/`q` cancel). The tab
+  like the row's other reads), and `App::sessions_listed` applies the CLI's
+  `--attach` rule (`commands::exec::attach_candidates`: the one detached
+  session, else the running ones, detached first; an `attached` one may
+  be a client left behind by a closed terminal, see
+  [in-container.md](../helper/in-container.md), *Sessions*): none is a
+  status line, one opens its tab (taking an attached one over), several a
+  picker (`Confirmed::Attach`: the `session ls` lines, each saying
+  attached or detached, `↑↓`/`j`/`k` move, `enter` attaches, `esc`/`q`
+  cancel). The tab
   (`App::attach_argvs`) runs `devsandbox -C <root> exec --attach=<id> --
   <instance>` (`ExecCli::attach_argv`, no `-i -t`: the session has its
   pty) with no re-dial; on a machine `remote::attach_argv`, which is also
@@ -90,8 +94,8 @@ arrives on reader threads and only shows on the next draw.
 - An attach from a session row (`a`/`enter` on a `session` row under an
   expanded instance; `App::attach_selected_session`): the same
   `open_attach` tab on that row's id, no listing first. An attached
-  session is offered too, unlike the picker: the user chose it, and the
-  attach takes it over (the other client gets `DETACHED_EXIT`).
+  session is offered too, as in the picker: the attach takes it over
+  (the other client gets `DETACHED_EXIT`).
 
 ## Remote tabs reconnect
 

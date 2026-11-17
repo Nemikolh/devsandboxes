@@ -119,7 +119,7 @@ Process rows (expanded instance)
 Terminals
   t           open terminal (instance / service)
   T           force a new terminal for the same target
-  a           attach to a detached session (Instances; a picker when several)
+  a           attach to a running session (Instances; a picker when several)
   [ / ]       previous / next terminal tab
   x           close the active terminal
   ctrl-] / F12  focus terminal ⇄ back to dashboard
@@ -233,8 +233,8 @@ pub enum Fetch {
     Config { kind: ConfigKind, name: String },
     /// `containers.inspect` for the config view's inspect pane.
     Inspect { container: String },
-    /// `sessions.list` for instance `instance` (a key): `a`'s detached
-    /// sessions, answered through [`App::sessions_listed`].
+    /// `sessions.list` for instance `instance` (a key): what `a` attaches
+    /// to, answered through [`App::sessions_listed`].
     Sessions { instance: String },
 }
 
@@ -327,7 +327,7 @@ fn build_log_title(instance: &str, phase: Option<&PhaseRow>) -> String {
 /// a skip. The profile picker (`P` with more than two allowed) lists the
 /// profiles as `body`, the cursor's marked: `↑↓`/`j`/`k` move, `enter`
 /// switches to it, `esc`/`q` cancel. The session picker (`a` with several
-/// detached sessions) is the same, `enter` attaching.
+/// sessions to choose from) is the same, `enter` attaching.
 pub struct ConfirmModal {
     pub question: String,
     /// Lines listed under the question (the identity findings).
@@ -359,7 +359,7 @@ impl ConfirmModal {
             Confirmed::Identity { .. } => "[u] update  [c] continue as is (don't ask again)  [s] skip this time",
             Confirmed::IdentityOffer(_) => "[u] update  [c] continue as is  [l] later",
             Confirmed::Profile { .. } => "[enter] switch  [esc] cancel",
-            Confirmed::Attach { .. } => "[enter] attach  [esc] cancel",
+            Confirmed::Attach { .. } => "[enter] attach (an attached one is taken over)  [esc] cancel",
         }
     }
 
@@ -386,12 +386,13 @@ pub(super) enum Confirmed {
     /// `profiles`, its `current` one, the `cursor` over them.
     Profile { instance: String, profiles: Vec<String>, current: Option<String>, cursor: usize },
     /// The session picker for `instance` (a key, `a` with several
-    /// detached): its `sessions` as `(id, line)`, the `cursor` over them.
+    /// running): its `sessions` as `(id, line)`, detached first, the
+    /// `cursor` over them.
     Attach { instance: String, sessions: Vec<(String, String)>, cursor: usize },
 }
 
-/// The session picker's body: one `session ls` line per detached session,
-/// the cursor's marked `›`.
+/// The session picker's body: one `session ls` line per session (it says
+/// attached or detached), the cursor's marked `›`.
 pub(super) fn session_lines(sessions: &[(String, String)], cursor: usize) -> Vec<String> {
     sessions
         .iter()

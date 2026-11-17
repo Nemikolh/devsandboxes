@@ -760,7 +760,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   `--end ID` a `sessions.rm` one (`ended session <id> in m/x`, the
   machine's error as `` `m/x`: <message> ``), never a dial;
   `--attach [ID]` is one dial attaching only (no id:
-  `exec::choose_detached` over that list), no loop, as a local
+  `exec::choose_session` over that list), no loop, as a local
   `--attach` (`session_exec`): on a terminal a session dial, else the
   helper's session client piped (`attach_mode`:
   `exec::session_attach_command`, stdin kept), as a local `exec --attach`

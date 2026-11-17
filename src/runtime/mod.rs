@@ -14,8 +14,9 @@ mod dockerlike;
 pub mod events;
 pub mod identity;
 pub mod installed;
-// Only the daemon and the dashboard list processes (both unix-only).
-#[cfg(unix)]
+// Only the daemon and the dashboard list processes (both unix-only); `exec
+// --attach` parses sessions everywhere.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub mod procs;
 pub mod seccomp;
 

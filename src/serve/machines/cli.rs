@@ -904,7 +904,7 @@ fn session_exec(
         Some(Some(id)) => crate::commands::exec::checked_session_id(id)?.to_string(),
         _ => {
             let listing = list()?.join("\n");
-            crate::commands::exec::choose_detached(&key, &listing, std::io::stdin().is_terminal(), &mut |prompt, options| {
+            crate::commands::exec::choose_session(&key, &listing, std::io::stdin().is_terminal(), &mut |prompt, options| {
                 crate::commands::pick(prompt, options)
             })?
         }
@@ -1321,6 +1321,34 @@ mod tests {
         let (r, calls) = run(&["exec", "box/web"], None);
         assert_eq!(r.unwrap(), None);
         assert!(calls.is_empty());
+    }
+
+    /// `--attach` without an id lists `sessions.list` and follows
+    /// `exec::choose_session`: a lone attached session is dialed (taken
+    /// over); none running is the error.
+    #[test]
+    fn attach_without_an_id_lists_and_chooses() {
+        let run = |sessions: Value| {
+            let mut calls: Vec<String> = Vec::new();
+            let r = session_exec(
+                &command(&["exec", "box/web", "--attach"]),
+                &mut |method, _| {
+                    calls.push(method.to_string());
+                    Ok(crate::serve::proto::Response { id: None, result: Some(json!({ "sessions": sessions })), error: None })
+                },
+                "box",
+                "web",
+                Path::new("/r/cfg"),
+                true,
+            );
+            (r, calls)
+        };
+        let (r, calls) = run(json!([format!("{ID} running attached 2026-09-21T10:00:01Z sh"), "1790000000-0001 exited 0 - 2026-09-21T10:00:00Z sh"]));
+        assert_eq!(calls, ["sessions.list"]);
+        let want = pty_client::Request { root: "/r/cfg".into(), instance: "web".into(), mode: attach_mode(ID.into(), true) };
+        assert_eq!(r.unwrap(), Some(SessionExec::Dial(want)));
+        let (r, _) = run(json!(["1790000000-0001 lost - 2026-09-21T10:00:00Z sh"]));
+        assert_eq!(r.unwrap_err().to_string(), "no running session in `box/web` (devsandbox exec box/web --sessions)");
     }
 
     /// Only a dial with a terminal records this host's attach: a piped exec

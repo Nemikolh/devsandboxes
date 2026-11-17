@@ -455,6 +455,36 @@ the session before the client connects (it reads only `meta`'s code).
 - Docs: `docs/architecture/helper/in-container.md` (*Sessions*:
   supervisor).
 
+## Step 7: fix: attach without an id considers attached sessions
+
+Found in the end-to-end run after step 6: closing the terminal of a
+local `exec` (or a dashboard tab, or a step 5 link terminal) leaves the
+session `attached`, because the in-container client docker leaves
+behind stays connected, and nothing in the container can tell: its
+stdin gets no EOF and no signal (probe: `cat` under `docker exec -it`
+stays blocked after the client is killed). `attached` in `session ls`
+means "a client is connected", not "someone is watching". So
+`--attach` without an id and the dashboard's `a`, which only took
+detached sessions, said "no detached session" in exactly the case they
+exist for.
+
+- The rule (`commands::exec`, replacing `detached_sessions` /
+  `choose_detached`; shared by the local CLI, `machines::cli`'s
+  `session_exec` and the dashboard): the candidates are the running
+  sessions. Exactly one detached: that one (as today). Else exactly one
+  running: that one (taking it over). Else several: the pick list (a
+  TTY; the dashboard's `Confirmed::Attach` picker), detached first,
+  each line saying attached or detached; off a TTY an error listing
+  them. None running: `no running session in <key>`.
+- Taking over a client that was live after all is recoverable: it gets
+  `detached` ("attached elsewhere") and can attach back.
+- Tests: the rule's table (exec.rs), the dashboard's `sessions_listed`
+  cases, `session_exec`.
+- Docs: `--attach`'s help in `src/main.rs`, `in-container.md`
+  (*Sessions*: what `attached` means), `dashboard/terminal.md`,
+  `tabs-and-actions.md`, the site's `going-further.mdx` and
+  `dashboard.mdx`.
+
 ## Compared with Kubernetes attach
 
 How Kubernetes reattaches to a terminal, against what this plan built.

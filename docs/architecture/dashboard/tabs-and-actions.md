@@ -185,8 +185,10 @@ event loop takes each once per pass and hands it to a thread.
   picker; with none other, a status line. It queues the same
   `PromptAction::Profile` as `:profile <instance> <profile>`.
 - `a` (an instance row, not a process row): attach a terminal tab to one
-  of the running instance's detached helper sessions, through a
-  `Fetch::Sessions` (`sessions.list`); a stopped row or an unreachable
+  of the running instance's helper sessions, through a
+  `Fetch::Sessions` (`sessions.list`): its one detached session, else
+  its one running one, else a picker, detached first (an attached one is
+  taken over); a stopped row or an unreachable
   machine's is a status line ([terminal.md](terminal.md), *What a tab
   runs*).
 - `r`/`p`/`:`: the prompt ([command-line.md](command-line.md)); `t`:

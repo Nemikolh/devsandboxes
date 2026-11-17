@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use super::resolve_instance;
 use crate::devsbd::control::valid_run_id;
 use crate::runtime::backend;
+use crate::runtime::procs::{parse_session, Session};
 use crate::state::{Instance, State};
 
 /// In-container login shell, as argv pieces: what `exec <name>` with no
@@ -24,8 +25,8 @@ pub enum Exec<'a> {
     /// Run `command` (empty: the login shell), through a session when
     /// [`session_for`] says so; `session` is the caller's id (`--session`).
     Run { interactive: bool, tty: bool, command: &'a [String], session: Option<&'a str> },
-    /// `--attach [ID]`: attach to session `ID`, or to the one detached
-    /// session ([`choose_detached`]).
+    /// `--attach [ID]`: attach to session `ID`, or to the one
+    /// [`choose_session`] picks.
     Attach(Option<&'a str>),
     /// `--sessions`: the helper's `session ls`.
     Sessions,
@@ -116,7 +117,7 @@ pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
                 Some(id) => checked_session_id(id)?.to_string(),
                 None => {
                     let listing = backend().output(&refs(&session_argv(instance, &["ls"])))?;
-                    choose_detached(&key, &listing, stdin_tty, &mut |prompt, options| super::pick(prompt, options))?
+                    choose_session(&key, &listing, stdin_tty, &mut |prompt, options| super::pick(prompt, options))?
                 }
             };
             let (interactive, tty) = shell_flags(false, false, stdin_tty);
@@ -393,39 +394,52 @@ pub(crate) fn checked_session_id(id: &str) -> Result<&str> {
     Ok(id)
 }
 
-/// The running, detached sessions in a `devsbd session ls` listing (lines
-/// `<id> <state> <attached|detached|-> <started> <argv…>`): `(id, line)`.
-pub(crate) fn detached_sessions(listing: &str) -> Vec<(&str, &str)> {
-    listing
+/// What an attach without an id chooses from, in a `devsbd session ls`
+/// listing (lines `<id> <state> <attached|detached|-> <started> <argv…>`),
+/// as `(session, line)`: the one detached running session when there is
+/// exactly one, else every running one, detached first. Attached ones count
+/// because `attached` only means a client is connected: the one docker
+/// leaves behind after its terminal went stays connected, and nothing in
+/// the container can tell (docs/architecture/helper/in-container.md,
+/// *Sessions*); attaching takes it over.
+pub(crate) fn attach_candidates(listing: &str) -> Vec<(Session, &str)> {
+    let mut running: Vec<(Session, &str)> = listing
         .lines()
-        .filter_map(|line| {
-            let mut words = line.split(' ');
-            let id = words.next()?;
-            (words.next() == Some("running") && words.next() == Some("detached")).then_some((id, line))
-        })
-        .collect()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| (parse_session(line), line))
+        .filter(|(s, _)| s.running())
+        .collect();
+    // Stable: listing order kept within each group.
+    running.sort_by_key(|(s, _)| s.attached);
+    if running.iter().filter(|(s, _)| !s.attached).count() == 1 {
+        running.truncate(1);
+    }
+    running
 }
 
-/// `--attach` without an id: the one detached session in `listing`; several
-/// → `pick` on a TTY (`tty`), else an error naming them; none → an error.
-pub(crate) fn choose_detached(
+/// `--attach` without an id: the one of [`attach_candidates`]; several →
+/// `pick` on a TTY (`tty`), else an error naming them; none → an error.
+pub(crate) fn choose_session(
     key: &str,
     listing: &str,
     tty: bool,
     pick: &mut dyn FnMut(&str, &[&str]) -> Result<usize>,
 ) -> Result<String> {
-    let found = detached_sessions(listing);
+    let found = attach_candidates(listing);
     match found.as_slice() {
-        [] => bail!("no detached session in `{key}` (devsandbox exec {key} --sessions)"),
-        [(id, _)] => Ok(id.to_string()),
+        [] => bail!("no running session in `{key}` (devsandbox exec {key} --sessions)"),
+        [(s, _)] => Ok(s.id.clone()),
         _ if tty => {
             let lines: Vec<&str> = found.iter().map(|(_, line)| *line).collect();
-            let i = pick(&format!("`{key}` has several detached sessions"), &lines)?;
-            Ok(found[i].0.to_string())
+            let i = pick(&format!("`{key}`: attach to a session (an attached one is taken over)"), &lines)?;
+            Ok(found[i].0.id.clone())
         }
         _ => {
-            let ids: Vec<&str> = found.iter().map(|(id, _)| *id).collect();
-            bail!("`{key}` has several detached sessions, pick one with --attach <id>: {}", ids.join(", "))
+            let ids: Vec<String> = found
+                .iter()
+                .map(|(s, _)| format!("{} ({})", s.id, if s.attached { "attached" } else { "detached" }))
+                .collect();
+            bail!("`{key}` has several running sessions, pick one with --attach <id>: {}", ids.join(", "))
         }
     }
 }
@@ -792,32 +806,64 @@ mod tests {
 1790000000-0005 killed 9 - 2026-09-21T10:00:04Z sh
 ";
 
+    /// [`attach_candidates`]' ids for `listing`.
+    fn candidate_ids(listing: &str) -> Vec<String> {
+        attach_candidates(listing).into_iter().map(|(s, _)| s.id).collect()
+    }
+
+    const ENDED: &str = "\
+1790000000-0001 exited 0 - 2026-09-21T10:00:00Z sh -lc x
+1790000000-0004 lost - 2026-09-21T10:00:03Z sh
+1790000000-0005 killed 9 - 2026-09-21T10:00:04Z sh
+";
+    const D3: &str = "1790000000-0003 running detached 2026-09-21T10:00:02Z claude\n";
+    const D6: &str = "1790000000-0006 running detached 2026-09-21T10:00:05Z zsh -l\n";
+    const A2: &str = "1790000000-0002 running attached 2026-09-21T10:00:01Z zidane\n";
+    const A7: &str = "1790000000-0007 running attached 2026-09-21T10:00:06Z sh\n";
+
+    /// The rule's table: one detached wins over attached ones; else one
+    /// running is it; else all running, detached first; ended/lost never.
     #[test]
-    fn detached_sessions_are_the_running_unattached_ones() {
-        assert_eq!(
-            detached_sessions(LISTING),
-            vec![("1790000000-0003", "1790000000-0003 running detached 2026-09-21T10:00:02Z claude")]
-        );
-        assert_eq!(detached_sessions(""), vec![]);
+    fn attach_candidates_follow_the_rule() {
+        let cases: [(String, &[&str]); 7] = [
+            (String::new(), &[]),
+            (ENDED.to_string(), &[]),
+            (LISTING.to_string(), &["1790000000-0003"]),
+            (format!("{A2}{ENDED}{D3}{A7}"), &["1790000000-0003"]),
+            (format!("{ENDED}{A2}"), &["1790000000-0002"]),
+            (format!("{D3}{A2}{D6}"), &["1790000000-0003", "1790000000-0006", "1790000000-0002"]),
+            (format!("{A7}{ENDED}{A2}"), &["1790000000-0007", "1790000000-0002"]),
+        ];
+        for (listing, want) in cases {
+            assert_eq!(candidate_ids(&listing), want, "{listing}");
+        }
+        assert_eq!(attach_candidates(D3)[0].1, D3.trim_end(), "the ls line kept for the pick list");
     }
 
     #[test]
     fn attach_without_an_id_picks_the_detached_one() {
         let mut never = |_: &str, _: &[&str]| -> Result<usize> { panic!("picked") };
-        assert_eq!(choose_detached("web", LISTING, false, &mut never).unwrap(), "1790000000-0003");
-        let e = choose_detached("web", "1790000000-0002 running attached 2026-09-21T10:00:01Z sh\n", true, &mut never);
-        assert!(e.unwrap_err().to_string().starts_with("no detached session in `web`"));
+        assert_eq!(choose_session("web", LISTING, false, &mut never).unwrap(), "1790000000-0003");
+        assert_eq!(choose_session("web", A2, false, &mut never).unwrap(), "1790000000-0002", "the one attached: taken over");
+        let e = choose_session("web", ENDED, true, &mut never).unwrap_err().to_string();
+        assert_eq!(e, "no running session in `web` (devsandbox exec web --sessions)");
 
-        let two = "1790000000-0003 running detached 2026-09-21T10:00:02Z claude\n\
-                   1790000000-0006 running detached 2026-09-21T10:00:05Z zsh -l\n";
-        let e = choose_detached("web", two, false, &mut never).unwrap_err().to_string();
-        assert_eq!(e, "`web` has several detached sessions, pick one with --attach <id>: 1790000000-0003, 1790000000-0006");
-        let mut second = |prompt: &str, options: &[&str]| {
-            assert_eq!(prompt, "`web` has several detached sessions");
-            assert_eq!(options, ["1790000000-0003 running detached 2026-09-21T10:00:02Z claude", "1790000000-0006 running detached 2026-09-21T10:00:05Z zsh -l"]);
-            Ok(1)
+        let several = format!("{A2}{D3}{D6}");
+        let e = choose_session("web", &several, false, &mut never).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "`web` has several running sessions, pick one with --attach <id>: \
+             1790000000-0003 (detached), 1790000000-0006 (detached), 1790000000-0002 (attached)"
+        );
+        let mut third = |prompt: &str, options: &[&str]| {
+            assert_eq!(prompt, "`web`: attach to a session (an attached one is taken over)");
+            assert_eq!(options, [D3.trim_end(), D6.trim_end(), A2.trim_end()]);
+            Ok(2)
         };
-        assert_eq!(choose_detached("web", two, true, &mut second).unwrap(), "1790000000-0006");
+        assert_eq!(choose_session("web", &several, true, &mut third).unwrap(), "1790000000-0002");
+        let two_attached = format!("{A2}{A7}");
+        let e = choose_session("web", &two_attached, false, &mut never).unwrap_err().to_string();
+        assert!(e.ends_with("1790000000-0002 (attached), 1790000000-0007 (attached)"), "{e}");
     }
 
     #[test]
