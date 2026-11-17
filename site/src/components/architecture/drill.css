@@ -1,5 +1,3 @@
-/* Drill-down components (architecture) */
-
 /*
  * `Drill`, `Deck`, `CommandTable`, `ThreeMachines`. Tokens only
  * (`tokens.css`). JS-only parts are gated on `:root[data-js]` (set in
