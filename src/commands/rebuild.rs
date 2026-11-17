@@ -144,7 +144,7 @@ fn recreate(
     let branch = info.branch.clone();
     let branch_created = info.branch_created;
 
-    // ignore failure (it may already be gone).
+    // Ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
 
     // In flight from here (docs/architecture/instances/lifecycle.md). The
@@ -286,6 +286,7 @@ mod tests {
 
     #[test]
     fn resolve_ok_when_project_empty() {
+        // Pre-upgrade state with no recorded root skips the mismatch check.
         let cfg = config();
         let info = instance("");
         assert!(resolve(&cfg, &info, "proj1234", "web").is_ok());

@@ -160,7 +160,6 @@ pub struct ParsedArgs {
 }
 
 impl ParsedArgs {
-    /// Was the boolean flag `name` set?
     pub fn flag(&self, name: &str) -> bool {
         self.flags.contains(&name)
     }

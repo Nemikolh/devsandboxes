@@ -796,6 +796,7 @@ mod tests {
         remove_folder_worktrees(&folders, false).unwrap();
         assert!(!worktree_listed(&b.base, wt_b), "stale record pruned");
         assert!(!root.join(".worktrees/i.folders").exists());
+        // And once more, with everything already gone.
         remove_folder_worktrees(&folders, false).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }

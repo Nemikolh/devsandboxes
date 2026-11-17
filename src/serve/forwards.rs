@@ -1873,8 +1873,7 @@ forwardPorts = ["redis:6379"]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A fixed host port another listener holds is `bind-failed`, phrased
-    /// like the dashboard's status line was.
+    /// A fixed host port another listener holds is `bind-failed`.
     #[test]
     fn a_taken_fixed_port_is_bind_failed() {
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

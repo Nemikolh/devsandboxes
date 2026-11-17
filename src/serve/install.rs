@@ -1076,7 +1076,7 @@ WantedBy=default.target
         let (old, gone) = alive_and_gone(&new, &root);
         let unit = || std::fs::read_to_string(s.unit_path()).unwrap();
 
-        // No unit: detached, as before; nothing written, no manager call.
+        // No unit: detached; nothing written, no manager call.
         assert_eq!(managed(&s, Handoff, &new), (1, vec![]));
         assert_eq!(managed(&s, NothingAnswering, &new), (1, vec![]));
         assert!(fake.calls().is_empty() && !s.unit_path().exists());

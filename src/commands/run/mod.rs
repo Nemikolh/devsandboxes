@@ -1477,6 +1477,7 @@ mod tests {
         state.instances.insert("repo".into(), instance("repo"));
         state.instances.insert("repo-2".into(), instance("repo-2"));
         assert_eq!(first_free_ordinal(&state, "repo"), "repo-3");
+        // Deterministic: no random component.
         assert_eq!(first_free_ordinal(&state, "repo"), "repo-3");
     }
 

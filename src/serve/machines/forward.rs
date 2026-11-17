@@ -649,7 +649,7 @@ mod tests {
         crate::serve::dts::assert_matches("InstancesResolved", &r);
         let r = c.call("instances.resolve", json!({"name": "web-r", "machines": true})).unwrap().result.unwrap();
         assert_eq!(r["matches"], json!(["box/web-r"]), "only there");
-        // Without `machines`: this host only, as before.
+        // Without `machines`: this host only.
         let r = c.call("instances.resolve", json!({"name": "web-r"})).unwrap();
         assert_eq!(code_message(&r).0, "not-found");
         let r = c.call("instances.resolve", json!({"name": "zzz", "machines": true})).unwrap();

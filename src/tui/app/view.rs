@@ -1931,6 +1931,7 @@ mod tests {
         assert_eq!(divider_pct(100, 100), SPLIT_MAX);
         assert_eq!(divider_pct(5, 100), SPLIT_MIN);
         assert_eq!(divider_pct(95, 100), SPLIT_MAX);
+        // Zero width never panics.
         assert_eq!(divider_pct(10, 0), SPLIT_MIN);
     }
 

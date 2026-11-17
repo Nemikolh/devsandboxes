@@ -901,9 +901,9 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
             errors.append(&mut resolve_errors);
             // The instance join needs each sandbox's services + hash; take them
             // from the rows so nothing is resolved twice. Placeholder rows (empty
-            // hash) are skipped to match the old resolved-only map: comparing a
-            // container's hash label against "" would flag phantom drift (and
-            // keeps an unresolved sandbox's profile unknown, never disallowed).
+            // hash) are skipped: comparing a container's hash label against ""
+            // would flag phantom drift (and keeps an unresolved sandbox's profile
+            // unknown, never disallowed).
             for row in rows.iter().filter(|r| !r.config_hash.is_empty()) {
                 resolved.insert(
                     row.name.clone(),

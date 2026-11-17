@@ -101,7 +101,6 @@ impl GroupKey {
     }
 }
 
-/// The group sandbox row `r` belongs to.
 pub fn group_key(r: &SandboxRow) -> GroupKey {
     match &r.mesh_root {
         Some(root) => GroupKey::Mesh { root: root.clone(), sandbox: r.name.clone() },

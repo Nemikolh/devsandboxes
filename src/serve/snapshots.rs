@@ -696,8 +696,7 @@ pub fn carry_remote_status(prev: &Value, next: &mut Value) {
 }
 
 /// A snapshot without stats keeps the last cpu/mem of containers still
-/// running, so the columns don't blank between stats passes (what the
-/// dashboard did itself before).
+/// running, so the columns don't blank between stats passes.
 fn carry_over(snapshot: &mut Snapshot, prev: &Usage) {
     if snapshot.stats {
         return;
@@ -714,7 +713,7 @@ fn carry_over(snapshot: &mut Snapshot, prev: &Usage) {
 }
 
 /// What the next pass carries over: the running containers' cpu/mem as
-/// pushed (a stopped container's are dropped, as the dashboard did).
+/// pushed (a stopped container's are dropped).
 fn usage(snapshot: &Snapshot) -> Usage {
     snapshot
         .instances

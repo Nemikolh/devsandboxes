@@ -527,7 +527,7 @@ fn prepare(
         },
         CliVerb::Rm { name, delete_branch, force } => {
             let t = resolved!(&name);
-            // Off a TTY nothing could answer: the non-TTY default, as today.
+            // Off a TTY nothing could answer: the non-TTY default.
             let ask = ui.tty && delete_branch.is_none();
             let p = RmParams { root: t.root.clone(), env, instance: t.name.clone(), delete_branch, force, ask, detach: false };
             one("rm", serde_json::to_value(p)?, Some(&t))
@@ -606,8 +606,8 @@ fn on_machine(method: &'static str, params: Value, m: &str, banner: String) -> P
 }
 
 /// Where a verb acts: the name on its host, the machine (`None`: here) and
-/// the config root the request carries (here: `-C`, as before machines;
-/// there: the instance's or sandbox's root on the machine).
+/// the config root the request carries (here: `-C`; there: the instance's or
+/// sandbox's root on the machine).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     name: String,
@@ -740,7 +740,7 @@ enum SandboxChoice {
     /// `unmatched`: the name asked for, if one was.
     Example { unmatched: Option<String> },
     /// Run it here; `matched`: this root defines it (else the local `run`'s
-    /// own error comes back, as before machines).
+    /// own error comes back).
     Here { sandbox: String, matched: bool },
     /// Run it on its machine.
     There(SandboxEntry),
@@ -1606,7 +1606,7 @@ mod tests {
         assert_eq!(prompt, "`web` is defined on several machines");
         assert_eq!(error, "`web` is defined on several machines: @/web, a/web; qualify it");
         assert_eq!(options.iter().map(|o| o.0.as_str()).collect::<Vec<_>>(), ["@/web", "a/web"]);
-        // Nothing matching: here, so the local `run` says so as before.
+        // Nothing matching: here, so the local `run` says so.
         assert_eq!(pick(Where::Any, "zzz"), SandboxChoice::Here { sandbox: "zzz".into(), matched: false });
         assert_eq!(pick(Where::Local, "db"), SandboxChoice::Here { sandbox: "db".into(), matched: false });
         assert_eq!(pick(Where::Machine("a".into()), "api"), SandboxChoice::Missing { machine: "a".into(), sandbox: "api".into() });
@@ -1652,7 +1652,6 @@ mod tests {
         let p = sent(p);
         assert_eq!((p.method, p.machine.as_deref(), p.instance.as_deref()), ("run", Some("a"), None));
         assert_eq!((&p.params["root"], &p.params["sandbox"], &p.params["machine"]), (&json!("/r"), &json!("web"), &json!("a")));
-        // Local: as before machines (no `machine`, `-C`'s root).
         let p = sent(prep_fed(&run_of(Some("@/loc")), &FED, false, None, &list, 0).0);
         assert_eq!((p.params.get("machine"), &p.params["root"], p.machine), (None, &json!("/cfg"), None));
         // A TTY pick without a sandbox lists both, a machine's qualified.
@@ -1734,7 +1733,7 @@ mod tests {
         let p = sent(p);
         assert_eq!((p.instance.as_deref(), p.machine.as_deref()), (Some("web-2"), Some("a")));
         assert_eq!(p.params, json!({"root": "/r", "env": {"A": "1"}, "instance": "web-2", "all": false, "detach": false, "machine": "a"}));
-        // The local one: today's request.
+        // The local one.
         let p = sent(prep_fed(&stop("web"), &FED, true, None, &both, 1).0);
         assert_eq!(p.params, json!({"root": "/cfg", "env": {"A": "1"}, "instance": "web-1", "all": false, "detach": false}));
 

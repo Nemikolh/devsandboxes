@@ -827,6 +827,7 @@ mod tests {
             feature_mount_decision(&dir, &BTreeSet::new(), false, |_| Some(false)),
             MountDecision::Apply
         );
+        // Non-bind mounts have no host source to probe.
         let vol = feature_mount("volume", Some("dind-var-lib-docker"), "/var/lib/docker");
         assert_eq!(
             feature_mount_decision(&vol, &BTreeSet::new(), false, |_| None),

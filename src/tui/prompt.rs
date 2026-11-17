@@ -345,7 +345,7 @@ impl Prompt {
     /// delimited; an empty trailing token counts as the next index.
     fn token_at_cursor(&self) -> (usize, usize, usize) {
         let chars: Vec<char> = self.input.chars().collect();
-        // the cursor belongs to the token whose span contains it, else to a new
+        // The cursor belongs to the token whose span contains it, else to a new
         // empty token at the cursor.
         let mut idx = 0;
         let mut i = 0;

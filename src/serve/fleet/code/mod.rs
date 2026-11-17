@@ -259,6 +259,7 @@ impl LinkTransfer {
 /// Where things land below `roots/<hash>/` on the worker ([`layout`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
+    /// The config root.
     pub root: PathBuf,
     /// Each folder, in the order given.
     pub folders: Vec<PathBuf>,

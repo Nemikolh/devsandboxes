@@ -883,6 +883,7 @@ mod tests {
         assert_eq!(t[2], "    (•) Post the reply   ( ) Don't reply");
         assert_eq!(out.lines[2].last(), Some(&(Tone::Cursor, "( ) Don't reply".to_string())));
         assert_eq!(out.questions[0], 0..3);
+        // Unfocused, the context is left out.
         let out = form_lines(&form, &record, Some(&cursor(1, 0)), 40);
         assert!(!texts(&out.lines).iter().any(|l| l.contains("Consider")));
     }

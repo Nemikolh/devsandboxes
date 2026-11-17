@@ -187,7 +187,7 @@ mod tests {
         assert!(err(r#"{"thread":"PR","id":"m","blocks":[]}"#).starts_with("bad `thread` `PR`"));
         assert!(err(r#"{"thread":"t","id":"M","blocks":[]}"#).starts_with("bad `id` `M`"));
         assert!(err(&format!(r#"{{"thread":"t","id":"{}","blocks":[]}}"#, "x".repeat(61))).starts_with("bad `id`"));
-        // Not reserved any more: an older store's header message is ordinary.
+        // An older store's header message is ordinary.
         assert!(parse(r#"{"thread":"t","id":"header-message","blocks":[{"type":"markdown","text":"x"}]}"#).is_ok());
         assert_eq!(err(&with_blocks("")), "no blocks");
         let nine = vec![r#"{"type":"markdown","text":"x"}"#; 9].join(",");

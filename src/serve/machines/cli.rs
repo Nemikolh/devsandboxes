@@ -285,7 +285,7 @@ pub(crate) fn found_of(answer: Value, wherever: &Where) -> Result<Vec<Found>> {
 }
 
 /// How matches are shown: qualified when any is a machine's (a local one as
-/// `@/x`, so it reads as the choice it is), plain as today otherwise.
+/// `@/x`, so it reads as the choice it is), plain otherwise.
 pub(crate) fn labels(found: &[Found]) -> Vec<String> {
     let remote = found.iter().any(|f| f.machine.is_some());
     found
