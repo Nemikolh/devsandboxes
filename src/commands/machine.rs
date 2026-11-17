@@ -1,8 +1,8 @@
-//! `devsandbox machine add|ls|set|upgrade|unlink|rm|trust|roots|key`
+//! `devsandbox machine add|ls|set|upgrade|unlink|rm|trust|roots|allow|key`
 //! (docs/architecture/daemon/machines.md, *`devsandbox machine
 //! add|ls|set|upgrade|unlink|rm|…`*): a client of the daemon's `machines.*`,
 //! never in-process, since the registry and the links are the daemon's.
-//! `machine trust`, `machine roots` and `machine key` are likewise clients of `member.*`
+//! `machine trust`, `machine roots`, `machine allow` and `machine key` are likewise clients of `member.*`
 //! (this host's `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
 //!
 //! `add` always probes the machine first (`machines.probe`): its member key's
@@ -33,7 +33,7 @@ use crate::render::table;
 use crate::serve::capacity;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
-use crate::serve::fleet::member::{MemberInfo, Trust};
+use crate::serve::fleet::member::{AllowInfo, MemberInfo, Trust};
 use crate::serve::fleet::update::{self, Build};
 use crate::serve::machines::{Entry, MachineKind};
 use crate::serve::machines::api::{Added, MachineInfo, MachineRow, Probed};
@@ -533,6 +533,74 @@ fn roots_text(roots: &[PathBuf]) -> String {
     roots.iter().map(|r| format!("{}\n", r.display())).collect()
 }
 
+/// `machine allow`'s flags: `(wire key, on)` per `--<allowance> on|off`
+/// given, and the list changes as typed.
+#[derive(Debug, Default)]
+pub struct AllowChange {
+    pub flags: Vec<(&'static str, bool)>,
+    pub bind_add: Vec<String>,
+    pub bind_rm: Vec<String>,
+    pub local_env_add: Vec<String>,
+    pub local_env_rm: Vec<String>,
+}
+
+/// `machine allow [--<allowance> on|off]… [--bind-add|--bind-rm <path>]…
+/// [--local-env-add|--local-env-rm <NAME>]…`: this host's worker policy
+/// allowances (`member.toml`'s `[allow]`), shown (`member.get`) or changed
+/// (`member.set {allow}`). This host's only: `member.*` is never answered
+/// over a link, and `--machine` refuses `devsandbox machine` (`machines::cli::plan`).
+pub fn allow(change: AllowChange) -> Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    let params = allow_params(&change, home.as_deref(), &cwd)?;
+    let mut conn = connect()?;
+    let info: MemberInfo = match params {
+        Some(params) => call(&mut conn, "member.set", params)?,
+        None => call(&mut conn, "member.get", Value::Null)?,
+    };
+    print!("{}", allow_text(&info.allow, info.trust));
+    Ok(())
+}
+
+/// `member.set`'s params for `change` (`None`: nothing to change, a show).
+/// Bind paths are resolved as `roots` are ([`resolve_root`]), not
+/// canonicalized: the policy resolves them at each check.
+fn allow_params(change: &AllowChange, home: Option<&Path>, cwd: &Path) -> Result<Option<Value>> {
+    // `components` drops `.`s, so `./x` is saved as `/cwd/x`.
+    let resolve = |paths: &[String]| {
+        paths.iter().map(|p| resolve_root(home, cwd, p).map(|p| p.components().collect::<PathBuf>())).collect::<Result<Vec<_>>>()
+    };
+    let mut allow = serde_json::Map::new();
+    for (key, on) in &change.flags {
+        allow.insert((*key).into(), json!(on));
+    }
+    let lists = [
+        ("binds_add", json!(resolve(&change.bind_add)?)),
+        ("binds_rm", json!(resolve(&change.bind_rm)?)),
+        ("local_env_add", json!(change.local_env_add)),
+        ("local_env_rm", json!(change.local_env_rm)),
+    ];
+    for (key, list) in lists {
+        if list.as_array().is_some_and(|l| !l.is_empty()) {
+            allow.insert(key.into(), list);
+        }
+    }
+    Ok((!allow.is_empty()).then(|| json!({ "allow": allow })))
+}
+
+/// One `<key>: on|off` line per allowance (the file's kebab names, as the
+/// flags), then `binds` and `local-env`; under `full`, that none applies.
+fn allow_text(allow: &AllowInfo, trust: Trust) -> String {
+    let mut text: String = allow.flags().iter().map(|(key, on)| format!("{}: {}\n", key.replace('_', "-"), on_off(*on))).collect();
+    let list = |items: Vec<String>| if items.is_empty() { "none".to_string() } else { items.join(", ") };
+    text.push_str(&format!("binds: {}\n", list(allow.binds.iter().map(|b| b.display().to_string()).collect())));
+    text.push_str(&format!("local-env: {}\n", list(allow.local_env.clone())));
+    if trust == Trust::Full {
+        text.push_str("trust is full: no worker policy applies here, so these limit nothing (devsandbox machine trust worker)\n");
+    }
+    text
+}
+
 /// `arg` as an absolute path: a leading `~` or `~/` is `home`, a relative
 /// path is against `cwd`. Not canonicalized (the caller does, where the
 /// path must exist).
@@ -1026,6 +1094,7 @@ mod tests {
             trust: Trust::Worker,
             dev_builds: false,
             roots: Vec::new(),
+            allow: AllowInfo::default(),
             fingerprint: key.fingerprint(),
             key,
             next: None,
@@ -1093,6 +1162,39 @@ mod tests {
         let err = resolve_root(None, cwd, "~/cfg").unwrap_err().to_string();
         assert!(err.contains("$HOME"), "{err}");
         assert_eq!(resolve_root(None, cwd, "cfg").unwrap(), PathBuf::from("/work/cfg"));
+    }
+
+    #[test]
+    fn allow_flags_become_a_patch() {
+        let home = Some(Path::new("/home/me"));
+        let cwd = Path::new("/work");
+        let params = |c: &AllowChange| allow_params(c, home, cwd).unwrap();
+        assert_eq!(params(&AllowChange::default()), None, "no flag: a show");
+        let change = AllowChange {
+            flags: vec![("gpus", true), ("runtime_socket", false)],
+            bind_add: vec!["data".into(), "~/x".into(), "/srv".into()],
+            local_env_rm: vec!["TOKEN".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            params(&change),
+            Some(json!({"allow": {"gpus": true, "runtime_socket": false, "binds_add": ["/work/data", "/home/me/x", "/srv"], "local_env_rm": ["TOKEN"]}}))
+        );
+        let rm = AllowChange { bind_rm: vec!["./data".into()], local_env_add: vec!["A".into()], ..Default::default() };
+        assert_eq!(params(&rm), Some(json!({"allow": {"binds_rm": ["/work/data"], "local_env_add": ["A"]}})));
+        let empty = AllowChange { bind_add: vec!["".into()], ..Default::default() };
+        assert!(allow_params(&empty, home, cwd).is_err());
+    }
+
+    #[test]
+    fn allow_lists_every_allowance() {
+        let allow = AllowInfo { gpus: true, runtime_socket: true, binds: vec!["/a".into(), "/b".into()], ..Default::default() };
+        assert_eq!(
+            allow_text(&allow, Trust::Worker),
+            "privileged: off\nruntime-socket: on\nhost-network: off\nglobal-services: off\ndispatcher: off\ninbox: off\n\
+             initialize-command: off\npublish: off\ngpus: on\nbinds: /a, /b\nlocal-env: none\n"
+        );
+        assert!(allow_text(&AllowInfo::default(), Trust::Full).ends_with("limit nothing (devsandbox machine trust worker)\n"));
     }
 
     #[test]

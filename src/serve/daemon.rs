@@ -5014,6 +5014,11 @@ pub(crate) mod tests {
         let code = |conn: &mut client::Conn, method: &str, params: Value| conn.call(method, params).unwrap().error.map(|e| e.code);
 
         assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
+        // Allowances are this host's own grant (gpus plan decision 7).
+        let allow = json!({"allow": {"gpus": true, "privileged": true, "binds_add": ["/"]}});
+        assert_eq!(code(&mut conn, "member.set", allow.clone()), Some("denied".into()));
+        let lent = || member::load(&data.join("member.toml")).unwrap().unwrap_or_default().allow;
+        assert_eq!(lent(), Default::default(), "nothing written");
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": own})), None, "an own root");
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), Some("denied".into()));
         assert_eq!(code(&mut conn, "machines.list", json!({})), Some("denied".into()));
@@ -5032,6 +5037,8 @@ pub(crate) mod tests {
         assert_eq!(code(&mut conn, "machines.list", json!({})), None);
         assert_eq!(code(&mut conn, "instances.list", json!({"dir": other})), None);
         assert_eq!(code(&mut conn, "member.get", json!({})), Some("denied".into()));
+        assert_eq!(code(&mut conn, "member.set", allow.clone()), Some("denied".into()), "not under `full` either");
+        assert_eq!(lent(), Default::default(), "nothing written");
         assert_eq!(code(&mut conn, "membership.get", json!({})), Some("denied".into()));
         assert_eq!(code(&mut conn, "link.attach", json!({"peer": "again", "channel": "api", "key": attach_key()})), Some("denied".into()));
         let r = conn.call("code.haves", json!({"repos": []})).unwrap();
@@ -5045,6 +5052,8 @@ pub(crate) mod tests {
         // No proven key: no link stream.
         assert_eq!(code(&mut plain, "link.attach", json!({"peer": "lap", "channel": "api"})), Some("invalid".into()));
         assert_eq!(code(&mut plain, "member.get", json!({})), None, "still a local client");
+        assert_eq!(code(&mut plain, "member.set", allow), None, "a local client sets them");
+        assert!(lent().gpus && lent().privileged);
         assert_eq!(code(&mut plain, "code.haves", json!({"repos": []})), Some("denied".into()), "a local client has no fleet root");
         drop(plain);
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);

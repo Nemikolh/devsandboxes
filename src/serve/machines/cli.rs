@@ -1015,7 +1015,7 @@ mod tests {
             assert_eq!(e, "--place asks the control plane where to run it; it doesn't go with --machine box", "{args:?}");
         }
         for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["machine", "trust", "full"], "machine"),
-            (&["machine", "roots", "add", "/x"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api")]
+            (&["machine", "roots", "add", "/x"], "machine"), (&["machine", "allow", "--gpus", "on"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api")]
         {
             let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
             assert_eq!(e, format!("--machine isn't for `devsandbox {what}`"));

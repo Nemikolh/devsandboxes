@@ -583,6 +583,18 @@ enum MachineCommand {
         #[command(subcommand)]
         cmd: Option<RootsCommand>,
     },
+    /// Show or change what work other machines place here may ask of this
+    /// host (its worker policy's allowances, `[allow]` in member.toml)
+    ///
+    /// Every allowance is off unless set; none applies under `full` trust.
+    /// Only ever set here, on this host: no other machine sets them.
+    /// Without flags, lists them.
+    ///
+    ///     devsandbox machine allow --gpus on --bind-add ~/datasets
+    Allow {
+        #[command(flatten)]
+        allow: AllowArgs,
+    },
     /// Show this host's member key and its fingerprint, or rotate it
     ///
     /// Prints `<name> ed25519:<hex>`, then the fingerprint to compare with
@@ -611,6 +623,74 @@ enum KeyCommand {
     ///
     ///     devsandbox machine key rotate
     Rotate,
+}
+
+#[cfg(unix)]
+#[derive(clap::Args)]
+struct AllowArgs {
+    /// Run privileged containers
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    privileged: Option<bool>,
+    /// Bind a container runtime's socket
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    runtime_socket: Option<bool>,
+    /// Use the host's network (`--network host`, run or build)
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    host_network: Option<bool>,
+    /// Run `scope = "global"` services
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    global_services: Option<bool>,
+    /// Use a `dispatcher` (children created on this host)
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    dispatcher: Option<bool>,
+    /// Open Inbox threads on this host (`inbox = true`)
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    inbox: Option<bool>,
+    /// Run `initializeCommand` (on this host, outside any container)
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    initialize_command: Option<bool>,
+    /// Publish ports beyond loopback
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    publish: Option<bool>,
+    /// Use this host's NVIDIA GPUs
+    #[arg(long, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+    gpus: Option<bool>,
+    /// Let binds and build contexts use this host path (`~` is this host's home, relative paths are against the current directory)
+    #[arg(long, value_name = "PATH")]
+    bind_add: Vec<String>,
+    /// Drop an allowed host path
+    #[arg(long, value_name = "PATH")]
+    bind_rm: Vec<String>,
+    /// Let a config read this host's env var with `${localEnv:NAME}`
+    #[arg(long, value_name = "NAME")]
+    local_env_add: Vec<String>,
+    /// Drop an allowed env var
+    #[arg(long, value_name = "NAME")]
+    local_env_rm: Vec<String>,
+}
+
+#[cfg(unix)]
+impl AllowArgs {
+    fn change(self) -> commands::machine::AllowChange {
+        let flags = [
+            ("privileged", self.privileged),
+            ("runtime_socket", self.runtime_socket),
+            ("host_network", self.host_network),
+            ("global_services", self.global_services),
+            ("dispatcher", self.dispatcher),
+            ("inbox", self.inbox),
+            ("initialize_command", self.initialize_command),
+            ("publish", self.publish),
+            ("gpus", self.gpus),
+        ];
+        commands::machine::AllowChange {
+            flags: flags.into_iter().filter_map(|(key, on)| on.map(|on| (key, on))).collect(),
+            bind_add: self.bind_add,
+            bind_rm: self.bind_rm,
+            local_env_add: self.local_env_add,
+            local_env_rm: self.local_env_rm,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -973,6 +1053,7 @@ fn main() -> Result<()> {
                 Some(RootsCommand::Add { paths }) => commands::machine::RootsOp::Add(paths),
                 Some(RootsCommand::Rm { paths }) => commands::machine::RootsOp::Rm(paths),
             }),
+            MachineCommand::Allow { allow } => commands::machine::allow(allow.change()),
         },
     }
 }
@@ -1050,6 +1131,23 @@ mod tests {
         assert_eq!(upgrade(&["machine", "upgrade", "box"]), ("box".into(), false));
         assert_eq!(upgrade(&["machine", "upgrade", "box", "--yes"]), ("box".into(), true));
         assert!(parse(&["machine", "upgrade"]).is_err(), "a name is required");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_allow_parses() {
+        use super::MachineCommand;
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()));
+        let change = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Machine { cmd: MachineCommand::Allow { allow } }) => allow.change(),
+            _ => panic!("not machine allow"),
+        };
+        assert!(change(&["machine", "allow"]).flags.is_empty());
+        let c = change(&["machine", "allow", "--gpus", "on", "--runtime-socket", "off", "--bind-add", "/a", "--bind-add", "b", "--local-env-rm", "T"]);
+        assert_eq!(c.flags, [("runtime_socket", false), ("gpus", true)]);
+        assert_eq!((c.bind_add, c.local_env_rm), (vec!["/a".to_string(), "b".into()], vec!["T".to_string()]));
+        assert!(parse(&["machine", "allow", "--gpus", "yes"]).is_err());
+        assert!(parse(&["machine", "allow", "--gpus"]).is_err(), "on or off is required");
     }
 
     #[test]

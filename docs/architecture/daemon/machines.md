@@ -53,7 +53,7 @@ dropped by the next write). Then an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
-[`machine add`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)) through `machines.add`'s
+[`machine add`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)) through `machines.add`'s
 `command` param, any other location is set by hand; `machines.probe`
 dials with the same param). An older build's `agent` key is ignored:
 whom this host's ssh-agent reaches is `member.toml`'s grants
@@ -73,7 +73,7 @@ Names: `[A-Za-z0-9._-]+`, not starting with `.` or `-` (`check_name`).
 A machine's registry name is its member name (fleet plan decision 35):
 without `--name`, `machines.add` takes it from the machine's `member.get`;
 `--name` renames the machine only while it joins a fleet by that add
-([`machine add`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)). `parse_name` splits a CLI
+([`machine add`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)). `parse_name` splits a CLI
 `<name>`: `m/x` → `Where::Machine`, `@/x` → `Where::Local`, bare →
 `Where::Any`. Container names can't hold `/` or `@`, so this never
 collides with an instance name.
@@ -204,7 +204,7 @@ each the user's own login there.
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
 copies this binary there, for `machine add` and `machine upgrade`
-([`devsandbox machine …`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)). The
+([`devsandbox machine …`](#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)). The
 CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
@@ -781,9 +781,9 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   shell; [fleet](fleet.md#pty), *Service terminals*), never re-dialed (no
   session), refused without a terminal.
 
-## `devsandbox machine add|ls|set|upgrade|unlink|rm|control-plane|pending|approve|deny|key|trust|roots`
+## `devsandbox machine add|ls|set|upgrade|unlink|rm|control-plane|pending|approve|deny|key|trust|roots|allow`
 
-A client of `machines.*` (and, for `trust`, `roots` and `key`,
+A client of `machines.*` (and, for `trust`, `roots`, `allow` and `key`,
 `member.*`; for `key rotate`, `control_plane`, `pending`, `approve` and `deny`,
 `membership.*`) only, never in-process (`src/commands/machine.rs`).
 
@@ -928,6 +928,20 @@ against the current directory), canonicalizes it and requires a directory
 way without requiring it to exist and sends both the canonical form (when
 it exists) and the literal one as `member.set {roots_rm}`, so a removed
 directory can be dropped. Both print the roots after the change. So is
+`allow` (`commands::machine::allow`), this host's worker policy
+allowances (`member.toml`'s `[allow]`; [fleet.md](fleet.md#worker-policy)):
+one `--<allowance> on|off` per on/off allowance (`--privileged`,
+`--runtime-socket`, `--host-network`, `--global-services`, `--dispatcher`,
+`--inbox`, `--initialize-command`, `--publish`, `--gpus`) and repeatable
+`--bind-add|--bind-rm <path>` (resolved as `roots`' are, `.`s dropped,
+not required to exist) and `--local-env-add|--local-env-rm <NAME>`, sent
+as one `member.set {allow}` (`allow_params`); without flags
+`member.get`. Either way it prints `<allowance>: on|off` per allowance,
+`binds:` and `local-env:` (`none` when empty) and, under `full`, that no
+worker policy applies (`allow_text`). It acts on this host only:
+`member.*` is never admitted over a link (`fleet::lent`), and
+`--machine` refuses `devsandbox machine` (`cli::machine_use`), whose
+verbs take no qualified name. So is
 `key` (`commands::machine::key`): `member.get`, printing `<name> <key>`
 (`-` for a host with no valid name) and the key's fingerprint on the next
 line (`key_text`), then a pending rotation's next key (`rotating to

@@ -1290,6 +1290,8 @@ export interface MemberInfo {
   dev_builds: boolean;
   /** Config roots shown to the fleet besides those with instances (absolute). */
   roots: string[];
+  /** The worker policy's allowances (`member.toml`'s `[allow]`). */
+  allow: MemberAllow;
   /** This member's public key, `ed25519:<64 lowercase hex>` (made on first ask). */
   key: string;
   /** The key's fingerprint, `SHA256:` and 8 groups of 4 lowercase hex digits joined by `-`. */
@@ -1306,6 +1308,45 @@ export interface MemberInfo {
    * control plane's platform differs or isn't known yet), until a pin is signed or none is due; `null` otherwise.
    */
   pin_skipped: string | null;
+}
+
+/**
+ * `member.toml`'s `[allow]`: what the worker policy lets placed work ask of this host beyond its defaults, every key
+ * present (the TOML's names in snake case). @experimental
+ */
+export interface MemberAllow {
+  privileged: boolean;
+  runtime_socket: boolean;
+  host_network: boolean;
+  global_services: boolean;
+  dispatcher: boolean;
+  inbox: boolean;
+  initialize_command: boolean;
+  publish: boolean;
+  gpus: boolean;
+  /** This host's env var names a config may read with `${localEnv:NAME}`. */
+  local_env: string[];
+  /** Host paths outside the fleet root that binds and build contexts may use (absolute). */
+  binds: string[];
+}
+
+/** `member.set`'s `allow`: each allowance given is set, the rest kept; list entries added (once) or removed. @experimental */
+export interface MemberAllowPatch {
+  privileged?: boolean;
+  runtime_socket?: boolean;
+  host_network?: boolean;
+  global_services?: boolean;
+  dispatcher?: boolean;
+  inbox?: boolean;
+  initialize_command?: boolean;
+  publish?: boolean;
+  gpus?: boolean;
+  /** Absolute paths. */
+  binds_add?: string[];
+  binds_rm?: string[];
+  /** Env var names (no `:`, `}`, `=`). */
+  local_env_add?: string[];
+  local_env_rm?: string[];
 }
 
 /** A signed statement (a membership entry's, an introduction's): `signer` says, with `key`, the payload of that hash. @experimental */
@@ -2050,11 +2091,12 @@ export interface ApiMethods {
   'member.get': { params: {}; result: MemberInfo };
   /**
    * Change what's given: `name` (`''` clears it; a peer link this host dials says it from its next dial), `trust`,
-   * and `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root. `control_plane` isn't
-   * settable: it comes from the membership log (`membership.adopt`).
+   * `roots_add` / `roots_rm` (absolute paths) and `allow` (the worker policy's allowances). `invalid` for a bad name,
+   * a relative root or bind, a bad env var name or an unknown `allow` key. `control_plane` isn't settable: it comes
+   * from the membership log (`membership.adopt`). Local only, as `member.get`: no peer sets this host's allowances.
    * @experimental
    */
-  'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
+  'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[]; allow?: MemberAllowPatch }; result: MemberInfo };
   /** This host's membership log and the introductions it holds. Local only: never over a fleet link. @experimental */
   'membership.get': { params: {}; result: MembershipInfo };
   /** The link reports this host holds (in memory: rebuilt from its peers after a restart). Local only. @experimental */

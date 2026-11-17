@@ -85,9 +85,10 @@ Phase 3, placement:
 
 Phase 4, allowances at add and join:
 
-8. **`devsandbox machine allow`**: a `member.allow` method answered only
-   for local clients, writing `[allow]` through `member::update`; one CLI
-   flag per allowance. Docs: machines.md, api.md.
+8. **`devsandbox machine allow`**: `member.set {allow}` (local clients
+   only, as all of `member.*`), writing `[allow]` through
+   `member::update`, and `member.get`'s `allow`; one CLI flag per
+   allowance. Docs: machines.md, api.md.
 9. **prompts**: `machine add` asks which allowances the target lends (or
    takes the same flags off a TTY) and applies them on the target over
    its ssh session; an inbound join asks on the joining host.

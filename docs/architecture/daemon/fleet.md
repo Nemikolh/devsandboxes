@@ -13,7 +13,7 @@ the machine a `run` is placed on); [versions](#versions): every member but the a
 follows the build the authority pins in the membership log, a published one
 downloaded, a dev one received over `TRANSFER` from a peer that has it;
 and the [member side](#member-side): `member.toml`, `member.*` with
-`devsandbox machine trust|roots|key`, the trust table and the worker
+`devsandbox machine trust|roots|allow|key`, the trust table and the worker
 policy that every remote caller goes through; and [member
 identity](#member-identity): each member's key (never reachable from a
 container), the [membership log](#membership-log) only the fleet's
@@ -42,7 +42,7 @@ reaches L's only while K grants L agent.
 The add is also the join (`machines::join::plan`, run by `machines.add`
 over this host's `member.toml` and the target's `member.get` and
 `machines.list` on the add-time probe;
-[machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)).
+[machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)).
 `machine add X` run on H, with "control plane K" a member's control plane by name (its own
 name when it's `self`):
 
@@ -100,7 +100,7 @@ X's key is the one the user confirmed: `machine add` shows the
 fingerprint `machines.probe` answers and asks (`--yes` off a TTY), and
 `machines.add {key}` refuses (`denied`, naming both fingerprints) when
 X's `member.get` says another
-([machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)).
+([machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)).
 ssh's first-use trust of the target is the root of this check.
 
 **How a machine leaves** (decisions 32 and 49 of the plan, step
@@ -1463,7 +1463,7 @@ there only through the trust table.
   `false`), `roots` (config roots this host shows the fleet besides
   those its `state.toml` has instances in, absolute; `devsandbox machine
   roots add|rm` on this host sets them:
-  [machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)),
+  [machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)),
   an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
   and a `[caps]` table, the soft caps of the
   [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
@@ -1478,9 +1478,10 @@ there only through the trust table.
   ([Member: `member.*`](#member-member)), with `member::update`, a
   read-modify-write under the sibling `member.lock`, written to a temp
   file and renamed (`locked_file::update`, which `machines.toml` and
-  `forwards.toml` are written with too); `dev-builds`, `[allow]` and
-  `[caps]` are edited by hand (no call changes them) and read at each
-  use; the grants are written by `machines.set {agent}` and
+  `forwards.toml` are written with too; a rewrite, so hand comments
+  don't survive it); `[allow]` is written by `member.set {allow}`
+  (`devsandbox machine allow`) or by hand, `dev-builds` and `[caps]` by
+  hand only (no call changes them), all read at each use; the grants are written by `machines.set {agent}` and
   `machines.add {agent}` (`fleet::grants::grant` / `withdraw`, through
   `member::update`) and read per `AGENT` stream.
 - **`member.key`** (next to `member.toml`, `member::key_path`) is this
@@ -1771,17 +1772,25 @@ Wire: [`member.*`](../../reference/api.md#member).
 - **`member.get`** answers `MemberInfo`: the `name` this host goes by
   (`Member::name_or`: the file's, else the hostname's first label; `null`
   when neither is valid), `control_plane` (`self`, the control plane's name, or `null` in no
-  fleet), `trust`, `dev_builds` as the file says, `roots`, and this
+  fleet), `trust`, `dev_builds` as the file says, `roots`, `allow`
+  (`member::AllowInfo`: `[allow]` with every key, snake case), and this
   member's public `key` with its `fingerprint` ([Member
   identity](#member-identity); the first ask makes the key), and
   `exposed_by`: this host's [exposure](#exposure) chain while it's
   `worker` and exposed through another machine, else `null`. `member.set`
   answers them too, `exposed_by` at the new trust.
-- **`member.set {name?, trust?, roots_add?, roots_rm?}`** merges what's
+- **`member.set {name?, trust?, roots_add?, roots_rm?, allow?}`** merges what's
   given into the file (`member::merge`, pure: `name` a
   `member::check_member_name`, `""` clears it; `roots_add` absolute, one
-  already there kept once; `roots_rm` drops what it names), checks it and
-  writes it. It answers the `MemberInfo` after the change. A changed
+  already there kept once; `roots_rm` drops what it names; `allow` a
+  `member::AllowPatch`, each on/off allowance given set, `binds_add`
+  absolute and `local_env_add` a `member::check_env_name`, each kept
+  once, `binds_rm` / `local_env_rm` dropping what they name), checks it and
+  writes it. Being local only, `allow` is never a peer's or the control
+  plane's to set: the allowances are this host's own grant. The worker
+  policy reads `[allow]` at each check (`worker_policy::load_member`), the
+  capacity report's `gpu.lent` at each report (`Member::lends_gpu`), so a
+  change applies from the next one. It answers the `MemberInfo` after the change. A changed
   name is what the next dial of each link says (`dialer::member_name`
   reads it per dial); a changed `trust` makes this host's [link
   report](#link-graph) due at once (`Published::republish`), so the other
@@ -1811,7 +1820,7 @@ signatures, signed statements and the rollback rule.
   (naming the path and `chmod 600`) and a malformed one (never echoing
   its text); neither is replaced. `member.get` (and `member.set`) answer
   its public half, making the key on the first ask; `devsandbox machine
-  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustroots)).
+  key` prints it ([machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)).
 - **Rotation**: `devsandbox machine key rotate` (`membership.rotate`,
   `machines::changes::rotate`) makes the next key, `member.key.next`
   (`FileKeyStore::next_path`, `KeyStore::next_key`: the same format and
@@ -3454,8 +3463,9 @@ logged one by one at either end (they are mostly probes).
 
 What a config under a fleet root may ask of the host beyond containers
 that see only what was lent (`src/worker_policy.rs`). Denied by default;
-every item has an allowance in `member.toml`'s `[allow]`, and none of it
-applies under `trust = "full"` ([Trust](#trust)).
+every item has an allowance in `member.toml`'s `[allow]`, set on this
+host only (`devsandbox machine allow`, `member.set {allow}`, or by hand),
+and none of it applies under `trust = "full"` ([Trust](#trust)).
 
 - **Under the policy by path.** A config dir whose canonical path is
   under `<data>/devsandbox/fleet/` (`fleet_root_of`: symlinks count where

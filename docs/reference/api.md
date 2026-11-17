@@ -1370,14 +1370,15 @@ link's head comparison.
 
 This host as a fleet member: `member.toml`
 ([fleet.md](../architecture/daemon/fleet.md#member-member)). The daemon is
-its only writer; `[allow]`, `[caps]` and `dev-builds` are edited by hand
-and have no param. Local only: both are denied on a remote caller's
-connection under either trust (*Remote callers*).
+its only writer; `[caps]` and `dev-builds` are edited by hand and have
+no param. Local only: both are denied on a remote caller's connection
+under either trust (*Remote callers*), so `allow` is this host's own
+grant, never a peer's or the control plane's to set.
 
 | method | params | result | errors |
 |---|---|---|---|
-| `member.get` | `{}` | `{"name", "control_plane", "trust", "dev_builds", "roots", "key", "fingerprint", "next", "exposed_by", "pin_skipped"}`: `next` a pending key rotation's next key as `{"key", "fingerprint"}` (`membership.rotate`), `null` when none is pending; `exposed_by` this host's chain from the control plane while it's `worker` and exposed through another machine (as `machines.list`'s, over this host's link graph; its last but one dials this host), else `null`; `pin_skipped`, on the fleet's authority, why the daemon's last try didn't pin this build (a dev build while the control plane's platform differs or isn't known: [fleet: Versions](../architecture/daemon/fleet.md#versions)) until a pin is signed or none is due, else `null` | `internal` (`member.toml` doesn't parse; `member.key` can't be made, or is malformed or reachable by group or others), `failed` (no data dir) |
-| `member.set` | `{"name"?, "trust"?, "roots_add"?, "roots_rm"?}`: each one given is changed | as `member.get`, after the change (`exposed_by` at the new trust) | `invalid` (an unknown param, `control_plane` included, or `trust`, a bad `name`, a relative root), `failed` (no data dir), `internal` (`member.toml` doesn't read or write; `member.key` as `member.get`) |
+| `member.get` | `{}` | `{"name", "control_plane", "trust", "dev_builds", "roots", "allow", "key", "fingerprint", "next", "exposed_by", "pin_skipped"}`: `next` a pending key rotation's next key as `{"key", "fingerprint"}` (`membership.rotate`), `null` when none is pending; `exposed_by` this host's chain from the control plane while it's `worker` and exposed through another machine (as `machines.list`'s, over this host's link graph; its last but one dials this host), else `null`; `pin_skipped`, on the fleet's authority, why the daemon's last try didn't pin this build (a dev build while the control plane's platform differs or isn't known: [fleet: Versions](../architecture/daemon/fleet.md#versions)) until a pin is signed or none is due, else `null` | `internal` (`member.toml` doesn't parse; `member.key` can't be made, or is malformed or reachable by group or others), `failed` (no data dir) |
+| `member.set` | `{"name"?, "trust"?, "roots_add"?, "roots_rm"?, "allow"?}`: each one given is changed | as `member.get`, after the change (`exposed_by` at the new trust) | `invalid` (an unknown param, `control_plane` included, or `trust`, a bad `name`, a relative root; in `allow` an unknown key, a non-boolean allowance, a relative bind, a bad env var name), `failed` (no data dir), `internal` (`member.toml` doesn't read or write; `member.key` as `member.get`) |
 
 - `name`: the name this host goes by in the fleet: the one set, else the
   hostname's first label; `null` when neither is a valid machine name.
@@ -1398,6 +1399,17 @@ connection under either trust (*Remote callers*).
 - `roots`: config roots shown to the fleet besides those with instances
   here (absolute paths). `roots_add` adds each one not there yet,
   `roots_rm` drops each one named.
+- `allow`: the worker policy's allowances, `member.toml`'s `[allow]`
+  ([fleet.md](../architecture/daemon/fleet.md#worker-policy)), its keys in
+  snake case, all present: `{"privileged", "runtime_socket",
+  "host_network", "global_services", "dispatcher", "inbox",
+  "initialize_command", "publish", "gpus"}` booleans, `"local_env"` (env
+  var names) and `"binds"` (absolute paths). `member.set`'s `allow` is a
+  patch: each of those booleans given is set, the rest kept;
+  `"binds_add"` (absolute) and `"local_env_add"` (no `:`, `}`, `=` or NUL,
+  not empty) add each entry not there yet, `"binds_rm"` and
+  `"local_env_rm"` drop each one named. Read at each worker policy check,
+  so a change applies from the next one.
 - `key`: this member's public key, `ed25519:<64 lowercase hex>`, from
   `member.key` next to `member.toml`, made on the first ask
   ([fleet.md](../architecture/daemon/fleet.md#member-identity)).

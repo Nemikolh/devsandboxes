@@ -936,6 +936,7 @@ mod tests {
             ("machines.get", json!({"name": "m"}), Err("denied")),
             ("member.get", p.clone(), Err("denied")),
             ("member.set", json!({"trust": "full"}), Err("denied")),
+            ("member.set", json!({"allow": {"gpus": true}}), Err("denied")),
             ("membership.get", p.clone(), Err("denied")),
             ("shutdown", p.clone(), Err("denied")),
             ("helper.call", p.clone(), Err("denied")),

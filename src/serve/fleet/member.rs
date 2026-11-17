@@ -1,20 +1,23 @@
 //! `member.toml`, next to `state.toml`: this host as a fleet member
 //! (docs/architecture/daemon/fleet.md, *Member file*): the name it goes by,
-//! its fleet's control plane, its trust, the config roots it shows the fleet, and the
-//! hand-edited `[allow]`, `[caps]` and `dev-builds`. Next to it,
+//! its fleet's control plane, its trust, the config roots it shows the fleet, its
+//! `[allow]`, and the hand-edited `[caps]` and `dev-builds`. Next to it,
 //! `member.key` ([`key_path`]) is this member's private key
 //! (`fleet::identity::FileKeyStore`), whose public half `member.get` answers.
 //!
 //! Written by the daemon only (decision 3 of the fleet plan), through
-//! `member.set` ([`call`]; `devsandbox machine trust` and `machine roots`
-//! are its clients), with [`update`]: under the sibling
+//! `member.set` ([`call`]; `devsandbox machine trust`, `machine roots` and
+//! `machine allow` are its clients), with [`update`]: under the sibling
 //! `member.lock`, a temp file and a rename (`serve::locked_file`). `control_plane`
 //! has no call: it's written from an accepted membership log
 //! (`membership.adopt`, `super::membership_api`) and cleared on leaving,
 //! both through [`set_fleet`].
-//! `[allow]`, `[caps]` and `dev-builds` have no call: they're edited by
-//! hand and re-read at each use (`worker_policy` reads `trust` and
-//! `[allow]` itself, on every platform). The `[[agent]]` grants have no
+//! `member.*` is local only (`fleet::lent` admits none of it over a link):
+//! `[allow]` is this host's own grant, never a peer's or the control
+//! plane's to set (gpus plan decision 7). `[caps]` and `dev-builds` have
+//! no call: they're edited by hand. All of it is re-read at each use
+//! (`worker_policy` reads `trust` and `[allow]` itself, on every
+//! platform), so nothing is cached to invalidate. The `[[agent]]` grants have no
 //! `member.*` call either: `machines.set {agent}` and `machines.add
 //! {agent}` write them (`super::grants`), read at each `AGENT` stream.
 
@@ -285,6 +288,8 @@ pub struct MemberInfo {
     /// `dev-builds` as the file says (`full` takes dev builds either way).
     pub dev_builds: bool,
     pub roots: Vec<PathBuf>,
+    /// `[allow]`, every key present.
+    pub allow: AllowInfo,
     /// This member's public key (`ed25519:<hex>`), from `member.key`,
     /// created on first ask.
     pub key: PublicKey,
@@ -307,6 +312,130 @@ pub struct MemberInfo {
     pub pin_skipped: Option<String>,
 }
 
+/// `[allow]` on the wire: the TOML keys in snake case, as the rest of
+/// `member.*` names its fields, every one present.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowInfo {
+    pub privileged: bool,
+    pub runtime_socket: bool,
+    pub host_network: bool,
+    pub global_services: bool,
+    pub dispatcher: bool,
+    pub inbox: bool,
+    pub initialize_command: bool,
+    pub publish: bool,
+    pub gpus: bool,
+    pub local_env: Vec<String>,
+    pub binds: Vec<PathBuf>,
+}
+
+impl AllowInfo {
+    /// The on/off allowances by wire name, in the file's order.
+    pub fn flags(&self) -> [(&'static str, bool); 9] {
+        [
+            ("privileged", self.privileged),
+            ("runtime_socket", self.runtime_socket),
+            ("host_network", self.host_network),
+            ("global_services", self.global_services),
+            ("dispatcher", self.dispatcher),
+            ("inbox", self.inbox),
+            ("initialize_command", self.initialize_command),
+            ("publish", self.publish),
+            ("gpus", self.gpus),
+        ]
+    }
+}
+
+impl From<&Allow> for AllowInfo {
+    fn from(a: &Allow) -> Self {
+        AllowInfo {
+            privileged: a.privileged,
+            runtime_socket: a.runtime_socket,
+            host_network: a.host_network,
+            global_services: a.global_services,
+            dispatcher: a.dispatcher,
+            inbox: a.inbox,
+            initialize_command: a.initialize_command,
+            publish: a.publish,
+            gpus: a.gpus,
+            local_env: a.local_env.clone(),
+            binds: a.binds.clone(),
+        }
+    }
+}
+
+/// `member.set`'s `allow`: each allowance given is set, the rest kept;
+/// list entries added (once) or removed (one not there is no error).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AllowPatch {
+    pub privileged: Option<bool>,
+    pub runtime_socket: Option<bool>,
+    pub host_network: Option<bool>,
+    pub global_services: Option<bool>,
+    pub dispatcher: Option<bool>,
+    pub inbox: Option<bool>,
+    pub initialize_command: Option<bool>,
+    pub publish: Option<bool>,
+    pub gpus: Option<bool>,
+    /// Absolute paths.
+    pub binds_add: Vec<PathBuf>,
+    pub binds_rm: Vec<PathBuf>,
+    /// Env var names ([`check_env_name`]).
+    pub local_env_add: Vec<String>,
+    pub local_env_rm: Vec<String>,
+}
+
+impl AllowPatch {
+    fn apply(&self, a: &mut Allow) -> Result<(), ApiError> {
+        let flags = [
+            (self.privileged, &mut a.privileged),
+            (self.runtime_socket, &mut a.runtime_socket),
+            (self.host_network, &mut a.host_network),
+            (self.global_services, &mut a.global_services),
+            (self.dispatcher, &mut a.dispatcher),
+            (self.inbox, &mut a.inbox),
+            (self.initialize_command, &mut a.initialize_command),
+            (self.publish, &mut a.publish),
+            (self.gpus, &mut a.gpus),
+        ];
+        for (want, have) in flags {
+            if let Some(want) = want {
+                *have = want;
+            }
+        }
+        for bind in &self.binds_add {
+            if !bind.is_absolute() {
+                return Err(ApiError::invalid(format!("`allow.binds_add`: `{}` is not an absolute path", bind.display())));
+            }
+            if !a.binds.contains(bind) {
+                a.binds.push(bind.clone());
+            }
+        }
+        a.binds.retain(|b| !self.binds_rm.contains(b));
+        for name in &self.local_env_add {
+            check_env_name(name).map_err(|e| ApiError::invalid(format!("`allow.local_env_add`: {e:#}")))?;
+            if !a.local_env.contains(name) {
+                a.local_env.push(name.clone());
+            }
+        }
+        a.local_env.retain(|n| !self.local_env_rm.contains(n));
+        Ok(())
+    }
+}
+
+/// A name `${localEnv:NAME}` can say and an env var can have: not empty,
+/// no `:` (the default's separator), `}`, `=` or NUL.
+pub fn check_env_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("empty env var name");
+    }
+    if let Some(c) = name.chars().find(|c| matches!(c, ':' | '}' | '=' | '\0')) {
+        bail!("`{name}`: an env var name has no `{}`", c.escape_default());
+    }
+    Ok(())
+}
+
 /// The [`MemberInfo::exposed_by`] chain of the member of this name at this
 /// trust (the daemon's link graph).
 pub type Exposure<'a> = &'a dyn Fn(&str, Trust) -> Option<Vec<String>>;
@@ -326,6 +455,9 @@ pub struct SetParams {
     /// Paths taken out of `roots` (one not there is no error).
     #[serde(default)]
     pub roots_rm: Vec<PathBuf>,
+    /// `[allow]` changes (`devsandbox machine allow`).
+    #[serde(default)]
+    pub allow: Option<AllowPatch>,
 }
 
 /// `member` with `p` applied, checked (pure).
@@ -348,6 +480,9 @@ pub fn merge(mut member: Member, p: &SetParams) -> Result<Member, ApiError> {
         }
     }
     member.roots.retain(|r| !p.roots_rm.contains(r));
+    if let Some(allow) = &p.allow {
+        allow.apply(&mut member.allow)?;
+    }
     check(&member).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     Ok(member)
 }
@@ -367,6 +502,7 @@ fn info(member: &Member, path: &Path, hostname: &str, exposure: Exposure, pin_sk
         trust: member.trust,
         dev_builds: member.dev_builds,
         roots: member.roots.clone(),
+        allow: AllowInfo::from(&member.allow),
         fingerprint: key.fingerprint(),
         key,
     })
@@ -549,7 +685,32 @@ mod tests {
         assert_eq!(code(json!({"roots_add": ["rel"]})), "invalid");
         // Hand-edited parts aren't settable, nor `control_plane` (only an accepted
         // membership log writes it).
-        for bad in [json!({"trust": "most"}), json!({"dev_builds": true}), json!({"allow": {}}), json!({"caps": {}}), json!({"control_plane": "self"})] {
+        for bad in [json!({"trust": "most"}), json!({"dev_builds": true}), json!({"caps": {}}), json!({"control_plane": "self"})] {
+            assert!(serde_json::from_value::<SetParams>(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allow_patches_change_only_what_they_name() {
+        let p = |v: Value| -> SetParams { serde_json::from_value(v).unwrap() };
+        let start = Member { trust: Trust::Full, allow: Allow { publish: true, binds: vec!["/x".into()], ..Default::default() }, ..Default::default() };
+        let m = merge(start.clone(), &p(json!({"allow": {"gpus": true, "runtime_socket": true, "publish": false}}))).unwrap();
+        let want = Allow { gpus: true, runtime_socket: true, binds: vec!["/x".into()], ..Default::default() };
+        assert_eq!((m.allow.clone(), m.trust), (want, Trust::Full), "the rest kept");
+        assert_eq!(merge(m.clone(), &p(json!({"allow": {}}))).unwrap(), m, "an empty patch");
+        let lists = json!({"allow": {"binds_add": ["/a", "/x", "/a"], "binds_rm": ["/x", "/gone"], "local_env_add": ["TOKEN", "HOME", "TOKEN"]}});
+        let l = merge(m.clone(), &p(lists)).unwrap();
+        assert_eq!(l.allow.binds, [PathBuf::from("/a")]);
+        assert_eq!(l.allow.local_env, ["TOKEN", "HOME"], "deduped");
+        let l = merge(l, &p(json!({"allow": {"local_env_rm": ["TOKEN", "NOPE"]}}))).unwrap();
+        assert_eq!(l.allow.local_env, ["HOME"]);
+        let code = |v: Value| merge(start.clone(), &p(v)).unwrap_err().code;
+        assert_eq!(code(json!({"allow": {"binds_add": ["rel"]}})), "invalid");
+        for bad in ["", "A:B", "A}", "A=B"] {
+            assert_eq!(code(json!({"allow": {"local_env_add": [bad]}})), "invalid", "{bad:?}");
+        }
+        // Unknown keys and the TOML's kebab names aren't the wire's.
+        for bad in [json!({"allow": {"nope": true}}), json!({"allow": {"runtime-socket": true}}), json!({"allow": {"binds": ["/a"]}}), json!({"allow": {"gpus": "on"}})] {
             assert!(serde_json::from_value::<SetParams>(bad.clone()).is_err(), "{bad}");
         }
     }
@@ -564,6 +725,7 @@ mod tests {
             trust: Trust::Full,
             dev_builds: true,
             roots: vec!["/srv/cfg".into()],
+            allow: AllowInfo { gpus: true, local_env: vec!["TOKEN".into()], binds: vec!["/srv/x".into()], ..Default::default() },
             fingerprint: key.fingerprint(),
             key,
             next: Some(KeyInfo::of(&key)),
@@ -573,6 +735,7 @@ mod tests {
         assert_matches("MemberInfo", &serde_json::to_value(&info).unwrap());
         assert_eq!(serde_json::to_value(&info).unwrap()["exposed_by"], json!(["box", "lap"]));
         assert_matches("MembershipKey", &serde_json::to_value(&info).unwrap()["next"]);
+        assert_matches("MemberAllow", &serde_json::to_value(&info).unwrap()["allow"]);
         assert_matches("MemberInfo", &serde_json::to_value(MemberInfo { control_plane: None, ..info }).unwrap());
         assert_eq!(union_members("MemberTrust"), ["'worker'", "'full'"]);
         assert!(prop_type("ApiMethods", "member.get").is_some());
@@ -598,7 +761,9 @@ mod tests {
         }
         assert_eq!(
             got,
-            json!({"name": "lap", "control_plane": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null, "exposed_by": ["k", "lap"], "pin_skipped": "not pinned: x"})
+            json!({"name": "lap", "control_plane": null, "trust": "worker", "dev_builds": false, "roots": [], "next": null, "exposed_by": ["k", "lap"], "pin_skipped": "not pinned: x",
+                "allow": {"privileged": false, "runtime_socket": false, "host_network": false, "global_services": false, "dispatcher": false,
+                    "inbox": false, "initialize_command": false, "publish": false, "gpus": false, "local_env": [], "binds": []}})
         );
         // A pending rotation shows.
         let next = FileKeyStore::new(key_path(&path)).next_key().unwrap().public_key();
@@ -615,6 +780,12 @@ mod tests {
 
         let set = call("member.set", json!({"name": "box"}));
         assert_eq!(set.unwrap().unwrap()["name"], "box");
+        let set = call("member.set", json!({"allow": {"gpus": true, "binds_add": ["/srv/x"]}})).unwrap().unwrap();
+        assert_eq!((&set["allow"]["gpus"], &set["allow"]["binds"], &set["allow"]["publish"]), (&json!(true), &json!(["/srv/x"]), &json!(false)));
+        // What the worker policy reads, on its next check.
+        let (_, allow) = crate::worker_policy::load_member(&path).unwrap();
+        assert_eq!(allow, Allow { gpus: true, binds: vec!["/srv/x".into()], ..Default::default() });
+        assert_eq!(call("member.set", json!({"allow": {"gpus": 1}})).unwrap().unwrap_err().code, "invalid");
         assert_eq!(call("member.set", json!({"control_plane": "self"})).unwrap().unwrap_err().code, "invalid");
         // The log's control plane, written internally; the name pinned with it.
         set_fleet(&path, Some("box2"), &ControlPlane::This).unwrap();
