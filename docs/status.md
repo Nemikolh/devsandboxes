@@ -12,7 +12,10 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **helper**: `exec` sessions' last steps: sessions as rows in the
+  dashboard's tree (4f), ending them explicitly with `exec --end`, no
+  idle timeout (4g), link terminals of a non-root helper as sessions
+  (5). → [plan](plans/active/resumable-exec.md)
 
 ## Planned
 
@@ -22,12 +25,6 @@ rewritten for the orchestrator
 ([helper-rpc](plans/active/helper-rpc.md#order-across-plans)). The Inbox
 is frozen: no new work on it.
 
-- **helper**: `exec` sessions after fleet step 1: detached sessions as
-  rows of their own in the dashboard's tree (it shows a count, and `a`
-  attaches; not through the Inbox), a policy
-  for sessions nobody reattaches to (`devsbd/src/sessions.rs`); link
-  terminals of a non-root helper as sessions (step 5).
-  → [plan](plans/active/resumable-exec.md)
 - **machines**: the authority no longer a single point of failure: a
   recovery key made at genesis, a scoped, expiring delegation to the
   control plane (`members`, `configs`); then machine → node.

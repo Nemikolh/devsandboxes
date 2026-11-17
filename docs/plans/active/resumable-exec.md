@@ -1,15 +1,16 @@
 # Resumable exec: interactive sessions that outlive their connection
 
-Status: planned (step 4, the part after fleet step 1)
+Status: in progress (steps 4f, 4g, 5)
 Steps 1-3 shipped: helper sessions (`devsbd/src/sessions.rs`), `exec`
 through them with `--attach` / `--sessions` / `--session`
 (`src/commands/exec.rs`), reconnect over ssh and in remote dashboard tabs
 (`serve::machines::cli` `Reconnect`, `tui::app::terminal`). Step 4's "now"
 part (4a-4d) shipped too: `session prune` and the prune on `new`, a
 displaced client that never blocks, the session wire version
-(`VERSION_EXIT`), the session count in `instances.procs`. The living docs
-describe all of it. Left: step 4's items after fleet step 1 (surfacing
-detached sessions, a policy for abandoned ones), and step 5 (link
+(`VERSION_EXIT`), the session count in `instances.procs`; and 4e, the
+dashboard's `a` (attach to a detached session). The living docs
+describe all of it. Left: 4f (sessions as rows in the dashboard's tree),
+4g (ending sessions: the policy, `exec --end`), and step 5 (link
 terminals resumable when the helper isn't root; from *Compared with
 Kubernetes attach*).
 
@@ -228,12 +229,12 @@ Now, before [fleet](fleet.md) step 2:
 
 After fleet step 1 (fleet root, `lend.toml`):
 
-- Surface detached sessions (dashboard rows, maybe an Inbox note). The
-  Inbox is per host until fleet step 15, so a note for a hub-placed
-  instance would land in the worker's own Inbox.
+- Surface detached sessions (dashboard rows; not an Inbox note: the
+  Inbox is frozen and goes with the in-repo dispatcher,
+  [fleet](fleet.md#rollout)). Shipped as 4e (`a`); 4f (rows).
 - A policy for sessions nobody re-attaches to (idle timeout or
   explicit); on a worker they hold lent capacity, so it may belong in
-  `lend.toml` or the capacity report.
+  `lend.toml` or the capacity report. Decided in 4g: explicit.
 
 The "now" part shipped as four commits (4a-4d). Landmarks are from recon
 (line numbers drift; trust the symbol).
@@ -324,6 +325,71 @@ The "now" part shipped as four commits (4a-4d). Landmarks are from recon
 - Docs: `docs/reference/api.md` (`instances.procs`),
   `docs/architecture/dashboard/tabs-and-actions.md`,
   `docs/architecture/runtimes.md` where it describes the procs listing.
+
+### Step 4e: `a` attaches from the dashboard (shipped)
+
+`a` on a running instance row: `sessions.list` through the daemon, the
+detached ones (`commands::exec::detached_sessions`), a tab on the one or
+a picker (`Confirmed::Attach`); a machine's tab re-dials like a `t` tab.
+`docs/architecture/dashboard/terminal.md`.
+
+### Step 4f: sessions as rows in the dashboard's tree
+
+- Wire: `ProcsListing.sessions` (`src/serve/api.rs`) becomes the
+  parsed list, not a count: `Vec<Session>` (`id`, `state`, `attached`,
+  `started`, `argv`), oldest first, absent when the helper didn't answer
+  (`#[serde(default, skip_serializing_if)]` as today). A parser in
+  `src/runtime/procs.rs` next to `count_sessions` (which goes; the
+  count is derived where it's shown). `npm/devsandboxes/index.d.ts`
+  (`src/serve/dts.rs` checks it). No compat with the count: pre-1.0.
+- Rows: after the runs (`tui::procs::proc_state`, `run_rows`), one row
+  per running session, `SESSION_PID` (`session`) in the gutter like
+  `RUN_PID`: `<id> attached|detached <argv>`. Ended and `lost` ones
+  aren't rows (the prune keeps them minutes only; they can't be
+  attached). The Detail line and the tree badge keep showing the count,
+  from the list.
+- Keys on a session row: `a` (and `enter`) attach that id (4e's
+  `open_attach`, so a machine's tab re-dials); `K` ends it
+  (`sessions.rm`, a new `Cmd::SessionRm` in `tui/daemon.rs`, routed
+  like the other one-shot calls; status line on the answer, then a
+  procs refetch as after a signal). `t` on a session row is a status
+  line (`a attaches, K ends the session`), not SIGTERM: it isn't a
+  process. Attaching to an *attached* session from its row is allowed
+  (it takes over, `DETACHED_EXIT` to the other client), unlike 4e's
+  picker which offers only detached ones: on a row the user chose it.
+- Tests: the parser, proc rows, the keys (`app/procs.rs`,
+  `app/terminal.rs` models), the call's params, dts.
+- Docs: `docs/reference/api.md` (`instances.procs`),
+  `docs/architecture/dashboard/tabs-and-actions.md` (*Process layer*),
+  `terminal.md`, `HELP_BODY` (*Process rows*).
+
+### Step 4g: ending sessions (the policy)
+
+Decision: a session ends when its program exits, when it's ended
+explicitly, or with its container. No idle timeout. Why: the point of a
+session is that it outlives its client, and the long ones are the ones
+worth keeping (an agent working while nobody watches, a shell left over
+a weekend); "idle" can't be told from "working, unwatched" without
+guessing at output, and a wrong guess kills the work the plan exists to
+save. The cost of an abandoned one is visible instead: the count and
+rows (4d, 4f), `exec --sessions`, and stopping the sandbox ends them
+all. On a fleet worker the lent instance's sessions end with it
+(`rm`, stop) like any other process of it. An opt-in timeout stays
+parked until someone misses it.
+
+- `devsandbox exec <instance> --end <id>`: the explicit end, from the
+  CLI (today only `sessions.rm` over the API and `devsbd session rm`
+  inside). `src/main.rs` `Command::Exec` (conflicts like `--sessions`),
+  `commands::exec::Exec::End`: the helper's `session rm` through the
+  runtime as `--sessions` runs `session ls` (`session_ls_argv`'s user);
+  on a machine (`serve::machines::cli::session_exec`) a `sessions.rm`
+  quick call. `checked_session_id` first. Prints `ended session <id> in
+  <key>`.
+- Tests: flag parsing and conflicts (`src/main.rs`
+  `exec_session_flags_parse`), the argv, `session_exec`'s routing.
+- Docs: `docs/architecture/helper/in-container.md` (*Sessions*: how one
+  ends), the CLI reference where `exec`'s flags are listed, an ADR in
+  `docs/decisions/` for the policy at the plan's close.
 
 ## Step 5: link terminals resumable when the helper isn't root
 
