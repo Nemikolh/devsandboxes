@@ -793,8 +793,8 @@ refuse, with the config root and the folders that move with it
 (`folder`, `folders` entries outside the root) as the only paths that
 travel. From the config, every `worker_policy::Policy::config_refusals`
 item (`initializeCommand`, `dispatcher`, `inbox`,
-`privileged`, a required GPU (`hostRequirements.gpu`; an optional one
-isn't a tie), `global` services, local features outside those paths, each `${localEnv:NAME}`
+`privileged`, a required GPU (`hostRequirements.gpu`, the sandbox's or a
+listed service's; an optional one isn't a tie), `global` services, local features outside those paths, each `${localEnv:NAME}`
 in the merged sandbox or its services); from each `mounts` bind (its
 source substituted as `run` does, `${localWorkspaceFolder}` the
 `folder`), `Policy::check_bind`'s: a source outside those paths, a
@@ -3498,8 +3498,9 @@ applies under `trust = "full"` ([Trust](#trust)).
   after the sandbox resolves, before the runtime is called or the
   instance recorded) and again at the top of `materialize` (so `rebuild`
   too), refuses `initializeCommand` (it runs on the host), `dispatcher`,
-  `inbox`, `privileged`, a required GPU (`gpus`; an optional one runs
-  without, with a warning: `commands::run::gpu::gpu_decision`), `global`
+  `inbox`, `privileged`, a required GPU, the sandbox's or a listed
+  service's (`gpus`; an optional one runs without, with a warning:
+  `commands::run::gpu::gpu_decision`), `global`
   services, and local features
   whose folder, or any file in it, resolves outside the fleet root (they
   are copied into the image's build context). `folder` and `folders`

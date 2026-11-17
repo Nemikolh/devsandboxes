@@ -133,7 +133,7 @@ Unknown keys error. No `extends` for services.
 | `env` | {string = string} | `-e` vars. |
 | `ports` | [string] | `docker run -p` specs (`"5432"`, `"5432:5432"`, `"127.0.0.1:5432:5432"`). A bare container port (`"5432"`, `"53/udp"`, `"127.0.0.1::5432"`) gets the same host port when it's free, else one picked by the runtime. An explicit host port already published by another container errors. |
 | `command` | string \| [string] | Appended after the image. A string is passed as **one** argv item, not shell-split. |
-| `hostRequirements` | table | The sandbox key and forms (devsandbox extension: the spec has none for services). Parsed and hashed for drift; not acted on, and not warned. |
+| `hostRequirements` | table | The sandbox key and forms (devsandbox extension: the spec has none for services). `gpu` acts as on a sandbox, decided before the service's image is built or pulled: required with no usable GPU fails the run naming the service, `"optional"` warns and runs without; on a fleet worker a required one needs `[allow] gpus = true`. The other keys are ignored, and not warned. Hashed for drift. |
 
 Sandboxes reach a service by its name as hostname (network alias, or `/etc/hosts` on runtimes without aliases). `devsandbox gc` reaps unreferenced containers; `devsandbox service rebuild <name>` recreates and rewires in place, without restarting the sandboxes.
 

@@ -31,6 +31,7 @@ mod worktree;
 
 pub(crate) use editor::write_vscode_name_config;
 pub(crate) use git::{check_repo, host_git, host_git_bare, host_git_new};
+pub(crate) use gpu::gpu_decision;
 pub(crate) use lifecycle::exec_lifecycle;
 pub(crate) use profile::choose_profile;
 pub(crate) use ssh_agent::{
@@ -629,10 +630,11 @@ pub(crate) fn materialize(
     let policy = crate::worker_policy::Policy::for_dir(dir)?;
 
     // Before anything is built or created, so a required GPU fails fast.
-    let (gpu_args, warnings) = gpu::gpu_decision(
+    let (gpu_args, warnings) = gpu_decision(
         props.host_requirements.as_ref().and_then(|h| h.gpu_need()),
         || backend().gpu_support(),
         policy.as_ref().is_none_or(|p| p.allow.gpus),
+        None,
     )?;
     for warning in warnings {
         eprintln!("warning: {warning}");

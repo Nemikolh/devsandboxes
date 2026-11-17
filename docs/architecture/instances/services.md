@@ -44,16 +44,35 @@ Called by `materialize` (before the instance container is created), by
 2. Create the scope's network if missing (`ensure_network`, see
    [networks](#networks)).
 3. `ensure_service`: exists → warn on drift, `start` if stopped; absent →
-   create. Creating builds a `build` service into
+   create. Creating first decides the service's [GPU](#gpus) flags, then
+   builds a `build` service into
    `devsandbox-img-svc-<project>-<name>` (`service_image_tag`; `build_args`,
    shared with sandbox builds),
    prefers the same host port for bare `-p` specs when it's free
    (`prefer_same_host_ports`), fails early if another running container
    publishes a requested host port (`check_port_conflicts`), then `run -d`
-   on its network with `env`, `ports`, `command`.
+   on its network with `env`, `ports`, the GPU flags, `command`.
 
 It returns the networks the instance joins and the `ServiceEndpoint`s
 (`alias` = service name) it must resolve.
+
+## GPUs
+
+A service takes the sandbox's `hostRequirements.gpu` (a devsandbox
+extension; its other `hostRequirements` keys are ignored, unwarned).
+`ensure_service` runs the sandbox's decision, `commands::run::gpu_decision`
+with the service's name (see [lifecycle](lifecycle.md#gpus)), before the
+image is built or pulled, the worker policy the one for the config dir
+(`Policy::for_dir`). A required GPU the runtime or the policy can't give
+fails the whole `run` (or `start`, `rebuild`, `service rebuild`) naming
+the service; an optional one is a warning and the service runs without.
+`service_run_args` puts the flags right before the image, for `global`
+and `isolated` services alike; a recreated service decides again. On a
+fleet worker, `Policy::config_refusals` refuses a listed service's
+required GPU without `[allow] gpus = true`, so it is a
+[tie](../daemon/fleet.md) as the sandbox's own is. A changed
+`hostRequirements` is drift like any changed service definition
+(`config_hash`): warned, applied by `service rebuild`.
 
 ## Networks
 

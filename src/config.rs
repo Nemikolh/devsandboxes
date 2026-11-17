@@ -1107,9 +1107,10 @@ pub struct Service {
     #[serde(default)]
     pub command: Option<StringOrList>,
     /// The sandbox key, on a service (a devsandbox extension); in the
-    /// service's `config_hash` like every key.
+    /// service's `config_hash` like every key. Only `gpu` is acted on
+    /// (`commands::run::gpu_decision`); the other keys are ignored,
+    /// unwarned.
     #[serde(default, rename = "hostRequirements")]
-    #[allow(dead_code)] // nothing acts on a service's GPU need yet
     pub host_requirements: Option<HostRequirements>,
 }
 

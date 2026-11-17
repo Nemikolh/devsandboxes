@@ -273,7 +273,8 @@ impl Policy {
     /// What the resolved sandbox `sandbox` of `config` (at `dir`) declares
     /// that never shows in a container's argv or is done on the host before
     /// one: `initializeCommand`, `dispatcher`, `inbox`, `privileged`, a
-    /// required GPU (an optional one runs without), `global` services, local features outside the fleet root (or with a file
+    /// required GPU, the sandbox's or a service's (an optional one runs
+    /// without), `global` services, local features outside the fleet root (or with a file
     /// resolving outside it), and `${localEnv:NAME}` in the merged sandbox
     /// or its services for a name `local-env` doesn't list.
     pub fn check_config(&self, dir: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Result<(), Refusal> {
@@ -335,6 +336,13 @@ impl Policy {
             // An unknown service fails later with its own error.
             if let Ok(service) = config.resolve_service(name) {
                 out.extend(self.check_service(&service).err());
+                let gpu = service.spec.host_requirements.as_ref().and_then(|h| h.gpu_need());
+                if gpu == Some(GpuNeed::Required) && !a.gpus {
+                    out.push(Refusal::new(
+                        format!("service `{name}`'s required GPU (`hostRequirements.gpu`)"),
+                        "gpus = true",
+                    ));
+                }
             }
         }
         for reference in props.features.iter().flat_map(|f| f.keys()) {
@@ -1097,6 +1105,8 @@ mod tests {
         let sandbox = |extra: &str| {
             let text = format!(
                 "[services.g]\nimage = \"redis\"\nscope = \"global\"\n[services.i]\nimage = \"redis\"\n\
+                 [services.gpu]\nimage = \"ollama\"\nhostRequirements.gpu = true\n\
+                 [services.opt]\nimage = \"ollama\"\nhostRequirements.gpu = \"optional\"\n\
                  [sandbox.s]\nfolder = \"repo\"\nimage = \"alpine\"\n{extra}\n"
             );
             let config = Config::parse(&text).unwrap();
@@ -1114,6 +1124,7 @@ mod tests {
             "privileged = false",
             "hostRequirements.gpu = false",
             "hostRequirements.gpu = \"optional\"",
+            "services = [\"opt\"]",
             "caches = [\"cargo\"]",
             "persist-shell-history = true",
             "worktree-link = [\".env\"]",
@@ -1123,13 +1134,14 @@ mod tests {
         ] {
             assert_eq!(check(&none, fine), Ok(()), "{fine}");
         }
-        let items: [(&str, &str, fn(&mut Allow)); 8] = [
+        let items: [(&str, &str, fn(&mut Allow)); 9] = [
             ("initializeCommand = \"true\"", "initialize-command = true", |a| a.initialize_command = true),
             ("dispatcher = {}", "dispatcher = true", |a| a.dispatcher = true),
             ("inbox = true", "inbox = true", |a| a.inbox = true),
             ("privileged = true", "privileged = true", |a| a.privileged = true),
             ("hostRequirements.gpu = true", "gpus = true", |a| a.gpus = true),
             ("hostRequirements.gpu = { cores = 2 }", "gpus = true", |a| a.gpus = true),
+            ("services = [\"i\", \"gpu\"]", "gpus = true", |a| a.gpus = true),
             ("services = [\"i\", \"g\"]", "global-services = true", |a| a.global_services = true),
             ("features = { \"./features/leak\" = {} }", "binds = [", |a| a.binds = vec![std::env::temp_dir()]),
         ];

@@ -204,6 +204,16 @@ fn ensure_service(
             }
         }
         None => {
+            // Before the image is built or pulled, so a required GPU fails fast.
+            let (gpu_args, warnings) = super::run::gpu_decision(
+                service.spec.host_requirements.as_ref().and_then(|h| h.gpu_need()),
+                || backend().gpu_support(),
+                policy.as_ref().is_none_or(|p| p.allow.gpus),
+                Some(&service.name),
+            )?;
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
             // Under the policy, `ports` without a host address publish on
             // loopback only (`worker_policy::loopback_publish`).
             let ports: Vec<String> = match &policy {
@@ -213,7 +223,7 @@ fn ensure_service(
             let ports = prefer_same_host_ports(container, &ports)?;
             check_port_conflicts(container, &ports)?;
             let image = service_image(dir, project, service)?;
-            let args = service_run_args(backend(), container, network, &image, service, &ports, labels);
+            let args = service_run_args(backend(), container, network, &image, service, &ports, labels, &gpu_args);
             crate::key_guard::check_argv(&args)?;
             if let Some(policy) = &policy {
                 policy.check_run(&args)?;
@@ -300,6 +310,8 @@ pub fn build_args(
 
 /// Build the `run` argv for a service container. Pure apart from the
 /// backend's alias flag, so it can be tested without a runtime.
+/// `gpu_args` are `run::gpu_decision`'s flags.
+#[allow(clippy::too_many_arguments)]
 pub fn service_run_args(
     rt: &dyn Backend,
     container: &str,
@@ -308,6 +320,7 @@ pub fn service_run_args(
     service: &ResolvedService,
     ports: &[String],
     labels: &[String],
+    gpu_args: &[String],
 ) -> Vec<String> {
     let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), container.into()];
     for label in labels {
@@ -327,6 +340,7 @@ pub fn service_run_args(
         args.push("-p".into());
         args.push(port.clone());
     }
+    args.extend(gpu_args.iter().cloned());
     args.push(image.to_string());
     if let Some(command) = &service.spec.command {
         for part in command.to_vec() {
@@ -1054,6 +1068,7 @@ ports = ["5432:5432"]
             &svc,
             &svc.spec.ports,
             &labels,
+            &[],
         );
         let joined = args.join(" ");
         assert_eq!(args[0], "run");
@@ -1076,7 +1091,8 @@ ports = ["5432:5432"]
         let podman = crate::runtime::Dockerlike::PODMAN;
         let apple = crate::runtime::AppleContainer;
         for rt in [&docker as &dyn Backend, &podman, &apple] {
-            let args = service_run_args(rt, "devsandbox-svc-p-db", "devsandbox-net-p", "postgres:16", &svc, &svc.spec.ports, &[]);
+            let args =
+                service_run_args(rt, "devsandbox-svc-p-db", "devsandbox-net-p", "postgres:16", &svc, &svc.spec.ports, &[], &[]);
             for flag in ["--user", "-u", "--userns", "-v", "--mount"] {
                 assert!(
                     !args.iter().any(|a| a == flag || a.starts_with(&format!("{flag}="))),
@@ -1099,10 +1115,30 @@ ports = ["5432:5432"]
             &svc,
             &[],
             &[],
+            &[],
         );
         let joined = args.join(" ");
         assert!(joined.contains("--network devsandbox-net-proj-repo"));
         assert!(!joined.contains("--network-alias"));
+    }
+
+    /// The GPU flags go before the image, so the runtime reads them as its
+    /// own and the service's `command` stays last.
+    #[test]
+    fn service_run_args_put_gpu_flags_before_the_image() {
+        let svc = service("[services.db]\nimage = \"ollama\"\ncommand = [\"serve\"]\nhostRequirements.gpu = true");
+        let gpu = ["--gpus".to_string(), "all".into()];
+        let args = service_run_args(
+            &crate::runtime::Dockerlike::DOCKER,
+            "devsandbox-svc-p-llm",
+            "devsandbox-net-p",
+            "ollama",
+            &svc,
+            &[],
+            &[],
+            &gpu,
+        );
+        assert_eq!(args[args.len() - 4..], ["--gpus", "all", "ollama", "serve"]);
     }
 
     #[test]
