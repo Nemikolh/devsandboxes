@@ -934,7 +934,7 @@ export interface RootCandidate {
   home?: boolean;
 }
 
-/** `machines.probe`'s answer: the machine's devsandbox and its member key. @experimental */
+/** `machines.probe`'s answer: the machine's devsandbox, its member key, trust and allowances. @experimental */
 export interface MachineProbe {
   version: string;
   protocol: number;
@@ -942,6 +942,10 @@ export interface MachineProbe {
   key: string;
   /** The key's fingerprint, to show the user. */
   fingerprint: string;
+  /** The machine's trust (under `full` no allowance applies). */
+  trust: MemberTrust;
+  /** The allowances the machine lends placed work now (its `member.get`'s). */
+  allow: MemberAllow;
 }
 
 /** `machines.add`'s answer. @experimental */
@@ -964,6 +968,8 @@ export interface MachineAdded {
    * `member.toml`'s `roots`) did, as `note:` lines. A failure is a note here, never a failed add.
    */
   configs: string[];
+  /** The machine's allowances after the add's `allow`; `null` when none was given. */
+  allow: MemberAllow | null;
 }
 
 /**
@@ -1970,10 +1976,12 @@ export interface ApiMethods {
    * the control plane of the new fleet; `denied` when either end is in a fleet whose control plane it isn't. `key`: the machine's
    * key as the user confirmed it (`machines.probe`'s); `denied` when the machine's differs. Writes both ends'
    * membership logs (`denied` for another fleet's log, a fork, a capped member letting a host in). `agent`:
-   * grant this host's ssh-agent to the machine by `key` once it's added.
+   * grant this host's ssh-agent to the machine by `key` once it's added. `allow`: allowances set on the
+   * machine as its own `member.set {allow}` over the add's ssh session, after every check (`invalid` up front
+   * for a bad one).
    * @experimental
    */
-  'machines.add': { params: { target: string; name?: string; control_plane: boolean; key: string; agent?: boolean; command?: string }; result: MachineAdded };
+  'machines.add': { params: { target: string; name?: string; control_plane: boolean; key: string; agent?: boolean; command?: string; allow?: MemberAllowPatch }; result: MachineAdded };
   /** @experimental */
   'machines.list': { params: {}; result: MachineRow[] };
   /**

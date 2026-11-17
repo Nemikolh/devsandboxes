@@ -809,7 +809,7 @@ login `PATH` resolves, an error naming what it resolves to. That
 `command` goes to both `machines.probe` and `machines.add`.
 
 `add` then always calls `machines.probe` (the remote's version and its
-`member.get`'s `key` and `fingerprint`). It prints `<target>'s key
+`member.get`'s `key`, `fingerprint`, `trust` and `allow`). It prints `<target>'s key
 fingerprint is SHA256:…` on stderr and has it confirmed (`confirm_key`,
 over `consent`): `--yes` takes it, a TTY asks `[y/N]` (to compare with
 `devsandbox machine key` run there), no TTY without `--yes` is an error
@@ -818,6 +818,31 @@ goes to `machines.add` as `key`. `add` picks no config roots: a
 machine's are the ones its own daemon lists (its `roots.list`), and a
 member names more of its own with `devsandbox machine roots add` run
 there. `add` prints `added <name> (<target>)`.
+
+`add` also sets which allowances the machine lends work the fleet places
+on it (its worker policy's `[allow]`, as `machine allow` there would;
+[fleet.md](fleet.md#worker-policy)), only ever adding. The flags, for
+scripts and GUIs: repeatable `--allow <allowance>` (comma-separated too;
+the CLI's spelling, `host-network`, parsed by `parse_allowance`),
+`--allow-bind <path>` (absolute, a path on the machine: neither this
+host's `~` nor its current directory means anything there) and
+`--allow-local-env <NAME>`, checked before anything reaches the machine
+(`add_patch`). What happens is `allow_step`'s: any flag, those and no
+question; else on a TTY, after the key is confirmed, `<target> lends
+placed work: <what>` (`lends_line`, the probe's `allow`) and one
+question on stderr (`allow_question`: `Allow on <target>,
+comma-separated (privileged, runtime-socket, …, gpus; paths and env
+vars: --allow-bind, --allow-local-env)? Empty adds none:`), asked again
+after an unknown allowance (`parse_allow_answer`); a machine at `trust =
+full`, where no allowance applies, gets a note instead; off a TTY,
+nothing is asked and nothing changes (an unset allowance is the safe
+default). What's asked or given goes as `machines.add`'s `allow`, and
+the answer's `allow` is printed as a `<name> lends placed work: …` line
+after `added …`. When the add put this host in a fleet it wasn't in
+(`joined` `this` or `new`) and this host lends nothing (`worker`, no
+allowance; its own `member.get`), `add` notes that `devsandbox machine
+allow` here sets it (`own_allow_hint`): an add asks the machine's
+allowances, never this host's.
 
 `machines.add` also applies the join rule
 ([fleet.md](fleet.md), *How a machine joins*): on the same probe it asks
@@ -832,8 +857,12 @@ neither end is in one, and is refused (`denied`) when either end is in a
 fleet whose control plane the machine isn't. Then `join::logs` plans both ends'
 membership logs over this host's `membership.json`, its key, and the
 machine's `membership.get`. Every check (names, the registry and
-the inbound neighbors, both logs) comes before any write; then the
-machine's `member.set {name}` when it joins, its membership over the
+the inbound neighbors, both logs, an `allow` that `member::AllowPatch::check`
+refuses) comes before any write; then the
+machine's `member.set {name}` when it joins, its `member.set {allow}`
+when `allow` is given (the machine's own call over the user's ssh
+session, a local client there: no link ever sets allowances), whose
+answer's `allow` is `machines.add`'s, its membership over the
 still-open probe (`membership.adopt` of the log made here, or of this
 host's on an extra link; `membership.sign` of this host when it joins
 the machine's fleet), this host's registry entry, this host's
@@ -938,7 +967,8 @@ not required to exist) and `--local-env-add|--local-env-rm <NAME>`, sent
 as one `member.set {allow}` (`allow_params`); without flags
 `member.get`. Either way it prints `<allowance>: on|off` per allowance,
 `binds:` and `local-env:` (`none` when empty) and, under `full`, that no
-worker policy applies (`allow_text`). It acts on this host only:
+worker policy applies (`allow_text`). It acts on this host only (`add`
+sets a machine's over its ssh session, above):
 `member.*` is never admitted over a link (`fleet::lent`), and
 `--machine` refuses `devsandbox machine` (`cli::machine_use`), whose
 verbs take no qualified name. So is

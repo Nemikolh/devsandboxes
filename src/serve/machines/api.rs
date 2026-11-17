@@ -17,7 +17,8 @@
 //! on the same probe, checks the machine's key is the one the user
 //! confirmed (`key`), and plans both ends' membership logs
 //! ([`join::logs`]) over this host's and the machine's `membership.get`:
-//! every check first, then the machine's `member.set {name}` and its
+//! every check first, then the machine's `member.set {name}`, its
+//! `member.set {allow}` (the allowances `machine add` asked for), and its
 //! membership (`membership.adopt`, or `membership.sign` of this host),
 //! this host's registry entry, and this host's membership, whose adopt
 //! writes its `control_plane`; on the authority, from a local client, this host's
@@ -44,7 +45,7 @@ use super::{Entry, MachineKind, check_name};
 use crate::serve::api::{ApiError, parse};
 use crate::serve::capacity::Capacity;
 use crate::serve::fleet::identity::{PublicKey, Signer};
-use crate::serve::fleet::member::{self, ControlPlane, MemberInfo};
+use crate::serve::fleet::member::{self, AllowInfo, AllowPatch, ControlPlane, MemberInfo, Trust};
 use crate::serve::fleet::membership::{Introduction, Stored, Wire};
 use crate::serve::fleet::proposals::Change;
 use crate::serve::fleet::membership_api::{self, MembershipInfo};
@@ -134,13 +135,16 @@ pub fn call(method: &str, params: Value, ctx: &Ctx, local: bool) -> Option<Answe
 }
 
 /// `machines.probe`'s answer: the machine's devsandbox and its member key (what `machine add` shows the user to
-/// confirm, then passes as `machines.add`'s `key`).
+/// confirm, then passes as `machines.add`'s `key`), its trust and allowances (what `machine add` shows before
+/// asking which to add).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Probed {
     pub version: String,
     pub protocol: u32,
     pub key: PublicKey,
     pub fingerprint: String,
+    pub trust: Trust,
+    pub allow: AllowInfo,
 }
 
 /// `machines.add`'s answer.
@@ -167,6 +171,10 @@ pub struct Added {
     /// failed add.
     #[serde(default)]
     pub configs: Vec<String>,
+    /// The machine's allowances after the add's `allow` (its `member.set
+    /// {allow}`'s answer); `None` when no `allow` was given.
+    #[serde(default)]
+    pub allow: Option<AllowInfo>,
 }
 
 /// One `machines.list` row: the registry entry, or an inbound neighbor up
@@ -241,7 +249,14 @@ fn probe(p: ProbeParams, ctx: &Ctx) -> Answer {
     let mut link = connect(&entry, ctx)?;
     let member: MemberInfo = remote_call(&mut link, &entry.name, "member.get", json!({}))?;
     let remote = link.remote();
-    to_value(Probed { version: remote.version.clone(), protocol: remote.protocol, key: member.key, fingerprint: member.fingerprint })
+    to_value(Probed {
+        version: remote.version.clone(),
+        protocol: remote.protocol,
+        key: member.key,
+        fingerprint: member.fingerprint,
+        trust: member.trust,
+        allow: member.allow,
+    })
 }
 
 #[derive(Deserialize)]
@@ -259,6 +274,11 @@ struct AddParams {
     agent: bool,
     #[serde(default)]
     command: Option<String>,
+    /// Allowances the machine lends placed work, set there as its own
+    /// `member.set {allow}` over the probe (the user's ssh session: no
+    /// link sets them).
+    #[serde(default)]
+    allow: Option<AllowPatch>,
 }
 
 fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
@@ -268,6 +288,9 @@ fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
         check_name(name).map_err(invalid)?;
     }
     check_command(p.command.as_deref())?;
+    if let Some(allow) = &p.allow {
+        allow.check()?;
+    }
     // A `--name` is the registry name if the add goes through: checked
     // before the ssh, so a taken one fails fast; again at the save.
     if let Some(name) = &p.name {
@@ -321,6 +344,15 @@ fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
         let _: MemberInfo = remote_call(&mut link, &entry.name, "member.set", json!({ "name": set.name }))?;
         written.push(format!("{}'s member.toml (name `{}`)", entry.name, set.name));
     }
+    let allow = match &p.allow {
+        Some(patch) => {
+            let info: MemberInfo =
+                remote_call(&mut link, &entry.name, "member.set", json!({ "allow": patch })).map_err(|e| after(e, &written))?;
+            written.push(format!("{}'s member.toml (allowances)", entry.name));
+            Some(info.allow)
+        }
+        None => None,
+    };
     let adopt_there = |link: &mut Link, stored: &Stored, written: &[String]| -> Result<(), ApiError> {
         let _: MembershipInfo =
             remote_call(link, &entry.name, "membership.adopt", to_value(stored.to_wire())?).map_err(|e| after(e, written))?;
@@ -404,7 +436,7 @@ fn add(p: AddParams, ctx: &Ctx, local: bool) -> Answer {
     drop(link);
     let warning = (version != ctx.version)
         .then(|| format!("{} runs devsandbox {version}, this is {}", entry.name, ctx.version));
-    to_value(Added { name: entry.name, version, warning, fleet: plan.fleet, proposed, configs })
+    to_value(Added { name: entry.name, version, warning, fleet: plan.fleet, proposed, configs, allow })
 }
 
 /// [`super::changes::sign_configs`] over [`super::changes::add_roots`],
@@ -1004,6 +1036,7 @@ mod tests {
             json!({
                 "version": "0.6.0", "protocol": 1,
                 "key": key, "fingerprint": key.fingerprint(),
+                "trust": "worker", "allow": serde_json::to_value(AllowInfo::default()).unwrap(),
             })
         );
         assert_eq!(err(&mut pair.local, "machines.probe", json!({"target": "-oProxyCommand=x"})).0, "invalid");
@@ -1050,7 +1083,7 @@ mod tests {
         let fleet = json!({"control_plane": "lap", "joined": "new"});
         assert_eq!(
             r,
-            json!({"name": "box", "version": "0.6.0", "warning": null, "fleet": fleet, "proposed": null, "configs": []})
+            json!({"name": "box", "version": "0.6.0", "warning": null, "fleet": fleet, "proposed": null, "configs": [], "allow": null})
         );
         assert_eq!(pair.registry(), vec![Entry::ssh("box", "me@box")]);
         assert_eq!((pair.this(), pair.machine()), (named("lap", "self"), named("box", "lap")));
@@ -1080,11 +1113,16 @@ mod tests {
         // the entry.
         assert_eq!(ok(&mut pair.local, "machines.unlink", json!({"name": "box"})), json!({"ok": true}));
         let cmd = "~/.local/bin/devsandbox";
-        let r = pair.add(json!({"control_plane": false, "target": "ssh://box:2200", "name": "box", "agent": true, "command": cmd}));
+        let allow = json!({"gpus": true, "binds_add": ["/srv/data"]});
+        let r = pair.add(json!({"control_plane": false, "target": "ssh://box:2200", "name": "box", "agent": true, "command": cmd, "allow": allow}));
         assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"control_plane": "lap", "joined": "same"})));
+        // `allow`: set on the machine, its resulting allowances answered.
+        let lent = member::Allow { gpus: true, binds: vec!["/srv/data".into()], ..Default::default() };
+        assert_eq!(r["allow"], serde_json::to_value(AllowInfo::from(&lent)).unwrap());
         // `agent`: granted by the confirmed key, in this host's member.toml.
         let grant = member::Grant { name: "box".into(), key: pair.machine_key().public_key() };
-        assert_eq!((pair.this(), pair.machine()), (Member { agent: vec![grant], ..named("lap", "self") }, named("box", "lap")));
+        let machine = Member { allow: lent, ..named("box", "lap") };
+        assert_eq!((pair.this(), pair.machine()), (Member { agent: vec![grant], ..named("lap", "self") }, machine));
         assert_eq!(pair.logs(), (Some(here.clone()), Some(here)));
         let saved = &pair.registry()[0];
         assert!(!std::fs::read_to_string(&registry).unwrap().contains("agent"), "not the registry's");
@@ -1398,11 +1436,17 @@ mod tests {
     fn two_control_planes_are_refused_and_nothing_written() {
         let (this, machine) = (named("lap", "self"), named("box", "k"));
         let mut pair = Pair::members("mach-two-control planes", "0.6.0", this.clone(), machine.clone(), |_| {});
-        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box"}));
+        let (code, message) = pair.add_err(json!({"control_plane": false, "target": "me@box", "allow": {"gpus": true}}));
         assert_eq!(code, "denied");
         assert_eq!(message, "this host is in `lap`'s fleet, me@box in `k`'s: a machine is in one fleet only");
-        assert_eq!((pair.this(), pair.machine()), (this, machine));
+        assert_eq!((pair.this(), pair.machine()), (this, machine.clone()));
         assert!(!pair.base.join("machines.toml").exists(), "no entry");
+        // A bad `allow` is refused before the ssh.
+        for bad in [json!({"binds_add": ["rel"]}), json!({"local_env_add": ["A=B"]}), json!({"nope": true})] {
+            let (code, _) = pair.add_err(json!({"control_plane": false, "target": "me@box", "allow": bad}));
+            assert_eq!(code, "invalid", "{bad}");
+        }
+        assert_eq!(pair.machine(), machine);
         pair.finish();
     }
 
@@ -1497,13 +1541,25 @@ mod tests {
     fn npm_typings_match() {
         use crate::serve::dts::{assert_matches, prop_type, union_members};
         let key = SigningKey::from_seed([1; 32]).public_key();
-        let probed = Probed { version: "0.6.0".into(), protocol: 1, key, fingerprint: key.fingerprint() };
-        assert_matches("MachineProbe", &to_value(probed).unwrap());
+        let allow = AllowInfo { gpus: true, ..Default::default() };
+        let probed = Probed { version: "0.6.0".into(), protocol: 1, key, fingerprint: key.fingerprint(), trust: Trust::Worker, allow: allow.clone() };
+        let probed = to_value(probed).unwrap();
+        assert_matches("MachineProbe", &probed);
+        assert_matches("MemberAllow", &probed["allow"]);
         let fleet = Fleet { control_plane: "k".into(), joined: join::Joined::Target };
         let proposed = super::super::changes::Proposed { name: "m".into(), authority: "lap".into(), id: Some(1), error: None };
-        let added = Added { name: "m".into(), version: "0.6.0".into(), warning: None, fleet, proposed: Some(proposed), configs: vec!["note: signed config `cfg` v1".into()] };
+        let added = Added {
+            name: "m".into(),
+            version: "0.6.0".into(),
+            warning: None,
+            fleet,
+            proposed: Some(proposed),
+            configs: vec!["note: signed config `cfg` v1".into()],
+            allow: Some(allow),
+        };
         let added = to_value(added).unwrap();
         assert_matches("MachineAdded", &added);
+        assert_matches("MemberAllow", &added["allow"]);
         assert_matches("FleetProposed", &added["proposed"]);
         assert_matches("MachineFleet", &added["fleet"]);
         assert_eq!(union_members("FleetJoined"), ["'target'", "'this'", "'new'", "'same'"]);

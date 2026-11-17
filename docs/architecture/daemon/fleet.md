@@ -1480,7 +1480,8 @@ there only through the trust table.
   file and renamed (`locked_file::update`, which `machines.toml` and
   `forwards.toml` are written with too; a rewrite, so hand comments
   don't survive it); `[allow]` is written by `member.set {allow}`
-  (`devsandbox machine allow`) or by hand, `dev-builds` and `[caps]` by
+  (`devsandbox machine allow`, or `machine add`'s on the machine it
+  adds, over the add's ssh session) or by hand, `dev-builds` and `[caps]` by
   hand only (no call changes them), all read at each use; the grants are written by `machines.set {agent}` and
   `machines.add {agent}` (`fleet::grants::grant` / `withdraw`, through
   `member::update`) and read per `AGENT` stream.
@@ -3464,7 +3465,10 @@ logged one by one at either end (they are mostly probes).
 What a config under a fleet root may ask of the host beyond containers
 that see only what was lent (`src/worker_policy.rs`). Denied by default;
 every item has an allowance in `member.toml`'s `[allow]`, set on this
-host only (`devsandbox machine allow`, `member.set {allow}`, or by hand),
+host only (`devsandbox machine allow`, `member.set {allow}`, or by hand;
+`machine add` on another host calls this host's `member.set {allow}` over
+its ssh session, a local client here,
+[machines.md](machines.md#devsandbox-machine-addlssetupgradeunlinkrmcontrol-planependingapprovedenykeytrustrootsallow)),
 and none of it applies under `trust = "full"` ([Trust](#trust)).
 
 - **Under the policy by path.** A config dir whose canonical path is

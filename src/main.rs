@@ -490,6 +490,15 @@ enum MachineCommand {
         /// Take the machine's key without asking to confirm its fingerprint
         #[arg(long)]
         yes: bool,
+        /// Let work the fleet places on the machine use this (repeatable or comma-separated: privileged, runtime-socket, host-network, global-services, dispatcher, inbox, initialize-command, publish, gpus); any --allow* skips the question
+        #[arg(long, value_name = "ALLOWANCE", value_delimiter = ',', value_parser = commands::machine::parse_allowance)]
+        allow: Vec<&'static str>,
+        /// Let binds and build contexts use this path on the machine (absolute)
+        #[arg(long, value_name = "PATH")]
+        allow_bind: Vec<String>,
+        /// Let a config read this env var of the machine's with `${localEnv:NAME}`
+        #[arg(long, value_name = "NAME")]
+        allow_local_env: Vec<String>,
     },
     /// List the registered machines
     Ls {
@@ -1033,8 +1042,9 @@ fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
-            MachineCommand::Add { target, name, agent, control_plane, auto_install, yes } => {
-                commands::machine::add(&target, name.as_deref(), agent, control_plane, auto_install, yes)
+            MachineCommand::Add { target, name, agent, control_plane, auto_install, yes, allow, allow_bind, allow_local_env } => {
+                let allow = commands::machine::AddAllow { flags: allow, binds: allow_bind, local_env: allow_local_env };
+                commands::machine::add(&target, name.as_deref(), agent, control_plane, auto_install, yes, &allow)
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
@@ -1148,6 +1158,21 @@ mod tests {
         assert_eq!((c.bind_add, c.local_env_rm), (vec!["/a".to_string(), "b".into()], vec!["T".to_string()]));
         assert!(parse(&["machine", "allow", "--gpus", "yes"]).is_err());
         assert!(parse(&["machine", "allow", "--gpus"]).is_err(), "on or off is required");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_add_takes_allowances() {
+        use super::MachineCommand;
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()));
+        let allow = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Machine { cmd: MachineCommand::Add { allow, allow_bind, allow_local_env, .. } }) => (allow, allow_bind, allow_local_env),
+            _ => panic!("not machine add"),
+        };
+        assert_eq!(allow(&["machine", "add", "box"]), (vec![], vec![], vec![]));
+        let args = ["machine", "add", "box", "--allow", "gpus,host-network", "--allow", "inbox", "--allow-bind", "/srv", "--allow-local-env", "T"];
+        assert_eq!(allow(&args), (vec!["gpus", "host_network", "inbox"], vec!["/srv".to_string()], vec!["T".to_string()]));
+        assert!(parse(&["machine", "add", "box", "--allow", "root"]).is_err());
     }
 
     #[test]

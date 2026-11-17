@@ -33,7 +33,7 @@ use crate::render::table;
 use crate::serve::capacity;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
-use crate::serve::fleet::member::{AllowInfo, MemberInfo, Trust};
+use crate::serve::fleet::member::{AllowInfo, AllowPatch, MemberInfo, Trust};
 use crate::serve::fleet::update::{self, Build};
 use crate::serve::machines::{Entry, MachineKind};
 use crate::serve::machines::api::{Added, MachineInfo, MachineRow, Probed};
@@ -45,17 +45,47 @@ use crate::serve::machines::install::{self, Dest, Plan, Remote, Upgrade};
 
 const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
-pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, auto_install: bool, yes: bool) -> Result<()> {
+pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, auto_install: bool, yes: bool, allow: &AddAllow) -> Result<()> {
+    // Checked before anything reaches the machine.
+    let flagged = add_patch(target, allow)?;
     let command = ensure_devsandbox(target, auto_install)?;
     let mut conn = connect()?;
     let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target, "command": command }))?;
-    confirm_key(target, &probed.fingerprint, std::io::stdin().is_terminal(), yes)?;
-    let params = json!({ "target": target, "name": name, "control_plane": control_plane, "agent": agent, "command": command, "key": probed.key });
+    let tty = std::io::stdin().is_terminal();
+    confirm_key(target, &probed.fingerprint, tty, yes)?;
+    let patch = match allow_step(flagged.is_some(), tty, probed.trust) {
+        AllowStep::Flags => flagged,
+        AllowStep::Ask => {
+            eprintln!("{}", lends_line(target, &probed.allow));
+            let question = allow_question(target);
+            loop {
+                match parse_allow_answer(&prompt(&question)?) {
+                    Ok(patch) => break patch,
+                    Err(e) => eprintln!("{e}"),
+                }
+            }
+        }
+        AllowStep::Full => {
+            eprintln!("note: {target}'s trust is full, so no allowance applies there: not asking which to add");
+            None
+        }
+        AllowStep::Nothing => None,
+    };
+    let params = json!({ "target": target, "name": name, "control_plane": control_plane, "agent": agent, "command": command, "key": probed.key, "allow": patch });
     let added: Added = call(&mut conn, "machines.add", params)?;
     println!("added {} ({target})", added.name);
+    if let Some(allow) = &added.allow {
+        println!("{}", lends_line(&added.name, allow));
+    }
     println!("{}", fleet_line(&added.name, &added.fleet));
     if let Some(p) = &added.proposed {
         println!("{}", added_proposal_line(&added.name, p));
+    }
+    if newly_in_a_fleet(added.fleet.joined) {
+        let own: MemberInfo = call(&mut conn, "member.get", Value::Null)?;
+        if let Some(hint) = own_allow_hint(&own) {
+            eprintln!("{hint}");
+        }
     }
     for note in &added.configs {
         eprintln!("{note}");
@@ -64,6 +94,144 @@ pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, a
         eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+/// `machine add`'s `--allow <allowance>` (wire names, [`parse_allowance`]),
+/// `--allow-bind <path>` and `--allow-local-env <NAME>`.
+#[derive(Debug, Default)]
+pub struct AddAllow {
+    pub flags: Vec<&'static str>,
+    pub binds: Vec<String>,
+    pub local_env: Vec<String>,
+}
+
+/// `machines.add`'s `allow` from the flags (`None`: none given). Each
+/// allowance is added, nothing removed. A bind is a path on the machine,
+/// so it must be absolute: neither this host's `~` nor its current
+/// directory means anything there.
+fn add_patch(target: &str, allow: &AddAllow) -> Result<Option<AllowPatch>> {
+    let mut patch = AllowPatch::default();
+    for key in &allow.flags {
+        set_allowance(&mut patch, key);
+    }
+    for bind in &allow.binds {
+        let path = Path::new(bind);
+        if !path.is_absolute() {
+            bail!("--allow-bind `{bind}`: give the path on {target} as an absolute one");
+        }
+        // `components` drops `.`s and trailing `/`s.
+        patch.binds_add.push(path.components().collect());
+    }
+    for name in &allow.local_env {
+        crate::serve::fleet::member::check_env_name(name).map_err(|e| anyhow::anyhow!("--allow-local-env: {e:#}"))?;
+        patch.local_env_add.push(name.clone());
+    }
+    Ok((patch != AllowPatch::default()).then_some(patch))
+}
+
+/// Turn on allowance `key` (a wire name from [`AllowInfo::flags`]) in `patch`.
+fn set_allowance(patch: &mut AllowPatch, key: &str) {
+    let slot = match key {
+        "privileged" => &mut patch.privileged,
+        "runtime_socket" => &mut patch.runtime_socket,
+        "host_network" => &mut patch.host_network,
+        "global_services" => &mut patch.global_services,
+        "dispatcher" => &mut patch.dispatcher,
+        "inbox" => &mut patch.inbox,
+        "initialize_command" => &mut patch.initialize_command,
+        "publish" => &mut patch.publish,
+        "gpus" => &mut patch.gpus,
+        _ => unreachable!("`{key}` isn't an allowance"),
+    };
+    *slot = Some(true);
+}
+
+/// The on/off allowances as the CLI spells them (`machine allow`'s flags).
+fn allowance_names() -> Vec<String> {
+    AllowInfo::default().flags().iter().map(|(key, _)| key.replace('_', "-")).collect()
+}
+
+/// `--allow`'s value, and each item of the add's question: an allowance
+/// as the CLI spells it (`host-network`), answered as its wire name.
+pub fn parse_allowance(s: &str) -> Result<&'static str, String> {
+    AllowInfo::default()
+        .flags()
+        .into_iter()
+        .map(|(key, _)| key)
+        .find(|key| key.replace('_', "-") == s)
+        .ok_or_else(|| format!("`{s}` isn't an allowance (one of: {})", allowance_names().join(", ")))
+}
+
+/// What `machine add` does about the machine's allowances.
+#[derive(Debug, PartialEq, Eq)]
+enum AllowStep {
+    /// `--allow*` given: those, nothing asked.
+    Flags,
+    /// On a TTY: show the machine's and ask which to add.
+    Ask,
+    /// On a TTY, the machine at `trust = full`: no allowance applies, a note.
+    Full,
+    /// Off a TTY: nothing asked, nothing changed (an unset allowance is
+    /// the safe default, unlike an unconfirmed key).
+    Nothing,
+}
+
+fn allow_step(flagged: bool, tty: bool, trust: Trust) -> AllowStep {
+    match (flagged, tty, trust) {
+        (true, _, _) => AllowStep::Flags,
+        (false, false, _) => AllowStep::Nothing,
+        (false, true, Trust::Full) => AllowStep::Full,
+        (false, true, Trust::Worker) => AllowStep::Ask,
+    }
+}
+
+fn allow_question(target: &str) -> String {
+    format!(
+        "Allow on {target}, comma-separated ({}; paths and env vars: --allow-bind, --allow-local-env)? Empty adds none: ",
+        allowance_names().join(", ")
+    )
+}
+
+/// The question's answer as `machines.add`'s `allow` (`None`: empty, none
+/// added); `Err` names an unknown allowance, and the question is asked again.
+fn parse_allow_answer(answer: &str) -> Result<Option<AllowPatch>, String> {
+    let mut patch = AllowPatch::default();
+    for item in answer.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+        set_allowance(&mut patch, parse_allowance(item)?);
+    }
+    Ok((patch != AllowPatch::default()).then_some(patch))
+}
+
+/// `<who> lends placed work: <what>` in one line, `nothing` when no
+/// allowance is set.
+fn lends_line(who: &str, allow: &AllowInfo) -> String {
+    let mut groups = Vec::new();
+    let on: Vec<String> = allow.flags().iter().filter(|(_, on)| *on).map(|(key, _)| key.replace('_', "-")).collect();
+    if !on.is_empty() {
+        groups.push(on.join(", "));
+    }
+    if !allow.binds.is_empty() {
+        groups.push(format!("binds: {}", allow.binds.iter().map(|b| b.display().to_string()).collect::<Vec<_>>().join(", ")));
+    }
+    if !allow.local_env.is_empty() {
+        groups.push(format!("local-env: {}", allow.local_env.join(", ")));
+    }
+    let what = if groups.is_empty() { "nothing".to_string() } else { groups.join("; ") };
+    format!("{who} lends placed work: {what}")
+}
+
+/// The add put this host in a fleet it wasn't in, so the fleet can place
+/// work here from now on.
+fn newly_in_a_fleet(joined: Joined) -> bool {
+    matches!(joined, Joined::This | Joined::New)
+}
+
+/// A hint when this host lends placed work nothing (`worker` trust, no
+/// allowance): `machine add` asks the machine's allowances, never this
+/// host's, which only `machine allow` here sets.
+fn own_allow_hint(own: &MemberInfo) -> Option<String> {
+    (own.trust == Trust::Worker && own.allow == AllowInfo::default())
+        .then(|| "note: this host lends nothing to placed work; set it with `devsandbox machine allow`".to_string())
 }
 
 /// Show `target`'s key fingerprint and have it confirmed: asked on a TTY
@@ -1184,6 +1352,100 @@ mod tests {
         assert_eq!(params(&rm), Some(json!({"allow": {"binds_rm": ["/work/data"], "local_env_add": ["A"]}})));
         let empty = AllowChange { bind_add: vec!["".into()], ..Default::default() };
         assert!(allow_params(&empty, home, cwd).is_err());
+    }
+
+    #[test]
+    fn add_allow_flags_become_a_patch() {
+        assert_eq!(add_patch("box", &AddAllow::default()).unwrap(), None, "no flag: none");
+        let flags = AddAllow { flags: vec!["gpus", "host_network"], binds: vec!["/srv/./data/".into()], local_env: vec!["TOKEN".into()] };
+        let want = AllowPatch {
+            gpus: Some(true),
+            host_network: Some(true),
+            binds_add: vec!["/srv/data".into()],
+            local_env_add: vec!["TOKEN".into()],
+            ..Default::default()
+        };
+        assert_eq!(add_patch("box", &flags).unwrap(), Some(want));
+        for relative in ["data", "~/data", "./data"] {
+            let e = add_patch("box", &AddAllow { binds: vec![relative.into()], ..Default::default() }).unwrap_err().to_string();
+            assert!(e.contains("absolute") && e.contains("box"), "{e}");
+        }
+        assert!(add_patch("box", &AddAllow { local_env: vec!["A=B".into()], ..Default::default() }).is_err());
+        // What goes on the wire: what `member.set` takes.
+        let wire = serde_json::to_value(add_patch("box", &AddAllow { flags: vec!["inbox"], ..Default::default() }).unwrap()).unwrap();
+        assert_eq!(serde_json::from_value::<AllowPatch>(wire).unwrap(), AllowPatch { inbox: Some(true), ..Default::default() });
+    }
+
+    #[test]
+    fn allowances_parse_as_the_cli_spells_them() {
+        assert_eq!(parse_allowance("host-network"), Ok("host_network"));
+        assert_eq!(parse_allowance("gpus"), Ok("gpus"));
+        let e = parse_allowance("host_network").unwrap_err();
+        assert!(e.starts_with("`host_network` isn't an allowance (one of: privileged, runtime-socket, "), "{e}");
+        assert!(parse_allowance("").is_err());
+        // Every allowance can be set.
+        for (key, _) in AllowInfo::default().flags() {
+            let mut patch = AllowPatch::default();
+            set_allowance(&mut patch, key);
+            assert_ne!(patch, AllowPatch::default(), "{key}");
+        }
+    }
+
+    #[test]
+    fn add_asks_on_a_tty_without_flags_unless_trust_is_full() {
+        assert_eq!(allow_step(true, false, Trust::Worker), AllowStep::Flags);
+        assert_eq!(allow_step(true, true, Trust::Full), AllowStep::Flags, "flags are applied whatever the trust");
+        assert_eq!(allow_step(false, true, Trust::Worker), AllowStep::Ask);
+        assert_eq!(allow_step(false, true, Trust::Full), AllowStep::Full);
+        assert_eq!(allow_step(false, false, Trust::Worker), AllowStep::Nothing);
+        assert_eq!(allow_step(false, false, Trust::Full), AllowStep::Nothing);
+        assert_eq!(
+            allow_question("me@box"),
+            "Allow on me@box, comma-separated (privileged, runtime-socket, host-network, global-services, dispatcher, inbox, \
+             initialize-command, publish, gpus; paths and env vars: --allow-bind, --allow-local-env)? Empty adds none: "
+        );
+    }
+
+    #[test]
+    fn the_answer_adds_the_allowances_it_names() {
+        assert_eq!(parse_allow_answer(""), Ok(None));
+        assert_eq!(parse_allow_answer(" , "), Ok(None));
+        let want = AllowPatch { gpus: Some(true), host_network: Some(true), ..Default::default() };
+        assert_eq!(parse_allow_answer("gpus, host-network"), Ok(Some(want.clone())));
+        assert_eq!(parse_allow_answer("gpus host-network,gpus"), Ok(Some(want)));
+        assert!(parse_allow_answer("gpus, root").unwrap_err().starts_with("`root` isn't an allowance"));
+    }
+
+    #[test]
+    fn lends_is_one_line() {
+        assert_eq!(lends_line("box", &AllowInfo::default()), "box lends placed work: nothing");
+        let allow = AllowInfo { gpus: true, publish: true, binds: vec!["/a".into(), "/b".into()], local_env: vec!["T".into()], ..Default::default() };
+        assert_eq!(lends_line("box", &allow), "box lends placed work: publish, gpus; binds: /a, /b; local-env: T");
+        assert_eq!(lends_line("box", &AllowInfo { binds: vec!["/a".into()], ..Default::default() }), "box lends placed work: binds: /a");
+    }
+
+    #[test]
+    fn joining_a_fleet_lending_nothing_hints_machine_allow() {
+        assert!(newly_in_a_fleet(Joined::This) && newly_in_a_fleet(Joined::New));
+        assert!(!newly_in_a_fleet(Joined::Target) && !newly_in_a_fleet(Joined::Same));
+        use crate::serve::fleet::identity::{Signer as _, SigningKey};
+        let key = SigningKey::from_seed([1; 32]).public_key();
+        let own = MemberInfo {
+            name: Some("lap".into()),
+            control_plane: Some("k".into()),
+            trust: Trust::Worker,
+            dev_builds: false,
+            roots: vec![],
+            allow: AllowInfo::default(),
+            fingerprint: key.fingerprint(),
+            key,
+            next: None,
+            exposed_by: None,
+            pin_skipped: None,
+        };
+        assert_eq!(own_allow_hint(&own).unwrap(), "note: this host lends nothing to placed work; set it with `devsandbox machine allow`");
+        assert_eq!(own_allow_hint(&MemberInfo { trust: Trust::Full, ..own.clone() }), None);
+        assert_eq!(own_allow_hint(&MemberInfo { allow: AllowInfo { inbox: true, ..Default::default() }, ..own }), None);
     }
 
     #[test]

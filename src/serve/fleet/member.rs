@@ -366,7 +366,8 @@ impl From<&Allow> for AllowInfo {
 
 /// `member.set`'s `allow`: each allowance given is set, the rest kept;
 /// list entries added (once) or removed (one not there is no error).
-#[derive(Debug, Default, Deserialize)]
+/// Serialized as `machines.add` forwards it to the machine's `member.set`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AllowPatch {
     pub privileged: Option<bool>,
@@ -387,6 +388,12 @@ pub struct AllowPatch {
 }
 
 impl AllowPatch {
+    /// What `apply` would refuse, checked against no allowances (pure):
+    /// `machines.add` checks it before any write.
+    pub fn check(&self) -> Result<(), ApiError> {
+        self.apply(&mut Allow::default())
+    }
+
     fn apply(&self, a: &mut Allow) -> Result<(), ApiError> {
         let flags = [
             (self.privileged, &mut a.privileged),
