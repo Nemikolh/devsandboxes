@@ -114,7 +114,6 @@ mod tests {
         let (got, store) = decide(Some("sha256:a".into()), |_| None, || (facts(2), true));
         assert_eq!(got, facts(2));
         assert_eq!(store, Some(("sha256:a".into(), facts(2))));
-        // A failed read isn't cached: the next run tries again.
         let (_, store) = decide(Some("sha256:a".into()), |_| None, || (facts(2), false));
         assert_eq!(store, None);
         // No id (Apple `container`): read every time, nothing cached.

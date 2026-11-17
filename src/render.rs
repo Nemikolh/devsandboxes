@@ -100,10 +100,8 @@ mod tests {
     fn classify_json_lines_by_kind() {
         // `"key": value` splits just past the colon.
         assert_eq!(classify_json_line("    \"Id\": \"abc\","), JsonLine::KeyValue(9));
-        // Punctuation-only structural lines.
         assert_eq!(classify_json_line("  {"), JsonLine::Structural);
         assert_eq!(classify_json_line("],"), JsonLine::Structural);
-        // Bare value, empty line, and non-key text stay plain.
         assert_eq!(classify_json_line("    \"abc\""), JsonLine::Plain);
         assert_eq!(classify_json_line(""), JsonLine::Plain);
         assert_eq!(classify_json_line("not json"), JsonLine::Plain);

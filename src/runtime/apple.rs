@@ -452,7 +452,6 @@ mod tests {
         ]}]"#;
         assert_eq!(parse_image_entrypoint(json, "arm64").unwrap(), ["/arm", "--"]);
         assert_eq!(parse_image_entrypoint(json, "amd64").unwrap(), ["/amd"]);
-        // No matching variant: first one.
         assert_eq!(parse_image_entrypoint(json, "riscv64").unwrap(), ["/amd"]);
     }
 

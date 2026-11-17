@@ -454,7 +454,6 @@ mod tests {
         assert!(parse("name = \"a/b\"\n").is_err());
         assert!(parse("name = \"self\"\n").is_err(), "`self` is reserved");
         assert!(parse("roots = [\"rel\"]\n").is_err(), "roots are absolute");
-        // `[allow]`.
         let a = parse("[allow]\nprivileged = true\nbinds = [\"/srv/x\"]\nlater = true\n").unwrap().allow;
         assert_eq!(a, Allow { privileged: true, binds: vec!["/srv/x".into()], ..Default::default() });
         assert!(parse("[allow]\nbinds = [\"x\"]\n").is_err(), "binds are absolute");

@@ -351,7 +351,7 @@ mod tests {
         let mut app = new_app();
         app.tab = Tab::Ports;
         app.set_ports(port_rows(3));
-        app.on_key(key(KeyCode::Down)); // onto id 1
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.take_pending_unport(), Some(1));
         assert_eq!(app.status.as_deref(), Some("stopping 127.0.0.1:3001"));
@@ -365,7 +365,6 @@ mod tests {
         let mut on = sm("b", LinkState::Unreachable);
         on.agent = true;
         app.set_machines(vec![sm("a", LinkState::Connected), on]);
-        // Another tab: nothing.
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(app.take_pending_machine_set(), None);
 
@@ -417,7 +416,7 @@ mod tests {
     fn d_on_an_instance_queues_rm_without_a_prompt() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(
             app.take_pending_action(),
@@ -429,17 +428,14 @@ mod tests {
 
     #[test]
     fn d_and_u_off_an_instance_queue_nothing() {
-        // A process row.
         let mut app = app_on_proc_row(&["10"]);
         app.on_key(key(KeyCode::Char('d')));
         app.on_key(key(KeyCode::Char('u')));
         assert_eq!(app.take_pending_action(), None);
-        // The sandbox node.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.take_pending_action(), None);
-        // Another tab.
         app.on_key(key(KeyCode::Down));
         app.tab = Tab::Services;
         app.on_key(key(KeyCode::Char('d')));
@@ -452,7 +448,7 @@ mod tests {
         let mut snap = snapshot_with(1);
         snap.instances[0].done = true;
         app.set_snapshot(snap);
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('u')));
         assert_eq!(app.take_pending_done(), []);
         assert_eq!(app.take_pending_action(), None);
@@ -461,8 +457,8 @@ mod tests {
     #[test]
     fn d_elsewhere_does_nothing_new() {
         let mut app = new_app();
-        app.set_snapshot(snapshot_with(1)); // Instances tab
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.take_pending_unport(), None);
     }
@@ -471,7 +467,7 @@ mod tests {
     fn o_on_instance_sets_pending_code() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(
             app.take_pending_action(),
@@ -483,7 +479,7 @@ mod tests {
     fn o_on_orphan_instance_sets_pending_code() {
         let mut app = new_app();
         app.set_snapshot(orphan_snapshot()); // [Orphans, orphan0]
-        app.on_key(key(KeyCode::Down)); // onto orphan0
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(
@@ -504,7 +500,7 @@ mod tests {
     fn s_on_running_instance_sets_pending_stop() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_status(1, running())); // [Sandbox(0), inst0]
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.stopping.contains("inst0"));
         assert_eq!(app.status.as_deref(), Some("stopping inst0…"));
@@ -518,7 +514,7 @@ mod tests {
     #[test]
     fn actions_on_a_machines_row_queue_its_key() {
         let mut app = machine_app();
-        app.selected[Tab::Instances.index()] = 5; // box/inst1
+        app.selected[Tab::Instances.index()] = 5;
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.status.as_deref(), Some("stopping box/inst1…"));
         assert!(app.stopping.contains("box/inst1") && !app.stopping.contains("inst1"));
@@ -528,7 +524,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst1".into() }));
 
-        app.selected[Tab::Instances.index()] = 4; // box/inst0
+        app.selected[Tab::Instances.index()] = 4;
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(
             app.take_pending_action(),
@@ -561,7 +557,7 @@ mod tests {
         let mut app = new_app();
         let status = ContainerStatus::Exited("Exited (0)".into());
         app.set_snapshot(snapshot_with_status(1, status));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.starting.contains("inst0"));
         assert_eq!(app.status.as_deref(), Some("starting inst0…"));
@@ -574,7 +570,7 @@ mod tests {
     fn s_on_unknown_instance_does_nothing() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_status(1, ContainerStatus::Unknown));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.status.as_deref(), Some("inst0: status still loading"));
         assert_eq!(app.take_pending_action(), None);
@@ -587,7 +583,7 @@ mod tests {
         let mut snap = snapshot_with_status(1, status);
         snap.instances[0].drift = true;
         app.set_snapshot(snap);
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(
             app.take_pending_action(),
@@ -603,9 +599,9 @@ mod tests {
     fn s_on_exited_undrifted_instance_still_starts() {
         let mut app = new_app();
         let status = ContainerStatus::Exited("Exited (0)".into());
-        let snap = snapshot_with_status(1, status); // drift: false
+        let snap = snapshot_with_status(1, status);
         app.set_snapshot(snap);
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.starting.contains("inst0"));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Start { instance: "inst0".into() }));
@@ -618,7 +614,7 @@ mod tests {
         let mut snap = snapshot_with_status(1, running());
         snap.instances[0].drift = true;
         app.set_snapshot(snap);
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.stopping.contains("inst0"));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst0".into() }));
@@ -631,7 +627,7 @@ mod tests {
         // detached rebuild (worktree preserved), like the drifted-exited case.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // status Missing
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(
             app.take_pending_action(),
@@ -648,7 +644,7 @@ mod tests {
         let mut snap = orphan_snapshot(); // [Orphans, orphan0]
         snap.instances[0].status = running();
         app.set_snapshot(snap);
-        app.on_key(key(KeyCode::Down)); // onto orphan0
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "orphan0".into() }));
@@ -667,7 +663,7 @@ mod tests {
     fn s_dedupes_while_stop_in_flight() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_status(1, running()));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst0".into() }));
         // Still in flight (loop hasn't cleared `stopping`): a second `s` is a no-op.
@@ -681,7 +677,7 @@ mod tests {
         let mut app = new_app();
         let status = ContainerStatus::Exited("Exited (0)".into());
         app.set_snapshot(snapshot_with_status(1, status));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Start { instance: "inst0".into() }));
         // Still in flight (loop hasn't cleared `starting`): a second `s` is a no-op.
@@ -696,7 +692,7 @@ mod tests {
     fn s_guards_clear_when_the_answer_arrives() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_status(1, running()));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         let stop = app.take_pending_action().unwrap();
         app.verb_answered(&stop, VerbEnd::Done { status: "stopped inst0".into(), failed: false });
@@ -763,14 +759,12 @@ mod tests {
     #[test]
     fn stop_start_hint_tracks_selection_status() {
         let mut app = new_app();
-        // No snapshot / nothing selected → the default verb.
         assert_eq!(app.stop_start_hint(), "stop");
-        // Exited instance under the cursor → `start`.
         app.set_snapshot(snapshot_with_status(
             1,
             ContainerStatus::Exited("Exited (0)".into()),
         ));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.stop_start_hint(), "start");
         // Running → `stop`; Missing (s rebuilds — a start from the user's
         // seat) → `start`.
@@ -788,7 +782,7 @@ mod tests {
         for status in [ContainerStatus::Missing, running(), ContainerStatus::Exited("Exited (1)".into())] {
             let mut app = new_app();
             app.set_snapshot(snapshot_with_phase(1, status, in_flight("postCreateCommand")));
-            app.on_key(key(KeyCode::Down)); // onto inst0
+            app.on_key(key(KeyCode::Down));
             assert_eq!(app.stop_start_hint(), "wait");
             app.on_key(key(KeyCode::Char('s')));
             assert_eq!(app.status.as_deref(), Some("`inst0` is still running postCreateCommand"));
@@ -806,7 +800,7 @@ mod tests {
     fn d_on_an_in_flight_instance_confirms_a_cancel() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Missing, in_flight("building")));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('d')));
         match &app.modal {
             Modal::Confirm(c) => assert_eq!(c.question, "cancel inst0's build?"),
@@ -824,7 +818,6 @@ mod tests {
         assert_eq!(app.take_pending_cancel(), Some("inst0".into()));
         assert_eq!(app.status.as_deref(), Some("cancelling inst0…"));
         assert_eq!(app.take_pending_action(), None);
-        // `enter` is yes too.
         app.on_key(key(KeyCode::Char('d')));
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.take_pending_cancel(), Some("inst0".into()));
@@ -837,7 +830,7 @@ mod tests {
         for status in [ContainerStatus::Missing, running(), ContainerStatus::Exited("Exited (1)".into())] {
             let mut app = new_app();
             app.set_snapshot(snapshot_with_phase(1, status, failed("postCreateCommand")));
-            app.on_key(key(KeyCode::Down)); // onto inst0
+            app.on_key(key(KeyCode::Down));
             assert_eq!(app.stop_start_hint(), "rebuild");
             app.on_key(key(KeyCode::Char('s')));
             assert_eq!(
@@ -853,12 +846,10 @@ mod tests {
     #[test]
     fn run_rename_hint_tracks_selection() {
         let mut app = new_app();
-        // No snapshot / sandbox row selected → `run`.
         assert_eq!(app.run_rename_hint(), "run");
         app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
         assert_eq!(app.run_rename_hint(), "run");
-        // Instance row under the cursor → `rename`.
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.run_rename_hint(), "rename");
     }
 
@@ -936,7 +927,7 @@ mod tests {
         let s = app.snapshot.as_mut().unwrap();
         s.sandboxes[1].profiles = strings(&["home", "office"]);
         s.instances[2].profile = Some("home".into());
-        app.selected[Tab::Instances.index()] = 4; // box/inst0
+        app.selected[Tab::Instances.index()] = 4;
         app.on_key(key(KeyCode::Char('P')));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Profile { instance: "box/inst0".into(), profile: "office".into() }));
         // The local `inst0`'s sandbox allows none.

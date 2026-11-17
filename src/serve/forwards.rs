@@ -98,7 +98,6 @@ pub struct ForwardRow {
     pub process: Option<String>,
     /// `"active"`, `"connecting"`, or `"error: …"`.
     pub state: String,
-    /// Open connections.
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by `forwards.add`.
     pub configured: bool,
@@ -935,7 +934,6 @@ struct Configured {
     entry: String,
 }
 
-/// A live configured forward.
 struct ConfiguredLive {
     /// Its id in `Root::live`.
     id: u64,
@@ -1521,8 +1519,6 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Mutex;
 
-    // ---- pure: configured forwards ----
-
     const CONFIG: &str = r#"
 [services.db]
 image = "postgres"
@@ -1714,8 +1710,6 @@ forwardPorts = ["redis:6379"]
         }
     }
 
-    // ---- pure: ForwardStatus -> ForwardRow ----
-
     #[test]
     fn status_to_row_maps_state_strings() {
         let dir = Path::new("/cfg");
@@ -1753,8 +1747,6 @@ forwardPorts = ["redis:6379"]
         assert_eq!(serde_json::from_value::<ForwardRow>(v).unwrap(), row);
     }
 
-    // ---- pure: bind_reason ----
-
     #[test]
     fn bind_reason_names_addr_in_use() {
         let in_use = std::io::Error::new(std::io::ErrorKind::AddrInUse, "os says busy");
@@ -1774,8 +1766,6 @@ forwardPorts = ["redis:6379"]
         let c = vec![status_to_row(1, dir, &status(ForwardState::Active, None, 0), false)];
         assert_ne!(a, c, "a state change makes rows differ (update sent)");
     }
-
-    // ---- the registry thread, without docker ----
 
     fn quiet(_: &str) {}
 
@@ -1896,8 +1886,6 @@ forwardPorts = ["redis:6379"]
         assert!(reg.handle().list(None, false).unwrap().is_empty());
         assert_eq!(reg.active(), 0);
     }
-
-    // ---- open forwards ----
 
     #[test]
     fn open_forwards_expire_after_the_idle_time_from_the_later_of_close_and_reuse() {
@@ -2037,8 +2025,6 @@ forwardPorts = ["redis:6379"]
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ---- persistence (forwards.toml) ----
-
     fn saved(dir: &Path, instance: Option<&str>, host_port: u16) -> Entry {
         Entry {
             dir: dir.to_path_buf(),
@@ -2070,8 +2056,6 @@ forwardPorts = ["redis:6379"]
         assert_eq!(restorable(vec![far.clone()], &state), (vec![far.clone()], vec![]));
         assert_eq!(describe(&far), "box/gone:5432 on 127.0.0.1:4");
     }
-
-    // ---- remote forwards (machines.toml) ----
 
     const MACHINES: &str = "[machine.box]\ntarget = \"me@box.invalid\"\nroots = [\"/far/cfg\"]\n";
 

@@ -162,7 +162,6 @@ mod tests {
             assert!(rl.allow("a", None, t0));
         }
         assert!(!rl.allow("a", None, t0), "burst spent");
-        // Another instance has its own bucket.
         assert!(rl.allow("b", None, t0));
         assert!(!rl.allow("a", None, t0 + RATE_REFILL - Duration::from_millis(1)));
         assert!(rl.allow("a", None, t0 + RATE_REFILL), "one token refilled");
@@ -187,7 +186,6 @@ mod tests {
         assert!(rl.allow("a", Some("thread:pr-1"), s1));
         assert!(rl.allow("b", Some("pr-1"), s1));
         assert!(rl.allow("a", None, s1));
-        // Past the window the key pops again.
         assert!(rl.allow("a", Some("pr-1"), t0 + COALESCE_WINDOW + Duration::from_secs(1)));
     }
 

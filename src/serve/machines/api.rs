@@ -953,12 +953,10 @@ mod tests {
             (test_support::read(&self.base.join("member.toml")), test_support::read(&remote_member(&self.base)))
         }
 
-        /// This host's key.
         fn this_key(&self) -> SigningKey {
             test_support::key_of(&self.base.join("member.toml"))
         }
 
-        /// The machine's key.
         fn machine_key(&self) -> SigningKey {
             test_support::key_of(&remote_member(&self.base))
         }
@@ -1278,7 +1276,6 @@ mod tests {
         let r = pair.add(json!({"control_plane": false, "target": "me@box"}));
         assert_eq!((&r["name"], &r["fleet"]), (&json!("box"), &json!({"control_plane": "box", "joined": "this"})));
         assert_eq!((pair.this(), pair.machine()), (named("lap", "box"), named("box", "self")));
-        // Through the daemon's own path: `member.get` says it.
         assert_eq!(ok(&mut pair.local, "member.get", Value::Null)["control_plane"], "box");
         let (Some(here), Some(there)) = pair.logs() else { panic!("no logs") };
         assert_eq!(here, there);
@@ -1462,7 +1459,6 @@ mod tests {
         crate::serve::machines::update(&registry, |e| e.push(entry.clone())).unwrap();
         let daemon = spawn_daemon(&base.join("local"), local_opts(&base, None));
         let mut local = client_at(&base.join("local"));
-        // No log yet: no key to grant by.
         let (code, message) = err(&mut local, "machines.set", json!({"name": "box", "agent": true}));
         assert!(code == "failed" && message.contains("no fleet's membership log"), "{code}: {message}");
         // `box` in the log as key 2.

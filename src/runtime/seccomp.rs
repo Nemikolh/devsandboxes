@@ -104,7 +104,6 @@ mod tests {
         let path = ensure_file_in(&dir).unwrap();
         assert_eq!(path, dir.join(format!("seccomp-{}.json", short_hash(&profile()))));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), profile());
-        // An existing file is left alone.
         std::fs::write(&path, "kept").unwrap();
         assert_eq!(ensure_file_in(&dir).unwrap(), path);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept");

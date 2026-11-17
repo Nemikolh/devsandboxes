@@ -133,7 +133,6 @@ mod tests {
         ] {
             assert_eq!(base64(input.as_bytes()), want, "{input:?}");
         }
-        // UTF-8 goes in as its bytes.
         assert_eq!(base64("日本 ✓".as_bytes()), "5pel5pysIOKckw==");
     }
 

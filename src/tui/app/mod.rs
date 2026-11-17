@@ -109,7 +109,6 @@ pub struct PortRow {
     pub process: Option<String>,
     /// Coarse state: `"active"`, `"connecting"`, or `"error: …"`.
     pub state: String,
-    /// Open connection count.
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by hand.
     pub configured: bool,
@@ -158,7 +157,6 @@ pub struct App {
     pub needs_proc_fetch: bool,
     /// Latest data collected off-thread; `None` until the first snapshot lands.
     pub snapshot: Option<Snapshot>,
-    /// Active overlay, if any.
     pub modal: Modal,
     /// Command prompt, when open (`:`). Occupies the bottom bar and swallows keys.
     pub prompt: Option<Prompt>,
@@ -753,7 +751,6 @@ mod tests {
         let mut app = new_app();
         assert_eq!(app.tab, Tab::Instances);
 
-        // `tab` cycles forward over all four tabs and wraps.
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Services);
         app.on_key(key(KeyCode::Tab));
@@ -763,7 +760,6 @@ mod tests {
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Instances);
 
-        // `S-tab` cycles backward and wraps (no longer a toggle).
         app.on_key(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::Inbox);
         app.on_key(key(KeyCode::BackTab));
@@ -773,7 +769,6 @@ mod tests {
         app.on_key(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::Instances);
 
-        // Number keys jump directly.
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.tab, Tab::Services);
         app.on_key(key(KeyCode::Char('3')));
@@ -900,11 +895,9 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // last row (idx 2)
         assert_eq!(app.selected(), 2);
 
-        // Shrinking to one row re-clamps to the last valid index.
         app.set_ports(port_rows(1));
         assert_eq!(app.selected(), 0);
 
-        // Emptying re-clamps to 0.
         app.set_ports(port_rows(0));
         assert_eq!(app.selected(), 0);
     }

@@ -93,7 +93,6 @@ impl Header {
     }
 }
 
-/// Why no header was read.
 #[derive(Debug)]
 pub enum HeaderError {
     /// The stream ended first: the far side never got to write one (the
@@ -224,7 +223,6 @@ pub fn remote_opener(machine: String, via: TunnelVia) -> Opener {
     })
 }
 
-/// How a wait for the header ended.
 enum Waited<T> {
     Got(T),
     Stopped,
@@ -411,8 +409,6 @@ mod tests {
             assert!(Request::parse(bad).unwrap_err().starts_with("bad tunnel request"), "{bad:?}");
         }
     }
-
-    // ---- the fleet opener against a fake worker on a socket ----
 
     /// A socket in a fresh dir whose one connection `worker` takes, with
     /// the request line it read.

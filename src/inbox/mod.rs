@@ -1513,7 +1513,6 @@ mod tests {
     fn entering_needs_you_is_reported_once() {
         let mut inbox = Inbox::default();
         let needs = ThreadPut { state: State::NeedsYou, ..put_body("pr-1") };
-        // Created straight into needs-you.
         let out = inbox.put("web-id", "web", 10, needs.clone());
         assert_eq!(out, PutOutcome::Applied { created: true, entered_needs_you: true });
         // Re-asserting it is not a new transition.
@@ -1927,7 +1926,6 @@ mod tests {
         assert_eq!(r.draft, [("ok".to_string(), Answer::Confirm(true))].into());
         assert!(!find(&inbox, "pr-1").unwrap().unread);
 
-        // Withdrawn with the message.
         sink(&mut inbox, Message::ThreadWithdraw { at: 6, key: "pr-1".into(), id: "run-1".into() });
         assert_eq!(form_state(&inbox, "pr-1", "run-1").unwrap().state, FormState::Withdrawn);
         // On an active thread a new form is news but no popup.
@@ -2363,7 +2361,6 @@ msg = "old"
         inbox.apply(&Op::Reopen(id), 204, "tui");
         inbox.apply(&Op::Reopen(id), 205, "tui");
         assert_eq!(find(&inbox, "pr-1").unwrap().state, Some(State::Active));
-        // `d` on a live thread.
         inbox.apply(&Op::MarkDone(id), 206, "tui");
         let t = find(&inbox, "pr-1").unwrap();
         assert_eq!(t.state, Some(State::Done));

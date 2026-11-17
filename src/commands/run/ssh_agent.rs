@@ -162,7 +162,6 @@ mod tests {
         assert_eq!(link, dir.join("repo-abc1.sock"));
         assert_eq!(std::fs::read_link(&link).unwrap(), first);
 
-        // A second call re-points the same link at the new target.
         let link2 = ssh_agent_link(&dir, "repo-abc1", &second).unwrap();
         assert_eq!(link2, link);
         assert_eq!(std::fs::read_link(&link).unwrap(), second);
@@ -196,6 +195,4 @@ mod tests {
             }
         }
     }
-
-    // --- features: pure generators ---
 }

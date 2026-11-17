@@ -804,7 +804,6 @@ mod tests {
         assert_eq!(account(PASSWD, "root"), acc(0, 0, "/root"));
         assert_eq!(account(PASSWD, "nobody"), None);
         assert_eq!(account(PASSWD, "4242"), None);
-        // Malformed lines are skipped, never matched.
         assert_eq!(account(PASSWD, "broken"), None);
         assert_eq!(account(PASSWD, "short"), None);
         assert_eq!(account("", "node"), None);
@@ -831,10 +830,8 @@ mod tests {
         let p = plan(probe(Mode::RootlessPodman), Identity::Host, accounts, HOST);
         assert_eq!(p.userns.as_deref(), Some("keep-id:uid=1001,gid=1002"));
         assert_eq!(p.keep_id(), Some(ids(1001, 1002)));
-        // Unknown: the assumed ids.
         let p = plan(probe(Mode::RootlessPodman), Identity::Host, vscode(), HOST);
         assert_eq!(p.keep_id(), Some(ASSUMED));
-        // Other modes have no keep-id.
         assert_eq!(plan(probe(Mode::Rootful), Identity::Host, accounts, HOST).keep_id(), None);
     }
 

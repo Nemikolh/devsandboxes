@@ -311,8 +311,6 @@ pub(crate) fn caller_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -
     vars.into_iter().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
 }
 
-// ---- prompts --------------------------------------------------------------
-
 /// The prompts, injectable for the tests.
 struct Ui<'a> {
     /// stdin is a TTY: prompts may ask.
@@ -858,8 +856,6 @@ fn note_unreachable(sandbox: &str, call: &mut Call) {
     }
 }
 
-// ---- the streamed request -------------------------------------------------
-
 /// A verb request's answer, sorted.
 #[derive(Debug, PartialEq)]
 enum Answer {
@@ -1098,8 +1094,6 @@ fn cancel_by_name(instance: &str, machine: Option<&str>) -> bool {
     }
 }
 
-// ---- the end --------------------------------------------------------------
-
 /// What the CLI does with a verb's final answer.
 #[derive(Debug, PartialEq)]
 enum Ending {
@@ -1323,7 +1317,6 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!((&sent[1]["deleteBranch"], &sent[1]["ask"]), (&json!(true), &json!(false)));
 
-        // No question: one send, nothing asked.
         let mut once = |_: Value| Ok(Answer::Failed(2));
         let mut never = |_: &str| -> Result<bool> { panic!("asked") };
         assert_eq!(with_confirm(json!({}), &mut once, &mut never).unwrap(), Answer::Failed(2));
@@ -1455,7 +1448,6 @@ mod tests {
         let old = [("instances.resolve", err("unknown-method", "unknown method", None))];
         assert!(matches!(prep(&stop, true, &old, 0).0.unwrap(), Prep::Old(_)));
 
-        // `--all` resolves nothing.
         let (p, calls, _) = prep(&CliVerb::Rebuild { target: None, force: true, reprobe: false, detach: true }, true, &[], 0);
         assert!(calls.is_empty());
         let p = sent(p);
@@ -1587,8 +1579,6 @@ mod tests {
         assert_eq!(settled(None), Some(1));
     }
 
-    // ---- machines -------------------------------------------------------------
-
     const FED: Fed = Fed { machines: true, machine: None };
 
     fn on(m: &str) -> Fed {
@@ -1705,7 +1695,6 @@ mod tests {
         let (p, _, _, picks) = prep_fed(&here(None), &FED, true, None, &two, 1);
         assert_eq!(picks, [vec!["api".to_string(), "web".to_string()]]);
         assert_eq!(sent(p).params["sandbox"], "web");
-        // A machine's name is refused.
         let e = prep_fed(&here(Some("a/web")), &FED, false, None, &list, 0).0.unwrap_err();
         assert_eq!(e.to_string(), "--place asks the control plane where to run this host's sandbox; `a/web` is on machine `a`");
         // Without it: `place: false` on the wire, so the daemon runs it here.
@@ -1859,8 +1848,6 @@ mod tests {
         s.qualify = None;
         assert_eq!(s.qualified("web-2\n".into()), "web-2\n");
     }
-
-    // ---- the identity prompt --------------------------------------------------
 
     fn finding(id: &str, kind: &str, edit: Option<&str>, sandboxes: &[&str], acked: bool) -> Value {
         json!({"id": id, "table": "sandbox.web", "kind": kind, "key": "workspaceFolder", "value": "/root/app",

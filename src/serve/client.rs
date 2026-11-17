@@ -38,7 +38,6 @@ pub struct Conn {
     partial: Vec<u8>,
 }
 
-/// One line from the daemon.
 enum Incoming {
     Response(Response),
     Notification(Notification),
@@ -580,7 +579,6 @@ mod tests {
         let r = conn.call("nope", Value::Null).unwrap();
         assert_eq!(r.error.unwrap().code, "unknown-method");
 
-        // A second client finds it running: no spawn.
         let second = connect_with(&dir, "test", &v(1), START_TIMEOUT, &fake_spawn(1, &count, &daemons)).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
         drop((conn, second));

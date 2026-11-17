@@ -883,7 +883,6 @@ mod tests {
         assert_eq!(t[2], "    (•) Post the reply   ( ) Don't reply");
         assert_eq!(out.lines[2].last(), Some(&(Tone::Cursor, "( ) Don't reply".to_string())));
         assert_eq!(out.questions[0], 0..3);
-        // Unfocused, the context is left out.
         let out = form_lines(&form, &record, Some(&cursor(1, 0)), 40);
         assert!(!texts(&out.lines).iter().any(|l| l.contains("Consider")));
     }
@@ -897,7 +896,6 @@ mod tests {
         let t = texts(&form_lines(&form, &record, None, 20).lines);
         assert_eq!(t[3], "      a much longer…", "a follow-up: indented, cut to what's left");
         assert_eq!(t[5..9], ["    1", "    2", "    3", "    … 2 more lines"]);
-        // Being edited: the live text, marked.
         let c = FormCursor { editing: Some("typed"), ..cursor(1, 0) };
         let t = texts(&form_lines(&form, &record, Some(&c), 20).lines);
         assert_eq!(t[3], "      ✎ typed");
@@ -985,9 +983,7 @@ mod tests {
         // 20 rows in 5: a focus below the window pulls it down to show it.
         assert_eq!(forms_offset(0, Some(8..10), 20, 5, true), 5);
         assert_eq!(forms_offset(9, Some(2..4), 20, 5, true), 2);
-        // Taller than the window: its start shows.
         assert_eq!(forms_offset(0, Some(8..16), 20, 5, true), 8);
-        // Not following (the wheel): stays, clamped.
         assert_eq!(forms_offset(3, Some(8..10), 20, 5, false), 3);
         assert_eq!(forms_offset(30, None, 20, 5, false), 15);
     }
@@ -1101,7 +1097,6 @@ mod tests {
         let (mut app, id) = form_app();
         app.on_key(key(KeyCode::Tab));
         app.on_key(key(KeyCode::Tab));
-        // Single choice: move to `skip`, pick it.
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
         assert_eq!(at(&app).2, 1, "clamped to the last option");
@@ -1110,7 +1105,6 @@ mod tests {
         // Applied at once, before the store reload.
         assert_eq!(record(&app, "run-1").draft.get("c-1"), Some(&Answer::Choice("skip".into())));
         assert_eq!(flush(&mut app), [save("c-1", Answer::Choice("skip".into()))]);
-        // Re-picking the same is no change.
         app.on_key(key(KeyCode::Char(' ')));
         assert_eq!(flush(&mut app), []);
         // Confirm: `no` with a custom-label yes. `skip` hid the reply under
@@ -1229,11 +1223,9 @@ mod tests {
         let t = app.selected_inbox_thread().unwrap();
         let (form, rec) = form_of(t, "run-1").unwrap();
         assert_eq!(confirm(form, rec), Confirm::Missing(vec!["Merge after?".into()]));
-        // Esc cancels the confirm step only.
         app.on_key(key(KeyCode::Esc));
         assert!(!app.inbox.form.as_ref().unwrap().confirming);
         assert_eq!(app.inbox.focus, InboxFocus::Form);
-        // Answer it, confirm, submit.
         app.on_key(key(KeyCode::BackTab));
         app.on_key(key(KeyCode::BackTab));
         assert_eq!(at(&app).1, 3);

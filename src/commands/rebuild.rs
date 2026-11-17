@@ -267,7 +267,6 @@ mod tests {
     }
 
     fn config() -> Config {
-        // A config with a single `web` sandbox pointing at an image.
         toml::from_str(
             r#"
             [sandbox.web]
@@ -287,7 +286,6 @@ mod tests {
 
     #[test]
     fn resolve_ok_when_project_empty() {
-        // Pre-upgrade state with no recorded root skips the mismatch check.
         let cfg = config();
         let info = instance("");
         assert!(resolve(&cfg, &info, "proj1234", "web").is_ok());
@@ -304,9 +302,7 @@ mod tests {
 
     #[test]
     fn resumable_needs_the_recorded_working_tree() {
-        // Base-folder instance: always resumable.
         assert!(resumable("web", &instance("p")).is_ok());
-        // A worktree instance with its worktree recorded.
         let mut info = instance("p");
         info.folder = "/cfg/.worktrees/web".into();
         info.worktree = Some("/cfg/.worktrees/web".into());

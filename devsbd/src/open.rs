@@ -14,7 +14,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::notify::{self, Message};
 use crate::outbox;
 
-/// The names the opener answers to.
 pub const NAMES: [&str; 4] = ["xdg-open", "sensible-browser", "x-www-browser", "www-browser"];
 
 /// `xdg-open`'s exit codes: a bad command line, and "a required tool could

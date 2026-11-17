@@ -1313,7 +1313,6 @@ mod tests {
         two.append(genesis(2, "box"), "lap", &key(1)).unwrap();
         two.append(Op::Add { name: "box".into(), key: pk(2) }, "lap", &key(1)).unwrap();
         assert!(format!("{:#}", check_introduction(two.membership().unwrap(), &i).unwrap_err()).contains("this fleet"));
-        // Tampered.
         let renamed = Introduction { name: "newer".into(), ..i.clone() };
         assert!(err(&renamed).contains("this fleet"));
         let rekeyed = Introduction { key: pk(6), ..i.clone() };
@@ -1323,7 +1322,6 @@ mod tests {
         assert!(check_introduction(m, &versioned).is_err());
         let as_entry = Introduction { statement: Statement { kind: KIND.into(), ..i.statement.clone() }, ..i.clone() };
         assert!(err(&as_entry).contains("not an introduction"));
-        // A revoked key.
         let mut l = log.clone();
         l.append(Op::Add { name: "gone".into(), key: pk(6) }, "lap", &key(1)).unwrap();
         l.append(Op::Revoke { name: "gone".into(), key: pk(6) }, "lap", &key(1)).unwrap();

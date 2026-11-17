@@ -254,7 +254,6 @@ mod tests {
         // `lap` dials `k`: its `fleet-link --peer` there binds the agent-link.
         assert_eq!(names(wanted(&g, &s, "k", |n| n == "lap")), ["m"]);
         assert_eq!(names(wanted(&g, &s, "lap", |_| false)), ["k"]);
-        // No one grants `m`; no reports, nothing.
         assert!(wanted(&g, &s, "m", |_| false).is_empty());
         assert!(wanted(&Graph::default(), &s, "b", |_| false).is_empty());
     }

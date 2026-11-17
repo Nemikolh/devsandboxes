@@ -736,7 +736,6 @@ fn main() { println!(\"hi\"); }
         assert_eq!(app.take_clipboard().as_deref(), Some("hello world\nsecond"));
         assert!(buf[(b.x, b.y)].modifier.contains(Modifier::REVERSED));
         assert!(!buf[(b.x - 1, b.y)].modifier.contains(Modifier::REVERSED), "border untouched");
-        // Nothing went to the shell.
         assert!(app.terms.active_session().unwrap().take_written().is_empty());
         // Past the panel's edges: clamped to the body, no border or tab title.
         ev(&mut app, DOWN, b.x + 2, b.y);
@@ -838,7 +837,6 @@ fn main() { println!(\"hi\"); }
             assert_eq!(app.take_clipboard().as_ref(), Some(&first), "{key:?}");
             assert!(app.selection.is_some());
         }
-        // Plain `c` is no copy key.
         app.on_key(mods('c', KeyModifiers::NONE));
         draw(&app);
         assert_eq!(app.take_clipboard(), None);

@@ -47,8 +47,6 @@ const L = {
   src: (label: string, path: string, rev?: string): SourceLink => ({ label, path, rev }),
 };
 
-// ------------------------------------------------------------------ Why
-
 const howLayer = (body: string) => [{ label: 'How', body: md(body) }];
 
 export const why: Card[] = [
@@ -173,8 +171,6 @@ export const why: Card[] = [
     links: [L.plan(), L.adr43, L.src('Lending (removed)', 'src/commands/lend.rs', MIDDLE)],
   },
 ];
-
-// ---------------------------------------------------------- The migration
 
 export const phases: Card[] = [
   {
@@ -853,8 +849,6 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
   },
 ];
 
-// ------------------------------------------------------ Command by command
-
 /** A row's drill-down: headless in the table, so title and summary don't show. */
 const cmdCard = (id: string, layers: Layer[], links: SourceLink[]): Card => ({ id, title: id, summary: '', layers, links });
 
@@ -1266,8 +1260,6 @@ export const commands: CommandRow[] = [
   },
 ];
 
-// ---------------------------------------------------------- Three machines
-
 export const machines: MachinesState[] = [
   {
     id: 'before',
@@ -1539,8 +1531,6 @@ export const machines: MachinesState[] = [
     ),
   },
 ];
-
-// ----------------------------------------------------------- What's left
 
 export const steps: Card = {
   id: 'left-steps',

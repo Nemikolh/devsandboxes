@@ -56,8 +56,6 @@ pub fn is_verb(method: &str) -> bool {
     matches!(method, "run" | "rebuild" | "start" | "stop" | "rm" | "services.rebuild" | "gc")
 }
 
-// ---- params ---------------------------------------------------------------
-
 pub use crate::build_log::TtySize;
 
 /// `run` params. `env` is required on every verb: never the daemon's own.
@@ -454,8 +452,6 @@ fn detach_at(req: &VerbRequest) -> DetachAt {
     }
 }
 
-// ---- wire values ----------------------------------------------------------
-
 pub(crate) fn output_params(request: Option<u64>, stream: &str, data: &str) -> Value {
     json!({ "request": request, "stream": stream, "data": data })
 }
@@ -479,8 +475,6 @@ fn detached_result(instance: Option<&str>, record: Option<Value>) -> Value {
 fn failed_data(exit: i32, instance: Option<&str>) -> Value {
     json!({ "exit": exit, "instance": instance })
 }
-
-// ---- execution ------------------------------------------------------------
 
 /// How the daemon runs verbs. Injectable so tests run `sh -c` scripts
 /// against scratch files instead of devsandbox against the user's state.

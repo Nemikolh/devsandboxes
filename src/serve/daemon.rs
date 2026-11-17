@@ -3885,7 +3885,6 @@ pub(crate) mod tests {
         let dir = scratch("handoff");
         let daemon = spawn_daemon(&dir, opts(1, 60_000));
 
-        // Equal and older clients just proceed.
         let (mut idle_client, equal) = hello_at(&dir, &v(1));
         assert!(matches!(equal, Hello::Ready(_)), "{equal:?}");
         let (_older_conn, older) = hello_at(&dir, &Version { semver: "0.5.9".into(), build: 9 });
@@ -3897,7 +3896,6 @@ pub(crate) mod tests {
         // Nothing answers once the handoff reply is out.
         assert!(endpoint::connect(&dir).is_err());
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Handoff);
-        // Idle connections are closed, not waited out.
         assert!(started.elapsed() < DRAIN_TIMEOUT);
         let mut buf = [0u8; 1];
         assert_eq!(idle_client.read(&mut buf).unwrap(), 0);
@@ -4434,7 +4432,6 @@ pub(crate) mod tests {
         assert!(next_snapshot(&mut on_b, &mut none, Duration::from_millis(300)).is_none(), "b doesn't watch a");
         assert!(next_snapshot(&mut idle, &mut none, Duration::from_millis(100)).is_none(), "watches nothing");
 
-        // Unwatch: nothing more.
         let (r, _) = ask(&mut on_a, "instances.unwatch", json!({"dir": a}));
         assert_eq!(r["result"], json!({"ok": true}));
         push(&a, 3);
@@ -4669,7 +4666,6 @@ pub(crate) mod tests {
         let closing = wait_for(&mut sub, "closing");
         assert_eq!(closing.params, json!({"reason": "shutdown"}));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
-        // Idle connections are closed, not waited out.
         assert!(started.elapsed() < DRAIN_TIMEOUT);
         let mut buf = [0u8; 1];
         assert_eq!(idle_client.read(&mut buf).unwrap(), 0);

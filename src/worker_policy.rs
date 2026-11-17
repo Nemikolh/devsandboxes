@@ -885,7 +885,6 @@ mod tests {
         let outside_s = outside.display().to_string();
         let ws = format!("{inside_s}:/w");
         let seccomp = format!("seccomp={}", data.join("seccomp-0123.json").display());
-        // Pass with no allowance.
         let fine: Vec<Vec<String>> = vec![
             vec!["-v".into(), ws.clone()],
             vec!["-v".into(), format!("{ws}:ro,z")],

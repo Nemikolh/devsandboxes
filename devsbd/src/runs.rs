@@ -911,7 +911,6 @@ pub(crate) mod tests {
         assert_eq!(read_chunk(&root, missing, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
         assert!(wait(&root, missing, Duration::ZERO).is_err());
         assert!(read_chunk(&root, "../lost", 0, 1).is_err());
-        // An empty or missing root lists nothing.
         assert_eq!(ls(&temp_root("none")).unwrap(), "");
         let _ = fs::remove_dir_all(&root);
     }

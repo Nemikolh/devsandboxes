@@ -509,8 +509,6 @@ fn log_call(log: fn(&str), container: &str, method: &str, caller: &str, outcome:
     log(&format!("helper {container}: {method} from {caller}: {outcome} ({} ms)", started.elapsed().as_millis()));
 }
 
-// ---- `helper.call` ----
-
 #[derive(Deserialize)]
 struct RawParams {
     instance: String,

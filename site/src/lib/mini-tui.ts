@@ -433,7 +433,7 @@ function switchTab(s: State, tab: Tab): State {
   return { ...s, tab, unread: tab === 'inbox' ? 0 : s.unread, message: null };
 }
 
-// ---- Instances: run / stop / start / rm, shared by the keys and the prompt.
+// Instances: run / stop / start / rm, shared by the keys and the prompt.
 
 /** `default_instance_name` in `src/commands/run/mod.rs`: the sandbox name, else the first free `web-<n>`. */
 export function defaultInstanceName(s: State, sandbox: string): string {
@@ -611,8 +611,6 @@ function suspendedKey(s: State): State {
   return s.suspended ? { ...s, suspended: null } : s;
 }
 
-// ---- Ports.
-
 const localPort = (f: Forward): number => Number(f.local.slice(f.local.lastIndexOf(':') + 1));
 
 /** How many ports a `<port>` spec tries upwards (`HostPort::Prefer`). */
@@ -661,8 +659,6 @@ function stopForward(s: State): State {
   const ports = s.ports.filter((p) => p.id !== row.id);
   return { ...s, ports, portSel: Math.min(s.portSel, Math.max(0, ports.length - 1)), message: `stopped ${row.local}` };
 }
-
-// ---- The `:` prompt.
 
 const openPrompt = (s: State, input = ''): State => ({ ...s, prompt: newPrompt(input), message: null });
 
@@ -745,8 +741,6 @@ function promptKey(s: State, key: string): State {
   }
   return [...key].length === 1 ? { ...s, prompt: typeChar(p, key) } : s;
 }
-
-// ---- The logs / config views.
 
 /** The config explorer for the selection (`open_config` in `src/tui/app/view.rs`). */
 function openConfig(s: State): State {
@@ -843,8 +837,6 @@ function modalKey(s: State, key: string): State {
   const scroll = scrolled(m.scroll, viewLines(s, m).length, key);
   return scroll === null || scroll === m.scroll ? s : { ...s, modal: { ...m, scroll } };
 }
-
-// ---- The dashboard.
 
 export function pressKey(s: State, key: string): State {
   // Precedence like `on_key`: a suspended command owns the screen, then the
@@ -997,7 +989,7 @@ export function settled(): State {
   return { ...s, message: null, step: -1 };
 }
 
-// ---- Pure render helpers: what the driver writes, kept here to be testable.
+// Pure render helpers: what the driver writes, kept here to be testable.
 
 /**
  * Which hint bar shows (`data-tui-help`): the dashboard's, a live shell's, an

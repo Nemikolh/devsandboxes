@@ -1159,11 +1159,9 @@ mod tests {
         assert_eq!(page, Page { text: String::from_utf8(all.clone()).unwrap(), next: all.len() as u64, tty: true, complete: true });
         let page = page_in(&data, "web", 5, true).unwrap().unwrap();
         assert_eq!((page.text.as_bytes(), page.next, page.complete), (&all[5..], all.len() as u64, false));
-        // Past the end: nothing, the offset kept.
         let page = page_in(&data, "web", 1 << 30, false).unwrap().unwrap();
         assert_eq!((page.text.as_str(), page.next), ("", 1 << 30));
 
-        // More than a page: capped, the rest from `next`.
         let big = vec![b'x'; PAGE_BYTES + 10];
         std::fs::write(&path, &big).unwrap();
         let page = page_in(&data, "web", 0, false).unwrap().unwrap();
@@ -1395,7 +1393,6 @@ mod tests {
         copy(Chunked(input, 3), &mut term, &log);
         assert_eq!(term, input);
         let writes = log.into_inner().unwrap().0;
-        // Every write but the trailing remainder ends a line.
         let (last, lines) = writes.split_last().unwrap();
         assert!(lines.iter().all(|w| w.ends_with(b"\n")), "{writes:?}");
         assert_eq!(last, b"no newline");

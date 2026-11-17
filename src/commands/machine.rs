@@ -484,7 +484,6 @@ fn control_plane_lines(r: &ControlPlaneMove) -> Vec<String> {
     }
 }
 
-/// What `machine roots` does.
 pub enum RootsOp {
     Show,
     Add(Vec<String>),
@@ -967,7 +966,6 @@ mod tests {
         let inbound = no_ssh("box", MachineKind::Inbound);
         assert!(inbound.starts_with("box links to this host from its end (inbound): `machine upgrade` copies over ssh"), "{inbound}");
         assert!(no_ssh("pi", MachineKind::Routed).starts_with("pi is reached over a route: "));
-        // Only an older semver can't hand the daemon off.
         assert!(older_note("box", "1.1.0 x dev linux/x86_64", ours).is_some());
         assert_eq!(older_note("box", "0.9.0 x dev linux/x86_64", ours), None);
         assert_eq!(older_note("box", "1.0.0 x dev linux/x86_64", ours), None);

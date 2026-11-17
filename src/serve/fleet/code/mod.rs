@@ -78,7 +78,6 @@ pub enum Unprepared {
     /// It can't move (a folder that isn't a checkout, a detached `HEAD`,
     /// …): it runs where it is; the reason is for the user.
     NotMovable(String),
-    /// Moving it failed.
     Failed(anyhow::Error),
 }
 
@@ -165,7 +164,6 @@ pub trait Transfer {
 /// through its link's socket, else its route socket
 /// (`fleet::route::connect`).
 pub struct LinkTransfer {
-    /// The socket dir.
     pub dir: PathBuf,
     pub worker: String,
 }
@@ -260,7 +258,6 @@ impl LinkTransfer {
 /// Where things land below `roots/<hash>/` on the worker ([`layout`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
-    /// The config root.
     pub root: PathBuf,
     /// Each folder, in the order given.
     pub folders: Vec<PathBuf>,
@@ -323,7 +320,6 @@ pub struct RepoOffer {
     pub host: PathBuf,
     /// Where it lands below `roots/<hash>/`.
     pub at: PathBuf,
-    /// The branch the bundle carries.
     pub branch: String,
     /// `branch` is the one checked out: [`send`] snapshots the working
     /// tree over it. A requested other branch goes as it is committed.
@@ -365,7 +361,6 @@ pub struct Prepared {
 /// One repo [`send`] sent: the control-plane mirror sends the same refs again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sent {
-    /// The repo's identity.
     pub id: String,
     /// The checkout it was bundled from.
     pub host: PathBuf,
@@ -1061,7 +1056,6 @@ mod tests {
         assert_eq!(l, Layout { root: p(".devsandboxes"), folders: vec![p("devsandboxes"), p("stackblitz/bolt")] });
         let l = layout(&p("/home/u/src/cfg"), &[p("/home/u/src/web"), p("/home/u/lib")]).unwrap();
         assert_eq!(l, Layout { root: p("src/cfg"), folders: vec![p("src/web"), p("lib")] });
-        // No folder outside: the root under its own name.
         assert_eq!(layout(&p("/w/cfg"), &[]).unwrap(), Layout { root: p("cfg"), folders: vec![] });
         let err = |root: &str, f: &[&str]| layout(&p(root), &f.iter().map(|s| p(s)).collect::<Vec<_>>()).unwrap_err();
         assert!(err("/w/cfg", &["/w/cfg"]).contains("is in the config root"));
@@ -1123,7 +1117,6 @@ mod tests {
         assert_ne!(short_hash(&pack_root(&cfg, &p("w/cfg")).unwrap()), short_hash(&tar));
         std::fs::write(cfg.join("dockerfiles/web.Dockerfile"), "FROM y\n").unwrap();
         assert_ne!(short_hash(&pack_root(&cfg, &p("cfg")).unwrap()), short_hash(&tar));
-        // A symlink out of the root refuses it.
         std::os::unix::fs::symlink("../web", cfg.join("out")).unwrap();
         let err = format!("{:#}", pack_root(&cfg, &p("cfg")).unwrap_err());
         assert!(err.contains("symlink out points outside the config root"), "{err}");
@@ -1167,7 +1160,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(tree.join("cfg/devsandboxes.toml")).unwrap(), "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n");
         assert_eq!(std::fs::read_link(tree.join("cfg/Dockerfile")).unwrap(), p("dockerfiles/web.Dockerfile"));
         assert!(std::fs::metadata(tree.join("cfg/features/f/install.sh")).unwrap().permissions().mode() & 0o100 != 0);
-        // Again: kept as is.
         std::fs::write(tree.join("cfg/marker"), "").unwrap();
         deliver(&r, &h, &tar).unwrap();
         assert!(tree.join("cfg/marker").exists());
@@ -1400,7 +1392,6 @@ mod tests {
         }
     }
 
-    /// No checkout is in use.
     fn free() -> InUse {
         Arc::new(|_| false)
     }
@@ -1589,7 +1580,6 @@ mod tests {
         assert_eq!(git(&moved, &["rev-parse", "HEAD"]), root, "the worker's main is the devsandbox root");
         assert_eq!(git(&moved, &["status", "--porcelain=v1", "-uall"]), "?? a\n?? sub/b");
         assert_eq!(std::fs::read_to_string(moved.join("sub/b")).unwrap(), "b\n");
-        // Again: the same root, made once.
         prepare(&t, &fleet, &cfg, "web", None).unwrap();
         assert_eq!(git(&web, &["rev-parse", repo::ROOT_REF]), root);
         assert_no_leftovers(&web);
@@ -1671,7 +1661,6 @@ mod tests {
         let link = LinkTransfer::for_worker(link(&dir, &fleet).parent().unwrap(), "w");
         let t = Recorded { inner: &link, sent: Mutex::default() };
         let id = repo::identity(Repo::Checkout(&web), "HEAD").unwrap();
-        // Nothing there yet: no roots, no tips.
         assert_eq!(link.haves(std::slice::from_ref(&id)).unwrap(), Haves::default());
 
         let got = prepare(&t, &fleet, &cfg, "web", None).unwrap();
@@ -1753,7 +1742,6 @@ mod tests {
         assert_eq!(entries, [".in".to_string(), format!("{}.git", sent.id)]);
         assert_eq!(std::fs::read_dir(control_plane.join("repos/.in")).unwrap().count(), 0, "no body left behind");
 
-        // Nothing new: a 0-byte body, still ok.
         assert_eq!(mirror(&got.sent, &t), none);
         assert_eq!(t.take(), [("bundle".to_string(), 0)]);
         assert_eq!(source_state(&web), before, "the source is untouched");
@@ -1830,7 +1818,6 @@ mod tests {
         assert_eq!(git(&there, &["rev-parse", "refs/devsandbox/wip/web-2"]), back.refs["refs/devsandbox/w/web-2/wip"], "the WIP stays there");
         assert_eq!(std::fs::read_dir(fleet.join(fetch::OUT_DIR)).unwrap().count(), 0, "pulled, so removed");
         assert_no_leftovers(&web);
-        // Nothing new: no bundle.
         let again = fetch::fetch_back(&entry, |haves| t.fetch_instance("web-2", haves), &t).unwrap();
         assert_eq!((again.fetched, again.refs), (0, back.refs));
         let _ = std::fs::remove_dir_all(&dir);

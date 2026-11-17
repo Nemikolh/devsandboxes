@@ -284,8 +284,6 @@ pub fn applies(form: &Form, q: &Question, value: impl Fn(&Question) -> Option<An
     }
 }
 
-// ---- schema ---------------------------------------------------------------
-
 /// The wire shape of a form block, minus `type` (`message.rs` dispatches on
 /// it). Unknown fields are rejected, like every `thread send` field.
 #[derive(Deserialize)]
@@ -605,8 +603,6 @@ pub fn sanitized(form: Form) -> Form {
     Form { id: sanitize(&form.id), title: opt(form.title), submit: sanitize(&form.submit), questions }
 }
 
-// ---- answers --------------------------------------------------------------
-
 /// Why a draft or a submission was refused; the API's error codes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormError {
@@ -909,7 +905,6 @@ pub(crate) mod tests {
     fn rejects_every_invalid_field() {
         let err = |json: &str| form(json).unwrap_err();
         let text = |id: &str| format!(r#"{{"id":"{id}","label":"L","type":"text"}}"#);
-        // Form.
         assert!(err(r#"{"type":"form","id":"F","questions":[]}"#).starts_with("bad `blocks[1].id` `F`"));
         assert_eq!(err(&qs("")), "block 1: form has no questions");
         let many: Vec<_> = (0..31).map(|i| text(&format!("q{i}"))).collect();
@@ -922,7 +917,6 @@ pub(crate) mod tests {
         let submit = |s: &str| format!(r#"{{"type":"form","id":"f","submit":"{s}","questions":[{}]}}"#, text("a"));
         assert!(err(&submit(&"s".repeat(41))).contains("longer than 40 bytes"));
         assert!(err(&submit(" ")).contains("is empty"));
-        // Common question fields.
         assert!(err(&qs(&text("A"))).starts_with("bad `blocks[1] question id` `A`"));
         assert!(err(&qs(r#"{"id":"a","label":"","type":"text"}"#)).contains("label` is empty"));
         assert!(err(&qs(r#"{"id":"a","label":"a\nb","type":"text"}"#)).contains("label` spans lines"));
@@ -932,7 +926,6 @@ pub(crate) mod tests {
         assert!(err(&qs(&context(4097))).contains("longer than 4096 bytes"));
         assert!(form(&qs(&context(4096))).is_ok());
         assert!(err(&qs(r#"{"id":"a","label":"L\u001b","type":"text"}"#)).contains("control character"));
-        // Choice.
         let choice = |rest: &str| qs(&format!(r#"{{"id":"c","label":"C","type":"choice",{rest}}}"#));
         assert_eq!(err(&choice(r#""options":[]"#)), "block 1: `c` has no options");
         let opts: Vec<_> = (0..21).map(|i| format!(r#"{{"id":"o{i}","label":"O"}}"#)).collect();
@@ -948,7 +941,6 @@ pub(crate) mod tests {
         assert!(form(&choice(&format!(r#"{ab},"default":"b""#))).is_ok());
         assert!(form(&choice(&format!(r#"{ab},"multiple":true,"default":["b","a"]"#))).is_ok());
         assert!(form(&choice(&format!(r#"{ab},"multiple":true,"default":[]"#))).is_ok());
-        // Text.
         let t = |rest: &str| qs(&format!(r#"{{"id":"t","label":"T","type":"text",{rest}}}"#));
         assert!(err(&t(r#""max":0"#)).contains("max 0"));
         assert!(err(&t(r#""max":8193"#)).contains("max 8193"));
@@ -961,7 +953,6 @@ pub(crate) mod tests {
         assert!(form(&t(r#""multiline":true,"default":"a\nb""#)).is_ok());
         let long_default = format!(r#""default":"{}""#, "d".repeat(DEFAULT_TEXT_MAX + 1));
         assert!(err(&t(&long_default)).contains("longer than its max"), "the default max applies");
-        // Confirm.
         let c = |rest: &str| qs(&format!(r#"{{"id":"y","label":"Y","type":"confirm",{rest}}}"#));
         assert!(err(&c(&format!(r#""yes":"{}""#, "y".repeat(41)))).contains("longer than 40 bytes"));
         assert!(err(&c(r#""default":"yes""#)).contains("invalid type"));

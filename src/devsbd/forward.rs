@@ -583,9 +583,7 @@ const HANDSHAKE_SLICE: Duration = Duration::from_millis(100);
 
 /// Outcome of waiting for a fresh bridge's handshake.
 enum Handshake {
-    /// The handshake succeeded.
     Ok,
-    /// The handshake failed with this reason.
     Err(String),
     /// No result within `HANDSHAKE_WAIT` (the bridge's own watchdog has already
     /// killed the `exec`).
@@ -695,16 +693,12 @@ mod tests {
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-    // ---- pure: retry gap ----
-
     #[test]
     fn retry_gap_is_short_unless_a_mismatch() {
         assert_eq!(retry_gap(false), RETRY);
         assert_eq!(retry_gap(true), MISMATCH_RETRY);
         assert!(MISMATCH_RETRY > RETRY);
     }
-
-    // ---- pure: who answers the listening-process probe ----
 
     #[test]
     fn helper_answer_table() {
@@ -739,8 +733,6 @@ mod tests {
         assert_eq!(open(&AtomicBool::new(false)).err().as_deref(), Some("no running container"));
     }
 
-    // ---- pure: the idle clock ----
-
     #[test]
     fn idle_since_is_none_while_open_and_resets_on_accept_and_last_close() {
         let t0 = Instant::now();
@@ -760,8 +752,6 @@ mod tests {
         assert_eq!(c.idle_since(), Some(at(4)));
     }
 
-    // ---- pure: note dedup ----
-
     #[test]
     fn notes_drop_empty_bridge_closed_and_consecutive_dupes() {
         let mut n = Notes::default();
@@ -780,8 +770,6 @@ mod tests {
             ]
         );
     }
-
-    // ---- HostPort bind fallback, against real loopback listeners ----
 
     #[test]
     fn prefer_walks_up_when_taken() {
@@ -823,8 +811,6 @@ mod tests {
         let err = bind_listener(LOOPBACK, HostPort::Fixed(port)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     }
-
-    // ---- Forward lifecycle without docker: a resolve that always fails ----
 
     /// `start` binds synchronously (so this never blocks on docker), the
     /// supervisor drives the failing resolve into `Error` with a note, and
@@ -933,8 +919,6 @@ mod tests {
         assert!(shared.notes.lock().unwrap().pending.is_empty(), "no note for a stopped open");
         assert_eq!(shared.inner.lock().unwrap().state, ForwardState::Connecting);
     }
-
-    // ---- docker-gated end-to-end ----
 
     use crate::devsbd::{install, Arch};
     use std::process::Command;

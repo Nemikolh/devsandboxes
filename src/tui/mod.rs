@@ -364,7 +364,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(id) = app.take_build_log_read() {
             daemon.build_log(id);
         }
-        // An Inbox link: hand it to the desktop opener.
         if let Some(link) = app.take_pending_open() {
             if let Err(status) = open_link(&link) {
                 app.status = Some(status);
@@ -494,7 +493,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             false
         });
 
-        // Drain the daemon's procs answers into the app, freeing the slot.
         while let Some(update) = poller.try_recv() {
             match update {
                 PollUpdate::Procs(answer) => {

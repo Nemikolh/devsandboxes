@@ -1503,15 +1503,12 @@ extends = "does-not-exist"
             vec![("repo".to_string(), "repo".to_string(), vec!["db".to_string()])];
         let name = "devsandbox-svc-proj-db";
 
-        // Both labels match → no drift.
         let ps = vec![ps_labeled(name, "cfg", "bld")];
         assert!(!build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
 
-        // Config label differs → drift.
         let ps = vec![ps_labeled(name, "old", "bld")];
         assert!(build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
 
-        // Build label differs (config matches) → drift.
         let ps = vec![ps_labeled(name, "cfg", "old")];
         assert!(build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
 
@@ -1576,7 +1573,6 @@ extends = "does-not-exist"
             vec!["no `image` or `build.dockerfile` set".to_string()],
         );
 
-        // Resolvable folder + an existing bind source ⇒ no issues.
         let ok = mk(
             Some("repo"),
             Some(vec![Mount::Shorthand(format!(
@@ -1586,7 +1582,6 @@ extends = "does-not-exist"
         );
         assert!(validate_sandbox(&root, &ok).is_empty());
 
-        // Missing folder value ⇒ a single folder issue.
         assert_eq!(
             validate_sandbox(&root, &mk(None, None)),
             vec!["folder: not set".to_string()],
@@ -1613,7 +1608,6 @@ extends = "does-not-exist"
         );
         assert!(validate_sandbox(&root, &auto).is_empty(), "{:?}", validate_sandbox(&root, &auto));
 
-        // A local feature folder missing under the config dir is flagged.
         let mut feat = mk(Some("repo"), None);
         feat.properties.features = Some(BTreeMap::from([(
             "./features/toolkit".to_string(),
@@ -1622,7 +1616,6 @@ extends = "does-not-exist"
         let issues = validate_sandbox(&root, &feat);
         assert_eq!(issues.len(), 1, "got: {issues:?}");
         assert!(issues[0].contains("feature `./features/toolkit`: folder"), "got: {issues:?}");
-        // Folder present but no metadata.
         std::fs::create_dir_all(root.join("features/toolkit")).unwrap();
         let issues = validate_sandbox(&root, &feat);
         assert!(issues[0].contains("no devcontainer-feature.json"), "got: {issues:?}");

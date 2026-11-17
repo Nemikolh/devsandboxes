@@ -198,7 +198,6 @@ mod tests {
         assert!(lines[2].ends_with("  work (not allowed)"), "{out}");
         assert!(lines[3].ends_with("Up 1 hour"), "{out}");
 
-        // No profile anywhere: the three columns as before.
         state.instances.values_mut().for_each(|i| i.profile = None);
         let rows = join_state(vec![row("devsandbox-a")], &state, |_| None, |_| unreachable!());
         assert!(render(rows, false).unwrap().starts_with("NAME          IMAGE  STATUS\n"));

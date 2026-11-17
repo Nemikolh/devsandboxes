@@ -969,10 +969,8 @@ mod tests {
         assert_eq!(link(&wt.join(".env")), Some(store.join(".env")));
         assert_eq!(link(&wt.join("secrets")), Some(store.join("secrets")));
         assert_eq!(std::fs::read_to_string(wt.join("secrets/key")).unwrap(), "k");
-        // Store copy linked into the base; the worktree's own file is kept.
         assert_eq!(link(&base.join(".env.local")), Some(store.join(".env.local")));
         assert_eq!(std::fs::read_to_string(wt.join(".env.local")).unwrap(), "mine");
-        // Tracked path untouched, missing everywhere skipped.
         assert!(link(&base.join("tracked.txt")).is_none());
         assert!(!store.join("tracked.txt").exists());
         assert!(base.join(".env.missing").symlink_metadata().is_err());
@@ -1275,7 +1273,6 @@ mod tests {
         let branches = git(&base, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
         let wt = root.join("wt");
 
-        // An explicit base is ignored (noted), not an error.
         let created = create_worktree(&base, &wt, "feat/a", Some("main"), true, &Default::default()).unwrap();
 
         assert!(!created);
@@ -1405,7 +1402,6 @@ mod tests {
         assert!(locked());
         unlock_worktree(&base, &wt);
         assert!(!locked());
-        // Not locked: a no-op.
         unlock_worktree(&base, &wt);
         std::fs::remove_dir_all(&root).unwrap();
     }

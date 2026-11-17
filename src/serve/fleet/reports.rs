@@ -212,7 +212,6 @@ struct State {
 /// change since the last flood came from (it holds them).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Flood {
-    /// Nothing changed.
     #[default]
     None,
     /// Every change came from this peer.
@@ -231,12 +230,10 @@ impl Flood {
         };
     }
 
-    /// Whether a flood is due.
     pub fn due(&self) -> bool {
         *self != Flood::None
     }
 
-    /// Whether the flood sends to `peer`.
     pub fn sends_to(&self, peer: &str) -> bool {
         match self {
             Flood::None => false,
@@ -425,7 +422,6 @@ fn own(io: &Io) -> Option<Own> {
     Some(Own { me, key, stored })
 }
 
-/// `name`'s link is up here.
 fn up(io: &Io, name: &str) -> bool {
     io.links.remotes().get(name).is_some_and(|m| m.state == LinkState::Connected)
 }
@@ -565,7 +561,6 @@ mod tests {
         assert!(!t.take_due(t0 + Duration::from_millis(1000)), "not yet");
         assert!(t.take_due(t0 + DEBOUNCE));
         assert!(!t.take_due(t0 + DEBOUNCE), "taken");
-        // Nothing moved: nothing due.
         assert!(t.observe(&[link("box", true, LinkState::Connected)], t0 + DEBOUNCE, 3).is_empty());
         assert_eq!(t.due(), None);
         // Sent now (the control-plane link came up), whatever was pending.

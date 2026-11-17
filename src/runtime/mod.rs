@@ -114,10 +114,7 @@ pub struct ProcList {
 pub trait Backend: Send + Sync {
     /// Short runtime name for messages and the dashboard header.
     fn name(&self) -> &'static str;
-    /// Executable to invoke.
     fn bin(&self) -> &'static str;
-
-    // --- process runners (shared) ---
 
     /// Run with stdio inherited (build output, exec, ps). Returns the exit code.
     fn run_inherit(&self, args: &[&str]) -> Result<i32> {
@@ -236,8 +233,6 @@ pub trait Backend: Send + Sync {
         written.with_context(|| format!("writing stdin of {} {}", self.bin(), args.first().unwrap_or(&"")))
     }
 
-    // --- queries (diverge per runtime) ---
-
     /// `Some(true|false)` for an existing container, `None` when it does not
     /// exist (any lookup failure is treated as "not found").
     fn is_running(&self, container: &str) -> Result<Option<bool>>;
@@ -282,10 +277,8 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Resource usage of running containers.
     fn stats(&self) -> Result<Vec<StatsRow>>;
 
-    /// Runtime (server) version string.
     fn server_version(&self) -> Result<String>;
 
     /// Last `n` lines of a container's stdout+stderr.
@@ -304,9 +297,6 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
-    // --- mutations that differ in shape ---
-
-    /// Force-remove a container.
     fn remove_force(&self, container: &str) -> Result<i32>;
 
     /// `run` args attaching `networks`. Docker-likes accept a single `--network`
@@ -325,7 +315,6 @@ pub trait Backend: Send + Sync {
     /// runtimes where the alias was applied at service creation.
     fn wire_service_dns(&self, container: &str, endpoints: &[ServiceEndpoint]) -> Result<()>;
 
-    /// Whether `build --cache-from` is supported.
     fn supports_cache_from(&self) -> bool;
 
     /// Whether a single host *file* (or socket) can be bind-mounted. Apple's

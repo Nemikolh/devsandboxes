@@ -120,11 +120,9 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
-        // A no-op writes nothing.
         let other = dir.join("sub/things.toml");
         update(&other, load, save, |_| ()).unwrap();
         assert!(!other.exists());
-        // A bad file stays.
         std::fs::write(&path, "!x").unwrap();
         assert!(update(&path, load, save, |v| v.clear()).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "!x");

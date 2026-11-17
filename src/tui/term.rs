@@ -594,7 +594,6 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Helper: an ESC-prefixed sequence when Alt is held, plain otherwise.
     let alt_prefixed = |body: Vec<u8>| -> Vec<u8> {
         if alt {
             let mut out = vec![0x1b];
@@ -608,7 +607,6 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     match key.code {
         KeyCode::Char(c) => {
             if ctrl {
-                // Control codes: derive C0 from the letter/symbol.
                 let byte = match c.to_ascii_lowercase() {
                     'a'..='z' => (c.to_ascii_lowercase() as u8) - b'a' + 1,
                     ' ' | '@' => 0x00,
@@ -691,7 +689,6 @@ mod tests {
     fn plain_chars_encode_utf8() {
         assert_eq!(encode_key(key(KeyCode::Char('a')), false), Some(vec![b'a']));
         assert_eq!(encode_key(key(KeyCode::Char('Z')), false), Some(vec![b'Z']));
-        // multi-byte UTF-8
         assert_eq!(
             encode_key(key(KeyCode::Char('é')), false),
             Some("é".as_bytes().to_vec())
@@ -707,7 +704,6 @@ mod tests {
                 "ctrl-{c}"
             );
         }
-        // uppercase letter with ctrl maps the same as lowercase
         assert_eq!(
             encode_key(key_mods(KeyCode::Char('C'), KeyModifiers::CONTROL), false),
             Some(vec![0x03])
@@ -739,7 +735,6 @@ mod tests {
             encode_key(key_mods(KeyCode::Char('b'), KeyModifiers::ALT), false),
             Some(vec![0x1b, b'b'])
         );
-        // alt+ctrl: ESC then the control byte
         assert_eq!(
             encode_key(
                 key_mods(
@@ -782,7 +777,6 @@ mod tests {
             encode_key(key(KeyCode::Left), false),
             Some(b"\x1b[D".to_vec())
         );
-        // application cursor mode → SS3
         assert_eq!(encode_key(key(KeyCode::Up), true), Some(b"\x1bOA".to_vec()));
         assert_eq!(
             encode_key(key(KeyCode::Left), true),
@@ -973,7 +967,6 @@ mod tests {
         // ST terminator; a later copy replaces an unrelayed one.
         s.feed_output(b"\x1b]52;c;b2xk\x1b\\\x1b]52;p;bmV3\x1b\\");
         assert_eq!(s.take_clipboard().as_deref(), Some(&b"bmV3"[..]));
-        // Nothing is ever answered on the PTY.
         assert_eq!(s.take_written(), b"");
     }
 
@@ -1025,7 +1018,6 @@ mod tests {
         let mut s = TermSession::test_session("web-1", "devsandbox-web-1", 24, 80);
         s.resize(30, 100);
         assert_eq!(s.size(), (30, 100));
-        // no-op path: unchanged size stays put
         s.resize(30, 100);
         assert_eq!(s.size(), (30, 100));
     }
@@ -1063,9 +1055,9 @@ mod tests {
         tabs.open(sess("b", "devsandbox-b"));
         tabs.open(sess("c", "devsandbox-c")); // active = 2
         tabs.next();
-        assert_eq!(tabs.active(), 0); // wrapped
+        assert_eq!(tabs.active(), 0);
         tabs.prev();
-        assert_eq!(tabs.active(), 2); // wrapped back
+        assert_eq!(tabs.active(), 2);
     }
 
     #[test]
@@ -1084,7 +1076,6 @@ mod tests {
         tabs.open(sess("b", "devsandbox-b"));
         tabs.open(sess("c", "devsandbox-c")); // active = 2 (last)
         tabs.close_active();
-        // last removed → active clamps to new last
         assert_eq!(tabs.sessions().len(), 2);
         assert_eq!(tabs.active(), 1);
         assert_eq!(tabs.active_session().unwrap().title, "b");
@@ -1094,7 +1085,7 @@ mod tests {
         assert_eq!(tabs.active_session().unwrap().title, "b");
         tabs.close_active();
         assert!(tabs.is_empty());
-        tabs.close_active(); // no-op on empty
+        tabs.close_active();
         assert!(tabs.is_empty());
     }
 
@@ -1104,7 +1095,6 @@ mod tests {
         let dead = sess("a", "devsandbox-a");
         dead.set_exited();
         tabs.open(dead);
-        // exited tab for the container is not a dedup target
         assert_eq!(tabs.find("devsandbox-a"), None);
         tabs.open(sess("a2", "devsandbox-a")); // a live one alongside
         assert_eq!(tabs.find("devsandbox-a"), Some(1));

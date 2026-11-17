@@ -61,7 +61,6 @@ pub struct PollWorker {
 }
 
 impl PollWorker {
-    /// Spawn the worker.
     pub fn spawn() -> PollWorker {
         Self::spawn_with(Arc::new(connect))
     }

@@ -174,7 +174,6 @@ pub struct MovedFolder {
     /// Its path on the worker.
     pub remote: PathBuf,
     pub branch: String,
-    /// The repo's identity.
     pub repo: String,
 }
 
@@ -843,7 +842,6 @@ mod tests {
         assert_eq!(start_point(&ask(Some("feature"), None), &prepared("feature")), None);
         // A new one: the bundle carried the checkout's branch, its start.
         assert_eq!(start_point(&ask(Some("new-one"), None), &prepared("main")).as_deref(), Some("main"));
-        // No `--branch`: nothing to start.
         assert_eq!(start_point(&ask(None, None), &prepared("main")), None);
         // The user's `--base` stays theirs.
         assert_eq!(start_point(&ask(Some("new-one"), Some("v1")), &prepared("main")).as_deref(), Some("v1"));

@@ -401,7 +401,6 @@ fn tick(watched: bool, quiet: bool, bridges_settled: bool) -> Duration {
     }
 }
 
-/// The running containers of a listing.
 fn running(rows: &[ContainerRow]) -> Vec<String> {
     rows.iter().filter(|r| r.is_running()).map(|r| r.name.clone()).collect()
 }
@@ -521,11 +520,8 @@ mod tests {
         assert_eq!(live_instances(&running(&[]), &s, dispatchers), 0);
         assert_eq!(live_instances(&running(&["devsandbox-disp", "devsandbox-disp-pr-1"]), &s, dispatchers), 1);
         assert_eq!(live_instances(&running(&["devsandbox-disp", "devsandbox-other"]), &s, dispatchers), 2);
-        // Running but not a dispatcher (a child, a plain sandbox): not a holder.
         assert_eq!(live_instances(&running(&["devsandbox-disp-pr-1", "devsandbox-old"]), &s, dispatchers), 0);
-        // A running container no state entry knows: not a holder.
         assert_eq!(live_instances(&running(&["devsandbox-stray"]), &s, |_| true), 0);
-        // The capacity report counts every running instance.
         let all = running(&["devsandbox-disp", "devsandbox-disp-pr-1", "devsandbox-old", "devsandbox-svc-pg"]);
         assert_eq!(running_instances(&all, &s), 3);
     }

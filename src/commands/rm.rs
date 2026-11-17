@@ -119,7 +119,6 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool, fail_on_ask: boo
         fresh.instances.retain(|_, i| i.instance_id != instance_id);
         Ok(())
     })?;
-    // The build log goes with the record.
     crate::build_log::remove(&instance_id);
     archive_inbox(&key, &instance_id);
     println!("removed {key}");
@@ -623,7 +622,6 @@ mod tests {
         git(&base, &["commit", "-q", "-m", "init"]);
         git(&base, &["worktree", "add", "-q", &wt.to_string_lossy(), "-b", "sandbox/r"]);
 
-        // Ignored files don't block removal.
         std::fs::write(wt.join("ignored"), "x").unwrap();
         check_worktree_removable(&wt).unwrap();
 
@@ -640,7 +638,6 @@ mod tests {
         assert!(err.contains("M tracked"), "{err}");
         assert!(wt.exists());
 
-        // Committed: passes, and git removes it.
         git(&wt, &["commit", "-q", "-am", "change"]);
         check_worktree_removable(&wt).unwrap();
         remove_worktree(&base, &wt, false).unwrap();
@@ -776,7 +773,6 @@ mod tests {
         assert!(err.contains("?? new"), "{err}");
         assert!(wt.exists());
 
-        // `--force` discards the changes and removes it all the same.
         remove_folder_worktrees(&folders, true).unwrap();
         assert!(!wt.exists());
         assert!(!worktree_listed(&folders[1].base, &wt));
@@ -800,7 +796,6 @@ mod tests {
         remove_folder_worktrees(&folders, false).unwrap();
         assert!(!worktree_listed(&b.base, wt_b), "stale record pruned");
         assert!(!root.join(".worktrees/i.folders").exists());
-        // And once more, with everything already gone.
         remove_folder_worktrees(&folders, false).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -839,7 +834,6 @@ mod tests {
         assert!(err.contains(".git/config sets core.fsmonitor"), "{err}");
         assert!(!marker.exists(), "fsmonitor ran on the host");
 
-        // Once the key is removed, the removal goes through.
         git(&["config", "--unset", "core.fsmonitor"]);
         remove_worktree(&base, &wt, false).unwrap();
         assert!(!wt.exists());

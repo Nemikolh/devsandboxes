@@ -160,9 +160,7 @@ pub struct Placement {
 pub enum NoPlace {
     /// The pinned machine isn't a candidate.
     UnknownPin(MachineRef),
-    /// The pinned machine can't be reached.
     PinUnreachable(MachineRef),
-    /// The pinned machine has no container runtime.
     PinNoRuntime(MachineRef),
     /// No candidate takes new work: each with why.
     NoCandidate(Vec<(MachineRef, &'static str)>),
@@ -555,7 +553,6 @@ mod tests {
         let (s, reasons) = score(&Spec { requester: m("x"), ..spec() }, &Candidate { has_image: true, has_repo: true, ..cand(m("a"), Some(capped)) });
         assert_eq!(s, 3 * 20 + 2 * 50 + 2 * 50 + 50 + IMAGE + REPO);
         assert_eq!(reasons, ["mem 20% free", "disk 50% free", "slots 50% free", "cpu 50% free", "image built", "repo there"]);
-        // No report: all neutral.
         let (s, reasons) = score(&Spec { requester: m("x"), ..spec() }, &cand(m("a"), None));
         assert_eq!(s, (W_MEM + W_DISK + W_SLOTS + W_CPU) * NEUTRAL);
         assert_eq!(reasons, ["no capacity report"]);

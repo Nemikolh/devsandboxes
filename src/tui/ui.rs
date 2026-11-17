@@ -123,7 +123,6 @@ fn tab_bar_areas(app: &App, area: Rect) -> (Rect, Rect, Option<String>) {
             }
         });
     let totals_w = totals.as_deref().map_or(0, |t| t.chars().count() as u16);
-    // Leave a gap before the totals; drop them entirely when the row is too narrow.
     let reserve = if totals_w > 0 && area.width > totals_w + 4 {
         totals_w + 2
     } else {
@@ -377,7 +376,6 @@ fn draw_services(frame: &mut Frame, app: &App, area: Rect) {
     // terminal panel's geometry stays independent of snapshot state.
     let table_area = draw_status_lines(frame, snapshot, top);
 
-    // Terminal focused ⇒ the terminal panel is the accented one; dim the rest.
     let panel_focused = app.focus == Focus::Terminal;
 
     if rows.is_empty() {
@@ -1795,7 +1793,6 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let nodes = app.visible_nodes();
 
     let (top, detail_area, terms_area) = content_areas(app, area);
-    // Terminal focused ⇒ the terminal panel is the accented one; dim the rest.
     let panel_focused = app.focus == Focus::Terminal;
 
     if nodes.is_empty() {
@@ -1832,7 +1829,6 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
         };
         let lines = detail_lines(Some(snapshot), selected, agent_count, sessions, &app.machines);
         let (top, detail_area) = fit_detail(top, detail_area, terms_area, lines.len());
-        // Status lines come out of the top part only (as above).
         let table_area = draw_status_lines(frame, Some(snapshot), top);
         draw_tree(frame, app, snapshot, &nodes, table_area, panel_focused);
         draw_detail(frame, lines, detail_area, panel_focused);
@@ -2038,7 +2034,6 @@ fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, si: usize, sb: &'a Sandb
     let marker = if collapsed { '▸' } else { '▾' };
     let (total, running) = group_counts(snapshot, si);
     let stats = sandbox_stats(total, running);
-    // Green when any running, dim when the sandbox has no instances at all.
     let stats_style = if running > 0 {
         Style::default().fg(Color::Green)
     } else if total == 0 {
@@ -2209,7 +2204,6 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
         }
     }
 
-    // Placeholder / message row.
     let msg = match state {
         Some(ProcState::Message(m)) => m.clone(),
         _ => "(loading…)".to_string(),
@@ -2311,7 +2305,6 @@ fn sandbox_detail<'a>(snapshot: &Snapshot, si: usize, sb: &'a SandboxRow) -> Vec
             Style::default().fg(Color::Red),
         )));
     }
-    // Identity notes: yellow, dimmed once acked ("continue as is").
     for note in &sb.identity {
         let mut style = Style::default().fg(Color::Yellow);
         if note.acked {
@@ -2817,8 +2810,6 @@ fn highlight_toml_line(line: &str) -> Line<'static> {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     }
-    // Split a `key = value` assignment at the first `=`, styling the key half
-    // (through the `=`) green and leaving the value default.
     if let Some(eq) = line.find('=') {
         let (key, value) = line.split_at(eq + 1);
         return Line::from(vec![
@@ -2957,25 +2948,21 @@ mod tests {
 
     #[test]
     fn highlight_toml_styles_by_kind() {
-        // Section header: cyan bold.
         let header = highlight_toml_line("[sandbox.repo]");
         assert_eq!(header.spans.len(), 1);
         let s = header.spans[0].style;
         assert_eq!(s.fg, Some(ACCENT));
         assert!(s.add_modifier.contains(Modifier::BOLD));
 
-        // Comment: dim.
         let comment = highlight_toml_line("  # a note");
         assert!(comment.spans[0].style.add_modifier.contains(Modifier::DIM));
 
-        // Assignment: key half green, value split off.
         let kv = highlight_toml_line("image = \"node:22\"");
         assert_eq!(kv.spans.len(), 2);
         assert_eq!(kv.spans[0].style.fg, Some(Color::Green));
         assert_eq!(kv.spans[0].content, "image =");
         assert_eq!(kv.spans[1].content, " \"node:22\"");
 
-        // Plain line: single default span, no panic.
         let plain = highlight_toml_line("just text");
         assert_eq!(plain.spans.len(), 1);
     }
@@ -2989,19 +2976,16 @@ mod tests {
 
     #[test]
     fn highlight_json_styles_by_kind() {
-        // Key/value: green key half through the colon, plain value.
         let kv = highlight_json_line("    \"Id\": \"abc\",");
         assert_eq!(kv.spans.len(), 2);
         assert_eq!(kv.spans[0].style.fg, Some(Color::Green));
         assert_eq!(kv.spans[0].content, "    \"Id\":");
         assert_eq!(kv.spans[1].content, " \"abc\",");
 
-        // Structural punctuation line: dim.
         let brace = highlight_json_line("  {");
         assert_eq!(brace.spans.len(), 1);
         assert!(brace.spans[0].style.add_modifier.contains(Modifier::DIM));
 
-        // Plain value line: single default span, no panic.
         let plain = highlight_json_line("    \"abc\"");
         assert_eq!(plain.spans.len(), 1);
         assert_eq!(plain.spans[0].style.fg, None);
@@ -3040,13 +3024,10 @@ mod tests {
     #[test]
     fn fit_keeps_both_with_a_gap_and_truncates_left_first() {
         assert_eq!(fit("title", "2m", 20), ("title".into(), "2m".into()));
-        // Exactly fits with one space.
         assert_eq!(fit("title", "2m", 8), ("title".into(), "2m".into()));
-        // Left cut with `…` to keep the gap.
         assert_eq!(fit("a long title here", "2m", 14), ("a long tit…".into(), "2m".into()));
         // Too narrow to keep FIT_MIN_LEFT columns of title: the right goes.
         assert_eq!(fit("a long title here", "12 min ago", 15), ("a long title h…".into(), String::new()));
-        // A short left needs only its own width.
         assert_eq!(fit("ok", "12 min ago", 13), ("ok".into(), "12 min ago".into()));
         assert_eq!(fit("anything", "", 4), ("any…".into(), String::new()));
         assert_eq!(fit("x", "y", 0), (String::new(), String::new()));
@@ -3243,7 +3224,7 @@ mod tests {
             ("busy", ContainerStatus::Missing, Some(PhaseRow::InFlight { step: "postCreateCommand".into() })),
             ("ok", running(), None),
         ]);
-        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `bad`
+        app.on_key(KeyEvent::from(KeyCode::Down));
         let screen = render(&app, 140, 30);
         let line = |name: &str| screen.lines().find(|l| l.contains(&format!("  {name} "))).unwrap().to_string();
         assert!(line("bad").contains(" failed "), "{screen}");
@@ -3268,7 +3249,7 @@ mod tests {
         app.procs.insert("web".into(), rows(Some(SessionCount { running: 2, detached: 1 })));
         app.procs.insert("idle".into(), rows(Some(SessionCount::default())));
         app.procs.insert("old".into(), rows(None));
-        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `web`
+        app.on_key(KeyEvent::from(KeyCode::Down));
         let screen = render(&app, 140, 30);
         let line = |name: &str| screen.lines().find(|l| l.contains(&format!("  {name} "))).unwrap().to_string();
         assert!(line("web").contains(&format!("  web {SESSION_BADGE}2 ")), "{screen}");
@@ -3297,7 +3278,7 @@ mod tests {
         app.set_snapshot(s);
         let rows = ProcState::Rows { rows: Vec::new(), signalable: true, sessions: Some(SessionCount::default()) };
         app.procs.insert("web".into(), rows);
-        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `web`
+        app.on_key(KeyEvent::from(KeyCode::Down));
         let screen = render(&app, 140, 30);
         assert!(screen.contains("base folder: /f"), "{screen}");
         assert!(screen.contains("drift: config or dockerfile changed"), "{screen}");
@@ -3323,7 +3304,7 @@ mod tests {
         s.instances[1].profile = Some("personal".into());
         s.instances[1].profile_disallowed = true;
         app.set_snapshot(s);
-        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `web`
+        app.on_key(KeyEvent::from(KeyCode::Down));
         let screen = render(&app, 140, 30);
         let line = |name: &str| screen.lines().find(|l| l.contains(&format!("  {name} "))).unwrap().to_string();
         assert!(line("web").contains("  web [work] "), "{screen}");
@@ -3377,7 +3358,6 @@ mod tests {
         let services = render(&app, 140, 30);
         assert!(services.contains("1 sandbox uses /root"), "services view too: {services}");
 
-        // Everything acked: no line.
         s.sandboxes[0].identity[1].acked = true;
         app.set_snapshot(s);
         assert!(!render(&app, 140, 30).contains("uses /root"));
@@ -3406,7 +3386,7 @@ mod tests {
         app.machines = vec![boxed, sm("new", LinkState::Connecting)];
         app.set_snapshot(s);
         for _ in 0..3 {
-            app.on_key(KeyEvent::from(KeyCode::Down)); // onto box's web
+            app.on_key(KeyEvent::from(KeyCode::Down));
         }
         let screen = render(&app, 200, 30);
         let header = screen.lines().find(|l| l.contains("TREE")).unwrap();
@@ -3418,7 +3398,6 @@ mod tests {
         assert!(screen.contains("box unreachable: Connection refused (last known)"), "{screen}");
         assert!(screen.contains("new: connecting · 1 sandbox"), "{screen}");
 
-        // Connected again: its own status.
         app.machines[0].state = LinkState::Connected;
         let screen = render(&app, 200, 30);
         let rows: Vec<&str> = screen.lines().filter(|l| l.contains("  web ")).collect();
@@ -3589,7 +3568,6 @@ mod tests {
         assert_eq!(hit(col("All")), Some(StripHit::View(View::All)));
         assert_eq!(hit(col("›")), Some(StripHit::Next));
         assert_eq!(hit(col("›") + 1), None, "past the end");
-        // Narrow: the short names move everything left.
         let narrow = text(&view_strip(View::All, counts, 20));
         let at = narrow.find("Active").map(|b| narrow[..b].chars().count() as u16).unwrap();
         assert_eq!(view_strip_hit(View::All, counts, 20, at), Some(StripHit::View(View::Active)));
@@ -3614,7 +3592,6 @@ mod tests {
         let mut app = inbox_app();
         let frame = Rect::new(0, 0, 120, 30);
         let screen: Vec<String> = render(&app, 120, 30).lines().map(str::to_string).collect();
-        // Every card's title row hits that card.
         let threads = app.inbox.threads().to_vec();
         for (pos, &i) in app.inbox.rows().iter().enumerate() {
             let title = title_of(&threads[i]);
@@ -3684,7 +3661,6 @@ mod tests {
         };
         let typed = |app: &mut App, s: &str| s.chars().for_each(|c| app.on_key(KeyEvent::from(KeyCode::Char(c))));
 
-        // Empty: one row, the placeholder.
         let (_, _, _, rows, _) = draw(&app);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].starts_with("reply to the owner"), "{rows:?}");
@@ -3725,7 +3701,6 @@ mod tests {
         assert_eq!(inbox_hit(&app, frame, x0 + 1, bottom), Some(InboxHit::Input));
         assert_eq!(inbox_hit(&app, frame, x0 + 1, top), Some(InboxHit::Input));
 
-        // Enter sends and the box shrinks back to one row.
         app.on_key(KeyEvent::from(KeyCode::Enter));
         let (_, _, _, rows, _) = draw(&app);
         assert_eq!(rows.len(), 1);
@@ -3853,7 +3828,6 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
         assert_eq!((cx, cy), (x, y + 2), "{screen}");
         assert_eq!(buf[(cx, cy)].style().bg, markdown::CODE.bg, "inline code keeps its tint");
         assert_eq!(find_cell(&rows, "e2e           3m  failing"), (x, y + 3), "{screen}");
-        // Raw: the source.
         app.on_key(KeyEvent::from(KeyCode::Char('m')));
         assert!(render(&app, 100, 20).contains("| `cargo test` | 41s | ok |"));
     }
@@ -3887,7 +3861,6 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
         let (_, end) = find_cell(&rows, "THE END");
         let (_, hint) = find_cell(&rows, "this thread takes no replies");
         assert_eq!(end + 1, hint, "{}", rows.join("\n"));
-        // One more line down is not possible.
         let scroll = app.inbox.scroll;
         app.on_key(KeyEvent::from(KeyCode::Down));
         assert_eq!(app.inbox.scroll, scroll);
@@ -4181,7 +4154,6 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
         }
         let screen = render(&app, 30, 8);
         assert!(screen.contains("▌image"), "{screen}");
-        // Back up to the top: the window follows.
         for _ in 0..4 {
             app.on_key(KeyEvent::from(KeyCode::Up));
         }

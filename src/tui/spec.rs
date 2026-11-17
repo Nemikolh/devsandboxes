@@ -249,7 +249,6 @@ mod tests {
         let args = parse("run web --branch feat/x").unwrap();
         assert_eq!(args.value("--branch"), Some("feat/x"));
 
-        // Flags are position-independent.
         let args = parse("run --name api web").unwrap();
         assert_eq!(args.positionals, vec!["web".to_string()]);
         assert_eq!(args.value("--name"), Some("api"));

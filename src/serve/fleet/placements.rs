@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 1;
 
-/// One placed run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     /// The worker, by the name this host knows it by (`Placed::Worker`'s).
@@ -36,7 +35,6 @@ pub struct Entry {
     pub remote: PathBuf,
     /// The repo's identity (`code::repo::identity`) when it was sent.
     pub repo: String,
-    /// The branch sent.
     pub branch: String,
 }
 

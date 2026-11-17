@@ -177,7 +177,6 @@ mod tests {
         assert!(update(&path, |e| remove(e, &entry(Some("a"), 1))).unwrap());
         assert!(!update(&path, |e| remove(e, &entry(Some("a"), 1))).unwrap());
         assert_eq!(load(&path).unwrap(), vec![entry(Some("b"), 2)]);
-        // A no-op doesn't write: no file appears where there was none.
         let other = dir.join("sub/forwards.toml");
         update(&other, |_| ()).unwrap();
         assert!(!other.exists());

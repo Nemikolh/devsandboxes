@@ -472,7 +472,6 @@ pub enum Accepted {
 /// Why [`Seen::accept`] refused a statement. Nothing is recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// The signature doesn't verify.
     BadSignature(String),
     /// Older than the latest seen.
     Rollback { kind: String, signer: String, version: u64, latest: u64 },

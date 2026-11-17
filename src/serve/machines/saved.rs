@@ -30,7 +30,6 @@ pub const VERSION: u32 = 2;
 /// At most one write per this long while rows keep changing.
 pub const SAVE_EVERY: Duration = Duration::from_secs(5);
 
-/// The file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Saved {
     pub version: u32,
@@ -240,7 +239,6 @@ mod tests {
         let (moved, m) = set(LinkState::Unreachable, Some("lap: its fleet link isn't up"));
         assert!(moved);
         assert_eq!(m.error.as_deref(), Some("lap: its fleet link isn't up (rows from Oct 27 12:00 UTC)"));
-        // Connected: a live machine again.
         let (moved, m) = set(LinkState::Connected, None);
         assert_eq!((moved, m.state, m.restored, m.error), (true, LinkState::Connected, false, None));
         let (_, m) = set(LinkState::Connecting, None);

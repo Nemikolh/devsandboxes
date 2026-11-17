@@ -253,7 +253,6 @@ impl Write for Conn {
 /// channel), or every stream on the connection waits.
 pub type OnClose = Box<dyn FnOnce(String) + Send>;
 
-/// A registered stream.
 enum Entry {
     /// `Open` stream on a legacy channel (ssh-agent, notify, control): the
     /// original unbuffered path.
@@ -1481,8 +1480,6 @@ mod tests {
         assert_eq!(refused_opens(&opens), over);
     }
 
-    // ---- flow-controlled (`Connect`) streams ----
-
     use std::sync::mpsc;
 
     #[test]
@@ -1952,8 +1949,6 @@ mod tests {
         let ids: Vec<u32> = (1..=MAX_HOST_STREAMS as u32 + 2).map(h).collect();
         assert_eq!(refused_connects(&ids), [h(MAX_HOST_STREAMS as u32 + 1), h(MAX_HOST_STREAMS as u32 + 2)]);
     }
-
-    // ---- flow-controlled `Open` (flowing channels) and host-opened `Open` ----
 
     /// A daemon-side hook accepting host `Open`s on `RPC` only, handing out
     /// one end of a socket pair; the other end goes to `peers`.

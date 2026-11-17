@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 use crate::serve::api::ApiError;
 use crate::serve::fleet::update::Behind;
 
-/// One inbound neighbor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Neighbor {
     pub name: String,

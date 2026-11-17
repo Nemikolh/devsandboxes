@@ -304,7 +304,6 @@ mod tests {
         if !until(|| w.is_live()) {
             return Err("docker events did not start");
         }
-        // The subscribe's wake.
         rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "no wake on subscribe")?;
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-evtest-{stamp}");

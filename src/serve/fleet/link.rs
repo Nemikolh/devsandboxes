@@ -140,7 +140,6 @@ impl<'a> Serves<'a> {
         self.with(channel::TRANSFER, move || receivers.accept())
     }
 
-    /// The caps this end advertises.
     fn caps(&self) -> u32 {
         self.table.iter().filter_map(|(c, _)| cap_of(*c)).fold(0, |all, cap| all | cap)
     }
@@ -245,7 +244,6 @@ enum Ending {
     Dead,
     /// Writing to the peer failed: it's gone too, seen from the other side.
     Write,
-    /// A listener failed.
     Accept(io::Error),
 }
 

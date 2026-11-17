@@ -236,7 +236,6 @@ mod tests {
         let started = Instant::now();
         wait_changed(generation(), Duration::from_millis(200));
         assert!(started.elapsed() < Duration::from_secs(2));
-        // An already-passed generation returns at once.
         let started = Instant::now();
         assert!(wait_changed(seen, Duration::from_secs(10)) > seen);
         assert!(started.elapsed() < Duration::from_millis(100));
@@ -330,7 +329,6 @@ mod tests {
         assert_eq!(out, crate::inbox::PutOutcome::Unchanged);
         assert_eq!(stamp_at(&path).unwrap(), before, "no write, no mtime bump");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-        // A real change does write.
         let changed = ThreadPut { status: Some("merged".into()), ..put() };
         update_at(&path, |i| i.put("web-id", "web", 99, changed)).unwrap();
         assert_ne!(stamp_at(&path).unwrap(), before);

@@ -1196,7 +1196,6 @@ struct Ensured<'a> {
     note: Option<String>,
 }
 
-/// The `stop` answer.
 #[derive(Serialize)]
 struct Stopped<'a> {
     name: &'a str,
@@ -1204,7 +1203,6 @@ struct Stopped<'a> {
     state: ChildState,
 }
 
-/// The `rm` answer.
 #[derive(Serialize)]
 struct Removed<'a> {
     name: &'a str,
@@ -1228,7 +1226,6 @@ enum ChildState {
     Missing,
 }
 
-/// One `ls` entry.
 #[derive(Debug, Serialize)]
 struct ChildRow<'a> {
     name: &'a str,
@@ -1630,7 +1627,6 @@ fn log_path(op: &str) -> Option<PathBuf> {
     Some(dir.join(format!("dispatch-{}-{op}.log", Instance::now())))
 }
 
-/// The last `n` non-empty lines of `text`.
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
@@ -1740,7 +1736,6 @@ folder = "."
         inbox: Option<PathBuf>,
         /// `wait_bridge` calls, by child name.
         bridge_waits: Vec<String>,
-        /// What `wait_bridge` answers.
         bridge_note: Option<String>,
         /// RPC methods the children's helpers offer (none: the exec path).
         rpc: BTreeSet<String>,
@@ -1748,7 +1743,6 @@ folder = "."
         rpc_reply: Vec<Record>,
         /// `helper_call` calls, `(container, method, params)`.
         rpc_calls: Vec<(String, String, Obj)>,
-        /// What `host_agent` answers.
         agent: bool,
     }
 
@@ -2000,7 +1994,6 @@ folder = "."
         assert_eq!(resp, ensured("web", "two", false, true));
         assert_eq!(fake.calls, vec![argv(&["rebuild", "web-two"])]);
 
-        // A failing subprocess is Failed with its message.
         let mut fake = Fake { fail: true, ..Fake::new() };
         let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
         assert_eq!(resp, Response::new(Status::Failed, "boom"));
@@ -2221,7 +2214,6 @@ folder = "."
             (run_req(Op::RunWait, "one"), vec![bin, "run", "wait", RUN_ID], "exited 4\n", "exited 4"),
             (Request { timeout: Some(5), ..run_req(Op::RunWait, "one") },
              vec![bin, "run", "wait", RUN_ID, "--timeout", "5"], "running\n", "running"),
-            // Capped.
             (Request { timeout: Some(99_999), ..run_req(Op::RunWait, "one") },
              vec![bin, "run", "wait", RUN_ID, "--timeout", "300"], "running\n", "running"),
             (run_req(Op::RunRm, "one"), vec![bin, "run", "rm", RUN_ID], "", ""),
@@ -2624,7 +2616,6 @@ folder = "."
         assert_eq!(resp, answered(Op::Done, "web-one", "one"));
         assert!(fake.dones.is_empty());
 
-        // A failed write is reported.
         let mut fake = Fake { fail: true, ..Fake::new() };
         let resp = call(&state(), "d", &req(Op::Done, None, Some("one")), &mut fake);
         assert_eq!(resp, Response::new(Status::Failed, "boom"));
@@ -2647,7 +2638,6 @@ folder = "."
         assert_eq!(resp, ensured("web", "two", false, true));
         assert_eq!(fake.dones, vec![("web-two".to_string(), None)]);
         assert_eq!(fake.calls, vec![argv(&["start", "web-two"])]);
-        // Not done: no write.
         let mut fake = Fake::new();
         call(&state(), "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
         assert!(fake.dones.is_empty());
@@ -2696,7 +2686,6 @@ folder = "."
             ])
         );
         assert!(fake.calls.is_empty());
-        // No children: an empty array.
         let resp = call(&s, "a", &req(Op::Ls, None, None), &mut Fake::default());
         let rows: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1, "only `web-other`");
@@ -2947,7 +2936,6 @@ folder = "."
         assert!(!resp.body.contains("client") && !resp.body.contains("some-gui"), "{}", resp.body);
         assert!(control::valid_event_id(got[0]["id"].as_str().unwrap()));
         assert_eq!(got[1]["text"], "second", "oldest first");
-        // Survives the response encoding.
         let wire = control::decode_response(&control::encode_response(&resp)).unwrap();
         assert_eq!(wire, resp);
 
@@ -3060,12 +3048,10 @@ folder = "."
     fn events_wait_wakes_on_an_enqueue_and_times_out_empty() {
         let s = state();
         let (path, mut fake) = inbox_fake("wait");
-        // Nothing pending: an empty body once the timeout passes.
         let started = Instant::now();
         let resp = call(&s, "d", &Request { timeout: Some(1), ..Request::new(Op::Events) }, &mut fake);
         assert_eq!(resp, Response::new(Status::Ok, ""));
         assert!(started.elapsed() >= Duration::from_secs(1));
-        // No timeout: at once.
         let started = Instant::now();
         assert_eq!(call(&s, "d", &Request::new(Op::Events), &mut fake).body, "");
         assert!(started.elapsed() < Duration::from_millis(500));
@@ -3277,10 +3263,8 @@ folder = "."
         let resp = call(&s, "d", &Request { feed: true, ..Request::new(Op::ThreadLs) }, &mut fake);
         let got: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(got[0]["messages"][2]["id"], "header-message", "{}", resp.body);
-        // Another owner's thread with no messages lists an empty array.
         let other = call(&s, "a", &Request { feed: true, ..Request::new(Op::ThreadLs) }, &mut fake);
         assert!(other.body.contains("\"messages\":[]"), "{}", other.body);
-        // Only `thread-ls` takes `feed`.
         let resp = call(&s, "d", &Request { feed: true, ..Request::new(Op::Events) }, &mut fake);
         assert_eq!((resp.status, resp.body.as_str()), (Status::Usage, "`events` takes no `feed`"));
     }

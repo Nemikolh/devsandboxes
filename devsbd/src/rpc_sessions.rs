@@ -142,7 +142,6 @@ fn start(ctx: &Ctx, id: &str, c: &Create) -> io::Result<Option<Child>> {
     })
 }
 
-/// The attach's last record.
 fn end_record(id: &str, end: End) -> Record {
     let code = match end {
         End::Exit(n) => return Record::Exit(Exit::Code(n)),

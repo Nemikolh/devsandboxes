@@ -120,7 +120,6 @@ pub fn check(m: &Membership, from: &str, change: &Change) -> Result<Op, String> 
     }
 }
 
-/// One pending proposal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {

@@ -58,11 +58,9 @@ pub(crate) fn check() -> Result<()> {
 /// Why [`cancel_instance`] signalled nothing.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NotCancelled {
-    /// No such instance in the state.
     Unknown,
     /// Not in flight (ready, failed, or its pid is gone): nothing to cancel.
     Done,
-    /// The signal itself failed.
     Signal(String),
 }
 
@@ -112,7 +110,6 @@ mod imp {
 
     use libc::c_int;
 
-    /// The signals that cancel.
     const CANCEL: [c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 
     /// One flag per signal number, so the handler can be exercised on a

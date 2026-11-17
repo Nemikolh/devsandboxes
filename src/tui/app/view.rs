@@ -363,7 +363,6 @@ impl ConfirmModal {
         }
     }
 
-    /// One of the identity modals.
     pub fn is_identity(&self) -> bool {
         matches!(self.action, Confirmed::Identity { .. } | Confirmed::IdentityOffer(_))
     }
@@ -380,7 +379,6 @@ pub(super) enum Confirmed {
     /// The verb `action`, held for its sandbox's un-acked identity notes
     /// `ids` (config at `route`).
     Identity { route: Route, ids: Vec<String>, action: PromptAction },
-    /// The offer's findings.
     IdentityOffer(Vec<Group>),
     /// The profile picker for `instance` (a key): its sandbox's allowed
     /// `profiles`, its `current` one, the `cursor` over them.
@@ -1201,7 +1199,6 @@ mod tests {
         open_modal(&mut app);
         assert_eq!(view(&app).showing, Side::Original);
 
-        // `t` toggles the config side; `tab` no longer touches it.
         app.on_key(key(KeyCode::Char('t')));
         assert_eq!(view(&app).showing, Side::Resolved);
         app.on_key(key(KeyCode::Char('t')));
@@ -1209,7 +1206,6 @@ mod tests {
         app.on_key(key(KeyCode::Tab));
         assert_eq!(view(&app).showing, Side::Original);
 
-        // esc closes; so does q.
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.modal, Modal::None));
 
@@ -1225,7 +1221,6 @@ mod tests {
         // Switch to the 10-line resolved body.
         app.on_key(key(KeyCode::Char('t')));
 
-        // Up at the top stays at 0.
         app.on_key(key(KeyCode::Up));
         assert_eq!(view(&app).scroll, 0);
 
@@ -1236,7 +1231,6 @@ mod tests {
         app.on_key(key(KeyCode::Char('G')));
         assert_eq!(view(&app).scroll, 9);
 
-        // PageDown past the end clamps, not overflows.
         app.on_key(key(KeyCode::PageDown));
         assert_eq!(view(&app).scroll, 9);
 
@@ -1260,12 +1254,10 @@ mod tests {
         app.on_key(key(KeyCode::Char('?')));
         assert!(matches!(app.modal, Modal::Help(_)));
 
-        // The help modal swallows dashboard keys.
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.tab, Tab::Instances);
         assert!(matches!(app.modal, Modal::Help(_)));
 
-        // `?` toggles it closed; so would esc/q.
         app.on_key(key(KeyCode::Char('?')));
         assert!(matches!(app.modal, Modal::None));
 
@@ -1295,7 +1287,6 @@ mod tests {
         assert!(!app.settings.copy_on_select, "on by default");
         assert_eq!(app.take_settings_save(), Some(app.settings));
         assert_eq!(app.take_settings_save(), None, "once per change");
-        // tab / S-tab move the cursor (wrapping); enter toggles too.
         app.on_key(key(KeyCode::Tab));
         assert_eq!(help(&app).cursor, 1);
         app.on_key(key(KeyCode::Enter));
@@ -1349,7 +1340,6 @@ mod tests {
             app.on_mouse(&press(col, row), FRAME);
             assert_eq!(app.take_settings_save(), None, "({col}, {row})");
         }
-        // Not without the modal.
         app.on_key(key(KeyCode::Esc));
         app.on_mouse(&press(5, 1), FRAME);
         assert_eq!(app.settings, Settings { copy_on_select: true, terminal_clipboard: false });
@@ -1360,17 +1350,16 @@ mod tests {
         // A 10-line body scrolls and clamps identically to the config modal.
         let mut m = TextModal::new("t".into(), (0..10).map(|i| format!("l{i}\n")).collect());
         assert_eq!(m.scroll, 0);
-        assert!(m.on_scroll_key(key(KeyCode::Up))); // stays at 0
+        assert!(m.on_scroll_key(key(KeyCode::Up)));
         assert_eq!(m.scroll, 0);
         assert!(m.on_scroll_key(key(KeyCode::Down)));
         assert_eq!(m.scroll, 1);
         assert!(m.on_scroll_key(key(KeyCode::Char('G'))));
         assert_eq!(m.scroll, 9);
-        assert!(m.on_scroll_key(key(KeyCode::PageDown))); // clamps, no overflow
+        assert!(m.on_scroll_key(key(KeyCode::PageDown)));
         assert_eq!(m.scroll, 9);
         assert!(m.on_scroll_key(key(KeyCode::Char('g'))));
         assert_eq!(m.scroll, 0);
-        // A non-scroll key is not consumed.
         assert!(!m.on_scroll_key(key(KeyCode::Char('x'))));
     }
 
@@ -1387,7 +1376,6 @@ mod tests {
         // queues the daemon read.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
-        // Cursor starts on the sandbox node; move down to the instance.
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('l')));
         assert!(logs(&app).title.contains("devsandbox-inst0"));
@@ -1412,7 +1400,6 @@ mod tests {
         app.open_logs_for("devsandbox-b");
         app.set_logs("devsandbox-a", "late".into());
         assert_eq!(logs(&app).body, "(loading…)");
-        // Closed: dropped, nothing opens.
         app.on_key(key(KeyCode::Esc));
         app.set_logs("devsandbox-b", "late".into());
         assert!(matches!(app.modal, Modal::None));
@@ -1428,7 +1415,7 @@ mod tests {
         let mut snap = snapshot_with(1);
         snap.instances[0].status = ContainerStatus::Running("Up".into());
         app.set_snapshot(snap);
-        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('e')));
         assert_eq!((view(&app).original.as_str(), view(&app).resolved.as_str()), ("(loading…)", "(loading…)"));
         assert_eq!((view(&app).inspect.as_str(), view(&app).inspect_container.as_str()), ("(loading…)", "devsandbox-inst0"));
@@ -1454,7 +1441,6 @@ mod tests {
         // An error fills both sides.
         app.set_config(ConfigKind::Sandbox, &sandbox, Err("config: needs devsandbox serve".into()));
         assert_eq!((view(&app).original.as_str(), view(&app).resolved.as_str()), ("config: needs devsandbox serve", "config: needs devsandbox serve"));
-        // Closed: dropped.
         app.on_key(key(KeyCode::Esc));
         app.set_config(ConfigKind::Sandbox, &sandbox, Ok(text("late")));
         app.set_inspect("devsandbox-inst0", "late".into());
@@ -1466,7 +1452,7 @@ mod tests {
         // A sandbox with no running instance: no inspect read, the placeholder.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // inst0 not running
-        app.on_key(key(KeyCode::Char('e'))); // the sandbox row
+        app.on_key(key(KeyCode::Char('e')));
         assert_eq!(view(&app).inspect, "(no running instance)");
         assert_eq!(view(&app).kind, ConfigKind::Sandbox);
         let fetches = app.take_pending_fetch();
@@ -1545,7 +1531,7 @@ mod tests {
         app.set_snapshot(recorded(Some(in_flight("building"))));
         app.on_key(key(KeyCode::Char('b'))); // the sandbox row: nothing
         assert!(matches!(app.modal, Modal::None));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(build_log(&app).text.title, " build log — inst0 (building) ");
         assert_eq!(app.take_build_log_read(), Some("id0".into()));
@@ -1557,7 +1543,7 @@ mod tests {
         assert_eq!(build_log(&app).text.body, "l0\nl1\nl2");
         app.on_key(key(KeyCode::Char('q')));
         assert!(matches!(app.modal, Modal::None));
-        app.set_build_log("id0", tail(0..1)); // closed: dropped
+        app.set_build_log("id0", tail(0..1));
         assert!(matches!(app.modal, Modal::None));
     }
 
@@ -1726,7 +1712,6 @@ mod tests {
         // The window keeps sliding: still the same line.
         app.set_build_log("id0", cut_tail(53..553));
         assert_eq!(shown(&app), "l100");
-        // An unchanged read moves nothing.
         app.set_build_log("id0", cut_tail(53..553));
         assert_eq!(shown(&app), "l100");
         // Its line dropped off: the note on top.
@@ -1740,7 +1725,6 @@ mod tests {
         let fresh = (0..500).map(|i| format!("m{i}")).collect::<Vec<_>>().join("\n");
         app.set_build_log("id0", Ok(Some(Tail { text: fresh, cut: true })));
         assert_eq!(build_log(&app).top(), top);
-        // Following the bottom, it just follows.
         app.on_key(key(KeyCode::Char('G')));
         app.set_build_log("id0", cut_tail(140..640));
         assert!(build_log(&app).stick);
@@ -1895,7 +1879,6 @@ mod tests {
         assert_eq!(view(&app).focus, Pane::Inspect);
         app.on_key(key(KeyCode::Tab));
         assert_eq!(view(&app).focus, Pane::Config);
-        // `t` still toggles the side, never the focus.
         app.on_key(key(KeyCode::Char('t')));
         assert_eq!(view(&app).focus, Pane::Config);
     }
@@ -1926,19 +1909,16 @@ mod tests {
         let mut app = new_app();
         open_modal(&mut app);
         assert_eq!(view(&app).split_pct, 50);
-        // `<` shrinks by 5, `>` grows by 5.
         app.on_key(key(KeyCode::Char('<')));
         assert_eq!(view(&app).split_pct, 45);
         app.on_key(key(KeyCode::Char('>')));
         app.on_key(key(KeyCode::Char('>')));
         assert_eq!(view(&app).split_pct, 55);
 
-        // Clamp at the lower bound.
         for _ in 0..20 {
             app.on_key(key(KeyCode::Char('<')));
         }
         assert_eq!(view(&app).split_pct, SPLIT_MIN);
-        // Clamp at the upper bound.
         for _ in 0..40 {
             app.on_key(key(KeyCode::Char('>')));
         }
@@ -1954,7 +1934,6 @@ mod tests {
         assert_eq!(divider_pct(100, 100), SPLIT_MAX);
         assert_eq!(divider_pct(5, 100), SPLIT_MIN);
         assert_eq!(divider_pct(95, 100), SPLIT_MAX);
-        // Zero width never panics.
         assert_eq!(divider_pct(10, 0), SPLIT_MIN);
     }
 
@@ -1995,7 +1974,6 @@ mod tests {
         // Wheel down right of it scrolls inspect by 3.
         app.on_mouse(&mouse(MouseEventKind::ScrollDown, 90), MODAL_AREA);
         assert_eq!(view(&app).inspect_scroll, 3);
-        // Wheel up clamps at 0.
         app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), MODAL_AREA);
         app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), MODAL_AREA);
         assert_eq!(view(&app).scroll, 0);
@@ -2046,9 +2024,7 @@ mod tests {
             inspect_target(&rows, Target::Sandbox("s")),
             Some("devsandbox-b".into()),
         );
-        // Sandbox with no running instance → None.
         assert_eq!(inspect_target(&rows, Target::Sandbox("t")), None);
-        // Unknown instance index → None.
         assert_eq!(inspect_target(&rows, Target::Instance(9)), None);
     }
 
@@ -2068,7 +2044,6 @@ mod tests {
         ];
         assert_eq!(service_inspect_target(&none_running), Some("svc-1".into()));
 
-        // Empty → None.
         assert_eq!(service_inspect_target(&[]), None);
     }
 }

@@ -1377,7 +1377,6 @@ build = { dockerfile = "dockerfiles/db/Dockerfile" }
         for kept in [".leader", "shared-volumes/state/db", "dispatcher/dispatch.log"] {
             assert!(tree.join(kept).is_file(), "{kept} stays");
         }
-        // Again: nothing to remove.
         assert_eq!(install(&data, "cfg", &v2.tar().unwrap(), &v2.hash()).unwrap().removed, Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&base);
     }

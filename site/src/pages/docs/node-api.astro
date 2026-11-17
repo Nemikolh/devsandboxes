@@ -82,7 +82,7 @@ const usage = markdownFence(readme, 'Node API', 'ts');
 const commonNote = markdownParagraph(readme, 'Every function takes');
 const platformsNote = markdownParagraph(readme, 'The binary comes from');
 
-// ---- Highlighted snippets (Shiki is async, the template isn't).
+// Highlighted snippets (Shiki is async, the template isn't).
 
 // Two layouts per signature: phones get one parameter per line much sooner.
 const sigHtml = new Map<Signature, { wide: string; narrow?: string }>();
@@ -114,7 +114,7 @@ const errorExample = `try {
   console.error(e.args, e.exitCode, e.stderr);
 }`;
 
-// ---- TOC, plus the build-time guarantees: unique anchors, nothing dropped.
+// TOC, plus the build-time guarantees: unique anchors, nothing dropped.
 
 const headings: MarkdownHeading[] = [];
 const h = (depth: 2 | 3, slug: string, text: string) => headings.push({ depth, slug, text });

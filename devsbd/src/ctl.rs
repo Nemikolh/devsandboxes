@@ -507,7 +507,6 @@ mod tests {
                 ..Request::new(Op::Ensure)
             }
         );
-        // Flags before the positional work too.
         assert_eq!(parse("ensure", &["--key=k", "web"]).unwrap(), req(Op::Ensure, Some("web"), Some("k")));
         assert_eq!(parse("ls", &[]).unwrap(), req(Op::Ls, None, None));
         assert_eq!(parse("stop", &["pr-1"]).unwrap(), req(Op::Stop, None, Some("pr-1")));
@@ -719,7 +718,6 @@ mod tests {
         }
         assert_eq!(parse("rm", &["k", "--sandbox="]).unwrap_err(), "--sandbox needs a value");
         assert!(parse("run", &[]).unwrap_err().contains("unknown command"));
-        // Run verbs.
         assert!(parse("exec", &["k"]).unwrap_err().contains("missing `-- <cmd>"));
         assert!(parse("exec", &["k", "--"]).unwrap_err().contains("missing"));
         assert!(parse("exec", &["--", "true"]).unwrap_err().contains("exactly one <key>"));
@@ -743,7 +741,6 @@ mod tests {
         assert_eq!(parse("run-prune", &["k", "--keep"]).unwrap_err(), "--keep needs a value");
         assert_eq!(parse("run-prune", &["k", "--keep", "1", "--keep=2"]).unwrap_err(), "--keep given twice");
         assert_eq!(parse("stop", &["k", "--force"]).unwrap_err(), "unknown option `--force`");
-        // Branches.
         assert_eq!(parse("branches", &[]).unwrap_err(), "takes exactly one <sandbox>");
         assert_eq!(parse("branches", &["a", "b"]).unwrap_err(), "takes exactly one <sandbox>");
         assert_eq!(parse("branches", &["web", "--ahead=1"]).unwrap_err(), "--ahead takes no value");

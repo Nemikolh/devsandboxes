@@ -204,7 +204,6 @@ impl App {
     /// application-cursor mode and kitty keyboard flags) and written to the PTY.
     pub(super) fn on_key_terminal(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // Leave keys: back to the dashboard.
         if matches!(key.code, KeyCode::Char(']') if ctrl) || key.code == KeyCode::F(12) {
             self.focus = Focus::Dashboard;
             return;
@@ -792,7 +791,6 @@ mod tests {
         app.terms.open(term_sess("web-1", "devsandbox-web-1"));
         assert_eq!(app.focus, Focus::Dashboard);
         let panel = crate::tui::ui::terminal_panel_rect(FRAME, false);
-        // A click in the panel body (below the title row) focuses the terminal.
         let click = mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             panel.x + 2,
@@ -864,7 +862,6 @@ mod tests {
     #[test]
     fn mouse_in_panel_ignored_when_no_terminal() {
         let mut app = new_app();
-        // No terminals: a click never changes focus.
         let click = mouse_at(MouseEventKind::Down(MouseButton::Left), 50, 30);
         app.on_mouse(&click, FRAME);
         assert_eq!(app.focus, Focus::Dashboard);
@@ -896,19 +893,16 @@ mod tests {
                 .scrollback()
         }
         assert_eq!(offset(&app), 0);
-        // Wheel up over the body scrolls back by 3 lines.
         app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, body.0, body.1), FRAME);
         assert_eq!(offset(&app), 3);
         app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, body.0, body.1), FRAME);
         assert_eq!(offset(&app), 6);
-        // Wheel down walks it back toward the live screen, saturating at 0.
         app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, body.0, body.1), FRAME);
         assert_eq!(offset(&app), 3);
         for _ in 0..5 {
             app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, body.0, body.1), FRAME);
         }
         assert_eq!(offset(&app), 0);
-        // The wheel outside the panel body is ignored (offset stays 0).
         app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, 0, 0), FRAME);
         assert_eq!(offset(&app), 0);
     }
@@ -1122,7 +1116,6 @@ mod tests {
         app.terms.active_session().unwrap().feed_output(b"\x1b[?1049h\x1b[>1u");
         app.on_key(ctrl_m);
         assert_eq!(written(&app), b"\x1b[109;5u");
-        // Plain text is unaffected.
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert_eq!(written(&app), b"a");
     }
@@ -1135,7 +1128,6 @@ mod tests {
         // Tab must not switch the top-level tab while a terminal is focused.
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, before);
-        // `q` forwards to the shell rather than quitting.
         app.on_key(key(KeyCode::Char('q')));
         assert!(!app.should_quit);
         assert_eq!(app.focus, Focus::Terminal);
@@ -1156,7 +1148,6 @@ mod tests {
     #[test]
     fn enter_terminal_needs_a_terminal() {
         let mut app = new_app();
-        // No terminals: ctrl-] and F12 stay on the dashboard with a hint.
         app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
         assert_eq!(app.focus, Focus::Dashboard);
         assert_eq!(app.status.as_deref(), Some("no terminal open — press t"));
@@ -1164,7 +1155,6 @@ mod tests {
         assert_eq!(app.focus, Focus::Dashboard);
         assert_eq!(app.status.as_deref(), Some("no terminal open — press t"));
 
-        // With one open (but unfocused), ctrl-] focuses it.
         app.terms
             .open(TermSession::test_session("web-1", "devsandbox-web-1", 24, 80));
         app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
@@ -1178,12 +1168,10 @@ mod tests {
             .open(TermSession::test_session("a", "devsandbox-a", 24, 80));
         app.terms
             .open(TermSession::test_session("b", "devsandbox-b", 24, 80)); // active = 1
-        // `]` wraps to 0, `[` wraps back to 1.
         app.on_key(key(KeyCode::Char(']')));
         assert_eq!(app.terms.active(), 0);
         app.on_key(key(KeyCode::Char('[')));
         assert_eq!(app.terms.active(), 1);
-        // `x` closes the active one.
         app.on_key(key(KeyCode::Char('x')));
         assert_eq!(app.terms.sessions().len(), 1);
         assert_eq!(app.terms.active_session().unwrap().title, "a");
@@ -1200,7 +1188,6 @@ mod tests {
         app.on_key(key(KeyCode::Char('a')));
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.focus, Focus::Terminal);
-        // Leave keys still work on an exited session.
         app.on_key(key(KeyCode::F(12)));
         assert_eq!(app.focus, Focus::Dashboard);
     }
@@ -1237,14 +1224,12 @@ mod tests {
     #[test]
     fn term_target_instance_requires_running() {
         let mut app = new_app();
-        // Not running → Err with the instance name.
         app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         assert_eq!(
             app.term_target(),
             Err("terminal: `inst0` is not running".into())
         );
-        // Running → the instance target.
         app.set_snapshot(snapshot_with_status(1, running()));
         app.on_key(key(KeyCode::Down));
         assert_eq!(
@@ -1257,7 +1242,6 @@ mod tests {
     fn term_target_service_picks_first_running() {
         let mut app = new_app();
         app.tab = Tab::Services;
-        // No running container → Err.
         app.set_snapshot(service_snapshot(vec![(
             "devsandbox-svc-web-1".into(),
             ContainerStatus::Exited("Exited (0)".into()),
@@ -1288,7 +1272,7 @@ mod tests {
         for kind in [crate::serve::machines::MachineKind::Ssh, crate::serve::machines::MachineKind::Inbound] {
             let mut app = machine_app();
             app.machines[0].kind = kind;
-            app.selected[Tab::Instances.index()] = 5; // box/inst1
+            app.selected[Tab::Instances.index()] = 5;
             let target = app.term_target();
             assert_eq!(target, Ok(("box/inst1".into(), "box/devsandbox-inst1".into(), true)));
             assert_eq!(app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID), Err("terminal: the devsandbox executable isn't known yet".into()));
@@ -1483,7 +1467,7 @@ mod tests {
     fn a_queues_a_sessions_fetch_for_a_running_instance_row() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
-        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(app.take_pending_fetch(), []);
         assert_eq!(app.status.as_deref(), Some("attach: `inst0` is not running"));
@@ -1497,7 +1481,7 @@ mod tests {
         assert_eq!(app.take_pending_fetch(), []);
 
         let mut app = machine_app();
-        app.selected[Tab::Instances.index()] = 5; // box/inst1
+        app.selected[Tab::Instances.index()] = 5;
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(app.take_pending_fetch(), [Fetch::Sessions { instance: "box/inst1".into() }]);
         app.machines[0].state = crate::serve::snapshots::LinkState::Unreachable;

@@ -161,7 +161,6 @@ mod tests {
                 },
             ]
         );
-        // An empty value is a fine row.
         assert!(parse(&with_blocks(r#"{"type":"fields","items":[{"label":"Base","value":""}]}"#)).is_ok());
     }
 
@@ -195,14 +194,12 @@ mod tests {
         assert_eq!(err(&with_blocks(&nine)), "9 blocks, at most 8 allowed");
         let eight = vec![r#"{"type":"markdown","text":"x"}"#; 8].join(",");
         assert!(parse(&with_blocks(&eight)).is_ok());
-        // Markdown.
         assert_eq!(err(&with_blocks(r#"{"type":"markdown","text":"  "}"#)), "block 1: empty markdown");
         let long = format!(r#"{{"type":"markdown","text":"{}"}}"#, "x".repeat(MAX_MARKDOWN + 1));
         assert!(err(&with_blocks(&long)).contains("longer than 16384 bytes"));
         let fits = format!(r#"{{"type":"markdown","text":"{}"}}"#, "x".repeat(MAX_MARKDOWN));
         assert!(parse(&with_blocks(&fits)).is_ok());
         assert!(err(&with_blocks(r#"{"type":"markdown","text":"a\u001bb"}"#)).contains("control character"));
-        // Fields.
         let field = |label: &str, value: &str| format!(r#"{{"label":"{label}","value":"{value}"}}"#);
         let fields = |items: &[String]| with_blocks(&format!(r#"{{"type":"fields","items":[{}]}}"#, items.join(",")));
         assert_eq!(err(&fields(&[])), "block 1: fields block has no items");
@@ -218,7 +215,6 @@ mod tests {
         let form = r#"{"type":"form","id":"f","questions":[{"id":"q","label":"Q","type":"confirm"}]}"#;
         assert!(parse(&with_blocks(&format!(r#"{{"type":"markdown","text":"x"}},{form}"#))).is_ok());
         assert_eq!(err(&with_blocks(&[form, form].join(","))), "more than one form block; one form per message");
-        // The whole body's budget.
         let pad = "x".repeat(MAX_SEND_BODY);
         assert!(err(&format!(r#"{{"thread":"t","id":"m","blocks":[],"p":"{pad}"}}"#)).contains("longer than 49152"));
     }

@@ -79,7 +79,6 @@ function init(tour: HTMLElement) {
 
   show(0);
 
-  // ---- Narrow: zoom the pinned widget to the column and a share of the viewport.
   function fit() {
     if (wide) {
       root!.style.removeProperty('zoom');
@@ -92,7 +91,7 @@ function init(tour: HTMLElement) {
     tour.style.setProperty('--tour-stage-h', `${Math.ceil(stage!.getBoundingClientRect().height)}px`);
   }
 
-  // ---- The activation band, rebuilt when the viewport or the pinned stage changes size.
+  // The activation band, rebuilt when the viewport or the pinned stage changes size.
   let observer: IntersectionObserver | undefined;
   const crossing = new Map<Element, boolean>();
   function observe() {

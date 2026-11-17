@@ -527,7 +527,6 @@ mod tests {
             app.take_pending_port(),
             Some(PortRequest { instance: "api".into(), spec: "3000".into(), ..Default::default() })
         );
-        // Submitting a forward switches to the Ports tab with a status line.
         assert_eq!(app.tab, Tab::Ports);
         assert_eq!(app.status.as_deref(), Some("forwarding 3000 …"));
     }
@@ -816,7 +815,6 @@ mod tests {
             app.on_key(key(KeyCode::Char(c)));
         }
         app.on_key(key(KeyCode::Enter));
-        // Parse error keeps the prompt open, sets no request, and stays put.
         assert!(app.prompt.is_some());
         assert!(prompt(&app).error.is_some());
         assert_eq!(app.take_pending_port(), None);
@@ -827,12 +825,10 @@ mod tests {
     fn port_completion_service_and_instance() {
         let instances = vec!["api".to_string()];
         let services = vec!["pg".to_string(), "redis".to_string()];
-        // First positional completes instances.
         assert_eq!(
             App::candidates_for(Tab::Instances, 1, &toks("port"), &[], &instances, &services, &no_branches(), &BTreeMap::new()),
             instances
         );
-        // `--service` value completes service names, on any tab.
         assert_eq!(
             App::candidates_for(
                 Tab::Instances,
@@ -851,7 +847,7 @@ mod tests {
     fn p_on_instance_prefills_port_prompt() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('p')));
         let p = prompt(&app);
         assert_eq!(p.input(), "port inst0 ");
@@ -894,7 +890,6 @@ mod tests {
         app.on_key(key(KeyCode::Char('r')));
         let p = prompt(&app);
         assert_eq!(p.input(), "run s ");
-        // Cursor at the end (6 chars).
         assert_eq!(p.cursor(), "run s ".chars().count());
     }
 
@@ -902,7 +897,7 @@ mod tests {
     fn r_on_empty_marker_prefills_run() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(0)); // [Sandbox(0), Empty(0)]
-        app.on_key(key(KeyCode::Down)); // onto Empty(0)
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected_node(), Some(Node::Empty(0)));
         app.on_key(key(KeyCode::Char('r')));
         assert_eq!(prompt(&app).input(), "run s ");
@@ -912,7 +907,7 @@ mod tests {
     fn r_on_instance_prefills_rename() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
         app.on_key(key(KeyCode::Char('r')));
         assert_eq!(prompt(&app).input(), "rename inst0 ");
@@ -999,7 +994,6 @@ mod tests {
             App::candidates_for(Tab::Instances, 1, &toks("run"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             sandboxes
         );
-        // Sandbox not on the line yet (only a flag pair) → still sandbox names.
         assert_eq!(
             App::candidates_for(Tab::Instances, 3, &toks("run --name x"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             sandboxes
@@ -1009,17 +1003,14 @@ mod tests {
     #[test]
     fn run_candidates_flags_after_sandbox() {
         let sandboxes = vec!["web".to_string()];
-        // Empty token after the sandbox → the flags.
         assert_eq!(
             App::candidates_for(Tab::Instances, 2, &toks("run web"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--name".to_string(), "--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
-        // A `--` stem too (the prompt then filters by the stem).
         assert_eq!(
             App::candidates_for(Tab::Instances, 2, &toks("run web --"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--name".to_string(), "--branch".to_string(), "--base".to_string(), "--place".to_string()]
         );
-        // A flag already used is not offered again.
         assert_eq!(
             App::candidates_for(Tab::Instances, 4, &toks("run web --name x"), &sandboxes, &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--branch".to_string(), "--base".to_string(), "--place".to_string()]
@@ -1032,17 +1023,14 @@ mod tests {
         let rows = [sandbox_row("api", None), sandbox_row("web", Some("wt/${instance}"))];
         let sandboxes: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
         let branches = App::worktree_branches(&rows);
-        // Sandbox with `worktree-branch` → its pattern as the editable base.
         assert_eq!(
             App::candidates_for(Tab::Instances, 3, &toks("run web --branch"), &sandboxes, &[], &[], &branches, &BTreeMap::new()),
             vec!["wt/${instance}".to_string()]
         );
-        // Without one → the built-in default pattern.
         assert_eq!(
             App::candidates_for(Tab::Instances, 3, &toks("run api --branch"), &sandboxes, &[], &[], &branches, &BTreeMap::new()),
             vec![DEFAULT_WORKTREE_BRANCH.to_string()]
         );
-        // `--name` values are free-form: no candidates.
         assert!(App::candidates_for(Tab::Instances, 3, &toks("run web --name"), &sandboxes, &[], &[], &branches, &BTreeMap::new())
             .is_empty());
     }
@@ -1111,7 +1099,6 @@ mod tests {
     fn rebuild_completes_service_names_on_services_tab() {
         let instances = vec!["a".to_string(), "b".to_string()];
         let services = vec!["cache".to_string(), "db".to_string()];
-        // Services tab: `rebuild`/`recreate` offer service names, not instances.
         assert_eq!(
             App::candidates_for(
                 Tab::Services,
@@ -1140,7 +1127,6 @@ mod tests {
 
     #[test]
     fn rebuild_offers_force_flag() {
-        // `--` stem before or after the positional → the spec's flags.
         assert_eq!(
             App::candidates_for(Tab::Instances, 1, &toks("rebuild --"), &[], &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--force".to_string()]
@@ -1149,7 +1135,6 @@ mod tests {
             App::candidates_for(Tab::Instances, 2, &toks("rebuild box --"), &[], &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--force".to_string()]
         );
-        // Positional filled, empty stem → unused flags too.
         assert_eq!(
             App::candidates_for(Tab::Instances, 2, &toks("rebuild box"), &[], &[], &[], &no_branches(), &BTreeMap::new()),
             vec!["--force".to_string()]
@@ -1174,7 +1159,6 @@ mod tests {
     fn rebuild_completes_instances_after_force() {
         let instances = vec!["a".to_string(), "b".to_string()];
         let services = vec!["cache".to_string()];
-        // Boolean flag before the positional: still the positional's names.
         assert_eq!(
             App::candidates_for(
                 Tab::Instances,
@@ -1187,7 +1171,6 @@ mod tests {
             ),
             instances
         );
-        // Services tab: same walk, service names.
         assert_eq!(
             App::candidates_for(
                 Tab::Services,
@@ -1205,7 +1188,6 @@ mod tests {
     #[test]
     fn exec_argv_offers_nothing() {
         let instances = vec!["box".to_string()];
-        // Positional consumed → the rest of the line is verbatim argv.
         assert!(App::candidates_for(Tab::Instances, 2, &toks("exec box"), &[], &instances, &[], &no_branches(), &BTreeMap::new())
             .is_empty());
         assert!(

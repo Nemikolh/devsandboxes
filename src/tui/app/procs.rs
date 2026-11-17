@@ -267,7 +267,7 @@ mod tests {
     fn proc_fetch_only_on_instances_tab() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_status(1, running()));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         assert_eq!(app.proc_fetch_targets().len(), 1);
         app.set_tab(Tab::Ports);
         assert!(app.proc_fetch_targets().is_empty());
@@ -380,8 +380,8 @@ mod tests {
         app.expanded_procs.insert("inst0".into());
         app.procs
             .insert("inst0".into(), ProcState::Message("(not running)".into()));
-        app.on_key(key(KeyCode::Down)); // inst0
-        app.on_key(key(KeyCode::Down)); // message row
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
         assert!(matches!(app.selected_node(), Some(Node::Proc { .. })));
         app.on_key(key(KeyCode::Char('t')));
         assert!(app.take_pending_signal().is_none());
@@ -392,10 +392,9 @@ mod tests {
         let app = app_on_proc_row(&["10"]);
         assert!(app.on_proc_row());
         assert!(app.proc_row_signalable());
-        // Instance row: not a proc.
         let mut app2 = new_app();
         app2.set_snapshot(snapshot_with_status(1, running()));
-        app2.on_key(key(KeyCode::Down)); // inst0
+        app2.on_key(key(KeyCode::Down));
         assert!(!app2.on_proc_row());
     }
 
@@ -415,8 +414,8 @@ mod tests {
                 sessions: None,
             },
         );
-        app.on_key(key(KeyCode::Down)); // inst0
-        app.on_key(key(KeyCode::Down)); // proc row
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
         assert!(app.on_proc_row());
         // Help bar drops the signal keys, and the keys are inert.
         assert!(!app.proc_row_signalable());
@@ -531,7 +530,6 @@ mod tests {
         app.on_key(key(KeyCode::Char('K')));
         assert_eq!(app.take_pending_session_rm().unwrap().instance, "box/inst1");
 
-        // A run row isn't a session.
         let mut app = app_on_proc_row(&[crate::tui::procs::RUN_PID]);
         assert!(!app.on_session_row());
         app.on_key(key(KeyCode::Char('K')));
@@ -542,7 +540,6 @@ mod tests {
     fn agent_count_counts_agent_rows_in_cache() {
         use crate::tui::procs::{ProcRow, ProcState};
         let mut app = new_app();
-        // Nothing cached → unknown.
         assert_eq!(app.agent_count("x"), None);
 
         let rows = vec![

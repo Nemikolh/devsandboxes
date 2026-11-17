@@ -34,7 +34,6 @@ impl Tracker {
         }
     }
 
-    /// The in-flight `progress` for the current phase.
     pub(crate) fn progress(&self) -> Progress {
         Progress { phase: self.phase.clone(), pid: std::process::id(), boot: self.boot.clone(), error: None }
     }

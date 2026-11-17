@@ -227,11 +227,9 @@ impl Prompt {
         }
         let chars: Vec<char> = self.input.chars().collect();
         let mut start = self.cursor;
-        // Skip trailing spaces just left of the cursor.
         while start > 0 && chars[start - 1].is_whitespace() {
             start -= 1;
         }
-        // Then the word itself.
         while start > 0 && !chars[start - 1].is_whitespace() {
             start -= 1;
         }
@@ -295,7 +293,6 @@ impl Prompt {
     where
         F: Fn(usize, &[String]) -> Vec<String>,
     {
-        // Repeated tab: advance within the existing cycle.
         if let Some(comp) = &mut self.completion {
             if comp.candidates.len() > 1 {
                 comp.cycle = (comp.cycle + 1) % comp.candidates.len();
@@ -366,7 +363,6 @@ impl Prompt {
             }
             idx += 1;
         }
-        // Cursor past the last token (on trailing space) → new empty token.
         (idx, self.cursor, self.cursor)
     }
 
@@ -579,7 +575,6 @@ mod tests {
         pr.left();
         pr.left();
         pr.left();
-        // Cursor after "foo": delete the word before it.
         pr.delete_word();
         assert_eq!(pr.input(), "run bar");
     }
@@ -601,13 +596,13 @@ mod tests {
         let mut pr = p("r");
         pr.complete(cands); // "r" matches rebuild, rename, rm, run → first sorted ("rebuild")
         assert_eq!(pr.input(), "rebuild");
-        pr.complete(cands); // cycle to next
+        pr.complete(cands);
         assert_eq!(pr.input(), "rename");
-        pr.complete(cands); // then rm
+        pr.complete(cands);
         assert_eq!(pr.input(), "rm");
-        pr.complete(cands); // then run
+        pr.complete(cands);
         assert_eq!(pr.input(), "run");
-        pr.complete(cands); // wraps back
+        pr.complete(cands);
         assert_eq!(pr.input(), "rebuild");
     }
 
@@ -618,7 +613,6 @@ mod tests {
         assert_eq!(pr.input(), "run bacon");
         pr.complete(cands);
         assert_eq!(pr.input(), "run beta");
-        // Typing resets the cycle.
         pr.insert_char('x');
         assert_eq!(pr.input(), "run betax");
         assert!(pr.candidates().is_empty());
@@ -802,11 +796,9 @@ mod tests {
                 spec: "8080:3000".into(),
             })
         );
-        // An instance is required; the port spec is required.
         assert!(parse_line("port").is_err());
         assert!(parse_line("port api").is_err());
         assert!(parse_line("port api --service").is_err());
-        // Bad spec shape is a parse error, surfaced inline.
         assert!(parse_line("port api 0").is_err());
         assert!(parse_line("port api abc").is_err());
         assert!(parse_line("port api 8080:0").is_err());
@@ -824,7 +816,6 @@ mod tests {
         let mut pr = p("exec box");
         assert!(pr.parse().is_none());
         assert!(pr.error.is_some());
-        // A successful parse clears it.
         let mut ok = p("rm box");
         assert!(ok.parse().is_some());
         assert!(ok.error.is_none());
@@ -832,18 +823,15 @@ mod tests {
 
     #[test]
     fn history_dedup_and_cap() {
-        // Consecutive duplicate is rejected.
         let h = vec!["a".to_string()];
         assert_eq!(push_capped(h, "a"), None);
 
-        // Non-consecutive duplicate is kept (only consecutive dedup).
         let h = vec!["a".to_string(), "b".to_string()];
         assert_eq!(
             push_capped(h, "a"),
             Some(vec!["a".into(), "b".into(), "a".into()])
         );
 
-        // Cap trims the oldest entries.
         let full: Vec<String> = (0..HISTORY_CAP).map(|i| i.to_string()).collect();
         let out = push_capped(full, "new").unwrap();
         assert_eq!(out.len(), HISTORY_CAP);
@@ -861,11 +849,11 @@ mod tests {
         assert_eq!(pr.input(), "rm b");
         pr.history_prev();
         assert_eq!(pr.input(), "run a");
-        pr.history_prev(); // clamps at oldest
+        pr.history_prev();
         assert_eq!(pr.input(), "run a");
         pr.history_next();
         assert_eq!(pr.input(), "rm b");
-        pr.history_next(); // back to the stashed live line
+        pr.history_next();
         assert_eq!(pr.input(), "draft");
     }
 }

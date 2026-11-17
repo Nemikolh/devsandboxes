@@ -127,10 +127,8 @@ mod tests {
         assert!(!accepted(&docker("attach", "devsandbox-web")));
         assert!(!accepted(&docker("top", "devsandbox-web")));
         assert!(!accepted(&podman("cleanup", "devsandbox-web")));
-        // Not ours.
         assert!(!accepted(&docker("start", "postgres")));
         assert!(!accepted(&podman("start", "my-devsandbox-x")));
-        // Not an event.
         assert_eq!(parse(""), None);
         assert_eq!(parse("   "), None);
         assert_eq!(parse("not json"), None);

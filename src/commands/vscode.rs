@@ -121,7 +121,6 @@ pub enum GotoOutcome {
     NotReady,
     /// No helper recorded for the instance: nothing to exec.
     NoHelper,
-    /// Anything else, with a one-line reason.
     Failed(String),
 }
 
@@ -286,7 +285,6 @@ mod tests {
         assert_eq!(Goto::parse("x.rs"), Ok(goto("x.rs", None, None)));
         assert_eq!(Goto::parse("x.rs:3"), Ok(goto("x.rs", Some(3), None)));
         assert_eq!(Goto::parse("x.rs:3:4"), Ok(goto("x.rs", Some(3), Some(4))));
-        // A `:` in the path survives.
         assert_eq!(Goto::parse("a:b.rs:3"), Ok(goto("a:b.rs", Some(3), None)));
         assert_eq!(Goto::parse("a:b.rs"), Ok(goto("a:b.rs", None, None)));
         // Normalized: `.` and empty components dropped.
@@ -364,7 +362,6 @@ mod tests {
 
     #[test]
     fn hex_encodes_container_name() {
-        // Lowercase hex of the UTF-8 bytes, matching the attach URI format.
         assert_eq!(hex_encode("devsandbox-web"), "64657673616e64626f782d776562");
         assert_eq!(hex_encode(""), "");
         assert_eq!(hex_encode("A/z"), "412f7a");

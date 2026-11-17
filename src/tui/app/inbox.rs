@@ -1268,7 +1268,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('v')));
         assert_eq!(app.inbox.view, View::All, "`v` no longer switches views");
         // Into a view without it: the top row.
-        app.on_key(key(KeyCode::Left)); // Done: one row
+        app.on_key(key(KeyCode::Left));
         assert_eq!(app.selected(), 0);
         assert_eq!(selected(&app).as_deref(), Some("over"));
         // Still visible in the next view: the cursor follows it.
@@ -1288,7 +1288,7 @@ mod tests {
         app.on_key(key(KeyCode::Right));
         app.on_key(key(KeyCode::Right));
         // Done's only row, "over", is followed into All.
-        app.on_key(key(KeyCode::Right)); // All
+        app.on_key(key(KeyCode::Right));
         assert_eq!(selected(&app).as_deref(), Some("over"));
         assert_eq!(app.selected(), 2);
 
@@ -1338,7 +1338,7 @@ mod tests {
         mixed(&mut app);
         inbox_tab(&mut app);
         assert_eq!(app.inbox.focus, InboxFocus::List);
-        app.on_key(key(KeyCode::Down)); // "asks"
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
         assert_eq!(selected(&app).as_deref(), Some("asks"));
@@ -1348,8 +1348,8 @@ mod tests {
         assert_eq!(app.tab, Tab::Inbox);
 
         // Nothing selected: enter stays in the list.
-        app.on_key(key(KeyCode::Right)); // Active
-        app.on_key(key(KeyCode::Right)); // Done
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Right));
         let mut inbox = app.inbox.content.clone();
         inbox.apply(&Op::RemoveThread(thread(&app, "over").id), 0, "tui");
         app.set_inbox(inbox);
@@ -1414,7 +1414,6 @@ mod tests {
         assert!(app.status.as_deref().unwrap().contains("Post replies"), "{:?}", app.status);
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.take_pending_open().as_deref(), Some("https://x/pr/1"));
-        // Quit still works.
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
     }
@@ -1516,7 +1515,6 @@ mod tests {
         let mut app = new_app();
         push(&mut app, "a", rec("one", None, None));
         put(&mut app, "d", 10, body("asks", State::NeedsYou));
-        // Not shown yet: nothing read.
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.take_pending_inbox(), []);
         inbox_tab(&mut app);
@@ -1529,7 +1527,7 @@ mod tests {
         // From a view that doesn't list notify records, nothing is read.
         push(&mut app, "a", rec("two", None, None));
         inbox_tab(&mut app);
-        app.on_key(key(KeyCode::Right)); // Active: empty
+        app.on_key(key(KeyCode::Right));
         app.take_pending_inbox();
         app.on_key(key(KeyCode::Char('1')));
         assert_eq!(app.take_pending_inbox(), []);
@@ -1591,7 +1589,7 @@ mod tests {
         put(&mut app, "d", 10, body("asks", State::NeedsYou));
         put(&mut app, "d", 20, body("other", State::NeedsYou));
         inbox_tab(&mut app);
-        app.on_key(key(KeyCode::Down)); // "asks"
+        app.on_key(key(KeyCode::Down));
         app.take_pending_inbox();
         // `o` aims at the thread's owner, not an Instances row: none here.
         app.on_key(key(KeyCode::Char('o')));
@@ -1834,7 +1832,6 @@ mod tests {
             format!("{s10}  d  (edited)"),
             "two".into(),
         ], "{text:#?}");
-        // Markers are dim; the message is a markdown document.
         assert_eq!(lines[15], [(Tone::Markdown, "two".to_string())]);
         assert_eq!(lines[11], [(Tone::Dim, format!("{s20}  · done"))]);
 
@@ -1977,7 +1974,6 @@ mod tests {
         let mut app = new_app();
         open_asks(&mut app, Some(Compose::default()));
         app.on_key(key(KeyCode::Char('r')));
-        // Empty (or blank) enter: nothing sent, the box stays.
         typed(&mut app, "  ");
         app.on_key(key(KeyCode::Enter));
         assert!(app.inbox.reply.is_some());
@@ -2021,7 +2017,6 @@ mod tests {
         app.on_key(key(KeyCode::Up));
         assert_eq!(selected(&app).as_deref(), Some("other"));
         assert!(app.inbox.raw);
-        // In the input, `m` is text.
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('r')));
         app.on_key(key(KeyCode::Char('m')));
@@ -2112,7 +2107,7 @@ mod tests {
         mixed(&mut app);
         inbox_tab(&mut app);
         for _ in 0..3 {
-            app.on_key(key(KeyCode::Right)); // All
+            app.on_key(key(KeyCode::Right));
         }
         // In All, select "over"; Done lists it too, at another row.
         let pos = rows(&app).iter().position(|r| r == "over").unwrap();
@@ -2120,12 +2115,12 @@ mod tests {
         app.selected[Tab::Inbox.index()] = pos;
         app.sync_inbox_selection();
         app.inbox.set_list_offset(3);
-        app.on_key(key(KeyCode::Left)); // Done
+        app.on_key(key(KeyCode::Left));
         assert_eq!(app.inbox.view, View::Done);
         assert_eq!((app.selected(), selected(&app).as_deref()), (0, Some("over")), "kept by id");
         assert_eq!(app.inbox.list_offset(), 3, "offset left to the renderer");
-        app.on_key(key(KeyCode::Left)); // Active
-        app.on_key(key(KeyCode::Left)); // Needs you
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
 
         // A second Active thread, so "top" differs from the old row number.
         put(&mut app, "d", 15, body("busy2", State::Active));
@@ -2185,7 +2180,6 @@ mod tests {
     #[test]
     fn inbox_mouse_only_on_the_inbox_tab_unobstructed() {
         let mut app = new_app();
-        // Another tab: the same press does nothing.
         app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 40, ROW), FRAME);
         app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 60, ROW), FRAME);
         assert_eq!(app.inbox.split_pct, 40);
@@ -2276,7 +2270,6 @@ mod tests {
         click(&mut app, 60, 10);
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
         assert!(app.inbox.reply.is_none());
-        // The list, on a card.
         click(&mut app, 10, 3);
         assert_eq!(app.inbox.focus, InboxFocus::List);
     }
@@ -2304,9 +2297,9 @@ mod tests {
         click(&mut app, 16, 1);
         assert_eq!(app.inbox.view, View::Active);
         assert_eq!(selected(&app).as_deref(), Some("busy"));
-        click(&mut app, 35, 1); // ›
+        click(&mut app, 35, 1);
         assert_eq!(app.inbox.view, View::Done);
-        click(&mut app, 2, 1); // ‹
+        click(&mut app, 2, 1);
         assert_eq!(app.inbox.view, View::Active);
         click(&mut app, 32, 1);
         assert_eq!(app.inbox.view, View::All);

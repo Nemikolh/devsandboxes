@@ -182,7 +182,6 @@ mod tests {
         assert_eq!(out.stderr, b"oops");
         assert_eq!(out.status.code(), Some(3));
         assert!(!out.truncated);
-        // Exactly the cap is not truncated.
         let out = run(&mut sh("printf 12345678"), 8, Duration::from_secs(10)).unwrap();
         assert_eq!((out.stdout.as_slice(), out.truncated), (&b"12345678"[..], false));
     }

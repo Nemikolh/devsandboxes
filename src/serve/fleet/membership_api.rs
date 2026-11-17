@@ -42,7 +42,6 @@ pub struct KeyInfo {
 pub struct IntroInfo {
     pub name: String,
     pub introducer: String,
-    /// The introduced key's fingerprint.
     pub fingerprint: String,
 }
 
@@ -309,7 +308,6 @@ pub fn load(member_toml: &Path) -> Result<Option<Stored>, ApiError> {
 /// What a store on the adopt path did ([`adopt`], [`sync`]).
 #[derive(Debug)]
 pub struct Taken {
-    /// What's stored now.
     pub stored: Stored,
     /// The control plane written from it, for the daemon to follow.
     pub control_plane: ControlPlane,
@@ -499,11 +497,9 @@ mod tests {
     #[test]
     fn the_authority_adds_a_member_introduces_a_capped_one_refuses() {
         let s = three();
-        // The authority: an `add` entry.
         assert_eq!(can_sign(&s, &own("lap", 1), "new", &pk(5)), Ok(Signs::Add));
         let added = sign_into(&s, &own("lap", 1), &key(1), "new", &pk(5)).unwrap();
         assert_eq!(added.log.membership().unwrap().key_of("new"), Some(pk(5)));
-        // Another member: an introduction by it.
         assert_eq!(can_sign(&s, &own("pi", 3), "new", &pk(5)), Ok(Signs::Introduction));
         let introduced = sign_into(&s, &own("pi", 3), &key(3), "new", &pk(5)).unwrap();
         assert_eq!(introduced.log, s.log);

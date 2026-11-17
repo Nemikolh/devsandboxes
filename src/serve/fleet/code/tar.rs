@@ -439,7 +439,6 @@ mod tests {
         let err = format!("{:#}", extract(&w.finish(), &dir.join("through")).unwrap_err());
         assert!(err.contains("isn't a directory"), "{err}");
         assert!(!dir.join("through/d/f").exists());
-        // A duplicate file: refused.
         let mut w = Writer::default();
         w.file("f", false, b"1").unwrap();
         w.file("f", false, b"2").unwrap();

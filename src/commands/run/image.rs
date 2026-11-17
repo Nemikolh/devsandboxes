@@ -197,7 +197,6 @@ fn base_image_for(dir: &Path, project: &str, sandbox: &ResolvedSandbox) -> Resul
     Ok(tag)
 }
 
-// ------------------------------------------------------------------------
 // Derived-image build from devcontainer `features`.
 //
 // The impure orchestration (`build_features_image`) fetches + orders the
@@ -206,7 +205,6 @@ fn base_image_for(dir: &Path, project: &str, sandbox: &ResolvedSandbox) -> Resul
 // pure functions (below) so they're unit-testable without docker or network.
 // The layout mirrors the official devcontainers CLI
 // (`containerFeaturesConfiguration.ts`, `containerFeatures.ts`).
-// ------------------------------------------------------------------------
 
 /// A feature ready to be baked in: its build-context directory name, its id,
 /// metadata, and the resolved option map (defaults merged under user values).
@@ -228,8 +226,6 @@ fn build_features_image(
 ) -> Result<String> {
     let props = &sandbox.properties;
 
-    // Resolve each config entry to a fetched feature + its option map, skipping
-    // features explicitly disabled with `= false`.
     let mut resolved = Vec::new();
     let mut options_by_key: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for (reference, opts) in features {
@@ -245,7 +241,7 @@ fn build_features_image(
         resolved.push(feature);
     }
     if resolved.is_empty() {
-        return Ok(base.to_string()); // all features disabled.
+        return Ok(base.to_string());
     }
 
     let ordered = features::install_order(resolved)?;
@@ -253,7 +249,6 @@ fn build_features_image(
     let container_user = props.container_user.as_deref().unwrap_or("root");
     let remote_user = props.remote_user.as_deref().unwrap_or(container_user);
 
-    // Fresh build context.
     let context = features::build_context_dir(project, &sandbox.name)?;
     std::fs::write(
         context.join("devcontainer-features.builtin.env"),
@@ -261,9 +256,6 @@ fn build_features_image(
     )
     .with_context(|| format!("cannot write builtin env in {}", context.display()))?;
 
-    // Per feature: copy its dir (cache or local folder, as-is) in under
-    // `<idx>-<id>`, write the env-file and install wrapper, and collect what
-    // the Dockerfile generator needs.
     let mut builds = Vec::with_capacity(ordered.len());
     for (idx, feature) in ordered.iter().enumerate() {
         let key = feature.key();
@@ -443,8 +435,7 @@ fn escape_dq(value: &str) -> String {
 /// The `devcontainer-features.env` body: one `NAME="value"` per option, names via
 /// [`safe_id`], values = metadata defaults overridden by user-provided values.
 fn feature_env_file(metadata: &FeatureMetadata, values: &BTreeMap<String, String>) -> String {
-    // Start from metadata defaults, override with user values. BTreeMap keeps a
-    // stable (alphabetical) order.
+    // BTreeMap keeps a stable (alphabetical) order.
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
     for (name, option) in &metadata.options {
         if let Some(default) = &option.default {
@@ -532,7 +523,6 @@ fn generate_dockerfile(
     out.push_str("USER root\n");
     out.push_str("RUN mkdir -p /tmp/dev-container-features\n");
     out.push_str("COPY devcontainer-features.builtin.env /tmp/dev-container-features/\n");
-    // Append the user home dirs to the builtin env, resolved in-container.
     out.push_str(&format!(
         "RUN echo \"_CONTAINER_USER_HOME=$(getent passwd {cu} | cut -d: -f6)\" \
 >> /tmp/dev-container-features/devcontainer-features.builtin.env && \
@@ -632,15 +622,11 @@ mod tests {
 
     #[test]
     fn safe_id_maps_like_get_safe_id() {
-        // Dashes and dots become underscores; uppercased.
         assert_eq!(safe_id("install-jq"), "INSTALL_JQ");
         assert_eq!(safe_id("version"), "VERSION");
-        // A leading digit run collapses to a single underscore.
         assert_eq!(safe_id("2fa"), "_FA");
         assert_eq!(safe_id("123abc"), "_ABC");
-        // Leading underscores/digits collapse together to one underscore.
         assert_eq!(safe_id("_1_x"), "_X");
-        // Already-safe names just uppercase.
         assert_eq!(safe_id("NODE_gyp"), "NODE_GYP");
     }
 
@@ -662,7 +648,6 @@ mod tests {
             feature_option_values(&FeatureOptions::Enabled(true)).unwrap(),
             Some(BTreeMap::new())
         );
-        // Disabled => skip the feature entirely.
         assert_eq!(feature_option_values(&FeatureOptions::Enabled(false)).unwrap(), None);
 
         let table = BTreeMap::from([
@@ -717,14 +702,10 @@ mod tests {
         let env_file = "VERSION=\"1.22\"";
         let w = install_wrapper(&m, "ghcr.io/x/y", env_file);
         assert!(w.starts_with("#!/bin/sh\nset -e\n"), "{w}");
-        // Single-quote escaping in the banner name.
         assert!(w.contains("echo 'Feature       : O'\\''Brien'\\''s Feature'"), "{w}");
         assert!(w.contains("echo 'Id            : ghcr.io/x/y'"), "{w}");
-        // Options echoed, indented.
         assert!(w.contains("echo '    VERSION=\"1.22\"'"), "{w}");
-        // set -a sourcing block, in order.
         assert!(w.contains("set -a\n. ../devcontainer-features.builtin.env\n. ./devcontainer-features.env\nset +a"), "{w}");
-        // Runs install.sh at the end.
         assert!(w.trim_end().ends_with("chmod +x ./install.sh\n./install.sh"), "{w}");
     }
 
@@ -812,16 +793,13 @@ ENTRYPOINT [\"/bin/sh\",\"/usr/local/share/devsandbox-entrypoint.sh\",\"/usr/bin
             df.contains("COPY devcontainer-features.builtin.env /tmp/dev-container-features/\n"),
             "{df}"
         );
-        // Home probe uses getent for both users (root here).
         assert!(
             df.contains("_CONTAINER_USER_HOME=$(getent passwd root | cut -d: -f6)")
                 && df.contains("_REMOTE_USER_HOME=$(getent passwd root | cut -d: -f6)"),
             "{df}"
         );
-        // ENV: $ preserved, " and \ escaped.
         assert!(df.contains("ENV PATH=\"/usr/local/go/bin:${PATH}\"\n"), "{df}");
         assert!(df.contains("ENV QUOTED=\"a\\\"b\\\\c\"\n"), "{df}");
-        // Per-feature COPY + RUN.
         assert!(df.contains("COPY 0-go /tmp/dev-container-features/0-go\n"), "{df}");
         assert!(
             df.contains(
@@ -832,7 +810,6 @@ chmod +x ./devcontainer-features-install.sh && \
             ),
             "{df}"
         );
-        // No containerUser => stays root, no trailing USER line.
         assert!(!df.contains("\nUSER root\nUSER"), "{df}");
         assert_eq!(df.matches("USER ").count(), 1, "only the initial USER root: {df}");
     }
@@ -841,9 +818,7 @@ chmod +x ./devcontainer-features-install.sh && \
     fn dockerfile_restores_container_user_when_set() {
         let features = vec![fb("0-common-utils", &[])];
         let df = generate_dockerfile("debian:bookworm", &features, Some("vscode"), "vscode");
-        // Final USER line restores the configured container user.
         assert!(df.trim_end().ends_with("USER vscode"), "{df}");
-        // Home probe uses the configured users.
         assert!(df.contains("_CONTAINER_USER_HOME=$(getent passwd vscode | cut -d: -f6)"), "{df}");
         assert!(df.contains("_REMOTE_USER_HOME=$(getent passwd vscode | cut -d: -f6)"), "{df}");
     }
@@ -887,7 +862,6 @@ chmod +x ./devcontainer-features-install.sh && \
         )
         .unwrap();
 
-        // Env-file: user overrides myopt to "chosen".
         let values = BTreeMap::from([("myopt".to_string(), "chosen".to_string())]);
         let env_file = feature_env_file(&m, &values);
         std::fs::write(feat_dir.join("devcontainer-features.env"), &env_file).unwrap();

@@ -231,7 +231,6 @@ mod tests {
             assert!(identity_modal(&app).is_none());
         }
         let mut app = app_with(vec![note("a", true), note("b", false)]);
-        // Not a build verb: no modal.
         app.pending_action = Some(PromptAction::Stop { instance: "inst0".into() });
         assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst0".into() }));
         for action in [
@@ -281,7 +280,6 @@ mod tests {
             assert_eq!(app.take_pending_identity(), None);
             assert_eq!(app.take_pending_action(), Some(start()), "{code:?}");
         }
-        // Other keys leave it up.
         let mut app = app_with(vec![note("b", false)]);
         app.pending_action = Some(start());
         app.take_pending_action();
@@ -294,7 +292,7 @@ mod tests {
     #[test]
     fn a_conflict_sends_nothing_and_clears_the_guard() {
         let mut app = app_with(vec![note("b", false)]);
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.starting.contains("inst0"));
         assert_eq!(app.take_pending_action(), None);

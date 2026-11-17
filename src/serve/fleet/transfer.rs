@@ -69,7 +69,6 @@ pub struct Header {
     pub kind: String,
     /// The body's file name for the receiver (no `/`, not `.` or `..`).
     pub name: String,
-    /// The body's length in bytes.
     pub size: u64,
     /// The body's sha256, lowercase hex.
     pub sha256: String,
@@ -1095,7 +1094,6 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(5), "bounded");
         assert!(err.contains("cannot read the transfer body"), "{err}");
         server.join().unwrap();
-        // No answer at all.
         let (a, _b) = bounded_pair(std::time::Duration::from_millis(200));
         let err = format!("{:#}", pull(a, "pull", "b", 100, &dir.join("got")).unwrap_err());
         assert!(err.contains("no answer to the pull"), "{err}");

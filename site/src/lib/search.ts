@@ -66,7 +66,7 @@ export function isApplePlatform(platform: string): boolean {
   return /mac|iphone|ipad|ipod/i.test(platform);
 }
 
-// ---- Pagefind (the slice of its result shape we use; it ships no client types)
+// Pagefind (the slice of its result shape we use; it ships no client types)
 
 export interface PagefindLocation {
   weight: number;

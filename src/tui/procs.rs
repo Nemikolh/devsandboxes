@@ -93,7 +93,6 @@ pub fn build_forest(rows: Vec<(String, String, String)>) -> Vec<ProcRow> {
 
     let pids: BTreeSet<&str> = rows.iter().map(|(pid, _, _)| pid.as_str()).collect();
 
-    // Children indexed by ppid, in input order; args indexed by pid.
     let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut args: HashMap<&str, &str> = HashMap::new();
     for (pid, ppid, arg) in &rows {
@@ -101,7 +100,6 @@ pub fn build_forest(rows: Vec<(String, String, String)>) -> Vec<ProcRow> {
         children.entry(ppid.as_str()).or_default().push(pid.as_str());
     }
 
-    // Sort each child list by numeric pid where possible, else lexically.
     for list in children.values_mut() {
         list.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
             (Ok(x), Ok(y)) => x.cmp(&y),
@@ -109,7 +107,6 @@ pub fn build_forest(rows: Vec<(String, String, String)>) -> Vec<ProcRow> {
         });
     }
 
-    // Roots: procs whose ppid isn't a known pid, in numeric-then-string order.
     let mut roots: Vec<&str> = rows
         .iter()
         .filter(|(_, ppid, _)| !pids.contains(ppid.as_str()))

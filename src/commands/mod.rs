@@ -392,7 +392,6 @@ mod tests {
 
     #[test]
     fn matches_unique_sandbox_name() {
-        // A sandbox name owned by exactly one instance resolves to it.
         let mut s = State::default();
         s.instances.insert(
             "api-cccc".into(),
@@ -433,7 +432,6 @@ mod tests {
 
     #[test]
     fn matches_folder_basename() {
-        // Unique folder basename resolves to the single owning instance.
         let s = state();
         assert_eq!(resolve_instance(&s, "site").unwrap(), "web-aaaa");
     }

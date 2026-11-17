@@ -836,7 +836,6 @@ pub(crate) mod tests {
         let mut c = machine("c", &["/c"], LinkState::Unreachable);
         c.error = Some("c: Permission denied".into());
         c.command = Some("~/bin/devsandbox".into());
-        // An inbound machine: no target.
         let w = Machine { kind: MachineKind::Inbound, target: None, ..machine("w", &[], LinkState::Idle) };
 
         let merged = merge(&local, &[a, b, c, w], None, &Default::default(), &Default::default());
@@ -1140,7 +1139,6 @@ pub(crate) mod tests {
         let three: BTreeSet<PathBuf> = [a.clone(), c.clone()].into();
         assert!(cache.stats_due(&three, first.at + Duration::from_secs(2)));
         assert_eq!(cache.uncached(&three), [c.clone()].into());
-        // Unwatched roots leave the cache.
         cache.prune(&three);
         cache.collect(&view(Depth::Listing), &three, &join);
         assert!(cache.cached(&b).is_none());

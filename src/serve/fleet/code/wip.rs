@@ -30,7 +30,6 @@ pub struct Snapshot {
     pub wip: String,
 }
 
-/// The message of every snapshot commit.
 pub const WIP_MESSAGE: &str = "devsandbox wip";
 
 /// Snapshot `checkout`'s working tree onto `wip_ref` (`refs/devsandbox/…`,

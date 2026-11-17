@@ -78,8 +78,6 @@ fn state() -> Option<State> {
     State::load().ok()
 }
 
-// ---- reads ----------------------------------------------------------------
-
 pub fn ls(view: &str, json: bool) -> Result<()> {
     let view = View::parse(view).ok_or_else(|| anyhow!("unknown view `{view}`"))?;
     let rows = wire::summaries(&ops::load(&store_path()?)?, view);
@@ -350,8 +348,6 @@ fn value_text(v: &Value) -> String {
         other => other.to_string(),
     }
 }
-
-// ---- mutations ------------------------------------------------------------
 
 /// A user op on a thread: one API method, one `wire::decide_*`.
 #[derive(Debug, Clone, PartialEq)]
@@ -656,7 +652,6 @@ mod tests {
         let again = apply_local(&path, id, &Mutation::Submit { message: "run-1".into(), answers: Default::default() }).unwrap();
         assert_eq!(again.unwrap_err().code, "closed-form");
         assert_eq!(apply_local(&path, id, &Mutation::Reply(String::new())).unwrap().unwrap_err().code, "invalid");
-        // The feed records the CLI as the client.
         assert!(ops::load(&path).unwrap().to_json().unwrap().contains("\"cli\""));
     }
 

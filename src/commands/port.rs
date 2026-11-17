@@ -858,8 +858,6 @@ image = "node"
         keys.iter().map(|s| s.to_string()).collect()
     }
 
-    // ---- instance forward (no service) ----
-
     #[test]
     fn instance_forward_running_yields_instance() {
         let plans =
@@ -889,8 +887,6 @@ image = "node"
         assert_eq!(err, "no instance or service named");
     }
 
-    // ---- unknown service ----
-
     #[test]
     fn unknown_service_surfaces_config_error() {
         let err =
@@ -898,8 +894,6 @@ image = "node"
                 .unwrap_err();
         assert!(err.contains("unknown service `nope`"), "{err}");
     }
-
-    // ---- isolated service ----
 
     #[test]
     fn isolated_needs_a_named_instance() {
@@ -988,8 +982,6 @@ image = "node"
         assert_eq!(c("nope", "db").unwrap_err(), "no sandbox instance `nope`");
     }
 
-    // ---- global service ----
-
     #[test]
     fn global_named_running_referencing_instance_wins() {
         let plans =
@@ -1046,7 +1038,6 @@ image = "node"
 
     #[test]
     fn global_no_running_referencer_yields_only_inject() {
-        // Nothing running references cache: inject is the sole candidate.
         let plans = plan(&config(), &state(), &running(&["plain-1"]), PROJECT, None, Some("cache")).unwrap();
         assert_eq!(
             plans,
@@ -1077,8 +1068,6 @@ image = "node"
         );
     }
 
-    // ---- split_target ----
-
     #[test]
     fn split_target_moves_a_leading_port_to_ports_only_with_service() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -1090,8 +1079,6 @@ image = "node"
         // Without --service a numeric name is left alone (the port guard reports it).
         assert_eq!(split_target(Some("3000".into()), false, vec![]), (Some("3000".into()), vec![]));
     }
-
-    // ---- parse_port_spec ----
 
     #[test]
     fn parse_port_spec_table() {
@@ -1107,15 +1094,15 @@ image = "node"
         }
 
         let err: &[&str] = &[
-            "",           // empty
-            "0",          // zero container/host port
-            "8080:0",     // zero container port
-            "0:3000",     // zero host port
-            "abc",        // non-numeric
-            "8080:abc",   // non-numeric container
-            "8080:3000:1", // extra colon
-            ":3000",      // empty host part
-            "8080:",      // empty container part
+            "",
+            "0",
+            "8080:0",
+            "0:3000",
+            "abc",
+            "8080:abc",
+            "8080:3000:1",
+            ":3000",
+            "8080:",
             "70000",      // out of u16 range
         ];
         for spec in err {
@@ -1123,13 +1110,10 @@ image = "node"
         }
     }
 
-    // ---- state_change_line ----
-
     #[test]
     fn state_change_line_transitions() {
         use crate::devsbd::forward::ForwardState::*;
 
-        // No change → nothing.
         assert_eq!(state_change_line(&Active, &Active, 3000), None);
         assert_eq!(state_change_line(&Connecting, &Connecting, 3000), None);
 
@@ -1148,11 +1132,8 @@ image = "node"
         );
     }
 
-    // ---- parse_lsof_f / format_procs ----
-
     #[test]
     fn parse_lsof_f_table() {
-        // Empty output → no processes.
         assert_eq!(parse_lsof_f(""), Vec::<(u32, String)>::new());
 
         // One process, with an interleaved (ignored) fd/address field line.
@@ -1161,7 +1142,6 @@ image = "node"
             vec![(412, "node".to_string())]
         );
 
-        // Multiple distinct processes.
         assert_eq!(
             parse_lsof_f("p1\ncnginx\np2\ncredis\n"),
             vec![(1, "nginx".to_string()), (2, "redis".to_string())]
@@ -1187,8 +1167,6 @@ image = "node"
         );
     }
 
-    // ---- process_reprint_line ----
-
     #[cfg(unix)]
     #[test]
     fn process_reprint_line_only_on_new_some() {
@@ -1210,12 +1188,10 @@ image = "node"
             process_reprint_line(&None, &status(Some("node (pid 412)")), hp),
             Some("127.0.0.1:3000 -> api:3000 [node (pid 412)]".to_string())
         );
-        // Unchanged Some → nothing.
         assert_eq!(
             process_reprint_line(&Some("node (pid 412)".into()), &status(Some("node (pid 412)")), hp),
             None
         );
-        // New pid → re-print.
         assert_eq!(
             process_reprint_line(&Some("node (pid 412)".into()), &status(Some("node (pid 999)")), hp),
             Some("127.0.0.1:3000 -> api:3000 [node (pid 999)]".to_string())
@@ -1223,8 +1199,6 @@ image = "node"
         // Back to None → nothing (don't print when it disappears).
         assert_eq!(process_reprint_line(&Some("node (pid 412)".into()), &status(None), hp), None);
     }
-
-    // ---- docker-gated: listening_procs ----
 
 
     /// Docker-gated: a container with `lsof` running a loopback listener yields

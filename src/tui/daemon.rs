@@ -1282,7 +1282,6 @@ mod tests {
                 json!({"dir": "/cfg", "instance": "web", "service": null, "address": null, "spec": "8080:3000"})
             )
         );
-        // No instance typed: a service-only forward.
         assert_eq!(add_call(dir, &port_req("", Some("db"))).1["instance"], Value::Null);
         // A machine's: its root there as `dir`, and the machine.
         assert_eq!(

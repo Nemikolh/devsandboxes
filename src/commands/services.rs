@@ -1064,7 +1064,6 @@ ports = ["5432:5432"]
         assert!(joined.contains("-e POSTGRES_PASSWORD=x"));
         assert!(joined.contains("-p 5432:5432"));
         assert!(joined.contains("--label devsandbox.scope=isolated"));
-        // Image is the final positional argument.
         assert_eq!(args.last().unwrap(), "postgres:16");
     }
 

@@ -103,10 +103,8 @@ mod tests {
         assert!(!on_path("docker", Some(OsStr::new("/nonexistent"))));
         assert!(!on_path("docker", Some(OsStr::new(""))));
         assert!(!on_path("docker", None));
-        // A path is checked as is.
         assert!(on_path(docker.to_str().unwrap(), None));
         assert!(!on_path("/nonexistent/docker", Some(&path)));
-        // A dir of that name isn't one.
         std::fs::create_dir_all(other.join("container")).unwrap();
         assert!(!on_path("container", Some(&path)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -119,7 +117,6 @@ mod tests {
         assert!(!cache.get(t0, || false));
         let never = || -> bool { panic!("asked within the ttl") };
         assert!(!cache.get(t0 + INSTALL_TTL - Duration::from_millis(1), never));
-        // Installed meanwhile: seen at the next check.
         assert!(cache.get(t0 + INSTALL_TTL, || true));
         assert!(cache.get(t0 + INSTALL_TTL + Duration::from_secs(1), never));
     }

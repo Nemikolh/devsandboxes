@@ -112,8 +112,6 @@ pub fn strip(mut params: Value) -> Value {
     params
 }
 
-// ---- federated calls --------------------------------------------------------
-
 /// `calls` (machine, method, params) in parallel, each on its machine's
 /// link: the remote's response, or why there is none (nothing within
 /// `wait`, a local error). A call still running at the deadline finishes on
@@ -275,8 +273,6 @@ fn join_sandboxes(local: Value, remotes: Vec<((String, PathBuf), Result<Response
     }
     Value::Array(out)
 }
-
-// ---- verbs ------------------------------------------------------------------
 
 /// What a forwarded verb needs from the daemon.
 pub struct VerbCtx<'a> {
@@ -485,8 +481,6 @@ mod tests {
             json!([{"name": "loc", "root": "/here"}, {"name": "web", "machine": "a", "root": "/r"}])
         );
     }
-
-    // ---- against two test daemons ------------------------------------------
 
     fn instance(key: &str, sandbox: &str, root: &Path) -> String {
         format!(

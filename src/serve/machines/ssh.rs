@@ -354,7 +354,6 @@ const NOISE_CHARS: usize = 200;
 /// Why [`skip_lines`] found no line.
 #[derive(Debug)]
 pub enum SkipError<E> {
-    /// The stream ended first.
     Eof,
     /// The bound was reached first.
     TooLong,

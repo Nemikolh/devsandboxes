@@ -570,7 +570,6 @@ mod tests {
         assert_eq!(args[4..], mounts.iter().flat_map(|m| ["--mount".to_string(), m.clone()]).collect::<Vec<_>>()[..]);
         let warning = warning.unwrap();
         assert!(warning.contains("/var/cache/devsandbox/cargo, /d") && !warning.contains("/v,"), "{warning}");
-        // No SELinux: untouched.
         let (args, warning) = create_args(&host_plan(Mode::Rootful, false), true, None, &volumes, &mounts);
         assert_eq!(args[5], "/src:/workspaces/x");
         assert_eq!(args[9], mounts[0]);

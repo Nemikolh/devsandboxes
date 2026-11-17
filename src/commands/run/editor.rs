@@ -21,7 +21,7 @@ pub(crate) fn write_vscode_name_config(
     for product in ["Code", "Cursor", "VSCodium"] {
         let product_dir = base.join(product);
         if !product_dir.is_dir() {
-            continue; // not installed
+            continue;
         }
         let dir =
             product_dir.join("User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs");
@@ -113,7 +113,6 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["remoteUser"], "root");
 
-        // remote_user gone from config → key removed from an existing file.
         let json = merged_name_config(Some(&json), Some(&[]), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("remoteUser").is_none());

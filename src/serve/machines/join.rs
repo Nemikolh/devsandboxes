@@ -73,7 +73,6 @@ pub struct TargetSet {
 /// `machines.add`'s `fleet`: the fleet both ends are in after the add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fleet {
-    /// The control plane's member name.
     pub control_plane: String,
     pub joined: Joined,
 }

@@ -879,7 +879,6 @@ mod tests {
     fn command_flags_default_to_a_tty_only_on_a_terminal() {
         assert_eq!(command_flags(false, false, true), (true, true));
         assert_eq!(command_flags(false, false, false), (false, false));
-        // Any explicit flag is honored exactly, terminal or not.
         assert_eq!(command_flags(true, false, true), (true, false));
         assert_eq!(command_flags(false, true, true), (false, true));
         assert_eq!(command_flags(true, true, false), (true, true));
@@ -890,7 +889,6 @@ mod tests {
         // Neither flag: stdin stays open, a TTY only when stdin is one.
         assert_eq!(shell_flags(false, false, true), (true, true));
         assert_eq!(shell_flags(false, false, false), (true, false));
-        // Any explicit flag is honored exactly, TTY or not.
         assert_eq!(shell_flags(true, false, true), (true, false));
         assert_eq!(shell_flags(false, true, false), (false, true));
         assert_eq!(shell_flags(true, true, false), (true, true));
@@ -932,7 +930,6 @@ mod tests {
             assert_eq!(ssh_auth_sock_env(&relay, true), None);
         }
 
-        // Neither mount nor relay: never injected.
         let bare = instance();
         assert_eq!(ssh_auth_sock_env(&bare, true), None);
         assert_eq!(ssh_auth_sock_env(&bare, false), None);

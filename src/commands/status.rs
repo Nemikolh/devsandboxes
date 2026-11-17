@@ -95,17 +95,13 @@ mod tests {
 
         let json = serde_json::to_string(&Envelope::new(snapshot)).unwrap();
 
-        // Envelope shape.
         assert!(json.contains(r#""schema":1"#), "{json}");
         assert!(json.contains(r#""data":"#), "{json}");
-        // Running status: internally tagged with its text.
         assert!(
             json.contains(r#""status":{"state":"running","text":"Up 3 minutes"}"#),
             "{json}"
         );
-        // Missing status: tagged, no `text` field.
         assert!(json.contains(r#""status":{"state":"missing"}"#), "{json}");
-        // `collected_at` is skipped.
         assert!(!json.contains("collected_at"), "{json}");
     }
 }

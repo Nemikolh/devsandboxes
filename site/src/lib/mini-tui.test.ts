@@ -362,8 +362,6 @@ describe('render helpers', () => {
   });
 });
 
-// ---- Step 3: the rest of the dashboard.
-
 const names = (s: State) => s.instances.map((i) => i.name);
 const inst = (s: State, name: string) => s.instances.find((i) => i.name === name);
 /** Open the prompt, type `line`, press Enter. */

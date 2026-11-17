@@ -1220,7 +1220,6 @@ mod tests {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     handler.read_to_end(&mut Vec::new()).unwrap();
-                    // Ping until a write fails.
                     loop {
                         if handler.write_all(b"{\"kind\":\"ping\"}\n").is_err() {
                             let _ = tx.send(());

@@ -665,7 +665,6 @@ mod tests {
             w.push(0);
             w
         };
-        // Non-utf8 host.
         let bad_utf8 = {
             let mut w = vec![0x01, 0x00, 0x00, 0x80, KIND_CONNECT, 4, 0, 0, 0];
             w.extend_from_slice(&80u16.to_le_bytes());
@@ -673,10 +672,8 @@ mod tests {
             w.push(0xff);
             w
         };
-        // Port 0.
         let mut port_zero = base.clone();
         port_zero[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0u16.to_le_bytes());
-        // Window with a payload that isn't four bytes.
         let mut bad_window = Frame::Window { stream: 1, credit: 1 }.encode();
         bad_window[5..9].copy_from_slice(&3u32.to_le_bytes());
         bad_window.truncate(HEADER_LEN + 3);
@@ -789,7 +786,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let vm = version_mismatch(&err).expect("typed VersionMismatch");
         assert_eq!(*vm, VersionMismatch { peer: VERSION + 1, ours: VERSION });
-        // A plain InvalidData error is not a mismatch.
         assert!(version_mismatch(&invalid("nope")).is_none());
     }
 

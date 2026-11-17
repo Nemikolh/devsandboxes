@@ -216,7 +216,6 @@ mod tests {
         let cells = row(["a", "image x", "-", "-", "base"]);
         let line = format_row(&cells, &cells, &widths);
         assert_eq!(line, "a      image x  -       -         base\n");
-        // last column is not padded: line ends right after "base".
         assert!(!line.trim_end_matches('\n').ends_with(' '));
     }
 

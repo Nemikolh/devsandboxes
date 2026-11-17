@@ -392,7 +392,6 @@ mod tests {
         assert!(parse_key(r#"{"key":"a"} {}"#).unwrap_err().contains("trailing data"));
         assert!(parse_key(r#"{"key":"a"}x"#).unwrap_err().contains("trailing data"));
         assert!(parse_key(r#"{"key":"a"}null"#).unwrap_err().contains("trailing data"));
-        // Whitespace around the document is fine.
         assert_eq!(parse_key("\n\t {\"key\":\"a\"} \r\n"), Ok("a".into()));
     }
 

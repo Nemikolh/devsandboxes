@@ -38,7 +38,6 @@ fn failed(e: impl ToString) -> Record {
     Record::error(code::FAILED, e.to_string())
 }
 
-/// The `id` param.
 fn id(call: &Call) -> Result<&str, Record> {
     call.params.str("id").ok_or_else(|| bad(format!("{} needs `id`", call.method)))
 }

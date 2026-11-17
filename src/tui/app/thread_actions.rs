@@ -98,7 +98,6 @@ impl App {
         }
     }
 
-    /// Carry out `verb` on `name`.
     fn run_deferred(&mut self, name: &str, verb: Deferred) {
         match verb {
             Deferred::Code { goto, note } => {
@@ -709,7 +708,6 @@ mod tests {
             Modal::Logs(v) => assert!(v.title.contains("devsandbox-inst0"), "{}", v.title),
             _ => panic!("logs modal not open"),
         }
-        // Closing it returns to the pane.
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.modal, Modal::None));
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
@@ -758,7 +756,6 @@ mod tests {
         assert_eq!(app.take_pending_inbox(), acted("code"));
         assert_eq!(app.code_note.take().as_deref(), Some("done queued for inst0"));
 
-        // Past the last action: nothing at all.
         app.on_key(key(KeyCode::Char('4')));
         assert_eq!(app.status.as_deref(), Some("no action 4"));
         assert_eq!(app.tab, Tab::Inbox, "`4` stays shadowed");
@@ -833,7 +830,7 @@ mod tests {
 
         app.on_key(key(KeyCode::Char('3')));
         assert_eq!(app.take_pending_done(), child_done("inst1", true));
-        app.on_key(key(KeyCode::Esc)); // close the logs modal
+        app.on_key(key(KeyCode::Esc));
 
         // A plain event action leaves the child alone.
         app.on_key(key(KeyCode::Char('4')));

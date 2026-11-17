@@ -174,9 +174,6 @@ pub fn run(
     // dispatcher's is its parent's, passed through.
     let remember = extras.profile.is_some() && extras.dispatcher.is_none();
     let extras = RunExtras { profile: profile.clone(), ..extras };
-    // Deterministic name: explicit --name, or the sandbox name when free, else
-    // the first free ordinal. `run` always creates a fresh instance; `start`
-    // restarts a stopped one.
     let instance = match instance_name {
         Some(name) => name,
         None => default_instance_name(&state, &sandbox_name),
@@ -757,7 +754,6 @@ pub(crate) fn materialize(
             fm.target
         ));
     }
-    // Package-manager caches: shared bind mounts + the env vars pointing at them.
     let (cache_mounts, cache_env) = resolve_caches(&config_dir, props, policy.as_ref())?;
     mounts.extend(cache_mounts);
     // Managed per-instance shell history: mount the host dir, point zsh at it
@@ -773,7 +769,6 @@ pub(crate) fn materialize(
         None
     };
     extra_env.extend(run_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    // `shell-rc`: host snippets mounted read-only, sourced by the rc files.
     let shell_rc = resolve_shell_rc(dir, &var_ctx, props)?;
     mounts.extend(shell_rc.iter().map(|(mount, _)| mount.clone()));
     // Feature-declared mounts come last: any target claimed above (or the
@@ -1484,7 +1479,6 @@ mod tests {
         state.instances.insert("repo".into(), instance("repo"));
         state.instances.insert("repo-2".into(), instance("repo-2"));
         assert_eq!(first_free_ordinal(&state, "repo"), "repo-3");
-        // Deterministic: no random component.
         assert_eq!(first_free_ordinal(&state, "repo"), "repo-3");
     }
 
@@ -1567,8 +1561,6 @@ mod tests {
         state.instances.insert("other-2".into(), instance("repo-1"));
         assert_eq!(unique_instance_id(&state, "repo"), "repo-2");
     }
-
-    // --- folders / generated workspace file ---
 
     #[test]
     fn container_command_hooks_then_keeps_alive() {

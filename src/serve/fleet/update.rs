@@ -106,7 +106,6 @@ pub fn own_sha256() -> Result<[u8; 32]> {
     sha.clone().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// The sha256 of the file at `path`.
 pub fn sha256_of(path: &Path) -> Result<[u8; 32]> {
     let file = std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
     let (_, hex) = transfer::digest(file).with_context(|| format!("cannot read {}", path.display()))?;
@@ -536,7 +535,6 @@ fn check_sum(archive: &Path, name: &str, want: &[u8; 32]) -> Result<()> {
 
 /// The steps of an update, injectable.
 pub trait Steps: Send + Sync {
-    /// Download `url` into the file `out`.
     fn download(&self, url: &str, out: &Path) -> Result<()>;
     /// Unpack the binary of the release archive `archive` into `into`.
     fn unpack(&self, archive: &Path, into: &Path) -> Result<PathBuf>;

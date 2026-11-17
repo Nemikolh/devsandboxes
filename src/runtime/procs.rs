@@ -35,7 +35,6 @@ fn remainder_after<'a>(line: &'a str, pid: &str, ppid: &str) -> Option<&'a str> 
     let after_pid = line.trim_start().strip_prefix(pid)?;
     let after_ppid = after_pid.trim_start().strip_prefix(ppid)?;
     let args = after_ppid.trim_start();
-    // A line with pid+ppid but no args (fewer than three fields) is skipped.
     if args.is_empty() {
         None
     } else {

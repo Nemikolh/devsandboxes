@@ -468,7 +468,6 @@ mod tests {
         let t1 = t0 + 2 * ENGINE_TTL;
         assert_eq!(cache.get(t1, || bail!("down")).unwrap().cpus, Some(8));
         assert_eq!(cache.get(t1 + Duration::from_secs(1), never).unwrap().cpus, Some(8));
-        // Never answered: nothing.
         let mut empty = EngineCache::default();
         assert!(empty.get(t0, || bail!("down")).is_none());
     }
@@ -505,7 +504,6 @@ mod tests {
         // A VM's memory without what's free.
         let vm = Capacity { mem_total: Some(8 * G), ..bare.clone() };
         assert_eq!(summary(Some(&vm)), "8G · 0 run");
-        // No caps: none reported.
         assert_eq!(Capacity::build(None, HostFacts::default(), 0, &own(SoftCaps::default())).caps, None);
         // Not native: never read.
         let vm_engine = EngineInfo { native: false, root_dir: Some("/".into()), ..engine };

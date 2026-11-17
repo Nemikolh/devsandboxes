@@ -299,8 +299,6 @@ fn session_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-// ---- wire ----------------------------------------------------------------
-
 const TAG_SIZE: u8 = 1;
 const TAG_DATA: u8 = 2;
 const TAG_EXIT: u8 = 3;
@@ -369,8 +367,6 @@ fn decode(buf: &mut Vec<u8>) -> Result<Option<Record>, String> {
     buf.drain(..5 + len);
     Ok(Some(record))
 }
-
-// ---- libc ----------------------------------------------------------------
 
 /// The few libc calls a pty needs, declared by hand: std links libc anyway
 /// (musl, static) and the crate takes no dependencies. Constants and struct
@@ -513,8 +509,6 @@ fn bind_private(path: &Path) -> io::Result<UnixListener> {
     unsafe { sys::umask(old) };
     bound
 }
-
-// ---- supervisor ----------------------------------------------------------
 
 /// Frames queued for one client. Kept whole, so dropping queued output (a
 /// takeover) never cuts a frame the client has half-read.
@@ -1026,8 +1020,6 @@ fn exit_code(state: State) -> i32 {
     }
 }
 
-// ---- client --------------------------------------------------------------
-
 /// What a client ends with: its exit code and a note for stderr (printed
 /// after the terminal is restored).
 #[derive(Debug, PartialEq, Eq)]
@@ -1420,8 +1412,6 @@ pub(crate) fn create_with(
         }
     }
 }
-
-// ---- ls / rm / prune -----------------------------------------------------
 
 /// `new`'s automatic prune: every `lost` session and every one ended more
 /// than [`ENDED_GRACE`] before `now`, so finished dirs don't pile up and push

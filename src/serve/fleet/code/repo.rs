@@ -819,7 +819,6 @@ pub(crate) mod tests {
         assert!(git(&b, &["bundle", "list-heads", delta.to_str().unwrap()]).ends_with(" refs/heads/main"));
         git(&b, &["fetch", "-q", delta.to_str().unwrap(), "refs/heads/main:refs/heads/main"]);
 
-        // Nothing new: no bundle.
         let none = dir.join("3.bundle");
         assert!(!bundle_refs(Repo::Checkout(&a), &["refs/heads/main"], &tips(Repo::Bare(&b)).unwrap(), &none).unwrap());
         assert!(!none.exists());

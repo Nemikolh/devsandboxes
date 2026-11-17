@@ -155,7 +155,6 @@ mod tests {
         assert!(rename_in_state(&mut state, "old", "a b").is_err());
         assert!(rename_in_state(&mut state, "old", "old").is_err());
         assert!(rename_in_state(&mut state, "old", "taken").is_err());
-        // A failed rename leaves the entry in place.
         assert!(state.instances.contains_key("old"));
     }
 }

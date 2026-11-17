@@ -374,8 +374,6 @@ pub struct RootCandidate {
     pub home: bool,
 }
 
-// ---- handlers -------------------------------------------------------------
-
 fn ok() -> Answer {
     Ok(json!({ "ok": true }))
 }
@@ -1508,7 +1506,6 @@ mod tests {
             want.sort();
             assert_eq!(got, want, "{view:?}");
         }
-        // Default view is all.
         let all = run(&path, "inbox.threads.list", Value::Null).unwrap();
         assert_eq!(all.as_array().unwrap().len(), 5);
         let needs = run(&path, "inbox.threads.list", json!({"view":"needs-you"})).unwrap();
@@ -1978,7 +1975,6 @@ mod tests {
         assert_eq!(all["found"], json!([found("web", Some("/cfg")), found("web-2", None), found("x", None)]));
         assert_eq!(code(resolve(json!({"name": "nope"}))), "not-found");
         assert_eq!(code(resolve(json!({}))), "invalid");
-        // A missing state file is no instances.
         let none = instances_resolve(NameParams { name: "web".into() }, &state.with_file_name("absent.toml"));
         assert_eq!(code(none), "not-found");
     }
@@ -2108,7 +2104,6 @@ mod tests {
         assert_eq!(code(rename(json!({"instance": "b", "newName": "b2"}))), "invalid", "in flight");
         assert_eq!(code(rename(json!({"instance": "web", "newName": "w"}))), "not-found");
         assert_eq!(code(rename(json!({"instance": "api", "new_name": "w"}))), "invalid", "camelCase");
-        // Refusals wrote nothing.
         let after = crate::state::State::load_at(&state).unwrap();
         assert_eq!(after.instances.keys().collect::<Vec<_>>(), ["api", "b", "web-x"]);
         std::fs::write(&state, "not = [toml").unwrap();
@@ -2248,7 +2243,6 @@ mod tests {
         // A member.toml that doesn't load adds none.
         std::fs::write(&member, "trust = \"most\"\n").unwrap();
         assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None, Some(&member)).unwrap(), json!([]));
-        // No home `.devsandboxes`, no state: nothing.
         let none = roots_list(&state.with_file_name("absent.toml"), Some(&base), None, None).unwrap();
         assert_eq!(none, json!([]));
         assert_eq!(roots_list(&state.with_file_name("absent.toml"), None, None, None).unwrap(), json!([]));
@@ -2341,7 +2335,6 @@ mod tests {
         assert_eq!(code(read(json!({"instance": "web", "lines": -1}))), "invalid");
         assert_eq!(code(read(json!({"instance": "web", "ansi": "yes"}))), "invalid");
         assert_eq!(code(read(json!({}))), "invalid");
-        // A plain log reads the same with `ansi`.
         assert_eq!(read(json!({"instance": "web", "ansi": true})).unwrap(), json!({"text": "one\ntwo\nthree", "cut": false}));
         // A pty log is replayed: SGR with `ansi`, plain without.
         let pty = "$ devsandbox run\n# 1970-01-01T00:00:00Z\n# tty 80x24\n\x1b[32mok\x1b[0m\r\n";

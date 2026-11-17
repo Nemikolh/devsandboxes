@@ -258,8 +258,6 @@ pub(crate) fn localize(command: Command) -> Result<Command> {
     }
 }
 
-// ---- resolving a name --------------------------------------------------------
-
 /// `instances.resolve`'s params for a name: a bare name everywhere,
 /// a qualified one on its machine, `@/` this host only.
 pub(crate) fn resolve_params(wherever: &Where, name: &str) -> Value {
@@ -368,8 +366,6 @@ fn machine_info_with(
     let default_root = info.default_root.ok_or_else(|| super::no_default_root(m, &info.roots, info.listed));
     Ok(Info { entry: Entry { name: info.name, kind, roots: info.roots, command: info.command }, default_root })
 }
-
-// ---- reconnecting a tty exec ------------------------------------------------
 
 /// ssh's exit code for its own failure (a lost or refused connection).
 pub(crate) const SSH_FAILED: i32 = 255;
@@ -601,7 +597,6 @@ pub(crate) fn banner(m: &str, root: &Path) -> String {
 
 /// What [`route`] leaves to `main`.
 pub(crate) enum Routed {
-    /// Run this command here.
     Here(Command),
     /// It ran elsewhere: exit with this code.
     Exit(i32),
@@ -981,7 +976,6 @@ mod tests {
         assert_eq!(plan_of(&["run", "@/web"], None, m).unwrap(), Plan::Here);
         assert_eq!(plan_of(&["rm", "@/web"], None, m).unwrap(), Plan::Here);
         assert!(plan_of(&["rm", "nope/web"], None, m).is_err());
-        // A container name stays local unless qualified.
         assert_eq!(plan_of(&["logs", "devsandbox-web"], None, m).unwrap(), Plan::Here);
         assert_eq!(
             plan_of(&["inspect", "box/devsandbox-web"], None, m).unwrap(),

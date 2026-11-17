@@ -554,7 +554,6 @@ mod tests {
 
         assert_eq!(git_dirs(&base).unwrap(), (base.join(".git"), base.join(".git")));
         assert_eq!(git_dirs(&wt).unwrap(), (wtdir.clone(), wtdir.join("../..")));
-        // A relative `gitdir:` resolves against the checkout.
         std::fs::write(wt.join(".git"), "gitdir: ../base/.git/worktrees/wt\n").unwrap();
         assert_eq!(git_dirs(&wt).unwrap().0, wt.join("../base/.git/worktrees/wt"));
         assert!(git_dirs(&root).is_err(), "no .git");

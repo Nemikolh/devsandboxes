@@ -61,7 +61,6 @@ pub const CLI_WAIT: Duration = Duration::from_secs(4 * 60 * 60);
 pub struct Fetched {
     /// The repo's identity over the WIP's history (`repo::identity`).
     pub repo: String,
-    /// The instance's branch.
     pub branch: String,
     /// `refs/heads/<branch>` and `refs/devsandbox/wip/<instance_id>`, each at
     /// its commit.
@@ -410,7 +409,6 @@ mod tests {
             serde_json::from_value(fetch_call(&s, &fleet, &json!({"instance": "web-id", "haves": [main, wip]})).unwrap()).unwrap();
         assert_eq!(again.bundle, None);
         assert_eq!(out_files(&fleet), [name]);
-        // Errors.
         let code = |p: Value| fetch_call(&s, &fleet, &p).unwrap_err().code;
         assert_eq!(code(json!({})), "invalid");
         assert_eq!(code(json!({"instance": "nope"})), "not-found");
@@ -582,7 +580,6 @@ mod tests {
         let temps: Vec<_> = std::fs::read_dir(web.join(".git")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("devsandbox-")).collect();
         assert!(temps.is_empty(), "{temps:?}");
 
-        // Again with nothing new: no bundle, the same refs.
         let again = fetch_back(&entry, ask, &OutDir(fleet.clone())).unwrap();
         assert_eq!((again.fetched, &again.refs), (0, &got.refs));
 

@@ -173,7 +173,6 @@ mod tests {
     #[test]
     fn selection_clamps() {
         let mut app = new_app();
-        // Up at the top stays at 0.
         app.on_key(key(KeyCode::Up));
         assert_eq!(app.selected(), 0);
 
@@ -188,13 +187,11 @@ mod tests {
         let mut app = new_app();
         // Tree: [Sandbox(0), inst0, inst1, inst2] → 4 nodes.
         app.set_snapshot(snapshot_with(3));
-        // Move down to the last row.
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.selected(), 3);
 
-        // Shrinking to one instance → [Sandbox(0), inst0] re-clamps to last row.
         app.set_snapshot(snapshot_with(1));
         assert_eq!(app.selected(), 1);
 
@@ -225,15 +222,12 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // on inst1 (pos 2)
         assert_eq!(app.selected(), 2);
 
-        // Collapse the sandbox from the child: jumps to the parent first.
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.selected(), 0);
-        // Now on the sandbox node: Left collapses it, hiding both instances.
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.visible_nodes(), vec![Node::Sandbox(0)]);
         assert_eq!(app.selected(), 0);
 
-        // Space toggles it back open.
         app.on_key(key(KeyCode::Char(' ')));
         assert_eq!(
             app.visible_nodes(),
@@ -249,9 +243,8 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down)); // last instance, pos 3
         assert_eq!(app.selected(), 3);
-        // Collapse via parent jump then Left.
         app.on_key(key(KeyCode::Left)); // to sandbox, pos 0
-        app.on_key(key(KeyCode::Left)); // collapse
+        app.on_key(key(KeyCode::Left));
         assert_eq!(app.visible_nodes().len(), 1);
 
         // A refresh keeps the collapse and re-clamps (still 1 node).
@@ -264,11 +257,10 @@ mod tests {
     fn right_on_instance_expands_procs_and_signals_fetch() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Right));
         assert!(app.expanded_procs.contains("inst0"));
         assert!(app.take_needs_proc_fetch());
-        // Consumed once.
         assert!(!app.take_needs_proc_fetch());
     }
 
@@ -276,7 +268,7 @@ mod tests {
     fn space_toggles_procs_on_instance() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
-        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char(' ')));
         assert!(app.expanded_procs.contains("inst0"));
         app.on_key(key(KeyCode::Char(' ')));
@@ -294,18 +286,14 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // proc r1 (pos 3)
         assert_eq!(app.selected_node(), Some(Node::Proc { instance: 0, row: 1 }));
 
-        // First Left: proc → its instance row.
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
-        // Procs still expanded (jump didn't collapse them).
         assert!(app.expanded_procs.contains("inst0"));
 
-        // Second Left: instance with procs expanded → collapse procs, stay put.
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
         assert!(!app.expanded_procs.contains("inst0"));
 
-        // Third Left: instance → parent sandbox.
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
     }

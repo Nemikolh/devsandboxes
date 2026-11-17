@@ -840,7 +840,6 @@ mod tests {
         assert_eq!(texts(&lines), ["see the PR (https://x/1) or https://y"]);
         assert_eq!(style_of(&lines, "the PR"), LINK);
         assert_eq!(style_of(&lines, "(https://x/1)"), DIM);
-        // Inline: the text only.
         assert_eq!(text(&Line::from(inline_spans("[the PR](https://x/1)"))), "the PR");
     }
 
@@ -933,10 +932,8 @@ mod tests {
         for title in ["1. fix", "- wip", "# 42", "> quoted", "* star", "---", "```x", "[a]: b"] {
             assert_eq!(text(&Line::from(inline_spans(title))), title, "{title}");
         }
-        // Emphasis at the start still renders.
         assert_eq!(text(&Line::from(inline_spans("*wip* x"))), "wip x");
         assert_eq!(text(&Line::from(inline_spans("#7001 docs"))), "#7001 docs");
-        // Wrapped by the caller.
         assert_eq!(texts(&wrap(&inline_spans("a b\nc"), 3, &[], &[], false)), ["a b", "c"]);
     }
 

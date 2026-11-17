@@ -785,7 +785,6 @@ pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeatu
         let key = f.key();
         for entry in &f.metadata.installs_after {
             let entry = entry.trim();
-            // Match sans-tag first; fall back to bare id.
             if let Some(dep) = by_sans_tag.get(entry) {
                 if *dep != key {
                     deps.get_mut(&key).unwrap().insert(dep.clone());
@@ -986,7 +985,6 @@ mod tests {
             ("./features/ok".to_string(), FeatureOptions::Enabled(true)),
             ("./features/nope".to_string(), FeatureOptions::Enabled(true)),
             ("./features/empty".to_string(), FeatureOptions::Enabled(true)),
-            // Disabled: not checked.
             ("./features/off".to_string(), FeatureOptions::Enabled(false)),
             ("ghcr.io/devcontainers/features/node:1".to_string(), FeatureOptions::Enabled(true)),
         ]);
@@ -1062,7 +1060,6 @@ mod tests {
 
     #[test]
     fn install_order_soft_dep() {
-        // common-utils installs first; node declares installsAfter common-utils.
         let feats = vec![
             feature("ghcr.io/devcontainers/features/node:1", &[
                 "ghcr.io/devcontainers/features/common-utils",
@@ -1088,7 +1085,6 @@ mod tests {
 
     #[test]
     fn install_order_alphabetical_tie_break() {
-        // No deps between them: alphabetical by full ref (git < node < zsh).
         let feats = vec![
             feature("ghcr.io/devcontainers/features/node:1", &[]),
             feature("ghcr.io/devcontainers/features/zsh:1", &[]),
@@ -1101,7 +1097,6 @@ mod tests {
 
     #[test]
     fn install_order_absent_dep_is_ignored() {
-        // installsAfter references a feature not in the set -> ignored, no error.
         let feats = vec![feature(
             "ghcr.io/devcontainers/features/node:1",
             &["ghcr.io/devcontainers/features/common-utils"],
@@ -1273,7 +1268,6 @@ mod tests {
         let reference = FeatureRef::parse("ghcr.io/devcontainers/features/common-utils:2").unwrap();
         let resolved = fetch_into(&reference, &tmp);
 
-        // Clean up regardless of outcome.
         let cleanup = |p: &Path| {
             let _ = std::fs::remove_dir_all(p);
         };

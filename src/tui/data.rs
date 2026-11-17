@@ -505,7 +505,6 @@ mod tests {
         let s = snap(Vec::new(), Vec::new(), 0, Some("24.0.7"));
         let out = totals_line(&s, std::time::Duration::from_secs(STALE_AFTER_SECS + 2), None);
         assert!(out.ends_with(" (stale 12s)"), "got: {out}");
-        // Fresh data has no staleness suffix.
         let fresh = totals_line(&s, std::time::Duration::from_secs(1), None);
         assert!(!fresh.contains("stale"), "got: {fresh}");
     }
@@ -667,7 +666,6 @@ mod tests {
             ],
         );
 
-        // Collapsing the orphan group hides its children but keeps the header.
         let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&[ORPHANS_NAME]), &ep, &pm);
         assert_eq!(
             nodes,
@@ -716,12 +714,10 @@ mod tests {
         let instances = vec![inst_in("a1", "a")];
         let expanded: BTreeSet<String> = ["a1".to_string()].into_iter().collect();
 
-        // Not fetched yet: one placeholder row.
         let nodes =
             visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &expanded, &BTreeMap::new());
         assert_eq!(nodes.last(), Some(&Node::Proc { instance: 0, row: MESSAGE_ROW }));
 
-        // Message state (e.g. not running / error): still one placeholder row.
         let mut procs = BTreeMap::new();
         procs.insert("a1".to_string(), ProcState::Message("(not running)".into()));
         let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &expanded, &procs);
@@ -745,7 +741,6 @@ mod tests {
             "a1".to_string(),
             ProcState::Rows { rows: vec![proc_row("1")], signalable: true, sessions: None },
         );
-        // Sandbox collapsed → its instance and procs are hidden entirely.
         let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&[&local_key("a")]), &expanded, &procs);
         assert_eq!(nodes, vec![Node::Sandbox(0)]);
     }

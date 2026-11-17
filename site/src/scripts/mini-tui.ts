@@ -349,7 +349,7 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
     if (user) stopAutoplay();
   }
 
-  // ---- Autoplay: one timer for the pending step, dropped when off screen and
+  // Autoplay: one timer for the pending step, dropped when off screen and
   // re-armed (with that step's full pause) when the widget comes back.
   function schedule() {
     window.clearTimeout(timer);
@@ -386,7 +386,7 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
 
   if (interactive) listen();
 
-  // ---- Interaction. The widget is one tab stop; its buttons stay out of the
+  // Interaction. The widget is one tab stop; its buttons stay out of the
   // tab order (tabindex=-1) but work with a pointer.
   function listen() {
     root.tabIndex = 0;

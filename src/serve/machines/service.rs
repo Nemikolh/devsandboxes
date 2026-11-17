@@ -1491,8 +1491,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ---- inbound machines and a control plane -----------------------------------------
-
     static CONTROL_PLANE_LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     /// Inbound neighbor `w` (announced: the returned guard) and ssh machine

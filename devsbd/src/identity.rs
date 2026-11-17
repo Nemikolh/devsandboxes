@@ -475,7 +475,6 @@ ubuntu:x:1002:1000:Ubuntu:/home/ubuntu:/bin/bash
 vscode:x:1000:1000::/home/vscode:/bin/bash
 "
         );
-        // Idempotent.
         assert_eq!(remap_passwd(&p, "vscode", ids(1000, 1000)).unwrap(), p);
     }
 

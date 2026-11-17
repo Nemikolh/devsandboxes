@@ -83,7 +83,6 @@ mod tests {
         let mut s = state();
         assert_eq!(set(&mut s, "a", true, 10).unwrap(), (true, "marked a done".into()));
         assert_eq!(s.instances["a"].done, Some(10));
-        // Again: unchanged, the original since kept.
         assert_eq!(set(&mut s, "a", true, 20).unwrap(), (false, "`a` is already done".into()));
         assert_eq!(s.instances["a"].done, Some(10));
         assert_eq!(set(&mut s, "a", false, 30).unwrap(), (true, "marked a not done".into()));

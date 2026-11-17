@@ -323,7 +323,6 @@ mod tests {
     fn exact_width_row_puts_the_end_caret_on_the_next_row() {
         assert_eq!(rows("abcd", 4), ["abcd", ""]);
         assert_eq!(wrap("abcd", 4).pos[4], (1, 0));
-        // Before a newline, the same.
         assert_eq!(rows("abcd\nx", 4), ["abcd", "", "x"]);
         let w = wrap("abcd\nx", 4);
         assert_eq!(w.pos[4], (1, 0), "the newline's slot");
@@ -364,13 +363,9 @@ mod tests {
 
     #[test]
     fn viewport_follows_the_cursor() {
-        // Stays while the cursor is inside.
         assert_eq!(viewport_top(2, 4, 10, 3), 2);
-        // Moves down just enough.
         assert_eq!(viewport_top(0, 7, 10, 3), 5);
-        // And up.
         assert_eq!(viewport_top(5, 1, 10, 3), 1);
-        // Never past the end (text got shorter).
         assert_eq!(viewport_top(8, 2, 4, 3), 1);
     }
 
@@ -382,7 +377,6 @@ mod tests {
             assert!(v.caret.0 < 4 && v.caret.1 < 3, "cursor {cursor}: {v:?}");
             assert!(v.lines.len() <= 3);
         }
-        // Start.
         assert_eq!(viewport(text, 0, 4, 3, 0), Viewport { top: 0, lines: vec!["abcd".into(), "efgh".into(), "ijkl".into()], caret: (0, 0) });
         // End: the last row holds `yz`.
         let v = viewport(text, 26, 4, 3, 0);
@@ -411,12 +405,9 @@ mod tests {
         let text = "abcdefghij"; // abcd / efgh / ij
         assert_eq!(vertical(text, 6, 4, true), 2);
         assert_eq!(vertical(text, 2, 4, false), 6);
-        // Into a shorter row: its end.
         assert_eq!(vertical(text, 7, 4, false), 10);
-        // Past the edges.
         assert_eq!(vertical(text, 2, 4, true), 0);
         assert_eq!(vertical(text, 9, 4, false), 10);
-        // Across a newline.
         assert_eq!(vertical("abc\nd", 2, 10, false), 5);
         assert_eq!(vertical("abc\nd", 5, 10, true), 1);
     }
@@ -459,12 +450,10 @@ mod tests {
 
     #[test]
     fn hscroll_keeps_the_caret_in_view() {
-        // Fits: unscrolled.
         assert_eq!(hscroll("hello", 5, 10), (0, "hello".into(), 5));
         // Caret at the very end of an exact fit needs one more column.
         assert_eq!(hscroll("hello", 5, 5), (1, "ello".into(), 4));
         assert_eq!(hscroll("hello", 0, 5), (0, "hello".into(), 0));
-        // Long line, caret mid-way.
         assert_eq!(hscroll("abcdefghijklmnop", 12, 5), (8, "ijklm".into(), 4));
         // Wide glyphs: columns, not chars; a straddler is dropped whole.
         assert_eq!(hscroll("漢漢漢", 3, 4), (2, "漢".into(), 2));

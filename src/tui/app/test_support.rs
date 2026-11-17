@@ -250,8 +250,8 @@ pub(super) fn app_on_proc_row(pids: &[&str]) -> App {
     let mut app = new_app();
     app.set_snapshot(snapshot_with_status(1, running()));
     expand_with_rows(&mut app, "inst0", pids);
-    app.on_key(key(KeyCode::Down)); // inst0
-    app.on_key(key(KeyCode::Down)); // proc row
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Down));
     assert_eq!(app.selected_node(), Some(Node::Proc { instance: 0, row: 0 }));
     app
 }

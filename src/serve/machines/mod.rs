@@ -60,7 +60,6 @@ pub mod ssh;
 pub struct Entry {
     /// The table key, so not a field of its own in the file.
     pub name: String,
-    /// How this host reaches the machine.
     pub kind: Kind,
     /// The machine's live roots: what its daemon's last `roots.list` over
     /// its link answered (`service::Handle::entries`, `machines.get`).
@@ -71,7 +70,6 @@ pub struct Entry {
     pub command: Option<String>,
 }
 
-/// How a machine is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     /// This host sshes to it: `target` is what ssh takes (`me@host`, `host`,
@@ -442,7 +440,6 @@ mod tests {
         let other = dir.join("sub/machines.toml");
         update(&other, |_| ()).unwrap();
         assert!(!other.exists());
-        // No temp file is left behind.
         let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
 

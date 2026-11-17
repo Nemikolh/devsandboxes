@@ -45,7 +45,6 @@ pub const SENTINEL: &str = "devsandbox-api";
 /// incompatible change to what follows it; a reader refuses any other.
 pub const SENTINEL_VERSION: u32 = 1;
 
-/// How a relay ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum End {
     /// stdin hit EOF: the client is done.

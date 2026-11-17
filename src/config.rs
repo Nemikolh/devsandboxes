@@ -140,7 +140,6 @@ pub fn table_text(table: &Table) -> String {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SandboxProperties {
-    // --- devsandbox extras ---
     pub folder: Option<String>,
     pub services: Option<Vec<String>>,
     /// Package-manager caches to persist and share across the config root (e.g.
@@ -213,7 +212,6 @@ pub struct SandboxProperties {
     /// excluded from `config_hash`.
     pub profiles: Option<Vec<String>>,
 
-    // --- implemented devcontainer properties ---
     pub image: Option<String>,
     pub build: Option<Build>,
     pub workspace_folder: Option<String>,
@@ -255,7 +253,7 @@ pub struct SandboxProperties {
     pub userns: Option<bool>,
     pub init: Option<bool>,
 
-    // --- devcontainer properties not implemented yet ([`Self::ignored`]) ---
+    // devcontainer properties not implemented yet ([`Self::ignored`])
     pub name: Option<Value>,
     pub app_port: Option<Value>,
     pub ports_attributes: Option<Value>,
@@ -1700,7 +1698,6 @@ folders = { "/workspaces/docs" = "../docs", "/workspaces/lib" = { path = "../lib
         assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
         let (table, table_hash) = with.resolved_table("app").unwrap();
         assert_eq!(table_hash, hash);
-        // Still shown in the resolved view.
         assert!(table.contains_key("autostart"));
     }
 
@@ -1935,12 +1932,9 @@ profiles = ["work"]
     #[test]
     fn build_hash_none_and_missing_are_empty() {
         let dir = std::env::temp_dir();
-        // No build block at all.
         assert_eq!(build_hash(&dir, None), "");
-        // Build with no dockerfile key.
         let no_dockerfile = Build::default();
         assert_eq!(build_hash(&dir, Some(&no_dockerfile)), "");
-        // Dockerfile key pointing at a nonexistent file.
         let missing = Build {
             dockerfile: Some("does-not-exist-xyz.Dockerfile".into()),
             ..Build::default()
@@ -1961,7 +1955,6 @@ profiles = ["work"]
         std::fs::write(&path, "FROM alpine\n").unwrap();
         let first = build_hash(&dir, Some(&build));
         assert!(!first.is_empty());
-        // Identical contents hash identically.
         assert_eq!(first, build_hash(&dir, Some(&build)));
         // A content change moves the hash even though the path is unchanged.
         std::fs::write(&path, "FROM alpine\nRUN echo hi\n").unwrap();
@@ -2012,7 +2005,6 @@ profiles = ["work"]
     fn resolved_table_merges_and_drops_extends() {
         let config = Config::parse(EXAMPLE).unwrap();
         let (table, hash) = config.resolved_table("repository-2").unwrap();
-        // `extends` is gone but the merged body is present.
         assert!(!table.contains_key("extends"));
         assert_eq!(table["folder"].as_str(), Some("../repository-2"));
         assert_eq!(table["caches"].as_array().unwrap().len(), 1); // from template
@@ -2020,7 +2012,6 @@ profiles = ["work"]
         let args = table["build"].as_table().unwrap()["args"].as_table().unwrap();
         assert_eq!(args["A"].as_str(), Some("1"));
         assert_eq!(args["B"].as_str(), Some("3"));
-        // Hash matches the typed resolver's for the same sandbox.
         assert_eq!(hash, config.resolve_sandbox("repository-2").unwrap().config_hash);
     }
 

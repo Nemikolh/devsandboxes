@@ -308,8 +308,6 @@ fn updated(file: &Path, edits: u64, drifted: &[String], machine: Option<&str>) -
     line
 }
 
-// ---- no daemon --------------------------------------------------------------
-
 /// The calls the prompt makes, answered in this process by the API's own
 /// method table (`serve::api::call`, `state.toml` at `State::path`): what
 /// [`prompt`] goes through when no daemon is reachable.

@@ -82,8 +82,6 @@ impl ApiError {
     }
 }
 
-// ---- wire views -----------------------------------------------------------
-
 /// One row of `inbox.threads.list`, and the head of `inbox.thread.get`.
 /// Carries both addresses: `id`, and `owner` (instance id) / `owner_name` +
 /// `key`.
@@ -466,8 +464,6 @@ pub fn summaries(inbox: &Inbox, view: super::View) -> Vec<ThreadSummary> {
     rows.into_iter().map(ThreadSummary::of).collect()
 }
 
-// ---- addressing -----------------------------------------------------------
-
 /// How every `inbox.thread.*` names its thread: `{"thread": id}`, or
 /// `{"owner": <instance name or id>, "key": …}` for a dispatcher thread.
 #[derive(Debug, Default, Deserialize)]
@@ -530,7 +526,6 @@ pub fn user_target<'a>(inbox: &'a Inbox, addr: &Addr) -> Result<&'a Thread, ApiE
     }
     Ok(t)
 }
-// ---- user-op decisions ----------------------------------------------------
 
 /// `inbox.thread.done`.
 pub fn decide_done(inbox: &Inbox, addr: &Addr) -> Result<Vec<Op>, ApiError> {

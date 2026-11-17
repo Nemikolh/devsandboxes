@@ -68,7 +68,6 @@ pub mod code {
     pub const VERSION: &str = "version";
 }
 
-/// A `call` record.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Call {
     pub method: String,
@@ -215,7 +214,6 @@ impl Record {
     }
 }
 
-/// Write one record.
 pub fn write_record(w: &mut impl Write, rec: &Record) -> io::Result<()> {
     let bytes = rec.encode();
     if bytes.len() - 5 > MAX_RECORD as usize {
@@ -248,8 +246,6 @@ pub fn read_record(r: &mut impl Read) -> io::Result<Option<Record>> {
     r.read_exact(&mut payload)?;
     Record::decode(tag[0], &payload).map(Some).map_err(bad)
 }
-
-// ---- JSON subset ----
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {

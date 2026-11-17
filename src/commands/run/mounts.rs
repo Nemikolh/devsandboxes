@@ -113,7 +113,6 @@ pub(super) struct ResolvedFolder {
     pub target: String,
     /// Canonical host folder.
     pub host: PathBuf,
-    /// The entry's `worktree` mode.
     pub mode: FolderWorktree,
 }
 
@@ -561,8 +560,6 @@ mod tests {
         assert_eq!(resolved[0].mode, FolderWorktree::Never);
     }
 
-    // --- caches ---
-
     #[test]
     fn caches_mount_outside_home_and_point_env_at_target() {
         let dir = std::env::temp_dir().join(format!("devsandbox-caches-{}", std::process::id()));
@@ -610,7 +607,6 @@ mod tests {
         let (root, outside, cfg) = (root.canonicalize().unwrap(), outside.canonicalize().unwrap(), cfg.canonicalize().unwrap());
         let policy = Policy { root: root.clone(), data: root.clone(), allow: Default::default(), sockets: Vec::new() };
         let sv = cfg.join("shared-volumes");
-        // In the root: created as before.
         guard_create(Some(&policy), &sv.join("gh")).unwrap();
         provision_shell_history(&cfg, "ok1", Some(&policy)).unwrap();
         assert!(sv.join("history/ok1/.zsh_history").is_file());
@@ -632,12 +628,9 @@ mod tests {
         // guards before `ensure_bind_source`).
         symlink(&outside, sv.join("feat")).unwrap();
         assert!(guard_create(Some(&policy), &sv.join("feat/state.json")).is_err());
-        // No policy: no check.
         guard_create(None, &sv.join("feat/state.json")).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
-
-    // --- shell-rc ---
 
     #[test]
     fn shell_rc_mounts_parent_dir_readonly_and_addresses_file() {
@@ -834,7 +827,6 @@ mod tests {
             feature_mount_decision(&dir, &BTreeSet::new(), false, |_| Some(false)),
             MountDecision::Apply
         );
-        // Non-bind mounts have no host source to probe.
         let vol = feature_mount("volume", Some("dind-var-lib-docker"), "/var/lib/docker");
         assert_eq!(
             feature_mount_decision(&vol, &BTreeSet::new(), false, |_| None),
@@ -898,7 +890,6 @@ mod tests {
             parsed["settings"]["terminal.integrated.cwd"],
             "${workspaceFolder:app}"
         );
-        // No recommendations passed → no `extensions` key at all.
         assert!(parsed.get("extensions").is_none());
     }
 
