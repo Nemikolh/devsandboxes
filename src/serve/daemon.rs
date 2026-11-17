@@ -3260,14 +3260,16 @@ fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState
         let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
     };
     // What ties the sandbox here is known before anything is asked; a
-    // config that doesn't load is the local run's to report.
-    if let Some(Placed::LocalWithNote(note)) = fleet::code::ties_of(&root, sandbox).ok().and_then(|t| placed::tied(&t)) {
+    // config that doesn't load is the local run's to report (placed then
+    // as needing no GPU).
+    let (ties, gpu) = fleet::code::ties_of(&root, sandbox).unwrap_or_default();
+    if let Some(Placed::LocalWithNote(note)) = placed::tied(&ties) {
         log(&format!("{}: run: {note}", conn.label()));
         say(&note);
         return None;
     }
     let locals: Vec<(PathBuf, Arc<Value>)> = shared.locals.lock().unwrap().iter().map(|(d, v)| (d.clone(), Arc::clone(v))).collect();
-    let spec = placed::spec(sandbox, locals.iter().find(|(d, _)| *d == root).map(|(_, v)| v.as_ref()));
+    let spec = placed::spec(sandbox, gpu, locals.iter().find(|(d, _)| *d == root).map(|(_, v)| v.as_ref()));
     let local_roots: Vec<Arc<Value>> = locals.into_iter().map(|(_, v)| v).collect();
     let ask = placed::Ask { branch: str_of("branch"), base: str_of("base") };
     let prepare = |worker: &str| move_code(shared, worker, &root, sandbox, ask.branch);

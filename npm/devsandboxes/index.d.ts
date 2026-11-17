@@ -1015,6 +1015,8 @@ export interface FleetPlaceSpec {
   /** The sandbox's config hash as the member's snapshot has it; `null` unknown (no image locality). */
   config_hash: string | null;
   build_hash: string | null;
+  /** What the sandbox or one of its services needs of a GPU: `required` goes only where one is usable and lent (or on the member itself), `optional` prefers there; `null` none. */
+  gpu: 'required' | 'optional' | null;
 }
 
 /** `fleet.place`'s params: a member's run, for the control plane to place. @experimental */

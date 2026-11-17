@@ -55,7 +55,7 @@ use sha2::{Digest, Sha256};
 use self::repo::Repo;
 use super::transfer::{self, Header, Received, Receivers};
 use crate::serve::api::ApiError;
-use crate::config::{Build, Config, MountContext, Placement, ResolvedSandbox};
+use crate::config::{Build, Config, GpuNeed, MountContext, Placement, ResolvedSandbox};
 use crate::worker_policy::{self, Allow, Policy, Refusal};
 
 /// A config root's tar: [`tar`], unpacked under `roots/<hash>/`.
@@ -449,13 +449,14 @@ pub fn repo_offer(host: &Path, at: &Path, branch: Option<&str>) -> Result<RepoOf
     Ok(RepoOffer { host: host.to_path_buf(), at: at.to_path_buf(), branch: current, wip: true, id })
 }
 
-/// [`ties`] of sandbox `sandbox` of the config at `config_root`; a config
+/// [`ties`] of sandbox `sandbox` of the config at `config_root`, and its
+/// GPU need for placement (`placed::gpu_need`), off the one load; a config
 /// that doesn't load or resolve is the error (the run reports it itself).
-pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<Vec<String>> {
+pub fn ties_of(config_root: &Path, sandbox: &str) -> Result<(Vec<String>, Option<GpuNeed>)> {
     let root = config_root.canonicalize().with_context(|| format!("config root {} does not exist", config_root.display()))?;
     let config = Config::load(&root)?;
     let resolved = config.resolve_sandbox(sandbox)?;
-    Ok(ties(&root, &config, &resolved))
+    Ok((ties(&root, &config, &resolved), super::placed::gpu_need(&config, &resolved)))
 }
 
 /// What ties `sandbox` of `config` (at the canonical config root `root`) to
@@ -1358,7 +1359,7 @@ mod tests {
             Err(Unprepared::NotMovable(why)) => assert_eq!(why, "`initializeCommand`, privileged"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(ties_of(&cfg, "web").unwrap(), ["`initializeCommand`", "privileged"]);
+        assert_eq!(ties_of(&cfg, "web").unwrap(), (vec!["`initializeCommand`".to_string(), "privileged".into()], None));
         assert!(ties_of(&cfg, "nope").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

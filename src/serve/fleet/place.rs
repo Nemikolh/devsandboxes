@@ -9,13 +9,15 @@
 //! `over cap: …` warning. New work never goes to a machine that is
 //! unreachable or has no container runtime (a driver, its capacity's
 //! `runtime: false`); a pin is refused only then (or when the machine is
-//! unknown).
+//! unknown). A required GPU goes only where one is usable and lent
+//! ([`gpu_check`]); an optional one scores [`GPU`] there.
 
 use std::cmp::Ordering;
 use std::fmt;
 
 use serde_json::Value;
 
+use crate::config::GpuNeed;
 use crate::serve::capacity::{Capacity, over_caps, over_note};
 use crate::serve::snapshots::{LinkState, Machine, Routed};
 
@@ -53,6 +55,8 @@ pub struct Spec {
     pub requester: MachineRef,
     /// `--machine m` or a qualified name: wins over the score.
     pub pinned: Option<MachineRef>,
+    /// The sandbox's GPU need, its services' included ([`super::placed::gpu_need`]).
+    pub gpu: Option<GpuNeed>,
 }
 
 /// One machine new work could go on.
@@ -162,6 +166,9 @@ pub enum NoPlace {
     UnknownPin(MachineRef),
     PinUnreachable(MachineRef),
     PinNoRuntime(MachineRef),
+    /// A required GPU pinned to a machine that can't give one: why
+    /// ([`gpu_check`]).
+    PinNoGpu(MachineRef, &'static str),
     /// No candidate takes new work: each with why.
     NoCandidate(Vec<(MachineRef, &'static str)>),
 }
@@ -172,6 +179,7 @@ impl fmt::Display for NoPlace {
             NoPlace::UnknownPin(m) => write!(f, "no machine `{m}`"),
             NoPlace::PinUnreachable(m) => write!(f, "{m} is unreachable"),
             NoPlace::PinNoRuntime(m) => write!(f, "{m} has no container runtime"),
+            NoPlace::PinNoGpu(m, why) => write!(f, "{m} can't take a required GPU ({why})"),
             NoPlace::NoCandidate(skipped) if skipped.is_empty() => f.write_str("no machine to place on"),
             NoPlace::NoCandidate(skipped) => {
                 let why: Vec<String> = skipped.iter().map(|(m, why)| format!("{m}: {why}")).collect();
@@ -191,17 +199,23 @@ pub const W_DISK: i64 = 2;
 pub const W_SLOTS: i64 = 2;
 pub const W_CPU: i64 = 1;
 /// Subtracted per exceeded cap: more than any in-cap machine can score
-/// (headroom 800 + locality 450 + bias 50), so over-cap always ranks last.
+/// (headroom 800 + locality 450 + GPU 400 + bias 50), so over-cap always
+/// ranks last.
 pub const OVER: i64 = 2000;
 /// Locality.
 pub const IMAGE: i64 = 300;
 pub const REPO: i64 = 150;
 /// The requester's own host.
 pub const REQUESTER: i64 = 50;
+/// An optional GPU it can use there: above [`IMAGE`], since a missing
+/// image costs one build and a missing GPU the whole run's speed; below
+/// the headroom span (800), so a full GPU host still loses to an idle one.
+pub const GPU: i64 = 400;
 
 /// Pick the machine for `spec` among `candidates`. A pin wins (refused only
-/// unknown, unreachable or without a runtime; warned over cap); otherwise
-/// the highest [`score`] among reachable candidates with a runtime, ties to
+/// unknown, unreachable, without a runtime or, for a required GPU, without
+/// one it gives; warned over cap); otherwise the highest [`score`] among
+/// reachable candidates with a runtime (and a GPU, when required), ties to
 /// the lowest [`MachineRef`].
 pub fn place(spec: &Spec, candidates: &[Candidate]) -> Result<Placement, NoPlace> {
     if let Some(pin) = &spec.pinned {
@@ -211,6 +225,11 @@ pub fn place(spec: &Spec, candidates: &[Candidate]) -> Result<Placement, NoPlace
         }
         if !has_runtime(c) {
             return Err(NoPlace::PinNoRuntime(pin.clone()));
+        }
+        if spec.gpu == Some(GpuNeed::Required)
+            && let Err(why) = gpu_check(spec, c)
+        {
+            return Err(NoPlace::PinNoGpu(pin.clone(), why));
         }
         return Ok(scored(spec, c));
     }
@@ -223,6 +242,12 @@ pub fn place(spec: &Spec, candidates: &[Candidate]) -> Result<Placement, NoPlace
         }
         if !has_runtime(c) {
             skipped.push((c.machine.clone(), "no container runtime"));
+            continue;
+        }
+        if spec.gpu == Some(GpuNeed::Required)
+            && let Err(why) = gpu_check(spec, c)
+        {
+            skipped.push((c.machine.clone(), why));
             continue;
         }
         let p = scored(spec, c);
@@ -244,6 +269,15 @@ fn has_runtime(c: &Candidate) -> bool {
     c.capacity.as_ref().is_none_or(|cap| cap.runtime)
 }
 
+/// Whether `c` gives `spec`'s work a GPU (decision 6 of the gpus plan):
+/// its report has a usable one (no report: none) and it lends it
+/// (`GpuReport::lent`), or it is the requester, whose own run is under no
+/// worker policy. Else why not.
+pub fn gpu_check(spec: &Spec, c: &Candidate) -> Result<(), &'static str> {
+    let Some(gpu) = c.capacity.as_ref().and_then(|cap| cap.gpu.as_ref()) else { return Err("no GPU") };
+    if gpu.lent || c.machine == spec.requester { Ok(()) } else { Err("GPU not lent") }
+}
+
 fn scored(spec: &Spec, c: &Candidate) -> Placement {
     let (score, reasons) = score(spec, c);
     let warnings = c.capacity.as_ref().and_then(over_note).into_iter().map(|n| format!("{}: {n}", c.machine)).collect();
@@ -252,8 +286,8 @@ fn scored(spec: &Spec, c: &Candidate) -> Placement {
 
 /// `c`'s score for `spec` and its parts: headroom (mem·3 + disk·2 +
 /// slots·2 + cpu·1, each `0..=100`, unknown [`NEUTRAL`]), minus [`OVER`]
-/// per exceeded cap, plus [`IMAGE`] / [`REPO`] locality and the
-/// [`REQUESTER`] bias.
+/// per exceeded cap, plus [`IMAGE`] / [`REPO`] locality, [`GPU`] for an
+/// optional GPU it gives ([`gpu_check`]) and the [`REQUESTER`] bias.
 pub fn score(spec: &Spec, c: &Candidate) -> (i64, Vec<String>) {
     let mut reasons = Vec::new();
     let mut total = 0;
@@ -283,6 +317,10 @@ pub fn score(spec: &Spec, c: &Candidate) -> (i64, Vec<String>) {
     if c.has_repo {
         total += REPO;
         reasons.push("repo there".into());
+    }
+    if spec.gpu == Some(GpuNeed::Optional) && gpu_check(spec, c).is_ok() {
+        total += GPU;
+        reasons.push("GPU".into());
     }
     if c.machine == spec.requester {
         total += REQUESTER;
@@ -336,7 +374,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::serve::capacity::Caps;
+    use crate::serve::capacity::{Caps, GpuReport};
     use crate::serve::machines::MachineKind;
 
     const G: u64 = 1 << 30;
@@ -353,7 +391,13 @@ mod tests {
             repo: None,
             requester: MachineRef::Local,
             pinned: None,
+            gpu: None,
         }
+    }
+
+    /// `c` with a usable GPU, `lent` or not.
+    fn gpu(c: Capacity, lent: bool) -> Capacity {
+        Capacity { gpu: Some(GpuReport { count: Some(1), lent }), ..c }
     }
 
     /// 8 cpus, 32G with `avail` free, 500G disk with `free_disk` free.
@@ -391,6 +435,8 @@ mod tests {
         let local = || cand(MachineRef::Local, Some(cap(16, 250, 2)));
         let roomy = || cand(m("big"), Some(cap(28, 450, 0)));
         let pinned = |p: MachineRef| Spec { pinned: Some(p), ..spec() };
+        let required = || Spec { gpu: Some(GpuNeed::Required), ..spec() };
+        let optional = || Spec { gpu: Some(GpuNeed::Optional), ..spec() };
         let cases = vec![
             Case { name: "more headroom wins", spec: spec(), candidates: vec![local(), roomy()], want: Ok(m("big")), warnings: &[] },
             Case {
@@ -527,6 +573,91 @@ mod tests {
                 warnings: &[],
             },
             Case { name: "a pin on an unknown machine is refused", spec: pinned(m("nope")), candidates: vec![local()], want: Err(NoPlace::UnknownPin(m("nope"))), warnings: &[] },
+            Case {
+                name: "a required GPU goes only where one is lent, however roomy the rest",
+                spec: required(),
+                candidates: vec![
+                    roomy(),
+                    cand(m("kept"), Some(gpu(cap(30, 490, 0), false))),
+                    cand(m("silent"), None),
+                    cand(m("gpu"), Some(gpu(cap(2, 10, 7), true))),
+                ],
+                want: Ok(m("gpu")),
+                warnings: &[],
+            },
+            Case {
+                name: "the requester needs only the GPU, not lending it",
+                spec: required(),
+                candidates: vec![cand(MachineRef::Local, Some(gpu(cap(2, 10, 7), false))), roomy()],
+                want: Ok(MachineRef::Local),
+                warnings: &[],
+            },
+            Case {
+                name: "a remote requester's unlent GPU is its own",
+                spec: Spec { requester: m("lap"), ..required() },
+                candidates: vec![cand(MachineRef::Local, Some(gpu(cap(30, 490, 0), false))), cand(m("lap"), Some(gpu(cap(2, 10, 7), false)))],
+                want: Ok(m("lap")),
+                warnings: &[],
+            },
+            Case {
+                name: "no GPU anywhere: nothing takes it, each with why",
+                spec: Spec { requester: m("nobody"), ..required() },
+                candidates: vec![
+                    cand(MachineRef::Local, Some(gpu(cap(16, 250, 2), false))),
+                    roomy(),
+                    cand(m("silent"), None),
+                    Candidate { reachable: false, ..cand(m("gone"), Some(gpu(cap(16, 250, 2), true))) },
+                ],
+                want: Err(NoPlace::NoCandidate(vec![
+                    (MachineRef::Local, "GPU not lent"),
+                    (m("big"), "no GPU"),
+                    (m("silent"), "no GPU"),
+                    (m("gone"), "unreachable"),
+                ])),
+                warnings: &[],
+            },
+            Case {
+                name: "a required GPU pinned where none is: refused",
+                spec: Spec { pinned: Some(m("big")), ..required() },
+                candidates: vec![local(), roomy()],
+                want: Err(NoPlace::PinNoGpu(m("big"), "no GPU")),
+                warnings: &[],
+            },
+            Case {
+                name: "a required GPU pinned where it isn't lent: refused",
+                spec: Spec { pinned: Some(m("a")), ..required() },
+                candidates: vec![local(), cand(m("a"), Some(gpu(cap(16, 250, 2), false)))],
+                want: Err(NoPlace::PinNoGpu(m("a"), "GPU not lent")),
+                warnings: &[],
+            },
+            Case {
+                name: "a required GPU pinned where it's lent",
+                spec: Spec { pinned: Some(m("a")), ..required() },
+                candidates: vec![local(), cand(m("a"), Some(gpu(cap(16, 250, 2), true)))],
+                want: Ok(m("a")),
+                warnings: &[],
+            },
+            Case {
+                name: "an optional GPU prefers a lent one over a built image",
+                spec: optional(),
+                candidates: vec![Candidate { has_image: true, ..local() }, cand(m("gpu"), Some(gpu(cap(16, 250, 2), true)))],
+                want: Ok(m("gpu")),
+                warnings: &[],
+            },
+            Case {
+                name: "an optional GPU not lent earns nothing",
+                spec: optional(),
+                candidates: vec![roomy(), cand(m("kept"), Some(gpu(cap(16, 250, 2), false)))],
+                want: Ok(m("big")),
+                warnings: &[],
+            },
+            Case {
+                name: "an optional GPU never filters",
+                spec: optional(),
+                candidates: vec![local()],
+                want: Ok(MachineRef::Local),
+                warnings: &[],
+            },
         ];
         for case in cases {
             let got = place(&case.spec, &case.candidates);
@@ -562,6 +693,15 @@ mod tests {
         let (s, reasons) = score(&Spec { requester: m("x"), ..spec() }, &cand(m("a"), Some(over)));
         assert_eq!(s, 2 * 50 + 75 - 2 * OVER, "mem and slots at 0");
         assert!(reasons.contains(&"over cap: mem 16G/8G, instances 2/1".to_string()), "{reasons:?}");
+        // An optional GPU there: the bonus; the requester's needn't be lent.
+        let opt = Spec { gpu: Some(GpuNeed::Optional), ..spec() };
+        let (s, reasons) = score(&Spec { requester: m("x"), ..opt.clone() }, &cand(m("a"), Some(gpu(cap(16, 250, 2), true))));
+        assert_eq!((s, reasons.last().map(String::as_str)), (425 + GPU, Some("GPU")));
+        let (s, _) = score(&opt, &cand(MachineRef::Local, Some(gpu(cap(16, 250, 2), false))));
+        assert_eq!(s, 425 + GPU + REQUESTER);
+        // A required one filters instead: no bonus.
+        let (s, _) = score(&Spec { gpu: Some(GpuNeed::Required), ..spec() }, &cand(MachineRef::Local, Some(gpu(cap(16, 250, 2), true))));
+        assert_eq!(s, 425 + REQUESTER);
     }
 
     #[test]
@@ -645,6 +785,7 @@ mod tests {
         assert_eq!(NoPlace::UnknownPin(m("x")).to_string(), "no machine `x`");
         assert_eq!(NoPlace::PinUnreachable(m("x")).to_string(), "x is unreachable");
         assert_eq!(NoPlace::PinNoRuntime(m("x")).to_string(), "x has no container runtime");
+        assert_eq!(NoPlace::PinNoGpu(m("x"), "GPU not lent").to_string(), "x can't take a required GPU (GPU not lent)");
         assert_eq!(NoPlace::NoCandidate(vec![]).to_string(), "no machine to place on");
         assert_eq!(
             NoPlace::NoCandidate(vec![(m("a"), "unreachable"), (MachineRef::Local, "unreachable")]).to_string(),

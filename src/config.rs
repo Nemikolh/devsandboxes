@@ -408,7 +408,10 @@ pub enum GpuRequirement {
 }
 
 /// What a sandbox or service needs of a GPU, from [`HostRequirements::gpu_need`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serde is the `fleet.place` wire's (`"required"` | `"optional"`); the
+/// config parses [`GpuRequirement`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GpuNeed {
     Required,
     Optional,

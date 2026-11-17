@@ -1232,7 +1232,8 @@ over-cap note; `no runtime` for a driver).
 
 Where new work goes (fleet plan decision 11: placement runs in the
 daemon). `place::place` is pure over a `Spec` (the sandbox, its
-`config_hash` / `build_hash`, the repo, the requester, an optional pin)
+`config_hash` / `build_hash`, the repo, the requester, an optional pin,
+its GPU need)
 and the `Candidate`s, each a `MachineRef` (this host or a machine name)
 with `reachable`, its `Capacity` (or none yet), `has_image` and
 `has_repo`. It answers a `Placement` (the machine, `warnings`, the
@@ -1243,13 +1244,23 @@ for the control plane's own runs and, through `fleet.place`, for its members'
 - **A pin wins** (`Spec::pinned`: `--machine m` or a qualified name).
   It is refused only when the machine isn't a candidate
   (`NoPlace::UnknownPin`), is unreachable (`NoPlace::PinUnreachable`) or
-  has no container runtime (`NoPlace::PinNoRuntime`); over a cap, it is
+  has no container runtime (`NoPlace::PinNoRuntime`), or, for a required
+  GPU, gives none (`NoPlace::PinNoGpu`, with why); over a cap, it is
   used with a warning.
 - **New work never goes** to an unreachable machine, nor to one whose
   capacity says `runtime: false` (a driver, skipped as `no container
   runtime`, the requester's own host included; no report yet is taken to
   have one). None left: `NoPlace::NoCandidate`, each skipped one with
   why.
+- **A GPU** (`Spec::gpu`, `placed::gpu_need`: required when the sandbox
+  or one of its services requires one, else optional when any asks for
+  one; gpus plan decision 6, fleet plan decision 78). A candidate gives
+  one (`place::gpu_check`) when its capacity's `gpu` is there (no report
+  is no GPU) and lent (`GpuReport::lent`), or when it is the requester's
+  own host, whose run is under no worker policy and needs only the GPU.
+  Required: the others are skipped (`no GPU`, `GPU not lent`). Optional:
+  nothing is skipped; one that gives it scores `GPU` (400).
+  Each placed run's worker still checks it (`check_run`).
 - **Soft caps never refuse.** Among the rest, the highest `place::score`
   wins; ties go to the lowest `MachineRef` (this host first, then
   machines by name). Every exceeded cap (`capacity::over_caps`)
@@ -1265,7 +1276,9 @@ for the control plane's own runs and, through `fleet.place`, for its members'
   cap), cpu ×1 (`running` per cpu, the `cpus` cap lowering the count;
   `0` at one instance per cpu). Then locality: `IMAGE` (300) when
   `has_image`, `REPO` (150) when `has_repo`; and `REQUESTER` (50) when
-  the candidate is the requester's own host.
+  the candidate is the requester's own host. `GPU` sits above `IMAGE`
+  (a missing image costs one build, a missing GPU the whole run) and
+  below the headroom span, so a full GPU host still loses to an idle one.
 
 Candidates come from what the daemon already keeps:
 `Candidate::local` (this host: always reachable) and
@@ -1325,7 +1338,9 @@ destination the same way), so a placed run needs no ssh of its own. A
   each machine and `from_routed` for each routed one, with its fresh
   report. The `Spec` (`placed::spec`) takes the sandbox's
   `config_hash` / `build_hash` from the request root's snapshot when it
-  is watched, and the requester is this host.
+  is watched, its GPU need from the config the tie check loaded
+  (`code::ties_of`; none when it doesn't load), and the requester is
+  this host.
 - **Decide** (`placed::decide`): this host wins (the `REQUESTER` bias
   breaks a tie) → the local verb, unchanged. A machine wins →
   `code::prepare` for it: its fleet root for this host is the row its
@@ -1387,8 +1402,8 @@ over its own paths (`daemon.rs` `placed_run`, `placed::by_control_plane`):
   fresh `API` stream of any path to it (`Handle::open_member`: its link
   while connected, else a route; dial and hello bounded by
   `CAPACITY_WAIT`, the answer by `placed::PLACE_WAIT`, 6 s), with
-  `placed::PlaceParams`: the spec as `placed::spec` built it here (the
-  sandbox and its hashes), this host's capacity now (`Shared::capacity`)
+  `placed::PlaceParams`: the spec as `placed::spec` built it here
+  (`placed::PlaceSpec`: the sandbox, its hashes and its GPU need), this host's capacity now (`Shared::capacity`)
   and `reachable`, the machines this host reaches
   (`placed::reachable_workers`): those with a connected link here and
   the routed ones a path reaches, the control plane among them.

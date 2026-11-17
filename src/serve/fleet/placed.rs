@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 
 use super::code::{Prepared, Unprepared};
 use super::place::{self, Candidate, MachineRef, NoPlace, Placement, Spec};
+use crate::config::{Config, GpuNeed, ResolvedSandbox};
 use crate::serve::api::RootCandidate;
 use crate::serve::capacity::Capacity;
 use crate::serve::snapshots::{Machine, Routed};
@@ -101,10 +102,27 @@ pub fn with_fresh(c: Candidate, fresh: Option<&Capacity>) -> Candidate {
     }
 }
 
-/// What placement places: `sandbox`, its hashes from `root`'s snapshot
-/// (`instances.snapshot` params; none known: no image locality), asked
-/// for on this host, pinned nowhere.
-pub fn spec(sandbox: &str, root: Option<&Value>) -> Spec {
+/// The GPU need placement places `sandbox` of `config` by: required when
+/// it or one of its services requires one, else optional when any asks
+/// for one, else none. A service that doesn't resolve is the run's to
+/// report.
+pub fn gpu_need(config: &Config, sandbox: &ResolvedSandbox) -> Option<GpuNeed> {
+    let own = sandbox.properties.host_requirements.as_ref().and_then(|h| h.gpu_need());
+    let services = sandbox.properties.services.iter().flatten().filter_map(|name| {
+        config.resolve_service(name).ok()?.spec.host_requirements.as_ref()?.gpu_need()
+    });
+    let needs: Vec<GpuNeed> = own.into_iter().chain(services).collect();
+    if needs.contains(&GpuNeed::Required) {
+        Some(GpuNeed::Required)
+    } else {
+        needs.first().copied()
+    }
+}
+
+/// What placement places: `sandbox` with its GPU need `gpu` ([`gpu_need`]),
+/// its hashes from `root`'s snapshot (`instances.snapshot` params; none
+/// known: no image locality), asked for on this host, pinned nowhere.
+pub fn spec(sandbox: &str, gpu: Option<GpuNeed>, root: Option<&Value>) -> Spec {
     let row = root
         .and_then(|r| r.get("sandboxes")?.as_array()?.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(sandbox)));
     let hash = |k: &str| row.and_then(|s| s.get(k)?.as_str()).filter(|h| !h.is_empty()).map(str::to_owned);
@@ -115,6 +133,7 @@ pub fn spec(sandbox: &str, root: Option<&Value>) -> Spec {
         repo: None,
         requester: MachineRef::Local,
         pinned: None,
+        gpu,
     }
 }
 
@@ -219,13 +238,15 @@ pub fn moved(ask: &Ask, name: &str, lines: Vec<String>, prepare: impl FnOnce(&st
     }
 }
 
-/// What a member's `fleet.place` names of its spec: the sandbox and its
-/// hashes ([`spec`]); the control plane fills in the requester.
+/// What a member's `fleet.place` names of its spec: the sandbox, its
+/// hashes and its GPU need ([`spec`]); the control plane fills in the
+/// requester.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceSpec {
     pub sandbox: String,
     pub config_hash: Option<String>,
     pub build_hash: Option<String>,
+    pub gpu: Option<GpuNeed>,
 }
 
 /// `fleet.place`'s params (docs/reference/api.md, *fleet*): the member's
@@ -242,7 +263,12 @@ pub struct PlaceParams {
 impl PlaceParams {
     /// A member's ask: `spec` as [`spec`] built it.
     pub fn of(spec: &Spec, capacity: Capacity, reachable: Vec<String>) -> PlaceParams {
-        let spec = PlaceSpec { sandbox: spec.sandbox.clone(), config_hash: spec.config_hash.clone(), build_hash: spec.build_hash.clone() };
+        let spec = PlaceSpec {
+            sandbox: spec.sandbox.clone(),
+            config_hash: spec.config_hash.clone(),
+            build_hash: spec.build_hash.clone(),
+            gpu: spec.gpu,
+        };
         PlaceParams { spec, capacity, reachable }
     }
 }
@@ -304,6 +330,7 @@ pub fn for_member(
         repo: None,
         requester: requester.clone(),
         pinned: None,
+        gpu: ask.spec.gpu,
     };
     // The request came over its link: reachable, whatever the last state.
     let asker = match machines.iter().find(|m| m.name == from) {
@@ -547,7 +574,7 @@ mod tests {
     /// A fresh `capacity.get` answer over the saved report; none: the saved one.
     #[test]
     fn a_fresh_report_replaces_the_saved_one() {
-        let s = spec("web", None);
+        let s = spec("web", None, None);
         let saved = cap(4, 6, None);
         let m = worker("lap", MachineKind::Inbound, LinkState::Connected, Some(saved.clone()));
         let fresh = cap(28, 0, None);
@@ -567,10 +594,10 @@ mod tests {
     #[test]
     fn the_spec_takes_the_roots_hashes() {
         let root = json!({"dir": "/r", "sandboxes": [{"name": "api", "config_hash": "c9"}, {"name": "web", "config_hash": "c1", "build_hash": ""}]});
-        let s = spec("web", Some(&root));
+        let s = spec("web", None, Some(&root));
         assert_eq!((s.config_hash.as_deref(), s.build_hash, s.requester, s.pinned), (Some("c1"), None, MachineRef::Local, None));
-        assert_eq!(spec("web", None).config_hash, None);
-        assert_eq!(spec("nope", Some(&root)).config_hash, None);
+        assert_eq!(spec("web", None, None).config_hash, None);
+        assert_eq!(spec("nope", None, Some(&root)).config_hash, None);
     }
 
     #[test]
@@ -581,7 +608,7 @@ mod tests {
             worker("nb", MachineKind::Inbound, LinkState::Connected, None),
             worker("off", MachineKind::Ssh, LinkState::Unreachable, None),
         ];
-        let c = candidates(&spec("web", None), Some(cap(16, 2, None)), &[], &machines, &[], &BTreeMap::new());
+        let c = candidates(&spec("web", None, None), Some(cap(16, 2, None)), &[], &machines, &[], &BTreeMap::new());
         let names: Vec<_> = c.iter().map(|c| (c.machine.to_string(), c.reachable)).collect();
         let want = [("this host", true), ("srv", true), ("lap", true), ("nb", true), ("off", false)];
         assert_eq!(names, want.map(|(n, r)| (n.to_string(), r)));
@@ -590,7 +617,7 @@ mod tests {
         // itself: those are the routed ones (`Handle::routed`), passed apart.
         let mut control_plane = worker("k", MachineKind::Ssh, LinkState::Connected, None);
         control_plane.fleet = Some(Arc::new(json!({"machines": [{"name": "x", "state": "connected"}], "instances": []})));
-        let seen = candidates(&spec("web", None), None, &[], std::slice::from_ref(&control_plane), &[], &BTreeMap::new());
+        let seen = candidates(&spec("web", None, None), None, &[], std::slice::from_ref(&control_plane), &[], &BTreeMap::new());
         assert_eq!(seen.iter().map(|c| c.machine.to_string()).collect::<Vec<_>>(), ["this host", "k"]);
         assert_eq!(reachable_workers(std::slice::from_ref(&control_plane), &[]), ["k"]);
         assert_eq!(c[0].capacity.as_ref().map(|c| c.running), Some(2));
@@ -599,8 +626,8 @@ mod tests {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
         for kind in [MachineKind::Inbound, MachineKind::Ssh] {
             let roomy = [worker("m", kind, LinkState::Connected, Some(cap(28, 0, None)))];
-            let c = candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &roomy, &[], &BTreeMap::new());
-            let placed = decide(&Ask::default(), &spec("web", None), &c, |_| Ok(prepared("main")));
+            let c = candidates(&spec("web", None, None), Some(cap(4, 3, over.clone())), &[], &roomy, &[], &BTreeMap::new());
+            let placed = decide(&Ask::default(), &spec("web", None, None), &c, |_| Ok(prepared("main")));
             assert!(matches!(&placed, Placed::Worker { name, .. } if name == "m"), "{kind:?}: {placed:?}");
         }
     }
@@ -620,7 +647,7 @@ mod tests {
         assert_eq!(reachable_workers(&machines, &r), ["k", "b"]);
         assert!(worth_placing(&[], &r[..1]), "a routed one alone is worth placing");
         assert!(!worth_placing(&[], &r[1..]), "no path up: not");
-        let s = spec("web", None);
+        let s = spec("web", None, None);
         let c = candidates(&s, Some(cap(16, 2, None)), &[], &machines, &r, &BTreeMap::new());
         let names: Vec<_> = c.iter().map(|c| (c.machine.to_string(), c.reachable, c.has_image)).collect();
         assert_eq!(names, [("this host", true, false), ("k", true, false), ("b", true, false), ("far", false, false)].map(|(n, r, i)| (n.to_string(), r, i)));
@@ -647,7 +674,7 @@ mod tests {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
         let machines = [worker("lap", MachineKind::Inbound, LinkState::Connected, None)];
         let r = [routed("b", LinkState::Connected, None), routed("c", LinkState::Connected, None)];
-        let a = PlaceParams::of(&spec("web", None), cap(4, 3, over.clone()), names(&["box", "b"]));
+        let a = PlaceParams::of(&spec("web", None, None), cap(4, 3, over.clone()), names(&["box", "b"]));
         assert_eq!(member_workers(&a, "lap", &machines, &r), ["b"], "c: lap doesn't reach it");
         let fresh = BTreeMap::from([("b".to_string(), cap(30, 0, None)), ("c".to_string(), cap(31, 0, None))]);
         let got = for_member(&a, "lap", "box", cap(4, 3, over), &[], &machines, &r, &fresh).unwrap();
@@ -662,8 +689,8 @@ mod tests {
     #[test]
     fn the_decision() {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
-        let busy_here = || candidates(&spec("web", None), Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, None)))], &[], &BTreeMap::new());
-        let idle_here = || candidates(&spec("web", None), Some(cap(28, 0, None)), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(4, 6, None)))], &[], &BTreeMap::new());
+        let busy_here = || candidates(&spec("web", None, None), Some(cap(4, 3, over.clone())), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, None)))], &[], &BTreeMap::new());
+        let idle_here = || candidates(&spec("web", None, None), Some(cap(28, 0, None)), &[], &[worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(4, 6, None)))], &[], &BTreeMap::new());
         let asked = RefCell::new(Vec::new());
         let ok = |branch: &'static str| {
             let asked = &asked;
@@ -672,7 +699,7 @@ mod tests {
                 Ok(prepared(branch))
             }
         };
-        let s = spec("web", None);
+        let s = spec("web", None, None);
         let ask = Ask::default();
 
         // This host has more room: here, nothing moved.
@@ -733,7 +760,7 @@ mod tests {
     #[test]
     fn the_control_plane_places_a_members_run() {
         let over = Some(Caps { instances: Some(1), ..Caps::default() });
-        let ask = |capacity: Capacity, reachable: &[&str]| PlaceParams::of(&spec("web", None), capacity, names(reachable));
+        let ask = |capacity: Capacity, reachable: &[&str]| PlaceParams::of(&spec("web", None, None), capacity, names(reachable));
         let machines = [
             worker("lap", MachineKind::Inbound, LinkState::Connected, Some(cap(28, 0, None))),
             worker("srv", MachineKind::Ssh, LinkState::Connected, None),
@@ -786,6 +813,61 @@ mod tests {
             .map(|o| format!("'{}'", serde_json::to_value(o).unwrap().as_str().unwrap()))
             .collect();
         assert_eq!(crate::serve::dts::union_members("FleetPlaceOn"), on);
+    }
+
+    /// A required GPU travels in `fleet.place`: the control plane places it
+    /// only where one is lent, or on the requester when it has one.
+    #[test]
+    fn the_control_plane_places_a_members_gpu() {
+        use crate::serve::capacity::GpuReport;
+        let with_gpu = |c: Capacity, lent| Capacity { gpu: Some(GpuReport { count: None, lent }), ..c };
+        let gpu_spec = |need| Spec { gpu: Some(need), ..spec("web", None, None) };
+        let machines = [worker("srv", MachineKind::Ssh, LinkState::Connected, None)];
+        let fresh = BTreeMap::from([("srv".to_string(), with_gpu(cap(4, 3, None), true))]);
+        // A roomy requester and control plane without one: the lent GPU on srv.
+        let a = PlaceParams::of(&gpu_spec(GpuNeed::Required), cap(28, 0, None), names(&["box", "srv"]));
+        let got = for_member(&a, "lap", "box", cap(28, 0, None), &[], &machines, &[], &fresh).unwrap();
+        assert_eq!((got.on, got.machine.as_str()), (PlaceOn::Machine, "srv"));
+        // The requester's own GPU, lent or not.
+        let a = PlaceParams::of(&gpu_spec(GpuNeed::Required), with_gpu(cap(4, 3, None), false), names(&["box", "srv"]));
+        let got = for_member(&a, "lap", "box", cap(28, 0, None), &[], &machines, &[], &BTreeMap::new()).unwrap();
+        assert_eq!(got.on, PlaceOn::Requester);
+        // None anywhere: no place, each with why.
+        let a = PlaceParams::of(&gpu_spec(GpuNeed::Required), cap(28, 0, None), names(&["box"]));
+        let e = for_member(&a, "lap", "box", with_gpu(cap(28, 0, None), false), &[], &machines, &[], &BTreeMap::new()).unwrap_err();
+        assert_eq!(e.to_string(), "no machine takes new work (lap: no GPU, box: GPU not lent)");
+
+        // The wire: lowercase, `null` without one.
+        let params = serde_json::to_value(PlaceParams::of(&gpu_spec(GpuNeed::Optional), cap(4, 3, None), names(&["box"]))).unwrap();
+        assert_eq!(params["spec"]["gpu"], "optional");
+        assert_eq!(serde_json::from_value::<PlaceParams>(params.clone()).unwrap().spec.gpu, Some(GpuNeed::Optional));
+        crate::serve::dts::assert_matches("FleetPlaceSpec", &params["spec"]);
+        let params = serde_json::to_value(PlaceParams::of(&gpu_spec(GpuNeed::Required), cap(4, 3, None), names(&["box"]))).unwrap();
+        assert_eq!(params["spec"]["gpu"], "required");
+        crate::serve::dts::assert_matches("FleetPlaceSpec", &params["spec"]);
+        assert_eq!(serde_json::to_value(PlaceParams::of(&spec("web", None, None), cap(4, 3, None), vec![])).unwrap()["spec"]["gpu"], Value::Null);
+    }
+
+    #[test]
+    fn the_gpu_need_counts_the_services() {
+        let need = |extra: &str| {
+            let text = format!(
+                "[services.gpu]\nimage = \"ollama\"\nhostRequirements.gpu = true\n\
+                 [services.opt]\nimage = \"ollama\"\nhostRequirements.gpu = \"optional\"\n\
+                 [services.db]\nimage = \"postgres\"\n\
+                 [sandbox.s]\nimage = \"alpine\"\n{extra}\n"
+            );
+            let config = Config::parse(&text).unwrap();
+            gpu_need(&config, &config.resolve_sandbox("s").unwrap())
+        };
+        assert_eq!(need(""), None);
+        assert_eq!(need("services = [\"db\"]"), None);
+        assert_eq!(need("hostRequirements.gpu = false\nservices = [\"db\"]"), None);
+        assert_eq!(need("hostRequirements.gpu = true"), Some(GpuNeed::Required));
+        assert_eq!(need("hostRequirements.gpu = \"optional\""), Some(GpuNeed::Optional));
+        assert_eq!(need("services = [\"db\", \"opt\"]"), Some(GpuNeed::Optional));
+        assert_eq!(need("services = [\"opt\", \"gpu\"]"), Some(GpuNeed::Required));
+        assert_eq!(need("hostRequirements.gpu = \"optional\"\nservices = [\"gpu\"]"), Some(GpuNeed::Required));
     }
 
     /// The member's side: the control plane's answer, or why none came.
