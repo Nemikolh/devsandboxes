@@ -308,7 +308,7 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
             eprintln!("warning: found no devsandbox on {target}, and {why}: install it there yourself");
             return Ok(None);
         }
-        // Today's behaviour: the daemon warns about the other version.
+        // Left as is: the daemon warns about the other version.
         eprintln!("note: {why}: leaving its devsandbox as it is");
         return Ok(found_command);
     }
@@ -660,8 +660,8 @@ pub enum RootsOp {
 
 /// `machine roots [add|rm] [<path>…]`: this host's picked roots
 /// (`member.toml`'s `roots`): shown (`member.get`), added or removed
-/// (`member.set {roots_add|roots_rm}`). The paths are resolved here, where
-/// they are: `machine add` runs `roots add` on the machine over ssh.
+/// (`member.set {roots_add|roots_rm}`). The paths are resolved here: `~` and
+/// relative paths are the caller's, which the daemon doesn't know.
 pub fn roots(op: RootsOp) -> Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
