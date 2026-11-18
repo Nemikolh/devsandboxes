@@ -44,6 +44,9 @@ const L = {
   adr44: { label: 'ADR 0044', path: 'docs/decisions/0044-one-fleet-authority-signs-membership.md' } as SourceLink,
   adr45: { label: 'ADR 0045', path: 'docs/decisions/0045-a-routed-stream-proves-its-origin-per-stream.md' } as SourceLink,
   adr46: { label: 'ADR 0046', path: 'docs/decisions/0046-routed-streams-are-end-to-end-sessions.md' } as SourceLink,
+  adr49: { label: 'ADR 0049', path: 'docs/decisions/0049-the-authority-signs-a-config-every-member-runs.md' } as SourceLink,
+  adr53: { label: 'ADR 0053', path: 'docs/decisions/0053-the-authority-pins-the-fleets-build.md' } as SourceLink,
+  adr56: { label: 'ADR 0056', path: 'docs/decisions/0056-a-gpu-is-placed-where-a-worker-lends-one.md' } as SourceLink,
   src: (label: string, path: string, rev?: string): SourceLink => ({ label, path, rev }),
 };
 
@@ -56,13 +59,13 @@ export const why: Card[] = [
     title: 'Why change anything?',
     summary: md(
       'At `7716cb8` a machine was something you could drive from here, and little more. Seven problems, and what each one is now:',
-      "<br><a href='#why-capacity'>**Machines were remote controls, not capacity.**</a> Ask, and the control plane picks the machine for you.",
-      "<br><a href='#why-laptop'>**A laptop could use other machines but not be used by them.**</a> Whichever side can reach the other connects, both sides use it, and machines with no link between them reach each other through those that have one.",
-      "<br><a href='#why-one-connection'>**Every use opened a new ssh connection, with nothing limiting it.**</a> One connection per pair of machines carries everything, both ends prove who they are on it, and each machine sets its own limits.",
-      "<br><a href='#why-always-on'>**Connections only lasted while someone was looking.**</a> They stay up, every member sees the fleet through the control plane, and the control plane remembers what it last saw.",
-      "<br><a href='#why-code'>**A sandbox only ran where its config and code were.**</a> The control plane sends what's needed.",
-      "<br><a href='#why-versions'>**Versions had to be upgraded by hand on every machine.**</a> Machines follow the build the authority pinned.",
-      "<br><a href='#why-keys'>**SSH keys needed a connection of their own.**</a> Your agent is a grant to a member, reaching it over the fleet's own streams (optional).",
+      "<br><a href='#why-capacity'>**Machines were remote controls, not capacity.**</a> Ask, and the control plane picks the machine.",
+      "<br><a href='#why-laptop'>**A laptop could use other machines but not be used by them.**</a> Whichever side can reach the other connects, and others are reached through it.",
+      "<br><a href='#why-one-connection'>**Every use opened a new ssh, with nothing limiting it.**</a> One proven connection per pair; each machine sets its own limits.",
+      "<br><a href='#why-always-on'>**Connections only lasted while someone was looking.**</a> They stay up, and the control plane remembers the fleet.",
+      "<br><a href='#why-code'>**A sandbox only ran where its config and code were.**</a> devsandbox moves both, work in progress included.",
+      "<br><a href='#why-versions'>**Versions were upgraded by hand on every machine.**</a> Members follow the build the authority pinned.",
+      "<br><a href='#why-keys'>**SSH keys needed a connection of their own.**</a> Your agent is a grant to a member (optional).",
       "<br><a href='#why-lending'>**Why the lending detour was dropped.**</a> Two kinds of machine became one.",
     ),
     links: [L.plan(BEFORE), L.plan(), L.adr43, L.adr44, L.adr46],
@@ -72,24 +75,24 @@ export const why: Card[] = [
     tag: 'Problem 1',
     title: 'Machines were remote controls, not capacity',
     summary: md(
-      'Adding a machine let you drive it from here, but you always picked the box yourself, and nothing knew which box had room.',
-      '**Now `run --place` asks the control plane to pick the machine:** every machine reports its CPUs, memory, disk and running count.',
+      'You always picked the box yourself, and nothing knew which box had room.',
+      '**Now `run --place` asks the control plane to pick:** every machine reports its CPUs, memory, disk, GPU and running count.',
     ),
     layers: howLayer(
-      "A plain `run` stays on the member whose config it names. `run --place`, typed on any member, asks the control plane (`fleet.place`), which scores every machine both of them reach, by a link or a route (soft caps, image already built, a small preference for staying put); the member then moves the code there over its own links. With the control plane out of reach it runs here, with a note. A sandbox tied to its host (a bind outside what moves, `${localEnv:…}`, the runtime socket…) or pinned with `placement = \"home\"` stays home. See <a href='#phase-step-9'>Step 9</a>.",
+      "A plain `run` stays on the member whose config it names. `run --place` asks the control plane (`fleet.place`), which scores every machine both reach (soft caps, image already built, a small preference for staying put); the member then moves the code there itself. A sandbox requiring a GPU goes only to a worker lending one (or stays home); an optional GPU is a score bonus. A sandbox tied to its host (a bind outside what moves, `${localEnv:…}`, the runtime socket…) or pinned with `placement = \"home\"` stays home. See <a href='#phase-step-9'>Step 9</a>.",
     ),
-    links: [L.plan(BEFORE), L.src('Placement', 'src/serve/fleet/place.rs'), L.src('Candidates', 'src/serve/fleet/placed.rs'), L.src('Ties', 'src/serve/fleet/code/mod.rs'), L.src('Capacity report', 'src/serve/capacity.rs')],
+    links: [L.adr56, L.src('Placement', 'src/serve/fleet/place.rs'), L.src('Candidates', 'src/serve/fleet/placed.rs'), L.src('Ties', 'src/serve/fleet/code/mod.rs'), L.src('Capacity report', 'src/serve/capacity.rs')],
   },
   {
     id: 'why-laptop',
     tag: 'Problem 2',
     title: 'A laptop could use other machines but not be used by them',
     summary: md(
-      'Every connection was an ssh login into the other machine, so a server could only use a laptop if the laptop accepted ssh logins from it. The design rules that out on purpose.',
+      'Every connection was an ssh login into the other machine, so a server could only use a laptop that accepted ssh logins.',
       '**Now whichever side can reach the other makes the connection, and both sides use it.**',
     ),
     layers: howLayer(
-      "The laptop runs `devsandbox machine add <control-plane>`. From then on the control plane sees the laptop as one of its machines and can run work there, while the laptop never accepts an ssh login. The control plane's other machines show on the laptop as `routed via <control-plane>`, and its commands reach them through the control plane. See <a href='#phase-step-8'>Step 8</a>, <a href='#phase-step-10b'>Step 10b</a> and <a href='#three-machines'>Three machines</a>.",
+      "The laptop runs `devsandbox machine add <control-plane>`; the control plane then sees it as one of its machines without ever logging into it. The control plane's other machines show on the laptop as `routed via <control-plane>`. See <a href='#phase-step-8'>Step 8</a>, <a href='#phase-step-10b'>Step 10b</a> and <a href='#three-machines'>Three machines</a>.",
     ),
     links: [L.adr43, L.machinesDoc(), L.src('Inbound machines', 'src/serve/machines/inbound.rs'), L.src('Route sockets', 'src/serve/fleet/routes.rs')],
   },
@@ -98,11 +101,11 @@ export const why: Card[] = [
     tag: 'Problem 3',
     title: 'Every use opened a new ssh connection, with nothing limiting it',
     summary: md(
-      'The background connection, every `run` or `stop`, every terminal, every port forward and the key forwarding each started their own ssh, and each could reach all of devsandbox on that machine.',
+      'The background link, every verb, terminal, port forward and the key forwarding each started their own ssh, each able to reach all of devsandbox there.',
       '**Now one connection per pair of machines carries everything, and each machine decides how much the others may do.**',
     ),
     layers: howLayer(
-      "The default, `worker`, lets other machines run and manage the sandboxes this machine already has, plus work placed on it, kept in a separate folder under a strict policy; never its settings, its machine list or host maintenance such as `gc`. `full` opens everything, and you set it only on that machine (`devsandbox machine trust worker|full`). Each end proves its member key on the link, so trust applies to a proven member, not a name. See <a href='#phase-step-7'>Step 7</a>, <a href='#phase-step-10a'>Step 10a</a> and <a href='#command-by-command'>Command by command</a>.",
+      "The default trust, `worker`, lets others manage the sandboxes this machine already has, plus work placed on it under a strict policy (loosened per host with `machine allow`); never its settings, machine list or host maintenance such as `gc`. `full` opens everything, set only on that machine (`machine trust worker|full`). Each end proves its member key on the link, so trust applies to a proven member. See <a href='#phase-step-7'>Step 7</a> and <a href='#phase-step-10a'>Step 10a</a>.",
     ),
     links: [L.machinesDoc(), L.src('Trust table', 'src/serve/fleet/lent.rs'), L.src('Transport', 'src/serve/fleet/transport.rs'), L.src('Key proof', 'src/serve/fleet/proof.rs')],
   },
@@ -111,11 +114,11 @@ export const why: Card[] = [
     tag: 'Problem 4',
     title: 'Connections only lasted while someone was looking',
     summary: md(
-      "A machine's connection opened when a dashboard or command wanted it and dropped 60 s later, and its rows were forgotten on restart.",
-      '**Now connections stay up for as long as both machines are up, and the control plane remembers what it last saw.**',
+      "A link opened when something wanted it and dropped 60 s later; its rows were forgotten on restart.",
+      '**Now links stay up while both machines are, and the control plane remembers what it last saw.**',
     ),
     layers: howLayer(
-      "Each machine a host connects to keeps that host's daemon running. A member watches the control plane's federated view, so the control plane's other machines show there too. The control plane saves the other machines' rows (`remotes.json`), so after a restart it shows the fleet before they reconnect. See <a href='#phase-step-9'>Step 9</a>.",
+      "Each link keeps both daemons running. A member watches the control plane's federated view, so it sees the whole fleet. The control plane saves the rows (`remotes.json`), so after a restart it shows the fleet before the others reconnect. See <a href='#phase-step-9'>Step 9</a>.",
     ),
     links: [L.src('Idle countdown', 'src/serve/idle.rs'), L.src('Saved rows', 'src/serve/machines/saved.rs'), L.src('Held machines', 'src/serve/machines/service.rs')],
   },
@@ -123,14 +126,11 @@ export const why: Card[] = [
     id: 'why-code',
     tag: 'Problem 5',
     title: 'A sandbox only ran where its config and code were',
-    summary: md(
-      'Running `web` on another box meant copying its config and checkout there by hand.',
-      "**Now the control plane sends what's needed.**",
-    ),
+    summary: md('Running `web` on another box meant copying its config and checkout there by hand.', '**Now devsandbox moves both.**'),
     layers: howLayer(
-      "When a run is placed elsewhere, the host it was typed on sends the config folder as an archive and each repo's branch, which it fetched from the git remote with its own credentials, so the other machine needs none. Only committed, pushed work moves for now; repos with no remote or unpushed work wait for step 12.",
+      "A placed run sends the config folder as an archive and each folder's branch plus a snapshot of its uncommitted work, straight from its checkout: no remote, no credentials on the worker. Repeat sends carry only the delta, and `devsandbox fetch <machine>/<instance>` brings the work back as hidden refs. Separately, a config the authority runs is signed, and every member installs that version (ADR 0049). See <a href='#phase-step-12'>Step 12</a>.",
     ),
-    links: [L.src('Code transfer', 'src/serve/fleet/code/mod.rs'), L.src('File transfer', 'src/serve/fleet/transfer.rs'), L.status],
+    links: [L.src('Code transfer', 'src/serve/fleet/code/mod.rs'), L.src('Fetch-back', 'src/serve/fleet/code/fetch.rs'), L.adr49, L.status],
   },
   {
     id: 'why-versions',
@@ -138,35 +138,32 @@ export const why: Card[] = [
     title: 'Versions had to be upgraded by hand on every machine',
     summary: md(
       "If two machines' protocols didn't match, the machine just showed as unreachable.",
-      "**Now machines follow the build the fleet's authority pinned, downgrades included.**",
+      "**Now members follow the build the fleet's authority pinned, downgrades included.**",
     ),
     layers: howLayer(
-      'The authority (the member whose key signs the membership log) pins its own build in the log whenever its daemon starts on a new one. Every other member, the control plane included, compares itself with that pin on each link: a pinned release is downloaded and checked against its signed checksums; a pinned dev build is copied over a link from any peer that has it, checked against the pin\'s sha256, and taken only by a machine that accepts dev builds (`dev-builds = true` or `full` trust) on the same OS and CPU type. Then it restarts its daemon. A machine that can\'t or won\'t take the pin keeps its build and stays linked, shown `behind: <why>` (`machine ls`, the dashboard header) on both ends, not unreachable.',
+      "The authority pins its own build in the membership log whenever its daemon starts on a new one. Every other member, the control plane included, compares itself with the pin on each link: a published release is downloaded and checked against its signed checksums; a dev build is copied from any peer that has it, and taken only with `dev-builds = true` or `full` trust on the same OS and CPU. A member that can't follow stays linked, shown `behind: <why>`. ADR 0053.",
     ),
-    links: [L.adr20, L.src('Update decision', 'src/serve/fleet/update.rs'), L.status],
+    links: [L.adr53, L.src('Update decision', 'src/serve/fleet/update.rs'), L.status],
   },
   {
     id: 'why-keys',
     tag: 'Problem 7 · optional',
     title: 'SSH keys needed a connection of their own',
-    summary: md(
-      'Lending your ssh keys to a machine took one more ssh, running beside the rest.',
-      "**Now your agent is a grant to a member, and travels over the fleet's own streams.**",
-    ),
+    summary: md('Lending your ssh keys to a machine took one more ssh.', "**Now your agent is a grant to a member, over the fleet's own streams.**"),
     layers: howLayer(
-      "Off by default. `machine set <m> --agent on` (or `machine add --agent`) writes a grant into this host's `member.toml`, by `m`'s member key, following its rotations. Any machine can be granted (registered, inbound or routed): it reaches your agent over its link to you, whichever end dialed, or routed through others, end to end, so no relay can grant or read it. See <a href='#phase-step-10c'>Step 10c</a>.",
+      "Off by default. `machine set <m> --agent on` writes a grant into this host's `member.toml`, by `m`'s member key. Any machine can be granted; it reaches your agent over its link or routed, end to end, so no relay can grant or read it. See <a href='#phase-step-10c'>Step 10c</a>.",
     ),
-    links: [L.adr36(), L.adr46, L.src('Grants', 'src/serve/fleet/grants.rs'), L.src('Agent routes', 'src/serve/fleet/agent_routes.rs'), L.src('Agent relay (removed)', 'src/commands/agent_relay.rs', BEFORE)],
+    links: [L.adr36(), L.adr46, L.src('Grants', 'src/serve/fleet/grants.rs'), L.src('Agent routes', 'src/serve/fleet/agent_routes.rs')],
   },
   {
     id: 'why-lending',
     tag: 'Steps 1–6 · superseded',
     title: 'Why the lending detour was dropped',
     summary: md(
-      'Steps 1–6 added a second kind of machine: a laptop “lent” itself to a control plane with `fleet join`, the control plane could only see a separate lent folder, and ssh machines kept working the old way.',
+      'Steps 1–6 added a second kind of machine: a laptop “lent” itself to a control plane with `fleet join`, which saw only a separate lent folder, while ssh machines kept working the old way.',
     ),
     layers: howLayer(
-      "That meant two ways to add a machine, and a laptop's own sandboxes were invisible to the rest of the fleet. Steps 7–8 merged the two: every machine is added with `machine add` and reached over one connection, and how much others may do is that machine's own trust setting. See <a href='#phase-steps-1-6'>Steps 1–6</a>.",
+      "Two ways to add a machine, and a laptop's own sandboxes invisible to the fleet. Steps 7–8 merged them: every machine is added with `machine add`, reached over one connection, and limited by its own trust setting. See <a href='#phase-steps-1-6'>Steps 1–6</a>.",
     ),
     links: [L.plan(), L.adr43, L.src('Lending (removed)', 'src/commands/lend.rs', MIDDLE)],
   },
@@ -182,31 +179,12 @@ export const phases: Card[] = [
       {
         label: 'What',
         body: md(
-          '`machine add` registers an ssh target in `machines.toml`. The local daemon links to the machine\'s daemon over `ssh <m> devsandbox api --stdio`, merges its rows into snapshots and forwards requests. Everything else (verbs, terminals, CLI re-runs, forwards, agent) is a separate ssh.',
+          "`machine add` registers an ssh target in `machines.toml`. The daemon links to the machine's daemon over `ssh <m> devsandbox api --stdio`, merges its rows and forwards requests. Verbs, terminals, CLI re-runs, forwards and the agent relay are each a separate ssh. The protocol must match (ADR 0020); remote rows are memory-only; federation is one hop.",
         ),
       },
       {
-        label: 'How',
-        body: ul([
-          '`Machines` runs one `serve-machine-<name>` thread per machine. The link connects only while wanted (a `machines: true` watcher, a queued call, a `Want`) plus `Timing::linger` 60 s.',
-          'Quick calls share the held link. Each forwarded verb spawns its own `ssh_dial` (`api_argv`).',
-          'CLI named commands on a machine are re-run as `ssh [-t] <target> devsandbox <args>` (`cli_argv`). With `agent` on, the command holds the machine with `machines.hold`.',
-          'A separate `serve-machine-<name>-agent` thread runs `ssh <m> devsandbox agent-relay --client machine:<host>`, which binds `agent-<client>.sock` on the machine (ADR 0036).',
-          'The hello says `0.0.0` and the protocol must match (ADR 0020). Remote rows are memory-only. Federation is one hop.',
-        ]),
-      },
-      {
-        label: 'Modules',
-        body: ul([
-          '`src/serve/machines/ssh.rs`: `api_argv`, `tty_argv`, `tty_argv_with`, `cli_argv`, `tunnel_argv`, `agent_argv`, `script_argv`, `ssh_dial`, `ssh_agent_dial`, `skip_lines`',
-          '`machines/service.rs`: `Machines`, `Want`, `Timing::linger`, `agent_loop`; `machines/agent.rs`: `serve`, `SENTINEL`; `machines/link.rs`: `client_name` = `machine:<hostname>`',
-          '`machines/cli.rs`: `route`, `plan`, `machine_use`, `MachineUse::{Once,PerRoot,Verb,Port,Named,Refused}`, `hold`, `hold_params`, `reconnect_loop`, `session_dials`, `spawn_ssh_owning_signals`; `machines/forward.rs`: `QUICK`, `verb`',
-          '`src/commands/agent_relay.rs`; `src/serve/relay.rs` (`--session-env`, `SessionEnv`, `write_sentinel`); `src/commands/tunnel.rs` (`remote_opener`); `src/serve/forwards.rs` (`batch_tunnel_argv`); `src/tui/remote.rs` (`tty_argv` tabs); `src/serve/endpoint.rs` (`agent_socket`, `agent_sockets`)',
-        ]),
-      },
-      {
         label: 'Code',
-        body: md('The link and the agent relay are two ssh argvs side by side; a link is held only while wanted.'),
+        body: md('The link and the agent relay are two ssh argvs side by side.'),
         snippets: [
           {
             title: 'src/serve/machines/ssh.rs',
@@ -215,107 +193,40 @@ export const phases: Card[] = [
             code: `pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     let args = ["api", "--stdio", "--client", client, "--session-env"];
     argv(entry, &["-T", "-o", "BatchMode=yes"], &args)
-}`,
-          },
-          {
-            title: 'src/serve/machines/ssh.rs',
-            lang: 'rust',
-            rev: BEFORE,
-            code: `pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
+}
+
+pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     argv(entry, &["-T", "-o", "BatchMode=yes"], &["agent-relay", "--client", client])
 }`,
           },
-          {
-            title: 'src/serve/machines/service.rs',
-            lang: 'rust',
-            rev: BEFORE,
-            code: `//! A link connects only while wanted: while some local connection
-//! watches with \`machines: true\` ([\`Hooks::watching\`]), a forwarded call
-//! is queued, or a [\`Want\`] holds the machine (a forwarded verb), and for
-//! [\`Timing::linger\`] after. Connected, it subscribes to`,
-          },
         ],
       },
-      {
-        label: 'Key commits',
-        body:
-          md('None in range: this is the starting point. The prerequisites that landed just after it:') +
-          ul([
-            '`b2547f1` docs(plans): order resumable-exec, helper-rpc and fleet…',
-            "`30c14bb` docs(plans): …the user's fleet decisions",
-            '`65f14ff` feat(devsbd): an RPC channel the host opens on the bridge…',
-            "`bed361d` feat(serve): a HelperClient over each bridge's RPC channel…",
-            "`5a03e86` feat(devsbd): session attach, ls and rm over RPC… (what step 4's PTY rides)",
-          ]),
-      },
     ],
-    links: [
-      L.machinesDoc(BEFORE),
-      L.adr20,
-      L.adr36(BEFORE),
-      L.plan(BEFORE),
-      L.src('ssh argvs', 'src/serve/machines/ssh.rs', BEFORE),
-      L.src('Agent relay', 'src/commands/agent_relay.rs', BEFORE),
-    ],
+    links: [L.machinesDoc(BEFORE), L.adr20, L.adr36(BEFORE), L.plan(BEFORE), L.src('ssh argvs', 'src/serve/machines/ssh.rs', BEFORE)],
   },
   {
     id: 'phase-steps-1-6',
     tag: 'Steps 1–6 · e8f1123..3ce588f · superseded',
     title: 'The fleet link, and lending (superseded)',
     summary: md(
-      'A frame-mux link carries the API (later PTY/TUNNEL/TRANSFER/AGENT). Laptops **lend** themselves by dialing the control plane. ssh machines stay on per-use ssh. Two kinds of machine; steps 7–8 replaced this.',
+      'A frame-mux link carries the API, then PTY, TUNNEL, TRANSFER and AGENT. Laptops **lend** themselves by dialing the control plane; ssh machines stay on per-use ssh. Steps 7–8 replaced this.',
     ),
     layers: [
       {
         label: 'What',
         body: md(
-          'A laptop runs `devsandbox fleet join <control-plane>` (or `lend on`). Its daemon dials the control plane, and the control plane lists it as an `offered` machine reached only over that link, with no ssh into the laptop. Control-plane mode (`[serve] control_plane = true` in `daemon.config.toml`) never idles, saves remote rows and places runs on offered workers. Over steps 2–6 the control plane also gets: self-update, placement and code transfer, terminals/forwards/agent over the link, the remaining commands as API calls, and `member.toml` with `worker`/`full` trust.',
+          "A laptop runs `devsandbox fleet join <control-plane>`; its daemon dials the control plane, which lists it as an `offered` machine. Over steps 2–6 the control plane also gets self-update, placement on offered workers with code transfer, terminals, forwards and agent over the link, the remaining commands as API calls, and `member.toml` with `worker`/`full` trust.",
         ),
       },
       {
-        label: 'How',
-        body: ul([
-          "The worker's `serve-lend` thread (`fleet/worker.rs`, `Lending`) holds `ssh <control-plane> devsandbox fleet-link --worker <name> --root <fleet root> [--drain]` (`worker::link_argv`) while `lend.toml` says `on`|`drain`. It is the answerer of `fleet::LINK` (sentinel `devsandbox-fleet 1`).",
-          'On the control plane, `fleet-link --worker` is the opener: it binds `fleet-<worker>.sock` + `.pty/.tunnel/.transfer` and sends `fleet.offer` (`fleet/offer.rs`), which writes an `offered = true` entry (`machines::Kind::Offered`).',
-          'Control plane streams are served on the worker by the confined table (`fleet::lent`: first the `Worker` table over the fleet root only; step 6 made it the trust table, which also admits the member\'s own roots).',
-          'Placement considered only offered workers (`placed::workers` filtered `MachineKind::Offered`). The worker binds `agent-fleet-<control-plane>.sock` so the **control plane\'s** agent reaches the worker\'s instances.',
-          'ssh machines kept `api_argv`/`tty_argv`/`cli_argv`/`tunnel_argv`/`agent_argv`. In step 6 their API relay got `link.attach {peer}` so the trust table applied to that link (`aa25738`), but the per-use argvs still bypassed trust.',
-        ]),
-      },
-      {
-        label: 'Modules (at 3ce588f)',
-        body: ul([
-          '`src/serve/fleet/`: `mod.rs` (`LINK`), `link.rs`, `worker.rs` (`Lending`, `link_argv`), `lender.rs`, `lend.rs`, `offer.rs` (`fleet.offer`, `fleet.agent`), `lent.rs` (Worker/trust table), `member.rs`, `update.rs`, `place.rs`, `placed.rs`, `transfer.rs`, `code/`, `pty.rs`, `pty_client.rs`, `tunnel.rs`, `agent.rs`',
-          '`src/commands/lend.rs` (`lend show|on|off|drain`, `fleet join|leave`); `src/commands/fleet_link.rs` (`--worker/--root/--drain`)',
-          '`src/serve/machines/mod.rs` (`Kind::{Ssh,Offered}`); `src/serve/capacity.rs`; `src/worker_policy.rs`; `src/serve/machines/saved.rs` (`remotes.json`)',
-        ]),
-      },
-      {
         label: 'Code',
-        body: md('The laptop dials the control plane; placement only looks at machines that dialed in.'),
+        body: md('Placement only looked at machines that dialed in.'),
         snippets: [
-          {
-            title: 'src/serve/fleet/worker.rs',
-            lang: 'rust',
-            rev: MIDDLE,
-            code: `pub fn link_argv(control_plane: &str, name: &str, root: &Path, draining: bool) -> Result<Vec<OsString>> {
-    check_name(name)?;
-    let root = root.to_str().with_context(|| format!("fleet root {} is not UTF-8", root.display()))?;
-    let mut args = vec!["fleet-link", "--worker", name, "--root", root];
-    if draining {
-        args.push("--drain");
-    }
-    ssh::target_argv(control_plane, &["-T", "-o", "BatchMode=yes"], "devsandbox", &args)
-}`,
-          },
           {
             title: 'src/serve/fleet/placed.rs',
             lang: 'rust',
             rev: MIDDLE,
-            code: `/// The machines placement may pick besides this host: offered fleet
-/// workers only, the hosts code moves to (through their link). An ssh
-/// machine is reached with \`--machine\` or a qualified name.
-pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
+            code: `pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
     machines.iter().filter(|m| m.kind == MachineKind::Offered)
 }`,
           },
@@ -324,13 +235,12 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
       {
         label: 'Key commits',
         body: ul([
-          '**1 Fleet link + control-plane mode:** `e8f1123` one link primitive for host-to-host muxes…; `ca191f5` a control plane accepts worker offers as offered machines…; `782b07d` a lending worker dials its control plane and serves it a confined Worker table…; `e19a8f5` lend and fleet join|leave…; `3a65d5b` check every container a fleet-root config creates against the worker\'s lending policy…; `c5189f1` control-plane mode keeps the daemon and every worker link up and saves remote rows…; `f59a05d` each daemon reports capacity…',
-          "**2 Self-update:** `b7fd80b` a TRANSFER channel on the fleet link, size- and hash-checked…; `2b2bb3c` a worker follows its control plane's exact published build, downgrades included…; `b214318` a control plane on a dev build pushes its own binary…",
-          "**3 Placement v0 + transfer:** `2c10a2d` key image tags and feature build dirs by config root…; `8d54318` a pure place over soft caps…; `3c8b19e` move a sandbox's config root as a tar and its repos as control-plane-cloned bundles…; `230d22a` run places a sandbox on the roomiest lending worker…",
-          "**4 Interactive over the link:** `f87d0f2` a link serves a table of channels and either end opens any the peer serves…; `de317bc` a worker serves PTY streams as helper session attaches…; `5435dca` exec and dashboard terminals on an offered worker attach over the fleet link's PTY channel…; `1a2aaf4` port forwards… ride the fleet link's TUNNEL channel…; `f0320ad` the control plane's ssh agent reaches an offered worker's instances over… AGENT…; `67a9dd5` logs, inspect, done, rename, ls and status on an offered worker run as API calls…",
-          '**5 The rest over the link:** `8e5707c` ps and stats…; `f0308d9` service ls and a followed build log…; `9abbf50` a non-tty exec… as a piped PTY stream…; `8b3e040` service terminals… and exec --service…',
-          "**6 Member file + trust:** `9f29d4d` member.toml holds a member's name, trust, roots…; `952c42e` …so trust, not lending, decides what a remote caller reaches; `2281189` machine add records the picked roots…; `aa25738` an ssh machine's api relay attaches its connection… with link.attach…; `1d956a0` gc on an offered worker is a daemon verb its member's full trust admits and worker trust refuses…; `3ce588f` docs: mark step 6 shipped.",
-          '**Design pivot, inside this range:** `8f0ee37` one kind of machine…; `5d9cecb` links are the ssh pairs machine add makes, routed over a graph…; `709466f` split one kind of machine into steps 5-9…',
+          '**1 Link + control-plane mode:** `e8f1123`, `ca191f5`, `782b07d`, `e19a8f5`, `c5189f1`, `f59a05d`',
+          '**2 Self-update:** `b7fd80b`, `2b2bb3c`, `b214318`',
+          '**3 Placement v0 + transfer:** `8d54318`, `3c8b19e`, `230d22a`',
+          '**4–5 Everything over the link:** `f87d0f2`, `5435dca`, `1a2aaf4`, `f0320ad`, `67a9dd5`, `8e5707c`, `8b3e040`',
+          '**6 Member file + trust:** `9f29d4d`, `952c42e`, `aa25738`, `1d956a0`',
+          '**Design pivot:** `8f0ee37` one kind of machine; `5d9cecb` links routed over a graph',
         ]),
       },
     ],
@@ -339,65 +249,33 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
       { label: 'ADR 0042', path: 'docs/decisions/0042-fleet-workers-follow-their-hubs-version.md', rev: MIDDLE },
       L.src('Lending worker', 'src/serve/fleet/worker.rs', MIDDLE),
       L.src('lend and fleet join', 'src/commands/lend.rs', MIDDLE),
-      L.src('Offers', 'src/serve/fleet/offer.rs', MIDDLE),
     ],
   },
   {
     id: 'phase-step-7',
     tag: 'Step 7 · b1cd7d3..23ecf62',
     title: 'One link per machine pair',
-    summary: md(
-      'Every ssh machine is held as a symmetric `fleet-link --peer` link, always, and every client reaches it through `fleet-<m>.*.sock`.',
-    ),
+    summary: md('Every ssh machine is held as a symmetric `fleet-link --peer` link, always, and every client reaches it through `fleet-<m>.*.sock`.'),
     layers: [
       {
         label: 'What',
         body: md(
-          'The dialing end and the dialed end both bind local sockets and both answer streams, so "who dialed" no longer decides who can use the link. ssh machines move onto that link. `Want`, linger, `machines.hold` and the separate agent-relay thread go away. Lending\'s links and the per-use ssh argvs stay until step 8.',
+          'Both ends bind local sockets and both answer streams, so who dialed no longer decides who can use the link. `Want`, linger, `machines.hold` and the agent-relay thread go away.',
         ),
       },
       {
         label: 'How',
         body: ul([
-          '`fleet/transport.rs` `Transport::dial(target, program, args) -> Duplex` is the only way bytes cross (ssh its one impl). `link::opener_with`/`answerer_with` share one post-handshake body over an `Endpoint` (OUT sockets + `Serves` table).',
-          "The dialer (`fleet::dialer::Dialer::hold`, thread `serve-machine-<m>-link`) dials `fleet-link --peer <own member name>`, binds `fleet-<m>.{sock,pty,tunnel,transfer}.sock`, and serves the peer's streams in-process (`Shared::open_lent`).",
-          'The dialed end (`commands::fleet_link::run_peer`) binds `fleet-<dialer>.*.sock` (+ `agent-link-<dialer>.sock` while the dialer serves AGENT) and hands each stream to its daemon with `link.attach {peer, channel}` as the first line (`attach_stream`). It announces the dialer as an inbound neighbor (`links.inbound`).',
-          "Both sides end in `Shared::serve_channel` under the receiving host's trust table, with fleet root `fleet/<peer>/`. Each end compares itself with the fleet's pinned build, whichever dialed.",
-          "A daemon with machines still idled out after step 7 alone; step 8 made each dialed link a holder (`idle::Holders::links`).",
-        ]),
-      },
-      {
-        label: 'Modules',
-        body: ul([
-          '`src/serve/fleet/transport.rs` (`Transport`, `Transport::ssh`); `src/serve/fleet/link.rs` (`Endpoint`, `Serves`, `Outlet`, `connect`, `opener_with`, `answerer_with`, `run`, `splice`); `src/serve/fleet/dialer.rs` (`Dialer::hold`, `link_args`, `member_name`, `dial`, `Open`)',
-          '`src/commands/fleet_link.rs` (`fleet_link_peer`, `run_peer`, `attach_stream`, `Announce`, `pinned`, `push_build`)',
-          '`src/serve/daemon.rs` (`link_attach`, `links_inbound`, `machine_dialer`, `Shared::serve_channel`, `Shared::open_lent`, `agent_for`); `src/serve/fleet/lent.rs` (`Peer`, `Channel`, `attach_params`, `peer_fleet_root`)',
-          '`src/serve/machines/inbound.rs` (`Neighbors`, `Guard`); `src/serve/endpoint.rs` (`fleet_socket`, `link_agent_socket`)',
+          '`Transport::dial` is the only way bytes cross (ssh its one impl); opener and answerer share one body.',
+          "The dialer (`Dialer::hold`) runs `fleet-link --peer <own name>`, binds `fleet-<m>.sock` and serves the peer's streams in-process.",
+          'The dialed end binds `fleet-<dialer>.sock`, hands each stream to its daemon with `link.attach {peer, channel}` and announces the dialer as an inbound neighbor.',
+          "Both ends serve under the receiving host's trust table, with fleet root `fleet/<peer>/`.",
         ]),
       },
       {
         label: 'Code',
-        body: md('One transport seam, and the dialed end binding one socket as the dialer does; each connection names its channel in its first byte.'),
+        body: md('Each connection names its channel in its first byte.'),
         snippets: [
-          {
-            title: 'src/serve/fleet/transport.rs',
-            lang: 'rust',
-            code: `pub fn ssh() -> Transport {
-    Transport(Arc::new(|target, program, args| ssh::spawn(&ssh_argv(target, program, args)?)))
-}`,
-          },
-          {
-            title: 'src/serve/fleet/transport.rs',
-            lang: 'rust',
-            code: `fn ssh_argv(target: &str, program: &str, args: &[String]) -> Result<Vec<OsString>> {
-    ssh::target_argv(target, &["-T", "-o", "BatchMode=yes"], program, args)
-}`,
-          },
-          {
-            title: 'src/commands/fleet_link.rs',
-            lang: 'rust',
-            code: `    let socket = endpoint::fleet_socket(&dir, peer);`,
-          },
           {
             title: 'src/serve/fleet/link.rs',
             lang: 'rust',
@@ -411,152 +289,54 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
       },
       {
         label: 'Key commits',
-        body: ul([
-          '`8660be9` docs(fleet): split one link per machine pair from one kind of machine… decisions 23-26',
-          '`b1cd7d3` refactor(fleet): links dial through one transport seam and both link roles share one body…',
-          "`4286ca8` feat(fleet): link.attach takes a channel and hands the connection to that channel's server under the peer's trust…",
-          "`6af5483` feat(fleet): fleet-link --peer binds the dialer's sockets, hands its streams to the daemon with link.attach and announces it as an inbound neighbor…",
-          '`e5b8f78` feat(machine): every ssh machine is held as a fleet-link --peer link whose sockets every client dials, its agent over AGENT…',
-          '`23ecf62` docs(fleet): mark step 7 shipped',
-        ]),
+        body: ul(['`b1cd7d3` one transport seam', '`4286ca8` link.attach takes a channel', '`6af5483` fleet-link --peer', '`e5b8f78` every ssh machine held as a peer link']),
       },
     ],
-    links: [
-      L.plan(),
-      L.fleetDoc(),
-      { label: 'API reference', path: 'docs/reference/api.md' },
-      L.src('Transport', 'src/serve/fleet/transport.rs'),
-      L.src('fleet-link --peer', 'src/commands/fleet_link.rs'),
-      L.src('Dialer', 'src/serve/fleet/dialer.rs'),
-    ],
+    links: [L.plan(), L.fleetDoc(), L.src('Transport', 'src/serve/fleet/transport.rs'), L.src('fleet-link --peer', 'src/commands/fleet_link.rs'), L.src('Dialer', 'src/serve/fleet/dialer.rs')],
   },
   {
     id: 'phase-step-8',
     tag: 'Step 8 · 2e1bd6d..08e8279',
     title: 'One kind of machine',
-    summary: md(
-      "Every use of every machine goes over its link's channels, inbound neighbors become machines, and lending is deleted.",
-    ),
+    summary: md("Every use of every machine goes over its link's channels, inbound neighbors become machines, and lending is deleted."),
     layers: [
       {
         label: 'What',
         body: md(
-          'The CLI, dashboard terminals, Ports-tab forwards and `port` reach every machine via `fleet-<m>.*.sock`. The per-use ssh argvs, `agent-relay`, `devsandbox tunnel` and `--session-env` are deleted, leaving ssh only for the link and `machine add`. A host that was dialed treats the dialer as a machine (kind `inbound`), so a laptop joins with `machine add <control-plane>`. `fleet join|leave`, `lend`, `lend.toml`, `offered` entries and `drain` are removed.',
+          'The CLI, dashboard terminals, forwards and `port` reach every machine via `fleet-<m>.*.sock`. The per-use ssh argvs, `agent-relay` and `devsandbox tunnel` are deleted: ssh is left only for the link and `machine add`. A dialed host treats the dialer as a machine (kind `inbound`), so a laptop joins with `machine add <control-plane>`. `fleet join|leave`, `lend`, `offered` entries and `drain` are removed.',
         ),
-      },
-      {
-        label: 'How',
-        body: ul([
-          '**8a:** `machines/cli.rs` `plan`/`route` + `cli/calls.rs` (`use_of`) make named commands API calls with `machine` and make `exec` a `PTY` dial (`fleet::pty_client::dial`).',
-          '**8b:** `tui/remote.rs` tabs run local `devsandbox exec … -- <m>/<name>` (`on_machine`), and `forwards.rs` `via()` / `port.rs` always `tunnel::Via::Fleet`.',
-          '**8c:** delete `tty_argv*`, `cli_argv`, `tunnel_argv`, `api_argv`, `agent_argv`, `machines/agent.rs`, `commands/agent_relay.rs`, and the sentinel inside link API streams (`Over::Link`).',
-          '**8d:** `Machines` holds a link over `fleet-<n>.sock` per announced inbound neighbor, and `placed::workers` returns every machine.',
-          '**8e:** delete lending (`fleet/worker.rs`, `lender.rs`, `lend.rs`, `offer.rs`, `commands/lend.rs`, `Kind::Offered`). `machines.toml` with `offered = true` now fails to parse.',
-        ]),
-      },
-      {
-        label: 'Modules',
-        body: ul([
-          '`src/serve/machines/cli.rs` (`plan`, `route`, `machine_use`, `MachineUse::Calls`, `reconnect_loop`, `pipe_mode`, `service_mode`, `attach_mode`, `foreign_link_sockets`); `src/serve/machines/cli/calls.rs` (`use_of`, `Use`, `Refused`, `answer_error`, `named`, `per_root`, `listing`, `follow_build_log`)',
-          '`src/serve/machines/service.rs` (`Hold`, `Held`, `with_inbound`, `carried`); `src/serve/machines/inbound.rs`; `src/serve/machines/mod.rs` (`Kind::{Ssh,Inbound}`, `MachineKind`); `src/serve/machines/ssh.rs` (only `probe_argv`, `script_argv`, `target_argv`)',
-          '`src/tui/remote.rs` (`on_machine`, `service_argv`); `src/serve/forwards.rs` (`via`); `src/commands/port.rs`, `src/commands/tunnel.rs` (`Via::Fleet`, `remote_opener`)',
-          '`src/serve/fleet/placed.rs` (`workers`); `src/serve/idle.rs` (`Holders::links`)',
-        ]),
-      },
-      {
-        label: 'Code',
-        body: md("Placement's candidates are every machine; a client reaches a machine only through its link's socket."),
-        snippets: [
-          {
-            title: 'src/serve/fleet/placed.rs',
-            lang: 'rust',
-            code: `/// The machines placement may pick besides this host: every one, whatever
-/// its kind (the candidates are every neighbor); [\`place::reachable\`]
-/// keeps those whose link is up.
-pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
-    machines.iter()
-}`,
-          },
-          {
-            title: 'src/serve/fleet/dialer.rs',
-            lang: 'rust',
-            code: `pub fn dial(socket_dir: PathBuf) -> Dial {
-    Arc::new(move |entry: &Entry| {
-        let path = endpoint::fleet_socket(&socket_dir, &entry.name);
-        let stream =
-            endpoint::Stream::connect(&path).map_err(|e| anyhow::anyhow!("its link isn't up ({}: {e})", path.display()))?;
-        Ok(Duplex::socket(stream))
-    })
-}`,
-          },
-        ],
       },
       {
         label: 'Key commits',
         body: ul([
-          '`2e1bd6d` docs(fleet): break step 8 into 8a-8f and record decisions 27-30…',
-          '`90c7ee3` feat(machine): CLI re-runs on every machine are API calls and PTY dials over its link…',
-          "`bfc7846` feat(machine): dashboard terminals, forwards and port reach every machine over its link's PTY and TUNNEL channels…",
-          "`a83207c` refactor(machine): delete the per-use ssh argvs, the agent relay, devsandbox tunnel's ssh half and the relay's session env…",
-          '`dd4d2ed` feat(machine): a dialed host holds a link to each inbound neighbor and a control plane places on every connected machine…',
-          '`b9cab24` feat(fleet): drop lending, offered machines and drain, and count each dialed link as a holder… (54 files, −4949 lines)',
-          '`08e8279` docs(fleet): mark step 8 shipped',
+          '`90c7ee3` CLI re-runs become API calls and PTY dials',
+          '`bfc7846` terminals, forwards and port over the link',
+          '`a83207c` delete the per-use ssh argvs and the agent relay',
+          '`dd4d2ed` a dialed host holds a link to each inbound neighbor',
+          '`b9cab24` drop lending, offered machines and drain (−4949 lines)',
         ]),
       },
     ],
-    links: [
-      L.plan(),
-      L.machinesDoc(),
-      L.fleetDoc(),
-      L.adr43,
-      L.src('CLI calls', 'src/serve/machines/cli/calls.rs'),
-      L.src('Inbound machines', 'src/serve/machines/inbound.rs'),
-    ],
+    links: [L.plan(), L.machinesDoc(), L.adr43, L.src('CLI calls', 'src/serve/machines/cli/calls.rs'), L.src('Inbound machines', 'src/serve/machines/inbound.rs')],
   },
   {
     id: 'phase-step-9',
     tag: 'Step 9 · a1bb25d..d486014',
     title: 'Membership and the control plane',
     summary: md(
-      "The control plane is a member setting, `machine add` makes both ends one fleet, every member sees the fleet through the control plane, and a member's `run --place` asks the control plane where to go.",
+      "The control plane is a member setting, `machine add` makes both ends one fleet, members see the fleet through the control plane, and `run --place` asks it where to go.",
     ),
     layers: [
       {
         label: 'What',
         body: md(
-          '`control_plane` in `member.toml` (`self` on the control plane, else the control plane\'s name) replaces `[serve] control_plane = true`, and every link\'s hello names it, so two fleets never link. `machine add` joins the target to this host\'s fleet, this host to the target\'s, or starts a fleet of two (`--control-plane` makes the target its control plane); two control planes and a name the fleet has are refused. A member watches the control plane\'s federated view, so it sees the control plane\'s other machines. `machine rm` takes a member out of the fleet; the old `rm` is `machine unlink`. After step 9, a typed `run` stays on the member whose config it names and only `run --place` asks the control plane (decisions 38, 40).',
+          "`control_plane` in `member.toml` (`self`, or the control plane's name) is named in every link's hello, so two fleets never link. `machine add` joins the target to this fleet, this host to the target's, or starts a fleet of two (`--control-plane` picks the target); two control planes are refused. `machine rm` takes a member out of the fleet; `machine unlink` only drops the link. A typed `run` stays on its member; `run --place` asks the control plane's `fleet.place` and moves the code itself.",
         ),
       },
       {
-        label: 'How',
-        body: ul([
-          '**9a:** the daemon reads `control_plane` at start and on `member.set`; a change cycles its links (`service::Handle::cycle`) and sends `links.cycle` to each `fleet-link` it\'s dialed on. The hello is `<build> <control_plane|member> <control-plane name|->`, checked by `update::same_fleet`.',
-          '**9b:** `machine add` reads both ends\' `member.get` (the target\'s over the add-time probe), applies the join table (`machines::join`) and pins both members\' names; `self` is reserved.',
-          "**9c:** a member watches the control plane's fleet root for it with `machines: true` (served on the control plane only; the asking member's rows never sent back). Machines seen that way are `via` the control plane, one hop (`snapshots::fleet_view`).",
-          '**9d:** `machine rm` runs `fleet.leave` / `fleet.forget` from the control plane (`machines::leave`, admitted by `lent::admit_fleet`); a member\'s is sent there as `fleet.rm`.',
-          "**9e:** a member's run asks the control plane's `fleet.place`, which answers `{on: requester|control_plane|machine, machine, lines}`, and moves its code there over its own links. Later, `2c28f0f` made placement opt-in (`run --place`), `17e88ea` keeps a tied sandbox home (`fleet::code::ties`) and `d9e7ead` adds `placement = \"home\"`.",
-        ]),
-      },
-      {
-        label: 'Modules',
-        body: ul([
-          '`src/serve/fleet/member.rs` (`Member::control_plane`); `src/serve/fleet/update.rs` (`same_fleet`, `control_plane_of`); `src/serve/machines/service.rs` (`Handle::cycle`)',
-          '`src/serve/machines/join.rs`; `src/serve/machines/leave.rs`; `src/serve/fleet/lent.rs` (`admit_fleet`)',
-          '`src/serve/snapshots.rs` (`fleet_view`, `merge`); `src/serve/fleet/placed.rs` (`PlaceOn`, `Placed`, `member_workers`); `src/serve/fleet/code/mod.rs` (`ties`)',
-        ]),
-      },
-      {
         label: 'Code',
-        body: md("The control plane is one field of the member file; a link between two fleets is refused at the hello; the control plane's answer says where a run goes."),
+        body: md('A link between two fleets is refused at the hello.'),
         snippets: [
-          {
-            title: 'src/serve/fleet/member.rs',
-            lang: 'rust',
-            code: `    /// The fleet's control plane ([\`Member::control_plane\`]): \`self\` on the control plane, else the control plane's
-    /// member name; empty is in no fleet (fleet plan decision 1).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub control_plane: String,`,
-          },
           {
             title: 'src/serve/fleet/update.rs',
             lang: 'rust',
@@ -569,95 +349,44 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
     }
 }`,
           },
-          {
-            title: 'src/serve/fleet/placed.rs',
-            lang: 'rust',
-            code: `pub enum PlaceOn {
-    /// The member that asked.
-    Requester,
-    /// The control plane itself.
-    ControlPlane,
-    /// Another machine (\`PlaceAnswer::machine\`).
-    Machine,
-}`,
-          },
         ],
       },
       {
         label: 'Key commits',
         body: ul([
-          '`a1bb25d` docs(fleet): break step 9 into 9a-9f and record decisions 31-35…',
-          "`98d5c06` feat(fleet): the control plane is member.toml's control plane, named in every link's hello and followed at runtime…",
-          "`581389b` feat(machine): machine add joins the target to this host's fleet, this host to the target's, or starts a fleet of two, refusing two control planes and a name the fleet has…",
-          "`582b629` feat(fleet): a member watches its control plane's federated view and shows the control plane's other machines as view-only via rows…",
-          "`001ccfa` feat(machine): machine rm takes a member out of the fleet through the control plane's fleet.leave/forget… machine unlink keeps the old…",
-          "`e832892` feat(fleet): a member's run asks the control plane's fleet.place where to go and moves its code there over its own links…",
-          '`d486014` docs(fleet): mark step 9 shipped',
-          '**After, decisions 36-44:** `fe72296` docs; `4af90c0` machine add takes no config roots when none are picked…; `d4455ec` machine add --control-plane…; `2c28f0f` a typed run stays on the member whose config it names and only run --place asks the control plane…; `17e88ea` run --place keeps a sandbox home when its config ties it there…; `d9e7ead` placement = "home"…',
+          "`98d5c06` the control plane is member.toml's, named in every hello",
+          '`581389b` machine add joins fleets',
+          "`582b629` a member watches the control plane's federated view",
+          '`001ccfa` machine rm through the control plane; machine unlink',
+          "`e832892` a member's run asks fleet.place",
+          'After: `2c28f0f` placement only with `run --place`; `17e88ea` tied sandboxes stay home; `d9e7ead` `placement = "home"`',
         ]),
       },
     ],
-    links: [L.plan(), L.fleetDoc(), L.machinesDoc(), L.src('Join rule', 'src/serve/machines/join.rs'), L.src('Leaving', 'src/serve/machines/leave.rs'), L.src('Candidates', 'src/serve/fleet/placed.rs')],
+    links: [L.plan(), L.fleetDoc(), L.machinesDoc(), L.src('Join rule', 'src/serve/machines/join.rs'), L.src('Candidates', 'src/serve/fleet/placed.rs')],
   },
   {
     id: 'phase-step-10a',
     tag: 'Step 10a · 2486e9b..bf5cd91',
     title: 'Member identity',
-    summary: md(
-      'Every member has a key, the fleet\'s authority signs who belongs in a hash-chained log, and both ends of every link prove their keys against it.',
-    ),
+    summary: md("Every member has a key, the fleet's authority signs who belongs in a hash-chained log, and both ends of every link prove their keys against it."),
     layers: [
       {
         label: 'What',
         body: md(
-          "Each member holds an ed25519 key in `member.key` (0600; `machine key` prints its fingerprint). The member that made the fleet is its authority: it signs every membership change into `membership.json`. `machine add` shows the joining key's fingerprint to confirm (`--yes` off a TTY). An add on another member is an introduction, capped by its introducer and proposed to the authority. `machine rm` revokes the key and `machine key rotate` replaces it: signed on the authority, elsewhere proposed and approved there with `machine pending|approve|deny`. A link that doesn't prove its keys is refused, and no container may bind or build from a path covering the key. ADR 0044.",
+          "Each member holds an ed25519 key in `member.key` (`machine key` prints its fingerprint). The member that made the fleet is its authority and signs every membership change into `membership.json`. `machine add` confirms the joining key's fingerprint (`--yes` off a TTY). An add on another member is an introduction, proposed to the authority. `machine rm` revokes a key, `machine key rotate` replaces one; typed elsewhere, both wait for `machine approve` on the authority. A link that doesn't prove its keys is refused, and no container may bind or build from a path covering the key. ADR 0044.",
         ),
       },
       {
-        label: 'How',
-        body: ul([
-          '**10a.1:** `KeyStore`, its file `member.key`; `Statement {signer, key, kind, payload_sha256, version, sig}`, older versions refused.',
-          '**10a.2:** the log is `Genesis`, `Add`, `Revoke`, `Rotate` (countersigned by the old key) and `ControlPlane` entries, each signed by the authority; `apply` verifies them, `compare` says same, behind, ahead or fork. Introductions sit beside the chain.',
-          '**10a.3–10a.4:** `machine add` signs `Genesis` + `Add` (a new fleet), `Add` (on the authority) or an introduction. After the hellos the link runs `fleet::proof` on the raw pipe: names, nonces and heads, a `sync` round carrying the entries the end behind lacks, then each end signs the transcript. A fork refuses the link; `fleet::LINK`\'s sentinel is at version 2.',
-          '**10a.5:** `lent::Peer` carries the proven key and its introducer; `lent::admit_fleet` admits the control-plane-only calls by the control plane\'s key in the log, not the announced name.',
-          '**10a.6–10a.7:** changes are pushed to every machine the authority holds and flooded on (`fleet.sync`); a rotation\'s `member.key.next` is promoted once a log lists it (`membership_api::settle`, `Shared::key_rotated`). `key_guard` refuses binds and build paths covering the key.',
-        ]),
-      },
-      {
-        label: 'Modules',
-        body: ul([
-          '`src/serve/fleet/identity.rs` (`KeyStore`, `Statement`); `src/serve/fleet/membership.rs` (`Op`, `Log`, `Compare`, introductions); `src/serve/fleet/membership_api.rs` (`membership.get|adopt|sign`, `sync`, `settle`)',
-          '`src/serve/fleet/proof.rs` (the key proof, `Identity`, `resolve`); `src/serve/fleet/proposals.rs` (`proposals.json`); `src/serve/machines/changes.rs` (`revoke`, `can_rotate`, `propose`)',
-          '`src/key_guard.rs`; `src/commands/machine.rs` (`key`, `pending`, `approve`, `deny`)',
-        ]),
-      },
-      {
         label: 'Code',
-        body: md('What the authority signs, and what two ends learn when they compare heads.'),
+        body: md('What two ends learn when they compare log heads.'),
         snippets: [
-          {
-            title: 'src/serve/fleet/membership.rs',
-            lang: 'rust',
-            code: `    Add { name: String, key: PublicKey },
-    /// \`name\`, whose key is \`key\`, leaves; \`key\` is revoked for good.
-    Revoke { name: String, key: PublicKey },
-    /// \`name\`'s key goes from \`old\` to \`new\`; \`by_old\` is \`old\`'s
-    /// signature over the change ([\`countersign_rotate\`]), so the
-    /// …
-    Rotate { name: String, old: PublicKey, new: PublicKey, by_old: Signature },
-    /// The control plane is now the member \`name\`.
-    ControlPlane { name: String },`,
-          },
           {
             title: 'src/serve/fleet/membership.rs',
             lang: 'rust',
             code: `pub enum Compare {
     Same,
-    /// Theirs is longer: we lack its later entries ([\`Log::extend\`] when
-    /// they arrive confirms they continue ours).
     Behind,
-    /// Ours continues theirs: they lack our later entries
-    /// ([\`Log::entries_after\`]).
     Ahead,
     /// The logs differ: \`another_fleet\` when their genesis isn't ours,
     /// else one authority signed two histories.
@@ -669,16 +398,11 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
       {
         label: 'Key commits',
         body: ul([
-          '`c0b31aa` docs(fleet): make H the only authority, cap introduced members by their introducer and add end-to-end sessions as step 10c…',
-          '`2486e9b` docs(fleet): break step 10a into eight sub-steps and record decisions 48-52…',
-          '`fbce32b` feat(fleet): every member has an ed25519 key in a 0600 member.key…',
-          "`7015c9a` feat(fleet): a hash-chained membership log signed by the fleet's authority…",
-          "`418a3ea` feat(machine): machine add signs the joining machine into the fleet's membership log…",
-          '`876a3cc` feat(fleet): both ends of a link prove their member keys against the membership log after the hellos…',
-          "`ca3943b` feat(fleet): a link peer carries the key it proved and its introducer, the control-plane-only fleet calls are admitted by the control plane's key…",
-          "`3c45e63` feat(fleet): machine rm revokes the member's key…; `cc080f1` machine key rotate…",
-          '`6d3421f` feat(run): refuse any container bind or build path that reaches the member key…',
-          '`bf5cd91` docs(fleet): close step 10a with ADR 0044…',
+          '`fbce32b` a member key',
+          "`7015c9a` the authority's hash-chained membership log",
+          '`876a3cc` both ends prove their keys after the hellos',
+          '`3c45e63` machine rm revokes; `cc080f1` machine key rotate',
+          '`6d3421f` refuse binds reaching the member key',
         ]),
       },
     ],
@@ -688,50 +412,18 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
     id: 'phase-step-10b',
     tag: 'Step 10b · 840787f..f10b5c9',
     title: 'Routing over the graph',
-    summary: md(
-      'Members report their links, every member keeps the graph, and a member with no link of its own is reached hop by hop, its origin proven per stream.',
-    ),
+    summary: md('Members report their links, every member keeps the graph, and a member with no link of its own is reached hop by hop, its origin proven per stream.'),
     layers: [
       {
         label: 'What',
         body: md(
-          "A member reached only through others is a **routed machine** (`machine ls`: `routed via <m>`), taking quick calls, verbs, terminals and forwards over its route. Proposals, removals and `run --place` reach their member over any path. Each relay checks its next hop is up and splices; the destination proves the stream's origin by its key and serves it under its trust for that origin, never the relay's. `machine trust worker` warns, and `machine ls` and the Machines tab show, when a machine the control plane's side controls dials this one (`exposed via …`). ADR 0043 accepted (0041 removed), ADR 0045.",
+          "A member reached only through others is a **routed machine** (`routed via <m>`), with calls, verbs, terminals and forwards over its route. Each member signs a report of its links; `Graph::paths` orders them (at most 4 hops). Each relay checks its next hop and splices; the destination proves the stream's origin by its key and serves it under its trust for that origin, never the relay's. `machine trust worker` warns when a machine the control plane's side controls dials this one. ADR 0045.",
         ),
       },
       {
-        label: 'How',
-        body: ul([
-          '**10b.1–10b.2:** each member signs a report of its links (an `identity::Statement` of kind `links`, versioned by its clock) and sends `fleet.report` to the control plane; `fleet.graph {reports}` is both the push and the link-up exchange, and every member floods changes on. `Graph::paths` orders direct, fewest hops, always-on hops, oldest; at most `MAX_HOPS` (4).',
-          "**10b.3–10b.4:** a `ROUTE` stream opens with a `Header {dest, origin, channel, path, ttl}`; each relay runs `relay_header` against its own log and `came_from`, and the origin and destination prove their keys over fresh nonces.",
-          '**10b.5:** the daemon binds `route-<m>.sock` for each member with no link up here; each accept tries the paths in order (`routes::first_open`). `route::connect` tries `fleet-<m>.sock` first, then the route socket; every link-socket caller uses it.',
-          '**10b.6–10b.8:** routed entries in `Machines` (`snapshots::routed`, `via` the first hop); `placed::reachable_workers`; `graph::exposure` for the warning.',
-        ]),
-      },
-      {
-        label: 'Modules',
-        body: ul([
-          '`src/serve/fleet/graph.rs` (`Graph`, `paths`, `MAX_HOPS`, `exposure`); `src/serve/fleet/reports.rs` (`fleet.report`, `fleet.graph`)',
-          '`src/serve/fleet/route.rs` (`Header`, `relay_header`, `came_from`, `connect`, `OPENING`); `src/serve/fleet/routes.rs` (`first_open`); `src/serve/endpoint.rs` (`route_socket`)',
-          '`src/serve/daemon.rs` (`Shared::serve_route`, `Shared::serve_routed`); `src/serve/snapshots.rs` (`routed`); `src/serve/fleet/placed.rs` (`reachable_workers`); `src/commands/machine.rs` (`exposure_warning`)',
-        ]),
-      },
-      {
         label: 'Code',
-        body: md("A routed stream's header, and the one way every client reaches a member: its link if up, else its route."),
+        body: md('The one way every client reaches a member: its link if up, else its route.'),
         snippets: [
-          {
-            title: 'src/serve/fleet/route.rs',
-            lang: 'rust',
-            code: `pub struct Header {
-    pub dest: String,
-    pub origin: String,
-    /// The channel served at the destination.
-    pub channel: Channel,
-    /// The hops after the origin, ending in \`dest\`.
-    pub path: Vec<String>,
-    pub ttl: u8,
-}`,
-          },
           {
             title: 'src/serve/fleet/route.rs',
             lang: 'rust',
@@ -742,94 +434,82 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
         Err(e) => e,
     };
     let routed = endpoint::route_socket(dir, name);
-    super::link::connect(&routed, channel).map_err(|e| {
-        let why = format!("no link to \`{name}\` is up ({}: {first}) nor a route to it ({}: {e})", direct.display(), routed.display());
-        io::Error::new(first.kind(), why)
-    })
-}`,
+    // …`,
           },
         ],
       },
       {
         label: 'Key commits',
         body: ul([
-          '`840787f` docs(fleet): break step 10b into nine sub-steps and record decisions 53-60…',
-          "`56bbf09` feat(fleet): a link graph of members' own signed link reports…",
-          '`156214d` feat(fleet): every member signs a report of its links on change and sends it to the control plane, which pushes the graph…',
-          "`d22fa6f` feat(fleet): a routed stream's opening on a ROUTE channel, its header checked at every hop and its origin and destination proving their keys…",
-          '`abfe3a2` feat(fleet): both ends of a link relay a routed stream to a next hop that\'s up and, as its destination, serve the inner channel under this host\'s trust…',
-          '`5b7ea54` feat(fleet): a `route-<member>.sock` for every member with no link up here…',
-          '`de6c450` feat(machine): a member reached only through others is a routed machine…',
-          '`08ac478` feat(fleet): proposals, removals, forgets and run --place reach their member over any path…',
-          "`b4fdffc` feat(machine): machine trust worker warns, and machine ls and the Machines tab show, when a machine the control plane's side controls dials this one…",
-          '`f10b5c9` docs(fleet): close step 10b with ADR 0045…, 0043 accepted and 0041 removed…',
+          '`56bbf09` a graph of signed link reports',
+          '`d22fa6f` a routed opening, checked at every hop',
+          '`5b7ea54` a `route-<member>.sock` per member with no link',
+          '`de6c450` routed machines',
+          '`b4fdffc` the exposure warning',
         ]),
       },
     ],
-    links: [L.plan(), L.fleetDoc(), L.machinesDoc(), L.adr43, L.adr45, L.src('Link graph', 'src/serve/fleet/graph.rs'), L.src('Routed opening', 'src/serve/fleet/route.rs')],
+    links: [L.plan(), L.fleetDoc(), L.adr43, L.adr45, L.src('Link graph', 'src/serve/fleet/graph.rs'), L.src('Routed opening', 'src/serve/fleet/route.rs')],
   },
   {
     id: 'phase-step-10c',
     tag: 'Step 10c · a87642d..03e3baf',
     title: 'End-to-end sessions and agent grants',
-    summary: md(
-      "A routed stream is encrypted between its two daemons, so relays carry ciphertext only, and your agent goes to the members you grant, over any path.",
-    ),
+    summary: md('A routed stream is encrypted between its two daemons, so relays carry ciphertext only, and your agent goes to the members you grant, over any path.'),
     layers: [
       {
         label: 'What',
         body: md(
-          "Each end of a routed stream sends a fresh key in the opening, signed with its member key; the records after it are sealed per direction, so a relay can't read, change, inject into, replay or reflect them (ADR 0046). Agent access is a per-member grant in `member.toml` (`[[agent]]`, by key, following rotations), set with `machine set <m> --agent on` on any machine and published in the member's link report; `machines.toml` has no agent flag. A granted member reaches the agent over its link, whichever end dialed, or routed.",
+          "Each end of a routed stream sends a fresh key in the opening, signed with its member key; records after it are sealed per direction (x25519, HKDF, ChaCha20-Poly1305), so a relay can't read, change, inject, replay or reflect them (ADR 0046). Agent access is a per-member grant in `member.toml`, by key, set with `machine set <m> --agent on` and published in the link report.",
         ),
       },
       {
-        label: 'How',
-        body: ul([
-          '**10c.1:** `fleet::session`: x25519 ephemerals, HKDF-SHA256 per-direction keys, ChaCha20-Poly1305 records numbered by a counter, an authenticated END per direction; `pump` between the plaintext and sealed streams.',
-          '**10c.2:** `Shared::serve_routed` (origin) and `Shared::serve_route` (destination) pump through the session; relays only splice.',
-          "**10c.3:** `daemon::agent_for` serves `AGENT` only when `fleet::grants::granted` holds for the peer's proven key; the dialed end's `fleet-link --peer` serves `AGENT` too.",
-          "**10c.4:** a host probes each member whose report lists it as granted (`fleet::agent_routes`, one `serve-agent-route` thread each) through `route::connect`, binding `agent-route-<m>.sock` while that member serves; an inbound neighbor's `fleet-link --peer` binds `agent-link-<m>.sock` as before. Bridges pick the newest `agent-*.sock`.",
-        ]),
+        label: 'Key commits',
+        body: ul(['`a87642d` the session layer', '`24f68fb` routed streams are end-to-end sessions', '`e0b890c` agent grants per member', '`4e08ea4` agent over any path']),
+      },
+    ],
+    links: [L.plan(), L.fleetDoc(), L.adr46, L.src('Sessions', 'src/serve/fleet/session.rs'), L.src('Grants', 'src/serve/fleet/grants.rs')],
+  },
+  {
+    id: 'phase-step-11',
+    tag: 'Step 11 · b8aaed8..45cb4e7',
+    title: 'Moving the control plane',
+    summary: md('`machine control-plane <m>` moves the role to another member; the links stay as they are.'),
+    layers: [
+      {
+        label: 'What',
+        body: md(
+          "The move is a `control_plane` entry in the membership log, signed by the authority (typed elsewhere, proposed and approved there). Every reachable member rewrites its `control_plane` and cycles its links; one that was down learns it at its next link's key proof (`proof::control_plane_moved`). Only the role moves: the new control plane's view is the machines it links to.",
+        ),
       },
       {
-        label: 'Modules',
-        body: ul([
-          '`src/serve/fleet/session.rs` (`Ephemeral`, `Keys::derive`, `Sealer`, `Opener`, `pump`); `src/serve/fleet/route.rs` (the opening\'s keys)',
-          '`src/serve/fleet/grants.rs` (`granted`, `granted_names`); `src/serve/fleet/member.rs` (`Grant`, `Member::agent`); `src/serve/fleet/agent_routes.rs`; `src/serve/fleet/agent.rs` (`PROBE`)',
-          '`src/serve/daemon.rs` (`agent_for`, `Shared::fleet_peer`); `src/serve/endpoint.rs` (`route_agent_socket`, `link_agent_socket`, `agent_sockets`)',
-        ]),
+        label: 'Key commits',
+        body: ul(['`5b8a979` the move, signed or proposed (decisions 68, 69)', '`b97a0be` a member that was down follows at its next proof']),
+      },
+    ],
+    links: [L.plan(), L.fleetDoc(), L.src('Membership changes', 'src/serve/machines/changes.rs'), L.status],
+  },
+  {
+    id: 'phase-step-12',
+    tag: 'Step 12 · cbe1a80..4e40da8',
+    title: 'Transfer v1',
+    summary: md('devsandbox moves code itself: unpushed and uncommitted work, no remote needed, and brings it back.'),
+    layers: [
+      {
+        label: 'What',
+        body: md(
+          "A placed run bundles each folder from its own checkout, with a WIP snapshot of its working tree (untracked files included, ignored ones not), into a per-repo cache on the worker. Repos are identified by their root commits; `code.haves` makes a repeat send carry only the delta. The control plane keeps a copy of each repo, best effort. `devsandbox fetch <machine>/<instance>`, also run before an `rm` or `done` typed on the placing host, pulls the branch and WIP back as hidden refs. The user's index, branches and stash are never touched.",
+        ),
       },
       {
         label: 'Code',
-        body: md('Sealed records with an authenticated end, and the agent served only by grant to a proven key.'),
+        body: md('A snapshot travels on a ref of its own.'),
         snippets: [
           {
-            title: 'src/serve/fleet/session.rs',
+            title: 'src/serve/fleet/code/repo.rs',
             lang: 'rust',
-            code: `    pub fn seal_data(&mut self, data: &[u8]) -> Result<()> {
-        for chunk in data.chunks(MAX_RECORD) {
-            self.record(DATA, chunk)?;
-        }
-        self.w.flush()?;
-        Ok(())
-    }
-
-    /// This direction's END, flushed; nothing is sealed after it.
-    pub fn seal_end(&mut self) -> Result<()> {
-        self.record(END, &[])?;
-        self.ended = true;
-        self.w.flush()?;
-        Ok(())
-    }`,
-          },
-          {
-            title: 'src/serve/daemon.rs',
-            lang: 'rust',
-            code: `fn agent_for(member: Option<&Path>, peer: &str, key: Option<&fleet::identity::PublicKey>, host_agent: &HostAgent) -> Option<PathBuf> {
-    let (member, key) = (member?, key?);
-    let grants = fleet::member::load(member).ok()??.agent;
-    let stored = fleet::membership_api::load(member).ok()??;
-    fleet::grants::granted(&grants, &stored, peer, key).then(|| host_agent()).flatten()
+            code: `pub fn wip_ref(branch: &str) -> String {
+    format!("refs/devsandbox/wip/{branch}")
 }`,
           },
         ],
@@ -837,15 +517,15 @@ pub fn workers(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
       {
         label: 'Key commits',
         body: ul([
-          '`a87642d` feat(fleet): session layer for routed streams (ephemeral x25519, per-direction hkdf keys, chacha20poly1305 records with an authenticated end)…',
-          '`24f68fb` feat(fleet): routed streams are end-to-end sessions between their two daemons…; adr 0046',
-          "`e0b890c` feat(fleet): agent access is a per-member grant in member.toml, by key and following rotations…",
-          '`4e08ea4` feat(fleet): an agent reaches a member it granted over any path, routed or a link the member dialed, through an agent-route socket…',
-          '`03e3baf` docs(fleet): close step 10c…',
+          '`0122d17` repo identity, WIP snapshots, delta bundles',
+          '`8d54cb2` per-repo caches and haves',
+          '`6db6684` send from the checkout with a WIP snapshot, no origin',
+          "`306f625` the control plane's copy",
+          '`e1479af` `devsandbox fetch`; `fe9a6dc` rm and done fetch back first',
         ]),
       },
     ],
-    links: [L.plan(), L.fleetDoc(), L.adr46, L.adr36(), L.src('Sessions', 'src/serve/fleet/session.rs'), L.src('Grants', 'src/serve/fleet/grants.rs'), L.src('Agent routes', 'src/serve/fleet/agent_routes.rs')],
+    links: [L.plan(), L.fleetDoc(), L.src('Code transfer', 'src/serve/fleet/code/mod.rs'), L.src('WIP snapshot', 'src/serve/fleet/code/wip.rs'), L.src('Fetch-back', 'src/serve/fleet/code/fetch.rs')],
   },
 ];
 
@@ -856,73 +536,69 @@ export const commands: CommandRow[] = [
   {
     cmd: 'machine add',
     before: md('Registers an ssh target in `machines.toml`; the link opens only while wanted.'),
-    after: md('Joins both ends into one fleet, signed into its membership log; then the daemon holds `ssh <m> devsandbox fleet-link --peer <me>` for good.'),
-    change: md("Adding a machine is a standing link and a fleet membership. You confirm the machine's key fingerprint; `--control-plane` makes the target the control plane."),
+    after: md('Joins both ends into one fleet, signed into its log; then holds `fleet-link --peer <me>` for good.'),
+    change: md("You confirm the machine's key fingerprint and what it lends (GPUs, binds); `--control-plane` makes the target the control plane."),
     card: cmdCard(
       'cmd-machine-add',
       [
         {
           label: 'Today',
           body: md(
-            "Install check (`script_argv`), probe = `ssh … api --stdio --sentinel` (`probe_argv`/`probe_dial`), roots recorded via `add_cli_argv` (none is fine, `4af90c0`). The join rule (`machines::join`, step 9) puts both ends in one fleet, refusing two control planes and a taken name. The target's fingerprint is confirmed (`--yes` off a TTY) and passed as `machines.add {key}`; the add signs `Genesis` + `Add`, an `Add`, or an introduction proposed to the authority (step 10a). `--agent` grants this host's agent to it. Then the daemon holds the link always.",
+            "Install check, then a probe over ssh. The join rule puts both ends in one fleet, refusing two control planes and a taken name. The target's fingerprint is confirmed (`--yes` off a TTY); the add signs a new fleet, an `Add`, or an introduction proposed to the authority. It asks (or takes `--allow …`) what the target lends and applies it there. `--agent` grants this host's agent.",
           ),
         },
-        {
-          label: 'Steps 1–6',
-          body: md('Also recorded the picked roots on the machine (`machine roots add` over a one-off ssh, `2281189`).'),
-        },
       ],
-      [L.src('ssh argvs', 'src/serve/machines/ssh.rs'), L.src('Join rule', 'src/serve/machines/join.rs'), L.src('Install check', 'src/serve/machines/install.rs'), L.src('machine verbs', 'src/commands/machine.rs'), L.machinesDoc()],
+      [L.src('Join rule', 'src/serve/machines/join.rs'), L.src('Install check', 'src/serve/machines/install.rs'), L.src('machine verbs', 'src/commands/machine.rs'), L.machinesDoc()],
     ),
   },
   {
     cmd: 'machine ls',
     before: md('`machines.list`; AGENT column.'),
-    after: md('Adds CAPACITY; TARGET `inbound` or `routed via <m>`; AGENT is this host\'s grant; names marked `introduced by …` / `exposed via …`.'),
-    change: md('You see every member: those that dialed you, those reached through others, and how much room each has.'),
+    after: md('Adds CAPACITY; TARGET `inbound` or `routed via <m>`; AGENT is this host\'s grant.'),
+    change: md('Every member: those that dialed you, those reached through others, and their room.'),
   },
   {
     cmd: 'machine set --agent on|off',
     before: md('Starts or kills a background agent-relay ssh.'),
-    after: md('A grant in this host\'s `member.toml`, by the machine\'s member key; any machine, inbound or routed.'),
-    change: md('No relay process. Consent is per member, by key, and no relay can give it.'),
+    after: md('A grant in `member.toml`, by the machine\'s key.'),
+    change: md('No relay process; consent is per member, by key.'),
   },
   {
     cmd: 'machine unlink',
     before: md('**Not present** (this was `machine rm`).'),
-    after: md('Drops this host\'s link and registry entry; refused for an inbound machine.'),
-    change: md('The machine stays a fleet member; nothing on it changes.'),
+    after: md('Drops this host\'s link and registry entry.'),
+    change: md('The machine stays a fleet member.'),
   },
   {
     cmd: 'machine rm',
     before: md('`machines.rm`: drop the registry entry.'),
-    after: md('Revokes the member\'s key (signed on the authority, else proposed), then the control plane\'s `fleet.leave` / `fleet.forget`.'),
+    after: md('Revokes the member\'s key, then the control plane forgets it.'),
     change: md('Takes the machine out of the fleet. `machine rm <this host>` leaves.'),
   },
   {
-    cmd: 'machine key [rotate]',
+    cmd: 'machine key [rotate] · pending|approve|deny',
     before: md('**Not present.**'),
-    after: md('Prints this member\'s key and fingerprint; `rotate` replaces the key through the log.'),
-    change: md('New (step 10a). Compare fingerprints when adding a machine.'),
+    after: md('The member key; changes proposed by other members, approved on the authority.'),
+    change: md('New (step 10a).'),
   },
   {
-    cmd: 'machine pending|approve|deny',
+    cmd: 'machine control-plane',
     before: md('**Not present.**'),
-    after: md('On the authority: the membership changes other members proposed.'),
-    change: md('New (step 10a). Adds, removals and rotations typed elsewhere wait here.'),
+    after: md('Moves the control-plane role by a signed log entry.'),
+    change: md('New (step 11). Links unchanged.'),
   },
   {
-    cmd: 'machine trust worker|full',
+    cmd: 'machine trust · roots · allow',
     before: md('**Not present.**'),
-    after: md('Local `member.set {trust}` only; `--machine` refuses it. `worker` warns when the control plane\'s side can reach in anyway.'),
-    change: md('New: each machine sets how much others may do on it. `worker` is the default.'),
+    after: md('Local only: trust `worker|full`, the roots `worker` reaches, what placed work may use (GPUs, binds…).'),
+    change: md('Each machine sets how much others may do on it; `--machine` refuses these.'),
     card: cmdCard(
       'cmd-machine-trust',
       [
         {
           label: 'What it decides',
           body: md(
-            'Every request from another machine is served under this host\'s trust table for that peer, a key it proved on the link or, routed, at the destination (`fleet::lent::admit`/`decide`). `member.*` is never served on a peer connection, so only the machine itself can change its trust. Added in step 6 (`9f29d4d`, `952c42e`). Since `b4fdffc`, `worker` warns when a machine the control plane\'s side controls dials this one (`graph::exposure`, `member.get`\'s `exposed_by`).',
+            "Every request from another machine is served under this host's trust table for the key that peer proved (`fleet::lent`). `member.*` is never served on a peer connection, so only the machine itself changes its trust or allowances. `worker` warns when a machine the control plane's side controls dials this one.",
           ),
         },
       ],
@@ -930,333 +606,104 @@ export const commands: CommandRow[] = [
     ),
   },
   {
-    cmd: 'machine roots [add|rm]',
-    before: md('**Not present.**'),
-    after: md('`member.get` / `member.set {roots_add, roots_rm}`.'),
-    change: md('New: which of this host\'s config roots others may reach under `worker`.'),
-  },
-  {
     cmd: 'fleet join|leave, lend',
     before: md('**Not present.**'),
     after: md('**Removed** (`b9cab24`).'),
-    change: md('Use `machine add <control-plane>` instead. There is no `drain` any more.'),
-    card: cmdCard(
-      'cmd-lend',
-      [
-        {
-          label: 'Steps 1–6',
-          body: md(
-            '`lend [show|on|off|drain]` and `fleet join|leave` (`e19a8f5`) over `lend.get`/`lend.set`. Join wrote `lend.toml`, and the daemon dialed the control plane with `fleet-link --worker`.',
-          ),
-        },
-        {
-          label: 'Removal',
-          body: md('`b9cab24` deleted lending with offered machines and drain. A `machines.toml` with `offered = true` now fails to parse.'),
-        },
-      ],
-      [L.src('lend and fleet join', 'src/commands/lend.rs', MIDDLE), L.src('Lending worker', 'src/serve/fleet/worker.rs', MIDDLE), L.status],
-    ),
+    change: md('Use `machine add <control-plane>`. There is no `drain`.'),
   },
   {
     cmd: 'run',
     before: md('`--machine` / `m/name`: a verb over a fresh ssh. No placement.'),
-    after: md('Runs here. `--machine`: a verb over the link or route. `run --place`: the control plane chooses.'),
-    change: md('Placement is asked for, from any member. A sandbox tied to its host, or `placement = "home"`, stays home.'),
+    after: md('Runs here. `--machine`: a verb over the link or route. `--place`: the control plane chooses.'),
+    change: md('Placement is asked for. A GPU sandbox goes only where one is lent; a tied or `placement = "home"` sandbox stays home.'),
     card: cmdCard(
       'cmd-run',
       [
         {
           label: 'Today',
           body: md(
-            "A pinned run is a verb over a fresh `API` stream (`forward::verb`, through `route::connect`). A typed `run` stays on the member whose config it names (decision 38). `run --place` on the control plane places across every machine it reaches; on a member it asks the control plane's `fleet.place` (`PlaceOn::{Requester,ControlPlane,Machine}`) among the machines both reach, then moves the code itself (`code::prepare`, `TRANSFER`) and forwards the verb, printing `placed on <m> (…)`. Unreachable control plane: runs here with a note. `--place` refuses `--machine`; `--here` is gone.",
+            "A pinned run is a verb over a fresh `API` stream. `run --place` on a member asks the control plane's `fleet.place` among the machines both reach, then moves the code itself (`TRANSFER`) and forwards the verb, printing `placed on <m> (…)`. Unreachable control plane: runs here with a note.",
           ),
         },
-        {
-          label: 'Steps 1–6',
-          body: md('A control plane with offered workers placed unpinned runs on them only (`placed_run`); ssh machines still took a fresh ssh.'),
-        },
       ],
-      [L.src('Placement', 'src/serve/fleet/place.rs'), L.src('Candidates', 'src/serve/fleet/placed.rs'), L.src('Forwarded verbs', 'src/serve/machines/forward.rs')],
+      [L.src('Placement', 'src/serve/fleet/place.rs'), L.src('Candidates', 'src/serve/fleet/placed.rs'), L.src('Forwarded verbs', 'src/serve/machines/forward.rs'), L.adr56],
     ),
+  },
+  {
+    cmd: 'fetch',
+    before: md('**Not present.**'),
+    after: md('Pulls a placed instance\'s branch and WIP back as hidden refs.'),
+    change: md('New (step 12); `rm` and `done` of a placed instance fetch first.'),
   },
   {
     cmd: 'start / stop / rebuild / rm',
     before: md('A forwarded verb over a fresh ssh.'),
     after: md('A verb over a fresh `API` stream on the link, or routed.'),
-    change: md('Trust-gated: under `worker`, `--all` only if every instance there is reachable.'),
+    change: md('Trust-gated.'),
   },
   {
-    cmd: 'exec (tty)',
+    cmd: 'exec',
     before: md('`ssh -t m devsandbox exec …`, re-dialed on exit 255.'),
-    after: md('A `PTY` dial through `fleet-<m>.sock` (`route-<m>.sock` for a routed machine); same reconnect loop.'),
-    change: md('No ssh per terminal. A lost link exits 255 and reconnects.'),
-    card: cmdCard(
-      'cmd-exec',
-      [
-        {
-          label: 'Today',
-          body: md(
-            'The CLI process dials `PTY` through `fleet-<m>.sock` (`fleet::pty_client::dial`); the machine\'s daemon calls the helper\'s `session.attach` over RPC. The reconnect loop is kept (`Reconnect`, `dials`).',
-          ),
-        },
-        {
-          label: 'Before',
-          body: md('`ssh -t m devsandbox exec --reserve-255 --session=<id> …`, re-dialed with `--attach` on 255 (`reconnect_loop`, `cli_argv`). Steps 1–6 used the PTY dial for offered workers only.'),
-        },
-      ],
-      [L.src('PTY client', 'src/serve/fleet/pty_client.rs'), L.src('CLI routing', 'src/serve/machines/cli.rs'), L.src('CLI routing', 'src/serve/machines/cli.rs', BEFORE)],
-    ),
+    after: md('A `PTY` dial through `fleet-<m>.sock` (or the route); same reconnect loop.'),
+    change: md('No ssh per terminal. `--service` is new.'),
   },
   {
-    cmd: 'exec (piped)',
-    before: md('`ssh -T m devsandbox exec …`.'),
-    after: md('One piped `PTY` dial, never re-dialed.'),
-    change: '—',
-  },
-  {
-    cmd: 'exec --service',
-    before: md('**Flag not present**; only the dashboard\'s service tab.'),
-    after: md('One service `PTY` dial; runtime exec under a host pty on the machine.'),
-    change: md('New CLI flag (`8b3e040`). Tty only.'),
-  },
-  {
-    cmd: 'exec --attach / --sessions',
-    before: md('An ssh re-run of the same flags.'),
-    after: md('`--sessions` is a quick call; `--attach [ID]` one attach-only dial.'),
-    change: '—',
-  },
-  {
-    cmd: 'logs',
-    before: md('An ssh re-run of `devsandbox logs`.'),
-    after: md('`containers.logs` via the daemon, rendered locally.'),
-    change: md('Same output, rendered with the same functions.'),
+    cmd: 'logs · inspect · done · rename · ls · ps · stats',
+    before: md('An ssh re-run of the command.'),
+    after: md('API calls via the daemon, rendered locally.'),
+    change: md('Same output; a `worker` machine shows only what you may reach.'),
     card: cmdCard(
       'cmd-logs',
       [
         {
           label: 'Routing today',
-          body: md(
-            '`machine_use` returns `MachineUse::Calls` for `ps|stats|ls|status|service ls` and `Verb` for `gc|service rebuild|--all`. `calls::use_of` maps named commands to `Use::{Logs,BuildLog,Inspect,Done,Rename,…}` or `Use::Link` (exec/port/verbs). A `denied` answer is reworded as coming from the machine (`calls::answer_error`).',
-          ),
-          snippets: [
-            {
-              title: 'src/serve/machines/cli/calls.rs',
-              lang: 'rust',
-              code: `pub(crate) fn use_of(command: &Command) -> Use {
-    match command {
-        Command::Logs { build: true, follow, .. } => Use::BuildLog { follow: *follow },
-        Command::Logs { lines, .. } => Use::Logs { lines: *lines },
-        Command::Inspect { json, .. } => Use::Inspect { json: *json },
-        Command::Done { .. } => Use::Done(true),
-        Command::Undone { .. } => Use::Done(false),
-        Command::Rename { new_name, .. } => Use::Rename(new_name.clone()),
-        Command::Ls { json } => Use::Ls { json: *json },
-        Command::Status { .. } => Use::Status,
-        Command::Ps { all, json } => Use::Ps { all: *all, json: *json },
-        Command::Stats { json } => Use::Stats { json: *json },
-        Command::Service { cmd: ServiceCommand::Ls { json } } => Use::ServiceLs { json: *json },
-        Command::Vscode { .. } => Use::Refused(Refused::Vscode),
-        _ => Use::Link,
-    }`,
-            },
-          ],
-        },
-        {
-          label: 'Before',
-          body: md('`route` → `plan`: `Plan::Machine` → `run_ssh(ssh::cli_argv(...))`, which `exec`s ssh (or spawns it while holding `machines.hold` when `agent` is on).'),
-          snippets: [
-            {
-              title: 'src/serve/machines/cli.rs',
-              lang: 'rust',
-              rev: BEFORE,
-              code: `        Command::Ps { all, json } => MachineUse::Once(args(&["ps"], [flag(*all, "--all"), flag(*json, "--json")])),
-        Command::Stats { json } => MachineUse::Once(args(&["stats"], [flag(*json, "--json")])),
-        Command::Ls { json } => MachineUse::PerRoot { args: args(&["ls"], [flag(*json, "--json")]), json: *json },
-        Command::Status { json: _ } => MachineUse::PerRoot { args: args(&["status", "--json"], []), json: true },
-        Command::Gc { force } => MachineUse::PerRoot { args: args(&["gc"], [flag(*force, "--force")]), json: false },`,
-            },
-          ],
+          body: md('`calls::use_of` maps each named command to an API call, or to `Use::Link` (exec, port, verbs). A `denied` answer is reworded as coming from the machine.'),
         },
       ],
-      [L.src('CLI calls', 'src/serve/machines/cli/calls.rs'), L.src('CLI routing', 'src/serve/machines/cli.rs'), L.src('CLI routing', 'src/serve/machines/cli.rs', BEFORE)],
+      [L.src('CLI calls', 'src/serve/machines/cli/calls.rs'), L.src('CLI routing', 'src/serve/machines/cli.rs')],
     ),
-  },
-  {
-    cmd: 'logs --build --follow',
-    before: md('An ssh re-run.'),
-    after: md('`instances.buildLog` paged by `offset`.'),
-    change: md('Doesn\'t follow a rotation into `build.1.log` mid-follow.'),
-  },
-  {
-    cmd: 'inspect',
-    before: md('An ssh re-run.'),
-    after: md('`containers.inspect`.'),
-    change: md('No browser-sandbox line.'),
-  },
-  {
-    cmd: 'done / undone / rename',
-    before: md('An ssh re-run.'),
-    after: md('`instances.done` / `instances.rename`.'),
-    change: '—',
-  },
-  {
-    cmd: 'ls / status --machine',
-    before: md('One ssh per registered root, `==> m:<root>` banners.'),
-    after: md('`instances.list` per config root, rendered locally.'),
-    change: md('Fleet roots list only the roots their instances name.'),
-  },
-  {
-    cmd: 'ps / stats --machine',
-    before: md('One ssh `ps` / `stats`.'),
-    after: md('`containers.list` / `containers.stats`, cut to what trust reaches.'),
-    change: md('A `worker` machine shows only the containers you may reach.'),
-  },
-  {
-    cmd: 'service ls --machine',
-    before: md('One ssh per root.'),
-    after: md('`instances.list` at `depth: listing` per root, `used_by` cut.'),
-    change: '—',
-  },
-  {
-    cmd: 'service rebuild --machine',
-    before: md('A verb.'),
-    after: md('A verb over the link.'),
-    change: '—',
   },
   {
     cmd: 'gc --machine',
-    before: md('One ssh `gc [--force]` per root, a full shell with no limits.'),
-    after: md('A daemon verb per config root, refused under `worker`.'),
+    before: md('One ssh `gc` per root, with no limits.'),
+    after: md('A daemon verb per config root.'),
     change: md('**Refused** unless the machine trusts you `full`.'),
-    card: cmdCard(
-      'cmd-gc',
-      [
-        {
-          label: 'The refusal',
-          body: md('`gc` is a daemon verb per config root (`CliVerb::Gc`); `lent::decide` refuses it under `worker`. Steps 1–6 had this for offered workers only (`1d956a0`); ssh machines still ran it over ssh.'),
-          snippets: [
-            {
-              title: 'src/serve/fleet/lent.rs',
-              lang: 'rust',
-              code: `        "gc" => return Err(ApiError::denied(format!(
-            "\`gc\` is host maintenance: not open to remote callers under this member's \`worker\` trust ({FULL_HINT})"
-        ))),`,
-            },
-          ],
-        },
-      ],
-      [L.src('Trust table', 'src/serve/fleet/lent.rs'), L.src('CLI routing', 'src/serve/machines/cli.rs')],
-    ),
   },
   {
-    cmd: 'port',
-    before: md('One `ssh m devsandbox -C <root> tunnel …` per port.'),
+    cmd: 'port · Ports tab',
+    before: md('One `ssh … tunnel` per port.'),
     after: md('One `TUNNEL` stream per bridge through the link or route.'),
-    change: md('No ssh per port. The hidden `devsandbox tunnel` command is gone.'),
-    card: cmdCard(
-      'cmd-port',
-      [
-        {
-          label: 'Today',
-          body: md('`tunnel::Via::Fleet`, `remote_opener`; a nameless `--service` resolves through `MachineUse::Port`. Steps 1–6 used `TUNNEL` for offered workers only (`1a2aaf4`).'),
-        },
-        {
-          label: 'Before',
-          body: md('`port_remote`: one `ssh m devsandbox -C <root> tunnel --instance=… --port N` per port (`tunnel_argv`, no BatchMode), becoming a `devsbd bridge` on the machine.'),
-        },
-      ],
-      [L.src('Tunnels', 'src/commands/tunnel.rs'), L.src('port', 'src/commands/port.rs'), L.src('Tunnels', 'src/commands/tunnel.rs', BEFORE)],
-    ),
-  },
-  {
-    cmd: 'dashboard terminal tabs',
-    before: md('`ssh -t m devsandbox exec …` per tab.'),
-    after: md('Each tab runs local `devsandbox exec … -- <m>/<name>`, a `PTY` dial.'),
-    change: md('A global service with no using instance has no terminal.'),
-  },
-  {
-    cmd: 'Ports tab forwards',
-    before: md('One `ssh … tunnel` per bridge.'),
-    after: md('`TUNNEL` streams on `fleet-<m>.sock`.'),
-    change: md('An inbound machine\'s forwards vanish when it disconnects and aren\'t restored.'),
+    change: md('No ssh per port.'),
   },
   {
     cmd: 'agent forwarding',
     before: md('`ssh m devsandbox agent-relay` while wanted.'),
-    after: md('`AGENT` streams to each granted member: over a link either way, or routed.'),
-    change: md('One less ssh. Only the members you grant get your agent, whoever dialed and whatever relays it.'),
-    card: cmdCard(
-      'cmd-agent',
-      [
-        {
-          label: 'Today',
-          body: md(
-            "Whether to serve is read per stream from this host's `[[agent]]` grants, against the key the peer proved (`daemon::agent_for`, `fleet::grants::granted`). A dialed end binds `agent-link-<dialer>.sock` while the dialer serves `AGENT` (probed every 2 s, `fleet::agent::PROBE`). Otherwise a host probes each member whose link report lists it (`fleet::agent_routes`) through `route::connect` and binds `agent-route-<m>.sock` while it serves; routed, the stream is end to end (step 10c).",
-          ),
-          snippets: [
-            {
-              title: 'src/serve/daemon.rs',
-              lang: 'rust',
-              code: `fn agent_for(member: Option<&Path>, peer: &str, key: Option<&fleet::identity::PublicKey>, host_agent: &HostAgent) -> Option<PathBuf> {
-    let (member, key) = (member?, key?);
-    let grants = fleet::member::load(member).ok()??.agent;
-    let stored = fleet::membership_api::load(member).ok()??;
-    fleet::grants::granted(&grants, &stored, peer, key).then(|| host_agent()).flatten()
-}`,
-            },
-          ],
-        },
-        {
-          label: 'Before, and steps 1–6',
-          body: md(
-            'Before: `ssh m devsandbox agent-relay --client machine:<host>` bound `agent-machine_<host>.sock` on the machine, and `--session-env` set verbs\' `SSH_AUTH_SOCK`. Steps 1–6 flipped it for offered workers: the **control plane\'s** agent reached the worker via `agent-fleet-<control-plane>.sock`. Today\'s direction is not a continuation of that.',
-          ),
-        },
-      ],
-      [L.src('Agent gate', 'src/serve/daemon.rs'), L.src('Grants', 'src/serve/fleet/grants.rs'), L.src('Agent routes', 'src/serve/fleet/agent_routes.rs'), L.src('Agent streams', 'src/serve/fleet/agent.rs'), L.adr36(), L.src('Agent relay', 'src/commands/agent_relay.rs', BEFORE)],
-    ),
+    after: md('`AGENT` streams to each granted member, over a link either way or routed.'),
+    change: md('Only the members you grant get your agent.'),
   },
   {
     cmd: 'self-update',
-    before: md('None: the protocol must match; `machine add` copies this binary if versions differ.'),
-    after: md('Every member but the authority follows the build the authority pinned in the membership log, whichever end dialed; one that can\'t is `behind: <why>`.'),
-    change: md('Automatic: the authority pins each new build its daemon starts on.'),
+    before: md('None: the protocol must match.'),
+    after: md('Members follow the build the authority pinned in the log; one that can\'t is `behind: <why>`.'),
+    change: md('Automatic.'),
     card: cmdCard(
       'cmd-update',
       [
         {
           label: 'Today',
           body: md(
-            '`update::decide` against the log\'s latest `Op::Build` pin (`machines::changes::sign_build` signs it on the authority): `Download` (published, checked against `SHA256SUMS`) / `Receive` (dev, its sha256 the pin\'s, same platform, `dev-builds` or `full`, pushed by any peer on the pin: `update::pushes`) / `Behind(why)` (the link served anyway; `update::peer_behind` says the peer\'s, both shown in `machine ls` and the dashboard), with a forced handoff (`HelloParams::force`). The hello is `<build> <os>/<arch> <control_plane|member> <control-plane name|-> <sha256 prefix|-> <dev|nodev>`, and `update::same_fleet` refuses a link between two fleets (step 9). Steps 1–6 had a worker follow its control plane (`2b2bb3c`, `b214318`).',
+            "`update::decide` against the log's latest `Op::Build` pin: download a published release (checked against signed `SHA256SUMS`), receive a dev build from a peer that has it (same sha256 and platform, `dev-builds` or `full`), or stay `behind` with the link served anyway. ADR 0053.",
           ),
         },
       ],
-      [L.src('Update decision', 'src/serve/fleet/update.rs'), L.src('fleet-link', 'src/commands/fleet_link.rs'), L.adr20],
+      [L.src('Update decision', 'src/serve/fleet/update.rs'), L.adr53],
     ),
   },
   {
     cmd: 'vscode / inbox on m',
     before: md('Refused.'),
-    after: md('Refused (`calls::refusal`).'),
+    after: md('Refused.'),
     change: md('Unchanged.'),
-  },
-  {
-    cmd: 'hidden commands',
-    before: md('`Tunnel`, `AgentRelay`; `api --stdio --session-env`.'),
-    after: md('`FleetLink {peer}`, `FleetHello`; `api --stdio --sentinel` (probe only).'),
-    change: md('Nothing to type; fewer things running on the far end.'),
-    card: cmdCard(
-      'cmd-hidden',
-      [
-        {
-          label: 'By revision',
-          body: md(
-            '`7716cb8` has `Tunnel` and `AgentRelay`. `3ce588f` adds `FleetLink {worker, root, drain}`, `FleetHello`, `Lend`, `Fleet`. `main` has `FleetLink {peer}` and `FleetHello` only. `api --stdio` lost `--session-env` and gained hidden `--sentinel` (probe only).',
-          ),
-        },
-      ],
-      [L.src('CLI', 'src/main.rs', BEFORE), L.src('CLI', 'src/main.rs', MIDDLE), L.src('CLI', 'src/main.rs')],
-    ),
   },
 ];
 
@@ -1270,11 +717,7 @@ export const machines: MachinesState[] = [
           id: 'L',
           role: 'laptop',
           items: [
-            {
-              name: 'devsandbox serve',
-              serve: true,
-              body: ['link to K: only while wanted (+60 s), rows in memory'],
-            },
+            { name: 'devsandbox serve', serve: true, body: ['link to K: only while wanted (+60 s), rows in memory'] },
             { name: 'CLI · dashboard tabs', client: true },
           ],
         },
@@ -1315,14 +758,14 @@ export const machines: MachinesState[] = [
       caption: "No arrow K → L; L doesn't see B.",
     },
     arrows: [
-      { from: 'L', to: 'K', label: '(1) API link', detail: md("L's `serve-machine-K` thread spawns `ssh_dial` = `api_argv`. The remote `api --stdio` relay is a full local client of K's daemon (`relay.rs`; `--session-env` swaps verb env for K's login env). Held while wanted + `Timing::linger` (`service.rs`).") },
-      { from: 'L', to: 'K', label: '(2) verb', detail: md('`forward::verb` dials a fresh ssh per `run/stop/…`, so a build never holds up the link.') },
-      { from: 'L', to: 'K', label: '(3) CLI re-run / tab', detail: md('`cli::route` `exec`s `ssh::cli_argv` (or `tty_argv` from `tui/remote.rs`). With agent on it holds `machines.hold`. A tty exec loops on 255 (`reconnect_loop`).') },
-      { from: 'L', to: 'K', label: '(4) forward', detail: md('`port_remote` / `forwards.rs` `batch_tunnel_argv` → `tunnel_argv`; the far end `devsandbox tunnel` becomes a `devsbd bridge`.') },
-      { from: 'L', to: 'K', label: '(5) agent relay', detail: md("`agent_loop` spawns `agent_argv`. On K, `commands::agent_relay` binds `agent-machine_L.sock` and serves `SSH_AGENT` streams from L's agent (`machines::agent::serve`).") },
-      { from: 'K', to: 'B', label: '(6) the same five kinds', detail: md('For K\'s own use. Nothing L does reaches B: federation is one hop.') },
+      { from: 'L', to: 'K', label: '(1) API link', detail: md("The remote `api --stdio` relay is a full client of K's daemon, held while wanted plus 60 s.") },
+      { from: 'L', to: 'K', label: '(2) verb', detail: md('A fresh ssh per `run/stop/…`, so a build never holds up the link.') },
+      { from: 'L', to: 'K', label: '(3) CLI re-run / tab', detail: md('`ssh [-t] K devsandbox <args>`; a tty exec loops on exit 255.') },
+      { from: 'L', to: 'K', label: '(4) forward', detail: md('The far end `devsandbox tunnel` becomes a `devsbd bridge`.') },
+      { from: 'L', to: 'K', label: '(5) agent relay', detail: md("On K, `agent-relay` binds `agent-machine_L.sock` and serves L's agent.") },
+      { from: 'K', to: 'B', label: '(6) the same five kinds', detail: md("For K's own use. Nothing L does reaches B: federation is one hop.") },
     ],
-    note: md('Assumes K is reachable by ssh from L, B by ssh from K, and L accepts no ssh. L ran `machine add K`; K ran `machine add B`.'),
+    note: md('K reachable by ssh from L, B by ssh from K, L accepts no ssh. L ran `machine add K`; K ran `machine add B`.'),
   },
   {
     id: 'middle',
@@ -1351,25 +794,10 @@ export const machines: MachinesState[] = [
             {
               name: 'fleet-link --worker L',
               icon: 'cable',
-              body: [
-                'binds',
-                {
-                  sockets: [
-                    { name: 'fleet-L.sock' },
-                    { name: 'fleet-L.pty.sock' },
-                    { name: 'fleet-L.tunnel.sock' },
-                    { name: 'fleet-L.transfer.sock' },
-                  ],
-                },
-              ],
+              body: ['binds', { sockets: [{ name: 'fleet-L.sock' }, { name: 'fleet-L.pty.sock' }, { name: 'fleet-L.tunnel.sock' }, { name: 'fleet-L.transfer.sock' }] }],
             },
             { hop: [{ n: 2, label: 'fleet.offer' }] },
-            {
-              name: 'devsandbox serve',
-              serve: true,
-              sub: 'control plane',
-              body: ['entry L offered=true; places runs on L only'],
-            },
+            { name: 'devsandbox serve', serve: true, sub: 'control plane', body: ['entry L offered=true; places runs on L only'] },
           ],
         },
         { id: 'B', role: 'box (ssh machine)', items: [] },
@@ -1378,35 +806,21 @@ export const machines: MachinesState[] = [
         {
           dialer: 'L',
           dialed: 'K',
-          links: [
-            {
-              n: 1,
-              label: 'one ssh, frame mux',
-              held: true,
-              carries: ['K opens API PTY TUNNEL TRANSFER', "L opens AGENT (K's agent)"],
-            },
-          ],
+          links: [{ n: 1, label: 'one ssh, frame mux', held: true, carries: ['K opens API PTY TUNNEL TRANSFER', "L opens AGENT (K's agent)"] }],
         },
         {
           dialer: 'K',
           dialed: 'B',
-          links: [
-            {
-              n: 3,
-              label: 'B still per-use ssh',
-              tone: 'runtime',
-              carries: ['api link (+link.attach{peer})', 'verbs, tty/cli, tunnel, agent-relay'],
-            },
-          ],
+          links: [{ n: 3, label: 'B still per-use ssh', tone: 'runtime', carries: ['api link (+link.attach{peer})', 'verbs, tty/cli, tunnel, agent-relay'] }],
         },
       ],
     },
     arrows: [
-      { from: 'L', to: 'K', label: '(1) fleet link', detail: md("`fleet/worker.rs` `Lending` holds `worker::link_argv` and is the answerer of `fleet::LINK`. K's streams are served on L by the `lent` table: the fleet root, plus L's own roots from step 6 (`952c42e`).") },
-      { from: 'fleet-link', to: 'K serve', label: '(2) offer', detail: md('`fleet.offer {worker, version, root, draining}` (`fleet/offer.rs`) writes the offered entry. K dials L\'s API via `fleet-L.sock`.') },
-      { from: 'K', to: 'B', label: '(3) ssh machine', detail: md("Unchanged per-use argvs. From step 6 the API relay attaches as K (`aa25738`), so B's trust table governs that link but not the other ssh uses. Placement never picks B (`placed::workers` = offered only); `--machine B` or `B/x` reaches it.") },
+      { from: 'L', to: 'K', label: '(1) fleet link', detail: md("L dials K and answers K's streams under the `lent` table: the fleet root, plus L's own roots from step 6.") },
+      { from: 'fleet-link', to: 'K serve', label: '(2) offer', detail: md('`fleet.offer` writes the offered entry; K reaches L via `fleet-L.sock`.') },
+      { from: 'K', to: 'B', label: '(3) ssh machine', detail: md('Unchanged per-use ssh. Placement never picks B; `--machine B` reaches it.') },
     ],
-    note: md("Superseded. L ran `fleet join K` (`lend.toml` `on`); K ran `machine add B` and runs `[serve] control_plane = true`. Agent direction: K's agent reaches L (`f0320ad`); L's own agent never reaches K."),
+    note: md("Superseded. L ran `fleet join K`; K ran `machine add B`. K's agent reaches L; L's own agent never reaches K."),
   },
   {
     id: 'today',
@@ -1423,14 +837,9 @@ export const machines: MachinesState[] = [
               body: [
                 'serve-machine-K-link holds ssh K devsandbox fleet-link --peer L',
                 'binds',
-                {
-                  sockets: [
-                    { name: 'fleet-K.sock' },
-                    { name: 'route-B.sock', note: 'B via K' },
-                  ],
-                },
+                { sockets: [{ name: 'fleet-K.sock' }, { name: 'route-B.sock', note: 'B via K' }] },
                 "IN: K's streams in-process, L's trust, root fleet/K/",
-                'member of K\'s fleet: control_plane = K, key proven on the link',
+                "member of K's fleet: control_plane = K, key proven on the link",
               ],
             },
           ],
@@ -1442,15 +851,7 @@ export const machines: MachinesState[] = [
             {
               name: 'fleet-link --peer L',
               icon: 'cable',
-              body: [
-                'binds',
-                {
-                  sockets: [
-                    { name: 'fleet-L.sock' },
-                    { name: 'agent-link-L.sock', note: 'if L grants K' },
-                  ],
-                },
-              ],
+              body: ['binds', { sockets: [{ name: 'fleet-L.sock' }, { name: 'agent-link-L.sock', note: 'if L grants K' }] }],
             },
             {
               hop: [
@@ -1485,10 +886,7 @@ export const machines: MachinesState[] = [
               name: 'devsandbox serve',
               serve: true,
               sub: 'trust per proven member',
-              body: [
-                'binds',
-                { sockets: [{ name: 'route-L.sock', note: 'L via K' }, { name: 'agent-route-L.sock', note: 'if L grants B' }] },
-              ],
+              body: ['binds', { sockets: [{ name: 'route-L.sock', note: 'L via K' }, { name: 'agent-route-L.sock', note: 'if L grants B' }] }],
             },
           ],
         },
@@ -1502,10 +900,7 @@ export const machines: MachinesState[] = [
               n: 1,
               label: 'the L-K link (one ssh)',
               held: true,
-              carries: [
-                'either end: API PTY TUNNEL TRANSFER, AGENT by grant',
-                'ROUTE: L-B streams, sealed end to end',
-              ],
+              carries: ['either end: API PTY TUNNEL TRANSFER, AGENT by grant', 'ROUTE: L-B streams, sealed end to end'],
             },
           ],
         },
@@ -1518,16 +913,16 @@ export const machines: MachinesState[] = [
       caption: 'L sees B as a routed machine, via K; K relays what it cannot read.',
     },
     arrows: [
-      { from: 'L', to: 'K', label: '(1) peer link', detail: md("`fleet::dialer::Dialer::hold` dials `Transport::ssh` with `link_args(\"L\")`. L is the answerer (reads sentinel `devsandbox-fleet 2`). After the hellos (each naming its control plane, `update::same_fleet`) both ends prove their member keys against `membership.json` (`fleet::proof`), the end behind taking the entries it lacks. L-side clients (CLI, dashboard, L's daemon) reach K through `fleet-K.sock` (the channel in each connection's first byte). K's streams to L go in-process to `Shared::open_lent` → `serve_channel` with `Peer {name: K, fleet_root: fleet/K/}`.") },
-      { from: 'fleet-link', to: 'K serve', label: '(2) attach', detail: md("`commands::fleet_link::attach_stream` connects K's daemon socket, sends `link.attach` with the peer, its proven key and the channel, then splices. K's `daemon::link_attach` (own uid only) → `Shared::serve_channel` under K's trust for L, fleet root `fleet/L/`.") },
-      { from: 'fleet-link', to: 'K serve', label: '(3) announce', detail: md("`links.inbound {peer: L, version, control_plane}`, held for the link's life (`Announce`, `inbound::Guard`). K's `Machines` then holds a link to L over `fleet-L.sock` (`service::carried`), whose `roots.list` at each link-up gives L's roots (the fleet root flagged `fleet: true`). L is now a placement candidate.") },
-      { from: 'K', to: 'B', label: '(4) peer link', detail: md("The same as (1) with K the dialer. On B, `fleet-link --peer K` binds `fleet-K.sock`, and `agent-link-K.sock` while K serves AGENT (K's `member.toml` grants B, `daemon::agent_for` by B's proven key). B's bridges pick that socket via `endpoint::agent_sockets`.") },
-      { from: 'L', to: 'B', label: 'routed stream', detail: md("Each member signs a report of its links and sends it to K (`fleet.report`), which pushes the graph (`fleet.graph`). With no link to B, L's daemon binds `route-B.sock` (`fleet::routes`), and `route::connect` falls back to it, so CLI calls, verbs, terminals and forwards to B work as for K. Each stream opens on `ROUTE` with a header naming L, B and the path; K checks its next hop and splices; B proves L's key over a fresh nonce (ADR 0045) and serves it under B's trust for L. Both ends agree fresh keys in the opening and seal every record after it (`fleet::session`, ADR 0046).") },
-      { from: 'B', to: 'L', label: 'agent grant', detail: md("If L ran `machine set B --agent on`, L's link report lists B; B probes L through `route::connect` (`fleet::agent_routes`) and binds `agent-route-L.sock` while L serves, its streams sealed like any routed one. K never sees the agent's bytes.") },
-      { from: 'L', to: 'K', label: 'run --place', detail: md("On L, `run --place` asks K's `fleet.place`. K asks each candidate both reach for `capacity.get` (2 s, `CAPACITY_WAIT`) and answers `{on: requester|control_plane|machine}`. If B wins, L sends the root tar + bundles as `TRANSFER` streams over `route-B.sock` into B's `fleet/L/`, then forwards the verb. K unreachable: it runs on L with a note.") },
+      { from: 'L', to: 'K', label: '(1) peer link', detail: md("L dials `fleet-link --peer L` on K. After the hellos (each naming its control plane) both ends prove their member keys against `membership.json`, the end behind taking the entries it lacks. L's clients reach K through `fleet-K.sock`; K's streams to L are served in-process under L's trust, fleet root `fleet/K/`.") },
+      { from: 'fleet-link', to: 'K serve', label: '(2) attach', detail: md("Each stream goes to K's daemon with `link.attach` (peer, proven key, channel), served under K's trust for L, fleet root `fleet/L/`.") },
+      { from: 'fleet-link', to: 'K serve', label: '(3) announce', detail: md("`links.inbound` for the link's life: K's `Machines` then holds L over `fleet-L.sock`, and L is a placement candidate.") },
+      { from: 'K', to: 'B', label: '(4) peer link', detail: md("The same as (1) with K the dialer. B binds `agent-link-K.sock` while K serves AGENT to it.") },
+      { from: 'L', to: 'B', label: 'routed stream', detail: md("With no link to B, L binds `route-B.sock` from the link graph. Each stream opens on `ROUTE` naming L, B and the path; K checks its next hop and splices; B proves L's key (ADR 0045) and serves it under B's trust for L. Both ends seal every record (ADR 0046).") },
+      { from: 'B', to: 'L', label: 'agent grant', detail: md("If L ran `machine set B --agent on`, B probes L over the route and binds `agent-route-L.sock` while L serves. K never sees the agent's bytes.") },
+      { from: 'L', to: 'K', label: 'run --place', detail: md("L asks K's `fleet.place`; K asks each candidate both reach for capacity and answers. If B wins, L sends the root and bundles over `route-B.sock` into B's `fleet/L/`, then forwards the verb. K unreachable: it runs on L with a note.") },
     ],
     note: md(
-      "K ran `machine add B --agent` (a fleet of two: K its control plane and authority, B granted K's agent), then L ran `machine add K` (L joins K's fleet; K signs L's `Add`). L sees K's rows and, through K's federated view, B's, as `routed via K`. L's daemon stays up while it dials K (`idle::Holders::links`); K never idles.",
+      "K ran `machine add B --agent` (a fleet of two: K its control plane and authority), then L ran `machine add K` (K signs L's `Add`). L sees B through K's federated view, as `routed via K`. Links keep both daemons up.",
     ),
   },
 ];
@@ -1535,20 +930,18 @@ export const machines: MachinesState[] = [
 export const steps: Card = {
   id: 'left-steps',
   tag: 'Planned · not built',
-  title: 'Rollout steps 11–18',
-  summary: md("From the plan's rollout; letters are its sizes. Steps 1–10 are on `main`; none of these is."),
+  title: 'Rollout steps 13–18',
+  summary: md("From the plan's rollout; letters are its sizes. Steps 1–12 are on `main`; none of these is."),
   layers: [
     {
       label: 'The steps',
       body: ul([
-        '**11 Control-plane swap, pointer (S–M).** `machine control-plane <m>` moves the control-plane role to another machine without changing any links; every reachable member rewrites its `control_plane`, a late one learns it on reconnect.',
-        '**12 Transfer v1 (L).** devsandbox moves code itself, including repos with no remote and unpushed work (WIP snapshots, bundles routed over the graph, repo caches, the control plane\'s mirror, fetch-back).',
-        '**13 Dispatcher children on any machine (M).** Children a dispatcher creates can run on any machine, with the control plane recording where each one lives.',
-        '**14 Checkpoints and re-placement (M–L).** Placed work is checkpointed to the control plane, and a child whose machine disappears is restarted elsewhere from its last checkpoint (`devsandbox move` by hand).',
-        '**15 The rest of the fleet view (M).** The Inbox across machines, and commands that take no name working across the fleet.',
-        "**16 Sync layer (L, later).** Moves what git can't (build outputs, volumes, caches, live editing), and then shared build caches and services that span machines.",
-        '**17 Control-plane handoff (M).** Swapping the control plane while the old one is alive ships its state (repo cache, rows, records, checkpoints) to the new one.',
-        '**18 Fallback control plane (M, later).** Another machine takes over the control-plane role when the control plane has been gone a while. Who decides that, and what happens when the old control plane returns, are still open.',
+        "**13 Children on any machine (M).** Re-scoped: an external orchestrator's children, placed and forwarded; waits on the orchestrator interface.",
+        '**14 Checkpoints and re-placement (M–L).** Placed work checkpoints to the control plane; a child whose machine is gone restarts elsewhere (`devsandbox move` by hand).',
+        '**15 The rest of the fleet view (M).** Nameless commands across the fleet.',
+        "**16 Sync layer (L, later).** What git can't carry: build outputs, volumes, caches, live editing.",
+        '**17 Control-plane handoff (M).** Moving the role while the old one is alive ships its state to the new one.',
+        '**18 Fallback control plane (M, later).** Another member takes over when the control plane has been gone a while.',
       ]),
     },
   ],
@@ -1559,58 +952,46 @@ export const limits: Card = {
   id: 'left-limits',
   tag: 'docs/status.md',
   title: 'Known limitations on main',
-  summary: md("What doesn't work yet, from the status page's machines section."),
+  summary: md("The main ones from the status page's machines section; it has the full list."),
   layers: [
     {
       label: 'Limitations',
       body:
         '<p><strong>Placement and moving code</strong></p>' +
         ul([
-          "Only `run --place` is placed, and only by the daemon: with no daemon, or `--in-process`, it runs here with a note. A dispatcher's children aren't placed yet (step 13).",
-          'A member waits up to 2 s to reach the control plane and 6 s for its answer; the control plane asks each candidate for capacity (up to 2 s) first.',
-          "The placing host doesn't record placed instances. A hang-up while code moves doesn't cancel it, a new `--branch` starts at the control plane checkout's tip, and a `--base` naming `origin/…` fails on the worker.",
-          'Only committed, pushed work moves (one branch per folder\'s `origin`). Everything is resent every time, and caches and moved trees are never pruned.',
-          "Anything tying a sandbox to its host keeps it home, whatever the worker allows; a pin can only say home (`placement = \"home\"`).",
-          "Placement's `has_image` reads only watched snapshots (a routed machine never has the image), and `has_repo` is never filled.",
-          'Soft caps are hand-edited and measured against the whole host, and capacity rides snapshots only while a root is watched.',
-          "A machine can't stop taking placed work while staying reachable: `drain` went with lending.",
+          "Only `run --place` is placed, and only by the daemon; a dispatcher's children aren't placed (step 13), and the placing host doesn't record placed instances.",
+          'Ties (a bind outside what moves, `${localEnv:…}`, `privileged`…) keep a sandbox home whatever a worker allows; a pin can only say home. GPUs are the exception.',
+          '`shared-volumes/`, caches and shell history start empty on the worker; `worktree-link` and `worktree-include` are skipped there.',
+          'A first send goes whole; worker caches, moved trees and the control plane\'s copies are never pruned.',
+          "Fetch-back brings only the `folder` repo; a `--base` naming `origin/…` fails on the worker.",
+          "Soft caps are hand-edited and measured against the whole host; `has_image` reads watched snapshots only.",
+          "A machine can't stop taking placed work while staying reachable (no `drain`).",
         ]) +
         '<p><strong>Membership and keys</strong></p>' +
         ul([
-          'Fleets made before member identity have no membership log: their links are refused until the fleet is made again with `machine add`.',
-          "A member that's only introduced (capped) can't be removed with `machine rm` or rotate its key until the authority adds it. An introduction the target signs for this host when it joins isn't proposed to the authority.",
-          "A member removed while unreachable keeps its control plane and entries until it's reachable again (run `machine rm` again, or on it). Members the control plane reaches by no path keep its entry, though its links are refused once the revoke reaches them.",
-          'A member that leaves is forgotten by the others only once the authority approves its revoke.',
-          'No command sets the member name (`member.set {name}` or a hand edit).',
+          'Fleets made before member identity have no log: remake them with `machine add`.',
+          'An introduced (capped) member can\'t be removed or rotate its key until the authority adds it.',
+          'A member removed while unreachable keeps its entries until reachable; one that leaves is forgotten once the authority approves.',
+          'No command sets the member name.',
         ]) +
-        '<p><strong>Routing</strong></p>' +
+        '<p><strong>Control plane and routing</strong></p>' +
         ul([
-          "Routed machines' rows come only from the control plane's view, one hop; a member it doesn't list has no roots in `machine ls` and isn't on the Machines tab.",
-          "A routed stream doesn't fail over once open (its client opens it again), and a member more than four hops away is unreachable.",
-          "Link reports are versioned by their signer's clock: a member whose clock went back has its reports refused until it passes its last one.",
-          'A link gone stays counted as exposure until both ends have reported since.',
+          "`machine control-plane` moves the role only, and needs the authority up. Routed machines' rows come only from the control plane's view, one hop.",
+          'A routed stream doesn\'t fail over once open; members more than four hops away are unreachable.',
+          "Link reports are versioned by their signer's clock.",
         ]) +
-        '<p><strong>Agent</strong></p>' +
+        '<p><strong>Agent and versions</strong></p>' +
         ul([
-          "A grant to an inbound or routed machine takes effect once this host's link report reaches it; while it's listed, that machine probes this host every 2 s.",
-          "With several hosts granting one machine, processes there use the newest agent socket, not their caller's.",
-          "A verb sent to a machine that reaches your agent through `agent-route-…` doesn't get it as `SSH_AUTH_SOCK`, so host git there doesn't use it (its instances do).",
-        ]) +
-        '<p><strong>Versions</strong></p>' +
-        ul([
-          'No build is published yet, so a member never downloads. It takes the control plane\'s binary only with `dev-builds = true` or `full` trust and the same OS/arch; otherwise it drops the link and is refused again on every redial. Dev builds from one commit with different local changes count as the same build.',
-          'A member that won\'t follow its control plane drops the link at every dial. If the control plane was the one dialed, it only sees the inbound machine come and go.',
-          "A member waiting for the control plane's binary gives up only if the transfer doesn't start within 60 s.",
+          'With several hosts granting one machine, processes there use the newest agent socket.',
+          "A published pin's download hasn't run against a real release yet. A dev pin is taken only with `dev-builds = true` or `full` trust on the same OS/arch; a member that can't update drops the link at each dial.",
         ]) +
         '<p><strong>Links and machines</strong></p>' +
         ul([
-          'An inbound machine exists only while its link is up: when the laptop sleeps, its rows and forwards vanish, and the forwards aren\'t restored.',
-          "Remote rows live in memory except on the control plane, so a fresh daemon shows machines without rows until they connect.",
-          "Verbs from a linked host run with the daemon's own process env (systemd/LaunchAgent), not a login shell's, so `PATH` additions are missing.",
-          'Machines added before roots were recorded have none in `member.toml`, so `worker` trust refuses those roots.',
-          'Terminals on helper-less instances, and service terminals, are not resumable over the link.',
-          'Daemon-side ssh is `BatchMode=yes`, so passphrase-prompting keys fail.',
-          '`vscode` and `inbox` are refused on machines, and nameless commands are local only.',
+          'An inbound machine exists only while its link is up; its forwards aren\'t restored.',
+          'Remote rows live in memory except on the control plane.',
+          "Verbs from a linked host get the daemon's env, not a login shell's.",
+          'Daemon-side ssh is `BatchMode=yes`: passphrase-prompting keys fail.',
+          '`vscode` and `inbox` are refused on machines; nameless commands are local only.',
         ]),
     },
   ],

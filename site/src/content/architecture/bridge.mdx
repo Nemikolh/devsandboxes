@@ -27,7 +27,7 @@ export const attachSteps = [
   { from: 'daemon', to: 'serve', label: 'Open(ssh-agent) · Data …', sub: 'id < 2³¹ · newest agent-capable bridge', tone: 'agent' },
   { from: 'serve', to: 'daemon', label: 'Data … · Close', sub: 'host dials the first live $SSH_AUTH_SOCK', tone: 'agent' },
   { from: 'client', to: 'daemon', label: 'devsbd notify → outbox, poke api.sock', tone: 'notify' },
-  { from: 'daemon', to: 'serve', label: 'Open(notify) · Data · Eof', sub: 'one record; resent until the host answers ok', tone: 'notify' },
+  { from: 'daemon', to: 'serve', label: 'Open(notify) · Data · Eof', sub: 'one record (notice, thread, URL to open); resent until ok', tone: 'notify' },
   { from: 'serve', to: 'daemon', label: 'Open(rpc) · call … result', sub: 'id ≥ 2³¹ · one stream per call · cancel = Close', tone: 'serve' },
   { from: 'serve', to: 'daemon', label: 'Connect(host, port) · Window · Eof', sub: 'forward bridges · id ≥ 2³¹ · daemon dials TCP' },
   { kind: 'phase', label: 'liveness' },
@@ -52,31 +52,22 @@ export const takeoverSteps = [
   { from: 'serve', to: 'new', label: 'next poll: exec -i devsbd bridge', sub: 'the bridge is the new build too', tone: 'serve' },
 ];
 
-Each host process that wants to reach a container runs its own `devsbd bridge` there. The bridge is a pipe fitter:
-it does a handshake on each side, then copies bytes until either end closes. All the logic is in the shared
-`Mux` (`src/devsbd/mux.rs`), which runs in the daemon and on the host, so only those two ends parse frames. The same
-`Mux` also carries the links between machines ([Fleet](/architecture/fleet)); this page is the container's side.
+Each host process that reaches a container runs its own `devsbd bridge` there. The bridge handshakes on each side,
+then copies bytes until either end closes; only the shared `Mux` (`src/devsbd/mux.rs`), in the daemon and on the
+host, parses frames. The same `Mux` carries the links between machines ([Fleet](/architecture/fleet)).
 
 <Sequence title="A host daemon's bridge, from attach to keepalive" lanes={attachLanes} steps={attachSteps} />
 
 ## Two handshakes
 
-The bridge sends `Hello` to the daemon first, then to the host. So a daemon of another protocol version fails the
-bridge (exit `3`, `proto::MISMATCH_EXIT`) before the host sees a frame, and the host never sends frames the
-daemon can't parse. Only `VERSION` must match. The build hash in `Hello` is informational: a bridge and daemon of
-the same old build work with a newer host as long as the protocol is the same.
+The bridge says `Hello` to the daemon first, then to the host, so a daemon of another protocol version fails the
+bridge (exit `3`, `proto::MISMATCH_EXIT`) before the host sends a frame it can't parse. Only `VERSION` must match;
+the build hash is informational. A mismatched container is retried every 5 minutes instead of every 10 s: only a
+helper rewrite fixes it.
 
-The caps don't pass through on their own, since each side only sees its own handshake:
-
-- the daemon's `Hello` advertises what it serves (`TCP_FORWARD`, `PORT_INFO`, `RPC`),
-- the bridge tells the host `OWN_CAPS ∧ daemon caps`, so a forward isn't attempted against a daemon that can't
-  serve it,
-- the host then sends `Caps` with what *it* serves, and the bridge passes it through unchanged. `SSH_AGENT` only
-  when it has a live agent, `NOTIFY` and `CONTROL` only from the host daemon's instance bridge (the one with a
-  sink).
-
-A host whose `Hello` mismatches (either side) retries that container every 5 minutes instead of every 10 s: only
-a helper rewrite fixes it.
+Each side sees only its own handshake, so caps are relayed by hand: the bridge tells the host `OWN_CAPS ∧ daemon
+caps`, and passes the host's `Caps` to the daemon unchanged. `SSH_AGENT` is sent only with a live agent, `NOTIFY`
+and `CONTROL` only by the host daemon's instance bridge (the one with a sink).
 
 ## Frames
 
@@ -101,43 +92,37 @@ u32 stream_id | u8 kind | u32 len | payload[len]      (len ≤ 1 MiB)
 | 11 | `PortQuery` | 0 | `u32 id`, `u16 port`: who listens on that port in the container |
 | 12 | `PortInfo` | 0 | `u32 id`, then per process `u32 pid`, `u8` + comm: the daemon's answer |
 
-Channels 6–10 (`API`, `TRANSFER`, `PTY`, `TUNNEL`, `AGENT`) never appear on a container's bridge: they're the
-channels of a link between two machines ([Fleet](/architecture/fleet)).
+Channels 6–11 (`API`, `TRANSFER`, `PTY`, `TUNNEL`, `AGENT`, `ROUTE`) only run between machines
+([Fleet](/architecture/fleet)). The header, `Hello`'s leading `version` and `Quit` are frozen, so any two builds can
+report a mismatch and evict each other; unknown kinds are skipped, so frames are added without a `VERSION` bump.
 
-The header, `Hello`'s leading `version` and `Quit` are frozen forever, so any two builds can at least report a
-mismatch and evict each other. Unknown kinds are skipped (payload consumed). That's how 7–12 landed without a
-`VERSION` bump.
-
-**Stream ids.** The daemon allocates ids with the high bit clear (agent, notify and control streams it opens),
-the host with it set (`Connect`, `Open(rpc)`). Each side refuses the other's id space, a live id, or too many
-streams: 64 daemon streams per bridge on the host, 256 host streams (`Connect` and rpc together) in the daemon.
+**Stream ids.** The daemon allocates with the high bit clear (agent, notify, control), the host with it set
+(`Connect`, `Open(rpc)`). Each side refuses the other's id space, a live id, or too many streams: 64 daemon-opened
+and 256 host-opened (`Connect` and rpc together) per bridge.
 
 ## Routing in the daemon
 
-The daemon keeps every attached bridge, newest last, and routes each kind of stream on its own:
+The daemon keeps every attached bridge and routes each stream it opens to the newest one whose host serves it:
 
 | stream | goes to | when there's none |
 |---|---|---|
-| ssh-agent | newest bridge whose host advertised `SSH_AGENT` | held up to 1 s for one, then closed ("agent refused") |
-| notify | newest bridge with `NOTIFY` | stays in `/var/lib/devsandbox/outbox/`, retried every 30 s and on attach |
+| ssh-agent | newest bridge with `SSH_AGENT` | held up to 1 s for one, then closed ("agent refused") |
+| notify (notices, threads, URLs to open) | newest bridge with `NOTIFY` | stays in `/var/lib/devsandbox/outbox/`, retried every 30 s and on attach |
 | control | newest bridge with `CONTROL` | answered `NoHost` (the CLI exits 75) |
-| rpc | n/a: opened by the host, one per call | |
-| `Connect` | n/a: opened by the host | |
 
-A bridge whose `Caps` hasn't arrived yet counts as not capable, unless its `Hello` caps were 0 (a host from
-before caps). So an agent-less `devsandbox port` that attaches last can't take ssh away from the host daemon's
-bridge.
+A bridge whose `Caps` hasn't arrived counts as serving nothing (one whose `Hello` caps were 0, as ssh-agent only), so an agent-less `devsandbox port` that attaches
+last can't take ssh away from the host daemon's bridge.
 
 ## Takeover
 
-`start` on a running container after a CLI upgrade rewrites the binary and starts a daemon of the new build. So does
-the serve daemon before it respawns a bridge, which is how a daemon that took over after an upgrade (or a machine
-that followed its control plane's version) reaches containers already running. The last start wins, upgrade or downgrade:
+`start` on a running container rewrites the binary and starts a daemon of the new build. So does the serve daemon
+before it respawns a bridge, which is how a daemon that took over after an upgrade (or a machine that followed the
+authority's pinned build) reaches containers already running. The last start wins, upgrade or downgrade:
 
 <Sequence title="A new build's daemon taking over a running container" lanes={takeoverLanes} steps={takeoverSteps} />
 
-Same build hash → the second daemon exits 0. No hash in the pidfile yet (its owner is still starting) counts as
-the same build, so two concurrent starts never evict each other.
+Same build hash → the second daemon exits 0. A pidfile with no hash yet (its owner still starting) counts as the
+same build, so two concurrent starts never evict each other.
 
-Design notes: `docs/architecture/helper/protocol.md` (frames, `Connect` flow control, takeover, self-heal),
-`docs/architecture/helper/bridges.md` (control and notify streams).
+Design notes: `docs/architecture/helper/protocol.md`, `docs/architecture/helper/bridges.md`,
+`docs/decisions/0053-the-authority-pins-the-fleets-build.md` (the pinned build).

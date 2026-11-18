@@ -1,50 +1,29 @@
 ---
 title: Going further
-description: The CLI behind the dashboard. Start sandboxes, run parallel instances on their own worktrees, and clean up, all from the commands your scripts and agents use.
+description: Sessions, who you are inside, links and profiles, GPUs and the host daemon.
 eyebrow: GETTING STARTED
 order: 2
 ---
 
-import Callout from '../../components/Callout.astro';
-import Experimental from '../../components/Experimental.astro';
-import ResourceLink from '../../components/ResourceLink.astro';
+## Build logs and detach
 
-This page picks up where the [quick start](/docs/quick-start) ends: a config root at `~/code/sandboxes` with a `web` sandbox. The dashboard takes over the terminal. Scripts and agents use these plain commands instead, and their output is uncoloured when piped.
-
-## Start a sandbox
+`run`, `rebuild` and `start` print their build and also write it to the instance's build log. Closing the terminal doesn't stop a build; Ctrl-C cancels it (a cancelled `run` is undone). `-d` returns as soon as the instance is registered:
 
 ```bash
-devsandbox run web           # prints the instance name: web
-devsandbox exec -it web zsh  # a shell in the workspace
-devsandbox exec web pnpm test
+devsandbox rebuild -d --force web       # prints: web, the build goes on
+devsandbox logs --build web --follow    # until it's up or failed
+devsandbox logs web                     # the container's own log
 ```
 
-`run` builds the image (Features included), starts the `database` service, creates the container `devsandbox-web` with `../web` mounted as the workspace, runs `postCreateCommand`, and returns once it's up. The instance runs in the background.
+A failing `postCreateCommand` aborts `run` but keeps the container, so `logs` and `exec` can show you why.
 
-What `run`, `rebuild` and `start` print, image build and lifecycle commands included, also goes to the instance's build log. `devsandbox logs --build web` prints it, and `--follow` keeps printing until the instance is up or has failed. The previous one is kept next to it as `build.1.log`.
-
-`run`, `rebuild`, `start`, `stop` and `rm` do their work in the [host daemon](/docs/host-daemon), with your shell's environment, and print it as it goes: closing the terminal doesn't stop a build, and Ctrl-C still cancels it (a cancelled `run` is undone). Pass `-d` (`--detach`) to `run`, `rebuild` or `start` to get the instance name back as soon as it's registered and leave the build running:
+`--service` opens a terminal in a service container the instance uses:
 
 ```bash
-devsandbox rebuild -d --force web   # prints: web, the build goes on
-devsandbox logs --build web --follow
+devsandbox exec web --service database -- psql -U postgres
 ```
 
-`exec` runs in the workspace directory as the instance's user ([below](#who-you-are-inside)), exits with the command's own status, and gets `-i` / `-t` by itself when run from a terminal (give either flag to choose yourself; redirected stdio stays piped). Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
-
-`--service <name>` opens a terminal in a service's container instead, the one that instance uses (a login shell, or the command after `--`); it needs a terminal and isn't a session:
-
-```bash
-devsandbox exec web --service db -- psql -U postgres
-```
-
-<Callout variant="note" title="When a lifecycle command fails">
-  A failing `postCreateCommand` aborts `run` but keeps the container, so `devsandbox logs --build web`, `devsandbox logs web` and `devsandbox exec web …` can show you why.
-</Callout>
-
-### Get a shell back
-
-An interactive `exec` (one with a terminal) runs in a session inside the instance: if your terminal closes or the connection drops, the program keeps running, and you can attach to it again:
+## Get a shell back
 
 ```bash
 devsandbox exec web --sessions                # id, state, attached or detached, started, command
@@ -54,95 +33,85 @@ devsandbox exec web --session 1790000000-a1b2 pnpm dev  # run in that session, o
 devsandbox exec web --end 1790000000-a1b2     # end a session (its program gets SIGHUP)
 ```
 
-A session id is `<unix seconds, 10 digits>-<4 hex digits>`, as `--sessions` lists them.
-
-The dashboard's terminals run in sessions too, so a shell still open when you quit the dashboard is there for `--attach`.
-
-A session whose terminal closed can still list as `attached`: the runtime leaves its client connected, and nothing in the container can tell. So `--attach` takes it over when it's the only one running; with several, the pick list shows each one's state, detached first.
-
-Sessions never time out: one ends when its program exits, when you end it (`--end`, or `K` on its row in the dashboard), or when its container stops. Stopping the sandbox ends them all. All of these work on a machine too (`devsandbox exec box/web --end …`).
+An `exec` from a terminal runs in a session that survives a closed terminal or a dropped connection, dashboard terminals included; sessions end with their program, `--end`, or the container.
 
 ## Who you are inside
 
-Inside a sandbox you are a user with your host uid/gid, so what it writes in the workspace is yours on the host, on rootful docker, rootless docker, rootless podman and VM-backed runtimes such as Apple `container` alike. The account is the config's `remoteUser` (else `containerUser`, else the image's `USER`), keeping its name, home and shell; only its ids change. How that's done depends on the runtime, which `run` probes once and states in one line:
+Inside a sandbox you are the config's `remoteUser` (else `containerUser`, else the image's `USER`) with your host uid/gid, on every runtime, so workspace files stay yours. `run` says how in one `identity:` line; `--reprobe` probes the runtime again after you change its setup.
 
-```text title="OUTPUT"
-identity: rootful: exec as vscode, remapped to 1000:1000, user namespaces allowed (seccomp)
-```
-
-On rootless docker, where root in the container already is you, execs run as root with `HOME` set to the account's home. An image with no user to adopt runs as root, with a warning recommending the `common-utils` Feature. `--reprobe` on `run` or `rebuild` probes the runtime again, after you change its setup. An instance keeps the user it was created with until it's rebuilt.
-
-To mount something into the user's home, whoever that is, target `${containerEnv:HOME}` ([variables](/docs/config#variables)):
+Mount into that user's home with `${containerEnv:HOME}` ([variables](/docs/config#variables)):
 
 ```toml
 mounts = ["source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"]
 ```
 
-To take the image's users as written instead, with nothing remapped, set [`identity = "image"`](/docs/config#devsandbox-extras) on the sandbox; a ported `updateRemoteUserUID = false` means the same.
+To take the image's users as written, nothing remapped, set [`identity = "image"`](/docs/config#devsandbox-extras) on the sandbox.
 
 ### Configs written for root
 
-A config that mounts into `/root` or sets a root `remoteUser` or `containerUser` breaks under this. Before `run`, `start` and `rebuild`, on a terminal, devsandbox lists those entries per config file, with the edit it would make, and asks:
+A config that mounts into `/root` or sets a root user gets a prompt before `run`, `start` and `rebuild`:
 
 ```text
 [u]pdate / [c]ontinue as is (don't ask again) / [s]kip this time
 ```
 
-`u` rewrites `devsandboxes.toml` in place, comments and layout kept: `/root` becomes `${containerEnv:HOME}`, a root user is removed, and it names the instances to `rebuild`. `c` keeps the config (a root user stays, as `identity = "image"`) and won't ask about those entries again; `s`, or Enter, goes ahead this once. A YAML config gets the edits to make by hand. Off a terminal, under `run --json` and on autostart, `run` prints one `warning:` line instead. The [dashboard](/docs/dashboard#run-stop-start) asks the same.
+`u` rewrites `devsandboxes.toml` (`/root` → `${containerEnv:HOME}`, root user removed, comments kept) and names the instances to `rebuild`; `c` keeps it as `identity = "image"`; `s` goes ahead this once.
 
-## A second instance
+## Links open on your desktop
 
-Run the same sandbox again:
+`xdg-open`, `$BROWSER` and a CLI's "press enter to open the browser" in a sandbox open the link in your host's browser. Only `http(s)` URLs open. A `localhost` URL or an OAuth callback (`gh auth login`) gets a port forward first, so it reaches the container. From a script, `devsbd open <url>`. Existing instances get it once rebuilt.
 
-```bash
-devsandbox run web   # prints: web-2
-devsandbox ps        # both instances
+[Profiles](/docs/config#profiles-profilesname) pick which browser:
+
+```toml title="devsandboxes.toml"
+[profiles.work]
+[profiles.personal]
+
+[sandbox.web]
+folder = "../web"
+image = "node:22"
+profiles = ["work", "personal"]   # the ones its instances may be in
 ```
 
-`web` is already using your checkout, so `web-2` gets its own **git worktree** in `~/code/sandboxes/.worktrees/web-2`, on a fresh `sandbox/web-2` branch. The two containers never share a working tree, which is the point when each one hosts a coding agent. Both reach the same global `database`.
-
-Pick the name with `--name`, or check out an existing branch with `--branch`:
-
-```bash
-devsandbox run web --name fix-login --branch fix/login
+```toml title="~/.local/share/devsandbox/profiles.toml"
+[work]
+open = ["google-chrome", "--profile-directory=Profile 2"]
 ```
 
-## From any directory
-
-Commands read the `devsandboxes.toml` in the current directory. `-C <dir>` points any of them at another config root, so you don't have to `cd` first:
-
 ```bash
-devsandbox -C ~/code/sandboxes run web
-devsandbox -C ~/code/sandboxes
+devsandbox run web --profile personal   # default: the last one picked, else the first
+devsandbox profile web work             # switch, nothing restarts
 ```
 
-## On another machine <Experimental />
+`P` in the dashboard does the same. A profile `profiles.toml` doesn't map opens with the system opener.
 
-Sandboxes can also live on a server you reach over ssh. Register it once (`machine add` offers to install devsandbox there if it's missing), then use its names like local ones:
+## GPUs
 
-```bash
-devsandbox machine add me@my-server   # its config roots are the ones it lists
-devsandbox run api                    # defined only there: runs there, prints my-server/api
-devsandbox exec api pnpm test         # in the instance there
-devsandbox stop my-server/web         # qualified, when `web` exists here too
+`hostRequirements.gpu = true` on a sandbox or a service gives its container every NVIDIA GPU; `"optional"` runs without one when none is usable. A required GPU that isn't usable stops `run` before anything is built, saying why. [Details](/docs/config#implemented-devcontainer-properties).
+
+```toml
+[sandbox.ml]
+folder = "../ml"
+image = "pytorch/pytorch"
+hostRequirements.gpu = true
 ```
 
-An interactive `exec` there reconnects by itself when the connection drops (`connection lost, reconnecting… (Ctrl-C to stop)`), back into the same session. See [Other machines](/docs/host-daemon#other-machines) for what runs where.
+## The host daemon
 
-## Clean up
+`run`, `rebuild`, `start`, `stop`, `rm`, the dashboard, port forwards, notifications and links all go through `devsandbox serve`, one per user. It starts on demand and exits after 10 minutes with nothing to do; files (`state.toml`, the Inbox) stay the source of truth, so stopping it loses nothing. Builds run with your shell's environment and keep going without the terminal. Linux and macOS.
+
+A sandbox the runtime restarts on boot (`autostart = "runtime"`) needs it running from login:
 
 ```bash
-devsandbox stop web-2   # stopped, kept: `start web-2` resumes it
-devsandbox rm web-2     # container, worktree and state entry gone
-devsandbox gc           # reap services nothing references
+devsandbox serve install     # a systemd user unit (Linux) or a LaunchAgent (macOS); never idles out
+devsandbox serve uninstall
 ```
 
-`rm` also removes the instance's isolated services, network and build log, and on a terminal asks before deleting the branch it created. Managed shell history is kept. Global services such as `database` outlive every `rm` until `gc` finds nothing referencing them.
+To only keep it from idling, without a unit:
 
-## Next steps
+```toml title="~/.local/share/devsandbox/daemon.config.toml"
+[serve]
+keep-alive = true
+```
 
-<div class="resource-grid">
-  <ResourceLink href="/docs/dashboard" label="Dashboard tour" description="Every tab and key, next to a preview you can play with" />
-  <ResourceLink href="/docs/config" label="Configuration" description="Every devsandboxes.toml field, merge rule and ${…} variable" />
-  <ResourceLink href="/examples" label="Examples" description="Parallel agents, shared databases, caches, ssh-agent, automations" />
-</div>
+Anyone who can open its socket can act as you on every sandbox, like `docker.sock`. Editors and GUIs talk to it over a JSON-lines API: `devsandbox api --stdio`, or the [Node API](/docs/node-api)'s `connect()`.

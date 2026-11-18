@@ -69,11 +69,11 @@ devsandbox exec fix-login ssh-add -l      # the same key, seen from inside
 Start <Agent /> in it and have it commit and push its branch:
 
 ```bash agent="claude"
-devsandbox exec -it fix-login claude
+devsandbox exec fix-login claude
 ```
 
 ```bash agent="codex"
-devsandbox exec -it fix-login codex
+devsandbox exec fix-login codex
 ```
 
 The remote must be an ssh URL (`git@github.com:…`); `https://` remotes never use the ssh-agent.

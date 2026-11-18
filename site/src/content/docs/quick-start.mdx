@@ -6,7 +6,6 @@ order: 1
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
-import Callout from '../../components/Callout.astro';
 import CodeBlock from '../../components/CodeBlock.astro';
 import InstallTabs from '../../components/InstallTabs.astro';
 import ResourceLink from '../../components/ResourceLink.astro';
@@ -15,11 +14,8 @@ import { REPO_URL, VERSION } from '../../lib/nav';
 
 ## Prerequisites
 
-devsandboxes drives a container runtime directly: no devcontainer CLI, no daemon to set up (its own starts on demand). You need:
-
-- A running **docker**, **podman** or Apple **`container`** (macOS). The default is `container` on macOS and `docker` elsewhere; pick another with `DEVSANDBOX_RUNTIME=docker|podman|container`.
-- **`git`**, for the worktrees extra instances get.
-- **`curl`**, to fetch devcontainer Features.
+- A running **docker**, **podman** or Apple **`container`** (default on macOS; `docker` elsewhere). Pick one with `DEVSANDBOX_RUNTIME=docker|podman|container`.
+- **`git`** and **`curl`**. No devcontainer CLI.
 
 ## Install
 
@@ -29,12 +25,7 @@ The package is `devsandboxes`; the binary it installs is `devsandbox`.
 
 ## Give your agent the skills
 
-The repo ships two [agent skills](https://agentskills.io):
-
-- **`devsandbox-cli`**: how to use the CLI.
-- **`config-toml-spec`**: the config format.
-
-Install them with [skills.sh](https://skills.sh), or copy them by hand:
+Two [agent skills](https://agentskills.io): **`devsandbox-cli`** (the CLI) and **`config-toml-spec`** (the config format).
 
 <Tabs id="skills" label="Skill install method" tabs={[{ id: 'skills-sh', label: 'skills.sh' }, { id: 'manual', label: 'Manually' }]}>
   <Fragment slot="skills-sh">
@@ -51,14 +42,9 @@ cp -r /tmp/ds/skills/* ~/.claude/skills/   # devsandbox-cli, config-toml-spec`}
   </Fragment>
 </Tabs>
 
-<div class="resource-grid">
-  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/devsandbox-cli/SKILL.md" label="devsandbox-cli" description="skills/devsandbox-cli/SKILL.md on GitHub" />
-  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/config-toml-spec/SKILL.md" label="config-toml-spec" description="skills/config-toml-spec/SKILL.md on GitHub" />
-</div>
-
 ## Write a config
 
-A config root is a folder holding one `devsandboxes.toml` (or `devsandboxes.yaml`, same schema). It lives **outside** your repos and describes every sandbox; each sandbox points at a repo with `folder`, relative to the config root. This guide uses this layout, with `web` being any git repository:
+A config root is a folder **outside** your repos holding one `devsandboxes.toml`; each sandbox points at a repo with `folder`, relative to it:
 
 ```text title="LAYOUT"
 ~/code/
@@ -68,8 +54,6 @@ A config root is a folder holding one `devsandboxes.toml` (or `devsandboxes.yaml
 ```
 
 ### With your agent
-
-Paste this into your agent and let it do the typing:
 
 <AgentPrompt
   goal="Create a devsandbox config dir at ~/code/sandboxes with a devsandboxes.toml holding a sandbox for my repo at ~/code/web, plus a postgres service it can use."
@@ -105,9 +89,9 @@ image = "mcr.microsoft.com/devcontainers/base:ubuntu"
 postCreateCommand = "pnpm install"
 ```
 
-`[sandbox.web]` is a devcontainer definition in TOML: `image`, `features` and `postCreateCommand` mean what they mean in `devcontainer.json`. It `extends` the `base` template, which deep-merges into it (tables recurse, arrays concatenate), so every sandbox extending `base` shares the pnpm cache and the Node feature. `[services.database]` is a postgres sidecar; `scope = "global"` makes every instance share one container instead of getting its own.
+`[sandbox.web]` is a devcontainer definition in TOML; `extends` merges the `base` template into it ([how](/docs/config#templates-and-extends)), and `scope = "global"` gives every instance one shared postgres.
 
-Check it from the config root. `ls` lists the sandboxes and fails loudly on unknown keys:
+Check it from the config root. `ls` lists the sandboxes and fails loudly on unknown keys (with no config yet, `devsandbox run` on a terminal offers to write one):
 
 ```bash
 cd ~/code/sandboxes
@@ -119,24 +103,30 @@ NAME  SOURCE                                             FOLDER  SERVICES  EXTEN
 web   image mcr.microsoft.com/devcontainers/base:ubuntu  ../web  database  base
 ```
 
-<Callout variant="tip" title="No config yet?">
-  Run `devsandbox run` in an empty folder: on a terminal it offers to write an example `devsandboxes.toml` for you to edit.
-</Callout>
+## Run it
+
+```bash
+devsandbox run web                                  # prints the instance name: web
+devsandbox exec web zsh                             # a shell in the workspace
+devsandbox run web                                  # web-2: its own worktree, branch sandbox/web-2
+devsandbox run web --name fix-login --branch fix/login
+devsandbox ps
+devsandbox stop web-2                               # `start web-2` resumes it
+devsandbox rm web-2                                 # container, worktree, state entry
+devsandbox gc                                       # services nothing uses
+devsandbox -C ~/code/sandboxes ps                   # from any directory
+```
+
+Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename. `exec` runs as your user, in the workspace, with the command's exit status.
 
 ## The dashboard
 
-From the config root, run `devsandbox` with no arguments to open the dashboard: every instance and service live, with the actions of the CLI one key away.
-
-```bash
-devsandbox
-```
-
-Select `web` and press `r` to run an instance, `t` for a terminal inside it, `?` for every key binding. Run it again and the second instance gets its own git worktree, so two agents never share a working tree. The [dashboard tour](/docs/dashboard) walks through each tab next to a preview you can play with.
+Run `devsandbox` with no arguments: every instance and service live, the CLI's actions one key away (`r` run, `t` terminal, `?` every key). See the [dashboard tour](/docs/dashboard).
 
 ## Next steps
 
 <div class="resource-grid">
-  <ResourceLink href="/docs/going-further" label="Going further" description="The same, from the CLI: run, exec, parallel instances, clean up" />
+  <ResourceLink href="/docs/going-further" label="Going further" description="Sessions, identity, links, GPUs, the daemon" />
   <ResourceLink href="/docs/config" label="Configuration" description="Every devsandboxes.toml field, merge rule and ${…} variable" />
   <ResourceLink href="/examples" label="Examples" description="Parallel agents, shared databases, caches, ssh-agent, automations" />
   <ResourceLink href="/docs/node-api" label="Node API" description="Every command as a typed promise from the devsandboxes package" />

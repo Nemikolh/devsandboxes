@@ -78,13 +78,13 @@ devsandbox ps
 Start <Agent /> in each:
 
 ```bash agent="claude"
-devsandbox exec -it fix-login claude
-devsandbox exec -it add-profile-pic claude
+devsandbox exec fix-login claude
+devsandbox exec add-profile-pic claude
 ```
 
 ```bash agent="codex"
-devsandbox exec -it fix-login codex
-devsandbox exec -it add-profile-pic codex
+devsandbox exec fix-login codex
+devsandbox exec add-profile-pic codex
 ```
 
 When a task is done, push its branch ([ssh and git push](/examples/ssh-and-git-push)) and remove the instance, container and worktree:

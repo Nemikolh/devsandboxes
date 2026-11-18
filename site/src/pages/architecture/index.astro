@@ -11,7 +11,7 @@ const processes = [
   { name: 'devsandbox <cmd>', where: 'host', lives: 'one command', code: 'src/commands/' },
   { name: 'devsandbox (dashboard)', where: 'host', lives: 'while open', code: 'src/tui/' },
   { name: 'devsandbox serve', where: 'host, setsid', lives: 'until idle, handoff or shutdown', code: 'src/serve/' },
-  { name: 'ssh … devsandbox api --stdio', where: 'host → a machine', lives: 'while the machine is wanted, or one remote verb', code: 'src/serve/machines/' },
+  { name: 'ssh <m> devsandbox fleet-link --peer <host>', where: 'host → an ssh machine', lives: 'held per machine pair, redialed on drop', code: 'src/serve/fleet/dialer.rs' },
   { name: 'devsbd bridge', where: 'container, exec -i', lives: 'its host process', code: 'devsbd/src/bridge.rs' },
   { name: 'devsbd daemon', where: 'container, root', lives: 'the container, per build', code: 'devsbd/src/daemon.rs' },
 ];

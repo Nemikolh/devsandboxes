@@ -1,6 +1,6 @@
 ---
 title: Machines to fleet
-description: How remote machines went from per-use ssh to one held link per machine pair, with a control plane that places work, in steps 1 to 8, and what is still planned.
+description: How remote machines went from per-use ssh to one held link per machine pair, with a control plane that places work, in steps 1 to 12, and what is still planned.
 eyebrow: ARCHITECTURE · 04
 order: 4
 ---
@@ -17,22 +17,20 @@ why, to how it got here (`7716cb8` to `main`), down to the code.
 
 ## Why
 
-Seven problems with machines at `7716cb8`, one slide each. Each slide opens one level into how it works now and
-points to the section below that covers it.
+Seven problems with machines at `7716cb8`, one slide each, each opening one level into how it works now.
 
 <Deck slides={why} label="Why machines became a fleet" />
 
 ## The migration
 
-Four stages. Steps 1–6 built a second kind of machine (lending) that steps 7–8 folded back into one; the second
+One slide per step. Steps 1–6 built a second kind of machine (lending) that steps 7–8 folded back into one; that
 slide is kept for history.
 
-<Deck slides={phases} label="From machines to fleet, by stage" />
+<Deck slides={phases} label="From machines to fleet, by step" />
 
 ## Command by command
 
-What each command does with a machine at `7716cb8` and on `main`. Rows with a chevron open onto the details,
-including the steps 1–6 behavior where it differed.
+What each command does with a machine at `7716cb8` and on `main`. Rows with a chevron open onto the details.
 
 <CommandTable rows={commands} beforeLabel="Before (7716cb8)" afterLabel="Today (main)" />
 
@@ -45,7 +43,7 @@ the arrows below each diagram explain it.
 
 ## What's left
 
-Steps 1–8 are on `main`. The rest is planned, and the current build has the limits listed after it.
+Steps 1–12 are on `main`. The rest is planned, and the current build has the limits listed after it.
 
 <Drill card={steps} open />
 

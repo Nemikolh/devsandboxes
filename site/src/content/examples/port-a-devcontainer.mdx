@@ -64,14 +64,12 @@ From the config dir:
 ```bash
 devsandbox ls                  # validates the config, no container needed
 devsandbox run web
-devsandbox exec -it web zsh
+devsandbox exec web zsh
 ```
 
 ## How it works
 
-The `devcontainer.json` can stay in the repo; devsandbox never reads it.
-
-### Property mapping
+The `devcontainer.json` can stay in the repo; devsandbox never reads it. `ls` errors on unknown keys; `run` warns about ignored ones.
 
 | devcontainer.json | devsandboxes.toml | notes |
 |---|---|---|
@@ -86,27 +84,19 @@ The `devcontainer.json` can stay in the repo; devsandbox never reads it.
 | `workspaceFolder` | same | default `/workspaces/<folder basename>` |
 | `workspaceMount` | `folder` | ignored |
 | `init`, `privileged` | same | |
+| `hostRequirements.gpu` | same | a required GPU that can't be had refuses the run; other `hostRequirements` ignored |
 | `initializeCommand` | same | runs on the host, in the config dir |
 | `onCreateCommand` … `postAttachCommand` | same | tables run in order, not in parallel |
 | `customizations.vscode.extensions` | same | |
 | `customizations.vscode.settings` | repo `.vscode/settings.json` | ignored |
-| `forwardPorts` | same | forwarded by the [host daemon](/docs/host-daemon) while the instance runs |
+| `forwardPorts` | same | forwarded by the [host daemon](/docs/going-further#the-host-daemon) while the instance runs |
 | `appPort`, `portsAttributes` | `devsandbox port web 3000` | ignored |
 | `runArgs`, `capAdd`, `securityOpt` | none | ignored |
 | `dockerComposeFile`, `service`, `runServices` | `[services.*]` + `services` | error |
 
-### Implemented, ignored, rejected
+The full list of implemented, ignored and rejected keys is in the [config reference](/docs/config#implemented-devcontainer-properties).
 
-`ls` errors on unknown keys; `run` warns about ignored ones.
-
-- **Implemented:** `image`, `build`, `features`, `workspaceFolder`, `mounts`, `containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `updateRemoteUserUID` (`false` means `identity = "image"`), `init`, `privileged`, the six lifecycle commands, `customizations.vscode.extensions`, `forwardPorts`, `hostRequirements.gpu` (a required GPU that can't be had refuses the run) ([details](/docs/config#implemented-devcontainer-properties)).
-- **Ignored:** `name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements` other than `gpu`, `waitFor`, `secrets`, other `customizations.*` ([details](/docs/config#accepted-but-ignored-warned-at-run)).
-- **Rejected:** `dockerComposeFile`, `service`, `runServices`, and any unknown key.
-- **Variables:** as in devcontainers, plus `${configDir}`, `${sharedVolumes}`, `${instance}`, and `${containerEnv:…}` in `mounts` too (`target=${containerEnv:HOME}/.config/gh`); substituted only in some keys ([variables](/docs/config#variables)).
-
-### Coming from docker compose
-
-The app container is the sandbox; each other compose service becomes a `[services.<name>]` (`image`, `env`, `ports`, `command`) that the sandbox lists in `services` and reaches by name as hostname. See [private services per instance](/examples/isolated-services) and [one shared Postgres](/examples/shared-postgres).
+From docker compose: the app container is the sandbox; each other compose service becomes a `[services.<name>]` that the sandbox lists in `services` and reaches by name ([private services](/examples/isolated-services), [one shared Postgres](/examples/shared-postgres)).
 
 ## Agent instructions
 

@@ -1,29 +1,16 @@
 ---
-title: Host daemon
-description: The per-user background process behind builds, notifications, dispatchers, port forwards and the API. It starts on its own; install it to run from login.
+title: Other machines
+description: Sandboxes on your other hosts, over ssh, in the same CLI and dashboard.
 eyebrow: REFERENCE
 order: 4
 ---
 
 import Callout from '../../components/Callout.astro';
 import Experimental from '../../components/Experimental.astro';
-import ResourceLink from '../../components/ResourceLink.astro';
 
-`devsandbox serve` is a small background process, one per user, that holds the live side of devsandbox on your machine: the `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` you start, everything the dashboard shows, the connection to each running sandbox's helper, the ssh-agent relay, port forwards, desktop notifications, the control commands dispatchers use, and the API other tools talk to. Because it lives outside the dashboard and your terminal, all of that keeps working when you close them.
+<Experimental />
 
-## You don't start it
-
-The dashboard, `run`, `rebuild`, `start`, `stop`, `rm`, `service rebuild` and the commands that relay your ssh-agent start it when it isn't running, and a newer devsandbox takes over from an older one by itself. It exits 10 minutes after its last user left: no dashboard, no build or other command still running, no port forward, no running dispatcher or `inbox = true` sandbox. Files stay the source of truth (`state.toml`, the Inbox), so stopping it loses nothing, and read-only commands such as `ps` or `devsandbox inbox ls` don't need it.
-
-What it keeps across restarts:
-
-- **Builds.** A `run`, `rebuild` or `start` keeps going when the daemon hands over to a newer one, and the next daemon picks it up. It runs with the environment of the shell that started it, not the daemon's, so `${localEnv:…}` and your ssh-agent are yours. With no daemon reachable, the command warns and runs in your terminal instead.
-- **Port forwards.** Ports-tab forwards survive closing the dashboard and come back on the same host port when the daemon restarts; a sandbox's `forwardPorts` follow its instance.
-- **Dispatchers.** `devsbd ensure`, `exec`, `events` and the rest are served whether or not a dashboard is open. A control command exits `75` only when no daemon is reachable; scripts retry.
-
-## Other machines <Experimental />
-
-The daemon can also manage sandboxes on other hosts you reach over ssh. `machine add` checks the machine's devsandbox first: when it's missing or another version, it offers to copy this one there (to `~/.local/bin/devsandbox`, or over the old one; `--auto-install` skips the question and is needed off a terminal). Register one, and its sandboxes and instances show in your dashboard next to yours, and the CLI finds its names:
+## Add a machine
 
 ```bash
 devsandbox machine add me@my-server   # its config roots are the ones it lists
@@ -32,61 +19,45 @@ devsandbox exec test                  # an instance there, over your daemon's li
 devsandbox stop my-server/test        # qualified, when the name exists here too
 devsandbox ps --machine my-server     # a command without a name, run there
 devsandbox machine ls                 # each machine's state: connected, unreachable, …
-devsandbox machine upgrade my-server  # copy this build over its devsandbox, when it runs another
 ```
 
-Commands on a machine reach only what it lets your host reach: by default its own config roots, and `gc --machine` is refused there until you run `devsandbox machine trust full` on it.
-
-While it runs, your daemon keeps one link to each machine (an ssh to it running `devsandbox fleet-link` there), and everything to that machine goes over it, so a build on a machine runs with that machine's daemon environment. Your ssh-agent reaches a machine only if you turn on its `agent` (`devsandbox machine add --agent`, `devsandbox machine set <name> --agent on`, or `a` on the dashboard's Machines tab); then it's relayed there over the link, and turning it off takes effect at once. ssh never prompts: use a key from your agent. A machine that's down keeps its last rows, marked `unreachable`. `devsandbox port my-server/web 3000` opens a machine's port here, over the link (the machine needs this devsandbox version); a machine's own `forwardPorts` stay on it. VS Code on a machine isn't supported yet.
+- `machine add` offers to install this devsandbox there when it's missing or another version (`--auto-install` off a terminal), and asks you to confirm the machine's key fingerprint (`--yes`).
+- Your ssh-agent reaches it only with `--agent`, or later `devsandbox machine set my-server --agent on` (`a` on the dashboard's Machines tab).
+- `devsandbox port my-server/web 3000` opens a machine's port here. An `exec` there reconnects into the same session when the link drops.
+- VS Code on a machine isn't supported yet.
 
 <Callout variant="note" title="Adding a machine means trusting it">
   Whoever controls it can act as you in its sandboxes, and, with its `agent` on, sign with your ssh-agent while you use it.
 </Callout>
 
-### A config every machine runs
+## What a machine lends
 
-A config can belong to all your machines instead of the one it was written on, so an always-on server keeps running its sandboxes while that host is off. The host that made the fleet (its first `machine add`: the fleet's authority) signs a new version of a config root whenever a `run`, `rebuild` or `start` typed there finds it changed. A `machine add` there does the same for `~/.devsandboxes` and the roots picked with `machine roots add`, so a machine it adds gets them right away. What's signed is the config and the files under the root it references (build files, `${configDir}` mounts, local features), not the rest of the root. Every other machine installs its own copy at `~/.local/share/devsandbox/mesh/tree/<root's directory name>/`, keeps the latest version it got while the authority is offline, and builds only from that version: edit the config on the authority, since a copy changed in place is refused.
-
-To run a config written on your desktop on a server `box`, driven from your laptop, in this order:
-
-1. Install the same devsandbox release on all three machines. `machine add` only compares version numbers, and every machine must understand the signed config entries.
-2. On the desktop: `devsandbox machine add box --control-plane`. The desktop becomes the authority. `--control-plane` makes the always-on `box` the control plane, since a control plane that's offline can only be replaced while the authority is up. The add signs `~/.devsandboxes` (and any root picked with `machine roots add`) and prints `note: signed config` and the version for each; `box` installs them as its link comes up.
-3. On the desktop, for a config root the add didn't sign, or after editing one: any `run`, `rebuild` or `start` on the root (one aimed at `box`, such as `run box/<sandbox>`, works too). Its output starts with `note: signed config` and the version. A `note:` naming a machine means that machine doesn't have it yet; it says why. Fix the cause and run any verb on the root again: an unchanged config is sent again. The dashboard doesn't show these notes; use the CLI. With no such note, `box` has installed the copy and the desktop can go offline.
-4. On `box`:
-   - `devsandbox serve install`, so its daemon runs without a login (needed by `autostart = "runtime"`).
-   - What the config's relative `folder` and `folders` point at lives next to the copy: `folders = { "/workspaces/multipass" = "../stackblitz/multipass" }` needs `~/.local/share/devsandbox/mesh/tree/stackblitz/multipass`. A `run box/<sandbox>` typed on the desktop brings each one from the desktop's checkout first (its branch and uncommitted work, then only new commits on later runs) and says `note: sent` for each. A run from anywhere else needs them there already: clone them by hand (a symlink to a clone elsewhere works); a missing one refuses the `run`. A clone you made is never touched, not even by the desktop's runs.
-   - Copy into the copy what the config only reaches through a command (a script a `postStartCommand` runs, its `node_modules`): those files aren't signed or sent. Files added outside build contexts and local features are allowed.
-   - Add what the config reads from the host: ignored files it links in (`worktree-link`), `${localEnv:…}` variables, and a reachable runtime (rootless docker: `XDG_RUNTIME_DIR`) in that daemon's environment.
-   - `shared-volumes/` starts empty on `box`, so log in again to whatever keeps its credentials there.
-5. On the laptop: `devsandbox machine add box`. Its copies show up as `box`'s roots on their own, even one installed after the add: `devsandbox run box/<sandbox>`.
-
-## Start it at login
-
-A sandbox the container runtime restarts on boot (`autostart = "runtime"`) can't start a host process itself, so until your first `devsandbox` command its control commands wait. Hand the daemon to your service manager to close that gap:
+Work placed on a machine gets nothing extra unless it allows it. Only that host sets its own allowances: `machine allow` there, or `machine add` over your ssh session to it.
 
 ```bash
-devsandbox serve install     # a systemd user unit (Linux) or a LaunchAgent (macOS)
-devsandbox serve uninstall
+devsandbox machine allow                                  # on the machine: list
+devsandbox machine allow --gpus on --bind-add ~/datasets  # what placed work may use
+devsandbox machine add box --allow gpus --allow-bind /srv/data   # or answer its prompt
+devsandbox run ml --place                                 # a GPU sandbox goes to a machine lending one
 ```
 
-The installed daemon never idles out and follows upgrades: a newer devsandbox repoints the unit at its own binary. Run `install` again after changing `PATH` or your container runtime's settings. To only keep the daemon from idling, without a unit, set it in `~/.local/share/devsandbox/daemon.config.toml`:
+`devsandbox machine trust full` on a machine opens its whole API to the fleet instead (any root, any path, `gc --machine`).
 
-```toml
-[serve]
-keep-alive = true
-```
+## A config every machine runs
 
-<Callout variant="note" title="Who can use it">
-  The daemon listens on a unix socket only you can open. Anyone who can connect to it can act as you on every sandbox, like with `docker.sock`. Linux and macOS only.
-</Callout>
+A config can belong to the whole fleet, so an always-on server keeps running its sandboxes while the host it was written on is off. The fleet's authority (the host of its first `machine add`) signs a new version whenever a `run`, `rebuild` or `start` there finds the config changed, and every machine installs its own copy under `~/.local/share/devsandbox/mesh/tree/<root>/`. Edit the config on the authority: a copy changed in place is refused.
 
-## Talk to it
+To run a config from your desktop on a server `box`, driven from your laptop:
 
-Editors and GUIs reach the same Inbox, instances and forwards as the dashboard through a JSON-lines API: spawn `devsandbox api --stdio`, or use the typed client of the npm package, `connect()`.
+1. Install the same devsandbox release on all three.
+2. Desktop: `devsandbox machine add box --control-plane`; each signed root prints `note: signed config`.
+3. Desktop, for another root or after an edit: any `run`, `rebuild` or `start` on it; a `note:` naming a machine says why it doesn't have it yet.
+4. `box`: `devsandbox serve install`; a `run box/<sandbox>` from the desktop sends the repos, else clone them next to the copy; add the `${localEnv:…}` variables and logins the config needs.
+5. Laptop: `devsandbox machine add box`, then `devsandbox run box/<sandbox>`.
 
-<div class="resource-grid">
-  <ResourceLink href="/docs/node-api" label="Node API" description="connect(): the Inbox, instances and port forwards, typed" />
-  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/architecture/daemon/role.md" label="docs/architecture/daemon/role.md" description="Start, handoff, idle exit, boot start, logs" />
-  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/architecture/daemon/machines.md" label="docs/architecture/daemon/machines.md" description="Machines: the ssh transport, names, limitations" />
-  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/reference/api.md" label="docs/reference/api.md" description="Every API method, notification and error code" />
-</div>
+## Control plane and versions
+
+- `machine add box --control-plane` makes `box` the control plane of a new fleet; `devsandbox machine control-plane <m>` moves the role later, even off a dead one.
+- Members run the build the authority pinned: a published release is downloaded and verified; a source build only with `dev-builds = true` in `member.toml` or `full` trust.
+- `devsandbox machine upgrade <m>` copies this build over the machine's, over ssh.
+- Links a sandbox on a machine opens open on the host that attached to it with a terminal last (within 10 minutes), in that host's [profile](/docs/going-further#links-open-on-your-desktop) browser.

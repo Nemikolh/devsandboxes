@@ -21,7 +21,7 @@ const sockets = [
 const serveParts = ['Bridges · event-driven poll', 'Forwards', 'API', 'Inbox sink', 'Helper RPC'];
 const hostEnds = [
   { icon: KeyRound, label: '$SSH_AUTH_SOCK', tone: 'agent' },
-  { icon: Bell, label: 'inbox.json · popup', tone: 'notify' },
+  { icon: Bell, label: 'inbox.json · popup · browser', tone: 'notify' },
   { icon: Network, label: 'localhost:<port>', tone: 'helper' },
 ];
 ---
@@ -35,7 +35,7 @@ const hostEnds = [
     devsbd.ctl socket. The daemon, running as root, owns ssh-agent.sock for ssh and git, api.sock for devsbd notify,
     ensure and events, dials TCP inside the container for port forwards, and runs the host daemon's RPC calls, such as
     attaching to a helper session or a tracked run. The host daemon ends the container's streams at your ssh-agent, the
-    Inbox store and desktop popups, and forward listeners on localhost.
+    Inbox store, desktop popups and the desktop browser (for URLs the sandbox opens), and forward listeners on localhost.
   </p>
 
   <div class="arc-helper-grid" aria-hidden="true" inert>

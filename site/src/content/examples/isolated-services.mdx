@@ -95,13 +95,13 @@ devsandbox stats        # both instances and all four service containers
 Start <Agent /> in each:
 
 ```bash agent="claude"
-devsandbox exec -it fix-login claude
-devsandbox exec -it add-search claude
+devsandbox exec fix-login claude
+devsandbox exec add-search claude
 ```
 
 ```bash agent="codex"
-devsandbox exec -it fix-login codex
-devsandbox exec -it add-search codex
+devsandbox exec fix-login codex
+devsandbox exec add-search codex
 ```
 
 `devsandbox rm add-search` removes the instance with its services and network.

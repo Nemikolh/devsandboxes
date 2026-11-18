@@ -40,8 +40,8 @@ describe('sidebarGroups', () => {
     expect(groups[1].links.map((l) => l.href)).toEqual(['/docs/dashboard']);
   });
 
-  it('opens the references with the host daemon, the last docs page in reading order', () => {
-    expect(sidebarGroups([])[2].links.map((l) => l.href)).toEqual(['/docs/host-daemon', '/docs/config', '/docs/node-api']);
+  it('opens the references with machines, the last docs page in reading order', () => {
+    expect(sidebarGroups([])[2].links.map((l) => l.href)).toEqual(['/docs/machines', '/docs/config', '/docs/node-api']);
   });
 
   it('ends with the changelog', () => {

@@ -38,7 +38,7 @@ mounts = ["source=${sharedVolumes}/gh,target=${containerEnv:HOME}/.config/gh,typ
 
 [sandbox.pr-dispatcher]
 extends = "base"
-folder = "../pr-dispatcher"        # its own repo: babysit-loop.sh, .gitignore
+folder = "../pr-dispatcher"        # its own repo: babysit-loop.sh, fix.sh, .gitignore
 autostart = "runtime"              # docker/podman bring it back after a reboot
 dispatcher = { spawn = ["web"] }   # it may create children of `web` only
 postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"
@@ -65,7 +65,7 @@ mounts = ["source=${sharedVolumes}/gh,target=${containerEnv:HOME}/.config/gh,typ
 
 [sandbox.pr-dispatcher]
 extends = "base"
-folder = "../pr-dispatcher"        # its own repo: babysit-loop.sh, .gitignore
+folder = "../pr-dispatcher"        # its own repo: babysit-loop.sh, fix.sh, .gitignore
 autostart = "runtime"              # docker/podman bring it back after a reboot
 dispatcher = { spawn = ["web"] }   # it may create children of `web` only
 postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"
@@ -87,19 +87,11 @@ On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any ins
 
 </AgentOnly>
 
-The loop, in `pr-dispatcher/` next to `devsandboxes.toml`, with a `.gitignore` for `babysit.log` and `.babysit/`. Set `REPO` and `chmod +x` it:
+The loop, in `pr-dispatcher/` next to `devsandboxes.toml`, with a `.gitignore` for `babysit.log` and `.babysit/`. It runs `fix.sh` in each child. Set `REPO` and `chmod +x` the loop:
 
-```sh title="pr-dispatcher/babysit-loop.sh" agent="claude" collapsed
-#!/bin/sh
-set -u
-REPO=owner/web
-STATE=.babysit            # per PR: "<run id> <head sha>"; gitignored
-mkdir -p "$STATE"
-
-# Runs inside the child, in the PR's worktree, with PR_NUMBER and BASE_BRANCH
-# from `ensure --env`. Merging the base in (no rebase) keeps a plain
-# `git push` enough; Claude Code only starts when the merge conflicts.
-FIX='
+```sh title="pr-dispatcher/fix.sh" agent="claude"
+# Runs in the child's worktree with PR_NUMBER and BASE_BRANCH. Merging the
+# base (no rebase) keeps a plain `git push` enough; Claude Code only starts on a conflict.
 set -u
 fail() {
   git merge --abort 2>/dev/null
@@ -121,84 +113,11 @@ stop and leave the merge unfinished." \
   fi
 fi
 git push || fail "git push failed"
-'
-
-# Run a control command, retrying while no host daemon is reachable (exit 75).
-ctl() {
-  while :; do
-    "$@" </dev/null; rc=$?
-    [ "$rc" -eq 75 ] || return "$rc"
-    sleep 60
-  done
-}
-
-# One line per open same-repo PR: "<number> <head branch> <base branch> <head sha>".
-OPEN='.[] | select(.isCrossRepository | not)
-  | "\(.number) \(.headRefName) \(.baseRefName) \(.headRefOid)"'
-
-# Cheap check, no agent: conflicted or behind its base.
-needs_attention() {
-  case $(gh pr view "$1" -R "$REPO" --json mergeStateStatus -q .mergeStateStatus </dev/null) in
-    DIRTY|BEHIND) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-while :; do
-  # Same-repo PRs only ($OPEN): a fork's head branch isn't on origin. If gh
-  # fails (logged out, offline), skip the round rather than retire every child.
-  if ! gh pr list -R "$REPO" -q "$OPEN" \
-       --json number,headRefName,baseRefName,headRefOid,isCrossRepository \
-       >"$STATE/open.new"; then
-    sleep 300
-    continue
-  fi
-  mv "$STATE/open.new" "$STATE/open"
-
-  while read -r num branch base head; do
-    key="pr-$num"
-    if [ -f "$STATE/$key" ]; then
-      read -r id last <"$STATE/$key"
-      case $(ctl devsbd run wait "$key" "$id" --timeout 0) in
-        running) continue ;;                          # still on it
-        "exited 0") ;;
-        *) [ "$last" = "$head" ] && continue ;;       # failed on this head: wait for a push
-      esac
-    fi
-    needs_attention "$num" || continue
-    ctl devsbd ensure web --key "$key" --branch "$branch" \
-        --env PR_NUMBER="$num" --env BASE_BRANCH="$base" >/dev/null || {
-      devsbd notify --level error --key "$key" "PR $num: cannot start a child (exit $?)"
-      continue
-    }
-    ctl devsbd run prune "$key" --keep 5 >/dev/null   # old runs' logs
-    id=$(ctl devsbd exec "$key" --detach -- sh -c "$FIX") || continue
-    echo "$id $head" >"$STATE/$key"
-  done <"$STATE/open"
-
-  # Retire children whose PR is no longer open.
-  for f in "$STATE"/pr-*; do
-    [ -e "$f" ] || continue
-    key=${f##*/}
-    grep -q "^${key#pr-} " "$STATE/open" && continue
-    ctl devsbd rm "$key" && rm -f "$f"
-  done
-
-  sleep 300
-done
 ```
 
-```sh title="pr-dispatcher/babysit-loop.sh" agent="codex" collapsed
-#!/bin/sh
-set -u
-REPO=owner/web
-STATE=.babysit            # per PR: "<run id> <head sha>"; gitignored
-mkdir -p "$STATE"
-
-# Runs inside the child, in the PR's worktree, with PR_NUMBER and BASE_BRANCH
-# from `ensure --env`. Merging the base in (no rebase) keeps a plain
-# `git push` enough; Codex only starts when the merge conflicts.
-FIX='
+```sh title="pr-dispatcher/fix.sh" agent="codex"
+# Runs in the child's worktree with PR_NUMBER and BASE_BRANCH. Merging the
+# base (no rebase) keeps a plain `git push` enough; Codex only starts on a conflict.
 set -u
 fail() {
   git merge --abort 2>/dev/null
@@ -220,7 +139,14 @@ If a conflict needs a human decision, stop and leave the merge unfinished." ||
   fi
 fi
 git push || fail "git push failed"
-'
+```
+
+```sh title="pr-dispatcher/babysit-loop.sh" collapsed
+#!/bin/sh
+set -u
+REPO=owner/web
+STATE=.babysit            # per PR: "<run id> <head sha>"; gitignored
+mkdir -p "$STATE"
 
 # Run a control command, retrying while no host daemon is reachable (exit 75).
 ctl() {
@@ -271,7 +197,7 @@ while :; do
       continue
     }
     ctl devsbd run prune "$key" --keep 5 >/dev/null   # old runs' logs
-    id=$(ctl devsbd exec "$key" --detach -- sh -c "$FIX") || continue
+    id=$(ctl devsbd exec "$key" --detach -- sh -c "$(cat fix.sh)") || continue
     echo "$id $head" >"$STATE/$key"
   done <"$STATE/open"
 
@@ -287,36 +213,30 @@ while :; do
 done
 ```
 
-It is the [sample from the automations guide](https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md#sample-pr-babysit-dispatcher), adapted: the child merges the base itself, a failure notifies you once per PR head, and fork PRs are skipped.
+Adapted from the [automations guide's sample](https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md#sample-pr-babysit-dispatcher).
 
 ## Try it
 
 ```bash
-devsandbox run pr-dispatcher                     # starts the loop (idle until gh works)
-devsandbox exec -it pr-dispatcher gh auth login  # once, before the first child
-devsandbox                                       # the dashboard, to watch it work
+devsandbox run pr-dispatcher                  # starts the loop (idle until gh works)
+devsandbox exec pr-dispatcher gh auth login   # once, before the first child
+devsandbox                                    # the dashboard, to watch it work
 ```
 
-Every five minutes the loop checks the PRs; a child `web-pr-<number>` appears in the Instances tab for each one that needs work. Failures land in the Inbox tab (`4`) and on your desktop. Follow along:
+Every five minutes the loop checks the PRs; a child `web-pr-<number>` appears for each one that needs work, and failures land in the Inbox tab (`4`) and on your desktop. Follow along:
 
 ```bash
 devsandbox exec pr-dispatcher tail -f babysit.log
-devsandbox exec pr-dispatcher devsbd ls           # the children
-devsandbox exec -it web-pr-123 bash               # look at a child
+devsandbox exec pr-dispatcher devsbd ls        # the children
+devsandbox exec web-pr-123 bash                # look at a child
 ```
 
 ## How it works
 
-- [`dispatcher`](/docs/config#devsandbox-extras) lets the dispatcher create, stop and remove children of the sandboxes in `spawn`; `devsbd ensure` / `exec` / `rm` are those requests.
-- Control commands are served by the [host daemon](/docs/host-daemon), which `run` started and the running dispatcher keeps up, dashboard open or not. Exit `75` means no daemon is reachable (after a reboot, until your first `devsandbox` command; `devsandbox serve install` avoids that), which `ctl` retries; notifications wait for it.
+- [`dispatcher`](/docs/config#devsandbox-extras) lets the dispatcher create, stop and remove children of the sandboxes in `spawn`, through `devsbd ensure` / `exec` / `rm`.
+- The [host daemon](/docs/going-further#the-host-daemon) serves those requests; exit `75` means it isn't reachable yet (after a reboot, until `devsandbox serve install` or your first command), and `ctl` retries.
 - `autostart = "runtime"` restarts the dispatcher, and so the loop, after a reboot.
-- Each child runs <Agent /> unattended with your `gh` login and pushes to your PR branches: keep `spawn` to what it needs and review what it pushes.
-
-### Known limitations
-
-- Same-repo PRs only: a fork's branch isn't on `origin`.
-- Children outlive the dispatcher; remove orphans with `devsandbox rm web-pr-123`.
-- `ensure` and `rm` run git on the host, which refuses a repo whose `.git/config` sets command-running keys (`core.sshCommand`, `credential.*`, …).
+- Children run <Agent /> unattended and push to your PR branches with your `gh` login: keep `spawn` narrow and review what they push. They outlive the dispatcher (`devsandbox rm web-pr-123`).
 
 ## Agent instructions
 
@@ -326,10 +246,10 @@ devsandbox exec -it web-pr-123 bash               # look at a child
     'Read docs/automations-guide.md in the devsandboxes repo (https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md); use only the devsbd commands and flags it documents.',
     'In devsandboxes.toml, add a sandbox for the repo (`folder` = <repo path>) with the github-cli Feature, a shared `${sharedVolumes}/gh` mount, `gh auth setup-git` and a git identity of <your name> / <your email> in `postCreateCommand`. Install <agent> there too and mount its host config dir (its login) into the container.',
     'Add a `[sandbox.pr-dispatcher]` with its own `folder` (a new git repo next to the config dir), `autostart = "runtime"`, `dispatcher = { spawn = ["<sandbox name>"] }` (never `"*"`) and `postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"`.',
-    'Write babysit-loop.sh in that folder from https://devsandboxes.com/examples/babysit-pr (the <agent> variant), with `REPO=<owner/repo>` and the sandbox name in `devsbd ensure`; `chmod +x` it, gitignore `babysit.log` and `.babysit/`, check it with `sh -n`.',
+    'Write babysit-loop.sh and fix.sh (the <agent> variant) in that folder from https://devsandboxes.com/examples/babysit-pr, with `REPO=<owner/repo>` and the sandbox name in `devsbd ensure`; `chmod +x` the loop, gitignore `babysit.log` and `.babysit/`, check both with `sh -n`.',
   ]}
   verify={[
-    'Ask me before starting anything. Then `devsandbox -C <config dir> run pr-dispatcher` and tell me to run `devsandbox -C <config dir> exec -it pr-dispatcher gh auth login` myself.',
+    'Ask me before starting anything. Then `devsandbox -C <config dir> run pr-dispatcher` and tell me to run `devsandbox -C <config dir> exec pr-dispatcher gh auth login` myself.',
     'Then check `devsandbox -C <config dir> exec pr-dispatcher tail babysit.log` and `devsandbox -C <config dir> exec pr-dispatcher devsbd ls` after the first round. Never push, merge or remove children yourself.',
   ]}
 />
