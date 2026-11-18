@@ -17,7 +17,11 @@ Start with `docs/README.md` (reading order and map) and
 - `src/exe.rs` — `devsandbox()`, the binary to spawn (re-resolved per spawn,
   survives an upgrade), and `own_build_stamp()`, this process's own mtime.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
-  `rm`, `ps`, `ls`, `exec`, `done`, `fetch`, `inbox`, `logs`, `inspect`, `stats`, `port`, `machine`, `services::{gc,ls,rebuild}`). Shared name
+  `rm`, `ps`, `ls`, `exec`, `done`, `rename`, `profile`, `vscode`, `fetch`,
+  `inbox`, `logs`, `inspect`, `stats`, `status`, `port`, `machine`,
+  `fleet_link` (hidden `fleet-link`), `services::{gc,ls,rebuild}`); not
+  verbs: `subnet.rs` (service-network subnet checks) and `tunnel.rs`
+  (remote bridges' `TUNNEL` opener). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: exact instance name/id
   first, then sandbox | folder basename). `exec.rs` also owns
   `SHELL_FALLBACK_CMD`, the login shell a command-less `exec` and the TUI
