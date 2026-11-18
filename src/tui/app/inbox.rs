@@ -811,7 +811,7 @@ impl App {
             self.inbox.focus = InboxFocus::List;
             return;
         };
-        if !ctrl && self.on_inbox_thread_key(key.code) {
+        if self.on_inbox_thread_key(key.code) {
             return;
         }
         let link = t.link.clone().or_else(|| t.head().and_then(|r| r.link.clone()));
@@ -833,7 +833,7 @@ impl App {
                     self.open_reply(&t);
                 }
             }
-            KeyCode::Char('m') if !ctrl => {
+            KeyCode::Char('m') => {
                 // Raw rows aren't the rendered ones a selection points into.
                 self.clear_selection();
                 self.inbox.raw = !self.inbox.raw;
@@ -2040,6 +2040,26 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("this thread takes no replies"));
         assert_eq!(app.inbox.focus, InboxFocus::List, "focus stays");
         assert_eq!(app.take_pending_inbox(), []);
+    }
+
+    #[test]
+    fn modified_thread_keys_do_nothing() {
+        let mut app = new_app();
+        let id = open_asks(&mut app, None);
+        app.take_pending_inbox();
+        for c in ['d', 'u', '1', 'm', 'q'] {
+            app.on_key(key_mods(KeyCode::Char(c), KeyModifiers::ALT));
+            app.on_key(key_mods(KeyCode::Char(c), KeyModifiers::CONTROL));
+        }
+        assert_eq!(app.take_pending_inbox(), []);
+        assert!(!app.inbox.raw && !app.should_quit);
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key_mods(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.on_key(key_mods(KeyCode::Char('D'), KeyModifiers::ALT | KeyModifiers::SHIFT));
+        assert_eq!(app.take_pending_inbox(), []);
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkDone(id)]);
     }
 
     #[test]

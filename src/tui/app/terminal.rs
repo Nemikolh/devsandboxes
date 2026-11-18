@@ -218,7 +218,7 @@ impl App {
         // above still work). `x` closes it in place, mirroring the dashboard
         // binding; fall back to the dashboard once no sessions remain.
         if session.exited() {
-            if key.code == KeyCode::Char('x') {
+            if key.code == KeyCode::Char('x') && key.modifiers.is_empty() {
                 self.terms.close_active();
                 if self.terms.is_empty() {
                     self.focus = Focus::Dashboard;

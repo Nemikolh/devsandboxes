@@ -169,6 +169,13 @@ fills the modal if it is still the one open:
 `pending_open`, `pending_identity`), and the
 event loop takes each once per pass and hands it to a thread.
 
+A letter or symbol key fires bare or with shift only: `App::stray_chord`
+drops it with ctrl, alt or super ahead of the modals, the Inbox thread
+and form zones and the tables, so ctrl-d (a shell habit, or the EOF a
+closing pty sends) is not `d`. The chords that stay are ctrl-c (quit)
+and ctrl-] (the terminal); the prompt, the Inbox input, a form's text
+edit and a focused terminal take modified keys as their own.
+
 - `s`: stop a running instance, start an exited one; an exited drifted
   one, a missing container or a failed phase gets a `rebuild` instead
   (worktree kept). `stopping`/`starting` sets drop repeat presses until

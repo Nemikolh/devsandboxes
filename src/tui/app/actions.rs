@@ -427,6 +427,64 @@ mod tests {
     }
 
     #[test]
+    fn modified_d_on_an_instance_queues_nothing() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Down));
+        app.take_pending_identity();
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        for (c, mods) in [('d', KeyModifiers::CONTROL), ('d', KeyModifiers::ALT), ('D', ctrl_shift), ('d', KeyModifiers::SUPER)] {
+            app.on_key(key_mods(KeyCode::Char(c), mods));
+            assert_eq!(app.take_pending_action(), None, "{mods:?}-{c}");
+            assert!(matches!(app.modal, Modal::None));
+        }
+        for c in ['s', 'r', 'o', 'P', 'U'] {
+            app.on_key(key_mods(KeyCode::Char(c), KeyModifiers::CONTROL));
+        }
+        assert_eq!(app.take_pending_action(), None);
+        assert!(app.prompt.is_none());
+        assert!(app.take_pending_identity().is_none());
+        assert!(!app.should_quit);
+        app.on_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.take_pending_action(), Some(PromptAction::Rm { .. })));
+    }
+
+    #[test]
+    fn chords_fire_only_the_ctrl_bindings() {
+        let mut app = new_app();
+        app.tab = Tab::Ports;
+        app.set_ports(port_rows(2));
+        app.on_key(key_mods(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.on_key(key_mods(KeyCode::Char('q'), KeyModifiers::ALT));
+        app.on_key(key_mods(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.take_pending_unport(), None);
+        assert_eq!(app.tab, Tab::Ports);
+        assert!(!app.should_quit);
+        // Shift alone is bare: `?` and uppercase letters arrive with it.
+        app.on_key(key_mods(KeyCode::Char('?'), KeyModifiers::SHIFT));
+        assert!(matches!(app.modal, Modal::Help(_)));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key_mods(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert_eq!(app.status.as_deref(), Some("no terminal open — press t"));
+        app.on_key(key_mods(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn modified_y_does_not_answer_a_confirm() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Missing, in_flight("building")));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key_mods(KeyCode::Char('y'), KeyModifiers::ALT));
+        app.on_key(key_mods(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::Confirm(_)));
+        assert!(!app.should_quit);
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.take_pending_cancel(), Some("inst0".into()));
+    }
+
+    #[test]
     fn d_and_u_off_an_instance_queue_nothing() {
         let mut app = app_on_proc_row(&["10"]);
         app.on_key(key(KeyCode::Char('d')));

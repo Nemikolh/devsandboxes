@@ -13,6 +13,10 @@ pub(super) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+pub(super) fn key_mods(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, modifiers)
+}
+
 /// `n` synthetic forward rows with ids `0..n`.
 pub(super) fn port_rows(n: usize) -> Vec<PortRow> {
     (0..n)

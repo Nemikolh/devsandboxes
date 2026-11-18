@@ -537,6 +537,11 @@ impl App {
             self.on_key_prompt(key);
             return;
         }
+        // Ctrl-D out of shell habit, or the EOF a closing pty sends, must not
+        // count as `d` (rm), nor alt-y as a confirm.
+        if self.stray_chord(&key) {
+            return;
+        }
         // The modal swallows every key while it is up; the tab bar and tables
         // must not react underneath it.
         if !matches!(self.modal, Modal::None) {
@@ -582,7 +587,7 @@ impl App {
             KeyCode::F(12) => self.enter_terminal(),
             // Inbox list: `o`/`t`/`l`/`p`/`d`/`u` act on the selected thread,
             // ahead of the instance keys they share letters with.
-            KeyCode::Char('o' | 't' | 'l' | 'p' | 'd' | 'u') if self.tab == Tab::Inbox && !ctrl => {
+            KeyCode::Char('o' | 't' | 'l' | 'p' | 'd' | 'u') if self.tab == Tab::Inbox => {
                 self.on_inbox_thread_key(key.code);
             }
             // Process-row signals; `t` doubles as SIGTERM there, otherwise it
@@ -638,6 +643,36 @@ impl App {
             KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
+    }
+
+    /// Whether `key` is a character with modifiers beyond shift (uppercase
+    /// may arrive with it) bound for a zone of one-key bindings that doesn't
+    /// bind it: those zones' letters and symbols fire bare, their only chords
+    /// being ctrl-c (quit) and ctrl-] (the terminal). A modal binds none.
+    fn stray_chord(&self, key: &KeyEvent) -> bool {
+        let KeyCode::Char(c) = key.code else { return false };
+        let mods = key.modifiers.difference(KeyModifiers::SHIFT);
+        if mods.is_empty() || self.takes_raw_keys() {
+            return false;
+        }
+        !matches!(self.modal, Modal::None) || !(mods == KeyModifiers::CONTROL && matches!(c, 'c' | ']'))
+    }
+
+    /// Whether keys go to the PTY or a text input (past the prompt), which
+    /// own their modified keys.
+    fn takes_raw_keys(&self) -> bool {
+        if !matches!(self.modal, Modal::None) {
+            return false;
+        }
+        if self.focus == Focus::Terminal {
+            return true;
+        }
+        self.tab == Tab::Inbox
+            && match self.inbox.focus {
+                InboxFocus::Input => true,
+                InboxFocus::Form => self.inbox.form.as_ref().is_some_and(|e| e.editing.is_some()),
+                _ => false,
+            }
     }
 
     /// Apply a mouse event over the full frame `area`. The config modal (when
