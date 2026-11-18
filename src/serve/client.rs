@@ -466,7 +466,7 @@ fn reply_line(r: &mut impl Read) -> Option<Vec<u8>> {
 /// Start `devsandbox serve --socket-dir <dir>` detached: its own session
 /// (`setsid`, so the terminal's hangup and Ctrl-C don't reach it), cwd `/`
 /// (pins no directory), stdin from /dev/null, stdout+stderr appended to
-/// `serve.log`.
+/// `serve.log`, and no other fd ([`cloexec_above_stdio`]).
 pub(super) fn spawn_detached(dir: &Path) -> Result<()> {
     let exe = crate::exe::devsandbox().context("cannot locate the devsandbox binary")?;
     let log_path = endpoint::log_path()?;
@@ -486,9 +486,21 @@ pub(super) fn spawn_detached(dir: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("cannot clone the log handle")?)
         .stderr(log);
-    // SAFETY: setsid is async-signal-safe; nothing else runs between fork and exec.
+    // sysconf isn't async-signal-safe: read before the fork.
+    let max_fd = match unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } {
+        n if n > 0 => n.min(1 << 20) as libc::c_int,
+        _ => 1024,
+    };
+    // SAFETY: setsid, close_range and fcntl are async-signal-safe and
+    // allocate nothing; nothing else runs between fork and exec.
     unsafe {
-        cmd.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+        cmd.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            cloexec_above_stdio(max_fd);
+            Ok(())
+        });
     }
     let mut child = cmd.spawn().context("cannot start devsandbox serve")?;
     // Reap it if it exits while this process lives on (a TUI), so it
@@ -497,6 +509,25 @@ pub(super) fn spawn_detached(dir: &Path) -> Result<()> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// Mark every fd above stdio close-on-exec, in the forked child. The daemon
+/// outlives the CLI that starts it, and an fd that CLI inherited without
+/// CLOEXEC (a shell's `exec 7>&1`, a harness's extra pipe) would otherwise
+/// hold its caller's pipe open: the pipeline never ends. CLOEXEC rather than
+/// close, as std's exec-error pipe must stay open up to the exec. The loop up
+/// to `max_fd` is for kernels or seccomp profiles without `close_range`, and
+/// macOS.
+fn cloexec_above_stdio(max_fd: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: a raw syscall over plain integers.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) } == 0 {
+        return;
+    }
+    for fd in 3..max_fd {
+        // SAFETY: fcntl on a closed fd fails with EBADF, ignored.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
 }
 
 /// Append one line to `serve.log`, formatted like the daemon's own. For the
@@ -545,6 +576,30 @@ mod tests {
 
     fn join_all(daemons: Daemons) -> Vec<Exit> {
         daemons.into_inner().unwrap().into_iter().map(|d| d.join().unwrap().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_detached_child_inherits_no_fd_above_stdio() {
+        // `dup` leaves the copy without CLOEXEC, as a shell's `exec 7>&1` does.
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&file)) };
+        assert!(fd > 2);
+        let probe = |cloexec: bool| {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(format!("[ -e /dev/fd/{fd} ]"));
+            if cloexec {
+                unsafe {
+                    cmd.pre_exec(|| {
+                        cloexec_above_stdio(1024);
+                        Ok(())
+                    });
+                }
+            }
+            cmd.status().unwrap().success()
+        };
+        assert!(probe(false), "the plain child sees fd {fd}");
+        assert!(!probe(true), "fd {fd} leaked");
+        unsafe { libc::close(fd) };
     }
 
     /// Its bytes, one `EINTR` before each.

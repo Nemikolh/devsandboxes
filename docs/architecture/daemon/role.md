@@ -72,7 +72,9 @@ exit, autostart notes.
 but it's plumbing: `client::connect` sends a `hello`, and when nothing
 answers it starts one and polls the socket up to `START_TIMEOUT` (5 s).
 Without a unit, `spawn_detached`: `setsid`, cwd `/`, stdin `/dev/null`,
-output appended to `serve.log`. With a unit installed it goes through the
+output appended to `serve.log`, every other fd close-on-exec
+(`cloexec_above_stdio`: one the CLI inherited without CLOEXEC would keep
+its caller's pipe open for the daemon's life). With a unit installed it goes through the
 service manager (*Boot start*).
 
 The daemon holds an exclusive lock on `serve.lock` for its life
