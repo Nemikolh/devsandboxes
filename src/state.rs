@@ -102,6 +102,11 @@ pub struct Instance {
     /// the next install so emulated images skip the host-arch attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devsbd_arch: Option<crate::devsbd::Arch>,
+    /// Why the last helper install failed (`devsbd::install`'s note), set
+    /// with `devsbd_arch = None` and cleared once it works: the note
+    /// otherwise only reaches that one command's stderr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devsbd_error: Option<String>,
     /// Per-instance named volumes (sources using `${instance}` /
     /// `${devcontainerId}`, e.g. docker-in-docker's `/var/lib/docker`),
     /// recorded so `rm` deletes exactly these even if the config changed since.
@@ -548,6 +553,7 @@ mod tests {
                 tool_env: Default::default(),
                 ssh_auth_sock: None,
                 devsbd_arch: None,
+                devsbd_error: None,
                 volumes: Vec::new(),
                 dispatcher: Some("pr-dispatcher".into()),
                 profile: Some("work".into()),

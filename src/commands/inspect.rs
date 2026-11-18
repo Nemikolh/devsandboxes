@@ -9,8 +9,8 @@ use crate::state::{Instance, State};
 /// container, with the same light key highlighting as the TUI inspect pane
 /// (color only on a TTY; see `render::paint`). For an instance, its browser
 /// sandbox line goes first, on stderr, from the record ([`browser_line`]),
-/// then its profile's when it has one ([`profile_line`]), then, when it has
-/// the helper, the exec cgroup warning if its execs land outside its cgroup
+/// then its profile's when it has one ([`profile_line`]), then why it has no
+/// helper ([`helper_line`]) or, when it has one, the exec cgroup warning if its execs land outside its cgroup
 /// (`run::cgroup`, checked live: no answer from a stopped container).
 pub fn inspect(name: &str, json: bool) -> Result<()> {
     let state = State::load()?;
@@ -22,8 +22,9 @@ pub fn inspect(name: &str, json: bool) -> Result<()> {
             let allowed = crate::snapshot::allowed_now(&mut Default::default(), info);
             eprintln!("{}", profile_line(info, allowed.as_deref()));
         }
-        if info.devsbd_arch.is_some() {
-            crate::commands::run::cgroup::warn_if_outside(&container);
+        match helper_line(info) {
+            Some(line) => eprintln!("{line}"),
+            None => crate::commands::run::cgroup::warn_if_outside(&container),
         }
     }
     println!("{}", render(&raw, json));
@@ -59,6 +60,16 @@ fn profile_line(info: &Instance, allowed: Option<&[String]>) -> String {
         true => format!("profile: {profile} (no longer allowed by the config)"),
         false => format!("profile: {profile}"),
     }
+}
+
+/// `helper: unavailable: <why>` for an instance recorded without the helper
+/// (no notifications, opener or agent relay), `None` with one.
+fn helper_line(info: &Instance) -> Option<String> {
+    if info.devsbd_arch.is_some() {
+        return None;
+    }
+    let why = info.devsbd_error.as_deref().unwrap_or("no reason recorded");
+    Some(format!("helper: unavailable: {why} (`devsandbox stop` + `start` retries the install)"))
 }
 
 /// Pretty-print raw `inspect` output. On JSON parse failure the raw output is
@@ -109,6 +120,21 @@ mod tests {
         assert_eq!(profile_line(info, Some(&["work".into()])), "profile: work");
         assert_eq!(profile_line(info, None), "profile: work", "unknown: not flagged");
         assert_eq!(profile_line(info, Some(&["personal".into()])), "profile: work (no longer allowed by the config)");
+    }
+
+    #[test]
+    fn helper_line_says_why_there_is_no_helper() {
+        let state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let mut info = state.instances["a"].clone();
+        let retry = " (`devsandbox stop` + `start` retries the install)";
+        assert_eq!(helper_line(&info), Some(format!("helper: unavailable: no reason recorded{retry}")));
+        info.devsbd_error = Some("devsbd couldn't run in `c`".into());
+        assert_eq!(helper_line(&info), Some(format!("helper: unavailable: devsbd couldn't run in `c`{retry}")));
+        info.devsbd_arch = Some(crate::devsbd::Arch::X86_64);
+        assert_eq!(helper_line(&info), None);
     }
 
     #[test]

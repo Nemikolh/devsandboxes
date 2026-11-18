@@ -1685,6 +1685,7 @@ folder = "."
             tool_env: Default::default(),
             ssh_auth_sock: None,
             devsbd_arch: None,
+            devsbd_error: None,
             volumes: Vec::new(),
             dispatcher: owner.map(str::to_string),
             profile: None,

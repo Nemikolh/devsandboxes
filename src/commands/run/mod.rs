@@ -257,6 +257,7 @@ pub fn run(
         tool_env: Default::default(),
         ssh_auth_sock: None,
         devsbd_arch: None,
+        devsbd_error: None,
         volumes: Vec::new(),
         dispatcher: extras.dispatcher.clone(),
         profile: profile.clone(),
@@ -842,15 +843,15 @@ pub(crate) fn materialize(
     // Before lifecycle commands, so they could already rely on the helper. In
     // relay-first mode a failure means no ssh-agent forwarding at all (no mount
     // fallback), so word the note that way; otherwise the plain install note.
-    let devsbd_arch = match crate::devsbd::ensure_or_reason(&container, None) {
-        Ok(arch) => Some(arch),
+    let (devsbd_arch, devsbd_error) = match crate::devsbd::ensure_or_reason(&container, None) {
+        Ok(arch) => (Some(arch), None),
         Err(reason) => {
             if relay_first {
                 eprintln!("note: ssh-agent forwarding off in `{container}`: {reason}");
             } else {
                 eprintln!("note: {reason}");
             }
-            None
+            (None, Some(reason))
         }
     };
     // Fit the adopted account to the plan, before anything runs as it. No
@@ -926,6 +927,7 @@ pub(crate) fn materialize(
         tool_env,
         ssh_auth_sock,
         devsbd_arch,
+        devsbd_error,
         volumes,
         dispatcher,
         profile,
@@ -1354,6 +1356,7 @@ mod tests {
             tool_env: Default::default(),
             ssh_auth_sock: None,
             devsbd_arch: None,
+            devsbd_error: None,
             volumes: Vec::new(),
             dispatcher: None,
             profile: None,

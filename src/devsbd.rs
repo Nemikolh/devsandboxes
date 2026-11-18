@@ -297,18 +297,21 @@ pub fn install(container: &str, recorded: Option<Arch>) -> Result<Arch, String> 
             return Ok(arch);
         }
     }
+    // The last attempt's failure: the note is recorded on the instance
+    // (`devsbd_error`), and "couldn't run" alone doesn't say what to fix.
+    let mut why = String::new();
     for arch in order {
         let (Some(want), Some(bytes)) = (hash(arch), blob(arch)) else {
             continue;
         };
         let args = root_script_argv(true, container, INSTALL_SCRIPT);
-        if backend().run_with_stdin(&as_strs(&args), &bytes).is_ok()
-            && installed_hash(container).as_deref() == Some(want)
-        {
-            return Ok(arch);
+        match backend().run_with_stdin(&as_strs(&args), &bytes) {
+            Err(e) => why = format!(": installing it failed: {e:#}"),
+            Ok(()) if installed_hash(container).as_deref() == Some(want) => return Ok(arch),
+            Ok(()) => why = ": installed, but `devsbd version` didn't report this build".into(),
         }
     }
-    Err(format!("devsbd couldn't run in `{container}`"))
+    Err(format!("devsbd couldn't run in `{container}`{why}"))
 }
 
 /// Start `devsbd daemon` detached. Idempotent: a second daemon sees the
@@ -342,19 +345,28 @@ pub fn ensure(container: &str, recorded: Option<Arch>, quiet: bool) -> Option<Ar
     }
 }
 
-/// `ensure` for an existing instance, persisting `devsbd_arch` under `key`
-/// when it changed (a [`State::update`], so writes made since the caller
+/// `ensure` for an existing instance, persisting `devsbd_arch` and
+/// `devsbd_error` under `key` when they changed (a [`State::update`], so writes made since the caller
 /// loaded its `info` survive). Returns the resulting arch so callers can act
 /// on the fresh value rather than the pre-ensure `info` (e.g. `start`'s relay
 /// decision, whose `info` snapshot may carry a stale `devsbd_arch`).
 pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> {
-    let arch = ensure(&info.container, info.devsbd_arch, quiet);
-    if arch == info.devsbd_arch {
+    let (arch, error) = match ensure_or_reason(&info.container, info.devsbd_arch) {
+        Ok(arch) => (Some(arch), None),
+        Err(note) => {
+            if !quiet {
+                eprintln!("note: {note}");
+            }
+            (None, Some(note))
+        }
+    };
+    if arch == info.devsbd_arch && error == info.devsbd_error {
         return arch;
     }
     let saved = State::update(|state| {
         if let Some(entry) = state.instances.get_mut(key) {
             entry.devsbd_arch = arch;
+            entry.devsbd_error = error.clone();
         }
         Ok(())
     });

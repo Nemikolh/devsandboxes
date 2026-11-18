@@ -1235,6 +1235,7 @@ ports = ["5432:5432"]
             tool_env: Default::default(),
             ssh_auth_sock: None,
             devsbd_arch: None,
+            devsbd_error: None,
             volumes: Vec::new(),
             dispatcher: None,
             profile: None,

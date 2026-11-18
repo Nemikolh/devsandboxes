@@ -86,8 +86,13 @@ are best-effort.
 - `ensure_or_reason` = `install` + `start_daemon` (`exec -d -u root … devsbd
   daemon`, idempotent via the daemon's pidfile lock, failures silent).
   `ensure` prints the reason as a note; `ensure_recorded` also persists a
-  changed `devsbd_arch` in `state.toml`. The helper is optional: no failure
-  here fails a command.
+  changed `devsbd_arch` in `state.toml`, with the reason as
+  `Instance::devsbd_error` (`run` records both too; cleared once an install
+  works). The reason names the last attempt's failure: the install
+  script's error, or a `version` that didn't report the build. `inspect`
+  prints `helper: unavailable: <why>` on stderr for an instance without the
+  helper (`helper_line`). The helper is optional: no failure here fails a
+  command.
 
 ## When it is (re)installed
 
