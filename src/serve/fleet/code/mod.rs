@@ -513,7 +513,7 @@ pub fn ties(root: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Vec<Stri
         workspace_folder: &folder_s,
         workspace_folder_basename: &basename,
         shared_volumes: &shared_s,
-        instance: "instance",
+        instance: "<instance>",
         container_env: None,
     };
     for mount in props.mounts.iter().flatten() {
@@ -549,7 +549,8 @@ pub fn ties(root: &Path, config: &Config, sandbox: &ResolvedSandbox) -> Vec<Stri
             }
         }
     }
-    out.dedup();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|t| seen.insert(t.clone()));
     out
 }
 
@@ -1354,6 +1355,16 @@ mod tests {
                 "`${localEnv:HOME}` (this host's env)".into(),
                 format!("bind mount of `{out}` (outside the config root)"),
             ]
+        );
+        // A source repeated apart from its first use is listed once; an
+        // instance-named path reads as the variable, not a literal `instance`.
+        assert_eq!(
+            ties_of_toml(&format!("mounts = [\"source={out},target=/a\", \"source=/var/run/docker.sock,target=/s\", \"source={out},target=/b\"]")),
+            [format!("bind mount of `{out}` (outside the config root)"), "runtime socket mount `/var/run/docker.sock`".into()]
+        );
+        assert_eq!(
+            ties_of_toml(&format!("mounts = [\"source={out}/${{instance}},target=/i\"]")),
+            [format!("bind mount of `{out}/<instance>` (outside the config root)")]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
