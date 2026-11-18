@@ -306,9 +306,10 @@ is frozen: no new work on it.
 - GPUs on podman: CDI specs are looked for in `/etc/cdi` and
   `/var/run/cdi` only; containers.conf's `cdi_spec_dirs` isn't read.
   `runtime::gpu::PODMAN_CDI_DIRS`
-- GPUs have never been run end to end on a GPU host (no GPU CI): only
-  the detection over fixtures and the flags are tested.
-  `run::gpu::gpu_decision`
+- GPUs are checked end to end only by hand, on docker through CDI (a
+  required GPU given, refused and an optional one warned without the
+  spec); docker's `--gpus` path, podman and placement on a GPU worker
+  have never run on a GPU host (no GPU CI). `run::gpu::gpu_decision`
 - GPU count in the capacity report: unknown (`gpu.count` `null`) on any
   engine that isn't native Linux (a VM's or a remote engine's devices
   aren't seen here). `capacity::HostFacts::read`
