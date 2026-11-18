@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 A config can now belong to the whole fleet and keep running on an always-on server while the host it was written on is off. Links a sandbox opens land in your desktop browser, picked per profile. Sandboxes and services get NVIDIA GPUs from `hostRequirements.gpu`, and placement sends them to a machine that lends one. Members run the build the fleet's authority pins.
 
