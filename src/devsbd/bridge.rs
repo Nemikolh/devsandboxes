@@ -1154,6 +1154,22 @@ pub struct Bridges {
     logged: Arc<Dedupe>,
     // The last `State::load` error logged, until a load succeeds.
     state_error: Option<String>,
+    // Running containers recorded without the helper whose install was
+    // retried since they appeared (`heal_now`).
+    healing: std::collections::HashSet<String>,
+}
+
+/// Whether `reconcile` retries the helper install for a running instance
+/// recorded without one: once per appearance in the running list (`tried`
+/// forgets a container when it stops), and not while `run` still has it
+/// `in_flight` (it installs the helper and records the instance itself).
+fn heal_now(tried: &mut std::collections::HashSet<String>, info: &Instance, in_flight: bool) -> bool {
+    info.devsbd_arch.is_none() && !in_flight && tried.insert(info.container.clone())
+}
+
+fn in_flight(info: &Instance) -> bool {
+    let view = info.progress.as_ref().map(crate::state::Progress::current_view);
+    matches!(view, Some(crate::state::PhaseView::InFlight(_)))
 }
 
 impl Bridges {
@@ -1168,9 +1184,13 @@ impl Bridges {
     /// protocol `VERSION` still bridges fine, it just lacks verbs. Spawns are
     /// rare (first sight, or a dead bridge's retry gap), so this is one extra
     /// `exec` per spawn, not per snapshot. `urgent` containers skip a dead
-    /// bridge's retry gap (`retry_decision`).
+    /// bridge's retry gap (`retry_decision`). An instance recorded without
+    /// the helper gets its install retried once per appearance (`heal_now`):
+    /// one failed install would otherwise cut it off for good, since only
+    /// helper instances are re-checked here.
     pub fn reconcile(&mut self, running: &[&str], urgent: &[String]) {
         self.live.retain(|c, _| running.contains(&c.as_str()));
+        self.healing.retain(|c| running.contains(&c.as_str()));
         let host_agent = has_host_agent();
         // No host agent and no sink → nothing to relay; skip the per-instance `exec`.
         if !host_agent && self.sink.is_none() {
@@ -1197,6 +1217,24 @@ impl Bridges {
             if !running.contains(&info.container.as_str()) {
                 continue;
             }
+            let installed;
+            let just_healed = self.sink.is_some() && heal_now(&mut self.healing, info, in_flight(info));
+            let info = match just_healed.then(|| crate::devsbd::ensure_recorded_or_reason(key, info, true)) {
+                Some(Ok(arch)) => {
+                    if let Some(log) = self.log {
+                        log(&format!("helper {}: installed (its record had none)", info.container));
+                    }
+                    installed = Instance { devsbd_arch: Some(arch), devsbd_error: None, ..info.clone() };
+                    &installed
+                }
+                Some(Err(why)) => {
+                    if let Some(log) = self.log {
+                        log(&format!("helper {}: unavailable: {why}", info.container));
+                    }
+                    info
+                }
+                None => info,
+            };
             let helper = info.devsbd_arch.is_some();
             let Some(with_agent) = wanted(helper, relay_mode(info), host_agent, self.sink.is_some()) else {
                 continue;
@@ -1210,7 +1248,8 @@ impl Bridges {
             if retry_decision(entry, urgent.contains(&info.container)) != Retry::Keep {
                 self.live.remove(&info.container);
                 let healed;
-                let info = match helper.then(|| crate::devsbd::ensure_recorded(key, info, true)).flatten() {
+                let recheck = helper && !just_healed;
+                let info = match recheck.then(|| crate::devsbd::ensure_recorded(key, info, true)).flatten() {
                     Some(arch) if Some(arch) != info.devsbd_arch => {
                         healed = Instance { devsbd_arch: Some(arch), ..info.clone() };
                         &healed
@@ -2045,6 +2084,24 @@ mod tests {
         assert_eq!(line(&failed("timed out")).as_deref(), Some("bridge c: timed out"), "a new failure");
         logged.retain(&[]);
         assert_eq!(line(&BridgeStatus::Ready), None, "a gone container's failure is forgotten");
+    }
+
+    #[test]
+    fn a_missing_helper_is_retried_once_per_appearance() {
+        let state: crate::state::State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let mut info = state.instances["a"].clone();
+        let mut tried = std::collections::HashSet::new();
+        assert!(heal_now(&mut tried, &info, false));
+        assert!(!heal_now(&mut tried, &info, false), "not again while it stays up");
+        tried.clear(); // what `reconcile` does once `c` leaves the running list
+        assert!(!heal_now(&mut tried, &info, true), "`run` has it in flight");
+        info.devsbd_arch = Some(crate::devsbd::Arch::X86_64);
+        assert!(!heal_now(&mut tried, &info, false), "recorded with the helper");
+        info.devsbd_arch = None;
+        assert!(heal_now(&mut tried, &info, false), "back after a stop, and once `run` is done");
     }
 
     /// `apply_message` refuses an `open` record outright (the sink never

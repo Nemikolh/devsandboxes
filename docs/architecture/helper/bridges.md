@@ -46,6 +46,14 @@ whose instance `wanted` one, and drops the rest (dropping a `Bridge` kills its
   matches (host agent appeared or vanished) is replaced at once.
 - Before every (re)spawn it runs `devsbd::ensure_recorded`, so a CLI upgrade
   reaches running containers ([overview.md](overview.md)).
+- An instance recorded without the helper (`devsbd_arch` none) gets
+  `devsbd::ensure_recorded_or_reason` once each time its container appears
+  in the running list, unless `run` has it in flight (`heal_now`): an
+  install that failed once (a `start` racing the container, a slow exec)
+  would otherwise leave it with no notify bridge for good. Success makes it
+  a helper instance in the same pass (`helper <container>: installed (its
+  record had none)` in `serve.log`); failure is `helper <container>:
+  unavailable: <why>`, with the reason recorded on the instance.
 - Retry (`retry_decision`): a dead bridge is respawned after `RETRY` (10 s), or
   `MISMATCH_RETRY` (300 s) after a protocol mismatch; an `urgent` container
   is respawned at once.

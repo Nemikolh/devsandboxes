@@ -156,7 +156,9 @@ pub const OPENER: &str = "/run/devsandbox/bin/xdg-open";
 pub const BIN_DIR: &str = "/run/devsandbox/bin";
 
 /// Write stdin to a temp file and rename, so a concurrent `devsbd version`
-/// never sees a half-written binary. The notify outbox (`notify::OUTBOX`), the
+/// never sees a half-written binary; the temp name is per shell (`$$`), so
+/// two installs at once (the daemon's and `start`'s) can't interleave their
+/// writes into one file. The notify outbox (`notify::OUTBOX`), the
 /// runs dir (`devsbd/src/runs.rs`) and the sessions dir
 /// (`devsbd/src/sessions.rs`) are made world-writable + sticky because
 /// `devsbd notify` / `devsbd run start` / `devsbd session new` run as the
@@ -172,9 +174,9 @@ pub const BIN_DIR: &str = "/run/devsandbox/bin";
 /// `/usr/local/bin` links are best-effort (read-only or missing dirs), each
 /// wrapped in `{ …; }` so it can't turn a good install into a failure.
 const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
-    && cat > /run/devsandbox/bin/devsbd.tmp \
-    && chmod 755 /run/devsandbox/bin/devsbd.tmp \
-    && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd \
+    && cat > /run/devsandbox/bin/devsbd.tmp.$$ \
+    && chmod 755 /run/devsandbox/bin/devsbd.tmp.$$ \
+    && mv /run/devsandbox/bin/devsbd.tmp.$$ /run/devsandbox/bin/devsbd \
     && for n in chrome chromium chromium-browser google-chrome google-chrome-stable; do ln -sf devsbd /run/devsandbox/bin/$n || exit; done \
     && for n in xdg-open sensible-browser x-www-browser www-browser; do ln -sf devsbd /run/devsandbox/bin/$n || exit; done \
     && { { mkdir -p /var/lib/devsandbox/outbox && chmod 1777 /var/lib/devsandbox/outbox; } 2>/dev/null || true; } \
@@ -351,17 +353,23 @@ pub fn ensure(container: &str, recorded: Option<Arch>, quiet: bool) -> Option<Ar
 /// on the fresh value rather than the pre-ensure `info` (e.g. `start`'s relay
 /// decision, whose `info` snapshot may carry a stale `devsbd_arch`).
 pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> {
-    let (arch, error) = match ensure_or_reason(&info.container, info.devsbd_arch) {
-        Ok(arch) => (Some(arch), None),
-        Err(note) => {
-            if !quiet {
-                eprintln!("note: {note}");
-            }
-            (None, Some(note))
-        }
+    let result = ensure_recorded_or_reason(key, info, quiet);
+    if let (Err(note), false) = (&result, quiet) {
+        eprintln!("note: {note}");
+    }
+    result.ok()
+}
+
+/// [`ensure_recorded`] with the reason instead of the note, for a caller
+/// that reports it elsewhere (the daemon's `serve.log`).
+pub fn ensure_recorded_or_reason(key: &str, info: &Instance, quiet: bool) -> Result<Arch, String> {
+    let result = ensure_or_reason(&info.container, info.devsbd_arch);
+    let (arch, error) = match &result {
+        Ok(arch) => (Some(*arch), None),
+        Err(note) => (None, Some(note.clone())),
     };
     if arch == info.devsbd_arch && error == info.devsbd_error {
-        return arch;
+        return result;
     }
     let saved = State::update(|state| {
         if let Some(entry) = state.instances.get_mut(key) {
@@ -373,7 +381,7 @@ pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> 
     if let (Err(e), false) = (saved, quiet) {
         eprintln!("note: couldn't record devsbd arch: {e:#}");
     }
-    arch
+    result
 }
 
 /// A fake attached VS Code window in the running python:alpine `container`

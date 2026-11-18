@@ -105,7 +105,12 @@ are best-effort.
   container it forwards into.
 - The serve daemon: `Bridges::reconcile` calls `ensure_recorded` before every
   bridge (re)spawn, so a CLI upgrade reaches running instances without a
-  restart ([bridges.md](bridges.md)).
+  restart, and retries it once per appearance in the running list for an
+  instance recorded without the helper (`heal_now`), so one failed install
+  doesn't cut it off ([bridges.md](bridges.md)).
+
+Installs may overlap (the daemon's and `start`'s): `INSTALL_SCRIPT` writes
+a per-shell temp file before the rename, so each lands whole.
 
 A hash change (any rebuild of the helper) reinstalls; the protocol
 `VERSION` alone doesn't decide it.
