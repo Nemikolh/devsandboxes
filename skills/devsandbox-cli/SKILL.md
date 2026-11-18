@@ -113,7 +113,15 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
    devsandbox exec web          # interactive login shell on a TTY
    ```
 
-2. **`run [sandbox] [--name <n>] [-d]`** — create/start an instance in the **background**.
+   With a TTY, on an instance with the devsbd helper, the command runs in a
+   **session** that outlives the client (no idle timeout).
+   `--sessions` lists them; `--attach[=ID]` takes one over (no ID: the one
+   detached, else the one running); `--end ID` ends one (SIGHUP, SIGKILL
+   after 2 s); `--session ID` runs in session ID, attaching if it is live.
+   `--service NAME` opens a terminal in the instance's service container
+   instead (needs a TTY, never a session).
+
+2. **`run [sandbox] [--name <n>] [--branch <b>] [--base <ref>] [--profile <p>] [-d]`** — create/start an instance in the **background**.
    Prints the instance name on stdout, but child output (image builds,
    `docker run`, git, hooks) may precede it and an autostart pass may follow
    it with its own lines. **`--json`** sends all of
@@ -131,7 +139,16 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
      `<sandbox>-<n>` instance name — the two containers never share a checkout.
      `--branch <name>` naming an existing branch checks it out instead (a local
      one as is, a remote-only one as a local branch tracking `origin/<name>`);
-     a branch checked out elsewhere is an error naming where.
+     a branch checked out elsewhere is an error naming where. `--base <ref>`
+     sets a new branch's start point (e.g. `origin/develop`).
+
+   - `--profile <p>` picks one of the sandbox's `profiles` (default: the
+     last one chosen for that sandbox, else its first); `profile <name>`
+     shows or switches it later.
+
+   - `--place` asks the fleet's control plane where to run it (see
+     [Machines](#machines)); `--reprobe` re-detects the runtime's
+     user-namespace mode.
 
    - **Config drift**: reusing a container whose recorded config hash differs from
      the current config only _warns_; `rebuild <name>` applies the changes without
@@ -160,22 +177,24 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
 
 4. **`inspect <name>`** — pretty-printed runtime `inspect` JSON (config, mounts,
    networks, env, exit code). Same name resolution as `logs`, service containers
-   included. Keys are colour-highlighted on a TTY only; piped output is plain
-   JSON, safe to parse.
+   included. Keys are colour-highlighted on a TTY only; piped output (or
+   `--json`) is plain JSON, safe to parse.
 
-5. **`ps [-a]`** — list instances (joined from state + runtime). `-a` includes
-   stopped ones. Columns: NAME, IMAGE, STATUS.
+5. **`ps [-a] [--json]`** — list instances (joined from state + runtime). `-a` includes
+   stopped ones. Columns: NAME, IMAGE, STATUS (plus PROFILE when an instance
+   has one).
 
-6. **`stats`** — one-shot CPU/memory usage of every running `devsandbox-*`
+6. **`stats [--json]`** — one-shot CPU/memory usage of every running `devsandbox-*`
    container (instances and services). Columns: NAME, CPU, MEM.
 
-7. **`ls`** — list sandbox _configs_ from `devsandboxes.toml` (NAME, SOURCE, FOLDER,
+7. **`ls [--json]`** — list sandbox _configs_ from `devsandboxes.toml` (NAME, SOURCE, FOLDER,
    SERVICES, EXTENDS). Use to discover what can be `run` and to catch config
    parse/validation errors.
 
-8. **`stop <name>`** — stop the instance container + its isolated service
-   containers. Idempotent (already-stopped/missing is fine). State survives; a
-   later `run` restarts it.
+8. **`stop <name>`** / **`stop --all`** — stop the instance container + its isolated service
+   containers. Idempotent (already-stopped/missing is fine). State survives;
+   **`start <name>`** / **`start --all`** (`-d` as for `run`) restarts it,
+   services included.
 
 9. **`rebuild <name>`** / **`rebuild --all`** (alias `recreate`; `-d` as for `run`) — recreate the
    instance's container from the current config when it has drifted; the
@@ -202,10 +221,34 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
    Scripts that need a local-only branch gone must pass `--delete-branch`.
 
 11. **`gc [--force]`** — reap shared services no live instance references, orphaned
-   networks, and orphaned shell-history files (`--force` skips the per-file
-   confirm). Housekeeping, not part of a normal task loop.
+   networks, orphaned shell-history files (`--force` skips the per-file
+   confirm) and agent links. Housekeeping, not part of a normal task loop.
 
-12. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
+12. Less common:
+   - **`profile <name> [<profile>]`** — show an instance's profile and what
+     its sandbox allows, or switch it (no restart). Exact instance name.
+   - **`rename <name> <new>`** — rename an instance (state only; the
+     container keeps its name). Exact instance name.
+   - **`done <name>`** / **`undone <name>`** — mark an instance done (kept
+     as is, shown dimmed) / clear the mark.
+   - **`port <name> [--service <s>] [--address <ip>] <port|host:port>…`** —
+     forward instance or service ports to the host until Ctrl-C (a global
+     service needs no `<name>`).
+   - **`vscode <name> [--goto PATH[:LINE[:COL]]]`** — open VS Code attached
+     to the instance.
+   - **`service ls [--json]`** / **`service rebuild <svc>`** — list services /
+     recreate one and rewire running sandboxes in place.
+   - **`status --json`** — the full snapshot (sandboxes, instances,
+     services) for scripts.
+   - **`inbox ls|show|reply|act|submit|done|reopen`** — Inbox threads
+     (docs/reference/inbox-cli.md).
+   - **`fetch <machine>/<instance>`** — bring a placed instance's work back
+     as hidden refs (`refs/devsandbox/<machine>/<instance>/…`).
+   - **`serve [--keep-alive]`**, **`serve install|uninstall`**, **`api
+     --stdio`** — the host daemon in the foreground, from login, and its API
+     relayed over stdin/stdout (plumbing).
+
+13. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
     TTY; prints help and exits `2` otherwise. **Not for agents** — it takes over
     the terminal.
 
@@ -214,27 +257,45 @@ piped/captured output is always plain text.
 
 ## Machines
 
-Sandboxes on other hosts, over ssh (Linux and macOS; the remote needs
-devsandbox on its login shell's `PATH`). The local host daemon keeps the list
-and talks to each machine's daemon; nothing else changes on the machine.
+Sandboxes on other hosts, over ssh (Linux and macOS; `machine add` offers
+to copy this devsandbox there when it has none or another version). The
+local host daemon keeps the list and talks to each machine's daemon; both
+ends end up in one fleet.
 
 ```bash
 devsandbox machine add me@my-server            # link it; its config roots are the ones it lists
 devsandbox machine add ssh://me@box:2200 --name box
 devsandbox machine add me@my-server --agent    # with `agent` on
-devsandbox machine ls [--json]                 # NAME TARGET ROOTS AGENT STATE VERSION
+devsandbox machine add me@my-server --allow gpus,publish   # what placed work may use there
+devsandbox machine ls [--json]                 # NAME TARGET ROOTS AGENT STATE VERSION CAPACITY
 devsandbox machine set box --agent on|off      # change a machine's `agent`
 devsandbox machine upgrade box [--yes]         # copy this build over its devsandbox (ssh), its daemon and link follow
 devsandbox machine unlink box                  # drop this host's link only (it stays in the fleet)
 devsandbox machine rm box                      # take it out of the fleet (this host's own name: leave)
+devsandbox machine control-plane box           # move the fleet's control-plane role to box
+devsandbox machine pending                     # on the authority: proposed membership changes
+devsandbox machine approve 3 | deny 3          # sign and run one / drop it
 devsandbox machine trust [worker|full]         # this host's fleet trust (show / set)
 devsandbox machine roots [add|rm <path>…]      # this host's picked roots (what it lists besides its instances')
-devsandbox machine key                         # this host's member key (ed25519:<hex>) and its fingerprint
+devsandbox machine allow [--gpus on|off …]     # what placed work may ask of this host (show / set)
+devsandbox machine key [rotate]                # this host's member key (ed25519:<hex>) and fingerprint / replace it
 ```
+
+`add` takes `--control-plane` (the machine becomes the new fleet's control
+plane), `--auto-install` (copy this devsandbox there without asking),
+`--yes` (take its key fingerprint without confirming; off a TTY it fails
+without it), and `--allow`, `--allow-bind <path>`, `--allow-local-env
+<name>` (the machine's allowances). `machine allow`'s flags: `--privileged`,
+`--runtime-socket`, `--host-network`, `--global-services`, `--dispatcher`,
+`--inbox`, `--initialize-command`, `--publish`, `--gpus` (each `on|off`),
+`--bind-add|--bind-rm <path>`, `--local-env-add|--local-env-rm <name>`.
+Changes typed on a member other than the fleet's authority (`rm`,
+`control-plane`, `key rotate`) are proposed there and wait for `machine
+approve`.
 
 - `add` picks no config roots: a machine's are the ones its own daemon
   lists (`machine roots add` run there names more). The name
-  defaults to the target's host; a name already registered is refused.
+  defaults to the machine's member name; a name already taken is refused.
   Adding a machine means trusting it. `--agent` / `machine set <name>
   --agent on|off` (off by default, shown in `machine ls`) decide whether
   the local daemon relays your ssh-agent there: for `run`/`start`/… (e.g.
