@@ -32,7 +32,7 @@ checks the typings against the wire structs).
 | containers, config | `containers.logs\|inspect\|list\|stats`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
-| verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
+| verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own `API` stream) |
 | machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|propose\|pending\|approve\|deny\|rotate\|control_plane`, `graph.get`, `capacity.get`, `code.haves`, `instances.fetch` and `open.deliver` (peers only), `mesh.folders`, `placements.fetch` (local only) | no (`placements.fetch` names the machine it fetches from) |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,

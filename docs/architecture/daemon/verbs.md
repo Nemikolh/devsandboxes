@@ -160,8 +160,8 @@ The dispatcher's child ops (`commands::dispatch`) run `devsandbox
 
 ## Verbs on a machine
 
-A verb request carrying `machine` runs over an ssh of its own for the
-request's life, ids rewritten, with no spool here; it's a `verbs` holder
+A verb request carrying `machine` runs over a fresh `API` stream on the
+machine's link for the request's life, ids rewritten, with no spool here; it's a `verbs` holder
 while it runs, and a drain cuts it like a hang-up (cancelled there unless
 `detach`). → [machines.md](machines.md)
 
