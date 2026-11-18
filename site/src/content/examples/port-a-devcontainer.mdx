@@ -1,10 +1,10 @@
 ---
 title: Port a devcontainer.json
 description: Turn an existing devcontainer.json into a devsandbox config.
-order: 10
+order: 7
 icon: file-code
 tags: [devcontainers, migration]
-related: [features, vscode, isolated-services]
+related: [services, caches, parallel-agents]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
@@ -12,9 +12,7 @@ import AgentPromptLink from '../../components/AgentPromptLink.astro';
 
 ## The problem
 
-Your repo already has a `.devcontainer/devcontainer.json` and you want to run it with devsandbox. Rewriting it from scratch risks losing something.
-
-`devsandboxes.toml` uses the same property names in TOML, so most of the file moves over line by line. The differences: `folder` says which repo the sandbox is for, some properties are ignored, and compose setups become `[services.*]`.
+Your repo already has a `.devcontainer/devcontainer.json`. `devsandboxes.toml` uses the same property names in TOML, so most of it moves over line by line. `folder` says which repo the sandbox is for, and compose services become `[services.*]`.
 
 <AgentPromptLink />
 
@@ -28,15 +26,10 @@ Your repo already has a `.devcontainer/devcontainer.json` and you want to run it
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
   "forwardPorts": [3000],
-  "containerEnv": { "NODE_ENV": "development" },
-  "mounts": ["source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind"],
   "remoteUser": "node",
   "postCreateCommand": "npm ci",
   "customizations": {
-    "vscode": {
-      "extensions": ["dbaeumer.vscode-eslint"],
-      "settings": { "editor.formatOnSave": true }
-    }
+    "vscode": { "extensions": ["dbaeumer.vscode-eslint"] }
   }
 }
 ```
@@ -45,12 +38,9 @@ Your repo already has a `.devcontainer/devcontainer.json` and you want to run it
 [sandbox.web]                      # the table key replaces `name`
 folder = "../web"                  # the repo; devsandboxes.toml lives outside it
 image = "mcr.microsoft.com/devcontainers/typescript-node:22"
-forwardPorts = [3000]              # forwarded while the instance runs
-containerEnv = { NODE_ENV = "development" }
-mounts = ["source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind"]
+forwardPorts = [3000]
 remoteUser = "node"
 postCreateCommand = "npm ci"
-# settings: ignored, keep them in the repo's .vscode/settings.json
 customizations.vscode.extensions = ["dbaeumer.vscode-eslint"]
 
 [sandbox.web.features]
@@ -59,44 +49,29 @@ customizations.vscode.extensions = ["dbaeumer.vscode-eslint"]
 
 ## Try it
 
-From the config dir:
-
 ```bash
-devsandbox ls                  # validates the config, no container needed
+devsandbox ls                  # validates the config
 devsandbox run web
-devsandbox exec web zsh
 ```
 
 ## How it works
 
-The `devcontainer.json` can stay in the repo; devsandbox never reads it. `ls` errors on unknown keys; `run` warns about ignored ones.
+devsandbox never reads the `devcontainer.json`. `ls` errors on unknown keys and `run` warns about ignored ones.
 
 | devcontainer.json | devsandboxes.toml | notes |
 |---|---|---|
 | the file's location | `folder` | required by `run` |
-| `name` | the table key | `name` is ignored |
-| `image`, `features` | same | Features: OCI references only |
+| `name` | the table key | ignored |
 | `build.*` | `build = { dockerfile, context, … }` | paths relative to the config dir |
-| `containerEnv`, `remoteEnv` | same | both `${…}`-substituted at create, `${containerEnv:…}` included |
-| `containerUser`, `remoteUser` | same | the account you [run as, with your host ids](/docs/going-further#who-you-are-inside) |
 | `updateRemoteUserUID` | same | `false` means `identity = "image"` |
-| `mounts` | same | missing bind sources are created |
-| `workspaceFolder` | same | default `/workspaces/<folder basename>` |
-| `workspaceMount` | `folder` | ignored |
-| `init`, `privileged` | same | |
-| `hostRequirements.gpu` | same | a required GPU that can't be had refuses the run; other `hostRequirements` ignored |
-| `initializeCommand` | same | runs on the host, in the config dir |
-| `onCreateCommand` … `postAttachCommand` | same | tables run in order, not in parallel |
-| `customizations.vscode.extensions` | same | |
+| `hostRequirements.gpu` | same | other `hostRequirements` ignored |
+| `onCreateCommand` … `postAttachCommand` | same | tables run in order |
 | `customizations.vscode.settings` | repo `.vscode/settings.json` | ignored |
-| `forwardPorts` | same | forwarded by the [host daemon](/docs/going-further#the-host-daemon) while the instance runs |
 | `appPort`, `portsAttributes` | `devsandbox port web 3000` | ignored |
 | `runArgs`, `capAdd`, `securityOpt` | none | ignored |
-| `dockerComposeFile`, `service`, `runServices` | `[services.*]` + `services` | error |
+| `dockerComposeFile`, `service` | `[services.*]` + `services` | error |
 
-The full list of implemented, ignored and rejected keys is in the [config reference](/docs/config#implemented-devcontainer-properties).
-
-From docker compose: the app container is the sandbox; each other compose service becomes a `[services.<name>]` that the sandbox lists in `services` and reaches by name ([private services](/examples/isolated-services), [one shared Postgres](/examples/shared-postgres)).
+Other properties carry over as they are. The full list is in the [config reference](/docs/config#implemented-devcontainer-properties). Compose services become [services](/examples/services) the sandbox reaches by name.
 
 ## Agent instructions
 
@@ -104,10 +79,10 @@ From docker compose: the app container is the sandbox; each other compose servic
   goal="Port the devcontainer.json of my repo at <repo path> to a sandbox in my devsandbox devsandboxes.toml."
   steps={[
     'Read <repo path>/.devcontainer/devcontainer.json and any Dockerfile or docker-compose.yml it references; do not modify them.',
-    'Add a `[sandbox.<sandbox name>]` with `folder` pointing at <repo path> (relative to the config dir) and copy the implemented properties over; rebase `build` paths onto the config dir. Extend an existing template instead of repeating what it provides.',
+    'Add a `[sandbox.<sandbox name>]` with `folder` pointing at <repo path> and copy the implemented properties over; rebase `build` paths onto the config dir.',
     'Drop the properties the config-toml-spec lists as ignored and tell me what each did; turn compose services into `[services.*]` listed in `services`.',
   ]}
   verify={[
-    'Run `devsandbox -C <config dir> run <sandbox name>` and report any `warning:` lines, then `devsandbox -C <config dir> exec <instance> <a command the repo needs>`.',
+    'Run `devsandbox -C <config dir> run <sandbox name>` and report any `warning:` lines.',
   ]}
 />

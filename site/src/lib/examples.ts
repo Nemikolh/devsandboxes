@@ -9,12 +9,9 @@
 export const EXAMPLE_ICONS = [
   'git-branch',
   'database',
-  'network',
   'hard-drive',
   'key-round',
   'plug',
-  'code',
-  'package',
   'git-pull-request',
   'file-code',
   'globe-lock',

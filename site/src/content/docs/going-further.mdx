@@ -1,67 +1,34 @@
 ---
 title: Going further
-description: Sessions, who you are inside, links and profiles, GPUs and the host daemon.
+description: Builds, sessions, who you are inside, links and profiles, GPUs and the host daemon.
 eyebrow: GETTING STARTED
 order: 2
 ---
 
-## Build logs and detach
+## Builds
 
-`run`, `rebuild` and `start` print their build and also write it to the instance's build log. Closing the terminal doesn't stop a build; Ctrl-C cancels it (a cancelled `run` is undone). `-d` returns as soon as the instance is registered:
+`run`, `rebuild` and `start` keep building after you close the terminal. Ctrl-C cancels, and a cancelled `run` is undone. `-d` returns once the instance is registered, and `devsandbox logs --build web --follow` follows the build. A failing `postCreateCommand` keeps the container, so `logs` and `exec` can show why.
 
-```bash
-devsandbox rebuild -d --force web       # prints: web, the build goes on
-devsandbox logs --build web --follow    # until it's up or failed
-devsandbox logs web                     # the container's own log
-```
+## Sessions
 
-A failing `postCreateCommand` aborts `run` but keeps the container, so `logs` and `exec` can show you why.
-
-`--service` opens a terminal in a service container the instance uses:
+An `exec` from a terminal runs in a session that survives a closed terminal or a dropped connection. It ends with its program, the container or `--end`.
 
 ```bash
-devsandbox exec web --service database -- psql -U postgres
+devsandbox exec web claude                    # gets -i -t on its own from a terminal
+devsandbox exec web --sessions                # list them
+devsandbox exec web --attach                  # back into a detached one
+devsandbox exec web --end 1790000000-a1b2     # end one
 ```
-
-## Get a shell back
-
-```bash
-devsandbox exec web --sessions                # id, state, attached or detached, started, command
-devsandbox exec web --attach                  # the detached session, else the running one; a pick list if several
-devsandbox exec web --attach=1790000000-a1b2  # a given one
-devsandbox exec web --session 1790000000-a1b2 pnpm dev  # run in that session, or attach if it's live
-devsandbox exec web --end 1790000000-a1b2     # end a session (its program gets SIGHUP)
-```
-
-An `exec` from a terminal runs in a session that survives a closed terminal or a dropped connection, dashboard terminals included; sessions end with their program, `--end`, or the container.
 
 ## Who you are inside
 
-Inside a sandbox you are the config's `remoteUser` (else `containerUser`, else the image's `USER`) with your host uid/gid, on every runtime, so workspace files stay yours. `run` says how in one `identity:` line; `--reprobe` probes the runtime again after you change its setup.
-
-Mount into that user's home with `${containerEnv:HOME}` ([variables](/docs/config#variables)):
-
-```toml
-mounts = ["source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"]
-```
-
-To take the image's users as written, nothing remapped, set [`identity = "image"`](/docs/config#devsandbox-extras) on the sandbox.
-
-### Configs written for root
-
-A config that mounts into `/root` or sets a root user gets a prompt before `run`, `start` and `rebuild`:
-
-```text
-[u]pdate / [c]ontinue as is (don't ask again) / [s]kip this time
-```
-
-`u` rewrites `devsandboxes.toml` (`/root` → `${containerEnv:HOME}`, root user removed, comments kept) and names the instances to `rebuild`; `c` keeps it as `identity = "image"`; `s` goes ahead this once.
+You are the config's `remoteUser` (else `containerUser`, else the image's `USER`) with your host uid/gid, so workspace files stay yours. Mount into that user's home with `${containerEnv:HOME}`. [`identity = "image"`](/docs/config#devsandbox-extras) takes the image's users as written. A config that mounts into `/root` gets a prompt before `run` that offers to rewrite it.
 
 ## Links open on your desktop
 
-`xdg-open`, `$BROWSER` and a CLI's "press enter to open the browser" in a sandbox open the link in your host's browser. Only `http(s)` URLs open. A `localhost` URL or an OAuth callback (`gh auth login`) gets a port forward first, so it reaches the container. From a script, `devsbd open <url>`. Existing instances get it once rebuilt.
+`xdg-open`, `$BROWSER` and CLI logins in a sandbox open `http(s)` links in your host's browser. A `localhost` URL or an OAuth callback gets a port forward first, so `gh auth login` works. Scripts call `devsbd open <url>`.
 
-[Profiles](/docs/config#profiles-profilesname) pick which browser:
+[Profiles](/docs/config#profiles-profilesname) pick the browser:
 
 ```toml title="devsandboxes.toml"
 [profiles.work]
@@ -70,7 +37,7 @@ A config that mounts into `/root` or sets a root user gets a prompt before `run`
 [sandbox.web]
 folder = "../web"
 image = "node:22"
-profiles = ["work", "personal"]   # the ones its instances may be in
+profiles = ["work", "personal"]
 ```
 
 ```toml title="~/.local/share/devsandbox/profiles.toml"
@@ -79,39 +46,14 @@ open = ["google-chrome", "--profile-directory=Profile 2"]
 ```
 
 ```bash
-devsandbox run web --profile personal   # default: the last one picked, else the first
-devsandbox profile web work             # switch, nothing restarts
+devsandbox run web --profile personal
+devsandbox profile web work             # switch, nothing restarts (P in the dashboard)
 ```
-
-`P` in the dashboard does the same. A profile `profiles.toml` doesn't map opens with the system opener.
 
 ## GPUs
 
-`hostRequirements.gpu = true` on a sandbox or a service gives its container every NVIDIA GPU; `"optional"` runs without one when none is usable. A required GPU that isn't usable stops `run` before anything is built, saying why. [Details](/docs/config#implemented-devcontainer-properties).
-
-```toml
-[sandbox.ml]
-folder = "../ml"
-image = "pytorch/pytorch"
-hostRequirements.gpu = true
-```
+`hostRequirements.gpu = true` on a sandbox or a service gives its container every NVIDIA GPU. `run` stops before building when none is usable. `"optional"` runs without one. On a fleet, `run --place` sends it to a [machine](/docs/machines) that lends a GPU.
 
 ## The host daemon
 
-`run`, `rebuild`, `start`, `stop`, `rm`, the dashboard, port forwards, notifications and links all go through `devsandbox serve`, one per user. It starts on demand and exits after 10 minutes with nothing to do; files (`state.toml`, the Inbox) stay the source of truth, so stopping it loses nothing. Builds run with your shell's environment and keep going without the terminal. Linux and macOS.
-
-A sandbox the runtime restarts on boot (`autostart = "runtime"`) needs it running from login:
-
-```bash
-devsandbox serve install     # a systemd user unit (Linux) or a LaunchAgent (macOS); never idles out
-devsandbox serve uninstall
-```
-
-To only keep it from idling, without a unit:
-
-```toml title="~/.local/share/devsandbox/daemon.config.toml"
-[serve]
-keep-alive = true
-```
-
-Anyone who can open its socket can act as you on every sandbox, like `docker.sock`. Editors and GUIs talk to it over a JSON-lines API: `devsandbox api --stdio`, or the [Node API](/docs/node-api)'s `connect()`.
+Verbs, the dashboard, port forwards, notifications and links go through `devsandbox serve`, one per user on Linux and macOS. It starts on demand and exits after 10 minutes idle. Stopping it loses nothing. A sandbox with `autostart = "runtime"` needs it from login, which `devsandbox serve install` sets up as a systemd user unit or a LaunchAgent. Anyone who can open its socket can act as you, like with `docker.sock`. Editors talk to it with `devsandbox api --stdio` or the [Node API](/docs/node-api).

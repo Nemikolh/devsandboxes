@@ -1,0 +1,73 @@
+---
+title: Private or shared services
+description: Give each instance its own Redis, and every sandbox one shared Postgres.
+order: 2
+icon: database
+tags: [services, databases, networking]
+related: [parallel-agents, port-forwarding, port-a-devcontainer]
+---
+
+import AgentPrompt from '../../components/AgentPrompt.astro';
+import AgentPromptLink from '../../components/AgentPromptLink.astro';
+
+## The problem
+
+Parallel agents on one database step on each other. Some services should belong to one instance and be free to wreck, others are one shared dev database.
+
+A service without `scope` is isolated, with one container per instance on a network of its own. `scope = "global"` makes one container shared by every sandbox that lists it. Both answer to the service's name.
+
+<AgentPromptLink />
+
+## Config
+
+```toml title="devsandboxes.toml"
+[services.postgres]
+image = "postgres:16"
+scope = "global"                       # one for the whole config root
+env = { POSTGRES_PASSWORD = "postgres" }
+ports = ["127.0.0.1:5432:5432"]        # optional: reach it from the host
+
+[services.redis]
+image = "redis:7"                      # no scope: one per instance
+
+[template.base]
+image = "node:22"
+services = ["postgres", "redis"]
+containerEnv = { DATABASE_URL = "postgres://postgres:postgres@postgres:5432/postgres", REDIS_URL = "redis://redis:6379" }
+
+[sandbox.api]
+extends = "base"
+folder = "../api"
+
+[sandbox.web]
+extends = "base"
+folder = "../web"
+```
+
+## Try it
+
+```bash
+devsandbox run api                     # starts postgres, then api with its own redis
+devsandbox run api --name fix-login    # its own redis, the same postgres
+devsandbox run web
+devsandbox service ls
+```
+
+## How it works
+
+- Isolated services follow their instance through `stop`, `start` and `rm`. Give them no host `ports`, since a second instance would collide. Use `devsandbox port` instead.
+- A global service keeps running for the others. `devsandbox gc` removes it once no instance uses it.
+- `devsandbox service rebuild postgres` applies config changes and rewires running sandboxes in place. The data lives in the container, so keep a way to re-seed.
+
+## Agent instructions
+
+<AgentPrompt
+  goal="Give my devsandbox sandboxes one shared Postgres, and every instance its own private Redis."
+  steps={[
+    'Add `[services.postgres]` with the Postgres version the repo targets, `scope = "global"` and `POSTGRES_PASSWORD` in `env`. Add `[services.redis]` without a `scope`.',
+    'List both in `services` of a template every sandbox extends, with `containerEnv` pointing the variables the repo reads at hosts `postgres` and `redis`.',
+  ]}
+  verify={[
+    'Start two instances with `devsandbox -C <config dir> run <sandbox> --name <task>` and check `devsandbox -C <config dir> service ls` shows one postgres and a redis per instance.',
+  ]}
+/>

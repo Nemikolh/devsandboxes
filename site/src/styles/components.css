@@ -672,62 +672,6 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   margin-top: -12px;
 }
 
-.resource-link {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  border: 1px solid #334649;
-  background: var(--surface-raised);
-  padding: 17px 19px;
-  margin: 22px 0;
-  transition:
-    border-color 0.2s,
-    background 0.2s;
-}
-
-.resource-link:hover {
-  border-color: #79ccc1;
-  background: #1a2a2d;
-}
-
-.resource-link > span {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.resource-link strong {
-  font-size: 13px;
-  color: #d8eee5;
-}
-
-.resource-link small {
-  font-size: 11px;
-  color: #91a9a5;
-}
-
-.resource-link svg {
-  color: var(--lime);
-  flex-shrink: 0;
-}
-
-.resource-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 12px;
-  margin: 22px 0;
-}
-
-.resource-grid .resource-link {
-  margin: 0;
-  align-items: flex-start;
-}
-
-.resource-grid .resource-link small {
-  line-height: 1.5;
-}
-
 .feature-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

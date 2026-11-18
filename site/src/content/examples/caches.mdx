@@ -1,10 +1,10 @@
 ---
 title: Shared package caches
 description: New sandboxes stop downloading the same packages again.
-order: 4
+order: 3
 icon: hard-drive
 tags: [caches, performance]
-related: [features, parallel-agents, shared-postgres]
+related: [parallel-agents, services, port-a-devcontainer]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
@@ -12,9 +12,7 @@ import AgentPromptLink from '../../components/AgentPromptLink.astro';
 
 ## The problem
 
-Throwaway instances are only cheap if they start fast. Each new container begins with an empty package cache, so every `npm install` or `cargo build` downloads the same dependencies again, once per instance, per rebuild.
-
-`caches` fixes that with one line: each named cache is one directory in the config dir's `shared-volumes/`, mounted into every sandbox that lists it.
+Each new container starts with an empty package cache, so every instance downloads the same dependencies again. Each name in `caches` is one directory in the config dir's `shared-volumes/`, mounted into every sandbox that lists it.
 
 <AgentPromptLink />
 
@@ -29,42 +27,28 @@ caches = ["npm"]            # one npm cache for every sandbox and instance
 extends = "base"
 folder = "../web"
 postCreateCommand = "npm install"
-
-[sandbox.api]
-extends = "base"
-folder = "../api"
-postCreateCommand = "npm install"
 ```
 
 ## Try it
 
-From the config dir:
-
 ```bash
 devsandbox run web                     # npm install fills shared-volumes/npm
-devsandbox run web --name fix-login    # same install, served from the cache
-devsandbox run api                     # the api shares it too
-devsandbox exec web sh -c 'echo $npm_config_cache'   # /var/cache/devsandbox/npm
+devsandbox run web --name fix-login    # served from the cache
 ```
-
-- `--name`: the instance name.
 
 ## How it works
 
-- Valid names are `pnpm`, `cargo`, `npm`, `yarn`, `go` and `pip`; each sets the tool's env vars to its mount ([`caches`](/docs/config#devsandbox-extras)).
-- Arrays concatenate under `extends`: a sandbox can add its own, e.g. `caches = ["cargo"]` ([templates](/docs/config#templates-and-extends)).
-- `rm` and `gc` leave caches alone; delete a directory in `shared-volumes/` to start that cache over.
-- Mounts target `/var/cache/devsandbox/…`, outside any home dir, so they work whatever user the sandbox runs as.
+- Valid names are `pnpm`, `cargo`, `npm`, `yarn`, `go` and `pip`. Each sets the tool's env vars to its mount.
+- `rm` and `gc` leave caches alone. Delete a directory in `shared-volumes/` to start that cache over.
 
 ## Agent instructions
 
 <AgentPrompt
   goal="Share package caches across my devsandbox sandboxes so new instances stop re-downloading dependencies."
   steps={[
-    'Find which package managers my sandboxes use and add them to `caches` (valid: pnpm, cargo, npm, yarn, go, pip), in a template every sandbox `extends` if there is one.',
+    'Find which package managers my sandboxes use and add them to `caches`, in a template every sandbox `extends` if there is one.',
   ]}
   verify={[
     'Existing instances now drift: list them with `devsandbox -C <config dir> ps -a` and ask me before running `devsandbox -C <config dir> rebuild <instance>` on each.',
-    'Check `devsandbox -C <config dir> exec <instance> env` shows the cache variables (e.g. npm_config_cache), and that <config dir>/shared-volumes/ fills up after an install.',
   ]}
 />

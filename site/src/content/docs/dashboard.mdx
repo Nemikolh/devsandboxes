@@ -10,7 +10,7 @@ import Experimental from '../../components/Experimental.astro';
 import TourStep from '../../components/TourStep.astro';
 import Try from '../../components/Try.astro';
 
-Run `devsandbox` with no arguments on a terminal and the dashboard opens (Linux and macOS: it works through the [host daemon](/docs/going-further#the-host-daemon), which it starts). The preview follows along as you scroll: click it and press the keys each section suggests (nothing in it runs).
+Run `devsandbox` with no arguments on a terminal to open the dashboard. The preview follows along as you scroll. Click it and press the keys each section suggests.
 
 <DashboardTour>
 
@@ -18,19 +18,9 @@ Run `devsandbox` with no arguments on a terminal and the dashboard opens (Linux 
 
 ## Instances
 
-The Instances tab lists each sandbox of your config with its instances under it. The first instance mounts your checkout; each repeat one has its own git worktree (`⎇ .worktrees/web-2`). Detail, below the table, shows the selected row.
+Each sandbox is listed with its instances under it. Repeat instances show their worktree (`⎇ .worktrees/web-2`). Detail shows the selected row. Tab `2` lists the service containers and who uses them.
 
-<Try>`↑` `↓` to move, or click the `▾ web` row for the sandbox itself.</Try>
-
-</TourStep>
-
-<TourStep scene="services">
-
-## Services
-
-Tab `2` lists the service containers your sandboxes use: shared by every instance (`global`) or one per instance, and who uses them.
-
-<Try>`enter` for the service's config, `1`–`4` or `←` `→` to switch tabs.</Try>
+<Try>`↑` `↓` to move, `1`–`4` to switch tabs.</Try>
 
 </TourStep>
 
@@ -38,9 +28,9 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Config explorer
 
-`enter` opens the selected sandbox's config as written in `devsandboxes.toml`, next to the `docker inspect` of its container. `t` flips to the resolved config, with templates and `extends` merged in.
+`enter` shows the config as written, next to the container's `docker inspect`. `t` flips to the resolved config.
 
-<Try>`t` to toggle, `↓` to scroll, `esc` to close.</Try>
+<Try>`t` to toggle, `esc` to close.</Try>
 
 </TourStep>
 
@@ -48,21 +38,9 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Run, stop, start
 
-`r` on a sandbox row prefills `:run web`: Enter starts a new instance, on its own worktree. Builds keep going if you quit the dashboard; the row shows the step (`building`, `postCreateCommand`, …), `b` follows its build log, `d` offers to cancel it. `s` stops or starts the selected instance. On an instance row, `r` renames it and `P` switches its [profile](/docs/going-further#links-open-on-your-desktop) (like `:profile web-2 work`; a picker with more than two).
+`r` on a sandbox row prefills `:run web`. The row shows the build step, `b` follows the build log, and `d` offers to cancel it. `s` stops or starts an instance and `l` shows its log. On an instance row, `r` renames it and `P` switches its [profile](/docs/going-further#links-open-on-your-desktop).
 
-A config [written for root](/docs/going-further#configs-written-for-root) is flagged in the header (`N sandboxes use /root (U to update)`); `U` offers the CLI's fix.
-
-<Try>`enter` to run `web-4` and watch its row go from `building` to `running`, then `↓` to it and `b` for its build log, or `s` on any instance.</Try>
-
-</TourStep>
-
-<TourStep scene="logs">
-
-## Logs
-
-`l` shows the last 50 lines of the instance's container log.
-
-<Try>`↓` to scroll, `g` / `G` for top and bottom, `esc` to close.</Try>
+<Try>`enter` to run `web-4`, then `↓` to it and `b` for its build log.</Try>
 
 </TourStep>
 
@@ -70,9 +48,9 @@ A config [written for root](/docs/going-further#configs-written-for-root) is fla
 
 ## Terminal
 
-`t` opens a shell in the selected instance, one tab per shell; `ctrl-]` (or `F12`) switches between it and the dashboard. Shells run in [sessions](/docs/going-further#get-a-shell-back): `a` on the instance attaches to one again, and an expanded instance lists them as `session` rows (`a` attaches, `K` ends).
+`t` opens a shell in the instance, one tab per shell. `ctrl-]` or `F12` switches between it and the dashboard. Shells run in [sessions](/docs/going-further#sessions). An expanded instance lists them as rows, where `a` or `enter` attaches and `K` ends one. `a` on the instance picks a detached one.
 
-<Try>type `ls` and `enter`, `esc` back to the dashboard (`ctrl-]` in the real one), `↓` `t` for a second shell, `esc` again, then `[` `]` to switch and `x` to close.</Try>
+<Try>type `ls` and `enter`, `esc` back to the dashboard, then `[` `]` to switch and `x` to close.</Try>
 
 </TourStep>
 
@@ -80,7 +58,7 @@ A config [written for root](/docs/going-further#configs-written-for-root) is fla
 
 ## Port forwards
 
-`p` prefills `:port web`: add a port and Enter, and it's on `127.0.0.1` on your machine. Forwards show in the Ports tab and outlive the dashboard, until `d` stops one. A sandbox's `forwardPorts` are forwarded for you while its instance runs; links a sandbox opens get forwards marked `(open)`, stopped after 10 minutes idle. `p` on a [machine](#other-machines)'s row opens the port here too.
+`p` prefills `:port web`. Forwards show in the Ports tab and outlive the dashboard until `d` stops one. Links a sandbox opens get forwards marked `(open)`.
 
 <Try>`d` to stop it, then `1` `p`, type `8080:3000` and `enter`.</Try>
 
@@ -90,9 +68,9 @@ A config [written for root](/docs/going-further#configs-written-for-root) is fla
 
 ## VS Code
 
-`o` opens VS Code attached to the instance's container, with the sandbox's extensions. See the [VS Code example](/examples/vscode) for the setup.
+`o` or `devsandbox vscode web-2` opens VS Code attached to the instance, with the sandbox's extensions. It needs the Dev Containers extension and `code` on your `PATH`.
 
-<Try>`↓` `o` to open it on `web-2`; `esc` closes it (only in the preview).</Try>
+<Try>`↓` `o` to open it on `web-2`.</Try>
 
 </TourStep>
 
@@ -100,9 +78,9 @@ A config [written for root](/docs/going-further#configs-written-for-root) is fla
 
 ## Inbox
 
-A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`: it lands in the Inbox tab (`4`), with a `✉` on the instance row, and pops up on your desktop. A sandbox with [`inbox = true`](https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md#inbox-threads) (typically a dispatcher) keeps one thread per item there, with buttons, forms and replies; answer from a shell with `devsandbox inbox`.
+`devsbd notify "tests pass"` in a sandbox lands in the Inbox tab, marks the instance with `✉` and pops up on your desktop. Answer threads from a shell with `devsandbox inbox`.
 
-<Try>`1` for Instances: leaving the Inbox marked it read, so `web-3` lost its `✉`.</Try>
+<Try>`1` for Instances, where `web-3` lost its `✉`.</Try>
 
 </TourStep>
 
@@ -110,19 +88,9 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`:
 
 ## Command prompt
 
-`:` opens a prompt for the CLI's verbs: `run`, `exec`, `code`, `rm`, `rename`, `profile`, `stop`, `start`, `rebuild`, `port`. Tab completes commands, sandboxes and instances; `rm` asks before deleting a worktree's branch.
+`:` takes the CLI's verbs, like `run`, `exec`, `rm`, `profile` and `port`. Tab completes them and their names. `?` lists every key, and `q` quits.
 
-<Try>`tab` to cycle, type `-3` and `enter` to remove `web-3`, then `y` or `n`.</Try>
-
-</TourStep>
-
-<TourStep scene="help">
-
-## Help
-
-`?` opens *Settings & help*: a few settings on top (`space` toggles, saved for next time) and every key below; `q` quits the dashboard.
-
-<Try>`esc` or `?` to close.</Try>
+<Try>`tab` to cycle, type `-3` and `enter` to remove `web-3`.</Try>
 
 </TourStep>
 
@@ -130,67 +98,8 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`:
 
 ## Other machines <Experimental />
 
-With [machines](/docs/machines) registered, the dashboard shows their instances too, with a MACHINE column. A config the fleet signs shows once, with every machine's instances under it. Every key works on their rows, terminals included, and `:` commands take `my-server/web-2`; `o` (VS Code) doesn't yet. A machine that's down keeps its last rows, shown `unreachable`; the header says `no runtime` on a host without one. The Machines tab (`5`) lists each machine's ssh target, connection, agent relay (`a` toggles it) and version. The status line says what happened to each link a sandbox opened: opened (in which profile), refused or failed.
+[Machines](/docs/machines)' instances show too, and every key but `o` works on them. The Machines tab (`5`) lists each machine, and `a` there turns its agent relay on or off.
 
-## Every key
+## Keys
 
-Also in the dashboard's `?` screen. Dragging selects text and copies it on release (*copy on select* in `?`; `shift`-drag for your terminal's own selection).
-
-### Everywhere
-
-| Key                 | Action               |
-| ------------------- | -------------------- |
-| `tab` / `shift-tab` | Next / previous tab  |
-| `1`–`5`             | Jump to a tab (`5`: Machines <Experimental />, with a machine registered) |
-| `:`                 | Command prompt       |
-| `?`                 | Settings & help: `space` / `enter` / click toggles a setting, `tab` moves between them |
-| `q`, `ctrl-c`       | Quit                 |
-| `ctrl-shift-c`, `cmd-c` | Copy the selection (`ctrl-c` too, over a dashboard selection) |
-
-### Instances and Services
-
-| Key               | Action                                           |
-| ----------------- | ------------------------------------------------ |
-| `↑` `k` / `↓` `j` | Move the selection                               |
-| `→`, `space`      | Expand a sandbox's instances, an instance's processes |
-| `←`               | Collapse, or jump to the parent row              |
-| `enter`, `e`      | Config explorer                                  |
-| `r`               | Run (sandbox row) / rename (instance row)        |
-| `P`               | Switch the instance's profile (Instances)        |
-| `s`               | Stop / start                                     |
-| `l`               | Logs (Instances)                                 |
-| `b`               | Build log (Instances): follows a build in flight |
-| `p`               | Forward a port (instance or service)             |
-| `o`               | Open in VS Code (Instances)                      |
-| `d`               | Remove the instance now, no prompt; cancel it, after a `y`/`n`, while it's building (Instances) |
-| `U`               | Update the configs that use `/root`              |
-| `t` / `K`         | SIGTERM / SIGKILL (process row)                  |
-| `a`, `enter` / `K` | Attach / end the session (session row)          |
-
-### Ports, Machines and Inbox list
-
-| Key     | Action                                     |
-| ------- | ------------------------------------------ |
-| `d`     | Stop the selected forward (Ports)          |
-| `a`     | Turn the selected machine's agent on / off (Machines <Experimental />) |
-| `←` `→` | Step the views: Needs you / Active / Done / All (Inbox) |
-| `enter` | Focus the selected thread (Inbox)          |
-| `r` / `i` | Focus the reply input, when the thread takes replies (Inbox) |
-| `d`     | Dismiss a notification / mark a thread done (Inbox) |
-| `u`     | Reopen a done thread (Inbox)               |
-| `D`     | Clear all notifications (Inbox)            |
-
-Thread and form keys: `?` in the dashboard.
-
-### Terminals
-
-| Key              | Action                                   |
-| ---------------- | ---------------------------------------- |
-| `t`              | Open a terminal (instance or service)    |
-| `T`              | Force a new terminal for the same target |
-| `a`              | Attach to a session (Instances)          |
-| `[` / `]`        | Previous / next terminal tab             |
-| `x`              | Close the active terminal                |
-| `ctrl-]`, `F12`  | Terminal ⇄ dashboard                     |
-
-The config explorer, logs and command prompt keys are in `?`.
+One-key actions fire bare or with shift only, so `ctrl-d` never removes an instance. `ctrl-c` quits, or copies over a selection. On a process row, `t` sends SIGTERM and `K` SIGKILL. The `?` screen has the rest.

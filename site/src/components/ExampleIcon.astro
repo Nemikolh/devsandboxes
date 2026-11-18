@@ -1,6 +1,5 @@
 ---
 import {
-  Code,
   Database,
   FileCode,
   GitBranch,
@@ -8,8 +7,6 @@ import {
   GlobeLock,
   HardDrive,
   KeyRound,
-  Network,
-  Package,
   Plug,
 } from '@lucide/astro';
 import type { ExampleIconName } from '../lib/examples';
@@ -24,12 +21,9 @@ interface Props {
 const ICONS: Record<ExampleIconName, typeof Database> = {
   'git-branch': GitBranch,
   database: Database,
-  network: Network,
   'hard-drive': HardDrive,
   'key-round': KeyRound,
   plug: Plug,
-  code: Code,
-  package: Package,
   'git-pull-request': GitPullRequest,
   'file-code': FileCode,
   'globe-lock': GlobeLock,

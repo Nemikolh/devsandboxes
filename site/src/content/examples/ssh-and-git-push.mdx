@@ -1,7 +1,7 @@
 ---
 title: ssh-agent and git push
 description: Agents push over ssh with your host's keys, which never enter the container.
-order: 5
+order: 4
 icon: key-round
 tags: [git, ssh, agents]
 related: [parallel-agents, babysit-pr, caches]
@@ -9,54 +9,26 @@ related: [parallel-agents, babysit-pr, caches]
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
 import AgentPromptLink from '../../components/AgentPromptLink.astro';
-import Agent from '../../components/Agent.astro';
-import AgentOnly from '../../components/AgentOnly.astro';
-import AgentPicker from '../../components/AgentPicker.astro';
 
 ## The problem
 
-An agent finishes its work on a branch and has to push it. Copying a private key into a throwaway container, or mounting `~/.ssh`, hands the key to everything that runs there.
-
-devsandbox forwards your host's **ssh-agent** instead: ssh inside the sandbox asks it to sign, and the key never leaves the host. You only add GitHub's host key and your git identity.
+An agent has to push its branch, but a private key copied into the container is handed to everything that runs there. devsandbox relays your host's ssh-agent instead, so the key never leaves the host.
 
 <AgentPromptLink />
 
 ## Config
 
-<AgentPicker />
+Nothing to enable. Add GitHub's host key and your git identity:
 
-```toml title="devsandboxes.toml" agent="claude"
+```toml title="devsandboxes.toml"
 [sandbox.app]
-folder = "../app"          # your repo, next to this config dir
+folder = "../app"
 image = "node:22"
-# Your Claude Code login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"]
-containerEnv = { CLAUDE_CONFIG_DIR = "${containerEnv:HOME}/.claude" }
 
-[sandbox.app.postCreateCommand]  # once, when an instance is created
+[sandbox.app.postCreateCommand]
 git-identity = "git config --global user.name 'Your Name' && git config --global user.email you@example.com"
-known-hosts = "mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts"  # trust github.com
-agent = "npm install -g @anthropic-ai/claude-code"
+known-hosts = "mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts"
 ```
-
-```toml title="devsandboxes.toml" agent="codex"
-[sandbox.app]
-folder = "../app"          # your repo, next to this config dir
-image = "node:22"
-# Your Codex login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.codex,target=${containerEnv:HOME}/.codex,type=bind"]
-
-[sandbox.app.postCreateCommand]  # once, when an instance is created
-git-identity = "git config --global user.name 'Your Name' && git config --global user.email you@example.com"
-known-hosts = "mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts"  # trust github.com
-agent = "npm install -g @openai/codex"
-```
-
-<AgentOnly agent="claude">
-
-On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any instance.
-
-</AgentOnly>
 
 ## Try it
 
@@ -64,37 +36,25 @@ On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any ins
 ssh-add -l                                # on the host: your key is loaded
 devsandbox run app --name fix-login
 devsandbox exec fix-login ssh-add -l      # the same key, seen from inside
+devsandbox exec fix-login git push
 ```
-
-Start <Agent /> in it and have it commit and push its branch:
-
-```bash agent="claude"
-devsandbox exec fix-login claude
-```
-
-```bash agent="codex"
-devsandbox exec fix-login codex
-```
-
-The remote must be an ssh URL (`git@github.com:…`); `https://` remotes never use the ssh-agent.
 
 ## How it works
 
-- No config: every `devsandbox exec`, dashboard terminal and lifecycle command gets `SSH_AUTH_SOCK` relayed to your host's ssh-agent.
-- A plain `docker exec` shell gets no forwarding.
-- Works on Linux (docker, podman) and macOS (docker; Apple `container` untested). Native Windows: use WSL2.
+- Every `devsandbox exec`, dashboard terminal and lifecycle command gets `SSH_AUTH_SOCK` relayed to your host's agent. A plain `docker exec` doesn't.
+- The remote must be an ssh URL (`git@github.com:…`).
+- On a [machine](/docs/machines), the agent is relayed only once you turn it on.
 
 ## Agent instructions
 
 <AgentPrompt
   goal="Make `git push` over ssh work from my devsandbox sandbox <sandbox name>, using my host's ssh-agent; no keys in the container."
   steps={[
-    'Check the host: `ssh-add -l` lists a key, and devsandbox was installed from npm or a release archive (a `cargo install` build forwards only on Linux docker/podman).',
-    'Add no keys or socket mounts. In `[sandbox.<sandbox name>]`, add a `postCreateCommand` table that runs `ssh-keyscan github.com` into ~/.ssh/known_hosts, sets git `user.name` / `user.email` to <your name> / <your email>, and installs <agent>. Mount <agent>\'s host config dir (its login) into the container.',
+    'Check `ssh-add -l` on the host lists a key. Add no keys or socket mounts.',
+    'In `[sandbox.<sandbox name>]`, add a `postCreateCommand` table that runs `ssh-keyscan github.com` into ~/.ssh/known_hosts and sets git `user.name` / `user.email` to <your name> / <your email>.',
     'Check the repo remote is an ssh URL (git@github.com:…); ask me before changing it.',
   ]}
   verify={[
-    'Start an instance with `devsandbox -C <config dir> run <sandbox name> --name <task>`.',
-    'Check `devsandbox -C <config dir> exec <task> ssh-add -l` lists my key and `devsandbox -C <config dir> exec <task> <agent> --version` works. Push only when I ask.',
+    'Start an instance with `devsandbox -C <config dir> run <sandbox name> --name <task>` and check `devsandbox -C <config dir> exec <task> ssh-add -l` lists my key. Push only when I ask.',
   ]}
 />

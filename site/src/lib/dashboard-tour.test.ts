@@ -30,10 +30,6 @@ describe('sceneState', () => {
     expect(selectedName(sceneState('instances'))).toBe('web-2');
   });
 
-  it('opens the Services tab', () => {
-    expect(sceneState('services').tab).toBe('services');
-  });
-
   it('opens the config explorer on the sandbox as written', () => {
     expect(sceneState('config').modal).toMatchObject({ kind: 'config', target: 'sandbox', side: 'original' });
   });
@@ -42,10 +38,6 @@ describe('sceneState', () => {
     const s = sceneState('run');
     expect(s.selected).toBe(SANDBOX_ROW);
     expect(s.prompt?.input).toBe('run web ');
-  });
-
-  it('shows web’s logs', () => {
-    expect(sceneState('logs').modal).toMatchObject({ kind: 'logs', name: 'web' });
   });
 
   it('leaves a focused terminal on web with git status answered', () => {
@@ -80,10 +72,6 @@ describe('sceneState', () => {
     const p = sceneState('prompt').prompt;
     expect(p?.input).toBe('rm web');
     expect(p?.completion?.candidates).toEqual(['web', 'web-2', 'web-3']);
-  });
-
-  it('opens help', () => {
-    expect(sceneState('help').help).toBe(true);
   });
 });
 

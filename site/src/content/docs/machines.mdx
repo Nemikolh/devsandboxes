@@ -13,51 +13,42 @@ import Experimental from '../../components/Experimental.astro';
 ## Add a machine
 
 ```bash
-devsandbox machine add me@my-server   # its config roots are the ones it lists
-devsandbox run api                    # `api` is only defined there
-devsandbox exec test                  # an instance there, over your daemon's link to it
-devsandbox stop my-server/test        # qualified, when the name exists here too
-devsandbox ps --machine my-server     # a command without a name, run there
-devsandbox machine ls                 # each machine's state: connected, unreachable, …
+devsandbox machine add me@my-server   # offers to install devsandbox there
+devsandbox run api                    # a sandbox defined only there
+devsandbox stop my-server/test        # qualified when the name exists here too
+devsandbox port my-server/web 3000    # the port opens here
 ```
 
-- `machine add` offers to install this devsandbox there when it's missing or another version (`--auto-install` off a terminal), and asks you to confirm the machine's key fingerprint (`--yes`).
-- Your ssh-agent reaches it only with `--agent`, or later `devsandbox machine set my-server --agent on` (`a` on the dashboard's Machines tab).
-- `devsandbox port my-server/web 3000` opens a machine's port here. An `exec` there reconnects into the same session when the link drops.
-- VS Code on a machine isn't supported yet.
+A machine's config roots are the ones its own daemon lists. `machine add` asks you to confirm the machine's key fingerprint. Your ssh-agent reaches the machine only with `--agent` or `devsandbox machine set my-server --agent on`. VS Code on a machine isn't supported yet.
 
 <Callout variant="note" title="Adding a machine means trusting it">
-  Whoever controls it can act as you in its sandboxes, and, with its `agent` on, sign with your ssh-agent while you use it.
+  Whoever controls it can act as you in its sandboxes, and sign with your ssh-agent if you turned that on.
 </Callout>
 
 ## What a machine lends
 
-Work placed on a machine gets nothing extra unless it allows it. Only that host sets its own allowances: `machine allow` there, or `machine add` over your ssh session to it.
+Work placed on a machine gets nothing extra unless that host allows it. Only the host itself sets this, with `machine allow`, or with `machine add` over your ssh session to it.
 
 ```bash
-devsandbox machine allow                                  # on the machine: list
-devsandbox machine allow --gpus on --bind-add ~/datasets  # what placed work may use
-devsandbox machine add box --allow gpus --allow-bind /srv/data   # or answer its prompt
-devsandbox run ml --place                                 # a GPU sandbox goes to a machine lending one
+devsandbox machine allow --gpus on --bind-add ~/datasets   # on the machine
+devsandbox machine add box --allow gpus --allow-bind /srv/data
+devsandbox run ml --place                                  # to a machine that lends a GPU
 ```
-
-`devsandbox machine trust full` on a machine opens its whole API to the fleet instead (any root, any path, `gc --machine`).
 
 ## A config every machine runs
 
-A config can belong to the whole fleet, so an always-on server keeps running its sandboxes while the host it was written on is off. The fleet's authority (the host of its first `machine add`) signs a new version whenever a `run`, `rebuild` or `start` there finds the config changed, and every machine installs its own copy under `~/.local/share/devsandbox/mesh/tree/<root>/`. Edit the config on the authority: a copy changed in place is refused.
+The fleet's authority is the host of its first `machine add`. When a `run`, `rebuild` or `start` there finds the config changed, it signs a new version and every machine installs its own copy. Machines keep running it while the authority is off. Edit the config on the authority only, since a copy changed in place is refused.
 
-To run a config from your desktop on a server `box`, driven from your laptop:
+To run your desktop's config on a server `box` and drive it from a laptop:
 
 1. Install the same devsandbox release on all three.
-2. Desktop: `devsandbox machine add box --control-plane`; each signed root prints `note: signed config`.
-3. Desktop, for another root or after an edit: any `run`, `rebuild` or `start` on it; a `note:` naming a machine says why it doesn't have it yet.
-4. `box`: `devsandbox serve install`; a `run box/<sandbox>` from the desktop sends the repos, else clone them next to the copy; add the `${localEnv:…}` variables and logins the config needs.
-5. Laptop: `devsandbox machine add box`, then `devsandbox run box/<sandbox>`.
+2. On the desktop, run `devsandbox machine add box --control-plane`.
+3. On `box`, run `devsandbox serve install`. A `run box/<sandbox>` from the desktop brings the repos along.
+4. On the laptop, run `devsandbox machine add box`, then `devsandbox machine approve <id>` on the desktop.
+5. On the laptop, run `devsandbox run box/<sandbox>`.
+
+A host with no container runtime, like that laptop, is a driver. Nothing is placed on it, and a bare `run <sandbox>` goes to the machine that runs it.
 
 ## Control plane and versions
 
-- `machine add box --control-plane` makes `box` the control plane of a new fleet; `devsandbox machine control-plane <m>` moves the role later, even off a dead one.
-- Members run the build the authority pinned: a published release is downloaded and verified; a source build only with `dev-builds = true` in `member.toml` or `full` trust.
-- `devsandbox machine upgrade <m>` copies this build over the machine's, over ssh.
-- Links a sandbox on a machine opens open on the host that attached to it with a terminal last (within 10 minutes), in that host's [profile](/docs/going-further#links-open-on-your-desktop) browser.
+`devsandbox machine control-plane <m>` moves the control plane, even off a dead one. Members run the build the authority pins, downloaded and checked by sha256. `machine ls` shows a machine behind the pin, and `devsandbox machine upgrade <m>` copies this build over it. A link a sandbox on a machine opens lands on the host that last attached to it with a terminal.

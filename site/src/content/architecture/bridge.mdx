@@ -61,13 +61,8 @@ host, parses frames. The same `Mux` carries the links between machines ([Fleet](
 ## Two handshakes
 
 The bridge says `Hello` to the daemon first, then to the host, so a daemon of another protocol version fails the
-bridge (exit `3`, `proto::MISMATCH_EXIT`) before the host sends a frame it can't parse. Only `VERSION` must match;
-the build hash is informational. A mismatched container is retried every 5 minutes instead of every 10 s: only a
-helper rewrite fixes it.
-
-Each side sees only its own handshake, so caps are relayed by hand: the bridge tells the host `OWN_CAPS ∧ daemon
-caps`, and passes the host's `Caps` to the daemon unchanged. `SSH_AGENT` is sent only with a live agent, `NOTIFY`
-and `CONTROL` only by the host daemon's instance bridge (the one with a sink).
+bridge (exit `3`) before the host sends a frame it can't parse. Only `VERSION` must match. The bridge tells the host
+`OWN_CAPS ∧ daemon caps`, and passes the host's `Caps` to the daemon unchanged.
 
 ## Frames
 
@@ -92,13 +87,9 @@ u32 stream_id | u8 kind | u32 len | payload[len]      (len ≤ 1 MiB)
 | 11 | `PortQuery` | 0 | `u32 id`, `u16 port`: who listens on that port in the container |
 | 12 | `PortInfo` | 0 | `u32 id`, then per process `u32 pid`, `u8` + comm: the daemon's answer |
 
-Channels 6–11 (`API`, `TRANSFER`, `PTY`, `TUNNEL`, `AGENT`, `ROUTE`) only run between machines
-([Fleet](/architecture/fleet)). The header, `Hello`'s leading `version` and `Quit` are frozen, so any two builds can
-report a mismatch and evict each other; unknown kinds are skipped, so frames are added without a `VERSION` bump.
-
-**Stream ids.** The daemon allocates with the high bit clear (agent, notify, control), the host with it set
-(`Connect`, `Open(rpc)`). Each side refuses the other's id space, a live id, or too many streams: 64 daemon-opened
-and 256 host-opened (`Connect` and rpc together) per bridge.
+Channels 6–11 only run between machines ([Fleet](/architecture/fleet)). The header, `Hello`'s leading `version` and
+`Quit` are frozen, so any two builds can evict each other. Unknown kinds are skipped. The daemon allocates stream ids
+with the high bit clear, the host with it set.
 
 ## Routing in the daemon
 
@@ -110,9 +101,6 @@ The daemon keeps every attached bridge and routes each stream it opens to the ne
 | notify (notices, threads, URLs to open) | newest bridge with `NOTIFY` | stays in `/var/lib/devsandbox/outbox/`, retried every 30 s and on attach |
 | control | newest bridge with `CONTROL` | answered `NoHost` (the CLI exits 75) |
 
-A bridge whose `Caps` hasn't arrived counts as serving nothing (one whose `Hello` caps were 0, as ssh-agent only), so an agent-less `devsandbox port` that attaches
-last can't take ssh away from the host daemon's bridge.
-
 ## Takeover
 
 `start` on a running container rewrites the binary and starts a daemon of the new build. So does the serve daemon
@@ -121,8 +109,7 @@ authority's pinned build) reaches containers already running. The last start win
 
 <Sequence title="A new build's daemon taking over a running container" lanes={takeoverLanes} steps={takeoverSteps} />
 
-Same build hash → the second daemon exits 0. A pidfile with no hash yet (its owner still starting) counts as the
-same build, so two concurrent starts never evict each other.
+With the same build hash the second daemon exits 0, so two concurrent starts never evict each other.
 
 Design notes: `docs/architecture/helper/protocol.md`, `docs/architecture/helper/bridges.md`,
 `docs/decisions/0053-the-authority-pins-the-fleets-build.md` (the pinned build).

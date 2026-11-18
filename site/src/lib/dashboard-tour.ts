@@ -44,16 +44,13 @@ const typed = (text: string): string[] => [...text];
 
 export const SCENES = {
   instances: { input: ['j'], regions: ['instances', 'detail'] },
-  services: { input: ['2'], regions: ['tabs', 'services'] },
   config: { input: ['Enter'], regions: ['config'] },
   run: { input: [{ type: 'selectSandbox' }, 'r'], regions: ['instances', 'prompt'] },
-  logs: { input: ['l'], regions: ['logs'] },
   terminal: { input: ['t', ...typed('git status'), 'Enter'], regions: ['terminal'] },
   ports: { input: ['p', ...typed('3000'), 'Enter'], regions: ['tabs', 'ports'] },
   vscode: { input: ['o'], regions: ['instances', 'status'] },
   inbox: { input: ['4'], regions: ['tabs', 'inbox'] },
   prompt: { input: [':', ...typed('rm '), 'Tab'], regions: ['prompt'] },
-  help: { input: ['?'], regions: ['help'] },
 } as const satisfies Record<string, Scene>;
 
 export type SceneId = keyof typeof SCENES;

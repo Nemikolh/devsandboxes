@@ -7,11 +7,10 @@ order: 1
 
 import HelperDiagram from '../../components/architecture/HelperDiagram.astro';
 
-Nothing in a sandbox talks to the host directly: no mounted socket, no TCP port back. The host runs
-`exec -i … devsbd bridge` in the container and keeps the pipe open; everything that crosses the boundary (ssh-agent
-requests, `devsbd notify`, a URL the sandbox opens, a dispatcher's `devsbd ensure`, a forwarded port, the host's own
-calls into the container) is a stream in that pipe. Plain `exec` stdio works the same on docker, podman and Apple
-`container`. Several machines: [Fleet](/architecture/fleet).
+Nothing in a sandbox talks to the host directly. The host runs `exec -i … devsbd bridge` in the container and keeps
+the pipe open. Everything that crosses the boundary (ssh-agent requests, `devsbd notify`, a URL the sandbox opens, a
+dispatcher's `devsbd ensure`, a forwarded port, the host's own calls) is a stream in that pipe, which works the same
+on every runtime.
 
 <HelperDiagram />
 
@@ -25,8 +24,8 @@ runs in `run` after create, `start` after the container starts, `port`, and the 
 and warn when an exec lands outside the container's cgroup (rootless runc before 1.4.1: a dockerd started there
 can't start containers).
 
-The arch that worked is saved on the instance (`devsbd_arch`). `None` means no helper (no `/bin/sh`, read-only
-`/run`, a build without one); the instance then falls back to a bind-mounted agent socket, if any.
+The arch that worked is saved on the instance (`devsbd_arch`). `None` means no helper, and the instance falls back to
+a bind-mounted agent socket.
 
 ## One daemon per container
 
@@ -58,12 +57,10 @@ several per container are normal:
 | a Ports-tab or `(open)` forward (inside `serve`) | one per forward | its `Connect` streams, ssh-agent |
 | `devsandbox port` (foreground) | its own | its `Connect` streams, ssh-agent when its shell has one |
 
-Notify and control only go to the instance bridge, the one with a sink. Commands that need the relay (`exec`,
-lifecycle commands, a dashboard terminal) don't bridge themselves: they send `bridges.ensure` with their own
-`$SSH_AUTH_SOCK` ([Host daemon lifecycle](/architecture/serve-lifecycle#who-talks-to-the-daemon)). A TTY `exec` runs
-its command in a helper session (`devsbd session new`, under `/var/lib/devsandbox/sessions`): the command outlives
-its client until it exits, `exec --end` or the container stops, `exec --attach` picks it up, and a remote `exec` re-dials into it after a
-dropped link.
+Commands that need the relay (`exec`, lifecycle commands, a dashboard terminal) don't bridge themselves. They send
+`bridges.ensure` with their own `$SSH_AUTH_SOCK` ([Host daemon lifecycle](/architecture/serve-lifecycle#who-talks-to-the-daemon)).
+A TTY `exec` runs its command in a helper session (`devsbd session new`) that outlives its client until the command
+exits, `exec --end` ends it or the container stops. The dashboard lists sessions as rows under their instance.
 
 ## Where the streams end
 
@@ -73,9 +70,7 @@ record lands in `inbox.json` with a popup; an `open` record (an `http(s)` URL, r
 in the desktop of the host the instance was last attached from, after forwarding the loopback ports it names as
 `(open)` forwards, stopped after 10 min idle. Control requests are served by the daemon (`src/commands/dispatch.rs`).
 
-The host opens two kinds of stream itself: a forward's bridge opens `Connect` streams, which the container's daemon
-dials over TCP, and the serve daemon opens an `RPC` stream per call (`HelperClient`, `src/serve/helper.rs`: the API's
-`helper.call`, a dispatcher's run ops, a session attach).
+The host opens `Connect` streams for forwards and an `RPC` stream per call (`HelperClient`, `src/serve/helper.rs`).
 
 Design notes: `docs/architecture/helper/overview.md`, `docs/architecture/helper/bridges.md`,
 `docs/architecture/helper/in-container.md`, `docs/architecture/helper/ssh-agent.md`,

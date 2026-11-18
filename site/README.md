@@ -30,8 +30,8 @@ Pages → Run workflow, pick the branch or tag to deploy).
 
 - `src/pages/` — routes. `src/layouts/` — `Base.astro` (head, header,
   footer, mobile drawer) and `Docs.astro` (sidebar / article / TOC shell).
-- `src/components/` — header, sidebar, TOC, code block, callout, resource
-  link, prev/next `Pager` (reading order from `nav.ts`), mobile drawer, accessible `Tabs` (panels are named
+- `src/components/` — header, sidebar, TOC, code block, callout,
+  prev/next `Pager` (reading order from `nav.ts`), mobile drawer, accessible `Tabs` (panels are named
   slots), `InstallTabs` (install commands built from the Cargo.toml version).
 - `src/styles/` — plain CSS: `tokens.css` (palette, fonts, radii), `base.css`,
   `components.css`, `home.css`, `docs.css`. No Tailwind.

@@ -1,10 +1,10 @@
 ---
 title: Babysit pull requests
 description: An agent keeps your open PRs merged with their base, and pings you when it can't.
-order: 9
+order: 6
 icon: git-pull-request
 tags: [automations, agents, git]
-related: [parallel-agents, ssh-and-git-push, vscode]
+related: [parallel-agents, ssh-and-git-push, services]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
@@ -16,9 +16,7 @@ import BabysitDiagram from '../../components/BabysitDiagram.astro';
 
 ## The problem
 
-Open pull requests rot: the base branch moves on, conflicts appear, and nobody notices until review. The fix is mostly mechanical: merge, resolve, push.
-
-A **dispatcher** sandbox runs a shell loop you own. For each PR that is conflicted or behind, it creates a **child** instance on the PR's branch, in its own worktree, merges the base in and starts <Agent /> only on a conflict. When it gives up, you get a notification.
+Open pull requests fall behind their base and pick up conflicts. A dispatcher sandbox runs a shell loop you own. For each PR that is conflicted or behind, it creates a child instance on the PR's branch, merges the base in and starts <Agent /> only on a conflict. When it gives up, you get a notification.
 
 <BabysitDiagram />
 
@@ -83,11 +81,11 @@ agent = "npm install -g @openai/codex"
 
 <AgentOnly agent="claude">
 
-On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any instance.
+On macOS <Agent /> keeps its login in the Keychain, so run `/login` once in any instance.
 
 </AgentOnly>
 
-The loop, in `pr-dispatcher/` next to `devsandboxes.toml`, with a `.gitignore` for `babysit.log` and `.babysit/`. It runs `fix.sh` in each child. Set `REPO` and `chmod +x` the loop:
+Put the loop and `fix.sh` in `pr-dispatcher/`, gitignore `babysit.log` and `.babysit/`, set `REPO` and `chmod +x` the loop.
 
 ```sh title="pr-dispatcher/fix.sh" agent="claude"
 # Runs in the child's worktree with PR_NUMBER and BASE_BRANCH. Merging the
@@ -213,8 +211,6 @@ while :; do
 done
 ```
 
-Adapted from the [automations guide's sample](https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md#sample-pr-babysit-dispatcher).
-
 ## Try it
 
 ```bash
@@ -223,20 +219,13 @@ devsandbox exec pr-dispatcher gh auth login   # once, before the first child
 devsandbox                                    # the dashboard, to watch it work
 ```
 
-Every five minutes the loop checks the PRs; a child `web-pr-<number>` appears for each one that needs work, and failures land in the Inbox tab (`4`) and on your desktop. Follow along:
-
-```bash
-devsandbox exec pr-dispatcher tail -f babysit.log
-devsandbox exec pr-dispatcher devsbd ls        # the children
-devsandbox exec web-pr-123 bash                # look at a child
-```
+Every five minutes the loop checks the PRs. A child `web-pr-<number>` appears for each one that needs work, and failures land in the Inbox. `devsandbox exec pr-dispatcher tail -f babysit.log` follows the loop.
 
 ## How it works
 
-- [`dispatcher`](/docs/config#devsandbox-extras) lets the dispatcher create, stop and remove children of the sandboxes in `spawn`, through `devsbd ensure` / `exec` / `rm`.
-- The [host daemon](/docs/going-further#the-host-daemon) serves those requests; exit `75` means it isn't reachable yet (after a reboot, until `devsandbox serve install` or your first command), and `ctl` retries.
-- `autostart = "runtime"` restarts the dispatcher, and so the loop, after a reboot.
-- Children run <Agent /> unattended and push to your PR branches with your `gh` login: keep `spawn` narrow and review what they push. They outlive the dispatcher (`devsandbox rm web-pr-123`).
+- [`dispatcher`](/docs/config#devsandbox-extras) lets the sandbox create and remove children of the sandboxes in `spawn`, through `devsbd ensure`, `exec` and `rm`.
+- The [host daemon](/docs/going-further#the-host-daemon) serves those requests. Exit `75` means it isn't reachable yet, and `ctl` retries.
+- Children push to your PR branches with your `gh` login, so keep `spawn` narrow and review what they push.
 
 ## Agent instructions
 

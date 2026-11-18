@@ -1,42 +1,29 @@
 ---
 title: Port forwarding on demand
 description: Open a sandbox's dev server or database from your host, without restarting anything.
-order: 6
+order: 5
 icon: plug
 tags: [networking, services]
-related: [isolated-services, shared-postgres, vscode]
+related: [services, parallel-agents, port-a-devcontainer]
 ---
-
-import Experimental from '../../components/Experimental.astro';
 
 ## The problem
 
-An agent started a dev server on port 3000 inside instance `api` and you want it in your browser, or `psql` on your host against that instance's Postgres. Publishing ports with `-p` has to happen at create time, collides as soon as a second instance wants the same port, and can't reach a server listening on the container's `127.0.0.1`.
-
-`devsandbox port` forwards a port **on demand**, like VS Code's _Ports_ tab: it is on `localhost` until you stop it.
+An agent started a dev server on port 3000 in instance `api`, and you want it in your browser. `-p` has to be decided at create time and collides with the next instance. `devsandbox port` forwards a port on demand, with nothing published.
 
 ## Try it
 
-With an instance `api` running, from a host terminal (no config needed; runs until Ctrl-C):
-
 ```bash
 devsandbox port api 3000                        # http://localhost:3000
-devsandbox port api 8080:3000                   # host :8080 -> api's :3000
+devsandbox port api 8080:3000                   # host :8080 to api's :3000
 devsandbox port api --service postgres 5432     # a service api uses
 devsandbox port my-server/web 3000              # an instance on another machine
 ```
 
-- `--service`: forward a service's port instead of the instance's.
-- `--address`: the host address to bind (default `127.0.0.1`).
-- `--machine` <Experimental />: a global service on a [machine](/docs/machines) (`--machine my-server --service redis 6379`); the port still opens here.
-
-From the dashboard: `p` on an instance or service, type the port; live forwards are on the **Ports** tab (`3`). The [host daemon](/docs/going-further#the-host-daemon) keeps them, on the same host port, until `d` stops them; `devsandbox port` forwards only while it runs. To forward a port whenever the instance runs, add [`forwardPorts`](/docs/config#implemented-devcontainer-properties) `= [3000]` to the sandbox.
+`devsandbox port` forwards until Ctrl-C. In the dashboard, `p` adds a forward that the host daemon keeps until you stop it. [`forwardPorts`](/docs/config#implemented-devcontainer-properties) `= [3000]` forwards a port whenever the instance runs.
 
 ## How it works
 
-- Each connection is tunnelled through the in-container helper, so a server on the container's `127.0.0.1` is reachable and nothing is published.
-- `--service` goes through a running instance that uses the service ([services](/docs/config#services-servicesname)).
-- A bare port taken on the host falls back to the next free one; the printed line says which.
-- A `localhost` URL a sandbox opens gets its own `(open)` forward before your browser opens it, stopped after 10 minutes unused.
-- On a machine <Experimental />, the tunnel rides the machine's link, reconnecting if it drops; its own `forwardPorts` aren't copied here.
+- Connections go through the in-container helper, so a server on the container's `127.0.0.1` is reachable.
+- A bare port taken on the host falls back to the next free one, and the printed line says which.
 - Unix hosts, TCP only.

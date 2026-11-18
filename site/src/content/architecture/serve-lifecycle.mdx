@@ -73,7 +73,7 @@ export const startLanes = [
 
 export const startSteps = [
   { kind: 'act', at: 'cmd', label: 'connect serve.sock: refused', sub: 'starts at most one daemon per attempt' },
-  { from: 'cmd', to: 'serve', label: 'spawn: setsid, cwd /, stdin /dev/null', sub: 'stdout + stderr appended to serve.log', tone: 'runtime' },
+  { from: 'cmd', to: 'serve', label: 'spawn: setsid, cwd /, stdin /dev/null', sub: 'stdout + stderr to serve.log · no other fd inherited', tone: 'runtime' },
   { kind: 'act', at: 'serve', label: 'lock · bind · poll', sub: 'inherits DEVSANDBOX_RUNTIME, SSH_AUTH_SOCK, DISPLAY' },
   { from: 'cmd', to: 'serve', label: 'hello {version, build, client}', sub: 'polled for up to 5 s' },
   { from: 'serve', to: 'cmd', label: '{protocol: 1}', tone: 'serve' },
@@ -117,9 +117,8 @@ binary replaces it on first contact. Unix only.
 <Sequence title="exec, with no daemon running" lanes={startLanes} steps={startSteps} />
 
 Without a unit the child runs in its own session (`setsid`), out of reach of the terminal's hangup and Ctrl-C.
-With a unit (`serve install`), the start goes through the service manager, and the daemon gets the manager's
-environment plus what `install` captured (`PATH`, the runtime, `XDG_*`; never `SSH_AUTH_SOCK`, which clients
-report per request).
+Every fd above stdio is marked close-on-exec first, so a pipeline whose command starts the daemon still ends. With
+a unit (`serve install`), the start goes through the service manager, with the environment `install` captured.
 
 ## Who talks to the daemon
 
@@ -127,18 +126,14 @@ report per request).
 |---|---|---|---|
 | dashboard | `connect` at launch, reconnect with backoff, `instances.watch`; plus a procs connection and one per verb request | yes (not the procs one) | while open |
 | `run`, `start`, `rebuild`, `stop`, `rm`, `service rebuild` | a verb request: the daemon runs it as a `devsandbox --in-process` subprocess and streams it back | yes (none reachable: runs in the CLI) | until the answer (`-d`: until registered); the verb holds it until it exits |
-| `run`'s, `start`'s, `rebuild`'s lifecycle commands | `bridges.ensure` with `wait: 12` | yes | for the chain |
 | `exec` | `bridges.ensure` on a thread, no wait | yes | while the command runs |
 | a TTY `exec`, a dashboard terminal | `instances.attach`, hello as `0.0.0` (where the instance's opened URLs go) | no | no (attach-only) |
 | a dispatcher's child op | the daemon itself, over its own socket: `connect_running`, then `bridges.ensure`, waited | no (a draining daemon must not start another) | for the op |
 | `api --stdio` | byte relay to `serve.sock` | yes | while it runs |
 | `inbox` mutations | `connect_running`, else the same op locally | no | for the call |
-| `serve install` | `connect_running`, then `shutdown` | no | no |
 | `devsandbox port` | none: forwards in its own process | no | no |
-| `machine …`, a command naming a machine's instance or given `--machine` | `connect`, then `machines.*` / `instances.resolve`; a remote match runs as API calls and `PTY` dials over the machine's link (a TTY `exec` re-dials into the same session after a dropped link) | yes | for the lookup |
-| another host's daemon (a machine link) | one `ssh … devsandbox fleet-link --peer <host>` per machine pair, each stream a `link.attach {channel}` connection, hello as `0.0.0` (never a handoff) | yes, `links.inbound` | for the link's life; `machine add`'s probe is `api --stdio --sentinel` once |
-
-The `bridges.ensure` rows only happen for relay-mode instances when the caller's shell has a live ssh-agent.
+| `machine …`, a command naming a machine's instance | `connect`, then API calls and `PTY` dials over the machine's link | yes | for the lookup |
+| another host's daemon | one `ssh … devsandbox fleet-link --peer <host>` per machine pair, hello as `0.0.0` (never a handoff) | yes, `links.inbound` | for the link's life |
 
 ## Handoff
 
@@ -147,16 +142,14 @@ counts) makes the old one step aside:
 
 <Sequence title="A newer build taking over" lanes={handoffLanes} steps={handoffSteps} />
 
-With a unit installed, the client rewrites it from its own binary and environment and restarts it, so the managed
-daemon follows upgrades; a plain start only repairs a unit whose binary is gone. A fleet member that installed the
-authority's pinned build sends a forced `hello`, which hands off whatever the versions.
+With a unit installed, the client rewrites it from its own binary and restarts it, so the managed daemon follows
+upgrades. A fleet member that installed the authority's pinned build sends a forced `hello`, which hands off
+whatever the versions.
 
 ## Exit
 
-Idle, handoff and `shutdown` share one path: listener first (a successor waits for the lock instead of seeing a
-live daemon), `closing`, the 5 s drain, the machine links (a remote verb not sent `detach` is cancelled there), the
-bridges, the forwards, the lock last. `serve uninstall` is the exception: the manager signals the daemon, so
-clients see the socket drop with no `closing`.
+Idle, handoff and `shutdown` share one path. The listener goes first, so a successor waits for the lock instead of
+seeing a live daemon. Then `closing`, the 5 s drain, the machine links, the bridges, the forwards, and the lock last.
 
 Design notes: `docs/architecture/daemon/role.md`, `docs/architecture/daemon/verbs.md`,
 `docs/architecture/daemon/client-server.md`, `docs/architecture/daemon/machines.md`, `docs/reference/api.md`,

@@ -1,5 +1,18 @@
 ---
-import { ArrowRight, ArrowUpRight, Boxes, Check, Copy, KeyRound, Layers, Puzzle } from '@lucide/astro';
+import {
+  ArrowRight,
+  ArrowUpRight,
+  Boxes,
+  Check,
+  Copy,
+  Cpu,
+  Globe,
+  KeyRound,
+  Layers,
+  Puzzle,
+  Server,
+  SquareTerminal,
+} from '@lucide/astro';
 import HowItWorks from '../components/HowItWorks.astro';
 import Base from '../layouts/Base.astro';
 import { REPO_URL } from '../lib/nav';
@@ -8,7 +21,8 @@ import '../styles/home.css';
 import '../styles/how-it-works.css';
 
 // High level to low level: what one sandbox is, then many, then what stays
-// on your side, then what it builds on. Few words; the docs say the rest.
+// on your side, then what it builds on; the second row is where it reaches
+// beyond one host. Few words; the docs say the rest.
 const benefits = [
   {
     icon: Layers,
@@ -37,6 +51,34 @@ const benefits = [
     text: 'devcontainer images and Features: reuse what the community already wrote.',
     href: '/examples/port-a-devcontainer',
     link: 'Port a devcontainer.json',
+  },
+  {
+    icon: Server,
+    title: 'Runs on your server',
+    text: 'A signed config every machine runs, so a server keeps working while your laptop sleeps.',
+    href: '/docs/machines',
+    link: 'Other machines',
+  },
+  {
+    icon: Globe,
+    title: 'Links open on your desktop',
+    text: 'Logins and dev servers open in your own browser, in the profile you picked.',
+    href: '/docs/going-further#links-open-on-your-desktop',
+    link: 'Links and profiles',
+  },
+  {
+    icon: Cpu,
+    title: 'GPUs when you need them',
+    text: 'One line gives a sandbox the GPU, placed on a machine that lends one.',
+    href: '/docs/going-further#gpus',
+    link: 'GPUs',
+  },
+  {
+    icon: SquareTerminal,
+    title: 'Shells that survive',
+    text: 'Close the terminal or lose the connection, then attach again from the CLI or the dashboard.',
+    href: '/docs/going-further#sessions',
+    link: 'Sessions',
   },
 ];
 

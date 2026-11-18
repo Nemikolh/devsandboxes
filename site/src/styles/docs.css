@@ -223,7 +223,7 @@
   font-weight: 700;
 }
 
-.prose a:not(.resource-link, .heading-anchor, .next-page) {
+.prose a:not(.heading-anchor, .next-page) {
   color: var(--lime-soft);
   text-decoration: underline;
   text-decoration-color: #4f6b45;
@@ -233,7 +233,7 @@
     text-decoration-color 0.2s;
 }
 
-.prose a:not(.resource-link, .heading-anchor, .next-page):hover {
+.prose a:not(.heading-anchor, .next-page):hover {
   color: var(--lime);
   text-decoration-color: var(--lime);
 }
