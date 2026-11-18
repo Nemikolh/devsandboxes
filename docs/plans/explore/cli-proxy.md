@@ -11,7 +11,7 @@ service-name alias, with drift warned on and fixed by `services rebuild`
 [services](../../architecture/instances/services.md); the helper's frame
 protocol and its reserved `channel::HTTP_PROXY`, see
 [protocol](../../architecture/helper/protocol.md); and possibly
-[helper-rpc](helper-rpc.md).
+[helper-rpc](../active/helper-rpc.md).
 
 ## Goal
 
@@ -78,9 +78,9 @@ Best-effort by design:
 1. **Own TCP**: `tools:7070` on the shared network, one connection per
    invocation, JSON header `{ tool, args, cwd, env, tty: {cols, rows}? }`
    then length-prefixed `stdin`/`stdout`/`stderr`/`resize`/`signal`/`exit`
-   frames (the [helper-rpc](helper-rpc.md) envelope, if that lands first).
+   frames (the [helper-rpc](../active/helper-rpc.md) envelope, if that lands first).
    AuthZ is network membership; optional shared-secret file later.
-2. **Through devsbd and the host** ([helper-rpc](helper-rpc.md) option 2):
+2. **Through devsbd and the host** ([helper-rpc](../active/helper-rpc.md) option 2):
    no listener in `tools`, authorization per caller instance, policy on the
    host; needs container → host RPC and `serve` running.
 3. **HTTP proxying over the helper** (the reserved `channel::HTTP_PROXY`):

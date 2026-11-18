@@ -1,6 +1,6 @@
 # Fleet: machines as one pool of capacity
 
-Status: in progress. Steps 1-12 shipped
+Status: planned (step 13 on, waiting on the orchestrator interface). Steps 1-12 shipped
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md),
 [0043](../../decisions/0043-every-machine-is-a-fleet-member.md),

@@ -312,9 +312,9 @@ its sandbox at euid 0, so a wrapper starts it at a non-root euid:
   - **said where agents read it:** a short note in
     `skills/devsandbox-cli/SKILL.md` (host agents exec'ing into
     instances), the Claude Code plugin's skill
-    ([claude-code-plugin](../active/claude-code-plugin.md)), and for agents running
+    ([claude-code-plugin](../explore/claude-code-plugin.md)), and for agents running
     inside an instance, the auto-mounted skills
-    ([agents-skills](../active/agents-skills.md), parked). The note: with
+    ([agents-skills](../explore/agents-skills.md), parked). The note: with
     `DEVSANDBOX_BROWSER_SANDBOX=1`, launch Playwright with
     `chromiumSandbox: true`, plus `executablePath: $DEVSANDBOX_CHROME`
     when that's set; never add `--no-sandbox` by hand. Written

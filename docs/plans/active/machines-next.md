@@ -7,7 +7,7 @@ spike (step 7) was agreed and never started, the rest is noted for later.
 A machine's `forwardPorts` are deliberately not mirrored here: forwards
 into a machine are always asked for from this side.
 
-Today: `machine add|ls|set|rm`, the ssh link, the federated snapshot, verbs and
+Today: `machine add|ls|set|upgrade|unlink|rm|control-plane|pending|approve|deny|key [rotate]|trust|roots|allow`, the ssh link, the federated snapshot, verbs and
 quick calls forwarded to a machine, names resolved across machines,
 `ssh -t` exec and terminal tabs, port forwards bound here, and the agent
 relayed to machines with `agent` on

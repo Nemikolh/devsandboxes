@@ -156,9 +156,9 @@ is frozen: no new work on it.
   of a host bind (ownership stops mattering, faster I/O on VM-backed
   runtimes; the host reaches them through `host_git` and the helper).
 - **services**: credential-isolated `gh`/`sentry-cli` through a `tools`
-  service, or HTTP proxying over the helper. → [plan](plans/active/cli-proxy.md)
+  service, or HTTP proxying over the helper. → [plan](plans/explore/cli-proxy.md)
 - **instances**: auto-mount a shared `.agents/skills` folder read-only into
-  every instance. → [plan](plans/active/agents-skills.md)
+  every instance. → [plan](plans/explore/agents-skills.md)
 - **daemon**: `rename`, `profile`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
   (they run in the CLI process; the API has `instances.rename`/`instances.setProfile`/`instances.done`,
   and `gc` is a verb for `--machine m gc`).
