@@ -240,6 +240,12 @@ is frozen: no new work on it.
 
 ### instances
 
+- A terminal's reply to a query a program sends just before it exits (or
+  one the terminal answers slowly) can arrive after `exec` has restored
+  the host tty's echo, and is echoed as `^[[…` text; nothing flushes
+  pending input when `exec` returns (`tcflush(0, TCIFLUSH)`), nor between
+  a reconnecting remote exec's dials. → `commands::exec::exec_status`,
+  `pty_client::dial`
 - The host-overlap check on a new service network reads routes only on
   Linux (macOS: nameservers only), is skipped on Apple `container`, and
   never re-checks a network that already exists, e.g. one created before
