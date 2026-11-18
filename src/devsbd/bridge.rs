@@ -1100,6 +1100,45 @@ fn timed_out(b: &Board, ticket: u64, waited: Duration) -> Readiness {
     }
 }
 
+/// The last `serve.log` reason per key, so a failure that repeats while it
+/// lasts (a dead bridge retried every [`RETRY`], a record resent until the
+/// store takes it) is one line per distinct reason, not one per attempt.
+#[derive(Default)]
+struct Dedupe(Mutex<HashMap<String, String>>);
+
+impl Dedupe {
+    /// Whether `why` differs from the last reason logged for `key`; it
+    /// becomes the last either way.
+    fn fresh(&self, key: &str, why: &str) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if last.get(key).is_some_and(|w| w == why) {
+            return false;
+        }
+        last.insert(key.to_string(), why.to_string());
+        true
+    }
+
+    /// `key` recovered: whether a failure had been logged for it.
+    fn clear(&self, key: &str) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(key).is_some()
+    }
+
+    fn retain(&self, keep: &[String]) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| keep.contains(k));
+    }
+}
+
+/// The `serve.log` line for a daemon bridge of `container` turning `status`,
+/// if any: a failure whose reason is new, or the first `Ready` after a logged
+/// failure.
+fn status_line(logged: &Dedupe, container: &str, status: &BridgeStatus) -> Option<String> {
+    match status {
+        BridgeStatus::Pending => None,
+        BridgeStatus::Ready => logged.clear(container).then(|| format!("bridge {container}: ready")),
+        BridgeStatus::Failed(why) => logged.fresh(container, why).then(|| format!("bridge {container}: {why}")),
+    }
+}
+
 /// The daemon's set of bridges (`devsandbox serve`), reconciled against the
 /// running instances on each poll. Owned by a worker thread (`spawn_worker`).
 #[derive(Default)]
@@ -1110,6 +1149,11 @@ pub struct Bridges {
     sink: Option<Sink>,
     // Every live bridge's status, for `bridges.ensure` waits.
     board: BridgeBoard,
+    // The daemon's `serve.log`; `None` (tests, no sink) logs nothing.
+    log: Option<fn(&str)>,
+    logged: Arc<Dedupe>,
+    // The last `State::load` error logged, until a load succeeds.
+    state_error: Option<String>,
 }
 
 impl Bridges {
@@ -1134,7 +1178,20 @@ impl Bridges {
             self.board.retain(&[]);
             return;
         }
-        let Ok(state) = State::load() else { return };
+        let state = match State::load() {
+            Ok(state) => {
+                self.state_error = None;
+                state
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                if let Some(log) = self.log.filter(|_| self.state_error.as_ref() != Some(&why)) {
+                    log(&format!("bridges: cannot read state.toml, no bridge changes: {why}"));
+                }
+                self.state_error = Some(why);
+                return;
+            }
+        };
         let mut keep = Vec::new();
         for (key, info) in &state.instances {
             if !running.contains(&info.container.as_str()) {
@@ -1163,20 +1220,44 @@ impl Bridges {
                     // bridge's retry gap instead of re-running every snapshot.
                     _ => info,
                 };
-                let observe = self.board.spawning(&info.container);
+                let observe = self.observe(&info.container);
                 match spawn_managed(key, info, with_agent, self.sink.as_ref(), observe) {
                     Some(b) => {
                         self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
                     }
-                    None => self.board.set(
-                        &info.container,
-                        BridgeStatus::Failed(format!("cannot run `{} exec` for the bridge", backend().bin())),
-                    ),
+                    None => {
+                        let failed =
+                            BridgeStatus::Failed(format!("cannot run `{} exec` for the bridge", backend().bin()));
+                        self.log_status(&info.container, &failed);
+                        self.board.set(&info.container, failed);
+                    }
                 }
             }
         }
         self.live.retain(|c, _| keep.contains(c));
         self.board.retain(&keep);
+        self.logged.retain(&keep);
+    }
+
+    /// The board's observer for a fresh bridge of `container`, also logging
+    /// its status changes ([`status_line`]).
+    fn observe(&self, container: &str) -> Observer {
+        let Observer { on_status, on_link } = self.board.spawning(container);
+        let Some(log) = self.log else { return Observer { on_status, on_link } };
+        let (logged, name) = (Arc::clone(&self.logged), container.to_string());
+        let on_status = Box::new(move |status: BridgeStatus| {
+            if let Some(line) = status_line(&logged, &name, &status) {
+                log(&line);
+            }
+            on_status(status);
+        });
+        Observer { on_status, on_link }
+    }
+
+    fn log_status(&self, container: &str, status: &BridgeStatus) {
+        if let (Some(log), Some(line)) = (self.log, status_line(&self.logged, container, status)) {
+            log(&line);
+        }
     }
 
     /// Move a `Bridges` onto its own thread, fed running-container lists (plus
@@ -1199,10 +1280,11 @@ impl Bridges {
     /// `board` gets every bridge's status and, after each reconcile, the
     /// newest ticket it covered (the `urgent` pairs' second half).
     pub fn spawn_worker(sink: Option<SinkHooks>, board: BridgeBoard) -> BridgeWorker {
+        let log = sink.as_ref().map(|hooks| hooks.log);
         let sink = sink.map(|hooks| self::sink(apply_message, hooks));
         let (tx, rx) = mpsc::channel::<(Vec<String>, Vec<(String, u64)>)>();
         let handle = std::thread::spawn(move || {
-            let mut bridges = Bridges { sink, board, ..Bridges::default() };
+            let mut bridges = Bridges { sink, board, log, ..Bridges::default() };
             // Block for the next list, then coalesce: drain everything already
             // queued and reconcile only against the newest list (with every
             // urgent container queued meanwhile), so a burst of snapshots
@@ -1274,6 +1356,7 @@ fn sink(apply: Apply, hooks: SinkHooks) -> Sink {
     let SinkHooks { on_shown, opener, on_open_done, log } = hooks;
     // One limiter of each for every bridge, keyed by instance inside.
     let popups = Mutex::new(RateLimit::default());
+    let unstored = Dedupe::default();
     let opens = Mutex::new(RateLimit::new(crate::open::OPEN_RATE_BURST, crate::open::OPEN_RATE_REFILL));
     Arc::new(move |n: Notification| {
         if let notify::Message::Open { at, url } = &n.message {
@@ -1294,7 +1377,20 @@ fn sink(apply: Apply, hooks: SinkHooks) -> Sink {
             }
             return Ok(());
         }
-        let shown = apply(n)?;
+        let instance = n.instance.clone();
+        let shown = match apply(n) {
+            Ok(shown) => {
+                unstored.clear(&instance);
+                shown
+            }
+            Err(e) => {
+                if unstored.fresh(&instance, &e) {
+                    let why = crate::open::printable(&e);
+                    log(&format!("{instance}: notification not stored (the helper keeps it and resends): {why}"));
+                }
+                return Err(e);
+            }
+        };
         let Some((instance, shown)) = shown else { return Ok(()) };
         if let Some(popup) = shown.popup {
             let allowed = popups
@@ -1885,6 +1981,70 @@ mod tests {
         });
         send(7, note.clone());
         assert_eq!(*APPLIED.lock().unwrap(), vec![note]);
+    }
+
+    /// A record the store won't take is one log line per distinct error
+    /// while the helper resends it, and a success resets that.
+    #[test]
+    fn a_failing_store_is_logged_once_per_reason() {
+        static FAIL: Mutex<Option<String>> = Mutex::new(None);
+        static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn apply(_: Notification) -> Result<Option<(String, crate::inbox::Shown)>, String> {
+            FAIL.lock().unwrap().clone().map_or(Ok(None), Err)
+        }
+        let hooks = SinkHooks {
+            on_shown: None,
+            opener: Arc::new(|_: &str, _: &str, _: &str| {}),
+            on_open_done: None,
+            log: |line| LOGGED.lock().unwrap().push(line.to_string()),
+        };
+        let sink = sink(apply, hooks);
+        let note = || Notification {
+            instance: "web-1".into(),
+            instance_id: "web-1-id".into(),
+            message: notify::Message::Notify(notify::Record {
+                level: notify::Level::Info,
+                key: None,
+                link: None,
+                msg: "m".into(),
+                at: 1,
+            }),
+        };
+        *FAIL.lock().unwrap() = Some("disk full".into());
+        assert!(sink(note()).is_err());
+        assert!(sink(note()).is_err());
+        *FAIL.lock().unwrap() = Some("locked\nout".into());
+        assert!(sink(note()).is_err());
+        *FAIL.lock().unwrap() = None;
+        assert!(sink(note()).is_ok());
+        *FAIL.lock().unwrap() = Some("disk full".into());
+        assert!(sink(note()).is_err());
+        let logged = LOGGED.lock().unwrap().clone();
+        let why = "web-1: notification not stored (the helper keeps it and resends): ";
+        assert_eq!(
+            logged,
+            vec![format!("{why}disk full"), format!("{why}{}", crate::open::printable("locked\nout")), format!("{why}disk full")]
+        );
+    }
+
+    /// A bridge failing on the same reason at every retry is logged once; a
+    /// new reason is logged, and so is the first recovery after a failure.
+    #[test]
+    fn bridge_status_lines_skip_repeats() {
+        let logged = Dedupe::default();
+        let failed = |why: &str| BridgeStatus::Failed(why.into());
+        let line = |s: &BridgeStatus| status_line(&logged, "c", s);
+        assert_eq!(line(&BridgeStatus::Ready), None, "no failure logged yet");
+        assert_eq!(line(&BridgeStatus::Pending), None);
+        assert_eq!(line(&failed("no daemon")).as_deref(), Some("bridge c: no daemon"));
+        assert_eq!(line(&BridgeStatus::Pending), None);
+        assert_eq!(line(&failed("no daemon")), None);
+        assert_eq!(line(&failed("timed out")).as_deref(), Some("bridge c: timed out"));
+        assert_eq!(line(&BridgeStatus::Ready).as_deref(), Some("bridge c: ready"));
+        assert_eq!(line(&BridgeStatus::Ready), None);
+        assert_eq!(line(&failed("timed out")).as_deref(), Some("bridge c: timed out"), "a new failure");
+        logged.retain(&[]);
+        assert_eq!(line(&BridgeStatus::Ready), None, "a gone container's failure is forgotten");
     }
 
     /// `apply_message` refuses an `open` record outright (the sink never

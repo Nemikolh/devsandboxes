@@ -51,6 +51,13 @@ whose instance `wanted` one, and drops the rest (dropping a `Bridge` kills its
   is respawned at once.
 - Runtime unreachable: the last list stands; bridges aren't torn down on a
   blip.
+- `serve.log` (`Bridges::observe`, `status_line`): a bridge failure is
+  `bridge <container>: <why>` (handshake error or timeout, `cannot run
+  `<runtime> exec``, the bridge ended), once per distinct reason while it
+  keeps failing (`Dedupe`), and the first `Ready` after one is `bridge
+  <container>: ready`. A `state.toml` that won't load leaves the bridges
+  as they are, one line per distinct error (`bridges: cannot read
+  state.toml, no bridge changes: <why>`).
 
 ### `bridges.ensure`
 
@@ -119,7 +126,10 @@ The sink (`bridge::sink`, built by `Bridges::spawn_worker` from its
 any other record to the shared Inbox store
 (`inbox::decide` → `inbox::ops::sink`); thread records are first checked with
 `dispatch::declares_inbox` (the sandbox must declare `inbox = true`). A store
-write that changed nothing shows nothing. Otherwise:
+write that changed nothing shows nothing. A write that fails is a
+`serve.log` line (`<instance>: notification not stored (the helper keeps
+it and resends): <why>`), once per distinct error per instance until one
+is stored, since the helper resends the record. Otherwise:
 
 - a desktop popup through `desktop::notify_desktop` (`notify-send` on Linux,
   `osascript` on macOS, silent if missing), rate-limited per instance
