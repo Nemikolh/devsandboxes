@@ -328,8 +328,9 @@ enum Command {
         #[arg(help = NAME_HELP)]
         name: String,
         /// Command and arguments to run; omitted: a login shell (zsh, bash,
-        /// or sh), with `-i`, plus `-t` when stdin is a TTY, unless either
-        /// flag is given
+        /// or sh), with `-i`, plus `-t` when stdin is a TTY. Given from a
+        /// terminal (stdin and stdout), it gets `-i -t` too. Either flag
+        /// overrides both defaults
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -583,8 +584,7 @@ enum MachineCommand {
     /// those it has instances in (its picked roots)
     ///
     /// Under `worker` trust, other machines reach only this host's own
-    /// roots: those its instances are in, plus these. `machine add` records
-    /// the roots it picks on the machine this way. Without a subcommand,
+    /// roots: those its instances are in, plus these. Without a subcommand,
     /// lists the picked roots.
     ///
     ///     devsandbox machine roots add ~/sandboxes

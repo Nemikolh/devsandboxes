@@ -1,8 +1,8 @@
 # Control plane: Kubernetes terms, and an authority that isn't a single point of failure
 
 Status: planned. Step 1 (hub → control plane,
-[ADR 0051](../../decisions/0051-fleet-terms-follow-kubernetes.md)) is in
-progress; the rest is design.
+[ADR 0051](../../decisions/0051-fleet-terms-follow-kubernetes.md)) has
+shipped; the rest is design.
 
 The fleet's roles map onto Kubernetes' ([kubernetes](../../reference/kubernetes.md)):
 the control plane federates and places; the authority is the cluster CA's
