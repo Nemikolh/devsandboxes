@@ -2,57 +2,161 @@
 
 ## Unreleased
 
-A config can now belong to the whole fleet and keep running on an always-on server while the host it was written on is offline; links opened in a sandbox open on your desktop, in the browser of the instance's profile.
-
-### Changed
-
-- **The fleet's hub is now its control plane**, the Kubernetes name for the role: `control_plane = "self" | "<name>"` in `member.toml`, `devsandbox machine control-plane <m>` to move it, `machine add --control-plane` to pick it for a new fleet, and `control_plane` in the API and `index.d.ts`. Make an existing fleet again with `machine add`.
-
-### Fixed
-
-- **The dashboard shows a fleet config's sandboxes once.** With machines, every sandbox showed again per machine (`web`, then `box/web`) even when they all ran the same signed config. The Instances tree now groups by config root: a signed config's sandbox is one group with every host's instances under it, and a root that isn't signed stays its host's, as do two roots defining the same name.
-- **`devsandbox exec web zidane` from a terminal gets a terminal.** A command given to `exec` ran without `-i`/`-t` unless you passed them, so a TUI drew at 80x24, saw no input or mouse and left its terminal replies on screen. With neither flag, a command run from a terminal (stdin and stdout) now gets `-i -t`, and so a resumable session, like the shell does; redirected or piped stdio stays plain.
-- **Service networks no longer break DNS on rootless docker.** Rootless docker can't see the host's routes, so once its `172.x` pools ran out it could give a service network the LAN's range (say `192.168.0.0/20` on a `192.168.1.x` LAN), and from then on no container could reach the router or its DNS. A new service network that covers a host route, gateway or nameserver is now recreated on a free `/24` of `10.200.0.0/16`, with a warning. To clear an existing bad one, run `devsandbox gc`, or `docker network rm` it if a container still uses it.
-- **A sandbox with `caches`, `persist-shell-history`, `${sharedVolumes}` mounts or `worktree-link` can be placed.** None of them keeps a sandbox home with `run --place` any more, and a worker always accepts them (`allow.caches`, `allow.shared-volumes` and `allow.worktree-link` are gone from `member.toml`). The placed instance gets the worker's own, empty the first time, shared volumes, caches and shell history, so what you keep in shared volumes at home (a `gh` login, say) doesn't follow it. On a worker `worktree-link` and `worktree-include` are skipped with a warning: gitignored files (a `.env`) stay home.
-- **`devsandbox gc` removes unused service networks on docker.** It never matched any on docker before, so leaked networks piled up and used up docker's address pools. A network a stopped instance still uses is kept.
+A config can now belong to the whole fleet and keep running on an always-on server while the host it was written on is off. Links a sandbox opens land in your desktop browser, picked per profile. Sandboxes and services get NVIDIA GPUs from `hostRequirements.gpu`, and placement sends them to a machine that lends one. Members run the build the fleet's authority pins.
 
 ### Added
 
-- **GPUs.** `hostRequirements.gpu = true` on a sandbox gives its container every NVIDIA GPU: docker's `--gpus all` when the `nvidia` runtime is registered, else the NVIDIA CDI spec (`--device nvidia.com/gpu=all`, docker or podman). When none is usable, `run` and `rebuild` stop before building anything and say why; `hostRequirements.gpu = "optional"` warns and runs without one instead. Services take the same key under `[services.*]`: a service that requires a GPU it can't get fails the run. A fleet worker lends its GPUs only with `gpus = true` under `[allow]` in its `member.toml`. `run --place` puts a sandbox that requires a GPU only on a machine that has one and lends it (`gpus = true` under `[allow]`, or full trust). A `run --place` of a sandbox with an optional GPU prefers a machine that lends one.
-- **`devsandbox machine allow` sets what placed work may ask of this host**, instead of editing `[allow]` in `member.toml` by hand: `machine allow --gpus on --bind-add ~/datasets` (one `--<allowance> on|off` per allowance, `--bind-add|--bind-rm`, `--local-env-add|--local-env-rm`); without flags it lists them. Only this host sets its own: no other machine can, whatever its trust. The API's `member.set` takes the same changes as `allow`, and `member.get` shows them. `member.toml` is rewritten on a change, so comments in it don't survive. `devsandbox machine add` sets them on the machine it adds, over your ssh session to it: on a terminal it shows what the machine lends and asks which to add (empty adds none), or takes `--allow gpus,host-network`, `--allow-bind /srv/data` and `--allow-local-env NAME` without asking (for scripts and GUIs); off a terminal without them nothing changes. The API's `machines.add` takes the same `allow`, and `machines.probe` shows the machine's.
-- **A laptop can drive a server.** `devsandbox machine add juchu --control-plane` on the fleet's authority now signs its configs (`~/.devsandboxes` and the roots `machine roots add` picked) as part of the add, so juchu has them from its first link-up. A laptop joining with `devsandbox machine add juchu` gets its join proposed to the authority (`approve there with devsandbox machine approve <id>`) instead of staying capped. A `run juchu/<sandbox>` typed on the authority brings the sandbox's repos from its own checkouts into juchu's copy, uncommitted work included, then later runs bring new commits; a checkout you cloned there yourself is left alone. Run from another host with the repo missing, it says what's missing and where. A laptop with no docker is a clean driver: no runtime errors in the dashboard (the header says `no runtime`), nothing is placed on it, and a bare `run <sandbox>` goes to the machine that can run it. `machine add` no longer asks for config roots (`--config` is gone): a machine's roots are what its own daemon lists (its configs, its `machine roots add` ones, its signed copies), and a command on a machine with no root given uses its signed copy, else its `~/.devsandboxes`.
-- **A config every machine runs.** A config can now belong to your whole fleet instead of the host it was written on, so an always-on server keeps running its sandboxes while that host is off for days. On the fleet's authority (the host that ran the fleet's first `machine add`), a `run`, `rebuild` or `start` you type signs the config's next version whenever it changed. The signed version covers the config's structure (comments and formatting don't count) and the files under the root it references (dockerfiles and build contexts, `${configDir}` mounts, local features), not notes or logs next to it. The verb then sends it to every machine it links to, which installs its own copy under `~/.local/share/devsandbox/mesh/tree/<name>/` before answering. The verb's output says so, or names a machine it didn't reach or that couldn't install it, and why; running `run`, `rebuild` or `start` on the root again re-sends it to those machines only, and an unchanged root that every machine has sends nothing. Every machine keeps the latest signed version while the authority is offline, never an older one, and builds only from a copy that is exactly that version. A copy edited in place, or with files added to a build context, is refused, from the CLI, the daemon, a dispatcher or autostart alike; the daemon then restores it from the signed version the machine stored (on that refusal, and at every link-up), with no new signature needed. Copies show up among a machine's roots on their own, so from a laptop:
+- **A config every machine runs.** On the fleet's authority (the host of its first `machine add`), a `run`, `rebuild` or `start` signs the config's next version when it changed and sends it to every machine, which installs its own copy. Machines keep the latest signed version while the authority is offline and build only from an exact copy of it, so a copy edited in place is refused and restored. The verb's output names any machine that didn't get it, and running the verb again retries those. A `run box/<sandbox>` from the authority also brings the sandbox's repos to `box`, uncommitted work included.
 
   ```bash
-  devsandbox machine add box --control-plane   # on the authority
-  devsandbox run web                    # on the authority: signs and sends to box
-  devsandbox run box/web                # on the laptop, even with the authority offline
+  devsandbox machine add box --control-plane   # on the authority, signs its configs for box
+  devsandbox run web                           # on the authority, signs a changed config and sends it
+  devsandbox run box/web                       # from the laptop, even with the authority off
   ```
 
-  The setup steps (repos to clone next to the copy, what isn't sent) are in the host daemon docs. The authority's signature is the consent: a signed config runs on a `worker` member without its worker policy.
+- **A laptop can drive a server.** A laptop joining with `devsandbox machine add box` gets its join proposed to the authority, which approves it with `devsandbox machine approve <id>`. A host with no container runtime is a clean driver. The dashboard says `no runtime`, nothing is placed on it, and a bare `run <sandbox>` goes to the machine that runs it.
+- **Links opened in a sandbox open on your desktop.** `xdg-open`, `$BROWSER`, `webbrowser`, Node's `open` and CLI logins open `http(s)` URLs in the host's browser. A `localhost` URL or OAuth callback gets a port forward first (marked `(open)` in the Ports tab, stopped after 10 minutes idle), so dev servers and `gh auth login` work. A link opens on the host that last attached to the instance with a terminal, so a server sandbox you `exec` into from your laptop opens on the laptop. The dashboard's status line says what happened to each link, and `devsbd open <url>` does the same from scripts.
+- **Profiles** pick that browser. Declare them in the config, list the ones a sandbox allows, choose one at `run` and switch it any time without a restart. Each host maps profiles to browsers in its own `profiles.toml` next to `state.toml`. `ps`, `inspect` and the dashboard show an instance's profile and flag one its sandbox no longer allows.
 
-- **A warning when a nested docker can't work from a shell.** On rootless docker with runc older than 1.4.1, processes started with `exec` (shells, VS Code, agents, lifecycle hooks) end up outside the container's cgroup, so a docker-in-docker `dockerd` restarted from one of them fails every `docker run` with `cgroup.procs: no such file or directory`. `run`, `start` and `inspect` now detect this and say so. The fix is upgrading the host's runc; until then, restart the container so its entrypoint starts `dockerd`.
+  ```toml
+  [profiles.work]
+  [profiles.personal]
 
-- **Links opened in a sandbox open on your desktop.** A program in a sandbox that opens a URL (`xdg-open`, `$BROWSER`, `sensible-browser`, Python's `webbrowser`, Node's `open`, a CLI's "press enter to open the browser") now opens it in the host's browser instead of failing. Only `http` and `https` URLs open; anything else, a URL with raw spaces or control characters, a URL more than 30 seconds old by the time it reaches the host, or more than 5 in 10 seconds from one instance is refused with a line in `serve.log`. A URL pointing at the sandbox's own localhost (a dev server on `http://localhost:3000`) gets a port forward on the host first, and opens on another port if that one is taken (never one saved for a configured `forwardPorts` forward); if it can't be forwarded at all it isn't opened, so the browser never hits whatever the host runs on that port. An OAuth login's localhost callback (`redirect_uri=http://localhost:8085/…`) gets a forward on exactly that port, so `gh auth login`-style logins complete. These forwards show in the dashboard's Ports tab marked `(open)` and stop after 10 minutes without a connection or when the instance stops. Opening files (`xdg-open report.pdf`) isn't supported. A link opens on the machine you last attached to the sandbox from with a terminal (a script's non-tty `exec` doesn't count): `exec` into a sandbox on your server from your laptop, and its links open on the laptop, in the browser the laptop's own `profiles.toml` picks for the sandbox's profile (only the profile's name travels, so no machine can make another run a command). The laptop only takes links for sandboxes it attached to in the last 10 minutes (after that, they open on the server again), and a link that can't reach it is logged on the server rather than opened there. Localhost URLs and OAuth callbacks from a sandbox on another machine forward to the machine that opens them, over its link, and stop after 10 minutes without a connection or when that machine is removed. The opening machine needs a desktop session. The dashboard's status line says what happened to each link: opened (and in which profile), refused, or failed, with why. An image's own `/usr/local/bin/xdg-open` is never overwritten; `devsbd open <url>` does the same from scripts. Existing instances get `BROWSER` once rebuilt.
+  [sandbox.web]
+  folder = "../web"
+  image = "node:22"
+  profiles = ["work", "personal"]
+  ```
 
-- **Profiles.** Declare named profiles with `[profiles.<name>]` and list the ones a sandbox's instances may be in with `profiles = [...]` on the sandbox or a template it extends (absent: every declared profile). Each instance is in one, chosen at `run` with `--profile <p>`; without it, the profile last chosen for that sandbox if still allowed, else the first allowed. A dispatcher's children get its profile, and a child whose sandbox doesn't allow it is refused. `ps`, `inspect`, the dashboard and `instances.list` show an instance's profile, and flag one its sandbox no longer allows. Switch it any time with `devsandbox profile <instance> <profile>` (without a profile it shows the current one and the allowed set), or in the dashboard with `P` (straight to the other one when two are allowed, a picker when more) or `:profile <instance> <profile>`; nothing restarts. A profile chooses the browser a URL from that instance opens in, per host, in `profiles.toml` next to `state.toml`; an instance with no profile, or one the file doesn't map, uses the system opener, and so does one whose sandbox no longer allows its profile, with a warning in `serve.log`.
+  ```toml
+  # ~/.local/share/devsandbox/profiles.toml
+  [work]
+  open = ["google-chrome", "--profile-directory=Profile 2"]
+  ```
 
-```toml
-[profiles.work]
-[profiles.personal]
+  ```bash
+  devsandbox run web --profile personal
+  devsandbox profile web work       # or P / :profile in the dashboard
+  ```
 
-[template.work]
-profiles = ["work"]
-```
+- **GPUs.** `hostRequirements.gpu = true` on a sandbox or a service gives its container every NVIDIA GPU (docker's `--gpus all` with the `nvidia` runtime, else the CDI spec on docker or podman). When none is usable, `run` stops before building, and `"optional"` warns and runs without. `run --place` puts a sandbox that requires a GPU only on a machine that lends one, and prefers one for an optional GPU.
 
-```toml
-# profiles.toml (per host)
-[work]
-open = ["google-chrome", "--profile-directory=Profile 2"]
-```
+  ```toml
+  [sandbox.ml]
+  folder = "../ml"
+  image = "pytorch/pytorch"
+  hostRequirements.gpu = true
+  ```
+
+- **`devsandbox machine allow`** sets what work placed on this host may use, instead of editing `[allow]` in `member.toml`. Only the host itself can. `machine add` asks the machine what to lend over your ssh session, or takes `--allow`, `--allow-bind` and `--allow-local-env`.
+
+  ```bash
+  devsandbox machine allow --gpus on --bind-add ~/datasets
+  devsandbox machine add box --allow gpus --allow-bind /srv/data
+  ```
+
+- **Members run the build the authority pins.** The authority signs its build into the membership log, and members download that release and check its sha256 before running it (a source build only with `dev-builds = true` in `member.toml` or `full` trust), so a compromised control plane can't push code. `machine ls` shows a machine behind the pin and why. `devsandbox machine upgrade <m>` copies this build over a machine's over ssh, for the control plane the authority no longer follows.
+- **Sessions in the dashboard.** An instance's helper sessions show as rows under it. `a` or `enter` attaches, `K` ends one, and `a` on the instance picks a detached one. `devsandbox exec web --end <id>` ends a session from the CLI. A terminal over a fleet link to an instance with a non-root user is now a session too, so a dropped link no longer ends it.
+- **A warning when a nested docker can't work from a shell.** On rootless docker with runc before 1.4.1, `exec`'d processes land outside the container's cgroup, so a docker-in-docker `dockerd` started from a shell fails. `run`, `start` and `inspect` now say so. Upgrade the host's runc.
+
+### Changed
+
+- **The fleet's hub is now its control plane**, the Kubernetes name for the role. It is `control_plane = "self" | "<name>"` in `member.toml`, `devsandbox machine control-plane <m>` moves it, `machine add --control-plane` picks it for a new fleet, and the API and `index.d.ts` call it `control_plane`.
+- **`machine add` picks no config roots** (`--config` is gone). A machine's roots are the ones its daemon lists, kept live as it installs signed copies. A command on a machine with no root given uses its signed copy, else its `~/.devsandboxes`.
+- **The docs site is much shorter.** Machines moved to `/docs/machines`, the basics are on the quick start, the two services examples are one `/examples/services` page, and the Features and VS Code examples are gone (their content lives in the quick start, the devcontainer port guide and the dashboard tour).
+
+### Fixed
+
+- **Ctrl-D in the dashboard no longer removes an instance.** One-key actions ignored modifiers, so Ctrl-D (a shell habit, or the EOF a closing terminal sends) counted as `d`, and Alt-Y answered a confirm. Letters and symbols now fire bare or with Shift only. Ctrl-C and Ctrl-] keep working, and a focused terminal still gets every Ctrl key.
+- **A pipeline whose command starts the daemon no longer hangs.** The daemon kept any fd the CLI had inherited, so `devsandbox … | cat` could wait forever on a pipe the daemon held. It now starts with only its own stdio.
+- **`devsandbox exec web zidane` from a terminal gets a terminal.** A command given to `exec` ran without `-i -t` unless asked, so a TUI drew at 80x24, saw no input and left its terminal replies on screen. From a terminal it now gets `-i -t` and a resumable session, and piped stdio stays plain.
+- **The dashboard shows a fleet config's sandboxes once**, with every host's instances under one group, instead of again per machine. The instances detail panel grows to fit, so the drift line no longer falls off.
+- **Service networks no longer break DNS on rootless docker.** A new service network covering a host route, gateway or nameserver is recreated on a free `/24` of `10.200.0.0/16`, with a warning. `devsandbox gc` now removes unused service networks on docker too.
+- **Caches, shell history, `${sharedVolumes}` mounts and `worktree-link` no longer keep a sandbox home** under `run --place`. A placed instance starts them empty on the worker, and a "not placed" note lists each tie once.
+- **Upgrading the authority first no longer locks it out** of an older control plane or silently downgrades it.
+- **Attaching without an id takes an attached session too**, and a session's creator sees the program's first output.
+- **A machine's root removed there leaves the dashboard** without a daemon restart, and a root that errors no longer sticks as a permanent error.
 
 <details><summary>Commits</summary>
 
+- ec10147 docs(site): cover sessions, the driver laptop, ctrl chords and gpus, merge the services examples, drop the features and vscode ones and cut the docs by 40%
+- 1d17cda docs(agents): list the profile, rename, vscode, status and fleet-link command files
+- b3929a2 chore(comments): drop machine add's roots claim and history wording from machine.rs
+- 2fc8199 docs(plans): move parked and proposed plans to explore and mark fleet planned, so active holds only agreed work
+- 4026122 docs(cli): list profile, machine allow/control-plane/approve, exec sessions and controlPlane where the reference and cli skill still lacked them
+- ac68b55 fix(serve): start the lazy daemon with every fd above stdio close-on-exec, so a pipeline whose command starts it no longer hangs on a pipe the daemon inherited
+- 2ad5bcc fix(tui): fire one-key actions only bare or with shift, so ctrl-d out of shell habit or a closing pty's eof no longer removes the instance under the cursor
+- 83a6ee8 docs(status): park terminal replies echoed after exec returns, since nothing flushes pending tty input
+- cf69da4 docs(site): cover profiles, links, gpus, lending, control plane and pinned builds, move machines to /docs/machines, and trim docs, examples and architecture to what a reader skims
+- 5f9ad03 docs(machines): a machine verb runs over an api stream on the link, not an ssh of its own
+- 8a44299 docs(cli): exec's help says a command from a terminal gets -i -t, machine roots' help drops add picking roots, and the control-plane plan marks the rename shipped
+- b717513 fix(fleet): list a sandbox's tie once even when repeated apart, and show ${instance} paths as <instance>, so not-placed notes don't repeat or name a literal instance dir
+- aba5e49 docs(status): record the hand-run gpu check on docker cdi and what is still unverified
+- 9ce5bcd docs(gpus): close the gpu plan: adrs for spec-compatible gpus and lent-gpu placement, follow-ups parked
+- c308945 feat(machine): ask at machine add what the target lends, applied over its own ssh session
+- 855d759 feat(machine): set worker allowances with machine allow so a gui can lend gpus without hand-editing member.toml
+- 2c25b8b feat(fleet): let required-gpu sandboxes be placed now that placement filters for a lent gpu
+- 58f8e67 feat(fleet): place gpu sandboxes only where a gpu is lent, preferring them for optional gpus
+- 7663a16 feat(capacity): report a host's usable gpu and whether it lends it, for gpu-aware placement
+- 91aebf5 feat(services): give services gpus from hostRequirements.gpu so a gpu-backed service (ollama) needs no runArgs
+- 7002091 docs(site): list hostRequirements.gpu as implemented in the devcontainer port guide
+- 6951613 feat(run): give sandboxes gpus from hostRequirements.gpu, refusing a required one that can't be had
+- 06bf906 feat(runtime): detect nvidia gpu support per runtime so run can pick --gpus or cdi flags
+- 92354f0 docs(agents): add a simplify-comments skill so future changes keep comments to why and contracts
+- c121bc0 feat(config): type hostRequirements so gpu requests can be acted on per the devcontainer spec
+- 67aa955 chore(comments): drop stylesheet title comments the header block repeats, restore the Drill open prop doc
+- 8335517 chore(comments): drop the site stylesheets' section banners and the last as-ever phrases
+- 815e9f4 docs(gpus): agree the gpu plan: spec-compatible hostRequirements.gpu, refusal when required, placement onto lending workers
+- 8f42200 chore(comments): cut the last as-before history phrases
+- b2eabfa chore(comments): cut stale parser history and doc restatements from long doc blocks
+- 1e81723 chore(comments): restore fixture and field contracts round five flagged
+- b8fc877 chore(comments): drop the last narration and history captions round four found
+- 54e6bc5 chore(comments): restore fixture and contract comments and cut change-history wording
+- 3dc93e7 chore(comments): restore the contracts round two flagged and drop the last restatements
+- e2a0740 chore(comments): bring back the why and contract comments the first pass dropped, and drop the restatements it missed
+- addf8c4 chore(comments): drop comments that restate the code, since they rot and bury the ones that explain why
+- 457292d chore(toolchain): install clippy so agents can run it as a check
+- e4d5939 docs(plans): close resumable-exec
+- 9200a98 fix(exec): attach without an id takes an attached session too
+- 8233ee1 fix(devsbd): a session's creator sees the program's first output
+- 1b8efda feat(fleet): resumable link terminals for a non-root helper
+- b7dcb02 feat(exec): end a session with --end
+- 2daf452 feat(tui): show helper sessions as rows under an instance
+- 781f895 docs(plans): break resumable-exec's remaining work into steps
+- 1fe5add feat(tui): attach to a detached session with a
+- b70711f docs(fleet): record the authority pinning the fleet's build as ADR 0053 and archive its plan, now that every step has landed
+- 62dbd40 feat(machine): show a link behind the pinned build on both ends and why the authority skipped a pin, so a host that can't follow is visible instead of silently diverging
+- c2bbb2a feat(fleet): members follow the authority's pinned build hop by hop and check its sha256 before running it, so a compromised control plane can no longer push arbitrary code and a host that can't follow stays linked
+- da38bf6 feat(fleet): the authority pins its build in the membership log, so members get a signed, persisted reference to follow instead of trusting the control plane's hello
+- 770e9be feat(machine): add machine upgrade, so the authority's new build can reach the control plane without a manual copy now that the authority no longer follows it
+- 1f19141 fix(fleet): the authority follows no one, so upgrading it first no longer locks it out of an older control plane or silently downgrades it
+- 53ba916 chore(ci): run the zidane extensions' bun tests, typechecking alone missed the cargo-timeouts redirection bug
+- c886a06 fix(zidane): keep 2>&1-style redirections whole so the cargo-timeouts block suggests a runnable command
+- 4599dfb chore(zidane): track the agent extensions and typecheck them in ci so they stop drifting from the zidane api
+- 620b405 docs(fleet): agree the authority pins the fleet's build as a log entry by sha256, after review showed a standalone statement could be replayed and a published control plane silently downgrades the authority
+- 9548e21 docs(tui): record grouping by signed config root as a decision and archive its plan, now that both steps landed
+- 92a9895 fix(tui): group the instances tree by config root instead of machine, so a signed config shared by the fleet shows each sandbox once
+- afabdb7 feat(snapshot): tag rows with the signed config root they come from, so hosts running one mesh config can tell its rows apart from a same-named local root
+- 06512bb docs(fleet): explore letting the authority sign the fleet's build, so a newer authority isn't locked out by an older control plane
+- fe9eb5a fix(exec): give a command run from a terminal -i -t (and so a session) when neither flag is given, so a tui like zidane gets its size, input and mouse instead of a pipe
+- 33970ea docs(plans): explore splitting the devsandbox crate, since one crate's single-threaded front-end and codegen dominate build time
+- 692291f fix(tui): grow the instances detail panel to fit its lines, so the drift line no longer falls off below the sessions and profile lines
+- fa5f00d refactor(fleet): hub → control plane; kubernetes map and plans
+- d86eba0 fix(machines): relist a machine's roots when its daemon says they moved, so a root whose last instance was removed there leaves the dashboard without a daemon restart
+- 0688412 docs(machines): close the machine-roots plan, noting that a machine with several roots and no default can't be given one
+- 5a90d15 feat(machines): pick a machine's signed copy, else its ~/.devsandboxes, as the root a command uses when none is given, now listed roots come in sorted order (plan machine-roots step 3)
+- 24dc7f4 refactor(machines): take a machine's roots only from its listing, with its member.toml roots and saved across a hub restart, now nothing records them at add (plan machine-roots step 2)
+- aa15d15 fix(fleet): re-send an unchanged config only to the machines its last push missed, and say a machine wasn't reached apart from one whose install failed, so the authority's everyday verbs no longer wait on every link or misreport down ones
+- 6530ca3 fix(fleet): refuse a peer's build from a root that carries a signed config's name but isn't its copy, and say when a sandbox is in several roots of one machine, so a laptop can't build a stale local config on a member by picking the wrong root
+- e721513 refactor(machines): stop picking and recording roots at machine add, a pre-fleet model: a machine's roots are what its daemon lists (plan machine-roots step 1)
+- 46f46c5 fix(fleet): repair a signed config's copy from its stored bundle when it fails verification and clear what an install's bundled dirs don't list, so one edit or stray file from a sandbox can't block a config until the authority is back
+- bb9d8f7 docs(fleet): close the fleet-driver plan now a laptop can join and drive a server end to end
+- 4d91da7 feat(fleet): treat a host with no container runtime as a driver, so a laptop without docker shows no runtime errors, isn't placed on and doesn't offer copies it can't run (plan fleet-driver step 4)
+- 937ab3f feat(fleet): bring a signed copy's folders from the authority's checkouts on its run, so a sandbox runs on a member without cloning its repos there by hand (plan fleet-driver step 3)
+- e954f59 feat(fleet): let a member take a signed copy's folders from the authority only, and say what's missing when a copy's folder isn't there (plan fleet-driver step 3, member side)
+- 8041e16 feat(machines): sign the authority's configs at machine add, so a new member has them from its first link-up without a verb on the authority first (plan fleet-driver step 2)
+- 1b09465 fix(machines): have the signer propose a joining host's introduction, so a laptop joining the hub reaches the authority for approval instead of staying capped (plan fleet-driver step 1)
+- f2b31f0 docs(changelog): notes for the next release
 - 6c94e8a docs(site): finish the signed-config setup steps with a matching release everywhere, box as hub, serve install, files only commands reach, empty shared volumes and how to retry a machine that missed the config
 - c135e02 fix(machines): skip a machine's listed roots that answer an error and write live roots into the snapshot store under the links lock, so a dead root no longer leaves a permanent error and a new copy's snapshots aren't dropped by a racing reload
 - ecd268c fix(fleet): refuse building from the signed-config store outside a copy and migrating a copy in place, and say the entry check doesn't stop a writer racing the build, so admission claims only what it enforces
