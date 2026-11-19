@@ -62,8 +62,8 @@ messages. Helper binary size is best effort, not a hard limit.
    there.
 3. **Daemon-owned runs**: started, tracked, reported and restarted by the
    daemon. Host death changes who listens, never what runs.
-4. **Enough for [cli-proxy](../explore/cli-proxy.md)**: PTY, resize, signals, stdin,
-   arbitrary streamed I/O and caller identity on the same wire shapes.
+4. **Interactive I/O on the same wire shapes**: PTY, resize, signals, stdin,
+   arbitrary streamed I/O and caller identity.
 
 Non-goals: replacing bootstrap (install, daemon start, the bridge) and the
 local interactive `exec -it` paths (the CLI's and the dashboard's own
@@ -210,9 +210,11 @@ Each ships alone; 1-3 already fix "runs depend on a host exec".
 5. **Restart policy**: `restart`/`max-restarts`/backoff, relaunch of
    `lost` runs at boot, `DEVSBD_RUN_ATTEMPT`, `resume-argv`; surfaced in
    `devsbd exec` flags and the control op.
-6. **`worktrees.sync`**.
-7. **Container → host `RPC`**, only if [cli-proxy](../explore/cli-proxy.md) picks the
-   through-the-host transport or `CONTROL` migrates.
+6. **`worktrees.sync`** (moot if [git-gateway](../explore/git-gateway.md)'s
+   clones replace worktrees).
+7. **Container → host `RPC`**, only if `CONTROL` migrates (the
+   [credential-broker](../explore/credential-broker.md) uses the
+   `HTTP_PROXY` channel instead).
 8. **Sessions over RPC**: `session.attach` / `session.ls` / `session.rm`,
    the daemon connecting to the session's `sock` as a client (the
    supervisor's one-client takeover applies to it like to any other).

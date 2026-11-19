@@ -161,8 +161,7 @@ is frozen: no new work on it.
   → [explore](plans/explore/credential-broker.md); per tool:
   [gh and sentry-cli](plans/explore/github-and-sentry-access.md),
   [git over smart HTTP, clones replacing worktrees](plans/explore/git-gateway.md),
-  [agents](plans/explore/agent-credentials.md). Supersedes the CLI shims
-  of [cli-proxy](plans/explore/cli-proxy.md).
+  [agents](plans/explore/agent-credentials.md).
 - **instances**: auto-mount a shared `.agents/skills` folder read-only into
   every instance. → [plan](plans/explore/agents-skills.md)
 - **daemon**: `rename`, `profile`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
