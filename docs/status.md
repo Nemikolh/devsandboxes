@@ -155,8 +155,14 @@ is frozen: no new work on it.
 - **instances**: repeat-instance worktrees in a container volume instead
   of a host bind (ownership stops mattering, faster I/O on VM-backed
   runtimes; the host reaches them through `host_git` and the helper).
-- **services**: credential-isolated `gh`/`sentry-cli` through a `tools`
-  service, or HTTP proxying over the helper. → [plan](plans/explore/cli-proxy.md)
+- **credentials**: no secret in any sandbox: a broker in `serve` swaps
+  per-instance phantoms for credentials kept at their home member, under
+  per-sandbox policy and permission requests.
+  → [explore](plans/explore/credential-broker.md); per tool:
+  [gh and sentry-cli](plans/explore/github-and-sentry-access.md),
+  [git over smart HTTP, clones replacing worktrees](plans/explore/git-gateway.md),
+  [agents](plans/explore/agent-credentials.md). Supersedes the CLI shims
+  of [cli-proxy](plans/explore/cli-proxy.md).
 - **instances**: auto-mount a shared `.agents/skills` folder read-only into
   every instance. → [plan](plans/explore/agents-skills.md)
 - **daemon**: `rename`, `profile`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
