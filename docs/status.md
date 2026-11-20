@@ -12,10 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **instances**: host-side hardening: host git refuses redirected git
-  dirs, fetches only a trusted origin URL and never runs filter drivers;
-  per-instance bind dirs go with the instance; worktree-include copies
-  never follow symlinks. → [plan](plans/active/host-side-hardening.md)
+Nothing.
 
 ## Planned
 
@@ -295,6 +292,12 @@ is frozen: no new work on it.
   `commondir`, config) in between. Fixed by clones replacing worktrees
   ([git-gateway](plans/explore/git-gateway.md)).
   → [mounts](architecture/instances/mounts-and-state.md#host-git); `run::git::check_repo`
+- Repeat instances and `folders` worktrees bind-mount the base repo's
+  `.git` read-write, so one sandbox can rewrite another's branches and
+  shared config, or plant code (`core.fsmonitor`, a `build.rs`) that runs
+  in another sandbox on the same checkout. Fixed by clones replacing
+  worktrees ([git-gateway](plans/explore/git-gateway.md)).
+  → [worktrees](architecture/instances/worktrees.md); `run::worktree::git_companion_mount`
 - The origin URL is trusted on first use: a repo whose `remote.origin.url`
   a sandbox rewrote before its first host fetch gets the rewritten URL
   pinned.

@@ -1,6 +1,9 @@
+> Archived 2026-11-20. Historical, may be wrong; do not use as a reference.
+> Current: [mounts-and-state.md](../../architecture/instances/mounts-and-state.md#host-git), [ADR 0057](../../decisions/0057-host-git-never-follows-what-a-sandbox-can-write.md)
+
 # Host-side hardening
 
-Status: in progress.
+Status: shipped.
 
 Fixes for bugs the credential plans' review found in today's code (the
 reviews are not in the repo; each bug is restated here with its
