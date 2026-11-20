@@ -381,8 +381,40 @@ pub(super) fn copy_worktree_includes(base: &Path, worktree: &Path, patterns: &[S
             return;
         }
     };
+    copy_include_paths(base, worktree, &paths);
+}
+
+/// Both trees are container-writable, so any directory below them may have
+/// been swapped for a symlink since `worktree_include_paths` listed them: on
+/// unix every component under the roots is opened without following
+/// symlinks ([`nofollow`]), and a file behind one is skipped with a warning.
+/// The roots themselves may sit behind symlinks.
+#[cfg(unix)]
+fn copy_include_paths(base: &Path, worktree: &Path, paths: &[String]) {
+    let roots = nofollow::open_root(base)
+        .with_context(|| format!("cannot open {}", base.display()))
+        .and_then(|b| {
+            let w = nofollow::open_root(worktree).with_context(|| format!("cannot open {}", worktree.display()))?;
+            Ok((b, w))
+        });
+    let (base_fd, wt_fd) = match roots {
+        Ok(fds) => fds,
+        Err(e) => {
+            eprintln!("warning: cannot apply worktree includes: {e:#}");
+            return;
+        }
+    };
     for rel in paths {
-        if let Err(e) = copy_entry(&base.join(&rel), &worktree.join(&rel)) {
+        if let Err(e) = nofollow::copy_entry(&base_fd, &wt_fd, rel) {
+            eprintln!("warning: cannot copy `{rel}` into worktree: {e:#}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn copy_include_paths(base: &Path, worktree: &Path, paths: &[String]) {
+    for rel in paths {
+        if let Err(e) = copy_entry(&base.join(rel), &worktree.join(rel)) {
             eprintln!("warning: cannot copy `{rel}` into worktree: {e:#}");
         }
     }
@@ -456,8 +488,8 @@ fn worktree_include_paths(
         .collect())
 }
 
-/// Copy one file or symlink, never overwriting: an existing destination
-/// (dangling symlinks included) is left alone.
+/// Copy one file, never overwriting: an existing destination is left alone.
+#[cfg(not(unix))]
 fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
     if dst.symlink_metadata().is_ok() {
         return Ok(());
@@ -465,16 +497,183 @@ fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let meta = src.symlink_metadata()?;
-    #[cfg(unix)]
-    if meta.file_type().is_symlink() {
-        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
-        return Ok(());
-    }
-    if meta.is_file() {
+    if src.symlink_metadata()?.is_file() {
         std::fs::copy(src, dst)?;
     }
     Ok(())
+}
+
+/// The include copy over directory fds: every component below a root is
+/// opened `O_NOFOLLOW`, so a symlink planted in either tree is never
+/// followed (it fails the open with `ELOOP`).
+#[cfg(unix)]
+mod nofollow {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use anyhow::{bail, Result};
+
+    pub(super) fn open_root(path: &Path) -> io::Result<OwnedFd> {
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Strict, though they come from git: no absolute path, `.`, `..` or empty
+    /// component. A trailing `/` (git's form for an untracked nested repo) is
+    /// allowed and names a directory, which the copy skips.
+    pub(super) fn components(rel: &str) -> Result<Vec<CString>> {
+        let trimmed = rel.strip_suffix('/').unwrap_or(rel);
+        if trimmed.is_empty() || trimmed.starts_with('/') {
+            bail!("not a relative path");
+        }
+        trimmed
+            .split('/')
+            .map(|c| {
+                if c.is_empty() || c == "." || c == ".." {
+                    bail!("unexpected `{c}` component");
+                }
+                Ok(CString::new(c)?)
+            })
+            .collect()
+    }
+
+    fn openat(dir: RawFd, name: &CString, flags: libc::c_int, mode: libc::mode_t) -> io::Result<OwnedFd> {
+        let fd = unsafe {
+            libc::openat(dir, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode as libc::c_uint)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn open_dir(dir: RawFd, name: &CString) -> io::Result<OwnedFd> {
+        openat(dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+    }
+
+    /// `None` when nothing is there.
+    fn lstatat(dir: RawFd, name: &CString) -> io::Result<Option<libc::stat>> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } < 0 {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(e) };
+        }
+        Ok(Some(st))
+    }
+
+    fn is(st: &libc::stat, kind: libc::mode_t) -> bool {
+        st.st_mode & libc::S_IFMT == kind
+    }
+
+    fn readlinkat(dir: RawFd, name: &CString) -> io::Result<CString> {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let n = n as usize;
+            if n < buf.len() {
+                buf.truncate(n);
+                return Ok(CString::new(buf)?);
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+
+    fn exists(e: &io::Error) -> bool {
+        e.raw_os_error() == Some(libc::EEXIST)
+    }
+
+    /// Names the component a failed open stopped at; `ELOOP` there means a
+    /// symlink.
+    fn walk_error(prefix: &[CString], e: io::Error) -> anyhow::Error {
+        let at = joined(prefix);
+        if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+            anyhow::anyhow!("`{at}` is not a directory (symlinks are not followed)")
+        } else {
+            anyhow::Error::new(e).context(format!("cannot open `{at}`"))
+        }
+    }
+
+    fn joined(comps: &[CString]) -> String {
+        comps.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")
+    }
+
+    /// Copy one file or symlink (recreated as a symlink) from under `base` to
+    /// the same `rel` under `worktree`, never overwriting: an existing
+    /// destination (dangling symlinks included) is left alone. Directories,
+    /// fifos and devices are skipped.
+    pub(super) fn copy_entry(base: &OwnedFd, worktree: &OwnedFd, rel: &str) -> Result<()> {
+        let comps = components(rel)?;
+        let (leaf, parents) = comps.split_last().expect("components is never empty");
+
+        let mut src = base.try_clone()?;
+        for (i, c) in parents.iter().enumerate() {
+            src = open_dir(src.as_raw_fd(), c).map_err(|e| walk_error(&comps[..=i], e))?;
+        }
+        let Some(st) = lstatat(src.as_raw_fd(), leaf)? else { bail!("no longer exists") };
+        let symlink = is(&st, libc::S_IFLNK);
+        if !symlink && !is(&st, libc::S_IFREG) {
+            return Ok(());
+        }
+
+        let mut dst = worktree.try_clone()?;
+        for (i, c) in parents.iter().enumerate() {
+            if unsafe { libc::mkdirat(dst.as_raw_fd(), c.as_ptr(), 0o777) } < 0 {
+                let e = io::Error::last_os_error();
+                if !exists(&e) {
+                    return Err(anyhow::Error::new(e).context(format!("cannot create `{}`", joined(&comps[..=i]))));
+                }
+            }
+            dst = open_dir(dst.as_raw_fd(), c).map_err(|e| walk_error(&comps[..=i], e))?;
+        }
+        if lstatat(dst.as_raw_fd(), leaf)?.is_some() {
+            return Ok(());
+        }
+
+        if symlink {
+            let target = readlinkat(src.as_raw_fd(), leaf)?;
+            if unsafe { libc::symlinkat(target.as_ptr(), dst.as_raw_fd(), leaf.as_ptr()) } < 0 {
+                let e = io::Error::last_os_error();
+                if !exists(&e) {
+                    return Err(e.into());
+                }
+            }
+            return Ok(());
+        }
+
+        // `O_NONBLOCK`: a fifo swapped in since the stat must not hang the open.
+        let from = File::from(openat(src.as_raw_fd(), leaf, libc::O_RDONLY | libc::O_NONBLOCK, 0)?);
+        let meta = from.metadata()?;
+        if !meta.is_file() {
+            return Ok(());
+        }
+        let perm = meta.permissions();
+        let to = match openat(
+            dst.as_raw_fd(),
+            leaf,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            perm.mode() as libc::mode_t & 0o7777,
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(e) if exists(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // As `fs::copy`: the mode is the source's, umask notwithstanding.
+        to.set_permissions(perm)?;
+        io::copy(&mut &from, &mut &to)?;
+        Ok(())
+    }
 }
 
 /// Share `entries` (repo-relative, gitignored paths) live across every
@@ -884,6 +1083,84 @@ mod tests {
         assert_eq!(git(&wt, &["status", "--porcelain"]), "");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `root/{base,wt,outside}`, fresh; `outside` holds a `secret` file.
+    #[cfg(unix)]
+    fn include_trees(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtnf-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (base, wt, outside) = (root.join("base"), root.join("wt"), root.join("outside"));
+        for d in [&base, &wt, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(outside.join("secret"), "host secret").unwrap();
+        (root, base, wt, outside)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_copy_keeps_contents_mode_and_leaf_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, base, wt, _) = include_trees("ok");
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/b/run.sh"), "#!/bin/sh").unwrap();
+        std::fs::set_permissions(base.join("a/b/run.sh"), std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::write(base.join(".env"), "base").unwrap();
+        std::fs::write(wt.join(".env"), "mine").unwrap();
+        std::os::unix::fs::symlink("../elsewhere", base.join("a/link")).unwrap();
+        std::fs::create_dir_all(base.join("nested/.git")).unwrap();
+
+        let paths = ["a/b/run.sh", ".env", "a/link", "nested/"].map(String::from);
+        copy_include_paths(&base, &wt, &paths);
+
+        assert_eq!(std::fs::read_to_string(wt.join("a/b/run.sh")).unwrap(), "#!/bin/sh");
+        let mode = std::fs::metadata(wt.join("a/b/run.sh")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o751);
+        assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "mine", "never overwrites");
+        assert_eq!(std::fs::read_link(wt.join("a/link")).unwrap(), Path::new("../elsewhere"));
+        assert!(!wt.join("nested").exists(), "directories are not copied");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The symlinks are planted after listing, as a container could.
+    #[cfg(unix)]
+    #[test]
+    fn include_copy_never_follows_a_symlinked_source_dir() {
+        let (root, base, wt, outside) = include_trees("src");
+        std::os::unix::fs::symlink(&outside, base.join("dir")).unwrap();
+
+        copy_include_paths(&base, &wt, &["dir/secret".into()]);
+
+        assert!(wt.join("dir/secret").symlink_metadata().is_err(), "nothing read through the link");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_copy_never_follows_a_symlinked_destination_dir() {
+        let (root, base, wt, outside) = include_trees("dst");
+        std::fs::create_dir_all(base.join("dir/sub")).unwrap();
+        std::fs::write(base.join("dir/planted"), "x").unwrap();
+        std::fs::write(base.join("dir/sub/deep"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("dir")).unwrap();
+
+        copy_include_paths(&base, &wt, &["dir/planted".into(), "dir/sub/deep".into()]);
+
+        let mut written: Vec<_> = std::fs::read_dir(&outside).unwrap().map(|e| e.unwrap().file_name()).collect();
+        written.sort();
+        assert_eq!(written, ["secret"], "nothing written outside");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_paths_are_strictly_relative() {
+        for bad in ["", "/etc/passwd", "a/../b", "./a", "a//b", "..", "/"] {
+            assert!(nofollow::components(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(nofollow::components("a/b").unwrap().len(), 2);
+        assert_eq!(nofollow::components("sub/").unwrap().len(), 1);
     }
 
     /// A committed repo at `root/base` with `.gitignore` = `ignore`.

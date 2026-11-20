@@ -99,7 +99,11 @@ on `run` and every `rebuild`, for the primary repo only.
   sandbox's `worktree-include` patterns (applied after, so they can negate)
   are copied from the base into the worktree. Git does the matching
   (`ls-files --others --ignored --exclude-from`, then `check-ignore`).
-  Never overwrites. Best effort: problems warn.
+  Never overwrites. Best effort: problems warn. Both trees are
+  container-writable, so on unix every path component below the two roots
+  is opened without following symlinks (`copy_include_paths`,
+  `nofollow::copy_entry`): a file behind a symlinked directory on either
+  side is skipped with a warning; a leaf symlink is recreated as a symlink.
 - **Link** (`link_shared_files`, every instance): each `worktree-link` entry
   (repo-relative, gitignored; `*`/`?` per segment, no `**`, no `..`/`.git`)
   lives once in `<config dir>/shared-files/<basename>-<hash8>/` (one store
