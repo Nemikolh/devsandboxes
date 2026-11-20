@@ -12,7 +12,10 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **instances**: host-side hardening: host git refuses redirected git
+  dirs, fetches only a trusted origin URL and never runs filter drivers;
+  per-instance bind dirs go with the instance; worktree-include copies
+  never follow symlinks. → [plan](plans/active/host-side-hardening.md)
 
 ## Planned
 
