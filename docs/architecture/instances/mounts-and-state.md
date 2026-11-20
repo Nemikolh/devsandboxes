@@ -42,7 +42,12 @@ In `materialize` / `run_container`:
   bind sources are created: a basename with a dot after any leading dots is a
   file, else a directory. A volume named with `${instance}` /
   `${devcontainerId}` is per-instance: recorded in `Instance.volumes`
-  (accumulated across rebuilds) and deleted by `rm`.
+  (accumulated across rebuilds) and deleted by `rm`. So is a bind source
+  named with one that `run` created itself (`provision_bind_source`, for
+  config and feature mounts alike; one that already existed, or with a `..`
+  in it, is never recorded): its canonical path goes in
+  `Instance.bind_dirs` (accumulated across rebuilds) and `rm` deletes it,
+  so a later instance reusing the id starts without the old one's files.
 - **`folders`**: each entry (or its detached worktree) at its container path.
 - **`caches`**: `<config dir>/shared-volumes/<dir>` bind-mounted at
   `/var/cache/devsandbox/<dir>` plus the tool's env var(s) pointing there

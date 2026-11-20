@@ -1687,6 +1687,7 @@ folder = "."
             devsbd_arch: None,
             devsbd_error: None,
             volumes: Vec::new(),
+            bind_dirs: Vec::new(),
             dispatcher: owner.map(str::to_string),
             profile: None,
             config_dir: Some("/cfg".into()),

@@ -148,6 +148,7 @@ pub(crate) fn rollback(instance_id: &str, branch_start: Option<&str>) {
             warn(&format!("volume `{volume}`"), e);
         }
     }
+    crate::commands::rm::remove_bind_dirs(&info.bind_dirs, info.config_dir.as_deref(), |_| {});
     if let Err(e) = crate::commands::rm::remove_folder_worktrees(&info.folders, true) {
         warn("`folders` worktrees", e);
     }

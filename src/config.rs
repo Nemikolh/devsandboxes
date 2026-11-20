@@ -782,6 +782,10 @@ pub struct ResolvedMount {
     /// `${devcontainerId}`), so it belongs to that instance alone and `rm`
     /// deletes it. Shared named volumes are never touched.
     pub per_instance: bool,
+    /// The unsubstituted source names the instance, whatever the kind: a
+    /// bind source devsandbox creates on that ground is the instance's own
+    /// (`Instance::bind_dirs`).
+    pub instance_source: bool,
 }
 
 /// Variables that resolve to the instance id; a volume named with one is
@@ -801,10 +805,10 @@ impl Mount {
             ),
         };
         let kind = kind.unwrap_or_else(|| "bind".to_string());
-        let per_instance = kind == "volume"
-            && source
-                .as_deref()
-                .is_some_and(|s| INSTANCE_VARS.iter().any(|v| s.contains(v)));
+        let instance_source = source
+            .as_deref()
+            .is_some_and(|s| INSTANCE_VARS.iter().any(|v| s.contains(v)));
+        let per_instance = kind == "volume" && instance_source;
         let source = source.map(|s| substitute(&s, ctx));
         let target = substitute(&target, ctx);
         if kind == "bind" && source.is_none() {
@@ -816,6 +820,7 @@ impl Mount {
             target,
             readonly,
             per_instance,
+            instance_source,
         })
     }
 }
@@ -2502,6 +2507,9 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
         assert_eq!(resolved.source.as_deref(), Some("/cfg/shared-volumes/agent/repo-2"));
         assert_eq!(resolved.target, "/root/.agent");
         assert!(!resolved.per_instance, "binds are never per-instance volumes");
+        assert!(resolved.instance_source);
+        let shared = Mount::Shorthand("source=${sharedVolumes}/agent,target=/a,type=bind".into());
+        assert!(!shared.resolve(&ctx()).unwrap().instance_source);
     }
 
     #[test]

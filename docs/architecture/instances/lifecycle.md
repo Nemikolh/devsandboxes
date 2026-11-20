@@ -44,7 +44,8 @@ recorded meanwhile.
 mounted), `workspace`, `workspace_file`, `remote_env`, `remote_user` and
 `home` (the exec user and its `HOME`, from the identity plan:
 [identity](identity.md)), `extra_env` (`run --env`, kept across rebuild), `volumes` (per-instance
-volumes `rm` deletes), `shell_history`, `ssh_auth_sock`, `devsbd_arch`,
+volumes `rm` deletes), `bind_dirs` (per-instance bind sources `run`
+created, which `rm` deletes), `shell_history`, `ssh_auth_sock`, `devsbd_arch`,
 `dispatcher` (owning dispatcher's id), `profile`
 ([profiles](profiles.md#per-instance)), `forwarded_ports`, `done`,
 `progress`, `created_unix`. `State` also holds `autostart_boot`,
@@ -76,7 +77,7 @@ restarts, `rm` frees it). Steps:
 
 Shared by `run` and `rebuild`; replaces the record. Fields a previous record
 had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
-`folders` worktrees, `volumes`) carry over.
+`folders` worktrees, `volumes`, `bind_dirs`) carry over.
 
 1. The GPU decision (below), then `initializeCommand` on the host (in the
    config dir).
@@ -182,8 +183,12 @@ runs afresh for every exec, so upgrading it fixes existing containers.
    gone from the remote, else ask (off a TTY: keep; `--fail-on-ask` exits 3 for the
    daemon's confirm round).
 3. Remove the container, isolated services and instance network
-   (`remove_container`); per-instance volumes; the ssh-agent link; `folders`
-   worktrees; the worktree; the branch if decided.
+   (`remove_container`); per-instance volumes; the recorded `bind_dirs`
+   (`remove_bind_dirs`: only a path still resolving to itself, not a
+   symlink, strictly inside the instance's `config_dir` and not
+   `shared-volumes/` itself; anything else is kept with a warning); the
+   ssh-agent link; `folders` worktrees; the worktree; the branch if
+   decided.
 4. Drop the record by `instance_id`, delete the build log, archive the
    instance's Inbox threads.
 

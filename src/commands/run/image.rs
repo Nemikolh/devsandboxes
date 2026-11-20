@@ -15,7 +15,7 @@ use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, NAME_PREFIX};
 
 use super::mounts::{
-    creatable_feature_source, ensure_bind_source, feature_mount_decision, guard_create, MountDecision,
+    creatable_feature_source, feature_mount_decision, guard_create, provision_bind_source, MountDecision,
 };
 
 /// What the sandbox's enabled features ask of the container itself (the image
@@ -25,6 +25,8 @@ pub(super) struct FeatureContainerOpts {
     pub(super) mounts: Vec<String>,
     /// Per-instance volume names among `mounts` (for `rm`).
     pub(super) volumes: Vec<String>,
+    /// Per-instance bind sources created here (for `rm`), applied or not.
+    pub(super) bind_dirs: Vec<std::path::PathBuf>,
     /// Refs of the enabled features declaring `privileged: true`; the backend
     /// check happens in [`privileged_decision`].
     pub(super) privileged_by: Vec<String>,
@@ -73,6 +75,7 @@ pub(super) fn feature_container_opts(
     let mut opts = FeatureContainerOpts {
         mounts: Vec::new(),
         volumes: Vec::new(),
+        bind_dirs: Vec::new(),
         privileged_by: Vec::new(),
     };
     let Some(features) = &props.features else {
@@ -101,7 +104,7 @@ pub(super) fn feature_container_opts(
             if let Some(source) = resolved.source.as_deref() {
                 if creatable_feature_source(&resolved.kind, source, ctx.shared_volumes) {
                     guard_create(policy, Path::new(source))?;
-                    ensure_bind_source(Path::new(source))?;
+                    opts.bind_dirs.extend(provision_bind_source(source, resolved.instance_source)?);
                 }
             }
             let probe = |source: &str| std::fs::metadata(source).ok().map(|m| !m.is_dir());

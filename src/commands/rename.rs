@@ -123,6 +123,7 @@ mod tests {
                 devsbd_arch: None,
                 devsbd_error: None,
                 volumes: Vec::new(),
+                bind_dirs: Vec::new(),
                 dispatcher: None,
                 profile: None,
                 config_dir: None,

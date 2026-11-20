@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -39,6 +39,8 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool, fail_on_ask: boo
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
     let volumes = info.volumes.clone();
+    let bind_dirs = info.bind_dirs.clone();
+    let config_dir = info.config_dir.clone();
     let folders = info.folders.clone();
 
     // Refuse up front, before anything is torn down, when the worktree's base
@@ -80,6 +82,7 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool, fail_on_ask: boo
             Err(e) => eprintln!("warning: cannot remove volume `{volume}`: {e:#}"),
         }
     }
+    remove_bind_dirs(&bind_dirs, config_dir.as_deref(), |m| println!("{m}"));
 
     // The managed shell-history dir is deliberately kept: `run` re-provisions
     // the same per-instance path, so history survives an rm + run rebuild.
@@ -143,6 +146,65 @@ pub(crate) fn remove_container(container: &str, project: &str, instance_id: &str
             let _ = backend().run_inherit(&["network", "rm", &network]);
         }
     }
+}
+
+/// Delete the bind sources `run` created for the instance
+/// (`Instance::bind_dirs`), after its container is gone; `say` gets what was
+/// removed. Best effort: a failure or a refusal ([`bind_dir_refusal`])
+/// warns. A shared container may still write under `shared-volumes/`, so
+/// nothing is followed: a symlink is refused, and `remove_dir_all` removes
+/// the symlinks inside a dir rather than following them (on unix std walks
+/// with `openat`/`unlinkat` and `O_NOFOLLOW`, CVE-2022-21658).
+pub(crate) fn remove_bind_dirs(dirs: &[PathBuf], config_dir: Option<&Path>, say: impl Fn(String)) {
+    let config_dir = config_dir.and_then(|d| d.canonicalize().ok());
+    for dir in dirs {
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                eprintln!("warning: cannot remove `{}`: {e}", dir.display());
+                continue;
+            }
+        };
+        let canonical = dir.canonicalize().ok();
+        let refusal =
+            bind_dir_refusal(dir, canonical.as_deref(), config_dir.as_deref(), meta.file_type().is_symlink());
+        if let Some(why) = refusal {
+            eprintln!("warning: not removing `{}`: {why}", dir.display());
+            continue;
+        }
+        let removed = if meta.is_dir() { std::fs::remove_dir_all(dir) } else { std::fs::remove_file(dir) };
+        match removed {
+            Ok(()) => say(format!("removed {}", dir.display())),
+            Err(e) => eprintln!("warning: cannot remove `{}`: {e}", dir.display()),
+        }
+    }
+}
+
+/// Why a recorded bind dir must not be deleted, `None` when it may be:
+/// `recorded` (canonical when `run` recorded it) must still resolve to
+/// itself (`canonical`: no symlink swapped in on the way since), not be a
+/// symlink, and lie strictly inside the instance's canonical `config_dir`,
+/// other than its `shared-volumes/` itself.
+fn bind_dir_refusal(
+    recorded: &Path,
+    canonical: Option<&Path>,
+    config_dir: Option<&Path>,
+    is_symlink: bool,
+) -> Option<&'static str> {
+    let Some(config_dir) = config_dir else {
+        return Some("the instance's config dir is unknown");
+    };
+    if is_symlink {
+        return Some("it is a symlink");
+    }
+    if canonical != Some(recorded) {
+        return Some("it no longer resolves to the recorded path");
+    }
+    if !recorded.starts_with(config_dir) || recorded == config_dir || recorded == config_dir.join("shared-volumes") {
+        return Some("it is not inside the config dir");
+    }
+    None
 }
 
 /// Mark the removed instance's Inbox threads read-only, after its state entry
@@ -478,6 +540,65 @@ mod tests {
         // Legacy entry: the pattern used the id, not the (renamable) key.
         assert_eq!(recorded_branch(None, true, "id").as_deref(), Some("sandbox/id"));
         assert_eq!(recorded_branch(None, false, "id"), None);
+    }
+
+    #[test]
+    fn bind_dir_refusal_keeps_deletes_inside_the_config_dir() {
+        let cfg = Path::new("/cfg");
+        let ok = Path::new("/cfg/shared-volumes/z/web");
+        assert_eq!(bind_dir_refusal(ok, Some(ok), Some(cfg), false), None);
+        assert!(bind_dir_refusal(ok, Some(ok), None, false).is_some(), "no config dir");
+        assert!(bind_dir_refusal(ok, Some(ok), Some(cfg), true).is_some(), "symlink");
+        let moved = Path::new("/home/u/web");
+        assert!(bind_dir_refusal(ok, Some(moved), Some(cfg), false).is_some(), "symlink on the way");
+        assert!(bind_dir_refusal(ok, None, Some(cfg), false).is_some());
+        for p in ["/etc/web", "/cfg", "/cfg/shared-volumes", "/cfgx/web", "rel/web"] {
+            let p = Path::new(p);
+            assert!(bind_dir_refusal(p, Some(p), Some(cfg), false).is_some(), "{}", p.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_bind_dirs_deletes_only_what_is_safe() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("devsandbox-rmbind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (cfg, outside) = (base.join("cfg"), base.join("outside"));
+        let sv = cfg.join("shared-volumes");
+        std::fs::create_dir_all(sv.join("z/web/nested")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "x").unwrap();
+        std::fs::write(sv.join("z/web/nested/tok"), "x").unwrap();
+        // Planted by the container: removed as a link, never followed.
+        symlink(&outside, sv.join("z/web/escape")).unwrap();
+        std::fs::write(sv.join("web.json"), "{}").unwrap();
+        symlink(&outside, sv.join("link")).unwrap();
+        std::fs::create_dir_all(sv.join("swapped-parent")).unwrap();
+        let cfg = cfg.canonicalize().unwrap();
+        let sv = cfg.join("shared-volumes");
+        let outside = outside.canonicalize().unwrap();
+        // Recorded as a real dir, then its parent swapped for a link out.
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::remove_dir(sv.join("swapped-parent")).unwrap();
+        symlink(&outside, sv.join("swapped-parent")).unwrap();
+        let dirs = vec![
+            sv.join("z/web"),
+            sv.join("web.json"),
+            sv.join("link"),
+            sv.join("swapped-parent/inner"),
+            outside.clone(),
+            sv.clone(),
+            sv.join("gone"),
+        ];
+        let said = std::cell::RefCell::new(Vec::new());
+        remove_bind_dirs(&dirs, Some(&cfg), |m| said.borrow_mut().push(m));
+        assert!(!sv.join("z/web").exists() && !sv.join("web.json").exists());
+        assert!(sv.join("z").is_dir(), "only the recorded path goes");
+        assert!(outside.join("keep").is_file() && outside.join("inner").is_dir());
+        assert!(std::fs::symlink_metadata(sv.join("link")).is_ok());
+        assert_eq!(said.into_inner().len(), 2);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

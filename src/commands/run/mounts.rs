@@ -57,7 +57,7 @@ pub(super) fn resolve_mounts(
     for resolved in resolved {
         if resolved.kind == "bind" {
             if let Some(source) = &resolved.source {
-                ensure_bind_source(Path::new(source))?;
+                out.bind_dirs.extend(provision_bind_source(source, resolved.instance_source)?);
             }
         }
         if resolved.per_instance {
@@ -69,11 +69,12 @@ pub(super) fn resolve_mounts(
 }
 
 /// The sandbox's own `mounts` as `--mount` args, plus the per-instance volume
-/// names among them (for `rm`).
+/// names and created bind sources among them (for `rm`).
 #[derive(Default)]
 pub(super) struct ResolvedMounts {
     pub(super) args: Vec<String>,
     pub(super) volumes: Vec<String>,
+    pub(super) bind_dirs: Vec<PathBuf>,
 }
 
 /// Drop every mount whose target a later entry claims again, keeping the order
@@ -380,12 +381,12 @@ fn unresolved_variable(value: &str) -> Option<&str> {
     Some(&value[start..end])
 }
 
-/// `previous` followed by the new names not already in it.
-pub(super) fn merge_volumes(previous: &[String], current: Vec<String>) -> Vec<String> {
+/// `previous` followed by the new entries not already in it.
+pub(super) fn merge_volumes<T: Clone + PartialEq>(previous: &[T], current: Vec<T>) -> Vec<T> {
     let mut out = previous.to_vec();
-    for volume in current {
-        if !out.contains(&volume) {
-            out.push(volume);
+    for item in current {
+        if !out.contains(&item) {
+            out.push(item);
         }
     }
     out
@@ -465,12 +466,34 @@ pub(super) fn creatable_feature_source(kind: &str, source: &str, shared_volumes:
         && source != Path::new(shared_volumes)
 }
 
-/// Create a missing bind-mount source. A final path component containing a dot
-/// (other than a leading one) is treated as a file (touched); anything else as a
-/// directory — so `credentials.json` becomes a file and `pnpm-store` a dir.
-pub(super) fn ensure_bind_source(path: &Path) -> Result<()> {
+/// [`ensure_bind_source`], and the canonical path of what it created when
+/// that is the instance's own to delete at `rm` ([`records_bind_dir`]).
+pub(super) fn provision_bind_source(source: &str, instance_source: bool) -> Result<Option<PathBuf>> {
+    let created = ensure_bind_source(Path::new(source))?;
+    if !records_bind_dir(source, instance_source, created) {
+        return Ok(None);
+    }
+    Ok(Path::new(source).canonicalize().ok())
+}
+
+/// Whether a bind source goes on `Instance::bind_dirs`: devsandbox created it
+/// just now, and its unsubstituted source names the instance. One that
+/// already existed may be anything (the user's own, or left by an `rm` from
+/// before these were recorded). A `..` hop can resolve to a path that
+/// existed: `a/../b` reads as missing while `a` is.
+pub(super) fn records_bind_dir(source: &str, instance_source: bool, created: bool) -> bool {
+    created
+        && instance_source
+        && !Path::new(source).components().any(|c| c == std::path::Component::ParentDir)
+}
+
+/// Create a missing bind-mount source; `true` when it did. A final path
+/// component containing a dot (other than a leading one) is treated as a file
+/// (touched); anything else as a directory — so `credentials.json` becomes a
+/// file and `pnpm-store` a dir.
+pub(super) fn ensure_bind_source(path: &Path) -> Result<bool> {
     if path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let is_file = path
         .file_name()
@@ -490,7 +513,7 @@ pub(super) fn ensure_bind_source(path: &Path) -> Result<()> {
     } else {
         std::fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -694,6 +717,7 @@ mod tests {
             target: target.into(),
             readonly: false,
             per_instance: false,
+            instance_source: false,
         }
     }
 
@@ -728,7 +752,7 @@ mod tests {
             merge_volumes(&previous, vec!["dind-web".into(), "new-web".into()]),
             ["dind-web", "old-web", "new-web"]
         );
-        assert!(merge_volumes(&[], vec![]).is_empty());
+        assert!(merge_volumes::<String>(&[], vec![]).is_empty());
     }
 
     #[test]
@@ -818,6 +842,50 @@ mod tests {
         assert!(!creatable_feature_source("bind", "/var/run/docker.sock", sv));
         // Volumes are named, not host paths.
         assert!(!creatable_feature_source("volume", "/cfg/shared-volumes/a", sv));
+    }
+
+    #[test]
+    fn records_bind_dir_only_created_per_instance_sources() {
+        assert!(records_bind_dir("/cfg/shared-volumes/z/web", true, true));
+        assert!(!records_bind_dir("/cfg/shared-volumes/z/web", true, false), "existed before");
+        assert!(!records_bind_dir("/cfg/shared-volumes/z", false, true), "shared by every instance");
+        assert!(!records_bind_dir("/cfg/web/../dockerfiles", true, true));
+    }
+
+    /// `run`'s record, then a rebuild's: only sources this pass created and
+    /// whose config names the instance, kept across the rebuild.
+    #[test]
+    fn resolve_mounts_records_created_per_instance_bind_sources() {
+        let base = std::env::temp_dir().join(format!("devsandbox-binddirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = base.join("cfg");
+        std::fs::create_dir_all(cfg.join("pre-web")).unwrap();
+        let cfg = cfg.canonicalize().unwrap();
+        let mounts = [
+            "source=${sharedVolumes}/agent/${instance},target=/a",
+            "source=${sharedVolumes}/${devcontainerId}.json,target=/b.json",
+            "source=${sharedVolumes}/shared,target=/c",
+            "source=${configDir}/pre-${instance},target=/d",
+            "type=volume,source=vol-${instance},target=/e",
+        ];
+        let sandbox = ResolvedSandbox {
+            name: "s".into(),
+            properties: SandboxProperties {
+                mounts: Some(mounts.iter().map(|m| crate::config::Mount::Shorthand(m.to_string())).collect()),
+                ..Default::default()
+            },
+            config_hash: "h".into(),
+        };
+        let first = resolve_mounts(&cfg, &cfg, "app", "web", &sandbox, None).unwrap();
+        let sv = cfg.join("shared-volumes");
+        assert_eq!(first.bind_dirs, vec![sv.join("agent/web"), sv.join("web.json")]);
+        assert!(sv.join("agent/web").is_dir() && sv.join("web.json").is_file() && sv.join("shared").is_dir());
+        assert_eq!(first.volumes, ["vol-web"]);
+
+        let rebuild = resolve_mounts(&cfg, &cfg, "app", "web", &sandbox, None).unwrap();
+        assert!(rebuild.bind_dirs.is_empty(), "nothing created this time");
+        assert_eq!(merge_volumes(&first.bind_dirs, rebuild.bind_dirs), first.bind_dirs);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

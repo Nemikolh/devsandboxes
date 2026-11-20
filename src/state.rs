@@ -113,6 +113,13 @@ pub struct Instance {
     /// Accumulated across rebuilds, which keep them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
+    /// Bind sources `run` created for this instance alone (sources using
+    /// `${instance}` / `${devcontainerId}`, e.g. a feature's
+    /// `${sharedVolumes}/<name>/${instance}`), canonical, so `rm` deletes
+    /// them (`commands::rm::remove_bind_dirs`). Never one that existed
+    /// before. Accumulated across rebuilds, like [`Instance::volumes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bind_dirs: Vec<PathBuf>,
     /// `instance_id` of the dispatcher that created this instance through the
     /// control API (docs/architecture/automations/dispatchers.md); also the container's
     /// `devsandbox.dispatcher` label. `None` for user-created instances.
@@ -561,6 +568,7 @@ mod tests {
                 devsbd_arch: None,
                 devsbd_error: None,
                 volumes: Vec::new(),
+                bind_dirs: Vec::new(),
                 dispatcher: Some("pr-dispatcher".into()),
                 profile: Some("work".into()),
                 config_dir: Some("/home/u/.devsandboxes".into()),

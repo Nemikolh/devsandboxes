@@ -261,6 +261,7 @@ pub fn run(
         devsbd_arch: None,
         devsbd_error: None,
         volumes: Vec::new(),
+        bind_dirs: Vec::new(),
         dispatcher: extras.dispatcher.clone(),
         profile: profile.clone(),
         config_dir: Some(config_dir.clone()),
@@ -761,7 +762,7 @@ pub(crate) fn materialize(
     let container_env =
         ContainerEnv::resolve(props.container_env.as_ref(), facts.env.clone(), facts::home(props, &facts), &var_ctx);
     let var_ctx = MountContext { container_env: Some(&container_env), ..var_ctx };
-    let ResolvedMounts { args: mut mounts, volumes: mut instance_volumes } =
+    let ResolvedMounts { args: mut mounts, volumes: mut instance_volumes, bind_dirs: mut created_dirs } =
         resolve_mounts(dir, folder, &basename, instance_id, sandbox, Some(&container_env))?;
     for fm in &folder_mounts {
         mounts.push(format!(
@@ -792,13 +793,17 @@ pub(crate) fn materialize(
     let feature = feature_container_opts(props, &var_ctx, &mounts, &workspace, policy.as_ref())?;
     mounts.extend(feature.mounts);
     instance_volumes.extend(feature.volumes);
-    // Keep volumes a previous run recorded: a rebuild keeps them on disk even
-    // when the config no longer mounts them, and `rm` must still find them.
-    let volumes = merge_volumes(
-        state.instances.get(instance).map(|i| i.volumes.as_slice()).unwrap_or_default(),
-        instance_volumes,
-    );
-    tracker.record(|i| i.volumes = volumes.clone())?;
+    created_dirs.extend(feature.bind_dirs);
+    // Keep volumes and bind dirs a previous run recorded: a rebuild keeps them
+    // on disk even when the config no longer mounts them, and `rm` must still
+    // find them.
+    let previous = state.instances.get(instance);
+    let volumes = merge_volumes(previous.map(|i| i.volumes.as_slice()).unwrap_or_default(), instance_volumes);
+    let bind_dirs = merge_volumes(previous.map(|i| i.bind_dirs.as_slice()).unwrap_or_default(), created_dirs);
+    tracker.record(|i| {
+        i.volumes = volumes.clone();
+        i.bind_dirs = bind_dirs.clone();
+    })?;
     sort_parents_first(&mut mounts);
     let (privileged, warnings) = privileged_decision(
         props.privileged == Some(true),
@@ -932,6 +937,7 @@ pub(crate) fn materialize(
         devsbd_arch,
         devsbd_error,
         volumes,
+        bind_dirs,
         dispatcher,
         profile,
         config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
@@ -1361,6 +1367,7 @@ mod tests {
             devsbd_arch: None,
             devsbd_error: None,
             volumes: Vec::new(),
+            bind_dirs: Vec::new(),
             dispatcher: None,
             profile: None,
             config_dir: None,
