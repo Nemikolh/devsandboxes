@@ -211,7 +211,7 @@ pub fn land_from(cache: &Path, at: &Path, branch: &str, wip: Option<&str>, in_us
         let mut refspecs = vec![format!("+{full}:{full}")];
         refspecs.extend(wip_at.iter().map(|w| format!("+{w}:{w}")));
         fetch(&refspecs)?;
-        run(host_git(at)?.args(["reset", "-q", "--hard"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)?;
+        run(host_git(at)?.args(["reset", "-q", "--hard"]), WHOLE)?;
         run(host_git(at)?.args(["clean", "-q", "-f", "-d"]), WHOLE).with_context(|| format!("cannot clean {}", at.display()))?;
         if let (Some(w), Some(wip_at)) = (wip, wip_at) {
             super::wip::apply_wip(at, w)?;
@@ -236,7 +236,7 @@ pub fn land_from(cache: &Path, at: &Path, branch: &str, wip: Option<&str>, in_us
     if !clean || !descends()? {
         return Ok(Landed::Kept);
     }
-    run(host_git(at)?.args(["merge", "-q", "--ff-only", "FETCH_HEAD"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)
+    run(host_git(at)?.args(["merge", "-q", "--ff-only", "FETCH_HEAD"]), WHOLE)
         .with_context(|| format!("cannot fast-forward {branch} in {}", at.display()))?;
     Ok(Landed::FastForwarded)
 }

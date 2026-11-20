@@ -122,6 +122,17 @@ git call on a sandbox's repo goes through `run::git::host_git`:
 - `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, stdin closed,
   `GIT_TERMINAL_PROMPT=0`, `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE`
   removed.
+- No filter driver runs: a sandbox-written `.gitattributes` can name any
+  filter the user's global or system config defines (`filter=lfs` plus an
+  `.lfsconfig` URL would have host git-lfs fetch with the user's
+  credentials). `GIT_LFS_SKIP_SMUDGE=1`, and for each driver name found
+  there (`run::git::user_filter_names`: `git config --global|--system
+  --includes -z --name-only --get-regexp`, from `/`, once per process)
+  `run::git::neutral_filter_args`: `smudge`/`clean` = `cat`, an empty
+  `process` (git then applies nothing and spawns nothing) and
+  `required=false` (so that is a pass-through), passed as `--config-env`
+  since a name may hold `=`. Files a host checkout writes are the blobs as
+  stored: LFS files stay pointers.
 - `check_repo` first: the repo's local config files are parsed as files
   (never `git config`, which follows includes) and every key checked against
   an allowlist of keys that can't run commands; `ext::` URLs (remote, push,

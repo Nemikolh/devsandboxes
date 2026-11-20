@@ -77,16 +77,16 @@ pub fn snapshot(checkout: &Path, wip_ref: &str) -> Result<Snapshot> {
 /// Make `checkout`'s working tree `wip`'s tree (a commit id or full ref,
 /// [`check_rev`]) and leave its index at `HEAD`: what the snapshot had
 /// modified, deleted or added shows as uncommitted changes (added files
-/// as untracked). `read-tree -u --reset` then a mixed `reset`, LFS smudge
-/// off as `repo::land_from`'s. It overwrites the working tree: meant for a
+/// as untracked). `read-tree -u --reset` then a mixed `reset`, filters off
+/// as on every host git. It overwrites the working tree: meant for a
 /// checkout the transfer just made (decision 73).
 pub fn apply_wip(checkout: &Path, wip: &str) -> Result<()> {
     check_rev(wip)?;
     run(host_git(checkout)?.args(["rev-parse", "-q", "--verify"]).arg(format!("{wip}^{{commit}}")), QUICK)
         .with_context(|| format!("{wip} isn't a commit in {}", checkout.display()))?;
-    run(host_git(checkout)?.args(["read-tree", "-u", "--reset"]).arg(wip).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)
+    run(host_git(checkout)?.args(["read-tree", "-u", "--reset"]).arg(wip), WHOLE)
         .with_context(|| format!("cannot check out {wip}'s tree"))?;
-    run(host_git(checkout)?.args(["reset", "-q"]).env("GIT_LFS_SKIP_SMUDGE", "1"), WHOLE)
+    run(host_git(checkout)?.args(["reset", "-q"]), WHOLE)
         .context("cannot reset the index to HEAD")?;
     Ok(())
 }

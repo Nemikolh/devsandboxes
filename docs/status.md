@@ -300,6 +300,13 @@ is frozen: no new work on it.
   pinned.
   → [mounts](architecture/instances/mounts-and-state.md#trusted-origin);
   `run::origin::fetch_trusted_origin`
+- Host checkouts run no filter driver, so LFS files in a worktree (or a
+  fleet checkout) the host made are pointers until `git lfs pull` in the
+  sandbox. A filter defined only under a global `includeIf` whose
+  condition holds for some repo isn't found (the names are read outside
+  any repo) and still runs there.
+  → [mounts](architecture/instances/mounts-and-state.md#host-git);
+  `run::git::neutral_filter_args`
 
 ### config
 

@@ -19,9 +19,20 @@
 //! `gitdir` back-pointer names this checkout), `commondir` only in such an
 //! admin dir, and no symlink may sit in the git dirs where git looks
 //! ([`symlink_refusal`]).
+//!
+//! A sandbox also writes the checkout's `.gitattributes`: `filter=<name>`
+//! there makes a host checkout (`worktree add`, `reset --hard`, …) run a
+//! filter driver the *user's* global or system config defines, git-lfs
+//! included (which then fetches with the user's credentials from a URL the
+//! sandbox's `.lfsconfig` names). The repo's own `filter.*` keys are refused
+//! above; for the rest every host git gets `GIT_LFS_SKIP_SMUDGE=1` and, per
+//! driver name in those configs ([`filter_args`]), overrides that make it
+//! pass content through unchanged.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 
@@ -40,7 +51,7 @@ pub(crate) fn host_git(repo: &Path) -> Result<Command> {
 pub(crate) fn host_git_bare(dir: &Path) -> Result<Command> {
     check_dirs(dir, dir, dir)?;
     let mut cmd = Command::new("git");
-    cmd.args(SAFE_ARGS).arg("--git-dir").arg(dir);
+    cmd.args(SAFE_ARGS).args(filter_args()).arg("--git-dir").arg(dir);
     Ok(safe_env(cmd))
 }
 
@@ -62,18 +73,79 @@ const SAFE_ARGS: [&str; 4] = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmo
 
 fn git_command(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(SAFE_ARGS).arg("-C").arg(repo);
+    cmd.args(SAFE_ARGS).args(filter_args()).arg("-C").arg(repo);
     safe_env(cmd)
 }
 
-/// No stdin, no credential prompts, no env pointing git at another repo.
+/// No stdin, no credential prompts, no LFS downloads, no env pointing git at
+/// another repo; the values [`neutral_filter_args`] reads.
 fn safe_env(mut cmd: Command) -> Command {
-    cmd.stdin(Stdio::null()).env("GIT_TERMINAL_PROMPT", "0");
+    cmd.stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .envs(FILTER_VALUES);
     // These would make git use another repo than the one `check_repo` read.
     for var in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"] {
         cmd.env_remove(var);
     }
     cmd
+}
+
+/// The [`neutral_filter_args`] of the user's global and system filter
+/// drivers, read once per process.
+fn filter_args() -> &'static [String] {
+    static ARGS: OnceLock<Vec<String>> = OnceLock::new();
+    ARGS.get_or_init(|| neutral_filter_args(&user_filter_names(&[])))
+}
+
+/// `--config-env` values: `-c` splits at the first `=`, and a filter name may
+/// hold one; `--config-env` splits at the last.
+const FILTER_VALUES: [(&str, &str); 3] =
+    [("DEVSANDBOX_GIT_EMPTY", ""), ("DEVSANDBOX_GIT_CAT", "cat"), ("DEVSANDBOX_GIT_FALSE", "false")];
+
+/// Overrides that make each filter driver in `names` inert. An empty
+/// `process` is what disables it: git (convert.c `apply_filter`) skips
+/// `smudge`/`clean` whenever `process` is set, then applies nothing when it
+/// is empty, spawning no command; `required=false` makes that a pass-through
+/// instead of an error. `smudge`/`clean` = `cat` keep it inert were an empty
+/// `process` ever read as unset.
+fn neutral_filter_args(names: &BTreeSet<String>) -> Vec<String> {
+    let [(empty, _), (cat, _), (no, _)] = FILTER_VALUES;
+    names
+        .iter()
+        .flat_map(|name| {
+            [("smudge", cat), ("clean", cat), ("process", empty), ("required", no)]
+                .map(|(key, var)| format!("--config-env=filter.{name}.{key}={var}"))
+        })
+        .collect()
+}
+
+/// The filter driver names the user's global and system config define
+/// (includes followed), with `env` added to git's: never a repo's config,
+/// which names none ([`refusal`]). A scope with no filters, or no file, has
+/// none.
+fn user_filter_names(env: &[(&str, &std::ffi::OsStr)]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for scope in ["--global", "--system"] {
+        let mut cmd = safe_env(Command::new("git"));
+        cmd.args(["config", scope, "--includes", "-z", "--name-only", "--get-regexp", r"^filter\."])
+            .current_dir("/")
+            .envs(env.iter().copied())
+            .stderr(Stdio::null());
+        if let Some(out) = cmd.output().ok().filter(|out| out.status.success()) {
+            names.extend(parse_filter_names(&out.stdout));
+        }
+    }
+    names
+}
+
+/// The `<name>` of each NUL-terminated `filter.<name>.<key>`; `<name>` may
+/// hold dots.
+fn parse_filter_names(out: &[u8]) -> BTreeSet<String> {
+    out.split(|b| *b == 0)
+        .filter_map(|key| String::from_utf8_lossy(key).strip_prefix("filter.")?.rsplit_once('.').map(|(name, _)| name.to_string()))
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 /// Refuse `repo` when its local config (or an alternates file) could make
@@ -685,14 +757,117 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_disables_hooks_fsmonitor_and_prompts() {
+    fn wrapper_disables_hooks_fsmonitor_filters_and_prompts() {
         let cmd = git_command(Path::new("/r"));
         assert_eq!(cmd.get_program(), "git");
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", "/r"]);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        let mut want = vec!["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+        want.extend(filter_args().iter().map(String::as_str));
+        want.extend(["-C", "/r"]);
+        assert_eq!(args, want);
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.contains(&("GIT_TERMINAL_PROMPT".as_ref(), Some("0".as_ref()))));
+        assert!(envs.contains(&("GIT_LFS_SKIP_SMUDGE".as_ref(), Some("1".as_ref()))));
+        assert!(envs.contains(&("DEVSANDBOX_GIT_EMPTY".as_ref(), Some("".as_ref()))));
         assert!(envs.contains(&("GIT_DIR".as_ref(), None)));
+    }
+
+    #[test]
+    fn filter_names_and_overrides() {
+        let names = parse_filter_names(b"filter.lfs.process\0filter.lfs.smudge\0filter.a.b.clean\0filter.x=y.required\0filter..smudge\0core.x\0");
+        assert_eq!(names.iter().map(String::as_str).collect::<Vec<_>>(), ["a.b", "lfs", "x=y"]);
+        let args = neutral_filter_args(&BTreeSet::from(["x=y".to_string()]));
+        assert_eq!(
+            args,
+            [
+                "--config-env=filter.x=y.smudge=DEVSANDBOX_GIT_CAT",
+                "--config-env=filter.x=y.clean=DEVSANDBOX_GIT_CAT",
+                "--config-env=filter.x=y.process=DEVSANDBOX_GIT_EMPTY",
+                "--config-env=filter.x=y.required=DEVSANDBOX_GIT_FALSE",
+            ]
+        );
+    }
+
+    const LFS_POINTER: &str = "version https://git-lfs.github.com/spec/v1\n\
+        oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
+
+    /// A global config (`<root>/global`) whose filters `lfs`, `my.dot` (via
+    /// an include) and `x=y` each touch `<root>/marker` from `smudge`,
+    /// `clean` and `process`, and a repo at `<root>/base` whose committed
+    /// `.gitattributes` uses them, committed without them.
+    #[cfg(unix)]
+    fn repo_with_user_filters(root: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = root.join("filter.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}/marker\ncat\n", root.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let section = |name: &str| {
+            let s = script.display();
+            format!("[filter \"{name}\"]\n\tsmudge = {s}\n\tclean = {s}\n\tprocess = {s}\n\trequired = true\n")
+        };
+        std::fs::write(root.join("included"), section("my.dot")).unwrap();
+        let global = root.join("global");
+        let include = format!("[include]\n\tpath = {}\n", root.join("included").display());
+        std::fs::write(&global, section("lfs") + &section("x=y") + &include).unwrap();
+
+        let base = root.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        git_in(&base, &["init", "-q", "-b", "main"]);
+        std::fs::write(base.join(".gitattributes"), "*.bin filter=lfs\n*.txt filter=my.dot\n*.dat filter=x=y\n").unwrap();
+        std::fs::write(base.join("big.bin"), LFS_POINTER).unwrap();
+        std::fs::write(base.join("a.txt"), "a\n").unwrap();
+        std::fs::write(base.join("b.dat"), "b\n").unwrap();
+        git_in(&base, &["add", "."]);
+        git_in(&base, &["commit", "-q", "-m", "x"]);
+        (base, global)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_checkouts_never_run_user_filters() {
+        let root = temp("filters");
+        let (base, global) = repo_with_user_filters(&root);
+        let env = [("GIT_CONFIG_GLOBAL", global.as_os_str())];
+        let names = user_filter_names(&env);
+        for name in ["lfs", "my.dot", "x=y"] {
+            assert!(names.contains(name), "{name}: {names:?}");
+        }
+        let marker = root.join("marker");
+        // `host_git` with the overrides `filter_args` would hold under `global`.
+        let git = |repo: &Path, args: &[&str]| {
+            let ok = host_git(repo)
+                .unwrap()
+                .args(neutral_filter_args(&names))
+                .envs(env)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let checked_out = |dir: &Path| {
+            assert!(!marker.exists(), "a filter ran");
+            assert_eq!(std::fs::read_to_string(dir.join("big.bin")).unwrap(), LFS_POINTER);
+            assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
+            assert_eq!(std::fs::read_to_string(dir.join("b.dat")).unwrap(), "b\n");
+        };
+
+        let wt = root.join("wt");
+        git(&base, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        checked_out(&wt);
+        for f in ["big.bin", "a.txt", "b.dat"] {
+            std::fs::remove_file(wt.join(f)).unwrap();
+        }
+        git(&wt, &["reset", "-q", "--hard"]);
+        checked_out(&wt);
+        git(&wt, &["status", "--porcelain"]);
+        assert!(!marker.exists(), "a filter ran");
+
+        // Without the overrides the same checkout runs them.
+        std::fs::remove_file(wt.join("a.txt")).unwrap();
+        let ran = Command::new("git").arg("-C").arg(&wt).args(["reset", "-q", "--hard"]).envs(env).status().unwrap();
+        assert!(marker.exists(), "control: filter not run ({ran})");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn temp(tag: &str) -> PathBuf {
