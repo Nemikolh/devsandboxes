@@ -25,6 +25,7 @@ pub mod stats;
 pub mod status;
 pub mod stop;
 pub mod subnet;
+pub mod trust_origin;
 #[cfg(unix)]
 pub mod tunnel;
 pub mod vscode;

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use super::git::{check_repo, host_git};
+use super::origin::{fetch_trusted_origin, Fetched, Refs};
 
 /// Bind mount for the base repo's `.git` at the identical host path, so a
 /// worktree's absolute `gitdir` pointer resolves inside the container.
@@ -49,6 +50,9 @@ fn branch_source(local: bool, remote: bool) -> BranchSource {
 /// targeted `git fetch` of that one branch when the regular fetch didn't bring
 /// it: pattern-generated names (`sandbox/${instance}`) are new by
 /// construction, so they never pay for the extra round-trip.
+///
+/// `state_path` holds the trusted origin URLs those fetches check
+/// (`origin::fetch_trusted_origin`).
 pub(super) fn create_worktree(
     base: &Path,
     worktree: &Path,
@@ -56,6 +60,7 @@ pub(super) fn create_worktree(
     base_ref: Option<&str>,
     explicit_branch: bool,
     state: &crate::state::State,
+    state_path: &Path,
 ) -> Result<bool> {
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)
@@ -70,9 +75,9 @@ pub(super) fn create_worktree(
         BranchSource::Local
     } else {
         // Refreshes `origin` (throttled) before the remote-tracking check too.
-        let start = worktree_start_point(base, base_ref)?;
+        let start = worktree_start_point(base, base_ref, state_path)?;
         if !has_ref(&remote_ref) && explicit_branch {
-            fetch_origin_branch(base, branch);
+            fetch_origin_branch(base, branch, state_path);
         }
         match branch_source(false, has_ref(&remote_ref)) {
             BranchSource::New => {
@@ -293,21 +298,12 @@ fn admin_dir(worktree: &Path) -> Option<PathBuf> {
     Some(worktree.join(gitdir))
 }
 
-/// Best-effort, quiet fetch of one branch into `origin/<branch>`. The explicit
-/// refspec also covers single-branch clones, whose configured refspec would
-/// leave the remote-tracking ref alone. `--no-write-fetch-head` keeps this
-/// narrow fetch from marking the full one fresh (see [`fetch_origin`]). A
-/// branch missing on the remote (or no `origin`, or offline) just fails.
-fn fetch_origin_branch(base: &Path, branch: &str) {
-    if git_query(base, &["remote", "get-url", "origin"]).is_none() {
-        return;
-    }
-    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    if let Ok(mut git) = host_git(base) {
-        let _ = git
-            .args(["fetch", "--quiet", "--no-write-fetch-head", "origin", &refspec])
-            .output();
-    }
+/// Best-effort, quiet fetch of one branch into `origin/<branch>`, its own
+/// refspec covering single-branch clones too. It leaves `FETCH_HEAD` alone,
+/// so it never marks the full fetch fresh (see [`fetch_origin`]). A branch
+/// missing on the remote (or no `origin`, or offline) just fails.
+fn fetch_origin_branch(base: &Path, branch: &str, state_path: &Path) {
+    let _ = fetch_trusted_origin(state_path, base, Refs::Branch(branch));
 }
 
 /// Where `branch` is checked out among `base`'s worktrees (the base checkout
@@ -765,11 +761,12 @@ fn fetch_is_fresh(modified: std::time::SystemTime, now: std::time::SystemTime) -
     now.duration_since(modified).map_or(true, |age| age < FETCH_FRESH_FOR)
 }
 
-/// `git fetch origin` unless one ran within [`FETCH_FRESH_FOR`]. Git records no
-/// fetch timestamp, but every fetch rewrites `FETCH_HEAD`, so its mtime stands
-/// in (missing file = never fetched). `--git-path` resolves it for a base that
-/// is itself a linked worktree.
-fn fetch_origin(base: &Path) -> Result<()> {
+/// Fetch origin's branches ([`fetch_trusted_origin`]) unless a fetch ran
+/// within [`FETCH_FRESH_FOR`]. Git records no fetch timestamp, but every
+/// fetch rewrites `FETCH_HEAD`, so its mtime stands in (missing file = never
+/// fetched). `--git-path` resolves it for a base that is itself a linked
+/// worktree.
+fn fetch_origin(base: &Path, state_path: &Path) -> Result<()> {
     let fresh = git_query(base, &["rev-parse", "--git-path", "FETCH_HEAD"])
         .and_then(|p| std::fs::metadata(base.join(p)).ok())
         .and_then(|m| m.modified().ok())
@@ -777,15 +774,10 @@ fn fetch_origin(base: &Path) -> Result<()> {
     if fresh {
         return Ok(());
     }
-    let fetch = host_git(base)?
-        .args(["fetch", "--quiet", "origin"])
-        .output()
-        .context("failed to run git (is it installed?)")?;
-    if !fetch.status.success() {
+    if let Fetched::Failed(stderr) = fetch_trusted_origin(state_path, base, Refs::All { prune: false })? {
         eprintln!(
-            "warning: `git fetch origin` failed in `{}`; worktree may start from a stale ref: {}",
+            "warning: `git fetch origin` failed in `{}`; worktree may start from a stale ref: {stderr}",
             base.display(),
-            String::from_utf8_lossy(&fetch.stderr).trim()
         );
     }
     Ok(())
@@ -796,8 +788,9 @@ fn fetch_origin(base: &Path) -> Result<()> {
 /// `fetch` only moves `refs/remotes/origin/*` and adds objects — the base
 /// checkout's HEAD, index and files are untouched, so it is safe while
 /// another agent works there. It is skipped when one ran in the last two
-/// minutes (see [`fetch_origin`]). Its output is captured; a failed fetch (offline, auth) only warns and falls back to
-/// the last-fetched refs.
+/// minutes (see [`fetch_origin`]). Its output is captured; a failed fetch
+/// (offline, auth) or one refused because the origin URL isn't the trusted
+/// one only warns and falls back to the last-fetched refs.
 ///
 /// Resolution: `explicit` (`--base`/`worktree-base`) → `origin/HEAD` →
 /// `origin/main` → `origin/master` → `HEAD`. The fetch still runs for an
@@ -805,12 +798,12 @@ fn fetch_origin(base: &Path) -> Result<()> {
 /// for repos that added the remote after `git init`; we don't `remote
 /// set-head` since that writes to the base repo. Repos with no `origin` keep
 /// the old start-from-HEAD behavior.
-fn worktree_start_point(base: &Path, explicit: Option<&str>) -> Result<String> {
+fn worktree_start_point(base: &Path, explicit: Option<&str>, state_path: &Path) -> Result<String> {
     let fallback = || explicit.unwrap_or("HEAD").to_string();
     if git_query(base, &["remote", "get-url", "origin"]).is_none() {
         return Ok(fallback());
     }
-    fetch_origin(base)?;
+    fetch_origin(base, state_path)?;
     if let Some(r) = explicit {
         return Ok(r.to_string());
     }
@@ -874,7 +867,7 @@ mod tests {
         write("notes.txt", "untracked, not ignored");
         write(".vscode/tasks.json", "{}");
         write(".vscode/other.json", "{}");
-        create_worktree(&base, &wt, "sandbox/i", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &wt, "sandbox/i", None, false, &Default::default(), &root.join("state.toml")).unwrap();
         // Pre-existing destination is never overwritten.
         std::fs::write(wt.join(".env.local"), "mine").unwrap();
 
@@ -914,7 +907,7 @@ mod tests {
         for f in [".env", ".env.local", ".env.test"] {
             std::fs::write(base.join(f), f).unwrap();
         }
-        create_worktree(&base, &wt, "sandbox/p", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &wt, "sandbox/p", None, false, &Default::default(), &root.join("state.toml")).unwrap();
 
         copy_worktree_includes(&base, &wt, &["!.env.local".into(), ".env.test".into()]);
 
@@ -948,7 +941,7 @@ mod tests {
         std::fs::write(base.join("tracked.txt"), "t").unwrap();
         git(&base, &["add", "tracked.txt"]);
         git(&base, &["commit", "-q", "-m", "t"]);
-        create_worktree(&base, &wt, "sandbox/l", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &wt, "sandbox/l", None, false, &Default::default(), &root.join("state.toml")).unwrap();
         // The worktree already holds its own `.env.local`: a conflict to keep.
         std::fs::write(wt.join(".env.local"), "mine").unwrap();
         std::fs::create_dir_all(&store).unwrap();
@@ -1001,7 +994,7 @@ mod tests {
         let stores = root.join("shared-files");
         let (old, store) = (stores.join("web"), stores.join("repo-1234"));
         let wt = root.join("wt");
-        create_worktree(&base, &wt, "sandbox/a", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &wt, "sandbox/a", None, false, &Default::default(), &root.join("state.toml")).unwrap();
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join(".env"), "a").unwrap();
         std::fs::write(old.join(".env.b"), "b").unwrap();
@@ -1078,7 +1071,7 @@ mod tests {
         // Only in the store (base copy gone): the glob must still find it.
         std::fs::create_dir_all(store.join("packages/gone")).unwrap();
         std::fs::write(store.join("packages/gone/.env"), "g").unwrap();
-        create_worktree(&base, &wt, "sandbox/g", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &wt, "sandbox/g", None, false, &Default::default(), &root.join("state.toml")).unwrap();
 
         let mut got = expand_link_glob(Path::new("packages/*/.env"), &[&base, &store]);
         got.sort();
@@ -1116,11 +1109,11 @@ mod tests {
         std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        create_worktree(&base, &root.join("wt"), "sandbox/h", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &root.join("wt"), "sandbox/h", None, false, &Default::default(), &root.join("state.toml")).unwrap();
         assert!(!marker.exists(), "post-checkout hook ran on the host");
 
         git(&base, &["config", "core.fsmonitor", &hook.to_string_lossy()]);
-        let err = create_worktree(&base, &root.join("wt2"), "sandbox/f", None, false, &Default::default()).unwrap_err().to_string();
+        let err = create_worktree(&base, &root.join("wt2"), "sandbox/f", None, false, &Default::default(), &root.join("state.toml")).unwrap_err().to_string();
         assert!(err.contains("refusing to run git on"), "{err}");
         assert!(err.contains(".git/config sets core.fsmonitor"), "{err}");
         assert!(!marker.exists(), "fsmonitor ran on the host");
@@ -1199,7 +1192,7 @@ mod tests {
         git(&origin, &["commit", "-q", "--allow-empty", "-m", "two"]);
         let main_tip = git(&origin, &["rev-parse", "HEAD"]);
 
-        create_worktree(&base, &wt, "sandbox/x", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &wt, "sandbox/x", None, false, &Default::default(), &root.join("state.toml")).unwrap();
 
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]), main_tip);
         let upstream = std::process::Command::new("git")
@@ -1214,9 +1207,9 @@ mod tests {
 
         // An explicit base wins over detection; a bad one errors, no fallback.
         let wt2 = root.join("wt2");
-        create_worktree(&base, &wt2, "sandbox/y", Some("feature"), false, &Default::default()).unwrap();
+        create_worktree(&base, &wt2, "sandbox/y", Some("feature"), false, &Default::default(), &root.join("state.toml")).unwrap();
         assert_eq!(git(&wt2, &["rev-parse", "HEAD"]), feature_tip);
-        let err = create_worktree(&base, &root.join("wt3"), "sandbox/z", Some("nope"), false, &Default::default())
+        let err = create_worktree(&base, &root.join("wt3"), "sandbox/z", Some("nope"), false, &Default::default(), &root.join("state.toml"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("worktree base `nope`"), "{err}");
@@ -1274,7 +1267,7 @@ mod tests {
         let wt = root.join("wt");
 
         // An explicit base is ignored (noted), not an error.
-        let created = create_worktree(&base, &wt, "feat/a", Some("main"), true, &Default::default()).unwrap();
+        let created = create_worktree(&base, &wt, "feat/a", Some("main"), true, &Default::default(), &root.join("state.toml")).unwrap();
 
         assert!(!created);
         assert_eq!(head_branch(&wt), "feat/a");
@@ -1289,7 +1282,7 @@ mod tests {
         let base = repo(&root, "");
         let canon = base.canonicalize().unwrap();
 
-        let err = create_worktree(&base, &root.join("wt"), "main", None, true, &Default::default())
+        let err = create_worktree(&base, &root.join("wt"), "main", None, true, &Default::default(), &root.join("state.toml"))
             .unwrap_err()
             .to_string();
         assert!(err.contains(&format!("already checked out at `{}`", canon.display())), "{err}");
@@ -1302,7 +1295,7 @@ mod tests {
             base.to_string_lossy()
         ))
         .unwrap();
-        let err = create_worktree(&base, &root.join("wt"), "main", None, true, &state)
+        let err = create_worktree(&base, &root.join("wt"), "main", None, true, &state, &root.join("state.toml"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("(instance `web`)"), "{err}");
@@ -1337,7 +1330,7 @@ mod tests {
         git(&root, &["clone", "-q", &origin.to_string_lossy(), "base"]);
 
         let wt = root.join("wt");
-        let created = create_worktree(&base, &wt, "pr/1", None, true, &Default::default()).unwrap();
+        let created = create_worktree(&base, &wt, "pr/1", None, true, &Default::default(), &root.join("state.toml")).unwrap();
         assert!(!created);
         assert_eq!(head_branch(&wt), "pr/1");
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]), pr_tip);
@@ -1352,16 +1345,16 @@ mod tests {
             git(&seed, &["push", "-q", "origin", b]);
         }
         let wt2 = root.join("wt2");
-        assert!(!create_worktree(&base, &wt2, "pr/2", None, true, &Default::default()).unwrap());
+        assert!(!create_worktree(&base, &wt2, "pr/2", None, true, &Default::default(), &root.join("state.toml")).unwrap());
         assert_eq!(upstream_of(&wt2, "pr/2").as_deref(), Some("origin/pr/2"));
         // A pattern-generated name is never fetched for: a fresh branch.
         let wt3 = root.join("wt3");
-        assert!(create_worktree(&base, &wt3, "sandbox/gen", None, false, &Default::default()).unwrap());
+        assert!(create_worktree(&base, &wt3, "sandbox/gen", None, false, &Default::default(), &root.join("state.toml")).unwrap());
         assert_eq!(upstream_of(&wt3, "sandbox/gen"), None);
 
         // Neither local nor remote: today's fresh, untracked branch.
         let wt4 = root.join("wt4");
-        assert!(create_worktree(&base, &wt4, "feat/new", None, true, &Default::default()).unwrap());
+        assert!(create_worktree(&base, &wt4, "feat/new", None, true, &Default::default(), &root.join("state.toml")).unwrap());
         assert_eq!(head_branch(&wt4), "feat/new");
         assert_eq!(upstream_of(&wt4, "feat/new"), None);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1372,7 +1365,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("devsandbox-wtlock-{}", std::process::id()));
         let base = repo(&root, "");
         let (wt, detached) = (root.join("wt"), root.join("detached"));
-        create_worktree(&base, &wt, "sandbox/k", None, false, &Default::default()).unwrap();
+        create_worktree(&base, &wt, "sandbox/k", None, false, &Default::default(), &root.join("state.toml")).unwrap();
         create_detached_worktree(&base, &detached).unwrap();
         // Seen from a container: the checkouts are missing, and prune runs.
         let hidden = root.join("hidden");

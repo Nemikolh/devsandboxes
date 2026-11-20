@@ -148,4 +148,27 @@ dir is the git dir, its `config`, alternates, `commondir` and symlinks
 checked as `check_repo` checks a checkout's main git dir) and `host_git_new` for a dir with no `.git` yet (`git
 init`; refused once one is there).
 
+### Trusted origin
+
+A container can also rewrite `remote.origin.url`, making the next host
+fetch (`run`'s start point, `rm`'s prune, which a dispatcher can trigger)
+use the user's credentials on another repo or a host path and write the
+result into `refs/remotes/origin/*`, which the sandbox reads. Every host
+fetch of origin is `fetch_trusted_origin` (`src/commands/run/origin.rs`):
+
+- `run::git::read_origin` reads the URL from the common dir's `config` as
+  a file (the remote's first `url`, the one `git fetch origin` uses) and
+  keys the repo by its canonical common dir.
+- `State.trusted_origins` pins that URL on the repo's first host fetch
+  (trust on first use; a local path or `file://` URL included).
+- When the config's URL equals the pin, git fetches the pinned URL by
+  value with devsandbox's refspec (`fetch_args`:
+  `+refs/heads/*:refs/remotes/origin/*`, or one branch), never the remote
+  by name, so neither a rewrite after the check nor the config's
+  `remote.origin.fetch` matters. `refs/remotes/origin/HEAD` is left as is.
+- Otherwise nothing is fetched: a warning names both URLs and
+  `devsandbox trust-origin <folder>` (`commands::trust_origin`), which
+  re-pins to the URL the config holds now, after printing it. It is
+  local-only (`--machine` refuses it).
+
 Limitations: [status.md](../../status.md#instances)

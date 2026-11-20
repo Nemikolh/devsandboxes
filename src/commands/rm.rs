@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::{confirm, resolve_instance};
-use crate::commands::run::{host_git, unlock_worktree};
+use crate::commands::run::{fetch_trusted_origin, host_git, unlock_worktree, Fetched, Refs};
 use crate::runtime::backend;
 use crate::state::{FolderMount, State};
 
@@ -56,9 +56,10 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool, fail_on_ask: boo
     // Before teardown: the worktree's HEAD is the only record of the branch
     // it ended on, and it goes with the worktree.
     let plan = worktree.as_deref().and_then(|wt| branch_plan(&base_folder, wt, recorded));
+    let state_path = State::path()?;
     let action = plan.as_ref().map(|p| {
         if delete_branch.is_none() {
-            fetch_prune(&base_folder);
+            fetch_prune(&base_folder, &state_path);
         }
         branch_action(delete_branch, remote_state(&base_folder, &p.branch))
     });
@@ -296,14 +297,16 @@ fn check_ask(action: &BranchAction, plan: &BranchPlan, fail_on_ask: bool) -> Res
 }
 
 /// Refresh `origin` and drop remote-tracking refs of deleted branches, so a
-/// merged PR reads as gone. Best-effort: offline, the last-fetched refs
+/// merged PR reads as gone. Best-effort: offline, or with an untrusted origin
+/// URL (`fetch_trusted_origin`, pins in `state_path`), the last-fetched refs
 /// decide (a stale ref only ever makes `rm` ask more, never delete more).
-fn fetch_prune(base: &Path) {
-    if git_query(base, &["remote", "get-url", "origin"]).is_none() {
-        return;
-    }
-    if git_query(base, &["fetch", "--quiet", "--prune", "origin"]).is_none() {
-        eprintln!("warning: `git fetch --prune origin` failed; using the last-fetched remote refs");
+fn fetch_prune(base: &Path, state_path: &Path) {
+    match fetch_trusted_origin(state_path, base, Refs::All { prune: true }) {
+        Ok(Fetched::Done | Fetched::NoOrigin | Fetched::Untrusted) => {}
+        Ok(Fetched::Failed(_)) => {
+            eprintln!("warning: `git fetch --prune origin` failed; using the last-fetched remote refs")
+        }
+        Err(e) => eprintln!("warning: origin not fetched: {e:#}; using the last-fetched remote refs"),
     }
 }
 
@@ -571,7 +574,7 @@ mod tests {
         // Merged PR: the remote branch is deleted upstream; the prune sees it.
         git(&remote, &["branch", "-q", "-D", "feat"]);
         assert_eq!(state("feat"), RemoteState::InSync, "stale ref before the fetch");
-        fetch_prune(&base);
+        fetch_prune(&base, &root.join("state.toml"));
         assert_eq!(state("feat"), RemoteState::Gone);
 
         // Pushed without `-u`: `origin/<branch>` still counts.

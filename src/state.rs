@@ -395,6 +395,12 @@ pub struct State {
     /// sandbox's last instance.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub last_profile: BTreeMap<String, BTreeMap<String, String>>,
+    /// A repo's canonical common dir -> the origin URL host git fetches for
+    /// it (`commands::run::fetch_trusted_origin`): pinned on the first fetch,
+    /// so a sandbox rewriting `remote.origin.url` in its checkout can't point
+    /// host git elsewhere. Moved only by `devsandbox trust-origin`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trusted_origins: BTreeMap<String, String>,
     /// Runtime context key (`runtime::identity::context_key`) -> its probed
     /// user-namespace mode, so a context is probed once (until `--reprobe`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

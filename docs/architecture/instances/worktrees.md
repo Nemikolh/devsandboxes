@@ -8,7 +8,7 @@ touching worktree creation, branches, `.worktreeinclude`/`worktree-link` or
 
 Code: `src/commands/run/worktree.rs` (`create_worktree`,
 `create_new_branch_worktree`, `create_detached_worktree`,
-`worktree_start_point`, `fetch_origin`, `git_companion_mount`,
+`worktree_start_point`, `fetch_origin`, `fetch_origin_branch`, `git_companion_mount`,
 `lock_worktree`, `unlock_worktree`, `copy_worktree_includes`,
 `link_shared_files`), `src/commands/run/folders.rs` (`mount_folders`,
 `needs_worktree`, `folder_owned`, `folder_directly_mounted`,
@@ -55,9 +55,14 @@ validated and used verbatim.
 
 Start point (`worktree_start_point`): `run --base` / `worktree-base` →
 `origin/HEAD` → `origin/main` → `origin/master` → `HEAD`; never the base
-checkout's branch, which another agent may be using. `git fetch origin` runs
-first unless `FETCH_HEAD` is under 2 minutes old; failure only warns. No
-`origin` → the explicit ref if any, else `HEAD`, with no fetch. An unborn start or empty result is an error.
+checkout's branch, which another agent may be using. A fetch of origin's
+branches runs first unless `FETCH_HEAD` is under 2 minutes old; failure,
+or an origin URL that isn't the trusted one, only warns and the
+last-fetched refs decide. Both fetches (this one and the one-branch fetch)
+go through `fetch_trusted_origin` (see
+[mounts and state](mounts-and-state.md#trusted-origin)). No `origin` → the
+explicit ref if any, else `HEAD`, with no fetch. An unborn start or empty
+result is an error.
 
 `Instance.branch_created` records whether `run` made the branch; `rm` only
 considers deleting branches it made (see [lifecycle](lifecycle.md#rm)).

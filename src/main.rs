@@ -139,6 +139,12 @@ enum Command {
         /// New instance name
         new_name: String,
     },
+    /// Trust the origin URL a repo's config holds now: host git fetches only
+    /// the URL pinned on its first fetch, so a sandbox can't redirect it
+    TrustOrigin {
+        /// The repo's checkout (a folder with a `.git`)
+        folder: PathBuf,
+    },
     /// Show or switch an instance's profile (one of its sandbox's `profiles`)
     Profile {
         /// Exact instance name (no sandbox/folder resolution);
@@ -932,6 +938,7 @@ fn main() -> Result<()> {
             result
         }
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
+        Command::TrustOrigin { folder } => commands::trust_origin::trust_origin(&folder),
         Command::Profile { name, profile } => commands::profile::profile(&name, profile.as_deref()),
         Command::Rm { name, delete_branch, keep_branch, force, fail_on_ask } => {
             let result = commands::rm::rm(&name, rm_branch_flag(delete_branch, keep_branch), force, fail_on_ask);

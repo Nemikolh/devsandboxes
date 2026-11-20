@@ -17,7 +17,8 @@ Start with `docs/README.md` (reading order and map) and
 - `src/exe.rs` — `devsandbox()`, the binary to spawn (re-resolved per spawn,
   survives an upgrade), and `own_build_stamp()`, this process's own mtime.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
-  `rm`, `ps`, `ls`, `exec`, `done`, `rename`, `profile`, `vscode`, `fetch`,
+  `rm`, `ps`, `ls`, `exec`, `done`, `rename`, `trust_origin` (`trust-origin`),
+  `profile`, `vscode`, `fetch`,
   `inbox`, `logs`, `inspect`, `stats`, `status`, `port`, `machine`,
   `fleet_link` (hidden `fleet-link`), `services::{gc,ls,rebuild}`); not
   verbs: `subnet.rs` (service-network subnet checks) and `tunnel.rs`
@@ -38,6 +39,8 @@ Start with `docs/README.md` (reading order and map) and
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
   `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the
   host runs git — hooks/fsmonitor off, repo config allowlist-checked),
+  `origin.rs` (`fetch_trusted_origin`: every host fetch of `origin`, only
+  the URL pinned in `State.trusted_origins`),
   `ssh_agent.rs`, `mounts.rs`, `image.rs`
   (feature image + Dockerfile/entrypoint generation), `lifecycle.rs`,
   `editor.rs` (VS Code name config), `identity.rs` (mode probe, the plan's

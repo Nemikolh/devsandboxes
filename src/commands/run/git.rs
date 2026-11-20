@@ -84,6 +84,44 @@ pub(crate) fn check_repo(repo: &Path) -> Result<()> {
     check_dirs(repo, &gitdir, &common)
 }
 
+/// The repo at `repo`'s identity for origin trust and the origin URL its
+/// config holds now, after [`check_repo`]'s checks.
+pub(crate) struct Origin {
+    /// The canonical common dir: every checkout of one repo shares it.
+    pub common: PathBuf,
+    /// `None`: no `remote.origin.url`.
+    pub url: Option<String>,
+}
+
+/// Read `repo`'s [`Origin`] from the common dir's `config` as a file, never
+/// via `git config`.
+pub(crate) fn read_origin(repo: &Path) -> Result<Origin> {
+    let (gitdir, common) = git_dirs(repo)?;
+    check_dirs(repo, &gitdir, &common)?;
+    let config = common.join("config");
+    let url = match std::fs::read(&config) {
+        Ok(bytes) => {
+            let entries = parse_config(&String::from_utf8_lossy(&bytes))
+                .map_err(|why| anyhow::anyhow!("cannot parse {} ({why})", config.display()))?;
+            origin_url(&entries)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", config.display())),
+    };
+    let common = common.canonicalize().with_context(|| format!("cannot resolve {}", common.display()))?;
+    Ok(Origin { common, url })
+}
+
+/// The URL `git fetch origin` would use: a remote's *first* `url` (more are
+/// push-only targets), unlike most keys, where the last wins. The legacy
+/// `[remote.Origin]` form names `origin` too: the parser lowercases it.
+fn origin_url(entries: &[Entry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| e.section == "remote" && e.subsection.as_deref() == Some("origin") && e.key == "url")
+        .and_then(|e| e.value.clone())
+}
+
 /// [`check_repo`] over a known git dir and common dir (`repo` names them in
 /// messages).
 fn check_dirs(repo: &Path, gitdir: &Path, common: &Path) -> Result<()> {
@@ -619,6 +657,31 @@ mod tests {
             let entries = parse_config(text).unwrap();
             assert_eq!(entries.iter().find_map(refusal).as_deref(), *want, "{text}");
         }
+    }
+
+    #[test]
+    fn origin_url_is_the_first_url_of_remote_origin() {
+        let url = |text: &str| origin_url(&parse_config(text).unwrap());
+        assert_eq!(url("[core]\nbare = false"), None);
+        assert_eq!(url("[remote \"upstream\"]\nurl = /u\n[remote \"Origin\"]\nurl = /x"), None);
+        assert_eq!(url("[remote \"origin\"]\nfetch = x\nURL = /a\nurl = /b\n[remote \"origin\"]\nurl = /c"), Some("/a".into()));
+        assert_eq!(url("[remote.ORIGIN]\nurl = /legacy\n[remote \"origin\"]\nurl = /b"), Some("/legacy".into()));
+    }
+
+    #[test]
+    fn read_origin_keys_checkouts_by_canonical_common_dir() {
+        let root = temp("origin");
+        let (base, wt) = base_and_worktree(&root);
+        let none = read_origin(&base).unwrap();
+        assert_eq!((none.common, none.url), (base.join(".git").canonicalize().unwrap(), None));
+        git_in(&base, &["remote", "add", "origin", "/srv/repo.git"]);
+        for repo in [&base, &wt] {
+            let o = read_origin(repo).unwrap();
+            assert_eq!((o.common, o.url.as_deref()), (base.join(".git").canonicalize().unwrap(), Some("/srv/repo.git")));
+        }
+        std::fs::write(base.join(".git/config.worktree"), "[core]\n\tfsmonitor = x\n").unwrap();
+        assert!(read_origin(&base).is_err(), "refused like check_repo");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

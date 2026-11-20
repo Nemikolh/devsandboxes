@@ -175,8 +175,11 @@ runs afresh for every exec, so upgrading it fixes existing containers.
    nothing is half torn down.
 2. Decide the branch (`branch_plan`: the worktree's current branch, never
    the remote's default; plus the recorded one if it is an ancestor). With no
-   flag: `git fetch --prune`, delete when in sync with or gone from the
-   remote, else ask (off a TTY: keep; `--fail-on-ask` exits 3 for the
+   flag: a pruning fetch of origin (`fetch_prune`, through
+   `fetch_trusted_origin`: only the trusted URL, see
+   [mounts and state](mounts-and-state.md#trusted-origin); offline or
+   untrusted, the last-fetched refs decide), delete when in sync with or
+   gone from the remote, else ask (off a TTY: keep; `--fail-on-ask` exits 3 for the
    daemon's confirm round).
 3. Remove the container, isolated services and instance network
    (`remove_container`); per-instance volumes; the ssh-agent link; `folders`

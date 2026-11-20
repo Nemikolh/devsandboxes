@@ -23,6 +23,7 @@ mod identity;
 mod image;
 mod lifecycle;
 mod mounts;
+mod origin;
 mod profile;
 mod progress;
 mod ssh_agent;
@@ -30,7 +31,8 @@ pub(crate) mod tool_env;
 mod worktree;
 
 pub(crate) use editor::write_vscode_name_config;
-pub(crate) use git::{check_repo, host_git, host_git_bare, host_git_new};
+pub(crate) use git::{check_repo, host_git, host_git_bare, host_git_new, read_origin};
+pub(crate) use origin::{fetch_trusted_origin, trust_key, Fetched, Refs};
 pub(crate) use gpu::gpu_decision;
 pub(crate) use lifecycle::exec_lifecycle;
 pub(crate) use profile::choose_profile;
@@ -394,7 +396,8 @@ fn prepare_worktree(
         // Start point: `--base`, else the sandbox's `worktree-base`, else
         // detected from the remote (see `worktree_start_point`).
         let base_ref = base_override.or_else(|| props.worktree_base.clone());
-        let created = create_worktree(folder, &wt, &branch, base_ref.as_deref(), explicit_branch, state)?;
+        let created =
+            create_worktree(folder, &wt, &branch, base_ref.as_deref(), explicit_branch, state, &State::path()?)?;
         (wt.clone(), Some(wt), Some(branch), created)
     } else {
         (folder.to_path_buf(), None, None, true)

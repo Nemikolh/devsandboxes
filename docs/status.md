@@ -295,6 +295,11 @@ is frozen: no new work on it.
   `commondir`, config) in between. Fixed by clones replacing worktrees
   ([git-gateway](plans/explore/git-gateway.md)).
   → [mounts](architecture/instances/mounts-and-state.md#host-git); `run::git::check_repo`
+- The origin URL is trusted on first use: a repo whose `remote.origin.url`
+  a sandbox rewrote before its first host fetch gets the rewritten URL
+  pinned.
+  → [mounts](architecture/instances/mounts-and-state.md#trusted-origin);
+  `run::origin::fetch_trusted_origin`
 
 ### config
 
