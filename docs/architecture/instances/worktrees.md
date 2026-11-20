@@ -18,7 +18,12 @@ Code: `src/commands/run/worktree.rs` (`create_worktree`,
 Config fields: [config-toml-spec](../../../skills/config-toml-spec/SKILL.md).
 
 All host git runs through `host_git`, which refuses repos whose config could
-run code: see [mounts and state](mounts-and-state.md#host-git).
+run code, and repos whose git dirs point it elsewhere: a `.git` symlink, a
+`gitdir:` file that isn't git's own link of a worktree (the
+`worktrees/<name>/gitdir` back-pointer must name the checkout), a
+`commondir` outside such an admin dir, or a symlink in the git dirs. A
+worktree made here is git's own link, so it passes. See
+[mounts and state](mounts-and-state.md#host-git).
 
 ## When an instance gets a worktree
 

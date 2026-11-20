@@ -10,6 +10,15 @@
 //! line and refuses repos whose local config holds anything outside a small
 //! allowlist of keys known not to run commands. The config is read as files,
 //! never via `git config`, which would follow includes.
+//!
+//! The same container can also *point* host git elsewhere: a `gitdir:` file
+//! or `commondir` naming another host repo, or a symlink in the git dir
+//! (`refs/heads`, `objects`, `index`, …) redirecting its reads and writes.
+//! So a `.git` symlink is refused, a `gitdir:` file only accepted when it is
+//! a linked worktree git itself made (`<common>/worktrees/<name>` whose
+//! `gitdir` back-pointer names this checkout), `commondir` only in such an
+//! admin dir, and no symlink may sit in the git dirs where git looks
+//! ([`symlink_refusal`]).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,8 +34,9 @@ pub(crate) fn host_git(repo: &Path) -> Result<Command> {
 
 /// A `git` command for the bare repo `dir` (a repo devsandbox keeps for
 /// itself, as the fleet's repo cache): `dir` is the git dir, its `config`
-/// and alternates checked as [`check_repo`] checks a checkout's, hooks and
-/// fsmonitor off as [`host_git`]'s.
+/// and alternates checked as [`check_repo`] checks a checkout's, symlinks and
+/// `commondir` refused as in a checkout's main git dir, hooks and fsmonitor
+/// off as [`host_git`]'s.
 pub(crate) fn host_git_bare(dir: &Path) -> Result<Command> {
     check_dirs(dir, dir, dir)?;
     let mut cmd = Command::new("git");
@@ -67,7 +77,8 @@ fn safe_env(mut cmd: Command) -> Command {
 }
 
 /// Refuse `repo` when its local config (or an alternates file) could make
-/// host git run commands or read objects from elsewhere.
+/// host git run commands or read objects from elsewhere, or when its git
+/// dirs point host git at another repo or files (see the module docs).
 pub(crate) fn check_repo(repo: &Path) -> Result<()> {
     let (gitdir, common) = git_dirs(repo)?;
     check_dirs(repo, &gitdir, &common)
@@ -80,6 +91,21 @@ fn check_dirs(repo: &Path, gitdir: &Path, common: &Path) -> Result<()> {
         anyhow::anyhow!("refusing to run git on {}: {what}", repo.display())
     };
     let shown = |p: &Path| p.strip_prefix(repo).unwrap_or(p).display().to_string();
+    let commondir = gitdir.join("commondir");
+    if gitdir == common && commondir.symlink_metadata().is_ok() {
+        return Err(refuse(format!(
+            "{} exists in a main git dir, which points host git at another repo; a sandbox may \
+             have written it — review and remove it",
+            shown(&commondir)
+        )));
+    }
+    if let Some(link) = symlink_refusal(gitdir, common).map_err(|e| refuse(format!("{e:#}")))? {
+        return Err(refuse(format!(
+            "{} is a symlink, which points host git at files outside the repo; a sandbox may \
+             have written it — review and remove it",
+            shown(&link)
+        )));
+    }
     let alternates = common.join("objects/info/alternates");
     if alternates.symlink_metadata().is_ok() {
         return Err(refuse(format!(
@@ -109,30 +135,101 @@ fn check_dirs(repo: &Path, gitdir: &Path, common: &Path) -> Result<()> {
 }
 
 /// `(gitdir, common dir)` of the checkout at `repo`, found the way git does
-/// for `git -C repo` without running it: `<repo>/.git` is the git dir, or a
-/// `gitdir: <path>` file pointing at it (a linked worktree); a `commondir`
-/// file in the git dir points at the shared one. Anything else (no `.git`, a
-/// bare repo) is refused rather than guessed at.
+/// for `git -C repo` without running it: `<repo>/.git` is the git dir (its
+/// own common dir), or a `gitdir: <path>` file pointing at a linked
+/// worktree's admin dir `<common>/worktrees/<name>`, accepted only when that
+/// dir's `gitdir` back-pointer names this `.git` and its `commondir` names
+/// `<common>`. Anything else (no `.git`, a `.git` symlink, a bare repo, a
+/// `gitdir:` file git didn't write for this checkout) is refused rather than
+/// guessed at. A linked worktree's dirs come back canonical.
 fn git_dirs(repo: &Path) -> Result<(PathBuf, PathBuf)> {
+    let refuse = |what: String| anyhow::anyhow!("refusing to run git on {}: {what}", repo.display());
     let dotgit = repo.join(".git");
-    let meta = std::fs::metadata(&dotgit)
-        .with_context(|| format!("refusing to run git on {}: no .git found", repo.display()))?;
-    let gitdir = if meta.is_dir() {
-        dotgit
-    } else {
-        let text = std::fs::read_to_string(&dotgit)
-            .with_context(|| format!("cannot read {}", dotgit.display()))?;
-        let Some(path) = text.strip_prefix("gitdir:").map(str::trim) else {
-            bail!("refusing to run git on {}: .git is not a `gitdir:` file", repo.display());
-        };
-        repo.join(path)
+    let meta = std::fs::symlink_metadata(&dotgit).map_err(|_| refuse("no .git found".into()))?;
+    if meta.is_symlink() {
+        return Err(refuse(
+            ".git is a symlink, which points host git at another repo; a sandbox may have written \
+             it — review and remove it"
+                .into(),
+        ));
+    }
+    if meta.is_dir() {
+        return Ok((dotgit.clone(), dotgit));
+    }
+    let text = std::fs::read_to_string(&dotgit).with_context(|| format!("cannot read {}", dotgit.display()))?;
+    let Some(path) = text.strip_prefix("gitdir:").map(str::trim) else {
+        bail!("refusing to run git on {}: .git is not a `gitdir:` file", repo.display());
     };
-    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
-        Ok(text) => gitdir.join(text.trim()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => gitdir.clone(),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", gitdir.join("commondir").display())),
+    let unlinked = |why: &str| {
+        refuse(format!(
+            ".git points at {path}, {why}; a sandbox may have written it — review and remove it"
+        ))
     };
+    let gitdir = repo
+        .join(path)
+        .canonicalize()
+        .map_err(|e| unlinked(&format!("which cannot be resolved ({e})")))?;
+    let common = match gitdir.parent() {
+        Some(worktrees) if worktrees.file_name().is_some_and(|n| n == "worktrees") => worktrees.parent(),
+        _ => None,
+    }
+    .ok_or_else(|| unlinked("which is not a linked worktree's `<repo>/worktrees/<name>` dir"))?
+    .to_path_buf();
+    let resolves_to = |file: &str, want: &Path| -> bool {
+        std::fs::read_to_string(gitdir.join(file))
+            .ok()
+            .and_then(|text| gitdir.join(text.trim()).canonicalize().ok())
+            .is_some_and(|p| p == want)
+    };
+    let this = dotgit.canonicalize().with_context(|| format!("cannot resolve {}", dotgit.display()))?;
+    if !resolves_to("gitdir", &this) {
+        return Err(unlinked("whose `gitdir` back-pointer does not name this checkout"));
+    }
+    if !resolves_to("commondir", &common) {
+        return Err(unlinked(&format!("whose `commondir` does not name {}", common.display())));
+    }
     Ok((gitdir, common))
+}
+
+/// The first symlink where git would follow it into another file: a direct
+/// entry of `gitdir` or `common`, anything under their `refs/`, or a direct
+/// entry of `objects/`, `objects/info/`, `objects/pack/`. Loose objects
+/// aren't walked: too many, and a redirected one only fails to inflate.
+fn symlink_refusal(gitdir: &Path, common: &Path) -> Result<Option<PathBuf>> {
+    // Breadth first: a dir is listed only after its parent's entry was seen
+    // not to be a symlink.
+    let mut dirs = std::collections::VecDeque::from([(gitdir.to_path_buf(), false)]);
+    if common != gitdir {
+        dirs.push_back((common.to_path_buf(), false));
+    }
+    for sub in ["objects", "objects/info", "objects/pack"] {
+        dirs.push_back((common.join(sub), false));
+    }
+    // A symlinked reflog makes host git append to any host file.
+    for sub in ["refs", "logs"] {
+        dirs.push_back((gitdir.join(sub), true));
+        if common != gitdir {
+            dirs.push_back((common.join(sub), true));
+        }
+    }
+    while let Some((dir, recurse)) = dirs.pop_front() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("cannot list {}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("cannot list {}", dir.display()))?;
+            let kind = entry.file_type().with_context(|| format!("cannot stat {}", entry.path().display()))?;
+            if kind.is_symlink() {
+                return Ok(Some(entry.path()));
+            }
+            if recurse && kind.is_dir() {
+                dirs.push_back((entry.path(), true));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Every config file git may read for any checkout of this repo: the shared
@@ -542,21 +639,169 @@ mod tests {
         root
     }
 
+    fn git_in(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A repo at `<root>/base` with one commit and git's own linked worktree
+    /// of it at `<root>/wt`.
+    fn base_and_worktree(root: &Path) -> (PathBuf, PathBuf) {
+        let (base, wt) = (root.join("base"), root.join("wt"));
+        std::fs::create_dir_all(&base).unwrap();
+        git_in(&base, &["init", "-q", "-b", "main"]);
+        std::fs::write(base.join("f"), "x\n").unwrap();
+        git_in(&base, &["add", "f"]);
+        git_in(&base, &["commit", "-q", "-m", "x"]);
+        git_in(&base, &["worktree", "add", "-q", "-b", "wt", wt.to_str().unwrap()]);
+        (base, wt)
+    }
+
+    fn refusal_of(repo: &Path) -> String {
+        format!("{:#}", check_repo(repo).unwrap_err())
+    }
+
     #[test]
     fn git_dirs_for_checkout_and_linked_worktree() {
         let root = temp("dirs");
-        let (base, wt) = (root.join("base"), root.join("wt"));
-        let wtdir = base.join(".git/worktrees/wt");
-        std::fs::create_dir_all(&wtdir).unwrap();
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(wtdir.join("commondir"), "../..\n").unwrap();
-        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wtdir.display())).unwrap();
+        let (base, wt) = base_and_worktree(&root);
+        let common = base.join(".git").canonicalize().unwrap();
 
         assert_eq!(git_dirs(&base).unwrap(), (base.join(".git"), base.join(".git")));
-        assert_eq!(git_dirs(&wt).unwrap(), (wtdir.clone(), wtdir.join("../..")));
+        assert_eq!(git_dirs(&wt).unwrap(), (common.join("worktrees/wt"), common.clone()));
+        check_repo(&wt).unwrap();
+        // git's relative form (`worktree.useRelativePaths`) resolves the same.
         std::fs::write(wt.join(".git"), "gitdir: ../base/.git/worktrees/wt\n").unwrap();
-        assert_eq!(git_dirs(&wt).unwrap().0, wt.join("../base/.git/worktrees/wt"));
+        std::fs::write(common.join("worktrees/wt/gitdir"), "../../../../wt/.git\n").unwrap();
+        assert_eq!(git_dirs(&wt).unwrap().0, common.join("worktrees/wt"));
         assert!(git_dirs(&root).is_err(), "no .git");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn redirected_gitdir_and_commondir_refuse() {
+        let root = temp("redirect");
+        let (base, wt) = base_and_worktree(&root);
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        git_in(&other, &["init", "-q"]);
+
+        // A planted `gitdir:` at another repo's git dir.
+        let checkout = root.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join(".git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+        let err = refusal_of(&checkout);
+        assert!(err.contains("not a linked worktree's"), "{err}");
+
+        // A planted `gitdir:` at a real worktree's admin dir: its back-pointer
+        // names `wt`, not this checkout.
+        let admin = base.join(".git/worktrees/wt");
+        std::fs::write(checkout.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let err = refusal_of(&checkout);
+        assert!(err.contains("back-pointer does not name this checkout"), "{err}");
+
+        // A forged admin dir under `other` whose back-pointer names another
+        // checkout, then one that names this checkout but has no `commondir`.
+        let fake = other.join(".git/worktrees/x");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(fake.join("commondir"), "../..\n").unwrap();
+        std::fs::write(fake.join("gitdir"), format!("{}\n", wt.join(".git").display())).unwrap();
+        std::fs::write(checkout.join(".git"), format!("gitdir: {}\n", fake.display())).unwrap();
+        let err = refusal_of(&checkout);
+        assert!(err.contains("back-pointer does not name this checkout"), "{err}");
+        std::fs::write(fake.join("gitdir"), format!("{}\n", checkout.join(".git").display())).unwrap();
+        std::fs::remove_file(fake.join("commondir")).unwrap();
+        let err = refusal_of(&checkout);
+        assert!(err.contains("`commondir` does not name"), "{err}");
+
+        // A worktree's `commondir` pointing at another repo.
+        std::fs::write(admin.join("commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+        let err = refusal_of(&wt);
+        assert!(err.contains("`commondir` does not name"), "{err}");
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        check_repo(&wt).unwrap();
+
+        std::fs::write(base.join(".git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+        let err = refusal_of(&base);
+        assert!(err.contains(".git/commondir exists in a main git dir"), "{err}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_in_git_dirs_refuse() {
+        use std::os::unix::fs::symlink;
+        let root = temp("symlinks");
+        let (base, wt) = base_and_worktree(&root);
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let git = base.join(".git");
+
+        // `(path in the base's .git, whether it's a dir)`: each swapped for a
+        // symlink must refuse, from the base and from the linked worktree.
+        for (rel, is_dir) in [("refs/heads", true), ("objects", true), ("index", false), ("refs/heads/main", false), ("objects/pack", true), ("logs/HEAD", false)] {
+            let p = git.join(rel);
+            let saved = root.join("saved");
+            std::fs::rename(&p, &saved).unwrap();
+            let target = if is_dir { elsewhere.clone() } else { elsewhere.join("f") };
+            symlink(&target, &p).unwrap();
+            for repo in [&base, &wt] {
+                let err = refusal_of(repo);
+                assert!(err.contains(&format!("{rel} is a symlink")), "{rel}: {err}");
+            }
+            std::fs::remove_file(&p).unwrap();
+            std::fs::rename(&saved, &p).unwrap();
+            check_repo(&base).unwrap();
+        }
+
+        // In the worktree's own admin dir.
+        symlink(elsewhere.join("f"), git.join("worktrees/wt/index.lock")).unwrap();
+        let err = refusal_of(&wt);
+        assert!(err.contains("worktrees/wt/index.lock is a symlink"), "{err}");
+        std::fs::remove_file(git.join("worktrees/wt/index.lock")).unwrap();
+
+        // `.git` itself, as a dir symlink or a symlinked `gitdir:` file.
+        let checkout = root.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        symlink(&git, checkout.join(".git")).unwrap();
+        let err = refusal_of(&checkout);
+        assert!(err.contains(".git is a symlink"), "{err}");
+        std::fs::remove_file(checkout.join(".git")).unwrap();
+        symlink(wt.join(".git"), checkout.join(".git")).unwrap();
+        let err = refusal_of(&checkout);
+        assert!(err.contains(".git is a symlink"), "{err}");
+
+        // A symlinked parent path to the repo is fine.
+        let via = root.join("via");
+        symlink(&root, &via).unwrap();
+        check_repo(&via.join("base")).unwrap();
+        check_repo(&via.join("wt")).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_repo_refuses_symlinks_and_commondir() {
+        use std::os::unix::fs::symlink;
+        let root = temp("bare");
+        let cache = root.join("c.git");
+        std::fs::create_dir_all(&cache).unwrap();
+        git_in(&cache, &["init", "-q", "--bare"]);
+        host_git_bare(&cache).unwrap();
+        symlink(root.join("x"), cache.join("refs/heads/main")).unwrap();
+        let err = format!("{:#}", host_git_bare(&cache).unwrap_err());
+        assert!(err.contains("refs/heads/main is a symlink"), "{err}");
+        std::fs::remove_file(cache.join("refs/heads/main")).unwrap();
+        std::fs::write(cache.join("commondir"), "/elsewhere\n").unwrap();
+        let err = format!("{:#}", host_git_bare(&cache).unwrap_err());
+        assert!(err.contains("commondir exists in a main git dir"), "{err}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

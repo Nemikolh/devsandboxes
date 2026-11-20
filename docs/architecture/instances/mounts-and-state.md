@@ -128,6 +128,15 @@ git call on a sandbox's repo goes through `run::git::host_git`:
   `insteadOf`, submodule) refuse too, as does any
   `objects/info/alternates`. A refusal names the file and key for the user
   to review; nothing is auto-fixed.
+- `check_repo` also refuses a repo whose git dirs point host git elsewhere
+  (`git_dirs`, `check_dirs`, `symlink_refusal`): a `.git` symlink; a
+  `gitdir:` file other than git's own linked worktree (it must name
+  `<common>/worktrees/<name>`, whose `gitdir` back-pointer names this
+  checkout's `.git` and whose `commondir` names `<common>`, paths compared
+  canonical); a `commondir` in a main git dir; a symlink as a direct entry
+  of the git dir or common dir, anywhere under their `refs/` or `logs/`, or in
+  `objects/`, `objects/info/`, `objects/pack/`. The path *to* the repo may
+  go through symlinks.
 
 `rm` runs `check_repo` before tearing anything down so it never stops
 half-way.
@@ -135,8 +144,8 @@ half-way.
 Two siblings cover the git the fleet's code moving runs
 ([fleet](../daemon/fleet.md#moving-code)), with the same flags and env:
 `host_git_bare` for a bare repo devsandbox keeps (the control plane's repo cache: the
-dir is the git dir, its `config` and alternates checked as `check_repo`
-checks a checkout's) and `host_git_new` for a dir with no `.git` yet (`git
+dir is the git dir, its `config`, alternates, `commondir` and symlinks
+checked as `check_repo` checks a checkout's main git dir) and `host_git_new` for a dir with no `.git` yet (`git
 init`; refused once one is there).
 
 Limitations: [status.md](../../status.md#instances)

@@ -290,6 +290,11 @@ is frozen: no new work on it.
   `gc.worktreePruneExpire=never` covers them), and the lock file is
   writable from the container. → [worktrees](architecture/instances/worktrees.md);
   `lock_worktree`, `gc_keeps_worktrees_env`
+- Host git checks a repo's git dirs and config, then runs: a container
+  running at the same time can swap a file (a symlink, `gitdir:`,
+  `commondir`, config) in between. Fixed by clones replacing worktrees
+  ([git-gateway](plans/explore/git-gateway.md)).
+  → [mounts](architecture/instances/mounts-and-state.md#host-git); `run::git::check_repo`
 
 ### config
 
