@@ -83,7 +83,7 @@ export const placement: MachinesState[] = [
               name: 'devsandbox serve',
               serve: true,
               sub: 'broker: grants · policy · minting',
-              body: ['credentials.toml says who gets what', { sockets: [{ name: 'github', note: 'keyring' }, { name: 'sentry-work', note: 'keyring' }, { name: 'anthropic', note: 'OAuth' }] }],
+              body: ['credentials.toml says who gets what', { sockets: [{ name: 'github', note: 'app key' }, { name: 'sentry-work', note: 'token' }, { name: 'anthropic', note: 'API key' }] }],
             },
             { hop: [{ n: 3, label: 'real token, upstream TLS' }], tone: 'agent' },
             { name: 'api.github.com · sentry.io · api.anthropic.com', icon: 'cable' },
@@ -94,7 +94,7 @@ export const placement: MachinesState[] = [
           role: 'box · runs web-2',
           items: [
             { name: 'sandbox web-2', icon: 'terminal', body: ['GH_TOKEN, SENTRY_AUTH_TOKEN: phantoms', 'HTTPS_PROXY, base URLs: 127.0.0.1 (devsbd)'] },
-            { hop: [{ n: 1, label: 'Open(http-proxy) through the bridge' }], tone: 'helper' },
+            { hop: [{ n: 1, label: 'Open(HTTP_PROXY) through the bridge' }], tone: 'helper' },
             { name: 'devsandbox serve', serve: true, sub: 'instance host', body: ["TLS ends here, B's own CA", 'knows which instance asked'] },
           ],
         },
@@ -113,10 +113,10 @@ export const placement: MachinesState[] = [
     },
     arrows: [
       { from: 'web-2', to: 'B serve', label: '(1) a request', detail: md("gh talks HTTPS to the helper's loopback proxy; the stream arrives on web-2's bridge, so the instance is known without asking the sandbox.") },
-      { from: 'B', to: 'L', label: '(2) to the home', detail: md('B forwards the decrypted request with a claim it signs with its member key: instance, sandbox, profile, linked repos. L trusts B for its own instances, as far as L granted B.') },
+      { from: 'B', to: 'L', label: '(2) to the home', detail: md('B forwards the decrypted request with a claim it signs with its member key: instance, sandbox, profile, linked repos, the access request from its config. L trusts B for its own instances, as far as L granted B.') },
       { from: 'L', to: 'upstream', label: '(3) the real call', detail: md('L checks the policy, swaps the phantom for a token (minted and downscoped when the provider can) and makes the call itself.') },
     ],
-    note: md('Works the same for a sandbox on L: (2) is a local call. L offline means brokered calls from B fail, like the agent today. Every credential can be brokered this way, minted or not.'),
+    note: md('Works the same for a sandbox on L: (2) is a local call. L offline means B holds the call briefly, then answers `503`, like the agent today: log in on an always-on member for credentials remote sandboxes use. Every credential can be brokered this way, minted or not.'),
   },
   {
     id: 'delegated',
@@ -126,15 +126,15 @@ export const placement: MachinesState[] = [
         {
           id: 'L',
           role: 'laptop · credential home',
-          items: [{ name: 'devsandbox serve', serve: true, sub: 'credential home', body: ['keeps the GitHub App key, OAuth refresh tokens', 'mints for B on demand, revokes on withdraw or rm'] }],
+          items: [{ name: 'devsandbox serve', serve: true, sub: 'credential home', body: ['keeps the GitHub App key', 'mints for B on demand, revokes on withdraw or rm'] }],
         },
         {
           id: 'B',
           role: 'box · always on',
           items: [
             { name: 'sandbox web-2', icon: 'terminal', body: ['phantoms, as before'] },
-            { hop: [{ label: 'Open(http-proxy)' }], tone: 'helper' },
-            { name: 'devsandbox serve', serve: true, sub: 'delegate', body: ['a minted token per instance, sealed to its member key', 'expired: one extra hop to L, the request waits, never fails'] },
+            { hop: [{ label: 'Open(HTTP_PROXY)' }], tone: 'helper' },
+            { name: 'devsandbox serve', serve: true, sub: 'delegate', body: ['a minted token per instance', 'expired: one extra hop to L, the request waits, never fails'] },
             { hop: [{ n: 2, label: 'upstream TLS' }], tone: 'agent' },
             { name: 'api.github.com', icon: 'cable' },
           ],
@@ -145,7 +145,7 @@ export const placement: MachinesState[] = [
     },
     arrows: [
       { from: 'L', to: 'B', label: '(1) mint', detail: md('`delegate = ["B"]` on a mintable credential: B asks L for a token narrowed to one instance (its repos, its permissions) when it has none or the last one expired, and holds the request meanwhile. L never sends the app key or a refresh token.') },
-      { from: 'B', to: 'upstream', label: '(2) direct', detail: md('B injects and calls upstream itself. A compromised B leaks at most one instance\'s scope, for at most the token\'s life.') },
+      { from: 'B', to: 'upstream', label: '(2) direct', detail: md('B injects and calls upstream itself. A compromised B leaks at most its own instances\' scopes, for at most the tokens\' life.') },
     ],
     note: md('The Kubernetes NodeRestriction rule, applied to tokens: a member only ever holds what its own instances may use. A static credential (a Sentry token, an API key) can\'t be narrowed, so delegating it would mean copying it: it stays brokered from L.'),
   },
@@ -161,14 +161,14 @@ const ghLanes: Lane[] = [
 
 const ghSteps: Step[] = [
   { kind: 'phase', label: 'in the sandbox' },
-  { kind: 'act', at: 'gh', label: 'GH_TOKEN=dsbx_ph_9f…', sub: 'a phantom, bound to web-2: worthless anywhere else' },
+  { kind: 'act', at: 'gh', label: 'GH_TOKEN=dsbx_github_9f…', sub: 'a phantom, bound to web-2: worthless anywhere else' },
   { from: 'gh', to: 'daemon', label: 'CONNECT api.github.com:443', sub: "HTTPS_PROXY=127.0.0.1:7890, the helper's listener" },
-  { from: 'daemon', to: 'b', label: 'Open(http-proxy) · Data …', sub: "channel 2 (reserved today) · on web-2's bridge", tone: 'helper' },
+  { from: 'daemon', to: 'b', label: 'Open(HTTP_PROXY) · Data …', sub: "channel 2 (reserved today) · on web-2's bridge", tone: 'helper' },
   { kind: 'act', at: 'b', label: 'terminate TLS', sub: "a leaf for api.github.com from B's CA; the CA key never enters a container" },
   { kind: 'act', at: 'b', label: 'POST /repos/acme/web/pulls', sub: 'phantom → credential github · instance web-2 · profile work' },
   { kind: 'phase', label: 'at the credential home' },
   { from: 'b', to: 'l', label: 'CRED: signed claim + request', sub: 'over the held link, like AGENT streams', tone: 'agent' },
-  { kind: 'act', at: 'l', label: 'grant ∩ access ∩ scope → allow', sub: 'github granted to B for work · pr.write on a linked repo' },
+  { kind: 'act', at: 'l', label: 'grant ∩ access ∩ fence ∩ scope → allow', sub: 'github granted to B for work · acme/web in the fence · pr.write' },
   { kind: 'act', at: 'l', label: 'swap the phantom', sub: 'installation token for [acme/web], pull_requests:write, cached ≤ 1 h', tone: 'agent' },
   { from: 'l', to: 'up', label: 'POST /repos/acme/web/pulls', sub: 'Authorization: token ghs_…', tone: 'agent' },
   { from: 'up', to: 'l', label: '201 Created', tone: 'runtime' },
@@ -181,7 +181,7 @@ const askLanes: Lane[] = [
   { id: 'agent', label: 'zidane', sub: 'agent in web-2', tone: 'client' },
   { id: 'b', label: 'devsandbox serve', sub: 'B · broker', tone: 'serve' },
   { id: 'l', label: 'devsandbox serve', sub: 'L · credential home', tone: 'serve' },
-  { id: 'you', label: 'you', sub: 'dashboard modal · popup · CLI', tone: 'notify' },
+  { id: 'you', label: 'you', sub: 'dashboard modal · popup · CLI, on L or an approver', tone: 'notify' },
 ];
 
 const askSteps: Step[] = [
@@ -189,7 +189,7 @@ const askSteps: Step[] = [
   { from: 'b', to: 'l', label: 'CRED: claim + request', tone: 'agent' },
   { kind: 'act', at: 'l', label: 'policy → ask', sub: 'issues.write is an ask scope for this sandbox · the repo is linked' },
   { from: 'l', to: 'you', label: 'request: web-2 wants issues.write on acme/web', sub: 'modal: once · this instance · always (a rule) · deny', tone: 'notify' },
-  { kind: 'act', at: 'l', label: 'request held', sub: 'up to 120 s, then 403 with the reason in the body' },
+  { kind: 'act', at: 'l', label: 'request held', sub: "for the claim's hold (120 s default), then a 403 in GitHub's error shape naming the request" },
   { from: 'you', to: 'l', label: 'this instance', tone: 'notify' },
   { kind: 'act', at: 'l', label: 'remember the answer', sub: '(web-2, github, issues.write) until rm · listed and revocable' },
   { from: 'l', to: 'b', label: 'response', tone: 'agent' },
@@ -205,9 +205,9 @@ const gitLanes: Lane[] = [
 ];
 
 const gitSteps: Step[] = [
-  { kind: 'act', at: 'git', label: 'insteadOf → http://127.0.0.1:7891/github.com/', sub: 'set in the system gitconfig by the gh feature · plain HTTP, no CA' },
-  { from: 'git', to: 'broker', label: 'GET …/acme/web.git/info/refs?service=git-receive-pack', sub: 'through the helper, like any http-proxy stream' },
-  { kind: 'act', at: 'broker', label: 'receive-pack on acme/web', sub: 'git = "read" for this sandbox → 403 here, before any pack' },
+  { kind: 'act', at: 'git', label: 'CONNECT github.com:443', sub: "git's own proxy port (http.https://github.com/.proxy) and the member CA · ssh remotes rewritten to https by the claim" },
+  { from: 'git', to: 'broker', label: 'GET …/acme/web.git/info/refs?service=git-receive-pack', sub: 'through the helper, like any HTTP_PROXY stream · phantom from devsbd, the credential helper' },
+  { kind: 'act', at: 'broker', label: 'receive-pack on acme/web', sub: 'without git.push this sandbox would get 403 here, before any pack' },
   { from: 'broker', to: 'up', label: 'info/refs, with the token', tone: 'agent' },
   { from: 'up', to: 'git', label: 'ref advertisement', tone: 'runtime' },
   { from: 'git', to: 'broker', label: 'POST git-receive-pack', sub: 'pkt-lines first: refs/heads/joan/web-2 · refs/heads/main' },
@@ -248,11 +248,21 @@ export const decision: State[] = [
     next: 'instance known',
   },
   {
-    name: 'which credential',
-    sub: 'phantom or upstream host',
+    name: 'which claim',
+    sub: 'the target host, for every request',
     tone: 'serve',
-    notes: ['A phantom names its credential and must belong to this instance.', 'A host no credential claims: tunneled untouched, or refused when the sandbox has an egress list.'],
-    side: ['foreign phantom → 403, logged'],
+    notes: [
+      "The host must be an upstream of one of the instance's claims. Hosts no claim names never get here: the helper dials them from the container.",
+      'A private or loopback address is refused unless the call is injected and its approved claim marks that upstream private.',
+    ],
+    next: 'claim known',
+  },
+  {
+    name: 'which credential',
+    sub: 'the phantom',
+    tone: 'serve',
+    notes: ["A phantom names its credential, must belong to this instance and be sent to that credential's own upstreams, in a claim version the home approved.", "No phantom: the instance's host sends it upstream uninjected itself, home up or not."],
+    side: ['foreign or misdirected phantom → 403, logged', 'version not approved → 403 naming `access approve`'],
     next: 'credential known',
   },
   {
@@ -267,15 +277,29 @@ export const decision: State[] = [
     name: 'asked for?',
     sub: 'config: access.<credential>',
     tone: 'cli',
-    notes: ['The repos are the fence: the remotes of `folder` and `folders`, plus any `access.github.repos` adds. Another repo is denied, never asked.', 'Scopes and optional branch rules come from `access` too. The effective set is request ∩ grant, checked at `run` as well.'],
-    side: ['repo not linked → 403 "acme/infra is not linked to web"'],
+    notes: ['Scopes and optional branch rules come from `access`. The effective set is request ∩ grant, checked at `run` as well.'],
+    side: ['not asked for → 403 with the reason'],
     next: 'within the request',
+  },
+  {
+    name: 'in the fence?',
+    sub: 'the repos of folder and folders',
+    tone: 'cli',
+    notes: [
+      'The scope table places the route in a repo (GraphQL mutations by the ids their inputs name) or lists it as repo-less. The fence is the remotes recorded at the folder\'s first `run`, plus any `access.github.repos` adds.',
+      'Another repo gets no credential and no ask: the request goes upstream as a stranger\'s, marked `devsandbox-fence: outside`. A route it can\'t place is denied.',
+    ],
+    side: ['out of the fence → anonymous; a write → 403 naming `access.github.repos`'],
+    next: 'inside',
   },
   {
     name: 'rule',
     sub: "the feature's scope table",
     tone: 'serve',
-    notes: ['The route (`POST /repos/{repo}/pulls`, a GraphQL operation, `git-receive-pack`) maps to a named scope.', 'allow, ask or deny; deny wins; an unknown route is the scope `other`, ask by default.'],
+    notes: [
+      'The route (`POST /repos/{repo}/pulls`, a GraphQL mutation, `git-receive-pack`) maps to a named scope: allow, ask or deny; deny wins. An unknown route is denied for a fenced credential, the scope `other` (ask) otherwise.',
+      '`presence` routes ask a human even when allowed; `never` routes stay shut whatever the answer.',
+    ],
     side: ['ask → a permission request, held', 'deny → 403 with the reason'],
     next: 'allowed',
   },
@@ -300,7 +324,7 @@ export const ownership: State[] = [
     name: 'the tool',
     sub: 'gh · git · sentry-cli · zidane',
     tone: 'client',
-    notes: ['Unchanged, in the common case. Reads its usual env and config: a token var, a base URL, `HTTPS_PROXY`, `insteadOf`, the system CA bundle.', 'Believes it is logged in.'],
+    notes: ['Unchanged, in the common case. Reads its usual env and config: a token var, a base URL, `HTTPS_PROXY`, git\'s credential helper, the system CA bundle.', 'Believes it is logged in.'],
     side: ['never: a real token'],
     next: 'env, files and a loopback port',
   },
@@ -309,7 +333,7 @@ export const ownership: State[] = [
     sub: 'ghcr.io/devsandboxes/features/gh',
     tone: 'cli',
     notes: [
-      'Installs the tool and declares a claim in `customizations.devsandbox.credentials`: upstream hosts, where the token goes, the phantom env and files, the login flow.',
+      'Installs the tool and declares a claim in `customizations.devsandbox.credentials`: upstream hosts, where the token goes, the phantom env and files, the login flow, its `presence` and `never` routes.',
       'Ships the scope table: named scopes (`pr.write`, `git.push`) over routes. Data only, no code on the host.',
       'Handles its tool\'s oddities only: a CA knob devsandbox doesn\'t set, a token file the tool insists on.',
     ],
@@ -329,8 +353,8 @@ export const ownership: State[] = [
   },
   {
     name: 'the host',
-    sub: 'keyring · 1Password · Vault',
+    sub: 'file store · keyring · 1Password',
     tone: 'runtime',
-    notes: ['Where secrets rest: the OS keyring by default, an external store through a source (`op://…`), like External Secrets in Kubernetes.'],
+    notes: ['Where secrets rest, on the home only: a 0600 file beside `member.key` by default on Linux (a headless box has no unlocked keyring), the OS keyring on macOS, an external store through a source (`op://…`), like External Secrets in Kubernetes.'],
   },
 ];
