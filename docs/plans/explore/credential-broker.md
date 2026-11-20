@@ -42,7 +42,10 @@ Wayland, the D-Bus session bus, `$XDG_RUNTIME_DIR`, which holds
 `serve`'s socket) can drive the desktop and answer any instance's asks,
 `presence` included, which holds only while none runs where asks are
 answered. `run` warns when such a sandbox runs on a host that brokers
-any credential or is one's approver, and `access ls` marks it.
+any credential or is one's approver, and `access ls` marks it. Nor
+host networking: on `--network=host` devsbd's loopback listener would be
+the host's, so `run` refuses claims there (unreachable today: `runArgs`
+is parsed and ignored).
 Two side doors are the other plans': ssh through the agent relay
 (git-gateway filters its keys under a git-host claim) and VS Code's
 attach, which forwards the host's git credentials and agent (outside
@@ -92,8 +95,10 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   another instance's namespaces or volumes (`--network`/`--pid`/`--ipc
   container:`, `--volumes-from`, podman `--pod`) when either has claims,
   as `worker_policy` does for worker trust. A sandbox that needs the config
-  gets its files read-only, one bind each (agent-credentials). The config
-  refusal holds without claims (an edit could hand a sibling or the next
+  gets its files read-only, one bind each (agent-credentials); an edit it
+  wants to the live config is a host-side confirm (the diff shown as a
+  permission request, step 4), with ADR 0049 signing on top from step 6.
+  The config refusal holds without claims (an edit could hand a sibling or the next
   `rebuild` claims), so a config inside its own `folder` (`folder = "."`)
   stops running: move it beside the repo.
 - **In the container**: `devsbd daemon` listens on `127.0.0.1`, a port
@@ -442,11 +447,16 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
    `access.log`, `run`'s bind, `runArgs` and host-class checks, broker
    ports refused by `forwards.*`; `ask` is deny and `presence` passes until step 4 (git-gateway
    step 2 the same). First user: sentry-cli
-   ([github-and-sentry-access](github-and-sentry-access.md)).
+   ([github-and-sentry-access](github-and-sentry-access.md)). New
+   dependencies: `rustls` with `ring` (shared with
+   [mtls-links](../active/mtls-links.md)), `httparse` for request heads,
+   `ureq` upstream with redirects off.
 2. `devsandbox login`'s device flow and browser OAuth, `access ls|revoke`.
-3. The member CA, intercept mode, trust installed at create.
+3. The member CA (`rcgen` for leaves), intercept mode, trust installed
+   at create.
 4. Permission requests: API, CLI, dashboard modal; remembered answers;
-   `approvers` (a headless home's asks answered from a laptop).
+   `approvers` (a headless home's asks answered from a laptop); a
+   sandbox's config edit confirmed on the host.
 5. `CRED` over links and routes; claims signed by the instance's host;
    homes in the membership log. Until then each host is its own
    credentials' home; once the log names one, the other hosts' copies go
@@ -456,10 +466,6 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
 
 ## Open questions
 
-- Dependencies: no TLS stack today. `rustls` with `ring` (the
-  [mtls-links](../active/mtls-links.md) choice, shared), `rcgen` for
-  leaves, `httparse` for request heads, an upstream client (`ureq` with
-  redirects off, or hand-rolled over rustls).
 - Handoff and restart: a drain drops the bridges within `DRAIN_TIMEOUT`
   (5 s) so a successor never overlaps them, which cuts open broker
   streams (a model's SSE, a long push, a held ask). Let a draining daemon
@@ -470,16 +476,6 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   new ones meanwhile: hand the listeners to the successor over
   `devsbd.ctl` (`SCM_RIGHTS`) and let the old daemon finish open
   connections, bounded, or run the proxy as its own process?
-- Decision 4's "denied" is read in all four plans as "no credential":
-  an out-of-fence request goes upstream anonymously (public repos work,
-  writes and git's 401 get a refusal). Confirm, or refuse such requests
-  outright?
-- In-sandbox edits of a config: with no config root mounted, a sandbox
-  that edits the live config needs a host-side confirm of the change, or
-  ADR 0049 signing?
-- Host networking: a sandbox on `--network=host` shares the host's
-  loopback, so devsbd's listener would be the host's. Refuse brokering
-  there, or a unix socket plus a tiny in-container `CONNECT` shim?
 - HTTP/2 upstream (gRPC-ish APIs) and WebSockets through intercept mode.
 - The file store at rest: plain 0600 like `member.key`, or sealed with
   `systemd-creds` / a TPM where there is one?

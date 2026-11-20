@@ -86,15 +86,20 @@ answers (a warning when a remote home is offline). So no feature, whatever its t
 another host, attributes a route to another repo, or redefines a scope to
 cover more routes.
 
-### A feature beside the installer, or the installer itself
+### The installer itself
 
-`ghcr.io/devcontainers/features/github-cli` already installs gh. Either
-`devsandboxes/features/gh` installs gh itself (one feature, version under
-our control) or it only adds the claim and the wiring on top of the
-official one (`installsAfter`; `dependsOn` isn't applied by devsandbox).
-Leaning towards installing it: one entry in a config, and the claim's
-scope table tracks the gh it installs. A config then drops the official
-feature, or two gh binaries race on `PATH`.
+`devsandboxes/features/gh` installs gh itself rather than layering on
+`ghcr.io/devcontainers/features/github-cli`: one entry in a config, and
+one update path everywhere. As `features/zidane` does, a `gh-update`
+puts a gh release in a shared bin dir (a `shared-volumes/` mount) and a
+`gh` launcher runs the version it made current, else the one baked at
+build, so one update reaches every sandbox without a rebuild. The bin
+dir is mounted read-only and updated on the host (agent-credentials,
+*Nothing shared writable that runs or steers*). `gh-update` goes to the
+latest release; the claim stays the one the feature shipped (its version
+pins the claim, not gh's), so a route a newer gh calls that the scope
+table can't place is denied until a feature release covers it. A config
+drops the official feature, or two gh binaries race on `PATH`.
 
 ## gh
 
@@ -258,8 +263,9 @@ Under a user token GraphQL reads any repo in its reach whatever the fence
 says, so keep the installation or the PAT down to what sandboxes may
 touch; classic tokens (`repo` scope: every private repo) aren't taken.
 The home says which kinds a credential offers (`as = ["app", "user"]` in
-`credentials.toml`); a config's `access.github.as` picks within it (the
-first by default), and a kind the home doesn't offer is refused at `run`:
+`credentials.toml`); a config's `access.github.as` picks within it
+(`user` by default when offered, else `app`: the babysit dispatcher's
+children push and reply as you; `as = "app"` narrows), and a kind the home doesn't offer is refused at `run`:
 a user token reaches more, and a config only narrows. An installation
 token is minted with `repository_ids` for the fence ∩ that installation's
 repos (GitHub refuses the whole mint if one listed repo is outside it)
@@ -368,10 +374,11 @@ only a note when the repo is public (a reference clone in `folders`).
    and on placed or remote instances once credential-broker step 5
    carries `CRED`; until then they keep today's mounts, so the live
    config drops its sentry and gh mounts only after that step.
-2. `devsandbox login github --app` (manifest and install), `features/gh`
-   in intercept mode with installation tokens per instance and
-   installation (`as = "app"`, `repository_ids` and `permissions`); the
-   repo fence (recorded remotes, `access.github.repos`, `access forget`,
+2. `features/gh` in intercept mode with your token (`as = "user"`):
+   fine-grained PATs by paste and app user tokens (an existing app's
+   device flow, credential-broker step 2), the home's `as` list, a
+   warning ahead of a user credential's expiry (`access ls`, a desktop
+   notice); `gh-update` and the launcher; the repo fence (recorded remotes, `access.github.repos`, `access forget`,
    ids, strict paths, anonymous outside); GraphQL mutations mapped to
    scopes and attributed by all their input ids; the read-only allowlist; the `never` routes; a
    scope table covering the gh it installs, checked by a test running
@@ -379,9 +386,7 @@ only a note when the repo is public (a reference clone in `folders`).
    intercept, the command-scope helper and the gateway's rule table.
    While the gh mount stays, devsbd skips `hosts.yml` there
    (credential-broker, *Phantoms*); `GH_TOKEN` wins anyway.
-3. `as = "user"` with app user tokens or fine-grained PATs, the home's
-   `as` list, a warning ahead of a user credential's expiry (`access ls`,
-   a desktop notice). Live config: `template.base` swaps
+   Live config: `template.base` swaps
    `ghcr.io/devcontainers/features/github-cli` for `features/gh`;
    `sandbox.devsandboxes` adds `stackblitz/bolt` (its
    dispatcher's repo) to `access.github.repos` and takes `as = "user"`
@@ -392,16 +397,13 @@ only a note when the repo is public (a reference clone in `folders`).
    (docker-in-docker), which the broker counts as the host
    (credential-broker, its non-goals): the widest token sits where the
    home's store is in reach on a rootful runtime.
+3. `devsandbox login github --app` (manifest and install), installation
+   tokens per instance and installation (`as = "app"`, `repository_ids`
+   and `permissions`).
 4. Installation tokens delegated to members.
 
 ## Open questions
 
-- Under a user token the fence is the token's reach on GraphQL queries
-  and the other unattributable routes, not the sandbox's repos. Accept that for
-  `as = "user"` (fence = a narrow PAT or installation), or keep user
-  tokens off those routes, which is most of gh?
-- The default `as` when the home offers both: "unattended means `app`"
-  doesn't hold for the babysit dispatcher's children.
 - Out-of-fence public reads share 60 an hour per host IP. The fence's
   installation token can't reach private repos outside it
   (`repository_ids`): lend it to out-of-fence GETs, or keep the
