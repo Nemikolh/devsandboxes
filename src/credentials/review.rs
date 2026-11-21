@@ -74,24 +74,6 @@ impl View {
         })
     }
 
-    /// The paste method's hint: `Ok(None)` for paste without one.
-    pub fn paste(&self) -> Result<Option<&str>> {
-        if self.login.is_empty() {
-            bail!("the `{}` claim has no secret to log in (no `inject` slot)", self.kind);
-        }
-        match self.login.iter().find(|(m, _)| m == "paste") {
-            Some((_, hint)) => Ok(hint.as_deref()),
-            None => {
-                let methods: Vec<&str> = self.login.iter().map(|(m, _)| m.as_str()).collect();
-                bail!(
-                    "the `{}` claim logs in by {}: not yet (credential-broker step 2); only paste works for now",
-                    self.kind,
-                    methods.join(", ")
-                )
-            }
-        }
-    }
-
     pub fn summary(&self) -> String {
         let mut out = format!("claim `{}` ({})\n", self.kind, self.mode);
         let up: Vec<&str> = self.upstreams.iter().map(String::as_str).collect();
@@ -268,19 +250,10 @@ mod tests {
     fn the_sentry_claim_summarizes() {
         let v = view(&sentry_json());
         assert_eq!(v.kind, "sentry");
-        assert_eq!(v.paste().unwrap().unwrap().split(' ').next(), Some("an"));
         let s = v.summary();
         assert!(s.starts_with("claim `sentry` (base-url)\n  upstreams: de.sentry.io, sentry.io, us.sentry.io\n"), "{s}");
         assert!(s.contains("    issues.read (6 routes)\n"), "{s}");
         assert!(s.contains("  never (no ask or rule opens them):\n    GET /api/0/projects/{org}/{project}/keys/\n"), "{s}");
-    }
-
-    #[test]
-    fn login_methods_other_than_paste_are_not_yet() {
-        let mut c = sentry_json();
-        c["login"] = json!([{ "method": "device", "clientId": "abc", "deviceUrl": "https://x/d", "tokenUrl": "https://x/t" }]);
-        let err = view(&c).paste().unwrap_err().to_string();
-        assert!(err.contains("by device: not yet (credential-broker step 2)"), "{err}");
     }
 
     #[test]

@@ -584,6 +584,10 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    headers (only the injected value is masked), calling a claim's `check`
    route after an upstream 401.
 2. `devsandbox login`'s device flow and browser OAuth, `access ls|revoke`.
+   Built so far: both logins (`login --method`, `--client-id`), the
+   store's token record ([login](../../architecture/credentials/login.md)).
+   No claim `scope` for them yet (GitHub Apps take none); one would join
+   the pinned `login` entry and so the claim's version.
 3. The member CA (`rcgen` for leaves), intercept mode, trust installed
    at create.
 4. Permission requests: API, CLI, dashboard modal; remembered answers;

@@ -11,16 +11,18 @@ write discipline). Local only: both run in-process on the host whose
 credentials they are, never on a machine (`--machine` refuses them).
 
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
-`src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `Term`,
-`EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
+`src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
+`obtain`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
 `pick_pending`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/store.rs` (`Store`,
-`Secret`), `src/credentials/review.rs` (`View`, `diff`, `Diff`),
+`Record`, `OAuthToken`, `Secret`), `src/credentials/oauth/` (the OAuth
+logins: [login](../architecture/credentials/login.md)), `src/credentials/review.rs` (`View`, `diff`, `Diff`),
 `src/credentials/mod.rs` (`check_name`), `src/broker/audit.rs` (`Audit`,
 `Line`).
 
 ```
 devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>]... [--yes]
+                 [--method paste|device|browser] [--client-id <id>]
 devsandbox access approve <credential> [--version <v>] [--yes]
 ```
 
@@ -54,21 +56,41 @@ grant: `--profile` is refused on it (edit `profiles` in the file). A
 claim version already approved for the credential is not asked about
 again.
 
-The login method is the claim's (`View::paste`): `paste` only; a claim
-listing only other methods is refused ("not yet (credential-broker step
-2)"), and one with no `login` (no `inject` slot) has no secret to log in.
+The login method is one of the claim's `login` (`choose`, over the
+version being approved, else the latest approved): `--method` names one
+the claim lists, else the first the claim lists of, on a terminal,
+`device`, `browser`, `paste`, and off one `paste`, `device`, `browser`;
+`browser` only where a browser opens (a display and a system opener,
+`open::has_display`, `open::opener_argv`), since its redirect lands on
+this host's loopback. A claim's own order isn't kept: its version sorts
+the list. `github-app-manifest` is refused as not yet, and a claim with
+no `login` (no `inject` slot) has no secret to log in. All of this is
+checked before anything is asked.
+
+`--client-id` logs in to that OAuth app instead of the claim's (an app
+the home owns: a GitHub App you made); refused with `paste`. It goes into
+the token record, never the claim, so it changes no claim version.
 
 Then, in order: a new version's summary (`View::summary`: kind, mode,
 upstreams, each scope with its route count, every `never` route, the
 short version) and the question (`approve_or_refuse`: `--yes` approves;
-off a terminal without `--yes`, refused); the secret from stdin
-(`Stdio::secret`: on a terminal, after the claim's paste `hint`, with echo
-off (`EchoOff`, termios `ECHO` cleared, line editing kept); else all of
-stdin, so `login x < file` works), trimmed, empty refused; the secret into
-the store (first: an approved claim with no secret serves nothing); the
-entry (created with `--profile`s as `profiles`, none: unset) and the
-approved version into `credentials.toml`. It prints `logged in …` with
-the approved version, or `secret replaced`.
+off a terminal without `--yes`, refused); the secret (`obtain`), by:
+
+- `paste`: from stdin (`Stdio::secret`: on a terminal, after the claim's
+  paste `hint`, with echo off (`EchoOff`, termios `ECHO` cleared, line
+  editing kept); else all of stdin, so `login x < file` works), trimmed,
+  empty refused. Stored as a static token.
+- `device`: the device flow; it prints the provider's page and code (and
+  opens the page where a browser opens) and waits until the code is
+  entered and approved, denied, or expired.
+- `browser`: the authorization code with PKCE; it prints and opens the
+  provider's authorize page and waits up to 5 minutes for the redirect.
+
+The record goes into the store first (an approved claim with no secret
+serves nothing), replacing any earlier one whole; then the entry (created
+with `--profile`s as `profiles`, none: unset) and the approved version
+into `credentials.toml`. A re-login touches the record only. It prints
+`logged in …` with the approved version, or `secret replaced`.
 
 ## `access approve`
 
@@ -130,8 +152,28 @@ then refuses
 ## The file store
 
 `credentials-store.toml` beside `member.key`
-(`daemon_config::CREDENTIAL_STORE`), the secrets by credential name
-(`[secret]` table), for `source = "file"`. `Store::put` / `get` /
+(`daemon_config::CREDENTIAL_STORE`), one record per credential name
+(`Record`, a `[secret.<name>]` table, unknown keys refused), for `source =
+"file"`:
+
+```toml
+[secret.sentry-work]          # pasted
+type = "static"
+token = "sntrys_…"
+
+[secret.github]               # an OAuth login (`OAuthToken`)
+type = "oauth"
+access_token = "ghu_…"
+refresh_token = "ghr_…"       # these four optional: as the provider sent them
+expires_at = 1795000000       # unix seconds
+refresh_expires_at = 1810000000
+scope = "…"
+token_url = "https://github.com/login/oauth/access_token"
+client_id = "Iv1.…"           # the claim's, or `--client-id`'s
+```
+
+The broker injects `Store::token_now`: the static token, or the access
+token as stored, expired or not. `Store::put` / `get` /
 `remove` read and write it under `credentials-store.lock`, each write to a
 temp file created 0600 and renamed (`serve::locked_file::write_atomic_mode`),
 so no secret is ever on disk with wider permissions. A store readable by

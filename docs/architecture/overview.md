@@ -106,6 +106,8 @@ the credential kept on this host, by policy, per call.
 
 - [broker.md](credentials/broker.md): per-connection flow, policy,
   injection, redaction, refusals, `access.log`.
+- [login.md](credentials/login.md): the device flow and browser OAuth
+  logins and the token record they store.
 - CLI and files: [reference/credentials-cli.md](../reference/credentials-cli.md).
 
 ## The Inbox

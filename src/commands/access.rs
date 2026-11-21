@@ -75,14 +75,14 @@ mod tests {
     use crate::commands::login::tests::{Script, temp};
     use crate::credentials::home::Entry;
     use crate::credentials::home::tests::sentry;
-    use crate::credentials::store::{Secret, Store};
+    use crate::credentials::store::{Record, Secret, Store};
 
     #[test]
     fn approves_the_pending_version_after_its_diff() {
         let data = temp("approve");
         let path = home::path(&data);
         assert!(approve_at(&data, "s", None, true, &mut Script::new(true, &[], None)).is_err());
-        Store::in_data(&data).put("s", &Secret::new("keep".into())).unwrap();
+        Store::in_data(&data).put("s", &Record::token(Secret::new("keep".into()))).unwrap();
         let mut newer = sentry();
         newer.pinned.never.pop();
         home::update(&path, |h| {
@@ -109,7 +109,7 @@ mod tests {
         assert!(e.pending.is_empty());
         assert_eq!(e.latest_approved().unwrap().version, newer.version());
         assert_eq!(e.approved.len(), 2, "the older version stays for instances pinned to it");
-        assert_eq!(Store::in_data(&data).get("s").unwrap().unwrap().expose(), "keep");
+        assert_eq!(Store::in_data(&data).token_now("s").unwrap().unwrap().expose(), "keep");
         let _ = std::fs::remove_dir_all(&data);
     }
 

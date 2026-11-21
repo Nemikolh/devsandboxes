@@ -15,8 +15,9 @@ limitation means editing this file in the same commit.
 - **credentials**: credential-broker step 1 and github-and-sentry-access
   step 1 are done (the broker, `login` by paste, `access approve`,
   sentry-cli brokered locally in base-URL mode through `features/sentry`);
-  now credential-broker step 2 (device flow and browser OAuth logins,
-  `access ls|revoke`), on the way to gh and git through the broker
+  now credential-broker step 2: device flow and browser OAuth logins are
+  done, refreshing their tokens behind the phantom and `access ls|revoke`
+  are next, on the way to gh and git through the broker
   (credential-broker step 3, git-gateway step 1, github-and-sentry-access
   step 2). → [plan](plans/active/credential-broker.md)
 
@@ -337,10 +338,16 @@ is frozen: no new work on it.
 
 ### credentials
 
-- `devsandbox login` takes a secret by paste only; device flow and browser
-  OAuth are credential-broker step 2. `credentials.toml`'s `members`,
-  `approvers`, `delegate` and `as` parse but nothing reads them yet. → [credentials CLI](reference/credentials-cli.md);
-  `commands::login::login_at`
+- An OAuth login's token isn't refreshed: the broker injects the stored
+  access token as is, expired too (a GitHub app user token after 8 hours),
+  until a re-login; refreshing behind the phantom is credential-broker
+  step 2's next part. A claim's device and browser logins send no
+  `scope` (no claim field; GitHub Apps take none), and
+  `github-app-manifest` logins are refused (github-and-sentry-access step
+  3). `credentials.toml`'s `members`, `approvers`, `delegate` and `as`
+  parse but nothing reads them yet.
+  → [login](architecture/credentials/login.md); `credentials::store::Store::token_now`,
+  `commands::login::choose`
 - Intercept-mode claims are skipped at `run` until credential-broker
   step 3, and claims on an instance placed by another member until step 5
   (`CRED`), each with a warning.

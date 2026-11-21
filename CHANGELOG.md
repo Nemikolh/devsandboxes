@@ -11,6 +11,12 @@
   devsandbox login sentry-work --feature ghcr.io/devsandboxes/features/sentry:1 --profile work
   ```
 
+- **`devsandbox login` by device code or browser.** A claim that lists the `device` or `browser` login gets its token by OAuth: `login` shows a code to enter at the provider's page (works on a headless box), or opens the provider's login page and takes the redirect on a loopback port. `--method` picks among the claim's methods, and `--client-id` logs in to your own OAuth app (a GitHub App you made) instead of the feature's. The token, its refresh token and expiries are kept on the host; tokens aren't refreshed yet, so log in again once one expires.
+
+  ```bash
+  devsandbox login github --method device --client-id Iv1.0123456789abcdef
+  ```
+
 - **`access.<kind>` in a sandbox's config** picks the credential a claim takes (`credential`) and narrows what the sandbox may do with it (`scopes`). Edits apply to the next call, no rebuild.
 
   ```toml

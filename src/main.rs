@@ -430,8 +430,9 @@ enum Command {
     /// Store a credential's secret on this host (its home) and approve the
     /// claim it is for (docs/reference/credentials-cli.md)
     ///
-    /// The secret is read from stdin: unechoed on a terminal, or piped
-    /// (`login sentry-work < token`). Paste is the only method so far.
+    /// By the claim's login methods: the device flow or a browser login
+    /// (OAuth), or paste from stdin, unechoed on a terminal or piped
+    /// (`login sentry-work < token`).
     #[cfg(unix)]
     Login {
         /// The credential's name in credentials.toml (`sentry-work`)
@@ -451,6 +452,14 @@ enum Command {
         /// Approve the claim without asking (required off a terminal)
         #[arg(long)]
         yes: bool,
+        /// The login method, one the claim lists (default: the first listed
+        /// of device, browser, paste on a terminal; paste, device, browser
+        /// off one; browser only where a browser opens)
+        #[arg(long, value_parser = ["paste", "device", "browser"])]
+        method: Option<String>,
+        /// Log in to this OAuth app instead of the claim's (an app you own)
+        #[arg(long, value_name = "ID")]
+        client_id: Option<String>,
     },
     /// This host's credentials: approve claim versions
     /// (docs/reference/credentials-cli.md)
@@ -1124,8 +1133,8 @@ fn main() -> Result<()> {
             MachineCommand::Allow { allow } => commands::machine::allow(allow.change()),
         },
         #[cfg(unix)]
-        Command::Login { credential, feature, kind, profiles, yes } => {
-            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes })
+        Command::Login { credential, feature, kind, profiles, yes, method, client_id } => {
+            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id })
         }
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Approve { credential, version, yes } } => {

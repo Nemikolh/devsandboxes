@@ -122,7 +122,8 @@ refusal shape (the approved copy's once read, else the instance's).
 upstream client writes itself (`upstream::RESERVED`: `Host`, framing,
 `Accept-Encoding`, `Connection`, hop-by-hop, `Expect`) and those the
 request's `Connection` names. An injected call gets the secret from the
-file store (`Store::get`; none stored names `devsandbox login`) and
+file store (`Store::token_now`, read per call: an OAuth record's access
+token as stored; none stored names `devsandbox login`) and
 `policy::inject` writes it into the chosen slot only: the header as its
 `format` with the token, `Basic` with the slot's username, or the query
 parameter percent-encoded. The address check lets private ranges through

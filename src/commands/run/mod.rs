@@ -2262,9 +2262,12 @@ mod tests {
             kind: None,
             profiles: Vec::new(),
             yes: true,
+            method: None,
+            client_id: None,
         };
         let mut term = crate::commands::login::tests::Script::new(false, &[], Some(TOKEN));
-        crate::commands::login::login_at(&data, &args, Some(claims), &mut term).unwrap();
+        let mut flows = crate::commands::login::tests::offline();
+        crate::commands::login::login_at(&data, &args, Some(claims), &mut term, &mut flows).unwrap();
 
         let chunked = Arc::new(AtomicBool::new(false));
         let saw_chunk = chunked.clone();

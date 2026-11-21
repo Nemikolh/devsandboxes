@@ -160,7 +160,7 @@ impl Service {
                 self.forward(&head, upstream_host, None, &cx, reader, w, &mut line)
             }
             Action::Inject(inj) => {
-                let token = match Store::in_data(&self.data).get(&inj.credential) {
+                let token = match Store::in_data(&self.data).token_now(&inj.credential) {
                     Ok(Some(t)) => t,
                     Ok(None) => {
                         let r = Refusal {

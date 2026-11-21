@@ -18,7 +18,7 @@ use serde_json::Value;
 use super::*;
 use crate::broker::policy::tests::{FOREIGN, OWN, caller, home_with, sentry, state_with};
 use crate::broker::upstream::Timeouts;
-use crate::credentials::store::Secret;
+use crate::credentials::store::{Record, Secret};
 
 const TOKEN: &str = "REALtoken-0123456789";
 
@@ -99,7 +99,7 @@ impl Rig {
         }
         std::fs::write(data.join("state.toml"), toml::to_string(&state).unwrap()).unwrap();
         std::fs::write(home::path(&data), home::serialize(&home_with(&claim)).unwrap()).unwrap();
-        Store::in_data(&data).put("sentry-work", &Secret::new(TOKEN.into())).unwrap();
+        Store::in_data(&data).put("sentry-work", &Record::token(Secret::new(TOKEN.into()))).unwrap();
 
         let mut roots = RootCertStore::empty();
         roots.add(CertificateDer::from_pem_file(fixture("ca.pem")).unwrap()).unwrap();
