@@ -5,7 +5,10 @@
 //! foreign `Host`, decides ([`policy::decide`]), then answers the refusal or
 //! makes the call: one upstream connection per request, the body streamed
 //! both ways, the injected value redacted on the way back, `Location` and the
-//! claim's `rewrite` fields pointed at the loopback. An OAuth credential's
+//! claim's `rewrite` fields pointed at the loopback (base-URL mode only). An
+//! intercepted connection is admitted before its TLS, then served the same
+//! way over the TLS the broker terminates ([`super::intercept`]) with the
+//! member CA's leaf for its host. An OAuth credential's
 //! token is renewed ahead of expiry, and on an upstream 401 renewed and the
 //! call replayed when its body was held; any other injected call's 401 is
 //! turned into a refusal naming `devsandbox login`. Every request leaves one
@@ -15,12 +18,14 @@
 //! store and the instance's config only for a call carrying its phantom,
 //! so an edit to any of them applies to the next call.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context as _, Result, bail};
+use rustls::{ServerConnection, StreamOwned};
 
 use super::audit::{Audit, Line};
 use super::body::{BodyReader, ChunkedWriter};
@@ -29,8 +34,9 @@ use super::policy::{self, Action, Call, Context, Injection, Sources};
 use super::redact::Secrets;
 use super::refusal::{Refusal, reason_phrase};
 use super::upstream::{self, Body, Length, Request, Response, Upstream};
-use super::{guard, rewrite, route};
+use super::{guard, intercept, rewrite, route};
 use crate::config::{Access, Config};
+use crate::credentials::ca::{Leaf, MemberCa};
 use crate::credentials::claim::{self, Refusal as Shape, Slot};
 use crate::credentials::home::{self, Home};
 use crate::credentials::instance;
@@ -64,7 +70,58 @@ pub struct Service {
     audit: Audit,
     /// Upstream host → the authority dialed instead: tests' local servers.
     authorities: HashMap<String, String>,
+    /// Loaded at the first intercepted connection, so a host that
+    /// intercepts nothing never makes a CA key; a failed load is retried.
+    ca: Mutex<Option<Arc<RwLock<MemberCa>>>>,
+    log: fn(&str),
 }
+
+/// A connection's bytes: the bridge's stream, or the TLS over it.
+enum Wire {
+    Plain(UnixStream),
+    Tls(Box<StreamOwned<ServerConnection, UnixStream>>),
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.read(buf),
+            Wire::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.write(buf),
+            Wire::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Wire::Plain(s) => s.flush(),
+            Wire::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl Wire {
+    fn close(&mut self) {
+        let sock = match self {
+            Wire::Plain(s) => s,
+            Wire::Tls(s) => {
+                s.conn.send_close_notify();
+                let _ = s.flush();
+                &mut s.sock
+            }
+        };
+        let _ = sock.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+type Conn = BufReader<Wire>;
 
 impl Service {
     /// The data dir is `state`'s.
@@ -79,6 +136,8 @@ impl Service {
             upstream,
             tokens,
             authorities: HashMap::new(),
+            ca: Mutex::default(),
+            log: |_| {},
         })
     }
 
@@ -89,7 +148,7 @@ impl Service {
             log(&format!("broker: {why}: brokered calls answer 502"));
             why
         });
-        Service::new(State::path()?, upstream)
+        Ok(Service { log, ..Service::new(State::path()?, upstream)? })
     }
 
     #[cfg(test)]
@@ -111,30 +170,98 @@ impl Service {
         }
     }
 
-    fn request(
-        &self,
-        caller: &Caller,
-        header: &ProxyHeader,
-        reader: &mut BufReader<UnixStream>,
-        w: &mut UnixStream,
-    ) -> io::Result<bool> {
-        let read = head::read_head(reader);
-        // After the head: a keep-alive connection may idle for minutes.
-        let state = State::load_at(&self.state);
-        let shape = state.as_ref().ok().and_then(|s| listener_shape(s, caller, header));
-        let mut line = Line {
+    /// The member CA's leaf for `host`, covering it first when the CA
+    /// doesn't yet.
+    fn leaf(&self, host: &str) -> Result<Leaf> {
+        let ca = {
+            let mut slot = self.ca.lock().unwrap_or_else(|e| e.into_inner());
+            match &*slot {
+                Some(ca) => ca.clone(),
+                None => slot.insert(Arc::new(RwLock::new(MemberCa::load_or_create(&self.data)?))).clone(),
+            }
+        };
+        {
+            let ca = ca.read().unwrap_or_else(|e| e.into_inner());
+            if ca.hosts().contains(host) {
+                return ca.leaf(host);
+            }
+        }
+        let mut ca = ca.write().unwrap_or_else(|e| e.into_inner());
+        if ca.ensure_hosts(&BTreeSet::from([host.to_string()]))? {
+            (self.log)(&format!(
+                "broker: the member CA now covers `{host}`: containers trust it once the CA is reinstalled in them"
+            ));
+        }
+        ca.leaf(host)
+    }
+
+    /// An intercepted stream admitted (before any TLS: devsbd already
+    /// answered the `CONNECT`, so a refusal can only close it) and its TLS
+    /// handshake done; `None` when it was closed, with an `access.log` line
+    /// unless the client merely went away.
+    fn open_intercept(&self, caller: &Caller, host: &str, port: u16, stream: UnixStream) -> Option<Wire> {
+        let mut line = self.line(caller);
+        let admitted = match State::load_at(&self.state) {
+            Ok(state) => policy::admit_intercept(&state, caller, host, port).map(|c| c.kind.clone()),
+            Err(e) => Err(Refusal::new(503, "error", format!("{e:#}"))),
+        };
+        let closed = |line: &mut Line, verdict: &str, reason: String| {
+            line.verdict = verdict.into();
+            line.reason = Some(reason);
+            self.audit.write(line);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        };
+        let kind = match admitted {
+            Ok(kind) => kind,
+            Err(r) => {
+                closed(&mut line, r.verdict, r.reason);
+                return None;
+            }
+        };
+        line.kind = Some(kind);
+        let config = self.leaf(host).and_then(|leaf| intercept::server_config(host, leaf));
+        let conn = config.and_then(|c| ServerConnection::new(c).context("the TLS server"));
+        let mut tls = match conn {
+            Ok(conn) => StreamOwned::new(conn, stream.try_clone().ok()?),
+            Err(e) => {
+                closed(&mut line, "error", format!("no TLS for `{host}`: {e:#}"));
+                return None;
+            }
+        };
+        while tls.conn.is_handshaking() {
+            if let Err(e) = tls.conn.complete_io(&mut tls.sock) {
+                if e.kind() == io::ErrorKind::InvalidData {
+                    closed(&mut line, "refused", format!("TLS handshake for `{host}`: {e}"));
+                }
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return None;
+            }
+        }
+        Some(Wire::Tls(Box::new(tls)))
+    }
+
+    fn line(&self, caller: &Caller) -> Line {
+        Line {
             time: crate::inbox::rfc3339(crate::state::Instance::now()),
             instance: caller.instance.clone(),
             instance_id: caller.instance_id.clone(),
             ..Line::default()
-        };
+        }
+    }
+
+    fn request(&self, caller: &Caller, header: &ProxyHeader, conn: &mut Conn) -> io::Result<bool> {
+        let read = head::read_head(conn);
+        // After the head: a keep-alive connection may idle for minutes.
+        let state = State::load_at(&self.state);
+        let shape = state.as_ref().ok().and_then(|s| claim_shape(s, caller, header));
+        let mut line = self.line(caller);
         let head = match read {
             Ok(Some(h)) => h,
             Ok(None) => return Ok(false),
             Err(e) => {
                 let Some(why) = super::refusal(&e) else { return Err(e) };
                 let r = Refusal::new(why.status(), "refused", why.to_string());
-                self.refuse(w, &r, shape.as_ref(), true, &mut line)?;
+                self.refuse(conn.get_mut(), &r, shape.as_ref(), true, &mut line)?;
                 return Ok(false);
             }
         };
@@ -145,18 +272,18 @@ impl Service {
 
         let guarded = guard::refuse_browser(&head.headers).and_then(|()| match header {
             ProxyHeader::BaseUrl { listener, .. } => guard::check_host(&head, &format!("127.0.0.1:{listener}"), 80),
-            ProxyHeader::Intercept { .. } => Ok(()),
+            ProxyHeader::Intercept { host, .. } => guard::check_host(&head, host, 443),
         });
         if let Err(why) = guarded {
             let r = Refusal::new(why.status(), "refused", why.to_string());
-            self.refuse(w, &r, shape.as_ref(), close_after_refusal, &mut line)?;
+            self.refuse(conn.get_mut(), &r, shape.as_ref(), close_after_refusal, &mut line)?;
             return Ok(!close_after_refusal);
         }
         let state = match state {
             Ok(s) => s,
             Err(e) => {
                 let r = Refusal::new(503, "error", format!("{e:#}"));
-                self.refuse(w, &r, None, close_after_refusal, &mut line)?;
+                self.refuse(conn.get_mut(), &r, None, close_after_refusal, &mut line)?;
                 return Ok(!close_after_refusal);
             }
         };
@@ -169,13 +296,9 @@ impl Service {
         line.credential = cx.credential.clone();
         line.scope = cx.scope.clone();
         line.phantom = cx.phantom.map(policy::Phantom::marker);
-        let upstream_host = match header {
-            ProxyHeader::BaseUrl { upstream, .. } => upstream.as_str(),
-            ProxyHeader::Intercept { host, .. } => host.as_str(),
-        };
         match outcome.action {
             Action::Refuse(r) => {
-                self.refuse(w, &r, cx.shape.as_ref(), close_after_refusal, &mut line)?;
+                self.refuse(conn.get_mut(), &r, cx.shape.as_ref(), close_after_refusal, &mut line)?;
                 Ok(!close_after_refusal)
             }
             Action::Uninjected { private: true } => {
@@ -185,7 +308,7 @@ impl Service {
                     out.extend_from_slice(b"Connection: close\r\n");
                 }
                 out.extend_from_slice(b"\r\n");
-                w.write_all(&out)?;
+                conn.get_mut().write_all(&out)?;
                 line.verdict = "uninjected".into();
                 line.reason = Some("a private upstream isn't dialed without the phantom".into());
                 line.status = 401;
@@ -194,7 +317,7 @@ impl Service {
             }
             Action::Uninjected { private: false } => {
                 line.verdict = "uninjected".into();
-                self.forward(&head, upstream_host, None, &cx, reader, w, &mut line)
+                self.forward(&head, header, None, &cx, conn, &mut line)
             }
             Action::Inject(inj) => {
                 let now = Instance::now();
@@ -202,11 +325,11 @@ impl Service {
                     Ok(fresh) => {
                         line.verdict = "allow".into();
                         line.refreshed = fresh.refreshed;
-                        self.forward(&head, upstream_host, Some((&inj, fresh)), &cx, reader, w, &mut line)
+                        self.forward(&head, header, Some((&inj, fresh)), &cx, conn, &mut line)
                     }
                     Err(f) => {
                         let r = failure_refusal(f, &inj.credential, cx.scope.clone());
-                        self.refuse(w, &r, cx.shape.as_ref(), close_after_refusal, &mut line)?;
+                        self.refuse(conn.get_mut(), &r, cx.shape.as_ref(), close_after_refusal, &mut line)?;
                         Ok(!close_after_refusal)
                     }
                 }
@@ -216,7 +339,7 @@ impl Service {
 
     fn refuse(
         &self,
-        w: &mut UnixStream,
+        w: &mut dyn Write,
         r: &Refusal,
         shape: Option<&Shape>,
         close: bool,
@@ -229,33 +352,36 @@ impl Service {
         w.write_all(&r.response(shape, close))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         head: &RequestHead,
-        upstream_host: &str,
+        header: &ProxyHeader,
         inject: Option<(&Injection, Fresh)>,
         cx: &Context,
-        reader: &mut BufReader<UnixStream>,
-        w: &mut UnixStream,
+        conn: &mut Conn,
         line: &mut Line,
     ) -> io::Result<bool> {
+        let upstream_host = match header {
+            ProxyHeader::BaseUrl { upstream, .. } => upstream.as_str(),
+            ProxyHeader::Intercept { host, .. } => host.as_str(),
+        };
         let keep = head.keep_alive();
         let upstream = match &self.upstream {
             Ok(u) => u,
             Err(why) => {
                 let r = Refusal::new(502, "error", why.clone());
                 let close = !keep || !matches!(head.framing, Framing::Empty | Framing::Length(0));
-                self.refuse(w, &r, cx.shape.as_ref(), close, line)?;
+                self.refuse(conn.get_mut(), &r, cx.shape.as_ref(), close, line)?;
                 return Ok(!close);
             }
         };
         let authority = self.authorities.get(upstream_host).map_or(upstream_host, String::as_str);
         if head.expect_continue {
-            w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            conn.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            conn.get_mut().flush()?;
         }
 
-        let mut body = BodyReader::new(&mut *reader, head.framing);
+        let mut body = BodyReader::new(&mut *conn, head.framing);
         let replayable = inject.as_ref().is_some_and(|(_, f)| f.renewable && !f.refreshed);
         let held = match head.framing {
             _ if !replayable => None,
@@ -263,7 +389,7 @@ impl Service {
             Framing::Length(n) if n <= MAX_REPLAY => {
                 let mut buf = Vec::new();
                 if let Err(e) = body.read_to_end(&mut buf) {
-                    return self.failed(w, upstream_host, &e, cx, false, line);
+                    return self.failed(conn.get_mut(), upstream_host, &e, cx, false, line);
                 }
                 Some(buf)
             }
@@ -274,6 +400,7 @@ impl Service {
         let to = Target { upstream, authority, head };
         let (sent, mut path) = to.send(inj.zip(token.as_ref().map(|t| t.expose())), held.as_deref(), &mut body);
         let keep = keep && body.is_done();
+        let w = conn.get_mut();
         let mut resp = match sent {
             Ok(resp) => resp,
             Err(e) => return self.failed(w, upstream_host, &e, cx, keep, line),
@@ -326,7 +453,7 @@ impl Service {
         }
 
         let secrets = inj.zip(token.as_ref()).map(|(inj, token)| policy::secrets(&inj.claim, token.expose()));
-        let fields = inj.and_then(|inj| {
+        let fields = inj.filter(|_| matches!(header, ProxyHeader::BaseUrl { .. })).and_then(|inj| {
             inj.claim.rewrite.iter().find(|r| route::is(&r.route, &head.method, &path)).map(|r| r.fields.clone())
         });
         line.status = resp.status;
@@ -347,7 +474,7 @@ impl Service {
     /// says (400 for a bad request body).
     fn failed(
         &self,
-        w: &mut UnixStream,
+        w: &mut dyn Write,
         upstream_host: &str,
         e: &io::Error,
         cx: &Context,
@@ -371,7 +498,7 @@ impl Service {
     #[allow(clippy::too_many_arguments)]
     fn unauthorized(
         &self,
-        w: &mut UnixStream,
+        w: &mut dyn Write,
         to: &Target,
         inj: &Injection,
         token: &crate::credentials::store::Secret,
@@ -454,19 +581,33 @@ impl Target<'_> {
 
 impl Broker for Service {
     fn serve(&self, caller: &Caller, header: ProxyHeader, stream: UnixStream) {
-        let Ok(read) = stream.try_clone() else { return };
-        let mut reader = BufReader::new(read);
-        let mut w = stream;
-        while let Ok(true) = self.request(caller, &header, &mut reader, &mut w) {}
-        let _ = w.shutdown(std::net::Shutdown::Both);
+        let (header, wire) = match header {
+            ProxyHeader::Intercept { host, port } => {
+                let host = intercept::fold(&host);
+                let Some(wire) = self.open_intercept(caller, &host, port, stream) else { return };
+                (ProxyHeader::Intercept { host, port }, wire)
+            }
+            base => (base, Wire::Plain(stream)),
+        };
+        let mut conn = BufReader::new(wire);
+        loop {
+            let keep = self.request(caller, &header, &mut conn);
+            if conn.get_mut().flush().is_err() || !matches!(keep, Ok(true)) {
+                break;
+            }
+        }
+        conn.get_mut().close();
     }
 }
 
-/// The instance's claim shape for the listener, for refusals before policy.
-fn listener_shape(state: &State, caller: &Caller, header: &ProxyHeader) -> Option<Shape> {
-    let ProxyHeader::BaseUrl { listener, .. } = header else { return None };
+/// The instance's claim shape for the listener or intercepted host, for
+/// refusals before policy.
+fn claim_shape(state: &State, caller: &Caller, header: &ProxyHeader) -> Option<Shape> {
     let inst = state.instances.get(&caller.instance).filter(|i| i.instance_id == caller.instance_id)?;
-    let (c, _) = instance::by_port(&inst.claims, *listener)?;
+    let c = match header {
+        ProxyHeader::BaseUrl { listener, .. } => instance::by_port(&inst.claims, *listener)?.0,
+        ProxyHeader::Intercept { host, port } => policy::intercept_claim(inst, host, *port)?,
+    };
     claim::from_canonical(&c.claim).ok()?.1.refusal
 }
 

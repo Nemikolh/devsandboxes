@@ -52,6 +52,14 @@ Hosts are in `check_host`'s form: lowercase DNS labels, no trailing dot,
 no wildcard, not an IP address. The broker case-folds a CONNECT target and
 drops its trailing dot before asking.
 
+The broker calls `MemberCa::ensure_hosts` (`broker::serve::Service::leaf`)
+when an admitted intercepted connection names a host the cert doesn't
+cover yet, one host at a time, and logs that containers trust the new
+cert only once it is reinstalled in them
+([broker](broker.md#intercept-mode)). It loads the CA once per daemon,
+at the first intercepted connection, so a host that intercepts nothing
+never makes a CA key.
+
 `MemberCa::ensure_hosts` unions the hosts it is given with the set on disk
 (so a second daemon's hosts survive a handoff) and reissues the cert when
 the set grows: same key, same subject, new serial. A leaf minted before
@@ -76,4 +84,6 @@ identifier. It is valid from `SKEW` (1 day) before it is minted, for a
 container whose clock lags the host's, to `LEAF_LIFETIME` (7 days) after.
 
 Leaves are cached in memory per host and minted again once less than
-`LEAF_RENEW` (1 day) is left; the cache dies with the daemon.
+`LEAF_RENEW` (1 day) is left; the cache dies with the daemon. The broker
+presents a leaf only to a ClientHello whose SNI is its host
+([broker](broker.md#intercept-mode)).

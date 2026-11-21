@@ -1,8 +1,9 @@
 # The credential broker
 
 What `devsandbox serve` does with a connection a sandbox opens to one of
-its broker listeners: decide, swap the phantom for the real credential,
-call the upstream, and send the answer back with the credential masked.
+its broker listeners, or a `CONNECT` to a host it intercepts: decide, swap
+the phantom for the real credential, call the upstream, and send the
+answer back with the credential masked.
 Read this before touching the broker, its policy, or what a tool sees when
 a call is refused. The design it implements is
 [credential-broker](../../plans/active/credential-broker.md) (*Shape*:
@@ -12,8 +13,10 @@ a call is refused. The design it implements is
 [status](../../status.md#credentials).
 
 Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
-`src/broker/policy.rs` (`decide`, `Sources`, `Outcome`, `Action`,
-`Injection`, `Phantom`, `inject`, `secrets`), `src/broker/route.rs`
+`src/broker/policy.rs` (`decide`, `admit_intercept`, `intercept_claim`,
+`Sources`, `Outcome`, `Action`, `Injection`, `Phantom`, `inject`,
+`secrets`), `src/broker/intercept.rs` (`server_config`, `fold`, `ALPN`),
+`src/credentials/ca.rs` (`MemberCa`), `src/broker/route.rs`
 (`check_path`, `matches`, `scope_of`), `src/broker/rewrite.rs`
 (`loopback_url`, `location`, `json_fields`, `MAX_REWRITE`),
 `src/broker/refusal.rs` (`Refusal`), `src/broker/audit.rs` (`Audit`,
@@ -42,6 +45,11 @@ bridge is the identity: nothing the container sends changes it. A host
 with no usable TLS roots still serves the broker; its calls answer `502`
 naming why.
 
+An intercepted host comes the same way from the helper's proxy port: a
+`CONNECT host:443` to a host its broker file binds is answered `200` by
+the helper, and the stream carries `ProxyHeader::Intercept` (the host,
+the port) then the tool's raw TLS ([Intercept mode](#intercept-mode)).
+
 ## Per connection
 
 `Service::serve` reads requests until either side closes. Per request
@@ -51,7 +59,8 @@ naming why.
    with `HttpError::status` (400, 431, 505, 417) and the connection
    closes.
 2. `guard::refuse_browser` (any `Origin` or `Sec-Fetch-Site`) and
-   `guard::check_host` (`Host` must be `127.0.0.1:<listener>`): `403`.
+   `guard::check_host` (`Host` must be `127.0.0.1:<listener>`, or in
+   intercept mode the `CONNECT` target, port 443 by default): `403`.
 3. `state.toml` is read (`State::load_at`), then `policy::decide`.
 4. A refusal is answered; an uninjected or injected call is forwarded
    (below); one `access.log` line either way.
@@ -77,9 +86,13 @@ only for a call carrying the phantom). First refusal answers:
 
 1. **Instance known**: a `state.toml` record under the caller's key with
    the caller's `instance_id`, carrying claims.
-2. **Listener**: `instance::by_port` finds the claim listening on the
-   header's port, and its upstream must be the one the header names. That
-   claim is "the claim" below. Intercept headers are refused (not built).
+2. **Listener or intercepted host**: base URL: `instance::by_port` finds
+   the claim listening on the header's port, its upstream must be the one
+   the header names, and the claim must be base-URL mode. Intercept:
+   `intercept_claim` finds the instance's intercept-mode claim with the
+   `CONNECT` host among its upstreams, port 443 only; listeners play no
+   part. That claim is "the claim" below, so a phantom of another claim
+   (a base-URL claim's included) sent to it is a `leak` at step 4.
 3. **Strict path** (`route::check_path`): a dot-segment (`.`, `..`), an
    encoded dot (`%2e` in any case, anywhere) or an empty segment (`//`)
    anywhere in the path is a `400`, for every call, phantom or not, so no
@@ -115,8 +128,9 @@ only for a call carrying the phantom). First refusal answers:
 
 The result (`Outcome`) carries the refusal or the injection (credential,
 slot, the approved claim, its upstream's `private`) and the log context:
-kind, credential, scope, whose phantom, the instance's listeners and the
-refusal shape (the approved copy's once read, else the instance's).
+kind, credential, scope, whose phantom, the instance's listeners (none in
+intercept mode) and the refusal shape (the approved copy's once read,
+else the instance's).
 
 ## The call
 
@@ -144,15 +158,17 @@ hop-by-hop ones and those the response's `Connection` names (and
 is masked (`policy::secrets`: the token, its query form, and its basic
 forms for the claim's basic slots) in the reason, every field value and
 the body as it streams (`redact::Redactor`, same length, so a passed
-`Content-Length` holds). A `Location` to `https://<upstream>[:443]` whose
-host has a listener on the instance is rewritten to
-`http://127.0.0.1:<port>` with path and query kept
-(`rewrite::location`); any other passes as is. The body goes back
+`Content-Length` holds). In base-URL mode a `Location` to
+`https://<upstream>[:443]` whose host has a listener on the instance is
+rewritten to `http://127.0.0.1:<port>` with path and query kept
+(`rewrite::location`); any other passes as is, as every one does in
+intercept mode, where the tool already talks to the real host. The body goes back
 `Content-Length` when the upstream framed it so, else chunked (to an
 HTTP/1.0 client: until close), flushed per read so a stream goes out as
 it comes.
 
-`rewrite`: for an injected call to a route the approved claim lists, the
+`rewrite` (base-URL mode only, as claims allow it): for an injected call
+to a route the approved claim lists, the
 body is read whole up to `MAX_REWRITE` (16 MiB), masked, and each named
 field (`url`, `regions[].url`: dotted names, `[]` for each element)
 holding an absolute URL to a bound upstream is replaced by that
@@ -178,6 +194,40 @@ broken, as the tool shaped every byte of its own call but the slot. A
 with the status `UpstreamError::status` gives (`403` for a refused
 address, `502` otherwise, `400` for a malformed request body),
 refusal-shaped.
+
+## Intercept mode
+
+`Service::serve` folds the header's host (`intercept::fold`: lowercase,
+one trailing dot dropped), then `Service::open_intercept`:
+
+1. **Admitted before any TLS**: `state.toml` is read and
+   `policy::admit_intercept` (steps 1 and 2) must find the claim. The
+   helper has already answered `200`, so a refusal can't be an HTTP
+   answer: the stream is closed, with an `access.log` line (`refused`,
+   `status` 0).
+2. **The leaf**: `Service::leaf` loads the member CA
+   ([ca](ca.md)) at the first intercepted connection
+   (`MemberCa::load_or_create`, kept in the `Service` behind an
+   `RwLock`, a failed load retried next time) and asks it for the host's
+   leaf. A host the CA doesn't cover yet is added first
+   (`MemberCa::ensure_hosts` under the write lock), logged to the daemon
+   log: containers trust the reissued cert only once it is installed in
+   them again.
+3. **The handshake**: a rustls server (`intercept::server_config`) whose
+   only certificate is that leaf, answered only for a ClientHello whose
+   SNI is the host (`OnlyHost`): no SNI or another name gets no
+   certificate and the handshake fails. ALPN offered is `http/1.1` only:
+   a client offering `h2` and `http/1.1` gets HTTP/1.1, one offering only
+   `h2` fails, one offering none is served HTTP/1.1. A handshake that
+   fails on TLS grounds leaves a `refused` line naming why; a client that
+   just goes away leaves none.
+
+Then the same request loop as base-URL mode runs over the TLS stream
+(`Wire::Tls`): `Host` checked against the host, policy with the claim
+matched by host, injection, redaction, and the upstream call to
+`https://<host><path>` over the host's own TLS, as in base-URL mode.
+`Location` passes as is and `rewrite` isn't applied. The connection
+closes with a TLS `close_notify`.
 
 ## Renewal
 
@@ -241,7 +291,9 @@ take it past 10 MiB (`MAX_BYTES`). Fields: `time` (RFC 3339 UTC),
 `route` (the path before injection, query dropped), `scope`, `verdict`
 (`allow`, `uninjected`, `refused`, `leak`, `error`), `reason`, `status`,
 `phantom` (`own`, `other-claim`, `foreign`), and `refreshed: true` when
-the call renewed the token. Never a token or a phantom.
+the call renewed the token. An intercepted connection closed before any
+request (not intercepted, no TLS, a failed handshake) leaves a line
+without `method` or `route`, `status` 0. Never a token or a phantom.
 Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog).
 
 ## End to end

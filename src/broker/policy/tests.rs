@@ -6,6 +6,7 @@ use crate::credentials::instance::plan;
 pub(crate) const OWN: &str = "sntrys_own";
 pub(crate) const FOREIGN: &str = "sntrys_foreign";
 pub(crate) const OTHER_CLAIM: &str = "dsbx_anth_x";
+pub(crate) const GH: &str = "dsbx_github_own";
 
 pub(crate) fn sentry() -> claim::Claim {
     crate::credentials::home::tests::sentry()
@@ -22,6 +23,37 @@ fn anth() -> claim::Claim {
         "login": [{ "method": "paste" }],
     });
     claim::parse("anth", &v).unwrap()
+}
+
+/// An intercept-mode claim on two hosts, its slot `Authorization: token`.
+pub(crate) fn github() -> claim::Claim {
+    let v = serde_json::json!({
+        "upstreams": ["api.github.com", "github.com"],
+        "mode": "intercept",
+        "inject": [{ "header": "Authorization", "format": "token {token}" }],
+        "phantom": { "env": ["GH_TOKEN"] },
+        "login": [{ "method": "paste" }],
+        "scopes": { "user.read": { "routes": ["GET /user"] } },
+    });
+    claim::parse("github", &v).unwrap()
+}
+
+/// `web-1` with sentry ([`OWN`]) and `github` ([`GH`]), `other` with
+/// github ([`FOREIGN`]).
+pub(crate) fn intercept_state(github: claim::Claim) -> State {
+    let mut state = State::default();
+    state.instances.insert("web-1".into(), instance("web-1", claims(&[sentry(), github.clone()], &[OWN, GH])));
+    state.instances.insert("other".into(), instance("other", claims(&[github], &[FOREIGN])));
+    state
+}
+
+/// [`home_with`] plus `github-work`, granted to `work`, with `claim` approved.
+pub(crate) fn intercept_home(claim: &claim::Claim) -> Home {
+    let mut home = home_with(&sentry());
+    let mut e = Entry::new("github", Some(vec!["work".into()]));
+    e.approve(Version::of(claim));
+    home.insert("github-work".into(), e);
+    home
 }
 
 /// `key` (id `<key>-id`) in profile `work` with `claims`, as `state.toml` holds it.
@@ -73,7 +105,7 @@ impl Sources for Src {
         Ok(self.home.clone())
     }
     fn access(&self, _: &Instance, kind: &str) -> Result<Option<Access>> {
-        assert_eq!(kind, "sentry");
+        assert!(["sentry", "github"].contains(&kind), "{kind}");
         Ok(self.access.clone())
     }
 }
@@ -339,13 +371,57 @@ fn scopes_never_other_ask_and_defaults() {
     assert_eq!(r.scope.as_deref(), Some("issues.read"));
 }
 
+/// A call through intercept to `host:port`.
+fn through(state: &State, src: &Src, host: &str, port: u16, path: &str, extra: &str) -> Outcome {
+    let head = parse_head(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
+    let header = ProxyHeader::Intercept { host: host.into(), port };
+    decide(&Call { caller: &caller(), header: &header, head: &head }, state, src)
+}
+
 #[test]
-fn intercept_is_not_built() {
-    let c = Case::new();
-    let head = parse_head(b"GET / HTTP/1.1\r\nHost: api.github.com\r\n\r\n").unwrap();
-    let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
-    let o = decide(&Call { caller: &caller(), header: &header, head: &head }, &c.state, &c.src);
-    refused(&o, "credential-broker step 3");
+fn intercept_matches_the_claim_by_host() {
+    let state = intercept_state(github());
+    let src = Src { home: intercept_home(&github()), access: None };
+    let token = |p: &str| format!("Authorization: token {p}\r\n");
+    for host in ["api.github.com", "github.com"] {
+        let o = through(&state, &src, host, 443, "/user", &token(GH));
+        let i = injected(&o);
+        assert_eq!((i.credential.as_str(), o.context.kind.as_deref()), ("github-work", Some("github")));
+        assert_eq!(o.context.phantom, Some(Phantom::Own));
+        assert!(o.context.listeners.is_empty());
+    }
+    assert!(matches!(through(&state, &src, "github.com", 443, "/user", "").action, Action::Uninjected { .. }));
+    refused(&through(&state, &src, "api.github.com", 443, "/repos/a/b", &token(GH)), "scope `other`");
+
+    // A base-URL claim's upstream, an unbound host, another port.
+    for (host, port) in [("sentry.io", 443), ("example.com", 443), ("api.github.com", 8443)] {
+        let o = through(&state, &src, host, port, "/user", &token(GH));
+        refused(&o, &format!("`{host}:{port}` is no intercepted upstream of instance `web-1`"));
+    }
+    let r = admit_intercept(&state, &Caller { instance: "web-1".into(), instance_id: "x".into() }, "github.com", 443);
+    assert!(r.unwrap_err().reason.contains("has no record"));
+    assert_eq!(admit_intercept(&state, &caller(), "github.com", 443).unwrap().kind, "github");
+}
+
+#[test]
+fn intercept_leaks_and_mode_mismatches() {
+    let state = intercept_state(github());
+    let src = Src { home: intercept_home(&github()), access: None };
+    // The base-URL claim's phantom in its own slot, sent to the intercepted host.
+    let o = through(&state, &src, "api.github.com", 443, "/user", &bearer(OWN));
+    let r = refused(&o, "the `sentry` claim's phantom was sent to the `github` claim's `api.github.com`");
+    assert_eq!((r.verdict, o.context.phantom), ("leak", Some(Phantom::OtherClaim)));
+    let o = through(&state, &src, "api.github.com", 443, "/user", &format!("Authorization: token {FOREIGN}\r\n"));
+    assert_eq!(o.context.phantom, Some(Phantom::Foreign));
+
+    // An intercept claim's upstream reached as a base-URL listener.
+    let gh = &state.instances["web-1"].claims[1];
+    let listener = gh.listeners.iter().find(|l| l.upstream == "api.github.com").unwrap().port;
+    let head = parse_head(format!("GET /user HTTP/1.1\r\nHost: 127.0.0.1:{listener}\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
+        .unwrap();
+    let header = ProxyHeader::BaseUrl { upstream: "api.github.com".into(), listener };
+    let o = decide(&Call { caller: &caller(), header: &header, head: &head }, &state, &src);
+    refused(&o, &format!("port {listener} is no broker listener for `api.github.com`"));
 }
 
 #[test]

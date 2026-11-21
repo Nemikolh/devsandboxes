@@ -11,12 +11,14 @@ use std::thread;
 use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use serde_json::Value;
 
 use super::*;
-use crate::broker::policy::tests::{FOREIGN, OWN, caller, home_with, sentry, state_with};
+use crate::broker::policy::tests::{
+    FOREIGN, GH, OWN, caller, github, home_with, intercept_home, intercept_state, sentry, state_with,
+};
 use crate::broker::upstream::Timeouts;
 use crate::credentials::oauth::tests::{GITHUB_TOKEN, field, form, json, path};
 use crate::credentials::store::{Record, Secret, Store};
@@ -82,6 +84,22 @@ impl Rig {
     /// `sentry-work` (token [`TOKEN`]) and a config root, each upstream
     /// dialed at `localhost:<upstream port>`.
     fn new(tag: &str, upstream_port: u16) -> Rig {
+        let claim = private(sentry());
+        Rig::with(tag, upstream_port, state_with(claim.clone()), home_with(&claim), "sentry-work", &claim)
+    }
+
+    /// [`intercept_state`] with github's upstreams private, `github-work`
+    /// holding [`TOKEN`].
+    fn intercept(tag: &str, upstream_port: u16) -> Rig {
+        let claim = private(github());
+        let mut state = intercept_state(claim.clone());
+        for c in state.instances.values_mut().flat_map(|i| &mut i.claims).filter(|c| c.kind == "github") {
+            c.listeners.clear();
+        }
+        Rig::with(tag, upstream_port, state, intercept_home(&claim), "github-work", &claim)
+    }
+
+    fn with(tag: &str, upstream_port: u16, mut state: State, home: Home, credential: &str, claim: &claim::Claim) -> Rig {
         let dir = std::env::temp_dir().join(format!("dsv-broker-serve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let data = dir.join("data");
@@ -90,17 +108,12 @@ impl Rig {
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(cfg.join("devsandboxes.toml"), "[sandbox.web]\nfolder = \".\"\n").unwrap();
 
-        let mut claim = sentry();
-        for u in &mut claim.pinned.upstreams {
-            u.private = true;
-        }
-        let mut state = state_with(claim.clone());
         for inst in state.instances.values_mut() {
             inst.config_dir = Some(cfg.clone());
         }
         std::fs::write(data.join("state.toml"), toml::to_string(&state).unwrap()).unwrap();
-        std::fs::write(home::path(&data), home::serialize(&home_with(&claim)).unwrap()).unwrap();
-        Store::in_data(&data).put("sentry-work", &Record::token(Secret::new(TOKEN.into()))).unwrap();
+        std::fs::write(home::path(&data), home::serialize(&home).unwrap()).unwrap();
+        Store::in_data(&data).put(credential, &Record::token(Secret::new(TOKEN.into()))).unwrap();
 
         let mut roots = RootCertStore::empty();
         roots.add(CertificateDer::from_pem_file(fixture("ca.pem")).unwrap()).unwrap();
@@ -153,7 +166,43 @@ impl Rig {
         let header = ProxyHeader::BaseUrl { upstream: upstream.into(), listener: self.port(upstream) };
         let service = self.service.clone();
         thread::spawn(move || service.serve(&caller, header, theirs));
-        Client { port: self.port(upstream), reader: BufReader::new(ours.try_clone().unwrap()), w: ours }
+        Client { host: format!("127.0.0.1:{}", self.port(upstream)), reader: BufReader::new(Box::new(ours)) }
+    }
+
+    /// The member CA's cert as the only root, as a container would trust it.
+    fn member_roots(&self) -> RootCertStore {
+        let ca = MemberCa::load_or_create(&self.dir.join("data")).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(ca.cert_pem().unwrap().as_bytes()).unwrap()).unwrap();
+        roots
+    }
+
+    /// `CONNECT host:port` as devsbd hands it over, then TLS to `sni`
+    /// (`None`: no SNI) offering `alpn`, trusting only the member CA: the
+    /// client, or why its handshake failed.
+    fn intercept_to(&self, host: &str, port: u16, sni: Option<&str>, alpn: &[&[u8]]) -> Result<Client, String> {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let header = ProxyHeader::Intercept { host: host.into(), port };
+        let service = self.service.clone();
+        thread::spawn(move || service.serve(&caller(), header, theirs));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(self.member_roots())
+            .with_no_client_auth();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        config.enable_sni = sni.is_some();
+        let name = ServerName::try_from(sni.unwrap_or(host).to_string()).unwrap();
+        let mut tls = StreamOwned::new(ClientConnection::new(Arc::new(config), name).unwrap(), ours);
+        while tls.conn.is_handshaking() {
+            tls.conn.complete_io(&mut tls.sock).map_err(|e| e.to_string())?;
+        }
+        if let Some(p) = tls.conn.alpn_protocol() {
+            assert_eq!(p, b"http/1.1");
+        }
+        Ok(Client { host: host.to_string(), reader: BufReader::new(Box::new(tls)) })
     }
 
     fn connect(&self, upstream: &str) -> Client {
@@ -170,7 +219,7 @@ impl Rig {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(!text.contains(TOKEN) && !text.contains(OWN) && !text.contains(FOREIGN), "{text}");
+        assert!(!text.contains(TOKEN) && !text.contains(OWN) && !text.contains(FOREIGN) && !text.contains(GH), "{text}");
         text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
     }
 }
@@ -181,10 +230,21 @@ impl Drop for Rig {
     }
 }
 
+fn private(mut claim: claim::Claim) -> claim::Claim {
+    for u in &mut claim.pinned.upstreams {
+        u.private = true;
+    }
+    claim
+}
+
+trait Duplex: Read + Write + Send {}
+impl<T: Read + Write + Send> Duplex for T {}
+
 struct Client {
-    port: u16,
-    reader: BufReader<UnixStream>,
-    w: UnixStream,
+    /// What `Host` names.
+    host: String,
+    /// Writes go through `get_mut`.
+    reader: BufReader<Box<dyn Duplex>>,
 }
 
 #[derive(Debug)]
@@ -208,15 +268,21 @@ impl Answer {
 }
 
 impl Client {
-    /// `extra` header lines, CRLF-terminated; `Host` is the listener's.
+    fn write(&mut self, bytes: &[u8]) {
+        let w = self.reader.get_mut();
+        w.write_all(bytes).unwrap();
+        w.flush().unwrap();
+    }
+
+    /// `extra` header lines, CRLF-terminated; `Host` is [`Client::host`].
     fn send(&mut self, method: &str, path: &str, extra: &str, body: &[u8]) {
-        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{extra}", self.port);
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n{extra}", self.host);
         if !body.is_empty() {
             req.push_str(&format!("Content-Length: {}\r\n", body.len()));
         }
         req.push_str("\r\n");
-        self.w.write_all(req.as_bytes()).unwrap();
-        self.w.write_all(body).unwrap();
+        self.write(req.as_bytes());
+        self.write(body);
     }
 
     fn read(&mut self) -> Answer {
@@ -323,9 +389,9 @@ fn chunk_upload_url_is_rewritten_and_the_post_comes_back_through_the_broker() {
     let mut req = format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{us}\r\n{}", bearer(OWN));
     req.push_str(&format!("Expect: 100-continue\r\nContent-Length: {}\r\n\r\n", body.len()));
     let mut up = rig.connect("us.sentry.io");
-    up.w.write_all(req.as_bytes()).unwrap();
+    up.write(req.as_bytes());
     assert_eq!(up.read().status, 100);
-    up.w.write_all(body).unwrap();
+    up.write(body);
     let a = up.read();
     assert_eq!((a.status, a.body.as_slice()), (200, &b"got 11 bytes"[..]));
 
@@ -374,7 +440,7 @@ fn refusals_take_the_claims_shape_and_never_reach_upstream() {
     assert_eq!((a.status, a.json()["devsandbox"]["verdict"].as_str()), (403, Some("leak")));
 
     let mut c = rig.connect("sentry.io");
-    c.w.write_all(b"GET /api/0/ HTTP/1.1\r\nHost: evil.example\r\n\r\n").unwrap();
+    c.write(b"GET /api/0/ HTTP/1.1\r\nHost: evil.example\r\n\r\n");
     let a = c.read();
     assert_eq!(a.status, 403);
     assert!(a.json()["detail"].as_str().unwrap().contains("Host"));
@@ -552,6 +618,95 @@ fn uninjected_calls() {
     assert!(a.header("www-authenticate").is_none());
     assert!(seen.lock().unwrap().is_empty());
     assert_eq!(rig.log(1)[0]["verdict"], "uninjected");
+}
+
+/// [`echo`] with a `Location` to the real host.
+fn echo_located(head: &str, body: &[u8]) -> Vec<u8> {
+    let reply = String::from_utf8(echo(head, body)).unwrap();
+    reply.replacen("\r\n", "\r\nLocation: https://api.github.com/next\r\n", 1).into_bytes()
+}
+
+/// The member CA covering `api.github.com` before the broker starts, as
+/// `run` will have made it.
+fn covered(rig: &Rig) {
+    let mut ca = MemberCa::load_or_create(&rig.dir.join("data")).unwrap();
+    ca.ensure_hosts(&BTreeSet::from(["api.github.com".to_string()])).unwrap();
+}
+
+#[test]
+fn intercept_terminates_tls_injects_and_keeps_alive() {
+    let (port, seen) = upstream_server(echo_located);
+    let rig = Rig::intercept("intercept", port);
+    covered(&rig);
+    // h2 is offered too: the broker settles on HTTP/1.1.
+    let mut c = rig.intercept_to("API.GitHub.com.", 443, Some("api.github.com"), &[b"h2", b"http/1.1"]).unwrap();
+    c.host = "api.github.com".into();
+    for _ in 0..2 {
+        let a = c.call("GET", "/user", &format!("Authorization: token {GH}\r\n"), b"");
+        assert_eq!(a.status, 200, "{a:?}");
+        let masked = format!("token {}", "*".repeat(TOKEN.len()));
+        assert_eq!(a.header("x-echo"), Some(masked.as_str()), "{}", a.head);
+        // Passed as is: the tool already talks to the real host.
+        assert_eq!(a.header("location"), Some("https://api.github.com/next"));
+    }
+    // `Host` must be the `CONNECT` target: refused over the TLS.
+    c.host = "evil.example".into();
+    let a = c.call("GET", "/user", &format!("Authorization: token {GH}\r\n"), b"");
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(a.json()["message"].as_str().unwrap().contains("Host"), "{a:?}");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for (head, _) in seen.iter() {
+        assert!(head.contains(&format!("\r\nAuthorization: token {TOKEN}\r\n")), "{head}");
+        assert!(head.starts_with("GET /user HTTP/1.1\r\n"), "{head}");
+    }
+    let log = rig.log(3);
+    let verdicts: Vec<&str> = log.iter().map(|l| l["verdict"].as_str().unwrap()).collect();
+    assert_eq!(verdicts, ["allow", "allow", "refused"]);
+    assert_eq!((log[0]["credential"].as_str(), log[0]["scope"].as_str()), (Some("github-work"), Some("user.read")));
+}
+
+#[test]
+fn intercept_refusals_close_the_stream() {
+    let (port, seen) = upstream_server(echo);
+    let rig = Rig::intercept("intercept-refuse", port);
+    covered(&rig);
+    // Not intercepted: closed before any TLS.
+    for (host, p) in [("sentry.io", 443), ("api.github.com", 8443)] {
+        let err = rig.intercept_to(host, p, Some(host), &[b"http/1.1"]).err().expect("closed");
+        assert!(!err.is_empty());
+    }
+    // SNI absent or another host, ALPN h2 only: the handshake fails.
+    assert!(rig.intercept_to("api.github.com", 443, None, &[]).is_err());
+    assert!(rig.intercept_to("api.github.com", 443, Some("github.com"), &[]).is_err());
+    let err = rig.intercept_to("api.github.com", 443, Some("api.github.com"), &[b"h2"]).err().expect("no h2");
+    assert!(err.contains("NoApplicationProtocol"), "{err}");
+    // No ALPN at all is plain HTTP/1.1.
+    let mut c = rig.intercept_to("api.github.com", 443, Some("api.github.com"), &[]).unwrap();
+    assert_eq!(c.call("GET", "/user", &format!("Authorization: token {GH}\r\n"), b"").status, 200);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // A failed handshake's line lands after its alert went out: unordered.
+    let log = rig.log(6);
+    let lines: Vec<String> = log.iter().map(|l| format!("{} {}", l["verdict"], l["reason"])).collect();
+    let count = |s: &str| lines.iter().filter(|l| l.contains(s)).count();
+    assert_eq!(count("\"refused\" \"`sentry.io:443` is no intercepted upstream of instance `web-1`\""), 1, "{lines:?}");
+    assert_eq!(count("`api.github.com:8443` is no intercepted upstream"), 1, "{lines:?}");
+    assert_eq!(count("TLS handshake for `api.github.com`"), 3, "{lines:?}");
+    assert_eq!(count("\"allow\""), 1, "{lines:?}");
+}
+
+#[test]
+fn an_uncovered_host_is_covered_on_demand() {
+    let (port, _) = upstream_server(echo);
+    let rig = Rig::intercept("intercept-ensure", port);
+    covered(&rig);
+    rig.service.leaf("github.com").unwrap();
+    let hosts = MemberCa::load_or_create(&rig.dir.join("data")).unwrap().hosts();
+    assert_eq!(hosts, BTreeSet::from(["api.github.com".to_string(), "github.com".to_string()]));
+    let mut c = rig.intercept_to("github.com", 443, Some("github.com"), &[b"http/1.1"]).unwrap();
+    assert_eq!(c.call("GET", "/user", &format!("Authorization: token {GH}\r\n"), b"").status, 200);
 }
 
 fn response(length: Length, headers: &[(&str, &str)], body: &'static [u8]) -> Response {

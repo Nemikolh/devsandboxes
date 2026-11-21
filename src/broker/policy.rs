@@ -5,8 +5,11 @@
 //! answers:
 //!
 //! 1. the bridge's instance has a record (key and `instance_id`) with claims;
-//! 2. the stream's listener is one of its claims' and stands for the
-//!    upstream the helper's header names (that claim is "the claim" below);
+//! 2. base URL: the stream's listener is one of its base-URL claims' and
+//!    stands for the upstream the helper's header names; intercept: the
+//!    `CONNECT` target is port 443 of an upstream of one of its
+//!    intercept-mode claims ([`intercept_claim`]) (that claim is "the
+//!    claim" below);
 //! 3. the path is strict ([`route::check_path`]), whatever comes next, so
 //!    nothing an upstream would resolve differently is ever forwarded;
 //! 4. the phantom, looked for only in inject slots: any other claim's
@@ -37,7 +40,7 @@ use super::redact;
 use super::refusal::Refusal;
 use super::route::{self, Scoped};
 use crate::config::Access;
-use crate::credentials::claim::{self, Pinned, Refusal as Shape, Slot};
+use crate::credentials::claim::{self, Mode, Pinned, Refusal as Shape, Slot};
 use crate::credentials::home::{self, Home};
 use crate::credentials::instance::{self, InstanceClaim};
 use crate::devsbd::bridge::Caller;
@@ -88,7 +91,8 @@ pub struct Context {
     pub scope: Option<String>,
     pub phantom: Option<Phantom>,
     /// Every listener of the instance, (upstream, port): where `Location`
-    /// and `rewrite` fields point back to.
+    /// and `rewrite` fields point back to. Empty in intercept mode: the
+    /// tool already talks to the real host.
     pub listeners: Vec<(String, u16)>,
     /// The approved claim's, once read, else the instance's.
     pub shape: Option<Shape>,
@@ -134,8 +138,9 @@ fn internal(why: impl std::fmt::Display) -> Refusal {
     Refusal::new(500, "error", why.to_string())
 }
 
-fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context) -> Result<Action, Refusal> {
-    let Caller { instance: key, instance_id } = call.caller;
+/// Step 1: the caller's record, carrying claims.
+fn known<'a>(state: &'a State, caller: &Caller) -> Result<&'a Instance, Refusal> {
+    let Caller { instance: key, instance_id } = caller;
     let inst = state
         .instances
         .get(key)
@@ -144,32 +149,69 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
     if inst.claims.is_empty() {
         return Err(Refusal::refused(format!("instance `{key}` claims no credential")));
     }
-    cx.incarnation = inst.incarnation.clone();
-    cx.listeners =
-        inst.claims.iter().flat_map(|c| c.listeners.iter().map(|l| (l.upstream.clone(), l.port))).collect();
+    Ok(inst)
+}
 
-    let (own, upstream) = match call.header {
+/// The intercept-mode claim of `inst` with `host` among its upstreams, for a
+/// `CONNECT` to `host:port`; only port 443 is intercepted.
+pub fn intercept_claim<'a>(inst: &'a Instance, host: &str, port: u16) -> Option<&'a InstanceClaim> {
+    if port != 443 {
+        return None;
+    }
+    inst.claims.iter().find(|c| {
+        claim::from_canonical(&c.claim)
+            .is_ok_and(|(_, p)| p.mode == Mode::Intercept && p.upstreams.iter().any(|u| u.host == host))
+    })
+}
+
+/// Steps 1 and 2 for an intercepted connection, before its TLS: whether the
+/// caller's instance intercepts `host:port`, and the claim that does.
+pub fn admit_intercept<'a>(state: &'a State, caller: &Caller, host: &str, port: u16) -> Result<&'a InstanceClaim, Refusal> {
+    let inst = known(state, caller)?;
+    intercept_claim(inst, host, port).ok_or_else(|| {
+        Refusal::refused(format!("`{host}:{port}` is no intercepted upstream of instance `{}`", caller.instance))
+    })
+}
+
+fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context) -> Result<Action, Refusal> {
+    let key = &call.caller.instance;
+    let inst = known(state, call.caller)?;
+    cx.incarnation = inst.incarnation.clone();
+
+    let no_listener = |listener: &u16, upstream: &str| {
+        Refusal::refused(format!("port {listener} is no broker listener for `{upstream}` on instance `{key}`"))
+    };
+    let (own, upstream, to) = match call.header {
         ProxyHeader::BaseUrl { upstream, listener } => match instance::by_port(&inst.claims, *listener) {
-            Some((c, u)) if u == upstream => (c, u),
-            _ => {
-                return Err(Refusal::refused(format!(
-                    "port {listener} is no broker listener for `{upstream}` on instance `{key}`"
-                )));
+            Some((c, u)) if u == upstream => {
+                cx.listeners = inst
+                    .claims
+                    .iter()
+                    .flat_map(|c| c.listeners.iter().map(|l| (l.upstream.clone(), l.port)))
+                    .collect();
+                (c, u, format!("a `{}` listener", c.kind))
             }
+            _ => return Err(no_listener(listener, upstream)),
         },
-        ProxyHeader::Intercept { .. } => {
-            return Err(Refusal::refused("intercept mode isn't built yet (credential-broker step 3)"));
+        ProxyHeader::Intercept { host, port } => {
+            let c = admit_intercept(state, call.caller, host, *port)?;
+            (c, host.as_str(), format!("the `{}` claim's `{host}`", c.kind))
         }
     };
     cx.kind = Some(own.kind.clone());
     let (_, own_claim) = claim::from_canonical(&own.claim).map_err(|e| internal(format!("{e:#}")))?;
     cx.shape = own_claim.refusal.clone();
+    if let ProxyHeader::BaseUrl { listener, .. } = call.header
+        && own_claim.mode != Mode::BaseUrl
+    {
+        return Err(no_listener(listener, upstream));
+    }
 
     let head = call.head;
     let path = head.target.path();
     route::check_path(path).map_err(|why| Refusal::new(400, "refused", why))?;
 
-    let slot = match phantom_slot(head, inst, own, &own_claim, state, cx)? {
+    let slot = match phantom_slot(head, inst, own, &own_claim, state, &to, cx)? {
         Some(found) => found,
         None => {
             let private = own_claim.upstreams.iter().any(|u| u.host == upstream && u.private);
@@ -253,13 +295,15 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
     })))
 }
 
-/// Step 4: the slot holding the claim's phantom, `None` without one.
+/// Step 4: the slot holding the claim's phantom, `None` without one. `to`
+/// names where the call went, for a leak's reason.
 fn phantom_slot(
     head: &RequestHead,
     inst: &Instance,
     own: &InstanceClaim,
     own_claim: &Pinned,
     state: &State,
+    to: &str,
     cx: &mut Context,
 ) -> Result<Option<Slot>, Refusal> {
     let mut seen: Vec<String> = Vec::new();
@@ -282,7 +326,7 @@ fn phantom_slot(
             return Err(Refusal::new(
                 403,
                 "leak",
-                format!("the `{}` claim's phantom was sent to a `{}` listener", other.kind, own.kind),
+                format!("the `{}` claim's phantom was sent to {to}", other.kind),
             ));
         }
         let foreign = state

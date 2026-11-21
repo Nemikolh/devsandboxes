@@ -343,7 +343,12 @@ is frozen: no new work on it.
   `approvers`, `delegate` and `as` parse but nothing reads them yet.
   → [login](architecture/credentials/login.md); `commands::login::choose`
 - Intercept-mode claims are skipped at `run` until credential-broker
-  step 3 (the member CA mints leaves, nothing serves them yet), and claims on an instance placed by another member until step 5
+  step 3's run wiring lands (the broker terminates TLS for intercepted
+  hosts and the helper's proxy ports route them, but `run` sets no
+  `HTTPS_PROXY` / `NO_PROXY` env, installs no member CA trust at create,
+  calls no `ensure_hosts` and doesn't reinstall a reissued cert, so the
+  broker covers a host on demand and a container's trust stays stale),
+  and claims on an instance placed by another member until step 5
   (`CRED`), each with a warning.
   → [images and features](architecture/instances/images-and-features.md#credential-claims);
   `credentials::instance::select`, `commands::run::claims::wire`

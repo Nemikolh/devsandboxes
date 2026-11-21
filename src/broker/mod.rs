@@ -15,9 +15,10 @@
 //!   check on every address it dials.
 //! - [`route`], [`rewrite`], [`refusal`]: a path against a claim's routes,
 //!   upstream URLs turned into loopback ones, the broker's own answers.
-//! - [`policy`], [`audit`], [`serve`] (unix, with `serve`): the decision
-//!   per call, `access.log`, and the [`Broker`](crate::devsbd::bridge::Broker)
-//!   the daemon's bridges hand connections to.
+//! - [`policy`], [`audit`], [`intercept`], [`serve`] (unix, with `serve`):
+//!   the decision per call, `access.log`, intercept mode's TLS, and the
+//!   [`Broker`](crate::devsbd::bridge::Broker) the daemon's bridges hand
+//!   connections to.
 //!
 //! A refusal reaches the caller as an `io::Error` of kind `InvalidData`
 //! carrying an [`HttpError`] ([`refusal`]), so one `?` covers transport
@@ -32,6 +33,8 @@ pub mod audit;
 pub mod body;
 pub mod guard;
 pub mod head;
+#[cfg(unix)]
+pub mod intercept;
 #[cfg(unix)]
 pub mod policy;
 pub mod redact;

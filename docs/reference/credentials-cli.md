@@ -278,10 +278,10 @@ take the file past 10 MiB. Never a token or a phantom.
 | `instance`, `instance_id` | the bridge's instance (state key, persistent id) |
 | `incarnation` | the instance's, when its record has one |
 | `kind`, `credential`, `scope` | as far as policy got (`null` before) |
-| `method`, `route` | the request's, the path before injection, query dropped |
+| `method`, `route` | the request's, the path before injection, query dropped; empty for an intercepted connection closed before any request |
 | `verdict` | `allow` (injected), `uninjected`, `refused`, `leak`, `error` |
 | `reason` | a refusal's or failure's one line; a skipped `rewrite` |
-| `status` | what the tool got (the upstream's, or the broker's own) |
+| `status` | what the tool got (the upstream's, or the broker's own); `0` when an intercepted connection was closed unanswered (not intercepted, no TLS, a failed handshake) |
 | `phantom` | whose phantom the call carried: `own`, `other-claim`, `foreign`; `null` for none |
 | `refreshed` | `true` when the call renewed the credential's token; absent otherwise |
 
