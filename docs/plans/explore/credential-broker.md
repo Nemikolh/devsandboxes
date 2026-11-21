@@ -183,7 +183,10 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   exception: devsandbox's own `mcp` claim, where the bridge's identity is
   enough, agent-credentials), and the real
   value replaces it only in the bound claim's `inject` slot (a request
-  carrying that header twice is refused): a phantom
+  carrying that header twice is refused; a claim naming two slots for
+  one credential, Anthropic's `x-api-key` and `Authorization: Bearer`,
+  which zidane sends, injects into the one holding the phantom and
+  refuses a request filling both): a phantom
   anywhere else (URL, other headers, a body) goes upstream as is, never
   swapped, so no posted text stores the token. Without one it goes
   upstream uninjected (git gets GitHub's 401 first, so the credential
@@ -253,16 +256,19 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   a remote home offline then is a warning, the per-call check stands) →
   the fence, for credentials that have one: the scope table attributes
   the route to a repo (case-folded, `.git` stripped, the query string
-  ignored; strict in the repo part, `%2F` past it decoded once:
+  ignored; strict in the repo part, dot-segments, encoded dots and `//`
+  refused anywhere in the path before anything is injected, `%2F` past
+  the repo decoded once:
   github-and-sentry-access, *Matching*; `/repositories/{id}` and node
   ids resolved by the home) or lists it as repo-less (never asked: an
   `ask` scope denies there, as an answer couldn't name a repo); a route
   it can't place, unknown ones included, is
   denied, and a repo outside the fence gets no credential, never asked:
   the request goes upstream with the phantom stripped, from the
-  instance's host, as to a stranger (public repos work, under the
-  upstream's anonymous rate limit, 60 requests an hour per IP on
-  GitHub's REST API); its response carries `devsandbox-fence: outside`,
+  instance's host, as to a stranger (public data works where the
+  upstream serves it anonymously: GitHub's REST API and git, under 60
+  requests an hour per IP shared with the host, never its GraphQL); its
+  response carries `devsandbox-fence: outside`,
   and an upstream `401` becomes the broker's refusal naming
   `access.<credential>.repos`, so no tool is sent to its own login → the
   bound scope table maps the route to a scope: allow, ask or deny, deny
@@ -312,8 +318,8 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   bundle file itself, never a snapshot, so a corporate CA added later
   still counts. An image with no system bundle gets one written from a
   vendored Mozilla set (`webpki-roots`) plus the CA, never the CA alone.
-  No `SSL_CERT_FILE`: Go (gh) and OpenSSL read the system bundle on
-  Linux, no custom build. git gets `http.https://github.com/.sslCAInfo`
+  No `SSL_CERT_FILE`: Go (gh), OpenSSL and libcurl (git, curl) and Bun
+  (zidane) read the system bundle on Linux, no custom build. git gets `http.https://github.com/.sslCAInfo`
   pointing at the same file, over a dotfile's or nix's own bundle path
   (git-gateway). Java ignores `HTTPS_PROXY`, so it and
   compiled-in roots are base-URL only.
@@ -438,6 +444,115 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
 | | by IP on a network | spoofable, breaks with host networking |
 | beyond credentials | devsandbox as an OIDC issuer: signed instance tokens for services that accept OIDC (cloud IAM, Vault) | later; the claim is already most of a token |
 
+## Spike findings
+
+2026-11-21, before any broker code. Versions: gh 2.105.0, git 2.39.5
+(Debian 12, libcurl-gnutls), git-lfs 3.3.0, curl 7.88.1, sentry-cli 3.8.2
+and 2.29.1, zidane 9.6.1 (Bun 1.4.3), mitmproxy 12.3.1. Method: a
+devsandbox instance on docker, a mitmproxy broker as a sidecar on the
+instance network (forward proxy, its CA in the sandbox's system bundle
+only), phantoms in the sandbox, the real GitHub token only in the broker,
+temp private repos allowed/forbidden by a path-based fence prototype,
+mocks for Sentry and Anthropic.
+
+- Rig: `[services.*]` takes no `mounts`, and a sandbox gets a
+  per-instance network only when it lists an isolated service, so the
+  sidecar was a plain `docker run`. Nothing here assumes a service holds
+  a credential (the broker is `serve`'s).
+
+gh in intercept mode:
+
+- CA from the system bundle alone, phantom in `Authorization: token`,
+  any token shape accepted: holds (*Shape*, *The member CA*).
+- `gh auth status` assumed to read `GET /`: it first sends GraphQL
+  `viewer{login}`, then `GET /`; stripped, "token invalid"
+  (github-and-sentry-access, *Routes it can't*).
+- Out of the fence "public repos work": false for gh. GitHub serves no
+  anonymous GraphQL (403), so stripped `repo view`, `issue/pr list`,
+  `repo clone`'s lookup fail on public repos; REST and git work under
+  the shared 60/h (*Policy*, github-and-sentry-access *Outside the
+  fence*).
+- GraphQL can't be fenced by path: holds. New: gh's own queries carry
+  `owner`/`name` in variables (parseable); mutations name node ids
+  (`addComment.subjectId`), so node-id resolution is needed
+  (github-and-sentry-access *Routes it can't*, open questions).
+- Under `as = "user"` with queries, search and `/user/repos`
+  credentialed, the forbidden repo's metadata leaks (accepted); its
+  contents don't (clone 401, mutations stripped).
+- A prefix fence injected on `repos/<allowed>/../<other>`, `%2e%2e`,
+  `//`; `uploads.github.com` resolves `..` (301 to the other repo):
+  strict refusal before injection, now explicit (*Policy*,
+  github-and-sentry-access *Matching*).
+- Hosts: release assets redirect to
+  `release-assets.githubusercontent.com`, LFS objects to
+  `github-cloud.githubusercontent.com` / S3; telemetry to
+  `cafe.github.com`, set off by the feature (github-and-sentry-access
+  *Reaching the broker*, *Redirects*).
+- gh never refuses up front: it sends the phantom and passes GitHub's
+  error on.
+
+git (git-gateway, *The gateway*):
+
+- Precedence holds: `http.proxy` beats `HTTPS_PROXY`; command-scope
+  URL-scoped settings beat a dotfile's plain or equal ones; a more
+  specific user `http.<url>.proxy` wins.
+- New: `GIT_SSL_CAINFO` env beats every config scope; a `NO_PROXY`
+  covering `github.com` bypasses the per-URL proxy (fails closed: the
+  phantom is rejected upstream). The boot check now covers both.
+- `--get-urlmatch` needs each remote's real URL, doesn't reflect env
+  overrides; `--show-scope` prints `unknown` on git 2.39.
+- "A dotfile's `sslCAInfo` replaces the system one": not on Debian's
+  libcurl (its compiled-in CA path stays; `sslCAPath` replaces it).
+- git-lfs honors the URL-scoped proxy, CA and helper; object transfers
+  go direct to storage hosts; batch actions carry `RemoteAuth` and AWS
+  signature headers: the batch rewrite is needed (*LFS*).
+- The helper sees protocol and host only; git sends `store` after
+  success, `erase` after failure; without the reset a user `store`
+  helper saves the phantom; gh's `-c` helper overrides the gateway's
+  (same phantom). Push via receive-pack with the Basic swap works.
+
+sentry-cli in base-URL mode (github-and-sentry-access, *sentry-cli*):
+
+- Plain-http `SENTRY_URL`, no CA, no proxy: holds on both versions.
+- "≥ 2.30 posts to an absolute URL": the gate is the server's
+  (User-Agent in `ChunkUploadEndpoint.get`); every client posts to any
+  absolute URL with the token, and self-hosted options force absolute
+  for all, so `rewrite` applies whatever the version. With it, uploads
+  complete end to end on both.
+- New `rewrite`: 2.x `organizations list` follows
+  `/api/0/users/me/regions/`'s absolute region URLs.
+- 3.x pairs URL and token by source: the `.sentryclirc` template needs
+  `[defaults] url`; dropping `SENTRY_URL` while passing a token sends it
+  to sentry.io.
+- Phantom: an unstructured `sntrys_…` (or one embedding the loopback
+  URL); a structured copy of the real token goes to sentry.io.
+- Format warnings: 3.x for `--auth-token` only, 2.29 for env and rc
+  too; both redact the header in logs, 2.29 logs the `--auth-token`
+  argv.
+
+zidane (agent-credentials):
+
+- Base-URL mode for Anthropic: every model call reached the mock. The key
+  goes as `Authorization: Bearer`, never `x-api-key` (*API key*; here,
+  *Phantoms*).
+- Bun trusted the CA from the system bundle alone (here, *The member
+  CA*).
+- Base-URL env: Anthropic, xAI (`PI_XAI_BASE_URL`, `XAI_BASE_URL`),
+  Bedrock (untested), `LOCAL_LLM_BASE_URL`; OpenAI Codex is hard-coded
+  to `chatgpt.com/backend-api`, OpenRouter, Gemini and Cerebras take no
+  env: intercept mode (*Rollout* step 6).
+- OpenAI phantom: an opaque key fails client-side; an unsigned JWT with
+  `chatgpt_account_id` passes (*Phantom shape*, open questions).
+- Other egress: the npm update check (`ZIDANE_NO_UPDATE=1`); the bare TUI
+  probes local model ports on the container's loopback.
+- A fresh config dir opens the setup wizard even with
+  `ANTHROPIC_API_KEY` set, which saves keys to `credentials.json`:
+  *Rollout* step 1 sets `ZIDANE_NO_ONBOARDING=1`. Likely a zidane bug,
+  not a plan change: `--json`/`--stream-json` without a schema hang in
+  the wizard even then.
+
+All clients negotiated HTTP/2 with the proxy (*Open questions*).
+
 ## Rollout
 
 1. Phantoms on the instance, the `HTTP_PROXY` cap and channel end to end,
@@ -476,7 +591,10 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   new ones meanwhile: hand the listeners to the successor over
   `devsbd.ctl` (`SCM_RIGHTS`) and let the old daemon finish open
   connections, bounded, or run the proxy as its own process?
-- HTTP/2 upstream (gRPC-ish APIs) and WebSockets through intercept mode.
+- HTTP/2 upstream (gRPC-ish APIs) and WebSockets through intercept mode;
+  and HTTP/2 from the tools: gh, git, git-lfs, curl and Bun all
+  negotiated h2 with the spike's proxy, so their behavior against an
+  `http/1.1`-only ALPN is untested (expected fine).
 - The file store at rest: plain 0600 like `member.key`, or sealed with
   `systemd-creds` / a TPM where there is one?
 - One home per credential name fleet-wide: two members can't keep

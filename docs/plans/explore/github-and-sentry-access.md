@@ -41,11 +41,11 @@ phantoms. One feature per instance claims a given credential
 |---|---|
 | `upstreams` | hosts the credential is for, one marked `private` if it's on the LAN (credential-broker, *The broker*) |
 | `mode` | `base-url` or `intercept` |
-| `inject` | where the token goes: a header and its format, basic auth, a query parameter |
+| `inject` | where the token goes: a header and its format, basic auth, a query parameter; two slots where clients differ (Anthropic's `x-api-key` and `Authorization: Bearer`), the one holding the phantom taken |
 | `phantom` | env vars, and files from a template (`hosts.yml` is YAML, `.sentryclirc` INI) in the remote user's home; a prefix, if the client reads its mode from it |
 | `git` | gitconfig devsandbox writes in the container (ssh forms to https, the credential helper; *git* below) |
 | `baseUrl` | for `base-url`: the env var that takes the loopback URL |
-| `rewrite` | response fields holding an absolute upstream URL, replaced with the loopback (sentry's chunk-upload `url`) |
+| `rewrite` | response fields holding an absolute upstream URL, replaced with the loopback (sentry's chunk-upload `url`, its regions list's `regions[].url`) |
 | `login` | how `devsandbox login` gets it: OAuth device flow, browser OAuth, GitHub App manifest, paste |
 | `check` | a route the broker calls with no sandbox input to confirm a 401 means a broken credential (`GET /user`, `GET /api/0/`; credential-broker, *Lifetimes*) |
 | `mint` | an adapter devsandbox ships (`github-app`, `oauth-refresh`), if any |
@@ -114,8 +114,14 @@ drops the official feature, or two gh binaries race on `PATH`.
   create), so VS Code terminals and tasks and a plain `docker exec` reach
   the broker too instead of sending the phantom to GitHub. `GH_TOKEN` is
   the phantom, so `gh auth login` refuses and `gh auth status` reports
-  logged in; `hosts.yml` gets the phantom for tools that read it. `gh auth
-  token` prints the phantom: harmless. `github.com` isn't claimed there
+  logged in (its GraphQL `viewer{login}`, then `GET /`, credentialed:
+  *Routes it can't*); `hosts.yml` gets the phantom for tools that read it. `gh auth
+  token` prints the phantom: harmless. gh checks no token itself (any
+  shape passes) and never refuses up front: it sends the phantom and
+  passes GitHub's or the broker's error on. The feature sets
+  `GH_TELEMETRY=false` beside the phantom: gh posts command names and
+  flags to `cafe.github.com`, unclaimed, no credential, egress no one
+  asked for. `github.com` isn't claimed there
   (*git* below), so release downloads by uv, rustls installers or a
   browser never meet the member CA or the broker.
 - **The repo fence**: the remotes of `folder` and `folders` (`github.com`
@@ -146,7 +152,11 @@ drops the official feature, or two gh binaries race on `PATH`.
 - **Matching**: owner and repo compare case-insensitively, with `.git`
   and `.wiki.git` reduced to the repo. Owner, repo and
   `/repositories/{id}` are strict: an encoded character, a dot-segment or
-  `//` there is refused, not normalized. Past the repo `%2F` is decoded
+  `//` there is refused, not normalized, as are dot-segments (`..`,
+  `%2e%2e`) and `//` anywhere in the path, on every claimed host, before
+  anything is injected: a prefix match takes
+  `/repos/{allowed}/../{other}` for the allowed repo, and
+  `uploads.github.com` resolves `..` (a 301 to the other repo's path). Past the repo `%2F` is decoded
   once and the decoded path matched (gh's `safeurl.JoinPath` sends
   `git/ref/tags%2Fv1` and `contents/.github%2Fworkflows%2Fci.yml`), so a
   branch rule on `git/refs/heads/{branch}` binds `heads%2Fmain`; double
@@ -158,11 +168,16 @@ drops the official feature, or two gh binaries race on `PATH`.
   nothing.
 - **Outside the fence** a request goes upstream from the instance's host
   with the phantom stripped and no credential, its response marked
-  `devsandbox-fence: outside` (credential-broker, *Policy*): public repos work (cargo and npm git dependencies,
-  release downloads, `gh extension install`), private ones answer 404 as
-  to a stranger. The fence keeps the credential, not the network (the
-  broker's non-goal). Reads share the host IP's anonymous limit (60 an
-  hour); a write gets the broker's refusal naming `access.github.repos`,
+  `devsandbox-fence: outside` (credential-broker, *Policy*): public data
+  over REST and git works (cargo and npm git dependencies, submodules,
+  `gh api`, release downloads, `gh search repos`), private repos answer
+  404 as to a stranger. GitHub serves no anonymous GraphQL (a 403), so
+  nothing GraphQL-backed works stripped, public repos included (`gh repo
+  view`, `issue`/`pr list`, `gh repo clone`'s lookup, `auth status`):
+  those gh commands work out of the fence only because GraphQL queries
+  are never fenced (*Routes it can't*). The fence keeps the credential, not the network (the
+  broker's non-goal). Stripped REST reads share the host IP's anonymous
+  limit (60 an hour, the host's own calls included); a write gets the broker's refusal naming `access.github.repos`,
   not GitHub's 401, which sends tools to `gh auth login`. Smart HTTP to a
   private or missing repo answers 401, which sends git to a credential
   prompt (a hang without a TTY): out of the fence the broker answers that
@@ -196,15 +211,20 @@ drops the official feature, or two gh binaries race on `PATH`.
   `updateRef`, `deleteRef`, merges) are ref writes for the gateway's
   branch rules.
 - **Routes it can't**: GraphQL queries (any repo, objects by global id),
-  `/search/*`, `/notifications`, `/user/repos`, gists. Only a token
+  `/search/*`, `/notifications`, `/user/repos`, gists. gh's own queries
+  name their repo in variables (`IssueList`, `RepositoryInfo`: `owner`
+  and `name`), but `node(id:)`, `search` and `viewer.repositories` don't,
+  and a query may ask any of them (open questions). Only a token
   GitHub narrows fences their repo, so their reads (GET, HEAD, GraphQL
   queries) pass under the token's own reach and never `ask` (an `ask`
   scope denies here); their writes (`POST /user/repos`, `POST /gists`)
   are `other`, denied: the broker can't
   name the repo, so an answer could cross the fence. An installation
   token minted for the sandbox's repos makes that reach the fence. A
-  read-only allowlist gh needs: `GET /` (the API root, whose
-  `X-Oauth-Scopes` `gh auth status` reads, failing on anything but 200),
+  read-only allowlist gh needs: the GraphQL `viewer{login}` query and
+  `GET /` (`gh auth status` sends the query first and calls the token
+  invalid when it fails, then reads the API root's `X-Oauth-Scopes`,
+  showing none when that fails),
   `/rate_limit`, `/meta`, and `/user` under a user token (an installation
   token gets 403 there, so `@me` fails under one).
 - **`never`**: besides routes that mint a credential, those that plant
@@ -244,9 +264,11 @@ drops the official feature, or two gh binaries race on `PATH`.
   (`gh repo clone`, `gh pr checkout`) hands over the same phantom. Submodules on GitHub take the same path: inside the
   fence with the credential, outside it anonymous.
 - **Redirects**: tarball, release asset and artifact downloads 302 to
-  `codeload.github.com` / `objects.githubusercontent.com` with a
-  short-lived signed URL. Those hosts are unclaimed and `Location` passes
-  through: the signature is in the URL, no header to carry.
+  `codeload.github.com` / `release-assets.githubusercontent.com` (LFS
+  objects come from `github-cloud.githubusercontent.com` or S3: the
+  gateway's *LFS*) with a short-lived signed URL. Those hosts are
+  unclaimed and `Location` passes through: the signature is in the URL,
+  no header to carry.
 
 ### Whose token: the bot or you
 
@@ -315,19 +337,36 @@ only a note when the repo is public (a reference clone in `folders`).
 ## sentry-cli
 
 - **Reaching the broker**: base-URL mode. `SENTRY_URL` points at the
-  loopback port, `SENTRY_AUTH_TOKEN` and `~/.sentryclirc` hold the phantom.
-  No CA. sentry-cli reads the env token unchecked (it warns about an
-  unknown format only for `--auth-token`), keeps `SENTRY_URL` (only an
-  `sntrys_` token's embedded URL overrides it), and leaves the phantom
-  unredacted in its logs: harmless.
-- **Chunk uploads**: sentry-cli 2.30 and later gets an absolute region URL
-  from `GET /api/0/organizations/{org}/chunk-upload/` (Sentry's
-  `ChunkUploadEndpoint`, `requires_region_url`) and posts the chunks there
-  directly. The claim's `rewrite` names that `url`: the broker returns
-  that upstream's loopback port in its place and sends those posts to the
-  host the server named (`us.sentry.io`); a host outside the claim's
-  upstreams is refused. Without it every source map and debug-file upload
-  gets a 401.
+  loopback port (plain http, no warning), `SENTRY_AUTH_TOKEN` and
+  `~/.sentryclirc` hold the phantom; the rc template carries `[defaults]
+  url` beside the token, as sentry-cli 3.x pairs URL and token by source
+  (`reconcile_auth_url`: a source setting only one drops the other's
+  inherited value), so a token-only rc is dropped once `SENTRY_URL` is
+  set, and anything that drops `SENTRY_URL` but passes a token
+  (`env -i`, a CI wrapper) sends it to `sentry.io` (a 401 for a phantom).
+  No CA. sentry-cli takes any token shape (an unknown one warned about by
+  3.x only for `--auth-token`, by 2.x from env and rc too) and keeps
+  `SENTRY_URL` unless an `sntrys_` token embeds a URL: the phantom is an
+  unstructured `sntrys_…` (or a structured one embedding the loopback
+  URL), never a copy of the real token's structure, which goes to
+  `sentry.io` (3.x) or errors (2.x env). Both redact the header in their
+  logs; 2.x logs a `--auth-token` argv in full: harmless.
+- **Chunk uploads**: `GET /api/0/organizations/{org}/chunk-upload/`
+  answers an absolute region URL (`us.sentry.io`) or a relative one, by
+  the server's rule: Sentry's `ChunkUploadEndpoint.get`
+  (`src/sentry/api/endpoints/chunk.py`, `requires_region_url`,
+  `generate_locality_url`) reads the client's User-Agent and sends
+  sentry-cli 2.30 and later the absolute one, and a self-hosted server
+  with `system.upload-url-prefix` or
+  `hybrid_cloud.disable_relative_upload_urls` sends every version one.
+  Every client version posts the chunks to whatever absolute URL it gets,
+  token attached. The claim's `rewrite` names that `url`, whatever the
+  client version: the broker returns that upstream's loopback port in its
+  place and sends those posts to the host the server named; a host
+  outside the claim's upstreams is refused. Without it every source map
+  and debug-file upload gets a 401. It names `regions[].url` of `GET
+  /api/0/users/me/regions/` too, which 2.x `organizations list` follows
+  to each region.
 - **Scopes**: routes under `/api/0/organizations/{org}/…` and
   `/api/0/projects/{org}/{project}/…`, plus `GET /api/0/` (sentry-cli's
   token check) and `GET /api/0/organizations/`; the fence is the org.
@@ -358,12 +397,12 @@ only a note when the repo is public (a reference clone in `folders`).
 | | the broker, intercept mode | 9 | 6 | chosen |
 | git to github.com | `insteadOf` to the loopback | 6 | 4 | no: `git remote -v` shows the loopback, gh finds no repo |
 | | the intercept, ssh forms rewritten to https | 8 | 6 | chosen |
-| GraphQL fence | parse the document | 7 | 5 | chosen for mutations (input ids resolved by the home); queries can't be fenced |
+| GraphQL fence | parse the document | 7 | 5 | chosen for mutations (input ids resolved by the home); queries can't be fenced in general (gh's own name `owner`/`name`: open questions) |
 | | a token minted for the repos | 9 | 6 | chosen where `as = "app"` |
 | | deny `/graphql` | 3 | 2 | breaks most of gh |
 | claim location | devsandbox's own table of known tools | 6 | 2 | every tool a devsandbox release |
 | | in the feature's metadata | 9 | 7 | chosen: features ship with their tool, the home approves a copy |
-| sentry chunk uploads | rewrite the upload URL the server returns to the loopback | 6 | 5 | chosen: sentry-cli ≥ 2.30 posts past `SENTRY_URL` |
+| sentry chunk uploads | rewrite the upload URL the server returns to the loopback | 6 | 5 | chosen: sentry-cli posts to any absolute URL it gets, past `SENTRY_URL` |
 
 ## Rollout
 
@@ -415,6 +454,12 @@ only a note when the repo is public (a reference clone in `folders`).
   table per tool, each tool's `owner`/`repo` attributed to the fence.
 - Which token takes queries when a fence spans installations (the
   fork-to-upstream lookup above)?
+- Fence gh's own GraphQL queries under `as = "user"` by their
+  `repository(owner:, name:)` arguments and variables, leaving
+  `node(id:)`, `search` and `viewer` to the token's reach? Most gh read
+  commands would then stay inside the fence, but an outside query can't
+  go anonymous (no anonymous GraphQL), so it would be denied: `gh repo
+  view` of a public repo out of the fence fails.
 - GitHub Enterprise and self-hosted Sentry: hosts no feature knows, and
   a config can't add upstreams. A home-side `upstreams` override in
   `credentials.toml`, one credential per host?

@@ -77,10 +77,14 @@ From [worktrees](../../architecture/instances/worktrees.md) and
   the broker), `http.<url>.sslCAInfo` set to the system bundle file that
   carries the member CA (credential-broker, *The member CA*; nix and
   conda git carry their own bundle path, and a dotfile's `sslCAInfo`
-  replaces the system one), and the
+  replaces the system one where libcurl has no compiled-in CA path:
+  Debian's keeps trusting `/etc/ssl/certs` beside it unless `sslCAPath`
+  replaces that too), and the
   `credential.<url>.helper` list reset (empty `helper =`) then set to
   devsbd, answering `x-access-token` and the phantom after git's first
-  401: the broker injects only on a request carrying the phantom, and
+  401 (it sees only protocol and host, `useHttpPath` unset, and ignores
+  the `store` git sends after a success and the `erase` after a
+  failure): the broker injects only on a request carrying the phantom, and
   git-lfs asks `git credential fill` the same way. The settings go on
   the container env as `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
   `GIT_CONFIG_VALUE_n`: command scope is read last, so equally specific
@@ -99,13 +103,24 @@ From [worktrees](../../architecture/instances/worktrees.md) and
   skip URL-scoped proxies (JGit, go-git, dulwich).
   gh's own `-c credential.helper=…gh auth git-credential` replaces the
   helper and hands over the same phantom. At boot, and again after the
-  create-time lifecycle commands (dotfiles land there), devsbd checks the
-  effective proxy and CA (`git config --get-urlmatch`) and each remote's
-  resulting fetch and push URLs (`git remote get-url [--push] --all`;
-  `--get-urlmatch` doesn't evaluate rewrites), and warns when a user's
-  setting still wins (a more specific `http.<url>.proxy`, a URL off
-  `https://github.com/`: that push fails under key filtering with
-  `Permission denied (publickey)`), naming the setting to drop or narrow.
+  create-time lifecycle commands (dotfiles land there), devsbd checks
+  each remote's resulting fetch and push URLs (`git remote get-url
+  [--push] --all`; `--get-urlmatch` doesn't evaluate rewrites), the
+  effective proxy and CA for each of those URLs (`git config
+  --get-urlmatch http <url>`, with the remote's real URL, as a user's
+  `http.https://github.com/<owner>/.proxy` shows only there), and the
+  env `--get-urlmatch` doesn't reflect: `GIT_SSL_CAINFO`,
+  `GIT_SSL_CAPATH` and `GIT_SSL_NO_VERIFY` beat every config scope,
+  command scope included, and a `NO_PROXY` covering `github.com` (or
+  `*`) bypasses `http.<url>.proxy`, so git goes direct and the helper
+  hands the phantom to GitHub (fails closed: "Invalid username or
+  token"; a shell rc's `NO_PROXY` the check can't see). It warns when a
+  user's setting still wins (a more specific `http.<url>.proxy`, one of
+  those env vars, a URL off `https://github.com/`: that push fails under
+  key filtering with `Permission denied (publickey)`), naming the setting
+  to drop or narrow; `--show-scope` prints `unknown` for
+  `--get-urlmatch` on git 2.39, so the file comes from `git config
+  --show-origin --get-regexp` over `http.*.proxy` and `http.*.sslCAInfo`.
 - **The broker** recognizes `GET …/<owner>/<repo>.git/info/refs?service=…`
   and `POST …/git-upload-pack|git-receive-pack` (de-chunked, gzip
   bodies decoded), passes `Git-Protocol` (v2 fetches) through, and
@@ -172,8 +187,11 @@ From [worktrees](../../architecture/instances/worktrees.md) and
   sandbox rebases instead, or gets `git.push.workflows`, and the config
   reference says so.
 - **LFS**: `info/lfs/objects/batch` is brokered, and its response
-  rewritten: action `header`s carry credentials (GitHub's `RemoteAuth`,
-  other hosts echo the client's `Authorization`), so each action's `href`
+  rewritten: action `header`s carry credentials (GitHub's `RemoteAuth` on
+  `lfs.github.com`'s verify, AWS signatures on S3 uploads, other hosts
+  echo the client's `Authorization`), and transfers go straight to the
+  storage hosts (`github-cloud.githubusercontent.com`, S3), which the
+  `github.com`-scoped proxy doesn't cover, so each action's `href`
   becomes `http://127.0.0.1:<port>/<handle>` on a loopback port for LFS
   transfers (base-URL mode: storage hosts vary, so none joins the CA's
   names), the handle mapping, per instance, to the href and header the

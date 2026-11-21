@@ -28,7 +28,9 @@ subscription OAuth.
 - **API key**: a static credential, brokered in base-URL mode (the
   provider's base URL env, a phantom key, both on the container env: zidane
   reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`; env only, nothing
-  in `credentials.json`). Never delegated: a
+  in `credentials.json`; it sends the key as `Authorization: Bearer`,
+  never `x-api-key`, so the claim's `inject` names both slots for SDK
+  clients that use the latter). Never delegated: a
   sandbox on another machine reaches the home for every call, so the home
   for model keys is an always-on member, shown in `access ls`; a sandbox
   that can't reach it (a laptop off its network) has no model. The key
@@ -65,8 +67,11 @@ subscription OAuth.
   OAuth, so the claim declares the phantom's prefix per mode
   (credential-broker, *Phantoms*). A client that decodes its access
   token needs more: zidane's ChatGPT login and refresh read
-  `chatgpt_account_id` from the JWT payload and fail without it, so an
-  opaque phantom can't stand in there (the OpenAI open question).
+  `chatgpt_account_id` from the JWT payload and fail without it (an
+  opaque phantom stops at `Failed to extract accountId from token`, no
+  request sent), so that phantom is a JWT copying the real one's
+  non-secret claims, unsigned: zidane 9.6.1 sends it on to
+  `chatgpt.com/backend-api` (the OpenAI open question).
 - **Streaming**: responses (SSE) pass through unbuffered; a hop home adds
   to the first byte only. A stream cut mid-response (link down, home
   asleep, a home daemon's drain) ends with an error event in the
@@ -285,8 +290,13 @@ Broker steps in brackets.
    `mcp-credentials.json` stays one shared file until step 5, through
    zidane's env for its path, as Linear's and Notion's refresh tokens
    rotate and copies would revoke each other),
-   its binary, skills and extensions read-only, `ZIDANE_NO_UPDATE=1`,
-   `secret` questions off; `sandbox.devsandboxes` gets the config files
+   its binary, skills and extensions read-only, `ZIDANE_NO_UPDATE=1`
+   (its npm update check is its only egress besides the model; the bare
+   TUI's local-model probes, ports 11434, 1234 and 8000, stay on the
+   container's loopback), `ZIDANE_NO_ONBOARDING=1` or the instance's
+   config seeded with the provider (a fresh config dir opens the setup
+   wizard even with `ANTHROPIC_API_KEY` set, and it saves keys to
+   `credentials.json`), `secret` questions off; `sandbox.devsandboxes` gets the config files
    read-only instead of the `.devsandboxes` folder, so the PR dispatcher
    it runs from there moves first (code in a folder of its own,
    `dispatcher.config.mts` one more read-only bind, `dispatch.log` and
@@ -307,7 +317,12 @@ Broker steps in brackets.
 6. Other agents: one feature per instance claims a credential and a
    sandbox often runs two agents, so the provider claims (`anthropic`,
    …) move into devsandbox as `mcp`'s is, an agent feature naming the
-   one it uses with its env and phantom prefix.
+   one it uses with its env and phantom prefix. zidane's other providers:
+   xAI takes a base URL (`PI_XAI_BASE_URL`, else `XAI_BASE_URL`), as do
+   Bedrock (`ANTHROPIC_BEDROCK_BASE_URL`) and `local`/`openai-compat`
+   (`LOCAL_LLM_BASE_URL`); OpenAI Codex (hard-coded
+   `chatgpt.com/backend-api`, `OPENAI_BASE_URL` ignored), OpenRouter,
+   Gemini and Cerebras take none: intercept mode.
 
 ## Open questions
 
@@ -315,10 +330,11 @@ Broker steps in brackets.
   `chatgpt.com/backend-api`): OpenAI's "Sign in with ChatGPT" now lets
   open-source clients spend the plan on the public Responses API
   (`api.openai.com/v1`, base URL `OPENAI_BASE_URL`) and steers them off
-  `backend-api`; open is whether zidane moves to it and what its access
-  token carries, i.e. a phantom shaped like it (a JWT copying the real
-  one's non-secret claims) or a client that stops decoding it; then any
-  other provider zidane uses.
+  `backend-api`. zidane 9.6.1 still hard-codes `backend-api`, so today
+  it's intercept mode for `chatgpt.com` and `auth.openai.com`, with a
+  JWT-shaped phantom (*Phantom shape*); open is whether zidane moves to
+  the Responses API (base-URL mode) and whether its access token there
+  is still decoded.
 - Per-instance settings drift from each other: should zidane read its
   settings from a read-only host file apart from its writable state
   (`state.json` mixes both today)?
