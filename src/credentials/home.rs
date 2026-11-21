@@ -1,0 +1,333 @@
+//! `credentials.toml`, next to `state.toml`: the home's credentials
+//! (credential-broker, *`credentials.toml`*). One table per credential,
+//! named as `devsandbox login <credential>` named it (`sentry-work`), holding
+//! its kind, where its secret is (`source`), its grant, and the claim
+//! versions approved for it and pending approval.
+//!
+//! An approved version keeps the canonical pinned claim
+//! ([`Claim::canonical`]) under its hash ([`Claim::version`]): the broker
+//! uses this copy, never the instance's, and `access approve` diffs a
+//! pending one against it. Each is re-hashed at load, so a hand edit to a
+//! claim without its version fails the file instead of approving content
+//! nobody saw. `approved` is in approval order: the last is the latest.
+//!
+//! Written by `login` and `access approve` (and `run` recording a pending
+//! version) under the sibling lock, temp file and rename
+//! (`serve::locked_file`). Kept out of every container by `key_guard`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::claim::Claim;
+use super::review::View;
+
+/// Every credential by name.
+pub type Home = BTreeMap<String, Entry>;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Entry {
+    /// The claim kind it serves (`sentry`): what a config's `access.<kind>`
+    /// and a feature's claim name.
+    pub kind: String,
+    #[serde(default)]
+    pub source: Source,
+    /// The profiles whose instances may use it; unset: every profile, as a
+    /// sandbox's unset `profiles` allows every declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<Vec<String>>,
+    /// The scopes it grants at most; unset: every scope of the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<Vec<String>>,
+    // Read from credential-broker step 4 (`approvers`), 5 (`members`) and 7
+    // (`delegate`), and github-and-sentry-access step 2 (`as`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegate: Vec<String>,
+    #[serde(default, rename = "as", skip_serializing_if = "Vec::is_empty")]
+    pub as_: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<Version>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<Version>,
+}
+
+impl Entry {
+    pub fn new(kind: &str, profiles: Option<Vec<String>>) -> Entry {
+        Entry {
+            kind: kind.to_string(),
+            source: Source::File,
+            profiles,
+            max: None,
+            members: Vec::new(),
+            approvers: Vec::new(),
+            delegate: Vec::new(),
+            as_: Vec::new(),
+            approved: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// The approved claim of `version`, canonical: what the broker enforces
+    /// for an instance that ran with it.
+    pub fn approved_claim(&self, version: &str) -> Option<&str> {
+        self.approved.iter().find(|v| v.version == version).map(|v| v.claim.as_str())
+    }
+
+    pub fn latest_approved(&self) -> Option<&Version> {
+        self.approved.last()
+    }
+
+    /// Drops it from `pending` too. Whether it was new.
+    pub fn approve(&mut self, version: Version) -> bool {
+        self.pending.retain(|p| p.version != version.version);
+        if self.approved_claim(&version.version).is_some() {
+            return false;
+        }
+        self.approved.push(version);
+        true
+    }
+
+    fn check(&self, name: &str) -> Result<()> {
+        super::check_name(name)?;
+        super::claim::check_kind(&self.kind).context("`kind`")?;
+        for p in self.profiles.iter().flatten() {
+            crate::config::check_profile_name(p).context("`profiles`")?;
+        }
+        for (field, versions) in [("approved", &self.approved), ("pending", &self.pending)] {
+            for v in versions {
+                v.check(&self.kind).with_context(|| format!("`{field}` version {}", v.short()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where the secret is. Only the file store so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Source {
+    /// `credentials::store`.
+    #[default]
+    File,
+}
+
+impl TryFrom<String> for Source {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Source, String> {
+        match s.as_str() {
+            "file" => Ok(Source::File),
+            "keyring" => Err("`source = \"keyring\"`: not yet; only \"file\" for now".into()),
+            s if s.contains("://") => Err(format!("`source = \"{s}\"`: external stores are not yet supported; only \"file\" for now")),
+            s => Err(format!("unknown `source` `{s}` (only \"file\")")),
+        }
+    }
+}
+
+impl From<Source> for String {
+    fn from(s: Source) -> String {
+        match s {
+            Source::File => "file".into(),
+        }
+    }
+}
+
+/// A claim version: its hash and the canonical pinned claim it hashes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Version {
+    pub version: String,
+    pub claim: String,
+}
+
+impl Version {
+    pub fn of(claim: &Claim) -> Version {
+        Version { version: claim.version(), claim: claim.canonical() }
+    }
+
+    /// From canonical JSON a host sent, re-hashed here.
+    #[cfg_attr(not(test), allow(dead_code))] // `run`'s pending record, next step
+    pub fn from_canonical(claim: &str) -> Version {
+        Version { version: hash(claim), claim: claim.to_string() }
+    }
+
+    /// Enough of the hash to tell versions apart on screen.
+    pub fn short(&self) -> &str {
+        &self.version[..self.version.len().min(12)]
+    }
+
+    pub fn view(&self) -> Result<View> {
+        View::parse(&self.claim)
+    }
+
+    fn check(&self, kind: &str) -> Result<()> {
+        if hash(&self.claim) != self.version {
+            bail!("its claim doesn't hash to its version");
+        }
+        let view = self.view()?;
+        if view.kind != kind {
+            bail!("a `{}` claim, not `{kind}`", view.kind);
+        }
+        Ok(())
+    }
+}
+
+/// [`Claim::version`]'s hash.
+fn hash(canonical: &str) -> String {
+    hex::encode(&Sha256::digest(canonical.as_bytes())[..])
+}
+
+/// Records `claim` (canonical) as pending for the credential `name`, unless
+/// already approved or pending. Whether it was new.
+#[cfg_attr(not(test), allow(dead_code))] // called by `run`, next step
+pub fn record_pending(home: &mut Home, name: &str, claim: &str) -> Result<bool> {
+    let entry = home.get_mut(name).with_context(|| format!("no credential `{name}`"))?;
+    let version = Version::from_canonical(claim);
+    version.check(&entry.kind)?;
+    if entry.approved_claim(&version.version).is_some() || entry.pending.iter().any(|p| p.version == version.version) {
+        return Ok(false);
+    }
+    entry.pending.push(version);
+    Ok(true)
+}
+
+/// `<data>/credentials.toml`.
+pub fn path(data: &Path) -> PathBuf {
+    data.join(crate::daemon_config::CREDENTIALS)
+}
+
+pub fn parse(text: &str) -> Result<Home> {
+    let home: Home = toml::from_str(text)?;
+    for (name, entry) in &home {
+        entry.check(name).with_context(|| format!("credential `{name}`"))?;
+    }
+    Ok(home)
+}
+
+pub fn serialize(home: &Home) -> Result<String> {
+    toml::to_string_pretty(home).context("cannot serialize credentials")
+}
+
+/// A missing file is no credentials.
+pub fn load(path: &Path) -> Result<Home> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse(&text).with_context(|| format!("invalid {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Home::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// Read-modify-write under the lock, saved only when `f` changed it; `f`'s
+/// error leaves the file alone.
+pub fn update<T>(path: &Path, f: impl FnOnce(&mut Home) -> Result<T>) -> Result<T> {
+    crate::serve::locked_file::update(path, load, serialize, |home| {
+        let before = home.clone();
+        let out = f(home);
+        if out.is_err() {
+            *home = before;
+        }
+        out
+    })?
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::credentials::claim;
+
+    pub(crate) fn sentry() -> Claim {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/features/sentry/devcontainer-feature.json"
+        ))
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        claim::parse("sentry", &v["customizations"]["devsandbox"]["credentials"]["sentry"]).unwrap()
+    }
+
+    #[test]
+    fn round_trips_and_rehashes() {
+        let mut entry = Entry::new("sentry", Some(vec!["work".into()]));
+        entry.max = Some(vec!["releases.write".into()]);
+        entry.approvers = vec!["laptop".into()];
+        entry.as_ = vec!["user".into()];
+        assert!(entry.approve(Version::of(&sentry())));
+        assert!(!entry.approve(Version::of(&sentry())), "approved once");
+        let home = Home::from([("sentry-work".to_string(), entry)]);
+        let text = serialize(&home).unwrap();
+        assert!(text.starts_with("[sentry-work]\nkind = \"sentry\"\nsource = \"file\"\nprofiles = [\"work\"]\n"), "{text}");
+        assert!(text.contains("as = [\"user\"]"), "{text}");
+        assert!(!text.contains("pending") && !text.contains("members"), "{text}");
+        assert_eq!(parse(&text).unwrap(), home);
+        let v = &home["sentry-work"].approved[0];
+        assert_eq!(v.version, sentry().version());
+        assert_eq!(home["sentry-work"].approved_claim(&v.version), Some(sentry().canonical().as_str()));
+
+        let tampered = text.replace("de.sentry.io", "evil.example");
+        let err = format!("{:#}", parse(&tampered).unwrap_err());
+        assert!(err.contains("doesn't hash to its version"), "{err}");
+        let other_kind = text.replace("kind = \"sentry\"", "kind = \"github\"");
+        let err = format!("{:#}", parse(&other_kind).unwrap_err());
+        assert!(err.contains("a `sentry` claim, not `github`"), "{err}");
+    }
+
+    #[test]
+    fn fields_and_sources_are_checked() {
+        assert_eq!(parse("").unwrap(), Home::new());
+        let min = parse("[sentry-work]\nkind = \"sentry\"\n").unwrap();
+        assert_eq!(min["sentry-work"], Entry::new("sentry", None));
+        for (bad, wants) in [
+            ("[x]\nkind = \"sentry\"\nsource = \"keyring\"\n", "not yet"),
+            ("[x]\nkind = \"sentry\"\nsource = \"op://Private/x\"\n", "not yet supported"),
+            ("[x]\nkind = \"sentry\"\nsource = \"vault\"\n", "unknown `source`"),
+            ("[x]\nkind = \"sentry\"\nbogus = 1\n", "bogus"),
+            ("[x]\nsource = \"file\"\n", "kind"),
+            ("[x]\nkind = \"Sentry\"\n", "the kind must be"),
+            ("[X]\nkind = \"sentry\"\n", "credential name"),
+            ("[x]\nkind = \"sentry\"\nprofiles = [\"Work\"]\n", "profile name"),
+        ] {
+            let err = format!("{:#}", parse(bad).unwrap_err());
+            assert!(err.contains(wants), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn pending_versions_are_recorded_once_and_move_on_approval() {
+        let mut home = Home::from([("s".to_string(), Entry::new("sentry", None))]);
+        let canonical = sentry().canonical();
+        assert!(record_pending(&mut home, "nope", &canonical).is_err());
+        assert!(record_pending(&mut home, "s", &canonical).unwrap());
+        assert!(!record_pending(&mut home, "s", &canonical).unwrap());
+        assert!(record_pending(&mut home, "s", "{\"kind\":\"github\",\"claim\":{}}").is_err());
+        let v = home["s"].pending[0].clone();
+        assert_eq!(v.version, sentry().version());
+        let entry = home.get_mut("s").unwrap();
+        assert!(entry.approve(v));
+        assert!(entry.pending.is_empty());
+        assert!(!record_pending(&mut home, "s", &canonical).unwrap(), "already approved");
+    }
+
+    #[test]
+    fn update_is_locked_and_atomic() {
+        let dir = std::env::temp_dir().join(format!("dsv-cred-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = path(&dir);
+        update(&p, |h| Ok(h.insert("s".into(), Entry::new("sentry", None)))).unwrap();
+        assert!(update(&p, |h| -> Result<()> {
+            h.clear();
+            bail!("no")
+        })
+        .is_err());
+        assert_eq!(load(&p).unwrap().len(), 1, "a failed update leaves the file");
+        assert!(dir.join("credentials.lock").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

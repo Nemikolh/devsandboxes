@@ -427,6 +427,55 @@ enum Command {
         #[command(subcommand)]
         cmd: MachineCommand,
     },
+    /// Store a credential's secret on this host (its home) and approve the
+    /// claim it is for (docs/reference/credentials-cli.md)
+    ///
+    /// The secret is read from stdin: unechoed on a terminal, or piped
+    /// (`login sentry-work < token`). Paste is the only method so far.
+    #[cfg(unix)]
+    Login {
+        /// The credential's name in credentials.toml (`sentry-work`)
+        credential: String,
+        /// The feature whose claim to approve: an OCI ref, or a local folder
+        /// (`./…`, `../…`, `/…`, from the current dir). Without it: the claim
+        /// version pending for the credential, else the secret only
+        #[arg(long, value_name = "REF")]
+        feature: Option<String>,
+        /// The claim's kind, when the feature claims several
+        #[arg(long)]
+        kind: Option<String>,
+        /// A profile a new credential is granted to (repeatable; none: every
+        /// profile)
+        #[arg(long = "profile", value_name = "PROFILE")]
+        profiles: Vec<String>,
+        /// Approve the claim without asking (required off a terminal)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// This host's credentials: approve claim versions
+    /// (docs/reference/credentials-cli.md)
+    #[cfg(unix)]
+    Access {
+        #[command(subcommand)]
+        cmd: AccessCommand,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum AccessCommand {
+    /// Approve the claim version pending for a credential, after its diff
+    /// against the latest approved one; the secret stays
+    Approve {
+        /// The credential's name in credentials.toml
+        credential: String,
+        /// The pending version (a prefix of it), when there are several
+        #[arg(long)]
+        version: Option<String>,
+        /// Approve without asking (required off a terminal)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// An instance `<name>`: one text for every command taking one.
@@ -1074,6 +1123,14 @@ fn main() -> Result<()> {
             }),
             MachineCommand::Allow { allow } => commands::machine::allow(allow.change()),
         },
+        #[cfg(unix)]
+        Command::Login { credential, feature, kind, profiles, yes } => {
+            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes })
+        }
+        #[cfg(unix)]
+        Command::Access { cmd: AccessCommand::Approve { credential, version, yes } } => {
+            commands::access::approve(&credential, version.as_deref(), yes)
+        }
     }
 }
 

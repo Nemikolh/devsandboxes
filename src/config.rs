@@ -212,6 +212,11 @@ pub struct SandboxProperties {
     /// the declared profiles by `resolve_sandbox`. Host-side only, so
     /// excluded from `config_hash`.
     pub profiles: Option<Vec<String>>,
+    /// `access.<kind>`: what this sandbox asks of the home's credential of
+    /// that claim kind (docs/plans/active/credential-broker.md, *Policy*).
+    /// Policy the broker reads per call from the host's config, baked into
+    /// nothing, so excluded from `config_hash`.
+    pub access: Option<BTreeMap<String, Access>>,
 
     // implemented devcontainer properties
     pub image: Option<String>,
@@ -295,6 +300,30 @@ pub enum Autostart {
 #[serde(rename_all = "lowercase")]
 pub enum Placement {
     Home,
+}
+
+/// `[sandbox.<name>.access.<kind>]`. Arrays concatenate under `extends`
+/// (deduplicated at resolve), so a template's scopes reach every sandbox
+/// extending it and a sandbox can only add to them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Access {
+    /// Scopes allowed outright.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Scopes held for an answer instead of denied.
+    #[serde(default)]
+    pub ask: Vec<String>,
+    /// The home's credential to take (`sentry-work`), over the one granted
+    /// to the instance's profile.
+    pub credential: Option<String>,
+    // Read from github-and-sentry-access step 2.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    #[serde(default)]
+    pub branches: Vec<String>,
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 /// `dispatcher = { spawn = [...], max-instances = N }`.
@@ -1223,6 +1252,16 @@ impl Config {
                 bail!("sandbox `{name}`: profile `{p}` in `profiles` isn't declared (no [profiles.{p}])");
             }
         }
+        for (kind, access) in properties.access.iter_mut().flatten() {
+            crate::credentials::claim::check_kind(kind).with_context(|| format!("sandbox `{name}`: `access.{kind}`"))?;
+            if let Some(c) = &access.credential {
+                crate::credentials::check_name(c).with_context(|| format!("sandbox `{name}`: `access.{kind}.credential`"))?;
+            }
+            for list in [&mut access.scopes, &mut access.ask, &mut access.repos, &mut access.branches] {
+                let mut seen = std::collections::BTreeSet::new();
+                list.retain(|s| seen.insert(s.clone()));
+            }
+        }
 
         Ok(ResolvedSandbox {
             name: name.to_string(),
@@ -1433,7 +1472,8 @@ fn config_hash(table: &Table) -> String {
 
 /// [`config_hash`] of a merged sandbox table minus the keys that apply without
 /// recreating the container (`autostart`, `dispatcher`, `inbox`, `placement`,
-/// the host-side `forwardPorts` and `profiles`), so changing them isn't drift.
+/// the host-side `forwardPorts`, `profiles` and `access`), so changing them
+/// isn't drift.
 fn sandbox_hash(table: &Table) -> String {
     let mut table = table.clone();
     table.remove("autostart");
@@ -1442,6 +1482,7 @@ fn sandbox_hash(table: &Table) -> String {
     table.remove("inbox");
     table.remove("forwardPorts");
     table.remove("profiles");
+    table.remove("access");
     if let Some(toml::Value::Table(folders)) = table.get_mut("folders") {
         normalize_folders(folders);
     }
@@ -1980,6 +2021,67 @@ forwardPorts = [true]
         let hash = plain.resolve_sandbox("app").unwrap().config_hash;
         assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
         assert_eq!(with.resolved_table("app").unwrap().1, hash);
+    }
+
+    #[test]
+    fn access_parses_merges_and_is_excluded_from_config_hash() {
+        let config = Config::parse(
+            r#"
+[template.base.access.sentry]
+scopes = ["issues.read"]
+
+[sandbox.web]
+extends = "base"
+folder = "../web"
+
+[sandbox.web.access.sentry]
+scopes = ["releases.write", "issues.read"]
+ask = ["uploads"]
+credential = "sentry-work"
+
+[sandbox.web.access.github]
+repos = ["acme/design-system"]
+branches = ["release/*"]
+as = "user"
+
+[sandbox.plain]
+extends = "base"
+folder = "../web"
+"#,
+        )
+        .unwrap();
+        let web = config.resolve_sandbox("web").unwrap();
+        let access = web.properties.access.as_ref().unwrap();
+        assert_eq!(
+            access["sentry"],
+            Access {
+                scopes: vec!["issues.read".into(), "releases.write".into()],
+                ask: vec!["uploads".into()],
+                credential: Some("sentry-work".into()),
+                ..Access::default()
+            }
+        );
+        assert_eq!(access["github"].as_.as_deref(), Some("user"));
+        assert_eq!(access["github"].repos, ["acme/design-system"]);
+        assert!(web.properties.ignored().is_empty());
+        let plain = config.resolve_sandbox("plain").unwrap();
+        assert_eq!(plain.properties.access.as_ref().unwrap()["sentry"].scopes, ["issues.read"]);
+
+        let bare = Config::parse("[sandbox.web]\nfolder = \"../web\"\n").unwrap();
+        assert_eq!(bare.resolve_sandbox("web").unwrap().config_hash, web.config_hash);
+        assert_eq!(config.resolved_table("web").unwrap().1, web.config_hash);
+
+        for (bad, wants) in [
+            ("[sandbox.s.access.sentry]\nscope = [\"x\"]\n", "scope"),
+            ("[sandbox.s.access.Sentry]\n", "the kind must be"),
+            ("[sandbox.s.access.sentry]\ncredential = \"a.b\"\n", "credential name"),
+        ] {
+            let err = match Config::parse(bad) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => format!("{:#}", c.resolve_sandbox("s").unwrap_err()),
+            };
+            assert!(err.contains(wants), "{bad}: {err}");
+        }
     }
 
     #[test]

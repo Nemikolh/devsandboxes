@@ -18,7 +18,8 @@ Start with `docs/README.md` (reading order and map) and
   survives an upgrade), and `own_build_stamp()`, this process's own mtime.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
   `rm`, `ps`, `ls`, `exec`, `done`, `rename`, `trust_origin` (`trust-origin`),
-  `profile`, `vscode`, `fetch`,
+  `profile`, `vscode`, `fetch`, `login`, `access` (`access approve`;
+  docs/reference/credentials-cli.md),
   `inbox`, `logs`, `inspect`, `stats`, `status`, `port`, `machine`,
   `fleet_link` (hidden `fleet-link`), `services::{gc,ls,rebuild}`); not
   verbs: `subnet.rs` (service-network subnet checks) and `tunnel.rs`
@@ -56,6 +57,11 @@ Start with `docs/README.md` (reading order and map) and
   `skills/config-toml-spec/SKILL.md` skill: update it whenever a config field,
   merge rule, or `${…}` variable changes (the docs site renders it verbatim as
   `/docs/config`).
+- `src/credentials/` — the credential broker's data: `claim.rs` (a
+  feature's claims, pinned part + version), `review.rs` (a version's
+  summary and diff, pure), and, unix-only, `home.rs` (`credentials.toml`:
+  credentials, grants, approved/pending versions) and `store.rs` (the 0600
+  file store of secrets). `src/broker/` is its HTTP core.
 - `src/config_identity.rs` (+ `ops.rs`) — findings under `/root` (and root
   users), the `toml_edit` rewrite, acks, the `config.*` ops.
 - `src/commands/services.rs` — service/network lifecycle. `scope = "isolated"`
@@ -180,7 +186,8 @@ Start with `docs/README.md` (reading order and map) and
   `route-<member>.sock` per member with no link up here, its graph's
   paths tried in order).
   `src/key_guard.rs` refuses any
-  container bind or build path covering the member key.
+  container bind or build path covering the member key or the
+  credential files beside it.
   `snapshots.rs`'s `merge` builds the federated
   snapshot (`instances.watch {machines: true}`).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.

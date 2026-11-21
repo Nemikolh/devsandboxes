@@ -71,6 +71,32 @@ pub fn member_key_files(key: &Path) -> [PathBuf; 3] {
     [key.to_path_buf(), member_key_sibling(key, ".next"), member_key_sibling(key, ".lock")]
 }
 
+/// The home's credentials (`credentials::home`): grants and approved
+/// claims. No secret in it, but a container that could write it would
+/// approve its own claims.
+pub const CREDENTIALS: &str = "credentials.toml";
+/// The file store's secrets (`credentials::store`), 0600.
+pub const CREDENTIAL_STORE: &str = "credentials-store.toml";
+/// Reserved for the broker's remembered answers (credential-broker,
+/// *Permission requests*), guarded before anything writes it.
+pub const ACCESS: &str = "access.json";
+/// Reserved for the member CA's key (credential-broker, *The member CA*).
+pub const MEMBER_CA_KEY: &str = "member-ca.key";
+
+/// Every credential-broker file in the data dir `data` no container may
+/// reach, with the locks they're written under (`serve::locked_file`'s
+/// `<stem>.lock`).
+pub fn credential_files(data: &Path) -> Vec<PathBuf> {
+    [CREDENTIALS, CREDENTIAL_STORE, ACCESS, MEMBER_CA_KEY]
+        .into_iter()
+        .flat_map(|name| {
+            let file = data.join(name);
+            let lock = file.with_extension("lock");
+            [file, lock]
+        })
+        .collect()
+}
+
 /// The global config; a missing file is the defaults.
 pub fn load() -> Result<DaemonConfig> {
     load_from(&path()?)
@@ -100,6 +126,25 @@ mod tests {
             member_key_files(&key),
             ["/d/devsandbox/member.key", "/d/devsandbox/member.key.next", "/d/devsandbox/member.key.lock"]
                 .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn credential_files_sit_in_the_data_dir_with_their_locks() {
+        let files = credential_files(Path::new("/d"));
+        let names: Vec<_> = files.iter().map(|f| f.strip_prefix("/d").unwrap().to_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "credentials.toml",
+                "credentials.lock",
+                "credentials-store.toml",
+                "credentials-store.lock",
+                "access.json",
+                "access.lock",
+                "member-ca.key",
+                "member-ca.lock"
+            ]
         );
     }
 

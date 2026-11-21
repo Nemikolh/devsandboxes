@@ -1,6 +1,9 @@
 //! The member key at rest (docs/architecture/daemon/fleet.md, *Member
 //! identity*): no container devsandbox creates or image it builds may reach
-//! `member.key` (nor its pending `member.key.next` or its `member.key.lock`).
+//! `member.key` (nor its pending `member.key.next` or its `member.key.lock`),
+//! nor the credential broker's files beside it
+//! (`daemon_config::credential_files`: `credentials.toml`, the file store,
+//! `access.json`, `member-ca.key`, and their locks).
 //! Unlike the worker policy (`worker_policy`), this holds on every host,
 //! for every config and trust level, and no allowance lifts it: a bind whose
 //! source is one of those files or a dir above them (`$HOME`, the data dir,
@@ -29,30 +32,37 @@ pub struct Exposure {
     pub what: &'static str,
     /// The path as the argv names it.
     pub source: String,
-    /// The key file it covers.
+    /// The guarded file it covers.
     pub key: PathBuf,
+    /// What that file is, for the message.
+    pub guards: &'static str,
 }
 
 impl fmt::Display for Exposure {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "refused: {} `{}` covers `{}`; this member's private key (fleet identity) must never be \
-             reachable from a container (use a narrower path that doesn't contain it)",
+            "refused: {} `{}` covers `{}`; {} must never be reachable from a container (use a narrower \
+             path that doesn't contain it)",
             self.what,
             self.source,
-            self.key.display()
+            self.key.display(),
+            self.guards
         )
     }
 }
 
 impl std::error::Error for Exposure {}
 
-/// The key files to keep out, each as written and as resolved (a symlinked
-/// data dir is caught either way), and `$HOME` for a `~` source.
+const MEMBER_KEY: &str = "this member's private key (fleet identity)";
+const CREDENTIALS: &str = "this host's credentials (credential broker)";
+
+/// The files to keep out, each as written and as resolved (a symlinked
+/// data dir is caught either way) with what it is, and `$HOME` for a `~`
+/// source.
 #[derive(Debug, Clone, Default)]
 pub struct Guard {
-    keys: Vec<(PathBuf, PathBuf)>,
+    keys: Vec<(PathBuf, PathBuf, &'static str)>,
     home: Option<PathBuf>,
 }
 
@@ -69,12 +79,15 @@ impl Guard {
 
     /// The guard over the data dir `data` (`<data>/devsandbox`).
     pub fn for_data(data: &Path, home: Option<PathBuf>) -> Guard {
-        let key = crate::daemon_config::member_key(&lexical(data));
+        let data = lexical(data);
+        let key = crate::daemon_config::member_key(&data);
         let keys = crate::daemon_config::member_key_files(&key)
             .into_iter()
-            .map(|k| {
+            .map(|k| (k, MEMBER_KEY))
+            .chain(crate::daemon_config::credential_files(&data).into_iter().map(|k| (k, CREDENTIALS)))
+            .map(|(k, guards)| {
                 let resolved = worker_policy::resolve(&k).unwrap_or_else(|| k.clone());
-                (k, resolved)
+                (k, resolved, guards)
             })
             .collect();
         Guard { keys, home }
@@ -93,9 +106,9 @@ impl Guard {
         let written = lexical(&expanded);
         let forms = [Some(written.clone()), worker_policy::resolve(&written), worker_policy::resolve(&expanded)];
         for form in forms.iter().flatten() {
-            for (key, resolved) in &self.keys {
+            for (key, resolved, guards) in &self.keys {
                 if key.starts_with(form) || resolved.starts_with(form) {
-                    return Err(Exposure { what, source: source.to_string(), key: key.clone() });
+                    return Err(Exposure { what, source: source.to_string(), key: key.clone(), guards });
                 }
             }
         }
@@ -336,6 +349,36 @@ mod tests {
         ] {
             let err = g.check_argv(&bad).unwrap_err();
             assert_eq!(err.what, what, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn credential_files_are_refused_like_the_key() {
+        let (_, home, data) = fixture("creds");
+        let g = Guard::for_data(&data, Some(home.clone()));
+        let names = [
+            "credentials.toml",
+            "credentials.lock",
+            "credentials-store.toml",
+            "credentials-store.lock",
+            "access.json",
+            "member-ca.key",
+        ];
+        for name in names {
+            // Missing files too: reserved names are guarded before they exist.
+            let path = data.join(name).display().to_string();
+            let err = g.check_argv(&run(&["-v", &format!("{path}:/c:ro")])).unwrap_err();
+            assert_eq!(err.key, data.join(name));
+            assert!(err.to_string().contains("this host's credentials (credential broker)"), "{err}");
+            let err = g.check_argv(&argv(&["build", "-t", "t", "--secret", &format!("id=c,src={path}"), "/x"])).unwrap_err();
+            assert_eq!(err.what, "build secret");
+        }
+        // A dir above them names the member key first.
+        let err = g.check_argv(&run(&["-v", &format!("{}:/d", data.display())])).unwrap_err();
+        assert!(err.key.ends_with("member.key"), "{err}");
+        for ok in ["credentials.toml.bak", "access.log", "credentials"] {
+            let path = data.join(ok).display().to_string();
+            assert_eq!(g.check_argv(&run(&["-v", &format!("{path}:/c")])), Ok(()), "{ok}");
         }
     }
 

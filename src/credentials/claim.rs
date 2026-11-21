@@ -335,7 +335,7 @@ fn parse_all(feature: &str, credentials: &Value) -> Result<Vec<Claim>> {
         .collect()
 }
 
-pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
+pub fn check_kind(kind: &str) -> Result<()> {
     if kind.is_empty()
         || kind.len() > MAX_KIND
         || !kind.starts_with(|c: char| c.is_ascii_lowercase())
@@ -343,6 +343,11 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
     {
         bail!("the kind must be lowercase letters, digits and `-`, starting with a letter");
     }
+    Ok(())
+}
+
+pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
+    check_kind(kind)?;
     let Some(obj) = value.as_object() else {
         bail!("must be an object");
     };

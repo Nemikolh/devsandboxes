@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub mod access;
 pub mod autostart;
 pub mod dispatch;
 pub mod done;
@@ -8,6 +10,8 @@ pub mod fleet_link;
 pub mod exec;
 pub mod inbox;
 pub mod inspect;
+#[cfg(unix)]
+pub mod login;
 pub mod logs;
 pub mod ls;
 #[cfg(unix)]

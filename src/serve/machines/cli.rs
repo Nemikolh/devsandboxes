@@ -102,6 +102,9 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::FleetLink { .. } => MachineUse::Refused("fleet-link"),
         Command::FleetHello => MachineUse::Refused("fleet-hello"),
         Command::Machine { .. } => MachineUse::Refused("machine"),
+        // This host's credentials, for its own instances.
+        Command::Login { .. } => MachineUse::Refused("login"),
+        Command::Access { .. } => MachineUse::Refused("access"),
     }
 }
 

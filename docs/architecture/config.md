@@ -62,7 +62,11 @@ A fourth table, `[profiles.*]`, is typed at parse.
   when `identity` is unset). `forwardPorts` entries are deduplicated after merge and each
   named service must be in the sandbox's `services`. `profiles` entries are
   deduplicated too and each must name a `[profiles.*]` table
-  ([profiles](instances/profiles.md)).
+  ([profiles](instances/profiles.md)). `access` is keyed by claim kind
+  (`credentials::claim::check_kind`) into `Access`; its lists are
+  deduplicated after merge and `credential` must be a credential name
+  (`credentials::check_name`;
+  [credentials CLI](../reference/credentials-cli.md)).
 - **Profiles**: `[profiles.*]` deserialize into `Profile` (no fields yet,
   `deny_unknown_fields`); `Config::validate`, run by both parsers, checks
   their names.
@@ -142,7 +146,7 @@ config ([rebuild and drift](instances/rebuild-and-drift.md)):
 
 - `sandbox_hash`: `short_hash` of the merged sandbox table's TOML (a
   `BTreeMap`, so key-sorted and stable) minus `autostart`, `dispatcher`,
-  `inbox`, `placement`, `forwardPorts` and `profiles` (they apply without
+  `inbox`, `placement`, `forwardPorts`, `profiles` and `access` (they apply without
   recreating the container).
   `folders` entries that only restate the default (`{ path = "x" }`,
   `worktree = "auto"`) are normalized to `"x"` first.

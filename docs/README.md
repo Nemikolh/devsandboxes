@@ -66,4 +66,5 @@ User-facing docs live in `site/` (and the config reference in
   [snapshot and json](architecture/dashboard/snapshot-and-json.md)
 - **Reference**: [daemon API](reference/api.md),
   [`devsandbox inbox` CLI](reference/inbox-cli.md),
+  [`devsandbox login` / `access` CLI](reference/credentials-cli.md),
   [Kubernetes concepts](reference/kubernetes.md)

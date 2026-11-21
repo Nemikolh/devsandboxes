@@ -1864,7 +1864,11 @@ signatures, signed statements and the rollback rule.
   [worker policy](#worker-policy)). `key_guard::Guard` holds the key files
   (`daemon_config::member_key_files`: `member.key`, `member.key.next`,
   `member.key.lock`, from `daemon_config::member_key`, which
-  `member::key_path` and `FileKeyStore` share), each as written and
+  `member::key_path` and `FileKeyStore` share) and, the same way, the
+  credential broker's files beside it (`daemon_config::credential_files`:
+  `credentials.toml`, the file store `credentials-store.toml`, the
+  reserved `access.json` and `member-ca.key`, and their `.lock`s;
+  [credentials CLI](../../reference/credentials-cli.md)), each as written and
   resolved; a host path covers them when it is one of them or a dir
   above (`$HOME`, `~/.local/share`, the data dir, `/`), taken as written
   (made absolute, `..` dropped as the runtime cleans it, `~` as `$HOME`)
