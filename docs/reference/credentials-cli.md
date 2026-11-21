@@ -1,7 +1,7 @@
 # `devsandbox login` and `devsandbox access`
 
-Store a credential's secret on this host and approve the claim versions
-it serves, and the two files that keep them. Read when changing these
+Store a credential's secret on this host, list, approve and revoke the
+claim versions it serves, and the two files that keep them. Read when changing these
 commands or the home's files; the design they implement is
 [credential-broker](../plans/active/credential-broker.md) (*Shape*,
 "`credentials.toml`") and
@@ -13,7 +13,7 @@ credentials they are, never on a machine (`--machine` refuses them).
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
 `obtain`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
-`pick_pending`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
+`pick_pending`, `list_at`, `uses`, `render`, `revoke_at`, `pick_any`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/store.rs` (`Store`,
 `Record`, `OAuthToken`, `Secret`), `src/credentials/oauth/` (the OAuth
 logins: [login](../architecture/credentials/login.md)), `src/credentials/review.rs` (`View`, `diff`, `Diff`),
@@ -24,6 +24,8 @@ logins: [login](../architecture/credentials/login.md)), `src/credentials/review.
 devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>]... [--yes]
                  [--method paste|device|browser] [--client-id <id>]
 devsandbox access approve <credential> [--version <v>] [--yes]
+devsandbox access ls [<credential>] [--json]
+devsandbox access revoke <credential> [--version <v>] [--yes]
 ```
 
 ## Names and kinds
@@ -106,8 +108,73 @@ the version from `pending` to the end of `approved`; older approved
 versions stay (instances pinned to them keep working). The secret is
 untouched.
 
-Both commands work on the files directly, in-process; no API method
-reaches them.
+## `access ls`
+
+`list_at`: every credential in `credentials.toml` (or the one named),
+by name, never a secret:
+
+```
+sentry-work: sentry, source file
+  token     static
+  profiles  work
+  max       every scope
+  approved  3f2a1b4c5d6e (unused), 9c1d0e2f3a4b (latest)
+  pending   77ab01cd23ef
+  instances
+    web-1  9c1d0e2f3a4b  approved
+    api    77ab01cd23ef  not approved
+    old    3f2a1b4c5d6e  approved  (may take another credential: cannot read its config: …)
+```
+
+- `token`: the store's record kind (`token`): `static`; `oauth` with
+  the access token's expiry (`expires` / `expired`, or `no expiry`),
+  whether it has a refresh token and until when, and the granted
+  `scope`; `none stored` (no record: `devsandbox login`); `unreadable`
+  with the store's error, which never holds its content.
+- `profiles`, `max` (unset: every profile, every scope), then
+  `members`, `approvers`, `delegate`, `as` when set.
+- `approved` (in approval order) and `pending` claim versions, by
+  `Version::short`. The last approved is `latest`; a version that isn't
+  and that no instance here pins is `unused` (`access revoke --version`
+  drops it).
+- `broken`: why the credential is marked broken, when it is (`broken`).
+- `instances`: those in `state.toml` with a claim that resolves to it
+  (`uses`): the claim's kind, the instance's config's
+  `access.<kind>.credential` (its config root and sandbox loaded now) and
+  its profile through `home::resolve`, as the broker does per call. Each
+  shows the claim version it pinned at `run` and whether that version is
+  approved for this credential. An instance whose config doesn't load, or
+  whose claim `home::resolve` refuses (two credentials granted), is shown
+  under every credential of its kind with the reason, and counts as
+  pinning its version.
+
+`--json` prints the same as `{"schema", "data": [credential…]}`, each
+`{"name", "kind", "source", "token": {"type": "static" | "oauth" |
+"missing" | "unreadable", …}, "profiles", "max", "members"?,
+"approvers"?, "delegate"?, "as"?, "approved": [{"version", "latest",
+"unused"}], "pending": […], "broken", "instances": [{"instance",
+"version", "approved", "unknown"?}]}` (full version hashes; `oauth`
+carries `expires_at`, `refresh_expires_at`, `refreshable`, `scope`).
+
+## `access revoke`
+
+`revoke_at`, after showing what goes and asking (`--yes` revokes; off a
+terminal without `--yes`, refused):
+
+- Without `--version`: the credential's record leaves the store, then its
+  entry leaves `credentials.toml` (the secret first: a failure in
+  between leaves an entry that serves nothing). Shown first: the
+  instances that lose it (`access ls`'s, unknown ones as perhaps). For
+  an OAuth record the token stays valid at the provider until it
+  expires: no claim declares a revocation endpoint, so it says so.
+- With `--version` (`pick_any`: a unique prefix of an approved or pending
+  version): that version leaves the entry. For an approved one it names
+  the instances pinning it, which get the not-approved refusal on their
+  next call, and which version becomes the latest approved (or that none
+  is left).
+
+The `access` commands work on the files directly, in-process; no API
+method reaches them.
 
 ## `credentials.toml`
 
@@ -134,6 +201,10 @@ claim = '{"kind":"sentry","claim":{…}}'   # `Claim::canonical`
 [[sentry-work.pending]]       # `home::record_pending`
 version = "…"
 claim = '…'
+
+[sentry-work.broken]          # `Entry::broken`, set by the broker, cleared by `login`
+at = "2026-11-21T10:00:00Z"   # when first marked, RFC 3339 UTC
+reason = "its refresh was refused: invalid_grant (…)"
 ```
 
 `claim` is the canonical pinned claim (no container-side wiring), the copy
@@ -172,8 +243,10 @@ token_url = "https://github.com/login/oauth/access_token"
 client_id = "Iv1.…"           # the claim's, or `--client-id`'s
 ```
 
-The broker injects `Store::token_now`: the static token, or the access
-token as stored, expired or not. `Store::put` / `get` /
+The broker injects the static token, or the access token, renewed with
+the refresh token when due (`oauth::refresh::Renewer`, under the store's
+lock: `Store::renew`;
+[broker](../architecture/credentials/broker.md#renewal)). `Store::put` / `get` /
 `remove` read and write it under `credentials-store.lock`, each write to a
 temp file created 0600 and renamed (`serve::locked_file::write_atomic_mode`),
 so no secret is ever on disk with wider permissions. A store readable by
@@ -210,5 +283,6 @@ take the file past 10 MiB. Never a token or a phantom.
 | `reason` | a refusal's or failure's one line; a skipped `rewrite` |
 | `status` | what the tool got (the upstream's, or the broker's own) |
 | `phantom` | whose phantom the call carried: `own`, `other-claim`, `foreign`; `null` for none |
+| `refreshed` | `true` when the call renewed the credential's token; absent otherwise |
 
 How calls are decided: [broker](../architecture/credentials/broker.md).

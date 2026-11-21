@@ -11,10 +11,17 @@
   devsandbox login sentry-work --feature ghcr.io/devsandboxes/features/sentry:1 --profile work
   ```
 
-- **`devsandbox login` by device code or browser.** A claim that lists the `device` or `browser` login gets its token by OAuth: `login` shows a code to enter at the provider's page (works on a headless box), or opens the provider's login page and takes the redirect on a loopback port. `--method` picks among the claim's methods, and `--client-id` logs in to your own OAuth app (a GitHub App you made) instead of the feature's. The token, its refresh token and expiries are kept on the host; tokens aren't refreshed yet, so log in again once one expires.
+- **`devsandbox login` by device code or browser.** A claim that lists the `device` or `browser` login gets its token by OAuth: `login` shows a code to enter at the provider's page (works on a headless box), or opens the provider's login page and takes the redirect on a loopback port. `--method` picks among the claim's methods, and `--client-id` logs in to your own OAuth app (a GitHub App you made) instead of the feature's. The token, its refresh token and expiries are kept on the host, and the broker renews the token before it expires (or when the provider rejects it, replaying the call), so tools in the sandbox never see it change. A credential whose renewal is refused is marked broken until you log in again.
 
   ```bash
   devsandbox login github --method device --client-id Iv1.0123456789abcdef
+  ```
+
+- **`devsandbox access ls` and `access revoke`.** `ls` lists this host's credentials: who they're granted to, whether the token is pasted or OAuth and when it expires (never the token), the approved and pending claim versions, and the instances using each, with the version they run and whether it's approved. Versions nothing uses are marked. `revoke` deletes a credential's secret and entry, or with `--version` drops one claim version, showing first which instances lose access.
+
+  ```bash
+  devsandbox access ls sentry-work
+  devsandbox access revoke sentry-work --version 3f2a1b
   ```
 
 - **`access.<kind>` in a sandbox's config** picks the credential a claim takes (`credential`) and narrows what the sandbox may do with it (`scopes`). Edits apply to the next call, no rebuild.

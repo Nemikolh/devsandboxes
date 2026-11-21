@@ -14,12 +14,11 @@ limitation means editing this file in the same commit.
 
 - **credentials**: credential-broker step 1 and github-and-sentry-access
   step 1 are done (the broker, `login` by paste, `access approve`,
-  sentry-cli brokered locally in base-URL mode through `features/sentry`);
-  now credential-broker step 2: device flow and browser OAuth logins are
-  done, refreshing their tokens behind the phantom and `access ls|revoke`
-  are next, on the way to gh and git through the broker
-  (credential-broker step 3, git-gateway step 1, github-and-sentry-access
-  step 2). → [plan](plans/active/credential-broker.md)
+  sentry-cli brokered locally in base-URL mode through `features/sentry`)
+  and credential-broker step 2 (device flow and browser OAuth logins,
+  their renewal behind the phantom, `access ls|revoke`); now gh and git
+  through the broker (credential-broker step 3, git-gateway step 1,
+  github-and-sentry-access step 2). → [plan](plans/active/credential-broker.md)
 
 ## Planned
 
@@ -338,16 +337,11 @@ is frozen: no new work on it.
 
 ### credentials
 
-- An OAuth login's token isn't refreshed: the broker injects the stored
-  access token as is, expired too (a GitHub app user token after 8 hours),
-  until a re-login; refreshing behind the phantom is credential-broker
-  step 2's next part. A claim's device and browser logins send no
-  `scope` (no claim field; GitHub Apps take none), and
-  `github-app-manifest` logins are refused (github-and-sentry-access step
-  3). `credentials.toml`'s `members`, `approvers`, `delegate` and `as`
-  parse but nothing reads them yet.
-  → [login](architecture/credentials/login.md); `credentials::store::Store::token_now`,
-  `commands::login::choose`
+- A claim's device and browser logins send no `scope` (no claim field;
+  GitHub Apps take none), and `github-app-manifest` logins are refused
+  (github-and-sentry-access step 3). `credentials.toml`'s `members`,
+  `approvers`, `delegate` and `as` parse but nothing reads them yet.
+  → [login](architecture/credentials/login.md); `commands::login::choose`
 - Intercept-mode claims are skipped at `run` until credential-broker
   step 3, and claims on an instance placed by another member until step 5
   (`CRED`), each with a warning.
@@ -357,18 +351,21 @@ is frozen: no new work on it.
   route in no scope (`other`) get a 403 saying asks need permission
   requests (credential-broker step 4); `presence` routes pass. No repo
   fence yet (github-and-sentry-access step 2), nor token and registration
-  endpoints a claim could mark (no claim field). An upstream 401 to an
-  injected call becomes a refusal naming `devsandbox login`, but nothing
-  marks the credential broken, calls the claim's `check` route or notifies
-  an approver. Policy reads no request body, and token-shaped response
-  headers aren't stripped: only the injected value is masked. One
+  endpoints a claim could mark (no claim field). A credential marked
+  broken notifies no approver (credential-broker step 4). Policy reads no
+  request body, and token-shaped response headers aren't stripped: only the injected value is masked. One
   upstream connection per call, no pooling. `access.log` shows nowhere
-  (no dashboard view, no `access ls`).
+  (no dashboard view, nor in `access ls`).
   → [broker](architecture/credentials/broker.md); `broker::policy::decide`,
   `broker::serve::Service`
-- `login` and `access approve` are local only: no `access.*` /
+- `login` and `access approve|ls|revoke` are local only: no `access.*` /
   `credentials.*` API methods, so no approver answers from another host
   (credential-broker step 4). → [plan](plans/active/credential-broker.md)
+- `access revoke` of an OAuth credential leaves its token valid at the
+  provider until it expires (no claim field names a revocation
+  endpoint), and `access ls` shows no approval time (`credentials.toml`
+  records none). → [credentials CLI](reference/credentials-cli.md#access-revoke);
+  `commands::access::revoke_at`
 - `run`'s host-class warning fires only on a host that brokers a
   credential, not yet on one that is a credential's approver (step 4), and
   `access ls` marks neither it nor a shared writable bind (step 2); the

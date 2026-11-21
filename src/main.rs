@@ -461,7 +461,7 @@ enum Command {
         #[arg(long, value_name = "ID")]
         client_id: Option<String>,
     },
-    /// This host's credentials: approve claim versions
+    /// This host's credentials: list them, approve claim versions, revoke
     /// (docs/reference/credentials-cli.md)
     #[cfg(unix)]
     Access {
@@ -473,6 +473,26 @@ enum Command {
 #[cfg(unix)]
 #[derive(Subcommand)]
 enum AccessCommand {
+    /// List credentials: grant, token kind and expiry (never the value),
+    /// claim versions, and the instances here that take each
+    Ls {
+        /// Only this credential
+        credential: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a credential's secret and entry, or drop one claim version
+    /// of it
+    Revoke {
+        /// The credential's name in credentials.toml
+        credential: String,
+        /// Drop only this approved or pending version (a prefix of it)
+        #[arg(long)]
+        version: Option<String>,
+        /// Revoke without asking (required off a terminal)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Approve the claim version pending for a credential, after its diff
     /// against the latest approved one; the secret stays
     Approve {
@@ -1139,6 +1159,14 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Approve { credential, version, yes } } => {
             commands::access::approve(&credential, version.as_deref(), yes)
+        }
+        #[cfg(unix)]
+        Command::Access { cmd: AccessCommand::Ls { credential, json } } => {
+            commands::access::ls(credential.as_deref(), json)
+        }
+        #[cfg(unix)]
+        Command::Access { cmd: AccessCommand::Revoke { credential, version, yes } } => {
+            commands::access::revoke(&credential, version.as_deref(), yes)
         }
     }
 }
