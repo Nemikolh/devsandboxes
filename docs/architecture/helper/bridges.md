@@ -302,7 +302,8 @@ holders (`control_in_flight`), so the daemon doesn't idle out under them.
 ### Broker connections (`HTTP_PROXY`)
 
 A bridge whose `Services` carry a broker (`bridge::Broker`, handed to
-`Bridges::spawn_worker`; `serve::host` passes none yet) advertises
+`Bridges::spawn_worker`; `serve::host` passes `broker::serve::Service`,
+[broker](../credentials/broker.md)) advertises
 `caps::HTTP_PROXY` (`own_caps`) and takes the helper's
 [broker listener](in-container.md#broker-listeners) streams; without one
 it advertises nothing and refuses them, so the helper answers its clients

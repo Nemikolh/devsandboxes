@@ -2118,8 +2118,9 @@ mod tests {
 
     /// A feature's credential claim wires the instance: the phantom and the
     /// base URL on the env, the phantom file in the remote user's home, and
-    /// devsbd listening on the broker port (answering 503 here: no broker
-    /// behind its bridge). No credential in this data dir: wired anyway.
+    /// devsbd listening on the broker port, the broker behind its bridge
+    /// answering a request it refuses before any network (a dot-segment).
+    /// No credential in this data dir: wired anyway.
     #[cfg(unix)]
     #[test_utils::docker_test(helper)]
     fn claims_wire_env_files_and_listeners_with_docker() -> Result<(), String> {
@@ -2165,17 +2166,29 @@ mod tests {
             let [claim] = &info.claims[..] else { panic!("one claim: {:?}", info.claims) };
             assert!(claim.phantom.starts_with("sntrys_"), "{}", claim.phantom);
             let port = claim.listeners.iter().find(|l| l.upstream == "sentry.io").expect("sentry.io listener").port;
+
+            let roots = rustls::RootCertStore::empty();
+            let upstream = crate::broker::upstream::Upstream::new(roots, None, Default::default()).unwrap();
+            let service = crate::broker::serve::Service::new(State::path().unwrap(), Ok(upstream)).unwrap();
+            let bridge = crate::devsbd::bridge::spawn_brokered(&name, info, std::sync::Arc::new(service)).unwrap();
+            assert_eq!(bridge.outcome(std::time::Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+
+            // The helper answers 503 itself until it has seen the bridge's caps.
             let probe = format!(
                 "echo \"$SENTRY_AUTH_TOKEN|$SENTRY_URL\"; \
-                 for i in $(seq 50); do r=$(printf 'GET / HTTP/1.1\\r\\nHost: 127.0.0.1:{port}\\r\\n\\r\\n' \
-                 | nc 127.0.0.1 {port} 2>/dev/null | head -n1); [ -n \"$r\" ] && break; sleep 0.1; done; echo \"$r\"; \
+                 for i in $(seq 50); do r=$(printf 'GET /api/0/../x HTTP/1.1\\r\\nHost: 127.0.0.1:{port}\\r\\nConnection: close\\r\\n\\r\\n' \
+                 | nc 127.0.0.1 {port} 2>/dev/null); case \"$r\" in 'HTTP/1.1 400'*) break;; esac; sleep 0.1; done; \
+                 echo \"$r\" | head -n1; echo \"$r\" | tail -n1; echo; \
                  cat \"$HOME/.sentryclirc\""
             );
             let argv = crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), probe], false);
             let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
             let lines: Vec<&str> = out.lines().collect();
             assert_eq!(lines[0], format!("{}|http://127.0.0.1:{port}", claim.phantom), "{out}");
-            assert!(lines[1].starts_with("HTTP/1.1 503"), "{out}");
+            assert!(lines[1].starts_with("HTTP/1.1 400"), "{out}");
+            let refusal: serde_json::Value = serde_json::from_str(lines[2]).expect("a refusal body");
+            assert!(refusal["detail"].as_str().unwrap().contains("dot-segment"), "{out}");
+            assert_eq!(refusal["devsandbox"]["verdict"], "refused");
             assert!(out.contains(&format!("url = http://127.0.0.1:{port}\n")), "{out}");
             assert!(out.contains(&format!("token = {}", claim.phantom)), "{out}");
         });

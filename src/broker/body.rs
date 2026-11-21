@@ -47,6 +47,7 @@ impl<R: BufRead> BodyReader<R> {
         self.state == State::Done
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn into_inner(self) -> R {
         self.inner
     }

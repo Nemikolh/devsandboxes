@@ -119,6 +119,37 @@ pub fn basic_auth(user: &[u8], secret: &[u8]) -> Vec<u8> {
     base64(&plain)
 }
 
+/// Standard alphabet, padded; `None` for anything else (whitespace
+/// included).
+pub fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |b: u8| match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let groups = text.len() / 4;
+    for (i, group) in text.chunks(4).enumerate() {
+        let pad = group.iter().rev().take_while(|&&b| b == b'=').count();
+        if pad > 2 || (pad > 0 && i + 1 != groups) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (j, &b) in group.iter().enumerate() {
+            let v = if j >= 4 - pad { 0 } else { value(b)? };
+            n |= u32::from(v) << (18 - 6 * j);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
+}
+
 fn base64(data: &[u8]) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
@@ -168,6 +199,10 @@ mod tests {
             ("foobar", "Zm9vYmFy"),
         ] {
             assert_eq!(base64(plain.as_bytes()), enc.as_bytes(), "{plain}");
+            assert_eq!(base64_decode(enc.as_bytes()).as_deref(), Some(plain.as_bytes()), "{enc}");
+        }
+        for bad in ["Zg", "Zg=", "Z===", "Zg==Zg==", "Zm9 ", "Zm9-"] {
+            assert_eq!(base64_decode(bad.as_bytes()), None, "{bad}");
         }
         assert_eq!(base64(&[0xff, 0xfe, 0x00]), b"//4A");
         assert_eq!(basic_auth(b"user", b"pass"), b"dXNlcjpwYXNz");

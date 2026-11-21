@@ -98,6 +98,16 @@ running instance.
 - [in-container.md](helper/in-container.md): `devsbd daemon`, boot hook, verbs.
 - [ssh-agent.md](helper/ssh-agent.md): agent forwarding.
 
+## Credentials
+
+A feature's credential claim gives its sandbox a phantom token and a
+loopback listener per upstream; the daemon's broker swaps the phantom for
+the credential kept on this host, by policy, per call.
+
+- [broker.md](credentials/broker.md): per-connection flow, policy,
+  injection, redaction, refusals, `access.log`.
+- CLI and files: [reference/credentials-cli.md](../reference/credentials-cli.md).
+
 ## The Inbox
 
 A host-wide store (`inbox.json`) of threads, keyed by owner instance and

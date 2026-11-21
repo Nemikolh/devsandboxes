@@ -40,7 +40,7 @@ use super::head::{Framing, Header};
 /// Fields the client writes itself; a caller's list carrying one (or any
 /// other hop-by-hop field) is refused, so they are stripped before the
 /// call, never sent twice.
-const RESERVED: &[&str] = &[
+pub const RESERVED: &[&str] = &[
     "host",
     "content-length",
     "transfer-encoding",

@@ -13,19 +13,33 @@
 //! - [`redact`]: masking the injected value wherever it comes back.
 //! - [`upstream`]: the HTTPS client calls go out on, with the address
 //!   check on every address it dials.
+//! - [`route`], [`rewrite`], [`refusal`]: a path against a claim's routes,
+//!   upstream URLs turned into loopback ones, the broker's own answers.
+//! - [`policy`], [`audit`], [`serve`] (unix, with `serve`): the decision
+//!   per call, `access.log`, and the [`Broker`](crate::devsbd::bridge::Broker)
+//!   the daemon's bridges hand connections to.
 //!
 //! A refusal reaches the caller as an `io::Error` of kind `InvalidData`
 //! carrying an [`HttpError`] ([`refusal`]), so one `?` covers transport
 //! failures and protocol violations alike while the caller can still answer
 //! the latter with a status.
 
-// No caller until the broker is wired into `serve`; its tests are here.
-#![cfg_attr(not(test), allow(dead_code))]
+// Off unix nothing serves the broker.
+#![cfg_attr(not(unix), allow(dead_code))]
 
+#[cfg(unix)]
+pub mod audit;
 pub mod body;
 pub mod guard;
 pub mod head;
+#[cfg(unix)]
+pub mod policy;
 pub mod redact;
+pub mod refusal;
+pub mod rewrite;
+pub mod route;
+#[cfg(unix)]
+pub mod serve;
 pub mod upstream;
 
 use std::fmt;

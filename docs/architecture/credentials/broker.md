@@ -1,0 +1,185 @@
+# The credential broker
+
+What `devsandbox serve` does with a connection a sandbox opens to one of
+its broker listeners: decide, swap the phantom for the real credential,
+call the upstream, and send the answer back with the credential masked.
+Read this before touching the broker, its policy, or what a tool sees when
+a call is refused. The design it implements is
+[credential-broker](../../plans/active/credential-broker.md) (*Shape*:
+"The broker", "Phantoms", "Policy", "Refusals", "Audit") and
+[github-and-sentry-access](../../plans/active/github-and-sentry-access.md)
+(*The claim contract*, *sentry-cli*). What isn't built yet:
+[status](../../status.md#credentials).
+
+Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
+`src/broker/policy.rs` (`decide`, `Sources`, `Outcome`, `Action`,
+`Injection`, `Phantom`, `inject`, `secrets`), `src/broker/route.rs`
+(`check_path`, `matches`, `scope_of`), `src/broker/rewrite.rs`
+(`loopback_url`, `location`, `json_fields`, `MAX_REWRITE`),
+`src/broker/refusal.rs` (`Refusal`), `src/broker/audit.rs` (`Audit`,
+`Line`), `src/broker/head.rs`, `src/broker/body.rs`, `src/broker/guard.rs`,
+`src/broker/redact.rs`, `src/broker/upstream/` (`Upstream`),
+`src/serve/host.rs` (`poll`, where the broker is built),
+`src/credentials/claim.rs` (`from_canonical`).
+
+## Where connections come from
+
+Each claimed instance's helper listens on `127.0.0.1:<port>` per upstream
+of its claims ([in-container](../helper/in-container.md#broker-listeners))
+and carries each connection to the host as an `HTTP_PROXY` stream on its
+bridge, with a `ProxyHeader` naming the upstream and the listener port.
+`serve::host::poll` builds one `broker::serve::Service` at start
+(`Service::from_host`: the user's `state.toml`, the host's native TLS
+roots and proxy env, built once) and hands it to `Bridges::spawn_worker`,
+so every daemon bridge advertises `caps::HTTP_PROXY` and passes each
+stream to `Broker::serve` with its `Caller`, the instance key and
+`instance_id` of the bridge that carried it
+([bridges](../helper/bridges.md#broker-connections-http_proxy)). The
+bridge is the identity: nothing the container sends changes it. A host
+with no usable TLS roots still serves the broker; its calls answer `502`
+naming why.
+
+## Per connection
+
+`Service::serve` reads requests until either side closes. Per request
+(`Service::request`):
+
+1. `head::read_head`: strict framing; a malformed head gets a refusal
+   with `HttpError::status` (400, 431, 505, 417) and the connection
+   closes.
+2. `guard::refuse_browser` (any `Origin` or `Sec-Fetch-Site`) and
+   `guard::check_host` (`Host` must be `127.0.0.1:<listener>`): `403`.
+3. `state.toml` is read (`State::load_at`), then `policy::decide`.
+4. A refusal is answered; an uninjected or injected call is forwarded
+   (below); one `access.log` line either way.
+
+Keep-alive holds both ways per request: the connection stays open when
+the request asked for it and its body was read to its end. A refusal
+leaves an unread body behind, so it closes the connection unless the
+request had none. `Expect: 100-continue` is answered only once policy let
+the call through; a refused one gets the refusal instead, and the body is
+never read.
+
+Nothing is cached: `state.toml` per request, and for a call carrying the
+phantom `credentials.toml`, the file store and the instance's config
+(`Config::load` of `Instance::config_dir`, `resolve_sandbox`), so an edit
+to a grant, a secret or `access.<kind>` applies to the next call, no
+rebuild.
+
+## Policy
+
+`policy::decide` is pure over the instance records, the head and a
+`Sources` (the home and the instance's config `access`, read on demand,
+only for a call carrying the phantom). First refusal answers:
+
+1. **Instance known**: a `state.toml` record under the caller's key with
+   the caller's `instance_id`, carrying claims.
+2. **Listener**: `instance::by_port` finds the claim listening on the
+   header's port, and its upstream must be the one the header names. That
+   claim is "the claim" below. Intercept headers are refused (not built).
+3. **Strict path** (`route::check_path`): a dot-segment (`.`, `..`), an
+   encoded dot (`%2e` in any case, anywhere) or an empty segment (`//`)
+   anywhere in the path is a `400`, for every call, phantom or not, so no
+   path an upstream would resolve differently is ever forwarded.
+4. **Phantom**, looked for only in inject slots, by the phantom table
+   (never by shape): a header slot's value in its `format` (the text
+   before `{token}`, an auth scheme, compares case-insensitively), a basic
+   slot's password (any username), a query slot's raw value. Any other
+   claim's phantom (this instance's other claim: `other-claim`, another
+   instance's: `foreign`) in any slot of this instance's claims is a
+   `leak`. A slot sent twice, or both slots of a two-slot claim filled, is
+   a `400`. No phantom of the claim in one of its slots: the call goes
+   upstream **uninjected**, as it came; a phantom anywhere else (another
+   header, the URL, the body) goes as is, never swapped. An uninjected
+   call to an upstream the claim marks `private` gets a bare `401` from
+   the broker and is never dialed.
+5. **Credential**: `home::resolve` with `access.<kind>.credential` and the
+   instance's profile; none names `devsandbox login <kind>`.
+6. **Approved version**: the claim's version must be one the credential
+   approved (`Entry::approved_claim`), else a refusal naming
+   `devsandbox access approve <credential>`. From here on the home's copy
+   (`claim::from_canonical`) rules; the instance's only selected it.
+7. **Upstream and slot** in that copy.
+8. **Scope** (`route::scope_of` on the copy): method and path, query
+   ignored; `{var}` takes one non-empty segment; segments compare raw
+   (percent-encoding and case included), so an encoded form never matches
+   a literal route and lands in `other`. A `never` route is refused
+   always. A route in no scope is `other`, refused as an ask. The scope
+   must be granted (`max`; unset: every scope) and not in
+   `access.<kind>.ask` (refused: asks need permission requests), and
+   requested (`access.<kind>.scopes`; empty: every scope of the claim),
+   each refusal naming what to change.
+
+The result (`Outcome`) carries the refusal or the injection (credential,
+slot, the approved claim, its upstream's `private`) and the log context:
+kind, credential, scope, whose phantom, the instance's listeners and the
+refusal shape (the approved copy's once read, else the instance's).
+
+## The call
+
+`Service::forward` builds the upstream request: `https://<upstream><path>`
+(path and query as the tool sent them), the tool's fields minus those the
+upstream client writes itself (`upstream::RESERVED`: `Host`, framing,
+`Accept-Encoding`, `Connection`, hop-by-hop, `Expect`) and those the
+request's `Connection` names. An injected call gets the secret from the
+file store (`Store::get`; none stored names `devsandbox login`) and
+`policy::inject` writes it into the chosen slot only: the header as its
+`format` with the token, `Basic` with the slot's username, or the query
+parameter percent-encoded. The address check lets private ranges through
+only for an injected call whose approved upstream is `private`. The body
+streams from the tool to the upstream as it arrives (`BodyReader` into
+`upstream::Body`, its length or chunked as sent). One upstream connection
+per request.
+
+The answer (`Respond::write`): status and fields as received, minus
+hop-by-hop ones and those the response's `Connection` names (and
+`Content-Encoding` when the client decoded the body). The injected value
+is masked (`policy::secrets`: the token, its query form, and its basic
+forms for the claim's basic slots) in the reason, every field value and
+the body as it streams (`redact::Redactor`, same length, so a passed
+`Content-Length` holds). A `Location` to `https://<upstream>[:443]` whose
+host has a listener on the instance is rewritten to
+`http://127.0.0.1:<port>` with path and query kept
+(`rewrite::location`); any other passes as is. The body goes back
+`Content-Length` when the upstream framed it so, else chunked (to an
+HTTP/1.0 client: until close), flushed per read so a stream goes out as
+it comes.
+
+`rewrite`: for an injected call to a route the approved claim lists, the
+body is read whole up to `MAX_REWRITE` (16 MiB), masked, and each named
+field (`url`, `regions[].url`: dotted names, `[]` for each element)
+holding an absolute URL to a bound upstream is replaced by that
+upstream's loopback URL (`rewrite::json_fields`), sent with its new
+length. A body that isn't JSON or needs no change goes as it came; one
+past the bound passes through unrewritten, noted in the log line. This is
+what makes sentry-cli's chunk uploads (`GET …/chunk-upload/` answering an
+absolute region URL) and its regions list come back through the broker.
+
+An upstream `401` to an injected call never reaches the tool, which would
+start its own login: the credential is static, so the broker answers its
+own `403` naming `devsandbox login <credential>`. A `401` to an
+uninjected call passes through. A failed call is answered with the
+status `UpstreamError::status` gives (`403` for a refused address, `502`
+otherwise, `400` for a malformed request body), refusal-shaped.
+
+## Refusals
+
+`refusal::Refusal` renders the claim's `refusal` shape: `json` puts the
+one-line reason at the claim's field (`detail` for sentry; a dotted field
+nests) beside a `devsandbox` object (`verdict`, `credential`, `scope`,
+`do`); `anthropic` is Anthropic's error object; `mcp` a JSON-RPC error;
+`git` the reason as a text body. No shape: `json` with `message`. `403`
+for policy refusals and leaks, `400` for malformed requests and strict
+paths, `503` when a file can't be read, `502` for a failed upstream.
+Never `WWW-Authenticate`.
+
+## `access.log`
+
+`audit::Audit`: one JSON line per request in `access.log` beside
+`state.toml` (0600), moved to `access.log.1` once the next line would
+take it past 10 MiB (`MAX_BYTES`). Fields: `time` (RFC 3339 UTC),
+`instance`, `instance_id`, `incarnation`, `kind`, `credential`, `method`,
+`route` (the path before injection, query dropped), `scope`, `verdict`
+(`allow`, `uninjected`, `refused`, `leak`, `error`), `reason`, `status`,
+`phantom` (`own`, `other-claim`, `foreign`). Never a token or a phantom.
+Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog).

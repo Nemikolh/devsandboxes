@@ -68,7 +68,6 @@ pub struct File {
 }
 
 /// The claim whose phantom is `phantom`, by the table, never by shape.
-#[cfg_attr(not(test), allow(dead_code))] // the broker's per-call policy, next step
 pub fn by_phantom<'a>(claims: &'a [InstanceClaim], phantom: &str) -> Option<&'a InstanceClaim> {
     claims.iter().find(|c| c.phantom == phantom)
 }

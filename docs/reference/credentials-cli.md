@@ -16,7 +16,8 @@ Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `pick_pending`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/store.rs` (`Store`,
 `Secret`), `src/credentials/review.rs` (`View`, `diff`, `Diff`),
-`src/credentials/mod.rs` (`check_name`).
+`src/credentials/mod.rs` (`check_name`), `src/broker/audit.rs` (`Audit`,
+`Line`).
 
 ```
 devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>]... [--yes]
@@ -98,7 +99,7 @@ per credential, unknown keys refused:
 kind = "sentry"
 source = "file"               # the only source; "keyring" and "op://…" refused as not yet
 profiles = ["work"]           # unset: every profile
-max = ["releases.write"]      # unset: every scope of the claim
+max = ["releases.write"]      # unset: every scope of the claim (the broker's grant check)
 members = []                  # these four: parsed, read by nothing
 approvers = []
 delegate = []
@@ -141,3 +142,31 @@ Both files, their locks, and the reserved `access.json` and
 `member-ca.key` are refused as bind and build sources in every container,
 like `member.key` (`key_guard`, `daemon_config::credential_files`;
 [fleet](../architecture/daemon/fleet.md), *Key at rest*).
+
+## `access.log`
+
+The broker's audit log, next to `state.toml` (`broker::audit::Audit`,
+0600): one JSON object per line, one line per request a broker listener
+carried, rotated to `access.log.1` (replacing it) once the next line would
+take the file past 10 MiB. Never a token or a phantom.
+
+```json
+{"time":"2026-11-21T10:00:00Z","instance":"web-1","instance_id":"web-1",
+ "incarnation":"…","kind":"sentry","credential":"sentry-work","method":"GET",
+ "route":"/api/0/organizations/acme/releases/","scope":"releases.read",
+ "verdict":"allow","reason":null,"status":200,"phantom":"own"}
+```
+
+| field | holds |
+|---|---|
+| `time` | RFC 3339, UTC, seconds |
+| `instance`, `instance_id` | the bridge's instance (state key, persistent id) |
+| `incarnation` | the instance's, when its record has one |
+| `kind`, `credential`, `scope` | as far as policy got (`null` before) |
+| `method`, `route` | the request's, the path before injection, query dropped |
+| `verdict` | `allow` (injected), `uninjected`, `refused`, `leak`, `error` |
+| `reason` | a refusal's or failure's one line; a skipped `rewrite` |
+| `status` | what the tool got (the upstream's, or the broker's own) |
+| `phantom` | whose phantom the call carried: `own`, `other-claim`, `foreign`; `null` for none |
+
+How calls are decided: [broker](../architecture/credentials/broker.md).

@@ -255,7 +255,8 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   foreign one is) → granted to this profile and member →
   asked for in the
   config's `access.<credential>` (the claim's `access` for a remote
-  instance; request ∩ grant, also checked at `run`;
+  instance; request ∩ grant, an unset `scopes` requesting and an unset
+  `max` granting every scope of the claim, also checked at `run`;
   a remote home offline then is a warning, the per-call check stands) →
   the fence, for credentials that have one: the scope table attributes
   the route to a repo (case-folded, `.git` stripped, the query string

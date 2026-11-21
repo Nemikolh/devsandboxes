@@ -614,6 +614,20 @@ fn spawn_managed(
     }
 }
 
+/// A daemon-like bridge for instance `key` serving only `broker` (notify
+/// dropped, control refused): tests outside this module that need the real
+/// broker behind a container's listener.
+#[cfg(test)]
+pub(crate) fn spawn_brokered(key: &str, info: &Instance, broker: Arc<dyn Broker>) -> Option<Bridge> {
+    let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
+    let sink: Sink = Arc::new(|_| Ok(()));
+    let control: ControlHandler = Arc::new(|_: &str, _: &Request| Response::new(Status::Usage, "not served"));
+    let services =
+        Services { broker: Some(broker), ..Services::new(key.to_string(), info.instance_id.clone(), sink, control) };
+    let none: Option<fn() -> Option<PathBuf>> = None;
+    spawn_with(&info.container, hash, none, Some(services))
+}
+
 /// Start a bridge for `container` with helper `hash`, optionally serving the
 /// host ssh-agent. `with_agent` = true wires the real `host_agent` provider (a
 /// forward bridge serves ssh-agent when the host has one, advertising

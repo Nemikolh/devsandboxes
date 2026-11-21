@@ -277,8 +277,14 @@ fn poll(
     observers: &Observers,
     board: BridgeBoard,
 ) {
-    // No broker yet: its policy plugs in here (credential-broker rollout 1).
-    let worker = Bridges::spawn_worker(Some(sink), None, board.clone());
+    let broker: Option<Arc<dyn bridge::Broker>> = match crate::broker::serve::Service::from_host(log) {
+        Ok(service) => Some(Arc::new(service)),
+        Err(e) => {
+            log(&format!("broker: {e:#}: no credential is brokered"));
+            None
+        }
+    };
+    let worker = Bridges::spawn_worker(Some(sink), broker, board.clone());
     let rt = crate::runtime::backend();
     // Declared after `worker`, so it drops (child killed, thread joined)
     // first. Started once a runtime is installed.

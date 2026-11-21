@@ -38,7 +38,7 @@ const MAX_TEMPLATE: usize = 64 * 1024;
 const MAX_KIND: usize = 32;
 const MAX_PREFIX: usize = 32;
 /// Unknown routes' scope for a credential without a fence; no claim names it.
-const OTHER_SCOPE: &str = "other";
+pub const OTHER_SCOPE: &str = "other";
 
 const FIELDS: &[&str] = &[
     "upstreams", "mode", "inject", "phantom", "git", "baseUrl", "rewrite", "login", "check",
@@ -71,8 +71,22 @@ impl Claim {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// The pinned claim back from [`Claim::canonical`]'s JSON (the home's
+/// approved copy), with its kind. Trusts the content: the home re-hashed it
+/// at load and it was checked when first parsed from a feature.
+pub fn from_canonical(canonical: &str) -> Result<(String, Pinned)> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Canonical {
+        kind: String,
+        claim: Pinned,
+    }
+    let c: Canonical = serde_json::from_str(canonical).context("an approved claim version doesn't read back")?;
+    Ok((c.kind, c.claim))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Pinned {
     pub upstreams: Vec<Upstream>,
     pub mode: Mode,
@@ -91,7 +105,7 @@ pub struct Pinned {
     pub fence: BTreeMap<Route, Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Upstream {
     pub host: String,
     /// On the LAN: the broker dials it despite its private address.
@@ -105,7 +119,7 @@ pub enum Mode {
     Intercept,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Slot {
     /// `name` lowercased; `format` holds [`TOKEN`] once.
@@ -115,7 +129,7 @@ pub enum Slot {
     Query { param: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Rewrite {
     pub route: Route,
     pub fields: Vec<String>,
@@ -146,7 +160,7 @@ pub enum Mint {
     OauthRefresh,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub routes: Vec<Route>,
     pub permissions: BTreeMap<String, Level>,
@@ -160,7 +174,7 @@ pub enum Level {
     Admin,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Presence {
     /// `{var}` from the route's path, else a body field path.
@@ -259,7 +273,7 @@ impl Method {
         METHODS.iter().find(|(m, _)| *m == self).map(|(_, s)| *s).expect("every method is listed")
     }
 
-    fn parse(s: &str) -> Option<Method> {
+    pub fn parse(s: &str) -> Option<Method> {
         METHODS.iter().find(|(_, name)| *name == s).map(|(m, _)| *m)
     }
 }
@@ -311,6 +325,13 @@ impl fmt::Display for Route {
 impl Serialize for Route {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Route {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Route, D::Error> {
+        let s = String::deserialize(d)?;
+        Route::parse(&s).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
     }
 }
 
@@ -1435,6 +1456,20 @@ mod tests {
         assert!(with("git", json!({ "hosts": [] })).contains("at least one host"));
         assert!(with("git", json!({ "hosts": ["github.com", "github.com"] })).contains("listed twice"));
         assert!(with("ca", json!({ "env": "GH_TOKEN" })).contains("`ca.env`: `GH_TOKEN` is already set"));
+    }
+
+    #[test]
+    fn canonical_reads_back() {
+        let mut c = sentry();
+        c.pinned.upstreams[0].private = true;
+        c.pinned.inject.push(Slot::Basic { username: "u".into() });
+        c.pinned.inject.push(Slot::Query { param: "key".into() });
+        c.pinned.presence.push(Presence::Ref { pattern: "refs/tags/*".into(), on: vec![RefOp::Create] });
+        c.pinned.fence.insert(Route::parse("GET /a/{x}/").unwrap(), vec!["{x}".into()]);
+        c.pinned.hold = Some(5);
+        let (kind, pinned) = from_canonical(&c.canonical()).unwrap();
+        assert_eq!((kind.as_str(), &pinned), ("sentry", &c.pinned));
+        assert!(from_canonical(r#"{"kind":"x","claim":{}}"#).is_err());
     }
 
     #[test]

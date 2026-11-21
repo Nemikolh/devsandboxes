@@ -328,24 +328,35 @@ is frozen: no new work on it.
   `SandboxProperties::ignored`
 - `extends` can't remove an inherited array entry; a diamond duplicates
   entries. → [config](architecture/config.md); `config::deep_merge`
-- A sandbox's `access` parses and is checked but only `credential` is read
-  (`run`, `home::resolve`), and `run` doesn't warn.
+- A sandbox's `access`: `repos`, `branches` and `as` parse but nothing
+  reads them (github-and-sentry-access step 2), and `run` doesn't warn
+  about `scopes` or `ask` a claim doesn't have.
   → [plan](plans/active/credential-broker.md); `config::Access`
 
 ### credentials
 
 - `devsandbox login` takes a secret by paste only; device flow and browser
-  OAuth are credential-broker step 2. `credentials.toml`'s `max`,
-  `members`, `approvers`, `delegate` and `as` parse but nothing reads them
-  yet. → [credentials CLI](reference/credentials-cli.md);
+  OAuth are credential-broker step 2. `credentials.toml`'s `members`,
+  `approvers`, `delegate` and `as` parse but nothing reads them yet. → [credentials CLI](reference/credentials-cli.md);
   `commands::login::login_at`
-- A claimed instance's broker listeners answer `503` to every call: the
-  host's bridges carry no broker yet (`Bridges::spawn_worker`), so
-  sentry-cli fails there. Intercept-mode claims are skipped at `run` until
-  credential-broker step 3, and claims on an instance placed by another
-  member until step 5 (`CRED`), each with a warning.
+- Intercept-mode claims are skipped at `run` until credential-broker
+  step 3, and claims on an instance placed by another member until step 5
+  (`CRED`), each with a warning.
   → [images and features](architecture/instances/images-and-features.md#credential-claims);
   `credentials::instance::select`, `commands::run::claims::wire`
+- The broker refuses every ask: a scope in `access.<kind>.ask` and a
+  route in no scope (`other`) get a 403 saying asks need permission
+  requests (credential-broker step 4); `presence` routes pass. No repo
+  fence yet (github-and-sentry-access step 2), nor token and registration
+  endpoints a claim could mark (no claim field). An upstream 401 to an
+  injected call becomes a refusal naming `devsandbox login`, but nothing
+  marks the credential broken, calls the claim's `check` route or notifies
+  an approver. Policy reads no request body, and token-shaped response
+  headers aren't stripped: only the injected value is masked. One
+  upstream connection per call, no pooling. `access.log` shows nowhere
+  (no dashboard view, no `access ls`).
+  → [broker](architecture/credentials/broker.md); `broker::policy::decide`,
+  `broker::serve::Service`
 - `login` and `access approve` are local only: no `access.*` /
   `credentials.*` API methods, so no approver answers from another host
   (credential-broker step 4). → [plan](plans/active/credential-broker.md)

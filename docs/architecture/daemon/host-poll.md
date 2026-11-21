@@ -30,7 +30,9 @@ A `serve-poll` thread. Each pass lists every devsandbox container once
 3. hands the list to the forward registry (configured `forwardPorts`
    follow it, [forwards.md](forwards.md));
 4. hands it, with urgent containers, to the bridge worker
-   (`Bridges::spawn_worker`, its own thread owning every bridge);
+   (`Bridges::spawn_worker`, its own thread owning every bridge, given
+   the credential broker built once at the poll's start:
+   [broker](../credentials/broker.md));
 5. while any root is watched, collects snapshots (below).
 
 The bridges get the list before any stats or snapshot work, so a
