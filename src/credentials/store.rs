@@ -15,9 +15,6 @@
 //! by group or others is refused, not read. Kept out of every container by
 //! `key_guard`.
 
-// Emptied by `access revoke` (credential-broker rollout 2).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
@@ -108,6 +105,7 @@ impl Store {
         Store { path: data.join(crate::daemon_config::CREDENTIAL_STORE) }
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -116,9 +114,9 @@ impl Store {
         Ok(self.load()?.secret.remove(name))
     }
 
-    /// The token the broker injects for `name` now. An expired OAuth
-    /// access token is returned as is: refreshing it is credential-broker
-    /// rollout 2's next part.
+    /// The token as stored, an OAuth access token expired or not; the
+    /// broker renews through `oauth::refresh::Renewer`.
+    #[cfg(test)]
     pub fn token_now(&self, name: &str) -> Result<Option<Secret>> {
         Ok(self.get(name)?.map(|r| r.access_token().clone()))
     }
@@ -128,6 +126,22 @@ impl Store {
         self.update(|doc| {
             doc.secret.insert(name.to_string(), record.clone());
         })
+    }
+
+    /// `f` runs under the store's lock, which it may hold for a refresh
+    /// call, so a login or a second daemon can't race a rotating refresh
+    /// token. It sees `name`'s record as stored now and returns its
+    /// replacement, if any, written atomically with the rest.
+    pub fn renew<T>(&self, name: &str, f: impl FnOnce(Option<&Record>) -> (Option<Record>, T)) -> Result<T> {
+        let mut out = None;
+        self.update(|doc| {
+            let (new, t) = f(doc.secret.get(name));
+            if let Some(r) = new {
+                doc.secret.insert(name.to_string(), r);
+            }
+            out = Some(t);
+        })?;
+        Ok(out.expect("update runs f once loaded"))
     }
 
     /// Whether there was one.

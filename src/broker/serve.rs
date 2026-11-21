@@ -5,7 +5,9 @@
 //! foreign `Host`, decides ([`policy::decide`]), then answers the refusal or
 //! makes the call: one upstream connection per request, the body streamed
 //! both ways, the injected value redacted on the way back, `Location` and the
-//! claim's `rewrite` fields pointed at the loopback, an injected call's 401
+//! claim's `rewrite` fields pointed at the loopback. An OAuth credential's
+//! token is renewed ahead of expiry, and on an upstream 401 renewed and the
+//! call replayed when its body was held; any other injected call's 401 is
 //! turned into a refusal naming `devsandbox login`. Every request leaves one
 //! `access.log` line.
 //!
@@ -29,10 +31,12 @@ use super::refusal::{Refusal, reason_phrase};
 use super::upstream::{self, Body, Length, Request, Response, Upstream};
 use super::{guard, rewrite, route};
 use crate::config::{Access, Config};
-use crate::credentials::claim::{self, Refusal as Shape};
+use crate::credentials::claim::{self, Refusal as Shape, Slot};
 use crate::credentials::home::{self, Home};
 use crate::credentials::instance;
-use crate::credentials::store::Store;
+use crate::credentials::oauth::Http;
+use crate::credentials::oauth::refresh::{self, Failure, Fresh, Refreshed, Renewer};
+use crate::credentials::store::OAuthToken;
 use crate::devsbd::bridge::{Broker, Caller};
 use crate::devsbd::proto::ProxyHeader;
 use crate::state::{Instance, State};
@@ -41,11 +45,22 @@ use crate::state::{Instance, State};
 const HOP_BY_HOP: &[&str] =
     &["connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"];
 
+/// A renewable call's body up to this is read before it's sent, so a 401 can
+/// be replayed with a renewed token; a longer or chunked one streams.
+pub const MAX_REPLAY: u64 = 1024 * 1024;
+
+/// What a `503` for an unreachable token endpoint asks the tool to wait.
+const RETRY_AFTER: u16 = 30;
+
 pub struct Service {
     state: PathBuf,
     data: PathBuf,
     /// `Err`: the host had no usable TLS roots; calls answer 502 with it.
     upstream: std::result::Result<Upstream, String>,
+    /// The token endpoints' client: `upstream`'s, without the private
+    /// override.
+    tokens: std::result::Result<Http, String>,
+    renewer: Renewer,
     audit: Audit,
     /// Upstream host → the authority dialed instead: tests' local servers.
     authorities: HashMap<String, String>,
@@ -55,7 +70,16 @@ impl Service {
     /// The data dir is `state`'s.
     pub fn new(state: PathBuf, upstream: std::result::Result<Upstream, String>) -> Result<Service> {
         let data = state.parent().context("state path has no parent")?.to_path_buf();
-        Ok(Service { audit: Audit::in_data(&data), state, data, upstream, authorities: HashMap::new() })
+        let tokens = upstream.as_ref().map(|u| Http::new(u.clone())).map_err(Clone::clone);
+        Ok(Service {
+            audit: Audit::in_data(&data),
+            renewer: Renewer::new(data.clone()),
+            state,
+            data,
+            upstream,
+            tokens,
+            authorities: HashMap::new(),
+        })
     }
 
     /// The user's `state.toml` and the host's TLS roots and proxy env.
@@ -72,6 +96,19 @@ impl Service {
     pub fn with_authority(mut self, host: &str, authority: &str) -> Service {
         self.authorities.insert(host.to_string(), authority.to_string());
         self
+    }
+
+    #[cfg(test)]
+    pub fn with_tokens(mut self, http: Http) -> Service {
+        self.tokens = Ok(http);
+        self
+    }
+
+    fn refresher(&self, now: u64) -> impl Fn(&OAuthToken) -> Refreshed + '_ {
+        move |t| match &self.tokens {
+            Ok(http) => refresh::refresh(http, t, now),
+            Err(why) => Refreshed::Unavailable(why.clone()),
+        }
     }
 
     fn request(
@@ -160,25 +197,19 @@ impl Service {
                 self.forward(&head, upstream_host, None, &cx, reader, w, &mut line)
             }
             Action::Inject(inj) => {
-                let token = match Store::in_data(&self.data).token_now(&inj.credential) {
-                    Ok(Some(t)) => t,
-                    Ok(None) => {
-                        let r = Refusal {
-                            credential: Some(inj.credential.clone()),
-                            ..Refusal::refused(format!("no secret is stored for credential `{}`", inj.credential))
-                                .todo(format!("devsandbox login {}", inj.credential))
-                        };
-                        self.refuse(w, &r, cx.shape.as_ref(), close_after_refusal, &mut line)?;
-                        return Ok(!close_after_refusal);
+                let now = Instance::now();
+                match self.renewer.token(&inj.credential, now, &self.refresher(now)) {
+                    Ok(fresh) => {
+                        line.verdict = "allow".into();
+                        line.refreshed = fresh.refreshed;
+                        self.forward(&head, upstream_host, Some((&inj, fresh)), &cx, reader, w, &mut line)
                     }
-                    Err(e) => {
-                        let r = Refusal::new(503, "error", format!("{e:#}"));
+                    Err(f) => {
+                        let r = failure_refusal(f, &inj.credential, cx.scope.clone());
                         self.refuse(w, &r, cx.shape.as_ref(), close_after_refusal, &mut line)?;
-                        return Ok(!close_after_refusal);
+                        Ok(!close_after_refusal)
                     }
-                };
-                line.verdict = "allow".into();
-                self.forward(&head, upstream_host, Some((&inj, token.expose())), &cx, reader, w, &mut line)
+                }
             }
         }
     }
@@ -203,7 +234,7 @@ impl Service {
         &self,
         head: &RequestHead,
         upstream_host: &str,
-        inject: Option<(&Injection, &str)>,
+        inject: Option<(&Injection, Fresh)>,
         cx: &Context,
         reader: &mut BufReader<UnixStream>,
         w: &mut UnixStream,
@@ -219,58 +250,83 @@ impl Service {
                 return Ok(!close);
             }
         };
-        let mut headers = upstream_headers(&head.headers);
-        let mut path = head.target.path().to_string();
-        if let Some((inj, token)) = inject {
-            policy::inject(&mut headers, &mut path, &inj.slot, token);
-        }
         let authority = self.authorities.get(upstream_host).map_or(upstream_host, String::as_str);
-        let url = format!("https://{authority}{path}");
         if head.expect_continue {
             w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         }
 
         let mut body = BodyReader::new(&mut *reader, head.framing);
-        let sent = {
-            let req_body = match head.framing {
-                Framing::Empty => Body::Empty,
-                Framing::Length(n) => Body::Length(n, &mut body),
-                Framing::Chunked => Body::Chunked(&mut body),
-            };
-            let private = inject.is_some_and(|(i, _)| i.private);
-            upstream.send(Request { method: &head.method, url: &url, headers: &headers, body: req_body, private })
-        };
-        let body_done = body.is_done();
-        let keep = keep && body_done;
-        let resp = match sent {
-            Ok(resp) => resp,
-            Err(e) => {
-                let status = super::refusal(&e)
-                    .map(|h| h.status())
-                    .or_else(|| upstream::upstream_error(&e).map(|u| u.status()))
-                    .unwrap_or(502);
-                let r = Refusal::new(status, "error", format!("calling `{upstream_host}`: {e}"));
-                self.refuse(w, &r, cx.shape.as_ref(), !keep, line)?;
-                return Ok(keep);
+        let replayable = inject.as_ref().is_some_and(|(_, f)| f.renewable && !f.refreshed);
+        let held = match head.framing {
+            _ if !replayable => None,
+            Framing::Empty => Some(Vec::new()),
+            Framing::Length(n) if n <= MAX_REPLAY => {
+                let mut buf = Vec::new();
+                if let Err(e) = body.read_to_end(&mut buf) {
+                    return self.failed(w, upstream_host, &e, cx, false, line);
+                }
+                Some(buf)
             }
+            _ => None,
+        };
+        let inj = inject.as_ref().map(|(i, _)| *i);
+        let mut token = inject.as_ref().map(|(_, f)| f.token.clone());
+        let to = Target { upstream, authority, head };
+        let (sent, mut path) = to.send(inj.zip(token.as_ref().map(|t| t.expose())), held.as_deref(), &mut body);
+        let keep = keep && body.is_done();
+        let mut resp = match sent {
+            Ok(resp) => resp,
+            Err(e) => return self.failed(w, upstream_host, &e, cx, keep, line),
         };
 
-        if let Some((inj, _)) = inject.filter(|_| resp.status == 401) {
-            let r = Refusal {
-                credential: Some(inj.credential.clone()),
-                scope: cx.scope.clone(),
-                ..Refusal::refused(format!(
-                    "`{upstream_host}` answered 401 to credential `{}`: it's expired, revoked or lacks the permission",
-                    inj.credential
-                ))
-                .todo(format!("devsandbox login {}", inj.credential))
+        if let Some((inj, fresh)) = &inject
+            && resp.status == 401
+        {
+            let now = Instance::now();
+            let renewed = match replayable {
+                true => self.renewer.after_401(&inj.credential, &fresh.token, now, &self.refresher(now)),
+                false => Ok(None),
             };
-            self.refuse(w, &r, cx.shape.as_ref(), !keep, line)?;
-            return Ok(keep);
+            let answered = format!("`{upstream_host}` answered 401 to credential `{}`", inj.credential);
+            let (new, held) = match (renewed, &held) {
+                (Err(f), _) => {
+                    let r = failure_refusal(f, &inj.credential, cx.scope.clone());
+                    self.refuse(w, &r, cx.shape.as_ref(), !keep, line)?;
+                    return Ok(keep);
+                }
+                (Ok(None), _) => {
+                    let why = match fresh.refreshed {
+                        true => format!("{answered}'s token renewed for this call: it's revoked or lacks the permission"),
+                        false => format!("{answered}: it's expired, revoked or lacks the permission"),
+                    };
+                    return self.unauthorized(w, &to, inj, &fresh.token, why, cx, keep, line);
+                }
+                (Ok(Some(new)), None) => {
+                    line.refreshed |= new.refreshed;
+                    let why = format!(
+                        "{answered} and the request's body streamed past {MAX_REPLAY} bytes, so it couldn't be \
+                         replayed with a renewed token: send it again"
+                    );
+                    return self.unauthorized(w, &to, inj, &new.token, why, cx, keep, line);
+                }
+                (Ok(Some(new)), Some(held)) => (new, held),
+            };
+            line.refreshed |= new.refreshed;
+            let (sent, p) = to.send(Some((inj, new.token.expose())), Some(held), &mut io::empty());
+            path = p;
+            resp = match sent {
+                Ok(resp) => resp,
+                Err(e) => return self.failed(w, upstream_host, &e, cx, keep, line),
+            };
+            if resp.status == 401 {
+                let why = format!("{answered}'s renewed token too: it's revoked or lacks the permission");
+                return self.unauthorized(w, &to, inj, &new.token, why, cx, keep, line);
+            }
+            token = Some(new.token);
         }
 
-        let secrets = inject.map(|(inj, token)| policy::secrets(&inj.claim, token));
-        let fields = inject.and_then(|(inj, _)| {
+        let secrets = inj.zip(token.as_ref()).map(|(inj, token)| policy::secrets(&inj.claim, token.expose()));
+        let fields = inj.and_then(|inj| {
             inj.claim.rewrite.iter().find(|r| route::is(&r.route, &head.method, &path)).map(|r| r.fields.clone())
         });
         line.status = resp.status;
@@ -285,6 +341,114 @@ impl Service {
         let result = respond.write(resp, w, line);
         self.audit.write(line);
         result
+    }
+
+    /// A call that couldn't be made, answered as `UpstreamError::status`
+    /// says (400 for a bad request body).
+    fn failed(
+        &self,
+        w: &mut UnixStream,
+        upstream_host: &str,
+        e: &io::Error,
+        cx: &Context,
+        keep: bool,
+        line: &mut Line,
+    ) -> io::Result<bool> {
+        let status = super::refusal(e)
+            .map(|h| h.status())
+            .or_else(|| upstream::upstream_error(e).map(|u| u.status()))
+            .unwrap_or(502);
+        let r = Refusal::new(status, "error", format!("calling `{upstream_host}`: {e}"));
+        self.refuse(w, &r, cx.shape.as_ref(), !keep, line)?;
+        Ok(keep)
+    }
+
+    /// An injected call's 401 that stays one: never passed on (the tool
+    /// would start its own login), a refusal naming `devsandbox login`. The
+    /// broker calls the claim's `check` route itself, and only a 401 there
+    /// marks the credential broken: the tool shaped every byte of the call
+    /// but the slot.
+    #[allow(clippy::too_many_arguments)]
+    fn unauthorized(
+        &self,
+        w: &mut UnixStream,
+        to: &Target,
+        inj: &Injection,
+        token: &crate::credentials::store::Secret,
+        why: String,
+        cx: &Context,
+        keep: bool,
+        line: &mut Line,
+    ) -> io::Result<bool> {
+        if let Some(route) = to.check_401(inj, token.expose()) {
+            let reason = format!("its `check` route `{route}` answered 401");
+            self.renewer.mark_broken(&inj.credential, reason, Instance::now());
+        }
+        let r = Refusal {
+            credential: Some(inj.credential.clone()),
+            scope: cx.scope.clone(),
+            ..Refusal::refused(why).todo(format!("devsandbox login {}", inj.credential))
+        };
+        self.refuse(w, &r, cx.shape.as_ref(), !keep, line)?;
+        Ok(keep)
+    }
+}
+
+/// Where one request goes: the upstream client, the authority dialed.
+struct Target<'a> {
+    upstream: &'a Upstream,
+    authority: &'a str,
+    head: &'a RequestHead,
+}
+
+impl Target<'_> {
+    /// The tool's request with `token` in the slot: the body `held`, else
+    /// streamed from `body`. Also the path as sent.
+    fn send(
+        &self,
+        inject: Option<(&Injection, &str)>,
+        held: Option<&[u8]>,
+        body: &mut dyn Read,
+    ) -> (io::Result<Response>, String) {
+        let head = self.head;
+        let mut headers = upstream_headers(&head.headers);
+        let mut path = head.target.path().to_string();
+        if let Some((inj, token)) = inject {
+            policy::inject(&mut headers, &mut path, &inj.slot, token);
+        }
+        let url = format!("https://{}{path}", self.authority);
+        let mut held_body = held.unwrap_or_default();
+        let req_body = match (held, head.framing) {
+            (_, Framing::Empty) => Body::Empty,
+            (Some(b), _) => Body::Length(b.len() as u64, &mut held_body),
+            (None, Framing::Length(n)) => Body::Length(n, body),
+            (None, Framing::Chunked) => Body::Chunked(body),
+        };
+        let private = inject.is_some_and(|(i, _)| i.private);
+        let sent = self.upstream.send(Request { method: &head.method, url: &url, headers: &headers, body: req_body, private });
+        (sent, path)
+    }
+
+    /// Calls the claim's `check` route (a `GET` or `HEAD` with no sandbox
+    /// input) with `token`: the route when it answered 401.
+    fn check_401<'c>(&self, inj: &'c Injection, token: &str) -> Option<&'c claim::Route> {
+        let route = inj.claim.check.as_ref()?;
+        let claim::Route::Http { method, path } = route else { return None };
+        let mut path = path.clone();
+        let mut headers = Vec::new();
+        match &inj.slot {
+            Slot::Header { name, .. } => headers.push(Header { name: name.clone(), value: Vec::new() }),
+            Slot::Basic { .. } => headers.push(Header { name: "Authorization".into(), value: Vec::new() }),
+            Slot::Query { param } => {
+                path.push(if path.contains('?') { '&' } else { '?' });
+                path.push_str(param);
+                path.push('=');
+            }
+        }
+        policy::inject(&mut headers, &mut path, &inj.slot, token);
+        let url = format!("https://{}{path}", self.authority);
+        let req = Request { method: method.as_str(), url: &url, headers: &headers, body: Body::Empty, private: inj.private };
+        self.upstream.send(req).is_ok_and(|r| r.status == 401).then_some(route)
     }
 }
 
@@ -304,6 +468,22 @@ fn listener_shape(state: &State, caller: &Caller, header: &ProxyHeader) -> Optio
     let inst = state.instances.get(&caller.instance).filter(|i| i.instance_id == caller.instance_id)?;
     let (c, _) = instance::by_port(&inst.claims, *listener)?;
     claim::from_canonical(&c.claim).ok()?.1.refusal
+}
+
+fn failure_refusal(f: Failure, credential: &str, scope: Option<String>) -> Refusal {
+    let login = format!("devsandbox login {credential}");
+    let r = match f {
+        Failure::Missing => Refusal::refused(format!("no secret is stored for credential `{credential}`")).todo(login),
+        Failure::Store(why) => Refusal::new(503, "error", why),
+        Failure::Refused(why) => {
+            Refusal::refused(format!("renewing credential `{credential}`'s token was refused: {why}")).todo(login)
+        }
+        Failure::Unavailable(why) => Refusal {
+            retry_after: Some(RETRY_AFTER),
+            ..Refusal::new(503, "error", format!("cannot renew credential `{credential}`'s token: {why}"))
+        },
+    };
+    Refusal { credential: Some(credential.to_string()), scope, ..r }
 }
 
 /// The request's fields minus what the upstream client writes itself and

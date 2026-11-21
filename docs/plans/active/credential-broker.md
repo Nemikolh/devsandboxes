@@ -581,11 +581,14 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    Built: all of it but the `runArgs` refusal. Deferred, each a
    [status](../../status.md#credentials) limitation: a claim field marking
    token and registration endpoints, stripping token-shaped response
-   headers (only the injected value is masked), calling a claim's `check`
-   route after an upstream 401.
+   headers (only the injected value is masked).
 2. `devsandbox login`'s device flow and browser OAuth, `access ls|revoke`.
-   Built so far: both logins (`login --method`, `--client-id`), the
-   store's token record ([login](../../architecture/credentials/login.md)).
+   Built: both logins (`login --method`, `--client-id`), the store's
+   token record ([login](../../architecture/credentials/login.md)),
+   renewal behind the phantom with the 401 replay and the `check` route
+   marking a credential broken ([broker](../../architecture/credentials/broker.md)),
+   `access ls|revoke`. Approvers aren't notified of a broken credential
+   until step 4.
    No claim `scope` for them yet (GitHub Apps take none); one would join
    the pinned `login` entry and so the claim's version.
 3. The member CA (`rcgen` for leaves), intercept mode, trust installed

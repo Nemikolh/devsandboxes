@@ -18,7 +18,8 @@ use serde_json::Value;
 use super::*;
 use crate::broker::policy::tests::{FOREIGN, OWN, caller, home_with, sentry, state_with};
 use crate::broker::upstream::Timeouts;
-use crate::credentials::store::{Record, Secret};
+use crate::credentials::oauth::tests::{GITHUB_TOKEN, field, form, json, path};
+use crate::credentials::store::{Record, Secret, Store};
 
 const TOKEN: &str = "REALtoken-0123456789";
 
@@ -105,7 +106,8 @@ impl Rig {
         roots.add(CertificateDer::from_pem_file(fixture("ca.pem")).unwrap()).unwrap();
         let timeouts = Timeouts { connect: Duration::from_secs(5), idle: Duration::from_secs(10) };
         let upstream = Upstream::new(roots, None, timeouts).unwrap();
-        let mut service = Service::new(data.join("state.toml"), Ok(upstream)).unwrap();
+        let mut service =
+            Service::new(data.join("state.toml"), Ok(upstream)).unwrap().with_tokens(crate::credentials::oauth::tests::http());
         for u in &claim.pinned.upstreams {
             service = service.with_authority(&u.host, &format!("localhost:{upstream_port}"));
         }
@@ -114,6 +116,30 @@ impl Rig {
 
     fn port(&self, upstream: &str) -> u16 {
         self.state.instances["web-1"].claims[0].listeners.iter().find(|l| l.upstream == upstream).unwrap().port
+    }
+
+    /// `sentry-work` as an OAuth login: [`OLD`] with refresh token
+    /// `refresh`, renewed at `https://127.0.0.1:<port>/token`.
+    fn oauth(&self, refresh: &str, expires_at: u64, port: u16) {
+        let rec = OAuthToken {
+            access_token: Secret::new(OLD.into()),
+            refresh_token: Some(Secret::new(refresh.into())),
+            expires_at: Some(expires_at),
+            refresh_expires_at: None,
+            token_url: format!("https://127.0.0.1:{port}/token"),
+            client_id: "Iv1.c".into(),
+            scope: None,
+        };
+        Store::in_data(&self.dir.join("data")).put("sentry-work", &Record::OAuth(rec)).unwrap();
+    }
+
+    fn stored(&self) -> String {
+        let token = Store::in_data(&self.dir.join("data")).token_now("sentry-work").unwrap().unwrap();
+        token.expose().to_string()
+    }
+
+    fn broken(&self) -> Option<home::Broken> {
+        home::load(&home::path(&self.dir.join("data"))).unwrap()["sentry-work"].broken.clone()
     }
 
     fn config(&self, text: &str) {
@@ -380,16 +406,140 @@ fn config_edits_apply_to_the_next_call() {
     assert_eq!(c.call("GET", "/api/0/", &bearer(OWN), b"").status, 200);
 }
 
+const UNAUTHORIZED: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 2\r\n\r\nno";
+
 #[test]
 fn upstream_401_on_an_injected_call_is_a_login_refusal() {
-    let (port, _) = upstream_server(|_, _| {
-        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 2\r\n\r\nno".to_vec()
-    });
+    let (port, seen) = upstream_server(|_, _| UNAUTHORIZED.to_vec());
     let rig = Rig::new("401", port);
-    let a = rig.connect("sentry.io").call("GET", "/api/0/", &bearer(OWN), b"");
+    let a = rig.connect("sentry.io").call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
     assert_eq!(a.status, 403);
     assert!(!a.head.to_ascii_lowercase().contains("www-authenticate"), "{}", a.head);
     assert_eq!(a.json()["devsandbox"]["do"], "devsandbox login sentry-work");
+    // The broker's own call to the claim's `check` route got a 401 too.
+    let seen = seen.lock().unwrap();
+    assert!(seen[1].0.starts_with("GET /api/0/ HTTP/1.1\r\n"), "{}", seen[1].0);
+    assert!(seen[1].0.to_ascii_lowercase().contains(&format!("\r\nauthorization: bearer {}\r\n", TOKEN.to_ascii_lowercase())));
+    assert_eq!(rig.broken().unwrap().reason, "its `check` route `GET /api/0/` answered 401");
+    assert_eq!(rig.log(1).len(), 1, "the check leaves no line");
+}
+
+#[test]
+fn a_401_the_check_route_doesnt_repeat_marks_nothing() {
+    let (port, _) = upstream_server(|head, _| match path(head) {
+        "/api/0/" => json(200, "{}"),
+        _ => UNAUTHORIZED.to_vec(),
+    });
+    let rig = Rig::new("401-check-ok", port);
+    let a = rig.connect("sentry.io").call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
+    assert_eq!(a.status, 403);
+    assert_eq!(rig.broken(), None);
+}
+
+const OLD: &str = "OLDtoken-9876543210";
+
+/// The provider and the API on one server: `/token` renews `ghr_old` to
+/// GitHub's `ghu_live` and refuses any other refresh token; the API answers
+/// 401 to anything but `Bearer ghu_live`, else how many body bytes it got.
+fn renewing(head: &str, body: &[u8]) -> Vec<u8> {
+    if path(head) == "/token" {
+        return match field(&form(body), "refresh_token") {
+            Some("ghr_old") => json(200, GITHUB_TOKEN),
+            _ => json(400, r#"{"error":"invalid_grant"}"#),
+        };
+    }
+    // The broker's own `check` call sends the claim's lowercase field name.
+    if !head.to_ascii_lowercase().contains("\r\nauthorization: bearer ghu_live\r\n") {
+        return UNAUTHORIZED.to_vec();
+    }
+    let reply = format!("got {} bytes", body.len());
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).into_bytes()
+}
+
+fn no_tokens_in(log: &[Value]) {
+    let text = serde_json::to_string(log).unwrap();
+    assert!(!text.contains(OLD) && !text.contains("ghu_live") && !text.contains("ghr_"), "{text}");
+}
+
+const RELEASES: &str = "/api/0/organizations/acme/releases/";
+
+#[test]
+fn a_401_renews_and_replays_a_held_body() {
+    let (port, seen) = upstream_server(renewing);
+    let rig = Rig::new("replay", port);
+    rig.oauth("ghr_old", Instance::now() + 86_400, port);
+    let mut c = rig.connect("sentry.io");
+    let a = c.call("POST", RELEASES, &bearer(OWN), br#"{"version":"1"}"#);
+    assert_eq!((a.status, a.body.as_slice()), (200, &b"got 15 bytes"[..]), "{a:?}");
+    {
+        let seen = seen.lock().unwrap();
+        let paths: Vec<&str> = seen.iter().map(|(h, _)| path(h)).collect();
+        assert_eq!(paths, [RELEASES, "/token", RELEASES]);
+        assert!(seen[0].0.contains(&format!("Bearer {OLD}\r\n")), "{}", seen[0].0);
+        assert_eq!(seen[0].1, seen[2].1, "the same body, replayed");
+    }
+    assert_eq!(rig.stored(), "ghu_live");
+
+    // The renewed token serves the next call as is.
+    assert_eq!(c.call("GET", "/api/0/", &bearer(OWN), b"").status, 200);
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    let log = rig.log(2);
+    no_tokens_in(&log);
+    assert_eq!((log[0]["refreshed"].as_bool(), log[0]["status"].as_u64()), (Some(true), Some(200)));
+    assert!(log[1].get("refreshed").is_none(), "{}", log[1]);
+}
+
+#[test]
+fn a_streamed_body_past_the_bound_isnt_replayed() {
+    let (port, seen) = upstream_server(renewing);
+    let rig = Rig::new("no-replay", port);
+    rig.oauth("ghr_old", Instance::now() + 86_400, port);
+    let body = vec![b'x'; MAX_REPLAY as usize + 1];
+    let a = rig.connect("sentry.io").call("POST", RELEASES, &bearer(OWN), &body);
+    assert_eq!(a.status, 403, "{a:?}");
+    let v = a.json();
+    assert!(v["detail"].as_str().unwrap().contains("streamed past 1048576 bytes"), "{v}");
+    assert_eq!(v["devsandbox"]["do"], "devsandbox login sentry-work");
+    let paths: Vec<String> = seen.lock().unwrap().iter().map(|(h, _)| path(h).to_string()).collect();
+    assert_eq!(paths, [RELEASES, "/token", "/api/0/"], "renewed and checked, not replayed");
+    assert_eq!(rig.stored(), "ghu_live");
+    assert_eq!(rig.broken(), None, "the check passed with the renewed token");
+    assert_eq!(rig.log(1)[0]["refreshed"], true);
+}
+
+#[test]
+fn renewed_ahead_of_expiry() {
+    let (port, seen) = upstream_server(renewing);
+    let rig = Rig::new("ahead", port);
+    rig.oauth("ghr_old", Instance::now() + 60, port);
+    let a = rig.connect("sentry.io").call("GET", "/api/0/", &bearer(OWN), b"");
+    assert_eq!(a.status, 200, "{a:?}");
+    let paths: Vec<String> = seen.lock().unwrap().iter().map(|(h, _)| path(h).to_string()).collect();
+    assert_eq!(paths, ["/token", "/api/0/"]);
+    let log = rig.log(1);
+    no_tokens_in(&log);
+    assert_eq!(log[0]["refreshed"], true);
+}
+
+#[test]
+fn a_refused_renewal_is_a_login_refusal_and_an_unreachable_one_a_503() {
+    let (port, _) = upstream_server(renewing);
+    let rig = Rig::new("renew-fail", port);
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    rig.oauth("ghr_old", Instance::now(), closed);
+    let a = rig.connect("sentry.io").call("GET", "/api/0/", &bearer(OWN), b"");
+    assert_eq!((a.status, a.header("retry-after")), (503, Some("30")), "{a:?}");
+    assert!(a.json()["detail"].as_str().unwrap().contains("cannot renew credential `sentry-work`'s token"));
+    assert_eq!(rig.broken(), None);
+
+    rig.oauth("ghr_dead", Instance::now(), port);
+    let a = rig.connect("sentry.io").call("GET", "/api/0/", &bearer(OWN), b"");
+    assert_eq!(a.status, 403, "{a:?}");
+    let v = a.json();
+    assert!(v["detail"].as_str().unwrap().contains("was refused: invalid_grant"), "{v}");
+    assert_eq!(v["devsandbox"]["do"], "devsandbox login sentry-work");
+    assert_eq!(rig.broken().unwrap().reason, "its refresh was refused: invalid_grant");
+    assert_eq!(rig.stored(), OLD);
 }
 
 #[test]

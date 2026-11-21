@@ -179,6 +179,7 @@ fn bad_response(e: io::Error, what: &str) -> io::Error {
 }
 
 /// Built once and shared: holds no connection.
+#[derive(Clone)]
 pub struct Upstream {
     tls: Arc<ClientConfig>,
     proxy: Option<Proxy>,

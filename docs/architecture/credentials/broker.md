@@ -20,7 +20,10 @@ Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
 `Line`), `src/broker/head.rs`, `src/broker/body.rs`, `src/broker/guard.rs`,
 `src/broker/redact.rs`, `src/broker/upstream/` (`Upstream`),
 `src/serve/host.rs` (`poll`, where the broker is built),
-`src/credentials/claim.rs` (`from_canonical`).
+`src/credentials/claim.rs` (`from_canonical`),
+`src/credentials/oauth/refresh.rs` (`Renewer`, `refresh`, `due`,
+`MARGIN`, `RECENT`), `src/credentials/home.rs` (`Broken`,
+`mark_broken`).
 
 ## Where connections come from
 
@@ -122,15 +125,18 @@ refusal shape (the approved copy's once read, else the instance's).
 upstream client writes itself (`upstream::RESERVED`: `Host`, framing,
 `Accept-Encoding`, `Connection`, hop-by-hop, `Expect`) and those the
 request's `Connection` names. An injected call gets the secret from the
-file store (`Store::token_now`, read per call: an OAuth record's access
-token as stored; none stored names `devsandbox login`) and
-`policy::inject` writes it into the chosen slot only: the header as its
+file store (`Renewer::token`, read per call: the static token, or an
+OAuth record's access token, renewed first when due ([Renewal](#renewal));
+none stored names `devsandbox login`) and `policy::inject` writes it into
+the chosen slot only: the header as its
 `format` with the token, `Basic` with the slot's username, or the query
 parameter percent-encoded. The address check lets private ranges through
 only for an injected call whose approved upstream is `private`. The body
 streams from the tool to the upstream as it arrives (`BodyReader` into
-`upstream::Body`, its length or chunked as sent). One upstream connection
-per request.
+`upstream::Body`, its length or chunked as sent), except a renewable
+call's (below), which is read whole first when it has a length up to
+`MAX_REPLAY` (1 MiB), so a 401 can replay it. One upstream connection per
+request.
 
 The answer (`Respond::write`): status and fields as received, minus
 hop-by-hop ones and those the response's `Connection` names (and
@@ -157,11 +163,63 @@ what makes sentry-cli's chunk uploads (`GET …/chunk-upload/` answering an
 absolute region URL) and its regions list come back through the broker.
 
 An upstream `401` to an injected call never reaches the tool, which would
-start its own login: the credential is static, so the broker answers its
-own `403` naming `devsandbox login <credential>`. A `401` to an
-uninjected call passes through. A failed call is answered with the
-status `UpstreamError::status` gives (`403` for a refused address, `502`
-otherwise, `400` for a malformed request body), refusal-shaped.
+start its own login. A renewable token not renewed for this call is
+renewed (`Renewer::after_401`) and the call replayed with the new one
+when its body was held; a body that streamed (chunked, or past
+`MAX_REPLAY`) can't be, so the tool gets the broker's `403` saying to send
+it again (the token renewed meanwhile). A `401` on a static token, one
+just renewed, or the replay is the broker's `403` naming `devsandbox login
+<credential>` (`Service::unauthorized`). Before answering it, the broker
+calls the claim's `check` route on the same upstream with the token
+(`Target::check_401`: a `GET` or `HEAD` with no sandbox input, the slot
+filled, no `access.log` line); only a `401` there marks the credential
+broken, as the tool shaped every byte of its own call but the slot. A
+`401` to an uninjected call passes through. A failed call is answered
+with the status `UpstreamError::status` gives (`403` for a refused
+address, `502` otherwise, `400` for a malformed request body),
+refusal-shaped.
+
+## Renewal
+
+An OAuth record with a refresh token is renewable: `Renewer` (one per
+`Service`, shared by every connection thread) renews it behind the
+phantom with RFC 6749 §6's `refresh_token` grant (`refresh`: `grant_type`,
+`refresh_token` and `client_id` posted to the record's `token_url` over
+`oauth::Http`, the public-address check on), so the tool never sees the
+token change:
+
+- **Ahead of expiry** (`Renewer::token`): within `MARGIN` (10 minutes,
+  longer than the upstream client's 5-minute idle bound, so no call
+  outlives its token) of `expires_at`. A record not due is read without a
+  lock.
+- **After a 401** (`Renewer::after_401`), unless this process renewed it
+  within `RECENT` (60 s): then the token is new and the 401 is about
+  something else. If the stored token is no longer the one that got the
+  401 (another call or a login replaced it), that one is replayed with no
+  refresh.
+
+One refresh at a time per credential: a per-name mutex in the process,
+then the store's file lock (`Store::renew`) held across the call, so a
+concurrent `login` or a second daemon in a handoff waits instead of
+spending a refresh token GitHub rotates. Under both, the record is re-read
+and renewed only if still wanted. The new record (`refresh::renewed`)
+replaces the old in one atomic write: the new access token and expiry,
+and the new refresh token with its expiry, or the old ones when the
+provider sent none.
+
+A renewal that fails answers the call:
+
+| failure | answer | broken |
+|---|---|---|
+| the provider refused (`invalid_grant`, any error but the transient ones) | `403` naming `devsandbox login <credential>` | yes |
+| unreachable, `temporarily_unavailable`, `server_error`, `slow_down`, a reply that isn't a token | `503` with `Retry-After: 30` | no |
+| the store can't be read or written | `503` | yes |
+
+`credentials.toml`'s entry carries the mark (`Entry::broken`: `at`, RFC
+3339 UTC, and a one-line `reason`), set by `home::mark_broken` only if
+unset, so the first reason stays; a successful renewal
+(`home::clear_broken`) or a `login` clears it. It refuses no call: it
+is for `access ls`.
 
 ## Refusals
 
@@ -182,7 +240,8 @@ take it past 10 MiB (`MAX_BYTES`). Fields: `time` (RFC 3339 UTC),
 `instance`, `instance_id`, `incarnation`, `kind`, `credential`, `method`,
 `route` (the path before injection, query dropped), `scope`, `verdict`
 (`allow`, `uninjected`, `refused`, `leak`, `error`), `reason`, `status`,
-`phantom` (`own`, `other-claim`, `foreign`). Never a token or a phantom.
+`phantom` (`own`, `other-claim`, `foreign`), and `refreshed: true` when
+the call renewed the token. Never a token or a phantom.
 Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog).
 
 ## End to end

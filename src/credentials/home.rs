@@ -57,6 +57,22 @@ pub struct Entry {
     pub approved: Vec<Version>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<Version>,
+    /// Set by the broker ([`mark_broken`]), cleared by a login or a
+    /// successful refresh. Refuses no call: it's for `access ls` (and, at
+    /// credential-broker step 4, the approvers' notice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broken: Option<Broken>,
+}
+
+/// Why the broker stopped trusting the secret: a refused refresh, an
+/// unreadable store, or a 401 on the claim's `check` route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Broken {
+    /// RFC 3339, UTC: when it was first marked.
+    pub at: String,
+    /// One line.
+    pub reason: String,
 }
 
 impl Entry {
@@ -72,6 +88,7 @@ impl Entry {
             as_: Vec::new(),
             approved: Vec::new(),
             pending: Vec::new(),
+            broken: None,
         }
     }
 
@@ -274,6 +291,28 @@ pub fn update<T>(path: &Path, f: impl FnOnce(&mut Home) -> Result<T>) -> Result<
     })?
 }
 
+/// Marks `name` broken unless it already is (the first reason stays until a
+/// login). No such credential: nothing.
+pub fn mark_broken(path: &Path, name: &str, broken: Broken) -> Result<()> {
+    update(path, |h| {
+        if let Some(e) = h.get_mut(name)
+            && e.broken.is_none()
+        {
+            e.broken = Some(broken);
+        }
+        Ok(())
+    })
+}
+
+pub fn clear_broken(path: &Path, name: &str) -> Result<()> {
+    update(path, |h| {
+        if let Some(e) = h.get_mut(name) {
+            e.broken = None;
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -374,6 +413,24 @@ pub(crate) mod tests {
         both.get_mut("sentry-oss").unwrap().profiles = None;
         let err = resolve(&both, "sentry", None, Some("work")).unwrap_err().to_string();
         assert!(err.contains("`sentry-oss`, `sentry-work`") && err.contains("access.sentry.credential"), "{err}");
+    }
+
+    #[test]
+    fn broken_is_marked_once_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("dsv-cred-home-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = path(&dir);
+        update(&p, |h| Ok(h.insert("s".into(), Entry::new("sentry", None)))).unwrap();
+        let broken = |reason: &str| Broken { at: "2026-11-21T10:00:00Z".into(), reason: reason.into() };
+        mark_broken(&p, "s", broken("refused")).unwrap();
+        mark_broken(&p, "s", broken("later")).unwrap();
+        mark_broken(&p, "nope", broken("x")).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[s.broken]\nat = \"2026-11-21T10:00:00Z\"\nreason = \"refused\"\n"), "{text}");
+        assert_eq!(load(&p).unwrap()["s"].broken, Some(broken("refused")));
+        clear_broken(&p, "s").unwrap();
+        assert_eq!(load(&p).unwrap()["s"].broken, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

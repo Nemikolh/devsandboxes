@@ -19,11 +19,13 @@ pub struct Refusal {
     pub scope: Option<String>,
     /// What would let the call through (`devsandbox login sentry`).
     pub todo: Option<String>,
+    /// Seconds, sent as `Retry-After`.
+    pub retry_after: Option<u16>,
 }
 
 impl Refusal {
     pub fn new(status: u16, verdict: &'static str, reason: impl Into<String>) -> Refusal {
-        Refusal { status, verdict, reason: reason.into(), credential: None, scope: None, todo: None }
+        Refusal { status, verdict, reason: reason.into(), credential: None, scope: None, todo: None, retry_after: None }
     }
 
     pub fn refused(reason: impl Into<String>) -> Refusal {
@@ -85,6 +87,9 @@ impl Refusal {
             body.len()
         )
         .into_bytes();
+        if let Some(s) = self.retry_after {
+            out.extend_from_slice(format!("Retry-After: {s}\r\n").as_bytes());
+        }
         if close {
             out.extend_from_slice(b"Connection: close\r\n");
         }

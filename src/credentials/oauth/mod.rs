@@ -11,6 +11,7 @@
 
 pub mod browser;
 pub mod device;
+pub mod refresh;
 
 use std::io::Read;
 use std::time::{Duration, Instant};
@@ -187,7 +188,11 @@ pub struct Http {
 
 impl Http {
     pub fn from_host() -> Result<Http> {
-        Ok(Http { upstream: Upstream::from_host()?, private: false })
+        Ok(Http::new(Upstream::from_host()?))
+    }
+
+    pub fn new(upstream: Upstream) -> Http {
+        Http { upstream, private: false }
     }
 
     /// Loopback let through, for a test server.

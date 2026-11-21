@@ -15,7 +15,7 @@ Code: `src/credentials/oauth/mod.rs` (`Http`, `parse_token_reply`,
 `random`), `src/credentials/oauth/device.rs` (`login`,
 `parse_authorization`, `Poller`, `poll`), `src/credentials/oauth/browser.rs`
 (`login`, `authorize_url`, `callback`, `TIMEOUT`),
-`src/credentials/store.rs` (`Record`, `OAuthToken`, `Store::token_now`),
+`src/credentials/store.rs` (`Record`, `OAuthToken`, `Store::renew`),
 `src/commands/login.rs` (`obtain`, `Flows`).
 
 ## The endpoints
@@ -74,5 +74,7 @@ Either flow ends in an `OAuthToken` (`TokenSet::into_record`): the
 tokens, `expires_at` and `refresh_expires_at` made absolute in unix
 seconds, the scope granted, and what a refresh needs: `token_url` and the
 `client_id` used (the claim's, or `--client-id`'s). `login` stores it as
-`Record::OAuth`, replacing the credential's record whole. The broker reads
-`Store::token_now` per injected call: the access token as stored.
+`Record::OAuth`, replacing the credential's record whole, and clears the
+entry's `broken` mark. The broker renews the token with the refresh token
+ahead of expiry and after a 401, storing a rotated refresh token with it
+([broker](broker.md#renewal), `oauth::refresh`).

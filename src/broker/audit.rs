@@ -33,6 +33,9 @@ pub struct Line {
     pub status: u16,
     /// `own`, `other-claim`, `foreign`: whose phantom the call carried.
     pub phantom: Option<&'static str>,
+    /// The credential's token was renewed for this call; omitted when not.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refreshed: bool,
 }
 
 pub struct Audit {

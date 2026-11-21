@@ -337,6 +337,7 @@ pub(crate) fn login_at(
         if entry.kind != kind {
             bail!("credential `{name}` is a `{}` credential, not `{kind}`", entry.kind);
         }
+        entry.broken = None;
         Ok(approving.cloned().map(|c| entry.approve(c)).unwrap_or(false))
     })?;
     Ok(match (approved, approving) {
@@ -493,7 +494,9 @@ pub(crate) mod tests {
         let done = login_at(&data, &args("sentry-work"), Some(vec![sentry()]), &mut term).unwrap();
         assert!(done.ends_with("secret replaced"), "{done}");
         assert!(term.shown.is_empty());
-        // And without one.
+        // And without one, which clears a broken mark.
+        let at = home::Broken { at: "2026-11-21T10:00:00Z".into(), reason: "refused".into() };
+        home::mark_broken(&home::path(&data), "sentry-work", at).unwrap();
         let mut term = Script::new(false, &[], Some("tok-3"));
         login_at(&data, &args("sentry-work"), None, &mut term).unwrap();
         assert_eq!(Store::in_data(&data).token_now("sentry-work").unwrap().unwrap().expose(), "tok-3");
