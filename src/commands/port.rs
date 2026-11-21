@@ -378,6 +378,9 @@ pub fn resolver_in(
             match planned {
                 Planned::Instance { key, container } => {
                     let info = state.instances.get(&key).ok_or_else(|| format!("no sandbox instance `{key}`"))?;
+                    if let Some(why) = crate::credentials::instance::forward_refusal(&info.claims, &key, port) {
+                        return Err(why);
+                    }
                     match crate::devsbd::ensure_recorded(&key, info, true) {
                         Some(arch) => {
                             return Ok(crate::devsbd::forward::Route {
@@ -837,6 +840,8 @@ image = "node"
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
             done: None,
+            incarnation: None,
+            claims: Vec::new(),
             progress: None,
             created_unix: 0,
         }

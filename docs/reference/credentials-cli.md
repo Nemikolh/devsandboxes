@@ -118,7 +118,13 @@ the broker enforces. At load (`Entry::check`, `Version::check`) every
 version is re-hashed and must match its `version`, and its claim's kind
 must be the entry's: a hand edit to a claim can't approve content nobody
 was shown. `record_pending` takes canonical JSON (re-hashed here) for an
-existing credential, and skips a version already approved or pending.
+existing credential, and skips a version already approved or pending;
+`run` calls it for a claim whose credential hasn't approved its version,
+then refuses
+([images and features](../architecture/instances/images-and-features.md#credential-claims)).
+`home::resolve` picks the credential a claim takes: the one
+`access.<kind>.credential` names, else the one of that kind whose
+`profiles` grant the instance's profile.
 
 ## The file store
 

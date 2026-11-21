@@ -154,7 +154,6 @@ impl Version {
     }
 
     /// From canonical JSON a host sent, re-hashed here.
-    #[cfg_attr(not(test), allow(dead_code))] // `run`'s pending record, next step
     pub fn from_canonical(claim: &str) -> Version {
         Version { version: hash(claim), claim: claim.to_string() }
     }
@@ -187,7 +186,6 @@ fn hash(canonical: &str) -> String {
 
 /// Records `claim` (canonical) as pending for the credential `name`, unless
 /// already approved or pending. Whether it was new.
-#[cfg_attr(not(test), allow(dead_code))] // called by `run`, next step
 pub fn record_pending(home: &mut Home, name: &str, claim: &str) -> Result<bool> {
     let entry = home.get_mut(name).with_context(|| format!("no credential `{name}`"))?;
     let version = Version::from_canonical(claim);
@@ -197,6 +195,44 @@ pub fn record_pending(home: &mut Home, name: &str, claim: &str) -> Result<bool> 
     }
     entry.pending.push(version);
     Ok(true)
+}
+
+/// The credential an instance in `profile` takes for claim kind `kind`: the
+/// one its config's `access.<kind>.credential` names (`named`), else the one
+/// of that kind granted to `profile` (an entry without `profiles` is granted
+/// to every profile, and to an instance without one). `Ok(None)`: none here.
+/// Resolved per use, never kept: profiles and configs change.
+pub fn resolve<'a>(
+    home: &'a Home,
+    kind: &str,
+    named: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Option<(&'a str, &'a Entry)>> {
+    if let Some(name) = named {
+        return match home.get_key_value(name) {
+            None => Ok(None),
+            Some((_, e)) if e.kind != kind => {
+                bail!("`access.{kind}.credential` names `{name}`, a `{}` credential", e.kind)
+            }
+            Some((n, e)) => Ok(Some((n.as_str(), e))),
+        };
+    }
+    let granted = |e: &Entry| match &e.profiles {
+        None => true,
+        Some(list) => profile.is_some_and(|p| list.iter().any(|l| l == p)),
+    };
+    let found: Vec<(&String, &Entry)> = home.iter().filter(|(_, e)| e.kind == kind && granted(e)).collect();
+    match found[..] {
+        [] => Ok(None),
+        [(n, e)] => Ok(Some((n.as_str(), e))),
+        _ => {
+            let names: Vec<String> = found.iter().map(|(n, _)| format!("`{n}`")).collect();
+            bail!(
+                "credentials {} are all `{kind}` credentials granted here: name one in `access.{kind}.credential`",
+                names.join(", ")
+            )
+        }
+    }
 }
 
 /// `<data>/credentials.toml`.
@@ -313,6 +349,31 @@ pub(crate) mod tests {
         assert!(entry.approve(v));
         assert!(entry.pending.is_empty());
         assert!(!record_pending(&mut home, "s", &canonical).unwrap(), "already approved");
+    }
+
+    #[test]
+    fn resolve_takes_the_named_entry_else_the_one_granted() {
+        let mut work = Entry::new("sentry", Some(vec!["work".into()]));
+        work.approve(Version::of(&sentry()));
+        let home = Home::from([
+            ("sentry-work".to_string(), work),
+            ("sentry-oss".to_string(), Entry::new("sentry", Some(vec!["oss".into()]))),
+            ("gh".to_string(), Entry::new("github", None)),
+        ]);
+        let name = |r: Result<Option<(&str, &Entry)>>| r.unwrap().map(|(n, _)| n.to_string());
+        assert_eq!(name(resolve(&home, "sentry", None, Some("work"))), Some("sentry-work".into()));
+        assert_eq!(name(resolve(&home, "sentry", None, Some("home"))), None);
+        assert_eq!(name(resolve(&home, "sentry", None, None)), None);
+        assert_eq!(name(resolve(&home, "github", None, None)), Some("gh".into()));
+        assert_eq!(name(resolve(&home, "sentry", Some("sentry-oss"), Some("work"))), Some("sentry-oss".into()));
+        assert_eq!(name(resolve(&home, "sentry", Some("nope"), None)), None);
+        let err = resolve(&home, "sentry", Some("gh"), None).unwrap_err().to_string();
+        assert!(err.contains("a `github` credential"), "{err}");
+
+        let mut both = home.clone();
+        both.get_mut("sentry-oss").unwrap().profiles = None;
+        let err = resolve(&both, "sentry", None, Some("work")).unwrap_err().to_string();
+        assert!(err.contains("`sentry-oss`, `sentry-work`") && err.contains("access.sentry.credential"), "{err}");
     }
 
     #[test]

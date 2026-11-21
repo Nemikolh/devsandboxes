@@ -4,6 +4,7 @@
 pub mod claim;
 #[cfg(unix)]
 pub mod home;
+pub mod instance;
 pub mod review;
 #[cfg(unix)]
 pub mod store;

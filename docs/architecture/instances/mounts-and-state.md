@@ -108,8 +108,11 @@ globally unique `instance_id` (containers); see [services](services.md).
 - `write_vscode_name_config`: the Remote-Containers `nameConfigs/<container>.json`
   for each installed product (`Code`, `Cursor`, `VSCodium`) with
   `customizations.vscode.extensions` and `remoteUser` (the instance's
-  recorded exec user, `Instance::remote_user`: [identity](identity.md));
-  written by `run` when either is set and by every `vscode` launch.
+  recorded exec user, `Instance::remote_user`: [identity](identity.md)),
+  and `portsAttributes."<port>".onAutoForward = "ignore"` for each
+  credential broker listener (`credentials::instance::ports`; other
+  attributes kept), so VS Code never forwards one; written by `run` when
+  any of these is set and by every `vscode` launch.
 - `vscode::launch`: `code --file-uri` (or `--folder-uri` without a workspace
   file) on `vscode-remote://attached-container+<hex(name)>/…`; on Apple
   `container`, `apple-container+<hex({id, image})>`, which needs VS Code's

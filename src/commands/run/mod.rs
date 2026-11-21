@@ -14,6 +14,7 @@ use super::{container_drifted, pick, services};
 
 pub(crate) mod cancel;
 pub(crate) mod cgroup;
+mod claims;
 mod editor;
 mod facts;
 mod folders;
@@ -268,6 +269,8 @@ pub fn run(
         extra_env: effective_extra_env(&extras.env, None),
         forwarded_ports: Default::default(),
         done: None,
+        incarnation: None,
+        claims: Vec::new(),
         progress: None,
         created_unix: Instance::now(),
     };
@@ -824,6 +827,18 @@ pub(crate) fn materialize(
     // Who the container runs as (docs/architecture/instances/identity.md).
     let (plan, seccomp) = identity::plan_for(&image, facts::accounts(props, &facts), props, extras.reprobe, privileged);
     let root_plan = tool_env::root_plan(plan.exec_user.as_deref());
+    let owner = plan.exec_user.as_deref().or(plan.create_user.as_deref()).or(facts.user.as_deref()).unwrap_or("root");
+    let wired = claims::wire(
+        dir,
+        props,
+        profile.as_deref(),
+        state.instances.get(instance),
+        feature.claims,
+        &facts::home(props, &facts),
+        owner,
+        &claims::mount_targets(&workspace, &extra_mounts, &mounts),
+    )?;
+    extra_env.extend(wired.env.iter().cloned());
     tracker.enter(Phase::Creating)?;
     run_container(
         dir,
@@ -851,7 +866,8 @@ pub(crate) fn materialize(
     // Before lifecycle commands, so they could already rely on the helper. In
     // relay-first mode a failure means no ssh-agent forwarding at all (no mount
     // fallback), so word the note that way; otherwise the plain install note.
-    let (devsbd_arch, devsbd_error) = match crate::devsbd::ensure_or_reason(&container, None) {
+    let broker = crate::credentials::instance::broker_spec(&wired.claims);
+    let (devsbd_arch, devsbd_error) = match crate::devsbd::prepare(&container, None, broker.as_ref()) {
         Ok(arch) => (Some(arch), None),
         Err(reason) => {
             if relay_first {
@@ -879,6 +895,11 @@ pub(crate) fn materialize(
                 plan.account.as_deref().unwrap_or_default()
             );
         }
+    }
+    // After the fit: the daemon writes the phantom files as their owner.
+    if devsbd_arch.is_some() {
+        crate::devsbd::start_daemon(&container);
+        claims::warn_foreign_files(&container, &wired.claims);
     }
     // Whether the browser sandbox can work here, checked as the exec user in
     // the real container (its seccomp, user, AppArmor); the knobs follow.
@@ -943,6 +964,8 @@ pub(crate) fn materialize(
         config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
         extra_env: run_env,
         forwarded_ports,
+        incarnation: Some(wired.incarnation),
+        claims: wired.claims,
         done,
         // Still in flight: the lifecycle chain runs after this save.
         progress: Some(tracker.progress()),
@@ -959,8 +982,10 @@ pub(crate) fn materialize(
     // Every exec below runs as the plan's user, recorded on the instance.
     let exec_user = plan.exec_user.as_deref();
     let extensions = props.vscode_extensions().unwrap_or(&[]);
-    if !extensions.is_empty() || exec_user.is_some() {
-        write_vscode_name_config(&container, Some(extensions), exec_user)?;
+    let broker_ports: Vec<u16> =
+        state.instances.get(instance).map(|i| crate::credentials::instance::ports(&i.claims).collect()).unwrap_or_default();
+    if !extensions.is_empty() || exec_user.is_some() || !broker_ports.is_empty() {
+        write_vscode_name_config(&container, Some(extensions), exec_user, &broker_ports)?;
     }
 
     // ssh-agent for the lifecycle chain. The instance was just saved, so read
@@ -1374,6 +1399,8 @@ mod tests {
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
             done: None,
+            incarnation: None,
+            claims: Vec::new(),
             progress: None,
             created_unix: 0,
         }
@@ -2077,6 +2104,71 @@ mod tests {
         renamed.instances.insert("other".into(), instance("repo"));
         assert!(claim_name(&renamed, "repo", "repo").is_err());
         claim_name(&renamed, "repo", "repo-1").unwrap();
+    }
+
+    /// A feature's credential claim wires the instance: the phantom and the
+    /// base URL on the env, the phantom file in the remote user's home, and
+    /// devsbd listening on the broker port (answering 503 here: no broker
+    /// behind its bridge). No credential in this data dir: wired anyway.
+    #[cfg(unix)]
+    #[test_utils::docker_test(helper)]
+    fn claims_wire_env_files_and_listeners_with_docker() -> Result<(), String> {
+        isolated("claims_child")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claims_child() {
+        let Some(root) = isolated_root("claims_child") else { return };
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let feature = cfg.join("features/sentry");
+        std::fs::create_dir_all(&feature).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/sentry");
+        for file in ["devcontainer-feature.json", "install.sh"] {
+            std::fs::copy(fixture.join(file), feature.join(file)).unwrap();
+        }
+        // Unique per run: container and image names are global to the runtime.
+        let name = format!("claims-{}", std::process::id());
+        std::fs::write(cfg.join("Dockerfile"), "FROM alpine:3.20\nRUN adduser -D -u 1000 dev\n").unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!(
+                "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+                 features = {{ \"./features/sentry\" = {{}} }}\n"
+            ),
+        )
+        .unwrap();
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = image::sandbox_image(&project, &name);
+        let features_image = image::features_image(&project, &name);
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().output_quiet(&["rmi", "-f", &features_image, &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            assert!(info.incarnation.is_some());
+            let [claim] = &info.claims[..] else { panic!("one claim: {:?}", info.claims) };
+            assert!(claim.phantom.starts_with("sntrys_"), "{}", claim.phantom);
+            let port = claim.listeners.iter().find(|l| l.upstream == "sentry.io").expect("sentry.io listener").port;
+            let probe = format!(
+                "echo \"$SENTRY_AUTH_TOKEN|$SENTRY_URL\"; \
+                 for i in $(seq 50); do r=$(printf 'GET / HTTP/1.1\\r\\nHost: 127.0.0.1:{port}\\r\\n\\r\\n' \
+                 | nc 127.0.0.1 {port} 2>/dev/null | head -n1); [ -n \"$r\" ] && break; sleep 0.1; done; echo \"$r\"; \
+                 cat \"$HOME/.sentryclirc\""
+            );
+            let argv = crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), probe], false);
+            let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines[0], format!("{}|http://127.0.0.1:{port}", claim.phantom), "{out}");
+            assert!(lines[1].starts_with("HTTP/1.1 503"), "{out}");
+            assert!(out.contains(&format!("url = http://127.0.0.1:{port}\n")), "{out}");
+            assert!(out.contains(&format!("token = {}", claim.phantom)), "{out}");
+        });
     }
 
     #[test]

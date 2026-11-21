@@ -93,7 +93,11 @@ streams and everything else as usual.
 The credential broker's container side. The host writes the broker file
 (`brokerfile::PATH`, `src/devsbd/brokerfile.rs`: `listen` and `file`
 lines, plus the container's own proxy env as `proxy` lines) with
-`devsbd::sync_broker`, atomically; every daemon start reads it
+`devsbd::sync_broker`, atomically, from the instance's claims
+(`credentials::instance::broker_spec`): at `run` between the install and
+the daemon's first start (`devsbd::prepare`), and before every daemon
+start `devsbd::ensure_recorded` makes (`start`, a bridge's heal, a
+forward's resolve); every daemon start reads it
 (`broker::start`), so a daemon already running keeps what it read. No
 file: nothing to do. A file that doesn't parse is logged and ignored.
 

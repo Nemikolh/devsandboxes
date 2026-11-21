@@ -263,6 +263,8 @@ mod tests {
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
             done: None,
+            incarnation: None,
+            claims: Vec::new(),
             progress: None,
             created_unix: 0,
         }

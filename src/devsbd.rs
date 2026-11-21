@@ -271,7 +271,6 @@ pub fn sync_boot(container: &str, spec: Option<&bootfile::BootSpec>, quiet: bool
 /// `None`. A daemon reads it when it starts, so call this before
 /// [`start_daemon`] (a daemon already running keeps what it read). `Err` is
 /// the runtime's failure, for the caller's note.
-#[allow(dead_code)] // `run`'s credential wiring (credential-broker rollout 1)
 pub fn sync_broker(container: &str, spec: Option<&brokerfile::BrokerSpec>) -> Result<(), String> {
     let result = match spec {
         Some(spec) => {
@@ -349,7 +348,7 @@ pub fn install(container: &str, recorded: Option<Arch>) -> Result<Arch, String> 
 /// Start `devsbd daemon` detached. Idempotent: a second daemon sees the
 /// pidfile lock and exits 0. Failures are silent; bridges then fail their
 /// handshake and the relay is simply off.
-fn start_daemon(container: &str) {
+pub fn start_daemon(container: &str) {
     let _ = backend().output_quiet(&["exec", "-d", "-u", "root", container, BIN, "daemon"]);
 }
 
@@ -357,8 +356,31 @@ fn start_daemon(container: &str) {
 /// its own note (relay-first `run` says "ssh-agent forwarding off"). Never
 /// fails the command: the helper is optional.
 pub fn ensure_or_reason(container: &str, recorded: Option<Arch>) -> Result<Arch, String> {
-    let arch = install(container, recorded)?;
+    ensure_with_broker(container, recorded, None)
+}
+
+/// [`ensure_or_reason`] writing `broker` (an instance's claims'
+/// listeners and phantom files) between the install and the daemon start,
+/// since the daemon reads it only as it starts.
+pub fn ensure_with_broker(
+    container: &str,
+    recorded: Option<Arch>,
+    broker: Option<&brokerfile::BrokerSpec>,
+) -> Result<Arch, String> {
+    let arch = prepare(container, recorded, broker)?;
     start_daemon(container);
+    Ok(arch)
+}
+
+/// [`install`], then `broker` written, the daemon left to the caller
+/// ([`start_daemon`]): `run` fits the account to the identity plan in
+/// between, so the daemon writes phantom files as the account's final ids.
+/// A failed write is a note, not the helper's failure.
+pub fn prepare(container: &str, recorded: Option<Arch>, broker: Option<&brokerfile::BrokerSpec>) -> Result<Arch, String> {
+    let arch = install(container, recorded)?;
+    if let Some(Err(e)) = broker.map(|spec| sync_broker(container, Some(spec))) {
+        eprintln!("note: couldn't write the credential broker file in `{container}`: {e}");
+    }
     Ok(arch)
 }
 
@@ -393,7 +415,9 @@ pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> 
 /// [`ensure_recorded`] with the reason instead of the note, for a caller
 /// that reports it elsewhere (the daemon's `serve.log`).
 pub fn ensure_recorded_or_reason(key: &str, info: &Instance, quiet: bool) -> Result<Arch, String> {
-    let result = ensure_or_reason(&info.container, info.devsbd_arch);
+    // Every time: `/run` may be a tmpfs that a restart emptied.
+    let broker = crate::credentials::instance::broker_spec(&info.claims);
+    let result = ensure_with_broker(&info.container, info.devsbd_arch, broker.as_ref());
     let (arch, error) = match &result {
         Ok(arch) => (Some(*arch), None),
         Err(note) => (None, Some(note.clone())),

@@ -64,6 +64,17 @@ call and tries them in order:
   the service container and dial `127.0.0.1:<port>` there (needs `/bin/sh`,
   root `exec`, writable `/run`).
 
+An instance's credential broker listeners
+([images and features](../instances/images-and-features.md#credential-claims))
+answer only the sandbox itself, so no forward reaches one:
+`credentials::instance::forward_refusal` refuses the instance route to
+such a port (every resolve, so a forward made before a `rebuild` added the
+claim errors too), `forwards.add` answers it `denied` (`Root::start`), an
+open forward is refused with a `forwards.status` line (`Root::open`), and
+a configured `forwardPorts` entry on one is skipped with a status line,
+once while it's wanted (`Root::sync`, `broker_port_refusal`). A service
+port through an instance isn't one.
+
 The engine shows which process listens (`node (pid 412)`, `format_procs`
 in `src/devsbd.rs`), per the opener's `ProcessLookup`. When the port lives
 in the dialed container (instance and injection routes: `Helper`) it asks

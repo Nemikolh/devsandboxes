@@ -1080,6 +1080,9 @@ impl Root {
     /// thread.
     fn open(&mut self, req: &OpenRequest, reserved: &BTreeSet<u16>, next_id: &mut u64, now: Instant) -> Result<OpenForward, OpenError> {
         let (key, port) = (req.instance.as_str(), req.container_port);
+        if let Some(why) = State::load().ok().and_then(|s| broker_port_refusal(&s, key, port)) {
+            return Err((ApiError::denied(why.clone()), Some(why)));
+        }
         if let Some(id) = self.reusable(key, port, req.callback) {
             if let Some(o) = self.opened.get_mut(&id) {
                 o.touched = now;
@@ -1132,10 +1135,14 @@ impl Root {
         let instance_key = match &req.instance {
             Some(name) => {
                 let state = State::load().map_err(ApiError::internal)?;
-                Some(
-                    crate::commands::resolve_instance_noninteractive(&state, name)
-                        .map_err(|e| ApiError::not_found(format!("{e:#}")))?,
-                )
+                let key = crate::commands::resolve_instance_noninteractive(&state, name)
+                    .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+                if req.service.is_none()
+                    && let Some(why) = broker_port_refusal(&state, &key, req.container_port)
+                {
+                    return Err(ApiError::denied(why));
+                }
+                Some(key)
             }
             None => None,
         };
@@ -1211,6 +1218,14 @@ impl Root {
         let mut chosen = Vec::new();
         for (c, fp) in &wanted {
             if self.configured.contains_key(c) || self.suppressed.contains(c) || self.failed.contains(c) {
+                continue;
+            }
+            // Noted once: `failed` holds it while it's wanted.
+            if let (Owner::Instance(key), None) = (&c.owner, &fp.service)
+                && let Some(why) = broker_port_refusal(&state, key, fp.port)
+            {
+                self.failed.insert(c.clone());
+                notes.push(format!("forwardPorts `{}`: skipped: {why}", c.entry));
                 continue;
             }
             match self.start_configured(&state, &project, c, fp, next_id) {
@@ -1299,6 +1314,12 @@ fn status_to_row(id: u64, dir: &Path, status: &ForwardStatus, configured: bool) 
         open: false,
         machine: None,
     }
+}
+
+/// Why instance `key`'s container port `port` can't be forwarded: it's one of
+/// its credential broker listeners.
+fn broker_port_refusal(state: &State, key: &str, port: u16) -> Option<String> {
+    crate::credentials::instance::forward_refusal(&state.instances.get(key)?.claims, key, port)
 }
 
 /// Whether `service` is a `global` one (its forward is shared by the config
@@ -1577,6 +1598,25 @@ forwardPorts = ["redis:6379"]
         );
         // Another root's instance and stopped instances contribute nothing.
         assert!(wanted(&config, &state, &BTreeSet::new(), "p1").is_empty());
+    }
+
+    #[test]
+    fn broker_ports_are_refused() {
+        let (_, mut state) = fixture();
+        let api = state.instances.get_mut("api").unwrap();
+        api.claims = vec![crate::credentials::instance::InstanceClaim {
+            kind: "sentry".into(),
+            feature: "./s".into(),
+            version: "v".into(),
+            claim: "{}".into(),
+            phantom: "p".into(),
+            listeners: vec![crate::credentials::instance::Listener { port: 29000, upstream: "sentry.io".into() }],
+            files: Vec::new(),
+        }];
+        let why = broker_port_refusal(&state, "api", 29000).unwrap();
+        assert!(why.contains("port 29000 of `api`"), "{why}");
+        assert!(broker_port_refusal(&state, "api", 3000).is_none());
+        assert!(broker_port_refusal(&state, "web", 29000).is_none());
     }
 
     #[test]

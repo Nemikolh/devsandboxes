@@ -14,7 +14,8 @@ Code: `src/commands/run/image.rs` (`image_for`, `base_image_for`,
 `install_order`, `feature_issues`, `local_features_fingerprint`,
 `build_context_dir`, `build_context_name`, `FeatureMetadata`),
 `src/commands/services.rs` (`build_args`, `project_id`), `src/commands/run/mod.rs` (`container_command`),
-`src/build_log.rs`.
+`src/build_log.rs`, `src/commands/run/claims.rs` (`wire`,
+`warn_foreign_files`), `src/credentials/instance.rs`.
 
 ## Base image
 
@@ -115,7 +116,64 @@ Order (install order) and the lack of arguments are the same.
 - `privileged`: OR-ed with the sandbox's `privileged` (`false` can't veto a
   feature). Skipped with a warning where the runtime has no `--privileged`.
 
+- `customizations.devsandbox.credentials`: the feature's credential
+  claims (`FeatureMetadata::credentials`), collected for `run`
+  ([below](#credential-claims)).
+
 Other metadata (`capAdd`, `init`, `dependsOn`, …) is not applied.
+
+## Credential claims
+
+What a feature's claim (`credentials::claim`; the contract is
+[github-and-sentry-access](../../plans/active/github-and-sentry-access.md#the-claim-contract))
+turns into on the instance, in `materialize` once the identity plan is
+known (`claims::wire`, the pure parts in `credentials::instance`):
+
+- **Which apply** (`instance::select`): a second feature claiming a kind
+  another feature claims is refused, naming both. An `intercept` claim is
+  skipped with a warning. On an instance placed here by another member
+  (its config root under the fleet dir, `worker_policy::fleet_root_of`)
+  every claim is skipped with a warning, and off unix too (no daemon).
+- **The credential** (`home::resolve` over `credentials.toml`): the one
+  `access.<kind>.credential` names, else the one of that kind granted to
+  the instance's profile; several granted is refused, naming them. None
+  is a warning naming `devsandbox login`: the claim is wired anyway, so a
+  later login needs no rebuild. One that hasn't approved the claim's
+  version gets it recorded pending (`home::record_pending`) and the run is
+  refused, naming `devsandbox access approve <credential>`. Which
+  credential serves a claim isn't kept: the broker resolves it per call.
+- **Phantoms and ports** (`instance::plan`): per claim a phantom, the
+  claim's `phantom.prefix` (else `dsbx_<kind>_`) and 24 random base62
+  characters (`mint_phantom`), and a container-loopback port per upstream
+  from `instance::PORTS` (29000-29999: below the ephemeral range and
+  Kubernetes' NodePorts, above dev-server defaults; per container, so
+  instances never contend), lowest free first. A `rebuild` keeps each
+  kind's phantom (while it has the claim's head) and each upstream's port;
+  a new upstream takes a free one. The instance's `incarnation`
+  (`mint_incarnation`) is minted at create and kept by `rebuild`.
+- **Env** (`instance::env`, `-e` on the container): each `phantom.env`
+  variable is the phantom, `baseUrl`'s is
+  `http://127.0.0.1:<the first upstream's port>`.
+- **Phantom files** (`instance::render_files`): each template with
+  `{phantom}` and `{baseUrl}` filled, at its path under the remote user's
+  home (`facts::home`), owned by the exec user. One on or under a mount or
+  volume target (`claims::mount_targets`: the workspace, the volumes, the
+  `--mount`s) is skipped with a warning: a login shared through a mount
+  would be overwritten. After the daemon starts, `claims::warn_foreign_files`
+  warns of each one devsbd leaves alone because something else is at its
+  path.
+
+The records (`credentials::instance::InstanceClaim`: kind, feature,
+`version`, the canonical pinned `claim`, `phantom`, `listeners`,
+`files`) go on `Instance::claims`; `instance::broker_spec` turns them
+into the helper's broker file, written after the helper's install and
+before its daemon starts (`devsbd::prepare`, then `devsbd::start_daemon`
+after `devsbd identity apply`, so the files get the account's final ids;
+at `start`, a bridge's heal and a forward's resolve through
+`devsbd::ensure_recorded`, as `/run` may be a tmpfs:
+[in-container](../helper/in-container.md#broker-listeners)). The VS Code
+name config marks the listener ports `onAutoForward: ignore`, and
+`forwards.*` refuses them ([forwards](../daemon/forwards.md)).
 
 ## Drift and logs
 

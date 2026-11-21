@@ -146,6 +146,17 @@ pub struct Instance {
     /// ports every time and no other instance takes them while it's stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub forwarded_ports: BTreeMap<String, u16>,
+    /// Random, minted at create and kept by `rebuild`; a `run` after `rm`
+    /// gets a new one, though `unique_instance_id` may hand it the same id
+    /// (docs/plans/active/credential-broker.md, *Identity is the bridge*).
+    /// `None` for instances created before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    /// The credential claims `run` wired, with their phantoms, broker
+    /// listeners and phantom files (`credentials::instance`), kept by
+    /// `rebuild`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<crate::credentials::instance::InstanceClaim>,
     /// Unix secs since the instance was marked done (docs/architecture/automations/dispatchers.md
     /// "Done children"): the user (or its dispatcher) is finished with it,
     /// but it's kept as is until removed. Only display and dispatcher policy
@@ -575,6 +586,20 @@ mod tests {
                 extra_env: BTreeMap::from([("PR_NUMBER".into(), "42".into())]),
                 forwarded_ports: BTreeMap::from([("8080:3000".into(), 8081)]),
                 done: Some(1_790_900_000),
+                incarnation: Some("Zx9".into()),
+                claims: vec![crate::credentials::instance::InstanceClaim {
+                    kind: "sentry".into(),
+                    feature: "./features/sentry".into(),
+                    version: "ab12".into(),
+                    claim: "{\"kind\":\"sentry\"}".into(),
+                    phantom: "sntrys_x".into(),
+                    listeners: vec![crate::credentials::instance::Listener { port: 29000, upstream: "sentry.io".into() }],
+                    files: vec![crate::credentials::instance::File {
+                        path: "/home/vscode/.sentryclirc".into(),
+                        owner: "vscode".into(),
+                        content: "[auth]\ntoken = sntrys_x\n".into(),
+                    }],
+                }],
                 progress: None,
                 created_unix: Instance::now(),
             },
@@ -598,6 +623,9 @@ mod tests {
         assert_eq!(back.instances["repo-abc1"].done, Some(1_790_900_000));
         assert_eq!(back.instances["repo-abc1"].home.as_deref(), Some("/home/vscode"));
         assert_eq!(back.instances["repo-abc1"].profile.as_deref(), Some("work"));
+        assert_eq!(back.instances["repo-abc1"].incarnation.as_deref(), Some("Zx9"));
+        assert_eq!(back.instances["repo-abc1"].claims, state.instances["repo-abc1"].claims);
+        assert_eq!(back.instances["repo-abc1"].created_unix, state.instances["repo-abc1"].created_unix);
     }
 
     #[test]

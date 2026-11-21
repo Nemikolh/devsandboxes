@@ -30,6 +30,9 @@ pub(super) struct FeatureContainerOpts {
     /// Refs of the enabled features declaring `privileged: true`; the backend
     /// check happens in [`privileged_decision`].
     pub(super) privileged_by: Vec<String>,
+    /// Every enabled feature's credential claims, by feature ref, in config
+    /// order (`claims::wire` decides which apply).
+    pub(super) claims: Vec<(String, crate::credentials::claim::Claim)>,
 }
 
 /// Whether to pass `--privileged`, plus the warnings to print. Requested by the
@@ -77,6 +80,7 @@ pub(super) fn feature_container_opts(
         volumes: Vec::new(),
         bind_dirs: Vec::new(),
         privileged_by: Vec::new(),
+        claims: Vec::new(),
     };
     let Some(features) = &props.features else {
         return Ok(opts);
@@ -99,6 +103,7 @@ pub(super) fn feature_container_opts(
         if feature.metadata.privileged == Some(true) {
             opts.privileged_by.push(reference.clone());
         }
+        opts.claims.extend(feature.metadata.credentials.iter().map(|c| (reference.clone(), c.clone())));
         for mount in &feature.metadata.mounts {
             let resolved = mount.resolve(ctx)?;
             if let Some(source) = resolved.source.as_deref() {

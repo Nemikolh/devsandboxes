@@ -47,8 +47,10 @@ mounted), `workspace`, `workspace_file`, `remote_env`, `remote_user` and
 volumes `rm` deletes), `bind_dirs` (per-instance bind sources `run`
 created, which `rm` deletes), `shell_history`, `ssh_auth_sock`, `devsbd_arch`,
 `dispatcher` (owning dispatcher's id), `profile`
-([profiles](profiles.md#per-instance)), `forwarded_ports`, `done`,
-`progress`, `created_unix`. `State` also holds `autostart_boot`,
+([profiles](profiles.md#per-instance)), `forwarded_ports`, `incarnation`
+and `claims` (credential claims with their phantoms, broker listeners and
+phantom files: [images and features](images-and-features.md#credential-claims)),
+`done`, `progress`, `created_unix`. `State` also holds `autostart_boot`,
 `global_forwarded_ports` and `last_profile` per project id.
 
 ## run
@@ -77,7 +79,8 @@ restarts, `rm` frees it). Steps:
 
 Shared by `run` and `rebuild`; replaces the record. Fields a previous record
 had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
-`folders` worktrees, `volumes`, `bind_dirs`) carry over.
+`folders` worktrees, `volumes`, `bind_dirs`, `incarnation`, the claims'
+phantoms and listener ports) carry over.
 
 1. The GPU decision (below), then `initializeCommand` on the host (in the
    config dir).
@@ -89,19 +92,24 @@ had (dispatcher, `profile`, `config_dir`, `extra_env`, `forwarded_ports`, `done`
    [images and features](images-and-features.md)).
 5. Phase `building`: `image_for`, then the identity plan
    (`identity::plan_for`: probe, plan, its summary and warnings on
-   stderr; [identity](identity.md)). Phase `creating`: `run_container`
+   stderr; [identity](identity.md)), then the credential claims
+   (`claims::wire`: refusals, phantoms, ports, env, phantom files;
+   [images and features](images-and-features.md#credential-claims)).
+   Phase `creating`: `run_container`
    (`run -d`, labels, `--privileged`, the GPU flags, the plan's
    `--user`/`--userns` and relabeled binds,
    `--mount`s, env, first network; command
    `sh -c '[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity'`,
    `container_command`), then
-   `connect_networks`, `wire_service_dns`, install the `devsbd` helper,
-   `devsbd identity apply` as root (a failure fails the create), `devsbd
+   `connect_networks`, `wire_service_dns`, install the `devsbd` helper
+   and write its broker file (`devsbd::prepare`),
+   `devsbd identity apply` as root (a failure fails the create), start the
+   helper's daemon, `devsbd
    userns check` as the exec user (the tool env,
    [identity](identity.md#the-check-and-the-env)), the exec cgroup check
    (below), write the `.code-workspace` file.
-6. Save the record (still in flight), write the VS Code name config, sync the
-   helper's boot file.
+6. Save the record (still in flight), write the VS Code name config (with
+   the broker ports' `portsAttributes`), sync the helper's boot file.
 7. Lifecycle (phase = step name): `shell-rc` wiring if any, then
    `onCreateCommand`, `updateContentCommand`, `postCreateCommand`,
    `postStartCommand`, `postAttachCommand`, each via `exec` with the
@@ -144,7 +152,8 @@ the pid is dead or the boot id changed, so nobody rewrites records.
 - `start <name>|--all`: refreshes the ssh-agent link and worktree locks. If
   the config still resolves for this root: drift warning
   ([rebuild and drift](rebuild-and-drift.md)), `start` the container, apply
-  the restart policy, ensure the helper, the exec cgroup check,
+  the restart policy, ensure the helper (its broker file rewritten before
+  its daemon starts), the exec cgroup check,
   `ensure_services` +
   `wire_service_dns`, sync the boot file, then exec `postStartCommand` itself
   unless the in-container boot hook already runs it (`autostart = "runtime"`
@@ -193,7 +202,10 @@ runs afresh for every exec, so upgrading it fixes existing containers.
    instance's Inbox threads.
 
 Kept: the shell-history dir (a later instance with the same id inherits it;
-`gc` reaps orphans) and the shared `worktree-link` store.
+`gc` reaps orphans) and the shared `worktree-link` store. Dropping the
+record drops its `incarnation` and its claims' phantoms, so the broker
+knows them no more; claim versions it recorded pending in
+`credentials.toml` stay for `access approve`.
 
 ## rename and done
 

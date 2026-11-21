@@ -324,7 +324,7 @@ fn poll(
                 // A state that won't load keeps the last count, like the
                 // runtime being down.
                 if let Ok(state) = State::load() {
-                    live.store(live_instances(&running, &state, expects_host), Ordering::Release);
+                    live.store(live_instances(&running, &state, |key| expects_host(&state, key)), Ordering::Release);
                     // Instances running as of the last listing that loaded with its state.
                     observers.capacity.set_running(running_instances(&running, &state));
                 }
@@ -406,10 +406,12 @@ fn running(rows: &[ContainerRow]) -> Vec<String> {
     rows.iter().filter(|r| r.is_running()).map(|r| r.name.clone()).collect()
 }
 
-/// Whether instance `key` expects a live host while it runs (see
-/// [`holds_host`]). One state + config load for both rules.
-fn expects_host(key: &str) -> bool {
-    crate::commands::dispatch::current_sandbox(key).is_some_and(|(info, props)| holds_host(&info, &props))
+/// Whether instance `key` expects a live host while it runs: it carries a
+/// credential claim (the broker serves it), else [`holds_host`], with one
+/// state + config load for both of its rules.
+fn expects_host(state: &State, key: &str) -> bool {
+    state.instances.get(key).is_some_and(|i| !i.claims.is_empty())
+        || crate::commands::dispatch::current_sandbox(key).is_some_and(|(info, props)| holds_host(&info, &props))
 }
 
 /// The holder rule: the instance declares `dispatcher` (children never count
@@ -511,6 +513,15 @@ mod tests {
         // A child is never a dispatcher, but may own threads.
         assert!(!holds_host(child, &dispatcher));
         assert!(holds_host(child, &inbox));
+    }
+
+    #[test]
+    fn an_instance_with_a_claim_holds_the_host() {
+        let s = state(&format!(
+            "{STATE}\n[[instance.old.claims]]\nkind = \"sentry\"\nfeature = \"./s\"\nversion = \"v\"\nclaim = \"{{}}\"\nphantom = \"p\"\n"
+        ));
+        assert!(expects_host(&s, "old"));
+        assert_eq!(live_instances(&["devsandbox-old".to_string()], &s, |k| expects_host(&s, k)), 1);
     }
 
     #[test]

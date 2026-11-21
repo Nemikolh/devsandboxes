@@ -24,7 +24,8 @@ A `serve-poll` thread. Each pass lists every devsandbox container once
 (`rt.list(true, NAME_PREFIX)`), then from the running ones:
 
 1. bumps `Host::changes` when the set moved (→ `instances.changed`);
-2. counts the `live_instances` holders (`holds_host`: `dispatcher` or
+2. counts the `live_instances` holders (`expects_host`: a credential
+   claim, which the broker serves, else `holds_host`: `dispatcher` or
    `inbox = true`);
 3. hands the list to the forward registry (configured `forwardPorts`
    follow it, [forwards.md](forwards.md));

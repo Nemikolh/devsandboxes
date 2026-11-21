@@ -123,8 +123,9 @@ The daemon exits `IDLE_TIMEOUT` (10 min) after its last holder left
   TTY `exec` left open for days) holds nothing (`ConnEntry::holds`; any
   other request makes it a holder for good);
 - `forwards`: every live forward, ad-hoc or configured, whatever its state;
-- `live_instances`: running instances declaring `dispatcher` or
-  `inbox = true` (`host::holds_host`), as of the last poll;
+- `live_instances`: running instances carrying a credential claim (the
+  broker serves them) or declaring `dispatcher` or `inbox = true`
+  (`host::expects_host`, `host::holds_host`), as of the last poll;
 - `control`: in-flight control requests (`devsbd events --follow` streams
   included);
 - `verbs`: verb subprocesses not reaped (detached and adopted ones too)
