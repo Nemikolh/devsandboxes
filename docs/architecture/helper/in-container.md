@@ -10,6 +10,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
 `devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`,
 `devsbd/src/open.rs`, `devsbd/src/broker.rs`, `devsbd/src/proxy.rs`,
+`devsbd/src/credential.rs`, `devsbd/src/gitcheck.rs`,
 `devsbd/src/rpc_server.rs`, `devsbd/src/rpc_runs.rs`;
 `src/devsbd/brokerfile.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
@@ -27,7 +28,8 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 | `/run/devsandbox/api.sock` (0666) | in-container clients: first byte `n` = outbox poke, `c` = control request |
 | `/run/devsandbox/devsbd.pid` | flock + `<pid> <build hash>` |
 | `/run/devsandbox/boot`, `boot.log` | boot file (host-written) and its commands' output |
-| `/run/devsandbox/broker` (0644) | broker file (host-written): listeners, proxy ports and phantom files |
+| `/run/devsandbox/broker` (0644) | broker file (host-written): listeners, proxy ports, git hosts' phantoms and phantom files |
+| `/etc/gitconfig.d/devsandbox` (0644) | git's settings under a git-host claim (host-written as root, included from `/etc/gitconfig`; [git](../credentials/git.md#the-system-copy)) |
 | `/var/lib/devsandbox/outbox/` (1777) | queued notify/thread/open records |
 | `/var/lib/devsandbox/runs/` (1777) | tracked runs |
 | `/var/lib/devsandbox/sessions/` (1777) | interactive sessions; `<id>/sock` (0600) is a session's socket |
@@ -91,8 +93,9 @@ streams and everything else as usual.
 ## Broker listeners
 
 The credential broker's container side. The host writes the broker file
-(`brokerfile::PATH`, `src/devsbd/brokerfile.rs`: `listen`, `proxy-listen`
-and `file` lines, plus the container's own proxy env as `proxy` lines) with
+(`brokerfile::PATH`, `src/devsbd/brokerfile.rs`: `listen`, `proxy-listen`,
+`credential` and `file` lines, plus the container's own proxy env as
+`proxy` lines) with
 `devsbd::sync_broker`, atomically, from the instance's claims
 (`credentials::instance::broker_spec`): at `run` between the install and
 the daemon's first start (`devsbd::prepare`), and before every daemon
@@ -119,14 +122,17 @@ file: nothing to do. A file that doesn't parse is logged and ignored.
   (`Mux::attach_with_header`), the client's bytes after it, flow-controlled.
   No such bridge → a fixed `503 Service Unavailable` (`broker::refuse`).
 - **Proxy ports** ([below](#proxy-ports)): each `proxy-listen` line.
+- `credential` lines aren't the daemon's: `devsbd credential` reads them
+  ([below](#devsbd-credential-getstoreerase)).
 
 ### Proxy ports
 
 The `HTTPS_PROXY` the container's tools use (intercept mode,
 `devsbd/src/proxy.rs`). Each `proxy-listen <port> <host>…` line binds
 `127.0.0.1:<port>` with its own set of bound hosts: the shared proxy port
-and git's own, whose set holds the hosts a claim's `git` field names
-(docs/plans/active/github-and-sentry-access.md). Each connection gets a
+and git's own, whose set holds the hosts a claim's `git` field names and
+which only git's URL-scoped `http.proxy` points at
+([git](../credentials/git.md#gits-proxy-port)). Each connection gets a
 thread that reads the request head (`proxy::read_head`: one byte at a
 time, so what follows stays in the socket; at most `MAX_HEAD`, 8 KiB,
 within `HEAD_TIMEOUT`, 10 s) and parses it strictly
@@ -484,6 +490,29 @@ also exit 1. 2 on a usage error. Off Linux it always exits 1 with
 `--as-root` at euid 0 it fails up front with `devsbd: userns: euid: root`
 (`ROOT_LINE`): Chromium refuses its sandbox there, whatever namespaces
 could be made.
+
+## `devsbd credential get|store|erase`
+
+git's credential helper for a git-host claim's hosts
+(`credential::run`; git runs it as `!/run/devsandbox/bin/devsbd
+credential <op>`, as whoever runs git). `get` reads git's `key=value`
+lines up to a blank line (at most 64 KiB) and, for `protocol=https` and a
+`host` with a `credential <host> <phantom>` line in the broker file
+(`:443` dropped, case-folded), prints `username=x-access-token` and
+`password=<phantom>` (`credential::answer`). Anything else, a missing or
+unparsable broker file included, prints nothing: git asks its next
+helper. `store` and `erase` read stdin and do nothing. Exit 0 always, 2 on
+a usage error. The phantom comes from the broker file, never the env
+([git](../credentials/git.md#the-credential-helper)).
+
+## `devsbd git-check`
+
+`devsbd git-check --proxy <url> --ca <path> --host <host>…
+[--no-signing-key] [--] <dir>…` (`gitcheck::run`, `gitcheck::check`):
+the boot check of git's settings under a git-host claim, run by the host
+as the exec user. One warning per stdout line, none when git is missing or
+a dir isn't a repo; exit 0 always, 2 on a usage error. The rules are in
+[git](../credentials/git.md#the-boot-check).
 
 ## `devsbd cgroup check`
 

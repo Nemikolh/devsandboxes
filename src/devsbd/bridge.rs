@@ -3186,6 +3186,7 @@ mod tests {
                 proxy_listeners: Vec::new(),
                 files: vec![file("/home/u/.config/sentry/rc", "p1"), file("/home/u/.taken", "p2")],
                 proxy_env: Vec::new(),
+                credentials: Vec::new(),
             };
             super::super::sync_broker(&name, Some(&spec)).unwrap();
             start_daemon(&name);

@@ -370,7 +370,7 @@ fn base64(data: &[u8]) -> String {
 /// Whether `no_proxy` exempts `host:port`: `*`, a domain (leading `.` or
 /// `*.` optional) matching itself and its subdomains, an IP, or a CIDR
 /// matching IP literals; any of them with `:port` matching that port only.
-fn bypass(no_proxy: &str, host: &str, port: u16) -> bool {
+pub fn bypass(no_proxy: &str, host: &str, port: u16) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let ip = bare.parse::<IpAddr>().ok();
     no_proxy.split(|c: char| c == ',' || c.is_ascii_whitespace()).filter(|e| !e.is_empty()).any(|entry| {

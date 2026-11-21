@@ -4,7 +4,8 @@
 //! approval each resolves to, and the phantoms, listeners, env and phantom
 //! files the instance gets (`credentials::instance`, pure); for intercept
 //! claims the shared proxy port, its env, and the member CA's trust in the
-//! container (`credentials::trust`).
+//! container (`credentials::trust`); for git-host claims git's own port,
+//! its settings and the boot check (`credentials::git`).
 
 use std::path::Path;
 
@@ -25,6 +26,9 @@ pub(super) struct Wired {
     pub(super) ca: Option<MemberCert>,
     /// `-e` for the container.
     pub(super) env: Vec<(String, String)>,
+    /// git's settings for the git-host claims (`credentials::git::entries`),
+    /// merged into the command-scope env behind a config's own by the caller.
+    pub(super) git: Vec<(String, String)>,
 }
 
 pub(super) struct MemberCert {
@@ -45,6 +49,9 @@ pub(super) struct Proxying<'a> {
     pub(super) aliases: Vec<String>,
     /// `--env`'s keys: set on every exec, like `remoteEnv`'s.
     pub(super) run_env_keys: Vec<String>,
+    /// The fenced owners as the folders' recorded URLs spell them
+    /// (`credentials::git::owners`).
+    pub(super) owners: Vec<String>,
 }
 
 /// Wire `found` (the enabled features' claims) for an instance in
@@ -71,7 +78,8 @@ pub(super) fn wire(
         Some(kept) => kept,
         None => instance::mint_incarnation()?,
     };
-    let mut wired = Wired { incarnation, claims: Vec::new(), intercept: None, ca: None, env: Vec::new() };
+    let mut wired =
+        Wired { incarnation, claims: Vec::new(), intercept: None, ca: None, env: Vec::new(), git: Vec::new() };
     if found.is_empty() {
         return Ok(wired);
     }
@@ -82,7 +90,8 @@ pub(super) fn wire(
     check_credentials(props, profile, &kept)?;
     let prior_claims = prior.map(|i| i.claims.as_slice()).unwrap_or_default();
     let prior_port = prior.and_then(|i| i.intercept.as_ref()).map(|i| i.port);
-    let planned = instance::plan(&kept, prior_claims, prior_port, instance::mint_phantom)?;
+    let prior_git_port = prior.and_then(|i| i.intercept.as_ref()).and_then(|i| i.git.as_ref()).map(|g| g.port);
+    let planned = instance::plan(&kept, prior_claims, prior_port, prior_git_port, instance::mint_phantom)?;
     let mut claims = planned.claims;
     for ((_, claim), record) in kept.iter().zip(claims.iter_mut()) {
         wired.env.extend(instance::env(claim, record));
@@ -105,6 +114,7 @@ pub(super) fn wire(
         let intercept = Intercept {
             port: shared.port,
             hosts: shared.hosts,
+            git: planned.git,
             proxy_env: proxying.proxy_env,
             bundle: probe_bundle(proxying.image),
             installed: None,
@@ -112,7 +122,13 @@ pub(super) fn wire(
         wired.env.extend(instance::intercept_env(&intercept, &proxying.aliases));
         let knobs = kept.iter().filter_map(|(_, c)| c.wiring.ca.as_ref());
         wired.env.extend(knobs.map(|ca| (ca.env.clone(), intercept.bundle.clone())));
-        wired.ca = member_cert(&intercept.hosts);
+        if let Some(git) = &intercept.git {
+            wired.git = crate::credentials::git::entries(&git.hosts, &proxying.owners, git.port, &intercept.bundle);
+            // cargo's libgit2 fetcher skips URL-scoped proxies: it'd take the
+            // shared port, where git hosts are dialed directly.
+            wired.env.push(("CARGO_NET_GIT_FETCH_WITH_CLI".into(), "true".into()));
+        }
+        wired.ca = member_cert(&intercept.bound_hosts());
         wired.intercept = Some(intercept);
     }
     Ok(wired)
@@ -174,7 +190,7 @@ fn member_cert(_: &[String]) -> Option<MemberCert> {
 pub(super) fn install_trust(container: &str, intercept: &mut Intercept, pem: &str) {
     match install_in(container, &intercept.bundle, pem) {
         Ok(()) => intercept.installed = Some(crate::credentials::trust::fingerprint(pem)),
-        Err(e) => eprintln!("{}", install_warning(container, &intercept.hosts, &e)),
+        Err(e) => eprintln!("{}", install_warning(container, &intercept.bound_hosts(), &e)),
     }
 }
 
@@ -217,7 +233,7 @@ pub(super) fn reinstall_running(except: &str, pem: &str) {
 #[cfg(unix)]
 fn reinstall(key: &str, container: &str, intercept: &Intercept, pem: &str, fingerprint: &str) {
     if let Err(e) = install_in(container, &intercept.bundle, pem) {
-        eprintln!("{}", install_warning(container, &intercept.hosts, &e));
+        eprintln!("{}", install_warning(container, &intercept.bound_hosts(), &e));
         return;
     }
     let saved = crate::state::State::update(|state| {
@@ -238,7 +254,7 @@ fn reinstall(key: &str, container: &str, intercept: &Intercept, pem: &str, finge
 #[cfg(unix)]
 pub(crate) fn refresh_trust(key: &str, info: &Instance) {
     let Some(intercept) = &info.intercept else { return };
-    let Some(cert) = member_cert(&intercept.hosts) else { return };
+    let Some(cert) = member_cert(&intercept.bound_hosts()) else { return };
     let fingerprint = crate::credentials::trust::fingerprint(&cert.pem);
     if intercept.installed.as_deref() != Some(fingerprint.as_str()) {
         reinstall(key, &info.container, intercept, &cert.pem, &fingerprint);
@@ -246,6 +262,71 @@ pub(crate) fn refresh_trust(key: &str, info: &Instance) {
     if cert.grew {
         reinstall_running(key, &cert.pem);
     }
+}
+
+/// git's settings into the container's system gitconfig too
+/// (`credentials::git::SYSTEM_SCRIPT`, as root), for tools that run git with
+/// a cleared env; a failure is a warning.
+#[cfg(unix)]
+pub(super) fn install_git_config(container: &str, entries: &[(String, String)]) {
+    use crate::credentials::git;
+    if entries.is_empty() {
+        return;
+    }
+    let script = crate::runtime::fixed_path(git::SYSTEM_SCRIPT);
+    let args = ["exec", "-i", "-u", "root", container, crate::runtime::SH, "-c", &script];
+    if let Err(e) = backend().run_with_stdin(&args, git::system_config(entries).as_bytes()) {
+        eprintln!(
+            "warning: couldn't write `{}` in `{container}` ({e:#}): git run with a cleared env there misses \
+             the git-host claim's settings",
+            git::SYSTEM_FILE
+        );
+    }
+}
+
+/// Whether `props`' `ssh-keys` names a key the agent relay lets sign git
+/// commits under a git-host claim: `signing-only`, or one with no
+/// `destinations` (docs/architecture/helper/ssh-agent.md, *Key filtering*).
+pub(crate) fn signs_git(props: &SandboxProperties) -> bool {
+    props.ssh_keys.iter().flatten().any(|k| k.signing_only || k.destinations.is_none())
+}
+
+/// `devsbd git-check`'s command for `info`: `None` without git's port.
+/// `no_signing_key`: check ssh commit signing too (the config is known and
+/// names no key that signs git: [`signs_git`]).
+pub(crate) fn git_check_command(info: &Instance, no_signing_key: bool) -> Option<Vec<String>> {
+    let intercept = info.intercept.as_ref()?;
+    let git = intercept.git.as_ref()?;
+    let mut cmd: Vec<String> = vec![crate::devsbd::BIN.into(), "git-check".into()];
+    cmd.extend(["--proxy".into(), format!("http://127.0.0.1:{}", git.port), "--ca".into(), intercept.bundle.clone()]);
+    for host in &git.hosts {
+        cmd.extend(["--host".into(), host.clone()]);
+    }
+    if no_signing_key {
+        cmd.push("--no-signing-key".into());
+    }
+    cmd.push("--".into());
+    cmd.push(info.workspace.clone());
+    cmd.extend(info.folders.iter().map(|f| f.target.clone()));
+    Some(cmd)
+}
+
+/// The boot check's warnings (docs/architecture/credentials/git.md, *The
+/// boot check*), run as the exec user with the exec env; none when it can't
+/// run (no helper, no git-host claim).
+#[cfg(unix)]
+pub(crate) fn git_check(info: &Instance, no_signing_key: bool) -> Vec<String> {
+    let Some(cmd) = git_check_command(info, no_signing_key).filter(|_| info.devsbd_arch.is_some()) else {
+        return Vec::new();
+    };
+    let argv = crate::commands::exec::exec_argv_with(info, false, false, &cmd, false);
+    let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap_or_default();
+    out.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn git_check(_: &Instance, _: bool) -> Vec<String> {
+    Vec::new()
 }
 
 /// `kept`, or `None` (each skipped with a warning) where the broker can't

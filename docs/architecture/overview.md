@@ -110,6 +110,8 @@ the credential kept on this host, by policy, per call.
   logins and the token record they store.
 - [ca.md](credentials/ca.md): the member CA intercepted hosts' leaves
   chain to, its name constraints and files.
+- [git.md](credentials/git.md): git in the container under a git-host
+  claim: its proxy port, settings, credential helper and boot check.
 - CLI and files: [reference/credentials-cli.md](../reference/credentials-cli.md).
 
 ## The Inbox

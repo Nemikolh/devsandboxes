@@ -342,10 +342,18 @@ is frozen: no new work on it.
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
   `approvers`, `delegate` and `as` parse but nothing reads them yet.
   → [login](architecture/credentials/login.md); `commands::login::choose`
-- Intercept claims' hosts that their `git` field names get no proxy port
-  yet: they're kept off the shared one for git's own port (git-gateway
-  step 1), so git to them goes direct, and a claim with only git hosts
-  gets no proxy env and no CA install at all. The CA variables point at
+- git under a git-host claim: no ssh host alias (`git@github-work:`)
+  is rewritten to `https://` (the folder's record keeps the URL, not what
+  the alias resolved to), so such a remote's push fails under key
+  filtering (the boot check doesn't see it either); the system
+  gitconfig copy is written only at create, under `/etc` (gits reading
+  another sysconfdir, nix's or conda's, see only the env); when
+  `remoteEnv` or `--env` sets git's `GIT_CONFIG_*`, every exec drops
+  `gc.worktreePruneExpire`, and an `ensure` replacing the saved `--env`
+  leaves `Instance::git_env` as `run` computed it. No clone or push
+  through the gateway is tested end to end yet (git-gateway step 1).
+  → [git](architecture/credentials/git.md); `credentials::git::entries`
+- The CA variables point at
   the Debian bundle path when the image probe can't run (Apple
   `container`), where the install writes the Mozilla set plus the CA if
   that file is missing. A CA reissued by the broker itself (a host it
@@ -379,9 +387,7 @@ is frozen: no new work on it.
   `broker::serve::Service`
 - The agent relay's key filter under a git-host claim signs a named
   key's login with no confirmation (confirm-on-sign is a permission
-  request, credential-broker step 4), and the boot check doesn't yet warn
-  when `commit.gpgsign` is on with an ssh key and no `signing-only` key
-  is named (git-gateway step 1). A destination key's forwarding hops
+  request, credential-broker step 4). A destination key's forwarding hops
   aren't checked, only the login's own bind; an agent certificate isn't
   matched by its underlying key; ecdsa nistp521, `ssh-rsa` (SHA-1),
   certificate and security-key host keys can't bind. The dashboard's `o`

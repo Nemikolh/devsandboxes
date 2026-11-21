@@ -168,6 +168,13 @@ pub struct Instance {
     /// `access.github.repos` isn't in it: read per call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub github_repos: Vec<String>,
+    /// git's command-scope env (`GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>`)
+    /// for every exec, when `remoteEnv` or `--env` set some of it: theirs
+    /// merged ahead of a git-host claim's settings, which they'd otherwise
+    /// replace (docs/architecture/credentials/git.md). Empty otherwise: the
+    /// container's env carries it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub git_env: BTreeMap<String, String>,
     /// Unix secs since the instance was marked done (docs/architecture/automations/dispatchers.md
     /// "Done children"): the user (or its dispatcher) is finished with it,
     /// but it's kept as is until removed. Only display and dispatcher policy
@@ -379,12 +386,13 @@ impl Instance {
     /// wins, as at `docker run` where `--env` comes after `containerEnv`; and
     /// the saved `extra_env` may be newer than the container's own env (an
     /// `ensure` replaced it), so it must override whatever the image or
-    /// config set.
+    /// config set. `git_env` goes last: it already holds what those set of it.
     pub fn exec_env(&self) -> BTreeMap<String, String> {
         let mut env = self.tool_env.clone();
         env.extend(self.home.iter().map(|h| ("HOME".to_string(), h.clone())));
         env.extend(self.remote_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env.extend(self.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        env.extend(self.git_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env
     }
 
@@ -651,11 +659,13 @@ mod tests {
                 intercept: Some(crate::credentials::instance::Intercept {
                     port: 29001,
                     hosts: vec!["api.github.com".into()],
+                    git: Some(crate::credentials::instance::ProxyPort { port: 29002, hosts: vec!["github.com".into()] }),
                     proxy_env: vec![("HTTPS_PROXY".into(), "http://corp:3128".into())],
                     bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
                     installed: Some("ab".repeat(32)),
                 }),
                 github_repos: vec!["o/r".into()],
+                git_env: Default::default(),
                 progress: None,
                 created_unix: Instance::now(),
             },

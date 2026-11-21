@@ -53,7 +53,7 @@ no wildcard, not an IP address. The broker case-folds a CONNECT target and
 drops its trailing dot before asking.
 
 `run` calls `MemberCa::ensure_hosts` with an instance's intercepted hosts
-before its container exists, and `start` again before it reinstalls
+(both proxy ports': `Intercept::bound_hosts`) before its container exists, and `start` again before it reinstalls
 ([trust in containers](#trust-in-containers)). The broker calls it too
 (`broker::serve::Service::leaf`) when an admitted intercepted connection
 names a host the cert doesn't cover yet (a cert removed since the run),

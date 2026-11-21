@@ -103,6 +103,7 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
             // instance carrying the just-established arch.
             let mut fresh = info.clone();
             fresh.devsbd_arch = arch;
+            warn_git(&fresh, !run::signs_git(&sandbox.properties));
             let host_agent = crate::commands::exec::has_host_agent();
             let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(&fresh, host_agent);
             let props = &sandbox.properties;
@@ -158,15 +159,24 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
         None => {
             let services = stop::service_containers(&info.project, &info.instance_id);
             start_containers(&info.container, &services);
-            if crate::devsbd::ensure_recorded(key, info, false).is_some() {
+            let arch = crate::devsbd::ensure_recorded(key, info, false);
+            if arch.is_some() {
                 run::cgroup::warn_if_outside(&info.container);
             }
             #[cfg(unix)]
             run::refresh_trust(key, info);
+            // No config: nothing says whether a key signs git.
+            warn_git(&Instance { devsbd_arch: arch, ..info.clone() }, false);
         }
     }
     println!("started {key}");
     Ok(())
+}
+
+fn warn_git(info: &Instance, no_signing_key: bool) {
+    for w in run::git_check(info, no_signing_key) {
+        eprintln!("warning: {w}");
+    }
 }
 
 /// Who runs `postStartCommand` on `start`.

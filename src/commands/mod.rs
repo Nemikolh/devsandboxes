@@ -388,6 +388,7 @@ mod tests {
             claims: Vec::new(),
             progress: None,
             github_repos: Vec::new(),
+            git_env: Default::default(),
             created_unix: 0,
         };
         state.instances.insert("web-aaaa".into(), mk("web", "/home/u/site"));
@@ -441,6 +442,7 @@ mod tests {
                 claims: Vec::new(),
                 progress: None,
                 github_repos: Vec::new(),
+                git_env: Default::default(),
                 created_unix: 0,
             },
         );

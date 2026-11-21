@@ -49,7 +49,7 @@ pub fn start(path: &Path, route: Route, ids: Arc<AtomicU32>) {
         Ok(Err(e)) => return eprintln!("devsbd: broker file {}: {e}", path.display()),
         Err(e) => return eprintln!("devsbd: broker file {}: {e}", path.display()),
     };
-    let BrokerSpec { listeners, proxy_listeners, files, proxy_env } = spec;
+    let BrokerSpec { listeners, proxy_listeners, files, proxy_env, credentials: _ } = spec;
     for file in &files {
         if let Err(e) = write_phantom(file) {
             eprintln!("devsbd: phantom file {}: {e}", file.path);

@@ -6,8 +6,10 @@ mod bridge;
 mod broker;
 mod browser;
 mod cgroup;
+mod credential;
 mod ctl;
 mod daemon;
+mod gitcheck;
 mod identity;
 mod json;
 mod listeners;
@@ -121,9 +123,11 @@ fn main() {
         Some("identity") => std::process::exit(identity::run(&args.collect::<Vec<_>>())),
         Some("userns") => std::process::exit(userns::run(&args.collect::<Vec<_>>())),
         Some("cgroup") => std::process::exit(cgroup::run(&args.collect::<Vec<_>>())),
+        Some("credential") => std::process::exit(credential::run(&args.collect::<Vec<_>>())),
+        Some("git-check") => std::process::exit(gitcheck::run(&args.collect::<Vec<_>>())),
         _ => {
             eprintln!(
-                "usage: devsbd version|features|daemon|bridge|boot|notify|open|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|cgroup|vscode-goto"
+                "usage: devsbd version|features|daemon|bridge|boot|notify|open|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|cgroup|credential|git-check|vscode-goto"
             );
             std::process::exit(2);
         }

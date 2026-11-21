@@ -6,6 +6,7 @@
 pub mod ca;
 pub mod claim;
 pub mod fence;
+pub mod git;
 #[cfg(unix)]
 pub mod home;
 pub mod instance;

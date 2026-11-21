@@ -104,6 +104,13 @@ fn recorded_line(folder: &Path, record: &FolderRemotes) -> String {
     }
 }
 
+/// The owners of `fence` as `folders`' records spell them, for git's
+/// rewrites (`credentials::git::owners`); none when the state can't be read.
+pub(crate) fn git_owners(folders: &[&Path], fence: &[String]) -> Vec<String> {
+    let Ok(state) = State::load() else { return Vec::new() };
+    crate::credentials::git::owners(folders.iter().filter_map(|f| state.folder_remotes.get(&folder_key(f))), fence)
+}
+
 /// The GitHub fence of `folders`' records: their `github` entries, sorted,
 /// deduplicated. A folder with no record adds nothing.
 pub(crate) fn fence_of<'a>(state: &State, folders: impl IntoIterator<Item = &'a Path>) -> Vec<String> {

@@ -35,6 +35,7 @@ mod worktree;
 
 #[cfg(unix)]
 pub(crate) use claims::refresh_trust;
+pub(crate) use claims::{git_check, signs_git};
 pub(crate) use editor::write_vscode_name_config;
 pub(crate) use git::{check_repo, host_git, host_git_bare, host_git_new, read_origin};
 pub(crate) use origin::{fetch_trusted_origin, trust_key, Fetched, Refs};
@@ -277,6 +278,7 @@ pub fn run(
         intercept: None,
         claims: Vec::new(),
         github_repos: Vec::new(),
+        git_env: Default::default(),
         progress: None,
         created_unix: Instance::now(),
     };
@@ -708,9 +710,9 @@ pub(crate) fn materialize(
     let recorded_folders = folders::merge_folder_mounts(&prior_folders, folder_mounts.clone());
     tracker.record(|i| i.folders = recorded_folders.clone())?;
     // After initializeCommand (it may clone them), before any container.
-    let github_repos = remotes::record(
-        &std::iter::once(folder).chain(extra_folders.iter().map(|f| f.host.as_path())).collect::<Vec<_>>(),
-    )?;
+    let fenced_folders: Vec<&Path> =
+        std::iter::once(folder).chain(extra_folders.iter().map(|f| f.host.as_path())).collect();
+    let github_repos = remotes::record(&fenced_folders)?;
     // Before the container exists, so nothing in it can prune them; a rebuild
     // of an instance from before locking gets locked here.
     if let Some(wt) = &worktree {
@@ -852,6 +854,7 @@ pub(crate) fn materialize(
         proxy_env: crate::credentials::instance::original_proxy_env(layers),
         aliases: endpoints.iter().map(|e| e.alias.clone()).collect(),
         run_env_keys: run_env.keys().cloned().collect(),
+        owners: remotes::git_owners(&fenced_folders, &github_repos),
     };
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut wired = claims::wire(
@@ -866,6 +869,21 @@ pub(crate) fn materialize(
         proxying,
     )?;
     extra_env.extend(wired.env.iter().cloned());
+    // After every layer that may set git's command-scope env, so ours land
+    // behind theirs (`gc_keeps_worktrees_env` then extends the count).
+    let git_layers = || facts.env.iter().map(|(k, v)| (k, v)).chain(&container_env.sandbox).chain(&run_env);
+    if !wired.git.is_empty() {
+        extra_env.extend(crate::credentials::git::config_env(git_layers(), &wired.git));
+    }
+    let remote_env: BTreeMap<String, String> =
+        props.remote_env.iter().flatten().map(|(k, v)| (k.clone(), substitute(v, &var_ctx))).collect();
+    let git_env = crate::credentials::git::exec_config_env(
+        git_layers().chain(&remote_env).chain(&run_env),
+        remote_env.keys().chain(run_env.keys()),
+        &wired.git,
+    )
+    .into_iter()
+    .collect();
     if let Some(why) =
         ssh_auth_sock.as_ref().and(ssh_agent::mount_refusal(&crate::credentials::instance::git_hosts(&wired.claims)))
     {
@@ -918,6 +936,8 @@ pub(crate) fn materialize(
     if let (Some(intercept), Some(cert)) = (wired.intercept.as_mut(), &wired.ca) {
         claims::install_trust(&container, intercept, &cert.pem);
     }
+    #[cfg(unix)]
+    claims::install_git_config(&container, &wired.git);
     // Fit the adopted account to the plan, before anything runs as it. No
     // helper means no remap: the container runs on, unfitted.
     let mut home = None;
@@ -989,7 +1009,7 @@ pub(crate) fn materialize(
         shell_history,
         workspace: workspace.clone(),
         workspace_file,
-        remote_env: props.remote_env.iter().flatten().map(|(k, v)| (k.clone(), substitute(v, &var_ctx))).collect(),
+        remote_env,
         remote_user: plan.exec_user.clone(),
         home,
         browser_sandbox,
@@ -1008,6 +1028,7 @@ pub(crate) fn materialize(
         claims: wired.claims,
         intercept: wired.intercept,
         github_repos,
+        git_env,
         done,
         // Still in flight: the lifecycle chain runs after this save.
         progress: Some(tracker.progress()),
@@ -1058,6 +1079,11 @@ pub(crate) fn materialize(
         ssh_auth_sock,
     );
     crate::devsbd::sync_boot(&container, boot.as_ref(), false);
+    let no_signing_key = !claims::signs_git(props);
+    let git_warnings = claims::git_check(inst, no_signing_key);
+    for w in &git_warnings {
+        eprintln!("warning: {w}");
+    }
     // Nothing to run in the container: no bridge to wait for.
     let lifecycle = !shell_rc.is_empty()
         || persist_history
@@ -1108,6 +1134,12 @@ pub(crate) fn materialize(
                 cmd,
             )
             .with_context(|| format!("{name} failed"))?;
+        }
+    }
+    // Again after the lifecycle commands (dotfiles land there): only what's new.
+    if lifecycle {
+        for w in claims::git_check(inst, no_signing_key).iter().filter(|w| !git_warnings.contains(w)) {
+            eprintln!("warning: {w}");
         }
     }
 
@@ -1451,6 +1483,7 @@ mod tests {
             claims: Vec::new(),
             progress: None,
             github_repos: Vec::new(),
+            git_env: Default::default(),
             created_unix: 0,
         }
     }
@@ -2605,6 +2638,122 @@ mod tests {
             let counts = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
             assert_eq!(counts, "new=1 old=0");
             assert!(curl().lines().any(|l| l == "curl=mock-ok"), "after the reissue");
+        });
+    }
+
+    /// git wired for the github fixture's git-host claim, no network: git's
+    /// own proxy port and CA for `https://github.com/`, the ssh form and the
+    /// fenced owner's spelling rewritten, devsbd's credential helper handing
+    /// out the phantom (from the env and, with the env cleared, from the
+    /// system gitconfig copy), remoteEnv's own `GIT_CONFIG_*` kept ahead,
+    /// and the boot check flagging a planted `GIT_SSL_NO_VERIFY`.
+    #[cfg(unix)]
+    #[test_utils::docker_test(helper)]
+    fn git_wired_for_a_git_host_claim_with_docker() -> Result<(), String> {
+        isolated("git_wired_child")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_wired_child() {
+        const BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+        let Some(root) = isolated_root("git_wired_child") else { return };
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["remote", "add", "origin", "git@github.com:Org/App.git"]);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/github");
+        let feature = cfg.join("features/github");
+        std::fs::create_dir_all(&feature).unwrap();
+        for f in ["devcontainer-feature.json", "install.sh"] {
+            std::fs::copy(fixture.join(f), feature.join(f)).unwrap();
+        }
+        let name = format!("git-wired-{}", std::process::id());
+        std::fs::write(
+            cfg.join("Dockerfile"),
+            "FROM alpine:3.20\nRUN apk add --no-cache git ca-certificates && adduser -D -u 1000 dev\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!(
+                "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+                 features = {{ \"./features/github\" = {{}} }}\n\
+                 remoteEnv = {{ GIT_CONFIG_COUNT = \"1\", GIT_CONFIG_KEY_0 = \"core.editor\", \
+                 GIT_CONFIG_VALUE_0 = \"nano\", GIT_SSL_NO_VERIFY = \"1\" }}\n"
+            ),
+        )
+        .unwrap();
+
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = image::sandbox_image(&project, &name);
+        let features_image = image::features_image(&project, &name);
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().output_quiet(&["rmi", "-f", &features_image, &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            let [claim] = &info.claims[..] else { panic!("one claim: {:?}", info.claims) };
+            let intercept = info.intercept.clone().expect("an intercept side");
+            let git_port = intercept.git.clone().expect("git's own port");
+            assert_eq!(git_port.hosts, ["github.com"]);
+            assert_ne!(git_port.port, intercept.port);
+            assert!(!intercept.hosts.contains(&"github.com".to_string()), "{:?}", intercept.hosts);
+            assert_eq!(info.github_repos, ["org/app"]);
+            assert_eq!(info.git_env.get("GIT_CONFIG_KEY_0").map(String::as_str), Some("core.editor"));
+
+            let ws = &info.workspace;
+            let script = format!(
+                "cat /run/devsandbox/broker; \
+                 echo editor=$(git config --get core.editor); \
+                 git config --get-urlmatch http https://github.com/o/r; \
+                 echo insteadof=$(git config --get-all url.https://github.com/.insteadof | tr '\\n' ' '); \
+                 echo owner=$(git config --get url.https://github.com/Org/.insteadof); \
+                 echo push=$(git config --get url.https://github.com/Org/.pushinsteadof); \
+                 echo url=$(git -c safe.directory='*' -C {ws} remote get-url origin); \
+                 echo cargo=$CARGO_NET_GIT_FETCH_WITH_CLI; \
+                 printf 'protocol=https\\nhost=github.com\\n\\n' | GIT_TERMINAL_PROMPT=0 git credential fill; \
+                 echo other=$(printf 'protocol=https\\nhost=gitlab.com\\n\\n' | GIT_TERMINAL_PROMPT=0 git credential fill 2>&1 | grep -c password=); \
+                 echo cleared=$(env -i /usr/bin/git config --get-urlmatch http https://github.com/o/r | tr '\\n' ' '); \
+                 echo cleared_fill=$(printf 'protocol=https\\nhost=github.com\\n\\n' | env -i GIT_TERMINAL_PROMPT=0 /usr/bin/git credential fill | grep password=)"
+            );
+            let argv =
+                crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), script], false);
+            let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+            let lines: Vec<&str> = out.lines().collect();
+            let proxy = format!("http://127.0.0.1:{}", git_port.port);
+            let phantom = &claim.phantom;
+            for want in [
+                format!("proxy-listen {} github.com", git_port.port),
+                format!("credential github.com {phantom}"),
+                "editor=nano".into(),
+                format!("http.proxy {proxy}"),
+                format!("http.sslcainfo {BUNDLE}"),
+                // Twice: the system copy, then command scope.
+                "insteadof=git@github.com: ssh://git@github.com/ git@github.com: ssh://git@github.com/".into(),
+                "owner=https://github.com/Org/".into(),
+                "push=https://github.com/Org/".into(),
+                "url=https://github.com/Org/App.git".into(),
+                "cargo=true".into(),
+                "username=x-access-token".into(),
+                format!("password={phantom}"),
+                "other=0".into(),
+                format!("cleared=http.proxy {proxy} http.sslcainfo {BUNDLE}"),
+                format!("cleared_fill=password={phantom}"),
+            ] {
+                assert!(lines.contains(&want.as_str()), "{want} missing:\n{out}");
+            }
+
+            let warnings = claims::git_check(info, true);
+            assert!(
+                warnings.iter().any(|w| w.starts_with("`GIT_SSL_NO_VERIFY` is set")),
+                "{warnings:#?}"
+            );
+            assert!(!warnings.iter().any(|w| w.contains("remote `origin`") || w.contains("has no")), "{warnings:#?}");
         });
     }
 

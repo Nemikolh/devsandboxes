@@ -73,7 +73,7 @@ pub(crate) fn instance(key: &str, claims: Vec<InstanceClaim>) -> Instance {
 pub(crate) fn claims(selected: &[claim::Claim], phantoms: &[&str]) -> Vec<InstanceClaim> {
     let selected: Vec<(String, claim::Claim)> = selected.iter().map(|c| (format!("./{}", c.kind), c.clone())).collect();
     let mut next = phantoms.iter();
-    plan(&selected, &[], None, |_| Ok(next.next().unwrap().to_string())).unwrap().claims
+    plan(&selected, &[], None, None, |_| Ok(next.next().unwrap().to_string())).unwrap().claims
 }
 
 /// `web-1` with sentry (+ anth) and `other` with sentry.

@@ -150,14 +150,17 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   `instance::PORTS` (29000-29999: below the ephemeral range and
   Kubernetes' NodePorts, above dev-server defaults; per container, so
   instances never contend), lowest free first: one per upstream of each
-  `base-url` claim, and one shared proxy port (`instance::SharedPort`,
+  `base-url` claim, and one shared proxy port (`instance::ProxyPort`,
   saved as the instance's `intercept`, `instance::Intercept`) whose hosts
   are every `intercept` claim's upstreams but the ones its `git` field
-  names (those go only on git's own proxy port, git-gateway). Intercept
-  claims get no listener. A `rebuild` keeps each kind's phantom (while it
-  has the claim's head), each upstream's port and the shared port; a new
-  one takes a free port. The helper's broker file gets the shared port as
-  `proxy-listen` (`instance::broker_spec`). The instance's `incarnation`
+  names, which go on git's own proxy port (`Intercept::git`, one more
+  `ProxyPort`; [git](../credentials/git.md)). With only git hosts
+  intercepted, the shared port binds none. Intercept claims get no
+  listener. A `rebuild` keeps each kind's phantom (while it has the
+  claim's head), each upstream's port and both proxy ports; a new one
+  takes a free port. The helper's broker file gets each proxy port as
+  `proxy-listen` and each git host's phantom as `credential`
+  (`instance::broker_spec`). The instance's `incarnation`
   (`mint_incarnation`) is minted at create and kept by `rebuild`.
 - **Env** (`instance::env`, `-e` on the container): each `phantom.env`
   variable is the phantom, `baseUrl`'s is
@@ -171,6 +174,8 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   | `NODE_USE_ENV_PROXY` | `1` |
   | `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `REQUESTS_CA_BUNDLE`, `AWS_CA_BUNDLE` (`instance::CA_VARS`) | the image's system bundle |
   | each intercept claim's `ca.env` | the image's system bundle |
+  | `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>` (with git hosts) | the image's, `containerEnv`'s and `--env`'s own entries, renumbered from 0, then git's settings for each git host ([git](../credentials/git.md#settings)) |
+  | `CARGO_NET_GIT_FETCH_WITH_CLI` (with git hosts) | `true` |
 
   No `HTTP_PROXY` (plain HTTP is never intercepted) and no
   `SSL_CERT_FILE` (OpenSSL, libcurl, Go and Bun read the system bundle).
@@ -190,7 +195,8 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   is warned of (`instance::proxy_overrides`): set on every exec, it sends
   that exec around the shared port.
 - **The member CA** (`claims::member_cert`): before create,
-  `MemberCa::ensure_hosts` covers the shared port's hosts, reissuing the
+  `MemberCa::ensure_hosts` covers both proxy ports' hosts
+  (`Intercept::bound_hosts`), reissuing the
   cert when they're new to it; once the container exists and before
   lifecycle commands, `claims::install_trust` installs it
   ([ca](../credentials/ca.md#trust-in-containers)) and records its
@@ -198,6 +204,9 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   cert, `claims::reinstall_running` puts it into every other running
   instance with an `intercept` that lacks it. Failures are warnings: the
   run goes on, TLS to the claimed hosts failing.
+- **git** (with git hosts): the system gitconfig copy right after the CA
+  install, and the boot check before and after the lifecycle commands
+  ([git](../credentials/git.md)).
 - **Phantom files** (`instance::render_files`): each template with
   `{phantom}` and `{baseUrl}` filled, at its path under the remote user's
   home (`facts::home`), owned by the exec user. One on or under a mount or
@@ -216,8 +225,9 @@ after `devsbd identity apply`, so the files get the account's final ids;
 at `start`, a bridge's heal and a forward's resolve through
 `devsbd::ensure_recorded`, as `/run` may be a tmpfs:
 [in-container](../helper/in-container.md#broker-listeners)). The VS Code
-name config marks the listener ports `onAutoForward: ignore`, and
-`forwards.*` refuses them ([forwards](../daemon/forwards.md)).
+name config marks the listener and proxy ports `onAutoForward: ignore`,
+and `forwards.*` refuses them (`instance::ports`, `forward_refusal`;
+[forwards](../daemon/forwards.md)).
 
 ## Drift and logs
 

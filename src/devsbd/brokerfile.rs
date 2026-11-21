@@ -12,6 +12,8 @@
 //! proxy-listen 41000 api.github.com github.com
 //!                                        a loopback proxy port: port, the hosts it
 //!                                        hands the broker (intercept)
+//! credential github.com dsbx_github_x    a git host and the phantom `devsbd credential`
+//!                                        answers for it
 //! file vscode /home/vscode/.sentryclirc\0sntrys_x\0[auth]\ntoken=sntrys_x\n
 //!                                        a phantom file: owner, path, phantom, content
 //! proxy HTTPS_PROXY=http://proxy:3128    the container's own proxy env, in order
@@ -20,11 +22,14 @@
 //! `file`'s owner is `name|uid[:group|gid]` (no spaces), resolved in the
 //! container at write time; then, split on NUL, the absolute path, the
 //! phantom the content holds, and the content. Values are escaped
-//! (`escape.rs`). `proxy-listen` may name no host (a proxy that dials
-//! every target itself). Anything else (an unknown key, a bad escape, a
-//! port twice across `listen` and `proxy-listen`, a host twice on one
-//! proxy port, a file twice, a relative path or one with `.`/`..`, content
-//! without its phantom) is a parse error: host and helper ship together.
+//! (`escape.rs`). Phantoms aren't secrets (the broker swaps them only for
+//! this instance's own calls), so the file is world-readable: git's
+//! credential helper runs as whoever runs git. `proxy-listen` may name no
+//! host (a proxy that dials every target itself). Anything else (an
+//! unknown key, a bad escape, a port twice across `listen` and
+//! `proxy-listen`, a host twice on one proxy port or across `credential`s,
+//! a file twice, a relative path or one with `.`/`..`, content without its
+//! phantom) is a parse error: host and helper ship together.
 
 use super::escape::{escape, unescape};
 
@@ -40,6 +45,15 @@ pub struct BrokerSpec {
     /// The proxy the container had: how a proxy port dials what it doesn't
     /// hand the broker.
     pub proxy_env: Vec<(String, String)>,
+    /// What `devsbd credential get` hands git, per git host.
+    pub credentials: Vec<Credential>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credential {
+    /// Bare lowercase hostname, as git's `host=` names it.
+    pub host: String,
+    pub phantom: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +107,13 @@ pub fn serialize(spec: &BrokerSpec) -> String {
         }
         out.push('\n');
     }
+    for c in &spec.credentials {
+        out.push_str("credential ");
+        escape(&c.host, &mut out);
+        out.push(' ');
+        escape(&c.phantom, &mut out);
+        out.push('\n');
+    }
     for f in &spec.files {
         out.push_str("file ");
         escape(&f.owner, &mut out);
@@ -140,6 +161,13 @@ pub fn parse(text: &str) -> Result<BrokerSpec, String> {
                     return Err(at(format!("port {} listed twice", listener.port)));
                 }
                 spec.proxy_listeners.push(listener);
+            }
+            "credential" => {
+                let credential = parse_credential(rest).map_err(at)?;
+                if spec.credentials.iter().any(|c| c.host == credential.host) {
+                    return Err(at(format!("credential host `{}` listed twice", credential.host)));
+                }
+                spec.credentials.push(credential);
             }
             "file" => {
                 let file = parse_file(rest).map_err(at)?;
@@ -203,6 +231,21 @@ fn parse_proxy_listener(rest: &str) -> Result<ProxyListener, String> {
     Ok(ProxyListener { port, hosts })
 }
 
+fn parse_credential(rest: &str) -> Result<Credential, String> {
+    let fields: Vec<&str> = rest.split(' ').collect();
+    let [host, phantom] = fields[..] else {
+        return Err(format!("credential `{rest}`: want `<host> <phantom>`"));
+    };
+    if !is_hostname(host) {
+        return Err(format!("credential host `{host}` isn't a lowercase hostname"));
+    }
+    let phantom = unescape(phantom)?;
+    if phantom.is_empty() || phantom.chars().any(|c| c.is_control()) {
+        return Err(format!("credential `{host}`: phantom `{phantom}`"));
+    }
+    Ok(Credential { host: host.to_string(), phantom })
+}
+
 /// The claim's own rule for upstreams (`credentials::claim`), restated
 /// std-only: dot-separated labels of lowercase letters, digits and inner
 /// `-`, no trailing dot.
@@ -250,6 +293,7 @@ listen 41002 base-url us.sentry.io\n\
 proxy-listen 41000 api.github.com github.com\n\
 proxy-listen 41003 github.com\n\
 proxy-listen 41004\n\
+credential github.com dsbx_github_x\n\
 file vscode /home/vscode/.sentryclirc\0sntrys_x\0[auth]\\ntoken=sntrys_x\\n\n\
 file 1000:1000 /home/u/a b/c\\\\d\0p\0p\n\
 proxy HTTPS_PROXY=http://proxy:3128\n\
@@ -281,6 +325,7 @@ proxy NO_PROXY=\n";
                 },
             ],
             proxy_env: vec![("HTTPS_PROXY".into(), "http://proxy:3128".into()), ("NO_PROXY".into(), "".into())],
+            credentials: vec![Credential { host: "github.com".into(), phantom: "dsbx_github_x".into() }],
         }
     }
 
@@ -333,6 +378,11 @@ proxy NO_PROXY=\n";
             ("file u /a\0p\0p\nfile v /a\0q\0q\n", "line 2: `/a` listed twice"),
             ("file u /a\\t\0p\0p\n", "bad escape"),
             ("proxy NOEQUALS\n", "proxy without `=`"),
+            ("credential github.com\n", "want `<host> <phantom>`"),
+            ("credential github.com a b\n", "want `<host> <phantom>`"),
+            ("credential GitHub.com p\n", "isn't a lowercase hostname"),
+            ("credential github.com \n", "phantom ``"),
+            ("credential github.com p\ncredential github.com q\n", "line 2: credential host `github.com` listed twice"),
             ("proxy =x\n", "proxy variable ``"),
         ] {
             let err = parse(text).unwrap_err();

@@ -86,6 +86,15 @@ pub(crate) fn plain_host(host: &str) -> bool {
 /// such as `github-work`, `ssh -G`'s `hostname`) when it isn't GitHub's
 /// own. `None`: not a GitHub repo URL.
 pub(crate) fn github_repo(url: &str, resolve: &mut dyn FnMut(&str) -> Option<String>) -> Option<String> {
+    github_parts(url, resolve).map(|(_, repo)| repo)
+}
+
+/// [`github_repo`] with the owner as `url` spells it: git's `insteadOf`
+/// matches case-sensitively, so a rewrite naming the owner must too.
+pub(crate) fn github_parts<'a>(
+    url: &'a str,
+    resolve: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<(&'a str, String)> {
     let remote = parse(url)?;
     let github = match remote.scheme {
         Scheme::Https => remote.host == "github.com" && remote.port.is_none_or(|p| p == "443"),
@@ -106,7 +115,7 @@ pub(crate) fn github_repo(url: &str, resolve: &mut dyn FnMut(&str) -> Option<Str
         _ => remote.path.strip_prefix('/').unwrap_or(remote.path),
     };
     let (owner, repo) = path.split_once('/')?;
-    normalize(owner, repo)
+    Some((owner, normalize(owner, repo)?))
 }
 
 /// `owner/repo` lowercased, `.wiki.git` or `.git` dropped from `repo`;

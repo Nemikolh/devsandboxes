@@ -51,6 +51,7 @@
   ]
   ```
 
+- **git in the sandbox goes through the broker for a git-host claim.** Remotes stay `https://github.com/` URLs (gh still finds its repo), and `git@github.com:` / `ssh://git@github.com/` remotes are rewritten to them. git reaches GitHub on a proxy port of its own with the member CA trusted, and devsandbox's credential helper hands it the phantom, so the broker adds the real token. Your `store`/`cache` helpers never see it. The settings are git's command-scope env (`GIT_CONFIG_*`, which a config's own entries are kept ahead of), plus a copy in `/etc/gitconfig` for tools that clear the env. At `run` (again after the lifecycle commands) and `start`, devsandbox warns of what would still send git around the broker: a dotfile's proxy or CA bundle for GitHub, `GIT_SSL_*` or a `NO_PROXY` covering GitHub, a remote left on ssh, or ssh commit signing with no `signing-only` key.
 - **`devsandbox vscode` asks before handing a sandbox your logins.** VS Code's attach gives the sandbox your host's git credentials and whole ssh-agent, so `vscode` (and the dashboard's `o`) refuses an instance with a credential claim; `--allow-credential-leak` opens it anyway, with a warning.
 - **`access.log`**, next to `state.toml`: one JSON line per call a sandbox made through the broker (instance, credential, route, scope, verdict, status), never a token.
 
