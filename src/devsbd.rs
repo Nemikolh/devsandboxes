@@ -416,7 +416,7 @@ pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> 
 /// that reports it elsewhere (the daemon's `serve.log`).
 pub fn ensure_recorded_or_reason(key: &str, info: &Instance, quiet: bool) -> Result<Arch, String> {
     // Every time: `/run` may be a tmpfs that a restart emptied.
-    let broker = crate::credentials::instance::broker_spec(&info.claims);
+    let broker = crate::credentials::instance::broker_spec(&info.claims, info.intercept.as_ref());
     let result = ensure_with_broker(&info.container, info.devsbd_arch, broker.as_ref());
     let (arch, error) = match &result {
         Ok(arch) => (Some(*arch), None),

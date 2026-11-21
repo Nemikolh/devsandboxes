@@ -93,7 +93,9 @@ phantoms and listener ports) carry over.
 5. Phase `building`: `image_for`, then the identity plan
    (`identity::plan_for`: probe, plan, its summary and warnings on
    stderr; [identity](identity.md)), then the credential claims
-   (`claims::wire`: refusals, phantoms, ports, env, phantom files;
+   (`claims::wire`: refusals, phantoms, ports, env, phantom files; with
+   intercept claims the image's system bundle probed and the member CA
+   covering their hosts;
    [images and features](images-and-features.md#credential-claims)).
    Phase `creating`: `run_container`
    (`run -d`, labels, `--privileged`, the GPU flags, the plan's
@@ -102,13 +104,17 @@ phantoms and listener ports) carry over.
    `sh -c '[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity'`,
    `container_command`), then
    `connect_networks`, `wire_service_dns`, install the `devsbd` helper
-   and write its broker file (`devsbd::prepare`),
+   and write its broker file (`devsbd::prepare`), install the member CA
+   into the system bundle as root when the instance intercepts
+   (`claims::install_trust`; [ca](../credentials/ca.md#trust-in-containers)),
    `devsbd identity apply` as root (a failure fails the create), start the
    helper's daemon, `devsbd
    userns check` as the exec user (the tool env,
    [identity](identity.md#the-check-and-the-env)), the exec cgroup check
    (below), write the `.code-workspace` file.
-6. Save the record (still in flight), write the VS Code name config (with
+6. Save the record (still in flight); when this run reissued the member
+   CA, install it in the other running instances that intercept
+   (`claims::reinstall_running`); write the VS Code name config (with
    the broker ports' `portsAttributes`), sync the helper's boot file.
 7. Lifecycle (phase = step name): `shell-rc` wiring if any, then
    `onCreateCommand`, `updateContentCommand`, `postCreateCommand`,
@@ -153,13 +159,15 @@ the pid is dead or the boot id changed, so nobody rewrites records.
   the config still resolves for this root: drift warning
   ([rebuild and drift](rebuild-and-drift.md)), `start` the container, apply
   the restart policy, ensure the helper (its broker file rewritten before
-  its daemon starts), the exec cgroup check,
+  its daemon starts), the exec cgroup check, reinstall the member CA when
+  the one installed isn't current (`run::refresh_trust`),
   `ensure_services` +
   `wire_service_dns`, sync the boot file, then exec `postStartCommand` itself
   unless the in-container boot hook already runs it (`autostart = "runtime"`
   on a runtime with restart policies; a container predating the hook warns
   to `rebuild --force`). Otherwise it bare-starts the
-  container and its labelled isolated services. A missing container is an
+  container and its labelled isolated services, then ensures the helper
+  and refreshes the CA the same way. A missing container is an
   error (its message points at `devsandbox run`).
 - `stop <name>|--all`: stops the container, then its isolated services.
   Global services keep running.

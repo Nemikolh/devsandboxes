@@ -593,6 +593,18 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    the pinned `login` entry and so the claim's version.
 3. The member CA (`rcgen` for leaves), intercept mode, trust installed
    at create.
+   Built: the CA ([ca](../../architecture/credentials/ca.md)), the
+   helper's proxy ports, the broker terminating TLS
+   ([broker](../../architecture/credentials/broker.md#intercept-mode)),
+   and `run`'s wiring: the shared proxy port, its env, the CA installed
+   at create, reinstalled at `start` and into running instances when a
+   `run` reissues it
+   ([images and features](../../architecture/instances/images-and-features.md#credential-claims)).
+   Two intercept claims of one upstream in a sandbox are refused. The
+   Mozilla set for an image without a bundle comes from
+   `webpki-root-certs` (`webpki-roots` has trust anchors, not whole
+   certificates). Left: hosts a claim's `git` field names stay off the
+   shared port until git-gateway step 1 builds git's own.
 4. Permission requests: API, CLI, dashboard modal; remembered answers;
    `approvers` (a headless home's asks answered from a laptop); a
    sandbox's config edit confirmed on the host.

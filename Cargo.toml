@@ -39,6 +39,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8.5"
 # The member CA and its leaves (`credentials::ca`), on ring like rustls.
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+# The bundle written into an image that has none (`credentials::trust`):
+# webpki-roots' Mozilla set as whole certificates, which a PEM bundle needs.
+webpki-root-certs = "1"
 # An upstream's gzip/deflate answer despite `Accept-Encoding: identity`.
 flate2 = "1.1.11"
 toml = "1.1.5"

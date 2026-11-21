@@ -32,6 +32,7 @@
   scopes = ["releases.write", "uploads"]
   ```
 
+- **Intercept-mode credential claims.** A feature whose claim intercepts its hosts (gh's `api.github.com`, say) now works with the tool as it ships: the sandbox gets `HTTPS_PROXY` pointing at the helper, which hands only the claimed hosts to the broker and dials everything else itself (through the proxy the container already had, if any). The broker's per-host certificates chain to this host's member CA, which `run` installs into the container's system CA bundle (`update-ca-certificates`, `update-ca-trust`, or the bundle itself) and names in `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `REQUESTS_CA_BUNDLE` and `AWS_CA_BUNDLE`. A new claimed host reissues the CA and reinstalls it in the running sandboxes; a stopped one gets it at `start`. `run` warns when `remoteEnv` or `--env` sets a proxy variable, which would bypass the route.
 - **`access.log`**, next to `state.toml`: one JSON line per call a sandbox made through the broker (instance, credential, route, scope, verdict, status), never a token.
 
 ### Changed

@@ -131,6 +131,7 @@ mod tests {
                 forwarded_ports: Default::default(),
                 done: None,
                 incarnation: None,
+                intercept: None,
                 claims: Vec::new(),
                 progress: None,
                 created_unix: 0,

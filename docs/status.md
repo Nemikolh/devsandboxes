@@ -342,16 +342,20 @@ is frozen: no new work on it.
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
   `approvers`, `delegate` and `as` parse but nothing reads them yet.
   → [login](architecture/credentials/login.md); `commands::login::choose`
-- Intercept-mode claims are skipped at `run` until credential-broker
-  step 3's run wiring lands (the broker terminates TLS for intercepted
-  hosts and the helper's proxy ports route them, but `run` sets no
-  `HTTPS_PROXY` / `NO_PROXY` env, installs no member CA trust at create,
-  calls no `ensure_hosts` and doesn't reinstall a reissued cert, so the
-  broker covers a host on demand and a container's trust stays stale),
-  and claims on an instance placed by another member until step 5
-  (`CRED`), each with a warning.
-  → [images and features](architecture/instances/images-and-features.md#credential-claims);
-  `credentials::instance::select`, `commands::run::claims::wire`
+- Intercept claims' hosts that their `git` field names get no proxy port
+  yet: they're kept off the shared one for git's own port (git-gateway
+  step 1), so git to them goes direct, and a claim with only git hosts
+  gets no proxy env and no CA install at all. The CA variables point at
+  the Debian bundle path when the image probe can't run (Apple
+  `container`), where the install writes the Mozilla set plus the CA if
+  that file is missing. A CA reissued by the broker itself (a host it
+  covers on demand, `member-ca.toml` removed since the run) reaches a
+  running container only at its next `start`. Claims on an
+  instance placed by another member are skipped with a warning until
+  credential-broker step 5 (`CRED`).
+  → [images and features](architecture/instances/images-and-features.md#credential-claims),
+  [ca](architecture/credentials/ca.md#trust-in-containers);
+  `credentials::instance::plan`, `commands::run::claims::wire`
 - The broker refuses every ask: a scope in `access.<kind>.ask` and a
   route in no scope (`other`) get a 403 saying asks need permission
   requests (credential-broker step 4); `presence` routes pass. No repo

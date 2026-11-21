@@ -130,8 +130,10 @@ turns into on the instance, in `materialize` once the identity plan is
 known (`claims::wire`, the pure parts in `credentials::instance`):
 
 - **Which apply** (`instance::select`): a second feature claiming a kind
-  another feature claims is refused, naming both. An `intercept` claim is
-  skipped with a warning. On an instance placed here by another member
+  another feature claims is refused, naming both, and so is a second
+  `intercept` claim of an upstream another intercept claim has (the broker
+  picks a connection's claim by its host), naming both features. On an
+  instance placed here by another member
   (its config root under the fleet dir, `worker_policy::fleet_root_of`)
   every claim is skipped with a warning, and off unix too (no daemon).
 - **The credential** (`home::resolve` over `credentials.toml`): the one
@@ -144,16 +146,58 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   credential serves a claim isn't kept: the broker resolves it per call.
 - **Phantoms and ports** (`instance::plan`): per claim a phantom, the
   claim's `phantom.prefix` (else `dsbx_<kind>_`) and 24 random base62
-  characters (`mint_phantom`), and a container-loopback port per upstream
-  from `instance::PORTS` (29000-29999: below the ephemeral range and
+  characters (`mint_phantom`), and container-loopback ports from
+  `instance::PORTS` (29000-29999: below the ephemeral range and
   Kubernetes' NodePorts, above dev-server defaults; per container, so
-  instances never contend), lowest free first. A `rebuild` keeps each
-  kind's phantom (while it has the claim's head) and each upstream's port;
-  a new upstream takes a free one. The instance's `incarnation`
+  instances never contend), lowest free first: one per upstream of each
+  `base-url` claim, and one shared proxy port (`instance::SharedPort`,
+  saved as the instance's `intercept`, `instance::Intercept`) whose hosts
+  are every `intercept` claim's upstreams but the ones its `git` field
+  names (those go only on git's own proxy port, git-gateway). Intercept
+  claims get no listener. A `rebuild` keeps each kind's phantom (while it
+  has the claim's head), each upstream's port and the shared port; a new
+  one takes a free port. The helper's broker file gets the shared port as
+  `proxy-listen` (`instance::broker_spec`). The instance's `incarnation`
   (`mint_incarnation`) is minted at create and kept by `rebuild`.
 - **Env** (`instance::env`, `-e` on the container): each `phantom.env`
   variable is the phantom, `baseUrl`'s is
-  `http://127.0.0.1:<the first upstream's port>`.
+  `http://127.0.0.1:<the first upstream's port>`. With a shared proxy port
+  (`instance::intercept_env`):
+
+  | Variable | Value |
+  | --- | --- |
+  | `HTTPS_PROXY`, `https_proxy` | `http://127.0.0.1:<shared port>` |
+  | `NO_PROXY`, `no_proxy` | `localhost,127.0.0.1,::1`, the instance's services' aliases, then the container's own `NO_PROXY` and `no_proxy` entries, minus every entry that would exempt a bound host (`instance::no_proxy`) |
+  | `NODE_USE_ENV_PROXY` | `1` |
+  | `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `REQUESTS_CA_BUNDLE`, `AWS_CA_BUNDLE` (`instance::CA_VARS`) | the image's system bundle |
+  | each intercept claim's `ca.env` | the image's system bundle |
+
+  No `HTTP_PROXY` (plain HTTP is never intercepted) and no
+  `SSL_CERT_FILE` (OpenSSL, libcurl, Go and Bun read the system bundle).
+  The system bundle is probed from the built image before create
+  (`claims::probe_bundle`, `credentials::trust::PROBE_SCRIPT`, a
+  throwaway container like `image_passwd`'s):
+  `/etc/ssl/certs/ca-certificates.crt` (Debian, Ubuntu, Alpine),
+  `/etc/pki/tls/certs/ca-bundle.crt` (Fedora, RHEL),
+  `/etc/ssl/ca-bundle.pem` (openSUSE); none, or a probe that can't run,
+  is the Debian path, where the install writes one. The proxy env the
+  container would have had (`instance::original_proxy_env`: the image's
+  `ENV`, then `containerEnv`, then `--env`, each variable's last value)
+  is saved on the `intercept` and written to the broker file as its
+  `proxy` lines, how devsbd dials the targets it doesn't hand the broker;
+  never the `HTTPS_PROXY` set here, which would loop. A `remoteEnv` or
+  `--env` setting `HTTPS_PROXY`, `https_proxy`, `NO_PROXY` or `no_proxy`
+  is warned of (`instance::proxy_overrides`): set on every exec, it sends
+  that exec around the shared port.
+- **The member CA** (`claims::member_cert`): before create,
+  `MemberCa::ensure_hosts` covers the shared port's hosts, reissuing the
+  cert when they're new to it; once the container exists and before
+  lifecycle commands, `claims::install_trust` installs it
+  ([ca](../credentials/ca.md#trust-in-containers)) and records its
+  fingerprint as the `intercept`'s `installed`. When this run reissued the
+  cert, `claims::reinstall_running` puts it into every other running
+  instance with an `intercept` that lacks it. Failures are warnings: the
+  run goes on, TLS to the claimed hosts failing.
 - **Phantom files** (`instance::render_files`): each template with
   `{phantom}` and `{baseUrl}` filled, at its path under the remote user's
   home (`facts::home`), owned by the exec user. One on or under a mount or

@@ -1,8 +1,9 @@
 //! What an instance carries for its credential claims (credential-broker,
 //! *Phantoms*, *In the container*): per claim its phantom, its loopback
-//! listeners and its phantom files, made at `run`, kept by `rebuild`, saved
-//! on the `Instance` in `state.toml` and gone with it at `rm`. Pure: `run`
-//! (`commands::run::claims`) does the I/O.
+//! listeners (base-URL claims) and its phantom files, plus, with intercept
+//! claims, the shared proxy port ([`Intercept`]), made at `run`, kept by
+//! `rebuild`, saved on the `Instance` in `state.toml` and gone with it at
+//! `rm`. Pure: `run` (`commands::run::claims`) does the I/O.
 //!
 //! The broker reads these per call: the bridge names the instance, its
 //! claims give the phantom table ([`by_phantom`]) and each listener's
@@ -10,7 +11,7 @@
 //! copy. Which home entry serves a claim isn't kept: profiles and config
 //! change, so it's resolved per call (`credentials::home::resolve`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, bail};
@@ -58,6 +59,42 @@ pub struct Listener {
     pub upstream: String,
 }
 
+/// An instance's intercept side: one proxy port handing `hosts` (every
+/// intercept claim's upstreams but the ones only git's own port takes,
+/// git-gateway) to the broker, the proxy env the container had (how devsbd
+/// dials every other target), the system bundle the CA variables name, and
+/// the member CA cert last installed there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Intercept {
+    /// On the container's `127.0.0.1`, from [`PORTS`], kept by `rebuild`.
+    pub port: u16,
+    pub hosts: Vec<String>,
+    /// [`original_proxy_env`]; never the `HTTPS_PROXY` `run` sets, which
+    /// would loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_env: Vec<(String, String)>,
+    pub bundle: String,
+    /// [`crate::credentials::trust::fingerprint`] of the cert installed;
+    /// `None` until an install succeeds. `start` reinstalls on a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+}
+
+/// The shared proxy port [`plan`] picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedPort {
+    pub port: u16,
+    pub hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    pub claims: Vec<InstanceClaim>,
+    /// `None` without an intercept claim (or with only git's hosts).
+    pub proxy: Option<SharedPort>,
+}
+
 /// A phantom file as devsbd writes it ([`brokerfile::PhantomFile`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,13 +117,19 @@ pub fn by_port(claims: &[InstanceClaim], port: u16) -> Option<(&InstanceClaim, &
         .find_map(|c| c.listeners.iter().find(|l| l.port == port).map(|l| (c, l.upstream.as_str())))
 }
 
-pub fn ports(claims: &[InstanceClaim]) -> impl Iterator<Item = u16> + '_ {
-    claims.iter().flat_map(|c| c.listeners.iter().map(|l| l.port))
+/// Every broker port: the listeners, then the shared proxy port.
+pub fn ports<'a>(claims: &'a [InstanceClaim], intercept: Option<&'a Intercept>) -> impl Iterator<Item = u16> + 'a {
+    claims.iter().flat_map(|c| c.listeners.iter().map(|l| l.port)).chain(intercept.map(|i| i.port))
 }
 
-/// `forwards.*`' refusal of a container port that's a broker listener: the
-/// listener answers only the container's own clients.
-pub fn forward_refusal(claims: &[InstanceClaim], key: &str, port: u16) -> Option<String> {
+/// `forwards.*`' refusal of a container port that's a broker port: it
+/// answers only the container's own clients.
+pub fn forward_refusal(claims: &[InstanceClaim], intercept: Option<&Intercept>, key: &str, port: u16) -> Option<String> {
+    if intercept.is_some_and(|i| i.port == port) {
+        return Some(format!(
+            "port {port} of `{key}` is its credential broker proxy port, which only the sandbox itself may reach"
+        ));
+    }
     let (claim, _) = by_port(claims, port)?;
     Some(format!(
         "port {port} of `{key}` is its `{}` credential broker listener, which only the sandbox itself may reach",
@@ -94,8 +137,9 @@ pub fn forward_refusal(claims: &[InstanceClaim], key: &str, port: u16) -> Option
     ))
 }
 
-/// The helper's broker file for `claims`; `None` without any.
-pub fn broker_spec(claims: &[InstanceClaim]) -> Option<BrokerSpec> {
+/// The helper's broker file for `claims` and the instance's intercept
+/// side; `None` without any claim.
+pub fn broker_spec(claims: &[InstanceClaim], intercept: Option<&Intercept>) -> Option<BrokerSpec> {
     if claims.is_empty() {
         return None;
     }
@@ -117,17 +161,21 @@ pub fn broker_spec(claims: &[InstanceClaim]) -> Option<BrokerSpec> {
             content: f.content.clone(),
         })
         .collect();
-    Some(BrokerSpec { listeners, proxy_listeners: Vec::new(), files, proxy_env: Vec::new() })
+    let (proxy_listeners, proxy_env) = match intercept {
+        Some(i) => (vec![brokerfile::ProxyListener { port: i.port, hosts: i.hosts.clone() }], i.proxy_env.clone()),
+        None => (Vec::new(), Vec::new()),
+    };
+    Some(BrokerSpec { listeners, proxy_listeners, files, proxy_env })
 }
 
 /// Of the claims a sandbox's features make (feature, claim), the ones `run`
-/// wires, plus a warning per one it skips. One feature per instance claims
-/// a credential: a second is refused, naming both.
-pub fn select(found: Found) -> Result<(Found, Vec<String>)> {
-    let mut kept: Found = Vec::new();
+/// wires. One feature per instance claims a credential: a second is
+/// refused, naming both; so is a second intercept claim of an upstream (the
+/// broker picks a connection's claim by its host), naming both features.
+pub fn select(found: Found) -> Result<Found> {
     let mut seen: Vec<(String, String)> = Vec::new();
-    let mut warnings = Vec::new();
-    for (feature, claim) in found {
+    let mut intercepted: BTreeMap<String, String> = BTreeMap::new();
+    for (feature, claim) in &found {
         if let Some((_, first)) = seen.iter().find(|(kind, _)| *kind == claim.kind) {
             bail!(
                 "features `{first}` and `{feature}` both claim the `{}` credential: one feature per sandbox may",
@@ -135,16 +183,19 @@ pub fn select(found: Found) -> Result<(Found, Vec<String>)> {
             );
         }
         seen.push((claim.kind.clone(), feature.clone()));
-        if claim.pinned.mode == Mode::Intercept {
-            warnings.push(format!(
-                "feature `{feature}`: the `{}` claim is intercept mode, not built yet (credential-broker step 3): skipped",
-                claim.kind
-            ));
+        if claim.pinned.mode != Mode::Intercept {
             continue;
         }
-        kept.push((feature, claim));
+        for u in &claim.pinned.upstreams {
+            if let Some(first) = intercepted.insert(u.host.clone(), feature.clone()) {
+                bail!(
+                    "features `{first}` and `{feature}` both intercept `{}`: one intercept claim per upstream in a sandbox",
+                    u.host
+                );
+            }
+        }
     }
-    Ok((kept, warnings))
+    Ok(found)
 }
 
 /// What a claim's phantom starts with: its declared prefix, else
@@ -184,15 +235,19 @@ fn random_base62(len: usize) -> Result<String> {
 }
 
 /// The records for `selected` (run's kept claims), files left to
-/// [`render_files`]. From `prior` (the instance being rebuilt) each kind
-/// keeps its phantom, while it still has the claim's head, and each
-/// upstream its port; new upstreams take the lowest free ports of
-/// [`PORTS`]. `mint` makes a new phantom.
+/// [`render_files`], and the shared proxy port. Base-URL claims get a
+/// listener per upstream; intercept claims none: their upstreams go on the
+/// shared port, but for the hosts their `git` field names (git's own port,
+/// git-gateway). From `prior` (the instance being rebuilt) each kind keeps
+/// its phantom, while it still has the claim's head, each upstream its
+/// port, and the shared port `prior_port`; new ones take the lowest free
+/// ports of [`PORTS`]. `mint` makes a new phantom.
 pub fn plan(
     selected: &[(String, Claim)],
     prior: &[InstanceClaim],
+    prior_port: Option<u16>,
     mut mint: impl FnMut(&Claim) -> Result<String>,
-) -> Result<Vec<InstanceClaim>> {
+) -> Result<Planned> {
     let mut taken: BTreeSet<u16> = BTreeSet::new();
     let mut out = Vec::new();
     for (feature, claim) in selected {
@@ -201,9 +256,8 @@ pub fn plan(
             Some(p) => p.phantom.clone(),
             None => mint(claim)?,
         };
-        let listeners = claim
-            .pinned
-            .upstreams
+        let listened = if claim.pinned.mode == Mode::BaseUrl { claim.pinned.upstreams.as_slice() } else { &[] };
+        let listeners = listened
             .iter()
             .map(|u| {
                 let kept = before.and_then(|p| p.listeners.iter().find(|l| l.upstream == u.host)).map(|l| l.port);
@@ -221,12 +275,110 @@ pub fn plan(
             files: Vec::new(),
         });
     }
-    for l in out.iter_mut().flat_map(|c| c.listeners.iter_mut()).filter(|l| l.port == 0) {
+    let hosts: BTreeSet<String> = selected
+        .iter()
+        .map(|(_, c)| c)
+        .filter(|c| c.pinned.mode == Mode::Intercept)
+        .flat_map(|c| {
+            let git = c.wiring.git.as_ref().map(|g| g.hosts.as_slice()).unwrap_or_default();
+            c.pinned.upstreams.iter().filter(move |u| !git.contains(&u.host)).map(|u| u.host.clone())
+        })
+        .collect();
+    let kept_port = prior_port.filter(|p| !hosts.is_empty() && PORTS.contains(p) && taken.insert(*p));
+    let mut free = || -> Result<u16> {
         let port = PORTS.clone().find(|p| !taken.contains(p)).context("out of credential broker ports")?;
         taken.insert(port);
-        l.port = port;
+        Ok(port)
+    };
+    for l in out.iter_mut().flat_map(|c| c.listeners.iter_mut()).filter(|l| l.port == 0) {
+        l.port = free()?;
     }
-    Ok(out)
+    let proxy = match (hosts.is_empty(), kept_port) {
+        (true, _) => None,
+        (false, Some(port)) => Some(SharedPort { port, hosts: hosts.into_iter().collect() }),
+        (false, None) => Some(SharedPort { port: free()?, hosts: hosts.into_iter().collect() }),
+    };
+    Ok(Planned { claims: out, proxy })
+}
+
+/// The proxy variables `run` reads from the container's env.
+pub const PROXY_VARS: [&str; 8] =
+    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+
+/// Variables naming a CA bundle that add to a tool's roots
+/// (`NODE_EXTRA_CA_CERTS`, `DENO_CERT`) or replace certifi's
+/// (`REQUESTS_CA_BUNDLE`, `AWS_CA_BUNDLE`), each pointed at the system
+/// bundle itself so a CA added to it later still counts. No
+/// `SSL_CERT_FILE`: OpenSSL, libcurl, Go and Bun read the system bundle.
+pub const CA_VARS: [&str; 4] = ["NODE_EXTRA_CA_CERTS", "DENO_CERT", "REQUESTS_CA_BUNDLE", "AWS_CA_BUNDLE"];
+
+const LOOPBACK: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// The proxy env the container has without `run`'s: of `layers` (key,
+/// value) in the order they apply (the image's `ENV`, then `containerEnv`,
+/// then `--env`), each of [`PROXY_VARS`]' last value.
+pub fn original_proxy_env<'a>(layers: impl IntoIterator<Item = (&'a String, &'a String)>) -> Vec<(String, String)> {
+    let mut last: BTreeMap<&str, &str> = BTreeMap::new();
+    for (k, v) in layers {
+        if let Some(var) = PROXY_VARS.iter().find(|var| **var == k.as_str()) {
+            last.insert(var, v);
+        }
+    }
+    PROXY_VARS.iter().filter_map(|var| last.get(var).map(|v| (var.to_string(), v.to_string()))).collect()
+}
+
+/// `NO_PROXY`'s value: loopback, the services' `aliases`, then the
+/// container's own `NO_PROXY` and `no_proxy` entries, each but the ones
+/// that would exempt a bound host (it would skip the broker).
+pub fn no_proxy(original: &[(String, String)], bound: &[String], aliases: &[String]) -> String {
+    let theirs = original
+        .iter()
+        .filter(|(k, _)| k == "NO_PROXY" || k == "no_proxy")
+        .flat_map(|(_, v)| v.split(','))
+        .map(str::trim);
+    let mut out: Vec<&str> = Vec::new();
+    for entry in LOOPBACK.into_iter().chain(aliases.iter().map(String::as_str)).chain(theirs) {
+        if !entry.is_empty() && !out.contains(&entry) && !bound.iter().any(|h| exempts(entry, h)) {
+            out.push(entry);
+        }
+    }
+    out.join(",")
+}
+
+/// Whether `NO_PROXY` entry `entry` (`*`, a name, `.name`, `*.name`, with
+/// or without `:port`) exempts `host`, as curl and Go read it.
+fn exempts(entry: &str, host: &str) -> bool {
+    let entry = entry.to_ascii_lowercase();
+    let name = match entry.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => entry.as_str(),
+    };
+    let name = name.trim_start_matches('*').trim_start_matches('.').trim_end_matches('.');
+    name.is_empty() || host == name || host.strip_suffix(name).is_some_and(|rest| rest.ends_with('.'))
+}
+
+/// The container env an intercept side sets: both cases of `HTTPS_PROXY`
+/// and `NO_PROXY` ([`no_proxy`], with the services' `aliases`),
+/// `NODE_USE_ENV_PROXY`, and [`CA_VARS`] at the system bundle.
+pub fn intercept_env(intercept: &Intercept, aliases: &[String]) -> Vec<(String, String)> {
+    let proxy = format!("http://127.0.0.1:{}", intercept.port);
+    let no_proxy = no_proxy(&intercept.proxy_env, &intercept.hosts, aliases);
+    let mut out = vec![
+        ("HTTPS_PROXY".to_string(), proxy.clone()),
+        ("https_proxy".to_string(), proxy),
+        ("NO_PROXY".to_string(), no_proxy.clone()),
+        ("no_proxy".to_string(), no_proxy),
+        ("NODE_USE_ENV_PROXY".to_string(), "1".to_string()),
+    ];
+    out.extend(CA_VARS.iter().map(|v| (v.to_string(), intercept.bundle.clone())));
+    out
+}
+
+/// The proxy variables of `keys` (remoteEnv's, `--env`'s): set on every
+/// exec, they'd send it around the shared port.
+pub fn proxy_overrides<'a>(keys: impl IntoIterator<Item = &'a String>) -> Vec<&'a str> {
+    let routed = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"];
+    keys.into_iter().map(String::as_str).filter(|k| routed.contains(k)).collect()
 }
 
 /// `baseUrl`'s value: the listener standing for the claim's first upstream.
@@ -296,14 +448,25 @@ mod tests {
     }
 
     fn intercept(kind: &str) -> Claim {
-        let v = serde_json::json!({
-            "upstreams": ["api.github.com"],
+        intercept_of(kind, serde_json::json!(["api.github.com"]), None)
+    }
+
+    fn intercept_of(kind: &str, upstreams: serde_json::Value, git: Option<serde_json::Value>) -> Claim {
+        let mut v = serde_json::json!({
+            "upstreams": upstreams,
             "mode": "intercept",
             "inject": [{ "header": "Authorization", "format": "token {token}" }],
-            "phantom": { "env": ["GH_TOKEN"] },
+            "phantom": { "env": [format!("{}_TOKEN", kind.to_uppercase())] },
             "login": [{ "method": "paste" }],
         });
+        if let Some(git) = git {
+            v["git"] = git;
+        }
         claim::parse(kind, &v).unwrap()
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
     fn counter() -> impl FnMut(&Claim) -> Result<String> {
@@ -315,21 +478,29 @@ mod tests {
     }
 
     #[test]
-    fn select_refuses_a_second_claim_and_skips_intercept() {
+    fn select_refuses_a_second_claim_and_a_shared_intercepted_upstream() {
         let found = vec![("./a".to_string(), sentry()), ("./b".to_string(), sentry())];
         let err = select(found).unwrap_err().to_string();
         assert!(err.contains("features `./a` and `./b` both claim the `sentry` credential"), "{err}");
 
-        let (kept, warnings) = select(vec![("./s".into(), sentry()), ("./gh".into(), intercept("github"))]).unwrap();
-        assert_eq!(kept.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), ["./s"]);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("`./gh`") && warnings[0].contains("credential-broker step 3"), "{warnings:?}");
+        let kept = select(vec![("./s".into(), sentry()), ("./gh".into(), intercept("github"))]).unwrap();
+        assert_eq!(kept.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), ["./s", "./gh"]);
+
+        let other = intercept_of("ghe", serde_json::json!(["example.com", "api.github.com"]), None);
+        let err = select(vec![("./gh".into(), intercept("github")), ("./ghe".into(), other)]).unwrap_err().to_string();
+        assert!(err.contains("features `./gh` and `./ghe` both intercept `api.github.com`"), "{err}");
+        // A base-URL claim of the same host is no conflict: it has its own listener.
+        let base = sentry();
+        let shared = intercept_of("x", serde_json::json!([base.pinned.upstreams[0].host.clone()]), None);
+        select(vec![("./s".into(), base), ("./x".into(), shared)]).unwrap();
     }
 
     #[test]
     fn plan_allocates_ports_and_rebuild_keeps_phantoms_and_ports() {
         let selected = vec![("./s".to_string(), sentry())];
-        let first = plan(&selected, &[], counter()).unwrap();
+        let planned = plan(&selected, &[], None, counter()).unwrap();
+        assert_eq!(planned.proxy, None);
+        let first = planned.claims;
         let c = &first[0];
         assert_eq!((c.kind.as_str(), c.phantom.as_str()), ("sentry", "sntrys_1"));
         assert_eq!(c.version, sentry().version());
@@ -337,14 +508,14 @@ mod tests {
         let got: Vec<(u16, &str)> = c.listeners.iter().map(|l| (l.port, l.upstream.as_str())).collect();
         assert_eq!(got, [(29000, "de.sentry.io"), (29001, "sentry.io"), (29002, "us.sentry.io")]);
 
-        let again = plan(&selected, &first, |_| panic!("kept")).unwrap();
+        let again = plan(&selected, &first, None, |_| panic!("kept")).unwrap().claims;
         assert_eq!(again, first);
 
         // A new version drops one upstream and adds one: the others keep
         // theirs, the new one takes the lowest free port.
         let mut prior = first.clone();
         prior[0].listeners.retain(|l| l.upstream != "de.sentry.io");
-        let next = plan(&selected, &prior, counter()).unwrap();
+        let next = plan(&selected, &prior, None, counter()).unwrap().claims;
         let got: Vec<(u16, &str)> = next[0].listeners.iter().map(|l| (l.port, l.upstream.as_str())).collect();
         assert_eq!(got, [(29000, "de.sentry.io"), (29001, "sentry.io"), (29002, "us.sentry.io")]);
         assert_eq!(next[0].phantom, "sntrys_1");
@@ -352,7 +523,96 @@ mod tests {
         // A phantom without the claim's head is minted again.
         let mut odd = first.clone();
         odd[0].phantom = "other_x".into();
-        assert_eq!(plan(&selected, &odd, counter()).unwrap()[0].phantom, "sntrys_1");
+        assert_eq!(plan(&selected, &odd, None, counter()).unwrap().claims[0].phantom, "sntrys_1");
+    }
+
+    #[test]
+    fn intercept_claims_share_one_proxy_port_kept_across_rebuilds() {
+        let gh = intercept_of(
+            "github",
+            serde_json::json!(["api.github.com", "uploads.github.com", "github.com"]),
+            Some(serde_json::json!({ "hosts": ["github.com"] })),
+        );
+        let other = intercept_of("x", serde_json::json!(["api.x.io"]), None);
+        let selected = vec![("./s".to_string(), sentry()), ("./gh".to_string(), gh.clone()), ("./x".to_string(), other)];
+        let first = plan(&selected, &[], None, counter()).unwrap();
+        assert!(first.claims[1].listeners.is_empty() && first.claims[2].listeners.is_empty());
+        // git's host stays off the shared port (git-gateway gives git its own).
+        assert_eq!(
+            first.proxy,
+            Some(SharedPort {
+                port: 29003,
+                hosts: vec!["api.github.com".into(), "api.x.io".into(), "uploads.github.com".into()]
+            })
+        );
+
+        // A rebuild whose sentry claim gained an upstream: the proxy port
+        // keeps its number, the new listener takes the next free one.
+        let mut prior = first.claims.clone();
+        prior[0].listeners.retain(|l| l.upstream != "us.sentry.io");
+        let next = plan(&selected, &prior, Some(29002), counter()).unwrap();
+        assert_eq!(next.proxy.as_ref().map(|p| p.port), Some(29002));
+        let us = next.claims[0].listeners.iter().find(|l| l.upstream == "us.sentry.io").unwrap();
+        assert_eq!(us.port, 29003);
+        let again = plan(&selected, &first.claims, Some(29003), counter()).unwrap();
+        assert_eq!(again.proxy, first.proxy);
+
+        let git_only = intercept_of("g", serde_json::json!(["github.com"]), Some(serde_json::json!({ "hosts": ["github.com"] })));
+        assert_eq!(plan(&[("./g".into(), git_only)], &[], Some(29000), counter()).unwrap().proxy, None);
+    }
+
+    #[test]
+    fn original_proxy_env_takes_each_variables_last_layer() {
+        let image = vars(&[("HTTPS_PROXY", "http://img:1"), ("PATH", "/bin"), ("no_proxy", "corp"), ("HTTPS_PROXY", "http://img:2")]);
+        let config: BTreeMap<String, String> =
+            [("HTTP_PROXY".to_string(), "http://cfg:3".to_string()), ("https_proxy".into(), "http://cfg:4".into())].into();
+        let layers = image.iter().map(|(k, v)| (k, v)).chain(config.iter());
+        assert_eq!(
+            original_proxy_env(layers),
+            vars(&[("HTTPS_PROXY", "http://img:2"), ("https_proxy", "http://cfg:4"), ("HTTP_PROXY", "http://cfg:3"), ("no_proxy", "corp")])
+        );
+        assert!(original_proxy_env(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn no_proxy_is_loopback_aliases_and_theirs_minus_bound_hosts() {
+        let bound = vec!["api.github.com".to_string(), "uploads.github.com".to_string()];
+        let original = vars(&[
+            ("HTTPS_PROXY", "http://corp:3128"),
+            ("NO_PROXY", "corp.lan, .github.com,db,api.github.com:443"),
+            ("no_proxy", "*,10.0.0.0/8,localhost,github.com,xapi.github.com,*.GitHub.com"),
+        ]);
+        assert_eq!(
+            no_proxy(&original, &bound, &["db".into(), "cache".into()]),
+            "localhost,127.0.0.1,::1,db,cache,corp.lan,10.0.0.0/8,xapi.github.com"
+        );
+        assert_eq!(no_proxy(&[], &bound, &[]), "localhost,127.0.0.1,::1");
+        assert_eq!(no_proxy(&[], &["localhost".into()], &["api".into()]), "127.0.0.1,::1,api");
+    }
+
+    #[test]
+    fn intercept_env_routes_https_and_names_the_bundle() {
+        let i = Intercept {
+            port: 29004,
+            hosts: vec!["api.github.com".into()],
+            proxy_env: vars(&[("https_proxy", "http://corp:3128"), ("NO_PROXY", "corp")]),
+            bundle: "/etc/pki/tls/certs/ca-bundle.crt".into(),
+            installed: None,
+        };
+        let env = intercept_env(&i, &["db".into()]);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("HTTPS_PROXY"), Some("http://127.0.0.1:29004"));
+        assert_eq!(get("https_proxy"), Some("http://127.0.0.1:29004"));
+        assert_eq!(get("NO_PROXY"), Some("localhost,127.0.0.1,::1,db,corp"));
+        assert_eq!(get("no_proxy"), get("NO_PROXY"));
+        assert_eq!(get("NODE_USE_ENV_PROXY"), Some("1"));
+        for var in CA_VARS {
+            assert_eq!(get(var), Some("/etc/pki/tls/certs/ca-bundle.crt"), "{var}");
+        }
+        assert!(get("SSL_CERT_FILE").is_none() && get("HTTP_PROXY").is_none());
+
+        let keys = ["HTTPS_PROXY".to_string(), "FOO".into(), "no_proxy".into(), "HTTP_PROXY".into()];
+        assert_eq!(proxy_overrides(&keys), ["HTTPS_PROXY", "no_proxy"]);
     }
 
     #[test]
@@ -370,7 +630,7 @@ mod tests {
     #[test]
     fn env_and_files_render_and_mount_targets_skip() {
         let claim = sentry();
-        let rec = plan(&[("./s".into(), claim.clone())], &[], counter()).unwrap().remove(0);
+        let rec = plan(&[("./s".into(), claim.clone())], &[], None, counter()).unwrap().claims.remove(0);
         assert_eq!(
             env(&claim, &rec),
             [
@@ -399,34 +659,60 @@ mod tests {
 
     #[test]
     fn lookups_and_broker_spec() {
-        let mut rec = plan(&[("./s".into(), sentry())], &[], counter()).unwrap();
+        let selected = vec![("./s".to_string(), sentry()), ("./gh".to_string(), intercept("github"))];
+        let planned = plan(&selected, &[], None, counter()).unwrap();
+        let mut rec = planned.claims;
         let (files, _) = render_files(&sentry(), &rec[0], "/home/dev", "dev", &[]);
         rec[0].files = files;
         assert_eq!(by_phantom(&rec, "sntrys_1").map(|c| c.kind.as_str()), Some("sentry"));
         assert!(by_phantom(&rec, "sntrys_2").is_none());
         assert_eq!(by_port(&rec, 29002).map(|(_, u)| u), Some("us.sentry.io"));
-        assert_eq!(ports(&rec).collect::<Vec<_>>(), [29000, 29001, 29002]);
-        assert!(forward_refusal(&rec, "web", 29001).unwrap().contains("`sentry` credential broker listener"));
-        assert!(forward_refusal(&rec, "web", 3000).is_none());
+        let shared = planned.proxy.unwrap();
+        let i = Intercept {
+            port: shared.port,
+            hosts: shared.hosts,
+            proxy_env: vars(&[("HTTPS_PROXY", "http://corp:3128")]),
+            bundle: "/b".into(),
+            installed: None,
+        };
+        assert_eq!(ports(&rec, None).collect::<Vec<_>>(), [29000, 29001, 29002]);
+        assert_eq!(ports(&rec, Some(&i)).collect::<Vec<_>>(), [29000, 29001, 29002, 29003]);
+        assert!(forward_refusal(&rec, None, "web", 29001).unwrap().contains("`sentry` credential broker listener"));
+        assert!(forward_refusal(&rec, Some(&i), "web", 29003).unwrap().contains("credential broker proxy port"));
+        assert!(forward_refusal(&rec, None, "web", 29003).is_none());
+        assert!(forward_refusal(&rec, Some(&i), "web", 3000).is_none());
 
-        assert_eq!(broker_spec(&[]), None);
-        let spec = broker_spec(&rec).unwrap();
+        assert_eq!(broker_spec(&[], None), None);
+        let spec = broker_spec(&rec, None).unwrap();
         let text = brokerfile::serialize(&spec);
         assert_eq!(brokerfile::parse(&text), Ok(spec.clone()));
         assert!(text.starts_with("listen 29000 base-url de.sentry.io\n"), "{text}");
         assert_eq!(spec.files[0].phantom, "sntrys_1");
         assert_eq!(spec.files[0].path, "/home/dev/.sentryclirc");
+
+        let text = brokerfile::serialize(&broker_spec(&rec, Some(&i)).unwrap());
+        assert!(text.contains("\nproxy-listen 29003 api.github.com\n"), "{text}");
+        assert!(text.ends_with("\nproxy HTTPS_PROXY=http://corp:3128\n"), "{text}");
+        assert!(brokerfile::parse(&text).is_ok());
     }
 
     #[test]
     fn records_round_trip_through_toml() {
-        let mut rec = plan(&[("./s".into(), sentry())], &[], counter()).unwrap();
+        let mut rec = plan(&[("./s".into(), sentry())], &[], None, counter()).unwrap().claims;
         rec[0].files = render_files(&sentry(), &rec[0], "/home/dev", "dev", &[]).0;
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
         struct Wrap {
             claims: Vec<InstanceClaim>,
+            intercept: Option<Intercept>,
         }
-        let w = Wrap { claims: rec };
+        let intercept = Intercept {
+            port: 29003,
+            hosts: vec!["api.github.com".into()],
+            proxy_env: vars(&[("HTTPS_PROXY", "http://corp:3128"), ("NO_PROXY", "")]),
+            bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
+            installed: Some("ab".repeat(32)),
+        };
+        let w = Wrap { claims: rec, intercept: Some(intercept) };
         let text = toml::to_string(&w).unwrap();
         assert_eq!(toml::from_str::<Wrap>(&text).unwrap(), w);
     }

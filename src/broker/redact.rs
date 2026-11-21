@@ -150,7 +150,7 @@ pub fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn base64(data: &[u8]) -> Vec<u8> {
+pub(crate) fn base64(data: &[u8]) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
     for group in data.chunks(3) {

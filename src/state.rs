@@ -157,6 +157,10 @@ pub struct Instance {
     /// `rebuild`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<crate::credentials::instance::InstanceClaim>,
+    /// With intercept claims: the shared proxy port, the container's own
+    /// proxy env and its CA trust (`credentials::instance::Intercept`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<crate::credentials::instance::Intercept>,
     /// Unix secs since the instance was marked done (docs/architecture/automations/dispatchers.md
     /// "Done children"): the user (or its dispatcher) is finished with it,
     /// but it's kept as is until removed. Only display and dispatcher policy
@@ -600,6 +604,13 @@ mod tests {
                         content: "[auth]\ntoken = sntrys_x\n".into(),
                     }],
                 }],
+                intercept: Some(crate::credentials::instance::Intercept {
+                    port: 29001,
+                    hosts: vec!["api.github.com".into()],
+                    proxy_env: vec![("HTTPS_PROXY".into(), "http://corp:3128".into())],
+                    bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
+                    installed: Some("ab".repeat(32)),
+                }),
                 progress: None,
                 created_unix: Instance::now(),
             },
@@ -625,6 +636,7 @@ mod tests {
         assert_eq!(back.instances["repo-abc1"].profile.as_deref(), Some("work"));
         assert_eq!(back.instances["repo-abc1"].incarnation.as_deref(), Some("Zx9"));
         assert_eq!(back.instances["repo-abc1"].claims, state.instances["repo-abc1"].claims);
+        assert_eq!(back.instances["repo-abc1"].intercept, state.instances["repo-abc1"].intercept);
         assert_eq!(back.instances["repo-abc1"].created_unix, state.instances["repo-abc1"].created_unix);
     }
 

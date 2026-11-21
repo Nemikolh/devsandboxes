@@ -32,6 +32,8 @@ mod ssh_agent;
 pub(crate) mod tool_env;
 mod worktree;
 
+#[cfg(unix)]
+pub(crate) use claims::refresh_trust;
 pub(crate) use editor::write_vscode_name_config;
 pub(crate) use git::{check_repo, host_git, host_git_bare, host_git_new, read_origin};
 pub(crate) use origin::{fetch_trusted_origin, trust_key, Fetched, Refs};
@@ -271,6 +273,7 @@ pub fn run(
         forwarded_ports: Default::default(),
         done: None,
         incarnation: None,
+        intercept: None,
         claims: Vec::new(),
         progress: None,
         created_unix: Instance::now(),
@@ -837,7 +840,15 @@ pub(crate) fn materialize(
     let (plan, seccomp) = identity::plan_for(&image, facts::accounts(props, &facts), props, extras.reprobe, privileged);
     let root_plan = tool_env::root_plan(plan.exec_user.as_deref());
     let owner = plan.exec_user.as_deref().or(plan.create_user.as_deref()).or(facts.user.as_deref()).unwrap_or("root");
-    let wired = claims::wire(
+    let layers = facts.env.iter().map(|(k, v)| (k, v)).chain(&container_env.sandbox).chain(&run_env);
+    let proxying = claims::Proxying {
+        image: &image,
+        proxy_env: crate::credentials::instance::original_proxy_env(layers),
+        aliases: endpoints.iter().map(|e| e.alias.clone()).collect(),
+        run_env_keys: run_env.keys().cloned().collect(),
+    };
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut wired = claims::wire(
         dir,
         props,
         profile.as_deref(),
@@ -846,6 +857,7 @@ pub(crate) fn materialize(
         &facts::home(props, &facts),
         owner,
         &claims::mount_targets(&workspace, &extra_mounts, &mounts),
+        proxying,
     )?;
     extra_env.extend(wired.env.iter().cloned());
     tracker.enter(Phase::Creating)?;
@@ -875,7 +887,7 @@ pub(crate) fn materialize(
     // Before lifecycle commands, so they could already rely on the helper. In
     // relay-first mode a failure means no ssh-agent forwarding at all (no mount
     // fallback), so word the note that way; otherwise the plain install note.
-    let broker = crate::credentials::instance::broker_spec(&wired.claims);
+    let broker = crate::credentials::instance::broker_spec(&wired.claims, wired.intercept.as_ref());
     let (devsbd_arch, devsbd_error) = match crate::devsbd::prepare(&container, None, broker.as_ref()) {
         Ok(arch) => (Some(arch), None),
         Err(reason) => {
@@ -887,6 +899,12 @@ pub(crate) fn materialize(
             (None, Some(reason))
         }
     };
+    // Root execs, no helper needed; before lifecycle commands, like the
+    // broker file.
+    #[cfg(unix)]
+    if let (Some(intercept), Some(cert)) = (wired.intercept.as_mut(), &wired.ca) {
+        claims::install_trust(&container, intercept, &cert.pem);
+    }
     // Fit the adopted account to the plan, before anything runs as it. No
     // helper means no remap: the container runs on, unfitted.
     let mut home = None;
@@ -975,6 +993,7 @@ pub(crate) fn materialize(
         forwarded_ports,
         incarnation: Some(wired.incarnation),
         claims: wired.claims,
+        intercept: wired.intercept,
         done,
         // Still in flight: the lifecycle chain runs after this save.
         progress: Some(tracker.progress()),
@@ -987,12 +1006,16 @@ pub(crate) fn materialize(
         Ok(())
     })?;
     state.instances.insert(instance.to_string(), record);
+    #[cfg(unix)]
+    if let Some(cert) = wired.ca.as_ref().filter(|c| c.grew) {
+        claims::reinstall_running(instance, &cert.pem);
+    }
 
     // Every exec below runs as the plan's user, recorded on the instance.
     let exec_user = plan.exec_user.as_deref();
     let extensions = props.vscode_extensions().unwrap_or(&[]);
     let broker_ports: Vec<u16> =
-        state.instances.get(instance).map(|i| crate::credentials::instance::ports(&i.claims).collect()).unwrap_or_default();
+        state.instances.get(instance).map(|i| crate::credentials::instance::ports(&i.claims, i.intercept.as_ref()).collect()).unwrap_or_default();
     if !extensions.is_empty() || exec_user.is_some() || !broker_ports.is_empty() {
         write_vscode_name_config(&container, Some(extensions), exec_user, &broker_ports)?;
     }
@@ -1410,6 +1433,7 @@ mod tests {
             forwarded_ports: Default::default(),
             done: None,
             incarnation: None,
+            intercept: None,
             claims: Vec::new(),
             progress: None,
             created_unix: 0,
@@ -2393,6 +2417,179 @@ mod tests {
                 "{log}"
             );
             assert!(!log.contains(TOKEN) && !log.contains(&claim.phantom), "{log}");
+        });
+    }
+
+    /// Intercept mode end to end: a claim on `localhost` (private, as the
+    /// test TLS leaf covers it) in an alpine image with curl and
+    /// ca-certificates. A plain `curl https://localhost/x` reaches the mock
+    /// through `HTTPS_PROXY`, trusting the broker's leaf through the system
+    /// bundle `run` installed the member CA into; the mock sees only the
+    /// real token. An unbound host is dialed by devsbd itself. A CA reissued
+    /// for another host reaches the running container.
+    #[cfg(unix)]
+    #[test_utils::docker_test(helper)]
+    fn intercept_brokered_end_to_end_with_docker() -> Result<(), String> {
+        isolated("intercept_e2e_child")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intercept_e2e_child() {
+        use std::sync::Arc;
+
+        const TOKEN: &str = "REAL-mock-token-0123456789abcdef";
+        const BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+        let Some(root) = isolated_root("intercept_e2e_child") else { return };
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let feature = cfg.join("features/mock");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(feature.join("install.sh"), "#!/bin/sh\nset -e\n").unwrap();
+        let metadata = serde_json::json!({
+            "id": "mock",
+            "version": "1.0.0",
+            "name": "intercepted mock (test)",
+            "customizations": { "devsandbox": { "credentials": { "mock": {
+                "upstreams": [{ "host": "localhost", "private": true }],
+                "mode": "intercept",
+                "inject": [{ "header": "Authorization", "format": "Bearer {token}" }],
+                "phantom": { "env": ["MOCK_TOKEN"] },
+                "login": [{ "method": "paste" }],
+                "scopes": { "x.read": { "routes": ["GET /x"] } },
+                "ca": { "env": "MOCK_CA" },
+            } } } },
+        });
+        std::fs::write(feature.join("devcontainer-feature.json"), metadata.to_string()).unwrap();
+
+        let name = format!("icpt-e2e-{}", std::process::id());
+        std::fs::write(
+            cfg.join("Dockerfile"),
+            "FROM alpine:3.20\nRUN apk add --no-cache curl ca-certificates && adduser -D -u 1000 dev\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!(
+                "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+                 features = {{ \"./features/mock\" = {{}} }}\n"
+            ),
+        )
+        .unwrap();
+
+        let data = State::path().unwrap().parent().unwrap().to_path_buf();
+        let source = crate::features::FeatureSource::parse("./features/mock").unwrap();
+        let claims = crate::features::resolve(&source, &cfg).unwrap().metadata.credentials;
+        let args = crate::commands::login::Args {
+            credential: "mock-work".into(),
+            feature: None,
+            kind: None,
+            profiles: Vec::new(),
+            yes: true,
+            method: None,
+            client_id: None,
+        };
+        let mut term = crate::commands::login::tests::Script::new(false, &[], Some(TOKEN));
+        let mut flows = crate::commands::login::tests::offline();
+        crate::commands::login::login_at(&data, &args, Some(claims), &mut term, &mut flows).unwrap();
+
+        let (mock_port, seen) = crate::broker::serve::tests::upstream_server(|_, _| {
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\nmock-ok\n".to_vec()
+        });
+
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = image::sandbox_image(&project, &name);
+        let features_image = image::features_image(&project, &name);
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().output_quiet(&["rmi", "-f", &features_image, &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            let [claim] = &info.claims[..] else { panic!("one claim: {:?}", info.claims) };
+            assert!(claim.listeners.is_empty(), "{claim:?}");
+            let intercept = info.intercept.clone().expect("an intercept side");
+            assert_eq!((intercept.hosts.as_slice(), intercept.bundle.as_str()), (&["localhost".to_string()][..], BUNDLE));
+            let ca = crate::credentials::ca::MemberCa::load_or_create(&data).unwrap();
+            let pem = ca.cert_pem().expect("the CA covers localhost").to_string();
+            assert_eq!(intercept.installed, Some(crate::credentials::trust::fingerprint(&pem)));
+
+            let mut roots = rustls::RootCertStore::empty();
+            let fixture_ca = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broker/ca.pem");
+            use rustls::pki_types::pem::PemObject;
+            roots.add(rustls::pki_types::CertificateDer::from_pem_file(fixture_ca).unwrap()).unwrap();
+            let upstream = crate::broker::upstream::Upstream::new(roots, None, Default::default()).unwrap();
+            let service = crate::broker::serve::Service::new(State::path().unwrap(), Ok(upstream))
+                .unwrap()
+                .with_authority("localhost", &format!("localhost:{mock_port}"));
+            let bridge = crate::devsbd::bridge::spawn_brokered(&name, info, Arc::new(service)).unwrap();
+            assert_eq!(bridge.outcome(std::time::Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+
+            // The helper answers 503 itself until it has seen the bridge's caps.
+            let script = "env | sort | grep -E '^(HTTPS?_PROXY|https?_proxy|NO_PROXY|no_proxy|NODE_[A-Z_]+|DENO_CERT|REQUESTS_CA_BUNDLE|AWS_CA_BUNDLE|MOCK_CA|SSL_CERT_FILE)='; \
+                 for i in $(seq 50); do out=$(curl -sS https://localhost/x -H \"Authorization: Bearer $MOCK_TOKEN\" 2>&1) && break; sleep 0.2; done; \
+                 echo \"curl=$out\"; \
+                 echo \"unbound=$(curl -s -o /dev/null -w '%{http_connect}' https://nohost.invalid/)\"";
+            let curl = || {
+                let argv =
+                    crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), script.into()], false);
+                backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap()
+            };
+            let out = curl();
+            let lines: Vec<&str> = out.lines().collect();
+            let proxy = format!("http://127.0.0.1:{}", intercept.port);
+            for want in [
+                format!("HTTPS_PROXY={proxy}"),
+                format!("https_proxy={proxy}"),
+                "NO_PROXY=127.0.0.1,::1".into(),
+                "no_proxy=127.0.0.1,::1".into(),
+                "NODE_USE_ENV_PROXY=1".into(),
+                format!("NODE_EXTRA_CA_CERTS={BUNDLE}"),
+                format!("DENO_CERT={BUNDLE}"),
+                format!("REQUESTS_CA_BUNDLE={BUNDLE}"),
+                format!("AWS_CA_BUNDLE={BUNDLE}"),
+                format!("MOCK_CA={BUNDLE}"),
+                "curl=mock-ok".into(),
+                "unbound=502".into(),
+            ] {
+                assert!(lines.contains(&want.as_str()), "{want} missing:\n{out}");
+            }
+            assert!(!out.contains("SSL_CERT_FILE") && !out.contains("HTTP_PROXY="), "{out}");
+
+            let auth = |head: &str| -> Vec<String> {
+                head.lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .filter(|(n, _)| n.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.trim().to_string())
+                    .collect()
+            };
+            for (head, _) in seen.lock().unwrap().iter() {
+                assert_eq!(auth(head), [format!("Bearer {TOKEN}")], "{head}");
+                assert!(!head.contains(&claim.phantom), "{head}");
+            }
+            assert_eq!(seen.lock().unwrap().len(), 1);
+
+            // Another instance's host reissues the cert: the running one gets it.
+            let mut ca = crate::credentials::ca::MemberCa::load_or_create(&data).unwrap();
+            assert!(ca.ensure_hosts(&["other.test".to_string()].into()).unwrap());
+            let reissued = ca.cert_pem().unwrap().to_string();
+            claims::reinstall_running("someone-else", &reissued);
+            let state = State::load().unwrap();
+            let installed = state.instances[&name].intercept.as_ref().unwrap().installed.clone();
+            assert_eq!(installed, Some(crate::credentials::trust::fingerprint(&reissued)));
+            // A cert's first base64 line holds its serial: the two differ.
+            let check = format!(
+                "echo new=$(grep -cF -- '{}' {BUNDLE}) old=$(grep -cF -- '{}' {BUNDLE})",
+                reissued.lines().nth(1).unwrap(),
+                pem.lines().nth(1).unwrap()
+            );
+            let argv = crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), check], false);
+            let counts = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+            assert_eq!(counts, "new=1 old=0");
+            assert!(curl().lines().any(|l| l == "curl=mock-ok"), "after the reissue");
         });
     }
 

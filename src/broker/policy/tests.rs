@@ -73,7 +73,7 @@ pub(crate) fn instance(key: &str, claims: Vec<InstanceClaim>) -> Instance {
 pub(crate) fn claims(selected: &[claim::Claim], phantoms: &[&str]) -> Vec<InstanceClaim> {
     let selected: Vec<(String, claim::Claim)> = selected.iter().map(|c| (format!("./{}", c.kind), c.clone())).collect();
     let mut next = phantoms.iter();
-    plan(&selected, &[], |_| Ok(next.next().unwrap().to_string())).unwrap()
+    plan(&selected, &[], None, |_| Ok(next.next().unwrap().to_string())).unwrap().claims
 }
 
 /// `web-1` with sentry (+ anth) and `other` with sentry.
@@ -414,9 +414,12 @@ fn intercept_leaks_and_mode_mismatches() {
     let o = through(&state, &src, "api.github.com", 443, "/user", &format!("Authorization: token {FOREIGN}\r\n"));
     assert_eq!(o.context.phantom, Some(Phantom::Foreign));
 
-    // An intercept claim's upstream reached as a base-URL listener.
-    let gh = &state.instances["web-1"].claims[1];
-    let listener = gh.listeners.iter().find(|l| l.upstream == "api.github.com").unwrap().port;
+    // An intercept claim's upstream reached as a base-URL listener (`run`
+    // gives intercept claims none: a hand-edited record).
+    let mut state = state;
+    let listener = 29900;
+    let gh = &mut state.instances.get_mut("web-1").unwrap().claims[1];
+    gh.listeners.push(crate::credentials::instance::Listener { port: listener, upstream: "api.github.com".into() });
     let head = parse_head(format!("GET /user HTTP/1.1\r\nHost: 127.0.0.1:{listener}\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
         .unwrap();
     let header = ProxyHeader::BaseUrl { upstream: "api.github.com".into(), listener };

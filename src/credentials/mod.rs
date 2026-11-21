@@ -13,6 +13,8 @@ pub mod oauth;
 pub mod review;
 #[cfg(unix)]
 pub mod store;
+#[cfg(unix)]
+pub mod trust;
 
 use anyhow::{Result, bail};
 

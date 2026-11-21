@@ -1317,9 +1317,10 @@ fn status_to_row(id: u64, dir: &Path, status: &ForwardStatus, configured: bool) 
 }
 
 /// Why instance `key`'s container port `port` can't be forwarded: it's one of
-/// its credential broker listeners.
+/// its credential broker ports.
 fn broker_port_refusal(state: &State, key: &str, port: u16) -> Option<String> {
-    crate::credentials::instance::forward_refusal(&state.instances.get(key)?.claims, key, port)
+    let info = state.instances.get(key)?;
+    crate::credentials::instance::forward_refusal(&info.claims, info.intercept.as_ref(), key, port)
 }
 
 /// Whether `service` is a `global` one (its forward is shared by the config

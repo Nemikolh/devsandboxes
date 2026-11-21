@@ -200,7 +200,7 @@ pub fn launch(dir: &Path, instance: &str, info: &Instance, goto: Option<&Goto>) 
         &info.container,
         extensions.as_deref(),
         info.remote_user.as_deref(),
-        &crate::credentials::instance::ports(&info.claims).collect::<Vec<_>>(),
+        &crate::credentials::instance::ports(&info.claims, info.intercept.as_ref()).collect::<Vec<_>>(),
     );
 
     // Prefer the generated `.code-workspace` (window named after the instance,

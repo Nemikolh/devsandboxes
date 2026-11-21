@@ -87,6 +87,9 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
             if arch.is_some() {
                 run::cgroup::warn_if_outside(&info.container);
             }
+            // Before postStartCommand, which may already call a claimed host.
+            #[cfg(unix)]
+            run::refresh_trust(key, info);
             // Services may have been recreated with new addresses (or gc'd)
             // since the instance last ran; bring them up and refresh resolution.
             let project = services::project_id(dir)?;
@@ -156,6 +159,8 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
             if crate::devsbd::ensure_recorded(key, info, false).is_some() {
                 run::cgroup::warn_if_outside(&info.container);
             }
+            #[cfg(unix)]
+            run::refresh_trust(key, info);
         }
     }
     println!("started {key}");

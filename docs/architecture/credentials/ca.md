@@ -52,13 +52,15 @@ Hosts are in `check_host`'s form: lowercase DNS labels, no trailing dot,
 no wildcard, not an IP address. The broker case-folds a CONNECT target and
 drops its trailing dot before asking.
 
-The broker calls `MemberCa::ensure_hosts` (`broker::serve::Service::leaf`)
-when an admitted intercepted connection names a host the cert doesn't
-cover yet, one host at a time, and logs that containers trust the new
-cert only once it is reinstalled in them
-([broker](broker.md#intercept-mode)). It loads the CA once per daemon,
-at the first intercepted connection, so a host that intercepts nothing
-never makes a CA key.
+`run` calls `MemberCa::ensure_hosts` with an instance's intercepted hosts
+before its container exists, and `start` again before it reinstalls
+([trust in containers](#trust-in-containers)). The broker calls it too
+(`broker::serve::Service::leaf`) when an admitted intercepted connection
+names a host the cert doesn't cover yet (a cert removed since the run),
+one host at a time, and logs that containers trust the new cert only
+once it is reinstalled in them ([broker](broker.md#intercept-mode)). It
+loads the CA once per daemon, at the first intercepted connection, so a
+host that intercepts nothing never makes a CA key.
 
 `MemberCa::ensure_hosts` unions the hosts it is given with the set on disk
 (so a second daemon's hosts survive a handoff) and reissues the cert when
@@ -87,3 +89,49 @@ Leaves are cached in memory per host and minted again once less than
 `LEAF_RENEW` (1 day) is left; the cache dies with the daemon. The broker
 presents a leaf only to a ClientHello whose SNI is its host
 ([broker](broker.md#intercept-mode)).
+
+## Trust in containers
+
+Code: `src/credentials/trust.rs` (`BUNDLES`, `PROBE_SCRIPT`,
+`INSTALL_SCRIPT`, `install_input`, `fingerprint`),
+`src/commands/run/claims.rs` (`member_cert`, `install_trust`,
+`reinstall_running`, `refresh_trust`).
+
+An instance with a shared proxy port (an `intercept` claim;
+[images and features](../instances/images-and-features.md#credential-claims))
+trusts the CA through its system bundle, the file the CA variables on its
+env name (`Intercept::bundle`, probed from the image at create). The
+install is `trust::INSTALL_SCRIPT` exec'd as root with `PATH` pinned, the
+bundle as `$1` and on stdin the CA's PEM followed by the Mozilla set
+(`webpki-root-certs`). Per distro:
+
+| Found in the container | Anchor written | Then |
+| --- | --- | --- |
+| `update-ca-trust` (Fedora, RHEL) | `/etc/pki/ca-trust/source/anchors/devsandbox-member.crt` | `update-ca-trust extract` |
+| `update-ca-certificates` and `/etc/pki/trust/anchors` (openSUSE) | `/etc/pki/trust/anchors/devsandbox-member.crt` | `update-ca-certificates` |
+| `update-ca-certificates` (Debian, Ubuntu, Alpine with `ca-certificates`) | `/usr/local/share/ca-certificates/devsandbox-member.crt` | `update-ca-certificates` |
+| no tool, a bundle (Alpine's `ca-certificates-bundle`) | `/usr/local/share/ca-certificates/devsandbox-member.crt` | the CA appended to the bundle between `# devsandbox member CA` markers, an earlier copy replaced |
+| no tool, no bundle (`debian:*-slim`) | as above | the bundle written: the Mozilla set plus the CA between the markers, never the CA alone |
+
+The anchor sits where the distro's tool reads it, so a later regeneration
+(a package install running the tool) keeps the CA. The bundle path the
+env names is the bundle itself, never a snapshot, so a CA added to it
+later still counts. A bundle that still doesn't hold the CA's first
+base64 line afterwards fails the install.
+
+When it runs:
+
+- **Create** (`materialize`): after the broker file is written, before the
+  account fit and lifecycle commands. The cert's `trust::fingerprint` is
+  saved as the instance's `Intercept::installed`.
+- **A reissue at `run`**: when `ensure_hosts` grew the set,
+  `reinstall_running` installs the new cert into every other running
+  instance with an `intercept` whose `installed` differs, and records it.
+  A stopped one waits for its `start`.
+- **`start`** (`refresh_trust`, after the helper, before
+  `postStartCommand`): `ensure_hosts` with the instance's hosts, then an
+  install when `installed` isn't the current cert (reissued meanwhile, or
+  a failed install); a set this grows reaches the running instances too.
+
+Every failure is a warning naming the hosts whose TLS fails there; `run`
+and `start` go on.

@@ -2,7 +2,9 @@
 //! (docs/architecture/instances/images-and-features.md, *Credential claims*):
 //! which of the features' claims apply here, the home's credential and
 //! approval each resolves to, and the phantoms, listeners, env and phantom
-//! files the instance gets (`credentials::instance`, pure).
+//! files the instance gets (`credentials::instance`, pure); for intercept
+//! claims the shared proxy port, its env, and the member CA's trust in the
+//! container (`credentials::trust`).
 
 use std::path::Path;
 
@@ -10,7 +12,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{parse_shorthand, SandboxProperties};
 use crate::credentials::claim::Claim;
-use crate::credentials::instance::{self, InstanceClaim};
+use crate::credentials::instance::{self, Intercept, InstanceClaim};
 use crate::runtime::backend;
 use crate::state::Instance;
 
@@ -18,8 +20,31 @@ use crate::state::Instance;
 pub(super) struct Wired {
     pub(super) incarnation: String,
     pub(super) claims: Vec<InstanceClaim>,
+    pub(super) intercept: Option<Intercept>,
+    /// What to install once the container exists ([`install_trust`]).
+    pub(super) ca: Option<MemberCert>,
     /// `-e` for the container.
     pub(super) env: Vec<(String, String)>,
+}
+
+pub(super) struct MemberCert {
+    pub(super) pem: String,
+    /// This run grew the CA's host set: running instances get the reissued
+    /// cert too ([`reinstall_running`]).
+    pub(super) grew: bool,
+}
+
+/// What the intercept side reads from the image and the run's env.
+pub(super) struct Proxying<'a> {
+    /// Built, local: probed for its system bundle.
+    pub(super) image: &'a str,
+    /// `instance::original_proxy_env` of the image's `ENV`, `containerEnv`
+    /// and `--env`.
+    pub(super) proxy_env: Vec<(String, String)>,
+    /// The services' aliases, for `NO_PROXY`.
+    pub(super) aliases: Vec<String>,
+    /// `--env`'s keys: set on every exec, like `remoteEnv`'s.
+    pub(super) run_env_keys: Vec<String>,
 }
 
 /// Wire `found` (the enabled features' claims) for an instance in
@@ -28,7 +53,8 @@ pub(super) struct Wired {
 /// every mount and volume target. Refuses a second claim of one kind and a
 /// claim version its credential hasn't approved (recorded pending first, for
 /// `devsandbox access approve`). A claim with no credential here is wired
-/// anyway, so a later `login` works without a rebuild.
+/// anyway, so a later `login` works without a rebuild. With intercept
+/// claims, the member CA covers their hosts before the container exists.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn wire(
     dir: &Path,
@@ -39,25 +65,25 @@ pub(super) fn wire(
     home: &str,
     owner: &str,
     targets: &[String],
+    proxying: Proxying,
 ) -> Result<Wired> {
     let incarnation = match prior.and_then(|i| i.incarnation.clone()) {
         Some(kept) => kept,
         None => instance::mint_incarnation()?,
     };
-    let mut wired = Wired { incarnation, claims: Vec::new(), env: Vec::new() };
+    let mut wired = Wired { incarnation, claims: Vec::new(), intercept: None, ca: None, env: Vec::new() };
     if found.is_empty() {
         return Ok(wired);
     }
-    let (kept, warnings) = instance::select(found)?;
-    for w in warnings {
-        eprintln!("warning: {w}");
-    }
+    let kept = instance::select(found)?;
     let Some(kept) = brokered_here(dir, kept)? else {
         return Ok(wired);
     };
     check_credentials(props, profile, &kept)?;
     let prior_claims = prior.map(|i| i.claims.as_slice()).unwrap_or_default();
-    let mut claims = instance::plan(&kept, prior_claims, instance::mint_phantom)?;
+    let prior_port = prior.and_then(|i| i.intercept.as_ref()).map(|i| i.port);
+    let planned = instance::plan(&kept, prior_claims, prior_port, instance::mint_phantom)?;
+    let mut claims = planned.claims;
     for ((_, claim), record) in kept.iter().zip(claims.iter_mut()) {
         wired.env.extend(instance::env(claim, record));
         let (files, warnings) = instance::render_files(claim, record, home, owner, targets);
@@ -67,7 +93,159 @@ pub(super) fn wire(
         record.files = files;
     }
     wired.claims = claims;
+    if let Some(shared) = planned.proxy {
+        let exec_keys = props.remote_env.iter().flat_map(|e| e.keys()).chain(&proxying.run_env_keys);
+        let overrides = instance::proxy_overrides(exec_keys);
+        if !overrides.is_empty() {
+            eprintln!(
+                "warning: `remoteEnv` or `--env` sets {}: every exec then goes around the credential broker's proxy port",
+                overrides.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ")
+            );
+        }
+        let intercept = Intercept {
+            port: shared.port,
+            hosts: shared.hosts,
+            proxy_env: proxying.proxy_env,
+            bundle: probe_bundle(proxying.image),
+            installed: None,
+        };
+        wired.env.extend(instance::intercept_env(&intercept, &proxying.aliases));
+        let knobs = kept.iter().filter_map(|(_, c)| c.wiring.ca.as_ref());
+        wired.env.extend(knobs.map(|ca| (ca.env.clone(), intercept.bundle.clone())));
+        wired.ca = member_cert(&intercept.hosts);
+        wired.intercept = Some(intercept);
+    }
     Ok(wired)
+}
+
+#[cfg(unix)]
+fn data_dir() -> Result<std::path::PathBuf> {
+    crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+/// The image's system bundle (`credentials::trust::PROBE_SCRIPT`, from a
+/// throwaway container like `Backend::image_passwd`'s); none, or a probe
+/// that can't run, reads as the default path, where the install writes one.
+#[cfg(unix)]
+fn probe_bundle(image: &str) -> String {
+    use crate::credentials::trust;
+    let script = crate::runtime::fixed_path(trust::PROBE_SCRIPT);
+    let args =
+        ["run", "--rm", "--pull=never", "--network=none", "--user", "0:0", "--entrypoint", crate::runtime::SH, image, "-c", &script];
+    let found = backend().output_quiet(&args).ok().and_then(|out| trust::parse_probe(&out));
+    found.unwrap_or(trust::DEFAULT_BUNDLE).to_string()
+}
+
+#[cfg(not(unix))]
+fn probe_bundle(_: &str) -> String {
+    unreachable!("claims aren't wired off unix (`brokered_here`)")
+}
+
+/// The member CA cert covering `hosts`, reissued when they're new to it.
+/// A failure is a warning: the run goes on, its TLS to them failing.
+#[cfg(unix)]
+fn member_cert(hosts: &[String]) -> Option<MemberCert> {
+    let covered = || -> Result<(Option<String>, bool)> {
+        let mut ca = crate::credentials::ca::MemberCa::load_or_create(&data_dir()?)?;
+        let grew = ca.ensure_hosts(&hosts.iter().cloned().collect())?;
+        Ok((ca.cert_pem().map(str::to_string), grew))
+    };
+    match covered() {
+        Ok((Some(pem), grew)) => Some(MemberCert { pem, grew }),
+        Ok((None, _)) => None,
+        Err(e) => {
+            eprintln!(
+                "warning: the member CA can't cover {}: {e:#}: TLS to them will fail in the sandbox",
+                hosts.join(", ")
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn member_cert(_: &[String]) -> Option<MemberCert> {
+    None
+}
+
+/// Put `pem` into `container`'s trust ([`install_in`]), recording it on
+/// `intercept`; a failure is a warning naming what breaks.
+#[cfg(unix)]
+pub(super) fn install_trust(container: &str, intercept: &mut Intercept, pem: &str) {
+    match install_in(container, &intercept.bundle, pem) {
+        Ok(()) => intercept.installed = Some(crate::credentials::trust::fingerprint(pem)),
+        Err(e) => eprintln!("{}", install_warning(container, &intercept.hosts, &e)),
+    }
+}
+
+#[cfg(unix)]
+fn install_warning(container: &str, hosts: &[String], why: &str) -> String {
+    format!(
+        "warning: couldn't install the member CA in `{container}` ({why}): TLS to {} fails there until it is",
+        hosts.join(", ")
+    )
+}
+
+/// `credentials::trust::INSTALL_SCRIPT` as root, `bundle` the file the CA
+/// variables name.
+#[cfg(unix)]
+fn install_in(container: &str, bundle: &str, pem: &str) -> Result<(), String> {
+    use crate::credentials::trust;
+    let script = crate::runtime::fixed_path(trust::INSTALL_SCRIPT);
+    let args = ["exec", "-i", "-u", "root", container, crate::runtime::SH, "-c", &script, "sh", bundle];
+    backend().run_with_stdin(&args, trust::install_input(pem).as_bytes()).map_err(|e| format!("{e:#}"))
+}
+
+/// The reissued `pem` into every other running instance with intercept
+/// claims that doesn't have it yet; a stopped one gets it at its next
+/// `start` ([`refresh_trust`]).
+#[cfg(unix)]
+pub(super) fn reinstall_running(except: &str, pem: &str) {
+    let Ok(state) = crate::state::State::load() else { return };
+    let fingerprint = crate::credentials::trust::fingerprint(pem);
+    for (key, info) in &state.instances {
+        let Some(intercept) = &info.intercept else { continue };
+        if key == except || intercept.installed.as_deref() == Some(fingerprint.as_str()) {
+            continue;
+        }
+        if backend().is_running(&info.container).ok().flatten() == Some(true) {
+            reinstall(key, &info.container, intercept, pem, &fingerprint);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reinstall(key: &str, container: &str, intercept: &Intercept, pem: &str, fingerprint: &str) {
+    if let Err(e) = install_in(container, &intercept.bundle, pem) {
+        eprintln!("{}", install_warning(container, &intercept.hosts, &e));
+        return;
+    }
+    let saved = crate::state::State::update(|state| {
+        if let Some(i) = state.instances.get_mut(key).and_then(|i| i.intercept.as_mut()) {
+            i.installed = Some(fingerprint.to_string());
+        }
+        Ok(())
+    });
+    if let Err(e) = saved {
+        eprintln!("note: couldn't record the member CA installed in `{container}`: {e:#}");
+    }
+}
+
+/// `start`'s side: the member CA cert covering the instance's hosts, into
+/// its container when it isn't the one installed there (reissued for
+/// another instance's host while this one was stopped, or a failed
+/// install); a set this grows reaches the running instances too.
+#[cfg(unix)]
+pub(crate) fn refresh_trust(key: &str, info: &Instance) {
+    let Some(intercept) = &info.intercept else { return };
+    let Some(cert) = member_cert(&intercept.hosts) else { return };
+    let fingerprint = crate::credentials::trust::fingerprint(&cert.pem);
+    if intercept.installed.as_deref() != Some(fingerprint.as_str()) {
+        reinstall(key, &info.container, intercept, &cert.pem, &fingerprint);
+    }
+    if cert.grew {
+        reinstall_running(key, &cert.pem);
+    }
 }
 
 /// `kept`, or `None` (each skipped with a warning) where the broker can't

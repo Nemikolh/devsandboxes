@@ -129,8 +129,6 @@ impl MemberCa {
 
     /// What a container installs as its anchor; `None` while no host is
     /// covered.
-    // Installed in containers at create (credential-broker step 3, run wiring).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cert_pem(&self) -> Option<&str> {
         self.issued.as_ref().map(|f| f.cert.as_str())
     }
