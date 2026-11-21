@@ -557,6 +557,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hkdf",
+ "httparse",
  "libc",
  "portable-pty",
  "pulldown-cmark",
@@ -867,6 +868,12 @@ checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hybrid-array"

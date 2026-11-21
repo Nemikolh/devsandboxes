@@ -31,6 +31,8 @@ hkdf = "0.13"
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 # Member keys' and statements' text forms (`serve::fleet::identity`); already in the tree.
 hex = "0.4"
+# The credential broker's request heads (`broker::head`).
+httparse = "1.10.1"
 toml = "1.1.5"
 tui-term = "0.3.4"
 vt100 = "0.16"
