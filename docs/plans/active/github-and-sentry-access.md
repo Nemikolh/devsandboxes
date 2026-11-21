@@ -419,6 +419,12 @@ only a note when the repo is public (a reference clone in `folders`).
    and on placed or remote instances once credential-broker step 5
    carries `CRED`; until then they keep today's mounts, so the live
    config drops its sentry and gh mounts only after that step.
+   Built: all of it; `features/sentry` 1.0.0 is in the features repo and
+   checked end to end with sentry-cli 3.8.2 against a mock Sentry
+   ([broker](../../architecture/credentials/broker.md#end-to-end)).
+   Deferred, each a [status](../../status.md#credentials) limitation:
+   calling the claim's `check` route, a claim field for token and
+   registration endpoints, stripping token-shaped response headers.
 2. `features/gh` in intercept mode with your token (`as = "user"`):
    fine-grained PATs by paste and app user tokens (an existing app's
    device flow, credential-broker step 2), the home's `as` list, a

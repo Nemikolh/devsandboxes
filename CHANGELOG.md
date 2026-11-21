@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- **sentry-cli without its token in the sandbox.** The new `ghcr.io/devsandboxes/features/sentry` feature installs sentry-cli and claims a `sentry` credential. The sandbox gets a phantom token, and `SENTRY_URL` points at a loopback port that devsandbox's credential broker answers on the host. The broker checks each call against the claim's scopes, swaps the phantom for the real token and calls Sentry, so releases, source-map and debug-file uploads work as before. Any feature can claim a credential the same way, in its `customizations.devsandbox.credentials`.
+- **`devsandbox login` and `devsandbox access approve`.** `login` stores a credential's secret on this host and approves the claim of the feature it's for, which it shows you first. A feature update that changes its claim stops `run` until you approve the change with `access approve`, which shows what changed. `--profile` limits a credential to the sandboxes of those profiles.
+
+  ```bash
+  devsandbox login sentry-work --feature ghcr.io/devsandboxes/features/sentry:1 --profile work
+  ```
+
+- **`access.<kind>` in a sandbox's config** picks the credential a claim takes (`credential`) and narrows what the sandbox may do with it (`scopes`). Edits apply to the next call, no rebuild.
+
+  ```toml
+  [sandbox.web.access.sentry]
+  credential = "sentry-work"
+  scopes = ["releases.write", "uploads"]
+  ```
+
+- **`access.log`**, next to `state.toml`: one JSON line per call a sandbox made through the broker (instance, credential, route, scope, verdict, status), never a token.
+
 ### Changed
 
 - **A sandbox can no longer see a config.** `run` refuses a bind, read-only too, that covers a config root (any config an instance was created from), a whole `shared-volumes/` dir, or another instance's worktree or per-instance volume. A config that sits inside its own `folder` (`folder = "."`) no longer runs: move it beside the repo. A sandbox that needs config files binds them read-only, one bind each. `run` also warns when a privileged sandbox, or one bound to the container runtime's socket or the desktop's display or session sockets, runs on a host that holds credentials.

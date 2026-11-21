@@ -27,10 +27,10 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 /// What the fake upstream received: the raw head and the body.
-type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+pub(crate) type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// Answers every connection with `answer(head, body)`, then closes it.
-fn upstream_server(answer: impl Fn(&str, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> (u16, Seen) {
+pub(crate) fn upstream_server(answer: impl Fn(&str, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> (u16, Seen) {
     let chain = CertificateDer::pem_file_iter(fixture("localhost.pem")).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
     let key = PrivateKeyDer::from_pem_file(fixture("localhost.key")).unwrap();
     let config = Arc::new(

@@ -12,11 +12,13 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **credentials**: the broker's first step and sentry-cli brokered locally
-  in base-URL mode (credential-broker step 1, github-and-sentry-access
-  step 1), on the way to gh and git through the broker (credential-broker
-  steps 2-3, git-gateway step 1, github-and-sentry-access step 2).
-  → [plan](plans/active/credential-broker.md)
+- **credentials**: credential-broker step 1 and github-and-sentry-access
+  step 1 are done (the broker, `login` by paste, `access approve`,
+  sentry-cli brokered locally in base-URL mode through `features/sentry`);
+  now credential-broker step 2 (device flow and browser OAuth logins,
+  `access ls|revoke`), on the way to gh and git through the broker
+  (credential-broker step 3, git-gateway step 1, github-and-sentry-access
+  step 2). → [plan](plans/active/credential-broker.md)
 
 ## Planned
 

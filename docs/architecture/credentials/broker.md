@@ -183,3 +183,18 @@ take it past 10 MiB (`MAX_BYTES`). Fields: `time` (RFC 3339 UTC),
 (`allow`, `uninjected`, `refused`, `leak`, `error`), `reason`, `status`,
 `phantom` (`own`, `other-claim`, `foreign`). Never a token or a phantom.
 Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog).
+
+## End to end
+
+`commands::run::tests::sentry_cli_brokered_end_to_end_with_docker` runs
+the whole path with a real sentry-cli (a pinned release in the test
+image): the sentry fixture's claim (`tests/fixtures/features/sentry/`,
+the claim `features/sentry` ships) with its one upstream at a private
+`localhost`, `sentry-work` logged in through `commands::login::login_at`,
+`run` wiring the instance, and a `Service` with the test CA's roots
+behind the instance's bridge (`devsbd::bridge::spawn_brokered`) calling
+a mock Sentry over TLS (`Service::with_authority`). `releases new` and a
+source-map upload (`GET …/chunk-upload/` answering an absolute URL, which
+`rewrite` points back at the loopback, then the chunk post and the
+assemble calls) succeed; the mock sees only the real token, as `Bearer`,
+and `access.log` an `allow` line per call with neither token nor phantom.

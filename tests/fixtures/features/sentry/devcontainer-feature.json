@@ -1,8 +1,17 @@
 {
   "id": "sentry",
-  "version": "0.1.0",
-  "name": "sentry-cli, brokered",
-  "description": "Test fixture: features/sentry's claim (docs/plans/active/github-and-sentry-access.md, sentry-cli). Installs nothing yet.",
+  "version": "1.0.0",
+  "name": "sentry-cli, brokered (test fixture)",
+  "description": "Test fixture mirroring github.com/devsandboxes/features' src/sentry: the same metadata and claim (docs/plans/active/github-and-sentry-access.md, sentry-cli), keep them in step. Its install.sh installs nothing.",
+  "options": {
+    "version": {
+      "type": "string",
+      "proposals": ["latest"],
+      "default": "latest",
+      "description": "sentry-cli version to install (a release like 3.8.2, or latest)."
+    }
+  },
+  "containerEnv": { "SENTRY_DISABLE_UPDATE_CHECK": "true" },
   "customizations": {
     "devsandbox": {
       "credentials": {
@@ -96,5 +105,6 @@
         }
       }
     }
-  }
+  },
+  "installsAfter": ["ghcr.io/devcontainers/features/common-utils"]
 }

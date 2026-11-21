@@ -578,6 +578,11 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    config's `sandbox.devsandboxes` drops its read-write
    `.devsandboxes` folder and the dispatcher run from it, which is out
    of use.
+   Built: all of it but the `runArgs` refusal. Deferred, each a
+   [status](../../status.md#credentials) limitation: a claim field marking
+   token and registration endpoints, stripping token-shaped response
+   headers (only the injected value is masked), calling a claim's `check`
+   route after an upstream 401.
 2. `devsandbox login`'s device flow and browser OAuth, `access ls|revoke`.
 3. The member CA (`rcgen` for leaves), intercept mode, trust installed
    at create.
