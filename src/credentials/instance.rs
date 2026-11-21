@@ -117,7 +117,7 @@ pub fn broker_spec(claims: &[InstanceClaim]) -> Option<BrokerSpec> {
             content: f.content.clone(),
         })
         .collect();
-    Some(BrokerSpec { listeners, files, proxy_env: Vec::new() })
+    Some(BrokerSpec { listeners, proxy_listeners: Vec::new(), files, proxy_env: Vec::new() })
 }
 
 /// Of the claims a sandbox's features make (feature, claim), the ones `run`

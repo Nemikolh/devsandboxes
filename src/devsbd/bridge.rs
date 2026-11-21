@@ -3146,6 +3146,7 @@ mod tests {
             };
             let spec = BrokerSpec {
                 listeners: vec![Listener { port: 41001, mode: Mode::BaseUrl { upstream: "sentry.io".into() } }],
+                proxy_listeners: Vec::new(),
                 files: vec![file("/home/u/.config/sentry/rc", "p1"), file("/home/u/.taken", "p2")],
                 proxy_env: Vec::new(),
             };

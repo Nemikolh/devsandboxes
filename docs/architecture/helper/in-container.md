@@ -9,7 +9,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
 `devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`,
-`devsbd/src/open.rs`, `devsbd/src/broker.rs`,
+`devsbd/src/open.rs`, `devsbd/src/broker.rs`, `devsbd/src/proxy.rs`,
 `devsbd/src/rpc_server.rs`, `devsbd/src/rpc_runs.rs`;
 `src/devsbd/brokerfile.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
@@ -27,7 +27,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 | `/run/devsandbox/api.sock` (0666) | in-container clients: first byte `n` = outbox poke, `c` = control request |
 | `/run/devsandbox/devsbd.pid` | flock + `<pid> <build hash>` |
 | `/run/devsandbox/boot`, `boot.log` | boot file (host-written) and its commands' output |
-| `/run/devsandbox/broker` (0644) | broker file (host-written): listeners and phantom files |
+| `/run/devsandbox/broker` (0644) | broker file (host-written): listeners, proxy ports and phantom files |
 | `/var/lib/devsandbox/outbox/` (1777) | queued notify/thread/open records |
 | `/var/lib/devsandbox/runs/` (1777) | tracked runs |
 | `/var/lib/devsandbox/sessions/` (1777) | interactive sessions; `<id>/sock` (0600) is a session's socket |
@@ -85,14 +85,14 @@ streams and everything else as usual.
   at once; no reply within 30 min or a dying bridge → `failed`.
   `events-follow` is relayed as a stream until either side closes or 90 s
   of silence (`FOLLOW_SILENCE`).
-- **Broker listeners**: set up once at start from the broker file
-  ([below](#broker-listeners)).
+- **Broker listeners** and **proxy ports**: set up once at start from the
+  broker file ([below](#broker-listeners)).
 
 ## Broker listeners
 
 The credential broker's container side. The host writes the broker file
-(`brokerfile::PATH`, `src/devsbd/brokerfile.rs`: `listen` and `file`
-lines, plus the container's own proxy env as `proxy` lines) with
+(`brokerfile::PATH`, `src/devsbd/brokerfile.rs`: `listen`, `proxy-listen`
+and `file` lines, plus the container's own proxy env as `proxy` lines) with
 `devsbd::sync_broker`, atomically, from the instance's claims
 (`credentials::instance::broker_spec`): at `run` between the install and
 the daemon's first start (`devsbd::prepare`), and before every daemon
@@ -118,6 +118,44 @@ file: nothing to do. A file that doesn't parse is logged and ignored.
   `ProxyHeader` (`base-url <upstream> <port>`) as the stream's first bytes
   (`Mux::attach_with_header`), the client's bytes after it, flow-controlled.
   No such bridge → a fixed `503 Service Unavailable` (`broker::refuse`).
+- **Proxy ports** ([below](#proxy-ports)): each `proxy-listen` line.
+
+### Proxy ports
+
+The `HTTPS_PROXY` the container's tools use (intercept mode,
+`devsbd/src/proxy.rs`). Each `proxy-listen <port> <host>…` line binds
+`127.0.0.1:<port>` with its own set of bound hosts: the shared proxy port
+and git's own, whose set holds the hosts a claim's `git` field names
+(docs/plans/active/github-and-sentry-access.md). Each connection gets a
+thread that reads the request head (`proxy::read_head`: one byte at a
+time, so what follows stays in the socket; at most `MAX_HEAD`, 8 KiB,
+within `HEAD_TIMEOUT`, 10 s) and parses it strictly
+(`proxy::parse_request`: ASCII, CRLF, `HTTP/1.0|1.1`, token header names,
+no folded lines). The target's host is case-folded and one trailing dot
+dropped before matching; IPv6 literals keep their brackets.
+
+| request | answer |
+|---|---|
+| `CONNECT <bound host>:443` | after a bridge serving `HTTP_PROXY` is found (`HOLD`, as listeners): `200 Connection Established`, then `Open(HTTP_PROXY)` with `ProxyHeader::Intercept { host, port }` first and the client's bytes after it (`Mux::attach_with_header`); no bridge → `503` (`broker::refuse`) |
+| `CONNECT <other host or port>` | dialed from the container (its resolver, each address with a 10 s connect timeout), or through the container's proxy with `CONNECT` (and `Proxy-Authorization: Basic` from its userinfo); `200` and a byte relay; any failure, or the proxy answering non-2xx → `502` |
+| `<METHOD> http://host[:port]/…` | never to the broker (bound upstreams are https): dialed as above with the target rewritten to origin-form, or sent to the container's proxy as is; `Proxy-*` and `Keep-Alive` dropped, the container proxy's credentials added, and `Connection: close` unless the client asks to upgrade (the relay carries one destination, so a kept-alive client's next request must come on a new connection); dial failure → `502` |
+| anything else (origin-form, `https://` targets, malformed, oversize) | `400` and close |
+
+The `200` to a bound `CONNECT` goes out before the `Open`, so it precedes
+anything the broker sends. After the head, a connection is a byte relay
+with no idle timeout: git transfers and SSE streams sit quiet for minutes;
+half-closes are passed on.
+
+The container's proxy is the broker file's `proxy` entries
+(`proxy::Upstreams::from_env`): `https_proxy`, `HTTPS_PROXY`,
+`all_proxy`, `ALL_PROXY` for `CONNECT` targets, the `http_proxy`
+family for `http://` requests, the first non-empty in that order;
+`no_proxy` / `NO_PROXY` exempts `*`, a domain and its subdomains (a
+leading `.` or `*.` optional), an IP, or a CIDR (IP literals only), each
+optionally `:port`. Only `http://` proxies (port 80 by default); another
+scheme is logged at start and gets each dial it would carry a `502`,
+never a direct dial past it. Errors never echo the proxy URL (it may hold
+a password).
 
 ## `devsbd bridge`
 

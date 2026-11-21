@@ -1040,6 +1040,31 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
     }
 
+    #[test]
+    fn a_bound_connect_reaches_the_proxy_host_as_intercept() {
+        let bridges = Arc::new(Bridges::default());
+        let headers = proxy_host_bridge(&bridges, caps::HTTP_PROXY);
+        wait_routable(&bridges, caps::HTTP_PROXY);
+        let b = Arc::clone(&bridges);
+        let route: crate::broker::Route = Arc::new(move || b.route(caps::HTTP_PROXY, HOLD));
+        let port = crate::proxy::tests::proxy_port(&["github.com"], &[], route);
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        client.write_all(b"CONNECT GitHub.COM.:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n").unwrap();
+        let mut established = [0u8; 39];
+        client.read_exact(&mut established).unwrap();
+        assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        client.write_all(b"client hello").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).unwrap();
+        assert_eq!(answer, b"CLIENT HELLO", "only the bytes after the CONNECT head");
+        assert_eq!(
+            headers.recv_timeout(Duration::from_secs(5)).unwrap(),
+            proto::ProxyHeader::Intercept { host: "github.com".into(), port: 443 }
+        );
+    }
+
     fn record(at: u64, msg: &str) -> notify::Message {
         notify::Message::Notify(notify::Record {
             level: notify::Level::Info,

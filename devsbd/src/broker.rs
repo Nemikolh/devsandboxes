@@ -2,7 +2,8 @@
 //! *Broker listeners*): at start, the broker file's phantom files and its
 //! loopback listeners. Each accepted connection becomes an `HTTP_PROXY`
 //! stream to the newest bridge whose host serves one, its `ProxyHeader`
-//! first; the broker itself runs in the host's `serve`.
+//! first; the broker itself runs in the host's `serve`. The proxy ports
+//! are `proxy.rs`.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -17,6 +18,7 @@ use std::time::Duration;
 use crate::brokerfile::{self, BrokerSpec, Mode, PhantomFile};
 use crate::mux::Mux;
 use crate::proto::{channel, ProxyHeader};
+use crate::proxy::{self, ProxyPort, Upstreams};
 
 /// The hidden verb [`write_phantom`] runs as a phantom file's owner.
 pub const WRITE_VERB: &str = "phantom-write";
@@ -37,7 +39,7 @@ pub type Route = Arc<dyn Fn() -> Option<Arc<Mux>> + Send + Sync>;
 const NO_HOST_BODY: &str = "no devsandbox host connected\n";
 
 /// Read the broker file at `path` (absent: nothing to do), write its phantom
-/// files, then bind its listeners and serve each on its own thread. Every
+/// files, then bind its listeners and proxy ports and serve each on its own thread. Every
 /// failure is logged and skips only its own entry: the daemon's other
 /// sockets matter more.
 pub fn start(path: &Path, route: Route, ids: Arc<AtomicU32>) {
@@ -47,7 +49,7 @@ pub fn start(path: &Path, route: Route, ids: Arc<AtomicU32>) {
         Ok(Err(e)) => return eprintln!("devsbd: broker file {}: {e}", path.display()),
         Err(e) => return eprintln!("devsbd: broker file {}: {e}", path.display()),
     };
-    let BrokerSpec { listeners, files, proxy_env: _ } = spec;
+    let BrokerSpec { listeners, proxy_listeners, files, proxy_env } = spec;
     for file in &files {
         if let Err(e) = write_phantom(file) {
             eprintln!("devsbd: phantom file {}: {e}", file.path);
@@ -66,6 +68,24 @@ pub fn start(path: &Path, route: Route, ids: Arc<AtomicU32>) {
         };
         let (route, ids) = (Arc::clone(&route), Arc::clone(&ids));
         std::thread::spawn(move || serve(listener, &header, &route, &ids));
+    }
+    let upstreams = Arc::new(Upstreams::from_env(&proxy_env));
+    if !proxy_listeners.is_empty() {
+        for why in upstreams.problems() {
+            eprintln!("devsbd: proxy ports: {why}");
+        }
+    }
+    for l in proxy_listeners {
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, l.port)) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("devsbd: proxy port 127.0.0.1:{}: {e}", l.port);
+                continue;
+            }
+        };
+        let port = Arc::new(ProxyPort { hosts: l.hosts, upstreams: Arc::clone(&upstreams) });
+        let (route, ids) = (Arc::clone(&route), Arc::clone(&ids));
+        std::thread::spawn(move || proxy::serve(listener, &port, &route, &ids));
     }
 }
 
@@ -86,10 +106,15 @@ pub(crate) fn serve(listener: TcpListener, header: &ProxyHeader, route: &Route, 
 
 /// Answer a client no host can take with a 503 (a valid answer to a request
 /// and to a `CONNECT` alike), so the tool reports why instead of a reset.
-fn refuse(mut conn: TcpStream) {
+pub(crate) fn refuse(conn: TcpStream) {
+    respond(conn, "503 Service Unavailable", NO_HOST_BODY);
+}
+
+/// Answer `status` with a plain-text `body`, then close.
+pub(crate) fn respond(mut conn: TcpStream, status: &str, body: &str) {
     let answer = format!(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{NO_HOST_BODY}",
-        NO_HOST_BODY.len()
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
     if conn.write_all(answer.as_bytes()).is_err() {
         return;

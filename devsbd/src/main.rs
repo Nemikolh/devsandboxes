@@ -13,6 +13,7 @@ mod json;
 mod listeners;
 mod open;
 mod outbox;
+mod proxy;
 mod rpc_runs;
 mod rpc_server;
 mod rpc_sessions;
