@@ -427,6 +427,133 @@ fn intercept_leaks_and_mode_mismatches() {
     refused(&o, &format!("port {listener} is no broker listener for `api.github.com`"));
 }
 
+/// [`intercept_state`] with the repo-fenced github fixture, `web-1`'s
+/// folders recording `o/r`.
+pub(crate) fn fenced_state() -> State {
+    let mut state = intercept_state(crate::credentials::home::tests::github());
+    state.instances.get_mut("web-1").unwrap().github_repos = vec!["o/r".into()];
+    state
+}
+
+pub(crate) fn fenced_src(access: Option<Access>) -> Src {
+    Src { home: intercept_home(&crate::credentials::home::tests::github()), access }
+}
+
+/// git's `Authorization: Basic` with `p` as the password.
+pub(crate) fn git_basic(p: &str) -> String {
+    let b = String::from_utf8(redact::basic_auth(b"x-access-token", p.as_bytes())).unwrap();
+    format!("Authorization: Basic {b}\r\n")
+}
+
+fn fenced(src: &Src, method: &str, host: &str, path: &str, extra: &str) -> Outcome {
+    let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
+    let header = ProxyHeader::Intercept { host: host.into(), port: 443 };
+    decide(&Call { caller: &caller(), header: &header, head: &head }, &fenced_state(), src)
+}
+
+const UPLOAD_REFS: &str = "/o/r.git/info/refs?service=git-upload-pack";
+
+#[test]
+fn fence_admits_its_repos_with_either_slot() {
+    let src = fenced_src(None);
+    let o = fenced(&src, "GET", "github.com", UPLOAD_REFS, &git_basic(GH));
+    let i = injected(&o);
+    assert_eq!(i.slot, Slot::Basic { username: "x-access-token".into() });
+    assert_eq!((o.context.scope.as_deref(), o.context.outside.as_deref()), (Some("repo.read"), None));
+    assert_eq!(o.context.shape, Some(Shape::Git {}), "git's shape for smart HTTP");
+    // Case-folded, `.git`/`.wiki.git` reduced, the REST form.
+    injected(&fenced(&src, "GET", "github.com", "/O/R.wiki.git/info/refs?service=git-upload-pack", &git_basic(GH)));
+    injected(&fenced(&src, "POST", "github.com", "/o/r.git/git-upload-pack", &git_basic(GH)));
+    let o = fenced(&src, "POST", "api.github.com", "/repos/o/R/pulls", &format!("Authorization: token {GH}\r\n"));
+    assert_eq!(injected(&o).slot, Slot::Header { name: "authorization".into(), format: "token {token}".into() });
+    assert_eq!(o.context.shape, Some(Shape::Json { field: "message".into() }));
+}
+
+#[test]
+fn outside_the_fence_reads_go_stripped_and_writes_are_refused() {
+    let src = fenced_src(None);
+    let o = fenced(&src, "GET", "github.com", "/x/y.git/info/refs?service=git-upload-pack", &git_basic(GH));
+    assert!(
+        matches!(&o.action, Action::Outside { slot: Slot::Basic { .. }, private: false }),
+        "{:?}",
+        o.action
+    );
+    assert_eq!(o.context.outside.as_deref(), Some("x/y"));
+    assert!(matches!(fenced(&src, "POST", "github.com", "/x/y/git-upload-pack", &git_basic(GH)).action, Action::Outside { .. }));
+    let token = format!("Authorization: token {GH}\r\n");
+    assert!(matches!(fenced(&src, "GET", "api.github.com", "/repos/x/y", &token).action, Action::Outside { .. }));
+
+    for (method, host, path) in [
+        ("POST", "api.github.com", "/repos/x/y/pulls"),
+        ("GET", "github.com", "/x/y.git/info/refs?service=git-receive-pack"),
+        ("POST", "github.com", "/x/y.git/git-receive-pack"),
+    ] {
+        let auth = if host == "github.com" { git_basic(GH) } else { token.clone() };
+        let o = fenced(&src, method, host, path, &auth);
+        let r = refused(&o, "`x/y` is outside the instance's repo fence: no credential writes to it");
+        assert_eq!(r.todo.as_deref(), Some("add `x/y` to `access.github.repos` in the sandbox's config"), "{path}");
+    }
+    // `never` wins over the fence.
+    refused(&fenced(&src, "GET", "api.github.com", "/repos/x/y/keys", &token), "a `never` route");
+}
+
+#[test]
+fn config_repos_widen_the_fence() {
+    let src = fenced_src(Some(Access { repos: vec!["X/Y.git".into(), "https://github.com/a/b".into(), "junk".into()], ..Access::default() }));
+    injected(&fenced(&src, "POST", "github.com", "/x/y.git/git-receive-pack", &git_basic(GH)));
+    injected(&fenced(&src, "GET", "github.com", "/a/b/info/refs?service=git-upload-pack", &git_basic(GH)));
+    injected(&fenced(&src, "GET", "github.com", UPLOAD_REFS, &git_basic(GH)));
+    assert_eq!(
+        fence_of(&fenced_state().instances["web-1"], &src.access.clone().unwrap()),
+        ["a/b", "o/r", "x/y"].map(String::from).into()
+    );
+}
+
+#[test]
+fn a_push_in_the_fence_still_needs_its_scope() {
+    let src = fenced_src(Some(Access { scopes: vec!["repo.read".into()], ..Access::default() }));
+    injected(&fenced(&src, "GET", "github.com", UPLOAD_REFS, &git_basic(GH)));
+    let o = fenced(&src, "GET", "github.com", "/o/r.git/info/refs?service=git-receive-pack", &git_basic(GH));
+    let r = refused(&o, "scope `git.push` isn't in `access.github.scopes`");
+    assert_eq!(r.scope.as_deref(), Some("git.push"));
+    assert_eq!(o.context.shape, Some(Shape::Git {}));
+}
+
+#[test]
+fn repo_less_and_unplaced_routes() {
+    let token = format!("Authorization: token {GH}\r\n");
+    let o = fenced(&fenced_src(None), "GET", "api.github.com", "/user", &token);
+    assert_eq!(o.context.outside, None);
+    injected(&o);
+    let ask = fenced_src(Some(Access { ask: vec!["user.read".into(), "repo.read".into()], ..Access::default() }));
+    refused(&fenced(&ask, "GET", "api.github.com", "/user", &token), "names no repo, so it's never asked");
+    refused(&fenced(&ask, "GET", "api.github.com", "/repos/o/r", &token), "asks need permission requests");
+
+    let o = fenced(&fenced_src(None), "GET", "api.github.com", "/repositories/123", &token);
+    refused(&o, "`GET /repositories/123` names its repo by `{id}`, which the broker can't resolve yet");
+    // Unknown routes stay `other`.
+    refused(&fenced(&fenced_src(None), "GET", "api.github.com", "/repos/o/r/hooks", &token), "scope `other`");
+    // A path past the repo that decodes badly.
+    let o = fenced(&fenced_src(None), "GET", "api.github.com", "/repos/o/r/contents/a%2F..%2Fb", &token);
+    assert_eq!(refused(&o, "dot-segment past the repo").status, 400);
+}
+
+#[test]
+fn stripping_removes_only_the_slot() {
+    let mut headers =
+        parse_head(format!("GET / HTTP/1.1\r\nAuthorization: token {GH}\r\nGit-Protocol: version=2\r\n\r\n").as_bytes())
+            .unwrap()
+            .headers;
+    let mut path = format!("/x?a=1&key={GH}");
+    strip(&mut headers, &mut path, &Slot::Basic { username: "u".into() });
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].name, "Git-Protocol");
+    strip(&mut headers, &mut path, &Slot::Query { param: "key".into() });
+    assert_eq!(path, "/x?a=1");
+    strip(&mut headers, &mut path, &Slot::Query { param: "a".into() });
+    assert_eq!(path, "/x");
+}
+
 #[test]
 fn injection_rewrites_only_the_slot() {
     let mut headers = parse_head(

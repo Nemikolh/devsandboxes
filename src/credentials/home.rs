@@ -319,13 +319,18 @@ pub(crate) mod tests {
     use crate::credentials::claim;
 
     pub(crate) fn sentry() -> Claim {
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/features/sentry/devcontainer-feature.json"
-        ))
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        claim::parse("sentry", &v["customizations"]["devsandbox"]["credentials"]["sentry"]).unwrap()
+        fixture("sentry")
+    }
+
+    /// The repo-fenced intercept claim of `tests/fixtures/features/github`.
+    pub(crate) fn github() -> Claim {
+        fixture("github")
+    }
+
+    fn fixture(kind: &str) -> Claim {
+        let path = format!("{}/tests/fixtures/features/{kind}/devcontainer-feature.json", env!("CARGO_MANIFEST_DIR"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        claim::parse(kind, &v["customizations"]["devsandbox"]["credentials"][kind]).unwrap()
     }
 
     #[test]

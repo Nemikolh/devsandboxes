@@ -12,7 +12,8 @@ and [github-and-sentry-access](../../plans/active/github-and-sentry-access.md)
 Code: `src/credentials/fence.rs` (`parse`, `github_repo`, `normalize`,
 `plain_host`, `ssh_g_hostname`, `ssh_hostname`, `repo_arg`),
 `src/commands/run/remotes.rs` (`record_at`, `read_folder`, `fence_of`,
-`instance_folders`, `refresh_at`), `src/commands/run/git.rs`
+`instance_folders`, `refresh_at`), `src/broker/policy.rs` (`fence_of`),
+`src/commands/run/git.rs`
 (`read_remotes`, `read_regular`, `remotes_of`), `src/state.rs`
 (`State::folder_remotes`, `FolderRemotes`, `FolderRemote`,
 `Instance::github_repos`), `src/commands/access.rs` (`forget_at`,
@@ -116,6 +117,20 @@ before the container starts) without ever recording, so a folder an
 instance mounted before records existed gets one at its next `run` or
 `rebuild`. The config's `access.github.repos` isn't in it: the broker
 reads that per call.
+
+## Enforcement
+
+The broker enforces the fence for a fenced claim (one whose `fence` names
+a route, as github's does): `policy::fence_of` is the instance's
+`github_repos` plus the config's `access.<kind>.repos` (each through
+`fence::repo_arg`), read per call, and a route's `{repo}` (normalized
+as `normalize` does) inside it gets the credential, subject to its scope.
+Outside it a read goes upstream with the phantom stripped, marked
+`devsandbox-fence: outside`, an upstream `401` turned into a `403` naming
+`access.<kind>.repos`; a write, a git push included, is refused at
+`info/refs`. Routes naming a repo by id (`/repositories/{id}`) aren't
+placed yet and are refused. The rules:
+[broker](broker.md#the-repo-fence).
 
 ## `access forget`
 

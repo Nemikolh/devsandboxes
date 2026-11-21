@@ -9,21 +9,25 @@ a call is refused. The design it implements is
 [credential-broker](../../plans/active/credential-broker.md) (*Shape*:
 "The broker", "Phantoms", "Policy", "Refusals", "Audit") and
 [github-and-sentry-access](../../plans/active/github-and-sentry-access.md)
-(*The claim contract*, *sentry-cli*). What isn't built yet:
+(*The claim contract*, *gh*'s *The repo fence*, *Matching*, *Outside the
+fence*, *sentry-cli*) and [git-gateway](../../plans/active/git-gateway.md)
+(*The gateway*, "The broker"). What isn't built yet:
 [status](../../status.md#credentials).
 
 Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
 `src/broker/policy.rs` (`decide`, `admit_intercept`, `intercept_claim`,
 `Sources`, `Outcome`, `Action`, `Injection`, `Phantom`, `inject`,
-`secrets`), `src/broker/intercept.rs` (`server_config`, `fold`, `ALPN`),
-`src/credentials/ca.rs` (`MemberCa`), `src/broker/route.rs`
-(`check_path`, `matches`, `scope_of`), `src/broker/rewrite.rs`
+`strip`, `fence_of`, `secrets`), `src/broker/intercept.rs`
+(`server_config`, `fold`, `ALPN`), `src/credentials/ca.rs` (`MemberCa`),
+`src/broker/route.rs` (`check_path`, `matches`, `Match`, `scope_of`,
+`Matched`, `git_service`, `is_write`), `src/broker/rewrite.rs`
 (`loopback_url`, `location`, `json_fields`, `MAX_REWRITE`),
 `src/broker/refusal.rs` (`Refusal`), `src/broker/audit.rs` (`Audit`,
 `Line`), `src/broker/head.rs`, `src/broker/body.rs`, `src/broker/guard.rs`,
 `src/broker/redact.rs`, `src/broker/upstream/` (`Upstream`),
 `src/serve/host.rs` (`poll`, where the broker is built),
-`src/credentials/claim.rs` (`from_canonical`),
+`src/credentials/claim.rs` (`from_canonical`, `Pinned::fenced`),
+`src/credentials/fence.rs` (`normalize`, `repo_arg`),
 `src/credentials/oauth/refresh.rs` (`Renewer`, `refresh`, `due`,
 `MARGIN`, `RECENT`), `src/credentials/home.rs` (`Broken`,
 `mark_broken`).
@@ -62,8 +66,8 @@ the port) then the tool's raw TLS ([Intercept mode](#intercept-mode)).
    `guard::check_host` (`Host` must be `127.0.0.1:<listener>`, or in
    intercept mode the `CONNECT` target, port 443 by default): `403`.
 3. `state.toml` is read (`State::load_at`), then `policy::decide`.
-4. A refusal is answered; an uninjected or injected call is forwarded
-   (below); one `access.log` line either way.
+4. A refusal is answered; an uninjected, injected or outside call is
+   forwarded (below); one `access.log` line either way.
 
 Keep-alive holds both ways per request: the connection stays open when
 the request asked for it and its body was read to its end. A refusal
@@ -116,21 +120,75 @@ only for a call carrying the phantom). First refusal answers:
    `devsandbox access approve <credential>`. From here on the home's copy
    (`claim::from_canonical`) rules; the instance's only selected it.
 7. **Upstream and slot** in that copy.
-8. **Scope** (`route::scope_of` on the copy): method and path, query
-   ignored; `{var}` takes one non-empty segment; segments compare raw
-   (percent-encoding and case included), so an encoded form never matches
-   a literal route and lands in `other`. A `never` route is refused
-   always. A route in no scope is `other`, refused as an ask. The scope
-   must be granted (`max`; unset: every scope) and not in
-   `access.<kind>.ask` (refused: asks need permission requests), and
-   requested (`access.<kind>.scopes`; empty: every scope of the claim),
-   each refusal naming what to change.
+8. **Route** (`route::scope_of` on the copy, [Route matching](#route-matching)):
+   a `never` route is refused always; a route in no scope is `other`,
+   refused as an ask; a path past `{repo}` that decodes badly is a `400`.
+9. **Repo fence**, for a fenced claim ([below](#the-repo-fence)): the
+   matched route is placed on a repo, repo-less, or refused; a repo
+   outside the fence goes upstream stripped, or is refused for a write.
+10. **Scope**: it must be granted (`max`; unset: every scope) and not in
+   `access.<kind>.ask` (refused: asks need permission requests; on a
+   repo-less route of a fenced claim, refused as never asked, since an
+   answer couldn't name a repo), and requested (`access.<kind>.scopes`;
+   empty: every scope of the claim), each refusal naming what to change.
 
-The result (`Outcome`) carries the refusal or the injection (credential,
-slot, the approved claim, its upstream's `private`) and the log context:
-kind, credential, scope, whose phantom, the instance's listeners (none in
-intercept mode) and the refusal shape (the approved copy's once read,
-else the instance's).
+The result (`Outcome`) carries the refusal, the injection (credential,
+slot, the approved claim, its upstream's `private`) or the outside call
+(`Action::Outside`: the phantom's slot, the upstream's `private`) and the
+log context: kind, credential, scope, whose phantom, the instance's
+listeners (none in intercept mode), the outside repo and the refusal
+shape (the approved copy's once read, else the instance's; git's for any
+git smart-HTTP request, `route::git_service`, so git prints the reason).
+
+### Route matching
+
+A route is a method and a path, optionally one `?name=value` query
+constraint (`GET /{repo}/info/refs?service=git-receive-pack`): the
+request's query must hold that parameter exactly once with that raw
+value; other parameters are ignored, and a route without one ignores the
+query. `{var}` takes one non-empty segment and `{repo}` two, `owner/repo`;
+literal segments compare raw (percent-encoding and case included), so an
+encoded form never matches a literal route and lands in `other`.
+
+`{repo}`'s segments are strict, as `fence::normalize` reads them: owner
+`[A-Za-z0-9-]`, repo `[A-Za-z0-9._-]`, so an encoded character there
+matches nothing; the match carries them lowercased with `.wiki.git` or
+`.git` dropped. Past them `%2F` (any case) is decoded once and the
+decoded segments matched against the rest of the route (gh sends
+`git/ref/tags%2Fv1`); a double encoding (`%25` and two hex digits) or a
+dot-segment or `//` after decoding refuses the call (`Match::Refused`).
+The request is forwarded exactly as sent.
+
+`never` routes are tried first, then routes with a query constraint, then
+the rest, so `info/refs?service=git-receive-pack` is `git.push`'s even if
+another scope lists a bare `info/refs`.
+
+### The repo fence
+
+A claim whose `fence` names any route is fenced (`Pinned::fenced`).
+`route::scope_of` returns the matched route and what its `{repo}` took;
+`attribute` places it:
+
+- the route's `fence` entry names an input other than `{repo}` (a repo id
+  as in `/repositories/{id}`, a body field): it can't be placed yet and is
+  refused;
+- it took a repo: checked against the instance's fence (`fence_of`:
+  `Instance::github_repos`, the folders' recorded repos
+  ([fence](fence.md)), and the config's `access.<kind>.repos`, each
+  `owner/repo` or a GitHub URL of it through `fence::repo_arg`, read per
+  call);
+- no `{repo}`: repo-less, on to the scope checks (never asked).
+
+In the fence the scope checks follow. Outside it the call gets no
+credential and is never asked: a write (`route::is_write`: a method but
+`GET`/`HEAD`, except git's upload-pack `POST`, and receive-pack's
+`info/refs` too) is refused naming `access.<kind>.repos`, at `info/refs`
+for a push, before git sends anything; a read is `Action::Outside`, sent
+upstream with the phantom's slot removed (`policy::strip`: the header, or
+the query parameter), its response marked `devsandbox-fence: outside`
+(an upstream's own such field dropped). An upstream `401` to it becomes
+the broker's `403` naming `access.<kind>.repos`, so git never falls back
+to a credential prompt and gh never to its login.
 
 ## The call
 
@@ -144,8 +202,10 @@ OAuth record's access token, renewed first when due ([Renewal](#renewal));
 none stored names `devsandbox login`) and `policy::inject` writes it into
 the chosen slot only: the header as its
 `format` with the token, `Basic` with the slot's username, or the query
-parameter percent-encoded. The address check lets private ranges through
-only for an injected call whose approved upstream is `private`. The body
+parameter percent-encoded. An outside call has that slot removed instead.
+The address check lets private ranges through only for an injected or
+outside call whose approved upstream is `private`. `Git-Protocol` (a v2
+fetch) passes through like any field the client doesn't reserve. The body
 streams from the tool to the upstream as it arrives (`BodyReader` into
 `upstream::Body`, its length or chunked as sent), except a renewable
 call's (below), which is read whole first when it has a length up to
@@ -289,7 +349,7 @@ Never `WWW-Authenticate`.
 take it past 10 MiB (`MAX_BYTES`). Fields: `time` (RFC 3339 UTC),
 `instance`, `instance_id`, `incarnation`, `kind`, `credential`, `method`,
 `route` (the path before injection, query dropped), `scope`, `verdict`
-(`allow`, `uninjected`, `refused`, `leak`, `error`), `reason`, `status`,
+(`allow`, `uninjected`, `outside`, `refused`, `leak`, `error`), `reason`, `status`,
 `phantom` (`own`, `other-claim`, `foreign`), and `refreshed: true` when
 the call renewed the token. An intercepted connection closed before any
 request (not intercepted, no TLS, a failed handshake) leaves a line

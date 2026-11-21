@@ -359,11 +359,17 @@ is frozen: no new work on it.
 - The broker refuses every ask: a scope in `access.<kind>.ask` and a
   route in no scope (`other`) get a 403 saying asks need permission
   requests (credential-broker step 4); `presence` routes pass. The GitHub
-  repo fence is recorded (`State::folder_remotes`, `Instance::github_repos`,
-  [fence](architecture/credentials/fence.md)) but nothing enforces it yet
-  (git-gateway step 1, github-and-sentry-access step 2), and it isn't
-  resolved to repo ids, so a renamed repo's new name doesn't match; a
-  placed or remote instance's fence doesn't travel with it. No token and registration
+  repo fence is enforced on a fenced claim's `{repo}` routes
+  ([fence](architecture/credentials/fence.md#enforcement)) but isn't
+  resolved to repo ids, so a renamed repo's new name doesn't match and
+  `/repositories/{id}` routes and other id- or body-named inputs are
+  refused (github-and-sentry-access step 2); a placed or remote instance's
+  fence doesn't travel with it. Pushes in the fence get no branch or tag
+  rules and a refused one is a plain `403` at `info/refs`, not a
+  `report-status` (git-gateway step 2). Out of the fence an LFS batch
+  `POST` counts as a write, so public LFS downloads there are refused. Only
+  the github test fixture claims a fence: the real `features/gh` claim is
+  github-and-sentry-access step 2. No token and registration
   endpoints a claim could mark (no claim field). A credential marked
   broken notifies no approver (credential-broker step 4). Policy reads no
   request body, and token-shaped response headers aren't stripped: only the injected value is masked. One

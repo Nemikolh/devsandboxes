@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::broker::policy::tests::{
-    FOREIGN, GH, OWN, caller, github, home_with, intercept_home, intercept_state, sentry, state_with,
+    FOREIGN, GH, OWN, caller, git_basic, github, home_with, intercept_home, intercept_state, sentry, state_with,
 };
 use crate::broker::upstream::Timeouts;
 use crate::credentials::oauth::tests::{GITHUB_TOKEN, field, form, json, path};
@@ -99,6 +99,15 @@ impl Rig {
         Rig::with(tag, upstream_port, state, intercept_home(&claim), "github-work", &claim)
     }
 
+    /// [`Rig::intercept`] with the repo-fenced github fixture, `web-1`'s
+    /// folders recording `o/r`.
+    fn fenced(tag: &str, upstream_port: u16) -> Rig {
+        let claim = private(crate::credentials::home::tests::github());
+        let mut state = intercept_state(claim.clone());
+        state.instances.get_mut("web-1").unwrap().github_repos = vec!["o/r".into()];
+        Rig::with(tag, upstream_port, state, intercept_home(&claim), "github-work", &claim)
+    }
+
     fn with(tag: &str, upstream_port: u16, mut state: State, home: Home, credential: &str, claim: &claim::Claim) -> Rig {
         let dir = std::env::temp_dir().join(format!("dsv-broker-serve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -151,8 +160,8 @@ impl Rig {
         token.expose().to_string()
     }
 
-    fn broken(&self) -> Option<home::Broken> {
-        home::load(&home::path(&self.dir.join("data"))).unwrap()["sentry-work"].broken.clone()
+    fn broken(&self, credential: &str) -> Option<home::Broken> {
+        home::load(&home::path(&self.dir.join("data"))).unwrap()[credential].broken.clone()
     }
 
     fn config(&self, text: &str) {
@@ -486,7 +495,7 @@ fn upstream_401_on_an_injected_call_is_a_login_refusal() {
     let seen = seen.lock().unwrap();
     assert!(seen[1].0.starts_with("GET /api/0/ HTTP/1.1\r\n"), "{}", seen[1].0);
     assert!(seen[1].0.to_ascii_lowercase().contains(&format!("\r\nauthorization: bearer {}\r\n", TOKEN.to_ascii_lowercase())));
-    assert_eq!(rig.broken().unwrap().reason, "its `check` route `GET /api/0/` answered 401");
+    assert_eq!(rig.broken("sentry-work").unwrap().reason, "its `check` route `GET /api/0/` answered 401");
     assert_eq!(rig.log(1).len(), 1, "the check leaves no line");
 }
 
@@ -499,7 +508,7 @@ fn a_401_the_check_route_doesnt_repeat_marks_nothing() {
     let rig = Rig::new("401-check-ok", port);
     let a = rig.connect("sentry.io").call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
     assert_eq!(a.status, 403);
-    assert_eq!(rig.broken(), None);
+    assert_eq!(rig.broken("sentry-work"), None);
 }
 
 const OLD: &str = "OLDtoken-9876543210";
@@ -569,7 +578,7 @@ fn a_streamed_body_past_the_bound_isnt_replayed() {
     let paths: Vec<String> = seen.lock().unwrap().iter().map(|(h, _)| path(h).to_string()).collect();
     assert_eq!(paths, [RELEASES, "/token", "/api/0/"], "renewed and checked, not replayed");
     assert_eq!(rig.stored(), "ghu_live");
-    assert_eq!(rig.broken(), None, "the check passed with the renewed token");
+    assert_eq!(rig.broken("sentry-work"), None, "the check passed with the renewed token");
     assert_eq!(rig.log(1)[0]["refreshed"], true);
 }
 
@@ -596,7 +605,7 @@ fn a_refused_renewal_is_a_login_refusal_and_an_unreachable_one_a_503() {
     let a = rig.connect("sentry.io").call("GET", "/api/0/", &bearer(OWN), b"");
     assert_eq!((a.status, a.header("retry-after")), (503, Some("30")), "{a:?}");
     assert!(a.json()["detail"].as_str().unwrap().contains("cannot renew credential `sentry-work`'s token"));
-    assert_eq!(rig.broken(), None);
+    assert_eq!(rig.broken("sentry-work"), None);
 
     rig.oauth("ghr_dead", Instance::now(), port);
     let a = rig.connect("sentry.io").call("GET", "/api/0/", &bearer(OWN), b"");
@@ -604,7 +613,7 @@ fn a_refused_renewal_is_a_login_refusal_and_an_unreachable_one_a_503() {
     let v = a.json();
     assert!(v["detail"].as_str().unwrap().contains("was refused: invalid_grant"), "{v}");
     assert_eq!(v["devsandbox"]["do"], "devsandbox login sentry-work");
-    assert_eq!(rig.broken().unwrap().reason, "its refresh was refused: invalid_grant");
+    assert_eq!(rig.broken("sentry-work").unwrap().reason, "its refresh was refused: invalid_grant");
     assert_eq!(rig.stored(), OLD);
 }
 
@@ -709,6 +718,82 @@ fn an_uncovered_host_is_covered_on_demand() {
     assert_eq!(c.call("GET", "/user", &format!("Authorization: token {GH}\r\n"), b"").status, 200);
 }
 
+/// A git client on `github.com` through the broker.
+fn git_client(rig: &Rig) -> Client {
+    let mut ca = MemberCa::load_or_create(&rig.dir.join("data")).unwrap();
+    ca.ensure_hosts(&BTreeSet::from(["github.com".to_string()])).unwrap();
+    let mut c = rig.intercept_to("github.com", 443, Some("github.com"), &[b"http/1.1"]).unwrap();
+    c.host = "github.com".into();
+    c
+}
+
+fn git_headers() -> String {
+    format!("{}Git-Protocol: version=2\r\n", git_basic(GH))
+}
+
+#[test]
+fn git_fetch_in_the_fence_injects_into_the_basic_slot() {
+    let (port, seen) = upstream_server(echo);
+    let rig = Rig::fenced("git-in", port);
+    let a = git_client(&rig).call("GET", "/o/r.git/info/refs?service=git-upload-pack", &git_headers(), b"");
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.header("devsandbox-fence"), None);
+    let seen = seen.lock().unwrap();
+    let head = &seen[0].0;
+    let real = String::from_utf8(crate::broker::redact::basic_auth(b"x-access-token", TOKEN.as_bytes())).unwrap();
+    assert!(head.contains(&format!("\r\nAuthorization: Basic {real}\r\n")), "{head}");
+    assert!(head.contains("\r\nGit-Protocol: version=2\r\n"), "{head}");
+    assert!(head.starts_with("GET /o/r.git/info/refs?service=git-upload-pack HTTP/1.1\r\n"), "{head}");
+    assert_eq!(rig.log(1)[0]["scope"], "repo.read");
+}
+
+#[test]
+fn git_fetch_outside_the_fence_goes_stripped_and_marked() {
+    let (port, seen) = upstream_server(echo);
+    let rig = Rig::fenced("git-out", port);
+    let a = git_client(&rig).call("GET", "/x/y.git/info/refs?service=git-upload-pack", &git_headers(), b"");
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.header("devsandbox-fence"), Some("outside"), "{}", a.head);
+    let seen = seen.lock().unwrap();
+    let head = &seen[0].0;
+    assert!(!head.to_ascii_lowercase().contains("authorization"), "{head}");
+    assert!(head.contains("\r\nGit-Protocol: version=2\r\n"), "{head}");
+    let log = rig.log(1);
+    assert_eq!((log[0]["verdict"].as_str(), log[0]["status"].as_u64()), (Some("outside"), Some(200)));
+}
+
+#[test]
+fn an_outside_401_is_the_brokers_403() {
+    let (port, _) = upstream_server(|_, _| UNAUTHORIZED.to_vec());
+    let rig = Rig::fenced("git-out-401", port);
+    let a = git_client(&rig).call("GET", "/x/y.git/info/refs?service=git-upload-pack", &git_headers(), b"");
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(!a.head.to_ascii_lowercase().contains("www-authenticate"), "{}", a.head);
+    assert_eq!(a.header("content-type"), Some("text/plain; charset=utf-8"));
+    let text = String::from_utf8(a.body).unwrap();
+    assert!(text.contains("`x/y` is outside the instance's repo fence"), "{text}");
+    assert!(text.contains("add `x/y` to `access.github.repos`"), "{text}");
+    assert_eq!(rig.broken("github-work"), None, "no credential was sent: nothing to mark");
+}
+
+#[test]
+fn pushes_are_refused_at_info_refs_before_upstream() {
+    let (port, seen) = upstream_server(echo);
+    let rig = Rig::fenced("git-push", port);
+    let mut c = git_client(&rig);
+    let a = c.call("GET", "/x/y.git/info/refs?service=git-receive-pack", &git_headers(), b"");
+    assert_eq!(a.status, 403, "{a:?}");
+    let text = String::from_utf8(a.body).unwrap();
+    assert!(text.starts_with("devsandbox: `x/y` is outside the instance's repo fence"), "{text}");
+
+    rig.config("[sandbox.web]\nfolder = \".\"\n[sandbox.web.access.github]\nscopes = [\"repo.read\"]\n");
+    let a = c.call("GET", "/o/r.git/info/refs?service=git-receive-pack", &git_headers(), b"");
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(String::from_utf8(a.body).unwrap().contains("scope `git.push` isn't in `access.github.scopes`"));
+    assert_eq!(c.call("GET", "/o/r.git/info/refs?service=git-upload-pack", &git_headers(), b"").status, 200);
+    assert_eq!(seen.lock().unwrap().len(), 1, "only the fetch went upstream");
+}
+
 fn response(length: Length, headers: &[(&str, &str)], body: &'static [u8]) -> Response {
     Response {
         status: 200,
@@ -721,7 +806,7 @@ fn response(length: Length, headers: &[(&str, &str)], body: &'static [u8]) -> Re
 }
 
 fn respond<'a>(listeners: &'a [(String, u16)], fields: Option<&'a [String]>, max: usize, http10: bool) -> Respond<'a> {
-    Respond { http10, keep: true, secrets: None, listeners, fields, max_rewrite: max }
+    Respond { http10, keep: true, outside: false, secrets: None, listeners, fields, max_rewrite: max }
 }
 
 #[test]

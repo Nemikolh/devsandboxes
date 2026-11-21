@@ -307,7 +307,7 @@ take the file past 10 MiB. Never a token or a phantom.
 | `incarnation` | the instance's, when its record has one |
 | `kind`, `credential`, `scope` | as far as policy got (`null` before) |
 | `method`, `route` | the request's, the path before injection, query dropped; empty for an intercepted connection closed before any request |
-| `verdict` | `allow` (injected), `uninjected`, `refused`, `leak`, `error` |
+| `verdict` | `allow` (injected), `uninjected`, `outside` (sent stripped, outside the repo fence), `refused`, `leak`, `error` |
 | `reason` | a refusal's or failure's one line; a skipped `rewrite` |
 | `status` | what the tool got (the upstream's, or the broker's own); `0` when an intercepted connection was closed unanswered (not intercepted, no TLS, a failed handshake) |
 | `phantom` | whose phantom the call carried: `own`, `other-claim`, `foreign`; `null` for none |

@@ -63,7 +63,13 @@ Data only: a claim can't run anything on the home or a member.
 points at the first upstream listed, `inject`'s `format` and phantom file
 templates take `{token}`, `{phantom}` and (`base-url` only) `{baseUrl}`,
 each `rewrite` entry names its route and field paths, and a route is in
-one scope or `never`, never both (`credentials::claim`).
+one scope or `never`, never both (`credentials::claim`). A route's
+`{var}` takes one path segment and `{repo}` two, `owner/repo` (matched as
+*Matching* says); a route may end in one `?name=value` the request's query
+must hold exactly once with that raw value, other parameters ignored
+(`GET /{repo}/info/refs?service=git-receive-pack`), and wins over the same
+route without one. A claim whose `fence` names any route is fenced: its
+`{repo}` routes are checked against the instance's repo fence.
 
 The home binds the secret to its destination. It pins the whole claim but
 its container-side wiring (`phantom`, `baseUrl`, `ca`, `git`: the

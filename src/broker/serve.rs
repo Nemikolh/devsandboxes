@@ -55,6 +55,10 @@ const HOP_BY_HOP: &[&str] =
 /// be replayed with a renewed token; a longer or chunked one streams.
 pub const MAX_REPLAY: u64 = 1024 * 1024;
 
+/// Marks a response to a call sent outside the repo fence; an upstream's
+/// own is dropped.
+const FENCE_HEADER: &str = "devsandbox-fence";
+
 /// What a `503` for an unreachable token endpoint asks the tool to wait.
 const RETRY_AFTER: u16 = 30;
 
@@ -317,7 +321,11 @@ impl Service {
             }
             Action::Uninjected { private: false } => {
                 line.verdict = "uninjected".into();
-                self.forward(&head, header, None, &cx, conn, &mut line)
+                self.forward(&head, header, Via::Bare, &cx, conn, &mut line)
+            }
+            Action::Outside { slot, private } => {
+                line.verdict = "outside".into();
+                self.forward(&head, header, Via::Stripped(&slot, private), &cx, conn, &mut line)
             }
             Action::Inject(inj) => {
                 let now = Instance::now();
@@ -325,7 +333,7 @@ impl Service {
                     Ok(fresh) => {
                         line.verdict = "allow".into();
                         line.refreshed = fresh.refreshed;
-                        self.forward(&head, header, Some((&inj, fresh)), &cx, conn, &mut line)
+                        self.forward(&head, header, Via::Inject(&inj, fresh), &cx, conn, &mut line)
                     }
                     Err(f) => {
                         let r = failure_refusal(f, &inj.credential, cx.scope.clone());
@@ -356,11 +364,16 @@ impl Service {
         &self,
         head: &RequestHead,
         header: &ProxyHeader,
-        inject: Option<(&Injection, Fresh)>,
+        via: Via<'_>,
         cx: &Context,
         conn: &mut Conn,
         line: &mut Line,
     ) -> io::Result<bool> {
+        let (inject, strip) = match via {
+            Via::Bare => (None, None),
+            Via::Inject(inj, fresh) => (Some((inj, fresh)), None),
+            Via::Stripped(slot, private) => (None, Some((slot, private))),
+        };
         let upstream_host = match header {
             ProxyHeader::BaseUrl { upstream, .. } => upstream.as_str(),
             ProxyHeader::Intercept { host, .. } => host.as_str(),
@@ -397,7 +410,7 @@ impl Service {
         };
         let inj = inject.as_ref().map(|(i, _)| *i);
         let mut token = inject.as_ref().map(|(_, f)| f.token.clone());
-        let to = Target { upstream, authority, head };
+        let to = Target { upstream, authority, head, strip };
         let (sent, mut path) = to.send(inj.zip(token.as_ref().map(|t| t.expose())), held.as_deref(), &mut body);
         let keep = keep && body.is_done();
         let w = conn.get_mut();
@@ -405,6 +418,22 @@ impl Service {
             Ok(resp) => resp,
             Err(e) => return self.failed(w, upstream_host, &e, cx, keep, line),
         };
+
+        if strip.is_some() && resp.status == 401 {
+            let repo = cx.outside.as_deref().unwrap_or_default();
+            let kind = cx.kind.as_deref().unwrap_or_default();
+            let r = Refusal {
+                credential: cx.credential.clone(),
+                scope: cx.scope.clone(),
+                ..Refusal::refused(format!(
+                    "`{repo}` is outside the instance's repo fence, and `{upstream_host}` answered 401 to the call \
+                     sent without a credential"
+                ))
+                .todo(policy::repos_todo(repo, kind))
+            };
+            self.refuse(w, &r, cx.shape.as_ref(), !keep, line)?;
+            return Ok(keep);
+        }
 
         if let Some((inj, fresh)) = &inject
             && resp.status == 401
@@ -460,6 +489,7 @@ impl Service {
         let respond = Respond {
             http10: head.version == Version::Http10,
             keep,
+            outside: strip.is_some(),
             secrets: secrets.as_ref(),
             listeners: &cx.listeners,
             fields: fields.as_deref(),
@@ -521,11 +551,21 @@ impl Service {
     }
 }
 
+enum Via<'a> {
+    /// As the tool sent it.
+    Bare,
+    Inject(&'a Injection, Fresh),
+    /// Without the phantom's slot (`true`: a private upstream).
+    Stripped(&'a Slot, bool),
+}
+
 /// Where one request goes: the upstream client, the authority dialed.
 struct Target<'a> {
     upstream: &'a Upstream,
     authority: &'a str,
     head: &'a RequestHead,
+    /// The slot removed and whether the upstream is private.
+    strip: Option<(&'a Slot, bool)>,
 }
 
 impl Target<'_> {
@@ -543,6 +583,9 @@ impl Target<'_> {
         if let Some((inj, token)) = inject {
             policy::inject(&mut headers, &mut path, &inj.slot, token);
         }
+        if let Some((slot, _)) = self.strip {
+            policy::strip(&mut headers, &mut path, slot);
+        }
         let url = format!("https://{}{path}", self.authority);
         let mut held_body = held.unwrap_or_default();
         let req_body = match (held, head.framing) {
@@ -551,7 +594,7 @@ impl Target<'_> {
             (None, Framing::Length(n)) => Body::Length(n, body),
             (None, Framing::Chunked) => Body::Chunked(body),
         };
-        let private = inject.is_some_and(|(i, _)| i.private);
+        let private = inject.is_some_and(|(i, _)| i.private) || self.strip.is_some_and(|(_, p)| p);
         let sent = self.upstream.send(Request { method: &head.method, url: &url, headers: &headers, body: req_body, private });
         (sent, path)
     }
@@ -647,6 +690,8 @@ fn upstream_headers(headers: &[Header]) -> Vec<Header> {
 struct Respond<'a> {
     http10: bool,
     keep: bool,
+    /// Sent stripped, outside the repo fence: marked `devsandbox-fence: outside`.
+    outside: bool,
     secrets: Option<&'a Secrets>,
     listeners: &'a [(String, u16)],
     /// The claim's `rewrite` fields for this route.
@@ -667,7 +712,7 @@ impl Respond<'_> {
             if HOP_BY_HOP.contains(&name.as_str()) || named.contains(&name) {
                 continue;
             }
-            if name == "content-encoding" && resp.decoded.is_some() {
+            if (name == "content-encoding" && resp.decoded.is_some()) || name == FENCE_HEADER {
                 continue;
             }
             let mut value = h.value.clone();
@@ -684,6 +729,9 @@ impl Respond<'_> {
             } else {
                 headers.push(Header { name: h.name.clone(), value });
             }
+        }
+        if self.outside {
+            headers.push(Header { name: FENCE_HEADER.into(), value: b"outside".to_vec() });
         }
         let mut reason = resp.reason.clone().into_bytes();
         if let Some(s) = self.secrets {

@@ -101,8 +101,18 @@ pub struct Pinned {
     /// `None` takes the broker's default.
     pub hold: Option<u32>,
     pub refusal: Option<Refusal>,
-    /// `{var}` from the path, else a body field path.
+    /// `{var}` from the path, else a body field path. Non-empty: the
+    /// credential is repo-fenced ([`Pinned::fenced`]).
     pub fence: BTreeMap<Route, Vec<String>>,
+}
+
+impl Pinned {
+    /// A claim declaring any `fence` input is fenced: its `{repo}` routes
+    /// are checked against the instance's repo fence (credential-broker,
+    /// *Policy*).
+    pub fn fenced(&self) -> bool {
+        !self.fence.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -278,8 +288,9 @@ impl Method {
     }
 }
 
-/// `METHOD /path/{var}/…` or `graphql mutation <name>`. Path segments are
-/// literal or a whole `{var}`; a trailing `/` is part of the route.
+/// `METHOD /path/{var}/…[?name=value]` or `graphql mutation <name>`. Path
+/// segments are literal or a whole `{var}`; `{repo}` takes two, `owner/repo`
+/// (`broker::route`); a trailing `/` is part of the route.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Route {
     Http { method: Method, path: String },
@@ -307,7 +318,9 @@ impl Route {
 
     pub fn vars(&self) -> Vec<&str> {
         match self {
-            Route::Http { path, .. } => path.split('/').filter_map(path_var).collect(),
+            Route::Http { path, .. } => {
+                path.split_once('?').map_or(path.as_str(), |(p, _)| p).split('/').filter_map(path_var).collect()
+            }
             Route::GraphqlMutation(_) => Vec::new(),
         }
     }
@@ -962,12 +975,23 @@ fn check_home_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// A route's path, then at most one `?name=value` the request's query must
+/// hold exactly once ([`query_constraint`]).
 fn check_path(path: &str) -> Result<()> {
+    let (path, query) = path.split_once('?').map_or((path, None), |(p, q)| (p, Some(q)));
     let Some(rest) = path.strip_prefix('/') else {
         bail!("the path must start with `/`");
     };
-    if path.contains(['?', '#']) {
-        bail!("no query string or fragment in a route");
+    if let Some(q) = query {
+        let ok = q.split_once('=').is_some_and(|(k, v)| {
+            !k.is_empty() && !v.is_empty() && k.bytes().all(is_unreserved) && v.bytes().all(is_unreserved)
+        });
+        if !ok {
+            bail!("`?{q}`: a route's query is one `?name=value`, unreserved characters only");
+        }
+    }
+    if path.contains('#') {
+        bail!("no fragment in a route");
     }
     let segments: Vec<&str> = rest.split('/').collect();
     let mut vars = BTreeSet::new();
@@ -1147,6 +1171,7 @@ mod tests {
             "POST /repos/{repo}/pulls",
             "DELETE /api/0/projects/{org}/{project}/keys/{key}/",
             "PUT /a/b:c@d",
+            "GET /{repo}/info/refs?service=git-receive-pack",
             "graphql mutation createPullRequest",
         ] {
             assert_eq!(Route::parse(s).unwrap().to_string(), s);
@@ -1170,7 +1195,11 @@ mod tests {
             ("GET /a{b}/", "a segment is literal"),
             ("GET /{a}/{a}/", "`{a}` twice"),
             ("GET /{a-b}/", "a variable is"),
-            ("GET /api/?x=1", "no query string"),
+            ("GET /api/?x", "one `?name=value`"),
+            ("GET /api/?x=1&y=2", "one `?name=value`"),
+            ("GET /api/?x=%41", "one `?name=value`"),
+            ("GET /api/?=1", "one `?name=value`"),
+            ("GET /api/#x", "no fragment"),
             ("GET  /api/", "must start with `/`"),
             ("graphql mutation create-pr", "isn't a GraphQL name"),
             ("graphql query viewer", "isn't one of GET"),

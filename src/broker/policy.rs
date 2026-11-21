@@ -23,15 +23,27 @@
 //! 6. the claim's version is approved for it; from here on the home's copy
 //!    rules, never the instance's;
 //! 7. the upstream and the phantom's slot are in that copy;
-//! 8. the scope: `never` routes refused; a route in no scope is `other`,
-//!    refused as an ask; the scope must be granted (`max`, unset: every
-//!    scope) and requested (`access.<kind>.scopes`, empty: every scope),
-//!    and one in `access.<kind>.ask` is refused as an ask: asks wait for
-//!    permission requests (credential-broker step 4).
+//! 8. the route: `never` routes refused; a route in no scope is `other`,
+//!    refused as an ask; a path past `{repo}` that decodes badly refused;
+//! 9. the repo fence, for a fenced claim ([`Pinned::fenced`]): a route
+//!    whose `fence` names an input but `{repo}` (a repo id, a body field)
+//!    can't be placed yet and is refused; a `{repo}` outside the instance's
+//!    fence ([`fence_of`]) goes upstream with the phantom stripped
+//!    ([`Action::Outside`]), or is refused naming `access.<kind>.repos`
+//!    for a write ([`route::is_write`]); a route without `{repo}` is
+//!    repo-less;
+//! 10. the scope must be granted (`max`, unset: every scope) and requested
+//!     (`access.<kind>.scopes`, empty: every scope), and one in
+//!     `access.<kind>.ask` is refused as an ask: asks wait for permission
+//!     requests (credential-broker step 4), and a repo-less route is never
+//!     asked.
+//!
+//! A git smart-HTTP request ([`route::git_service`]) is refused in git's
+//! shape whatever the claim's: git prints a text body.
 //!
 //! Not here yet: token and registration endpoints a claim marks (no claim
-//! field for them), the repo fence (github-and-sentry-access step 2),
-//! `presence` (passes until step 4).
+//! field for them), repo ids and body inputs in the fence, `presence`
+//! (passes until step 4).
 
 use anyhow::Result;
 
@@ -41,6 +53,7 @@ use super::refusal::Refusal;
 use super::route::{self, Scoped};
 use crate::config::Access;
 use crate::credentials::claim::{self, Mode, Pinned, Refusal as Shape, Slot};
+use crate::credentials::fence;
 use crate::credentials::home::{self, Home};
 use crate::credentials::instance::{self, InstanceClaim};
 use crate::devsbd::bridge::Caller;
@@ -94,8 +107,11 @@ pub struct Context {
     /// and `rewrite` fields point back to. Empty in intercept mode: the
     /// tool already talks to the real host.
     pub listeners: Vec<(String, u16)>,
-    /// The approved claim's, once read, else the instance's.
+    /// The approved claim's, once read, else the instance's; git's for a
+    /// smart-HTTP request.
     pub shape: Option<Shape>,
+    /// The `owner/repo` of an [`Action::Outside`] call.
+    pub outside: Option<String>,
 }
 
 #[derive(Debug)]
@@ -104,6 +120,10 @@ pub enum Action {
     /// `private`: the upstream is on the LAN; answer a bare 401 instead.
     Uninjected { private: bool },
     Inject(Box<Injection>),
+    /// Outside the repo fence: upstream with the phantom's slot removed,
+    /// no credential (`private`: dialed as the upstream's injected calls
+    /// are).
+    Outside { slot: Slot, private: bool },
 }
 
 #[derive(Debug)]
@@ -209,6 +229,10 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
 
     let head = call.head;
     let path = head.target.path();
+    let git = route::git_service(&head.method, path).is_some();
+    if git {
+        cx.shape = Some(Shape::Git {});
+    }
     route::check_path(path).map_err(|why| Refusal::new(400, "refused", why))?;
 
     let slot = match phantom_slot(head, inst, own, &own_claim, state, &to, cx)? {
@@ -250,7 +274,7 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         .todo(format!("devsandbox access approve {name}")));
     };
     let (_, approved) = claim::from_canonical(approved).map_err(|e| internal(format!("{e:#}")))?;
-    if approved.refusal.is_some() {
+    if approved.refusal.is_some() && !git {
         cx.shape = approved.refusal.clone();
     }
     let Some(up) = approved.upstreams.iter().find(|u| u.host == upstream) else {
@@ -261,9 +285,9 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
     }
 
     let call_route = format!("{} {}", head.method, route::path_only(path));
-    let scoped = route::scope_of(&approved, &head.method, path);
-    cx.scope = Some(scoped.name().to_string());
-    let scope = match scoped {
+    let matched = route::scope_of(&approved, &head.method, path).map_err(|why| Refusal::new(400, "refused", why))?;
+    cx.scope = Some(matched.scoped.name().to_string());
+    let scope = match matched.scoped.clone() {
         Scoped::Never => {
             return Err(Refusal::refused(format!(
                 "`{call_route}` is a `never` route of the `{kind}` claim: no ask or rule opens it"
@@ -276,11 +300,38 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         }
         Scoped::Scope(s) => s,
     };
+    let mut repo_less = false;
+    if approved.fenced() {
+        match attribute(&approved, &matched) {
+            Placed::Unplaced(inputs) => {
+                return Err(Refusal::refused(format!(
+                    "`{call_route}` names its repo by {inputs}, which the broker can't resolve yet"
+                )));
+            }
+            Placed::RepoLess => repo_less = true,
+            Placed::Repo(repo) if fence_of(inst, &access).contains(&repo) => {}
+            Placed::Repo(repo) => {
+                if route::is_write(&head.method, path) {
+                    return Err(Refusal::refused(format!(
+                        "`{repo}` is outside the instance's repo fence: no credential writes to it"
+                    ))
+                    .todo(repos_todo(&repo, kind)));
+                }
+                cx.outside = Some(repo);
+                return Ok(Action::Outside { slot, private: up.private });
+            }
+        }
+    }
     if entry.max.as_ref().is_some_and(|max| !max.contains(&scope)) {
         return Err(Refusal::refused(format!("scope `{scope}` isn't granted by credential `{name}` (its `max`)"))
             .todo(format!("add `{scope}` to `max` of [{name}] in credentials.toml")));
     }
     if access.ask.contains(&scope) {
+        if repo_less {
+            return Err(Refusal::refused(format!(
+                "scope `{scope}` is in `access.{kind}.ask`, but `{call_route}` names no repo, so it's never asked"
+            )));
+        }
         return Err(Refusal::refused(format!("scope `{scope}` is in `access.{kind}.ask`: {ASKS}")));
     }
     if !access.scopes.is_empty() && !access.scopes.contains(&scope) {
@@ -293,6 +344,37 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         private: up.private,
         claim: approved,
     })))
+}
+
+/// What a matched route of a fenced claim names.
+#[derive(Debug, PartialEq, Eq)]
+enum Placed {
+    Repo(String),
+    RepoLess,
+    /// The `fence` inputs beyond `{repo}`, for the reason.
+    Unplaced(String),
+}
+
+fn attribute(claim: &Pinned, matched: &route::Matched) -> Placed {
+    let inputs = matched.route.as_ref().and_then(|r| claim.fence.get(r));
+    let unplaced: Vec<String> = inputs.into_iter().flatten().filter(|i| *i != route::REPO).map(|i| format!("`{i}`")).collect();
+    match &matched.repo {
+        _ if !unplaced.is_empty() => Placed::Unplaced(unplaced.join(", ")),
+        Some(repo) => Placed::Repo(repo.clone()),
+        None => Placed::RepoLess,
+    }
+}
+
+/// The instance's repo fence: its folders' recorded GitHub repos and the
+/// config's `access.<kind>.repos`, normalized (an entry naming no repo
+/// adds none).
+pub fn fence_of(inst: &Instance, access: &Access) -> std::collections::BTreeSet<String> {
+    let config = access.repos.iter().filter_map(|r| fence::repo_arg(r).ok());
+    inst.github_repos.iter().cloned().chain(config).collect()
+}
+
+pub fn repos_todo(repo: &str, kind: &str) -> String {
+    format!("add `{repo}` to `access.{kind}.repos` in the sandbox's config")
 }
 
 /// Step 4: the slot holding the claim's phantom, `None` without one. `to`
@@ -451,6 +533,23 @@ pub fn inject(headers: &mut [super::head::Header], path: &mut String, slot: &Slo
                 })
                 .collect();
             *path = format!("{p}?{}", q.join("&"));
+        }
+    }
+}
+
+/// The request without `slot`: its header, or its query parameter.
+pub fn strip(headers: &mut Vec<super::head::Header>, path: &mut String, slot: &Slot) {
+    match slot {
+        Slot::Header { name, .. } => headers.retain(|h| !h.name.eq_ignore_ascii_case(name)),
+        Slot::Basic { .. } => headers.retain(|h| !h.name.eq_ignore_ascii_case("authorization")),
+        Slot::Query { param } => {
+            let Some((p, q)) = path.split_once('?') else { return };
+            let kept: Vec<&str> =
+                q.split('&').filter(|pair| pair.split_once('=').map_or(*pair, |(k, _)| k) != param).collect();
+            *path = match kept.is_empty() {
+                true => p.to_string(),
+                false => format!("{p}?{}", kept.join("&")),
+            };
         }
     }
 }
