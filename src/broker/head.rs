@@ -122,6 +122,15 @@ impl RequestHead {
 /// `None` when the connection ends cleanly before a request starts (the
 /// end of a keep-alive connection).
 pub fn read_head<R: BufRead>(r: &mut R) -> io::Result<Option<RequestHead>> {
+    match read_raw_head(r)? {
+        Some(head) => Ok(Some(parse_head(&head)?)),
+        None => Ok(None),
+    }
+}
+
+/// A head's bytes through its blank line, with `read_head`'s bounds and
+/// CRLF rule; `broker::upstream` reads response heads with it too.
+pub fn read_raw_head<R: BufRead>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut head = Vec::new();
     let mut seen = 0usize;
     loop {
@@ -156,7 +165,7 @@ pub fn read_head<R: BufRead>(r: &mut R) -> io::Result<Option<RequestHead>> {
         }
         r.consume(used);
         if done {
-            return Ok(Some(parse_head(&head)?));
+            return Ok(Some(head));
         }
     }
 }
@@ -246,7 +255,7 @@ fn framing(version: Version, headers: &[Header]) -> Result<Framing, HttpError> {
     }
 }
 
-fn parse_decimal(v: &[u8]) -> Option<u64> {
+pub(super) fn parse_decimal(v: &[u8]) -> Option<u64> {
     if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
         return None;
     }
@@ -275,13 +284,13 @@ pub fn header<'a>(headers: &'a [Header], name: &str) -> Option<&'a [u8]> {
 }
 
 /// Whitespace-trimmed (empty elements kept, so `chunked,` is two codings).
-fn list_elements<'a>(headers: &'a [Header], name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
+pub(super) fn list_elements<'a>(headers: &'a [Header], name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
     header_indices(headers, name)
         .flat_map(move |i| headers[i].value.split(|&b| b == b','))
         .map(trim_ows)
 }
 
-fn trim_ows(v: &[u8]) -> &[u8] {
+pub(super) fn trim_ows(v: &[u8]) -> &[u8] {
     let ows = |b: &u8| *b == b' ' || *b == b'\t';
     let start = v.iter().position(|b| !ows(b)).unwrap_or(v.len());
     let end = v.iter().rposition(|b| !ows(b)).map_or(start, |e| e + 1);

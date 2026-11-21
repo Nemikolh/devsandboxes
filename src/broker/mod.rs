@@ -1,8 +1,8 @@
 //! The credential broker's HTTP core (docs/plans/active/credential-broker.md,
 //! *Shape*, "The broker"): what `serve` runs over every request an
 //! instance's `HTTP_PROXY` stream carries, before policy and injection.
-//! All of it is pure over `BufRead` / `Write` / byte slices, so it runs on
-//! any platform and tests need no sockets.
+//! All of it but [`upstream`] is pure over `BufRead` / `Write` / byte
+//! slices, so it runs on any platform and tests need no sockets.
 //!
 //! - [`head`]: a request head, parsed with strict framing (one unambiguous
 //!   body length or refusal), and case-insensitive header lookup.
@@ -11,6 +11,8 @@
 //! - [`guard`]: the refusals that keep a browser in the sandbox from
 //!   driving the broker (`Origin`, `Sec-Fetch-Site`, `Host`).
 //! - [`redact`]: masking the injected value wherever it comes back.
+//! - [`upstream`]: the HTTPS client calls go out on, with the address
+//!   check on every address it dials.
 //!
 //! A refusal reaches the caller as an `io::Error` of kind `InvalidData`
 //! carrying an [`HttpError`] ([`refusal`]), so one `?` covers transport
@@ -24,6 +26,7 @@ pub mod body;
 pub mod guard;
 pub mod head;
 pub mod redact;
+pub mod upstream;
 
 use std::fmt;
 use std::io;

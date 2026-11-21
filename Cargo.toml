@@ -33,6 +33,12 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 hex = "0.4"
 # The credential broker's request heads (`broker::head`).
 httparse = "1.10.1"
+# The broker's upstream TLS (`broker::upstream`): ring rather than the default
+# aws-lc-rs (docs/plans/active/mtls-links.md), the host's native roots.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+# An upstream's gzip/deflate answer despite `Accept-Encoding: identity`.
+flate2 = "1.1.11"
 toml = "1.1.5"
 tui-term = "0.3.4"
 vt100 = "0.16"

@@ -565,8 +565,11 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    step 2 the same). First user: sentry-cli
    ([github-and-sentry-access](github-and-sentry-access.md)). New
    dependencies: `rustls` with `ring` (shared with
-   [mtls-links](../active/mtls-links.md)), `httparse` for request heads,
-   `ureq` upstream with redirects off. The `runArgs` refusal waits for
+   [mtls-links](../active/mtls-links.md)), `httparse` for request and
+   response heads, `rustls-native-certs` and `flate2` for the upstream
+   client (`broker::upstream`, over rustls and the broker's own parsers
+   rather than `ureq`, whose proxy path tunnels by name and whose
+   response headers come back as a map). The `runArgs` refusal waits for
    `runArgs` to reach the runtime (parsed and ignored today, so nothing
    to refuse). The config-root bind refusal ships here: the live
    config's `sandbox.devsandboxes` drops its read-write
