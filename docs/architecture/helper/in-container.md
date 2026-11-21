@@ -9,8 +9,9 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
 `devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`,
-`devsbd/src/open.rs`,
+`devsbd/src/open.rs`, `devsbd/src/broker.rs`,
 `devsbd/src/rpc_server.rs`, `devsbd/src/rpc_runs.rs`;
+`src/devsbd/brokerfile.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
 ## Files and sockets
@@ -26,6 +27,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 | `/run/devsandbox/api.sock` (0666) | in-container clients: first byte `n` = outbox poke, `c` = control request |
 | `/run/devsandbox/devsbd.pid` | flock + `<pid> <build hash>` |
 | `/run/devsandbox/boot`, `boot.log` | boot file (host-written) and its commands' output |
+| `/run/devsandbox/broker` (0644) | broker file (host-written): listeners and phantom files |
 | `/var/lib/devsandbox/outbox/` (1777) | queued notify/thread/open records |
 | `/var/lib/devsandbox/runs/` (1777) | tracked runs |
 | `/var/lib/devsandbox/sessions/` (1777) | interactive sessions; `<id>/sock` (0600) is a session's socket |
@@ -83,6 +85,35 @@ streams and everything else as usual.
   at once; no reply within 30 min or a dying bridge → `failed`.
   `events-follow` is relayed as a stream until either side closes or 90 s
   of silence (`FOLLOW_SILENCE`).
+- **Broker listeners**: set up once at start from the broker file
+  ([below](#broker-listeners)).
+
+## Broker listeners
+
+The credential broker's container side. The host writes the broker file
+(`brokerfile::PATH`, `src/devsbd/brokerfile.rs`: `listen` and `file`
+lines, plus the container's own proxy env as `proxy` lines) with
+`devsbd::sync_broker`, atomically; every daemon start reads it
+(`broker::start`), so a daemon already running keeps what it read. No
+file: nothing to do. A file that doesn't parse is logged and ignored.
+
+- **Phantom files** first, each written by `devsbd phantom-write <path>
+  <phantom>` (`broker::write_main`, content on stdin) run as the file's
+  owner (`file`'s `name|uid[:group|gid]`, resolved against the container's
+  passwd now, so an identity remap is followed), so a link the user
+  planted can't steer a root write. It writes only where nothing is or
+  where a regular file already holds that phantom (`broker::replaceable`):
+  a file the user or the image put there, a link or a dir is left alone
+  and logged. Missing parent dirs are made as the owner; the file goes
+  through a temp file and a rename, mode 0600. A daemon that isn't root
+  writes only its own user's files.
+- **Listeners**: each `listen` binds `127.0.0.1:<port>` (a failure is
+  logged and skips that port). Each connection gets a thread: it waits up
+  to `HOLD` (1 s) for a bridge whose host serves `HTTP_PROXY`, like agent
+  clients, then becomes an `Open(HTTP_PROXY)` on it with the listener's
+  `ProxyHeader` (`base-url <upstream> <port>`) as the stream's first bytes
+  (`Mux::attach_with_header`), the client's bytes after it, flow-controlled.
+  No such bridge → a fixed `503 Service Unavailable` (`broker::refuse`).
 
 ## `devsbd bridge`
 

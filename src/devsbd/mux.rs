@@ -612,7 +612,7 @@ impl Mux {
     pub fn attach(self: &Arc<Self>, stream: u32, conn: impl Into<Conn>, open: Option<u8>) -> io::Result<()> {
         let conn = conn.into();
         if open.is_some_and(proto::channel::flows) {
-            return self.attach_flow(stream, conn, open);
+            return self.attach_flow(stream, conn, open, &[]);
         }
         let reader = conn.try_clone()?;
         self.streams.lock().unwrap().insert(stream, Entry::Legacy(Arc::new(conn)));
@@ -627,15 +627,43 @@ impl Mux {
         Ok(())
     }
 
+    /// [`attach`](Self::attach) on flowing `channel`, with `header` sent as
+    /// the stream's first `Data`, ahead of anything read from `conn`: a
+    /// stream whose far end must learn what it carries before the local
+    /// client's bytes (the helper's `HTTP_PROXY` connections). `header` is
+    /// charged to the send window like any other `Data`.
+    #[allow(dead_code)] // helper side (`devsbd/src/broker.rs`)
+    pub fn attach_with_header(
+        self: &Arc<Self>,
+        stream: u32,
+        conn: impl Into<Conn>,
+        channel: u8,
+        header: &[u8],
+    ) -> io::Result<()> {
+        if !proto::channel::flows(channel) || header.len() > CHUNK {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("no header on channel {channel}")));
+        }
+        self.attach_flow(stream, conn.into(), Some(channel), header)
+    }
+
     /// `attach` for a flowing channel: registered as a flow stream before
     /// `Open` goes out (so the peer's answer always finds it), threads started
-    /// after (so no `Data` precedes the `Open`), like `connect`.
-    fn attach_flow(self: &Arc<Self>, stream: u32, conn: Conn, open: Option<u8>) -> io::Result<()> {
+    /// after (so no `Data` precedes the `Open`, nor the `header`), like
+    /// `connect`.
+    fn attach_flow(self: &Arc<Self>, stream: u32, conn: Conn, open: Option<u8>, header: &[u8]) -> io::Result<()> {
         let reader = conn.try_clone()?;
         let flow = Flow::new(None, None);
         self.streams.lock().unwrap().insert(stream, Entry::Flow(Arc::clone(&flow)));
         if let Some(channel) = open {
-            if let Err(e) = self.send(&Frame::Open { stream, channel }) {
+            let sent = self.send(&Frame::Open { stream, channel }).and_then(|()| {
+                if header.is_empty() {
+                    return Ok(());
+                }
+                // No pump yet, so nothing else spends this credit.
+                flow.state.lock().unwrap().send_credit -= header.len() as u32;
+                self.send(&Frame::Data { stream, bytes: header.to_vec() })
+            });
+            if let Err(e) = sent {
                 self.unregister(stream, &flow);
                 return Err(e);
             }
@@ -648,7 +676,7 @@ impl Mux {
     /// flowing channel, legacy otherwise. Sends nothing.
     fn accept_open(self: &Arc<Self>, stream: u32, channel: u8, conn: Conn) -> bool {
         if proto::channel::flows(channel) {
-            self.attach_flow(stream, conn, None).is_ok()
+            self.attach_flow(stream, conn, None, &[]).is_ok()
         } else {
             self.attach(stream, conn, None).is_ok()
         }
@@ -1992,7 +2020,8 @@ mod tests {
     #[test]
     fn flowing_channels() {
         assert!(channel::flows(channel::RPC));
-        for ch in [channel::SSH_AGENT, channel::HTTP_PROXY, channel::NOTIFY, channel::CONTROL] {
+        assert!(channel::flows(channel::HTTP_PROXY));
+        for ch in [channel::SSH_AGENT, channel::NOTIFY, channel::CONTROL] {
             assert!(!channel::flows(ch), "{ch} stays legacy");
         }
     }

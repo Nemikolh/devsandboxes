@@ -12,6 +12,9 @@ pub mod bridge;
 // Shared with the helper; the parser is helper-only (the host only writes).
 #[allow(dead_code)]
 pub mod bootfile;
+// Shared with the helper; the parser is helper-only (the host only writes).
+#[allow(dead_code)]
+pub mod brokerfile;
 // Shared with the helper, which sends requests; the host decodes them and
 // answers (`commands::dispatch`). Partly helper-only (`encode_request`,
 // `decode_response`, exit codes).
@@ -191,6 +194,14 @@ const BOOT_WRITE_SCRIPT: &str = "mkdir -p /run/devsandbox \
     && cat > /run/devsandbox/boot.tmp \
     && mv /run/devsandbox/boot.tmp /run/devsandbox/boot";
 
+/// Broker file write: atomic like [`BOOT_WRITE_SCRIPT`] (a daemon starting
+/// mid-write reads the old file or the new one). World-readable: `devsbd
+/// boot` may start the daemon as the container command's user, and the
+/// file holds nothing secret (phantoms are on the container env anyway).
+const BROKER_WRITE_SCRIPT: &str = "umask 022 && mkdir -p /run/devsandbox \
+    && cat > /run/devsandbox/broker.tmp.$ \
+    && mv /run/devsandbox/broker.tmp.$ /run/devsandbox/broker";
+
 /// `exec [-i] -u root <container> /bin/sh -c <script>` with `PATH` pinned
 /// (`runtime::fixed_path`): these run as root, so neither the shell nor the
 /// tools the script names may resolve through the container's `PATH`.
@@ -254,6 +265,25 @@ pub fn sync_boot(container: &str, spec: Option<&bootfile::BootSpec>, quiet: bool
             let _ = backend().output_quiet(&as_strs(&args));
         }
     }
+}
+
+/// Write `spec` as `container`'s broker file, or remove the file when
+/// `None`. A daemon reads it when it starts, so call this before
+/// [`start_daemon`] (a daemon already running keeps what it read). `Err` is
+/// the runtime's failure, for the caller's note.
+#[allow(dead_code)] // `run`'s credential wiring (credential-broker rollout 1)
+pub fn sync_broker(container: &str, spec: Option<&brokerfile::BrokerSpec>) -> Result<(), String> {
+    let result = match spec {
+        Some(spec) => {
+            let args = root_script_argv(true, container, BROKER_WRITE_SCRIPT);
+            backend().run_with_stdin(&as_strs(&args), brokerfile::serialize(spec).as_bytes())
+        }
+        None => {
+            let args = root_script_argv(false, container, &format!("rm -f {}", brokerfile::PATH));
+            backend().output_quiet(&as_strs(&args)).map(drop)
+        }
+    };
+    result.map_err(|e| format!("{e:#}"))
 }
 
 /// Build hash from `devsbd version` output (`devsbd <protocol> <hash>`). The

@@ -45,7 +45,10 @@ pub const MAX_PAYLOAD: u32 = 1 << 20;
 /// channel, not a protocol change.
 pub mod channel {
     pub const SSH_AGENT: u8 = 1;
-    #[allow(dead_code)] // reserved for API proxying (docs/architecture/helper/protocol.md)
+    /// One connection to a credential-broker listener in the container
+    /// (`devsbd/src/broker.rs`), its [`ProxyHeader`](super::ProxyHeader) in
+    /// the stream's first bytes, then the client's bytes both ways. Only
+    /// opened toward a host that advertised `caps::HTTP_PROXY`.
     pub const HTTP_PROXY: u8 = 2;
     /// A notification record from the outbox (`notify.rs`): the daemon sends
     /// the record then `Eof`; the host replies `notify::REPLY_OK`. Only opened
@@ -96,7 +99,7 @@ pub mod channel {
     /// than a legacy one. A property of the channel, so both ends agree
     /// without a flag on the wire.
     pub const fn flows(channel: u8) -> bool {
-        matches!(channel, RPC | API | TRANSFER | PTY | TUNNEL | AGENT | ROUTE)
+        matches!(channel, HTTP_PROXY | RPC | API | TRANSFER | PTY | TUNNEL | AGENT | ROUTE)
     }
 }
 
@@ -152,6 +155,81 @@ pub mod caps {
     /// end).
     #[allow(dead_code)] // host-only: devsbd never sends it
     pub const ROUTE: u32 = 1 << 11;
+    /// Host serves `channel::HTTP_PROXY` streams for this bridge (a daemon
+    /// bridge with a broker).
+    pub const HTTP_PROXY: u32 = 1 << 12;
+}
+
+/// Upper bound on an encoded [`ProxyHeader`], newline included.
+pub const MAX_PROXY_HEADER: usize = 300;
+
+/// What an `HTTP_PROXY` stream's first line says it carries: a hint the
+/// broker checks against the instance's bound claims, never trusted alone.
+/// Wire: `base-url <upstream> <listener port>\n` or `intercept <host>
+/// <port>\n`, single spaces, ports decimal without leading zeros.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyHeader {
+    /// Plain HTTP to a base-URL listener: the upstream it stands for, and
+    /// its port, the authority a request's `Host` must name.
+    BaseUrl { upstream: String, listener: u16 },
+    /// A `CONNECT` target on a proxy port (intercept mode).
+    Intercept { host: String, port: u16 },
+}
+
+impl ProxyHeader {
+    pub fn encode(&self) -> Vec<u8> {
+        let (mode, host, port) = match self {
+            ProxyHeader::BaseUrl { upstream, listener } => ("base-url", upstream, listener),
+            ProxyHeader::Intercept { host, port } => ("intercept", host, port),
+        };
+        format!("{mode} {host} {port}\n").into_bytes()
+    }
+
+    /// One line, its `\n` included.
+    pub fn parse(line: &[u8]) -> Result<ProxyHeader, String> {
+        if line.len() > MAX_PROXY_HEADER {
+            return Err(format!("proxy header longer than {MAX_PROXY_HEADER} bytes"));
+        }
+        let text = std::str::from_utf8(line).map_err(|_| "proxy header is not utf-8".to_string())?;
+        let text = text.strip_suffix('\n').ok_or("proxy header without its newline")?;
+        let fields: Vec<&str> = text.split(' ').collect();
+        let [mode, host, port] = fields[..] else {
+            return Err(format!("proxy header `{text}`: want `<mode> <host> <port>`"));
+        };
+        let host_ok = !host.is_empty() && host.len() <= 255 && host.bytes().all(|b| b.is_ascii_graphic());
+        if !host_ok {
+            return Err(format!("proxy header host `{host}`"));
+        }
+        let port = match port.parse::<u16>() {
+            Ok(p) if p != 0 && port.bytes().all(|b| b.is_ascii_digit()) && !port.starts_with('0') => p,
+            _ => return Err(format!("proxy header port `{port}`")),
+        };
+        let host = host.to_string();
+        match mode {
+            "base-url" => Ok(ProxyHeader::BaseUrl { upstream: host, listener: port }),
+            "intercept" => Ok(ProxyHeader::Intercept { host, port }),
+            _ => Err(format!("proxy header mode `{mode}`")),
+        }
+    }
+
+    /// Read the header off `r` one byte at a time, so nothing past its
+    /// newline is taken (the client's bytes follow), and parse it.
+    pub fn read(r: &mut impl Read) -> io::Result<ProxyHeader> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while line.last() != Some(&b'\n') {
+            if line.len() == MAX_PROXY_HEADER {
+                return Err(invalid(&format!("no proxy header in the first {MAX_PROXY_HEADER} bytes")));
+            }
+            match r.read(&mut byte) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream ended inside its proxy header")),
+                Ok(_) => line.push(byte[0]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        ProxyHeader::parse(&line).map_err(|e| invalid(&e))
+    }
 }
 
 /// Upper bound on the processes one `PortInfo` lists; the helper stops
@@ -846,5 +924,46 @@ mod tests {
         assert_eq!(read_frame(&mut a_r).unwrap(), Some(Frame::Close { stream: 1, reason: String::new() }));
         helper.join().unwrap();
         assert_eq!(read_frame(&mut a_r).unwrap(), None);
+    }
+
+    #[test]
+    fn proxy_header_round_trips() {
+        let base = ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: 41001 };
+        assert_eq!(base.encode(), b"base-url sentry.io 41001\n");
+        let intercept = ProxyHeader::Intercept { host: "[::1]".into(), port: 443 };
+        assert_eq!(intercept.encode(), b"intercept [::1] 443\n");
+        for h in [base, intercept] {
+            assert_eq!(ProxyHeader::parse(&h.encode()), Ok(h.clone()));
+            // `read` stops at the newline: the client's bytes stay unread.
+            let mut wire = Cursor::new([h.encode(), b"GET / HTTP/1.1\r\n".to_vec()].concat());
+            assert_eq!(ProxyHeader::read(&mut wire).unwrap(), h);
+            assert_eq!(&wire.get_ref()[wire.position() as usize..], b"GET / HTTP/1.1\r\n");
+        }
+    }
+
+    #[test]
+    fn proxy_header_parse_is_strict() {
+        for bad in [
+            &b"base-url sentry.io 41001"[..],
+            b"base-url sentry.io 41001\r\n",
+            b"base-url  sentry.io 41001\n",
+            b"base-url sentry.io\n",
+            b"base-url sentry.io 41001 x\n",
+            b"socks sentry.io 41001\n",
+            b"base-url sentry.io 0\n",
+            b"base-url sentry.io 041001\n",
+            b"base-url sentry.io +4100\n",
+            b"base-url sentry.io 70000\n",
+            b"base-url sentr\x01y.io 1\n",
+            b"base-url \xff 1\n",
+            b"base-url sentry.io 1\nextra",
+        ] {
+            assert!(ProxyHeader::parse(bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
+        }
+        let long = format!("base-url {} 1\n", "a".repeat(MAX_PROXY_HEADER));
+        assert!(ProxyHeader::parse(long.as_bytes()).is_err());
+        assert!(ProxyHeader::read(&mut Cursor::new(long.into_bytes())).unwrap_err().to_string().contains("first"));
+        let cut = ProxyHeader::read(&mut Cursor::new(b"base-url sentry.io".to_vec())).unwrap_err();
+        assert_eq!(cut.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

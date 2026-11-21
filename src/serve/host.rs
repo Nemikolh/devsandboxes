@@ -277,7 +277,8 @@ fn poll(
     observers: &Observers,
     board: BridgeBoard,
 ) {
-    let worker = Bridges::spawn_worker(Some(sink), board.clone());
+    // No broker yet: its policy plugs in here (credential-broker rollout 1).
+    let worker = Bridges::spawn_worker(Some(sink), None, board.clone());
     let rt = crate::runtime::backend();
     // Declared after `worker`, so it drops (child killed, thread joined)
     // first. Started once a runtime is installed.

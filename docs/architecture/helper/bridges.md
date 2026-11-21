@@ -299,6 +299,22 @@ Bounds: at most 8 notify/control handler threads per bridge (`MAX_HANDLERS`).
 In-flight control requests (waits and followers included) count as daemon
 holders (`control_in_flight`), so the daemon doesn't idle out under them.
 
+### Broker connections (`HTTP_PROXY`)
+
+A bridge whose `Services` carry a broker (`bridge::Broker`, handed to
+`Bridges::spawn_worker`; `serve::host` passes none yet) advertises
+`caps::HTTP_PROXY` (`own_caps`) and takes the helper's
+[broker listener](in-container.md#broker-listeners) streams; without one
+it advertises nothing and refuses them, so the helper answers its clients
+`503` itself. `handle_proxy` reads the stream's `ProxyHeader` (10 s), then
+calls `Broker::serve` with the `Caller` (this bridge's instance key and
+`instance_id`: the bridge is the identity, nothing the container sends
+changes it), the header, and the stream for as long as the connection
+lasts. A bad header closes the stream before the broker sees it. At most
+48 broker handler threads per bridge, apart from `MAX_HANDLERS`
+(`MAX_BROKER_HANDLERS`, under `mux::MAX_STREAMS` so agent streams keep
+room).
+
 ## Host → container requests
 
 The serve daemon calls into a container's `devsbd daemon` over the same

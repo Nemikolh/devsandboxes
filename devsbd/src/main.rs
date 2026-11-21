@@ -3,6 +3,7 @@
 
 mod boot;
 mod bridge;
+mod broker;
 mod browser;
 mod cgroup;
 mod ctl;
@@ -25,6 +26,9 @@ mod vscode;
 #[path = "../../src/devsbd/bootfile.rs"]
 #[allow(dead_code)] // host-only serializer
 mod bootfile;
+#[path = "../../src/devsbd/brokerfile.rs"]
+#[allow(dead_code)] // host-only serializer
+mod brokerfile;
 #[path = "../../src/devsbd/control.rs"]
 #[allow(dead_code)] // host-only decoder (`decode_request`)
 mod control;
@@ -82,6 +86,8 @@ fn main() {
         Some("daemon") => exit_on_err(daemon::run(&build_hash())),
         Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         Some("boot") => exit_on_err(boot::run()),
+        // Internal: the daemon's phantom-file writer, run as the file's owner.
+        Some(broker::WRITE_VERB) => std::process::exit(broker::write_main(&args.collect::<Vec<_>>())),
         Some("notify") => exit_on_err(outbox::run(&args.collect::<Vec<_>>())),
         Some("open") => std::process::exit(open::run("devsbd open", std::env::args_os().skip(2).collect())),
         // `put`/`send`/`withdraw`/`rm` queue in the outbox (no host needed);

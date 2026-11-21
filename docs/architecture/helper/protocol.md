@@ -65,9 +65,15 @@ must match.
 
 ### Channels (`Open`)
 
-`SSH_AGENT` = 1, `HTTP_PROXY` = 2 (reserved, unused), `NOTIFY` = 3,
-`CONTROL` = 4: opened by the daemon. The daemon opens `NOTIFY`/`CONTROL` only
-toward a host that advertised the matching cap. `RPC` = 5: opened by the
+`SSH_AGENT` = 1, `HTTP_PROXY` = 2, `NOTIFY` = 3,
+`CONTROL` = 4: opened by the daemon. The daemon opens `HTTP_PROXY`/`NOTIFY`/`CONTROL` only
+toward a host that advertised the matching cap. An `HTTP_PROXY` stream is
+one connection to a broker listener ([in-container](in-container.md#broker-listeners)):
+its first bytes are a `proto::ProxyHeader` line, `base-url <upstream>
+<listener port>` or `intercept <host> <port>` (single spaces, decimal
+ports, `\n`-terminated, at most `MAX_PROXY_HEADER` bytes; anything else
+ends the stream), sent with the `Open` by `Mux::attach_with_header` and
+charged to the window; the client's bytes follow. `RPC` = 5: opened by the
 host, only toward a daemon advertising `caps::RPC`. `API` = 6: never on a
 container's link; between two hosts' `serve::fleet::link` ends
 ([fleet](../daemon/fleet.md)), opened by the end with the socket toward a
@@ -93,8 +99,8 @@ table of channels it serves (`serve::fleet::link::Serves`).
 
 Whether a channel's streams are legacy or flow-controlled (see
 [Mux](#mux)) is a property of the channel, `proto::channel::flows`, so both
-ends agree without a flag on the wire: `RPC`, `API`, `TRANSFER`, `PTY`,
-`TUNNEL`, `AGENT` and `ROUTE` flow, the rest are legacy.
+ends agree without a flag on the wire: `HTTP_PROXY`, `RPC`, `API`,
+`TRANSFER`, `PTY`, `TUNNEL`, `AGENT` and `ROUTE` flow, the rest are legacy.
 
 ### Caps
 
@@ -105,11 +111,13 @@ Bitset, unknown bits ignored: `TCP_FORWARD` (daemon serves `Connect`),
 those channels), `API` (a fleet link's answerer serves `channel::API`;
 host-to-host only), `TRANSFER` (the peer receives `channel::TRANSFER`;
 both ends of a fleet link, host-to-host only), `PTY`, `TUNNEL`, `AGENT`,
-`ROUTE` (bits 8–11: the peer serves that channel; host-to-host only). A link end
+`ROUTE` (bits 8–11: the peer serves that channel; host-to-host only),
+`HTTP_PROXY` (bit 12: host serves `channel::HTTP_PROXY`). A link end
 advertises the caps of the channels it serves
 (`serve::fleet::link::cap_of`). The host sends
 `Caps` after the handshake (`SSH_AGENT` only when it has a live agent;
-`NOTIFY | CONTROL` only on the serve daemon's bridges). Until a bridge's
+`NOTIFY | CONTROL` only on the serve daemon's bridges, `HTTP_PROXY` only on
+those with a broker). Until a bridge's
 `Caps` arrives the daemon treats it as capable of nothing, except a bridge
 whose own `Hello` caps were 0 (a pre-`Caps` host), treated as `SSH_AGENT`
 only (`known_host_caps`).

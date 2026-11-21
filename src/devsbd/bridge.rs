@@ -300,8 +300,28 @@ pub type ControlHandler = Arc<dyn Fn(&str, &Request) -> Response + Send + Sync>;
 /// module doc). Blocking; called on the stream's handler thread.
 pub type FollowHandler = Arc<dyn Fn(&str, &Request, &mut dyn Write) + Send + Sync>;
 
+/// The instance an `HTTP_PROXY` stream came from: the one whose bridge
+/// carried it, whatever the container says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// Its state key.
+    pub instance: String,
+    pub instance_id: String,
+}
+
+/// Serves the credential-broker connections a daemon bridge carries
+/// (docs/plans/active/credential-broker.md, *Shape*).
+pub trait Broker: Send + Sync {
+    /// One connection, on its own handler thread, for as long as it lasts:
+    /// `header` is the helper's hint (already read off `stream`), `stream`
+    /// the client's bytes from there on, both ways; shutting its write side
+    /// down is the client's EOF.
+    fn serve(&self, caller: &Caller, header: proto::ProxyHeader, stream: UnixStream);
+}
+
 /// What a long-lived (daemon) bridge serves beyond the agent: notify into its
-/// sink, control through its handler, both tagged with the instance it serves.
+/// sink, control through its handler, broker connections to its broker, all
+/// tagged with the instance it serves.
 #[derive(Clone)]
 struct Services {
     instance: String,
@@ -312,12 +332,25 @@ struct Services {
     follow: FollowHandler,
     // Live notify/control handler threads of this bridge (see `HandlerSlot`).
     handlers: Arc<AtomicUsize>,
+    /// `None`: `HTTP_PROXY` is neither advertised nor served.
+    broker: Option<Arc<dyn Broker>>,
+    // Live broker handler threads of this bridge, up to `MAX_BROKER_HANDLERS`.
+    brokered: Arc<AtomicUsize>,
 }
 
 impl Services {
     fn new(instance: String, instance_id: String, sink: Sink, control: ControlHandler) -> Services {
         let follow: FollowHandler = Arc::new(dispatch_follow);
-        Services { instance, instance_id, sink, control, follow, handlers: Arc::default() }
+        Services {
+            instance,
+            instance_id,
+            sink,
+            control,
+            follow,
+            handlers: Arc::default(),
+            broker: None,
+            brokered: Arc::default(),
+        }
     }
 }
 
@@ -326,15 +359,21 @@ impl Services {
 /// our handler keeps going, so `mux::MAX_STREAMS` alone doesn't bound these.
 const MAX_HANDLERS: usize = 8;
 
-/// One of a bridge's [`MAX_HANDLERS`] slots, held by a handler thread for its
-/// whole life and released on drop.
+/// Broker handler threads one bridge may run at once, apart from
+/// [`MAX_HANDLERS`]: broker connections last (keep-alive, a model's SSE) and
+/// must not starve notify and control. Under `mux::MAX_STREAMS`, the cap on
+/// every stream the container opens, so agent streams keep room too.
+const MAX_BROKER_HANDLERS: usize = 48;
+
+/// One of a bridge's handler slots, held by a handler thread for its whole
+/// life and released on drop.
 struct HandlerSlot(Arc<AtomicUsize>);
 
 impl HandlerSlot {
-    /// A slot on `count`, or `None` when all are taken.
-    fn acquire(count: &Arc<AtomicUsize>) -> Option<HandlerSlot> {
+    /// One of `max` slots on `count`, or `None` when all are taken.
+    fn acquire(count: &Arc<AtomicUsize>, max: usize) -> Option<HandlerSlot> {
         count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_HANDLERS).then_some(n + 1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
             .ok()
             .map(|_| HandlerSlot(Arc::clone(count)))
     }
@@ -352,11 +391,14 @@ impl Drop for HandlerSlot {
 /// never take notify streams, which would drop the records with them, nor
 /// control requests, which must outlive a one-shot command. Every such bridge
 /// advertises `CONTROL`, dispatcher or not: `dispatch::handle` re-checks the
-/// config on each request and answers `Denied` for the rest.
-fn own_caps(has_agent: bool, has_sink: bool) -> u32 {
+/// config on each request and answers `Denied` for the rest. `HTTP_PROXY`
+/// only with a broker too, so the helper answers its clients `503` itself
+/// rather than routing them to a bridge that refuses the stream.
+fn own_caps(has_agent: bool, has_sink: bool, has_broker: bool) -> u32 {
     let agent = if has_agent { caps::SSH_AGENT } else { 0 };
     let sink = if has_sink { caps::NOTIFY | caps::CONTROL } else { 0 };
-    agent | sink
+    let broker = if has_sink && has_broker { caps::HTTP_PROXY } else { 0 };
+    agent | sink | broker
 }
 
 /// A control stream whose request doesn't end (no `Eof`) within this is
@@ -448,21 +490,25 @@ const NOTIFY_REPLY_BAD: &[u8] = b"bad record";
 /// The local end for an `Open` on `channel`, or `None` to refuse it: agent
 /// streams connect to the host agent (when this bridge has a provider), notify
 /// and control streams go to a handler thread (when it has `services` and a
-/// free [`HandlerSlot`]). Must return at once: it runs on the mux's `serve`
-/// thread.
+/// free [`HandlerSlot`]), broker streams likewise when its services have a
+/// broker, on a slot of their own. Must return at once: it runs on the mux's
+/// `serve` thread.
 fn open_stream(
     channel: u8,
     agent: Option<&impl Fn() -> Option<PathBuf>>,
     services: Option<&Services>,
 ) -> Option<Conn> {
-    let handler: fn(UnixStream, &Services) = match channel {
+    let (handler, slots, max): (fn(UnixStream, &Services), _, _) = match channel {
         proto::channel::SSH_AGENT => return UnixStream::connect(agent?()?).ok().map(Into::into),
-        proto::channel::NOTIFY => handle_notify,
-        proto::channel::CONTROL => handle_control,
+        proto::channel::NOTIFY => (handle_notify, &services?.handlers, MAX_HANDLERS),
+        proto::channel::CONTROL => (handle_control, &services?.handlers, MAX_HANDLERS),
+        proto::channel::HTTP_PROXY if services?.broker.is_some() => {
+            (handle_proxy, &services?.brokered, MAX_BROKER_HANDLERS)
+        }
         _ => return None,
     };
+    let slot = HandlerSlot::acquire(slots, max)?;
     let to = services?.clone();
-    let slot = HandlerSlot::acquire(&to.handlers)?;
     let (ours, theirs) = UnixStream::pair().ok()?;
     std::thread::spawn(move || {
         let _slot = slot;
@@ -499,6 +545,21 @@ fn handle_control(mut conn: UnixStream, to: &Services) {
     let _ = conn.write_all(control::encode_response(&resp).as_bytes());
 }
 
+/// A broker stream's header must arrive within this; the helper sends it
+/// with the `Open`.
+const PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One broker stream: read its header, then hand the stream to the broker
+/// for as long as the connection lasts. A missing or bad header closes it.
+fn handle_proxy(conn: UnixStream, to: &Services) {
+    let Some(broker) = &to.broker else { return };
+    let _ = conn.set_read_timeout(Some(PROXY_HEADER_TIMEOUT));
+    let Ok(header) = proto::ProxyHeader::read(&mut &conn) else { return };
+    let _ = conn.set_read_timeout(None);
+    let caller = Caller { instance: to.instance.clone(), instance_id: to.instance_id.clone() };
+    broker.serve(&caller, header, conn);
+}
+
 /// One notify stream: read the record to EOF (the daemon's `Eof` half-closes
 /// our side), decode, hand it to the sink, and only then reply `ok`. Applying
 /// before acking is what makes delivery durable: a host that dies between the
@@ -529,23 +590,21 @@ fn handle_notify(mut conn: UnixStream, to: &Services) {
 }
 
 /// A `Bridges` bridge for instance `key`: the host agent only when
-/// `with_agent`, notify + control only when `sink` is set. `observe` gets its
-/// handshake outcome and its end (see [`BridgeBoard`]).
+/// `with_agent`, notify + control only when `sink` is set, broker streams
+/// when `broker` is too. `observe` gets its handshake outcome and its end
+/// (see [`BridgeBoard`]).
 fn spawn_managed(
     key: &str,
     info: &Instance,
     with_agent: bool,
     sink: Option<&Sink>,
+    broker: Option<&Arc<dyn Broker>>,
     observe: Observer,
 ) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
-    let notify = sink.map(|s| {
-        Services::new(
-            key.to_string(),
-            info.instance_id.clone(),
-            Arc::clone(s),
-            Arc::new(dispatch_control),
-        )
+    let notify = sink.map(|s| Services {
+        broker: broker.cloned(),
+        ..Services::new(key.to_string(), info.instance_id.clone(), Arc::clone(s), Arc::new(dispatch_control))
     });
     if with_agent {
         spawn_observed(&info.container, hash, Some(host_agent), notify, Some(observe))
@@ -788,12 +847,14 @@ fn attach_with(
             let mux = Mux::new(stdin);
             // Tell the daemon our caps right after the handshake, on stream 0:
             // `SSH_AGENT` only when this bridge has an agent provider and it
-            // yields a socket now; `NOTIFY`/`CONTROL` only with a sink (`own_caps`). An
+            // yields a socket now; `NOTIFY`/`CONTROL` only with a sink, `HTTP_PROXY`
+            // only with a broker too (`own_caps`). An
             // agent-less bridge (a `devsandbox port` forward) advertises no
             // `SSH_AGENT`, so the daemon won't route agent clients to it. Best
             // effort — a send failure just means the connection died.
             let has_agent = agent.as_ref().and_then(|a| a()).is_some();
-            let _ = mux.send(&proto::Frame::Caps(own_caps(has_agent, notify.is_some())));
+            let has_broker = notify.as_ref().is_some_and(|s| s.broker.is_some());
+            let _ = mux.send(&proto::Frame::Caps(own_caps(has_agent, notify.is_some(), has_broker)));
             // Publish the mux + daemon caps *before* reporting the handshake
             // result, so a caller that sees `outcome() == Ok` can rely on
             // `peer_caps()` / `connect()` being ready (no publish race).
@@ -1147,6 +1208,8 @@ pub struct Bridges {
     live: HashMap<String, (Bridge, Instant, bool)>,
     // Set → bridges advertise `NOTIFY` and are kept even without a host agent.
     sink: Option<Sink>,
+    // Set (with `sink`) → bridges advertise and serve `HTTP_PROXY`.
+    broker: Option<Arc<dyn Broker>>,
     // Every live bridge's status, for `bridges.ensure` waits.
     board: BridgeBoard,
     // The daemon's `serve.log`; `None` (tests, no sink) logs nothing.
@@ -1260,7 +1323,7 @@ impl Bridges {
                     _ => info,
                 };
                 let observe = self.observe(&info.container);
-                match spawn_managed(key, info, with_agent, self.sink.as_ref(), observe) {
+                match spawn_managed(key, info, with_agent, self.sink.as_ref(), self.broker.as_ref(), observe) {
                     Some(b) => {
                         self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
                     }
@@ -1316,14 +1379,16 @@ impl Bridges {
     /// finally its status line ("<instance>: <msg>") goes to the sink's
     /// [`OnShown`], if any. A put that changed nothing produces neither, so a
     /// dispatcher re-asserting its threads is invisible.
+    /// `broker` set (with `sink`) → those bridges serve `HTTP_PROXY` streams
+    /// to it, tagged with their instance ([`Broker`]).
     /// `board` gets every bridge's status and, after each reconcile, the
     /// newest ticket it covered (the `urgent` pairs' second half).
-    pub fn spawn_worker(sink: Option<SinkHooks>, board: BridgeBoard) -> BridgeWorker {
+    pub fn spawn_worker(sink: Option<SinkHooks>, broker: Option<Arc<dyn Broker>>, board: BridgeBoard) -> BridgeWorker {
         let log = sink.as_ref().map(|hooks| hooks.log);
         let sink = sink.map(|hooks| self::sink(apply_message, hooks));
         let (tx, rx) = mpsc::channel::<(Vec<String>, Vec<(String, u64)>)>();
         let handle = std::thread::spawn(move || {
-            let mut bridges = Bridges { sink, board, log, ..Bridges::default() };
+            let mut bridges = Bridges { sink, broker, board, log, ..Bridges::default() };
             // Block for the next list, then coalesce: drain everything already
             // queued and reconcile only against the newest list (with every
             // urgent container queued meanwhile), so a burst of snapshots
@@ -1803,14 +1868,101 @@ mod tests {
     #[test]
     fn caps_advertise_notify_and_control_only_with_a_sink() {
         const SERVED: u32 = caps::NOTIFY | caps::CONTROL;
-        assert_eq!(own_caps(false, false), 0);
-        assert_eq!(own_caps(true, false), caps::SSH_AGENT);
-        assert_eq!(own_caps(false, true), SERVED);
-        assert_eq!(own_caps(true, true), caps::SSH_AGENT | SERVED);
+        assert_eq!(own_caps(false, false, false), 0);
+        assert_eq!(own_caps(true, false, false), caps::SSH_AGENT);
+        assert_eq!(own_caps(false, true, false), SERVED);
+        assert_eq!(own_caps(true, true, false), caps::SSH_AGENT | SERVED);
+        assert_eq!(own_caps(false, true, true), SERVED | caps::HTTP_PROXY);
+        assert_eq!(own_caps(true, false, true), caps::SSH_AGENT, "a broker serves only daemon bridges");
         // `RPC` is a daemon cap: the host opens those streams, never serves them.
         for (agent, sink) in [(false, false), (true, false), (false, true), (true, true)] {
-            assert_eq!(own_caps(agent, sink) & caps::RPC, 0);
+            assert_eq!(own_caps(agent, sink, true) & caps::RPC, 0);
         }
+    }
+
+    /// A [`Broker`] that reports each connection's caller and header, then
+    /// echoes the client's bytes upper-cased until it half-closes.
+    struct EchoBroker(Mutex<mpsc::Sender<(Caller, proto::ProxyHeader)>>);
+
+    impl Broker for EchoBroker {
+        fn serve(&self, caller: &Caller, header: proto::ProxyHeader, mut stream: UnixStream) {
+            let _ = self.0.lock().unwrap().send((caller.clone(), header));
+            let mut body = Vec::new();
+            if stream.read_to_end(&mut body).is_ok() {
+                let _ = stream.write_all(&body.to_ascii_uppercase());
+            }
+        }
+    }
+
+    fn echo_broker() -> (Arc<dyn Broker>, mpsc::Receiver<(Caller, proto::ProxyHeader)>) {
+        let (tx, rx) = mpsc::channel();
+        (Arc::new(EchoBroker(Mutex::new(tx))), rx)
+    }
+
+    /// What the helper's broker listener does with a client: `Open(HTTP_PROXY)`
+    /// with `header` first, then `bytes` and its half-close; returns everything
+    /// the host wrote back before closing.
+    fn send_proxied(daemon: &Arc<Mux>, stream: u32, header: &proto::ProxyHeader, bytes: &[u8]) -> Vec<u8> {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        daemon.attach_with_header(stream, theirs, proto::channel::HTTP_PROXY, &header.encode()).unwrap();
+        ours.write_all(bytes).unwrap();
+        ours.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        ours.read_to_end(&mut reply).unwrap();
+        reply
+    }
+
+    #[test]
+    fn proxy_stream_reaches_the_broker_as_its_bridges_instance() {
+        let (broker, calls) = echo_broker();
+        let (to, _rx) = services("web-1", no_control());
+        let daemon = pair_with(Services { broker: Some(broker), ..to });
+        let header = proto::ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: 41001 };
+        // Past one window, so the header's credit and the flow both count.
+        let body: Vec<u8> = (0..proto::INITIAL_WINDOW as usize * 2).map(|i| b'a' + (i % 26) as u8).collect();
+        let reply = send_proxied(&daemon, 1, &header, &body);
+        assert_eq!(reply, body.to_ascii_uppercase());
+        let (caller, got) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(caller, Caller { instance: "web-1".into(), instance_id: "web-1-id".into() });
+        assert_eq!(got, header);
+    }
+
+    #[test]
+    fn proxy_stream_is_refused_without_a_broker_or_with_a_bad_header() {
+        let (to, _rx) = services("web-1", no_control());
+        let daemon = pair_with(to);
+        let header = proto::ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: 41001 };
+        assert!(send_proxied(&daemon, 1, &header, b"GET / HTTP/1.1\r\n\r\n").is_empty());
+
+        let (broker, calls) = echo_broker();
+        let (to, _rx) = services("web-1", no_control());
+        let daemon = pair_with(Services { broker: Some(broker), ..to });
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        daemon.attach_with_header(1, theirs, proto::channel::HTTP_PROXY, b"socks5 sentry.io 1\n").unwrap();
+        ours.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        ours.read_to_end(&mut reply).unwrap();
+        assert!(reply.is_empty());
+        assert!(calls.try_recv().is_err(), "the broker never sees a bad header");
+    }
+
+    /// Past `MAX_BROKER_HANDLERS` live broker handlers an `HTTP_PROXY` `Open`
+    /// is refused; notify and control keep their own slots.
+    #[test]
+    fn broker_slots_bound_proxy_opens_apart_from_notify() {
+        let (broker, _calls) = echo_broker();
+        let (to, _rx) = services("web-1", no_control());
+        let to = Services { broker: Some(broker), ..to };
+        let none: Option<fn() -> Option<PathBuf>> = None;
+        let held: Vec<_> = (0..MAX_BROKER_HANDLERS)
+            .map(|_| HandlerSlot::acquire(&to.brokered, MAX_BROKER_HANDLERS).unwrap())
+            .collect();
+        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), Some(&to)).is_none());
+        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), Some(&to)).is_some());
+        drop(held);
+        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), Some(&to)).is_some());
     }
 
     /// `Services` for instance `instance` (owner id `<instance>-id`) whose
@@ -2140,6 +2292,7 @@ mod tests {
         assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None).is_none());
         assert!(open_stream(proto::channel::CONTROL, none.as_ref(), None).is_none());
         assert!(open_stream(proto::channel::SSH_AGENT, none.as_ref(), None).is_none());
+        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), None).is_none());
     }
 
     /// Past `MAX_HANDLERS` live handler threads a notify/control `Open` is
@@ -2148,7 +2301,7 @@ mod tests {
     #[test]
     fn handler_slots_bound_notify_and_control_opens() {
         let (to, _rx) = services("web-1", no_control());
-        let held: Vec<_> = (0..MAX_HANDLERS).map(|_| HandlerSlot::acquire(&to.handlers).unwrap()).collect();
+        let held: Vec<_> = (0..MAX_HANDLERS).map(|_| HandlerSlot::acquire(&to.handlers, MAX_HANDLERS).unwrap()).collect();
         let none: Option<fn() -> Option<PathBuf>> = None;
         assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), Some(&to)).is_none());
         assert!(open_stream(proto::channel::CONTROL, none.as_ref(), Some(&to)).is_none());
@@ -2206,7 +2359,7 @@ mod tests {
     /// send/coalesce/join path without docker.
     #[test]
     fn worker_coalesces_and_joins() {
-        let worker = Bridges::spawn_worker(None, BridgeBoard::default());
+        let worker = Bridges::spawn_worker(None, None, BridgeBoard::default());
         for i in 0..100 {
             worker.send(vec![format!("devsandbox-c{i}")], vec![(format!("devsandbox-c{i}"), i)]);
         }
@@ -2929,6 +3082,83 @@ mod tests {
             let kill = "kill $(cut -d' ' -f1 /run/devsandbox/devsbd.pid)";
             assert!(ok(crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", kill])));
             assert_eq!(exit_within(&mut third, 20), Some(control::EXIT_NO_HOST), "daemon killed");
+            Ok(())
+        })
+    }
+
+    /// A [`Broker`] answering each connection's first request with a 200
+    /// naming its caller and header, then closing.
+    struct HttpBroker;
+
+    impl Broker for HttpBroker {
+        fn serve(&self, caller: &Caller, header: proto::ProxyHeader, mut stream: UnixStream) {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                head.push(byte[0]);
+            }
+            let body = format!("{} {:?}\n", caller.instance, header);
+            let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    }
+
+    /// Docker-gated end to end: a broker file written into a container with
+    /// `sync_broker`, read by a daemon started after it: its phantom file is
+    /// written as its owner, a file that isn't a phantom is left alone, and
+    /// an HTTP request to the loopback listener inside reaches the host's
+    /// broker with this bridge's instance and the listener's header.
+    #[test_utils::docker_test(helper)]
+    fn brokers_a_loopback_listener_and_writes_phantoms_with_docker() -> Result<(), &'static str> {
+        use super::super::brokerfile::{BrokerSpec, Listener, Mode, PhantomFile};
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-broker-test-{stamp}");
+        let cleanup = || {
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
+        };
+        let sh = |script: &str| {
+            let out = crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", script]).output().unwrap();
+            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            assert!(sh("adduser -D -u 1234 u && printf real > /home/u/.taken && chown u /home/u/.taken").0);
+            let arch = install(&name, None).unwrap();
+            let file = |path: &str, phantom: &str| PhantomFile {
+                owner: "u".into(),
+                path: path.into(),
+                phantom: phantom.into(),
+                content: format!("token={phantom}\n"),
+            };
+            let spec = BrokerSpec {
+                listeners: vec![Listener { port: 41001, mode: Mode::BaseUrl { upstream: "sentry.io".into() } }],
+                files: vec![file("/home/u/.config/sentry/rc", "p1"), file("/home/u/.taken", "p2")],
+                proxy_env: Vec::new(),
+            };
+            super::super::sync_broker(&name, Some(&spec)).unwrap();
+            start_daemon(&name);
+
+            let broker: Arc<dyn Broker> = Arc::new(HttpBroker);
+            let (to, _notes) = services("broker-test", no_control());
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(Services { broker: Some(broker), ..to })).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+
+            // The daemon starts detached: retry until its listener is up.
+            let mut got = (false, String::new());
+            for _ in 0..50 {
+                got = sh("wget -qO- http://127.0.0.1:41001/api/0/");
+                if got.0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(got.1, "broker-test BaseUrl { upstream: \"sentry.io\", listener: 41001 }\n");
+
+            assert_eq!(sh("stat -c '%U %a' /home/u/.config/sentry/rc && cat /home/u/.config/sentry/rc").1, "u 600\ntoken=p1\n");
+            assert_eq!(sh("stat -c '%U' /home/u/.config").1, "u\n", "parent dirs made as the owner");
+            assert_eq!(sh("cat /home/u/.taken").1, "real", "a file that isn't a phantom is left alone");
+            assert_eq!(sh("stat -c '%a' /run/devsandbox/broker").1, "644\n");
             Ok(())
         })
     }

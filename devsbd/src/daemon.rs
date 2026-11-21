@@ -15,6 +15,10 @@
 //! stream instead of one reply: bytes pass through as they arrive, for as
 //! long as the host keeps the stream open (`control_follow`).
 //!
+//! At start it sets up the broker file's phantom files and loopback
+//! listeners (`broker.rs`), whose connections are routed like agent clients
+//! to the newest bridge whose host serves `HTTP_PROXY`.
+//!
 //! One daemon per container, per build: the pidfile records the owner's build
 //! hash, and a daemon of a different build (the host rewrote the binary, e.g.
 //! `start` on a running container after a CLI upgrade) makes the running one
@@ -82,9 +86,10 @@ const FLUSH_RETRY: Duration = Duration::from_secs(30);
 /// giving up on this flush.
 const NOTIFY_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long an agent client that arrives with no bridge attached waits for
-/// one. The host starts a CLI `exec`'s bridge concurrently with the command
-/// (no handshake wait), so a command using the agent at once can beat it.
+/// How long an agent or broker client that arrives with no bridge attached
+/// waits for one. The host starts a CLI `exec`'s bridge concurrently with the
+/// command (no handshake wait), so a command using the agent at once can beat
+/// it.
 const HOLD: Duration = Duration::from_secs(1);
 
 /// How long a taking-over daemon waits for the outdated one to exit.
@@ -264,6 +269,9 @@ pub fn run(hash: &str) -> io::Result<()> {
     std::thread::spawn(move || accept_bridges(ctl, b, &hash));
     let (b, i) = (Arc::clone(&bridges), Arc::clone(&ids));
     std::thread::spawn(move || flush_loop(Path::new(notify::OUTBOX), &b, &i));
+    let b = Arc::clone(&bridges);
+    let route: crate::broker::Route = Arc::new(move || b.route(caps::HTTP_PROXY, HOLD));
+    crate::broker::start(Path::new(crate::brokerfile::PATH), route, Arc::clone(&ids));
     if let Some(api) = api {
         let (b, i) = (Arc::clone(&bridges), Arc::clone(&ids));
         std::thread::spawn(move || accept_api_clients(api, b, i));
@@ -713,7 +721,7 @@ fn send_record(mux: &Arc<Mux>, stream: u32, record: &[u8], timeout: Duration) ->
 
 /// Next daemon-allocated stream id in 1..2^31, wrapping back to 1. A CAS loop
 /// keeps two concurrent accepts from landing on the same id.
-fn next_stream_id(next: &AtomicU32) -> u32 {
+pub(crate) fn next_stream_id(next: &AtomicU32) -> u32 {
     let mut cur = next.load(Ordering::Relaxed);
     loop {
         let step = if cur >= (1 << 31) - 1 { 1 } else { cur + 1 };
@@ -947,6 +955,89 @@ mod tests {
         });
         host.send(&Frame::Caps(host_caps)).unwrap();
         rx
+    }
+
+    /// A bridge attached to `bridges` whose host sends `Caps(host_caps)` and
+    /// answers each `Open(HTTP_PROXY)` like a broker would: reads the header
+    /// line, reports it on the returned channel, then echoes the client's
+    /// bytes back upper-cased until it half-closes.
+    fn proxy_host_bridge(bridges: &Arc<Bridges>, host_caps: u32) -> std::sync::mpsc::Receiver<proto::ProxyHeader> {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        Bridges::attach(bridges, &daemon, caps::TCP_FORWARD);
+        std::thread::spawn(move || daemon.serve_with(d_r, |_, _| None, |_, _, _, _reply| {}));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = Arc::clone(&host);
+        std::thread::spawn(move || {
+            h.serve(h_r, move |_, ch| {
+                if ch != channel::HTTP_PROXY {
+                    return None;
+                }
+                let (ours, mut handler) = UnixStream::pair().unwrap();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(proto::ProxyHeader::read(&mut handler).unwrap());
+                    let mut body = Vec::new();
+                    handler.read_to_end(&mut body).unwrap();
+                    handler.write_all(&body.to_ascii_uppercase()).unwrap();
+                });
+                Some(ours.into())
+            })
+        });
+        host.send(&Frame::Caps(host_caps)).unwrap();
+        rx
+    }
+
+    /// A broker listener on an ephemeral port, routed through `bridges` as
+    /// `run` routes it.
+    fn broker_listener(bridges: &Arc<Bridges>, hold: Duration) -> u16 {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let b = Arc::clone(bridges);
+        let route: crate::broker::Route = Arc::new(move || b.route(caps::HTTP_PROXY, hold));
+        let header = proto::ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: port };
+        let ids = Arc::new(AtomicU32::new(1));
+        std::thread::spawn(move || crate::broker::serve(listener, &header, &route, &ids));
+        port
+    }
+
+    #[test]
+    fn broker_connection_reaches_the_proxy_host_with_its_header() {
+        let bridges = Arc::new(Bridges::default());
+        // An older bridge whose host has no broker, then one with: the
+        // newest capable takes the stream, past a newer incapable one.
+        let _plain = proxy_host_bridge(&bridges, caps::NOTIFY);
+        let headers = proxy_host_bridge(&bridges, caps::HTTP_PROXY);
+        let _newer_plain = proxy_host_bridge(&bridges, caps::NOTIFY);
+        wait_routable(&bridges, caps::HTTP_PROXY);
+        let port = broker_listener(&bridges, HOLD);
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        client.write_all(b"get / http/1.1\r\n\r\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).unwrap();
+        assert_eq!(answer, b"GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            headers.recv_timeout(Duration::from_secs(5)).unwrap(),
+            proto::ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: port }
+        );
+    }
+
+    #[test]
+    fn broker_connection_without_a_proxy_host_gets_a_503_after_the_hold() {
+        let bridges = Arc::new(Bridges::default());
+        let _plain = proxy_host_bridge(&bridges, caps::NOTIFY | caps::SSH_AGENT);
+        let hold = Duration::from_millis(200);
+        let port = broker_listener(&bridges, hold);
+        let t = std::time::Instant::now();
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).unwrap();
+        assert!(t.elapsed() >= hold, "held for a bridge first");
+        assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
     }
 
     fn record(at: u64, msg: &str) -> notify::Message {
