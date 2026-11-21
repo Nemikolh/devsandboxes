@@ -28,6 +28,7 @@ mod mounts;
 mod origin;
 mod profile;
 mod progress;
+pub(crate) mod remotes;
 mod ssh_agent;
 pub(crate) mod tool_env;
 mod worktree;
@@ -275,6 +276,7 @@ pub fn run(
         incarnation: None,
         intercept: None,
         claims: Vec::new(),
+        github_repos: Vec::new(),
         progress: None,
         created_unix: Instance::now(),
     };
@@ -705,6 +707,10 @@ pub(crate) fn materialize(
     )?;
     let recorded_folders = folders::merge_folder_mounts(&prior_folders, folder_mounts.clone());
     tracker.record(|i| i.folders = recorded_folders.clone())?;
+    // After initializeCommand (it may clone them), before any container.
+    let github_repos = remotes::record(
+        &std::iter::once(folder).chain(extra_folders.iter().map(|f| f.host.as_path())).collect::<Vec<_>>(),
+    )?;
     // Before the container exists, so nothing in it can prune them; a rebuild
     // of an instance from before locking gets locked here.
     if let Some(wt) = &worktree {
@@ -994,6 +1000,7 @@ pub(crate) fn materialize(
         incarnation: Some(wired.incarnation),
         claims: wired.claims,
         intercept: wired.intercept,
+        github_repos,
         done,
         // Still in flight: the lifecycle chain runs after this save.
         progress: Some(tracker.progress()),
@@ -1436,6 +1443,7 @@ mod tests {
             intercept: None,
             claims: Vec::new(),
             progress: None,
+            github_repos: Vec::new(),
             created_unix: 0,
         }
     }

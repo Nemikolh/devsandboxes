@@ -505,6 +505,14 @@ enum AccessCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Drop a repo from a folder's recorded GitHub fence (narrow only);
+    /// its instances take it at their next start or rebuild
+    Forget {
+        /// The folder (a sandbox's `folder` or `folders` entry)
+        folder: PathBuf,
+        /// `owner/repo`, or its GitHub URL
+        repo: String,
+    },
 }
 
 /// An instance `<name>`: one text for every command taking one.
@@ -1164,6 +1172,8 @@ fn main() -> Result<()> {
         Command::Access { cmd: AccessCommand::Ls { credential, json } } => {
             commands::access::ls(credential.as_deref(), json)
         }
+        #[cfg(unix)]
+        Command::Access { cmd: AccessCommand::Forget { folder, repo } } => commands::access::forget(&folder, &repo),
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Revoke { credential, version, yes } } => {
             commands::access::revoke(&credential, version.as_deref(), yes)

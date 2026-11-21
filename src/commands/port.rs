@@ -844,6 +844,7 @@ image = "node"
             intercept: None,
             claims: Vec::new(),
             progress: None,
+            github_repos: Vec::new(),
             created_unix: 0,
         }
     }

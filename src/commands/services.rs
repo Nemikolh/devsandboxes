@@ -1248,6 +1248,7 @@ ports = ["5432:5432"]
             intercept: None,
             claims: Vec::new(),
             progress: None,
+            github_repos: Vec::new(),
             created_unix: 0,
         }
     }

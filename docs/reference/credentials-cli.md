@@ -13,7 +13,8 @@ credentials they are, never on a machine (`--machine` refuses them).
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
 `obtain`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
-`pick_pending`, `list_at`, `uses`, `render`, `revoke_at`, `pick_any`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
+`pick_pending`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
+`forget_at`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/store.rs` (`Store`,
 `Record`, `OAuthToken`, `Secret`), `src/credentials/oauth/` (the OAuth
 logins: [login](../architecture/credentials/login.md)), `src/credentials/review.rs` (`View`, `diff`, `Diff`),
@@ -26,6 +27,7 @@ devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>].
 devsandbox access approve <credential> [--version <v>] [--yes]
 devsandbox access ls [<credential>] [--json]
 devsandbox access revoke <credential> [--version <v>] [--yes]
+devsandbox access forget <folder> <repo>
 ```
 
 ## Names and kinds
@@ -148,7 +150,22 @@ sentry-work: sentry, source file
   under every credential of its kind with the reason, and counts as
   pinning its version.
 
-`--json` prints the same as `{"schema", "data": [credential…]}`, each
+Without a credential named, the GitHub repo fences follow (`fences`,
+[fence](../architecture/credentials/fence.md)): each folder in
+`State::folder_remotes`, its recorded `owner/repo`s (or `none`, with why
+its remotes couldn't be read), and the instances on it, an instance whose
+snapshot (`Instance::github_repos`) still differs from the records marked
+`(until its next start)`:
+
+```
+GitHub repo fences (each folder's remotes at its first run):
+  /home/u/app  org/app, up/app
+    instances  app-1, app-2 (until its next start)
+```
+
+`--json` prints the same as `{"schema", "data": {"credentials":
+[credential…], "fences": [{"folder", "repos", "unread"?, "instances":
+[{"instance", "stale"}]}]}}`, each credential
 `{"name", "kind", "source", "token": {"type": "static" | "oauth" |
 "missing" | "unreadable", …}, "profiles", "max", "members"?,
 "approvers"?, "delegate"?, "as"?, "approved": [{"version", "latest",
@@ -172,6 +189,17 @@ terminal without `--yes`, refused):
   the instances pinning it, which get the not-approved refusal on their
   next call, and which version becomes the latest approved (or that none
   is left).
+
+## `access forget`
+
+`forget_at`: drops `<repo>` (`owner/repo` or a GitHub URL of it,
+normalized as the fence is: `fence::repo_arg`) from the GitHub fence
+recorded for `<folder>` (canonicalized; a folder since moved or deleted
+is named as recorded). Narrow only: nothing re-adds it, since the record
+is never re-read; `access.github.repos` in the config adds repos. A
+folder with no record, or a repo not in its fence (the fence is listed),
+is refused. The instances on that folder, named in the output, keep
+their snapshot until their next `start` or `rebuild`.
 
 The `access` commands work on the files directly, in-process; no API
 method reaches them.

@@ -161,6 +161,13 @@ pub struct Instance {
     /// proxy env and its CA trust (`credentials::instance::Intercept`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intercept: Option<crate::credentials::instance::Intercept>,
+    /// The GitHub repo fence's recorded part: the `owner/repo`s of
+    /// [`State::folder_remotes`] for its folder and `folders`, taken at
+    /// `run`/`rebuild` and refreshed at `start`, so `access forget` reaches
+    /// it there (docs/architecture/credentials/fence.md). The config's
+    /// `access.github.repos` isn't in it: read per call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub github_repos: Vec<String>,
     /// Unix secs since the instance was marked done (docs/architecture/automations/dispatchers.md
     /// "Done children"): the user (or its dispatcher) is finished with it,
     /// but it's kept as is until removed. Only display and dispatcher policy
@@ -432,6 +439,42 @@ pub struct State {
     /// oldest dropped ([`State::remember_image_facts`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub image_facts: BTreeMap<String, ImageFacts>,
+    /// Canonical host folder -> its remotes as its first `run` ever read
+    /// them (`commands::run::remotes`): never re-read, since the folder is
+    /// container-writable from then on, and kept past `rm`. Narrowed only
+    /// by `devsandbox access forget`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub folder_remotes: BTreeMap<String, FolderRemotes>,
+}
+
+/// One folder's [`State::folder_remotes`] record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderRemotes {
+    /// Every remote with a URL naming a network host, as `.git/config`
+    /// spelled it (`credentials::fence::parse` keeps it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<FolderRemote>,
+    /// The GitHub fence: the `owner/repo` (normalized) each `remotes` URL
+    /// names on github.com, ssh aliases resolved when recorded; sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub github: Vec<String>,
+    /// Why the remotes couldn't be read (no git repo, a refused `.git`, an
+    /// unparsable config): recorded empty all the same, never retried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<String>,
+    /// Unix seconds ([`Instance::now`]).
+    #[serde(default)]
+    pub recorded_at: u64,
+}
+
+/// A `[remote "<name>"]`'s kept `url` and `pushurl` values, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderRemote {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pushurls: Vec<String>,
 }
 
 /// How many images' facts `state.toml` keeps.
@@ -611,6 +654,7 @@ mod tests {
                     bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
                     installed: Some("ab".repeat(32)),
                 }),
+                github_repos: vec!["o/r".into()],
                 progress: None,
                 created_unix: Instance::now(),
             },
@@ -618,6 +662,17 @@ mod tests {
         state.autostart_boot.insert("abc12345".into(), "3f2c-boot".into());
         let probe = crate::runtime::identity::Probe { mode: crate::runtime::identity::Mode::RootlessPodman, selinux: true };
         state.identity_probes.insert("podman:host=unix:///run/user/1000/podman/podman.sock".into(), probe);
+        let remotes = FolderRemotes {
+            remotes: vec![FolderRemote {
+                name: "origin".into(),
+                urls: vec!["git@github.com:o/r.git".into()],
+                pushurls: vec!["https://github.com/o/r".into()],
+            }],
+            github: vec!["o/r".into()],
+            unread: None,
+            recorded_at: 7,
+        };
+        state.folder_remotes.insert("/home/u/repository-1".into(), remotes.clone());
         let text = toml::to_string_pretty(&state).unwrap();
         let back: State = toml::from_str(&text).unwrap();
         assert_eq!(back.identity_probes["podman:host=unix:///run/user/1000/podman/podman.sock"], probe);
@@ -638,6 +693,8 @@ mod tests {
         assert_eq!(back.instances["repo-abc1"].claims, state.instances["repo-abc1"].claims);
         assert_eq!(back.instances["repo-abc1"].intercept, state.instances["repo-abc1"].intercept);
         assert_eq!(back.instances["repo-abc1"].created_unix, state.instances["repo-abc1"].created_unix);
+        assert_eq!(back.instances["repo-abc1"].github_repos, ["o/r"]);
+        assert_eq!(back.folder_remotes["/home/u/repository-1"], remotes);
     }
 
     #[test]

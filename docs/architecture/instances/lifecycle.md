@@ -50,8 +50,11 @@ created, which `rm` deletes), `shell_history`, `ssh_auth_sock`, `devsbd_arch`,
 ([profiles](profiles.md#per-instance)), `forwarded_ports`, `incarnation`
 and `claims` (credential claims with their phantoms, broker listeners and
 phantom files: [images and features](images-and-features.md#credential-claims)),
-`done`, `progress`, `created_unix`. `State` also holds `autostart_boot`,
-`global_forwarded_ports` and `last_profile` per project id.
+`github_repos` (the GitHub repo fence's snapshot:
+[fence](../credentials/fence.md)), `done`, `progress`, `created_unix`.
+`State` also holds `autostart_boot`, `global_forwarded_ports` and
+`last_profile` per project id, and `folder_remotes` per folder, kept past
+`rm` ([fence](../credentials/fence.md)).
 
 ## run
 

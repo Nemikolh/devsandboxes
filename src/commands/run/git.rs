@@ -184,6 +184,82 @@ pub(crate) fn read_origin(repo: &Path) -> Result<Origin> {
     Ok(Origin { common, url })
 }
 
+/// The biggest repo config [`read_remotes`] reads.
+const MAX_CONFIG: u64 = 1 << 20;
+
+/// Every `[remote "<name>"]` in `repo`'s common dir `config`, its `url` and
+/// `pushurl` values kept where `keep` says, a remote left with none dropped.
+/// Data only, for a checkout a sandbox may have written: the git dirs
+/// resolved as [`check_repo`] resolves them, but no key refused, the file
+/// opened without following a symlink, at most [`MAX_CONFIG`] bytes, and
+/// `include.path`/`includeIf` never followed (git reads them; the record
+/// doesn't). `Ok(empty)` when there's no `config`.
+pub(crate) fn read_remotes(repo: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<crate::state::FolderRemote>> {
+    let (_, common) = git_dirs(repo)?;
+    let config = common.join("config");
+    let bytes = match read_regular(&config) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", config.display())),
+    };
+    let entries = parse_config(&String::from_utf8_lossy(&bytes))
+        .map_err(|why| anyhow::anyhow!("cannot parse {} ({why})", config.display()))?;
+    Ok(remotes_of(&entries, keep))
+}
+
+/// `path`'s bytes if it is a regular file, not a symlink (`ELOOP`), at most
+/// [`MAX_CONFIG`] bytes. Non-blocking open: a FIFO planted there is
+/// refused, not waited on.
+fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)?.is_symlink() {
+        return Err(Error::other("a symlink"));
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::other("not a regular file"));
+    }
+    if meta.len() > MAX_CONFIG {
+        return Err(Error::new(ErrorKind::InvalidData, format!("bigger than {MAX_CONFIG} bytes")));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG {
+        return Err(Error::new(ErrorKind::InvalidData, format!("bigger than {MAX_CONFIG} bytes")));
+    }
+    Ok(bytes)
+}
+
+/// [`read_remotes`] over parsed entries: remotes in first-seen order, values
+/// in file order, empty values (git's list reset) skipped.
+fn remotes_of(entries: &[Entry], keep: impl Fn(&str) -> bool) -> Vec<crate::state::FolderRemote> {
+    let mut out: Vec<crate::state::FolderRemote> = Vec::new();
+    for e in entries.iter().filter(|e| e.section == "remote") {
+        let (Some(name), Some(value)) = (&e.subsection, e.value.as_deref().filter(|v| !v.is_empty())) else {
+            continue;
+        };
+        if !matches!(e.key.as_str(), "url" | "pushurl") || !keep(value) {
+            continue;
+        }
+        let i = match out.iter().position(|r| &r.name == name) {
+            Some(i) => i,
+            None => {
+                out.push(crate::state::FolderRemote { name: name.clone(), ..Default::default() });
+                out.len() - 1
+            }
+        };
+        let list = if e.key == "url" { &mut out[i].urls } else { &mut out[i].pushurls };
+        list.push(value.to_string());
+    }
+    out
+}
+
 /// The URL `git fetch origin` would use: a remote's *first* `url` (more are
 /// push-only targets), unlike most keys, where the last wins. The legacy
 /// `[remote.Origin]` form names `origin` too: the parser lowercases it.
@@ -1077,5 +1153,76 @@ mod tests {
     #[ignore]
     fn real_repo_passes() {
         check_repo(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+    }
+
+    fn remote(name: &str, urls: &[&str], pushurls: &[&str]) -> crate::state::FolderRemote {
+        crate::state::FolderRemote {
+            name: name.into(),
+            urls: urls.iter().map(|u| u.to_string()).collect(),
+            pushurls: pushurls.iter().map(|u| u.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn reads_every_remote_url_and_pushurl() {
+        let text = "[remote \"origin\"]\n\
+            \turl = \"git@github.com:o/r.git\" ; quoted\n\
+            \tpushurl = https://github.com/o/r\n\
+            \turl = /home/u/mirror\n\
+            \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+            [include]\n\tpath = /etc/evil\n\
+            [includeIf \"gitdir:/\"]\n\tpath = x\n\
+            [branch \"main\"]\n\tremote = https://github.com/planted/x\n\
+            [remote \"Up\\\"stream\"]\n\turl =\n\turl = https://github.com/u/r\n\tpushurl = file:///x\n\
+            [remote \"local\"]\n\turl = ../other\n\
+            [remote.Legacy]\n\turl = https://gitlab.com/l/r\n\
+            [remote \"origin\"]\n\tpushurl = git@gitlab.com:o/r\n";
+        let entries = parse_config(text).unwrap();
+        let keep = |u: &str| crate::credentials::fence::parse(u).is_some();
+        assert_eq!(
+            remotes_of(&entries, keep),
+            [
+                remote("origin", &["git@github.com:o/r.git"], &["https://github.com/o/r", "git@gitlab.com:o/r"]),
+                remote("Up\"stream", &["https://github.com/u/r"], &[]),
+                remote("legacy", &["https://gitlab.com/l/r"], &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_remotes_refuses_a_symlinked_or_huge_config() {
+        let root = temp("remotes");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        git_in(&repo, &["remote", "add", "origin", "https://github.com/o/r"]);
+        let all = |_: &str| true;
+        assert_eq!(read_remotes(&repo, all).unwrap(), [remote("origin", &["https://github.com/o/r"], &[])]);
+
+        let config = repo.join(".git/config");
+        let elsewhere = root.join("elsewhere");
+        std::fs::write(&elsewhere, "[remote \"x\"]\n\turl = https://github.com/x/y\n").unwrap();
+        std::fs::remove_file(&config).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, &config).unwrap();
+            let err = read_remotes(&repo, all).unwrap_err();
+            assert!(format!("{err:#}").contains("cannot read"), "{err:#}");
+            std::fs::remove_file(&config).unwrap();
+            let ok = Command::new("mkfifo").arg(&config).status().unwrap().success();
+            assert!(ok);
+            assert!(read_remotes(&repo, all).is_err(), "a FIFO is refused, not waited on");
+            std::fs::remove_file(&config).unwrap();
+        }
+        assert!(read_remotes(&repo, all).unwrap().is_empty(), "no config: no remotes");
+        std::fs::write(&config, format!("[core]\n#{}\n", "x".repeat(MAX_CONFIG as usize))).unwrap();
+        assert!(read_remotes(&repo, all).is_err());
+
+        // A linked worktree reads the common dir's config.
+        std::fs::write(&config, "[remote \"origin\"]\n\turl = https://github.com/o/r\n").unwrap();
+        let (base, wt) = base_and_worktree(&root.join("wt"));
+        git_in(&base, &["remote", "add", "origin", "git@github.com:b/r"]);
+        assert_eq!(read_remotes(&wt, all).unwrap(), [remote("origin", &["git@github.com:b/r"], &[])]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

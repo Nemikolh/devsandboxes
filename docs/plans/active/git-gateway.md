@@ -333,9 +333,12 @@ through the gateway.
   `Instance`, as in github-and-sentry-access): every remote's name and
   `url`/`pushurl` verbatim, any host, a host path, `file://` or `ext::`
   URL dropped, for every sandbox, claimed or not; the GitHub fence is
-  its `github.com` entries. Read at the folder's first `run` ever (`git
-  config --get-regexp` in a one-off container like the bundle's, binding
-  the checkout read-only, never host git: *Who clones*), never re-read, so `rm`-ing every instance
+  its `github.com` entries. Read at the folder's first `run` ever (built:
+  the common dir's `config` read as data by devsandbox's strict parser,
+  opened without following symlinks, size-capped, includes never
+  followed, never host git; no image or one-off container needed, so it
+  works before any build and in images without git:
+  [fence](../../architecture/credentials/fence.md)), never re-read, so `rm`-ing every instance
   doesn't make the next `run` a first one; your checkout and the clones
   are writable from the container, so a `git remote add` or a rewritten
   `remote.*.url` there never changes it; widening is

@@ -75,6 +75,8 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
     run::ssh_agent_refresh(info);
     // Instances from before worktree locking get locked on their next start.
     run::lock_instance_worktrees(info);
+    // Before the container: an `access forget` since applies to it.
+    run::remotes::refresh(key);
     match resolved_sandbox(dir, info) {
         Some((config, sandbox)) => {
             run::warn_on_drift(dir, &info.container, &sandbox)?;

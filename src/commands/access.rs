@@ -2,7 +2,9 @@
 //! this home's credentials as `credentials.toml`, the store and `state.toml`
 //! hold them; approving a pending claim version after its diff against the
 //! latest approved one (github-and-sentry-access, *The claim contract*);
-//! dropping a credential or one of its versions. Local only.
+//! dropping a credential or one of its versions; the folders' GitHub repo
+//! fences, and `forget` narrowing one (docs/architecture/credentials/fence.md).
+//! Local only.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,7 +14,9 @@ use serde::Serialize;
 
 use super::login::{Stdio, Term, approve_or_refuse, data_dir};
 use super::status::Envelope;
+use super::run::remotes;
 use crate::config::{Access, Config};
+use crate::credentials::fence;
 use crate::credentials::home::{self, Broken, Entry, Home, Version};
 use crate::credentials::review;
 use crate::credentials::store::{Record, Store};
@@ -34,13 +38,119 @@ fn now() -> u64 {
 }
 
 pub fn ls(credential: Option<&str>, json: bool) -> Result<()> {
-    let list = list_at(&data_dir()?, &State::load()?, credential, &mut config_access)?;
+    let state = State::load()?;
+    let list = list_at(&data_dir()?, &state, credential, &mut config_access)?;
+    // Naming a credential asks about it alone.
+    let fences = if credential.is_none() { fences(&state) } else { Vec::new() };
     if json {
-        println!("{}", serde_json::to_string_pretty(&Envelope::new(&list)).context("serialize access ls")?);
+        let data = Listing { credentials: list, fences };
+        println!("{}", serde_json::to_string_pretty(&Envelope::new(&data)).context("serialize access ls")?);
     } else {
         print!("{}", render(&list, now()));
+        print!("{}", render_fences(&fences));
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct Listing {
+    credentials: Vec<Credential>,
+    fences: Vec<Fence>,
+}
+
+/// One folder's GitHub repo fence as recorded (`State::folder_remotes`).
+#[derive(Debug, PartialEq, Serialize)]
+struct Fence {
+    folder: String,
+    repos: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unread: Option<String>,
+    instances: Vec<FenceUse>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct FenceUse {
+    instance: String,
+    /// Its snapshot (`Instance::github_repos`) differs from its folders'
+    /// records: an `access forget` it takes at its next start or rebuild.
+    stale: bool,
+}
+
+fn fences(state: &State) -> Vec<Fence> {
+    state
+        .folder_remotes
+        .iter()
+        .map(|(folder, record)| Fence {
+            folder: folder.clone(),
+            repos: record.github.clone(),
+            unread: record.unread.clone(),
+            instances: state
+                .instances
+                .iter()
+                .filter(|(_, i)| remotes::instance_folders(i).any(|f| remotes::folder_key(f) == *folder))
+                .map(|(key, i)| FenceUse {
+                    instance: key.clone(),
+                    stale: i.github_repos != remotes::fence_of(state, remotes::instance_folders(i)),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn render_fences(fences: &[Fence]) -> String {
+    if fences.is_empty() {
+        return String::new();
+    }
+    let mut out = "\nGitHub repo fences (each folder's remotes at its first run):\n".to_string();
+    for f in fences {
+        let repos = if f.repos.is_empty() { "none".to_string() } else { f.repos.join(", ") };
+        out.push_str(&format!("  {}  {repos}", f.folder));
+        if let Some(why) = &f.unread {
+            out.push_str(&format!("  ({why})"));
+        }
+        out.push('\n');
+        if !f.instances.is_empty() {
+            let one = |u: &FenceUse| {
+                if u.stale { format!("{} (until its next start)", u.instance) } else { u.instance.clone() }
+            };
+            out.push_str(&format!("    instances  {}\n", f.instances.iter().map(one).collect::<Vec<_>>().join(", ")));
+        }
+    }
+    out
+}
+
+pub fn forget(folder: &Path, repo: &str) -> Result<()> {
+    println!("{}", forget_at(&State::path()?, folder, repo)?);
+    Ok(())
+}
+
+/// Drop `repo` from `folder`'s recorded GitHub fence in the state file
+/// `state`. Instances keep their snapshot until their next start or
+/// rebuild. Returns the line to print.
+pub(crate) fn forget_at(state: &Path, folder: &Path, repo: &str) -> Result<String> {
+    let repo = fence::repo_arg(repo)?;
+    // A folder since moved or deleted is named as recorded.
+    let key = remotes::folder_key(&folder.canonicalize().unwrap_or_else(|_| folder.to_path_buf()));
+    State::update_at(state, |s| {
+        let Some(record) = s.folder_remotes.get_mut(&key) else {
+            bail!("no remotes recorded for `{key}`: no instance has run on it");
+        };
+        let Some(at) = record.github.iter().position(|r| *r == repo) else {
+            bail!("`{repo}` isn't in `{key}`'s GitHub fence (it holds: {})", or_none(&record.github.join(", ")));
+        };
+        record.github.remove(at);
+        let users: Vec<&str> = s
+            .instances
+            .iter()
+            .filter(|(_, i)| remotes::instance_folders(i).any(|f| remotes::folder_key(f) == key))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let mut done = format!("dropped `{repo}` from `{key}`'s GitHub fence");
+        if !users.is_empty() {
+            done.push_str(&format!("; these instances take it at their next start or rebuild: {}", users.join(", ")));
+        }
+        Ok(done)
+    })
 }
 
 /// One credential as `access ls` shows it: never a secret.
@@ -826,6 +936,44 @@ mod tests {
         let err = revoke(&v2[..10], true, &mut Script::new(false, &[], None)).unwrap_err().to_string();
         assert!(err.contains("(versions: none)"), "{err}");
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn forget_narrows_a_folder_fence_and_ls_shows_it() {
+        let root = temp("forget");
+        let (folder, state) = (root.join("app"), root.join("state.toml"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let key = remotes::folder_key(&folder.canonicalize().unwrap());
+        assert!(forget_at(&state, &folder, "o/r").unwrap_err().to_string().contains("no remotes recorded"));
+        State::update_at(&state, |s| {
+            let record = crate::state::FolderRemotes { github: vec!["o/app".into(), "v/x".into()], ..Default::default() };
+            s.folder_remotes.insert(key.clone(), record);
+            let mut inst = instance("app", Vec::new());
+            inst.base_folder = key.clone().into();
+            inst.github_repos = vec!["o/app".into(), "v/x".into()];
+            s.instances.insert("app".into(), inst);
+            Ok(())
+        })
+        .unwrap();
+        assert!(forget_at(&state, &folder, "o/nope").unwrap_err().to_string().contains("(it holds: o/app, v/x)"));
+        assert!(forget_at(&state, &folder, "not a repo").is_err());
+
+        let done = forget_at(&state, &folder, "https://github.com/V/X.git").unwrap();
+        assert_eq!(done, format!("dropped `v/x` from `{key}`'s GitHub fence; these instances take it at their next start or rebuild: app"));
+        let s = State::load_at(&state).unwrap();
+        assert_eq!(s.folder_remotes[&key].github, ["o/app"]);
+        assert_eq!(s.instances["app"].github_repos, ["o/app", "v/x"], "until its next start");
+        let listed = fences(&s);
+        assert_eq!(listed[0].instances, [FenceUse { instance: "app".into(), stale: true }]);
+        assert_eq!(
+            render_fences(&listed),
+            format!("\nGitHub repo fences (each folder's remotes at its first run):\n  {key}  o/app\n    instances  app (until its next start)\n")
+        );
+        remotes::refresh_at(&state, "app").unwrap();
+        assert!(!fences(&State::load_at(&state).unwrap())[0].instances[0].stale);
+        assert!(forget_at(&state, &folder, "v/x").is_err(), "never re-widened");
+        assert_eq!(render_fences(&[]), "");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

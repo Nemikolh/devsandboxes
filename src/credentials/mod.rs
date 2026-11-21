@@ -5,6 +5,7 @@
 #[cfg(unix)]
 pub mod ca;
 pub mod claim;
+pub mod fence;
 #[cfg(unix)]
 pub mod home;
 pub mod instance;
