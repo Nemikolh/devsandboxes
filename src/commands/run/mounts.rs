@@ -13,12 +13,15 @@ use crate::config::{
 use crate::runtime::backend;
 use crate::worker_policy::Policy;
 
+use super::binds::Fence;
+
 /// Resolve the sandbox's `mounts` into `docker run --mount` values, substituting
 /// `${…}` variables and creating any missing bind sources so a first run doesn't
 /// fail on a non-existent host path. Entries sharing a target collapse to the
 /// last one (see [`last_wins_by_target`]) before any source is created, so an
 /// overridden template mount leaves no stub behind. `container_env` is what
 /// `${containerEnv:…}` reads (the built image's, see `ContainerEnv`).
+/// `fence` refuses what no bind may reach (`binds`).
 pub(super) fn resolve_mounts(
     dir: &Path,
     folder: &Path,
@@ -26,6 +29,7 @@ pub(super) fn resolve_mounts(
     instance_id: &str,
     sandbox: &ResolvedSandbox,
     container_env: Option<&ContainerEnv>,
+    fence: &Fence,
 ) -> Result<ResolvedMounts> {
     let Some(mounts) = &sandbox.properties.mounts else {
         return Ok(ResolvedMounts::default());
@@ -51,6 +55,7 @@ pub(super) fn resolve_mounts(
     // late for that).
     for m in &resolved {
         crate::key_guard::check_mount(&m.to_arg())?;
+        fence.check_mount(&m.to_arg())?;
     }
     crate::worker_policy::enforce(dir, |p| resolved.iter().try_for_each(|m| p.check_mount(&m.to_arg())))?;
     let mut out = ResolvedMounts::default();
@@ -876,13 +881,13 @@ mod tests {
             },
             config_hash: "h".into(),
         };
-        let first = resolve_mounts(&cfg, &cfg, "app", "web", &sandbox, None).unwrap();
+        let first = resolve_mounts(&cfg, &cfg, "app", "web", &sandbox, None, &Fence::default()).unwrap();
         let sv = cfg.join("shared-volumes");
         assert_eq!(first.bind_dirs, vec![sv.join("agent/web"), sv.join("web.json")]);
         assert!(sv.join("agent/web").is_dir() && sv.join("web.json").is_file() && sv.join("shared").is_dir());
         assert_eq!(first.volumes, ["vol-web"]);
 
-        let rebuild = resolve_mounts(&cfg, &cfg, "app", "web", &sandbox, None).unwrap();
+        let rebuild = resolve_mounts(&cfg, &cfg, "app", "web", &sandbox, None, &Fence::default()).unwrap();
         assert!(rebuild.bind_dirs.is_empty(), "nothing created this time");
         assert_eq!(merge_volumes(&first.bind_dirs, rebuild.bind_dirs), first.bind_dirs);
         let _ = std::fs::remove_dir_all(&base);

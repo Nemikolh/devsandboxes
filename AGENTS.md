@@ -44,7 +44,8 @@ Start with `docs/README.md` (reading order and map) and
   the URL pinned in `State.trusted_origins`),
   `ssh_agent.rs`, `mounts.rs`, `image.rs`
   (feature image + Dockerfile/entrypoint generation), `lifecycle.rs`,
-  `editor.rs` (VS Code name config), `identity.rs` (mode probe, the plan's
+  `editor.rs` (VS Code name config), `binds.rs` (binds no sandbox may
+  have: config roots, other instances' paths; the host-class warning), `identity.rs` (mode probe, the plan's
   create args, `devsbd identity apply`), `tool_env.rs` (userns check
   verdict → exec env), `facts.rs` (image ENV/USER/passwd, cached per image
   id); `mod.rs` re-exports what other commands use.

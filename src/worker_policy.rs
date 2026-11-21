@@ -150,7 +150,7 @@ pub struct Policy {
 }
 
 /// Socket file names refused wherever they are.
-const SOCKET_NAMES: [&str; 3] = ["docker.sock", "podman.sock", "containerd.sock"];
+pub(crate) const SOCKET_NAMES: [&str; 3] = ["docker.sock", "podman.sock", "containerd.sock"];
 
 /// The runtime socket paths of this host: the usual ones, `DOCKER_HOST`'s
 /// and `CONTAINER_HOST`'s unix paths, and the per-user ones under

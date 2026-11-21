@@ -349,6 +349,14 @@ is frozen: no new work on it.
 - `login` and `access approve` are local only: no `access.*` /
   `credentials.*` API methods, so no approver answers from another host
   (credential-broker step 4). → [plan](plans/active/credential-broker.md)
+- `run`'s host-class warning fires only on a host that brokers a
+  credential, not yet on one that is a credential's approver (step 4), and
+  `access ls` marks neither it nor a shared writable bind (step 2); the
+  `runArgs` refusals wait for `runArgs` to reach the runtime. In a build
+  without the helper, an ssh-agent fallback mount whose agent lives in
+  `$XDG_RUNTIME_DIR` reads as a session socket.
+  → [mounts](architecture/instances/mounts-and-state.md#what-no-bind-may-reach);
+  `commands::run::binds`
 
 ### runtimes
 

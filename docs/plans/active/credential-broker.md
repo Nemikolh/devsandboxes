@@ -92,7 +92,9 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   `core.fsmonitor`, build scripts), marked in `access ls` when the
   sandboxes' fences or grants differ: an instance bounded by the broker
   still runs as any instance that writes what it executes (git-gateway's
-  clones drop the companion mount). It refuses `runArgs` that join
+  clones drop the companion mount). The warning is only for an instance
+  with claims (orchestrator's narrowing: otherwise every sandbox sharing
+  the caches warns on every run). It refuses `runArgs` that join
   another instance's namespaces or volumes (`--network`/`--pid`/`--ipc
   container:`, `--volumes-from`, podman `--pod`) when either has claims,
   as `worker_policy` does for worker trust. A sandbox that needs the config

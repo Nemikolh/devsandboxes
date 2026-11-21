@@ -97,15 +97,7 @@ impl Guard {
     /// key file or a dir above one, as written (made absolute, `..` dropped
     /// lexically, as the runtime cleans it) or resolved (symlinks).
     pub fn check_path(&self, source: &str, what: &'static str) -> Result<(), Exposure> {
-        let expanded = match (source.strip_prefix('~'), &self.home) {
-            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-                home.join(rest.trim_start_matches('/'))
-            }
-            _ => PathBuf::from(source),
-        };
-        let written = lexical(&expanded);
-        let forms = [Some(written.clone()), worker_policy::resolve(&written), worker_policy::resolve(&expanded)];
-        for form in forms.iter().flatten() {
+        for form in &source_forms(source, self.home.as_deref()) {
             for (key, resolved, guards) in &self.keys {
                 if key.starts_with(form) || resolved.starts_with(form) {
                     return Err(Exposure { what, source: source.to_string(), key: key.clone(), guards });
@@ -212,9 +204,23 @@ pub fn check_mount(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The forms a host path `source` is checked in: as written (a leading `~`
+/// expanded with `home`, made absolute, `..` dropped lexically, as the
+/// runtime cleans it) and resolved (symlinks). Shared with `run`'s bind
+/// checks (`commands::run::binds`).
+pub(crate) fn source_forms(source: &str, home: Option<&Path>) -> Vec<PathBuf> {
+    let expanded = match (source.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+        _ => PathBuf::from(source),
+    };
+    let written = lexical(&expanded);
+    let resolved = [worker_policy::resolve(&written), worker_policy::resolve(&expanded)];
+    std::iter::once(written).chain(resolved.into_iter().flatten()).collect()
+}
+
 /// `path` made absolute with `.` and `..` dropped lexically (as a runtime
 /// cleans a bind source), no filesystem access.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = PathBuf::new();
     for c in abs.components() {

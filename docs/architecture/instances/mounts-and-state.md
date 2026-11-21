@@ -12,6 +12,7 @@ Code: `src/commands/run/mounts.rs` (`resolve_mounts`, `last_wins_by_target`,
 `src/commands/run/git.rs` (`host_git`, `host_git_bare`, `host_git_new`, `check_repo`),
 `src/commands/run/editor.rs` (`write_vscode_name_config`),
 `src/commands/vscode.rs` (`launch`), `src/commands/run/ssh_agent.rs`,
+`src/commands/run/binds.rs` (`Fence`, `check_argv`, `warnings`),
 `src/commands/run/mod.rs` (`materialize`, `run_container`), `src/config.rs`
 (`Mount`, `MountContext`, `known_cache`).
 
@@ -67,6 +68,51 @@ In `materialize` / `run_container`:
 
 `sort_parents_first` orders all `--mount`s by target depth so nested mounts
 stay visible on every runtime, not just docker.
+
+## What no bind may reach
+
+`src/commands/run/binds.rs` (`Fence`) refuses, on every host and with or
+without credential claims, read-only too, a bind whose source:
+
+- covers a config root: the running one or any an instance in
+  `state.toml` came from (`Instance.config_dir`). A sandbox that needs
+  config files binds them read-only, one bind each; a config inside its
+  own `folder` (`folder = "."`, or a config dir inside the repo) is refused
+  even when the instance gets a worktree, since its companion `.git` is
+  the config's: the config moves beside the repo;
+- covers a whole `<root>/shared-volumes/` (a subdir is fine);
+- covers or lies in another instance's worktree (`.worktrees/<id>/`,
+  `.worktrees/<id>.folders/`, its recorded `worktree` and `folders`
+  worktrees) or per-instance bind dir (`Instance.bind_dirs`, its
+  shell-history dir);
+
+and a mount of another instance's per-instance named volume
+(`Instance.volumes`). Sources are compared as `key_guard` compares them
+(`key_guard::source_forms`: `~` expanded, cleaned lexically, and with
+symlinks resolved), and `key_guard` refuses what it guards
+([fleet](../daemon/fleet.md)). The other instances are every record whose
+`instance_id` isn't this one's, so a `rebuild` passes its own paths.
+Checked on `folder` and `folders` before anything is created
+(`Fence::check_folders`), on `mounts` before their sources are created
+(`resolve_mounts`), and over the final argv (`binds::check_argv` in
+`run_container`, next to `key_guard::check_argv`). Build contexts and
+dockerfiles aren't binds: a config root may be one.
+
+`binds::warnings` adds, before the container is created:
+
+- the host-class warning, when this host brokers a credential
+  (`credentials.toml` has an entry) and the sandbox can act as the host:
+  it runs privileged, a bind covers a runtime socket
+  (`worker_policy::host_sockets`, or a file named like one), or a bind
+  covers or lies in the host's display or session sockets
+  (`binds::session_sockets`: `/tmp/.X11-unix`, `$XDG_RUNTIME_DIR`, an
+  absolute `$WAYLAND_DISPLAY`, the session bus's `unix:path=`). One line,
+  every reason;
+- for an instance with credential claims (an enabled feature declares
+  one), each writable bind other instances run code from: a `caches` dir
+  of any config root, another instance's checkout or base (its `.git`, the
+  companion mount). Without claims nothing the broker keeps from an
+  instance is gained, so it stays quiet.
 
 Who owns what lands in these binds is the identity plan's
 ([identity](identity.md)): it relabels binds under SELinux, and

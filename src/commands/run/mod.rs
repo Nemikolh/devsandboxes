@@ -13,6 +13,7 @@ use crate::state::{Instance, Phase, State};
 use super::{container_drifted, pick, services};
 
 pub(crate) mod cancel;
+mod binds;
 pub(crate) mod cgroup;
 mod claims;
 mod editor;
@@ -634,6 +635,8 @@ pub(crate) fn materialize(
     crate::worker_policy::enforce(dir, |p| {
         extra_folders.iter().try_for_each(|f| p.check_path(&f.host, &format!("`folders` entry `{}`", f.target)))
     })?;
+    let fence = binds::Fence::for_run(dir, state, instance_id);
+    fence.check_folders(folder, &extra_folders)?;
 
     let policy = crate::worker_policy::Policy::for_dir(dir)?;
 
@@ -766,7 +769,7 @@ pub(crate) fn materialize(
         ContainerEnv::resolve(props.container_env.as_ref(), facts.env.clone(), facts::home(props, &facts), &var_ctx);
     let var_ctx = MountContext { container_env: Some(&container_env), ..var_ctx };
     let ResolvedMounts { args: mut mounts, volumes: mut instance_volumes, bind_dirs: mut created_dirs } =
-        resolve_mounts(dir, folder, &basename, instance_id, sandbox, Some(&container_env))?;
+        resolve_mounts(dir, folder, &basename, instance_id, sandbox, Some(&container_env), &fence)?;
     for fm in &folder_mounts {
         mounts.push(format!(
             "type=bind,source={},target={}",
@@ -814,6 +817,12 @@ pub(crate) fn materialize(
         backend().supports_privileged(),
     );
     for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    let volumes: Vec<String> =
+        std::iter::once(format!("{}:{workspace}", source.display())).chain(extra_mounts.iter().cloned()).collect();
+    let all_binds = binds::binds_of(&volumes, &mounts);
+    for warning in binds::warnings(dir, state, instance, instance_id, &all_binds, privileged, !feature.claims.is_empty()) {
         eprintln!("warning: {warning}");
     }
     let (restart, warnings) = crate::commands::autostart::restart_decision(
@@ -1271,6 +1280,7 @@ fn run_container(
     // gets (features' mounts and `privileged`, identity, caches). The member
     // key's guard holds whatever the policy.
     crate::key_guard::check_argv(&args)?;
+    binds::check_argv(dir, &args, instance)?;
     crate::worker_policy::enforce_argv(dir, &args)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&arg_refs)?;

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A sandbox can no longer see a config.** `run` refuses a bind, read-only too, that covers a config root (any config an instance was created from), a whole `shared-volumes/` dir, or another instance's worktree or per-instance volume. A config that sits inside its own `folder` (`folder = "."`) no longer runs: move it beside the repo. A sandbox that needs config files binds them read-only, one bind each. `run` also warns when a privileged sandbox, or one bound to the container runtime's socket or the desktop's display or session sockets, runs on a host that holds credentials.
+
 ## 0.10.0
 
 A config can now belong to the whole fleet and keep running on an always-on server while the host it was written on is off. Links a sandbox opens land in your desktop browser, picked per profile. Sandboxes and services get NVIDIA GPUs from `hostRequirements.gpu`, and placement sends them to a machine that lends one. Members run the build the fleet's authority pins.
