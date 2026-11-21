@@ -343,7 +343,7 @@ is frozen: no new work on it.
   `approvers`, `delegate` and `as` parse but nothing reads them yet.
   → [login](architecture/credentials/login.md); `commands::login::choose`
 - Intercept-mode claims are skipped at `run` until credential-broker
-  step 3, and claims on an instance placed by another member until step 5
+  step 3 (the member CA mints leaves, nothing serves them yet), and claims on an instance placed by another member until step 5
   (`CRED`), each with a warning.
   → [images and features](architecture/instances/images-and-features.md#credential-claims);
   `credentials::instance::select`, `commands::run::claims::wire`

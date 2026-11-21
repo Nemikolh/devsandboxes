@@ -108,6 +108,8 @@ the credential kept on this host, by policy, per call.
   injection, redaction, refusals, `access.log`.
 - [login.md](credentials/login.md): the device flow and browser OAuth
   logins and the token record they store.
+- [ca.md](credentials/ca.md): the member CA intercepted hosts' leaves
+  chain to, its name constraints and files.
 - CLI and files: [reference/credentials-cli.md](../reference/credentials-cli.md).
 
 ## The Inbox

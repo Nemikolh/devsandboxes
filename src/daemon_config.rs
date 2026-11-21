@@ -80,21 +80,27 @@ pub const CREDENTIAL_STORE: &str = "credentials-store.toml";
 /// Reserved for the broker's remembered answers (credential-broker,
 /// *Permission requests*), guarded before anything writes it.
 pub const ACCESS: &str = "access.json";
-/// Reserved for the member CA's key (credential-broker, *The member CA*).
+/// The member CA's key (`credentials::ca`), 0600.
 pub const MEMBER_CA_KEY: &str = "member-ca.key";
+/// The member CA's cert and the hosts it covers (`credentials::ca`),
+/// written under `member-ca.lock` like the key. Public, but a container
+/// that could write it would get its own CA installed in the others.
+pub const MEMBER_CA_CERT: &str = "member-ca.toml";
 
 /// Every credential-broker file in the data dir `data` no container may
 /// reach, with the locks they're written under (`serve::locked_file`'s
 /// `<stem>.lock`).
 pub fn credential_files(data: &Path) -> Vec<PathBuf> {
-    [CREDENTIALS, CREDENTIAL_STORE, ACCESS, MEMBER_CA_KEY]
-        .into_iter()
-        .flat_map(|name| {
-            let file = data.join(name);
-            let lock = file.with_extension("lock");
-            [file, lock]
-        })
-        .collect()
+    let mut files = Vec::new();
+    for name in [CREDENTIALS, CREDENTIAL_STORE, ACCESS, MEMBER_CA_KEY, MEMBER_CA_CERT] {
+        let file = data.join(name);
+        let lock = file.with_extension("lock");
+        files.push(file);
+        if !files.contains(&lock) {
+            files.push(lock);
+        }
+    }
+    files
 }
 
 /// The global config; a missing file is the defaults.
@@ -143,7 +149,8 @@ mod tests {
                 "access.json",
                 "access.lock",
                 "member-ca.key",
-                "member-ca.lock"
+                "member-ca.lock",
+                "member-ca.toml"
             ]
         );
     }

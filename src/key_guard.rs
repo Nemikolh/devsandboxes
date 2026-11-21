@@ -3,7 +3,7 @@
 //! `member.key` (nor its pending `member.key.next` or its `member.key.lock`),
 //! nor the credential broker's files beside it
 //! (`daemon_config::credential_files`: `credentials.toml`, the file store,
-//! `access.json`, `member-ca.key`, and their locks).
+//! `access.json`, `member-ca.key`, `member-ca.toml`, and their locks).
 //! Unlike the worker policy (`worker_policy`), this holds on every host,
 //! for every config and trust level, and no allowance lifts it: a bind whose
 //! source is one of those files or a dir above them (`$HOME`, the data dir,
@@ -369,6 +369,7 @@ mod tests {
             "credentials-store.lock",
             "access.json",
             "member-ca.key",
+            "member-ca.toml",
         ];
         for name in names {
             // Missing files too: reserved names are guarded before they exist.

@@ -253,8 +253,8 @@ so no secret is ever on disk with wider permissions. A store readable by
 group or others is refused (read and write), and a parse error names the
 file, never its content. `Secret` has no `Display` and a blank `Debug`.
 
-Both files, their locks, and the reserved `access.json` and
-`member-ca.key` are refused as bind and build sources in every container,
+Both files, their locks, the reserved `access.json` and the member CA's
+`member-ca.key` and `member-ca.toml` ([member CA](../architecture/credentials/ca.md)) are refused as bind and build sources in every container,
 like `member.key` (`key_guard`, `daemon_config::credential_files`;
 [fleet](../architecture/daemon/fleet.md), *Key at rest*).
 

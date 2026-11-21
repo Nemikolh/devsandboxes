@@ -37,6 +37,8 @@ httparse = "1.10.1"
 # aws-lc-rs (docs/plans/active/mtls-links.md), the host's native roots.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
+# The member CA and its leaves (`credentials::ca`), on ring like rustls.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 # An upstream's gzip/deflate answer despite `Accept-Encoding: identity`.
 flate2 = "1.1.11"
 toml = "1.1.5"

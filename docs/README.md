@@ -52,7 +52,8 @@ User-facing docs live in `site/` (and the config reference in
   [in-container](architecture/helper/in-container.md),
   [ssh-agent](architecture/helper/ssh-agent.md)
 - **Credentials**: [broker](architecture/credentials/broker.md),
-  [login](architecture/credentials/login.md)
+  [login](architecture/credentials/login.md),
+  [member CA](architecture/credentials/ca.md)
 - **Inbox**: [model](architecture/inbox/model.md),
   [threads and feed](architecture/inbox/threads-and-feed.md),
   [forms](architecture/inbox/forms.md),
