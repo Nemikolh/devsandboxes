@@ -120,6 +120,18 @@ pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, Str
     }
 }
 
+/// Why an agent mount is dropped for an instance whose claims name
+/// `git_hosts`: a bind hands over the whole agent, and only the relay
+/// filters keys (docs/architecture/helper/ssh-agent.md, *Key filtering*).
+pub(super) fn mount_refusal(git_hosts: &[String]) -> Option<String> {
+    (!git_hosts.is_empty()).then(|| {
+        format!(
+            "ssh-agent forwarding off: a git-host claim ({}) applies, and a mounted agent can't filter keys (a build with the embedded helper relays it filtered)",
+            git_hosts.join(", ")
+        )
+    })
+}
+
 /// Re-point `info`'s agent symlink at the current host agent before its
 /// container starts, so a restart after agent rotation (reboot, re-login)
 /// re-captures the live socket — bind sources re-resolve at every container
@@ -167,6 +179,13 @@ mod tests {
         assert_eq!(std::fs::read_link(&link).unwrap(), second);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mount_is_refused_only_under_a_git_host_claim() {
+        assert_eq!(mount_refusal(&[]), None);
+        let why = mount_refusal(&["github.com".into()]).unwrap();
+        assert!(why.contains("github.com") && why.contains("can't filter"), "{why}");
     }
 
     #[test]

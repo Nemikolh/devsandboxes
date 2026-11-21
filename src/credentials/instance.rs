@@ -49,6 +49,15 @@ pub struct InstanceClaim {
     pub listeners: Vec<Listener>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<File>,
+    /// The claim's `git.hosts`: while any claim has some, the agent relay
+    /// filters keys (docs/architecture/helper/ssh-agent.md, *Key filtering*).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_hosts: Vec<String>,
+}
+
+/// Every claim's `git.hosts`, in claim order.
+pub fn git_hosts(claims: &[InstanceClaim]) -> Vec<String> {
+    claims.iter().flat_map(|c| c.git_hosts.iter().cloned()).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +282,7 @@ pub fn plan(
             phantom,
             listeners,
             files: Vec::new(),
+            git_hosts: claim.wiring.git.as_ref().map(|g| g.hosts.clone()).unwrap_or_default(),
         });
     }
     let hosts: BTreeSet<String> = selected
@@ -537,6 +547,8 @@ mod tests {
         let selected = vec![("./s".to_string(), sentry()), ("./gh".to_string(), gh.clone()), ("./x".to_string(), other)];
         let first = plan(&selected, &[], None, counter()).unwrap();
         assert!(first.claims[1].listeners.is_empty() && first.claims[2].listeners.is_empty());
+        assert_eq!(git_hosts(&first.claims), ["github.com"]);
+        assert!(first.claims[0].git_hosts.is_empty());
         // git's host stays off the shared port (git-gateway gives git its own).
         assert_eq!(
             first.proxy,

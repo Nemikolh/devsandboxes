@@ -33,6 +33,23 @@
   ```
 
 - **Intercept-mode credential claims.** A feature whose claim intercepts its hosts (gh's `api.github.com`, say) now works with the tool as it ships: the sandbox gets `HTTPS_PROXY` pointing at the helper, which hands only the claimed hosts to the broker and dials everything else itself (through the proxy the container already had, if any). The broker's per-host certificates chain to this host's member CA, which `run` installs into the container's system CA bundle (`update-ca-certificates`, `update-ca-trust`, or the bundle itself) and names in `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `REQUESTS_CA_BUNDLE` and `AWS_CA_BUNDLE`. A new claimed host reissues the CA and reinstalls it in the running sandboxes; a stopped one gets it at `start`. `run` warns when `remoteEnv` or `--env` sets a proxy variable, which would bypass the route.
+- **Each folder's remotes are recorded at its first `run`.** Before a folder's first container, `run` reads its git remotes (any host; host paths, `file://` and `ext::` URLs dropped) into `state.toml` and prints the GitHub repos among them: the repos a sandbox's GitHub credential will be fenced to. The record is never re-read, so a remote a sandbox adds or rewrites later never counts, and `rm` keeps it. `access.github.repos` adds repos; `devsandbox access forget <folder> <repo>` drops one (instances take it at their next start or rebuild); `access ls` lists each folder's fence. Nothing enforces the fence yet.
+
+  ```bash
+  devsandbox access forget ~/src/app someone/planted-repo
+  ```
+
+- **A sandbox with a GitHub git claim can't reach GitHub with your ssh keys.** While a feature claims git hosts, the ssh-agent relay shows the sandbox only the keys its config's new `ssh-keys` names, none by default. A key with `destinations` signs only logins to those hosts, checked against their host keys in this host's `known_hosts` (the client must bind the session, OpenSSH 8.9+). A `signing-only` key signs only git's ssh commit signatures. A key named without destinations works everywhere, GitHub included, and so gets around the repo fence. Refusals land in the instance's Inbox. An instance with such a claim never gets the agent by bind mount.
+
+  ```toml
+  [sandbox.web]
+  ssh-keys = [
+    { key = "SHA256:Xq3…", destinations = ["gitlab.example.com"] },
+    { key = "ssh-ed25519 AAAA… me@laptop", signing-only = true },
+  ]
+  ```
+
+- **`devsandbox vscode` asks before handing a sandbox your logins.** VS Code's attach gives the sandbox your host's git credentials and whole ssh-agent, so `vscode` (and the dashboard's `o`) refuses an instance with a credential claim; `--allow-credential-leak` opens it anyway, with a warning.
 - **`access.log`**, next to `state.toml`: one JSON line per call a sandbox made through the broker (instance, credential, route, scope, verdict, status), never a token.
 
 ### Changed

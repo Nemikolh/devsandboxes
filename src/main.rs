@@ -247,6 +247,10 @@ enum Command {
         /// the window to attach
         #[arg(long, value_name = "PATH[:LINE[:COL]]", value_parser = commands::vscode::Goto::parse)]
         goto: Option<commands::vscode::Goto>,
+        /// Open an instance with credential claims anyway: VS Code's attach
+        /// gives it your host's git logins and whole ssh-agent
+        #[arg(long)]
+        allow_credential_leak: bool,
     },
     /// Mark a sandbox instance done: kept as is (container, worktree), shown
     /// dimmed until removed
@@ -1082,7 +1086,9 @@ fn main() -> Result<()> {
             }
         }
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
-        Command::Vscode { name, goto } => commands::vscode::vscode(&cli.dir, &name, goto.as_ref()),
+        Command::Vscode { name, goto, allow_credential_leak } => {
+            commands::vscode::vscode(&cli.dir, &name, goto.as_ref(), allow_credential_leak)
+        }
         Command::Done { name } => commands::done::done(&name, true),
         Command::Undone { name } => commands::done::done(&name, false),
         Command::Fetch { name } => {

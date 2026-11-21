@@ -669,6 +669,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "ruzstd",

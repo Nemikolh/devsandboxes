@@ -758,7 +758,7 @@ pub(crate) fn materialize(
     // Only builds without a helper (`cargo install`) and non-unix hosts fall
     // back to the bind mount.
     let relay_first = cfg!(unix) && crate::devsbd::embedded();
-    let ssh_auth_sock = if relay_first {
+    let mut ssh_auth_sock = if relay_first {
         None
     } else {
         match ssh_agent_forward(instance_id)? {
@@ -866,6 +866,13 @@ pub(crate) fn materialize(
         proxying,
     )?;
     extra_env.extend(wired.env.iter().cloned());
+    if let Some(why) =
+        ssh_auth_sock.as_ref().and(ssh_agent::mount_refusal(&crate::credentials::instance::git_hosts(&wired.claims)))
+    {
+        eprintln!("warning: {why}");
+        extra_mounts.retain(|m| !m.ends_with(&format!(":{SSH_AGENT_TARGET}")));
+        ssh_auth_sock = None;
+    }
     tracker.enter(Phase::Creating)?;
     run_container(
         dir,

@@ -592,7 +592,7 @@ fn launch_code(dir: &Path, instance: &str, goto: Option<&Goto>) -> String {
     let Some(info) = state.instances.get(instance) else {
         return format!("code: unknown instance `{instance}`");
     };
-    commands::vscode::launch(dir, instance, info, goto).unwrap_or_else(|e| format!("{e:#}"))
+    commands::vscode::launch(dir, instance, info, goto, false).unwrap_or_else(|e| format!("{e:#}"))
 }
 
 /// Spawn a detached thread running [`launch_code`] (a goto blocks while the

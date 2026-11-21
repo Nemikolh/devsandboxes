@@ -68,7 +68,7 @@ Each sandbox is listed with its instances under it. Repeat instances show their 
 
 ## VS Code
 
-`o` or `devsandbox vscode web-2` opens VS Code attached to the instance, with the sandbox's extensions. It needs the Dev Containers extension and `code` on your `PATH`.
+`o` or `devsandbox vscode web-2` opens VS Code attached to the instance, with the sandbox's extensions. It needs the Dev Containers extension and `code` on your `PATH`. An instance with a credential claim doesn't open: VS Code's attach hands it your host's git logins and whole ssh-agent. `devsandbox vscode --allow-credential-leak web-2` opens it anyway.
 
 <Try>`↓` `o` to open it on `web-2`.</Try>
 

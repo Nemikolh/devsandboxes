@@ -37,6 +37,9 @@ httparse = "1.10.1"
 # aws-lc-rs (docs/plans/active/mtls-links.md), the host's native roots.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
+# The agent relay's check of a session-bind's ecdsa and rsa host key
+# signatures (`devsbd::agent_filter`); already in the tree under rustls.
+ring = "0.17"
 # The member CA and its leaves (`credentials::ca`), on ring like rustls.
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 # The bundle written into an image that has none (`credentials::trust`):

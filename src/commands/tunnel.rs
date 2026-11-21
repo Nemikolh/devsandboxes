@@ -333,6 +333,7 @@ mod tests {
             port: 5432,
             label: "db:5432".into(),
             process_container: process_container.into(),
+            agent: true,
         };
         let header = |helper| Header::Route { label: "db:5432".into(), host: "db".into(), port: 5432, hash: None, helper };
         assert_eq!(Header::of_route(&route("c")), header(true));

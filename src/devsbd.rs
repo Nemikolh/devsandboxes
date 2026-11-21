@@ -8,6 +8,8 @@
 //! binds on Apple `container`).
 
 #[cfg(unix)]
+pub mod agent_filter;
+#[cfg(unix)]
 pub mod bridge;
 // Shared with the helper; the parser is helper-only (the host only writes).
 #[allow(dead_code)]

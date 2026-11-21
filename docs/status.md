@@ -371,6 +371,18 @@ is frozen: no new work on it.
   (no dashboard view, nor in `access ls`).
   → [broker](architecture/credentials/broker.md); `broker::policy::decide`,
   `broker::serve::Service`
+- The agent relay's key filter under a git-host claim signs a named
+  key's login with no confirmation (confirm-on-sign is a permission
+  request, credential-broker step 4), and the boot check doesn't yet warn
+  when `commit.gpgsign` is on with an ssh key and no `signing-only` key
+  is named (git-gateway step 1). A destination key's forwarding hops
+  aren't checked, only the login's own bind; an agent certificate isn't
+  matched by its underlying key; ecdsa nistp521, `ssh-rsa` (SHA-1),
+  certificate and security-key host keys can't bind. The dashboard's `o`
+  refuses an instance with a claim and has no override (only
+  `devsandbox vscode --allow-credential-leak`).
+  → [ssh-agent](architecture/helper/ssh-agent.md#key-filtering);
+  `devsbd::agent_filter::Filter`, `commands::vscode::leak_refusal`
 - `login` and `access approve|ls|revoke` are local only: no `access.*` /
   `credentials.*` API methods, so no approver answers from another host
   (credential-broker step 4). → [plan](plans/active/credential-broker.md)

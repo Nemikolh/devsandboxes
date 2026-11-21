@@ -390,6 +390,7 @@ pub fn resolver_in(
                                 host: "127.0.0.1".into(),
                                 port,
                                 label: format!("{key}:{port}"),
+                                agent: crate::credentials::instance::git_hosts(&info.claims).is_empty(),
                             });
                         }
                         None => return Err(format!("devsbd couldn't run in `{container}`")),
@@ -408,6 +409,7 @@ pub fn resolver_in(
                                 // The port lives in the service container, not
                                 // the instance, so probe there.
                                 process_container: service_container,
+                                agent: crate::credentials::instance::git_hosts(&info.claims).is_empty(),
                             });
                         }
                         // Helper unavailable in this instance: fall through to
@@ -432,6 +434,7 @@ pub fn resolver_in(
                                 host: "127.0.0.1".into(),
                                 port,
                                 label: format!("{alias}:{port}"),
+                                agent: true,
                             });
                         }
                         None => {

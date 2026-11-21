@@ -3,10 +3,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::resolve_instance;
 use crate::config::Config;
+use crate::credentials::instance::InstanceClaim;
 use crate::runtime::{backend, bounded};
 use crate::state::{Instance, State};
 
@@ -165,13 +166,39 @@ pub fn goto_in(container: &str, workspace: &str, goto: &Goto) -> GotoOutcome {
 }
 
 /// CLI entry point: open VS Code attached to the instance `name` resolves to
-/// (same as `o` in the dashboard), at `goto` when given.
-pub fn vscode(dir: &Path, name: &str, goto: Option<&Goto>) -> Result<()> {
+/// (same as `o` in the dashboard), at `goto` when given. An instance with
+/// a credential claim opens only with `allow_credential_leak`, warned.
+pub fn vscode(dir: &Path, name: &str, goto: Option<&Goto>, allow_credential_leak: bool) -> Result<()> {
     let state = State::load()?;
     let key = resolve_instance(&state, name)?;
     let info = &state.instances[&key];
-    println!("{}", launch(dir, &key, info, goto)?);
+    if allow_credential_leak && let Some(why) = credential_leak(&key, &info.claims) {
+        eprintln!("warning: {why}");
+    }
+    println!("{}", launch(dir, &key, info, goto, allow_credential_leak)?);
     Ok(())
+}
+
+/// [`launch`]'s refusal of an instance with `claims`, unless `allowed`.
+fn leak_refusal(instance: &str, claims: &[InstanceClaim], allowed: bool) -> Option<String> {
+    let why = credential_leak(instance, claims).filter(|_| !allowed)?;
+    Some(format!("{why}; `devsandbox vscode --allow-credential-leak {instance}` opens it anyway"))
+}
+
+/// Why attaching VS Code to an instance with `claims` hands the sandbox
+/// what the broker keeps out (git-gateway, *Other ways around the
+/// gateway*): Dev Containers' git credential helper, its forwarded agent
+/// and the git extension's askpass reach the host's logins, and their
+/// switches are host-side user settings devsandbox can't set.
+fn credential_leak(instance: &str, claims: &[InstanceClaim]) -> Option<String> {
+    if claims.is_empty() {
+        return None;
+    }
+    let kinds: Vec<&str> = claims.iter().map(|c| c.kind.as_str()).collect();
+    Some(format!(
+        "`{instance}` has credential claims ({}): VS Code's attach gives it your host's git logins and whole ssh-agent, past the broker and the agent's key filter",
+        kinds.join(", ")
+    ))
 }
 
 /// Launch VS Code attached to `info`'s container, detached. Writes the
@@ -181,8 +208,18 @@ pub fn vscode(dir: &Path, name: &str, goto: Option<&Goto>) -> Result<()> {
 /// <abs>[:line[:col]] [--wait SECS]`*): the host `code` always runs first,
 /// since it opens or focuses the window the in-container CLI needs. Blocks up
 /// to [`GOTO_TIMEOUT`] then. Returns a one-line status. Shared with the TUI's
-/// `o` so both open identically.
-pub fn launch(dir: &Path, instance: &str, info: &Instance, goto: Option<&Goto>) -> Result<String> {
+/// `o` so both open identically; an instance with a credential claim is
+/// refused unless `allow_credential_leak`.
+pub fn launch(
+    dir: &Path,
+    instance: &str,
+    info: &Instance,
+    goto: Option<&Goto>,
+    allow_credential_leak: bool,
+) -> Result<String> {
+    if let Some(why) = leak_refusal(instance, &info.claims, allow_credential_leak) {
+        bail!("{why}");
+    }
     // Extensions come from the resolved sandbox, read from the instance's own
     // config root: state is global, so `dir` (the cwd by default) may be
     // another root or none. Failure to resolve is non-fatal: keep the
@@ -360,6 +397,27 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&argv.stdout), "-g\n/workspaces/repo/src/a.rs:4:2\n");
         });
         Ok(())
+    }
+
+    #[test]
+    fn an_instance_with_claims_needs_the_leak_flag() {
+        assert_eq!(credential_leak("repo", &[]), None);
+        assert_eq!(leak_refusal("repo", &[], false), None);
+        let claims = vec![InstanceClaim {
+            kind: "github".into(),
+            feature: "./gh".into(),
+            version: "v".into(),
+            claim: "{}".into(),
+            phantom: "p".into(),
+            listeners: Vec::new(),
+            files: Vec::new(),
+            git_hosts: vec!["github.com".into()],
+        }];
+        let why = credential_leak("repo", &claims).unwrap();
+        assert!(why.contains("(github)") && why.contains("ssh-agent"), "{why}");
+        let refused = leak_refusal("repo", &claims, false).unwrap();
+        assert!(refused.contains("--allow-credential-leak repo"), "{refused}");
+        assert_eq!(leak_refusal("repo", &claims, true), None);
     }
 
     #[test]

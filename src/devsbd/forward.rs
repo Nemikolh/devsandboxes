@@ -40,6 +40,10 @@ pub struct Route {
     pub port: u16,
     pub label: String,
     pub process_container: String,
+    /// Whether the bridge serves the host agent: never for an instance with
+    /// a git-host claim, whose daemon bridge serves it key-filtered
+    /// (`agent_filter::Gate`).
+    pub agent: bool,
 }
 
 /// The host port to bind. `Fixed` fails if the port is taken; `Prefer` walks
@@ -89,13 +93,13 @@ pub type Opener = Box<dyn Fn(&AtomicBool) -> Result<(Opened, Bridge), String> + 
 
 /// The opener for a forward into a local instance: `resolve` the route, then
 /// `exec` a bridge into its container (`bridge::spawn_for`, serving the host
-/// ssh-agent when there is one). The helper answers the listening-process
+/// ssh-agent when there is one and the route allows it). The helper answers the listening-process
 /// lookup when the port lives in the dialed container.
 pub fn local_opener(resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>) -> Opener {
     Box::new(move |_stop| {
         let route = resolve()?;
         let hash = route.arch.and_then(hash).unwrap_or_default();
-        let bridge = bridge::spawn_for(&route.container, hash, true)
+        let bridge = bridge::spawn_for(&route.container, hash, route.agent)
             .ok_or_else(|| format!("could not exec into {}", route.container))?;
         let lookup = lookup_for(&route);
         Ok((Opened { label: route.label, host: route.host, port: route.port, lookup }, bridge))
@@ -725,6 +729,7 @@ mod tests {
             port: 80,
             label: "x:80".into(),
             process_container: process_container.into(),
+            agent: true,
         };
         assert_eq!(lookup_for(&route("c")), ProcessLookup::Helper { container: "c".into() });
         assert_eq!(lookup_for(&route("svc")), ProcessLookup::Probe { container: "svc".into() });
@@ -937,6 +942,7 @@ mod tests {
                 port,
                 label: format!("test:{port}"),
                 process_container: container.clone(),
+                agent: true,
             })
         }))
     }
@@ -1117,6 +1123,7 @@ mod tests {
                         port: 8080,
                         label: "test:8080 (via)".into(),
                         process_container: "svc-container".into(),
+                        agent: true,
                     })
                 })
             };

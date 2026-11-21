@@ -13,7 +13,8 @@ Code: `src/commands/run/mod.rs` (`relay_first`), `src/commands/run/ssh_agent.rs`
 `exec_argv_with`, `AgentRelay`), `src/commands/run/lifecycle.rs`,
 `src/devsbd/bridge.rs` (`host_agent`, `AgentCandidates`, `report_agent`,
 `own_agent`), `devsbd/src/daemon.rs` (`AGENT_SOCK`, `accept_agent_clients`),
-`src/serve/fleet/agent.rs` (a machine's and a fleet worker's relayed agent).
+`src/serve/fleet/agent.rs` (a machine's and a fleet worker's relayed agent),
+`src/devsbd/agent_filter.rs` (the key filter under a git-host claim).
 
 ## Mode is decided at `run`
 
@@ -30,6 +31,9 @@ Code: `src/commands/run/mod.rs` (`relay_first`), `src/commands/run/ssh_agent.rs`
   by `start` (`ssh_agent_refresh`) because bind sources re-resolve on every
   container start. On macOS with `docker` the source is Docker Desktop's
   `/run/host-services/ssh-auth.sock` instead, bound directly (no link).
+  A mount hands over the whole agent, so an instance with a git-host claim
+  gets none: `run` drops it with a warning (`ssh_agent::mount_refusal`)
+  and the instance has no agent.
 
 Off unix neither applies: no relay, and `ssh_agent_forward` mounts nothing.
 The mode sticks to the instance: one created with a mount keeps it until
@@ -95,6 +99,72 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
   one `note:`.
 - A dispatcher's `ensure` waits for the child's bridge before answering
   (`wait_bridge` in `src/commands/dispatch.rs`).
+
+## Key filtering
+
+While a git-host claim applies (a claim whose `git.hosts` names hosts,
+recorded as `InstanceClaim::git_hosts`), the relay filters the agent, or
+anything in the sandbox could `ssh git@github.com git-receive-pack …` with
+the user's key past the gateway's repo fence. The daemon's bridge for such
+an instance holds an `agent_filter::Gate` (`Gate::for_instance`); each agent
+stream then runs through `agent_filter::relay` on its own thread instead of
+being spliced to the agent socket (`open_stream`). Forward bridges of such
+an instance serve no agent (`forward::Route::agent`), so every agent
+stream goes through the daemon's.
+
+Per connection, the gate reads the sandbox's `ssh-keys` from its config
+(like the broker's `access`: an edit applies to the next connection, no
+rebuild; a config that doesn't load offers no keys) and runs a fresh
+`agent_filter::Filter`:
+
+- `REQUEST_IDENTITIES`: the agent's answer keeps only the named keys
+  (`KeyRef::matches`: the `SHA256:` fingerprint or the public key line's
+  blob, exact; a certificate is its own key). None by default.
+- `SIGN_REQUEST` with an unnamed key: refused.
+- A named key without `destinations` signs anything, as without a claim:
+  it reopens GitHub over ssh (the config reference says so).
+- A named key with `destinations` signs only a publickey
+  `SSH_MSG_USERAUTH_REQUEST` (`publickey` or
+  `publickey-hostbound-v00@openssh.com`) that names that key and carries
+  the session id of the connection's last `session-bind@openssh.com`,
+  which must be a login bind (not forwarding) to a host key that one of
+  the destinations has in this host's `known_hosts` (OpenSSH's
+  destination constraints, `ssh-add -h`). Intermediate forwarding hops
+  aren't checked: the login's own bind is. A client without session-bind
+  (OpenSSH before 8.9, Go's x/crypto/ssh, libgit2) loses named keys only.
+- A `signing-only` key signs only an SSHSIG blob (the `SSHSIG` preamble,
+  `ssh-keygen -Y sign`) in namespace `git`: ssh commit signing, never a
+  login. The same key can be named twice, once per use.
+- `session-bind@openssh.com`: verified before it counts
+  (`agent_filter::verify`: the host key's signature over the session id;
+  ed25519, ecdsa nistp256/384, rsa-sha2-256/512; nistp521, `ssh-rsa`'s
+  SHA-1, certificate and security-key host keys are refused, naming the
+  type), then passed on to the agent. As in OpenSSH's agent, a connection
+  bound for a login takes no further bind, and at most 16.
+- Anything else (adding, removing or locking keys, other extensions):
+  refused.
+
+A destination's host keys come from the filtering host's own `known_hosts`
+(`agent_filter::SshKeygen`: `ssh-keygen -F <host> -f <file>` over
+`~/.ssh/known_hosts` and `/etc/ssh/ssh_known_hosts`, run per connection so
+a rotation is followed; `@revoked` keys dropped, `@cert-authority` lines
+skipped), never the container's, where the sandbox could plant its own key
+under the destination's name. A destination with no entry refuses, naming
+the host and that it must be in `known_hosts`.
+
+A refusal answers `SSH_AGENT_FAILURE`, which the client prints as "agent
+refused operation", so its reason goes to `serve.log` and to the
+instance's Inbox as a warning keyed `ssh-agent` (`refusal_report` in
+`src/devsbd/bridge.rs`).
+
+The filter sits where the relay ends, on the instance's host: a remote
+instance's agent arrives there over `AGENT` streams and is filtered by
+that host's bridge, against that host's `known_hosts` and config.
+
+VS Code's attach brings its own credential helper, agent and askpass, so
+`devsandbox vscode` refuses an instance with any credential claim unless
+`--allow-credential-leak` (then warns), and the dashboard's `o` refuses it
+(`commands::vscode::leak_refusal`).
 
 ## What works where
 

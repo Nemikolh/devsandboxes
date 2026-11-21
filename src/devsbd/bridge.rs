@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use super::mux::{self, Conn, Mux};
 use super::control::{self, Request, Response, Status};
 use super::proto::caps;
+use super::agent_filter::{self, Gate};
 use super::{notify, proto, relay_mode, BIN};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
@@ -488,7 +489,8 @@ const NOTIFY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFY_REPLY_BAD: &[u8] = b"bad record";
 
 /// The local end for an `Open` on `channel`, or `None` to refuse it: agent
-/// streams connect to the host agent (when this bridge has a provider), notify
+/// streams connect to the host agent (when this bridge has a provider),
+/// through `gate`'s key filter on its own thread when set, notify
 /// and control streams go to a handler thread (when it has `services` and a
 /// free [`HandlerSlot`]), broker streams likewise when its services have a
 /// broker, on a slot of their own. Must return at once: it runs on the mux's
@@ -496,10 +498,18 @@ const NOTIFY_REPLY_BAD: &[u8] = b"bad record";
 fn open_stream(
     channel: u8,
     agent: Option<&impl Fn() -> Option<PathBuf>>,
+    gate: Option<&Arc<Gate>>,
     services: Option<&Services>,
 ) -> Option<Conn> {
     let (handler, slots, max): (fn(UnixStream, &Services), _, _) = match channel {
-        proto::channel::SSH_AGENT => return UnixStream::connect(agent?()?).ok().map(Into::into),
+        proto::channel::SSH_AGENT => {
+            let host = UnixStream::connect(agent?()?).ok()?;
+            let Some(gate) = gate else { return Some(host.into()) };
+            let (ours, theirs) = UnixStream::pair().ok()?;
+            let gate = Arc::clone(gate);
+            std::thread::spawn(move || gate.serve(ours, host));
+            return Some(theirs.into());
+        }
         proto::channel::NOTIFY => (handle_notify, &services?.handlers, MAX_HANDLERS),
         proto::channel::CONTROL => (handle_control, &services?.handlers, MAX_HANDLERS),
         proto::channel::HTTP_PROXY if services?.broker.is_some() => {
@@ -590,15 +600,17 @@ fn handle_notify(mut conn: UnixStream, to: &Services) {
 }
 
 /// A `Bridges` bridge for instance `key`: the host agent only when
-/// `with_agent`, notify + control only when `sink` is set, broker streams
-/// when `broker` is too. `observe` gets its handshake outcome and its end
-/// (see [`BridgeBoard`]).
+/// `with_agent`, key-filtered under a git-host claim (refusals to `log` and
+/// the instance's Inbox), notify + control only when `sink` is set, broker
+/// streams when `broker` is too. `observe` gets its handshake outcome and
+/// its end (see [`BridgeBoard`]).
 fn spawn_managed(
     key: &str,
     info: &Instance,
     with_agent: bool,
     sink: Option<&Sink>,
     broker: Option<&Arc<dyn Broker>>,
+    log: Option<fn(&str)>,
     observe: Observer,
 ) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
@@ -607,11 +619,33 @@ fn spawn_managed(
         ..Services::new(key.to_string(), info.instance_id.clone(), Arc::clone(s), Arc::new(dispatch_control))
     });
     if with_agent {
-        spawn_observed(&info.container, hash, Some(host_agent), notify, Some(observe))
+        let gate = Gate::for_instance(info, refusal_report(key, &info.instance_id, sink, log)).map(Arc::new);
+        spawn_observed(&info.container, hash, Some(host_agent), gate, notify, Some(observe))
     } else {
         let none: Option<fn() -> Option<PathBuf>> = None;
-        spawn_observed(&info.container, hash, none, notify, Some(observe))
+        spawn_observed(&info.container, hash, none, None, notify, Some(observe))
     }
+}
+
+/// Where a filtered agent's refusals go: `serve.log`, and the instance's
+/// Inbox as one warning that each new refusal replaces, since the client
+/// only ever prints "agent refused operation".
+fn refusal_report(key: &str, instance_id: &str, sink: Option<&Sink>, log: Option<fn(&str)>) -> agent_filter::Report {
+    let (key, instance_id, sink) = (key.to_string(), instance_id.to_string(), sink.cloned());
+    Arc::new(move |msg: String| {
+        if let Some(log) = log {
+            log(&format!("{key}: {msg}"));
+        }
+        if let Some(sink) = &sink {
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let record = notify::Record { level: notify::Level::Warn, key: Some("ssh-agent".into()), link: None, msg, at };
+            let _ = sink(Notification {
+                instance: key.clone(),
+                instance_id: instance_id.clone(),
+                message: notify::Message::Notify(record),
+            });
+        }
+    })
 }
 
 /// A daemon-like bridge for instance `key` serving only `broker` (notify
@@ -627,6 +661,7 @@ pub(crate) fn spawn_brokered(key: &str, info: &Instance, broker: Arc<dyn Broker>
     let none: Option<fn() -> Option<PathBuf>> = None;
     spawn_with(&info.container, hash, none, Some(services))
 }
+
 
 /// Start a bridge for `container` with helper `hash`, optionally serving the
 /// host ssh-agent. `with_agent` = true wires the real `host_agent` provider (a
@@ -657,7 +692,7 @@ fn spawn_with(
     agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
     notify: Option<Services>,
 ) -> Option<Bridge> {
-    spawn_observed(container, hash, agent, notify, None)
+    spawn_observed(container, hash, agent, None, notify, None)
 }
 
 /// Gets a bridge's news from its handshake thread: its mux and the daemon's
@@ -710,6 +745,7 @@ fn spawn_observed(
     container: &str,
     hash: &str,
     agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
+    gate: Option<Arc<Gate>>,
     notify: Option<Services>,
     observe: Option<Observer>,
 ) -> Option<Bridge> {
@@ -722,7 +758,7 @@ fn spawn_observed(
     let stdin = child.stdin.take()?;
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
-    Some(attach_with(child.into(), stdin, stdout, stderr, hash, container, None, agent, notify, observe))
+    Some(attach_with(child.into(), stdin, stdout, stderr, hash, container, None, agent, gate, notify, observe))
 }
 
 /// `<runtime> exec -i -u root <container> devsbd bridge`: the in-container end
@@ -755,7 +791,7 @@ pub fn attach(
     machine: Option<&str>,
 ) -> Bridge {
     let none: Option<fn() -> Option<PathBuf>> = None;
-    attach_with(child.into(), stdin, stdout, stderr, hash, label, machine, none, None, None)
+    attach_with(child.into(), stdin, stdout, stderr, hash, label, machine, none, None, None, None)
 }
 
 /// [`attach`] with the full set of options [`spawn_observed`] takes.
@@ -769,6 +805,7 @@ fn attach_with(
     label: &str,
     machine: Option<&str>,
     agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
+    gate: Option<Arc<Gate>>,
     notify: Option<Services>,
     observe: Option<Observer>,
 ) -> Bridge {
@@ -885,7 +922,7 @@ fn attach_with(
             mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
                 dead_child.lock().unwrap().kill();
             });
-            mux.serve(stdout, move |_, channel| open_stream(channel, agent.as_ref(), notify.as_ref()));
+            mux.serve(stdout, move |_, channel| open_stream(channel, agent.as_ref(), gate.as_ref(), notify.as_ref()));
         }
         finished.store(true, Ordering::Relaxed);
         observe.status(BridgeStatus::Failed("the bridge ended (container stopped or helper gone)".into()));
@@ -1337,7 +1374,7 @@ impl Bridges {
                     _ => info,
                 };
                 let observe = self.observe(&info.container);
-                match spawn_managed(key, info, with_agent, self.sink.as_ref(), self.broker.as_ref(), observe) {
+                match spawn_managed(key, info, with_agent, self.sink.as_ref(), self.broker.as_ref(), self.log, observe) {
                     Some(b) => {
                         self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
                     }
@@ -1973,10 +2010,10 @@ mod tests {
         let held: Vec<_> = (0..MAX_BROKER_HANDLERS)
             .map(|_| HandlerSlot::acquire(&to.brokered, MAX_BROKER_HANDLERS).unwrap())
             .collect();
-        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), Some(&to)).is_none());
-        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), Some(&to)).is_some());
+        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), None, Some(&to)).is_none());
+        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None, Some(&to)).is_some());
         drop(held);
-        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), Some(&to)).is_some());
+        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), None, Some(&to)).is_some());
     }
 
     /// `Services` for instance `instance` (owner id `<instance>-id`) whose
@@ -2056,7 +2093,7 @@ mod tests {
         std::thread::spawn(move || d.serve(d_r, |_, _| None));
         std::thread::spawn(move || {
             let none: Option<fn() -> Option<PathBuf>> = None;
-            host.serve(h_r, move |_, ch| open_stream(ch, none.as_ref(), Some(&to)))
+            host.serve(h_r, move |_, ch| open_stream(ch, none.as_ref(), None, Some(&to)))
         });
         daemon
     }
@@ -2303,10 +2340,10 @@ mod tests {
     #[test]
     fn sink_less_refuses_notify_and_control() {
         let none: Option<fn() -> Option<PathBuf>> = None;
-        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None).is_none());
-        assert!(open_stream(proto::channel::CONTROL, none.as_ref(), None).is_none());
-        assert!(open_stream(proto::channel::SSH_AGENT, none.as_ref(), None).is_none());
-        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), None).is_none());
+        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None, None).is_none());
+        assert!(open_stream(proto::channel::CONTROL, none.as_ref(), None, None).is_none());
+        assert!(open_stream(proto::channel::SSH_AGENT, none.as_ref(), None, None).is_none());
+        assert!(open_stream(proto::channel::HTTP_PROXY, none.as_ref(), None, None).is_none());
     }
 
     /// Past `MAX_HANDLERS` live handler threads a notify/control `Open` is
@@ -2317,13 +2354,13 @@ mod tests {
         let (to, _rx) = services("web-1", no_control());
         let held: Vec<_> = (0..MAX_HANDLERS).map(|_| HandlerSlot::acquire(&to.handlers, MAX_HANDLERS).unwrap()).collect();
         let none: Option<fn() -> Option<PathBuf>> = None;
-        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), Some(&to)).is_none());
-        assert!(open_stream(proto::channel::CONTROL, none.as_ref(), Some(&to)).is_none());
+        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None, Some(&to)).is_none());
+        assert!(open_stream(proto::channel::CONTROL, none.as_ref(), None, Some(&to)).is_none());
         assert_eq!(to.handlers.load(Ordering::Acquire), MAX_HANDLERS);
         drop(held);
         assert_eq!(to.handlers.load(Ordering::Acquire), 0);
         // Accepted again; dropping our end ends the handler, freeing the slot.
-        let conn = open_stream(proto::channel::NOTIFY, none.as_ref(), Some(&to));
+        let conn = open_stream(proto::channel::NOTIFY, none.as_ref(), None, Some(&to));
         assert!(conn.is_some());
         drop(conn);
         let mut freed = false;
@@ -2946,7 +2983,7 @@ mod tests {
         std::thread::spawn(move || d.serve(d_r, |_, _| None));
         std::thread::spawn(move || {
             let none: Option<fn() -> Option<PathBuf>> = None;
-            host.serve(h_r, move |_, ch| open_stream(ch, none.as_ref(), Some(&to)))
+            host.serve(h_r, move |_, ch| open_stream(ch, none.as_ref(), None, Some(&to)))
         });
         let reply = send_on(&daemon, 1, proto::channel::CONTROL, b"op events-follow\nkey pr-1\n");
         assert_eq!(reply, b"status ok\nbody \nweb-1 pr-1\n");
@@ -3278,7 +3315,7 @@ mod tests {
             start_daemon(&name);
             let board = BridgeBoard::default();
             let none: Option<fn() -> Option<PathBuf>> = None;
-            let bridge = spawn_observed(&name, hash(arch).unwrap(), none, None, Some(board.spawning(&name))).unwrap();
+            let bridge = spawn_observed(&name, hash(arch).unwrap(), none, None, None, Some(board.spawning(&name))).unwrap();
             assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
             let link = board.link(&name).expect("published by the handshake");
             assert_ne!(link.caps & caps::RPC, 0);

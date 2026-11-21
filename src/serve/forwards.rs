@@ -1613,6 +1613,7 @@ forwardPorts = ["redis:6379"]
             phantom: "p".into(),
             listeners: vec![crate::credentials::instance::Listener { port: 29000, upstream: "sentry.io".into() }],
             files: Vec::new(),
+            git_hosts: Vec::new(),
         }];
         let why = broker_port_refusal(&state, "api", 29000).unwrap();
         assert!(why.contains("port 29000 of `api`"), "{why}");

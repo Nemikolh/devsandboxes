@@ -646,6 +646,7 @@ mod tests {
                         owner: "vscode".into(),
                         content: "[auth]\ntoken = sntrys_x\n".into(),
                     }],
+                    git_hosts: Vec::new(),
                 }],
                 intercept: Some(crate::credentials::instance::Intercept {
                     port: 29001,

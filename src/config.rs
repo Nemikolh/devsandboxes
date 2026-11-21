@@ -217,6 +217,12 @@ pub struct SandboxProperties {
     /// Policy the broker reads per call from the host's config, baked into
     /// nothing, so excluded from `config_hash`.
     pub access: Option<BTreeMap<String, Access>>,
+    /// The host agent's keys the relay offers while a git-host claim
+    /// applies (docs/architecture/helper/ssh-agent.md, *Key filtering*);
+    /// none by default. Read per agent connection, so excluded from
+    /// `config_hash`.
+    #[serde(rename = "ssh-keys")]
+    pub ssh_keys: Option<Vec<SshKey>>,
 
     // implemented devcontainer properties
     pub image: Option<String>,
@@ -324,6 +330,94 @@ pub struct Access {
     pub branches: Vec<String>,
     #[serde(rename = "as")]
     pub as_: Option<String>,
+}
+
+/// One `ssh-keys` entry: `{ key, destinations, signing-only }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawSshKey")]
+pub struct SshKey {
+    pub key: KeyRef,
+    /// `None`: any host, GitHub over ssh included. Hosts as `known_hosts`
+    /// names them (`host`, `[host]:port`).
+    pub destinations: Option<Vec<String>>,
+    pub signing_only: bool,
+}
+
+/// How an `ssh-keys` entry names an agent key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyRef {
+    /// `SHA256:<base64>` as `ssh-add -l` prints it; holds the base64.
+    Fingerprint(String),
+    /// The key blob of a public key line (`ssh-ed25519 AAAA… comment`).
+    Blob(Vec<u8>),
+}
+
+impl KeyRef {
+    pub fn matches(&self, blob: &[u8]) -> bool {
+        match self {
+            KeyRef::Blob(b) => b == blob,
+            KeyRef::Fingerprint(fp) => *fp == fingerprint_b64(blob),
+        }
+    }
+}
+
+/// The base64 part of an OpenSSH `SHA256:` fingerprint: unpadded.
+pub fn fingerprint_b64(blob: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let full = crate::broker::redact::base64(&Sha256::digest(blob));
+    String::from_utf8_lossy(&full).trim_end_matches('=').to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSshKey {
+    key: String,
+    destinations: Option<Vec<String>>,
+    #[serde(default, rename = "signing-only")]
+    signing_only: bool,
+}
+
+impl TryFrom<RawSshKey> for SshKey {
+    type Error = String;
+
+    fn try_from(raw: RawSshKey) -> Result<SshKey, String> {
+        let key = parse_key_ref(raw.key.trim())?;
+        match &raw.destinations {
+            Some(_) if raw.signing_only => {
+                return Err("`ssh-keys`: a `signing-only` key logs in nowhere, so it takes no `destinations`".into());
+            }
+            Some(d) if d.is_empty() => {
+                return Err("`ssh-keys`: `destinations` is empty: name hosts, or leave it out for every host".into());
+            }
+            Some(d) if d.iter().any(|h| h.is_empty() || h.contains(char::is_whitespace) || h.starts_with('-')) => {
+                return Err("`ssh-keys`: a destination is a host as `known_hosts` names it (`host`, `[host]:port`)".into());
+            }
+            _ => {}
+        }
+        Ok(SshKey { key, destinations: raw.destinations, signing_only: raw.signing_only })
+    }
+}
+
+fn parse_key_ref(s: &str) -> Result<KeyRef, String> {
+    if let Some(fp) = s.strip_prefix("SHA256:") {
+        let padded = format!("{fp}{}", "=".repeat((4 - fp.len() % 4) % 4));
+        return match crate::broker::redact::base64_decode(padded.as_bytes()) {
+            Some(digest) if digest.len() == 32 => Ok(KeyRef::Fingerprint(fp.to_string())),
+            _ => Err(format!("`ssh-keys`: `{s}` isn't a SHA256 fingerprint as `ssh-add -l` prints it")),
+        };
+    }
+    let mut words = s.split_whitespace();
+    let (Some(kind), Some(b64)) = (words.next(), words.next()) else {
+        return Err(format!("`ssh-keys`: `{s}` is neither a `SHA256:` fingerprint nor a public key line"));
+    };
+    let blob = crate::broker::redact::base64_decode(b64.as_bytes())
+        .ok_or_else(|| format!("`ssh-keys`: the public key line for `{kind}` has bad base64"))?;
+    // The blob opens with its own type name: a line whose two disagree was mangled.
+    let named = blob.get(..4).map(|n| u32::from_be_bytes([n[0], n[1], n[2], n[3]]) as usize);
+    if named.and_then(|n| blob.get(4..4 + n)) != Some(kind.as_bytes()) {
+        return Err(format!("`ssh-keys`: the public key line's blob isn't a `{kind}` key"));
+    }
+    Ok(KeyRef::Blob(blob))
 }
 
 /// `dispatcher = { spawn = [...], max-instances = N }`.
@@ -1472,8 +1566,8 @@ fn config_hash(table: &Table) -> String {
 
 /// [`config_hash`] of a merged sandbox table minus the keys that apply without
 /// recreating the container (`autostart`, `dispatcher`, `inbox`, `placement`,
-/// the host-side `forwardPorts`, `profiles` and `access`), so changing them
-/// isn't drift.
+/// the host-side `forwardPorts`, `profiles`, `access` and `ssh-keys`), so
+/// changing them isn't drift.
 fn sandbox_hash(table: &Table) -> String {
     let mut table = table.clone();
     table.remove("autostart");
@@ -1483,6 +1577,7 @@ fn sandbox_hash(table: &Table) -> String {
     table.remove("forwardPorts");
     table.remove("profiles");
     table.remove("access");
+    table.remove("ssh-keys");
     if let Some(toml::Value::Table(folders)) = table.get_mut("folders") {
         normalize_folders(folders);
     }
@@ -2077,6 +2172,60 @@ folder = "../web"
             ("[sandbox.s.access.sentry]\ncredential = \"a.b\"\n", "credential name"),
         ] {
             let err = match Config::parse(bad) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => format!("{:#}", c.resolve_sandbox("s").unwrap_err()),
+            };
+            assert!(err.contains(wants), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn ssh_keys_parse_concatenate_and_are_excluded_from_config_hash() {
+        let mut blob = Vec::new();
+        for part in [&b"ssh-ed25519"[..], &[7u8; 32][..]] {
+            blob.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            blob.extend_from_slice(part);
+        }
+        let line = format!("ssh-ed25519 {} me@laptop", String::from_utf8(crate::broker::redact::base64(&blob)).unwrap());
+        let fp = fingerprint_b64(&blob);
+        let config = Config::parse(&format!(
+            r#"
+[template.base]
+ssh-keys = [{{ key = "SHA256:{fp}", destinations = ["gitlab.example.com", "[git.corp]:2222"] }}]
+
+[sandbox.web]
+extends = "base"
+folder = "../web"
+ssh-keys = [{{ key = "{line}", signing-only = true }}]
+"#
+        ))
+        .unwrap();
+        let web = config.resolve_sandbox("web").unwrap();
+        let keys = web.properties.ssh_keys.as_ref().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, KeyRef::Fingerprint(fp.clone()));
+        assert_eq!(keys[0].destinations.as_deref(), Some(&["gitlab.example.com".to_string(), "[git.corp]:2222".into()][..]));
+        assert!(!keys[0].signing_only);
+        assert_eq!(keys[1].key, KeyRef::Blob(blob.clone()));
+        assert!(keys[1].signing_only && keys[1].destinations.is_none());
+        assert!(keys.iter().all(|k| k.key.matches(&blob)));
+        assert!(!keys[0].key.matches(b"other"));
+
+        let bare = Config::parse("[sandbox.web]\nfolder = \"../web\"\n").unwrap();
+        assert_eq!(bare.resolve_sandbox("web").unwrap().config_hash, web.config_hash);
+
+        for (bad, wants) in [
+            (format!("key = \"SHA256:{fp}\", signing-only = true, destinations = [\"x\"]"), "takes no `destinations`"),
+            (format!("key = \"SHA256:{fp}\", destinations = []"), "is empty"),
+            (format!("key = \"SHA256:{fp}\", destinations = [\"-oProxyCommand=x\"]"), "as `known_hosts` names it"),
+            ("key = \"SHA256:short\"".into(), "isn't a SHA256 fingerprint"),
+            ("key = \"me@laptop\"".into(), "neither"),
+            (line.replace("ssh-ed25519 ", "ssh-rsa "), "isn't a `ssh-rsa` key"),
+            (format!("key = \"SHA256:{fp}\", comment = \"x\""), "comment"),
+        ] {
+            let bad = if bad.starts_with("key") { bad } else { format!("key = \"{bad}\"") };
+            let toml = format!("[sandbox.s]\nfolder = \".\"\nssh-keys = [{{ {bad} }}]\n");
+            let err = match Config::parse(&toml) {
                 Err(e) => format!("{e:#}"),
                 Ok(c) => format!("{:#}", c.resolve_sandbox("s").unwrap_err()),
             };
