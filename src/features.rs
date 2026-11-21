@@ -20,6 +20,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::config::Mount;
+use crate::credentials::claim::{self, Claim};
 
 /// The layer mediaType carrying a feature's tarball.
 const FEATURE_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
@@ -326,6 +327,11 @@ pub struct FeatureMetadata {
     pub privileged: Option<bool>,
     #[serde(default, rename = "documentationURL")]
     pub documentation_url: Option<String>,
+    #[serde(default)]
+    customizations: Option<serde_json::Value>,
+    /// Validated at parse.
+    #[serde(skip)]
+    pub credentials: Vec<Claim>,
 }
 
 /// One entry in a feature's `options` map. Only `default` is acted on for now;
@@ -339,7 +345,10 @@ pub struct FeatureOption {
 
 impl FeatureMetadata {
     fn parse(json: &str) -> Result<Self> {
-        serde_json::from_str(json).context("invalid devcontainer-feature.json")
+        let mut md: Self = serde_json::from_str(json).context("invalid devcontainer-feature.json")?;
+        let feature = md.id.clone().unwrap_or_else(|| "(no id)".to_string());
+        md.credentials = claim::from_customizations(&feature, md.customizations.take().as_ref())?;
+        Ok(md)
     }
 
     fn read(path: &Path) -> Result<Self> {
@@ -1188,6 +1197,22 @@ mod tests {
         assert_eq!(resolved.kind, "bind");
         assert_eq!(resolved.source.as_deref(), Some("/var/run/docker.sock"));
         assert_eq!(resolved.target, "/var/run/docker-host.sock");
+    }
+
+    #[test]
+    fn metadata_reads_credential_claims() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/sentry");
+        let md = FeatureMetadata::read(&dir.join("devcontainer-feature.json")).unwrap();
+        assert_eq!(md.credentials.len(), 1);
+        assert_eq!(md.credentials[0].kind, "sentry");
+        assert!(md.customizations.is_none());
+
+        let md = FeatureMetadata::parse(r#"{"id": "node", "customizations": {"vscode": {}}}"#).unwrap();
+        assert!(md.credentials.is_empty());
+
+        let bad = r#"{"id": "x", "customizations": {"devsandbox": {"credentials": {"sentry": {"mode": "base-url"}}}}}"#;
+        let e = format!("{:#}", FeatureMetadata::parse(bad).unwrap_err());
+        assert!(e.contains("feature `x`: credential `sentry`: `upstreams` is required"), "{e}");
     }
 
     #[test]

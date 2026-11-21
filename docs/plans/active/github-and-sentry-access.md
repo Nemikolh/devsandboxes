@@ -59,6 +59,11 @@ phantoms. One feature per instance claims a given credential
 | `ca` | a CA knob devsandbox doesn't set by default, if the tool has one |
 
 Data only: a claim can't run anything on the home or a member.
+`credentials` is keyed by the kind, unknown fields are refused, `baseUrl`
+points at the first upstream listed, `inject`'s `format` and phantom file
+templates take `{token}`, `{phantom}` and (`base-url` only) `{baseUrl}`,
+each `rewrite` entry names its route and field paths, and a route is in
+one scope or `never`, never both (`credentials::claim`).
 
 The home binds the secret to its destination. It pins the whole claim but
 its container-side wiring (`phantom`, `baseUrl`, `ca`, `git`: the
