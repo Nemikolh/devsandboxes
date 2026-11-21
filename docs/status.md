@@ -12,7 +12,11 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **credentials**: the broker's first step and sentry-cli brokered locally
+  in base-URL mode (credential-broker step 1, github-and-sentry-access
+  step 1), on the way to gh and git through the broker (credential-broker
+  steps 2-3, git-gateway step 1, github-and-sentry-access step 2).
+  → [plan](plans/active/credential-broker.md)
 
 ## Planned
 
@@ -35,6 +39,13 @@ is frozen: no new work on it.
 - **runtimes**: `isolation = "gvisor"` on a sandbox or template (runsc on
   docker/podman, refused where the host can't), Kata after.
   → [plan](plans/active/isolation.md)
+- **credentials**: no secret in any sandbox: a broker in `serve` swaps
+  per-instance phantoms for credentials kept at their home member, under
+  per-sandbox policy; after gh: permission requests, `CRED` over the
+  fleet, signed policy, delegation, git push rules and clones.
+  → [plan](plans/active/credential-broker.md); per tool:
+  [gh and sentry-cli](plans/active/github-and-sentry-access.md),
+  [git over smart HTTP, clones replacing worktrees](plans/active/git-gateway.md)
 
 - **helper**: daemon-owned runs (registry, run-state events, a `queued`
   state) with a restart policy, worktree stand-ins, container → host
@@ -155,13 +166,8 @@ is frozen: no new work on it.
 - **instances**: repeat-instance worktrees in a container volume instead
   of a host bind (ownership stops mattering, faster I/O on VM-backed
   runtimes; the host reaches them through `host_git` and the helper).
-- **credentials**: no secret in any sandbox: a broker in `serve` swaps
-  per-instance phantoms for credentials kept at their home member, under
-  per-sandbox policy and permission requests.
-  → [explore](plans/explore/credential-broker.md); per tool:
-  [gh and sentry-cli](plans/explore/github-and-sentry-access.md),
-  [git over smart HTTP, clones replacing worktrees](plans/explore/git-gateway.md),
-  [agents](plans/explore/agent-credentials.md).
+- **credentials** (agents): zidane's and other agents' credentials through
+  the broker. → [explore](plans/explore/agent-credentials.md)
 - **instances**: auto-mount a shared `.agents/skills` folder read-only into
   every instance. → [plan](plans/explore/agents-skills.md)
 - **daemon**: `rename`, `profile`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
@@ -290,13 +296,13 @@ is frozen: no new work on it.
 - Host git checks a repo's git dirs and config, then runs: a container
   running at the same time can swap a file (a symlink, `gitdir:`,
   `commondir`, config) in between. Fixed by clones replacing worktrees
-  ([git-gateway](plans/explore/git-gateway.md)).
+  ([git-gateway](plans/active/git-gateway.md)).
   → [mounts](architecture/instances/mounts-and-state.md#host-git); `run::git::check_repo`
 - Repeat instances and `folders` worktrees bind-mount the base repo's
   `.git` read-write, so one sandbox can rewrite another's branches and
   shared config, or plant code (`core.fsmonitor`, a `build.rs`) that runs
   in another sandbox on the same checkout. Fixed by clones replacing
-  worktrees ([git-gateway](plans/explore/git-gateway.md)).
+  worktrees ([git-gateway](plans/active/git-gateway.md)).
   → [worktrees](architecture/instances/worktrees.md); `run::worktree::git_companion_mount`
 - The origin URL is trusted on first use: a repo whose `remote.origin.url`
   a sandbox rewrote before its first host fetch gets the rewritten URL

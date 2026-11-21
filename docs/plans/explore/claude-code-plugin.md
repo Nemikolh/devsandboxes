@@ -243,7 +243,7 @@ shell's.
   hook and MCP server does: they're the trusted base, so both are the
   `devsandbox` binary, not scripts.
 - Credentials in containers stay a config matter
-  ([credential-broker](credential-broker.md)).
+  ([credential-broker](../active/credential-broker.md)).
 
 ## Packaging
 

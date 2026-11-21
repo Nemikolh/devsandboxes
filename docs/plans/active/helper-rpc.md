@@ -210,10 +210,10 @@ Each ships alone; 1-3 already fix "runs depend on a host exec".
 5. **Restart policy**: `restart`/`max-restarts`/backoff, relaunch of
    `lost` runs at boot, `DEVSBD_RUN_ATTEMPT`, `resume-argv`; surfaced in
    `devsbd exec` flags and the control op.
-6. **`worktrees.sync`** (moot if [git-gateway](../explore/git-gateway.md)'s
+6. **`worktrees.sync`** (moot if [git-gateway](git-gateway.md)'s
    clones replace worktrees).
 7. **Container → host `RPC`**, only if `CONTROL` migrates (the
-   [credential-broker](../explore/credential-broker.md) uses the
+   [credential-broker](credential-broker.md) uses the
    `HTTP_PROXY` channel instead).
 8. **Sessions over RPC**: `session.attach` / `session.ls` / `session.rm`,
    the daemon connecting to the session's `sock` as a client (the

@@ -1,6 +1,6 @@
 # Git gateway
 
-Status: explored, not agreed. Builds on
+Status: agreed; building step 1, the rest after. Builds on
 [credential-broker](credential-broker.md) (intercept mode, phantoms, the
 repo fence). Design and diagrams:
 [Credentials and access](../../../site/src/content/architecture/secrets.mdx),

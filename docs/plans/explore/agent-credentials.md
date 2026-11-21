@@ -1,9 +1,9 @@
 # Agent credentials
 
 Status: explored, not agreed. zidane first, any coding agent after. Needs
-[credential-broker](credential-broker.md) (base-URL and intercept modes,
+[credential-broker](../active/credential-broker.md) (base-URL and intercept modes,
 permission requests, `CRED` over the fleet); its GitHub side is
-[github-and-sentry-access](github-and-sentry-access.md). Design and
+[github-and-sentry-access](../active/github-and-sentry-access.md). Design and
 diagrams: [Credentials and access](../../../site/src/content/architecture/secrets.mdx),
 *zidane and other agents*.
 
@@ -162,7 +162,7 @@ subscription OAuth.
   policy or a container (credential-broker, *`presence`*). Unattended,
   they wait out the hold and are refused. Git pushes too, as a tag push
   is a release where CI publishes on tags: the gateway holds a push to a
-  `presence` ref form ([git-gateway](git-gateway.md)); gh's routes are
+  `presence` ref form ([git-gateway](../active/git-gateway.md)); gh's routes are
   github-and-sentry-access's.
 - **MCP servers over HTTP**: MCP fixes discovery, OAuth and JSON-RPC, so
   devsandbox carries one generic `mcp` claim, per server the config

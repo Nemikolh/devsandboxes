@@ -1,6 +1,7 @@
 # GitHub and Sentry access
 
-Status: explored, not agreed. Needs [credential-broker](credential-broker.md)
+Status: agreed; building steps 1-2, steps 3-4 after credential-broker's
+fleet steps. Needs [credential-broker](credential-broker.md)
 step 1 for sentry (step 1 here), its step 3 for gh (step 2 here), its
 step 4 for `ask` scopes (which answer 403 with the reason until
 then), its step 5 for remote sandboxes; its git half needs
@@ -148,7 +149,7 @@ drops the official feature, or two gh binaries race on `PATH`.
   lives on its host and travels in the signed claim (the member is trusted
   for it as for the instance's identity); a placed run takes the placing
   instance's. A dispatcher reaches its children's fences too
-  ([agent-credentials](agent-credentials.md)).
+  ([agent-credentials](../explore/agent-credentials.md)).
 - **Matching**: owner and repo compare case-insensitively, with `.git`
   and `.wiki.git` reduced to the repo. Owner, repo and
   `/repositories/{id}` are strict: an encoded character, a dot-segment or

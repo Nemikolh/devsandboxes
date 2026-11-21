@@ -41,7 +41,7 @@ the instance leak the same way.
 - A remote the user changes needs one `trust-origin`.
 - Checks race a container rewriting files between check and use; only
   removing the shared, container-writable git dir closes that (clones,
-  `docs/plans/explore/git-gateway.md`).
+  `docs/plans/active/git-gateway.md`).
 - Rejected: host git with global and system config off (loses the
   credential helpers and `insteadOf` legitimate fetches need), refusing
   every fetch while a sandbox is running.
