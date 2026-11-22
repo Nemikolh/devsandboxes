@@ -1,6 +1,6 @@
 {
   "id": "sentry",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "sentry-cli, brokered (test fixture)",
   "description": "Test fixture mirroring github.com/devsandboxes/features' src/sentry: the same metadata and claim (docs/plans/active/github-and-sentry-access.md, sentry-cli), keep them in step. Its install.sh installs nothing.",
   "options": {
@@ -8,12 +8,27 @@
       "type": "string",
       "proposals": ["latest"],
       "default": "latest",
-      "description": "sentry-cli version to install (a release like 3.8.2, or latest)."
+      "description": "sentry-cli version baked into the image (a release like 3.8.2, or latest). The version devsandbox's `sentry` update made current runs instead."
     }
   },
   "containerEnv": { "SENTRY_DISABLE_UPDATE_CHECK": "true" },
+  "mounts": [
+    {
+      "type": "bind",
+      "source": "${sharedVolumes}/sentry-bin",
+      "target": "/var/lib/devsandbox/sentry/bin",
+      "readonly": true
+    }
+  ],
   "customizations": {
     "devsandbox": {
+      "updates": [
+        {
+          "name": "sentry",
+          "mount": "/var/lib/devsandbox/sentry/bin",
+          "command": ["/usr/local/lib/sentry/sentry-update", "/var/lib/devsandbox/sentry/bin"]
+        }
+      ],
       "credentials": {
         "sentry": {
           "upstreams": ["sentry.io", "us.sentry.io", "de.sentry.io"],
