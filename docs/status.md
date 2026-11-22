@@ -40,8 +40,8 @@ is frozen: no new work on it.
   per-sandbox policy. Built locally: sentry-cli, gh and git (credential-broker
   steps 1-3, github-and-sentry-access steps 1-2, git-gateway step 1). Next:
   permission requests, `CRED` over the fleet (then the live config drops its
-  gh and sentry mounts), signed policy, delegation and installation tokens,
-  git push rules and clones.
+  gh and sentry mounts), signed policy, delegation, git push rules and
+  clones.
   → [plan](plans/active/credential-broker.md); per tool:
   [gh and sentry-cli](plans/active/github-and-sentry-access.md),
   [git over smart HTTP, clones replacing worktrees](plans/active/git-gateway.md)
@@ -125,6 +125,12 @@ is frozen: no new work on it.
 
 ## Parked
 
+- **credentials**: GitHub App installation tokens (`as = "app"`,
+  `login github --app`; github-and-sentry-access steps 3-4): most users
+  work in orgs where they can't install an app, so a narrow fine-grained
+  PAT stays the way to keep gh's reach small. `as = "app"` and
+  `github-app-manifest` logins parse and are refused.
+  → [plan](plans/active/github-and-sentry-access.md); `credentials::tokens`
 - **runtimes**: GPU CI: a job on a self-hosted GPU runner running a
   sandbox and a service with `hostRequirements.gpu` on docker, rootless
   docker and podman, behind a test gate of its own (the `CI` rule would

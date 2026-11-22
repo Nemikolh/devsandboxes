@@ -479,10 +479,11 @@ only a note when the repo is public (a reference clone in `folders`).
    read-only mount: the config mounts it), multi-segment route
    variables (paths are listed per depth), Projects, discussion
    comments by id, and `gh repo fork` (REST body inputs).
-3. `devsandbox login github --app` (manifest and install), installation
-   tokens per instance and installation (`as = "app"`, `repository_ids`
-   and `permissions`).
-4. Installation tokens delegated to members.
+3. Parked: most users work in orgs where they can't install an app
+   ([status](../../status.md#parked)). `devsandbox login github --app`
+   (manifest and install), installation tokens per instance and
+   installation (`as = "app"`, `repository_ids` and `permissions`).
+4. Parked with step 3: installation tokens delegated to members.
 
 ## Open questions
 
