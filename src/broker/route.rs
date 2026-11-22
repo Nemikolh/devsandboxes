@@ -187,6 +187,12 @@ pub fn lfs_batch(m: &str, target: &str) -> bool {
     m == "POST" && path_only(target).ends_with("/info/lfs/objects/batch")
 }
 
+/// A GraphQL request (`POST /graphql`), decided by its document when the
+/// claim has GraphQL routes ([`Pinned::graphql`]).
+pub fn graphql(m: &str, target: &str) -> bool {
+    m == "POST" && path_only(target) == claim::GRAPHQL_PATH
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LfsOp {
     Download,

@@ -904,6 +904,98 @@ fn a_renamed_repo_is_pinned_and_called_by_its_current_name() {
     assert_eq!((state.github_ids["o/r"].id, state.github_ids["o/r"].node_id.as_str()), (42, "R_42"));
 }
 
+/// GitHub for the fence's own lookups (`o/r` is id 42, node `R_7` is
+/// `x/y`); the tool's calls echoed.
+fn github_api(head: &str, body: &[u8]) -> Vec<u8> {
+    let answer = |s: &str| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{s}", s.len()).into_bytes();
+    let broker = head.contains("User-Agent: devsandbox-broker");
+    match head.split(' ').nth(1).unwrap() {
+        "/repos/o/r" if broker => answer(r#"{"id":42,"node_id":"R_42","full_name":"o/r"}"#),
+        "/graphql" if broker => {
+            answer(r#"{"data":{"node":{"__typename":"Repository","databaseId":7,"id":"R_7","nameWithOwner":"x/y"}}}"#)
+        }
+        _ => echo(head, body),
+    }
+}
+
+#[test]
+fn graphql_goes_upstream_byte_identical_once_decided() {
+    let (port, seen) = upstream_server(github_api);
+    let rig = Rig::fenced("graphql", port);
+    let mut ca = MemberCa::load_or_create(&rig.dir.join("data")).unwrap();
+    ca.ensure_hosts(&BTreeSet::from(["api.github.com".to_string()])).unwrap();
+    let mut c = rig.intercept_to("api.github.com", 443, Some("api.github.com"), &[b"http/1.1"]).unwrap();
+    let auth = format!("Authorization: token {GH}\r\n");
+
+    let viewer = br#"{"query":"query { viewer { login } }"}"#;
+    assert_eq!(c.call("POST", "/graphql", &auth, viewer).status, 200);
+    let pr = br#"{ "query": "mutation($input: CreatePullRequestInput!) { createPullRequest(input: $input) { pullRequest { url } } }",
+        "variables": { "input": { "repositoryId": "R_42", "baseRefName": "main", "headRefName": "x", "title": "t" } } }"#;
+    let a = c.call("POST", "/graphql", &auth, pr);
+    assert_eq!(a.status, 200, "{a:?}");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(viewer).unwrap();
+    let gz = gz.finish().unwrap();
+    assert_eq!(c.call("POST", "/graphql", &format!("{auth}Content-Encoding: gzip\r\n"), &gz).status, 200);
+
+    let tool = tool_calls(&seen);
+    assert_eq!(tool.len(), 3, "{tool:?}");
+    for ((head, body), sent) in tool.iter().zip([&viewer[..], &pr[..], &gz[..]]) {
+        assert_eq!(body, sent, "{head}");
+        assert!(head.starts_with("POST /graphql HTTP/1.1\r\n") && head.contains(&format!("\r\nAuthorization: token {TOKEN}\r\n")), "{head}");
+    }
+    assert!(tool[2].0.contains("\r\nContent-Encoding: gzip\r\n"), "{}", tool[2].0);
+
+    // Outside the fence, a batch, a body that doesn't decode: refused before
+    // the tool's call goes anywhere. A refusal with a body closes.
+    let refused = |extra: &str, body: &[u8]| {
+        let mut c = rig.intercept_to("api.github.com", 443, Some("api.github.com"), &[b"http/1.1"]).unwrap();
+        c.call("POST", "/graphql", &format!("{auth}{extra}"), body)
+    };
+    let out = br#"{"query":"mutation { createPullRequest(input: {repositoryId: \"R_42\", headRepositoryId: \"R_7\"}) { clientMutationId } }"}"#;
+    let a = refused("", out);
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(a.json()["message"].as_str().unwrap().contains("names `x/y`, outside the instance's repo fence"), "{:?}", a.json());
+    let a = refused("", br#"[{"query":"{ a }"}]"#);
+    assert_eq!(a.status, 400, "{a:?}");
+    assert!(a.json()["message"].as_str().unwrap().contains("a batch of GraphQL requests"));
+    let a = refused("Content-Encoding: gzip\r\n", viewer);
+    assert_eq!(a.status, 400, "{a:?}");
+    assert_eq!(tool_calls(&seen).len(), 3);
+
+    let log = rig.log(6);
+    let scopes: Vec<_> = log.iter().map(|l| (l["verdict"].as_str().unwrap(), l["scope"].as_str())).collect();
+    assert_eq!(
+        scopes,
+        [
+            ("allow", Some("api.read")),
+            ("allow", Some("pr.write")),
+            ("allow", Some("api.read")),
+            ("refused", Some("pr.write")),
+            ("refused", None),
+            ("refused", None)
+        ]
+    );
+}
+
+#[test]
+fn a_graphql_body_past_the_bound_is_refused() {
+    let (port, seen) = upstream_server(github_api);
+    let rig = Rig::fenced("graphql-big", port);
+    let mut ca = MemberCa::load_or_create(&rig.dir.join("data")).unwrap();
+    ca.ensure_hosts(&BTreeSet::from(["api.github.com".to_string()])).unwrap();
+    let mut c = rig.intercept_to("api.github.com", 443, Some("api.github.com"), &[b"http/1.1"]).unwrap();
+    let head = format!(
+        "POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token {GH}\r\nContent-Length: {}\r\n\r\n",
+        graphql::MAX_BODY + 1
+    );
+    c.write(head.as_bytes());
+    let a = c.read();
+    assert_eq!(a.status, 413, "{a:?}");
+    assert!(c.closed());
+    assert!(seen.lock().unwrap().is_empty());
+}
+
 const STORAGE_AUTH: &str = "RemoteAuth STORAGE-secret-42";
 const SIG: &str = "X-Amz-Signature=SIG0123456789";
 const BATCH: &str = "/o/r.git/info/lfs/objects/batch";

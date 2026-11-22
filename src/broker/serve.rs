@@ -39,7 +39,7 @@ use super::policy::{self, Action, Call, Context, Injection, Sources};
 use super::redact::Secrets;
 use super::refusal::{Refusal, reason_phrase};
 use super::upstream::{self, Body, Length, Request, Response, Upstream, UpstreamError};
-use super::{github, guard, intercept, lfs, rewrite, route};
+use super::{github, graphql, guard, intercept, lfs, rewrite, route};
 use crate::config::{Access, Config};
 use crate::credentials::ca::{Leaf, MemberCa};
 use crate::credentials::claim::{self, Refusal as Shape, Slot};
@@ -344,8 +344,23 @@ impl Service {
                 }
             }
         }
-        let call = Call { caller, header, head: &head, lfs: batch.as_ref().map(|(_, op)| *op) };
-        let pre = batch.map(|(body, _)| body);
+        let mut gql = None;
+        if route::graphql(&head.method, head.target.path()) && instance_claim(&state, caller, header).is_some_and(|c| c.graphql()) {
+            match graphql_body(&head, conn)? {
+                Ok(read) => gql = Some(read),
+                Err((r, close)) => {
+                    self.refuse(conn.get_mut(), &r, shape.as_ref(), close, &mut line)?;
+                    return Ok(!close);
+                }
+            }
+        }
+        let call = Call {
+            caller,
+            header,
+            head: &head,
+            lfs: batch.as_ref().map(|(_, op)| *op),
+            graphql: gql.as_ref().map(|(_, op)| op),
+        };
         let token = |credential: &str| {
             let now = Instance::now();
             self.renewer.token(credential, now, &self.refresher(now)).ok().map(|f| f.token)
@@ -362,6 +377,7 @@ impl Service {
             now: Instance::now(),
         });
         let outcome = policy::decide(&call, &state, &Files { data: &self.data, github: live });
+        let pre = batch.map(|(body, _)| body).or(gql.map(|(body, _)| body));
         let cx = outcome.context;
         line.incarnation = cx.incarnation.clone();
         line.kind = cx.kind.clone();
@@ -942,13 +958,20 @@ impl Broker for Service {
 /// The instance's claim shape for the listener or intercepted host, for
 /// refusals before policy.
 fn claim_shape(state: &State, caller: &Caller, header: &ProxyHeader) -> Option<Shape> {
+    instance_claim(state, caller, header)?.refusal
+}
+
+/// The instance's claim for the listener or intercepted host. Its version
+/// names the approved copy policy uses, so the two agree on what to read
+/// before policy.
+fn instance_claim(state: &State, caller: &Caller, header: &ProxyHeader) -> Option<claim::Pinned> {
     let inst = state.instances.get(&caller.instance).filter(|i| i.instance_id == caller.instance_id)?;
     let c = match header {
         ProxyHeader::BaseUrl { listener, .. } => instance::by_port(&inst.claims, *listener)?.0,
         ProxyHeader::Intercept { host, port } => policy::intercept_claim(inst, host, *port)?,
         ProxyHeader::Lfs { .. } => return None,
     };
-    claim::from_canonical(&c.claim).ok()?.1.refusal
+    Some(claim::from_canonical(&c.claim).ok()?.1)
 }
 
 /// A batch's body and its `operation`, else the refusal and whether the
@@ -981,6 +1004,40 @@ fn batch_body(head: &RequestHead, conn: &mut Conn) -> io::Result<BatchBody> {
     match route::lfs_operation(&body) {
         Ok(op) => Ok(Ok((body, op))),
         Err(why) => Ok(Err((Refusal::new(400, "refused", why), !head.keep_alive()))),
+    }
+}
+
+/// A GraphQL request's body as sent and its operation, else the refusal and
+/// whether the connection closes after it.
+type GraphqlBody = Result<(Vec<u8>, graphql::Operation), (Refusal, bool)>;
+
+/// A GraphQL request's body, read whole before policy (its operation is the
+/// call's route), after the `100 Continue` it asked for: within
+/// [`graphql::MAX_BODY`] as sent and decoded, then [`graphql::parse`]d.
+/// The bytes as sent go upstream.
+fn graphql_body(head: &RequestHead, conn: &mut Conn) -> io::Result<GraphqlBody> {
+    let too_large = || Refusal::new(413, "refused", format!("a GraphQL body over {} bytes", graphql::MAX_BODY));
+    if matches!(head.framing, Framing::Length(n) if n > graphql::MAX_BODY) {
+        return Ok(Err((too_large(), true)));
+    }
+    if head.expect_continue {
+        conn.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        conn.get_mut().flush()?;
+    }
+    let mut body = Vec::new();
+    let mut reader = BodyReader::new(&mut *conn, head.framing);
+    if let Err(e) = (&mut reader).take(graphql::MAX_BODY + 1).read_to_end(&mut body) {
+        let Some(why) = super::refusal(&e) else { return Err(e) };
+        return Ok(Err((Refusal::new(why.status(), "refused", why.to_string()), true)));
+    }
+    if body.len() as u64 > graphql::MAX_BODY {
+        return Ok(Err((too_large(), true)));
+    }
+    let close = !head.keep_alive();
+    let read = graphql::decode(&body, head::header(&head.headers, "content-encoding")).and_then(|d| graphql::parse(&d));
+    match read {
+        Ok(op) => Ok(Ok((body, op))),
+        Err(bad) => Ok(Err((Refusal::new(bad.status, "refused", bad.why), close))),
     }
 }
 

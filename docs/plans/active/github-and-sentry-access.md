@@ -71,8 +71,14 @@ one scope or `never`, never both (`credentials::claim`). A route's
 *Matching* says); a route may end in one `?name=value` the request's query
 must hold exactly once with that raw value, other parameters ignored
 (`GET /{repo}/info/refs?service=git-receive-pack`), and wins over the same
-route without one. A claim whose `fence` names any route is fenced: its
-`{repo}` routes are checked against the instance's repo fence.
+route without one. `graphql query` stands for every GraphQL query
+(never fenced) and `graphql mutation <name>` for one top-level mutation
+field; a claim with either lists no HTTP route on `/graphql`. A
+mutation's `fence` inputs are paths in its arguments
+(`input.repositoryId`, `input.branch.repositoryNameWithOwner`, `[]` for
+each element of a list): one named `…NameWithOwner` holds `owner/name`,
+any other a global or repository id. A claim whose `fence` names any route is fenced: its
+`{repo}` routes and its mutations' inputs are checked against the instance's repo fence.
 
 The home binds the secret to its destination. It pins the whole claim but
 its container-side wiring (`phantom`, `baseUrl`, `ca`, `git`: the

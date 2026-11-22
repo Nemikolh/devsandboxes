@@ -35,6 +35,10 @@
           "refusal": { "shape": "json", "field": "message" },
           "scopes": {
             "user.read": { "routes": ["GET /user"], "permissions": {} },
+            "api.read": {
+              "routes": ["graphql query", "GET /", "GET /rate_limit", "GET /meta"],
+              "permissions": {}
+            },
             "repo.read": {
               "routes": [
                 "GET /{repo}/info/refs?service=git-upload-pack",
@@ -55,13 +59,18 @@
                 "POST /{repo}/git-receive-pack",
                 "POST /{repo}/info/lfs/locks",
                 "POST /{repo}/info/lfs/locks/verify",
-                "POST /{repo}/info/lfs/locks/{id}/unlock"
+                "POST /{repo}/info/lfs/locks/{id}/unlock",
+                "graphql mutation createCommitOnBranch"
               ],
               "permissions": { "contents": "write" }
             },
             "pr.write": {
-              "routes": ["POST /repos/{repo}/pulls"],
+              "routes": ["POST /repos/{repo}/pulls", "graphql mutation createPullRequest"],
               "permissions": { "pull_requests": "write" }
+            },
+            "issues.write": {
+              "routes": ["graphql mutation addComment"],
+              "permissions": { "issues": "write" }
             }
           },
           "never": [
@@ -71,7 +80,10 @@
           ],
           "fence": {
             "POST /repos/{repo}/pulls": ["{repo}"],
-            "GET /repositories/{id}": ["{id}"]
+            "GET /repositories/{id}": ["{id}"],
+            "graphql mutation createPullRequest": ["input.repositoryId", "input.headRepositoryId"],
+            "graphql mutation addComment": ["input.subjectId"],
+            "graphql mutation createCommitOnBranch": ["input.branch.repositoryNameWithOwner", "input.branch.id"]
           }
         }
       }

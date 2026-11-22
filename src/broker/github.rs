@@ -45,7 +45,6 @@ const MAX_BODY: u64 = 1024 * 1024;
 
 /// The `node(id:)` query: a repository, or the repository of an object
 /// that has one.
-#[allow(dead_code)] // Until GraphQL mutations are attributed by their ids.
 const NODE_QUERY: &str = "query($id:ID!){node(id:$id){__typename \
     ...on Repository{databaseId id nameWithOwner} \
     ...on RepositoryNode{repository{databaseId id nameWithOwner}} \
@@ -96,7 +95,6 @@ pub trait Lookup {
     /// `node(id:)`: the repository a global id names or belongs to. Only a
     /// repository's answer may be cached: any other object can move (a
     /// transferred issue keeps its id).
-    #[allow(dead_code)] // Until GraphQL mutations are attributed by their ids.
     fn node(&self, via: &Via<'_>, node_id: &str) -> Option<RepoRef>;
     /// Records `repo`'s pin unless it has one.
     fn pin(&self, repo: &str, to: &RepoRef);
@@ -179,7 +177,6 @@ impl<'a> Fence<'a> {
     /// no call; else the repository `node(id:)` resolves it to, placed by
     /// its id. `Ok`: in, with the repository (`full_name` the entry's for
     /// a pinned one); `Err`: out, with the repository when it resolved.
-    #[allow(dead_code)] // Until GraphQL mutations are attributed by their ids.
     pub fn place_node(&mut self, node_id: &str) -> Result<RepoRef, Option<RepoRef>> {
         let entries: Vec<String> = self.names.iter().cloned().collect();
         for e in &entries {
@@ -274,7 +271,6 @@ pub fn fetch_id(t: &dyn Transport, via: &Via<'_>, id: u64) -> Fetched {
 }
 
 /// `node(id:)` over GraphQL, and whether the node is the repository itself.
-#[allow(dead_code)] // Until GraphQL mutations are attributed by their ids.
 pub fn fetch_node(t: &dyn Transport, via: &Via<'_>, node_id: &str) -> (Fetched, bool) {
     let body = serde_json::json!({ "query": NODE_QUERY, "variables": { "id": node_id } }).to_string();
     let a = match t.call(via, "POST", "/graphql", Some(body.as_bytes())) {
@@ -284,7 +280,6 @@ pub fn fetch_node(t: &dyn Transport, via: &Via<'_>, node_id: &str) -> (Fetched, 
     parse_node(&a.body)
 }
 
-#[allow(dead_code)] // Until GraphQL mutations are attributed by their ids.
 pub fn parse_node(body: &[u8]) -> (Fetched, bool) {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]

@@ -134,7 +134,7 @@ impl Case {
             parse_head(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{extra}\r\n", self.port).as_bytes())
                 .unwrap();
         let header = ProxyHeader::BaseUrl { upstream: self.upstream.clone(), listener: self.port };
-        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, &self.state, &self.src)
+        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &self.state, &self.src)
     }
 
     fn get(&self, path: &str, extra: &str) -> Outcome {
@@ -375,7 +375,7 @@ fn scopes_never_other_ask_and_defaults() {
 fn through(state: &State, src: &Src, host: &str, port: u16, path: &str, extra: &str) -> Outcome {
     let head = parse_head(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, state, src)
 }
 
 #[test]
@@ -423,7 +423,7 @@ fn intercept_leaks_and_mode_mismatches() {
     let head = parse_head(format!("GET /user HTTP/1.1\r\nHost: 127.0.0.1:{listener}\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
         .unwrap();
     let header = ProxyHeader::BaseUrl { upstream: "api.github.com".into(), listener };
-    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, &state, &src);
+    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &state, &src);
     refused(&o, &format!("port {listener} is no broker listener for `api.github.com`"));
 }
 
@@ -448,7 +448,7 @@ pub(crate) fn git_basic(p: &str) -> String {
 fn fenced(src: &Src, method: &str, host: &str, path: &str, extra: &str) -> Outcome {
     let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, &fenced_state(), src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &fenced_state(), src)
 }
 
 const UPLOAD_REFS: &str = "/o/r.git/info/refs?service=git-upload-pack";
@@ -539,7 +539,7 @@ fn batch(state: &State, src: &Src, path: &str, op: Option<route::LfsOp>) -> Outc
     let head = parse_head(format!("POST {path} HTTP/1.1\r\nHost: github.com\r\n{}Content-Length: 2\r\n\r\n", git_basic(GH)).as_bytes())
         .unwrap();
     let header = ProxyHeader::Intercept { host: "github.com".into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: op }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: op, graphql: None }, state, src)
 }
 
 #[test]
@@ -684,7 +684,7 @@ fn resolving(state: &State, src: &Resolving, method: &str, host: &str, path: &st
     let auth = if host == "github.com" { git_basic(GH) } else { format!("Authorization: token {GH}\r\n") };
     let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{auth}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, state, src)
 }
 
 #[test]
@@ -720,6 +720,7 @@ fn repository_ids_are_placed_by_the_fences_pins() {
             head: &parse_head(format!("GET /repositories/42 HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
                 .unwrap(),
             lfs: None,
+            graphql: None,
         },
         &pinned,
         &fenced_src(None),
@@ -768,4 +769,130 @@ fn a_claim_without_api_github_com_matches_names_only() {
     let o = resolving(&fenced_state(), &src, "GET", "github.com", UPLOAD_REFS);
     assert_eq!(injected(&o).path, None);
     assert!(src.fake.calls.borrow().is_empty());
+}
+
+/// `POST /graphql` to `api.github.com` with `body` read as the serve layer
+/// reads it.
+fn gql(state: &State, src: &dyn Sources, body: serde_json::Value) -> Outcome {
+    let op = graphql::parse(body.to_string().as_bytes()).unwrap();
+    let head = parse_head(
+        format!("POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token {GH}\r\nContent-Length: 2\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: Some(&op) }, state, src)
+}
+
+fn gql_src(access: Option<Access>) -> Resolving {
+    use github::tests::{Fake, repo};
+    let mut fake = Fake::default().with(repo(42, "o/r"), &["o/r"]).with(repo(7, "x/y"), &["x/y"]);
+    fake.nodes.insert("I_in".into(), repo(42, "o/r"));
+    fake.nodes.insert("I_out".into(), repo(7, "x/y"));
+    Resolving { src: fenced_src(access), fake }
+}
+
+const CREATE_PR: &str = "mutation($input: CreatePullRequestInput!) { createPullRequest(input: $input) { pullRequest { url } } }";
+
+#[test]
+fn graphql_queries_are_repo_less_reads() {
+    let state = fenced_state();
+    let viewer = serde_json::json!({ "query": "query { viewer { login } }" });
+    let o = gql(&state, &gql_src(None), viewer.clone());
+    injected(&o);
+    assert_eq!((o.context.scope.as_deref(), o.context.outside.as_deref()), (Some("api.read"), None));
+    let ask = gql_src(Some(Access { ask: vec!["api.read".into()], ..Access::default() }));
+    refused(&gql(&state, &ask, viewer.clone()), "scope `api.read` is in `access.github.ask`, but `POST /graphql` names no repo, so it's never asked");
+
+    // A claim without `graphql query`: queries are `other`.
+    let mut no_query = crate::credentials::home::tests::github();
+    no_query.pinned.scopes.get_mut("api.read").unwrap().routes.retain(|r| *r != claim::Route::GraphqlQuery);
+    let mut src = gql_src(None);
+    src.src.home.get_mut("github-work").unwrap().approved[0].claim = no_query.canonical();
+    let o = gql(&state, &src, viewer);
+    refused(&o, "`graphql query` is in no scope of the `github` claim (scope `other`)");
+    assert_eq!(o.context.scope.as_deref(), Some("other"));
+
+    // The serve layer reads every GraphQL body of a claim with GraphQL routes.
+    let head = parse_head(format!("POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
+        .unwrap();
+    let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
+    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &state, &gql_src(None));
+    assert_eq!(refused(&o, "its document unread").status, 500);
+}
+
+#[test]
+fn graphql_mutations_are_placed_by_their_fence_inputs() {
+    let state = fenced_state();
+    let pr = |input: serde_json::Value| serde_json::json!({ "query": CREATE_PR, "variables": { "input": input } });
+
+    // A repository node id is matched against the pin: no `node` call.
+    let src = gql_src(None);
+    let o = gql(&state, &src, pr(serde_json::json!({ "repositoryId": "R_42", "headRepositoryId": "R_42", "title": "t" })));
+    assert_eq!((injected(&o).path.as_deref(), o.context.scope.as_deref()), (None, Some("pr.write")));
+    assert!(!src.fake.calls.borrow().iter().any(|c| c.starts_with("node")), "{:?}", src.fake.calls.borrow());
+
+    // Another object's id is resolved to its repository.
+    let comment = |id: &str| serde_json::json!({ "query": format!("mutation {{ addComment(input: {{subjectId: \"{id}\", body: \"b\"}}) {{ clientMutationId }} }}") });
+    let o = gql(&state, &src, comment("I_in"));
+    assert_eq!(o.context.scope.as_deref(), Some("issues.write"));
+    injected(&o);
+    assert!(src.fake.calls.borrow().contains(&"node I_in".to_string()));
+
+    // Outside the fence a mutation is refused, never stripped.
+    let o = gql(&state, &src, pr(serde_json::json!({ "repositoryId": "R_42", "headRepositoryId": "R_7" })));
+    let r = refused(&o, "`createPullRequest`'s `input.headRepositoryId` names `x/y`, outside the instance's repo fence");
+    assert_eq!(r.todo.as_deref(), Some("add `x/y` to `access.github.repos` in the sandbox's config"));
+    refused(&gql(&state, &src, comment("I_out")), "names `x/y`, outside");
+    let o = gql(&state, &src, comment("I_nothing"));
+    refused(&o, "`addComment`'s `input.subjectId` holds `I_nothing`, which doesn't resolve to a repository (scope `other`)");
+    assert_eq!(o.context.scope.as_deref(), Some("other"));
+
+    // By name: `…NameWithOwner` inputs.
+    let commit = |nwo: &str| {
+        serde_json::json!({ "query": "mutation($b: CommittableBranch!) { createCommitOnBranch(input: {branch: $b, message: {headline: \"h\"}, expectedHeadOid: \"0\"}) { commit { oid } } }", "variables": { "b": { "repositoryNameWithOwner": nwo, "branchName": "main" } } })
+    };
+    let o = gql(&state, &src, commit("O/R"));
+    assert_eq!(o.context.scope.as_deref(), Some("git.push"));
+    injected(&o);
+    refused(&gql(&state, &src, commit("x/y")), "names `x/y`, outside");
+    assert_eq!(refused(&gql(&state, &src, commit("o/r/x")), "not an `owner/name`").status, 400);
+
+    refused(&gql(&state, &src, serde_json::json!({ "query": "mutation { deleteRepository(input: {}) { a } }" })), "`graphql mutation deleteRepository` is in no scope");
+    let mut never = crate::credentials::home::tests::github();
+    never.pinned.never.push(claim::Route::GraphqlMutation("addDeployKey".into()));
+    let mut nsrc = gql_src(None);
+    nsrc.src.home.get_mut("github-work").unwrap().approved[0].claim = never.canonical();
+    refused(&gql(&state, &nsrc, serde_json::json!({ "query": "mutation { addDeployKey(input: {}) { a } }" })), "a `never` route");
+}
+
+#[test]
+fn every_graphql_mutation_field_needs_its_scope() {
+    let state = fenced_state();
+    let both = serde_json::json!({ "query": "mutation($r: ID!) { a: createPullRequest(input: {repositoryId: $r}) { x } addComment(input: {subjectId: \"I_in\"}) { x } }", "variables": { "r": "R_42" } });
+    let o = gql(&state, &gql_src(None), both.clone());
+    injected(&o);
+    assert_eq!(o.context.scope.as_deref(), Some("pr.write,issues.write"));
+    let only_pr = gql_src(Some(Access { scopes: vec!["pr.write".into()], ..Access::default() }));
+    refused(&gql(&state, &only_pr, both.clone()), "scope `issues.write` isn't in `access.github.scopes`");
+    // One field outside the fence refuses the whole call.
+    let mixed = serde_json::json!({ "query": "mutation { createPullRequest(input: {repositoryId: \"R_42\"}) { x } addComment(input: {subjectId: \"I_out\"}) { x } }" });
+    refused(&gql(&state, &gql_src(None), mixed), "outside the instance's repo fence");
+
+    // Asked scopes: a placed mutation waits for permission requests, one
+    // naming no repo is never asked.
+    let ask = gql_src(Some(Access { ask: vec!["pr.write".into()], ..Access::default() }));
+    refused(&gql(&state, &ask, both), "scope `pr.write` is in `access.github.ask`: asks need permission requests");
+    let bare = serde_json::json!({ "query": "mutation { createPullRequest(input: {title: \"t\"}) { x } }" });
+    injected(&gql(&state, &gql_src(None), bare.clone()));
+    refused(&gql(&state, &ask, bare), "names no repo, so it's never asked");
+}
+
+#[test]
+fn graphql_ids_without_a_lookup_match_pins_only() {
+    let mut state = fenced_state();
+    state.github_ids.insert("o/r".into(), crate::state::GithubPin { id: 42, node_id: "R_42".into(), pinned_at: 1 });
+    let pr = |id: &str| serde_json::json!({ "query": format!("mutation {{ createPullRequest(input: {{repositoryId: \"{id}\"}}) {{ x }} }}") });
+    injected(&gql(&state, &fenced_src(None), pr("R_42")));
+    refused(&gql(&state, &fenced_src(None), pr("R_7")), "doesn't resolve to a repository");
 }

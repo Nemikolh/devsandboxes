@@ -18,8 +18,9 @@ limitation means editing this file in the same commit.
   github-and-sentry-access step 1 (sentry-cli through `features/sentry`)
   and git-gateway step 1 (git through the broker with the repo fence, LFS
   and the relay's key filtering) are done, and the fence resolves to repo
-  ids; now github-and-sentry-access step 2: `features/gh`, its scope
-  table, GraphQL mutations mapped to scopes.
+  ids and GraphQL mutations are mapped to scopes and placed by their
+  input ids; now github-and-sentry-access step 2: `features/gh` and its
+  scope table, with the test walking GitHub's GraphQL schema.
   → [plan](plans/active/github-and-sentry-access.md)
 
 ## Planned
@@ -380,9 +381,14 @@ is frozen: no new work on it.
   requests (credential-broker step 4); `presence` routes pass. The GitHub
   repo fence is enforced on a fenced claim's `{repo}` and
   `/repositories/{id}` routes
-  ([fence](architecture/credentials/fence.md#enforcement)); body-named
-  inputs and GraphQL mutations' ids are refused (github-and-sentry-access
-  step 2). A fence entry's pin ([ids](architecture/credentials/fence.md#ids))
+  ([fence](architecture/credentials/fence.md#enforcement)) and on
+  GraphQL mutations' `fence` inputs
+  ([broker](architecture/credentials/broker.md#graphql)); REST body-named
+  inputs are refused (github-and-sentry-access step 2). A GraphQL input
+  naming a renamed repo by its old `owner/name` is refused, not
+  redirected (the body goes as sent). Nothing yet checks that a claim's
+  `fence` names every repo- or object-naming input of its mutations (the
+  schema-walk test comes with the real `features/gh` claim). A fence entry's pin ([ids](architecture/credentials/fence.md#ids))
   is never dropped, not even by `access forget`: a repo deleted and
   re-created under its name stays outside its entry. A pinned repo
   renamed again is called by its previous name until the cached answer
@@ -399,7 +405,8 @@ is frozen: no new work on it.
   github-and-sentry-access step 2. No token and registration
   endpoints a claim could mark (no claim field). A credential marked
   broken notifies no approver (credential-broker step 4). Policy reads no
-  request body beyond an LFS batch's `operation`, and token-shaped response headers aren't stripped: only the injected value is masked. One
+  request body beyond an LFS batch's `operation` and a GraphQL request's
+  document, and token-shaped response headers aren't stripped: only the injected value is masked. One
   upstream connection per call, no pooling. `access.log` shows nowhere
   (no dashboard view, nor in `access ls`).
   → [broker](architecture/credentials/broker.md); `broker::policy::decide`,

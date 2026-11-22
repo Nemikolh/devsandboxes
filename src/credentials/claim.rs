@@ -39,6 +39,8 @@ const MAX_KIND: usize = 32;
 const MAX_PREFIX: usize = 32;
 /// Unknown routes' scope for a credential without a fence; no claim names it.
 pub const OTHER_SCOPE: &str = "other";
+/// Where a claim's GraphQL routes are called: `POST` with a JSON body.
+pub const GRAPHQL_PATH: &str = "/graphql";
 
 const FIELDS: &[&str] = &[
     "upstreams", "mode", "inject", "phantom", "git", "baseUrl", "rewrite", "login", "check",
@@ -178,6 +180,12 @@ impl Pinned {
     /// *Policy*).
     pub fn fenced(&self) -> bool {
         !self.fence.is_empty()
+    }
+
+    /// Any scope or `never` route is a GraphQL one: the broker reads
+    /// `POST /graphql`'s document to decide it (`broker::graphql`).
+    pub fn graphql(&self) -> bool {
+        self.scopes.values().flat_map(|s| &s.routes).chain(&self.never).any(Route::is_graphql)
     }
 }
 
@@ -354,22 +362,30 @@ impl Method {
     }
 }
 
-/// `METHOD /path/{var}/…[?name=value]` or `graphql mutation <name>`. Path
-/// segments are literal or a whole `{var}`; `{repo}` takes two, `owner/repo`
+/// `METHOD /path/{var}/…[?name=value]`, `graphql query` (every query) or
+/// `graphql mutation <name>` (a top-level mutation field). Path segments
+/// are literal or a whole `{var}`; `{repo}` takes two, `owner/repo`
 /// (`broker::route`); a trailing `/` is part of the route.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Route {
     Http { method: Method, path: String },
+    GraphqlQuery,
     GraphqlMutation(String),
 }
 
 impl Route {
     pub fn parse(s: &str) -> Result<Route> {
+        if s == "graphql query" {
+            return Ok(Route::GraphqlQuery);
+        }
         if let Some(name) = s.strip_prefix("graphql mutation ") {
             if !is_ident(name, false) {
                 bail!("`{s}`: `{name}` isn't a GraphQL name");
             }
             return Ok(Route::GraphqlMutation(name.to_string()));
+        }
+        if s.starts_with("graphql ") {
+            bail!("`{s}`: write `graphql query` or `graphql mutation <name>`");
         }
         let Some((m, path)) = s.split_once(' ') else {
             bail!("`{s}`: write `METHOD /path` or `graphql mutation <name>`");
@@ -387,8 +403,12 @@ impl Route {
             Route::Http { path, .. } => {
                 path.split_once('?').map_or(path.as_str(), |(p, _)| p).split('/').filter_map(path_var).collect()
             }
-            Route::GraphqlMutation(_) => Vec::new(),
+            Route::GraphqlQuery | Route::GraphqlMutation(_) => Vec::new(),
         }
+    }
+
+    pub fn is_graphql(&self) -> bool {
+        !matches!(self, Route::Http { .. })
     }
 }
 
@@ -396,6 +416,7 @@ impl fmt::Display for Route {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Route::Http { method, path } => write!(f, "{} {path}", method.as_str()),
+            Route::GraphqlQuery => write!(f, "graphql query"),
             Route::GraphqlMutation(name) => write!(f, "graphql mutation {name}"),
         }
     }
@@ -479,6 +500,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
     let mint: Option<Mint> = field(obj, "mint")?;
     let scopes = scopes(field(obj, "scopes")?.unwrap_or_default())?;
     let never = never(field(obj, "never")?.unwrap_or_default(), &scopes)?;
+    check_graphql_path(&scopes, &never)?;
     let presence = presence(field(obj, "presence")?.unwrap_or_default())?;
     let hold: Option<u32> = field(obj, "hold")?;
     if let Some(secs) = hold
@@ -818,7 +840,7 @@ fn rewrite(raw: Vec<RawRewrite>, mode: Mode) -> Result<Vec<Rewrite>> {
     for (i, entry) in raw.into_iter().enumerate() {
         let at = || format!("`rewrite[{i}]`");
         let route = Route::parse(&entry.route).with_context(at)?;
-        if matches!(route, Route::GraphqlMutation(_)) {
+        if route.is_graphql() {
             bail!("{}: rewrites apply to HTTP routes", at());
         }
         if out.iter().any(|r| r.route == route) {
@@ -941,6 +963,19 @@ fn scopes(raw: BTreeMap<String, Value>) -> Result<BTreeMap<String, Scope>> {
     Ok(out)
 }
 
+/// A claim with GraphQL routes has `POST /graphql` decided by its document,
+/// so an HTTP route on that path could only mislead.
+fn check_graphql_path(scopes: &BTreeMap<String, Scope>, never: &[Route]) -> Result<()> {
+    let routes = || scopes.values().flat_map(|s| &s.routes).chain(never);
+    if !routes().any(Route::is_graphql) {
+        return Ok(());
+    }
+    match routes().find(|r| matches!(r, Route::Http { path, .. } if path.split('?').next() == Some(GRAPHQL_PATH))) {
+        Some(r) => bail!("`{r}`: a claim with GraphQL routes decides `{GRAPHQL_PATH}` by its document"),
+        None => Ok(()),
+    }
+}
+
 /// A route is scoped or `never`, not both: no ask or rule opens a `never`
 /// route, so a scope naming one could only mislead.
 fn never(raw: Vec<String>, scopes: &BTreeMap<String, Scope>) -> Result<Vec<Route>> {
@@ -1008,6 +1043,9 @@ fn fence(raw: BTreeMap<String, Vec<String>>) -> Result<BTreeMap<Route, Vec<Strin
     for (raw_route, inputs) in raw {
         let at = || format!("`fence.{raw_route}`");
         let route = Route::parse(&raw_route).with_context(at)?;
+        if route == Route::GraphqlQuery {
+            bail!("{}: queries pass under the token's own reach, never fenced", at());
+        }
         if inputs.is_empty() {
             bail!("{}: name at least one input", at());
         }
@@ -1302,6 +1340,7 @@ mod tests {
             "PUT /a/b:c@d",
             "GET /{repo}/info/refs?service=git-receive-pack",
             "graphql mutation createPullRequest",
+            "graphql query",
         ] {
             assert_eq!(Route::parse(s).unwrap().to_string(), s);
         }
@@ -1331,7 +1370,8 @@ mod tests {
             ("GET /api/#x", "no fragment"),
             ("GET  /api/", "must start with `/`"),
             ("graphql mutation create-pr", "isn't a GraphQL name"),
-            ("graphql query viewer", "isn't one of GET"),
+            ("graphql query viewer", "write `graphql query` or `graphql mutation <name>`"),
+            ("graphql subscription x", "write `graphql query`"),
         ] {
             let e = format!("{:#}", Route::parse(s).unwrap_err());
             assert!(e.contains(want), "{s:?}: {want:?} not in {e:?}");
@@ -1576,15 +1616,29 @@ mod tests {
             "fence",
             json!({
                 "POST /repos/{repo}/forks": ["{repo}", "organization"],
-                "graphql mutation createPullRequest": ["repositoryId", "headRepositoryId"],
+                "graphql mutation createPullRequest": ["input.repositoryId", "input.headRepositoryId"],
+                "graphql mutation createCommitOnBranch": ["input.branch.repositoryNameWithOwner", "input.ids[].id"],
             }),
         );
         let f = parse("sentry", &fence).unwrap().pinned.fence;
-        assert_eq!(f[&Route::parse("graphql mutation createPullRequest").unwrap()], ["headRepositoryId", "repositoryId"]);
+        assert_eq!(f[&Route::parse("graphql mutation createPullRequest").unwrap()], ["input.headRepositoryId", "input.repositoryId"]);
+        assert_err(sentry_with("fence", json!({ "graphql query": ["owner"] })), &["`fence.graphql query`", "never fenced"]);
+        assert_err(sentry_with("fence", json!({ "graphql mutation m": ["input..x"] })), &["isn't a field path"]);
         assert_err(sentry_with("fence", json!({ "GET /a/{x}": ["{y}"] })), &["`fence.GET /a/{x}`", "has no `{y}`"]);
         assert_err(sentry_with("fence", json!({ "graphql mutation m": ["{repo}"] })), &["has no `{repo}`"]);
         assert_err(sentry_with("fence", json!({ "GET /a": [] })), &["name at least one input"]);
         assert_err(sentry_with("fence", json!({ "GET /a": ["x", "x"] })), &["`x` is listed twice"]);
+    }
+
+    #[test]
+    fn graphql_routes_own_the_graphql_path() {
+        let gql = parse("sentry", &sentry_with("scopes", json!({ "read": ["graphql query", "GET /api/0/"] }))).unwrap();
+        assert!(gql.pinned.graphql());
+        assert!(!parse("sentry", &sentry_with("scopes", json!({ "read": ["POST /graphql"] }))).unwrap().pinned.graphql());
+        assert_err(
+            sentry_with("scopes", json!({ "read": ["graphql query"], "w": ["POST /graphql"] })),
+            &["`POST /graphql`: a claim with GraphQL routes decides `/graphql` by its document"],
+        );
     }
 
     #[test]

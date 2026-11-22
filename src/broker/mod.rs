@@ -36,6 +36,7 @@ pub mod audit;
 pub mod body;
 #[cfg(unix)]
 pub mod github;
+pub mod graphql;
 pub mod guard;
 pub mod head;
 #[cfg(unix)]

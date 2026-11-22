@@ -17,8 +17,9 @@ fence*, *sentry-cli*) and [git-gateway](../../plans/active/git-gateway.md)
 Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
 `src/broker/policy.rs` (`decide`, `admit_intercept`, `intercept_claim`,
 `Sources`, `Outcome`, `Action`, `Injection`, `Phantom`, `inject`,
-`strip`, `fence_of`, `fence_for`, `secrets`), `src/broker/github.rs`
-(`Fence`, `Live`), `src/broker/intercept.rs`
+`strip`, `fence_of`, `fence_for`, `graphql_scopes`, `secrets`), `src/broker/github.rs`
+(`Fence`, `Live`), `src/broker/graphql.rs` (`decode`, `parse`,
+`Operation`, `inputs`), `src/broker/intercept.rs`
 (`server_config`, `fold`, `ALPN`), `src/credentials/ca.rs` (`MemberCa`),
 `src/broker/route.rs` (`check_path`, `matches`, `Match`, `scope_of`,
 `Matched`, `git_service`, `is_write`), `src/broker/rewrite.rs`
@@ -71,7 +72,9 @@ LFS transfers, not calls: `Service::lfs_request` serves them
    intercept mode the `CONNECT` target, port 443 by default): `403`.
 3. `state.toml` is read (`State::load_at`); an LFS batch's body is read
    whole (`batch_body`, at most `route::MAX_LFS_BATCH`, after the `100
-   Continue` it asked for; [git](git.md#lfs)), then `policy::decide`.
+   Continue` it asked for; [git](git.md#lfs)), and so is a GraphQL
+   request's to a claim with GraphQL routes (`graphql_body`,
+   [GraphQL](#graphql)), then `policy::decide`.
 4. A refusal is answered; an uninjected, injected or outside call is
    forwarded (below); one `access.log` line either way.
 
@@ -131,6 +134,9 @@ only for a call carrying the phantom). First refusal answers:
 8. **Route** (`route::scope_of` on the copy, [Route matching](#route-matching)):
    a `never` route is refused always; a route in no scope is `other`,
    refused as an ask; a path past `{repo}` that decodes badly is a `400`.
+   `POST /graphql` to a claim with GraphQL routes is decided by its
+   operation instead, its mutation inputs placed in the fence here too
+   ([GraphQL](#graphql)), each scope it needs then taking step 10.
 9. **Repo fence**, for a fenced claim ([below](#the-repo-fence)): the
    matched route is placed on a repo or a repository id, repo-less, or
    refused; a repo outside the fence goes upstream stripped, or is
@@ -205,6 +211,53 @@ the query parameter), its response marked `devsandbox-fence: outside`
 (an upstream's own such field dropped). An upstream `401` to it becomes
 the broker's `403` naming `access.<kind>.repos`, so git never falls back
 to a credential prompt and gh never to its login.
+
+### GraphQL
+
+A claim with any `graphql query` or `graphql mutation <name>` route
+(`Pinned::graphql`; it may then list no HTTP route on `/graphql`) has
+every `POST /graphql` body read before policy (`serve::graphql_body`):
+at most `graphql::MAX_BODY` (1 MiB) as sent, else a `413` and the
+connection closes; a `Content-Encoding` of `gzip` or `deflate` (zlib) is
+decoded within the same bound (`graphql::decode`: past it a `413`, one
+that doesn't decode, or any other encoding, a `400`). `graphql::parse`
+then reads it strictly, each failure a `400`:
+
+- the body is one JSON object (an array is a batch), no object anywhere
+  naming a key twice, its fields only `query` (a string), `variables`
+  (an object or `null`) and `operationName` (a string or `null`, naming
+  the operation);
+- the document is exactly one operation, never a subscription, with
+  fragments each defined once, every spread defined, none reaching
+  itself; no argument, input field or variable given twice; no nesting
+  past 64 levels; strings without `\u{…}` escapes or a lone surrogate.
+
+The bytes as sent go upstream, `Content-Encoding` and all (and are what a
+401 replays). `policy::graphql_scopes` decides the operation:
+
+- a **query** takes the `graphql query` route's scope, repo-less: it
+  passes under the token's own reach and is never asked, so an `ask`
+  scope refuses it;
+- a **mutation** takes each top-level field's `graphql mutation <name>`
+  scope, fragments (spread or inline, whatever their type condition)
+  expanded into the top level and aliases ignored; a field in no scope is
+  `other`, in `never` refused. On a fenced claim each `fence` input of
+  the field (dotted from its arguments, `[]` for each element of a list,
+  a single value taken as a list of one: `input.repositoryId`,
+  `input.branch.repositoryNameWithOwner`) is read from the arguments,
+  variables replaced by their JSON value or the definition's default
+  (`graphql::inputs`): an input named `…NameWithOwner` must be an
+  `owner/name` in the fence (an entry's old name is refused: the body
+  can't be redirected), any other a global id `Fence::place_node`
+  places (a pinned repository's node id with no call, else `node(id:)`
+  resolves it), or an integer repository id. One outside the fence
+  refuses the call naming `access.<kind>.repos` (a mutation is a write,
+  never stripped); one that doesn't resolve is `other`, refused. A field
+  whose inputs are all absent is repo-less (never asked); a block
+  string, an enum or an object where an input is read is a `400`.
+
+Every scope the fields need must pass step 10; the log line's `scope`
+lists them, comma-separated.
 
 ## The call
 

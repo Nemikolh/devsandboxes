@@ -25,6 +25,11 @@
 //! 7. the upstream and the phantom's slot are in that copy;
 //! 8. the route: `never` routes refused; a route in no scope is `other`,
 //!    refused as an ask; a path past `{repo}` that decodes badly refused;
+//!    `POST /graphql` to a claim with GraphQL routes is its operation's
+//!    instead ([`graphql_scopes`]): a query's `graphql query` route,
+//!    repo-less, or each top-level mutation field's `graphql mutation
+//!    <name>`, every `fence` input it holds placed inside the fence or the
+//!    call refused (a write);
 //! 9. the repo fence, for a fenced claim ([`Pinned::fenced`]): a route
 //!    whose `fence` names an input but `{repo}` and a `/repositories/{id}`
 //!    route's `{id}` (a body field) can't be placed yet and is refused; a
@@ -46,12 +51,13 @@
 //! shape whatever the claim's: git prints a text body.
 //!
 //! Not here yet: token and registration endpoints a claim marks (no claim
-//! field for them), body inputs in the fence, `presence` (passes until
-//! step 4).
+//! field for them), REST body inputs in the fence, `presence` (passes
+//! until step 4).
 
 use anyhow::Result;
 
 use super::github::{self, Place};
+use super::graphql;
 use super::head::{RequestHead, header_indices};
 use super::redact;
 use super::refusal::Refusal;
@@ -86,6 +92,9 @@ pub struct Call<'a> {
     /// An LFS batch's `operation`, read from its body before policy
     /// ([`route::lfs_operation`]); `None` for any other call.
     pub lfs: Option<route::LfsOp>,
+    /// A GraphQL request's operation, read from its body before policy
+    /// ([`graphql::parse`]) when the claim has GraphQL routes.
+    pub graphql: Option<&'a graphql::Operation>,
 }
 
 /// Which phantom a call carried, for the log: never its value.
@@ -310,89 +319,100 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
     }
 
     let call_route = format!("{} {}", head.method, route::path_only(path));
-    let matched = route::scope_of(&approved, &head.method, path).map_err(|why| Refusal::new(400, "refused", why))?;
-    cx.scope = Some(matched.scoped.name().to_string());
-    let lfs_upload = approved.lfs.as_ref().filter(|_| call.lfs == Some(route::LfsOp::Upload));
-    let scope = match matched.scoped.clone() {
-        Scoped::Never => {
-            return Err(Refusal::refused(format!(
-                "`{call_route}` is a `never` route of the `{kind}` claim: no ask or rule opens it"
-            )));
-        }
-        Scoped::Other => {
-            return Err(Refusal::refused(format!(
-                "`{call_route}` is in no scope of the `{kind}` claim (scope `other`): {ASKS}"
-            )));
-        }
-        Scoped::Scope(s) => s,
-    };
-    let scope = match lfs_upload {
-        Some(lfs) => {
-            cx.scope = Some(lfs.upload.clone());
-            lfs.upload.clone()
-        }
-        None => scope,
-    };
-    let mut repo_less = false;
     let mut renamed = None;
-    if approved.fenced() {
-        let mut fence = fence_for(inst, &access, state, sources, &approved, name);
-        let outside = |repo: String, named: bool, cx: &mut Context| {
-            let write = match call.lfs {
-                Some(op) => op == route::LfsOp::Upload,
-                None => route::is_write(&head.method, path),
-            };
-            if write {
-                let r = Refusal::refused(format!("`{repo}` is outside the instance's repo fence: no credential writes to it"));
-                return Err(if named { r.todo(repos_todo(&repo, kind)) } else { r });
-            }
-            cx.outside = Some(repo);
-            Ok(Action::Outside { slot: slot.clone(), private: up.private })
+    let needed = if approved.graphql() && route::graphql(&head.method, path) {
+        let Some(op) = call.graphql else {
+            return Err(internal("a GraphQL request reached policy with its document unread"));
         };
-        match attribute(&approved, &matched, path) {
-            Placed::Unplaced(inputs) => {
+        let mut fence = approved.fenced().then(|| fence_for(inst, &access, state, sources, &approved, name));
+        graphql_scopes(&approved, op, fence.as_mut(), kind, cx)?
+    } else {
+        let matched = route::scope_of(&approved, &head.method, path).map_err(|why| Refusal::new(400, "refused", why))?;
+        cx.scope = Some(matched.scoped.name().to_string());
+        let lfs_upload = approved.lfs.as_ref().filter(|_| call.lfs == Some(route::LfsOp::Upload));
+        let scope = match matched.scoped.clone() {
+            Scoped::Never => {
                 return Err(Refusal::refused(format!(
-                    "`{call_route}` names its repo by {inputs}, which the broker can't resolve yet"
+                    "`{call_route}` is a `never` route of the `{kind}` claim: no ask or rule opens it"
                 )));
             }
-            Placed::BadId => {
-                return Err(Refusal::new(400, "refused", format!("`{call_route}` names no repository id")));
+            Scoped::Other => {
+                return Err(Refusal::refused(format!(
+                    "`{call_route}` is in no scope of the `{kind}` claim (scope `other`): {ASKS}"
+                )));
             }
-            Placed::RepoLess => repo_less = true,
-            Placed::Repo(repo) => match fence.place_name(&repo) {
-                Place::In { current } => {
-                    let route_path = match &matched.route {
-                        Some(claim::Route::Http { path, .. }) => Some(path.as_str()),
-                        _ => None,
-                    };
-                    renamed = current.zip(route_path).and_then(|(c, rp)| route::with_repo(rp, path, &c));
-                }
-                Place::Out => return outside(repo, true, cx),
-            },
-            Placed::Id(id) if fence.place_id(id) => {}
-            Placed::Id(id) => {
-                return match fence.name_of(id) {
-                    Some(repo) => outside(repo, true, cx),
-                    None => outside(format!("repository {id}"), false, cx),
+            Scoped::Scope(s) => s,
+        };
+        let scope = match lfs_upload {
+            Some(lfs) => {
+                cx.scope = Some(lfs.upload.clone());
+                lfs.upload.clone()
+            }
+            None => scope,
+        };
+        let mut repo_less = false;
+        if approved.fenced() {
+            let mut fence = fence_for(inst, &access, state, sources, &approved, name);
+            let outside = |repo: String, named: bool, cx: &mut Context| {
+                let write = match call.lfs {
+                    Some(op) => op == route::LfsOp::Upload,
+                    None => route::is_write(&head.method, path),
                 };
+                if write {
+                    let r = Refusal::refused(format!("`{repo}` is outside the instance's repo fence: no credential writes to it"));
+                    return Err(if named { r.todo(repos_todo(&repo, kind)) } else { r });
+                }
+                cx.outside = Some(repo);
+                Ok(Action::Outside { slot: slot.clone(), private: up.private })
+            };
+            match attribute(&approved, &matched, path) {
+                Placed::Unplaced(inputs) => {
+                    return Err(Refusal::refused(format!(
+                        "`{call_route}` names its repo by {inputs}, which the broker can't resolve yet"
+                    )));
+                }
+                Placed::BadId => {
+                    return Err(Refusal::new(400, "refused", format!("`{call_route}` names no repository id")));
+                }
+                Placed::RepoLess => repo_less = true,
+                Placed::Repo(repo) => match fence.place_name(&repo) {
+                    Place::In { current } => {
+                        let route_path = match &matched.route {
+                            Some(claim::Route::Http { path, .. }) => Some(path.as_str()),
+                            _ => None,
+                        };
+                        renamed = current.zip(route_path).and_then(|(c, rp)| route::with_repo(rp, path, &c));
+                    }
+                    Place::Out => return outside(repo, true, cx),
+                },
+                Placed::Id(id) if fence.place_id(id) => {}
+                Placed::Id(id) => {
+                    return match fence.name_of(id) {
+                        Some(repo) => outside(repo, true, cx),
+                        None => outside(format!("repository {id}"), false, cx),
+                    };
+                }
             }
         }
-    }
-    if entry.max.as_ref().is_some_and(|max| !max.contains(&scope)) {
-        return Err(Refusal::refused(format!("scope `{scope}` isn't granted by credential `{name}` (its `max`)"))
-            .todo(format!("add `{scope}` to `max` of [{name}] in credentials.toml")));
-    }
-    if access.ask.contains(&scope) {
-        if repo_less {
-            return Err(Refusal::refused(format!(
-                "scope `{scope}` is in `access.{kind}.ask`, but `{call_route}` names no repo, so it's never asked"
-            )));
+        vec![(scope, repo_less)]
+    };
+    for (scope, repo_less) in &needed {
+        if entry.max.as_ref().is_some_and(|max| !max.contains(scope)) {
+            return Err(Refusal::refused(format!("scope `{scope}` isn't granted by credential `{name}` (its `max`)"))
+                .todo(format!("add `{scope}` to `max` of [{name}] in credentials.toml")));
         }
-        return Err(Refusal::refused(format!("scope `{scope}` is in `access.{kind}.ask`: {ASKS}")));
-    }
-    if !access.scopes.is_empty() && !access.scopes.contains(&scope) {
-        return Err(Refusal::refused(format!("scope `{scope}` isn't in `access.{kind}.scopes`"))
-            .todo(format!("add `{scope}` to `access.{kind}.scopes` in the sandbox's config")));
+        if access.ask.contains(scope) {
+            if *repo_less {
+                return Err(Refusal::refused(format!(
+                    "scope `{scope}` is in `access.{kind}.ask`, but `{call_route}` names no repo, so it's never asked"
+                )));
+            }
+            return Err(Refusal::refused(format!("scope `{scope}` is in `access.{kind}.ask`: {ASKS}")));
+        }
+        if !access.scopes.is_empty() && !access.scopes.contains(scope) {
+            return Err(Refusal::refused(format!("scope `{scope}` isn't in `access.{kind}.scopes`"))
+                .todo(format!("add `{scope}` to `access.{kind}.scopes` in the sandbox's config")));
+        }
     }
     let lfs = match (call.header, &approved.lfs, inst.intercept.as_ref().and_then(|i| i.lfs)) {
         (ProxyHeader::Intercept { host, .. }, Some(lfs), Some(port)) if call.lfs.is_some() && lfs.hosts.contains(host) => {
@@ -409,6 +429,122 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         expires_at: entry.expires(),
         path: renamed,
     })))
+}
+
+/// A GraphQL call's scopes, each with whether it's reached repo-less: a
+/// query's `graphql query` scope (repo-less: never asked), else each
+/// top-level mutation field's, its `fence` inputs placed in the fence
+/// first (a fenced claim) or refused: a mutation is a write.
+fn graphql_scopes(
+    claim: &Pinned,
+    op: &graphql::Operation,
+    mut fence: Option<&mut github::Fence<'_>>,
+    kind: &str,
+    cx: &mut Context,
+) -> Result<Vec<(String, bool)>, Refusal> {
+    let scope_of = |route: &claim::Route, cx: &mut Context| {
+        if claim.never.contains(route) {
+            cx.scope = Some(Scoped::Never.name().to_string());
+            return Err(Refusal::refused(format!(
+                "`{route}` is a `never` route of the `{kind}` claim: no ask or rule opens it"
+            )));
+        }
+        match claim.scopes.iter().find(|(_, s)| s.routes.contains(route)) {
+            Some((name, _)) => {
+                cx.scope = Some(name.clone());
+                Ok(name.clone())
+            }
+            None => {
+                cx.scope = Some(claim::OTHER_SCOPE.to_string());
+                Err(Refusal::refused(format!("`{route}` is in no scope of the `{kind}` claim (scope `other`): {ASKS}")))
+            }
+        }
+    };
+    let fields = match op {
+        graphql::Operation::Query => return Ok(vec![(scope_of(&claim::Route::GraphqlQuery, cx)?, true)]),
+        graphql::Operation::Mutation(fields) => fields,
+    };
+    let mut needed: Vec<(String, bool)> = Vec::new();
+    for f in fields {
+        let route = claim::Route::GraphqlMutation(f.name.clone());
+        let scope = scope_of(&route, cx)?;
+        let mut repo_less = false;
+        if let Some(fence) = fence.as_deref_mut() {
+            let mut placed = 0;
+            for input in claim.fence.get(&route).into_iter().flatten() {
+                let leaves = graphql::inputs(f, input).map_err(|why| Refusal::new(400, "refused", why))?;
+                for leaf in leaves {
+                    place_input(fence, &f.name, input, leaf, kind, cx)?;
+                    placed += 1;
+                }
+            }
+            repo_less = placed == 0;
+        }
+        match needed.iter_mut().find(|(s, _)| *s == scope) {
+            Some((_, r)) => *r |= repo_less,
+            None => needed.push((scope, repo_less)),
+        }
+    }
+    if needed.is_empty() {
+        return Err(Refusal::new(400, "refused", "a GraphQL mutation without a field"));
+    }
+    cx.scope = Some(needed.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(","));
+    Ok(needed)
+}
+
+/// One value of a mutation's `fence` input, inside the fence or refused:
+/// an input named `…NameWithOwner` holds `owner/name`, any other a global
+/// id (a repository's matched against the pins, another object's resolved
+/// to its repository) or a repository's database id.
+fn place_input(
+    fence: &mut github::Fence<'_>,
+    field: &str,
+    input: &str,
+    leaf: graphql::Leaf,
+    kind: &str,
+    cx: &mut Context,
+) -> Result<(), Refusal> {
+    let at = format!("`{field}`'s `{input}`");
+    let outside = |repo: String, named: bool| {
+        let r = Refusal::refused(format!("{at} names `{repo}`, outside the instance's repo fence: no credential writes to it"));
+        if named { r.todo(repos_todo(&repo, kind)) } else { r }
+    };
+    let last = input.rsplit('.').next().unwrap_or(input).trim_end_matches("[]");
+    let by_name = last.to_ascii_lowercase().ends_with("namewithowner");
+    match (leaf, by_name) {
+        (graphql::Leaf::Str(s), true) => {
+            let Some(repo) = s.split_once('/').and_then(|(o, r)| fence::normalize(o, r)) else {
+                return Err(Refusal::new(400, "refused", format!("{at} holds `{s}`, not an `owner/name`")));
+            };
+            match fence.place_name(&repo) {
+                Place::In { current: None } => Ok(()),
+                // The body goes upstream as sent, so the old name can't be
+                // swapped for the current one as a REST path is.
+                Place::In { current: Some(c) } => {
+                    Err(Refusal::refused(format!("{at} names `{repo}`, which is `{c}` now: name it by its current name")))
+                }
+                Place::Out => Err(outside(repo, true)),
+            }
+        }
+        (graphql::Leaf::Str(id), false) => match fence.place_node(&id) {
+            Ok(_) => Ok(()),
+            Err(Some(r)) => Err(outside(r.name(), true)),
+            Err(None) => {
+                cx.scope = Some(claim::OTHER_SCOPE.to_string());
+                Err(Refusal::refused(format!(
+                    "{at} holds `{id}`, which doesn't resolve to a repository (scope `other`): {ASKS}"
+                )))
+            }
+        },
+        (graphql::Leaf::Int(id), false) => match fence.place_id(id) {
+            true => Ok(()),
+            false => Err(match fence.name_of(id) {
+                Some(repo) => outside(repo, true),
+                None => outside(format!("repository {id}"), false),
+            }),
+        },
+        (graphql::Leaf::Int(id), true) => Err(Refusal::new(400, "refused", format!("{at} holds {id}, not an `owner/name`"))),
+    }
 }
 
 /// What a matched route of a fenced claim names.
