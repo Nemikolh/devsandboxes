@@ -419,10 +419,8 @@ is frozen: no new work on it.
   deeper than four segments or a branch name with two `/` is `other`;
   `node(id:)` resolves no discussion comment, so replying to, editing or
   deleting one is refused, as are Projects (`gh pr create --project`)
-  and repo settings (no scope maps `administration`). The shared bin dir `gh-update` fills is mounted by the config,
-  not the feature (the feature schema has no read-only mount), and
-  nothing runs `gh-update` on a schedule. The test fixture mirrors the
-  features repo's claim by hand.
+  and repo settings (no scope maps `administration`). The test fixture
+  mirrors the features repo's metadata and claim by hand.
   → [gh](architecture/credentials/gh.md)
 - The agent relay's key filter under a git-host claim signs a named
   key's login with no confirmation (confirm-on-sign is a permission
