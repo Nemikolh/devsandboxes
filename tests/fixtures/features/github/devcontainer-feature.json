@@ -84,6 +84,7 @@
             }
           ],
           "check": "GET /user",
+          "checkShows": "login",
           "refusal": {
             "shape": "json",
             "field": "message"

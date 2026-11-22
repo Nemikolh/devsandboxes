@@ -185,8 +185,9 @@ pub fn parse_token_reply(status: u16, content_type: Option<&str>, body: &[u8]) -
     }))
 }
 
-/// The OAuth endpoints' client: the broker's upstream one, with its address
-/// check (never the private override a claim's upstream may carry).
+/// The OAuth endpoints' and login's token check's client: the broker's
+/// upstream one, with its address check (the private override only for the
+/// check, on the claim's own private upstream, as the broker calls it).
 pub struct Http {
     upstream: Upstream,
     private: bool,
@@ -213,7 +214,7 @@ impl Http {
         let headers = [
             Header { name: "Accept".into(), value: b"application/json".to_vec() },
             Header { name: "Content-Type".into(), value: b"application/x-www-form-urlencoded".to_vec() },
-            Header { name: "User-Agent".into(), value: concat!("devsandbox/", env!("CARGO_PKG_VERSION")).into() },
+            Header { name: "User-Agent".into(), value: USER_AGENT.into() },
         ];
         let mut reader = body.as_bytes();
         let resp = self
@@ -227,18 +228,40 @@ impl Http {
             })
             .with_context(|| format!("cannot reach {url}"))?;
         let content_type = head::header(&resp.headers, "content-type").map(|v| String::from_utf8_lossy(v).into_owned());
-        let mut out = Vec::new();
-        resp.body.take(MAX_REPLY + 1).read_to_end(&mut out).with_context(|| format!("reading {url}'s reply"))?;
-        if out.len() as u64 > MAX_REPLY {
-            bail!("{url} answered over {MAX_REPLY} bytes");
-        }
-        Ok((resp.status, content_type, out))
+        let status = resp.status;
+        Ok((status, content_type, bounded(url, resp.body)?))
+    }
+
+    /// A bodiless `method` (`GET`, `HEAD`) to `url` with `headers` (the
+    /// token's slot among them): the status, the response's headers and
+    /// body. `private`: the claim marks the upstream private.
+    pub fn fetch(&self, method: &str, url: &str, headers: &[Header], private: bool) -> Result<(u16, Vec<Header>, Vec<u8>)> {
+        let mut sent = vec![Header { name: "User-Agent".into(), value: USER_AGENT.into() }];
+        sent.extend(headers.iter().cloned());
+        let resp = self
+            .upstream
+            .send(Request { method, url, headers: &sent, body: Body::Empty, private: self.private || private })
+            .with_context(|| format!("cannot reach {url}"))?;
+        let body = bounded(url, resp.body)?;
+        Ok((resp.status, resp.headers, body))
     }
 
     pub fn token(&self, url: &str, form: &[(&str, &str)]) -> Result<Reply> {
         let (status, ct, body) = self.post(url, form)?;
         parse_token_reply(status, ct.as_deref(), &body).with_context(|| format!("calling {url}"))
     }
+}
+
+const USER_AGENT: &str = concat!("devsandbox/", env!("CARGO_PKG_VERSION"));
+
+/// Refused past [`MAX_REPLY`], unread.
+fn bounded(url: &str, body: impl Read) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    body.take(MAX_REPLY + 1).read_to_end(&mut out).with_context(|| format!("reading {url}'s reply"))?;
+    if out.len() as u64 > MAX_REPLY {
+        bail!("{url} answered over {MAX_REPLY} bytes");
+    }
+    Ok(out)
 }
 
 /// `application/x-www-form-urlencoded`, also a URL's query: everything but

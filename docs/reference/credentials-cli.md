@@ -12,7 +12,7 @@ credentials they are, never on a machine (`--machine` refuses them).
 
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
-`obtain`, `create_url`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
+`obtain`, `create_url`, `check_request`, `read_check`, `check_token`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
 `pick_pending`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
 `forget_at`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/store.rs` (`Store`,
@@ -117,12 +117,31 @@ short). The github claim accepts fine-grained PATs (`github_pat_…`) and
 GitHub App user tokens (`ghu_…`), so a classic PAT (`ghp_…`) or gh's own
 OAuth token (`gho_…`), which reach every repo you can, is refused.
 
+An accepted secret is then checked (`check_token`) when the claim has a
+`check` route: that `GET`/`HEAD` on the claim's first upstream (as
+the claim lists them: their order is pinned), the secret in the claim's first `inject` slot, as the
+broker calls it (`check_request`), over `Flows.http` (the private
+address override only for a `private` upstream). The answer
+(`read_check`):
+
+- 401: refused, `the token was refused by <host> (401)`, nothing
+  written. Only a 401, as the broker's own check reads it: a 403 may be
+  a rate limit or an org policy, not a bad token.
+- 2xx: the claim's `checkShows` field of the JSON body (a top-level
+  string, e.g. GitHub's `login`) is whose the token is; the claim's
+  `tokens.expiry` header (`tokens::captured`) is a pasted secret's
+  `expires_at` (an OAuth record keeps its own expiry).
+- Anything else, or no answer (offline, a 403, a 5xx): a warning, the secret
+  stored unchecked.
+
 The record goes into the store first (an approved claim with no secret
 serves nothing), replacing any earlier one whole; then the entry (created
 with `--profile`s as `profiles`, none: unset) and the approved version
 into `credentials.toml`. A re-login touches the record only, but for
-clearing `broken` and `expires_at` (the new secret has its own). It
-prints `logged in …` with the approved version, or `secret replaced`.
+clearing `broken` and setting `expires_at` to the check's (else unset).
+It prints `logged in …` with `as <whose>` when the check showed it
+(escaped, `open::printable`), then the approved version, or `secret
+replaced`.
 
 ## `access approve`
 
@@ -132,7 +151,7 @@ its diff against the latest approved version (`review::diff`, rendered by
 `Diff::render`: upstreams `+`/`-`, routes added and removed per scope,
 `(new)` and `(dropped)` scopes, `never` routes `+`/`-`, and `also
 changed:` naming every other pinned field that differs, `mode`, `inject`,
-`login`, `refusal`, a kept scope's `permissions` and a login's `create`
+`login`, `checkShows`, `refusal`, a kept scope's `permissions` and a login's `create`
 page, `login.<method>.create`, among them), or its
 summary when none is approved. Same question as `login`. Approval moves
 the version from `pending` to the end of `approved`; older approved
@@ -296,8 +315,8 @@ offered, else `app`: a config only narrows, so a kind the credential
 doesn't offer, or the claim doesn't declare, refuses the run. `app`
 (installation tokens) is refused as not supported yet.
 
-`expires_at` (RFC 3339, UTC) is written by the broker: on an injected
-call with a pasted secret, the response's header the claim's
+`expires_at` (RFC 3339, UTC) is written by `login`, from its token
+check, and by the broker: on an injected call with a pasted secret, the response's header the claim's
 `tokens.expiry` names (GitHub's `github-authentication-token-expiration`,
 `2026-12-01 10:00:00 UTC` or with a numeric offset, `tokens::parse_expiry`)
 is recorded when it differs (`home::set_expires_at`). Within 7 days of a

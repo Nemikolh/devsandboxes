@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::credentials::claim::{self, Claim, Create, Level, Login, Scope};
+use crate::broker::head::Header;
+use crate::credentials::claim::{self, Claim, Create, Level, Login, Pinned, Route, Scope, Slot};
 use crate::credentials::home::{self, Entry, Home, Version};
 use crate::credentials::oauth::{self, Clock, Http, browser, device};
 use crate::credentials::store::{Record, Secret, Store};
@@ -44,6 +45,9 @@ pub(crate) struct Flows {
     pub browser: bool,
     pub open: Box<dyn FnMut(&str)>,
     pub browser_timeout: Duration,
+    /// The authority dialed for a claim's upstream host: the host itself,
+    /// a local server in tests.
+    pub authority: Box<dyn Fn(&str) -> String>,
 }
 
 impl Flows {
@@ -66,6 +70,7 @@ impl Flows {
                 }
             }),
             browser_timeout: browser::TIMEOUT,
+            authority: Box::new(str::to_string),
         }
     }
 }
@@ -367,6 +372,71 @@ fn obtain(
     }
 }
 
+/// What the claim's `check` route said of a token.
+#[derive(Debug, PartialEq)]
+enum Checked {
+    /// A 401, as the broker's `check_401` reads it: a 403 may be a rate
+    /// limit or an org policy, not a bad token.
+    Refused,
+    /// `shows`: the claim's `checkShows` field; `expires_at`: its expiry
+    /// header's (unix seconds).
+    Valid { shows: Option<String>, expires_at: Option<u64> },
+    /// Anything else: says nothing of the token.
+    Unknown(String),
+}
+
+/// The claim's `check` call with `token` in its first slot, as the broker
+/// makes it (`check_401`): method, URL on the first upstream at
+/// `authority`, headers, whether that upstream is private. `None`: no
+/// check, or no slot.
+fn check_request(pinned: &Pinned, token: &str, authority: &dyn Fn(&str) -> String) -> Option<(&'static str, String, Vec<Header>, bool)> {
+    let Some(Route::Http { method, path }) = &pinned.check else { return None };
+    let slot = pinned.inject.first()?;
+    let upstream = pinned.upstreams.first()?;
+    let mut path = path.clone();
+    let mut headers = Vec::new();
+    match slot {
+        Slot::Header { name, .. } => headers.push(Header { name: name.clone(), value: Vec::new() }),
+        Slot::Basic { .. } => headers.push(Header { name: "Authorization".into(), value: Vec::new() }),
+        Slot::Query { param } => {
+            path.push(if path.contains('?') { '&' } else { '?' });
+            path.push_str(param);
+            path.push('=');
+        }
+    }
+    crate::broker::policy::inject(&mut headers, &mut path, slot, token);
+    let url = format!("https://{}{path}", authority(&upstream.host));
+    Some((method.as_str(), url, headers, upstream.private))
+}
+
+/// The check's answer. A 2xx's body is read for `checkShows` only; a
+/// missing or non-string field shows nothing.
+fn read_check(pinned: &Pinned, status: u16, headers: &[Header], body: &[u8]) -> Checked {
+    match status {
+        401 => Checked::Refused,
+        200..=299 => {
+            let shows = pinned.check_shows.as_deref().and_then(|field| {
+                let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+                doc.get(field)?.as_str().filter(|s| !s.is_empty()).map(String::from)
+            });
+            let headers = headers.iter().map(|h| (h.name.as_str(), h.value.as_slice()));
+            let expires_at = crate::credentials::tokens::captured(pinned.tokens.as_ref(), headers, None);
+            Checked::Valid { shows, expires_at }
+        }
+        _ => Checked::Unknown(format!("it answered {status}")),
+    }
+}
+
+/// `None` when the claim has no check.
+fn check_token(pinned: &Pinned, token: &str, flows: &Flows) -> Option<Checked> {
+    let (method, url, headers, private) = check_request(pinned, token, &*flows.authority)?;
+    let answer = (flows.http)().and_then(|http| http.fetch(method, &url, &headers, private));
+    Some(match answer {
+        Ok((status, headers, body)) => read_check(pinned, status, &headers, &body),
+        Err(e) => Checked::Unknown(format!("{e:#}")),
+    })
+}
+
 /// Returns the line to print.
 pub(crate) fn login_at(
     data: &Path,
@@ -448,6 +518,20 @@ pub(crate) fn login_at(
 
     let record = obtain(login, name, page.as_deref(), args, term, flows)?;
     crate::credentials::tokens::check_accepted(pinned.tokens.as_ref(), record.access_token().expose(), &kind)?;
+    let (whose, expires_at) = match check_token(&pinned, record.access_token().expose(), flows) {
+        None => (None, None),
+        Some(Checked::Refused) => {
+            let host = pinned.upstreams.first().map_or("", |u| u.host.as_str());
+            bail!("the token was refused by {host} (401): nothing changed");
+        }
+        // A home may be offline.
+        Some(Checked::Unknown(why)) => {
+            term.show(&format!("warning: cannot check the token, stored unchecked: {}\n", crate::open::printable(&why)));
+            (None, None)
+        }
+        // An OAuth record carries its own expiry.
+        Some(Checked::Valid { shows, expires_at }) => (shows, expires_at.filter(|_| matches!(record, Record::Static { .. }))),
+    };
     // The secret first: a claim approved without one serves nothing.
     Store::in_data(data).put(name, &record)?;
     let profiles = (!args.profiles.is_empty()).then(|| args.profiles.clone());
@@ -457,12 +541,13 @@ pub(crate) fn login_at(
             bail!("credential `{name}` is a `{}` credential, not `{kind}`", entry.kind);
         }
         entry.broken = None;
-        entry.expires_at = None;
+        entry.expires_at = expires_at.map(crate::inbox::rfc3339);
         Ok(approving.cloned().map(|c| entry.approve(c)).unwrap_or(false))
     })?;
+    let whose = whose.map(|w| format!(" as {}", crate::open::printable(&w))).unwrap_or_default();
     Ok(match (approved, approving) {
-        (true, Some(c)) => format!("logged in `{name}` ({kind}); claim version {} approved", c.short()),
-        _ => format!("logged in `{name}` ({kind}): secret replaced"),
+        (true, Some(c)) => format!("logged in `{name}` ({kind}){whose}; claim version {} approved", c.short()),
+        _ => format!("logged in `{name}` ({kind}){whose}: secret replaced"),
     })
 }
 
@@ -556,6 +641,7 @@ pub(crate) mod tests {
             browser: false,
             open: Box::new(|_| {}),
             browser_timeout: Duration::from_secs(1),
+            authority: Box::new(str::to_string),
         }
     }
 
@@ -614,7 +700,7 @@ pub(crate) mod tests {
         let mut term = Script::new(false, &[], Some("tok-2"));
         let done = login_at(&data, &args("sentry-work"), Some(vec![sentry()]), &mut term).unwrap();
         assert!(done.ends_with("secret replaced"), "{done}");
-        assert!(term.shown.is_empty());
+        assert_eq!(term.shown, "warning: cannot check the token, stored unchecked: no network in this test\n");
         // And without one, which clears a broken mark.
         let at = home::Broken { at: "2026-11-21T10:00:00Z".into(), reason: "refused".into() };
         home::mark_broken(&home::path(&data), "sentry-work", at).unwrap();
@@ -765,6 +851,8 @@ pub(crate) mod tests {
             browser: true,
             open: Box::new(open),
             browser_timeout: Duration::from_secs(20),
+            // Nothing listens there: the check fails fast, a warning.
+            authority: Box::new(|_| "127.0.0.1:1".into()),
         }
     }
 
@@ -900,7 +988,7 @@ pub(crate) mod tests {
         assert!(url.ends_with("%20every%20profile"), "no permission asked: {url}");
         let mut term = Script::new(false, &[], Some("github_pat_3"));
         super::login_at(&data, &a, None, &mut term, &mut f).unwrap();
-        assert!(opened.borrow().is_empty() && term.shown.is_empty(), "{}", term.shown);
+        assert!(opened.borrow().is_empty() && term.shown.starts_with("warning: cannot check"), "{}", term.shown);
 
         let owner = Args { yes: true, owner: Some("acme".into()), ..args("s") };
         let err = login_at(&data, &owner, Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
@@ -909,6 +997,137 @@ pub(crate) mod tests {
         let err = login_at(&data, &blank, None, &mut Script::new(false, &[], Some("t"))).unwrap_err();
         assert!(err.to_string().contains("--owner must be non-empty"), "{err}");
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    const EXPIRY: &str = "2026-12-01 10:00:00 UTC";
+
+    /// Offline flows whose claim upstreams are a local server answering
+    /// `answer` to every request.
+    fn checked_by(answer: Vec<u8>) -> (Flows, crate::broker::serve::tests::Seen) {
+        let (port, seen) = crate::broker::serve::tests::upstream_server(move |_, _| answer.clone());
+        let mut f = offline();
+        f.http = Box::new(|| Ok(crate::credentials::oauth::tests::http()));
+        f.authority = Box::new(move |_| format!("127.0.0.1:{port}"));
+        (f, seen)
+    }
+
+    fn user(status: u16, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\ngithub-authentication-token-expiration: {EXPIRY}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn login_checks_the_token_and_says_whose_it_is() {
+        use crate::credentials::home::tests::github;
+        let data = temp("check-ok");
+        let (mut f, seen) = checked_by(user(200, r#"{"login":"alice","id":1}"#));
+        let a = Args { yes: true, ..args("gh") };
+        let mut term = Script::new(false, &[], Some("github_pat_1"));
+        let done = super::login_at(&data, &a, Some(vec![github()]), &mut term, &mut f).unwrap();
+        assert!(done.starts_with("logged in `gh` (github) as alice; claim version"), "{done}");
+        assert!(!term.shown.contains("warning"), "{}", term.shown);
+        let (head, _) = seen.lock().unwrap()[0].clone();
+        assert!(head.starts_with("GET /user HTTP/1.1\r\n"), "{head}");
+        assert!(head.contains("\r\nauthorization: token github_pat_1\r\n"), "{head}");
+        let e = &home::load(&home::path(&data)).unwrap()["gh"];
+        assert_eq!(e.expires(), crate::credentials::tokens::parse_expiry(EXPIRY));
+        assert!(e.expires().is_some());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_refused_token_is_not_stored() {
+        use crate::credentials::home::tests::github;
+        let data = temp("check-refused");
+        let a = Args { yes: true, ..args("gh") };
+        let (mut f, _) = checked_by(user(401, r#"{"message":"Bad credentials"}"#));
+        let mut term = Script::new(false, &[], Some("github_pat_1"));
+        let err = super::login_at(&data, &a, Some(vec![github()]), &mut term, &mut f).unwrap_err().to_string();
+        assert_eq!(err, "the token was refused by api.github.com (401): nothing changed");
+        assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+    }
+
+    #[test]
+    fn the_check_goes_to_the_first_upstream_declared() {
+        let data = temp("check-host");
+        let (port, seen) = crate::broker::serve::tests::upstream_server(|_, _| user(200, "{}"));
+        let mut f = offline();
+        f.http = Box::new(|| Ok(crate::credentials::oauth::tests::http()));
+        let hosts = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let asked = hosts.clone();
+        f.authority = Box::new(move |h| {
+            asked.borrow_mut().push(h.to_string());
+            format!("127.0.0.1:{port}")
+        });
+        let a = Args { yes: true, ..args("s") };
+        let mut term = Script::new(false, &[], Some("sntryu_1"));
+        super::login_at(&data, &a, Some(vec![sentry()]), &mut term, &mut f).unwrap();
+        assert_eq!(*hosts.borrow(), ["sentry.io"]);
+        let (head, _) = seen.lock().unwrap()[0].clone();
+        assert!(head.starts_with("GET /api/0/ HTTP/1.1\r\n"), "{head}");
+        assert!(head.contains("\r\nauthorization: Bearer sntryu_1\r\n"), "{head}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn an_unchecked_token_is_stored_with_a_warning() {
+        use crate::credentials::home::tests::github;
+        let data = temp("check-unknown");
+        let (mut f, _) = checked_by(user(403, r#"{"message":"API rate limit exceeded"}"#));
+        let a = Args { yes: true, ..args("gh") };
+        let mut term = Script::new(false, &[], Some("github_pat_1"));
+        let done = super::login_at(&data, &a, Some(vec![github()]), &mut term, &mut f).unwrap();
+        assert!(done.starts_with("logged in `gh` (github); claim version"), "{done}");
+        assert!(term.shown.ends_with("\nwarning: cannot check the token, stored unchecked: it answered 403\n"), "{}", term.shown);
+        assert_eq!(Store::in_data(&data).token_now("gh").unwrap().unwrap().expose(), "github_pat_1");
+        assert_eq!(home::load(&home::path(&data)).unwrap()["gh"].expires_at, None);
+
+        let mut term = Script::new(false, &[], Some("github_pat_2"));
+        let done = super::login_at(&data, &args("gh"), None, &mut term, &mut offline()).unwrap();
+        assert!(done.ends_with("secret replaced"), "{done}");
+        assert!(term.shown.contains("stored unchecked: no network in this test"), "{}", term.shown);
+        assert_eq!(Store::in_data(&data).token_now("gh").unwrap().unwrap().expose(), "github_pat_2");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_check_puts_the_token_in_the_claim_s_slot() {
+        let mut p = sentry().pinned;
+        let host = |h: &str| format!("{h}:8443");
+        let (method, url, headers, private) = check_request(&p, "t", &host).unwrap();
+        assert_eq!((method, url.as_str(), private), ("GET", "https://sentry.io:8443/api/0/", false));
+        assert_eq!(headers, [Header { name: "authorization".into(), value: b"Bearer t".to_vec() }]);
+        p.inject = vec![Slot::Query { param: "key".into() }];
+        p.upstreams[0].private = true;
+        let (_, url, headers, private) = check_request(&p, "a b", &host).unwrap();
+        assert_eq!((url.as_str(), private), ("https://sentry.io:8443/api/0/?key=a%20b", true));
+        assert!(headers.is_empty());
+        p.check = None;
+        assert!(check_request(&p, "t", &host).is_none());
+    }
+
+    #[test]
+    fn the_check_s_answer_reads_whose_and_until_when() {
+        use crate::credentials::home::tests::github;
+        let p = github().pinned;
+        let expiry = [Header { name: "GitHub-Authentication-Token-Expiration".into(), value: EXPIRY.into() }];
+        let valid = |shows: Option<&str>, expires_at| Checked::Valid { shows: shows.map(String::from), expires_at };
+        let at = crate::credentials::tokens::parse_expiry(EXPIRY);
+        assert_eq!(read_check(&p, 200, &expiry, br#"{"login":"alice"}"#), valid(Some("alice"), at));
+        assert_eq!(read_check(&p, 204, &[], b""), valid(None, None));
+        assert_eq!(read_check(&p, 200, &[], br#"{"login":7}"#), valid(None, None));
+        assert_eq!(read_check(&p, 200, &[], b"not json"), valid(None, None));
+        assert_eq!(read_check(&p, 401, &expiry, b""), Checked::Refused);
+        assert_eq!(read_check(&p, 403, &[], b""), Checked::Unknown("it answered 403".into()));
+        assert_eq!(read_check(&p, 500, &[], b""), Checked::Unknown("it answered 500".into()));
+        assert_eq!(read_check(&p, 404, &[], b""), Checked::Unknown("it answered 404".into()));
+        let mut quiet = p.clone();
+        quiet.check_shows = None;
+        assert_eq!(read_check(&quiet, 200, &[], br#"{"login":"alice"}"#), valid(None, None));
     }
 
     #[test]

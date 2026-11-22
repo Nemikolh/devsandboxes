@@ -44,7 +44,7 @@ pub const GRAPHQL_PATH: &str = "/graphql";
 
 const FIELDS: &[&str] = &[
     "upstreams", "mode", "inject", "phantom", "git", "baseUrl", "rewrite", "login", "check",
-    "mint", "scopes", "never", "presence", "hold", "refusal", "fence", "ca", "lfs", "tokens",
+    "checkShows", "mint", "scopes", "never", "presence", "hold", "refusal", "fence", "ca", "lfs", "tokens",
 ];
 
 const MAX_ACCEPT: usize = 8;
@@ -92,12 +92,18 @@ pub fn from_canonical(canonical: &str) -> Result<(String, Pinned)> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Pinned {
+    /// As declared, not sorted: the first is where `login` checks a token
+    /// (and `baseUrl`'s).
     pub upstreams: Vec<Upstream>,
     pub mode: Mode,
     pub inject: Vec<Slot>,
     pub rewrite: Vec<Rewrite>,
     pub login: Vec<Login>,
     pub check: Option<Route>,
+    /// A top-level string field of `check`'s response naming whose the
+    /// token is (GitHub's `login`): `login` shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_shows: Option<String>,
     pub mint: Option<Mint>,
     pub scopes: BTreeMap<String, Scope>,
     pub never: Vec<Route>,
@@ -514,9 +520,8 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
 
     let mode: Mode = required(obj, "mode")?;
     let raw_upstreams: Vec<RawUpstream> = required(obj, "upstreams")?;
-    let mut upstreams = upstreams(raw_upstreams)?;
+    let upstreams = upstreams(raw_upstreams)?;
     let first_upstream = upstreams[0].host.clone();
-    upstreams.sort();
     let hosts: BTreeSet<&str> = upstreams.iter().map(|u| u.host.as_str()).collect();
 
     let inject = inject(field(obj, "inject")?.unwrap_or_default())?;
@@ -533,6 +538,15 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
         None => None,
         Some(raw) => Some(check_route(&raw).context("`check`")?),
     };
+    let check_shows: Option<String> = field(obj, "checkShows")?;
+    if let Some(name) = &check_shows {
+        if check.is_none() {
+            bail!("`checkShows` reads `check`'s response: the claim has no `check`");
+        }
+        if !is_ident(name, true) {
+            bail!("`checkShows`: `{name}` isn't a field name (letters, digits, `_` and `-`)");
+        }
+    }
     let mint: Option<Mint> = field(obj, "mint")?;
     let scopes = scopes(field(obj, "scopes")?.unwrap_or_default())?;
     let never = never(field(obj, "never")?.unwrap_or_default(), &scopes)?;
@@ -561,6 +575,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
             rewrite,
             login,
             check,
+            check_shows,
             mint,
             scopes,
             never,
@@ -1336,7 +1351,7 @@ mod tests {
         let p = &c.pinned;
         assert_eq!(p.mode, Mode::BaseUrl);
         let hosts: Vec<&str> = p.upstreams.iter().map(|u| u.host.as_str()).collect();
-        assert_eq!(hosts, ["de.sentry.io", "sentry.io", "us.sentry.io"]);
+        assert_eq!(hosts, ["sentry.io", "us.sentry.io", "de.sentry.io"]);
         assert!(p.upstreams.iter().all(|u| !u.private));
         assert_eq!(
             p.inject,
@@ -1650,6 +1665,17 @@ mod tests {
         assert_err(sentry_with("check", json!("GET /api/0/organizations/{org}/")), &["`check`", "no `{var}`"]);
         assert_err(sentry_with("check", json!("POST /api/0/")), &["`check`", "a `GET` or `HEAD`"]);
         assert_err(sentry_with("check", json!("graphql mutation x")), &["`check`"]);
+
+        let c = parse("sentry", &sentry_with("checkShows", json!("user_name"))).unwrap();
+        assert_eq!(c.pinned.check_shows.as_deref(), Some("user_name"));
+        assert!(c.canonical().contains(r#""checkShows":"user_name""#), "{}", c.canonical());
+        assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
+        assert!(!sentry().canonical().contains("checkShows"), "absent stays absent");
+        assert_err(sentry_with("checkShows", json!("user.name")), &["`checkShows`", "isn't a field name"]);
+        assert_err(sentry_with("checkShows", json!("")), &["isn't a field name"]);
+        let mut unchecked = sentry_with("checkShows", json!("login"));
+        unchecked.as_object_mut().unwrap().remove("check");
+        assert_err(unchecked, &["the claim has no `check`"]);
     }
 
     #[test]
@@ -1807,15 +1833,17 @@ mod tests {
         let base = sentry().version();
         let mut claim = sentry_value();
         let obj = claim.as_object_mut().unwrap();
-        for list in ["upstreams", "never", "rewrite"] {
+        for list in ["never", "rewrite"] {
             obj.get_mut(list).unwrap().as_array_mut().unwrap().reverse();
         }
         for scope in obj["scopes"].as_object_mut().unwrap().values_mut() {
             scope["routes"].as_array_mut().unwrap().reverse();
         }
+        assert_eq!(parse("sentry", &claim).unwrap().version(), base);
+        // The first upstream is pinned: the host `login` checks a token on.
+        claim["upstreams"].as_array_mut().unwrap().reverse();
         let reordered = parse("sentry", &claim).unwrap();
-        assert_eq!(reordered.version(), base);
-        // the first upstream is wiring: baseUrl's target moves, the version doesn't
+        assert_ne!(reordered.version(), base);
         assert_eq!(reordered.wiring.base_url.unwrap().upstream, "de.sentry.io");
 
         let two = |a: Value, b: Value| version_of(sentry_with("inject", json!([a, b])));
@@ -1862,6 +1890,7 @@ mod tests {
         changed(sentry_with("inject", json!([{ "query": "token" }])), "slot");
         changed(sentry_with("check", json!("HEAD /api/0/")), "check");
         changed(sentry_with("check", Value::Null), "no check");
+        changed(sentry_with("checkShows", json!("user")), "checkShows");
         changed(sentry_with("hold", json!(30)), "hold");
         changed(sentry_with("mint", json!("oauth-refresh")), "mint");
         changed(sentry_with("refusal", json!({ "shape": "json", "field": "message" })), "refusal");

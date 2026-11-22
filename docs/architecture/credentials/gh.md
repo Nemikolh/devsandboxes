@@ -27,7 +27,8 @@ and `github.com` (git's own proxy port, `git.hosts`), injected as
 `GH_TOKEN` and `~/.config/gh/hosts.yml`; `GITHUB_TOKEN` isn't set, so
 tools that only read it stay unauthenticated rather than pick up a
 phantom the plan never named. `tokens` takes `github_pat_` and `ghu_`,
-acting as `user` or `app`; `check` is `GET /user`; refusals are GitHub's
+acting as `user` or `app`; `check` is `GET /user`, whose `login`
+(`checkShows`) `devsandbox login` prints as the account logged in; refusals are GitHub's
 JSON `message`. `login` is paste, whose `create` page is GitHub's
 fine-grained PAT form (`settings/personal-access-tokens/new`) prefilled
 with the granted scopes' permissions (`login --owner` prefills the

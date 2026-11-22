@@ -16,7 +16,8 @@ Code: `src/credentials/oauth/mod.rs` (`Http`, `parse_token_reply`,
 `parse_authorization`, `Poller`, `poll`), `src/credentials/oauth/browser.rs`
 (`login`, `authorize_url`, `callback`, `TIMEOUT`),
 `src/credentials/store.rs` (`Record`, `OAuthToken`, `Store::renew`),
-`src/commands/login.rs` (`obtain`, `create_url`, `Flows`).
+`src/commands/login.rs` (`obtain`, `create_url`, `check_request`,
+`read_check`, `check_token`, `Flows`).
 
 ## The endpoints
 
@@ -26,7 +27,9 @@ with the private override off, so each address dialed passes the public
 address check: a claim's `deviceUrl` or `tokenUrl` can't reach the home's
 LAN or loopback. Requests are form posts with `Accept: application/json`
 (GitHub answers a form otherwise; both are parsed) and a `User-Agent`;
-replies past 64 KiB are refused.
+replies past 64 KiB are refused. `Http::fetch` is the one other call:
+the check of a logged-in token (below), the only one whose address check
+may let a private address through, for a claim's `private` upstream.
 
 `parse_token_reply` reads a token endpoint's answer: an `error` field is
 an `OAuthError` whatever the status (GitHub answers errors with a 200), a
@@ -78,6 +81,21 @@ it, pure, with `form_encode`: the token's name, description, owner and,
 with `permissions`, the granted scopes' permissions at their highest
 level ([credentials CLI](../../reference/credentials-cli.md#login)).
 
+## The token check
+
+Whatever the method, an accepted secret is sent once to the claim's
+`check` route before anything is stored (`check_token`): the request the
+broker makes on a 401 (`check_401`), built by `check_request` (the first
+upstream the claim declares, an order its version pins; the first
+`inject` slot), sent with `Http::fetch` to the authority
+`Flows.authority` maps the host to (the host itself; a local server in
+tests). `read_check` reads the answer, pure: only a 401 refuses the
+login, as only a 401 marks a credential broken in the broker (a 403 may
+be a rate limit or an org policy); a 2xx gives whose the token is (the claim's `checkShows` field)
+and a pasted token's expiry (`tokens::captured`); anything else, or a
+failed call, is a warning and the secret is stored unchecked, so a home
+that is offline can still log in.
+
 ## The record
 
 Either flow ends in an `OAuthToken` (`TokenSet::into_record`): the
@@ -87,6 +105,6 @@ seconds, the scope granted, and what a refresh needs: `token_url` and the
 none, leaving the app to the home, and then `login` requires
 `--client-id`). `login` stores it as
 `Record::OAuth`, replacing the credential's record whole, and clears the
-entry's `broken` mark. The broker renews the token with the refresh token
+entry's `broken` mark and `expires_at` (the record carries its own). The broker renews the token with the refresh token
 ahead of expiry and after a 401, storing a rotated refresh token with it
 ([broker](broker.md#renewal), `oauth::refresh`).

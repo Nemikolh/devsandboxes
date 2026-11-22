@@ -589,9 +589,9 @@ mod tests {
         let c = &first[0];
         assert_eq!((c.kind.as_str(), c.phantom.as_str()), ("sentry", "sntrys_1"));
         assert_eq!(c.version, sentry().version());
-        // Upstreams sorted at parse; ports from the bottom of the range.
+        // Upstreams in the claim's order; ports from the bottom of the range.
         let got: Vec<(u16, &str)> = c.listeners.iter().map(|l| (l.port, l.upstream.as_str())).collect();
-        assert_eq!(got, [(29000, "de.sentry.io"), (29001, "sentry.io"), (29002, "us.sentry.io")]);
+        assert_eq!(got, [(29000, "sentry.io"), (29001, "us.sentry.io"), (29002, "de.sentry.io")]);
 
         let again = plan(&selected, &first, None, None, None, |_| panic!("kept")).unwrap().claims;
         assert_eq!(again, first);
@@ -599,10 +599,10 @@ mod tests {
         // A new version drops one upstream and adds one: the others keep
         // theirs, the new one takes the lowest free port.
         let mut prior = first.clone();
-        prior[0].listeners.retain(|l| l.upstream != "de.sentry.io");
+        prior[0].listeners.retain(|l| l.upstream != "us.sentry.io");
         let next = plan(&selected, &prior, None, None, None, counter()).unwrap().claims;
         let got: Vec<(u16, &str)> = next[0].listeners.iter().map(|l| (l.port, l.upstream.as_str())).collect();
-        assert_eq!(got, [(29000, "de.sentry.io"), (29001, "sentry.io"), (29002, "us.sentry.io")]);
+        assert_eq!(got, [(29000, "sentry.io"), (29001, "us.sentry.io"), (29002, "de.sentry.io")]);
         assert_eq!(next[0].phantom, "sntrys_1");
 
         // A phantom without the claim's head is minted again.
@@ -637,12 +637,12 @@ mod tests {
         // A rebuild whose sentry claim gained an upstream: both proxy ports
         // keep their numbers, the new listener takes the next free one.
         let mut prior = first.claims.clone();
-        prior[0].listeners.retain(|l| l.upstream != "us.sentry.io");
+        prior[0].listeners.retain(|l| l.upstream != "de.sentry.io");
         let next = plan(&selected, &prior, Some(29002), Some(29004), None, counter()).unwrap();
         assert_eq!(next.proxy.as_ref().map(|p| p.port), Some(29002));
         assert_eq!(next.git.as_ref().map(|p| p.port), Some(29004));
-        let us = next.claims[0].listeners.iter().find(|l| l.upstream == "us.sentry.io").unwrap();
-        assert_eq!(us.port, 29003);
+        let added = next.claims[0].listeners.iter().find(|l| l.upstream == "de.sentry.io").unwrap();
+        assert_eq!(added.port, 29003);
         let again = plan(&selected, &first.claims, Some(29003), Some(29004), None, counter()).unwrap();
         assert_eq!((again.proxy, again.git), (first.proxy.clone(), first.git.clone()));
         // An instance from before git's port gets one, the lowest free.
@@ -736,7 +736,7 @@ mod tests {
             env(&claim, &rec),
             [
                 ("SENTRY_AUTH_TOKEN".to_string(), "sntrys_1".to_string()),
-                ("SENTRY_URL".to_string(), "http://127.0.0.1:29001".to_string())
+                ("SENTRY_URL".to_string(), "http://127.0.0.1:29000".to_string())
             ]
         );
         let (files, warnings) = render_files(&claim, &rec, "/home/dev/", "dev", &["/workspaces/x".into()]);
@@ -746,7 +746,7 @@ mod tests {
             [File {
                 path: "/home/dev/.sentryclirc".into(),
                 owner: "dev".into(),
-                content: "[defaults]\nurl = http://127.0.0.1:29001\n\n[auth]\ntoken = sntrys_1\n".into(),
+                content: "[defaults]\nurl = http://127.0.0.1:29000\n\n[auth]\ntoken = sntrys_1\n".into(),
             }]
         );
         for target in ["/home/dev", "/home/dev/", "/", "/home/dev/.sentryclirc"] {
@@ -797,7 +797,7 @@ mod tests {
         rec[0].files = files;
         assert_eq!(by_phantom(&rec, "sntrys_1").map(|c| c.kind.as_str()), Some("sentry"));
         assert!(by_phantom(&rec, "sntrys_2").is_none());
-        assert_eq!(by_port(&rec, 29002).map(|(_, u)| u), Some("us.sentry.io"));
+        assert_eq!(by_port(&rec, 29002).map(|(_, u)| u), Some("de.sentry.io"));
         let shared = planned.proxy.unwrap();
         let i = Intercept {
             port: shared.port,
@@ -819,7 +819,7 @@ mod tests {
         let spec = broker_spec(&rec, None).unwrap();
         let text = brokerfile::serialize(&spec);
         assert_eq!(brokerfile::parse(&text), Ok(spec.clone()));
-        assert!(text.starts_with("listen 29000 base-url de.sentry.io\n"), "{text}");
+        assert!(text.starts_with("listen 29000 base-url sentry.io\n"), "{text}");
         assert_eq!(spec.files[0].phantom, "sntrys_1");
         assert_eq!(spec.files[0].path, "/home/dev/.sentryclirc");
 

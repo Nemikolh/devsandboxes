@@ -308,6 +308,14 @@ mod tests {
     }
 
     #[test]
+    fn the_check_s_shown_field_is_a_change() {
+        let old_json = sentry_json();
+        let mut c = old_json.clone();
+        c["checkShows"] = json!("user");
+        assert_eq!(diff(&view(&old_json), &view(&c)).changed, ["checkShows"]);
+    }
+
+    #[test]
     fn bad_versions_are_refused() {
         for bad in ["", "[]", r#"{"kind":"x"}"#, r#"{"kind":"x","claim":{"never":"GET /"}}"#] {
             assert!(View::parse(bad).is_err(), "{bad}");
