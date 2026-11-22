@@ -12,17 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **credentials**: credential-broker steps 1-3 (the broker, `login` by
-  paste, device flow and browser OAuth with renewal behind the phantom,
-  `access approve|ls|revoke`, the member CA and intercept mode),
-  github-and-sentry-access step 1 (sentry-cli through `features/sentry`)
-  and git-gateway step 1 (git through the broker with the repo fence, LFS
-  and the relay's key filtering) are done, and so is github-and-sentry-access
-  step 2's `features/gh` (its scope table checked against gh 2.105.0's
-  calls and GitHub's GraphQL schema, gh end to end through the broker);
-  now the live config moving to it.
-  → [plan](plans/active/github-and-sentry-access.md),
-  [gh](architecture/credentials/gh.md)
+Nothing.
 
 ## Planned
 
@@ -47,8 +37,11 @@ is frozen: no new work on it.
   → [plan](plans/active/isolation.md)
 - **credentials**: no secret in any sandbox: a broker in `serve` swaps
   per-instance phantoms for credentials kept at their home member, under
-  per-sandbox policy; after gh: permission requests, `CRED` over the
-  fleet, signed policy, delegation, git push rules and clones.
+  per-sandbox policy. Built locally: sentry-cli, gh and git (credential-broker
+  steps 1-3, github-and-sentry-access steps 1-2, git-gateway step 1). Next:
+  permission requests, `CRED` over the fleet (then the live config drops its
+  gh and sentry mounts), signed policy, delegation and installation tokens,
+  git push rules and clones.
   → [plan](plans/active/credential-broker.md); per tool:
   [gh and sentry-cli](plans/active/github-and-sentry-access.md),
   [git over smart HTTP, clones replacing worktrees](plans/active/git-gateway.md)
