@@ -1,3 +1,9 @@
+> Archived 2026-11-22. Historical, may be wrong; do not use as a reference.
+> Current: [daemon/updates.md](../../architecture/daemon/updates.md),
+> [credentials CLI](../../reference/credentials-cli.md),
+> [ADR 0060](../../decisions/0060-an-image-runs-the-updates-it-was-built-with.md),
+> github.com/devsandboxes/features (`src/sentry`)
+
 # Sentry's new CLI, and two update/run fixes
 
 Status: agreed; building.

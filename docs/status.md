@@ -12,9 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **credentials / features**: Sentry's new CLI in the sentry feature; a
-  run refused for an unapproved claim rolls back; updates come from the
-  image's label. → [plan](plans/active/sentry-and-update-fixes.md)
+Nothing.
 
 ## Planned
 
@@ -342,6 +340,11 @@ is frozen: no new work on it.
 
 ### credentials
 
+- Sentry's `sentry` CLI shows its own "permission denied" for a call the
+  broker refuses, not the broker's reason; only `access.log` has it. The
+  sentry claim takes any token prefix (its device-flow tokens have none),
+  so an org token is stored unchecked.
+  → [broker](architecture/credentials/broker.md)
 - `github-app-manifest` logins are refused
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
   `approvers` and `delegate` parse and `access ls` lists them, but
