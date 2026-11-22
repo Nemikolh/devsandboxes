@@ -1,3 +1,8 @@
+> Archived 2026-11-22. Historical, may be wrong; do not use as a reference.
+> Current: [daemon/updates.md](../../architecture/daemon/updates.md),
+> [ADR 0059](../../decisions/0059-feature-updates-run-in-the-features-image.md),
+> github.com/devsandboxes/features (`src/zidane`, `src/sentry`)
+
 # zidane and sentry updates
 
 Status: agreed; building.
