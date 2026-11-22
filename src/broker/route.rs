@@ -18,6 +18,8 @@
 //! the decoded path matched (gh sends `git/ref/tags%2Fv1`); a double
 //! encoding (`%25XX`) or a dot-segment or `//` after decoding is refused.
 
+use serde::Deserialize;
+
 use crate::credentials::claim::{self, Method, Pinned, Route};
 use crate::credentials::fence;
 
@@ -159,8 +161,40 @@ pub fn git_service(m: &str, target: &str) -> Option<&'static str> {
     SERVICES.into_iter().find(|s| m == "POST" && *s == last)
 }
 
+/// The git-lfs batch API: `POST …/info/lfs/objects/batch`.
+pub fn lfs_batch(m: &str, target: &str) -> bool {
+    m == "POST" && path_only(target).ends_with("/info/lfs/objects/batch")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LfsOp {
+    Download,
+    Upload,
+}
+
+/// The bound on an LFS batch request body the broker reads before policy:
+/// git-lfs sends at most 100 objects of an oid and a size per batch.
+pub const MAX_LFS_BATCH: u64 = 1024 * 1024;
+
+/// A batch request body's `operation`: a JSON object naming it once, as
+/// `download` or `upload`.
+pub fn lfs_operation(body: &[u8]) -> Result<LfsOp, &'static str> {
+    #[derive(Deserialize)]
+    struct Batch {
+        operation: String,
+    }
+    let batch: Batch = serde_json::from_slice(body)
+        .map_err(|_| "an LFS batch body that isn't a JSON object naming its `operation` once")?;
+    match batch.operation.as_str() {
+        "download" => Ok(LfsOp::Download),
+        "upload" => Ok(LfsOp::Upload),
+        _ => Err("an LFS batch `operation` other than `download` or `upload`"),
+    }
+}
+
 /// A call that would change something upstream: git's receive-pack, and
 /// any method but `GET`/`HEAD` other than upload-pack (a fetch's `POST`).
+/// An LFS batch's own answer is its [`LfsOp`], which policy reads.
 pub fn is_write(m: &str, target: &str) -> bool {
     match git_service(m, target) {
         Some(s) => s == "git-receive-pack",
@@ -332,6 +366,31 @@ mod tests {
         assert!(!is_write("HEAD", "/repos/o/r"));
         assert!(is_write("POST", "/repos/o/r/pulls"));
         assert!(is_write("POST", "/o/r/info/lfs/objects/batch"));
+    }
+
+    #[test]
+    fn lfs_batches_and_their_operation() {
+        assert!(lfs_batch("POST", "/o/r.git/info/lfs/objects/batch"));
+        assert!(lfs_batch("POST", "/o/r/info/lfs/objects/batch?x=1"));
+        assert!(!lfs_batch("GET", "/o/r.git/info/lfs/objects/batch"));
+        assert!(!lfs_batch("POST", "/o/r.git/info/lfs/objects/batch/"));
+        assert!(!lfs_batch("POST", "/o/r.git/info/lfs/locks/verify"));
+
+        let op = |b: &str| lfs_operation(b.as_bytes());
+        assert_eq!(op(r#"{"operation":"download","objects":[{"oid":"a","size":1}]}"#), Ok(LfsOp::Download));
+        assert_eq!(op(r#"{"transfers":["basic"],"operation":"upload","ref":{"name":"refs/heads/x"}}"#), Ok(LfsOp::Upload));
+        for bad in [
+            r#"{"operation":"download","operation":"upload"}"#,
+            r#"{"operation":"Download"}"#,
+            r#"{"operation":"verify"}"#,
+            r#"{"operation":1}"#,
+            r#"{"objects":[]}"#,
+            r#"["operation"]"#,
+            r#"{"operation":"download"} x"#,
+            "",
+        ] {
+            assert!(op(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

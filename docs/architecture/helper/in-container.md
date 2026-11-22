@@ -121,6 +121,10 @@ file: nothing to do. A file that doesn't parse is logged and ignored.
   `ProxyHeader` (`base-url <upstream> <port>`) as the stream's first bytes
   (`Mux::attach_with_header`), the client's bytes after it, flow-controlled.
   No such bridge → a fixed `503 Service Unavailable` (`broker::refuse`).
+  The one `listen <port> lfs` line (an instance whose claim pins `lfs`)
+  is the LFS transfers' listener, served the same way with `lfs <port>`
+  as its header: the broker maps each request's path to a transfer it
+  handed out ([git](../credentials/git.md#lfs)).
 - **Proxy ports** ([below](#proxy-ports)): each `proxy-listen` line.
 - `credential` lines aren't the daemon's: `devsbd credential` reads them
   ([below](#devsbd-credential-getstoreerase)).

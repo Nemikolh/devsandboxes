@@ -374,8 +374,12 @@ is frozen: no new work on it.
   refused (github-and-sentry-access step 2); a placed or remote instance's
   fence doesn't travel with it. Pushes in the fence get no branch or tag
   rules and a refused one is a plain `403` at `info/refs`, not a
-  `report-status` (git-gateway step 2). Out of the fence an LFS batch
-  `POST` counts as a write, so public LFS downloads there are refused. Only
+  `report-status` (git-gateway step 2). LFS transfer handles live in the
+  daemon's memory: a daemon restart between a batch and its transfers
+  answers them 404, and git-lfs must be run again; an injected batch
+  response that isn't JSON or is over the rewrite bound passes with its
+  actions' headers (only the injected token masked); transfer adapters
+  other than `basic` (tus, ssh) aren't rewritten. Only
   the github test fixture claims a fence: the real `features/gh` claim is
   github-and-sentry-access step 2. No token and registration
   endpoints a claim could mark (no claim field). A credential marked

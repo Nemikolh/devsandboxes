@@ -85,6 +85,10 @@ pub struct Intercept {
     /// points there (docs/architecture/credentials/git.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<ProxyPort>,
+    /// The LFS transfers' listener, from [`PORTS`], kept by `rebuild`: with a
+    /// claim pinning `lfs`, batch responses point transfers at its handles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfs: Option<u16>,
     /// [`original_proxy_env`]; never the `HTTPS_PROXY` `run` sets, which
     /// would loop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -119,6 +123,8 @@ pub struct Planned {
     pub proxy: Option<ProxyPort>,
     /// git's own port: `None` without a claim naming `git.hosts`.
     pub git: Option<ProxyPort>,
+    /// The LFS listener's port: `None` without a claim pinning `lfs`.
+    pub lfs: Option<u16>,
 }
 
 /// A phantom file as devsbd writes it ([`brokerfile::PhantomFile`]).
@@ -143,9 +149,11 @@ pub fn by_port(claims: &[InstanceClaim], port: u16) -> Option<(&InstanceClaim, &
         .find_map(|c| c.listeners.iter().find(|l| l.port == port).map(|l| (c, l.upstream.as_str())))
 }
 
-/// Every broker port: the listeners, then the shared proxy port, then git's.
+/// Every broker port: the listeners, then the shared proxy port, git's and
+/// the LFS listener.
 pub fn ports<'a>(claims: &'a [InstanceClaim], intercept: Option<&'a Intercept>) -> impl Iterator<Item = u16> + 'a {
-    let proxies = intercept.into_iter().flat_map(|i| std::iter::once(i.port).chain(i.git.as_ref().map(|g| g.port)));
+    let proxies =
+        intercept.into_iter().flat_map(|i| std::iter::once(i.port).chain(i.git.as_ref().map(|g| g.port)).chain(i.lfs));
     claims.iter().flat_map(|c| c.listeners.iter().map(|l| l.port)).chain(proxies)
 }
 
@@ -162,6 +170,11 @@ pub fn forward_refusal(claims: &[InstanceClaim], intercept: Option<&Intercept>, 
             "port {port} of `{key}` is git's credential broker proxy port, which only the sandbox itself may reach"
         ));
     }
+    if intercept.and_then(|i| i.lfs) == Some(port) {
+        return Some(format!(
+            "port {port} of `{key}` is its credential broker LFS listener, which only the sandbox itself may reach"
+        ));
+    }
     let (claim, _) = by_port(claims, port)?;
     Some(format!(
         "port {port} of `{key}` is its `{}` credential broker listener, which only the sandbox itself may reach",
@@ -175,6 +188,7 @@ pub fn broker_spec(claims: &[InstanceClaim], intercept: Option<&Intercept>) -> O
     if claims.is_empty() {
         return None;
     }
+    let lfs = intercept.and_then(|i| i.lfs).map(|port| brokerfile::Listener { port, mode: brokerfile::Mode::Lfs });
     let listeners = claims
         .iter()
         .flat_map(|c| &c.listeners)
@@ -182,6 +196,7 @@ pub fn broker_spec(claims: &[InstanceClaim], intercept: Option<&Intercept>) -> O
             port: l.port,
             mode: brokerfile::Mode::BaseUrl { upstream: l.upstream.clone() },
         })
+        .chain(lfs)
         .collect();
     let files = claims
         .iter()
@@ -258,7 +273,7 @@ pub fn mint_incarnation() -> Result<String> {
     random_base62(PHANTOM_RANDOM)
 }
 
-fn random_base62(len: usize) -> Result<String> {
+pub(crate) fn random_base62(len: usize) -> Result<String> {
     let mut out = String::with_capacity(len);
     let mut buf = [0u8; 64];
     while out.len() < len {
@@ -278,16 +293,18 @@ fn random_base62(len: usize) -> Result<String> {
 /// [`render_files`], and the shared proxy port. Base-URL claims get a
 /// listener per upstream; intercept claims none: their upstreams go on the
 /// shared port, but for the hosts their `git` field names, which go on
-/// git's own port (git-gateway). From `prior` (the instance being rebuilt)
-/// each kind keeps its phantom, while it still has the claim's head, each
-/// upstream its port, the shared port `prior_port` and git's
-/// `prior_git_port`; new ones take the lowest free ports of [`PORTS`].
-/// `mint` makes a new phantom.
+/// git's own port (git-gateway); a claim pinning `lfs` adds the LFS
+/// listener. From `prior` (the instance being rebuilt) each kind keeps its
+/// phantom, while it still has the claim's head, each upstream its port,
+/// the shared port `prior_port`, git's `prior_git_port` and the LFS
+/// listener `prior_lfs_port`; new ones take the lowest free ports of
+/// [`PORTS`]. `mint` makes a new phantom.
 pub fn plan(
     selected: &[(String, Claim)],
     prior: &[InstanceClaim],
     prior_port: Option<u16>,
     prior_git_port: Option<u16>,
+    prior_lfs_port: Option<u16>,
     mut mint: impl FnMut(&Claim) -> Result<String>,
 ) -> Result<Planned> {
     let mut taken: BTreeSet<u16> = BTreeSet::new();
@@ -331,6 +348,8 @@ pub fn plan(
     let git_hosts: BTreeSet<String> = intercepting.iter().flat_map(|c| git_of(c)).collect();
     let kept_port = prior_port.filter(|p| !intercepting.is_empty() && PORTS.contains(p) && taken.insert(*p));
     let kept_git = prior_git_port.filter(|p| !git_hosts.is_empty() && PORTS.contains(p) && taken.insert(*p));
+    let lfs_wanted = intercepting.iter().any(|c| c.pinned.lfs.is_some());
+    let kept_lfs = prior_lfs_port.filter(|p| lfs_wanted && PORTS.contains(p) && taken.insert(*p));
     let mut free = || -> Result<u16> {
         let port = PORTS.clone().find(|p| !taken.contains(p)).context("out of credential broker ports")?;
         taken.insert(port);
@@ -349,7 +368,12 @@ pub fn plan(
         (false, Some(port)) => Some(ProxyPort { port, hosts: git_hosts.into_iter().collect() }),
         (false, None) => Some(ProxyPort { port: free()?, hosts: git_hosts.into_iter().collect() }),
     };
-    Ok(Planned { claims: out, proxy, git })
+    let lfs = match (lfs_wanted, kept_lfs) {
+        (false, _) => None,
+        (true, Some(port)) => Some(port),
+        (true, None) => Some(free()?),
+    };
+    Ok(Planned { claims: out, proxy, git, lfs })
 }
 
 /// The proxy variables `run` reads from the container's env.
@@ -549,7 +573,7 @@ mod tests {
     #[test]
     fn plan_allocates_ports_and_rebuild_keeps_phantoms_and_ports() {
         let selected = vec![("./s".to_string(), sentry())];
-        let planned = plan(&selected, &[], None, None, counter()).unwrap();
+        let planned = plan(&selected, &[], None, None, None, counter()).unwrap();
         assert_eq!(planned.proxy, None);
         let first = planned.claims;
         let c = &first[0];
@@ -559,14 +583,14 @@ mod tests {
         let got: Vec<(u16, &str)> = c.listeners.iter().map(|l| (l.port, l.upstream.as_str())).collect();
         assert_eq!(got, [(29000, "de.sentry.io"), (29001, "sentry.io"), (29002, "us.sentry.io")]);
 
-        let again = plan(&selected, &first, None, None, |_| panic!("kept")).unwrap().claims;
+        let again = plan(&selected, &first, None, None, None, |_| panic!("kept")).unwrap().claims;
         assert_eq!(again, first);
 
         // A new version drops one upstream and adds one: the others keep
         // theirs, the new one takes the lowest free port.
         let mut prior = first.clone();
         prior[0].listeners.retain(|l| l.upstream != "de.sentry.io");
-        let next = plan(&selected, &prior, None, None, counter()).unwrap().claims;
+        let next = plan(&selected, &prior, None, None, None, counter()).unwrap().claims;
         let got: Vec<(u16, &str)> = next[0].listeners.iter().map(|l| (l.port, l.upstream.as_str())).collect();
         assert_eq!(got, [(29000, "de.sentry.io"), (29001, "sentry.io"), (29002, "us.sentry.io")]);
         assert_eq!(next[0].phantom, "sntrys_1");
@@ -574,7 +598,7 @@ mod tests {
         // A phantom without the claim's head is minted again.
         let mut odd = first.clone();
         odd[0].phantom = "other_x".into();
-        assert_eq!(plan(&selected, &odd, None, None, counter()).unwrap().claims[0].phantom, "sntrys_1");
+        assert_eq!(plan(&selected, &odd, None, None, None, counter()).unwrap().claims[0].phantom, "sntrys_1");
     }
 
     #[test]
@@ -586,7 +610,7 @@ mod tests {
         );
         let other = intercept_of("x", serde_json::json!(["api.x.io"]), None);
         let selected = vec![("./s".to_string(), sentry()), ("./gh".to_string(), gh.clone()), ("./x".to_string(), other)];
-        let first = plan(&selected, &[], None, None, counter()).unwrap();
+        let first = plan(&selected, &[], None, None, None, counter()).unwrap();
         assert!(first.claims[1].listeners.is_empty() && first.claims[2].listeners.is_empty());
         assert_eq!(git_hosts(&first.claims), ["github.com"]);
         assert!(first.claims[0].git_hosts.is_empty());
@@ -604,26 +628,26 @@ mod tests {
         // keep their numbers, the new listener takes the next free one.
         let mut prior = first.claims.clone();
         prior[0].listeners.retain(|l| l.upstream != "us.sentry.io");
-        let next = plan(&selected, &prior, Some(29002), Some(29004), counter()).unwrap();
+        let next = plan(&selected, &prior, Some(29002), Some(29004), None, counter()).unwrap();
         assert_eq!(next.proxy.as_ref().map(|p| p.port), Some(29002));
         assert_eq!(next.git.as_ref().map(|p| p.port), Some(29004));
         let us = next.claims[0].listeners.iter().find(|l| l.upstream == "us.sentry.io").unwrap();
         assert_eq!(us.port, 29003);
-        let again = plan(&selected, &first.claims, Some(29003), Some(29004), counter()).unwrap();
+        let again = plan(&selected, &first.claims, Some(29003), Some(29004), None, counter()).unwrap();
         assert_eq!((again.proxy, again.git), (first.proxy.clone(), first.git.clone()));
         // An instance from before git's port gets one, the lowest free.
-        let upgraded = plan(&selected, &first.claims, Some(29003), None, counter()).unwrap();
+        let upgraded = plan(&selected, &first.claims, Some(29003), None, None, counter()).unwrap();
         assert_eq!(upgraded.git.map(|g| g.port), Some(29004));
         // A kept git port out of the range is replaced.
-        let moved = plan(&selected, &first.claims, Some(29003), Some(80), counter()).unwrap();
+        let moved = plan(&selected, &first.claims, Some(29003), Some(80), None, counter()).unwrap();
         assert_eq!(moved.git.map(|g| g.port), Some(29004));
 
         let git_only = intercept_of("g", serde_json::json!(["github.com"]), Some(serde_json::json!({ "hosts": ["github.com"] })));
-        let planned = plan(&[("./g".into(), git_only)], &[], Some(29000), Some(29001), counter()).unwrap();
+        let planned = plan(&[("./g".into(), git_only)], &[], Some(29000), Some(29001), None, counter()).unwrap();
         assert_eq!(planned.proxy, Some(ProxyPort { port: 29000, hosts: vec![] }));
         assert_eq!(planned.git, Some(ProxyPort { port: 29001, hosts: vec!["github.com".into()] }));
         // No git field: no git port, whatever was kept.
-        assert_eq!(plan(&selected[2..], &[], None, Some(29001), counter()).unwrap().git, None);
+        assert_eq!(plan(&selected[2..], &[], None, Some(29001), None, counter()).unwrap().git, None);
     }
 
     #[test]
@@ -661,6 +685,7 @@ mod tests {
             port: 29004,
             hosts: vec!["api.github.com".into()],
             git: None,
+            lfs: None,
             proxy_env: vars(&[("https_proxy", "http://corp:3128"), ("NO_PROXY", "corp")]),
             bundle: "/etc/pki/tls/certs/ca-bundle.crt".into(),
             installed: None,
@@ -696,7 +721,7 @@ mod tests {
     #[test]
     fn env_and_files_render_and_mount_targets_skip() {
         let claim = sentry();
-        let rec = plan(&[("./s".into(), claim.clone())], &[], None, None, counter()).unwrap().claims.remove(0);
+        let rec = plan(&[("./s".into(), claim.clone())], &[], None, None, None, counter()).unwrap().claims.remove(0);
         assert_eq!(
             env(&claim, &rec),
             [
@@ -726,7 +751,7 @@ mod tests {
     #[test]
     fn lookups_and_broker_spec() {
         let selected = vec![("./s".to_string(), sentry()), ("./gh".to_string(), intercept("github"))];
-        let planned = plan(&selected, &[], None, None, counter()).unwrap();
+        let planned = plan(&selected, &[], None, None, None, counter()).unwrap();
         let mut rec = planned.claims;
         let (files, _) = render_files(&sentry(), &rec[0], "/home/dev", "dev", &[]);
         rec[0].files = files;
@@ -738,6 +763,7 @@ mod tests {
             port: shared.port,
             hosts: shared.hosts,
             git: None,
+            lfs: None,
             proxy_env: vars(&[("HTTPS_PROXY", "http://corp:3128")]),
             bundle: "/b".into(),
             installed: None,
@@ -771,12 +797,13 @@ mod tests {
             serde_json::json!(["api.github.com", "github.com"]),
             Some(serde_json::json!({ "hosts": ["github.com"] })),
         );
-        let planned = plan(&[("./gh".into(), gh)], &[], None, None, counter()).unwrap();
+        let planned = plan(&[("./gh".into(), gh)], &[], None, None, None, counter()).unwrap();
         let (shared, git) = (planned.proxy.unwrap(), planned.git.unwrap());
         let i = Intercept {
             port: shared.port,
             hosts: shared.hosts,
             git: Some(git),
+            lfs: None,
             proxy_env: Vec::new(),
             bundle: "/b".into(),
             installed: None,
@@ -793,8 +820,43 @@ mod tests {
     }
 
     #[test]
+    fn an_lfs_claim_gets_a_listener_kept_across_rebuilds() {
+        let mut gh = intercept_of(
+            "github",
+            serde_json::json!(["api.github.com", "github.com"]),
+            Some(serde_json::json!({ "hosts": ["github.com"] })),
+        );
+        gh.pinned.lfs = Some(claim::Lfs { hosts: vec!["github.com".into()], upload: "git.push".into() });
+        let selected = [("./gh".to_string(), gh.clone())];
+        let planned = plan(&selected, &[], None, None, None, counter()).unwrap();
+        let ports_of = |p: &Planned| (p.proxy.as_ref().map(|p| p.port), p.git.as_ref().map(|g| g.port), p.lfs);
+        assert_eq!(ports_of(&planned), (Some(29000), Some(29001), Some(29002)));
+        let again = plan(&selected, &planned.claims, Some(29001), Some(29000), Some(29002), counter()).unwrap();
+        assert_eq!(ports_of(&again), (Some(29001), Some(29000), Some(29002)));
+        assert_eq!(plan(&selected, &planned.claims, Some(29000), Some(29001), Some(80), counter()).unwrap().lfs, Some(29002));
+        gh.pinned.lfs = None;
+        assert_eq!(plan(&[("./gh".into(), gh)], &[], None, None, Some(29002), counter()).unwrap().lfs, None);
+
+        let (shared, git) = (planned.proxy.unwrap(), planned.git.unwrap());
+        let i = Intercept {
+            port: shared.port,
+            hosts: shared.hosts,
+            git: Some(git),
+            lfs: planned.lfs,
+            proxy_env: Vec::new(),
+            bundle: "/b".into(),
+            installed: None,
+        };
+        assert_eq!(ports(&planned.claims, Some(&i)).collect::<Vec<_>>(), [29000, 29001, 29002]);
+        assert!(forward_refusal(&planned.claims, Some(&i), "web", 29002).unwrap().contains("credential broker LFS listener"));
+        let text = brokerfile::serialize(&broker_spec(&planned.claims, Some(&i)).unwrap());
+        assert!(text.starts_with("listen 29002 lfs\nproxy-listen 29000 api.github.com\n"), "{text}");
+        assert_eq!(brokerfile::parse(&text), Ok(broker_spec(&planned.claims, Some(&i)).unwrap()));
+    }
+
+    #[test]
     fn records_round_trip_through_toml() {
-        let mut rec = plan(&[("./s".into(), sentry())], &[], None, None, counter()).unwrap().claims;
+        let mut rec = plan(&[("./s".into(), sentry())], &[], None, None, None, counter()).unwrap().claims;
         rec[0].files = render_files(&sentry(), &rec[0], "/home/dev", "dev", &[]).0;
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
         struct Wrap {
@@ -805,6 +867,7 @@ mod tests {
             port: 29003,
             hosts: vec!["api.github.com".into()],
             git: Some(ProxyPort { port: 29004, hosts: vec!["github.com".into()] }),
+            lfs: None,
             proxy_env: vars(&[("HTTPS_PROXY", "http://corp:3128"), ("NO_PROXY", "")]),
             bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
             installed: Some("ab".repeat(32)),

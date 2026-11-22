@@ -156,8 +156,10 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   names, which go on git's own proxy port (`Intercept::git`, one more
   `ProxyPort`; [git](../credentials/git.md)). With only git hosts
   intercepted, the shared port binds none. Intercept claims get no
-  listener. A `rebuild` keeps each kind's phantom (while it has the
-  claim's head), each upstream's port and both proxy ports; a new one
+  listener, but a claim pinning `lfs` gives the instance the LFS
+  transfers' listener (`Intercept::lfs`, broker file `listen <port> lfs`;
+  [git](../credentials/git.md#lfs)). A `rebuild` keeps each kind's phantom (while it has the
+  claim's head), each upstream's port, both proxy ports and the LFS listener; a new one
   takes a free port. The helper's broker file gets each proxy port as
   `proxy-listen` and each git host's phantom as `credential`
   (`instance::broker_spec`). The instance's `incarnation`

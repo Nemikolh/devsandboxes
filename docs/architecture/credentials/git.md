@@ -13,8 +13,8 @@ container") and [github-and-sentry-access](../../plans/active/github-and-sentry-
 
 Code: `src/credentials/git.rs` (`entries`, `owners`, `config_env`,
 `exec_config_env`, `system_config`, `SYSTEM_SCRIPT`, `helper`),
-`src/credentials/instance.rs` (`plan`, `Intercept::git`, `ProxyPort`,
-`broker_spec`), `src/commands/run/claims.rs` (`wire`,
+`src/credentials/instance.rs` (`plan`, `Intercept::git`, `Intercept::lfs`,
+`ProxyPort`, `broker_spec`), `src/broker/lfs.rs`, `src/commands/run/claims.rs` (`wire`,
 `install_git_config`, `git_check_command`, `git_check`, `signs_git`),
 `src/commands/run/mod.rs` (`materialize`), `src/commands/start.rs`
 (`warn_git`), `src/state.rs` (`Instance::git_env`, `exec_env`),
@@ -134,3 +134,68 @@ What it warns of, each warning once:
 
 No git in the container, or a folder that isn't a repo, is nothing to
 check. A shell rc's env is out of its sight.
+
+## LFS
+
+git-lfs's batch API (`POST /<owner>/<repo>.git/info/lfs/objects/batch`)
+rides git's port like any git request, asking the credential helper the
+same way. Its answer names where each object goes (`actions.download`,
+`upload`, `verify`: an `href` and a `header`), and the header carries
+credentials: GitHub's `RemoteAuth` for `lfs.github.com`'s verify, S3
+signatures, or, on some hosts, the batch's own `Authorization` echoed,
+which after injection holds the real token. The hrefs name storage hosts
+(`github-cloud.githubusercontent.com`, S3) that vary per answer and that
+no port hands the broker.
+
+A claim pins `lfs` to take part (`claim::Lfs`, in the approved copy, so
+it changes the claim's version):
+
+```json
+"lfs": { "hosts": ["github.com"], "upload": "git.push" }
+```
+
+`hosts` must be among `git.hosts` (so intercept mode only); `upload`
+names the scope an `upload` batch needs, since the batch route itself
+can't tell an upload from a download. With it, `instance::plan` gives the
+instance an LFS listener (`Intercept::lfs`, from `instance::PORTS`, kept
+by `rebuild`), a broker port like the others (`instance::ports`,
+`forward_refusal`), carried as the broker file's `listen <port> lfs`.
+
+The broker reads a batch's body before policy (`route::lfs_operation`,
+at most `route::MAX_LFS_BATCH`; a body that isn't a JSON object naming
+`operation` once, as `download` or `upload`, is a 400), so a download is
+a read and an upload a write: outside the repo fence a download goes
+upstream without a credential (public LFS objects download), an upload
+is refused ([broker](broker.md#the-repo-fence)). An upload's scope is
+`lfs.upload` instead of the route's. On an injected batch's `200` to a
+host `lfs.hosts` names, `lfs::rewrite_batch` takes each action's `href`,
+`header` (minus the fields the upstream client writes itself) and expiry
+(`expires_in`, else `expires_at`, else `lfs::DEFAULT_TTL`; at most
+`lfs::MAX_TTL`) into the broker's `lfs::Store`, under a fresh handle
+(32 base62 characters), and rewrites the action to
+`http://127.0.0.1:<LFS port>/<handle>` without its `header`, keeping
+`expires_*`. An action whose href isn't https only loses its header. A
+body that isn't JSON, or over `rewrite::MAX_REWRITE`, passes as it came,
+redacted as any response is. A batch sent stripped (outside the fence)
+carried no credential and passes untouched.
+
+The store is in memory, per daemon: a handle is the instance's (key,
+`instance_id`, incarnation), at most `lfs::MAX_PER_INSTANCE` of them (the
+one expiring first makes room). On the LFS listener (`ProxyHeader::Lfs`),
+`serve::Service::lfs_request` refuses a browser, a foreign `Host` and a
+listener that isn't the instance's, then looks the path's handle up: an
+unknown or expired one is a 404, another instance's a 403 logged as a
+`leak`, a method other than the action's (`GET` download, `PUT` upload,
+`POST` verify) a 403. A found one is sent to its href (address checked
+as public, like any upstream) with the stored header replacing the
+client's fields of the same name, the client's `Authorization` and
+`Cookie` dropped, the body streamed both ways; the response comes back
+with the stored header's values (`Accept` and `Content-Type` aside) and
+the href's query masked. Each request leaves an `access.log` line with
+route `lfs <action>` (`lfs` before the handle resolves), never the href,
+the handle or a header value.
+
+git-lfs reaches the loopback href directly: `NO_PROXY` always holds
+`127.0.0.1` ([images and features](../instances/images-and-features.md#credential-claims)). `locks` routes are the
+claim's own (`GET …/info/lfs/locks` a read, the `POST`s, `locks/verify`
+before every push included, writes).

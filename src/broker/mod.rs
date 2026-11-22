@@ -15,6 +15,8 @@
 //!   check on every address it dials.
 //! - [`route`], [`rewrite`], [`refusal`]: a path against a claim's routes,
 //!   upstream URLs turned into loopback ones, the broker's own answers.
+//! - [`lfs`]: LFS batch responses' transfers behind handles on the
+//!   instance's LFS listener.
 //! - [`policy`], [`audit`], [`intercept`], [`serve`] (unix, with `serve`):
 //!   the decision per call, `access.log`, intercept mode's TLS, and the
 //!   [`Broker`](crate::devsbd::bridge::Broker) the daemon's bridges hand
@@ -35,6 +37,7 @@ pub mod guard;
 pub mod head;
 #[cfg(unix)]
 pub mod intercept;
+pub mod lfs;
 #[cfg(unix)]
 pub mod policy;
 pub mod redact;

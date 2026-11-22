@@ -2,7 +2,7 @@
   "id": "github",
   "version": "1.0.0",
   "name": "GitHub, brokered and repo-fenced (test fixture)",
-  "description": "Test fixture for the broker's repo fence and git smart HTTP: a small slice of what features/gh will claim (docs/plans/active/github-and-sentry-access.md, gh). Its install.sh installs nothing.",
+  "description": "Test fixture for the broker's repo fence and git smart HTTP: a small slice of what features/gh will claim, LFS included (docs/plans/active/github-and-sentry-access.md, gh). Its install.sh installs nothing.",
   "customizations": {
     "devsandbox": {
       "credentials": {
@@ -15,6 +15,7 @@
           ],
           "phantom": { "env": ["GH_TOKEN"] },
           "git": { "hosts": ["github.com"] },
+          "lfs": { "hosts": ["github.com"], "upload": "git.push" },
           "login": [{ "method": "paste" }],
           "check": "GET /user",
           "refusal": { "shape": "json", "field": "message" },
@@ -25,6 +26,7 @@
                 "GET /{repo}/info/refs?service=git-upload-pack",
                 "POST /{repo}/git-upload-pack",
                 "POST /{repo}/info/lfs/objects/batch",
+                "GET /{repo}/info/lfs/locks",
                 "GET /repos/{repo}",
                 "GET /repos/{repo}/pulls",
                 "GET /repos/{repo}/git/ref/tags/{tag}",
@@ -36,7 +38,10 @@
             "git.push": {
               "routes": [
                 "GET /{repo}/info/refs?service=git-receive-pack",
-                "POST /{repo}/git-receive-pack"
+                "POST /{repo}/git-receive-pack",
+                "POST /{repo}/info/lfs/locks",
+                "POST /{repo}/info/lfs/locks/verify",
+                "POST /{repo}/info/lfs/locks/{id}/unlock"
               ],
               "permissions": { "contents": "write" }
             },

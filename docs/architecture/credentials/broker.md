@@ -53,6 +53,9 @@ An intercepted host comes the same way from the helper's proxy port: a
 `CONNECT host:443` to a host its broker file binds is answered `200` by
 the helper, and the stream carries `ProxyHeader::Intercept` (the host,
 the port) then the tool's raw TLS ([Intercept mode](#intercept-mode)).
+The LFS listener's streams carry `ProxyHeader::Lfs` (its port) and are
+LFS transfers, not calls: `Service::lfs_request` serves them
+([git](git.md#lfs)).
 
 ## Per connection
 
@@ -65,7 +68,9 @@ the port) then the tool's raw TLS ([Intercept mode](#intercept-mode)).
 2. `guard::refuse_browser` (any `Origin` or `Sec-Fetch-Site`) and
    `guard::check_host` (`Host` must be `127.0.0.1:<listener>`, or in
    intercept mode the `CONNECT` target, port 443 by default): `403`.
-3. `state.toml` is read (`State::load_at`), then `policy::decide`.
+3. `state.toml` is read (`State::load_at`); an LFS batch's body is read
+   whole (`batch_body`, at most `route::MAX_LFS_BATCH`, after the `100
+   Continue` it asked for; [git](git.md#lfs)), then `policy::decide`.
 4. A refusal is answered; an uninjected, injected or outside call is
    forwarded (below); one `access.log` line either way.
 
@@ -182,7 +187,8 @@ A claim whose `fence` names any route is fenced (`Pinned::fenced`).
 In the fence the scope checks follow. Outside it the call gets no
 credential and is never asked: a write (`route::is_write`: a method but
 `GET`/`HEAD`, except git's upload-pack `POST`, and receive-pack's
-`info/refs` too) is refused naming `access.<kind>.repos`, at `info/refs`
+`info/refs` too; an LFS batch by its body's `operation`, `upload` the
+write) is refused naming `access.<kind>.repos`, at `info/refs`
 for a push, before git sends anything; a read is `Action::Outside`, sent
 upstream with the phantom's slot removed (`policy::strip`: the header, or
 the query parameter), its response marked `devsandbox-fence: outside`
@@ -237,6 +243,9 @@ length. A body that isn't JSON or needs no change goes as it came; one
 past the bound passes through unrewritten, noted in the log line. This is
 what makes sentry-cli's chunk uploads (`GET …/chunk-upload/` answering an
 absolute region URL) and its regions list come back through the broker.
+An injected LFS batch's `200` is read the same way, but its actions are
+put behind handles before masking (`lfs::rewrite_batch`, [git](git.md#lfs)):
+the header they carry is what goes upstream later.
 
 An upstream `401` to an injected call never reaches the tool, which would
 start its own login. A renewable token not renewed for this call is

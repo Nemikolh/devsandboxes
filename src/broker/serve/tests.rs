@@ -17,7 +17,8 @@ use serde_json::Value;
 
 use super::*;
 use crate::broker::policy::tests::{
-    FOREIGN, GH, OWN, caller, git_basic, github, home_with, intercept_home, intercept_state, sentry, state_with,
+    FOREIGN, GH, LFS_PORT, OWN, caller, git_basic, github, home_with, intercept_home, intercept_state, sentry, state_with,
+    with_lfs,
 };
 use crate::broker::upstream::Timeouts;
 use crate::credentials::oauth::tests::{GITHUB_TOKEN, field, form, json, path};
@@ -108,7 +109,31 @@ impl Rig {
         Rig::with(tag, upstream_port, state, intercept_home(&claim), "github-work", &claim)
     }
 
-    fn with(tag: &str, upstream_port: u16, mut state: State, home: Home, credential: &str, claim: &claim::Claim) -> Rig {
+    /// [`Rig::fenced`] with an LFS listener on `web-1` and `other`, LFS
+    /// storage host `storage.test` dialed at `localhost:<storage_port>`.
+    fn lfs(tag: &str, upstream_port: u16, storage_port: u16) -> Rig {
+        let claim = private(crate::credentials::home::tests::github());
+        let mut state = intercept_state(claim.clone());
+        state.instances.get_mut("web-1").unwrap().github_repos = vec!["o/r".into()];
+        state.instances.values_mut().for_each(with_lfs);
+        let storage = format!("localhost:{storage_port}");
+        let home = intercept_home(&claim);
+        Rig::with_service(tag, upstream_port, state, home, "github-work", &claim, |s| s.with_storage("storage.test", &storage))
+    }
+
+    fn with(tag: &str, upstream_port: u16, state: State, home: Home, credential: &str, claim: &claim::Claim) -> Rig {
+        Rig::with_service(tag, upstream_port, state, home, credential, claim, |s| s)
+    }
+
+    fn with_service(
+        tag: &str,
+        upstream_port: u16,
+        mut state: State,
+        home: Home,
+        credential: &str,
+        claim: &claim::Claim,
+        extra: impl FnOnce(Service) -> Service,
+    ) -> Rig {
         let dir = std::env::temp_dir().join(format!("dsv-broker-serve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let data = dir.join("data");
@@ -133,7 +158,7 @@ impl Rig {
         for u in &claim.pinned.upstreams {
             service = service.with_authority(&u.host, &format!("localhost:{upstream_port}"));
         }
-        Rig { dir, service: Arc::new(service), state }
+        Rig { dir, service: Arc::new(extra(service)), state }
     }
 
     fn port(&self, upstream: &str) -> u16 {
@@ -216,6 +241,15 @@ impl Rig {
 
     fn connect(&self, upstream: &str) -> Client {
         self.connect_as(caller(), upstream)
+    }
+
+    /// A connection to the LFS listener, as `caller` on its bridge.
+    fn lfs_listener(&self, caller: Caller) -> Client {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let service = self.service.clone();
+        thread::spawn(move || service.serve(&caller, ProxyHeader::Lfs { listener: LFS_PORT }, theirs));
+        Client { host: format!("127.0.0.1:{LFS_PORT}"), reader: BufReader::new(Box::new(ours)) }
     }
 
     /// `access.log` once it has `n` lines: a line lands after its answer.
@@ -794,6 +828,192 @@ fn pushes_are_refused_at_info_refs_before_upstream() {
     assert_eq!(seen.lock().unwrap().len(), 1, "only the fetch went upstream");
 }
 
+const STORAGE_AUTH: &str = "RemoteAuth STORAGE-secret-42";
+const SIG: &str = "X-Amz-Signature=SIG0123456789";
+const BATCH: &str = "/o/r.git/info/lfs/objects/batch";
+const DOWNLOAD: &[u8] = br#"{"operation":"download","transfers":["basic"],"objects":[{"oid":"a","size":5}]}"#;
+const UPLOAD: &[u8] = br#"{"operation":"upload","transfers":["basic"],"objects":[{"oid":"a","size":5}]}"#;
+
+/// github.com's LFS batch API: one object whose actions live on
+/// `storage.test`, each with a storage credential in its header (the
+/// download's also echoes the batch's `Authorization`, as some hosts do).
+fn lfs_api(head: &str, body: &[u8]) -> Vec<u8> {
+    let auth = head.lines().find_map(|l| l.strip_prefix("Authorization: ")).unwrap_or("").to_string();
+    let actions = match route::lfs_operation(body).unwrap() {
+        route::LfsOp::Download => serde_json::json!({ "download": {
+            "href": format!("https://storage.test/obj/a?{SIG}"),
+            "header": { "Authorization": STORAGE_AUTH, "X-Batch-Auth": auth },
+            "expires_in": 600,
+        } }),
+        route::LfsOp::Upload => serde_json::json!({
+            "upload": { "href": "https://storage.test/up/a", "header": { "Authorization": STORAGE_AUTH, "Content-Type": "application/octet-stream" } },
+            "verify": { "href": "https://storage.test/verify", "header": { "Authorization": STORAGE_AUTH } },
+        }),
+    };
+    let body = serde_json::json!({ "transfer": "basic", "objects": [{ "oid": "a", "size": 5, "actions": actions }] }).to_string();
+    format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.git-lfs+json\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        .into_bytes()
+}
+
+/// A storage host repeating what it got, credentials included.
+fn storage_echo(head: &str, body: &[u8]) -> Vec<u8> {
+    let first = head.lines().next().unwrap_or("").to_string();
+    let auth = head.lines().find_map(|l| l.strip_prefix("Authorization: ")).unwrap_or("").to_string();
+    let reply = format!("{first} with {auth}: {} bytes", body.len());
+    format!("HTTP/1.1 200 OK\r\nX-Seen-Auth: {auth}\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).into_bytes()
+}
+
+fn lfs_headers() -> String {
+    format!("{}Content-Type: application/vnd.git-lfs+json\r\n", git_basic(GH))
+}
+
+/// The action's href as a path on the LFS listener.
+fn handle_path(action: &Value) -> String {
+    assert!(action.get("header").is_none(), "{action}");
+    let href = action["href"].as_str().unwrap();
+    href.strip_prefix(&format!("http://127.0.0.1:{LFS_PORT}")).unwrap_or_else(|| panic!("{href}")).to_string()
+}
+
+fn hides_storage(text: &str) {
+    for hidden in ["STORAGE-secret", "SIG0123456789", "storage.test", TOKEN, GH] {
+        assert!(!text.contains(hidden), "{hidden} in {text}");
+    }
+}
+
+#[test]
+fn lfs_transfers_go_through_handles_with_the_stored_header() {
+    let (api, api_seen) = upstream_server(lfs_api);
+    let (storage, storage_seen) = upstream_server(storage_echo);
+    let rig = Rig::lfs("lfs", api, storage);
+
+    let a = git_client(&rig).call("POST", BATCH, &lfs_headers(), DOWNLOAD);
+    assert_eq!(a.status, 200, "{a:?}");
+    hides_storage(&String::from_utf8_lossy(&a.body));
+    let action = &a.json()["objects"][0]["actions"]["download"];
+    assert_eq!(action["expires_in"], 600);
+    let download = handle_path(action);
+    let real = String::from_utf8(crate::broker::redact::basic_auth(b"x-access-token", TOKEN.as_bytes())).unwrap();
+    {
+        let seen = api_seen.lock().unwrap();
+        assert!(seen[0].0.contains(&format!("\r\nAuthorization: Basic {real}\r\n")), "{}", seen[0].0);
+        assert_eq!(seen[0].1, DOWNLOAD, "the read-ahead body went upstream as sent");
+    }
+
+    // The client's own credential stays behind; the stored header goes out,
+    // masked wherever the storage host repeats it.
+    let mut t = rig.lfs_listener(caller());
+    for _ in 0..2 {
+        let got = t.call("GET", &download, &git_basic(GH), b"");
+        assert_eq!(got.status, 200, "{got:?}");
+        hides_storage(&format!("{}{}", got.head, String::from_utf8_lossy(&got.body)));
+    }
+    {
+        let seen = storage_seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one connection per transfer, the client's kept alive");
+        let head = &seen[0].0;
+        assert!(head.starts_with(&format!("GET /obj/a?{SIG} HTTP/1.1\r\n")), "{head}");
+        assert!(head.contains(&format!("\r\nAuthorization: {STORAGE_AUTH}\r\n")), "{head}");
+        assert!(head.contains(&format!("\r\nX-Batch-Auth: Basic {real}\r\n")), "an echoed header is used, not shown: {head}");
+        assert!(!head.contains(GH) && head.matches("Authorization:").count() == 1, "{head}");
+    }
+    let a = rig.lfs_listener(caller()).call("PUT", &download, "", b"bytes");
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(a.json()["message"].as_str().unwrap().contains("`PUT` to an LFS download transfer, which takes `GET`"));
+
+    let a = git_client(&rig).call("POST", BATCH, &lfs_headers(), UPLOAD);
+    assert_eq!(a.status, 200, "{a:?}");
+    hides_storage(&String::from_utf8_lossy(&a.body));
+    let actions = &a.json()["objects"][0]["actions"];
+    let (upload, verify) = (handle_path(&actions["upload"]), handle_path(&actions["verify"]));
+    let got = rig.lfs_listener(caller()).call("PUT", &upload, "Content-Type: text/plain\r\n", b"hello");
+    assert_eq!((got.status, String::from_utf8_lossy(&got.body).ends_with(": 5 bytes")), (200, true), "{got:?}");
+    assert_eq!(rig.lfs_listener(caller()).call("POST", &verify, "", br#"{"oid":"a","size":5}"#).status, 200);
+    {
+        let seen = storage_seen.lock().unwrap();
+        let put = seen.iter().find(|(h, _)| h.starts_with("PUT /up/a ")).unwrap();
+        assert_eq!(put.1, b"hello");
+        assert!(put.0.contains("\r\nContent-Type: application/octet-stream\r\n") && !put.0.contains("text/plain"), "{}", put.0);
+        assert!(seen.iter().any(|(h, _)| h.starts_with("POST /verify ")));
+    }
+
+    // Unknown, another instance's, or on the wrong listener: refused, never dialed.
+    let before = storage_seen.lock().unwrap().len();
+    let a = rig.lfs_listener(caller()).call("GET", "/0123456789abcdefABCDEF0123456789", "", b"");
+    assert_eq!(a.status, 404, "{a:?}");
+    assert_eq!(rig.lfs_listener(caller()).call("GET", &format!("{download}?x=1"), "", b"").status, 404);
+    let other = Caller { instance: "other".into(), instance_id: "other-id".into() };
+    let a = rig.lfs_listener(other).call("GET", &download, "", b"");
+    assert_eq!((a.status, a.json()["devsandbox"]["verdict"].as_str()), (403, Some("leak")), "{a:?}");
+    let mut wrong = rig.lfs_listener(caller());
+    wrong.host = "127.0.0.1:1".into();
+    assert_eq!(wrong.call("GET", &download, "", b"").status, 403);
+    assert_eq!(storage_seen.lock().unwrap().len(), before);
+
+    let log = rig.log(12);
+    let text = serde_json::to_string(&log).unwrap();
+    hides_storage(&text);
+    assert!(!text.contains(download.trim_start_matches('/')), "no handle in the log: {text}");
+    let routes = |route: &str, verdict: &str| log.iter().filter(|l| l["route"] == route && l["verdict"] == verdict).count();
+    assert_eq!(routes("lfs download", "allow"), 2, "{text}");
+    assert_eq!(routes("lfs download", "refused"), 1, "{text}");
+    assert_eq!((routes("lfs upload", "allow"), routes("lfs verify", "allow")), (1, 1), "{text}");
+    assert_eq!((routes("lfs", "refused"), routes("lfs", "leak")), (3, 1), "{text}");
+    let l = log.iter().find(|l| l["route"] == "lfs upload").unwrap();
+    assert_eq!((l["credential"].as_str(), l["kind"].as_str(), l["incarnation"].as_str()), (Some("github-work"), Some("github"), Some("inc-web-1")));
+    let batches: Vec<&Value> = log.iter().filter(|l| l["route"] == "/o/r.git/info/lfs/objects/batch").collect();
+    let scopes: Vec<&str> = batches.iter().map(|l| l["scope"].as_str().unwrap()).collect();
+    assert_eq!(scopes, ["repo.read", "git.push"]);
+}
+
+#[test]
+fn lfs_batches_outside_the_fence_or_malformed() {
+    let (api, seen) = upstream_server(lfs_api);
+    let rig = Rig::lfs("lfs-out", api, 1);
+    let outside = "/x/y.git/info/lfs/objects/batch";
+    let a = git_client(&rig).call("POST", outside, &lfs_headers(), DOWNLOAD);
+    assert_eq!((a.status, a.header("devsandbox-fence")), (200, Some("outside")), "{a:?}");
+    // Sent with no credential: nothing to hide, passed as is.
+    assert!(a.json()["objects"][0]["actions"]["download"]["href"].as_str().unwrap().starts_with("https://storage.test/"));
+    assert!(!seen.lock().unwrap()[0].0.to_ascii_lowercase().contains("authorization"));
+
+    let a = git_client(&rig).call("POST", outside, &lfs_headers(), UPLOAD);
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(a.json()["message"].as_str().unwrap().contains("`x/y` is outside the instance's repo fence"));
+    for (body, status) in [(&br#"{"operation":"verify"}"#[..], 400), (b"{}", 400), (b"", 400)] {
+        let a = git_client(&rig).call("POST", BATCH, &lfs_headers(), body);
+        assert_eq!(a.status, status, "{a:?}");
+    }
+    let mut c = git_client(&rig);
+    c.send("POST", BATCH, &format!("{}Content-Length: {}\r\n", lfs_headers(), route::MAX_LFS_BATCH + 1), b"");
+    assert_eq!(c.read().status, 413);
+    assert_eq!(seen.lock().unwrap().len(), 1, "only the outside download went upstream");
+}
+
+#[test]
+fn an_lfs_batch_past_the_bound_or_not_json_passes() {
+    let store = Mutex::new(lfs::Store::new(10));
+    let owner = lfs::Owner { instance: "web-1".into(), instance_id: "web-1-id".into(), incarnation: None };
+    let body: &'static [u8] =
+        br#"{"objects":[{"actions":{"download":{"href":"https://s.example/a","header":{"Authorization":"x"}}}}]}"#;
+    let write = |body: &'static [u8], max: usize, line: &mut Line| {
+        let lfs = LfsRewrite { store: &store, owner: owner.clone(), port: LFS_PORT, kind: None, credential: None };
+        let respond = Respond { lfs: Some(lfs), ..respond(&[], None, max, false) };
+        let mut out = Vec::new();
+        respond.write(response(Length::Exact(body.len() as u64), &[], body), &mut out, line).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let mut line = Line::default();
+    let text = write(body, 1024, &mut line);
+    assert!(text.contains(&format!("http://127.0.0.1:{LFS_PORT}/")) && !text.contains("Authorization"), "{text}");
+    assert_eq!(line.reason, None);
+    let text = write(body, 8, &mut line);
+    assert!(text.ends_with(std::str::from_utf8(body).unwrap()), "{text}");
+    assert!(line.reason.as_deref().unwrap().contains("not rewritten"));
+    let mut line = Line::default();
+    assert!(write(b"<html>", 1024, &mut line).ends_with("\r\n\r\n<html>"));
+    assert_eq!(store.lock().unwrap().len(), 1);
+}
+
 fn response(length: Length, headers: &[(&str, &str)], body: &'static [u8]) -> Response {
     Response {
         status: 200,
@@ -806,7 +1026,7 @@ fn response(length: Length, headers: &[(&str, &str)], body: &'static [u8]) -> Re
 }
 
 fn respond<'a>(listeners: &'a [(String, u16)], fields: Option<&'a [String]>, max: usize, http10: bool) -> Respond<'a> {
-    Respond { http10, keep: true, outside: false, secrets: None, listeners, fields, max_rewrite: max }
+    Respond { http10, keep: true, outside: false, secrets: None, listeners, fields, lfs: None, max_rewrite: max }
 }
 
 #[test]

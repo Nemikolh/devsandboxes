@@ -30,13 +30,14 @@
 //!    can't be placed yet and is refused; a `{repo}` outside the instance's
 //!    fence ([`fence_of`]) goes upstream with the phantom stripped
 //!    ([`Action::Outside`]), or is refused naming `access.<kind>.repos`
-//!    for a write ([`route::is_write`]); a route without `{repo}` is
-//!    repo-less;
+//!    for a write ([`route::is_write`]; an LFS batch by its body's
+//!    `operation`, [`Call::lfs`]); a route without `{repo}` is repo-less;
 //! 10. the scope must be granted (`max`, unset: every scope) and requested
 //!     (`access.<kind>.scopes`, empty: every scope), and one in
 //!     `access.<kind>.ask` is refused as an ask: asks wait for permission
 //!     requests (credential-broker step 4), and a repo-less route is never
-//!     asked.
+//!     asked. An `upload` LFS batch needs the claim's `lfs.upload` scope
+//!     instead of its route's.
 //!
 //! A git smart-HTTP request ([`route::git_service`]) is refused in git's
 //! shape whatever the claim's: git prints a text body.
@@ -73,6 +74,9 @@ pub struct Call<'a> {
     pub caller: &'a Caller,
     pub header: &'a ProxyHeader,
     pub head: &'a RequestHead,
+    /// An LFS batch's `operation`, read from its body before policy
+    /// ([`route::lfs_operation`]); `None` for any other call.
+    pub lfs: Option<route::LfsOp>,
 }
 
 /// Which phantom a call carried, for the log: never its value.
@@ -133,6 +137,9 @@ pub struct Injection {
     /// The home's approved copy.
     pub claim: Pinned,
     pub private: bool,
+    /// The instance's LFS listener, for an LFS batch to a host the approved
+    /// claim's `lfs` names: its response's transfers are pointed there.
+    pub lfs: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -217,6 +224,9 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
             let c = admit_intercept(state, call.caller, host, *port)?;
             (c, host.as_str(), format!("the `{}` claim's `{host}`", c.kind))
         }
+        ProxyHeader::Lfs { listener } => {
+            return Err(Refusal::refused(format!("port {listener} is an LFS listener, not a brokered upstream")));
+        }
     };
     cx.kind = Some(own.kind.clone());
     let (_, own_claim) = claim::from_canonical(&own.claim).map_err(|e| internal(format!("{e:#}")))?;
@@ -287,6 +297,7 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
     let call_route = format!("{} {}", head.method, route::path_only(path));
     let matched = route::scope_of(&approved, &head.method, path).map_err(|why| Refusal::new(400, "refused", why))?;
     cx.scope = Some(matched.scoped.name().to_string());
+    let lfs_upload = approved.lfs.as_ref().filter(|_| call.lfs == Some(route::LfsOp::Upload));
     let scope = match matched.scoped.clone() {
         Scoped::Never => {
             return Err(Refusal::refused(format!(
@@ -300,6 +311,13 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         }
         Scoped::Scope(s) => s,
     };
+    let scope = match lfs_upload {
+        Some(lfs) => {
+            cx.scope = Some(lfs.upload.clone());
+            lfs.upload.clone()
+        }
+        None => scope,
+    };
     let mut repo_less = false;
     if approved.fenced() {
         match attribute(&approved, &matched) {
@@ -311,7 +329,11 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
             Placed::RepoLess => repo_less = true,
             Placed::Repo(repo) if fence_of(inst, &access).contains(&repo) => {}
             Placed::Repo(repo) => {
-                if route::is_write(&head.method, path) {
+                let write = match call.lfs {
+                    Some(op) => op == route::LfsOp::Upload,
+                    None => route::is_write(&head.method, path),
+                };
+                if write {
                     return Err(Refusal::refused(format!(
                         "`{repo}` is outside the instance's repo fence: no credential writes to it"
                     ))
@@ -338,11 +360,18 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         return Err(Refusal::refused(format!("scope `{scope}` isn't in `access.{kind}.scopes`"))
             .todo(format!("add `{scope}` to `access.{kind}.scopes` in the sandbox's config")));
     }
+    let lfs = match (call.header, &approved.lfs, inst.intercept.as_ref().and_then(|i| i.lfs)) {
+        (ProxyHeader::Intercept { host, .. }, Some(lfs), Some(port)) if call.lfs.is_some() && lfs.hosts.contains(host) => {
+            Some(port)
+        }
+        _ => None,
+    };
     Ok(Action::Inject(Box::new(Injection {
         credential: name.to_string(),
         slot,
         private: up.private,
         claim: approved,
+        lfs,
     })))
 }
 

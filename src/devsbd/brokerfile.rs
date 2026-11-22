@@ -9,6 +9,8 @@
 //!
 //! ```text
 //! listen 41001 base-url sentry.io        a loopback listener: port, mode, upstream
+//! listen 41005 lfs                       the LFS transfers' loopback listener (at
+//!                                        most one): port, mode
 //! proxy-listen 41000 api.github.com github.com
 //!                                        a loopback proxy port: port, the hosts it
 //!                                        hands the broker (intercept)
@@ -75,6 +77,9 @@ pub struct Listener {
 pub enum Mode {
     /// Plain HTTP standing for `upstream` (a bare lowercase hostname).
     BaseUrl { upstream: String },
+    /// Plain HTTP to the transfer handles the broker put in LFS batch
+    /// responses (docs/architecture/credentials/git.md, *LFS*).
+    Lfs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +101,7 @@ pub fn serialize(spec: &BrokerSpec) -> String {
                 out.push_str(&format!("listen {} base-url ", l.port));
                 escape(upstream, &mut out);
             }
+            Mode::Lfs => out.push_str(&format!("listen {} lfs", l.port)),
         }
         out.push('\n');
     }
@@ -153,6 +159,9 @@ pub fn parse(text: &str) -> Result<BrokerSpec, String> {
                 if taken(&spec, listener.port) {
                     return Err(at(format!("port {} listed twice", listener.port)));
                 }
+                if listener.mode == Mode::Lfs && spec.listeners.iter().any(|l| l.mode == Mode::Lfs) {
+                    return Err(at("a second `lfs` listener".into()));
+                }
                 spec.listeners.push(listener);
             }
             "proxy-listen" => {
@@ -194,8 +203,12 @@ pub fn parse(text: &str) -> Result<BrokerSpec, String> {
 
 fn parse_listener(rest: &str) -> Result<Listener, String> {
     let fields: Vec<&str> = rest.split(' ').collect();
+    if let [port, "lfs"] = fields[..] {
+        let port = parse_port(port).ok_or_else(|| format!("listen port `{port}`"))?;
+        return Ok(Listener { port, mode: Mode::Lfs });
+    }
     let [port, mode, upstream] = fields[..] else {
-        return Err(format!("listen `{rest}`: want `<port> base-url <host>`"));
+        return Err(format!("listen `{rest}`: want `<port> base-url <host>` or `<port> lfs`"));
     };
     let port = parse_port(port).ok_or_else(|| format!("listen port `{port}`"))?;
     if mode != "base-url" {
@@ -290,6 +303,7 @@ mod tests {
     /// host's serializer and the helper's parser agree on the exact bytes.
     const FIXTURE: &str = "listen 41001 base-url sentry.io\n\
 listen 41002 base-url us.sentry.io\n\
+listen 41005 lfs\n\
 proxy-listen 41000 api.github.com github.com\n\
 proxy-listen 41003 github.com\n\
 proxy-listen 41004\n\
@@ -304,6 +318,7 @@ proxy NO_PROXY=\n";
             listeners: vec![
                 Listener { port: 41001, mode: Mode::BaseUrl { upstream: "sentry.io".into() } },
                 Listener { port: 41002, mode: Mode::BaseUrl { upstream: "us.sentry.io".into() } },
+                Listener { port: 41005, mode: Mode::Lfs },
             ],
             proxy_listeners: vec![
                 ProxyListener { port: 41000, hosts: vec!["api.github.com".into(), "github.com".into()] },
@@ -348,6 +363,10 @@ proxy NO_PROXY=\n";
             ("listen 41001 intercept a.io\n", "listen mode `intercept`"),
             ("listen 41001 base-url\n", "want `<port> base-url <host>`"),
             ("listen 41001 base-url  a.io\n", "want"),
+            ("listen 41001 lfs a.io\n", "listen mode `lfs`"),
+            ("listen 0 lfs\n", "listen port `0`"),
+            ("listen 41001 lfs\nlisten 41002 lfs\n", "line 2: a second `lfs` listener"),
+            ("listen 41001 lfs\nproxy-listen 41001\n", "line 2: port 41001 listed twice"),
             ("listen 41001 base-url A.io\n", "isn't a lowercase hostname"),
             ("listen 41001 base-url a.io.\n", "isn't a lowercase hostname"),
             ("listen 41001 base-url -a.io\n", "isn't a lowercase hostname"),

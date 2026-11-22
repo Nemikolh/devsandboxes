@@ -73,7 +73,7 @@ pub(crate) fn instance(key: &str, claims: Vec<InstanceClaim>) -> Instance {
 pub(crate) fn claims(selected: &[claim::Claim], phantoms: &[&str]) -> Vec<InstanceClaim> {
     let selected: Vec<(String, claim::Claim)> = selected.iter().map(|c| (format!("./{}", c.kind), c.clone())).collect();
     let mut next = phantoms.iter();
-    plan(&selected, &[], None, None, |_| Ok(next.next().unwrap().to_string())).unwrap().claims
+    plan(&selected, &[], None, None, None, |_| Ok(next.next().unwrap().to_string())).unwrap().claims
 }
 
 /// `web-1` with sentry (+ anth) and `other` with sentry.
@@ -134,7 +134,7 @@ impl Case {
             parse_head(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{extra}\r\n", self.port).as_bytes())
                 .unwrap();
         let header = ProxyHeader::BaseUrl { upstream: self.upstream.clone(), listener: self.port };
-        decide(&Call { caller: &caller(), header: &header, head: &head }, &self.state, &self.src)
+        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, &self.state, &self.src)
     }
 
     fn get(&self, path: &str, extra: &str) -> Outcome {
@@ -375,7 +375,7 @@ fn scopes_never_other_ask_and_defaults() {
 fn through(state: &State, src: &Src, host: &str, port: u16, path: &str, extra: &str) -> Outcome {
     let head = parse_head(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port };
-    decide(&Call { caller: &caller(), header: &header, head: &head }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, state, src)
 }
 
 #[test]
@@ -423,7 +423,7 @@ fn intercept_leaks_and_mode_mismatches() {
     let head = parse_head(format!("GET /user HTTP/1.1\r\nHost: 127.0.0.1:{listener}\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
         .unwrap();
     let header = ProxyHeader::BaseUrl { upstream: "api.github.com".into(), listener };
-    let o = decide(&Call { caller: &caller(), header: &header, head: &head }, &state, &src);
+    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, &state, &src);
     refused(&o, &format!("port {listener} is no broker listener for `api.github.com`"));
 }
 
@@ -448,7 +448,7 @@ pub(crate) fn git_basic(p: &str) -> String {
 fn fenced(src: &Src, method: &str, host: &str, path: &str, extra: &str) -> Outcome {
     let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head }, &fenced_state(), src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, &fenced_state(), src)
 }
 
 const UPLOAD_REFS: &str = "/o/r.git/info/refs?service=git-upload-pack";
@@ -517,6 +517,77 @@ fn a_push_in_the_fence_still_needs_its_scope() {
     let r = refused(&o, "scope `git.push` isn't in `access.github.scopes`");
     assert_eq!(r.scope.as_deref(), Some("git.push"));
     assert_eq!(o.context.shape, Some(Shape::Git {}));
+}
+
+/// The LFS listener port [`with_lfs`] gives an instance.
+pub(crate) const LFS_PORT: u16 = 29005;
+
+/// `inst`'s intercept side with the LFS listener on [`LFS_PORT`].
+pub(crate) fn with_lfs(inst: &mut Instance) {
+    inst.intercept = Some(crate::credentials::instance::Intercept {
+        port: 29003,
+        hosts: vec!["api.github.com".into()],
+        git: None,
+        lfs: Some(LFS_PORT),
+        proxy_env: Vec::new(),
+        bundle: "/b".into(),
+        installed: None,
+    });
+}
+
+fn batch(state: &State, src: &Src, path: &str, op: Option<route::LfsOp>) -> Outcome {
+    let head = parse_head(format!("POST {path} HTTP/1.1\r\nHost: github.com\r\n{}Content-Length: 2\r\n\r\n", git_basic(GH)).as_bytes())
+        .unwrap();
+    let header = ProxyHeader::Intercept { host: "github.com".into(), port: 443 };
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: op }, state, src)
+}
+
+#[test]
+fn lfs_batches_read_or_write_by_their_operation() {
+    use route::LfsOp::{Download, Upload};
+    let mut state = fenced_state();
+    with_lfs(state.instances.get_mut("web-1").unwrap());
+    let src = fenced_src(None);
+    let inside = "/o/r.git/info/lfs/objects/batch";
+    let o = batch(&state, &src, inside, Some(Download));
+    assert_eq!((injected(&o).lfs, o.context.scope.as_deref()), (Some(LFS_PORT), Some("repo.read")));
+    // An upload needs the claim's `lfs.upload` scope, not the route's.
+    let o = batch(&state, &src, inside, Some(Upload));
+    assert_eq!((injected(&o).lfs, o.context.scope.as_deref()), (Some(LFS_PORT), Some("git.push")));
+    let read_only = fenced_src(Some(Access { scopes: vec!["repo.read".into()], ..Access::default() }));
+    injected(&batch(&state, &read_only, inside, Some(Download)));
+    let r = refused(&batch(&state, &read_only, inside, Some(Upload)), "scope `git.push` isn't in `access.github.scopes`");
+    assert_eq!(r.scope.as_deref(), Some("git.push"));
+
+    // Outside the fence a download goes stripped, an upload is refused.
+    let outside = "/x/y.git/info/lfs/objects/batch";
+    let o = batch(&state, &src, outside, Some(Download));
+    assert!(matches!(o.action, Action::Outside { .. }), "{:?}", o.action);
+    refused(&batch(&state, &src, outside, Some(Upload)), "`x/y` is outside the instance's repo fence: no credential writes");
+    refused(&batch(&state, &src, outside, None), "no credential writes");
+
+    // No LFS listener on the instance: nothing to point transfers at.
+    let o = batch(&fenced_state(), &src, inside, Some(Download));
+    assert_eq!(injected(&o).lfs, None);
+    // Nor for a claim approved without `lfs`.
+    let mut plain = crate::credentials::home::tests::github();
+    plain.pinned.lfs = None;
+    let mut home = fenced_src(None).home;
+    home.get_mut("github-work").unwrap().approved[0].claim = plain.canonical();
+    let o = batch(&state, &Src { home, access: None }, inside, Some(Upload));
+    assert_eq!((injected(&o).lfs, o.context.scope.as_deref()), (None, Some("repo.read")));
+}
+
+#[test]
+fn lfs_locks_list_as_reads_and_verify_as_writes() {
+    let src = fenced_src(None);
+    let o = fenced(&src, "GET", "github.com", "/o/r.git/info/lfs/locks?path=a", &git_basic(GH));
+    assert_eq!((injected(&o).lfs, o.context.scope.as_deref()), (None, Some("repo.read")));
+    for path in ["/o/r.git/info/lfs/locks/verify", "/o/r.git/info/lfs/locks", "/o/r.git/info/lfs/locks/12/unlock"] {
+        assert_eq!(fenced(&src, "POST", "github.com", path, &git_basic(GH)).context.scope.as_deref(), Some("git.push"), "{path}");
+    }
+    assert!(matches!(fenced(&src, "GET", "github.com", "/x/y.git/info/lfs/locks", &git_basic(GH)).action, Action::Outside { .. }));
+    refused(&fenced(&src, "POST", "github.com", "/x/y.git/info/lfs/locks/verify", &git_basic(GH)), "no credential writes");
 }
 
 #[test]

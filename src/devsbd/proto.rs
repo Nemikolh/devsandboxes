@@ -165,8 +165,9 @@ pub const MAX_PROXY_HEADER: usize = 300;
 
 /// What an `HTTP_PROXY` stream's first line says it carries: a hint the
 /// broker checks against the instance's bound claims, never trusted alone.
-/// Wire: `base-url <upstream> <listener port>\n` or `intercept <host>
-/// <port>\n`, single spaces, ports decimal without leading zeros.
+/// Wire: `base-url <upstream> <listener port>\n`, `intercept <host>
+/// <port>\n` or `lfs <listener port>\n`, single spaces, ports decimal
+/// without leading zeros.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyHeader {
     /// Plain HTTP to a base-URL listener: the upstream it stands for, and
@@ -174,6 +175,9 @@ pub enum ProxyHeader {
     BaseUrl { upstream: String, listener: u16 },
     /// A `CONNECT` target on a proxy port (intercept mode).
     Intercept { host: String, port: u16 },
+    /// Plain HTTP to the LFS transfers' listener: its port, the authority a
+    /// request's `Host` must name.
+    Lfs { listener: u16 },
 }
 
 impl ProxyHeader {
@@ -181,6 +185,7 @@ impl ProxyHeader {
         let (mode, host, port) = match self {
             ProxyHeader::BaseUrl { upstream, listener } => ("base-url", upstream, listener),
             ProxyHeader::Intercept { host, port } => ("intercept", host, port),
+            ProxyHeader::Lfs { listener } => return format!("lfs {listener}\n").into_bytes(),
         };
         format!("{mode} {host} {port}\n").into_bytes()
     }
@@ -193,6 +198,9 @@ impl ProxyHeader {
         let text = std::str::from_utf8(line).map_err(|_| "proxy header is not utf-8".to_string())?;
         let text = text.strip_suffix('\n').ok_or("proxy header without its newline")?;
         let fields: Vec<&str> = text.split(' ').collect();
+        if let ["lfs", port] = fields[..] {
+            return parse_port(port).map(|listener| ProxyHeader::Lfs { listener });
+        }
         let [mode, host, port] = fields[..] else {
             return Err(format!("proxy header `{text}`: want `<mode> <host> <port>`"));
         };
@@ -200,10 +208,7 @@ impl ProxyHeader {
         if !host_ok {
             return Err(format!("proxy header host `{host}`"));
         }
-        let port = match port.parse::<u16>() {
-            Ok(p) if p != 0 && port.bytes().all(|b| b.is_ascii_digit()) && !port.starts_with('0') => p,
-            _ => return Err(format!("proxy header port `{port}`")),
-        };
+        let port = parse_port(port)?;
         let host = host.to_string();
         match mode {
             "base-url" => Ok(ProxyHeader::BaseUrl { upstream: host, listener: port }),
@@ -229,6 +234,13 @@ impl ProxyHeader {
             }
         }
         ProxyHeader::parse(&line).map_err(|e| invalid(&e))
+    }
+}
+
+fn parse_port(port: &str) -> Result<u16, String> {
+    match port.parse::<u16>() {
+        Ok(p) if p != 0 && port.bytes().all(|b| b.is_ascii_digit()) && !port.starts_with('0') => Ok(p),
+        _ => Err(format!("proxy header port `{port}`")),
     }
 }
 
@@ -932,7 +944,9 @@ mod tests {
         assert_eq!(base.encode(), b"base-url sentry.io 41001\n");
         let intercept = ProxyHeader::Intercept { host: "[::1]".into(), port: 443 };
         assert_eq!(intercept.encode(), b"intercept [::1] 443\n");
-        for h in [base, intercept] {
+        let lfs = ProxyHeader::Lfs { listener: 29005 };
+        assert_eq!(lfs.encode(), b"lfs 29005\n");
+        for h in [base, intercept, lfs] {
             assert_eq!(ProxyHeader::parse(&h.encode()), Ok(h.clone()));
             // `read` stops at the newline: the client's bytes stay unread.
             let mut wire = Cursor::new([h.encode(), b"GET / HTTP/1.1\r\n".to_vec()].concat());
@@ -957,6 +971,13 @@ mod tests {
             b"base-url sentr\x01y.io 1\n",
             b"base-url \xff 1\n",
             b"base-url sentry.io 1\nextra",
+            b"lfs\n",
+            b"lfs 0\n",
+            b"lfs 029005\n",
+            b"lfs 29005 x\n",
+            b"lfs  29005\n",
+            b"lfs x 29005\n",
+            b"LFS 29005\n",
         ] {
             assert!(ProxyHeader::parse(bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
         }

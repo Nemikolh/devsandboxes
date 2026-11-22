@@ -42,7 +42,7 @@ pub const OTHER_SCOPE: &str = "other";
 
 const FIELDS: &[&str] = &[
     "upstreams", "mode", "inject", "phantom", "git", "baseUrl", "rewrite", "login", "check",
-    "mint", "scopes", "never", "presence", "hold", "refusal", "fence", "ca",
+    "mint", "scopes", "never", "presence", "hold", "refusal", "fence", "ca", "lfs",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +104,21 @@ pub struct Pinned {
     /// `{var}` from the path, else a body field path. Non-empty: the
     /// credential is repo-fenced ([`Pinned::fenced`]).
     pub fence: BTreeMap<Route, Vec<String>>,
+    /// Pinned, not wiring: it sends LFS transfers, with the credentials a
+    /// batch response hands out, through the broker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfs: Option<Lfs>,
+}
+
+/// git-lfs through the broker (docs/architecture/credentials/git.md, *LFS*).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lfs {
+    /// Sorted; each one of `git.hosts`.
+    pub hosts: Vec<String>,
+    /// The scope an `upload` batch needs, whatever scope the batch route is
+    /// in: the route can't tell an upload from a download.
+    pub upload: String,
 }
 
 impl Pinned {
@@ -425,6 +440,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
         check_field_path(field).context("`refusal.field`")?;
     }
     let fence = fence(field(obj, "fence")?.unwrap_or_default())?;
+    let lfs = lfs(field(obj, "lfs")?, mode, git.as_ref(), &scopes)?;
 
     Ok(Claim {
         kind: kind.to_string(),
@@ -442,6 +458,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
             hold,
             refusal,
             fence,
+            lfs,
         },
         wiring: Wiring { phantom, base_url, ca, git },
     })
@@ -672,6 +689,32 @@ fn git(raw: Option<RawGit>, mode: Mode, upstreams: &BTreeSet<&str>) -> Result<Op
         }
     }
     Ok(Some(Git { hosts: raw.hosts }))
+}
+
+fn lfs(raw: Option<Lfs>, mode: Mode, git: Option<&Git>, scopes: &BTreeMap<String, Scope>) -> Result<Option<Lfs>> {
+    let Some(mut raw) = raw else { return Ok(None) };
+    if mode != Mode::Intercept {
+        bail!("`lfs` is only for `intercept` mode");
+    }
+    let Some(git) = git else {
+        bail!("`lfs` needs `git`: LFS batches go to the git hosts");
+    };
+    if raw.hosts.is_empty() {
+        bail!("`lfs.hosts` must name at least one host");
+    }
+    for (i, host) in raw.hosts.iter().enumerate() {
+        if !git.hosts.contains(host) {
+            bail!("`lfs.hosts[{i}]`: `{host}` isn't one of `git.hosts`");
+        }
+        if raw.hosts[..i].contains(host) {
+            bail!("`lfs.hosts[{i}]`: `{host}` is listed twice");
+        }
+    }
+    if !scopes.contains_key(&raw.upload) {
+        bail!("`lfs.upload`: `{}` isn't one of the claim's `scopes`", raw.upload);
+    }
+    raw.hosts.sort();
+    Ok(Some(raw))
 }
 
 #[derive(Deserialize)]
@@ -1485,6 +1528,45 @@ mod tests {
         assert!(with("git", json!({ "hosts": [] })).contains("at least one host"));
         assert!(with("git", json!({ "hosts": ["github.com", "github.com"] })).contains("listed twice"));
         assert!(with("ca", json!({ "env": "GH_TOKEN" })).contains("`ca.env`: `GH_TOKEN` is already set"));
+    }
+
+    #[test]
+    fn lfs_is_pinned_and_rides_on_git_hosts() {
+        let gh = json!({
+            "upstreams": ["api.github.com", "github.com"],
+            "mode": "intercept",
+            "inject": [{ "basic": "x-access-token" }],
+            "phantom": { "env": ["GH_TOKEN"] },
+            "login": [{ "method": "paste" }],
+            "git": { "hosts": ["github.com"] },
+            "scopes": { "repo.read": ["POST /{repo}/info/lfs/objects/batch"], "git.push": ["POST /{repo}/git-receive-pack"] },
+        });
+        let with = |lfs: Value| {
+            let mut c = gh.clone();
+            c.as_object_mut().unwrap().insert("lfs".into(), lfs);
+            c
+        };
+        let ok = with(json!({ "hosts": ["github.com"], "upload": "git.push" }));
+        let c = parse("github", &ok).unwrap();
+        assert_eq!(c.pinned.lfs, Some(Lfs { hosts: vec!["github.com".into()], upload: "git.push".into() }));
+        assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
+        let without = parse("github", &gh).unwrap();
+        assert_ne!(c.version(), without.version(), "lfs is pinned");
+        assert!(!without.canonical().contains("\"lfs\""), "absent: the canonical form doesn't change");
+        let other_scope = with(json!({ "hosts": ["github.com"], "upload": "repo.read" }));
+        assert_ne!(parse("github", &other_scope).unwrap().version(), c.version());
+
+        let err = |v: Value| format!("{:#}", parse("github", &v).unwrap_err());
+        assert!(err(with(json!({ "hosts": ["api.github.com"], "upload": "git.push" }))).contains("`lfs.hosts[0]`: `api.github.com` isn't one of `git.hosts`"));
+        assert!(err(with(json!({ "hosts": [], "upload": "git.push" }))).contains("at least one host"));
+        assert!(err(with(json!({ "hosts": ["github.com", "github.com"], "upload": "git.push" }))).contains("listed twice"));
+        assert!(err(with(json!({ "hosts": ["github.com"], "upload": "lfs.write" }))).contains("`lfs.upload`: `lfs.write` isn't one of the claim's `scopes`"));
+        assert!(err(with(json!({ "hosts": ["github.com"] }))).contains("`lfs`"));
+        assert!(err(with(json!({ "hosts": ["github.com"], "upload": "git.push", "verify": true }))).contains("unknown field `verify`"));
+        let mut no_git = ok.clone();
+        no_git.as_object_mut().unwrap().remove("git");
+        assert!(err(no_git).contains("`lfs` needs `git`"));
+        assert_err(sentry_with("lfs", json!({ "hosts": ["sentry.io"], "upload": "uploads" })), &["`lfs` is only for `intercept` mode"]);
     }
 
     #[test]

@@ -660,6 +660,7 @@ mod tests {
                     port: 29001,
                     hosts: vec!["api.github.com".into()],
                     git: Some(crate::credentials::instance::ProxyPort { port: 29002, hosts: vec!["github.com".into()] }),
+                    lfs: Some(29003),
                     proxy_env: vec![("HTTPS_PROXY".into(), "http://corp:3128".into())],
                     bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
                     installed: Some("ab".repeat(32)),

@@ -91,7 +91,9 @@ pub(super) fn wire(
     let prior_claims = prior.map(|i| i.claims.as_slice()).unwrap_or_default();
     let prior_port = prior.and_then(|i| i.intercept.as_ref()).map(|i| i.port);
     let prior_git_port = prior.and_then(|i| i.intercept.as_ref()).and_then(|i| i.git.as_ref()).map(|g| g.port);
-    let planned = instance::plan(&kept, prior_claims, prior_port, prior_git_port, instance::mint_phantom)?;
+    let prior_lfs_port = prior.and_then(|i| i.intercept.as_ref()).and_then(|i| i.lfs);
+    let planned =
+        instance::plan(&kept, prior_claims, prior_port, prior_git_port, prior_lfs_port, instance::mint_phantom)?;
     let mut claims = planned.claims;
     for ((_, claim), record) in kept.iter().zip(claims.iter_mut()) {
         wired.env.extend(instance::env(claim, record));
@@ -115,6 +117,7 @@ pub(super) fn wire(
             port: shared.port,
             hosts: shared.hosts,
             git: planned.git,
+            lfs: planned.lfs,
             proxy_env: proxying.proxy_env,
             bundle: probe_bundle(proxying.image),
             installed: None,

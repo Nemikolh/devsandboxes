@@ -1,6 +1,6 @@
 //! `devsbd daemon`'s credential-broker side (docs/architecture/helper/in-container.md,
 //! *Broker listeners*): at start, the broker file's phantom files and its
-//! loopback listeners. Each accepted connection becomes an `HTTP_PROXY`
+//! loopback listeners (base-URL and LFS). Each accepted connection becomes an `HTTP_PROXY`
 //! stream to the newest bridge whose host serves one, its `ProxyHeader`
 //! first; the broker itself runs in the host's `serve`. The proxy ports
 //! are `proxy.rs`.
@@ -65,6 +65,7 @@ pub fn start(path: &Path, route: Route, ids: Arc<AtomicU32>) {
         };
         let header = match l.mode {
             Mode::BaseUrl { upstream } => ProxyHeader::BaseUrl { upstream, listener: l.port },
+            Mode::Lfs => ProxyHeader::Lfs { listener: l.port },
         };
         let (route, ids) = (Arc::clone(&route), Arc::clone(&ids));
         std::thread::spawn(move || serve(listener, &header, &route, &ids));

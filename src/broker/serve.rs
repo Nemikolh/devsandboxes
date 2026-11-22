@@ -11,8 +11,12 @@
 //! member CA's leaf for its host. An OAuth credential's
 //! token is renewed ahead of expiry, and on an upstream 401 renewed and the
 //! call replayed when its body was held; any other injected call's 401 is
-//! turned into a refusal naming `devsandbox login`. Every request leaves one
-//! `access.log` line.
+//! turned into a refusal naming `devsandbox login`. An LFS batch's body is
+//! read before policy (its `operation` makes it a read or a write), and an
+//! injected batch's response has its transfers put behind handles on the
+//! instance's LFS listener ([`super::lfs`]), whose connections this serves
+//! too: each request's handle forwarded to its stored `href` with its
+//! stored header. Every request leaves one `access.log` line.
 //!
 //! Nothing is cached: `state.toml` per request, `credentials.toml`, the
 //! store and the instance's config only for a call carrying its phantom,
@@ -33,8 +37,8 @@ use super::head::{self, Framing, Header, RequestHead, Version};
 use super::policy::{self, Action, Call, Context, Injection, Sources};
 use super::redact::Secrets;
 use super::refusal::{Refusal, reason_phrase};
-use super::upstream::{self, Body, Length, Request, Response, Upstream};
-use super::{guard, intercept, rewrite, route};
+use super::upstream::{self, Body, Length, Request, Response, Upstream, UpstreamError};
+use super::{guard, intercept, lfs, rewrite, route};
 use crate::config::{Access, Config};
 use crate::credentials::ca::{Leaf, MemberCa};
 use crate::credentials::claim::{self, Refusal as Shape, Slot};
@@ -74,6 +78,10 @@ pub struct Service {
     audit: Audit,
     /// Upstream host → the authority dialed instead: tests' local servers.
     authorities: HashMap<String, String>,
+    /// LFS storage hosts dialed despite a private address: tests' local
+    /// servers.
+    private_storage: BTreeSet<String>,
+    lfs: Mutex<lfs::Store>,
     /// Loaded at the first intercepted connection, so a host that
     /// intercepts nothing never makes a CA key; a failed load is retried.
     ca: Mutex<Option<Arc<RwLock<MemberCa>>>>,
@@ -140,6 +148,8 @@ impl Service {
             upstream,
             tokens,
             authorities: HashMap::new(),
+            private_storage: BTreeSet::new(),
+            lfs: Mutex::new(lfs::Store::new(lfs::MAX_PER_INSTANCE)),
             ca: Mutex::default(),
             log: |_| {},
         })
@@ -159,6 +169,14 @@ impl Service {
     pub fn with_authority(mut self, host: &str, authority: &str) -> Service {
         self.authorities.insert(host.to_string(), authority.to_string());
         self
+    }
+
+    /// `host` dialed at `authority`, its private address allowed: a test's
+    /// LFS storage host.
+    #[cfg(test)]
+    pub fn with_storage(mut self, host: &str, authority: &str) -> Service {
+        self.private_storage.insert(host.to_string());
+        self.with_authority(host, authority)
     }
 
     #[cfg(test)]
@@ -277,6 +295,7 @@ impl Service {
         let guarded = guard::refuse_browser(&head.headers).and_then(|()| match header {
             ProxyHeader::BaseUrl { listener, .. } => guard::check_host(&head, &format!("127.0.0.1:{listener}"), 80),
             ProxyHeader::Intercept { host, .. } => guard::check_host(&head, host, 443),
+            ProxyHeader::Lfs { listener } => guard::check_host(&head, &format!("127.0.0.1:{listener}"), 80),
         });
         if let Err(why) = guarded {
             let r = Refusal::new(why.status(), "refused", why.to_string());
@@ -292,7 +311,18 @@ impl Service {
             }
         };
 
-        let call = Call { caller, header, head: &head };
+        let mut batch = None;
+        if route::lfs_batch(&head.method, head.target.path()) {
+            match batch_body(&head, conn)? {
+                Ok(read) => batch = Some(read),
+                Err((r, close)) => {
+                    self.refuse(conn.get_mut(), &r, shape.as_ref(), close, &mut line)?;
+                    return Ok(!close);
+                }
+            }
+        }
+        let call = Call { caller, header, head: &head, lfs: batch.as_ref().map(|(_, op)| *op) };
+        let pre = batch.map(|(body, _)| body);
         let outcome = policy::decide(&call, &state, &Files { data: &self.data });
         let cx = outcome.context;
         line.incarnation = cx.incarnation.clone();
@@ -321,11 +351,11 @@ impl Service {
             }
             Action::Uninjected { private: false } => {
                 line.verdict = "uninjected".into();
-                self.forward(&head, header, Via::Bare, &cx, conn, &mut line)
+                self.forward(&head, header, Via::Bare, &cx, pre, conn, &mut line)
             }
             Action::Outside { slot, private } => {
                 line.verdict = "outside".into();
-                self.forward(&head, header, Via::Stripped(&slot, private), &cx, conn, &mut line)
+                self.forward(&head, header, Via::Stripped(&slot, private), &cx, pre, conn, &mut line)
             }
             Action::Inject(inj) => {
                 let now = Instance::now();
@@ -333,7 +363,7 @@ impl Service {
                     Ok(fresh) => {
                         line.verdict = "allow".into();
                         line.refreshed = fresh.refreshed;
-                        self.forward(&head, header, Via::Inject(&inj, fresh), &cx, conn, &mut line)
+                        self.forward(&head, header, Via::Inject(&inj, fresh), &cx, pre, conn, &mut line)
                     }
                     Err(f) => {
                         let r = failure_refusal(f, &inj.credential, cx.scope.clone());
@@ -360,12 +390,15 @@ impl Service {
         w.write_all(&r.response(shape, close))
     }
 
+    /// `pre`: the body, already read (an LFS batch's).
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         head: &RequestHead,
         header: &ProxyHeader,
         via: Via<'_>,
         cx: &Context,
+        pre: Option<Vec<u8>>,
         conn: &mut Conn,
         line: &mut Line,
     ) -> io::Result<bool> {
@@ -377,6 +410,7 @@ impl Service {
         let upstream_host = match header {
             ProxyHeader::BaseUrl { upstream, .. } => upstream.as_str(),
             ProxyHeader::Intercept { host, .. } => host.as_str(),
+            ProxyHeader::Lfs { .. } => unreachable!("policy refuses an LFS listener's request"),
         };
         let keep = head.keep_alive();
         let upstream = match &self.upstream {
@@ -389,7 +423,8 @@ impl Service {
             }
         };
         let authority = self.authorities.get(upstream_host).map_or(upstream_host, String::as_str);
-        if head.expect_continue {
+        let read_ahead = pre.is_some();
+        if head.expect_continue && !read_ahead {
             conn.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             conn.get_mut().flush()?;
         }
@@ -397,6 +432,7 @@ impl Service {
         let mut body = BodyReader::new(&mut *conn, head.framing);
         let replayable = inject.as_ref().is_some_and(|(_, f)| f.renewable && !f.refreshed);
         let held = match head.framing {
+            _ if read_ahead => pre,
             _ if !replayable => None,
             Framing::Empty => Some(Vec::new()),
             Framing::Length(n) if n <= MAX_REPLAY => {
@@ -412,7 +448,7 @@ impl Service {
         let mut token = inject.as_ref().map(|(_, f)| f.token.clone());
         let to = Target { upstream, authority, head, strip };
         let (sent, mut path) = to.send(inj.zip(token.as_ref().map(|t| t.expose())), held.as_deref(), &mut body);
-        let keep = keep && body.is_done();
+        let keep = keep && (read_ahead || body.is_done());
         let w = conn.get_mut();
         let mut resp = match sent {
             Ok(resp) => resp,
@@ -485,6 +521,17 @@ impl Service {
         let fields = inj.filter(|_| matches!(header, ProxyHeader::BaseUrl { .. })).and_then(|inj| {
             inj.claim.rewrite.iter().find(|r| route::is(&r.route, &head.method, &path)).map(|r| r.fields.clone())
         });
+        let lfs = inj.and_then(|i| i.lfs).filter(|_| resp.status == 200).map(|port| LfsRewrite {
+            store: &self.lfs,
+            owner: lfs::Owner {
+                instance: line.instance.clone(),
+                instance_id: line.instance_id.clone(),
+                incarnation: cx.incarnation.clone(),
+            },
+            port,
+            kind: cx.kind.as_deref(),
+            credential: cx.credential.as_deref(),
+        });
         line.status = resp.status;
         let respond = Respond {
             http10: head.version == Version::Http10,
@@ -493,6 +540,7 @@ impl Service {
             secrets: secrets.as_ref(),
             listeners: &cx.listeners,
             fields: fields.as_deref(),
+            lfs,
             max_rewrite: rewrite::MAX_REWRITE,
         };
         let result = respond.write(resp, w, line);
@@ -549,6 +597,182 @@ impl Service {
         self.refuse(w, &r, cx.shape.as_ref(), !keep, line)?;
         Ok(keep)
     }
+}
+
+impl Service {
+    /// One request on the LFS listener: its path's handle, looked up for
+    /// the caller ([`lfs::Store::get`]), forwarded to the stored `href`.
+    fn lfs_request(&self, caller: &Caller, listener: u16, conn: &mut Conn) -> io::Result<bool> {
+        let read = head::read_head(conn);
+        let mut line = Line { route: "lfs".into(), ..self.line(caller) };
+        let head = match read {
+            Ok(Some(h)) => h,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                let Some(why) = super::refusal(&e) else { return Err(e) };
+                let r = Refusal::new(why.status(), "refused", why.to_string());
+                self.refuse(conn.get_mut(), &r, None, true, &mut line)?;
+                return Ok(false);
+            }
+        };
+        line.method = head.method.clone();
+        let close = !matches!(head.framing, Framing::Empty | Framing::Length(0)) || !head.keep_alive();
+        match self.lfs_entry(caller, listener, &head, &mut line) {
+            Ok(entry) => {
+                line.verdict = "allow".into();
+                self.transfer(&head, &entry, conn, &mut line)
+            }
+            Err(r) => {
+                self.refuse(conn.get_mut(), &r, None, close, &mut line)?;
+                Ok(!close)
+            }
+        }
+    }
+
+    fn lfs_entry(&self, caller: &Caller, listener: u16, head: &RequestHead, line: &mut Line) -> Result<lfs::Entry, Refusal> {
+        guard::refuse_browser(&head.headers)
+            .and_then(|()| guard::check_host(head, &format!("127.0.0.1:{listener}"), 80))
+            .map_err(|why| Refusal::new(why.status(), "refused", why.to_string()))?;
+        let state = State::load_at(&self.state).map_err(|e| Refusal::new(503, "error", format!("{e:#}")))?;
+        let key = &caller.instance;
+        let inst = state
+            .instances
+            .get(key)
+            .filter(|i| i.instance_id == caller.instance_id)
+            .ok_or_else(|| Refusal::refused(format!("instance `{key}` has no record on this host")))?;
+        line.incarnation = inst.incarnation.clone();
+        if inst.intercept.as_ref().and_then(|i| i.lfs) != Some(listener) {
+            return Err(Refusal::refused(format!("port {listener} is no LFS listener of instance `{key}`")));
+        }
+        let owner = lfs::Owner {
+            instance: key.clone(),
+            instance_id: caller.instance_id.clone(),
+            incarnation: inst.incarnation.clone(),
+        };
+        let handle = head.target.path().strip_prefix('/').filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric()));
+        let store = self.lfs.lock().unwrap_or_else(|e| e.into_inner());
+        match handle.map_or(lfs::Lookup::Missing, |h| store.get(h, &owner, Instance::now())) {
+            lfs::Lookup::Missing => Err(Refusal::new(
+                404,
+                "refused",
+                "no such LFS transfer: its handle is unknown or expired (run the git lfs command again)",
+            )),
+            lfs::Lookup::Foreign => {
+                Err(Refusal::new(403, "leak", "another instance's LFS transfer handle was sent from this one"))
+            }
+            lfs::Lookup::Found(e) => {
+                let action = e.action;
+                line.route = format!("lfs {}", action.name());
+                line.kind = e.kind.clone();
+                line.credential = e.credential.clone();
+                if head.method != action.method() {
+                    return Err(Refusal::refused(format!(
+                        "`{}` to an LFS {} transfer, which takes `{}`",
+                        head.method,
+                        action.name(),
+                        action.method()
+                    )));
+                }
+                Ok(e.clone())
+            }
+        }
+    }
+
+    /// The client's request to `e.href` with `e`'s header and none of the
+    /// client's credentials, the body streamed both ways. The log never
+    /// gets the href (its query is a signature) nor a header value.
+    fn transfer(&self, head: &RequestHead, e: &lfs::Entry, conn: &mut Conn, line: &mut Line) -> io::Result<bool> {
+        let keep = head.keep_alive();
+        let target = upstream::Target::parse(&e.href);
+        let (upstream, target) = match (&self.upstream, target) {
+            (Ok(u), Ok(t)) => (u, t),
+            (Err(why), _) => {
+                let close = !keep || !matches!(head.framing, Framing::Empty | Framing::Length(0));
+                self.refuse(conn.get_mut(), &Refusal::new(502, "error", why.clone()), None, close, line)?;
+                return Ok(!close);
+            }
+            (Ok(_), Err(_)) => {
+                let r = Refusal::new(500, "error", "the stored LFS transfer has no https href");
+                self.refuse(conn.get_mut(), &r, None, true, line)?;
+                return Ok(false);
+            }
+        };
+        let authority = self.authorities.get(&target.host).cloned().unwrap_or_else(|| target.authority());
+        let url = format!("https://{authority}{}", target.path);
+        let headers = transfer_headers(&head.headers, &e.headers);
+        if head.expect_continue {
+            conn.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            conn.get_mut().flush()?;
+        }
+        let mut body = BodyReader::new(&mut *conn, head.framing);
+        let req_body = match head.framing {
+            Framing::Empty => Body::Empty,
+            Framing::Length(n) => Body::Length(n, &mut body),
+            Framing::Chunked => Body::Chunked(&mut body),
+        };
+        let private = self.private_storage.contains(&target.host);
+        let sent = upstream.send(Request { method: &head.method, url: &url, headers: &headers, body: req_body, private });
+        let keep = keep && body.is_done();
+        let w = conn.get_mut();
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(err) => {
+                let status = super::refusal(&err)
+                    .map(|h| h.status())
+                    .or_else(|| upstream::upstream_error(&err).map(|u| u.status()))
+                    .unwrap_or(502);
+                // An invalid request's error quotes it: the stored header.
+                let why = match upstream::upstream_error(&err) {
+                    Some(UpstreamError::Invalid(_)) => "the stored LFS transfer isn't a valid request".to_string(),
+                    _ => err.to_string(),
+                };
+                let r = Refusal::new(status, "error", format!("calling `{}`: {why}", target.host));
+                self.refuse(w, &r, None, !keep, line)?;
+                return Ok(keep);
+            }
+        };
+        line.status = resp.status;
+        let secrets = transfer_secrets(e);
+        let respond = Respond {
+            http10: head.version == Version::Http10,
+            keep,
+            outside: false,
+            secrets: Some(&secrets),
+            listeners: &[],
+            fields: None,
+            lfs: None,
+            max_rewrite: 0,
+        };
+        let result = respond.write(resp, w, line);
+        self.audit.write(line);
+        result
+    }
+}
+
+/// Stored header fields that carry no credential: left unmasked, as a
+/// response may well repeat them.
+const PLAIN_FIELDS: &[&str] = &["accept", "content-type"];
+
+/// A transfer's fields: the client's, minus its credentials and any the
+/// stored header names, then the stored header.
+fn transfer_headers(client: &[Header], stored: &[(String, String)]) -> Vec<Header> {
+    let mut out: Vec<Header> = upstream_headers(client)
+        .into_iter()
+        .filter(|h| {
+            !["authorization", "cookie"].iter().any(|n| h.name.eq_ignore_ascii_case(n))
+                && !stored.iter().any(|(name, _)| name.eq_ignore_ascii_case(&h.name))
+        })
+        .collect();
+    out.extend(stored.iter().map(|(name, value)| Header { name: name.clone(), value: value.as_bytes().to_vec() }));
+    out
+}
+
+/// What a transfer's response must not show the container: the stored
+/// header's values and the href's query (a signed URL's signature).
+fn transfer_secrets(e: &lfs::Entry) -> Secrets {
+    let values = e.headers.iter().filter(|(name, _)| !PLAIN_FIELDS.iter().any(|p| name.eq_ignore_ascii_case(p)));
+    let query = e.href.split_once('?').map(|(_, q)| q.as_bytes().to_vec());
+    Secrets::new(values.map(|(_, v)| v.as_bytes().to_vec()).chain(query))
 }
 
 enum Via<'a> {
@@ -634,7 +858,10 @@ impl Broker for Service {
         };
         let mut conn = BufReader::new(wire);
         loop {
-            let keep = self.request(caller, &header, &mut conn);
+            let keep = match header {
+                ProxyHeader::Lfs { listener } => self.lfs_request(caller, listener, &mut conn),
+                _ => self.request(caller, &header, &mut conn),
+            };
             if conn.get_mut().flush().is_err() || !matches!(keep, Ok(true)) {
                 break;
             }
@@ -650,8 +877,64 @@ fn claim_shape(state: &State, caller: &Caller, header: &ProxyHeader) -> Option<S
     let c = match header {
         ProxyHeader::BaseUrl { listener, .. } => instance::by_port(&inst.claims, *listener)?.0,
         ProxyHeader::Intercept { host, port } => policy::intercept_claim(inst, host, *port)?,
+        ProxyHeader::Lfs { .. } => return None,
     };
     claim::from_canonical(&c.claim).ok()?.1.refusal
+}
+
+/// A batch's body and its `operation`, else the refusal and whether the
+/// connection closes after it.
+type BatchBody = Result<(Vec<u8>, route::LfsOp), (Refusal, bool)>;
+
+/// An LFS batch's body, read whole before policy (its `operation` makes the
+/// call a read or a write), after the `100 Continue` it asked for.
+fn batch_body(head: &RequestHead, conn: &mut Conn) -> io::Result<BatchBody> {
+    let too_large = || Refusal::new(413, "refused", format!("an LFS batch body over {} bytes", route::MAX_LFS_BATCH));
+    if head::header(&head.headers, "content-encoding").is_some() {
+        return Ok(Err((Refusal::new(400, "refused", "an LFS batch body with a `Content-Encoding`"), true)));
+    }
+    if matches!(head.framing, Framing::Length(n) if n > route::MAX_LFS_BATCH) {
+        return Ok(Err((too_large(), true)));
+    }
+    if head.expect_continue {
+        conn.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        conn.get_mut().flush()?;
+    }
+    let mut body = Vec::new();
+    let mut reader = BodyReader::new(&mut *conn, head.framing);
+    if let Err(e) = (&mut reader).take(route::MAX_LFS_BATCH + 1).read_to_end(&mut body) {
+        let Some(why) = super::refusal(&e) else { return Err(e) };
+        return Ok(Err((Refusal::new(why.status(), "refused", why.to_string()), true)));
+    }
+    if body.len() as u64 > route::MAX_LFS_BATCH {
+        return Ok(Err((too_large(), true)));
+    }
+    match route::lfs_operation(&body) {
+        Ok(op) => Ok(Ok((body, op))),
+        Err(why) => Ok(Err((Refusal::new(400, "refused", why), !head.keep_alive()))),
+    }
+}
+
+/// An injected LFS batch's response rewrite ([`lfs::rewrite_batch`]).
+struct LfsRewrite<'a> {
+    store: &'a Mutex<lfs::Store>,
+    owner: lfs::Owner,
+    port: u16,
+    kind: Option<&'a str>,
+    credential: Option<&'a str>,
+}
+
+impl LfsRewrite<'_> {
+    fn rewrite(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let to = lfs::Batch {
+            owner: &self.owner,
+            kind: self.kind,
+            credential: self.credential,
+            port: self.port,
+            now: Instance::now(),
+        };
+        lfs::rewrite_batch(body, &to, &mut self.store.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 fn failure_refusal(f: Failure, credential: &str, scope: Option<String>) -> Refusal {
@@ -696,6 +979,8 @@ struct Respond<'a> {
     listeners: &'a [(String, u16)],
     /// The claim's `rewrite` fields for this route.
     fields: Option<&'a [String]>,
+    /// An injected LFS batch's 200: its actions go behind handles.
+    lfs: Option<LfsRewrite<'a>>,
     max_rewrite: usize,
 }
 
@@ -740,13 +1025,21 @@ impl Respond<'_> {
 
         let mut body = resp.body;
         let mut prefix = Vec::new();
-        if let Some(fields) = self.fields.filter(|_| resp.length != Length::Empty) {
+        if (self.fields.is_some() || self.lfs.is_some()) && resp.length != Length::Empty {
             (&mut body).take(self.max_rewrite as u64 + 1).read_to_end(&mut prefix)?;
             if prefix.len() <= self.max_rewrite {
+                // Before masking: the stored header is what goes upstream.
+                let mut out = match &self.lfs {
+                    Some(lfs) => lfs.rewrite(&prefix).unwrap_or(prefix),
+                    None => prefix,
+                };
                 if let Some(s) = self.secrets {
-                    s.mask(&mut prefix);
+                    s.mask(&mut out);
                 }
-                let out = rewrite::json_fields(&prefix, fields, self.listeners).unwrap_or(prefix);
+                let out = match self.fields {
+                    Some(fields) => rewrite::json_fields(&out, fields, self.listeners).unwrap_or(out),
+                    None => out,
+                };
                 headers.push(Header { name: "Content-Length".into(), value: out.len().to_string().into_bytes() });
                 w.write_all(&status_head(resp.status, &reason, &headers, keep, self.http10))?;
                 w.write_all(&out)?;
