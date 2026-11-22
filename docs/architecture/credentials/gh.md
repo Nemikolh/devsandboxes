@@ -27,7 +27,8 @@ and `github.com` (git's own proxy port, `git.hosts`), injected as
 `GH_TOKEN` and `~/.config/gh/hosts.yml`; `GITHUB_TOKEN` isn't set, so
 tools that only read it stay unauthenticated rather than pick up a
 phantom the plan never named. `tokens` takes `github_pat_` and `ghu_`,
-acting as `user` or `app`; `check` is `GET /user`, whose `login`
+and `gho_` from a broad credential only (`tokens.broad`), acting as
+`user` or `app`; `check` is `GET /user`, whose `login`
 (`checkShows`) `devsandbox login` prints as the account logged in; refusals are GitHub's
 JSON `message`. `login` is paste, whose `create` page is GitHub's
 fine-grained PAT form (`settings/personal-access-tokens/new`) prefilled
@@ -37,8 +38,14 @@ or `device` at GitHub's device flow endpoints with no client id: no app ships wi
 login names the home's own GitHub App (`login --client-id`; "Device
 flow" enabled, the repository permissions the scopes need). Its user
 tokens (`ghu_`) expire in 8 hours and refresh for 6 months, renewed by
-the broker; gh's own OAuth app would mint `gho_` tokens, which `tokens`
-refuses.
+the broker. A second `device` login is the broad opt-in: gh's own OAuth
+app (`clientId` `178c6fc778ccc68e1d6a`, `scope` `repo read:org`, no
+`workflow`), marked `broad`, so only `login --broad` uses it. Its `gho_`
+token reaches every repo the account can, has no expiry and no refresh
+token; the broker's fence still refuses writes outside an instance's
+repos, but GraphQL reads aren't fenced. `gh auth token | devsandbox
+login <credential> --broad --method paste --yes` stores gh's own token
+the same way.
 
 Scopes, each with the app permissions it needs:
 

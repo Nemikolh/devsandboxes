@@ -136,6 +136,11 @@ pub struct Tokens {
     /// Prefixes `login` takes a secret by, sorted; empty: any secret.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept: Vec<String>,
+    /// Prefixes `login` takes only for a broad credential (`login --broad`),
+    /// sorted, none of `accept`'s: tokens reaching every repo the account
+    /// can, more than the claim fences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broad: Vec<String>,
     /// A response header, lowercased, in which the upstream reports a
     /// pasted token's expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,21 +244,37 @@ pub enum Login {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         create: Option<Create>,
     },
-    /// No `client_id`: the home names its own OAuth app at login.
+    /// No `client_id`: the home names its own OAuth app at login. `scope`:
+    /// sent as the request's OAuth `scope`. `broad`: it yields one of
+    /// `tokens.broad`, so only `login --broad` uses it.
     Device {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
         device_url: String,
         token_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        broad: bool,
     },
     Browser {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
         authorize_url: String,
         token_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        broad: bool,
     },
     /// Empty, not unit: see [`Refusal`].
     GithubAppManifest {},
+}
+
+impl Login {
+    pub fn broad(&self) -> bool {
+        matches!(self, Login::Device { broad: true, .. } | Login::Browser { broad: true, .. })
+    }
 }
 
 /// The page a paste login opens to create the token on.
@@ -533,7 +554,8 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
     let git = git(field(obj, "git")?, mode, &hosts)?;
 
     let rewrite = rewrite(field(obj, "rewrite")?.unwrap_or_default(), mode)?;
-    let login = login(field(obj, "login")?, &inject)?;
+    let tokens = tokens(field(obj, "tokens")?, &inject)?;
+    let login = login(field(obj, "login")?, &inject, tokens.as_ref())?;
     let check = match field::<String>(obj, "check")? {
         None => None,
         Some(raw) => Some(check_route(&raw).context("`check`")?),
@@ -564,7 +586,6 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
     }
     let fence = fence(field(obj, "fence")?.unwrap_or_default())?;
     let lfs = lfs(field(obj, "lfs")?, mode, git.as_ref(), &scopes)?;
-    let tokens = tokens(field(obj, "tokens")?, &inject)?;
 
     Ok(Claim {
         kind: kind.to_string(),
@@ -848,25 +869,34 @@ fn tokens(raw: Option<Tokens>, inject: &[Slot]) -> Result<Option<Tokens>> {
     if inject.is_empty() {
         bail!("`tokens` without an `inject` slot: there is no secret");
     }
-    if raw.as_.is_empty() && raw.accept.is_empty() && raw.expiry.is_none() {
-        bail!("`tokens` names nothing: `as`, `accept` or `expiry`");
+    if raw.as_.is_empty() && raw.accept.is_empty() && raw.broad.is_empty() && raw.expiry.is_none() {
+        bail!("`tokens` names nothing: `as`, `accept`, `broad` or `expiry`");
     }
     raw.as_.sort();
     if raw.as_.windows(2).any(|w| w[0] == w[1]) {
         bail!("`tokens.as`: a kind is listed twice");
     }
-    if raw.accept.len() > MAX_ACCEPT {
-        bail!("`tokens.accept`: at most {MAX_ACCEPT} prefixes");
-    }
-    for (i, p) in raw.accept.iter().enumerate() {
-        if p.is_empty() || p.len() > MAX_PREFIX || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
-            bail!("`tokens.accept[{i}]`: up to {MAX_PREFIX} letters, digits, `_` and `-`");
+    for (name, list) in [("accept", &mut raw.accept), ("broad", &mut raw.broad)] {
+        if list.len() > MAX_ACCEPT {
+            bail!("`tokens.{name}`: at most {MAX_ACCEPT} prefixes");
         }
-        if raw.accept[..i].contains(p) {
-            bail!("`tokens.accept[{i}]`: `{p}` is listed twice");
+        for (i, p) in list.iter().enumerate() {
+            if p.is_empty() || p.len() > MAX_PREFIX || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                bail!("`tokens.{name}[{i}]`: up to {MAX_PREFIX} letters, digits, `_` and `-`");
+            }
+            if list[..i].contains(p) {
+                bail!("`tokens.{name}[{i}]`: `{p}` is listed twice");
+            }
+        }
+        list.sort();
+    }
+    // Disjoint as prefixes, not only as strings: else one secret would be
+    // both accepted and broad.
+    for b in &raw.broad {
+        if let Some(a) = raw.accept.iter().find(|a| a.starts_with(b.as_str()) || b.starts_with(a.as_str())) {
+            bail!("`tokens.broad`: `{b}` overlaps `tokens.accept`'s `{a}`: a prefix is accepted or broad, not both");
         }
     }
-    raw.accept.sort();
     if let Some(h) = &mut raw.expiry {
         if !is_http_token(h) {
             bail!("`tokens.expiry`: `{h}` isn't a header name");
@@ -913,7 +943,7 @@ fn rewrite(raw: Vec<RawRewrite>, mode: Mode) -> Result<Vec<Rewrite>> {
     Ok(out)
 }
 
-fn login(raw: Option<Vec<Login>>, inject: &[Slot]) -> Result<Vec<Login>> {
+fn login(raw: Option<Vec<Login>>, inject: &[Slot], tokens: Option<&Tokens>) -> Result<Vec<Login>> {
     let mut raw = match (raw, inject.is_empty()) {
         (None, true) => return Ok(Vec::new()),
         (Some(_), true) => bail!("`login` without an `inject` slot: there is no secret to get"),
@@ -925,8 +955,13 @@ fn login(raw: Option<Vec<Login>>, inject: &[Slot]) -> Result<Vec<Login>> {
     }
     for (i, l) in raw.iter().enumerate() {
         let at = || format!("`login[{i}]`");
-        if raw[..i].iter().any(|o| std::mem::discriminant(o) == std::mem::discriminant(l)) {
+        // A method twice only as a broad and a narrow one: `--broad` picks
+        // between them.
+        if raw[..i].iter().any(|o| std::mem::discriminant(o) == std::mem::discriminant(l) && o.broad() == l.broad()) {
             bail!("{}: the same method twice", at());
+        }
+        if l.broad() && tokens.is_none_or(|t| t.broad.is_empty()) {
+            bail!("{}: a `broad` login needs `tokens.broad`: the prefixes of the tokens it yields", at());
         }
         match l {
             Login::Paste { hint, create } => {
@@ -940,13 +975,15 @@ fn login(raw: Option<Vec<Login>>, inject: &[Slot]) -> Result<Vec<Login>> {
                     }
                 }
             }
-            Login::Device { client_id, device_url, token_url } => {
+            Login::Device { client_id, device_url, token_url, scope, .. } => {
                 client_id.as_deref().map(check_client_id).transpose().with_context(at)?;
+                scope.as_deref().map(check_scope).transpose().with_context(at)?;
                 check_https_url(device_url).with_context(|| format!("{}: `deviceUrl`", at()))?;
                 check_https_url(token_url).with_context(|| format!("{}: `tokenUrl`", at()))?;
             }
-            Login::Browser { client_id, authorize_url, token_url } => {
+            Login::Browser { client_id, authorize_url, token_url, scope, .. } => {
                 client_id.as_deref().map(check_client_id).transpose().with_context(at)?;
+                scope.as_deref().map(check_scope).transpose().with_context(at)?;
                 check_https_url(authorize_url).with_context(|| format!("{}: `authorizeUrl`", at()))?;
                 check_https_url(token_url).with_context(|| format!("{}: `tokenUrl`", at()))?;
             }
@@ -1178,6 +1215,15 @@ fn check_https_url(url: &str) -> Result<()> {
 fn check_client_id(id: &str) -> Result<()> {
     if id.is_empty() || id.chars().any(|c| c.is_control() || c.is_whitespace()) {
         bail!("`clientId` must be non-empty, no whitespace");
+    }
+    Ok(())
+}
+
+/// RFC 6749 §3.3: space-separated tokens of printable ASCII, no `"` or `\`.
+fn check_scope(scope: &str) -> Result<()> {
+    let token = |t: &str| !t.is_empty() && t.bytes().all(|b| matches!(b, 0x21 | 0x23..=0x5b | 0x5d..=0x7e));
+    if !scope.split(' ').all(token) {
+        bail!("`scope` `{}`: OAuth scopes separated by single spaces", scope.escape_debug());
     }
     Ok(())
 }
@@ -1650,6 +1696,47 @@ mod tests {
         assert!(c.pinned.login.iter().all(|l| matches!(l, Login::Device { client_id: None, .. } | Login::Browser { client_id: None, .. })));
         assert!(!c.canonical().contains("clientId"), "an absent client id stays absent in the pinned claim");
         assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
+
+        let device = |extra: Value| {
+            let mut d = json!({ "method": "device", "clientId": "c", "deviceUrl": "https://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" });
+            d.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            d
+        };
+        let broad = |logins: Value, tokens: Value| {
+            let mut c = sentry_with("login", logins);
+            if !tokens.is_null() {
+                c["tokens"] = tokens;
+            }
+            c
+        };
+        let two = json!([device(json!({})), device(json!({ "broad": true, "scope": "repo read:org" }))]);
+        let c = parse("sentry", &broad(two.clone(), json!({ "accept": ["sntryu_"], "broad": ["gho_", "ghb_"] }))).unwrap();
+        let t = c.pinned.tokens.as_ref().unwrap();
+        assert_eq!(t.broad, ["ghb_", "gho_"], "sorted");
+        assert_eq!(c.pinned.login.iter().filter(|l| l.broad()).count(), 1);
+        assert!(c.pinned.login.iter().any(|l| matches!(l, Login::Device { scope: Some(s), broad: true, .. } if s == "repo read:org")));
+        assert!(!c.canonical().contains("\"broad\":false"), "a narrow login stays without it");
+        assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
+        assert_err(broad(two.clone(), json!({ "accept": ["sntryu_"] })), &["`login[1]`: a `broad` login needs `tokens.broad`"]);
+        assert_err(broad(two.clone(), Value::Null), &["`login[1]`: a `broad` login needs `tokens.broad`"]);
+        let twice = json!([device(json!({ "broad": true })), device(json!({ "broad": true }))]);
+        assert_err(broad(twice, json!({ "broad": ["gho_"] })), &["`login[1]`: the same method twice"]);
+        for (tokens, wants) in [
+            (json!({ "accept": ["gh"], "broad": ["gho_"] }), "`tokens.broad`: `gho_` overlaps `tokens.accept`'s `gh`"),
+            (json!({ "accept": ["gho_x"], "broad": ["gho_"] }), "overlaps `tokens.accept`'s `gho_x`"),
+            (json!({ "accept": ["gho_"], "broad": ["gho_"] }), "overlaps"),
+            (json!({ "broad": ["gho_", "gho_"] }), "`tokens.broad[1]`: `gho_` is listed twice"),
+            (json!({ "broad": ["g o"] }), "`tokens.broad[0]`: up to 32 letters"),
+            (json!({ "broad": vec!["a"; 9] }), "`tokens.broad`: at most 8 prefixes"),
+        ] {
+            assert_err(broad(two.clone(), tokens), &[wants]);
+        }
+        for bad in ["", "repo  read", " repo", "a\"b", "a\\b", "r\u{e9}po", "a\tb"] {
+            assert_err(broad(json!([device(json!({ "scope": bad }))]), Value::Null), &["`login[0]`", "OAuth scopes separated by single spaces"]);
+        }
+        let browser = json!([{ "method": "browser", "authorizeUrl": "https://github.com/login/oauth/authorize", "tokenUrl": "https://github.com/login/oauth/access_token", "scope": "repo", "broad": true }]);
+        let c = parse("sentry", &broad(browser, json!({ "broad": ["gho_"] }))).unwrap();
+        assert!(matches!(&c.pinned.login[..], [Login::Browser { client_id: None, broad: true, .. }]), "the client id may be the home's");
 
         let paste = |create: Value| sentry_with("login", json!([{ "method": "paste", "create": create }]));
         let c = parse("sentry", &paste(json!({ "url": "https://github.com/settings/personal-access-tokens/new" }))).unwrap();

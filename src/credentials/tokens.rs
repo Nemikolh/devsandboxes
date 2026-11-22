@@ -68,14 +68,27 @@ pub fn pick(
     Ok(Some(picked))
 }
 
-/// Refuses a secret none of the claim's `accept` prefixes start, naming the
-/// secret's own prefix (up to its first `_`) when it has a short one.
-pub fn check_accepted(claim: Option<&Tokens>, secret: &str, kind: &str) -> Result<()> {
+/// Refuses a secret none of the claim's `accept` prefixes start (and, for a
+/// `broad` credential, none of its `broad` ones), naming the secret's own
+/// prefix (up to its first `_`) when it has a short one. A `broad` prefix
+/// is refused from a credential that isn't, even when `accept` is empty.
+pub fn check_accepted(claim: Option<&Tokens>, secret: &str, kind: &str, broad: bool) -> Result<()> {
     let accept = claim.map(|t| t.accept.as_slice()).unwrap_or_default();
+    let wide = claim.map(|t| t.broad.as_slice()).unwrap_or_default();
+    if let Some(p) = wide.iter().find(|p| secret.starts_with(p.as_str())) {
+        if broad {
+            return Ok(());
+        }
+        bail!(
+            "a `{p}…` token reaches every repo your account can access, more than the `{kind}` claim can fence: \
+             the claim takes one only for a broad credential, a new one logged in with --broad: nothing changed"
+        );
+    }
     if accept.is_empty() || accept.iter().any(|p| secret.starts_with(p.as_str())) {
         return Ok(());
     }
-    let listed = accept.iter().map(|p| format!("`{p}…`")).collect::<Vec<_>>().join(", ");
+    let taken: Vec<&String> = if broad { accept.iter().chain(wide).collect() } else { accept.iter().collect() };
+    let listed = taken.iter().map(|p| format!("`{p}…`")).collect::<Vec<_>>().join(", ");
     let theirs = secret
         .find('_')
         .filter(|&at| at > 0 && at < 12 && secret[..at].bytes().all(|b| b.is_ascii_alphanumeric()))
@@ -190,6 +203,7 @@ mod tests {
         Tokens {
             as_: as_.to_vec(),
             accept: vec!["ghu_".into(), "github_pat_".into()],
+            broad: vec![],
             expiry: Some("github-authentication-token-expiration".into()),
         }
     }
@@ -227,17 +241,33 @@ mod tests {
     #[test]
     fn only_the_accepted_prefixes_are_taken() {
         let t = tokens(&[]);
-        check_accepted(Some(&t), "github_pat_11ABC", "github").unwrap();
-        check_accepted(Some(&t), "ghu_abc", "github").unwrap();
-        check_accepted(None, "anything", "sentry").unwrap();
-        check_accepted(Some(&Tokens { accept: vec![], ..t.clone() }), "ghp_x", "github").unwrap();
+        check_accepted(Some(&t), "github_pat_11ABC", "github", false).unwrap();
+        check_accepted(Some(&t), "ghu_abc", "github", false).unwrap();
+        check_accepted(None, "anything", "sentry", false).unwrap();
+        check_accepted(Some(&Tokens { accept: vec![], ..t.clone() }), "ghp_x", "github", false).unwrap();
         for (secret, theirs) in [("ghp_abc", ", not `ghp_…`"), ("gho_abc", ", not `gho_…`"), ("plainhex", ""), ("_x", "")] {
-            let err = check_accepted(Some(&t), secret, "github").unwrap_err().to_string();
+            let err = check_accepted(Some(&t), secret, "github", false).unwrap_err().to_string();
             assert!(err.contains(&format!("takes only `ghu_…`, `github_pat_…` tokens{theirs}:")), "{secret}: {err}");
             assert!(err.contains("nothing changed"), "{err}");
         }
-        let err = check_accepted(Some(&t), "averyveryverylongprefix_x", "github").unwrap_err().to_string();
+        let err = check_accepted(Some(&t), "averyveryverylongprefix_x", "github", false).unwrap_err().to_string();
         assert!(!err.contains("averyvery"), "a long head may be the secret itself: {err}");
+    }
+
+    #[test]
+    fn broad_prefixes_only_from_a_broad_credential() {
+        let t = Tokens { broad: vec!["gho_".into()], ..tokens(&[]) };
+        let err = check_accepted(Some(&t), "gho_abc", "github", false).unwrap_err().to_string();
+        assert!(err.contains("a `gho_…` token reaches every repo your account can access"), "{err}");
+        assert!(err.contains("--broad") && err.ends_with("nothing changed"), "{err}");
+        let any = Tokens { accept: vec![], ..t.clone() };
+        assert!(check_accepted(Some(&any), "gho_abc", "github", false).is_err(), "refused even when `accept` takes any");
+        check_accepted(Some(&any), "ghp_abc", "github", false).unwrap();
+
+        check_accepted(Some(&t), "gho_abc", "github", true).unwrap();
+        check_accepted(Some(&t), "github_pat_1", "github", true).unwrap();
+        let err = check_accepted(Some(&t), "ghp_abc", "github", true).unwrap_err().to_string();
+        assert!(err.contains("takes only `ghu_…`, `github_pat_…`, `gho_…` tokens, not `ghp_…`"), "{err}");
     }
 
     #[test]

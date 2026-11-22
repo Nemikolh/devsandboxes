@@ -33,6 +33,9 @@ pub struct Args {
     /// The user or org a paste login's token page prefills as the token's
     /// resource owner.
     pub owner: Option<String>,
+    /// A broad credential: its token may be one of the claim's
+    /// `tokens.broad`, reaching every repo the account can.
+    pub broad: bool,
 }
 
 /// What the OAuth logins reach beyond the terminal, a seam for tests.
@@ -259,11 +262,13 @@ fn client_id_required(login: &Login, kind: &str) -> anyhow::Error {
 /// the claim's that works here, in this order: off a terminal paste (stdin),
 /// device, browser; on one device, browser, paste. Browser only where a
 /// browser opens, a login needing `--client-id` only with one. A claim's
-/// own order isn't kept (its version sorts them).
+/// own order isn't kept (its version sorts them). A `broad` login only
+/// with `broad` (`--broad`), which takes no other but paste.
 fn choose<'a>(
     logins: &'a [Login],
     wanted: Option<&str>,
     client_id: bool,
+    broad: bool,
     tty: bool,
     browser: bool,
     kind: &str,
@@ -271,10 +276,22 @@ fn choose<'a>(
     if logins.is_empty() {
         bail!("the `{kind}` claim has no secret to log in (no `inject` slot)");
     }
-    let listed = || logins.iter().map(method_name).collect::<Vec<_>>().join(", ");
-    let find = |m: &str| logins.iter().find(|l| method_name(l) == m);
+    let fits = |l: &&Login| l.broad() == broad || matches!(l, Login::Paste { .. });
+    let listed = || {
+        let mut names: Vec<&str> = logins.iter().filter(fits).map(method_name).collect();
+        names.dedup();
+        names.join(", ")
+    };
+    let find = |m: &str| logins.iter().filter(fits).find(|l| method_name(l) == m);
     if let Some(m) = wanted {
-        let l = find(m).with_context(|| format!("the `{kind}` claim logs in by {}, not {m}", listed()))?;
+        let l = find(m).with_context(|| match logins.iter().any(|l| method_name(l) == m) {
+            true if broad => format!("the `{kind}` claim's {m} login isn't broad: drop --broad, or log in by {}", listed()),
+            true => format!(
+                "the `{kind}` claim's {m} login is broad (its token reaches every repo your account can access): \
+                 pass --broad for a new broad credential"
+            ),
+            false => format!("the `{kind}` claim logs in by {}, not {m}", listed()),
+        })?;
         if needs_client_id(l) && !client_id {
             return Err(client_id_required(l, kind));
         }
@@ -290,6 +307,12 @@ fn choose<'a>(
     }
     if find("browser").is_some() {
         bail!("the `{kind}` claim logs in by {}: no browser opens here (pass --method browser to try anyway)", listed());
+    }
+    if broad {
+        bail!("the `{kind}` claim has no broad login");
+    }
+    if logins.iter().any(Login::broad) && listed().is_empty() {
+        bail!("the `{kind}` claim's only logins are broad (their token reaches every repo your account can access): pass --broad");
     }
     bail!("the `{kind}` claim logs in by {}: {}", listed(), crate::NOT_SUPPORTED_YET)
 }
@@ -384,17 +407,17 @@ fn obtain(
             }
             Ok(Record::token(secret))
         }
-        Login::Device { client_id, device_url, token_url } => {
+        Login::Device { client_id, device_url, token_url, scope, .. } => {
             let http = (flows.http)()?;
             let client_id = client(client_id);
-            let at = device::Endpoints { client_id: &client_id, device_url, token_url };
+            let at = device::Endpoints { client_id: &client_id, device_url, token_url, scope: scope.as_deref() };
             let mut ui = TermUi { term, open: &mut *flows.open };
             Ok(Record::OAuth(device::login(&http, &at, &mut *flows.clock, &mut ui)?))
         }
-        Login::Browser { client_id, authorize_url, token_url } => {
+        Login::Browser { client_id, authorize_url, token_url, scope, .. } => {
             let http = (flows.http)()?;
             let client_id = client(client_id);
-            let at = browser::Endpoints { client_id: &client_id, authorize_url, token_url };
+            let at = browser::Endpoints { client_id: &client_id, authorize_url, token_url, scope: scope.as_deref() };
             let mut ui = TermUi { term, open: &mut *flows.open };
             Ok(Record::OAuth(browser::login(&http, &at, flows.browser_timeout, &mut *flows.clock, &mut ui)?))
         }
@@ -485,6 +508,18 @@ pub(crate) fn login_at(
     if existing.is_some() && !args.profiles.is_empty() {
         bail!("credential `{name}` exists: its profiles are `profiles` in {}", path.display());
     }
+    match &existing {
+        Some(e) if e.broad && !args.broad => bail!(
+            "credential `{name}` is broad (`broad` in {}): its token reaches every repo your account can access; \
+             log in to it with --broad",
+            path.display()
+        ),
+        Some(e) if !e.broad && args.broad => bail!(
+            "credential `{name}` exists and isn't broad: --broad makes a new credential (`broad` in {})",
+            path.display()
+        ),
+        _ => {}
+    }
     let candidate = match claims {
         Some(claims) => Some(Version::of(&pick(claims, name, args.kind.as_deref())?)),
         None => pending_one(name, existing.as_ref(), &path)?,
@@ -514,7 +549,11 @@ pub(crate) fn login_at(
     };
     let shown = deciding.view()?;
     let (_, pinned) = claim::from_canonical(&deciding.claim)?;
-    let login = choose(&pinned.login, args.method.as_deref(), args.client_id.is_some(), term.tty(), flows.browser, &kind)?;
+    if args.broad && pinned.tokens.as_ref().is_none_or(|t| t.broad.is_empty()) {
+        bail!("the `{kind}` claim takes no broad token (no `tokens.broad`): --broad changes nothing");
+    }
+    let login =
+        choose(&pinned.login, args.method.as_deref(), args.client_id.is_some(), args.broad, term.tty(), flows.browser, &kind)?;
     if let Some(id) = &args.client_id {
         if matches!(login, Login::Paste { .. }) {
             bail!("--client-id is for the device and browser logins, not paste");
@@ -522,7 +561,9 @@ pub(crate) fn login_at(
         check_client_id(id)?;
     }
     let page = match login {
-        Login::Paste { create: Some(create), .. } => {
+        // Its page makes a narrow token; a broad paste is a token at hand
+        // (`gh auth token`).
+        Login::Paste { create: Some(create), .. } if !args.broad => {
             let profiles = match &existing {
                 Some(e) => e.profiles.as_deref(),
                 None => (!args.profiles.is_empty()).then_some(args.profiles.as_slice()),
@@ -545,9 +586,17 @@ pub(crate) fn login_at(
         term.show(&format!("{}  version {}\n", shown.summary(), c.short()));
         approve_or_refuse(term, args.yes, &format!("Approve this claim for `{name}`?"))?;
     }
+    // A broad entry's reach was agreed when it was made.
+    if args.broad && existing.is_none() {
+        term.show(&format!(
+            "`{name}` is broad: its token reaches every repo your account can access. The broker refuses writes \
+             outside an instance's repo fence; GraphQL reads aren't fenced.\n"
+        ));
+        approve_or_refuse(term, args.yes, &format!("Make `{name}` a broad credential?"))?;
+    }
 
     let record = obtain(login, name, page.as_deref(), args, term, flows)?;
-    crate::credentials::tokens::check_accepted(pinned.tokens.as_ref(), record.access_token().expose(), &kind)?;
+    crate::credentials::tokens::check_accepted(pinned.tokens.as_ref(), record.access_token().expose(), &kind, args.broad)?;
     let (whose, expires_at) = match check_token(&pinned, record.access_token().expose(), flows) {
         None => (None, None),
         Some(Checked::Refused) => {
@@ -566,7 +615,7 @@ pub(crate) fn login_at(
     Store::in_data(data).put(name, &record)?;
     let profiles = (!args.profiles.is_empty()).then(|| args.profiles.clone());
     let approved = home::update(&path, |h: &mut Home| {
-        let entry = h.entry(name.to_string()).or_insert_with(|| Entry::new(&kind, profiles));
+        let entry = h.entry(name.to_string()).or_insert_with(|| Entry { broad: args.broad, ..Entry::new(&kind, profiles) });
         if entry.kind != kind {
             bail!("credential `{name}` is a `{}` credential, not `{kind}`", entry.kind);
         }
@@ -689,6 +738,7 @@ pub(crate) mod tests {
             method: None,
             client_id: None,
             owner: None,
+            broad: false,
         }
     }
 
@@ -777,6 +827,8 @@ pub(crate) mod tests {
             client_id: Some("c".into()),
             device_url: "https://x/d".into(),
             token_url: "https://x/t".into(),
+            scope: None,
+            broad: false,
         }];
         let paste = Args { method: Some("paste".into()), ..args("s") };
         let err = login_at(&data, &paste, Some(vec![device.clone()]), &mut Script::new(false, &[], None)).unwrap_err();
@@ -829,6 +881,8 @@ pub(crate) mod tests {
             client_id: Some("Iv1.claims".into()),
             device_url: format!("https://127.0.0.1:{port}/device"),
             token_url: format!("https://127.0.0.1:{port}/token"),
+            scope: None,
+            broad: false,
         }
     }
 
@@ -837,13 +891,21 @@ pub(crate) mod tests {
             client_id: Some("Iv1.claims".into()),
             authorize_url: "https://github.example/login/oauth/authorize".into(),
             token_url: format!("https://127.0.0.1:{port}/token"),
+            scope: None,
+            broad: false,
         }
+    }
+
+    /// gh's own app's device login: a broad token, a scope.
+    fn broad_device(port: u16) -> Login {
+        let Login::Device { device_url, token_url, .. } = device(port) else { unreachable!() };
+        Login::Device { client_id: Some("178c6fc778ccc68e1d6a".into()), device_url, token_url, scope: Some("repo read:org".into()), broad: true }
     }
 
     /// A device login whose claim leaves the OAuth app to the home.
     fn home_device(port: u16) -> Login {
         let Login::Device { device_url, token_url, .. } = device(port) else { unreachable!() };
-        Login::Device { client_id: None, device_url, token_url }
+        Login::Device { client_id: None, device_url, token_url, scope: None, broad: false }
     }
 
     #[test]
@@ -851,18 +913,18 @@ pub(crate) mod tests {
         let paste = Login::Paste { hint: None, create: None };
         let all = [paste.clone(), device(1), browser(1)];
         let name = |l: Result<&Login>| method_name(l.unwrap());
-        assert_eq!(name(choose(&all, None, false, false, true, "k")), "paste");
-        assert_eq!(name(choose(&all, None, false, true, true, "k")), "device");
-        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, false, true, true, "k")), "browser");
-        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, false, true, false, "k")), "paste");
-        assert_eq!(name(choose(&[device(1)], None, false, false, false, "k")), "device");
-        assert_eq!(name(choose(&all, Some("browser"), false, false, false, "k")), "browser");
-        let err = choose(&[browser(1)], None, false, true, false, "k").unwrap_err().to_string();
+        assert_eq!(name(choose(&all, None, false, false, false, true, "k")), "paste");
+        assert_eq!(name(choose(&all, None, false, false, true, true, "k")), "device");
+        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, false, false, true, true, "k")), "browser");
+        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, false, false, true, false, "k")), "paste");
+        assert_eq!(name(choose(&[device(1)], None, false, false, false, false, "k")), "device");
+        assert_eq!(name(choose(&all, Some("browser"), false, false, false, false, "k")), "browser");
+        let err = choose(&[browser(1)], None, false, false, true, false, "k").unwrap_err().to_string();
         assert!(err.contains("no browser opens here"), "{err}");
-        assert_eq!(name(choose(&[browser(1)], None, false, false, true, "k")), "browser");
-        let err = choose(&[Login::GithubAppManifest {}], None, false, true, true, "k").unwrap_err().to_string();
+        assert_eq!(name(choose(&[browser(1)], None, false, false, false, true, "k")), "browser");
+        let err = choose(&[Login::GithubAppManifest {}], None, false, false, true, true, "k").unwrap_err().to_string();
         assert!(err.contains("by github-app-manifest: not supported yet! open an issue in"), "{err}");
-        let err = choose(&[], None, false, true, true, "k").unwrap_err().to_string();
+        let err = choose(&[], None, false, false, true, true, "k").unwrap_err().to_string();
         assert!(err.contains("no `inject` slot"), "{err}");
     }
 
@@ -871,12 +933,12 @@ pub(crate) mod tests {
         let paste = Login::Paste { hint: None, create: None };
         let gh = [paste.clone(), home_device(1)];
         let name = |l: Result<&Login>| method_name(l.unwrap());
-        assert_eq!(name(choose(&gh, None, false, true, true, "k")), "paste", "skipped by default without one");
-        assert_eq!(name(choose(&gh, None, true, true, true, "k")), "device");
-        assert_eq!(name(choose(&gh, Some("device"), true, false, false, "k")), "device");
-        let err = choose(&gh, Some("device"), false, true, true, "k").unwrap_err().to_string();
+        assert_eq!(name(choose(&gh, None, false, false, true, true, "k")), "paste", "skipped by default without one");
+        assert_eq!(name(choose(&gh, None, true, false, true, true, "k")), "device");
+        assert_eq!(name(choose(&gh, Some("device"), true, false, false, false, "k")), "device");
+        let err = choose(&gh, Some("device"), false, false, true, true, "k").unwrap_err().to_string();
         assert!(err.contains("device login names no OAuth app: pass --client-id"), "{err}");
-        let err = choose(&[home_device(1)], None, false, true, true, "k").unwrap_err().to_string();
+        let err = choose(&[home_device(1)], None, false, false, true, true, "k").unwrap_err().to_string();
         assert!(err.contains("pass --client-id"), "{err}");
 
         let data = temp("no-client-id");
@@ -886,6 +948,29 @@ pub(crate) mod tests {
         let err = login_at(&data, &a, Some(vec![c]), &mut Script::new(true, &[], None)).unwrap_err().to_string();
         assert!(err.contains("pass --client-id"), "refused before any network: {err}");
         assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+    }
+
+    #[test]
+    fn broad_logins_only_with_broad_which_takes_them_and_paste() {
+        let paste = Login::Paste { hint: None, create: None };
+        let gh = [paste.clone(), home_device(1), broad_device(1)];
+        let name = |l: Result<&Login>| l.unwrap().clone();
+        assert_eq!(name(choose(&gh, None, false, false, true, true, "k")), paste, "the narrow device needs a client id");
+        assert_eq!(name(choose(&gh, None, true, false, true, true, "k")), home_device(1));
+        assert_eq!(name(choose(&gh, None, false, true, true, true, "k")), broad_device(1));
+        assert_eq!(name(choose(&gh, None, true, true, true, true, "k")), broad_device(1));
+        assert_eq!(name(choose(&gh, None, false, true, false, true, "k")), paste, "off a terminal");
+        assert_eq!(name(choose(&gh, Some("device"), false, true, false, true, "k")), broad_device(1));
+        assert_eq!(name(choose(&gh, Some("paste"), false, true, true, true, "k")), paste);
+
+        let err = choose(&[paste.clone(), broad_device(1)], Some("device"), false, false, true, true, "k").unwrap_err().to_string();
+        assert!(err.contains("the `k` claim's device login is broad") && err.contains("pass --broad"), "{err}");
+        let err = choose(&[paste.clone(), device(1)], Some("device"), false, true, true, true, "k").unwrap_err().to_string();
+        assert!(err.contains("device login isn't broad: drop --broad, or log in by paste"), "{err}");
+        let err = choose(&[device(1)], None, false, true, true, true, "k").unwrap_err().to_string();
+        assert_eq!(err, "the `k` claim has no broad login");
+        let err = choose(&[broad_device(1)], None, false, false, true, true, "k").unwrap_err().to_string();
+        assert!(err.starts_with("the `k` claim's only logins are broad") && err.ends_with("pass --broad"), "{err}");
     }
 
     fn flows(open: impl FnMut(&str) + 'static, clock: Box<dyn Clock>) -> Flows {
@@ -937,10 +1022,10 @@ pub(crate) mod tests {
         use crate::credentials::home::tests::github;
         let data = temp("accept");
         let yes = Args { yes: true, ..args("gh") };
-        for bad in ["ghp_classic", "gho_oauth"] {
-            let err = login_at(&data, &yes, Some(vec![github()]), &mut Script::new(false, &[], Some(bad))).unwrap_err();
-            assert!(err.to_string().contains(&format!("not `{}…`", &bad[..4])), "{err}");
-        }
+        let err = login_at(&data, &yes, Some(vec![github()]), &mut Script::new(false, &[], Some("ghp_classic"))).unwrap_err();
+        assert!(err.to_string().contains("not `ghp_…`"), "{err}");
+        let err = login_at(&data, &yes, Some(vec![github()]), &mut Script::new(false, &[], Some("gho_oauth"))).unwrap_err();
+        assert!(err.to_string().contains("a `gho_…` token reaches every repo") && err.to_string().contains("--broad"), "{err}");
         assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
         login_at(&data, &yes, Some(vec![github()]), &mut Script::new(false, &[], Some("github_pat_11A\n"))).unwrap();
         home::set_expires_at(&home::path(&data), "gh", 1_800_000_000).unwrap();
@@ -957,12 +1042,69 @@ pub(crate) mod tests {
         let data = temp("accept-oauth");
         let mut gh = other("github");
         gh.pinned.login = vec![device(port)];
-        gh.pinned.tokens = Some(claim::Tokens { as_: vec![], accept: vec!["github_pat_".into()], expiry: None });
+        gh.pinned.tokens = Some(claim::Tokens { as_: vec![], accept: vec!["github_pat_".into()], broad: vec![], expiry: None });
         let mut f = flows(|_| {}, Box::new(FakeClock::new()));
         let a = Args { yes: true, ..args("gh") };
         let err = super::login_at(&data, &a, Some(vec![gh]), &mut Script::new(true, &[], None), &mut f).unwrap_err();
         assert!(err.to_string().contains("takes only `github_pat_…` tokens, not `ghu_…`"), "{err}");
         assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// gh's own device flow on a new broad credential: asked about, its
+    /// scope sent, its `gho_` stored with no expiry; the entry stays broad.
+    #[test]
+    fn a_broad_login_asks_then_takes_a_broad_token() {
+        use crate::credentials::home::tests::github;
+        use crate::credentials::oauth::tests::{FakeClock, GH_OAUTH_TOKEN, device_provider_issuing, field, form};
+        let (port, seen) = device_provider_issuing(GH_OAUTH_TOKEN);
+        let data = temp("broad");
+        let mut gh = github();
+        gh.pinned.login = vec![Login::Paste { hint: None, create: None }, home_device(port), broad_device(port)];
+        let a = Args { broad: true, ..args("gh") };
+        let mut term = Script::new(true, &[true, true], None);
+        let mut f = flows(|_| {}, Box::new(FakeClock::new()));
+        let done = super::login_at(&data, &a, Some(vec![gh.clone()]), &mut term, &mut f).unwrap();
+        assert!(done.contains("approved"), "{done}");
+        assert!(term.shown.contains("`gh` is broad: its token reaches every repo your account can access."), "{}", term.shown);
+        assert!(term.shown.contains("Make `gh` a broad credential?"), "{}", term.shown);
+        let Some(Record::OAuth(rec)) = Store::in_data(&data).get("gh").unwrap() else { panic!("an OAuth record") };
+        assert_eq!((rec.access_token.expose(), rec.client_id.as_str()), ("gho_x", "178c6fc778ccc68e1d6a"));
+        assert_eq!((rec.expires_at, rec.refresh_token.is_none()), (None, true));
+        assert_eq!(field(&form(&seen.lock().unwrap()[0].1), "scope"), Some("repo read:org"));
+        assert!(home::load(&home::path(&data)).unwrap()["gh"].broad);
+
+        // A re-login keeps it broad, unasked; a plain one is refused.
+        let piped = Args { broad: true, method: Some("paste".into()), ..args("gh") };
+        let done = login_at(&data, &piped, None, &mut Script::new(false, &[], Some("gho_y"))).unwrap();
+        assert!(done.ends_with("secret replaced"), "{done}");
+        let pat = login_at(&data, &piped, None, &mut Script::new(false, &[], Some("github_pat_1")));
+        assert!(pat.is_ok(), "a broad credential takes `accept`'s too: {pat:?}");
+        let err = login_at(&data, &args("gh"), None, &mut Script::new(false, &[], Some("github_pat_2"))).unwrap_err();
+        assert!(err.to_string().contains("credential `gh` is broad") && err.to_string().contains("--broad"), "{err}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn broad_refusals_change_nothing() {
+        use crate::credentials::home::tests::github;
+        let data = temp("broad-refuse");
+        let broad = Args { broad: true, yes: true, ..args("gh") };
+        let err = login_at(&data, &broad, Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        assert!(err.to_string().contains("the `sentry` claim takes no broad token"), "{err}");
+        let unconfirmed = Args { broad: true, ..args("gh") };
+        let err = login_at(&data, &unconfirmed, Some(vec![github()]), &mut Script::new(true, &[true, false], Some("gho_x"))).unwrap_err();
+        assert!(err.to_string().contains("not approved"), "{err}");
+        let piped = Args { method: Some("paste".into()), ..args("gh") };
+        let err = login_at(&data, &Args { broad: true, ..piped }, Some(vec![github()]), &mut Script::new(false, &[], Some("gho_x")))
+            .unwrap_err();
+        assert!(err.to_string().contains("pass --yes"), "{err}");
+        assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+
+        login_at(&data, &Args { yes: true, ..args("gh") }, Some(vec![github()]), &mut Script::new(false, &[], Some("github_pat_1"))).unwrap();
+        let err = login_at(&data, &broad, None, &mut Script::new(false, &[], Some("gho_x"))).unwrap_err();
+        assert!(err.to_string().contains("exists and isn't broad: --broad makes a new credential"), "{err}");
+        assert_eq!(Store::in_data(&data).token_now("gh").unwrap().unwrap().expose(), "github_pat_1");
         let _ = std::fs::remove_dir_all(&data);
     }
 

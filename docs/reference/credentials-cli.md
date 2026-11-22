@@ -23,7 +23,7 @@ logins: [login](../architecture/credentials/login.md)), `src/credentials/review.
 
 ```
 devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>]... [--yes]
-                 [--method paste|device|browser] [--client-id <id>] [--owner <user|org>]
+                 [--method paste|device|browser] [--client-id <id>] [--owner <user|org>] [--broad]
 devsandbox access approve <credential> [--version <v>] [--yes]
 devsandbox access ls [<credential>] [--json]
 devsandbox access revoke <credential> [--version <v>] [--yes]
@@ -56,9 +56,17 @@ The claim to approve (`login_at`):
   naming `--feature`.
 
 An existing credential keeps its kind (another kind is refused) and its
-grant: `--profile` is refused on it (edit `profiles` in the file). A
+grant: `--profile` is refused on it (edit `profiles` in the file), and so
+is `--broad` on one that isn't broad, or a login without `--broad` on
+one that is (edit `broad` in the file). A
 claim version already approved for the credential is not asked about
 again.
+
+`--broad` makes a broad credential: one whose token may be of the
+claim's `tokens.broad` prefixes (the github claim's `gho_`, gh's own
+OAuth app's), which reach every repo the account can access. The broker
+still refuses writes outside an instance's repo fence, but GraphQL reads
+aren't fenced. Refused when the claim declares no `tokens.broad`.
 
 The login method is one of the claim's `login` (`choose`, over the
 version being approved, else the latest approved): `--method` names one
@@ -69,7 +77,12 @@ the claim lists, else the first the claim lists of, on a terminal,
 this host's loopback, and a `device` or `browser` login whose claim has
 no `clientId` only with `--client-id` (`needs_client_id`; named by
 `--method` without it, refused). A claim's own order isn't kept: its version sorts
-the list. `github-app-manifest` is refused as not yet, and a claim with
+the list. A claim's `device` or `browser` login marked `broad` yields a
+broad token: only `--broad` uses it, and `--broad` takes no other
+method but `paste` (so `gh auth token | devsandbox login gh --broad
+--method paste --yes` works); a claim may list a method twice, broad
+and not. A login's `scope` (OAuth scopes, space-separated) is sent as
+the device code request's or the authorize page's `scope`. `github-app-manifest` is refused as not yet, and a claim with
 no `login` (no `inject` slot) has no secret to log in. All of this is
 checked before anything is asked.
 
@@ -85,13 +98,16 @@ login is a paste with `create`.
 Then, in order: a new version's summary (`View::summary`: kind, mode,
 upstreams, each scope with its route count, every `never` route, the
 short version) and the question (`approve_or_refuse`: `--yes` approves;
-off a terminal without `--yes`, refused); the secret (`obtain`), by:
+off a terminal without `--yes`, refused); for a new credential with
+`--broad`, what it reaches and the same kind of question (a re-login of
+a broad one isn't asked: its reach was agreed when it was made); the
+secret (`obtain`), by:
 
 - `paste`: from stdin (`Stdio::secret`: on a terminal, after the claim's
   paste `hint`, with echo off (`EchoOff`, termios `ECHO` cleared, line
   editing kept); else all of stdin, so `login x < file` works), trimmed,
   empty refused. Stored as a static token. When the claim's paste login
-  has a `create` page (`{"url": …, "permissions": bool}`; https, no query
+  has a `create` page (not with `--broad`: the page makes a narrow token) (`{"url": …, "permissions": bool}`; https, no query
   or fragment) and stdin is a terminal, it first shows that page and opens
   it (`oauth::openable`, through `Flows.open`), prefilled by `create_url`:
   `name` `devsandbox <credential>` (cut to GitHub's 40 characters),
@@ -119,11 +135,28 @@ doesn't map, or an unreadable file (a warning): the system opener
 
 A claim whose `tokens.accept` lists prefixes takes only a secret one of
 them starts (`tokens::check_accepted`), pasted or an OAuth login's
-access token; any other is refused before anything is written, naming
-the accepted prefixes and the secret's own (up to its first `_`, when
-short). The github claim accepts fine-grained PATs (`github_pat_…`) and
-GitHub App user tokens (`ghu_…`), so a classic PAT (`ghp_…`) or gh's own
-OAuth token (`gho_…`), which reach every repo you can, is refused.
+access token, and a broad credential one of `tokens.broad` too; any
+other is refused before anything is written, naming the accepted
+prefixes and the secret's own (up to its first `_`, when short). A
+secret of a `tokens.broad` prefix is refused from a credential that
+isn't broad, even when `accept` is empty, naming `--broad`. The github
+claim accepts fine-grained PATs (`github_pat_…`) and GitHub App user
+tokens (`ghu_…`), and gh's own OAuth token (`gho_…`) from a broad
+credential only; a classic PAT (`ghp_…`) is refused.
+
+The claim's `tokens` and `login` fields `login` reads (validated by
+`claim::parse`; a change is a new version, shown by `access approve`):
+
+- `tokens.accept`, `tokens.broad`: up to 8 prefixes each (letters,
+  digits, `_`, `-`, at most 32), sorted; no prefix of one list starts
+  or is started by one of the other.
+- `login[]`: `{"method": "paste", "hint"?, "create"?}`,
+  `{"method": "device", "clientId"?, "deviceUrl", "tokenUrl", "scope"?,
+  "broad"?}`, `{"method": "browser", "clientId"?, "authorizeUrl",
+  "tokenUrl", "scope"?, "broad"?}`, `{"method": "github-app-manifest"}`.
+  A method once, or twice as a broad and a narrow one; a `broad` login
+  needs `tokens.broad`; `scope` is RFC 6749 scope tokens separated by
+  single spaces.
 
 An accepted secret is then checked (`check_token`) when the claim has a
 `check` route: that `GET`/`HEAD` on the claim's first upstream (as
@@ -159,8 +192,9 @@ its diff against the latest approved version (`review::diff`, rendered by
 `Diff::render`: upstreams `+`/`-`, routes added and removed per scope,
 `(new)` and `(dropped)` scopes, `never` routes `+`/`-`, and `also
 changed:` naming every other pinned field that differs, `mode`, `inject`,
-`login`, `checkShows`, `refusal`, a kept scope's `permissions` and a login's `create`
-page, `login.<method>.create`, among them), or its
+`login`, `checkShows`, `refusal`, `tokens`, a kept scope's `permissions` and a login's `create`
+page or `scope`, `login.<method>.create` and `login.<method>.scope`
+(a broad login's method read `<method>.broad`), among them), or its
 summary when none is approved. Same question as `login`. Approval moves
 the version from `pending` to the end of `approved`; older approved
 versions stay (instances pinned to them keep working). The secret is
@@ -191,7 +225,8 @@ sentry-work: sentry, source file
   `scope`; `none stored` (no record: `devsandbox login`); `unreadable`
   with the store's error, which never holds its content.
 - `profiles`, `max` (unset: every profile, every scope), then
-  `members`, `approvers`, `delegate`, `as` when set.
+  `members`, `approvers`, `delegate`, `as` when set, and `broad` for a
+  broad credential.
 - `approved` (in approval order) and `pending` claim versions, by
   `Version::short`. The last approved is `latest`; a version that isn't
   and that no instance here pins is `unused` (`access revoke --version`
@@ -231,7 +266,7 @@ GitHub repo fences (each folder's remotes at its first run):
 [{"instance", "stale"}]}]}}`, each credential
 `{"name", "kind", "source", "token": {"type": "static" | "oauth" |
 "missing" | "unreadable", …}, "profiles", "max", "members"?,
-"approvers"?, "delegate"?, "as"?, "approved": [{"version", "latest",
+"approvers"?, "delegate"?, "as"?, "broad", "approved": [{"version", "latest",
 "unused"}], "pending": […], "broken", "expires"?: {"at", "days",
 "expired", "warn"}, "instances": [{"instance", "version", "approved",
 "unknown"?}]}` (full version hashes; `oauth` carries `expires_at`,
@@ -286,6 +321,7 @@ members = []                  # these three: parsed, read by nothing
 approvers = []
 delegate = []
 as = ["user"]                 # the token kinds it offers, "user" | "app"; unset: ["user"]
+broad = true                  # takes the claim's `tokens.broad` too (`login --broad`); unset: false
 expires_at = "2026-12-01T10:00:00Z"   # a pasted secret's expiry, as the upstream reported it
 
 [[sentry-work.approved]]      # approval order: the last is the latest
@@ -323,6 +359,11 @@ offered, else `app`: a config only narrows, so a kind the credential
 doesn't offer, or the claim doesn't declare, refuses the run. `app`
 (installation tokens) is refused as not supported yet.
 
+`broad` is set by the `login --broad` that creates the credential and
+only read by `login` (which token it takes, and that the flag matches);
+the broker serves whatever the store holds, so turning it off by hand
+takes effect at the next login.
+
 `expires_at` (RFC 3339, UTC) is written by `login`, from its token
 check, and by the broker: on an injected call with a pasted secret, the response's header the claim's
 `tokens.expiry` names (GitHub's `github-authentication-token-expiration`,
@@ -348,7 +389,7 @@ token = "sntrys_…"
 [secret.github]               # an OAuth login (`OAuthToken`)
 type = "oauth"
 access_token = "ghu_…"
-refresh_token = "ghr_…"       # these four optional: as the provider sent them
+refresh_token = "ghr_…"       # these four optional: as the provider sent them (a `gho_`: none but `scope`)
 expires_at = 1795000000       # unix seconds
 refresh_expires_at = 1810000000
 scope = "…"

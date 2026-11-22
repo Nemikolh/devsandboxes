@@ -23,10 +23,10 @@ pub struct View {
     /// Scope name → its routes.
     pub scopes: BTreeMap<String, BTreeSet<String>>,
     pub never: BTreeSet<String>,
-    /// `(method, hint)`.
+    /// `(method, hint)`, a broad login's method as `<method>.broad`.
     pub login: Vec<(String, Option<String>)>,
-    /// The other pinned fields, plus `scopes.<name>.permissions` and
-    /// `login.<method>.create`.
+    /// The other pinned fields, plus `scopes.<name>.permissions`,
+    /// `login.<method>.create` and `login.<method>.scope`.
     pub rest: BTreeMap<String, Value>,
 }
 
@@ -61,10 +61,17 @@ impl View {
             .iter()
             .map(|l| {
                 let method = l.get("method").and_then(Value::as_str).context("a login without `method`")?;
-                if let Some(c) = l.get("create") {
-                    rest.insert(format!("login.{method}.create"), c.clone());
+                // A claim may have a method twice, broad and not.
+                let method = match l.get("broad").and_then(Value::as_bool) {
+                    Some(true) => format!("{method}.broad"),
+                    _ => method.to_string(),
+                };
+                for field in ["create", "scope"] {
+                    if let Some(v) = l.get(field) {
+                        rest.insert(format!("login.{method}.{field}"), v.clone());
+                    }
                 }
-                Ok((method.to_string(), l.get("hint").and_then(Value::as_str).map(String::from)))
+                Ok((method, l.get("hint").and_then(Value::as_str).map(String::from)))
             })
             .collect::<Result<_>>()?;
         Ok(View {
@@ -305,6 +312,27 @@ mod tests {
         let mut d = c.clone();
         d["login"][0]["create"]["permissions"] = json!(true);
         assert_eq!(diff(&new, &view(&d)).changed, ["login.paste.create"]);
+    }
+
+    #[test]
+    fn a_broad_login_its_scope_and_broad_tokens_are_changes() {
+        let old_json = sentry_json();
+        let device = |scope: &str| {
+            json!({ "method": "device", "clientId": "c", "scope": scope, "broad": true,
+                    "deviceUrl": "https://sentry.io/d", "tokenUrl": "https://sentry.io/t" })
+        };
+        let mut c = old_json.clone();
+        c["tokens"] = json!({ "broad": ["sntryu_"] });
+        c["login"].as_array_mut().unwrap().push(device("org:read"));
+        let (old, new) = (view(&old_json), view(&c));
+        assert_eq!(diff(&old, &new).changed, ["login", "login.device.broad.scope", "tokens"]);
+        let mut d = c.clone();
+        d["login"][1] = device("org:read org:write");
+        assert_eq!(diff(&new, &view(&d)).changed, ["login.device.broad.scope"]);
+        let mut narrow = c.clone();
+        narrow["login"][1]["broad"] = json!(false);
+        let changed = diff(&new, &view(&narrow)).changed;
+        assert!(changed.contains(&"login".to_string()) && changed.contains(&"login.device.scope".to_string()), "{changed:?}");
     }
 
     #[test]

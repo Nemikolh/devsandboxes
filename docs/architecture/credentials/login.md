@@ -42,7 +42,8 @@ may hold a token.
 
 ## Device flow
 
-RFC 8628. `device::login` posts `client_id` to `deviceUrl`
+RFC 8628. `device::login` posts `client_id` (and the login's `scope`,
+when the claim gives one) to `deviceUrl`
 (`parse_authorization`: `device_code`, `user_code`, `verification_uri`
 or Google's `verification_url`, `expires_in`, `interval`), shows the page
 and code, and opens the page (`verification_uri_complete` when sent; an
@@ -63,7 +64,8 @@ Authorization code with PKCE `S256` (RFC 7636) and a loopback redirect
 `state` and verifier (`random`, base64url), and opens `authorize_url`:
 the claim's `authorizeUrl` with `response_type=code`, `client_id`,
 `redirect_uri=http://127.0.0.1:<port>/callback`, `state`,
-`code_challenge` and `code_challenge_method=S256`. Each request to the
+`code_challenge`, `code_challenge_method=S256` and the login's `scope`
+when the claim gives one. Each request to the
 listener (`broker::head::read_head`) goes through `callback`: only a `GET`
 of `/callback` whose one `state` is this login's (compared in constant
 time) counts; anything else (another path, method or state, a parameter
@@ -125,3 +127,9 @@ none, leaving the app to the home, and then `login` requires
 entry's `broken` mark and `expires_at` (the record carries its own). The broker renews the token with the refresh token
 ahead of expiry and after a 401, storing a rotated refresh token with it
 ([broker](broker.md#renewal), `oauth::refresh`).
+
+A token with neither `expires_in` nor a refresh token (gh's own OAuth
+app's `gho_`, from a claim's `broad` login) is stored with neither: it
+is never due (`refresh::due`), and after a 401 there is nothing to renew
+(`Renewer::after_401` answers `None`), so the call gets the 401 and the
+user logs in again.

@@ -55,6 +55,9 @@
               "github_pat_",
               "ghu_"
             ],
+            "broad": [
+              "gho_"
+            ],
             "expiry": "github-authentication-token-expiration"
           },
           "git": {
@@ -79,6 +82,14 @@
             },
             {
               "method": "device",
+              "deviceUrl": "https://github.com/login/device/code",
+              "tokenUrl": "https://github.com/login/oauth/access_token"
+            },
+            {
+              "method": "device",
+              "clientId": "178c6fc778ccc68e1d6a",
+              "scope": "repo read:org",
+              "broad": true,
               "deviceUrl": "https://github.com/login/device/code",
               "tokenUrl": "https://github.com/login/oauth/access_token"
             }

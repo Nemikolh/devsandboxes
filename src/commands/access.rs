@@ -173,6 +173,7 @@ struct Credential {
     delegate: Vec<String>,
     #[serde(rename = "as", skip_serializing_if = "Vec::is_empty")]
     as_: Vec<String>,
+    broad: bool,
     approved: Vec<VersionRow>,
     pending: Vec<VersionRow>,
     broken: Option<Broken>,
@@ -304,6 +305,7 @@ fn credential(name: &str, entry: &Entry, record: Result<Option<Record>>, uses: V
         approvers: entry.approvers.clone(),
         delegate: entry.delegate.clone(),
         as_: entry.as_.clone(),
+        broad: entry.broad,
         approved: entry.approved.iter().map(row).collect(),
         pending: entry.pending.iter().map(row).collect(),
         broken: entry.broken.clone(),
@@ -386,6 +388,9 @@ fn render(list: &[Credential], now: u64) -> String {
             if !list.is_empty() {
                 line(&mut out, label, &list.join(", "));
             }
+        }
+        if c.broad {
+            line(&mut out, "broad", "its token may reach every repo the account can access (login --broad)");
         }
         line(&mut out, "approved", &render_versions(&c.approved));
         if !c.pending.is_empty() {
@@ -830,6 +835,7 @@ mod tests {
             let gh = h.get_mut("gh").unwrap();
             gh.max = Some(vec!["repo.read".into()]);
             gh.approvers = vec!["laptop".into()];
+            gh.broad = true;
             Ok(())
         })
         .unwrap();
@@ -842,7 +848,7 @@ mod tests {
                 "name": "gh", "kind": "github", "source": "file",
                 "token": {"type": "oauth", "expires_at": 1_800_000_000u64, "refresh_expires_at": 1_900_000_000u64,
                           "refreshable": true, "scope": null},
-                "profiles": null, "max": ["repo.read"], "approvers": ["laptop"],
+                "profiles": null, "max": ["repo.read"], "approvers": ["laptop"], "broad": true,
                 "approved": [], "pending": [], "broken": null,
                 "expires": {"at": 1_900_000_000u64, "days": 21990, "expired": false, "warn": false},
                 "instances": [],
@@ -852,6 +858,7 @@ mod tests {
         for secret in ["ghu_REALACCESS", "ghr_REALREFRESH"] {
             assert!(!text.contains(secret), "{text}");
         }
+        assert!(text.contains("\n  broad     its token may reach every repo the account can access (login --broad)\n"), "{text}");
 
         let broken = Broken { at: "2026-11-21T10:00:00Z".into(), reason: "its refresh was refused".into() };
         home::mark_broken(&home::path(&data), "sentry-work", broken).unwrap();
@@ -866,6 +873,8 @@ mod tests {
             "{text}"
         );
         assert_eq!(json["token"], serde_json::json!({"type": "missing"}));
+        assert_eq!(json["broad"], false);
+        assert!(!text.contains("broad"), "{text}");
         assert_eq!(json["approved"][1], serde_json::json!({"version": trimmed(1).version(), "latest": true, "unused": false}));
         assert_eq!(json["instances"][1], serde_json::json!({"instance": "w0", "version": trimmed(0).version(), "approved": true}));
         assert!(json["instances"][0]["unknown"].as_str().unwrap().contains("cannot read its config"));

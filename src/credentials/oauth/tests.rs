@@ -74,9 +74,17 @@ pub(crate) fn field<'a>(form: &'a [(String, String)], key: &str) -> Option<&'a s
 
 pub(crate) const GITHUB_TOKEN: &str = r#"{"access_token":"ghu_live","expires_in":28800,"refresh_token":"ghr_live","refresh_token_expires_in":15897600,"token_type":"bearer","scope":""}"#;
 
+/// gh's OAuth app's token: no expiry, no refresh token.
+pub(crate) const GH_OAUTH_TOKEN: &str = r#"{"access_token":"gho_x","token_type":"bearer","scope":"repo,read:org"}"#;
+
 /// A device-flow provider: `/device` answers a code, `/token` is pending
 /// once, asks to slow down once, then issues GitHub's app user token.
 pub(crate) fn device_provider() -> (u16, crate::broker::serve::tests::Seen) {
+    device_provider_issuing(GITHUB_TOKEN)
+}
+
+/// [`device_provider`] issuing `token` (a JSON reply).
+pub(crate) fn device_provider_issuing(token: &'static str) -> (u16, crate::broker::serve::tests::Seen) {
     let polls = AtomicUsize::new(0);
     crate::broker::serve::tests::upstream_server(move |head, body| {
         let f = form(body);
@@ -90,7 +98,7 @@ pub(crate) fn device_provider() -> (u16, crate::broker::serve::tests::Seen) {
             "/token" => match polls.fetch_add(1, Ordering::SeqCst) {
                 0 => json(200, r#"{"error":"authorization_pending","error_description":"wait"}"#),
                 1 => json(200, r#"{"error":"slow_down","interval":10}"#),
-                _ => json(200, GITHUB_TOKEN),
+                _ => json(200, token),
             },
             _ => json(404, "{}"),
         }
@@ -284,6 +292,7 @@ fn device_login_end_to_end() {
         client_id: "Iv1.mine",
         device_url: &format!("https://127.0.0.1:{port}/device"),
         token_url: &format!("https://127.0.0.1:{port}/token"),
+        scope: None,
     };
     let mut ui = Seen { shown: String::new(), opened: Vec::new() };
     let mut clock = FakeClock::new();
@@ -304,6 +313,27 @@ fn device_login_end_to_end() {
     assert_eq!((field(&poll, "client_id"), field(&poll, "device_code")), (Some("Iv1.mine"), Some("dev-123")));
 }
 
+/// gh's own app: the code request carries the scope; the token has no
+/// expiry and no refresh token, which the renewer leaves alone.
+#[test]
+fn device_login_with_a_scope_and_a_token_that_never_expires() {
+    let (port, seen) = device_provider_issuing(GH_OAUTH_TOKEN);
+    let at = device::Endpoints {
+        client_id: "178c6fc778ccc68e1d6a",
+        device_url: &format!("https://127.0.0.1:{port}/device"),
+        token_url: &format!("https://127.0.0.1:{port}/token"),
+        scope: Some("repo read:org"),
+    };
+    let mut ui = Seen { shown: String::new(), opened: Vec::new() };
+    let rec = device::login(&http(), &at, &mut FakeClock::new(), &mut ui).unwrap();
+    assert_eq!(rec.access_token.expose(), "gho_x");
+    assert_eq!((rec.refresh_token.is_none(), rec.expires_at, rec.refresh_expires_at), (true, None, None));
+    assert_eq!(rec.scope.as_deref(), Some("repo,read:org"));
+    assert!(!refresh::due(&rec, u64::MAX), "never due");
+    let code = form(&seen.lock().unwrap()[0].1);
+    assert_eq!(code, [("client_id".into(), "178c6fc778ccc68e1d6a".into()), ("scope".into(), "repo read:org".into())]);
+}
+
 #[test]
 fn the_oauth_endpoints_take_the_address_check() {
     let (port, seen) = device_provider();
@@ -312,6 +342,7 @@ fn the_oauth_endpoints_take_the_address_check() {
         client_id: "c",
         device_url: &format!("https://127.0.0.1:{port}/device"),
         token_url: &format!("https://127.0.0.1:{port}/token"),
+        scope: None,
     };
     let mut ui = Seen { shown: String::new(), opened: Vec::new() };
     let err = format!("{:#}", device::login(&public, &at, &mut FakeClock::new(), &mut ui).err().unwrap());
@@ -347,13 +378,15 @@ fn callbacks_count_only_with_this_state() {
 
 #[test]
 fn authorize_urls() {
-    let u = browser::authorize_url("https://github.com/login/oauth/authorize", "Iv1.c", "http://127.0.0.1:9/callback", "s", "ch");
+    let u = browser::authorize_url("https://github.com/login/oauth/authorize", "Iv1.c", None, "http://127.0.0.1:9/callback", "s", "ch");
     assert_eq!(
         u,
         "https://github.com/login/oauth/authorize?response_type=code&client_id=Iv1.c&\
          redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcallback&state=s&code_challenge=ch&code_challenge_method=S256"
     );
-    assert!(browser::authorize_url("https://x/a?prompt=consent", "c", "r", "s", "ch").starts_with("https://x/a?prompt=consent&response_type=code&"));
+    assert!(browser::authorize_url("https://x/a?prompt=consent", "c", None, "r", "s", "ch").starts_with("https://x/a?prompt=consent&response_type=code&"));
+    let u = browser::authorize_url("https://x/a", "c", Some("repo read:org"), "r", "s", "ch");
+    assert!(u.ends_with("&code_challenge_method=S256&scope=repo%20read%3Aorg"), "{u}");
 }
 
 /// Plays the browser: a stray request, one with a forged state, then the
@@ -405,6 +438,7 @@ fn browser_login_end_to_end() {
         client_id: "Iv1.c",
         authorize_url: "https://github.example/login/oauth/authorize",
         token_url: &format!("https://127.0.0.1:{port}/token"),
+        scope: None,
     };
     struct Browser<F>(F, String);
     impl<F: FnMut(&str)> Ui for Browser<F> {
@@ -430,7 +464,7 @@ fn browser_login_end_to_end() {
 
 #[test]
 fn browser_login_times_out_and_takes_a_denial() {
-    let at = browser::Endpoints { client_id: "c", authorize_url: "https://x/a", token_url: "https://x/t" };
+    let at = browser::Endpoints { client_id: "c", authorize_url: "https://x/a", token_url: "https://x/t", scope: None };
     let mut ui = Seen { shown: String::new(), opened: Vec::new() };
     let err = browser::login(&http(), &at, Duration::from_millis(200), &mut SystemClock::new(), &mut ui).err().unwrap();
     assert!(err.to_string().contains("no login callback within"), "{err}");

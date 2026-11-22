@@ -456,9 +456,15 @@ enum Command {
         /// profile)
         #[arg(long = "profile", value_name = "PROFILE")]
         profiles: Vec<String>,
-        /// Approve the claim without asking (required off a terminal)
+        /// Approve the claim, and with --broad a broad credential, without
+        /// asking (required off a terminal)
         #[arg(long)]
         yes: bool,
+        /// A new broad credential: it takes the claim's broad tokens (gh's
+        /// own `gho_…`), which reach every repo your account can access, by
+        /// the claim's broad logins or paste
+        #[arg(long)]
+        broad: bool,
         /// The login method, one the claim lists (default: the first listed
         /// of device, browser, paste on a terminal; paste, device, browser
         /// off one; browser only where a browser opens)
@@ -1174,8 +1180,8 @@ fn main() -> Result<()> {
             MachineCommand::Allow { allow } => commands::machine::allow(allow.change()),
         },
         #[cfg(unix)]
-        Command::Login { credential, feature, kind, profiles, yes, method, client_id, owner } => {
-            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id, owner })
+        Command::Login { credential, feature, kind, profiles, yes, method, client_id, owner, broad } => {
+            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id, owner, broad })
         }
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Approve { credential, version, yes } } => {

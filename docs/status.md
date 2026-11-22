@@ -343,20 +343,26 @@ is frozen: no new work on it.
 
 ### credentials
 
-- A claim's device and browser logins send no `scope` (no claim field;
-  GitHub Apps take none), and `github-app-manifest` logins are refused
+- `github-app-manifest` logins are refused
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
   `approvers` and `delegate` parse and `access ls` lists them, but
   nothing acts on them yet; of `as`'s kinds only `user` works, `app`
   (installation tokens) refusing the run until step 3.
   → [login](architecture/credentials/login.md); `commands::login::choose`
-- A pasted token's expiry is known only once a brokered call's response
-  reports it (`login` calls no `check` route), so `access ls` shows none
-  before; the expiry notice's once-a-day limit lives in the daemon's
+- A pasted token's expiry comes from `login`'s `check` response, else
+  only once a brokered call's response reports it (a claim with no
+  `check`, or a check that failed), so `access ls` shows none before; the expiry notice's once-a-day limit lives in the daemon's
   memory (a restart may repeat it); a refreshed OAuth token isn't checked
   against the claim's `tokens.accept` (only `login`'s).
   → [credentials CLI](reference/credentials-cli.md#credentialstoml);
   `credentials::tokens`
+- A broad credential's (`login --broad`) GraphQL reads reach every repo
+  the account can: GraphQL queries aren't fenced.
+  → [gh](architecture/credentials/gh.md#the-claim); `credentials::tokens::check_accepted`
+- GitHub keeps a limited number of OAuth tokens per user, app and scope
+  set and revokes the oldest, so `gh auth login` elsewhere and
+  devsandbox's broad login can log each other out.
+  → [gh](architecture/credentials/gh.md#the-claim)
 - git under a git-host claim: no ssh host alias (`git@github-work:`)
   is rewritten to `https://` (the folder's record keeps the URL, not what
   the alias resolved to), so such a remote's push fails under key

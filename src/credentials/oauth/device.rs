@@ -111,10 +111,13 @@ pub struct Endpoints<'a> {
     pub client_id: &'a str,
     pub device_url: &'a str,
     pub token_url: &'a str,
+    pub scope: Option<&'a str>,
 }
 
 pub fn login(http: &Http, at: &Endpoints<'_>, clock: &mut dyn Clock, ui: &mut dyn Ui) -> Result<OAuthToken> {
-    let (status, ct, body) = http.post(at.device_url, &[("client_id", at.client_id)])?;
+    let mut code = vec![("client_id", at.client_id)];
+    code.extend(at.scope.map(|s| ("scope", s)));
+    let (status, ct, body) = http.post(at.device_url, &code)?;
     let auth = parse_authorization(status, ct.as_deref(), &body).with_context(|| format!("calling {}", at.device_url))?;
     let uri = crate::open::printable(&auth.verification_uri);
     ui.show(&format!(

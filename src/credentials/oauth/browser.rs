@@ -21,15 +21,24 @@ pub const CALLBACK: &str = "/callback";
 
 /// The authorize page's URL: `authorize_url` with the request's query
 /// appended (after its own query, if it has one).
-pub fn authorize_url(authorize_url: &str, client_id: &str, redirect: &str, state: &str, challenge: &str) -> String {
-    let query = form_encode(&[
+pub fn authorize_url(
+    authorize_url: &str,
+    client_id: &str,
+    scope: Option<&str>,
+    redirect: &str,
+    state: &str,
+    challenge: &str,
+) -> String {
+    let mut params = vec![
         ("response_type", "code"),
         ("client_id", client_id),
         ("redirect_uri", redirect),
         ("state", state),
         ("code_challenge", challenge),
         ("code_challenge_method", "S256"),
-    ]);
+    ];
+    params.extend(scope.map(|s| ("scope", s)));
+    let query = form_encode(&params);
     let sep = if authorize_url.contains('?') { '&' } else { '?' };
     format!("{authorize_url}{sep}{query}")
 }
@@ -91,6 +100,7 @@ pub struct Endpoints<'a> {
     pub client_id: &'a str,
     pub authorize_url: &'a str,
     pub token_url: &'a str,
+    pub scope: Option<&'a str>,
 }
 
 pub fn login(
@@ -105,7 +115,7 @@ pub fn login(
     let redirect = format!("http://127.0.0.1:{}{CALLBACK}", listener.local_addr()?.port());
     let state = random(32)?;
     let verifier = random(32)?;
-    let url = authorize_url(at.authorize_url, at.client_id, &redirect, &state, &pkce_challenge(&verifier));
+    let url = authorize_url(at.authorize_url, at.client_id, at.scope, &redirect, &state, &pkce_challenge(&verifier));
     ui.show(&format!("Opening your browser to log in; if it doesn't open, visit:\n  {url}\nwaiting…\n"));
     ui.open(&url);
 
