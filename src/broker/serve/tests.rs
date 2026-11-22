@@ -464,7 +464,7 @@ fn refusals_take_the_claims_shape_and_never_reach_upstream() {
     assert_eq!(a.status, 403, "{a:?}");
     assert!(!a.head.to_ascii_lowercase().contains("www-authenticate"));
     let v = a.json();
-    assert!(v["detail"].as_str().unwrap().contains("asks need permission requests"), "{v}");
+    assert!(v["detail"].as_str().unwrap().contains("permission requests: not supported yet!"), "{v}");
     assert_eq!(v["devsandbox"]["verdict"], "refused");
     assert_eq!(v["devsandbox"]["scope"], "other");
     assert_eq!(v["devsandbox"]["credential"], "sentry-work");

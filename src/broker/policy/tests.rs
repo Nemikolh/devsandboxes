@@ -344,7 +344,7 @@ fn scopes_never_other_ask_and_defaults() {
     refused(&o, "a `never` route");
     assert_eq!(o.context.scope.as_deref(), Some("never"));
     let o = c.get("/api/0/unknown/", &bearer(OWN));
-    let r = refused(&o, "(scope `other`): asks need permission requests (credential-broker step 4)");
+    let r = refused(&o, "(scope `other`): permission requests: not supported yet! open an issue in https://github.com/Nemikolh/devsandboxes");
     assert_eq!(r.scope.as_deref(), Some("other"));
 
     // Unset scopes and max: every scope.
@@ -362,7 +362,8 @@ fn scopes_never_other_ask_and_defaults() {
 
     let mut c = Case::new();
     c.src.access = Some(Access { ask: vec!["issues.read".into()], ..Access::default() });
-    refused(&c.get("/api/0/issues/1/", &bearer(OWN)), "is in `access.sentry.ask`: asks need permission requests");
+    let r = refused(&c.get("/api/0/issues/1/", &bearer(OWN)), "is in `access.sentry.ask`, and asking isn't supported yet");
+    assert!(r.todo.unwrap().contains("out of `access.sentry.ask`"));
 
     let mut c = Case::new();
     c.src.home.get_mut("sentry-work").unwrap().max = Some(vec!["org.read".into()]);
@@ -598,7 +599,7 @@ fn repo_less_and_unplaced_routes() {
     injected(&o);
     let ask = fenced_src(Some(Access { ask: vec!["user.read".into(), "repo.read".into()], ..Access::default() }));
     refused(&fenced(&ask, "GET", "api.github.com", "/user", &token), "names no repo, so it's never asked");
-    refused(&fenced(&ask, "GET", "api.github.com", "/repos/o/r", &token), "asks need permission requests");
+    refused(&fenced(&ask, "GET", "api.github.com", "/repos/o/r", &token), "asking isn't supported yet");
 
     // A body input isn't placed.
     let mut body = crate::credentials::home::tests::github();
@@ -882,7 +883,7 @@ fn every_graphql_mutation_field_needs_its_scope() {
     // Asked scopes: a placed mutation waits for permission requests, one
     // naming no repo is never asked.
     let ask = gql_src(Some(Access { ask: vec!["pr.write".into()], ..Access::default() }));
-    refused(&gql(&state, &ask, both), "scope `pr.write` is in `access.github.ask`: asks need permission requests");
+    refused(&gql(&state, &ask, both), "scope `pr.write` is in `access.github.ask`, and asking isn't supported yet");
     let bare = serde_json::json!({ "query": "mutation { createPullRequest(input: {title: \"t\"}) { x } }" });
     injected(&gql(&state, &gql_src(None), bare.clone()));
     refused(&gql(&state, &ask, bare), "names no repo, so it's never asked");

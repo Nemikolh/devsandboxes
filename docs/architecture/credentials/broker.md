@@ -143,7 +143,7 @@ only for a call carrying the phantom). First refusal answers:
    refused for a write; a renamed repo's old name is sent to its current
    one.
 10. **Scope**: it must be granted (`max`; unset: every scope) and not in
-   `access.<kind>.ask` (refused: asks need permission requests; on a
+   `access.<kind>.ask` (refused: permission requests aren't supported yet; on a
    repo-less route of a fenced claim, refused as never asked, since an
    answer couldn't name a repo), and requested (`access.<kind>.scopes`;
    empty: every scope of the claim), each refusal naming what to change.

@@ -339,9 +339,9 @@ fn brokered_here(dir: &Path, kept: instance::Found) -> Result<Option<instance::F
     let why = if cfg!(unix) {
         let data = crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
         crate::worker_policy::fleet_root_of(&data, dir)?
-            .map(|_| "isn't brokered on a placed instance yet (credential-broker step 5)")
+            .map(|_| format!("isn't brokered on a placed instance ({})", crate::NOT_SUPPORTED_YET))
     } else {
-        Some("needs the host daemon, which is unix-only")
+        Some("needs the host daemon, which is unix-only".to_string())
     };
     let Some(why) = why else { return Ok(Some(kept)) };
     for (feature, claim) in &kept {
@@ -503,7 +503,7 @@ mod tests {
         let user = "[sandbox.s.access.github]\nas = \"user\"\n";
         // No credential yet: only the claim's and step 3's refusals.
         check("").unwrap();
-        assert!(check(app).unwrap_err().contains("installation tokens: github-and-sentry-access step 3"));
+        assert!(check(app).unwrap_err().contains("installation tokens: not supported yet!"));
 
         let mut entry = Entry::new("github", None);
         entry.approve(Version::of(&gh));

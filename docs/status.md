@@ -377,8 +377,8 @@ is frozen: no new work on it.
   [ca](architecture/credentials/ca.md#trust-in-containers);
   `credentials::instance::plan`, `commands::run::claims::wire`
 - The broker refuses every ask: a scope in `access.<kind>.ask` and a
-  route in no scope (`other`) get a 403 saying asks need permission
-  requests (credential-broker step 4); `presence` routes pass. The GitHub
+  route in no scope (`other`) get a 403 saying permission requests
+  aren't supported yet (credential-broker step 4); `presence` routes pass. The GitHub
   repo fence is enforced on a fenced claim's `{repo}` and
   `/repositories/{id}` routes
   ([fence](architecture/credentials/fence.md#enforcement)) and on

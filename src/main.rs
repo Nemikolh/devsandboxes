@@ -29,6 +29,9 @@ mod tui;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+/// The tail of a refusal for a feature not built yet: `<feature>: {NOT_SUPPORTED_YET}`.
+pub const NOT_SUPPORTED_YET: &str = "not supported yet! open an issue in https://github.com/Nemikolh/devsandboxes";
+
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 

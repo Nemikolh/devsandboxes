@@ -277,8 +277,7 @@ would change nothing. At `run` (`tokens::pick`) the config's
 `access.<kind>.as` picks within the credential's `as`, else `user` when
 offered, else `app`: a config only narrows, so a kind the credential
 doesn't offer, or the claim doesn't declare, refuses the run. `app`
-(installation tokens) is refused as not yet (github-and-sentry-access
-step 3).
+(installation tokens) is refused as not supported yet.
 
 `expires_at` (RFC 3339, UTC) is written by the broker: on an injected
 call with a pasted secret, the response's header the claim's

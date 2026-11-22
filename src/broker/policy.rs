@@ -62,6 +62,7 @@ use super::head::{RequestHead, header_indices};
 use super::redact;
 use super::refusal::Refusal;
 use super::route::{self, Scoped};
+use crate::NOT_SUPPORTED_YET;
 use crate::config::Access;
 use crate::credentials::claim::{self, Mode, Pinned, Refusal as Shape, Slot};
 use crate::credentials::fence;
@@ -71,7 +72,7 @@ use crate::devsbd::bridge::Caller;
 use crate::devsbd::proto::ProxyHeader;
 use crate::state::{Instance, State};
 
-const ASKS: &str = "asks need permission requests (credential-broker step 4)";
+const ASKS: &str = "permission requests";
 
 /// What policy reads on demand, only for a call carrying the phantom.
 pub trait Sources {
@@ -338,7 +339,7 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
             }
             Scoped::Other => {
                 return Err(Refusal::refused(format!(
-                    "`{call_route}` is in no scope of the `{kind}` claim (scope `other`): {ASKS}"
+                    "`{call_route}` is in no scope of the `{kind}` claim (scope `other`): {ASKS}: {NOT_SUPPORTED_YET}"
                 )));
             }
             Scoped::Scope(s) => s,
@@ -407,7 +408,8 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
                     "scope `{scope}` is in `access.{kind}.ask`, but `{call_route}` names no repo, so it's never asked"
                 )));
             }
-            return Err(Refusal::refused(format!("scope `{scope}` is in `access.{kind}.ask`: {ASKS}")));
+            return Err(Refusal::refused(format!("scope `{scope}` is in `access.{kind}.ask`, and asking isn't supported yet"))
+                .todo(format!("take `{scope}` out of `access.{kind}.ask` in the sandbox's config to allow it")));
         }
         if !access.scopes.is_empty() && !access.scopes.contains(scope) {
             return Err(Refusal::refused(format!("scope `{scope}` isn't in `access.{kind}.scopes`"))
@@ -456,7 +458,7 @@ fn graphql_scopes(
             }
             None => {
                 cx.scope = Some(claim::OTHER_SCOPE.to_string());
-                Err(Refusal::refused(format!("`{route}` is in no scope of the `{kind}` claim (scope `other`): {ASKS}")))
+                Err(Refusal::refused(format!("`{route}` is in no scope of the `{kind}` claim (scope `other`): {ASKS}: {NOT_SUPPORTED_YET}")))
             }
         }
     };
@@ -532,7 +534,7 @@ fn place_input(
             Err(None) => {
                 cx.scope = Some(claim::OTHER_SCOPE.to_string());
                 Err(Refusal::refused(format!(
-                    "{at} holds `{id}`, which doesn't resolve to a repository (scope `other`): {ASKS}"
+                    "{at} holds `{id}`, which doesn't resolve to a repository (scope `other`): {ASKS}: {NOT_SUPPORTED_YET}"
                 )))
             }
         },

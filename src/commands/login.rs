@@ -252,7 +252,7 @@ fn choose<'a>(
     if find("browser").is_some() {
         bail!("the `{kind}` claim logs in by {}: no browser opens here (pass --method browser to try anyway)", listed());
     }
-    bail!("the `{kind}` claim logs in by {}: not yet (github-and-sentry-access step 3)", listed())
+    bail!("the `{kind}` claim logs in by {}: {}", listed(), crate::NOT_SUPPORTED_YET)
 }
 
 fn check_client_id(id: &str) -> Result<()> {
@@ -643,7 +643,7 @@ pub(crate) mod tests {
         assert!(err.contains("no browser opens here"), "{err}");
         assert_eq!(name(choose(&[browser(1)], None, false, false, true, "k")), "browser");
         let err = choose(&[Login::GithubAppManifest {}], None, false, true, true, "k").unwrap_err().to_string();
-        assert!(err.contains("by github-app-manifest: not yet"), "{err}");
+        assert!(err.contains("by github-app-manifest: not supported yet! open an issue in"), "{err}");
         let err = choose(&[], None, false, true, true, "k").unwrap_err().to_string();
         assert!(err.contains("no `inject` slot"), "{err}");
     }

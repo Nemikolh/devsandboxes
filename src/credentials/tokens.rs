@@ -63,7 +63,7 @@ pub fn pick(
         );
     }
     if picked == TokenKind::App {
-        bail!("`as = \"app\"` for credential `{credential}`: installation tokens: github-and-sentry-access step 3");
+        bail!("`as = \"app\"` for credential `{credential}`: installation tokens: {}", crate::NOT_SUPPORTED_YET);
     }
     Ok(Some(picked))
 }
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(pick(&[User], Some(User)).unwrap(), Some(User));
         assert_eq!(pick(&[App, User], None).unwrap(), Some(User), "user when offered");
         for (home, wanted, wants) in [
-            (&[App, User][..], Some(App), "installation tokens: github-and-sentry-access step 3"),
+            (&[App, User][..], Some(App), "installation tokens: not supported yet! open an issue in https://github.com/Nemikolh/devsandboxes"),
             (&[App][..], None, "installation tokens"),
             (&[][..], Some(App), "credential `gh` offers `as = [\"user\"]`, not `app`: a config only narrows"),
             (&[App][..], Some(User), "offers `as = [\"app\"]`, not `user`"),

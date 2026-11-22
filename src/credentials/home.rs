@@ -161,8 +161,10 @@ impl TryFrom<String> for Source {
     fn try_from(s: String) -> Result<Source, String> {
         match s.as_str() {
             "file" => Ok(Source::File),
-            "keyring" => Err("`source = \"keyring\"`: not yet; only \"file\" for now".into()),
-            s if s.contains("://") => Err(format!("`source = \"{s}\"`: external stores are not yet supported; only \"file\" for now")),
+            "keyring" => Err(format!("`source = \"keyring\"`: {} (only \"file\" for now)", crate::NOT_SUPPORTED_YET)),
+            s if s.contains("://") => {
+                Err(format!("`source = \"{s}\"`: external stores: {} (only \"file\" for now)", crate::NOT_SUPPORTED_YET))
+            }
             s => Err(format!("unknown `source` `{s}` (only \"file\")")),
         }
     }
@@ -394,8 +396,8 @@ pub(crate) mod tests {
         let min = parse("[sentry-work]\nkind = \"sentry\"\n").unwrap();
         assert_eq!(min["sentry-work"], Entry::new("sentry", None));
         for (bad, wants) in [
-            ("[x]\nkind = \"sentry\"\nsource = \"keyring\"\n", "not yet"),
-            ("[x]\nkind = \"sentry\"\nsource = \"op://Private/x\"\n", "not yet supported"),
+            ("[x]\nkind = \"sentry\"\nsource = \"keyring\"\n", "keyring\"`: not supported yet!"),
+            ("[x]\nkind = \"sentry\"\nsource = \"op://Private/x\"\n", "external stores: not supported yet!"),
             ("[x]\nkind = \"sentry\"\nsource = \"vault\"\n", "unknown `source`"),
             ("[x]\nkind = \"sentry\"\nbogus = 1\n", "bogus"),
             ("[x]\nsource = \"file\"\n", "kind"),
