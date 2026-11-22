@@ -12,7 +12,9 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **credentials / features**: Sentry's new CLI in the sentry feature; a
+  run refused for an unapproved claim rolls back; updates come from the
+  image's label. → [plan](plans/active/sentry-and-update-fixes.md)
 
 ## Planned
 
