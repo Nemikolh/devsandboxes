@@ -1981,21 +1981,27 @@ mod tests {
 
     #[test]
     fn proxy_stream_is_refused_without_a_broker_or_with_a_bad_header() {
+        // No body: a refusal can close our peer before a write, failing it
+        // (EPIPE) or resetting the read (ECONNRESET, unread data dropped).
+        fn refused(daemon: &Arc<Mux>, header: &[u8]) -> Vec<u8> {
+            let (mut ours, theirs) = UnixStream::pair().unwrap();
+            ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            daemon.attach_with_header(1, theirs, proto::channel::HTTP_PROXY, header).unwrap();
+            let _ = ours.shutdown(std::net::Shutdown::Write);
+            let mut reply = Vec::new();
+            ours.read_to_end(&mut reply).unwrap();
+            reply
+        }
+
         let (to, _rx) = services("web-1", no_control());
         let daemon = pair_with(to);
         let header = proto::ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: 41001 };
-        assert!(send_proxied(&daemon, 1, &header, b"GET / HTTP/1.1\r\n\r\n").is_empty());
+        assert!(refused(&daemon, &header.encode()).is_empty());
 
         let (broker, calls) = echo_broker();
         let (to, _rx) = services("web-1", no_control());
         let daemon = pair_with(Services { broker: Some(broker), ..to });
-        let (mut ours, theirs) = UnixStream::pair().unwrap();
-        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        daemon.attach_with_header(1, theirs, proto::channel::HTTP_PROXY, b"socks5 sentry.io 1\n").unwrap();
-        ours.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut reply = Vec::new();
-        ours.read_to_end(&mut reply).unwrap();
-        assert!(reply.is_empty());
+        assert!(refused(&daemon, b"socks5 sentry.io 1\n").is_empty());
         assert!(calls.try_recv().is_err(), "the broker never sees a bad header");
     }
 

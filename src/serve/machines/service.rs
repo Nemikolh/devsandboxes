@@ -1534,18 +1534,22 @@ mod tests {
         let base = short_scratch("held");
         let (machines, _w, up, dials, runs) = inbound_and_ssh(&base, None, |l| CONTROL_PLANE_LOGGED.lock().unwrap().push(l.into()));
         let h = machines.handle();
-        wait_for("the inbound link retrying", Duration::from_secs(5), || ran(&dials, "w") >= 3);
-        assert_eq!(h.remotes().get("w").unwrap().state, LinkState::Unreachable);
+        // Each retry goes `Connecting` before its dial: the state is only
+        // read once that dial's failure has landed.
+        wait_for("the inbound link retrying", Duration::from_secs(5), || {
+            ran(&dials, "w") >= 3 && h.remotes().get("w").unwrap().state == LinkState::Unreachable
+        });
         let logged: Vec<_> = CONTROL_PLANE_LOGGED.lock().unwrap().iter().filter(|l| l.starts_with("machine w: ")).cloned().collect();
         assert_eq!(logged.len(), 1, "one line for one way of failing: {logged:?}");
         assert!(logged[0].contains("its link isn't up"), "{}", logged[0]);
 
         up.store(true, Ordering::SeqCst);
         wait_for("the inbound link up", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        wait_for("the ssh machine's carrier failed", Duration::from_secs(5), || {
+            ran(&runs, "s") >= 1 && h.remotes().get("s").unwrap().state == LinkState::Unreachable
+        });
         assert_eq!(ran(&runs, "w"), 0, "no carrier for an inbound machine");
-        assert!(ran(&runs, "s") >= 1, "the ssh machine's carrier runs");
         assert_eq!(ran(&dials, "s"), 0, "nothing dialed over a down carrier");
-        assert_eq!(h.remotes().get("s").unwrap().state, LinkState::Unreachable);
         assert!(!base.join("remotes.json").exists(), "only a control plane saves");
         drop(machines);
         let _ = std::fs::remove_dir_all(&base);
