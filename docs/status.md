@@ -12,7 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **features**: zidane and sentry update like gh: a read-only shared bin
+  dir the daemon updates. → [plan](plans/active/zidane-and-sentry-updates.md)
 
 ## Planned
 
