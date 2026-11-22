@@ -73,7 +73,9 @@ ends the login as denied; a code is exchanged at `tokenUrl` with the
 Either flow ends in an `OAuthToken` (`TokenSet::into_record`): the
 tokens, `expires_at` and `refresh_expires_at` made absolute in unix
 seconds, the scope granted, and what a refresh needs: `token_url` and the
-`client_id` used (the claim's, or `--client-id`'s). `login` stores it as
+`client_id` used (`--client-id`'s, else the claim's; a claim may name
+none, leaving the app to the home, and then `login` requires
+`--client-id`). `login` stores it as
 `Record::OAuth`, replacing the credential's record whole, and clears the
 entry's `broken` mark. The broker renews the token with the refresh token
 ahead of expiry and after a 401, storing a rotated refresh token with it

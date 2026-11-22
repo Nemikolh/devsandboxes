@@ -66,13 +66,16 @@ the claim lists, else the first the claim lists of, on a terminal,
 `device`, `browser`, `paste`, and off one `paste`, `device`, `browser`;
 `browser` only where a browser opens (a display and a system opener,
 `open::has_display`, `open::opener_argv`), since its redirect lands on
-this host's loopback. A claim's own order isn't kept: its version sorts
+this host's loopback, and a `device` or `browser` login whose claim has
+no `clientId` only with `--client-id` (`needs_client_id`; named by
+`--method` without it, refused). A claim's own order isn't kept: its version sorts
 the list. `github-app-manifest` is refused as not yet, and a claim with
 no `login` (no `inject` slot) has no secret to log in. All of this is
 checked before anything is asked.
 
 `--client-id` logs in to that OAuth app instead of the claim's (an app
-the home owns: a GitHub App you made); refused with `paste`. It goes into
+the home owns: a GitHub App you made), and is required when the claim
+names none; refused with `paste`. It goes into
 the token record, never the claim, so it changes no claim version.
 
 Then, in order: a new version's summary (`View::summary`: kind, mode,

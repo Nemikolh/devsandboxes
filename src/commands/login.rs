@@ -25,7 +25,8 @@ pub struct Args {
     /// `paste`, `device` or `browser`: one of the claim's methods.
     pub method: Option<String>,
     /// The OAuth app to log in to instead of the claim's (one the home
-    /// owns); kept in the token record, not the claim.
+    /// owns), required when the claim names none; kept in the token
+    /// record, not the claim.
     pub client_id: Option<String>,
 }
 
@@ -203,22 +204,50 @@ fn method_name(login: &Login) -> &'static str {
     }
 }
 
+/// A device or browser login whose claim names no OAuth app.
+fn needs_client_id(login: &Login) -> bool {
+    matches!(login, Login::Device { client_id: None, .. } | Login::Browser { client_id: None, .. })
+}
+
+fn client_id_required(login: &Login, kind: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the `{kind}` claim's {} login names no OAuth app: pass --client-id <your app's client id>",
+        method_name(login)
+    )
+}
+
 /// The login method: `wanted` if the claim lists it, else the first of
 /// the claim's that works here, in this order: off a terminal paste (stdin),
 /// device, browser; on one device, browser, paste. Browser only where a
-/// browser opens. A claim's own order isn't kept (its version sorts them).
-fn choose<'a>(logins: &'a [Login], wanted: Option<&str>, tty: bool, browser: bool, kind: &str) -> Result<&'a Login> {
+/// browser opens, a login needing `--client-id` only with one. A claim's
+/// own order isn't kept (its version sorts them).
+fn choose<'a>(
+    logins: &'a [Login],
+    wanted: Option<&str>,
+    client_id: bool,
+    tty: bool,
+    browser: bool,
+    kind: &str,
+) -> Result<&'a Login> {
     if logins.is_empty() {
         bail!("the `{kind}` claim has no secret to log in (no `inject` slot)");
     }
     let listed = || logins.iter().map(method_name).collect::<Vec<_>>().join(", ");
     let find = |m: &str| logins.iter().find(|l| method_name(l) == m);
     if let Some(m) = wanted {
-        return find(m).with_context(|| format!("the `{kind}` claim logs in by {}, not {m}", listed()));
+        let l = find(m).with_context(|| format!("the `{kind}` claim logs in by {}, not {m}", listed()))?;
+        if needs_client_id(l) && !client_id {
+            return Err(client_id_required(l, kind));
+        }
+        return Ok(l);
     }
     let order: &[&str] = if tty { &["device", "browser", "paste"] } else { &["paste", "device", "browser"] };
-    if let Some(l) = order.iter().filter(|m| browser || **m != "browser").find_map(|m| find(m)) {
+    let usable = |l: &&Login| client_id || !needs_client_id(l);
+    if let Some(l) = order.iter().filter(|m| browser || **m != "browser").find_map(|m| find(m).filter(usable)) {
         return Ok(l);
+    }
+    if let Some(l) = order.iter().filter_map(|m| find(m)).find(|l| needs_client_id(l) && !client_id) {
+        return Err(client_id_required(l, kind));
     }
     if find("browser").is_some() {
         bail!("the `{kind}` claim logs in by {}: no browser opens here (pass --method browser to try anyway)", listed());
@@ -235,7 +264,9 @@ fn check_client_id(id: &str) -> Result<()> {
 
 /// The secret by `login`'s method.
 fn obtain(login: &Login, name: &str, args: &Args, term: &mut dyn Term, flows: &mut Flows) -> Result<Record> {
-    let client = |claims: &str| args.client_id.clone().unwrap_or_else(|| claims.to_string());
+    let client = |claims: &Option<String>| {
+        args.client_id.clone().or_else(|| claims.clone()).expect("choose requires --client-id when the claim has none")
+    };
     match login {
         Login::Paste { hint } => {
             let secret = term.secret(&match hint {
@@ -313,7 +344,7 @@ pub(crate) fn login_at(
     };
     let shown = deciding.view()?;
     let (_, pinned) = claim::from_canonical(&deciding.claim)?;
-    let login = choose(&pinned.login, args.method.as_deref(), term.tty(), flows.browser, &kind)?;
+    let login = choose(&pinned.login, args.method.as_deref(), args.client_id.is_some(), term.tty(), flows.browser, &kind)?;
     if let Some(id) = &args.client_id {
         if matches!(login, Login::Paste { .. }) {
             bail!("--client-id is for the device and browser logins, not paste");
@@ -525,7 +556,7 @@ pub(crate) mod tests {
 
         let mut device = sentry();
         device.pinned.login = vec![crate::credentials::claim::Login::Device {
-            client_id: "c".into(),
+            client_id: Some("c".into()),
             device_url: "https://x/d".into(),
             token_url: "https://x/t".into(),
         }];
@@ -577,7 +608,7 @@ pub(crate) mod tests {
 
     fn device(port: u16) -> Login {
         Login::Device {
-            client_id: "Iv1.claims".into(),
+            client_id: Some("Iv1.claims".into()),
             device_url: format!("https://127.0.0.1:{port}/device"),
             token_url: format!("https://127.0.0.1:{port}/token"),
         }
@@ -585,10 +616,16 @@ pub(crate) mod tests {
 
     fn browser(port: u16) -> Login {
         Login::Browser {
-            client_id: "Iv1.claims".into(),
+            client_id: Some("Iv1.claims".into()),
             authorize_url: "https://github.example/login/oauth/authorize".into(),
             token_url: format!("https://127.0.0.1:{port}/token"),
         }
+    }
+
+    /// A device login whose claim leaves the OAuth app to the home.
+    fn home_device(port: u16) -> Login {
+        let Login::Device { device_url, token_url, .. } = device(port) else { unreachable!() };
+        Login::Device { client_id: None, device_url, token_url }
     }
 
     #[test]
@@ -596,19 +633,41 @@ pub(crate) mod tests {
         let paste = Login::Paste { hint: None };
         let all = [paste.clone(), device(1), browser(1)];
         let name = |l: Result<&Login>| method_name(l.unwrap());
-        assert_eq!(name(choose(&all, None, false, true, "k")), "paste");
-        assert_eq!(name(choose(&all, None, true, true, "k")), "device");
-        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, true, true, "k")), "browser");
-        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, true, false, "k")), "paste");
-        assert_eq!(name(choose(&[device(1)], None, false, false, "k")), "device");
-        assert_eq!(name(choose(&all, Some("browser"), false, false, "k")), "browser");
-        let err = choose(&[browser(1)], None, true, false, "k").unwrap_err().to_string();
+        assert_eq!(name(choose(&all, None, false, false, true, "k")), "paste");
+        assert_eq!(name(choose(&all, None, false, true, true, "k")), "device");
+        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, false, true, true, "k")), "browser");
+        assert_eq!(name(choose(&[paste.clone(), browser(1)], None, false, true, false, "k")), "paste");
+        assert_eq!(name(choose(&[device(1)], None, false, false, false, "k")), "device");
+        assert_eq!(name(choose(&all, Some("browser"), false, false, false, "k")), "browser");
+        let err = choose(&[browser(1)], None, false, true, false, "k").unwrap_err().to_string();
         assert!(err.contains("no browser opens here"), "{err}");
-        assert_eq!(name(choose(&[browser(1)], None, false, true, "k")), "browser");
-        let err = choose(&[Login::GithubAppManifest {}], None, true, true, "k").unwrap_err().to_string();
+        assert_eq!(name(choose(&[browser(1)], None, false, false, true, "k")), "browser");
+        let err = choose(&[Login::GithubAppManifest {}], None, false, true, true, "k").unwrap_err().to_string();
         assert!(err.contains("by github-app-manifest: not yet"), "{err}");
-        let err = choose(&[], None, true, true, "k").unwrap_err().to_string();
+        let err = choose(&[], None, false, true, true, "k").unwrap_err().to_string();
         assert!(err.contains("no `inject` slot"), "{err}");
+    }
+
+    #[test]
+    fn a_login_naming_no_app_needs_a_client_id() {
+        let paste = Login::Paste { hint: None };
+        let gh = [paste.clone(), home_device(1)];
+        let name = |l: Result<&Login>| method_name(l.unwrap());
+        assert_eq!(name(choose(&gh, None, false, true, true, "k")), "paste", "skipped by default without one");
+        assert_eq!(name(choose(&gh, None, true, true, true, "k")), "device");
+        assert_eq!(name(choose(&gh, Some("device"), true, false, false, "k")), "device");
+        let err = choose(&gh, Some("device"), false, true, true, "k").unwrap_err().to_string();
+        assert!(err.contains("device login names no OAuth app: pass --client-id"), "{err}");
+        let err = choose(&[home_device(1)], None, false, true, true, "k").unwrap_err().to_string();
+        assert!(err.contains("pass --client-id"), "{err}");
+
+        let data = temp("no-client-id");
+        let mut c = other("github");
+        c.pinned.login = gh.to_vec();
+        let a = Args { yes: true, method: Some("device".into()), ..args("gh") };
+        let err = login_at(&data, &a, Some(vec![c]), &mut Script::new(true, &[], None)).unwrap_err().to_string();
+        assert!(err.contains("pass --client-id"), "refused before any network: {err}");
+        assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
     }
 
     fn flows(open: impl FnMut(&str) + 'static, clock: Box<dyn Clock>) -> Flows {
@@ -621,15 +680,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// The device flow against a local provider, with the home's own app;
-    /// a re-login by paste then replaces the record and nothing else.
+    /// The device flow against a local provider, with the home's own app
+    /// for a claim naming none; a re-login by paste then replaces the
+    /// record and nothing else.
     #[test]
     fn device_login_stores_the_token_set_under_the_home_client_id() {
         use crate::credentials::oauth::tests::{FakeClock, UNIX, device_provider, field, form};
         let (port, seen) = device_provider();
         let data = temp("device");
         let mut gh = other("github");
-        gh.pinned.login = vec![Login::Paste { hint: None }, device(port)];
+        gh.pinned.login = vec![Login::Paste { hint: None }, home_device(port)];
         let a = Args { yes: true, client_id: Some("Iv1.mine".into()), ..args("gh") };
         let mut term = Script::new(true, &[], None);
         let mut f = flows(|_| {}, Box::new(FakeClock::new()));

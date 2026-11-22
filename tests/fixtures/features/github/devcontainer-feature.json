@@ -1,6 +1,6 @@
 {
   "id": "gh",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "gh, brokered and repo-fenced (test fixture)",
   "description": "Test fixture mirroring github.com/devsandboxes/features' src/gh: the same metadata and claim (docs/plans/active/github-and-sentry-access.md, gh), keep them in step. Its install.sh installs nothing.",
   "options": {
@@ -72,6 +72,11 @@
             {
               "method": "paste",
               "hint": "a fine-grained personal access token (github_pat_…) selecting the sandboxes' repos, or a GitHub App user token (ghu_…)"
+            },
+            {
+              "method": "device",
+              "deviceUrl": "https://github.com/login/device/code",
+              "tokenUrl": "https://github.com/login/oauth/access_token"
             }
           ],
           "check": "GET /user",

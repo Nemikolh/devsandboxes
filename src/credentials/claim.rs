@@ -231,8 +231,19 @@ pub enum Login {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
     },
-    Device { client_id: String, device_url: String, token_url: String },
-    Browser { client_id: String, authorize_url: String, token_url: String },
+    /// No `client_id`: the home names its own OAuth app at login.
+    Device {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        device_url: String,
+        token_url: String,
+    },
+    Browser {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        authorize_url: String,
+        token_url: String,
+    },
     /// Empty, not unit: see [`Refusal`].
     GithubAppManifest {},
 }
@@ -884,12 +895,12 @@ fn login(raw: Option<Vec<Login>>, inject: &[Slot]) -> Result<Vec<Login>> {
                 }
             }
             Login::Device { client_id, device_url, token_url } => {
-                check_client_id(client_id).with_context(at)?;
+                client_id.as_deref().map(check_client_id).transpose().with_context(at)?;
                 check_https_url(device_url).with_context(|| format!("{}: `deviceUrl`", at()))?;
                 check_https_url(token_url).with_context(|| format!("{}: `tokenUrl`", at()))?;
             }
             Login::Browser { client_id, authorize_url, token_url } => {
-                check_client_id(client_id).with_context(at)?;
+                client_id.as_deref().map(check_client_id).transpose().with_context(at)?;
                 check_https_url(authorize_url).with_context(|| format!("{}: `authorizeUrl`", at()))?;
                 check_https_url(token_url).with_context(|| format!("{}: `tokenUrl`", at()))?;
             }
@@ -1581,6 +1592,18 @@ mod tests {
             { "method": "paste" },
         ]);
         assert_eq!(parse("sentry", &sentry_with("login", all)).unwrap().pinned.login.len(), 4);
+        assert_err(
+            sentry_with("login", json!([{ "method": "device", "clientId": "", "deviceUrl": "https://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" }])),
+            &["`login[0]`", "`clientId` must be non-empty"],
+        );
+        let home_app = json!([
+            { "method": "browser", "authorizeUrl": "https://github.com/login/oauth/authorize", "tokenUrl": "https://github.com/login/oauth/access_token" },
+            { "method": "device", "deviceUrl": "https://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" },
+        ]);
+        let c = parse("sentry", &sentry_with("login", home_app)).unwrap();
+        assert!(c.pinned.login.iter().all(|l| matches!(l, Login::Device { client_id: None, .. } | Login::Browser { client_id: None, .. })));
+        assert!(!c.canonical().contains("clientId"), "an absent client id stays absent in the pinned claim");
+        assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
 
         assert_err(sentry_with("check", json!("GET /api/0/organizations/{org}/")), &["`check`", "no `{var}`"]);
         assert_err(sentry_with("check", json!("POST /api/0/")), &["`check`", "a `GET` or `HEAD`"]);

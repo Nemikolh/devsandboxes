@@ -84,7 +84,10 @@ The home binds the secret to its destination. It pins the whole claim but
 its container-side wiring (`phantom`, `baseUrl`, `ca`, `git`: the
 container could ignore them anyway) in `credentials.toml`, under the
 claim's version: a hash of that pinned part as `FeatureMetadata` reads
-it, the same for an OCI or a local feature. Not the feature's digest:
+it, the same for an OCI or a local feature; a `device` or `browser`
+login with no `clientId` (the home names its own app at `login`) is
+pinned as having none, so adding or dropping one is a new version. Not
+the feature's digest:
 `fetch_into` keeps none (its cache is keyed by tag), a local feature has
 none, and a gh release that leaves the claim alone must not ask again.
 `devsandbox login <credential>` shows and approves the claim of the
@@ -463,15 +466,15 @@ only a note when the repo is public (a reference clone in `folders`).
    (docker-in-docker), which the broker counts as the host
    (credential-broker, its non-goals): the widest token sits where the
    home's store is in reach on a rootful runtime.
-   Built: all of it but the live config; `features/gh` 1.0.0 is in the
+   Built: all of it but the live config; `features/gh` 1.1.0 is in the
    features repo, its claim mirrored by the github test fixture, its
    scope table checked against gh 2.105.0's calls (from its source) and
    GitHub's public GraphQL schema, and gh run end to end through the
    broker against a mock GitHub
-   ([gh](../../architecture/credentials/gh.md)). Deferred, each a
-   [status](../../status.md#credentials) limitation: the claim's
-   `device` login (it needs an app's client id in the claim; paste
-   takes `ghu_` tokens meanwhile), a `gh-update` schedule and the
+   ([gh](../../architecture/credentials/gh.md)); its `device` login
+   names no app, the home's comes with `login --client-id`. Deferred,
+   each a [status](../../status.md#credentials) limitation: a
+   `gh-update` schedule and the
    shared bin dir's mount in the feature (the feature schema has no
    read-only mount: the config mounts it), multi-segment route
    variables (paths are listed per depth), Projects, discussion
