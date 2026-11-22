@@ -1,0 +1,522 @@
+{
+ "inputs": {
+  "AddBlockedByInput": {
+   "blockingIssueId": "ID!",
+   "clientMutationId": "String",
+   "issueId": "ID!"
+  },
+  "AddCommentInput": {
+   "body": "String!",
+   "clientMutationId": "String",
+   "subjectId": "ID!"
+  },
+  "AddDiscussionCommentInput": {
+   "body": "String!",
+   "clientMutationId": "String",
+   "discussionId": "ID!",
+   "replyToId": "ID"
+  },
+  "AddLabelsToLabelableInput": {
+   "clientMutationId": "String",
+   "labelIds": "[ID!]",
+   "labelableId": "ID!",
+   "labels": "[LabelUpdateInput!]"
+  },
+  "AddPullRequestReviewInput": {
+   "body": "String",
+   "clientMutationId": "String",
+   "comments": "[DraftPullRequestReviewComment]",
+   "commitOID": "GitObjectID",
+   "event": "PullRequestReviewEvent",
+   "pullRequestId": "ID!",
+   "threads": "[DraftPullRequestReviewThread]"
+  },
+  "AddSubIssueInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!",
+   "replaceParent": "Boolean",
+   "subIssueId": "ID",
+   "subIssueUrl": "String"
+  },
+  "AgentAssignmentInput": {
+   "baseRef": "String",
+   "customAgent": "String",
+   "customInstructions": "String",
+   "targetRepositoryId": "ID"
+  },
+  "AssigneeUpdateInput": {
+   "actorId": "ID!",
+   "confidence": "IssueEventConfidenceLevel",
+   "rationale": "String",
+   "suggest": "Boolean"
+  },
+  "CloseIssueInput": {
+   "clientMutationId": "String",
+   "confidence": "IssueEventConfidenceLevel",
+   "duplicateIssueId": "ID",
+   "isSuggestion": "Boolean",
+   "issueId": "ID!",
+   "rationale": "String",
+   "stateReason": "IssueClosedStateReason"
+  },
+  "ClosePullRequestInput": {
+   "clientMutationId": "String",
+   "pullRequestId": "ID!"
+  },
+  "CommitMessage": {
+   "body": "String",
+   "headline": "String!"
+  },
+  "CommittableBranch": {
+   "branchName": "String",
+   "id": "ID",
+   "repositoryNameWithOwner": "String"
+  },
+  "ConvertPullRequestToDraftInput": {
+   "clientMutationId": "String",
+   "pullRequestId": "ID!"
+  },
+  "CreateCommitOnBranchInput": {
+   "branch": "CommittableBranch!",
+   "clientMutationId": "String",
+   "expectedHeadOid": "GitObjectID!",
+   "fileChanges": "FileChanges",
+   "message": "CommitMessage!"
+  },
+  "CreateDiscussionInput": {
+   "body": "String!",
+   "categoryId": "ID!",
+   "clientMutationId": "String",
+   "repositoryId": "ID!",
+   "title": "String!"
+  },
+  "CreateIssueInput": {
+   "agentAssignment": "AgentAssignmentInput",
+   "assigneeIds": "[ID!]",
+   "body": "String",
+   "clientMutationId": "String",
+   "issueFields": "[IssueFieldCreateOrUpdateInput!]",
+   "issueTemplate": "String",
+   "issueTypeId": "ID",
+   "labelIds": "[ID!]",
+   "milestoneId": "ID",
+   "parentIssueId": "ID",
+   "projectIds": "[ID!]",
+   "projectV2Ids": "[ID!]",
+   "repositoryId": "ID!",
+   "statusId": "ID",
+   "title": "String!"
+  },
+  "CreateLinkedBranchInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!",
+   "name": "String",
+   "oid": "GitObjectID!",
+   "repositoryId": "ID"
+  },
+  "CreatePullRequestInput": {
+   "baseRefName": "String!",
+   "body": "String",
+   "clientMutationId": "String",
+   "draft": "Boolean",
+   "headRefName": "String!",
+   "headRepositoryId": "ID",
+   "maintainerCanModify": "Boolean",
+   "repositoryId": "ID!",
+   "title": "String!"
+  },
+  "CreateRefInput": {
+   "clientMutationId": "String",
+   "name": "String!",
+   "oid": "GitObjectID!",
+   "repositoryId": "ID!"
+  },
+  "DeleteDiscussionCommentInput": {
+   "clientMutationId": "String",
+   "id": "ID!"
+  },
+  "DeleteIssueCommentInput": {
+   "clientMutationId": "String",
+   "id": "ID!"
+  },
+  "DeleteIssueInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!"
+  },
+  "DeleteRefInput": {
+   "clientMutationId": "String",
+   "refId": "ID!"
+  },
+  "DisablePullRequestAutoMergeInput": {
+   "clientMutationId": "String",
+   "includeStack": "Boolean",
+   "pullRequestId": "ID!"
+  },
+  "DraftPullRequestReviewComment": {
+   "body": "String!",
+   "path": "String!",
+   "position": "Int!"
+  },
+  "DraftPullRequestReviewThread": {
+   "body": "String!",
+   "line": "Int",
+   "path": "String",
+   "side": "DiffSide",
+   "startLine": "Int",
+   "startSide": "DiffSide"
+  },
+  "EnablePullRequestAutoMergeInput": {
+   "authorEmail": "String",
+   "clientMutationId": "String",
+   "commitBody": "String",
+   "commitHeadline": "String",
+   "expectedHeadOid": "GitObjectID",
+   "includeStack": "Boolean",
+   "mergeMethod": "PullRequestMergeMethod",
+   "pullRequestId": "ID!"
+  },
+  "FileAddition": {
+   "contents": "Base64String!",
+   "path": "String!"
+  },
+  "FileChanges": {
+   "additions": "[FileAddition!]",
+   "deletions": "[FileDeletion!]"
+  },
+  "FileDeletion": {
+   "path": "String!"
+  },
+  "IssueFieldCreateOrUpdateInput": {
+   "confidence": "IssueEventConfidenceLevel",
+   "dateValue": "String",
+   "delete": "Boolean",
+   "fieldId": "ID!",
+   "multiSelectOptionIds": "[ID!]",
+   "numberValue": "Float",
+   "rationale": "String",
+   "singleSelectOptionId": "ID",
+   "suggest": "Boolean",
+   "textValue": "String"
+  },
+  "IssueFieldUpdateInput": {
+   "fieldName": "String!",
+   "operation": "IssueFieldUpdateOperation!",
+   "value": "String"
+  },
+  "IssueStateUpdateInput": {
+   "confidence": "IssueEventConfidenceLevel",
+   "duplicateIssueId": "ID",
+   "rationale": "String",
+   "stateReason": "IssueClosedStateReason",
+   "suggest": "Boolean",
+   "value": "IssueState!"
+  },
+  "IssueTypeUpdateInput": {
+   "confidence": "IssueEventConfidenceLevel",
+   "issueTypeId": "ID",
+   "rationale": "String",
+   "suggest": "Boolean"
+  },
+  "LabelUpdateInput": {
+   "confidence": "IssueEventConfidenceLevel",
+   "labelId": "ID!",
+   "rationale": "String",
+   "suggest": "Boolean"
+  },
+  "LockLockableInput": {
+   "clientMutationId": "String",
+   "lockReason": "LockReason",
+   "lockableId": "ID!"
+  },
+  "MarkPullRequestReadyForReviewInput": {
+   "clientMutationId": "String",
+   "pullRequestId": "ID!"
+  },
+  "MergePullRequestInput": {
+   "authorEmail": "String",
+   "clientMutationId": "String",
+   "commitBody": "String",
+   "commitHeadline": "String",
+   "expectedHeadOid": "GitObjectID",
+   "mergeMethod": "PullRequestMergeMethod",
+   "pullRequestId": "ID!"
+  },
+  "PinIssueInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!"
+  },
+  "RemoveBlockedByInput": {
+   "blockingIssueId": "ID!",
+   "clientMutationId": "String",
+   "issueId": "ID!"
+  },
+  "RemoveLabelsFromLabelableInput": {
+   "clientMutationId": "String",
+   "labelIds": "[ID!]!",
+   "labelableId": "ID!"
+  },
+  "RemoveSubIssueInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!",
+   "subIssueId": "ID!"
+  },
+  "ReopenIssueInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!"
+  },
+  "ReopenPullRequestInput": {
+   "clientMutationId": "String",
+   "pullRequestId": "ID!"
+  },
+  "ReplaceActorsForAssignableInput": {
+   "actorIds": "[ID!]",
+   "actorLogins": "[String!]",
+   "agentAssignment": "AgentAssignmentInput",
+   "assignableId": "ID!",
+   "assignees": "[AssigneeUpdateInput!]",
+   "clientMutationId": "String"
+  },
+  "RequestReviewsByLoginInput": {
+   "botLogins": "[String!]",
+   "clientMutationId": "String",
+   "pullRequestId": "ID!",
+   "teamSlugs": "[String!]",
+   "union": "Boolean",
+   "userLogins": "[String!]"
+  },
+  "RequestReviewsInput": {
+   "botIds": "[ID!]",
+   "clientMutationId": "String",
+   "pullRequestId": "ID!",
+   "teamIds": "[ID!]",
+   "union": "Boolean",
+   "userIds": "[ID!]"
+  },
+  "RevertPullRequestInput": {
+   "body": "String",
+   "clientMutationId": "String",
+   "draft": "Boolean",
+   "pullRequestId": "ID!",
+   "title": "String"
+  },
+  "TransferIssueInput": {
+   "clientMutationId": "String",
+   "createLabelsIfMissing": "Boolean",
+   "issueId": "ID!",
+   "repositoryId": "ID!"
+  },
+  "UnlockLockableInput": {
+   "clientMutationId": "String",
+   "lockableId": "ID!"
+  },
+  "UnpinIssueInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!"
+  },
+  "UpdateDiscussionCommentInput": {
+   "body": "String!",
+   "clientMutationId": "String",
+   "commentId": "ID!"
+  },
+  "UpdateDiscussionInput": {
+   "body": "String",
+   "categoryId": "ID",
+   "clientMutationId": "String",
+   "discussionId": "ID!",
+   "title": "String"
+  },
+  "UpdateIssueCommentInput": {
+   "body": "String!",
+   "clientMutationId": "String",
+   "id": "ID!"
+  },
+  "UpdateIssueInput": {
+   "agentAssignment": "AgentAssignmentInput",
+   "assigneeIds": "[ID!]",
+   "assignees": "[AssigneeUpdateInput!]",
+   "body": "String",
+   "clientMutationId": "String",
+   "id": "ID!",
+   "issueFieldUpdates": "[IssueFieldUpdateInput!]",
+   "issueType": "IssueTypeUpdateInput",
+   "issueTypeId": "ID",
+   "labelIds": "[ID!]",
+   "labels": "[LabelUpdateInput!]",
+   "milestoneId": "ID",
+   "projectIds": "[ID!]",
+   "state": "IssueState",
+   "stateInput": "IssueStateUpdateInput",
+   "statusId": "ID",
+   "title": "String"
+  },
+  "UpdateIssueIssueTypeInput": {
+   "clientMutationId": "String",
+   "issueId": "ID!",
+   "issueTypeId": "ID"
+  },
+  "UpdatePullRequestBranchInput": {
+   "clientMutationId": "String",
+   "expectedHeadOid": "GitObjectID",
+   "pullRequestId": "ID!",
+   "updateMethod": "PullRequestBranchUpdateMethod"
+  },
+  "UpdatePullRequestInput": {
+   "assigneeIds": "[ID!]",
+   "baseRefName": "String",
+   "body": "String",
+   "clientMutationId": "String",
+   "labelIds": "[ID!]",
+   "maintainerCanModify": "Boolean",
+   "milestoneId": "ID",
+   "projectIds": "[ID!]",
+   "pullRequestId": "ID!",
+   "state": "PullRequestUpdateState",
+   "title": "String"
+  },
+  "UpdateRefInput": {
+   "clientMutationId": "String",
+   "force": "Boolean",
+   "oid": "GitObjectID!",
+   "refId": "ID!"
+  }
+ },
+ "license": "CC BY 4.0, GitHub, Inc. (github/docs); trimmed to the mutations the features/gh claim maps",
+ "mutations": {
+  "addBlockedBy": {
+   "input": "AddBlockedByInput!"
+  },
+  "addComment": {
+   "input": "AddCommentInput!"
+  },
+  "addDiscussionComment": {
+   "input": "AddDiscussionCommentInput!"
+  },
+  "addLabelsToLabelable": {
+   "input": "AddLabelsToLabelableInput!"
+  },
+  "addPullRequestReview": {
+   "input": "AddPullRequestReviewInput!"
+  },
+  "addSubIssue": {
+   "input": "AddSubIssueInput!"
+  },
+  "closeIssue": {
+   "input": "CloseIssueInput!"
+  },
+  "closePullRequest": {
+   "input": "ClosePullRequestInput!"
+  },
+  "convertPullRequestToDraft": {
+   "input": "ConvertPullRequestToDraftInput!"
+  },
+  "createCommitOnBranch": {
+   "input": "CreateCommitOnBranchInput!"
+  },
+  "createDiscussion": {
+   "input": "CreateDiscussionInput!"
+  },
+  "createIssue": {
+   "input": "CreateIssueInput!"
+  },
+  "createLinkedBranch": {
+   "input": "CreateLinkedBranchInput!"
+  },
+  "createPullRequest": {
+   "input": "CreatePullRequestInput!"
+  },
+  "createRef": {
+   "input": "CreateRefInput!"
+  },
+  "deleteDiscussionComment": {
+   "input": "DeleteDiscussionCommentInput!"
+  },
+  "deleteIssue": {
+   "input": "DeleteIssueInput!"
+  },
+  "deleteIssueComment": {
+   "input": "DeleteIssueCommentInput!"
+  },
+  "deleteRef": {
+   "input": "DeleteRefInput!"
+  },
+  "disablePullRequestAutoMerge": {
+   "input": "DisablePullRequestAutoMergeInput!"
+  },
+  "enablePullRequestAutoMerge": {
+   "input": "EnablePullRequestAutoMergeInput!"
+  },
+  "lockLockable": {
+   "input": "LockLockableInput!"
+  },
+  "markPullRequestReadyForReview": {
+   "input": "MarkPullRequestReadyForReviewInput!"
+  },
+  "mergePullRequest": {
+   "input": "MergePullRequestInput!"
+  },
+  "pinIssue": {
+   "input": "PinIssueInput!"
+  },
+  "removeBlockedBy": {
+   "input": "RemoveBlockedByInput!"
+  },
+  "removeLabelsFromLabelable": {
+   "input": "RemoveLabelsFromLabelableInput!"
+  },
+  "removeSubIssue": {
+   "input": "RemoveSubIssueInput!"
+  },
+  "reopenIssue": {
+   "input": "ReopenIssueInput!"
+  },
+  "reopenPullRequest": {
+   "input": "ReopenPullRequestInput!"
+  },
+  "replaceActorsForAssignable": {
+   "input": "ReplaceActorsForAssignableInput!"
+  },
+  "requestReviews": {
+   "input": "RequestReviewsInput!"
+  },
+  "requestReviewsByLogin": {
+   "input": "RequestReviewsByLoginInput!"
+  },
+  "revertPullRequest": {
+   "input": "RevertPullRequestInput!"
+  },
+  "transferIssue": {
+   "input": "TransferIssueInput!"
+  },
+  "unlockLockable": {
+   "input": "UnlockLockableInput!"
+  },
+  "unpinIssue": {
+   "input": "UnpinIssueInput!"
+  },
+  "updateDiscussion": {
+   "input": "UpdateDiscussionInput!"
+  },
+  "updateDiscussionComment": {
+   "input": "UpdateDiscussionCommentInput!"
+  },
+  "updateIssue": {
+   "input": "UpdateIssueInput!"
+  },
+  "updateIssueComment": {
+   "input": "UpdateIssueCommentInput!"
+  },
+  "updateIssueIssueType": {
+   "input": "UpdateIssueIssueTypeInput!"
+  },
+  "updatePullRequest": {
+   "input": "UpdatePullRequestInput!"
+  },
+  "updatePullRequestBranch": {
+   "input": "UpdatePullRequestBranchInput!"
+  },
+  "updateRef": {
+   "input": "UpdateRefInput!"
+  }
+ },
+ "source": "https://docs.github.com/public/fpt/schema.docs.graphql"
+}

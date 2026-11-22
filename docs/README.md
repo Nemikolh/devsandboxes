@@ -55,7 +55,8 @@ User-facing docs live in `site/` (and the config reference in
   [login](architecture/credentials/login.md),
   [member CA](architecture/credentials/ca.md),
   [repo fence](architecture/credentials/fence.md),
-  [git](architecture/credentials/git.md)
+  [git](architecture/credentials/git.md),
+  [gh](architecture/credentials/gh.md)
 - **Inbox**: [model](architecture/inbox/model.md),
   [threads and feed](architecture/inbox/threads-and-feed.md),
   [forms](architecture/inbox/forms.md),

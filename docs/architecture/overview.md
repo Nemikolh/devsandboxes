@@ -112,6 +112,8 @@ the credential kept on this host, by policy, per call.
   chain to, its name constraints and files.
 - [git.md](credentials/git.md): git in the container under a git-host
   claim: its proxy port, settings, credential helper and boot check.
+- [gh.md](credentials/gh.md): `features/gh`'s claim and the tests holding
+  it to gh's calls and GitHub's GraphQL schema.
 - CLI and files: [reference/credentials-cli.md](../reference/credentials-cli.md).
 
 ## The Inbox

@@ -5,6 +5,12 @@
 ### Added
 
 - **sentry-cli without its token in the sandbox.** The new `ghcr.io/devsandboxes/features/sentry` feature installs sentry-cli and claims a `sentry` credential. The sandbox gets a phantom token, and `SENTRY_URL` points at a loopback port that devsandbox's credential broker answers on the host. The broker checks each call against the claim's scopes, swaps the phantom for the real token and calls Sentry, so releases, source-map and debug-file uploads work as before. Any feature can claim a credential the same way, in its `customizations.devsandbox.credentials`.
+- **gh without its token in the sandbox, fenced to the sandbox's repos.** The new `ghcr.io/devsandboxes/features/gh` feature installs the GitHub CLI and claims a `github` credential: gh, git and anything else calling `api.github.com` reach GitHub through devsandbox's credential broker with a phantom token. Calls on the sandbox's own repos (its folders' remotes plus `access.github.repos`) get the real token, scoped per sandbox (`repo.read`, `pr.write`, `pr.merge`, `issues.write`, `git.push`, `releases.write`, `actions.read`, `actions.write`, …); other repos are read anonymously and never written; GraphQL writes are checked by every id they name. Deploy keys, webhooks, runner tokens, secret writes and other routes that would plant access are refused whatever the config. Use it instead of `ghcr.io/devcontainers/features/github-cli`. `gh-update`, run on the host against a shared bin dir the sandboxes mount read-only, updates gh in every sandbox without a rebuild.
+
+  ```bash
+  devsandbox login github --feature ghcr.io/devsandboxes/features/gh:1 --profile work
+  ```
+
 - **`devsandbox login` and `devsandbox access approve`.** `login` stores a credential's secret on this host and approves the claim of the feature it's for, which it shows you first. A feature update that changes its claim stops `run` until you approve the change with `access approve`, which shows what changed. `--profile` limits a credential to the sandboxes of those profiles.
 
   ```bash

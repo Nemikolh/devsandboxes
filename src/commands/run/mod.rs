@@ -3019,6 +3019,230 @@ mod tests {
         });
     }
 
+    /// The gh release `tests/fixtures/gh/routes.json` was derived from, and
+    /// its linux tarballs' sha256 from `gh_<version>_checksums.txt`.
+    const GH_VERSION: &str = "2.105.0";
+    const GH_SHA256: [(&str, &str); 2] = [
+        ("amd64", "79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f"),
+        ("arm64", "b1278c75107423d818f1937fd92cafc9e5e9b606631568f68d7fb816f5885a02"),
+    ];
+
+    /// gh itself through the broker: the pinned gh in a debian image (its
+    /// release tarball checksummed at build), the github fixture's claim
+    /// with `api.github.com` private so the loopback mock is dialed, the
+    /// folder's origin `allowed-org/app` its fence. `gh auth status` exits
+    /// 0 (its `viewer` query, then `GET /`), `gh api` reads the fenced repo
+    /// with the token and `other/lib` anonymously, and a `createPullRequest`
+    /// naming the fenced repo's node id passes while one naming another
+    /// repo's is refused with the broker's reason. The mock sees the token
+    /// only on calls inside the fence, never the phantom.
+    #[cfg(unix)]
+    #[test_utils::docker_test(helper)]
+    fn gh_through_the_broker_end_to_end_with_docker() -> Result<(), String> {
+        isolated("gh_e2e_child")
+    }
+
+    /// The fake api.github.com: two repos by name, id and node id, the
+    /// GraphQL `viewer`, `node(id:)` and `createPullRequest`, the API root.
+    #[cfg(unix)]
+    fn fake_github_api(head: &str, body: &[u8]) -> Vec<u8> {
+        let repo = |id: u64, node: &str, name: &str| {
+            serde_json::json!({ "id": id, "node_id": node, "full_name": name, "private": false })
+        };
+        let (app, lib) = (repo(1, "R_app", "allowed-org/app"), repo(2, "R_lib", "other/lib"));
+        let line = head.lines().next().unwrap_or_default();
+        let target = line.split(' ').nth(1).unwrap_or_default();
+        let gql = String::from_utf8_lossy(body);
+        let json = match (line.split(' ').next().unwrap_or_default(), target) {
+            ("GET", "/") => serde_json::json!({ "current_user_url": "https://api.github.com/user" }),
+            ("GET", "/repos/allowed-org/app" | "/repositories/1") => app,
+            ("GET", "/repos/other/lib" | "/repositories/2") => lib,
+            ("POST", "/graphql") if gql.contains("viewer") => serde_json::json!({ "data": { "viewer": { "login": "octo" } } }),
+            ("POST", "/graphql") if gql.contains("node(id:") => {
+                let (id, node, name) = match gql.contains("R_lib") {
+                    true => (2, "R_lib", "other/lib"),
+                    false => (1, "R_app", "allowed-org/app"),
+                };
+                serde_json::json!({ "data": { "node": {
+                    "__typename": "Repository", "databaseId": id, "id": node, "nameWithOwner": name
+                } } })
+            }
+            ("POST", "/graphql") if gql.contains("createPullRequest") => serde_json::json!({ "data": { "createPullRequest": {
+                "pullRequest": { "url": "https://github.com/allowed-org/app/pull/1" }
+            } } }),
+            _ => {
+                let body = r#"{"message":"Not Found"}"#;
+                return format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    .into_bytes();
+            }
+        };
+        let body = json.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-OAuth-Scopes: \r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_e2e_child() {
+        use std::sync::Arc;
+
+        let Some(root) = isolated_root("gh_e2e_child") else { return };
+        let routes: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/gh/routes.json")).unwrap();
+        assert_eq!(routes["gh"], GH_VERSION, "the e2e runs the gh the route table was derived from");
+        let mut seed = [0u8; 16];
+        getrandom::fill(&mut seed).unwrap();
+        let token = format!("github_pat_REAL{:032x}", u128::from_le_bytes(seed));
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["remote", "add", "origin", "https://github.com/allowed-org/app.git"]);
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/github");
+        let feature = cfg.join("features/github");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::copy(fixture.join("install.sh"), feature.join("install.sh")).unwrap();
+        let json = std::fs::read_to_string(fixture.join("devcontainer-feature.json")).unwrap();
+        let mut metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let upstreams = &mut metadata["customizations"]["devsandbox"]["credentials"]["github"]["upstreams"];
+        for u in upstreams.as_array_mut().unwrap() {
+            if u == "api.github.com" {
+                *u = serde_json::json!({ "host": "api.github.com", "private": true });
+            }
+        }
+        std::fs::write(feature.join("devcontainer-feature.json"), metadata.to_string()).unwrap();
+
+        let name = format!("gh-e2e-{}", std::process::id());
+        let sums: String = GH_SHA256.iter().map(|(arch, sum)| format!("{arch}) sum={sum};; ")).collect();
+        std::fs::write(
+            cfg.join("Dockerfile"),
+            format!(
+                "FROM debian:bookworm-slim\n\
+                 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+                 && rm -rf /var/lib/apt/lists/* && useradd -m -u 1000 dev\n\
+                 RUN set -e; arch=$(dpkg --print-architecture); case $arch in {sums}*) exit 1;; esac; \
+                 curl -fsSL -o /tmp/gh.tgz https://github.com/cli/cli/releases/download/v{GH_VERSION}/gh_{GH_VERSION}_linux_$arch.tar.gz; \
+                 echo \"$sum  /tmp/gh.tgz\" | sha256sum -c -; tar -xzof /tmp/gh.tgz -C /tmp; \
+                 install -m 0755 /tmp/gh_{GH_VERSION}_linux_$arch/bin/gh /usr/local/bin/gh; rm -rf /tmp/gh*\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!(
+                "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+                 features = {{ \"./features/github\" = {{}} }}\n"
+            ),
+        )
+        .unwrap();
+
+        let data = State::path().unwrap().parent().unwrap().to_path_buf();
+        let source = crate::features::FeatureSource::parse("./features/github").unwrap();
+        let claims = crate::features::resolve(&source, &cfg).unwrap().metadata.credentials;
+        let args = crate::commands::login::Args {
+            credential: "github".into(),
+            feature: None,
+            kind: None,
+            profiles: Vec::new(),
+            yes: true,
+            method: None,
+            client_id: None,
+        };
+        let mut term = crate::commands::login::tests::Script::new(false, &[], Some(&token));
+        let mut flows = crate::commands::login::tests::offline();
+        crate::commands::login::login_at(&data, &args, Some(claims), &mut term, &mut flows).unwrap();
+
+        let (mock_port, seen) = crate::broker::serve::tests::upstream_server(fake_github_api);
+
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = image::sandbox_image(&project, &name);
+        let features_image = image::features_image(&project, &name);
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().output_quiet(&["rmi", "-f", &features_image, &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            let [claim] = &info.claims[..] else { panic!("one claim: {:?}", info.claims) };
+            let phantom = claim.phantom.clone();
+            assert_eq!(info.github_repos, ["allowed-org/app"]);
+
+            let mut roots = rustls::RootCertStore::empty();
+            let fixture_ca = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broker/ca.pem");
+            use rustls::pki_types::pem::PemObject;
+            roots.add(rustls::pki_types::CertificateDer::from_pem_file(fixture_ca).unwrap()).unwrap();
+            let upstream = crate::broker::upstream::Upstream::new(roots, None, Default::default()).unwrap();
+            let service = crate::broker::serve::Service::new(State::path().unwrap(), Ok(upstream))
+                .unwrap()
+                .with_authority("api.github.com", &format!("localhost:{mock_port}"));
+            let bridge = crate::devsbd::bridge::spawn_brokered(&name, info, Arc::new(service)).unwrap();
+            assert_eq!(bridge.outcome(std::time::Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+
+            // The helper answers 503 itself until it has seen the bridge's caps.
+            let pr = |node: &str| {
+                format!(
+                    "gh api graphql -f query='mutation{{createPullRequest(input:{{repositoryId:\"{node}\",\
+                     baseRefName:\"main\",headRefName:\"f\",title:\"t\"}}){{pullRequest{{url}}}}}}' 2>&1"
+                )
+            };
+            let script = format!(
+                "cd /tmp; for i in $(seq 50); do gh auth status >/dev/null 2>&1 && break; sleep 0.2; done; \
+                 gh auth status 2>&1; echo status=$?; \
+                 gh api repos/allowed-org/app 2>&1; r=$?; echo; echo allowed=$r; \
+                 gh api -i repos/other/lib 2>&1; r=$?; echo; echo outside=$r; \
+                 {}; r=$?; echo; echo pr_in=$r; \
+                 {}; r=$?; echo; echo pr_out=$r",
+                pr("R_app"),
+                pr("R_lib")
+            );
+            let argv = crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), script], false);
+            let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+            let lines: Vec<&str> = out.lines().collect();
+            for want in ["status=0", "allowed=0", "outside=0", "pr_in=0"] {
+                assert!(lines.contains(&want), "{want} missing:\n{out}");
+            }
+            assert!(!lines.contains(&"pr_out=0"), "{out}");
+            assert!(out.contains("\"full_name\":\"allowed-org/app\""), "{out}");
+            assert!(out.contains("\"full_name\":\"other/lib\""), "{out}");
+            assert!(out.to_ascii_lowercase().contains("devsandbox-fence: outside"), "{out}");
+            assert!(out.contains("https://github.com/allowed-org/app/pull/1"), "{out}");
+            assert!(out.contains("names `other/lib`, outside the instance's repo fence"), "{out}");
+
+            let seen = seen.lock().unwrap().clone();
+            let request = |want: &str| seen.iter().filter(|(head, _)| head.starts_with(want)).count();
+            assert!(request("GET / HTTP/1.1") > 0 && request("GET /repos/other/lib ") == 1, "{seen:#?}");
+            let creates = seen.iter().filter(|(_, b)| String::from_utf8_lossy(b).contains("createPullRequest")).count();
+            assert_eq!(creates, 1, "the refused mutation never reached GitHub");
+            let contains = |hay: &[u8], needle: &str| hay.windows(needle.len()).any(|w| w == needle.as_bytes());
+            for (head, body) in &seen {
+                assert!(!head.contains(&phantom) && !contains(body, &phantom), "{head}");
+                let auth: Vec<&str> = head
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .filter(|(n, _)| n.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.trim())
+                    .collect();
+                match head.starts_with("GET /repos/other/lib ") {
+                    true => assert!(auth.is_empty(), "{head}"),
+                    // gh's own calls, then the home's id lookups.
+                    false => assert!(
+                        auth == [format!("token {token}")] || auth == [format!("Bearer {token}")],
+                        "{head}"
+                    ),
+                }
+            }
+
+            let log = std::fs::read_to_string(data.join("access.log")).unwrap_or_default();
+            assert!(!log.contains(&token) && !log.contains(&phantom), "{log}");
+        });
+    }
+
     #[test]
     fn gc_keeps_worktrees_env_extends_a_given_count() {
         let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {

@@ -1,21 +1,44 @@
 {
-  "id": "github",
+  "id": "gh",
   "version": "1.0.0",
-  "name": "GitHub, brokered and repo-fenced (test fixture)",
-  "description": "Test fixture for the broker's repo fence and git smart HTTP: a small slice of what features/gh will claim, LFS included (docs/plans/active/github-and-sentry-access.md, gh). Its install.sh installs nothing.",
-  "containerEnv": { "GH_TELEMETRY": "false" },
+  "name": "gh, brokered and repo-fenced (test fixture)",
+  "description": "Test fixture mirroring github.com/devsandboxes/features' src/gh: the same metadata and claim (docs/plans/active/github-and-sentry-access.md, gh), keep them in step. Its install.sh installs nothing.",
+  "options": {
+    "version": {
+      "type": "string",
+      "proposals": [
+        "latest"
+      ],
+      "default": "latest",
+      "description": "gh version baked into the image (a release like 2.105.0, or latest). A version gh-update made current in a mounted shared bin dir runs instead."
+    }
+  },
+  "containerEnv": {
+    "GH_TELEMETRY": "false"
+  },
   "customizations": {
     "devsandbox": {
       "credentials": {
         "github": {
-          "upstreams": ["api.github.com", "uploads.github.com", "github.com"],
+          "upstreams": [
+            "api.github.com",
+            "uploads.github.com",
+            "github.com"
+          ],
           "mode": "intercept",
           "inject": [
-            { "header": "Authorization", "format": "token {token}" },
-            { "basic": "x-access-token" }
+            {
+              "header": "Authorization",
+              "format": "token {token}"
+            },
+            {
+              "basic": "x-access-token"
+            }
           ],
           "phantom": {
-            "env": ["GH_TOKEN"],
+            "env": [
+              "GH_TOKEN"
+            ],
             "files": [
               {
                 "path": ".config/gh/hosts.yml",
@@ -24,19 +47,70 @@
             ]
           },
           "tokens": {
-            "as": ["app", "user"],
-            "accept": ["github_pat_", "ghu_"],
+            "as": [
+              "app",
+              "user"
+            ],
+            "accept": [
+              "github_pat_",
+              "ghu_"
+            ],
             "expiry": "github-authentication-token-expiration"
           },
-          "git": { "hosts": ["github.com"] },
-          "lfs": { "hosts": ["github.com"], "upload": "git.push" },
-          "login": [{ "method": "paste" }],
+          "git": {
+            "hosts": [
+              "github.com"
+            ]
+          },
+          "lfs": {
+            "hosts": [
+              "github.com"
+            ],
+            "upload": "git.push"
+          },
+          "login": [
+            {
+              "method": "paste",
+              "hint": "a fine-grained personal access token (github_pat_…) selecting the sandboxes' repos, or a GitHub App user token (ghu_…)"
+            }
+          ],
           "check": "GET /user",
-          "refusal": { "shape": "json", "field": "message" },
+          "refusal": {
+            "shape": "json",
+            "field": "message"
+          },
+          "hold": 300,
           "scopes": {
-            "user.read": { "routes": ["GET /user"], "permissions": {} },
             "api.read": {
-              "routes": ["graphql query", "GET /", "GET /rate_limit", "GET /meta"],
+              "routes": [
+                "graphql query",
+                "GET /",
+                "GET /rate_limit",
+                "GET /meta"
+              ],
+              "permissions": {}
+            },
+            "user.read": {
+              "routes": [
+                "GET /user"
+              ],
+              "permissions": {}
+            },
+            "search.read": {
+              "routes": [
+                "GET /search/repositories",
+                "GET /search/issues",
+                "GET /search/code",
+                "GET /search/commits",
+                "GET /notifications",
+                "GET /users/{user}",
+                "GET /users/{user}/received_events",
+                "GET /gists/{gist_id}",
+                "GET /licenses",
+                "GET /licenses/{license}",
+                "GET /gitignore/templates",
+                "GET /gitignore/templates/{template}"
+              ],
               "permissions": {}
             },
             "repo.read": {
@@ -45,13 +119,215 @@
                 "POST /{repo}/git-upload-pack",
                 "POST /{repo}/info/lfs/objects/batch",
                 "GET /{repo}/info/lfs/locks",
+                "GET /repositories/{id}",
                 "GET /repos/{repo}",
-                "GET /repos/{repo}/pulls",
-                "GET /repos/{repo}/git/ref/tags/{tag}",
+                "HEAD /repos/{repo}",
+                "GET /repos/{repo}/readme",
                 "GET /repos/{repo}/contents/{path}",
-                "GET /repositories/{id}"
+                "GET /repos/{repo}/contents/{dir}/{path}",
+                "GET /repos/{repo}/contents/{dir}/{sub}/{path}",
+                "GET /repos/{repo}/contents/{dir}/{sub}/{subsub}/{path}",
+                "GET /repos/{repo}/contributors",
+                "GET /repos/{repo}/topics",
+                "GET /repos/{repo}/languages",
+                "GET /repos/{repo}/tags",
+                "GET /repos/{repo}/branches",
+                "GET /repos/{repo}/branches/{branch}",
+                "GET /repos/{repo}/branches/{prefix}/{branch}",
+                "GET /repos/{repo}/commits",
+                "GET /repos/{repo}/commits/{ref}",
+                "GET /repos/{repo}/compare/{basehead}",
+                "GET /repos/{repo}/git/ref/heads/{branch}",
+                "GET /repos/{repo}/git/ref/heads/{prefix}/{branch}",
+                "GET /repos/{repo}/git/ref/tags/{tag}",
+                "GET /repos/{repo}/git/refs/heads/{branch}",
+                "GET /repos/{repo}/git/refs/heads/{prefix}/{branch}",
+                "GET /repos/{repo}/git/refs/tags/{tag}",
+                "GET /repos/{repo}/git/commits/{sha}",
+                "GET /repos/{repo}/git/tags/{sha}",
+                "GET /repos/{repo}/git/trees/{sha}",
+                "GET /repos/{repo}/git/blobs/{sha}",
+                "GET /repos/{repo}/rulesets",
+                "GET /repos/{repo}/rulesets/{ruleset_id}",
+                "GET /repos/{repo}/rules/branches/{branch}",
+                "GET /repos/{repo}/rules/branches/{prefix}/{branch}",
+                "GET /repos/{repo}/collaborators",
+                "GET /repos/{repo}/labels",
+                "GET /repos/{repo}/labels/{name}",
+                "GET /repos/{repo}/milestones",
+                "GET /repos/{repo}/milestones/{number}",
+                "GET /repos/{repo}/issues",
+                "GET /repos/{repo}/issues/{number}",
+                "GET /repos/{repo}/issues/{number}/comments",
+                "GET /repos/{repo}/issues/{number}/events",
+                "GET /repos/{repo}/issues/{number}/timeline",
+                "GET /repos/{repo}/issues/{number}/artifacts",
+                "GET /repos/{repo}/issues/{number}/artifacts/{artifact}",
+                "GET /repos/{repo}/issues/comments",
+                "GET /repos/{repo}/issues/comments/{comment_id}",
+                "GET /repos/{repo}/pulls",
+                "GET /repos/{repo}/pulls/{number}",
+                "GET /repos/{repo}/pulls/{number}/files",
+                "GET /repos/{repo}/pulls/{number}/commits",
+                "GET /repos/{repo}/pulls/{number}/comments",
+                "GET /repos/{repo}/pulls/{number}/reviews",
+                "GET /repos/{repo}/pulls/{number}/requested_reviewers",
+                "GET /repos/{repo}/pulls/comments",
+                "GET /repos/{repo}/releases",
+                "GET /repos/{repo}/releases/latest",
+                "GET /repos/{repo}/releases/tags/{tag}",
+                "HEAD /repos/{repo}/releases/tags/{tag}",
+                "GET /repos/{repo}/releases/{release_id}",
+                "GET /repos/{repo}/releases/{release_id}/assets",
+                "GET /repos/{repo}/releases/assets/{asset_id}",
+                "GET /repos/{repo}/tarball/{ref}",
+                "GET /repos/{repo}/zipball/{ref}",
+                "GET /repos/{repo}/attestations/{digest}"
               ],
-              "permissions": { "contents": "read", "metadata": "read" }
+              "permissions": {
+                "contents": "read",
+                "metadata": "read",
+                "issues": "read",
+                "pull_requests": "read"
+              }
+            },
+            "actions.read": {
+              "routes": [
+                "GET /repos/{repo}/actions/runs",
+                "GET /repos/{repo}/actions/runs/{run_id}",
+                "GET /repos/{repo}/actions/runs/{run_id}/jobs",
+                "GET /repos/{repo}/actions/runs/{run_id}/logs",
+                "GET /repos/{repo}/actions/runs/{run_id}/artifacts",
+                "GET /repos/{repo}/actions/runs/{run_id}/attempts/{attempt}",
+                "GET /repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs",
+                "GET /repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/logs",
+                "GET /repos/{repo}/actions/jobs/{job_id}",
+                "GET /repos/{repo}/actions/jobs/{job_id}/logs",
+                "GET /repos/{repo}/actions/artifacts",
+                "GET /repos/{repo}/actions/artifacts/{artifact_id}",
+                "GET /repos/{repo}/actions/artifacts/{artifact_id}/zip",
+                "GET /repos/{repo}/actions/workflows",
+                "GET /repos/{repo}/actions/workflows/{workflow_id}",
+                "GET /repos/{repo}/actions/workflows/{workflow_id}/runs",
+                "GET /repos/{repo}/actions/caches",
+                "GET /repos/{repo}/check-runs/{check_run_id}",
+                "GET /repos/{repo}/check-runs/{check_run_id}/annotations",
+                "GET /repos/{repo}/commits/{ref}/check-runs",
+                "GET /repos/{repo}/commits/{ref}/check-suites",
+                "GET /repos/{repo}/commits/{ref}/status",
+                "GET /repos/{repo}/commits/{ref}/statuses"
+              ],
+              "permissions": {
+                "actions": "read",
+                "checks": "read",
+                "statuses": "read"
+              }
+            },
+            "actions.write": {
+              "routes": [
+                "POST /repos/{repo}/actions/runs/{run_id}/rerun",
+                "POST /repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs",
+                "POST /repos/{repo}/actions/runs/{run_id}/cancel",
+                "POST /repos/{repo}/actions/runs/{run_id}/force-cancel",
+                "DELETE /repos/{repo}/actions/runs/{run_id}",
+                "POST /repos/{repo}/actions/jobs/{job_id}/rerun",
+                "POST /repos/{repo}/actions/workflows/{workflow_id}/dispatches",
+                "PUT /repos/{repo}/actions/workflows/{workflow_id}/enable",
+                "PUT /repos/{repo}/actions/workflows/{workflow_id}/disable",
+                "DELETE /repos/{repo}/actions/caches",
+                "DELETE /repos/{repo}/actions/caches/{cache_id}"
+              ],
+              "permissions": {
+                "actions": "write"
+              }
+            },
+            "pr.write": {
+              "routes": [
+                "POST /repos/{repo}/pulls",
+                "PATCH /repos/{repo}/pulls/{number}",
+                "POST /repos/{repo}/pulls/{number}/requested_reviewers",
+                "DELETE /repos/{repo}/pulls/{number}/requested_reviewers",
+                "POST /repos/{repo}/pulls/{number}/reviews",
+                "POST /repos/{repo}/pulls/{number}/comments",
+                "graphql mutation createPullRequest",
+                "graphql mutation updatePullRequest",
+                "graphql mutation closePullRequest",
+                "graphql mutation reopenPullRequest",
+                "graphql mutation markPullRequestReadyForReview",
+                "graphql mutation convertPullRequestToDraft",
+                "graphql mutation addPullRequestReview",
+                "graphql mutation requestReviews",
+                "graphql mutation requestReviewsByLogin",
+                "graphql mutation revertPullRequest"
+              ],
+              "permissions": {
+                "pull_requests": "write"
+              }
+            },
+            "pr.merge": {
+              "routes": [
+                "PUT /repos/{repo}/pulls/{number}/merge",
+                "graphql mutation mergePullRequest",
+                "graphql mutation enablePullRequestAutoMerge",
+                "graphql mutation disablePullRequestAutoMerge"
+              ],
+              "permissions": {
+                "contents": "write",
+                "pull_requests": "write"
+              }
+            },
+            "issues.write": {
+              "routes": [
+                "POST /repos/{repo}/issues",
+                "PATCH /repos/{repo}/issues/{number}",
+                "POST /repos/{repo}/issues/{number}/comments",
+                "PATCH /repos/{repo}/issues/comments/{comment_id}",
+                "DELETE /repos/{repo}/issues/comments/{comment_id}",
+                "POST /repos/{repo}/issues/{number}/labels",
+                "DELETE /repos/{repo}/issues/{number}/labels/{name}",
+                "POST /repos/{repo}/issues/{number}/artifacts",
+                "PATCH /repos/{repo}/issues/{number}/artifacts/{artifact}",
+                "DELETE /repos/{repo}/issues/{number}/artifacts/{artifact}",
+                "POST /repos/{repo}/labels",
+                "PATCH /repos/{repo}/labels/{name}",
+                "DELETE /repos/{repo}/labels/{name}",
+                "graphql mutation createIssue",
+                "graphql mutation updateIssue",
+                "graphql mutation closeIssue",
+                "graphql mutation reopenIssue",
+                "graphql mutation deleteIssue",
+                "graphql mutation transferIssue",
+                "graphql mutation pinIssue",
+                "graphql mutation unpinIssue",
+                "graphql mutation lockLockable",
+                "graphql mutation unlockLockable",
+                "graphql mutation updateIssueIssueType",
+                "graphql mutation addSubIssue",
+                "graphql mutation removeSubIssue",
+                "graphql mutation addBlockedBy",
+                "graphql mutation removeBlockedBy",
+                "graphql mutation addComment",
+                "graphql mutation updateIssueComment",
+                "graphql mutation deleteIssueComment",
+                "graphql mutation addLabelsToLabelable",
+                "graphql mutation removeLabelsFromLabelable",
+                "graphql mutation replaceActorsForAssignable"
+              ],
+              "permissions": {
+                "issues": "write"
+              }
+            },
+            "discussions.write": {
+              "routes": [
+                "graphql mutation createDiscussion",
+                "graphql mutation updateDiscussion",
+                "graphql mutation addDiscussionComment",
+                "graphql mutation updateDiscussionComment",
+                "graphql mutation deleteDiscussionComment"
+              ],
+              "permissions": {
+                "discussions": "write"
+              }
             },
             "git.push": {
               "routes": [
@@ -60,33 +336,304 @@
                 "POST /{repo}/info/lfs/locks",
                 "POST /{repo}/info/lfs/locks/verify",
                 "POST /{repo}/info/lfs/locks/{id}/unlock",
-                "graphql mutation createCommitOnBranch"
+                "POST /repos/{repo}/forks",
+                "POST /repos/{repo}/merge-upstream",
+                "POST /repos/{repo}/git/refs",
+                "PATCH /repos/{repo}/git/refs/heads/{branch}",
+                "PATCH /repos/{repo}/git/refs/heads/{prefix}/{branch}",
+                "PATCH /repos/{repo}/git/refs/tags/{tag}",
+                "DELETE /repos/{repo}/git/refs/heads/{branch}",
+                "DELETE /repos/{repo}/git/refs/heads/{prefix}/{branch}",
+                "DELETE /repos/{repo}/git/refs/tags/{tag}",
+                "graphql mutation createCommitOnBranch",
+                "graphql mutation createRef",
+                "graphql mutation updateRef",
+                "graphql mutation deleteRef",
+                "graphql mutation updatePullRequestBranch",
+                "graphql mutation createLinkedBranch"
               ],
-              "permissions": { "contents": "write" }
+              "permissions": {
+                "contents": "write"
+              }
             },
-            "pr.write": {
-              "routes": ["POST /repos/{repo}/pulls", "graphql mutation createPullRequest"],
-              "permissions": { "pull_requests": "write" }
-            },
-            "issues.write": {
-              "routes": ["graphql mutation addComment"],
-              "permissions": { "issues": "write" }
+            "releases.write": {
+              "routes": [
+                "POST /repos/{repo}/releases",
+                "POST /repos/{repo}/releases/generate-notes",
+                "PATCH /repos/{repo}/releases/{release_id}",
+                "DELETE /repos/{repo}/releases/{release_id}",
+                "POST /repos/{repo}/releases/{release_id}/assets",
+                "PATCH /repos/{repo}/releases/assets/{asset_id}",
+                "DELETE /repos/{repo}/releases/assets/{asset_id}"
+              ],
+              "permissions": {
+                "contents": "write"
+              }
             }
           },
           "never": [
             "GET /repos/{repo}/keys",
             "POST /repos/{repo}/keys",
-            "POST /repos/{repo}/hooks"
+            "POST /user/keys",
+            "POST /user/gpg_keys",
+            "POST /user/ssh_signing_keys",
+            "POST /repos/{repo}/hooks",
+            "PATCH /repos/{repo}/hooks/{hook_id}",
+            "POST /orgs/{org}/hooks",
+            "PATCH /orgs/{org}/hooks/{hook_id}",
+            "PUT /repos/{repo}/collaborators/{user}",
+            "PUT /orgs/{org}/memberships/{user}",
+            "POST /orgs/{org}/invitations",
+            "POST /repos/{repo}/actions/runners/registration-token",
+            "POST /repos/{repo}/actions/runners/remove-token",
+            "POST /repos/{repo}/actions/runners/generate-jitconfig",
+            "POST /orgs/{org}/actions/runners/registration-token",
+            "POST /orgs/{org}/actions/runners/remove-token",
+            "POST /orgs/{org}/actions/runners/generate-jitconfig",
+            "PUT /repos/{repo}/actions/secrets/{name}",
+            "PUT /repos/{repo}/dependabot/secrets/{name}",
+            "PUT /repos/{repo}/codespaces/secrets/{name}",
+            "PUT /repos/{repo}/environments/{env}/secrets/{name}",
+            "PUT /orgs/{org}/actions/secrets/{name}",
+            "PUT /orgs/{org}/dependabot/secrets/{name}",
+            "PUT /orgs/{org}/codespaces/secrets/{name}",
+            "PUT /user/codespaces/secrets/{name}",
+            "POST /app/installations/{installation_id}/access_tokens",
+            "POST /applications/{client_id}/token",
+            "PATCH /applications/{client_id}/token",
+            "POST /applications/{client_id}/token/scoped",
+            "POST /authorizations"
+          ],
+          "presence": [
+            {
+              "ref": "refs/tags/*"
+            },
+            {
+              "ref": "refs/heads/*",
+              "on": [
+                "delete"
+              ]
+            },
+            {
+              "route": "POST /repos/{repo}/git/refs",
+              "target": "ref"
+            },
+            {
+              "route": "PATCH /repos/{repo}/git/refs/tags/{tag}",
+              "target": "{tag}"
+            },
+            {
+              "route": "DELETE /repos/{repo}/git/refs/tags/{tag}",
+              "target": "{tag}"
+            },
+            {
+              "route": "DELETE /repos/{repo}/git/refs/heads/{branch}",
+              "target": "{branch}"
+            },
+            {
+              "route": "DELETE /repos/{repo}/git/refs/heads/{prefix}/{branch}",
+              "target": "{branch}"
+            },
+            {
+              "route": "POST /repos/{repo}/releases",
+              "target": "tag_name"
+            },
+            {
+              "route": "PATCH /repos/{repo}/releases/{release_id}",
+              "target": "{release_id}"
+            },
+            {
+              "route": "graphql mutation createRef",
+              "target": "input.name"
+            },
+            {
+              "route": "graphql mutation updateRef",
+              "target": "input.refId"
+            },
+            {
+              "route": "graphql mutation deleteRef",
+              "target": "input.refId"
+            }
           ],
           "fence": {
-            "POST /repos/{repo}/pulls": ["{repo}"],
-            "GET /repositories/{id}": ["{id}"],
-            "graphql mutation createPullRequest": ["input.repositoryId", "input.headRepositoryId"],
-            "graphql mutation addComment": ["input.subjectId"],
-            "graphql mutation createCommitOnBranch": ["input.branch.repositoryNameWithOwner", "input.branch.id"]
+            "GET /repositories/{id}": [
+              "{id}"
+            ],
+            "POST /repos/{repo}/forks": [
+              "organization"
+            ],
+            "graphql mutation createPullRequest": [
+              "input.repositoryId",
+              "input.headRepositoryId"
+            ],
+            "graphql mutation updatePullRequest": [
+              "input.pullRequestId",
+              "input.labelIds[]",
+              "input.milestoneId",
+              "input.projectIds[]"
+            ],
+            "graphql mutation closePullRequest": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation reopenPullRequest": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation markPullRequestReadyForReview": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation convertPullRequestToDraft": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation addPullRequestReview": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation requestReviews": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation requestReviewsByLogin": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation revertPullRequest": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation mergePullRequest": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation enablePullRequestAutoMerge": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation disablePullRequestAutoMerge": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation createIssue": [
+              "input.repositoryId",
+              "input.labelIds[]",
+              "input.milestoneId",
+              "input.projectIds[]",
+              "input.projectV2Ids[]",
+              "input.parentIssueId",
+              "input.agentAssignment.targetRepositoryId"
+            ],
+            "graphql mutation updateIssue": [
+              "input.id",
+              "input.labelIds[]",
+              "input.labels[].labelId",
+              "input.milestoneId",
+              "input.projectIds[]",
+              "input.stateInput.duplicateIssueId",
+              "input.agentAssignment.targetRepositoryId"
+            ],
+            "graphql mutation closeIssue": [
+              "input.issueId",
+              "input.duplicateIssueId"
+            ],
+            "graphql mutation reopenIssue": [
+              "input.issueId"
+            ],
+            "graphql mutation deleteIssue": [
+              "input.issueId"
+            ],
+            "graphql mutation transferIssue": [
+              "input.issueId",
+              "input.repositoryId"
+            ],
+            "graphql mutation pinIssue": [
+              "input.issueId"
+            ],
+            "graphql mutation unpinIssue": [
+              "input.issueId"
+            ],
+            "graphql mutation lockLockable": [
+              "input.lockableId"
+            ],
+            "graphql mutation unlockLockable": [
+              "input.lockableId"
+            ],
+            "graphql mutation updateIssueIssueType": [
+              "input.issueId"
+            ],
+            "graphql mutation addSubIssue": [
+              "input.issueId",
+              "input.subIssueId"
+            ],
+            "graphql mutation removeSubIssue": [
+              "input.issueId",
+              "input.subIssueId"
+            ],
+            "graphql mutation addBlockedBy": [
+              "input.issueId",
+              "input.blockingIssueId"
+            ],
+            "graphql mutation removeBlockedBy": [
+              "input.issueId",
+              "input.blockingIssueId"
+            ],
+            "graphql mutation addComment": [
+              "input.subjectId"
+            ],
+            "graphql mutation updateIssueComment": [
+              "input.id"
+            ],
+            "graphql mutation deleteIssueComment": [
+              "input.id"
+            ],
+            "graphql mutation addLabelsToLabelable": [
+              "input.labelableId",
+              "input.labelIds[]",
+              "input.labels[].labelId"
+            ],
+            "graphql mutation removeLabelsFromLabelable": [
+              "input.labelableId",
+              "input.labelIds[]"
+            ],
+            "graphql mutation replaceActorsForAssignable": [
+              "input.assignableId",
+              "input.agentAssignment.targetRepositoryId"
+            ],
+            "graphql mutation createDiscussion": [
+              "input.repositoryId",
+              "input.categoryId"
+            ],
+            "graphql mutation updateDiscussion": [
+              "input.discussionId",
+              "input.categoryId"
+            ],
+            "graphql mutation addDiscussionComment": [
+              "input.discussionId",
+              "input.replyToId"
+            ],
+            "graphql mutation updateDiscussionComment": [
+              "input.commentId"
+            ],
+            "graphql mutation deleteDiscussionComment": [
+              "input.id"
+            ],
+            "graphql mutation createCommitOnBranch": [
+              "input.branch.repositoryNameWithOwner",
+              "input.branch.id"
+            ],
+            "graphql mutation createRef": [
+              "input.repositoryId"
+            ],
+            "graphql mutation updateRef": [
+              "input.refId"
+            ],
+            "graphql mutation deleteRef": [
+              "input.refId"
+            ],
+            "graphql mutation updatePullRequestBranch": [
+              "input.pullRequestId"
+            ],
+            "graphql mutation createLinkedBranch": [
+              "input.issueId",
+              "input.repositoryId"
+            ]
           }
         }
       }
     }
-  }
+  },
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils"
+  ]
 }

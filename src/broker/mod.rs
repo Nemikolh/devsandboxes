@@ -34,6 +34,8 @@
 #[cfg(unix)]
 pub mod audit;
 pub mod body;
+#[cfg(test)]
+mod gh_claim;
 #[cfg(unix)]
 pub mod github;
 pub mod graphql;

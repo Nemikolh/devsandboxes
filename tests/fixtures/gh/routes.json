@@ -1,0 +1,589 @@
+{
+  "gh": "2.105.0",
+  "source": "https://github.com/cli/cli/tree/v2.105.0",
+  "regenerate": "docs/architecture/credentials/gh.md#the-route-table",
+  "commands": {
+    "auth status": [
+      "graphql query",
+      "GET /"
+    ],
+    "api user": [
+      "GET /user"
+    ],
+    "api rate_limit": [
+      "GET /rate_limit"
+    ],
+    "api repos/{repo}": [
+      "GET /repos/acme/app"
+    ],
+    "browse": [
+      "graphql query"
+    ],
+    "status": [
+      "graphql query",
+      "GET /notifications?all=true&participating=true",
+      "GET /search/issues?q=is%3Aopen",
+      "GET /users/octo/received_events"
+    ],
+    "search repos": [
+      "GET /search/repositories?q=x"
+    ],
+    "search issues": [
+      "GET /search/issues?q=x"
+    ],
+    "search prs": [
+      "GET /search/issues?q=x+type%3Apr"
+    ],
+    "search code": [
+      "GET /search/code?q=x"
+    ],
+    "search commits": [
+      "GET /search/commits?q=x"
+    ],
+    "repo view": [
+      "graphql query",
+      "GET /repos/acme/app/readme"
+    ],
+    "repo clone": [
+      "graphql query",
+      "GET /acme/app.git/info/refs?service=git-upload-pack",
+      "POST /acme/app.git/git-upload-pack"
+    ],
+    "repo list": [
+      "graphql query"
+    ],
+    "repo credits": [
+      "GET /repos/acme/app/contributors?per_page=100"
+    ],
+    "repo license list": [
+      "GET /licenses"
+    ],
+    "repo license view": [
+      "GET /licenses/mit"
+    ],
+    "repo gitignore list": [
+      "GET /gitignore/templates"
+    ],
+    "repo gitignore view": [
+      "GET /gitignore/templates/Rust"
+    ],
+    "repo sync": [
+      "graphql query",
+      "POST /repos/acme/app/merge-upstream",
+      "GET /repos/acme/app/git/refs/heads%2Fmain",
+      "PATCH /repos/acme/app/git/refs/heads%2Fmain",
+      "PATCH /repos/acme/app/git/refs/heads%2Ffeature%2Fx"
+    ],
+    "repo read-file": [
+      "GET /repos/acme/app/contents/src%2Fmain.rs?ref=main"
+    ],
+    "pr list": [
+      "graphql query"
+    ],
+    "pr view": [
+      "graphql query"
+    ],
+    "pr status": [
+      "graphql query"
+    ],
+    "pr checks": [
+      "graphql query"
+    ],
+    "pr diff": [
+      "graphql query",
+      "GET /repos/acme/app/pulls/12"
+    ],
+    "pr checkout": [
+      "graphql query",
+      "GET /acme/app.git/info/refs?service=git-upload-pack",
+      "POST /acme/app.git/git-upload-pack"
+    ],
+    "pr create": [
+      "graphql query",
+      "graphql mutation createPullRequest",
+      "graphql mutation requestReviews",
+      "graphql mutation requestReviewsByLogin",
+      "graphql mutation updatePullRequest",
+      "graphql mutation addLabelsToLabelable",
+      "graphql mutation replaceActorsForAssignable",
+      "GET /acme/app.git/info/refs?service=git-receive-pack",
+      "POST /acme/app.git/git-receive-pack"
+    ],
+    "pr edit": [
+      "graphql query",
+      "graphql mutation updatePullRequest",
+      "graphql mutation addLabelsToLabelable",
+      "graphql mutation removeLabelsFromLabelable",
+      "graphql mutation replaceActorsForAssignable",
+      "graphql mutation requestReviewsByLogin",
+      "POST /repos/acme/app/pulls/12/requested_reviewers",
+      "DELETE /repos/acme/app/pulls/12/requested_reviewers"
+    ],
+    "pr close": [
+      "graphql query",
+      "graphql mutation closePullRequest",
+      "DELETE /repos/acme/app/git/refs/heads%2Ffeature"
+    ],
+    "pr reopen": [
+      "graphql query",
+      "graphql mutation reopenPullRequest"
+    ],
+    "pr ready": [
+      "graphql query",
+      "graphql mutation markPullRequestReadyForReview",
+      "graphql mutation convertPullRequestToDraft"
+    ],
+    "pr review": [
+      "graphql query",
+      "graphql mutation addPullRequestReview"
+    ],
+    "pr comment": [
+      "graphql query",
+      "graphql mutation addComment",
+      "graphql mutation updateIssueComment",
+      "graphql mutation deleteIssueComment"
+    ],
+    "pr merge": [
+      "graphql query",
+      "graphql mutation mergePullRequest",
+      "graphql mutation enablePullRequestAutoMerge",
+      "graphql mutation disablePullRequestAutoMerge",
+      "DELETE /repos/acme/app/git/refs/heads%2Ffeature",
+      "DELETE /repos/acme/app/git/refs/heads%2Fuser%2Ffeature"
+    ],
+    "pr update-branch": [
+      "graphql query",
+      "graphql mutation updatePullRequestBranch"
+    ],
+    "pr revert": [
+      "graphql query",
+      "graphql mutation revertPullRequest"
+    ],
+    "pr lock": [
+      "graphql query",
+      "graphql mutation lockLockable",
+      "graphql mutation unlockLockable"
+    ],
+    "issue list": [
+      "graphql query"
+    ],
+    "issue view": [
+      "graphql query"
+    ],
+    "issue status": [
+      "graphql query"
+    ],
+    "issue create": [
+      "graphql query",
+      "graphql mutation createIssue",
+      "graphql mutation addSubIssue",
+      "graphql mutation addBlockedBy",
+      "graphql mutation updateIssueIssueType"
+    ],
+    "issue edit": [
+      "graphql query",
+      "graphql mutation updateIssue",
+      "graphql mutation addLabelsToLabelable",
+      "graphql mutation removeLabelsFromLabelable",
+      "graphql mutation replaceActorsForAssignable",
+      "graphql mutation addSubIssue",
+      "graphql mutation removeSubIssue",
+      "graphql mutation addBlockedBy",
+      "graphql mutation removeBlockedBy",
+      "graphql mutation updateIssueIssueType"
+    ],
+    "issue close": [
+      "graphql query",
+      "graphql mutation closeIssue"
+    ],
+    "issue reopen": [
+      "graphql query",
+      "graphql mutation reopenIssue"
+    ],
+    "issue delete": [
+      "graphql query",
+      "graphql mutation deleteIssue"
+    ],
+    "issue transfer": [
+      "graphql query",
+      "graphql mutation transferIssue"
+    ],
+    "issue pin": [
+      "graphql query",
+      "graphql mutation pinIssue",
+      "graphql mutation unpinIssue"
+    ],
+    "issue lock": [
+      "graphql query",
+      "graphql mutation lockLockable",
+      "graphql mutation unlockLockable"
+    ],
+    "issue comment": [
+      "graphql query",
+      "graphql mutation addComment",
+      "graphql mutation updateIssueComment",
+      "graphql mutation deleteIssueComment"
+    ],
+    "issue develop": [
+      "graphql query",
+      "graphql mutation createLinkedBranch"
+    ],
+    "issue artifact": [
+      "GET /repos/acme/app/issues/7/artifacts",
+      "GET /repos/acme/app/issues/7/artifacts/1",
+      "POST /repos/acme/app/issues/7/artifacts",
+      "PATCH /repos/acme/app/issues/7/artifacts/1",
+      "DELETE /repos/acme/app/issues/7/artifacts/1"
+    ],
+    "label list": [
+      "graphql query"
+    ],
+    "label create": [
+      "POST /repos/acme/app/labels",
+      "PATCH /repos/acme/app/labels/bug"
+    ],
+    "label edit": [
+      "PATCH /repos/acme/app/labels/bug"
+    ],
+    "label delete": [
+      "DELETE /repos/acme/app/labels/bug"
+    ],
+    "label clone": [
+      "graphql query",
+      "POST /repos/acme/app/labels"
+    ],
+    "discussion list": [
+      "graphql query"
+    ],
+    "discussion create": [
+      "graphql query",
+      "graphql mutation createDiscussion",
+      "graphql mutation addLabelsToLabelable"
+    ],
+    "discussion edit": [
+      "graphql query",
+      "graphql mutation updateDiscussion",
+      "graphql mutation addLabelsToLabelable",
+      "graphql mutation removeLabelsFromLabelable"
+    ],
+    "discussion comment": [
+      "graphql query",
+      "graphql mutation addDiscussionComment",
+      "graphql mutation updateDiscussionComment",
+      "graphql mutation deleteDiscussionComment"
+    ],
+    "release list": [
+      "graphql query"
+    ],
+    "release view": [
+      "GET /repos/acme/app/releases/latest",
+      "GET /repos/acme/app/releases/tags/v1.2.3",
+      "GET /repos/acme/app/git/ref/tags%2Fv1.2.3",
+      "GET /repos/acme/app/releases/42"
+    ],
+    "release create": [
+      "graphql query",
+      "HEAD /repos/acme/app/releases/tags/v1.2.3",
+      "GET /repos/acme/app/tags?per_page=100",
+      "GET /repos/acme/app/compare/v1.2.2...HEAD",
+      "POST /repos/acme/app/releases/generate-notes",
+      "POST /repos/acme/app/releases",
+      "POST /repos/acme/app/releases/42/assets?name=app.tar.gz",
+      "PATCH /repos/acme/app/releases/42",
+      "DELETE /repos/acme/app/releases/42"
+    ],
+    "release edit": [
+      "GET /repos/acme/app/releases/tags/v1.2.3",
+      "PATCH /repos/acme/app/releases/42"
+    ],
+    "release upload": [
+      "GET /repos/acme/app/releases/tags/v1.2.3",
+      "POST /repos/acme/app/releases/42/assets?name=app.tar.gz&label=",
+      "DELETE /repos/acme/app/releases/assets/9"
+    ],
+    "release download": [
+      "GET /repos/acme/app/releases/tags/v1.2.3",
+      "GET /repos/acme/app/releases/assets/9",
+      "GET /repos/acme/app/tarball/v1.2.3",
+      "GET /repos/acme/app/zipball/v1.2.3"
+    ],
+    "release delete": [
+      "GET /repos/acme/app/releases/tags/v1.2.3",
+      "DELETE /repos/acme/app/releases/42",
+      "DELETE /repos/acme/app/git/refs/tags%2Fv1.2.3"
+    ],
+    "release delete-asset": [
+      "GET /repos/acme/app/releases/tags/v1.2.3",
+      "DELETE /repos/acme/app/releases/assets/9"
+    ],
+    "release verify": [
+      "GET /repos/acme/app/releases/tags/v1.2.3",
+      "GET /repos/acme/app/attestations/sha256:abc"
+    ],
+    "run list": [
+      "GET /repos/acme/app/actions/runs?per_page=20",
+      "GET /repos/acme/app/actions/workflows/7/runs",
+      "GET /repos/acme/app/actions/workflows?per_page=100"
+    ],
+    "run view": [
+      "GET /repos/acme/app/actions/runs/5",
+      "GET /repos/acme/app/actions/runs/5/attempts/2",
+      "GET /repos/acme/app/actions/runs/5/jobs",
+      "GET /repos/acme/app/actions/runs/5/attempts/2/jobs",
+      "GET /repos/acme/app/actions/runs/5/artifacts",
+      "GET /repos/acme/app/actions/jobs/11",
+      "GET /repos/acme/app/actions/jobs/11/logs",
+      "GET /repos/acme/app/actions/runs/5/logs",
+      "GET /repos/acme/app/actions/runs/5/attempts/2/logs",
+      "GET /repos/acme/app/check-runs/11/annotations",
+      "GET /repos/acme/app/actions/workflows/7"
+    ],
+    "run watch": [
+      "GET /repos/acme/app/actions/runs/5",
+      "GET /repos/acme/app/actions/runs/5/jobs",
+      "GET /repos/acme/app/check-runs/11/annotations"
+    ],
+    "run download": [
+      "GET /repos/acme/app/actions/runs/5/artifacts",
+      "GET /repos/acme/app/actions/artifacts",
+      "GET /repos/acme/app/actions/artifacts/3/zip"
+    ],
+    "run rerun": [
+      "GET /repos/acme/app/actions/runs/5",
+      "POST /repos/acme/app/actions/runs/5/rerun",
+      "POST /repos/acme/app/actions/runs/5/rerun-failed-jobs",
+      "POST /repos/acme/app/actions/jobs/11/rerun"
+    ],
+    "run cancel": [
+      "GET /repos/acme/app/actions/runs/5",
+      "POST /repos/acme/app/actions/runs/5/cancel",
+      "POST /repos/acme/app/actions/runs/5/force-cancel"
+    ],
+    "run delete": [
+      "GET /repos/acme/app/actions/runs/5",
+      "DELETE /repos/acme/app/actions/runs/5"
+    ],
+    "workflow list": [
+      "GET /repos/acme/app/actions/workflows?per_page=100"
+    ],
+    "workflow view": [
+      "GET /repos/acme/app/actions/workflows/ci.yml",
+      "GET /repos/acme/app/contents/.github%2Fworkflows%2Fci.yml?ref=main",
+      "GET /repos/acme/app/actions/workflows/7/runs"
+    ],
+    "workflow run": [
+      "GET /repos/acme/app/actions/workflows/ci.yml",
+      "GET /repos/acme/app/contents/.github%2Fworkflows%2Fci.yml",
+      "POST /repos/acme/app/actions/workflows/7/dispatches"
+    ],
+    "workflow enable": [
+      "GET /repos/acme/app/actions/workflows?per_page=100",
+      "PUT /repos/acme/app/actions/workflows/7/enable"
+    ],
+    "workflow disable": [
+      "GET /repos/acme/app/actions/workflows?per_page=100",
+      "PUT /repos/acme/app/actions/workflows/7/disable"
+    ],
+    "cache list": [
+      "GET /repos/acme/app/actions/caches?per_page=30"
+    ],
+    "cache delete": [
+      "DELETE /repos/acme/app/actions/caches/8",
+      "DELETE /repos/acme/app/actions/caches?key=cargo-abc",
+      "GET /repos/acme/app/actions/caches?per_page=100"
+    ],
+    "ruleset list": [
+      "graphql query"
+    ],
+    "ruleset view": [
+      "graphql query",
+      "GET /repos/acme/app/rulesets/3"
+    ],
+    "ruleset check": [
+      "GET /repos/acme/app/rules/branches/main",
+      "GET /repos/acme/app/rules/branches/feature%2Fx"
+    ],
+    "extension install": [
+      "GET /repos/acme/gh-ext",
+      "GET /repos/acme/gh-ext/releases/latest",
+      "GET /repos/acme/gh-ext/releases/tags/v1",
+      "GET /repos/acme/gh-ext/commits/main",
+      "GET /repos/acme/gh-ext/contents/gh-ext"
+    ],
+    "skills install": [
+      "GET /repos/acme/skills",
+      "GET /repos/acme/skills/releases/latest",
+      "GET /repos/acme/skills/git/ref/tags%2Fv1",
+      "GET /repos/acme/skills/git/ref/heads%2Fmain",
+      "GET /repos/acme/skills/git/tags/abc",
+      "GET /repos/acme/skills/commits/main",
+      "GET /repos/acme/skills/git/trees/abc?recursive=1",
+      "GET /repos/acme/skills/git/blobs/abc",
+      "GET /repos/acme/skills/contents/skills%2Fx%2FSKILL.md",
+      "GET /search/code?q=filename%3ASKILL.md"
+    ],
+    "attestation verify": [
+      "GET /repos/acme/app/attestations/sha256:abc"
+    ],
+    "git fetch": [
+      "GET /acme/app.git/info/refs?service=git-upload-pack",
+      "POST /acme/app.git/git-upload-pack",
+      "POST /acme/app.git/info/lfs/objects/batch"
+    ],
+    "git push": [
+      "GET /acme/app.git/info/refs?service=git-receive-pack",
+      "POST /acme/app.git/git-receive-pack",
+      "POST /acme/app.git/info/lfs/objects/batch",
+      "POST /acme/app.git/info/lfs/locks/verify"
+    ],
+    "git lfs locks": [
+      "GET /acme/app.git/info/lfs/locks",
+      "POST /acme/app.git/info/lfs/locks",
+      "POST /acme/app.git/info/lfs/locks/1/unlock"
+    ],
+    "repo fork": [
+      "graphql query",
+      "POST /repos/acme/app/forks"
+    ]
+  },
+  "outside": {
+    "repo create": {
+      "why": "a new repo is outside every fence, and creating one is no repo's write",
+      "calls": [
+        "POST /user/repos",
+        "POST /orgs/acme/repos",
+        "graphql mutation createRepository",
+        "graphql mutation cloneTemplateRepository"
+      ]
+    },
+    "repo edit": {
+      "why": "repo settings take the administration permission, which no scope maps to",
+      "calls": [
+        "PATCH /repos/acme/app",
+        "PUT /repos/acme/app/topics",
+        "graphql mutation updateRepository"
+      ]
+    },
+    "repo rename": {
+      "why": "administration",
+      "calls": [
+        "PATCH /repos/acme/app"
+      ]
+    },
+    "repo archive": {
+      "why": "administration",
+      "calls": [
+        "graphql mutation archiveRepository",
+        "graphql mutation unarchiveRepository"
+      ]
+    },
+    "repo delete": {
+      "why": "administration",
+      "calls": [
+        "DELETE /repos/acme/app"
+      ]
+    },
+    "repo autolink": {
+      "why": "administration",
+      "calls": [
+        "GET /repos/acme/app/autolinks",
+        "POST /repos/acme/app/autolinks",
+        "DELETE /repos/acme/app/autolinks/1"
+      ]
+    },
+    "secret": {
+      "why": "secrets steer workflows; writes are `never`, the rest is out of the table",
+      "calls": [
+        "GET /repos/acme/app/actions/secrets",
+        "GET /repos/acme/app/actions/secrets/public-key",
+        "DELETE /repos/acme/app/actions/secrets/TOKEN",
+        "GET /user/codespaces/secrets"
+      ]
+    },
+    "variable": {
+      "why": "variables steer workflows",
+      "calls": [
+        "GET /repos/acme/app/actions/variables",
+        "POST /repos/acme/app/actions/variables",
+        "PATCH /repos/acme/app/actions/variables/X",
+        "DELETE /repos/acme/app/actions/variables/X",
+        "PATCH /repositories/1/environments/prod/variables/X"
+      ]
+    },
+    "gist": {
+      "why": "a gist is no repo: writes are `other` (github-and-sentry-access, Routes it can't)",
+      "calls": [
+        "POST /gists",
+        "PATCH /gists/abc",
+        "DELETE /gists/abc"
+      ]
+    },
+    "project": {
+      "why": "Projects belong to an owner, not a repo",
+      "calls": [
+        "graphql mutation addProjectV2ItemById",
+        "graphql mutation deleteProjectV2Item",
+        "graphql mutation updateProjectV2ItemFieldValue",
+        "graphql mutation createProjectV2"
+      ]
+    },
+    "ssh-key list": {
+      "why": "account keys are out of the table",
+      "calls": [
+        "GET /user/keys",
+        "GET /user/ssh_signing_keys",
+        "DELETE /user/keys/1"
+      ]
+    },
+    "gpg-key list": {
+      "why": "account keys are out of the table",
+      "calls": [
+        "GET /user/gpg_keys",
+        "DELETE /user/gpg_keys/1"
+      ]
+    },
+    "org list": {
+      "why": "org reads and rulesets aren't a repo's",
+      "calls": [
+        "GET /orgs/acme/rulesets/3",
+        "GET /orgs/acme/attestations/sha256:abc"
+      ]
+    },
+    "skills publish": {
+      "why": "security and administration reads",
+      "calls": [
+        "GET /repos/acme/skills/code-scanning/alerts",
+        "GET /repos/acme/skills/vulnerability-alerts",
+        "PATCH /repos/acme/skills/immutable-releases"
+      ]
+    },
+    "codespace": {
+      "why": "another API surface, out of the claim",
+      "calls": [
+        "GET /user/codespaces",
+        "POST /repos/acme/app/codespaces"
+      ]
+    }
+  },
+  "never": {
+    "repo deploy-key": [
+      "GET /repos/acme/app/keys",
+      "POST /repos/acme/app/keys"
+    ],
+    "ssh-key add": [
+      "POST /user/keys",
+      "POST /user/ssh_signing_keys"
+    ],
+    "gpg-key add": [
+      "POST /user/gpg_keys"
+    ],
+    "secret set": [
+      "PUT /repos/acme/app/actions/secrets/TOKEN",
+      "PUT /repos/acme/app/dependabot/secrets/TOKEN",
+      "PUT /repos/acme/app/codespaces/secrets/TOKEN",
+      "PUT /repos/acme/app/environments/prod/secrets/TOKEN",
+      "PUT /orgs/acme/actions/secrets/TOKEN",
+      "PUT /user/codespaces/secrets/TOKEN"
+    ]
+  }
+}

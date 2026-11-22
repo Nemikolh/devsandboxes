@@ -17,11 +17,12 @@ limitation means editing this file in the same commit.
   `access approve|ls|revoke`, the member CA and intercept mode),
   github-and-sentry-access step 1 (sentry-cli through `features/sentry`)
   and git-gateway step 1 (git through the broker with the repo fence, LFS
-  and the relay's key filtering) are done, and the fence resolves to repo
-  ids and GraphQL mutations are mapped to scopes and placed by their
-  input ids; now github-and-sentry-access step 2: `features/gh` and its
-  scope table, with the test walking GitHub's GraphQL schema.
-  → [plan](plans/active/github-and-sentry-access.md)
+  and the relay's key filtering) are done, and so is github-and-sentry-access
+  step 2's `features/gh` (its scope table checked against gh 2.105.0's
+  calls and GitHub's GraphQL schema, gh end to end through the broker);
+  now the live config moving to it.
+  → [plan](plans/active/github-and-sentry-access.md),
+  [gh](architecture/credentials/gh.md)
 
 ## Planned
 
@@ -384,11 +385,9 @@ is frozen: no new work on it.
   ([fence](architecture/credentials/fence.md#enforcement)) and on
   GraphQL mutations' `fence` inputs
   ([broker](architecture/credentials/broker.md#graphql)); REST body-named
-  inputs are refused (github-and-sentry-access step 2). A GraphQL input
+  inputs are refused, so `gh repo fork` (its `organization`) is. A GraphQL input
   naming a renamed repo by its old `owner/name` is refused, not
-  redirected (the body goes as sent). Nothing yet checks that a claim's
-  `fence` names every repo- or object-naming input of its mutations (the
-  schema-walk test comes with the real `features/gh` claim). A fence entry's pin ([ids](architecture/credentials/fence.md#ids))
+  redirected (the body goes as sent). A fence entry's pin ([ids](architecture/credentials/fence.md#ids))
   is never dropped, not even by `access forget`: a repo deleted and
   re-created under its name stays outside its entry. A pinned repo
   renamed again is called by its previous name until the cached answer
@@ -400,9 +399,7 @@ is frozen: no new work on it.
   answers them 404, and git-lfs must be run again; an injected batch
   response that isn't JSON or is over the rewrite bound passes with its
   actions' headers (only the injected token masked); transfer adapters
-  other than `basic` (tus, ssh) aren't rewritten. Only
-  the github test fixture claims a fence: the real `features/gh` claim is
-  github-and-sentry-access step 2. No token and registration
+  other than `basic` (tus, ssh) aren't rewritten. No token and registration
   endpoints a claim could mark (no claim field). A credential marked
   broken notifies no approver (credential-broker step 4). Policy reads no
   request body beyond an LFS batch's `operation` and a GraphQL request's
@@ -411,6 +408,17 @@ is frozen: no new work on it.
   (no dashboard view, nor in `access ls`).
   → [broker](architecture/credentials/broker.md); `broker::policy::decide`,
   `broker::serve::Service`
+- `features/gh`: a route variable takes one segment, so a contents path
+  deeper than four segments or a branch name with two `/` is `other`;
+  `node(id:)` resolves no discussion comment, so replying to, editing or
+  deleting one is refused, as are Projects (`gh pr create --project`)
+  and repo settings (no scope maps `administration`). Its claim logs in
+  by paste only (a `device` login needs an app's client id in the
+  claim). The shared bin dir `gh-update` fills is mounted by the config,
+  not the feature (the feature schema has no read-only mount), and
+  nothing runs `gh-update` on a schedule. The test fixture mirrors the
+  features repo's claim by hand.
+  → [gh](architecture/credentials/gh.md)
 - The agent relay's key filter under a git-host claim signs a named
   key's login with no confirmation (confirm-on-sign is a permission
   request, credential-broker step 4). A destination key's forwarding hops

@@ -463,6 +463,19 @@ only a note when the repo is public (a reference clone in `folders`).
    (docker-in-docker), which the broker counts as the host
    (credential-broker, its non-goals): the widest token sits where the
    home's store is in reach on a rootful runtime.
+   Built: all of it but the live config; `features/gh` 1.0.0 is in the
+   features repo, its claim mirrored by the github test fixture, its
+   scope table checked against gh 2.105.0's calls (from its source) and
+   GitHub's public GraphQL schema, and gh run end to end through the
+   broker against a mock GitHub
+   ([gh](../../architecture/credentials/gh.md)). Deferred, each a
+   [status](../../status.md#credentials) limitation: the claim's
+   `device` login (it needs an app's client id in the claim; paste
+   takes `ghu_` tokens meanwhile), a `gh-update` schedule and the
+   shared bin dir's mount in the feature (the feature schema has no
+   read-only mount: the config mounts it), multi-segment route
+   variables (paths are listed per depth), Projects, discussion
+   comments by id, and `gh repo fork` (REST body inputs).
 3. `devsandbox login github --app` (manifest and install), installation
    tokens per instance and installation (`as = "app"`, `repository_ids`
    and `permissions`).
