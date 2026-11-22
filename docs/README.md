@@ -43,6 +43,7 @@ User-facing docs live in `site/` (and the config reference in
   [verbs](architecture/daemon/verbs.md),
   [host poll](architecture/daemon/host-poll.md),
   [forwards](architecture/daemon/forwards.md),
+  [feature updates](architecture/daemon/updates.md),
   [machines](architecture/daemon/machines.md),
   [fleet](architecture/daemon/fleet.md),
   [platform support](architecture/daemon/platform-support.md)

@@ -7,8 +7,8 @@ a feature declares is in
 [images-and-features](../architecture/instances/images-and-features.md#running-an-update).
 
 Code: `src/main.rs` (`Command::Update`), `src/commands/update.rs`
-(`update`, `candidate`, `newest`, `host_dir`, `update_argv`),
-`src/updates.rs`.
+(`update`, `candidate`, `enabled_features`, `newest`, `host_dir`,
+`update_argv`), `src/updates.rs`.
 
 ```
 devsandbox [-C <dir>] update <name> [args…]
@@ -19,6 +19,20 @@ devsandbox [-C <dir>] update <name> [args…]
 are appended to the update's `command` (a version, to pin or roll back:
 `devsandbox update gh 2.60.0`); anything after `<name>` goes there,
 flags included.
+
+## Scheduled runs
+
+The host daemon runs the same verb on its own, with no args: when it
+starts and then hourly, each update a sandbox with an instance declares,
+once its interval has passed since its last success. The interval is the
+config's top-level `updates` table (`gh = "1d"`, or `"never"` to never
+run it on schedule), else the feature's `every` (default `7d`). A
+failure is retried after 6 h; its first in a row posts an Inbox notice,
+and each run's output is in `logs/update-<unix>-<name>.log` next to
+`state.toml`. Detail:
+[daemon/updates.md](../architecture/daemon/updates.md). Running the
+verb by hand works whatever the schedule says, and a success counts for
+it.
 
 ## Which image
 
@@ -58,9 +72,10 @@ passes the guards a sandbox's `run` does (`key_guard::check_argv`,
 `worker_policy::enforce_argv`). Its output goes to the terminal.
 
 On exit 0 the time goes to `state.toml` as
-`State.updates[<project id>][<name>]` (unix seconds, `State::update`);
+`State.updates[<project id>][<name>].ok` (unix seconds, `State::update`);
 any other exit is ``update `<name>` failed (exit N)`` and records
-nothing. The config's `updates` table isn't read here.
+nothing. The config's `updates` table isn't read here: an interval is
+the schedule's, not the verb's.
 
 `update` runs against this host's config only: `--machine` refuses it
 (`machines::cli::machine_use`), and so does Apple `container`.

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What keeps the daemon alive, one field per row of the holder table (plus
-/// `autostart`). A `--follow` stream is an in-flight control request, so it
+/// `autostart` and `updates`). A `--follow` stream is an in-flight control request, so it
 /// counts under `control`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Holders {
@@ -25,6 +25,9 @@ pub struct Holders {
     /// 1 while the startup `autostart = true` pass runs (it may be creating
     /// an instance; an idle exit would cut it off).
     pub autostart: usize,
+    /// 1 while a scheduled feature update pass runs (`serve::updates`): an
+    /// idle exit would kill its update.
+    pub updates: usize,
     /// Verb subprocesses (`run`, `rebuild`, …; `serve::verbs`) not reaped
     /// yet, detached ones included: their client may be gone.
     pub verbs: usize,
@@ -36,8 +39,8 @@ pub struct Holders {
 
 impl Holders {
     pub fn any(&self) -> bool {
-        let Holders { clients, forwards, live_instances, control, autostart, verbs, links } = *self;
-        clients + forwards + live_instances + control + autostart + verbs + links > 0
+        let Holders { clients, forwards, live_instances, control, autostart, updates, verbs, links } = *self;
+        clients + forwards + live_instances + control + autostart + updates + verbs + links > 0
     }
 }
 
@@ -92,6 +95,7 @@ mod tests {
             Holders { live_instances: 1, ..Default::default() },
             Holders { control: 1, ..Default::default() },
             Holders { autostart: 1, ..Default::default() },
+            Holders { updates: 1, ..Default::default() },
             Holders { verbs: 1, ..Default::default() },
             Holders { links: 1, ..Default::default() },
         ];

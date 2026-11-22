@@ -1142,7 +1142,7 @@ impl Shared {
             live_instances: host.live_instances(),
             control: host.control(),
             autostart: host.autostarting(),
-            ..Default::default()
+            updates: host.updating(),
         }
     }
 

@@ -459,10 +459,23 @@ pub struct State {
     /// name never matches it (docs/architecture/credentials/fence.md#ids).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub github_ids: BTreeMap<String, GithubPin>,
-    /// Project id (`services::project_id`) -> feature update name -> unix
-    /// time of its last successful run (`commands::update`).
+    /// Project id (`services::project_id`) -> feature update name -> its
+    /// last run and the daemon's last attempt (`commands::update`,
+    /// `serve::updates`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub updates: BTreeMap<String, BTreeMap<String, u64>>,
+    pub updates: BTreeMap<String, BTreeMap<String, UpdateRecord>>,
+}
+
+/// One [`State::updates`] entry, unix seconds. Kept apart so a failed
+/// attempt never moves the last success.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateRecord {
+    /// The last successful run, by the verb or the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<u64>,
+    /// When the daemon last claimed a run, whatever came of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tried: Option<u64>,
 }
 
 /// One [`State::github_ids`] pin.

@@ -6,7 +6,8 @@ configured forwards, holders, `instances.changed`, and the watched roots'
 the runtime periodically: it should ride this poll, not start its own.
 
 Code: `src/serve/host.rs` (`Host`, `poll`, `tick`, `POLL`, `QUIET_POLL`,
-`Waker`, `Observers`, `holds_host`, the `serve-autostart` thread),
+`Waker`, `Observers`, `holds_host`, the `serve-autostart` and
+`serve-updates` threads),
 `src/serve/events.rs` (`EventWatcher`, `EVENTS_RETRY`),
 `src/runtime/installed.rs` (`installed`, `on_path`, `InstallCache`,
 `INSTALL_TTL`),
@@ -207,5 +208,8 @@ for every config root recorded in `state.toml`; its notes go to
 `serve.log`, and it's an `autostart` holder while it runs. The pass is
 once per boot per root (`State.autostart_boot`), so `run`/`rebuild`/`start`
 calling it too is harmless. Detail: the automations docs.
+
+A `serve-updates` thread runs the scheduled feature updates beside it
+(`updates_loop`, not on the poll): [updates.md](updates.md).
 
 Limitations: [status.md](../../status.md#daemon)

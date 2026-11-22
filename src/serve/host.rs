@@ -2,7 +2,8 @@
 //! "Bridges"): one bridge per running instance with a helper
 //! (`devsbd::bridge::Bridges`, with the notify sink and the control handler),
 //! so outboxes drain, popups fire and control ops answer with the dashboard
-//! closed; plus the once-per-boot `autostart = true` pass at start.
+//! closed; plus the once-per-boot `autostart = true` pass at start and the
+//! scheduled feature updates (`updates.rs`).
 //!
 //! Threading: a `serve-poll` thread is the daemon's one container poll. Each
 //! tick it lists every devsandbox container once; from the running ones it
@@ -28,9 +29,11 @@
 //! handed their list before any stats or snapshot work.
 //! [`Waker::refresh`] (and a container event) cuts it short with no container
 //! urgent (a `state.toml` write, a new watch). A `serve-autostart` thread runs the autostart pass
-//! once per config root recorded in `state.toml`. Dropping [`Host`] stops
-//! the poll, which drops the event watcher (killing its child) and the worker
-//! (killing every bridge's `exec`), and joins both threads.
+//! once per config root recorded in `state.toml`; a `serve-updates` thread
+//! runs `updates::pass` at start and every `updates::CHECK_EVERY`. Dropping
+//! [`Host`] stops the poll, which drops the event watcher (killing its
+//! child) and the worker (killing every bridge's `exec`), kills a running
+//! update, and joins the threads.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -152,6 +155,7 @@ pub struct Host {
     board: BridgeBoard,
     live: Arc<AtomicUsize>,
     autostarting: Arc<AtomicUsize>,
+    updating: Arc<AtomicUsize>,
     changes: Arc<AtomicU64>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -175,6 +179,7 @@ impl Host {
         let live = Arc::new(AtomicUsize::new(0));
         // Counted before the thread runs, so the first idle check sees it.
         let autostarting = Arc::new(AtomicUsize::new(1));
+        let updating = Arc::new(AtomicUsize::new(1));
         let changes = Arc::new(AtomicU64::new(0));
         let mut threads = Vec::new();
         let spawned = {
@@ -201,7 +206,18 @@ impl Host {
                 log(&format!("cannot start the autostart thread: {e}"));
             }
         }
-        Host { stop, board, live, autostarting, changes, threads }
+        let spawned = {
+            let (stop, updating) = (Arc::clone(&stop), Arc::clone(&updating));
+            std::thread::Builder::new().name("serve-updates".into()).spawn(move || updates_loop(&stop, &updating, log))
+        };
+        match spawned {
+            Ok(t) => threads.push(t),
+            Err(e) => {
+                updating.store(0, Ordering::Release);
+                log(&format!("cannot start the updates thread: {e}"));
+            }
+        }
+        Host { stop, board, live, autostarting, updating, changes, threads }
     }
 
     /// The poll's [`Waker`], for the API.
@@ -235,6 +251,12 @@ impl Host {
     pub fn autostarting(&self) -> usize {
         self.autostarting.load(Ordering::Acquire)
     }
+
+    /// 1 while a feature update pass runs: an idle exit would kill its
+    /// update.
+    pub fn updating(&self) -> usize {
+        self.updating.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for Host {
@@ -243,7 +265,8 @@ impl Drop for Host {
         lock.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
         cvar.notify_all();
         // The poll thread drops the bridge worker, which kills every bridge;
-        // autostart is waited out (see `autostarting`).
+        // autostart is waited out (see `autostarting`); a running update is
+        // killed (`updates_loop`), its claim kept: retried after `updates::RETRY`.
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -448,6 +471,27 @@ fn running_instances(running: &[String], state: &State) -> usize {
 pub(super) fn config_roots(state: &State) -> Vec<PathBuf> {
     let roots: BTreeSet<PathBuf> = state.instances.values().filter_map(|i| i.config_dir.clone()).collect();
     roots.into_iter().collect()
+}
+
+/// The scheduled updates: a pass now, then every `CHECK_EVERY` until the
+/// host stops (which also cuts a running update short).
+fn updates_loop(stop: &Shared, updating: &AtomicUsize, log: fn(&str)) {
+    let stopped = || stop.0.lock().unwrap_or_else(|e| e.into_inner()).stop;
+    loop {
+        updating.store(1, Ordering::Release);
+        super::updates::pass(&mut super::updates::Live::new(&stopped), &log);
+        updating.store(0, Ordering::Release);
+        let deadline = Instant::now() + super::updates::CHECK_EVERY;
+        let (lock, cvar) = &**stop;
+        let mut signal = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !signal.stop {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { break };
+            signal = cvar.wait_timeout(signal, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        if signal.stop {
+            return;
+        }
+    }
 }
 
 /// The `autostart = true` pass for every known config root. Idempotent per

@@ -4,6 +4,7 @@
 //! that image with the update's `${sharedVolumes}` dir as its only bind,
 //! read-write; sandboxes mount that dir read-only.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -80,16 +81,60 @@ pub fn update(dir: &Path, name: &str, args: &[String]) -> Result<()> {
         bail!("update `{name}` failed (exit {code})");
     }
     State::update(|state| {
-        state.updates.entry(project.clone()).or_default().insert(name.to_string(), Instance::now());
+        let record = state.updates.entry(project.clone()).or_default().entry(name.to_string()).or_default();
+        record.ok = Some(Instance::now());
         Ok(())
     })
 }
 
-/// Sandbox `sandbox`'s enabled feature declaring update `name`, if any. Its
-/// features must not declare one name twice.
+/// One update the config root's sandboxes declare.
+pub struct Declared {
+    /// The first declaring sandbox's (in name order).
+    pub update: Update,
+    /// Every sandbox whose features declare it, in name order.
+    pub sandboxes: Vec<String>,
+}
+
+/// Every update the sandboxes of the config root in `dir` declare, by name,
+/// without running any. A sandbox that doesn't resolve is in the second
+/// list with why.
+pub fn declared(dir: &Path, config: &Config) -> (BTreeMap<String, Declared>, Vec<(String, anyhow::Error)>) {
+    let mut found: BTreeMap<String, Declared> = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for sandbox in config.sandboxes.keys() {
+        let features = match enabled_features(dir, config, sandbox) {
+            Ok((_, features)) => features,
+            Err(e) => {
+                skipped.push((sandbox.clone(), e));
+                continue;
+            }
+        };
+        for update in features.iter().flat_map(|f| &f.metadata.updates) {
+            found
+                .entry(update.name.clone())
+                .or_insert_with(|| Declared { update: update.clone(), sandboxes: Vec::new() })
+                .sandboxes
+                .push(sandbox.clone());
+        }
+    }
+    (found, skipped)
+}
+
+/// Sandbox `sandbox`'s enabled feature declaring update `name`, if any.
 fn candidate(dir: &Path, config: &Config, sandbox: &str, name: &str) -> Result<Option<Candidate>> {
+    let (resolved, enabled) = enabled_features(dir, config, sandbox)?;
+    let found = enabled.into_iter().find_map(|feature| {
+        let update = feature.metadata.updates.iter().find(|u| u.name == name)?.clone();
+        Some((feature, update))
+    });
+    Ok(found.map(|(feature, update)| Candidate { sandbox: resolved, feature, update }))
+}
+
+/// Sandbox `sandbox` and its enabled features, resolved (fetched into the
+/// cache like at `run`). Its features must not declare one update name twice.
+fn enabled_features(dir: &Path, config: &Config, sandbox: &str) -> Result<(ResolvedSandbox, Vec<ResolvedFeature>)> {
     let resolved = config.resolve_sandbox(sandbox)?;
-    let Some(refs) = &resolved.properties.features else { return Ok(None) };
+    let Some(refs) = &resolved.properties.features else { return Ok((resolved, Vec::new())) };
     let mut enabled = Vec::new();
     for (reference, options) in refs {
         if run::feature_option_values(options)
@@ -104,11 +149,8 @@ fn candidate(dir: &Path, config: &Config, sandbox: &str, name: &str) -> Result<O
     }
     let declared: Vec<(&str, &[Update])> = enabled.iter().map(|(r, f)| (*r, f.metadata.updates.as_slice())).collect();
     updates::check_unique(&declared)?;
-    let found = enabled.into_iter().find_map(|(_, feature)| {
-        let update = feature.metadata.updates.iter().find(|u| u.name == name)?.clone();
-        Some((feature, update))
-    });
-    Ok(found.map(|(feature, update)| Candidate { sandbox: resolved, feature, update }))
+    let enabled = enabled.into_iter().map(|(_, feature)| feature).collect();
+    Ok((resolved, enabled))
 }
 
 /// Among the sandboxes' features images (`None`: not built; else its
@@ -209,6 +251,36 @@ mod tests {
         assert_eq!(newest(&[Some(Some(3)), Some(Some(3))]), Some(0));
     }
 
+    #[test]
+    fn declared_lists_each_update_with_its_sandboxes() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let cfg = std::env::temp_dir().join(format!("devsandbox-declared-{stamp}"));
+        let feature = cfg.join("features/upd");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(
+            feature.join("devcontainer-feature.json"),
+            r#"{"id": "upd",
+                "mounts": [{"type": "bind", "source": "${sharedVolumes}/upd-bin", "target": "/opt/upd", "readonly": true}],
+                "customizations": {"devsandbox": {"updates": [
+                    {"name": "upd", "mount": "/opt/upd", "command": ["/bin/up"], "every": "1d"}
+                ]}}}"#,
+        )
+        .unwrap();
+        let config = Config::parse(
+            "[sandbox.a]\nimage = \"x\"\nfeatures = { \"./features/upd\" = true }\n\
+             [sandbox.b]\nimage = \"x\"\nfeatures = { \"./features/upd\" = true }\n\
+             [sandbox.c]\nimage = \"x\"\n\
+             [sandbox.d]\nimage = \"x\"\nfeatures = { \"./features/missing\" = true }\n",
+        )
+        .unwrap();
+        let (found, skipped) = declared(&cfg, &config);
+        let _ = std::fs::remove_dir_all(&cfg);
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["upd"]);
+        assert_eq!(found["upd"].sandboxes, ["a", "b"]);
+        assert_eq!(found["upd"].update.every, std::time::Duration::from_secs(86400));
+        assert_eq!(skipped.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["d"]);
+    }
+
     const CHILD_ROOT: &str = "DEVSANDBOX_UPDATE_TEST_ROOT";
 
     /// The update runs from a sandbox's features image (alpine retagged as
@@ -280,14 +352,14 @@ mod tests {
             update(&cfg, "upd", &["1.2.3".into(), "--pin".into()]).unwrap();
             let out = std::fs::read_to_string(cfg.join("shared-volumes/upd-bin/out")).unwrap();
             assert_eq!(out.trim(), "1.2.3 --pin");
-            let at = State::load().unwrap().updates[&project]["upd"];
+            let at = State::load().unwrap().updates[&project]["upd"].ok.unwrap();
             assert!(at.abs_diff(Instance::now()) < 600, "{at}");
 
             // A failing command records nothing new.
             std::fs::remove_dir_all(cfg.join("shared-volumes/upd-bin")).unwrap();
             std::fs::write(cfg.join("shared-volumes/upd-bin"), "").unwrap();
             assert!(update(&cfg, "upd", &[]).is_err());
-            assert_eq!(State::load().unwrap().updates[&project]["upd"], at);
+            assert_eq!(State::load().unwrap().updates[&project]["upd"].ok, Some(at));
         });
     }
 }

@@ -15,7 +15,9 @@
 //! - `idle`: the pure idle countdown over a holder snapshot
 //! - `daemon`: the accept loop, lock, handoff and idle exit
 //! - `host`: the live host side: the one container poll (bridges, forwards,
-//!   watched roots' snapshots) and the autostart pass
+//!   watched roots' snapshots), the autostart pass and the updates thread
+//! - `updates`: the scheduled feature updates (when one is due, the claim,
+//!   the logged `devsandbox update` subprocess, the failure notice)
 //! - `events`: the runtime's container event stream (`docker events`) as
 //!   wake-ups, on its own thread
 //! - `snapshots`: the watched roots' snapshot cache and the poll's cadence
@@ -66,6 +68,7 @@ pub mod opens;
 pub mod proto;
 pub mod relay;
 pub mod snapshots;
+mod updates;
 pub mod verbs;
 pub mod verbs_client;
 #[cfg(test)]

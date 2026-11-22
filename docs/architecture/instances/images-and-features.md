@@ -154,7 +154,8 @@ update can change what they run. `command[0]` replaces the image's
 entrypoint; `command[1..]` and the CLI's args follow the image. The argv
 passes `run`'s guards (`key_guard::check_argv`, `binds::check_argv`,
 `worker_policy::enforce_argv`). A successful run's time is
-`State.updates[<project id>][<name>]`.
+`State.updates[<project id>][<name>].ok`. The daemon runs each declared
+update on schedule ([daemon/updates.md](../daemon/updates.md)).
 
 ## Credential claims
 

@@ -159,7 +159,7 @@ extends = "work"
 
 ## Updates (`[updates]`)
 
-A feature can declare updates (`customizations.devsandbox.updates` in its `devcontainer-feature.json`): a command from its image refreshing a shared dir its sandboxes mount read-only, every `7d` unless the feature sets another `every`. `[updates]` overrides that per update name, for the whole config dir: a duration `"<n>h"`, `"<n>d"` or `"<n>w"` (`n` ≥ 1), or `"never"` to turn it off. Keys are `[a-z0-9][a-z0-9-]*`, at most 32 characters; a bad key or value errors when the file loads. Not part of any sandbox's hash, so changing it is never drift.
+A feature can declare updates (`customizations.devsandbox.updates` in its `devcontainer-feature.json`): a command from its image refreshing a shared dir its sandboxes mount read-only, every `7d` unless the feature sets another `every`. `[updates]` overrides that per update name, for the whole config dir: a duration `"<n>h"`, `"<n>d"` or `"<n>w"` (`n` ≥ 1), or `"never"` to turn it off. Keys are `[a-z0-9][a-z0-9-]*`, at most 32 characters; a bad key or value errors when the file loads. Not part of any sandbox's hash, so changing it is never drift. The host daemon (`devsandbox serve`) runs each update when it starts and then hourly, once the interval has passed since the update's last success (a failure is retried after 6 hours and posts an Inbox notice), for sandboxes that have an instance; `devsandbox update <name>` runs one now.
 
 ```toml
 [updates]

@@ -23,7 +23,7 @@ const SHARED_VOLUMES: &str = "${sharedVolumes}/";
 
 /// One declared update, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // `every` read once the daemon schedules updates
+#[cfg_attr(not(unix), allow(dead_code))] // `every`: read by the daemon, unix-only
 pub struct Update {
     pub name: String,
     /// The target of the feature's `${sharedVolumes}` bind the command writes.
@@ -34,7 +34,7 @@ pub struct Update {
 
 /// A config `updates` value: `"never"` or a duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // read once updates run
+#[cfg_attr(not(unix), allow(dead_code))] // read by the daemon, unix-only
 pub enum Interval {
     Never,
     Every(Duration),

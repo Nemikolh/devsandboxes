@@ -23,6 +23,8 @@ Code: `src/serve/mod.rs` (module list), `endpoint.rs` (`socket_dir`,
   → [verbs.md](verbs.md)
 - **Port forwards**: every Ports-tab forward, ad-hoc and configured.
   → [forwards.md](forwards.md)
+- **Feature updates**: each declared update run on schedule, as a
+  `devsandbox --in-process update` subprocess. → [updates.md](updates.md)
 - **Machine links**: remote hosts over ssh. → [machines.md](machines.md)
 - **The API** on its socket (JSON lines), used by the CLI, the dashboard
   and the npm package. → [client-server.md](client-server.md),
@@ -64,7 +66,7 @@ container, like `docker.sock`. No TCP listener.
 
 `serve.log` is appended to, never rotated: start (socket, pid, version,
 keep-alive), handoff/shutdown, runtime lost/back, forward status lines,
-exit, autostart notes.
+exit, autostart notes, feature updates run and failed.
 
 ## Lazy start
 
@@ -131,6 +133,8 @@ The daemon exits `IDLE_TIMEOUT` (10 min) after its last holder left
 - `verbs`: verb subprocesses not reaped (detached and adopted ones too)
   plus verbs forwarded to a machine while their ssh runs;
 - `autostart`: the startup pass while it runs;
+- `updates`: a feature update pass while it runs
+  ([updates.md](updates.md#holding-the-daemon));
 - `links`: the links this host dials, one per registered machine
   (`Kind::Ssh` entries of `machines::service::Handle::entries`): a
   member's daemon stays up while it's in a fleet, or its machines would

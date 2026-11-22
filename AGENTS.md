@@ -121,6 +121,11 @@ Start with `docs/README.md` (reading order and map) and
   `events.rs` (`EventWatcher`: the `serve-events` thread following
   `Backend::events_argv`, a wake per relevant event, respawned after
   `EVENTS_RETRY`; program injectable, tests run `sh`).
+  `updates.rs` is the scheduled feature updates (`serve-updates` thread,
+  docs/architecture/daemon/updates.md): `due`/`claim` pure over
+  `State.updates`, the `pass` over an injectable `Env`; each due update a
+  logged `devsandbox --in-process update <name>` subprocess, the first
+  failure of a streak an Inbox notice.
   `daemon.rs` also owns `subscribe`: a `serve-watch` thread flags changes on
   each connection's `Outbox`, a per-connection notifier writes them; and
   `instances.watch`/`unwatch` (per-connection watched roots in `Pending`,
