@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 use crate::config::Mount;
 use crate::credentials::claim::{self, Claim};
+use crate::updates::{self, Update};
 
 /// The layer mediaType carrying a feature's tarball.
 const FEATURE_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
@@ -332,6 +333,10 @@ pub struct FeatureMetadata {
     /// Validated at parse.
     #[serde(skip)]
     pub credentials: Vec<Claim>,
+    /// `customizations.devsandbox.updates`, validated at parse against
+    /// `mounts`.
+    #[serde(skip)]
+    pub updates: Vec<Update>,
 }
 
 /// One entry in a feature's `options` map. Only `default` is acted on for now;
@@ -347,7 +352,9 @@ impl FeatureMetadata {
     fn parse(json: &str) -> Result<Self> {
         let mut md: Self = serde_json::from_str(json).context("invalid devcontainer-feature.json")?;
         let feature = md.id.clone().unwrap_or_else(|| "(no id)".to_string());
-        md.credentials = claim::from_customizations(&feature, md.customizations.take().as_ref())?;
+        let customizations = md.customizations.take();
+        md.credentials = claim::from_customizations(&feature, customizations.as_ref())?;
+        md.updates = updates::from_customizations(&feature, customizations.as_ref(), &md.mounts)?;
         Ok(md)
     }
 
@@ -1213,6 +1220,27 @@ mod tests {
         let bad = r#"{"id": "x", "customizations": {"devsandbox": {"credentials": {"sentry": {"mode": "base-url"}}}}}"#;
         let e = format!("{:#}", FeatureMetadata::parse(bad).unwrap_err());
         assert!(e.contains("feature `x`: credential `sentry`: `upstreams` is required"), "{e}");
+    }
+
+    #[test]
+    fn metadata_reads_updates() {
+        let json = r#"{
+            "id": "gh",
+            "mounts": [{"type": "bind", "source": "${sharedVolumes}/gh-bin", "target": "/var/lib/gh/bin", "readonly": true}],
+            "customizations": {"devsandbox": {"updates": [
+                {"name": "gh", "mount": "/var/lib/gh/bin", "command": ["/usr/local/lib/gh/gh-update"]}
+            ]}}
+        }"#;
+        let md = FeatureMetadata::parse(json).unwrap();
+        assert_eq!(md.updates.len(), 1);
+        assert_eq!(md.updates[0].name, "gh");
+        assert!(md.credentials.is_empty());
+
+        let bad = r#"{"id": "gh", "customizations": {"devsandbox": {"updates": [
+            {"name": "gh", "mount": "/var/lib/gh/bin", "command": ["/x"]}
+        ]}}}"#;
+        let e = format!("{:#}", FeatureMetadata::parse(bad).unwrap_err());
+        assert!(e.contains("feature `gh`: update `gh`: `mount`"), "{e}");
     }
 
     #[test]

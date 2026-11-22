@@ -1,6 +1,6 @@
 ---
 name: config-toml-spec
-description: Reference for devsandbox's `devsandboxes.toml` format — `[template.*]`, `[sandbox.*]`, `[services.*]`, `[profiles.*]`, `extends` merge rules, `${…}` variables, and which devcontainer properties are implemented. Use when writing, editing, reviewing, or debugging a devsandbox config (e.g. porting a devcontainer.json to it).
+description: Reference for devsandbox's `devsandboxes.toml` format — `[template.*]`, `[sandbox.*]`, `[services.*]`, `[profiles.*]`, `[updates]`, `extends` merge rules, `${…}` variables, and which devcontainer properties are implemented. Use when writing, editing, reviewing, or debugging a devsandbox config (e.g. porting a devcontainer.json to it).
 ---
 
 # devsandbox `devsandboxes.toml` spec
@@ -11,13 +11,14 @@ description: Reference for devsandbox's `devsandboxes.toml` format — `[templat
 
 `devsandboxes.toml` lives in the *config dir* (`-C <dir>`, default `.`). `devsandboxes.yaml` / `devsandboxes.yml` are read instead when present: same schema, merge rules and validation, only the syntax differs (`sandbox: {web: {image: …}}` for `[sandbox.web]`), and a YAML config hashes the same as its TOML equivalent, so switching formats doesn't flag drift. YAML `null` is not a valid value. More than one of the three in a config dir is an error. A legacy `config.toml` (pre-0.5.1 name) is still read when none exist, and is renamed to `devsandboxes.toml` the next time `devsandbox` runs there; one without a `sandbox`, `template` or `services` table is not a devsandbox config and is left alone.
 
-Four top-level tables, all optional:
+Five top-level tables, all optional:
 
 ```toml
 [template.<name>]   # reusable, never run directly
 [sandbox.<name>]    # runnable; `devsandbox run <name>`
 [services.<name>]   # sidecar containers a sandbox lists in `services`
 [profiles.<name>]   # profiles a sandbox lists in `profiles`
+[updates]           # how often each feature update runs
 ```
 
 Next to it devsandbox uses: `shared-volumes/` (`${sharedVolumes}`, persistent host state), `.worktrees/<instance-id>/` (repeat-instance git worktrees), `.worktrees/<instance-id>.folders/<basename>-<hash>/` (`folders` worktrees), `shared-files/<folder-basename>-<hash>/` (`worktree-link` store, one per base folder). Relative paths (`folder`, `folders` values, `shell-rc`, `build.dockerfile`, `build.context`) resolve against the config dir.
@@ -154,6 +155,16 @@ profiles = ["work"]
 
 [sandbox.api]
 extends = "work"
+```
+
+## Updates (`[updates]`)
+
+A feature can declare updates (`customizations.devsandbox.updates` in its `devcontainer-feature.json`): a command from its image refreshing a shared dir its sandboxes mount read-only, every `7d` unless the feature sets another `every`. `[updates]` overrides that per update name, for the whole config dir: a duration `"<n>h"`, `"<n>d"` or `"<n>w"` (`n` ≥ 1), or `"never"` to turn it off. Keys are `[a-z0-9][a-z0-9-]*`, at most 32 characters; a bad key or value errors when the file loads. Not part of any sandbox's hash, so changing it is never drift.
+
+```toml
+[updates]
+gh = "1d"
+node = "never"
 ```
 
 ## Drift

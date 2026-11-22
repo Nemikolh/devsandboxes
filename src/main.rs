@@ -19,6 +19,7 @@ mod runtime;
 mod serve;
 mod snapshot;
 mod state;
+mod updates;
 mod worker_policy;
 #[cfg(test)]
 mod test_support;

@@ -85,6 +85,11 @@ pub struct Config {
     /// [`check_profile_name`] at parse.
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// `[updates]`: per feature update, by name, how often it runs
+    /// (`"never"` or a duration), overriding the feature's `every`. Root
+    /// level, so never in a sandbox's `config_hash`.
+    #[serde(default)]
+    pub updates: BTreeMap<String, crate::updates::Interval>,
 }
 
 /// A `[profiles.<name>]` table. Empty: any key in it is an error until
@@ -1267,6 +1272,9 @@ impl Config {
         for name in self.profiles.keys() {
             check_profile_name(name).context("invalid config")?;
         }
+        for name in self.updates.keys() {
+            crate::updates::check_name(name).context("invalid config: `updates`")?;
+        }
         Ok(self)
     }
 
@@ -2121,6 +2129,29 @@ forwardPorts = [true]
         let hash = plain.resolve_sandbox("app").unwrap().config_hash;
         assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
         assert_eq!(with.resolved_table("app").unwrap().1, hash);
+    }
+
+    #[test]
+    fn updates_parse_in_toml_and_yaml_and_stay_out_of_config_hash() {
+        use crate::updates::Interval;
+        use std::time::Duration;
+        let base = "[sandbox.app]\nfolder = \"../app\"\n";
+        let toml = Config::parse(&format!("{base}[updates]\ngh = \"1d\"\nnode = \"never\"\n")).unwrap();
+        let want = [
+            ("gh".to_string(), Interval::Every(Duration::from_secs(86400))),
+            ("node".to_string(), Interval::Never),
+        ];
+        assert_eq!(toml.updates, BTreeMap::from(want.clone()));
+        let yaml = Config::parse_yaml("updates:\n  gh: 1d\n  node: never\n").unwrap();
+        assert_eq!(yaml.updates, BTreeMap::from(want));
+        let hash = Config::parse(base).unwrap().resolve_sandbox("app").unwrap().config_hash;
+        assert_eq!(toml.resolve_sandbox("app").unwrap().config_hash, hash);
+
+        for bad in ["[updates]\ngh = \"0d\"\n", "[updates]\ngh = 7\n", "[updates]\nGH = \"1d\"\n"] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        let e = format!("{:#}", Config::parse_yaml("updates:\n  gh: 1m\n").unwrap_err());
+        assert!(e.contains("isn't a duration"), "{e}");
     }
 
     #[test]

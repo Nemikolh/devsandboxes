@@ -119,6 +119,19 @@ Order (install order) and the lack of arguments are the same.
 - `customizations.devsandbox.credentials`: the feature's credential
   claims (`FeatureMetadata::credentials`), collected for `run`
   ([below](#credential-claims)).
+- `customizations.devsandbox.updates`: the feature's updates
+  (`FeatureMetadata::updates`, `updates::from_customizations`), a list of
+  `{ "name", "mount", "command", "every" }`. `name` is
+  `[a-z0-9][a-z0-9-]*`, at most 32 bytes, the key the config's `updates`
+  table and the CLI use, so one namespace across a sandbox's features
+  (`updates::check_unique`). `mount` is the target of one of the feature's
+  own `mounts`, which must be a read-only bind of a dir under
+  `${sharedVolumes}/` (no `..`): the one dir the update writes, read-only
+  in every sandbox. `command` is an argv run in the feature's image,
+  `command[0]` an absolute path. `every` is `<n>h`, `<n>d` or `<n>w`
+  (`updates::parse_duration`), default `7d` (`updates::DEFAULT_EVERY`).
+  Unknown fields, a bad entry or a name declared twice fail the feature's
+  parse.
 
 Other metadata (`capAdd`, `init`, `dependsOn`, …) is not applied.
 
