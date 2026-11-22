@@ -8,8 +8,9 @@ pub(crate) const FOREIGN: &str = "sntrys_foreign";
 pub(crate) const OTHER_CLAIM: &str = "dsbx_anth_x";
 pub(crate) const GH: &str = "dsbx_github_own";
 
+/// The base-url claim: one listener per upstream.
 pub(crate) fn sentry() -> claim::Claim {
-    crate::credentials::home::tests::sentry()
+    crate::credentials::home::tests::sentry_cli()
 }
 
 /// A second claim on the instance, its slot `x-api-key`.

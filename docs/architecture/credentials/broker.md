@@ -304,9 +304,12 @@ field (`url`, `regions[].url`: dotted names, `[]` for each element)
 holding an absolute URL to a bound upstream is replaced by that
 upstream's loopback URL (`rewrite::json_fields`), sent with its new
 length. A body that isn't JSON or needs no change goes as it came; one
-past the bound passes through unrewritten, noted in the log line. This is
-what makes sentry-cli's chunk uploads (`GET …/chunk-upload/` answering an
-absolute region URL) and its regions list come back through the broker.
+past the bound passes through unrewritten, noted in the log line. No
+shipped claim rewrites (the sentry feature's claim intercepts); the
+sentry-cli test fixture's base-URL claim
+(`tests/fixtures/features/sentry-cli/`) brings its chunk uploads
+(`GET …/chunk-upload/` answering an absolute region URL) and regions list
+back through the broker this way.
 An injected LFS batch's `200` is read the same way, but its actions are
 put behind handles before masking (`lfs::rewrite_batch`, [git](git.md#lfs)):
 the header they carry is what goes upstream later.
@@ -448,15 +451,20 @@ Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog
 
 ## End to end
 
-`commands::run::tests::sentry_cli_brokered_end_to_end_with_docker` runs
-the whole path with a real sentry-cli (a pinned release in the test
+`commands::run::tests::sentry_through_the_broker_end_to_end_with_docker`
+runs the whole path with a real `sentry` (a pinned release in the test
 image): the sentry fixture's claim (`tests/fixtures/features/sentry/`,
-the claim `features/sentry` ships) with its one upstream at a private
-`localhost`, `sentry-work` logged in through `commands::login::login_at`,
-`run` wiring the instance, and a `Service` with the test CA's roots
-behind the instance's bridge (`devsbd::bridge::spawn_brokered`) calling
-a mock Sentry over TLS (`Service::with_authority`). `releases new` and a
-source-map upload (`GET …/chunk-upload/` answering an absolute URL, which
-`rewrite` points back at the loopback, then the chunk post and the
-assemble calls) succeed; the mock sees only the real token, as `Bearer`,
-and `access.log` an `allow` line per call with neither token nor phantom.
+the claim `features/sentry` ships), `sentry-work` logged in through
+`commands::login::login_at`, `run` wiring the instance, and a `Service`
+with the test CA's roots behind the instance's bridge
+(`devsbd::bridge::spawn_brokered`) calling two mocks over TLS:
+`sentry.io` (the claim's one private upstream, `Service::with_authority`)
+and `us.sentry.io` (`Service::with_private_host`). `sentry issue list`
+resolves the org on sentry.io and lists its issues on the region host the
+org names; `sentry project delete` is refused at its `never` DELETE,
+which reaches neither mock. The mocks see only the real token, as
+`Bearer`, and `access.log` neither token nor phantom.
+`commands::run::tests::gh_through_the_broker_end_to_end_with_docker` does
+the same for gh and its repo fence; base-URL mode's listeners, env and
+phantom file are `claims_wire_env_files_and_listeners_with_docker`'s,
+over the sentry-cli fixture.

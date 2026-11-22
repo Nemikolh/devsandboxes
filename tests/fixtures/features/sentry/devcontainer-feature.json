@@ -1,17 +1,22 @@
 {
   "id": "sentry",
-  "version": "1.1.0",
-  "name": "sentry-cli, brokered (test fixture)",
-  "description": "Test fixture mirroring github.com/devsandboxes/features' src/sentry: the same metadata and claim (docs/plans/active/github-and-sentry-access.md, sentry-cli), keep them in step. Its install.sh installs nothing.",
+  "version": "1.2.0",
+  "name": "sentry, brokered (test fixture)",
+  "description": "Test fixture mirroring github.com/devsandboxes/features' src/sentry: the same metadata and claim, keep them in step. Its install.sh installs nothing.",
   "options": {
     "version": {
       "type": "string",
-      "proposals": ["latest"],
+      "proposals": [
+        "latest"
+      ],
       "default": "latest",
-      "description": "sentry-cli version baked into the image (a release like 3.8.2, or latest). The version devsandbox's `sentry` update made current runs instead."
+      "description": "sentry version baked into the image (a release like 0.50.0, or latest). The version devsandbox's `sentry` update made current runs instead."
     }
   },
-  "containerEnv": { "SENTRY_DISABLE_UPDATE_CHECK": "true" },
+  "containerEnv": {
+    "SENTRY_CLI_NO_TELEMETRY": "1",
+    "SENTRY_CLI_NO_UPDATE_CHECK": "1"
+  },
   "mounts": [
     {
       "type": "bind",
@@ -26,100 +31,270 @@
         {
           "name": "sentry",
           "mount": "/var/lib/devsandbox/sentry/bin",
-          "command": ["/usr/local/lib/sentry/sentry-update", "/var/lib/devsandbox/sentry/bin"]
+          "command": [
+            "/usr/local/lib/sentry/sentry-update",
+            "/var/lib/devsandbox/sentry/bin"
+          ]
         }
       ],
       "credentials": {
         "sentry": {
-          "upstreams": ["sentry.io", "us.sentry.io", "de.sentry.io"],
-          "mode": "base-url",
-          "baseUrl": "SENTRY_URL",
-          "inject": [{ "header": "Authorization", "format": "Bearer {token}" }],
+          "upstreams": [
+            "sentry.io",
+            "us.sentry.io",
+            "de.sentry.io"
+          ],
+          "mode": "intercept",
+          "inject": [
+            {
+              "header": "Authorization",
+              "format": "Bearer {token}"
+            }
+          ],
           "phantom": {
-            "prefix": "sntrys_",
-            "env": ["SENTRY_AUTH_TOKEN"],
-            "files": [
-              {
-                "path": ".sentryclirc",
-                "template": "[defaults]\nurl = {baseUrl}\n\n[auth]\ntoken = {phantom}\n"
-              }
+            "env": [
+              "SENTRY_AUTH_TOKEN"
             ]
           },
-          "rewrite": [
-            { "route": "GET /api/0/organizations/{org}/chunk-upload/", "fields": ["url"] },
-            { "route": "GET /api/0/users/me/regions/", "fields": ["regions[].url"] }
-          ],
           "login": [
             {
               "method": "paste",
-              "hint": "an internal integration's token (Settings > Developer Settings > Custom Integrations), with Release admin and Issue & Event read"
+              "hint": "a user auth token (sntryu_…) with the scopes the sandboxes need",
+              "create": {
+                "url": "https://sentry.io/settings/account/api/auth-tokens/new-token/"
+              }
+            },
+            {
+              "method": "device",
+              "clientId": "1d673b81d60ef84c951359c36296972ca6fd41bd8f45acd2d3a783a3b3c28e41",
+              "scope": "project:read project:write org:read event:read event:write member:read team:read team:write alerts:read alerts:write",
+              "deviceUrl": "https://sentry.io/oauth/device/code/",
+              "tokenUrl": "https://sentry.io/oauth/token/"
             }
           ],
-          "check": "GET /api/0/",
-          "refusal": { "shape": "json", "field": "detail" },
+          "check": "GET /api/0/users/me/",
+          "checkShows": "email",
+          "refusal": {
+            "shape": "json",
+            "field": "detail"
+          },
           "scopes": {
             "org.read": {
               "routes": [
                 "GET /api/0/",
-                "GET /api/0/organizations/",
+                "GET /api/0/auth/",
+                "GET /api/0/users/me/",
                 "GET /api/0/users/me/regions/",
+                "GET /api/0/organizations/",
                 "GET /api/0/organizations/{org}/",
                 "GET /api/0/organizations/{org}/projects/",
-                "GET /api/0/organizations/{org}/repos/"
+                "GET /api/0/organizations/{org}/teams/",
+                "GET /api/0/organizations/{org}/repos/",
+                "GET /api/0/organizations/{org}/integrations/",
+                "GET /api/0/organizations/{org}/integrations/{integration_id}/",
+                "GET /api/0/organizations/{org}/sentry-app-components/",
+                "GET /api/0/organizations/{org}/sentry-app-installations/",
+                "GET /api/0/organizations/{org}/dsn-lookup/",
+                "GET /api/0/projects/",
+                "GET /api/0/projects/{org}/{project}/",
+                "GET /api/0/projects/{org}/{project}/environments/",
+                "GET /api/0/projects/{org}/{project}/teams/",
+                "GET /api/0/customers/{org}/"
               ],
-              "permissions": { "org": "read" }
+              "permissions": {
+                "org": "read",
+                "project": "read",
+                "team": "read",
+                "member": "read"
+              }
+            },
+            "dsn.read": {
+              "routes": [
+                "GET /api/0/projects/{org}/{project}/keys/",
+                "GET /api/0/organizations/{org}/project-keys/"
+              ],
+              "permissions": {
+                "project": "read"
+              }
+            },
+            "issues.read": {
+              "routes": [
+                "GET /api/0/organizations/{org}/issues/",
+                "GET /api/0/organizations/{org}/issues/{issue_id}/",
+                "GET /api/0/organizations/{org}/issues/{issue_id}/events/",
+                "GET /api/0/organizations/{org}/issues/{issue_id}/events/{event_id}/",
+                "GET /api/0/organizations/{org}/issues/{issue_id}/tags/{key}/",
+                "GET /api/0/organizations/{org}/issues/{issue_id}/autofix/",
+                "GET /api/0/organizations/{org}/issues/{issue_id}/external-issues/",
+                "GET /api/0/organizations/{org}/issues/{issue_id}/integrations/",
+                "GET /api/0/organizations/{org}/shortids/{issue_id}/",
+                "GET /api/0/organizations/{org}/eventids/{event_id}/",
+                "GET /api/0/organizations/{org}/shared/issues/{share_id}/",
+                "GET /api/0/projects/{org}/{project}/events/{event_id}/",
+                "GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/",
+                "GET /api/0/sentry-app-installations/{uuid}/external-requests/"
+              ],
+              "permissions": {
+                "event": "read"
+              }
+            },
+            "events.read": {
+              "routes": [
+                "GET /api/0/organizations/{org}/events/",
+                "GET /api/0/organizations/{org}/events-timeseries/",
+                "GET /api/0/organizations/{org}/events-dropped/",
+                "GET /api/0/organizations/{org}/trace-items/attributes/",
+                "GET /api/0/organizations/{org}/trace-logs/",
+                "GET /api/0/organizations/{org}/trace/{trace_id}/",
+                "GET /api/0/organizations/{org}/trace-meta/{trace_id}/",
+                "GET /api/0/projects/{org}/{project}/trace-items/{item_id}/",
+                "GET /api/0/organizations/{org}/replays/",
+                "GET /api/0/organizations/{org}/replays/{replay_id}/",
+                "GET /api/0/organizations/{org}/replay-count/",
+                "GET /api/0/projects/{org}/{project}/replays/{replay_id}/recording-segments/",
+                "GET /api/0/organizations/{org}/agents/conversations/",
+                "GET /api/0/organizations/{org}/agents/conversations/{conversation_id}/"
+              ],
+              "permissions": {
+                "event": "read"
+              }
+            },
+            "issues.write": {
+              "routes": [
+                "PUT /api/0/organizations/{org}/issues/",
+                "PUT /api/0/organizations/{org}/issues/{issue_id}/",
+                "PUT /api/0/organizations/{org}/issues/{issue_id}/integrations/{integration_id}/",
+                "DELETE /api/0/organizations/{org}/issues/{issue_id}/integrations/{integration_id}/",
+                "DELETE /api/0/organizations/{org}/issues/{issue_id}/external-issues/{external_issue_id}/",
+                "POST /api/0/sentry-app-installations/{uuid}/external-issue-actions/"
+              ],
+              "permissions": {
+                "event": "write"
+              }
+            },
+            "seer": {
+              "routes": [
+                "POST /api/0/organizations/{org}/issues/{issue_id}/autofix/"
+              ],
+              "permissions": {
+                "event": "write"
+              }
             },
             "releases.read": {
               "routes": [
                 "GET /api/0/organizations/{org}/releases/",
                 "GET /api/0/organizations/{org}/releases/{version}/",
                 "GET /api/0/organizations/{org}/releases/{version}/deploys/",
-                "GET /api/0/projects/{org}/{project}/releases/"
+                "GET /api/0/organizations/{org}/releases/{version}/previous-with-commits/",
+                "GET /api/0/projects/{org}/{project}/releases/",
+                "GET /api/0/organizations/{org}/preprodartifacts/{artifact_id}/install-details/"
               ],
-              "permissions": { "release": "admin" }
+              "permissions": {
+                "project": "read"
+              }
             },
             "releases.write": {
               "routes": [
                 "POST /api/0/organizations/{org}/releases/",
                 "PUT /api/0/organizations/{org}/releases/{version}/",
                 "DELETE /api/0/organizations/{org}/releases/{version}/",
-                "POST /api/0/organizations/{org}/releases/{version}/deploys/",
-                "POST /api/0/projects/{org}/{project}/releases/"
+                "POST /api/0/organizations/{org}/releases/{version}/deploys/"
               ],
-              "permissions": { "release": "admin" }
+              "permissions": {
+                "project": "write"
+              }
             },
             "uploads": {
               "routes": [
                 "GET /api/0/organizations/{org}/chunk-upload/",
                 "POST /api/0/organizations/{org}/chunk-upload/",
                 "POST /api/0/organizations/{org}/artifactbundle/assemble/",
-                "POST /api/0/organizations/{org}/releases/{version}/assemble/",
-                "POST /api/0/projects/{org}/{project}/files/difs/assemble/"
+                "POST /api/0/projects/{org}/{project}/files/difs/assemble/",
+                "POST /api/0/projects/{org}/{project}/files/preprodartifacts/assemble/"
               ],
-              "permissions": { "release": "admin", "project": "write" }
+              "permissions": {
+                "project": "write"
+              }
             },
-            "issues.read": {
+            "projects.write": {
               "routes": [
-                "GET /api/0/organizations/{org}/issues/",
-                "GET /api/0/projects/{org}/{project}/issues/",
-                "GET /api/0/issues/{id}/",
-                "GET /api/0/issues/{id}/events/",
-                "GET /api/0/projects/{org}/{project}/events/",
-                "GET /api/0/projects/{org}/{project}/events/{id}/"
+                "POST /api/0/organizations/{org}/projects/",
+                "POST /api/0/teams/{org}/{team}/projects/",
+                "POST /api/0/organizations/{org}/teams/",
+                "POST /api/0/organizations/{org}/members/{member_id}/teams/{team}/",
+                "POST /api/0/organizations/{org}/code-mappings/bulk/"
               ],
-              "permissions": { "event": "read" }
+              "permissions": {
+                "project": "write",
+                "team": "write"
+              }
+            },
+            "alerts.read": {
+              "routes": [
+                "GET /api/0/organizations/{org}/detectors/",
+                "GET /api/0/organizations/{org}/detectors/{detector_id}/",
+                "GET /api/0/organizations/{org}/workflows/",
+                "GET /api/0/organizations/{org}/workflows/{workflow_id}/",
+                "GET /api/0/organizations/{org}/monitors/"
+              ],
+              "permissions": {
+                "alerts": "read"
+              }
+            },
+            "alerts.write": {
+              "routes": [
+                "POST /api/0/organizations/{org}/projects/{project}/detectors/",
+                "PUT /api/0/organizations/{org}/detectors/{detector_id}/",
+                "DELETE /api/0/organizations/{org}/detectors/{detector_id}/",
+                "POST /api/0/organizations/{org}/workflows/",
+                "PUT /api/0/organizations/{org}/workflows/{workflow_id}/",
+                "DELETE /api/0/organizations/{org}/workflows/{workflow_id}/"
+              ],
+              "permissions": {
+                "alerts": "write"
+              }
+            },
+            "dashboards.read": {
+              "routes": [
+                "GET /api/0/organizations/{org}/dashboards/",
+                "GET /api/0/organizations/{org}/dashboards/{dashboard_id}/",
+                "GET /api/0/organizations/{org}/dashboards/{dashboard_id}/revisions/"
+              ],
+              "permissions": {
+                "org": "read"
+              }
+            },
+            "dashboards.write": {
+              "routes": [
+                "POST /api/0/organizations/{org}/dashboards/",
+                "PUT /api/0/organizations/{org}/dashboards/{dashboard_id}/",
+                "POST /api/0/organizations/{org}/dashboards/{dashboard_id}/revisions/{revision_id}/restore/"
+              ],
+              "permissions": {
+                "org": "read"
+              }
             }
           },
           "never": [
+            "DELETE /api/0/organizations/{org}/",
+            "DELETE /api/0/projects/{org}/{project}/",
+            "DELETE /api/0/teams/{org}/{team}/",
+            "DELETE /api/0/organizations/{org}/integrations/{integration_id}/",
+            "GET /api/0/organizations/{org}/org-auth-tokens/",
             "POST /api/0/organizations/{org}/org-auth-tokens/",
+            "DELETE /api/0/organizations/{org}/org-auth-tokens/{token_id}/",
+            "POST /api/0/api-tokens/",
+            "POST /api/0/agent-handoff/",
             "POST /api/0/sentry-apps/{slug}/api-tokens/",
-            "GET /api/0/projects/{org}/{project}/keys/",
             "POST /api/0/projects/{org}/{project}/keys/",
-            "POST /api/0/api-tokens/"
+            "GET /api/0/projects/{org}/{project}/preprodartifacts/snapshots/upload-options/",
+            "PUT /api/0/customers/{org}/product-trial/"
           ]
         }
       }
     }
   },
-  "installsAfter": ["ghcr.io/devcontainers/features/common-utils"]
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils"
+  ]
 }

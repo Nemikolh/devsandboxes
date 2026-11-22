@@ -355,17 +355,24 @@ pub(crate) mod tests {
     use super::*;
     use crate::credentials::claim;
 
+    /// The intercept claim of `tests/fixtures/features/sentry`.
     pub(crate) fn sentry() -> Claim {
-        fixture("sentry")
+        fixture("sentry", "sentry")
+    }
+
+    /// The base-url claim of `tests/fixtures/features/sentry-cli`: listeners
+    /// and rewrites, which no shipped claim uses.
+    pub(crate) fn sentry_cli() -> Claim {
+        fixture("sentry-cli", "sentry")
     }
 
     /// The repo-fenced intercept claim of `tests/fixtures/features/github`.
     pub(crate) fn github() -> Claim {
-        fixture("github")
+        fixture("github", "github")
     }
 
-    fn fixture(kind: &str) -> Claim {
-        let path = format!("{}/tests/fixtures/features/{kind}/devcontainer-feature.json", env!("CARGO_MANIFEST_DIR"));
+    fn fixture(dir: &str, kind: &str) -> Claim {
+        let path = format!("{}/tests/fixtures/features/{dir}/devcontainer-feature.json", env!("CARGO_MANIFEST_DIR"));
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         claim::parse(kind, &v["customizations"]["devsandbox"]["credentials"][kind]).unwrap()
     }
@@ -385,7 +392,7 @@ pub(crate) mod tests {
         assert!(text.contains("as = [\"user\"]\nbroad = true\n"), "{text}");
         let narrow = Home::from([("s".to_string(), Entry::new("sentry", None))]);
         assert!(!serialize(&narrow).unwrap().contains("broad"), "false is left out");
-        assert!(!text.contains("pending") && !text.contains("members"), "{text}");
+        assert!(!text.contains("pending") && !text.contains("\nmembers"), "{text}");
         assert_eq!(parse(&text).unwrap(), home);
         let v = &home["sentry-work"].approved[0];
         assert_eq!(v.version, sentry().version());

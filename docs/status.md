@@ -39,13 +39,13 @@ is frozen: no new work on it.
   → [plan](plans/active/isolation.md)
 - **credentials**: no secret in any sandbox: a broker in `serve` swaps
   per-instance phantoms for credentials kept at their home member, under
-  per-sandbox policy. Built locally: sentry-cli, gh and git (credential-broker
+  per-sandbox policy. Built locally: sentry, gh and git (credential-broker
   steps 1-3, github-and-sentry-access steps 1-2, git-gateway step 1). Next:
   permission requests, `CRED` over the fleet (then the live config drops its
   gh and sentry mounts), signed policy, delegation, git push rules and
   clones.
   → [plan](plans/active/credential-broker.md); per tool:
-  [gh and sentry-cli](plans/active/github-and-sentry-access.md),
+  [gh and sentry](plans/active/github-and-sentry-access.md),
   [git over smart HTTP, clones replacing worktrees](plans/active/git-gateway.md)
 
 - **helper**: daemon-owned runs (registry, run-state events, a `queued`

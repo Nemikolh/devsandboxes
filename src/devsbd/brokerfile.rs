@@ -8,7 +8,7 @@
 //! Format, line-based UTF-8, one directive per line, `<key> <value>`:
 //!
 //! ```text
-//! listen 41001 base-url sentry.io        a loopback listener: port, mode, upstream
+//! listen 41001 base-url api.example.com  a loopback listener: port, mode, upstream
 //! listen 41005 lfs                       the LFS transfers' loopback listener (at
 //!                                        most one): port, mode
 //! proxy-listen 41000 api.github.com github.com
@@ -16,7 +16,7 @@
 //!                                        hands the broker (intercept)
 //! credential github.com dsbx_github_x    a git host and the phantom `devsbd credential`
 //!                                        answers for it
-//! file vscode /home/vscode/.sentryclirc\0sntrys_x\0[auth]\ntoken=sntrys_x\n
+//! file vscode /home/vscode/.config/gh/hosts.yml\0dsbx_github_x\0github.com:\n    oauth_token: dsbx_github_x\n
 //!                                        a phantom file: owner, path, phantom, content
 //! proxy HTTPS_PROXY=http://proxy:3128    the container's own proxy env, in order
 //! ```

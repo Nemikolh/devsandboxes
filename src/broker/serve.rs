@@ -80,9 +80,8 @@ pub struct Service {
     audit: Audit,
     /// Upstream host → the authority dialed instead: tests' local servers.
     authorities: HashMap<String, String>,
-    /// LFS storage hosts dialed despite a private address: tests' local
-    /// servers.
-    private_storage: BTreeSet<String>,
+    /// Hosts dialed despite a private address: tests' local servers.
+    private_hosts: BTreeSet<String>,
     lfs: Mutex<lfs::Store>,
     /// What GitHub answered for the fence's names and ids, per credential.
     github: Mutex<github::Cache>,
@@ -155,7 +154,7 @@ impl Service {
             upstream,
             tokens,
             authorities: HashMap::new(),
-            private_storage: BTreeSet::new(),
+            private_hosts: BTreeSet::new(),
             lfs: Mutex::new(lfs::Store::new(lfs::MAX_PER_INSTANCE)),
             ca: Mutex::default(),
             github: Mutex::default(),
@@ -189,10 +188,10 @@ impl Service {
     }
 
     /// `host` dialed at `authority`, its private address allowed: a test's
-    /// LFS storage host.
+    /// LFS storage host, or a claim's host past the one it may mark private.
     #[cfg(test)]
-    pub fn with_storage(mut self, host: &str, authority: &str) -> Service {
-        self.private_storage.insert(host.to_string());
+    pub fn with_private_host(mut self, host: &str, authority: &str) -> Service {
+        self.private_hosts.insert(host.to_string());
         self.with_authority(host, authority)
     }
 
@@ -505,7 +504,8 @@ impl Service {
         };
         let inj = inject.as_ref().map(|(i, _)| *i);
         let mut token = inject.as_ref().map(|(_, f)| f.token.clone());
-        let to = Target { upstream, authority, head, strip };
+        let private = self.private_hosts.contains(upstream_host);
+        let to = Target { upstream, authority, head, strip, private };
         let (sent, mut path) = to.send(inj.zip(token.as_ref().map(|t| t.expose())), held.as_deref(), &mut body);
         let keep = keep && (read_ahead || body.is_done());
         let w = conn.get_mut();
@@ -794,7 +794,7 @@ impl Service {
             Framing::Length(n) => Body::Length(n, &mut body),
             Framing::Chunked => Body::Chunked(&mut body),
         };
-        let private = self.private_storage.contains(&target.host);
+        let private = self.private_hosts.contains(&target.host);
         let sent = upstream.send(Request { method: &head.method, url: &url, headers: &headers, body: req_body, private });
         let keep = keep && body.is_done();
         let w = conn.get_mut();
@@ -874,6 +874,8 @@ struct Target<'a> {
     head: &'a RequestHead,
     /// The slot removed and whether the upstream is private.
     strip: Option<(&'a Slot, bool)>,
+    /// A test's private host, whatever the claim says.
+    private: bool,
 }
 
 impl Target<'_> {
@@ -903,7 +905,7 @@ impl Target<'_> {
             (None, Framing::Length(n)) => Body::Length(n, body),
             (None, Framing::Chunked) => Body::Chunked(body),
         };
-        let private = inject.is_some_and(|(i, _)| i.private) || self.strip.is_some_and(|(_, p)| p);
+        let private = self.private || inject.is_some_and(|(i, _)| i.private) || self.strip.is_some_and(|(_, p)| p);
         let sent = self.upstream.send(Request { method: &head.method, url: &url, headers: &headers, body: req_body, private });
         (sent, path)
     }

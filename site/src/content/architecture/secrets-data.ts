@@ -66,7 +66,7 @@ export const placement: MachinesState[] = [
     arrows: [
       { from: 'shared-volumes', to: 'sandboxes', label: '(1) mounts', detail: md('`template.base.mounts` binds `${sharedVolumes}/gh` and `sentry/` read-write (gh rewrites `hosts.yml` on refresh). Nothing scopes them: every sandbox, every profile, every repo.') },
       { from: 'L', to: 'B', label: '(2) the link', detail: md('Carries the ssh-agent (an `[[agent]]` grant by member key), never a token file.') },
-      { from: 'B', to: 'sandboxes', label: '(3) nothing to mount', detail: md("B's `shared-volumes/` is B's own. zidane, gh and sentry-cli start logged out; copying the files over doubles the exposure.") },
+      { from: 'B', to: 'sandboxes', label: '(3) nothing to mount', detail: md("B's `shared-volumes/` is B's own. zidane, gh and sentry start logged out; copying the files over doubles the exposure.") },
     ],
     note: md('The only credential that already works on B is the one devsandbox brokers: the ssh-agent. The proposal generalizes that.'),
   },
@@ -322,7 +322,7 @@ export const decision: State[] = [
 export const ownership: State[] = [
   {
     name: 'the tool',
-    sub: 'gh · git · sentry-cli · zidane',
+    sub: 'gh · git · sentry · zidane',
     tone: 'client',
     notes: ['Unchanged, in the common case. Reads its usual env and config: a token var, a base URL, `HTTPS_PROXY`, git\'s credential helper, the system CA bundle.', 'Believes it is logged in.'],
     side: ['never: a real token'],

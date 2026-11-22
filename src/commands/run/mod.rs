@@ -2203,11 +2203,11 @@ mod tests {
         claim_name(&renamed, "repo", "repo-1").unwrap();
     }
 
-    /// A feature's credential claim wires the instance: the phantom and the
-    /// base URL on the env, the phantom file in the remote user's home, and
-    /// devsbd listening on the broker port, the broker behind its bridge
-    /// answering a request it refuses before any network (a dot-segment).
-    /// No credential in this data dir: wired anyway.
+    /// A feature's base-url claim (the sentry-cli fixture) wires the
+    /// instance: the phantom and the base URL on the env, the phantom file in
+    /// the remote user's home, and devsbd listening on the broker port, the
+    /// broker behind its bridge answering a request it refuses before any
+    /// network (a dot-segment). No credential in this data dir: wired anyway.
     #[cfg(unix)]
     #[test_utils::docker_test(helper)]
     fn claims_wire_env_files_and_listeners_with_docker() -> Result<(), String> {
@@ -2220,9 +2220,9 @@ mod tests {
         let Some(root) = isolated_root("claims_child") else { return };
         let (repo, cfg) = (root.join("repo"), root.join("cfg"));
         std::fs::create_dir_all(&repo).unwrap();
-        let feature = cfg.join("features/sentry");
+        let feature = cfg.join("features/sentry-cli");
         std::fs::create_dir_all(&feature).unwrap();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/sentry");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/sentry-cli");
         for file in ["devcontainer-feature.json", "install.sh"] {
             std::fs::copy(fixture.join(file), feature.join(file)).unwrap();
         }
@@ -2233,7 +2233,7 @@ mod tests {
             cfg.join(CONFIG_FILE),
             format!(
                 "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
-                 features = {{ \"./features/sentry\" = {{}} }}\n"
+                 features = {{ \"./features/sentry-cli\" = {{}} }}\n"
             ),
         )
         .unwrap();
@@ -2354,53 +2354,90 @@ mod tests {
         });
     }
 
-    /// sentry-cli end to end: a pinned release in the image, the sentry
-    /// fixture's claim with its one upstream at `localhost` (private, as the
-    /// test TLS leaf covers it), `sentry-work` logged in by the `login` code
-    /// path, and the broker behind the bridge calling a mock Sentry over TLS.
-    /// `releases new` and a source-map upload (chunk-upload's absolute `url`,
-    /// rewritten to the loopback, then the chunk post and assemble) both
-    /// succeed, the mock seeing only the real token as `Bearer`.
+    /// The sentry release the e2e runs, and its linux `.gz` assets' sha256
+    /// from Sentry's release registry.
+    const SENTRY_VERSION: &str = "0.50.0";
+    const SENTRY_SHA256: [(&str, &str); 2] = [
+        ("x64", "acbc613130f9dbf6341d1f334594b81946253d8ff9281ae877985f243aa163aa"),
+        ("arm64", "e8a2afda8cb644ae1b410029121fe89f06da039835769ee81a1d171bb5459999"),
+    ];
+
+    /// sentry itself through the broker in intercept mode: the pinned
+    /// release in a debian image, the sentry fixture's claim with
+    /// `sentry.io` private and `us.sentry.io` let through by the test
+    /// service, each dialed at a loopback mock of its own; `sentry-work`
+    /// logged in by the `login` code path. `sentry issue list` resolves the
+    /// org on sentry.io, then lists its issues on the region host the org
+    /// names (us.sentry.io); `sentry project delete` is refused at its
+    /// `never` DELETE, which reaches neither mock. The mocks see only the
+    /// real token as `Bearer`.
     #[cfg(unix)]
     #[test_utils::docker_test(helper)]
-    fn sentry_cli_brokered_end_to_end_with_docker() -> Result<(), String> {
+    fn sentry_through_the_broker_end_to_end_with_docker() -> Result<(), String> {
         isolated("sentry_e2e_child")
+    }
+
+    /// The fake Sentry: org `o` in region us.sentry.io, its project `p`
+    /// without issues.
+    #[cfg(unix)]
+    fn fake_sentry_api(head: &str, _body: &[u8]) -> Vec<u8> {
+        let line = head.lines().next().unwrap_or_default();
+        let mut parts = line.split(' ');
+        let (method, target) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+        let path = target.split('?').next().unwrap_or_default();
+        let org = serde_json::json!({ "id": "1", "slug": "o", "name": "O" });
+        let (status, json) = match (method, path) {
+            ("GET", "/api/0/organizations/o/") => {
+                let mut org = org;
+                org["links"] = serde_json::json!({ "organizationUrl": "https://o.sentry.io", "regionUrl": "https://us.sentry.io" });
+                (200, org)
+            }
+            ("GET", "/api/0/projects/o/p/") => {
+                (200, serde_json::json!({ "id": "2", "slug": "p", "name": "P", "platform": "node", "organization": org }))
+            }
+            ("GET", "/api/0/organizations/o/issues/") => (200, serde_json::json!([])),
+            _ => (404, serde_json::json!({ "detail": format!("mock: {line}") })),
+        };
+        let body = json.to_string();
+        format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
     }
 
     #[cfg(unix)]
     #[test]
     fn sentry_e2e_child() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
-        const TOKEN: &str = "REAL-sentry-token-0123456789abcdef";
-        const SENTRY_CLI: &str = "3.8.2";
+        const TOKEN: &str = "sntryu_REAL0123456789abcdef";
         let Some(root) = isolated_root("sentry_e2e_child") else { return };
         let (repo, cfg) = (root.join("repo"), root.join("cfg"));
         std::fs::create_dir_all(&repo).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/sentry");
         let feature = cfg.join("features/sentry");
         std::fs::create_dir_all(&feature).unwrap();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/sentry");
         std::fs::copy(fixture.join("install.sh"), feature.join("install.sh")).unwrap();
-        let mut metadata: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(fixture.join("devcontainer-feature.json")).unwrap()).unwrap();
-        metadata["customizations"]["devsandbox"]["credentials"]["sentry"]["upstreams"] =
-            serde_json::json!([{ "host": "localhost", "private": true }]);
+        let json = std::fs::read_to_string(fixture.join("devcontainer-feature.json")).unwrap();
+        let mut metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let upstreams = &mut metadata["customizations"]["devsandbox"]["credentials"]["sentry"]["upstreams"];
+        upstreams[0] = serde_json::json!({ "host": "sentry.io", "private": true });
         std::fs::write(feature.join("devcontainer-feature.json"), metadata.to_string()).unwrap();
 
         let name = format!("sentry-e2e-{}", std::process::id());
+        let sums: String = SENTRY_SHA256.iter().map(|(arch, sum)| format!("{arch}) sum={sum};; ")).collect();
         std::fs::write(
             cfg.join("Dockerfile"),
             format!(
-                "FROM alpine:3.20\nRUN adduser -D -u 1000 dev\n\
-                 RUN case \"$(uname -m)\" in \\\n\
-                 x86_64) sum=c958865f9d4000183509ea21b1f04925d5390de6d8d87386b9e69f2b305070c3 ;; \\\n\
-                 aarch64) sum=b6e49fca868a36d20da2ada1832a0ce2f9ac7012c128207518b09d6b6c991f4d ;; \\\n\
-                 *) echo \"no sentry-cli for $(uname -m)\"; exit 1 ;; esac \\\n\
-                 && wget -qO /usr/local/bin/sentry-cli \
-                 https://github.com/getsentry/sentry-cli/releases/download/{SENTRY_CLI}/sentry-cli-Linux-$(uname -m) \\\n\
-                 && echo \"$sum  /usr/local/bin/sentry-cli\" | sha256sum -c - \\\n\
-                 && chmod 0755 /usr/local/bin/sentry-cli\n"
+                "FROM debian:bookworm-slim\n\
+                 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libatomic1 \
+                 && rm -rf /var/lib/apt/lists/* && useradd -m -u 1000 dev\n\
+                 RUN set -e; arch=$(dpkg --print-architecture); [ $arch = amd64 ] && arch=x64; \
+                 case $arch in {sums}*) exit 1;; esac; \
+                 curl -fsSL -o /tmp/sentry.gz https://github.com/getsentry/toolkit/releases/download/cli@{SENTRY_VERSION}/sentry-linux-$arch.gz; \
+                 echo \"$sum  /tmp/sentry.gz\" | sha256sum -c -; gunzip -c /tmp/sentry.gz > /usr/local/bin/sentry; \
+                 chmod 0755 /usr/local/bin/sentry; rm /tmp/sentry.gz\n"
             ),
         )
         .unwrap();
@@ -2431,43 +2468,8 @@ mod tests {
         let mut flows = crate::commands::login::tests::offline();
         crate::commands::login::login_at(&data, &args, Some(claims), &mut term, &mut flows).unwrap();
 
-        let chunked = Arc::new(AtomicBool::new(false));
-        let saw_chunk = chunked.clone();
-        let (mock_port, seen) = crate::broker::serve::tests::upstream_server(move |head, body| {
-            let line = head.lines().next().unwrap_or_default();
-            let json: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
-            let (status, answer) = match line.split(' ').take(2).collect::<Vec<_>>()[..] {
-                ["POST", "/api/0/organizations/o/releases/"] => (
-                    201,
-                    serde_json::json!({ "version": json["version"], "shortVersion": json["version"],
-                        "dateCreated": "2026-11-21T00:00:00Z", "newGroups": 0, "projects": [] }),
-                ),
-                ["GET", "/api/0/organizations/o/chunk-upload/"] => (
-                    200,
-                    serde_json::json!({ "url": "https://localhost/api/0/organizations/o/chunk-upload/",
-                        "chunkSize": 8388608, "chunksPerRequest": 64, "maxFileSize": 2147483648u64,
-                        "maxRequestSize": 33554432, "concurrency": 1, "hashAlgorithm": "sha1",
-                        "compression": ["gzip"], "accept": ["artifact_bundles", "release_files", "sources"] }),
-                ),
-                ["POST", "/api/0/organizations/o/chunk-upload/"] => {
-                    saw_chunk.store(true, Ordering::SeqCst);
-                    (200, serde_json::json!({}))
-                }
-                ["POST", "/api/0/organizations/o/artifactbundle/assemble/"] if saw_chunk.load(Ordering::SeqCst) => {
-                    (200, serde_json::json!({ "state": "created", "missingChunks": [], "detail": null }))
-                }
-                ["POST", "/api/0/organizations/o/artifactbundle/assemble/"] => {
-                    (200, serde_json::json!({ "state": "not_found", "missingChunks": json["chunks"] }))
-                }
-                _ => (404, serde_json::json!({ "detail": format!("mock: {line}") })),
-            };
-            let body = answer.to_string();
-            format!(
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .into_bytes()
-        });
+        let (main_port, main_seen) = crate::broker::serve::tests::upstream_server(fake_sentry_api);
+        let (region_port, region_seen) = crate::broker::serve::tests::upstream_server(fake_sentry_api);
 
         let project = services::project_id(&cfg).unwrap();
         let container = format!("{NAME_PREFIX}{name}");
@@ -2482,47 +2484,42 @@ mod tests {
             let state = State::load().unwrap();
             let info = state.instances.get(&name).expect("instance recorded");
             let [claim] = &info.claims[..] else { panic!("one claim: {:?}", info.claims) };
-            let port = claim.listeners.iter().find(|l| l.upstream == "localhost").expect("localhost listener").port;
+            let phantom = claim.phantom.clone();
+            assert!(claim.listeners.is_empty(), "{claim:?}");
 
             let mut roots = rustls::RootCertStore::empty();
-            let ca = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broker/ca.pem");
+            let fixture_ca = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broker/ca.pem");
             use rustls::pki_types::pem::PemObject;
-            roots.add(rustls::pki_types::CertificateDer::from_pem_file(ca).unwrap()).unwrap();
+            roots.add(rustls::pki_types::CertificateDer::from_pem_file(fixture_ca).unwrap()).unwrap();
             let upstream = crate::broker::upstream::Upstream::new(roots, None, Default::default()).unwrap();
             let service = crate::broker::serve::Service::new(State::path().unwrap(), Ok(upstream))
                 .unwrap()
-                .with_authority("localhost", &format!("localhost:{mock_port}"));
+                .with_authority("sentry.io", &format!("localhost:{main_port}"))
+                .with_private_host("us.sentry.io", &format!("localhost:{region_port}"));
             let bridge = crate::devsbd::bridge::spawn_brokered(&name, info, Arc::new(service)).unwrap();
             assert_eq!(bridge.outcome(std::time::Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
 
             // The helper answers 503 itself until it has seen the bridge's caps.
-            let script = format!(
-                "for i in $(seq 50); do r=$(printf 'GET /api/0/../x HTTP/1.1\\r\\nHost: 127.0.0.1:{port}\\r\\nConnection: close\\r\\n\\r\\n' \
-                 | nc 127.0.0.1 {port} 2>/dev/null); case \"$r\" in 'HTTP/1.1 400'*) break;; esac; sleep 0.1; done; \
-                 cd /tmp && mkdir dist \
-                 && printf 'function f(){{return 1}}\\n//# sourceMappingURL=app.js.map\\n' > dist/app.js \
-                 && printf '{{\"version\":3,\"file\":\"app.js\",\"sources\":[\"app.ts\"],\"names\":[],\"mappings\":\"AAAA\"}}' > dist/app.js.map; \
-                 sentry-cli releases new v-e2e --org o --project p 2>&1; echo \"release=$?\"; \
-                 sentry-cli sourcemaps inject dist >/dev/null 2>&1; \
-                 sentry-cli sourcemaps upload --org o --project p dist 2>&1; echo \"upload=$?\""
-            );
-            let argv = crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), script], false);
+            let script = "cd /tmp; for i in $(seq 50); do sentry api organizations/o/ >/dev/null 2>&1 && break; sleep 0.2; done; \
+                 sentry issue list o/p 2>&1; echo issues=$?; \
+                 sentry project delete o/p --yes 2>&1; echo delete=$?";
+            let argv =
+                crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), script.into()], false);
             let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
-            assert!(out.lines().any(|l| l == "release=0"), "{out}");
-            assert!(out.lines().any(|l| l == "upload=0"), "{out}");
+            let lines: Vec<&str> = out.lines().collect();
+            assert!(lines.contains(&"issues=0"), "{out}");
+            // sentry words a 403 its own way; the access log has the broker's reason.
+            assert!(!lines.contains(&"delete=0"), "{out}");
 
-            let seen = seen.lock().unwrap().clone();
-            let routes: Vec<&str> = seen.iter().map(|(head, _)| head.lines().next().unwrap_or_default()).collect();
-            for want in [
-                "POST /api/0/organizations/o/releases/ HTTP/1.1",
-                "GET /api/0/organizations/o/chunk-upload/ HTTP/1.1",
-                "POST /api/0/organizations/o/chunk-upload/ HTTP/1.1",
-                "POST /api/0/organizations/o/artifactbundle/assemble/ HTTP/1.1",
-            ] {
-                assert!(routes.contains(&want), "{want} missing from {routes:#?}\n{out}");
-            }
+            let (main, region) = (main_seen.lock().unwrap().clone(), region_seen.lock().unwrap().clone());
+            let asked = |seen: &[(String, Vec<u8>)], want: &str| seen.iter().any(|(head, _)| head.starts_with(want));
+            assert!(asked(&main, "GET /api/0/organizations/o/ "), "{main:#?}");
+            assert!(asked(&region, "GET /api/0/organizations/o/issues/"), "{region:#?}");
+            assert!(!asked(&main, "DELETE ") && !asked(&region, "DELETE "), "the refused DELETE reached Sentry");
+            let seen: Vec<_> = main.into_iter().chain(region).collect();
             let contains = |hay: &[u8], needle: &str| hay.windows(needle.len()).any(|w| w == needle.as_bytes());
             for (head, body) in &seen {
+                assert!(!head.contains(&phantom) && !contains(body, &phantom), "{head}");
                 let auth: Vec<&str> = head
                     .lines()
                     .filter_map(|l| l.split_once(':'))
@@ -2530,7 +2527,6 @@ mod tests {
                     .map(|(_, v)| v.trim())
                     .collect();
                 assert_eq!(auth, [format!("Bearer {TOKEN}")], "{head}");
-                assert!(!head.contains(&claim.phantom) && !contains(body, &claim.phantom), "{head}");
             }
 
             // A line lands after its answer.
@@ -2538,23 +2534,24 @@ mod tests {
             let mut log = String::new();
             for _ in 0..50 {
                 log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                if log.lines().filter(|l| l.contains("\"verdict\":\"allow\"")).count() >= seen.len() {
+                if log.contains("\"verdict\":\"refused\"") && log.contains("/issues/") {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             let lines: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-            let allowed = lines.iter().filter(|l| l["verdict"] == "allow").count();
-            assert_eq!(allowed, seen.len(), "{log}");
             assert!(
                 lines.iter().any(|l| l["verdict"] == "allow"
-                    && l["method"] == "POST"
-                    && l["route"] == "/api/0/organizations/o/chunk-upload/"
-                    && l["scope"] == "uploads"
+                    && l["route"] == "/api/0/organizations/o/issues/"
+                    && l["scope"] == "issues.read"
                     && l["credential"] == "sentry-work"),
                 "{log}"
             );
-            assert!(!log.contains(TOKEN) && !log.contains(&claim.phantom), "{log}");
+            assert!(
+                lines.iter().any(|l| l["verdict"] == "refused" && l["method"] == "DELETE" && l["scope"] == "never"),
+                "{log}"
+            );
+            assert!(!log.contains(TOKEN) && !log.contains(&phantom), "{log}");
         });
     }
 

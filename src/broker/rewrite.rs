@@ -1,7 +1,7 @@
 //! Absolute upstream URLs in a response turned into the instance's loopback
 //! listeners (base-URL mode): a `Location` header, and the JSON fields a
-//! claim's `rewrite` names (sentry's chunk-upload `url`, its regions'
-//! `regions[].url`), so the tool's next call comes back through the broker
+//! claim's `rewrite` names (sentry-cli's chunk-upload `url`, Sentry's
+//! regions' `regions[].url`), so the tool's next call comes back through the broker
 //! instead of going to the upstream with the phantom.
 //!
 //! Only `https://<host>[:443]` URLs whose host has a listener on the

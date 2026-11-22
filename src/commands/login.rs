@@ -779,10 +779,11 @@ pub(crate) mod tests {
         let data = temp("first");
         let mut a = args("sentry-work");
         a.profiles = vec!["work".into()];
+        a.method = Some("paste".into());
         let mut term = Script::new(true, &[true], Some("tok-1\n"));
         let done = login_at(&data, &a, Some(vec![sentry()]), &mut term).unwrap();
         assert!(done.contains("claim version") && done.contains("approved"), "{done}");
-        assert!(term.shown.contains("claim `sentry` (base-url)"), "{}", term.shown);
+        assert!(term.shown.contains("claim `sentry` (intercept)"), "{}", term.shown);
         assert_eq!(Store::in_data(&data).token_now("sentry-work").unwrap().unwrap().expose(), "tok-1");
         let h = home::load(&home::path(&data)).unwrap();
         let e = &h["sentry-work"];
@@ -857,7 +858,8 @@ pub(crate) mod tests {
         })
         .unwrap();
         let mut term = Script::new(true, &[true], Some("t"));
-        let done = login_at(&data, &args("s"), None, &mut term).unwrap();
+        let paste = Args { method: Some("paste".into()), ..args("s") };
+        let done = login_at(&data, &paste, None, &mut term).unwrap();
         assert!(done.contains("approved"), "{done}");
         let e = &home::load(&path).unwrap()["s"];
         assert!(e.pending.is_empty() && e.approved.len() == 1);
@@ -1177,7 +1179,9 @@ pub(crate) mod tests {
         assert!(opened.borrow().is_empty() && term.shown.starts_with("warning: cannot check"), "{}", term.shown);
 
         let owner = Args { yes: true, owner: Some("acme".into()), ..args("s") };
-        let err = login_at(&data, &owner, Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        let mut pageless = sentry();
+        pageless.pinned.login = vec![Login::Paste { hint: None, create: None }];
+        let err = login_at(&data, &owner, Some(vec![pageless]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
         assert!(err.to_string().contains("--owner is for a paste login that opens a token page"), "{err}");
         let blank = Args { owner: Some(" ".into()), ..a };
         let err = login_at(&data, &blank, None, &mut Script::new(false, &[], Some("t"))).unwrap_err();
@@ -1254,7 +1258,7 @@ pub(crate) mod tests {
         super::login_at(&data, &a, Some(vec![sentry()]), &mut term, &mut f).unwrap();
         assert_eq!(*hosts.borrow(), ["sentry.io"]);
         let (head, _) = seen.lock().unwrap()[0].clone();
-        assert!(head.starts_with("GET /api/0/ HTTP/1.1\r\n"), "{head}");
+        assert!(head.starts_with("GET /api/0/users/me/ HTTP/1.1\r\n"), "{head}");
         assert!(head.contains("\r\nauthorization: Bearer sntryu_1\r\n"), "{head}");
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -1285,12 +1289,12 @@ pub(crate) mod tests {
         let mut p = sentry().pinned;
         let host = |h: &str| format!("{h}:8443");
         let (method, url, headers, private) = check_request(&p, "t", &host).unwrap();
-        assert_eq!((method, url.as_str(), private), ("GET", "https://sentry.io:8443/api/0/", false));
+        assert_eq!((method, url.as_str(), private), ("GET", "https://sentry.io:8443/api/0/users/me/", false));
         assert_eq!(headers, [Header { name: "authorization".into(), value: b"Bearer t".to_vec() }]);
         p.inject = vec![Slot::Query { param: "key".into() }];
         p.upstreams[0].private = true;
         let (_, url, headers, private) = check_request(&p, "a b", &host).unwrap();
-        assert_eq!((url.as_str(), private), ("https://sentry.io:8443/api/0/?key=a%20b", true));
+        assert_eq!((url.as_str(), private), ("https://sentry.io:8443/api/0/users/me/?key=a%20b", true));
         assert!(headers.is_empty());
         p.check = None;
         assert!(check_request(&p, "t", &host).is_none());

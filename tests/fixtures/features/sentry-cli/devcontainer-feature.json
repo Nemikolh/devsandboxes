@@ -1,0 +1,138 @@
+{
+  "id": "sentry-cli",
+  "version": "1.0.0",
+  "name": "sentry-cli in base-url mode (test fixture)",
+  "description": "Test fixture: a claim for the Rust sentry-cli, which reads its server from a base URL. It covers what no shipped claim uses: base-url mode, response rewrites (chunk-upload's and regions' absolute URLs) and a phantom prefix. Its install.sh installs nothing.",
+  "customizations": {
+    "devsandbox": {
+      "credentials": {
+        "sentry": {
+          "upstreams": [
+            "sentry.io",
+            "us.sentry.io",
+            "de.sentry.io"
+          ],
+          "mode": "base-url",
+          "baseUrl": "SENTRY_URL",
+          "inject": [
+            {
+              "header": "Authorization",
+              "format": "Bearer {token}"
+            }
+          ],
+          "phantom": {
+            "prefix": "sntrys_",
+            "env": [
+              "SENTRY_AUTH_TOKEN"
+            ],
+            "files": [
+              {
+                "path": ".sentryclirc",
+                "template": "[defaults]\nurl = {baseUrl}\n\n[auth]\ntoken = {phantom}\n"
+              }
+            ]
+          },
+          "rewrite": [
+            {
+              "route": "GET /api/0/organizations/{org}/chunk-upload/",
+              "fields": [
+                "url"
+              ]
+            },
+            {
+              "route": "GET /api/0/users/me/regions/",
+              "fields": [
+                "regions[].url"
+              ]
+            }
+          ],
+          "login": [
+            {
+              "method": "paste",
+              "hint": "an internal integration's token (Settings > Developer Settings > Custom Integrations), with Release admin and Issue & Event read"
+            }
+          ],
+          "check": "GET /api/0/",
+          "refusal": {
+            "shape": "json",
+            "field": "detail"
+          },
+          "scopes": {
+            "org.read": {
+              "routes": [
+                "GET /api/0/",
+                "GET /api/0/organizations/",
+                "GET /api/0/users/me/regions/",
+                "GET /api/0/organizations/{org}/",
+                "GET /api/0/organizations/{org}/projects/",
+                "GET /api/0/organizations/{org}/repos/"
+              ],
+              "permissions": {
+                "org": "read"
+              }
+            },
+            "releases.read": {
+              "routes": [
+                "GET /api/0/organizations/{org}/releases/",
+                "GET /api/0/organizations/{org}/releases/{version}/",
+                "GET /api/0/organizations/{org}/releases/{version}/deploys/",
+                "GET /api/0/projects/{org}/{project}/releases/"
+              ],
+              "permissions": {
+                "release": "admin"
+              }
+            },
+            "releases.write": {
+              "routes": [
+                "POST /api/0/organizations/{org}/releases/",
+                "PUT /api/0/organizations/{org}/releases/{version}/",
+                "DELETE /api/0/organizations/{org}/releases/{version}/",
+                "POST /api/0/organizations/{org}/releases/{version}/deploys/",
+                "POST /api/0/projects/{org}/{project}/releases/"
+              ],
+              "permissions": {
+                "release": "admin"
+              }
+            },
+            "uploads": {
+              "routes": [
+                "GET /api/0/organizations/{org}/chunk-upload/",
+                "POST /api/0/organizations/{org}/chunk-upload/",
+                "POST /api/0/organizations/{org}/artifactbundle/assemble/",
+                "POST /api/0/organizations/{org}/releases/{version}/assemble/",
+                "POST /api/0/projects/{org}/{project}/files/difs/assemble/"
+              ],
+              "permissions": {
+                "release": "admin",
+                "project": "write"
+              }
+            },
+            "issues.read": {
+              "routes": [
+                "GET /api/0/organizations/{org}/issues/",
+                "GET /api/0/projects/{org}/{project}/issues/",
+                "GET /api/0/issues/{id}/",
+                "GET /api/0/issues/{id}/events/",
+                "GET /api/0/projects/{org}/{project}/events/",
+                "GET /api/0/projects/{org}/{project}/events/{id}/"
+              ],
+              "permissions": {
+                "event": "read"
+              }
+            }
+          },
+          "never": [
+            "POST /api/0/organizations/{org}/org-auth-tokens/",
+            "POST /api/0/sentry-apps/{slug}/api-tokens/",
+            "GET /api/0/projects/{org}/{project}/keys/",
+            "POST /api/0/projects/{org}/{project}/keys/",
+            "POST /api/0/api-tokens/"
+          ]
+        }
+      }
+    }
+  },
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils"
+  ]
+}

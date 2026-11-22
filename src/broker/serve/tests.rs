@@ -118,7 +118,7 @@ impl Rig {
         state.instances.values_mut().for_each(with_lfs);
         let storage = format!("localhost:{storage_port}");
         let home = intercept_home(&claim);
-        Rig::with_service(tag, upstream_port, state, home, "github-work", &claim, |s| s.with_storage("storage.test", &storage))
+        Rig::with_service(tag, upstream_port, state, home, "github-work", &claim, |s| s.with_private_host("storage.test", &storage))
     }
 
     fn with(tag: &str, upstream_port: u16, state: State, home: Home, credential: &str, claim: &claim::Claim) -> Rig {

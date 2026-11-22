@@ -521,16 +521,8 @@ fn covers(target: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::home::tests::{sentry, sentry_cli};
 
-    fn sentry() -> Claim {
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/features/sentry/devcontainer-feature.json"
-        ))
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        claim::parse("sentry", &v["customizations"]["devsandbox"]["credentials"]["sentry"]).unwrap()
-    }
 
     fn intercept(kind: &str) -> Claim {
         intercept_of(kind, serde_json::json!(["api.github.com"]), None)
@@ -564,31 +556,31 @@ mod tests {
 
     #[test]
     fn select_refuses_a_second_claim_and_a_shared_intercepted_upstream() {
-        let found = vec![("./a".to_string(), sentry()), ("./b".to_string(), sentry())];
+        let found = vec![("./a".to_string(), sentry_cli()), ("./b".to_string(), sentry_cli())];
         let err = select(found).unwrap_err().to_string();
         assert!(err.contains("features `./a` and `./b` both claim the `sentry` credential"), "{err}");
 
-        let kept = select(vec![("./s".into(), sentry()), ("./gh".into(), intercept("github"))]).unwrap();
+        let kept = select(vec![("./s".into(), sentry_cli()), ("./gh".into(), intercept("github"))]).unwrap();
         assert_eq!(kept.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), ["./s", "./gh"]);
 
         let other = intercept_of("ghe", serde_json::json!(["example.com", "api.github.com"]), None);
         let err = select(vec![("./gh".into(), intercept("github")), ("./ghe".into(), other)]).unwrap_err().to_string();
         assert!(err.contains("features `./gh` and `./ghe` both intercept `api.github.com`"), "{err}");
         // A base-URL claim of the same host is no conflict: it has its own listener.
-        let base = sentry();
+        let base = sentry_cli();
         let shared = intercept_of("x", serde_json::json!([base.pinned.upstreams[0].host.clone()]), None);
         select(vec![("./s".into(), base), ("./x".into(), shared)]).unwrap();
     }
 
     #[test]
     fn plan_allocates_ports_and_rebuild_keeps_phantoms_and_ports() {
-        let selected = vec![("./s".to_string(), sentry())];
+        let selected = vec![("./s".to_string(), sentry_cli())];
         let planned = plan(&selected, &[], None, None, None, counter()).unwrap();
         assert_eq!(planned.proxy, None);
         let first = planned.claims;
         let c = &first[0];
         assert_eq!((c.kind.as_str(), c.phantom.as_str()), ("sentry", "sntrys_1"));
-        assert_eq!(c.version, sentry().version());
+        assert_eq!(c.version, sentry_cli().version());
         // Upstreams in the claim's order; ports from the bottom of the range.
         let got: Vec<(u16, &str)> = c.listeners.iter().map(|l| (l.port, l.upstream.as_str())).collect();
         assert_eq!(got, [(29000, "sentry.io"), (29001, "us.sentry.io"), (29002, "de.sentry.io")]);
@@ -619,7 +611,7 @@ mod tests {
             Some(serde_json::json!({ "hosts": ["github.com"] })),
         );
         let other = intercept_of("x", serde_json::json!(["api.x.io"]), None);
-        let selected = vec![("./s".to_string(), sentry()), ("./gh".to_string(), gh.clone()), ("./x".to_string(), other)];
+        let selected = vec![("./s".to_string(), sentry_cli()), ("./gh".to_string(), gh.clone()), ("./x".to_string(), other)];
         let first = plan(&selected, &[], None, None, None, counter()).unwrap();
         assert!(first.claims[1].listeners.is_empty() && first.claims[2].listeners.is_empty());
         assert_eq!(git_hosts(&first.claims), ["github.com"]);
@@ -718,11 +710,11 @@ mod tests {
 
     #[test]
     fn minted_values_are_long_random_and_plain() {
-        let p = mint_phantom(&sentry()).unwrap();
+        let p = mint_phantom(&sentry_cli()).unwrap();
         let rest = p.strip_prefix("sntrys_").unwrap();
         assert_eq!(rest.len(), PHANTOM_RANDOM);
         assert!(rest.bytes().all(|b| b.is_ascii_alphanumeric()), "{p}");
-        assert_ne!(p, mint_phantom(&sentry()).unwrap());
+        assert_ne!(p, mint_phantom(&sentry_cli()).unwrap());
         let gh = mint_phantom(&intercept("github")).unwrap();
         assert!(gh.starts_with("dsbx_github_"), "{gh}");
         assert_eq!(mint_incarnation().unwrap().len(), PHANTOM_RANDOM);
@@ -730,7 +722,7 @@ mod tests {
 
     #[test]
     fn env_and_files_render_and_mount_targets_skip() {
-        let claim = sentry();
+        let claim = sentry_cli();
         let rec = plan(&[("./s".into(), claim.clone())], &[], None, None, None, counter()).unwrap().claims.remove(0);
         assert_eq!(
             env(&claim, &rec),
@@ -756,6 +748,16 @@ mod tests {
         }
         let (files, _) = render_files(&claim, &rec, "/home/dev", "dev", &["/home/devx".into()]);
         assert_eq!(files.len(), 1);
+
+        // The sentry fixture's intercept claim.
+        let claim = sentry();
+        let planned = plan(&[("./s".into(), claim.clone())], &[], None, None, None, counter()).unwrap();
+        let rec = &planned.claims[0];
+        assert!(rec.listeners.is_empty());
+        assert_eq!(env(&claim, rec), [("SENTRY_AUTH_TOKEN".to_string(), "dsbx_sentry_1".to_string())]);
+        assert!(render_files(&claim, rec, "/home/dev", "dev", &[]).0.is_empty());
+        let hosts = planned.proxy.unwrap().hosts;
+        assert_eq!(hosts, ["de.sentry.io", "sentry.io", "us.sentry.io"]);
     }
 
     /// gh's `hosts.yml` from the github fixture, and the live config's gh
@@ -790,10 +792,10 @@ mod tests {
 
     #[test]
     fn lookups_and_broker_spec() {
-        let selected = vec![("./s".to_string(), sentry()), ("./gh".to_string(), intercept("github"))];
+        let selected = vec![("./s".to_string(), sentry_cli()), ("./gh".to_string(), intercept("github"))];
         let planned = plan(&selected, &[], None, None, None, counter()).unwrap();
         let mut rec = planned.claims;
-        let (files, _) = render_files(&sentry(), &rec[0], "/home/dev", "dev", &[]);
+        let (files, _) = render_files(&sentry_cli(), &rec[0], "/home/dev", "dev", &[]);
         rec[0].files = files;
         assert_eq!(by_phantom(&rec, "sntrys_1").map(|c| c.kind.as_str()), Some("sentry"));
         assert!(by_phantom(&rec, "sntrys_2").is_none());
@@ -896,8 +898,8 @@ mod tests {
 
     #[test]
     fn records_round_trip_through_toml() {
-        let mut rec = plan(&[("./s".into(), sentry())], &[], None, None, None, counter()).unwrap().claims;
-        rec[0].files = render_files(&sentry(), &rec[0], "/home/dev", "dev", &[]).0;
+        let mut rec = plan(&[("./s".into(), sentry_cli())], &[], None, None, None, counter()).unwrap().claims;
+        rec[0].files = render_files(&sentry_cli(), &rec[0], "/home/dev", "dev", &[]).0;
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
         struct Wrap {
             claims: Vec<InstanceClaim>,

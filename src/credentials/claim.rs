@@ -1350,15 +1350,22 @@ mod tests {
     use serde_json::json;
 
     const SENTRY: &str = include_str!("../../tests/fixtures/features/sentry/devcontainer-feature.json");
+    const SENTRY_CLI: &str = include_str!("../../tests/fixtures/features/sentry-cli/devcontainer-feature.json");
 
-    fn sentry_value() -> Value {
-        let feature: Value = serde_json::from_str(SENTRY).unwrap();
+    fn claim_of(feature: &str) -> Value {
+        let feature: Value = serde_json::from_str(feature).unwrap();
         feature.pointer("/customizations/devsandbox/credentials/sentry").unwrap().clone()
     }
 
-    /// The sentry claim with `field` set (`Null` removes it).
-    fn sentry_with(field: &str, value: Value) -> Value {
-        let mut claim = sentry_value();
+    /// The base-url claim most error cases start from: `baseUrl`, `rewrite`,
+    /// a phantom prefix and file all set.
+    fn cli_value() -> Value {
+        claim_of(SENTRY_CLI)
+    }
+
+    /// The sentry-cli claim with `field` set (`Null` removes it).
+    fn cli_with(field: &str, value: Value) -> Value {
+        let mut claim = cli_value();
         let obj = claim.as_object_mut().unwrap();
         if value.is_null() {
             obj.remove(field);
@@ -1368,8 +1375,8 @@ mod tests {
         claim
     }
 
-    fn sentry() -> Claim {
-        parse("sentry", &sentry_value()).unwrap()
+    fn cli() -> Claim {
+        parse("sentry", &cli_value()).unwrap()
     }
 
     fn version_of(claim: Value) -> String {
@@ -1392,7 +1399,38 @@ mod tests {
 
     #[test]
     fn sentry_fixture_parses() {
-        let c = sentry();
+        let c = parse("sentry", &claim_of(SENTRY)).unwrap();
+        let p = &c.pinned;
+        assert_eq!(p.mode, Mode::Intercept);
+        let hosts: Vec<&str> = p.upstreams.iter().map(|u| u.host.as_str()).collect();
+        assert_eq!(hosts, ["sentry.io", "us.sentry.io", "de.sentry.io"]);
+        assert_eq!(
+            p.inject,
+            [Slot::Header { name: "authorization".into(), format: "Bearer {token}".into() }]
+        );
+        assert!(p.rewrite.is_empty());
+        assert_eq!(p.check, Some(Route::parse("GET /api/0/users/me/").unwrap()));
+        assert_eq!(p.check_shows.as_deref(), Some("email"));
+        assert!(matches!(
+            p.login[..],
+            [Login::Paste { create: Some(_), .. }, Login::Device { client_id: Some(_), broad: false, .. }]
+        ));
+        assert!(p.tokens.is_none());
+        let org_read = &p.scopes["org.read"].routes;
+        assert!(org_read.contains(&Route::parse("GET /api/0/users/me/").unwrap()));
+        assert!(p.never.contains(&Route::parse("DELETE /api/0/projects/{org}/{project}/").unwrap()));
+
+        let w = &c.wiring;
+        assert_eq!(w.base_url, None);
+        assert_eq!(w.phantom.prefix, None);
+        assert_eq!(w.phantom.env, ["SENTRY_AUTH_TOKEN"]);
+        assert!(w.phantom.files.is_empty());
+        assert_eq!((&w.ca, &w.git), (&None, &None));
+    }
+
+    #[test]
+    fn sentry_cli_fixture_parses() {
+        let c = cli();
         assert_eq!(c.kind, "sentry");
         let p = &c.pinned;
         assert_eq!(p.mode, Mode::BaseUrl);
@@ -1495,25 +1533,25 @@ mod tests {
 
     #[test]
     fn kind_and_shape_errors() {
-        let e = format!("{:#}", parse_all("f", &json!({ "Sentry": sentry_value() })).unwrap_err());
+        let e = format!("{:#}", parse_all("f", &json!({ "Sentry": cli_value() })).unwrap_err());
         assert!(e.contains("credential `Sentry`: the kind must be lowercase"), "{e}");
         assert_err(json!([]), &["must be an object"]);
-        assert_err(sentry_with("upstream", json!(["sentry.io"])), &["unknown field `upstream`"]);
-        assert_err(sentry_with("mode", Value::Null), &["`mode` is required"]);
-        assert_err(sentry_with("mode", json!("proxy")), &["`mode`: unknown variant `proxy`"]);
-        assert_err(sentry_with("hold", json!(0)), &["`hold`: 0 isn't between 1 and 3600"]);
-        assert_err(sentry_with("hold", json!("2m")), &["`hold`: invalid type"]);
-        assert_err(sentry_with("mint", json!("magic")), &["`mint`: unknown variant `magic`"]);
+        assert_err(cli_with("upstream", json!(["sentry.io"])), &["unknown field `upstream`"]);
+        assert_err(cli_with("mode", Value::Null), &["`mode` is required"]);
+        assert_err(cli_with("mode", json!("proxy")), &["`mode`: unknown variant `proxy`"]);
+        assert_err(cli_with("hold", json!(0)), &["`hold`: 0 isn't between 1 and 3600"]);
+        assert_err(cli_with("hold", json!("2m")), &["`hold`: invalid type"]);
+        assert_err(cli_with("mint", json!("magic")), &["`mint`: unknown variant `magic`"]);
         assert_err(
-            sentry_with("refusal", json!({ "shape": "json", "field": "a..b" })),
+            cli_with("refusal", json!({ "shape": "json", "field": "a..b" })),
             &["`refusal.field`", "isn't a field path"],
         );
         assert_eq!(
-            parse("sentry", &sentry_with("refusal", json!({ "shape": "git" }))).unwrap().pinned.refusal,
+            parse("sentry", &cli_with("refusal", json!({ "shape": "git" }))).unwrap().pinned.refusal,
             Some(Refusal::Git {})
         );
         assert_err(
-            sentry_with("refusal", json!({ "shape": "git", "field": "x" })),
+            cli_with("refusal", json!({ "shape": "git", "field": "x" })),
             &["`refusal`", "unknown field `field`"],
         );
     }
@@ -1536,21 +1574,21 @@ mod tests {
             ),
             (json!([{ "host": "a.lan", "lan": true }]), "`upstreams`"),
         ] {
-            assert_err(sentry_with("upstreams", upstreams), &[want]);
+            assert_err(cli_with("upstreams", upstreams), &[want]);
         }
-        let c = parse("sentry", &sentry_with("upstreams", json!(["sentry.io", { "host": "sentry.lan", "private": true }]))).unwrap();
+        let c = parse("sentry", &cli_with("upstreams", json!(["sentry.io", { "host": "sentry.lan", "private": true }]))).unwrap();
         assert!(c.pinned.upstreams.iter().any(|u| u.host == "sentry.lan" && u.private));
     }
 
     #[test]
     fn mode_and_base_url_errors() {
-        assert_err(sentry_with("baseUrl", Value::Null), &["`base-url` mode needs `baseUrl`"]);
-        assert_err(sentry_with("baseUrl", json!("SENTRY-URL")), &["`baseUrl`: `SENTRY-URL` isn't an env var name"]);
+        assert_err(cli_with("baseUrl", Value::Null), &["`base-url` mode needs `baseUrl`"]);
+        assert_err(cli_with("baseUrl", json!("SENTRY-URL")), &["`baseUrl`: `SENTRY-URL` isn't an env var name"]);
         assert_err(
-            sentry_with("baseUrl", json!("SENTRY_AUTH_TOKEN")),
+            cli_with("baseUrl", json!("SENTRY_AUTH_TOKEN")),
             &["`phantom.env[0]`: `SENTRY_AUTH_TOKEN` is already set by this claim"],
         );
-        let mut intercept = sentry_with("mode", json!("intercept"));
+        let mut intercept = cli_with("mode", json!("intercept"));
         assert_err(intercept.clone(), &["`baseUrl` is only for `base-url` mode"]);
         intercept.as_object_mut().unwrap().remove("baseUrl");
         // the fixture's rc template holds {baseUrl}
@@ -1583,15 +1621,15 @@ mod tests {
             (json!([{ "cookie": "a" }]), "unknown field `cookie`"),
             (json!([bearer, { "header": "authorization", "format": "Bearer {token}" }]), "`inject[1]`: the same slot twice"),
         ] {
-            assert_err(sentry_with("inject", inject), &[want]);
+            assert_err(cli_with("inject", inject), &[want]);
         }
-        let two = sentry_with("inject", json!([bearer, { "header": "X-Api-Key", "format": "{token}" }]));
+        let two = cli_with("inject", json!([bearer, { "header": "X-Api-Key", "format": "{token}" }]));
         assert_eq!(parse("sentry", &two).unwrap().pinned.inject.len(), 2);
     }
 
     #[test]
     fn guard_only_claim_has_no_phantom_or_login() {
-        let mut claim = sentry_value();
+        let mut claim = cli_value();
         let obj = claim.as_object_mut().unwrap();
         obj.remove("inject");
         assert_err(claim.clone(), &["`phantom` without an `inject` slot"]);
@@ -1619,18 +1657,18 @@ mod tests {
             (rc(".config//gh/hosts.yml", "{phantom}"), "without `.`, `..` or empty parts"),
             (rc(".sentryclirc", "[auth]\ntoken = x\n"), "the template must hold `{phantom}`"),
         ] {
-            assert_err(sentry_with("phantom", phantom), &[want]);
+            assert_err(cli_with("phantom", phantom), &[want]);
         }
         let dup = json!({ "files": [
             { "path": ".a", "template": "{phantom}" },
             { "path": ".a", "template": "{phantom}" },
         ] });
-        assert_err(sentry_with("phantom", dup), &["`phantom.files[1]`: `.a` is listed twice"]);
+        assert_err(cli_with("phantom", dup), &["`phantom.files[1]`: `.a` is listed twice"]);
     }
 
     #[test]
     fn scope_and_never_errors() {
-        let scopes = |v: Value| sentry_with("scopes", v);
+        let scopes = |v: Value| cli_with("scopes", v);
         assert_err(scopes(json!({ "a": ["GET /x"], "b": ["GET /x"] })), &["`scopes.b`: `GET /x` is in scope `a` too"]);
         assert_err(scopes(json!({ "a": ["GET /x", "GET /x"] })), &["`scopes.a`: `GET /x` is listed twice"]);
         assert_err(scopes(json!({ "other": ["GET /x"] })), &["`other` is the scope of unknown routes"]);
@@ -1645,15 +1683,15 @@ mod tests {
         assert!(pr.pinned.scopes["pr.write"].permissions.is_empty());
 
         assert_err(
-            sentry_with("never", json!(["GET /api/0/"])),
+            cli_with("never", json!(["GET /api/0/"])),
             &["`never[0]`: `GET /api/0/` is in scope `org.read` too: a route is scoped or `never`, not both"],
         );
-        assert_err(sentry_with("never", json!(["POST /x", "POST /x"])), &["`never[1]`: `POST /x` is listed twice"]);
+        assert_err(cli_with("never", json!(["POST /x", "POST /x"])), &["`never[1]`: `POST /x` is listed twice"]);
     }
 
     #[test]
     fn rewrite_errors() {
-        let rewrite = |v: Value| sentry_with("rewrite", v);
+        let rewrite = |v: Value| cli_with("rewrite", v);
         assert_err(rewrite(json!([{ "route": "GET /x", "fields": [] }])), &["`rewrite[0]`: `fields` must name"]);
         assert_err(rewrite(json!([{ "route": "GET /x", "fields": ["regions[]url"] }])), &["isn't a field path"]);
         assert_err(rewrite(json!([{ "route": "GET /x", "fields": ["a", "a"] }])), &["`a` is listed twice"]);
@@ -1667,14 +1705,14 @@ mod tests {
 
     #[test]
     fn login_and_check_errors() {
-        assert_err(sentry_with("login", Value::Null), &["`login` is required"]);
-        assert_err(sentry_with("login", json!([])), &["at least one method"]);
-        assert_err(sentry_with("login", json!([{ "method": "paste" }, { "method": "paste", "hint": "x" }])), &["`login[1]`: the same method twice"]);
-        assert_err(sentry_with("login", json!([{ "method": "sms" }])), &["`login`", "unknown variant `sms`"]);
-        assert_err(sentry_with("login", json!([{ "method": "paste", "url": "x" }])), &["unknown field `url`"]);
-        assert_err(sentry_with("login", json!([{ "method": "github-app-manifest", "owner": "x" }])), &["unknown field `owner`"]);
+        assert_err(cli_with("login", Value::Null), &["`login` is required"]);
+        assert_err(cli_with("login", json!([])), &["at least one method"]);
+        assert_err(cli_with("login", json!([{ "method": "paste" }, { "method": "paste", "hint": "x" }])), &["`login[1]`: the same method twice"]);
+        assert_err(cli_with("login", json!([{ "method": "sms" }])), &["`login`", "unknown variant `sms`"]);
+        assert_err(cli_with("login", json!([{ "method": "paste", "url": "x" }])), &["unknown field `url`"]);
+        assert_err(cli_with("login", json!([{ "method": "github-app-manifest", "owner": "x" }])), &["unknown field `owner`"]);
         assert_err(
-            sentry_with("login", json!([{ "method": "device", "clientId": "abc", "deviceUrl": "http://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" }])),
+            cli_with("login", json!([{ "method": "device", "clientId": "abc", "deviceUrl": "http://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" }])),
             &["`login[0]`: `deviceUrl`", "isn't an https URL"],
         );
         let all = json!([
@@ -1683,16 +1721,16 @@ mod tests {
             { "method": "device", "clientId": "abc", "deviceUrl": "https://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" },
             { "method": "paste" },
         ]);
-        assert_eq!(parse("sentry", &sentry_with("login", all)).unwrap().pinned.login.len(), 4);
+        assert_eq!(parse("sentry", &cli_with("login", all)).unwrap().pinned.login.len(), 4);
         assert_err(
-            sentry_with("login", json!([{ "method": "device", "clientId": "", "deviceUrl": "https://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" }])),
+            cli_with("login", json!([{ "method": "device", "clientId": "", "deviceUrl": "https://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" }])),
             &["`login[0]`", "`clientId` must be non-empty"],
         );
         let home_app = json!([
             { "method": "browser", "authorizeUrl": "https://github.com/login/oauth/authorize", "tokenUrl": "https://github.com/login/oauth/access_token" },
             { "method": "device", "deviceUrl": "https://github.com/login/device/code", "tokenUrl": "https://github.com/login/oauth/access_token" },
         ]);
-        let c = parse("sentry", &sentry_with("login", home_app)).unwrap();
+        let c = parse("sentry", &cli_with("login", home_app)).unwrap();
         assert!(c.pinned.login.iter().all(|l| matches!(l, Login::Device { client_id: None, .. } | Login::Browser { client_id: None, .. })));
         assert!(!c.canonical().contains("clientId"), "an absent client id stays absent in the pinned claim");
         assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
@@ -1703,7 +1741,7 @@ mod tests {
             d
         };
         let broad = |logins: Value, tokens: Value| {
-            let mut c = sentry_with("login", logins);
+            let mut c = cli_with("login", logins);
             if !tokens.is_null() {
                 c["tokens"] = tokens;
             }
@@ -1738,7 +1776,7 @@ mod tests {
         let c = parse("sentry", &broad(browser, json!({ "broad": ["gho_"] }))).unwrap();
         assert!(matches!(&c.pinned.login[..], [Login::Browser { client_id: None, broad: true, .. }]), "the client id may be the home's");
 
-        let paste = |create: Value| sentry_with("login", json!([{ "method": "paste", "create": create }]));
+        let paste = |create: Value| cli_with("login", json!([{ "method": "paste", "create": create }]));
         let c = parse("sentry", &paste(json!({ "url": "https://github.com/settings/personal-access-tokens/new" }))).unwrap();
         let want = Create { url: "https://github.com/settings/personal-access-tokens/new".into(), permissions: false };
         assert_eq!(c.pinned.login, [Login::Paste { hint: None, create: Some(want) }]);
@@ -1749,25 +1787,25 @@ mod tests {
         assert_err(paste(json!({ "url": "https://github.com/new", "name": "x" })), &["unknown field `name`"]);
         assert_err(paste(json!({ "permissions": true })), &["missing field `url`"]);
 
-        assert_err(sentry_with("check", json!("GET /api/0/organizations/{org}/")), &["`check`", "no `{var}`"]);
-        assert_err(sentry_with("check", json!("POST /api/0/")), &["`check`", "a `GET` or `HEAD`"]);
-        assert_err(sentry_with("check", json!("graphql mutation x")), &["`check`"]);
+        assert_err(cli_with("check", json!("GET /api/0/organizations/{org}/")), &["`check`", "no `{var}`"]);
+        assert_err(cli_with("check", json!("POST /api/0/")), &["`check`", "a `GET` or `HEAD`"]);
+        assert_err(cli_with("check", json!("graphql mutation x")), &["`check`"]);
 
-        let c = parse("sentry", &sentry_with("checkShows", json!("user_name"))).unwrap();
+        let c = parse("sentry", &cli_with("checkShows", json!("user_name"))).unwrap();
         assert_eq!(c.pinned.check_shows.as_deref(), Some("user_name"));
         assert!(c.canonical().contains(r#""checkShows":"user_name""#), "{}", c.canonical());
         assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
-        assert!(!sentry().canonical().contains("checkShows"), "absent stays absent");
-        assert_err(sentry_with("checkShows", json!("user.name")), &["`checkShows`", "isn't a field name"]);
-        assert_err(sentry_with("checkShows", json!("")), &["isn't a field name"]);
-        let mut unchecked = sentry_with("checkShows", json!("login"));
+        assert!(!cli().canonical().contains("checkShows"), "absent stays absent");
+        assert_err(cli_with("checkShows", json!("user.name")), &["`checkShows`", "isn't a field name"]);
+        assert_err(cli_with("checkShows", json!("")), &["isn't a field name"]);
+        let mut unchecked = cli_with("checkShows", json!("login"));
         unchecked.as_object_mut().unwrap().remove("check");
         assert_err(unchecked, &["the claim has no `check`"]);
     }
 
     #[test]
     fn presence_and_fence() {
-        let ok = sentry_with(
+        let ok = cli_with(
             "presence",
             json!([
                 { "route": "POST /repos/{repo}/releases", "target": "tag_name" },
@@ -1781,7 +1819,7 @@ mod tests {
         assert!(p.contains(&Presence::Ref { pattern: "refs/tags/*".into(), on: vec![RefOp::Create, RefOp::Update, RefOp::Delete] }));
         assert!(p.contains(&Presence::Ref { pattern: "refs/heads/*".into(), on: vec![RefOp::Delete] }));
 
-        let presence = |v: Value| sentry_with("presence", v);
+        let presence = |v: Value| cli_with("presence", v);
         assert_err(presence(json!([{ "route": "DELETE /a/{x}", "target": "{y}" }])), &["`presence[0]`: `target`", "has no `{y}`"]);
         assert_err(presence(json!([{ "route": "POST /a" }])), &["needs the `target` field"]);
         assert_err(presence(json!([{ "ref": "tags/*" }])), &["starts with `refs/`"]);
@@ -1790,7 +1828,7 @@ mod tests {
         assert_err(presence(json!([{ "ref": "refs/tags/*", "route": "POST /a", "target": "x" }])), &["name a `route` with its `target`, or a `ref`"]);
         assert_err(presence(json!([{ "ref": "refs/tags/*" }, { "ref": "refs/tags/*", "on": ["delete", "create", "update"] }])), &["`presence[1]`: listed twice"]);
 
-        let fence = sentry_with(
+        let fence = cli_with(
             "fence",
             json!({
                 "POST /repos/{repo}/forks": ["{repo}", "organization"],
@@ -1800,29 +1838,29 @@ mod tests {
         );
         let f = parse("sentry", &fence).unwrap().pinned.fence;
         assert_eq!(f[&Route::parse("graphql mutation createPullRequest").unwrap()], ["input.headRepositoryId", "input.repositoryId"]);
-        assert_err(sentry_with("fence", json!({ "graphql query": ["owner"] })), &["`fence.graphql query`", "never fenced"]);
-        assert_err(sentry_with("fence", json!({ "graphql mutation m": ["input..x"] })), &["isn't a field path"]);
-        assert_err(sentry_with("fence", json!({ "GET /a/{x}": ["{y}"] })), &["`fence.GET /a/{x}`", "has no `{y}`"]);
-        assert_err(sentry_with("fence", json!({ "graphql mutation m": ["{repo}"] })), &["has no `{repo}`"]);
-        assert_err(sentry_with("fence", json!({ "GET /a": [] })), &["name at least one input"]);
-        assert_err(sentry_with("fence", json!({ "GET /a": ["x", "x"] })), &["`x` is listed twice"]);
+        assert_err(cli_with("fence", json!({ "graphql query": ["owner"] })), &["`fence.graphql query`", "never fenced"]);
+        assert_err(cli_with("fence", json!({ "graphql mutation m": ["input..x"] })), &["isn't a field path"]);
+        assert_err(cli_with("fence", json!({ "GET /a/{x}": ["{y}"] })), &["`fence.GET /a/{x}`", "has no `{y}`"]);
+        assert_err(cli_with("fence", json!({ "graphql mutation m": ["{repo}"] })), &["has no `{repo}`"]);
+        assert_err(cli_with("fence", json!({ "GET /a": [] })), &["name at least one input"]);
+        assert_err(cli_with("fence", json!({ "GET /a": ["x", "x"] })), &["`x` is listed twice"]);
     }
 
     #[test]
     fn graphql_routes_own_the_graphql_path() {
-        let gql = parse("sentry", &sentry_with("scopes", json!({ "read": ["graphql query", "GET /api/0/"] }))).unwrap();
+        let gql = parse("sentry", &cli_with("scopes", json!({ "read": ["graphql query", "GET /api/0/"] }))).unwrap();
         assert!(gql.pinned.graphql());
-        assert!(!parse("sentry", &sentry_with("scopes", json!({ "read": ["POST /graphql"] }))).unwrap().pinned.graphql());
+        assert!(!parse("sentry", &cli_with("scopes", json!({ "read": ["POST /graphql"] }))).unwrap().pinned.graphql());
         assert_err(
-            sentry_with("scopes", json!({ "read": ["graphql query"], "w": ["POST /graphql"] })),
+            cli_with("scopes", json!({ "read": ["graphql query"], "w": ["POST /graphql"] })),
             &["`POST /graphql`: a claim with GraphQL routes decides `/graphql` by its document"],
         );
     }
 
     #[test]
     fn git_and_ca_are_intercept_only() {
-        assert_err(sentry_with("git", json!({ "hosts": ["sentry.io"] })), &["`git` is only for `intercept` mode"]);
-        assert_err(sentry_with("ca", json!({ "env": "X" })), &["`ca` is only for `intercept` mode"]);
+        assert_err(cli_with("git", json!({ "hosts": ["sentry.io"] })), &["`git` is only for `intercept` mode"]);
+        assert_err(cli_with("ca", json!({ "env": "X" })), &["`ca` is only for `intercept` mode"]);
 
         let gh = json!({
             "upstreams": ["api.github.com", "uploads.github.com", "github.com"],
@@ -1884,12 +1922,12 @@ mod tests {
         let mut no_git = ok.clone();
         no_git.as_object_mut().unwrap().remove("git");
         assert!(err(no_git).contains("`lfs` needs `git`"));
-        assert_err(sentry_with("lfs", json!({ "hosts": ["sentry.io"], "upload": "uploads" })), &["`lfs` is only for `intercept` mode"]);
+        assert_err(cli_with("lfs", json!({ "hosts": ["sentry.io"], "upload": "uploads" })), &["`lfs` is only for `intercept` mode"]);
     }
 
     #[test]
     fn canonical_reads_back() {
-        let mut c = sentry();
+        let mut c = cli();
         c.pinned.upstreams[0].private = true;
         c.pinned.inject.push(Slot::Basic { username: "u".into() });
         c.pinned.inject.push(Slot::Query { param: "key".into() });
@@ -1903,7 +1941,7 @@ mod tests {
 
     #[test]
     fn version_is_sha256_hex_of_the_canonical_pinned_part() {
-        let c = sentry();
+        let c = cli();
         let v = c.version();
         assert_eq!(v.len(), 64);
         assert!(v.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -1917,8 +1955,8 @@ mod tests {
 
     #[test]
     fn reordering_keeps_the_version() {
-        let base = sentry().version();
-        let mut claim = sentry_value();
+        let base = cli().version();
+        let mut claim = cli_value();
         let obj = claim.as_object_mut().unwrap();
         for list in ["never", "rewrite"] {
             obj.get_mut(list).unwrap().as_array_mut().unwrap().reverse();
@@ -1933,24 +1971,24 @@ mod tests {
         assert_ne!(reordered.version(), base);
         assert_eq!(reordered.wiring.base_url.unwrap().upstream, "de.sentry.io");
 
-        let two = |a: Value, b: Value| version_of(sentry_with("inject", json!([a, b])));
+        let two = |a: Value, b: Value| version_of(cli_with("inject", json!([a, b])));
         let bearer = json!({ "header": "Authorization", "format": "Bearer {token}" });
         let key = json!({ "header": "x-api-key", "format": "{token}" });
         assert_eq!(two(bearer.clone(), key.clone()), two(key, bearer));
         // header names compare case-insensitively
         assert_eq!(
-            version_of(sentry_with("inject", json!([{ "header": "AUTHORIZATION", "format": "Bearer {token}" }]))),
+            version_of(cli_with("inject", json!([{ "header": "AUTHORIZATION", "format": "Bearer {token}" }]))),
             base
         );
         let rewrite = |fields: Value| {
-            version_of(sentry_with("rewrite", json!([{ "route": "GET /x", "fields": fields }])))
+            version_of(cli_with("rewrite", json!([{ "route": "GET /x", "fields": fields }])))
         };
         assert_eq!(rewrite(json!(["a", "b"])), rewrite(json!(["b", "a"])));
     }
 
     #[test]
     fn wiring_changes_keep_the_version() {
-        let base = sentry().version();
+        let base = cli().version();
         let rc = "[defaults]\nurl = {baseUrl}\n\n[auth]\ntoken = {phantom}\n";
         for (field, value) in [
             ("baseUrl", json!("SENTRY_BASE")),
@@ -1958,52 +1996,52 @@ mod tests {
             ("phantom", json!({ "prefix": "x_", "env": ["SENTRY_AUTH_TOKEN"] })),
             ("phantom", json!({ "files": [{ "path": ".config/sentry/rc", "template": "token={phantom}" }] })),
         ] {
-            assert_eq!(version_of(sentry_with(field, value.clone())), base, "{field} = {value}");
+            assert_eq!(version_of(cli_with(field, value.clone())), base, "{field} = {value}");
         }
     }
 
     #[test]
     fn semantic_changes_move_the_version() {
-        let base = sentry().version();
+        let base = cli().version();
         let mut seen = BTreeSet::from([base.clone()]);
         let mut changed = |claim: Value, what: &str| {
             let v = version_of(claim);
             assert!(seen.insert(v), "{what}: version unchanged or same as another change");
         };
-        changed(sentry_with("upstreams", json!(["sentry.io", "us.sentry.io", "de.sentry.io", "eu.sentry.io"])), "upstream added");
-        changed(sentry_with("upstreams", json!(["sentry.io", "us.sentry.io"])), "upstream dropped");
-        changed(sentry_with("upstreams", json!(["sentry.io", "us.sentry.io", { "host": "de.sentry.io", "private": true }])), "private");
-        changed(sentry_with("inject", json!([{ "header": "Authorization", "format": "Token {token}" }])), "format");
-        changed(sentry_with("inject", json!([{ "query": "token" }])), "slot");
-        changed(sentry_with("check", json!("HEAD /api/0/")), "check");
-        changed(sentry_with("check", Value::Null), "no check");
-        changed(sentry_with("checkShows", json!("user")), "checkShows");
-        changed(sentry_with("hold", json!(30)), "hold");
-        changed(sentry_with("mint", json!("oauth-refresh")), "mint");
-        changed(sentry_with("refusal", json!({ "shape": "json", "field": "message" })), "refusal");
-        changed(sentry_with("login", json!([{ "method": "paste" }])), "login hint");
-        changed(sentry_with("rewrite", json!([{ "route": "GET /api/0/organizations/{org}/chunk-upload/", "fields": ["url"] }])), "rewrite dropped");
-        changed(sentry_with("presence", json!([{ "ref": "refs/tags/*" }])), "presence");
-        changed(sentry_with("fence", json!({ "GET /api/0/organizations/{org}/": ["{org}"] })), "fence");
+        changed(cli_with("upstreams", json!(["sentry.io", "us.sentry.io", "de.sentry.io", "eu.sentry.io"])), "upstream added");
+        changed(cli_with("upstreams", json!(["sentry.io", "us.sentry.io"])), "upstream dropped");
+        changed(cli_with("upstreams", json!(["sentry.io", "us.sentry.io", { "host": "de.sentry.io", "private": true }])), "private");
+        changed(cli_with("inject", json!([{ "header": "Authorization", "format": "Token {token}" }])), "format");
+        changed(cli_with("inject", json!([{ "query": "token" }])), "slot");
+        changed(cli_with("check", json!("HEAD /api/0/")), "check");
+        changed(cli_with("check", Value::Null), "no check");
+        changed(cli_with("checkShows", json!("user")), "checkShows");
+        changed(cli_with("hold", json!(30)), "hold");
+        changed(cli_with("mint", json!("oauth-refresh")), "mint");
+        changed(cli_with("refusal", json!({ "shape": "json", "field": "message" })), "refusal");
+        changed(cli_with("login", json!([{ "method": "paste" }])), "login hint");
+        changed(cli_with("rewrite", json!([{ "route": "GET /api/0/organizations/{org}/chunk-upload/", "fields": ["url"] }])), "rewrite dropped");
+        changed(cli_with("presence", json!([{ "ref": "refs/tags/*" }])), "presence");
+        changed(cli_with("fence", json!({ "GET /api/0/organizations/{org}/": ["{org}"] })), "fence");
 
-        let mut scopes = sentry_value()["scopes"].clone();
+        let mut scopes = cli_value()["scopes"].clone();
         scopes["issues.read"]["routes"].as_array_mut().unwrap().push(json!("GET /api/0/issues/{id}/hashes/"));
-        changed(sentry_with("scopes", scopes), "route added to a scope");
+        changed(cli_with("scopes", scopes), "route added to a scope");
 
-        let mut scopes = sentry_value()["scopes"].clone();
+        let mut scopes = cli_value()["scopes"].clone();
         let moved = scopes["issues.read"]["routes"].as_array_mut().unwrap().pop().unwrap();
         scopes["org.read"]["routes"].as_array_mut().unwrap().push(moved);
-        changed(sentry_with("scopes", scopes), "route moved between scopes");
+        changed(cli_with("scopes", scopes), "route moved between scopes");
 
-        let mut scopes = sentry_value()["scopes"].clone();
+        let mut scopes = cli_value()["scopes"].clone();
         scopes["issues.read"]["permissions"]["event"] = json!("write");
-        changed(sentry_with("scopes", scopes), "permission level");
+        changed(cli_with("scopes", scopes), "permission level");
 
-        let mut never = sentry_value()["never"].clone();
+        let mut never = cli_value()["never"].clone();
         never.as_array_mut().unwrap().pop();
-        changed(sentry_with("never", never), "never dropped");
+        changed(cli_with("never", never), "never dropped");
 
-        let other_kind = parse("sentry-alt", &sentry_value()).unwrap().version();
+        let other_kind = parse("sentry-alt", &cli_value()).unwrap().version();
         assert_ne!(other_kind, base, "kind");
     }
 }

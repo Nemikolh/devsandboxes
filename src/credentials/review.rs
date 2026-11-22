@@ -244,12 +244,12 @@ mod tests {
     use serde_json::json;
 
     fn sentry_json() -> Value {
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/features/sentry/devcontainer-feature.json"
-        ))
-        .unwrap();
-        let v: Value = serde_json::from_str(&text).unwrap();
+        fixture_json("sentry")
+    }
+
+    fn fixture_json(dir: &str) -> Value {
+        let path = format!("{}/tests/fixtures/features/{dir}/devcontainer-feature.json", env!("CARGO_MANIFEST_DIR"));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         v["customizations"]["devsandbox"]["credentials"]["sentry"].clone()
     }
 
@@ -262,9 +262,10 @@ mod tests {
         let v = view(&sentry_json());
         assert_eq!(v.kind, "sentry");
         let s = v.summary();
-        assert!(s.starts_with("claim `sentry` (base-url)\n  upstreams: de.sentry.io, sentry.io, us.sentry.io\n"), "{s}");
-        assert!(s.contains("    issues.read (6 routes)\n"), "{s}");
-        assert!(s.contains("  never (no ask or rule opens them):\n    GET /api/0/projects/{org}/{project}/keys/\n"), "{s}");
+        assert!(s.starts_with("claim `sentry` (intercept)\n  upstreams: de.sentry.io, sentry.io, us.sentry.io\n"), "{s}");
+        assert!(s.contains("    issues.read (14 routes)\n    issues.write (6 routes)\n"), "{s}");
+        assert!(s.contains("    seer (1 route)\n"), "{s}");
+        assert!(s.contains("  never (no ask or rule opens them):\n    DELETE /api/0/organizations/{org}/\n"), "{s}");
     }
 
     #[test]
@@ -279,20 +280,22 @@ mod tests {
         c["scopes"]["debug.read"] = json!({ "routes": ["GET /api/0/projects/{org}/{project}/files/dsyms/"] });
         c["never"].as_array_mut().unwrap().push(json!("POST /api/0/organizations/{org}/integrations/"));
         c["refusal"] = json!({ "shape": "json", "field": "message" });
-        c["rewrite"] = json!([]);
         let (old, new) = (view(&old_json), view(&c));
         let d = diff(&old, &new);
         assert_eq!(d.upstreams, Change { added: vec!["eu.sentry.io".into()], removed: vec!["de.sentry.io".into()] });
         assert_eq!(d.scopes.keys().collect::<Vec<_>>(), ["debug.read", "org.read", "releases.read", "uploads"]);
-        assert_eq!(d.scopes["releases.read"].removed, ["GET /api/0/projects/{org}/{project}/releases/"]);
+        assert_eq!(
+            d.scopes["releases.read"].removed,
+            ["GET /api/0/organizations/{org}/preprodartifacts/{artifact_id}/install-details/"]
+        );
         assert_eq!(d.scopes["uploads"].removed.len(), 5);
         assert_eq!(d.never.added, ["POST /api/0/organizations/{org}/integrations/"]);
         assert!(d.never.removed.is_empty());
-        assert_eq!(d.changed, ["refusal", "rewrite", "scopes.org.read.permissions"]);
+        assert_eq!(d.changed, ["refusal", "scopes.org.read.permissions"]);
         let text = d.render(&old, &new);
         assert!(text.starts_with("  upstreams:\n    + eu.sentry.io\n    - de.sentry.io\n  scope debug.read (new):\n"), "{text}");
         assert!(text.contains("  scope uploads (dropped):\n    - "), "{text}");
-        assert!(text.ends_with("  also changed: refusal, rewrite, scopes.org.read.permissions\n"), "{text}");
+        assert!(text.ends_with("  also changed: refusal, scopes.org.read.permissions\n"), "{text}");
 
         assert_eq!(diff(&old, &old), Diff::default());
         let mut private = old_json.clone();
@@ -300,11 +303,17 @@ mod tests {
         let d = diff(&old, &view(&private));
         assert_eq!(d.upstreams.added, ["us.sentry.io (private)"]);
         assert_eq!(d.upstreams.removed, ["us.sentry.io"]);
+
+        let cli = fixture_json("sentry-cli");
+        let mut unrewritten = cli.clone();
+        unrewritten["rewrite"] = json!([]);
+        assert_eq!(diff(&view(&cli), &view(&unrewritten)).changed, ["rewrite"]);
     }
 
     #[test]
     fn a_paste_login_s_token_page_is_a_change() {
-        let old_json = sentry_json();
+        let mut old_json = sentry_json();
+        old_json["login"][0].as_object_mut().unwrap().remove("create");
         let mut c = old_json.clone();
         c["login"][0]["create"] = json!({ "url": "https://sentry.io/settings/account/api/auth-tokens/new-token/" });
         let (old, new) = (view(&old_json), view(&c));
@@ -316,7 +325,8 @@ mod tests {
 
     #[test]
     fn a_broad_login_its_scope_and_broad_tokens_are_changes() {
-        let old_json = sentry_json();
+        let mut old_json = sentry_json();
+        old_json["login"].as_array_mut().unwrap().retain(|l| l["method"] == "paste");
         let device = |scope: &str| {
             json!({ "method": "device", "clientId": "c", "scope": scope, "broad": true,
                     "deviceUrl": "https://sentry.io/d", "tokenUrl": "https://sentry.io/t" })
