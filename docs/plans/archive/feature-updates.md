@@ -1,3 +1,9 @@
+> Archived 2026-11-22. Historical, may be wrong; do not use as a reference.
+> Current: [daemon/updates.md](../../architecture/daemon/updates.md),
+> [update CLI](../../reference/update-cli.md),
+> [images and features](../../architecture/instances/images-and-features.md),
+> [ADR 0059](../../decisions/0059-feature-updates-run-in-the-features-image.md)
+
 # Feature updates
 
 Status: agreed; building.

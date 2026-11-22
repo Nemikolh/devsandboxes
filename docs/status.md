@@ -12,9 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **features**: feature updates: a feature's shared tool dir updated on
-  schedule by the daemon, in the feature's image, gh first.
-  → [plan](plans/active/feature-updates.md)
+Nothing.
 
 ## Planned
 
