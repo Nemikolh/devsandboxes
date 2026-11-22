@@ -199,3 +199,21 @@ git-lfs reaches the loopback href directly: `NO_PROXY` always holds
 `127.0.0.1` ([images and features](../instances/images-and-features.md#credential-claims)). `locks` routes are the
 claim's own (`GET …/info/lfs/locks` a read, the `POST`s, `locks/verify`
 before every push included, writes).
+
+## End to end
+
+`commands::run::tests::git_through_the_broker_end_to_end_with_docker`
+runs the whole path: an alpine container with the github test fixture's
+claim (its `github.com` marked private, so loopback may be dialed and
+the broker answers an uninjected call's 401 itself), whose `github.com`
+the broker dials at a local TLS server
+(`Service::with_authority`) running the host's `git http-backend` per
+request (`http_backend`). The folder's recorded origin puts
+`allowed-org/app` in the fence; `other/lib` is outside and anonymous.
+git clones and pushes `allowed-org/app` (the broker's 401 challenge, the
+helper's phantom, the real token injected), clones `other/lib` stripped
+(`devsandbox-fence: outside`), is refused a push to it before the
+upstream, and, with `access.github.scopes = ["repo.read"]` written into
+the config mid-test, a push to `allowed-org/app`. The upstream never
+sees the phantom, and the token only on `allowed-org`; `access.log`
+holds neither.

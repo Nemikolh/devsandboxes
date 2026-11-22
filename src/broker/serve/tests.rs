@@ -782,6 +782,16 @@ fn git_fetch_in_the_fence_injects_into_the_basic_slot() {
 }
 
 #[test]
+fn git_without_the_phantom_on_a_private_upstream_is_challenged() {
+    let (port, seen) = upstream_server(echo);
+    let rig = Rig::fenced("git-challenge", port);
+    let a = git_client(&rig).call("GET", "/o/r.git/info/refs?service=git-upload-pack", "Git-Protocol: version=2\r\n", b"");
+    assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Basic realm=\"devsandbox\"")), "{a:?}");
+    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(rig.log(1)[0]["verdict"], "uninjected");
+}
+
+#[test]
 fn git_fetch_outside_the_fence_goes_stripped_and_marked() {
     let (port, seen) = upstream_server(echo);
     let rig = Rig::fenced("git-out", port);

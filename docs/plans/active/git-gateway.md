@@ -435,6 +435,19 @@ impossible: rewrite to the gateway where the host speaks HTTPS.
    remote instances once credential-broker step 5 carries `CRED`; until
    then they keep today's agent and `[[agent]]` grants. Enough for
    [github-and-sentry-access](github-and-sentry-access.md) step 2.
+   Built: the remotes record and fence
+   ([fence](../../architecture/credentials/fence.md)), the broker's fence
+   and smart HTTP ([broker](../../architecture/credentials/broker.md#the-repo-fence)),
+   git's own proxy port, settings, credential helper and boot check, LFS
+   handles ([git](../../architecture/credentials/git.md)), the relay's
+   key filtering ([ssh-agent](../../architecture/helper/ssh-agent.md#key-filtering)),
+   `devsandbox vscode`'s refusal, `ssh-keys` in the `config-toml-spec`
+   skill; tested end to end with a clone and push through the broker
+   (git's 401 challenge on a private upstream came with it). Deferred, each a
+   [status](../../status.md#credentials) limitation: rewrites for a
+   recorded ssh host alias (`git@github-work:`), the fence resolved to
+   repo ids (shared with github-and-sentry-access step 2), `access ls`
+   marking a host-class home or shared writable bind.
 2. **Push rules**: receive-pack parsing, `branches` and `tags` (git and
    REST), create and delete rules, `report-status` refusals,
    `git.push.workflows`, `presence` ref forms (passing as in step 1

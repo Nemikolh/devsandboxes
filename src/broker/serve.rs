@@ -338,6 +338,11 @@ impl Service {
             Action::Uninjected { private: true } => {
                 let close = close_after_refusal;
                 let mut out = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n".to_vec();
+                // git's curl sends the helper's credential only in answer to
+                // a challenge.
+                if matches!(cx.shape, Some(Shape::Git {})) {
+                    out.extend_from_slice(b"WWW-Authenticate: Basic realm=\"devsandbox\"\r\n");
+                }
                 if close {
                     out.extend_from_slice(b"Connection: close\r\n");
                 }

@@ -117,7 +117,9 @@ only for a call carrying the phantom). First refusal answers:
    upstream **uninjected**, as it came; a phantom anywhere else (another
    header, the URL, the body) goes as is, never swapped. An uninjected
    call to an upstream the claim marks `private` gets a bare `401` from
-   the broker and is never dialed.
+   the broker and is never dialed; a git smart-HTTP call's carries
+   `WWW-Authenticate: Basic`, since git's curl sends the credential
+   helper's answer only to a challenge.
 5. **Credential**: `home::resolve` with `access.<kind>.credential` and the
    instance's profile; none names `devsandbox login <kind>`.
 6. **Approved version**: the claim's version must be one the credential

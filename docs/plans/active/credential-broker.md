@@ -603,8 +603,8 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    Two intercept claims of one upstream in a sandbox are refused. The
    Mozilla set for an image without a bundle comes from
    `webpki-root-certs` (`webpki-roots` has trust anchors, not whole
-   certificates). Left: hosts a claim's `git` field names stay off the
-   shared port until git-gateway step 1 builds git's own.
+   certificates). Hosts a claim's `git` field names stay off the shared
+   port: git-gateway step 1 gave them git's own.
 4. Permission requests: API, CLI, dashboard modal; remembered answers;
    `approvers` (a headless home's asks answered from a laptop); a
    sandbox's config edit confirmed on the host.

@@ -2757,6 +2757,268 @@ mod tests {
         });
     }
 
+    /// git through the broker end to end: a fake GitHub (the host's `git
+    /// http-backend` behind TLS with the test CA, `github.com` dialed there)
+    /// serving `allowed-org/app` (the folder's recorded origin, so in the
+    /// fence; 401 without the real token) and `other/lib` (anonymous, outside
+    /// the fence). In an alpine container: clone and push in the fence with
+    /// the injected token, an anonymous clone outside it, a push outside it
+    /// refused before the upstream, and with `access.github.scopes =
+    /// ["repo.read"]` a push in the fence refused. The upstream never sees the
+    /// phantom, the token only for `allowed-org`; `access.log` holds neither.
+    #[cfg(unix)]
+    #[test_utils::docker_test(helper)]
+    fn git_through_the_broker_end_to_end_with_docker() -> Result<(), String> {
+        isolated("git_e2e_child")
+    }
+
+    /// One request to `git http-backend` over the bare repos under `root`:
+    /// `allowed-org/*` needs `token` as git's Basic, the rest is anonymous.
+    #[cfg(unix)]
+    fn http_backend(root: &Path, token: &str, head: &str, body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut lines = head.lines();
+        let mut request = lines.next().unwrap_or_default().split(' ');
+        let (method, target) = (request.next().unwrap_or_default(), request.next().unwrap_or_default());
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let headers: Vec<(&str, &str)> = lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n, v.trim())).collect();
+        let header = |name: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| *v);
+        let basic = crate::broker::redact::basic_auth(b"x-access-token", token.as_bytes());
+        let authorized = header("authorization") == Some(&format!("Basic {}", String::from_utf8(basic).unwrap()));
+        if path.starts_with("/allowed-org/") && !authorized {
+            return b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"mock\"\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                .to_vec();
+        }
+        let mut cgi = Command::new("git");
+        cgi.arg("http-backend")
+            .env("GIT_PROJECT_ROOT", root)
+            .env("GIT_HTTP_EXPORT_ALL", "1")
+            .env("PATH_INFO", path)
+            .env("REQUEST_METHOD", method)
+            .env("QUERY_STRING", query)
+            .env("CONTENT_LENGTH", body.len().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for (from, to) in [("content-type", "CONTENT_TYPE"), ("content-encoding", "HTTP_CONTENT_ENCODING"), ("git-protocol", "GIT_PROTOCOL")] {
+            if let Some(v) = header(from) {
+                cgi.env(to, v);
+            }
+        }
+        if authorized {
+            cgi.env("REMOTE_USER", "x-access-token");
+        }
+        let mut child = cgi.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let body = body.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&body);
+        });
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+
+        let (cgi_head, rest) = match out.stdout.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(i) => (&out.stdout[..i], &out.stdout[i + 4..]),
+            None => {
+                let i = out.stdout.windows(2).position(|w| w == b"\n\n").expect("a CGI head");
+                (&out.stdout[..i], &out.stdout[i + 2..])
+            }
+        };
+        let (mut status, mut fields) = ("200 OK".to_string(), String::new());
+        for line in String::from_utf8_lossy(cgi_head).lines() {
+            match line.split_once(':') {
+                Some((n, v)) if n.eq_ignore_ascii_case("status") => status = v.trim().to_string(),
+                Some((n, _)) if n.eq_ignore_ascii_case("content-length") => {}
+                _ => fields.push_str(&format!("{line}\r\n")),
+            }
+        }
+        let mut reply =
+            format!("HTTP/1.1 {status}\r\n{fields}Content-Length: {}\r\nConnection: close\r\n\r\n", rest.len()).into_bytes();
+        reply.extend_from_slice(rest);
+        reply
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_e2e_child() {
+        use std::sync::Arc;
+
+        let Some(root) = isolated_root("git_e2e_child") else { return };
+        let mut seed = [0u8; 16];
+        getrandom::fill(&mut seed).unwrap();
+        let token = format!("REAL-{:032x}", u128::from_le_bytes(seed));
+        let (repo, cfg, upstream_root) = (root.join("repo"), root.join("cfg"), root.join("upstream"));
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&repo, &["remote", "add", "origin", "https://github.com/allowed-org/app.git"]);
+        let bare = |name: &str| {
+            let dir = upstream_root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            git(&dir, &["init", "-q", "--bare", "-b", "main"]);
+            git(&dir, &["config", "http.receivepack", "true"]);
+            git(&repo, &["push", "-q", dir.to_str().unwrap(), "main"]);
+            dir
+        };
+        let (app, lib) = (bare("allowed-org/app.git"), bare("other/lib.git"));
+
+        // The fixture's claim with `github.com` private: the address check
+        // then lets the loopback mock through.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/github");
+        let feature = cfg.join("features/github");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::copy(fixture.join("install.sh"), feature.join("install.sh")).unwrap();
+        let json = std::fs::read_to_string(fixture.join("devcontainer-feature.json")).unwrap();
+        let mut metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let upstreams = &mut metadata["customizations"]["devsandbox"]["credentials"]["github"]["upstreams"];
+        for u in upstreams.as_array_mut().unwrap() {
+            if u == "github.com" {
+                *u = serde_json::json!({ "host": "github.com", "private": true });
+            }
+        }
+        std::fs::write(feature.join("devcontainer-feature.json"), metadata.to_string()).unwrap();
+
+        let name = format!("git-e2e-{}", std::process::id());
+        std::fs::write(
+            cfg.join("Dockerfile"),
+            "FROM alpine:3.20\nRUN apk add --no-cache git ca-certificates && adduser -D -u 1000 dev\n",
+        )
+        .unwrap();
+        let config = format!(
+            "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+             features = {{ \"./features/github\" = {{}} }}\n"
+        );
+        std::fs::write(cfg.join(CONFIG_FILE), &config).unwrap();
+
+        let data = State::path().unwrap().parent().unwrap().to_path_buf();
+        let source = crate::features::FeatureSource::parse("./features/github").unwrap();
+        let claims = crate::features::resolve(&source, &cfg).unwrap().metadata.credentials;
+        let args = crate::commands::login::Args {
+            credential: "github".into(),
+            feature: None,
+            kind: None,
+            profiles: Vec::new(),
+            yes: true,
+            method: None,
+            client_id: None,
+        };
+        let mut term = crate::commands::login::tests::Script::new(false, &[], Some(&token));
+        let mut flows = crate::commands::login::tests::offline();
+        crate::commands::login::login_at(&data, &args, Some(claims), &mut term, &mut flows).unwrap();
+
+        let (mock_port, seen) = {
+            let (root, token) = (upstream_root.clone(), token.clone());
+            crate::broker::serve::tests::upstream_server(move |head, body| http_backend(&root, &token, head, body))
+        };
+
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = image::sandbox_image(&project, &name);
+        let features_image = image::features_image(&project, &name);
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().output_quiet(&["rmi", "-f", &features_image, &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            let [claim] = &info.claims[..] else { panic!("one claim: {:?}", info.claims) };
+            let phantom = claim.phantom.clone();
+            assert_eq!(info.github_repos, ["allowed-org/app"]);
+
+            let mut roots = rustls::RootCertStore::empty();
+            let fixture_ca = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broker/ca.pem");
+            use rustls::pki_types::pem::PemObject;
+            roots.add(rustls::pki_types::CertificateDer::from_pem_file(fixture_ca).unwrap()).unwrap();
+            let upstream = crate::broker::upstream::Upstream::new(roots, None, Default::default()).unwrap();
+            let service = crate::broker::serve::Service::new(State::path().unwrap(), Ok(upstream))
+                .unwrap()
+                .with_authority("github.com", &format!("localhost:{mock_port}"));
+            let bridge = crate::devsbd::bridge::spawn_brokered(&name, info, Arc::new(service)).unwrap();
+            assert_eq!(bridge.outcome(std::time::Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+            let sh = |script: &str| {
+                let argv =
+                    crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), script.into()], false);
+                backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap()
+            };
+
+            // The helper answers 503 itself until it has seen the bridge's caps.
+            let out = sh("for i in $(seq 50); do git ls-remote https://github.com/other/lib.git >/dev/null 2>&1 && break; sleep 0.2; done; \
+                 export GIT_TERMINAL_PROMPT=0; c='-c user.name=t -c user.email=t@t'; cd /tmp; \
+                 git clone -q https://github.com/allowed-org/app.git app 2>&1; echo clone_app=$?; \
+                 git -C app $c commit -q --allow-empty -m e2e && git -C app push -q origin HEAD:refs/heads/feature 2>&1; \
+                 echo push_app=$?; \
+                 GIT_CURL_VERBOSE=1 git clone -q https://github.com/other/lib.git lib >verbose 2>&1; echo clone_lib=$?; \
+                 echo fence=$(grep -ci 'recv header: devsandbox-fence: outside' verbose); \
+                 git -C lib $c commit -q --allow-empty -m e2e && git -C lib push -q origin HEAD:refs/heads/x 2>&1; \
+                 echo push_lib=$?");
+            let lines: Vec<&str> = out.lines().collect();
+            for want in ["clone_app=0", "push_app=0", "clone_lib=0"] {
+                assert!(lines.contains(&want), "{want} missing:\n{out}");
+            }
+            assert!(!lines.contains(&"fence=0"), "no `devsandbox-fence: outside` seen:\n{out}");
+            assert!(!lines.contains(&"push_lib=0"), "{out}");
+            assert!(
+                out.contains("`other/lib` is outside the instance's repo fence")
+                    && out.contains("add `other/lib` to `access.github.repos`"),
+                "{out}"
+            );
+            assert_eq!(git(&app, &["log", "-1", "--format=%s", "refs/heads/feature"]), "e2e");
+            assert_eq!(git(&lib, &["for-each-ref", "--format=%(refname)"]), "refs/heads/main");
+
+            let receive_packs = |repo: &str| {
+                seen.lock().unwrap().iter().filter(|(head, _)| head.contains(repo) && head.contains("receive-pack")).count()
+            };
+            assert_eq!(receive_packs("/other/lib.git"), 0);
+            let pushed = receive_packs("/allowed-org/app.git");
+            assert!(pushed > 0);
+
+            // `access` is read per call: no restart.
+            std::fs::write(cfg.join(CONFIG_FILE), format!("{config}access.github.scopes = [\"repo.read\"]\n")).unwrap();
+            let out = sh("export GIT_TERMINAL_PROMPT=0; cd /tmp/app; git -c user.name=t -c user.email=t@t commit -q --allow-empty -m two \
+                 && git push -q origin HEAD:refs/heads/feature 2>&1; echo push_read_only=$?");
+            assert!(!out.lines().any(|l| l == "push_read_only=0"), "{out}");
+            assert!(out.contains("scope `git.push` isn't in `access.github.scopes`"), "{out}");
+            assert_eq!(receive_packs("/allowed-org/app.git"), pushed);
+
+            let contains = |hay: &[u8], needle: &str| hay.windows(needle.len()).any(|w| w == needle.as_bytes());
+            let basic = String::from_utf8(crate::broker::redact::basic_auth(b"x-access-token", token.as_bytes())).unwrap();
+            for (head, body) in seen.lock().unwrap().iter() {
+                assert!(!head.contains(&phantom) && !contains(body, &phantom), "{head}");
+                let auth: Vec<&str> = head
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .filter(|(n, _)| n.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.trim())
+                    .collect();
+                let path = head.split(' ').nth(1).unwrap_or_default();
+                match path.starts_with("/allowed-org/") {
+                    true => assert_eq!(auth, [format!("Basic {basic}")], "{head}"),
+                    false => assert!(auth.is_empty(), "{head}"),
+                }
+            }
+
+            // A line lands after its answer.
+            let log_path = data.join("access.log");
+            let mut log = String::new();
+            for _ in 0..50 {
+                log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if log.lines().filter(|l| l.contains("\"verdict\":\"refused\"")).count() >= 2 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let lines: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            let verdict = |v: &str| lines.iter().filter(|l| l["verdict"] == v).count();
+            assert!(verdict("allow") > 0 && verdict("outside") > 0 && verdict("refused") >= 2, "{log}");
+            assert!(!log.contains(&token) && !log.contains(&basic) && !log.contains(&phantom), "{log}");
+        });
+    }
+
     #[test]
     fn gc_keeps_worktrees_env_extends_a_given_count() {
         let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {

@@ -12,13 +12,15 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **credentials**: credential-broker step 1 and github-and-sentry-access
-  step 1 are done (the broker, `login` by paste, `access approve`,
-  sentry-cli brokered locally in base-URL mode through `features/sentry`)
-  and credential-broker step 2 (device flow and browser OAuth logins,
-  their renewal behind the phantom, `access ls|revoke`); now gh and git
-  through the broker (credential-broker step 3, git-gateway step 1,
-  github-and-sentry-access step 2). → [plan](plans/active/credential-broker.md)
+- **credentials**: credential-broker steps 1-3 (the broker, `login` by
+  paste, device flow and browser OAuth with renewal behind the phantom,
+  `access approve|ls|revoke`, the member CA and intercept mode),
+  github-and-sentry-access step 1 (sentry-cli through `features/sentry`)
+  and git-gateway step 1 (git through the broker with the repo fence, LFS
+  and the relay's key filtering) are done; now github-and-sentry-access
+  step 2: `features/gh`, its scope table, GraphQL mutations mapped to
+  scopes, the fence resolved to repo ids.
+  → [plan](plans/active/github-and-sentry-access.md)
 
 ## Planned
 
@@ -340,7 +342,8 @@ is frozen: no new work on it.
 - A claim's device and browser logins send no `scope` (no claim field;
   GitHub Apps take none), and `github-app-manifest` logins are refused
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
-  `approvers`, `delegate` and `as` parse but nothing reads them yet.
+  `approvers`, `delegate` and `as` parse and `access ls` lists them, but
+  nothing acts on them yet.
   → [login](architecture/credentials/login.md); `commands::login::choose`
 - git under a git-host claim: no ssh host alias (`git@github-work:`)
   is rewritten to `https://` (the folder's record keeps the URL, not what
@@ -350,8 +353,8 @@ is frozen: no new work on it.
   another sysconfdir, nix's or conda's, see only the env); when
   `remoteEnv` or `--env` sets git's `GIT_CONFIG_*`, every exec drops
   `gc.worktreePruneExpire`, and an `ensure` replacing the saved `--env`
-  leaves `Instance::git_env` as `run` computed it. No clone or push
-  through the gateway is tested end to end yet (git-gateway step 1).
+  leaves `Instance::git_env` as `run` computed it. LFS is tested against
+  the broker only, not end to end from a container.
   → [git](architecture/credentials/git.md); `credentials::git::entries`
 - The CA variables point at
   the Debian bundle path when the image probe can't run (Apple
@@ -384,7 +387,7 @@ is frozen: no new work on it.
   github-and-sentry-access step 2. No token and registration
   endpoints a claim could mark (no claim field). A credential marked
   broken notifies no approver (credential-broker step 4). Policy reads no
-  request body, and token-shaped response headers aren't stripped: only the injected value is masked. One
+  request body beyond an LFS batch's `operation`, and token-shaped response headers aren't stripped: only the injected value is masked. One
   upstream connection per call, no pooling. `access.log` shows nowhere
   (no dashboard view, nor in `access ls`).
   → [broker](architecture/credentials/broker.md); `broker::policy::decide`,
@@ -409,7 +412,8 @@ is frozen: no new work on it.
   `commands::access::revoke_at`
 - `run`'s host-class warning fires only on a host that brokers a
   credential, not yet on one that is a credential's approver (step 4), and
-  `access ls` marks neither it nor a shared writable bind (step 2); the
+  `access ls` marks neither it nor a shared writable bind (left out of
+  step 2, deferred again by git-gateway step 1); the
   `runArgs` refusals wait for `runArgs` to reach the runtime. In a build
   without the helper, an ssh-agent fallback mount whose agent lives in
   `$XDG_RUNTIME_DIR` reads as a session socket.
