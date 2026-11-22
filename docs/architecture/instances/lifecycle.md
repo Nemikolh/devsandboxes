@@ -149,10 +149,13 @@ the pid is dead or the boot id changed, so nobody rewrites records.
 
 - Any failure keeps the instance as `failed` with its build log
   (`devsandbox rebuild` retries, `rm` removes).
-- Only a cancelled `run` (SIGINT/SIGTERM, `run::cancel`) rolls back:
-  `rollback` removes what the record says was made, and the branch only if
-  this run created it and it has no new commits. A cancelled `rebuild` is
-  recorded `failed`. A second signal kills as usual.
+- Only a cancelled `run` (SIGINT/SIGTERM, `run::cancel`) or one stopped
+  for an unapproved claim version (`claims::unapproved_stop`;
+  [images and features](images-and-features.md), *Credential claims*)
+  rolls back: `rollback` removes what the record says was made, and the
+  branch only if this run created it and it has no new commits. A
+  cancelled or refused `rebuild` is recorded `failed`. A second signal
+  kills as usual.
 - `not_ready` / `in_flight` gate other verbs on an in-flight or failed
   instance; `exec` only waits for the container to exist.
 

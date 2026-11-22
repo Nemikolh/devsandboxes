@@ -182,7 +182,12 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   Through the daemon, the subprocess fails for the CLI to ask and resend
   (docs/architecture/daemon/verbs.md, *The CLI side*). A no, or no
   terminal (`--json`, the dashboard, `rebuild`, a machine's run), refuses
-  the run, naming `devsandbox access approve <credential>`. Which
+  the run (`claims::Refused`), naming `devsandbox access approve
+  <credential>`. Either stop rolls a fresh `run` back
+  (`progress::on_failure`, `claims::unapproved_stop`): nothing is left
+  but the pending version, so trying again is another `run`. A `rebuild`
+  keeps its instance as `failed`, and its refusal (`claims::refusal`)
+  names `devsandbox rebuild <instance>`. Which
   credential serves a claim isn't kept: the broker resolves it per call.
 - **Phantoms and ports** (`instance::plan`): per claim a phantom, the
   claim's `phantom.prefix` (else `dsbx_<kind>_`) and 24 random base62

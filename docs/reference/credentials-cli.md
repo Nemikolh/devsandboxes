@@ -208,8 +208,11 @@ asks "Approve this claim for `<credential>`?" (`ask_approve`): yes
 approves it as above and the run goes on (through the daemon: the run is
 rolled back and resent, docs/architecture/daemon/verbs.md, *The CLI
 side*); no refuses the run, naming `devsandbox access approve
-<credential>`. Off a TTY, with `--json` or `-d`, from the dashboard, and
-for `rebuild` or a machine's run, it refuses without asking.
+<credential>`, then try again. Off a TTY, with `--json` or `-d`, from the
+dashboard, and for `rebuild` or a machine's run, it refuses without
+asking. A refused `run` is rolled back, so trying again is another `run`
+under the same name; a refused `rebuild` keeps its instance as `failed`,
+and its refusal names `devsandbox rebuild <instance>` instead.
 
 ## `access ls`
 

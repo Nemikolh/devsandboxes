@@ -344,10 +344,7 @@ pub fn run(
         )
     })();
     let result = result.map_err(|e| {
-        let outcome = match extras.unapproved == Unapproved::FailOnAsk && e.is::<NeedsApproval>() {
-            true => OnFailure::RollBack,
-            false => tracker.on_failure(true),
-        };
+        let outcome = tracker.on_failure(true, &e);
         match outcome {
             OnFailure::RollBack => progress::rollback(&instance_id, branch_start.as_deref()),
             OnFailure::KeepFailed => tracker.fail(&e),
@@ -877,6 +874,7 @@ pub(crate) fn materialize(
         dir,
         props,
         profile.as_deref(),
+        instance,
         state.instances.get(instance),
         feature.claims,
         &facts::home(props, &facts),
@@ -2280,6 +2278,79 @@ mod tests {
             assert_eq!(refusal["devsandbox"]["verdict"], "refused");
             assert!(out.contains(&format!("url = http://127.0.0.1:{port}\n")), "{out}");
             assert!(out.contains(&format!("token = {}", claim.phantom)), "{out}");
+        });
+    }
+
+    /// A claim version its credential hasn't approved: a fresh `run` refused
+    /// for it leaves nothing (no record, no container), a `rebuild` refused
+    /// for it keeps its instance as failed, naming `devsandbox rebuild`.
+    #[cfg(unix)]
+    #[test_utils::docker_test(helper)]
+    fn unapproved_claim_rolls_back_a_run_and_keeps_a_rebuild_with_docker() -> Result<(), String> {
+        isolated("unapproved_child")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unapproved_child() {
+        let Some(root) = isolated_root("unapproved_child") else { return };
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        // A git repo: the second instance gets a worktree, which the rollback removes.
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let feature = cfg.join("features/sentry");
+        std::fs::create_dir_all(&feature).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/features/sentry");
+        for file in ["devcontainer-feature.json", "install.sh"] {
+            std::fs::copy(fixture.join(file), feature.join(file)).unwrap();
+        }
+        // Unique per run: container and image names are global to the runtime.
+        let name = format!("unapproved-{}", std::process::id());
+        let refused = format!("{name}-2");
+        std::fs::write(cfg.join("Dockerfile"), "FROM alpine:3.20\nRUN adduser -D -u 1000 dev\n").unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!(
+                "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+                 features = {{ \"./features/sentry\" = {{}} }}\n"
+            ),
+        )
+        .unwrap();
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = image::sandbox_image(&project, &name);
+        let features_image = image::features_image(&project, &name);
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            crate::commands::rm::remove_container(&format!("{NAME_PREFIX}{refused}"), &project, &refused);
+            let _ = backend().output_quiet(&["rmi", "-f", &features_image, &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            // No credential yet: wired anyway.
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let data = State::path().unwrap().parent().unwrap().to_path_buf();
+            let home = crate::credentials::home::path(&data);
+            crate::credentials::home::update(&home, |h| {
+                h.insert("sentry-work".into(), crate::credentials::home::Entry::new("sentry", None));
+                Ok(())
+            })
+            .unwrap();
+
+            let err = run(&cfg, Some(name.clone()), Some(refused.clone()), None, None, RunExtras::default()).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.ends_with("run `devsandbox access approve sentry-work`, then try again"), "{msg}");
+            assert!(!State::load().unwrap().instances.contains_key(&refused), "refused run rolled back");
+            assert!(backend().is_running(&format!("{NAME_PREFIX}{refused}")).unwrap().is_none(), "no container");
+            assert!(!cfg.join(".worktrees").join(&refused).exists(), "worktree left behind");
+
+            let err = crate::commands::rebuild::rebuild(&cfg, Some(name.clone()), false, true, false).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&format!("then `devsandbox rebuild {name}`")), "{msg}");
+            assert!(!msg.contains("try again"), "{msg}");
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("rebuilt instance kept");
+            assert!(matches!(info.progress.as_ref().map(|p| &p.phase), Some(Phase::Failed { .. })), "{:?}", info.progress);
         });
     }
 

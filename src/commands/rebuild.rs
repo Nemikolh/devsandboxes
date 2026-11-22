@@ -177,7 +177,7 @@ fn recreate(
         &mut tracker,
     );
     if let Err(e) = result {
-        debug_assert_eq!(tracker.on_failure(false), run::OnFailure::KeepFailed);
+        debug_assert_eq!(tracker.on_failure(false, &e), run::OnFailure::KeepFailed);
         if run::cancel::requested() {
             tracker.fail(&anyhow::anyhow!(run::cancel::CANCELLED));
             bail!("rebuild of `{key}` {}; {}", run::cancel::CANCELLED, run::kept_hint(key));

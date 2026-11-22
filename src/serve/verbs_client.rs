@@ -930,7 +930,7 @@ struct Unapproved {
 impl Unapproved {
     /// What `run` itself says when nothing asks.
     fn refusal(&self) -> String {
-        crate::commands::run::refusal(&self.message, &self.credential)
+        crate::commands::run::refusal(&self.message, &self.credential, None)
     }
 }
 

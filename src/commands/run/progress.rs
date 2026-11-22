@@ -86,8 +86,8 @@ impl Tracker {
         })
     }
 
-    pub(crate) fn on_failure(&self, fresh: bool) -> OnFailure {
-        on_failure(fresh, super::cancel::requested())
+    pub(crate) fn on_failure(&self, fresh: bool, error: &anyhow::Error) -> OnFailure {
+        on_failure(fresh, super::cancel::requested(), super::claims::unapproved_stop(error))
     }
 }
 
@@ -102,11 +102,14 @@ pub(crate) enum OnFailure {
 
 /// `fresh`: the record was made by this command (`run`), not a `rebuild` of an
 /// instance that existed before, which is never rolled back. `cancelled`: the
-/// user stopped it (SIGINT/SIGTERM) and asked for nothing to be left. Any
-/// other failure, before the container exists included, is kept with its
-/// build log: `rebuild` retries, `rm` removes.
-pub(crate) fn on_failure(fresh: bool, cancelled: bool) -> OnFailure {
-    if fresh && cancelled { OnFailure::RollBack } else { OnFailure::KeepFailed }
+/// user stopped it (SIGINT/SIGTERM) and asked for nothing to be left.
+/// `unapproved`: stopped for a claim version its credential hasn't approved
+/// (`claims::unapproved_stop`), an expected stop before the container whose
+/// message says to approve and try again, so `run` again must not find the
+/// name taken. Any other failure, before the container exists included, is
+/// kept with its build log: `rebuild` retries, `rm` removes.
+pub(crate) fn on_failure(fresh: bool, cancelled: bool, unapproved: bool) -> OnFailure {
+    if fresh && (cancelled || unapproved) { OnFailure::RollBack } else { OnFailure::KeepFailed }
 }
 
 /// Whether the rollback deletes the worktree's branch: only one this run
@@ -183,12 +186,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_cancelled_run_rolls_back() {
-        assert_eq!(on_failure(true, true), OnFailure::RollBack);
-        assert_eq!(on_failure(true, false), OnFailure::KeepFailed);
+    fn only_a_cancelled_or_unapproved_run_rolls_back() {
+        assert_eq!(on_failure(true, true, false), OnFailure::RollBack);
+        assert_eq!(on_failure(true, false, true), OnFailure::RollBack);
+        assert_eq!(on_failure(true, false, false), OnFailure::KeepFailed);
         // `rebuild`: the instance existed before, never rolled back.
-        assert_eq!(on_failure(false, true), OnFailure::KeepFailed);
-        assert_eq!(on_failure(false, false), OnFailure::KeepFailed);
+        assert_eq!(on_failure(false, true, false), OnFailure::KeepFailed);
+        assert_eq!(on_failure(false, false, true), OnFailure::KeepFailed);
+        assert_eq!(on_failure(false, false, false), OnFailure::KeepFailed);
     }
 
     #[test]

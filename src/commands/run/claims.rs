@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::config::{parse_shorthand, SandboxProperties};
 use crate::credentials::claim::Claim;
@@ -46,6 +46,25 @@ impl std::fmt::Display for NeedsApproval {
 
 impl std::error::Error for NeedsApproval {}
 
+/// The refusal of a claim version its credential hasn't approved
+/// ([`refusal`]'s message): typed so a fresh `run` rolls it back.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Whether `e` is a stop for an unapproved claim version, asked for
+/// ([`NeedsApproval`]) or refused ([`Refused`]).
+pub(crate) fn unapproved_stop(e: &anyhow::Error) -> bool {
+    e.is::<NeedsApproval>() || e.is::<Refused>()
+}
+
 /// What hasn't been approved, short `version` included.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn unapproved(credential: &str, feature: &str, kind: &str, version: &str) -> String {
@@ -61,10 +80,17 @@ pub(crate) fn parse_unapproved(message: &str) -> Option<(String, String)> {
     Some((credential.to_string(), version.to_string()))
 }
 
-/// The refusal: [`unapproved`]'s `message` and what to run.
+/// The refusal: [`unapproved`]'s `message` and what to run. `rebuilt`: the
+/// instance a `rebuild` refused for, kept as failed, so retrying means
+/// rebuilding it; a refused `run` left nothing, so it's run again.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn refusal(message: &str, credential: &str) -> String {
-    format!("{message}: run `devsandbox access approve {credential}`, then try again")
+pub(crate) fn refusal(message: &str, credential: &str, rebuilt: Option<&str>) -> String {
+    match rebuilt {
+        Some(instance) => {
+            format!("{message}: run `devsandbox access approve {credential}`, then `devsandbox rebuild {instance}`")
+        }
+        None => format!("{message}: run `devsandbox access approve {credential}`, then try again"),
+    }
 }
 
 /// What `materialize` puts on the instance and its container.
@@ -104,7 +130,7 @@ pub(super) struct Proxying<'a> {
     pub(super) owners: Vec<String>,
 }
 
-/// Wire `found` (the enabled features' claims) for an instance in
+/// Wire `found` (the enabled features' claims) for `instance` in
 /// `profile`, keeping what `prior` (the instance being rebuilt) had. `home`
 /// is the remote user's, `owner` who the phantom files belong to, `targets`
 /// every mount and volume target. Refuses a second claim of one kind and a
@@ -118,6 +144,7 @@ pub(super) fn wire(
     dir: &Path,
     props: &SandboxProperties,
     profile: Option<&str>,
+    instance: &str,
     prior: Option<&Instance>,
     found: instance::Found,
     home: &str,
@@ -139,7 +166,7 @@ pub(super) fn wire(
     let Some(kept) = brokered_here(dir, kept)? else {
         return Ok(wired);
     };
-    check_credentials(props, profile, &kept, unapproved)?;
+    check_credentials(props, profile, &kept, unapproved, prior.map(|_| instance))?;
     let prior_claims = prior.map(|i| i.claims.as_slice()).unwrap_or_default();
     let prior_port = prior.and_then(|i| i.intercept.as_ref()).map(|i| i.port);
     let prior_git_port = prior.and_then(|i| i.intercept.as_ref()).and_then(|i| i.git.as_ref()).map(|g| g.port);
@@ -405,17 +432,19 @@ fn brokered_here(dir: &Path, kept: instance::Found) -> Result<Option<instance::F
 /// Each claim's credential here (`home::resolve`): none is a warning naming
 /// `devsandbox login`; one that hasn't approved the claim's version records
 /// it pending, then does as `unapproved` says; a token kind it can't be
-/// taken as (`credentials::tokens::pick`) refuses the run.
+/// taken as (`credentials::tokens::pick`) refuses the run. `rebuilt`: as
+/// [`refusal`]'s.
 #[cfg(unix)]
 fn check_credentials(
     props: &SandboxProperties,
     profile: Option<&str>,
     kept: &[(String, Claim)],
     unapproved: Unapproved,
+    rebuilt: Option<&str>,
 ) -> Result<()> {
     let data = crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
     let path = crate::credentials::home::path(&data);
-    check_credentials_at(&path, props, profile, kept, unapproved, &mut crate::commands::login::Stdio)
+    check_credentials_at(&path, props, profile, kept, unapproved, rebuilt, &mut crate::commands::login::Stdio)
 }
 
 /// [`check_credentials`] against the `credentials.toml` at `path`, asking
@@ -427,6 +456,7 @@ fn check_credentials_at(
     profile: Option<&str>,
     kept: &[(String, Claim)],
     mode: Unapproved,
+    rebuilt: Option<&str>,
     term: &mut dyn crate::commands::login::Term,
 ) -> Result<()> {
     use crate::credentials::home;
@@ -457,10 +487,10 @@ fn check_credentials_at(
                 Unapproved::FailOnAsk => return Err(NeedsApproval(what).into()),
                 Unapproved::Ask if term.tty() => {
                     if !crate::commands::access::ask_approve(path, name, Some(&version), term)? {
-                        bail!("{}", refusal(&what, name));
+                        return Err(Refused(refusal(&what, name, rebuilt)).into());
                     }
                 }
-                Unapproved::Ask | Unapproved::Refuse => bail!("{}", refusal(&what, name)),
+                Unapproved::Ask | Unapproved::Refuse => return Err(Refused(refusal(&what, name, rebuilt)).into()),
             }
         }
         tokens::pick(claim.pinned.tokens.as_ref(), &tokens::offered(&entry.as_)?, wanted, kind, name)?;
@@ -469,7 +499,13 @@ fn check_credentials_at(
 }
 
 #[cfg(not(unix))]
-fn check_credentials(_: &SandboxProperties, _: Option<&str>, _: &[(String, Claim)], _: Unapproved) -> Result<()> {
+fn check_credentials(
+    _: &SandboxProperties,
+    _: Option<&str>,
+    _: &[(String, Claim)],
+    _: Unapproved,
+    _: Option<&str>,
+) -> Result<()> {
     Ok(())
 }
 
@@ -529,12 +565,17 @@ mod tests {
             config.resolve_sandbox("s").unwrap().properties
         };
         // No credential: wired anyway.
-        check_credentials_at(&path, &props(""), None, &kept, Unapproved::Refuse, &mut no_term()).unwrap();
+        check_credentials_at(&path, &props(""), None, &kept, Unapproved::Refuse, None, &mut no_term()).unwrap();
 
         home::update(&path, |h: &mut Home| Ok(h.insert("sentry-work".into(), Entry::new("sentry", None)))).unwrap();
-        let err = check_credentials_at(&path, &props(""), None, &kept, Unapproved::Refuse, &mut no_term()).unwrap_err().to_string();
-        assert!(err.contains("run `devsandbox access approve sentry-work`"), "{err}");
+        let err = check_credentials_at(&path, &props(""), None, &kept, Unapproved::Refuse, None, &mut no_term()).unwrap_err();
+        assert!(unapproved_stop(&err), "{err}");
+        assert!(err.to_string().ends_with("run `devsandbox access approve sentry-work`, then try again"), "{err}");
         assert_eq!(home::load(&path).unwrap()["sentry-work"].pending[0].version, claim.version());
+        // A rebuild's names the instance it keeps.
+        let err = check_credentials_at(&path, &props(""), None, &kept, Unapproved::Refuse, Some("web"), &mut no_term()).unwrap_err();
+        assert!(unapproved_stop(&err), "{err}");
+        assert!(err.to_string().ends_with("run `devsandbox access approve sentry-work`, then `devsandbox rebuild web`"), "{err}");
 
         home::update(&path, |h: &mut Home| {
             let e = h.get_mut("sentry-work").unwrap();
@@ -542,9 +583,9 @@ mod tests {
             Ok(e.approve(v))
         })
         .unwrap();
-        check_credentials_at(&path, &props(""), None, &kept, Unapproved::Refuse, &mut no_term()).unwrap();
+        check_credentials_at(&path, &props(""), None, &kept, Unapproved::Refuse, None, &mut no_term()).unwrap();
         home::update(&path, |h: &mut Home| Ok(h.insert("gh".into(), Entry::new("github", None)))).unwrap();
-        let err = check_credentials_at(&path, &props("[sandbox.s.access.sentry]\ncredential = \"gh\"\n"), None, &kept, Unapproved::Refuse, &mut no_term())
+        let err = check_credentials_at(&path, &props("[sandbox.s.access.sentry]\ncredential = \"gh\"\n"), None, &kept, Unapproved::Refuse, None, &mut no_term())
             .unwrap_err()
             .to_string();
         assert!(err.contains("a `github` credential"), "{err}");
@@ -564,7 +605,7 @@ mod tests {
             let config = crate::config::Config::parse(&format!("[sandbox.s]\nimage = \"x\"\n{toml}")).unwrap();
             config.resolve_sandbox("s").unwrap().properties
         };
-        let check = |toml: &str| check_credentials_at(&path, &props(toml), None, &kept, Unapproved::Refuse, &mut no_term()).map_err(|e| e.to_string());
+        let check = |toml: &str| check_credentials_at(&path, &props(toml), None, &kept, Unapproved::Refuse, None, &mut no_term()).map_err(|e| e.to_string());
         let app = "[sandbox.s.access.github]\nas = \"app\"\n";
         let user = "[sandbox.s.access.github]\nas = \"user\"\n";
         // No credential yet: only the claim's and step 3's refusals.
@@ -587,7 +628,7 @@ mod tests {
         assert!(check(user).unwrap_err().contains("offers `as = [\"app\"]`, not `user`"));
 
         let sentry = vec![("./s".to_string(), crate::credentials::home::tests::sentry())];
-        let err = check_credentials_at(&path, &props("[sandbox.s.access.sentry]\nas = \"user\"\n"), None, &sentry, Unapproved::Refuse, &mut no_term())
+        let err = check_credentials_at(&path, &props("[sandbox.s.access.sentry]\nas = \"user\"\n"), None, &sentry, Unapproved::Refuse, None, &mut no_term())
             .unwrap_err()
             .to_string();
         assert!(err.contains("the `sentry` claim declares no token kinds"), "{err}");
@@ -616,21 +657,24 @@ mod tests {
         entry.approve(Version::of(&old));
         home::update(&path, |h: &mut Home| Ok(h.insert("sentry-work".into(), entry))).unwrap();
         let approved = || home::load(&path).unwrap()["sentry-work"].approved_claim(&new.version()).is_some();
-        let check = |mode, term: &mut Script| check_credentials_at(&path, &props, None, &kept, mode, term);
+        let check = |mode, term: &mut Script| check_credentials_at(&path, &props, None, &kept, mode, None, term);
 
         // The client's round: recorded pending, its message read back.
         let err = check(Unapproved::FailOnAsk, &mut Script::new(true, &[], None)).unwrap_err();
         let message = err.downcast_ref::<NeedsApproval>().expect("NeedsApproval").0.clone();
         assert_eq!(parse_unapproved(&message), Some(("sentry-work".into(), new.version()[..12].to_string())));
         assert!(!message.contains("access approve"), "the client adds it on a no: {message}");
-        assert!(refusal(&message, "sentry-work").ends_with("run `devsandbox access approve sentry-work`, then try again"));
+        assert!(unapproved_stop(&err));
+        assert!(refusal(&message, "sentry-work", None).ends_with("run `devsandbox access approve sentry-work`, then try again"));
 
         // Off a terminal, asking refuses as `Refuse` does.
         let err = check(Unapproved::Ask, &mut no_term()).unwrap_err().to_string();
         assert!(err.contains("run `devsandbox access approve sentry-work`"), "{err}");
 
         let mut term = Script::new(true, &[false], None);
-        let err = check(Unapproved::Ask, &mut term).unwrap_err().to_string();
+        let err = check(Unapproved::Ask, &mut term).unwrap_err();
+        assert!(unapproved_stop(&err), "a no is a refusal: {err}");
+        let err = err.to_string();
         assert!(err.contains("run `devsandbox access approve sentry-work`"), "{err}");
         assert!(term.shown.contains("against approved"), "{}", term.shown);
         assert!(term.shown.ends_with("Approve this claim for `sentry-work`?"), "{}", term.shown);
