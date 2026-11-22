@@ -5,13 +5,14 @@
 //! The secret comes by paste, the device flow or the browser's OAuth login,
 //! per the claim's `login` (docs/architecture/credentials/login.md).
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::credentials::claim::{self, Claim, Login};
+use crate::credentials::claim::{self, Claim, Create, Level, Login, Scope};
 use crate::credentials::home::{self, Entry, Home, Version};
 use crate::credentials::oauth::{self, Clock, Http, browser, device};
 use crate::credentials::store::{Record, Secret, Store};
@@ -28,6 +29,9 @@ pub struct Args {
     /// owns), required when the claim names none; kept in the token
     /// record, not the claim.
     pub client_id: Option<String>,
+    /// The user or org a paste login's token page prefills as the token's
+    /// resource owner.
+    pub owner: Option<String>,
 }
 
 /// What the OAuth logins reach beyond the terminal, a seam for tests.
@@ -262,13 +266,79 @@ fn check_client_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The secret by `login`'s method.
-fn obtain(login: &Login, name: &str, args: &Args, term: &mut dyn Term, flows: &mut Flows) -> Result<Record> {
+fn check_owner(owner: &str) -> Result<()> {
+    if owner.is_empty() || owner.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        bail!("--owner must be non-empty, no whitespace");
+    }
+    Ok(())
+}
+
+/// GitHub's cap on a token's name.
+const TOKEN_NAME_MAX: usize = 40;
+
+/// The page a paste login's `create` opens: its `url` with the token's
+/// name, description and owner prefilled and, with `permissions`, every
+/// permission the granted scopes (the claim's within `max`; unset: all)
+/// ask, at the highest level any of them asks.
+fn create_url(
+    create: &Create,
+    scopes: &BTreeMap<String, Scope>,
+    max: Option<&[String]>,
+    name: &str,
+    profiles: Option<&[String]>,
+    owner: Option<&str>,
+) -> String {
+    let title: String = format!("devsandbox {name}").chars().take(TOKEN_NAME_MAX).collect();
+    let description = match profiles {
+        Some(p) => format!("devsandbox credential {name}, profiles: {}", p.join(", ")),
+        None => format!("devsandbox credential {name}, every profile"),
+    };
+    let mut params = vec![("name", title.as_str()), ("description", description.as_str())];
+    if let Some(owner) = owner {
+        params.push(("target_name", owner));
+    }
+    let mut levels: BTreeMap<&str, Level> = BTreeMap::new();
+    if create.permissions {
+        let granted = scopes.iter().filter(|(s, _)| max.is_none_or(|m| m.contains(s)));
+        for (p, l) in granted.flat_map(|(_, scope)| &scope.permissions) {
+            let at = levels.entry(p.as_str()).or_insert(*l);
+            *at = (*at).max(*l);
+        }
+    }
+    params.extend(levels.iter().map(|(p, l)| (*p, l.as_str())));
+    format!("{}?{}", create.url, oauth::form_encode(&params))
+}
+
+/// The secret by `login`'s method; `page`: where a paste login's token is
+/// created ([`create_url`]).
+fn obtain(
+    login: &Login,
+    name: &str,
+    page: Option<&str>,
+    args: &Args,
+    term: &mut dyn Term,
+    flows: &mut Flows,
+) -> Result<Record> {
     let client = |claims: &Option<String>| {
         args.client_id.clone().or_else(|| claims.clone()).expect("choose requires --client-id when the claim has none")
     };
     match login {
-        Login::Paste { hint } => {
+        Login::Paste { hint, .. } => {
+            // Piped, the secret exists already: no page to send the user to.
+            if let Some(url) = page
+                && term.tty()
+            {
+                let mut text = format!("Create the token at {}\n  select the repositories it reaches", crate::open::printable(url));
+                if let Some(owner) = &args.owner {
+                    let owner = crate::open::printable(owner);
+                    text.push_str(&format!("; check its resource owner is {owner} (the page may show {owner} yet create it under your user)"));
+                }
+                text.push('\n');
+                term.show(&text);
+                if oauth::openable(url) {
+                    (flows.open)(url);
+                }
+            }
             let secret = term.secret(&match hint {
                 Some(hint) => format!("Paste {hint}"),
                 None => format!("Paste the `{name}` secret"),
@@ -351,6 +421,23 @@ pub(crate) fn login_at(
         }
         check_client_id(id)?;
     }
+    let page = match login {
+        Login::Paste { create: Some(create), .. } => {
+            let profiles = match &existing {
+                Some(e) => e.profiles.as_deref(),
+                None => (!args.profiles.is_empty()).then_some(args.profiles.as_slice()),
+            };
+            let max = existing.as_ref().and_then(|e| e.max.as_deref());
+            Some(create_url(create, &pinned.scopes, max, name, profiles, args.owner.as_deref()))
+        }
+        _ => None,
+    };
+    if let Some(owner) = &args.owner {
+        if page.is_none() {
+            bail!("--owner is for a paste login that opens a token page; the `{kind}` claim's {} login has none", method_name(login));
+        }
+        check_owner(owner)?;
+    }
     let approving = candidate
         .as_ref()
         .filter(|c| existing.as_ref().and_then(|e| e.approved_claim(&c.version)).is_none());
@@ -359,7 +446,7 @@ pub(crate) fn login_at(
         approve_or_refuse(term, args.yes, &format!("Approve this claim for `{name}`?"))?;
     }
 
-    let record = obtain(login, name, args, term, flows)?;
+    let record = obtain(login, name, page.as_deref(), args, term, flows)?;
     crate::credentials::tokens::check_accepted(pinned.tokens.as_ref(), record.access_token().expose(), &kind)?;
     // The secret first: a claim approved without one serves nothing.
     Store::in_data(data).put(name, &record)?;
@@ -485,6 +572,7 @@ pub(crate) mod tests {
             yes: false,
             method: None,
             client_id: None,
+            owner: None,
         }
     }
 
@@ -630,7 +718,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_method_is_asked_for_else_the_first_that_works_here() {
-        let paste = Login::Paste { hint: None };
+        let paste = Login::Paste { hint: None, create: None };
         let all = [paste.clone(), device(1), browser(1)];
         let name = |l: Result<&Login>| method_name(l.unwrap());
         assert_eq!(name(choose(&all, None, false, false, true, "k")), "paste");
@@ -650,7 +738,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_login_naming_no_app_needs_a_client_id() {
-        let paste = Login::Paste { hint: None };
+        let paste = Login::Paste { hint: None, create: None };
         let gh = [paste.clone(), home_device(1)];
         let name = |l: Result<&Login>| method_name(l.unwrap());
         assert_eq!(name(choose(&gh, None, false, true, true, "k")), "paste", "skipped by default without one");
@@ -689,7 +777,7 @@ pub(crate) mod tests {
         let (port, seen) = device_provider();
         let data = temp("device");
         let mut gh = other("github");
-        gh.pinned.login = vec![Login::Paste { hint: None }, home_device(port)];
+        gh.pinned.login = vec![Login::Paste { hint: None, create: None }, home_device(port)];
         let a = Args { yes: true, client_id: Some("Iv1.mine".into()), ..args("gh") };
         let mut term = Script::new(true, &[], None);
         let mut f = flows(|_| {}, Box::new(FakeClock::new()));
@@ -743,6 +831,83 @@ pub(crate) mod tests {
         let err = super::login_at(&data, &a, Some(vec![gh]), &mut Script::new(true, &[], None), &mut f).unwrap_err();
         assert!(err.to_string().contains("takes only `github_pat_…` tokens, not `ghu_…`"), "{err}");
         assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_token_page_prefills_the_granted_permissions_at_their_highest_level() {
+        let scope = |p: &[(&str, Level)]| Scope {
+            routes: vec![],
+            permissions: p.iter().map(|(k, l)| (k.to_string(), *l)).collect(),
+        };
+        let scopes: BTreeMap<String, Scope> = [
+            ("a", scope(&[("contents", Level::Read), ("issues", Level::Write)])),
+            ("b", scope(&[("contents", Level::Write), ("metadata", Level::Read)])),
+            ("c", scope(&[("administration", Level::Admin), ("issues", Level::Read)])),
+            ("d", scope(&[])),
+        ]
+        .into_iter()
+        .map(|(k, s)| (k.to_string(), s))
+        .collect();
+        let create = Create { url: "https://github.com/settings/personal-access-tokens/new".into(), permissions: true };
+        let url = create_url(&create, &scopes, None, "gh-work", Some(&["work".into(), "oss".into()]), Some("acme"));
+        assert_eq!(
+            url,
+            "https://github.com/settings/personal-access-tokens/new?name=devsandbox%20gh-work\
+             &description=devsandbox%20credential%20gh-work%2C%20profiles%3A%20work%2C%20oss&target_name=acme\
+             &administration=admin&contents=write&issues=write&metadata=read"
+        );
+        let max = ["a".to_string(), "d".into()];
+        let url = create_url(&create, &scopes, Some(&max), "gh", None, None);
+        assert!(url.ends_with("?name=devsandbox%20gh&description=devsandbox%20credential%20gh%2C%20every%20profile&contents=read&issues=write"), "{url}");
+        let bare = Create { permissions: false, ..create };
+        let url = create_url(&bare, &scopes, None, "gh", None, None);
+        assert!(url.ends_with("%20every%20profile"), "{url}");
+        let long = "x".repeat(64);
+        let url = create_url(&bare, &scopes, None, &long, None, None);
+        assert!(url.contains(&format!("?name=devsandbox%20{}&", "x".repeat(29))), "40 chars: {url}");
+    }
+
+    #[test]
+    fn a_paste_login_opens_its_token_page_on_a_terminal() {
+        use crate::credentials::home::tests::github;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let data = temp("create");
+        let opened = Rc::new(RefCell::new(Vec::<String>::new()));
+        let mut f = offline();
+        let seen = opened.clone();
+        f.open = Box::new(move |url| seen.borrow_mut().push(url.to_string()));
+        let a = Args { yes: true, owner: Some("acme".into()), method: Some("paste".into()), ..args("gh") };
+        let mut term = Script::new(true, &[], Some("github_pat_1"));
+        super::login_at(&data, &a, Some(vec![github()]), &mut term, &mut f).unwrap();
+        let url = opened.borrow_mut().pop().expect("the page opened");
+        assert!(url.starts_with("https://github.com/settings/personal-access-tokens/new?name=devsandbox%20gh&"), "{url}");
+        assert!(url.contains("&target_name=acme&") && url.contains("&contents=write"), "{url}");
+        assert!(term.shown.contains(&format!("Create the token at {url}\n")), "{}", term.shown);
+        assert!(term.shown.contains("check its resource owner is acme"), "{}", term.shown);
+
+        // The entry's `max` narrows the permissions; piped, nothing opens.
+        home::update(&home::path(&data), |h| {
+            h.get_mut("gh").unwrap().max = Some(vec!["user.read".into()]);
+            Ok(())
+        })
+        .unwrap();
+        let a = Args { method: Some("paste".into()), ..args("gh") };
+        let mut term = Script::new(true, &[], Some("github_pat_2"));
+        super::login_at(&data, &a, None, &mut term, &mut f).unwrap();
+        let url = opened.borrow_mut().pop().expect("the page opened");
+        assert!(url.ends_with("%20every%20profile"), "no permission asked: {url}");
+        let mut term = Script::new(false, &[], Some("github_pat_3"));
+        super::login_at(&data, &a, None, &mut term, &mut f).unwrap();
+        assert!(opened.borrow().is_empty() && term.shown.is_empty(), "{}", term.shown);
+
+        let owner = Args { yes: true, owner: Some("acme".into()), ..args("s") };
+        let err = login_at(&data, &owner, Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        assert!(err.to_string().contains("--owner is for a paste login that opens a token page"), "{err}");
+        let blank = Args { owner: Some(" ".into()), ..a };
+        let err = login_at(&data, &blank, None, &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        assert!(err.to_string().contains("--owner must be non-empty"), "{err}");
         let _ = std::fs::remove_dir_all(&data);
     }
 

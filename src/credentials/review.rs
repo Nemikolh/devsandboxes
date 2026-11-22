@@ -25,7 +25,8 @@ pub struct View {
     pub never: BTreeSet<String>,
     /// `(method, hint)`.
     pub login: Vec<(String, Option<String>)>,
-    /// The other pinned fields, plus `scopes.<name>.permissions`.
+    /// The other pinned fields, plus `scopes.<name>.permissions` and
+    /// `login.<method>.create`.
     pub rest: BTreeMap<String, Value>,
 }
 
@@ -60,6 +61,9 @@ impl View {
             .iter()
             .map(|l| {
                 let method = l.get("method").and_then(Value::as_str).context("a login without `method`")?;
+                if let Some(c) = l.get("create") {
+                    rest.insert(format!("login.{method}.create"), c.clone());
+                }
                 Ok((method.to_string(), l.get("hint").and_then(Value::as_str).map(String::from)))
             })
             .collect::<Result<_>>()?;
@@ -289,6 +293,18 @@ mod tests {
         let d = diff(&old, &view(&private));
         assert_eq!(d.upstreams.added, ["us.sentry.io (private)"]);
         assert_eq!(d.upstreams.removed, ["us.sentry.io"]);
+    }
+
+    #[test]
+    fn a_paste_login_s_token_page_is_a_change() {
+        let old_json = sentry_json();
+        let mut c = old_json.clone();
+        c["login"][0]["create"] = json!({ "url": "https://sentry.io/settings/account/api/auth-tokens/new-token/" });
+        let (old, new) = (view(&old_json), view(&c));
+        assert_eq!(diff(&old, &new).changed, ["login.paste.create"]);
+        let mut d = c.clone();
+        d["login"][0]["create"]["permissions"] = json!(true);
+        assert_eq!(diff(&new, &view(&d)).changed, ["login.paste.create"]);
     }
 
     #[test]

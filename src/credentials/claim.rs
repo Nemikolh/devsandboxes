@@ -230,6 +230,8 @@ pub enum Login {
     Paste {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        create: Option<Create>,
     },
     /// No `client_id`: the home names its own OAuth app at login.
     Device {
@@ -248,6 +250,18 @@ pub enum Login {
     GithubAppManifest {},
 }
 
+/// The page a paste login opens to create the token on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Create {
+    /// https, no query: login appends its own.
+    pub url: String,
+    /// Prefill the granted scopes' `permissions` as `<permission>=<level>`
+    /// query params (GitHub's fine-grained PAT page reads them).
+    #[serde(default)]
+    pub permissions: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mint {
@@ -261,12 +275,23 @@ pub struct Scope {
     pub permissions: BTreeMap<String, Level>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered: a higher level includes the lower ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Read,
     Write,
     Admin,
+}
+
+impl Level {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Read => "read",
+            Level::Write => "write",
+            Level::Admin => "admin",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -889,9 +914,15 @@ fn login(raw: Option<Vec<Login>>, inject: &[Slot]) -> Result<Vec<Login>> {
             bail!("{}: the same method twice", at());
         }
         match l {
-            Login::Paste { hint } => {
+            Login::Paste { hint, create } => {
                 if hint.as_deref().is_some_and(str::is_empty) {
                     bail!("{}: `hint` is empty", at());
+                }
+                if let Some(c) = create {
+                    check_https_url(&c.url).with_context(|| format!("{}: `create.url`", at()))?;
+                    if c.url.contains(['?', '#']) {
+                        bail!("{}: `create.url` `{}` has a query or fragment: login adds its own", at(), c.url);
+                    }
                 }
             }
             Login::Device { client_id, device_url, token_url } => {
@@ -1313,7 +1344,7 @@ mod tests {
         );
         assert_eq!(p.check, Some(Route::parse("GET /api/0/").unwrap()));
         assert_eq!(p.refusal, Some(Refusal::Json { field: "detail".into() }));
-        assert!(matches!(p.login[..], [Login::Paste { hint: Some(_) }]));
+        assert!(matches!(p.login[..], [Login::Paste { hint: Some(_), create: None }]));
         assert_eq!(p.rewrite.len(), 2);
         let chunk = p.rewrite.iter().find(|r| r.route.to_string().contains("chunk-upload")).unwrap();
         assert_eq!(chunk.fields, ["url"]);
@@ -1604,6 +1635,17 @@ mod tests {
         assert!(c.pinned.login.iter().all(|l| matches!(l, Login::Device { client_id: None, .. } | Login::Browser { client_id: None, .. })));
         assert!(!c.canonical().contains("clientId"), "an absent client id stays absent in the pinned claim");
         assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
+
+        let paste = |create: Value| sentry_with("login", json!([{ "method": "paste", "create": create }]));
+        let c = parse("sentry", &paste(json!({ "url": "https://github.com/settings/personal-access-tokens/new" }))).unwrap();
+        let want = Create { url: "https://github.com/settings/personal-access-tokens/new".into(), permissions: false };
+        assert_eq!(c.pinned.login, [Login::Paste { hint: None, create: Some(want) }]);
+        assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
+        assert_err(paste(json!({ "url": "http://github.com/new" })), &["`login[0]`: `create.url`", "isn't an https URL"]);
+        assert_err(paste(json!({ "url": "https://github.com/new?x=1" })), &["`login[0]`: `create.url`", "a query or fragment"]);
+        assert_err(paste(json!({ "url": "https://github.com/new#x" })), &["a query or fragment"]);
+        assert_err(paste(json!({ "url": "https://github.com/new", "name": "x" })), &["unknown field `name`"]);
+        assert_err(paste(json!({ "permissions": true })), &["missing field `url`"]);
 
         assert_err(sentry_with("check", json!("GET /api/0/organizations/{org}/")), &["`check`", "no `{var}`"]);
         assert_err(sentry_with("check", json!("POST /api/0/")), &["`check`", "a `GET` or `HEAD`"]);

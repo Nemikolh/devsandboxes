@@ -11,12 +11,12 @@ pick, approval, method choice, `--client-id`) and the store's format:
 (*Whose token*: app user tokens by an existing app's device flow).
 
 Code: `src/credentials/oauth/mod.rs` (`Http`, `parse_token_reply`,
-`TokenSet`, `OAuthError`, `Ui`, `Clock`, `form_encode`, `pkce_challenge`,
-`random`), `src/credentials/oauth/device.rs` (`login`,
+`TokenSet`, `OAuthError`, `Ui`, `Clock`, `openable`, `form_encode`,
+`pkce_challenge`, `random`), `src/credentials/oauth/device.rs` (`login`,
 `parse_authorization`, `Poller`, `poll`), `src/credentials/oauth/browser.rs`
 (`login`, `authorize_url`, `callback`, `TIMEOUT`),
 `src/credentials/store.rs` (`Record`, `OAuthToken`, `Store::renew`),
-`src/commands/login.rs` (`obtain`, `Flows`).
+`src/commands/login.rs` (`obtain`, `create_url`, `Flows`).
 
 ## The endpoints
 
@@ -43,7 +43,8 @@ RFC 8628. `device::login` posts `client_id` to `deviceUrl`
 (`parse_authorization`: `device_code`, `user_code`, `verification_uri`
 or Google's `verification_url`, `expires_in`, `interval`), shows the page
 and code, and opens the page (`verification_uri_complete` when sent; an
-`https` URL without control characters only) where a browser opens. Then
+`https` URL without control characters only, `openable`) where a browser
+opens. Then
 `poll` asks `tokenUrl` with the device code every interval (5 s when the
 provider sends none, at least 1 s): `authorization_pending` waits again,
 `slow_down` adds 5 s (or takes the provider's `interval` when longer, as
@@ -67,6 +68,15 @@ given twice, no code) gets a 4xx and the wait goes on. A matching `error`
 ends the login as denied; a code is exchanged at `tokenUrl` with the
 `redirect_uri`, `client_id` and `code_verifier`. No callback within
 `TIMEOUT` (5 minutes) ends it.
+
+## A paste login's token page
+
+Not OAuth, but the same opener: a paste login whose claim names a
+`create` page shows it and opens it through `Flows.open` (when
+`openable`) before reading the secret on a terminal. `create_url` builds
+it, pure, with `form_encode`: the token's name, description, owner and,
+with `permissions`, the granted scopes' permissions at their highest
+level ([credentials CLI](../../reference/credentials-cli.md#login)).
 
 ## The record
 

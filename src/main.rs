@@ -467,6 +467,10 @@ enum Command {
         /// Log in to this OAuth app instead of the claim's (an app you own)
         #[arg(long, value_name = "ID")]
         client_id: Option<String>,
+        /// The user or org a pasted token's creation page prefills as its
+        /// resource owner
+        #[arg(long, value_name = "USER|ORG")]
+        owner: Option<String>,
     },
     /// This host's credentials: list them, approve claim versions, revoke
     /// (docs/reference/credentials-cli.md)
@@ -1170,8 +1174,8 @@ fn main() -> Result<()> {
             MachineCommand::Allow { allow } => commands::machine::allow(allow.change()),
         },
         #[cfg(unix)]
-        Command::Login { credential, feature, kind, profiles, yes, method, client_id } => {
-            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id })
+        Command::Login { credential, feature, kind, profiles, yes, method, client_id, owner } => {
+            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id, owner })
         }
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Approve { credential, version, yes } } => {

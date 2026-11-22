@@ -12,7 +12,7 @@ credentials they are, never on a machine (`--machine` refuses them).
 
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
-`obtain`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
+`obtain`, `create_url`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
 `pick_pending`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
 `forget_at`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/store.rs` (`Store`,
@@ -23,7 +23,7 @@ logins: [login](../architecture/credentials/login.md)), `src/credentials/review.
 
 ```
 devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>]... [--yes]
-                 [--method paste|device|browser] [--client-id <id>]
+                 [--method paste|device|browser] [--client-id <id>] [--owner <user|org>]
 devsandbox access approve <credential> [--version <v>] [--yes]
 devsandbox access ls [<credential>] [--json]
 devsandbox access revoke <credential> [--version <v>] [--yes]
@@ -78,6 +78,10 @@ the home owns: a GitHub App you made), and is required when the claim
 names none; refused with `paste`. It goes into
 the token record, never the claim, so it changes no claim version.
 
+`--owner` names the user or org a paste login's token page prefills as
+the token's resource owner (`target_name`); refused unless the chosen
+login is a paste with `create`.
+
 Then, in order: a new version's summary (`View::summary`: kind, mode,
 upstreams, each scope with its route count, every `never` route, the
 short version) and the question (`approve_or_refuse`: `--yes` approves;
@@ -86,7 +90,19 @@ off a terminal without `--yes`, refused); the secret (`obtain`), by:
 - `paste`: from stdin (`Stdio::secret`: on a terminal, after the claim's
   paste `hint`, with echo off (`EchoOff`, termios `ECHO` cleared, line
   editing kept); else all of stdin, so `login x < file` works), trimmed,
-  empty refused. Stored as a static token.
+  empty refused. Stored as a static token. When the claim's paste login
+  has a `create` page (`{"url": …, "permissions": bool}`; https, no query
+  or fragment) and stdin is a terminal, it first shows that page and opens
+  it (`oauth::openable`, through `Flows.open`), prefilled by `create_url`:
+  `name` `devsandbox <credential>` (cut to GitHub's 40 characters),
+  `description` naming the credential and its profiles (the existing
+  entry's, else the `--profile`s; none: every profile), `target_name`
+  from `--owner`, and with `permissions` each permission of the granted
+  scopes (the claim's within the entry's `max`; a new credential: all) as
+  `<permission>=<level>`, at the highest level any of them asks. No
+  `expires_in`: GitHub's default. The text asks to select the
+  repositories and, with `--owner`, to check the resource owner (GitHub's
+  page can show the org yet create the token under the user).
 - `device`: the device flow; it prints the provider's page and code (and
   opens the page where a browser opens) and waits until the code is
   entered and approved, denied, or expired.
@@ -116,7 +132,8 @@ its diff against the latest approved version (`review::diff`, rendered by
 `Diff::render`: upstreams `+`/`-`, routes added and removed per scope,
 `(new)` and `(dropped)` scopes, `never` routes `+`/`-`, and `also
 changed:` naming every other pinned field that differs, `mode`, `inject`,
-`login`, `refusal`, a kept scope's `permissions` among them), or its
+`login`, `refusal`, a kept scope's `permissions` and a login's `create`
+page, `login.<method>.create`, among them), or its
 summary when none is approved. Same question as `login`. Approval moves
 the version from `pending` to the end of `approved`; older approved
 versions stay (instances pinned to them keep working). The secret is

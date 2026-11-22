@@ -34,6 +34,12 @@ pub trait Ui {
     fn open(&mut self, url: &str);
 }
 
+/// A provider or claim chose this URL: only an `https` one without control
+/// characters reaches the opener.
+pub fn openable(url: &str) -> bool {
+    url.starts_with("https://") && !crate::open::has_bad_chars(url)
+}
+
 /// Monotonic time and waiting, injectable so the device poll runs in tests
 /// without sleeping.
 pub trait Clock {

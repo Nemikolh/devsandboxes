@@ -71,7 +71,11 @@
           "login": [
             {
               "method": "paste",
-              "hint": "a fine-grained personal access token (github_pat_…) selecting the sandboxes' repos, or a GitHub App user token (ghu_…)"
+              "hint": "a fine-grained personal access token (github_pat_…) selecting the sandboxes' repos, or a GitHub App user token (ghu_…)",
+              "create": {
+                "url": "https://github.com/settings/personal-access-tokens/new",
+                "permissions": true
+              }
             },
             {
               "method": "device",

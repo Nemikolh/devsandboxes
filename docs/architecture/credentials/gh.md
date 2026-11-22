@@ -28,8 +28,11 @@ and `github.com` (git's own proxy port, `git.hosts`), injected as
 tools that only read it stay unauthenticated rather than pick up a
 phantom the plan never named. `tokens` takes `github_pat_` and `ghu_`,
 acting as `user` or `app`; `check` is `GET /user`; refusals are GitHub's
-JSON `message`. `login` is paste or `device` at GitHub's device flow
-endpoints with no client id: no app ships with the feature, so a device
+JSON `message`. `login` is paste, whose `create` page is GitHub's
+fine-grained PAT form (`settings/personal-access-tokens/new`) prefilled
+with the granted scopes' permissions (`login --owner` prefills the
+resource owner; [credentials CLI](../../reference/credentials-cli.md#login)),
+or `device` at GitHub's device flow endpoints with no client id: no app ships with the feature, so a device
 login names the home's own GitHub App (`login --client-id`; "Device
 flow" enabled, the repository permissions the scopes need). Its user
 tokens (`ghu_`) expire in 8 hours and refresh for 6 months, renewed by

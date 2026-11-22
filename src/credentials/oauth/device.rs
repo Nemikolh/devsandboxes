@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{Clock, Http, Reply, TokenSet, Ui, fields, seconds, text};
+use super::{Clock, Http, Reply, TokenSet, Ui, fields, openable, seconds, text};
 use crate::credentials::store::{OAuthToken, Secret};
 
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -129,10 +129,4 @@ pub fn login(http: &Http, at: &Endpoints<'_>, clock: &mut dyn Clock, ui: &mut dy
     let form = [("grant_type", GRANT), ("device_code", auth.device_code.expose()), ("client_id", at.client_id)];
     let set = poll(&auth, clock, || http.token(at.token_url, &form))?;
     Ok(set.into_record(at.token_url, at.client_id, clock.unix()))
-}
-
-/// The provider chose this URL: only an `https` one without control
-/// characters reaches the opener.
-fn openable(url: &str) -> bool {
-    url.starts_with("https://") && !crate::open::has_bad_chars(url)
 }
