@@ -42,8 +42,10 @@ pub const OTHER_SCOPE: &str = "other";
 
 const FIELDS: &[&str] = &[
     "upstreams", "mode", "inject", "phantom", "git", "baseUrl", "rewrite", "login", "check",
-    "mint", "scopes", "never", "presence", "hold", "refusal", "fence", "ca", "lfs",
+    "mint", "scopes", "never", "presence", "hold", "refusal", "fence", "ca", "lfs", "tokens",
 ];
+
+const MAX_ACCEPT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Claim {
@@ -108,6 +110,55 @@ pub struct Pinned {
     /// batch response hands out, through the broker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lfs: Option<Lfs>,
+    /// Pinned: which secrets the home takes for it and what it may act as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Tokens>,
+}
+
+/// What the credential's secret may be (docs/reference/credentials-cli.md;
+/// github-and-sentry-access, *Whose token*).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tokens {
+    /// The kinds a credential of this claim can be, sorted: a claim
+    /// declaring any is one the home's `as` and a config's
+    /// `access.<kind>.as` apply to (`credentials::tokens`).
+    #[serde(default, rename = "as", skip_serializing_if = "Vec::is_empty")]
+    pub as_: Vec<TokenKind>,
+    /// Prefixes `login` takes a secret by, sorted; empty: any secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept: Vec<String>,
+    /// A response header, lowercased, in which the upstream reports a
+    /// pasted token's expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenKind {
+    /// Minted per instance for the app's installation (github-and-sentry-access
+    /// step 3).
+    App,
+    /// The user's own: a pasted token or an OAuth login's.
+    User,
+}
+
+impl TokenKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::App => "app",
+            TokenKind::User => "user",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<TokenKind> {
+        match s {
+            "app" => Ok(TokenKind::App),
+            "user" => Ok(TokenKind::User),
+            _ => bail!("`{s}` isn't a token kind: `user` or `app`"),
+        }
+    }
 }
 
 /// git-lfs through the broker (docs/architecture/credentials/git.md, *LFS*).
@@ -441,6 +492,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
     }
     let fence = fence(field(obj, "fence")?.unwrap_or_default())?;
     let lfs = lfs(field(obj, "lfs")?, mode, git.as_ref(), &scopes)?;
+    let tokens = tokens(field(obj, "tokens")?, &inject)?;
 
     Ok(Claim {
         kind: kind.to_string(),
@@ -459,6 +511,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
             refusal,
             fence,
             lfs,
+            tokens,
         },
         wiring: Wiring { phantom, base_url, ca, git },
     })
@@ -714,6 +767,39 @@ fn lfs(raw: Option<Lfs>, mode: Mode, git: Option<&Git>, scopes: &BTreeMap<String
         bail!("`lfs.upload`: `{}` isn't one of the claim's `scopes`", raw.upload);
     }
     raw.hosts.sort();
+    Ok(Some(raw))
+}
+
+fn tokens(raw: Option<Tokens>, inject: &[Slot]) -> Result<Option<Tokens>> {
+    let Some(mut raw) = raw else { return Ok(None) };
+    if inject.is_empty() {
+        bail!("`tokens` without an `inject` slot: there is no secret");
+    }
+    if raw.as_.is_empty() && raw.accept.is_empty() && raw.expiry.is_none() {
+        bail!("`tokens` names nothing: `as`, `accept` or `expiry`");
+    }
+    raw.as_.sort();
+    if raw.as_.windows(2).any(|w| w[0] == w[1]) {
+        bail!("`tokens.as`: a kind is listed twice");
+    }
+    if raw.accept.len() > MAX_ACCEPT {
+        bail!("`tokens.accept`: at most {MAX_ACCEPT} prefixes");
+    }
+    for (i, p) in raw.accept.iter().enumerate() {
+        if p.is_empty() || p.len() > MAX_PREFIX || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            bail!("`tokens.accept[{i}]`: up to {MAX_PREFIX} letters, digits, `_` and `-`");
+        }
+        if raw.accept[..i].contains(p) {
+            bail!("`tokens.accept[{i}]`: `{p}` is listed twice");
+        }
+    }
+    raw.accept.sort();
+    if let Some(h) = &mut raw.expiry {
+        if !is_http_token(h) {
+            bail!("`tokens.expiry`: `{h}` isn't a header name");
+        }
+        *h = h.to_ascii_lowercase();
+    }
     Ok(Some(raw))
 }
 

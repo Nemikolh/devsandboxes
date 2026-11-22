@@ -90,11 +90,20 @@ off a terminal without `--yes`, refused); the secret (`obtain`), by:
 - `browser`: the authorization code with PKCE; it prints and opens the
   provider's authorize page and waits up to 5 minutes for the redirect.
 
+A claim whose `tokens.accept` lists prefixes takes only a secret one of
+them starts (`tokens::check_accepted`), pasted or an OAuth login's
+access token; any other is refused before anything is written, naming
+the accepted prefixes and the secret's own (up to its first `_`, when
+short). The github claim accepts fine-grained PATs (`github_pat_…`) and
+GitHub App user tokens (`ghu_…`), so a classic PAT (`ghp_…`) or gh's own
+OAuth token (`gho_…`), which reach every repo you can, is refused.
+
 The record goes into the store first (an approved claim with no secret
 serves nothing), replacing any earlier one whole; then the entry (created
 with `--profile`s as `profiles`, none: unset) and the approved version
-into `credentials.toml`. A re-login touches the record only. It prints
-`logged in …` with the approved version, or `secret replaced`.
+into `credentials.toml`. A re-login touches the record only, but for
+clearing `broken` and `expires_at` (the new secret has its own). It
+prints `logged in …` with the approved version, or `secret replaced`.
 
 ## `access approve`
 
@@ -122,6 +131,7 @@ sentry-work: sentry, source file
   max       every scope
   approved  3f2a1b4c5d6e (unused), 9c1d0e2f3a4b (latest)
   pending   77ab01cd23ef
+  expires   warning: in 9 days (2026-12-01T10:00:00Z): `devsandbox login sentry-work` replaces it
   instances
     web-1  9c1d0e2f3a4b  approved
     api    77ab01cd23ef  not approved
@@ -140,6 +150,12 @@ sentry-work: sentry, source file
   and that no instance here pins is `unused` (`access revoke --version`
   drops it).
 - `broken`: why the credential is marked broken, when it is (`broken`).
+- `expires`: when the secret stops working, when known
+  (`tokens::ends_at`): an OAuth record's refresh token's expiry (its
+  access token renews until then; a record without a refresh token has
+  none here), else a pasted secret's `expires_at`. `in N days` and the
+  date, prefixed `warning:` with a pointer to `devsandbox login` within
+  14 days (`tokens::WARN_DAYS`) or once past.
 - `instances`: those in `state.toml` with a claim that resolves to it
   (`uses`): the claim's kind, the instance's config's
   `access.<kind>.credential` (its config root and sandbox loaded now) and
@@ -169,9 +185,11 @@ GitHub repo fences (each folder's remotes at its first run):
 `{"name", "kind", "source", "token": {"type": "static" | "oauth" |
 "missing" | "unreadable", …}, "profiles", "max", "members"?,
 "approvers"?, "delegate"?, "as"?, "approved": [{"version", "latest",
-"unused"}], "pending": […], "broken", "instances": [{"instance",
-"version", "approved", "unknown"?}]}` (full version hashes; `oauth`
-carries `expires_at`, `refresh_expires_at`, `refreshable`, `scope`).
+"unused"}], "pending": […], "broken", "expires"?: {"at", "days",
+"expired", "warn"}, "instances": [{"instance", "version", "approved",
+"unknown"?}]}` (full version hashes; `oauth` carries `expires_at`,
+`refresh_expires_at`, `refreshable`, `scope`; `expires.at` is unix
+seconds).
 
 ## `access revoke`
 
@@ -217,10 +235,11 @@ kind = "sentry"
 source = "file"               # the only source; "keyring" and "op://…" refused as not yet
 profiles = ["work"]           # unset: every profile
 max = ["releases.write"]      # unset: every scope of the claim (the broker's grant check)
-members = []                  # these four: parsed, read by nothing
+members = []                  # these three: parsed, read by nothing
 approvers = []
 delegate = []
-as = []
+as = ["user"]                 # the token kinds it offers, "user" | "app"; unset: ["user"]
+expires_at = "2026-12-01T10:00:00Z"   # a pasted secret's expiry, as the upstream reported it
 
 [[sentry-work.approved]]      # approval order: the last is the latest
 version = "3f2a…"             # sha256 of `claim`, as `Claim::version`
@@ -247,6 +266,26 @@ then refuses
 `home::resolve` picks the credential a claim takes: the one
 `access.<kind>.credential` names, else the one of that kind whose
 `profiles` grant the instance's profile.
+
+`as` applies to a credential whose claim declares token kinds
+(`tokens.as`, the github claim's `["app", "user"]`); for any other it is
+ignored, and a config's `access.<kind>.as` is refused at `run`, since it
+would change nothing. At `run` (`tokens::pick`) the config's
+`access.<kind>.as` picks within the credential's `as`, else `user` when
+offered, else `app`: a config only narrows, so a kind the credential
+doesn't offer, or the claim doesn't declare, refuses the run. `app`
+(installation tokens) is refused as not yet (github-and-sentry-access
+step 3).
+
+`expires_at` (RFC 3339, UTC) is written by the broker: on an injected
+call with a pasted secret, the response's header the claim's
+`tokens.expiry` names (GitHub's `github-authentication-token-expiration`,
+`2026-12-01 10:00:00 UTC` or with a numeric offset, `tokens::parse_expiry`)
+is recorded when it differs (`home::set_expires_at`). Within 7 days of a
+credential's end (`tokens::NOTICE_DAYS`) the broker's injected calls
+also raise a desktop notice (`devsbd::desktop::notify_desktop`), at most
+once per credential per UTC day (`tokens::Notices`, in the daemon's
+memory: a restarted daemon may repeat it that day).
 
 ## The file store
 

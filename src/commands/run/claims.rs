@@ -352,7 +352,8 @@ fn brokered_here(dir: &Path, kept: instance::Found) -> Result<Option<instance::F
 
 /// Each claim's credential here (`home::resolve`): none is a warning naming
 /// `devsandbox login`; one that hasn't approved the claim's version records
-/// it pending and refuses the run.
+/// it pending and refuses the run, as does a token kind it can't be taken as
+/// (`credentials::tokens::pick`).
 #[cfg(unix)]
 fn check_credentials(props: &SandboxProperties, profile: Option<&str>, kept: &[(String, Claim)]) -> Result<()> {
     let data = crate::daemon_config::data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
@@ -369,10 +370,16 @@ fn check_credentials_at(
 ) -> Result<()> {
     use crate::credentials::home;
     let creds = home::load(path)?;
+    use crate::credentials::{claim::TokenKind, tokens};
     for (feature, claim) in kept {
         let kind = claim.kind.as_str();
-        let named = props.access.as_ref().and_then(|a| a.get(kind)).and_then(|a| a.credential.as_deref());
+        let access = props.access.as_ref().and_then(|a| a.get(kind));
+        let named = access.and_then(|a| a.credential.as_deref());
+        let wanted = access.and_then(|a| a.as_.as_deref()).map(TokenKind::parse).transpose()?;
         let Some((name, entry)) = home::resolve(&creds, kind, named, profile)? else {
+            // No home `as` to narrow by yet: the claim's and step 3's refusals only.
+            let any = [TokenKind::App, TokenKind::User];
+            tokens::pick(claim.pinned.tokens.as_ref(), &any, wanted, kind, named.unwrap_or(kind))?;
             eprintln!(
                 "warning: feature `{feature}`: no `{kind}` credential here: `devsandbox login {}` stores one; \
                  the sandbox is wired for it, no rebuild needed",
@@ -390,6 +397,7 @@ fn check_credentials_at(
                 &version[..12]
             );
         }
+        tokens::pick(claim.pinned.tokens.as_ref(), &tokens::offered(&entry.as_)?, wanted, kind, name)?;
     }
     Ok(())
 }
@@ -474,6 +482,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("a `github` credential"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_kinds_are_checked_against_the_claim_and_the_home() {
+        use crate::credentials::home::{self, Entry, Home, Version};
+        let dir = std::env::temp_dir().join(format!("dsv-run-claims-as-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = home::path(&dir);
+        let gh = crate::credentials::home::tests::github();
+        let kept = vec![("./gh".to_string(), gh.clone())];
+        let props = |toml: &str| {
+            let config = crate::config::Config::parse(&format!("[sandbox.s]\nimage = \"x\"\n{toml}")).unwrap();
+            config.resolve_sandbox("s").unwrap().properties
+        };
+        let check = |toml: &str| check_credentials_at(&path, &props(toml), None, &kept).map_err(|e| e.to_string());
+        let app = "[sandbox.s.access.github]\nas = \"app\"\n";
+        let user = "[sandbox.s.access.github]\nas = \"user\"\n";
+        // No credential yet: only the claim's and step 3's refusals.
+        check("").unwrap();
+        assert!(check(app).unwrap_err().contains("installation tokens: github-and-sentry-access step 3"));
+
+        let mut entry = Entry::new("github", None);
+        entry.approve(Version::of(&gh));
+        home::update(&path, |h: &mut Home| Ok(h.insert("gh".into(), entry))).unwrap();
+        check("").unwrap();
+        check(user).unwrap();
+        let err = check(app).unwrap_err();
+        assert!(err.contains("credential `gh` offers `as = [\"user\"]`, not `app`"), "{err}");
+        home::update(&path, |h: &mut Home| {
+            h.get_mut("gh").unwrap().as_ = vec!["app".into()];
+            Ok(())
+        })
+        .unwrap();
+        assert!(check("").unwrap_err().contains("installation tokens"), "app when user isn't offered");
+        assert!(check(user).unwrap_err().contains("offers `as = [\"app\"]`, not `user`"));
+
+        let sentry = vec![("./s".to_string(), crate::credentials::home::tests::sentry())];
+        let err = check_credentials_at(&path, &props("[sandbox.s.access.sentry]\nas = \"user\"\n"), None, &sentry)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the `sentry` claim declares no token kinds"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

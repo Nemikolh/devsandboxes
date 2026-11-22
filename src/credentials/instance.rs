@@ -476,7 +476,9 @@ pub fn env(claim: &Claim, record: &InstanceClaim) -> Vec<(String, String)> {
 /// `claim`'s phantom files under `home` (the remote user's), owned by
 /// `owner`, plus a warning per file skipped because it lands on or under a
 /// mount or volume target in `targets`: a shared login mounted there would
-/// be overwritten (and every other instance's calls flagged as leaks).
+/// be overwritten (and every other instance's calls flagged as leaks). The
+/// claim's phantom env still reaches a tool that reads it before the file
+/// (gh's `GH_TOKEN` over its mounted `hosts.yml`).
 pub fn render_files(
     claim: &Claim,
     record: &InstanceClaim,
@@ -490,8 +492,16 @@ pub fn render_files(
     for f in &claim.wiring.phantom.files {
         let path = format!("{}/{}", home.trim_end_matches('/'), f.path);
         if let Some(target) = targets.iter().find(|t| covers(t, &path)) {
+            let env = match claim.wiring.phantom.env.as_slice() {
+                [] => String::new(),
+                vars => format!(
+                    "; {} still holds the phantom, so a tool reading it first goes through the broker anyway",
+                    vars.iter().map(|v| format!("`{v}`")).collect::<Vec<_>>().join(", ")
+                ),
+            };
             warnings.push(format!(
-                "feature `{}`: `{path}` is under mount `{target}`: its `{}` phantom file is skipped",
+                "feature `{}`: `{path}` is under mount `{target}`, which keeps its own: the `{}` phantom file is \
+                 skipped{env}",
                 record.feature, claim.kind
             ));
             continue;
@@ -746,6 +756,36 @@ mod tests {
         }
         let (files, _) = render_files(&claim, &rec, "/home/dev", "dev", &["/home/devx".into()]);
         assert_eq!(files.len(), 1);
+    }
+
+    /// gh's `hosts.yml` from the github fixture, and the live config's gh
+    /// mount keeping its own.
+    #[cfg(unix)]
+    #[test]
+    fn gh_hosts_yml_renders_unless_mounted() {
+        let claim = crate::credentials::home::tests::github();
+        let rec = plan(&[("./gh".into(), claim.clone())], &[], None, None, None, counter()).unwrap().claims.remove(0);
+        assert_eq!(env(&claim, &rec), [("GH_TOKEN".to_string(), "dsbx_github_1".to_string())]);
+        let (files, warnings) = render_files(&claim, &rec, "/home/dev", "dev", &["/workspaces/x".into()]);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            files,
+            [File {
+                path: "/home/dev/.config/gh/hosts.yml".into(),
+                owner: "dev".into(),
+                content: "github.com:\n    users:\n        x-access-token:\n            oauth_token: dsbx_github_1\n    \
+                          oauth_token: dsbx_github_1\n    user: x-access-token\n    git_protocol: https\n"
+                    .into(),
+            }]
+        );
+        let (files, warnings) = render_files(&claim, &rec, "/home/dev", "dev", &["/home/dev/.config/gh".into()]);
+        assert!(files.is_empty());
+        assert_eq!(
+            warnings,
+            ["feature `./gh`: `/home/dev/.config/gh/hosts.yml` is under mount `/home/dev/.config/gh`, which keeps its \
+              own: the `github` phantom file is skipped; `GH_TOKEN` still holds the phantom, so a tool reading it \
+              first goes through the broker anyway"]
+        );
     }
 
     #[test]

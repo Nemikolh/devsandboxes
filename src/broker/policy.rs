@@ -26,12 +26,15 @@
 //! 8. the route: `never` routes refused; a route in no scope is `other`,
 //!    refused as an ask; a path past `{repo}` that decodes badly refused;
 //! 9. the repo fence, for a fenced claim ([`Pinned::fenced`]): a route
-//!    whose `fence` names an input but `{repo}` (a repo id, a body field)
-//!    can't be placed yet and is refused; a `{repo}` outside the instance's
-//!    fence ([`fence_of`]) goes upstream with the phantom stripped
-//!    ([`Action::Outside`]), or is refused naming `access.<kind>.repos`
-//!    for a write ([`route::is_write`]; an LFS batch by its body's
-//!    `operation`, [`Call::lfs`]); a route without `{repo}` is repo-less;
+//!    whose `fence` names an input but `{repo}` and a `/repositories/{id}`
+//!    route's `{id}` (a body field) can't be placed yet and is refused; a
+//!    `{repo}` or repository id outside the instance's fence
+//!    ([`fence_for`], resolved to ids by [`github::Fence`]) goes upstream
+//!    with the phantom stripped ([`Action::Outside`]), or is refused naming
+//!    `access.<kind>.repos` for a write ([`route::is_write`]; an LFS batch
+//!    by its body's `operation`, [`Call::lfs`]); a `{repo}` naming an
+//!    entry's old name is sent to its current one; a route without either
+//!    is repo-less;
 //! 10. the scope must be granted (`max`, unset: every scope) and requested
 //!     (`access.<kind>.scopes`, empty: every scope), and one in
 //!     `access.<kind>.ask` is refused as an ask: asks wait for permission
@@ -43,11 +46,12 @@
 //! shape whatever the claim's: git prints a text body.
 //!
 //! Not here yet: token and registration endpoints a claim marks (no claim
-//! field for them), repo ids and body inputs in the fence, `presence`
-//! (passes until step 4).
+//! field for them), body inputs in the fence, `presence` (passes until
+//! step 4).
 
 use anyhow::Result;
 
+use super::github::{self, Place};
 use super::head::{RequestHead, header_indices};
 use super::redact;
 use super::refusal::Refusal;
@@ -68,6 +72,11 @@ pub trait Sources {
     fn home(&self) -> Result<Home>;
     /// The instance's config `access.<kind>`, read now.
     fn access(&self, instance: &Instance, kind: &str) -> Result<Option<Access>>;
+    /// What resolves the fence to GitHub's ids; `None`: entries match by
+    /// name only.
+    fn github(&self) -> Option<&dyn github::Lookup> {
+        None
+    }
 }
 
 pub struct Call<'a> {
@@ -140,6 +149,12 @@ pub struct Injection {
     /// The instance's LFS listener, for an LFS batch to a host the approved
     /// claim's `lfs` names: its response's transfers are pointed there.
     pub lfs: Option<u16>,
+    /// The entry's recorded `expires_at` (unix seconds).
+    pub expires_at: Option<u64>,
+    /// The path to send instead of the tool's: the repo it named renamed to
+    /// the current name of the repository that name was pinned to, so a
+    /// later owner of the old name never gets the credential.
+    pub path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -319,28 +334,47 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         None => scope,
     };
     let mut repo_less = false;
+    let mut renamed = None;
     if approved.fenced() {
-        match attribute(&approved, &matched) {
+        let mut fence = fence_for(inst, &access, state, sources, &approved, name);
+        let outside = |repo: String, named: bool, cx: &mut Context| {
+            let write = match call.lfs {
+                Some(op) => op == route::LfsOp::Upload,
+                None => route::is_write(&head.method, path),
+            };
+            if write {
+                let r = Refusal::refused(format!("`{repo}` is outside the instance's repo fence: no credential writes to it"));
+                return Err(if named { r.todo(repos_todo(&repo, kind)) } else { r });
+            }
+            cx.outside = Some(repo);
+            Ok(Action::Outside { slot: slot.clone(), private: up.private })
+        };
+        match attribute(&approved, &matched, path) {
             Placed::Unplaced(inputs) => {
                 return Err(Refusal::refused(format!(
                     "`{call_route}` names its repo by {inputs}, which the broker can't resolve yet"
                 )));
             }
+            Placed::BadId => {
+                return Err(Refusal::new(400, "refused", format!("`{call_route}` names no repository id")));
+            }
             Placed::RepoLess => repo_less = true,
-            Placed::Repo(repo) if fence_of(inst, &access).contains(&repo) => {}
-            Placed::Repo(repo) => {
-                let write = match call.lfs {
-                    Some(op) => op == route::LfsOp::Upload,
-                    None => route::is_write(&head.method, path),
-                };
-                if write {
-                    return Err(Refusal::refused(format!(
-                        "`{repo}` is outside the instance's repo fence: no credential writes to it"
-                    ))
-                    .todo(repos_todo(&repo, kind)));
+            Placed::Repo(repo) => match fence.place_name(&repo) {
+                Place::In { current } => {
+                    let route_path = match &matched.route {
+                        Some(claim::Route::Http { path, .. }) => Some(path.as_str()),
+                        _ => None,
+                    };
+                    renamed = current.zip(route_path).and_then(|(c, rp)| route::with_repo(rp, path, &c));
                 }
-                cx.outside = Some(repo);
-                return Ok(Action::Outside { slot, private: up.private });
+                Place::Out => return outside(repo, true, cx),
+            },
+            Placed::Id(id) if fence.place_id(id) => {}
+            Placed::Id(id) => {
+                return match fence.name_of(id) {
+                    Some(repo) => outside(repo, true, cx),
+                    None => outside(format!("repository {id}"), false, cx),
+                };
             }
         }
     }
@@ -372,6 +406,8 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         private: up.private,
         claim: approved,
         lfs,
+        expires_at: entry.expires(),
+        path: renamed,
     })))
 }
 
@@ -380,15 +416,42 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
 enum Placed {
     Repo(String),
     RepoLess,
+    /// A `/repositories/{id}` route's id.
+    Id(u64),
+    /// A `/repositories/{id}` route whose `{id}` isn't ASCII digits.
+    BadId,
     /// The `fence` inputs beyond `{repo}`, for the reason.
     Unplaced(String),
 }
 
-fn attribute(claim: &Pinned, matched: &route::Matched) -> Placed {
-    let inputs = matched.route.as_ref().and_then(|r| claim.fence.get(r));
-    let unplaced: Vec<String> = inputs.into_iter().flatten().filter(|i| *i != route::REPO).map(|i| format!("`{i}`")).collect();
+/// A route naming its repository by id.
+const REPOSITORY_ID: &str = "/repositories/{id}";
+
+fn attribute(claim: &Pinned, matched: &route::Matched, path: &str) -> Placed {
+    let inputs: Vec<&String> = matched.route.as_ref().and_then(|r| claim.fence.get(r)).into_iter().flatten().collect();
+    let by_id = match &matched.route {
+        Some(claim::Route::Http { path: rp, .. }) => {
+            let rest = route::path_only(rp).strip_prefix(REPOSITORY_ID);
+            rest.is_some_and(|r| r.is_empty() || r.starts_with('/')) && inputs.iter().any(|i| *i == "{id}")
+        }
+        _ => false,
+    };
+    let unplaced: Vec<String> = inputs
+        .iter()
+        .filter(|i| **i != route::REPO && !(by_id && **i == "{id}"))
+        .map(|i| format!("`{i}`"))
+        .collect();
+    if !unplaced.is_empty() {
+        return Placed::Unplaced(unplaced.join(", "));
+    }
+    if by_id {
+        let id = route::path_only(path).split('/').nth(2).unwrap_or_default();
+        return match id.bytes().all(|b| b.is_ascii_digit()) {
+            true => id.parse().map_or(Placed::BadId, Placed::Id),
+            false => Placed::BadId,
+        };
+    }
     match &matched.repo {
-        _ if !unplaced.is_empty() => Placed::Unplaced(unplaced.join(", ")),
         Some(repo) => Placed::Repo(repo.clone()),
         None => Placed::RepoLess,
     }
@@ -400,6 +463,25 @@ fn attribute(claim: &Pinned, matched: &route::Matched) -> Placed {
 pub fn fence_of(inst: &Instance, access: &Access) -> std::collections::BTreeSet<String> {
     let config = access.repos.iter().filter_map(|r| fence::repo_arg(r).ok());
     inst.github_repos.iter().cloned().chain(config).collect()
+}
+
+/// The instance's fence as a [`github::Fence`]: [`fence_of`]'s entries,
+/// their pins in `state`, and `sources`' lookup with `credential` when the
+/// approved `claim` has `api.github.com` among its upstreams.
+pub fn fence_for<'a>(
+    inst: &Instance,
+    access: &Access,
+    state: &State,
+    sources: &'a dyn Sources,
+    claim: &Pinned,
+    credential: &'a str,
+) -> github::Fence<'a> {
+    let api = claim.upstreams.iter().find(|u| u.host == github::API);
+    let lookup = sources
+        .github()
+        .zip(api)
+        .map(|(l, u)| (l, github::Via { credential, private: u.private }));
+    github::Fence::new(fence_of(inst, access), &state.github_ids, lookup)
 }
 
 pub fn repos_todo(repo: &str, kind: &str) -> String {

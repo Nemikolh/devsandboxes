@@ -329,6 +329,7 @@ pub(crate) fn login_at(
     }
 
     let record = obtain(login, name, args, term, flows)?;
+    crate::credentials::tokens::check_accepted(pinned.tokens.as_ref(), record.access_token().expose(), &kind)?;
     // The secret first: a claim approved without one serves nothing.
     Store::in_data(data).put(name, &record)?;
     let profiles = (!args.profiles.is_empty()).then(|| args.profiles.clone());
@@ -338,6 +339,7 @@ pub(crate) fn login_at(
             bail!("credential `{name}` is a `{}` credential, not `{kind}`", entry.kind);
         }
         entry.broken = None;
+        entry.expires_at = None;
         Ok(approving.cloned().map(|c| entry.approve(c)).unwrap_or(false))
     })?;
     Ok(match (approved, approving) {
@@ -647,6 +649,40 @@ pub(crate) mod tests {
         assert!(done.ends_with("secret replaced"), "{done}");
         assert_eq!(Store::in_data(&data).get("gh").unwrap(), Some(Record::token(Secret::new("pat".into()))));
         assert_eq!(home::load(&home::path(&data)).unwrap()["gh"], entry);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn only_accepted_tokens_are_stored_and_a_login_clears_the_expiry() {
+        use crate::credentials::home::tests::github;
+        let data = temp("accept");
+        let yes = Args { yes: true, ..args("gh") };
+        for bad in ["ghp_classic", "gho_oauth"] {
+            let err = login_at(&data, &yes, Some(vec![github()]), &mut Script::new(false, &[], Some(bad))).unwrap_err();
+            assert!(err.to_string().contains(&format!("not `{}…`", &bad[..4])), "{err}");
+        }
+        assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+        login_at(&data, &yes, Some(vec![github()]), &mut Script::new(false, &[], Some("github_pat_11A\n"))).unwrap();
+        home::set_expires_at(&home::path(&data), "gh", 1_800_000_000).unwrap();
+        login_at(&data, &args("gh"), None, &mut Script::new(false, &[], Some("ghu_x"))).unwrap();
+        assert_eq!(home::load(&home::path(&data)).unwrap()["gh"].expires_at, None);
+        assert_eq!(Store::in_data(&data).token_now("gh").unwrap().unwrap().expose(), "ghu_x");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn an_oauth_token_of_another_kind_is_refused() {
+        use crate::credentials::oauth::tests::{FakeClock, device_provider};
+        let (port, _) = device_provider();
+        let data = temp("accept-oauth");
+        let mut gh = other("github");
+        gh.pinned.login = vec![device(port)];
+        gh.pinned.tokens = Some(claim::Tokens { as_: vec![], accept: vec!["github_pat_".into()], expiry: None });
+        let mut f = flows(|_| {}, Box::new(FakeClock::new()));
+        let a = Args { yes: true, ..args("gh") };
+        let err = super::login_at(&data, &a, Some(vec![gh]), &mut Script::new(true, &[], None), &mut f).unwrap_err();
+        assert!(err.to_string().contains("takes only `github_pat_…` tokens, not `ghu_…`"), "{err}");
+        assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
         let _ = std::fs::remove_dir_all(&data);
     }
 

@@ -761,6 +761,12 @@ fn git_client(rig: &Rig) -> Client {
     c
 }
 
+/// What reached the upstream from the tool: the fence's own lookups
+/// (`broker::github`) left out.
+fn tool_calls(seen: &Seen) -> Vec<(String, Vec<u8>)> {
+    seen.lock().unwrap().iter().filter(|(h, _)| !h.contains("\r\nUser-Agent: devsandbox-broker\r\n")).cloned().collect()
+}
+
 fn git_headers() -> String {
     format!("{}Git-Protocol: version=2\r\n", git_basic(GH))
 }
@@ -772,13 +778,42 @@ fn git_fetch_in_the_fence_injects_into_the_basic_slot() {
     let a = git_client(&rig).call("GET", "/o/r.git/info/refs?service=git-upload-pack", &git_headers(), b"");
     assert_eq!(a.status, 200, "{a:?}");
     assert_eq!(a.header("devsandbox-fence"), None);
-    let seen = seen.lock().unwrap();
+    let seen = tool_calls(&seen);
     let head = &seen[0].0;
     let real = String::from_utf8(crate::broker::redact::basic_auth(b"x-access-token", TOKEN.as_bytes())).unwrap();
     assert!(head.contains(&format!("\r\nAuthorization: Basic {real}\r\n")), "{head}");
     assert!(head.contains("\r\nGit-Protocol: version=2\r\n"), "{head}");
     assert!(head.starts_with("GET /o/r.git/info/refs?service=git-upload-pack HTTP/1.1\r\n"), "{head}");
     assert_eq!(rig.log(1)[0]["scope"], "repo.read");
+}
+
+#[test]
+fn a_pasted_tokens_reported_expiry_is_recorded_and_noticed_once_a_day() {
+    let end = Instance::now() + 3 * 86_400;
+    let reported = crate::inbox::rfc3339(end).replace('T', " ").replace('Z', " UTC");
+    let (port, _) = upstream_server(move |_, _| {
+        format!("HTTP/1.1 200 OK\r\nGitHub-Authentication-Token-Expiration: {reported}\r\nContent-Length: 0\r\n\r\n")
+            .into_bytes()
+    });
+    let claim = private(crate::credentials::home::tests::github());
+    let mut state = intercept_state(claim.clone());
+    state.instances.get_mut("web-1").unwrap().github_repos = vec!["o/r".into()];
+    let shown = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = shown.clone();
+    let rig = Rig::with_service("expiry", port, state, intercept_home(&claim), "github-work", &claim, |s| {
+        s.with_notify(move |body| sink.lock().unwrap().push(body.to_string()))
+    });
+    let mut c = git_client(&rig);
+    for _ in 0..2 {
+        let a = c.call("GET", "/o/r.git/info/refs?service=git-upload-pack", &git_headers(), b"");
+        assert_eq!(a.status, 200, "{a:?}");
+    }
+    let entry = home::load(&home::path(&rig.dir.join("data"))).unwrap()["github-work"].clone();
+    assert_eq!(entry.expires(), Some(end));
+    let shown = shown.lock().unwrap();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    let rfc = crate::inbox::rfc3339(end);
+    assert!(shown[0].starts_with("credential `github-work` expires in ") && shown[0].contains(&rfc), "{}", shown[0]);
 }
 
 #[test]
@@ -798,7 +833,7 @@ fn git_fetch_outside_the_fence_goes_stripped_and_marked() {
     let a = git_client(&rig).call("GET", "/x/y.git/info/refs?service=git-upload-pack", &git_headers(), b"");
     assert_eq!(a.status, 200, "{a:?}");
     assert_eq!(a.header("devsandbox-fence"), Some("outside"), "{}", a.head);
-    let seen = seen.lock().unwrap();
+    let seen = tool_calls(&seen);
     let head = &seen[0].0;
     assert!(!head.to_ascii_lowercase().contains("authorization"), "{head}");
     assert!(head.contains("\r\nGit-Protocol: version=2\r\n"), "{head}");
@@ -835,7 +870,38 @@ fn pushes_are_refused_at_info_refs_before_upstream() {
     assert_eq!(a.status, 403, "{a:?}");
     assert!(String::from_utf8(a.body).unwrap().contains("scope `git.push` isn't in `access.github.scopes`"));
     assert_eq!(c.call("GET", "/o/r.git/info/refs?service=git-upload-pack", &git_headers(), b"").status, 200);
-    assert_eq!(seen.lock().unwrap().len(), 1, "only the fetch went upstream");
+    assert_eq!(tool_calls(&seen).len(), 1, "only the fetch went upstream");
+}
+
+/// GitHub after `o/r` became `N/R` (id 42): a 301 for the old name.
+fn renamed(head: &str, body: &[u8]) -> Vec<u8> {
+    let repo = r#"{"id":42,"node_id":"R_42","full_name":"N/R"}"#;
+    match head.split(' ').nth(1).unwrap() {
+        "/repos/o/r" => b"HTTP/1.1 301 Moved\r\nLocation: https://api.github.com/repositories/42\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        "/repositories/42" if head.contains("User-Agent: devsandbox-broker") => {
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{repo}", repo.len()).into_bytes()
+        }
+        _ => echo(head, body),
+    }
+}
+
+#[test]
+fn a_renamed_repo_is_pinned_and_called_by_its_current_name() {
+    let (port, seen) = upstream_server(renamed);
+    let rig = Rig::fenced("renamed", port);
+    let mut ca = MemberCa::load_or_create(&rig.dir.join("data")).unwrap();
+    ca.ensure_hosts(&BTreeSet::from(["api.github.com".to_string()])).unwrap();
+    let mut c = rig.intercept_to("api.github.com", 443, Some("api.github.com"), &[b"http/1.1"]).unwrap();
+    let auth = format!("Authorization: token {GH}\r\n");
+    assert_eq!(c.call("GET", "/repos/o/r/pulls", &auth, b"").status, 200);
+    assert_eq!(c.call("GET", "/repositories/42", &auth, b"").status, 200);
+    let tool = tool_calls(&seen);
+    assert!(tool[0].0.starts_with("GET /repos/N/R/pulls HTTP/1.1\r\n"), "{}", tool[0].0);
+    assert!(tool[0].0.contains(&format!("\r\nAuthorization: token {TOKEN}\r\n")), "{}", tool[0].0);
+    assert!(tool[1].0.starts_with("GET /repositories/42 HTTP/1.1\r\n"), "{}", tool[1].0);
+    assert_eq!(seen.lock().unwrap().len(), 4, "the old name and the id looked up once each");
+    let state = State::load_at(&rig.dir.join("data/state.toml")).unwrap();
+    assert_eq!((state.github_ids["o/r"].id, state.github_ids["o/r"].node_id.as_str()), (42, "R_42"));
 }
 
 const STORAGE_AUTH: &str = "RemoteAuth STORAGE-secret-42";

@@ -12,11 +12,13 @@ and [github-and-sentry-access](../../plans/active/github-and-sentry-access.md)
 Code: `src/credentials/fence.rs` (`parse`, `github_repo`, `normalize`,
 `plain_host`, `ssh_g_hostname`, `ssh_hostname`, `repo_arg`),
 `src/commands/run/remotes.rs` (`record_at`, `read_folder`, `fence_of`,
-`instance_folders`, `refresh_at`), `src/broker/policy.rs` (`fence_of`),
+`instance_folders`, `refresh_at`), `src/broker/policy.rs` (`fence_of`,
+`fence_for`), `src/broker/github.rs` (`Fence`, `Lookup`, `Live`,
+`Cache`, `Https`, `fetch_name`, `redirect_path`, `fetch_node`),
 `src/commands/run/git.rs`
 (`read_remotes`, `read_regular`, `remotes_of`), `src/state.rs`
 (`State::folder_remotes`, `FolderRemotes`, `FolderRemote`,
-`Instance::github_repos`), `src/commands/access.rs` (`forget_at`,
+`Instance::github_repos`, `State::github_ids`, `GithubPin`), `src/commands/access.rs` (`forget_at`,
 `fences`, `render_fences`).
 
 ## Why once
@@ -128,9 +130,71 @@ as `normalize` does) inside it gets the credential, subject to its scope.
 Outside it a read goes upstream with the phantom stripped, marked
 `devsandbox-fence: outside`, an upstream `401` turned into a `403` naming
 `access.<kind>.repos`; a write, a git push included, is refused at
-`info/refs`. Routes naming a repo by id (`/repositories/{id}`) aren't
-placed yet and are refused. The rules:
+`info/refs`. Entries stand for the repositories they were pinned to
+([Ids](#ids)), so `/repositories/{id}` routes are placed too. The rules:
 [broker](broker.md#the-repo-fence).
+
+## Ids
+
+A name can change hands: a repo is renamed (GitHub redirects the old
+name until someone takes it) or its owner renames their account and
+someone registers the old login. So the broker pins each fence entry to
+the repository it named the first time the home resolved it, and from
+then on the entry stands for that repository's id, whatever the names
+do.
+
+```toml
+[github_ids."org/app"]
+id = 1296269
+node_id = "R_kgDOABC"
+pinned_at = 1795000000
+```
+
+`State::github_ids` maps an entry (normalized, from a folder's record or
+`access.github.repos`) to its `GithubPin`, host-wide: an id is GitHub's,
+not a folder's. A pin is written once (`Live::pin`, under the state
+lock, only where absent) and never changed.
+
+`policy::fence_for` builds a `github::Fence` per call from `fence_of`'s
+entries, their pins and, when the approved claim has `api.github.com`
+among its upstreams, the lookup with the call's credential
+(`github::Via`). Placement (`Fence`):
+
+- An entry without a pin is resolved: `GET /repos/{owner}/{repo}` on
+  `api.github.com` with the credential (`Authorization: Bearer`,
+  `Accept: application/vnd.github+json`, `User-Agent: devsandbox-broker`).
+  A 301/302/307/308 is followed once, and only to a `Location` on
+  `https://api.github.com` itself (`redirect_path`): GitHub answers a
+  renamed repo's old name with a 301 to `/repositories/{id}`. A second
+  redirect, or one to any other host, is never followed. The answer's
+  `id`, `node_id` and `full_name` (checked as `normalize` reads names)
+  pin the entry. A 404 (no access, no such repo) pins nothing: the entry
+  matches by name only, as does every entry without a lookup.
+- A `{repo}` that is an entry: in, and when its pinned repository's
+  current name (`GET /repositories/{id}`) differs, the call is sent to
+  that name (`route::with_repo` rewrites the two segments, a `.git` or
+  `.wiki.git` suffix kept; `Injection::path`). The old name is never
+  dialed with the credential, so whoever registers it gets nothing.
+- A `{repo}` that isn't: in when it is the current name of an entry's
+  pinned repository. Only the entries are looked up, never the name the
+  sandbox sent, so what the sandbox names can't spend the credential's
+  rate limit.
+- A repository id (`/repositories/{id}`): in when an entry is pinned to
+  it. Outside, its name (looked up by id) names it in the refusal.
+- A node id (`Fence::place_node`, for GraphQL mutation inputs): in when
+  an entry is pinned to that repository node id, with no call; else
+  GitHub's `node(id:)` (`fetch_node`: a repository, or the `repository`
+  of a `RepositoryNode`, `Ref`, `Release`, `Milestone`, `Label` or
+  `Commit`) and placed by that repository's id.
+
+`Live` is the lookup `serve` runs: answers cached in the daemon's
+memory per (credential, name | id | node id), since what a credential
+sees is its own: a repository for `TTL` (1 h), a 404 for `MISSING_TTL`
+(5 min), any other answer or none for `FAILED_TTL` (1 min), at most
+`CACHE_CAP` entries. A node that isn't a repository is never cached (a
+transferred issue keeps its id), nor is a node that resolves to nothing.
+The calls go through the broker's upstream client (`Https`), redirects
+off, the token the credential's (`Renewer::token`, renewed when due).
 
 ## `access forget`
 

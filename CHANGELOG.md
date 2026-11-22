@@ -24,6 +24,7 @@
   devsandbox access revoke sentry-work --version 3f2a1b
   ```
 
+- **GitHub tokens that stay narrow, and a warning before they expire.** `devsandbox login` for a GitHub credential takes fine-grained PATs (`github_pat_…`) and GitHub App user tokens (`ghu_…`) and refuses classic PATs and gh's own OAuth token, which reach every repo you can. `access.github.as` in a sandbox's config picks which kind of token a sandbox takes, within the kinds the credential offers (`as` in `credentials.toml`, `["user"]` by default). `access ls` shows when a credential expires and warns two weeks ahead, and in its last week you get a desktop notice once a day while sandboxes use it.
 - **`access.<kind>` in a sandbox's config** picks the credential a claim takes (`credential`) and narrows what the sandbox may do with it (`scopes`). Edits apply to the next call, no rebuild.
 
   ```toml
@@ -40,6 +41,7 @@
   ```
 
 - **The broker enforces the repo fence, git over HTTPS included.** A claim that declares a `fence` gets its credential only on repos in the sandbox's fence: its folders' recorded repos plus `access.<kind>.repos`. Outside the fence a read goes to GitHub without a credential, as a stranger's would (public repos and git dependencies work), marked `devsandbox-fence: outside`; a write or a `git push` is refused before git sends anything, naming `access.<kind>.repos`, and so is an upstream 401, so git never prompts for a password. Claim routes take `{repo}` (`owner/repo`, case-insensitive, `.git` dropped) and a `?service=` style query constraint, so git's fetch and push map to their own scopes.
+- **The repo fence follows renamed repos, and an old name can't be taken over.** The first time the broker sees a fenced repo it asks GitHub for its id (following a rename's redirect, only on `api.github.com`) and keeps it in `state.toml`. A renamed repo then works under its old and new names, calls naming the old one are sent to the new one, and `/repositories/{id}` routes work for the fence's repos. Whoever later registers the old name gets nothing: the fence entry stays with the repo it first named.
 
 - **A sandbox with a GitHub git claim can't reach GitHub with your ssh keys.** While a feature claims git hosts, the ssh-agent relay shows the sandbox only the keys its config's new `ssh-keys` names, none by default. A key with `destinations` signs only logins to those hosts, checked against their host keys in this host's `known_hosts` (the client must bind the session, OpenSSH 8.9+). A `signing-only` key signs only git's ssh commit signatures. A key named without destinations works everywhere, GitHub included, and so gets around the repo fence. Refusals land in the instance's Inbox. An instance with such a claim never gets the agent by bind mount.
 

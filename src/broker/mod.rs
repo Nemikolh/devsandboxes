@@ -17,8 +17,9 @@
 //!   upstream URLs turned into loopback ones, the broker's own answers.
 //! - [`lfs`]: LFS batch responses' transfers behind handles on the
 //!   instance's LFS listener.
-//! - [`policy`], [`audit`], [`intercept`], [`serve`] (unix, with `serve`):
-//!   the decision per call, `access.log`, intercept mode's TLS, and the
+//! - [`policy`], [`github`], [`audit`], [`intercept`], [`serve`] (unix,
+//!   with `serve`): the decision per call, the repo fence resolved to
+//!   GitHub's ids, `access.log`, intercept mode's TLS, and the
 //!   [`Broker`](crate::devsbd::bridge::Broker) the daemon's bridges hand
 //!   connections to.
 //!
@@ -33,6 +34,8 @@
 #[cfg(unix)]
 pub mod audit;
 pub mod body;
+#[cfg(unix)]
+pub mod github;
 pub mod guard;
 pub mod head;
 #[cfg(unix)]

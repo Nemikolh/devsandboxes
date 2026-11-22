@@ -17,7 +17,8 @@ fence*, *sentry-cli*) and [git-gateway](../../plans/active/git-gateway.md)
 Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
 `src/broker/policy.rs` (`decide`, `admit_intercept`, `intercept_claim`,
 `Sources`, `Outcome`, `Action`, `Injection`, `Phantom`, `inject`,
-`strip`, `fence_of`, `secrets`), `src/broker/intercept.rs`
+`strip`, `fence_of`, `fence_for`, `secrets`), `src/broker/github.rs`
+(`Fence`, `Live`), `src/broker/intercept.rs`
 (`server_config`, `fold`, `ALPN`), `src/credentials/ca.rs` (`MemberCa`),
 `src/broker/route.rs` (`check_path`, `matches`, `Match`, `scope_of`,
 `Matched`, `git_service`, `is_write`), `src/broker/rewrite.rs`
@@ -131,8 +132,10 @@ only for a call carrying the phantom). First refusal answers:
    a `never` route is refused always; a route in no scope is `other`,
    refused as an ask; a path past `{repo}` that decodes badly is a `400`.
 9. **Repo fence**, for a fenced claim ([below](#the-repo-fence)): the
-   matched route is placed on a repo, repo-less, or refused; a repo
-   outside the fence goes upstream stripped, or is refused for a write.
+   matched route is placed on a repo or a repository id, repo-less, or
+   refused; a repo outside the fence goes upstream stripped, or is
+   refused for a write; a renamed repo's old name is sent to its current
+   one.
 10. **Scope**: it must be granted (`max`; unset: every scope) and not in
    `access.<kind>.ask` (refused: asks need permission requests; on a
    repo-less route of a fenced claim, refused as never asked, since an
@@ -164,7 +167,8 @@ matches nothing; the match carries them lowercased with `.wiki.git` or
 decoded segments matched against the rest of the route (gh sends
 `git/ref/tags%2Fv1`); a double encoding (`%25` and two hex digits) or a
 dot-segment or `//` after decoding refuses the call (`Match::Refused`).
-The request is forwarded exactly as sent.
+The request is forwarded exactly as sent, but for a renamed repo's old
+name ([The repo fence](#the-repo-fence)).
 
 `never` routes are tried first, then routes with a query constraint, then
 the rest, so `info/refs?service=git-receive-pack` is `git.push`'s even if
@@ -176,14 +180,18 @@ A claim whose `fence` names any route is fenced (`Pinned::fenced`).
 `route::scope_of` returns the matched route and what its `{repo}` took;
 `attribute` places it:
 
-- the route's `fence` entry names an input other than `{repo}` (a repo id
-  as in `/repositories/{id}`, a body field): it can't be placed yet and is
-  refused;
-- it took a repo: checked against the instance's fence (`fence_of`:
-  `Instance::github_repos`, the folders' recorded repos
+- the route's `fence` entry names an input other than `{repo}` and a
+  `/repositories/{id}` route's `{id}` (a body field): it can't be placed
+  yet and is refused;
+- a `/repositories/{id}` route whose `fence` names `{id}`: the id (ASCII
+  digits, else a `400`) is checked against the fence's pins;
+- it took a repo: checked against the instance's fence (`fence_for`:
+  `fence_of`'s `Instance::github_repos`, the folders' recorded repos
   ([fence](fence.md)), and the config's `access.<kind>.repos`, each
   `owner/repo` or a GitHub URL of it through `fence::repo_arg`, read per
-  call);
+  call), resolved to ids at the home ([fence](fence.md#ids)): an entry's
+  old name or its current one is in, and a call naming the old one is
+  sent to the current one (`Injection::path`);
 - no `{repo}`: repo-less, on to the scope checks (never asked).
 
 In the fence the scope checks follow. Outside it the call gets no
@@ -201,7 +209,8 @@ to a credential prompt and gh never to its login.
 ## The call
 
 `Service::forward` builds the upstream request: `https://<upstream><path>`
-(path and query as the tool sent them), the tool's fields minus those the
+(path and query as the tool sent them, a renamed repo's segments
+aside), the tool's fields minus those the
 upstream client writes itself (`upstream::RESERVED`: `Host`, framing,
 `Accept-Encoding`, `Connection`, hop-by-hop, `Expect`) and those the
 request's `Connection` names. An injected call gets the secret from the
@@ -341,6 +350,23 @@ A renewal that fails answers the call:
 unset, so the first reason stays; a successful renewal
 (`home::clear_broken`) or a `login` clears it. It refuses no call: it
 is for `access ls`.
+
+## Expiry
+
+Every injected call that gets an answer goes through
+`Service::track_expiry`. With a pasted secret (`Fresh::pasted`), the
+response header the approved claim's `tokens.expiry` names (GitHub's
+`github-authentication-token-expiration`) is read
+(`tokens::captured`) and, when it differs from the entry's `expires_at`
+(`Injection::expires_at`), recorded there (`home::set_expires_at`; a
+failed write is logged, the call answered either way). The credential's
+end is that, or an OAuth record's refresh token's expiry (`Fresh::ends`,
+`tokens::ends_at`). Within 7 days of it the daemon shows a desktop
+notice (`devsbd::desktop::notify_desktop`) naming `devsandbox login
+<credential>`, at most once per credential per UTC day
+(`tokens::Notices`, in memory): the broker sees every call a credential
+serves, whichever instance makes it. `access ls` shows the same end and
+warns 14 days ahead ([credentials CLI](../../reference/credentials-cli.md#access-ls)).
 
 ## Refusals
 

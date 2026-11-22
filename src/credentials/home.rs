@@ -44,13 +44,15 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<Vec<String>>,
     // Read from credential-broker step 4 (`approvers`), 5 (`members`) and 7
-    // (`delegate`), and github-and-sentry-access step 2 (`as`).
+    // (`delegate`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegate: Vec<String>,
+    /// The token kinds it offers (`credentials::tokens::pick`); unset:
+    /// `["user"]`.
     #[serde(default, rename = "as", skip_serializing_if = "Vec::is_empty")]
     pub as_: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -62,6 +64,11 @@ pub struct Entry {
     /// credential-broker step 4, the approvers' notice).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broken: Option<Broken>,
+    /// RFC 3339, UTC: a pasted secret's expiry as the upstream reported it
+    /// to the broker (the claim's `tokens.expiry` header); cleared by a
+    /// login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 /// Why the broker stopped trusting the secret: a refused refresh, an
@@ -89,7 +96,13 @@ impl Entry {
             approved: Vec::new(),
             pending: Vec::new(),
             broken: None,
+            expires_at: None,
         }
+    }
+
+    /// [`Entry::expires_at`] in unix seconds; checked at load.
+    pub fn expires(&self) -> Option<u64> {
+        self.expires_at.as_deref().and_then(crate::broker::lfs::parse_rfc3339)
     }
 
     /// The approved claim of `version`, canonical: what the broker enforces
@@ -117,6 +130,12 @@ impl Entry {
         super::claim::check_kind(&self.kind).context("`kind`")?;
         for p in self.profiles.iter().flatten() {
             crate::config::check_profile_name(p).context("`profiles`")?;
+        }
+        super::tokens::offered(&self.as_).context("`as`")?;
+        if let Some(at) = &self.expires_at
+            && self.expires().is_none()
+        {
+            bail!("`expires_at`: `{at}` isn't an RFC 3339 date-time");
         }
         for (field, versions) in [("approved", &self.approved), ("pending", &self.pending)] {
             for v in versions {
@@ -304,6 +323,16 @@ pub fn mark_broken(path: &Path, name: &str, broken: Broken) -> Result<()> {
     })
 }
 
+/// Records `name`'s expiry (unix seconds). No such credential: nothing.
+pub fn set_expires_at(path: &Path, name: &str, at: u64) -> Result<()> {
+    update(path, |h| {
+        if let Some(e) = h.get_mut(name) {
+            e.expires_at = Some(crate::inbox::rfc3339(at));
+        }
+        Ok(())
+    })
+}
+
 pub fn clear_broken(path: &Path, name: &str) -> Result<()> {
     update(path, |h| {
         if let Some(e) = h.get_mut(name) {
@@ -373,6 +402,8 @@ pub(crate) mod tests {
             ("[x]\nkind = \"Sentry\"\n", "the kind must be"),
             ("[X]\nkind = \"sentry\"\n", "credential name"),
             ("[x]\nkind = \"sentry\"\nprofiles = [\"Work\"]\n", "profile name"),
+            ("[x]\nkind = \"github\"\nas = [\"bot\"]\n", "`as`"),
+            ("[x]\nkind = \"github\"\nexpires_at = \"soon\"\n", "`expires_at`"),
         ] {
             let err = format!("{:#}", parse(bad).unwrap_err());
             assert!(err.contains(wants), "{bad}: {err}");
@@ -435,6 +466,10 @@ pub(crate) mod tests {
         assert_eq!(load(&p).unwrap()["s"].broken, Some(broken("refused")));
         clear_broken(&p, "s").unwrap();
         assert_eq!(load(&p).unwrap()["s"].broken, None);
+        set_expires_at(&p, "s", 1_800_000_000).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("expires_at = \"2027-01-15T08:00:00Z\""), "{text}");
+        assert_eq!(load(&p).unwrap()["s"].expires(), Some(1_800_000_000));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -50,6 +50,7 @@ phantoms. One feature per instance claims a given credential
 | `login` | how `devsandbox login` gets it: OAuth device flow, browser OAuth, GitHub App manifest, paste |
 | `check` | a route the broker calls with no sandbox input to confirm a 401 means a broken credential (`GET /user`, `GET /api/0/`; credential-broker, *Lifetimes*) |
 | `mint` | an adapter devsandbox ships (`github-app`, `oauth-refresh`), if any |
+| `tokens` | what the secret may be: the token kinds it can act as (`as`, `user` / `app`: *Whose token*), the prefixes `login` accepts (`accept`: `github_pat_`, `ghu_`), the response header reporting a pasted token's expiry (`expiry`) |
 | `scopes` | named scopes over routes and GraphQL mutations, with the app permissions each needs: `pr.write = ["POST /repos/{repo}/pulls", "graphql mutation createPullRequest", …]` |
 | `never` | routes no ask or rule opens |
 | `presence` | routes and ref forms that always ask a human, with the field naming each one's target (credential-broker, *`presence`*) |
@@ -62,7 +63,9 @@ Data only: a claim can't run anything on the home or a member.
 `credentials` is keyed by the kind, unknown fields are refused, `baseUrl`
 points at the first upstream listed, `inject`'s `format` and phantom file
 templates take `{token}`, `{phantom}` and (`base-url` only) `{baseUrl}`,
-each `rewrite` entry names its route and field paths, and a route is in
+each `rewrite` entry names its route and field paths, `tokens` needs an
+`inject` slot and names at least one of its parts (each prefix up to 32
+letters, digits, `_`, `-`), and a route is in
 one scope or `never`, never both (`credentials::claim`). A route's
 `{var}` takes one path segment and `{repo}` two, `owner/repo` (matched as
 *Matching* says); a route may end in one `?name=value` the request's query

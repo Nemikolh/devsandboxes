@@ -19,6 +19,7 @@ use crate::config::{Access, Config};
 use crate::credentials::fence;
 use crate::credentials::home::{self, Broken, Entry, Home, Version};
 use crate::credentials::review;
+use crate::credentials::tokens;
 use crate::credentials::store::{Record, Store};
 use crate::state::{Instance, State};
 
@@ -39,7 +40,7 @@ fn now() -> u64 {
 
 pub fn ls(credential: Option<&str>, json: bool) -> Result<()> {
     let state = State::load()?;
-    let list = list_at(&data_dir()?, &state, credential, &mut config_access)?;
+    let list = list_at(&data_dir()?, &state, credential, &mut config_access, now())?;
     // Naming a credential asks about it alone.
     let fences = if credential.is_none() { fences(&state) } else { Vec::new() };
     if json {
@@ -175,7 +176,20 @@ struct Credential {
     approved: Vec<VersionRow>,
     pending: Vec<VersionRow>,
     broken: Option<Broken>,
+    /// When the secret stops working, if known (`tokens::ends_at`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires: Option<Expires>,
     instances: Vec<Use>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct Expires {
+    /// Unix seconds.
+    at: u64,
+    days: u64,
+    expired: bool,
+    /// Within `tokens::WARN_DAYS`.
+    warn: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -268,7 +282,11 @@ fn token(record: &Result<Option<Record>>) -> Token {
     }
 }
 
-fn credential(name: &str, entry: &Entry, record: Result<Option<Record>>, uses: Vec<Use>) -> Credential {
+fn credential(name: &str, entry: &Entry, record: Result<Option<Record>>, uses: Vec<Use>, now: u64) -> Credential {
+    let expires = tokens::ends_at(record.as_ref().ok().and_then(Option::as_ref), entry.expires()).map(|at| {
+        let l = tokens::left(at, now);
+        Expires { at, days: l.days, expired: l.expired, warn: l.warn }
+    });
     let pinned = |v: &Version| uses.iter().any(|u| u.version == v.version);
     let latest = entry.latest_approved().map(|v| v.version.as_str());
     let row = |v: &Version| {
@@ -289,11 +307,18 @@ fn credential(name: &str, entry: &Entry, record: Result<Option<Record>>, uses: V
         approved: entry.approved.iter().map(row).collect(),
         pending: entry.pending.iter().map(row).collect(),
         broken: entry.broken.clone(),
+        expires,
         instances: uses,
     }
 }
 
-fn list_at(data: &Path, state: &State, only: Option<&str>, access_of: &mut AccessOf) -> Result<Vec<Credential>> {
+fn list_at(
+    data: &Path,
+    state: &State,
+    only: Option<&str>,
+    access_of: &mut AccessOf,
+    now: u64,
+) -> Result<Vec<Credential>> {
     let path = home::path(data);
     let home = home::load(&path)?;
     if let Some(name) = only.filter(|n| !home.contains_key(*n)) {
@@ -304,7 +329,7 @@ fn list_at(data: &Path, state: &State, only: Option<&str>, access_of: &mut Acces
     Ok(home
         .iter()
         .filter(|(n, _)| only.is_none_or(|o| o == n.as_str()))
-        .map(|(n, e)| credential(n, e, store.get(n), uses.remove(n).unwrap_or_default()))
+        .map(|(n, e)| credential(n, e, store.get(n), uses.remove(n).unwrap_or_default(), now))
         .collect())
 }
 
@@ -368,6 +393,14 @@ fn render(list: &[Credential], now: u64) -> String {
         }
         if let Some(b) = &c.broken {
             line(&mut out, "broken", &format!("{} (since {}): `devsandbox login {}`", b.reason, b.at, c.name));
+        }
+        if let Some(e) = &c.expires {
+            let left = tokens::Left { days: e.days, expired: e.expired, warn: e.warn };
+            let mut text = format!("{} ({})", tokens::in_days(left), crate::inbox::rfc3339(e.at));
+            if e.warn || e.expired {
+                text = format!("warning: {text}: `devsandbox login {}` replaces it", c.name);
+            }
+            line(&mut out, "expires", &text);
         }
         if c.instances.is_empty() {
             line(&mut out, "instances", "none here");
@@ -735,14 +768,14 @@ mod tests {
         Store::in_data(&data).put("sentry-work", &Record::token(Secret::new(STATIC.into()))).unwrap();
         let mut state = state_fixture();
         state.instances.remove("lost");
-        let list = list_at(&data, &state, Some("sentry-work"), &mut access_fixture).unwrap();
+        let list = list_at(&data, &state, Some("sentry-work"), &mut access_fixture, 0).unwrap();
         let c = &list[0];
         let marks: Vec<(bool, bool)> = c.approved.iter().chain(&c.pending).map(|r| (r.latest, r.unused)).collect();
         assert_eq!(marks, [(false, false), (true, false), (false, false)], "v0 and v2 pinned, v1 latest");
 
         state.instances.remove("w0");
         state.instances.remove("w2");
-        let list = list_at(&data, &state, None, &mut access_fixture).unwrap();
+        let list = list_at(&data, &state, None, &mut access_fixture, 0).unwrap();
         assert_eq!(list.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["gh", "sentry-oss", "sentry-work"]);
         let c = &list[2];
         let marks: Vec<(bool, bool)> = c.approved.iter().chain(&c.pending).map(|r| (r.latest, r.unused)).collect();
@@ -766,7 +799,7 @@ mod tests {
         assert!(!text.contains(STATIC));
         assert_eq!(render(&[], 0), "no credentials on this host: `devsandbox login <credential>` adds one\n");
 
-        let err = list_at(&data, &state, Some("nope"), &mut access_fixture).unwrap_err().to_string();
+        let err = list_at(&data, &state, Some("nope"), &mut access_fixture, 0).unwrap_err().to_string();
         assert!(err.contains("no credential `nope`"), "{err}");
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -776,7 +809,7 @@ mod tests {
         let data = data_fixture("ls-unknown");
         let mut state = State::default();
         state.instances.insert("lost".into(), with_claim("lost", &trimmed(0), Some("work")));
-        let list = list_at(&data, &state, Some("sentry-work"), &mut access_fixture).unwrap();
+        let list = list_at(&data, &state, Some("sentry-work"), &mut access_fixture, 0).unwrap();
         assert!(!list[0].approved[0].unused, "an unknown instance may pin it");
         let text = render(&list, 0);
         assert!(
@@ -800,7 +833,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let list = list_at(&data, &state_fixture(), Some("gh"), &mut access_fixture).unwrap();
+        let list = list_at(&data, &state_fixture(), Some("gh"), &mut access_fixture, 0).unwrap();
         let json = serde_json::to_value(Envelope::new(&list)).unwrap();
         let c = &json["data"][0];
         assert_eq!(
@@ -810,7 +843,9 @@ mod tests {
                 "token": {"type": "oauth", "expires_at": 1_800_000_000u64, "refresh_expires_at": 1_900_000_000u64,
                           "refreshable": true, "scope": null},
                 "profiles": null, "max": ["repo.read"], "approvers": ["laptop"],
-                "approved": [], "pending": [], "broken": null, "instances": [],
+                "approved": [], "pending": [], "broken": null,
+                "expires": {"at": 1_900_000_000u64, "days": 21990, "expired": false, "warn": false},
+                "instances": [],
             })
         );
         let text = serde_json::to_string(&json).unwrap() + &render(&list, 0);
@@ -820,7 +855,7 @@ mod tests {
 
         let broken = Broken { at: "2026-11-21T10:00:00Z".into(), reason: "its refresh was refused".into() };
         home::mark_broken(&home::path(&data), "sentry-work", broken).unwrap();
-        let list = list_at(&data, &state_fixture(), Some("sentry-work"), &mut access_fixture).unwrap();
+        let list = list_at(&data, &state_fixture(), Some("sentry-work"), &mut access_fixture, 0).unwrap();
         let json = serde_json::to_value(&list[0]).unwrap();
         assert_eq!(json["broken"], serde_json::json!({"at": "2026-11-21T10:00:00Z", "reason": "its refresh was refused"}));
         let text = render(&list, 0);
@@ -834,6 +869,44 @@ mod tests {
         assert_eq!(json["approved"][1], serde_json::json!({"version": trimmed(1).version(), "latest": true, "unused": false}));
         assert_eq!(json["instances"][1], serde_json::json!({"instance": "w0", "version": trimmed(0).version(), "approved": true}));
         assert!(json["instances"][0]["unknown"].as_str().unwrap().contains("cannot read its config"));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn expiry_is_shown_and_warned_of_within_fourteen_days() {
+        let data = data_fixture("ls-expiry");
+        let now = 1_800_000_000;
+        let day = 86_400;
+        Store::in_data(&data).put("sentry-work", &Record::token(Secret::new(STATIC.into()))).unwrap();
+        let show = |data: &Path, now: u64| {
+            let list = list_at(data, &State::default(), Some("sentry-work"), &mut access_fixture, now).unwrap();
+            let text = render(&list, now);
+            (serde_json::to_value(&list[0]).unwrap()["expires"].clone(), text)
+        };
+        let (json, text) = show(&data, now);
+        assert_eq!(json, serde_json::Value::Null, "a pasted token with no reported expiry");
+        assert!(!text.contains("expires"), "{text}");
+
+        home::set_expires_at(&home::path(&data), "sentry-work", now + 30 * day).unwrap();
+        let (json, text) = show(&data, now);
+        assert_eq!(json, serde_json::json!({"at": now + 30 * day, "days": 30, "expired": false, "warn": false}));
+        assert!(text.contains("  expires   in 30 days (2027-02-14T08:00:00Z)\n"), "{text}");
+        let (json, text) = show(&data, now + 20 * day);
+        assert_eq!(json["warn"], true);
+        assert!(
+            text.contains(
+                "  expires   warning: in 10 days (2027-02-14T08:00:00Z): `devsandbox login sentry-work` replaces it\n"
+            ),
+            "{text}"
+        );
+        let (json, text) = show(&data, now + 31 * day);
+        assert_eq!((json["expired"].clone(), json["warn"].clone()), (true.into(), false.into()));
+        assert!(text.contains("  expires   warning: expired (2027-02-14T08:00:00Z)"), "{text}");
+
+        // An OAuth record's end is its refresh token's, whatever was recorded.
+        Store::in_data(&data).put("sentry-work", &oauth_record()).unwrap();
+        let (json, _) = show(&data, 1_900_000_000 - 3 * day);
+        assert_eq!(json, serde_json::json!({"at": 1_900_000_000u64, "days": 3, "expired": false, "warn": true}));
         let _ = std::fs::remove_dir_all(&data);
     }
 

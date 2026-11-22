@@ -328,6 +328,8 @@ pub struct Access {
     pub repos: Vec<String>,
     #[serde(default)]
     pub branches: Vec<String>,
+    /// The token kind to take the credential as (`user` | `app`), within
+    /// what the home offers (`credentials::tokens::pick`).
     #[serde(rename = "as")]
     pub as_: Option<String>,
 }
@@ -1351,6 +1353,9 @@ impl Config {
             if let Some(c) = &access.credential {
                 crate::credentials::check_name(c).with_context(|| format!("sandbox `{name}`: `access.{kind}.credential`"))?;
             }
+            if let Some(a) = &access.as_ {
+                crate::credentials::claim::TokenKind::parse(a).with_context(|| format!("sandbox `{name}`: `access.{kind}.as`"))?;
+            }
             for list in [&mut access.scopes, &mut access.ask, &mut access.repos, &mut access.branches] {
                 let mut seen = std::collections::BTreeSet::new();
                 list.retain(|s| seen.insert(s.clone()));
@@ -2170,6 +2175,7 @@ folder = "../web"
             ("[sandbox.s.access.sentry]\nscope = [\"x\"]\n", "scope"),
             ("[sandbox.s.access.Sentry]\n", "the kind must be"),
             ("[sandbox.s.access.sentry]\ncredential = \"a.b\"\n", "credential name"),
+            ("[sandbox.s.access.github]\nas = \"bot\"\n", "`user` or `app`"),
         ] {
             let err = match Config::parse(bad) {
                 Err(e) => format!("{e:#}"),

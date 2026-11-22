@@ -600,8 +600,14 @@ fn repo_less_and_unplaced_routes() {
     refused(&fenced(&ask, "GET", "api.github.com", "/user", &token), "names no repo, so it's never asked");
     refused(&fenced(&ask, "GET", "api.github.com", "/repos/o/r", &token), "asks need permission requests");
 
-    let o = fenced(&fenced_src(None), "GET", "api.github.com", "/repositories/123", &token);
-    refused(&o, "`GET /repositories/123` names its repo by `{id}`, which the broker can't resolve yet");
+    // A body input isn't placed.
+    let mut body = crate::credentials::home::tests::github();
+    let pulls = claim::Route::parse("POST /repos/{repo}/pulls").unwrap();
+    body.pinned.fence.insert(pulls, vec!["{repo}".into(), "head".into()]);
+    let mut src = fenced_src(None);
+    src.home.get_mut("github-work").unwrap().approved[0].claim = body.canonical();
+    let o = fenced(&src, "POST", "api.github.com", "/repos/o/r/pulls", &token);
+    refused(&o, "`POST /repos/o/r/pulls` names its repo by `head`, which the broker can't resolve yet");
     // Unknown routes stay `other`.
     refused(&fenced(&fenced_src(None), "GET", "api.github.com", "/repos/o/r/hooks", &token), "scope `other`");
     // A path past the repo that decodes badly.
@@ -654,4 +660,112 @@ fn secrets_cover_basic_and_query_forms() {
     body.extend(redact::basic_auth(b"x-access-token", b"t/k"));
     assert!(s.mask(&mut body));
     assert!(body.iter().all(|&b| b == b'*' || b == b' '), "{}", String::from_utf8_lossy(&body));
+}
+
+/// [`fenced_src`] with GitHub answered by `fake`.
+struct Resolving {
+    src: Src,
+    fake: github::tests::Fake,
+}
+
+impl Sources for Resolving {
+    fn home(&self) -> Result<Home> {
+        self.src.home()
+    }
+    fn access(&self, inst: &Instance, kind: &str) -> Result<Option<Access>> {
+        self.src.access(inst, kind)
+    }
+    fn github(&self) -> Option<&dyn github::Lookup> {
+        Some(&self.fake)
+    }
+}
+
+fn resolving(state: &State, src: &Resolving, method: &str, host: &str, path: &str) -> Outcome {
+    let auth = if host == "github.com" { git_basic(GH) } else { format!("Authorization: token {GH}\r\n") };
+    let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{auth}\r\n").as_bytes()).unwrap();
+    let header = ProxyHeader::Intercept { host: host.into(), port: 443 };
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None }, state, src)
+}
+
+#[test]
+fn repository_ids_are_placed_by_the_fences_pins() {
+    use github::tests::{Fake, repo};
+    let src = Resolving {
+        src: fenced_src(None),
+        fake: Fake::default().with(repo(42, "o/r"), &["o/r"]).with(repo(7, "x/y"), &["x/y"]),
+    };
+    let state = fenced_state();
+    let o = resolving(&state, &src, "GET", "api.github.com", "/repositories/42");
+    assert_eq!((injected(&o).path.as_deref(), o.context.scope.as_deref()), (None, Some("repo.read")));
+    assert_eq!(*src.fake.pins.borrow(), [("o/r".to_string(), 42)], "pinned at its first resolution");
+
+    let o = resolving(&state, &src, "GET", "api.github.com", "/repositories/7");
+    assert!(matches!(o.action, Action::Outside { .. }), "{:?}", o.action);
+    assert_eq!(o.context.outside.as_deref(), Some("x/y"));
+    let o = resolving(&state, &src, "GET", "api.github.com", "/repositories/8");
+    assert_eq!(o.context.outside.as_deref(), Some("repository 8"));
+    for bad in ["/repositories/4x2", "/repositories/99999999999999999999999"] {
+        assert_eq!(refused(&resolving(&state, &src, "GET", "api.github.com", bad), "names no repository id").status, 400);
+    }
+
+    // Without a lookup only a pin places an id.
+    let o = fenced(&fenced_src(None), "GET", "api.github.com", "/repositories/42", &format!("Authorization: token {GH}\r\n"));
+    assert_eq!(o.context.outside.as_deref(), Some("repository 42"));
+    let mut pinned = fenced_state();
+    pinned.github_ids.insert("o/r".into(), crate::state::GithubPin { id: 42, node_id: "R_42".into(), pinned_at: 1 });
+    let o = decide(
+        &Call {
+            caller: &caller(),
+            header: &ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 },
+            head: &parse_head(format!("GET /repositories/42 HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
+                .unwrap(),
+            lfs: None,
+        },
+        &pinned,
+        &fenced_src(None),
+    );
+    injected(&o);
+}
+
+#[test]
+fn a_renamed_repo_is_reached_by_either_name_at_its_current_one() {
+    use github::tests::{Fake, repo};
+    // `o/r` (recorded) is now `N/R`.
+    let src = Resolving { src: fenced_src(None), fake: Fake::default().with(repo(42, "N/R"), &["o/r", "n/r"]) };
+    let state = fenced_state();
+    let o = resolving(&state, &src, "POST", "api.github.com", "/repos/o/r/pulls");
+    assert_eq!(injected(&o).path.as_deref(), Some("/repos/N/R/pulls"));
+    let o = resolving(&state, &src, "GET", "github.com", UPLOAD_REFS);
+    assert_eq!(injected(&o).path.as_deref(), Some("/N/R.git/info/refs?service=git-upload-pack"));
+    let o = resolving(&state, &src, "POST", "api.github.com", "/repos/n/r/pulls");
+    assert_eq!((injected(&o).path.as_deref(), o.context.outside.as_deref()), (None, None));
+    let r = refused(&resolving(&state, &src, "POST", "api.github.com", "/repos/x/y/pulls"), "outside the instance's repo fence");
+    assert_eq!(r.todo.as_deref(), Some("add `x/y` to `access.github.repos` in the sandbox's config"));
+}
+
+#[test]
+fn a_re_registered_old_name_never_gets_the_credential() {
+    use github::tests::{Fake, repo};
+    // `o/r` was pinned to 42, renamed `n/r`; someone else registered `o/r`.
+    let fake = Fake::default().with(repo(42, "n/r"), &["n/r"]).with(repo(99, "o/r"), &["o/r"]);
+    let src = Resolving { src: fenced_src(None), fake };
+    let mut state = fenced_state();
+    state.github_ids.insert("o/r".into(), crate::state::GithubPin { id: 42, node_id: "R_42".into(), pinned_at: 1 });
+    let o = resolving(&state, &src, "POST", "api.github.com", "/repos/o/r/pulls");
+    assert_eq!(injected(&o).path.as_deref(), Some("/repos/n/r/pulls"), "sent to the pinned repository");
+    assert!(matches!(resolving(&state, &src, "GET", "api.github.com", "/repositories/99").action, Action::Outside { .. }));
+    injected(&resolving(&state, &src, "GET", "api.github.com", "/repositories/42"));
+    assert!(src.fake.pins.borrow().is_empty());
+}
+
+#[test]
+fn a_claim_without_api_github_com_matches_names_only() {
+    use github::tests::{Fake, repo};
+    let mut plain = crate::credentials::home::tests::github();
+    plain.pinned.upstreams.retain(|u| u.host != github::API);
+    let mut src = Resolving { src: fenced_src(None), fake: Fake::default().with(repo(42, "N/R"), &["o/r"]) };
+    src.src.home.get_mut("github-work").unwrap().approved[0].claim = plain.canonical();
+    let o = resolving(&fenced_state(), &src, "GET", "github.com", UPLOAD_REFS);
+    assert_eq!(injected(&o).path, None);
+    assert!(src.fake.calls.borrow().is_empty());
 }

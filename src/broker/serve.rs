@@ -18,7 +18,8 @@
 //! too: each request's handle forwarded to its stored `href` with its
 //! stored header. Every request leaves one `access.log` line.
 //!
-//! Nothing is cached: `state.toml` per request, `credentials.toml`, the
+//! Nothing is cached but GitHub's answers about the repo fence's names
+//! ([`github::Cache`]): `state.toml` per request, `credentials.toml`, the
 //! store and the instance's config only for a call carrying its phantom,
 //! so an edit to any of them applies to the next call.
 
@@ -38,7 +39,7 @@ use super::policy::{self, Action, Call, Context, Injection, Sources};
 use super::redact::Secrets;
 use super::refusal::{Refusal, reason_phrase};
 use super::upstream::{self, Body, Length, Request, Response, Upstream, UpstreamError};
-use super::{guard, intercept, lfs, rewrite, route};
+use super::{github, guard, intercept, lfs, rewrite, route};
 use crate::config::{Access, Config};
 use crate::credentials::ca::{Leaf, MemberCa};
 use crate::credentials::claim::{self, Refusal as Shape, Slot};
@@ -46,6 +47,7 @@ use crate::credentials::home::{self, Home};
 use crate::credentials::instance;
 use crate::credentials::oauth::Http;
 use crate::credentials::oauth::refresh::{self, Failure, Fresh, Refreshed, Renewer};
+use crate::credentials::tokens::{self, Notices};
 use crate::credentials::store::OAuthToken;
 use crate::devsbd::bridge::{Broker, Caller};
 use crate::devsbd::proto::ProxyHeader;
@@ -82,10 +84,15 @@ pub struct Service {
     /// servers.
     private_storage: BTreeSet<String>,
     lfs: Mutex<lfs::Store>,
+    /// What GitHub answered for the fence's names and ids, per credential.
+    github: Mutex<github::Cache>,
     /// Loaded at the first intercepted connection, so a host that
     /// intercepts nothing never makes a CA key; a failed load is retried.
     ca: Mutex<Option<Arc<RwLock<MemberCa>>>>,
     log: fn(&str),
+    notices: Mutex<Notices>,
+    /// Shows a notice's text: the desktop's notifier, a test's sink.
+    notify: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 /// A connection's bytes: the bridge's stream, or the TLS over it.
@@ -151,7 +158,17 @@ impl Service {
             private_storage: BTreeSet::new(),
             lfs: Mutex::new(lfs::Store::new(lfs::MAX_PER_INSTANCE)),
             ca: Mutex::default(),
+            github: Mutex::default(),
             log: |_| {},
+            notices: Mutex::default(),
+            notify: Box::new(|body| {
+                let popup = crate::inbox::ShownPopup {
+                    key: None,
+                    level: crate::devsbd::notify::Level::Warn,
+                    body: body.to_string(),
+                };
+                crate::devsbd::desktop::notify_desktop("credentials", &popup);
+            }),
         })
     }
 
@@ -177,6 +194,12 @@ impl Service {
     pub fn with_storage(mut self, host: &str, authority: &str) -> Service {
         self.private_storage.insert(host.to_string());
         self.with_authority(host, authority)
+    }
+
+    #[cfg(test)]
+    pub fn with_notify(mut self, notify: impl Fn(&str) + Send + Sync + 'static) -> Service {
+        self.notify = Box::new(notify);
+        self
     }
 
     #[cfg(test)]
@@ -323,7 +346,22 @@ impl Service {
         }
         let call = Call { caller, header, head: &head, lfs: batch.as_ref().map(|(_, op)| *op) };
         let pre = batch.map(|(body, _)| body);
-        let outcome = policy::decide(&call, &state, &Files { data: &self.data });
+        let token = |credential: &str| {
+            let now = Instance::now();
+            self.renewer.token(credential, now, &self.refresher(now)).ok().map(|f| f.token)
+        };
+        let https = self.upstream.as_ref().ok().map(|upstream| github::Https {
+            upstream,
+            authority: self.authorities.get(github::API).map_or(github::API, String::as_str),
+            token: &token,
+        });
+        let live = https.as_ref().map(|t| github::Live {
+            cache: &self.github,
+            transport: t,
+            state: &self.state,
+            now: Instance::now(),
+        });
+        let outcome = policy::decide(&call, &state, &Files { data: &self.data, github: live });
         let cx = outcome.context;
         line.incarnation = cx.incarnation.clone();
         line.kind = cx.kind.clone();
@@ -522,6 +560,9 @@ impl Service {
             token = Some(new.token);
         }
 
+        if let Some((inj, fresh)) = &inject {
+            self.track_expiry(inj, fresh, &resp.headers);
+        }
         let secrets = inj.zip(token.as_ref()).map(|(inj, token)| policy::secrets(&inj.claim, token.expose()));
         let fields = inj.filter(|_| matches!(header, ProxyHeader::BaseUrl { .. })).and_then(|inj| {
             inj.claim.rewrite.iter().find(|r| route::is(&r.route, &head.method, &path)).map(|r| r.fields.clone())
@@ -551,6 +592,28 @@ impl Service {
         let result = respond.write(resp, w, line);
         self.audit.write(line);
         result
+    }
+
+    /// Records a pasted token's expiry as the response reports it (the
+    /// claim's `tokens.expiry` header), and sends the desktop notice of a
+    /// credential ending soon (`tokens::Notices`): the daemon sees every
+    /// injected call, so a credential in use is noticed whatever runs it.
+    fn track_expiry(&self, inj: &Injection, fresh: &Fresh, headers: &[Header]) {
+        let mut end = if fresh.pasted { inj.expires_at } else { fresh.ends };
+        if fresh.pasted {
+            let pairs = headers.iter().map(|h| (h.name.as_str(), h.value.as_slice()));
+            if let Some(at) = tokens::captured(inj.claim.tokens.as_ref(), pairs, inj.expires_at) {
+                if let Err(e) = home::set_expires_at(&home::path(&self.data), &inj.credential, at) {
+                    (self.log)(&format!("broker: cannot record credential `{}`'s expiry: {e:#}", inj.credential));
+                }
+                end = Some(at);
+            }
+        }
+        let Some(end) = end else { return };
+        let due = self.notices.lock().unwrap_or_else(|e| e.into_inner()).due(&inj.credential, end, Instance::now());
+        if let Some(body) = due {
+            (self.notify)(&body);
+        }
     }
 
     /// A call that couldn't be made, answered as `UpstreamError::status`
@@ -808,7 +871,8 @@ impl Target<'_> {
     ) -> (io::Result<Response>, String) {
         let head = self.head;
         let mut headers = upstream_headers(&head.headers);
-        let mut path = head.target.path().to_string();
+        let renamed = inject.and_then(|(inj, _)| inj.path.clone());
+        let mut path = renamed.unwrap_or_else(|| head.target.path().to_string());
         if let Some((inj, token)) = inject {
             policy::inject(&mut headers, &mut path, &inj.slot, token);
         }
@@ -1141,6 +1205,7 @@ fn pump(
 /// The files policy reads, from the data dir and the instance's config root.
 struct Files<'a> {
     data: &'a Path,
+    github: Option<github::Live<'a>>,
 }
 
 impl Sources for Files<'_> {
@@ -1154,6 +1219,10 @@ impl Sources for Files<'_> {
         };
         let resolved = Config::load(dir)?.resolve_sandbox(&inst.sandbox)?;
         Ok(resolved.properties.access.and_then(|mut a| a.remove(kind)))
+    }
+
+    fn github(&self) -> Option<&dyn github::Lookup> {
+        self.github.as_ref().map(|l| l as &dyn github::Lookup)
     }
 }
 

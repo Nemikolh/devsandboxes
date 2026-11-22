@@ -453,6 +453,22 @@ pub struct State {
     /// by `devsandbox access forget`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub folder_remotes: BTreeMap<String, FolderRemotes>,
+    /// GitHub repo fence entry (normalized `owner/repo`, from a folder's
+    /// record or `access.github.repos`) -> the repository it named when the
+    /// broker first resolved it (`broker::github`): a later owner of that
+    /// name never matches it (docs/architecture/credentials/fence.md#ids).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub github_ids: BTreeMap<String, GithubPin>,
+}
+
+/// One [`State::github_ids`] pin.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPin {
+    pub id: u64,
+    pub node_id: String,
+    /// Unix seconds.
+    #[serde(default)]
+    pub pinned_at: u64,
 }
 
 /// One folder's [`State::folder_remotes`] record.

@@ -91,6 +91,27 @@ pub fn matches(route_path: &str, path: &str) -> Match {
     }
 }
 
+/// `path` with the two segments `route_path`'s `{repo}` took replaced by
+/// `full_name` (a `.git` or `.wiki.git` suffix kept, the query too): a
+/// renamed repo's call sent to its current name. `None` when the route has
+/// no `{repo}` or `full_name` isn't one [`fence::normalize`] reads.
+pub fn with_repo(route_path: &str, path: &str, full_name: &str) -> Option<String> {
+    let at = path_only(route_path).split('/').position(|w| w == REPO)?;
+    let (owner, repo) = full_name.split_once('/')?;
+    fence::normalize(owner, repo)?;
+    let (p, query) = path.split_once('?').map_or((path, None), |(p, q)| (p, Some(q)));
+    let mut got: Vec<String> = p.split('/').map(str::to_string).collect();
+    let old = got.get(at + 1)?;
+    let suffix = [".wiki.git", ".git"].into_iter().find(|s| old.ends_with(s)).unwrap_or("");
+    got[at] = owner.to_string();
+    got[at + 1] = format!("{repo}{suffix}");
+    let p = got.join("/");
+    Some(match query {
+        Some(q) => format!("{p}?{q}"),
+        None => p,
+    })
+}
+
 fn segments_match(want: &[&str], got: &[&str]) -> bool {
     want.len() == got.len()
         && want.iter().zip(got).all(|(w, g)| match w.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
@@ -338,6 +359,20 @@ mod tests {
             assert!(matches!(matches(contents, bad), Match::Refused(_)), "{bad}");
         }
         assert_eq!(matches(contents, "/repos/o/r/contents/a%25b"), Match::Yes(Some("o/r".into())), "a lone `%25`");
+    }
+
+    #[test]
+    fn a_renamed_repo_takes_its_current_name_in_the_path() {
+        let w = |route: &str, path: &str| with_repo(route, path, "New/Name");
+        assert_eq!(w("/repos/{repo}/pulls", "/repos/o/r/pulls").as_deref(), Some("/repos/New/Name/pulls"));
+        assert_eq!(
+            w("/{repo}/info/refs?service=git-upload-pack", "/o/r.git/info/refs?service=git-upload-pack").as_deref(),
+            Some("/New/Name.git/info/refs?service=git-upload-pack")
+        );
+        assert_eq!(w("/{repo}/git-upload-pack", "/O/R.wiki.git/git-upload-pack").as_deref(), Some("/New/Name.wiki.git/git-upload-pack"));
+        assert_eq!(w("/repos/{repo}/contents/{path}", "/repos/o/r/contents/a%2Fb").as_deref(), Some("/repos/New/Name/contents/a%2Fb"));
+        assert_eq!(w("/user", "/user"), None);
+        assert_eq!(with_repo("/repos/{repo}", "/repos/o/r", "o/../x"), None);
     }
 
     #[test]

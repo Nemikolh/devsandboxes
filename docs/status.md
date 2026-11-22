@@ -17,9 +17,9 @@ limitation means editing this file in the same commit.
   `access approve|ls|revoke`, the member CA and intercept mode),
   github-and-sentry-access step 1 (sentry-cli through `features/sentry`)
   and git-gateway step 1 (git through the broker with the repo fence, LFS
-  and the relay's key filtering) are done; now github-and-sentry-access
-  step 2: `features/gh`, its scope table, GraphQL mutations mapped to
-  scopes, the fence resolved to repo ids.
+  and the relay's key filtering) are done, and the fence resolves to repo
+  ids; now github-and-sentry-access step 2: `features/gh`, its scope
+  table, GraphQL mutations mapped to scopes.
   → [plan](plans/active/github-and-sentry-access.md)
 
 ## Planned
@@ -332,8 +332,8 @@ is frozen: no new work on it.
   `SandboxProperties::ignored`
 - `extends` can't remove an inherited array entry; a diamond duplicates
   entries. → [config](architecture/config.md); `config::deep_merge`
-- A sandbox's `access`: `repos`, `branches` and `as` parse but nothing
-  reads them (github-and-sentry-access step 2), and `run` doesn't warn
+- A sandbox's `access`: `branches` parses but nothing reads it
+  (git-gateway step 2, push rules), and `run` doesn't warn
   about `scopes` or `ask` a claim doesn't have.
   → [plan](plans/active/credential-broker.md); `config::Access`
 
@@ -342,9 +342,17 @@ is frozen: no new work on it.
 - A claim's device and browser logins send no `scope` (no claim field;
   GitHub Apps take none), and `github-app-manifest` logins are refused
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
-  `approvers`, `delegate` and `as` parse and `access ls` lists them, but
-  nothing acts on them yet.
+  `approvers` and `delegate` parse and `access ls` lists them, but
+  nothing acts on them yet; of `as`'s kinds only `user` works, `app`
+  (installation tokens) refusing the run until step 3.
   → [login](architecture/credentials/login.md); `commands::login::choose`
+- A pasted token's expiry is known only once a brokered call's response
+  reports it (`login` calls no `check` route), so `access ls` shows none
+  before; the expiry notice's once-a-day limit lives in the daemon's
+  memory (a restart may repeat it); a refreshed OAuth token isn't checked
+  against the claim's `tokens.accept` (only `login`'s).
+  → [credentials CLI](reference/credentials-cli.md#credentialstoml);
+  `credentials::tokens`
 - git under a git-host claim: no ssh host alias (`git@github-work:`)
   is rewritten to `https://` (the folder's record keeps the URL, not what
   the alias resolved to), so such a remote's push fails under key
@@ -370,11 +378,15 @@ is frozen: no new work on it.
 - The broker refuses every ask: a scope in `access.<kind>.ask` and a
   route in no scope (`other`) get a 403 saying asks need permission
   requests (credential-broker step 4); `presence` routes pass. The GitHub
-  repo fence is enforced on a fenced claim's `{repo}` routes
-  ([fence](architecture/credentials/fence.md#enforcement)) but isn't
-  resolved to repo ids, so a renamed repo's new name doesn't match and
-  `/repositories/{id}` routes and other id- or body-named inputs are
-  refused (github-and-sentry-access step 2); a placed or remote instance's
+  repo fence is enforced on a fenced claim's `{repo}` and
+  `/repositories/{id}` routes
+  ([fence](architecture/credentials/fence.md#enforcement)); body-named
+  inputs and GraphQL mutations' ids are refused (github-and-sentry-access
+  step 2). A fence entry's pin ([ids](architecture/credentials/fence.md#ids))
+  is never dropped, not even by `access forget`: a repo deleted and
+  re-created under its name stays outside its entry. A pinned repo
+  renamed again is called by its previous name until the cached answer
+  expires (1 h). A placed or remote instance's
   fence doesn't travel with it. Pushes in the fence get no branch or tag
   rules and a refused one is a plain `403` at `info/refs`, not a
   `report-status` (git-gateway step 2). LFS transfer handles live in the

@@ -2849,7 +2849,7 @@ mod tests {
         let Some(root) = isolated_root("git_e2e_child") else { return };
         let mut seed = [0u8; 16];
         getrandom::fill(&mut seed).unwrap();
-        let token = format!("REAL-{:032x}", u128::from_le_bytes(seed));
+        let token = format!("github_pat_REAL{:032x}", u128::from_le_bytes(seed));
         let (repo, cfg, upstream_root) = (root.join("repo"), root.join("cfg"), root.join("upstream"));
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);

@@ -80,6 +80,11 @@ pub struct Fresh {
     pub renewable: bool,
     /// Renewed for this call.
     pub refreshed: bool,
+    /// A pasted token, whose expiry the broker reads off responses.
+    pub pasted: bool,
+    /// `credentials::tokens::ends_at` of the record, for a pasted one
+    /// without its recorded expiry.
+    pub ends: Option<u64>,
 }
 
 fn fresh(rec: &Record, refreshed: bool) -> Fresh {
@@ -87,6 +92,8 @@ fn fresh(rec: &Record, refreshed: bool) -> Fresh {
         token: rec.access_token().clone(),
         renewable: matches!(rec, Record::OAuth(t) if t.refresh_token.is_some()),
         refreshed,
+        pasted: matches!(rec, Record::Static { .. }),
+        ends: crate::credentials::tokens::ends_at(Some(rec), None),
     }
 }
 
@@ -174,12 +181,8 @@ impl Renewer {
             }
             match refresh(t) {
                 Refreshed::Token(new) => {
-                    let f = Fresh {
-                        token: new.access_token.clone(),
-                        renewable: new.refresh_token.is_some(),
-                        refreshed: true,
-                    };
-                    (Some(Record::OAuth(new)), Ok(Some(f)))
+                    let rec = Record::OAuth(new);
+                    (Some(rec.clone()), Ok(Some(fresh(&rec, true))))
                 }
                 Refreshed::Refused(why) => (None, Err(Failure::Refused(why))),
                 Refreshed::Unavailable(why) => (None, Err(Failure::Unavailable(why))),

@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "name": "GitHub, brokered and repo-fenced (test fixture)",
   "description": "Test fixture for the broker's repo fence and git smart HTTP: a small slice of what features/gh will claim, LFS included (docs/plans/active/github-and-sentry-access.md, gh). Its install.sh installs nothing.",
+  "containerEnv": { "GH_TELEMETRY": "false" },
   "customizations": {
     "devsandbox": {
       "credentials": {
@@ -13,7 +14,20 @@
             { "header": "Authorization", "format": "token {token}" },
             { "basic": "x-access-token" }
           ],
-          "phantom": { "env": ["GH_TOKEN"] },
+          "phantom": {
+            "env": ["GH_TOKEN"],
+            "files": [
+              {
+                "path": ".config/gh/hosts.yml",
+                "template": "github.com:\n    users:\n        x-access-token:\n            oauth_token: {phantom}\n    oauth_token: {phantom}\n    user: x-access-token\n    git_protocol: https\n"
+              }
+            ]
+          },
+          "tokens": {
+            "as": ["app", "user"],
+            "accept": ["github_pat_", "ghu_"],
+            "expiry": "github-authentication-token-expiration"
+          },
           "git": { "hosts": ["github.com"] },
           "lfs": { "hosts": ["github.com"], "upload": "git.push" },
           "login": [{ "method": "paste" }],
