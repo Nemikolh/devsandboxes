@@ -36,6 +36,8 @@ mod worktree;
 #[cfg(unix)]
 pub(crate) use claims::refresh_trust;
 pub(crate) use claims::{git_check, signs_git};
+pub use claims::{NeedsApproval, Unapproved};
+pub(crate) use claims::{parse_unapproved, refusal};
 pub(crate) use editor::write_vscode_name_config;
 pub(crate) use git::{check_repo, host_git, host_git_bare, host_git_new, read_origin};
 pub(crate) use origin::{fetch_trusted_origin, trust_key, Fetched, Refs};
@@ -90,6 +92,10 @@ pub struct RunExtras {
     /// chose ([`choose_profile`]). `None` into `materialize` (a `rebuild`)
     /// keeps the recorded `Instance::profile`.
     pub profile: Option<String>,
+    /// A claim version its credential hasn't approved: refuse, ask, or fail
+    /// for the verb client to ask (then the run rolls back, so its resend
+    /// starts clean).
+    pub unapproved: Unapproved,
 }
 
 /// Create and start an instance; returns its name (state key), or `None` when
@@ -338,7 +344,10 @@ pub fn run(
         )
     })();
     let result = result.map_err(|e| {
-        let outcome = tracker.on_failure(true);
+        let outcome = match extras.unapproved == Unapproved::FailOnAsk && e.is::<NeedsApproval>() {
+            true => OnFailure::RollBack,
+            false => tracker.on_failure(true),
+        };
         match outcome {
             OnFailure::RollBack => progress::rollback(&instance_id, branch_start.as_deref()),
             OnFailure::KeepFailed => tracker.fail(&e),
@@ -874,6 +883,7 @@ pub(crate) fn materialize(
         owner,
         &claims::mount_targets(&workspace, &extra_mounts, &mounts),
         proxying,
+        extras.unapproved,
     )?;
     extra_env.extend(wired.env.iter().cloned());
     // After every layer that may set git's command-scope env, so ours land

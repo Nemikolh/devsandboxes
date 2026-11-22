@@ -46,7 +46,10 @@ whole across reads), re-reads `state.toml` every 250 ms for `progress`
 exit is error `failed` with `data {exit, instance}` and the message from
 the child's last `Error:` line plus its `Caused by:` chain (else its last
 non-empty stderr line). `rm` with `ask` answers `confirm` with the
-branch question, having removed nothing.
+branch question, having removed nothing; `run` with `ask` (`run
+--fail-on-ask`, exit 3) answers `approve` naming the credential and claim
+version it found unapproved (`claims::parse_unapproved` of the message),
+rolled back.
 
 ## Detach and hang-up
 
@@ -100,8 +103,15 @@ the CLI's process. Sent as a verb, `gc` has no TTY: without `force` its
 shell-history prompt answers no, so those files stay. Every prompt happens on the user's TTY before
 the send, since the child has no stdin: sandbox pick and example config
 (`sandboxes.list`), instance pick (`instances.resolve`), the identity
-prompt (below), rm's branch question (`ask` → `confirm` → resend). The
-request env is the CLI's whole env (`caller_env`, non-UTF-8 vars dropped).
+prompt (below), rm's branch question (`ask` → `confirm` → resend). One
+question can't come first: a claim version the run's credential hasn't
+approved, known once the features image is built. A `run` here (not a
+machine's, not `--json`, `-d` or `--place`) on a TTY is sent with `ask`;
+an `approve` answer gets the version's review and the question "Approve
+this claim for `<credential>`?" (`access::ask_approve`, as `access
+approve` shows it), and
+the run is resent, once per credential (`with_answers`); a no is `run`'s
+refusal. The request env is the CLI's whole env (`caller_env`, non-UTF-8 vars dropped).
 
 No daemon reachable, or one too old for verbs: one `warning:` line and the
 verb runs in the CLI's process as `--in-process` (`Done::InProcess`); `-d`

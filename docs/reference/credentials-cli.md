@@ -12,7 +12,7 @@ credentials they are, never on a machine (`--machine` refuses them).
 
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
-`obtain`, `create_url`, `check_request`, `read_check`, `check_token`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`,
+`obtain`, `create_url`, `check_request`, `read_check`, `check_token`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`, `ask_approve`,
 `pick_pending`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
 `forget_at`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/store.rs` (`Store`,
@@ -199,6 +199,17 @@ summary when none is approved. Same question as `login`. Approval moves
 the version from `pending` to the end of `approved`; older approved
 versions stay (instances pinned to them keep working). The secret is
 untouched.
+
+### At `run`
+
+A `run` whose feature brings a claim version its credential hasn't
+approved records it pending, then on a TTY shows the same review and
+asks "Approve this claim for `<credential>`?" (`ask_approve`): yes
+approves it as above and the run goes on (through the daemon: the run is
+rolled back and resent, docs/architecture/daemon/verbs.md, *The CLI
+side*); no refuses the run, naming `devsandbox access approve
+<credential>`. Off a TTY, with `--json` or `-d`, from the dashboard, and
+for `rebuild` or a machine's run, it refuses without asking.
 
 ## `access ls`
 

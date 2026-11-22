@@ -176,8 +176,13 @@ known (`claims::wire`, the pure parts in `credentials::instance`):
   the instance's profile; several granted is refused, naming them. None
   is a warning naming `devsandbox login`: the claim is wired anyway, so a
   later login needs no rebuild. One that hasn't approved the claim's
-  version gets it recorded pending (`home::record_pending`) and the run is
-  refused, naming `devsandbox access approve <credential>`. Which
+  version gets it recorded pending (`home::record_pending`), then
+  (`claims::Unapproved`) on a TTY `run` shows its review and asks
+  (`access::ask_approve`): a yes approves it in place and the run goes on.
+  Through the daemon, the subprocess fails for the CLI to ask and resend
+  (docs/architecture/daemon/verbs.md, *The CLI side*). A no, or no
+  terminal (`--json`, the dashboard, `rebuild`, a machine's run), refuses
+  the run, naming `devsandbox access approve <credential>`. Which
   credential serves a claim isn't kept: the broker resolves it per call.
 - **Phantoms and ports** (`instance::plan`): per claim a phantom, the
   claim's `phantom.prefix` (else `dsbx_<kind>_`) and 24 random base62

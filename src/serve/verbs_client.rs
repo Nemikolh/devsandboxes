@@ -10,7 +10,9 @@
 //! identity prompt ([`identity`], `config.findings`; with no daemon too),
 //! rm's branch question (`ask` → `confirm` → resend). Then the request streams:
 //! `output` goes to our stdout/stderr as it comes, and the answer decides the
-//! exit code. Ctrl-C cancels through a second connection
+//! exit code. One question comes after: a claim version `run` found its
+//! credential hasn't approved, known only once the features image is built
+//! (`ask` → `approve` → resend, [`with_answers`]). Ctrl-C cancels through a second connection
 //! (`instances.cancel`) so the rollback still streams; when there's nothing
 //! to name yet, or the cancel is refused, it hangs up, which the daemon
 //! takes as a cancel. A second Ctrl-C kills this process: a hang-up too.
@@ -249,11 +251,16 @@ fn send(conn: &mut Conn, verb: &CliVerb, prepared: Prepared) -> Result<(Done, bo
     let instance = prepared.instance.clone();
     let machine = prepared.machine.clone();
     let mut last = Streaming::new(instance.clone(), false, None);
-    let answer = with_confirm(prepared.params, &mut |params| {
-        let (answer, streaming) = stream(conn, verb, prepared.method, params, instance.clone(), machine.clone())?;
-        last = streaming;
-        Ok(answer)
-    }, &mut |question| crate::commands::confirm(question))?;
+    let answer = with_answers(
+        prepared.params,
+        &mut |params| {
+            let (answer, streaming) = stream(conn, verb, prepared.method, params, instance.clone(), machine.clone())?;
+            last = streaming;
+            Ok(answer)
+        },
+        &mut |question| crate::commands::confirm(question),
+        &mut approve_here,
+    )?;
     if let Answer::Ok(v) = &answer
         && last.instance.is_none()
     {
@@ -432,6 +439,10 @@ fn prepare(
                 identity::prompt(target.ask().into_iter().collect(), call, ui)?;
             }
             let tty = if json { None } else { ui.term };
+            // The claim's approval is asked here, after the run reached it:
+            // only for a run here (this host's credentials) whose output
+            // this terminal follows to the end.
+            let ask = ui.tty && !json && !detach && !place && target.machine.is_none();
             let p = RunParams {
                 root: target.root.clone(),
                 env,
@@ -445,6 +456,7 @@ fn prepare(
                 detach,
                 tty,
                 place,
+                ask,
             };
             // `run` names no instance before it runs: `progress` does.
             Prepared { instance: None, ..one("run", serde_json::to_value(p)?, Some(&target)) }
@@ -865,6 +877,8 @@ enum Answer {
     Failed(i32),
     /// `confirm`: rm's branch question.
     Confirm(String),
+    /// `approve`: run's claim version its credential hasn't approved.
+    Approve(Unapproved),
     /// Another error: its message, printed as ours.
     Error(String),
     Old(String),
@@ -890,28 +904,76 @@ impl Answer {
                 Answer::Failed(exit.filter(|&n| n != 0).unwrap_or(1))
             }
             Reply::Err(e) if e.code == "confirm" => Answer::Confirm(e.message),
+            Reply::Err(e) if e.code == "approve" => {
+                let field = |k: &str| e.data.as_ref().and_then(|d| d[k].as_str()).map(str::to_string);
+                match (field("credential"), field("version")) {
+                    (Some(credential), Some(version)) => {
+                        Answer::Approve(Unapproved { credential, version, message: e.message })
+                    }
+                    _ => Answer::Error(e.message),
+                }
+            }
             Reply::Err(e) => Answer::Error(e.message),
         }
     }
 }
 
-/// rm's question loop: an `ask` that comes back `confirm` is put to the
+/// An `approve` answer's claim version.
+#[derive(Debug, Clone, PartialEq)]
+struct Unapproved {
+    credential: String,
+    /// Short: a prefix of the pending version.
+    version: String,
+    message: String,
+}
+
+impl Unapproved {
+    /// What `run` itself says when nothing asks.
+    fn refusal(&self) -> String {
+        crate::commands::run::refusal(&self.message, &self.credential)
+    }
+}
+
+/// The answer rounds. rm's `ask` that comes back `confirm` is put to the
 /// user (`confirm`), then resent once with the answer as `deleteBranch`.
-/// Any other answer, of either send, is the result.
-fn with_confirm(
+/// run's `ask` that comes back `approve` (rolled back) is put to the user
+/// (`approve`: the claim's review and question) and, approved, resent: once
+/// per credential, as each claim stops it in turn; refused, it's `run`'s
+/// refusal. Any other answer is the result.
+fn with_answers(
     params: Value,
     send: &mut dyn FnMut(Value) -> Result<Answer>,
     confirm: &mut dyn FnMut(&str) -> Result<bool>,
+    approve: &mut dyn FnMut(&str, &str) -> Result<bool>,
 ) -> Result<Answer> {
-    let answer = send(params.clone())?;
-    let Answer::Confirm(question) = answer else { return Ok(answer) };
     let mut params = params;
-    params["deleteBranch"] = confirm(&question)?.into();
-    params["ask"] = false.into();
-    match send(params)? {
-        Answer::Confirm(question) => bail!("devsandbox serve asked again: {question}"),
-        answer => Ok(answer),
+    let mut confirmed = false;
+    let mut approved: Vec<String> = Vec::new();
+    loop {
+        match send(params.clone())? {
+            Answer::Confirm(question) if !confirmed => {
+                params["deleteBranch"] = confirm(&question)?.into();
+                params["ask"] = false.into();
+                confirmed = true;
+            }
+            Answer::Confirm(question) => bail!("devsandbox serve asked again: {question}"),
+            Answer::Approve(u) if !approved.contains(&u.credential) => {
+                if !approve(&u.credential, &u.version)? {
+                    bail!("{}", u.refusal());
+                }
+                approved.push(u.credential);
+            }
+            Answer::Approve(u) => bail!("devsandbox serve asked again: {}", u.message),
+            answer => return Ok(answer),
+        }
     }
+}
+
+/// `approve` for [`with_answers`]: the run's claims resolve to this host's
+/// credentials, the same `credentials.toml` the verb's subprocess read.
+fn approve_here(credential: &str, version: &str) -> Result<bool> {
+    let path = crate::credentials::home::path(&crate::commands::login::data_dir()?);
+    crate::commands::access::ask_approve(&path, credential, Some(version), &mut crate::commands::login::Stdio)
 }
 
 /// What one streamed request learnt besides its answer.
@@ -972,7 +1034,7 @@ fn stream(
     let track_progress = matches!(verb, CliVerb::Run { .. });
     // rm's `ask` round too: on `confirm` its output is just the question,
     // as an `Error:` line, which the prompt asks properly.
-    let held = (verb.detach() || params["ask"] == true).then(Vec::new);
+    let held = (verb.detach() || matches!(verb, CliVerb::Rm { .. }) && params["ask"] == true).then(Vec::new);
     let mut s = Streaming::new(instance, track_progress, held);
     // `run --json`'s stdout is the record, unchanged.
     s.qualify_placed = matches!(verb, CliVerb::Run { json: false, .. });
@@ -1113,6 +1175,7 @@ fn ending(answer: Answer, cancelled: bool) -> Result<Ending> {
         Answer::HungUp => Ending::Exit(CANCELLED_EXIT),
         Answer::Error(message) => bail!("{message}"),
         Answer::Confirm(question) => bail!("devsandbox serve asked, unasked: {question}"),
+        Answer::Approve(u) => bail!("{}", u.refusal()),
         _ if cancelled => Ending::Exit(CANCELLED_EXIT),
         Answer::Lost => Ending::Lost,
         Answer::Failed(exit) => Ending::Exit(exit),
@@ -1311,7 +1374,7 @@ mod tests {
             Ok(true)
         };
         let params = json!({"instance": "w", "ask": true});
-        assert_eq!(with_confirm(params, &mut send, &mut confirm).unwrap(), Answer::Ok(json!({"exit": 0})));
+        assert_eq!(with_answers(params, &mut send, &mut confirm, &mut never_approve).unwrap(), Answer::Ok(json!({"exit": 0})));
         assert_eq!(*asked.borrow(), ["Delete branch `b`?"]);
         let sent = sent.into_inner();
         assert_eq!(sent.len(), 2);
@@ -1319,11 +1382,65 @@ mod tests {
 
         let mut once = |_: Value| Ok(Answer::Failed(2));
         let mut never = |_: &str| -> Result<bool> { panic!("asked") };
-        assert_eq!(with_confirm(json!({}), &mut once, &mut never).unwrap(), Answer::Failed(2));
+        assert_eq!(with_answers(json!({}), &mut once, &mut never, &mut never_approve).unwrap(), Answer::Failed(2));
         // A daemon asking twice is an error, not a loop.
         let mut again = |_: Value| Ok(Answer::Confirm("q".into()));
         let mut no = |_: &str| Ok(false);
-        assert!(with_confirm(json!({"ask": true}), &mut again, &mut no).is_err());
+        assert!(with_answers(json!({"ask": true}), &mut again, &mut no, &mut never_approve).is_err());
+    }
+
+    fn never_approve(_: &str, _: &str) -> Result<bool> {
+        panic!("asked to approve")
+    }
+
+    fn unapproved(credential: &str) -> Answer {
+        Answer::Approve(Unapproved {
+            credential: credential.into(),
+            version: "0123456789ab".into(),
+            message: format!("credential `{credential}` hasn't approved this version of feature `f`'s `sentry` claim (0123456789ab)"),
+        })
+    }
+
+    #[test]
+    fn run_asks_per_credential_on_approve_and_resends() {
+        // Two claims stop it in turn; each approved, it's resent as is.
+        let sent = RefCell::new(0);
+        let mut send = |p: Value| {
+            assert_eq!(p, json!({"sandbox": "web", "ask": true}));
+            *sent.borrow_mut() += 1;
+            Ok(match *sent.borrow() {
+                1 => unapproved("a"),
+                2 => unapproved("b"),
+                _ => Answer::Ok(json!({"exit": 0})),
+            })
+        };
+        let asked = RefCell::new(Vec::new());
+        let mut approve = |c: &str, v: &str| {
+            asked.borrow_mut().push((c.to_string(), v.to_string()));
+            Ok(true)
+        };
+        let mut never = |_: &str| -> Result<bool> { panic!("confirm") };
+        let params = json!({"sandbox": "web", "ask": true});
+        assert_eq!(with_answers(params.clone(), &mut send, &mut never, &mut approve).unwrap(), Answer::Ok(json!({"exit": 0})));
+        assert_eq!(*asked.borrow(), [("a".into(), "0123456789ab".into()), ("b".into(), "0123456789ab".to_string())]);
+        assert_eq!(sent.into_inner(), 3);
+
+        let mut once = |_: Value| Ok(unapproved("a"));
+        let mut no = |_: &str, _: &str| Ok(false);
+        let err = with_answers(params.clone(), &mut once, &mut never, &mut no).unwrap_err().to_string();
+        assert!(err.ends_with("(0123456789ab): run `devsandbox access approve a`, then try again"), "{err}");
+        // Approved, yet asked again: an error, not a loop.
+        let mut yes = |_: &str, _: &str| Ok(true);
+        let err = with_answers(params, &mut once, &mut never, &mut yes).unwrap_err().to_string();
+        assert!(err.starts_with("devsandbox serve asked again"), "{err}");
+    }
+
+    #[test]
+    fn approve_answers_carry_the_credential_or_read_as_errors() {
+        let r = |data: Value| Response::err_with(None, "approve", "m", Some(data));
+        let got = Answer::of(Streamed::Answer(r(json!({"credential": "c", "version": "v"}))));
+        assert_eq!(got, Answer::Approve(Unapproved { credential: "c".into(), version: "v".into(), message: "m".into() }));
+        assert_eq!(Answer::of(Streamed::Answer(r(json!({})))), Answer::Error("m".into()));
     }
 
     /// A fake daemon for [`prepare`]: canned answers by method, calls logged.

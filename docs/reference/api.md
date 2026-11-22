@@ -105,7 +105,7 @@ know. A breaking change bumps `protocol`; check it after the hello.
 
 `{"id":n,"error":{"code":"…","message":"…"}}`. `message` is for humans;
 match on `code`. Some codes add a `data` object (`failed`: *Verbs*); it's
-absent otherwise (`confirm` included).
+absent otherwise (`confirm` included; `approve`: *Verbs*).
 
 | code | |
 |---|---|
@@ -119,6 +119,7 @@ absent otherwise (`confirm` included).
 | `bind-failed` | a forward's host port couldn't be bound (in use, privileged, an address not on this host) |
 | `failed` | a verb exited non-zero; `data`: `{"exit": n, "instance": name \| null}` (*Verbs*). Also a machine that couldn't be reached: ssh failed, the hello failed or the protocols differ, the link is `unreachable` (*Machines*) |
 | `confirm` | an `rm` sent with `ask: true` needs an answer; `message` is the question, nothing was removed (*Verbs*) |
+| `approve` | a `run` sent with `ask: true` reached a claim version its credential hasn't approved; `data`: `{"credential", "version"}` (short), recorded pending, the run rolled back (*Verbs*) |
 | `internal` | the daemon failed (store unreadable, …); logged in `serve.log` |
 
 ### Remote callers
@@ -1021,7 +1022,7 @@ and `HOME` are the caller's, never the daemon's.
 
 | method | params (besides `root`, `env`) |
 |---|---|
-| `run` | `sandbox`, `name?`, `branch?`, `base?`, `profile?`, `json?`, `reprobe?`, `detach?`, `tty?`, `place?` |
+| `run` | `sandbox`, `name?`, `branch?`, `base?`, `profile?`, `json?`, `reprobe?`, `detach?`, `tty?`, `place?`, `ask?` |
 | `rebuild` | `instance` \| `all: true`, `force?`, `reprobe?`, `detach?`, `tty?` |
 | `start` | `instance` \| `all: true`, `detach?`, `tty?` |
 | `stop` | `instance` \| `all: true`, `detach?` |
@@ -1142,6 +1143,14 @@ branch with commits not on its remote, and off a TTY (as here) keeps it.
 With `"ask": true` it answers the error `confirm` instead, `message` the
 question, having removed nothing; the client asks its user and resends with
 `deleteBranch` set. Without `ask`, the non-TTY default applies.
+
+**`run`'s claim approval**: a feature's claim version the credential
+hasn't approved is recorded pending and refuses the run. With `"ask":
+true` it answers the error `approve` instead, `message` what isn't
+approved, `data` the credential and the version's first 12 characters,
+the run rolled back (nothing left, its name free again); the client shows
+the pending version's review, approves it in `credentials.toml` and
+resends. Without `ask`, `failed`, the instance kept failed.
 
 **`rm` of a placed instance**: an `rm` with `machine` naming an instance
 this host placed there (`placements.json`) fetches it back first, as

@@ -706,6 +706,8 @@ fn verb_call(
                 detach: true,
                 tty,
                 place,
+                // No question to put mid-run: an unapproved claim refuses.
+                ask: false,
             }),
         ),
         PromptAction::Rebuild { instance, force } => (
@@ -1075,7 +1077,8 @@ mod tests {
                 base: Some("-odd".into()),
                 profile: None,
                 json: false,
-                reprobe: false
+                reprobe: false,
+                ask: false
             }
         );
         assert_eq!(

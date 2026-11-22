@@ -1742,6 +1742,12 @@ export interface RunParams extends VerbParams {
    * @experimental
    */
   place?: boolean;
+  /**
+   * Where a claim version its credential hasn't approved would refuse the
+   * run, answer `approve` (`data`: `credential`, short `version`), rolled
+   * back and the version recorded pending; approve it, then resend.
+   */
+  ask?: boolean;
 }
 
 /** `rebuild` params: `instance` or `all: true`. */

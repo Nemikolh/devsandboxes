@@ -118,6 +118,11 @@ enum Command {
         /// `--machine` or a `<machine>/<sandbox>`)
         #[arg(long)]
         place: bool,
+        /// Where a claim version its credential hasn't approved would be
+        /// refused, fail (exit 3, rolled back): the daemon's `run` with `ask`,
+        /// so the client asks on its own TTY and resends
+        #[arg(long, hide = true)]
+        fail_on_ask: bool,
     },
     /// Recreate an instance's container from the current config (keeps the
     /// worktree, branch, and per-instance state); no-op when there is no drift
@@ -1012,7 +1017,7 @@ fn main() -> Result<()> {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
         // Placement is the daemon's: here, `--place` can only say it isn't.
-        Command::Run { sandbox, name, branch, base, profile, env, dispatcher, json, reprobe, detach, place } => {
+        Command::Run { sandbox, name, branch, base, profile, env, dispatcher, json, reprobe, detach, place, fail_on_ask } => {
             if detach {
                 return Err(detach_refused());
             }
@@ -1025,7 +1030,12 @@ fn main() -> Result<()> {
             // A CLI process: the build log may tee fds 1/2 (on top of
             // `--json`'s redirect). Autostart's runs below get their own.
             build_log::enable();
-            let extras = commands::run::RunExtras { reprobe, env, dispatcher, profile };
+            let unapproved = match (fail_on_ask, !json && std::io::stdin().is_terminal()) {
+                (true, _) => commands::run::Unapproved::FailOnAsk,
+                (false, true) => commands::run::Unapproved::Ask,
+                (false, false) => commands::run::Unapproved::Refuse,
+            };
+            let extras = commands::run::RunExtras { reprobe, env, dispatcher, profile, unapproved };
             let result = commands::run::run(&cli.dir, sandbox, name, branch, base, extras);
             if let (None, Ok(Some(key))) = (&json_out, &result) {
                 println!("{key}");
@@ -1037,6 +1047,14 @@ fn main() -> Result<()> {
             #[cfg(unix)]
             if matches!(result, Ok(Some(_))) && !in_process {
                 serve::client::ensure_running("cli");
+            }
+            // Printed as `main`'s own `Err` would be, its message the
+            // daemon's `approve` answer.
+            if let Err(e) = &result
+                && e.is::<commands::run::NeedsApproval>()
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(commands::rm::NEEDS_ANSWER_EXIT);
             }
             match (result?, json_out) {
                 (Some(key), Some(out)) => out.emit(&commands::run::run_record_json(&key)?),

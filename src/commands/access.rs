@@ -564,10 +564,35 @@ pub fn approve(credential: &str, version: Option<&str>, yes: bool) -> Result<()>
 /// Returns the line to print.
 pub(crate) fn approve_at(data: &Path, name: &str, version: Option<&str>, yes: bool, term: &mut dyn Term) -> Result<String> {
     let path = home::path(data);
-    let entry = home::load(&path)?
+    let (pending, text) = review_pending(&path, name, version)?;
+    term.show(&text);
+    approve_or_refuse(term, yes, &format!("Approve this claim version for `{name}`?"))?;
+    approve_pending(&path, name, &pending)?;
+    Ok(format!("approved claim version {} for `{name}`", pending.short()))
+}
+
+/// `run`'s question (`run::claims`, the verb client): `name`'s pending
+/// `version` (a prefix; `None`: the only one) shown as `access approve`
+/// shows it, approved on a yes. `Ok(false)`: not approved, nothing changed.
+/// The caller has checked there's a terminal to ask on.
+pub(crate) fn ask_approve(path: &Path, name: &str, version: Option<&str>, term: &mut dyn Term) -> Result<bool> {
+    let (pending, text) = review_pending(path, name, version)?;
+    term.show(&text);
+    if !term.confirm(&format!("Approve this claim for `{name}`?"))? {
+        return Ok(false);
+    }
+    approve_pending(path, name, &pending)?;
+    term.show(&format!("approved claim version {} for `{name}`\n", pending.short()));
+    Ok(true)
+}
+
+/// The pending version and its review: the diff against the latest
+/// approved version, else the claim's summary.
+fn review_pending(path: &Path, name: &str, version: Option<&str>) -> Result<(Version, String)> {
+    let entry = home::load(path)?
         .remove(name)
         .with_context(|| format!("no credential `{name}` in {}", path.display()))?;
-    let pending = pick_pending(name, &entry.pending, version)?;
+    let pending = pick_pending(name, &entry.pending, version)?.clone();
     let new = pending.view()?;
     let text = match entry.latest_approved() {
         Some(latest) => {
@@ -577,16 +602,18 @@ pub(crate) fn approve_at(data: &Path, name: &str, version: Option<&str>, yes: bo
         }
         None => format!("{}  version {}\n", new.summary(), pending.short()),
     };
-    term.show(&text);
-    approve_or_refuse(term, yes, &format!("Approve this claim version for `{name}`?"))?;
-    home::update(&path, |h| {
+    Ok((pending, text))
+}
+
+fn approve_pending(path: &Path, name: &str, pending: &Version) -> Result<()> {
+    home::update(path, |h| {
         let entry = h.get_mut(name).with_context(|| format!("credential `{name}` is gone"))?;
         if !entry.pending.iter().any(|p| p.version == pending.version) {
             bail!("claim version {} of `{name}` is no longer pending", pending.short());
         }
         Ok(entry.approve(pending.clone()))
     })?;
-    Ok(format!("approved claim version {} for `{name}`", pending.short()))
+    Ok(())
 }
 
 /// `version` (a prefix of one), else the only one.
