@@ -203,6 +203,12 @@ on macOS).
 The display rule is the same for every command
 ([bridges.md](../helper/bridges.md#opening-urls-kind-open)).
 
+`devsandbox login` is the other opener on a host: its pages open with
+`open::open_argv` too, for the credential's profile when it has exactly
+one, the file read once per login and an unreadable one a warning on the
+terminal
+([login](../credentials/login.md#where-pages-open)).
+
 Commands only ever come from the opening host's own `profiles.toml`, never
 from a config: only a profile's name comes from `state.toml`, and only that
 name crosses machines (`open.deliver`'s `profile`, checked as a profile name

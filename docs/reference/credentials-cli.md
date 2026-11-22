@@ -64,8 +64,8 @@ The login method is one of the claim's `login` (`choose`, over the
 version being approved, else the latest approved): `--method` names one
 the claim lists, else the first the claim lists of, on a terminal,
 `device`, `browser`, `paste`, and off one `paste`, `device`, `browser`;
-`browser` only where a browser opens (a display and a system opener,
-`open::has_display`, `open::opener_argv`), since its redirect lands on
+`browser` only where a browser opens (a display and an opener,
+`open::has_display`, `open::open_argv`), since its redirect lands on
 this host's loopback, and a `device` or `browser` login whose claim has
 no `clientId` only with `--client-id` (`needs_client_id`; named by
 `--method` without it, refused). A claim's own order isn't kept: its version sorts
@@ -108,6 +108,14 @@ off a terminal without `--yes`, refused); the secret (`obtain`), by:
   entered and approved, denied, or expired.
 - `browser`: the authorization code with PKCE; it prints and opens the
   provider's authorize page and waits up to 5 minutes for the redirect.
+
+Every page opens in the browser of the credential's profile when it has
+exactly one (the existing entry's `profiles`, else the `--profile`s):
+that profile's `open` command in `profiles.toml`
+([profiles](../architecture/instances/profiles.md#on-the-opening-host)),
+else the system opener. Several or every profile, a profile the file
+doesn't map, or an unreadable file (a warning): the system opener
+([login](../architecture/credentials/login.md#where-pages-open)).
 
 A claim whose `tokens.accept` lists prefixes takes only a secret one of
 them starts (`tokens::check_accepted`), pasted or an OAuth login's

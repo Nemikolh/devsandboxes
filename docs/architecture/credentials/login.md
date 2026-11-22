@@ -17,7 +17,7 @@ Code: `src/credentials/oauth/mod.rs` (`Http`, `parse_token_reply`,
 (`login`, `authorize_url`, `callback`, `TIMEOUT`),
 `src/credentials/store.rs` (`Record`, `OAuthToken`, `Store::renew`),
 `src/commands/login.rs` (`obtain`, `create_url`, `check_request`,
-`read_check`, `check_token`, `Flows`).
+`read_check`, `check_token`, `Flows`, `login_profile`).
 
 ## The endpoints
 
@@ -80,6 +80,23 @@ Not OAuth, but the same opener: a paste login whose claim names a
 it, pure, with `form_encode`: the token's name, description, owner and,
 with `permissions`, the granted scopes' permissions at their highest
 level ([credentials CLI](../../reference/credentials-cli.md#login)).
+
+## Where pages open
+
+Every page a login opens (the device page, the authorize page, a paste
+login's token page) goes through `Flows.open`, which `Flows::host` builds
+on the mapping container URLs use
+([profiles](../instances/profiles.md#on-the-opening-host)):
+`open::open_argv` with the credential's profile, so the page lands in the
+browser where that profile's account is signed in. The profile
+(`login_profile`, pure) is the credential's `profiles` (the existing
+entry's, else the `--profile`s) when it names exactly one; several, or
+every profile, is none. `profiles.toml` (`open::load_profiles`) is read
+only for a profile, once per login; unreadable or invalid, `login` warns
+and uses the system opener, as for a profile the file doesn't map.
+`Flows.browser` (whether a browser login is possible here) is whether
+that argv exists where a display is (`open::has_display`): a mapped
+profile counts as a browser.
 
 ## The token check
 

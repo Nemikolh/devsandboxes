@@ -51,16 +51,28 @@ pub(crate) struct Flows {
 }
 
 impl Flows {
-    fn host() -> Flows {
+    /// Pages open in `profile`'s browser where `profiles.toml` maps it, as
+    /// container URLs do (`open::open_argv`), else with the system opener.
+    fn host(profile: Option<String>, term: &mut dyn Term) -> Flows {
         let os = std::env::consts::OS;
+        let profiles = match &profile {
+            Some(p) => crate::open::profiles_path().and_then(|path| crate::open::load_profiles(&path)).unwrap_or_else(|e| {
+                let e = crate::open::printable(&format!("{e:#}"));
+                term.show(&format!("warning: {e}; opening pages for profile `{p}` with the system opener\n"));
+                crate::open::HostProfiles::new()
+            }),
+            None => crate::open::HostProfiles::new(),
+        };
+        let argv = move |url: &str| {
+            crate::open::open_argv(os, profile.as_deref(), &profiles, url)
+                .filter(|_| crate::open::has_display(os, |k| std::env::var_os(k)))
+        };
         Flows {
             http: Box::new(Http::from_host),
             clock: Box::new(oauth::SystemClock::new()),
-            browser: crate::open::has_display(os, |k| std::env::var_os(k)) && crate::open::opener_argv(os, "").is_some(),
+            browser: argv("").is_some(),
             open: Box::new(move |url| {
-                if crate::open::has_display(os, |k| std::env::var_os(k))
-                    && let Some(argv) = crate::open::opener_argv(os, url)
-                {
+                if let Some(argv) = argv(url) {
                     let _ = std::process::Command::new(&argv[0])
                         .args(&argv[1..])
                         .stdin(std::process::Stdio::null())
@@ -165,9 +177,27 @@ pub fn login(args: Args) -> Result<()> {
         Some(reference) => Some(feature_claims(reference)?),
         None => None,
     };
-    let done = login_at(&data_dir()?, &args, claims, &mut Stdio, &mut Flows::host())?;
+    let data = data_dir()?;
+    let existing = home::load(&home::path(&data))?.remove(&args.credential);
+    let profile = login_profile(existing.as_ref(), &args.profiles);
+    let mut flows = Flows::host(profile, &mut Stdio);
+    let done = login_at(&data, &args, claims, &mut Stdio, &mut flows)?;
     println!("{done}");
     Ok(())
+}
+
+/// The profile whose browser login pages open in: the credential's only
+/// profile, the existing `entry`'s, else among the `--profile` `flags` of a
+/// new one. Several or every profile: none.
+fn login_profile(entry: Option<&Entry>, flags: &[String]) -> Option<String> {
+    let profiles = match entry {
+        Some(e) => e.profiles.as_deref()?,
+        None => flags,
+    };
+    match profiles {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
 }
 
 /// The claims of the feature `reference`: an OCI ref, or a local folder
@@ -666,6 +696,20 @@ pub(crate) mod tests {
         let mut c = sentry();
         c.kind = kind.into();
         c
+    }
+
+    #[test]
+    fn pages_open_in_the_credentials_only_profile() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let entry = |p: Option<&[&str]>| Entry::new("github", p.map(names));
+        assert_eq!(login_profile(None, &names(&["work"])), Some("work".into()));
+        assert_eq!(login_profile(None, &names(&["work", "oss"])), None, "several");
+        assert_eq!(login_profile(None, &[]), None, "every profile");
+        assert_eq!(login_profile(Some(&entry(Some(&["work"]))), &[]), Some("work".into()));
+        assert_eq!(login_profile(Some(&entry(Some(&["work", "oss"]))), &[]), None);
+        assert_eq!(login_profile(Some(&entry(None)), &[]), None, "an entry for every profile");
+        assert_eq!(login_profile(Some(&entry(Some(&["work"]))), &names(&["oss"])), Some("work".into()), "the entry's");
+        assert_eq!(login_profile(Some(&entry(None)), &names(&["oss"])), None, "the entry's, every profile");
     }
 
     #[test]
