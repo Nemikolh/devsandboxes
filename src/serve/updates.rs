@@ -189,7 +189,7 @@ impl Env for Live<'_> {
     fn declared(&mut self, root: &Path) -> Result<Root> {
         let config = Config::load(root)?;
         let project = crate::commands::services::project_id(root)?;
-        let (declared, skipped) = crate::commands::update::declared(root, &config);
+        let (declared, skipped) = crate::commands::update::declared(&project, &config);
         for (sandbox, e) in skipped {
             eprintln!("updates: {}: sandbox `{sandbox}`: {e:#}", root.display());
         }

@@ -293,8 +293,14 @@ fn build_features_image(
     std::fs::write(&dockerfile_path, dockerfile)
         .with_context(|| format!("cannot write {}", dockerfile_path.display()))?;
 
+    let baked: Vec<crate::updates::Baked> = ordered
+        .iter()
+        .flat_map(|f| crate::updates::baked(&f.key(), &f.metadata.updates, &f.metadata.mounts))
+        .collect();
+    let updates_label = format!("{}={}", crate::updates::LABEL, crate::updates::to_label(&baked));
+
     let tag = features_image(project, &sandbox.name);
-    features_build(&tag, &dockerfile_path, &context)?;
+    features_build(&tag, &dockerfile_path, &context, &updates_label)?;
 
     // Feature entrypoints: a second, metadata-only build on the same tag. The
     // image's own ENTRYPOINT is read from the first build (which inherits the
@@ -315,17 +321,19 @@ fn build_features_image(
         let dockerfile_path = context.join("Dockerfile.devsandbox-entrypoint");
         std::fs::write(&dockerfile_path, entrypoint_dockerfile(&tag, &image_entrypoint))
             .with_context(|| format!("cannot write {}", dockerfile_path.display()))?;
-        features_build(&tag, &dockerfile_path, &context)?;
+        features_build(&tag, &dockerfile_path, &context, &updates_label)?;
     }
     Ok(tag)
 }
 
-/// `build -t tag -f dockerfile context` of the features image's generated
-/// context, past the member key's guard like every build.
-fn features_build(tag: &str, dockerfile: &Path, context: &Path) -> Result<()> {
-    let args: Vec<String> = ["build", "-t", tag, "-f", &dockerfile.to_string_lossy(), &context.to_string_lossy()]
-        .map(str::to_string)
-        .into();
+/// `build -t tag --label label -f dockerfile context` of the features image's
+/// generated context, past the member key's guard like every build. The
+/// label is set even when empty, so none is inherited from the base image.
+fn features_build(tag: &str, dockerfile: &Path, context: &Path, label: &str) -> Result<()> {
+    let args: Vec<String> =
+        ["build", "-t", tag, "--label", label, "-f", &dockerfile.to_string_lossy(), &context.to_string_lossy()]
+            .map(str::to_string)
+            .into();
     crate::key_guard::check_argv(&args)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&refs)
@@ -936,7 +944,11 @@ chmod +x ./devcontainer-features-install.sh && \
             r#"{"id": "marker", "name": "Marker", "options": {
                 "myopt": {"type": "string", "default": "fallback"},
                 "other": {"type": "string", "default": "dflt"}
-            }}"#,
+            },
+            "mounts": [{"type": "bind", "source": "${sharedVolumes}/marker", "target": "/opt/m", "readonly": true}],
+            "customizations": {"devsandbox": {"updates": [
+                {"name": "marker", "mount": "/opt/m", "command": ["/bin/up"], "every": "1d"}
+            ]}}}"#,
         )
         .unwrap();
         std::fs::write(feat.join("lib/value.txt"), "nested").unwrap();
@@ -972,7 +984,13 @@ chmod +x ./devcontainer-features-install.sh && \
                     .args(["run", "--rm", &tag, "cat", "/opt/marker"])
                     .output()
                     .unwrap();
+                let labels = backend().image_labels(&tag);
                 let _ = crate::test_support::runtime_cmd().args(["rmi", "-f", &tag]).output();
+                let label = labels.map_err(|e| format!("{e:#}"))?.unwrap_or_default();
+                let baked = crate::updates::from_label(&label[crate::updates::LABEL]).map_err(|e| format!("{e:#}"))?;
+                if baked.len() != 1 || baked[0].source != "${sharedVolumes}/marker" || baked[0].feature != "./features/marker" {
+                    return Err(format!("label: {baked:?}"));
+                }
                 if !run.status.success() {
                     return Err(String::from_utf8_lossy(&run.stderr).into_owned());
                 }

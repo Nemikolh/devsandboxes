@@ -7,8 +7,8 @@ a feature declares is in
 [images-and-features](../architecture/instances/images-and-features.md#running-an-update).
 
 Code: `src/main.rs` (`Command::Update`), `src/commands/update.rs`
-(`update`, `candidate`, `enabled_features`, `newest`, `host_dir`,
-`update_argv`), `src/updates.rs`.
+(`update`, `images`, `choose`, `refusal`, `declares`, `newest`,
+`host_dir`, `update_argv`), `src/updates.rs` (`from_label`).
 
 ```
 devsandbox [-C <dir>] update <name> [args…]
@@ -23,10 +23,12 @@ flags included.
 ## Scheduled runs
 
 The host daemon runs the same verb on its own, with no args: when it
-starts and then hourly, each update a sandbox with an instance declares,
+starts and then hourly, each update the features image of a sandbox with
+an instance lists,
 once its interval has passed since its last success. The interval is the
 config's top-level `updates` table (`gh = "1d"`, or `"never"` to never
-run it on schedule), else the feature's `every` (default `7d`). A
+run it on schedule), else the `every` the image was built with (default
+`7d`). A
 failure is retried after 6 h; its first in a row posts an Inbox notice,
 and each run's output is in `logs/update-<unix>-<name>.log` next to
 `state.toml`. Detail:
@@ -36,26 +38,32 @@ it.
 
 ## Which image
 
-For the config at `-C` (`update` → `candidate`), each sandbox's enabled
-`features` are resolved (fetched into the cache like at `run`); the ones
-whose feature declares `<name>` are candidates. A sandbox whose config or
-features don't resolve, or whose features declare one update name twice
-(`updates::check_unique`), is skipped with a ``warning: sandbox `<name>`:
-…`` line. No candidate: ``no sandbox of this config has a feature
-declaring update `<name>` ``.
+An image runs the updates it was built with: each features image carries
+them in its `devsandbox.updates` label
+([images-and-features](../architecture/instances/images-and-features.md#feature-image)).
+For the config at `-C` (`update` → `images`), each sandbox's local
+features image (`run::features_image`) is inspected
+(`Backend::image_labels`) and its label checked like a feature's
+declaration (`updates::from_label`); a label that doesn't pass is a
+``warning: sandbox `<name>`: …`` line and lists nothing. Among the images
+whose label lists `<name>`, the newest by `Backend::image_created` runs
+it (`choose` → `newest`; an unknown date ranks below any known one, a tie
+goes to the first sandbox in name order), with the `mount`, `source` and
+`command` of that label, whatever the feature declares now.
 
-Among the candidates' features images (`run::features_image`) that exist
-locally (`Backend::image_id`), the newest by `Backend::image_created`
-runs it (`newest`; an unknown date ranks below any known one, a tie goes
-to the first sandbox in name order). None built: ``update `<name>`: no
-image of sandbox `a`, `b` is built yet; `devsandbox run <sandbox>` builds
-it``. The update's `mount` and `command` are read from that sandbox's
-feature.
+No image lists it (`refusal`): the sandboxes' enabled `features` are
+resolved (fetched into the cache like at `run`, `declares`) to say why.
+Some declare `<name>` and have a built image: ``update `<name>`: the
+image of sandbox `a` was built without it; `devsandbox rebuild a` adds
+it`` (several: `devsandbox rebuild <sandbox>`). Some declare it, none
+built: ``update `<name>`: no image of sandbox `a`, `b` is built yet;
+`devsandbox run <sandbox>` builds it``. None declares it: ``no sandbox of
+this config has a feature declaring update `<name>` ``.
 
 ## The container
 
-`host_dir` resolves the source of the feature's mount at the update's
-`mount` with `${sharedVolumes}` = `<config root>/shared-volumes` and no
+`host_dir` resolves the label's `source` (the source of the feature's
+mount at the update's `mount` when the image was built) with `${sharedVolumes}` = `<config root>/shared-volumes` and no
 instance (a source naming `${instance}` / `${devcontainerId}` is refused:
 every instance shares the dir), checks it lies under `shared-volumes/`
 (`run::creatable_feature_source`), and creates it when missing, past a

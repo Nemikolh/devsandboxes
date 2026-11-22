@@ -9,7 +9,8 @@ Code: `src/commands/run/image.rs` (`image_for`, `base_image_for`,
 `sandbox_image`, `features_image`,
 `build_features_image`, `generate_dockerfile`, `install_wrapper`,
 `feature_env_file`, `builtin_env`, `entrypoint_wrapper`,
-`entrypoint_dockerfile`, `feature_container_opts`, `privileged_decision`),
+`entrypoint_dockerfile`, `features_build`, `feature_container_opts`,
+`privileged_decision`),
 `src/features.rs` (`FeatureSource`, `resolve`, `fetch_into`,
 `install_order`, `feature_issues`, `local_features_fingerprint`,
 `build_context_dir`, `build_context_name`, `FeatureMetadata`),
@@ -60,6 +61,15 @@ official devcontainers CLI.
    `containerEnv` as `ENV`, `COPY` and `RUN` the wrapper; `USER
    <containerUser>` last if set. `_REMOTE_USER` is `remoteUser`, else
    `containerUser`, else `root` (no image-user introspection).
+5. `features_build`: `build -t <tag> --label devsandbox.updates=<json> -f
+   <Dockerfile> <context>`. The label (`updates::LABEL`, `updates::baked`,
+   `updates::to_label`) lists every enabled feature's
+   [updates](#running-an-update) as `{ "feature", "name", "mount",
+   "source", "command", "every" }`, `source` the feature mount's source
+   unresolved (`${sharedVolumes}/…`), `every` in hours, sorted by name; it's
+   set (to `[]` when none) on every features build, so a base image's own
+   label never shows through. It's what the image's updaters are, whatever
+   the feature declares since.
 
 ## Feature sources and cache
 
@@ -124,7 +134,7 @@ Order (install order) and the lack of arguments are the same.
   `{ "name", "mount", "command", "every" }`. `name` is
   `[a-z0-9][a-z0-9-]*`, at most 32 bytes, the key the config's `updates`
   table and the CLI use, so one namespace across a sandbox's features
-  (`updates::check_unique`). `mount` is the target of one of the feature's
+  (an image whose label lists a name twice runs neither). `mount` is the target of one of the feature's
   own `mounts`, which must be a read-only bind of a dir under
   `${sharedVolumes}/` (no `..`): the one dir the update writes, read-only
   in every sandbox. `command` is an argv run in the feature's image,
@@ -141,13 +151,19 @@ Other metadata (`capAdd`, `init`, `dependsOn`, …) is not applied.
 [reference](../../reference/update-cli.md)) runs a declared update now.
 The command is the feature's own code and runs where its `install.sh`
 ran, in a container from a features image built with it, never on the
-host: the newest such image among the config's sandboxes using the
-feature (`features_image`, `Backend::image_created`). None built is
-refused, naming `devsandbox run`.
+host: the newest image among the config's sandboxes whose
+`devsandbox.updates` label lists the update (`features_image`,
+`Backend::image_labels`, `Backend::image_created`), with the `mount`,
+`source` and `command` that label gives, re-checked like a feature's
+(`updates::from_label`). A feature release that moves its updater thus
+never reaches an image built before it. No image listing it is refused:
+naming `devsandbox rebuild <sandbox>` when a sandbox's features declare
+it now but its built image doesn't list it, `devsandbox run` when none is
+built.
 
 The container is thrown away (`--rm`), never pulled, on the default
 network, under the sandbox's identity plan (`plan_for`, `create_args`),
-with the update's dir, the source of the feature's mount at `mount`
+with the update's dir, the label's `source` at `mount`
 (created under `shared-volumes/` like a feature mount's), as its only
 bind, read-write. Every sandbox mounts that dir read-only, so only the
 update can change what they run. `command[0]` replaces the image's

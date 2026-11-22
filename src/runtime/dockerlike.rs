@@ -227,6 +227,11 @@ impl Backend for Dockerlike {
         parse_created(&out)
     }
 
+    fn image_labels(&self, image: &str) -> Result<Option<BTreeMap<String, String>>> {
+        let out = self.output_quiet(&["image", "inspect", "--format", "{{json .Config.Labels}}", image])?;
+        parse_image_labels(&out).map(Some)
+    }
+
     fn image_passwd(&self, image: &str) -> Result<Option<String>> {
         let args = passwd_argv(image);
         let out = std::process::Command::new(self.bin)
@@ -324,6 +329,13 @@ fn parse_network_subnets(json: &str) -> Result<Vec<String>> {
 fn parse_created(json: &str) -> Result<Option<u64>> {
     let created: String = serde_json::from_str(json).context("unexpected `image inspect` created date")?;
     Ok(crate::broker::lfs::parse_rfc3339(&created))
+}
+
+/// `{{json .Config.Labels}}`: `null` for an image without any.
+fn parse_image_labels(json: &str) -> Result<BTreeMap<String, String>> {
+    let labels: Option<BTreeMap<String, String>> =
+        serde_json::from_str(json).context("unexpected `image inspect` labels")?;
+    Ok(labels.unwrap_or_default())
 }
 
 /// Where the canary's host dir is bound inside.
@@ -708,6 +720,14 @@ mod tests {
         assert_eq!(parse_created(r#""2024-02-29T14:00:00+02:00""#).unwrap(), Some(1_709_208_000));
         assert_eq!(parse_created(r#""0001-01-01T00:00:00Z""#).unwrap(), None);
         assert!(parse_created("null").is_err());
+    }
+
+    #[test]
+    fn image_labels() {
+        assert!(parse_image_labels("null").unwrap().is_empty());
+        let labels = parse_image_labels(r#"{"a":"1","devsandbox.updates":"[]"}"#).unwrap();
+        assert_eq!(labels["devsandbox.updates"], "[]");
+        assert!(parse_image_labels("").is_err());
     }
 
     /// Runtime-gated: the canary agrees with the fast path (CI: rootful

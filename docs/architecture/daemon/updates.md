@@ -19,14 +19,16 @@ A `serve-updates` thread (`host::updates_loop`) runs `updates::pass` when
 the daemon starts, then every `CHECK_EVERY` (1 h). A pass walks the
 config roots recorded on instances (`host::config_roots`). For each root
 (`Live::declared`): the config loads (else a `serve.log` line and the root
-is skipped), its sandboxes' enabled features are resolved
-(`commands::update::declared`, the verb's own discovery; a sandbox that
-doesn't resolve is a log line), and of the updates they declare only
-those of a sandbox with an instance in that root count: an instance means
-its features image was built, which the update runs from.
+is skipped), its sandboxes' features images list the updates they were
+built with (`commands::update::declared`: each image's
+`devsandbox.updates` label, the one the verb runs from; a sandbox whose
+image isn't built or has no label lists nothing and is skipped quietly, no
+failure and no notice, while a label that doesn't validate is a log line),
+and of those only the updates of a sandbox with an instance in that root
+count.
 
 An update's interval is the config's `updates.<name>` (`"never"`: not
-run), else the feature's `every` (`updates::interval`). It's due
+run), else the `every` in the image's label (`updates::interval`). It's due
 (`updates::due`) once the interval has passed since its last success and,
 while its last attempt failed, `RETRY` (6 h) since that attempt.
 

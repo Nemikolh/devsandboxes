@@ -341,6 +341,10 @@ impl Backend for AppleContainer {
         Ok(None)
     }
 
+    fn image_labels(&self, _image: &str) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+        Ok(None)
+    }
+
     /// A VM per run is too slow for one file: the fallbacks stand in.
     fn image_passwd(&self, _image: &str) -> Result<Option<String>> {
         Ok(None)

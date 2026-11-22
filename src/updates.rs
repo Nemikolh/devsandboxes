@@ -5,10 +5,15 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{parse_shorthand, Mount};
+use crate::config::{parse_shorthand, Mount, INSTANCE_VARS};
+
+/// The features image's label listing the updates baked in it: what
+/// `devsandbox update` runs from that image, whatever its features declare
+/// since.
+pub const LABEL: &str = "devsandbox.updates";
 
 /// A feature's `every` when it sets none.
 pub const DEFAULT_EVERY: Duration = Duration::from_secs(7 * DAY);
@@ -130,18 +135,40 @@ fn parse(value: &Value, mounts: &[Mount]) -> Result<Update> {
     let raw: RawUpdate = serde_json::from_value(value.clone())?;
     check_name(&raw.name)?;
     check_mount(&raw.mount, mounts).context("`mount`")?;
-    match raw.command.first() {
-        None => bail!("`command` is empty"),
-        Some(program) if !program.starts_with('/') => {
-            bail!("`command`: `{}` must be an absolute path", program.escape_debug())
-        }
-        Some(_) => {}
-    }
+    check_command(&raw.command)?;
     let every = match &raw.every {
         None => DEFAULT_EVERY,
         Some(s) => parse_duration(s).context("`every`")?,
     };
     Ok(Update { name: raw.name, mount: raw.mount, command: raw.command, every })
+}
+
+fn check_command(command: &[String]) -> Result<()> {
+    match command.first() {
+        None => bail!("`command` is empty"),
+        Some(program) if !program.starts_with('/') => {
+            bail!("`command`: `{}` must be an absolute path", program.escape_debug())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// A dir under `${sharedVolumes}`, never above it.
+fn under_shared_volumes(source: &str) -> bool {
+    source
+        .strip_prefix(SHARED_VOLUMES)
+        .is_some_and(|rest| !rest.is_empty() && rest.split('/').all(|seg| seg != ".."))
+}
+
+/// The unresolved source of the feature's mount at `target`.
+fn mount_source(target: &str, mounts: &[Mount]) -> Option<String> {
+    mounts.iter().find_map(|m| {
+        let (source, t) = match m {
+            Mount::Shorthand(s) => parse_shorthand(s).map(|(_, source, t, _)| (source, t)).ok()?,
+            Mount::Object(o) => (o.source.clone(), o.target.clone()),
+        };
+        if t == target { source } else { None }
+    })
 }
 
 /// `target` must be one of the feature's `mounts`, a read-only bind of a dir
@@ -158,9 +185,7 @@ fn check_mount(target: &str, mounts: &[Mount]) -> Result<()> {
     let Some((kind, source, readonly)) = found else {
         bail!("`{}` isn't the target of one of the feature's `mounts`", target.escape_debug());
     };
-    let shared = source.as_deref().and_then(|s| s.strip_prefix(SHARED_VOLUMES)).is_some_and(|rest| {
-        !rest.is_empty() && rest.split('/').all(|seg| seg != "..")
-    });
+    let shared = source.as_deref().is_some_and(under_shared_volumes);
     if kind.as_deref().unwrap_or("bind") != "bind" || !shared {
         bail!("`{}` must be a bind of a dir under `${{sharedVolumes}}`", target.escape_debug());
     }
@@ -170,20 +195,91 @@ fn check_mount(target: &str, mounts: &[Mount]) -> Result<()> {
     Ok(())
 }
 
-/// Update names are one namespace across a sandbox's features (the config
-/// and the CLI name an update alone): refuse a name two features declare.
-pub fn check_unique(features: &[(&str, &[Update])]) -> Result<()> {
-    let mut seen: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
-    for (feature, updates) in features {
-        for update in *updates {
-            if let Some(other) = seen.insert(&update.name, feature)
-                && other != *feature
-            {
-                bail!("update `{}` is declared by both `{other}` and `{feature}`", update.name);
-            }
+/// An update as a features image was built with it: one entry of [`LABEL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Baked {
+    /// The declaring feature's reference, for messages.
+    pub feature: String,
+    pub update: Update,
+    /// The source of the feature's mount at `update.mount`, unresolved
+    /// (`${sharedVolumes}/…`): the host dir the update writes.
+    pub source: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LabelEntry {
+    feature: String,
+    name: String,
+    mount: String,
+    source: String,
+    command: Vec<String>,
+    /// `<n>h`, read back by [`parse_duration`].
+    every: String,
+}
+
+/// A feature's updates (already validated against `mounts`) as label entries.
+pub fn baked(feature: &str, updates: &[Update], mounts: &[Mount]) -> Vec<Baked> {
+    updates
+        .iter()
+        .filter_map(|u| {
+            let source = mount_source(&u.mount, mounts)?;
+            Some(Baked { feature: feature.to_string(), update: u.clone(), source })
+        })
+        .collect()
+}
+
+/// [`LABEL`]'s value: a JSON list sorted by name (then feature), so an
+/// unchanged set of features labels its image alike.
+pub fn to_label(baked: &[Baked]) -> String {
+    let mut entries: Vec<LabelEntry> = baked
+        .iter()
+        .map(|b| LabelEntry {
+            feature: b.feature.clone(),
+            name: b.update.name.clone(),
+            mount: b.update.mount.clone(),
+            source: b.source.clone(),
+            command: b.update.command.clone(),
+            every: format!("{}h", (b.update.every.as_secs() / HOUR).max(1)),
+        })
+        .collect();
+    entries.sort_by(|a, b| (&a.name, &a.feature).cmp(&(&b.name, &b.feature)));
+    serde_json::to_string(&entries).expect("strings serialize")
+}
+
+/// [`LABEL`]'s value, checked like a feature's declaration: an image's label
+/// is the runtime's word, and it picks the dir an update writes.
+pub fn from_label(json: &str) -> Result<Vec<Baked>> {
+    let entries: Vec<LabelEntry> = serde_json::from_str(json).context("label `devsandbox.updates`")?;
+    let mut parsed: Vec<Baked> = Vec::new();
+    for entry in entries {
+        let name = entry.name.clone();
+        let baked = check_entry(entry).with_context(|| format!("label `devsandbox.updates`: update `{name}`"))?;
+        // One namespace across the image's features: the config and the CLI
+        // name an update alone.
+        if parsed.iter().any(|b| b.update.name == baked.update.name) {
+            bail!("label `devsandbox.updates`: update `{}` is declared twice", baked.update.name);
         }
+        parsed.push(baked);
     }
-    Ok(())
+    Ok(parsed)
+}
+
+fn check_entry(entry: LabelEntry) -> Result<Baked> {
+    check_name(&entry.name)?;
+    if !entry.mount.starts_with('/') {
+        bail!("`mount`: `{}` must be an absolute path", entry.mount.escape_debug());
+    }
+    if !under_shared_volumes(&entry.source) || INSTANCE_VARS.iter().any(|v| entry.source.contains(v)) {
+        bail!("`source`: `{}` must be a dir under `${{sharedVolumes}}` every instance shares", entry.source.escape_debug());
+    }
+    check_command(&entry.command)?;
+    let every = parse_duration(&entry.every).context("`every`")?;
+    Ok(Baked {
+        feature: entry.feature,
+        update: Update { name: entry.name, mount: entry.mount, command: entry.command, every },
+        source: entry.source,
+    })
 }
 
 #[cfg(test)]
@@ -314,17 +410,56 @@ mod tests {
     }
 
     #[test]
-    fn unique_across_features() {
-        let one = |name: &str| Update {
-            name: name.into(),
-            mount: "/m".into(),
-            command: vec!["/bin/up".into()],
-            every: DEFAULT_EVERY,
+    fn label_round_trip() {
+        let updates = from_customizations(
+            "gh",
+            Some(&custom(json!([
+                {"name": "tool", "mount": "/opt/tool", "command": ["/bin/up", "x"], "every": "2d"},
+                {"name": "gh", "mount": "/var/lib/gh/bin", "command": ["/usr/local/lib/gh/gh-update", "/var/lib/gh/bin"]},
+            ]))),
+            &mounts(),
+        )
+        .unwrap();
+        let baked = baked("ghcr.io/x/gh:1", &updates, &mounts());
+        assert_eq!(baked.iter().map(|b| b.source.as_str()).collect::<Vec<_>>(), ["${sharedVolumes}/tool", "${sharedVolumes}/gh-bin"]);
+        let label = to_label(&baked);
+        // Sorted by name, whatever the declaration order.
+        assert!(label.starts_with(r#"[{"feature":"ghcr.io/x/gh:1","name":"gh","mount":"/var/lib/gh/bin","source":"${sharedVolumes}/gh-bin","#), "{label}");
+        let mut back = from_label(&label).unwrap();
+        back.sort_by(|a, b| b.update.name.cmp(&a.update.name));
+        assert_eq!(back, baked);
+        assert_eq!(to_label(&[]), "[]");
+        assert!(from_label("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_refusals() {
+        let ok = |extra: Value| {
+            let mut v = json!({"feature": "f", "name": "gh", "mount": "/m", "source": "${sharedVolumes}/gh", "command": ["/bin/up"], "every": "7d"});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            json!([v]).to_string()
         };
-        let (a, b) = ([one("gh"), one("x")], [one("y")]);
-        check_unique(&[("a", &a), ("b", &b), ("a", &a)]).unwrap();
-        let c = [one("x")];
-        let e = check_unique(&[("a", &a), ("c", &c)]).unwrap_err().to_string();
-        assert_eq!(e, "update `x` is declared by both `a` and `c`");
+        from_label(&ok(json!({}))).unwrap();
+        let cases = [
+            (ok(json!({"extra": 1})), "unknown field `extra`"),
+            (ok(json!({"name": "Gh"})), "update name `Gh`"),
+            (ok(json!({"mount": "m"})), "`mount`: `m` must be an absolute path"),
+            (ok(json!({"source": "/etc"})), "`source`"),
+            (ok(json!({"source": "${sharedVolumes}/"})), "`source`"),
+            (ok(json!({"source": "${sharedVolumes}/../x"})), "`source`"),
+            (ok(json!({"source": "${sharedVolumes}/a/${instance}"})), "`source`"),
+            (ok(json!({"source": "${sharedVolumes}/${devcontainerId}"})), "`source`"),
+            (ok(json!({"command": []})), "`command` is empty"),
+            (ok(json!({"command": ["up"]})), "must be an absolute path"),
+            (ok(json!({"every": "0h"})), "`every`"),
+            ("{}".to_string(), "label `devsandbox.updates`"),
+        ];
+        for (label, want) in cases {
+            let e = format!("{:#}", from_label(&label).unwrap_err());
+            assert!(e.contains(want), "{label}: {e}");
+        }
+        let one = json!({"feature": "f", "name": "gh", "mount": "/m", "source": "${sharedVolumes}/gh", "command": ["/bin/up"], "every": "7d"});
+        let e = format!("{:#}", from_label(&json!([one, one]).to_string()).unwrap_err());
+        assert!(e.contains("update `gh` is declared twice"), "{e}");
     }
 }

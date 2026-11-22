@@ -364,6 +364,10 @@ pub trait Backend: Send + Sync {
     /// that doesn't say.
     fn image_created(&self, image: &str) -> Result<Option<u64>>;
 
+    /// The local image's labels (empty when it has none); `None` on a
+    /// runtime that doesn't say.
+    fn image_labels(&self, image: &str) -> Result<Option<BTreeMap<String, String>>>;
+
     /// The local image's `/etc/passwd`, read from a throwaway container
     /// (never pulled, no network, entrypoint replaced by `sh`). `None` when
     /// the image has no `sh` (or `cat`), or the runtime can't run one

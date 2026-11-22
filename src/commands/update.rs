@@ -1,8 +1,8 @@
 //! `devsandbox update <name> [args…]`: run a feature's update now
-//! (docs/reference/update-cli.md). The command comes from the feature, baked
-//! in a sandbox's features image, and runs in a throwaway container from
-//! that image with the update's `${sharedVolumes}` dir as its only bind,
-//! read-write; sandboxes mount that dir read-only.
+//! (docs/reference/update-cli.md). The command comes from the features image
+//! it was baked in (its `devsandbox.updates` label), and runs in a throwaway
+//! container from that image with the update's `${sharedVolumes}` dir as
+//! its only bind, read-write; sandboxes mount that dir read-only.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,65 +11,52 @@ use anyhow::{bail, Context, Result};
 
 use crate::commands::run;
 use crate::commands::services;
-use crate::config::{Config, MountContext, ResolvedSandbox};
-use crate::features::{self, ResolvedFeature};
-use crate::runtime::backend;
+use crate::config::{Config, Mount, MountContext, MountObject};
+use crate::features;
+use crate::runtime::{backend, Backend};
 use crate::state::{Instance, State};
-use crate::updates::{self, Update};
-
-/// One sandbox whose features declare the update.
-struct Candidate {
-    sandbox: ResolvedSandbox,
-    feature: ResolvedFeature,
-    update: Update,
-}
+use crate::updates::{self, Baked, Update};
 
 pub fn update(dir: &Path, name: &str, args: &[String]) -> Result<()> {
     updates::check_name(name)?;
     let b = backend();
-    // No image dates to pick by, nor the identity plan's flags.
+    // No image dates or labels to pick by, nor the identity plan's flags.
     if b.name() == "container" {
         bail!("`devsandbox update` on Apple's container: {}", crate::NOT_SUPPORTED_YET);
     }
     let config = Config::load(dir)?;
     let project = services::project_id(dir)?;
-    let mut candidates = Vec::new();
-    for sandbox in config.sandboxes.keys() {
-        match candidate(dir, &config, sandbox, name) {
-            Ok(Some(c)) => candidates.push(c),
-            Ok(None) => {}
-            Err(e) => eprintln!("warning: sandbox `{sandbox}`: {e:#}"),
+    let images = images(config.sandboxes.keys(), |sandbox| facts(b, &run::features_image(&project, sandbox)));
+    for image in &images {
+        if let Err(e) = &image.baked {
+            eprintln!("warning: sandbox `{}`: {e:#}", image.sandbox);
         }
     }
-    if candidates.is_empty() {
-        bail!("no sandbox of this config has a feature declaring update `{name}`");
-    }
-    let tags: Vec<String> = candidates.iter().map(|c| run::features_image(&project, &c.sandbox.name)).collect();
-    let built: Vec<Option<Option<u64>>> = tags
-        .iter()
-        .map(|tag| b.image_id(tag).ok().flatten().map(|_| b.image_created(tag).ok().flatten()))
-        .collect();
-    let Some(i) = newest(&built) else {
-        let names: Vec<String> = candidates.iter().map(|c| format!("`{}`", c.sandbox.name)).collect();
-        bail!(
-            "update `{name}`: no image of sandbox {} is built yet; `devsandbox run <sandbox>` builds it",
-            names.join(", ")
-        );
+    let Some((i, baked)) = choose(&images, name) else {
+        let mut declaring = Vec::new();
+        for sandbox in config.sandboxes.keys() {
+            match declares(dir, &config, sandbox, name) {
+                Ok(true) => declaring.push(sandbox.clone()),
+                Ok(false) => {}
+                Err(e) => eprintln!("warning: sandbox `{sandbox}`: {e:#}"),
+            }
+        }
+        bail!(refusal(name, &images, &declaring));
     };
-    let Candidate { sandbox, feature, update } = &candidates[i];
-    let image = &tags[i];
+    let sandbox = config.resolve_sandbox(&images[i].sandbox)?;
+    let image = run::features_image(&project, &sandbox.name);
     eprintln!("update `{name}`: from `{image}` (sandbox `{}`)", sandbox.name);
 
-    let bind = host_dir(dir, feature, update)?;
+    let bind = host_dir(dir, baked)?;
     let props = &sandbox.properties;
-    let facts = run::image_facts(image);
-    let (plan, seccomp) = run::plan_for(image, run::accounts(props, &facts), props, false, false);
+    let facts = run::image_facts(&image);
+    let (plan, seccomp) = run::plan_for(&image, run::accounts(props, &facts), props, false, false);
     let (identity_args, warning) =
         run::create_args(&plan, b.name() == "podman", seccomp.as_deref(), &[], std::slice::from_ref(&bind));
     if let Some(warning) = warning {
         eprintln!("warning: {warning}");
     }
-    let argv = update_argv(image, identity_args, &update.command, args)?;
+    let argv = update_argv(&image, identity_args, &baked.update.command, args)?;
     // `run_container`'s guards: the argv is everything the runtime gets.
     // No instance of its own, so every instance's paths are someone else's.
     crate::key_guard::check_argv(&argv)?;
@@ -87,55 +74,112 @@ pub fn update(dir: &Path, name: &str, args: &[String]) -> Result<()> {
     })
 }
 
-/// One update the config root's sandboxes declare.
+struct Facts {
+    created: Option<u64>,
+    labels: BTreeMap<String, String>,
+}
+
+/// `None`: the image isn't built (or can't be inspected).
+fn facts(b: &dyn Backend, tag: &str) -> Option<Facts> {
+    let labels = b.image_labels(tag).ok()?.unwrap_or_default();
+    Some(Facts { created: b.image_created(tag).ok().flatten(), labels })
+}
+
+struct Image {
+    sandbox: String,
+    /// Unix seconds; `None` when unknown.
+    created: Option<u64>,
+    /// The updates its label lists; `Ok(None)` without the label.
+    baked: Result<Option<Vec<Baked>>>,
+}
+
+/// The built features images of `sandboxes`, in their order.
+fn images<'a>(sandboxes: impl Iterator<Item = &'a String>, mut facts: impl FnMut(&str) -> Option<Facts>) -> Vec<Image> {
+    sandboxes
+        .filter_map(|sandbox| {
+            let Facts { created, labels } = facts(sandbox)?;
+            let baked = labels.get(updates::LABEL).map(|label| updates::from_label(label)).transpose();
+            Some(Image { sandbox: sandbox.clone(), created, baked })
+        })
+        .collect()
+}
+
+fn baked<'a>(image: &'a Image, name: &str) -> Option<&'a Baked> {
+    image.baked.as_ref().ok()?.as_ref()?.iter().find(|b| b.update.name == name)
+}
+
+/// The newest image whose label lists update `name`, and its entry.
+fn choose<'a>(images: &'a [Image], name: &str) -> Option<(usize, &'a Baked)> {
+    let built: Vec<Option<Option<u64>>> = images.iter().map(|i| baked(i, name).map(|_| i.created)).collect();
+    let i = newest(&built)?;
+    Some((i, baked(&images[i], name)?))
+}
+
+/// Why no image runs update `name`, `declaring` the sandboxes whose
+/// features declare it now.
+fn refusal(name: &str, images: &[Image], declaring: &[String]) -> String {
+    let quoted = |names: &[&String]| names.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ");
+    if declaring.is_empty() {
+        return format!("no sandbox of this config has a feature declaring update `{name}`");
+    }
+    let stale: Vec<&String> = declaring.iter().filter(|s| images.iter().any(|i| &i.sandbox == *s)).collect();
+    match stale.as_slice() {
+        [] => format!(
+            "update `{name}`: no image of sandbox {} is built yet; `devsandbox run <sandbox>` builds it",
+            quoted(&declaring.iter().collect::<Vec<_>>())
+        ),
+        [one] => format!("update `{name}`: the image of sandbox `{one}` was built without it; `devsandbox rebuild {one}` adds it"),
+        _ => format!(
+            "update `{name}`: the images of sandbox {} were built without it; `devsandbox rebuild <sandbox>` adds it",
+            quoted(&stale)
+        ),
+    }
+}
+
+/// One update the config root's built images carry.
 pub struct Declared {
-    /// The first declaring sandbox's (in name order).
+    /// The first carrying sandbox's (in name order).
     pub update: Update,
-    /// Every sandbox whose features declare it, in name order.
+    /// Every sandbox whose features image carries it, in name order.
     pub sandboxes: Vec<String>,
 }
 
-/// Every update the sandboxes of the config root in `dir` declare, by name,
-/// without running any. A sandbox that doesn't resolve is in the second
+/// Every update the features images of the config's sandboxes carry, by
+/// name, without running any. A sandbox whose image isn't built or has no
+/// label carries none; one whose label doesn't validate is in the second
 /// list with why.
-pub fn declared(dir: &Path, config: &Config) -> (BTreeMap<String, Declared>, Vec<(String, anyhow::Error)>) {
+pub fn declared(project: &str, config: &Config) -> (BTreeMap<String, Declared>, Vec<(String, anyhow::Error)>) {
+    let b = backend();
+    declared_in(images(config.sandboxes.keys(), |sandbox| facts(b, &run::features_image(project, sandbox))))
+}
+
+fn declared_in(images: Vec<Image>) -> (BTreeMap<String, Declared>, Vec<(String, anyhow::Error)>) {
     let mut found: BTreeMap<String, Declared> = BTreeMap::new();
     let mut skipped = Vec::new();
-    for sandbox in config.sandboxes.keys() {
-        let features = match enabled_features(dir, config, sandbox) {
-            Ok((_, features)) => features,
+    for image in images {
+        let baked = match image.baked {
+            Ok(baked) => baked.unwrap_or_default(),
             Err(e) => {
-                skipped.push((sandbox.clone(), e));
+                skipped.push((image.sandbox, e));
                 continue;
             }
         };
-        for update in features.iter().flat_map(|f| &f.metadata.updates) {
+        for Baked { update, .. } in baked {
             found
                 .entry(update.name.clone())
-                .or_insert_with(|| Declared { update: update.clone(), sandboxes: Vec::new() })
+                .or_insert_with(|| Declared { update, sandboxes: Vec::new() })
                 .sandboxes
-                .push(sandbox.clone());
+                .push(image.sandbox.clone());
         }
     }
     (found, skipped)
 }
 
-/// Sandbox `sandbox`'s enabled feature declaring update `name`, if any.
-fn candidate(dir: &Path, config: &Config, sandbox: &str, name: &str) -> Result<Option<Candidate>> {
-    let (resolved, enabled) = enabled_features(dir, config, sandbox)?;
-    let found = enabled.into_iter().find_map(|feature| {
-        let update = feature.metadata.updates.iter().find(|u| u.name == name)?.clone();
-        Some((feature, update))
-    });
-    Ok(found.map(|(feature, update)| Candidate { sandbox: resolved, feature, update }))
-}
-
-/// Sandbox `sandbox` and its enabled features, resolved (fetched into the
-/// cache like at `run`). Its features must not declare one update name twice.
-fn enabled_features(dir: &Path, config: &Config, sandbox: &str) -> Result<(ResolvedSandbox, Vec<ResolvedFeature>)> {
+/// Whether sandbox `sandbox`'s enabled features declare update `name` now
+/// (resolved and fetched into the cache like at `run`): its image predates it.
+fn declares(dir: &Path, config: &Config, sandbox: &str, name: &str) -> Result<bool> {
     let resolved = config.resolve_sandbox(sandbox)?;
-    let Some(refs) = &resolved.properties.features else { return Ok((resolved, Vec::new())) };
-    let mut enabled = Vec::new();
+    let Some(refs) = &resolved.properties.features else { return Ok(false) };
     for (reference, options) in refs {
         if run::feature_option_values(options)
             .with_context(|| format!("feature `{reference}`: invalid options"))?
@@ -145,12 +189,11 @@ fn enabled_features(dir: &Path, config: &Config, sandbox: &str) -> Result<(Resol
         }
         let source = features::FeatureSource::parse(reference)?;
         let feature = features::resolve(&source, dir).with_context(|| format!("fetching feature `{reference}`"))?;
-        enabled.push((reference.as_str(), feature));
+        if feature.metadata.updates.iter().any(|u| u.name == name) {
+            return Ok(true);
+        }
     }
-    let declared: Vec<(&str, &[Update])> = enabled.iter().map(|(r, f)| (*r, f.metadata.updates.as_slice())).collect();
-    updates::check_unique(&declared)?;
-    let enabled = enabled.into_iter().map(|(_, feature)| feature).collect();
-    Ok((resolved, enabled))
+    Ok(false)
 }
 
 /// Among the sandboxes' features images (`None`: not built; else its
@@ -166,10 +209,11 @@ fn newest(built: &[Option<Option<u64>>]) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-/// The `--mount` of the update's dir, read-write: the source of the
-/// feature's own read-only mount at `update.mount`, created like a feature
-/// mount's (under `shared-volumes/` only, past a worker policy's check).
-fn host_dir(dir: &Path, feature: &ResolvedFeature, update: &Update) -> Result<String> {
+/// The `--mount` of the update's dir, read-write: its source as the image's
+/// label names it, created like a feature mount's (under `shared-volumes/`
+/// only, past a worker policy's check).
+fn host_dir(dir: &Path, baked: &Baked) -> Result<String> {
+    let update = &baked.update;
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let config_dir = config_dir.to_string_lossy().into_owned();
     let shared_volumes = Path::new(&config_dir).join("shared-volumes").to_string_lossy().into_owned();
@@ -181,15 +225,13 @@ fn host_dir(dir: &Path, feature: &ResolvedFeature, update: &Update) -> Result<St
         instance: "",
         container_env: None,
     };
-    let mut mount = None;
-    for m in &feature.metadata.mounts {
-        let resolved = m.resolve(&ctx)?;
-        if resolved.target == update.mount {
-            mount = Some(resolved);
-            break;
-        }
-    }
-    let mut mount = mount.with_context(|| format!("update `{}`: no mount at `{}`", update.name, update.mount))?;
+    let mount = Mount::Object(MountObject {
+        kind: Some("bind".into()),
+        source: Some(baked.source.clone()),
+        target: update.mount.clone(),
+        readonly: Some(false),
+    });
+    let mount = mount.resolve(&ctx)?;
     if mount.instance_source {
         bail!("update `{}`: its dir names the instance, but every instance shares it", update.name);
     }
@@ -200,7 +242,6 @@ fn host_dir(dir: &Path, feature: &ResolvedFeature, update: &Update) -> Result<St
     let policy = crate::worker_policy::Policy::for_dir(dir)?;
     run::guard_create(policy.as_ref(), Path::new(&source))?;
     run::provision_bind_source(&source, false)?;
-    mount.readonly = false;
     Ok(mount.to_arg())
 }
 
@@ -251,41 +292,92 @@ mod tests {
         assert_eq!(newest(&[Some(Some(3)), Some(Some(3))]), Some(0));
     }
 
+    fn entry(name: &str, every: &str) -> serde_json::Value {
+        serde_json::json!({"feature": "f", "name": name, "mount": "/opt/x", "source": "${sharedVolumes}/x",
+            "command": ["/bin/up"], "every": every})
+    }
+
+    /// `label`: `None` for an image without one.
+    fn image(sandbox: &str, created: Option<u64>, label: Option<serde_json::Value>) -> (String, Facts) {
+        let labels = label.map(|l| (updates::LABEL.to_string(), l.to_string())).into_iter().collect();
+        (sandbox.to_string(), Facts { created, labels })
+    }
+
+    /// `built`: the sandboxes with an image; the rest of `all` have none.
+    fn seen(all: &[&str], built: Vec<(String, Facts)>) -> Vec<Image> {
+        let mut built: BTreeMap<String, Facts> = built.into_iter().collect();
+        let all: Vec<String> = all.iter().map(|s| s.to_string()).collect();
+        images(all.iter(), |s| built.remove(s))
+    }
+
     #[test]
-    fn declared_lists_each_update_with_its_sandboxes() {
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let cfg = std::env::temp_dir().join(format!("devsandbox-declared-{stamp}"));
-        let feature = cfg.join("features/upd");
-        std::fs::create_dir_all(&feature).unwrap();
-        std::fs::write(
-            feature.join("devcontainer-feature.json"),
-            r#"{"id": "upd",
-                "mounts": [{"type": "bind", "source": "${sharedVolumes}/upd-bin", "target": "/opt/upd", "readonly": true}],
-                "customizations": {"devsandbox": {"updates": [
-                    {"name": "upd", "mount": "/opt/upd", "command": ["/bin/up"], "every": "1d"}
-                ]}}}"#,
-        )
-        .unwrap();
-        let config = Config::parse(
-            "[sandbox.a]\nimage = \"x\"\nfeatures = { \"./features/upd\" = true }\n\
-             [sandbox.b]\nimage = \"x\"\nfeatures = { \"./features/upd\" = true }\n\
-             [sandbox.c]\nimage = \"x\"\n\
-             [sandbox.d]\nimage = \"x\"\nfeatures = { \"./features/missing\" = true }\n",
-        )
-        .unwrap();
-        let (found, skipped) = declared(&cfg, &config);
-        let _ = std::fs::remove_dir_all(&cfg);
-        assert_eq!(found.keys().collect::<Vec<_>>(), ["upd"]);
+    fn choice_goes_to_the_newest_image_labelled_with_it() {
+        let images = seen(
+            &["a", "b", "c", "d", "e", "f"],
+            vec![
+                image("a", Some(5), Some(serde_json::json!([entry("upd", "1d")]))),
+                image("b", Some(9), None),
+                image("c", Some(7), Some(serde_json::json!([entry("other", "1d"), entry("upd", "2d")]))),
+                image("d", Some(8), Some(serde_json::json!([entry("upd", "0d")]))),
+                image("e", Some(10), Some(serde_json::json!([]))),
+            ],
+        );
+        assert_eq!(images.iter().map(|i| i.sandbox.as_str()).collect::<Vec<_>>(), ["a", "b", "c", "d", "e"]);
+        assert!(images[3].baked.is_err());
+        let (i, baked) = choose(&images, "upd").unwrap();
+        assert_eq!((images[i].sandbox.as_str(), baked.update.every.as_secs()), ("c", 2 * 86400));
+        assert_eq!(baked.source, "${sharedVolumes}/x");
+        assert!(choose(&images, "nope").is_none());
+    }
+
+    #[test]
+    fn refusal_names_a_rebuild_when_the_images_predate_the_update() {
+        let images = seen(&["a", "b", "c"], vec![image("a", None, None), image("b", None, Some(serde_json::json!([])))]);
+        let declaring = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            refusal("upd", &images, &[]),
+            "no sandbox of this config has a feature declaring update `upd`"
+        );
+        assert_eq!(
+            refusal("upd", &images, &declaring(&["c"])),
+            "update `upd`: no image of sandbox `c` is built yet; `devsandbox run <sandbox>` builds it"
+        );
+        assert_eq!(
+            refusal("upd", &images, &declaring(&["a", "c"])),
+            "update `upd`: the image of sandbox `a` was built without it; `devsandbox rebuild a` adds it"
+        );
+        assert_eq!(
+            refusal("upd", &images, &declaring(&["a", "b"])),
+            "update `upd`: the images of sandbox `a`, `b` were built without it; `devsandbox rebuild <sandbox>` adds it"
+        );
+    }
+
+    #[test]
+    fn declared_lists_each_labelled_update_with_its_sandboxes() {
+        let images = seen(
+            &["a", "b", "c", "d", "e"],
+            vec![
+                image("a", None, Some(serde_json::json!([entry("upd", "1d")]))),
+                image("b", None, Some(serde_json::json!([entry("upd", "3d"), entry("tool", "1h")]))),
+                image("c", None, None),
+                image("d", None, Some(serde_json::json!("not a list"))),
+            ],
+        );
+        let (found, skipped) = declared_in(images);
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["tool", "upd"]);
         assert_eq!(found["upd"].sandboxes, ["a", "b"]);
         assert_eq!(found["upd"].update.every, std::time::Duration::from_secs(86400));
+        assert_eq!(found["tool"].sandboxes, ["b"]);
+        // Unlabelled `c` and unbuilt `e` say nothing; only a bad label is reported.
         assert_eq!(skipped.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["d"]);
     }
 
     const CHILD_ROOT: &str = "DEVSANDBOX_UPDATE_TEST_ROOT";
 
-    /// The update runs from a sandbox's features image (alpine retagged as
-    /// one: no build), writes its dir under `shared-volumes/`, gets the
-    /// CLI's args, and its time lands in `State`. In a child with its own
+    /// The update runs what a sandbox's features image's label says (alpine
+    /// plus the label, not the feature's current command), writes its dir
+    /// under `shared-volumes/`, gets the CLI's args, and its time lands in
+    /// `State`; an image without the label is refused. In a child with its own
     /// `XDG_DATA_HOME`, so the state written is the test's.
     #[cfg(unix)]
     #[test_utils::docker_test]
@@ -324,7 +416,7 @@ mod tests {
             r#"{"id": "upd",
                 "mounts": [{"type": "bind", "source": "${sharedVolumes}/upd-bin", "target": "/opt/upd", "readonly": true}],
                 "customizations": {"devsandbox": {"updates": [
-                    {"name": "upd", "mount": "/opt/upd", "command": ["/bin/sh", "-c", "echo \"$@\" > /opt/upd/out", "upd"]}
+                    {"name": "upd", "mount": "/opt/upd", "command": ["/bin/false"]}
                 ]}}}"#,
         )
         .unwrap();
@@ -349,6 +441,29 @@ mod tests {
             let _ = crate::test_support::runtime_cmd().args(["rmi", &tag]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
+            let e = format!("{:#}", update(&cfg, "upd", &[]).unwrap_err());
+            assert!(e.contains("the image of sandbox `b` was built without it; `devsandbox rebuild b`"), "{e}");
+
+            let label = updates::to_label(&[Baked {
+                feature: "./features/upd".into(),
+                update: Update {
+                    name: "upd".into(),
+                    mount: "/opt/upd".into(),
+                    command: ["/bin/sh", "-c", "echo \"$@\" > /opt/upd/out", "upd"].map(String::from).into(),
+                    every: updates::DEFAULT_EVERY,
+                },
+                source: "${sharedVolumes}/upd-bin".into(),
+            }]);
+            let context = root.join("image");
+            std::fs::create_dir_all(&context).unwrap();
+            std::fs::write(context.join("Dockerfile"), "FROM alpine:3.20\n").unwrap();
+            let built = crate::test_support::runtime_cmd()
+                .args(["build", "-q", "-t", &tag, "--label", &format!("{}={label}", updates::LABEL)])
+                .arg(&context)
+                .output()
+                .unwrap();
+            assert!(built.status.success(), "build: {}", String::from_utf8_lossy(&built.stderr));
+
             update(&cfg, "upd", &["1.2.3".into(), "--pin".into()]).unwrap();
             let out = std::fs::read_to_string(cfg.join("shared-volumes/upd-bin/out")).unwrap();
             assert_eq!(out.trim(), "1.2.3 --pin");
