@@ -1,7 +1,13 @@
+> Archived 2026-11-22. Historical, may be wrong; do not use as a reference.
+> Current: [credentials/login.md](../../architecture/credentials/login.md),
+> [credentials/gh.md](../../architecture/credentials/gh.md),
+> [credentials CLI](../../reference/credentials-cli.md),
+> [ADR 0058](../../decisions/0058-a-broad-token-is-the-homes-opt-in.md)
+
 # GitHub login
 
 Status: agreed; building. Builds on
-[github-and-sentry-access](github-and-sentry-access.md) (the github claim,
+[github-and-sentry-access](../active/github-and-sentry-access.md) (the github claim,
 `devsandbox login`).
 
 ## Goal

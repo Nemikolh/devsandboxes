@@ -12,10 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **credentials**: GitHub login: a prefilled PAT page on paste, the
-  account checked at login, login pages in the profile's browser, and a
-  broad opt-in through gh's own device flow.
-  → [plan](plans/active/github-login.md)
+Nothing.
 
 ## Planned
 
