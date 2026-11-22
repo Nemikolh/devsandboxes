@@ -459,6 +459,8 @@ is frozen: no new work on it.
   `true`), no file binds (feature file mounts skipped, no ssh-agent mount
   fallback), CPU shows `-`. → [runtimes](architecture/runtimes.md);
   `AppleContainer::supports_*`
+- Apple `container`: `devsandbox update` is refused (no image dates to
+  pick the newest features image by). `commands::update::update`
 - GPUs: NVIDIA only, and every GPU (`--gpus all`, `--device
   nvidia.com/gpu=all`): no device selection, and `hostRequirements.gpu`'s
   `cores` / `memory` aren't enforced (warned). `GpuSupport::run_args`

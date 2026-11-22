@@ -73,4 +73,5 @@ User-facing docs live in `site/` (and the config reference in
 - **Reference**: [daemon API](reference/api.md),
   [`devsandbox inbox` CLI](reference/inbox-cli.md),
   [`devsandbox login` / `access` CLI](reference/credentials-cli.md),
+  [`devsandbox update` CLI](reference/update-cli.md),
   [Kubernetes concepts](reference/kubernetes.md)

@@ -154,7 +154,7 @@ pub(super) fn sandbox_image(project: &str, sandbox: &str) -> String {
 
 /// Tag of a sandbox's derived features image (scoped like [`sandbox_image`],
 /// whose doc has why no tag collides with it).
-pub(super) fn features_image(project: &str, sandbox: &str) -> String {
+pub(crate) fn features_image(project: &str, sandbox: &str) -> String {
     format!("{NAME_PREFIX}feat-{project}-{sandbox}")
 }
 
@@ -378,7 +378,7 @@ ENTRYPOINT {}\n",
 /// the feature is disabled (`= false`). `Options` tables reject array/table
 /// values with a clear error; scalars stringify (strings as-is, bools
 /// `true`/`false`, ints/floats via their `Display`).
-fn feature_option_values(opts: &FeatureOptions) -> Result<Option<BTreeMap<String, String>>> {
+pub(crate) fn feature_option_values(opts: &FeatureOptions) -> Result<Option<BTreeMap<String, String>>> {
     match opts {
         FeatureOptions::Enabled(false) => Ok(None),
         FeatureOptions::Enabled(true) => Ok(Some(BTreeMap::new())),

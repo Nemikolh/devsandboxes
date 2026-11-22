@@ -222,6 +222,11 @@ impl Backend for Dockerlike {
         Ok(Some(out).filter(|id| !id.is_empty()))
     }
 
+    fn image_created(&self, image: &str) -> Result<Option<u64>> {
+        let out = self.output_quiet(&["image", "inspect", "--format", "{{json .Created}}", image])?;
+        parse_created(&out)
+    }
+
     fn image_passwd(&self, image: &str) -> Result<Option<String>> {
         let args = passwd_argv(image);
         let out = std::process::Command::new(self.bin)
@@ -312,6 +317,13 @@ fn parse_network_subnets(json: &str) -> Result<Vec<String>> {
         out.extend(subnets.map(str::to_string));
     }
     Ok(out)
+}
+
+/// `{{json .Created}}`: a JSON RFC 3339 string on docker and podman alike.
+/// `None` for a date before the epoch (reproducible builds stamp year 1).
+fn parse_created(json: &str) -> Result<Option<u64>> {
+    let created: String = serde_json::from_str(json).context("unexpected `image inspect` created date")?;
+    Ok(crate::broker::lfs::parse_rfc3339(&created))
 }
 
 /// Where the canary's host dir is bound inside.
@@ -685,7 +697,17 @@ mod tests {
         let hex = id.strip_prefix("sha256:").unwrap_or(&id);
         assert!(hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
         assert!(crate::runtime::backend().image_id("devsandbox-no-such-image:never").is_err());
+        let created = crate::runtime::backend().image_created(image).unwrap().expect("a date");
+        assert!(created > 1_600_000_000, "{created}");
         Ok(())
+    }
+
+    #[test]
+    fn created_dates() {
+        assert_eq!(parse_created(r#""2024-02-29T12:00:00.123456789Z""#).unwrap(), Some(1_709_208_000));
+        assert_eq!(parse_created(r#""2024-02-29T14:00:00+02:00""#).unwrap(), Some(1_709_208_000));
+        assert_eq!(parse_created(r#""0001-01-01T00:00:00Z""#).unwrap(), None);
+        assert!(parse_created("null").is_err());
     }
 
     /// Runtime-gated: the canary agrees with the fast path (CI: rootful

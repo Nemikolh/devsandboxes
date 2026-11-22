@@ -95,6 +95,7 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::TrustOrigin { .. } => MachineUse::Refused("trust-origin"),
         // Runs here, against this host's placements: `fetch <machine>/<instance>`.
         Command::Fetch { .. } => MachineUse::Refused("fetch"),
+        Command::Update { .. } => MachineUse::Refused("update"),
         Command::Port { .. } if port_nameless(command) => MachineUse::Port,
         Command::Port { .. } => MachineUse::Named,
         Command::Serve { .. } => MachineUse::Refused("serve"),

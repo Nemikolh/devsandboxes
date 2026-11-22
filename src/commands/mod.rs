@@ -32,6 +32,7 @@ pub mod subnet;
 pub mod trust_origin;
 #[cfg(unix)]
 pub mod tunnel;
+pub mod update;
 pub mod vscode;
 
 use std::io::{IsTerminal, Write};

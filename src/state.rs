@@ -459,6 +459,10 @@ pub struct State {
     /// name never matches it (docs/architecture/credentials/fence.md#ids).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub github_ids: BTreeMap<String, GithubPin>,
+    /// Project id (`services::project_id`) -> feature update name -> unix
+    /// time of its last successful run (`commands::update`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub updates: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 /// One [`State::github_ids`] pin.

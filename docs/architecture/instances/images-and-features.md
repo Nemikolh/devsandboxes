@@ -131,9 +131,30 @@ Order (install order) and the lack of arguments are the same.
   `command[0]` an absolute path. `every` is `<n>h`, `<n>d` or `<n>w`
   (`updates::parse_duration`), default `7d` (`updates::DEFAULT_EVERY`).
   Unknown fields, a bad entry or a name declared twice fail the feature's
-  parse.
+  parse. [Running an update](#running-an-update) below.
 
 Other metadata (`capAdd`, `init`, `dependsOn`, …) is not applied.
+
+## Running an update
+
+`devsandbox update <name> [args…]` (`commands::update`,
+[reference](../../reference/update-cli.md)) runs a declared update now.
+The command is the feature's own code and runs where its `install.sh`
+ran, in a container from a features image built with it, never on the
+host: the newest such image among the config's sandboxes using the
+feature (`features_image`, `Backend::image_created`). None built is
+refused, naming `devsandbox run`.
+
+The container is thrown away (`--rm`), never pulled, on the default
+network, under the sandbox's identity plan (`plan_for`, `create_args`),
+with the update's dir, the source of the feature's mount at `mount`
+(created under `shared-volumes/` like a feature mount's), as its only
+bind, read-write. Every sandbox mounts that dir read-only, so only the
+update can change what they run. `command[0]` replaces the image's
+entrypoint; `command[1..]` and the CLI's args follow the image. The argv
+passes `run`'s guards (`key_guard::check_argv`, `binds::check_argv`,
+`worker_policy::enforce_argv`). A successful run's time is
+`State.updates[<project id>][<name>]`.
 
 ## Credential claims
 

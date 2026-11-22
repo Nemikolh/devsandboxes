@@ -242,6 +242,10 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
      services) for scripts.
    - **`inbox ls|show|reply|act|submit|done|reopen`** — Inbox threads
      (docs/reference/inbox-cli.md).
+   - **`update <name> [args…]`** — run a feature's update now (e.g. `gh`;
+     args go to its command, e.g. a version), in a throwaway container from
+     the newest sandbox image built with the feature
+     (docs/reference/update-cli.md).
    - **`fetch <machine>/<instance>`** — bring a placed instance's work back
      as hidden refs (`refs/devsandbox/<machine>/<instance>/…`).
    - **`serve [--keep-alive]`**, **`serve install|uninstall`**, **`api

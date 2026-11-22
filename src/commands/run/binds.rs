@@ -284,7 +284,7 @@ fn overlaps(e: &Entry, forms: &[PathBuf]) -> bool {
 
 /// [`Fence::check_argv`] over the current `state.toml`, before `argv` (the
 /// container of instance `instance_id` of the config at `dir`) runs.
-pub(super) fn check_argv(dir: &Path, argv: &[String], instance_id: &str) -> Result<()> {
+pub(crate) fn check_argv(dir: &Path, argv: &[String], instance_id: &str) -> Result<()> {
     Fence::for_run(dir, &State::load()?, instance_id).check_argv(argv)?;
     Ok(())
 }

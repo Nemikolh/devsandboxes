@@ -292,6 +292,23 @@ enum Command {
         #[arg(long, required = true)]
         json: bool,
     },
+    /// Run a feature's update now (e.g. a tool's new release into the dir its
+    /// sandboxes mount read-only)
+    ///
+    /// The update's command, baked in the feature, runs in a throwaway
+    /// container from the newest features image among this config's sandboxes
+    /// using the feature, with the update's dir as its only bind. Arguments
+    /// after the name go to the command (a version, to pin or roll back).
+    ///
+    ///     devsandbox update gh
+    ///     devsandbox update gh 2.60.0
+    Update {
+        /// The update's name, as its feature declares it
+        name: String,
+        /// Arguments for the update's command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run a command in a sandbox instance (a login shell when none is given)
     ///
     /// With a TTY, on an instance with the devsbd helper, the command runs in
@@ -1118,6 +1135,7 @@ fn main() -> Result<()> {
         }
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
+        Command::Update { name, args } => commands::update::update(&cli.dir, &name, &args),
         Command::Exec { interactive, tty, attach, sessions, end, session, service, reserve_255, name, command } => {
             use commands::exec::Exec;
             let what = match (&attach, sessions, &end, &service) {

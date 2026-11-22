@@ -58,6 +58,13 @@ use worktree::{
     copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files, lock_worktree, worker_skip_warning,
 };
 pub(crate) use worktree::{instance_at, lock_instance_worktrees, parse_worktree_list, unlock_worktree};
+// `update`'s throwaway container: a sandbox image's identity plan, its
+// feature mount's source, and `run_container`'s argv guards.
+pub(crate) use binds::check_argv as check_bind_argv;
+pub(crate) use facts::{accounts, image_facts};
+pub(crate) use identity::{create_args, plan_for};
+pub(crate) use image::{feature_option_values, features_image};
+pub(crate) use mounts::{creatable_feature_source, guard_create, provision_bind_source};
 
 /// Branch pattern for worktree instances when neither `--branch` nor the
 /// sandbox's `worktree-branch` is set. Also the TUI prompt's completion base

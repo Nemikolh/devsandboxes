@@ -453,7 +453,7 @@ pub(super) fn feature_mount_decision(
 /// the bind check on the final argv comes after the create, and a container
 /// that can write `shared-volumes/` could plant a symlink there pointing at
 /// any host dir.
-pub(super) fn guard_create(policy: Option<&Policy>, path: &Path) -> Result<()> {
+pub(crate) fn guard_create(policy: Option<&Policy>, path: &Path) -> Result<()> {
     if let Some(policy) = policy {
         policy.check_path(path, "host path to create")?;
     }
@@ -463,7 +463,7 @@ pub(super) fn guard_create(policy: Option<&Policy>, path: &Path) -> Result<()> {
 /// Whether a feature mount's missing bind source may be created: only inside
 /// `shared_volumes` (no `..` hop out of it), so a feature can't make devsandbox
 /// create arbitrary host paths.
-pub(super) fn creatable_feature_source(kind: &str, source: &str, shared_volumes: &str) -> bool {
+pub(crate) fn creatable_feature_source(kind: &str, source: &str, shared_volumes: &str) -> bool {
     let source = Path::new(source);
     kind == "bind"
         && !source.components().any(|c| c == std::path::Component::ParentDir)
@@ -473,7 +473,7 @@ pub(super) fn creatable_feature_source(kind: &str, source: &str, shared_volumes:
 
 /// [`ensure_bind_source`], and the canonical path of what it created when
 /// that is the instance's own to delete at `rm` ([`records_bind_dir`]).
-pub(super) fn provision_bind_source(source: &str, instance_source: bool) -> Result<Option<PathBuf>> {
+pub(crate) fn provision_bind_source(source: &str, instance_source: bool) -> Result<Option<PathBuf>> {
     let created = ensure_bind_source(Path::new(source))?;
     if !records_bind_dir(source, instance_source, created) {
         return Ok(None);

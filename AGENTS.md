@@ -21,6 +21,8 @@ Start with `docs/README.md` (reading order and map) and
   `profile`, `vscode`, `fetch`, `login`, `access` (`access approve`;
   docs/reference/credentials-cli.md),
   `inbox`, `logs`, `inspect`, `stats`, `status`, `port`, `machine`,
+  `update` (a feature's update run now from the newest features image;
+  docs/reference/update-cli.md),
   `fleet_link` (hidden `fleet-link`), `services::{gc,ls,rebuild}`); not
   verbs: `subnet.rs` (service-network subnet checks) and `tunnel.rs`
   (remote bridges' `TUNNEL` opener). Shared name

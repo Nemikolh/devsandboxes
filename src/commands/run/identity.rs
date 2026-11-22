@@ -32,7 +32,7 @@ use super::IDENTITY_LABEL;
 /// Also the seccomp profile's path when [`wants_seccomp`] (`plan.seccomp`
 /// says it's there); a profile that can't be written is a warning and no
 /// profile.
-pub(super) fn plan_for(
+pub(crate) fn plan_for(
     image: &str,
     accounts: Accounts,
     props: &SandboxProperties,
@@ -117,7 +117,7 @@ fn decide_plan(
 /// `mounts` as `--mount`, relabeled when SELinux asks for it (`plan.relabel`): `-v` binds get `z`; a `--mount`
 /// bind gets `relabel=shared` on podman, while docker's `--mount` has no
 /// relabel option, so its binds are named in the returned warning instead.
-pub(super) fn create_args(
+pub(crate) fn create_args(
     plan: &Plan,
     podman: bool,
     seccomp: Option<&Path>,

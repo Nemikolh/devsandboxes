@@ -23,7 +23,7 @@ const SHARED_VOLUMES: &str = "${sharedVolumes}/";
 
 /// One declared update, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // read once updates run
+#[allow(dead_code)] // `every` read once the daemon schedules updates
 pub struct Update {
     pub name: String,
     /// The target of the feature's `${sharedVolumes}` bind the command writes.
@@ -172,7 +172,6 @@ fn check_mount(target: &str, mounts: &[Mount]) -> Result<()> {
 
 /// Update names are one namespace across a sandbox's features (the config
 /// and the CLI name an update alone): refuse a name two features declare.
-#[allow(dead_code)] // called where a sandbox's resolved features meet
 pub fn check_unique(features: &[(&str, &[Update])]) -> Result<()> {
     let mut seen: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
     for (feature, updates) in features {

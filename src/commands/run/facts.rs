@@ -12,7 +12,7 @@ use crate::state::{ImageFacts, Instance, State};
 /// The facts of `image` (built or pulled, local): the cache's when its id is
 /// there, else read now and cached. Never fails: an unreadable fact reads
 /// as unset and isn't cached (the next run tries again).
-pub(super) fn image_facts(image: &str) -> ImageFacts {
+pub(crate) fn image_facts(image: &str) -> ImageFacts {
     let b = backend();
     let id = b.image_id(image).ok().flatten();
     let cached = |id: &str| State::load().ok().and_then(|s| s.image_facts.get(id).cloned());
@@ -59,7 +59,7 @@ fn decide(
 /// and the adopted account's ids when the image's passwd has it.
 /// `image_user` only counts for `identity = "host"` when the config names
 /// no user (else the plan never adopts it); [`home`] reads it either way.
-pub(super) fn accounts<'a>(props: &'a SandboxProperties, facts: &'a ImageFacts) -> Accounts<'a> {
+pub(crate) fn accounts<'a>(props: &'a SandboxProperties, facts: &'a ImageFacts) -> Accounts<'a> {
     let image_user =
         (props.identity() == Identity::Host && props.container_user.is_none() && props.remote_user.is_none())
             .then_some(facts.user.as_deref())

@@ -360,6 +360,10 @@ pub trait Backend: Send + Sync {
     /// keyed by; `None` on a runtime with nothing cheap to key by.
     fn image_id(&self, image: &str) -> Result<Option<String>>;
 
+    /// When the local image was built, in unix seconds; `None` on a runtime
+    /// that doesn't say.
+    fn image_created(&self, image: &str) -> Result<Option<u64>>;
+
     /// The local image's `/etc/passwd`, read from a throwaway container
     /// (never pulled, no network, entrypoint replaced by `sh`). `None` when
     /// the image has no `sh` (or `cat`), or the runtime can't run one
