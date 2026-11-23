@@ -1,7 +1,6 @@
 # GitHub and Sentry access
 
-Status: agreed; building steps 1-2, steps 3-4 after credential-broker's
-fleet steps. Needs [credential-broker](credential-broker.md)
+Status: agreed; steps 1-2 built, building step 2b, steps 3-4 parked. Needs [credential-broker](credential-broker.md)
 step 1 for sentry (step 1 here), its step 3 for gh (step 2 here), its
 step 4 for `ask` scopes (which answer 403 with the reason until
 then), its step 5 for remote sandboxes; its git half needs
@@ -380,8 +379,8 @@ only a note when the repo is public (a reference clone in `folders`).
 - **Credential**: a user auth token (`sntryu_…`, pasted) or the CLI's
   OAuth device flow (its public client id); `check` is `GET
   /api/0/users/me/`, showing the account's email. Either spans every org
-  the account is in, so a sandbox granted a scope holds it in each of
-  them (open questions). `never` lists deleting an org, project, team or
+  the account is in; the org fence (*Sentry's org fence*) narrows it.
+  `never` lists deleting an org, project, team or
   integration, the routes that mint a credential (org auth tokens,
   `api-tokens`, `sentry-apps/{slug}/api-tokens/`, project client keys,
   `agent-handoff`) and product-trial changes, checked by the same test as
@@ -442,6 +441,43 @@ keeps base-URL mode and `rewrite` covered.
   only ever holds `org:ci` (releases, source maps, code mappings): enough
   for uploads, 403 on issues and on the `GET /api/0/organizations/{org}/`
   lookup. A user token spans orgs.
+
+### Sentry's org fence
+
+A claim's `orgs` field fences one path variable, the account's
+organization, as data any tool's claim can use:
+
+```json
+"orgs": {
+  "var": "{org}",
+  "resolve": "GET /api/0/organizations/{org}/",
+  "id": "id",
+  "lists": { "GET /api/0/organizations/": ["slug", "id"] }
+}
+```
+
+- **The set**: the credential's `orgs` in `credentials.toml` (`login
+  --org`, else edited by hand, as the rest of the grant), narrowed by a
+  config's `access.<kind>.orgs`; the home bounds it, so it holds for
+  remote instances once they're brokered. A credential with no `orgs`
+  refuses every route holding the variable, naming the field.
+- **Matching**: every scoped route holding `var` is fenced. Its value
+  matches an allowed slug case-insensitively, or the numeric id of one:
+  the `sentry` CLI names an org by id from a DSN. The home learns each
+  slug's id from `resolve` with the credential, cached per credential,
+  never pinned (Sentry slugs need an org admin to change, and a renamed
+  org is fixed by editing its slug).
+- **Outside the set** a call is refused, reads included: Sentry has no
+  anonymous reads to fall back to.
+- **Lists**: a `lists` route's JSON array answer keeps only the elements
+  whose named fields hold an allowed slug or id, so a command naming no
+  org (the CLI's fallback lists the account's orgs) sees only the fence.
+  An answer past the rewrite bound is refused, not passed.
+- **Org-less routes** stay unfenced, so the claim lists only those that
+  hold no org's data: `GET /api/0/projects/` (every org's projects) and
+  the `sentry-app-installations/{uuid}` routes leave the scope table.
+- No `SENTRY_ORG` is set for the sandbox: it names its org as it would
+  anywhere.
 
 ## Ideas weighed
 
@@ -513,6 +549,11 @@ keeps base-URL mode and `rewrite` covered.
    each a [status](../../status.md#credentials) limitation: multi-segment route
    variables (paths are listed per depth), Projects, discussion
    comments by id, and `gh repo fork` (REST body inputs).
+2b. Sentry's org fence (*Sentry's org fence*): the claim's `orgs`
+   field, the credential's and config's `orgs`; the broker's check and
+   list filter; `login --org` and `access ls`; `features/sentry` 1.3.0
+   with the field, its org-less cross-org routes dropped, checked end to
+   end.
 3. Parked: most users work in orgs where they can't install an app
    ([status](../../status.md#parked)). `devsandbox login github --app`
    (manifest and install), installation tokens per instance and
@@ -538,11 +579,6 @@ keeps base-URL mode and `rewrite` covered.
   commands would then stay inside the fence, but an outside query can't
   go anonymous (no anonymous GraphQL), so it would be denied: `gh repo
   view` of a public repo out of the fence fails.
-- Sentry's org fence: the `sentry` claim's tokens span the account's
-  orgs and its `{org}` routes take any of them. Fence `{org}` against
-  the orgs a sandbox's config names (`access.sentry.orgs`), as the
-  GitHub fence does repos, and the org-less listings to them; or take an
-  org-bound internal-integration token, which needs an org admin?
 - GitHub Enterprise and self-hosted Sentry: hosts no feature knows, and
   a config can't add upstreams. A home-side `upstreams` override in
   `credentials.toml`, one credential per host?
