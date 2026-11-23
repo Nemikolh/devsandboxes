@@ -66,7 +66,8 @@ official devcontainers CLI.
    `updates::to_label`) lists every enabled feature's
    [updates](#running-an-update) as `{ "feature", "name", "mount",
    "source", "command", "every" }`, `source` the feature mount's source
-   unresolved (`${sharedVolumes}/…`), `every` in hours, sorted by name; it's
+   unresolved (`${sharedVolumes}/…`), `every` in hours, sorted by name,
+   every `$` written `\u0024` (podman expands `$…` in a label value); it's
    set (to `[]` when none) on every features build, so a base image's own
    label never shows through. It's what the image's updaters are, whatever
    the feature declares since.

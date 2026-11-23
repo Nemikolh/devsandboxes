@@ -243,7 +243,9 @@ pub fn to_label(baked: &[Baked]) -> String {
         })
         .collect();
     entries.sort_by(|a, b| (&a.name, &a.feature).cmp(&(&b.name, &b.feature)));
-    serde_json::to_string(&entries).expect("strings serialize")
+    // Podman expands `$…` in a `--label` value; a `$` only occurs inside
+    // JSON strings, where `\u0024` reads back as the same `$`.
+    serde_json::to_string(&entries).expect("strings serialize").replace('$', "\\u0024")
 }
 
 /// [`LABEL`]'s value, checked like a feature's declaration: an image's label
@@ -425,8 +427,9 @@ mod tests {
         let baked = baked("ghcr.io/x/gh:1", &updates, &mounts());
         assert_eq!(baked.iter().map(|b| b.source.as_str()).collect::<Vec<_>>(), ["${sharedVolumes}/tool", "${sharedVolumes}/gh-bin"]);
         let label = to_label(&baked);
+        assert!(!label.contains('$'), "{label}");
         // Sorted by name, whatever the declaration order.
-        assert!(label.starts_with(r#"[{"feature":"ghcr.io/x/gh:1","name":"gh","mount":"/var/lib/gh/bin","source":"${sharedVolumes}/gh-bin","#), "{label}");
+        assert!(label.starts_with(r#"[{"feature":"ghcr.io/x/gh:1","name":"gh","mount":"/var/lib/gh/bin","source":"\u0024{sharedVolumes}/gh-bin","#), "{label}");
         let mut back = from_label(&label).unwrap();
         back.sort_by(|a, b| b.update.name.cmp(&a.update.name));
         assert_eq!(back, baked);
