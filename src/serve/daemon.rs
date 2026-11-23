@@ -526,6 +526,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let _ = shared.open_here.set(Arc::clone(&open_here));
     let host = opts.host.then(|| {
         let shared = Arc::clone(&shared);
+        let asks = Arc::clone(&shared.asks);
         // Configured `forwardPorts` follow the running containers.
         let sync = registry.as_ref().map(Registry::handle);
         let observers = {
@@ -571,6 +572,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 }
             }),
             observers,
+            asks,
         )
     });
     if let Some(host) = &host {
@@ -906,6 +908,8 @@ struct Shared {
     /// Why the last [`Shared::pin_now`] didn't pin this build
     /// (`machines::changes::pin_skipped`): `member.get`'s `pin_skipped`.
     pin_skipped: Mutex<Option<String>>,
+    /// The broker's permission requests: its held calls wait on them.
+    asks: Arc<crate::broker::asks::Registry>,
 }
 
 /// Why [`Shared::pin_build`] runs: the daemon's start (`None`), or a link
@@ -961,6 +965,7 @@ impl Shared {
             told_not_authority: Mutex::default(),
             pin: OnceLock::new(),
             pin_skipped: Mutex::default(),
+            asks: Arc::default(),
         }
     }
 

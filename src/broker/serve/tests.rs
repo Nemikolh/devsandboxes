@@ -459,15 +459,17 @@ fn location_points_back_at_the_loopback() {
 fn refusals_take_the_claims_shape_and_never_reach_upstream() {
     let (port, seen) = upstream_server(echo);
     let rig = Rig::new("refuse", port);
+    rig.config("[sandbox.web]\nfolder = \".\"\n[sandbox.web.access.sentry]\nscopes = [\"org.read\"]\n");
     let mut c = rig.connect("sentry.io");
-    let a = c.call("GET", "/api/0/unknown/", &bearer(OWN), b"");
+    let a = c.call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
     assert_eq!(a.status, 403, "{a:?}");
     assert!(!a.head.to_ascii_lowercase().contains("www-authenticate"));
     let v = a.json();
-    assert!(v["detail"].as_str().unwrap().contains("permission requests: not supported yet!"), "{v}");
+    assert!(v["detail"].as_str().unwrap().contains("isn't in `access.sentry.scopes`"), "{v}");
     assert_eq!(v["devsandbox"]["verdict"], "refused");
-    assert_eq!(v["devsandbox"]["scope"], "other");
+    assert_eq!(v["devsandbox"]["scope"], "issues.read");
     assert_eq!(v["devsandbox"]["credential"], "sentry-work");
+    assert_eq!(v["devsandbox"]["request"], Value::Null);
     // A refusal with no body keeps the connection.
     let a = c.call("GET", "/api/0/organizations/acme/../x/", "", b"");
     assert_eq!(a.status, 400);
@@ -500,6 +502,100 @@ fn refusals_take_the_claims_shape_and_never_reach_upstream() {
     let verdicts: Vec<String> = rig.log(6).iter().map(|l| l["verdict"].as_str().unwrap().to_string()).collect();
     assert_eq!(verdicts, ["refused", "refused", "refused", "leak", "refused", "refused"]);
     assert_eq!(rig.log(6)[3]["phantom"], "foreign");
+}
+
+/// [`Rig::new`] with the claim's `hold` at `secs` and `issues.read` asked.
+fn asking(tag: &str, port: u16, secs: u32) -> Rig {
+    let mut claim = private(sentry());
+    claim.pinned.hold = Some(secs);
+    let rig = Rig::with(tag, port, state_with(claim.clone()), home_with(&claim), "sentry-work", &claim);
+    rig.config("[sandbox.web]\nfolder = \".\"\n[sandbox.web.access.sentry]\nask = [\"issues.read\"]\n");
+    rig
+}
+
+/// The first listed request, once there is one.
+fn first_pending(asks: &asks::Registry) -> asks::Request {
+    for _ in 0..500 {
+        if let Some(r) = asks.pending().into_iter().next() {
+            return r;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("no request was raised");
+}
+
+#[test]
+fn a_held_call_goes_upstream_once_approved_and_a_denied_one_is_refused() {
+    let (port, seen) = upstream_server(echo);
+    let rig = asking("ask-once", port, 30);
+    let service = rig.service.clone();
+    let approver = thread::spawn(move || {
+        let first = first_pending(service.asks());
+        assert_eq!((first.key.scope.as_str(), first.key.credential.as_str(), first.key.repo.as_deref()), ("issues.read", "sentry-work", None));
+        assert_eq!((first.instance.as_str(), first.method.as_str(), first.route.as_str()), ("web-1", "GET", "/api/0/issues/1/"));
+        service.asks().answer(&first.id, asks::Answer::Once).unwrap();
+        let second = first_pending(service.asks());
+        service.asks().answer(&second.id, asks::Answer::Deny).unwrap();
+        (first.id, second.id)
+    });
+    let mut c = rig.connect("sentry.io");
+    let a = c.call("GET", "/api/0/issues/1/?x=1", &bearer(OWN), b"");
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(seen.lock().unwrap()[0].0.contains(&format!("\r\nAuthorization: Bearer {TOKEN}\r\n")));
+    // One answer, one call: the next is held again.
+    let a = c.call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
+    let (once, denied) = approver.join().unwrap();
+    assert_ne!(once, denied);
+    assert_eq!(a.status, 403, "{a:?}");
+    let v = a.json();
+    assert_eq!(v["detail"], "devsandbox: denied by the user");
+    assert_eq!((v["devsandbox"]["verdict"].as_str(), v["devsandbox"]["request"].as_str()), (Some("denied"), Some(denied.as_str())));
+    assert_eq!(v["devsandbox"]["scope"], "issues.read");
+    assert_eq!(seen.lock().unwrap().len(), 1, "a denied call isn't dialed");
+
+    let log = rig.log(2);
+    assert_eq!((log[0]["verdict"].as_str(), log[0]["decided"].as_str()), (Some("allow"), Some("once")));
+    assert_eq!(log[0]["request"].as_str(), Some(once.as_str()));
+    assert_eq!((log[1]["verdict"].as_str(), log[1]["decided"].as_str()), (Some("denied"), Some("deny")));
+    assert_eq!(log[1]["request"].as_str(), Some(denied.as_str()));
+    // A call never held has neither.
+    c.call("GET", "/api/0/", &bearer(OWN), b"");
+    let log = rig.log(3);
+    assert!(log[2].get("request").is_none() && log[2].get("decided").is_none(), "{}", log[2]);
+}
+
+#[test]
+fn an_unanswered_hold_is_pending_and_a_late_answer_grants_the_next_call() {
+    let (port, seen) = upstream_server(echo);
+    let rig = asking("ask-timeout", port, 1);
+    let mut c = rig.connect("sentry.io");
+    let started = std::time::Instant::now();
+    let a = c.call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(a.status, 403, "{a:?}");
+    let v = a.json();
+    let id = v["devsandbox"]["request"].as_str().unwrap().to_string();
+    assert!(id.starts_with("R-"), "{v}");
+    assert_eq!(v["devsandbox"]["verdict"], "pending");
+    assert_eq!(v["devsandbox"]["do"], format!("devsandbox access approve {id}"));
+    assert_eq!(
+        v["detail"],
+        format!("devsandbox: scope `issues.read` of credential `sentry-work` needs permission: request {id} is pending (devsandbox access approve {id})")
+    );
+    let log = rig.log(1);
+    assert_eq!((log[0]["verdict"].as_str(), log[0]["decided"].as_str()), (Some("pending"), Some("timeout")));
+    assert_eq!(log[0]["request"].as_str(), Some(id.as_str()));
+    assert!(seen.lock().unwrap().is_empty());
+
+    // Answered after the hold: the instance's next matching call goes
+    // through at once, on the same connection.
+    rig.service.asks().answer(&id, asks::Answer::Once).unwrap();
+    let started = std::time::Instant::now();
+    let a = c.call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
 #[test]

@@ -483,10 +483,12 @@ take the file past 10 MiB. Never a token or a phantom.
 | `incarnation` | the instance's, when its record has one |
 | `kind`, `credential`, `scope` | as far as policy got (`null` before) |
 | `method`, `route` | the request's, the path before injection, query dropped; empty for an intercepted connection closed before any request |
-| `verdict` | `allow` (injected), `uninjected`, `outside` (sent stripped, outside the repo fence), `refused`, `leak`, `error` |
+| `verdict` | `allow` (injected), `uninjected`, `outside` (sent stripped, outside the repo fence), `refused`, `pending` (held, unanswered, or past the instance's cap of open requests), `denied`, `leak`, `error` |
 | `reason` | a refusal's or failure's one line; a skipped `rewrite` |
 | `status` | what the tool got (the upstream's, or the broker's own); `0` when an intercepted connection was closed unanswered (not intercepted, no TLS, a failed handshake) |
 | `phantom` | whose phantom the call carried: `own`, `other-claim`, `foreign`; `null` for none |
 | `refreshed` | `true` when the call renewed the credential's token; absent otherwise |
+| `request` | the permission request (`R-…`) the call was held on, or the one a refusal past the cap names; absent otherwise |
+| `decided` | how the call's last hold ended: `once`, `deny`, `timeout`; absent for a call never held |
 
 How calls are decided: [broker](../architecture/credentials/broker.md).

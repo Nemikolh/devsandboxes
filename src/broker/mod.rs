@@ -17,10 +17,11 @@
 //!   upstream URLs turned into loopback ones, the broker's own answers.
 //! - [`lfs`]: LFS batch responses' transfers behind handles on the
 //!   instance's LFS listener.
-//! - [`policy`], [`github`], [`orgs`], [`audit`], [`intercept`], [`serve`]
-//!   (unix, with `serve`): the decision per call, the repo fence resolved
-//!   to GitHub's ids, org slugs resolved to their ids, `access.log`,
-//!   intercept mode's TLS, and the
+//! - [`policy`], [`github`], [`orgs`], [`asks`], [`audit`], [`intercept`],
+//!   [`serve`] (unix, with `serve`): the decision per call, the repo fence
+//!   resolved to GitHub's ids, org slugs resolved to their ids, the
+//!   permission requests held calls wait on, `access.log`, intercept
+//!   mode's TLS, and the
 //!   [`Broker`](crate::devsbd::bridge::Broker) the daemon's bridges hand
 //!   connections to.
 //!
@@ -31,7 +32,11 @@
 
 // Off unix nothing serves the broker.
 #![cfg_attr(not(unix), allow(dead_code))]
+// A `Refusal` is the slow path's value; boxing it would touch every `?`.
+#![allow(clippy::result_large_err)]
 
+#[cfg(unix)]
+pub mod asks;
 #[cfg(unix)]
 pub mod audit;
 pub mod body;

@@ -2,8 +2,9 @@
 //! bridges hand every `HTTP_PROXY` connection to
 //! (docs/architecture/credentials/broker.md). Per connection it reads
 //! requests until either side closes; per request it refuses browsers and a
-//! foreign `Host`, decides ([`policy::decide`]), then answers the refusal or
-//! makes the call: one upstream connection per request, the body streamed
+//! foreign `Host`, decides ([`policy::decide`]; an ask holds the call for its
+//! permission request, [`asks`], then decides again), then answers the
+//! refusal or makes the call: one upstream connection per request, the body streamed
 //! both ways, the injected value redacted on the way back, `Location` and the
 //! claim's `rewrite` fields pointed at the loopback (base-URL mode only). An
 //! intercepted connection is admitted before its TLS, then served the same
@@ -36,6 +37,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context as _, Result, bail};
 use rustls::{ServerConnection, StreamOwned};
 
+use super::asks::{self, Ask, AskKey, Grants, Registry};
 use super::audit::{Audit, Line};
 use super::body::{BodyReader, ChunkedWriter};
 use super::head::{self, Framing, Header, RequestHead, Version};
@@ -98,6 +100,8 @@ pub struct Service {
     notices: Mutex<Notices>,
     /// Shows a notice's text: the desktop's notifier, a test's sink.
     notify: Box<dyn Fn(&str) + Send + Sync>,
+    /// The permission requests held calls wait on: the daemon's one.
+    asks: Arc<Registry>,
 }
 
 /// A connection's bytes: the bridge's stream, or the TLS over it.
@@ -175,17 +179,24 @@ impl Service {
                 };
                 crate::devsbd::desktop::notify_desktop("credentials", &popup);
             }),
+            asks: Arc::default(),
         })
     }
 
-    /// The user's `state.toml` and the host's TLS roots and proxy env.
-    pub fn from_host(log: fn(&str)) -> Result<Service> {
+    /// The user's `state.toml` and the host's TLS roots and proxy env;
+    /// held calls wait on `asks`.
+    pub fn from_host(log: fn(&str), asks: Arc<Registry>) -> Result<Service> {
         let upstream = Upstream::from_host().map_err(|e| {
             let why = format!("{e:#}");
             log(&format!("broker: {why}: brokered calls answer 502"));
             why
         });
-        Ok(Service { log, ..Service::new(State::path()?, upstream)? })
+        Ok(Service { log, asks, ..Service::new(State::path()?, upstream)? })
+    }
+
+    #[cfg(test)]
+    pub fn asks(&self) -> &Arc<Registry> {
+        &self.asks
     }
 
     #[cfg(test)]
@@ -384,7 +395,25 @@ impl Service {
         });
         let org_https = self.upstream.as_ref().ok().map(|upstream| self.org_https(upstream, &token));
         let org_live = org_https.as_ref().map(|t| orgs::Live { cache: &self.orgs, transport: t, now: Instance::now() });
-        let outcome = policy::decide(&call, &state, &Files { data: &self.data, github: live, orgs: org_live });
+        let grants = Grants::new(&self.asks);
+        let files = Files { data: &self.data, github: live, orgs: org_live, grants: &grants };
+        let mut outcome = policy::decide(&call, &state, &files);
+        // Decided again after an answer: the call's held body (`call`
+        // borrows it) is reused, and `state.toml` reread, as minutes may
+        // have passed.
+        while let Action::Ask(ask) = &outcome.action {
+            let ask = ask.clone();
+            let held = self.hold(&ask, &mut line).and_then(|()| {
+                State::load_at(&self.state).map_err(|e| Refusal::new(503, "error", format!("{e:#}")))
+            });
+            outcome = match held {
+                Ok(state) => {
+                    grants.allow(ask.key);
+                    policy::decide(&call, &state, &files)
+                }
+                Err(r) => policy::Outcome { action: Action::Refuse(r), context: outcome.context },
+            };
+        }
         let pre = batch.map(|(body, _)| body).or(gql.map(|(body, _)| body));
         let cx = outcome.context;
         line.incarnation = cx.incarnation.clone();
@@ -424,6 +453,7 @@ impl Service {
                 line.verdict = "outside".into();
                 self.forward(&head, header, Via::Stripped(&slot, private), &cx, pre, conn, &mut line)
             }
+            Action::Ask(_) => unreachable!("a held call is decided again until it isn't an ask"),
             Action::Inject(inj) => {
                 let now = Instance::now();
                 match self.renewer.token(&inj.credential, now, &self.refresher(now)) {
@@ -439,6 +469,27 @@ impl Service {
                     }
                 }
             }
+        }
+    }
+
+    /// Holds the call on `ask`'s request until it's answered: `Ok` for a
+    /// `once`, else the refusal. `line` gets the request and how it ended.
+    fn hold(&self, ask: &Ask, line: &mut Line) -> Result<(), Refusal> {
+        let named = |r: Refusal| Refusal { credential: Some(ask.key.credential.clone()), scope: Some(ask.key.scope.clone()), ..r };
+        let ticket = self.asks.ask(ask).map_err(|r| {
+            line.request = r.request.clone();
+            named(r)
+        })?;
+        let id = ticket.id().to_string();
+        line.request = Some(id.clone());
+        let answer = self.asks.wait(ticket);
+        line.decided = Some(answer.map_or("timeout", asks::Answer::marker));
+        match answer {
+            Some(asks::Answer::Once) => Ok(()),
+            Some(asks::Answer::Deny) => {
+                Err(named(Refusal { request: Some(id), ..Refusal::new(403, "denied", "denied by the user") }))
+            }
+            None => Err(named(asks::pending(&id, waiting(&id, &ask.key)))),
         }
     }
 
@@ -1351,6 +1402,7 @@ struct Files<'a> {
     data: &'a Path,
     github: Option<github::Live<'a>>,
     orgs: Option<orgs::Live<'a>>,
+    grants: &'a Grants<'a>,
 }
 
 impl Sources for Files<'_> {
@@ -1373,6 +1425,16 @@ impl Sources for Files<'_> {
     fn orgs(&self) -> Option<&dyn orgs::Lookup> {
         self.orgs.as_ref().map(|l| l as &dyn orgs::Lookup)
     }
+
+    fn granted(&self, key: &AskKey) -> bool {
+        self.grants.granted(key)
+    }
+}
+
+/// A held call's reason once its hold ended unanswered.
+fn waiting(id: &str, key: &AskKey) -> String {
+    let on = key.repo.as_ref().map(|r| format!(" on `{r}`")).unwrap_or_default();
+    format!("scope `{}`{on} of credential `{}` needs permission: request {id} is pending", key.scope, key.credential)
 }
 
 #[cfg(test)]

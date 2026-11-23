@@ -167,6 +167,35 @@ fn injected(o: &Outcome) -> &Injection {
     }
 }
 
+/// The ask `o` holds for, its key's scope and repo checked.
+fn asked<'a>(o: &'a Outcome, scope: &str, repo: Option<&str>) -> &'a Ask {
+    match &o.action {
+        Action::Ask(a) => {
+            assert_eq!((a.key.scope.as_str(), a.key.repo.as_deref()), (scope, repo), "{a:?}");
+            a
+        }
+        other => panic!("want an ask, got {other:?}"),
+    }
+}
+
+/// `src` with the asks in `keys` answered.
+struct Granted<'a>(&'a dyn Sources, Vec<AskKey>);
+
+impl Sources for Granted<'_> {
+    fn home(&self) -> Result<Home> {
+        self.0.home()
+    }
+    fn access(&self, inst: &Instance, kind: &str) -> Result<Option<Access>> {
+        self.0.access(inst, kind)
+    }
+    fn github(&self) -> Option<&dyn github::Lookup> {
+        self.0.github()
+    }
+    fn granted(&self, key: &AskKey) -> bool {
+        self.1.contains(key)
+    }
+}
+
 #[test]
 fn allowed_call_injects_into_the_slot_with_the_homes_copy() {
     let c = Case::new();
@@ -323,7 +352,7 @@ fn version_must_be_approved_and_the_homes_copy_rules() {
     let entry = c.src.home.get_mut("sentry-work").unwrap();
     entry.approved[0].claim = narrower.canonical();
     let o = c.get("/api/0/organizations/acme/releases/", &bearer(OWN));
-    refused(&o, "scope `other`");
+    asked(&o, "other", None);
 
     let mut c = Case::new();
     let mut moved = sentry();
@@ -344,9 +373,19 @@ fn scopes_never_other_ask_and_defaults() {
     let o = c.run("POST", "/api/0/projects/acme/web/keys/", &bearer(OWN));
     refused(&o, "a `never` route");
     assert_eq!(o.context.scope.as_deref(), Some("never"));
+    // Unfenced: `other` is asked, whatever `access` says.
     let o = c.get("/api/0/unknown/", &bearer(OWN));
-    let r = refused(&o, "(scope `other`): permission requests: not supported yet! open an issue in https://github.com/Nemikolh/devsandboxes");
-    assert_eq!(r.scope.as_deref(), Some("other"));
+    let a = asked(&o, "other", None);
+    assert_eq!(
+        (a.key.instance_id.as_str(), a.key.credential.as_str(), a.instance.as_str(), a.kind.as_str()),
+        ("web-1-id", "sentry-work", "web-1", "sentry")
+    );
+    assert_eq!((a.method.as_str(), a.route.as_str(), a.hold), ("GET", "/api/0/unknown/", asks::DEFAULT_HOLD));
+    assert_eq!(o.context.scope.as_deref(), Some("other"));
+    let mut narrow = Case::new();
+    narrow.src.access = Some(Access { scopes: vec!["org.read".into()], ..Access::default() });
+    narrow.src.home.get_mut("sentry-work").unwrap().max = Some(vec!["org.read".into()]);
+    asked(&narrow.get("/api/0/unknown/", &bearer(OWN)), "other", None);
 
     // Unset scopes and max: every scope.
     for (method, path) in
@@ -363,8 +402,30 @@ fn scopes_never_other_ask_and_defaults() {
 
     let mut c = Case::new();
     c.src.access = Some(Access { ask: vec!["issues.read".into()], ..Access::default() });
-    let r = refused(&c.get("/api/0/issues/1/", &bearer(OWN)), "is in `access.sentry.ask`, and asking isn't supported yet");
-    assert!(r.todo.unwrap().contains("out of `access.sentry.ask`"));
+    let o = c.get("/api/0/issues/1/", &bearer(OWN));
+    let key = asked(&o, "issues.read", None).key.clone();
+    injected(&c.get("/api/0/", &bearer(OWN)));
+    // Answered: the same call injects; another scope's grant doesn't count.
+    let head = parse_head(format!("GET /api/0/issues/1/ HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{}\r\n", c.port, bearer(OWN)).as_bytes())
+        .unwrap();
+    let header = ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: c.port };
+    let call = Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None };
+    injected(&decide(&call, &c.state, &Granted(&c.src, vec![key.clone()])));
+    let wrong = AskKey { scope: "org.read".into(), ..key };
+    asked(&decide(&call, &c.state, &Granted(&c.src, vec![wrong])), "issues.read", None);
+    // `access.scopes` and `max` refuse before anything is asked.
+    c.src.access = Some(Access { ask: vec!["issues.read".into()], scopes: vec!["org.read".into()], ..Access::default() });
+    refused(&c.get("/api/0/issues/1/", &bearer(OWN)), "scope `issues.read` isn't in `access.sentry.scopes`");
+    c.src.access = Some(Access { ask: vec!["issues.read".into()], ..Access::default() });
+    c.src.home.get_mut("sentry-work").unwrap().max = Some(vec!["org.read".into()]);
+    refused(&c.get("/api/0/issues/1/", &bearer(OWN)), "(its `max`)");
+    let mut held = sentry();
+    held.pinned.hold = Some(5);
+    let mut c = Case::new();
+    c.state = state_with(held.clone());
+    c.src.home = home_with(&held);
+    c.src.access = Some(Access { ask: vec!["issues.read".into()], ..Access::default() });
+    assert_eq!(asked(&c.get("/api/0/issues/1/", &bearer(OWN)), "issues.read", None).hold, std::time::Duration::from_secs(5));
 
     let mut c = Case::new();
     c.src.home.get_mut("sentry-work").unwrap().max = Some(vec!["org.read".into()]);
@@ -393,7 +454,7 @@ fn intercept_matches_the_claim_by_host() {
         assert!(o.context.listeners.is_empty());
     }
     assert!(matches!(through(&state, &src, "github.com", 443, "/user", "").action, Action::Uninjected { .. }));
-    refused(&through(&state, &src, "api.github.com", 443, "/repos/a/b", &token(GH)), "scope `other`");
+    asked(&through(&state, &src, "api.github.com", 443, "/repos/a/b", &token(GH)), "other", None);
 
     // A base-URL claim's upstream, an unbound host, another port.
     for (host, port) in [("sentry.io", 443), ("example.com", 443), ("api.github.com", 8443)] {
@@ -600,7 +661,8 @@ fn repo_less_and_unplaced_routes() {
     injected(&o);
     let ask = fenced_src(Some(Access { ask: vec!["user.read".into(), "repo.read".into()], ..Access::default() }));
     refused(&fenced(&ask, "GET", "api.github.com", "/user", &token), "names no repo, so it's never asked");
-    refused(&fenced(&ask, "GET", "api.github.com", "/repos/o/r", &token), "asking isn't supported yet");
+    asked(&fenced(&ask, "GET", "api.github.com", "/repos/O/R", &token), "repo.read", Some("o/r"));
+    asked(&fenced(&ask, "GET", "github.com", UPLOAD_REFS, &git_basic(GH)), "repo.read", Some("o/r"));
 
     // A body input isn't placed.
     let mut body = crate::credentials::home::tests::github();
@@ -610,8 +672,10 @@ fn repo_less_and_unplaced_routes() {
     src.home.get_mut("github-work").unwrap().approved[0].claim = body.canonical();
     let o = fenced(&src, "POST", "api.github.com", "/repos/o/r/pulls", &token);
     refused(&o, "`POST /repos/o/r/pulls` names its repo by `head`, which the broker can't resolve yet");
-    // Unknown routes stay `other`.
-    refused(&fenced(&fenced_src(None), "GET", "api.github.com", "/repos/o/r/hooks", &token), "scope `other`");
+    // A fenced claim's unknown routes are `other`, never asked.
+    let o = fenced(&fenced_src(None), "GET", "api.github.com", "/repos/o/r/hooks", &token);
+    refused(&o, "`GET /repos/o/r/hooks` is in no scope of the `github` claim (scope `other`), and a repo-fenced claim never asks for one");
+    assert_eq!(o.context.scope.as_deref(), Some("other"));
     // A path past the repo that decodes badly.
     let o = fenced(&fenced_src(None), "GET", "api.github.com", "/repos/o/r/contents/a%2F..%2Fb", &token);
     assert_eq!(refused(&o, "dot-segment past the repo").status, 400);
@@ -860,7 +924,14 @@ fn graphql_mutations_are_placed_by_their_fence_inputs() {
     refused(&gql(&state, &src, commit("x/y")), "names `x/y`, outside");
     assert_eq!(refused(&gql(&state, &src, commit("o/r/x")), "not an `owner/name`").status, 400);
 
-    refused(&gql(&state, &src, serde_json::json!({ "query": "mutation { deleteRepository(input: {}) { a } }" })), "`graphql mutation deleteRepository` is in no scope");
+    let delete = serde_json::json!({ "query": "mutation { deleteRepository(input: {}) { a } }" });
+    refused(&gql(&state, &src, delete.clone()), "`graphql mutation deleteRepository` is in no scope");
+    // Without a repo fence it's asked.
+    let mut open = crate::credentials::home::tests::github();
+    open.pinned.fence.clear();
+    let mut osrc = gql_src(None);
+    osrc.src.home.get_mut("github-work").unwrap().approved[0].claim = open.canonical();
+    asked(&gql(&state, &osrc, delete), "other", None);
     let mut never = crate::credentials::home::tests::github();
     never.pinned.never.push(claim::Route::GraphqlMutation("addDeployKey".into()));
     let mut nsrc = gql_src(None);
@@ -881,10 +952,13 @@ fn every_graphql_mutation_field_needs_its_scope() {
     let mixed = serde_json::json!({ "query": "mutation { createPullRequest(input: {repositoryId: \"R_42\"}) { x } addComment(input: {subjectId: \"I_out\"}) { x } }" });
     refused(&gql(&state, &gql_src(None), mixed), "outside the instance's repo fence");
 
-    // Asked scopes: a placed mutation waits for permission requests, one
-    // naming no repo is never asked.
-    let ask = gql_src(Some(Access { ask: vec!["pr.write".into()], ..Access::default() }));
-    refused(&gql(&state, &ask, both), "scope `pr.write` is in `access.github.ask`, and asking isn't supported yet");
+    // Asked scopes: a placed mutation is asked, per repo; one naming no
+    // repo is never asked.
+    let ask = gql_src(Some(Access { ask: vec!["pr.write".into(), "issues.write".into()], ..Access::default() }));
+    let key = asked(&gql(&state, &ask, both.clone()), "pr.write", Some("o/r")).key.clone();
+    let next = gql(&state, &Granted(&ask, vec![key.clone()]), both.clone());
+    let issues = asked(&next, "issues.write", Some("o/r")).key.clone();
+    injected(&gql(&state, &Granted(&ask, vec![key, issues]), both));
     let bare = serde_json::json!({ "query": "mutation { createPullRequest(input: {title: \"t\"}) { x } }" });
     injected(&gql(&state, &gql_src(None), bare.clone()));
     refused(&gql(&state, &ask, bare), "names no repo, so it's never asked");

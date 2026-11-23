@@ -27,7 +27,8 @@ pub struct Line {
     pub method: String,
     pub route: String,
     pub scope: Option<String>,
-    /// `allow`, `uninjected`, `refused`, `leak` or `error`.
+    /// `allow`, `uninjected`, `outside`, `refused`, `pending`, `denied`,
+    /// `leak` or `error`.
     pub verdict: String,
     pub reason: Option<String>,
     pub status: u16,
@@ -36,6 +37,12 @@ pub struct Line {
     /// The credential's token was renewed for this call; omitted when not.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub refreshed: bool,
+    /// The permission request the call was held on, or refused naming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    /// How its hold ended: `once`, `deny` or `timeout`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided: Option<&'static str>,
 }
 
 pub struct Audit {

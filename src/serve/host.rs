@@ -168,8 +168,15 @@ impl Host {
     /// routes it, `serve::opens`), `on_open_done` each one refused at intake
     /// (`opens.done`); `on_running` gets each poll's running containers (the
     /// forward registry's sync; it must not block); `observers` the watched
-    /// roots the poll collects snapshots for.
-    pub fn start(log: fn(&str), sink: SinkHooks, on_running: OnRunning, observers: Observers) -> Host {
+    /// roots the poll collects snapshots for; `asks` the permission
+    /// requests the broker's held calls wait on.
+    pub fn start(
+        log: fn(&str),
+        sink: SinkHooks,
+        on_running: OnRunning,
+        observers: Observers,
+        asks: Arc<crate::broker::asks::Registry>,
+    ) -> Host {
         let stop: Shared = Arc::default();
         let board = BridgeBoard::default();
         // A failed bridge unsettles the board: wake the poll so it drops to
@@ -186,7 +193,7 @@ impl Host {
             let (stop, live, changes, board) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes), board.clone());
             std::thread::Builder::new()
                 .name("serve-poll".into())
-                .spawn(move || poll(&stop, &live, &changes, log, sink, on_running, &observers, board))
+                .spawn(move || poll(&stop, &live, &changes, log, sink, on_running, &observers, board, asks))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -299,8 +306,9 @@ fn poll(
     on_running: OnRunning,
     observers: &Observers,
     board: BridgeBoard,
+    asks: Arc<crate::broker::asks::Registry>,
 ) {
-    let broker: Option<Arc<dyn bridge::Broker>> = match crate::broker::serve::Service::from_host(log) {
+    let broker: Option<Arc<dyn bridge::Broker>> = match crate::broker::serve::Service::from_host(log, asks) {
         Ok(service) => Some(Arc::new(service)),
         Err(e) => {
             log(&format!("broker: {e:#}: no credential is brokered"));
@@ -654,7 +662,7 @@ mod tests {
         let sink = SinkHooks { on_shown: None, opener: Arc::new(|_, _, _| {}), on_open_done: None, log: logged };
         let thread = {
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || poll(&stop, &live, &changes, logged, sink, on_running, &observers, BridgeBoard::default()))
+            std::thread::spawn(move || poll(&stop, &live, &changes, logged, sink, on_running, &observers, BridgeBoard::default(), Arc::default()))
         };
         // Two passes: a refresh cuts the 2 s sleep short.
         let deadline = Instant::now() + Duration::from_secs(10);

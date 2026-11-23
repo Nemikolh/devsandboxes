@@ -169,8 +169,12 @@ impl<'a> Fence<'a> {
     /// A repository id (`/repositories/{id}`, a mutation's `databaseId`):
     /// in when an entry is pinned to it.
     pub fn place_id(&mut self, id: u64) -> bool {
+        self.entry_with_id(id).is_some()
+    }
+
+    pub fn entry_with_id(&mut self, id: u64) -> Option<String> {
         let entries: Vec<String> = self.names.iter().cloned().collect();
-        entries.iter().any(|e| self.pin_of(e).is_some_and(|p| p.id == id))
+        entries.into_iter().find(|e| self.pin_of(e).is_some_and(|p| p.id == id))
     }
 
     /// A global node id: a repository node id an entry is pinned to, with

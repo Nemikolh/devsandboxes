@@ -10,13 +10,16 @@ use crate::credentials::claim::Refusal as Shape;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub status: u16,
-    /// `refused`, `leak` (a phantom where it doesn't belong) or `error`
-    /// (the broker or the upstream failed).
+    /// `refused`, `leak` (a phantom where it doesn't belong), `pending`
+    /// (a permission request unanswered), `denied` (answered no) or
+    /// `error` (the broker or the upstream failed).
     pub verdict: &'static str,
     /// One line.
     pub reason: String,
     pub credential: Option<String>,
     pub scope: Option<String>,
+    /// The permission request the call was held on (`R-…`).
+    pub request: Option<String>,
     /// What would let the call through (`devsandbox login sentry`).
     pub todo: Option<String>,
     /// Seconds, sent as `Retry-After`.
@@ -25,7 +28,7 @@ pub struct Refusal {
 
 impl Refusal {
     pub fn new(status: u16, verdict: &'static str, reason: impl Into<String>) -> Refusal {
-        Refusal { status, verdict, reason: reason.into(), credential: None, scope: None, todo: None, retry_after: None }
+        Refusal { status, verdict, reason: reason.into(), credential: None, scope: None, request: None, todo: None, retry_after: None }
     }
 
     pub fn refused(reason: impl Into<String>) -> Refusal {
@@ -42,6 +45,7 @@ impl Refusal {
             "verdict": self.verdict,
             "credential": self.credential,
             "scope": self.scope,
+            "request": self.request,
             "do": self.todo,
         })
     }
@@ -158,7 +162,7 @@ mod tests {
         );
         assert_eq!(
             body["devsandbox"],
-            json!({ "verdict": "refused", "credential": "sentry-work", "scope": "releases.write", "do": "add it to the config" })
+            json!({ "verdict": "refused", "credential": "sentry-work", "scope": "releases.write", "request": null, "do": "add it to the config" })
         );
     }
 

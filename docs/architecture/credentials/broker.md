@@ -135,8 +135,10 @@ only for a call carrying the phantom). First refusal answers:
    (`claim::from_canonical`) rules; the instance's only selected it.
 7. **Upstream and slot** in that copy.
 8. **Route** (`route::scope_of` on the copy, [Route matching](#route-matching)):
-   a `never` route is refused always; a route in no scope is `other`,
-   refused as an ask; a path past `{repo}` that decodes badly is a `400`.
+   a `never` route is refused always; a route in no scope is `other`:
+   asked on a claim without a repo fence, refused on a fenced one (an
+   answer couldn't name a repo); a path past `{repo}` that decodes badly
+   is a `400`.
    `POST /graphql` to a claim with GraphQL routes is decided by its
    operation instead, its mutation inputs placed in the fence here too
    ([GraphQL](#graphql)), each scope it needs then taking step 11.
@@ -148,15 +150,23 @@ only for a call carrying the phantom). First refusal answers:
 10. **Org fence**, for a claim with `orgs` ([below](#the-org-fence)): a
    route holding `orgs.var` must name one of the credential's orgs the
    config allows, by slug or id, else it's refused, reads included.
-11. **Scope**: it must be granted (`max`; unset: every scope) and not in
-   `access.<kind>.ask` (refused: permission requests aren't supported yet; on a
-   repo-less route of a fenced claim, refused as never asked, since an
-   answer couldn't name a repo), and requested (`access.<kind>.scopes`;
-   empty: every scope of the claim), each refusal naming what to change.
+11. **Scope**: each scope the call needs must be granted (`max`; unset:
+   every scope) and requested (`access.<kind>.scopes`; empty: every scope
+   of the claim), each refusal naming what to change; `other` takes
+   neither, as both name claim scopes. Every refusal comes before any
+   ask, so an answer is never followed by one. A scope in
+   `access.<kind>.ask` on a repo-less route of a fenced claim is refused
+   as never asked. Then the first asked scope (in `access.<kind>.ask`,
+   or `other`) whose `asks::AskKey` (instance id, credential, scope, and
+   the repo a fenced claim's call names) `Sources::granted` doesn't
+   answer is `Action::Ask`: the call is held for a
+   [permission request](#permission-requests) and decided again.
 
 The result (`Outcome`) carries the refusal, the injection (credential,
-slot, the approved claim, its upstream's `private`) or the outside call
-(`Action::Outside`: the phantom's slot, the upstream's `private`) and the
+slot, the approved claim, its upstream's `private`), the outside call
+(`Action::Outside`: the phantom's slot, the upstream's `private`) or the
+ask (`asks::Ask`: its key, the instance, method and route, the claim's
+`hold`, else `asks::DEFAULT_HOLD`, 120 s) and the
 log context: kind, credential, scope, whose phantom, the instance's
 listeners (none in intercept mode), the outside repo and the refusal
 shape (the approved copy's once read, else the instance's; git's for any
@@ -205,6 +215,9 @@ A claim whose `fence` names any route is fenced (`Pinned::fenced`).
   old name or its current one is in, and a call naming the old one is
   sent to the current one (`Injection::path`);
 - no `{repo}`: repo-less, on to the scope checks (never asked).
+
+A placed repo (the name the call used, or the entry an id is pinned to)
+is the repo of the call's ask key.
 
 In the fence the scope checks follow. Outside it the call gets no
 credential and is never asked: a write (`route::is_write`: a method but
@@ -293,8 +306,10 @@ The bytes as sent go upstream, `Content-Encoding` and all (and are what a
   places (a pinned repository's node id with no call, else `node(id:)`
   resolves it), or an integer repository id. One outside the fence
   refuses the call naming `access.<kind>.repos` (a mutation is a write,
-  never stripped); one that doesn't resolve is `other`, refused. A field
-  whose inputs are all absent is repo-less (never asked); a block
+  never stripped); one that doesn't resolve is `other`, refused. Each
+  repo the inputs place is asked for separately (one `Need` per scope
+  and repo). A field whose inputs are all absent is repo-less (never
+  asked); a block
   string, an enum or an object where an input is read is a `400`.
 
 Every scope the fields need must pass step 11; the log line's `scope`
@@ -476,15 +491,54 @@ notice (`devsbd::desktop::notify_desktop`) naming `devsandbox login
 serves, whichever instance makes it. `access ls` shows the same end and
 warns 14 days ahead ([credentials CLI](../../reference/credentials-cli.md#access-ls)).
 
+## Permission requests
+
+An `Action::Ask` holds the call on its connection's thread (each
+bridged connection has its own, so only that connection waits) while a
+request waits in `asks::Registry`, the daemon's one (`daemon::run`
+makes it, kept on `Shared`, and hands it through `Host::start` to
+`Service::from_host`):
+
+- **Ids**: `R-` and 12 Crockford base32 characters, 60 bits from the OS
+  random source (`asks::fresh_id`): unguessable to another instance,
+  and never a credential name, which has no uppercase letter.
+- **Join**: a call whose key matches an unanswered request joins it, a
+  retry included, and extends its hold to the joiner's; another repo or
+  scope is another request.
+- **Cap**: an instance with `MAX_OPEN_SCOPE_ASKS` (3) requests still in
+  their hold gets a new one refused at once, `403` `pending`, "another
+  request pending for this instance: <id>" naming the oldest, no request
+  raised.
+- **Hold**: `Registry::wait` blocks for the ask's `hold`. `once` wakes
+  every waiter; each decides again (`state.toml` reread, the body read
+  before policy reused) with its key answered for that call only
+  (`asks::Grants`, the `Sources::granted` behind `serve::Files`), so a
+  call needing several asks goes through them in turn. `deny` refuses
+  `403` `denied`, "denied by the user". A hold ending unanswered refuses
+  `403` `pending`, "scope `<scope>`[ on `<repo>`] of credential
+  `<credential>` needs permission: request <id> is pending", naming
+  `devsandbox access approve <id>`.
+- **Late answers**: a request no call waits on stays listed
+  (`Registry::pending`) for `LATE_GRANT` (5 min) past its hold, then is
+  dropped. A `once` then becomes a one-shot grant: the instance's next
+  call with that key within `LATE_GRANT` takes it (`Registry::granted`)
+  and goes through unheld; a `deny` just closes the request.
+- **Changes**: `Registry::on_change` sets the hook every open, join,
+  answer and waiter leaving calls, outside the registry's lock.
+
+Requests live in memory: a daemon exiting drops them with their held
+calls.
+
 ## Refusals
 
 `refusal::Refusal` renders the claim's `refusal` shape: `json` puts the
 one-line reason at the claim's field (`detail` for sentry; a dotted field
 nests) beside a `devsandbox` object (`verdict`, `credential`, `scope`,
+`request`: the permission request of a `pending` or `denied` verdict,
 `do`); `anthropic` is Anthropic's error object; `mcp` a JSON-RPC error;
 `git` the reason as a text body. No shape: `json` with `message`. `403`
-for policy refusals and leaks, `400` for malformed requests and strict
-paths, `503` when a file can't be read, `502` for a failed upstream.
+for policy refusals, held calls' refusals and leaks, `400` for
+malformed requests and strict paths, `503` when a file can't be read, `502` for a failed upstream.
 Never `WWW-Authenticate`.
 
 ## `access.log`
@@ -494,9 +548,11 @@ Never `WWW-Authenticate`.
 take it past 10 MiB (`MAX_BYTES`). Fields: `time` (RFC 3339 UTC),
 `instance`, `instance_id`, `incarnation`, `kind`, `credential`, `method`,
 `route` (the path before injection, query dropped), `scope`, `verdict`
-(`allow`, `uninjected`, `outside`, `refused`, `leak`, `error`), `reason`, `status`,
-`phantom` (`own`, `other-claim`, `foreign`), and `refreshed: true` when
-the call renewed the token. An intercepted connection closed before any
+(`allow`, `uninjected`, `outside`, `refused`, `pending`, `denied`,
+`leak`, `error`), `reason`, `status`, `phantom` (`own`, `other-claim`,
+`foreign`), `refreshed: true` when the call renewed the token, and for a
+held call `request` (its id) and `decided` (`once`, `deny`,
+`timeout`). An intercepted connection closed before any
 request (not intercepted, no TLS, a failed handshake) leaves a line
 without `method` or `route`, `status` 0. Never a token or a phantom.
 Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog).
