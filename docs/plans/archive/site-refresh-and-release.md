@@ -1,3 +1,6 @@
+> Archived 2026-11-23. Historical, may be wrong; do not use as a reference.
+> Current: the site (`site/`), [CHANGELOG](../../../CHANGELOG.md) (0.11.0)
+
 # Site refresh and the 0.11.0 release
 
 Status: agreed; building.
