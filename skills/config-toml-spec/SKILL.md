@@ -21,7 +21,7 @@ Top-level tables, all optional:
 [updates]           # how often each feature update runs
 ```
 
-Any other top-level table is ignored, not an error: check its spelling.
+Any other top-level table is an error.
 
 Beside the file devsandbox keeps `shared-volumes/` (`${sharedVolumes}`, persistent host state), `.worktrees/` (instances' git worktrees) and `shared-files/` (`worktree-link` stores). Relative paths (`folder`, `folders`, `shell-rc`, `build.dockerfile`, `build.context`, local features) resolve against the config dir.
 

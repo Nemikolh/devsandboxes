@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A misspelled top-level table is an error**: `[sandboxx.web]` used to load
+  as an empty config with no warning; now `devsandbox` names the unknown
+  table, as it already did for unknown keys inside a sandbox.
+
 ## 0.11.0
 
 Sandboxes can use gh, git and Sentry's CLI without ever holding your tokens: devsandbox's credential broker keeps them on the host and spends them only on what each sandbox's config allows, gh and git only on the sandbox's own repos. Features now update their tools on a schedule, with no rebuild and no sandbox able to swap them, and host git no longer follows anything a sandbox can write. The features gh 1.3.1, zidane 2.1.1 and sentry 1.2.1 need this release.

@@ -73,6 +73,7 @@ pub fn migrate_legacy(dir: &Path) -> Result<Option<PathBuf>> {
 /// free-form tables so `extends` can deep-merge them; the merged result is
 /// validated into [`SandboxProperties`] by `resolve_sandbox`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub services: BTreeMap<String, Table>,
@@ -1722,6 +1723,14 @@ sandbox:
         assert!(Config::parse_yaml("sandbox: [").is_err());
         // TOML has no null; resolving would otherwise see a key TOML can't express.
         assert!(Config::parse_yaml("sandbox: {s: {image: ~}}").is_err());
+    }
+
+    #[test]
+    fn a_misspelled_top_level_table_is_an_error() {
+        let toml = Config::parse("[sandboxx.a]\nimage = \"x\"\n").unwrap_err();
+        assert!(format!("{toml:#}").contains("unknown field `sandboxx`"), "{toml:#}");
+        let yaml = Config::parse_yaml("sandboxx: {a: {image: x}}\n").unwrap_err();
+        assert!(format!("{yaml:#}").contains("sandboxx"), "{yaml:#}");
     }
 
     fn scratch(tag: &str) -> PathBuf {
