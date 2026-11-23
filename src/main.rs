@@ -526,10 +526,11 @@ enum AccessCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Delete a credential's secret and entry, or drop one claim version
-    /// of it
+    /// Delete a credential's secret and entry, drop one claim version of
+    /// it, or drop the rule or kept answer a permission request left
     Revoke {
-        /// The credential's name in credentials.toml
+        /// The credential's name in credentials.toml, or a request id
+        /// (`R-…`)
         credential: String,
         /// Drop only this approved or pending version (a prefix of it)
         #[arg(long)]
@@ -1237,7 +1238,14 @@ fn main() -> Result<()> {
         Command::Access { cmd: AccessCommand::Forget { folder, repo } } => commands::access::forget(&folder, &repo),
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Revoke { credential, version, yes } } => {
-            commands::access::revoke(&credential, version.as_deref(), yes)
+            if broker::asks::is_request_id(&credential) {
+                if version.is_some() {
+                    anyhow::bail!("`--version` names a claim version of a credential, not of a request");
+                }
+                commands::access::revoke_answer(&credential)
+            } else {
+                commands::access::revoke(&credential, version.as_deref(), yes)
+            }
         }
     }
 }

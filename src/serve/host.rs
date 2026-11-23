@@ -662,7 +662,7 @@ mod tests {
         let sink = SinkHooks { on_shown: None, opener: Arc::new(|_, _, _| {}), on_open_done: None, log: logged };
         let thread = {
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || poll(&stop, &live, &changes, logged, sink, on_running, &observers, BridgeBoard::default(), Arc::default()))
+            std::thread::spawn(move || poll(&stop, &live, &changes, logged, sink, on_running, &observers, BridgeBoard::default(), Arc::new(crate::broker::asks::Registry::new(std::env::temp_dir()))))
         };
         // Two passes: a refresh cuts the 2 s sleep short.
         let deadline = Instant::now() + Duration::from_secs(10);

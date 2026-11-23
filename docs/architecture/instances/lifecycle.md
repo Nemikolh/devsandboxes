@@ -213,7 +213,8 @@ runs afresh for every exec, so upgrading it fixes existing containers.
    ssh-agent link; `folders` worktrees; the worktree; the branch if
    decided.
 4. Drop the record by `instance_id`, delete the build log, archive the
-   instance's Inbox threads.
+   instance's Inbox threads, drop the permission answers `access.json`
+   keeps for it (`answers::forget_instance`; a failure only warns).
 
 Kept: the shell-history dir (a later instance with the same id inherits it;
 `gc` reaps orphans) and the shared `worktree-link` store. Dropping the

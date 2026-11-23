@@ -404,9 +404,11 @@ is frozen: no new work on it.
   → [images and features](architecture/instances/images-and-features.md#credential-claims),
   [ca](architecture/credentials/ca.md#trust-in-containers);
   `credentials::instance::plan`, `commands::run::claims::wire`
-- The broker refuses every ask: a scope in `access.<kind>.ask` and a
-  route in no scope (`other`) get a 403 saying permission requests
-  aren't supported yet (credential-broker step 4); `presence` routes pass. The GitHub
+- Permission requests are held and their answers kept (rules in
+  `credentials.toml`, `access.json`), but nothing can answer one yet: no
+  API, `access pending|approve|deny`, dashboard modal or popup
+  (credential-broker step 4), so a held call ends `pending` after its
+  hold; `presence` routes pass. The GitHub
   repo fence is enforced on a fenced claim's `{repo}` and
   `/repositories/{id}` routes
   ([fence](architecture/credentials/fence.md#enforcement)) and on

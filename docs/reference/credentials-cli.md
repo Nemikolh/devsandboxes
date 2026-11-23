@@ -14,8 +14,9 @@ Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
 `obtain`, `create_url`, `check_request`, `read_check`, `check_token`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`, `ask_approve`,
 `pick_pending`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
-`forget_at`), `src/credentials/home.rs` (`Entry`, `Source`, `Version`,
-`record_pending`, `update`), `src/credentials/store.rs` (`Store`,
+`revoke_answer_at`, `forget_at`), `src/credentials/home.rs` (`Entry`, `Rule`, `Source`, `Version`,
+`record_pending`, `update`), `src/credentials/answers.rs` (`Answers`,
+`Remembered`, `lookup`, `forget_instance`), `src/credentials/store.rs` (`Store`,
 `Record`, `OAuthToken`, `Secret`), `src/credentials/oauth/` (the OAuth
 logins: [login](../architecture/credentials/login.md)), `src/credentials/review.rs` (`View`, `diff`, `Diff`),
 `src/credentials/mod.rs` (`check_name`), `src/broker/audit.rs` (`Audit`,
@@ -28,6 +29,7 @@ devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>].
 devsandbox access approve <credential> [--version <v>] [--yes]
 devsandbox access ls [<credential>] [--json]
 devsandbox access revoke <credential> [--version <v>] [--yes]
+devsandbox access revoke <request>
 devsandbox access forget <folder> <repo>
 ```
 
@@ -257,6 +259,12 @@ sentry-work: sentry, source file
     web-1  9c1d0e2f3a4b  approved
     api    77ab01cd23ef  not approved
     old    3f2a1b4c5d6e  approved  (may take another credential: cannot read its config: …)
+  rules
+    releases.write, sandbox web  (R-7Q2M9XK4TB0D)
+    issues.read, profile work  (by hand)
+  answers
+    web-1  other  this instance  R-3JX8W1PZ6N2C  2026-11-23T10:00:00Z
+    api    other  deny  R-K5D0V9HQ2M7S  2026-11-23T10:05:00Z
 ```
 
 - `token`: the store's record kind (`token`): `static`; `oauth` with
@@ -289,6 +297,11 @@ sentry-work: sentry, source file
   whose claim `home::resolve` refuses (two credentials granted), is shown
   under every credential of its kind with the reason, and counts as
   pinning its version.
+- `rules`: the credential's `rules`, each its scope (`on <repo>` when
+  set), the fields it sets and the request that wrote it, or `by hand`.
+- `answers`: the answers `access.json` keeps on it: instance (its name
+  when answered), scope (`on <repo>`), `this instance` or `deny`, the
+  request id and when.
 
 Without a credential named, the GitHub repo fences follow (`fences`,
 [fence](../architecture/credentials/fence.md)): each folder in
@@ -311,7 +324,8 @@ GitHub repo fences (each folder's remotes at its first run):
 "approvers"?, "delegate"?, "as"?, "broad", "orgs", "org_fence", "approved": [{"version", "latest",
 "unused"}], "pending": […], "broken", "expires"?: {"at", "days",
 "expired", "warn"}, "instances": [{"instance", "version", "approved",
-"unknown"?}]}` (full version hashes; `oauth` carries `expires_at`,
+"unknown"?}], "rules": [{"scope", "repo"?, "sandbox"?, "profile"?,
+"id"?}], "answers": [<an `access.json` entry>]}` (full version hashes; `oauth` carries `expires_at`,
 `refresh_expires_at`, `refreshable`, `scope`; `expires.at` is unix
 seconds; `org_fence`: the latest approved claim has an `orgs` field).
 
@@ -331,6 +345,16 @@ terminal without `--yes`, refused):
   the instances pinning it, which get the not-approved refusal on their
   next call, and which version becomes the latest approved (or that none
   is left).
+- A request id (`R-` and 12 Crockford base32 characters,
+  `asks::is_request_id`; never a credential name, which has no
+  uppercase letter), `revoke_answer_at`: drops the answer that request
+  left, its entry in `access.json`, else its rule in
+  `credentials.toml`, without asking (its calls are just asked again):
+  "dropped the deny answer of request R-… (`gh` pr.write on o/r for
+  instance `web-1`): its calls are asked again", "dropped the rule of
+  request R-… on `gh` (pr.write on o/r, sandbox web): its calls are
+  asked again". None left: "no rule or kept answer from request R-… on
+  this host". `--version` with a request id is refused.
 
 ## `access forget`
 
@@ -378,6 +402,16 @@ claim = '…'
 [sentry-work.broken]          # `Entry::broken`, set by the broker, cleared by `login`
 at = "2026-11-21T10:00:00Z"   # when first marked, RFC 3339 UTC
 reason = "its refresh was refused: invalid_grant (…)"
+
+[[sentry-work.rules]]         # an asked scope allowed without asking: an *always* answer
+scope = "releases.write"
+repo = "o/r"                  # these four optional; each set one must equal the call's
+sandbox = "web"               # the instance's sandbox
+id = "R-7Q2M9XK4TB0D"         # the request it answered, for `access revoke`
+
+[[sentry-work.rules]]         # hand-written: no `id`
+scope = "issues.read"
+profile = "work"              # the instance's profile
 ```
 
 `claim` is the canonical pinned claim (no container-side wiring), the copy
@@ -413,6 +447,16 @@ routes may name, an org matched by its slug (case-insensitively) or its
 id. A config's `access.<kind>.orgs` narrows it, never widens it. Unset:
 no route holding the variable is reachable. Set by `login --org`, else
 by hand, as the rest of the grant (`Entry::orgs`).
+
+`rules` (`Entry::rules`, `Rule::matches`) let an asked scope through
+without a permission request: a rule matches a call of its `scope` when
+each field it sets equals the call's, `repo` (`owner/name`, the repo a
+fenced claim's call names) case-insensitively, `sandbox` the instance's
+sandbox name, `profile` its profile. An *always* answer appends one with
+the request's scope, repo, sandbox and id
+([broker](../architecture/credentials/broker.md#permission-requests));
+an `id` must be a request id, a `profile` a profile name. A deny kept in
+`access.json` beats a rule.
 
 `expires_at` (RFC 3339, UTC) is written by `login`, from its token
 check, and by the broker: on an injected call with a pasted secret, the response's header the claim's
@@ -457,7 +501,39 @@ so no secret is ever on disk with wider permissions. A store readable by
 group or others is refused (read and write), and a parse error names the
 file, never its content. `Secret` has no `Display` and a blank `Debug`.
 
-Both files, their locks, the reserved `access.json` and the member CA's
+## `access.json`
+
+Next to `state.toml` (`answers::path`, `daemon_config::ACCESS`), read
+and written under `access.lock` (`answers::update` over
+`serve::locked_file::update`): the *this instance* and deny answers of
+permission requests, one per instance, credential, scope and repo (a
+later answer replaces it). Written by the daemon's `asks::Registry`, by
+`rm` (`answers::forget_instance` drops the instance's) and by `access
+revoke <request>`; read by the broker per call.
+
+```json
+{
+  "version": 1,
+  "answers": [
+    {
+      "id": "R-3JX8W1PZ6N2C",
+      "instance_id": "…",
+      "instance": "web-1",
+      "credential": "github-work",
+      "scope": "pr.write",
+      "repo": "o/r",
+      "answer": "instance",
+      "at": "2026-11-23T10:00:00Z"
+    }
+  ]
+}
+```
+
+`answer` is `instance` or `deny`; `repo` only for a fenced claim's
+scope; `instance` is the name when answered, for display; `at` RFC 3339
+UTC. Another `version` fails the file, as do unknown keys.
+
+Both credential files, their locks, `access.json` and the member CA's
 `member-ca.key` and `member-ca.toml` ([member CA](../architecture/credentials/ca.md)) are refused as bind and build sources in every container,
 like `member.key` (`key_guard`, `daemon_config::credential_files`;
 [fleet](../architecture/daemon/fleet.md), *Key at rest*).
@@ -488,7 +564,7 @@ take the file past 10 MiB. Never a token or a phantom.
 | `status` | what the tool got (the upstream's, or the broker's own); `0` when an intercepted connection was closed unanswered (not intercepted, no TLS, a failed handshake) |
 | `phantom` | whose phantom the call carried: `own`, `other-claim`, `foreign`; `null` for none |
 | `refreshed` | `true` when the call renewed the credential's token; absent otherwise |
-| `request` | the permission request (`R-…`) the call was held on, or the one a refusal past the cap names; absent otherwise |
-| `decided` | how the call's last hold ended: `once`, `deny`, `timeout`; absent for a call never held |
+| `request` | the permission request (`R-…`) the call was held on, or the one a refusal names (past the cap, a kept deny); absent otherwise |
+| `decided` | how the call's last hold ended: `once`, `instance`, `always`, `deny`, `timeout`; absent for a call never held |
 
 How calls are decided: [broker](../architecture/credentials/broker.md).

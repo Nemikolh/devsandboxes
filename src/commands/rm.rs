@@ -125,6 +125,8 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool, fail_on_ask: boo
     })?;
     crate::build_log::remove(&instance_id);
     archive_inbox(&key, &instance_id);
+    #[cfg(unix)]
+    forget_answers(&key, &instance_id);
     println!("removed {key}");
     Ok(())
 }
@@ -216,6 +218,17 @@ fn archive_inbox(key: &str, instance_id: &str) {
     let updated = crate::inbox::store::path().and_then(|path| crate::inbox::ops::archive(&path, instance_id));
     if let Err(e) = updated {
         eprintln!("warning: cannot archive `{key}`'s inbox threads: {e:#}");
+    }
+}
+
+/// Drops the permission answers kept for the instance (`access.json`):
+/// *this instance* means until its `rm`. A failure only warns, as
+/// [`archive_inbox`]'s.
+#[cfg(unix)]
+fn forget_answers(key: &str, instance_id: &str) {
+    let forgot = super::login::data_dir().and_then(|data| crate::credentials::answers::forget_instance(&data, instance_id));
+    if let Err(e) = forgot {
+        eprintln!("warning: cannot drop `{key}`'s kept access answers: {e:#}");
     }
 }
 

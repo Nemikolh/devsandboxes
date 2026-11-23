@@ -156,16 +156,20 @@ only for a call carrying the phantom). First refusal answers:
    neither, as both name claim scopes. Every refusal comes before any
    ask, so an answer is never followed by one. A scope in
    `access.<kind>.ask` on a repo-less route of a fenced claim is refused
-   as never asked. Then the first asked scope (in `access.<kind>.ask`,
-   or `other`) whose `asks::AskKey` (instance id, credential, scope, and
-   the repo a fenced claim's call names) `Sources::granted` doesn't
-   answer is `Action::Ask`: the call is held for a
+   as never asked. Then, for the asked scopes (in `access.<kind>.ask`,
+   or `other`), each by its `asks::AskKey` (instance id, credential,
+   scope, and the repo a fenced claim's call names), in this order: a
+   deny kept for it (`Sources::remembered`, `access.json`) refuses,
+   checked for every asked scope before any is asked; one a rule on the
+   credential allows (`Entry::rule_for`), or a *this instance* answer
+   kept for it, or `Sources::granted`, goes through; the first other is
+   `Action::Ask`: the call is held for a
    [permission request](#permission-requests) and decided again.
 
 The result (`Outcome`) carries the refusal, the injection (credential,
 slot, the approved claim, its upstream's `private`), the outside call
 (`Action::Outside`: the phantom's slot, the upstream's `private`) or the
-ask (`asks::Ask`: its key, the instance, method and route, the claim's
+ask (`asks::Ask`: its key, the instance and its sandbox, method and route, the claim's
 `hold`, else `asks::DEFAULT_HOLD`, 120 s) and the
 log context: kind, credential, scope, whose phantom, the instance's
 listeners (none in intercept mode), the outside repo and the refusal
@@ -495,9 +499,9 @@ warns 14 days ahead ([credentials CLI](../../reference/credentials-cli.md#access
 
 An `Action::Ask` holds the call on its connection's thread (each
 bridged connection has its own, so only that connection waits) while a
-request waits in `asks::Registry`, the daemon's one (`daemon::run`
-makes it, kept on `Shared`, and hands it through `Host::start` to
-`Service::from_host`):
+request waits in `asks::Registry`, the daemon's one (`Shared::new`
+makes it over `state.toml`'s dir, the broker's data dir; `daemon::run`
+hands it through `Host::start` to `Service::from_host`):
 
 - **Ids**: `R-` and 12 Crockford base32 characters, 60 bits from the OS
   random source (`asks::fresh_id`): unguessable to another instance,
@@ -509,12 +513,24 @@ makes it, kept on `Shared`, and hands it through `Host::start` to
   their hold gets a new one refused at once, `403` `pending`, "another
   request pending for this instance: <id>" naming the oldest, no request
   raised.
-- **Hold**: `Registry::wait` blocks for the ask's `hold`. `once` wakes
-  every waiter; each decides again (`state.toml` reread, the body read
-  before policy reused) with its key answered for that call only
-  (`asks::Grants`, the `Sources::granted` behind `serve::Files`), so a
-  call needing several asks goes through them in turn. `deny` refuses
-  `403` `denied`, "denied by the user". A hold ending unanswered refuses
+- **Answers** (`Registry::answer`, `asks::Answer`): `once`, `instance`
+  (this instance, until its `rm`), `always` (a rule), `deny`. The
+  answer is kept first (`asks::remember`, under the registry's lock):
+  `instance` and `deny` as an entry in `access.json`
+  (`credentials::answers`, one per key: a later answer replaces it),
+  `always` as a rule appended to the credential's `rules` in
+  `credentials.toml` (`home::Rule`: the key's scope and repo, the
+  instance's sandbox, the request id); a failed write leaves the request
+  unanswered.
+- **Hold**: `Registry::wait` blocks for the ask's `hold`. Every answer
+  but `deny` wakes the waiters through: each decides again (`state.toml`
+  reread, the body read before policy reused) with its key answered for
+  that call (`asks::Grants`, the `Sources::granted` behind
+  `serve::Files`), so a call needing several asks goes through them in
+  turn. `deny` refuses `403` `denied`, "denied for this instance
+  (request <id>)", naming `devsandbox access revoke <id>`; a kept deny
+  refuses the instance's later matching calls the same way at once, so
+  an agent stops retrying. A hold ending unanswered refuses
   `403` `pending`, "scope `<scope>`[ on `<repo>`] of credential
   `<credential>` needs permission: request <id> is pending", naming
   `devsandbox access approve <id>`.
@@ -522,12 +538,20 @@ makes it, kept on `Shared`, and hands it through `Host::start` to
   (`Registry::pending`) for `LATE_GRANT` (5 min) past its hold, then is
   dropped. A `once` then becomes a one-shot grant: the instance's next
   call with that key within `LATE_GRANT` takes it (`Registry::granted`)
-  and goes through unheld; a `deny` just closes the request.
+  and goes through unheld; the other answers are kept as above.
 - **Changes**: `Registry::on_change` sets the hook every open, join,
   answer and waiter leaving calls, outside the registry's lock.
 
 Requests live in memory: a daemon exiting drops them with their held
-calls.
+calls. Kept answers live in the files: `serve::Files::remembered` reads
+`access.json` per call, as the rules are read with `credentials.toml`.
+They end with `rm` (`answers::forget_instance`: every answer kept for
+the instance) or `devsandbox access revoke <id>` (the answer, or the
+rule, the request left;
+[credentials CLI](../../reference/credentials-cli.md#access-revoke)).
+A hand-written rule (no `id`) may also name a `profile`; a rule's
+fields, all optional but `scope`, each must equal the call's (`repo`
+case-insensitively).
 
 ## Refusals
 
@@ -551,8 +575,8 @@ take it past 10 MiB (`MAX_BYTES`). Fields: `time` (RFC 3339 UTC),
 (`allow`, `uninjected`, `outside`, `refused`, `pending`, `denied`,
 `leak`, `error`), `reason`, `status`, `phantom` (`own`, `other-claim`,
 `foreign`), `refreshed: true` when the call renewed the token, and for a
-held call `request` (its id) and `decided` (`once`, `deny`,
-`timeout`). An intercepted connection closed before any
+held call `request` (its id) and `decided` (`once`, `instance`,
+`always`, `deny`, `timeout`). An intercepted connection closed before any
 request (not intercepted, no TLS, a failed handshake) leaves a line
 without `method` or `route`, `status` 0. Never a token or a phantom.
 Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog).

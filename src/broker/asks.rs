@@ -7,16 +7,24 @@
 //! held is refused at once, so volume can't wear an approver down. A
 //! request no call waits on any more stays listed for [`LATE_GRANT`]: a
 //! `once` answer then becomes a one-shot grant for the instance's next
-//! matching call ([`Registry::granted`]).
+//! matching call ([`Registry::granted`]). *This instance* and deny answers
+//! are kept in `access.json` ([`answers`]), *always* answers as a rule on
+//! the credential in `credentials.toml` ([`home::Rule`]), before the
+//! waiters wake.
 
 // Answering and listing have no caller but tests until the API serves them.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
+
 use super::refusal::Refusal;
+use crate::credentials::answers::{self, Kind, Remembered};
+use crate::credentials::home::{self, Rule};
 
 /// A claim without `hold`'s.
 pub const DEFAULT_HOLD: Duration = Duration::from_secs(120);
@@ -43,6 +51,8 @@ pub struct Ask {
     pub key: AskKey,
     /// The instance's key in `state.toml`.
     pub instance: String,
+    /// The instance's sandbox: what an *always* answer's rule names.
+    pub sandbox: String,
     pub kind: String,
     pub method: String,
     /// The path, query dropped.
@@ -54,6 +64,11 @@ pub struct Ask {
 pub enum Answer {
     /// The held calls go through, each once.
     Once,
+    /// The instance's matching calls go through until its `rm`.
+    Instance,
+    /// A rule on the credential: matching calls of the sandbox go through.
+    Always,
+    /// The instance's matching calls are refused until revoked.
     Deny,
 }
 
@@ -62,8 +77,14 @@ impl Answer {
     pub fn marker(self) -> &'static str {
         match self {
             Answer::Once => "once",
+            Answer::Instance => "instance",
+            Answer::Always => "always",
             Answer::Deny => "deny",
         }
+    }
+
+    pub fn allows(self) -> bool {
+        self != Answer::Deny
     }
 }
 
@@ -73,6 +94,7 @@ pub struct Request {
     /// `R-` and 12 Crockford base32 characters.
     pub id: String,
     pub instance: String,
+    pub sandbox: String,
     pub key: AskKey,
     pub kind: String,
     pub method: String,
@@ -121,17 +143,17 @@ pub struct Registry {
     answered: Condvar,
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
     on_change: RwLock<Hook>,
-}
-
-impl Default for Registry {
-    fn default() -> Registry {
-        Registry::with_clock(Box::new(Instant::now))
-    }
+    /// Where kept answers go: `access.json` and `credentials.toml`.
+    data: PathBuf,
 }
 
 impl Registry {
-    pub fn with_clock(clock: Box<dyn Fn() -> Instant + Send + Sync>) -> Registry {
-        Registry { inner: Mutex::default(), answered: Condvar::new(), clock, on_change: RwLock::new(Box::new(|| {})) }
+    pub fn new(data: PathBuf) -> Registry {
+        Registry::with_clock(data, Box::new(Instant::now))
+    }
+
+    pub fn with_clock(data: PathBuf, clock: Box<dyn Fn() -> Instant + Send + Sync>) -> Registry {
+        Registry { inner: Mutex::default(), answered: Condvar::new(), clock, on_change: RwLock::new(Box::new(|| {})), data }
     }
 
     /// Called after every change [`Registry::pending`] would show (pruning
@@ -184,6 +206,7 @@ impl Registry {
             request: Request {
                 id: id.clone(),
                 instance: ask.instance.clone(),
+                sandbox: ask.sandbox.clone(),
                 key: ask.key.clone(),
                 kind: ask.kind.clone(),
                 method: ask.method.clone(),
@@ -227,13 +250,18 @@ impl Registry {
         answer
     }
 
-    /// Answers listed request `id`, waking its waiters; with none left, a
-    /// `once` leaves a one-shot grant instead. `None`: no such request.
-    pub fn answer(&self, id: &str, answer: Answer) -> Option<Request> {
+    /// Answers listed request `id`: keeps the answer ([`remember`]), then
+    /// wakes its waiters; with none left, a `once` leaves a one-shot grant
+    /// instead. `Ok(None)`: no such request. A failed write leaves the
+    /// request unanswered.
+    pub fn answer(&self, id: &str, answer: Answer) -> Result<Option<Request>> {
         let now = (self.clock)();
         let mut g = self.lock(now);
-        let i = g.entries.iter().position(|e| e.request.id == id && e.answer.is_none())?;
+        let Some(i) = g.entries.iter().position(|e| e.request.id == id && e.answer.is_none()) else { return Ok(None) };
         let request = g.entries[i].request.clone();
+        // Under the lock: a second answer to the same request finds it
+        // answered, never writes again.
+        remember(&self.data, &request, answer)?;
         if request.waiting > 0 {
             g.entries[i].answer = Some(answer);
             self.answered.notify_all();
@@ -245,7 +273,7 @@ impl Registry {
         }
         drop(g);
         self.changed();
-        Some(request)
+        Ok(Some(request))
     }
 
     /// Takes a late `once`'s grant for `key`, if one is left.
@@ -293,6 +321,47 @@ impl<'a> Grants<'a> {
     }
 }
 
+/// Writes what outlives the request: an *always* answer's rule on its
+/// credential, a *this instance* or deny answer into `access.json`.
+fn remember(data: &Path, request: &Request, answer: Answer) -> Result<()> {
+    let key = &request.key;
+    let kind = match answer {
+        Answer::Once => return Ok(()),
+        Answer::Always => {
+            return home::update(&home::path(data), |h| {
+                let entry = h.get_mut(&key.credential).with_context(|| format!("credential `{}` is gone", key.credential))?;
+                entry.rules.push(Rule {
+                    scope: key.scope.clone(),
+                    repo: key.repo.clone(),
+                    sandbox: Some(request.sandbox.clone()),
+                    profile: None,
+                    id: Some(request.id.clone()),
+                });
+                Ok(())
+            });
+        }
+        Answer::Instance => Kind::Instance,
+        Answer::Deny => Kind::Deny,
+    };
+    let kept = Remembered {
+        id: request.id.clone(),
+        instance_id: key.instance_id.clone(),
+        instance: request.instance.clone(),
+        credential: key.credential.clone(),
+        scope: key.scope.clone(),
+        repo: key.repo.clone(),
+        answer: kind,
+        at: crate::inbox::rfc3339(crate::state::Instance::now()),
+    };
+    answers::update(&answers::path(data), |a| answers::record(a, kept))
+}
+
+/// A `403` `denied` for a call matching request `id`'s kept deny.
+pub fn denied(id: &str) -> Refusal {
+    Refusal { request: Some(id.to_string()), ..Refusal::new(403, "denied", format!("denied for this instance (request {id})")) }
+        .todo(format!("devsandbox access revoke {id}"))
+}
+
 /// A `403` `pending` naming request `id`.
 pub fn pending(id: &str, reason: String) -> Refusal {
     Refusal { request: Some(id.to_string()), ..Refusal::new(403, "pending", reason) }
@@ -300,6 +369,11 @@ pub fn pending(id: &str, reason: String) -> Refusal {
 }
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// The shape of [`fresh_id`]'s ids.
+pub fn is_request_id(s: &str) -> bool {
+    s.strip_prefix("R-").is_some_and(|rest| rest.len() == 12 && rest.bytes().all(|b| CROCKFORD.contains(&b)))
+}
 
 /// `R-` and 60 random bits: unguessable to another instance, and never a
 /// credential name, which has no uppercase letter.

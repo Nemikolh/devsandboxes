@@ -47,6 +47,7 @@ use super::refusal::{Refusal, reason_phrase};
 use super::upstream::{self, Body, Length, Request, Response, Upstream, UpstreamError};
 use super::{github, graphql, guard, intercept, lfs, orgs, rewrite, route};
 use crate::config::{Access, Config};
+use crate::credentials::answers;
 use crate::credentials::ca::{Leaf, MemberCa};
 use crate::credentials::claim::{self, Refusal as Shape, Slot};
 use crate::credentials::home::{self, Home};
@@ -159,6 +160,7 @@ impl Service {
         Ok(Service {
             audit: Audit::in_data(&data),
             renewer: Renewer::new(data.clone()),
+            asks: Arc::new(Registry::new(data.clone())),
             state,
             data,
             upstream,
@@ -179,7 +181,6 @@ impl Service {
                 };
                 crate::devsbd::desktop::notify_desktop("credentials", &popup);
             }),
-            asks: Arc::default(),
         })
     }
 
@@ -423,6 +424,10 @@ impl Service {
         line.phantom = cx.phantom.map(policy::Phantom::marker);
         match outcome.action {
             Action::Refuse(r) => {
+                // A kept deny's request, which no hold set.
+                if line.request.is_none() {
+                    line.request = r.request.clone();
+                }
                 self.refuse(conn.get_mut(), &r, cx.shape.as_ref(), close_after_refusal, &mut line)?;
                 Ok(!close_after_refusal)
             }
@@ -472,8 +477,8 @@ impl Service {
         }
     }
 
-    /// Holds the call on `ask`'s request until it's answered: `Ok` for a
-    /// `once`, else the refusal. `line` gets the request and how it ended.
+    /// Holds the call on `ask`'s request until it's answered: `Ok` for an
+    /// answer that allows it, else the refusal. `line` gets the request and how it ended.
     fn hold(&self, ask: &Ask, line: &mut Line) -> Result<(), Refusal> {
         let named = |r: Refusal| Refusal { credential: Some(ask.key.credential.clone()), scope: Some(ask.key.scope.clone()), ..r };
         let ticket = self.asks.ask(ask).map_err(|r| {
@@ -485,10 +490,8 @@ impl Service {
         let answer = self.asks.wait(ticket);
         line.decided = Some(answer.map_or("timeout", asks::Answer::marker));
         match answer {
-            Some(asks::Answer::Once) => Ok(()),
-            Some(asks::Answer::Deny) => {
-                Err(named(Refusal { request: Some(id), ..Refusal::new(403, "denied", "denied by the user") }))
-            }
+            Some(a) if a.allows() => Ok(()),
+            Some(_) => Err(named(asks::denied(&id))),
             None => Err(named(asks::pending(&id, waiting(&id, &ask.key)))),
         }
     }
@@ -1428,6 +1431,11 @@ impl Sources for Files<'_> {
 
     fn granted(&self, key: &AskKey) -> bool {
         self.grants.granted(key)
+    }
+
+    fn remembered(&self, key: &AskKey) -> Result<Option<answers::Remembered>> {
+        let kept = answers::load(&answers::path(self.data))?;
+        Ok(answers::lookup(&kept, key).cloned())
     }
 }
 

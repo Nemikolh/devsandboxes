@@ -52,13 +52,17 @@
 //! 11. every scope the call needs must be granted (`max`, unset: every
 //!     scope) and requested (`access.<kind>.scopes`, empty: every scope);
 //!     `other` takes neither. Then one in `access.<kind>.ask` on a fenced
-//!     claim's repo-less route is refused (never asked); else each asked
-//!     one (in `access.<kind>.ask`, or `other`) not
-//!     [`Sources::granted`] for its [`AskKey`] (instance, credential,
-//!     scope, the repo a fenced claim's call names) is
-//!     [`Action::Ask`], the first such one: the caller holds the call for
-//!     an answer and decides again ([`super::asks`]). An `upload` LFS
-//!     batch needs the claim's `lfs.upload` scope instead of its route's.
+//!     claim's repo-less route is refused (never asked); else, for each
+//!     asked one (in `access.<kind>.ask`, or `other`) by its [`AskKey`]
+//!     (instance, credential, scope, the repo a fenced claim's call
+//!     names): a deny kept for it in `access.json`
+//!     ([`Sources::remembered`]) refuses, any asked one's before an ask;
+//!     then one allowed by a rule on the credential
+//!     ([`home::Entry::rule_for`]), a *this instance* answer kept for it
+//!     or [`Sources::granted`] goes through, and the first other one is
+//!     [`Action::Ask`]: the caller holds the call for an answer and
+//!     decides again ([`super::asks`]). An `upload` LFS batch needs the
+//!     claim's `lfs.upload` scope instead of its route's.
 //!
 //! A git smart-HTTP request ([`route::git_service`]) is refused in git's
 //! shape whatever the claim's: git prints a text body.
@@ -78,6 +82,7 @@ use super::redact;
 use super::refusal::Refusal;
 use super::route::{self, Scoped};
 use crate::config::Access;
+use crate::credentials::answers::{Kind, Remembered};
 use crate::credentials::claim::{self, Mode, Pinned, Refusal as Shape, Slot};
 use crate::credentials::fence;
 use crate::credentials::home::{self, Home};
@@ -110,6 +115,10 @@ pub trait Sources {
     /// asked only once every refusal is ruled out.
     fn granted(&self, _key: &AskKey) -> bool {
         false
+    }
+    /// The answer kept in `access.json` for `key`, read now.
+    fn remembered(&self, _key: &AskKey) -> Result<Option<Remembered>> {
+        Ok(None)
     }
 }
 
@@ -488,6 +497,7 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
             "scope `{scope}` is in `access.{kind}.ask`, but `{call_route}` names no repo, so it's never asked"
         )));
     }
+    let mut open = Vec::new();
     for n in needed.iter().filter(|n| asked(n)) {
         let ask_key = AskKey {
             instance_id: inst.instance_id.clone(),
@@ -495,10 +505,22 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
             scope: n.scope.clone(),
             repo: n.repo.clone(),
         };
+        let kept = sources
+            .remembered(&ask_key)
+            .map_err(|e| Refusal::new(503, "error", format!("cannot read the kept answers: {e:#}")))?;
+        match kept {
+            Some(r) if r.answer == Kind::Deny => return Err(asks::denied(&r.id)),
+            Some(_) => {}
+            None if entry.rule_for(&n.scope, n.repo.as_deref(), &inst.sandbox, profile).is_some() => {}
+            None => open.push(ask_key),
+        }
+    }
+    for ask_key in open {
         if !sources.granted(&ask_key) {
             return Ok(Action::Ask(Box::new(Ask {
                 key: ask_key,
                 instance: key.clone(),
+                sandbox: inst.sandbox.clone(),
                 kind: kind.to_string(),
                 method: head.method.clone(),
                 route: route::path_only(path).to_string(),

@@ -40,7 +40,7 @@ pub struct Line {
     /// The permission request the call was held on, or refused naming.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
-    /// How its hold ended: `once`, `deny` or `timeout`.
+    /// How its hold ended: an `asks::Answer::marker`, or `timeout`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decided: Option<&'static str>,
 }

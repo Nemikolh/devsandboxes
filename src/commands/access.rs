@@ -2,7 +2,8 @@
 //! this home's credentials as `credentials.toml`, the store and `state.toml`
 //! hold them; approving a pending claim version after its diff against the
 //! latest approved one (github-and-sentry-access, *The claim contract*);
-//! dropping a credential or one of its versions; the folders' GitHub repo
+//! dropping a credential or one of its versions, or the rule or kept
+//! answer a permission request left (`access.json`); the folders' GitHub repo
 //! fences, and `forget` narrowing one (docs/architecture/credentials/fence.md).
 //! Local only.
 
@@ -16,8 +17,9 @@ use super::login::{Stdio, Term, approve_or_refuse, data_dir};
 use super::status::Envelope;
 use super::run::remotes;
 use crate::config::{Access, Config};
+use crate::credentials::answers::{self, Answers, Kind, Remembered};
 use crate::credentials::fence;
-use crate::credentials::home::{self, Broken, Entry, Home, Version};
+use crate::credentials::home::{self, Broken, Entry, Home, Rule, Version};
 use crate::credentials::review;
 use crate::credentials::tokens;
 use crate::credentials::store::{Record, Store};
@@ -185,6 +187,9 @@ struct Credential {
     #[serde(skip_serializing_if = "Option::is_none")]
     expires: Option<Expires>,
     instances: Vec<Use>,
+    rules: Vec<Rule>,
+    /// The answers `access.json` keeps for it.
+    answers: Vec<Remembered>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -287,7 +292,14 @@ fn token(record: &Result<Option<Record>>) -> Token {
     }
 }
 
-fn credential(name: &str, entry: &Entry, record: Result<Option<Record>>, uses: Vec<Use>, now: u64) -> Credential {
+fn credential(
+    name: &str,
+    entry: &Entry,
+    record: Result<Option<Record>>,
+    uses: Vec<Use>,
+    kept: &Answers,
+    now: u64,
+) -> Credential {
     let expires = tokens::ends_at(record.as_ref().ok().and_then(Option::as_ref), entry.expires()).map(|at| {
         let l = tokens::left(at, now);
         Expires { at, days: l.days, expired: l.expired, warn: l.warn }
@@ -320,6 +332,8 @@ fn credential(name: &str, entry: &Entry, record: Result<Option<Record>>, uses: V
         broken: entry.broken.clone(),
         expires,
         instances: uses,
+        rules: entry.rules.clone(),
+        answers: kept.answers.iter().filter(|a| a.credential == name).cloned().collect(),
     }
 }
 
@@ -337,10 +351,11 @@ fn list_at(
     }
     let mut uses = uses(&home, state, access_of);
     let store = Store::in_data(data);
+    let kept = answers::load(&answers::path(data))?;
     Ok(home
         .iter()
         .filter(|(n, _)| only.is_none_or(|o| o == n.as_str()))
-        .map(|(n, e)| credential(n, e, store.get(n), uses.remove(n).unwrap_or_default(), now))
+        .map(|(n, e)| credential(n, e, store.get(n), uses.remove(n).unwrap_or_default(), &kept, now))
         .collect())
 }
 
@@ -435,15 +450,94 @@ fn render(list: &[Credential], now: u64) -> String {
                 out.push('\n');
             }
         }
+        if !c.rules.is_empty() {
+            out.push_str("  rules\n");
+            for r in &c.rules {
+                out.push_str(&format!("    {}\n", render_rule(r)));
+            }
+        }
+        if !c.answers.is_empty() {
+            out.push_str("  answers\n");
+            let width = c.answers.iter().map(|a| a.instance.len()).max().unwrap_or(0);
+            for a in &c.answers {
+                let answer = match a.answer {
+                    Kind::Instance => "this instance",
+                    Kind::Deny => "deny",
+                };
+                let scope = on_repo(&a.scope, a.repo.as_deref());
+                out.push_str(&format!("    {:<width$}  {scope}  {answer}  {}  {}\n", a.instance, a.id, a.at));
+            }
+        }
         blocks.push(out);
     }
     blocks.join("\n")
+}
+
+fn on_repo(scope: &str, repo: Option<&str>) -> String {
+    match repo {
+        Some(r) => format!("{scope} on {r}"),
+        None => scope.to_string(),
+    }
+}
+
+fn rule_fields(r: &Rule) -> String {
+    let mut out = on_repo(&r.scope, r.repo.as_deref());
+    for (field, value) in [("sandbox", &r.sandbox), ("profile", &r.profile)] {
+        if let Some(v) = value {
+            out.push_str(&format!(", {field} {v}"));
+        }
+    }
+    out
+}
+
+fn render_rule(r: &Rule) -> String {
+    let by = r.id.as_deref().unwrap_or("by hand");
+    format!("{}  ({by})", rule_fields(r))
 }
 
 pub fn revoke(credential: &str, version: Option<&str>, yes: bool) -> Result<()> {
     let done = revoke_at(&data_dir()?, &State::load()?, credential, version, yes, &mut Stdio, &mut config_access)?;
     println!("{done}");
     Ok(())
+}
+
+pub fn revoke_answer(id: &str) -> Result<()> {
+    println!("{}", revoke_answer_at(&data_dir()?, id)?);
+    Ok(())
+}
+
+/// Drops what request `id`'s answer left: its kept answer in
+/// `access.json`, else its rule in `credentials.toml`. No confirmation:
+/// the calls it covered are asked again, nothing is lost. Returns the line
+/// to print.
+pub(crate) fn revoke_answer_at(data: &Path, id: &str) -> Result<String> {
+    let kept = answers::update(&answers::path(data), |a| {
+        let found = a.answers.iter().find(|r| r.id == id).cloned();
+        answers::revoke(a, id);
+        found
+    })?;
+    if let Some(r) = kept {
+        let answer = match r.answer {
+            Kind::Instance => "this-instance",
+            Kind::Deny => "deny",
+        };
+        return Ok(format!(
+            "dropped the {answer} answer of request {id} (`{}` {} for instance `{}`): its calls are asked again",
+            r.credential,
+            on_repo(&r.scope, r.repo.as_deref()),
+            r.instance
+        ));
+    }
+    let rule = home::update(&home::path(data), |h| {
+        Ok(h.iter_mut().find_map(|(name, e)| {
+            let i = e.rules.iter().position(|r| r.id.as_deref() == Some(id))?;
+            Some((name.clone(), e.rules.remove(i)))
+        }))
+    })?;
+    match rule {
+        Some((name, r)) => Ok(format!("dropped the rule of request {id} on `{name}` ({}): its calls are asked again", rule_fields(&r))),
+        None => bail!("no rule or kept answer from request {id} on this host"),
+    }
 }
 
 /// `--yes` revokes; else ask on a terminal, refuse off one.
@@ -906,6 +1000,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    const ALWAYS: &str = "R-AAAAAAAAAAAA";
+    const KEPT: &str = "R-BBBBBBBBBBBB";
+
+    /// `gh` with an *always* rule and a hand-written one, and two kept
+    /// answers: `w0`'s on `gh`, `w1`'s on `sentry-work`.
+    fn answers_fixture(tag: &str) -> std::path::PathBuf {
+        let data = data_fixture(tag);
+        home::update(&home::path(&data), |h| {
+            h.get_mut("gh").unwrap().rules = vec![
+                Rule { scope: "pr.write".into(), repo: Some("o/r".into()), sandbox: Some("web".into()), profile: None, id: Some(ALWAYS.into()) },
+                Rule { scope: "issues.read".into(), repo: None, sandbox: None, profile: Some("work".into()), id: None },
+            ];
+            Ok(())
+        })
+        .unwrap();
+        let kept = |id: &str, instance: &str, credential: &str, repo: Option<&str>, answer| Remembered {
+            id: id.into(),
+            instance_id: format!("{instance}-id"),
+            instance: instance.into(),
+            credential: credential.into(),
+            scope: "other".into(),
+            repo: repo.map(String::from),
+            answer,
+            at: "2026-11-23T10:00:00Z".into(),
+        };
+        answers::update(&answers::path(&data), |a| {
+            answers::record(a, kept(KEPT, "w0", "gh", Some("o/r"), Kind::Deny));
+            answers::record(a, kept("R-CCCCCCCCCCCC", "w1", "sentry-work", None, Kind::Instance));
+        })
+        .unwrap();
+        data
+    }
+
+    #[test]
+    fn ls_shows_rules_and_kept_answers_per_credential() {
+        let data = answers_fixture("ls-answers");
+        let list = list_at(&data, &state_fixture(), None, &mut access_fixture, 0).unwrap();
+        let gh = list.iter().find(|c| c.name == "gh").unwrap();
+        assert_eq!(gh.answers.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), [KEPT]);
+        let json = serde_json::to_value(gh).unwrap();
+        assert_eq!(
+            json["rules"],
+            serde_json::json!([
+                {"scope": "pr.write", "repo": "o/r", "sandbox": "web", "id": ALWAYS},
+                {"scope": "issues.read", "profile": "work"},
+            ])
+        );
+        assert_eq!(
+            json["answers"][0],
+            serde_json::json!({"id": KEPT, "instance_id": "w0-id", "instance": "w0", "credential": "gh", "scope": "other",
+                               "repo": "o/r", "answer": "deny", "at": "2026-11-23T10:00:00Z"})
+        );
+        let text = render(&list, 0);
+        let want = format!(
+            "  rules\n    pr.write on o/r, sandbox web  ({ALWAYS})\n    issues.read, profile work  (by hand)\n  \
+             answers\n    w0  other on o/r  deny  {KEPT}  2026-11-23T10:00:00Z\n"
+        );
+        assert!(text.contains(&want), "{text}");
+        assert!(text.contains("  answers\n    w1  other  this instance  R-CCCCCCCCCCCC  2026-11-23T10:00:00Z\n"), "{text}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn revoke_by_request_id_drops_its_kept_answer_or_rule() {
+        let data = answers_fixture("revoke-answer");
+        let done = revoke_answer_at(&data, KEPT).unwrap();
+        assert_eq!(done, format!("dropped the deny answer of request {KEPT} (`gh` other on o/r for instance `w0`): its calls are asked again"));
+        let left = answers::load(&answers::path(&data)).unwrap();
+        assert_eq!(left.answers.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["R-CCCCCCCCCCCC"]);
+
+        let done = revoke_answer_at(&data, ALWAYS).unwrap();
+        assert_eq!(done, format!("dropped the rule of request {ALWAYS} on `gh` (pr.write on o/r, sandbox web): its calls are asked again"));
+        let rules = home::load(&home::path(&data)).unwrap()["gh"].rules.clone();
+        assert_eq!(rules.iter().map(|r| r.scope.as_str()).collect::<Vec<_>>(), ["issues.read"], "the hand-written one stays");
+
+        let err = revoke_answer_at(&data, ALWAYS).unwrap_err().to_string();
+        assert_eq!(err, format!("no rule or kept answer from request {ALWAYS} on this host"));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     #[test]
     fn json_shape_and_oauth_tokens_without_values() {
         let data = data_fixture("ls-json");
@@ -931,7 +1105,7 @@ mod tests {
                 "orgs": [], "org_fence": false,
                 "approved": [], "pending": [], "broken": null,
                 "expires": {"at": 1_900_000_000u64, "days": 21990, "expired": false, "warn": false},
-                "instances": [],
+                "instances": [], "rules": [], "answers": [],
             })
         );
         let text = serde_json::to_string(&json).unwrap() + &render(&list, 0);

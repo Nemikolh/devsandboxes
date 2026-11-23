@@ -79,6 +79,41 @@ pub struct Entry {
     /// login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Asked scopes that go through without asking: *always* answers,
+    /// and hand-written ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
+}
+
+/// An asked scope allowed for every call it matches: its `scope`, and each
+/// field set equal to the call's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub scope: String,
+    /// `owner/name`, any case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The instance's sandbox name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    /// The instance's profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// The request whose *always* answer wrote it, for `access revoke`;
+    /// hand-written rules have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl Rule {
+    /// `repo`: the lowercase one a fenced claim's call names.
+    pub fn matches(&self, scope: &str, repo: Option<&str>, sandbox: &str, profile: Option<&str>) -> bool {
+        self.scope == scope
+            && self.repo.as_deref().is_none_or(|r| repo.is_some_and(|c| r.eq_ignore_ascii_case(c)))
+            && self.sandbox.as_deref().is_none_or(|s| s == sandbox)
+            && self.profile.as_deref().is_none_or(|p| profile == Some(p))
+    }
 }
 
 /// Why the broker stopped trusting the secret: a refused refresh, an
@@ -109,7 +144,13 @@ impl Entry {
             pending: Vec::new(),
             broken: None,
             expires_at: None,
+            rules: Vec::new(),
         }
+    }
+
+    /// The rule allowing `scope` for this call, if any.
+    pub fn rule_for(&self, scope: &str, repo: Option<&str>, sandbox: &str, profile: Option<&str>) -> Option<&Rule> {
+        self.rules.iter().find(|r| r.matches(scope, repo, sandbox, profile))
     }
 
     /// [`Entry::expires_at`] in unix seconds; checked at load.
@@ -148,6 +189,16 @@ impl Entry {
             && self.expires().is_none()
         {
             bail!("`expires_at`: `{at}` isn't an RFC 3339 date-time");
+        }
+        for r in &self.rules {
+            if let Some(id) = &r.id
+                && !crate::broker::asks::is_request_id(id)
+            {
+                bail!("`rules`: `{id}` isn't a request id");
+            }
+            if let Some(p) = &r.profile {
+                crate::config::check_profile_name(p).context("`rules`")?;
+            }
         }
         for (field, versions) in [("approved", &self.approved), ("pending", &self.pending)] {
             for v in versions {
@@ -430,6 +481,30 @@ pub(crate) mod tests {
             ("[x]\nkind = \"sentry\"\nprofiles = [\"Work\"]\n", "profile name"),
             ("[x]\nkind = \"github\"\nas = [\"bot\"]\n", "`as`"),
             ("[x]\nkind = \"github\"\nexpires_at = \"soon\"\n", "`expires_at`"),
+        ] {
+            let err = format!("{:#}", parse(bad).unwrap_err());
+            assert!(err.contains(wants), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rules_round_trip_and_match_each_field_they_set() {
+        let text = "[gh]\nkind = \"github\"\nsource = \"file\"\n\n[[gh.rules]]\nscope = \"pr.write\"\nrepo = \"O/R\"\nsandbox = \"web\"\nid = \"R-0123456789AB\"\n\n[[gh.rules]]\nscope = \"issues.read\"\nprofile = \"work\"\n";
+        let home = parse(text).unwrap();
+        assert_eq!(serialize(&home).unwrap(), text);
+        let e = &home["gh"];
+        assert_eq!(e.rule_for("pr.write", Some("o/r"), "web", None).and_then(|r| r.id.as_deref()), Some("R-0123456789AB"));
+        assert!(e.rule_for("pr.write", None, "web", None).is_none(), "a rule naming a repo needs the call's");
+        assert!(e.rule_for("pr.write", Some("o/s"), "web", None).is_none());
+        assert!(e.rule_for("pr.write", Some("o/r"), "api", None).is_none());
+        assert!(e.rule_for("pr.read", Some("o/r"), "web", None).is_none());
+        assert!(e.rule_for("issues.read", Some("any/repo"), "any", Some("work")).is_some());
+        assert!(e.rule_for("issues.read", None, "any", Some("home")).is_none());
+        assert!(e.rule_for("issues.read", None, "any", None).is_none());
+        for (bad, wants) in [
+            ("[gh]\nkind = \"github\"\n[[gh.rules]]\nscope = \"x\"\nid = \"gh\"\n", "isn't a request id"),
+            ("[gh]\nkind = \"github\"\n[[gh.rules]]\nscope = \"x\"\nprofile = \"Work\"\n", "profile name"),
+            ("[gh]\nkind = \"github\"\n[[gh.rules]]\nscope = \"x\"\nmember = \"m\"\n", "member"),
         ] {
             let err = format!("{:#}", parse(bad).unwrap_err());
             assert!(err.contains(wants), "{bad}: {err}");

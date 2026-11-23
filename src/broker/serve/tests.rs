@@ -549,20 +549,67 @@ fn a_held_call_goes_upstream_once_approved_and_a_denied_one_is_refused() {
     assert_ne!(once, denied);
     assert_eq!(a.status, 403, "{a:?}");
     let v = a.json();
-    assert_eq!(v["detail"], "devsandbox: denied by the user");
+    assert_eq!(
+        v["detail"],
+        format!("devsandbox: denied for this instance (request {denied}) (devsandbox access revoke {denied})")
+    );
     assert_eq!((v["devsandbox"]["verdict"].as_str(), v["devsandbox"]["request"].as_str()), (Some("denied"), Some(denied.as_str())));
     assert_eq!(v["devsandbox"]["scope"], "issues.read");
     assert_eq!(seen.lock().unwrap().len(), 1, "a denied call isn't dialed");
+    // The deny is kept: the next call is refused at once, no request.
+    let a = c.call("GET", "/api/0/issues/1/", &bearer(OWN), b"");
+    assert_eq!(a.json()["devsandbox"]["request"].as_str(), Some(denied.as_str()));
+    assert!(rig.service.asks().pending().is_empty());
 
-    let log = rig.log(2);
+    let log = rig.log(3);
     assert_eq!((log[0]["verdict"].as_str(), log[0]["decided"].as_str()), (Some("allow"), Some("once")));
+    assert!(log[2].get("decided").is_none(), "{}", log[2]);
+    assert_eq!((log[2]["verdict"].as_str(), log[2]["request"].as_str()), (Some("denied"), Some(denied.as_str())));
     assert_eq!(log[0]["request"].as_str(), Some(once.as_str()));
     assert_eq!((log[1]["verdict"].as_str(), log[1]["decided"].as_str()), (Some("denied"), Some("deny")));
     assert_eq!(log[1]["request"].as_str(), Some(denied.as_str()));
     // A call never held has neither.
     c.call("GET", "/api/0/", &bearer(OWN), b"");
-    let log = rig.log(3);
-    assert!(log[2].get("request").is_none() && log[2].get("decided").is_none(), "{}", log[2]);
+    let log = rig.log(4);
+    assert!(log[3].get("request").is_none() && log[3].get("decided").is_none(), "{}", log[3]);
+}
+
+#[test]
+fn this_instance_and_always_answers_let_every_next_call_through() {
+    for (tag, answer) in [("ask-instance", asks::Answer::Instance), ("ask-always", asks::Answer::Always)] {
+        let (port, seen) = upstream_server(echo);
+        let rig = asking(tag, port, 30);
+        let service = rig.service.clone();
+        let approver = thread::spawn(move || {
+            let first = first_pending(service.asks());
+            service.asks().answer(&first.id, answer).unwrap().unwrap();
+            first.id
+        });
+        let mut c = rig.connect("sentry.io");
+        assert_eq!(c.call("GET", "/api/0/issues/1/", &bearer(OWN), b"").status, 200);
+        let id = approver.join().unwrap();
+        for _ in 0..2 {
+            assert_eq!(c.call("GET", "/api/0/issues/1/", &bearer(OWN), b"").status, 200);
+        }
+        assert_eq!(seen.lock().unwrap().len(), 3, "{tag}");
+        assert!(rig.service.asks().pending().is_empty(), "{tag}");
+        let log = rig.log(3);
+        assert_eq!(log[0]["decided"].as_str(), Some(answer.marker()));
+        assert!(log[1].get("request").is_none(), "{}", log[1]);
+        let data = rig.dir.join("data");
+        let kept = crate::credentials::answers::load(&crate::credentials::answers::path(&data)).unwrap();
+        let rules = home::load(&home::path(&data)).unwrap()["sentry-work"].rules.clone();
+        match answer {
+            asks::Answer::Instance => {
+                assert_eq!(kept.answers.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), [id.as_str()]);
+                assert!(rules.is_empty());
+            }
+            _ => {
+                assert!(kept.answers.is_empty());
+                assert_eq!((rules[0].id.as_deref(), rules[0].sandbox.as_deref()), (Some(id.as_str()), Some("web")));
+            }
+        }
+    }
 }
 
 #[test]

@@ -1,7 +1,9 @@
-//! Platform-neutral, but for the home's files ([`home`], [`store`], [`ca`]), which
+//! Platform-neutral, but for the home's files ([`home`], [`store`], [`ca`], [`answers`]), which
 //! take `serve::locked_file`'s unix write discipline, and the logins that
 //! fill them ([`oauth`]), which open URLs as `open` does.
 
+#[cfg(unix)]
+pub mod answers;
 #[cfg(unix)]
 pub mod ca;
 pub mod claim;

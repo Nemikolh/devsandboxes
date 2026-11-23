@@ -919,6 +919,8 @@ type PinTrigger = Option<(String, String)>;
 
 impl Shared {
     fn new(version: Version, inbox: PathBuf, state: PathBuf, join: Join) -> Self {
+        // The broker's data dir is `state.toml`'s too (`broker::serve::Service::new`).
+        let data = state.parent().map(Path::to_path_buf).unwrap_or_default();
         Self {
             version,
             inbox,
@@ -965,7 +967,7 @@ impl Shared {
             told_not_authority: Mutex::default(),
             pin: OnceLock::new(),
             pin_skipped: Mutex::default(),
-            asks: Arc::default(),
+            asks: Arc::new(crate::broker::asks::Registry::new(data)),
         }
     }
 

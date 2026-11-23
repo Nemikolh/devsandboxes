@@ -1109,3 +1109,106 @@ fn an_org_list_route_hands_serve_the_fence() {
     let none = OrgSrc::new(&[], &[], &[]);
     assert_eq!(injected(&org_call(&none, "GET", "/api/0/organizations/")).orgs.as_ref().unwrap().allowed, Vec::<String>::new());
 }
+
+/// `src` with `kept` in `access.json`.
+struct Kept<'a>(&'a dyn Sources, Vec<Remembered>);
+
+impl Sources for Kept<'_> {
+    fn home(&self) -> Result<Home> {
+        self.0.home()
+    }
+    fn access(&self, inst: &Instance, kind: &str) -> Result<Option<Access>> {
+        self.0.access(inst, kind)
+    }
+    fn github(&self) -> Option<&dyn github::Lookup> {
+        self.0.github()
+    }
+    fn remembered(&self, key: &AskKey) -> Result<Option<Remembered>> {
+        let kept = crate::credentials::answers::Answers { answers: self.1.clone() };
+        Ok(crate::credentials::answers::lookup(&kept, key).cloned())
+    }
+}
+
+fn kept(id: &str, key: &AskKey, answer: Kind) -> Remembered {
+    Remembered {
+        id: id.into(),
+        instance_id: key.instance_id.clone(),
+        instance: "web-1".into(),
+        credential: key.credential.clone(),
+        scope: key.scope.clone(),
+        repo: key.repo.clone(),
+        answer,
+        at: "2026-11-23T10:00:00Z".into(),
+    }
+}
+
+fn rule(scope: &str, repo: Option<&str>, sandbox: Option<&str>, profile: Option<&str>) -> home::Rule {
+    home::Rule {
+        scope: scope.into(),
+        repo: repo.map(String::from),
+        sandbox: sandbox.map(String::from),
+        profile: profile.map(String::from),
+        id: None,
+    }
+}
+
+const DENIED: &str = "R-0123456789AB";
+
+#[test]
+fn rules_and_kept_answers_let_asked_calls_through_and_a_kept_deny_refuses() {
+    let token = format!("Authorization: token {GH}\r\n");
+    let ask = || fenced_src(Some(Access { ask: vec!["repo.read".into()], ..Access::default() }));
+    let call = |src: &dyn Sources| {
+        let head = parse_head(format!("GET /repos/O/R HTTP/1.1\r\nHost: api.github.com\r\n{token}\r\n").as_bytes()).unwrap();
+        let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
+        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &fenced_state(), src)
+    };
+    let key = asked(&call(&ask()), "repo.read", Some("o/r")).key.clone();
+    assert_eq!(asked(&call(&ask()), "repo.read", Some("o/r")).sandbox, "web");
+
+    // A rule: its scope, and each field it sets equal to the call's.
+    for (r, through) in [
+        (rule("repo.read", None, None, None), true),
+        (rule("repo.read", Some("O/R"), Some("web"), Some("work")), true),
+        (rule("repo.read", Some("o/s"), None, None), false),
+        (rule("repo.read", None, Some("api"), None), false),
+        (rule("repo.read", None, None, Some("home")), false),
+        (rule("pr.write", None, None, None), false),
+    ] {
+        let mut src = ask();
+        src.home.get_mut("github-work").unwrap().rules = vec![r.clone()];
+        if through {
+            injected(&call(&src));
+        } else {
+            asked(&call(&src), "repo.read", Some("o/r"));
+        }
+    }
+
+    // A kept *this instance* answer, its own instance's only.
+    let src = ask();
+    injected(&call(&Kept(&src, vec![kept("R-AAAAAAAAAAAA", &key, Kind::Instance)])));
+    let elsewhere = AskKey { instance_id: "other-id".into(), ..key.clone() };
+    asked(&call(&Kept(&src, vec![kept("R-AAAAAAAAAAAA", &elsewhere, Kind::Instance)])), "repo.read", Some("o/r"));
+
+    // A kept deny beats a rule.
+    let mut src = ask();
+    src.home.get_mut("github-work").unwrap().rules = vec![rule("repo.read", None, None, None)];
+    let o = call(&Kept(&src, vec![kept(DENIED, &key, Kind::Deny)]));
+    let r = refused(&o, &format!("denied for this instance (request {DENIED})"));
+    assert_eq!((r.status, r.verdict, r.request.as_deref()), (403, "denied", Some(DENIED)));
+    assert_eq!(r.todo.as_deref(), Some(format!("devsandbox access revoke {DENIED}").as_str()));
+    assert_eq!((r.credential.as_deref(), r.scope.as_deref()), (Some("github-work"), Some("repo.read")));
+    // Another instance's deny doesn't count.
+    injected(&call(&Kept(&src, vec![kept(DENIED, &elsewhere, Kind::Deny)])));
+}
+
+#[test]
+fn a_kept_deny_refuses_before_another_scope_is_asked() {
+    let state = fenced_state();
+    let both = serde_json::json!({ "query": "mutation($r: ID!) { a: createPullRequest(input: {repositoryId: $r}) { x } addComment(input: {subjectId: \"I_in\"}) { x } }", "variables": { "r": "R_42" } });
+    let ask = gql_src(Some(Access { ask: vec!["pr.write".into(), "issues.write".into()], ..Access::default() }));
+    let first = asked(&gql(&state, &ask, both.clone()), "pr.write", Some("o/r")).key.clone();
+    let issues = AskKey { scope: "issues.write".into(), ..first };
+    let o = gql(&state, &Kept(&ask, vec![kept(DENIED, &issues, Kind::Deny)]), both);
+    refused(&o, "denied for this instance");
+}
