@@ -446,6 +446,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     let shared = Arc::new(shared);
     let _ = hooked.set(Arc::downgrade(&shared));
+    publish_access(&shared);
     // On the authority: this build pinned, once the control plane's platform
     // allows (now if this host is the control plane; else at the link to it).
     if opts.pin_builds {
@@ -1762,6 +1763,18 @@ impl Shared {
 /// and a client that stops reading still costs a bounded few.
 const OPENS_KEPT: usize = 8;
 
+/// `access.changed` to `access` subscribers on every change of the
+/// permission requests. Weak like [`open_done`]: the hook lives in
+/// [`Shared::asks`].
+fn publish_access(shared: &Arc<Shared>) {
+    let weak = Arc::downgrade(shared);
+    shared.asks.on_change(Box::new(move || {
+        if let Some(shared) = weak.upgrade() {
+            shared.publish(Topic::Access, |p| p.access = true);
+        }
+    }));
+}
+
 /// The daemon's `open::OnDone`: each outcome to `opens` subscribers
 /// ([`Shared::publish_open`]). Holds `shared` weakly: it ends up inside
 /// [`Shared::open_here`], and a strong one would keep a stopped daemon's
@@ -1831,6 +1844,8 @@ struct Pending {
     opens: Vec<Value>,
     /// `roots.changed`.
     roots: bool,
+    /// `access.changed`.
+    access: bool,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
     /// The connection holds a `links.inbound` announce (a `fleet-link
@@ -1872,6 +1887,7 @@ impl Pending {
             || self.forwards_status.is_some()
             || !self.opens.is_empty()
             || self.roots
+            || self.access
             || self.closing.is_some()
             || self.cycle.is_some()
     }
@@ -1901,6 +1917,9 @@ impl Pending {
         }
         if std::mem::take(&mut self.roots) {
             out.push(Notification { method: "roots.changed".into(), params: json!({}) });
+        }
+        if std::mem::take(&mut self.access) {
+            out.push(Notification { method: "access.changed".into(), params: json!({}) });
         }
         if let Some(why) = self.cycle.take() {
             let params = match why {
@@ -2758,7 +2777,7 @@ fn local_call(method: &str, params: Value, shared: &Shared, conn: &ConnState) ->
     // could run them; the copies stay, for relaying).
     let data = shared.data_dir().filter(|_| (shared.installed)());
     let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref(), data, member: shared.member.as_deref() });
-    api::call(method, params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, host })
+    api::call(method, params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, access: Some(&shared.asks), host })
 }
 
 /// A quick call with `machine`: the rest of its params to that machine's
@@ -3566,6 +3585,7 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
                     }
                     Topic::Opens => p.opens.clear(),
                     Topic::Roots => p.roots = false,
+                    Topic::Access => p.access = false,
                 }
             }
         }
@@ -4553,6 +4573,42 @@ pub(crate) mod tests {
         // Not subscribed to `forwards`: nothing.
         other.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
         line.clear();
+        assert!(other.read_line(&mut line).is_err() || line.is_empty(), "{line}");
+    }
+
+    /// A request opened and one answered each reach `access` subscribers
+    /// as `access.changed`, over the hook `run` installs.
+    #[test]
+    fn access_subscribers_hear_requests_open_and_close() {
+        use crate::broker::asks::{Answer, Ask, AskKey};
+        let shared = bare_shared("access-store");
+        publish_access(&shared);
+        let mut access = subscribed(&shared, 1, json!(["access"]));
+        let mut other = subscribed(&shared, 2, json!(["inbox", "instances", "forwards"]));
+        let read = |reader: &mut BufReader<std::os::unix::net::UnixStream>| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let n: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!((n["method"].as_str(), &n["params"]), (Some("access.changed"), &json!({})));
+        };
+        assert_eq!(crate::serve::dts::prop_type("ApiEvents", "access.changed").as_deref(), Some("{}"));
+        let raised = Ask {
+            key: AskKey { instance_id: "w-id".into(), credential: "gh".into(), scope: "pr.write".into(), repo: None },
+            instance: "w".into(),
+            sandbox: "w".into(),
+            kind: "github".into(),
+            method: "POST".into(),
+            route: "/x".into(),
+            hold: Duration::from_secs(30),
+        };
+        let id = shared.asks.ask(&raised).unwrap().id().to_string();
+        read(&mut access);
+        let (r, _) = ask(&mut access, "access.pending", json!({}));
+        assert_eq!(r["result"]["requests"][0]["id"], id.as_str());
+        shared.asks.answer(&id, Answer::Once).unwrap().unwrap();
+        read(&mut access);
+        other.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut line = String::new();
         assert!(other.read_line(&mut line).is_err() || line.is_empty(), "{line}");
     }
 

@@ -315,7 +315,7 @@ pub(super) fn local_call(method: &str, params: Value) -> Result<Response> {
     if !matches!(method, "config.findings" | "config.migrate" | "config.ack" | "instances.resolve") {
         bail!("`{method}` needs devsandbox serve");
     }
-    let ctx = api::Ctx { inbox: Path::new(""), client: "cli", bridges: None, forwards: None, host: None };
+    let ctx = api::Ctx { inbox: Path::new(""), client: "cli", bridges: None, forwards: None, access: None, host: None };
     Ok(match api::call(method, params, &ctx) {
         Ok(v) => Response::ok(None, v),
         Err(e) => Response::err(None, e.code, e.message),

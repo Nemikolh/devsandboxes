@@ -265,6 +265,35 @@ fn an_unanswered_request_goes_once_its_late_window_passes() {
 }
 
 #[test]
+fn a_request_leaving_its_late_window_calls_the_hook_once() {
+    let (r, clock) = manual("prune-hook");
+    let changes = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&changes);
+    r.on_change(Box::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    }));
+    let t = r.ask(&ask("pr.write", None, Duration::from_secs(1))).unwrap();
+    clock.advance(Duration::from_secs(1));
+    r.wait(t);
+    let before = changes.load(Ordering::SeqCst);
+    r.prune();
+    assert_eq!(changes.load(Ordering::SeqCst), before, "nothing dropped");
+    clock.advance(LATE_GRANT);
+    r.prune();
+    assert_eq!(changes.load(Ordering::SeqCst), before + 1);
+    assert!(r.pending().is_empty());
+    assert_eq!(changes.load(Ordering::SeqCst), before + 1, "dropped once");
+}
+
+#[test]
+fn answers_parse_from_their_markers() {
+    for a in [Answer::Once, Answer::Instance, Answer::Always, Answer::Deny] {
+        assert_eq!(Answer::parse(a.marker()), Some(a));
+    }
+    assert_eq!(Answer::parse("yes"), None);
+}
+
+#[test]
 fn a_call_keeps_the_grants_it_took() {
     let (r, clock) = manual("keeps");
     let key = ask("pr.write", None, LONG).key;

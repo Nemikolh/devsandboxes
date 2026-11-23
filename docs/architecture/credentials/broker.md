@@ -540,7 +540,19 @@ hands it through `Host::start` to `Service::from_host`):
   call with that key within `LATE_GRANT` takes it (`Registry::granted`)
   and goes through unheld; the other answers are kept as above.
 - **Changes**: `Registry::on_change` sets the hook every open, join,
-  answer and waiter leaving calls, outside the registry's lock.
+  answer and waiter leaving calls, outside the registry's lock, and a
+  request dropped past its late window: by whichever call locks the
+  registry next, else by `Registry::prune`, which the host poll
+  (`serve::host`) calls every pass. The daemon's hook
+  (`daemon::publish_access`) flags `access.changed` for `access`
+  subscribers.
+- **Who answers**: the API, local clients only: `access.pending` lists
+  the requests (`api::AccessRequest`: what the sandbox's call chose,
+  method, route and repo, with control characters escaped by
+  `open::printable`), `access.decide` answers one
+  ([API](../../reference/api.md#access)). `lent::admit` refuses
+  `access.*`, `credentials.*` and a `subscribe` to `access` to every
+  peer, under either trust.
 
 Requests live in memory: a daemon exiting drops them with their held
 calls. Kept answers live in the files: `serve::Files::remembered` reads

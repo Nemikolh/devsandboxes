@@ -566,7 +566,7 @@ export type ThreadState = 'needs-you' | 'active' | 'done';
 export type InboxView = 'needs-you' | 'active' | 'done' | 'all';
 
 /** A notification topic for `subscribe`. */
-export type ApiTopic = 'inbox' | 'instances' | 'forwards' | 'opens' | 'roots';
+export type ApiTopic = 'inbox' | 'instances' | 'forwards' | 'opens' | 'roots' | 'access';
 
 /** One Inbox thread (`inbox.list()`), and the head of {@link ThreadDetail}. */
 export interface ThreadSummary {
@@ -1654,6 +1654,44 @@ export interface ForwardRemoved {
   configured: boolean;
 }
 
+/** A credential call held for a permission (`access.pending`). */
+export interface AccessRequest {
+  /** `R-` and 12 characters: what `access.decide` takes. */
+  id: string;
+  instance: string;
+  instance_id: string;
+  sandbox: string;
+  credential: string;
+  /** The credential's kind, e.g. `github`. */
+  kind: string;
+  scope: string;
+  /** The repo the call names, for a repo-fenced scope. Control characters escaped. */
+  repo: string | null;
+  /** The call's HTTP method. Control characters escaped. */
+  method: string;
+  /** The call's path, query dropped. Control characters escaped. */
+  route: string;
+  /** Unix seconds. */
+  opened_at: number;
+  /** A call waits on it now; else only a late answer is left (a `once` then grants the next matching call). */
+  held: boolean;
+  /** Calls held on it now. */
+  waiting: number;
+}
+
+/** `access.pending`'s answer: unanswered requests, oldest first. */
+export interface AccessPending {
+  requests: AccessRequest[];
+}
+
+/** How `access.decide` answers: once, this instance (until its `rm`), always (a rule for its sandbox), deny (kept). */
+export type AccessAnswer = 'once' | 'instance' | 'always' | 'deny';
+
+/** `access.decide`'s answer: the request as it was answered. */
+export interface AccessDecided {
+  request: AccessRequest;
+}
+
 /** `inbox.changed` params: the store changed, re-fetch. */
 export interface InboxChanged {
   /** Grows per change this daemon saw; compare within one connection only. */
@@ -1881,6 +1919,8 @@ export interface ApiEvents {
   'opens.done': OpensDone;
   /** What `roots.list` lists moved; needs the `roots` topic. */
   'roots.changed': {};
+  /** What `access.pending` lists changed; needs the `access` topic (local clients only). */
+  'access.changed': {};
   /** A verb request's output; sent to its connection, no `subscribe` needed. */
   output: VerbOutput;
   /** A verb request's phase change; sent to its connection, no `subscribe` needed. */
@@ -2182,6 +2222,10 @@ export interface ApiMethods {
   'forwards.list': { params: { dir?: string; machines?: boolean }; result: ForwardRow[] };
   'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };
+  /** Local clients only. */
+  'access.pending': { params: {}; result: AccessPending };
+  /** `not-found` for a request answered meanwhile or gone past its late window. Local clients only. */
+  'access.decide': { params: { request: string; answer: AccessAnswer }; result: AccessDecided };
   /** Verbs hold the connection until they exit (or a `detach` answer); hanging up cancels. */
   run: { params: RunParams; result: VerbResult | VerbDetached };
   rebuild: { params: RebuildParams; result: VerbResult | VerbDetached };

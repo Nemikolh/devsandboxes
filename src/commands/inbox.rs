@@ -599,7 +599,7 @@ mod tests {
             let api = crate::serve::api::call(
                 m.method(),
                 m.params(id),
-                &crate::serve::api::Ctx { inbox: &copy, client: "cli", bridges: None, forwards: None, host: None },
+                &crate::serve::api::Ctx { inbox: &copy, client: "cli", bridges: None, forwards: None, access: None, host: None },
             );
             match (&cli, &api) {
                 (Ok(_), Ok(_)) => {

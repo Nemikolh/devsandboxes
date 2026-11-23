@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::forwards::{AddRequest, Added, ForwardRow, Removed};
+use crate::broker::asks::{self, Registry};
 use crate::devsbd::rpc::Obj;
 use crate::config_identity::ops as identity_ops;
 use crate::inbox::wire::{self, Addr, resolve};
@@ -46,6 +47,9 @@ pub struct Ctx<'a> {
     pub bridges: Option<&'a dyn Bridging>,
     /// The port forwards `forwards.*` act on; `None` like `bridges`.
     pub forwards: Option<&'a dyn Forwarding>,
+    /// The permission requests `access.*` list and answer; `None` like
+    /// `bridges`.
+    pub access: Option<&'a Registry>,
     /// Where `roots.list` and the instance methods look; `None` is the
     /// user's (`State::path`, `$HOME`). A daemon passes its own, so a test
     /// daemon standing in as a machine never reads the user's.
@@ -185,6 +189,8 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "forwards.list" => forwards_list(parse(params)?, ctx),
         "forwards.add" => forwards_add(parse(params)?, ctx),
         "forwards.rm" => forwards_rm(parse(params)?, ctx),
+        "access.pending" => access_pending(ctx),
+        "access.decide" => access_decide(parse(params)?, ctx),
         other => Err(ApiError::unknown_method(other)),
     }
 }
@@ -211,6 +217,9 @@ pub enum Topic {
     Opens,
     /// `roots.changed`: what `roots.list` lists moved, re-fetch.
     Roots,
+    /// `access.changed`: what `access.pending` lists changed, re-fetch.
+    /// Local clients only.
+    Access,
 }
 
 impl Topic {
@@ -221,6 +230,7 @@ impl Topic {
             "forwards" => Some(Topic::Forwards),
             "opens" => Some(Topic::Opens),
             "roots" => Some(Topic::Roots),
+            "access" => Some(Topic::Access),
             _ => None,
         }
     }
@@ -236,7 +246,7 @@ pub fn topics(params: Value) -> Result<Vec<Topic>, ApiError> {
     let p: TopicsParams = parse(params)?;
     p.topics
         .iter()
-        .map(|t| Topic::parse(t).ok_or_else(|| ApiError::invalid(format!("unknown topic `{t}` (inbox, instances, forwards, opens)"))))
+        .map(|t| Topic::parse(t).ok_or_else(|| ApiError::invalid(format!("unknown topic `{t}` (inbox, instances, forwards, opens, roots, access)"))))
         .collect()
 }
 
@@ -1353,6 +1363,78 @@ fn forwards_rm(p: ForwardsRmParams, ctx: &Ctx) -> Answer {
     serde_json::to_value(view).map_err(|e| ApiError::internal(e.into()))
 }
 
+/// A permission request as `access.*` show it. What the sandbox's call
+/// chose (method, route, repo) has its control characters escaped, so no
+/// client prints a container's terminal escapes.
+#[derive(Debug, Serialize)]
+pub struct AccessRequest {
+    pub id: String,
+    pub instance: String,
+    pub instance_id: String,
+    pub sandbox: String,
+    pub credential: String,
+    pub kind: String,
+    pub scope: String,
+    pub repo: Option<String>,
+    pub method: String,
+    pub route: String,
+    /// Unix seconds.
+    pub opened_at: u64,
+    /// A call waits on it now; else only a late answer is left.
+    pub held: bool,
+    pub waiting: usize,
+}
+
+impl AccessRequest {
+    pub fn new(r: &asks::Request) -> AccessRequest {
+        let printable = crate::open::printable;
+        AccessRequest {
+            id: r.id.clone(),
+            instance: r.instance.clone(),
+            instance_id: r.key.instance_id.clone(),
+            sandbox: r.sandbox.clone(),
+            credential: r.key.credential.clone(),
+            kind: r.kind.clone(),
+            scope: r.key.scope.clone(),
+            repo: r.key.repo.as_deref().map(printable),
+            method: printable(&r.method),
+            route: printable(&r.route),
+            opened_at: r.opened_unix,
+            held: r.waiting > 0,
+            waiting: r.waiting,
+        }
+    }
+}
+
+fn asking<'a>(ctx: &Ctx<'a>) -> Result<&'a Registry, ApiError> {
+    ctx.access.ok_or_else(|| ApiError::internal(anyhow::anyhow!("this daemon brokers no credentials")))
+}
+
+fn access_pending(ctx: &Ctx) -> Answer {
+    let requests: Vec<AccessRequest> = asking(ctx)?.pending().iter().map(AccessRequest::new).collect();
+    Ok(json!({ "requests": requests }))
+}
+
+#[derive(Deserialize)]
+struct DecideParams {
+    request: String,
+    answer: String,
+}
+
+/// Answers a listed request; the answer is kept before this returns
+/// (`asks::Registry::answer`). A request answered, or dropped past its
+/// late window, meanwhile is `not-found`.
+fn access_decide(p: DecideParams, ctx: &Ctx) -> Answer {
+    let registry = asking(ctx)?;
+    let answer = asks::Answer::parse(&p.answer)
+        .ok_or_else(|| ApiError::invalid(format!("unknown answer `{}` (once, instance, always, deny)", p.answer)))?;
+    let request = registry
+        .answer(&p.request, answer)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no pending request `{}`", crate::open::printable(&p.request))))?;
+    Ok(json!({ "request": AccessRequest::new(&request) }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1391,7 +1473,7 @@ mod tests {
     }
 
     fn run(path: &Path, method: &str, params: Value) -> Answer {
-        call(method, params, &Ctx { inbox: path, client: "api:test", bridges: None, forwards: None, host: None })
+        call(method, params, &Ctx { inbox: path, client: "api:test", bridges: None, forwards: None, access: None, host: None })
     }
 
     /// Records what `bridges.ensure` asked for; knows instance `web` only.
@@ -1431,7 +1513,7 @@ mod tests {
         let path = store_path("ensure-wait");
         let not = Readiness { ready: false, error: Some("helper in devsandbox-web is outdated".into()) };
         let fake = FakeBridges { readiness: Some(not), ..FakeBridges::default() };
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None, host: None });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None, access: None, host: None });
 
         assert_eq!(ensure(json!({"instance": "web"})).unwrap(), json!({"ok": true}), "no wait: unchanged");
         assert!(fake.waits.borrow().is_empty());
@@ -1451,7 +1533,7 @@ mod tests {
         assert_eq!(fake.woken.borrow().len(), 4, "a bad wait wakes nothing");
 
         let ready = FakeBridges { readiness: Some(Readiness { ready: true, error: None }), ..FakeBridges::default() };
-        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, client: "api:test", bridges: Some(&ready), forwards: None, host: None });
+        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, client: "api:test", bridges: Some(&ready), forwards: None, access: None, host: None });
         assert_eq!(r.unwrap(), json!({"ok": true, "ready": true, "error": null}));
     }
 
@@ -1459,7 +1541,7 @@ mod tests {
     fn bridges_ensure_records_the_agent_and_reconciles_the_instance() {
         let path = store_path("ensure");
         let fake = FakeBridges::default();
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None, host: None });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None, access: None, host: None });
 
         assert_eq!(ensure(json!({"instance": "web", "agent": "/tmp/ssh-x/agent.1"})).unwrap(), json!({"ok": true}));
         assert_eq!(ensure(json!({"instance": "web", "agent": null})).unwrap(), json!({"ok": true}));
@@ -2258,7 +2340,7 @@ mod tests {
         let home = base.join("home");
         let state = base.join("state.toml");
         let host = HostPaths { state: &state, home: Some(&home), data: None, member: None };
-        let ctx = Ctx { inbox: &base.join("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) };
+        let ctx = Ctx { inbox: &base.join("inbox.json"), client: "api:test", bridges: None, forwards: None, access: None, host: Some(host) };
         let candidates = call("roots.list", Value::Null, &ctx).unwrap();
         assert_eq!(candidates, json!([]), "no state, no ~/.devsandboxes");
         std::fs::create_dir_all(home.join(".devsandboxes")).unwrap();
@@ -2476,7 +2558,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let host = HostPaths { state: &state, home: None, data: None, member: None };
         let run = |method: &str, params: Value| {
-            call(method, params, &Ctx { inbox: &state.with_file_name("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) })
+            call(method, params, &Ctx { inbox: &state.with_file_name("inbox.json"), client: "api:test", bridges: None, forwards: None, access: None, host: Some(host) })
         };
         let file = root.join(crate::config::CONFIG_FILE);
         assert_eq!(code(run("config.findings", json!({"root": root}))), "not-found", "no config file");
@@ -2727,9 +2809,16 @@ mod tests {
     #[test]
     fn topics_parse_and_reject_unknown_ones() {
         assert_eq!(
-            topics(json!({"topics":["inbox","instances","forwards","opens","roots"]})).unwrap(),
-            [Topic::Inbox, Topic::Instances, Topic::Forwards, Topic::Opens, Topic::Roots]
+            topics(json!({"topics":["inbox","instances","forwards","opens","roots","access"]})).unwrap(),
+            [Topic::Inbox, Topic::Instances, Topic::Forwards, Topic::Opens, Topic::Roots, Topic::Access]
         );
+        // The npm package's `ApiTopic` and the error's list name them all.
+        let named = crate::serve::dts::union_members("ApiTopic");
+        assert_eq!(named, ["'inbox'", "'instances'", "'forwards'", "'opens'", "'roots'", "'access'"]);
+        let e = topics(json!({"topics":["ports"]})).unwrap_err();
+        for t in &named {
+            assert!(e.message.contains(t.trim_matches('\'')), "{}", e.message);
+        }
         assert_eq!(topics(json!({"topics":["ports"]})).unwrap_err().code, "invalid");
         assert_eq!(topics(Value::Null).unwrap_err().code, "invalid");
     }
@@ -2778,7 +2867,7 @@ mod tests {
         use crate::devsbd::forward::HostPort;
         let path = store_path("forwards");
         let fake = FakeForwards::default();
-        let fwd = |method: &str, params: Value| call(method, params, &Ctx { inbox: &path, client: "api:test", bridges: None, forwards: Some(&fake), host: None });
+        let fwd = |method: &str, params: Value| call(method, params, &Ctx { inbox: &path, client: "api:test", bridges: None, forwards: Some(&fake), access: None, host: None });
 
         let rows = fwd("forwards.list", json!({"dir": "/cfg"})).unwrap();
         assert_eq!(rows[0]["id"], 1);
@@ -2852,6 +2941,84 @@ mod tests {
 
         // A daemon without a host side says so.
         assert_eq!(code(run(&path, "forwards.list", json!({}))), "internal");
+    }
+
+    fn held_ask(scope: &str, route: &str) -> asks::Ask {
+        asks::Ask {
+            key: asks::AskKey {
+                instance_id: "web-1-id".into(),
+                credential: "github-work".into(),
+                scope: scope.into(),
+                repo: Some("o/r\u{1b}[2J".into()),
+            },
+            instance: "web-1".into(),
+            sandbox: "web".into(),
+            kind: "github".into(),
+            method: "POST".into(),
+            route: route.into(),
+            hold: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn access_methods_list_and_answer_the_requests() {
+        use crate::credentials::{answers, home};
+        let path = store_path("access");
+        let data = path.parent().unwrap().join("data");
+        let registry = Registry::new(data.clone());
+        home::update(&home::path(&data), |h| Ok(h.insert("github-work".into(), home::Entry::new("github", None)))).unwrap();
+        let access = |method: &str, params: Value| {
+            call(method, params, &Ctx { inbox: &path, client: "api:test", bridges: None, forwards: None, access: Some(&registry), host: None })
+        };
+        assert_eq!(access("access.pending", Value::Null).unwrap(), json!({"requests": []}));
+
+        let ids: Vec<String> = ["once", "instance", "always"]
+            .iter()
+            .map(|s| registry.ask(&held_ask(s, "/repos/o/r/pulls\n\u{7}")).unwrap().id().to_string())
+            .collect();
+        registry.ask(&held_ask("once", "/again")).unwrap();
+        let listed = access("access.pending", json!({})).unwrap();
+        let rows = listed["requests"].as_array().unwrap();
+        assert_eq!(rows.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), ids);
+        let first = &rows[0];
+        // What the call chose is escaped; the rest as is.
+        assert_eq!(first["route"], "/repos/o/r/pulls\\n\\u{7}");
+        assert_eq!(first["repo"], "o/r\\u{1b}[2J");
+        assert_eq!((first["held"].as_bool(), first["waiting"].as_u64()), (Some(true), Some(2)), "the second call joined");
+        assert_eq!(
+            (&first["instance"], &first["instance_id"], &first["sandbox"], &first["credential"], &first["scope"], &first["kind"], &first["method"]),
+            (&json!("web-1"), &json!("web-1-id"), &json!("web"), &json!("github-work"), &json!("once"), &json!("github"), &json!("POST"))
+        );
+        assert!(first["opened_at"].as_u64().unwrap() > 1_700_000_000);
+        crate::serve::dts::assert_matches("AccessPending", &listed);
+        crate::serve::dts::assert_matches("AccessRequest", first);
+
+        for (id, answer) in ids.iter().zip(["once", "instance", "always"]) {
+            let decided = access("access.decide", json!({"request": id, "answer": answer})).unwrap();
+            assert_eq!(decided["request"]["id"], id.as_str(), "{answer}");
+            crate::serve::dts::assert_matches("AccessDecided", &decided);
+        }
+        let markers: Vec<String> =
+            [asks::Answer::Once, asks::Answer::Instance, asks::Answer::Always, asks::Answer::Deny].iter().map(|a| format!("'{}'", a.marker())).collect();
+        assert_eq!(crate::serve::dts::union_members("AccessAnswer"), markers);
+        assert_eq!(access("access.pending", json!({})).unwrap(), json!({"requests": []}));
+        let kept = answers::load(&answers::path(&data)).unwrap();
+        assert_eq!(answers::lookup(&kept, &held_ask("instance", "/").key).map(|a| a.answer), Some(answers::Kind::Instance));
+        assert_eq!(home::load(&home::path(&data)).unwrap()["github-work"].rules[0].id.as_deref(), Some(ids[2].as_str()));
+
+        let deny = registry.ask(&held_ask("deny", "/")).unwrap().id().to_string();
+        assert_eq!(code(access("access.decide", json!({"request": deny, "answer": "yes"}))), "invalid");
+        assert_eq!(code(access("access.decide", json!({"request": deny}))), "invalid");
+        access("access.decide", json!({"request": deny, "answer": "deny"})).unwrap();
+        let kept = answers::load(&answers::path(&data)).unwrap();
+        assert_eq!(answers::lookup(&kept, &held_ask("deny", "/").key).map(|a| a.answer), Some(answers::Kind::Deny));
+        // Answered already, or never raised.
+        assert_eq!(code(access("access.decide", json!({"request": deny, "answer": "once"}))), "not-found");
+        assert_eq!(code(access("access.decide", json!({"request": "R-0000000000AB", "answer": "once"}))), "not-found");
+
+        // A daemon brokering nothing says so.
+        assert_eq!(code(run(&path, "access.pending", json!({}))), "internal");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Every wire struct the npm package types matches its `index.d.ts`

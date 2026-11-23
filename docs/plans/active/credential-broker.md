@@ -293,7 +293,7 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
 - **Who's asking**: `access.*` and `credentials.*` are local clients'
   only, `denied` to peers under either trust (as `member.*` is, in
   `lent::admit`), except from a credential's `approvers`: the home pushes
-  them `access.requested` over their links and admits their
+  them `access.changed` over their links and admits their
   `access.pending` / `access.decide` and `credentials.login` (the secret
   over the proven link) for that credential, so a laptop answers for a
   headless home. A placed instance's grant is its host's ∩ its
@@ -329,7 +329,7 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   compiled-in roots are base-URL only.
 - **Permission requests**: an `ask` holds the request (the claim's
   `hold`, 120 s default, as tools' timeouts differ) and
-  raises a request on the home: `access.requested` notifications,
+  raises a request on the home: `access.changed` notifications,
   `access.pending` / `access.decide` methods, a dashboard modal, a desktop
   popup, `devsandbox access pending|approve|deny <request>` (the
   `machine pending|approve|deny` shape; `access approve <credential>`,

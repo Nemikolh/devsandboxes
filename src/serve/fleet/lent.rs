@@ -34,8 +34,10 @@
 //!   host attached to on the caller, within the window).
 //!
 //! Under `trust = "full"` none of that: the peer has the API a local client
-//! has, except `member.*`, `membership.*`, `graph.*`, `link.*` and `links.*` (this member's own
-//! settings, membership log and link graph, and its links), refused under both; a verb's `env` is still the peer's when it
+//! has, except `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*`, `access.*` and
+//! `credentials.*` (this member's own settings, membership log and link graph, its links,
+//! and its brokered credentials with their permission requests, the `access` topic too),
+//! refused under both; a verb's `env` is still the peer's when it
 //! has one.
 //!
 //! `fleet.*` (a removal from the fleet, `machines::leave`; a membership
@@ -587,8 +589,13 @@ pub fn admit_fleet(method: &str, params: &Value, from: Option<&Peer>, log: Optio
 /// to run it with. `state` is this host's `state.toml`, read only when the
 /// request names an instance or a container under `worker`.
 pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
-    if ["member.", "membership.", "graph.", "link.", "links.", "placements."].iter().any(|p| method.starts_with(p)) {
+    if ["member.", "membership.", "graph.", "link.", "links.", "placements.", "access.", "credentials."].iter().any(|p| method.starts_with(p)) {
         return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
+    }
+    // `full` skips the topic check below: a permission request is this
+    // member's own too.
+    if method == "subscribe" && params.get("topics").and_then(Value::as_array).is_some_and(|t| t.iter().any(|t| t == "access")) {
+        return Err(ApiError::denied("`access` is this member's own: local clients only"));
     }
     // [`admit_fleet`]'s, which knows this host's control plane: never through here.
     if method.starts_with("fleet.") {
@@ -1283,7 +1290,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `full`: nothing confined, but `member.*`, `membership.*`, `link.*` and `links.*` stay local.
+    /// `full`: nothing confined, but `member.*`, `membership.*`, `link.*`, `links.*`, `access.*`
+    /// and `credentials.*` stay local.
     #[test]
     fn full_skips_the_table_but_not_member_or_link() {
         let base = scratch("full");
@@ -1310,11 +1318,18 @@ mod tests {
         let e = admit("gc", gc, &s, &fleet(&root), &state).unwrap_err();
         assert_eq!(e.code, "denied");
         assert!(e.message.contains("host maintenance"), "{}", e.message);
-        for m in ["member.get", "member.set", "membership.get", "membership.adopt", "membership.sign", "link.attach", "link.anything", "links.inbound", "fleet.leave", "fleet.rm"] {
+        for m in ["member.get", "member.set", "membership.get", "membership.adopt", "membership.sign", "link.attach", "link.anything", "links.inbound", "fleet.leave", "fleet.rm", "access.pending", "access.decide", "credentials.login"] {
             for reach in [&r, &fleet(&root)] {
                 assert_eq!(admit(m, json!({}), &s, reach, &state).unwrap_err().code, "denied", "{m}");
             }
         }
+        // The `access` topic too; `full` subscribes to the others.
+        for reach in [&r, &fleet(&root)] {
+            let e = admit("subscribe", json!({"topics": ["instances", "access"]}), &s, reach, &state).unwrap_err();
+            assert_eq!(e.code, "denied");
+        }
+        let p = json!({"topics": ["instances", "forwards"]});
+        assert_eq!(admit("subscribe", p.clone(), &s, &r, &state).unwrap(), p);
         let _ = std::fs::remove_dir_all(&base);
     }
 

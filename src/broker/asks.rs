@@ -12,9 +12,6 @@
 //! the credential in `credentials.toml` ([`home::Rule`]), before the
 //! waiters wake.
 
-// Answering and listing have no caller but tests until the API serves them.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
@@ -86,6 +83,11 @@ impl Answer {
     pub fn allows(self) -> bool {
         self != Answer::Deny
     }
+
+    /// The answer [`Answer::marker`] names: what `access.decide` takes.
+    pub fn parse(s: &str) -> Option<Answer> {
+        [Answer::Once, Answer::Instance, Answer::Always, Answer::Deny].into_iter().find(|a| a.marker() == s)
+    }
 }
 
 /// A listed request, as approvers see it.
@@ -156,8 +158,10 @@ impl Registry {
         Registry { inner: Mutex::default(), answered: Condvar::new(), clock, on_change: RwLock::new(Box::new(|| {})), data }
     }
 
-    /// Called after every change [`Registry::pending`] would show (pruning
-    /// aside), outside the registry's lock.
+    /// Called after every change [`Registry::pending`] would show, outside
+    /// the registry's lock. A request outliving [`LATE_GRANT`] is dropped
+    /// by the next call that locks the registry ([`Registry::prune`] when
+    /// nothing else does).
     pub fn on_change(&self, hook: Hook) {
         *self.on_change.write().unwrap_or_else(|e| e.into_inner()) = hook;
     }
@@ -166,11 +170,29 @@ impl Registry {
         (self.on_change.read().unwrap_or_else(|e| e.into_inner()))();
     }
 
-    fn lock(&self, now: Instant) -> MutexGuard<'_, Inner> {
+    /// The registry, its outlived requests dropped; `true` when one was,
+    /// so the caller calls the hook once the guard is gone.
+    fn lock(&self, now: Instant) -> (MutexGuard<'_, Inner>, bool) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let listed = g.entries.len();
         g.entries.retain(|e| e.answer.is_some() || e.request.waiting > 0 || now < e.request.held_until + LATE_GRANT);
         g.late.retain(|(_, until)| now < *until);
-        g
+        let dropped = g.entries.len() < listed;
+        (g, dropped)
+    }
+
+    fn changed_if(&self, dropped: bool) {
+        if dropped {
+            self.changed();
+        }
+    }
+
+    /// Drops the requests that outlived [`LATE_GRANT`]: for a caller that
+    /// polls, so a request nobody calls about still leaves the listing.
+    pub fn prune(&self) {
+        let (g, dropped) = self.lock((self.clock)());
+        drop(g);
+        self.changed_if(dropped);
     }
 
     /// The call's place on the unanswered request with its key, else on a
@@ -179,7 +201,7 @@ impl Registry {
     pub fn ask(&self, ask: &Ask) -> Result<Ticket, Refusal> {
         let now = (self.clock)();
         let deadline = now + ask.hold;
-        let mut g = self.lock(now);
+        let (mut g, dropped) = self.lock(now);
         if let Some(e) = g.entries.iter_mut().find(|e| e.answer.is_none() && e.request.key == ask.key) {
             e.request.waiting += 1;
             e.request.held_until = e.request.held_until.max(deadline);
@@ -194,7 +216,10 @@ impl Registry {
             .filter(|e| e.answer.is_none() && e.request.key.instance_id == ask.key.instance_id && now < e.request.held_until)
             .collect();
         if held.len() >= MAX_OPEN_SCOPE_ASKS {
-            return Err(pending(&held[0].request.id, format!("another request pending for this instance: {}", held[0].request.id)));
+            let refusal = pending(&held[0].request.id, format!("another request pending for this instance: {}", held[0].request.id));
+            drop(g);
+            self.changed_if(dropped);
+            return Err(refusal);
         }
         let id = loop {
             let id = fresh_id().map_err(|why| Refusal::new(500, "error", why))?;
@@ -256,12 +281,20 @@ impl Registry {
     /// request unanswered.
     pub fn answer(&self, id: &str, answer: Answer) -> Result<Option<Request>> {
         let now = (self.clock)();
-        let mut g = self.lock(now);
-        let Some(i) = g.entries.iter().position(|e| e.request.id == id && e.answer.is_none()) else { return Ok(None) };
+        let (mut g, dropped) = self.lock(now);
+        let Some(i) = g.entries.iter().position(|e| e.request.id == id && e.answer.is_none()) else {
+            drop(g);
+            self.changed_if(dropped);
+            return Ok(None);
+        };
         let request = g.entries[i].request.clone();
         // Under the lock: a second answer to the same request finds it
         // answered, never writes again.
-        remember(&self.data, &request, answer)?;
+        if let Err(e) = remember(&self.data, &request, answer) {
+            drop(g);
+            self.changed_if(dropped);
+            return Err(e);
+        }
         if request.waiting > 0 {
             g.entries[i].answer = Some(answer);
             self.answered.notify_all();
@@ -278,16 +311,20 @@ impl Registry {
 
     /// Takes a late `once`'s grant for `key`, if one is left.
     pub fn granted(&self, key: &AskKey) -> bool {
-        let mut g = self.lock((self.clock)());
-        let Some(i) = g.late.iter().position(|(k, _)| k == key) else { return false };
-        g.late.remove(i);
-        true
+        let (mut g, dropped) = self.lock((self.clock)());
+        let taken = g.late.iter().position(|(k, _)| k == key).map(|i| g.late.remove(i)).is_some();
+        drop(g);
+        self.changed_if(dropped);
+        taken
     }
 
     /// Unanswered requests, oldest first.
     pub fn pending(&self) -> Vec<Request> {
-        let g = self.lock((self.clock)());
-        g.entries.iter().filter(|e| e.answer.is_none()).map(|e| e.request.clone()).collect()
+        let (g, dropped) = self.lock((self.clock)());
+        let listed = g.entries.iter().filter(|e| e.answer.is_none()).map(|e| e.request.clone()).collect();
+        drop(g);
+        self.changed_if(dropped);
+        listed
     }
 }
 

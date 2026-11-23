@@ -308,7 +308,7 @@ fn poll(
     board: BridgeBoard,
     asks: Arc<crate::broker::asks::Registry>,
 ) {
-    let broker: Option<Arc<dyn bridge::Broker>> = match crate::broker::serve::Service::from_host(log, asks) {
+    let broker: Option<Arc<dyn bridge::Broker>> = match crate::broker::serve::Service::from_host(log, Arc::clone(&asks)) {
         Ok(service) => Some(Arc::new(service)),
         Err(e) => {
             log(&format!("broker: {e:#}: no credential is brokered"));
@@ -402,6 +402,9 @@ fn poll(
             }
             publish(observers.cache.collect(&view, &watched, &*observers.join));
         }
+        // A request no call comes back for leaves `access.pending` only
+        // when something locks the registry.
+        asks.prune();
         // Read before the lock: a stream lost after this read sets `refresh`,
         // which the wait sees at once.
         let quiet = !installed || events.as_ref().is_some_and(EventWatcher::is_live);

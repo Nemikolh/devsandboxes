@@ -11,6 +11,7 @@ Code: `src/serve/proto.rs` (envelope, `PROTOCOL`, `MAX_LINE`),
 method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
 `src/serve/verbs.rs` (verbs), `src/serve/helper.rs` (`helper.call`),
 `src/serve/forwards.rs` (`forwards.*`),
+`src/broker/asks.rs` (`access.*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
 (`QUICK`, federation), `src/serve/fleet/member.rs` (`member.*`),
 `src/serve/fleet/membership_api.rs` (`membership.*`),
@@ -32,12 +33,13 @@ checks the typings against the wire structs).
 | containers, config | `containers.logs\|inspect\|list\|stats`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
+| access | `access.pending\|decide` (local only) | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own `API` stream) |
 | machines | `machines.probe\|add\|list\|get\|rm`, `member.get\|set`, `membership.get\|adopt\|sign\|propose\|pending\|approve\|deny\|rotate\|controlPlane`, `graph.get`, `capacity.get`, `code.haves`, `instances.fetch` and `open.deliver` (peers only), `mesh.folders`, `placements.fetch` (local only) | no (`placements.fetch` names the machine it fetches from) |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`,
-`opens.done`, `roots.changed`, `closing` (*Notifications*); `output`, `progress` (a verb's, *Verbs*);
+`opens.done`, `roots.changed`, `access.changed`, `closing` (*Notifications*); `output`, `progress` (a verb's, *Verbs*);
 `helper.record` (a `helper.call`'s).
 
 ## Transport
@@ -109,7 +111,7 @@ absent otherwise (`confirm` included; `approve`: *Verbs*).
 
 | code | |
 |---|---|
-| `not-found` | the thread, action, directory, instance, sandbox, service, forward or machine named doesn't exist |
+| `not-found` | the thread, action, directory, instance, sandbox, service, forward, machine or pending permission request named doesn't exist |
 | `invalid` | bad params (missing, wrong type, unknown value), an op that makes no sense for its target, a `machine` on a method that doesn't take one, or a `machine` that isn't a non-empty string |
 | `unknown-method` | no such method on this daemon |
 | `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies), or a remote caller's trust doesn't reach it (*Remote callers*) |
@@ -128,8 +130,8 @@ A remote caller's connection is served with this member's trust table
 ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
 its `member.toml` per request: a link peer's channel streams (those the
 daemon answers in-process on the links it dials, and those after
-`link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*`, `placements.*` and `instances.attach` are
-`denied` under either trust, as is a hello's handoff. Under `trust = "worker"` (the
+`link.attach`, below). `member.*`, `membership.*`, `graph.*`, `link.*`, `links.*`, `placements.*`, `access.*`, `credentials.*` and `instances.attach` are
+`denied` under either trust, as are a `subscribe` to the `access` topic and a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` and `roots` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
@@ -1003,6 +1005,50 @@ running instance that declares it).
 
 Errors: `not-found` (no forward `id`; another client may have stopped it).
 
+## Access
+
+Permission requests ([broker.md](../architecture/credentials/broker.md#permission-requests)):
+a sandbox's credential call that policy asks about is held while a
+request waits here for an answer. Local clients only (*Remote callers*).
+Requests live in the daemon's memory; the answers they leave live in
+`access.json` and `credentials.toml`.
+
+### Access request
+
+| field | |
+|---|---|
+| `id` | `R-` and 12 Crockford base32 characters, what `access.decide` takes |
+| `instance`, `instance_id`, `sandbox` | the calling instance (its `state.toml` key and id) and its sandbox |
+| `credential`, `kind`, `scope` | what the call needs: the credential, its kind (`github`), the claim's scope |
+| `repo` | the repo the call names (lowercase `owner/name`) for a repo-fenced scope, else `null` |
+| `method`, `route` | the call's HTTP method and path (query dropped) |
+| `opened_at` | unix seconds |
+| `held` | a call waits on it now; `false`: its hold ended, and it waits only for a late answer (5 min) |
+| `waiting` | calls held on it now (a retry joins the request) |
+
+`repo`, `method` and `route` come from the sandbox's call: their control
+characters and whitespace but a space are escaped (`\n`, `\u{1b}`).
+
+### `access.pending`
+
+Params: none. Result: `{"requests": [request, …]}`, the unanswered
+requests, oldest first: those with a call held and, for 5 min past
+their hold, those without.
+
+### `access.decide`
+
+Params: `{"request": "R-…", "answer": "once" | "instance" | "always" |
+"deny"}`: once (the held calls, or with none the instance's next
+matching call), this instance (until its `rm`), always (a rule on the
+credential for the sandbox), deny (kept, until `devsandbox access
+revoke`). The answer is written before the held calls wake. Result:
+`{"request": request}` as it stood when answered.
+
+Errors: `invalid` (an unknown `answer`), `not-found` (``no pending
+request `R-…` ``: answered meanwhile, past its late window, or never
+raised), `internal` (the answer couldn't be written: the request stays
+pending).
+
 ## Verbs
 
 `run`, `rebuild`, `start`, `stop` and `rm` are methods taking the CLI
@@ -1690,7 +1736,7 @@ A forwarded verb holds this daemon while its ssh runs (*Holders*).
 
 ### `subscribe` / `unsubscribe`
 
-Params: `{"topics": ["inbox", "instances", "forwards", "opens", "roots"]}`. Result: `{"ok": true}`.
+Params: `{"topics": ["inbox", "instances", "forwards", "opens", "roots", "access"]}`. Result: `{"ok": true}`.
 Unknown topics are `invalid`. Notifications are coarse ("something
 changed, re-fetch"): subscribe first, then fetch, so nothing falls in
 between.
@@ -1705,6 +1751,7 @@ between.
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
 | `opens.done` | `opens` | `{"instance": "<name>", "url": "…", "profile": "<p>" \| null, "outcome": "opened" \| "refused" \| "failed", "why": "…" \| null, "line": "…"}` | what became of one URL a container opened ([bridges](../architecture/helper/bridges.md#opening-urls-kind-open)), from the host that knows: the instance's host for a refusal at intake (control characters, scheme, too old, rate limit; `profile` `null`) or a failed delivery to a fleet member (the member's refusal included), the opening host when it opened it or couldn't (no display, the URL's own loopback port not forwarded, no opener, a failed spawn). `instance` is `machine/name` for an open delivered from another member; `url` the one opened (rewritten to a forward's port), else the one given; `why` the refusal or failure, or for `opened` the callback ports that couldn't be forwarded (`cannot forward callback port 8085`). `line` is the dashboard's status-line text (`web: opened https://… (work)`, `web: open refused: rate limit (5 per 10s)`, `web: open failed: no display on this host`; a URL past 120 characters is cut there with `…`). Every open is its own: up to the last 8 unwritten are kept |
 | `roots.changed` | `roots` | `{}` | what `roots.list` lists here moved (checked every 0.5 s, on a write of `state.toml`, `member.toml` or the signed copies' `installed.toml`, or `~/.devsandboxes` appearing or going): an instance's root recorded or its last instance removed, a root picked or dropped (`machine roots add\|rm`), a signed copy installed. A write that leaves the set as it was isn't one |
+| `access.changed` | `access` (local only) | `{}` | what `access.pending` lists changed: a request opened, a call joined or left it (answered, its hold ended), it was answered, or it left past its late window (seen within a container poll, at most 60 s) |
 | `closing` | any | `{"reason": "handoff" \| "idle" \| "shutdown"}` | the daemon is exiting; reconnect (which starts a new one) |
 
 Notifications coalesce: many changes before one is written are one line.
