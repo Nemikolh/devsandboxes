@@ -12,7 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **site / release**: the site refreshed for 0.11.0, then the release.
+  → [plan](plans/active/site-refresh-and-release.md)
 
 ## Planned
 
