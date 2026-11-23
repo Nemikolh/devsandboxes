@@ -60,6 +60,11 @@ pub struct Entry {
     /// it; changed only by editing the file, as the rest of the grant.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub broad: bool,
+    /// The orgs a claim with an `orgs` field may reach, by slug: the
+    /// account may be in more than a sandbox should touch. Set by
+    /// `login --org` or by hand, as the rest of the grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orgs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved: Vec<Version>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -99,6 +104,7 @@ impl Entry {
             delegate: Vec::new(),
             as_: Vec::new(),
             broad: false,
+            orgs: Vec::new(),
             approved: Vec::new(),
             pending: Vec::new(),
             broken: None,
@@ -384,14 +390,16 @@ pub(crate) mod tests {
         entry.approvers = vec!["laptop".into()];
         entry.as_ = vec!["user".into()];
         entry.broad = true;
+        entry.orgs = vec!["acme".into()];
         assert!(entry.approve(Version::of(&sentry())));
         assert!(!entry.approve(Version::of(&sentry())), "approved once");
         let home = Home::from([("sentry-work".to_string(), entry)]);
         let text = serialize(&home).unwrap();
         assert!(text.starts_with("[sentry-work]\nkind = \"sentry\"\nsource = \"file\"\nprofiles = [\"work\"]\n"), "{text}");
-        assert!(text.contains("as = [\"user\"]\nbroad = true\n"), "{text}");
+        assert!(text.contains("as = [\"user\"]\nbroad = true\norgs = [\"acme\"]\n"), "{text}");
         let narrow = Home::from([("s".to_string(), Entry::new("sentry", None))]);
-        assert!(!serialize(&narrow).unwrap().contains("broad"), "false is left out");
+        let narrow_text = serialize(&narrow).unwrap();
+        assert!(!narrow_text.contains("broad") && !narrow_text.contains("orgs"), "unset is left out");
         assert!(!text.contains("pending") && !text.contains("\nmembers"), "{text}");
         assert_eq!(parse(&text).unwrap(), home);
         let v = &home["sentry-work"].approved[0];

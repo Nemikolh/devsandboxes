@@ -334,6 +334,9 @@ pub struct Access {
     pub repos: Vec<String>,
     #[serde(default)]
     pub branches: Vec<String>,
+    /// Narrows the credential's `orgs`, for a claim with an org fence.
+    #[serde(default)]
+    pub orgs: Vec<String>,
     /// The token kind to take the credential as (`user` | `app`), within
     /// what the home offers (`credentials::tokens::pick`).
     #[serde(rename = "as")]
@@ -1365,7 +1368,7 @@ impl Config {
             if let Some(a) = &access.as_ {
                 crate::credentials::claim::TokenKind::parse(a).with_context(|| format!("sandbox `{name}`: `access.{kind}.as`"))?;
             }
-            for list in [&mut access.scopes, &mut access.ask, &mut access.repos, &mut access.branches] {
+            for list in [&mut access.scopes, &mut access.ask, &mut access.repos, &mut access.branches, &mut access.orgs] {
                 let mut seen = std::collections::BTreeSet::new();
                 list.retain(|s| seen.insert(s.clone()));
             }
@@ -2178,6 +2181,7 @@ folder = "../web"
 scopes = ["releases.write", "issues.read"]
 ask = ["uploads"]
 credential = "sentry-work"
+orgs = ["acme", "acme"]
 
 [sandbox.web.access.github]
 repos = ["acme/design-system"]
@@ -2198,6 +2202,7 @@ folder = "../web"
                 scopes: vec!["issues.read".into(), "releases.write".into()],
                 ask: vec!["uploads".into()],
                 credential: Some("sentry-work".into()),
+                orgs: vec!["acme".into()],
                 ..Access::default()
             }
         );

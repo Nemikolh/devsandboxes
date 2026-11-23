@@ -354,6 +354,23 @@ mod tests {
     }
 
     #[test]
+    fn the_org_fence_is_a_change() {
+        let old_json = sentry_json();
+        let mut c = old_json.clone();
+        c["orgs"] = json!({
+            "var": "{org}",
+            "resolve": "GET /api/0/organizations/{org}/",
+            "id": "id",
+            "lists": { "GET /api/0/organizations/": ["slug", "id"] },
+        });
+        let new = view(&c);
+        assert_eq!(diff(&view(&old_json), &new).changed, ["orgs"]);
+        let mut d = c.clone();
+        d["orgs"]["lists"] = json!({});
+        assert_eq!(diff(&new, &view(&d)).changed, ["orgs"]);
+    }
+
+    #[test]
     fn bad_versions_are_refused() {
         for bad in ["", "[]", r#"{"kind":"x"}"#, r#"{"kind":"x","claim":{"never":"GET /"}}"#] {
             assert!(View::parse(bad).is_err(), "{bad}");

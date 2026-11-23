@@ -45,6 +45,7 @@ pub const GRAPHQL_PATH: &str = "/graphql";
 const FIELDS: &[&str] = &[
     "upstreams", "mode", "inject", "phantom", "git", "baseUrl", "rewrite", "login", "check",
     "checkShows", "mint", "scopes", "never", "presence", "hold", "refusal", "fence", "ca", "lfs", "tokens",
+    "orgs",
 ];
 
 const MAX_ACCEPT: usize = 8;
@@ -114,6 +115,8 @@ pub struct Pinned {
     /// `{var}` from the path, else a body field path. Non-empty: the
     /// credential is repo-fenced ([`Pinned::fenced`]).
     pub fence: BTreeMap<Route, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orgs: Option<Orgs>,
     /// Pinned, not wiring: it sends LFS transfers, with the credentials a
     /// batch response hands out, through the broker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +175,23 @@ impl TokenKind {
             _ => bail!("`{s}` isn't a token kind: `user` or `app`"),
         }
     }
+}
+
+/// The org fence: one path variable naming the account's organization
+/// (github-and-sentry-access, *Sentry's org fence*).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Orgs {
+    /// A whole `{name}`, as routes write it.
+    pub var: String,
+    /// Answers an org's slug with its `id`: an org may be named by either.
+    pub resolve: Route,
+    /// The top-level field of `resolve`'s answer holding the id.
+    pub id: String,
+    /// Org-less routes whose JSON array answer lists orgs: each element is
+    /// kept by the named top-level fields (sorted) holding a slug or id.
+    #[serde(default)]
+    pub lists: BTreeMap<Route, Vec<String>>,
 }
 
 /// git-lfs through the broker (docs/architecture/credentials/git.md, *LFS*).
@@ -586,6 +606,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
     }
     let fence = fence(field(obj, "fence")?.unwrap_or_default())?;
     let lfs = lfs(field(obj, "lfs")?, mode, git.as_ref(), &scopes)?;
+    let orgs = orgs(field(obj, "orgs")?, &scopes)?;
 
     Ok(Claim {
         kind: kind.to_string(),
@@ -604,6 +625,7 @@ pub fn parse(kind: &str, value: &Value) -> Result<Claim> {
             hold,
             refusal,
             fence,
+            orgs,
             lfs,
             tokens,
         },
@@ -861,6 +883,55 @@ fn lfs(raw: Option<Lfs>, mode: Mode, git: Option<&Git>, scopes: &BTreeMap<String
         bail!("`lfs.upload`: `{}` isn't one of the claim's `scopes`", raw.upload);
     }
     raw.hosts.sort();
+    Ok(Some(raw))
+}
+
+fn orgs(raw: Option<Orgs>, scopes: &BTreeMap<String, Scope>) -> Result<Option<Orgs>> {
+    let Some(mut raw) = raw else { return Ok(None) };
+    let var = match path_var(&raw.var) {
+        Some(name) if is_ident(name, false) => name.to_string(),
+        _ => bail!("`orgs.var`: `{}` isn't a whole `{{name}}` variable", raw.var),
+    };
+    if var == "repo" {
+        bail!("`orgs.var`: `{{repo}}` is the repo fence's");
+    }
+    let holds = |r: &Route| r.vars().contains(&var.as_str());
+    if !scopes.values().flat_map(|s| &s.routes).any(holds) {
+        bail!("`orgs.var`: no scoped route holds `{}`", raw.var);
+    }
+    if !matches!(raw.resolve, Route::Http { method: Method::Get, .. }) {
+        bail!("`orgs.resolve`: `{}` isn't a `GET` route: its answer names the id", raw.resolve);
+    }
+    if !holds(&raw.resolve) {
+        bail!("`orgs.resolve`: `{}` has no `{}`", raw.resolve, raw.var);
+    }
+    if !is_ident(&raw.id, true) {
+        bail!("`orgs.id`: `{}` isn't a field name (letters, digits, `_` and `-`)", raw.id);
+    }
+    for (route, fields) in &mut raw.lists {
+        let at = || format!("`orgs.lists.{route}`");
+        if route.is_graphql() {
+            bail!("{}: lists are HTTP routes", at());
+        }
+        if !scopes.values().any(|s| s.routes.contains(route)) {
+            bail!("{}: not in any of the claim's `scopes`", at());
+        }
+        if holds(route) {
+            bail!("{}: it holds `{}`, so the fence checks it already", at(), raw.var);
+        }
+        if fields.is_empty() {
+            bail!("{}: name at least one field", at());
+        }
+        for (i, f) in fields.iter().enumerate() {
+            if !is_ident(f, true) {
+                bail!("{}: `{f}` isn't a field name (letters, digits, `_` and `-`)", at());
+            }
+            if fields[..i].contains(f) {
+                bail!("{}: `{f}` is listed twice", at());
+            }
+        }
+        fields.sort();
+    }
     Ok(Some(raw))
 }
 
@@ -1846,6 +1917,58 @@ mod tests {
         assert_err(cli_with("fence", json!({ "GET /a": ["x", "x"] })), &["`x` is listed twice"]);
     }
 
+    fn orgs_value() -> Value {
+        json!({
+            "var": "{org}",
+            "resolve": "GET /api/0/organizations/{org}/",
+            "id": "id",
+            "lists": { "GET /api/0/organizations/": ["slug", "id"] },
+        })
+    }
+
+    fn orgs_with(field: &str, value: Value) -> Value {
+        let mut orgs = orgs_value();
+        orgs[field] = value;
+        cli_with("orgs", orgs)
+    }
+
+    #[test]
+    fn orgs_fence_one_scoped_variable() {
+        let c = parse("sentry", &cli_with("orgs", orgs_value())).unwrap();
+        let o = c.pinned.orgs.as_ref().unwrap();
+        assert_eq!(o.var, "{org}");
+        assert_eq!(o.resolve, Route::parse("GET /api/0/organizations/{org}/").unwrap());
+        assert_eq!(o.id, "id");
+        assert_eq!(o.lists[&Route::parse("GET /api/0/organizations/").unwrap()], ["id", "slug"], "sorted");
+        assert_eq!(from_canonical(&c.canonical()).unwrap().1, c.pinned);
+        assert!(!cli().canonical().contains("\"orgs\""), "absent: the canonical form doesn't change");
+        let mut no_lists = orgs_value();
+        no_lists.as_object_mut().unwrap().remove("lists");
+        assert!(parse("sentry", &cli_with("orgs", no_lists)).unwrap().pinned.orgs.unwrap().lists.is_empty());
+
+        assert_err(orgs_with("extra", json!(1)), &["`orgs`", "unknown field `extra`"]);
+        assert_err(orgs_with("var", json!("org")), &["`orgs.var`: `org` isn't a whole `{name}` variable"]);
+        assert_err(orgs_with("var", json!("{a-b}")), &["isn't a whole `{name}` variable"]);
+        assert_err(orgs_with("var", json!("{repo}")), &["`orgs.var`: `{repo}` is the repo fence's"]);
+        assert_err(orgs_with("var", json!("{team}")), &["`orgs.var`: no scoped route holds `{team}`"]);
+        assert_err(orgs_with("resolve", json!("graphql query")), &["`orgs.resolve`: `graphql query` isn't a `GET` route"]);
+        assert_err(orgs_with("resolve", json!("PUT /api/0/organizations/{org}/")), &["isn't a `GET` route"]);
+        assert_err(orgs_with("resolve", json!("GET /api/0/organizations/")), &["`orgs.resolve`: `GET /api/0/organizations/` has no `{org}`"]);
+        assert_err(orgs_with("resolve", json!("GET /a//")), &["`orgs`", "empty segment"]);
+        assert_err(orgs_with("id", json!("")), &["`orgs.id`: `` isn't a field name"]);
+        assert_err(orgs_with("id", json!("a.b")), &["`orgs.id`: `a.b` isn't a field name"]);
+        let lists = |l: Value| orgs_with("lists", l);
+        assert_err(lists(json!({ "graphql query": ["slug"] })), &["`orgs.lists.graphql query`: lists are HTTP routes"]);
+        assert_err(lists(json!({ "GET /api/0/teams/": ["slug"] })), &["`orgs.lists.GET /api/0/teams/`: not in any of the claim's `scopes`"]);
+        assert_err(
+            lists(json!({ "GET /api/0/organizations/{org}/projects/": ["slug"] })),
+            &["`orgs.lists.GET /api/0/organizations/{org}/projects/`: it holds `{org}`"],
+        );
+        assert_err(lists(json!({ "GET /api/0/organizations/": [] })), &["name at least one field"]);
+        assert_err(lists(json!({ "GET /api/0/organizations/": ["a[]"] })), &["`a[]` isn't a field name"]);
+        assert_err(lists(json!({ "GET /api/0/organizations/": ["slug", "slug"] })), &["`slug` is listed twice"]);
+    }
+
     #[test]
     fn graphql_routes_own_the_graphql_path() {
         let gql = parse("sentry", &cli_with("scopes", json!({ "read": ["graphql query", "GET /api/0/"] }))).unwrap();
@@ -2023,6 +2146,9 @@ mod tests {
         changed(cli_with("rewrite", json!([{ "route": "GET /api/0/organizations/{org}/chunk-upload/", "fields": ["url"] }])), "rewrite dropped");
         changed(cli_with("presence", json!([{ "ref": "refs/tags/*" }])), "presence");
         changed(cli_with("fence", json!({ "GET /api/0/organizations/{org}/": ["{org}"] })), "fence");
+        changed(cli_with("orgs", orgs_value()), "orgs");
+        changed(orgs_with("id", json!("uuid")), "orgs.id");
+        changed(orgs_with("lists", json!({})), "orgs.lists");
 
         let mut scopes = cli_value()["scopes"].clone();
         scopes["issues.read"]["routes"].as_array_mut().unwrap().push(json!("GET /api/0/issues/{id}/hashes/"));

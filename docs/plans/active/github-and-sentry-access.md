@@ -56,6 +56,7 @@ phantoms. One feature per instance claims a given credential
 | `hold` | how long an `ask` holds the call (credential-broker, *Permission requests*) |
 | `refusal` | the upstream's error shape refusals take (credential-broker, *Refusals*) |
 | `fence` | how a route or mutation names its repos or project: every repo- or object-naming input (`{repo}` from the path, a body's `owner`/`organization`, each mutation input holding a repository or node id) |
+| `orgs` | the path variable naming the account's organization, fenced to the credential's and config's `orgs`: the route resolving a slug to its `id`, list routes filtered to them (*Sentry's org fence*) |
 | `ca` | a CA knob devsandbox doesn't set by default, if the tool has one |
 
 Data only: a claim can't run anything on the home or a member.

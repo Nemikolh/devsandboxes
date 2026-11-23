@@ -71,6 +71,7 @@ Devcontainer keys are camelCase; devsandbox extras are kebab-case. **Unknown key
   - `ask` ([string]): scopes held for an answer; refused until asking exists.
   - `credential` (string): a credential from `credentials.toml` (`"sentry-work"`) to take instead of the profile's.
   - `repos` ([string], `github`): repos (`owner/repo` or a URL) the repo fence allows beyond the remotes recorded at the folder's first `run`.
+  - `orgs` ([string], claims with an org fence, e.g. `sentry`): the org slugs calls may name, within the credential's `orgs` in `credentials.toml`; unset or empty: all of the credential's.
   - `as` (`"user"` | `"app"`): the token kind, for claims declaring kinds (github); default `user`. `app` is refused as not supported yet.
   - `branches` ([string]): parsed, not enforced yet.
 

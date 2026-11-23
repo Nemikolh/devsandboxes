@@ -336,6 +336,7 @@ approvers = []
 delegate = []
 as = ["user"]                 # the token kinds it offers, "user" | "app"; unset: ["user"]
 broad = true                  # takes the claim's `tokens.broad` too (`login --broad`); unset: false
+orgs = ["acme"]               # the orgs, by slug, a claim with an `orgs` field may reach; unset: none
 expires_at = "2026-12-01T10:00:00Z"   # a pasted secret's expiry, as the upstream reported it
 
 [[sentry-work.approved]]      # approval order: the last is the latest
@@ -377,6 +378,13 @@ doesn't offer, or the claim doesn't declare, refuses the run. `app`
 only read by `login` (which token it takes, and that the flag matches);
 the broker serves whatever the store holds, so turning it off by hand
 takes effect at the next login.
+
+`orgs` applies to a credential whose claim has an `orgs` field (an org
+fence over one path variable, sentry's `{org}`): the orgs, by slug, its
+routes may name, an org matched by its slug (case-insensitively) or its
+id. A config's `access.<kind>.orgs` narrows it, never widens it. Unset:
+no route holding the variable is reachable. Set by `login --org`, else
+by hand, as the rest of the grant (`Entry::orgs`).
 
 `expires_at` (RFC 3339, UTC) is written by `login`, from its token
 check, and by the broker: on an injected call with a pasted secret, the response's header the claim's
