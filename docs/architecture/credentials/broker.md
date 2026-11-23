@@ -10,7 +10,7 @@ a call is refused. The design it implements is
 "The broker", "Phantoms", "Policy", "Refusals", "Audit") and
 [github-and-sentry-access](../../plans/active/github-and-sentry-access.md)
 (*The claim contract*, *gh*'s *The repo fence*, *Matching*, *Outside the
-fence*, *sentry-cli*) and [git-gateway](../../plans/active/git-gateway.md)
+fence*, *sentry*) and [git-gateway](../../plans/active/git-gateway.md)
 (*The gateway*, "The broker"). What isn't built yet:
 [status](../../status.md#credentials).
 

@@ -12,13 +12,13 @@ Design and diagrams:
 
 ## Goal
 
-`gh` and `sentry-cli` work in every sandbox, on every machine, with no
-token in any of them:
+`gh` and Sentry's `sentry` CLI work in every sandbox, on every machine,
+with no token in any of them:
 
 - gh reaches only the sandbox's repos (the remotes of its `folder` and
   `folders`); another repo is denied, never asked, and only a config
   change adds one.
-- sentry-cli works only in the profiles its credential is granted to
+- `sentry` works only in the profiles its credential is granted to
   (`work`, not `personal`).
 - The live config drops its shared `gh` and `sentry` mounts
   (`template.base.mounts`).
@@ -358,7 +358,45 @@ the account that owns it, so for repos spanning owners it's made public
 fenced repo's owner with no installation ("app not installed on acme"),
 only a note when the repo is public (a reference clone in `folders`).
 
-## sentry-cli
+## sentry
+
+- **Reaching the broker**: intercept mode, like gh. Sentry's `sentry` CLI
+  (`getsentry/toolkit`, on Node) talks to `sentry.io` and an org's region
+  host (`us.sentry.io`, `de.sentry.io`), the claim's upstreams; Node's
+  fetch takes `HTTPS_PROXY` only with `NODE_USE_ENV_PROXY=1`, which
+  devsandbox sets for every intercept claim beside the CA variables
+  (`NODE_EXTRA_CA_CERTS`). `SENTRY_AUTH_TOKEN` is the phantom, sent as
+  `Authorization: Bearer`; no rc file, no base URL, no `rewrite`. The
+  feature sets `SENTRY_CLI_NO_TELEMETRY=1` and
+  `SENTRY_CLI_NO_UPDATE_CHECK=1`, and updates `sentry` the way gh's
+  feature updates gh (a read-only `sentry-bin` dir).
+- **Scopes**: routes under `/api/0/organizations/{org}/…` and
+  `/api/0/projects/{org}/{project}/…`, plus a few with no org in the
+  path: `GET /api/0/`, `/auth/`, `/users/me/`, `/users/me/regions/`,
+  `/organizations/`, `/projects/` (`org.read`) and the
+  `sentry-app-installations/{uuid}/…` routes (`issues.read`,
+  `issues.write`). The claim names no `fence`, so an `{org}` route takes
+  any org.
+- **Credential**: a user auth token (`sntryu_…`, pasted) or the CLI's
+  OAuth device flow (its public client id); `check` is `GET
+  /api/0/users/me/`, showing the account's email. Either spans every org
+  the account is in, so a sandbox granted a scope holds it in each of
+  them (open questions). `never` lists deleting an org, project, team or
+  integration, the routes that mint a credential (org auth tokens,
+  `api-tokens`, `sentry-apps/{slug}/api-tokens/`, project client keys,
+  `agent-handoff`) and product-trial changes, checked by the same test as
+  gh's. No minting, so never delegated: a sandbox on another machine is
+  always brokered from home.
+- **Profiles**: one credential per account (`sentry-work`), granted to
+  the profiles that may use it. The claim names the kind (`sentry`); an
+  instance takes the one granted to its profile, or the one
+  `access.sentry.credential` names.
+
+### sentry-cli, the base-URL path
+
+The feature's 1.0 claim, for the older `sentry-cli`; no feature ships it
+now, and the sentry-cli test fixture (`tests/fixtures/features/sentry-cli/`)
+keeps base-URL mode and `rewrite` covered.
 
 - **Reaching the broker**: base-URL mode. `SENTRY_URL` points at the
   loopback port (plain http, no warning), `SENTRY_AUTH_TOKEN` and
@@ -403,15 +441,7 @@ only a note when the repo is public (a reference clone in `folders`).
   chosen (releases, issue and event read). An org auth token (`sntrys_`)
   only ever holds `org:ci` (releases, source maps, code mappings): enough
   for uploads, 403 on issues and on the `GET /api/0/organizations/{org}/`
-  lookup. A user token spans orgs. `never` lists the routes that mint a
-  credential (`…/org-auth-tokens/`, `sentry-apps/{slug}/api-tokens/`,
-  project client keys), checked by the same test as gh's. No minting, so never delegated: a
-  sandbox on another machine is always brokered from home.
-- **Profiles**: one credential per org (`sentry-work`), granted to the
-  profiles that may use it. The claim names the kind (`sentry`); an
-  instance takes the one granted to its profile, or the one
-  `access.sentry.credential` names. One org per instance:
-  `SENTRY_AUTH_TOKEN` is one variable.
+  lookup. A user token spans orgs.
 
 ## Ideas weighed
 
@@ -426,7 +456,9 @@ only a note when the repo is public (a reference clone in `folders`).
 | | deny `/graphql` | 3 | 2 | breaks most of gh |
 | claim location | devsandbox's own table of known tools | 6 | 2 | every tool a devsandbox release |
 | | in the feature's metadata | 9 | 7 | chosen: features ship with their tool, the home approves a copy |
-| sentry chunk uploads | rewrite the upload URL the server returns to the loopback | 6 | 5 | chosen: sentry-cli posts to any absolute URL it gets, past `SENTRY_URL` |
+| sentry chunk uploads | rewrite the upload URL the server returns to the loopback | 6 | 5 | chosen for sentry-cli (it posts to any absolute URL it gets, past `SENTRY_URL`); the `sentry` CLI's intercept mode needs none |
+| how sentry reaches the broker | base-URL mode (sentry-cli) | 6 | 5 | superseded: the feature moved to the `sentry` CLI |
+| | intercept mode, like gh | 8 | 6 | chosen |
 
 ## Rollout
 
@@ -437,8 +469,10 @@ only a note when the repo is public (a reference clone in `folders`).
    and on placed or remote instances once credential-broker step 5
    carries `CRED`; until then they keep today's mounts, so the live
    config drops its sentry and gh mounts only after that step.
-   Built: all of it; `features/sentry` 1.0.0 is in the features repo and
-   checked end to end with sentry-cli 3.8.2 against a mock Sentry
+   Built: all of it; `features/sentry` 1.0.0 shipped it for sentry-cli
+   in base-URL mode, and 1.2 moved to Sentry's `sentry` CLI in intercept
+   mode (*sentry*), checked end to end with `sentry` 0.50.0 against
+   mock Sentry hosts
    ([broker](../../architecture/credentials/broker.md#end-to-end)).
    Deferred, each a [status](../../status.md#credentials) limitation:
    calling the claim's `check` route, a claim field for token and
@@ -504,6 +538,11 @@ only a note when the repo is public (a reference clone in `folders`).
   commands would then stay inside the fence, but an outside query can't
   go anonymous (no anonymous GraphQL), so it would be denied: `gh repo
   view` of a public repo out of the fence fails.
+- Sentry's org fence: the `sentry` claim's tokens span the account's
+  orgs and its `{org}` routes take any of them. Fence `{org}` against
+  the orgs a sandbox's config names (`access.sentry.orgs`), as the
+  GitHub fence does repos, and the org-less listings to them; or take an
+  org-bound internal-integration token, which needs an org admin?
 - GitHub Enterprise and self-hosted Sentry: hosts no feature knows, and
   a config can't add upstreams. A home-side `upstreams` override in
   `credentials.toml`, one credential per host?

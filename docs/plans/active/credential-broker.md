@@ -515,7 +515,7 @@ git (git-gateway, *The gateway*):
   helper saves the phantom; gh's `-c` helper overrides the gateway's
   (same phantom). Push via receive-pack with the Basic swap works.
 
-sentry-cli in base-URL mode (github-and-sentry-access, *sentry-cli*):
+sentry-cli in base-URL mode (github-and-sentry-access, *sentry-cli, the base-URL path*):
 
 - Plain-http `SENTRY_URL`, no CA, no proxy: holds on both versions.
 - "≥ 2.30 posts to an absolute URL": the gate is the server's
@@ -627,10 +627,10 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
   new ones meanwhile: hand the listeners to the successor over
   `devsbd.ctl` (`SCM_RIGHTS`) and let the old daemon finish open
   connections, bounded, or run the proxy as its own process?
-- HTTP/2 upstream (gRPC-ish APIs) and WebSockets through intercept mode;
-  and HTTP/2 from the tools: gh, git, git-lfs, curl and Bun all
-  negotiated h2 with the spike's proxy, so their behavior against an
-  `http/1.1`-only ALPN is untested (expected fine).
+- HTTP/2 upstream (gRPC-ish APIs) and WebSockets through intercept mode.
+  The tools that offer h2 fall back to the broker's `http/1.1`-only ALPN
+  (gh end to end, a client offering both in the broker's
+  tests); an h2-only client fails the handshake.
 - The file store at rest: plain 0600 like `member.key`, or sealed with
   `systemd-creds` / a TPM where there is one?
 - One home per credential name fleet-wide: two members can't keep

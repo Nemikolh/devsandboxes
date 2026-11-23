@@ -345,6 +345,22 @@ is frozen: no new work on it.
   sentry claim takes any token prefix (its device-flow tokens have none),
   so an org token is stored unchecked.
   → [broker](architecture/credentials/broker.md)
+- The sentry claim has no org fence: its `{org}` routes take any org, and
+  both its logins (a pasted user auth token, `sntryu_…`, or the device
+  flow) span every org the account is in, so a sandbox granted a scope
+  holds it in each of them; the org-less routes (`GET /api/0/projects/`,
+  `/api/0/organizations/`) list them all.
+  → [plan](plans/active/github-and-sentry-access.md#sentry)
+- The broker speaks HTTP/1.1 only: intercept mode's ALPN offers only
+  `http/1.1` (a client offering only `h2`, as gRPC does, fails the
+  handshake), an `Upgrade` (WebSockets, `h2c`) is refused, and upstreams
+  are called over HTTP/1.1.
+  → [broker](architecture/credentials/broker.md); `broker::intercept::ALPN`, `broker::head::HttpError::Upgrade`
+- A daemon drain (an upgrade's handoff, a restart) drops the bridges
+  within 5 s and an upgrade's helper takeover drops every proxied
+  connection, so open broker streams (a model's SSE, a long push or
+  upload) are cut and the tool has to retry.
+  → [plan](plans/active/credential-broker.md#open-questions)
 - `github-app-manifest` logins are refused
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
   `approvers` and `delegate` parse and `access ls` lists them, but
