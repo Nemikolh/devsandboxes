@@ -532,6 +532,8 @@ pub(crate) fn handle_with(
         }
         // Served by `follow` on the bridge; never answered as one response.
         Op::Subscribe => usage("`events-follow` streams; send it on its own control stream"),
+        // Served by `asks::serve_wait` on the bridge, never through here.
+        Op::AccessWait => usage("`access-wait` is held; send it on its own control stream"),
         Op::Events | Op::EventsAck | Op::ThreadLs => {
             let path = match exec.inbox_path() {
                 Ok(path) => path,
@@ -833,7 +835,7 @@ fn helper_argv(req: &Request) -> Vec<String> {
             }
         }
         Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Done | Op::Branches | Op::Events | Op::EventsAck
-        | Op::Subscribe | Op::ThreadLs => {
+        | Op::Subscribe | Op::ThreadLs | Op::AccessWait => {
             unreachable!("not a run op")
         }
     }
@@ -924,7 +926,7 @@ fn rpc_request(child: &Instance, req: &Request, host_agent: bool) -> Option<(&'s
             ("run.prune", params)
         }
         Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Done | Op::Branches | Op::Events | Op::EventsAck
-        | Op::Subscribe | Op::ThreadLs => unreachable!("not a run op"),
+        | Op::Subscribe | Op::ThreadLs | Op::AccessWait => unreachable!("not a run op"),
     })
 }
 

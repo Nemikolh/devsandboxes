@@ -68,7 +68,7 @@ fn build_hash() -> String {
 /// which reads as "none of these". Append-only; separate from `version`,
 /// whose one-line output is the host's install check, and from the frame
 /// protocol's `caps`, which describe the host link, not the CLI.
-const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session", "userns", "open", "cgroup"];
+const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session", "userns", "open", "cgroup", "access-wait"];
 
 fn main() {
     // Multicall: under a browser's name (the links in /run/devsandbox/bin)
@@ -110,6 +110,17 @@ fn main() {
             };
             std::process::exit(code)
         }
+        Some("access") => {
+            let args = args.collect::<Vec<_>>();
+            let code = match args.split_first() {
+                Some((wait, rest)) if wait == "wait" => ctl::run("access-wait", rest),
+                _ => {
+                    eprintln!("usage: devsbd access wait <request> [--timeout SECS]");
+                    control::EXIT_USAGE
+                }
+            };
+            std::process::exit(code)
+        }
         Some(verb @ ("ensure" | "ls" | "branches" | "stop" | "rm" | "done" | "exec")) => {
             std::process::exit(ctl::run(verb, &args.collect::<Vec<_>>()))
         }
@@ -127,7 +138,7 @@ fn main() {
         Some("git-check") => std::process::exit(gitcheck::run(&args.collect::<Vec<_>>())),
         _ => {
             eprintln!(
-                "usage: devsbd version|features|daemon|bridge|boot|notify|open|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|cgroup|credential|git-check|vscode-goto"
+                "usage: devsbd version|features|daemon|bridge|boot|notify|open|thread|events|access|ensure|ls|branches|stop|rm|done|exec|run|session|identity|userns|cgroup|credential|git-check|vscode-goto"
             );
             std::process::exit(2);
         }

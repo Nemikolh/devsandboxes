@@ -284,6 +284,12 @@ then:
 
 - `events-follow` → `dispatch::follow`, which holds the stream and writes
   JSON lines until it ends;
+- `access-wait` → `asks::serve_wait` over the daemon's `asks::Registry`
+  (`Bridges::spawn_worker`'s `asks`, from `serve::host::poll`), keyed by
+  the bridge's own `instance_id`: no `dispatch` authorization, only that
+  instance's requests; pings until the answer or the timeout, then one
+  response
+  ([broker](../credentials/broker.md#permission-requests));
 - anything else → `dispatch_control` → `dispatch::handle(key, req)`, one
   encoded `Response` back. Undecodable → `usage`.
 
@@ -295,7 +301,8 @@ serialized host-wide; reads, run ops and requests that will be denied skip
 the lock. Every daemon bridge advertises `CONTROL`; non-dispatchers get
 `denied`.
 
-Bounds: at most 8 notify/control handler threads per bridge (`MAX_HANDLERS`).
+Bounds: at most 8 notify/control handler threads per bridge (`MAX_HANDLERS`),
+held ones (followers, `access-wait`s) included.
 In-flight control requests (waits and followers included) count as daemon
 holders (`control_in_flight`), so the daemon doesn't idle out under them.
 

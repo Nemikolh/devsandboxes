@@ -404,11 +404,10 @@ is frozen: no new work on it.
   → [images and features](architecture/instances/images-and-features.md#credential-claims),
   [ca](architecture/credentials/ca.md#trust-in-containers);
   `credentials::instance::plan`, `commands::run::claims::wire`
-- Permission requests are answered by `access pending|approve|deny`,
-  the dashboard's modal and the command a desktop popup names, but a
-  container can't wait for an answer past the hold yet (`devsbd access
-  wait`, credential-broker step 4), so a held call still ends `pending`
-  after its hold; `presence` routes pass. The GitHub
+- Permission requests: `presence` routes pass unasked (credential-broker
+  step 4's next part), and requests live in the daemon's memory, so a
+  drain or restart drops the open ones and the answers `devsbd access
+  wait` would read (it then says `unknown`). The GitHub
   repo fence is enforced on a fenced claim's `{repo}` and
   `/repositories/{id}` routes
   ([fence](architecture/credentials/fence.md#enforcement)) and on

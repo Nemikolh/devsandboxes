@@ -287,18 +287,24 @@ top-level fields; the host owns the schema.
 ### `control`
 
 Request: `op` (one of `ensure|ls|stop|rm|done|exec|run-ls|run-logs|run-wait|
-run-rm|run-prune|branches|events|events-ack|events-follow|thread-ls`) plus
+run-rm|run-prune|branches|events|events-ack|events-follow|thread-ls|access-wait`) plus
 optional `sandbox`, `key`, `branch`, `env` (repeatable), `arg` (repeatable),
 `id`, `offset`, `timeout`, `force`, `keep`, `ahead`, `ack` (repeatable),
 `feed`; ≤ `MAX_REQUEST` 64 KiB. Which fields an op needs is the host handler's
 call, not the codec's. Response: `status`
 (`ok|denied|failed|no-host|usage`) and `body`; ≤ `MAX_RESPONSE` 1 MiB.
-`events-follow` is the one held-open response: after `status ok` the host
+`events-follow` is a held-open response: after `status ok` the host
 streams raw JSON lines, a `{"kind":"ping"}` every 30 s idle, and
 `{"kind":"replaced"}` when a newer follower for the same owner starts.
+`access-wait` (`id` a permission request's, `control::valid_request_id`;
+optional `timeout`) is held too, the other way round: `{"kind":"ping"}`
+lines every 30 s while the host waits, then one response whose `ok`
+body is the outcome (`once|instance|always|deny|pending|unknown`,
+`control::access_exit_code`).
 Long polls cap at `MAX_WAIT` (300 s).
 
 Exit codes of the `devsbd` control verbs: 0 ok, 1 failed, 2 usage,
-75 no host (`EX_TEMPFAIL`), 77 denied (`EX_NOPERM`).
+75 no host (`EX_TEMPFAIL`), 77 denied (`EX_NOPERM`); `access wait` adds
+3 deny, 4 pending (timed out), 5 unknown request.
 
 Limitations: [status.md](../../status.md#helper)

@@ -539,6 +539,22 @@ hands it through `Host::start` to `Service::from_host`):
   dropped. A `once` then becomes a one-shot grant: the instance's next
   call with that key within `LATE_GRANT` takes it (`Registry::granted`)
   and goes through unheld; the other answers are kept as above.
+- **Waiting in the container**: `devsbd access wait <request>
+  [--timeout SECS]` (the `access-wait` control op,
+  [protocol](../helper/protocol.md#control)) is how an agent refused
+  `403` `pending` waits for the answer before it retries. The bridge
+  hands it to `asks::serve_wait` with its own instance's id, never
+  through `dispatch`: no `dispatcher` or `inbox` allowance is needed,
+  and only that instance's requests are found (`Registry::wait_answer`,
+  keyed by id and instance id), so another instance's id reads as
+  `unknown`, the same as none. The wait is no waiter of the request: a
+  `once` answered while no call is held still leaves its one-shot grant
+  for the retry. Every answer is kept for `LATE_GRANT` after it is given
+  (`Registry::answer`), so a wait started after the answer still reads
+  it. The wait lasts up to `MAX_WAIT` (300 s, the default), pinging
+  every 30 s, and prints `once`, `instance`, `always` (exit 0), `deny`
+  (3), `pending` (4: the timeout passed) or `unknown` (5: no such
+  request for this instance, or it expired).
 - **Changes**: `Registry::on_change` sets the hook every open, join,
   answer and waiter leaving calls, outside the registry's lock, and a
   request dropped past its late window: by whichever call locks the

@@ -301,6 +301,14 @@ pub type ControlHandler = Arc<dyn Fn(&str, &Request) -> Response + Send + Sync>;
 /// module doc). Blocking; called on the stream's handler thread.
 pub type FollowHandler = Arc<dyn Fn(&str, &Request, &mut dyn Write) + Send + Sync>;
 
+/// Serves one `access-wait` request from instance `instance_id` (its bridge's)
+/// by writing its held response to the stream (`control`'s module doc).
+/// Blocking; called on the stream's handler thread.
+pub type AccessHandler = Arc<dyn Fn(&str, &Request, &mut dyn Write) + Send + Sync>;
+
+/// The permission requests `access-wait` reads.
+type Asks = Arc<crate::broker::asks::Registry>;
+
 /// The instance an `HTTP_PROXY` stream came from: the one whose bridge
 /// carried it, whatever the container says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +339,8 @@ struct Services {
     control: ControlHandler,
     /// `events-follow` streams ([`dispatch_follow`] outside tests).
     follow: FollowHandler,
+    /// `access-wait` streams ([`access_wait`]).
+    access: AccessHandler,
     // Live notify/control handler threads of this bridge (see `HandlerSlot`).
     handlers: Arc<AtomicUsize>,
     /// `None`: `HTTP_PROXY` is neither advertised nor served.
@@ -348,6 +358,7 @@ impl Services {
             sink,
             control,
             follow,
+            access: access_wait(None),
             handlers: Arc::default(),
             broker: None,
             brokered: Arc::default(),
@@ -440,9 +451,21 @@ fn dispatch_follow(key: &str, req: &Request, out: &mut dyn Write) {
     crate::commands::dispatch::follow(key, req, out)
 }
 
+/// The production [`AccessHandler`] over `asks` (`None`: no broker, so no
+/// request exists): `asks::serve_wait`, counted in [`CONTROL_IN_FLIGHT`]
+/// like a follower. Never through `dispatch`: no dispatcher or Inbox
+/// allowance is needed to wait on one's own request.
+fn access_wait(asks: Option<Asks>) -> AccessHandler {
+    Arc::new(move |instance_id: &str, req: &Request, out: &mut dyn Write| {
+        let _in_flight = InFlight::enter();
+        crate::broker::asks::serve_wait(asks.as_deref(), instance_id, req, out, control::FOLLOW_PING)
+    })
+}
+
 /// Control requests being handled by [`dispatch_control`] right now, waiting
-/// ones (`events --wait`, `run wait`) and `events-follow` streams
-/// ([`dispatch_follow`]) included: a daemon holder row.
+/// ones (`events --wait`, `run wait`), `events-follow` streams
+/// ([`dispatch_follow`]) and `access-wait`s ([`access_wait`]) included: a
+/// daemon holder row.
 static CONTROL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// How many control requests this process is serving (see
@@ -532,8 +555,9 @@ fn open_stream(
 /// encoded response, close. Oversized or undecodable → a `Usage` response;
 /// timed out → close with no reply (the daemon reports the host
 /// disconnected). Silent: the bridge's owner does any reporting. An `events-follow`
-/// request goes to the follow handler instead, which holds the stream (and
-/// this handler's slot) until it ends.
+/// request goes to the follow handler instead, an `access-wait` to the access
+/// handler, each holding the stream (and this handler's slot, one of
+/// [`MAX_HANDLERS`]) until it ends.
 fn handle_control(mut conn: UnixStream, to: &Services) {
     let _ = conn.set_read_timeout(Some(CONTROL_READ_TIMEOUT));
     let mut buf = Vec::new();
@@ -547,6 +571,10 @@ fn handle_control(mut conn: UnixStream, to: &Services) {
             Ok(req) if req.op == control::Op::Subscribe => {
                 let _ = conn.set_write_timeout(Some(FOLLOW_WRITE_TIMEOUT));
                 return (to.follow)(&to.instance, &req, &mut conn);
+            }
+            Ok(req) if req.op == control::Op::AccessWait => {
+                let _ = conn.set_write_timeout(Some(FOLLOW_WRITE_TIMEOUT));
+                return (to.access)(&to.instance_id, &req, &mut conn);
             }
             Ok(req) => (to.control)(&to.instance, &req),
             Err(e) => Response::new(Status::Usage, format!("bad request: {e}")),
@@ -602,20 +630,23 @@ fn handle_notify(mut conn: UnixStream, to: &Services) {
 /// A `Bridges` bridge for instance `key`: the host agent only when
 /// `with_agent`, key-filtered under a git-host claim (refusals to `log` and
 /// the instance's Inbox), notify + control only when `sink` is set, broker
-/// streams when `broker` is too. `observe` gets its handshake outcome and
-/// its end (see [`BridgeBoard`]).
+/// streams when `broker` is too, `access-wait` on `asks`. `observe` gets its
+/// handshake outcome and its end (see [`BridgeBoard`]).
+#[allow(clippy::too_many_arguments)]
 fn spawn_managed(
     key: &str,
     info: &Instance,
     with_agent: bool,
     sink: Option<&Sink>,
     broker: Option<&Arc<dyn Broker>>,
+    asks: Option<&Asks>,
     log: Option<fn(&str)>,
     observe: Observer,
 ) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
     let notify = sink.map(|s| Services {
         broker: broker.cloned(),
+        access: access_wait(asks.cloned()),
         ..Services::new(key.to_string(), info.instance_id.clone(), Arc::clone(s), Arc::new(dispatch_control))
     });
     if with_agent {
@@ -1261,6 +1292,8 @@ pub struct Bridges {
     sink: Option<Sink>,
     // Set (with `sink`) → bridges advertise and serve `HTTP_PROXY`.
     broker: Option<Arc<dyn Broker>>,
+    // What their `access-wait`s read.
+    asks: Option<Asks>,
     // Every live bridge's status, for `bridges.ensure` waits.
     board: BridgeBoard,
     // The daemon's `serve.log`; `None` (tests, no sink) logs nothing.
@@ -1374,7 +1407,8 @@ impl Bridges {
                     _ => info,
                 };
                 let observe = self.observe(&info.container);
-                match spawn_managed(key, info, with_agent, self.sink.as_ref(), self.broker.as_ref(), self.log, observe) {
+                let (sink, broker, asks) = (self.sink.as_ref(), self.broker.as_ref(), self.asks.as_ref());
+                match spawn_managed(key, info, with_agent, sink, broker, asks, self.log, observe) {
                     Some(b) => {
                         self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
                     }
@@ -1431,15 +1465,21 @@ impl Bridges {
     /// [`OnShown`], if any. A put that changed nothing produces neither, so a
     /// dispatcher re-asserting its threads is invisible.
     /// `broker` set (with `sink`) → those bridges serve `HTTP_PROXY` streams
-    /// to it, tagged with their instance ([`Broker`]).
+    /// to it, tagged with their instance ([`Broker`]); their `access-wait`s
+    /// read `asks`, the registry the broker's held calls wait on.
     /// `board` gets every bridge's status and, after each reconcile, the
     /// newest ticket it covered (the `urgent` pairs' second half).
-    pub fn spawn_worker(sink: Option<SinkHooks>, broker: Option<Arc<dyn Broker>>, board: BridgeBoard) -> BridgeWorker {
+    pub fn spawn_worker(
+        sink: Option<SinkHooks>,
+        broker: Option<Arc<dyn Broker>>,
+        asks: Option<Asks>,
+        board: BridgeBoard,
+    ) -> BridgeWorker {
         let log = sink.as_ref().map(|hooks| hooks.log);
         let sink = sink.map(|hooks| self::sink(apply_message, hooks));
         let (tx, rx) = mpsc::channel::<(Vec<String>, Vec<(String, u64)>)>();
         let handle = std::thread::spawn(move || {
-            let mut bridges = Bridges { sink, broker, board, log, ..Bridges::default() };
+            let mut bridges = Bridges { sink, broker, asks, board, log, ..Bridges::default() };
             // Block for the next list, then coalesce: drain everything already
             // queued and reconcile only against the newest list (with every
             // urgent container queued meanwhile), so a burst of snapshots
@@ -2416,7 +2456,7 @@ mod tests {
     /// send/coalesce/join path without docker.
     #[test]
     fn worker_coalesces_and_joins() {
-        let worker = Bridges::spawn_worker(None, None, BridgeBoard::default());
+        let worker = Bridges::spawn_worker(None, None, None, BridgeBoard::default());
         for i in 0..100 {
             worker.send(vec![format!("devsandbox-c{i}")], vec![(format!("devsandbox-c{i}"), i)]);
         }
@@ -2993,6 +3033,42 @@ mod tests {
         });
         let reply = send_on(&daemon, 1, proto::channel::CONTROL, b"op events-follow\nkey pr-1\n");
         assert_eq!(reply, b"status ok\nbody \nweb-1 pr-1\n");
+    }
+
+    /// An `access-wait` stream reaches the registry through the access
+    /// handler, keyed by the bridge's own instance id, never through the
+    /// control or follow handlers (no dispatcher check).
+    #[test]
+    fn access_wait_stream_reads_the_bridges_own_requests() {
+        use crate::broker::asks::{Answer, Ask, AskKey, Registry};
+        let dir = std::env::temp_dir().join(format!("dsv-bridge-access-{}", std::process::id()));
+        let asks = Arc::new(Registry::new(dir));
+        let ask = |instance_id: &str| Ask {
+            key: AskKey { instance_id: instance_id.into(), credential: "gh".into(), scope: "pr.write".into(), repo: None },
+            instance: "web-1".into(),
+            sandbox: "web".into(),
+            kind: "github".into(),
+            method: "POST".into(),
+            route: "/".into(),
+            hold: Duration::ZERO,
+        };
+        let ours = asks.ask(&ask("web-1-id")).unwrap();
+        let theirs = asks.ask(&ask("web-2-id")).unwrap();
+        let (ours_id, theirs_id) = (ours.id().to_string(), theirs.id().to_string());
+        asks.wait(ours);
+        asks.wait(theirs);
+        asks.answer(&ours_id, Answer::Once).unwrap();
+        asks.answer(&theirs_id, Answer::Once).unwrap();
+        let (mut to, _rx) = services("web-1", no_control());
+        to.follow = Arc::new(|_: &str, _: &Request, _: &mut dyn Write| panic!("follow handler called"));
+        to.access = access_wait(Some(asks));
+        let daemon = pair_with(to);
+        let wait = |stream: u32, id: &str| {
+            let req = format!("op access-wait\nid {id}\ntimeout 0\n");
+            String::from_utf8(send_on(&daemon, stream, proto::channel::CONTROL, req.as_bytes())).unwrap()
+        };
+        assert_eq!(wait(1, &ours_id), "status ok\nbody once\n");
+        assert_eq!(wait(3, &theirs_id), "status ok\nbody unknown\n", "another instance's request");
     }
 
     /// The user replies `text` on `owner`'s thread `pr-1` in the store at

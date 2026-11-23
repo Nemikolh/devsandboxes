@@ -10,9 +10,11 @@
 //! matching call ([`Registry::granted`]). *This instance* and deny answers
 //! are kept in `access.json` ([`answers`]), *always* answers as a rule on
 //! the credential in `credentials.toml` ([`home::Rule`]), before the
-//! waiters wake.
+//! waiters wake. In the container, `devsbd access wait` waits on its
+//! instance's request without holding a call ([`serve_wait`]).
 
 use std::cell::RefCell;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
@@ -22,6 +24,7 @@ use anyhow::{Context, Result};
 use super::refusal::Refusal;
 use crate::credentials::answers::{self, Kind, Remembered};
 use crate::credentials::home::{self, Rule};
+use crate::devsbd::control::{self, CROCKFORD, Op, Response, Status};
 
 /// A claim without `hold`'s.
 pub const DEFAULT_HOLD: Duration = Duration::from_secs(120);
@@ -138,11 +141,41 @@ struct Entry {
     answer: Option<Answer>,
 }
 
+impl Entry {
+    /// Whether the request is still answerable (or still to wake its
+    /// answered waiters) at `now`.
+    fn live(&self, now: Instant) -> bool {
+        self.answer.is_some() || self.request.waiting > 0 || now < self.request.held_until + LATE_GRANT
+    }
+}
+
+/// An answered request's answer, for [`Registry::wait_answer`] callers
+/// that come after its waiters woke (or when it had none).
+struct Decided {
+    id: String,
+    instance_id: String,
+    answer: Answer,
+    until: Instant,
+}
+
 #[derive(Default)]
 struct Inner {
     entries: Vec<Entry>,
     /// Late `once` answers, each until its expiry.
     late: Vec<(AskKey, Instant)>,
+    /// Every answer, for [`LATE_GRANT`].
+    decided: Vec<Decided>,
+}
+
+/// What [`Registry::wait_answer`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Answered(Answer),
+    /// Still unanswered at the deadline.
+    Pending,
+    /// No such request for the instance: never one, another instance's, or
+    /// gone past its late window.
+    Unknown,
 }
 
 type Hook = Box<dyn Fn() + Send + Sync>;
@@ -182,8 +215,9 @@ impl Registry {
     fn lock(&self, now: Instant) -> (MutexGuard<'_, Inner>, bool) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let listed = g.entries.len();
-        g.entries.retain(|e| e.answer.is_some() || e.request.waiting > 0 || now < e.request.held_until + LATE_GRANT);
+        g.entries.retain(|e| e.live(now));
         g.late.retain(|(_, until)| now < *until);
+        g.decided.retain(|d| now < d.until);
         let dropped = g.entries.len() < listed;
         (g, dropped)
     }
@@ -302,9 +336,16 @@ impl Registry {
             self.changed_if(dropped);
             return Err(e);
         }
+        g.decided.push(Decided {
+            id: request.id.clone(),
+            instance_id: request.key.instance_id.clone(),
+            answer,
+            until: now + LATE_GRANT,
+        });
+        // Always: `wait_answer` callers aren't counted in `waiting`.
+        self.answered.notify_all();
         if request.waiting > 0 {
             g.entries[i].answer = Some(answer);
-            self.answered.notify_all();
         } else {
             g.entries.remove(i);
             if answer == Answer::Once {
@@ -314,6 +355,37 @@ impl Registry {
         drop(g);
         self.changed();
         Ok(Some(request))
+    }
+
+    /// Blocks until request `id` of instance `instance_id` is answered, or
+    /// until `deadline` (on the registry's clock, [`Registry::now`]). Not a
+    /// waiter of the request: a `once` answered meanwhile with no call held
+    /// still leaves its one-shot grant, for the retry the waiting agent then
+    /// makes. An answer reads for [`LATE_GRANT`] after it was given.
+    pub fn wait_answer(&self, id: &str, instance_id: &str, deadline: Instant) -> Outcome {
+        let (mut g, dropped) = self.lock((self.clock)());
+        let outcome = loop {
+            if let Some(d) = g.decided.iter().find(|d| d.id == id && d.instance_id == instance_id) {
+                break Outcome::Answered(d.answer);
+            }
+            let now = (self.clock)();
+            let found = g.entries.iter().find(|e| e.request.id == id && e.request.key.instance_id == instance_id);
+            match found.filter(|e| e.live(now)) {
+                None => break Outcome::Unknown,
+                Some(Entry { answer: Some(a), .. }) => break Outcome::Answered(*a),
+                Some(_) if now >= deadline => break Outcome::Pending,
+                Some(_) => {}
+            }
+            g = self.answered.wait_timeout(g, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+        };
+        drop(g);
+        self.changed_if(dropped);
+        outcome
+    }
+
+    /// The registry's clock: what [`Registry::wait_answer`]'s deadline is on.
+    pub fn now(&self) -> Instant {
+        (self.clock)()
     }
 
     /// Takes a late `once`'s grant for `key`, if one is left.
@@ -412,11 +484,64 @@ pub fn pending(id: &str, reason: String) -> Refusal {
         .todo(format!("devsandbox access approve {id}"))
 }
 
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// Serves `access-wait` request `req` from instance `instance_id` (its
+/// bridge's, whatever the container says) on `out`, the bridge's control
+/// stream: a [`control::FOLLOW_PING_LINE`] every `ping` while
+/// [`Registry::wait_answer`] waits, then one response (`control`'s module
+/// doc). No dispatcher or Inbox check: the instance only ever reaches its
+/// own requests, and an id it doesn't own reads as `unknown`. Without a
+/// registry (no broker) no request exists. Ends early when a ping can't be
+/// written: the client left.
+pub fn serve_wait(asks: Option<&Registry>, instance_id: &str, req: &control::Request, out: &mut dyn Write, ping: Duration) {
+    let resp = match wait_params(req) {
+        Err(why) => Response::new(Status::Usage, why),
+        Ok((id, timeout)) => {
+            let outcome = match asks {
+                None => Outcome::Unknown,
+                Some(asks) => {
+                    let deadline = asks.now() + timeout;
+                    loop {
+                        let step = deadline.min(asks.now() + ping);
+                        match asks.wait_answer(id, instance_id, step) {
+                            Outcome::Pending if step < deadline => {
+                                let line = format!("{}\n", control::FOLLOW_PING_LINE);
+                                if out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_err() {
+                                    return;
+                                }
+                            }
+                            outcome => break outcome,
+                        }
+                    }
+                }
+            };
+            let body = match outcome {
+                Outcome::Answered(a) => a.marker(),
+                Outcome::Pending => control::ACCESS_PENDING,
+                Outcome::Unknown => control::ACCESS_UNKNOWN,
+            };
+            Response::new(Status::Ok, body)
+        }
+    };
+    let _ = out.write_all(control::encode_response(&resp).as_bytes());
+}
 
-/// The shape of [`fresh_id`]'s ids.
+/// An `access-wait` request's id and timeout; it takes nothing else.
+fn wait_params(req: &control::Request) -> Result<(&str, Duration), String> {
+    let Some(id) = req.id.as_deref() else { return Err("`access-wait` needs `id`".into()) };
+    if !control::valid_request_id(id) {
+        return Err(format!("bad request id `{id}`"));
+    }
+    let bare = control::Request { id: req.id.clone(), timeout: req.timeout, ..control::Request::new(Op::AccessWait) };
+    if *req != bare {
+        return Err("`access-wait` takes only `id` and `timeout`".into());
+    }
+    let secs = req.timeout.unwrap_or(control::MAX_WAIT).min(control::MAX_WAIT);
+    Ok((id, Duration::from_secs(secs)))
+}
+
+/// The shape of [`fresh_id`]'s ids, shared with the helper.
 pub fn is_request_id(s: &str) -> bool {
-    s.strip_prefix("R-").is_some_and(|rest| rest.len() == 12 && rest.bytes().all(|b| CROCKFORD.contains(&b)))
+    control::valid_request_id(s)
 }
 
 /// `R-` and 60 random bits: unguessable to another instance, and never a

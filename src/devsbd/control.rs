@@ -1,5 +1,5 @@
-//! Control requests and responses: what `devsbd ensure|ls|stop|rm|done|exec|run|branches|events|thread ls`
-//! sends from a dispatcher's container to the host, and what comes back
+//! Control requests and responses: what `devsbd ensure|ls|stop|rm|done|exec|run|branches|events|thread ls|access wait`
+//! sends from a container to the host, and what comes back
 //! (docs/architecture/automations/dispatchers.md, "Ops"). One file shared by both crates
 //! (devsbd includes it via `#[path]`) so both ends can't drift; std-only and
 //! hand-parsed, like `notify.rs`.
@@ -9,15 +9,16 @@
 //!
 //! ```text
 //! op ensure             required, once: ensure|ls|stop|rm|done|exec|run-ls|run-logs|run-wait|run-rm|run-prune|
-//!                       branches|events|events-ack|events-follow|thread-ls
+//!                       branches|events|events-ack|events-follow|thread-ls|access-wait
 //! sandbox web           optional, at most once
 //! key pr-123            optional, at most once: a child key, or `events`/`events-follow`'s thread filter
 //! branch feat/x         optional, at most once
 //! env FOO=bar           optional, repeatable, each `K=V` (see `parse_env`)
 //! arg zidane            optional, repeatable: `exec`'s command, one line per argv word
-//! id 1790000000-a1b2    optional, at most once: a run id (see `valid_run_id`)
+//! id 1790000000-a1b2    optional, at most once: a run id (see `valid_run_id`), or
+//!                       access-wait's request id (see `valid_request_id`)
 //! offset 1024           optional, at most once: decimal byte offset into a run's log
-//! timeout 5             optional, at most once: decimal seconds (run-wait, events)
+//! timeout 5             optional, at most once: decimal seconds (run-wait, events, access-wait)
 //! force                 optional, at most once, no value: a flag (`run-rm --force`)
 //! keep 5                optional, at most once: decimal count of runs to keep
 //! ahead                 optional, at most once, no value: a flag (`branches --ahead`)
@@ -76,6 +77,22 @@
 //! {"kind":"replaced"}
 //! ```
 //!
+//! `access-wait` (`devsbd access wait <request>`) waits for the answer to a
+//! permission request of the requester's own instance, up to `timeout`
+//! seconds (at most and by default [`MAX_WAIT`]). The host writes a
+//! [`FOLLOW_PING_LINE`] every [`FOLLOW_PING`] while it waits, then one normal
+//! response and closes. Its `ok` body is the outcome, mapped to an exit code
+//! by [`access_exit_code`]: an answer (`once`, `instance`, `always`, `deny`),
+//! `pending` (the timeout passed unanswered) or `unknown` (no such request
+//! for this instance, or it expired: another instance's request reads the
+//! same as none).
+//!
+//! ```text
+//! {"kind":"ping"}
+//! status ok
+//! body once
+//! ```
+//!
 //! Unknown keys, repeats of a non-repeatable key, a missing required key, or
 //! a bad escape are decode errors.
 
@@ -89,6 +106,29 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_NO_HOST: i32 = 75;
 /// The host refused the request (`EX_NOPERM`).
 pub const EXIT_DENIED: i32 = 77;
+/// `access wait`: the request was answered deny.
+pub const EXIT_ACCESS_DENY: i32 = 3;
+/// `access wait`: the timeout passed with the request still unanswered.
+pub const EXIT_ACCESS_PENDING: i32 = 4;
+/// `access wait`: no such request for this instance (or it expired).
+pub const EXIT_ACCESS_UNKNOWN: i32 = 5;
+
+/// `access-wait`'s `ok` body when the timeout passed unanswered.
+pub const ACCESS_PENDING: &str = "pending";
+/// `access-wait`'s `ok` body when this instance has no such request.
+pub const ACCESS_UNKNOWN: &str = "unknown";
+
+/// The exit code for an `access-wait` `ok` body; `None` for a body that is
+/// no outcome. An approval of any reach is 0: the caller retries.
+pub fn access_exit_code(body: &str) -> Option<i32> {
+    match body {
+        "once" | "instance" | "always" => Some(EXIT_OK),
+        "deny" => Some(EXIT_ACCESS_DENY),
+        ACCESS_PENDING => Some(EXIT_ACCESS_PENDING),
+        ACCESS_UNKNOWN => Some(EXIT_ACCESS_UNKNOWN),
+        _ => None,
+    }
+}
 
 /// Longest encoded request any end accepts: the daemon sends it as one `Data`
 /// frame (well under `proto::MAX_PAYLOAD`), and the cap bounds a misbehaving
@@ -97,7 +137,8 @@ pub const MAX_REQUEST: usize = 64 * 1024;
 /// Longest encoded response the daemon and CLI accept (`ls` JSON is the big one).
 pub const MAX_RESPONSE: usize = 1024 * 1024;
 
-/// Cap on a long-polling request's `timeout` (`run-wait`, `events`), seconds:
+/// Cap on a long-polling request's `timeout` (`run-wait`, `events`,
+/// `access-wait`, which is also its default), seconds:
 /// each wait holds a bridge handler thread; clients loop instead (`devsbd run
 /// wait`), and the daemon gives up on a reply after 30 minutes anyway. Here so
 /// the helper caps `events --wait` with the host's own number.
@@ -145,10 +186,13 @@ pub enum Op {
     Subscribe,
     /// The requester's live Inbox threads, in put shape.
     ThreadLs,
+    /// Wait for the answer to one of the requester's permission requests:
+    /// held like `Subscribe`, exempt from the dispatcher check (module doc).
+    AccessWait,
 }
 
 impl Op {
-    pub const ALL: [Op; 16] = [
+    pub const ALL: [Op; 17] = [
         Op::Ensure,
         Op::Ls,
         Op::Stop,
@@ -165,6 +209,7 @@ impl Op {
         Op::EventsAck,
         Op::Subscribe,
         Op::ThreadLs,
+        Op::AccessWait,
     ];
 
     pub fn parse(s: &str) -> Option<Op> {
@@ -189,6 +234,7 @@ impl Op {
             Op::EventsAck => "events-ack",
             Op::Subscribe => "events-follow",
             Op::ThreadLs => "thread-ls",
+            Op::AccessWait => "access-wait",
         }
     }
 }
@@ -209,6 +255,16 @@ pub fn valid_run_id(id: &str) -> bool {
 /// error rather than a silent no-op.
 pub fn valid_event_id(id: &str) -> bool {
     id.strip_prefix("e-").is_some_and(valid_run_id)
+}
+
+/// The alphabet of a permission request id's characters (Crockford base32).
+pub const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A permission request id as the host mints them: `R-` and 12
+/// [`CROCKFORD`] characters. Checked on both ends, so a typo in `devsbd
+/// access wait` is a usage error rather than an `unknown`.
+pub fn valid_request_id(id: &str) -> bool {
+    id.strip_prefix("R-").is_some_and(|rest| rest.len() == 12 && rest.bytes().all(|b| CROCKFORD.contains(&b)))
 }
 
 /// Longest accepted child/thread key (the charset is checked by [`valid_key`]).
@@ -671,6 +727,29 @@ timeout 5\n";
         assert!(decode_request("op thread-ls\nfeed\nfeed\n").unwrap_err().contains("repeated `feed`"));
         // The codec only carries the ids; their shape is the host's check.
         assert_eq!(decode_request("op events-ack\nack x\n").map(|r| r.ack), Ok(vec!["x".to_string()]));
+    }
+
+    #[test]
+    fn access_wait_round_trips_and_maps_its_outcomes() {
+        let wait = Request { id: Some("R-0123456789AB".into()), timeout: Some(30), ..Request::new(Op::AccessWait) };
+        let text = "op access-wait\nid R-0123456789AB\ntimeout 30\n";
+        assert_eq!(encode_request(&wait), text);
+        assert_eq!(decode_request(text), Ok(wait));
+        let codes: Vec<_> =
+            ["once", "instance", "always", "deny", "pending", "unknown", "", "ok"].map(access_exit_code).into();
+        assert_eq!(codes, [Some(0), Some(0), Some(0), Some(3), Some(4), Some(5), None, None]);
+        let all = [EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_NO_HOST, EXIT_DENIED, EXIT_ACCESS_DENY, EXIT_ACCESS_PENDING, EXIT_ACCESS_UNKNOWN];
+        assert!(all.iter().enumerate().all(|(i, c)| !all[..i].contains(c)), "distinct exit codes");
+    }
+
+    #[test]
+    fn request_ids() {
+        assert!(valid_request_id("R-0123456789AB"));
+        assert!(valid_request_id("R-ZZZZZZZZZZZZ"));
+        for bad in ["", "R-", "github-work", "R-0123456789A", "R-0123456789ABC", "R-0123456789AI",
+                    "R-0123456789AU", "r-0123456789AB", "R-0123456789ab", "R-0123456789AB ", "R-../../etc/x"] {
+            assert!(!valid_request_id(bad), "{bad:?}");
+        }
     }
 
     #[test]

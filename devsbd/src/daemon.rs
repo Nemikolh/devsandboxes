@@ -507,22 +507,23 @@ fn serve_control_client(mut conn: UnixStream, bridges: &Bridges, ids: &AtomicU32
         Ok(_) if request.len() > control::MAX_REQUEST => {
             encoded(Status::Usage, format!("request longer than {} bytes", control::MAX_REQUEST))
         }
-        Ok(_) if is_follow(&request) => return control_follow(bridges, ids, &request, conn),
+        Ok(_) if is_held(&request) => return control_follow(bridges, ids, &request, conn),
         Ok(_) => control_exchange(bridges, ids, &request, CONTROL_REPLY_TIMEOUT),
     };
     let _ = conn.write_all(&reply);
 }
 
-/// Whether an encoded request is `events-follow`. Anything that doesn't
-/// decode takes the one-reply path, and the host answers its `Usage`.
-fn is_follow(request: &[u8]) -> bool {
+/// Whether an encoded request is held open by the host, writing pings:
+/// `events-follow` or `access-wait`. Anything that doesn't decode takes the
+/// one-reply path, and the host answers its `Usage`.
+fn is_held(request: &[u8]) -> bool {
     std::str::from_utf8(request)
         .ok()
         .and_then(|t| control::decode_request(t).ok())
-        .is_some_and(|r| r.op == control::Op::Subscribe)
+        .is_some_and(|r| matches!(r.op, control::Op::Subscribe | control::Op::AccessWait))
 }
 
-/// Relay an `events-follow` request like [`control_exchange`], but stream the
+/// Relay a held request ([`is_held`]) like [`control_exchange`], but stream the
 /// host's response to `conn` as it arrives, with no reply timeout or size
 /// cap: the host's ping lines keep it alive, and [`control::FOLLOW_SILENCE`]
 /// without a byte ends it. Without a route the answer is `NoHost`; any other
@@ -1288,12 +1289,13 @@ mod tests {
     }
 
     #[test]
-    fn only_events_follow_takes_the_stream_path() {
-        assert!(is_follow(FOLLOW));
-        assert!(is_follow(b"op events-follow\nkey pr-1\n"));
-        assert!(!is_follow(b"op events\n"));
-        assert!(!is_follow(b"op nope\n"));
-        assert!(!is_follow(b"\xff"));
+    fn only_held_ops_take_the_stream_path() {
+        assert!(is_held(FOLLOW));
+        assert!(is_held(b"op events-follow\nkey pr-1\n"));
+        assert!(is_held(b"op access-wait\nid R-0123456789AB\n"));
+        assert!(!is_held(b"op events\n"));
+        assert!(!is_held(b"op nope\n"));
+        assert!(!is_held(b"\xff"));
     }
 
     /// A held-open response passes through as it arrives, not at EOF; the

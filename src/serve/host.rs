@@ -315,7 +315,7 @@ fn poll(
             None
         }
     };
-    let worker = Bridges::spawn_worker(Some(sink), broker, board.clone());
+    let worker = Bridges::spawn_worker(Some(sink), broker, Some(Arc::clone(&asks)), board.clone());
     let rt = crate::runtime::backend();
     // Declared after `worker`, so it drops (child killed, thread joined)
     // first. Started once a runtime is installed.

@@ -85,8 +85,8 @@ streams and everything else as usual.
   the daemon relays it on `Open(CONTROL)` to the newest `CONTROL`-capable
   bridge and returns the host's response verbatim. No such bridge → `no-host`
   at once; no reply within 30 min or a dying bridge → `failed`.
-  `events-follow` is relayed as a stream until either side closes or 90 s
-  of silence (`FOLLOW_SILENCE`).
+  `events-follow` and `access-wait` are relayed as a stream until either
+  side closes or 90 s of silence (`FOLLOW_SILENCE`).
 - **Broker listeners** and **proxy ports**: set up once at start from the
   broker file ([below](#broker-listeners)).
 
@@ -207,16 +207,26 @@ control request instead (below).
 
 `ensure`, `ls`, `branches`, `stop`, `rm`, `done`, `exec`, `run
 ls|logs|wait|rm|prune <key>`, `events [--wait|--follow] [--thread]`,
-`events ack`, `thread ls [--feed]`: each builds one `control::Request`,
-sends it over `api.sock`, prints the body, and exits with the status's code
-(0 ok, 1 failed, 2 usage, 75 no host, 77 denied). Child ops need the
-sandbox to declare `dispatcher`, thread/event ops `inbox = true`; the host
-decides (`src/commands/dispatch.rs`, via [bridges.md](bridges.md)).
+`events ack`, `thread ls [--feed]`, `access wait <request> [--timeout
+SECS]`: each builds one `control::Request`, sends it over `api.sock`,
+prints the body, and exits with the status's code (0 ok, 1 failed, 2
+usage, 75 no host, 77 denied). Child ops need the sandbox to declare
+`dispatcher`, thread/event ops `inbox = true`; the host decides
+(`src/commands/dispatch.rs`, via [bridges.md](bridges.md)). `access wait`
+needs neither: it waits for the answer to one of this instance's
+permission requests
+([broker](../credentials/broker.md#permission-requests)), the id a `403`
+`pending` refusal names, and prints it: `once`, `instance` or `always`
+exit 0 (retry the call), `deny` 3, `pending` 4 (the timeout, at most and
+by default 300 s, passed), `unknown` 5 (no such request for this
+instance, or it expired).
 
 Long operations loop over short requests rather than holding one stream:
 `exec` without `--detach` and `run logs --follow` poll in 5 s steps,
 `run wait` in 60 s steps. `events --follow` is the exception, one held-open
-`events-follow` stream copied to stdout.
+`events-follow` stream copied to stdout, and so is `access wait`, one
+`access-wait` stream read past its pings to its one response
+(`ctl::relay_wait`).
 
 ## Runs: `devsbd run start|ls|logs|wait|rm|prune`
 
@@ -607,7 +617,7 @@ vscode` (`src/commands/vscode.rs`).
 ## `devsbd features`
 
 Prints the append-only list of CLI capabilities (`thread-send`,
-`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`, `userns`, `open`, `cgroup`) a dispatcher may probe
+`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`, `userns`, `open`, `cgroup`, `access-wait`) a dispatcher may probe
 before relying on them.
 
 Limitations: [status.md](../../status.md#helper)

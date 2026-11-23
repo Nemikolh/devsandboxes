@@ -311,3 +311,129 @@ fn a_call_keeps_the_grants_it_took() {
     grants.allow(held.clone());
     assert!(grants.granted(&held));
 }
+
+/// A request whose only call's hold ended: answers no longer wake anyone.
+fn unheld(r: &Registry, clock: &Clock) -> (String, AskKey) {
+    let a = ask("pr.write", None, Duration::from_secs(1));
+    let t = r.ask(&a).unwrap();
+    let id = t.id.clone();
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(r.wait(t), None);
+    (id, a.key)
+}
+
+#[test]
+fn wait_answer_reads_an_answer_given_before_it_and_leaves_the_late_grant() {
+    let (r, clock) = manual("wait-before");
+    let (id, key) = unheld(&r, &clock);
+    r.answer(&id, Answer::Once).unwrap();
+    assert_eq!(r.wait_answer(&id, "web-1-id", r.now()), Outcome::Answered(Answer::Once));
+    assert!(r.granted(&key), "the retry still gets its one-shot grant");
+    // Kept for the late window, then forgotten.
+    clock.advance(LATE_GRANT - Duration::from_millis(1));
+    assert_eq!(r.wait_answer(&id, "web-1-id", r.now()), Outcome::Answered(Answer::Once));
+    clock.advance(Duration::from_millis(1));
+    assert_eq!(r.wait_answer(&id, "web-1-id", r.now()), Outcome::Unknown);
+}
+
+#[test]
+fn wait_answer_wakes_on_an_answer_given_while_it_waits() {
+    let r = Arc::new(registry("wait-during"));
+    let t = r.ask(&ask("pr.write", None, Duration::from_millis(10))).unwrap();
+    let id = t.id.clone();
+    assert_eq!(r.wait(t), None);
+    let waiter = {
+        let (r, id) = (Arc::clone(&r), id.clone());
+        thread::spawn(move || r.wait_answer(&id, "web-1-id", r.now() + LONG))
+    };
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    r.answer(&id, Answer::Deny).unwrap();
+    assert_eq!(waiter.join().unwrap(), Outcome::Answered(Answer::Deny));
+    assert!(started.elapsed() < LONG);
+    assert_eq!(r.pending().len(), 0, "never counted as a waiter");
+}
+
+#[test]
+fn wait_answer_times_out_pending_and_hides_other_instances_requests() {
+    let (r, clock) = manual("wait-pending");
+    let (id, _) = unheld(&r, &clock);
+    assert_eq!(r.wait_answer(&id, "web-1-id", r.now()), Outcome::Pending);
+    assert_eq!(r.pending()[0].waiting, 0);
+    assert_eq!(r.wait_answer(&id, "other-id", r.now() + LONG), Outcome::Unknown, "at once, not at the deadline");
+    assert_eq!(r.wait_answer("R-0000000000AB", "web-1-id", r.now() + LONG), Outcome::Unknown);
+    r.answer(&id, Answer::Instance).unwrap();
+    assert_eq!(r.wait_answer(&id, "other-id", r.now()), Outcome::Unknown, "nor their answers");
+    assert_eq!(r.wait_answer(&id, "web-1-id", r.now()), Outcome::Answered(Answer::Instance));
+    // Past its late window unanswered, a request is gone.
+    let (id, _) = unheld(&r, &clock);
+    clock.advance(LATE_GRANT);
+    assert_eq!(r.wait_answer(&id, "web-1-id", r.now()), Outcome::Unknown);
+}
+
+fn wait_request(id: &str, timeout: Option<u64>) -> control::Request {
+    control::Request { id: Some(id.into()), timeout, ..control::Request::new(Op::AccessWait) }
+}
+
+fn served(asks: Option<&Registry>, instance_id: &str, req: &control::Request, ping: Duration) -> String {
+    let mut out = Vec::new();
+    serve_wait(asks, instance_id, req, &mut out, ping);
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn serve_wait_pings_then_answers_one_response() {
+    let r = registry("serve-wait");
+    let t = r.ask(&ask("pr.write", None, Duration::from_millis(10))).unwrap();
+    let id = t.id.clone();
+    r.wait(t);
+    let ping = format!("{}\n", control::FOLLOW_PING_LINE);
+    let started = Instant::now();
+    let out = served(Some(&r), "web-1-id", &wait_request(&id, Some(1)), Duration::from_millis(300));
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(out, format!("{}status ok\nbody pending\n", ping.repeat(3)));
+    r.answer(&id, Answer::Once).unwrap();
+    assert_eq!(served(Some(&r), "web-1-id", &wait_request(&id, None), LONG), "status ok\nbody once\n");
+    assert_eq!(served(Some(&r), "other-id", &wait_request(&id, None), LONG), "status ok\nbody unknown\n");
+    assert_eq!(served(None, "web-1-id", &wait_request(&id, None), LONG), "status ok\nbody unknown\n");
+}
+
+#[test]
+fn serve_wait_takes_only_a_request_id_and_a_timeout() {
+    let r = registry("serve-wait-usage");
+    let usage = |req: &control::Request| served(Some(&r), "web-1-id", req, LONG);
+    assert_eq!(usage(&control::Request::new(Op::AccessWait)), "status usage\nbody `access-wait` needs `id`\n");
+    assert_eq!(usage(&wait_request("1790000000-a1b2", None)), "status usage\nbody bad request id `1790000000-a1b2`\n");
+    let keyed = control::Request { key: Some("pr-1".into()), ..wait_request("R-0123456789AB", None) };
+    assert_eq!(usage(&keyed), "status usage\nbody `access-wait` takes only `id` and `timeout`\n");
+}
+
+/// A client gone mid-wait: the first ping fails, and the wait ends there.
+#[test]
+fn serve_wait_ends_when_a_ping_cannot_be_written() {
+    struct Gone;
+    impl Write for Gone {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let r = registry("serve-wait-gone");
+    let t = r.ask(&ask("pr.write", None, Duration::from_millis(10))).unwrap();
+    let id = t.id.clone();
+    r.wait(t);
+    let started = Instant::now();
+    serve_wait(Some(&r), "web-1-id", &wait_request(&id, Some(30)), &mut Gone, Duration::from_millis(20));
+    assert!(started.elapsed() < LONG);
+}
+
+/// Every answer reads as an approval or a deny to the helper.
+#[test]
+fn every_answer_marker_has_an_exit_code() {
+    for a in [Answer::Once, Answer::Instance, Answer::Always, Answer::Deny] {
+        let code = control::access_exit_code(a.marker());
+        assert_eq!(code, Some(if a.allows() { control::EXIT_OK } else { control::EXIT_ACCESS_DENY }), "{a:?}");
+    }
+}

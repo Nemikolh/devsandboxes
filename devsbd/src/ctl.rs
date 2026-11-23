@@ -1,7 +1,8 @@
 //! `devsbd ensure|ls|branches|stop|rm|done|exec`, `devsbd run ls|logs|wait|rm|prune <key> …`,
-//! `devsbd events [--wait SECS | --follow] [--thread KEY]`, `devsbd events ack <id>...` and `devsbd
-//! thread ls`: the control commands (child ops need `dispatcher`, the thread
-//! and event ops `inbox = true`) (docs/architecture/helper/in-container.md, "Control
+//! `devsbd events [--wait SECS | --follow] [--thread KEY]`, `devsbd events ack <id>...`, `devsbd
+//! thread ls` and `devsbd access wait <request>`: the control commands (child ops need
+//! `dispatcher`, the thread and event ops `inbox = true`, `access wait` nothing)
+//! (docs/architecture/helper/in-container.md, "Control
 //! verbs (`ctl.rs`)"; docs/architecture/inbox/threads-and-feed.md, *Events*). Each request is one encoded [`control::Request`] sent to the
 //! daemon over `daemon::API_SOCK`, which relays it to a host serving
 //! `CONTROL` (or answers `NoHost` itself); the command exits with the
@@ -10,7 +11,8 @@
 //! answers each from the child's `devsbd run logs|wait`, `runs.rs`) instead of
 //! holding one stream open for a run's whole life. `events --follow` is the
 //! exception: one held-open `events-follow` stream, its lines copied to
-//! stdout until it ends ([`subscribe`]).
+//! stdout until it ends ([`subscribe`]). `access wait` holds one stream too,
+//! pings until its one response ([`access_wait`]).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -35,7 +37,8 @@ const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--
        devsbd events [--wait SECS] [--thread KEY]\n\
        devsbd events --follow [--thread KEY]\n\
        devsbd events ack <id>...\n\
-       devsbd thread ls [--feed]";
+       devsbd thread ls [--feed]\n\
+       devsbd access wait <request> [--timeout SECS]";
 
 /// `devsbd run <sub>` forms that name a child (`run_remote`); each is the
 /// [`Op`] `run-<sub>`.
@@ -50,7 +53,7 @@ const WAIT_STEP: u64 = 60;
 
 /// Run control verb `verb` with its argv (after the verb); returns the exit
 /// code. `verb` is an [`Op`] name: `run ls` arrives as `run-ls`, `events ack`
-/// as `events-ack`, `thread ls` as `thread-ls`.
+/// as `events-ack`, `thread ls` as `thread-ls`, `access wait` as `access-wait`.
 pub fn run(verb: &str, args: &[String]) -> i32 {
     let cmd = match parse_args(verb, args) {
         Ok(cmd) => cmd,
@@ -63,6 +66,9 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     let mut stdout = io::stdout();
     if cmd.req.op == Op::Subscribe {
         return subscribe(daemon::API_SOCK, &cmd.req, &mut stdout);
+    }
+    if cmd.req.op == Op::AccessWait {
+        return access_wait(daemon::API_SOCK, &cmd.req, &mut stdout);
     }
     let mut send = |req: &Request| request(daemon::API_SOCK, req);
     match execute(&cmd, &mut send, &mut stdout, WAIT_STEP) {
@@ -133,9 +139,12 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             (Op::Branches, "--ahead") => true,
             (Op::Events, "--wait" | "--thread" | "--follow") => true,
             (Op::ThreadLs, "--feed") => true,
-            (Op::Ls | Op::Ensure | Op::Branches | Op::Events | Op::EventsAck | Op::Subscribe | Op::ThreadLs, _) => {
-                false
-            }
+            (Op::AccessWait, "--timeout") => true,
+            (
+                Op::Ls | Op::Ensure | Op::Branches | Op::Events | Op::EventsAck | Op::Subscribe | Op::ThreadLs
+                | Op::AccessWait,
+                _,
+            ) => false,
             (_, "--sandbox") => true,
             (Op::Exec, "--detach" | "--") => true,
             (Op::RunLogs, "--follow") => true,
@@ -168,8 +177,13 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             }
             "--timeout" => {
                 let v = value()?;
-                let secs = v.parse().map_err(|_| format!("--timeout: bad number `{v}`"))?;
-                set_once(&mut cmd.deadline, secs, flag)?;
+                let secs: u64 = v.parse().map_err(|_| format!("--timeout: bad number `{v}`"))?;
+                if op == Op::AccessWait {
+                    // One request, capped like `--wait`.
+                    set_once(&mut req.timeout, secs.min(control::MAX_WAIT), flag)?;
+                } else {
+                    set_once(&mut cmd.deadline, secs, flag)?;
+                }
             }
             // Capped like the host does, so a long `--wait` still waits
             // (the most the host would) instead of failing.
@@ -206,6 +220,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
     let (wanted, what) = match op {
         Op::Ls | Op::Events | Op::ThreadLs | Op::EventsAck | Op::Subscribe => (0, "no arguments"),
         Op::Ensure | Op::Branches => (1, "exactly one <sandbox>"),
+        Op::AccessWait => (1, "exactly one <request>"),
         Op::Stop | Op::Rm | Op::Done | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
         Op::RunLogs | Op::RunWait | Op::RunRm => (2, "<key> <id>"),
     };
@@ -221,6 +236,13 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             }
         }
         Op::Branches => req.sandbox = positional.next(),
+        Op::AccessWait => {
+            let id = positional.next().unwrap_or_default();
+            if !control::valid_request_id(&id) {
+                return Err(format!("bad request id `{id}` (R- and 12 characters)"));
+            }
+            req.id = Some(id);
+        }
         Op::Ls | Op::Events | Op::EventsAck | Op::Subscribe | Op::ThreadLs => {}
         _ => req.key = positional.next(),
     }
@@ -443,6 +465,61 @@ fn relay_follow(mut from: impl BufRead, out: &mut dyn Write) -> i32 {
             return control::EXIT_OK;
         }
     }
+}
+
+/// `access wait`: send the `access-wait` request over the API socket at
+/// `sock` and wait for its one response past the host's pings; the exit
+/// code ([`relay_wait`]).
+fn access_wait(sock: &str, req: &Request, out: &mut dyn Write) -> i32 {
+    let Ok(mut conn) = UnixStream::connect(sock) else {
+        return report(&Response::new(Status::NoHost, "no host connected (devsbd daemon not running)"));
+    };
+    let mut msg = vec![daemon::API_CONTROL];
+    msg.extend_from_slice(control::encode_request(req).as_bytes());
+    if conn.write_all(&msg).and_then(|()| conn.shutdown(Shutdown::Write)).is_err() {
+        return lost();
+    }
+    let _ = conn.set_read_timeout(Some(control::FOLLOW_SILENCE));
+    relay_wait(BufReader::new(conn), out)
+}
+
+/// Read an `access-wait` response from `from` (`control`'s module doc):
+/// pings skipped, then one response. An `ok` body is the outcome, printed
+/// to `out`, its exit code [`control::access_exit_code`]'s; any other
+/// status is reported like a failed op; a stream that ends before a
+/// response is exit 75 ([`lost`]): ask again.
+fn relay_wait(mut from: impl BufRead, out: &mut dyn Write) -> i32 {
+    let mut text = loop {
+        let mut line = String::new();
+        match from.read_line(&mut line) {
+            Ok(n) if n > 0 && line.ends_with('\n') => {}
+            _ => return lost(),
+        }
+        if line.trim_end() != control::FOLLOW_PING_LINE {
+            break line;
+        }
+    };
+    if (&mut from).take(control::MAX_RESPONSE as u64).read_to_string(&mut text).is_err() {
+        return lost();
+    }
+    // Cut short: the bridge or daemon went away mid-wait.
+    if !text.ends_with('\n') || text.lines().count() < 2 {
+        return lost();
+    }
+    let resp = match control::decode_response(&text) {
+        Ok(resp) => resp,
+        Err(e) => return report(&Response::new(Status::Failed, format!("bad response: {e}"))),
+    };
+    if resp.status != Status::Ok {
+        return report(&resp);
+    }
+    let Some(code) = control::access_exit_code(&resp.body) else {
+        return report(&Response::new(Status::Failed, format!("bad answer `{}`", resp.body)));
+    };
+    if writeln!(out, "{}", resp.body).and_then(|()| out.flush()).is_err() {
+        return control::EXIT_FAILED;
+    }
+    code
 }
 
 /// One round trip over the API socket at `sock`. Never fails: a missing
@@ -683,6 +760,57 @@ mod tests {
         assert_eq!(follow_from("status denied\nbody no\n").0, control::EXIT_DENIED);
         assert_eq!(follow_from("garbage\nmore\n").0, control::EXIT_FAILED);
         let code = subscribe("/nonexistent/devsbd-api.sock", &Request::new(Op::Subscribe), &mut Vec::new());
+        assert_eq!(code, control::EXIT_NO_HOST);
+    }
+
+    const REQ_ID: &str = "R-0123456789AB";
+
+    #[test]
+    fn parses_access_wait() {
+        let wait = |timeout| Request { id: Some(REQ_ID.into()), timeout, ..Request::new(Op::AccessWait) };
+        assert_eq!(parse("access-wait", &[REQ_ID]).unwrap(), wait(None));
+        assert_eq!(parse("access-wait", &[REQ_ID, "--timeout", "30"]).unwrap(), wait(Some(30)));
+        let c = parse_cmd("access-wait", &["--timeout=0", REQ_ID]).unwrap();
+        assert_eq!((c.req, c.deadline), (wait(Some(0)), None), "the host waits, not a client loop");
+        assert_eq!(parse("access-wait", &[REQ_ID, "--timeout", "9999"]).unwrap(), wait(Some(control::MAX_WAIT)), "capped");
+        let r = parse("access-wait", &[REQ_ID, "--timeout", "5"]).unwrap();
+        assert_eq!(control::encode_request(&r), "op access-wait\nid R-0123456789AB\ntimeout 5\n");
+        assert_eq!(parse("access-wait", &[]).unwrap_err(), "takes exactly one <request>");
+        assert_eq!(parse("access-wait", &[REQ_ID, REQ_ID]).unwrap_err(), "takes exactly one <request>");
+        assert!(parse("access-wait", &["github-work"]).unwrap_err().starts_with("bad request id `github-work`"));
+        assert!(parse("access-wait", &["R-0123456789ab"]).unwrap_err().starts_with("bad request id"));
+        assert!(parse("access-wait", &[REQ_ID, "--timeout", "x"]).unwrap_err().contains("bad number"));
+        assert_eq!(parse("access-wait", &[REQ_ID, "--timeout"]).unwrap_err(), "--timeout needs a value");
+        assert_eq!(parse("access-wait", &[REQ_ID, "--timeout=1", "--timeout=2"]).unwrap_err(), "--timeout given twice");
+        assert_eq!(parse("access-wait", &[REQ_ID, "--sandbox", "x"]).unwrap_err(), "unknown option `--sandbox`");
+        assert_eq!(parse("access-wait", &[REQ_ID, "--wait", "1"]).unwrap_err(), "unknown option `--wait`");
+    }
+
+    fn wait_from(stream: &str) -> (i32, String) {
+        let mut out = Vec::new();
+        let code = relay_wait(stream.as_bytes(), &mut out);
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    /// Pings are skipped; the outcome is printed and picks the exit code; a
+    /// stream cut before a whole response is 75; other statuses are reported.
+    #[test]
+    fn access_wait_relays_the_outcome_past_the_pings() {
+        let ping = format!("{}\n", control::FOLLOW_PING_LINE);
+        let ok = |body: &str| format!("{ping}{ping}status ok\nbody {body}\n");
+        for (body, code) in [("once", 0), ("instance", 0), ("always", 0), ("deny", 3), ("pending", 4), ("unknown", 5)] {
+            assert_eq!(wait_from(&ok(body)), (code, format!("{body}\n")), "{body}");
+        }
+        assert_eq!(wait_from("status ok\nbody once\n"), (0, "once\n".into()), "no ping");
+        assert_eq!(wait_from(&ok("maybe")).0, control::EXIT_FAILED);
+        assert_eq!(wait_from(""), (control::EXIT_NO_HOST, String::new()));
+        assert_eq!(wait_from(&ping).0, control::EXIT_NO_HOST);
+        assert_eq!(wait_from(&format!("{ping}status ok\n")).0, control::EXIT_NO_HOST);
+        assert_eq!(wait_from(&format!("{ping}status ok\nbody on")).0, control::EXIT_NO_HOST);
+        assert_eq!(wait_from("status usage\nbody bad request id\n").0, control::EXIT_USAGE);
+        assert_eq!(wait_from("status no-host\nbody no host connected\n").0, control::EXIT_NO_HOST);
+        assert_eq!(wait_from("garbage\nmore\n").0, control::EXIT_FAILED);
+        let code = access_wait("/nonexistent/devsbd-api.sock", &Request::new(Op::AccessWait), &mut Vec::new());
         assert_eq!(code, control::EXIT_NO_HOST);
     }
 
