@@ -12,7 +12,9 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- **features**: an update's mount is read-only because the update declares
+  it, so feature metadata stays spec-valid.
+  → [plan](plans/active/update-mounts-read-only.md)
 
 ## Planned
 
