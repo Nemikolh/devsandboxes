@@ -7,13 +7,15 @@ commands or the home's files; the design they implement is
 "`credentials.toml`") and
 [github-and-sentry-access](../plans/active/github-and-sentry-access.md)
 (*The claim contract*). Unix only (the files take `serve::locked_file`'s
-write discipline). Local only: both run in-process on the host whose
-credentials they are, never on a machine (`--machine` refuses them).
+write discipline). Local only: both run on the host whose credentials
+they are, never on a machine (`--machine` refuses them); in-process, but
+for permission requests, which are the local daemon's (*Permission
+requests*).
 
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
 `obtain`, `create_url`, `check_request`, `read_check`, `check_token`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`, `ask_approve`,
-`pick_pending`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
+`pick_pending`, `approve_route`, `deny_route`, `pending_text`, `decide_with`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
 `revoke_answer_at`, `forget_at`), `src/credentials/home.rs` (`Entry`, `Rule`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/answers.rs` (`Answers`,
 `Remembered`, `lookup`, `forget_instance`), `src/credentials/store.rs` (`Store`,
@@ -27,6 +29,9 @@ devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>].
                  [--method paste|device|browser] [--client-id <id>] [--owner <user|org>] [--broad]
                  [--org <slug>]...
 devsandbox access approve <credential> [--version <v>] [--yes]
+devsandbox access approve <request> [--for once|instance|always]
+devsandbox access deny <request>
+devsandbox access pending [--json]
 devsandbox access ls [<credential>] [--json]
 devsandbox access revoke <credential> [--version <v>] [--yes]
 devsandbox access revoke <request>
@@ -242,6 +247,53 @@ asking. A refused `run` is rolled back, so trying again is another `run`
 under the same name; a refused `rebuild` keeps its instance as `failed`,
 and its refusal names `devsandbox rebuild <instance>` instead.
 
+## Permission requests
+
+A call an `ask` holds raises a request in the daemon
+([broker](../architecture/credentials/broker.md#permission-requests));
+these three are clients of its `access.*` methods
+([API](api.md#access)), connecting as `devsandbox machine` does (the
+lazy start included).
+
+`access pending` (`pending_text`) lists the unanswered requests, oldest
+first, or `no pending requests`:
+
+```
+ID              INSTANCE  CREDENTIAL  SCOPE        REPO  CALL                   AGE  HELD
+R-7Q2M9XK4TB0D  web-1     gh          pr.write     o/r   POST /repos/o/r/pulls  now  yes
+R-3JX8W1PZ6N2C  api       sentry      issues.read  -     GET /api/0/issues/     2m   no
+```
+
+`REPO` is `-` for a scope with no repo fence; `HELD` says whether a call
+waits on it now (`yes (N calls)` for several); `no`: its hold ended, and
+only a late answer is left. `--json` prints `{"schema", "data":
+{"requests": [request…]}}`, each request as the API's.
+
+`access approve <request>` and `access deny <request>` (`decide_with`):
+a request id (`asks::is_request_id`) as the positional makes `approve`
+answer that request (`approve_route`): `--for` once (the default),
+`instance` or `always`, as `access.decide` takes them; `--version` with a
+request is refused, and so is `--for` with a credential; `--yes` changes
+nothing for a request, which isn't asked about (the user named it). `deny`
+takes a request id only (`deny_route`), refusing anything else with a
+pointer to `access revoke <credential> --version`. Both first show the
+request as listed, then answer it:
+
+```
+request R-7Q2M9XK4TB0D: `web-1` (sandbox web) asks `gh` pr.write on o/r for POST /repos/o/r/pulls
+approved R-7Q2M9XK4TB0D for this instance: `web-1` `gh` pr.write on o/r, until its `rm` (`devsandbox access revoke R-7Q2M9XK4TB0D` drops it)
+```
+
+The other answers print "approved R-… once: `web-1` `gh` pr.write on
+o/r" (with no call held: "(no call waits on it: the instance's next
+matching call within 5 minutes takes it)" appended), "approved R-…
+always: a rule on `gh` lets sandbox web's pr.write on o/r through
+(`devsandbox access revoke R-…` drops it)", "denied R-…: `web-1` `gh`
+pr.write on o/r, kept until `devsandbox access revoke R-…`". A request
+not listed, or answered between the listing and the answer
+(`not-found`): "no pending request `R-…` (answered already, or
+expired)".
+
 ## `access ls`
 
 `list_at`: every credential in `credentials.toml` (or the one named),
@@ -367,8 +419,8 @@ folder with no record, or a repo not in its fence (the fence is listed),
 is refused. The instances on that folder, named in the output, keep
 their snapshot until their next `start` or `rebuild`.
 
-The `access` commands work on the files directly, in-process; no API
-method reaches them.
+The `access` commands but the request ones work on the files directly,
+in-process; no API method reaches them.
 
 ## `credentials.toml`
 

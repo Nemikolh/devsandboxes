@@ -550,7 +550,11 @@ hands it through `Host::start` to `Service::from_host`):
   the requests (`api::AccessRequest`: what the sandbox's call chose,
   method, route and repo, with control characters escaped by
   `open::printable`), `access.decide` answers one
-  ([API](../../reference/api.md#access)). `lent::admit` refuses
+  ([API](../../reference/api.md#access)); the CLI's `devsandbox access
+  pending`, `access approve <request> [--for …]` and `access deny
+  <request>` are clients of them
+  ([credentials CLI](../../reference/credentials-cli.md#permission-requests)).
+  `lent::admit` refuses
   `access.*`, `credentials.*` and a `subscribe` to `access` to every
   peer, under either trust.
 

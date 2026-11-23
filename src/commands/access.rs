@@ -1,21 +1,26 @@
-//! `devsandbox access ls|approve|revoke` (docs/reference/credentials-cli.md):
+//! `devsandbox access ls|approve|revoke|pending|deny` (docs/reference/credentials-cli.md):
 //! this home's credentials as `credentials.toml`, the store and `state.toml`
 //! hold them; approving a pending claim version after its diff against the
 //! latest approved one (github-and-sentry-access, *The claim contract*);
 //! dropping a credential or one of its versions, or the rule or kept
 //! answer a permission request left (`access.json`); the folders' GitHub repo
 //! fences, and `forget` narrowing one (docs/architecture/credentials/fence.md).
-//! Local only.
+//! Local only: the files directly, but for permission requests (`pending`,
+//! `approve <request>`, `deny`), which live in the daemon's memory and so
+//! go through its `access.*` methods.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::login::{Stdio, Term, approve_or_refuse, data_dir};
 use super::status::Envelope;
 use super::run::remotes;
+use crate::broker::asks::{self, Answer};
 use crate::config::{Access, Config};
 use crate::credentials::answers::{self, Answers, Kind, Remembered};
 use crate::credentials::fence;
@@ -23,6 +28,10 @@ use crate::credentials::home::{self, Broken, Entry, Home, Rule, Version};
 use crate::credentials::review;
 use crate::credentials::tokens;
 use crate::credentials::store::{Record, Store};
+use crate::serve::api::AccessRequest;
+use crate::serve::client::{self, Conn};
+use crate::serve::endpoint;
+use crate::serve::proto::Response;
 use crate::state::{Instance, State};
 
 /// An instance's config `access`, read now; a seam for tests.
@@ -755,6 +764,160 @@ fn pick_pending<'a>(name: &str, pending: &'a [Version], version: Option<&str>) -
     }
 }
 
+/// What `access approve <arg>` answers: `Some` a permission request, with
+/// the `--for` answer (default once), `None` a credential's pending claim
+/// version. Request ids are never credential names (no uppercase).
+pub(crate) fn approve_route(arg: &str, version: Option<&str>, for_: Option<&str>) -> Result<Option<Answer>> {
+    if !asks::is_request_id(arg) {
+        if for_.is_some() {
+            bail!("`--for` answers a permission request (`R-…`), not a credential's claim version");
+        }
+        return Ok(None);
+    }
+    if version.is_some() {
+        bail!("`--version` names a claim version of a credential, not of a request");
+    }
+    match Answer::parse(for_.unwrap_or("once")) {
+        Some(a) if a.allows() => Ok(Some(a)),
+        _ => bail!("`--for` takes once, instance or always (`devsandbox access deny` denies)"),
+    }
+}
+
+/// `access deny` takes a request only: a claim version isn't denied, it's
+/// dropped.
+pub(crate) fn deny_route(arg: &str) -> Result<()> {
+    if asks::is_request_id(arg) {
+        return Ok(());
+    }
+    bail!(
+        "`{arg}` isn't a request id (`R-` and 12 characters, as `devsandbox access pending` lists them); \
+         a credential's pending claim version is dropped with `devsandbox access revoke {arg} --version <v>`"
+    )
+}
+
+/// One daemon call; a seam for tests.
+type Call<'a> = dyn FnMut(&str, Value) -> Result<Response> + 'a;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Pending {
+    requests: Vec<AccessRequest>,
+}
+
+fn connect() -> Result<Conn> {
+    client::connect(&endpoint::socket_dir()?, "cli").context("permission requests need devsandbox serve")
+}
+
+fn result<T: DeserializeOwned>(r: Response, method: &str) -> Result<T> {
+    if let Some(e) = r.error {
+        bail!("{}", e.message);
+    }
+    serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("unexpected {method} answer"))
+}
+
+fn requests(call: &mut Call) -> Result<Vec<AccessRequest>> {
+    let listed: Pending = result(call("access.pending", Value::Null)?, "access.pending")?;
+    Ok(listed.requests)
+}
+
+pub fn pending(json: bool) -> Result<()> {
+    let mut conn = connect()?;
+    let requests = requests(&mut |m, p| conn.call(m, p))?;
+    if json {
+        let data = Pending { requests };
+        println!("{}", serde_json::to_string_pretty(&Envelope::new(&data)).context("serialize access pending")?);
+    } else {
+        print!("{}", pending_text(&requests, now(), crate::inbox::clock::local_utc_offset()));
+    }
+    Ok(())
+}
+
+/// `access pending`'s table, or a note when there's none.
+fn pending_text(list: &[AccessRequest], now: u64, utc_offset: i64) -> String {
+    if list.is_empty() {
+        return "no pending requests\n".into();
+    }
+    let cells: Vec<[String; 8]> = list
+        .iter()
+        .map(|r| {
+            let held = match r.waiting {
+                0 => "no".to_string(),
+                1 => "yes".to_string(),
+                n => format!("yes ({n} calls)"),
+            };
+            [
+                r.id.clone(),
+                r.instance.clone(),
+                r.credential.clone(),
+                r.scope.clone(),
+                r.repo.clone().unwrap_or_else(|| "-".into()),
+                format!("{} {}", r.method, r.route),
+                crate::inbox::clock::short_age(r.opened_at, now, utc_offset),
+                held,
+            ]
+        })
+        .collect();
+    crate::render::table(&["ID", "INSTANCE", "CREDENTIAL", "SCOPE", "REPO", "CALL", "AGE", "HELD"], &cells)
+}
+
+/// `access approve <request>` and `access deny <request>`.
+pub fn decide(id: &str, answer: Answer) -> Result<()> {
+    let mut conn = connect()?;
+    let done = decide_with(id, answer, &mut |m, p| conn.call(m, p), &mut |line| println!("{line}"))?;
+    println!("{done}");
+    Ok(())
+}
+
+fn not_found(id: &str) -> String {
+    format!("no pending request `{id}` (answered already, or expired)")
+}
+
+/// Shows the request before answering it: the user named an id, so no
+/// question, but they see what it covers. Returns the line to print.
+fn decide_with(id: &str, answer: Answer, call: &mut Call, show: &mut dyn FnMut(&str)) -> Result<String> {
+    let listed = requests(call)?;
+    let Some(request) = listed.iter().find(|r| r.id == id) else { bail!("{}", not_found(id)) };
+    show(&format!("request {id}: {}", what(request)));
+    let r = call("access.decide", json!({ "request": id, "answer": answer.marker() }))?;
+    if r.error.as_ref().is_some_and(|e| e.code == "not-found") {
+        bail!("{}", not_found(id));
+    }
+    #[derive(Deserialize)]
+    struct Decided {
+        request: AccessRequest,
+    }
+    let decided: Decided = result(r, "access.decide")?;
+    Ok(decided_line(&decided.request, answer))
+}
+
+fn what(r: &AccessRequest) -> String {
+    format!(
+        "`{}` (sandbox {}) asks `{}` {} for {} {}",
+        r.instance,
+        r.sandbox,
+        r.credential,
+        on_repo(&r.scope, r.repo.as_deref()),
+        r.method,
+        r.route
+    )
+}
+
+fn decided_line(r: &AccessRequest, answer: Answer) -> String {
+    let (id, scope) = (&r.id, on_repo(&r.scope, r.repo.as_deref()));
+    let covers = format!("`{}` `{}` {scope}", r.instance, r.credential);
+    match answer {
+        Answer::Once if r.held => format!("approved {id} once: {covers}"),
+        Answer::Once => format!("approved {id} once: {covers} (no call waits on it: the instance's next matching call within 5 minutes takes it)"),
+        Answer::Instance => format!(
+            "approved {id} for this instance: {covers}, until its `rm` (`devsandbox access revoke {id}` drops it)"
+        ),
+        Answer::Always => format!(
+            "approved {id} always: a rule on `{}` lets sandbox {}'s {scope} through (`devsandbox access revoke {id}` drops it)",
+            r.credential, r.sandbox
+        ),
+        Answer::Deny => format!("denied {id}: {covers}, kept until `devsandbox access revoke {id}`"),
+    }
+}
+
 fn or_none(list: &str) -> &str {
     if list.is_empty() { "none" } else { list }
 }
@@ -1360,5 +1523,138 @@ mod tests {
         revoke_at(&data, &State::default(), "sentry-work", Some(&v1), true, &mut term, &mut access_fixture).unwrap();
         assert!(term.shown.contains(&format!("the latest approved version becomes {}\n", &v0[..12])), "{}", term.shown);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    const RID: &str = "R-7Q2M9XK4TB0D";
+
+    fn request(repo: Option<&str>, waiting: usize) -> AccessRequest {
+        AccessRequest {
+            id: RID.into(),
+            instance: "web-1".into(),
+            instance_id: "i1".into(),
+            sandbox: "web".into(),
+            credential: "gh".into(),
+            kind: "github".into(),
+            scope: "pr.write".into(),
+            repo: repo.map(Into::into),
+            method: "POST".into(),
+            route: "/repos/o/r/pulls".into(),
+            opened_at: 1_000,
+            held: waiting > 0,
+            waiting,
+        }
+    }
+
+    #[test]
+    fn approve_routes_a_request_id_or_a_credential() {
+        assert_eq!(approve_route("gh", None, None).unwrap(), None);
+        assert_eq!(approve_route("gh", Some("3f2a"), None).unwrap(), None);
+        let err = approve_route("gh", None, Some("once")).unwrap_err().to_string();
+        assert_eq!(err, "`--for` answers a permission request (`R-…`), not a credential's claim version");
+
+        assert_eq!(approve_route(RID, None, None).unwrap(), Some(Answer::Once));
+        for (flag, answer) in [("once", Answer::Once), ("instance", Answer::Instance), ("always", Answer::Always)] {
+            assert_eq!(approve_route(RID, None, Some(flag)).unwrap(), Some(answer));
+        }
+        for bad in ["deny", "forever"] {
+            assert!(approve_route(RID, None, Some(bad)).unwrap_err().to_string().contains("once, instance or always"));
+        }
+        let err = approve_route(RID, Some("3f2a"), None).unwrap_err().to_string();
+        assert_eq!(err, "`--version` names a claim version of a credential, not of a request");
+        // Lowercase: a credential name, never a request.
+        assert_eq!(approve_route(&RID.to_lowercase(), None, None).unwrap(), None);
+
+        deny_route(RID).unwrap();
+        let err = deny_route("gh").unwrap_err().to_string();
+        assert!(err.starts_with("`gh` isn't a request id") && err.contains("`devsandbox access revoke gh --version <v>`"), "{err}");
+    }
+
+    #[test]
+    fn pending_lists_each_request_and_whether_a_call_waits() {
+        assert_eq!(pending_text(&[], 0, 0), "no pending requests\n");
+        let mut late = request(None, 0);
+        late.id = "R-0000000000AB".into();
+        let text = pending_text(&[request(Some("o/r"), 2), late], 1_000 + 120, 0);
+        let lines: Vec<&str> = text.lines().collect();
+        let header: Vec<&str> = lines[0].split_whitespace().collect();
+        assert_eq!(header, ["ID", "INSTANCE", "CREDENTIAL", "SCOPE", "REPO", "CALL", "AGE", "HELD"], "{text}");
+        for want in [RID, "web-1", "gh", "pr.write", "o/r", "POST /repos/o/r/pulls", "2m", "yes (2 calls)"] {
+            assert!(lines[1].contains(want), "{want}: {text}");
+        }
+        assert!(lines[2].contains(" - ") && lines[2].trim_end().ends_with("no"), "{text}");
+    }
+
+    /// A daemon answering `access.pending` with `listed` and
+    /// `access.decide` with `decided`, recording the decide params.
+    fn daemon<'a>(listed: Vec<AccessRequest>, decided: Response, sent: &'a mut Vec<Value>) -> impl FnMut(&str, Value) -> Result<Response> + 'a {
+        let mut decided = Some(decided);
+        move |method, params| match method {
+            "access.pending" => Ok(Response::ok(None, serde_json::to_value(Pending { requests: listed.iter().map(clone).collect() }).unwrap())),
+            "access.decide" => {
+                sent.push(params);
+                Ok(decided.take().expect("decided once"))
+            }
+            m => panic!("unexpected {m}"),
+        }
+    }
+
+    fn clone(r: &AccessRequest) -> AccessRequest {
+        serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap()
+    }
+
+    fn answered(r: AccessRequest) -> Response {
+        Response::ok(None, json!({ "request": r }))
+    }
+
+    #[test]
+    fn decide_shows_the_request_then_answers_it() {
+        let mut sent = Vec::new();
+        let mut shown = Vec::new();
+        let done = decide_with(
+            RID,
+            Answer::Instance,
+            &mut daemon(vec![request(Some("o/r"), 1)], answered(request(Some("o/r"), 1)), &mut sent),
+            &mut |l| shown.push(l.to_string()),
+        )
+        .unwrap();
+        assert_eq!(shown, ["request R-7Q2M9XK4TB0D: `web-1` (sandbox web) asks `gh` pr.write on o/r for POST /repos/o/r/pulls"]);
+        assert_eq!(sent, [json!({"request": RID, "answer": "instance"})]);
+        assert_eq!(
+            done,
+            "approved R-7Q2M9XK4TB0D for this instance: `web-1` `gh` pr.write on o/r, until its `rm` \
+             (`devsandbox access revoke R-7Q2M9XK4TB0D` drops it)"
+        );
+
+        let line = |answer, r: AccessRequest| decided_line(&r, answer);
+        assert_eq!(line(Answer::Once, request(None, 1)), "approved R-7Q2M9XK4TB0D once: `web-1` `gh` pr.write");
+        assert!(line(Answer::Once, request(None, 0)).ends_with("(no call waits on it: the instance's next matching call within 5 minutes takes it)"));
+        assert_eq!(
+            line(Answer::Always, request(Some("o/r"), 1)),
+            "approved R-7Q2M9XK4TB0D always: a rule on `gh` lets sandbox web's pr.write on o/r through \
+             (`devsandbox access revoke R-7Q2M9XK4TB0D` drops it)"
+        );
+        assert_eq!(
+            line(Answer::Deny, request(Some("o/r"), 1)),
+            "denied R-7Q2M9XK4TB0D: `web-1` `gh` pr.write on o/r, kept until `devsandbox access revoke R-7Q2M9XK4TB0D`"
+        );
+    }
+
+    #[test]
+    fn a_request_no_longer_pending_is_named_so() {
+        let gone = "no pending request `R-7Q2M9XK4TB0D` (answered already, or expired)";
+        let (mut sent, mut shown) = (Vec::new(), 0);
+        let err = decide_with(RID, Answer::Once, &mut daemon(vec![], answered(request(None, 1)), &mut sent), &mut |_| shown += 1)
+            .unwrap_err();
+        assert_eq!(err.to_string(), gone);
+        assert!(sent.is_empty() && shown == 0, "nothing decided or shown");
+
+        // Answered between the listing and the decide.
+        let raced = Response::err(None, "not-found", "no pending request `R-7Q2M9XK4TB0D`");
+        let err = decide_with(RID, Answer::Deny, &mut daemon(vec![request(None, 1)], raced, &mut sent), &mut |_| {}).unwrap_err();
+        assert_eq!(err.to_string(), gone);
+
+        let failed = Response::err(None, "internal", "cannot write access.json");
+        let err = decide_with(RID, Answer::Deny, &mut daemon(vec![request(None, 1)], failed, &mut sent), &mut |_| {}).unwrap_err();
+        assert_eq!(err.to_string(), "cannot write access.json");
     }
 }

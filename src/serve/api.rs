@@ -1366,7 +1366,7 @@ fn forwards_rm(p: ForwardsRmParams, ctx: &Ctx) -> Answer {
 /// A permission request as `access.*` show it. What the sandbox's call
 /// chose (method, route, repo) has its control characters escaped, so no
 /// client prints a container's terminal escapes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AccessRequest {
     pub id: String,
     pub instance: String,

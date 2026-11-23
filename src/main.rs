@@ -506,8 +506,8 @@ enum Command {
         #[arg(long, value_name = "USER|ORG")]
         owner: Option<String>,
     },
-    /// This host's credentials: list them, approve claim versions, revoke
-    /// (docs/reference/credentials-cli.md)
+    /// This host's credentials: list them, approve claim versions, answer
+    /// permission requests, revoke (docs/reference/credentials-cli.md)
     #[cfg(unix)]
     Access {
         #[command(subcommand)]
@@ -539,17 +539,38 @@ enum AccessCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Approve the claim version pending for a credential, after its diff
-    /// against the latest approved one; the secret stays
+    /// Approve a permission request a sandbox's call is waiting on, or the
+    /// claim version pending for a credential (after its diff against the
+    /// latest approved one; the secret stays)
     Approve {
-        /// The credential's name in credentials.toml
+        /// A request id (`R-…`, as `access pending` lists them), or the
+        /// credential's name in credentials.toml
         credential: String,
-        /// The pending version (a prefix of it), when there are several
+        /// The pending claim version (a prefix of it), when there are
+        /// several; not for a request
         #[arg(long)]
         version: Option<String>,
-        /// Approve without asking (required off a terminal)
+        /// Approve a claim version without asking (required off a terminal);
+        /// a request is approved as named
         #[arg(long)]
         yes: bool,
+        /// How long a request's approval lasts: once (the waiting calls), the
+        /// instance (until its `rm`), or always (a rule for the sandbox)
+        #[arg(long = "for", value_name = "WHEN", value_parser = ["once", "instance", "always"])]
+        for_: Option<String>,
+    },
+    /// List the permission requests waiting for an answer: which instance
+    /// asks for which credential, scope and repo, the call, and whether a
+    /// call is held on it now
+    Pending {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deny a permission request: the instance's matching calls are refused
+    /// until `access revoke <request>`
+    Deny {
+        /// The request id (`R-…`, as `access pending` lists them)
+        request: String,
     },
     /// Drop a repo from a folder's recorded GitHub fence (narrow only);
     /// its instances take it at their next start or rebuild
@@ -1227,8 +1248,18 @@ fn main() -> Result<()> {
             commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id, owner, broad, orgs })
         }
         #[cfg(unix)]
-        Command::Access { cmd: AccessCommand::Approve { credential, version, yes } } => {
-            commands::access::approve(&credential, version.as_deref(), yes)
+        Command::Access { cmd: AccessCommand::Approve { credential, version, yes, for_ } } => {
+            match commands::access::approve_route(&credential, version.as_deref(), for_.as_deref())? {
+                Some(answer) => commands::access::decide(&credential, answer),
+                None => commands::access::approve(&credential, version.as_deref(), yes),
+            }
+        }
+        #[cfg(unix)]
+        Command::Access { cmd: AccessCommand::Pending { json } } => commands::access::pending(json),
+        #[cfg(unix)]
+        Command::Access { cmd: AccessCommand::Deny { request } } => {
+            commands::access::deny_route(&request)?;
+            commands::access::decide(&request, broker::asks::Answer::Deny)
         }
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Ls { credential, json } } => {
@@ -1323,6 +1354,29 @@ mod tests {
         assert_eq!(upgrade(&["machine", "upgrade", "box"]), ("box".into(), false));
         assert_eq!(upgrade(&["machine", "upgrade", "box", "--yes"]), ("box".into(), true));
         assert!(parse(&["machine", "upgrade"]).is_err(), "a name is required");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn access_request_verbs_parse() {
+        use super::AccessCommand;
+        let parse = |args: &[&str]| Cli::try_parse_from(["devsandbox", "access"].into_iter().chain(args.iter().copied()));
+        match parse(&["approve", "R-7Q2M9XK4TB0D", "--for", "instance"]).unwrap().command {
+            Some(Command::Access { cmd: AccessCommand::Approve { credential, for_, version: None, yes: false } }) => {
+                assert_eq!((credential.as_str(), for_.as_deref()), ("R-7Q2M9XK4TB0D", Some("instance")));
+            }
+            _ => panic!("not access approve"),
+        }
+        assert!(parse(&["approve", "R-7Q2M9XK4TB0D", "--for", "deny"]).is_err());
+        assert!(matches!(
+            parse(&["deny", "R-7Q2M9XK4TB0D"]).unwrap().command,
+            Some(Command::Access { cmd: AccessCommand::Deny { .. } })
+        ));
+        assert!(parse(&["deny"]).is_err(), "a request is required");
+        assert!(matches!(
+            parse(&["pending", "--json"]).unwrap().command,
+            Some(Command::Access { cmd: AccessCommand::Pending { json: true } })
+        ));
     }
 
     #[cfg(unix)]
